@@ -156,13 +156,15 @@ pub fn checked(path: &str) -> Result<&str, ChildError<'_>> {
 
 /// The test's Seatbelt profile (macOS): everything denied but what a test may do. Reads
 /// anywhere (each is an ask, recorded by the wrappers, not refused); writes only beneath its
-/// temporary folder and to `/dev/null`; sockets only on loopback (a host's loopback service is
-/// not kept: oscall.rs) and to the launcher's socket when one is named; no Mach service (no
-/// XPC: the supported test program has only libSystem loaded); signals only within the
-/// sandbox; programs may start and inherit the profile (a start is not kept). The deny-default
-/// form matches `bstd::procs::hermetic::seatbelt`'s; the policy differs (a build script
-/// reads only what its grant names). The exact filter forms (`local ip "localhost:*"`) are to
-/// verify by a test (fork_smoke's run applies this profile).
+/// temporary folder, `/private/tmp` (for tests and libraries that bind IPC endpoints under
+/// `/tmp`), and to `/dev/null`; sockets only on loopback (a host's loopback service is not
+/// kept: oscall.rs), Unix domain sockets beneath its temporary folder or `/private/tmp`, and
+/// to the launcher's socket when one is named; no Mach service (no XPC: the supported test
+/// program has only libSystem loaded); signals only within the sandbox; programs may start
+/// and inherit the profile (a start is not kept). The deny-default form matches
+/// `bstd::procs::hermetic::seatbelt`'s; the policy differs (a build script reads only what
+/// its grant names). The exact filter forms (`local ip "localhost:*"`) are to verify by a
+/// test (fork_smoke's run applies this profile).
 pub fn seatbelt<'a, 's>(temp: &'s str, control: Option<&'s str>, alloc: Alloc<'a>) -> Result<AString<'a>, ChildError<'s>> {
     let temp = checked(temp)?;
     let mut out: AString<'a> = String::new_in(alloc);
@@ -172,11 +174,17 @@ pub fn seatbelt<'a, 's>(temp: &'s str, control: Option<&'s str>, alloc: Alloc<'a
     out.push_str("(allow file-read*)\n");
     out.push_str("(allow file-write* (subpath \"");
     out.push_str(temp);
-    out.push_str("\") (literal \"/dev/null\"))\n");
+    out.push_str("\") (subpath \"/private/tmp\") (literal \"/dev/null\"))\n");
     out.push_str("(allow file-ioctl (literal \"/dev/null\"))\n");
-    out.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
-    out.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
-    out.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+    out.push_str("(allow network-bind (local ip \"localhost:*\") (subpath \"");
+    out.push_str(temp);
+    out.push_str("\") (subpath \"/private/tmp\"))\n");
+    out.push_str("(allow network-inbound (local ip \"localhost:*\") (subpath \"");
+    out.push_str(temp);
+    out.push_str("\") (subpath \"/private/tmp\"))\n");
+    out.push_str("(allow network-outbound (remote ip \"localhost:*\") (subpath \"");
+    out.push_str(temp);
+    out.push_str("\") (subpath \"/private/tmp\"))\n");
     if let Some(socket) = control {
         out.push_str("(allow network-outbound (literal \"");
         out.push_str(checked(socket)?);
