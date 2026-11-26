@@ -4,6 +4,7 @@
 //! `rust_cell`, `host`) compile and are unit-tested on every platform without requiring Metal.
 
 pub mod agent_hub;
+pub mod agent_probe;
 pub mod blocks;
 pub mod cli_spec_driver;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod sysmon_driver;
 pub mod sysmon_view;
 pub mod theme;
 pub mod tiling;
+pub mod ui_widgets;
 pub mod view;
 pub mod yazi;
 pub mod zoxide;
@@ -990,13 +992,14 @@ mod tests {
         let editor = Editor::new();
 
         let mut yazi = crate::yazi::YaziState::open(&dir);
-        let hub = crate::agent_hub::AgentHub {
-            local_host: "hydra".to_owned(),
-            agents: vec![crate::agent_hub::AgentRecord {
+        let mut hub = crate::agent_hub::AgentHub::from_records(
+            "hydra",
+            vec![crate::agent_hub::AgentRecord {
                 id: "local-1".to_owned(),
                 host: "hydra".to_owned(),
                 is_remote: false,
                 name: "claude #1".to_owned(),
+                kind_label: "claude".to_owned(),
                 prompt_summary: "test".to_owned(),
                 metric_badge: "12%".to_owned(),
                 cwd: "/tmp".to_owned(),
@@ -1004,12 +1007,9 @@ mod tests {
                 status: crate::agent_hub::AgentStatus::Running,
                 pty_session_idx: None,
                 preview_lines: vec!["ok".to_owned()],
+                ..Default::default()
             }],
-            selected: 0,
-            sidebar_ratio: 0.34,
-            composing_new: false,
-            new_prompt: String::new(),
-        };
+        );
 
         for &vw in &[260.0f32, 320.0, 400.0, 514.0, 620.0, 1140.0] {
             for &vh in &[200.0f32, 400.0, 820.0] {
@@ -1026,7 +1026,7 @@ mod tests {
                 assert!(!sy.rects.is_empty());
 
                 let sh = crate::agent_hub::layout_agent_hub(
-                    &hub,
+                    &mut hub,
                     &store,
                     &prompt,
                     vw,

@@ -269,9 +269,16 @@ pub enum HitAction {
     /// Rendered Markdown/HTML interactive actions.
     OpenLink { href: String, base_dir: String },
     CopyText(String),
-    /// Agent Hub interactive actions (resizable sidebar divider + clickable agent rows).
+    /// Agent Hub interactive actions (resizable sidebar divider, clickable rows, toolbar & kill).
     ResizeAgentSidebar,
     SelectAgent(usize),
+    AgentToggleOffline,
+    AgentReprobeServers,
+    AgentAttachSelected,
+    AgentNewTaskSelected,
+    AgentRequestKill,
+    AgentConfirmKill { sigkill: bool },
+    AgentCancelKill,
 }
 
 /// Clickable UI target recorded during layout.
