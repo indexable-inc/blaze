@@ -8,23 +8,30 @@
 //! of `n` characters takes `O(t * n)` however many `*` it has; glob's own matcher backtracks.
 //!
 //! A [`Pattern`] is a core: it borrows its text and keeps its tokens, and the table a match
-//! fills, in the allocator it was made in ([`Pattern::new_in`]). [`glob`] and [`Tree`] are not
-//! yet: they speak `std::path` and `std::io::Error` and return a vector on the global heap
-//! (wave-1124-sansio, W1 group a's report says what replaces them).
+//! fills, in the allocator it was made in ([`Pattern::new_in`]). [`glob_in`] and [`Tree`] are
+//! sans-IO cores over `&str` paths, [`blaze_own::String`] and [`blaze_own::Vec`] in the caller's
+//! explicit allocator `A`.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 mod tests;
 
 use core::alloc::Allocator;
 use core::fmt;
-#[cfg(feature = "std")]
-use std::alloc::Global;
-#[cfg(feature = "std")]
-use std::path::{Component, Path, PathBuf};
 
-use blaze_own::Vec as OwnVec;
+use blaze_own::{String as OwnString, Vec as OwnVec};
 
 #[inline]
 fn is_separator(c: char) -> bool {
@@ -147,18 +154,6 @@ impl<A: Allocator, B: Allocator> PartialEq<Pattern<'_, B>> for Pattern<'_, A> {
 }
 
 impl<A: Allocator> Eq for Pattern<'_, A> {}
-
-#[cfg(feature = "std")]
-impl<'a> Pattern<'a, Global> {
-    /// `pattern` parsed on the global heap, or glob's error for it.
-    ///
-    /// Deprecated: names no allocator; use [`Pattern::new_in`]. Goes with its last callers,
-    /// blaze-manifest's layout/mod.rs:729 and :759 and blaze-new's lib.rs:1157 (and this
-    /// crate's [`glob`], until it is ported).
-    pub fn new(pattern: &'a str) -> Result<Pattern<'a, Global>, PatternError> {
-        Pattern::new_in(pattern, Global)
-    }
-}
 
 impl<'a, A: Allocator + Clone> Pattern<'a, A> {
     /// `pattern` parsed, its tokens in `alloc` (with the characters it is read through, freed
@@ -303,12 +298,10 @@ impl<'a, A: Allocator + Clone> Pattern<'a, A> {
     }
 
     /// Whether its first token is a literal `.`, so that it may match `.` and `..`.
-    #[cfg(feature = "std")]
     fn leading_dot(&self) -> bool {
         self.tokens.first() == Some(&Token::Char('.'))
     }
 
-    #[cfg(feature = "std")]
     fn recursive(&self) -> bool {
         self.tokens.len() == 1 && self.tokens[0] == Token::AnyRecursiveSequence
     }
@@ -320,75 +313,124 @@ impl<A: Allocator> fmt::Display for Pattern<'_, A> {
     }
 }
 
-#[cfg(feature = "std")]
-mod walk_std {
-    use super::*;
+/// What [`glob_in`] walks: a tree of directories, read through this.
+pub trait Tree<A: Allocator> {
+    /// Error returned when a directory cannot be listed.
+    type Error;
 
-/// What [`glob`] walks: a tree of directories, read through this.
-pub trait Tree {
     /// Whether anything is at `path` (a dangling link counts, as glob's `symlink_metadata`).
-    fn exists(&self, path: &Path) -> bool;
+    fn exists(&self, path: &str) -> bool;
     /// Whether `path` is a directory, following links.
-    fn is_dir(&self, path: &Path) -> bool;
+    fn is_dir(&self, path: &str) -> bool;
     /// The names in a directory, sorted, each with whether it is a directory (not following a
     /// link); names that are not UTF-8 are left out.
-    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool), Global>>;
+    fn list(&self, path: &str, alloc: A) -> Result<OwnVec<(OwnString<A>, bool), A>, Self::Error>;
 }
 
 /// A directory of a pattern that could not be listed, as glob says it.
 #[derive(Debug)]
-pub struct GlobError {
-    pub path: PathBuf,
-    pub error: std::io::Error,
+pub struct GlobError<E, A: Allocator> {
+    pub path: OwnString<A>,
+    pub error: E,
 }
 
-impl fmt::Display for GlobError {
+impl<E: fmt::Display, A: Allocator> fmt::Display for GlobError<E, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "attempting to read `{}` resulted in an error: {}", self.path.display(), self.error)
+        write!(f, "attempting to read `{}` resulted in an error: {}", self.path, self.error)
     }
 }
 
-impl std::error::Error for GlobError {
-    // dyn: std's error chain, read only on an error path.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl<E: core::error::Error + 'static, A: Allocator + fmt::Debug> core::error::Error
+    for GlobError<E, A>
+{
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         Some(&self.error)
     }
 }
 
 /// A path to match against the parts from `at` on; `usize::MAX` for one already matched whole.
-struct Todo {
-    path: PathBuf,
+struct Todo<A: Allocator> {
+    path: OwnString<A>,
     dir: bool,
     at: usize,
 }
 
+/// Splits `pattern` into `(scope, rest)`:
+/// - `"/w/m/*"` -> `("/", "w/m/*")`
+/// - `"/"` -> `("/", "")`
+/// - `"C:/w/m"` -> `("C:/", "w/m")`
+/// - `"crates/*"` -> `(".", "crates/*")`
+fn split_root(pattern: &str) -> (&str, &str, bool) {
+    let bytes = pattern.as_bytes();
+    // Optional drive prefix (`X:/` or `X:\`).
+    let mut prefix = 0;
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        prefix = 2;
+    }
+    let mut sep_end = prefix;
+    while sep_end < bytes.len() && (bytes[sep_end] == b'/' || bytes[sep_end] == b'\\') {
+        sep_end += 1;
+    }
+    if sep_end > 0 {
+        let scope_end = if sep_end > prefix { prefix + 1 } else { prefix };
+        (&pattern[..scope_end], &pattern[sep_end..], true)
+    } else {
+        (".", pattern, false)
+    }
+}
+
+fn join_path<A: Allocator>(dir: &str, name: &str, alloc: A) -> OwnString<A> {
+    let mut out = OwnString::new_in(alloc);
+    out.push_str(dir);
+    if !dir.ends_with('/') && !dir.ends_with('\\') {
+        out.push('/');
+    }
+    out.push_str(name);
+    out
+}
+
+fn file_name(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches(is_separator);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let name = match trimmed.rfind(is_separator) {
+        Some(at) => &trimmed[at + 1..],
+        None => trimmed,
+    };
+    (!name.is_empty()).then_some(name)
+}
+
 /// The paths of `tree` that `pattern` matches, in glob's (alphabetical) order, with a
 /// [`GlobError`] for each directory that could not be listed: glob 0.3's `glob_with` and
-/// `fill_todo` under its default options.
-pub fn glob<T: Tree>(tree: &T, pattern: &str) -> Result<Vec<Result<PathBuf, GlobError>, Global>, PatternError> {
-    Pattern::new(pattern)?;
-    let mut components = Path::new(pattern).components().peekable();
-    while matches!(components.peek(), Some(Component::Prefix(..) | Component::RootDir)) {
-        components.next();
-    }
-    let rest: PathBuf = components.map(|c| c.as_os_str()).collect();
-    let normalized: PathBuf = Path::new(pattern).iter().collect();
-    let root_len = normalized.as_os_str().len() - rest.as_os_str().len();
-    let scope = if root_len > 0 { PathBuf::from(&pattern[..root_len]) } else { PathBuf::from(".") };
+/// `fill_todo` under its default options, all allocations in `alloc`.
+pub fn glob_in<A: Allocator + Clone, T: Tree<A>>(
+    tree: &T,
+    pattern: &str,
+    alloc: A,
+) -> Result<OwnVec<Result<OwnString<A>, GlobError<T::Error, A>>, A>, PatternError> {
+    Pattern::new_in(pattern, alloc.clone())?;
+    let (scope_str, rest, has_root) = split_root(pattern);
+    let scope = OwnString::from_str_in(scope_str, alloc.clone());
 
-    let mut parts = OwnVec::new_in(Global);
-    for component in pattern[root_len.min(pattern.len())..].split_terminator(is_separator) {
-        parts.push(Pattern::new(component)?);
+    let mut parts = OwnVec::new_in(alloc.clone());
+    for component in rest.split_terminator(is_separator) {
+        if component.is_empty() {
+            continue;
+        }
+        parts.push(Pattern::new_in(component, alloc.clone())?);
     }
-    if root_len == pattern.len() {
-        parts.push(Pattern::new("")?);
+    if has_root && rest.is_empty() {
+        parts.push(Pattern::new_in("", alloc.clone())?);
     }
     let require_dir = pattern.chars().next_back().is_some_and(is_separator);
 
-    let mut out = Vec::new_in(Global);
-    let mut todo: OwnVec<Result<Todo, GlobError>, Global> = OwnVec::new_in(Global);
-    let scope_dir = tree.is_dir(&scope);
-    fill(tree, &mut todo, &parts, 0, &scope, scope_dir);
+    let mut out = OwnVec::new_in(alloc.clone());
+    let mut todo: OwnVec<Result<Todo<A>, GlobError<T::Error, A>>, A> = OwnVec::new_in(alloc.clone());
+    let scope_dir = tree.is_dir(scope.as_str());
+    if !parts.is_empty() {
+        fill(tree, &mut todo, &parts, 0, scope.as_str(), scope_dir, &alloc);
+    }
     while let Some(next) = todo.pop() {
         let Todo { path, dir, mut at } = match next {
             Ok(next) => next,
@@ -409,7 +451,7 @@ pub fn glob<T: Tree>(tree: &T, pattern: &str) -> Result<Vec<Result<PathBuf, Glob
                 last += 1;
             }
             if dir {
-                fill(tree, &mut todo, &parts, last, &path, dir);
+                fill(tree, &mut todo, &parts, last, path.as_str(), dir, &alloc);
                 if last == parts.len() - 1 {
                     out.push(Ok(path));
                     continue;
@@ -421,60 +463,64 @@ pub fn glob<T: Tree>(tree: &T, pattern: &str) -> Result<Vec<Result<PathBuf, Glob
                 at = last + 1;
             }
         }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        let Some(name) = file_name(path.as_str()) else { continue };
         if parts[at].matches(name) {
             if at == parts.len() - 1 {
                 if !require_dir || dir {
                     out.push(Ok(path));
                 }
             } else {
-                fill(tree, &mut todo, &parts, at + 1, &path, dir);
+                fill(tree, &mut todo, &parts, at + 1, path.as_str(), dir, &alloc);
             }
         }
     }
     Ok(out)
 }
 
-fn fill<T: Tree>(tree: &T, todo: &mut OwnVec<Result<Todo, GlobError>, Global>, parts: &[Pattern<'_, Global>], at: usize, path: &Path, dir: bool) {
-    let add = |todo: &mut OwnVec<Result<Todo, GlobError>, Global>, next: PathBuf| {
-        let next_dir = tree.is_dir(&next);
+fn fill<A: Allocator + Clone, T: Tree<A>>(
+    tree: &T,
+    todo: &mut OwnVec<Result<Todo<A>, GlobError<T::Error, A>>, A>,
+    parts: &[Pattern<'_, A>],
+    at: usize,
+    path: &str,
+    dir: bool,
+    alloc: &A,
+) {
+    let add = |todo: &mut OwnVec<Result<Todo<A>, GlobError<T::Error, A>>, A>, next: OwnString<A>| {
+        let next_dir = tree.is_dir(next.as_str());
         if at + 1 == parts.len() {
             todo.push(Ok(Todo { path: next, dir: next_dir, at: usize::MAX }));
         } else {
-            fill(tree, todo, parts, at + 1, &next, next_dir);
+            fill(tree, todo, parts, at + 1, next.as_str(), next_dir, alloc);
         }
     };
     let part = &parts[at];
-    let curdir = path == Path::new(".");
+    let curdir = path == ".";
     if !part.meta {
         let s = part.as_str();
         let special = s == "." || s == "..";
-        let next = if curdir { PathBuf::from(s) } else { path.join(s) };
-        if (special && dir) || (!special && tree.exists(&next)) {
+        let next = if curdir { OwnString::from_str_in(s, alloc.clone()) } else { join_path(path, s, alloc.clone()) };
+        if (special && dir) || (!special && tree.exists(next.as_str())) {
             add(todo, next);
         }
     } else if dir {
-        match tree.list(path) {
+        match tree.list(path, alloc.clone()) {
             Ok(names) => {
                 for (name, is_dir) in names.into_iter().rev() {
-                    let child = if curdir { PathBuf::from(&name) } else { path.join(&name) };
+                    let child = if curdir { name } else { join_path(path, name.as_str(), alloc.clone()) };
                     // glob follows a link to learn whether it is a directory.
-                    let child_dir = is_dir || tree.is_dir(&child);
+                    let child_dir = is_dir || tree.is_dir(child.as_str());
                     todo.push(Ok(Todo { path: child, dir: child_dir, at }));
                 }
                 if part.leading_dot() {
                     for special in [".", ".."] {
                         if part.matches(special) {
-                            add(todo, path.join(special));
+                            add(todo, join_path(path, special, alloc.clone()));
                         }
                     }
                 }
             }
-            Err(error) => todo.push(Err(GlobError { path: path.to_path_buf(), error })),
+            Err(error) => todo.push(Err(GlobError { path: OwnString::from_str_in(path, alloc.clone()), error })),
         }
     }
 }
-}
-
-#[cfg(feature = "std")]
-pub use walk_std::{GlobError, Tree, glob};

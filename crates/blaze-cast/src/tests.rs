@@ -6,6 +6,8 @@
 //! The invariant: for every function `f: F -> T` here and every `x: F`, `f(x)` and `x as T`
 //! are the same bits; for every composition the lint writes for `x as T`, the same.
 
+use std::{vec, vec::Vec};
+
 use blaze_sim::Config;
 
 use super::*;

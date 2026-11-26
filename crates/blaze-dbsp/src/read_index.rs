@@ -1,7 +1,7 @@
-use std::hash::Hash;
+use core::{alloc::Allocator, hash::Hash};
 
 use blaze_hash::{FixedState, Map, MapOpts};
-use std::alloc::Global;
+use blaze_own::Vec as OwnVec;
 
 /// [`ReadIndex::forget_many`] sweeps once the readers it forgets hold at least one in this many
 /// of the edges: a one-at-a-time forget costs about three probes at random per edge it drops,
@@ -16,30 +16,36 @@ const SWEEP_SHARE: usize = 4;
 /// [`ReadIndex::forget`], are `O(1)` (a swap-remove and one fix-up per side). A row left empty
 /// goes on a free list with its buffer, which the next new handle takes.
 #[derive(Debug)]
-pub struct ReadIndex<K, R> {
-    by_key: Side<K, R>,
-    by_reader: Side<R, K>,
+pub struct ReadIndex<K, R, A: Allocator> {
+    by_key: Side<K, R, A>,
+    by_reader: Side<R, K, A>,
     /// (key row, reader row) -> (place in the key's list, place in the reader's list).
-    pairs: Map<(u32, u32), (u32, u32), FixedState, Global>,
+    pairs: Map<(u32, u32), (u32, u32), FixedState, A>,
 }
 
 #[derive(Debug)]
-struct Side<A, B> {
-    slot: Map<A, u32, FixedState, Global>,
-    rows: Vec<Row<A, B>>,
-    free: Vec<u32>,
+struct Side<T, U, A: Allocator> {
+    alloc: A,
+    slot: Map<T, u32, FixedState, A>,
+    rows: OwnVec<Row<T, U, A>, A>,
+    free: OwnVec<u32, A>,
 }
 
 #[derive(Debug)]
-struct Row<A, B> {
-    owner: A,
+struct Row<T, U, A: Allocator> {
+    owner: T,
     /// The other side's handle and its row.
-    items: Vec<(B, u32)>,
+    items: OwnVec<(U, u32), A>,
 }
 
-impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
-    fn new() -> Self {
-        Side { slot: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
+impl<T: Copy + Eq + Hash, U: Copy, A: Allocator + Clone> Side<T, U, A> {
+    fn new_in(alloc: A) -> Self {
+        Side {
+            slot: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            rows: OwnVec::new_in(alloc.clone()),
+            free: OwnVec::new_in(alloc.clone()),
+            alloc,
+        }
     }
 
     #[expect(
@@ -47,7 +53,7 @@ impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
         reason = "row handles are u32 and freed rows are reused first: 2^32 live owners at once \
                   needs a typed refusal from the index"
     )]
-    fn intern(&mut self, a: A) -> u32 {
+    fn intern(&mut self, a: T) -> u32 {
         if let Some(&at) = self.slot.get(&a) {
             return at;
         }
@@ -58,7 +64,7 @@ impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
             }
             None => {
                 let at = u32::try_from(self.rows.len()).expect("more than `u32::MAX` handles");
-                self.rows.push(Row { owner: a, items: Vec::new() });
+                self.rows.push(Row { owner: a, items: OwnVec::new_in(self.alloc.clone()) });
                 at
             }
         };
@@ -66,7 +72,7 @@ impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
         at
     }
 
-    fn items(&self, a: A) -> &[(B, u32)] {
+    fn items(&self, a: T) -> &[(U, u32)] {
         match self.slot.get(&a) {
             Some(&at) => &self.rows[at as usize].items,
             None => &[],
@@ -76,7 +82,7 @@ impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
     /// Swap-removes item `at` of row `row`: the row of the item moved into its place, if any.
     fn remove_at(&mut self, row: u32, at: u32) -> Option<u32> {
         let items = &mut self.rows[row as usize].items;
-        items.swap_remove(at as usize);
+        items.remove_swap(at as usize);
         items.get(at as usize).map(|moved| moved.1)
     }
 
@@ -88,15 +94,13 @@ impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
     }
 }
 
-impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> Default for ReadIndex<K, R> {
-    fn default() -> Self {
-        ReadIndex::new()
-    }
-}
-
-impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
-    pub fn new() -> Self {
-        ReadIndex { by_key: Side::new(), by_reader: Side::new(), pairs: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }
+impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash, A: Allocator + Clone> ReadIndex<K, R, A> {
+    pub fn new_in(alloc: A) -> Self {
+        ReadIndex {
+            by_key: Side::new_in(alloc.clone()),
+            by_reader: Side::new_in(alloc.clone()),
+            pairs: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+        }
     }
 
     pub fn add(&mut self, key: K, reader: R) {
@@ -116,7 +120,10 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
 
     pub fn forget(&mut self, reader: R) {
         let Some(&r) = self.by_reader.slot.get(&reader) else { return };
-        let items = std::mem::take(&mut self.by_reader.rows[r as usize].items);
+        let items = core::mem::replace(
+            &mut self.by_reader.rows[r as usize].items,
+            OwnVec::new_in(self.by_reader.alloc.clone()),
+        );
         for &(_, k) in &items {
             let (in_key, _) =
                 self.pairs.remove(&(k, r)).expect("a read index edge without its pair");
@@ -141,14 +148,14 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
     /// impls maintainer resetting every crate a proc macro reached) is then a sweep, not three
     /// probes at random per edge, and leaves the pair map with no tombstones to probe past.
     pub fn forget_many(&mut self, readers: impl IntoIterator<Item = R>) {
-        // alloc: once per call, a flag per reader row
-        let mut dropped = vec![false; self.by_reader.rows.len()];
-        // alloc: once per call, the rows of the readers forgotten
-        let mut gone: Vec<u32> = Vec::new();
+        let alloc = self.by_reader.alloc.clone();
+        let mut dropped = OwnVec::new_in(alloc.clone());
+        dropped.resize(self.by_reader.rows.len(), false);
+        let mut gone: OwnVec<u32, A> = OwnVec::new_in(alloc);
         let mut edges = 0usize;
         for reader in readers {
             let Some(&r) = self.by_reader.slot.get(&reader) else { continue };
-            if !std::mem::replace(&mut dropped[r as usize], true) {
+            if !core::mem::replace(&mut dropped[r as usize], true) {
                 gone.push(r);
                 edges += self.by_reader.rows[r as usize].items.len();
             }
@@ -170,8 +177,7 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
     fn sweep(&mut self, dropped: &[bool], gone: &[u32]) {
         let ReadIndex { by_key, by_reader, pairs } = self;
         pairs.retain(|&(_, r), _| !dropped[r as usize]);
-        // alloc: once per sweep, the key rows that lost an edge and kept others
-        let mut changed: Vec<u32> = Vec::new();
+        let mut changed: OwnVec<u32, A> = OwnVec::new_in(by_key.alloc.clone());
         for k in 0..by_key.rows.len() {
             let items = &mut by_key.rows[k].items;
             let before = items.len();
@@ -260,7 +266,7 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
     }
 }
 
-impl<A, B> Side<A, B> {
+impl<T, U, A: Allocator> Side<T, U, A> {
     fn clear(&mut self) {
         self.slot.clear();
         self.rows.clear();

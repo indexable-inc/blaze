@@ -1,15 +1,18 @@
+use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{vec, vec::Vec};
 
+use blaze_own::Vec as OwnVec;
 use blaze_sim::{Config, Tape};
 
 use crate::{
-    Arrangement, Closure, Pos, ReadIndex, SeqDiff, SliceHasher, Weight, Worklist, ZSet, closure,
-    diff_seq,
+    Arrangement, Closure, Pos, ReadIndex, SeqDiff, SliceHasher, Weight, Worklist, ZSet,
+    closure_in, diff_seq,
 };
 
 #[test]
 fn positions_sort_in_text_order() {
-    let root = Pos::root();
+    let root = Pos::root_in(Global);
     let m = root.child(3);
     let op = m.child(0);
     let expansion = op.child(7);
@@ -25,14 +28,14 @@ fn positions_sort_in_text_order() {
 
 #[test]
 fn a_child_is_one_allocation() {
-    let deep = Pos(vec![1, 2, 3, 4, 5]);
+    let deep = Pos::from_slice_in(&[1, 2, 3, 4, 5], Global);
     let (_, used) = blaze_alloc_count::measure(|| deep.child(6));
     assert_eq!(used.allocations, 1);
 }
 
 #[test]
 fn zset_consolidates() {
-    let mut set = ZSet::new();
+    let mut set = ZSet::new_in(Global);
     set.push(3, 1);
     set.push(1, 2);
     set.push(3, -1);
@@ -49,7 +52,7 @@ fn zset_consolidates() {
 #[test]
 #[should_panic(expected = "before `consolidate`")]
 fn an_unconsolidated_zset_is_not_read() {
-    let mut set = ZSet::new();
+    let mut set = ZSet::new_in(Global);
     set.push(2, 1);
     set.push(1, 1);
     let _ = set.len();
@@ -57,7 +60,7 @@ fn an_unconsolidated_zset_is_not_read() {
 
 #[test]
 fn pushes_in_order_stay_consolidated() {
-    let mut set = ZSet::with_capacity(4);
+    let mut set = ZSet::with_capacity_in(4, Global);
     set.push(1, 1);
     set.push(2, -1);
     set.push(5, 3);
@@ -77,7 +80,7 @@ fn zset_matches_a_btreemap() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let rows: Vec<(u8, i32)> = tape
             .vec(0..=63, "rows", |tape| (tape.int_in(0u8..=15, "row"), tape.int_in(-3i32..=3, "weight")));
-        let mut set = ZSet::new();
+        let mut set = ZSet::new_in(Global);
         let mut model = BTreeMap::<u8, Weight>::new();
         for &(t, w) in &rows {
             set.push(t, w);
@@ -93,26 +96,26 @@ fn zset_matches_a_btreemap() {
 
 #[test]
 fn diff_skips_prefix_and_suffix() {
-    let mut out = SeqDiff::new();
+    let mut out = SeqDiff::new_in(Global);
     diff_seq(&[1, 2, 3, 4, 5], &[1, 2, 9, 4, 5], &mut out);
-    assert_eq!(out, SeqDiff { removed: vec![2], added: vec![2] });
+    assert_eq!((out.removed.as_slice(), out.added.as_slice()), (&[2][..], &[2][..]));
     diff_seq(&[1, 2, 3], &[1, 2, 3], &mut out);
     assert!(out.is_empty());
     diff_seq(&[1, 2], &[1, 7, 2], &mut out);
-    assert_eq!(out, SeqDiff { removed: vec![], added: vec![1] });
+    assert_eq!((out.removed.as_slice(), out.added.as_slice()), (&[][..], &[1][..]));
     diff_seq(&[1, 7, 7, 2], &[1, 2], &mut out);
-    assert_eq!(out, SeqDiff { removed: vec![1, 2], added: vec![] });
+    assert_eq!((out.removed.as_slice(), out.added.as_slice()), (&[1, 2][..], &[][..]));
 }
 
 #[test]
 fn diff_keeps_a_moved_item() {
-    let mut out = SeqDiff::new();
+    let mut out = SeqDiff::new_in(Global);
     // `a` moves from the front to the back: only the moved item is in the middle twice, and
     // every item of the middle is kept, so nothing is removed or added.
     diff_seq(&["a", "b", "c"], &["b", "c", "a"], &mut out);
     assert!(out.is_empty(), "{out:?}");
     diff_seq(&["x", "a", "a", "y"], &["z", "a", "w"], &mut out);
-    assert_eq!(out, SeqDiff { removed: vec![0, 2, 3], added: vec![0, 2] });
+    assert_eq!((out.removed.as_slice(), out.added.as_slice()), (&[0, 2, 3][..], &[0, 2][..]));
 }
 
 #[test]
@@ -121,11 +124,11 @@ fn a_warm_diff_allocates_nothing() {
     let mut new = old.clone();
     new[100] = 9999;
     new.swap(10, 150);
-    let mut out = SeqDiff::new();
+    let mut out = SeqDiff::new_in(Global);
     diff_seq(&old, &new, &mut out);
     let (_, used) = blaze_alloc_count::measure(|| diff_seq(&old, &new, &mut out));
     assert_eq!(used.allocations, 0);
-    assert_eq!(out, SeqDiff { removed: vec![100], added: vec![100] });
+    assert_eq!((out.removed.as_slice(), out.added.as_slice()), (&[100][..], &[100][..]));
 }
 
 #[test]
@@ -137,7 +140,7 @@ fn diff_is_the_multiset_difference() {
 fn diff_case(tape: &Tape) {
     let old: Vec<u8> = tape.vec(0..=39, "old", |tape| tape.int_in(0u8..=7, "old item"));
     let new: Vec<u8> = tape.vec(0..=39, "new", |tape| tape.int_in(0u8..=7, "new item"));
-    let mut out = SeqDiff::new();
+    let mut out = SeqDiff::new_in(Global);
     diff_seq(&old, &new, &mut out);
     assert!(out.removed.windows(2).all(|w| w[0] < w[1]));
     assert!(out.added.windows(2).all(|w| w[0] < w[1]));
@@ -170,7 +173,7 @@ fn diff_case(tape: &Tape) {
 
 #[test]
 fn read_index_both_ways() {
-    let mut index = ReadIndex::<(u32, u32), u32>::new();
+    let mut index = ReadIndex::<(u32, u32), u32, Global>::new_in(Global);
     index.add((1, 10), 100);
     index.add((1, 10), 100);
     index.add((1, 10), 101);
@@ -193,7 +196,7 @@ fn read_index_both_ways() {
 
 #[test]
 fn read_index_lookups_allocate_nothing() {
-    let mut index = ReadIndex::<u32, u32>::new();
+    let mut index = ReadIndex::<u32, u32, Global>::new_in(Global);
     for reader in 0..100 {
         for key in 0..8 {
             index.add(reader * 3 + key, reader);
@@ -254,7 +257,7 @@ fn read_index_matches_a_set_of_pairs() {
 /// One case of [`read_index_matches_a_set_of_pairs`].
 fn read_index_case(tape: &Tape) {
     let ops: Vec<IndexOp> = tape.vec(0..=199, "ops", index_op);
-    let mut index = ReadIndex::<u8, u8>::new();
+    let mut index = ReadIndex::<u8, u8, Global>::new_in(Global);
     let mut model = BTreeSet::<(u8, u8)>::new();
     for op in ops {
         match op {
@@ -296,15 +299,15 @@ fn read_index_case(tape: &Tape) {
 
 #[test]
 fn arrangement_orders_and_tracks_changes() {
-    let mut arr = Arrangement::<u32, Pos, u32>::new();
-    let p = |at: u32| Pos::root().child(at);
+    let mut arr = Arrangement::<u32, Pos<Global>, u32, Global>::new_in(Global);
+    let p = |at: u32| Pos::root_in(Global).child(at);
     arr.update(1, p(5), 50, 1);
     arr.update(1, p(2), 20, 1);
     arr.update(2, p(1), 10, 1);
     assert_eq!(arr.get(1).collect::<Vec<_>>(), vec![20, 50]);
-    let mut changed = Vec::new();
+    let mut changed = OwnVec::new_in(Global);
     arr.take_changed(&mut changed);
-    assert_eq!(changed, vec![1, 2]);
+    assert_eq!(changed.as_slice(), &[1, 2]);
     // A weight going 1 -> 2 changes nothing visible.
     arr.update(1, p(2), 20, 1);
     changed.clear();
@@ -322,12 +325,12 @@ fn arrangement_orders_and_tracks_changes() {
     assert_eq!(keys, vec![1]);
     changed.clear();
     arr.take_changed(&mut changed);
-    assert_eq!(changed, vec![1, 2]);
+    assert_eq!(changed.as_slice(), &[1, 2]);
 }
 
 #[test]
 fn arrangement_lookups_allocate_nothing() {
-    let mut arr = Arrangement::<u32, u32, u32>::new();
+    let mut arr = Arrangement::<u32, u32, u32, Global>::new_in(Global);
     for key in 0..50 {
         for v in 0..10 {
             arr.update(key, v * 7 % 10, key * 100 + v, 1);
@@ -344,7 +347,7 @@ fn arrangement_lookups_allocate_nothing() {
     assert!(sum > 0);
     assert_eq!(used.allocations, 0, "an arrangement lookup allocates nothing");
     // A key emptied and refilled takes its old buffer back.
-    let mut changed = Vec::with_capacity(64);
+    let mut changed = OwnVec::with_capacity_in(64, Global);
     arr.take_changed(&mut changed);
     for v in 0..10 {
         arr.update(3, v * 7 % 10, 300 + v, -1);
@@ -374,11 +377,11 @@ fn arrangement_case(tape: &Tape) {
             tape.int_in(-2i32..=2, "weight"),
         )
     });
-    let mut arr = Arrangement::<u8, u8, u8>::new();
+    let mut arr = Arrangement::<u8, u8, u8, Global>::new_in(Global);
     // key -> (sort, value) -> weight.
     let mut model = BTreeMap::<u8, BTreeMap<(u8, u8), Weight>>::new();
     let mut visible_before = BTreeMap::<u8, Vec<(u8, u8)>>::new();
-    let mut changed = Vec::new();
+    let mut changed = OwnVec::new_in(Global);
     for (key, sort, value, w) in ops {
         arr.update(key, sort, value, w);
         *model.entry(key).or_default().entry((sort, value)).or_default() += w;
@@ -418,16 +421,17 @@ fn closure_is_bfs_and_visits_each_once() {
         [(1, vec![2, 3]), (2, vec![4, 1]), (3, vec![4]), (4, vec![1, 5]), (6, vec![1])]
             .into_iter()
             .collect();
-    let mut out = vec![99];
-    closure([1, 1], |n, next| next.extend(edges.get(&n).into_iter().flatten()), &mut out);
-    assert_eq!(out, vec![1, 2, 3, 4, 5]);
+    let mut out = OwnVec::new_in(Global);
+    out.push(99);
+    closure_in([1, 1], |n, next| next.extend(edges.get(&n).into_iter().flatten().copied()), &mut out, Global);
+    assert_eq!(out.as_slice(), &[1, 2, 3, 4, 5]);
 }
 
 #[test]
 fn a_warm_closure_allocates_nothing() {
-    let mut region = Closure::new();
-    let mut out = Vec::new();
-    let step = |n: u32, next: &mut Vec<u32>| {
+    let mut region = Closure::new_in(Global);
+    let mut out = OwnVec::new_in(Global);
+    let step = |n: u32, next: &mut OwnVec<u32, Global>| {
         if n < 500 {
             next.push(n * 2);
             next.push(n * 2 + 1);
@@ -449,11 +453,11 @@ fn closure_case(tape: &Tape) {
     let edges: Vec<(u8, u8)> = tape
         .vec(0..=59, "edges", |tape| (tape.int_in(0u8..=19, "edge from"), tape.int_in(0u8..=19, "edge to")));
     let seeds: Vec<u8> = tape.vec(0..=3, "seeds", |tape| tape.int_in(0u8..=19, "seed"));
-    let step = |n: u8, next: &mut Vec<u8>| {
+    let step = |n: u8, next: &mut OwnVec<u8, Global>| {
         next.extend(edges.iter().filter(|e| e.0 == n).map(|e| e.1));
     };
-    let mut out = Vec::new();
-    closure(seeds.iter().copied(), step, &mut out);
+    let mut out = OwnVec::new_in(Global);
+    closure_in(seeds.iter().copied(), step, &mut out, Global);
     let mut want = Vec::new();
     let mut queue = VecDeque::new();
     for &seed in &seeds {
@@ -470,12 +474,12 @@ fn closure_case(tape: &Tape) {
             }
         }
     }
-    assert_eq!(out, want);
+    assert_eq!(out.as_slice(), want.as_slice());
 }
 
 #[test]
 fn worklist_is_a_fifo_set() {
-    let mut work = Worklist::new();
+    let mut work = Worklist::new_in(Global);
     assert!(work.push(1));
     assert!(work.push(2));
     assert!(!work.push(1));
@@ -490,7 +494,7 @@ fn worklist_is_a_fifo_set() {
 
 #[test]
 fn a_warm_worklist_allocates_nothing() {
-    let mut work = Worklist::new();
+    let mut work = Worklist::new_in(Global);
     (0..256u32).for_each(|it| _ = work.push(it));
     while work.pop().is_some() {}
     let (_, used) = blaze_alloc_count::measure(|| {
@@ -509,7 +513,7 @@ fn worklist_matches_a_naive_queue() {
 fn worklist_case(tape: &Tape) {
     let ops: Vec<Option<u8>> =
         tape.vec(0..=99, "ops", |tape| tape.option("push", |tape| tape.int_in(0u8..=9, "pushed")));
-    let mut work = Worklist::new();
+    let mut work = Worklist::new_in(Global);
     let mut model = VecDeque::new();
     for op in ops {
         match op {

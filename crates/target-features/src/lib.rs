@@ -8,11 +8,19 @@
 //! AArch64 and `sse2` on x86). Nothing is interned, hashed or allocated to ask whether a
 //! feature is enabled.
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate std;
 
-extern crate alloc;
 use core::fmt;
 
 use blaze_ids::bits::{BitArray, BitIndex};

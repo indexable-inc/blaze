@@ -1,4 +1,7 @@
+use std::alloc::Global;
 use std::path::{Path, PathBuf};
+use std::string::{String, ToString};
+use std::vec::Vec;
 
 use super::*;
 
@@ -51,7 +54,6 @@ fn patterns_match_as_glob_s_do() {
     ];
     for &(pattern, text, want) in cases {
         let parsed = Pattern::new_in(pattern, Global).unwrap_or_else(|e| panic!("{pattern}: {e}"));
-        assert_eq!(Pattern::new(pattern).as_ref(), Ok(&parsed), "the deprecated form is the same");
         assert_eq!(parsed.matches(text), want, "{pattern:?} on {text:?}");
         assert_eq!(naive(&parsed, text), want, "naive {pattern:?} on {text:?}");
     }
@@ -72,17 +74,17 @@ fn bad_patterns_are_glob_s_errors() {
         ("[!]", 0, Refusal::InvalidRange),
     ];
     for &(pattern, pos, refusal) in cases {
-        assert_eq!(Pattern::new(pattern), Err(PatternError { pos, refusal }), "{pattern:?}");
+        assert_eq!(Pattern::new_in(pattern, Global), Err(PatternError { pos, refusal }), "{pattern:?}");
     }
-    let shown = Pattern::new("[").unwrap_err().to_string();
+    let shown = Pattern::new_in("[", Global).unwrap_err().to_string();
     assert_eq!(shown, "Pattern syntax error near position 0: invalid range pattern");
 }
 
 #[test]
 fn metachars_are_glob_s() {
-    assert!(!Pattern::new("abc").unwrap().has_metachars());
+    assert!(!Pattern::new_in("abc", Global).unwrap().has_metachars());
     for it in ["a*", "?", "[a]"] {
-        assert!(Pattern::new(it).unwrap().has_metachars(), "{it}");
+        assert!(Pattern::new_in(it, Global).unwrap().has_metachars(), "{it}");
     }
 }
 
@@ -142,7 +144,7 @@ fn the_table_is_the_backtracker() {
     blaze_sim::check_kept(blaze_sim::Config::DEFAULT, blaze_sim::sim_kept!(), |tape| {
         let pattern: String = tape.vec(0..=6, "pattern", |tape| *tape.one_of(PIECES, "piece")).concat();
         let text: String = tape.vec(0..=8, "text", |tape| *tape.one_of(LETTERS, "char")).into_iter().collect();
-        if let Ok(parsed) = Pattern::new(&pattern) {
+        if let Ok(parsed) = Pattern::new_in(&pattern, Global) {
             assert_eq!(parsed.matches(&text), naive(&parsed, &text), "{pattern:?} on {text:?}");
         }
     });
@@ -165,23 +167,27 @@ impl Mem {
     }
 }
 
-impl Tree for Mem {
-    fn exists(&self, path: &Path) -> bool {
-        self.0.contains_key(path)
+impl Tree<Global> for Mem {
+    type Error = std::io::Error;
+
+    fn exists(&self, path: &str) -> bool {
+        self.0.contains_key(Path::new(path))
     }
 
-    fn is_dir(&self, path: &Path) -> bool {
-        self.0.get(path) == Some(&true)
+    fn is_dir(&self, path: &str) -> bool {
+        self.0.get(Path::new(path)) == Some(&true)
     }
 
-    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool), Global>> {
-        if !self.is_dir(path) {
+    fn list(&self, path: &str, alloc: Global) -> Result<OwnVec<(OwnString<Global>, bool), Global>, Self::Error> {
+        let path = Path::new(path);
+        if self.0.get(path) != Some(&true) {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         }
-        let mut out = Vec::new_in(Global);
+        let mut out = OwnVec::new_in(alloc);
         for (child, dir) in &self.0 {
             if child.parent() == Some(path) {
-                out.push((child.file_name().unwrap().to_str().unwrap().to_owned(), *dir));
+                let name = child.file_name().unwrap().to_str().unwrap();
+                out.push((OwnString::from_str_in(name, alloc), *dir));
             }
         }
         Ok(out)
@@ -189,7 +195,7 @@ impl Tree for Mem {
 }
 
 fn walked(tree: &Mem, pattern: &str) -> Vec<String> {
-    glob(tree, pattern).unwrap().into_iter().map(|it| it.unwrap().display().to_string()).collect()
+    glob_in(tree, pattern, Global).unwrap().into_iter().map(|it| it.unwrap().as_str().to_string()).collect()
 }
 
 #[test]

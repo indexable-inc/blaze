@@ -16,10 +16,10 @@
 //! Pure data and pure functions: the front end names the levels (the attribute), the code
 //! generator the unit's features, std's detection the CPU's.
 
-use alloc::{borrow::ToOwned, boxed::Box, string::String, string::ToString, vec::Vec};
-use core::fmt;
+use core::{alloc::Allocator, fmt};
 
 use blaze_ids::{ContentId, Hasher};
+use blaze_own::{FixedVec, String as OwnString, Vec as OwnVec};
 
 use crate::{TargetArch, TargetFeature, TargetFeatureSet, cpus};
 
@@ -42,10 +42,10 @@ pub fn default_levels(arch: TargetArch) -> &'static [&'static str] {
 
 /// One clone of a multiversioned function: the level it was named by and what it is compiled
 /// with.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Level {
+#[derive(Debug)]
+pub struct Level<A: Allocator> {
     /// The level as the attribute (or [`default_levels`]) wrote it.
-    pub name: Box<str>,
+    pub name: OwnString<A>,
     /// Every feature the clone's code may use: the unit's and the level's, with what each
     /// implies. Part of the clone's code identity.
     pub features: TargetFeatureSet,
@@ -54,20 +54,40 @@ pub struct Level {
     pub added: TargetFeatureSet,
 }
 
+impl<A: Allocator + Clone> Clone for Level<A> {
+    fn clone(&self) -> Self {
+        Level {
+            name: OwnString::from_str_in(self.name.as_str(), self.name.allocator().clone()),
+            features: self.features,
+            added: self.added,
+        }
+    }
+}
+
+impl<A: Allocator, B: Allocator> PartialEq<Level<B>> for Level<A> {
+    fn eq(&self, other: &Level<B>) -> bool {
+        self.name.as_str() == other.name.as_str()
+            && self.features == other.features
+            && self.added == other.added
+    }
+}
+
+impl<A: Allocator> Eq for Level<A> {}
+
 /// Why a function's levels are no plan.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Refusal {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refusal<'a> {
     /// Level `at` (from 0) is empty, or names an empty feature (`"avx2,,fma"`).
     Empty { at: usize },
     /// `name`, in level `level`, is no CPU of the target and no target feature of its arch.
-    Unknown { level: String, name: String, triple: String },
+    Unknown { level: &'a str, name: &'a str, triple: &'a str },
     /// Two levels come to one set of features: their clones would be one code under two names.
-    Same { first: String, second: String },
+    Same { first: &'a str, second: &'a str },
     /// More than [`MOST_LEVELS`] levels.
     TooMany { levels: usize },
 }
 
-impl fmt::Display for Refusal {
+impl fmt::Display for Refusal<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Refusal::Empty { at } => write!(
@@ -99,6 +119,8 @@ impl fmt::Display for Refusal {
     }
 }
 
+impl core::error::Error for Refusal<'_> {}
+
 /// What [`Plan::select`] picked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Selected {
@@ -110,30 +132,53 @@ pub enum Selected {
 
 /// The clones of one multiversioned function in one unit, in the order its levels were declared:
 /// least preferred first.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Plan {
+#[derive(Debug)]
+pub struct Plan<A: Allocator> {
     arch: TargetArch,
     /// The unit's features with what they imply: the baseline's set.
     unit: TargetFeatureSet,
-    clones: Vec<Level>,
+    clones: OwnVec<Level<A>, A>,
 }
 
-impl Plan {
+impl<A: Allocator + Clone> Clone for Plan<A> {
+    fn clone(&self) -> Self {
+        let mut clones = OwnVec::with_capacity_in(self.clones.len(), self.clones.allocator().clone());
+        for clone in &self.clones {
+            clones.push(clone.clone());
+        }
+        Plan { arch: self.arch, unit: self.unit, clones }
+    }
+}
+
+impl<A: Allocator, B: Allocator> PartialEq<Plan<B>> for Plan<A> {
+    fn eq(&self, other: &Plan<B>) -> bool {
+        self.arch == other.arch
+            && self.unit == other.unit
+            && self.clones.len() == other.clones.len()
+            && self.clones.iter().zip(other.clones.iter()).all(|(a, b)| a == b)
+    }
+}
+
+impl<A: Allocator> Eq for Plan<A> {}
+
+impl<A: Allocator + Clone> Plan<A> {
     /// The plan of `levels` (the attribute's list; [`default_levels`] of `arch` when it is
-    /// empty) for a unit of target `triple` compiled with `unit`.
-    pub fn new(
-        triple: &str,
+    /// empty) for a unit of target `triple` compiled with `unit`, storing clone names and table
+    /// in `alloc`.
+    pub fn new_in<'a>(
+        triple: &'a str,
         arch: TargetArch,
         unit: &TargetFeatureSet,
-        levels: &[&str],
-    ) -> Result<Plan, Refusal> {
+        levels: &[&'a str],
+        alloc: A,
+    ) -> Result<Plan<A>, Refusal<'a>> {
         let levels = if levels.is_empty() { default_levels(arch) } else { levels };
         if levels.len() > MOST_LEVELS {
             return Err(Refusal::TooMany { levels: levels.len() });
         }
         let unit = unit.implied_in(arch);
-        // alloc: per multiversioned function and unit, at most `MOST_LEVELS` clones
-        let mut clones: Vec<Level> = Vec::with_capacity(levels.len());
+        let mut clones: OwnVec<Level<A>, A> = OwnVec::with_capacity_in(levels.len(), alloc.clone());
+        let mut names: FixedVec<&'a str, MOST_LEVELS> = FixedVec::new();
         for (at, &name) in levels.iter().enumerate() {
             let named = level_features(triple, arch, at, name)?;
             let features = unit.union(&named).implied_in(arch);
@@ -143,21 +188,19 @@ impl Plan {
                 // The unit already has the level: its clone would be the baseline again.
                 continue;
             }
-            if let Some(first) = clones.iter().find(|it| it.features == features) {
-                // alloc: an error, naming both levels
-                return Err(Refusal::Same {
-                    first: first.name.to_string(),
-                    second: name.to_owned(),
-                });
+            if let Some(first_at) = clones.iter().position(|it| it.features == features) {
+                return Err(Refusal::Same { first: names[first_at], second: name });
             }
-            // alloc: the level's name, kept for errors, the key and debug names
-            clones.push(Level { name: name.into(), features, added });
+            let _ = names.push(name);
+            clones.push(Level { name: OwnString::from_str_in(name, alloc.clone()), features, added });
         }
         Ok(Plan { arch, unit, clones })
     }
+}
 
+impl<A: Allocator> Plan<A> {
     /// The clones, least preferred first. Empty when the unit has every level already.
-    pub fn clones(&self) -> &[Level] {
+    pub fn clones(&self) -> &[Level<A>] {
         &self.clones
     }
 
@@ -200,21 +243,16 @@ fn hash_set(hasher: &mut Hasher, set: &TargetFeatureSet) {
 
 /// The features level `name` (the `at`th) names on target `triple`: a CPU's, as rustc gives
 /// them, or each feature of a comma-separated list, which must be of `arch`'s table.
-fn level_features(
-    triple: &str,
+fn level_features<'a>(
+    triple: &'a str,
     arch: TargetArch,
     at: usize,
-    name: &str,
-) -> Result<TargetFeatureSet, Refusal> {
+    name: &'a str,
+) -> Result<TargetFeatureSet, Refusal<'a>> {
     if name.is_empty() {
         return Err(Refusal::Empty { at });
     }
-    // alloc: an error, naming the level, the name and the target
-    let unknown = |feature: &str| Refusal::Unknown {
-        level: name.to_owned(),
-        name: feature.to_owned(),
-        triple: triple.to_owned(),
-    };
+    let unknown = |feature: &'a str| Refusal::Unknown { level: name, name: feature, triple };
     let mut set = TargetFeatureSet::EMPTY;
     if let Some(cpu) = cpus::of(triple).and_then(|it| it.features(name)) {
         for &feature in cpu {
@@ -235,6 +273,9 @@ fn level_features(
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::Global;
+    use std::{format, string::String, string::ToString, vec::Vec};
+
     use blaze_sim::{Config, Tape};
 
     use super::*;
@@ -266,14 +307,14 @@ mod tests {
         ["fxsr", "sse", "sse2", "x87"].into_iter().map(feature).collect()
     }
 
-    fn plan(unit: &TargetFeatureSet, levels: &[&str]) -> Result<Plan, Refusal> {
-        Plan::new(LINUX, TargetArch::X86, unit, levels)
+    fn plan<'a>(unit: &TargetFeatureSet, levels: &[&'a str]) -> Result<Plan<Global>, Refusal<'a>> {
+        Plan::new_in(LINUX, TargetArch::X86, unit, levels, Global)
     }
 
     /// The oracle, from the plan's public data alone: `selected` is a clone every added feature
     /// of which `has` holds, and no later clone is one; the baseline only when no clone is.
-    fn check(plan: &Plan, has: &TargetFeatureSet, selected: Selected) -> Result<(), String> {
-        let supported = |level: &Level| level.added.iter().all(|it| has.contains(it));
+    fn check(plan: &Plan<Global>, has: &TargetFeatureSet, selected: Selected) -> Result<(), String> {
+        let supported = |level: &Level<Global>| level.added.iter().all(|it| has.contains(it));
         let best = plan.clones().iter().rposition(supported);
         match selected {
             Selected::Clone(at) => {
@@ -307,7 +348,7 @@ mod tests {
     }
 
     /// A planted bug: the most preferred clone, whatever the CPU has.
-    fn select_without_asking(plan: &Plan, _has: &TargetFeatureSet) -> Selected {
+    fn select_without_asking(plan: &Plan<Global>, _has: &TargetFeatureSet) -> Selected {
         match plan.clones().len() {
             0 => Selected::Baseline,
             clones => Selected::Clone(clones - 1),
@@ -315,13 +356,13 @@ mod tests {
     }
 
     /// A planted bug: never a clone.
-    fn select_the_baseline(_plan: &Plan, _has: &TargetFeatureSet) -> Selected {
+    fn select_the_baseline(_plan: &Plan<Global>, _has: &TargetFeatureSet) -> Selected {
         Selected::Baseline
     }
 
     /// A drawn case: a unit past the baseline, up to four levels, and what the CPU has (closed
     /// by what it implies, as a CPU's features are). `None` when the levels are no plan.
-    fn drawn(tape: &Tape) -> Option<(Plan, TargetFeatureSet)> {
+    fn drawn(tape: &Tape) -> Option<(Plan<Global>, TargetFeatureSet)> {
         let unit = baseline().union(&subset(tape.int_in(0..=127u8, "unit mask")));
         let masks: Vec<u8> =
             tape.vec(0..=4, "level masks", |tape| tape.int_in(0..=126u8, "level mask"));
@@ -420,7 +461,7 @@ mod tests {
     }
 
     /// The oracle of [`clones_never_share_a_feature_set`].
-    fn distinct(unit: &TargetFeatureSet, clones: &[Level]) -> Result<(), String> {
+    fn distinct(unit: &TargetFeatureSet, clones: &[Level<Global>]) -> Result<(), String> {
         for (at, clone) in clones.iter().enumerate() {
             if clone.features == *unit || clone.added.is_empty() {
                 return Err(format!("clone `{}` is compiled as the baseline is", clone.name));
@@ -464,14 +505,15 @@ mod tests {
         }
         // A unit that has a level already keeps no clone of it: a dev build for this machine.
         let unit = baseline().union(&subset(0b10));
-        let kept = super::Plan::new(LINUX, TargetArch::X86, &unit, &["avx", "avx2", "avx512f"]);
+        let kept =
+            super::Plan::new_in(LINUX, TargetArch::X86, &unit, &["avx", "avx2", "avx512f"], Global);
         let kept = kept.expect("three levels");
-        assert_eq!(kept.clones().iter().map(|it| &*it.name).collect::<Vec<_>>(), ["avx512f"]);
+        assert_eq!(kept.clones().iter().map(|it| it.name.as_str()).collect::<Vec<_>>(), ["avx512f"]);
         let all = baseline().union(&subset(127));
         assert!(plan_of(&all, &["avx2", "avx512f"]).clones().is_empty());
     }
 
-    fn plan_of(unit: &TargetFeatureSet, levels: &[&str]) -> Plan {
+    fn plan_of(unit: &TargetFeatureSet, levels: &[&str]) -> Plan<Global> {
         plan(unit, levels).unwrap_or_else(|why| panic!("{levels:?}: {why}"))
     }
 
@@ -479,7 +521,7 @@ mod tests {
     fn the_defaults_are_the_targets_levels() {
         // x86: the three levels, as the CPU table has them, each past the one before.
         let x86 = plan_of(&baseline(), &[]);
-        let names: Vec<&str> = x86.clones().iter().map(|it| &*it.name).collect();
+        let names: Vec<&str> = x86.clones().iter().map(|it| it.name.as_str()).collect();
         assert_eq!(names, ["x86-64-v2", "x86-64-v3", "x86-64-v4"]);
         let [v2, v3, v4] = x86.clones() else { panic!("{x86:?}") };
         assert!(v2.features.contains(feature("sse4.2")) && !v2.features.contains(feature("avx")));
@@ -490,15 +532,17 @@ mod tests {
         assert_eq!(x86.select(&baseline()), Selected::Baseline);
         // AArch64 and a target with no table: no level, so no clone.
         let neon: TargetFeatureSet = [feature("neon")].into_iter().collect();
-        let arm = Plan::new("aarch64-apple-darwin", TargetArch::AArch64, &neon, &[]);
+        let arm = Plan::new_in("aarch64-apple-darwin", TargetArch::AArch64, &neon, &[], Global);
         assert!(arm.expect("no levels").clones().is_empty());
-        let other = Plan::new("avr-none", TargetArch::Avr, &TargetFeatureSet::EMPTY, &[]);
+        let other = Plan::new_in("avr-none", TargetArch::Avr, &TargetFeatureSet::EMPTY, &[], Global);
         assert!(other.expect("no levels").clones().is_empty());
     }
 
     #[test]
     fn levels_that_are_no_plan_are_refused_by_name() {
-        let refused = |levels: &[&str]| plan(&baseline(), levels).expect_err("refused");
+        fn refused<'a>(levels: &[&'a str]) -> Refusal<'a> {
+            plan(&baseline(), levels).expect_err("refused")
+        }
         assert_eq!(refused(&[""]), Refusal::Empty { at: 0 });
         assert_eq!(refused(&["avx2", "avx2,,fma"]), Refusal::Empty { at: 1 });
         let unknown = refused(&["avx2", "avx9000"]);
@@ -509,7 +553,7 @@ mod tests {
         assert!(neon.to_string().contains("`neon` in level `avx2,neon`"), "{neon}");
         // `avx2` and `avx,avx2` are one set; so are a CPU and its features spelled out.
         let same = refused(&["avx2", "avx,avx2"]);
-        assert_eq!(same, Refusal::Same { first: "avx2".into(), second: "avx,avx2".into() });
+        assert_eq!(same, Refusal::Same { first: "avx2", second: "avx,avx2" });
         assert!(same.to_string().contains("`avx2` and `avx,avx2`"), "{same}");
         let many = ["avx"; MOST_LEVELS + 1];
         assert_eq!(refused(&many), Refusal::TooMany { levels: MOST_LEVELS + 1 });

@@ -1,7 +1,7 @@
-use std::hash::Hash;
+use core::{alloc::Allocator, hash::Hash};
 
 use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
-use std::alloc::Global;
+use blaze_own::Vec as OwnVec;
 
 use crate::Weight;
 
@@ -18,18 +18,19 @@ use crate::Weight;
 /// rows after it, as the slice published for the key is rewritten whole anyway. A key whose rows
 /// all cancel goes on a free list with its buffer, which the next new key takes.
 #[derive(Debug)]
-pub struct Arrangement<K, S, V> {
-    slot: Map<K, u32, FixedState, Global>,
-    rows: Vec<KeyRows<K, S, V>>,
-    free: Vec<u32>,
-    changed: Vec<K>,
-    changed_set: Set<K, FixedState, Global>,
+pub struct Arrangement<K, S, V, A: Allocator> {
+    alloc: A,
+    slot: Map<K, u32, FixedState, A>,
+    rows: OwnVec<KeyRows<K, S, V, A>, A>,
+    free: OwnVec<u32, A>,
+    changed: OwnVec<K, A>,
+    changed_set: Set<K, FixedState, A>,
 }
 
 #[derive(Debug)]
-struct KeyRows<K, S, V> {
+struct KeyRows<K, S, V, A: Allocator> {
     key: K,
-    entries: Vec<Entry<S, V>>,
+    entries: OwnVec<Entry<S, V>, A>,
     /// How many entries have a positive weight.
     positive: u32,
     live: bool,
@@ -42,20 +43,21 @@ struct Entry<S, V> {
     weight: Weight,
 }
 
-impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Default for Arrangement<K, S, V> {
-    fn default() -> Self {
-        Arrangement::new()
-    }
-}
-
-impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S, V> {
-    pub fn new() -> Self {
+impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash, A: Allocator + Clone>
+    Arrangement<K, S, V, A>
+{
+    pub fn new_in(alloc: A) -> Self {
         Arrangement {
-            slot: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
-            rows: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
-            free: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
-            changed: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
-            changed_set: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            slot: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            rows: OwnVec::new_in(alloc.clone()),
+            free: OwnVec::new_in(alloc.clone()),
+            changed: OwnVec::new_in(alloc.clone()),
+            changed_set: Set::new(SetOpts {
+                hasher: FixedState,
+                alloc: alloc.clone(),
+                capacity: None,
+            }),
+            alloc,
         }
     }
 
@@ -79,12 +81,12 @@ impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S,
                     before.checked_add(w).expect("an arrangement weight overflows `i32`");
                 let after = entry.weight;
                 if after == 0 {
-                    rows.entries.remove(start + offset);
+                    rows.entries.remove_shift(start + offset);
                 }
                 (before, after)
             }
             None => {
-                rows.entries.insert(start + run, Entry { sort, value, weight: w });
+                rows.entries.insert_shift(start + run, Entry { sort, value, weight: w });
                 (0, w)
             }
         };
@@ -141,7 +143,7 @@ impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S,
 
     /// Each key changed since the last call, once, in the order each first changed; then
     /// forgets them. `out` is appended to.
-    pub fn take_changed(&mut self, out: &mut Vec<K>) {
+    pub fn take_changed<B: Allocator>(&mut self, out: &mut OwnVec<K, B>) {
         out.extend(self.changed.drain(..));
         self.changed_set.clear();
     }
@@ -171,7 +173,12 @@ impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S,
             }
             None => {
                 let at = u32::try_from(self.rows.len()).expect("more than `u32::MAX` keys");
-                self.rows.push(KeyRows { key, entries: Vec::new(), positive: 0, live: true }); // alloc: a key first seen; an emptied key's row and buffer are reused
+                self.rows.push(KeyRows {
+                    key,
+                    entries: OwnVec::new_in(self.alloc.clone()),
+                    positive: 0,
+                    live: true,
+                });
                 at
             }
         };

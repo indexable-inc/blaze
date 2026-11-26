@@ -1154,7 +1154,7 @@ fn update_manifest_with_new_member(
                 let Some(pat) = member.as_str() else {
                     return Err(NewError::NotAString { exclude: false, written: written(workspace_document, member) });
                 };
-                let pattern = blaze_glob::Pattern::new(pat)
+                let pattern = blaze_glob::Pattern::new_in(pat, Global)
                     .map_err(|error| NewError::Pattern { pattern: pat.to_owned(), error })?;
                 if pattern.matches(display_path) {
                     return Ok(false);
