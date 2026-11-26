@@ -30,9 +30,10 @@ Follow the strict hierarchy:
 3. **Skill** (loaded only for the specific class of task whose trigger matches; never rely on a task-scoped skill for a habit that must apply on every turn).
 4. **Always-on prompt rule (`AGENTS.md`)** — last resort. Before adding a new rule, check whether tightening or merging an existing rule covers the class with zero extra lines. Every added rule dilutes attention on the rules already there.
 
-## 4. Name by exact action or role, and write interface-first briefs
+## 4. Name by exact action or role, sweep siblings, and write interface-first briefs
 
 - Name every skill, rule, and doc by its unambiguous action or role (e.g., `authoring-prompts`, `changing-code`, `debugging`) — never a vague topic noun that leaves direction or purpose ambiguous.
+- **Retroactive sweep without asking:** Whenever you introduce or tighten a rule, naming convention, or design invariant, immediately audit its existing siblings (rules, skills, docs, scripts, callers) against the new invariant and fix every clear violation in the same batch — never patch only the single artifact that triggered it.
 - A subagent or swarm brief is an interface specification, not a narrative:
   - State **owned files/paths**, **non-goals / boundaries**, **exact public contracts** (types, signatures, invariants) when lanes run in parallel, and **what done looks like** (the concrete check).
   - Omit background history or reasoning the worker does not need to satisfy its contract.
