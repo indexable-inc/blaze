@@ -375,7 +375,7 @@ pub fn native_outputs<'a>(
 
     // The host binary the interim builder made with exactly the unit's features.
     let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of_native(setting.store, name, version, &features, setting.host).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
+    let module = crate::script_unit::module_of_native_files(setting.store, name, version, &features, setting.host, setting.files_digest).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
         package: pkg(),
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.display().to_string(),

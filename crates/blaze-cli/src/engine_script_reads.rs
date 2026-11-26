@@ -253,7 +253,7 @@ fn observed<'s>(subject: &'s str, digest: Option<ContentId>, alloc: SharedAlloc<
             }
             let mut words = [""; MOST_GIT_WORDS];
             let Some(count) = git_words(command, &mut words) else { return Err(NoCell::Git { subject: owned() }) };
-            if matches!(git::question(&words[..count]), git::Question::Other | git::Question::Dirty | git::Question::Short | git::Question::Log(Err(_))) {
+            if matches!(git::question(&words[..count]), git::Question::Other | git::Question::Dirty | git::Question::Log(Err(_))) {
                 return Err(NoCell::Git { subject: owned() });
             }
             if digest.is_none() {

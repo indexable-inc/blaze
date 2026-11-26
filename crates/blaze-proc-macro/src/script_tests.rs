@@ -577,8 +577,8 @@ fn no_repository_is_gits_own_answer() {
 fn git_refuses_by_name_what_it_cannot_answer_exactly() {
     let (_, unborn) = checkout("git-refusals", &[(".git/HEAD", "ref: refs/heads/unborn\n")]);
     assert_eq!(ask(&unborn, "", &["rev-parse", "HEAD"]).0, Err(git::Refused::NoCommit));
-    assert_eq!(ask(&unborn, "", &["rev-parse", "--short", "HEAD"]).0, Err(git::Refused::Short));
-    assert_eq!(ask(&unborn, "", &["rev-parse", "--short=8", "HEAD"]).0, Err(git::Refused::Short));
+    assert_eq!(ask(&unborn, "", &["rev-parse", "--short", "HEAD"]).0, Err(git::Refused::NoCommit));
+    assert_eq!(ask(&unborn, "", &["rev-parse", "--short=8", "HEAD"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["status", "--porcelain"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["status", "--short"]).0, Err(git::Refused::Dirty));
     // `--dirty` is answered (from the tracked status); another mark is not.

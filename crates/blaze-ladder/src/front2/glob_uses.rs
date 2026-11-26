@@ -358,6 +358,8 @@ where
         return Ok(None);
     }
     let mut uses: AVec<'a, UseAt<'a>> = AVec::new_in(alloc);
+    let mut has_glob_or_direct = false;
+    let explicit_is_use = explicit.is_some_and(|e| e.kind == LocalKind::Use);
     let mut body = owner;
     let mut at = Some(scope);
     let mut depth = 0u32;
@@ -381,12 +383,24 @@ where
             },
         };
         let declares = |e: &Row<'l>| b.rows.iter().any(|r| r.scope == here && r.kind == e.kind && r.name == e.name && r.key == e.key && r.range == e.range);
-        if explicit.is_some_and(declares) {
+        if explicit.is_some_and(declares) && !explicit_is_use {
             ended = true;
             break;
         }
+        if explicit_is_use {
+            // A named `use` (e.g. `use hir::{Class, HirKind::*};`) only shadows globs and outer
+            // imports in the namespace(s) it actually binds: `Class` is type-only, so
+            // `HirKind::Class` from `HirKind::*` still answers `Ns::Value`. Keep named `use`
+            // bindings alongside globs so `lookup` applies per-namespace shadowing.
+            for row in b.rows.iter().filter(|r| r.scope == here && r.kind == LocalKind::Use && r.name == name) {
+                let mut written: AVec<'a, &'a str> = AVec::new_in(alloc);
+                written.extend_from_slice(row.path);
+                uses.push(UseAt { depth, bound: Some(name), start: row_start(locals, module, body, row, alloc)?, written, item: row.key, range: row.range });
+            }
+        }
         if let Some(binding) = super::scope_table::direct_name_in(b, here, name, ns, depth, alloc, paths.names, b.names_of_blocks)? {
             uses.push(binding);
+            has_glob_or_direct = true;
             ended = true;
             break;
         }
@@ -394,17 +408,19 @@ where
             let mut written: AVec<'a, &'a str> = AVec::new_in(alloc);
             written.extend_from_slice(row.path);
             uses.push(UseAt { depth, bound: None, start: row_start(locals, module, body, row, alloc)?, written, item: row.key, range: row.range });
+            has_glob_or_direct = true;
         }
         at = b.parents.get(here as usize).copied().flatten();
         depth += 1;
     }
-    if uses.is_empty() {
+    if !has_glob_or_direct || uses.is_empty() {
         return Ok(None);
     }
     if !ended {
         return Err(LocalGap { item: uses[0].item, form: TOO_DEEP, range: uses[0].range });
     }
-    lookup(paths, module, &uses, name, ns, alloc)
+    let hit = lookup(paths, module, &uses, name, ns, alloc)?;
+    Ok(hit.filter(|h| !explicit_is_use || of_namespace(paths, &h.target, ns)))
 }
 
 /// A body's blocks as the names library made them modules, for a pattern's question (asked

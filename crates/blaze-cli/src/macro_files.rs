@@ -253,6 +253,138 @@ pub(crate) fn member_hex(rows: &Rows<'_>, dir: &str) -> Option<String> {
     rows.of(LeafKind::MacroFiles).find(|leaf| !leaf.absent() && rows.path(leaf) == dir).map(|leaf| files_hex(&leaf.id))
 }
 
+/// Records `LeafKind::MacroFile` rows for the build-script files of the member/path package at
+/// `dir` (whose package-relative script root is `script_root`, e.g. `build.rs` or `build/main.rs`):
+/// `script_root`, top-level `*.rs` in `dir`, and any `*.rs` under `script_root`'s parent dir when
+/// that dir is neither `""` nor `"src"`. Never touches `src/*.rs`, so editing library/binary code
+/// does not move `units_source` (rule 60), while editing `build.rs` moves `units_source` and
+/// invalidates the build-script module key (rule 21).
+pub(crate) fn read_script_files(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    stamps: &impl Stamps,
+    dir: &str,
+    script_root: &str,
+    rows: &mut Rows<'_>,
+    frame: &Frame,
+) -> Result<(), CliError> {
+    let cx = cx.span("macro files: read a member build script's files with their stamps");
+    let mut bytes = Bytes::new_in(frame, "a member build script's file");
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut record_file = |rel: &str| -> Result<(), CliError> {
+        let norm = rel.trim_start_matches("./");
+        if norm.is_empty() || !seen.insert(String::from(norm)) {
+            return Ok(());
+        }
+        let path = under(dir, norm);
+        if let Some((stamp, id)) = look(&cx, root, stamps, Plant::None, &path, None, &mut bytes)? {
+            rows.push(LeafKind::MacroFile, 0, &path, stamp, id);
+        }
+        Ok(())
+    };
+    record_file(script_root)?;
+    if let Some(listed) = walked(&cx, root, dir, InPackage::Root, frame)? {
+        for (name, is_dir) in listed.entries() {
+            if !is_dir && name.ends_with(".rs") {
+                record_file(name)?;
+            }
+        }
+    }
+    let script_rel = script_root.trim_start_matches("./");
+    if let Some((parent, _)) = script_rel.rsplit_once('/')
+        && !parent.is_empty()
+        && parent != "src"
+        && !parent.starts_with("src/")
+    {
+        let mut stack: std::vec::Vec<String, Global> = std::vec::Vec::new_in(Global);
+        stack.push(String::from(parent));
+        while let Some(dir_rel) = stack.pop() {
+            let at = under(dir, &dir_rel);
+            let Some(listed) = walked(&cx, root, &at, InPackage::Beneath, frame)? else { continue };
+            for (name, is_dir) in listed.entries() {
+                let child = std::format!("{dir_rel}/{name}");
+                if is_dir {
+                    stack.push(child);
+                } else if name.ends_with(".rs") {
+                    record_file(&child)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Computes the exact same `files <sha256>` digest as `blaze_proc_macro::script_unit::script_files_digest`
+/// through the sans-IO checkout `Dir<ReadOnly>` (so simulated test worlds and on-disk checkouts
+/// produce identical digests).
+pub(crate) fn script_files_digest_in_dir(
+    cx: &Cx,
+    root: &Dir<bstd::fs::ReadOnly>,
+    dir: &str,
+    script_root: &str,
+    frame: &Frame,
+) -> Option<String> {
+    let mut files: std::vec::Vec<(String, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut bytes = Bytes::new_in(frame, "script files digest read");
+    let mut push_file = |rel: &str| {
+        let norm = rel.trim_start_matches("./");
+        if norm.is_empty() || !seen.insert(String::from(norm)) {
+            return;
+        }
+        let path = under(dir, norm);
+        let Ok(p) = Path::new(&path) else { return };
+        bytes.clear();
+        if root.read_all(cx, &p, &mut bytes).is_ok() {
+            let mut held = std::vec::Vec::new_in(Global);
+            held.extend_from_slice(bytes.as_slice());
+            files.push((String::from(norm), held));
+        }
+    };
+    push_file("Cargo.toml");
+    push_file(script_root);
+    let list_at = |at: &str| {
+        if at.is_empty() {
+            root.own_entries(cx).ok()
+        } else {
+            Path::new(at).ok().and_then(|p| root.entries(cx, &p).ok().flatten())
+        }
+    };
+    if let Some(listed) = list_at(dir) {
+        for i in 0..listed.len() {
+            if listed.kind(i) == EntryKind::File {
+                let name = listed.name(i);
+                if name.ends_with(".rs") {
+                    push_file(name);
+                }
+            }
+        }
+    }
+    let script_rel = script_root.trim_start_matches("./");
+    if let Some((parent, _)) = script_rel.rsplit_once('/')
+        && !parent.is_empty()
+        && parent != "src"
+        && !parent.starts_with("src/")
+    {
+        let mut stack: std::vec::Vec<String, Global> = std::vec::Vec::new_in(Global);
+        stack.push(String::from(parent));
+        while let Some(dir_rel) = stack.pop() {
+            let at = under(dir, &dir_rel);
+            let Some(listed) = list_at(&at) else { continue };
+            for i in 0..listed.len() {
+                let name = listed.name(i);
+                let child = std::format!("{dir_rel}/{name}");
+                match listed.kind(i) {
+                    EntryKind::Dir => stack.push(child),
+                    EntryKind::File if name.ends_with(".rs") => push_file(&child),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(blaze_proc_macro::module::files_digest(&mut files))
+}
+
 #[cfg(test)]
 mod stamp_tests;
 

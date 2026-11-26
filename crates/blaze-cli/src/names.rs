@@ -1833,8 +1833,20 @@ fn make_world<'f>(
         script_roots.push((at, script.root.as_str()));
         let mut features = std::vec::Vec::new_in(Global);
         features.extend(script.features.iter().map(|feature| feature.as_str()));
-        let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features);
-        script_modules.push(crate::script_modules::ScriptModule { subject, crate_at: at, ran_as, package: script.name.as_str(), version: script.version.as_str(), features });
+        let files = paths
+            .iter()
+            .find(|p| p.id == script.package)
+            .and_then(|p| crate::macro_files::script_files_digest_in_dir(cx, &reader.root, p.dir, script.root.as_str(), frame));
+        let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features, files.as_deref());
+        script_modules.push(crate::script_modules::ScriptModule {
+            subject,
+            crate_at: at,
+            ran_as,
+            package: script.name.as_str(),
+            version: script.version.as_str(),
+            features,
+            files,
+        });
     }
     script_modules.sort_unstable_by_key(|module| (module.subject, module.crate_at));
     for (at, _) in scripts.iter() {

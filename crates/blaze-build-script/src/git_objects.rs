@@ -140,6 +140,13 @@ impl<'a> Store<'a> {
     /// `ceil((msb(n) + 1) / 2)` and at least 7 hex digits, `n` the objects of every pack index,
     /// then lengthened until no other object (packed or loose) shares the prefix.
     pub(crate) fn abbrev(&self, oid: &Oid, files: &mut impl GitFiles, alloc: Alloc<'a>) -> Result<usize, Refused> {
+        self.abbrev_min(oid, None, files, alloc)
+    }
+
+    /// git's abbreviation of `oid` with an optional explicit minimum length (`--short=N` clamps
+    /// `N` to `4..=40`; `None` uses git's auto length `max(7, ceil((msb(n) + 1) / 2))`), lengthened
+    /// until unique across every pack index and loose object in the object store.
+    pub(crate) fn abbrev_min(&self, oid: &Oid, min_len: Option<usize>, files: &mut impl GitFiles, alloc: Alloc<'a>) -> Result<usize, Refused> {
         let mut count: u64 = 0;
         let mut shared = 0;
         let mut file = Vec::new_in(alloc);
@@ -164,9 +171,14 @@ impl<'a> Store<'a> {
                 }
             }
         }
-        let msb = if count == 0 { 0 } else { 63 - count.leading_zeros() as usize };
-        let least = (msb + 2) / 2;
-        Ok(least.max(7).max(shared + 1).min(40))
+        let floor = match min_len {
+            Some(n) => n.clamp(4, 40),
+            None => {
+                let msb = if count == 0 { 0 } else { 63 - count.leading_zeros() as usize };
+                ((msb + 2) / 2).max(7)
+            }
+        };
+        Ok(floor.max(shared + 1).min(40))
     }
 }
 

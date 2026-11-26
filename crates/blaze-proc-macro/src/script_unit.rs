@@ -54,6 +54,11 @@ pub struct Setting<'s> {
     /// What the command's setting says about spawns, chosen once per command
     /// (`crate::fact_pins::command_spawn_setting`): every script of the graph gets it.
     pub spawn_setting: Arc<crate::spawn_route::SpawnSetting>,
+    /// For a workspace-member or external path package's build script: the `files <sha256>`
+    /// digest of its build-script files (`script_files_digest`), matched in module lookup so
+    /// edits invalidate and distinct path packages never collide (rule 21). `None` for
+    /// registry/git packages whose sources are already pinned by the lock.
+    pub files_digest: Option<&'s str>,
 }
 
 /// A script ready to run: its loaded module, its sandboxed inputs, its environment.
@@ -127,18 +132,98 @@ impl std::fmt::Display for UnitScriptError {
 impl std::error::Error for UnitScriptError {}
 
 /// The module record (`<store>/build-script/modules/<key>`) of `name version` compiled with
-/// exactly `features`: the one whose identity names all three. A native script's record (its
-/// identity has a `target` line, D69) is never it: that one holds `script.bin`, not a module.
-/// `Ok(None)`: the store holds no such record (no `modules` folder at all included).
+/// exactly `features`: the one whose identity names all three (and no `files` line, for a
+/// lock-pinned package). A native script's record (its identity has a `target` line, D69) is
+/// never it: that one holds `script.bin`, not a module. `Ok(None)`: the store holds no such
+/// record (no `modules` folder at all included).
 pub fn module_of(store: &Path, name: &str, version: &str, features: &[&str]) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, None)
+    module_where(store, name, version, features, None, None)
+}
+
+/// [`module_of`] for a package with optional `files <sha256>` identity line (workspace members
+/// and external path packages pass `Some(hex)`; lock-pinned packages pass `None`).
+pub fn module_of_files(store: &Path, name: &str, version: &str, features: &[&str], files: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
+    module_where(store, name, version, features, None, files)
 }
 
 /// The native binary record (`<store>/build-script/modules/<key>`, holding `script.bin`) of
 /// `name version` built for `host` with exactly `features` (D69: the interim builder's
 /// `native` mode, whose identity adds `target <host>`).
 pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&str], host: &str) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, Some(host))
+    module_where(store, name, version, features, Some(host), None)
+}
+
+/// [`module_of_native`] with optional `files <sha256>` identity line for path packages.
+/// Prefers an exact `files <sha256>` match when present; falls back to an untagged native
+/// bootstrap record (`blaze build-script module native 1`, which `placed_in_store` selects via
+/// `module_of_native`) when no `files`-tagged native record exists.
+pub fn module_of_native_files(store: &Path, name: &str, version: &str, features: &[&str], host: &str, files: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
+    if let Some(found) = module_where(store, name, version, features, Some(host), files)? {
+        return Ok(Some(found));
+    }
+    if files.is_some() {
+        return module_where(store, name, version, features, Some(host), None);
+    }
+    Ok(None)
+}
+
+/// Relative paths under a package directory that contribute to a workspace-member or path
+/// package's build script (`Cargo.toml`, `script_root`, top-level `*.rs`, and any `*.rs` under
+/// `script_root`'s parent directory when that directory is neither `""` nor `"src"`). Never
+/// descends into `src/`, `tests/`, `benches/`, or `examples/`, so ordinary edits to library or
+/// binary sources do not recompile `build.rs` (rule 60) while edits to `build.rs`, its helper
+/// modules, or `Cargo.toml` immediately invalidate the build-script module key (rule 21).
+pub fn script_files_digest(pkg_dir: &Path, script_root: &str) -> Result<String, std::io::Error> {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut push_file = |rel: &str| -> Result<(), std::io::Error> {
+        let norm = rel.trim_start_matches("./");
+        if norm.is_empty() || !seen.insert(norm.to_owned()) {
+            return Ok(());
+        }
+        let full = pkg_dir.join(norm);
+        if full.is_file() {
+            let bytes = std::fs::read(&full)?;
+            files.push((norm.to_owned(), bytes));
+        }
+        Ok(())
+    };
+    push_file("Cargo.toml")?;
+    push_file(script_root)?;
+    if let Ok(entries) = std::fs::read_dir(pkg_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(s) = name.to_str()
+                && s.ends_with(".rs")
+                && entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                push_file(s)?;
+            }
+        }
+    }
+    let script_rel = script_root.trim_start_matches("./");
+    if let Some((parent, _)) = script_rel.rsplit_once('/')
+        && !parent.is_empty()
+        && parent != "src"
+        && !parent.starts_with("src/")
+    {
+        let mut stack = vec![parent.to_owned()];
+        while let Some(dir_rel) = stack.pop() {
+            let full_dir = pkg_dir.join(&dir_rel);
+            let Ok(entries) = std::fs::read_dir(&full_dir) else { continue };
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                let child = format!("{dir_rel}/{name}");
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(child);
+                } else if ft.is_file() && name.ends_with(".rs") {
+                    push_file(&child)?;
+                }
+            }
+        }
+    }
+    Ok(crate::module::files_digest(&mut files))
 }
 
 /// Why the module store could not answer a lookup: each names the path (rule 19), and none is
@@ -219,11 +304,12 @@ pub fn shim_line() -> String {
 /// The record whose identity names `name`, `version`, `features` and, for `host`, `target
 /// <host>`; for `None`, one with no `target` line and this host's [`shim_line`] (a wasm module).
 /// Two such records are a typed refusal, never the first in the listing's order.
-fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
+fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>, files: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
     let target = host.map(|host| format!("target {host}"));
+    let files_line = files.map(|hex| format!("files {hex}"));
     let shim = shim_line();
     let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
         // A wasm module answers only with the shim this host speaks to: one built with another
@@ -234,7 +320,11 @@ fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host
             Some(want) => identity.lines().any(|l| l == want),
             None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
         };
-        runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
+        let files_fits = match &files_line {
+            Some(want) => identity.lines().any(|l| l == want),
+            None => !identity.lines().any(|l| l.starts_with("files ")),
+        };
+        runner_fits && files_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
     });
     let Some((first, _)) = fits.next() else { return Ok(None) };
     match fits.next() {
@@ -327,7 +417,7 @@ pub fn prepare_viewing_on<'a>(
     let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package.clone() })?;
     let serves = &graph.units[serves.index()];
     let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
+    let module = module_of_files(setting.store, unit.name.as_str(), unit.version.as_str(), &features, setting.files_digest).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
         package: package.clone(),
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.to_owned(),

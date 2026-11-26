@@ -1094,6 +1094,134 @@ fn generic_fn_param_called_inside_closure_checks_owner_lifetime() {
     }
 }
 
+/// An enum variant field holding a `dyn Fn*` destructured in an outer `match` and captured into
+/// a nested closure (`match sorter { Sorter::ByName(cmp) => { let _c = move |x: &S| cmp(x); } }`,
+/// the `ignore::walk::WalkBuilder::build` shape):
+/// - Positive: higher-ranked `dyn for<'x> Fn(&'x S) + 'static` captured into nested closure
+///   lowers cleanly with zero findings (previously `CalleeValueUnknown` because nested closures
+///   did not inherit `local_field_source`).
+/// - Negative (soundness): `dyn Fn(&'static S) + 'static` captured into nested closure rejects
+///   passing a local borrow `&local` (`!report.borrows.is_empty()`).
+#[test]
+fn enum_variant_dyn_fn_captured_in_nested_closure() {
+    use crate::FieldRegion;
+
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let fns = add_fn_traits(fx);
+        let d_in = dyn_fn_ty(fx, fns.0, fns.2, &[rs], unit);
+        let r_in = fx.r(Mutbl::Not, d_in);
+        let (sorter, _) = fx.enum_("Sorter", 0, &[("ByName", &[r_in]), ("Sink", &[r_in])]);
+        let sorter_ty = fx.adt(sorter, &[]);
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+        let f_ok = fx.func("ok", 0, &[sorter_ty], unit, no_clauses());
+        let f_bad = fx.func("bad", 0, &[sorter_ty], unit, no_clauses());
+        items = Some((fns, sorter, sorter_ty, r_in, mk, f_ok, f_bad));
+    });
+    let (fns, sorter, sorter_ty, r_in, mk, f_ok, f_bad) = items.expect("declared");
+
+    const HRTB_FR: [FieldRegion; 4] = [FieldRegion::Static, FieldRegion::Static, FieldRegion::Bound(0), FieldRegion::Bound(0)];
+    const SINK_FR: [FieldRegion; 4] = [FieldRegion::Static, FieldRegion::Static, FieldRegion::Static, FieldRegion::Static];
+
+    let mut facts = DynFacts::of(&w, fns);
+    facts.adts.push((
+        sorter,
+        AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: true, is_box: false },
+        &[],
+    ));
+    facts.field_counts.push((sorter, 0, 1));
+    facts.field_counts.push((sorter, 1, 1));
+    facts.fields.push((sorter, 0, "0", 0, &HRTB_FR));
+    facts.fields.push((sorter, 1, "0", 0, &SINK_FR));
+    const ST: crate::Region = crate::Region::Static;
+    facts.lane.wide.sigs.decls.adt(sorter, 0);
+    facts.lane.wide.sigs.decls.field(sorter, 0, 0, r_in, &[ST, ST, BOUND1, BOUND1]);
+    facts.lane.wide.sigs.decls.field(sorter, 1, 0, r_in, &[ST, ST, ST, ST]);
+    facts.lane.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.lane.wide.add(f_ok, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[sorter_ty], output: w.unit, slots: &[] });
+    facts.lane.wide.add(f_bad, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[sorter_ty], output: w.unit, slots: &[] });
+
+    // Positive: `match s { Sorter::ByName(cmp) => { let _c = || { let x = mk(); cmp(&x); }; }, _ => {} }`
+    {
+        let mut b = Bb::new();
+        let ps = b.param("s");
+        let p_cmp = b.bind("cmp");
+        let p_by_name = b.variant_pat(&["Sorter", "ByName"], &[p_cmp]);
+        let p_wild = b.wild();
+
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let px = b.bind("x");
+        let st1 = b.let_(px, None, call_mk);
+        let l_cmp = b.local(p_cmp);
+        let l_x = b.local(px);
+        let ref_x = b.borrow(Mutbl::Not, l_x);
+        let call_cmp = b.call(l_cmp, &[ref_x]);
+        let st2 = b.semi(call_cmp);
+        let inner = b.block(&[st1, st2], None);
+        let cl = b.closure(&[], inner);
+        let pc = b.bind("c");
+        let st_let = b.let_(pc, None, cl);
+        let arm_body = b.block(&[st_let], None);
+        let wild_body = b.block(&[], None);
+        let scrut = b.local(ps);
+        let m = b.match_(scrut, &[(p_by_name, arm_body), (p_wild, wild_body)]);
+        let root = b.block(&[], Some(m));
+
+        let body = b.view(f_ok, root);
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc())
+            .expect("nested closure capturing enum-variant dyn Fn must lower");
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        assert!(
+            report.moves.is_empty() && report.borrows.is_empty(),
+            "POSITIVE: HRTB enum-variant dyn Fn captured into nested closure must check clean: moves={} borrows={}",
+            report.moves.len(),
+            report.borrows.len()
+        );
+    }
+
+    // Negative: `match s { Sorter::Sink(cmp) => { let _c = || { let x = mk(); cmp(&x); }; }, _ => {} }`
+    // where `Sorter::Sink` expects `&'static S` — local borrow `&x` must fail borrow check!
+    {
+        let mut b = Bb::new();
+        let ps = b.param("s");
+        let p_cmp = b.bind("cmp");
+        let p_sink = b.variant_pat(&["Sorter", "Sink"], &[p_cmp]);
+        let p_wild = b.wild();
+
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let px = b.bind("x");
+        let st1 = b.let_(px, None, call_mk);
+        let l_cmp = b.local(p_cmp);
+        let l_x = b.local(px);
+        let ref_x = b.borrow(Mutbl::Not, l_x);
+        let call_cmp = b.call(l_cmp, &[ref_x]);
+        let st2 = b.semi(call_cmp);
+        let inner = b.block(&[st1, st2], None);
+        let cl = b.closure(&[], inner);
+        let pc = b.bind("c");
+        let st_let = b.let_(pc, None, cl);
+        let arm_body = b.block(&[st_let], None);
+        let wild_body = b.block(&[], None);
+        let scrut = b.local(ps);
+        let m = b.match_(scrut, &[(p_sink, arm_body), (p_wild, wild_body)]);
+        let root = b.block(&[], Some(m));
+
+        let body = b.view(f_bad, root);
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc())
+            .expect("nested closure capturing enum-variant sink dyn Fn must lower");
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        assert!(!report.borrows.is_empty(), "NEGATIVE: local `&x` passed to `&'static S` enum-variant dyn Fn must fail borrow check");
+    }
+}
+
 /// Struct-destructured `&'a dyn Fn() -> &'a S` (`Edge { opts, .. }` in `engine_check.rs::serve`)
 /// captured into a nested closure:
 /// - Positive: `let Edge { opts } = edge; let _c = || { let r = opts(); g(r); };` lowers cleanly

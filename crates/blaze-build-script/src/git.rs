@@ -218,8 +218,9 @@ pub enum Question {
     ShowCurrent,
     /// The full name of the ref HEAD points to.
     SymbolicRef,
-    /// An abbreviated commit (`--short`).
-    Short,
+    /// An abbreviated `HEAD` commit (`rev-parse --short[=N] HEAD`), lengthened until unique in
+    /// the object store.
+    Short { min_len: Option<usize> },
     /// `status --porcelain`, listing untracked files when `untracked` (git's default) and not
     /// with `--untracked-files=no`; `all` selects `--untracked-files=all` instead of Git's
     /// directory-collapsed default.
@@ -251,7 +252,7 @@ pub fn question(args: &[&str]) -> Question {
         | ["rev-parse", "--symbolic-full-name", "--abbrev-ref", "HEAD"] => Question::Branch,
         ["branch", "--show-current"] => Question::ShowCurrent,
         ["symbolic-ref", "HEAD"] => Question::SymbolicRef,
-        ["rev-parse", rest @ ..] if rest.iter().any(|arg| *arg == "--short" || arg.starts_with("--short=")) => Question::Short,
+        ["rev-parse", rest @ ..] if rest.iter().any(|arg| *arg == "--short" || arg.starts_with("--short=")) => rev_parse_short(rest),
         ["status", "--porcelain"] => Question::Status { untracked: true, all: false },
         ["status", "--porcelain", "--untracked-files=no"] | ["status", "--porcelain", "-uno"] => Question::Status { untracked: false, all: false },
         ["status", "--porcelain", "--untracked-files=all"] | ["status", "--porcelain", "-uall"] => Question::Status { untracked: true, all: true },
@@ -576,7 +577,10 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             Question::SymbolicRef => Ok(Answer { code: 128, stdout: String::new_in(alloc), stderr: "fatal: ref HEAD is not a symbolic ref\n" }),
             // Clean: no tracked file differs from the commit, and no file is untracked.
             Question::Status { .. } => Ok(ok("")),
-            Question::Short => Err(Refused::Short),
+            Question::Short { min_len } => {
+                let len = min_len.unwrap_or(FALLBACK_DEFAULT_ABBREV).clamp(4, 40);
+                Ok(ok(&hex[..len]))
+            }
             Question::Log(Err(why)) => Err(why),
             // The record keeps the commit id, not the commit object (D54): git's own failure,
             // which every unit asking tolerates with no value (smolgen: no commit-date keys).
@@ -595,7 +599,6 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
     }
     match question {
         Question::Version => return Ok(ok(VERSION)),
-        Question::Short => return Err(Refused::Short),
         Question::Dirty => return Err(Refused::Dirty),
         Question::Other => return Err(Refused::CannotAnswerYet),
         Question::Log(Err(why)) => return Err(why),
@@ -616,6 +619,13 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
         Question::InsideWorkTree => return Ok(ok("true")),
         Question::GitDir => return Ok(ok(&relative_to(folder, &repo.gitdir, alloc))),
         Question::CommonDir => return Ok(ok(&relative_to(folder, &repo.common, alloc))),
+        Question::Short { min_len } => {
+            let commit = head_commit(&repo, files, alloc)?;
+            let store = crate::git_objects::Store::open(&repo.common, files, alloc)?;
+            let len = store.abbrev_min(&commit, min_len, files, alloc)?;
+            let hex = commit.hex();
+            return Ok(ok(core::str::from_utf8(&hex[..len]).expect("hex")));
+        }
         Question::Log(Ok(format)) => {
             let commit = head_commit(&repo, files, alloc)?;
             let store = crate::git_objects::Store::open(&repo.common, files, alloc)?;
@@ -715,6 +725,36 @@ pub const FALLBACK_DEFAULT_ABBREV: usize = 7;
 
 /// What a fetched source answers to `log`: git's failure, stated (D54).
 pub const FETCHED_NO_COMMIT_OBJECT: &str = "fatal: blaze: a fetched git source keeps no commit object, only its id (D54)\n";
+
+/// `rev-parse` with `--short` or `--short=N` (optionally `--verify`) for `HEAD`.
+fn rev_parse_short(args: &[&str]) -> Question {
+    let mut min_len: Option<usize> = None;
+    let mut saw_short = false;
+    let mut saw_head = false;
+    for &arg in args {
+        if arg == "--short" {
+            saw_short = true;
+            min_len = None;
+        } else if let Some(rest) = arg.strip_prefix("--short=") {
+            let Ok(n) = rest.parse::<usize>() else {
+                return Question::Other;
+            };
+            saw_short = true;
+            min_len = Some(n);
+        } else if arg == "--verify" {
+            continue;
+        } else if arg == "HEAD" && !saw_head {
+            saw_head = true;
+        } else {
+            return Question::Other;
+        }
+    }
+    if saw_short && saw_head {
+        Question::Short { min_len }
+    } else {
+        Question::Other
+    }
+}
 
 /// `describe`'s arguments read: only `--always`, `--tags` and `--match <glob>` (which change
 /// nothing when no tag exists) and `--dirty` (or `--dirty=-dirty`, git's own mark); another
