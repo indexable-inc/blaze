@@ -244,6 +244,8 @@ pub enum HitAction {
     FocusPaneBlock { pane: crate::tiling::PaneId, block: BlockId },
     /// Open native Activity & GPU Monitor (`top`) focused/filtered on a specific OS PID.
     InspectProcessPid(u32),
+    /// Terminate a specific OS PID directly from the folder-processes popover (SIGTERM; Shift+click SIGKILL).
+    KillProcessPid(u32),
     SortTableColumn { block: BlockId, col: usize },
     ResizeTableColumn { block: BlockId, col: usize, col_x0: i32 },
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
