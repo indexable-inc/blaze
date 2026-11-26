@@ -176,8 +176,8 @@ fn collect_coroutines<'a>(
                     // never pay any `blaze_build::ground` or trait-solver cost here.
                     if mode == Walk::Inline
                         && let Ok(PNode::Adt(key, l)) = ground.view().node(inner)
-                        && let Some(adt) = facts.adt(key)
                     {
+                        let adt = facts.adt(key).ok_or(BuildError::NoAdt { adt: key })?;
                         args.clear();
                         args.extend_from_slice(ground.view().list(l).map_err(past)?);
                         for field in adt.fields {
