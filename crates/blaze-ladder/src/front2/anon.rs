@@ -486,10 +486,10 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
         }
         let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
         let alloc = store.tys.alloc();
-        let mut declaration = blaze_own::format_in!(alloc, "const _: {prim} = ");
+        let mut declaration = blaze_own::format_in!(alloc, "const _: {prim} = {{ ");
         let prefix = declaration.len();
         declaration.push_str(&a.text);
-        declaration.push(';');
+        declaration.push_str(" };");
         let text = store.locals.keep_text(&declaration);
         if let Some(marked) = &a.marked {
             file_marks(&mut store.anon_marks, key, text, prefix, marked, alloc)

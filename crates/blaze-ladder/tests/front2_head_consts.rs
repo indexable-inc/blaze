@@ -327,3 +327,29 @@ fn main() {}
     }
     expect("self length", &got, &[true, false]);
 }
+
+/// A multi-statement block const generic argument (`unsafe impl MaxEncodedLen<{ let _sz = ...; _sz + f(_sz) }> for S`,
+/// as expanded by `alloy_rlp_derive::RlpMaxEncodedLen` in `reth-ecies`): `const_term` strips the outer `{ ... }`,
+/// so `anon::file_asked` must wrap the synthetic declaration in `{ ... }` lest `let _sz = ...` parse as a
+/// Rust 2024 `Expr::Let` (`bool`) instead of a statement inside a block.
+#[test]
+fn a_multi_statement_block_const_arg_preserves_its_braces() {
+    const TEXT: &str = "
+const fn extra(n: usize) -> usize { n + 2 }
+trait MaxLen<const N: usize> {}
+trait AssocLen { const LEN: usize; }
+struct A;
+struct B;
+impl AssocLen for A { const LEN: usize = 3; }
+impl AssocLen for B { const LEN: usize = 4; }
+struct S;
+impl MaxLen<{ let _sz = 0usize + <A as AssocLen>::LEN + <B as AssocLen>::LEN; _sz + extra(_sz) }> for S {}
+fn need16<T: MaxLen<16>>() {}
+fn need17<T: MaxLen<17>>() {}
+fn sixteen() { need16::<S>() }
+fn seventeen() { need17::<S>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["sixteen", "seventeen"]);
+    expect("block stmt arg", &got, &[true, false]);
+}
