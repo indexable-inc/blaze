@@ -72,6 +72,8 @@ pub struct Block {
     pub folded: bool,
     /// Optional user override for compact grid vs detailed table view on file tables.
     pub grid_override: Option<bool>,
+    /// When true, reveals columns marked hidden by default on the table (e.g. `type` in `ls`).
+    pub show_hidden_cols: bool,
     /// Smooth per-table vertical scroll offset in logical pixels (snapped to row grid in layout).
     pub table_scroll_y: f32,
     /// Smooth per-table horizontal scroll offset in logical pixels (for wide tables).
@@ -213,6 +215,7 @@ impl BlockStore {
             exit_code,
             folded,
             grid_override: None,
+            show_hidden_cols: false,
             table_scroll_y: 0.0,
             table_scroll_x: 0.0,
             table_sort: None,
@@ -233,6 +236,16 @@ impl BlockStore {
             };
             let cur = blk.grid_override.unwrap_or(default_grid);
             blk.grid_override = Some(!cur);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Toggle revealing default-hidden columns (e.g. `type` in `ls`) for a table block.
+    pub fn toggle_hidden_cols(&mut self, id: BlockId) -> bool {
+        if let Some(blk) = self.block_mut(id) {
+            blk.show_hidden_cols = !blk.show_hidden_cols;
             true
         } else {
             false

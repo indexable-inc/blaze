@@ -230,6 +230,9 @@ pub struct Table<'a> {
     /// When true (e.g. plain `ls`), renderers default to a dense multi-column `eza`-style
     /// icon grid; `ls -l` or piped transforms (`sort-by`, `where`, `select`) show the full table.
     pub default_grid: bool,
+    /// Bitmask of column indices hidden by default in table views (e.g. `type` in `ls` where
+    /// the file icon already communicates it); pipelines (`where`, `select`) still see all columns.
+    pub hidden_mask: u64,
 }
 
 impl<'a> Share for Table<'a> {}
@@ -242,10 +245,10 @@ impl<'a> Table<'a> {
             cols.push(PVec::new(alloc));
             col_display.push(ColDisplay::Auto);
         }
-        Table { columns, cols, col_display, nrows: 0, default_grid: false }
+        Table { columns, cols, col_display, nrows: 0, default_grid: false, hidden_mask: 0 }
     }
 
-    /// Create an empty table with identical columns and [`ColDisplay`] metadata.
+    /// Create an empty table with identical columns, [`ColDisplay`] metadata, and hidden-column defaults.
     pub fn empty_like(&self) -> Table<'a> {
         let alloc = self.alloc();
         let mut cols = PVec::new(alloc);
@@ -258,7 +261,40 @@ impl<'a> Table<'a> {
             col_display: self.col_display.share(),
             nrows: 0,
             default_grid: false,
+            hidden_mask: self.hidden_mask,
         }
+    }
+
+    /// Mark column `col` as hidden by default in GUI table views.
+    #[inline]
+    pub fn hide_col(&mut self, col: usize) {
+        if col < 64 {
+            self.hidden_mask |= 1u64 << col;
+        }
+    }
+
+    /// Mark column `name` as hidden by default in GUI table views.
+    pub fn hide_col_by_name(&mut self, name: &str) {
+        if let Some(ci) = self.col_index(name) {
+            self.hide_col(ci);
+        }
+    }
+
+    /// True when column `col` is hidden by default in GUI table views.
+    #[inline]
+    pub fn is_col_hidden(&self, col: usize) -> bool {
+        col < 64 && ((self.hidden_mask >> col) & 1) != 0
+    }
+
+    /// Number of columns currently marked hidden by default.
+    #[inline]
+    pub fn hidden_col_count(&self) -> usize {
+        let valid_bits = if self.columns.len() >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.columns.len()) - 1
+        };
+        (self.hidden_mask & valid_bits).count_ones() as usize
     }
 
     /// Tag column `name` with a custom [`ColDisplay`] type.
@@ -388,7 +424,14 @@ impl<'a> Table<'a> {
             cols.push(self.cols.get(ci).unwrap().share());
             col_display.push(self.col_display(ci));
         }
-        Ok(Table { columns, cols, col_display, nrows: self.nrows, default_grid: false })
+        Ok(Table {
+            columns,
+            cols,
+            col_display,
+            nrows: self.nrows,
+            default_grid: false,
+            hidden_mask: 0,
+        })
     }
 
     /// Drop named columns in O(ncols), sharing every surviving column's persistent vector.
@@ -397,15 +440,27 @@ impl<'a> Table<'a> {
         let mut columns = PVec::new(alloc);
         let mut cols = PVec::new(alloc);
         let mut col_display = PVec::new(alloc);
+        let mut hidden_mask = 0u64;
         for c in 0..self.columns.len() {
             let cname = self.columns.get(c).unwrap();
             if !names.iter().any(|&drop| drop == cname.as_ref()) {
+                let new_idx = columns.len();
                 columns.push(cname.share());
                 cols.push(self.cols.get(c).unwrap().share());
                 col_display.push(self.col_display(c));
+                if self.is_col_hidden(c) && new_idx < 64 {
+                    hidden_mask |= 1u64 << new_idx;
+                }
             }
         }
-        Table { columns, cols, col_display, nrows: self.nrows, default_grid: false }
+        Table {
+            columns,
+            cols,
+            col_display,
+            nrows: self.nrows,
+            default_grid: false,
+            hidden_mask,
+        }
     }
 
     /// Build a table from a list of records if all elements are records (or empty).
