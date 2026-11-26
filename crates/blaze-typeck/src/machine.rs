@@ -307,6 +307,11 @@ pub(crate) struct Lowered<'a> {
 pub(crate) enum Lower {
     /// A world's answer: parameter `i` is `args[i]`; a hole is malformed.
     Args(TyList),
+    /// Like [`Lower::Args`], for probing an impl's where-clauses (`interior_clauses_of`):
+    /// normalizes projections immediately via `ty.normalize` (falling back to the rigid
+    /// `TyView::Alias`) rather than emitting unbound fresh variables + pending projection
+    /// obligations that are never selected inside a probe.
+    NormalizedArgs(TyList),
     /// A defining body's coroutine record. A bare future expression belongs to
     /// that body and cannot be interpreted as an expression of the reader.
     CoroutineArgs { args: TyList, owner: ItemKey, ordinal: u32 },
@@ -1237,8 +1242,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             if witness == Witness::Fixed
                 && (err.kind == crate::ty::FulfillErrorKind::Unsatisfied || (ambiguity && ambiguous))
                 && err.because.is_none()
-                && let crate::ty::Goal::Trait { trait_, args } = err.obligation.goal
-                && let Some((w, leaf)) = self.interior_candidate(trait_, args)?
+                && let Some((trait_, args, proj)) = match err.obligation.goal {
+                    crate::ty::Goal::Trait { trait_, args } => Some((trait_, args, None)),
+                    crate::ty::Goal::Projection { trait_, args, name, term } => {
+                        let resolved = self.ty.shallow_resolve(term);
+                        (!matches!(self.ty.view(resolved), TyView::Infer(_))).then_some((trait_, args, Some((name, term))))
+                    }
+                    _ => None,
+                }
+                && let Some((w, leaf)) = self.interior_candidate(trait_, args, proj)?
             {
                 // Several suspect clauses (or one naming the probe's variables): no one clause
                 // can be re-asked on the exact interior, so the gap.
@@ -1285,6 +1297,25 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             None => (trait_, ty),
                         };
                         self.stalled.push(crate::stalled::PendingStalled { trait_: row_trait, ty: row_ty, diag });
+                        continue;
+                    }
+                    (crate::stalled::Interior::Defer, Witness::LocalFlow, crate::ty::Goal::Projection { trait_, args, name, term })
+                        if let Some((lt, la)) = nested =>
+                    {
+                        let ty = self.ty.list_get(args, 0);
+                        let leaf = Some(PendingGoal::Trait { trait_: lt, args: la });
+                        let diag = PendingDiag::unmet(
+                            DiagCode::Unsatisfied,
+                            at,
+                            Some(ty),
+                            PendingGoal::Projection { trait_, args, name, term },
+                            leaf,
+                        );
+                        self.stalled.push(crate::stalled::PendingStalled {
+                            trait_: lt,
+                            ty: self.ty.list_get(la, 0),
+                            diag,
+                        });
                         continue;
                     }
                     _ => return Err(self.witness_gap_of(witness, at).into()),
@@ -1447,12 +1478,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         Ok(Some(crate::diag::PendingWhy { start, len, leaf }))
     }
 
-    /// The list `l` of `types` under the impl arguments `iargs`, each type resolved.
+    /// The list `l` of `types` under the impl arguments `iargs`, each projection normalized
+    /// immediately and each type resolved (called inside a probe).
     fn lower_resolved(&mut self, types: PTys<'_>, l: crate::ids::List, iargs: TyList) -> Result<TyList, Stop> {
         let parts = types.list(l)?;
         let mut tys: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(parts.len(), self.alloc);
         for &p in parts {
-            let t = self.lower(types, p, Lower::Args(iargs), Cause::Body)?;
+            let t = self.lower(types, p, Lower::NormalizedArgs(iargs), Cause::Body)?;
             tys.push(self.ty.resolve(t)?);
         }
         Ok(self.ty.mk_list(&tys)?)
@@ -1512,7 +1544,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// impl fails by a decided clause (or one the initial capture fails), and the goal's
     /// failure is a finding. One level: a clause that is itself no auto trait is not looked
     /// under (rustc reports such a goal with no leaf either).
-    fn interior_candidate(&mut self, trait_: ItemKey, args: TyList) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
+    fn interior_candidate(
+        &mut self,
+        trait_: ItemKey,
+        args: TyList,
+        proj: Option<(Name, Ty)>,
+    ) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
         if self.ty.list_len(args) == 0 {
             return Ok(None);
         }
@@ -1521,7 +1558,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let Some(shape) = self.shape(self_ty) else { return Ok(None) };
         let impls = self.reads.impls_of(trait_, shape)?;
         for &imp in impls {
-            let found = self.probe(|m| m.interior_clauses_of(imp, trait_, args))?;
+            let found = self.probe(|m| m.interior_clauses_of(imp, trait_, args, proj))?;
             if found.is_some() {
                 return Ok(found);
             }
@@ -1530,9 +1567,25 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     }
 
     /// [`Self::interior_candidate`] for one impl, in the caller's probe.
-    fn interior_clauses_of(&mut self, imp: ItemKey, trait_: ItemKey, args: TyList) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
+    fn interior_clauses_of(
+        &mut self,
+        imp: ItemKey,
+        trait_: ItemKey,
+        args: TyList,
+        proj: Option<(Name, Ty)>,
+    ) -> Result<Option<(Witness, Option<(ItemKey, TyList)>)>, Stop> {
         let before_impl = self.ty.var_mark();
         let Some((iargs, true)) = self.instantiate_for_leaf(imp, trait_, args)? else { return Ok(None) };
+        if let Some((name, term)) = proj {
+            let Some(h) = self.reads.impl_header(imp)? else { return Ok(None) };
+            let Some(&(_, assoc_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == name) else {
+                return Ok(None);
+            };
+            let lowered = self.lower(h.types, assoc_ty, Lower::NormalizedArgs(iargs), Cause::Body)?;
+            if !self.ty.unify(term, lowered)? {
+                return Ok(None);
+            }
+        }
         let wc = self.reads.predicates(imp)?;
         let mut suspects = 0u32;
         let mut first: Option<(Witness, ItemKey, TyList)> = None;
@@ -2224,7 +2277,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 TyView::CoroutineOf { owner, ordinal, args, output, interior }
             }
             PNode::Param(i) => match mode {
-                Lower::Args(args) | Lower::CoroutineArgs { args, .. } => {
+                Lower::Args(args) | Lower::NormalizedArgs(args) | Lower::CoroutineArgs { args, .. } => {
                     let len = self.ty.list_len(args);
                     if i >= len {
                         // `Machine::lower` fills in its caller.
@@ -2236,7 +2289,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 Lower::Body | Lower::Assumed => TyView::Param(i),
             },
             PNode::ConstParam(i) => match mode {
-                Lower::Args(args) | Lower::CoroutineArgs { args, .. } => {
+                Lower::Args(args) | Lower::NormalizedArgs(args) | Lower::CoroutineArgs { args, .. } => {
                     let len = self.ty.list_len(args);
                     if i >= len {
                         let site = crate::error::ParamSite::Lower { at: None };
@@ -2249,6 +2302,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::ConstValue { ty, bits } => TyView::ConstValue { ty: Self::lowered(memo, ty)?, bits },
             PNode::Alias { trait_, name, args } if matches!(mode, Lower::Assumed) => {
                 TyView::Alias { trait_, name, args: self.lowered_list(memo, types, args)? }
+            }
+            PNode::Alias { trait_, name, args } if matches!(mode, Lower::NormalizedArgs(_)) => {
+                let args = self.lowered_list(memo, types, args)?;
+                match self.ty.normalize(trait_, args, name, &mut self.reads)? {
+                    Some(crate::ty::Normalized::Certain(t) | crate::ty::Normalized::Ambiguous(t)) => {
+                        return Ok(self.ty.resolve(t)?);
+                    }
+                    None => TyView::Alias { trait_, name, args },
+                }
             }
             PNode::Alias { trait_, name, args } => {
                 let args = self.lowered_list(memo, types, args)?;
@@ -2280,7 +2342,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Foreign(k) => TyView::Foreign(k),
             PNode::Infer => match mode {
                 Lower::Body => return self.fresh(),
-                Lower::Args(_) | Lower::CoroutineArgs { .. } | Lower::Assumed => return Err(CheckError::Malformed(Malformed::HoleInAnswer).into()),
+                Lower::Args(_) | Lower::NormalizedArgs(_) | Lower::CoroutineArgs { .. } | Lower::Assumed => {
+                    return Err(CheckError::Malformed(Malformed::HoleInAnswer).into());
+                }
             },
             PNode::Error => TyView::Error,
         };
