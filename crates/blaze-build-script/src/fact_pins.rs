@@ -178,16 +178,17 @@ fn triple_stem(target: &str) -> Option<&'static str> {
     }
 }
 
-/// The derived facts' pins for a script whose guest is `target` (its host): `clang --version`
-/// composed from the pin table `pin` ([`blaze_pins::CLANG_JSON`]) and `userland`, the clang seen in
-/// `clang_dir` ([`CLANG_GUEST_DIR`]); the `sw_vers` values from `userland`.
-pub fn fact_pins<'a, 't>(
-    pin: &'t str,
-    target: &'t str,
-    userland: &AppleUserland<'_>,
-    clang_dir: &str,
-    alloc: Alloc<'a>,
-) -> Result<OwnedPins<'a>, FactPinsError<'t>> {
+/// The pinned clang's default triple on Linux (`clang --version`'s `Target:` line carries no host
+/// kernel release, unlike Darwin).
+fn linux_triple(target: &str) -> Option<&'static str> {
+    match target {
+        "aarch64-unknown-linux-gnu" => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// The validated `(version, repository, revision)` from the clang pin table `pin`.
+fn clang_header<'t>(pin: &'t str) -> Result<(&'t str, &'t str, &'t str), FactPinsError<'t>> {
     let field = |field: &'static str| scalar(pin, field).filter(|v| !v.is_empty() && !v.contains(' ')).ok_or(FactPinsError::Pin { field });
     let version = field("version")?;
     if version != RUSTC_LLVM {
@@ -198,6 +199,20 @@ pub fn fact_pins<'a, 't>(
     if revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(FactPinsError::Pin { field: "revision" });
     }
+    Ok((version, repository, revision))
+}
+
+/// The derived facts' pins for a script whose guest is `target` (its host): `clang --version`
+/// composed from the pin table `pin` ([`blaze_pins::CLANG_JSON`]) and `userland`, the clang seen in
+/// `clang_dir` ([`CLANG_GUEST_DIR`]); the `sw_vers` values from `userland`.
+pub fn fact_pins<'a, 't>(
+    pin: &'t str,
+    target: &'t str,
+    userland: &AppleUserland<'_>,
+    clang_dir: &str,
+    alloc: Alloc<'a>,
+) -> Result<OwnedPins<'a>, FactPinsError<'t>> {
+    let (version, repository, revision) = clang_header(pin)?;
     let stem = triple_stem(target).ok_or(FactPinsError::NoTriple { target })?;
 
     let mut text = String::new_in(alloc);
@@ -211,5 +226,27 @@ pub fn fact_pins<'a, 't>(
         clang_version_text: text,
         macos_product_version: String::from_str_in(userland.product_version, alloc),
         macos_build_version: String::from_str_in(userland.build_version, alloc),
+    })
+}
+
+/// The derived facts' pins for a Linux script whose guest is `target` (its host): `clang --version`
+/// composed from the pin table `pin` ([`blaze_pins::CLANG_JSON`]), the clang seen in `clang_dir`
+/// ([`CLANG_GUEST_DIR`]). Linux declares no Apple userland, so the macOS version fields stay empty
+/// and [`crate::facts::answer`] refuses `sw_vers` by name.
+pub fn linux_fact_pins<'a, 't>(pin: &'t str, target: &'t str, clang_dir: &str, alloc: Alloc<'a>) -> Result<OwnedPins<'a>, FactPinsError<'t>> {
+    let (version, repository, revision) = clang_header(pin)?;
+    let triple = linux_triple(target).ok_or(FactPinsError::NoTriple { target })?;
+
+    let mut text = String::new_in(alloc);
+    for part in ["clang version ", version, " (", repository, " ", revision, ")\nTarget: ", triple] {
+        text.push_str(part);
+    }
+    for part in ["\nThread model: posix\nInstalledDir: ", clang_dir, "\n"] {
+        text.push_str(part);
+    }
+    Ok(OwnedPins {
+        clang_version_text: text,
+        macos_product_version: String::new_in(alloc),
+        macos_build_version: String::new_in(alloc),
     })
 }

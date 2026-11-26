@@ -271,6 +271,13 @@ const AUTOCFG: &[&str] = &["--crate-type=lib", "--emit=llvm-ir"];
 /// rustix 1.1.5's `can_compile` arguments (`-o` says where; stdin).
 const RUSTIX: &[&str] = &["--crate-type=rlib", "--emit=metadata"];
 
+/// eyre 0.6.12's legacy `backtrace` probe (`build.rs`): rejected since Rust 1.65 removed
+/// `Error::backtrace` in favor of `Error::provide` (`error_generic_member_access`).
+const EYRE_0612_BACKTRACE_PROBE: &str = "\n    #![feature(backtrace)]\n    #![allow(dead_code)]\n\n    use std::backtrace::{Backtrace, BacktraceStatus};\n    use std::error::Error;\n    use std::fmt::{self, Display};\n\n    #[derive(Debug)]\n    struct E;\n\n    impl Display for E {\n        fn fmt(&self, _formatter: &mut fmt::Formatter) -> fmt::Result {\n            unimplemented!()\n        }\n    }\n\n    impl Error for E {\n        fn backtrace(&self) -> Option<&Backtrace> {\n            let backtrace = Backtrace::capture();\n            match backtrace.status() {\n                BacktraceStatus::Captured | BacktraceStatus::Disabled | _ => {}\n            }\n            unimplemented!()\n        }\n    }\n";
+
+/// eyre 0.6.12's `#[track_caller]` probe (`build.rs`).
+const EYRE_0612_TRACK_CALLER_PROBE: &str = "\n    #![allow(dead_code)]\n\n    #[track_caller]\n    fn foo() {\n        let _location = std::panic::Location::caller();\n    }\n";
+
 /// proc-macro2 1.0.94's `build/probe.rs`, exactly (turso's macro side; its build.rs passes no
 /// `--cfg`).
 const PROC_MACRO2_094_SPAN: &str = "// This code exercises the surface area that we expect of Span's unstable API.\n// If the current toolchain is able to compile it, then proc-macro2 is able to\n// offer these APIs too.\n\n#![feature(proc_macro_span)]\n\nextern crate proc_macro;\n\nuse core::ops::{Range, RangeBounds};\nuse proc_macro::{Literal, Span};\n\npub fn byte_range(this: &Span) -> Range<usize> {\n    this.byte_range()\n}\n\npub fn start(this: &Span) -> Span {\n    this.start()\n}\n\npub fn end(this: &Span) -> Span {\n    this.end()\n}\n\npub fn line(this: &Span) -> usize {\n    this.line()\n}\n\npub fn column(this: &Span) -> usize {\n    this.column()\n}\n\npub fn join(this: &Span, other: Span) -> Option<Span> {\n    this.join(other)\n}\n\npub fn subspan<R: RangeBounds<usize>>(this: &Literal, range: R) -> Option<Span> {\n    this.subspan(range)\n}\n\n// Include in sccache cache key.\nconst _: Option<&str> = option_env!(\"RUSTC_BOOTSTRAP\");\n";
@@ -427,5 +434,33 @@ pub const TEMPO: &[Known] = &[
         accepted: true,
         why: "proc_macro/src/lib.rs: Span::byte_range (661), Span::join (716) and Literal::subspan (1584) under the unstable proc_macro_span, which the probe's #![feature] turns on; start/end/line/column (667-689) stable as proc_macro_span_location since 1.88.0",
         needs: PROC_MACRO,
+    },
+    // Read against library/core/src/error.rs:2 (`#![stable(feature = "error_in_core", since = "1.81.0")]`).
+    Known {
+        probe: "faster-hex 0.10.1 (autocfg): `core::error::Error`",
+        args: AUTOCFG,
+        snippet: "pub use core::error::Error;",
+        accepted: true,
+        why: "core/src/error.rs:2 `#![stable(feature = \"error_in_core\", since = \"1.81.0\")]` exports `core::error::Error` in every target's core",
+        needs: CORE,
+    },
+    // Read against library/core/src/error.rs: `Error::backtrace` was removed when `std::backtrace::Backtrace`
+    // stabilized (replaced by `Error::provide` under `error_generic_member_access`), so `impl Error for E { fn backtrace(..) }` fails E0407.
+    Known {
+        probe: "eyre 0.6.12: legacy `Error::backtrace` method",
+        args: &["--edition=2018", "--crate-type=lib", "--emit=metadata"],
+        snippet: EYRE_0612_BACKTRACE_PROBE,
+        accepted: false,
+        why: "core/src/error.rs defines no `Error::backtrace` method (removed in Rust 1.65 in favor of `Error::provide`)",
+        needs: STD,
+    },
+    // Read against library/core/src/panic/location.rs:184 (`#[stable(feature = "track_caller", since = "1.46.0")]`).
+    Known {
+        probe: "eyre 0.6.12: `#[track_caller]` with `std::panic::Location::caller`",
+        args: &["--edition=2018", "--crate-type=lib", "--emit=metadata"],
+        snippet: EYRE_0612_TRACK_CALLER_PROBE,
+        accepted: true,
+        why: "core/src/panic/location.rs:184 `pub const fn caller`, #[stable(feature = \"track_caller\", since = \"1.46.0\")], re-exported as std::panic::Location",
+        needs: STD,
     },
 ];

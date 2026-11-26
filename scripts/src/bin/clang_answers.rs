@@ -39,7 +39,7 @@ const CLANG: &str = "bin/clang-23";
 /// The input, every field required.
 struct Given {
     shelf: String,
-    sdk: String,
+    sdk: Option<String>,
     table: String,
     work: String,
     deadline: Duration,
@@ -77,12 +77,21 @@ fn typed(text: &str) -> Given {
         Some(_) => fail(SCRIPT, "field deadline_secs is a whole number of seconds from 1 to 3600"),
         None => fail(SCRIPT, "field deadline_secs is missing"),
     };
-    let (shelf, sdk) = (text_of("shelf"), text_of("sdk"));
-    for (name, path) in [("shelf", &shelf), ("sdk", &sdk)] {
-        if !Path::new(path).is_absolute() {
-            fail(SCRIPT, &format!("field {name} is an absolute path, not {path}"));
-        }
+    let shelf = text_of("shelf");
+    if !Path::new(&shelf).is_absolute() {
+        fail(SCRIPT, &format!("field shelf is an absolute path, not {shelf}"));
     }
+    let sdk = match value.get("sdk") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(it)) if it.is_empty() => None,
+        Some(Value::String(it)) => {
+            if !Path::new(it).is_absolute() {
+                fail(SCRIPT, &format!("field sdk is an absolute path, not {it}"));
+            }
+            Some(it.clone())
+        }
+        Some(_) => fail(SCRIPT, "field sdk is an absolute path string, empty, or null"),
+    };
     Given { shelf, sdk, table: text_of("table"), work: text_of("work"), deadline }
 }
 
@@ -135,21 +144,29 @@ fn placeholder(text: &str) -> Option<String> {
 /// `text` with the guest spellings put back for the machine's paths: each placeholder's host
 /// path first (longest first, so no path is spelled by a shorter one inside it), then the
 /// folders.
-fn to_guest(text: &str, paths: &[(String, String)], out_dir: &str, sdk: &str) -> String {
+fn to_guest(text: &str, paths: &[(String, String)], out_dir: &str, sdk: Option<&str>) -> String {
     let mut text = text.to_owned();
     for (spelled, host) in paths {
         text = text.replace(host.as_str(), spelled);
     }
-    text.replace(out_dir, "$OUT_DIR").replace(sdk, "$SDKROOT")
+    let text = text.replace(out_dir, "$OUT_DIR");
+    match sdk {
+        Some(sdk) => text.replace(sdk, "$SDKROOT"),
+        None => text,
+    }
 }
 
 /// An argument with the machine's paths for the guest spellings: a placeholder argument is its
 /// host path whole.
-fn to_host(text: &str, paths: &[(String, String)], out_dir: &str, sdk: &str) -> String {
+fn to_host(text: &str, paths: &[(String, String)], out_dir: &str, sdk: Option<&str>) -> String {
     if let Some((_, host)) = paths.iter().find(|(spelled, _)| spelled == text) {
         return host.clone();
     }
-    text.replace("$OUT_DIR", out_dir).replace("$SDKROOT", sdk)
+    let text = text.replace("$OUT_DIR", out_dir);
+    match sdk {
+        Some(sdk) => text.replace("$SDKROOT", sdk),
+        None => text,
+    }
 }
 
 fn answer(given: &Given, sources: &Map<String, Value>, row: &Map<String, Value>, at: usize) -> Value {
@@ -191,7 +208,7 @@ fn answer(given: &Given, sources: &Map<String, Value>, row: &Map<String, Value>,
         if !guest.starts_with("$IN") || placeholder(guest).is_none() {
             fail(SCRIPT, &format!("rows[{at}].files names {guest}, not an input placeholder `$IN<n><ext>`"));
         }
-        let host = to_host(guest, &paths, &out_dir, &given.sdk);
+        let host = to_host(guest, &paths, &out_dir, given.sdk.as_deref());
         if let Err(e) = std::fs::write(&host, text) {
             fail(SCRIPT, &os_error(&e, &host));
         }
@@ -199,7 +216,7 @@ fn answer(given: &Given, sources: &Map<String, Value>, row: &Map<String, Value>,
     let clang = format!("{}/{CLANG}", given.shelf.trim_end_matches('/'));
     let mut argv: Vec<String> = vec!["/usr/bin/env".to_owned(), "-i".to_owned()];
     for (name, value) in row_pairs(row, at, "env") {
-        argv.push(format!("{name}={}", to_host(value, &paths, &out_dir, &given.sdk)));
+        argv.push(format!("{name}={}", to_host(value, &paths, &out_dir, given.sdk.as_deref())));
     }
     argv.push(clang);
     if driver_cxx {
@@ -207,10 +224,12 @@ fn answer(given: &Given, sources: &Map<String, Value>, row: &Map<String, Value>,
     }
     argv.push("-fintegrated-cc1".to_owned());
     argv.push("--no-default-config".to_owned());
-    argv.extend(args.iter().map(|arg| to_host(arg, &paths, &out_dir, &given.sdk)));
-    if !args.iter().any(|arg| arg.starts_with("-isysroot") || arg.starts_with("--sysroot")) {
+    argv.extend(args.iter().map(|arg| to_host(arg, &paths, &out_dir, given.sdk.as_deref())));
+    if let Some(sdk) = given.sdk.as_deref()
+        && !args.iter().any(|arg| arg.starts_with("-isysroot") || arg.starts_with("--sysroot"))
+    {
         argv.push("-isysroot".to_owned());
-        argv.push(given.sdk.clone());
+        argv.push(sdk.to_owned());
     }
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let ran = match run_within(&argv, Path::new(&out_dir), given.deadline) {
@@ -218,7 +237,10 @@ fn answer(given: &Given, sources: &Map<String, Value>, row: &Map<String, Value>,
         Ok(None) => fail(SCRIPT, &format!("rows[{at}] ran past {}s: {}", given.deadline.as_secs(), argv.join(" "))),
         Err(why) => fail(SCRIPT, &format!("rows[{at}]: {why}")),
     };
-    let (stdout, stderr) = (to_guest(&ran.out(), &paths, &out_dir, &given.sdk), to_guest(&ran.err(), &paths, &out_dir, &given.sdk));
+    let (stdout, stderr) = (
+        to_guest(&ran.out(), &paths, &out_dir, given.sdk.as_deref()),
+        to_guest(&ran.err(), &paths, &out_dir, given.sdk.as_deref()),
+    );
     for (name, text) in [("stdout", &stdout), ("stderr", &stderr)] {
         for (what, path) in [("the shelf", given.shelf.as_str()), ("the work folder", given.work.as_str())] {
             if text.contains(path) {

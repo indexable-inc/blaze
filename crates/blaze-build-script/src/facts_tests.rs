@@ -103,13 +103,27 @@ fn facts_pkg_config_unknown_flag_is_refused_by_name() {
 }
 
 /// `sw_vers -productVersion` / `-buildVersion` print the pins, one line; two options are not a
-/// fact (sw_vers takes one).
+/// fact (sw_vers takes one). On a host declaring no Apple userland (empty macOS pins), `sw_vers`
+/// is refused by name while compiler identity and `pkg-config` still answer.
 #[test]
 fn facts_sw_vers_answers_the_pins() {
     assert_eq!(ask("/usr/bin/sw_vers", &["-productVersion"]).stdout, "26.1\n");
     assert_eq!(ask("sw_vers", &["-buildVersion"]).stdout, "25B78\n");
     assert_eq!(ask("sw_vers", &["-productName"]).stdout, "macOS\n");
     assert_eq!(question("sw_vers", &["-productVersion", "-buildVersion"]), None);
+
+    let linux_pins = Pins {
+        clang_version_text: "clang version 23.1.4\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\n",
+        macos_product_version: "",
+        macos_build_version: "",
+    };
+    for opt in ["-productVersion", "-buildVersion", "-productName"] {
+        let args = [opt];
+        let fact = question("sw_vers", &args).expect("a derived fact");
+        assert_eq!(answer(&fact, &linux_pins, Alloc::global()), Err(FactRefused::NoAppleUserland));
+    }
+    let cc = question("cc", &["--version"]).expect("a derived fact");
+    assert_eq!(answer(&cc, &linux_pins, Alloc::global()).expect("answered").stdout, linux_pins.clang_version_text);
 }
 
 /// `clang --version` is the pin's text exactly; `cc -dumpversion` is the pinned LLVM's version;
