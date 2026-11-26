@@ -10159,6 +10159,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             && at_bool(block_is_loop_hdr, b)
             && (!prev_falls_through || prev_loop_depth < cur_loop_depth)
         {
+            while (words.len() & 3) != 0 {
+                words.push(enc::nop());
+            }
             set_at(&mut align16_blocks, b, true);
         }
         let block_start_words = words.len();
