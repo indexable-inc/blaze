@@ -422,6 +422,8 @@ struct Flags<'a> {
     open: blaze_run::viewer::OpenExplore,
     /// `-o <path>` / `--output <path>`: where `blaze build` writes the standalone executable.
     output: Option<&'a str>,
+    /// `--target <triple>`: target backend for `blaze build` (`native` or `wasm64`).
+    target: Option<&'a str>,
     /// `--names-oracle`: `check` decides every crate's names twice and compares them (D158 step
     /// 1, engine_names.rs `NamesOracle`).
     names_oracle: engine_names::NamesOracle,
@@ -453,6 +455,7 @@ impl<'a> Flags<'a> {
             select: run_package::Select::NONE,
             open: blaze_run::viewer::OpenExplore::No,
             output: None,
+            target: None,
             names_oracle: engine_names::NamesOracle::Off,
             driver: engine_ready_edit::Driver::Auto,
             block_scopes: blaze_scope::surface::BlockScopes::Modules,
@@ -551,6 +554,9 @@ pub(crate) fn parse_flags_in<'a>(args: &'a Args, frame: &Frame, mut package: imp
     }
     if let Some(path) = parsed.last_value("output") {
         flags.output = Some(path);
+    }
+    if let Some(target) = parsed.last_value("target") {
+        flags.target = Some(target);
     }
     for word in parsed.values("view") {
         flags.view = Some(View::parse(word).ok_or(CliError::Usage("--view is person, agent or json"))?);

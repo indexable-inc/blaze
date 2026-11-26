@@ -146,6 +146,8 @@ pub enum ExportCliError {
     Materialize { symbol: [u8; 32], shown: AString<'static> },
     /// `blaze_export::export` refused the program.
     Export(ExportError),
+    /// Whole-program `wasm64` (`memory64`) compilation failed.
+    Wasm64 { shown: AString<'static> },
     /// Persisting the closing program or toolchain store root failed (Rule 3: never silently drop roots).
     KeepRoots { class: &'static str, shown: AString<'static> },
     /// Invalid output path supplied via `-o` / `--output`.
@@ -196,6 +198,7 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Position { symbol, shown } => write!(f, "blaze build: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Materialize { symbol, shown } => write!(f, "blaze build: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Export(error) => write!(f, "blaze build: {error}"),
+            ExportCliError::Wasm64 { shown } => write!(f, "blaze build --target wasm64: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::KeepRoots { class, shown } => write!(f, "blaze build: keeping {class} root failed: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::BadOutputPath { path, why } => write!(f, "blaze build: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
             ExportCliError::OutputHome(error) => write!(f, "blaze build: output directory: {error} (engine_export.rs)"),
@@ -318,6 +321,21 @@ fn check_export_flags(flags: &crate::Flags<'_>) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Target format selected by `blaze build [--target ...]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BuildTarget {
+    Native,
+    Wasm64,
+}
+
+fn parse_build_target(flag: Option<&str>) -> Result<BuildTarget, CliError> {
+    match flag {
+        None | Some("native") => Ok(BuildTarget::Native),
+        Some("wasm64" | "wasm64-blaze-wasip1") => Ok(BuildTarget::Wasm64),
+        Some(_) => Err(CliError::Usage("--target is `native`, `wasm64`, or `wasm64-blaze-wasip1`")),
+    }
+}
+
 /// Top-level `blaze export` command entry point, dispatched from `main.rs`.
 #[expect(clippy::too_many_arguments, reason = "top-level command entry: each argument one capability extracted at main")]
 pub(crate) fn command(
@@ -337,6 +355,7 @@ pub(crate) fn command(
     let mut packages = Vec::new_in(cx.frame());
     let flags = crate::parse_flags(args, |name| packages.push(name))?;
     check_export_flags(&flags)?;
+    let target = parse_build_target(flags.target)?;
     let select = run_package::Select { test_packages: packages.as_slice(), ..flags.select };
     let started_ns = phases.now();
     let stats = flags.stats;
@@ -353,7 +372,7 @@ pub(crate) fn command(
                 Some(picked) => picked,
                 None => run_package::pick(cx, root, select, frame)?,
             };
-            let summary = export_program(cx, standing, &picked, fs, output_flag, phases, watch)?;
+            let summary = export_program(cx, standing, &picked, fs, output_flag, target, phases, watch)?;
             write_start_profile(cx, root, phases, frame)?;
             let wall_ns = phases.since(started_ns);
             print_summary(cx, &summary, wall_ns, stats, out, err, frame)?;
@@ -835,13 +854,15 @@ impl blaze_ladder::run::make_one::export_lto::ExportLtoRunner for CliLtoRunner<'
     }
 }
 
-/// Core whole-program reachability closure + `blaze_export::export` + atomic write + chmod.
+/// Core whole-program reachability closure + `blaze_export::export` (or `wasm64`) + atomic write.
+#[expect(clippy::too_many_arguments, reason = "build pipeline entry: each argument one handle or selected option")]
 fn export_program<'f>(
     cx: &Cx,
     mut standing: Standing<'f, '_>,
     picked: &run_package::Program<'f>,
     fs: &Fs,
     output_flag: Option<&str>,
+    target: BuildTarget,
     phases: &mut Phases,
     watch: &dyn blaze_screen::Watch,
 ) -> Result<ExportSummary<'f>, CliError> {
@@ -851,7 +872,13 @@ fn export_program<'f>(
     };
     let output_path: &'f str = match output_flag {
         Some(path) => frame.alloc_str(path),
-        None => picked.bin,
+        None => match target {
+            BuildTarget::Native => picked.bin,
+            BuildTarget::Wasm64 => {
+                let name = bstd::mem::format_in!(frame, "{}.wasm", picked.bin);
+                frame.alloc_str(name.as_str())
+            }
+        },
     };
     let export_frame = Frame::with_reserve(EXPORT_FRAME_RESERVE, bstd::mem::Tag::Other).map_err(|_| box_err(ExportCliError::Frame, heap))?;
     let export_erased = Erased::new(&export_frame);
@@ -1015,6 +1042,88 @@ fn export_program<'f>(
                 }
             }
         }
+    }
+
+    if target == BuildTarget::Wasm64 {
+        let mut wasm_bytes: AVec<'_, u8> = Vec::new_in(alloc);
+        let wasm_opts = blaze_ladder::run::make_one::wasm64::Wasm64BuildOpts {
+            module_name: picked.bin,
+            start_symbol: Some(roots.entry),
+            exports: &[],
+            export_globals: &[],
+            include_blaze_host_v1: false,
+            opts: blaze_export::wasm64::Wasm64Opts::DEFAULT,
+        };
+        let built = blaze_ladder::run::make_one::wasm64::compile_walk_to_wasm64(
+            &walk,
+            |tabled| ids.runnable(tabled).ok(),
+            &mut maker,
+            &wasm_opts,
+            blaze_ladder::run::make_one::wasm64::default_wasm64_import,
+            &mut wasm_bytes,
+            alloc,
+        )
+        .map_err(|why| {
+            box_err(
+                ExportCliError::Wasm64 { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        end_procs(cx, &maker_procs, standing.err, "build")?;
+        let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
+        phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
+        if let Some(why) = seen.refused() {
+            return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
+        }
+        codes.ensure_persisted().map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots { class: "program code entries", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        let walked = codes.reached();
+        let toolchain_made = codes.toolchain_made();
+        drop(codes);
+        let kept_roots = keep_export_roots(lent, &today, builder.toolchain, &walked, &toolchain_made);
+        kept_roots.program.map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots { class: "program code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        kept_roots.toolchain.map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots { class: "toolchain code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        write_output_file(cx, fs, output_path, wasm_bytes.as_slice(), false, heap)?;
+        let exported = Exported {
+            platform: Platform::Wasm64,
+            functions: u32::try_from(built.func_count).unwrap_or(u32::MAX),
+            folded: 0,
+            fast: 0,
+            optimized: 0,
+            made: 0,
+            imports: u32::try_from(built.import_count).unwrap_or(u32::MAX),
+            len: wasm_bytes.len() as u64,
+            identity: built.exported.identity,
+            profile: None,
+            panics: blaze_export::Panics::Abort { functions: 0 },
+        };
+        return Ok(ExportSummary {
+            output: output_path,
+            exported,
+            data_count: built.static_count,
+            tls_count: 0,
+            compiled,
+            cached,
+            unkeyed,
+            stubs,
+            lto_bodies: 0,
+            lto_inlined: 0,
+            lto_hot: 0,
+        });
     }
 
     // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
@@ -1483,9 +1592,9 @@ fn parse_output_target(raw: &str) -> Result<OutputTarget<'_>, OutputPathIssue> {
     }
 }
 
-/// Atomically publishes `bytes` to `output_path` through `bstd::fs` and marks the resulting file
+/// Atomically publishes `bytes` to `output_path` through `bstd::fs`, optionally marking the file
 /// executable (`0o755`) on real Unix hosts.
-fn write_executable(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'static blaze_own::Heap) -> Result<(), CliError> {
+fn write_output_file(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], executable: bool, heap: &'static blaze_own::Heap) -> Result<(), CliError> {
     let target = parse_output_target(output_path).map_err(|why| {
         box_err(ExportCliError::BadOutputPath { path: owned_str(output_path, heap.alloc()), why }, heap)
     })?;
@@ -1506,10 +1615,16 @@ fn write_executable(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'s
         }
     }
     #[cfg(unix)]
-    if !cx.is_simulated() {
+    if executable && !cx.is_simulated() {
         chmod_executable(output_path, heap)?;
     }
     Ok(())
+}
+
+/// Atomically publishes `bytes` to `output_path` through `bstd::fs` and marks the resulting file
+/// executable (`0o755`) on real Unix hosts.
+fn write_executable(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'static blaze_own::Heap) -> Result<(), CliError> {
+    write_output_file(cx, fs, output_path, bytes, true, heap)
 }
 
 /// Marks `output_path` executable (`0o755`) via safe `blaze_sys::posix` calls (`openat` + `fchmod`).
