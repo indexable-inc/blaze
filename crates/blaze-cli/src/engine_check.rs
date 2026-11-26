@@ -2934,7 +2934,15 @@ fn finish_store_for_check(
         None => crate::store::after_answer_printed_with(cx, opened.lent, &opened.home, false, teardown, clock, err),
         Some(slot) => {
             let cleanup = if opened.lent.needs_commit() {
-                crate::store::plain_place::after_answer(cx, &opened.lent, 0)?.cleanup
+                let cleanup = crate::store::plain_place::after_answer(cx, &opened.lent, 0)?.cleanup;
+                // `after_answer` released the check phase's lease (`Plain::release_lease`,
+                // setting `released = true`). Re-arm automatic lease acquisition before handing
+                // the reused store to `Standing` (`blaze build`/`run`/`test`/`ci`) so any
+                // mid-command commits (such as `HomeCodeStore` past `COMMIT_BYTES`) acquire a
+                // fresh lease and cannot be swept by concurrent `blaze gc --background` before
+                // the command commits its closing roots.
+                opened.lent.rearm_lease();
+                cleanup
             } else {
                 let named = opened.lent.named();
                 let before = opened.lent.put_tally();

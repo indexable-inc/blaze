@@ -28,9 +28,11 @@
 use core::cell::RefCell;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace};
+use blaze_cas::plain::{CommittedLend, INDEX_KEYS_MOST, Lent, LentError, Namespace};
 use blaze_core::Driver;
+use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_keyed::kind::ReservedTag;
+use blaze_keyed::store::Put;
 use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, StoreError};
 
 use crate::store::plain_place::{COMMIT_BYTES, StoreAlloc};
@@ -56,6 +58,12 @@ pub(crate) struct HomeCodeStore<'m, D: Driver> {
     reached: RefCell<std::vec::Vec<CasKey, StoreAlloc>>,
     /// The toolchain-class keys this run wrote: entries and pointers with their targets.
     toolchain: std::vec::Vec<CasKey, StoreAlloc>,
+    /// Code entries already read from `lent` (or confirmed present via committed `Put::Same`)
+    /// during this command, borrowing `lent`'s immutable segment mmaps / kept arenas directly
+    /// with zero payload copies. Prevents a mid-command `lent.commit()` that adopts a newer
+    /// manifest (after concurrent `blaze gc` swept an unrooted pre-existing segment) from making
+    /// an already-stepped entry disappear (`MissingEntry`) before the command finishes reading it.
+    lent_entries: RefCell<Map<[u8; 32], &'m [u8], BuildKeyHasher, StoreAlloc>>,
 }
 
 /// The most keys one run's code may reach: one index's (blaze-cas `INDEX_KEYS_MOST`); one more
@@ -65,7 +73,8 @@ const REACHED_MOST: usize = INDEX_KEYS_MOST;
 impl<'m, D: Driver> HomeCodeStore<'m, D> {
     pub(crate) fn new(lent: &'m Lent<D, StoreAlloc>) -> HomeCodeStore<'m, D> {
         let alloc = *lent.alloc();
-        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(alloc)), toolchain: std::vec::Vec::new_in(alloc) }
+        let lent_entries = RefCell::new(Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }));
+        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(alloc)), toolchain: std::vec::Vec::new_in(alloc), lent_entries }
     }
 
     /// The toolchain-class keys this run wrote, sorted, each once (the toolchain root's new
@@ -134,10 +143,14 @@ fn refused(key: CodeKey, error: &LentError) -> StoreError {
 
 impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
+        if let Some(&bytes) = self.lent_entries.borrow().get(&key.0.0) {
+            return Ok(Some(bytes));
+        }
         match self.lent.get(&CasKey(key.0)) {
             Ok(None) => Ok(None),
             Ok(Some(lend)) if ReservedTag::Code.is(lend.tag) => {
                 self.reach(key, &[CasKey(key.0)])?;
+                self.lent_entries.borrow_mut().insert(key.0.0, lend.bytes);
                 Ok(Some(lend.bytes))
             }
             Ok(Some(_)) => Err(StoreError::Failed { key, what: "a record under a code key is filed under another tag than ReservedTag::Code: not a code entry" }),
@@ -153,7 +166,13 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
             self.lent.commit().map_err(|error| refused(key, &error))?;
             self.commits += 1;
         }
-        self.lent.put(&CasKey(key.0), Namespace::LOCAL, ReservedTag::Code.tag(), bytes).map_err(|error| refused(key, &error))?;
+        let wrote = self.lent.put(&CasKey(key.0), Namespace::LOCAL, ReservedTag::Code.tag(), bytes).map_err(|error| refused(key, &error))?;
+        if wrote == Put::Same
+            && let Ok(CommittedLend::Found(lend)) = self.lent.get_committed(&CasKey(key.0))
+            && ReservedTag::Code.is(lend.tag)
+        {
+            self.lent_entries.borrow_mut().insert(key.0.0, lend.bytes);
+        }
         self.wrote(class, key, &[CasKey(key.0)])
     }
 
@@ -162,6 +181,9 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
     /// program root that expired, store/roots.rs) is the cache's miss: the instance is built again, put, and `key` pointed anew; that is the
     /// path every miss takes, not another route.
     fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
+        if self.lent_entries.borrow().contains_key(&key.0.0) {
+            return Ok(None);
+        }
         match self.lent.pointed(ReservedTag::Code.tag(),&CasKey(key.0)) {
             // A pointer is kept by naming its name AND its target (blaze-keyed `ReservedTag::Pointer`: reach
             // does not follow a pointer), so both are this run's.

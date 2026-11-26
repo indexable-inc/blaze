@@ -284,7 +284,7 @@ const SCOPED_IDS_CERT_DOMAIN: &str = "blaze-cli run ids scoped cert 1";
 
 /// The certificate key for `RunIds` of `standing`: equal to `Key(root)` for whole-workspace runs,
 /// and folded with `scope` for scoped runs so each scope owns a disjoint `RunIds` record.
-fn body_ids_cert(root: ContentId, scope: crate::engine_check::CheckScope<'_>) -> Key {
+pub(crate) fn body_ids_cert(root: ContentId, scope: crate::engine_check::CheckScope<'_>) -> Key {
     let put_len = |h: &mut blaze_ids::Hasher, n: usize| {
         h.update(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
     };

@@ -254,3 +254,113 @@ fn a_key_without_an_input_is_caught_by_the_two_values_refusal() {
     assert!(!caught(KeyPlant::None, optimized, 13), "the full key refused an optimized entry beside a fast one");
     std::println!("code store planted: WithoutOverflow caught by TwoValues; WithoutTier caught by TwoValues; unplanted both stand");
 }
+
+/// Regression for mid-build `ExportCliError::MissingEntry` under concurrent `blaze gc --background`:
+/// 1. After a check-phase `after_answer(..., 0)` (which releases the check lease), `rearm_lease()`
+///    re-enables lease acquisition so a mid-walk `HomeCodeStore` commit acquires a fresh lease and
+///    survives concurrent GC compaction (control without `rearm_lease()` leaves 0 leases and gets swept).
+/// 2. Pre-existing unrooted entries read during the walk (`entry_of` hit OR `Put::Same`) stay
+///    readable from `HomeCodeStore` even after concurrent GC sweeps their old segment and a later
+///    mid-walk commit adopts the newer manifest without that segment.
+#[test]
+fn concurrent_gc_during_mid_walk_commit_never_drops_stepped_entries() {
+    use blaze_cas::plain::Liveness;
+    use blaze_ladder::code_records::entry_of;
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::mem::TASK_FRAME;
+    use bstd::test::BUDGET;
+    use crate::store::Home;
+
+    let io = Io::simulated(SimWorld::new(91, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let heap = blaze_own::testing::heap();
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+    let open_reached = |nonce: u64| {
+        home.open_store_with_liveness(&StoreSettings::default(), Facts { boot: Some(1), nonce }, Liveness::Reached, heap.alloc())
+            .expect("open store")
+    };
+    let big_entry = |seed: u8| -> std::vec::Vec<u8> {
+        (0..8192).map(|i| seed.wrapping_mul(37).wrapping_add((i & 0xff) as u8)).collect()
+    };
+    let key_of = |name: &str| CodeKey(ContentId::of("concurrent gc code test", name.as_bytes()));
+
+    let hit_bytes = big_entry(1);
+    let same_bytes = big_entry(2);
+    let new_bytes = big_entry(3);
+    let new2_bytes = big_entry(4);
+    let hit_ptr = key_of("hit_ptr");
+    let hit_content = key_of("hit_content");
+    let same_content = key_of("same_content");
+    let new_ptr = key_of("new_ptr");
+    let new_content = key_of("new_content");
+    let new2_content = key_of("new2_content");
+
+    // 1. Seed an unrooted segment S1 (simulating a prior unrooted build or evicted root).
+    {
+        let seed = open_reached(1);
+        let mut codes = HomeCodeStore::new(&seed);
+        codes.put(CodeClass::Program, hit_content, &hit_bytes).expect("seed hit");
+        codes.point(CodeClass::Program, hit_ptr, hit_content).expect("seed hit ptr");
+        codes.put(CodeClass::Program, same_content, &same_bytes).expect("seed same");
+        drop(codes);
+        after_answer(&cx, &seed, 0).expect("commit seed");
+    }
+
+    // 2. Process `build` runs a check-phase commit (`finish_store_for_check`) and rearms its lease.
+    let lent_build = open_reached(2);
+    let check_key = CasKey(ContentId::of("concurrent gc check record", b"r1"));
+    lent_build.put(&check_key, Namespace::LOCAL, ReservedTag::Drive.tag(), b"checked").expect("put check");
+    lent_build.root_for("ans.check", &[check_key], blaze_cas::plain::ROOT_LIFE_NS).expect("root check");
+    after_answer(&cx, &lent_build, 0).expect("check-phase commit");
+    lent_build.rearm_lease();
+
+    // Walk steps: read `hit_ptr` (cache hit on S1), hit `Put::Same` on `same_content` (on S1),
+    // and compile `new_content` + mid-walk commit (must acquire a live lease!).
+    let mut codes = HomeCodeStore::new(&lent_build);
+    let walked_hit_under = codes.pointed(hit_ptr).expect("pointed hit").expect("hit target");
+    assert_eq!(walked_hit_under, hit_content);
+    assert_eq!(codes.get(walked_hit_under).expect("get hit"), Some(hit_bytes.as_slice()));
+    codes.put(CodeClass::Program, same_content, &same_bytes).expect("put same");
+    codes.put(CodeClass::Program, new_content, &new_bytes).expect("put new");
+    codes.point(CodeClass::Program, new_ptr, new_content).expect("point new");
+    lent_build.commit().expect("mid-walk commit");
+    assert_eq!(lent_build.leases_len(), 1, "rearmed build must acquire a live lease on mid-walk commit");
+
+    // 3. Concurrent `blaze gc` compacts the store while `lent_build` is still open mid-walk.
+    // Unrooted S1 (generation <= opened_generation) is swept; leased `new_content` MUST survive!
+    {
+        let lent_gc = open_reached(3);
+        let _ = lent_gc.compact_foreground(32).expect("concurrent gc");
+        assert!(lent_gc.get(&CasKey(hit_content.0)).expect("gc check hit").is_none(), "gc must have swept unrooted S1");
+        assert!(lent_gc.get(&CasKey(new_content.0)).expect("gc check new").is_some(), "gc must preserve leased mid-walk segment");
+    }
+
+    // 4. `build` performs another mid-walk commit, adopting GC's manifest (which dropped S1).
+    codes.put(CodeClass::Program, new2_content, &new2_bytes).expect("put new2");
+    lent_build.commit().expect("second mid-walk commit");
+
+    // 5. Post-walk assembly (`engine_export.rs` `entry_of(&codes, key)`) must find EVERY entry!
+    assert_eq!(entry_of(&codes, hit_content).expect("post-walk hit"), Some(hit_bytes.as_slice()));
+    assert_eq!(entry_of(&codes, same_content).expect("post-walk same"), Some(same_bytes.as_slice()));
+    assert_eq!(entry_of(&codes, new_content).expect("post-walk new"), Some(new_bytes.as_slice()));
+    assert_eq!(entry_of(&codes, new2_content).expect("post-walk new2"), Some(new2_bytes.as_slice()));
+    drop(codes);
+    after_answer(&cx, &lent_build, 0).expect("closing commit");
+
+    // 6. Control (rule 23): without `rearm_lease()`, `after_answer(..., 0)` leaves `released = true`,
+    // so a subsequent mid-walk commit acquires 0 leases and concurrent GC sweeps its segment.
+    let lent_unarmed = open_reached(4);
+    let check_key2 = CasKey(ContentId::of("concurrent gc check record", b"r2"));
+    lent_unarmed.put(&check_key2, Namespace::LOCAL, ReservedTag::Drive.tag(), b"checked2").expect("put check2");
+    lent_unarmed.root_for("ans.check2", &[check_key2], blaze_cas::plain::ROOT_LIFE_NS).expect("root check2");
+    after_answer(&cx, &lent_unarmed, 0).expect("check-phase commit without rearm");
+    let unarmed_key = key_of("unarmed_content");
+    let unarmed_bytes = big_entry(5);
+    lent_unarmed.put(&CasKey(unarmed_key.0), Namespace::LOCAL, ReservedTag::Code.tag(), &unarmed_bytes).expect("put unarmed");
+    lent_unarmed.commit().expect("unarmed mid-walk commit");
+    assert_eq!(lent_unarmed.leases_len(), 0, "control: without rearm_lease, released stays true and acquires no lease");
+    let lent_gc2 = open_reached(5);
+    let _ = lent_gc2.compact_foreground(32).expect("gc sweeps unleased segment");
+    assert!(lent_gc2.get(&CasKey(unarmed_key.0)).expect("gc check unarmed").is_none(), "control: unleased mid-walk segment was swept by concurrent GC");
+}
