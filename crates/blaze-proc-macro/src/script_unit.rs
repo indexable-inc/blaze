@@ -154,8 +154,17 @@ pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&st
 }
 
 /// [`module_of_native`] with optional `files <sha256>` identity line for path packages.
+/// Prefers an exact `files <sha256>` match when present; falls back to an untagged native
+/// bootstrap record (`blaze build-script module native 1`, which `placed_in_store` selects via
+/// `module_of_native`) when no `files`-tagged native record exists.
 pub fn module_of_native_files(store: &Path, name: &str, version: &str, features: &[&str], host: &str, files: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, Some(host), files)
+    if let Some(found) = module_where(store, name, version, features, Some(host), files)? {
+        return Ok(Some(found));
+    }
+    if files.is_some() {
+        return module_where(store, name, version, features, Some(host), None);
+    }
+    Ok(None)
 }
 
 /// Relative paths under a package directory that contribute to a workspace-member or path
