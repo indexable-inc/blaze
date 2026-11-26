@@ -512,6 +512,7 @@ fn walk_nix_elf_closure(
     // ONLY with the executable itself, its `PT_INTERP`, and (for `nix-ld`) `NIX_LD_SO`.
     // For the primary program we always keep `program` (its shelf path) for `$ORIGIN` expansion
     // even when `verified_exec_fd` is an anonymous sealed `memfd`.
+    let host_ld_caps = if !is_nix { HostLdCaps::detect() } else { HostLdCaps { at_hwcap: 0, x86_64_level: 0 } };
     let mut queue = [([0u8; PATH_CAP], 0usize, RpathChain::EMPTY); MAX_LIBS];
     let mut q_len = 0usize;
     let mut q_head = 0usize;
@@ -734,6 +735,7 @@ fn walk_nix_elf_closure(
                     glibc_dir,
                     is_nix,
                     ld_cache_bytes.as_deref(),
+                    &host_ld_caps,
                     plan,
                     &mut queue,
                     &mut q_len,
@@ -1031,14 +1033,212 @@ fn matches_target_ld_cache_flags(flags: u32) -> bool {
     }
 }
 
+/// Host CPU capabilities read from `/proc/self/auxv` (and `/proc/cpuinfo` on x86_64) used to
+/// match glibc `ld.so`'s exact `glibc-hwcaps` and legacy `AT_HWCAP` entry selection in
+/// `/etc/ld.so.cache`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostLdCaps {
+    pub at_hwcap: u64,
+    pub x86_64_level: u8,
+}
+
+impl HostLdCaps {
+    pub fn detect() -> Self {
+        let at_hwcap = read_proc_auxv_hwcap();
+        #[cfg(target_arch = "x86_64")]
+        let x86_64_level = read_proc_cpuinfo_x86_64_level();
+        #[cfg(not(target_arch = "x86_64"))]
+        let x86_64_level = 0;
+        Self { at_hwcap, x86_64_level }
+    }
+}
+
+fn read_proc_auxv_hwcap() -> u64 {
+    let Ok(fd) = openat(CWD, blaze_sys::Path::new(c"/proc/self/auxv"), OpenFlags::CLOSE_ON_EXEC, 0) else {
+        return 0;
+    };
+    let mut buf = [0u8; 2048];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let Ok(off) = u64::try_from(filled) else {
+            break;
+        };
+        let Some(dst) = buf.get_mut(filled..) else {
+            break;
+        };
+        let Ok(n) = pread(fd.fd(), dst, off) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let mut pos = 0usize;
+    while pos + 16 <= filled {
+        let tag = read_u64_le(&buf, pos);
+        let val = read_u64_le(&buf, pos + 8);
+        pos += 16;
+        if tag == 0 {
+            break;
+        }
+        if tag == 16 {
+            // AT_HWCAP
+            return val;
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_proc_cpuinfo_x86_64_level() -> u8 {
+    let Ok(fd) = openat(CWD, blaze_sys::Path::new(c"/proc/cpuinfo"), OpenFlags::CLOSE_ON_EXEC, 0) else {
+        return 1;
+    };
+    let mut buf = [0u8; 8192];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let Ok(off) = u64::try_from(filled) else {
+            break;
+        };
+        let Some(dst) = buf.get_mut(filled..) else {
+            break;
+        };
+        let Ok(n) = pread(fd.fd(), dst, off) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let text = buf.get(..filled).unwrap_or(&[]);
+    let Some(flags_line) = text
+        .split(|&b| b == b'\n')
+        .find(|line| line.starts_with(b"flags") && line.contains(&b':'))
+    else {
+        return 1;
+    };
+    let Some(colon) = flags_line.iter().position(|&b| b == b':') else {
+        return 1;
+    };
+    let flags = flags_line.get(colon + 1..).unwrap_or(&[]);
+    let has = |feat: &[u8]| flags.split(|&b| b == b' ' || b == b'\t').any(|tok| tok == feat);
+    let v2 = has(b"cx16") && has(b"lahf_lm") && has(b"popcnt") && has(b"sse4_1") && has(b"sse4_2") && has(b"ssse3");
+    if !v2 {
+        return 1;
+    }
+    let v3 = has(b"avx")
+        && has(b"avx2")
+        && has(b"bmi1")
+        && has(b"bmi2")
+        && has(b"f16c")
+        && has(b"fma")
+        && (has(b"abm") || has(b"lzcnt"))
+        && has(b"movbe")
+        && has(b"xsave");
+    if !v3 {
+        return 2;
+    }
+    let v4 = has(b"avx512f") && has(b"avx512bw") && has(b"avx512cd") && has(b"avx512dq") && has(b"avx512vl");
+    if v4 { 4 } else { 3 }
+}
+
+/// Locates the `cache_extension_tag_glibc_hwcaps` (`tag == 1`) string-offset table inside a
+/// `glibc-ld.so.cache1.1` header, returning `(table_file_offset, entry_count)` when present.
+fn find_glibc_hwcaps_extension(cache_bytes: &[u8], base_off: usize) -> Option<(usize, usize)> {
+    const EXT_MAGIC: u32 = 0xeaa4_2174;
+    const TAG_GLIBC_HWCAPS: u32 = 1;
+    let ext_rel = usize::try_from(read_u32_le(cache_bytes, base_off + 32)).ok()?;
+    if ext_rel == 0 {
+        return None;
+    }
+    let ext_off = base_off.checked_add(ext_rel)?;
+    if ext_off.checked_add(8)? > cache_bytes.len() {
+        return None;
+    }
+    if read_u32_le(cache_bytes, ext_off) != EXT_MAGIC {
+        return None;
+    }
+    let count = usize::try_from(read_u32_le(cache_bytes, ext_off + 4)).ok()?;
+    let sections_start = ext_off.checked_add(8)?;
+    let sections_end = sections_start.checked_add(count.checked_mul(16)?)?;
+    if sections_end > cache_bytes.len() {
+        return None;
+    }
+    for i in 0..count {
+        let s_off = sections_start + i * 16;
+        if read_u32_le(cache_bytes, s_off) == TAG_GLIBC_HWCAPS {
+            let data_rel = usize::try_from(read_u32_le(cache_bytes, s_off + 8)).ok()?;
+            let data_size = usize::try_from(read_u32_le(cache_bytes, s_off + 12)).ok()?;
+            let data_off = base_off.checked_add(data_rel)?;
+            if data_off.checked_add(data_size)? <= cache_bytes.len() {
+                return Some((data_off, data_size / 4));
+            }
+        }
+    }
+    None
+}
+
+fn ld_cache_hwcap_supported(
+    cache_bytes: &[u8],
+    base_off: usize,
+    hwcaps_ext: Option<(usize, usize)>,
+    hwcap: u64,
+    host_caps: &HostLdCaps,
+) -> bool {
+    if hwcap == 0 {
+        return true;
+    }
+    let tag = hwcap >> 62;
+    if tag == 1 {
+        // glibc-hwcaps extension entry (`DL_CACHE_HWCAP_EXTENSION = 1 << 62`): low 32 bits index
+        // into `cache_extension_tag_glibc_hwcaps`.
+        let Some((table_off, count)) = hwcaps_ext else {
+            return false;
+        };
+        let Ok(idx) = usize::try_from(hwcap & 0xffff_ffff) else {
+            return false;
+        };
+        if idx >= count {
+            return false;
+        }
+        let Ok(str_rel) = usize::try_from(read_u32_le(cache_bytes, table_off + idx * 4)) else {
+            return false;
+        };
+        let Some(str_off) = base_off.checked_add(str_rel) else {
+            return false;
+        };
+        let Some(tail) = cache_bytes.get(str_off..) else {
+            return false;
+        };
+        let Some(end) = tail.iter().position(|&b| b == 0) else {
+            return false;
+        };
+        let subdir = tail.get(..end).unwrap_or(&[]);
+        return match subdir {
+            b"x86-64-v2" => host_caps.x86_64_level >= 2,
+            b"x86-64-v3" => host_caps.x86_64_level >= 3,
+            b"x86-64-v4" => host_caps.x86_64_level >= 4,
+            _ => false,
+        };
+    }
+    if tag == 0 {
+        // Legacy `AT_HWCAP` entry (bits 0..55; bits 56..61 encode legacy platform id).
+        return (hwcap >> 56) == 0 && (hwcap & !host_caps.at_hwcap) == 0;
+    }
+    false
+}
+
 /// Parses glibc's `/etc/ld.so.cache` (`glibc-ld.so.cache1.1`, either standalone at offset 0 or
-/// 8-byte-aligned after a compat `ld.so-1.7.0` header) and invokes `on_path` for EVERY
-/// target-architecture entry whose key equals `soname` (covering both `/etc/ld.so.conf.d`
-/// directories and `glibc-hwcaps` ISA variants). Returns `Ok(true)` if at least one `on_path`
-/// invocation resolved an existing library file.
-pub fn parse_ld_so_cache_matches(
+/// 8-byte-aligned after a compat `ld.so-1.7.0` header) in glibc `ld.so`'s priority order,
+/// filtering by target ELF architecture and `host_caps` (`glibc-hwcaps` extension + legacy
+/// `AT_HWCAP`), and stops on the FIRST eligible existing library where `on_path` returns
+/// `Ok(true)` so neither Landlock confinement nor closure hashing touches unused alternatives.
+pub fn parse_ld_so_cache_match(
     cache_bytes: &[u8],
     soname: &[u8],
+    host_caps: &HostLdCaps,
     mut on_path: impl FnMut(&[u8]) -> Result<bool, Fault>,
 ) -> Result<bool, Fault> {
     const NEW_MAGIC: &[u8] = b"glibc-ld.so.cache1.1";
@@ -1083,11 +1283,15 @@ pub fn parse_ld_so_cache_matches(
         return Err(Fault::Host { call: "ld.so.cache (truncated entry table)", code: 22 });
     }
 
-    let mut resolved_any = false;
+    let hwcaps_ext = find_glibc_hwcaps_extension(cache_bytes, base_off);
     for idx in 0..nlibs {
         let entry_off = hdr_end + idx * NEW_ENTRY_LEN;
         let flags = read_u32_le(cache_bytes, entry_off);
         if !matches_target_ld_cache_flags(flags) {
+            continue;
+        }
+        let hwcap = read_u64_le(cache_bytes, entry_off + 16);
+        if !ld_cache_hwcap_supported(cache_bytes, base_off, hwcaps_ext, hwcap, host_caps) {
             continue;
         }
         let Ok(key_rel) = usize::try_from(read_u32_le(cache_bytes, entry_off + 4)) else {
@@ -1116,10 +1320,10 @@ pub fn parse_ld_so_cache_matches(
         };
         let path = val_tail.get(..val_end).unwrap_or(&[]);
         if !path.is_empty() && on_path(path)? {
-            resolved_any = true;
+            return Ok(true);
         }
     }
-    Ok(resolved_any)
+    Ok(false)
 }
 
 fn enqueue_nix_soname<const N: usize>(
@@ -1133,6 +1337,7 @@ fn enqueue_nix_soname<const N: usize>(
     glibc_dir: Option<&[u8]>,
     is_nix: bool,
     ld_cache: Option<&[u8]>,
+    host_caps: &HostLdCaps,
     plan: Option<&Plan<'_>>,
     queue: &mut [([u8; 320], usize, RpathChain); N],
     q_len: &mut usize,
@@ -1155,13 +1360,13 @@ fn enqueue_nix_soname<const N: usize>(
         }
     } else {
         // On non-Nix FHS Linux (in BOTH Landlock confinement AND runtime closure hashing),
-        // resolve through `/etc/ld.so.cache` FIRST (granting `READ_FILE` and/or hashing every
-        // matching arch path including custom `/etc/ld.so.conf.d` dirs and `glibc-hwcaps`
-        // variants), falling back to standard FHS dirs only when no matching cache entry exists.
+        // select ONLY the single active entry in `/etc/ld.so.cache` matching glibc `ld.so`'s
+        // priority order and `host_caps` (`glibc-hwcaps` / `AT_HWCAP`), falling back to standard
+        // FHS dirs only when no matching cache entry exists.
         if let Some(cache_bytes) = ld_cache
             && !cache_bytes.is_empty()
         {
-            let found = parse_ld_so_cache_matches(cache_bytes, soname, |resolved_path| {
+            let found = parse_ld_so_cache_match(cache_bytes, soname, host_caps, |resolved_path| {
                 try_grant_and_enqueue_lib(
                     reader,
                     cx,
@@ -1434,7 +1639,7 @@ impl Confiner for Landlock {
 mod nix_closure_tests {
     use alloc::vec::Vec;
 
-    use super::{Fault, RpathChain, enqueue_nix_resolved_path, parse_ld_so_cache_matches};
+    use super::{Fault, HostLdCaps, RpathChain, enqueue_nix_resolved_path, parse_ld_so_cache_match};
 
     #[test]
     fn nix_elf_closure_queue_cap_refuses_instead_of_truncating() {
@@ -1456,7 +1661,7 @@ mod nix_closure_tests {
     }
 
     #[test]
-    fn ld_so_cache_parser_resolves_custom_dirs_and_hwcaps_in_both_formats() {
+    fn ld_so_cache_parser_selects_only_active_entry_in_both_formats() {
         #[cfg(target_arch = "aarch64")]
         let (target_flags, other_flags) = (0x0a03u32, 0x0303u32);
         #[cfg(target_arch = "x86_64")]
@@ -1465,42 +1670,57 @@ mod nix_closure_tests {
         let (target_flags, other_flags) = (0x0003u32, 0x0000u32);
 
         let build_new_cache = || -> Vec<u8> {
-            let entries: &[(u32, &[u8], &[u8])] = &[
-                (target_flags, b"libz.so.1", b"/opt/custom/glibc-hwcaps/v3/libz.so.1"),
-                (target_flags, b"libz.so.1", b"/opt/custom/libz.so.1"),
-                (other_flags, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
-                (target_flags, b"libc.so.6", b"/usr/lib/libc.so.6"),
+            let hwcap_ext_0 = (1u64 << 62) | 0u64;
+            let entries: &[(u32, u64, &[u8], &[u8])] = &[
+                (target_flags, hwcap_ext_0, b"libz.so.1", b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1"),
+                (target_flags, 0, b"libz.so.1", b"/opt/custom/libz.so.1"),
+                (target_flags, 0, b"libz.so.1", b"/usr/lib/fallback/libz.so.1"),
+                (other_flags, 0, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
             ];
             let str_base = 48 + entries.len() * 24;
             let mut strings = Vec::new();
             let mut offsets = Vec::new();
-            for &(flags, key, val) in entries {
+            for &(flags, hwcap, key, val) in entries {
                 let k_off = str_base + strings.len();
                 strings.extend_from_slice(key);
                 strings.push(0);
                 let v_off = str_base + strings.len();
                 strings.extend_from_slice(val);
                 strings.push(0);
-                offsets.push((flags, k_off as u32, v_off as u32));
+                offsets.push((flags, hwcap, k_off as u32, v_off as u32));
             }
+            let v3_str_off = (str_base + strings.len()) as u32;
+            strings.extend_from_slice(b"x86-64-v3\0");
             let mut buf = Vec::new();
             buf.extend_from_slice(b"glibc-ld.so.cache1.1");
             buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
             buf.extend_from_slice(&(strings.len() as u32).to_le_bytes());
             buf.resize(48, 0);
-            for (flags, k_off, v_off) in offsets {
+            for (flags, hwcap, k_off, v_off) in offsets {
                 buf.extend_from_slice(&flags.to_le_bytes());
                 buf.extend_from_slice(&k_off.to_le_bytes());
                 buf.extend_from_slice(&v_off.to_le_bytes());
                 buf.extend_from_slice(&0u32.to_le_bytes());
-                buf.extend_from_slice(&0u64.to_le_bytes());
+                buf.extend_from_slice(&hwcap.to_le_bytes());
             }
             buf.extend_from_slice(&strings);
+            while buf.len() % 4 != 0 {
+                buf.push(0);
+            }
+            let ext_off = buf.len() as u32;
+            buf[32..36].copy_from_slice(&ext_off.to_le_bytes());
+            let data_off = ext_off + 8 + 16;
+            buf.extend_from_slice(&0xeaa4_2174u32.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&data_off.to_le_bytes());
+            buf.extend_from_slice(&4u32.to_le_bytes());
+            buf.extend_from_slice(&v3_str_off.to_le_bytes());
             buf
         };
 
         let new_only = build_new_cache();
-        // Compat format: `ld.so-1.7.0` + 1 legacy 12-byte entry + 4-byte padding to 8-byte boundary.
         let mut compat = Vec::new();
         compat.extend_from_slice(b"ld.so-1.7.0\0");
         compat.extend_from_slice(&1u32.to_le_bytes());
@@ -1510,24 +1730,18 @@ mod nix_closure_tests {
         }
         compat.extend_from_slice(&new_only);
 
+        let caps_v3 = HostLdCaps { at_hwcap: 0, x86_64_level: 3 };
+        let caps_base = HostLdCaps { at_hwcap: 0, x86_64_level: 1 };
         for buf in [&new_only, &compat] {
-            let mut found: Vec<Vec<u8>> = Vec::new();
-            let ok = parse_ld_so_cache_matches(buf, b"libz.so.1", |path| {
-                found.push(path.to_vec());
-                Ok(true)
-            })
-            .expect("valid ld.so.cache must parse");
-            assert!(ok);
-            assert_eq!(
-                found,
-                alloc::vec![
-                    b"/opt/custom/glibc-hwcaps/v3/libz.so.1".to_vec(),
-                    b"/opt/custom/libz.so.1".to_vec(),
-                ]
-            );
+            let mut found_v3: Vec<Vec<u8>> = Vec::new();
+            assert!(parse_ld_so_cache_match(buf, b"libz.so.1", &caps_v3, |p| { found_v3.push(p.to_vec()); Ok(true) }).expect("v3"));
+            assert_eq!(found_v3, alloc::vec![b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1".to_vec()]);
+
+            let mut found_base: Vec<Vec<u8>> = Vec::new();
+            assert!(parse_ld_so_cache_match(buf, b"libz.so.1", &caps_base, |p| { found_base.push(p.to_vec()); Ok(true) }).expect("base"));
+            assert_eq!(found_base, alloc::vec![b"/opt/custom/libz.so.1".to_vec()]);
         }
-        // Corrupt magic must fail loudly rather than silently falling back.
-        let err = parse_ld_so_cache_matches(b"not-an-ld-cache", b"libz.so.1", |_| Ok(true))
+        let err = parse_ld_so_cache_match(b"not-an-ld-cache", b"libz.so.1", &caps_base, |_| Ok(true))
             .expect_err("corrupt ld.so.cache must fail");
         assert!(matches!(err, Fault::Host { code: 22, .. }));
     }

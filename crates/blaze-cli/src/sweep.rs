@@ -53,7 +53,6 @@ struct FactFiles<'a> {
     /// `cc-probe` leaf row is actually followed (zero overhead on pure-Rust workspaces).
     sdk_digest: Option<&'a dyn Fn() -> [u8; 32]>,
     cached_sdk: Option<[u8; 32]>,
-    cached_answerer: Option<ContentId>,
     #[cfg(target_os = "linux")]
     root_reader: Option<bstd::procs::hermetic::RootReader>,
 }
@@ -166,9 +165,9 @@ impl<'a> FactFiles<'a> {
     }
 
     fn active_answerer_id(&mut self, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
-        if let Some(cached) = self.cached_answerer {
-            return Ok(cached);
-        }
+        // Recompute live on every saved `cc-probe` leaf (matching `HermeticClangProbe::id`) so a
+        // mid-sweep `/run/current-system` switch cannot let later leaves pass under the old closure,
+        // while still reusing `self.root_reader` across leaves.
         let id = match (self.home, self.home_path) {
             (Some((cx, _)), Some(home)) => {
                 #[cfg(target_os = "linux")]
@@ -208,7 +207,6 @@ impl<'a> FactFiles<'a> {
             }
             _ => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id(),
         };
-        self.cached_answerer = Some(id);
         Ok(id)
     }
 
@@ -279,7 +277,6 @@ pub(crate) fn verify_fact_leaves(leaves: &Leaves<'_>, exe_dir: Option<&str>, fra
         home_path: None,
         sdk_digest: None,
         cached_sdk: None,
-        cached_answerer: None,
         #[cfg(target_os = "linux")]
         root_reader: None,
     };
@@ -1310,7 +1307,6 @@ impl<S: Stamps> Follow<S> {
             home_path,
             sdk_digest,
             cached_sdk: None,
-            cached_answerer: None,
             #[cfg(target_os = "linux")]
             root_reader: None,
         };

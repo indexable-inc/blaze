@@ -607,6 +607,25 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert!(!is_probe("cc", &["-c", "-Xpreprocessor", "-MD", "-Xpreprocessor", "-MF", "-Xpreprocessor", "/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
     assert!(!is_probe("cc", &["-E", "-Xpreprocessor", "-MD", "/out/12345detect_compiler_family.c"]));
     assert!(!is_probe("cc", &["-c", "-Xclang", "-dependency-file", "-Xclang", "/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-g", "-gsplit-dwarf", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-g", "-gsplit-dwarf=split", "-o", "/out/flag_check", "/out/flag_check.c"]));
+
+    // Root substitution must only occur at real path/option boundaries: `+` or non-ASCII suffixes
+    // after `OUT_DIR` are distinct literals and must NOT be rewritten to `$OUT_DIR`.
+    for literal_def in [
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out+suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/outé\"",
+    ] {
+        let def_args = flag_args(literal_def);
+        let sp_def = Spawn { program: "cc", args: &def_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        let canon = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_def, files, alloc)
+            .expect("literal macro def with +/non-ASCII suffix");
+        assert!(
+            canon.row.args.iter().any(|a| a.as_str() == literal_def),
+            "expected `{literal_def}` to stay literal without $OUT_DIR substitution, got {:?}",
+            canon.row.args
+        );
+    }
 
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");

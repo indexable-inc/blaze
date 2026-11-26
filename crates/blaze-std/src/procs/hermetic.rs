@@ -513,7 +513,7 @@ mod tests;
 mod process_tests;
 
 #[cfg(target_os = "linux")]
-pub use landlock::{feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_matches};
+pub use landlock::{HostLdCaps, feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match};
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
 pub use machine::{Effect, Event, HermeticMachine, MachineOpts, State, Stream, Usage};
 pub use plan::{Access, Plan, PlanOpts, Rule as PlanRule, Why};

@@ -222,6 +222,10 @@ fn is_extra_output_flag(arg: &str) -> bool {
             | "-fproc-stat-report"
             | "-ftest-coverage"
             | "--coverage"
+            | "-gsplit-dwarf"
+            | "--split-dwarf"
+            | "-split-dwarf-file"
+            | "-split-dwarf-output"
             | "--output"
             | "-Xpreprocessor"
             | "-Xclang"
@@ -234,6 +238,10 @@ fn is_extra_output_flag(arg: &str) -> bool {
         || arg.starts_with("-Wp,")
         || arg.starts_with("-Wa,")
         || arg.starts_with("-Wl,")
+        || arg.starts_with("-gsplit-dwarf=")
+        || arg.starts_with("--split-dwarf=")
+        || arg.starts_with("-split-dwarf-file=")
+        || arg.starts_with("-split-dwarf-output=")
         || arg.starts_with("-dependency-file=")
         || arg.starts_with("--dependency-file=")
         || arg.starts_with("-serialize-diagnostics=")
@@ -1578,9 +1586,16 @@ fn same_key(a: &Row<'_>, b: &Row<'_>) -> bool {
         && same_set(&a.files, &b.files)
 }
 
-/// Whether `byte` may continue a path component (so a root followed by it is another name).
-fn continues_name(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+/// Whether `next` is a real path or option boundary immediately after a substituted root directory
+/// (never treating filename characters like `+`, `@`, or non-ASCII UTF-8 bytes as delimiters).
+fn is_root_end_boundary(next: Option<u8>) -> bool {
+    match next {
+        None => true,
+        Some(b) => matches!(
+            b,
+            b'/' | b':' | b';' | b',' | b'=' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b')' | b']' | b'}' | b'>'
+        ),
+    }
 }
 
 /// `text` split structurally into literal spans and real guest-folder placeholders.
@@ -1596,7 +1611,7 @@ fn spelled_segments<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) ->
         for (root, spelling) in roots.iter().copied() {
             if !root.is_empty()
                 && rest.starts_with(root)
-                && !bytes.get(at + root.len()).is_some_and(|b| continues_name(*b))
+                && is_root_end_boundary(bytes.get(at + root.len()).copied())
             {
                 if !lit.is_empty() {
                     out.push(Segment::Literal(lit));
@@ -1633,7 +1648,7 @@ fn spelled_roots<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) -> AS
     let mut at = 0;
     'scan: while at < text.len() {
         for (root, spelling) in roots.iter().copied() {
-            if !root.is_empty() && text[at..].starts_with(root) && !bytes.get(at + root.len()).is_some_and(|b| continues_name(*b)) {
+            if !root.is_empty() && text[at..].starts_with(root) && is_root_end_boundary(bytes.get(at + root.len()).copied()) {
                 out.push_str(spelling);
                 at += root.len();
                 continue 'scan;

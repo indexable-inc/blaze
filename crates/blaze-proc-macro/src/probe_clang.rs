@@ -1847,37 +1847,54 @@ mod tests {
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let (target_flags, other_flags) = (0x0003u32, 0x0000u32);
 
-        let entries: &[(u32, &[u8], &[u8])] = &[
-            (target_flags, b"libz.so.1", b"/opt/custom/glibc-hwcaps/v3/libz.so.1"),
-            (target_flags, b"libz.so.1", b"/opt/custom/libz.so.1"),
-            (other_flags, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
-            (target_flags, b"libc.so.6", b"/usr/lib/libc.so.6"),
+        let hwcap_ext_0 = (1u64 << 62) | 0u64;
+        let entries: &[(u32, u64, &[u8], &[u8])] = &[
+            (target_flags, hwcap_ext_0, b"libz.so.1", b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1"),
+            (target_flags, 0, b"libz.so.1", b"/opt/custom/libz.so.1"),
+            (target_flags, 0, b"libz.so.1", b"/usr/lib/fallback/libz.so.1"),
+            (other_flags, 0, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
         ];
         let str_base = 48 + entries.len() * 24;
         let mut strings = std::vec::Vec::new();
         let mut offsets = std::vec::Vec::new();
-        for &(flags, key, val) in entries {
+        for &(flags, hwcap, key, val) in entries {
             let k_off = str_base + strings.len();
             strings.extend_from_slice(key);
             strings.push(0);
             let v_off = str_base + strings.len();
             strings.extend_from_slice(val);
             strings.push(0);
-            offsets.push((flags, k_off as u32, v_off as u32));
+            offsets.push((flags, hwcap, k_off as u32, v_off as u32));
         }
+        let v3_str_off = (str_base + strings.len()) as u32;
+        strings.extend_from_slice(b"x86-64-v3\0");
+
         let mut new_only = std::vec::Vec::new();
         new_only.extend_from_slice(b"glibc-ld.so.cache1.1");
         new_only.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         new_only.extend_from_slice(&(strings.len() as u32).to_le_bytes());
         new_only.resize(48, 0);
-        for (flags, k_off, v_off) in offsets {
+        for (flags, hwcap, k_off, v_off) in offsets {
             new_only.extend_from_slice(&flags.to_le_bytes());
             new_only.extend_from_slice(&k_off.to_le_bytes());
             new_only.extend_from_slice(&v_off.to_le_bytes());
             new_only.extend_from_slice(&0u32.to_le_bytes());
-            new_only.extend_from_slice(&0u64.to_le_bytes());
+            new_only.extend_from_slice(&hwcap.to_le_bytes());
         }
         new_only.extend_from_slice(&strings);
+        while new_only.len() % 4 != 0 {
+            new_only.push(0);
+        }
+        let ext_off = new_only.len() as u32;
+        new_only[32..36].copy_from_slice(&ext_off.to_le_bytes());
+        let data_off = ext_off + 8 + 16;
+        new_only.extend_from_slice(&0xeaa4_2174u32.to_le_bytes());
+        new_only.extend_from_slice(&1u32.to_le_bytes());
+        new_only.extend_from_slice(&1u32.to_le_bytes());
+        new_only.extend_from_slice(&0u32.to_le_bytes());
+        new_only.extend_from_slice(&data_off.to_le_bytes());
+        new_only.extend_from_slice(&4u32.to_le_bytes());
+        new_only.extend_from_slice(&v3_str_off.to_le_bytes());
 
         let mut compat = std::vec::Vec::new();
         compat.extend_from_slice(b"ld.so-1.7.0\0");
@@ -1888,23 +1905,43 @@ mod tests {
         }
         compat.extend_from_slice(&new_only);
 
+        let caps_v3 = bstd::procs::hermetic::HostLdCaps { at_hwcap: 0, x86_64_level: 3 };
+        let caps_base = bstd::procs::hermetic::HostLdCaps { at_hwcap: 0, x86_64_level: 1 };
         for buf in [&new_only, &compat] {
-            let mut found: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
-            let ok = bstd::procs::hermetic::parse_ld_so_cache_matches(buf, b"libz.so.1", |path| {
-                found.push(path.to_vec());
+            // Host with x86-64-v3 selects ONLY the active hwcaps entry (never grants fallback alternatives).
+            let mut found_v3: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+            let ok_v3 = bstd::procs::hermetic::parse_ld_so_cache_match(buf, b"libz.so.1", &caps_v3, |path| {
+                found_v3.push(path.to_vec());
                 Ok(true)
             })
-            .expect("valid ld.so.cache must parse");
-            assert!(ok);
+            .expect("v3 cache parse");
+            assert!(ok_v3);
+            assert_eq!(found_v3, std::vec![b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1".to_vec()]);
+
+            // Baseline host skips x86-64-v3 and selects ONLY the first baseline entry (`/opt/custom`).
+            let mut found_base: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+            let ok_base = bstd::procs::hermetic::parse_ld_so_cache_match(buf, b"libz.so.1", &caps_base, |path| {
+                found_base.push(path.to_vec());
+                Ok(true)
+            })
+            .expect("base cache parse");
+            assert!(ok_base);
+            assert_eq!(found_base, std::vec![b"/opt/custom/libz.so.1".to_vec()]);
+
+            // Missing first entry falls through to the next eligible baseline entry.
+            let mut tried: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+            let ok_fall = bstd::procs::hermetic::parse_ld_so_cache_match(buf, b"libz.so.1", &caps_base, |path| {
+                tried.push(path.to_vec());
+                Ok(path == b"/usr/lib/fallback/libz.so.1")
+            })
+            .expect("fallthrough parse");
+            assert!(ok_fall);
             assert_eq!(
-                found,
-                std::vec![
-                    b"/opt/custom/glibc-hwcaps/v3/libz.so.1".to_vec(),
-                    b"/opt/custom/libz.so.1".to_vec(),
-                ]
+                tried,
+                std::vec![b"/opt/custom/libz.so.1".to_vec(), b"/usr/lib/fallback/libz.so.1".to_vec()]
             );
         }
-        let err = bstd::procs::hermetic::parse_ld_so_cache_matches(b"not-an-ld-cache", b"libz.so.1", |_| Ok(true))
+        let err = bstd::procs::hermetic::parse_ld_so_cache_match(b"not-an-ld-cache", b"libz.so.1", &caps_base, |_| Ok(true))
             .expect_err("corrupt ld.so.cache must fail loudly");
         assert!(matches!(err, bstd::procs::hermetic::Fault::Host { code: 22, .. }));
     }

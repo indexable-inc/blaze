@@ -1117,26 +1117,41 @@ pub(crate) fn panicking() -> bool {
 }
 
 /// Retires an abandoned native `Io` (whose worker thread is still blocked in an uninterruptible
-/// kernel read after cancellation/deadline) onto a single lazily-started detached reaper thread so
-/// caller stack-drop never hangs in `Threads::drop` AND the worker thread + driver allocation are
-/// cleanly reclaimed once the stalled syscall eventually returns (never leaking via `mem::forget`).
+/// kernel read after cancellation/deadline) onto its own bounded detached reaper thread so:
+/// 1. Caller stack-drop never hangs in `Threads::drop`,
+/// 2. Each retired driver is reclaimed independently as soon as its own syscall returns (one
+///    permanently wedged mount can never block cleanup of later retired drivers), and
+/// 3. Concurrent reaper threads are capped (`MAX_REAPERS = 64`) rather than unbounded.
 #[cfg(target_os = "linux")]
 pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::fs::ReadOnly>) {
-    use self::std::sync::{OnceLock, mpsc};
-    static REAPER: OnceLock<mpsc::Sender<(crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>)>> = OnceLock::new();
-    let tx = REAPER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>)>();
-        let _ = self::std::thread::Builder::new()
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    const MAX_REAPERS: usize = 64;
+    static ACTIVE_REAPERS: AtomicUsize = AtomicUsize::new(0);
+
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            ACTIVE_REAPERS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    let prev = ACTIVE_REAPERS.fetch_add(1, Ordering::AcqRel);
+    if prev < MAX_REAPERS {
+        let spawned = self::std::thread::Builder::new()
             .name(self::std::string::String::from("bstd-io-reaper"))
             .spawn(move || {
-                while let Ok((retired_io, retired_root)) = rx.recv() {
-                    drop(retired_root);
-                    drop(retired_io);
-                }
+                let _guard = ActiveGuard;
+                drop(root);
+                drop(io);
             });
-        tx
-    });
-    let _ = tx.send((io, root));
+        if spawned.is_err() {
+            ACTIVE_REAPERS.fetch_sub(1, Ordering::AcqRel);
+        }
+    } else {
+        ACTIVE_REAPERS.fetch_sub(1, Ordering::AcqRel);
+        drop(root);
+        drop(io);
+    }
 }
 
 // How the containers only Rust's `std` has hold their type arguments, for `bstd::own`'s walk
