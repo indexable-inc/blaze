@@ -175,15 +175,26 @@ impl Toolchain {
     /// Opens the shelf's pinned manifest and reads the packs of every unit reachable from bstd,
     /// core and alloc for [`TRIPLE`] (not the host side).
     pub fn open(shelf: &mut DirShelf) -> Result<Toolchain, CratesError> {
-        let id: ToolchainId = blaze_toolchain::PINNED;
+        Self::open_target(shelf, blaze_toolchain::PINNED, TRIPLE)
+    }
+
+    /// Opens `id`'s manifest from `shelf` and reads the packs of every unit reachable from bstd,
+    /// core, alloc and std for `triple` (e.g., `"wasm64-blaze-wasip1"`).
+    pub fn open_target(shelf: &mut DirShelf, id: ToolchainId, triple: &str) -> Result<Toolchain, CratesError> {
         let manifest = blaze_toolchain::shelf::open_manifest(shelf, id).map_err(CratesError::Toolchain)?;
         let view = ToolchainView::open(manifest.as_ref(), id).expect("open_manifest checked it");
-        let sys = blaze_toolchain::sysroot(&view, TRIPLE, false).ok_or(CratesError::NoTarget)?;
-        let all: Vec<_> = view.units(TRIPLE).ok_or(CratesError::NoTarget)?.collect();
-        // The closure of bstd, core, alloc and Rust's std over dependencies, by a work list:
-        // std because the Rust-edition crates beneath bstd (blaze_mem) name it implicitly.
+        let sys = blaze_toolchain::sysroot(&view, triple, false).ok_or(CratesError::NoTarget)?;
+        let all: Vec<_> = view.units(triple).ok_or(CratesError::NoTarget)?.collect();
+        // The closure of bstd, core, alloc, Rust's std and proc_macro over dependencies, by a work
+        // list: std because Rust-edition crates name it implicitly, proc_macro for wasm64 proc-macros.
         let mut keep = vec![false; all.len()];
-        let mut todo = vec![sys.bstd.0 as usize, sys.core.0 as usize, sys.alloc.0 as usize, sys.std.0 as usize];
+        let mut todo = vec![
+            sys.bstd.0 as usize,
+            sys.core.0 as usize,
+            sys.alloc.0 as usize,
+            sys.std.0 as usize,
+            sys.proc_macro.0 as usize,
+        ];
         while let Some(u) = todo.pop() {
             if keep[u] {
                 continue;
@@ -244,7 +255,7 @@ impl Toolchain {
                 dep.1 = kept;
             }
         }
-        let cfg = view.cfg(TRIPLE).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
+        let cfg = view.cfg(triple).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
         Ok(Toolchain { units, cfg, arena: Arena::new(Tag::Other) })
     }
 }

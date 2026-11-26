@@ -1174,10 +1174,14 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     }
 
     /// The front end resolves the function's own or inherited caller-tracking attribute.
-    /// At a call from an untracked function, the fast emitter records the item-relative
-    /// caller site. Placement supplies its current line and column.
-    fn track_caller(&self, instance: Instance, _ground: &mut PortableTys<'_>) -> Option<bool> {
-        self.0.track_caller(instance.item)
+    /// Trait methods are resolved to their concrete impl item first so an impl-only
+    /// `#[track_caller]` (such as `Result::from_residual`) matches between caller and callee.
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+        let item = match self.0.resolve(self.1, instance.item, instance.args, ground) {
+            Ok((resolved, _)) => resolved,
+            Err(_) => instance.item,
+        };
+        self.0.track_caller(item)
     }
 
     /// The library's `#[lang = "panic_location"]` struct (core/src/panic/location.rs).

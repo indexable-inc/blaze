@@ -24,7 +24,7 @@ use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::wasm64::{
-    Wasm64BuildOpts, compile_walk_to_wasm64, default_wasm64_import,
+    Wasm64BuildOpts, compile_roots_to_wasm64, compile_walk_to_wasm64, default_wasm64_import,
 };
 use blaze_ladder::run::make_one::{Maker, NamesRecords, SecondCheck, walk_records};
 use blaze_ladder::run::special::MakerStart;
@@ -586,5 +586,169 @@ pub extern "C-unwind" fn main() -> u32 {
         matches!(err.error, CallError::Failed(ref why) if why.contains("no macro at index 1")),
         "expected missing macro index error, got {err:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn real_std_build_script_self_compiles_to_wasm64_and_runs_in_script_runtime() {
+    const REAL_STD_SCRIPT: &str = r#"use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() {
+    println!("cargo:rustc-cfg=real_std_wasm64");
+    let pkg = env::var("CARGO_PKG_NAME").unwrap_or_default();
+    println!("cargo:rustc-env=PKG_WAS={pkg}");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let sub = out_dir.join("gen");
+    fs::create_dir_all(&sub).expect("create_dir_all in OUT_DIR");
+    let gen_file = sub.join("hello.rs");
+    fs::write(&gen_file, "pub const ANSWER: u32 = 42;\n").expect("write in OUT_DIR");
+    let back = fs::read_to_string(&gen_file).expect("read back from OUT_DIR");
+    if back.contains("42") {
+        println!("cargo:rustc-cfg=out_dir_roundtrip_ok");
+    }
+    let cwd = env::current_dir().expect("current_dir");
+    println!("cargo:rustc-env=CWD_WAS={}", cwd.display());
+    if let Ok(out) = Command::new("rustc").arg("--version").output() {
+        if out.status.success() {
+            let ver = String::from_utf8_lossy(&out.stdout);
+            if ver.contains("rustc") {
+                println!("cargo:rustc-cfg=command_rustc_ok");
+            }
+        }
+    }
+}
+"#;
+    let home = std::env::var("HOME").expect("HOME");
+    let shelf_dir = std::path::PathBuf::from(home).join(".blaze/v2/toolchain");
+    if !shelf_dir.join(blaze_toolchain::PINNED.to_string()).exists() {
+        eprintln!("skipping real_std_build_script test: pinned toolchain {} not on shelf {}", blaze_toolchain::PINNED, shelf_dir.display());
+        return;
+    }
+    let a = alloc();
+    let edition = edition::PackageEdition::of_manifest("2024").expect("2024");
+    let files = vec![(String::from(ROOT), String::from(REAL_STD_SCRIPT))];
+    let user = UserCrate {
+        name: "wasm64_std_build_rs",
+        dir: DIR,
+        root: ROOT,
+        files: &files,
+        edition,
+        panic: blaze_ladder::run::Panic::Abort,
+    };
+    let id = blaze_toolchain::PINNED;
+    let mut shelf = blaze_ladder::crates::DirShelf::new(shelf_dir.to_string_lossy().into_owned());
+    let tc = Toolchain::open_target(&mut shelf, id, "wasm64-blaze-wasip1").expect("open wasm64 toolchain");
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve");
+    let mut kept = Kept::default();
+    for c in names.crates().iter() {
+        kept.names.push(aligned(&names_record::encode(c, a).expect("names record"), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode_with(c, &names, a).expect("items record"), blaze_own::testing::bump()));
+        kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
+        kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
+        kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
+    }
+    let f = Fixture { kept, keys, crate_names };
+    let pos = |name: &str| crate_names.iter().position(|&n| n == name);
+    let lang_crates: &'static [usize] = Vec::leak(
+        [Some(0), pos("core"), pos("alloc"), pos("std"), pos("panic_abort"), pos("bstd"), pos("blaze_std")]
+            .into_iter()
+            .flatten()
+            .collect(),
+    );
+    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
+    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(f.crate_names, a)));
+    let load: &'static Kept = Box::leak(Box::new(f.kept.clone()));
+    let records: &'static Records<'static> = Box::leak(Box::new(Records::new(f.keys, load, log, frame, a)));
+    let nr = NamesRecords { records, frame, lang_crates, body_sources: None };
+
+    let mut b = builder();
+    b.settings = Settings::baseline(OverflowChecks::Off, blaze_ladder::run::Panic::Abort);
+    b.toolchain = id;
+
+    let roots = blaze_ladder::run::special::run_roots(nr.records, nr.lang_crates, b.settings.panic, &[], nr.frame, a, a).expect("run_roots");
+    let maker_entry = match roots.shim() {
+        Some(shim) => Some(shim.main.tabled),
+        None => (!roots.is_empty()).then(|| roots.root(0).tabled),
+    };
+    let mut build_maker = Maker::of_roots(nr, maker_entry, &roots, SecondCheck, &b, a);
+    let mut wasm_out: AVec<'static, u8> = OwnVec::new_in(a);
+    let out = compile_roots_to_wasm64(
+        &roots,
+        |_| Some(TestGrant),
+        &mut build_maker,
+        &Wasm64BuildOpts {
+            module_name: "real_std_build_rs",
+            start_symbol: Some(roots.entry),
+            exports: &[],
+            export_globals: &[],
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::DEFAULT,
+        },
+        default_wasm64_import,
+        &mut wasm_out,
+        a,
+    )
+    .expect("compile_roots_to_wasm64 for real std build.rs");
+    assert!(out.func_count > 100);
+    let checked = check_wasm64(wasm_out.as_slice()).expect("valid wasm64");
+    assert!(checked.memory64);
+
+    let dir = std::env::temp_dir().join(format!("blaze-wasm64-real-std-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let rt = ScriptRuntime::new(&dir).expect("ScriptRuntime");
+    let loaded = rt.load("real_std_build_rs", wasm_out.as_slice()).expect("ScriptRuntime loads wasm64");
+    let mut env_vars = OwnVec::new_in(a);
+    for (k, v) in [
+        ("CARGO_PKG_NAME", "real_std_pkg"),
+        ("CARGO_MANIFEST_DIR", "/package"),
+        ("OUT_DIR", "/out"),
+        ("RUSTC", "rustc"),
+    ] {
+        env_vars.push((blaze_own::String::from_str_in(k, a), blaze_own::String::from_str_in(v, a)));
+    }
+    let env = Env { vars: env_vars };
+    let script = Arc::new(Script {
+        package: "real_std_pkg".to_owned(),
+        tree: Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: None },
+        root: ScriptRoot::package(),
+        env: vec![
+            ("CARGO_PKG_NAME".to_owned(), "real_std_pkg".to_owned()),
+            ("CARGO_MANIFEST_DIR".to_owned(), "/package".to_owned()),
+            ("OUT_DIR".to_owned(), "/out".to_owned()),
+            ("RUSTC".to_owned(), "rustc".to_owned()),
+        ],
+        target: "aarch64-apple-darwin".to_owned(),
+        host: "aarch64-apple-darwin".to_owned(),
+        c_mode: CMode::Deferred,
+        limits: RunLimits {
+            fuel: 1 << 28,
+            memory: 64 << 20,
+            out_dir_bytes: 1 << 20,
+            out_dir_files: 16,
+            output: 1 << 20,
+            line: 256 << 10,
+        },
+        table: Arc::new(Vec::new()),
+        probes: None,
+        spawner: None,
+        step: blaze_ids::ContentId::default(),
+        spawn_setting: Arc::new(blaze_proc_macro::spawn_route::SpawnSetting::off()),
+        deps: Arc::new(blaze_proc_macro::script_sandbox::dep_mount::DepViews::none()),
+    });
+    let ran = rt.run(&loaded, script, &env, a).expect("run real std build.rs in Wasmtime memory64");
+    assert!(ran.outputs.cfgs.iter().any(|(n, v)| n.as_str() == "real_std_wasm64" && v.is_none()), "cfgs={:?}", ran.outputs.cfgs);
+    assert!(ran.outputs.cfgs.iter().any(|(n, v)| n.as_str() == "out_dir_roundtrip_ok" && v.is_none()), "cfgs={:?}", ran.outputs.cfgs);
+    assert!(ran.outputs.cfgs.iter().any(|(n, v)| n.as_str() == "command_rustc_ok" && v.is_none()), "cfgs={:?}", ran.outputs.cfgs);
+    assert!(ran.outputs.env.iter().any(|(n, v)| n.as_str() == "PKG_WAS" && v.as_str() == "real_std_pkg"), "env={:?}", ran.outputs.env);
+    assert!(ran.outputs.env.iter().any(|(n, v)| n.as_str() == "CWD_WAS" && v.as_str() == "/package"), "env={:?}", ran.outputs.env);
+    assert!(ran.outputs.files.iter().any(|f| f.name.as_str() == "gen/hello.rs" && f.bytes.as_slice() == b"pub const ANSWER: u32 = 42;\n"), "files={:?}", ran.outputs.files);
     let _ = std::fs::remove_dir_all(&dir);
 }
