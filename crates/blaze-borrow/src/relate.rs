@@ -38,6 +38,13 @@ use crate::inst::{Arg, Ask, AskArgs, Clause, EnvId, Envs, ImplValue, Inst, Keyed
 use crate::types::{Kids, Pos, RegionTypes, SlotCount, Unknown};
 use crate::{Bad, Head, NotSelected, Refused, Reg, ShapeWhy, Variance};
 
+/// Bounds for supertrait elaboration in `elaborate_outlives_from_trait`, `elaborate_for_trait`,
+/// and `elaborate_for_proj`: large trait hierarchies (e.g. reth's `FullProvider`) exceed 64
+/// transitive supertraits.
+const MAX_ELAB_VISITED: usize = 256;
+const MAX_ELAB_STACK: usize = 512;
+const MAX_ELAB_DEPTH: u32 = 24;
+
 /// What a fresh origin is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -1435,7 +1442,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
                 // Also elaborate supertrait outlives bounds (`type Convert: ConvertTx<...>` where
                 // `trait ConvertTx: 'static`).
-                let mut visited = [ItemKey(0); 64];
+                let mut visited = [ItemKey(0); MAX_ELAB_VISITED];
                 let mut vlen = 0usize;
                 for cv in views {
                     if cv.outlives.is_some() {
@@ -1572,10 +1579,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         cur: Side<'c>,
         region: Reg,
         unique_rhs: &mut Option<Option<Reg>>,
-        visited: &mut [ItemKey; 64],
+        visited: &mut [ItemKey; MAX_ELAB_VISITED],
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
-        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 64] = [None; 64];
+        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
             *slot = Some((seed_tr, seed_self, seed_trait, seed_has_self, 0));
@@ -1586,7 +1593,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let Some((cur_tr, cur_self, cur_trait, cur_has_self, cur_depth)) = stack.get_mut(sp).and_then(Option::take) else {
                 continue;
             };
-            if cur_depth >= 12 || *vlen >= 64 || visited.iter().take(*vlen).any(|&k| k == cur_tr) {
+            if cur_depth >= MAX_ELAB_DEPTH || *vlen >= MAX_ELAB_VISITED || visited.iter().take(*vlen).any(|&k| k == cur_tr) {
                 continue;
             }
             if let Some(slot) = visited.get_mut(*vlen) {
@@ -1687,7 +1694,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 _ => unique_rhs = Some(None),
             }
         }
-        let mut visited = [ItemKey(0); 64];
+        let mut visited = [ItemKey(0); MAX_ELAB_VISITED];
         let mut vlen = 0usize;
         for cv in views {
             if cv.outlives.is_some() {
@@ -2474,6 +2481,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let head = match selected.select_keyed(Ask { trait_, name: None, written: trait_ref.ty }, &key) {
             Selection::Impl { head, .. } => head,
             Selection::Not(NotSelected::Builtin) if self.nothing_to_tie(trait_ref, 1)? => return Ok(()),
+            Selection::Not(NotSelected::GenericSelf(_)) if selected.is_auto_trait(trait_) && self.nothing_to_tie(trait_ref, 1)? => return Ok(()),
             Selection::Not(NotSelected::Unanswered | NotSelected::Generic | NotSelected::GenericSelf(_)) if param_miss => {
                 return Err(Refused::Unselected { item: self.item, node: trait_ref.ty, trait_, name: None, why: NotSelected::NoBound });
             }
@@ -2852,10 +2860,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         trait_ref: Side<'c>,
         has_subject: bool,
         depth: u32,
-        visited: &mut [(ItemKey, bool); 64],
+        visited: &mut [(ItemKey, bool); MAX_ELAB_VISITED],
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
-        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 128] = [None; 128];
+        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
             *slot = Some((seed_tr, seed_self, seed_trait, seed_has_self, depth));
@@ -2868,7 +2876,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             };
             let is_sub = self.erased_sides(cur_self, subject);
             let visit_key = (cur_tr, is_sub);
-            if cur_depth >= 12 || *vlen >= 64 || visited.iter().take(*vlen).any(|&k| k == visit_key) {
+            if cur_depth >= MAX_ELAB_DEPTH || *vlen >= MAX_ELAB_VISITED || visited.iter().take(*vlen).any(|&k| k == visit_key) {
                 continue;
             }
             if let Some(slot) = visited.get_mut(*vlen) {
@@ -2935,10 +2943,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         want_tr: ItemKey,
         want_name: blaze_typeck::Name,
         depth: u32,
-        visited: &mut [(ItemKey, bool); 64],
+        visited: &mut [(ItemKey, bool); MAX_ELAB_VISITED],
         vlen: &mut usize,
     ) -> Result<Option<Side<'c>>, Refused> {
-        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 128] = [None; 128];
+        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
             *slot = Some((seed_tr, seed_self, seed_trait, seed_has_self, depth));
@@ -2951,7 +2959,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             };
             let is_sub = self.erased_sides(cur_self, subject);
             let visit_key = (cur_tr, is_sub);
-            if cur_depth >= 12 || *vlen >= 64 || visited.iter().take(*vlen).any(|&k| k == visit_key) {
+            if cur_depth >= MAX_ELAB_DEPTH || *vlen >= MAX_ELAB_VISITED || visited.iter().take(*vlen).any(|&k| k == visit_key) {
                 continue;
             }
             if let Some(slot) = visited.get_mut(*vlen) {
@@ -3097,7 +3105,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        let mut visited = [(ItemKey(0), false); 64];
+        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
         let mut vlen = 0usize;
         for cv in views {
             if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
@@ -3143,7 +3151,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        let mut visited = [(ItemKey(0), false); 64];
+        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
         let mut vlen = 0usize;
         for cv in views {
             if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
@@ -3217,7 +3225,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
             }
-            let mut visited = [(ItemKey(0), false); 64];
+            let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
             let mut vlen = 0usize;
             for cv in clauses {
                 let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
@@ -3288,7 +3296,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
                 let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
-                let mut visited = [(ItemKey(0), false); 64];
+                let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
                 let mut vlen = 0usize;
                 for k in 0..skids.len() {
                     let (pred, sr) = self.kid(subject, &skids, srest, k)?;
@@ -3375,7 +3383,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        let mut visited = [(ItemKey(0), false); 64];
+        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
         let mut vlen = 0usize;
         for cv in views {
             let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };
@@ -3477,7 +3485,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
             }
-            let mut visited = [(ItemKey(0), false); 64];
+            let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
             let mut vlen = 0usize;
             for cv in clauses {
                 let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
@@ -3578,7 +3586,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
                 let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
-                let mut visited = [(ItemKey(0), false); 64];
+                let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
                 let mut vlen = 0usize;
                 for k in 0..skids.len() {
                     let (pred, sr) = self.kid(subject, &skids, srest, k)?;
@@ -3642,7 +3650,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 }
                             }
                         }
-                        let mut visited = [(ItemKey(0), false); 64];
+                        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
                         let mut vlen = 0usize;
                         for cv in views {
                             let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };

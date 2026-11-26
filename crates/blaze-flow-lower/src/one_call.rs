@@ -499,6 +499,9 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     fn relates_nothing(&self, trait_: ItemKey) -> bool {
         self.facts.trait_relates_nothing(trait_)
     }
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_auto_trait(trait_)
+    }
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.facts.is_zero_slot_builtin_assoc(trait_, name)
     }

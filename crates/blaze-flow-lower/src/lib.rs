@@ -386,6 +386,12 @@ pub trait Facts {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is an `auto trait` (`Send`, `Sync`, `Unpin`, `Freeze`, etc.), forwarded to
+    /// `blaze_borrow::Selected::is_auto_trait`.
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
     /// Whether `trait_` is one of the callable traits (`Fn`, `FnMut`, `FnOnce`: lang items `fn`,
     /// `fn_mut`, `fn_once`). Used by `call_through_value` to locate a generic parameter's or
     /// trait object's callable signature in the owner's clause or signature columns.

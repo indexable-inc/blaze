@@ -250,6 +250,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn trait_relates_nothing(&self, trait_: tc::ItemKey) -> bool {
         self.facts.trait_relates_nothing(trait_)
     }
+    fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_auto_trait(trait_)
+    }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.is_fn_trait(trait_)
     }
