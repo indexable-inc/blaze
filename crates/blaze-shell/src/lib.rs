@@ -1294,6 +1294,7 @@ mod tests {
                 kind: crate::editor::CompletionKind::File,
                 icon: None,
                 avatar_path: None,
+                fs_meta: None,
                 match_indices: Vec::new(),
             });
         }
