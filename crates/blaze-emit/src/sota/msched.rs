@@ -522,7 +522,8 @@ fn classify_inst(func: &MFunc<'_>, idx: usize, target: TargetModel) -> InstInfo 
         | MOp::Csel { dst, rn, rm, .. }
         | MOp::Csinc { dst, rn, rm, .. }
         | MOp::Csinv { dst, rn, rm, .. }
-        | MOp::Csneg { dst, rn, rm, .. } => {
+        | MOp::Csneg { dst, rn, rm, .. }
+        | MOp::CarryAddSub { dst, rn, rm, .. } => {
             info.add_def(dst);
             info.add_use(rn);
             info.add_use(rm);
@@ -801,6 +802,56 @@ fn is_cbz_fusible(op: &MOp, rt: MReg) -> bool {
     match *op {
         MOp::LogicalReg { dst, kind: LogicalKind::And, .. } | MOp::Ubfm { dst, .. } => dst == rt,
         _ => false,
+    }
+}
+
+/// If `op` is a pre-RA SSA pointer-advance step (`AddImm`/`SubImm`/`AddReg`/`SubReg`/
+/// `AddExt`/`SubExt` defining a distinct virtual register from one or two candidate virtual base
+/// registers), returns the candidate base `VReg` ids.
+#[inline]
+fn ssa_ptr_step_bases(op: &MOp) -> (Option<u32>, Option<u32>) {
+    match *op {
+        MOp::AddImm { dst: MReg::V(d), rn: MReg::V(base), .. }
+        | MOp::SubImm { dst: MReg::V(d), rn: MReg::V(base), .. }
+        | MOp::SubReg { dst: MReg::V(d), rn: MReg::V(base), .. }
+        | MOp::AddExt { dst: MReg::V(d), rn: MReg::V(base), .. }
+        | MOp::SubExt { dst: MReg::V(d), rn: MReg::V(base), .. }
+            if d != base =>
+        {
+            (Some(base.0), None)
+        }
+        MOp::AddReg { dst: MReg::V(d), rn, rm, .. } => {
+            let b0 = match rn {
+                MReg::V(v) if v != d => Some(v.0),
+                _ => None,
+            };
+            let b1 = match rm {
+                MReg::V(v) if v != d && Some(v.0) != b0 => Some(v.0),
+                _ => None,
+            };
+            (b0, b1)
+        }
+        _ => (None, None),
+    }
+}
+
+/// If `op` is a memory op (`Ldr`/`Str`/`Ldp`/`Stp`) reading a virtual address base register
+/// `base`, returns `Some(base.0)`.
+#[inline]
+fn mem_base_vreg(op: &MOp) -> Option<u32> {
+    match *op {
+        MOp::Ldr { addr, .. } | MOp::Str { addr, .. } => match addr {
+            AddrMode::BaseOff { base: MReg::V(b), .. }
+            | AddrMode::ScaledIdx { base: MReg::V(b), .. }
+            | AddrMode::PostIdx { base: MReg::V(b), .. }
+            | AddrMode::PreIdx { base: MReg::V(b), .. } => Some(b.0),
+            AddrMode::BaseOff { .. }
+            | AddrMode::ScaledIdx { .. }
+            | AddrMode::PostIdx { .. }
+            | AddrMode::PreIdx { .. } => None,
+        },
+        MOp::Ldp { base: MReg::V(b), .. } | MOp::Stp { base: MReg::V(b), .. } => Some(b.0),
+        _ => None,
     }
 }
 
@@ -2567,6 +2618,58 @@ fn schedule_window(
         }
     }
 
+    // 3c. Pre-RA SSA induction-pointer tie-breaker: for each pointer-advance op (`AddImm`/`SubImm`/
+    //     `AddReg`/`SubReg`/`AddExt`/`SubExt`) defining a new `VReg` from `base`, record:
+    //     - `ptr_step_mem_peers`: all `Ldr`/`Str`/`Ldp`/`Stp` ops in this window reading `base` as
+    //       their address base (deferred while any such peer is ready), and
+    //     - `ptr_step_store_peers`: the `Str`/`Stp` subset reading `base` as their address base
+    //       (deferred while any such store is still unscheduled, so `str [base]` always issues
+    //       before `base_next = base + off` and `base` dies right at the step for `mra` coalescing).
+    let mut ptr_step_mem_peers = [0u128; WINDOW_MAX];
+    let mut ptr_step_store_peers = [0u128; WINDOW_MAX];
+    if func.is_ssa {
+        let mut mem_base = [None; WINDOW_MAX];
+        let mut mem_mask = 0u128;
+        let mut store_mask = 0u128;
+        for j in 0..len {
+            if let Some(op) = func.ops.get(w_start + j)
+                && let Some(base) = mem_base_vreg(op)
+            {
+                set(&mut mem_base, j, Some(base));
+                mem_mask |= 1u128 << j;
+                if matches!(*op, MOp::Str { .. } | MOp::Stp { .. }) {
+                    store_mask |= 1u128 << j;
+                }
+            }
+        }
+        if mem_mask != 0 {
+            for i in 0..len {
+                if let Some(op) = func.ops.get(w_start + i) {
+                    let (b0, b1) = ssa_ptr_step_bases(op);
+                    if b0.is_none() && b1.is_none() {
+                        continue;
+                    }
+                    let succ_i = at(&succs, i, 0u128);
+                    let mut peers = 0u128;
+                    let mut scan = mem_mask & !(1u128 << i);
+                    while scan != 0 {
+                        let j = to_idx(scan.trailing_zeros());
+                        scan &= scan - 1;
+                        let mb = at(&mem_base, j, None);
+                        let matches_base = (b0.is_some() && mb == b0) || (b1.is_some() && mb == b1);
+                        if ((succ_i >> j) & 1) == 0 && matches_base {
+                            peers |= 1u128 << j;
+                        }
+                    }
+                    if peers != 0 {
+                        set(&mut ptr_step_mem_peers, i, peers);
+                        set(&mut ptr_step_store_peers, i, peers & store_mask);
+                    }
+                }
+            }
+        }
+    }
+
     // 4. Pipe-balanced critical-path list scheduling (with SSA register-pressure control when
     //    `func.is_ssa == true`, and post-RA Beam-4 comparison on hot loops).
     let pipe_caps = [
@@ -2608,6 +2711,7 @@ fn schedule_window(
             ready |= 1u128 << u;
         }
     }
+    let mut unscheduled: u128 = if len >= 128 { u128::MAX } else { (1u128 << len) - 1 };
 
     let mut ready_at = [0u16; WINDOW_MAX];
     let mut order = [0usize; WINDOW_MAX];
@@ -2697,13 +2801,16 @@ fn schedule_window(
             //     Tier 2: pressure-reducing (`active_delta < 0`, kills live VRegs!)
             //     Tier 1: pressure-neutral (`active_delta == 0`)
             //     Tier 0: pressure-increasing non-critical load/ALU (`active_delta > 0`)
-            let mut best_key: (u8, i16, u16, bool, bool, u16, u8, bool, u16, usize) =
-                (0, i16::MIN, 0, false, false, 0, 0, false, 0, 0);
+            let mut best_key: (bool, u8, i16, u16, bool, bool, u16, u8, bool, u16, usize) =
+                (false, 0, i16::MIN, 0, false, false, 0, 0, false, 0, 0);
             let mut cand_mask = ready;
             while cand_mask != 0 {
                 let u = to_idx(cand_mask.trailing_zeros());
                 cand_mask &= cand_mask - 1;
                 let u_info = at(&info, u, InstInfo::EMPTY);
+                let not_deferred_ptr_step = ((at(&ptr_step_mem_peers, u, 0u128) & ready)
+                    | (at(&ptr_step_store_peers, u, 0u128) & unscheduled))
+                    == 0;
 
                 let mut gpr_kills: i16 = 0;
                 let mut fp_kills: i16 = 0;
@@ -2779,6 +2886,7 @@ fn schedule_window(
                 let orig_tie = usize::MAX - u;
 
                 let key = (
+                    not_deferred_ptr_step,
                     pressure_tier,
                     tier_tie,
                     u_rec_h,
@@ -2797,9 +2905,10 @@ fn schedule_window(
             }
         } else {
             // Aggressive latency + recurrence + port-balance mode (post-RA or SSA below pressure threshold).
-            // `adrp_fuse` ranks highest in post-RA so `adrp + addlo12/ldr` pairs stay strictly glued!
-            let mut best_key: (bool, bool, bool, u16, u8, bool, u16, usize) =
-                (false, false, false, 0, 0, false, 0, 0);
+            // `adrp_fuse` ranks highest in post-RA so `adrp + addlo12/ldr` pairs stay strictly glued;
+            // `not_deferred_ptr_step` defers pre-RA `AddImm`/`SubImm` behind ready base-reading memory ops.
+            let mut best_key: (bool, bool, bool, bool, u16, u8, bool, u16, usize) =
+                (false, false, false, false, 0, 0, false, 0, 0);
             let mut cand_mask = ready;
             while cand_mask != 0 {
                 let u = to_idx(cand_mask.trailing_zeros());
@@ -2807,6 +2916,9 @@ fn schedule_window(
                 let u_info = at(&info, u, InstInfo::EMPTY);
 
                 let adrp_fuse = fuses_adrp_with_prev(&ctx, prev_op_idx, u);
+                let not_deferred_ptr_step = ((at(&ptr_step_mem_peers, u, 0u128) & ready)
+                    | (at(&ptr_step_store_peers, u, 0u128) & unscheduled))
+                    == 0;
                 let eff_ra = effective_ready_at(&ctx, prev_op_idx, u, at(&ready_at, u, 0u16), cycle);
                 let is_ready_now = eff_ra <= cycle;
                 let p_idx = u_info.pipe.index();
@@ -2819,6 +2931,7 @@ fn schedule_window(
                 let orig_tie = usize::MAX - u;
                 let key = (
                     adrp_fuse,
+                    not_deferred_ptr_step,
                     is_ready_now,
                     pipe_free,
                     at(&height, u, 0u16),
@@ -2836,6 +2949,7 @@ fn schedule_window(
 
         set(&mut order, step, best_u);
         ready &= !(1u128 << best_u);
+        unscheduled &= !(1u128 << best_u);
 
         let best_info = at(&info, best_u, InstInfo::EMPTY);
         let fused_adrp = fuses_adrp_with_prev(&ctx, prev_op_idx, best_u);
@@ -4743,5 +4857,156 @@ mod tests {
             "128-inst window must hoist recurrence chain from indices 72..76 into first half (< 39): mvn={pos_mvn}, lsr={pos_lsr}, add={pos_add}, close={pos_close}"
         );
         assert_eq!(ops[ops.len() - 2], subs_op, "subs must remain macro-op fused before b.ne");
+    }
+
+    #[test]
+    fn msched_pre_ra_schedules_base_mem_op_before_ptr_step_add_imm() {
+        let alloc = test_alloc();
+        let mut func = new_ssa(Os::MacOs);
+        let v_ptr = func.alloc_vreg(VRegClass::Gpr64);
+        let v_next = func.alloc_vreg(VRegClass::Gpr64);
+        let v_end = func.alloc_vreg(VRegClass::Gpr64);
+
+        let b_loop = func.new_block(true);
+        let b_exit = func.new_block(false);
+
+        let add_step_op = MOp::AddImm {
+            dst: MReg::V(v_next),
+            rn: MReg::V(v_ptr),
+            imm12: 32,
+            shift12: false,
+            wide: true,
+            sets_flags: false,
+        };
+        let stp_op = MOp::Stp {
+            src0: MReg::vec(16),
+            src1: MReg::vec(16),
+            base: MReg::V(v_ptr),
+            off: 0,
+            size: MemSize::Q128,
+            post_idx: false,
+            pre_idx: false,
+        };
+        let cmp_op = MOp::CmpReg {
+            rn: MReg::V(v_next),
+            rm: MReg::V(v_end),
+            shift: None,
+            wide: true,
+        };
+
+        // Reversed input order: `v_next = add v_ptr, #32` (boosted recurrence!) placed BEFORE
+        // `stp q16, q16, [v_ptr]`. Pre-RA scheduling must emit `Stp` first so `v_ptr` dies at
+        // `AddImm` without overlapping `v_next` (enabling `mra` coalescing + post-index fusion).
+        func.begin_block(b_loop);
+        func.push_inst(add_step_op, MInstFlags::NONE);
+        func.push_inst(stp_op, MInstFlags::MEM_WRITE);
+        let i_cmp = func.push_inst(cmp_op, MInstFlags::NONE);
+        func.set_vflag_def(i_cmp, 0);
+        func.push_parallel_copy(&[(MReg::V(v_ptr), MReg::V(v_next))], MInstFlags::NONE);
+        let i_br = func.push_inst(
+            MOp::BCond { cond: MCond::Lo, target: b_loop },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(i_br, 0);
+        func.end_block(b_loop);
+
+        func.begin_block(b_exit);
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_exit);
+
+        func.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func), Ok(()));
+
+        let stats = schedule_mfunc(&mut func, TargetModel::APPLE_M5, alloc);
+        assert!(stats.recurrences_boosted >= 1, "expected ptr step recurrence boosted: {stats:?}");
+        assert!(stats.insts_reordered > 0, "expected Stp and AddImm to reorder: {stats:?}");
+        assert_eq!(mverify(&func), Ok(()));
+
+        let range = func.block_inst_range(b_loop);
+        let ops = &func.ops[range.start..range.end];
+        let mut pos_stp = usize::MAX;
+        let mut pos_add = usize::MAX;
+        let mut pos_cmp = usize::MAX;
+        for (rel, &op) in ops.iter().enumerate() {
+            if op == stp_op {
+                pos_stp = rel;
+            } else if op == add_step_op {
+                pos_add = rel;
+            } else if op == cmp_op {
+                pos_cmp = rel;
+            }
+        }
+        assert!(
+            pos_stp < pos_add,
+            "pre-RA msched must emit Stp reading v_ptr before AddImm defining v_next: stp={pos_stp}, add={pos_add}"
+        );
+        assert!(
+            pos_add < pos_cmp,
+            "AddImm defining v_next must precede CmpReg reading v_next: add={pos_add}, cmp={pos_cmp}"
+        );
+    }
+
+    #[test]
+    fn msched_pre_ra_defers_add_reg_ptr_step_until_unscheduled_store_issues() {
+        let alloc = test_alloc();
+        let mut func = new_ssa(Os::MacOs);
+        let v_ptr = func.alloc_vreg(VRegClass::Gpr64);
+        let v_off = func.alloc_vreg(VRegClass::Gpr64);
+        let v_next = func.alloc_vreg(VRegClass::Gpr64);
+        let v_a = func.alloc_vreg(VRegClass::Gpr64);
+        let v_b = func.alloc_vreg(VRegClass::Gpr64);
+        let v_val = func.alloc_vreg(VRegClass::Gpr64);
+
+        let b0 = func.new_block(false);
+        func.begin_block(b0);
+        func.push_inst(MOp::Mov { dst: MReg::V(v_ptr), src: MReg::p(PReg::X0), wide: true }, MInstFlags::NONE);
+        func.push_inst(MOp::Mov { dst: MReg::V(v_off), src: MReg::p(PReg::X1), wide: true }, MInstFlags::NONE);
+        func.push_inst(MOp::Mov { dst: MReg::V(v_a), src: MReg::p(PReg::X2), wide: true }, MInstFlags::NONE);
+        func.push_inst(MOp::Mov { dst: MReg::V(v_b), src: MReg::p(PReg::X3), wide: true }, MInstFlags::NONE);
+
+        // Input order has `v_next = add v_ptr, v_off` ready immediately, BEFORE `v_val = orr v_a, v_b`
+        // and `str v_val, [v_ptr]` (so `str` is NOT ready when `add` first becomes ready!).
+        let add_step_op = MOp::AddReg {
+            dst: MReg::V(v_next),
+            rn: MReg::V(v_ptr),
+            rm: MReg::V(v_off),
+            shift: None,
+            wide: true,
+            sets_flags: false,
+        };
+        let orr_op = MOp::LogicalReg {
+            dst: MReg::V(v_val),
+            rn: MReg::V(v_a),
+            rm: MReg::V(v_b),
+            shift: None,
+            kind: LogicalKind::Orr,
+            invert_rm: false,
+            wide: true,
+        };
+        let str_op = MOp::Str {
+            src: MReg::V(v_val),
+            addr: AddrMode::BaseOff { base: MReg::V(v_ptr), off: 0 },
+            size: MemSize::X64,
+        };
+        func.push_inst(add_step_op, MInstFlags::NONE);
+        func.push_inst(orr_op, MInstFlags::NONE);
+        func.push_inst(str_op, MInstFlags::MEM_WRITE);
+        func.push_inst(MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_next), wide: true }, MInstFlags::NONE);
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b0);
+
+        func.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        let _ = schedule_mfunc(&mut func, TargetModel::APPLE_M5, alloc);
+        assert_eq!(mverify(&func), Ok(()));
+
+        let range = func.block_inst_range(b0);
+        let ops = &func.ops[range.start..range.end];
+        let pos_str = ops.iter().position(|&op| op == str_op).expect("str present");
+        let pos_add = ops.iter().position(|&op| op == add_step_op).expect("add present");
+        assert!(
+            pos_str < pos_add,
+            "pre-RA msched must defer AddReg ptr step behind unscheduled Str [v_ptr]: str={pos_str}, add={pos_add}"
+        );
     }
 }

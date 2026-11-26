@@ -78,9 +78,9 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
     let len = view.len();
-    let no_jumps = filled(len, NONE, &alloc);
-    let reached = reachable(&view, &no_jumps, &alloc);
-    let into = incoming(&view, &reached, &no_jumps, &alloc);
+    let mut jump = filled(len, NONE, &alloc);
+    let reached = reachable(&view, &jump, &alloc);
+    let into = incoming(&view, &reached, &jump, &alloc);
 
     // Single pass over reached blocks: build CSR def-use edges for values that can ever gain a
     // fact, record each eligible block parameter's block, and seed the worklist.
@@ -159,6 +159,7 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
 
     let mut any_stands = false;
     let mut any_folded = false;
+    let mut any_jump = false;
 
     drain_worklist(
         &view,
@@ -176,7 +177,7 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
         &mut any_folded,
     );
 
-    if fold_value_info_icmps(
+    if fold_value_info_facts(
         &view,
         &reached,
         &mut facts,
@@ -188,6 +189,8 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
         &mut queue,
         &mut in_work,
         &mut any_folded,
+        &mut jump,
+        &mut any_jump,
         alloc,
     ) {
         drain_worklist(
@@ -207,6 +210,8 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
         );
     }
 
+    collapse_const_terminators(&view, &reached, &facts, &mut jump, &mut any_jump);
+
     let mut devirt = filled(len, NONE, &alloc);
     let mut any_devirt = false;
     for &ci in call_indirects.iter() {
@@ -218,7 +223,7 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
         }
     }
 
-    if !any_stands && !any_folded && !any_devirt {
+    if !any_stands && !any_folded && !any_devirt && !any_jump {
         verify(view).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
@@ -236,7 +241,7 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
         inst_kept: filled(len, true, &alloc),
         stands,
         constant,
-        jump: no_jumps,
+        jump,
         devirt,
         merge_next: filled(view.blocks(), NONE, &alloc),
         fma_fuse: filled(len, None, &alloc),
@@ -663,7 +668,7 @@ impl<A: Allocator> Facts<'_, A> {
 }
 
 // ---------------------------------------------------------------------------
-// Worklist helpers and ValueInfo-backed icmp folding
+// Worklist helpers and ValueInfo-backed constant folding
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -764,10 +769,146 @@ fn drain_worklist<A: Allocator + Copy>(
     }
 }
 
-/// Folds undecided flagless scalar-integer `Op::Icmp` instructions proved constant by the
-/// unified [`ValueInfo`] analysis (known bits, unsigned ranges, and dominator-scoped branch /
-/// XOR-range refinements), waking users of any folded comparison.
-fn fold_value_info_icmps<A: Allocator + Copy>(
+/// Pure, side-effect-free, non-trapping scalar integer operations that [`ValueInfo`] may fold
+/// to an exact constant when flagless. Excludes `Iconst`, `IconstWide`, `Param`, `Uninit`, and
+/// potentially trapping ops (`Udiv`, `Sdiv`, `Urem`, `Srem`).
+#[inline]
+fn is_pure_scalar_int_foldable(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Trunc
+            | Op::Zext
+            | Op::Sext
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Select
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax
+            | Op::Clz
+            | Op::Ctz
+            | Op::Popcnt
+            | Op::Bswap
+            | Op::Bitrev
+    )
+}
+
+/// Returns the exact constant proved by `f` for a scalar integer of bit width `width`,
+/// rejecting contradictory/empty lattice states and out-of-width values.
+#[inline]
+fn exact_const_fact(f: ValFact, width: u32) -> Option<u128> {
+    if width == 0 {
+        return None;
+    }
+    let m = width_mask(width);
+    if (f.bits.zeros & f.bits.ones) == 0
+        && f.range.lo == f.range.hi
+        && f.range.lo <= m
+        && f.contains(f.range.lo)
+    {
+        Some(f.range.lo)
+    } else {
+        None
+    }
+}
+
+/// Target ordinal for an `Op::Switch` or `Op::Br` terminator at `inst` when its
+/// scrutinee/condition is proved equal to `value`.
+fn terminator_target_for_const(view: &View<'_>, inst: usize, value: u128) -> Option<u32> {
+    match view.op(inst) {
+        Op::Br => Some(if value != 0 { 0 } else { 1 }),
+        Op::Switch => {
+            let mut o = view.operands(inst);
+            let scrutinee = o.value();
+            let width = scalar_int_width(Ty(at(view.tys, to_idx(scrutinee.0), 0)), view.head.ptr_bits);
+            if width == 0 {
+                return None;
+            }
+            o.target();
+            let found = o.cases(scrutinee).position(|(words, _)| wide_value(words, width) == value);
+            let chosen = match found {
+                Some(case) => u32::try_from(case).ok()?.checked_add(1)?,
+                None => 0,
+            };
+            if chosen == NONE { None } else { Some(chosen) }
+        }
+        _ => None,
+    }
+}
+
+/// Collapses an `Op::Switch` or `Op::Br` terminator in `block` to an unconditional jump when
+/// its scrutinee/condition is proved constant by `facts` or block-local `vi`.
+fn try_collapse_terminator<A: Allocator>(
+    view: &View<'_>,
+    block: Block,
+    inst: usize,
+    facts: &Facts<'_, A>,
+    vi: Option<&ValueInfo<A>>,
+    jump: &mut [u32],
+    any_jump: &mut bool,
+) {
+    if at(jump, inst, NONE) != NONE {
+        return;
+    }
+    let op = view.op(inst);
+    if !matches!(op, Op::Switch | Op::Br) {
+        return;
+    }
+    let raw = view.operands(inst).value().0;
+    let resolved = facts.resolve(raw);
+    let width = scalar_int_width(Ty(at(view.tys, to_idx(resolved), 0)), view.head.ptr_bits);
+    if width == 0 {
+        return;
+    }
+    let const_val = if let Some((c, _)) = facts.int(resolved) {
+        Some(c)
+    } else if let Some(vi) = vi {
+        let m = width_mask(width);
+        let f = vi.fact_at(block, to_idx(raw));
+        let combined = if resolved != raw { f.refine(vi.fact_at(block, to_idx(resolved)), m) } else { f };
+        exact_const_fact(combined, width)
+    } else {
+        None
+    };
+    if let Some(c) = const_val
+        && let Some(chosen) = terminator_target_for_const(view, inst, c)
+    {
+        set_at(jump, inst, chosen);
+        *any_jump = true;
+    }
+}
+
+/// Collapses any reached `Op::Switch` or `Op::Br` terminator whose scrutinee/condition is
+/// proved constant in `facts` (including block parameters folded to a single constant).
+fn collapse_const_terminators<A: Allocator>(
+    view: &View<'_>,
+    reached: &[bool],
+    facts: &Facts<'_, A>,
+    jump: &mut [u32],
+    any_jump: &mut bool,
+) {
+    for b in (0..view.blocks()).filter(|&b| at(reached, b, false)) {
+        let block = Block(to_u32(b));
+        let term = view.terminator(block);
+        try_collapse_terminator(view, block, term, facts, None, jump, any_jump);
+    }
+}
+
+/// Folds undecided flagless scalar-integer `Op::Icmp` and pure scalar-integer instructions
+/// proved constant by the unified [`ValueInfo`] analysis (known bits, unsigned ranges, and
+/// dominator-scoped branch / XOR-range refinements), waking users of any folded instruction,
+/// and collapses `Op::Switch`/`Op::Br` terminators whose scrutinee/condition is proved
+/// constant in its block.
+fn fold_value_info_facts<A: Allocator + Copy>(
     view: &View<'_>,
     reached: &[bool],
     facts: &mut Facts<'_, A>,
@@ -779,6 +920,8 @@ fn fold_value_info_icmps<A: Allocator + Copy>(
     queue: &mut Queue<A>,
     in_work: &mut [bool],
     any_folded: &mut bool,
+    jump: &mut [u32],
+    any_jump: &mut bool,
     alloc: A,
 ) -> bool {
     let mut has_candidate = false;
@@ -786,11 +929,28 @@ fn fold_value_info_icmps<A: Allocator + Copy>(
         let block = Block(to_u32(b));
         let params = view.params(block);
         for inst in params.end..view.block(block).end {
-            if view.op(inst) == Op::Icmp && view.flags(inst) == Flags::NONE && !facts.decided(inst) {
+            let op = view.op(inst);
+            if op == Op::Icmp && view.flags(inst) == Flags::NONE && !facts.decided(inst) {
                 let mut o = view.operands(inst);
                 let _cond = o.int_cond();
                 let lhs = o.value().0;
                 if scalar_int_width(Ty(at(view.tys, to_idx(lhs), 0)), view.head.ptr_bits) > 0 {
+                    has_candidate = true;
+                    break 'scan;
+                }
+            } else if is_pure_scalar_int_foldable(op)
+                && view.flags(inst) == Flags::NONE
+                && !facts.decided(inst)
+                && scalar_int_width(Ty(at(view.tys, inst, 0)), view.head.ptr_bits) > 0
+            {
+                has_candidate = true;
+                break 'scan;
+            } else if matches!(op, Op::Switch | Op::Br) {
+                let scrutinee = view.operands(inst).value().0;
+                let rs = facts.resolve(scrutinee);
+                if facts.int(rs).is_none()
+                    && scalar_int_width(Ty(at(view.tys, to_idx(rs), 0)), view.head.ptr_bits) > 0
+                {
                     has_candidate = true;
                     break 'scan;
                 }
@@ -807,54 +967,85 @@ fn fold_value_info_icmps<A: Allocator + Copy>(
         let block = Block(to_u32(b));
         let params = view.params(block);
         for inst in params.end..view.block(block).end {
-            if view.op(inst) != Op::Icmp || view.flags(inst) != Flags::NONE || facts.decided(inst) {
-                continue;
-            }
-            let mut o = view.operands(inst);
-            let cond = o.int_cond();
-            let lhs = o.value().0;
-            let rhs = o.value().0;
-            let width = scalar_int_width(Ty(at(view.tys, to_idx(lhs), 0)), view.head.ptr_bits);
-            if width == 0
-                || width != scalar_int_width(Ty(at(view.tys, to_idx(rhs), 0)), view.head.ptr_bits)
-            {
-                continue;
-            }
-            let rl = facts.resolve(lhs);
-            let rr = facts.resolve(rhs);
-            let folded = if rl == rr && to_idx(rl) < view.len() && view.op(to_idx(rl)) != Op::Uninit {
-                Some(matches!(
-                    cond,
-                    IntCond::Eq | IntCond::Ule | IntCond::Uge | IntCond::Sle | IntCond::Sge
-                ))
-            } else {
-                let m = width_mask(width);
-                let operand_fact = |raw: u32, resolved: u32| -> ValFact {
-                    if let Some((c, _)) = facts.int(resolved) {
-                        ValFact::constant(c, m)
-                    } else {
-                        let f = vi.fact_at(block, to_idx(raw));
-                        if resolved != raw { f.refine(vi.fact_at(block, to_idx(resolved)), m) } else { f }
-                    }
+            let op = view.op(inst);
+            if op == Op::Icmp {
+                if view.flags(inst) != Flags::NONE || facts.decided(inst) {
+                    continue;
+                }
+                let mut o = view.operands(inst);
+                let cond = o.int_cond();
+                let lhs = o.value().0;
+                let rhs = o.value().0;
+                let width = scalar_int_width(Ty(at(view.tys, to_idx(lhs), 0)), view.head.ptr_bits);
+                if width == 0
+                    || width != scalar_int_width(Ty(at(view.tys, to_idx(rhs), 0)), view.head.ptr_bits)
+                {
+                    continue;
+                }
+                let rl = facts.resolve(lhs);
+                let rr = facts.resolve(rhs);
+                let folded = if rl == rr && to_idx(rl) < view.len() && view.op(to_idx(rl)) != Op::Uninit {
+                    Some(matches!(
+                        cond,
+                        IntCond::Eq | IntCond::Ule | IntCond::Uge | IntCond::Sle | IntCond::Sge
+                    ))
+                } else {
+                    let m = width_mask(width);
+                    let operand_fact = |raw: u32, resolved: u32| -> ValFact {
+                        if let Some((c, _)) = facts.int(resolved) {
+                            ValFact::constant(c, m)
+                        } else {
+                            let f = vi.fact_at(block, to_idx(raw));
+                            if resolved != raw { f.refine(vi.fact_at(block, to_idx(resolved)), m) } else { f }
+                        }
+                    };
+                    eval_icmp_facts(cond, width, operand_fact(lhs, rl), operand_fact(rhs, rr))
                 };
-                eval_icmp_facts(cond, width, operand_fact(lhs, rl), operand_fact(rhs, rr))
-            };
-            if let Some(val) = folded
-                && facts.take(inst, Fact::Known(Known::Int(u128::from(val))))
-            {
-                *any_folded = true;
-                changed = true;
-                wake_users(
-                    to_u32(inst),
-                    facts,
-                    use_start,
-                    use_list,
-                    stand_head,
-                    stand_next,
-                    relay_stack,
-                    queue,
-                    in_work,
-                );
+                if let Some(val) = folded
+                    && facts.take(inst, Fact::Known(Known::Int(u128::from(val))))
+                {
+                    *any_folded = true;
+                    changed = true;
+                    wake_users(
+                        to_u32(inst),
+                        facts,
+                        use_start,
+                        use_list,
+                        stand_head,
+                        stand_next,
+                        relay_stack,
+                        queue,
+                        in_work,
+                    );
+                }
+            } else if is_pure_scalar_int_foldable(op) {
+                if view.flags(inst) != Flags::NONE || facts.decided(inst) {
+                    continue;
+                }
+                let width = scalar_int_width(Ty(at(view.tys, inst, 0)), view.head.ptr_bits);
+                if width == 0 {
+                    continue;
+                }
+                let f = vi.fact_at(block, inst);
+                if let Some(c) = exact_const_fact(f, width)
+                    && facts.take(inst, Fact::Known(Known::Int(c)))
+                {
+                    *any_folded = true;
+                    changed = true;
+                    wake_users(
+                        to_u32(inst),
+                        facts,
+                        use_start,
+                        use_list,
+                        stand_head,
+                        stand_next,
+                        relay_stack,
+                        queue,
+                        in_work,
+                    );
+                }
+            } else if matches!(op, Op::Switch | Op::Br) {
+                try_collapse_terminator(view, block, inst, facts, Some(&vi), jump, any_jump);
             }
         }
     }

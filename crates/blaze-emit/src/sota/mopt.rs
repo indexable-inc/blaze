@@ -29,8 +29,11 @@
 //!    sliding window and zero-offset `Ldr`/`Str`/`Ldp`/`Stp` + `AddImm`/`SubImm` post-index fusion.
 //! 4. [`mopt_branch_opt`]: bounded empty-trampoline branch threading (`<= 16` hops), conditional
 //!    branch inversion over trailing `B` (including across empty/pass-through fallthrough chains),
-//!    fallthrough `B` elision, short edge-split block (`S -> B T`) relocation before `T`,
-//!    unreachable empty/trampoline block pruning, and `CFG` rebuild.
+//!    fallthrough `B` elision, unreachable empty/trampoline block pruning, post-RA identical
+//!    short-block tail merging up to 12 ops (Pass 4e), post-RA distant / post-`Ret` copy-trampoline
+//!    hoisting (Pass 4g), short edge-split block relocation & distant back-edge trampoline
+//!    inversion/co-location (Pass 4d Phases 1–3), post-RA short hot loop-header relocation before
+//!    its fallthrough-free body (Pass 4f), and `CFG` rebuild.
 //! 5. [`mopt_fuse_addsub_cbz_post_ra`] (post-RA only): fuses adjacent `SubImm`/`AddImm`/`SubReg`/
 //!    `AddReg` + `Cbz`/`Cbnz` into Apple Silicon macro-op fused `subs`/`adds` + `b.eq`/`b.ne`.
 
@@ -39,7 +42,7 @@ use blaze_own::{Alloc, Vec};
 use crate::enc;
 
 use super::mfunc::{
-    AddrMode, FpAluOp, LogicalKind, MBlock, MCond, MFunc, MInstFlags, MNoteKind, MOp, MReg,
+    AddrMode, FpAluOp, LogicalKind, MBlock, MCond, MExt, MFunc, MInstFlags, MNoteKind, MOp, MReg,
     MShift, MemSize, NO_NOTE, NO_VFLAG, PReg, VReg, VRegClass, VecAluOp,
 };
 
@@ -50,7 +53,7 @@ const PEEPHOLE_WINDOW: usize = 24;
 const PAIR_WINDOW: usize = 12;
 
 /// Sliding window bound for Pass 3 post-index writeback fusion (Rule 18).
-const POST_IDX_WINDOW: usize = 12;
+const POST_IDX_WINDOW: usize = 64;
 
 /// Fixed stack table capacity for Pass 2 intra-MBB load/store forwarding (zero allocation).
 const LOAD_SLOTS: usize = 32;
@@ -76,6 +79,47 @@ const MAX_RELOCATE_BLOCK_INSTS: usize = 6;
 /// Maximum non-NOP instruction count of a pure fallthrough copy block `P` before `T` eligible for
 /// secondary I-cache co-location of `S -> B T` immediately before `P`.
 const MAX_SECONDARY_CO_LOCATE_P_INSTS: usize = 4;
+
+/// Maximum total non-NOP instruction count (`1..=12`, including trailing `B`) for Pass 4e post-RA
+/// identical short-block tail merging.
+const MAX_TAIL_MERGE_OPS: usize = 12;
+
+/// Maximum prefix instruction count (`0..=11`, i.e. `1..=12` total ops with trailing `B`, or
+/// `1..=11` ops for a pure fallthrough block immediately before `target`) for Pass 4e post-RA
+/// identical short-block tail merging.
+const MAX_TAIL_MERGE_PREFIX_OPS: usize = MAX_TAIL_MERGE_OPS - 1;
+
+/// Maximum candidate blocks compared per target bucket in Pass 4e (Rule 18).
+const MAX_TAIL_MERGE_BUCKET: usize = 64;
+
+/// Maximum non-NOP instruction count (`1..=10`, all non-terminator ops `Mov`/`MovImm`, ending in
+/// `MOp::B { target }`) for Pass 4g post-RA distant / post-`Ret` copy-trampoline hoisting.
+const MAX_TRAMPOLINE_HOIST_INSTS: usize = 10;
+
+/// Minimum `block_order` distance (`s_pos > t_pos + 8`) for Pass 4g hoisting when no `Ret` sits
+/// between `T` and `S`.
+const MIN_TRAMPOLINE_HOIST_DIST: usize = 8;
+
+/// Maximum distant / post-`Ret` copy-trampoline hoists per Pass 4g call (Rule 18).
+const MAX_TRAMPOLINE_HOISTS: usize = 32;
+
+/// Bitmask covering all 31 architectural GPRs (`x0..=x30`) for post-RA bitmask liveness.
+const ALL_GPRS_MASK: u32 = 0x7fff_ffff;
+
+/// Maximum backward fixed-point iterations for post-RA GPR bitmask liveness (Rule 18).
+const MAX_LIVENESS_ITERS: usize = 32;
+
+/// Known-immediate slot count per block for post-RA cross-block `MovImm` elision (Rule 18).
+const CROSS_BLOCK_IMM_SLOTS: usize = 8;
+
+/// Maximum non-NOP instruction count of a short loop-header block `H` eligible for Pass 4f.
+const MAX_HEADER_RELOC_INSTS: usize = 8;
+
+/// Maximum hot loop-header relocations per Pass 4f call (Rule 18).
+const MAX_HEADER_RELOCATIONS: usize = 32;
+
+/// Maximum non-NOP instruction count of a distant back-edge trampoline `S -> B T` in Pass 4d Phase 3.
+const MAX_BACKEDGE_SPLIT_INSTS: usize = 3;
 
 // -----------------------------------------------------------------------------
 // Zero-`as` conversion helpers
@@ -194,6 +238,18 @@ pub fn optimize_mfunc<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>) -> MOptStats {
     // Pass 1: Typed intra-MBB peepholes, `MovImm` CSE, copy propagation, flag/bitfield fusion.
     mopt_peepholes_and_cse(func, alloc, &mut stats);
     compact_nops(func, alloc);
+
+    // Pass 1m:
+    // - SSA: global cross-block pure `Mov { wide: true }` copy elimination (folds `u32 as usize`
+    //   copies upgraded by `peephole_known_zero_upper32` across all basic blocks).
+    // - Post-RA: cross-block known-`MovImm` elision over CFG predecessors.
+    if func.is_ssa {
+        mopt_global_wide_mov_ssa(func, alloc, &mut stats);
+        compact_nops(func, alloc);
+    } else {
+        mopt_cross_block_mov_imm_post_ra(func, alloc, &mut stats);
+        compact_nops(func, alloc);
+    }
 
     // Pass 2: Zero-allocation intra-MBB redundant load elimination & store-to-load forwarding.
     let loads_before = stats.loads_forwarded;
@@ -362,6 +418,7 @@ fn inst_defines_reg(func: &MFunc<'_>, idx: usize, reg: MReg) -> bool {
         | MOp::Msub { dst, .. }
         | MOp::Umulh { dst, .. }
         | MOp::Smulh { dst, .. }
+        | MOp::CarryAddSub { dst, .. }
         | MOp::Udiv { dst, .. }
         | MOp::Sdiv { dst, .. }
         | MOp::Umin { dst, .. }
@@ -474,6 +531,7 @@ fn inst_uses_reg(func: &MFunc<'_>, idx: usize, reg: MReg) -> bool {
         | MOp::Mul { rn, rm, .. }
         | MOp::Umulh { rn, rm, .. }
         | MOp::Smulh { rn, rm, .. }
+        | MOp::CarryAddSub { rn, rm, .. }
         | MOp::Udiv { rn, rm, .. }
         | MOp::Sdiv { rn, rm, .. }
         | MOp::Umin { rn, rm, .. }
@@ -600,6 +658,7 @@ fn visit_op_vreg_uses(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(u
         | MOp::Mul { rn, rm, .. }
         | MOp::Umulh { rn, rm, .. }
         | MOp::Smulh { rn, rm, .. }
+        | MOp::CarryAddSub { rn, rm, .. }
         | MOp::Udiv { rn, rm, .. }
         | MOp::Sdiv { rn, rm, .. }
         | MOp::Umin { rn, rm, .. }
@@ -748,6 +807,7 @@ fn visit_op_vreg_defs(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(u
         | MOp::Msub { dst, .. }
         | MOp::Umulh { dst, .. }
         | MOp::Smulh { dst, .. }
+        | MOp::CarryAddSub { dst, .. }
         | MOp::Udiv { dst, .. }
         | MOp::Sdiv { dst, .. }
         | MOp::Umin { dst, .. }
@@ -901,6 +961,7 @@ fn remap_op_vreg_uses(op: &mut MOp, copy_pairs: &mut [(MReg, MReg)], remap: &[u3
         | MOp::Mul { rn, rm, .. }
         | MOp::Umulh { rn, rm, .. }
         | MOp::Smulh { rn, rm, .. }
+        | MOp::CarryAddSub { rn, rm, .. }
         | MOp::Udiv { rn, rm, .. }
         | MOp::Sdiv { rn, rm, .. }
         | MOp::Umin { rn, rm, .. }
@@ -1044,7 +1105,9 @@ fn op_uses_reg_only_low32(op: &MOp, copy_pairs: &[(MReg, MReg)], reg: MReg) -> b
         MOp::Madd { rn, rm, ra, wide, .. } | MOp::Msub { rn, rm, ra, wide, .. } => {
             !wide || (rn != reg && rm != reg && ra != reg)
         }
-        MOp::Umulh { rn, rm, .. } | MOp::Smulh { rn, rm, .. } => rn != reg && rm != reg,
+        MOp::Umulh { rn, rm, .. }
+        | MOp::Smulh { rn, rm, .. }
+        | MOp::CarryAddSub { rn, rm, .. } => rn != reg && rm != reg,
         MOp::AddLo12 { rn, .. } => rn != reg,
         MOp::FpAlu { op: fp_op, rn, double, .. } => match fp_op {
             FpAluOp::MovFromGpr => !double || rn != reg,
@@ -1223,6 +1286,7 @@ fn rewrite_gpr_uses_in_op(op: &mut MOp, old_reg: MReg, new_reg: MReg) -> Rewrite
         | MOp::Mul { rn, rm, .. }
         | MOp::Umulh { rn, rm, .. }
         | MOp::Smulh { rn, rm, .. }
+        | MOp::CarryAddSub { rn, rm, .. }
         | MOp::Udiv { rn, rm, .. }
         | MOp::Sdiv { rn, rm, .. }
         | MOp::Umin { rn, rm, .. }
@@ -1465,7 +1529,9 @@ fn rewrite_narrow32_uses_in_op(op: &mut MOp, old_reg: MReg, new_reg: MReg) -> Re
                 out.had_unrewritable_use = true;
             }
         }
-        MOp::Umulh { rn, rm, .. } | MOp::Smulh { rn, rm, .. } => {
+        MOp::Umulh { rn, rm, .. }
+        | MOp::Smulh { rn, rm, .. }
+        | MOp::CarryAddSub { rn, rm, .. } => {
             if *rn == old_reg || *rm == old_reg {
                 out.had_unrewritable_use = true;
             }
@@ -2085,6 +2151,91 @@ fn mopt_dead_narrow32_mov_ssa<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats:
     }
 }
 
+/// Pass 1m (SSA only): Whole-function pure wide-`Mov` (`Mov { dst: V(d), src: V(s), wide: true }`)
+/// copy elimination across basic blocks when both `V(d)` and `V(s)` are single-def, non-phi
+/// (`!is_phi`) GPR `VReg`s. Eliminates cross-block copies left behind after
+/// `peephole_known_zero_upper32` upgrades zero-upper-32 `u32 -> u64` widens to `wide: true`.
+fn mopt_global_wide_mov_ssa<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptStats) {
+    if !func.is_ssa || func.vreg_class.is_empty() {
+        return;
+    }
+    let n_vregs = func.vreg_class.len();
+    let def_counts = compute_vreg_def_counts(func, alloc);
+    let mut is_phi: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n_vregs, alloc);
+    for _ in 0..n_vregs {
+        is_phi.push(false);
+    }
+    for op in func.ops.iter() {
+        if let MOp::ParallelCopy { start, len } = *op {
+            let s = to_idx(start);
+            let e = s.saturating_add(usize::from(len)).min(func.copy_pairs.len());
+            if let Some(pairs) = func.copy_pairs.get(s..e) {
+                for &(dst, _) in pairs {
+                    if let MReg::V(v) = dst {
+                        set(&mut is_phi, to_idx(v.0), true);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut remap: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_vregs, alloc);
+    for _ in 0..n_vregs {
+        remap.push(u32::MAX);
+    }
+    let mut elided_any = false;
+    for i in 0..func.ops.len() {
+        if is_protected(func, i) {
+            continue;
+        }
+        let MOp::Mov { dst: MReg::V(d), src: MReg::V(s), wide: true } = op_at(func, i) else {
+            continue;
+        };
+        if d == s {
+            continue;
+        }
+        let di = to_idx(d.0);
+        let si = to_idx(s.0);
+        if def_counts.get(di).copied().unwrap_or(0) != 1
+            || def_counts.get(si).copied().unwrap_or(0) != 1
+            || at(&is_phi, di, true)
+            || at(&is_phi, si, true)
+            || !func.vreg_class.get(di).copied().is_some_and(VRegClass::is_gpr)
+            || !func.vreg_class.get(si).copied().is_some_and(VRegClass::is_gpr)
+        {
+            continue;
+        }
+        let mut cur = s.0;
+        let mut hops: usize = 0;
+        let mut safe_chain = true;
+        while hops < MAX_THREAD_HOPS {
+            if cur == d.0 {
+                safe_chain = false;
+                break;
+            }
+            let next = remap.get(to_idx(cur)).copied().unwrap_or(u32::MAX);
+            if next == u32::MAX {
+                break;
+            }
+            cur = next;
+            hops += 1;
+        }
+        if !safe_chain || hops >= MAX_THREAD_HOPS {
+            continue;
+        }
+        set(&mut remap, di, s.0);
+        mark_deleted(func, i);
+        stats.movs_eliminated = stats.movs_eliminated.saturating_add(1);
+        elided_any = true;
+    }
+
+    if elided_any {
+        for op in func.ops.iter_mut() {
+            remap_op_vreg_uses(op, &mut func.copy_pairs, &remap);
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Pass 1: Peepholes, `MovImm` CSE, and Local Copy Propagation
 // -----------------------------------------------------------------------------
@@ -2186,6 +2337,11 @@ impl<'a> ZeroUpper32<'a> {
 fn mopt_peepholes_and_cse<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptStats) {
     let mut vreg_uses = compute_vreg_use_counts(func, alloc);
     let mut zero_hi = ZeroUpper32::new(func, alloc);
+    let live_out_gprs = if !func.is_ssa {
+        compute_post_ra_live_out_gprs(func, alloc)
+    } else {
+        None
+    };
     let n_order = func.block_order.len();
 
     for bi in 0..n_order {
@@ -2196,6 +2352,9 @@ fn mopt_peepholes_and_cse<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mu
         if start >= end {
             continue;
         }
+        let live_out_mask = live_out_gprs
+            .as_ref()
+            .and_then(|v| v.get(to_idx(blk.0)).copied());
 
         // 1a. Dead self-`Mov` removal (64-bit `Mov`, `MovSp`, `FpAlu::Mov`, `VecAlu::Mov`) +
         //     known-zero-upper-32 tracking & redundant `mov wR, wR` elimination (pre- & post-RA).
@@ -2254,11 +2413,30 @@ fn mopt_peepholes_and_cse<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mu
         // 1g. `Ubfm` LSR + `Ubfm` UBFX fusion (`sh + lsb + w <= width`).
         peephole_fuse_lsr_ubfx(func, start, end, &mut vreg_uses, stats);
 
-        // 1h. Single-use `Ubfm`/`Sbfm` shift-into-ALU/`Mvn` fusion (`AddReg`/`SubReg`/`LogicalReg`/`Mvn`).
-        peephole_fuse_shift_into_alu(func, start, end, &mut vreg_uses, stats);
+        // 1h. Single-use `Ubfm`/`Sbfm` shift-into-ALU/`Mvn` fusion (`AddReg`/`SubReg`/`LogicalReg`/`Mvn`),
+        //     including zero-upper-32 narrow `LSR` into 64-bit ALU.
+        peephole_fuse_shift_into_alu(func, start, end, &zero_hi, live_out_mask, &mut vreg_uses, stats);
+
+        // 1h-2. Single-use `uxtb`/`uxth`/`uxtw` (`Ubfm` or `And #0xff/#0xffff`) + 64-bit `AddReg`/`SubReg`
+        //       -> `AddExt`/`SubExt` (`add/sub xD, xN, wM, uxtb/uxth/uxtw`).
+        peephole_fuse_uxt_into_addsub(func, start, end, live_out_mask, &mut vreg_uses, stats);
 
         // 1i. SSA `neg` (optional shift) + `AddReg` -> `SubReg` fusion.
         peephole_fuse_neg_add(func, start, end, &mut vreg_uses, stats);
+
+        // 1j. `CmpImm(rn, 0) + BCond(Eq|Ls|Ne|Hi)` -> `Cbz`/`Cbnz` (frees `NZCV`, unlocks Pass 5).
+        peephole_fuse_cmp_zero_branch(func, start, end, &mut vreg_uses, stats);
+
+        // 1k. `MovImm(0|1) + Csel` -> `Csel(..., Xzr)` / `Csinc(..., Xzr)`.
+        peephole_fold_const_csel(func, start, end, live_out_mask, &mut vreg_uses, stats);
+
+        // 1l. Post-RA liveness-backed constant-copy propagation, backward single-def copy folding,
+        //     and redundant `uxtb`/`uxth` before `strb`/`strh` elimination.
+        if !func.is_ssa {
+            peephole_post_ra_const_copy_prop(func, start, end, live_out_mask, stats);
+            peephole_post_ra_backward_copy_fold(func, start, end, live_out_mask, stats);
+            peephole_post_ra_uxtb_str(func, start, end, live_out_mask, stats);
+        }
     }
 }
 
@@ -2556,6 +2734,7 @@ fn peephole_known_zero_upper32(
             MOp::VecAlu { .. } => {}
             MOp::Umulh { dst, .. }
             | MOp::Smulh { dst, .. }
+            | MOp::CarryAddSub { dst, .. }
             | MOp::Adrp { dst }
             | MOp::AddLo12 { dst, .. }
             | MOp::AdrTable { dst, .. } => {
@@ -3199,13 +3378,16 @@ fn decode_const_shift(op: MOp) -> Option<DecodedShift> {
 }
 
 /// Fuses single-use immediate shifts (`Ubfm` `LSR`/`LSL`, `Sbfm` `ASR`) directly into a following
-/// `AddReg`, `SubReg`, `LogicalReg`, or `Mvn` with `shift: None` and matching width (swapping
-/// `rn`/`rm` for commutative `AddReg` and non-inverting `LogicalReg`), deleting the shift
-/// instruction.
+/// `AddReg`, `SubReg`, `LogicalReg`, or `Mvn` with `shift: None` and matching width (or a 32-bit
+/// `LSR` of a known-zero-upper-32 SSA `VReg` directly into a 64-bit `AddReg`/`SubReg`/
+/// `LogicalReg`, swapping `rn`/`rm` for commutative `AddReg` and non-inverting `LogicalReg`),
+/// deleting the shift instruction.
 fn peephole_fuse_shift_into_alu(
     func: &mut MFunc<'_>,
     start: usize,
     end: usize,
+    zero_hi: &ZeroUpper32<'_>,
+    live_out_mask: Option<u32>,
     vreg_uses: &mut [u32],
     stats: &mut MOptStats,
 ) {
@@ -3222,6 +3404,14 @@ fn peephole_fuse_shift_into_alu(
         if !is_trackable_reg(tmp) || x == MReg::SP {
             continue;
         }
+        // In SSA mode, a 32-bit `LSR` (`lsr wTmp, wX, #s`) of a `VReg` whose upper 32 bits are
+        // already proven zero produces the exact same 64-bit value as `lsr xTmp, xX, #s`, so it
+        // can fuse directly into a 64-bit `AddReg`/`SubReg`/`LogicalReg`.
+        let narrow_lsr_as_wide = func.is_ssa
+            && !sh.wide
+            && x.is_virtual()
+            && matches!(sh.shift, Some(MShift::Lsr(_)))
+            && zero_hi.is_zero_hi(x);
 
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for j in (i + 1)..scan_end {
@@ -3230,9 +3420,10 @@ fn peephole_fuse_shift_into_alu(
                 continue;
             }
             if !is_protected(func, j) {
+                let width_ok = |w: bool| w == sh.wide || (w && narrow_lsr_as_wide);
                 let fused_candidate: Option<(MReg, MOp)> = match op_j {
                     MOp::AddReg { dst, rn, rm, shift: None, wide, sets_flags }
-                        if wide == sh.wide && rn != rm =>
+                        if width_ok(wide) && rn != rm =>
                     {
                         if rm == tmp {
                             Some((
@@ -3263,7 +3454,7 @@ fn peephole_fuse_shift_into_alu(
                         }
                     }
                     MOp::SubReg { dst, rn, rm, shift: None, wide, sets_flags }
-                        if wide == sh.wide && rn != rm && rm == tmp =>
+                        if width_ok(wide) && rn != rm && rm == tmp =>
                     {
                         Some((
                             dst,
@@ -3285,7 +3476,7 @@ fn peephole_fuse_shift_into_alu(
                         invert_rm,
                         kind,
                         wide,
-                    } if wide == sh.wide && rn != rm => {
+                    } if width_ok(wide) && rn != rm => {
                         if rm == tmp {
                             Some((
                                 dst,
@@ -3341,7 +3532,114 @@ fn peephole_fuse_shift_into_alu(
                                 is_reg_dead_after(func, end, j, tmp, vreg_uses)
                             }
                         } else {
-                            is_reg_dead_after(func, end, j, tmp, vreg_uses)
+                            is_gpr_dead_after_with_liveout(func, end, j, tmp, live_out_mask)
+                        };
+                    if tmp_dead {
+                        dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+                        dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
+                        mark_deleted(func, i);
+                        set(&mut func.ops, j, fused);
+                        inc_op_vreg_uses(&fused, &func.copy_pairs, vreg_uses);
+                        stats.peepholes = stats.peepholes.saturating_add(1);
+                    }
+                    break;
+                }
+            }
+
+            if is_control_or_call(&op_j)
+                || is_call_or_mem_barrier(func, j)
+                || matches!(op_j, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
+                || inst_touches_reg(func, j, tmp)
+                || inst_defines_reg(func, j, x)
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// Pass 1h-2: Fuses single-use unsigned zero-extend (`uxtb`/`uxth`/`uxtw` via `Ubfm` or
+/// `LogicalImm::And #0xff/#0xffff`) directly into a following 64-bit `AddReg`/`SubReg`
+/// (`shift: None`), producing `AddExt`/`SubExt` (`add/sub xD, xN, wM, uxtb/uxth/uxtw`) and
+/// deleting the extend instruction.
+fn peephole_fuse_uxt_into_addsub(
+    func: &mut MFunc<'_>,
+    start: usize,
+    end: usize,
+    live_out_mask: Option<u32>,
+    vreg_uses: &mut [u32],
+    stats: &mut MOptStats,
+) {
+    for i in start..end {
+        if is_protected(func, i) {
+            continue;
+        }
+        let op_i = op_at(func, i);
+        let (tmp, x, ext) = match op_i {
+            MOp::Ubfm { dst, rn, immr: 0, imms: 7, wide: false } => (dst, rn, MExt::Uxtb),
+            MOp::Ubfm { dst, rn, immr: 0, imms: 15, wide: false } => (dst, rn, MExt::Uxth),
+            MOp::Ubfm { dst, rn, immr: 0, imms: 31, wide: false } => (dst, rn, MExt::Uxtw),
+            MOp::LogicalImm { dst, rn, imm: 0xff, kind: LogicalKind::And, .. } => {
+                (dst, rn, MExt::Uxtb)
+            }
+            MOp::LogicalImm { dst, rn, imm: 0xffff, kind: LogicalKind::And, .. } => {
+                (dst, rn, MExt::Uxth)
+            }
+            _ => continue,
+        };
+        if !is_trackable_reg(tmp) || x == MReg::SP {
+            continue;
+        }
+
+        let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
+        for j in (i + 1)..scan_end {
+            let op_j = op_at(func, j);
+            if matches!(op_j, MOp::Nop) {
+                continue;
+            }
+            if !is_protected(func, j) {
+                let fused_candidate: Option<(MReg, MOp)> = match op_j {
+                    MOp::AddReg { dst, rn, rm, shift: None, wide: true, sets_flags }
+                        if rn != rm && (sets_flags || dst != MReg::XZR) =>
+                    {
+                        if rm == tmp && rn != MReg::XZR {
+                            Some((
+                                dst,
+                                MOp::AddExt { dst, rn, rm: x, ext, wide: true, sets_flags },
+                            ))
+                        } else if rn == tmp && rm != MReg::XZR {
+                            Some((
+                                dst,
+                                MOp::AddExt { dst, rn: rm, rm: x, ext, wide: true, sets_flags },
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    MOp::SubReg { dst, rn, rm, shift: None, wide: true, sets_flags }
+                        if rn != rm
+                            && rm == tmp
+                            && rn != MReg::XZR
+                            && (sets_flags || dst != MReg::XZR) =>
+                    {
+                        Some((
+                            dst,
+                            MOp::SubExt { dst, rn, rm: x, ext, wide: true, sets_flags },
+                        ))
+                    }
+                    _ => None,
+                };
+
+                if let Some((consumer_dst, fused)) = fused_candidate {
+                    let tmp_dead = consumer_dst == tmp
+                        || if func.is_ssa {
+                            if let MReg::V(v) = tmp {
+                                vreg_uses.get(to_idx(v.0)).copied().unwrap_or(0) == 1
+                            } else {
+                                is_reg_dead_after(func, end, j, tmp, vreg_uses)
+                            }
+                        } else {
+                            is_gpr_dead_after_with_liveout(func, end, j, tmp, live_out_mask)
                         };
                     if tmp_dead {
                         dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
@@ -3540,6 +3838,1025 @@ fn peephole_fuse_cset_add(
             {
                 break;
             }
+        }
+    }
+}
+
+/// Returns `true` iff `func` contains indirect jumps (`AdrTable`/`Br`) or jump-table/unwind notes
+/// that introduce implicit CFG edges not captured by `func.block_succs`/`block_preds`.
+fn has_indirect_or_unwind_cfg(func: &MFunc<'_>) -> bool {
+    func.ops.iter().any(|op| matches!(*op, MOp::AdrTable { .. } | MOp::Br { .. }))
+        || func.notes.iter().any(|note| {
+            matches!(note.kind, MNoteKind::JumpTableAnchor { .. } | MNoteKind::Unwind { .. })
+        })
+}
+
+#[inline]
+fn gpr_bit(reg: MReg) -> u32 {
+    match reg {
+        MReg::P(PReg::Gpr(r)) if r <= 30 => 1u32 << r,
+        _ => 0,
+    }
+}
+
+#[inline]
+fn opt_gpr_bit(reg: Option<MReg>) -> u32 {
+    match reg {
+        Some(r) => gpr_bit(r),
+        None => 0,
+    }
+}
+
+/// Exhaustive O(1) GPR (`x0..=x30`) `(def_mask, use_mask)` for a post-RA instruction, returning
+/// `None` for calls, indirect branches, `Ret`, `ParallelCopy`, and `RawWord` which the liveness
+/// solver handles explicitly.
+fn op_gpr_def_use_masks(op: &MOp) -> Option<(u32, u32)> {
+    Some(match *op {
+        MOp::Mov { dst, src, .. } | MOp::MovSp { dst, src } => (gpr_bit(dst), gpr_bit(src)),
+        MOp::MovImm { dst, .. } | MOp::Adrp { dst } | MOp::AdrTable { dst, .. } => {
+            (gpr_bit(dst), 0)
+        }
+        MOp::AddImm { dst, rn, .. }
+        | MOp::SubImm { dst, rn, .. }
+        | MOp::LogicalImm { dst, rn, .. }
+        | MOp::Ubfm { dst, rn, .. }
+        | MOp::Sbfm { dst, rn, .. }
+        | MOp::Rbit { dst, rn, .. }
+        | MOp::Clz { dst, rn, .. }
+        | MOp::Rev { dst, rn, .. }
+        | MOp::AddLo12 { dst, rn, .. } => (gpr_bit(dst), gpr_bit(rn)),
+        MOp::Mvn { dst, rm, .. } => (gpr_bit(dst), gpr_bit(rm)),
+        MOp::Bfxil { dst, rn, .. } => (gpr_bit(dst), gpr_bit(dst) | gpr_bit(rn)),
+        MOp::AddReg { dst, rn, rm, .. }
+        | MOp::SubReg { dst, rn, rm, .. }
+        | MOp::AddExt { dst, rn, rm, .. }
+        | MOp::SubExt { dst, rn, rm, .. }
+        | MOp::LogicalReg { dst, rn, rm, .. }
+        | MOp::ShiftVar { dst, rn, rm, .. }
+        | MOp::Extr { dst, rn, rm, .. }
+        | MOp::Mul { dst, rn, rm, .. }
+        | MOp::Umulh { dst, rn, rm, .. }
+        | MOp::Smulh { dst, rn, rm, .. }
+        | MOp::CarryAddSub { dst, rn, rm, .. }
+        | MOp::Udiv { dst, rn, rm, .. }
+        | MOp::Sdiv { dst, rn, rm, .. }
+        | MOp::Umin { dst, rn, rm, .. }
+        | MOp::Umax { dst, rn, rm, .. }
+        | MOp::Smin { dst, rn, rm, .. }
+        | MOp::Smax { dst, rn, rm, .. }
+        | MOp::Csel { dst, rn, rm, .. }
+        | MOp::Csinc { dst, rn, rm, .. }
+        | MOp::Csinv { dst, rn, rm, .. }
+        | MOp::Csneg { dst, rn, rm, .. } => (gpr_bit(dst), gpr_bit(rn) | gpr_bit(rm)),
+        MOp::Madd { dst, rn, rm, ra, .. } | MOp::Msub { dst, rn, rm, ra, .. } => {
+            (gpr_bit(dst), gpr_bit(rn) | gpr_bit(rm) | gpr_bit(ra))
+        }
+        MOp::CmpImm { rn, .. } | MOp::TstImm { rn, .. } | MOp::CcmpImm { rn, .. } => {
+            (0, gpr_bit(rn))
+        }
+        MOp::CmpReg { rn, rm, .. } | MOp::TstReg { rn, rm, .. } | MOp::CcmpReg { rn, rm, .. } => {
+            (0, gpr_bit(rn) | gpr_bit(rm))
+        }
+        MOp::FpAlu { dst, rn, rm, ra, .. } => {
+            (gpr_bit(dst), gpr_bit(rn) | opt_gpr_bit(rm) | opt_gpr_bit(ra))
+        }
+        MOp::VecAlu { op: vop, dst, rn, rm, .. } => {
+            let extra_dst_use = matches!(
+                vop,
+                VecAluOp::Bsl
+                    | VecAluOp::Bit
+                    | VecAluOp::Bif
+                    | VecAluOp::Mla
+                    | VecAluOp::Mls
+                    | VecAluOp::Fmla
+                    | VecAluOp::Fmls
+            );
+            let uses = if matches!(vop, VecAluOp::Zero) {
+                0
+            } else {
+                (if extra_dst_use { gpr_bit(dst) } else { 0 }) | gpr_bit(rn) | opt_gpr_bit(rm)
+            };
+            (gpr_bit(dst), uses)
+        }
+        MOp::Ldr { dst, addr, .. } => match addr {
+            AddrMode::BaseOff { base, .. } => (gpr_bit(dst), gpr_bit(base)),
+            AddrMode::ScaledIdx { base, idx, .. } => (gpr_bit(dst), gpr_bit(base) | gpr_bit(idx)),
+            AddrMode::PostIdx { base, .. } | AddrMode::PreIdx { base, .. } => {
+                (gpr_bit(dst) | gpr_bit(base), gpr_bit(base))
+            }
+        },
+        MOp::Str { src, addr, .. } => match addr {
+            AddrMode::BaseOff { base, .. } => (0, gpr_bit(src) | gpr_bit(base)),
+            AddrMode::ScaledIdx { base, idx, .. } => {
+                (0, gpr_bit(src) | gpr_bit(base) | gpr_bit(idx))
+            }
+            AddrMode::PostIdx { base, .. } | AddrMode::PreIdx { base, .. } => {
+                (gpr_bit(base), gpr_bit(src) | gpr_bit(base))
+            }
+        },
+        MOp::Ldp { dst0, dst1, base, post_idx, pre_idx, .. } => (
+            gpr_bit(dst0) | gpr_bit(dst1) | if post_idx || pre_idx { gpr_bit(base) } else { 0 },
+            gpr_bit(base),
+        ),
+        MOp::Stp { src0, src1, base, post_idx, pre_idx, .. } => (
+            if post_idx || pre_idx { gpr_bit(base) } else { 0 },
+            gpr_bit(src0) | gpr_bit(src1) | gpr_bit(base),
+        ),
+        MOp::Prfm { base, .. } => (0, gpr_bit(base)),
+        MOp::Cbz { rt, .. } | MOp::Cbnz { rt, .. } | MOp::Tbz { rt, .. } | MOp::Tbnz { rt, .. } => {
+            (0, gpr_bit(rt))
+        }
+        MOp::FpCmp { .. }
+        | MOp::Fcsel { .. }
+        | MOp::B { .. }
+        | MOp::BCond { .. }
+        | MOp::Brk { .. }
+        | MOp::Udf
+        | MOp::Nop => (0, 0),
+        MOp::Bl
+        | MOp::Blr { .. }
+        | MOp::Br { .. }
+        | MOp::Ret
+        | MOp::ParallelCopy { .. }
+        | MOp::RawWord { .. } => return None,
+    })
+}
+
+/// Computes exact post-RA `live_out` 31-GPR bitmasks (`x0..=x30`) for every block in `func`,
+/// returning `None` if `func.is_ssa`, if indirect/unwind CFG edges exist, or if the backward
+/// fixed point does not converge within `MAX_LIVENESS_ITERS`.
+fn compute_post_ra_live_out_gprs<'a>(
+    func: &mut MFunc<'a>,
+    alloc: Alloc<'a>,
+) -> Option<Vec<u32, Alloc<'a>>> {
+    if func.is_ssa || has_indirect_or_unwind_cfg(func) {
+        return None;
+    }
+    let num_blocks = func.block_insts.len();
+    if num_blocks == 0 {
+        return None;
+    }
+    if func.block_succs_off.len() != num_blocks + 1 {
+        func.rebuild_cfg(alloc);
+    }
+
+    let mut live_in: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+    let mut live_out: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+    for _ in 0..num_blocks {
+        live_in.push(0);
+        live_out.push(0);
+    }
+
+    let ret_mask = (func.ret_live_gprs & ALL_GPRS_MASK) | (1u32 << 30);
+    let n_ord = func.block_order.len();
+    let mut converged = false;
+
+    for _ in 0..MAX_LIVENESS_ITERS {
+        let mut changed = false;
+        for oi in (0..n_ord).rev() {
+            let Some(&blk) = func.block_order.get(oi) else {
+                continue;
+            };
+            let b = to_idx(blk.0);
+            let mut out_m: u32 = 0;
+            for &succ in func.block_succs(blk) {
+                out_m |= at(&live_in, to_idx(succ.0), 0);
+            }
+            if out_m != at(&live_out, b, 0) {
+                set(&mut live_out, b, out_m);
+                changed = true;
+            }
+
+            let (start, end) = block_range(func, blk);
+            let mut live = out_m;
+            for idx in (start..end).rev() {
+                let op = op_at(func, idx);
+                match op {
+                    MOp::Nop => {}
+                    MOp::Ret => {
+                        live = ret_mask;
+                    }
+                    MOp::B { target } => {
+                        live = at(&live_in, to_idx(target.0), ALL_GPRS_MASK);
+                    }
+                    MOp::Bl
+                    | MOp::Blr { .. }
+                    | MOp::Br { .. }
+                    | MOp::ParallelCopy { .. }
+                    | MOp::RawWord { .. } => {
+                        live = ALL_GPRS_MASK;
+                    }
+                    _ => {
+                        if let Some(target) = op.branch_target() {
+                            live |= at(&live_in, to_idx(target.0), ALL_GPRS_MASK);
+                        }
+                        if let Some((defs, uses)) = op_gpr_def_use_masks(&op) {
+                            live = (live & !defs) | uses;
+                        } else {
+                            live = ALL_GPRS_MASK;
+                        }
+                    }
+                }
+            }
+            if live != at(&live_in, b, 0) {
+                set(&mut live_in, b, live);
+                changed = true;
+            }
+        }
+        if !changed {
+            converged = true;
+            break;
+        }
+    }
+
+    if converged { Some(live_out) } else { None }
+}
+
+/// Returns `true` iff physical GPR `reg` (`x0..=x30`) is provably dead immediately after
+/// instruction `after_idx` in the block `[_, end)`, using exact block `live_out_mask` when
+/// available (properly guarding mid-block conditional branches).
+fn is_gpr_dead_after_with_liveout(
+    func: &MFunc<'_>,
+    end: usize,
+    after_idx: usize,
+    reg: MReg,
+    live_out_mask: Option<u32>,
+) -> bool {
+    let bit = gpr_bit(reg);
+    if bit == 0 {
+        return false;
+    }
+    let live_out = live_out_mask.is_some_and(|m| (m & bit) == 0);
+    for k in (after_idx + 1)..end {
+        let op_k = op_at(func, k);
+        if matches!(op_k, MOp::Nop) {
+            continue;
+        }
+        if inst_uses_reg(func, k, reg) {
+            return false;
+        }
+        if matches!(op_k, MOp::Ret) {
+            return true;
+        }
+        if matches!(op_k, MOp::B { .. }) {
+            return live_out;
+        }
+        if op_k.is_conditional_branch() {
+            if !live_out {
+                return false;
+            }
+            continue;
+        }
+        if matches!(
+            op_k,
+            MOp::Bl
+                | MOp::Blr { .. }
+                | MOp::Br { .. }
+                | MOp::Brk { .. }
+                | MOp::Udf
+                | MOp::ParallelCopy { .. }
+                | MOp::RawWord { .. }
+        ) {
+            return false;
+        }
+        if inst_defines_reg(func, k, reg) {
+            return true;
+        }
+    }
+    live_out
+}
+
+/// Pass 1j: Fuses `CmpImm { rn, imm12: 0, shift12: false, wide }` + sole consumer
+/// `BCond { cond: Eq | Ls | Ne | Hi, target }` into `Cbz` / `Cbnz`, eliminating the `cmp`
+/// instruction, freeing `NZCV`, and unlocking Pass 5 `add/sub + cbz` macro-op fusion.
+///
+/// Soundness for `Ls`/`Hi`: `cmp rn, #0` computes `rn - 0`, which NEVER borrows (`C == 1`),
+/// so unsigned `Ls` (`C == 0 || Z == 1`) holds iff `rn == 0` and unsigned `Hi` (`C == 1 && Z == 0`)
+/// holds iff `rn != 0`.
+fn peephole_fuse_cmp_zero_branch(
+    func: &mut MFunc<'_>,
+    start: usize,
+    end: usize,
+    vreg_uses: &mut [u32],
+    stats: &mut MOptStats,
+) {
+    for i in start..end {
+        if is_protected(func, i) {
+            continue;
+        }
+        let op_i = op_at(func, i);
+        let MOp::CmpImm { rn, imm12: 0, shift12: false, wide } = op_i else {
+            continue;
+        };
+        // `Cbz`/`Cbnz` operand role is `GprOrZr` (never `SP`).
+        if !is_trackable_reg(rn) || rn == MReg::SP {
+            continue;
+        }
+        let vf = vflag_def_at(func, i);
+        if vf == NO_VFLAG || vflag_use_at(func, i) != NO_VFLAG {
+            continue;
+        }
+
+        let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
+        let mut found_j: Option<(usize, MCond, MBlock)> = None;
+        for j in (i + 1)..scan_end {
+            let op_j = op_at(func, j);
+            if matches!(op_j, MOp::Nop) {
+                continue;
+            }
+            if vflag_use_at(func, j) == vf {
+                if !is_protected(func, j)
+                    && let MOp::BCond { cond, target } = op_j
+                    && matches!(cond, MCond::Eq | MCond::Ls | MCond::Ne | MCond::Hi)
+                {
+                    found_j = Some((j, cond, target));
+                }
+                break;
+            }
+            if op_j.reads_flags()
+                || op_j.writes_flags()
+                || vflag_def_at(func, j) != NO_VFLAG
+                || is_control_or_call(&op_j)
+                || is_call_or_mem_barrier(func, j)
+                || matches!(op_j, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
+                || inst_defines_reg(func, j, rn)
+            {
+                break;
+            }
+        }
+
+        let Some((j, cond, target)) = found_j else {
+            continue;
+        };
+
+        // Ensure no subsequent instruction in the block consumes `vf` or reads `NZCV` before a
+        // fresh flag write.
+        let mut flag_used_after = false;
+        for k in (j + 1)..end {
+            let op_k = op_at(func, k);
+            if matches!(op_k, MOp::Nop) {
+                continue;
+            }
+            if vflag_use_at(func, k) == vf || op_k.reads_flags() {
+                flag_used_after = true;
+                break;
+            }
+            if op_k.writes_flags() || vflag_def_at(func, k) != NO_VFLAG {
+                break;
+            }
+        }
+        if flag_used_after {
+            continue;
+        }
+
+        let new_br = match cond {
+            MCond::Eq | MCond::Ls => MOp::Cbz { rt: rn, target, wide },
+            MCond::Ne | MCond::Hi => MOp::Cbnz { rt: rn, target, wide },
+            _ => continue,
+        };
+        let op_j = op_at(func, j);
+        dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+        dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
+        mark_deleted(func, i);
+        set(&mut func.ops, j, new_br);
+        set(&mut func.vflag_use, j, NO_VFLAG);
+        inc_op_vreg_uses(&new_br, &func.copy_pairs, vreg_uses);
+        stats.peepholes = stats.peepholes.saturating_add(1);
+    }
+}
+
+/// Pass 1k: Folds `MovImm { dst: k, imm: 0 | 1 }` feeding `Csel` into `Csel(..., Xzr)` (for `0`)
+/// or `Csinc(..., Xzr)` (for `1`), deleting `MovImm` when `k` becomes provably dead.
+fn peephole_fold_const_csel(
+    func: &mut MFunc<'_>,
+    start: usize,
+    end: usize,
+    live_out_mask: Option<u32>,
+    vreg_uses: &mut [u32],
+    stats: &mut MOptStats,
+) {
+    for i in start..end {
+        if is_protected(func, i) {
+            continue;
+        }
+        let op_i = op_at(func, i);
+        let MOp::MovImm { dst: k, imm, .. } = op_i else {
+            continue;
+        };
+        if (imm != 0 && imm != 1) || !is_trackable_reg(k) || k == MReg::SP {
+            continue;
+        }
+
+        let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
+        let mut rewrote_any = false;
+        for j in (i + 1)..scan_end {
+            let op_j = op_at(func, j);
+            if matches!(op_j, MOp::Nop) {
+                continue;
+            }
+            if !is_protected(func, j)
+                && let MOp::Csel { dst, rn, rm, cond, wide } = op_j
+                && !matches!(cond, MCond::Al | MCond::Nv)
+                && ((rn == k) ^ (rm == k))
+            {
+                let replacement = if imm == 0 {
+                    if rn == k {
+                        MOp::Csel { dst, rn: MReg::XZR, rm, cond, wide }
+                    } else {
+                        MOp::Csel { dst, rn, rm: MReg::XZR, cond, wide }
+                    }
+                } else if rn == k {
+                    MOp::Csinc { dst, rn: rm, rm: MReg::XZR, cond: cond.invert(), wide }
+                } else {
+                    MOp::Csinc { dst, rn, rm: MReg::XZR, cond, wide }
+                };
+                dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
+                set(&mut func.ops, j, replacement);
+                inc_op_vreg_uses(&replacement, &func.copy_pairs, vreg_uses);
+                stats.peepholes = stats.peepholes.saturating_add(1);
+                rewrote_any = true;
+            }
+            if inst_defines_reg(func, j, k)
+                || is_control_or_call(&op_j)
+                || is_call_or_mem_barrier(func, j)
+                || matches!(op_j, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
+            {
+                break;
+            }
+        }
+
+        if rewrote_any {
+            let dead = if func.is_ssa {
+                if let MReg::V(v) = k {
+                    vreg_uses.get(to_idx(v.0)).copied().unwrap_or(1) == 0
+                } else {
+                    false
+                }
+            } else {
+                is_gpr_dead_after_with_liveout(func, end, i, k, live_out_mask)
+            };
+            if dead {
+                dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+                mark_deleted(func, i);
+                stats.peepholes = stats.peepholes.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Pass 1l-1 (post-RA only): Propagates 1-word `MovImm` constants through lowered `ParallelCopy`
+/// `Mov { dst, src, wide: true }` chains (e.g. `mov x2, #1; mov x16, x2; mov x0, x16` ->
+/// `mov x0, #1`) and sweeps any newly dead `MovImm`/`Mov` instructions using exact `live_out_mask`.
+fn peephole_post_ra_const_copy_prop(
+    func: &mut MFunc<'_>,
+    start: usize,
+    end: usize,
+    live_out_mask: Option<u32>,
+    stats: &mut MOptStats,
+) {
+    let mut table = [ImmCseSlot::EMPTY; IMM_CSE_SLOTS];
+    let mut next_evict: usize = 0;
+    let mut rewrote_any = false;
+
+    for i in start..end {
+        let op = op_at(func, i);
+        if matches!(op, MOp::Nop) {
+            continue;
+        }
+        if let MOp::MovImm { dst, imm, wide } = op {
+            let imm_norm = if wide { imm } else { imm & 0xffff_ffff };
+            for slot in &mut table {
+                if slot.valid && slot.reg == dst {
+                    slot.valid = false;
+                }
+            }
+            if gpr_bit(dst) != 0 && mov_imm_inst_cost(imm_norm, wide) == 1 {
+                let mut inserted = false;
+                for slot in &mut table {
+                    if !slot.valid {
+                        *slot = ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide };
+                        inserted = true;
+                        break;
+                    }
+                }
+                if !inserted {
+                    set(
+                        &mut table,
+                        next_evict % IMM_CSE_SLOTS,
+                        ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide },
+                    );
+                    next_evict = next_evict.wrapping_add(1);
+                }
+            }
+            continue;
+        }
+        if !is_protected(func, i)
+            && let MOp::Mov { dst, src, wide: true } = op
+            && dst != src
+            && gpr_bit(dst) != 0
+            && gpr_bit(src) != 0
+        {
+            let mut found: Option<(u64, bool)> = None;
+            for slot in &table {
+                if slot.valid && slot.reg == src {
+                    found = Some((slot.imm, slot.wide));
+                    break;
+                }
+            }
+            if let Some((imm_norm, src_wide)) = found {
+                let new_op = MOp::MovImm { dst, imm: imm_norm, wide: src_wide };
+                set(&mut func.ops, i, new_op);
+                set(&mut func.flags, i, MInstFlags::NONE);
+                stats.peepholes = stats.peepholes.saturating_add(1);
+                rewrote_any = true;
+                for slot in &mut table {
+                    if slot.valid && slot.reg == dst {
+                        slot.valid = false;
+                    }
+                }
+                let mut inserted = false;
+                for slot in &mut table {
+                    if !slot.valid {
+                        *slot = ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide: src_wide };
+                        inserted = true;
+                        break;
+                    }
+                }
+                if !inserted {
+                    set(
+                        &mut table,
+                        next_evict % IMM_CSE_SLOTS,
+                        ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide: src_wide },
+                    );
+                    next_evict = next_evict.wrapping_add(1);
+                }
+                continue;
+            }
+        }
+        if is_call_or_mem_barrier(func, i) || is_control_or_call(&op) {
+            for slot in &mut table {
+                slot.valid = false;
+            }
+            continue;
+        }
+        for slot in &mut table {
+            if slot.valid && inst_defines_reg(func, i, slot.reg) {
+                slot.valid = false;
+            }
+        }
+    }
+
+    if rewrote_any {
+        for i in (start..end).rev() {
+            if is_protected(func, i) {
+                continue;
+            }
+            let op = op_at(func, i);
+            let dead_dst = match op {
+                MOp::MovImm { dst, .. } | MOp::Mov { dst, .. } if gpr_bit(dst) != 0 => Some(dst),
+                _ => None,
+            };
+            if let Some(dst) = dead_dst
+                && is_gpr_dead_after_with_liveout(func, end, i, dst, live_out_mask)
+            {
+                mark_deleted(func, i);
+                stats.movs_eliminated = stats.movs_eliminated.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Returns `Some((old_dst, rewritten_op))` when `op` is a pure single-GPR-destination instruction
+/// whose destination can legally be rewritten directly to physical GPR `new_dst` (`x0..=x30`),
+/// excluding read-modify-write (`Bfxil`), writeback loads (`PostIdx`/`PreIdx`), `Ldp`, `MovSp`,
+/// FP/vector loads, calls, and opaque instructions.
+fn rewrite_pure_single_gpr_dst(op: MOp, new_dst: MReg) -> Option<(MReg, MOp)> {
+    if gpr_bit(new_dst) == 0 {
+        return None;
+    }
+    let out = match op {
+        MOp::MovImm { dst, imm, wide } => (dst, MOp::MovImm { dst: new_dst, imm, wide }),
+        MOp::AddImm { dst, rn, imm12, shift12, wide, sets_flags } => {
+            (dst, MOp::AddImm { dst: new_dst, rn, imm12, shift12, wide, sets_flags })
+        }
+        MOp::SubImm { dst, rn, imm12, shift12, wide, sets_flags } => {
+            (dst, MOp::SubImm { dst: new_dst, rn, imm12, shift12, wide, sets_flags })
+        }
+        MOp::AddReg { dst, rn, rm, shift, wide, sets_flags } => {
+            (dst, MOp::AddReg { dst: new_dst, rn, rm, shift, wide, sets_flags })
+        }
+        MOp::SubReg { dst, rn, rm, shift, wide, sets_flags } => {
+            (dst, MOp::SubReg { dst: new_dst, rn, rm, shift, wide, sets_flags })
+        }
+        MOp::AddExt { dst, rn, rm, ext, wide, sets_flags } => {
+            (dst, MOp::AddExt { dst: new_dst, rn, rm, ext, wide, sets_flags })
+        }
+        MOp::SubExt { dst, rn, rm, ext, wide, sets_flags } => {
+            (dst, MOp::SubExt { dst: new_dst, rn, rm, ext, wide, sets_flags })
+        }
+        MOp::LogicalImm { dst, rn, imm, kind, wide } => {
+            (dst, MOp::LogicalImm { dst: new_dst, rn, imm, kind, wide })
+        }
+        MOp::LogicalReg { dst, rn, rm, shift, kind, invert_rm, wide } => {
+            (dst, MOp::LogicalReg { dst: new_dst, rn, rm, shift, kind, invert_rm, wide })
+        }
+        MOp::Mvn { dst, rm, shift, wide } => (dst, MOp::Mvn { dst: new_dst, rm, shift, wide }),
+        MOp::ShiftVar { dst, rn, rm, kind, wide } => {
+            (dst, MOp::ShiftVar { dst: new_dst, rn, rm, kind, wide })
+        }
+        MOp::Ubfm { dst, rn, immr, imms, wide } => {
+            (dst, MOp::Ubfm { dst: new_dst, rn, immr, imms, wide })
+        }
+        MOp::Sbfm { dst, rn, immr, imms, wide } => {
+            (dst, MOp::Sbfm { dst: new_dst, rn, immr, imms, wide })
+        }
+        MOp::Extr { dst, rn, rm, lsb, wide } => {
+            (dst, MOp::Extr { dst: new_dst, rn, rm, lsb, wide })
+        }
+        MOp::Rbit { dst, rn, wide } => (dst, MOp::Rbit { dst: new_dst, rn, wide }),
+        MOp::Clz { dst, rn, wide } => (dst, MOp::Clz { dst: new_dst, rn, wide }),
+        MOp::Rev { dst, rn, wide } => (dst, MOp::Rev { dst: new_dst, rn, wide }),
+        MOp::Mul { dst, rn, rm, wide } => (dst, MOp::Mul { dst: new_dst, rn, rm, wide }),
+        MOp::Madd { dst, rn, rm, ra, wide } => (dst, MOp::Madd { dst: new_dst, rn, rm, ra, wide }),
+        MOp::Msub { dst, rn, rm, ra, wide } => (dst, MOp::Msub { dst: new_dst, rn, rm, ra, wide }),
+        MOp::Umulh { dst, rn, rm } => (dst, MOp::Umulh { dst: new_dst, rn, rm }),
+        MOp::Smulh { dst, rn, rm } => (dst, MOp::Smulh { dst: new_dst, rn, rm }),
+        MOp::CarryAddSub { dst, rn, rm, is_sub, sets_flags } => {
+            (dst, MOp::CarryAddSub { dst: new_dst, rn, rm, is_sub, sets_flags })
+        }
+        MOp::Udiv { dst, rn, rm, wide } => (dst, MOp::Udiv { dst: new_dst, rn, rm, wide }),
+        MOp::Sdiv { dst, rn, rm, wide } => (dst, MOp::Sdiv { dst: new_dst, rn, rm, wide }),
+        MOp::Umin { dst, rn, rm, wide } => (dst, MOp::Umin { dst: new_dst, rn, rm, wide }),
+        MOp::Umax { dst, rn, rm, wide } => (dst, MOp::Umax { dst: new_dst, rn, rm, wide }),
+        MOp::Smin { dst, rn, rm, wide } => (dst, MOp::Smin { dst: new_dst, rn, rm, wide }),
+        MOp::Smax { dst, rn, rm, wide } => (dst, MOp::Smax { dst: new_dst, rn, rm, wide }),
+        MOp::Csel { dst, rn, rm, cond, wide } => {
+            (dst, MOp::Csel { dst: new_dst, rn, rm, cond, wide })
+        }
+        MOp::Csinc { dst, rn, rm, cond, wide } => {
+            (dst, MOp::Csinc { dst: new_dst, rn, rm, cond, wide })
+        }
+        MOp::Csinv { dst, rn, rm, cond, wide } => {
+            (dst, MOp::Csinv { dst: new_dst, rn, rm, cond, wide })
+        }
+        MOp::Csneg { dst, rn, rm, cond, wide } => {
+            (dst, MOp::Csneg { dst: new_dst, rn, rm, cond, wide })
+        }
+        MOp::Adrp { dst } => (dst, MOp::Adrp { dst: new_dst }),
+        MOp::AddLo12 { dst, rn } => (dst, MOp::AddLo12 { dst: new_dst, rn }),
+        MOp::Ldr { dst, addr, size, signed }
+            if !size.is_fp_or_vec()
+                && matches!(addr, AddrMode::BaseOff { .. } | AddrMode::ScaledIdx { .. }) =>
+        {
+            (dst, MOp::Ldr { dst: new_dst, addr, size, signed })
+        }
+        _ => return None,
+    };
+    if gpr_bit(out.0) == 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Pass 1l-2 (post-RA only): Backward single-def copy folding (`op dst=rA; ...; mov rB, rA` ->
+/// `op dst=rB`) when `rA` and `rB` are untouched in between, no intervening trapping/control op
+/// sits between them, and `rA` is provably dead after the `mov`. Runs before Pass 3 so folded
+/// pointer increments (`add x6, x20, #1; mov x20, x6` -> `add x20, x20, #1`) immediately unlock
+/// post-index `[x20], #1` fusion.
+fn peephole_post_ra_backward_copy_fold(
+    func: &mut MFunc<'_>,
+    start: usize,
+    end: usize,
+    live_out_mask: Option<u32>,
+    stats: &mut MOptStats,
+) {
+    for j in start..end {
+        if is_protected(func, j) {
+            continue;
+        }
+        let MOp::Mov { dst: r_b, src: r_a, wide: true } = op_at(func, j) else {
+            continue;
+        };
+        if r_a == r_b || gpr_bit(r_a) == 0 || gpr_bit(r_b) == 0 {
+            continue;
+        }
+        if !is_gpr_dead_after_with_liveout(func, end, j, r_a, live_out_mask) {
+            continue;
+        }
+
+        let scan_start = j.saturating_sub(PEEPHOLE_WINDOW).max(start);
+        let mut i = j;
+        while i > scan_start {
+            i -= 1;
+            let op_i = op_at(func, i);
+            if matches!(op_i, MOp::Nop) {
+                continue;
+            }
+            if inst_defines_reg(func, i, r_a) {
+                // Preserve in-place `AddImm`/`SubImm { dst == rn }` before Pass 3 so post-index
+                // load/store writeback (`[base], #imm`) is never broken by retargeting `dst`.
+                let is_inplace_ptr_step = matches!(
+                    op_i,
+                    MOp::AddImm { dst, rn, .. } | MOp::SubImm { dst, rn, .. } if dst == rn
+                );
+                if !is_protected(func, i)
+                    && !is_inplace_ptr_step
+                    && let Some((old_dst, rewritten)) = rewrite_pure_single_gpr_dst(op_i, r_b)
+                    && old_dst == r_a
+                {
+                    set(&mut func.ops, i, rewritten);
+                    mark_deleted(func, j);
+                    stats.movs_eliminated = stats.movs_eliminated.saturating_add(1);
+                }
+                break;
+            }
+            if is_control_or_call(&op_i)
+                || is_call_or_mem_barrier(func, i)
+                || flags_at(func, i).contains(MInstFlags::MAY_TRAP)
+                || matches!(op_i, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
+                || inst_uses_reg(func, i, r_a)
+                || inst_touches_reg(func, i, r_b)
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// Pass 1l-3 (post-RA only): Deletes redundant `uxtb`/`uxth` (`Ubfm { immr: 0, imms: 7 | 15, wide: false }`)
+/// whose sole remaining use before death is the value operand (`src`, never `addr`) of a matching
+/// narrow `Str(B1)` / `Str(B2)`.
+fn peephole_post_ra_uxtb_str(
+    func: &mut MFunc<'_>,
+    start: usize,
+    end: usize,
+    live_out_mask: Option<u32>,
+    stats: &mut MOptStats,
+) {
+    for i in start..end {
+        if is_protected(func, i) {
+            continue;
+        }
+        let MOp::Ubfm { dst: r, rn, immr: 0, imms, wide: false } = op_at(func, i) else {
+            continue;
+        };
+        let req_size = match imms {
+            7 => MemSize::B8,
+            15 => MemSize::H16,
+            _ => continue,
+        };
+        if gpr_bit(r) == 0 || gpr_bit(rn) == 0 {
+            continue;
+        }
+
+        let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
+        let mut str_idx: Option<usize> = None;
+        for j in (i + 1)..scan_end {
+            let op_j = op_at(func, j);
+            if matches!(op_j, MOp::Nop) {
+                continue;
+            }
+            if inst_uses_reg(func, j, r) {
+                if !is_protected(func, j)
+                    && let MOp::Str { src, addr, size } = op_j
+                    && src == r
+                    && size == req_size
+                    && !addr_uses_reg(addr, r)
+                    && is_gpr_dead_after_with_liveout(func, end, j, r, live_out_mask)
+                {
+                    let wb_conflict = match addr {
+                        AddrMode::PostIdx { base, .. } | AddrMode::PreIdx { base, .. } => {
+                            base == rn
+                        }
+                        AddrMode::BaseOff { .. } | AddrMode::ScaledIdx { .. } => false,
+                    };
+                    if !wb_conflict {
+                        str_idx = Some(j);
+                    }
+                }
+                break;
+            }
+            if inst_defines_reg(func, j, r)
+                || (rn != r && inst_defines_reg(func, j, rn))
+                || is_control_or_call(&op_j)
+                || is_call_or_mem_barrier(func, j)
+                || matches!(op_j, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
+            {
+                break;
+            }
+        }
+
+        if let Some(j) = str_idx {
+            if r != rn
+                && let MOp::Str { addr, size, .. } = op_at(func, j)
+            {
+                set(&mut func.ops, j, MOp::Str { src: rn, addr, size });
+            }
+            mark_deleted(func, i);
+            stats.peepholes = stats.peepholes.saturating_add(1);
+        }
+    }
+}
+
+/// Pass 1m (post-RA only): Cross-block known-`MovImm` elision over CFG predecessors.
+///
+/// Propagates exact `(GPR -> (imm_norm, wide))` bindings forward along `func.block_order`:
+/// when a block's CFG predecessors are all strictly earlier in `block_order`, its entry state is
+/// the intersection of its predecessors' exit states (exact copy for single-predecessor blocks).
+/// Any unprotected `MovImm { dst, imm, wide }` already guaranteed live in `dst` is deleted.
+fn mopt_cross_block_mov_imm_post_ra<'a>(
+    func: &mut MFunc<'a>,
+    alloc: Alloc<'a>,
+    stats: &mut MOptStats,
+) {
+    if func.is_ssa || has_indirect_or_unwind_cfg(func) {
+        return;
+    }
+    let num_blocks = func.block_insts.len();
+    if num_blocks <= 1 {
+        return;
+    }
+    if func.block_preds_off.len() != num_blocks + 1 {
+        func.rebuild_cfg(alloc);
+    }
+
+    let mut ord_pos: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+    for _ in 0..num_blocks {
+        ord_pos.push(u32::MAX);
+    }
+    for (pos, &blk) in func.block_order.iter().enumerate() {
+        set(&mut ord_pos, to_idx(blk.0), u32_of(pos).unwrap_or(u32::MAX));
+    }
+
+    let total_slots = num_blocks.saturating_mul(CROSS_BLOCK_IMM_SLOTS);
+    let mut exit_tables: Vec<ImmCseSlot, Alloc<'a>> = Vec::with_capacity_in(total_slots, alloc);
+    for _ in 0..total_slots {
+        exit_tables.push(ImmCseSlot::EMPTY);
+    }
+
+    let n_ord = func.block_order.len();
+    for bi in 0..n_ord {
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let b = to_idx(blk.0);
+        let my_pos = at(&ord_pos, b, u32::MAX);
+        let mut table = [ImmCseSlot::EMPTY; CROSS_BLOCK_IMM_SLOTS];
+
+        let preds = func.block_preds(blk);
+        if bi > 0 && !preds.is_empty() {
+            let all_earlier = preds
+                .iter()
+                .all(|&p| at(&ord_pos, to_idx(p.0), u32::MAX) < my_pos);
+            if all_earlier && let Some(&first_p) = preds.first() {
+                let fp_base = to_idx(first_p.0).saturating_mul(CROSS_BLOCK_IMM_SLOTS);
+                let mut out_k: usize = 0;
+                for s in 0..CROSS_BLOCK_IMM_SLOTS {
+                    let cand = at(&exit_tables, fp_base + s, ImmCseSlot::EMPTY);
+                    if !cand.valid {
+                        continue;
+                    }
+                    let mut in_all = true;
+                    for &other_p in preds.iter().skip(1) {
+                        let op_base = to_idx(other_p.0).saturating_mul(CROSS_BLOCK_IMM_SLOTS);
+                        let mut matched = false;
+                        for os in 0..CROSS_BLOCK_IMM_SLOTS {
+                            let o = at(&exit_tables, op_base + os, ImmCseSlot::EMPTY);
+                            if o.valid
+                                && o.reg == cand.reg
+                                && o.imm == cand.imm
+                                && o.wide == cand.wide
+                            {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if !matched {
+                            in_all = false;
+                            break;
+                        }
+                    }
+                    if in_all && out_k < CROSS_BLOCK_IMM_SLOTS {
+                        set(&mut table, out_k, cand);
+                        out_k += 1;
+                    }
+                }
+            }
+        }
+
+        let mut exit_table = table;
+        let mut seen_cond_branch = false;
+        let mut next_evict: usize = 0;
+        let mut exit_next_evict: usize = 0;
+        let (start, end) = block_range(func, blk);
+        for i in start..end {
+            let op = op_at(func, i);
+            if matches!(op, MOp::Nop) {
+                continue;
+            }
+            if op.is_conditional_branch() {
+                seen_cond_branch = true;
+                continue;
+            }
+            if let MOp::MovImm { dst, imm, wide } = op {
+                let imm_norm = if wide { imm } else { imm & 0xffff_ffff };
+                let mut already_same = false;
+                for slot in &table {
+                    if slot.valid && slot.reg == dst && slot.imm == imm_norm && slot.wide == wide {
+                        already_same = true;
+                        break;
+                    }
+                }
+                if already_same && !is_protected(func, i) && gpr_bit(dst) != 0 {
+                    mark_deleted(func, i);
+                    stats.peepholes = stats.peepholes.saturating_add(1);
+                    continue;
+                }
+                for slot in &mut table {
+                    if slot.valid && slot.reg == dst {
+                        slot.valid = false;
+                    }
+                }
+                for slot in &mut exit_table {
+                    if slot.valid && slot.reg == dst {
+                        slot.valid = false;
+                    }
+                }
+                if gpr_bit(dst) != 0 {
+                    let mut inserted = false;
+                    for slot in &mut table {
+                        if !slot.valid {
+                            *slot = ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide };
+                            inserted = true;
+                            break;
+                        }
+                    }
+                    if !inserted {
+                        set(
+                            &mut table,
+                            next_evict % CROSS_BLOCK_IMM_SLOTS,
+                            ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide },
+                        );
+                        next_evict = next_evict.wrapping_add(1);
+                    }
+                    // Only expose bindings defined BEFORE any mid-block conditional branch in
+                    // `exit_table`, so taken branch targets never observe post-branch `MovImm`s.
+                    if !seen_cond_branch {
+                        let mut ex_inserted = false;
+                        for slot in &mut exit_table {
+                            if !slot.valid {
+                                *slot = ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide };
+                                ex_inserted = true;
+                                break;
+                            }
+                        }
+                        if !ex_inserted {
+                            set(
+                                &mut exit_table,
+                                exit_next_evict % CROSS_BLOCK_IMM_SLOTS,
+                                ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide },
+                            );
+                            exit_next_evict = exit_next_evict.wrapping_add(1);
+                        }
+                    }
+                }
+                continue;
+            }
+            // Note: branches do not clobber GPRs, so only calls/mem barriers/opaque ops clear all.
+            if is_call_or_mem_barrier(func, i)
+                || matches!(
+                    op,
+                    MOp::Bl
+                        | MOp::Blr { .. }
+                        | MOp::Br { .. }
+                        | MOp::Ret
+                        | MOp::ParallelCopy { .. }
+                        | MOp::RawWord { .. }
+                )
+            {
+                for slot in &mut table {
+                    slot.valid = false;
+                }
+                for slot in &mut exit_table {
+                    slot.valid = false;
+                }
+                continue;
+            }
+            for slot in &mut table {
+                if slot.valid && inst_defines_reg(func, i, slot.reg) {
+                    slot.valid = false;
+                }
+            }
+            for slot in &mut exit_table {
+                if slot.valid && inst_defines_reg(func, i, slot.reg) {
+                    slot.valid = false;
+                }
+            }
+        }
+
+        let my_base = b.saturating_mul(CROSS_BLOCK_IMM_SLOTS);
+        for (s, &slot) in exit_table.iter().enumerate() {
+            set(&mut exit_tables, my_base + s, slot);
         }
     }
 }
@@ -4307,16 +5624,12 @@ fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
             }
             let (base, size, is_pair) = match op_at(func, i) {
                 MOp::Ldr { dst, addr: AddrMode::BaseOff { base, off: 0 }, size, .. }
-                    if is_pairable_size(size)
-                        && base != MReg::SP
-                        && (size.is_fp_or_vec() || dst != base) =>
+                    if base != MReg::SP && (size.is_fp_or_vec() || dst != base) =>
                 {
                     (base, size, false)
                 }
                 MOp::Str { src, addr: AddrMode::BaseOff { base, off: 0 }, size }
-                    if is_pairable_size(size)
-                        && base != MReg::SP
-                        && (size.is_fp_or_vec() || src != base) =>
+                    if base != MReg::SP && (size.is_fp_or_vec() || src != base) =>
                 {
                     (base, size, false)
                 }
@@ -4330,6 +5643,7 @@ fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                     pre_idx: false,
                 } if is_pairable_size(size)
                     && base != MReg::SP
+                    && dst0 != dst1
                     && (size.is_fp_or_vec() || (dst0 != base && dst1 != base)) =>
                 {
                     (base, size, true)
@@ -4359,6 +5673,9 @@ fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
 
             let scan_end = end.min(i.saturating_add(POST_IDX_WINDOW));
             for j in (i + 1)..scan_end {
+                if note_at(func, j) != NO_NOTE {
+                    break;
+                }
                 let op_j = op_at(func, j);
                 if matches!(op_j, MOp::Nop) {
                     continue;
@@ -4788,15 +6105,892 @@ fn mopt_branch_fold_fallthrough(
     changed
 }
 
+/// Returns `true` iff every instruction in `blk` has zero attached `MNote`s.
+fn block_has_no_notes(func: &MFunc<'_>, blk: MBlock) -> bool {
+    let (start, end) = block_range(func, blk);
+    for i in start..end {
+        if note_at(func, i) != NO_NOTE {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns `true` iff no instruction in `blk` carries `MInstFlags::PINNED`.
+fn block_has_no_pinned(func: &MFunc<'_>, blk: MBlock) -> bool {
+    let (start, end) = block_range(func, blk);
+    for i in start..end {
+        if flags_at(func, i).contains(MInstFlags::PINNED) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Shifts `count` (`1` or `2`) contiguous blocks starting at `src_start` in `order` so that they
+/// land immediately before `dst_before` (zero allocation, zero unchecked indexing).
+fn move_block_slice_before(
+    order: &mut [MBlock],
+    src_start: usize,
+    count: usize,
+    dst_before: usize,
+) {
+    let n = order.len();
+    if count == 0 || count > 2 || src_start.saturating_add(count) > n || dst_before > n {
+        return;
+    }
+    let saved0 = at(order, src_start, MBlock(0));
+    let saved1 = if count == 2 { at(order, src_start + 1, MBlock(0)) } else { MBlock(0) };
+    if dst_before < src_start {
+        let mut k = src_start;
+        while k > dst_before {
+            k -= 1;
+            let blk = at(order, k, MBlock(0));
+            set(order, k + count, blk);
+        }
+        set(order, dst_before, saved0);
+        if count == 2 {
+            set(order, dst_before + 1, saved1);
+        }
+    } else if dst_before > src_start + count {
+        let src_end = src_start + count;
+        for k in src_end..dst_before {
+            let blk = at(order, k, MBlock(0));
+            set(order, k - count, blk);
+        }
+        let insert_at = dst_before - count;
+        set(order, insert_at, saved0);
+        if count == 2 {
+            set(order, insert_at + 1, saved1);
+        }
+    }
+}
+
+/// Pass 4c helper: prunes unreachable empty / unprotected-trampoline blocks from `func.block_order`
+/// (never dropping `block_order[0]`, keeping every target/fallthrough reachable from any kept
+/// block), compacts NOPs, folds newly exposed fallthroughs, and rebuilds CFG CSRs.
+fn prune_unreachable_empty_blocks<'a>(
+    func: &mut MFunc<'a>,
+    alloc: Alloc<'a>,
+    next_in_order: &mut [u32],
+    block_ord_pos: &mut [u32],
+    stats: &mut MOptStats,
+) -> bool {
+    let num_blocks = func.block_insts.len();
+    if func.block_order.len() <= 1 || num_blocks == 0 {
+        return false;
+    }
+    if func.block_succs_off.len() != num_blocks + 1 {
+        func.rebuild_cfg(alloc);
+    }
+
+    let mut keep: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+    for _ in 0..num_blocks {
+        keep.push(false);
+    }
+    let mut worklist: Vec<MBlock, Alloc<'a>> = Vec::with_capacity_in(func.block_order.len(), alloc);
+
+    for (ord_pos, &blk) in func.block_order.iter().enumerate() {
+        let b = to_idx(blk.0);
+        if b < num_blocks
+            && (ord_pos == 0 || !is_empty_or_unprotected_trampoline(func, blk))
+            && !at(&keep, b, true)
+        {
+            set(&mut keep, b, true);
+            worklist.push(blk);
+        }
+    }
+
+    while let Some(cur) = worklist.pop() {
+        for &succ in func.block_succs(cur) {
+            let s = to_idx(succ.0);
+            if s < num_blocks && !at(&keep, s, true) {
+                set(&mut keep, s, true);
+                worklist.push(succ);
+            }
+        }
+    }
+
+    let mut write_pos: usize = 0;
+    let orig_len = func.block_order.len();
+    for read_pos in 0..orig_len {
+        let Some(&blk) = func.block_order.get(read_pos) else {
+            continue;
+        };
+        let b = to_idx(blk.0);
+        if read_pos == 0 || keep.get(b).copied().unwrap_or(true) {
+            set(&mut func.block_order, write_pos, blk);
+            write_pos += 1;
+        } else {
+            let mut deleted_b = false;
+            let (s_i, e_i) = block_range(func, blk);
+            for i in s_i..e_i {
+                if !is_protected(func, i) {
+                    if matches!(op_at(func, i), MOp::B { .. }) {
+                        deleted_b = true;
+                    }
+                    mark_deleted(func, i);
+                }
+            }
+            if deleted_b {
+                stats.branches_folded = stats.branches_folded.saturating_add(1);
+            }
+        }
+    }
+
+    if write_pos < orig_len {
+        func.block_order.truncate(write_pos);
+        compact_nops(func, alloc);
+        refresh_order_maps(func, next_in_order, block_ord_pos);
+        if mopt_branch_fold_fallthrough(func, next_in_order, block_ord_pos, stats) {
+            compact_nops(func, alloc);
+        }
+        func.rebuild_cfg(alloc);
+        return true;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+struct TailMergeCand {
+    blk: MBlock,
+    ord_pos: u32,
+    target: MBlock,
+    prefix: [MOp; MAX_TAIL_MERGE_OPS],
+    prefix_len: u8,
+    is_ft_to_target: bool,
+    has_ft_pred: bool,
+}
+
+#[inline]
+fn tail_merge_prefix_eq(a: &TailMergeCand, b: &TailMergeCand) -> bool {
+    if a.prefix_len != b.prefix_len || a.target != b.target {
+        return false;
+    }
+    let len = usize::from(a.prefix_len).min(MAX_TAIL_MERGE_OPS);
+    for k in 0..len {
+        if at(&a.prefix, k, MOp::Nop) != at(&b.prefix, k, MOp::Nop) {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn tail_merge_canon_rank(c: &TailMergeCand, target_pos: u32) -> (u8, u32) {
+    let adj_to_target = target_pos != u32::MAX && c.ord_pos.saturating_add(1) == target_pos;
+    let tier: u8 = if c.is_ft_to_target {
+        0
+    } else if c.has_ft_pred && adj_to_target {
+        1
+    } else if c.has_ft_pred {
+        2
+    } else if adj_to_target {
+        3
+    } else {
+        4
+    };
+    (tier, c.ord_pos)
+}
+
+/// Pass 4e (post-RA only, no jump tables or unwind notes): merges identical short non-entry tail
+/// blocks (`1..=12` non-NOP ops ending in `MOp::B { target }`, or a matching `1..=11`-op pure
+/// fallthrough block immediately before `target`) into one canonical block, redirecting all
+/// branches targeting duplicates and clearing duplicate ops so Pass 4c prunes them.
+fn mopt_branch_tail_merge_post_ra<'a>(
+    func: &mut MFunc<'a>,
+    alloc: Alloc<'a>,
+    next_in_order: &[u32],
+    block_ord_pos: &[u32],
+    stats: &mut MOptStats,
+) -> bool {
+    let num_blocks = func.block_insts.len();
+    let n_order = func.block_order.len();
+    if func.is_ssa || num_blocks == 0 || n_order <= 2 {
+        return false;
+    }
+
+    // Never redirect or delete a block targeted by a protected (`PINNED`/noted) branch.
+    let mut has_protected_ref: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+    for _ in 0..num_blocks {
+        has_protected_ref.push(false);
+    }
+    for i in 0..func.ops.len() {
+        if is_protected(func, i)
+            && let Some(target) = op_at(func, i).branch_target()
+        {
+            set(&mut has_protected_ref, to_idx(target.0), true);
+        }
+    }
+
+    let mut cands: Vec<TailMergeCand, Alloc<'a>> = Vec::new_in(alloc);
+    for ord_pos in 1..n_order {
+        let Some(&blk) = func.block_order.get(ord_pos) else {
+            continue;
+        };
+        let Some(&prev_blk) = func.block_order.get(ord_pos - 1) else {
+            continue;
+        };
+        let has_ft_pred = !block_ends_with_uncond_term(func, prev_blk);
+        let (start, end) = block_range(func, blk);
+
+        let mut ops = [MOp::Nop; MAX_TAIL_MERGE_OPS];
+        let mut count: usize = 0;
+        let mut eligible = true;
+        for i in start..end {
+            if note_at(func, i) != NO_NOTE {
+                eligible = false;
+                break;
+            }
+            let fl = flags_at(func, i);
+            if fl.contains(MInstFlags::PINNED)
+                || fl.contains(MInstFlags::VOLATILE)
+                || fl.contains(MInstFlags::MAY_TRAP)
+                || fl.contains(MInstFlags::CALL)
+                || fl.contains(MInstFlags::MEM_BARRIER)
+            {
+                eligible = false;
+                break;
+            }
+            let op = op_at(func, i);
+            if matches!(op, MOp::Nop) {
+                continue;
+            }
+            if matches!(op, MOp::RawWord { .. } | MOp::ParallelCopy { .. }) {
+                eligible = false;
+                break;
+            }
+            if count >= MAX_TAIL_MERGE_OPS {
+                eligible = false;
+                break;
+            }
+            set(&mut ops, count, op);
+            count += 1;
+        }
+        if !eligible || count == 0 {
+            continue;
+        }
+
+        let last_op = at(&ops, count - 1, MOp::Nop);
+        let (target, prefix_len, is_ft_to_target) = if let MOp::B { target } = last_op {
+            if target == blk || to_idx(target.0) >= num_blocks {
+                continue;
+            }
+            let mut prefix_ok = true;
+            for k in 0..(count - 1) {
+                let op_k = at(&ops, k, MOp::Nop);
+                if is_control_or_call(&op_k) {
+                    prefix_ok = false;
+                    break;
+                }
+            }
+            if !prefix_ok {
+                continue;
+            }
+            (target, count - 1, false)
+        } else if count <= MAX_TAIL_MERGE_PREFIX_OPS {
+            let next_id = at(next_in_order, to_idx(blk.0), u32::MAX);
+            if next_id == u32::MAX {
+                continue;
+            }
+            let target = MBlock(next_id);
+            if target == blk || to_idx(target.0) >= num_blocks {
+                continue;
+            }
+            let mut prefix_ok = true;
+            for k in 0..count {
+                let op_k = at(&ops, k, MOp::Nop);
+                if is_control_or_call(&op_k) {
+                    prefix_ok = false;
+                    break;
+                }
+            }
+            if !prefix_ok {
+                continue;
+            }
+            (target, count, true)
+        } else {
+            continue;
+        };
+
+        let mut prefix = [MOp::Nop; MAX_TAIL_MERGE_OPS];
+        for k in 0..prefix_len.min(MAX_TAIL_MERGE_PREFIX_OPS) {
+            set(&mut prefix, k, at(&ops, k, MOp::Nop));
+        }
+        let Some(ord_pos_u) = u32_of(ord_pos) else {
+            continue;
+        };
+        let Ok(prefix_len_u8) = u8::try_from(prefix_len) else {
+            continue;
+        };
+        cands.push(TailMergeCand {
+            blk,
+            ord_pos: ord_pos_u,
+            target,
+            prefix,
+            prefix_len: prefix_len_u8,
+            is_ft_to_target,
+            has_ft_pred,
+        });
+    }
+
+    if cands.len() < 2 {
+        return false;
+    }
+
+    // Group candidates by `target` in ascending `ord_pos` via an O(N) intrusive bucket list.
+    let mut first_for_target: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+    for _ in 0..num_blocks {
+        first_for_target.push(u32::MAX);
+    }
+    let mut next_in_bucket: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(cands.len(), alloc);
+    for _ in 0..cands.len() {
+        next_in_bucket.push(u32::MAX);
+    }
+    for ci in (0..cands.len()).rev() {
+        let Some(cand) = cands.get(ci) else {
+            continue;
+        };
+        let ti = to_idx(cand.target.0);
+        let prev_head = at(&first_for_target, ti, u32::MAX);
+        set(&mut next_in_bucket, ci, prev_head);
+        if let Some(ci_u) = u32_of(ci) {
+            set(&mut first_for_target, ti, ci_u);
+        }
+    }
+
+    let mut redirect: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+    for _ in 0..num_blocks {
+        redirect.push(u32::MAX);
+    }
+    let mut merged_any = false;
+
+    for t in 0..num_blocks {
+        let mut cur = at(&first_for_target, t, u32::MAX);
+        if cur == u32::MAX {
+            continue;
+        }
+        let mut bucket_idxs = [0usize; MAX_TAIL_MERGE_BUCKET];
+        let mut bucket_len: usize = 0;
+        while cur != u32::MAX && bucket_len < MAX_TAIL_MERGE_BUCKET {
+            let ci = to_idx(cur);
+            set(&mut bucket_idxs, bucket_len, ci);
+            bucket_len += 1;
+            cur = at(&next_in_bucket, ci, u32::MAX);
+        }
+        if bucket_len < 2 {
+            continue;
+        }
+
+        let target_pos = at(block_ord_pos, t, u32::MAX);
+        let mut visited = [false; MAX_TAIL_MERGE_BUCKET];
+        for a in 0..bucket_len {
+            if at(&visited, a, true) {
+                continue;
+            }
+            let ci_a = at(&bucket_idxs, a, 0);
+            let Some(&cand_a) = cands.get(ci_a) else {
+                continue;
+            };
+            let mut group = [0usize; MAX_TAIL_MERGE_BUCKET];
+            let mut group_len: usize = 0;
+            for b in a..bucket_len {
+                if at(&visited, b, true) {
+                    continue;
+                }
+                let ci_b = at(&bucket_idxs, b, 0);
+                let Some(&cand_b) = cands.get(ci_b) else {
+                    continue;
+                };
+                if tail_merge_prefix_eq(&cand_a, &cand_b) {
+                    set(&mut visited, b, true);
+                    set(&mut group, group_len, ci_b);
+                    group_len += 1;
+                }
+            }
+            if group_len < 2 {
+                continue;
+            }
+
+            let mut canon = cand_a;
+            let mut best_rank = tail_merge_canon_rank(&cand_a, target_pos);
+            for g in 1..group_len {
+                let ci_g = at(&group, g, 0);
+                if let Some(&cand_g) = cands.get(ci_g) {
+                    let rank_g = tail_merge_canon_rank(&cand_g, target_pos);
+                    if rank_g < best_rank {
+                        best_rank = rank_g;
+                        canon = cand_g;
+                    }
+                }
+            }
+
+            for g in 0..group_len {
+                let ci_g = at(&group, g, 0);
+                let Some(&dup) = cands.get(ci_g) else {
+                    continue;
+                };
+                if dup.blk == canon.blk
+                    || dup.has_ft_pred
+                    || dup.is_ft_to_target
+                    || at(&has_protected_ref, to_idx(dup.blk.0), true)
+                {
+                    continue;
+                }
+                set(&mut redirect, to_idx(dup.blk.0), canon.blk.0);
+                merged_any = true;
+            }
+        }
+    }
+
+    if !merged_any {
+        return false;
+    }
+
+    // Redirect every non-protected branch targeting a merged duplicate to its canonical block.
+    for bi in 0..n_order {
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
+        for i in start..end {
+            if is_protected(func, i) {
+                continue;
+            }
+            if let Some(orig) = op_at(func, i).branch_target() {
+                let new_t = at(&redirect, to_idx(orig.0), u32::MAX);
+                if new_t != u32::MAX && new_t != orig.0 {
+                    if let Some(op_mut) = func.ops.get_mut(i) {
+                        set_branch_target(op_mut, MBlock(new_t));
+                    }
+                    stats.branches_folded = stats.branches_folded.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    // Clear duplicate blocks to empty so Pass 4c prunes them cleanly.
+    for b in 0..num_blocks {
+        let canon_id = at(&redirect, b, u32::MAX);
+        if canon_id == u32::MAX {
+            continue;
+        }
+        if at(&func.block_align16, b, false) {
+            set(&mut func.block_align16, to_idx(canon_id), true);
+        }
+        let Some(b_u32) = u32_of(b) else {
+            continue;
+        };
+        let (start, end) = block_range(func, MBlock(b_u32));
+        for i in start..end {
+            if !is_protected(func, i) {
+                mark_deleted(func, i);
+            }
+        }
+    }
+
+    true
+}
+
+/// Returns `Some(target)` iff `blk` is a short (`1..=MAX_BACKEDGE_SPLIT_INSTS`), noteless,
+/// unpinned block ending in an unprotected `MOp::B { target }` whose target sits at or before
+/// `max_pos` in `block_order` (a loop back-edge trampoline).
+fn is_short_backedge_trampoline(
+    func: &MFunc<'_>,
+    block_ord_pos: &[u32],
+    blk: MBlock,
+    max_pos: usize,
+) -> Option<MBlock> {
+    if !block_has_no_notes(func, blk) || !block_has_no_pinned(func, blk) {
+        return None;
+    }
+    let (start, end) = block_range(func, blk);
+    let mut non_nop_count: usize = 0;
+    let mut last_idx: Option<usize> = None;
+    for i in start..end {
+        let op = op_at(func, i);
+        if matches!(op, MOp::Nop) {
+            continue;
+        }
+        if matches!(op, MOp::RawWord { .. } | MOp::ParallelCopy { .. }) {
+            return None;
+        }
+        if let Some(prev) = last_idx
+            && is_control_or_call(&op_at(func, prev))
+        {
+            return None;
+        }
+        non_nop_count += 1;
+        if non_nop_count > MAX_BACKEDGE_SPLIT_INSTS {
+            return None;
+        }
+        last_idx = Some(i);
+    }
+    let last = last_idx?;
+    if is_protected(func, last) {
+        return None;
+    }
+    let MOp::B { target } = op_at(func, last) else {
+        return None;
+    };
+    if target == blk {
+        return None;
+    }
+    let t_pos_u = at(block_ord_pos, to_idx(target.0), u32::MAX);
+    if t_pos_u == u32::MAX || to_idx(t_pos_u) > max_pos {
+        return None;
+    }
+    Some(target)
+}
+
+/// Pass 4f (post-RA only, no jump tables or unwind notes): relocates a short displaced hot loop
+/// header `H` (`2..=8` non-NOP insts, no notes, ending in `[cond_br Body, B Exit]`) — together
+/// with an optional short pure fallthrough predecessor `prev_H` (`1..=4` ALU ops) — immediately
+/// before its fallthrough-free `Body`, then inverts `H` to `invert(cond_br) Exit` falling straight
+/// through into `Body`.
+fn mopt_branch_relocate_hot_loop_header_post_ra(
+    func: &mut MFunc<'_>,
+    entry_blk: MBlock,
+    next_in_order: &mut [u32],
+    block_ord_pos: &mut [u32],
+    stats: &mut MOptStats,
+) -> bool {
+    if func.is_ssa || func.block_order.len() <= 2 {
+        return false;
+    }
+    let mut header_relocs: usize = 0;
+    let mut moved_any = false;
+
+    while header_relocs < MAX_HEADER_RELOCATIONS {
+        let mut did_move = false;
+        let n_ord = func.block_order.len();
+        for h_pos in 1..n_ord {
+            let Some(&blk_h) = func.block_order.get(h_pos) else {
+                continue;
+            };
+            if blk_h == entry_blk
+                || !block_has_no_notes(func, blk_h)
+                || !block_has_no_pinned(func, blk_h)
+            {
+                continue;
+            }
+
+            let (start, end) = block_range(func, blk_h);
+            let mut non_nop_count: usize = 0;
+            let mut prev_idx: Option<usize> = None;
+            let mut last_idx: Option<usize> = None;
+            let mut clean_ops = true;
+            for i in start..end {
+                let op = op_at(func, i);
+                if matches!(op, MOp::Nop) {
+                    continue;
+                }
+                if matches!(op, MOp::RawWord { .. } | MOp::ParallelCopy { .. }) {
+                    clean_ops = false;
+                    break;
+                }
+                non_nop_count += 1;
+                if non_nop_count > MAX_HEADER_RELOC_INSTS {
+                    clean_ops = false;
+                    break;
+                }
+                prev_idx = last_idx;
+                last_idx = Some(i);
+            }
+            if !clean_ops || non_nop_count < 2 {
+                continue;
+            }
+            let (Some(prev), Some(last)) = (prev_idx, last_idx) else {
+                continue;
+            };
+            if is_protected(func, prev) || is_protected(func, last) {
+                continue;
+            }
+            let MOp::B { target: blk_exit } = op_at(func, last) else {
+                continue;
+            };
+            let op_prev = op_at(func, prev);
+            if !op_prev.is_conditional_branch() {
+                continue;
+            }
+            let Some(blk_body) = op_prev.branch_target() else {
+                continue;
+            };
+            let Some(inv_op) = invert_cond_branch(op_prev, blk_exit) else {
+                continue;
+            };
+            if blk_body == blk_h || blk_body == blk_exit || blk_body == entry_blk {
+                continue;
+            }
+
+            let body_pos_u = at(block_ord_pos, to_idx(blk_body.0), u32::MAX);
+            if body_pos_u == u32::MAX || body_pos_u == 0 {
+                continue;
+            }
+            let body_pos = to_idx(body_pos_u);
+            if body_pos >= n_ord || h_pos + 1 == body_pos {
+                continue;
+            }
+            if body_pos >= h_pos && body_pos.saturating_sub(h_pos) <= 4 {
+                continue;
+            }
+            let Some(&prev_body) = func.block_order.get(body_pos - 1) else {
+                continue;
+            };
+            if !block_ends_with_uncond_term(func, prev_body) {
+                continue;
+            }
+
+            let Some(&prev_h) = func.block_order.get(h_pos - 1) else {
+                continue;
+            };
+            let (move_start, move_len) = if block_ends_with_uncond_term(func, prev_h) {
+                (h_pos, 1usize)
+            } else if h_pos >= 2
+                && prev_h != blk_body
+                && prev_h != entry_blk
+                && let Some(&prev_prev_h) = func.block_order.get(h_pos - 2)
+                && block_ends_with_uncond_term(func, prev_prev_h)
+                && is_short_pure_fallthrough_block(func, prev_h)
+                && block_has_no_notes(func, prev_h)
+                && block_has_no_pinned(func, prev_h)
+            {
+                (h_pos - 1, 2usize)
+            } else {
+                continue;
+            };
+
+            move_block_slice_before(&mut func.block_order, move_start, move_len, body_pos);
+            set(&mut func.ops, prev, inv_op);
+            mark_deleted(func, last);
+            stats.branches_folded = stats.branches_folded.saturating_add(1);
+            refresh_order_maps(func, next_in_order, block_ord_pos);
+            header_relocs += 1;
+            moved_any = true;
+            did_move = true;
+            break;
+        }
+        if !did_move {
+            break;
+        }
+    }
+
+    moved_any
+}
+
+/// Returns `true` iff `blk`'s last non-NOP instruction is `MOp::Ret`.
+fn block_ends_with_ret(func: &MFunc<'_>, blk: MBlock) -> bool {
+    let (start, end) = block_range(func, blk);
+    for i in (start..end).rev() {
+        let op = op_at(func, i);
+        if matches!(op, MOp::Nop) {
+            continue;
+        }
+        return matches!(op, MOp::Ret);
+    }
+    false
+}
+
+/// Pass 4g (post-RA only, no jump tables or unwind notes): hoists a distant or post-`Ret` lowered
+/// `ParallelCopy` trampoline `S` (`1..=10` non-NOP ops, every non-terminator op is `Mov`/`MovImm`,
+/// ending in `MOp::B { target: T }`, no `MNote`s, non-entry, `prev_S` ends with an unconditional
+/// terminator):
+/// 1. When `prev_T` ends with an unconditional terminator, moves `S` immediately before `T` and
+///    folds `S`'s trailing `B T` into zero-branch fallthrough.
+/// 2. Otherwise, when `S` sits past the earliest `Ret` block (`s_pos > first_ret_pos > t_pos`),
+///    evicts `S` from the cold post-`Ret` tail into the nearest unconditional-terminator boundary
+///    in `1..=first_ret_pos` closest to `T` (keeping `B T`), placing hot copy trampolines on the
+///    same hot I-cache pages as their targets.
+fn mopt_branch_hoist_copy_trampoline_post_ra(
+    func: &mut MFunc<'_>,
+    entry_blk: MBlock,
+    next_in_order: &mut [u32],
+    block_ord_pos: &mut [u32],
+    stats: &mut MOptStats,
+) -> bool {
+    if func.is_ssa || func.block_order.len() <= 2 {
+        return false;
+    }
+    let mut hoists: usize = 0;
+    let mut moved_any = false;
+
+    while hoists < MAX_TRAMPOLINE_HOISTS {
+        let mut did_move = false;
+        let n_ord = func.block_order.len();
+        let mut first_ret_pos: Option<usize> = None;
+        for (pos, &blk) in func.block_order.iter().enumerate() {
+            if block_ends_with_ret(func, blk) {
+                first_ret_pos = Some(pos);
+                break;
+            }
+        }
+
+        for s_pos in 1..n_ord {
+            let Some(&blk_s) = func.block_order.get(s_pos) else {
+                continue;
+            };
+            if blk_s == entry_blk
+                || !block_has_no_notes(func, blk_s)
+                || !block_has_no_pinned(func, blk_s)
+            {
+                continue;
+            }
+            let Some(&prev_s) = func.block_order.get(s_pos - 1) else {
+                continue;
+            };
+            if !block_ends_with_uncond_term(func, prev_s) {
+                continue;
+            }
+
+            let (start, end) = block_range(func, blk_s);
+            let mut non_nop_count: usize = 0;
+            let mut last_idx: Option<usize> = None;
+            let mut all_copy_prefix = true;
+            for i in start..end {
+                let op = op_at(func, i);
+                if matches!(op, MOp::Nop) {
+                    continue;
+                }
+                if let Some(prev_i) = last_idx {
+                    let prev_op = op_at(func, prev_i);
+                    if !matches!(prev_op, MOp::Mov { .. } | MOp::MovImm { .. })
+                        || is_protected(func, prev_i)
+                    {
+                        all_copy_prefix = false;
+                        break;
+                    }
+                }
+                non_nop_count += 1;
+                if non_nop_count > MAX_TRAMPOLINE_HOIST_INSTS {
+                    all_copy_prefix = false;
+                    break;
+                }
+                last_idx = Some(i);
+            }
+            if !all_copy_prefix || non_nop_count == 0 {
+                continue;
+            }
+            let Some(last) = last_idx else {
+                continue;
+            };
+            if is_protected(func, last) {
+                continue;
+            }
+            let MOp::B { target: blk_t } = op_at(func, last) else {
+                continue;
+            };
+            if blk_s == blk_t || blk_t == entry_blk {
+                continue;
+            }
+
+            let t_pos_u = at(block_ord_pos, to_idx(blk_t.0), u32::MAX);
+            if t_pos_u == u32::MAX || t_pos_u == 0 {
+                continue;
+            }
+            let t_pos = to_idx(t_pos_u);
+            if t_pos >= n_ord || s_pos <= t_pos {
+                continue;
+            }
+
+            let past_first_ret =
+                first_ret_pos.is_some_and(|rp| t_pos < rp && s_pos > rp);
+            let far_after_t = if s_pos > t_pos.saturating_add(MIN_TRAMPOLINE_HOIST_DIST)
+                || past_first_ret
+            {
+                true
+            } else {
+                let mut past_ret = false;
+                for mid_pos in (t_pos + 1)..s_pos {
+                    if let Some(&mid_blk) = func.block_order.get(mid_pos)
+                        && block_ends_with_ret(func, mid_blk)
+                    {
+                        past_ret = true;
+                        break;
+                    }
+                }
+                past_ret
+            };
+            if !far_after_t {
+                continue;
+            }
+
+            let Some(&prev_t) = func.block_order.get(t_pos - 1) else {
+                continue;
+            };
+            if block_ends_with_uncond_term(func, prev_t) {
+                // Case 1: Shift `blk_s` immediately before `blk_t` and fold its trailing `B blk_t`
+                // into zero-branch fallthrough.
+                move_block_slice_before(&mut func.block_order, s_pos, 1, t_pos);
+                mark_deleted(func, last);
+                stats.branches_folded = stats.branches_folded.saturating_add(1);
+                refresh_order_maps(func, next_in_order, block_ord_pos);
+                hoists += 1;
+                moved_any = true;
+                did_move = true;
+                break;
+            }
+
+            // Case 2: `prev_t` falls through into `blk_t`, but `blk_s` is stranded past the first
+            // `Ret` block (`t_pos < first_ret_pos < s_pos`). Evict `blk_s` to the nearest
+            // unconditional-terminator boundary in `1..=first_ret_pos` closest to `t_pos`, keeping
+            // `B blk_t`. Because `blk_s` moves strictly ahead of `first_ret_pos`, it can never be
+            // picked again by Case 2 (strict monotone termination).
+            if let Some(ret_pos) = first_ret_pos
+                && past_first_ret
+            {
+                let mut best_ins: Option<(usize, usize)> = None;
+                for ins_pos in 1..=ret_pos {
+                    if ins_pos == s_pos || ins_pos == s_pos + 1 {
+                        continue;
+                    }
+                    let Some(&prev_ins) = func.block_order.get(ins_pos - 1) else {
+                        continue;
+                    };
+                    if !block_ends_with_uncond_term(func, prev_ins) {
+                        continue;
+                    }
+                    let dist = ins_pos.abs_diff(t_pos);
+                    let better = match best_ins {
+                        None => true,
+                        Some((best_dist, _)) => dist < best_dist,
+                    };
+                    if better {
+                        best_ins = Some((dist, ins_pos));
+                    }
+                }
+                if let Some((_, ins_pos)) = best_ins {
+                    move_block_slice_before(&mut func.block_order, s_pos, 1, ins_pos);
+                    refresh_order_maps(func, next_in_order, block_ord_pos);
+                    hoists += 1;
+                    moved_any = true;
+                    did_move = true;
+                    break;
+                }
+            }
+        }
+        if !did_move {
+            break;
+        }
+    }
+
+    moved_any
+}
+
 /// Pass 4: threads branches through empty pass-through blocks (`<= 16` hops), inverts
 /// `BCond`/`Cbz`/`Cbnz`/`Tbz`/`Tbnz` followed by `B` when the conditional branch targets the next
 /// layout block (directly or across empty/pass-through blocks) or when a forward exit precedes a
-/// backward loop back-edge, eliminates redundant fallthrough `B`s, relocates short edge-split
-/// blocks (`S -> B T`) immediately before `T`, prunes unreachable empty/trampoline blocks,
-/// compacts NOPs, and rebuilds CFG CSRs.
+/// backward loop back-edge, eliminates redundant fallthrough `B`s, prunes unreachable
+/// empty/trampoline blocks, merges identical short tail blocks up to 12 ops (Pass 4e), hoists
+/// distant / post-`Ret` copy trampolines immediately before fallthrough-free targets (Pass 4g),
+/// relocates short edge-split blocks & distant back-edge trampolines (Pass 4d Phases 1–3),
+/// relocates short hot loop headers before their fallthrough-free bodies (Pass 4f), compacts NOPs,
+/// and rebuilds CFG CSRs.
 fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptStats) {
     let num_blocks = func.block_insts.len();
-    if num_blocks == 0 || func.block_order.is_empty() {
+    let Some(&entry_blk) = func.block_order.first() else {
+        return;
+    };
+    if num_blocks == 0 {
         return;
     }
 
@@ -4840,7 +7034,7 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
     }
 
     // Compact NOPs and ensure CFG CSRs are current before pruning unreachable empty blocks
-    // (pruning first exposes clean `P -> T` boundaries for short-block relocation in 4d!).
+    // (pruning first exposes clean `P -> T` boundaries for tail merging and relocation!).
     compact_nops(func, alloc);
     if cfg_changed {
         func.rebuild_cfg(alloc);
@@ -4850,83 +7044,59 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
     //     (never dropping `block_order[0]`, never dropping when jump tables / indirect `Br` or
     //     `MNoteKind::Unwind` notes exist, and keeping every target/fallthrough reachable from
     //     any kept block).
-    let has_indirect_or_unwind = func
-        .ops
-        .iter()
-        .any(|op| matches!(*op, MOp::AdrTable { .. } | MOp::Br { .. }))
-        || func.notes.iter().any(|note| {
-            matches!(note.kind, MNoteKind::JumpTableAnchor { .. } | MNoteKind::Unwind { .. })
-        });
+    let has_indirect_or_unwind = has_indirect_or_unwind_cfg(func);
 
     if !has_indirect_or_unwind && func.block_order.len() > 1 {
-        if func.block_succs_off.len() != num_blocks + 1 {
-            func.rebuild_cfg(alloc);
-        }
+        let _ = prune_unreachable_empty_blocks(
+            func,
+            alloc,
+            &mut next_in_order,
+            &mut block_ord_pos,
+            stats,
+        );
+    }
 
-        let mut keep: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
-        for _ in 0..num_blocks {
-            keep.push(false);
-        }
-        let mut worklist: Vec<MBlock, Alloc<'a>> =
-            Vec::with_capacity_in(func.block_order.len(), alloc);
-
-        for (ord_pos, &blk) in func.block_order.iter().enumerate() {
-            let b = to_idx(blk.0);
-            if b < num_blocks
-                && (ord_pos == 0 || !is_empty_or_unprotected_trampoline(func, blk))
-                && !at(&keep, b, true)
-            {
-                set(&mut keep, b, true);
-                worklist.push(blk);
-            }
-        }
-
-        while let Some(cur) = worklist.pop() {
-            for &succ in func.block_succs(cur) {
-                let s = to_idx(succ.0);
-                if s < num_blocks && !at(&keep, s, true) {
-                    set(&mut keep, s, true);
-                    worklist.push(succ);
-                }
-            }
-        }
-
-        let mut write_pos: usize = 0;
-        let orig_len = func.block_order.len();
-        for read_pos in 0..orig_len {
-            let Some(&blk) = func.block_order.get(read_pos) else {
-                continue;
-            };
-            let b = to_idx(blk.0);
-            if read_pos == 0 || keep.get(b).copied().unwrap_or(true) {
-                set(&mut func.block_order, write_pos, blk);
-                write_pos += 1;
-            } else {
-                let mut deleted_b = false;
-                let (s_i, e_i) = block_range(func, blk);
-                for i in s_i..e_i {
-                    if !is_protected(func, i) {
-                        if matches!(op_at(func, i), MOp::B { .. }) {
-                            deleted_b = true;
-                        }
-                        mark_deleted(func, i);
-                    }
-                }
-                if deleted_b {
-                    stats.branches_folded = stats.branches_folded.saturating_add(1);
-                }
-            }
-        }
-
-        if write_pos < orig_len {
-            func.block_order.truncate(write_pos);
-            compact_nops(func, alloc);
+    // 4e. Post-RA identical short-block tail merging (no jump tables or unwind notes):
+    //     deduplicates identical `1..=12`-op tail blocks ending in `B target` (preferring one
+    //     immediately preceding `target`), redirects branches, and prunes the unreachable copies.
+    if !func.is_ssa
+        && !has_indirect_or_unwind
+        && mopt_branch_tail_merge_post_ra(func, alloc, &next_in_order, &block_ord_pos, stats)
+    {
+        compact_nops(func, alloc);
+        func.rebuild_cfg(alloc);
+        let pruned = prune_unreachable_empty_blocks(
+            func,
+            alloc,
+            &mut next_in_order,
+            &mut block_ord_pos,
+            stats,
+        );
+        if !pruned {
             refresh_order_maps(func, &mut next_in_order, &mut block_ord_pos);
             if mopt_branch_fold_fallthrough(func, &next_in_order, &block_ord_pos, stats) {
                 compact_nops(func, alloc);
+                func.rebuild_cfg(alloc);
             }
-            func.rebuild_cfg(alloc);
         }
+    }
+
+    let mut relocated_any = false;
+
+    // 4g. Post-RA hoist distant or post-`Ret` lowered `ParallelCopy` trampolines (`1..=10` non-NOP
+    //     ops, every non-terminator op `Mov`/`MovImm`, ending in `B T`) immediately before
+    //     fallthrough-free `T`, folding the trailing `B T` into zero-branch fallthrough.
+    if !func.is_ssa
+        && !has_indirect_or_unwind
+        && mopt_branch_hoist_copy_trampoline_post_ra(
+            func,
+            entry_blk,
+            &mut next_in_order,
+            &mut block_ord_pos,
+            stats,
+        )
+    {
+        relocated_any = true;
     }
 
     // 4d. Relocate short edge-split blocks (`S -> B T`, `1..=6` non-NOP insts), capped at
@@ -4939,9 +7109,12 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
     //       an unconditional terminator `PP = block_order[t_pos - 2]` and `S` sits after `T`
     //       (`s_pos > t_pos`), move `S` to `t_pos - 1` (immediately before `P`) while keeping
     //       `S`'s `B T` so `S` shares `T`'s I-cache line instead of jumping from the cold tail.
-    let entry_blk = func.block_order[0];
+    //     - Phase 3 (post-RA distant back-edge trampoline inversion & co-location): when `P` ends
+    //       with a single invertible conditional branch targeting a single-pred `1..=3`-op back-edge
+    //       trampoline `S -> B T` (`pos[T] <= p_pos`) whose predecessor in `block_order` ends with
+    //       an unconditional terminator, invert `P`'s branch to its fallthrough `F` and move `S`
+    //       immediately after `P`.
     let mut relocations: usize = 0;
-    let mut relocated_any = false;
     for allow_secondary in [false, true] {
         while relocations < MAX_BLOCK_RELOCATIONS {
             let mut did_move = false;
@@ -4997,24 +7170,7 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                     }
 
                     // Shift `blk_s` in `func.block_order` to immediately precede `blk_t` (zero `Vec::remove`).
-                    if s_pos > t_pos {
-                        let mut k = s_pos;
-                        while k > t_pos {
-                            if let Some(prev_blk) = func.block_order.get(k - 1).copied() {
-                                set(&mut func.block_order, k, prev_blk);
-                            }
-                            k -= 1;
-                        }
-                        set(&mut func.block_order, t_pos, blk_s);
-                    } else {
-                        let dst_pos = t_pos - 1;
-                        for k in s_pos..dst_pos {
-                            if let Some(next_blk) = func.block_order.get(k + 1).copied() {
-                                set(&mut func.block_order, k, next_blk);
-                            }
-                        }
-                        set(&mut func.block_order, dst_pos, blk_s);
-                    }
+                    move_block_slice_before(&mut func.block_order, s_pos, 1, t_pos);
 
                     // Immediately delete `blk_s`'s trailing `B blk_t` so `blk_s` falls through into `blk_t`
                     // (and is no longer an uncond-terminated separator before `blk_t`).
@@ -5049,15 +7205,7 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                 // Shift `blk_s` to `t_pos - 1` (immediately before `blk_p`) while keeping `B blk_t`.
                 // Because `s_pos > t_pos`, `s_pos` strictly decreases to `t_pos - 1 < t_pos`,
                 // so `blk_s` can never ping-pong on subsequent iterations.
-                let dst_pos = t_pos - 1;
-                let mut k = s_pos;
-                while k > dst_pos {
-                    if let Some(prev_blk) = func.block_order.get(k - 1).copied() {
-                        set(&mut func.block_order, k, prev_blk);
-                    }
-                    k -= 1;
-                }
-                set(&mut func.block_order, dst_pos, blk_s);
+                move_block_slice_before(&mut func.block_order, s_pos, 1, t_pos - 1);
 
                 refresh_order_maps(func, &mut next_in_order, &mut block_ord_pos);
                 relocations += 1;
@@ -5069,6 +7217,133 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                 break;
             }
         }
+    }
+
+    // Pass 4d Phase 3: post-RA invert & co-locate distant back-edge trampolines.
+    if !func.is_ssa
+        && !has_indirect_or_unwind
+        && func.block_order.len() > 2
+        && relocations < MAX_BLOCK_RELOCATIONS
+    {
+        if relocated_any || func.block_preds_off.len() != num_blocks + 1 {
+            compact_nops(func, alloc);
+            func.rebuild_cfg(alloc);
+            refresh_order_maps(func, &mut next_in_order, &mut block_ord_pos);
+        }
+
+        let mut inverted_p: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(num_blocks, alloc);
+        for _ in 0..num_blocks {
+            inverted_p.push(false);
+        }
+
+        while relocations < MAX_BLOCK_RELOCATIONS {
+            let mut did_move = false;
+            let n_ord = func.block_order.len();
+            for p_pos in 0..n_ord.saturating_sub(1) {
+                let Some(&blk_p) = func.block_order.get(p_pos) else {
+                    continue;
+                };
+                if at(&inverted_p, to_idx(blk_p.0), true) {
+                    continue;
+                }
+                let Some(&blk_f) = func.block_order.get(p_pos + 1) else {
+                    continue;
+                };
+                let (p_start, p_end) = block_range(func, blk_p);
+                let mut last_idx: Option<usize> = None;
+                let mut prev_idx: Option<usize> = None;
+                for i in (p_start..p_end).rev() {
+                    if matches!(op_at(func, i), MOp::Nop) {
+                        continue;
+                    }
+                    if last_idx.is_none() {
+                        last_idx = Some(i);
+                    } else {
+                        prev_idx = Some(i);
+                        break;
+                    }
+                }
+                let Some(p_last) = last_idx else {
+                    continue;
+                };
+                if is_protected(func, p_last) {
+                    continue;
+                }
+                let op_last = op_at(func, p_last);
+                if !op_last.is_conditional_branch() {
+                    continue;
+                }
+                if let Some(p_prev) = prev_idx {
+                    let op_prev = op_at(func, p_prev);
+                    if op_prev.is_conditional_branch() || op_prev.is_unconditional_terminator() {
+                        continue;
+                    }
+                }
+                let Some(blk_s) = op_last.branch_target() else {
+                    continue;
+                };
+                let Some(inv_op) = invert_cond_branch(op_last, blk_f) else {
+                    continue;
+                };
+                if blk_s == blk_p || blk_s == blk_f || blk_s == entry_blk {
+                    continue;
+                }
+                let s_pos_u = at(&block_ord_pos, to_idx(blk_s.0), u32::MAX);
+                if s_pos_u == u32::MAX || s_pos_u == 0 {
+                    continue;
+                }
+                let s_pos = to_idx(s_pos_u);
+                if s_pos >= n_ord || s_pos == p_pos + 1 {
+                    continue;
+                }
+                if func.block_preds(blk_s) != [blk_p].as_slice() {
+                    continue;
+                }
+                let Some(&prev_s) = func.block_order.get(s_pos - 1) else {
+                    continue;
+                };
+                if !block_ends_with_uncond_term(func, prev_s) {
+                    continue;
+                }
+                let Some(blk_t) = is_short_backedge_trampoline(func, &block_ord_pos, blk_s, p_pos)
+                else {
+                    continue;
+                };
+                if blk_f == blk_t
+                    || is_short_backedge_trampoline(func, &block_ord_pos, blk_f, p_pos).is_some()
+                {
+                    continue;
+                }
+
+                set(&mut func.ops, p_last, inv_op);
+                move_block_slice_before(&mut func.block_order, s_pos, 1, p_pos + 1);
+                set(&mut inverted_p, to_idx(blk_p.0), true);
+                stats.branches_folded = stats.branches_folded.saturating_add(1);
+                refresh_order_maps(func, &mut next_in_order, &mut block_ord_pos);
+                relocations += 1;
+                relocated_any = true;
+                did_move = true;
+                break;
+            }
+            if !did_move {
+                break;
+            }
+        }
+    }
+
+    // 4f. Post-RA relocate short displaced hot loop-header `H` (or `[prev_H, H]`) immediately
+    //     before its fallthrough-free `Body` and invert `b.cc Body; b Exit` -> `b.!cc Exit`.
+    if !func.is_ssa
+        && !has_indirect_or_unwind
+        && mopt_branch_relocate_hot_loop_header_post_ra(
+            func,
+            entry_blk,
+            &mut next_in_order,
+            &mut block_ord_pos,
+            stats,
+        )
+    {
+        relocated_any = true;
     }
 
     if relocated_any {
@@ -5961,12 +8236,12 @@ mod tests {
         assert_eq!(mverify(&func), Ok(()));
         assert!(stats.branches_folded >= 3, "expected trampoline thread + invert + fallthrough elide");
 
-        // Verify `b_entry` now ends directly with inverted `b.ne b_done` (no trailing `B`!).
+        // Verify `b_entry` fused `cmp x0, #0; b.eq b_then; b b_done` into single `cbnz x0, b_done`!
         let entry_range = func.block_inst_range(b_entry);
-        assert_eq!(entry_range.len(), 2);
+        assert_eq!(entry_range.len(), 1);
         assert_eq!(
-            func.ops[entry_range.start + 1],
-            MOp::BCond { cond: MCond::Ne, target: b_done }
+            func.ops[entry_range.start],
+            MOp::Cbnz { rt: MReg::p(PReg::X0), target: b_done, wide: true }
         );
         // Verify `b_tramp` had its fallthrough `B` eliminated.
         assert_eq!(func.block_inst_range(b_tramp).len(), 0);
@@ -6850,7 +9125,7 @@ mod tests {
         assert!(pos.ops.iter().any(|op| matches!(
             *op,
             MOp::AddReg {
-                dst: MReg::P(PReg::X10),
+                dst: MReg::P(PReg::X0),
                 rn: MReg::P(PReg::X2),
                 rm: MReg::P(PReg::X1),
                 shift: Some(MShift::Lsl(2)),
@@ -9643,5 +11918,1862 @@ mod tests {
             assert_eq!(f_neg(5, 0), 25);
         }
         let _ = (pos_enc, neg_enc);
+    }
+
+    #[test]
+    fn mopt_post_ra_tail_merges_identical_short_blocks() {
+        let alloc = test_alloc();
+
+        // 1. Positive post-RA control (`lz77_scan_default_leaf` false-match tail pattern):
+        //    4 identical 3-inst blocks (`add x2, #1; add x0, #1; b b_hdr`) with `b_dup2`
+        //    immediately preceding `b_hdr` -> merged into canonical `b_dup2` (falling straight
+        //    through into `b_hdr`), all 3 duplicates pruned from `block_order`!
+        let mut func = new_post_ra();
+        let b_entry = func.new_block(false);
+        let b_c0 = func.new_block(false);
+        let b_c1 = func.new_block(false);
+        let b_dup0 = func.new_block(false);
+        let b_dup1 = func.new_block(false);
+        let b_dup2 = func.new_block(false);
+        let b_hdr = func.new_block(false);
+        let b_dup3 = func.new_block(false);
+
+        func.begin_block(b_entry);
+        func.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X2), imm: 10, wide: true },
+            MInstFlags::NONE,
+        );
+        let c_e = func.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X0), imm12: 0, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        func.set_vflag_def(c_e, 0);
+        let br_e = func.push_inst(
+            MOp::BCond { cond: MCond::Eq, target: b_dup0 },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(br_e, 0);
+        func.end_block(b_entry);
+
+        func.begin_block(b_c0);
+        let c_0 = func.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X0), imm12: 1, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        func.set_vflag_def(c_0, 0);
+        let br_0 = func.push_inst(
+            MOp::BCond { cond: MCond::Eq, target: b_dup1 },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(br_0, 0);
+        func.end_block(b_c0);
+
+        func.begin_block(b_c1);
+        let c_1 = func.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X0), imm12: 2, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        func.set_vflag_def(c_1, 0);
+        let br_1 = func.push_inst(
+            MOp::BCond { cond: MCond::Eq, target: b_dup3 },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(br_1, 0);
+        func.push_inst(MOp::B { target: b_dup2 }, MInstFlags::TERMINATOR);
+        func.end_block(b_c1);
+
+        for dup in [b_dup0, b_dup1, b_dup2] {
+            func.begin_block(dup);
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::p(PReg::X2),
+                    rn: MReg::p(PReg::X2),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::p(PReg::X0),
+                    rn: MReg::p(PReg::X0),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::B { target: b_hdr }, MInstFlags::TERMINATOR);
+            func.end_block(dup);
+        }
+
+        func.begin_block(b_hdr);
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                rm: MReg::p(PReg::X2),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                rm: MReg::p(PReg::X1),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_hdr);
+
+        func.begin_block(b_dup3);
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X2),
+                rn: MReg::p(PReg::X2),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::B { target: b_hdr }, MInstFlags::TERMINATOR);
+        func.end_block(b_dup3);
+
+        func.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        let stats = optimize_mfunc(&mut func, alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        assert!(stats.branches_folded >= 3, "3 duplicate tails must merge into canonical b_dup2");
+        assert_eq!(
+            func.block_order.as_slice(),
+            &[b_entry, b_c0, b_c1, b_dup2, b_hdr],
+            "b_dup0, b_dup1, and b_dup3 must be merged into b_dup2 and pruned"
+        );
+        assert_eq!(func.block_inst_range(b_dup2).len(), 2, "b_dup2 falls straight into b_hdr");
+        assert!(
+            !func.ops.iter().any(|op| matches!(op.branch_target(), Some(t) if t == b_dup0 || t == b_dup1 || t == b_dup3)),
+            "no branch may still target a pruned duplicate"
+        );
+        let pos_enc = mencode(&func, alloc).expect("mencode tail-merged func must succeed");
+
+        // 2. Negative guard: jump-table anchor (`AdrTable`) present -> MUST NOT merge or prune!
+        let mut neg = new_post_ra();
+        let n_entry = neg.new_block(false);
+        let n_d0 = neg.new_block(false);
+        let n_d1 = neg.new_block(false);
+        let n_hdr = neg.new_block(false);
+
+        neg.begin_block(n_entry);
+        neg.push_inst(
+            MOp::AdrTable { dst: MReg::p(PReg::X3), table_id: 0 },
+            MInstFlags::PINNED,
+        );
+        neg.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X0), target: n_d0, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        neg.push_inst(MOp::B { target: n_d1 }, MInstFlags::TERMINATOR);
+        neg.end_block(n_entry);
+
+        for d in [n_d0, n_d1] {
+            neg.begin_block(d);
+            neg.push_inst(
+                MOp::AddImm {
+                    dst: MReg::p(PReg::X0),
+                    rn: MReg::p(PReg::X0),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            neg.push_inst(MOp::B { target: n_hdr }, MInstFlags::TERMINATOR);
+            neg.end_block(d);
+        }
+
+        neg.begin_block(n_hdr);
+        neg.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        neg.end_block(n_hdr);
+
+        neg.rebuild_cfg(alloc);
+        assert_eq!(mverify(&neg), Ok(()));
+        let _ = optimize_mfunc(&mut neg, alloc);
+        assert_eq!(mverify(&neg), Ok(()));
+        assert_eq!(
+            neg.block_order.as_slice(),
+            &[n_entry, n_d0, n_d1, n_hdr],
+            "AdrTable presence must skip Pass 4e tail merging"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let pos_bytes = words_to_bytes(&pos_enc.words, alloc);
+            let pos_exec =
+                blaze_inproc::exec::Executable::new(&pos_bytes, 0).expect("exec map must succeed");
+            // SAFETY: Valid AAPCS64 leaf function touching only caller-saved `X0..=X2`.
+            let f_pos: extern "C" fn(u64, u64) -> u64 = unsafe { pos_exec.as_fn() };
+            assert_eq!(f_pos(0, 100), 112);
+            assert_eq!(f_pos(1, 100), 113);
+            assert_eq!(f_pos(2, 100), 114);
+            assert_eq!(f_pos(5, 100), 117);
+        }
+        let _ = pos_enc;
+    }
+
+    #[test]
+    fn mopt_post_ra_relocates_hot_loop_header_and_prev_before_body() {
+        let alloc = test_alloc();
+
+        // 1. Positive post-RA control (`lz77_scan_default_leaf` outer header pattern):
+        //    Layout: `[b_entry, b_body, b_cold_exit, b_prev_h, b_hdr]`
+        //    - `b_entry` ends with `b b_hdr` (uncond -> `b_body` has NO fallthrough pred).
+        //    - `b_body` is a 7-inst loop body ending in `b b_prev_h`.
+        //    - `b_cold_exit` ends with `ret` (uncond -> `[b_prev_h, b_hdr]` is fallthrough-free).
+        //    - `b_prev_h` is a 2-inst pure ALU fallthrough block (`add x3, #1; add x0, #1`).
+        //    - `b_hdr` is a 5-inst displaced header (`lsr; add; cmp; b.ls b_body; b b_cold_exit`).
+        //    -> Pass 4f relocates `[b_prev_h, b_hdr]` immediately before `b_body` and inverts
+        //       `b_hdr` to `b.hi b_cold_exit` falling straight through into `b_body`!
+        let mut func = new_post_ra();
+        let b_entry = func.new_block(false);
+        let b_body = func.new_block(false);
+        let b_cold_exit = func.new_block(false);
+        let b_prev_h = func.new_block(false);
+        let b_hdr = func.new_block(true);
+
+        func.begin_block(b_entry);
+        func.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X3), imm: 0, wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::B { target: b_hdr }, MInstFlags::TERMINATOR);
+        func.end_block(b_entry);
+
+        func.begin_block(b_body);
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X1),
+                rn: MReg::p(PReg::X1),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X1),
+                rn: MReg::p(PReg::X1),
+                rm: MReg::p(PReg::X0),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X1),
+                rn: MReg::p(PReg::X1),
+                rm: MReg::p(PReg::X3),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::LogicalReg {
+                dst: MReg::p(PReg::X5),
+                rn: MReg::p(PReg::X1),
+                rm: MReg::p(PReg::X0),
+                shift: None,
+                invert_rm: false,
+                kind: LogicalKind::Eor,
+                wide: true,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X5),
+                rn: MReg::p(PReg::X5),
+                imm12: 3,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X1),
+                rn: MReg::p(PReg::X1),
+                rm: MReg::p(PReg::X5),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::B { target: b_prev_h }, MInstFlags::TERMINATOR);
+        func.end_block(b_body);
+
+        func.begin_block(b_cold_exit);
+        func.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X1), wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_cold_exit);
+
+        func.begin_block(b_prev_h);
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X3),
+                rn: MReg::p(PReg::X3),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.end_block(b_prev_h);
+
+        func.begin_block(b_hdr);
+        func.push_inst(
+            MOp::Ubfm { dst: MReg::p(PReg::X7), rn: MReg::p(PReg::X0), immr: 1, imms: 63, wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X6),
+                rn: MReg::p(PReg::X3),
+                rm: MReg::p(PReg::X7),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        let cmp = func.push_inst(
+            MOp::CmpReg {
+                rn: MReg::p(PReg::X6),
+                rm: MReg::p(PReg::X2),
+                shift: None,
+                wide: true,
+            },
+            MInstFlags::NONE,
+        );
+        func.set_vflag_def(cmp, 0);
+        let bls = func.push_inst(
+            MOp::BCond { cond: MCond::Ls, target: b_body },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(bls, 0);
+        func.push_inst(MOp::B { target: b_cold_exit }, MInstFlags::TERMINATOR);
+        func.end_block(b_hdr);
+
+        func.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        let stats = optimize_mfunc(&mut func, alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        assert!(stats.branches_folded >= 1, "Pass 4f must relocate and invert displaced header");
+        assert_eq!(
+            func.block_order.as_slice(),
+            &[b_entry, b_prev_h, b_hdr, b_body, b_cold_exit],
+            "[b_prev_h, b_hdr] must move together immediately before b_body"
+        );
+        let hdr_r = func.block_inst_range(b_hdr);
+        assert_eq!(
+            func.ops[hdr_r.end - 1],
+            MOp::BCond { cond: MCond::Hi, target: b_cold_exit },
+            "b_hdr must invert b.ls b_body; b b_cold_exit -> b.hi b_cold_exit (fallthrough to b_body)"
+        );
+        assert_eq!(func.vflag_use[hdr_r.end - 1], 0, "vflag_use must remain intact after inversion");
+        assert!(
+            !func.ops[hdr_r].iter().any(|op| matches!(*op, MOp::B { .. })),
+            "b_hdr must have zero trailing B after inversion"
+        );
+        let pos_enc = mencode(&func, alloc).expect("mencode relocated hot loop header must succeed");
+
+        // 2. Negative guard: `b_entry` falls through into `b_body` -> `b_hdr` MUST NOT relocate!
+        let mut neg = new_post_ra();
+        let n_entry = neg.new_block(false);
+        let n_body = neg.new_block(false);
+        let n_exit = neg.new_block(false);
+        let n_hdr = neg.new_block(true);
+
+        neg.begin_block(n_entry);
+        neg.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X0), target: n_exit, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        neg.end_block(n_entry);
+
+        neg.begin_block(n_body);
+        neg.push_inst(
+            MOp::SubImm {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(MOp::B { target: n_hdr }, MInstFlags::TERMINATOR);
+        neg.end_block(n_body);
+
+        neg.begin_block(n_exit);
+        neg.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        neg.end_block(n_exit);
+
+        neg.begin_block(n_hdr);
+        let n_cmp = neg.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X0), imm12: 0, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        neg.set_vflag_def(n_cmp, 0);
+        let n_bne = neg.push_inst(
+            MOp::BCond { cond: MCond::Ne, target: n_body },
+            MInstFlags::TERMINATOR,
+        );
+        neg.set_vflag_use(n_bne, 0);
+        neg.push_inst(MOp::B { target: n_exit }, MInstFlags::TERMINATOR);
+        neg.end_block(n_hdr);
+
+        neg.rebuild_cfg(alloc);
+        assert_eq!(mverify(&neg), Ok(()));
+        let _ = optimize_mfunc(&mut neg, alloc);
+        assert_eq!(mverify(&neg), Ok(()));
+        assert_eq!(
+            &neg.block_order.as_slice()[0..2],
+            &[n_entry, n_body],
+            "fallthrough into n_body must prevent relocating n_hdr before n_body"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let pos_bytes = words_to_bytes(&pos_enc.words, alloc);
+            let pos_exec =
+                blaze_inproc::exec::Executable::new(&pos_bytes, 0).expect("exec map must succeed");
+            // SAFETY: Valid AAPCS64 leaf function touching only caller-saved `X0..=X7`.
+            let f_pos: extern "C" fn(u64, u64, u64) -> u64 = unsafe { pos_exec.as_fn() };
+            assert_eq!(f_pos(0, 10, 2), 60);
+            assert_eq!(f_pos(10, 7, 2), 7);
+        }
+        let _ = pos_enc;
+    }
+
+    #[test]
+    fn mopt_post_ra_inverts_and_colocates_distant_backedge_trampoline() {
+        let alloc = test_alloc();
+
+        // `build_huffman_weights` pattern:
+        // Layout: `[b_entry, b_hdr, b_exit, b_cold_pad, b_split]`
+        // - `b_entry` falls through into `b_hdr` (so Phases 1 & 2 cannot relocate `b_split` before `b_hdr`).
+        // - `b_hdr` ends in single `b.lo b_split` (falling through to `b_exit`).
+        // - `b_split` (`mov x14, x13; b b_hdr`) sits in the cold tail after uncond `b_cold_pad`,
+        //   has 1 pred (`b_hdr`), and branches back to `b_hdr` (`pos[b_hdr] <= pos[b_hdr]`).
+        // -> Pass 4d Phase 3 inverts `b_hdr` to `b.hs b_exit` and co-locates `b_split` at `p_pos + 1`!
+        let mut func = new_post_ra();
+        let b_entry = func.new_block(false);
+        let b_hdr = func.new_block(true);
+        let b_exit = func.new_block(false);
+        let b_cold_pad = func.new_block(false);
+        let b_split = func.new_block(false);
+
+        func.begin_block(b_entry);
+        func.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X14), imm: 0, wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X13), imm: 1, wide: true },
+            MInstFlags::NONE,
+        );
+        func.end_block(b_entry);
+
+        func.begin_block(b_hdr);
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X13),
+                rn: MReg::p(PReg::X13),
+                imm12: 2,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        let cmp = func.push_inst(
+            MOp::CmpReg {
+                rn: MReg::p(PReg::X13),
+                rm: MReg::p(PReg::X0),
+                shift: None,
+                wide: true,
+            },
+            MInstFlags::NONE,
+        );
+        func.set_vflag_def(cmp, 0);
+        let blo = func.push_inst(
+            MOp::BCond { cond: MCond::Lo, target: b_split },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(blo, 0);
+        func.end_block(b_hdr);
+
+        func.begin_block(b_exit);
+        func.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X14), wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_exit);
+
+        func.begin_block(b_cold_pad);
+        func.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X0), imm: 999, wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_cold_pad);
+
+        func.begin_block(b_split);
+        func.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X14), src: MReg::p(PReg::X13), wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::B { target: b_hdr }, MInstFlags::TERMINATOR);
+        func.end_block(b_split);
+
+        func.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        let stats = optimize_mfunc(&mut func, alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        assert!(stats.branches_folded >= 1, "Pass 4d Phase 3 must invert & co-locate back-edge split");
+        assert_eq!(
+            func.block_order.as_slice(),
+            &[b_entry, b_hdr, b_split, b_exit, b_cold_pad],
+            "b_split must co-locate immediately after b_hdr"
+        );
+        let hdr_r = func.block_inst_range(b_hdr);
+        assert_eq!(
+            func.ops[hdr_r.end - 1],
+            MOp::BCond { cond: MCond::Hs, target: b_exit },
+            "b_hdr must invert b.lo b_split -> b.hs b_exit"
+        );
+        assert_eq!(func.vflag_use[hdr_r.end - 1], 0);
+        let split_r = func.block_inst_range(b_split);
+        assert_eq!(split_r.len(), 2);
+        assert_eq!(func.ops[split_r.start + 1], MOp::B { target: b_hdr });
+
+        // Second pass must be strictly idempotent (no ping-pong!).
+        let stats2 = optimize_mfunc(&mut func, alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        assert_eq!(stats2.branches_folded, 0);
+        assert_eq!(func.block_order.as_slice(), &[b_entry, b_hdr, b_split, b_exit, b_cold_pad]);
+
+        let enc_out = mencode(&func, alloc).expect("mencode co-located back-edge split must succeed");
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let bytes = words_to_bytes(&enc_out.words, alloc);
+            let exec =
+                blaze_inproc::exec::Executable::new(&bytes, 0).expect("exec map must succeed");
+            // SAFETY: Valid AAPCS64 leaf function touching only caller-saved `X0, X13, X14`.
+            let f: extern "C" fn(u64) -> u64 = unsafe { exec.as_fn() };
+            assert_eq!(f(0), 0);
+            assert_eq!(f(4), 3);
+            assert_eq!(f(10), 9);
+        }
+        let _ = enc_out;
+    }
+
+    #[test]
+    fn mopt_post_ra_fuses_stp_ldp_q128_post_index() {
+        let alloc = test_alloc();
+
+        // 1. Positive Q128 `Stp` post-index (`stp q16, q16, [x14], #32`):
+        //    Signature: `fn(dst: *mut u64, fill_src: *const u64, iters: u64) -> *mut u64`.
+        let mut func = new_post_ra();
+        let b_entry = func.new_block(false);
+        let b_loop = func.new_block(true);
+        let b_exit = func.new_block(false);
+
+        func.begin_block(b_entry);
+        func.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X14), src: MReg::p(PReg::X0), wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::Ldr {
+                dst: MReg::vec(16),
+                addr: AddrMode::BaseOff { base: MReg::p(PReg::X1), off: 0 },
+                size: MemSize::Q128,
+                signed: false,
+            },
+            MInstFlags::MEM_READ,
+        );
+        func.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X2), target: b_exit, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        func.end_block(b_entry);
+
+        func.begin_block(b_loop);
+        func.push_inst(
+            MOp::Stp {
+                src0: MReg::vec(16),
+                src1: MReg::vec(16),
+                base: MReg::p(PReg::X14),
+                off: 0,
+                size: MemSize::Q128,
+                post_idx: false,
+                pre_idx: false,
+            },
+            MInstFlags::MEM_WRITE,
+        );
+        func.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X14),
+                rn: MReg::p(PReg::X14),
+                imm12: 32,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::SubImm {
+                dst: MReg::p(PReg::X2),
+                rn: MReg::p(PReg::X2),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::Cbnz { rt: MReg::p(PReg::X2), target: b_loop, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        func.end_block(b_loop);
+
+        func.begin_block(b_exit);
+        func.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X14), wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_exit);
+
+        func.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        let stats = optimize_mfunc(&mut func, alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        assert_eq!(stats.post_idx_formed, 1, "stp q16, q16, [x14] + add #32 must fuse");
+        assert!(func.ops.iter().any(|op| matches!(
+            *op,
+            MOp::Stp {
+                src0: MReg::P(PReg::V(16)),
+                src1: MReg::P(PReg::V(16)),
+                base: MReg::P(PReg::X14),
+                off: 32,
+                size: MemSize::Q128,
+                post_idx: true,
+                pre_idx: false,
+            }
+        )));
+        assert!(
+            !func.ops.iter().any(|op| matches!(
+                *op,
+                MOp::AddImm { dst: MReg::P(PReg::X14), rn: MReg::P(PReg::X14), .. }
+            )),
+            "folded AddImm on x14 must be removed"
+        );
+        let pos_enc = mencode(&func, alloc).expect("mencode Q128 stp post-index must succeed");
+
+        // 2. Positive Q128 `Ldp` negative post-index (`ldp q17, q18, [x15], #-32`) across >12
+        //    intervening unrelated ALU ops (exercises widened `POST_IDX_WINDOW`).
+        let mut ldp_fn = new_post_ra();
+        let lb0 = ldp_fn.new_block(false);
+        ldp_fn.begin_block(lb0);
+        ldp_fn.push_inst(
+            MOp::Ldp {
+                dst0: MReg::vec(17),
+                dst1: MReg::vec(18),
+                base: MReg::p(PReg::X15),
+                off: 0,
+                size: MemSize::Q128,
+                post_idx: false,
+                pre_idx: false,
+            },
+            MInstFlags::MEM_READ,
+        );
+        for _ in 0..14 {
+            ldp_fn.push_inst(
+                MOp::AddImm {
+                    dst: MReg::p(PReg::X9),
+                    rn: MReg::p(PReg::X9),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+        }
+        ldp_fn.push_inst(
+            MOp::SubImm {
+                dst: MReg::p(PReg::X15),
+                rn: MReg::p(PReg::X15),
+                imm12: 32,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        ldp_fn.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X15), wide: true },
+            MInstFlags::NONE,
+        );
+        ldp_fn.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        ldp_fn.end_block(lb0);
+
+        assert_eq!(mverify(&ldp_fn), Ok(()));
+        let ldp_stats = optimize_mfunc(&mut ldp_fn, alloc);
+        assert_eq!(mverify(&ldp_fn), Ok(()));
+        assert_eq!(ldp_stats.post_idx_formed, 1, "ldp q17, q18 + sub #32 across 14 ops must fuse");
+        assert!(ldp_fn.ops.iter().any(|op| matches!(
+            *op,
+            MOp::Ldp {
+                dst0: MReg::P(PReg::V(17)),
+                dst1: MReg::P(PReg::V(18)),
+                base: MReg::P(PReg::X15),
+                off: -32,
+                size: MemSize::Q128,
+                post_idx: true,
+                pre_idx: false,
+            }
+        )));
+        let _ldp_enc = mencode(&ldp_fn, alloc).expect("mencode Q128 ldp post-index must succeed");
+
+        // 3. Negative guards: out-of-range (+1024), unaligned (+24), `SP` base, and `dst0 == base`
+        //    MUST NOT fuse!
+        let mut neg = new_post_ra();
+        let nb0 = neg.new_block(false);
+        neg.begin_block(nb0);
+        // Out of Q128 7-bit scaled range (max +1008):
+        neg.push_inst(
+            MOp::Stp {
+                src0: MReg::vec(16),
+                src1: MReg::vec(16),
+                base: MReg::p(PReg::X14),
+                off: 0,
+                size: MemSize::Q128,
+                post_idx: false,
+                pre_idx: false,
+            },
+            MInstFlags::MEM_WRITE,
+        );
+        neg.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X14),
+                rn: MReg::p(PReg::X14),
+                imm12: 1024,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        // Unaligned for Q128 (24 % 16 != 0):
+        neg.push_inst(
+            MOp::Stp {
+                src0: MReg::vec(16),
+                src1: MReg::vec(16),
+                base: MReg::p(PReg::X13),
+                off: 0,
+                size: MemSize::Q128,
+                post_idx: false,
+                pre_idx: false,
+            },
+            MInstFlags::MEM_WRITE,
+        );
+        neg.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X13),
+                rn: MReg::p(PReg::X13),
+                imm12: 24,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        // `base == SP`:
+        neg.push_inst(
+            MOp::Stp {
+                src0: MReg::p(PReg::X3),
+                src1: MReg::p(PReg::X4),
+                base: MReg::SP,
+                off: 0,
+                size: MemSize::X64,
+                post_idx: false,
+                pre_idx: false,
+            },
+            MInstFlags::MEM_WRITE,
+        );
+        neg.push_inst(
+            MOp::AddImm {
+                dst: MReg::SP,
+                rn: MReg::SP,
+                imm12: 16,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        // `Ldp` with `dst0 == base`:
+        neg.push_inst(
+            MOp::Ldp {
+                dst0: MReg::p(PReg::X12),
+                dst1: MReg::p(PReg::X11),
+                base: MReg::p(PReg::X12),
+                off: 0,
+                size: MemSize::X64,
+                post_idx: false,
+                pre_idx: false,
+            },
+            MInstFlags::MEM_READ,
+        );
+        neg.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X12),
+                rn: MReg::p(PReg::X12),
+                imm12: 16,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        neg.end_block(nb0);
+
+        assert_eq!(mverify(&neg), Ok(()));
+        let neg_stats = optimize_mfunc(&mut neg, alloc);
+        assert_eq!(mverify(&neg), Ok(()));
+        assert_eq!(neg_stats.post_idx_formed, 0, "all 4 guarded pair post-index cases must reject");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let pos_bytes = words_to_bytes(&pos_enc.words, alloc);
+            let pos_exec =
+                blaze_inproc::exec::Executable::new(&pos_bytes, 0).expect("exec map must succeed");
+            // SAFETY: Valid AAPCS64 leaf function touching only caller-saved `X0..X2, X14, V16`.
+            let f_pos: extern "C" fn(*mut u64, *const u64, u64) -> *mut u64 =
+                unsafe { pos_exec.as_fn() };
+            let fill = [0x1122_3344_5566_7788u64, 0x99aa_bbcc_ddee_ff00u64];
+            let mut dst = [0u64; 8];
+            let end_ptr = f_pos(dst.as_mut_ptr(), fill.as_ptr(), 2);
+            // SAFETY: `dst` has length 8, so `.add(8)` is the exact one-past-end pointer.
+            assert_eq!(end_ptr, unsafe { dst.as_mut_ptr().add(8) });
+            assert_eq!(dst, [fill[0], fill[1], fill[0], fill[1], fill[0], fill[1], fill[0], fill[1]]);
+        }
+        let _ = pos_enc;
+    }
+
+    #[test]
+    fn mopt_post_ra_tail_merges_and_hoists_long_copy_trampolines() {
+        let alloc = test_alloc();
+
+        // 1. Combined 6-inst `Mov`/`MovImm` + `B T` tail merge (Pass 4e, widened to 12 ops) AND
+        //    post-`Ret` copy-trampoline hoist (Pass 4g) with zero-branch fallthrough into `T`:
+        //    Layout: `[b_entry, b_c1, b_t, b_exit (Ret), b_dup0 (6 ops), b_dup1 (6 ops)]`
+        let mut func = new_post_ra();
+        let b_entry = func.new_block(false);
+        let b_c1 = func.new_block(false);
+        let b_t = func.new_block(false);
+        let b_exit = func.new_block(false);
+        let b_dup0 = func.new_block(false);
+        let b_dup1 = func.new_block(false);
+
+        func.begin_block(b_entry);
+        let c_e = func.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X0), imm12: 0, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        func.set_vflag_def(c_e, 0);
+        let br_e = func.push_inst(
+            MOp::BCond { cond: MCond::Eq, target: b_dup0 },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(br_e, 0);
+        func.end_block(b_entry);
+
+        func.begin_block(b_c1);
+        let c_1 = func.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X0), imm12: 1, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        func.set_vflag_def(c_1, 0);
+        let br_1 = func.push_inst(
+            MOp::BCond { cond: MCond::Eq, target: b_dup1 },
+            MInstFlags::TERMINATOR,
+        );
+        func.set_vflag_use(br_1, 0);
+        func.push_inst(MOp::B { target: b_exit }, MInstFlags::TERMINATOR);
+        func.end_block(b_c1);
+
+        func.begin_block(b_t);
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X3),
+                rm: MReg::p(PReg::X4),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        for reg in [PReg::X5, PReg::X6, PReg::X7] {
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::p(PReg::X0),
+                    rn: MReg::p(PReg::X0),
+                    rm: MReg::p(reg),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+        }
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_t);
+
+        func.begin_block(b_exit);
+        func.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X0), imm: 99, wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b_exit);
+
+        for dup in [b_dup0, b_dup1] {
+            func.begin_block(dup);
+            func.push_inst(
+                MOp::Mov { dst: MReg::p(PReg::X3), src: MReg::p(PReg::X1), wide: true },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::Mov { dst: MReg::p(PReg::X4), src: MReg::p(PReg::X2), wide: true },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::MovImm { dst: MReg::p(PReg::X5), imm: 10, wide: true },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::MovImm { dst: MReg::p(PReg::X6), imm: 20, wide: true },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::MovImm { dst: MReg::p(PReg::X7), imm: 30, wide: true },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::B { target: b_t }, MInstFlags::TERMINATOR);
+            func.end_block(dup);
+        }
+
+        func.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        let stats = optimize_mfunc(&mut func, alloc);
+        assert_eq!(mverify(&func), Ok(()));
+        assert!(stats.branches_folded >= 2, "6-inst duplicate merge + hoist must fold branches");
+        assert_eq!(
+            func.block_order.as_slice(),
+            &[b_entry, b_c1, b_dup0, b_t, b_exit],
+            "b_dup1 must merge into b_dup0 and b_dup0 must hoist directly before b_t"
+        );
+        let dup0_r = func.block_inst_range(b_dup0);
+        assert_eq!(dup0_r.len(), 5, "hoisted b_dup0 must drop its trailing B b_t");
+        assert!(
+            !func.ops[dup0_r].iter().any(|op| matches!(*op, MOp::B { .. })),
+            "hoisted b_dup0 must fall through into b_t with zero trailing branch"
+        );
+        assert!(
+            !func.ops.iter().any(|op| op.branch_target() == Some(b_dup1)),
+            "no branch may still target merged duplicate b_dup1"
+        );
+        let pos_enc = mencode(&func, alloc).expect("mencode merged/hoisted 6-inst trampoline");
+
+        // 2. Distant 8-inst (7 `Mov`/`MovImm` + `B T`) post-`Ret` trampoline at `s_pos > t_pos + 8`
+        //    (exceeds Pass 4d's 6-inst cap, so ONLY Pass 4g hoists it before fallthrough-free `T`):
+        let mut func2 = new_post_ra();
+        let d_entry = func2.new_block(false);
+        let d_t = func2.new_block(false);
+        let mut d_pads = [super::MBlock(0); 8];
+        for slot in d_pads.iter_mut() {
+            *slot = func2.new_block(false);
+        }
+        let d_exit = func2.new_block(false);
+        let d_tramp = func2.new_block(false);
+
+        func2.begin_block(d_entry);
+        func2.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X0), target: d_tramp, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        func2.push_inst(MOp::B { target: d_exit }, MInstFlags::TERMINATOR);
+        func2.end_block(d_entry);
+
+        func2.begin_block(d_t);
+        func2.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X3),
+                rm: MReg::p(PReg::X4),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        for reg in [PReg::X5, PReg::X6, PReg::X7, PReg::X8, PReg::X9] {
+            func2.push_inst(
+                MOp::AddReg {
+                    dst: MReg::p(PReg::X0),
+                    rn: MReg::p(PReg::X0),
+                    rm: MReg::p(reg),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+        }
+        func2.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func2.end_block(d_t);
+
+        for (k, &pad) in (0u64..8).zip(d_pads.iter()) {
+            func2.begin_block(pad);
+            func2.push_inst(
+                MOp::MovImm { dst: MReg::p(PReg::X0), imm: 100 + k, wide: true },
+                MInstFlags::NONE,
+            );
+            func2.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+            func2.end_block(pad);
+        }
+
+        func2.begin_block(d_exit);
+        func2.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X0), imm: 42, wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func2.end_block(d_exit);
+
+        func2.begin_block(d_tramp);
+        func2.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X3), src: MReg::p(PReg::X1), wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X4), src: MReg::p(PReg::X2), wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X5), imm: 1, wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X6), imm: 2, wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X7), imm: 3, wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X8), imm: 4, wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X9), imm: 5, wide: true },
+            MInstFlags::NONE,
+        );
+        func2.push_inst(MOp::B { target: d_t }, MInstFlags::TERMINATOR);
+        func2.end_block(d_tramp);
+
+        func2.rebuild_cfg(alloc);
+        assert_eq!(mverify(&func2), Ok(()));
+        let stats2 = optimize_mfunc(&mut func2, alloc);
+        assert_eq!(mverify(&func2), Ok(()));
+        assert!(stats2.branches_folded >= 1, "Pass 4g must hoist distant 8-inst copy trampoline");
+        assert_eq!(
+            &func2.block_order.as_slice()[0..3],
+            &[d_entry, d_tramp, d_t],
+            "8-inst post-Ret copy trampoline must hoist directly before fallthrough-free d_t"
+        );
+        let tramp_r = func2.block_inst_range(d_tramp);
+        assert_eq!(tramp_r.len(), 7, "hoisted 8-inst trampoline must drop its trailing B d_t");
+        assert!(
+            !func2.ops[tramp_r].iter().any(|op| matches!(*op, MOp::B { .. })),
+            "hoisted 8-inst trampoline must have zero trailing B"
+        );
+        let dist_enc = mencode(&func2, alloc).expect("mencode hoisted 8-inst copy trampoline");
+
+        // 3. Negative guard: an 8-inst post-`Ret` block with a non-copy `AddImm` op MUST NOT hoist.
+        let mut neg = new_post_ra();
+        let n_entry = neg.new_block(false);
+        let n_t = neg.new_block(false);
+        let n_exit = neg.new_block(false);
+        let n_tramp = neg.new_block(false);
+
+        neg.begin_block(n_entry);
+        neg.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X0), target: n_tramp, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        neg.push_inst(MOp::B { target: n_exit }, MInstFlags::TERMINATOR);
+        neg.end_block(n_entry);
+
+        neg.begin_block(n_t);
+        neg.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        neg.end_block(n_t);
+
+        neg.begin_block(n_exit);
+        neg.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        neg.end_block(n_exit);
+
+        neg.begin_block(n_tramp);
+        neg.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X3), src: MReg::p(PReg::X1), wide: true },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X4), src: MReg::p(PReg::X2), wide: true },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X5),
+                rn: MReg::p(PReg::X1),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X6), imm: 2, wide: true },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X7), imm: 3, wide: true },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X8), imm: 4, wide: true },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(
+            MOp::MovImm { dst: MReg::p(PReg::X9), imm: 5, wide: true },
+            MInstFlags::NONE,
+        );
+        neg.push_inst(MOp::B { target: n_t }, MInstFlags::TERMINATOR);
+        neg.end_block(n_tramp);
+
+        neg.rebuild_cfg(alloc);
+        assert_eq!(mverify(&neg), Ok(()));
+        let _ = optimize_mfunc(&mut neg, alloc);
+        assert_eq!(mverify(&neg), Ok(()));
+        assert_eq!(
+            neg.block_order.as_slice(),
+            &[n_entry, n_t, n_exit, n_tramp],
+            "non-copy 8-inst post-Ret block must not be hoisted by Pass 4g"
+        );
+        let neg_tramp_r = neg.block_inst_range(n_tramp);
+        assert_eq!(neg_tramp_r.len(), 8);
+        assert_eq!(neg.ops[neg_tramp_r.end - 1], MOp::B { target: n_t });
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let pos_bytes = words_to_bytes(&pos_enc.words, alloc);
+            let pos_exec =
+                blaze_inproc::exec::Executable::new(&pos_bytes, 0).expect("exec map must succeed");
+            // SAFETY: Valid AAPCS64 leaf function touching only caller-saved `X0..=X7`.
+            let f_pos: extern "C" fn(u64, u64, u64) -> u64 = unsafe { pos_exec.as_fn() };
+            assert_eq!(f_pos(0, 5, 7), 72);
+            assert_eq!(f_pos(1, 5, 7), 72);
+            assert_eq!(f_pos(2, 5, 7), 99);
+
+            let dist_bytes = words_to_bytes(&dist_enc.words, alloc);
+            let dist_exec =
+                blaze_inproc::exec::Executable::new(&dist_bytes, 0).expect("exec map must succeed");
+            // SAFETY: Valid AAPCS64 leaf function touching only caller-saved `X0..=X9`.
+            let f_dist: extern "C" fn(u64, u64, u64) -> u64 = unsafe { dist_exec.as_fn() };
+            assert_eq!(f_dist(0, 10, 20), 45);
+            assert_eq!(f_dist(1, 10, 20), 42);
+        }
+        let _ = (pos_enc, dist_enc);
+    }
+
+    #[test]
+    fn mopt_v4w3_cmp_zero_ls_hi_and_sub_cbz_fusion() {
+        let alloc = test_alloc();
+        let mut f = new_post_ra();
+        f.ret_live_gprs = 1;
+        let b0 = f.new_block(false);
+        let b1 = f.new_block(false);
+        let b_zero = f.new_block(false);
+        let b_nz = f.new_block(false);
+
+        f.begin_block(b0);
+        f.push_inst(
+            MOp::SubReg {
+                dst: MReg::p(PReg::X2),
+                rn: MReg::p(PReg::X0),
+                rm: MReg::p(PReg::X1),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        let cmp_i = f.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X2), imm12: 0, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        f.set_vflag_def(cmp_i, 0);
+        let br_i = f.push_inst(
+            MOp::BCond { cond: MCond::Ls, target: b_zero },
+            MInstFlags::TERMINATOR,
+        );
+        f.set_vflag_use(br_i, 0);
+        f.end_block(b0);
+
+        f.begin_block(b1);
+        let cmp2_i = f.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X2), imm12: 0, shift12: false, wide: true },
+            MInstFlags::NONE,
+        );
+        f.set_vflag_def(cmp2_i, 1);
+        let br2_i = f.push_inst(
+            MOp::BCond { cond: MCond::Hi, target: b_nz },
+            MInstFlags::TERMINATOR,
+        );
+        f.set_vflag_use(br2_i, 1);
+        f.push_inst(MOp::B { target: b_zero }, MInstFlags::TERMINATOR);
+        f.end_block(b1);
+
+        f.begin_block(b_zero);
+        f.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 100, wide: true }, MInstFlags::NONE);
+        f.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        f.end_block(b_zero);
+
+        f.begin_block(b_nz);
+        f.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X2), wide: true },
+            MInstFlags::NONE,
+        );
+        f.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        f.end_block(b_nz);
+
+        f.rebuild_cfg(alloc);
+        assert_eq!(mverify(&f), Ok(()));
+        let _ = optimize_mfunc(&mut f, alloc);
+        assert_eq!(mverify(&f), Ok(()));
+
+        // `sub + cmp #0 + b.ls` in `b0` fuses all the way to `subs + b.eq` via Pass 1j -> Pass 5!
+        let r0 = f.block_inst_range(b0);
+        assert!(
+            f.ops[r0.clone()]
+                .iter()
+                .any(|op| matches!(*op, MOp::SubReg { sets_flags: true, .. })),
+            "expected sub + cmp #0 + b.ls to fuse into subs + b.eq; ops={:?}",
+            &f.ops[r0]
+        );
+        assert!(
+            !f.ops.iter().any(|op| matches!(*op, MOp::CmpImm { .. })),
+            "expected both cmp #0 to be eliminated; ops={:?}",
+            f.ops.as_slice()
+        );
+
+        let enc = mencode(&f, alloc).expect("mencode must succeed");
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let bytes = words_to_bytes(&enc.words, alloc);
+            let exec = blaze_inproc::exec::Executable::new(&bytes, 0).expect("exec map");
+            // SAFETY: Valid AAPCS64 leaf function touching only X0..X2.
+            let func: extern "C" fn(u64, u64) -> u64 = unsafe { exec.as_fn() };
+            assert_eq!(func(42, 42), 100);
+            assert_eq!(func(50, 42), 8);
+            assert_eq!(func(0, 1), u64::MAX);
+        }
+        let _ = enc;
+    }
+
+    #[test]
+    fn mopt_v4w3_const_csel_const_copy_backward_fold_and_uxtb_str() {
+        let alloc = test_alloc();
+        // 1. `mov w4, #1; cmp w0, #0; csel w3, w4, w1, ne` -> `csinc w3, w1, wzr, eq` + dead mov deleted.
+        // 2. `mov x2, #1; mov x16, x2; mov x2, x1; mov x0, x16` -> `mov x2, x1; mov x0, #1`.
+        let mut f = new_post_ra();
+        f.ret_live_gprs = 1;
+        let b0 = f.new_block(false);
+        f.begin_block(b0);
+        f.push_inst(MOp::MovImm { dst: MReg::p(PReg::X4), imm: 1, wide: false }, MInstFlags::NONE);
+        let ci = f.push_inst(
+            MOp::CmpImm { rn: MReg::p(PReg::X0), imm12: 0, shift12: false, wide: false },
+            MInstFlags::NONE,
+        );
+        f.set_vflag_def(ci, 0);
+        let si = f.push_inst(
+            MOp::Csel {
+                dst: MReg::p(PReg::X3),
+                rn: MReg::p(PReg::X4),
+                rm: MReg::p(PReg::X1),
+                cond: MCond::Ne,
+                wide: false,
+            },
+            MInstFlags::NONE,
+        );
+        f.set_vflag_use(si, 0);
+        f.push_inst(MOp::MovImm { dst: MReg::p(PReg::X2), imm: 1, wide: true }, MInstFlags::NONE);
+        f.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X16), src: MReg::p(PReg::X2), wide: true },
+            MInstFlags::NONE,
+        );
+        f.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X2), src: MReg::p(PReg::X1), wide: true },
+            MInstFlags::NONE,
+        );
+        f.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X16), wide: true },
+            MInstFlags::NONE,
+        );
+        f.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X5),
+                rn: MReg::p(PReg::X0),
+                rm: MReg::p(PReg::X3),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        f.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X5), wide: true },
+            MInstFlags::NONE,
+        );
+        f.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        f.end_block(b0);
+
+        f.rebuild_cfg(alloc);
+        assert_eq!(mverify(&f), Ok(()));
+        let _ = optimize_mfunc(&mut f, alloc);
+        assert_eq!(mverify(&f), Ok(()));
+
+        let r0 = f.block_inst_range(b0);
+        assert!(
+            f.ops[r0.clone()].iter().any(|op| matches!(
+                *op,
+                MOp::Csinc { dst, rn, rm: MReg::XZR, cond: MCond::Eq, wide: false }
+                    if dst == MReg::p(PReg::X3) && rn == MReg::p(PReg::X1)
+            )),
+            "expected MovImm(1)+Csel -> Csinc; ops={:?}",
+            &f.ops[r0]
+        );
+        assert!(
+            !f.ops[r0.clone()].iter().any(|op| matches!(
+                *op,
+                MOp::Mov { dst, .. } if dst == MReg::p(PReg::X16)
+            )),
+            "expected X16 const-copy chain eliminated; ops={:?}",
+            &f.ops[r0]
+        );
+        assert!(
+            f.ops[r0.clone()].iter().any(|op| matches!(
+                *op,
+                MOp::AddReg { dst, .. } if dst == MReg::p(PReg::X0)
+            )),
+            "expected backward copy fold add x5 + mov x0, x5 -> add x0; ops={:?}",
+            &f.ops[r0]
+        );
+
+        // 3. `uxtb w6, w6; strb w6, [x0]; add x6, x0, #1; mov x0, x6; ret` -> `strb w6, [x0], #1; ret`!
+        let mut g = new_post_ra();
+        g.ret_live_gprs = 1;
+        let gb0 = g.new_block(false);
+        g.begin_block(gb0);
+        g.push_inst(
+            MOp::Ubfm {
+                dst: MReg::p(PReg::X6),
+                rn: MReg::p(PReg::X6),
+                immr: 0,
+                imms: 7,
+                wide: false,
+            },
+            MInstFlags::NONE,
+        );
+        g.push_inst(
+            MOp::Str {
+                src: MReg::p(PReg::X6),
+                addr: AddrMode::BaseOff { base: MReg::p(PReg::X0), off: 0 },
+                size: MemSize::B8,
+            },
+            MInstFlags::NONE,
+        );
+        g.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X6),
+                rn: MReg::p(PReg::X0),
+                imm12: 1,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        g.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::p(PReg::X6), wide: true },
+            MInstFlags::NONE,
+        );
+        g.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        g.end_block(gb0);
+        g.rebuild_cfg(alloc);
+        assert_eq!(mverify(&g), Ok(()));
+        let _ = optimize_mfunc(&mut g, alloc);
+        assert_eq!(mverify(&g), Ok(()));
+        let gr0 = g.block_inst_range(gb0);
+        assert_eq!(
+            &g.ops[gr0],
+            &[
+                MOp::Str {
+                    src: MReg::p(PReg::X6),
+                    addr: AddrMode::PostIdx { base: MReg::p(PReg::X0), off: 1 },
+                    size: MemSize::B8,
+                },
+                MOp::Ret,
+            ],
+            "expected uxtb + strb + add + mov to collapse into single post-idx strb"
+        );
+    }
+
+    #[test]
+    fn mopt_v4w3_cross_block_mov_imm_and_post_ret_trampoline_eviction() {
+        let alloc = test_alloc();
+        // Part A: Cross-block known-`MovImm` elision (single-pred + diamond intersection + negative).
+        let mut f = new_post_ra();
+        f.ret_live_gprs = 1;
+        let b0 = f.new_block(false);
+        let b1 = f.new_block(false);
+        let b_mid = f.new_block(false);
+
+        f.begin_block(b0);
+        f.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 64, wide: true }, MInstFlags::NONE);
+        f.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X1), target: b_mid, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        f.end_block(b0);
+
+        f.begin_block(b1);
+        // Redundant: `x0 == 64` already guaranteed from `b0`!
+        f.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 64, wide: true }, MInstFlags::NONE);
+        f.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        f.end_block(b1);
+
+        f.begin_block(b_mid);
+        // `x0 == 64` is redundant, `x2 == 99` was never set in `b0` and must stay!
+        f.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 64, wide: true }, MInstFlags::NONE);
+        f.push_inst(MOp::MovImm { dst: MReg::p(PReg::X2), imm: 99, wide: true }, MInstFlags::NONE);
+        f.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                rm: MReg::p(PReg::X2),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        f.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        f.end_block(b_mid);
+
+        f.rebuild_cfg(alloc);
+        assert_eq!(mverify(&f), Ok(()));
+        let _ = optimize_mfunc(&mut f, alloc);
+        assert_eq!(mverify(&f), Ok(()));
+
+        let r1 = f.block_inst_range(b1);
+        assert_eq!(&f.ops[r1], &[MOp::Ret], "redundant x0=#64 in b1 must be elided");
+        let rm = f.block_inst_range(b_mid);
+        assert!(
+            !f.ops[rm.clone()].iter().any(|op| matches!(
+                *op,
+                MOp::MovImm { dst, imm: 64, .. } if dst == MReg::p(PReg::X0)
+            )),
+            "redundant x0=#64 in b_mid must be elided; ops={:?}",
+            &f.ops[rm]
+        );
+        assert!(
+            f.ops[rm.clone()].iter().any(|op| matches!(
+                *op,
+                MOp::MovImm { dst, imm: 99, .. } if dst == MReg::p(PReg::X2)
+            )),
+            "non-redundant x2=#99 in b_mid MUST NOT be elided; ops={:?}",
+            &f.ops[rm]
+        );
+
+        // Part B: Pass 4g Case 2 evicts post-Ret copy trampoline even when `T` has a fallthrough pred!
+        let mut g = new_post_ra();
+        g.ret_live_gprs = 1;
+        let ge = g.new_block(false);
+        let g_prev = g.new_block(false);
+        let g_t = g.new_block(false);
+        let g_other = g.new_block(false);
+        let g_ret = g.new_block(false);
+        let g_tramp = g.new_block(false);
+
+        g.begin_block(ge);
+        g.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X0), target: g_tramp, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        g.push_inst(MOp::B { target: g_prev }, MInstFlags::TERMINATOR);
+        g.end_block(ge);
+
+        // `g_prev` falls through into `g_t` (no uncond terminator before `g_t`!).
+        g.begin_block(g_prev);
+        g.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X1),
+                rn: MReg::p(PReg::X1),
+                imm12: 5,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        g.end_block(g_prev);
+
+        g.begin_block(g_t);
+        g.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X1),
+                rm: MReg::p(PReg::X2),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        g.push_inst(MOp::B { target: g_ret }, MInstFlags::TERMINATOR);
+        g.end_block(g_t);
+
+        // Separate block between `g_t` and `g_ret` so `g_t`'s `B g_ret` stays an uncond terminator
+        // providing a hot pre-`Ret` insertion boundary.
+        g.begin_block(g_other);
+        g.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 999, wide: true }, MInstFlags::NONE);
+        g.push_inst(MOp::B { target: g_ret }, MInstFlags::TERMINATOR);
+        g.end_block(g_other);
+
+        g.begin_block(g_ret);
+        g.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        g.end_block(g_ret);
+
+        // Post-Ret copy trampoline targeting fallthrough-receiving `g_t`.
+        g.begin_block(g_tramp);
+        g.push_inst(MOp::MovImm { dst: MReg::p(PReg::X1), imm: 10, wide: true }, MInstFlags::NONE);
+        g.push_inst(MOp::B { target: g_t }, MInstFlags::TERMINATOR);
+        g.end_block(g_tramp);
+
+        g.rebuild_cfg(alloc);
+        assert_eq!(mverify(&g), Ok(()));
+        let _ = optimize_mfunc(&mut g, alloc);
+        assert_eq!(mverify(&g), Ok(()));
+
+        let ret_pos = g.block_order.iter().position(|&b| b == g_ret).expect("g_ret present");
+        let tramp_pos = g.block_order.iter().position(|&b| b == g_tramp).expect("g_tramp present");
+        assert!(
+            tramp_pos < ret_pos,
+            "Pass 4g must evict post-Ret copy trampoline before g_ret; order={:?}",
+            g.block_order.as_slice()
+        );
+        let g_enc = mencode(&g, alloc).expect("mencode g");
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let bytes = words_to_bytes(&g_enc.words, alloc);
+            let exec = blaze_inproc::exec::Executable::new(&bytes, 0).expect("exec map");
+            // SAFETY: Valid AAPCS64 leaf function touching only X0..X2.
+            let gf: extern "C" fn(u64, u64, u64) -> u64 = unsafe { exec.as_fn() };
+            assert_eq!(gf(0, 100, 7), 17);
+            assert_eq!(gf(1, 100, 7), 112);
+        }
+        let _ = g_enc;
+    }
+
+    #[test]
+    fn mopt_v4w4_fuses_uxt_into_addsub_and_narrow_lsr_into_wide_add() {
+        let alloc = test_alloc();
+        // 1. Post-RA `uxtb w6, w1; add x0, x0, x6; ret` -> `add x0, x0, w1, uxtb; ret`!
+        let mut f = new_post_ra();
+        f.ret_live_gprs = 1;
+        let b0 = f.new_block(false);
+        f.begin_block(b0);
+        f.push_inst(
+            MOp::Ubfm {
+                dst: MReg::p(PReg::X6),
+                rn: MReg::p(PReg::X1),
+                immr: 0,
+                imms: 7,
+                wide: false,
+            },
+            MInstFlags::NONE,
+        );
+        f.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                rm: MReg::p(PReg::X6),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        f.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        f.end_block(b0);
+        f.rebuild_cfg(alloc);
+        assert_eq!(mverify(&f), Ok(()));
+        let _ = optimize_mfunc(&mut f, alloc);
+        assert_eq!(mverify(&f), Ok(()));
+        let r0 = f.block_inst_range(b0);
+        assert_eq!(
+            &f.ops[r0],
+            &[
+                MOp::AddExt {
+                    dst: MReg::p(PReg::X0),
+                    rn: MReg::p(PReg::X0),
+                    rm: MReg::p(PReg::X1),
+                    ext: super::MExt::Uxtb,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MOp::Ret,
+            ]
+        );
+        let enc = mencode(&f, alloc).expect("mencode AddExt");
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let bytes = words_to_bytes(&enc.words, alloc);
+            let exec = blaze_inproc::exec::Executable::new(&bytes, 0).expect("exec map");
+            // SAFETY: Valid AAPCS64 leaf function touching only X0..X1.
+            let ff: extern "C" fn(u64, u64) -> u64 = unsafe { exec.as_fn() };
+            assert_eq!(ff(1000, 0x1234_5678_9abc_de05), 1005);
+            assert_eq!(ff(1000, 0xffff_ffff_ffff_ffff), 1255);
+        }
+        let _ = enc;
+
+        // 2. SSA: 32-bit `add w_sum, w_a, w_b` (zero-upper-32) -> `lsr w_shr, w_sum, #3` ->
+        //    64-bit `add x_out, x_base, x_shr` fuses to `add x_out, x_base, x_sum, lsr #3`!
+        let mut s = new_ssa();
+        let v_base = s.alloc_vreg(VRegClass::Gpr64);
+        let v_a = s.alloc_vreg(VRegClass::Gpr64);
+        let v_b = s.alloc_vreg(VRegClass::Gpr64);
+        let v_sum = s.alloc_vreg(VRegClass::Gpr64);
+        let v_shr = s.alloc_vreg(VRegClass::Gpr64);
+        let v_out = s.alloc_vreg(VRegClass::Gpr64);
+        let sb0 = s.new_block(false);
+        s.begin_block(sb0);
+        s.push_inst(MOp::Mov { dst: MReg::V(v_base), src: MReg::p(PReg::X0), wide: true }, MInstFlags::NONE);
+        s.push_inst(MOp::Mov { dst: MReg::V(v_a), src: MReg::p(PReg::X1), wide: true }, MInstFlags::NONE);
+        s.push_inst(MOp::Mov { dst: MReg::V(v_b), src: MReg::p(PReg::X2), wide: true }, MInstFlags::NONE);
+        s.push_inst(
+            MOp::AddReg {
+                dst: MReg::V(v_sum),
+                rn: MReg::V(v_a),
+                rm: MReg::V(v_b),
+                shift: None,
+                wide: false,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        s.push_inst(
+            MOp::Ubfm {
+                dst: MReg::V(v_shr),
+                rn: MReg::V(v_sum),
+                immr: 3,
+                imms: 31,
+                wide: false,
+            },
+            MInstFlags::NONE,
+        );
+        s.push_inst(
+            MOp::AddReg {
+                dst: MReg::V(v_out),
+                rn: MReg::V(v_base),
+                rm: MReg::V(v_shr),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        s.push_inst(MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_out), wide: true }, MInstFlags::NONE);
+        s.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        s.end_block(sb0);
+        s.rebuild_cfg(alloc);
+        assert_eq!(mverify(&s), Ok(()));
+        let _ = optimize_mfunc(&mut s, alloc);
+        assert_eq!(mverify(&s), Ok(()));
+        assert!(
+            !s.ops.iter().any(|op| matches!(*op, MOp::Ubfm { .. })),
+            "expected narrow LSR of zero-upper-32 VReg to fuse into 64-bit AddReg; ops={:?}",
+            s.ops.as_slice()
+        );
+        assert!(
+            s.ops.iter().any(|op| matches!(
+                *op,
+                MOp::AddReg { shift: Some(MShift::Lsr(3)), wide: true, .. }
+            )),
+            "expected 64-bit AddReg with Lsr(3); ops={:?}",
+            s.ops.as_slice()
+        );
+    }
+
+    #[test]
+    fn mopt_v4w5_global_wide_mov_ssa_eliminates_cross_block_zext_copies() {
+        let alloc = test_alloc();
+        // `b0`: 32-bit `add w_v0, w_x, w_y` (zero-upper-32!) -> `mov w_v1, w_v0` (u32 -> u64 zext)
+        //       -> branch to `b1` where `v1` is used in 64-bit `add`.
+        // `peephole_known_zero_upper32` upgrades `mov w_v1, w_v0` -> `mov x_v1, x_v0`, and
+        // `mopt_global_wide_mov_ssa` eliminates the cross-block copy completely!
+        let mut s = new_ssa();
+        let v_x = s.alloc_vreg(VRegClass::Gpr64);
+        let v_y = s.alloc_vreg(VRegClass::Gpr64);
+        let v_sum = s.alloc_vreg(VRegClass::Gpr64);
+        let v_wide = s.alloc_vreg(VRegClass::Gpr64);
+        let v_res = s.alloc_vreg(VRegClass::Gpr64);
+
+        let b0 = s.new_block(false);
+        let b1 = s.new_block(false);
+        let b2 = s.new_block(false);
+
+        s.begin_block(b0);
+        s.push_inst(MOp::Mov { dst: MReg::V(v_x), src: MReg::p(PReg::X0), wide: true }, MInstFlags::NONE);
+        s.push_inst(MOp::Mov { dst: MReg::V(v_y), src: MReg::p(PReg::X1), wide: true }, MInstFlags::NONE);
+        s.push_inst(
+            MOp::AddReg {
+                dst: MReg::V(v_sum),
+                rn: MReg::V(v_x),
+                rm: MReg::V(v_y),
+                shift: None,
+                wide: false,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        s.push_inst(MOp::Mov { dst: MReg::V(v_wide), src: MReg::V(v_sum), wide: false }, MInstFlags::NONE);
+        s.push_inst(MOp::Cbz { rt: MReg::V(v_x), target: b2, wide: true }, MInstFlags::TERMINATOR);
+        s.push_inst(MOp::B { target: b1 }, MInstFlags::TERMINATOR);
+        s.end_block(b0);
+
+        s.begin_block(b1);
+        s.push_inst(
+            MOp::AddReg {
+                dst: MReg::V(v_res),
+                rn: MReg::V(v_wide),
+                rm: MReg::V(v_y),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        s.push_inst(MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_res), wide: true }, MInstFlags::NONE);
+        s.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        s.end_block(b1);
+
+        s.begin_block(b2);
+        s.push_inst(MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_wide), wide: true }, MInstFlags::NONE);
+        s.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        s.end_block(b2);
+
+        s.rebuild_cfg(alloc);
+        assert_eq!(mverify(&s), Ok(()));
+        let _ = optimize_mfunc(&mut s, alloc);
+        assert_eq!(mverify(&s), Ok(()));
+
+        // Cross-block copy `v_wide = mov v_sum` must be completely eliminated across b0, b1, b2!
+        assert!(
+            !s.ops.iter().any(|op| matches!(
+                *op,
+                MOp::Mov { dst, .. } if dst == MReg::V(v_wide)
+            )),
+            "expected cross-block v_wide copy eliminated; ops={:?}",
+            s.ops.as_slice()
+        );
+        assert!(
+            s.ops.iter().any(|op| matches!(
+                *op,
+                MOp::AddReg { dst, rn, .. } if dst == MReg::V(v_res) && rn == MReg::V(v_sum)
+            )),
+            "expected b1 to read v_sum directly; ops={:?}",
+            s.ops.as_slice()
+        );
     }
 }

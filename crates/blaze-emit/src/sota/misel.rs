@@ -428,6 +428,39 @@ const fn splat_kind_for_ty(ty: Ty) -> Option<SplatKind> {
     }
 }
 
+/// Maps a 128-bit vector LIR ALU op and vector result type to its typed NEON `(VecAluOp, elem_size)`
+/// encoding (`elem_size`: `0=B8, 1=H16, 2=S32/F32, 3=D64/F64`), or `None` if unsupported.
+#[inline]
+fn vec128_alu_op(op: Op, res_ty: Ty) -> Option<(VecAluOp, u8)> {
+    match splat_kind_for_ty(res_ty)? {
+        SplatKind::Int { elem_size } => match op {
+            Op::Add => Some((VecAluOp::Add, elem_size)),
+            Op::Sub => Some((VecAluOp::Sub, elem_size)),
+            Op::UaddSat => Some((VecAluOp::Uqadd, elem_size)),
+            Op::UsubSat => Some((VecAluOp::Uqsub, elem_size)),
+            Op::SaddSat => Some((VecAluOp::Sqadd, elem_size)),
+            Op::SsubSat => Some((VecAluOp::Sqsub, elem_size)),
+            Op::Mul if elem_size <= 2 => Some((VecAluOp::Mul, elem_size)),
+            Op::Smin if elem_size <= 2 => Some((VecAluOp::Smin, elem_size)),
+            Op::Smax if elem_size <= 2 => Some((VecAluOp::Smax, elem_size)),
+            Op::Umin if elem_size <= 2 => Some((VecAluOp::Umin, elem_size)),
+            Op::Umax if elem_size <= 2 => Some((VecAluOp::Umax, elem_size)),
+            Op::And => Some((VecAluOp::And, 0)),
+            Op::Or => Some((VecAluOp::Orr, 0)),
+            Op::Xor => Some((VecAluOp::Eor, 0)),
+            Op::Not => Some((VecAluOp::Not, 0)),
+            _ => None,
+        },
+        SplatKind::Float { elem_size } => match op {
+            Op::Fadd => Some((VecAluOp::Fadd, elem_size)),
+            Op::Fsub => Some((VecAluOp::Fsub, elem_size)),
+            Op::Fmul => Some((VecAluOp::Fmul, elem_size)),
+            _ => None,
+        },
+        SplatKind::Identity128 => None,
+    }
+}
+
 /// True when two SSA `VRegClass`es can safely share one zero-instruction aliased `VReg`
 /// (`Gpr32`/`Gpr64` share the GPR bank and 64-bit spill slots; FP/Vec classes match strictly).
 #[inline]
@@ -631,6 +664,7 @@ fn refuse(inst: Option<usize>, what: &'static str) -> TierError {
 }
 
 fn check_sig_c_abi(
+    view: &View<'_>,
     sig_rec: SigRec,
     params: &[blaze_lir::func::ParamRec],
     rets: &[blaze_lir::func::ParamRec],
@@ -647,6 +681,7 @@ fn check_sig_c_abi(
     }
     let mut walk = AbiWalk::new(os, internal_fast);
     let mut has_sret = false;
+    let mut byval_bytes: u32 = 0;
     for p in params {
         let pkind = ParamKind::from_byte(p.kind);
         let ty = Ty(p.ty);
@@ -655,8 +690,30 @@ fn check_sig_c_abi(
                 return Err(refuse(inst, "invalid sret parameter"));
             }
             has_sret = true;
+        } else if pkind == Some(ParamKind::Byval) {
+            if internal_fast {
+                return Err(refuse(inst, "InternalFast with byval parameter"));
+            }
+            if ty != Ty::PTR {
+                return Err(refuse(inst, "non-ptr byval parameter"));
+            }
+            let Some(facts) = view.facts(p) else {
+                return Err(refuse(inst, "byval without size/align"));
+            };
+            if facts.align > 4 {
+                return Err(refuse(inst, "byval align > 16"));
+            }
+            let align = 1u32 << u32::from(facts.align);
+            let at = align_up_u32(byval_bytes, align).ok_or(TierError::TooLarge {
+                tier: TIER,
+                what: "byval argument area",
+            })?;
+            byval_bytes = at.checked_add(facts.size).ok_or(TierError::TooLarge {
+                tier: TIER,
+                what: "byval argument area",
+            })?;
         } else if pkind != Some(ParamKind::Value) {
-            return Err(refuse(inst, "non-value parameter kind (byval)"));
+            return Err(refuse(inst, "unsupported parameter kind"));
         } else if !is_supported_scalar(ty) {
             return Err(refuse(inst, "unsupported parameter type"));
         }
@@ -664,7 +721,9 @@ fn check_sig_c_abi(
             return Err(refuse(inst, "stack parameter overflow"));
         }
     }
-    if walk.stack.aligned16().is_none_or(|b| b >= FRAME_LIMIT / 2) {
+    if walk.stack.aligned16().is_none_or(|b| b >= FRAME_LIMIT / 2)
+        || align_up_u32(byval_bytes, 16).is_none_or(|b| b >= FRAME_LIMIT / 2)
+    {
         return Err(TierError::TooLarge {
             tier: TIER,
             what: "stacked call argument area",
@@ -719,6 +778,7 @@ pub(crate) fn check_misel_subset(
     };
     let fn_sig = view.sig(SigId(view.head.sig));
     check_sig_c_abi(
+        view,
         fn_sig_rec,
         fn_sig.params,
         fn_sig.rets,
@@ -767,13 +827,17 @@ pub(crate) fn check_misel_subset(
                 }
             }
             Op::Iconst => {
-                if !is_scalar_int_or_ptr(res_ty) || res_ty == Ty::PTR {
+                if (!is_scalar_int_or_ptr(res_ty) || res_ty == Ty::PTR) && res_ty != Ty::I128 {
                     return Err(refuse(Some(inst), "unsupported iconst type"));
                 }
             }
             Op::IconstWide => {
-                if res_ty != Ty::I64 {
-                    return Err(refuse(Some(inst), "unsupported iconst_wide type (e.g. i128)"));
+                if res_ty == Ty::I128 {
+                    if o.constant().len() != 4 {
+                        return Err(refuse(Some(inst), "non-4-word i128 iconst_wide"));
+                    }
+                } else if res_ty != Ty::I64 {
+                    return Err(refuse(Some(inst), "unsupported iconst_wide type"));
                 }
             }
             Op::Fconst => {
@@ -806,12 +870,6 @@ pub(crate) fn check_misel_subset(
             Op::Add
             | Op::Sub
             | Op::Mul
-            | Op::Umulhi
-            | Op::Smulhi
-            | Op::Udiv
-            | Op::Sdiv
-            | Op::Urem
-            | Op::Srem
             | Op::Neg
             | Op::And
             | Op::Or
@@ -819,7 +877,20 @@ pub(crate) fn check_misel_subset(
             | Op::Not
             | Op::Shl
             | Op::Lshr
-            | Op::Ashr
+            | Op::Ashr => {
+                if (!is_scalar_int_or_ptr(res_ty) || res_ty == Ty::PTR)
+                    && res_ty != Ty::I128
+                    && vec128_alu_op(op, res_ty).is_none()
+                {
+                    return Err(refuse(Some(inst), "integer op on unsupported type"));
+                }
+            }
+            Op::Umulhi
+            | Op::Smulhi
+            | Op::Udiv
+            | Op::Sdiv
+            | Op::Urem
+            | Op::Srem
             | Op::Rotl
             | Op::Rotr
             | Op::Clz
@@ -835,7 +906,9 @@ pub(crate) fn check_misel_subset(
             | Op::UsubSat
             | Op::SaddSat
             | Op::SsubSat => {
-                if !is_scalar_int_or_ptr(res_ty) || res_ty == Ty::PTR {
+                if (!is_scalar_int_or_ptr(res_ty) || res_ty == Ty::PTR)
+                    && vec128_alu_op(op, res_ty).is_none()
+                {
                     return Err(refuse(Some(inst), "integer op on unsupported type"));
                 }
             }
@@ -1001,14 +1074,15 @@ pub(crate) fn check_misel_subset(
             Op::Switch => {
                 let scrut = o.value();
                 let scrut_ty = view.ty(scrut);
-                if !is_scalar_int_or_ptr(scrut_ty) || scrut_ty == Ty::PTR {
+                if (!is_scalar_int_or_ptr(scrut_ty) || scrut_ty == Ty::PTR) && scrut_ty != Ty::I128 {
                     return Err(refuse(Some(inst), "switch on unsupported scrutinee type"));
                 }
             }
             Op::Icmp => {
                 let _cond = o.int_cond();
                 let a = o.value();
-                if res_ty != Ty::I1 || !is_scalar_int_or_ptr(view.ty(a)) {
+                let a_ty = view.ty(a);
+                if res_ty != Ty::I1 || (!is_scalar_int_or_ptr(a_ty) && a_ty != Ty::I128) {
                     return Err(refuse(Some(inst), "icmp on unsupported type"));
                 }
             }
@@ -1034,11 +1108,9 @@ pub(crate) fn check_misel_subset(
             Op::Zext | Op::Sext | Op::Trunc => {
                 let a = o.value();
                 let src_ty = view.ty(a);
-                if !is_scalar_int_or_ptr(src_ty)
-                    || src_ty == Ty::PTR
-                    || !is_scalar_int_or_ptr(res_ty)
-                    || res_ty == Ty::PTR
-                {
+                let src_ok = (is_scalar_int_or_ptr(src_ty) && src_ty != Ty::PTR) || src_ty == Ty::I128;
+                let res_ok = (is_scalar_int_or_ptr(res_ty) && res_ty != Ty::PTR) || res_ty == Ty::I128;
+                if !src_ok || !res_ok {
                     return Err(refuse(Some(inst), "int cast on unsupported type"));
                 }
             }
@@ -1120,7 +1192,7 @@ pub(crate) fn check_misel_subset(
             | Op::Fabs
             | Op::Fma
             | Op::Fmuladd => {
-                if !is_scalar_fp(res_ty) {
+                if !is_scalar_fp(res_ty) && vec128_alu_op(op, res_ty).is_none() {
                     return Err(refuse(Some(inst), "float op on unsupported type"));
                 }
             }
@@ -1187,6 +1259,7 @@ pub(crate) fn check_misel_subset(
                 };
                 let sig = view.sig(sig_id);
                 check_sig_c_abi(
+                    view,
                     sig_rec,
                     sig.params,
                     sig.rets,
@@ -1211,6 +1284,7 @@ pub(crate) fn check_misel_subset(
                 };
                 let sig = view.sig(sig_id);
                 check_sig_c_abi(
+                    view,
                     sig_rec,
                     sig.params,
                     sig.rets,
@@ -1252,6 +1326,7 @@ pub(crate) fn check_misel_subset(
                 };
                 let sig = view.sig(sig_id);
                 check_sig_c_abi(
+                    view,
                     sig_rec,
                     sig.params,
                     sig.rets,
@@ -1281,6 +1356,7 @@ pub(crate) fn check_misel_subset(
                 };
                 let sig = view.sig(sig_id);
                 check_sig_c_abi(
+                    view,
                     sig_rec,
                     sig.params,
                     sig.rets,
@@ -1849,8 +1925,10 @@ struct Selector<'a, 'v> {
     is_cleanup_block: Vec<bool, Alloc<'a>>,
     /// Per LIR instruction: owning LIR block index.
     inst_block: Vec<u32, Alloc<'a>>,
-    /// Per LIR instruction: constant integer/null value if statically known.
+    /// Per LIR instruction: constant integer/null value if statically known (<= 64-bit).
     const_u64: Vec<Option<u64>, Alloc<'a>>,
+    /// Per LIR instruction: constant `Ty::I128` value `(lo, hi)` if statically known.
+    const_i128: Vec<Option<(u64, u64)>, Alloc<'a>>,
     /// Per LIR instruction: constant float bits if `Fconst` / `FconstWide`.
     const_fp_bits: Vec<Option<u64>, Alloc<'a>>,
     /// Per LIR instruction: total uses across the whole function.
@@ -1863,6 +1941,11 @@ struct Selector<'a, 'v> {
     pattern: Vec<SelPattern, Alloc<'a>>,
     /// Per LIR instruction: assigned SSA `VReg` (`NONE_U32` if unallocated / void).
     val_vreg: Vec<u32, Alloc<'a>>,
+    /// Per LIR `Ty::I128` scalar-pair instruction: `(lo_vreg, hi_vreg)` (`Gpr64` pair).
+    i128_pair: Vec<(u32, u32), Alloc<'a>>,
+    /// Order-independent static classification: true iff a `Ty::I128` instruction is represented
+    /// as a `Vec128` (`Q128`) VReg (`Load`/`Bitcast`/`Select`/`Freeze` of Q128) rather than `i128_pair`.
+    i128_is_q128: Vec<bool, Alloc<'a>>,
     /// Per LIR overflow instruction: `(val_vreg, flag_vreg)` for zero-cost `Op::Project`.
     ovf_pair: Vec<(u32, u32), Alloc<'a>>,
     /// Per LIR multi-return call/invoke instruction: base offset into `call_ret_vregs` (`NONE_U32` if unset).
@@ -1871,6 +1954,8 @@ struct Selector<'a, 'v> {
     call_ret_vregs: Vec<u32, Alloc<'a>>,
     /// Per LIR stack slot: byte offset from `SP` (final before `mra`).
     slot_off: Vec<u32, Alloc<'a>>,
+    /// Base `SP`-relative byte offset of the outgoing `ParamKind::Byval` copy area.
+    byval_base_off: u32,
     /// Currently open `MBlock` during lowering.
     cur_blk: MBlock,
     /// Currently lowering LIR block index.
@@ -2444,6 +2529,98 @@ impl<'a, 'v> Selector<'a, 'v> {
     ) -> (u32, MCond, Option<LiveIntCmp>) {
         let mut c = cond;
         let op_ty = self.view.ty(a_val);
+        if op_ty == Ty::I128 {
+            let (a_lo, a_hi) = self.get_i128_pair(a_val, true);
+            let (b_lo, b_hi) = self.get_i128_pair(b_val, true);
+            if matches!(c, IntCond::Eq | IntCond::Ne) {
+                let t0 = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::LogicalReg {
+                        dst: MReg::V(t0),
+                        rn: a_lo,
+                        rm: b_lo,
+                        shift: None,
+                        invert_rm: false,
+                        kind: LogicalKind::Eor,
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                let t1 = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::LogicalReg {
+                        dst: MReg::V(t1),
+                        rn: a_hi,
+                        rm: b_hi,
+                        shift: None,
+                        invert_rm: false,
+                        kind: LogicalKind::Eor,
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                let t2 = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::LogicalReg {
+                        dst: MReg::V(t2),
+                        rn: MReg::V(t0),
+                        rm: MReg::V(t1),
+                        shift: None,
+                        invert_rm: false,
+                        kind: LogicalKind::Orr,
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                let (_, vf) = self.push_flag_writer(
+                    MOp::CmpImm { rn: MReg::V(t2), imm12: 0, shift12: false, wide: true },
+                    MInstFlags::NONE,
+                );
+                return (vf, int_cond_to_mcond(c), None);
+            }
+            // Ordered 128-bit comparison via `subs xzr, lhs_lo, rhs_lo; sbcs xzr, lhs_hi, rhs_hi`.
+            // Swap operands for `>` / `<=` so we only ever test `<` (`Lo`/`Lt`) or `>=` (`Hs`/`Ge`),
+            // avoiding dependence on `Z` (which only reflects the high 64 bits after `sbcs`).
+            let ((lhs_lo, lhs_hi), (rhs_lo, rhs_hi), mc) = match c {
+                IntCond::Ult => ((a_lo, a_hi), (b_lo, b_hi), MCond::Lo),
+                IntCond::Uge => ((a_lo, a_hi), (b_lo, b_hi), MCond::Hs),
+                IntCond::Ugt => ((b_lo, b_hi), (a_lo, a_hi), MCond::Lo),
+                IntCond::Ule => ((b_lo, b_hi), (a_lo, a_hi), MCond::Hs),
+                IntCond::Slt => ((a_lo, a_hi), (b_lo, b_hi), MCond::Lt),
+                IntCond::Sge => ((a_lo, a_hi), (b_lo, b_hi), MCond::Ge),
+                IntCond::Sgt => ((b_lo, b_hi), (a_lo, a_hi), MCond::Lt),
+                IntCond::Sle => ((b_lo, b_hi), (a_lo, a_hi), MCond::Ge),
+                IntCond::Eq => ((a_lo, a_hi), (b_lo, b_hi), MCond::Eq),
+                IntCond::Ne => ((a_lo, a_hi), (b_lo, b_hi), MCond::Ne),
+            };
+            let (_, vf1) = self.push_flag_writer(
+                MOp::SubReg {
+                    dst: MReg::XZR,
+                    rn: lhs_lo,
+                    rm: rhs_lo,
+                    shift: None,
+                    wide: true,
+                    sets_flags: true,
+                },
+                MInstFlags::NONE,
+            );
+            let vf2 = self.alloc_vflag();
+            self.live_cmp = None;
+            let mi2 = self.push_op(
+                MOp::CarryAddSub {
+                    dst: MReg::XZR,
+                    rn: lhs_hi,
+                    rm: rhs_hi,
+                    is_sub: true,
+                    sets_flags: true,
+                },
+                MInstFlags::NONE,
+            );
+            self.mfunc.set_vflag_use(mi2, vf1);
+            self.mfunc.set_vflag_def(mi2, vf2);
+            return (vf2, mc, None);
+        }
+
         let bits = int_bits(op_ty);
         let wide = bits == 64;
         let signed = matches!(c, IntCond::Slt | IntCond::Sle | IntCond::Sgt | IntCond::Sge);
@@ -2698,12 +2875,9 @@ impl<'a, 'v> Selector<'a, 'v> {
         }
     }
 
-    /// Emits a C runtime call (`memcpy` / `memmove` / `memset`) taking `(X0, X1, X2)`.
-    fn emit_c_bulk_call(&mut self, name: &str, a0: Value, a1: Value, a2: Value) -> Result<(), TierError> {
+    /// Emits a C runtime call (`memcpy` / `memmove` / `memset`) taking pre-lowered `(X0, X1, X2)`.
+    fn emit_c_bulk_call_regs(&mut self, name: &str, r0: MReg, r1: MReg, r2: MReg) -> Result<(), TierError> {
         let target_id = self.targets.intern_c_name(name)?;
-        let r0 = self.get_val(a0, true);
-        let r1 = self.get_val(a1, true);
-        let r2 = self.get_val(a2, true);
         let pairs = [
             (MReg::p(PReg::X0), r0),
             (MReg::p(PReg::X1), r1),
@@ -2712,6 +2886,766 @@ impl<'a, 'v> Selector<'a, 'v> {
         self.mfunc.push_parallel_copy(&pairs, MInstFlags::NONE);
         let _ = self.emit_direct_call_site(target_id, CallClobbers::C_ABI_ARM64);
         Ok(())
+    }
+
+    /// Emits a C runtime call (`memcpy` / `memmove` / `memset`) taking `(X0, X1, X2)`.
+    fn emit_c_bulk_call(&mut self, name: &str, a0: Value, a1: Value, a2: Value) -> Result<(), TierError> {
+        let r0 = self.get_val(a0, true);
+        let r1 = self.get_val(a1, true);
+        let r2 = self.get_val(a2, true);
+        self.emit_c_bulk_call_regs(name, r0, r1, r2)
+    }
+
+    /// Emits a non-overlapping fixed-length byte copy from `src_r` to `dst_r` (inline Q128/GPR
+    /// up to `INLINE_BULK_MAX`, or a C `memcpy` call above that).
+    fn emit_const_memcpy_regs(&mut self, dst_r: MReg, src_r: MReg, n: u64) -> Result<(), TierError> {
+        if n == 0 {
+            return Ok(());
+        }
+        if n <= INLINE_BULK_MAX {
+            let mut off: i32 = 0;
+            let mut rem = n;
+            while rem >= 16 {
+                let tmp = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                self.push_op(
+                    MOp::Ldr {
+                        dst: MReg::V(tmp),
+                        addr: AddrMode::BaseOff { base: src_r, off },
+                        size: MemSize::Q128,
+                        signed: false,
+                    },
+                    MInstFlags::MEM_READ,
+                );
+                self.push_op(
+                    MOp::Str {
+                        src: MReg::V(tmp),
+                        addr: AddrMode::BaseOff { base: dst_r, off },
+                        size: MemSize::Q128,
+                    },
+                    MInstFlags::MEM_WRITE,
+                );
+                off += 16;
+                rem -= 16;
+            }
+            for (bytes, sz, cls) in [
+                (8u64, MemSize::X64, VRegClass::Gpr64),
+                (4, MemSize::W32, VRegClass::Gpr32),
+                (2, MemSize::H16, VRegClass::Gpr32),
+                (1, MemSize::B8, VRegClass::Gpr32),
+            ] {
+                if rem >= bytes {
+                    let tmp = self.mfunc.alloc_vreg(cls);
+                    self.push_op(
+                        MOp::Ldr {
+                            dst: MReg::V(tmp),
+                            addr: AddrMode::BaseOff { base: src_r, off },
+                            size: sz,
+                            signed: false,
+                        },
+                        MInstFlags::MEM_READ,
+                    );
+                    self.push_op(
+                        MOp::Str {
+                            src: MReg::V(tmp),
+                            addr: AddrMode::BaseOff { base: dst_r, off },
+                            size: sz,
+                        },
+                        MInstFlags::MEM_WRITE,
+                    );
+                    off += i32::try_from(bytes).unwrap_or(0);
+                    rem -= bytes;
+                }
+            }
+            return Ok(());
+        }
+        let len_v = self.materialize_int_const(n, true);
+        self.emit_c_bulk_call_regs("memcpy", dst_r, src_r, MReg::V(len_v))
+    }
+
+    /// Allocates a `(lo, hi)` `Gpr64` SSA `VReg` pair for `Ty::I128` instruction `inst`.
+    fn alloc_i128_pair(&mut self, inst: usize) -> (VReg, VReg) {
+        let cur = at(&self.i128_pair, inst, (NONE_U32, NONE_U32));
+        if cur.0 != NONE_U32 {
+            return (VReg(cur.0), VReg(cur.1));
+        }
+        let lo = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+        let hi = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+        set(&mut self.i128_pair, inst, (lo.0, hi.0));
+        (lo, hi)
+    }
+
+    /// Binds `Ty::I128` instruction `inst` to `(lo, hi)`, aliasing zero-cost when `inst` has NOT
+    /// been forward-preallocated by a non-RPO block and both halves are `Gpr64` `VReg`s, or
+    /// emitting 64-bit `Mov`s into `alloc_i128_pair(inst)` otherwise.
+    fn bind_i128_pair(&mut self, inst: usize, lo: MReg, hi: MReg) {
+        let existing = at(&self.i128_pair, inst, (NONE_U32, NONE_U32));
+        if existing.0 == NONE_U32
+            && let (MReg::V(lv), MReg::V(hv)) = (lo, hi)
+            && self.mfunc.vreg_class.get(to_idx(lv.0)).copied() == Some(VRegClass::Gpr64)
+            && self.mfunc.vreg_class.get(to_idx(hv.0)).copied() == Some(VRegClass::Gpr64)
+        {
+            set(&mut self.i128_pair, inst, (lv.0, hv.0));
+            return;
+        }
+        let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+        if MReg::V(dst_lo) != lo {
+            self.push_op(MOp::Mov { dst: MReg::V(dst_lo), src: lo, wide: true }, MInstFlags::NONE);
+        }
+        if MReg::V(dst_hi) != hi {
+            self.push_op(MOp::Mov { dst: MReg::V(dst_hi), src: hi, wide: true }, MInstFlags::NONE);
+        }
+    }
+
+    #[inline]
+    fn i128_has_q128(&self, val: Value) -> bool {
+        at(&self.i128_is_q128, val.index(), false)
+    }
+
+    /// Returns `(lo, hi)` 64-bit GPR operands for a `Ty::I128` LIR value, lazily materializing
+    /// 128-bit constants, extracting 64-bit lanes from `Q128` loads via `umov`, or forward
+    /// pre-allocating `i128_pair[idx]` when Ext-TSP lowers a dominated block before its dominator.
+    fn get_i128_pair(&mut self, val: Value, allow_xzr: bool) -> (MReg, MReg) {
+        let idx = val.index();
+        if let Some((lo_c, hi_c)) = self.const_i128.get(idx).copied().flatten() {
+            let lo = if allow_xzr && lo_c == 0 {
+                MReg::XZR
+            } else {
+                MReg::V(self.materialize_int_const(lo_c, true))
+            };
+            let hi = if allow_xzr && hi_c == 0 {
+                MReg::XZR
+            } else {
+                MReg::V(self.materialize_int_const(hi_c, true))
+            };
+            return (lo, hi);
+        }
+        if self.view.op(idx) == Op::Uninit {
+            if allow_xzr {
+                return (MReg::XZR, MReg::XZR);
+            }
+            let z = self.materialize_int_const(0, true);
+            return (MReg::V(z), MReg::V(z));
+        }
+        if self.i128_has_q128(val) {
+            let q = self.get_val(val, false);
+            let lo = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+            let hi = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+            self.push_op(
+                MOp::VecAlu {
+                    op: VecAluOp::UmovLane { lane: 0 },
+                    dst: MReg::V(lo),
+                    rn: q,
+                    rm: None,
+                    elem_size: 3,
+                },
+                MInstFlags::NONE,
+            );
+            self.push_op(
+                MOp::VecAlu {
+                    op: VecAluOp::UmovLane { lane: 1 },
+                    dst: MReg::V(hi),
+                    rn: q,
+                    rm: None,
+                    elem_size: 3,
+                },
+                MInstFlags::NONE,
+            );
+            return (MReg::V(lo), MReg::V(hi));
+        }
+        let (lo, hi) = self.alloc_i128_pair(idx);
+        (MReg::V(lo), MReg::V(hi))
+    }
+
+    /// Lowers a `Ty::I128` scalar-pair ALU or shift instruction.
+    fn lower_i128_alu(&mut self, inst: usize, op: Op, a: Value, b_opt: Option<Value>) {
+        let (a_lo, a_hi) = self.get_i128_pair(a, true);
+        match op {
+            Op::Add | Op::Sub => {
+                let b = b_opt.unwrap_or(a);
+                let (b_lo, b_hi) = self.get_i128_pair(b, true);
+                let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+                let is_sub = op == Op::Sub;
+                let lo_op = if is_sub {
+                    MOp::SubReg {
+                        dst: MReg::V(dst_lo),
+                        rn: a_lo,
+                        rm: b_lo,
+                        shift: None,
+                        wide: true,
+                        sets_flags: true,
+                    }
+                } else {
+                    MOp::AddReg {
+                        dst: MReg::V(dst_lo),
+                        rn: a_lo,
+                        rm: b_lo,
+                        shift: None,
+                        wide: true,
+                        sets_flags: true,
+                    }
+                };
+                let (_, vf) = self.push_flag_writer(lo_op, MInstFlags::NONE);
+                let mi_hi = self.push_op(
+                    MOp::CarryAddSub {
+                        dst: MReg::V(dst_hi),
+                        rn: a_hi,
+                        rm: b_hi,
+                        is_sub,
+                        sets_flags: false,
+                    },
+                    MInstFlags::NONE,
+                );
+                self.mfunc.set_vflag_use(mi_hi, vf);
+            }
+            Op::Neg => {
+                let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+                let (_, vf) = self.push_flag_writer(
+                    MOp::SubReg {
+                        dst: MReg::V(dst_lo),
+                        rn: MReg::XZR,
+                        rm: a_lo,
+                        shift: None,
+                        wide: true,
+                        sets_flags: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                let mi_hi = self.push_op(
+                    MOp::CarryAddSub {
+                        dst: MReg::V(dst_hi),
+                        rn: MReg::XZR,
+                        rm: a_hi,
+                        is_sub: true,
+                        sets_flags: false,
+                    },
+                    MInstFlags::NONE,
+                );
+                self.mfunc.set_vflag_use(mi_hi, vf);
+            }
+            Op::And | Op::Or | Op::Xor => {
+                let b = b_opt.unwrap_or(a);
+                let (b_lo, b_hi) = self.get_i128_pair(b, true);
+                let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+                let kind = match op {
+                    Op::And => LogicalKind::And,
+                    Op::Or => LogicalKind::Orr,
+                    _ => LogicalKind::Eor,
+                };
+                self.push_op(
+                    MOp::LogicalReg {
+                        dst: MReg::V(dst_lo),
+                        rn: a_lo,
+                        rm: b_lo,
+                        shift: None,
+                        invert_rm: false,
+                        kind,
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                self.push_op(
+                    MOp::LogicalReg {
+                        dst: MReg::V(dst_hi),
+                        rn: a_hi,
+                        rm: b_hi,
+                        shift: None,
+                        invert_rm: false,
+                        kind,
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+            }
+            Op::Not => {
+                let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+                self.push_op(
+                    MOp::Mvn { dst: MReg::V(dst_lo), rm: a_lo, shift: None, wide: true },
+                    MInstFlags::NONE,
+                );
+                self.push_op(
+                    MOp::Mvn { dst: MReg::V(dst_hi), rm: a_hi, shift: None, wide: true },
+                    MInstFlags::NONE,
+                );
+            }
+            Op::Mul => {
+                let b = b_opt.unwrap_or(a);
+                let (b_lo, b_hi) = self.get_i128_pair(b, true);
+                let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+                self.push_op(
+                    MOp::Mul { dst: MReg::V(dst_lo), rn: a_lo, rm: b_lo, wide: true },
+                    MInstFlags::NONE,
+                );
+                let hi0 = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::Umulh { dst: MReg::V(hi0), rn: a_lo, rm: b_lo },
+                    MInstFlags::NONE,
+                );
+                let hi1 = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::Madd {
+                        dst: MReg::V(hi1),
+                        rn: a_lo,
+                        rm: b_hi,
+                        ra: MReg::V(hi0),
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                self.push_op(
+                    MOp::Madd {
+                        dst: MReg::V(dst_hi),
+                        rn: a_hi,
+                        rm: b_lo,
+                        ra: MReg::V(hi1),
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+            }
+            Op::Shl | Op::Lshr | Op::Ashr => {
+                let b = b_opt.unwrap_or(a);
+                let const_k = if self.view.ty(b) == Ty::I128 {
+                    self.const_i128.get(b.index()).copied().flatten().map(|(lo, _)| lo & 127)
+                } else {
+                    self.const_u64.get(b.index()).copied().flatten().map(|v| v & 127)
+                };
+                if let Some(k) = const_k {
+                    let k_u8 = u8::try_from(k).unwrap_or(0);
+                    let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+                    if k_u8 == 0 {
+                        self.push_op(
+                            MOp::Mov { dst: MReg::V(dst_lo), src: a_lo, wide: true },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::Mov { dst: MReg::V(dst_hi), src: a_hi, wide: true },
+                            MInstFlags::NONE,
+                        );
+                    } else if op == Op::Shl {
+                        if k_u8 < 64 {
+                            self.push_op(
+                                MOp::Ubfm {
+                                    dst: MReg::V(dst_lo),
+                                    rn: a_lo,
+                                    immr: 64 - k_u8,
+                                    imms: 63 - k_u8,
+                                    wide: true,
+                                },
+                                MInstFlags::NONE,
+                            );
+                            self.push_op(
+                                MOp::Extr {
+                                    dst: MReg::V(dst_hi),
+                                    rn: a_hi,
+                                    rm: a_lo,
+                                    lsb: 64 - k_u8,
+                                    wide: true,
+                                },
+                                MInstFlags::NONE,
+                            );
+                        } else {
+                            self.push_op(
+                                MOp::MovImm { dst: MReg::V(dst_lo), imm: 0, wide: true },
+                                MInstFlags::REMATERIALIZABLE,
+                            );
+                            let rem = k_u8 - 64;
+                            if rem == 0 {
+                                self.push_op(
+                                    MOp::Mov { dst: MReg::V(dst_hi), src: a_lo, wide: true },
+                                    MInstFlags::NONE,
+                                );
+                            } else {
+                                self.push_op(
+                                    MOp::Ubfm {
+                                        dst: MReg::V(dst_hi),
+                                        rn: a_lo,
+                                        immr: 64 - rem,
+                                        imms: 63 - rem,
+                                        wide: true,
+                                    },
+                                    MInstFlags::NONE,
+                                );
+                            }
+                        }
+                    } else {
+                        let is_signed = op == Op::Ashr;
+                        if k_u8 < 64 {
+                            self.push_op(
+                                MOp::Extr {
+                                    dst: MReg::V(dst_lo),
+                                    rn: a_hi,
+                                    rm: a_lo,
+                                    lsb: k_u8,
+                                    wide: true,
+                                },
+                                MInstFlags::NONE,
+                            );
+                            let hi_op = if is_signed {
+                                MOp::Sbfm { dst: MReg::V(dst_hi), rn: a_hi, immr: k_u8, imms: 63, wide: true }
+                            } else {
+                                MOp::Ubfm { dst: MReg::V(dst_hi), rn: a_hi, immr: k_u8, imms: 63, wide: true }
+                            };
+                            self.push_op(hi_op, MInstFlags::NONE);
+                        } else {
+                            let rem = k_u8 - 64;
+                            if rem == 0 {
+                                self.push_op(
+                                    MOp::Mov { dst: MReg::V(dst_lo), src: a_hi, wide: true },
+                                    MInstFlags::NONE,
+                                );
+                            } else if is_signed {
+                                self.push_op(
+                                    MOp::Sbfm { dst: MReg::V(dst_lo), rn: a_hi, immr: rem, imms: 63, wide: true },
+                                    MInstFlags::NONE,
+                                );
+                            } else {
+                                self.push_op(
+                                    MOp::Ubfm { dst: MReg::V(dst_lo), rn: a_hi, immr: rem, imms: 63, wide: true },
+                                    MInstFlags::NONE,
+                                );
+                            }
+                            if is_signed {
+                                self.push_op(
+                                    MOp::Sbfm { dst: MReg::V(dst_hi), rn: a_hi, immr: 63, imms: 63, wide: true },
+                                    MInstFlags::NONE,
+                                );
+                            } else {
+                                self.push_op(
+                                    MOp::MovImm { dst: MReg::V(dst_hi), imm: 0, wide: true },
+                                    MInstFlags::REMATERIALIZABLE,
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Variable 128-bit shift using `inv = ~s` identity (`(x >> 1) >> (~s & 63)` is 0 when s&63 == 0).
+                let sr = if self.view.ty(b) == Ty::I128 {
+                    self.get_i128_pair(b, true).0
+                } else {
+                    self.get_val(b, true)
+                };
+                let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+                let inv_s = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::Mvn { dst: MReg::V(inv_s), rm: sr, shift: None, wide: true },
+                    MInstFlags::NONE,
+                );
+                if op == Op::Shl {
+                    let lo_small = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::ShiftVar { dst: MReg::V(lo_small), rn: a_lo, rm: sr, kind: ShiftKind::Lsl, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    let hi_sh = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::ShiftVar { dst: MReg::V(hi_sh), rn: a_hi, rm: sr, kind: ShiftKind::Lsl, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    let carry1 = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::Ubfm { dst: MReg::V(carry1), rn: a_lo, immr: 1, imms: 63, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    let carry = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::ShiftVar {
+                            dst: MReg::V(carry),
+                            rn: MReg::V(carry1),
+                            rm: MReg::V(inv_s),
+                            kind: ShiftKind::Lsr,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    let hi_small = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::LogicalReg {
+                            dst: MReg::V(hi_small),
+                            rn: MReg::V(hi_sh),
+                            rm: MReg::V(carry),
+                            shift: None,
+                            invert_rm: false,
+                            kind: LogicalKind::Orr,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    let (_, vf) = self.push_flag_writer(
+                        MOp::TstImm { rn: sr, imm: 64, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    let m0 = self.push_op(
+                        MOp::Csel {
+                            dst: MReg::V(dst_lo),
+                            rn: MReg::XZR,
+                            rm: MReg::V(lo_small),
+                            cond: MCond::Ne,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    self.mfunc.set_vflag_use(m0, vf);
+                    let m1 = self.push_op(
+                        MOp::Csel {
+                            dst: MReg::V(dst_hi),
+                            rn: MReg::V(lo_small),
+                            rm: MReg::V(hi_small),
+                            cond: MCond::Ne,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    self.mfunc.set_vflag_use(m1, vf);
+                } else {
+                    let is_signed = op == Op::Ashr;
+                    let lo_sh = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::ShiftVar { dst: MReg::V(lo_sh), rn: a_lo, rm: sr, kind: ShiftKind::Lsr, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    let hi_small = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::ShiftVar {
+                            dst: MReg::V(hi_small),
+                            rn: a_hi,
+                            rm: sr,
+                            kind: if is_signed { ShiftKind::Asr } else { ShiftKind::Lsr },
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    let carry1 = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::Ubfm { dst: MReg::V(carry1), rn: a_hi, immr: 63, imms: 62, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    let carry = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::ShiftVar {
+                            dst: MReg::V(carry),
+                            rn: MReg::V(carry1),
+                            rm: MReg::V(inv_s),
+                            kind: ShiftKind::Lsl,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    let lo_small = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::LogicalReg {
+                            dst: MReg::V(lo_small),
+                            rn: MReg::V(lo_sh),
+                            rm: MReg::V(carry),
+                            shift: None,
+                            invert_rm: false,
+                            kind: LogicalKind::Orr,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    let hi_big = if is_signed {
+                        let sgn = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                        self.push_op(
+                            MOp::Sbfm { dst: MReg::V(sgn), rn: a_hi, immr: 63, imms: 63, wide: true },
+                            MInstFlags::NONE,
+                        );
+                        MReg::V(sgn)
+                    } else {
+                        MReg::XZR
+                    };
+                    let (_, vf) = self.push_flag_writer(
+                        MOp::TstImm { rn: sr, imm: 64, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    let m0 = self.push_op(
+                        MOp::Csel {
+                            dst: MReg::V(dst_lo),
+                            rn: MReg::V(hi_small),
+                            rm: MReg::V(lo_small),
+                            cond: MCond::Ne,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    self.mfunc.set_vflag_use(m0, vf);
+                    let m1 = self.push_op(
+                        MOp::Csel {
+                            dst: MReg::V(dst_hi),
+                            rn: hi_big,
+                            rm: MReg::V(hi_small),
+                            cond: MCond::Ne,
+                            wide: true,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    self.mfunc.set_vflag_use(m1, vf);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Lowers a `Ty::I128` scalar-pair store as two adjacent 64-bit `Str`s (paired into `Stp` by Pass 3).
+    fn lower_i128_store(&mut self, val: Value, ptr: Value, off: i32, flags: Flags, pat: SelPattern) {
+        let (lo, hi) = self.get_i128_pair(val, true);
+        let (addr_lo, addr_hi) = match pat {
+            SelPattern::MemSp { off: sp_off } => (
+                self.addr_base_off(MReg::SP, i64::from(sp_off), MemSize::X64),
+                self.addr_base_off(MReg::SP, i64::from(sp_off) + 8, MemSize::X64),
+            ),
+            SelPattern::MemBaseOff { base, off: comb_off } => {
+                let br = self.get_val(Value(base), false);
+                (
+                    self.addr_base_off(br, i64::from(comb_off), MemSize::X64),
+                    self.addr_base_off(br, i64::from(comb_off) + 8, MemSize::X64),
+                )
+            }
+            SelPattern::MemScaledIdx { base, idx, shift } => {
+                let br = self.get_val(Value(base), false);
+                let ir = self.get_val(Value(idx), true);
+                let ptr_v = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                let mshift = if shift != 0 { Some(MShift::Lsl(shift)) } else { None };
+                self.push_op(
+                    MOp::AddReg {
+                        dst: MReg::V(ptr_v),
+                        rn: br,
+                        rm: ir,
+                        shift: mshift,
+                        wide: true,
+                        sets_flags: false,
+                    },
+                    MInstFlags::NONE,
+                );
+                (
+                    AddrMode::BaseOff { base: MReg::V(ptr_v), off: 0 },
+                    AddrMode::BaseOff { base: MReg::V(ptr_v), off: 8 },
+                )
+            }
+            _ => {
+                let br = self.get_val(ptr, false);
+                (
+                    self.addr_base_off(br, i64::from(off), MemSize::X64),
+                    self.addr_base_off(br, i64::from(off) + 8, MemSize::X64),
+                )
+            }
+        };
+        let is_vol = flags.contains(Flags::VOLATILE);
+        let mflags = if is_vol {
+            MInstFlags::MEM_WRITE.union(MInstFlags::VOLATILE)
+        } else {
+            MInstFlags::MEM_WRITE
+        };
+        let m0 = self.push_op(MOp::Str { src: lo, addr: addr_lo, size: MemSize::X64 }, mflags);
+        let m1 = self.push_op(MOp::Str { src: hi, addr: addr_hi, size: MemSize::X64 }, mflags);
+        if is_vol {
+            self.mfunc.attach_note(m0, MNoteKind::Volatile);
+            self.mfunc.attach_note(m1, MNoteKind::Volatile);
+        }
+    }
+
+    /// Lowers `Op::Switch` on a `Ty::I128` scrutinee via `(lo ^ c_lo) | (hi ^ c_hi) == 0` chain.
+    fn lower_switch_i128(
+        &mut self,
+        scrut: Value,
+        default_tgt: blaze_lir::op::Target<'_>,
+        cases: blaze_lir::op::Cases<'_>,
+        scratch_pairs: &mut Vec<(MReg, MReg), Alloc<'a>>,
+    ) {
+        let (sr_lo, sr_hi) = self.get_i128_pair(scrut, true);
+        let mut resolved: Vec<((u64, u64), MBlock), Alloc<'a>> = Vec::new_in(self.alloc);
+        for (words, tgt) in cases {
+            let w0 = words.first().copied().unwrap_or(0);
+            let w1 = words.get(1).copied().unwrap_or(0);
+            let w2 = words.get(2).copied().unwrap_or(0);
+            let w3 = words.get(3).copied().unwrap_or(0);
+            let lo = u64::from(w0) | (u64::from(w1) << 32);
+            let hi = u64::from(w2) | (u64::from(w3) << 32);
+            let mblk = self.resolve_deferred_edge(tgt.block, tgt.args, scratch_pairs);
+            resolved.push(((lo, hi), mblk));
+        }
+        if resolved.is_empty() {
+            let def_mblk = at(&self.mblock_of_lir, default_tgt.block.index(), MBlock(0));
+            self.build_edge_copy_pairs(default_tgt.block, default_tgt.args, scratch_pairs);
+            if !scratch_pairs.is_empty() {
+                self.mfunc.push_parallel_copy(scratch_pairs, MInstFlags::NONE);
+            }
+            self.push_op(MOp::B { target: def_mblk }, MInstFlags::TERMINATOR);
+            return;
+        }
+        let def_mblk = self.resolve_deferred_edge(default_tgt.block, default_tgt.args, scratch_pairs);
+        let n = resolved.len();
+        for (k, &((c_lo, c_hi), ctgt)) in resolved.iter().enumerate() {
+            let is_last = k + 1 == n;
+            let fall_blk = if is_last {
+                def_mblk
+            } else {
+                self.new_mblock(false, self.cur_weight)
+            };
+            let d_lo = if c_lo == 0 {
+                sr_lo
+            } else {
+                let cv = self.materialize_int_const(c_lo, true);
+                let tmp = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::LogicalReg {
+                        dst: MReg::V(tmp),
+                        rn: sr_lo,
+                        rm: MReg::V(cv),
+                        shift: None,
+                        invert_rm: false,
+                        kind: LogicalKind::Eor,
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                MReg::V(tmp)
+            };
+            let d_hi = if c_hi == 0 {
+                sr_hi
+            } else {
+                let cv = self.materialize_int_const(c_hi, true);
+                let tmp = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                self.push_op(
+                    MOp::LogicalReg {
+                        dst: MReg::V(tmp),
+                        rn: sr_hi,
+                        rm: MReg::V(cv),
+                        shift: None,
+                        invert_rm: false,
+                        kind: LogicalKind::Eor,
+                        wide: true,
+                    },
+                    MInstFlags::NONE,
+                );
+                MReg::V(tmp)
+            };
+            let diff = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+            self.push_op(
+                MOp::LogicalReg {
+                    dst: MReg::V(diff),
+                    rn: d_lo,
+                    rm: d_hi,
+                    shift: None,
+                    invert_rm: false,
+                    kind: LogicalKind::Orr,
+                    wide: true,
+                },
+                MInstFlags::NONE,
+            );
+            self.push_op(
+                MOp::Cbz { rt: MReg::V(diff), target: ctgt, wide: true },
+                MInstFlags::TERMINATOR,
+            );
+            self.push_op(MOp::B { target: fall_blk }, MInstFlags::TERMINATOR);
+            if !is_last {
+                self.mfunc.end_block(self.cur_blk);
+                self.mfunc.begin_block(fall_blk);
+                self.cur_blk = fall_blk;
+                self.live_cmp = None;
+            }
+        }
     }
 
     /// Builds `ParallelCopy` pairs for target block `target_lir_blk` with arguments `args`,
@@ -2726,6 +3660,22 @@ impl<'a, 'v> Selector<'a, 'v> {
         let param_range = self.view.params(target_lir_blk);
         for (param_inst, arg_val) in param_range.zip(args.iter()) {
             if self.use_count.get(param_inst).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            if ty_at(self.view, param_inst) == Ty::I128 {
+                let (dst_lo, dst_hi) = at(&self.i128_pair, param_inst, (NONE_U32, NONE_U32));
+                if dst_lo == NONE_U32 {
+                    continue;
+                }
+                let (src_lo, src_hi) = self.get_i128_pair(arg_val, true);
+                let d_lo = MReg::V(VReg(dst_lo));
+                let d_hi = MReg::V(VReg(dst_hi));
+                if d_lo != src_lo {
+                    out_pairs.push((d_lo, src_lo));
+                }
+                if d_hi != src_hi {
+                    out_pairs.push((d_hi, src_hi));
+                }
                 continue;
             }
             let dst_v = self.val_vreg.get(param_inst).copied().unwrap_or(NONE_U32);
@@ -2747,12 +3697,36 @@ impl<'a, 'v> Selector<'a, 'v> {
 
         // Identical arms: `Select(c, x, x)` -> alias `x`!
         if t_val == f_val {
+            if res_ty == Ty::I128 && !self.i128_has_q128(t_val) {
+                let (lo, hi) = self.get_i128_pair(t_val, true);
+                self.bind_i128_pair(inst, lo, hi);
+                return;
+            }
             let src = self.get_val(t_val, false);
             self.bind_alias_vreg(inst, src, res_ty);
             return;
         }
 
-        // 128-bit vector / `I128` select -> `csetm` + `dup.2d` + `bsl.16b`.
+        // Scalar-pair `I128` select -> two `csel`s (avoids cross-bank NEON `dup`/`bsl`).
+        if res_ty == Ty::I128 && !(self.i128_has_q128(t_val) && self.i128_has_q128(f_val)) {
+            let (t_lo, t_hi) = self.get_i128_pair(t_val, true);
+            let (f_lo, f_hi) = self.get_i128_pair(f_val, true);
+            let (vf, mc) = self.ensure_cond_flags(cond_val);
+            let (dst_lo, dst_hi) = self.alloc_i128_pair(inst);
+            let m0 = self.push_op(
+                MOp::Csel { dst: MReg::V(dst_lo), rn: t_lo, rm: f_lo, cond: mc, wide: true },
+                MInstFlags::NONE,
+            );
+            self.mfunc.set_vflag_use(m0, vf);
+            let m1 = self.push_op(
+                MOp::Csel { dst: MReg::V(dst_hi), rn: t_hi, rm: f_hi, cond: mc, wide: true },
+                MInstFlags::NONE,
+            );
+            self.mfunc.set_vflag_use(m1, vf);
+            return;
+        }
+
+        // 128-bit vector / Q128 `I128` select -> `csetm` + `dup.2d` + `bsl.16b`.
         if is_q128_ty(res_ty) {
             let tr = self.get_val(t_val, false);
             let fr = self.get_val(f_val, false);
@@ -3206,7 +4180,8 @@ impl<'a, 'v> Selector<'a, 'v> {
                     core::mem::swap(&mut a, &mut b);
                     ic = swap_int_cond(ic);
                 }
-                let rhs_zero = self.const_u64.get(b.index()).copied().flatten() == Some(0);
+                let rhs_zero = self.view.ty(a) != Ty::I128
+                    && self.const_u64.get(b.index()).copied().flatten() == Some(0);
                 if rhs_zero && matches!(ic, IntCond::Eq | IntCond::Ne) {
                     let op_bits = int_bits(self.view.ty(a));
                     let wide = op_bits == 64;
@@ -3367,6 +4342,98 @@ impl<'a, 'v> Selector<'a, 'v> {
         let flags = self.view.flags(inst);
         let pat = at(&self.pattern, inst, SelPattern::None);
         let mut o = self.view.operands(inst);
+
+        // Native 128-bit NEON SIMD ALU (`v16i8`/`v8i16`/`v4i32`/`v2i64`/`v4f32`/`v2f64`).
+        if is_vec128(res_ty)
+            && let Some((vec_op, elem_size)) = vec128_alu_op(op, res_ty)
+        {
+            let dst = self.alloc_res_vreg(inst, res_ty);
+            if op == Op::Not {
+                let a = o.value();
+                let rn = self.get_val(a, false);
+                self.push_op(
+                    MOp::VecAlu { op: vec_op, dst: MReg::V(dst), rn, rm: None, elem_size },
+                    MInstFlags::NONE,
+                );
+            } else {
+                let a = o.value();
+                let b = o.value();
+                let rn = self.get_val(a, false);
+                let rm = self.get_val(b, false);
+                self.push_op(
+                    MOp::VecAlu { op: vec_op, dst: MReg::V(dst), rn, rm: Some(rm), elem_size },
+                    MInstFlags::NONE,
+                );
+            }
+            return Ok(());
+        }
+
+        // Native 128-bit scalar-pair integer ops (`Ty::I128`).
+        if res_ty == Ty::I128 {
+            match op {
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::And
+                | Op::Or
+                | Op::Xor
+                | Op::Shl
+                | Op::Lshr
+                | Op::Ashr => {
+                    let a = o.value();
+                    let b = o.value();
+                    self.lower_i128_alu(inst, op, a, Some(b));
+                    return Ok(());
+                }
+                Op::Neg | Op::Not => {
+                    let a = o.value();
+                    self.lower_i128_alu(inst, op, a, None);
+                    return Ok(());
+                }
+                Op::Freeze => {
+                    let a = o.value();
+                    if self.i128_has_q128(a) {
+                        let ar = self.get_val(a, false);
+                        self.bind_alias_vreg(inst, ar, res_ty);
+                    } else {
+                        let (lo, hi) = self.get_i128_pair(a, true);
+                        self.bind_i128_pair(inst, lo, hi);
+                    }
+                    return Ok(());
+                }
+                Op::Zext => {
+                    let a = o.value();
+                    let ar = self.get_val(a, true);
+                    let hi = MReg::V(self.materialize_int_const(0, true));
+                    self.bind_i128_pair(inst, ar, hi);
+                    return Ok(());
+                }
+                Op::Sext => {
+                    let a = o.value();
+                    let from_bits = int_bits(self.view.ty(a));
+                    let ar = self.get_val(a, false);
+                    let lo_reg = if from_bits == 64 {
+                        ar
+                    } else {
+                        let v = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                        let imms = u8_of(from_bits - 1).unwrap_or(7);
+                        self.push_op(
+                            MOp::Sbfm { dst: MReg::V(v), rn: ar, immr: 0, imms, wide: true },
+                            MInstFlags::NONE,
+                        );
+                        MReg::V(v)
+                    };
+                    let hi_v = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+                    self.push_op(
+                        MOp::Sbfm { dst: MReg::V(hi_v), rn: lo_reg, immr: 63, imms: 63, wide: true },
+                        MInstFlags::NONE,
+                    );
+                    self.bind_i128_pair(inst, lo_reg, MReg::V(hi_v));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
 
         match op {
             Op::Param
@@ -3897,6 +4964,30 @@ impl<'a, 'v> Selector<'a, 'v> {
             Op::Trunc => {
                 let a = o.value();
                 let to_bits = int_bits(res_ty);
+                if self.view.ty(a) == Ty::I128 {
+                    let (lo, _) = self.get_i128_pair(a, true);
+                    if to_bits == 64 {
+                        if let MReg::V(v) = lo {
+                            self.bind_alias_vreg(inst, MReg::V(v), res_ty);
+                        } else {
+                            let dst = self.alloc_res_vreg(inst, res_ty);
+                            self.push_op(
+                                MOp::Mov { dst: MReg::V(dst), src: lo, wide: true },
+                                MInstFlags::NONE,
+                            );
+                        }
+                    } else if to_bits == 32 {
+                        let dst = self.alloc_res_vreg(inst, res_ty);
+                        self.push_op(
+                            MOp::Mov { dst: MReg::V(dst), src: lo, wide: false },
+                            MInstFlags::NONE,
+                        );
+                    } else {
+                        let dst = self.alloc_res_vreg(inst, res_ty);
+                        self.emit_narrow_mask(MReg::V(dst), lo, to_bits);
+                    }
+                    return Ok(());
+                }
                 if self.value_fits_zero_extended_bits(a, to_bits) {
                     let ar = self.get_val(a, false);
                     self.bind_alias_vreg(inst, ar, res_ty);
@@ -3918,6 +5009,14 @@ impl<'a, 'v> Selector<'a, 'v> {
             Op::Bitcast => {
                 let a = o.value();
                 let src_ty = self.view.ty(a);
+                if src_ty == Ty::I128 && !self.i128_has_q128(a) {
+                    if res_ty == Ty::I128 {
+                        let (lo, hi) = self.get_i128_pair(a, true);
+                        self.bind_i128_pair(inst, lo, hi);
+                        return Ok(());
+                    }
+                    return Err(refuse(Some(inst), "bitcast from scalar-pair i128 to vector"));
+                }
                 let ar = self.get_val(a, false);
                 if is_scalar_int_or_ptr(src_ty) && is_scalar_fp(res_ty) {
                     let dst = self.alloc_res_vreg(inst, res_ty);
@@ -4011,6 +5110,9 @@ impl<'a, 'v> Selector<'a, 'v> {
                         }
                     }
                     SplatKind::Identity128 => {
+                        if self.view.ty(a) == Ty::I128 && !self.i128_has_q128(a) {
+                            return Err(refuse(Some(inst), "splat from scalar-pair i128"));
+                        }
                         let sr = self.get_val(a, false);
                         self.bind_alias_vreg(inst, sr, res_ty);
                     }
@@ -4065,6 +5167,10 @@ impl<'a, 'v> Selector<'a, 'v> {
                 let ptr = o.value();
                 let off = o.offset();
                 let val_ty = self.view.ty(val);
+                if val_ty == Ty::I128 && !self.i128_has_q128(val) {
+                    self.lower_i128_store(val, ptr, off, flags, pat);
+                    return Ok(());
+                }
                 let size = mem_size_for_ty(val_ty).unwrap_or(MemSize::X64);
                 let src = self.get_val(val, !size.is_fp_or_vec());
                 let addr = self.select_mem_addr(ptr, off, size, pat);
@@ -6353,6 +7459,10 @@ impl<'a, 'v> Selector<'a, 'v> {
         cases: blaze_lir::op::Cases<'_>,
         scratch_pairs: &mut Vec<(MReg, MReg), Alloc<'a>>,
     ) {
+        if self.view.ty(scrut) == Ty::I128 {
+            self.lower_switch_i128(scrut, default_tgt, cases, scratch_pairs);
+            return;
+        }
         let scrut_bits = int_bits(self.view.ty(scrut));
         let wide = scrut_bits == 64;
 
@@ -6569,60 +7679,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                 {
                     let dst_r = self.get_val(dst_val, false);
                     let src_r = self.get_val(src_val, false);
-                    let mut off: i32 = 0;
-                    let mut rem = n;
-                    while rem >= 16 {
-                        let tmp = self.mfunc.alloc_vreg(VRegClass::Vec128);
-                        self.push_op(
-                            MOp::Ldr {
-                                dst: MReg::V(tmp),
-                                addr: AddrMode::BaseOff { base: src_r, off },
-                                size: MemSize::Q128,
-                                signed: false,
-                            },
-                            MInstFlags::MEM_READ,
-                        );
-                        self.push_op(
-                            MOp::Str {
-                                src: MReg::V(tmp),
-                                addr: AddrMode::BaseOff { base: dst_r, off },
-                                size: MemSize::Q128,
-                            },
-                            MInstFlags::MEM_WRITE,
-                        );
-                        off += 16;
-                        rem -= 16;
-                    }
-                    for (bytes, sz, cls) in [
-                        (8u64, MemSize::X64, VRegClass::Gpr64),
-                        (4, MemSize::W32, VRegClass::Gpr32),
-                        (2, MemSize::H16, VRegClass::Gpr32),
-                        (1, MemSize::B8, VRegClass::Gpr32),
-                    ] {
-                        if rem >= bytes {
-                            let tmp = self.mfunc.alloc_vreg(cls);
-                            self.push_op(
-                                MOp::Ldr {
-                                    dst: MReg::V(tmp),
-                                    addr: AddrMode::BaseOff { base: src_r, off },
-                                    size: sz,
-                                    signed: false,
-                                },
-                                MInstFlags::MEM_READ,
-                            );
-                            self.push_op(
-                                MOp::Str {
-                                    src: MReg::V(tmp),
-                                    addr: AddrMode::BaseOff { base: dst_r, off },
-                                    size: sz,
-                                },
-                                MInstFlags::MEM_WRITE,
-                            );
-                            off += i32::try_from(bytes).unwrap_or(0);
-                            rem -= bytes;
-                        }
-                    }
-                    return Ok(());
+                    return self.emit_const_memcpy_regs(dst_r, src_r, n);
                 }
                 self.emit_c_bulk_call("memcpy", dst_val, src_val, len_val)?;
             }
@@ -6832,17 +7889,51 @@ impl<'a, 'v> Selector<'a, 'v> {
 
         let call_fast = matches!(callee, CallCallee::Direct(_))
             && is_internal_fast_call(self.opts.internal_fast_calls, inst);
+
+        // 0. Copy `ParamKind::Byval` arguments into this function's reserved outgoing byval area
+        //    (`[SP + byval_base_off + ...]`) BEFORE storing stacked args or touching arg regs,
+        //    because copies > `INLINE_BULK_MAX` invoke C `memcpy`.
+        let mut byval_ptrs: Vec<(usize, MReg), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut byval_cur = self.byval_base_off;
+        for (idx, (arg_val, param)) in args.iter().zip(sig.params.iter()).enumerate() {
+            if ParamKind::from_byte(param.kind) != Some(ParamKind::Byval) {
+                continue;
+            }
+            let Some(facts) = self.view.facts(param) else {
+                return Err(refuse(Some(inst), "byval without size/align"));
+            };
+            let align = 1u32 << u32::from(facts.align);
+            let copy_off = align_up_u32(byval_cur, align).ok_or(TierError::TooLarge {
+                tier: TIER,
+                what: "outgoing byval copies",
+            })?;
+            byval_cur = copy_off.checked_add(facts.size).ok_or(TierError::TooLarge {
+                tier: TIER,
+                what: "outgoing byval copies",
+            })?;
+            let dst_v = self.mfunc.alloc_vreg(VRegClass::Gpr64);
+            self.emit_sp_plus_off(MReg::V(dst_v), copy_off);
+            let src_r = self.get_val(arg_val, false);
+            self.emit_const_memcpy_regs(MReg::V(dst_v), src_r, u64::from(facts.size))?;
+            byval_ptrs.push((idx, MReg::V(dst_v)));
+        }
+
         let mut walk = AbiWalk::new(self.opts.machine.os, call_fast);
         scratch_pairs.clear();
 
         // 1. Store stack arguments first (at `[SP + out_off]`), collect register args for ParallelCopy.
-        for (arg_val, param) in args.iter().zip(sig.params.iter()) {
+        for (idx, (arg_val, param)) in args.iter().zip(sig.params.iter()).enumerate() {
             let Some(loc) = walk.next_param(param) else {
                 return Err(refuse(Some(inst), "call argument placement overflow"));
             };
+            let byval_reg = if ParamKind::from_byte(param.kind) == Some(ParamKind::Byval) {
+                byval_ptrs.iter().find(|&&(k, _)| k == idx).map(|&(_, r)| r)
+            } else {
+                None
+            };
             match loc {
                 AbiLoc::Gpr(r) => {
-                    let sr = self.get_val(arg_val, true);
+                    let sr = byval_reg.unwrap_or_else(|| self.get_val(arg_val, true));
                     scratch_pairs.push((MReg::gpr(r), sr));
                 }
                 AbiLoc::Fp(v) => {
@@ -6850,7 +7941,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                     scratch_pairs.push((MReg::vec(v), sr));
                 }
                 AbiLoc::Stack { off, size } => {
-                    let sr = self.get_val(arg_val, !size.is_fp_or_vec());
+                    let sr = byval_reg.unwrap_or_else(|| self.get_val(arg_val, !size.is_fp_or_vec()));
                     let addr = self.addr_sp_off(off, size);
                     self.push_op(MOp::Str { src: sr, addr, size }, MInstFlags::MEM_WRITE);
                 }
@@ -7289,7 +8380,11 @@ fn match_patterns(
         if !matches!(op, Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr) {
             continue;
         }
-        let bits = int_bits(ty_at(view, inst));
+        let shift_ty = ty_at(view, inst);
+        if !is_scalar_int_or_ptr(shift_ty) || shift_ty == Ty::PTR {
+            continue;
+        }
+        let bits = int_bits(shift_ty);
         if bits < 8 {
             continue;
         }
@@ -7601,6 +8696,9 @@ fn match_patterns(
         let b = at(inst_block, inst, 0);
         let op = view.op(inst);
         let res_ty = ty_at(view, inst);
+        if is_q128_ty(res_ty) {
+            continue;
+        }
         let bits = int_bits(res_ty);
 
         match op {
@@ -7920,8 +9018,9 @@ fn select_mfunc_ssa<'a>(
     let n_insts = view.len();
     let n_blocks = view.blocks();
 
-    // 1. Compute max outgoing call stacked-argument bytes (16B aligned).
+    // 1. Compute max outgoing call stacked-argument bytes and outgoing `byval` area (16B aligned).
     let mut outgoing_args_bytes: u32 = 0;
+    let mut outgoing_byval_bytes: u32 = 0;
     for inst in 0..n_insts {
         let op = view.op(inst);
         let (sig_id, call_fast) = match op {
@@ -7949,7 +9048,22 @@ fn select_mfunc_ssa<'a>(
         };
         let sig = view.sig(sig_id);
         let mut walk = AbiWalk::new(opts.machine.os, call_fast);
+        let mut call_byval: u32 = 0;
         for p in sig.params {
+            if ParamKind::from_byte(p.kind) == Some(ParamKind::Byval) {
+                let Some(facts) = view.facts(p) else {
+                    return Err(refuse(Some(inst), "byval without size/align"));
+                };
+                let align = 1u32 << u32::from(facts.align);
+                let at = align_up_u32(call_byval, align).ok_or(TierError::TooLarge {
+                    tier: TIER,
+                    what: "outgoing byval copies",
+                })?;
+                call_byval = at.checked_add(facts.size).ok_or(TierError::TooLarge {
+                    tier: TIER,
+                    what: "outgoing byval copies",
+                })?;
+            }
             let _ = walk.next_param(p);
         }
         let need = walk.stack.aligned16().ok_or(TierError::TooLarge {
@@ -7959,11 +9073,26 @@ fn select_mfunc_ssa<'a>(
         if need > outgoing_args_bytes {
             outgoing_args_bytes = need;
         }
+        let need_byval = align_up_u32(call_byval, 16).ok_or(TierError::TooLarge {
+            tier: TIER,
+            what: "outgoing byval copies",
+        })?;
+        if need_byval > outgoing_byval_bytes {
+            outgoing_byval_bytes = need_byval;
+        }
     }
 
-    // 2. Pack local stack slots starting at `outgoing_args_bytes` -> `spill_base_off` (16B aligned).
+    // 2. Reserve outgoing `byval` copies at `[outgoing_args_bytes .. byval_end)`, then pack local
+    //    stack slots starting at `byval_end` -> `spill_base_off` (16B aligned).
+    let byval_base_off = outgoing_args_bytes;
+    let byval_end = byval_base_off
+        .checked_add(outgoing_byval_bytes)
+        .ok_or(TierError::TooLarge {
+            tier: TIER,
+            what: "outgoing byval copies",
+        })?;
     let mut slot_off: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(view.slots.len(), alloc);
-    let mut cursor = outgoing_args_bytes;
+    let mut cursor = byval_end;
     for slot in view.slots {
         let align = 1u32 << u32::from(slot.align);
         let at = align_up_u32(cursor, align).ok_or(TierError::TooLarge {
@@ -7994,6 +9123,7 @@ fn select_mfunc_ssa<'a>(
     }
 
     let mut const_u64 = vec_filled(n_insts, None, alloc);
+    let mut const_i128 = vec_filled(n_insts, None, alloc);
     let mut const_fp_bits = vec_filled(n_insts, None, alloc);
     let mut skip_inst = vec_filled(n_insts, false, alloc);
     for inst in 0..n_insts {
@@ -8003,19 +9133,35 @@ fn select_mfunc_ssa<'a>(
         match op {
             Op::Iconst => {
                 let raw = o.imm();
-                let bits = int_bits(ty);
-                let val = if bits == 64 {
-                    i64::from(raw.cast_signed()).cast_unsigned()
+                if ty == Ty::I128 {
+                    let s = raw.cast_signed();
+                    let lo = i64::from(s).cast_unsigned();
+                    let hi = if s < 0 { u64::MAX } else { 0 };
+                    set(&mut const_i128, inst, Some((lo, hi)));
                 } else {
-                    u64::from(raw) & bit_mask(bits)
-                };
-                set(&mut const_u64, inst, Some(val));
+                    let bits = int_bits(ty);
+                    let val = if bits == 64 {
+                        i64::from(raw.cast_signed()).cast_unsigned()
+                    } else {
+                        u64::from(raw) & bit_mask(bits)
+                    };
+                    set(&mut const_u64, inst, Some(val));
+                }
                 set(&mut skip_inst, inst, true);
             }
             Op::IconstWide => {
                 let words = o.constant();
-                let val = u64::from(words[0]) | (u64::from(words[1]) << 32);
-                set(&mut const_u64, inst, Some(val));
+                let w0 = words.first().copied().unwrap_or(0);
+                let w1 = words.get(1).copied().unwrap_or(0);
+                let lo = u64::from(w0) | (u64::from(w1) << 32);
+                if ty == Ty::I128 {
+                    let w2 = words.get(2).copied().unwrap_or(0);
+                    let w3 = words.get(3).copied().unwrap_or(0);
+                    let hi = u64::from(w2) | (u64::from(w3) << 32);
+                    set(&mut const_i128, inst, Some((lo, hi)));
+                } else {
+                    set(&mut const_u64, inst, Some(lo));
+                }
                 set(&mut skip_inst, inst, true);
             }
             Op::Null => {
@@ -8142,6 +9288,51 @@ fn select_mfunc_ssa<'a>(
             next_unreach = next_unreach.saturating_add(1);
         }
     }
+    // Order-independent static classification of `Ty::I128` values that live in `Q128` (`Vec128`)
+    // rather than `(Gpr64, Gpr64)` scalar pairs, so non-RPO Ext-TSP lowering never disagrees across blocks.
+    let mut i128_is_q128 = vec_filled(n_insts, false, alloc);
+    for inst in 0..n_insts {
+        if ty_at(view, inst) != Ty::I128 {
+            continue;
+        }
+        let op = view.op(inst);
+        if op == Op::Load {
+            set(&mut i128_is_q128, inst, true);
+        } else if op == Op::Bitcast {
+            let mut o = view.operands(inst);
+            if view.ty(o.value()) != Ty::I128 {
+                set(&mut i128_is_q128, inst, true);
+            }
+        }
+    }
+    // Bounded fixed-point propagation through `Freeze`, `Bitcast`, and `Select`.
+    for _ in 0..8 {
+        let mut changed = false;
+        for inst in 0..n_insts {
+            if ty_at(view, inst) != Ty::I128 || at(&i128_is_q128, inst, false) {
+                continue;
+            }
+            let mut o = view.operands(inst);
+            let is_q = match view.op(inst) {
+                Op::Freeze | Op::Bitcast => at(&i128_is_q128, o.value().index(), false),
+                Op::Select => {
+                    let _c = o.value();
+                    let t = o.value();
+                    let f = o.value();
+                    at(&i128_is_q128, t.index(), false) && at(&i128_is_q128, f.index(), false)
+                }
+                _ => false,
+            };
+            if is_q {
+                set(&mut i128_is_q128, inst, true);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let mut sel = Selector {
         view,
         names,
@@ -8161,16 +9352,20 @@ fn select_mfunc_ssa<'a>(
         is_cleanup_block,
         inst_block,
         const_u64,
+        const_i128,
         const_fp_bits,
         use_count,
         skip_inst,
         cmp_all_fused,
         pattern,
         val_vreg: vec_filled(n_insts, NONE_U32, alloc),
+        i128_pair: vec_filled(n_insts, (NONE_U32, NONE_U32), alloc),
+        i128_is_q128,
         ovf_pair: vec_filled(n_insts, (NONE_U32, NONE_U32), alloc),
         call_ret_off: vec_filled(n_insts, NONE_U32, alloc),
         call_ret_vregs: Vec::new_in(alloc),
         slot_off,
+        byval_base_off,
         cur_blk: MBlock(0),
         cur_lir_blk: 0,
         cur_weight: 1,
@@ -8190,11 +9385,15 @@ fn select_mfunc_ssa<'a>(
         let mblk = sel.new_mblock(align16, weight);
         sel.mblock_of_lir.push(mblk);
 
-        // Pre-allocate one SSA `VReg` per LIR `Op::Param`.
+        // Pre-allocate one SSA `VReg` (or `Gpr64` pair for `Ty::I128` block phis) per LIR `Op::Param`.
         let b_u32 = u32_of(b).unwrap_or(0);
         for p_inst in view.params(Block(b_u32)) {
             let ty = ty_at(view, p_inst);
-            let _ = sel.alloc_res_vreg(p_inst, ty);
+            if ty == Ty::I128 {
+                let _ = sel.alloc_i128_pair(p_inst);
+            } else {
+                let _ = sel.alloc_res_vreg(p_inst, ty);
+            }
         }
     }
 
@@ -12547,5 +13746,244 @@ mod tests {
             .expect("unwind Emitted must convert cleanly to CodeRecord");
         let sealed = rec.seal().expect("CodeRecord with unwind pads must seal cleanly");
         assert_eq!(sealed.record().pads.len(), 3, "sealed CodeRecord must preserve all 3 unwind pads");
+    }
+
+    #[test]
+    fn misel_v128_neon_alu_add_sub_mul_xor_executes_on_apple_silicon() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let v4i32 = Ty::vector(Scalar::I32, 4).expect("<4 x i32> valid");
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I32)],
+            &[],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let src = b.param(Ty::PTR);
+        let dst = b.param(Ty::PTR);
+        let k = b.param(Ty::I32);
+        let v_src = b.load(v4i32, Flags::NONE, src, 0, MemAttrs::aligned(2));
+        let v_k = b.convert(Op::Splat, Flags::NONE, v4i32, k);
+        let v_add = b.binary(Op::Add, Flags::NONE, v_src, v_k);
+        let v_xor = b.binary(Op::Xor, Flags::NONE, v_add, v_k);
+        let v_mul = b.binary(Op::Mul, Flags::NONE, v_xor, v_k);
+        b.store(Flags::NONE, v_mul, dst, 0, MemAttrs::aligned(2));
+        b.ret(&[]);
+
+        let func = b.finish_checked().expect("finish");
+        let verified = verify(func.view()).expect("verify");
+        let (emitted, _clob, _stats) =
+            emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+                .expect("misel must compile V4xI32 NEON ALU natively");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let exec =
+                blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+            // SAFETY: Valid AAPCS64 leaf function matching `(ptr, ptr, u32) -> ()`.
+            let f: extern "C" fn(*const u32, *mut u32, u32) = unsafe { exec.as_fn() };
+            let inp = [1u32, 10, 100, 0xffff_fffe];
+            let mut out = [0u32; 4];
+            let kv = 7u32;
+            f(inp.as_ptr(), out.as_mut_ptr(), kv);
+            for i in 0..4 {
+                let want = (inp[i].wrapping_add(kv) ^ kv).wrapping_mul(kv);
+                assert_eq!(out[i], want, "lane {i} mismatch");
+            }
+        }
+        let _ = emitted;
+    }
+
+    #[test]
+    fn misel_byval_incoming_and_outgoing_copy_semantics_on_apple_silicon() {
+        let alloc = test_alloc();
+        let mut byval_param = Param::of(Ty::PTR);
+        byval_param.kind = ParamKind::Byval;
+        byval_param.facts = blaze_lir::builder::Facts {
+            size: 40,
+            align: 3,
+            ..blaze_lir::builder::Facts::default()
+        };
+
+        // 1. Callee: sums 5 x u64 from `byval` ptr and clobbers `[ptr + 0]` to verify caller's
+        //    private copy isolates the caller's original buffer.
+        let mut cb = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let callee_sig = cb.sig(Conv::C, Variadic::No, &[byval_param], &[Param::of(Ty::I64)]);
+        cb.set_signature(callee_sig);
+        let ce = cb.create_block(BlockKind::Normal);
+        cb.begin(ce);
+        let bp = cb.param(Ty::PTR);
+        let mut sum = cb.load(Ty::I64, Flags::NONE, bp, 0, MemAttrs::aligned(3));
+        for off in [8i32, 16, 24, 32] {
+            let v = cb.load(Ty::I64, Flags::NONE, bp, off, MemAttrs::aligned(3));
+            sum = cb.binary(Op::Add, Flags::NONE, sum, v);
+        }
+        let poison = cb.iconst(Ty::I64, 0xdead_beef_cafe_babe);
+        cb.store(Flags::NONE, poison, bp, 0, MemAttrs::aligned(3));
+        cb.ret(&[sum]);
+        let callee_fn = cb.finish_checked().expect("callee finish");
+        let callee_ver = verify(callee_fn.view()).expect("callee verify");
+        let (callee_emitted, _, _) =
+            emit_mfunc_ssa_a64(callee_ver, &NoNames, default_opts(), alloc)
+                .expect("misel must compile incoming byval callee");
+
+        // 2. Caller: takes `(callee_fn_ptr, src_ptr)` and calls `callee_fn_ptr(byval(40) src_ptr)`
+        //    via `Op::CallIndirect`, returning the callee's sum.
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let caller_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(caller_sig);
+        let call_sig = b.sig(Conv::C, Variadic::No, &[byval_param], &[Param::of(Ty::I64)]);
+        let e = b.create_block(BlockKind::Normal);
+        b.begin(e);
+        let fn_ptr = b.param(Ty::PTR);
+        let src = b.param(Ty::PTR);
+        let res = b.call_indirect(Flags::NONE, fn_ptr, call_sig, &[src]);
+        b.ret(&[res]);
+        let caller_fn = b.finish_checked().expect("caller finish");
+        let caller_ver = verify(caller_fn.view()).expect("caller verify");
+        let (caller_emitted, _, _) =
+            emit_mfunc_ssa_a64(caller_ver, &NoNames, default_opts(), alloc)
+                .expect("misel must compile outgoing byval caller");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let callee_exec =
+                blaze_inproc::exec::Executable::new(&callee_emitted.code, 0).expect("callee map");
+            let caller_exec =
+                blaze_inproc::exec::Executable::new(&caller_emitted.code, 0).expect("caller map");
+            // SAFETY: Valid AAPCS64 functions matching our LIR signatures.
+            let callee_f: extern "C" fn(*mut u64) -> u64 = unsafe { callee_exec.as_fn() };
+            let caller: extern "C" fn(extern "C" fn(*mut u64) -> u64, *const u64) -> u64 =
+                unsafe { caller_exec.as_fn() };
+            let buf = [10u64, 20, 30, 40, 50];
+            let got = caller(callee_f, buf.as_ptr());
+            assert_eq!(got, 150, "byval sum mismatch");
+            assert_eq!(buf[0], 10, "byval copy must isolate caller's original buffer");
+        }
+        let _ = (callee_emitted, caller_emitted);
+    }
+
+    #[test]
+    fn misel_i128_arith_cmp_shift_and_store_executes_on_apple_silicon() {
+        let alloc = test_alloc();
+        // Function `(a_ptr: ptr, b_ptr: ptr, out_ptr: ptr, shift: i32) -> i64`:
+        // Loads 128-bit `a` and `b`, computes `sum = a + b`, `diff = a - b`, `prod = a * b`,
+        // `shl_v = a << shift`, `shr_v = a >>_u shift`, `ashr_v = a >>_s shift`,
+        // writes `(sum, diff, prod, shl_v, shr_v, ashr_v)` to `out_ptr`, and returns a bitmask
+        // of all 10 `Icmp(a, b)` results (`Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge`).
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I32)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let a_ptr = b.param(Ty::PTR);
+        let b_ptr = b.param(Ty::PTR);
+        let out_ptr = b.param(Ty::PTR);
+        let sh = b.param(Ty::I32);
+        let a = b.load(Ty::I128, Flags::NONE, a_ptr, 0, MemAttrs::aligned(3));
+        let bv = b.load(Ty::I128, Flags::NONE, b_ptr, 0, MemAttrs::aligned(3));
+        // Exercise small `Op::Iconst(Ty::I128)` (`-1i128` + `1u128` == 0) too!
+        let neg1 = b.iconst(Ty::I128, u128::MAX);
+        let pos1 = b.iconst(Ty::I128, 1);
+        let zero128 = b.binary(Op::Add, Flags::NONE, neg1, pos1);
+        let a = b.binary(Op::Add, Flags::NONE, a, zero128);
+        let sh128 = b.convert(Op::Zext, Flags::NONE, Ty::I128, sh);
+        let sum = b.binary(Op::Add, Flags::NONE, a, bv);
+        let diff = b.binary(Op::Sub, Flags::NONE, a, bv);
+        let prod = b.binary(Op::Mul, Flags::NONE, a, bv);
+        let shl_v = b.binary(Op::Shl, Flags::NONE, a, sh128);
+        let shr_v = b.binary(Op::Lshr, Flags::NONE, a, sh128);
+        let ashr_v = b.binary(Op::Ashr, Flags::NONE, a, sh128);
+        b.store(Flags::NONE, sum, out_ptr, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, diff, out_ptr, 16, MemAttrs::aligned(3));
+        b.store(Flags::NONE, prod, out_ptr, 32, MemAttrs::aligned(3));
+        b.store(Flags::NONE, shl_v, out_ptr, 48, MemAttrs::aligned(3));
+        b.store(Flags::NONE, shr_v, out_ptr, 64, MemAttrs::aligned(3));
+        b.store(Flags::NONE, ashr_v, out_ptr, 80, MemAttrs::aligned(3));
+
+        let conds = [
+            IntCond::Eq,
+            IntCond::Ne,
+            IntCond::Ult,
+            IntCond::Ule,
+            IntCond::Ugt,
+            IntCond::Uge,
+            IntCond::Slt,
+            IntCond::Sle,
+            IntCond::Sgt,
+            IntCond::Sge,
+        ];
+        let mut mask = b.iconst(Ty::I64, 0);
+        for (bit, &cond) in conds.iter().enumerate() {
+            let cmp = b.icmp(cond, a, bv);
+            let ext = b.convert(Op::Zext, Flags::NONE, Ty::I64, cmp);
+            let k = b.iconst(Ty::I64, u128::try_from(bit).unwrap_or(0));
+            let shifted = b.binary(Op::Shl, Flags::NONE, ext, k);
+            mask = b.binary(Op::Or, Flags::NONE, mask, shifted);
+        }
+        b.ret(&[mask]);
+
+        let func = b.finish_checked().expect("i128 LIR finish");
+        let verified = verify(func.view()).expect("i128 LIR verify");
+        let (emitted, _, _) = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+            .expect("misel must compile Ty::I128 arithmetic/cmp/shift/store natively");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+            // SAFETY: Valid AAPCS64 leaf function matching `(ptr, ptr, ptr, u32) -> u64`.
+            let f: extern "C" fn(*const u128, *const u128, *mut u128, u32) -> u64 =
+                unsafe { exec.as_fn() };
+            let cases: &[(u128, u128, u32)] = &[
+                (0, 0, 0),
+                (1, 0, 1),
+                (0, 1, 63),
+                (u128::MAX, 1, 64),
+                (i128::MIN as u128, i128::MAX as u128, 65),
+                (0x1234_5678_9abc_def0_fedc_ba98_7654_3210, 0x0000_0001_ffff_ffff_0000_0000_ffff_ffff, 17),
+                (0x8000_0000_0000_0000_0000_0000_0000_0005, 0x8000_0000_0000_0000_0000_0000_0000_0005, 127),
+            ];
+            for &(av, bv, shv) in cases {
+                let mut out = [0u128; 6];
+                let got_mask = f(&av, &bv, out.as_mut_ptr(), shv);
+                assert_eq!(out[0], av.wrapping_add(bv), "add mismatch for ({av:#x}, {bv:#x})");
+                assert_eq!(out[1], av.wrapping_sub(bv), "sub mismatch for ({av:#x}, {bv:#x})");
+                assert_eq!(out[2], av.wrapping_mul(bv), "mul mismatch for ({av:#x}, {bv:#x})");
+                assert_eq!(out[3], av.wrapping_shl(shv), "shl mismatch for ({av:#x}, {shv})");
+                assert_eq!(out[4], av.wrapping_shr(shv), "lshr mismatch for ({av:#x}, {shv})");
+                assert_eq!(
+                    out[5],
+                    (av as i128).wrapping_shr(shv) as u128,
+                    "ashr mismatch for ({av:#x}, {shv})"
+                );
+                let sa = av as i128;
+                let sb = bv as i128;
+                let want_mask = u64::from(av == bv)
+                    | (u64::from(av != bv) << 1)
+                    | (u64::from(av < bv) << 2)
+                    | (u64::from(av <= bv) << 3)
+                    | (u64::from(av > bv) << 4)
+                    | (u64::from(av >= bv) << 5)
+                    | (u64::from(sa < sb) << 6)
+                    | (u64::from(sa <= sb) << 7)
+                    | (u64::from(sa > sb) << 8)
+                    | (u64::from(sa >= sb) << 9);
+                assert_eq!(got_mask, want_mask, "icmp mask mismatch for ({av:#x}, {bv:#x})");
+            }
+        }
+        let _ = emitted;
     }
 }
