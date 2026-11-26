@@ -2158,6 +2158,45 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 }
                 Ok(Val::Ptr(Pointer { alloc: p.alloc, offset: off as u64 }))
             }
+            Intrinsic::PtrOffsetFrom | Intrinsic::PtrOffsetFromUnsigned => {
+                let &(av, at) = vals.first().ok_or(malformed("`ptr_offset_from` arguments"))?;
+                let &(bv, _) = vals.get(1).ok_or(malformed("`ptr_offset_from` arguments"))?;
+                let (PNode::Ptr(_, pointee) | PNode::Ref(_, pointee)) = self.node(at)? else {
+                    return Err(malformed("`ptr_offset_from` of a value that is not a pointer"));
+                };
+                let (size, _) = self.size_align(pointee)?;
+                if size == 0 {
+                    return Err(Stop::Refused(Refusal::DivByZero));
+                }
+                let (a_off, b_off) = match (av, bv) {
+                    (Val::Ptr(p), Val::Ptr(q)) => {
+                        if p.alloc != q.alloc {
+                            return Err(Stop::Refused(Refusal::PointerCompare));
+                        }
+                        (p.offset, q.offset)
+                    }
+                    (Val::Int(a), Val::Int(b)) => (a, b),
+                    _ => return Err(Stop::Refused(Refusal::PointerCompare)),
+                };
+                let (bits, _) = info(self, rt)?;
+                if i == Intrinsic::PtrOffsetFromUnsigned {
+                    let Some(diff) = a_off.checked_sub(b_off) else {
+                        return Err(Stop::Refused(Refusal::Overflow { op: Arith::Sub }));
+                    };
+                    if diff % size != 0 {
+                        return Err(Stop::Refused(Refusal::Overflow { op: Arith::Div }));
+                    }
+                    s(mask(u128::from(diff / size), bits))
+                } else {
+                    let diff = i128::from(a_off) - i128::from(b_off);
+                    let sz = i128::from(size);
+                    if diff % sz != 0 {
+                        return Err(Stop::Refused(Refusal::Overflow { op: Arith::Div }));
+                    }
+                    let q = diff / sz;
+                    s(mask(q.cast_unsigned(), bits))
+                }
+            }
             Intrinsic::DiscriminantValue => {
                 Err(malformed("`discriminant_value` not compiled to its enum's facts"))
             }

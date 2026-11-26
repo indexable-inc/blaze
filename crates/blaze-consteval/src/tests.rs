@@ -1173,6 +1173,36 @@ fn offset_intrinsic_overflow_is_refused() {
     assert!(refusal(&mut w, "OVER_MIN").contains("OutOfBounds"));
 }
 
+/// `Intrinsic::PtrOffsetFrom` and `Intrinsic::PtrOffsetFromUnsigned` compute element-scaled
+/// offsets within one allocation (e.g. `interprocess::os::unix::ud_addr::PATH_OFFSET`), and
+/// refuse cross-allocation, ZST, negative unsigned, and non-exact differences.
+#[test]
+fn ptr_offset_from_and_unsigned_evaluate_and_refuse_invalid() {
+    let mut w = world();
+    let p0 = w.fx.param(0);
+    let ptr = w.fx.ty(PNode::Ptr(blaze_typeck::Mutbl::Not, p0));
+    let isize_ = w.ty("isize");
+    let usize_ = w.ty("usize");
+    w.intrinsic("ptr_offset_from", 1, &[ptr, ptr], isize_, Intrinsic::PtrOffsetFrom);
+    w.intrinsic("ptr_offset_from_unsigned", 1, &[ptr, ptr], usize_, Intrinsic::PtrOffsetFromUnsigned);
+    w.strukt("Addr", &[("family", "u16"), ("path", "[u8; 8]")]);
+    w.konst("POS_U32", "isize", "{ let a = [10u32, 20, 30, 40]; ptr_offset_from(&raw const a[3], &raw const a[1]) }");
+    w.konst("NEG_U32", "isize", "{ let a = [10u32, 20, 30, 40]; ptr_offset_from(&raw const a[1], &raw const a[3]) }");
+    w.konst("FIELD_OFF", "isize", "{ let s = Addr { family: 1, path: [0; 8] }; ptr_offset_from(&raw const s.path as *const u8, &raw const s as *const u8) }");
+    w.konst("UNSIGNED_OK", "usize", "{ let a = [10u32, 20, 30, 40]; ptr_offset_from_unsigned(&raw const a[3], &raw const a[1]) }");
+    w.konst("UNSIGNED_NEG", "usize", "{ let a = [10u32, 20, 30, 40]; ptr_offset_from_unsigned(&raw const a[1], &raw const a[3]) }");
+    w.konst("DIFF_ALLOC", "isize", "{ let a = 1u32; let b = 2u32; ptr_offset_from(&raw const a, &raw const b) }");
+    w.konst("ZST", "isize", "{ let a = (); ptr_offset_from(&raw const a, &raw const a) }");
+    w.build();
+    assert_eq!(eval_int(&mut w, "POS_U32"), Ok(2));
+    assert_eq!(eval_int(&mut w, "NEG_U32"), Ok(u128::from((-2i64).cast_unsigned())));
+    assert_eq!(eval_int(&mut w, "FIELD_OFF"), Ok(2));
+    assert_eq!(eval_int(&mut w, "UNSIGNED_OK"), Ok(2));
+    assert!(refusal(&mut w, "UNSIGNED_NEG").contains("Overflow"));
+    assert!(refusal(&mut w, "DIFF_ALLOC").contains("PointerCompare"));
+    assert!(refusal(&mut w, "ZST").contains("DivByZero"));
+}
+
 /// The Reference, "Raw borrow operators" (`&raw const`, `&raw mut`): forms a thin or wide raw
 /// pointer to a place (locals, struct/tuple fields, array elements, slices/`str`/DST tails,
 /// and `static` / `static mut` items) without reading the pointee or requiring a safe
