@@ -373,12 +373,18 @@ pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), M
 
 /// The record of `id` in `store` (prefers native `.dylib`/`.so` over `module.wasm` when present).
 pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, ModuleError> {
-    let key = module_key(id);
+    read_module_by_key(store, module_key(id), id.name, id.version)
+}
+
+/// The record for `key` (`name` `version`) in `store` (prefers native `.dylib`/`.so` over
+/// `module.wasm` when present). Used both on initial registration ([`read_module`]) and when
+/// a `MacroModule` task self-compiles and publishes the module later in the same command.
+pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) -> Result<ModuleRecord, ModuleError> {
     let dir = store.join("proc-macro/modules").join(&key);
     let native_path = dir.join(native_dylib_filename());
     let is_native = dir.join("dylib-sha256").is_file() && native_path.is_file();
     if !is_native && !dir.join("wasm-sha256").exists() {
-        return Err(ModuleError::Missing { name: id.name.to_owned(), version: id.version.to_owned(), key });
+        return Err(ModuleError::Missing { name: name.to_owned(), version: version.to_owned(), key });
     }
     let read = |file: &str| -> Result<Vec<u8>, ModuleError> {
         let path = dir.join(file);
@@ -397,9 +403,9 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
             Some("bang") => ProcKind::FnLike,
             _ => return Err(bad()),
         };
-        let name = parts.next().filter(|it| !it.is_empty()).ok_or_else(bad)?.to_owned();
+        let macro_name = parts.next().filter(|it| !it.is_empty()).ok_or_else(bad)?.to_owned();
         let helpers = parts.next().unwrap_or("").split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect();
-        macros.push(Exported { index, kind, name, helpers });
+        macros.push(Exported { index, kind, name: macro_name, helpers });
     }
     let decls = if is_native {
         dir.join("decls")
@@ -414,8 +420,8 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
     };
     Ok(ModuleRecord {
         key,
-        name: id.name.to_owned(),
-        version: id.version.to_owned(),
+        name: name.to_owned(),
+        version: version.to_owned(),
         wasm_sha256: held,
         macros,
         decls,

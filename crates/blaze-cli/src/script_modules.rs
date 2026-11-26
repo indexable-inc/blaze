@@ -95,7 +95,14 @@ pub(crate) struct Wanted<'w> {
 /// module's `wasm-sha256`; for a native run (D112) the host binary built for the pinned host
 /// (`target <host>`), its out the binary's `bin-sha256`. The same record the `Script` run
 /// then reads (blaze-proc-macro `script_unit::prepare` or `native_unit::native_outputs`).
-pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Task<'_>, held: &'b bstd::mem::Frame) -> Result<Did<'b>, CliError> {
+pub(crate) fn run<'b>(
+    cx: &Cx,
+    home: Option<&str>,
+    wanted: Wanted<'_>,
+    compile: Option<crate::wasm64_compile::CompileInputs<'_>>,
+    task: &Task<'_>,
+    held: &'b bstd::mem::Frame,
+) -> Result<Did<'b>, CliError> {
     let _cx = cx.span("script module: look the module up");
     let name = task.name;
     let refused = |what: &'static str| TaskFailure { name, why: Why::Refused { what, rule: RULE } };
@@ -118,6 +125,28 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
         Err(error) => return Ok(unread(&error)),
     };
     let Some(record) = found else {
+        if ran_as == RanAs::Wasm
+            && let Some(inputs) = compile
+        {
+            let _compile_cx = cx.span("script module: self-compile build.rs to wasm64");
+            match crate::wasm64_compile::compile_build_script(&store, inputs, package, version, features) {
+                Ok(wasm_sha256) => {
+                    let mut made = Made::new_in(name, held);
+                    made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.trim().as_bytes());
+                    return Ok(Did::Done(made));
+                }
+                Err(why) => {
+                    let words = bstd::mem::format_in!(
+                        held,
+                        "the build script of {package} {version}: wasm64 self-compilation failed: {why}"
+                    );
+                    return Ok(Did::FailedSaying(
+                        refused("build-script wasm64 self-compilation failed"),
+                        held_str(words.as_str(), held),
+                    ));
+                }
+            }
+        }
         let asked = asked_lines(ran_as, package, version, features, host);
         let nearest = match blaze_proc_macro::script_unit::records_named(&store, package, version) {
             Ok(nearest) => nearest,

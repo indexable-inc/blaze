@@ -177,6 +177,7 @@ pub(crate) fn run<'b>(
     lock: Option<&crate::fetch::Lockfile<'_>>,
     crates: &mut Option<MacroCrates>,
     place: Place<'_, '_>,
+    compile: Option<crate::wasm64_compile::CompileInputs<'_>>,
     task: &Task<'_>,
     frame: &Frame,
     held: &'b Frame,
@@ -227,6 +228,26 @@ pub(crate) fn run<'b>(
             Ok(Did::Done(made))
         }
         Err(ModuleError::Missing { name: package, version, key }) => {
+            if let Some(inputs) = compile {
+                let _compile_cx = cx.span("macro module: self-compile proc-macro to wasm64");
+                match crate::wasm64_compile::compile_proc_macro(&modules, inputs, identity) {
+                    Ok(wasm_sha256) => {
+                        let mut made = Made::new_in(name, held);
+                        made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.as_bytes());
+                        return Ok(Did::Done(made));
+                    }
+                    Err(why) => {
+                        let words = bstd::mem::format_in!(
+                            held,
+                            "{package} {version}: wasm64 proc-macro self-compilation failed (key {key}): {why}"
+                        );
+                        return Ok(Did::FailedSaying(
+                            refused("proc-macro wasm64 self-compilation failed"),
+                            held_str(words.as_str(), held),
+                        ));
+                    }
+                }
+            }
             let features = identity.with_id(|id| match id.features.is_empty() {
                 true => std::string::String::new(),
                 false => std::format!("\"{}\"", id.features.join("\", \"")),
