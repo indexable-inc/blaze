@@ -54,7 +54,7 @@ use super::{
     TaskError,
     claim::{Claim, ClaimPlant, Start},
     deque::{Deque, DequePlant, Steal},
-    idle::{Idle, IdlePlant, Mark, Woke},
+    idle::{BITMAP_WORDS, Idle, IdlePlant, Mark, Woke},
     ring::{self, PoolPlant, RingEnd},
     seat::{Current, Named, Seats},
 };
@@ -80,6 +80,10 @@ pub(crate) const INJECT: usize = 1024;
 
 /// The slots of a worker's pinned queue.
 pub(crate) const PINNED: usize = 64;
+
+/// Maximum victim deques a searching worker probes in a single [`Pool::find`] pass: keeps steal
+/// scans O(1) on 128-core hosts while rotating across all peers over successive spin rounds.
+pub(crate) const MAX_STEAL_VICTIMS: usize = 16;
 
 /// How many times an idle worker looks again, spinning between, before it parks: about a few
 /// microseconds, the cost of one park and wake.
@@ -246,11 +250,16 @@ pub(crate) struct Tally {
     /// tasks in spawn order (so a scope fails the same under every layout).
     failed: Lock<Option<(u32, TaskError)>>,
     cancel: Canceller,
-    /// The scope's thread parks here while it waits for a task; only that thread parks on it.
-    owner: Parker,
-    /// What the scope's joins did, and how many of its tasks ended (task/help.rs).
-    joins: super::help::Joins,
+    /// The scope's thread parks here while it waits for a task; only that thread parks on it,
+    /// isolated onto its own 128-byte line away from `joins`.
+    owner: Padded<Parker>,
+    /// What the scope's joins did, and how many of its tasks ended (task/help.rs), padded onto
+    /// its own 128-byte line so concurrent task completions never false-share with `owner`.
+    joins: Padded<super::help::Joins>,
 }
+
+const _: () = assert!(core::mem::offset_of!(Tally, owner) % LINE == 0);
+const _: () = assert!(core::mem::offset_of!(Tally, joins) % LINE == 0);
 
 impl Tally {
     pub(crate) fn new(cancel: Canceller) -> Arc<Tally, Global> {
@@ -259,8 +268,8 @@ impl Tally {
                 running: Padded(AtomicUsize::new(0)),
                 failed: Lock::new("bstd.task.failed", None),
                 cancel,
-                owner: Parker::new(),
-                joins: super::help::Joins::new(),
+                owner: Padded(Parker::new()),
+                joins: Padded(super::help::Joins::new()),
             },
             Global,
         )
@@ -268,7 +277,7 @@ impl Tally {
 
     /// What the scope's joins did so far, and its count of ended tasks (task/help.rs).
     pub(crate) fn joins(&self) -> &super::help::Joins {
-        &self.joins
+        &self.joins.0
     }
 
     /// Task `index` failed: the scope is cancelled, and the failure kept if it is the lowest.
@@ -308,8 +317,8 @@ impl Tally {
         self.running.0.fetch_sub(1, Ordering::AcqRel);
         // After the task's `DONE` (its runner's store before this call) and before the wake: a
         // batch join that reads this count and then sweeps misses no task (task/help.rs).
-        self.joins.ended.fetch_add(1, Ordering::AcqRel);
-        self.owner.unpark();
+        self.joins.0.ended.fetch_add(1, Ordering::AcqRel);
+        self.owner.0.unpark();
     }
 }
 
@@ -551,6 +560,9 @@ struct Worker {
     /// Steals from its own group and from the others: its own counters, read by a test.
     stole_near: AtomicU64,
     stole_far: AtomicU64,
+    /// Per-worker rotating steal seed (written only by this worker, Relaxed) to spread bounded
+    /// steal probes uniformly across all peers on large-core machines.
+    steal_cursor: AtomicU32,
 }
 
 /// One group's shared state, padded to 128 bytes so adjacent CCX/L3 groups never false-share.
@@ -573,6 +585,9 @@ struct Shared {
     workers: Vec<Padded<Worker>, Global>,
     groups: Vec<GroupState, Global>,
     idle: Idle,
+    /// Monotonic bitmap of started worker threads (up to 512 workers): paired with
+    /// [`Idle::parked_mask`] so [`Pool::notify`] wakes a started parked worker in O(1).
+    started_mask: [Padded<AtomicU64>; BITMAP_WORDS],
     stop: Padded<AtomicBool>,
     /// The group an outside spawn goes to next (round robin).
     next_group: Padded<AtomicU32>,
@@ -784,6 +799,7 @@ impl Pool {
                     broken: Lock::new("bstd.task.broken", None),
                     stole_near: AtomicU64::new(0),
                     stole_far: AtomicU64::new(0),
+                    steal_cursor: AtomicU32::new(cpu.wrapping_mul(0x9E37_79B1)),
                 }));
             }
             groups.push(GroupState {
@@ -797,10 +813,12 @@ impl Pool {
             });
             first += len;
         }
+        let group_count = u32::try_from(groups.len()).unwrap_or(1);
         Shared {
             workers,
             groups,
-            idle: Idle::unstarted(count, plants.idle),
+            idle: Idle::unstarted_for(count, group_count, plants.idle),
+            started_mask: [const { Padded(AtomicU64::new(0)) }; BITMAP_WORDS],
             stop: Padded(AtomicBool::new(false)),
             next_group: Padded(AtomicU32::new(0)),
             pin: topology.pin,
@@ -814,12 +832,19 @@ impl Pool {
     /// The unpark comes first and is a token, so a thread started after it, or still starting,
     /// finds its wake: its first act reads the mark as after a park (task/idle.rs).
     fn rouse(&self, at: usize) {
-        let worker = &self.shared().workers[at].0;
+        let shared = self.shared();
+        let Some(slot) = shared.workers.get(at) else {
+            return;
+        };
+        let worker = &slot.0;
         worker.parker.unpark();
         if worker.thread.load(Ordering::Acquire) {
             return;
         }
         if worker.thread.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if let Some(word) = shared.started_mask.get(at / 64) {
+                word.0.fetch_or(1u64 << (at % 64), Ordering::Release);
+            }
             self.0.started.fetch_add(1, Ordering::AcqRel);
             (self.0.starter)(self, u32::try_from(at).unwrap_or(u32::MAX));
         }
@@ -828,9 +853,13 @@ impl Pool {
     /// Starts every worker's thread that has none, now: a test's pool, which then waits for
     /// all of them to park. Each is still parked until a wake reaches it.
     pub(crate) fn start_all(&self) {
-        for at in 0..self.shared().workers.len() {
-            let worker = &self.shared().workers[at].0;
+        let shared = self.shared();
+        for (at, slot) in shared.workers.iter().enumerate() {
+            let worker = &slot.0;
             if worker.thread.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                if let Some(word) = shared.started_mask.get(at / 64) {
+                    word.0.fetch_or(1u64 << (at % 64), Ordering::Release);
+                }
                 self.0.started.fetch_add(1, Ordering::AcqRel);
                 (self.0.starter)(self, u32::try_from(at).unwrap_or(u32::MAX));
             }
@@ -973,6 +1002,7 @@ impl Pool {
                 let head = unsafe { job.0.as_ref() };
                 // A full queue hands back only open tasks: a reserved one goes to a mailbox.
                 if head.claim.by_joiner() {
+                    let _reclaim = blaze_reclaim::enter();
                     // SAFETY: claimed by this thread just now.
                     unsafe { (head.run)(job.0, Here::Outside) };
                 }
@@ -982,12 +1012,25 @@ impl Pool {
         }
     }
 
-    /// After a task is published: wakes at most one parked worker, its group `near` first,
-    /// when no worker is searching (task/idle.rs), and starts its thread if it has none.
+    /// After a task is published: wakes at most one parked worker in O(1) via [`Idle::wake_one_bitmap`],
+    /// preferring started workers in group `near`, then other started workers, then unstarted ones,
+    /// and starts its thread if it has none.
     fn notify(&self, near: u32) {
         let shared = self.shared();
-        let order = self.wake_order(near).map(|at| (at as usize, &shared.workers[at as usize].0.mark));
-        if let Some(at) = shared.idle.wake_one(order) {
+        let (near_first, near_len) = shared
+            .groups
+            .get(usize::try_from(near).unwrap_or(0))
+            .map_or((0, 0), |group| {
+                (usize::try_from(group.first).unwrap_or(0), usize::try_from(group.len).unwrap_or(0))
+            });
+        let woken = shared.idle.wake_one_bitmap(
+            shared.workers.len(),
+            near_first,
+            near_len,
+            |w| shared.started_mask.get(w).map_or(0, |word| word.0.load(Ordering::Acquire)),
+            |at| shared.workers.get(at).map(|worker| &worker.0.mark),
+        );
+        if let Some(at) = woken {
             self.rouse(at);
         }
     }
@@ -1088,7 +1131,7 @@ impl Pool {
                 continue;
             }
             let clock = &self.0.clock;
-            match tally.owner.park(what, Some(Deadline::after(clock.now(), PARK_SLICE)), clock)? {
+            match tally.owner.0.park(what, Some(Deadline::after(clock.now(), PARK_SLICE)), clock)? {
                 Waited::Ready(()) | Waited::Deadline => {}
             }
         }
@@ -1114,6 +1157,7 @@ impl Pool {
         let head = unsafe { job.0.as_ref() };
         let took = super::help::take(&head.claim, super::help::HelpPlant::None);
         if took {
+            let _reclaim = blaze_reclaim::enter();
             // SAFETY: claimed by this thread just now, so the body is this thread's to run, once.
             unsafe { (head.run)(job.0, here) };
         }
@@ -1181,6 +1225,9 @@ impl Pool {
         // SAFETY: the queue's reference keeps the job alive until the release below.
         let head = unsafe { header.as_ref() };
         if head.claim.by_worker() {
+            // Pin the reclaim epoch once for the whole job so nested `SharedMap::pin()` calls
+            // inside the job hit the thread-local depth fast path with zero `SeqCst` fences.
+            let _reclaim = blaze_reclaim::enter();
             let outer = worker.current.set(head.name);
             // SAFETY: claimed by this thread just now.
             unsafe { (head.run)(header, Here::Worker(at)) };
@@ -1194,10 +1241,11 @@ impl Pool {
     /// looks.
     pub(crate) fn work(&self, at: u32) {
         let shared = self.shared();
+        let at_idx = usize::try_from(at).unwrap_or(0);
         let worker = &shared.workers[at as usize].0;
         // The thread was parked before it existed (task/idle.rs): it comes back as from a
         // park, a searcher if a spawn woke it, its mailbox first if it was reserved.
-        let mut searching = shared.idle.back(&worker.mark) == Woke::Searching;
+        let mut searching = shared.idle.back_at(at_idx, &worker.mark) == Woke::Searching;
         #[cfg(test)]
         self.0.arrived.fetch_add(1, Ordering::SeqCst);
         let mut looks = 0;
@@ -1247,7 +1295,7 @@ impl Pool {
                 continue;
             }
             looks = 0;
-            if !shared.idle.to_park(&worker.mark, searching) {
+            if !shared.idle.to_park_at(at_idx, &worker.mark, searching) {
                 // Reserved: the mailbox, at the loop's top.
                 searching = false;
                 continue;
@@ -1255,14 +1303,14 @@ impl Pool {
             searching = false;
             // The re-check after the fence: every queue once more (task/idle.rs).
             let woke = if self.visible(at) || shared.stop.0.load(Ordering::Acquire) {
-                shared.idle.back(&worker.mark)
+                shared.idle.back_at(at_idx, &worker.mark)
             } else {
                 // Honor any pending cross-thread spare-frame trim request before parking idle
                 // (`blaze_mem::frame::ask_spare_trim`): 1 relaxed atomic load on the fast path.
                 let _ = blaze_mem::frame::settle_spare();
                 let clock = &self.0.clock;
                 let parked = worker.parker.park("bstd.task.worker.idle", Some(Deadline::after(clock.now(), PARK_SLICE)), clock);
-                let woke = shared.idle.back(&worker.mark);
+                let woke = shared.idle.back_at(at_idx, &worker.mark);
                 if let Err(why) = parked {
                     *worker.broken.lock() = Some(why);
                     if woke == Woke::Searching {
@@ -1314,25 +1362,65 @@ impl Pool {
             *searching = true;
         }
         let groups = shared.groups.len();
-        let me = worker.group as usize;
+        let me = usize::try_from(worker.group).unwrap_or(0);
         // The planted control starts one group on: the thief's own group comes last.
         let first = usize::from(self.0.plants.find == FindPlant::FarFirst);
+        let large_pool = shared.workers.len() > MAX_STEAL_VICTIMS;
+        let seed = if large_pool {
+            let cur = worker.steal_cursor.load(Ordering::Relaxed);
+            worker.steal_cursor.store(cur.wrapping_add(1), Ordering::Relaxed);
+            cur
+        } else {
+            0
+        };
+        let mut budget = MAX_STEAL_VICTIMS;
         for step in 0..groups {
-            let at_group = (me + first + step) % groups;
-            let group = &shared.groups[at_group];
-            // Start past the thief in its own group, so thieves spread over victims.
-            for k in 0..group.len {
-                let victim = group.first + (at + 1 + k) % group.len;
-                if victim == at {
-                    continue;
-                }
-                match shared.workers[victim as usize].0.deque.steal_half_into(&worker.deque) {
-                    Steal::Taken(job) => {
-                        let counter = if at_group == me { &worker.stole_near } else { &worker.stole_far };
-                        counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                        return Some(JobPtr(job));
+            let at_group = if large_pool && step > 0 && groups > 1 {
+                let far_groups = groups - 1;
+                let rot = usize::try_from(seed).unwrap_or(0) % far_groups;
+                (me + first + 1 + (rot + step - 1) % far_groups) % groups
+            } else {
+                (me + first + step) % groups
+            };
+            let Some(group) = shared.groups.get(at_group) else { continue };
+            if budget > 0 && group.len > 0 {
+                let group_len = usize::try_from(group.len).unwrap_or(0);
+                let probe_limit = if !large_pool {
+                    group_len
+                } else if step == 0 && groups > 1 {
+                    group_len.min(budget.min(MAX_STEAL_VICTIMS / 2))
+                } else {
+                    group_len.min(budget.div_ceil(groups - step))
+                };
+                let start_offset = if large_pool {
+                    at.wrapping_add(1).wrapping_add(seed).wrapping_add(u32::try_from(step).unwrap_or(0))
+                } else {
+                    at.wrapping_add(1)
+                };
+                for k in 0..probe_limit {
+                    let k_u32 = u32::try_from(k).unwrap_or(0);
+                    let victim = group.first + start_offset.wrapping_add(k_u32) % group.len;
+                    if victim == at {
+                        continue;
                     }
-                    Steal::Empty | Steal::Lost => {}
+                    budget = budget.saturating_sub(1);
+                    let victim_idx = usize::try_from(victim).unwrap_or(0);
+                    let Some(victim_worker) = shared.workers.get(victim_idx) else { continue };
+                    // Skip empty victim deques with relaxed loads before paying `steal`'s `SeqCst` fence.
+                    if victim_worker.0.deque.looks_empty() {
+                        continue;
+                    }
+                    match victim_worker.0.deque.steal_half_into(&worker.deque) {
+                        Steal::Taken(job) => {
+                            let counter = if at_group == me { &worker.stole_near } else { &worker.stole_far };
+                            counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                            return Some(JobPtr(job));
+                        }
+                        Steal::Empty | Steal::Lost => {}
+                    }
+                    if budget == 0 {
+                        break;
+                    }
                 }
             }
             if at_group != me
@@ -1342,7 +1430,9 @@ impl Pool {
             }
         }
         for step in 0..groups {
-            if let Some(job) = take(&shared.groups[(me + step) % groups], classes[1]) {
+            if let Some(group) = shared.groups.get((me + step) % groups)
+                && let Some(job) = take(group, classes[1])
+            {
                 return Some(job);
             }
         }
@@ -1495,5 +1585,48 @@ impl Drop for Shared {
             // SAFETY: the queue's reference, given up once.
             unsafe { (head.release)(job.0) };
         }
+    }
+}
+
+#[cfg(all(test, not(blaze_check)))]
+mod scale_128_tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::time::Duration;
+
+    use blaze_core::wait::{Deadline, Monotonic};
+    use blaze_mem::{Frame, Tag};
+
+    use super::{Class, Here, LINE, Plants, Pool, Ran, Start, Tally, Topology, job};
+    use crate::{cx::Cx, io::Io, mem::TASK_FRAME};
+
+    fn no_threads(_pool: &Pool, _at: u32) {}
+
+    #[test]
+    fn tally_pads_owner_and_joins_and_run_job_enters_reclaim_task() {
+        assert_eq!(core::mem::offset_of!(Tally, owner) % LINE, 0);
+        assert_eq!(core::mem::offset_of!(Tally, joins) % LINE, 0);
+        assert_ne!(core::mem::offset_of!(Tally, owner), core::mem::offset_of!(Tally, joins));
+
+        let pool = Pool::new(&Topology::groups(&[(Class::Foreground, 16); 8]), Monotonic::new(), Plants::NONE, no_threads);
+        assert_eq!(pool.workers(), 128);
+        assert_eq!(pool.groups(), 8);
+
+        let io = Io::sim(31);
+        let frame = Frame::with_reserve(TASK_FRAME, Tag::Frames).expect("frame");
+        let cx = Cx::root_on(Deadline::after(io.now(), Duration::from_secs(60)), frame, io, pool.clone());
+        let tally = Tally::new(cx.canceller());
+        let saw_in_task = AtomicBool::new(false);
+        // SAFETY: body runs to completion below before `saw_in_task` drops.
+        let (queued, ptr) = unsafe {
+            job::<_, ()>("reclaim_check", &tally, Start::Open, |_here: Here| {
+                saw_in_task.store(blaze_reclaim::in_task(), Ordering::SeqCst);
+                Ran::Made(())
+            })
+        };
+        assert!(!blaze_reclaim::in_task(), "outside a job, thread is not in a reclaim task");
+        pool.run_job(0, ptr);
+        assert!(queued.done());
+        assert!(saw_in_task.load(Ordering::SeqCst), "Pool::run_job must enter a blaze_reclaim task");
+        assert!(!blaze_reclaim::in_task(), "reclaim guard drops when run_job finishes");
     }
 }

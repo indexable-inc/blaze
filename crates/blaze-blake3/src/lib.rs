@@ -713,6 +713,267 @@ impl Default for Hasher {
     }
 }
 
+/// A streaming hasher for one aligned subtree of a BLAKE3 Merkle tree, starting at chunk counter
+/// `start_chunk`. Feeds arbitrary slices through the same wide SIMD subtree compressor as
+/// [`Hasher`] and finishes either as a non-root 8-word chaining value
+/// ([`SubtreeHasher::finalize_non_root`]) for parallel parent folding via [`finalize_subtrees`],
+/// or as a root digest when `start_chunk == 0` and this subtree covers the entire message
+/// ([`SubtreeHasher::finalize_root`]).
+#[derive(Clone)]
+pub struct SubtreeHasher {
+    start_chunk: u64,
+    chunk: ChunkState,
+    stack: [[u32; 8]; MAX_DEPTH + 1],
+    key: [u32; 8],
+    flags: u32,
+    engine: Engine,
+    stack_len: u8,
+}
+
+impl SubtreeHasher {
+    /// A subtree hasher initialized with explicit `key` words, `flags`, and starting chunk counter
+    /// `start_chunk`, running on this CPU's detected [`Engine`].
+    pub fn new(key: &[u32; 8], flags: u32, start_chunk: u64) -> SubtreeHasher {
+        SubtreeHasher::with_engine(Engine::detected(), *key, flags, start_chunk)
+    }
+
+    /// A subtree hasher in BLAKE3's plain mode (`IV`, flags `0`) starting at `start_chunk`.
+    pub fn new_subtree(start_chunk: u64) -> SubtreeHasher {
+        SubtreeHasher::with_engine(Engine::detected(), IV, 0, start_chunk)
+    }
+
+    /// A subtree hasher in BLAKE3's keyed mode under `key` starting at `start_chunk`.
+    pub fn new_keyed(key: &[u8; OUT_LEN], start_chunk: u64) -> SubtreeHasher {
+        SubtreeHasher::with_engine(Engine::detected(), words_of(key), KEYED_HASH, start_chunk)
+    }
+
+    /// A subtree hasher in BLAKE3's key-derivation material mode under context key `key` starting
+    /// at `start_chunk`.
+    pub fn new_from_context_key(key: &[u8; OUT_LEN], start_chunk: u64) -> SubtreeHasher {
+        SubtreeHasher::with_engine(Engine::detected(), words_of(key), DERIVE_KEY_MATERIAL, start_chunk)
+    }
+
+    /// A subtree hasher of `mode` starting at `start_chunk` on a handed `engine`.
+    pub fn on(engine: Engine, mode: Mode, start_chunk: u64) -> SubtreeHasher {
+        let (key, flags) = mode.key_and_flags();
+        SubtreeHasher::with_engine(engine, key, flags, start_chunk)
+    }
+
+    fn with_engine(engine: Engine, key: [u32; 8], flags: u32, start_chunk: u64) -> SubtreeHasher {
+        SubtreeHasher {
+            start_chunk,
+            chunk: ChunkState::new(&key, start_chunk, flags),
+            stack: [[0; 8]; MAX_DEPTH + 1],
+            key,
+            flags,
+            engine,
+            stack_len: 0,
+        }
+    }
+
+    /// Feeds `input` into this subtree.
+    pub fn update(&mut self, mut input: &[u8]) -> &mut SubtreeHasher {
+        if self.chunk.append(input) {
+            return self;
+        }
+        let e = self.engine;
+        if self.chunk.len() > 0 {
+            let take = (CHUNK_LEN - self.chunk.len()).min(input.len());
+            let Some(head) = input.get(..take) else {
+                return self;
+            };
+            let Some(tail) = input.get(take..) else {
+                return self;
+            };
+            self.chunk.update(e, head);
+            input = tail;
+            if input.is_empty() {
+                return self;
+            }
+            let global_counter = self.chunk.counter;
+            let local_counter = global_counter.wrapping_sub(self.start_chunk);
+            let cv = self.chunk.output(e).chaining_value();
+            self.push_cv(cv, local_counter);
+            self.chunk = ChunkState::new(&self.key, global_counter.wrapping_add(1), self.flags);
+        }
+        while input.len() > CHUNK_LEN {
+            let global_counter = self.chunk.counter;
+            let local_counter = global_counter.wrapping_sub(self.start_chunk);
+            let so_far = local_counter.wrapping_mul(CHUNK_LEN.widen_to::<u64>());
+            let mut subtree = tree::largest_power_of_two_at_most(input.len());
+            while subtree > CHUNK_LEN && (subtree - 1).widen_to::<u64>() & so_far != 0 {
+                subtree /= 2;
+            }
+            let chunks = (subtree / CHUNK_LEN).widen_to::<u64>();
+            if subtree <= CHUNK_LEN {
+                let Some((chunk, rest)) = input.split_first_chunk::<CHUNK_LEN>() else {
+                    break;
+                };
+                self.push_cv(tree::chunk_cv(e, &self.key, self.flags, chunk, global_counter), local_counter);
+                self.chunk = ChunkState::new(&self.key, global_counter.wrapping_add(1), self.flags);
+                input = rest;
+            } else {
+                let Some(head) = input.get(..subtree) else {
+                    break;
+                };
+                let Some(rest) = input.get(subtree..) else {
+                    break;
+                };
+                let [left, right] = tree::subtree_to_parent(e, &self.key, self.flags, head, global_counter);
+                self.push_cv(left, local_counter);
+                self.push_cv(right, local_counter.wrapping_add(chunks / 2));
+                self.chunk = ChunkState::new(&self.key, global_counter.wrapping_add(chunks), self.flags);
+                input = rest;
+            }
+        }
+        self.chunk.update(e, input);
+        self
+    }
+
+    fn push_cv(&mut self, cv: [u32; 8], local_counter: u64) {
+        let keep = local_counter.count_ones();
+        while u32::from(self.stack_len) > keep {
+            let top = usize::from(self.stack_len);
+            let Some(below) = top.checked_sub(2) else {
+                break;
+            };
+            let (Some(left), Some(right)) = (self.stack.get(below), self.stack.get(top - 1)) else {
+                break;
+            };
+            let merged = parent_output(left, right, &self.key, self.flags, self.engine).chaining_value();
+            if let Some(slot) = self.stack.get_mut(below) {
+                *slot = merged;
+            }
+            self.stack_len = self.stack_len.saturating_sub(1);
+        }
+        if let Some(slot) = self.stack.get_mut(usize::from(self.stack_len)) {
+            *slot = cv;
+            self.stack_len = self.stack_len.saturating_add(1);
+        }
+    }
+
+    fn root(&self) -> Output {
+        let e = self.engine;
+        let depth = usize::from(self.stack_len);
+        if depth == 0 {
+            return self.chunk.output(e);
+        }
+        let (mut output, left) = if self.chunk.len() > 0 {
+            let local_counter = self.chunk.counter.wrapping_sub(self.start_chunk);
+            let keep = local_counter.count_ones();
+            let mut top = self.stack_len;
+            let mut merged = self.stack.get(depth.saturating_sub(1)).copied().unwrap_or(self.key);
+            while u32::from(top) > keep {
+                let Some(below) = usize::from(top).checked_sub(2) else {
+                    break;
+                };
+                let Some(left_cv) = self.stack.get(below) else {
+                    break;
+                };
+                merged = parent_output(left_cv, &merged, &self.key, self.flags, e).chaining_value();
+                top = top.saturating_sub(1);
+            }
+            let chunk = self.chunk.output(e).chaining_value();
+            (parent_output(&merged, &chunk, &self.key, self.flags, e), usize::from(top).saturating_sub(1))
+        } else {
+            let (Some(left_cv), Some(right_cv)) = (
+                depth.checked_sub(2).and_then(|i| self.stack.get(i)),
+                depth.checked_sub(1).and_then(|i| self.stack.get(i)),
+            ) else {
+                return self.chunk.output(e);
+            };
+            (parent_output(left_cv, right_cv, &self.key, self.flags, e), depth.saturating_sub(2))
+        };
+        if let Some(rest) = self.stack.get(..left) {
+            for cv in rest.iter().rev() {
+                output = parent_output(cv, &output.chaining_value(), &self.key, self.flags, e);
+            }
+        }
+        output
+    }
+
+    /// Compresses this subtree's top node WITHOUT the `ROOT` flag, yielding its 8-word chaining
+    /// value for parent-level folding via [`finalize_subtrees`].
+    pub fn finalize_non_root(&self) -> [u32; 8] {
+        self.root().chaining_value()
+    }
+
+    /// Compresses this subtree's top node WITH the `ROOT` flag (valid when `start_chunk == 0` and
+    /// this subtree covers the entire message).
+    pub fn finalize_root(&self) -> [u8; OUT_LEN] {
+        first_32(&self.root().root_block(0))
+    }
+}
+
+/// Folds the chaining values of aligned power-of-two subtrees (`stripe_chunks` chunks each, plus
+/// an optional shorter final tail subtree) into the final 32-byte BLAKE3 digest in plain mode.
+///
+/// Requires `stripe_chunks.is_power_of_two()` and either zero subtrees (empty input) or at least
+/// two subtrees (`full_cvs.len() + usize::from(tail_cv.is_some()) >= 2`); for a message that fits
+/// inside a single stripe, use [`Hasher`] or [`SubtreeHasher::finalize_root`].
+pub fn finalize_subtrees(stripe_chunks: u64, full_cvs: &[[u32; 8]], tail_cv: Option<[u32; 8]>) -> [u8; OUT_LEN] {
+    finalize_subtrees_with(Engine::detected(), &IV, 0, stripe_chunks, full_cvs, tail_cv)
+}
+
+/// [`finalize_subtrees`] in keyed mode under `key`.
+pub fn finalize_subtrees_keyed(
+    key: &[u8; OUT_LEN],
+    stripe_chunks: u64,
+    full_cvs: &[[u32; 8]],
+    tail_cv: Option<[u32; 8]>,
+) -> [u8; OUT_LEN] {
+    finalize_subtrees_with(Engine::detected(), &words_of(key), KEYED_HASH, stripe_chunks, full_cvs, tail_cv)
+}
+
+/// [`finalize_subtrees`] in key-derivation material mode under context key `key`.
+pub fn finalize_subtrees_from_context_key(
+    key: &[u8; OUT_LEN],
+    stripe_chunks: u64,
+    full_cvs: &[[u32; 8]],
+    tail_cv: Option<[u32; 8]>,
+) -> [u8; OUT_LEN] {
+    finalize_subtrees_with(Engine::detected(), &words_of(key), DERIVE_KEY_MATERIAL, stripe_chunks, full_cvs, tail_cv)
+}
+
+/// [`finalize_subtrees`] for `mode` on a handed `engine`.
+pub fn finalize_subtrees_on(
+    engine: Engine,
+    mode: Mode,
+    stripe_chunks: u64,
+    full_cvs: &[[u32; 8]],
+    tail_cv: Option<[u32; 8]>,
+) -> [u8; OUT_LEN] {
+    let (key, flags) = mode.key_and_flags();
+    finalize_subtrees_with(engine, &key, flags, stripe_chunks, full_cvs, tail_cv)
+}
+
+/// [`finalize_subtrees`] with explicit `engine`, `key` words, and `flags`.
+pub fn finalize_subtrees_with(
+    engine: Engine,
+    key: &[u32; 8],
+    flags: u32,
+    stripe_chunks: u64,
+    full_cvs: &[[u32; 8]],
+    tail_cv: Option<[u32; 8]>,
+) -> [u8; OUT_LEN] {
+    let mut hasher = Hasher::with_key(engine, *key, flags);
+    if full_cvs.is_empty() && tail_cv.is_none() {
+        return first_32(&hasher.root().root_block(0));
+    }
+    let step = if stripe_chunks.is_power_of_two() { stripe_chunks } else { 1 };
+    for (idx, &cv) in full_cvs.iter().enumerate() {
+        hasher.push_cv(cv, idx.widen_to::<u64>().wrapping_mul(step));
+    }
+    if let Some(tail) = tail_cv {
+        hasher.push_cv(tail, full_cvs.len().widen_to::<u64>().wrapping_mul(step));
+    }
+    if hasher.stack_len < 2 {
+        let lone = hasher.stack.first().copied().unwrap_or(*key);
+        return bytes_of(&lone);
+    }
+    first_32(&hasher.root().root_block(0))
+}
+
 /// The extended output of a [`Hasher`]: any number of bytes, read from any position.
 #[derive(Clone)]
 pub struct OutputReader {
@@ -985,7 +1246,264 @@ mod tests {
 
     use blaze_sim::{Config, Tape, check};
 
-    use super::{BLOCK_LEN, compress, compress_in_place, first_8, lanes};
+    use super::{
+        BLOCK_LEN, CHUNK_LEN, Hasher, SubtreeHasher, compress, compress_in_place, context_key, first_8,
+        finalize_subtrees, finalize_subtrees_from_context_key, finalize_subtrees_keyed, lanes,
+    };
+
+    /// Deterministic byte value at stream offset `pos`, avoiding any heap buffer for multi-MB tests.
+    fn pattern_byte(pos: usize) -> u8 {
+        let mut x = (pos as u64).wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((x ^ (x >> 31)) >> 56) as u8
+    }
+
+    /// Fills `dst` with [`pattern_byte`] starting at logical stream offset `start`.
+    fn fill_pattern(start: usize, dst: &mut [u8]) {
+        for (i, byte) in dst.iter_mut().enumerate() {
+            *byte = pattern_byte(start + i);
+        }
+    }
+
+    /// Streams logical bytes `start..end` into `feed` in pieces cycling through `splits`
+    /// (or 8 KiB chunks when `splits` is empty), using only a stack buffer.
+    fn stream_pattern(start: usize, end: usize, splits: &[usize], mut feed: impl FnMut(&[u8])) {
+        let mut buf = [0u8; 8192];
+        let mut at = start;
+        let mut step = 0usize;
+        while at < end {
+            let want = if splits.is_empty() {
+                buf.len()
+            } else {
+                splits[step % splits.len()].max(1).min(buf.len())
+            };
+            let take = want.min(end - at);
+            fill_pattern(at, &mut buf[..take]);
+            feed(&buf[..take]);
+            at += take;
+            step += 1;
+        }
+    }
+
+    fn parallel_hash_pattern_plain(len: usize, stripe_chunks: u64, splits: &[usize]) -> [u8; 32] {
+        let stripe_bytes = usize::try_from(stripe_chunks).expect("stripe fits") * CHUNK_LEN;
+        if len == 0 {
+            return finalize_subtrees(stripe_chunks, &[], None);
+        }
+        if len <= stripe_bytes {
+            let mut h = SubtreeHasher::new_subtree(0);
+            stream_pattern(0, len, splits, |chunk| {
+                h.update(chunk);
+            });
+            return h.finalize_root();
+        }
+        let full_count = len / stripe_bytes;
+        let mut full_cvs = [[0u32; 8]; 2048];
+        assert!(full_count <= full_cvs.len(), "test stack cap");
+        for (i, slot) in full_cvs[..full_count].iter_mut().enumerate() {
+            let lo = i * stripe_bytes;
+            let hi = lo + stripe_bytes;
+            let mut h = SubtreeHasher::new_subtree(u64::try_from(i).expect("i fits") * stripe_chunks);
+            stream_pattern(lo, hi, splits, |chunk| {
+                h.update(chunk);
+            });
+            *slot = h.finalize_non_root();
+        }
+        let rem_lo = full_count * stripe_bytes;
+        let tail_cv = if rem_lo < len {
+            let mut h = SubtreeHasher::new_subtree(u64::try_from(full_count).expect("n fits") * stripe_chunks);
+            stream_pattern(rem_lo, len, splits, |chunk| {
+                h.update(chunk);
+            });
+            Some(h.finalize_non_root())
+        } else {
+            None
+        };
+        finalize_subtrees(stripe_chunks, &full_cvs[..full_count], tail_cv)
+    }
+
+    fn feed_slice_split(hasher: &mut SubtreeHasher, data: &[u8], splits: &[usize]) {
+        if splits.is_empty() {
+            hasher.update(data);
+            return;
+        }
+        let mut at = 0usize;
+        let mut step = 0usize;
+        while at < data.len() {
+            let take = splits[step % splits.len()].max(1).min(data.len() - at);
+            hasher.update(&data[at..at + take]);
+            at += take;
+            step += 1;
+        }
+    }
+
+    fn parallel_hash_slice_plain(data: &[u8], stripe_chunks: u64, splits: &[usize]) -> [u8; 32] {
+        let stripe_bytes = usize::try_from(stripe_chunks).expect("stripe fits") * CHUNK_LEN;
+        if data.is_empty() {
+            return finalize_subtrees(stripe_chunks, &[], None);
+        }
+        if data.len() <= stripe_bytes {
+            let mut h = SubtreeHasher::new_subtree(0);
+            feed_slice_split(&mut h, data, splits);
+            return h.finalize_root();
+        }
+        let full_count = data.len() / stripe_bytes;
+        let mut full_cvs = [[0u32; 8]; 64];
+        assert!(full_count <= full_cvs.len(), "slice stack cap");
+        for (i, slot) in full_cvs[..full_count].iter_mut().enumerate() {
+            let lo = i * stripe_bytes;
+            let hi = lo + stripe_bytes;
+            let mut h = SubtreeHasher::new_subtree(u64::try_from(i).expect("i fits") * stripe_chunks);
+            feed_slice_split(&mut h, &data[lo..hi], splits);
+            *slot = h.finalize_non_root();
+        }
+        let rem_lo = full_count * stripe_bytes;
+        let tail_cv = if rem_lo < data.len() {
+            let mut h = SubtreeHasher::new_subtree(u64::try_from(full_count).expect("n fits") * stripe_chunks);
+            feed_slice_split(&mut h, &data[rem_lo..], splits);
+            Some(h.finalize_non_root())
+        } else {
+            None
+        };
+        finalize_subtrees(stripe_chunks, &full_cvs[..full_count], tail_cv)
+    }
+
+    /// `SubtreeHasher` + `finalize_subtrees` matches both `blaze_blake3::Hasher` and the
+    /// official `blake3` crate bit-for-bit across critical lengths, power-of-two stripe widths,
+    /// and arbitrary odd streaming splits.
+    #[test]
+    fn subtree_hasher_matches_reference_across_lengths_stripes_and_splits() {
+        const LENGTHS: &[usize] = &[
+            0, 1, 1023, 1024, 1025, 65_535, 65_536, 65_537, 131_072, 196_608, 500_000, 1_500_000,
+        ];
+        const STRIPES: &[u64] = &[1, 2, 4, 8, 16, 64];
+        const ODD_SPLITS: &[&[usize]] = &[&[], &[1, 7, 63, 64, 65, 333, 1023, 1025, 4099]];
+
+        for &len in LENGTHS {
+            let mut serial = Hasher::new();
+            let mut reference = blake3::Hasher::new();
+            stream_pattern(0, len, &[], |chunk| {
+                serial.update(chunk);
+                reference.update(chunk);
+            });
+            let want_serial = serial.finalize();
+            let want_ref = *reference.finalize().as_bytes();
+            assert_eq!(want_serial, want_ref, "serial mismatch at len={len}");
+
+            for &stripe_chunks in STRIPES {
+                for &splits in ODD_SPLITS {
+                    if len > 196_608 && !splits.is_empty() && stripe_chunks < 64 {
+                        continue;
+                    }
+                    let got = parallel_hash_pattern_plain(len, stripe_chunks, splits);
+                    assert_eq!(
+                        got, want_ref,
+                        "subtree plain mismatch at len={len}, stripe_chunks={stripe_chunks}, splits={splits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `SubtreeHasher` + `finalize_subtrees_from_context_key` and `finalize_subtrees_keyed` match
+    /// official `blake3` derive-key and keyed modes bit-for-bit.
+    #[test]
+    fn subtree_hasher_matches_derive_key_and_keyed_modes() {
+        let domain = "blaze plain store segment 1";
+        let ctx_key = context_key(domain);
+        let mac_key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(7));
+        let splits = [17usize, 64, 511, 1024, 2049, 8193];
+
+        for &len in &[0usize, 1, 1024, 1025, 65_536, 131_072, 196_609, 300_000] {
+            let mut ref_dk = blake3::Hasher::new_derive_key(domain);
+            let mut ref_mac = blake3::Hasher::new_keyed(&mac_key);
+            stream_pattern(0, len, &[], |chunk| {
+                ref_dk.update(chunk);
+                ref_mac.update(chunk);
+            });
+            let want_dk = *ref_dk.finalize().as_bytes();
+            let want_mac = *ref_mac.finalize().as_bytes();
+
+            for &stripe_chunks in &[1u64, 4, 16, 64] {
+                let stripe_bytes = usize::try_from(stripe_chunks).expect("fit") * CHUNK_LEN;
+                let (got_dk, got_mac) = if len == 0 {
+                    (
+                        finalize_subtrees_from_context_key(&ctx_key, stripe_chunks, &[], None),
+                        finalize_subtrees_keyed(&mac_key, stripe_chunks, &[], None),
+                    )
+                } else if len <= stripe_bytes {
+                    let mut h_dk = SubtreeHasher::new_from_context_key(&ctx_key, 0);
+                    let mut h_mac = SubtreeHasher::new_keyed(&mac_key, 0);
+                    stream_pattern(0, len, &splits, |chunk| {
+                        h_dk.update(chunk);
+                        h_mac.update(chunk);
+                    });
+                    (h_dk.finalize_root(), h_mac.finalize_root())
+                } else {
+                    let full = len / stripe_bytes;
+                    let mut dk_cvs = [[0u32; 8]; 512];
+                    let mut mac_cvs = [[0u32; 8]; 512];
+                    assert!(full <= dk_cvs.len());
+                    for i in 0..full {
+                        let lo = i * stripe_bytes;
+                        let hi = lo + stripe_bytes;
+                        let sc = u64::try_from(i).expect("fit") * stripe_chunks;
+                        let mut h_dk = SubtreeHasher::new_from_context_key(&ctx_key, sc);
+                        let mut h_mac = SubtreeHasher::new_keyed(&mac_key, sc);
+                        stream_pattern(lo, hi, &splits, |chunk| {
+                            h_dk.update(chunk);
+                            h_mac.update(chunk);
+                        });
+                        dk_cvs[i] = h_dk.finalize_non_root();
+                        mac_cvs[i] = h_mac.finalize_non_root();
+                    }
+                    let rem = full * stripe_bytes;
+                    let (dk_tail, mac_tail) = if rem < len {
+                        let sc = u64::try_from(full).expect("fit") * stripe_chunks;
+                        let mut h_dk = SubtreeHasher::new_from_context_key(&ctx_key, sc);
+                        let mut h_mac = SubtreeHasher::new_keyed(&mac_key, sc);
+                        stream_pattern(rem, len, &splits, |chunk| {
+                            h_dk.update(chunk);
+                            h_mac.update(chunk);
+                        });
+                        (Some(h_dk.finalize_non_root()), Some(h_mac.finalize_non_root()))
+                    } else {
+                        (None, None)
+                    };
+                    (
+                        finalize_subtrees_from_context_key(&ctx_key, stripe_chunks, &dk_cvs[..full], dk_tail),
+                        finalize_subtrees_keyed(&mac_key, stripe_chunks, &mac_cvs[..full], mac_tail),
+                    )
+                };
+                assert_eq!(got_dk, want_dk, "derive-key mismatch len={len} stripe={stripe_chunks}");
+                assert_eq!(got_mac, want_mac, "keyed mismatch len={len} stripe={stripe_chunks}");
+            }
+        }
+    }
+
+    /// Property test: arbitrary drawn lengths, power-of-two stripe widths, and random streaming
+    /// chunk splits match official `blake3::hash` bit-for-bit.
+    #[test]
+    fn subtree_hasher_property_matches_blake3() {
+        check(Config::cases(200), |tape: &Tape| {
+            let len = usize::try_from(tape.range(0..20_000, "len")).expect("len fits");
+            let mut data = [0u8; 20_000];
+            tape.fill(&mut data[..len], "data");
+            let shift = tape.range(0..5, "stripe_shift");
+            let stripe_chunks = 1u64 << shift;
+            let n_splits = usize::try_from(tape.range(1..6, "n_splits")).expect("n_splits fits");
+            let mut splits = [1usize; 6];
+            for slot in &mut splits[..n_splits] {
+                *slot = usize::try_from(tape.range(1..2049, "split")).expect("split fits");
+            }
+            let got = parallel_hash_slice_plain(&data[..len], stripe_chunks, &splits[..n_splits]);
+            let want = *blake3::hash(&data[..len]).as_bytes();
+            assert_eq!(got, want, "len={len} stripe_chunks={stripe_chunks} splits={:?}", &splits[..n_splits]);
+        });
+    }
 
     /// The in-place form is the first eight words of [`compress`] of the block's words: drawn
     /// chaining values, blocks, counters, lengths and flags.

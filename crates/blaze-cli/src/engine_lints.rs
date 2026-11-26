@@ -71,6 +71,24 @@ const LINTS_FRAME: usize = 1 << 28;
 /// coordinator's frame without spawning a pool worker or reserving a 256 MiB [`LINTS_FRAME`].
 const INLINE_ASKED_MAX: usize = 256;
 
+/// Minimum task count in a multi-file lint phase before workers claim chunks of
+/// [`LINT_CLAIM_CHUNK`] files per atomic `fetch_add` (cuts bus traffic on 128 cores by 4x).
+const LINT_CHUNK_THRESHOLD: usize = 64;
+
+/// Maximum files claimed per atomic `fetch_add` on the parallel lint cursor.
+const LINT_CLAIM_CHUNK: usize = 4;
+
+/// Files claimed per atomic `fetch_add` for `task_count` files across `worker_count` workers:
+/// `1` below [`LINT_CHUNK_THRESHOLD`], otherwise up to [`LINT_CLAIM_CHUNK`] without starving
+/// workers when `task_count < worker_count * LINT_CLAIM_CHUNK`.
+fn lint_claim_chunk(task_count: usize, worker_count: usize) -> usize {
+    if task_count < LINT_CHUNK_THRESHOLD {
+        return 1;
+    }
+    let per_worker = task_count / worker_count.max(1);
+    per_worker.clamp(1, LINT_CLAIM_CHUNK)
+}
+
 /// 3: one task a FILE (lints.rs `file_part`), its source the file part's; 2: one task a unit, its
 /// record ranges of its own text; 1: ranges of its whole text, holes and all.
 const SOURCE_DOMAIN: &str = "blaze-cli engine lint task source 3";
@@ -590,7 +608,8 @@ impl LintsStage {
                 // both serial coordinator `job_of` and per-file 256 MiB mmap/munmap churn on 18-128 cores).
                 let max_workers = usize::try_from(workers.get()).unwrap_or(1).max(1);
                 let worker_count = tasks.len().min(max_workers).max(1);
-                let cursor = AtomicUsize::new(0);
+                let chunk = lint_claim_chunk(tasks.len(), worker_count);
+                let cursor = CachePadded::new(AtomicUsize::new(0));
                 let cursor_ref = &cursor;
                 let scope = cx.scope();
                 scope.narrow_workers(workers, Class::Foreground);
@@ -604,15 +623,21 @@ impl LintsStage {
                         let mut local_counts = LintCounts::default();
                         let mut local_out: blaze_own::Vec<(usize, Ran, u64), SharedAlloc<'a>> = blaze_own::Vec::new_in(alloc);
                         loop {
-                            let idx = cursor_ref.fetch_add(1, Ordering::Relaxed);
-                            let Some(task) = tasks.get(idx) else { break };
-                            let began = clock.now();
-                            let ran = stage
-                                .job_of(outlined, task)
-                                .and_then(|job| stage.run_job_in(cx, &scratch, root, &job, &mut local_counts).map(|linted| (job.file, linted)));
-                            let ns = clock.now().since(began).map_or(0, crate::engine_times::ns);
-                            local_out.push((idx, ran, ns));
-                            let _ = scratch.reset();
+                            let start = cursor_ref.fetch_add(chunk, Ordering::Relaxed);
+                            if start >= tasks.len() {
+                                break;
+                            }
+                            let end = start.saturating_add(chunk).min(tasks.len());
+                            for idx in start..end {
+                                let Some(task) = tasks.get(idx) else { break };
+                                let began = clock.now();
+                                let ran = stage
+                                    .job_of(outlined, task)
+                                    .and_then(|job| stage.run_job_in(cx, &scratch, root, &job, &mut local_counts).map(|linted| (job.file, linted)));
+                                let ns = clock.now().since(began).map_or(0, crate::engine_times::ns);
+                                local_out.push((idx, ran, ns));
+                                let _ = scratch.reset();
+                            }
                         }
                         Ok(Ok((local_out, local_counts)))
                     }));
@@ -980,4 +1005,69 @@ fn lint_text_in(
 fn part_place(parts: &[Part], name: Name) -> Option<u32> {
     let at = parts.binary_search_by_key(&name, |part| part.name).ok()?;
     matches!(parts[at].locate, Locate::Source(_)).then_some(parts[at].place)
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn lint_claim_chunk_scales_and_bounds_cleanly() {
+        assert_eq!(lint_claim_chunk(0, 8), 1);
+        assert_eq!(lint_claim_chunk(1, 8), 1);
+        assert_eq!(lint_claim_chunk(63, 8), 1);
+        assert_eq!(lint_claim_chunk(64, 8), 4);
+        assert_eq!(lint_claim_chunk(64, 16), 4);
+        assert_eq!(lint_claim_chunk(64, 64), 1);
+        assert_eq!(lint_claim_chunk(256, 128), 2);
+        assert_eq!(lint_claim_chunk(512, 128), 4);
+        assert_eq!(lint_claim_chunk(4096, 128), 4);
+    }
+
+    #[test]
+    fn chunked_claiming_visits_every_index_once_in_deterministic_order() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(17, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("root context");
+        let cases = [(1usize, 1u32), (17, 4), (63, 8), (64, 8), (65, 8), (257, 8), (1024, 8)];
+        for (task_count, workers) in cases {
+            let max_workers = usize::try_from(workers).unwrap_or(1).max(1);
+            let worker_count = task_count.min(max_workers).max(1);
+            let chunk = lint_claim_chunk(task_count, worker_count);
+            let cursor = CachePadded::new(AtomicUsize::new(0));
+            let cursor_ref = &cursor;
+            let scope = cx.scope();
+            scope.narrow_workers(NonZeroU32::new(workers).expect("nonzero workers"), Class::Foreground);
+            let mut running = blaze_own::Vec::with_capacity_in(worker_count, cx.frame());
+            for _ in 0..worker_count {
+                running.push(scope.may_overlap("lint chunk test worker", 64 << 10, move |_cx: &Cx| {
+                    let mut local = blaze_own::Vec::new_in(alloc);
+                    loop {
+                        let start = cursor_ref.fetch_add(chunk, Ordering::Relaxed);
+                        if start >= task_count {
+                            break;
+                        }
+                        let end = start.saturating_add(chunk).min(task_count);
+                        for idx in start..end {
+                            let val = u64::try_from(idx).expect("idx fits u64").wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                            local.push((idx, val));
+                        }
+                    }
+                    Ok::<_, Infallible>(local)
+                }));
+            }
+            let mut results = blaze_own::Vec::with_capacity_in(task_count, alloc);
+            for h in running.into_iter() {
+                results.extend(h.join(&cx).expect("join lint chunk worker"));
+            }
+            scope.join(&cx).expect("join lint chunk scope");
+            results.sort_unstable_by_key(|(idx, _)| *idx);
+            let mut expected = blaze_own::Vec::with_capacity_in(task_count, alloc);
+            for idx in 0..task_count {
+                expected.push((idx, u64::try_from(idx).expect("idx fits u64").wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+            }
+            assert_eq!(results.as_slice(), expected.as_slice(), "mismatch for task_count={task_count}, workers={workers}, chunk={chunk}");
+        }
+    }
 }

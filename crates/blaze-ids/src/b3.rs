@@ -48,6 +48,14 @@ pub fn derive_key_with(key: &ContextKey, material: &[u8]) -> [u8; 32] {
 /// `new_from_context_key(key)`, then `update`s and `finalize`.
 pub use blaze_blake3::Hasher;
 
+/// Parallel BLAKE3 Merkle subtree primitives: hash aligned power-of-two stripes independently with
+/// [`SubtreeHasher`] and fold their chaining values into the final 32-byte digest with
+/// [`finalize_subtrees`] (and its keyed / context-key variants).
+pub use blaze_blake3::{
+    SubtreeHasher, finalize_subtrees, finalize_subtrees_from_context_key, finalize_subtrees_keyed,
+    finalize_subtrees_on, finalize_subtrees_with,
+};
+
 /// [`crate::ContentId::of_many`]'s way through what [`crate::many`]'s last blocks don't
 /// cover: every block of a one-chunk input before its last in [`crate::many::leading_lanes`],
 /// a lane each, and an input longer than a chunk through [`derive_key_with`].

@@ -56,8 +56,8 @@ pub use blaze_own::pod::{
 };
 pub use blaze_mem::{
     AppendVec, ArenaLocal, Block, Built, Cache, Column, Frame, FromUtf8Error, HUGE_PAGE, Handle,
-    Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,
-    format_in, page_size,
+    Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, SharedBump, Slab, String,
+    Tag, format_in, page_size,
 };
 pub use blaze_mem::Arena as RequestArena;
 pub mod fast;

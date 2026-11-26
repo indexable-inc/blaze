@@ -79,18 +79,21 @@ pub(crate) struct Solved<'a> {
 }
 
 /// Solves the crate under `root` with the cell core and writes each of its modules' scopes.
-/// `expand(call, def)` makes a call's expansion, which `facts.expansion` then hands back;
-/// `made` lists every module made so far (expansions' modules, blocks); `places` says where
-/// a block's body is written; `held` lists the places of the bodies whose blocks are left to
-/// their own solve (D189 step 4, `BlockScopes::Bodies`), each counted into [`Solved::cuts`].
+/// `expand_batch(batch)` expands a deterministic wave of resolved calls (in ascending `ItemId`
+/// order), which `facts.expansion` then hands back; `made` lists every module made so far
+/// (expansions' modules, blocks); `places` says where a block's body is written; `held` lists the
+/// places of the bodies whose blocks are left to their own solve (D189 step 4,
+/// `BlockScopes::Bodies`), each counted into [`Solved::cuts`]. When `par_workers > 1` and
+/// `par_alloc` is `Some` (a thread-safe allocator living for `'a`), `NamesPart::Scopes` builds
+/// module scopes in parallel via `par.map` and merges them in exact sorted `ItemKey` order.
 #[expect(clippy::too_many_arguments, reason = "the solve's inputs, each named; one caller")]
-pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
+pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>, P: crate::task::Par>(
     facts: &F,
     built: &Built<'_, 'a>,
     enums: &dyn EnumNames<&'a str>,
     places: &dyn Fn(ItemKey) -> Option<(ItemKey, u32)>,
     root: ItemKey,
-    expand: &dyn Fn(ItemKey, Def),
+    expand_batch: &dyn Fn(&[(ItemKey, Def)]),
     made: &dyn Fn(&mut AVec<'_, ItemKey>),
     held: &dyn Fn(&mut AVec<'_, (ItemKey, u32)>),
     check: Option<&dyn Fn() -> u64>,
@@ -99,6 +102,9 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     only: Option<Members<'_>>,
     part: &dyn Fn(NamesPart),
     solve_scratch: &dyn Fn(&mut dyn FnMut(Alloc<'_>)) -> crate::task::Scratch,
+    par: &P,
+    par_alloc: Option<Alloc<'a>>,
+    par_workers: usize,
     bump: Bump<'a>,
 ) -> Result<Solved<'a>, Unwritten> {
     let out_alloc = bump.alloc();
@@ -136,7 +142,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
             }
         }
         part(NamesPart::Run);
-        c.run(facts, expand, &[]).map_err(Unwritten::Run)?;
+        c.run_batched(facts, expand_batch, &[]).map_err(Unwritten::Run)?;
         // The modules no `mod` line names (a block's module) and those made after the walk: solved
         // after the rest, round by round, until a run makes none.
         let mut rounds = 0u32;
@@ -168,7 +174,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
                 }
             }
             part(NamesPart::Run);
-            c.run(facts, expand, &[]).map_err(Unwritten::Run)?;
+            c.run_batched(facts, expand_batch, &[]).map_err(Unwritten::Run)?;
         }
         // Each held body's cut of its module's textual sequence, over the final fragments.
         let mut at: AVec<'_, (ItemKey, u32)> = AVec::new_in(solver_alloc);
@@ -190,12 +196,39 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
         keys.sort_unstable();
         let extra_recorded = records.as_ref().map_or(0, |r| r.recorded.borrow().len());
         let mut done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>> = HashMap::with_capacity_in(keys.len() + extra_recorded, out_alloc);
-        for &k in keys.iter() {
-            let Some((scope, unknown)) = c.scope(&ix, k, out_alloc) else { continue };
-            if unknown > 0 {
-                return Err(Unwritten::Unknown { module: k, count: unknown, why: c.first_unknown(&ix, k) });
+        if par_workers > 1 && keys.len() >= 16
+            && let Some(shared_alloc) = par_alloc
+        {
+            // `&Cells` and `&WriteIndex` are read-only during `Cells::scope`; swapping `c.alloc`
+            // temporarily to the thread-safe `shared_alloc` ensures the ephemeral `seen`/`stack`
+            // scratch inside `scope()` never touches the single-threaded `solver_alloc` frame.
+            let saved_alloc = core::mem::replace(&mut c.alloc, shared_alloc);
+            let mut built_scopes: AVec<'_, Option<(ItemKey, ScopeBuilder<'a, &'a str>, u32)>> = AVec::with_capacity_in(keys.len(), solver_alloc);
+            par.map(
+                keys.len(),
+                |idx| {
+                    let k = keys.get(idx).copied()?;
+                    let (scope, unknown) = c.scope(&ix, k, shared_alloc)?;
+                    Some((k, scope, unknown))
+                },
+                &mut built_scopes,
+            );
+            c.alloc = saved_alloc;
+            for entry in built_scopes {
+                let Some((k, scope, unknown)) = entry else { continue };
+                if unknown > 0 {
+                    return Err(Unwritten::Unknown { module: k, count: unknown, why: c.first_unknown(&ix, k) });
+                }
+                done.insert(k, Resolved { scope, reads: ReadList { entries: AVec::new_in(out_alloc) } });
             }
-            done.insert(k, Resolved { scope, reads: ReadList { entries: AVec::new_in(out_alloc) } });
+        } else {
+            for &k in keys.iter() {
+                let Some((scope, unknown)) = c.scope(&ix, k, out_alloc) else { continue };
+                if unknown > 0 {
+                    return Err(Unwritten::Unknown { module: k, count: unknown, why: c.first_unknown(&ix, k) });
+                }
+                done.insert(k, Resolved { scope, reads: ReadList { entries: AVec::new_in(out_alloc) } });
+            }
         }
         // The modules outside the group a member read: their scopes as their records hold them.
         if let Some(r) = &records {
