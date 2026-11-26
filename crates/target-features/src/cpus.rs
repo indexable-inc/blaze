@@ -8,7 +8,6 @@
 //! `tools/cpus.py` writes from harness/answers.py's record of the pinned nightly and
 //! `llvm_cpus.json`.
 
-use alloc::{borrow::ToOwned, string::String};
 mod table;
 
 use core::fmt;
@@ -46,15 +45,15 @@ pub fn of(triple: &str) -> Option<&'static Cpus> {
 }
 
 /// A `-C target-cpu` that names no CPU blaze knows of the target.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnknownCpu {
-    pub triple: String,
-    pub cpu: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownCpu<'a> {
+    pub triple: &'a str,
+    pub cpu: &'a str,
     /// Whether blaze has data of the target at all.
     pub known_target: bool,
 }
 
-impl fmt::Display for UnknownCpu {
+impl fmt::Display for UnknownCpu<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { triple, cpu, known_target } = self;
         if *known_target {
@@ -73,19 +72,20 @@ impl fmt::Display for UnknownCpu {
     }
 }
 
+impl core::error::Error for UnknownCpu<'_> {}
+
 /// The `target_feature`s CPU `cpu` of target `triple` has, sorted, as rustc gives them with
 /// `-C target-cpu=<cpu>` and no `-C target-feature`; an error naming both for a CPU blaze does
 /// not know.
-pub fn features(triple: &str, cpu: &str) -> Result<&'static [&'static str], UnknownCpu> {
-    // alloc: an error, naming the target and the CPU
-    let unknown =
-        |known_target| UnknownCpu { triple: triple.to_owned(), cpu: cpu.to_owned(), known_target };
+pub fn features<'a>(triple: &'a str, cpu: &'a str) -> Result<&'static [&'static str], UnknownCpu<'a>> {
+    let unknown = |known_target| UnknownCpu { triple, cpu, known_target };
     let cpus = of(triple).ok_or_else(|| unknown(false))?;
     cpus.features(cpu).ok_or_else(|| unknown(true))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::string::ToString;
     /// Apple's M1 to M3 are LLVM aliases (`apple-m1` of `apple-a14`) that rustc's list of CPUs
     /// leaves out: each has its CPU's features, and every table is sorted for its searches.
     #[test]

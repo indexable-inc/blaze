@@ -92,34 +92,50 @@ impl Files for Disk {
 
 /// A directory of a glob pattern that could not be listed, which cargo's "unable to match path
 /// to pattern" context wraps.
-pub use blaze_glob::{GlobError, PatternError};
+pub use blaze_glob::PatternError;
+pub type GlobError = blaze_glob::GlobError<std::io::Error, std::alloc::Global>;
 
 /// `files` as the tree a pattern is walked over.
 struct Walked<'a, F>(&'a F);
 
-impl<F: Files> blaze_glob::Tree for Walked<'_, F> {
-    fn exists(&self, path: &Path) -> bool {
-        self.0.exists(path)
+impl<F: Files> blaze_glob::Tree<std::alloc::Global> for Walked<'_, F> {
+    type Error = std::io::Error;
+
+    fn exists(&self, path: &str) -> bool {
+        self.0.exists(Path::new(path))
     }
 
-    fn is_dir(&self, path: &Path) -> bool {
-        self.0.is_dir(path)
+    fn is_dir(&self, path: &str) -> bool {
+        self.0.is_dir(Path::new(path))
     }
 
-    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool), std::alloc::Global>> {
-        let mut out = Vec::new_in(std::alloc::Global);
-        out.extend(self.0.list(path)?);
+    fn list(
+        &self,
+        path: &str,
+        alloc: std::alloc::Global,
+    ) -> std::io::Result<blaze_own::Vec<(blaze_own::String<std::alloc::Global>, bool), std::alloc::Global>>
+    {
+        let entries = self.0.list(Path::new(path))?;
+        let mut out = blaze_own::Vec::with_capacity_in(entries.len(), alloc);
+        for (name, is_dir) in entries {
+            out.push((blaze_own::String::from_str_in(&name, alloc), is_dir));
+        }
         Ok(out)
     }
 }
 
 /// `glob::glob(pattern)` read through `files`: the same matches in the same (alphabetical) order,
-/// the same pattern errors, and a [`GlobError`] where glob would give one (`blaze_glob::glob`).
+/// the same pattern errors, and a [`GlobError`] where glob would give one (`blaze_glob::glob_in`).
 pub fn glob<F: Files>(
     files: &F,
     pattern: &str,
 ) -> Result<Vec<Result<PathBuf, GlobError>, std::alloc::Global>, PatternError> {
-    blaze_glob::glob(&Walked(files), pattern)
+    let entries = blaze_glob::glob_in(&Walked(files), pattern, std::alloc::Global)?;
+    let mut out = Vec::with_capacity_in(entries.len(), std::alloc::Global);
+    for entry in entries {
+        out.push(entry.map(|p| PathBuf::from(p.as_str())));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

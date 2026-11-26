@@ -819,6 +819,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-hash",
  "blaze-ids",
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -1833,6 +1834,7 @@ name = "blaze-record"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
+ "blaze-own",
  "blaze-rng",
 ]
 
@@ -4569,6 +4571,7 @@ name = "target-features"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
+ "blaze-own",
  "blaze-phf",
  "blaze-sim",
 ]

@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

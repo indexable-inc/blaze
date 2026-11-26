@@ -3,13 +3,14 @@
 
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
 use core::{
+    alloc::Allocator,
     fmt,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use blaze_ids::ContentId;
+use blaze_own::Vec as OwnVec;
 
 use crate::{
     keys::{AnswerKey, Digest, Slot, list_key},
@@ -437,22 +438,22 @@ pub enum Placed {
 /// not published yet: so what this filing placed is remembered here and looked at before the
 /// store. A flush that places the lists of one base in an order that is of their bytes alone
 /// gives each the same slot whichever thread offered it.
-pub struct Filing<'a> {
+pub struct Filing<'a, A: Allocator> {
     base: ContentId,
     bounds: Bounds,
-    placed: Vec<(Slot, &'a [u8])>,
+    placed: OwnVec<(Slot, &'a [u8]), A>,
     forgetful: bool,
 }
 
-impl<'a> Filing<'a> {
-    pub fn new(base: ContentId, bounds: Bounds) -> Filing<'a> {
-        Filing { base, bounds, placed: Vec::new(), forgetful: false }
+impl<'a, A: Allocator> Filing<'a, A> {
+    pub fn new_in(base: ContentId, bounds: Bounds, alloc: A) -> Filing<'a, A> {
+        Filing { base, bounds, placed: OwnVec::new_in(alloc), forgetful: false }
     }
 
     /// The planted bug of a flush's control: nothing placed is remembered, so the second list
     /// of a base is placed against the store alone. For tests.
     #[doc(hidden)]
-    pub fn planted_forgetful(mut self) -> Filing<'a> {
+    pub fn planted_forgetful(mut self) -> Filing<'a, A> {
         self.forgetful = true;
         self
     }

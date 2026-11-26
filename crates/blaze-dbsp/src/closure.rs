@@ -1,45 +1,46 @@
-use std::hash::Hash;
+use core::{alloc::Allocator, hash::Hash};
 
 use blaze_hash::{FixedState, Set, SetOpts};
-use std::alloc::Global;
+use blaze_own::Vec as OwnVec;
 
 /// The DRed over-delete closure: from `seeds`, every node `step` reaches, each once, in BFS
 /// order; `out` is cleared first. `step(n, next)` appends `n`'s successors to `next`.
 ///
-/// Makes its visited set for the call; a maintainer that runs it per edit keeps a [`Closure`].
-pub fn closure<N: Copy + Eq + Hash>(
+/// Makes its visited set for the call in `alloc`; a maintainer that runs it per edit keeps a
+/// [`Closure`].
+pub fn closure_in<N: Copy + Eq + Hash, A: Allocator + Clone, B: Allocator>(
     seeds: impl IntoIterator<Item = N>,
-    step: impl FnMut(N, &mut Vec<N>),
-    out: &mut Vec<N>,
+    step: impl FnMut(N, &mut OwnVec<N, A>),
+    out: &mut OwnVec<N, B>,
+    alloc: A,
 ) {
-    Closure::new().run(seeds, step, out);
+    Closure::new_in(alloc).run(seeds, step, out);
 }
 
-/// [`closure`] with its visited set and successor buffer kept between calls: a warm run that
+/// [`closure_in`] with its visited set and successor buffer kept between calls: a warm run that
 /// reaches no more nodes than an earlier one allocates nothing.
 #[derive(Debug)]
-pub struct Closure<N> {
-    seen: Set<N, FixedState, Global>,
-    next: Vec<N>,
+pub struct Closure<N, A: Allocator> {
+    seen: Set<N, FixedState, A>,
+    next: OwnVec<N, A>,
 }
 
-impl<N: Copy + Eq + Hash> Default for Closure<N> {
-    fn default() -> Self {
-        Closure::new()
+impl<N: Copy + Eq + Hash, A: Allocator + Clone> Closure<N, A> {
+    pub fn new_in(alloc: A) -> Self {
+        Closure {
+            seen: Set::new(SetOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            next: OwnVec::new_in(alloc),
+        }
     }
 }
 
-impl<N: Copy + Eq + Hash> Closure<N> {
-    pub fn new() -> Self {
-        Closure { seen: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }), next: Vec::new() } // alloc: setup: empty buffers, grown once and kept
-    }
-
+impl<N: Copy + Eq + Hash, A: Allocator> Closure<N, A> {
     /// `O(nodes reached + edges stepped)`, one set probe per edge.
-    pub fn run(
+    pub fn run<B: Allocator>(
         &mut self,
         seeds: impl IntoIterator<Item = N>,
-        mut step: impl FnMut(N, &mut Vec<N>),
-        out: &mut Vec<N>,
+        mut step: impl FnMut(N, &mut OwnVec<N, A>),
+        out: &mut OwnVec<N, B>,
     ) {
         out.clear();
         self.seen.clear();

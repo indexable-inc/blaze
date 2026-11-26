@@ -9,9 +9,10 @@
 //! memory.
 
 use core::cell::{Cell, RefCell};
-use std::{collections::BTreeMap, format, string::String, vec, vec::Vec};
+use std::{alloc::Global, collections::BTreeMap, format, string::String, vec, vec::Vec};
 
 use blaze_ids::ContentId;
+use blaze_own::Vec as OwnVec;
 use blaze_rng::SplitMix64;
 
 use crate::{
@@ -172,9 +173,9 @@ fn file(
         Bug::None | Bug::AnswerKeyedWithoutARead => {}
     }
     let base = base_key(base);
-    let mut list = Vec::new();
+    let mut list = OwnVec::new_in(Global);
     write_list(&mut list, &base, b"", reads.iter().map(|&(read, _)| name(read)));
-    let placed = Filing::new(base, bounds).place(store, &list).map_err(other(step))?;
+    let placed = Filing::new_in(base, bounds, Global).place(store, &list).map_err(other(step))?;
     if placed == Placed::Full {
         return Ok(placed);
     }
@@ -368,8 +369,8 @@ fn a_full_chain_is_counted_and_stays_correct() {
     assert!(said_full >= full, "a filing hit the bound after a lookup that did not say so");
 }
 
-fn list_of(base: &ContentId, read: u8) -> Vec<u8> {
-    let mut list = Vec::new();
+fn list_of(base: &ContentId, read: u8) -> OwnVec<u8, Global> {
+    let mut list = OwnVec::new_in(Global);
     write_list(&mut list, base, b"", [name(read)]);
     list
 }
@@ -384,7 +385,7 @@ fn a_list_past_the_first_generation_is_stored_and_found() {
     let value = Some(7);
     for read in 0..9_u8 {
         let list = list_of(&base, read);
-        let placed = Filing::new(base, bounds).place(&store, &list).unwrap();
+        let placed = Filing::new_in(base, bounds, Global).place(&store, &list).unwrap();
         let want = match read {
             0..4 => Placed::Written(Slot { generation: 0, n: u32::from(read) }),
             4..8 => Placed::Written(Slot { generation: 1, n: u32::from(read) - 4 }),
@@ -404,7 +405,7 @@ fn a_list_past_the_first_generation_is_stored_and_found() {
             miss => panic!("list {read} was filed and not found: {miss:?}"),
         }
         // Placed again, it is kept where it is.
-        let again = Filing::new(base, bounds).place(&store, &list).unwrap();
+        let again = Filing::new_in(base, bounds, Global).place(&store, &list).unwrap();
         assert!(matches!(again, Placed::Kept(_)), "list {read}: {again:?}");
     }
     let nothing = lookup(&store, bounds, &base, |_| Some(Digest::Nothing)).unwrap();
@@ -431,9 +432,9 @@ fn a_walk_shows_the_lists_a_lookup_searches_and_ends_where_its_visitor_says() {
     let base = base_key(1);
     let store = Memory::default();
     // Three generations of lists: 0 and 1 full, 2 open with one list.
-    let lists: Vec<Vec<u8>> = (0..5_u8).map(|read| list_of(&base, read)).collect();
+    let lists: Vec<OwnVec<u8, Global>> = (0..5_u8).map(|read| list_of(&base, read)).collect();
     for list in &lists {
-        let placed = Filing::new(base, bounds).place(&store, list).unwrap();
+        let placed = Filing::new_in(base, bounds, Global).place(&store, list).unwrap();
         assert!(matches!(placed, Placed::Written(_)), "{placed:?}");
     }
     let slot = |generation, n| Slot { generation, n };
@@ -449,7 +450,7 @@ fn a_walk_shows_the_lists_a_lookup_searches_and_ends_where_its_visitor_says() {
     });
     assert_eq!(passed, Ok(Walked::Passed { lists: 5, full: false }));
     let want: Vec<(Slot, Vec<u8>)> =
-        searched.iter().map(|&(at, list)| (at, lists[list].clone())).collect();
+        searched.iter().map(|&(at, list)| (at, lists[list].as_slice().to_vec())).collect();
     assert_eq!(seen, want);
 
     // The visitor refuses the first list it could take and takes a later one.
@@ -458,7 +459,7 @@ fn a_walk_shows_the_lists_a_lookup_searches_and_ends_where_its_visitor_says() {
         asked += 1;
         Ok::<Option<Vec<u8>>, Stopped>((asked >= 3).then(|| bytes.to_vec()))
     });
-    assert_eq!(found, Ok(Walked::Found { found: lists[4].clone(), at: slot(2, 0) }));
+    assert_eq!(found, Ok(Walked::Found { found: lists[4].as_slice().to_vec(), at: slot(2, 0) }));
     assert_eq!(asked, 3, "nothing is shown after the visitor's `Some`");
 
     let mut asked = 0;
@@ -522,13 +523,13 @@ fn a_tally_counts_lookups_hits_lists_and_reads_valued() {
 
     // Two lists of three reads each, and an answer under the second.
     let list = |reads: [u8; 3]| {
-        let mut list = Vec::new();
+        let mut list = OwnVec::new_in(Global);
         write_list(&mut list, &base, b"", reads.map(name));
         list
     };
     let (one, two) = (list([0, 1, 2]), list([3, 4, 5]));
     let slot = |n| Slot { generation: 0, n };
-    let mut filing = Filing::new(base, ROOMY);
+    let mut filing = Filing::new_in(base, ROOMY, Global);
     assert_eq!(filing.place(&store, &one), Ok(Placed::Written(slot(0))));
     assert_eq!(filing.place(&store, &two), Ok(Placed::Written(slot(1))));
     let mut key = AnswerKey::new(&two);
@@ -550,7 +551,7 @@ fn a_tally_counts_lookups_hits_lists_and_reads_valued() {
     let both = Memory::default();
     lookup(&both, ROOMY, &base, now).unwrap();
     for bytes in [&one, &two] {
-        assert!(matches!(Filing::new(base, ROOMY).place(&both, bytes), Ok(Placed::Written(_))));
+        assert!(matches!(Filing::new_in(base, ROOMY, Global).place(&both, bytes), Ok(Placed::Written(_))));
     }
     assert_eq!(keep_answer(&both, key, b"answer"), Ok(Kept::Written));
     lookup(&both, ROOMY, &base, now).unwrap();
@@ -588,7 +589,7 @@ fn one_filing_places_two_lists_in_two_slots() {
     let (one, two) = (list_of(&base, 1), list_of(&base, 2));
     let keys = |forgetful: bool| {
         let store = Buffered::default();
-        let mut filing = Filing::new(base, ROOMY);
+        let mut filing = Filing::new_in(base, ROOMY, Global);
         if forgetful {
             filing = filing.planted_forgetful();
         }
@@ -615,14 +616,16 @@ fn one_filing_places_two_lists_in_two_slots() {
 fn a_read_list_round_trips_and_refuses_what_is_not_one() {
     let base = base_key(2);
     let names: [&[u8]; 3] = [b"", b"a name", &[0xff; 70]];
-    let mut bytes = vec![9, 9];
+    let mut bytes = OwnVec::new_in(Global);
+    bytes.extend_from_slice(&[9, 9]);
     write_list(&mut bytes, &base, b"note", names);
     let list = &bytes[2..];
     let read = ListRef::open(list, &base).unwrap();
     assert_eq!(read.note(), b"note");
     assert_eq!(read.len(), 3);
     assert_eq!(read.reads().collect::<Vec<_>>(), names);
-    let mut in_place = vec![9, 9];
+    let mut in_place = OwnVec::new_in(Global);
+    in_place.extend_from_slice(&[9, 9]);
     write_list_with(
         &mut in_place,
         &base,
@@ -633,7 +636,7 @@ fn a_read_list_round_trips_and_refuses_what_is_not_one() {
         names,
     );
     assert_eq!(in_place, bytes, "a note written in place gives the same list");
-    let mut none = Vec::new();
+    let mut none = OwnVec::new_in(Global);
     write_list(&mut none, &base, b"", [] as [&[u8]; 0]);
     assert_eq!(empty_list(&base)[..], none[..], "the list of no reads, without a buffer");
     assert!(ListRef::open(&empty_list(&base), &base).unwrap().is_empty());
