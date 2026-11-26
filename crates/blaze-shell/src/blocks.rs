@@ -92,6 +92,16 @@ pub struct Block {
 }
 
 impl Block {
+    /// True when this block is a live pinned view (running inline terminal / alternate-screen TUI,
+    /// live `top` monitor, or in-flight command) that `Cmd+K` / `clear` should keep visible.
+    pub fn is_pinned_live(&self) -> bool {
+        match &self.body {
+            BlockBody::Terminal { running: true, .. } | BlockBody::Running { .. } => true,
+            BlockBody::SysMon(sm) => sm.running,
+            _ => false,
+        }
+    }
+
     pub fn is_grid_view(&self, default_grid: bool) -> bool {
         self.grid_override.unwrap_or(default_grid)
     }
@@ -460,9 +470,18 @@ impl BlockStore {
         }
     }
 
-    /// Clear visible blocks on the active branch while preserving its live `EngineState`.
+    /// Clear all non-pinned blocks on the active branch while preserving its live `EngineState`
+    /// and keeping live pinned blocks (running inline terminals / alternate-screen TUIs, live
+    /// `top` monitors, and in-flight async commands) intact.
     pub fn clear_active_branch(&mut self) {
-        self.active_branch_mut().blocks.clear();
+        let pinned: Vec<BlockId> = self
+            .active_branch()
+            .blocks
+            .iter()
+            .copied()
+            .filter(|&id| self.block(id).is_some_and(Block::is_pinned_live))
+            .collect();
+        self.active_branch_mut().blocks = pinned;
     }
 
     /// Return the `BlockId` of the currently running interactive terminal block on the active branch.
@@ -490,5 +509,78 @@ impl BlockStore {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_own::Alloc;
+    use blaze_vt::terminal::{Opts as VtOpts, Terminal};
+
+    #[test]
+    fn clear_active_branch_preserves_pinned_live_blocks() {
+        let alloc = Alloc::global();
+        let state = EngineState::new("/tmp", &[], alloc);
+        let prompt = PromptInfo::from_cwd("/tmp", "/tmp", 0, 0);
+        let mut store = BlockStore::new(state.fork());
+
+        let done_id = store.record_block(
+            "echo hi".to_owned(),
+            prompt.clone(),
+            state.fork(),
+            state.fork(),
+            0,
+            1,
+            0,
+            BlockBody::Value(Value::Int(42)),
+        );
+        let exited_pty = store.record_block(
+            "vim old".to_owned(),
+            prompt.clone(),
+            state.fork(),
+            state.fork(),
+            0,
+            2,
+            0,
+            BlockBody::Terminal {
+                term: Terminal::new_in(VtOpts::new(80, 24, 1 << 16), alloc).unwrap(),
+                running: false,
+                exit_code: Some(0),
+                pid: None,
+            },
+        );
+        let live_pty = store.record_block(
+            "claude".to_owned(),
+            prompt.clone(),
+            state.fork(),
+            state.fork(),
+            0,
+            0,
+            0,
+            BlockBody::Terminal {
+                term: Terminal::new_in(VtOpts::new(80, 24, 1 << 16), alloc).unwrap(),
+                running: true,
+                exit_code: None,
+                pid: Some(4242),
+            },
+        );
+        let live_job = store.record_block(
+            "sleep 10".to_owned(),
+            prompt,
+            state.fork(),
+            state,
+            0,
+            0,
+            0,
+            BlockBody::Running {
+                label: "sleep 10".to_owned(),
+                pid: Arc::new(AtomicU32::new(4243)),
+            },
+        );
+        assert_eq!(store.active_branch().blocks, vec![done_id, exited_pty, live_pty, live_job]);
+
+        store.clear_active_branch();
+        assert_eq!(store.active_branch().blocks, vec![live_pty, live_job]);
     }
 }

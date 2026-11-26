@@ -781,6 +781,9 @@ mod macos_app {
         /// When an inline PTY is running (`!pty_fullscreen`), whether keyboard & scroll focus is
         /// captured by the inline PTY (`true`) or returned to the shell composer (`false`).
         pty_focused: bool,
+        /// Optional row-count override for the inline PTY box, adjusted with `Cmd+`/`Cmd-`/`Cmd+0`
+        /// while focused inside the inline alternate-screen terminal.
+        pty_inline_rows_override: Option<u16>,
         active_sysmon: Option<BlockId>,
         sysmon_fullscreen: bool,
         last_sysmon_tick: Instant,
@@ -835,6 +838,7 @@ mod macos_app {
                 active_pty: None,
                 pty_fullscreen: false,
                 pty_focused: false,
+                pty_inline_rows_override: None,
                 active_sysmon: None,
                 sysmon_fullscreen: false,
                 last_sysmon_tick: Instant::now(),
@@ -1529,6 +1533,7 @@ mod macos_app {
                             started: Instant::now(),
                         });
                         self.pty_focused = true;
+                        self.pty_inline_rows_override = None;
                         self.auto_scroll_bottom = true;
                     }
                 }
@@ -1781,10 +1786,12 @@ mod macos_app {
                 let (cols, rows) = if pane.pty_fullscreen {
                     (raw_cols, raw_rows)
                 } else {
-                    (
-                        raw_cols.saturating_sub(4).max(20),
-                        (raw_rows.saturating_mul(65) / 100).clamp(18, 34),
-                    )
+                    let max_inline = raw_rows.saturating_sub(3).max(12);
+                    let default_rows = (raw_rows.saturating_mul(65) / 100).clamp(18, 34).min(max_inline);
+                    let target_rows = pane
+                        .pty_inline_rows_override
+                        .map_or(default_rows, |r| r.clamp(8, max_inline));
+                    (raw_cols.saturating_sub(4).max(20), target_rows)
                 };
                 let px = (
                     cols.saturating_mul(fonts.metrics.cell_w as u16),
@@ -3348,25 +3355,90 @@ mod macos_app {
                                     continue;
                                 }
 
-                                // Zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`).
-                                if matches!(lower.as_str(), "=" | "+")
+                                // Context-aware resize / zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`):
+                                // - Inside a focused inline alternate-screen PTY: enlarge / shrink / reset that TUI box.
+                                // - Inside a multi-pane split tab: enlarge / shrink / equalize the focused pane.
+                                // - Otherwise (or anytime with `Cmd+Opt+/-/0`): zoom global font size.
+                                let resize_dir: Option<i8> = if matches!(lower.as_str(), "=" | "+")
                                     || matches!(key, Key::Equal | Key::NumpadAdd)
                                 {
-                                    font_points = (font_points + ZOOM_STEP_POINTS).min(MAX_FONT_POINTS);
-                                    zoom_changed = true;
-                                    dirty = true;
-                                    continue;
-                                }
-                                if lower == "-" || matches!(key, Key::Minus | Key::NumpadSubtract) {
-                                    font_points = (font_points - ZOOM_STEP_POINTS).max(MIN_FONT_POINTS);
-                                    zoom_changed = true;
-                                    dirty = true;
-                                    continue;
-                                }
-                                if lower == "0" || matches!(key, Key::Digit0 | Key::Numpad0) {
-                                    font_points = FONT_POINTS;
-                                    zoom_changed = true;
-                                    dirty = true;
+                                    Some(1)
+                                } else if lower == "-" || matches!(key, Key::Minus | Key::NumpadSubtract) {
+                                    Some(-1)
+                                } else if lower == "0" || matches!(key, Key::Digit0 | Key::Numpad0) {
+                                    Some(0)
+                                } else {
+                                    None
+                                };
+                                if let Some(dir) = resize_dir {
+                                    let focused_pid = wm.focused_pane();
+                                    let inline_pty_focused = !alt
+                                        && panes.get(&focused_pid).is_some_and(|p| {
+                                            p.active_pty.is_some() && !p.pty_fullscreen && p.pty_focused
+                                        });
+                                    let split_pane_active = !alt
+                                        && wm.active_tab().root.leaf_count() > 1
+                                        && !wm.active_tab().zoomed;
+
+                                    if inline_pty_focused {
+                                        if let Some(pane) = panes.get_mut(&focused_pid) {
+                                            let pane_rect = tile_layout
+                                                .panes
+                                                .iter()
+                                                .find(|pl| pl.pane == focused_pid)
+                                                .map(|pl| pl.rect)
+                                                .unwrap_or_else(|| {
+                                                    HitRect::new(
+                                                        0.0,
+                                                        TOP_BAR_H,
+                                                        size.width as f32,
+                                                        size.height as f32,
+                                                    )
+                                                });
+                                            let (_, raw_rows) = grid_for_rect(pane_rect, &fonts, scale);
+                                            let max_inline = raw_rows.saturating_sub(3).max(12);
+                                            let default_rows =
+                                                (raw_rows.saturating_mul(65) / 100).clamp(18, 34).min(max_inline);
+                                            let cur = pane.pty_inline_rows_override.unwrap_or(default_rows);
+                                            pane.pty_inline_rows_override = match dir {
+                                                1 => Some(cur.saturating_add(5).min(max_inline)),
+                                                -1 => Some(cur.saturating_sub(5).max(8)),
+                                                _ => None,
+                                            };
+                                            pty_sizes_dirty = true;
+                                            dirty = true;
+                                        }
+                                    } else if split_pane_active {
+                                        match dir {
+                                            1 => {
+                                                wm.resize_focused_pane(0.06);
+                                            }
+                                            -1 => {
+                                                wm.resize_focused_pane(-0.06);
+                                            }
+                                            _ => {
+                                                wm.equalize_splits();
+                                            }
+                                        }
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                    } else {
+                                        match dir {
+                                            1 => {
+                                                font_points =
+                                                    (font_points + ZOOM_STEP_POINTS).min(MAX_FONT_POINTS);
+                                            }
+                                            -1 => {
+                                                font_points =
+                                                    (font_points - ZOOM_STEP_POINTS).max(MIN_FONT_POINTS);
+                                            }
+                                            _ => {
+                                                font_points = FONT_POINTS;
+                                            }
+                                        }
+                                        zoom_changed = true;
+                                        dirty = true;
+                                    }
                                     continue;
                                 }
                                 if lower == "q" {
@@ -3440,14 +3512,15 @@ mod macos_app {
                                 }
 
                                 match lower.as_str() {
-                                    "k" if shell.active_pty.is_none() => {
+                                    "k" if !shell.pty_fullscreen => {
                                         shell.store.clear_active_branch();
                                         shell.scroll_y = 0.0;
+                                        shell.auto_scroll_bottom = true;
                                         output_selection = None;
                                         dirty = true;
                                         continue;
                                     }
-                                    "b" if shell.active_pty.is_none() => {
+                                    "b" if !shell.pty_accepts_input() => {
                                         let _ = shell.store.fork_active_branch(None);
                                         shell.refresh_prompt(shell.prompt.last_exit, shell.prompt.last_duration_ms);
                                         dirty = true;
@@ -6116,6 +6189,7 @@ mod macos_app {
                 if let Some((block_id, code, dur_ms)) = pty_finished {
                     pane.pty_fullscreen = false;
                     pane.pty_focused = false;
+                    pane.pty_inline_rows_override = None;
                     if let Some(ap) = pane.active_pty.take() {
                         let drain_deadline = Instant::now() + std::time::Duration::from_millis(15);
                         loop {
