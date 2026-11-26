@@ -2359,14 +2359,12 @@ mod closure_param_regions_tests {
         let prepared = Prepares::new_in(bump);
         let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
         let mut target = None;
+        let needle = std::format!("fn {method_name}(");
         for (item, _, _) in names.items(0) {
-            if names.item_text(item).is_some_and(|t| t.text.trim_start().starts_with("impl")) {
+            if names.item_text(item).is_some_and(|t| t.text.trim_start().starts_with("impl") && t.text.contains(&needle)) {
                 store.ensure(&names, &mut front.keys, super::Want::Impl(item)).expect("impl head");
-            }
-        }
-        for (&key, head) in store.fns.iter() {
-            if head.text.contains(&std::format!("fn {method_name}(")) {
-                target = Some(key);
+                let container_ck = super::super::keys::checker_of(item);
+                target = Some(front.keys.member(container_ck, super::super::keys::MemberKind::Fn, method_name).expect("member key"));
                 break;
             }
         }
