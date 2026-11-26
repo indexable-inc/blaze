@@ -73,6 +73,7 @@ const CORE_RULES: &[&str] = &[
     "keys-cover-every-input",
     "own-the-language",
     "verify-once",
+    "alarm-on-any-compile-failure",
     // Runtime code
     "no-fallback",
     "sans-io-cores",
@@ -242,10 +243,11 @@ Vertically integrated Rust stack (language, comptime reflection, pinned std, bst
 - **Autonomy & craft:** Act autonomously on non-controversial improvements — when you see something clearly suboptimal, duplicated, or a pattern that generalizes, make it ideal and sweep all siblings directly without asking. Pause to ask only on genuinely controversial tradeoffs or irreversible direction changes. Always pursue/present the longest-term best solution by default (assume infinite time, even if OOD), within 10% of the floor on iteration one, then iterate; delete jank/duplication. Show unitless proportional effort bars (`[████████░░]`) when comparing options.
 - **Workflow & orientation:** Before doing anything wrt Rust/Cargo, read `.agents/skills/must_read_blaze/SKILL.md` (`must_read_blaze`) and log missing features or stricter-is-better catches in `agents/feature-requests.md`. Spawn tasks as subagents by default so the coordinator stays free for incoming tasks. Sandbox blocking shell/tools? Stop immediately, ask the user for full permissions, and wait.
 - **Docs & skills:** [docs/contributing.md](docs/contributing.md), [docs/README.md](docs/README.md), and `.agents/skills/` (load the relevant skill before domain work, including `authoring-prompts` before editing rules/skills/briefs).
+- ✨ **Core gap (build scripts & proc macros):** `MacroModule` (`macros.rs`/`script_modules.rs`) is lookup-only — blaze does not compile `build.rs` or proc-macro crates itself yet (it has native arm64 codegen + OS sandboxes, no wasm32 backend yet), so any crate missing from `~/.blaze/v2/{proc-macro,build-script}/modules` fails `CrateScope` and blocks downstream crates. ✨
 
 ## Core Rules
 
-36 always-on principles below; all 89 rules with full detail live in each heading's skill (`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run `write`."#;
+37 always-on principles below; all 90 rules with full detail live in each heading's skill (`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run `write`."#;
 
 const RULES: &[Rule<'static>] = &[
     Rule {
@@ -1048,6 +1050,15 @@ const RULES: &[Rule<'static>] = &[
         reason: Some(r#"Andrew, 2026-11-26: "i think also AGENTS.md should be clear if you cant do something a proper way (you are going a jank solution to kinda get it or it is monumentous task and i dont really understand what getting into) be clear about this and write in all caps and then merge that in"."#),
         link: None,
         also_in: &["runtime-code"],
+    },
+    Rule {
+        id: "alarm-on-any-compile-failure",
+        skill: "compiler-correctness",
+        line: "🚨🚨🚨 If ANY repo fails to compile or leaves items unchecked, plaster 🚨🚨🚨 over your reply.",
+        info: r#"Whenever ANY target repository, workspace, or crate fails to compile, exits non-zero, or leaves even a single item unchecked (including partial checks, missing `MacroModule`/`CrateScope` records, failing build scripts or proc macros, or incomplete typeck/borrowck), PLASTER 🚨🚨🚨 PROMINENTLY ACROSS THE TOP AND BODY OF YOUR RESPONSE. Never bury partial compilation failures in footnotes, never treat a subset passing as the whole repo working, and never report benchmark timings from an incomplete check without 🚨🚨🚨 explicitly naming the repo, exit status, unchecked item count, and exact root cause."#,
+        reason: Some(r#"Andrew, 2026-11-26: "if any repo doesnt compile please give 🚨🚨🚨 all over response (even if it doesnt compile a little bit) change AGENTS.md"."#),
+        link: None,
+        also_in: &["debugging", "build-and-test"],
     },
 ];
 

@@ -81,17 +81,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    /// The type `P::Assoc` of the value path `P::Assoc::name` at `at`: the associated type
-    /// `assoc` of the one candidate trait of `prefix` that declares it, as a projection the
-    /// solver normalizes. `None`: refused and reported, naming `assoc` (E0220: no candidate
-    /// declares it; E0221: two do; E0223: the prefix has no candidate traits at all).
-    ///
-    /// Arguments written on the associated type's segment (`T::Out::<u8>::f`, a generic
-    /// associated type's own) are not checked yet: a typed stop, never a guess.
+    /// The type `P::Assoc` (or `P::Assoc::<A..>`) of the value path `P::Assoc::name` at `at`:
+    /// the associated type `assoc` of the one candidate trait of `prefix` that declares it, as a
+    /// projection the solver normalizes. In value/expression path position, omitted GAT arguments
+    /// (`K::MapStorage::empty()`) are inferred with fresh inference variables. `None`: refused
+    /// and reported, naming `assoc` (E0220: no candidate declares it; E0221: two do; E0223: the
+    /// prefix has no candidate traits at all).
     pub(crate) fn assoc_ty_of_prefix(&mut self, at: At, cause: Cause, prefix: AssocPrefix, assoc: Segment) -> Result<Option<Ty>, Stop> {
-        if assoc.has_args {
-            return Err(CheckError::Unported("a value path with generic arguments on an associated type's segment (`T::Assoc::<A>::f`)").into());
-        }
         let name = Some(assoc.name);
         let mut cands: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
         // The impl's own trait at the arguments its header writes.
@@ -134,21 +130,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         // The candidates that declare the name: each trait is listed once, so two hits are two
         // declarations (a handful of bounds: the scan is short).
-        let mut picked: Option<(ItemKey, u32)> = None;
+        let mut picked: Option<(ItemKey, u32, ItemKey)> = None;
         let mut count = 0u32;
         for &tr in cands.iter() {
             let Some(def) = self.reads.trait_def(tr)? else {
                 self.diag(DiagCode::UnresolvedPath, at, About::found_maybe_named(self_ty, name));
                 return Ok(None);
             };
-            if def.assoc_types.iter().any(|a| a.name == assoc.name) {
+            if let Some(decl) = def.assoc_types.iter().find(|a| a.name == assoc.name) {
                 count += 1;
                 if picked.is_none() {
-                    picked = Some((tr, def.generics));
+                    picked = Some((tr, def.generics, decl.item));
                 }
             }
         }
-        let (tr, generics) = match (count, picked) {
+        let (tr, generics, decl_item) = match (count, picked) {
             (1, Some(p)) => p,
             (0, _) | (_, None) => {
                 self.diag(DiagCode::NoAssocTy, at, About::found_maybe_named(self_ty, name));
@@ -169,12 +165,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.concat(self_list, rest)?
             }
         };
-        // A generic associated type named without its own arguments: E0107, reported there.
-        if !self.alias_arity(tr, assoc.name, self.ty.list_len(trait_args), cause)? {
-            return Ok(None);
-        }
+        let projection_args = if assoc.has_args {
+            let own_len = assoc.generic_args.len;
+            let written = self.ty.list_len(trait_args).saturating_add(own_len);
+            if !self.alias_arity(tr, assoc.name, written, cause)? {
+                return Ok(None);
+            }
+            if own_len == 0 {
+                trait_args
+            } else {
+                let args = self.explicit_args(at, Some(assoc), decl_item, generics, own_len)?;
+                self.concat(trait_args, args)?
+            }
+        } else if let Some(g) = self.reads.assoc_generics(tr, assoc.name)?
+            && g.own > 0
+        {
+            let args = self.fresh_generic_args(decl_item, generics, g.own)?;
+            self.concat(trait_args, args)?
+        } else {
+            trait_args
+        };
         self.register_trait(tr, trait_args, cause)?;
-        let projected = self.project(tr, trait_args, assoc.name, cause)?;
+        let projected = self.project(tr, projection_args, assoc.name, cause)?;
         Ok(Some(self.try_structurally_resolve(projected)?))
     }
 }

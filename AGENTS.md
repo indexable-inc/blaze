@@ -30,10 +30,14 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **Docs & skills:** [docs/contributing.md](docs/contributing.md), [docs/README.md](docs/README.md),
   and `.agents/skills/` (load the relevant skill before domain work, including `authoring-prompts`
   before editing rules/skills/briefs).
+- ✨ **Core gap (build scripts & proc macros):** `MacroModule` (`macros.rs`/`script_modules.rs`) is
+  lookup-only — blaze does not compile `build.rs` or proc-macro crates itself yet (it has native
+  arm64 codegen + OS sandboxes, no wasm32 backend yet), so any crate missing from
+  `~/.blaze/v2/{proc-macro,build-script}/modules` fails `CrateScope` and blocks downstream crates. ✨
 
 ## Core Rules
 
-36 always-on principles below; all 89 rules with full detail live in each heading's skill
+37 always-on principles below; all 90 rules with full detail live in each heading's skill
 (`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run
 `write`.
 
@@ -49,6 +53,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **21. keys-cover-every-input**: Item-grained, item-relative, deterministic keys cover every input; `TwoValues` is a key bug.
 - **55. own-the-language**: Never work around Rust/std/bstd gaps: extend language, comptime, std or bstd and delete jank.
 - **74. verify-once**: A check happens once and returns a proof type that later code takes; nothing is verified twice.
+- **90. alarm-on-any-compile-failure**: 🚨🚨🚨 If ANY repo fails to compile or leaves items unchecked, plaster 🚨🚨🚨 over your reply.
 
 ### Runtime code (skill `runtime-code`)
 - **3. no-fallback**: No fallback, no retry, nothing quietly ignored: stop with an error naming what and where.
