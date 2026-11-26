@@ -43,7 +43,8 @@ most it held then.
 
 Output: `out` (every sample, the machine, blaze's version, the date, and one outcome a row in
 report.py's shape, which the ledger reads to say why a run failed) and the table. Exit 0 when every row is met, 1 when any is lost, 2 when a run failed for another reason
-(its exit status and last lines are the record), 3 when none is lost but a project was skipped.
+(its exit status and last lines are the record), 3 when none is lost but a project was skipped or
+no `extra` checkout was measured (the fixtures alone are too small to decide T9).
 """
 
 import json
@@ -187,8 +188,10 @@ class Watched:
                 text=True,
                 timeout=60,
             ).stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return
+        except (OSError, subprocess.TimeoutExpired) as e:
+            # A detached helper (journal-helper, the store's GC) would go uncounted, and the
+            # run could pass on an undercount: the run cannot be judged.
+            raise Failed(f"could not look for the run's detached processes with lsof: {e}") from e
         for pid in {int(word) for word in found.split() if word.isdigit()} - {os.getpid()}:
             self.add(pid)
 
@@ -229,8 +232,10 @@ class Watched:
         self._done.set()
         if self._thread:
             self._thread.join()
-        self.adopt()
-        self.kill()
+        try:
+            self.adopt()
+        finally:
+            self.kill()
 
 
 def source(root: Path, project: str, body: int) -> str:
@@ -430,12 +435,14 @@ def outcomes(rows: list[Row], skipped: list[str], failed: list[str]) -> list[dic
     ]
 
 
-def verdict(rows: list[Row], skipped: list[str], failed: list[str]) -> int:
+def verdict(rows: list[Row], skipped: list[str], failed: list[str], large: bool = True) -> int:
+    """2 a run failed, 1 a row lost, 3 nothing lost but not decided (a project skipped, or no
+    `extra` checkout measured: the fixtures alone are too small to say T9 holds), 0 met."""
     if failed:
         return 2
     if any(not r.met for r in rows):
         return 1
-    return 3 if skipped else 0
+    return 3 if skipped or not large else 0
 
 
 def version(blaze: str) -> str:
@@ -511,7 +518,10 @@ def main(it: Input) -> None:
     print(table(rows, skipped))
     for line in failed:
         print(f"{SCRIPT}: failed: {line}")
-    sys.exit(verdict(rows, skipped, failed))
+    large = any(e.name in record["projects"] for e in it.extra)
+    if not large and not any(not r.met for r in rows):
+        print(f"{SCRIPT}: no `extra` checkout was measured; hello and six alone do not decide T9")
+    sys.exit(verdict(rows, skipped, failed, large))
 
 
 def expect(holds: bool, what: str) -> None:
@@ -567,6 +577,8 @@ def selftest() -> None:
         verdict(rows, ["ripgrep: this machine has 24 GB, it needs 32"], []) == 3, "met but skipped exits 3"
     )
     expect(verdict(over, [], ["hello: blaze run exited 125"]) == 2, "a failed run exits 2 before any verdict")
+    expect(verdict(rows, [], [], large=False) == 3, "met on the fixtures alone is not decided: exits 3")
+    expect(verdict(over, [], [], large=False) == 1, "a lost fixture row is lost whatever else ran")
     said = outcomes(over[:1] + rows[:1], ["ripgrep: needs 32"], ["six: blaze run exited 125"])
     expect(
         said
@@ -614,6 +626,18 @@ def selftest() -> None:
         status != 0 and watch.stopped_kb is not None and watch.stopped_kb > 1024,
         f"a 64 MB process under a 1 MB limit is stopped: status {status}, held {watch.stopped_kb}",
     )
+    gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    path = os.environ["PATH"]
+    os.environ["PATH"] = "/nonexistent"
+    try:
+        with Watched(10**6, (Path("/tmp"),)) as watch:
+            watch.add(gone.pid)
+        expect(False, "a watch whose lsof cannot run must fail the run")
+    except Failed as e:
+        expect("lsof" in str(e), f"the failure names lsof: {e}")
+    finally:
+        os.environ["PATH"] = path
+    expect(gone.wait(timeout=10) != 0, "the watched process is stopped even when discovery failed")
     print(f"{SCRIPT} selftest: ok")
 
 
