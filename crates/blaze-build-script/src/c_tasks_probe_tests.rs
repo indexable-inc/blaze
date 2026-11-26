@@ -328,7 +328,7 @@ fn binary_probe_answer_round_trips_and_resolves_once_via_cache() {
     let answerer = CountingAnswerer(AtomicUsize::new(0));
     let cache = MemCache(RefCell::new(std::vec::Vec::new()));
     let args = flag_args("-Wshadow");
-    let sp = Spawn { program: "cc", args: &args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    let sp = Spawn { program: "cc", args: &args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
     let mut no_bytes = |_: &str| -> Option<&[u8]> { None };
     let first = resolve(&answerer, &cache, &CLANG_PIN, &sp, files, &mut no_bytes, alloc).expect("first");
     let second = resolve(&answerer, &cache, &CLANG_PIN, &sp, files, &mut no_bytes, alloc).expect("second");
@@ -382,7 +382,7 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         fn get<'a>(&self, _: &ProbeKey, _: Alloc<'a>) -> Result<Option<blaze_own::AVec<'a, u8>>, blaze_own::AString<'a>> { Ok(None) }
         fn put<'a>(&self, _: &ProbeKey, _: &[u8], _: Alloc<'a>) -> Result<(), blaze_own::AString<'a>> { Ok(()) }
     }
-    let sp_ok = Spawn { program: "cc", args: &ok_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    let sp_ok = Spawn { program: "cc", args: &ok_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
     for bad_src in [
         b"#include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
         b"#/**/include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
@@ -434,7 +434,21 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         ProbeWhy::PackageInput
     );
 
-    // Joined and delegated header/preprocessor flags are refused before caching.
+    // Quoted argv macro definitions (e.g. `-DVERSION="__TIMESTAMP__"`) are inert string literals
+    // and must pass canonicalization cleanly.
+    let quoted_def_args = flag_args("-DVERSION=\"__TIMESTAMP__\"");
+    let sp_quoted_def = Spawn { program: "cc", args: &quoted_def_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    assert!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_quoted_def, files, alloc).is_ok());
+
+    // Unbound `SDKROOT` (non-empty `SDKROOT` env / `sdk` with empty `sdk_id`) is refused before caching.
+    let sdk_env = [("SDKROOT", SDK)];
+    let sp_unbound_sdk = Spawn { program: "cc", args: &ok_args, env: &sdk_env, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    assert_eq!(
+        canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_unbound_sdk, files, alloc).err().expect("unbound SDKROOT").why,
+        ProbeWhy::PackageInput
+    );
+
+    // Joined and delegated header/preprocessor/module-file flags are refused before caching.
     for bad_flag in [
         "-include/target/debug/build/zstd-sys-1/out/foo.h",
         "-imacros/target/debug/build/zstd-sys-1/out/foo.h",
@@ -442,10 +456,12 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         "-Xpreprocessor",
         "-Xclang",
         "--include=/target/debug/build/zstd-sys-1/out/foo.h",
+        "-fmodule-file=m=/target/debug/build/zstd-sys-1/out/m.pcm",
+        "-fembed-dir=/target/debug/build/zstd-sys-1/out",
         "-ivfsoverlay/target/debug/build/zstd-sys-1/out/vfs.yaml",
     ] {
         let joined_args = ["-c", bad_flag, "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
-        let sp = Spawn { program: "cc", args: &joined_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+        let sp = Spawn { program: "cc", args: &joined_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
         assert_eq!(
             canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp, files, alloc).err().expect(bad_flag).why,
             ProbeWhy::PackageInput
@@ -457,8 +473,8 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     let lit_args = flag_args("-DROOT=\"$OUT_DIR\"");
     let real_define = std::format!("-DROOT=\"{OUT}\"");
     let real_args = flag_args(&real_define);
-    let sp_lit = Spawn { program: "cc", args: &lit_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
-    let sp_real = Spawn { program: "cc", args: &real_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    let sp_lit = Spawn { program: "cc", args: &lit_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let sp_real = Spawn { program: "cc", args: &real_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
     let can_lit = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_lit, files, alloc).expect("lit");
     let can_real = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_real, files, alloc).expect("real");
     assert_ne!(can_lit.key, can_real.key, "literal $OUT_DIR must not collide with real OUT_DIR");

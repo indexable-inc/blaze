@@ -674,7 +674,7 @@ impl ProbeAnswerer for HermeticClangProbe {
         let mut has_sysroot = false;
         let sdk_str = self.sdk_dir.as_ref().map(OwnString::as_str);
         for segs in probe.exec_args.iter() {
-            let rendered = render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc);
+            let rendered = render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc)?;
             has_sysroot |= rendered.as_str().starts_with("-isysroot") || rendered.as_str().starts_with("--sysroot");
             owned_args.push(rendered);
         }
@@ -692,7 +692,7 @@ impl ProbeAnswerer for HermeticClangProbe {
         for (k, segs) in probe.exec_env.iter() {
             owned_env.push((
                 own_str(k.as_str(), alloc),
-                render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc),
+                render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc)?,
             ));
         }
         let epoch_secs = resolve_source_date_epoch(&mut owned_env, alloc)?;
@@ -802,19 +802,21 @@ fn render_segments<'a>(
     sdk_dir: Option<&str>,
     placeholders: &[(AString<'a>, AString<'a>)],
     alloc: Alloc<'a>,
-) -> AString<'a> {
+) -> Result<AString<'a>, AString<'a>> {
     let mut out = OwnString::new_in(alloc);
     for seg in segs {
         match seg {
             Segment::Literal(lit) => out.push_str(lit.as_str()),
             Segment::OutDir => out.push_str(task_dir),
-            Segment::SdkRoot => {
-                if let Some(sdk) = sdk_dir {
-                    out.push_str(sdk);
-                } else {
-                    out.push_str(SDKROOT);
+            Segment::SdkRoot => match sdk_dir {
+                Some(sdk) => out.push_str(sdk),
+                None => {
+                    return Err(own_str(
+                        "c-probe references SDKROOT without a configured SDK root (rule 3)",
+                        alloc,
+                    ));
                 }
-            }
+            },
             Segment::Mount => out.push_str("/package"),
             Segment::Placeholder(spelled) => {
                 if let Some((_, host_file)) = placeholders.iter().find(|(k, _)| k.as_str() == spelled.as_str()) {
@@ -825,7 +827,7 @@ fn render_segments<'a>(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Creates a crash- and PID-reuse-safe per-probe task folder under `work_root`, mixing wall-clock
@@ -1216,17 +1218,23 @@ mod tests {
             .expect_err("must time out waiting on scheduler lock");
         assert!(err.as_str().contains("timed out"), "unexpected error: {err}");
 
-        // Structural segment rendering preserves literal `$OUT_DIR` while expanding real `Segment::OutDir`.
+        // Structural segment rendering preserves literal `$OUT_DIR`, expands real `Segment::OutDir`,
+        // and explicitly refuses `Segment::SdkRoot` when no SDK is configured.
         let lit_segs = [super::Segment::Literal(OwnString::from_str_in("-DROOT=\"$OUT_DIR\"", alloc))];
-        let rendered_lit = super::render_segments(&lit_segs, "/tmp/task-1", None, &[], alloc);
+        let rendered_lit = super::render_segments(&lit_segs, "/tmp/task-1", None, &[], alloc).expect("lit");
         assert_eq!(rendered_lit.as_str(), "-DROOT=\"$OUT_DIR\"");
         let real_segs = [
             super::Segment::Literal(OwnString::from_str_in("-DROOT=\"", alloc)),
             super::Segment::OutDir,
             super::Segment::Literal(OwnString::from_str_in("\"", alloc)),
         ];
-        let rendered_real = super::render_segments(&real_segs, "/tmp/task-1", None, &[], alloc);
+        let rendered_real = super::render_segments(&real_segs, "/tmp/task-1", None, &[], alloc).expect("real");
         assert_eq!(rendered_real.as_str(), "-DROOT=\"/tmp/task-1\"");
+        let unbound_sdk_segs = [super::Segment::SdkRoot];
+        assert!(
+            super::render_segments(&unbound_sdk_segs, "/tmp/task-1", None, &[], alloc).is_err(),
+            "Segment::SdkRoot without sdk_dir must be refused"
+        );
 
         // Reply normalization scrubs BOTH `<shelf>/bin/clang-23` AND `<shelf>/bin` (`InstalledDir:`).
         let norm = super::normalize_reply(

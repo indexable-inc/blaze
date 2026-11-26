@@ -118,9 +118,21 @@ fn is_header_search_flag(arg: &str) -> bool {
         "-Wp,",
         "-Xpreprocessor",
         "-Xclang",
+        "-fmodule-file",
         "-fmodule-map-file",
         "-fprebuilt-module-path",
         "-fmodules-cache-path",
+        "-fembed-dir",
+        "-fsanitize-ignorelist",
+        "-fsanitize-blacklist",
+        "-fprofile-list",
+        "-fpass-plugin",
+        "-fplugin",
+        "--config",
+        "-resource-dir",
+        "-B",
+        "--gcc-toolchain",
+        "--sysroot",
         "-ivfsoverlay",
     ];
     PREFIXES.iter().any(|p| arg.starts_with(p))
@@ -505,6 +517,49 @@ fn contains_ident(text: &str, ident: &str) -> bool {
     false
 }
 
+/// Masks characters inside `"..."` and `'...'` literals with spaces while preserving quote
+/// delimiters so inert string tokens (e.g. `-DVERSION="__TIMESTAMP__"`) are not misclassified as
+/// active preprocessor operators.
+fn mask_quoted_literals<'a>(text: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out: AVec<'a, u8> = Vec::with_capacity_in(text.len(), alloc);
+    let src = text.as_bytes();
+    let mut j = 0usize;
+    let mut quote: Option<u8> = None;
+    while let Some(&b) = src.get(j) {
+        if let Some(q) = quote {
+            j += 1;
+            if b == b'\\' {
+                out.push(b' ');
+                if src.get(j).is_some() {
+                    out.push(b' ');
+                    j += 1;
+                }
+            } else if b == q {
+                out.push(b);
+                quote = None;
+            } else if b == b'\n' {
+                out.push(b'\n');
+                quote = None;
+            } else {
+                out.push(b' ');
+            }
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            quote = Some(b);
+            out.push(b);
+            j += 1;
+            continue;
+        }
+        out.push(b);
+        j += 1;
+    }
+    match core::str::from_utf8(out.as_slice()) {
+        Ok(s) => String::from_str_in(s, alloc),
+        Err(_) => String::from_str_in(text, alloc),
+    }
+}
+
 /// Checks materialized `OUT_DIR` probe source bytes (after C translation phase 2 line-splicing
 /// and phase 3 comment stripping) for unkeyed file/header inclusions (`#include`, `#include_next`,
 /// `#import`, `__has_include`, `__has_include_next`, `__has_embed`) or host-timestamp macros
@@ -652,15 +707,17 @@ pub fn canonicalize<'b, 's>(
     let mut skip_next = false;
     for (idx, &arg) in spawn.args.iter().enumerate() {
         let next = spawn.args.get(idx + 1).copied();
-        if is_host_dependent_flag(arg, next) || contains_ident(arg, "__TIMESTAMP__") {
+        let masked_arg = mask_quoted_literals(arg, alloc);
+        let masked = masked_arg.as_str();
+        if is_host_dependent_flag(arg, next) || contains_ident(masked, "__TIMESTAMP__") {
             has_host_dep_arg = true;
             break;
         }
         if is_header_search_flag(arg)
             || arg.starts_with('@')
-            || contains_ident(arg, "__has_include")
-            || contains_ident(arg, "__has_include_next")
-            || contains_ident(arg, "__has_embed")
+            || contains_ident(masked, "__has_include")
+            || contains_ident(masked, "__has_include_next")
+            || contains_ident(masked, "__has_embed")
             || (!spawn.mount.is_empty() && arg.contains(spawn.mount) && !is_prefix_map_flag(arg))
         {
             has_arg_package_input = true;
@@ -680,10 +737,13 @@ pub fn canonicalize<'b, 's>(
             break;
         }
     }
+    let uses_unbound_sdk = spawn.sdk_id.is_empty()
+        && (asked.exec_args.iter().flatten().any(|s| matches!(s, Segment::SdkRoot))
+            || asked.exec_env.iter().flat_map(|(_, segs)| segs.iter()).any(|s| matches!(s, Segment::SdkRoot)));
     if has_host_dep_arg {
         return Err(ProbeRefused { why: ProbeWhy::HostDependent, row: row_json(&asked.row, alloc) });
     }
-    if has_env_package_input || has_arg_package_input {
+    if has_env_package_input || has_arg_package_input || uses_unbound_sdk {
         return Err(ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&asked.row, alloc) });
     }
     let key = probe_key(answerer_id, clang, spawn.sdk_id, &asked.row, &asked.exec_args, &asked.exec_env);

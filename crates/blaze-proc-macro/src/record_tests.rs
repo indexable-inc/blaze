@@ -259,3 +259,100 @@ fn c_probe_concurrent_repair_catches_unserialized_repair() {
         .expect_err("planted UnserializedRepair must be caught");
     assert!(err.contains("silent overwrite"), "unexpected error: {err}");
 }
+
+/// Simulated crash/failure DST for the corrupted-record repair-locking path: seeds torn/corrupted
+/// records under `bstd::test::seeded`, drives `put_c_probe` repair (`Effect::Lock` -> protected
+/// bounded re-read -> `publish` -> `Effect::Unlock`) across power cuts and I/O failures, and
+/// exercises the interleaved conflicting repairer after a committed repair.
+fn c_probe_repair_sim_program(io: &Io, plant: RecordPlant) -> Result<(), FilesError> {
+    let dir = io.need_fs().map_err(|_| FilesError::NoTree)?.root();
+    let store = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir }, plant);
+    let alloc = blaze_own::testing::heap().alloc();
+    let cx = io.cx(core::time::Duration::from_secs(30), bstd::mem::TASK_FRAME).map_err(|_| {
+        FilesError::Stopped { name: DirStore::named(b"c-probe/", &key(0)) }
+    })?;
+    let fs_root = io.need_fs().map_err(|_| FilesError::NoTree)?.root();
+    let mut value = [0u8; LONGEST];
+
+    // Check invariant on any state surviving a prior power cut.
+    for k in 0..4u32 {
+        let want = payload(k, &mut value);
+        if let Some(held) = store.get_c_probe(&key(k), alloc)? {
+            assert!(
+                held.as_slice() == want,
+                "c-probe repair oracle: key {k} survived crash with unexpected bytes ({} for {})",
+                held.len(),
+                want.len()
+            );
+        }
+    }
+
+    for k in 0..4u32 {
+        let want = payload(k, &mut value);
+        let name = DirStore::named(b"c-probe/", &key(k));
+        let rel = bstd::path::Path::new(name.as_str()).map_err(|_| FilesError::Name { name })?;
+        // If absent, seed a torn/corrupted record so `put_c_probe` enters the repair-lock path
+        // (`Effect::Lock` -> bounded re-read -> `publish` -> `Effect::Unlock`) under fault injection.
+        if store.get_c_probe(&key(k), alloc)?.is_none() {
+            fs_root
+                .publish(&cx, &rel, bstd::fs::Content::bytes(b"torn-corrupt"), bstd::fs::Durable::No)
+                .map_err(FilesError::Effect)?;
+        }
+        store.put_c_probe(&key(k), want)?;
+        // Interleaved second repairer that observed the corrupted file prior to the first writer's
+        // commit MUST be rejected with `OtherBytes` once it enters the locked repair check.
+        let mut conflict = std::vec::Vec::from(want);
+        conflict.push(0x5A);
+        match store.repair_c_probe_after_invalid(&name, &conflict, alloc) {
+            Err(FilesError::OtherBytes { .. }) => {}
+            Ok(()) => assert!(
+                false,
+                "c-probe repair oracle: conflicting interleaved repair on key {k} silently succeeded"
+            ),
+            Err(other) => return Err(other),
+        }
+        if let Some(held) = store.get_c_probe(&key(k), alloc)? {
+            assert!(
+                held.as_slice() == want,
+                "c-probe repair oracle: key {k} corrupted after interleaved conflict"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn c_probe_repair_lock_survives_crashes_and_failures_in_sim() {
+    match seeded(
+        "blaze-proc-macro",
+        module_path!(),
+        "c_probe_repair_lock_crash",
+        Seeds::DEFAULT.from(0, 300),
+        Given::NOTHING,
+        |_: &Cx, io: Io| c_probe_repair_sim_program(&io, RecordPlant::None),
+    ) {
+        Ok(passed) => {
+            assert!(passed.counts.cuts > 100, "too few power cuts: {:?}", passed.counts);
+            assert!(passed.counts.failures > 100, "too few failures: {:?}", passed.counts);
+        }
+        Err(failed) => panic!("{failed}"),
+    }
+}
+
+#[test]
+fn c_probe_repair_lock_sim_catches_unserialized_repair() {
+    match seeded(
+        "blaze-proc-macro",
+        module_path!(),
+        "c_probe_repair_lock_planted_bug",
+        Seeds::DEFAULT.from(0, 32),
+        Given::NOTHING,
+        |_: &Cx, io: Io| c_probe_repair_sim_program(&io, RecordPlant::UnserializedRepair),
+    ) {
+        Ok(passed) => panic!("planted UnserializedRepair was not caught in {} starts", passed.starts),
+        Err(failed) => {
+            let said = std::format!("{failed}");
+            assert!(said.contains("c-probe repair oracle"), "planted UnserializedRepair failed otherwise: {said}");
+        }
+    }
+}

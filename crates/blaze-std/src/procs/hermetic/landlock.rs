@@ -340,7 +340,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
             }
         }
 
-        let mut name_buf = [0u8; 192];
+        let mut name_buf = [0u8; 320];
         for &str_off in needed_offs.get(..needed_count).unwrap_or(&[]) {
             let Some(at) = strtab_file_off.checked_add(str_off) else {
                 continue;
@@ -349,7 +349,34 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
             let raw = name_buf.get(..n).unwrap_or(&[]);
             let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
             let soname = raw.get(..end).unwrap_or(&[]);
-            if !soname.is_empty() && !soname.contains(&b'/') {
+            if soname.is_empty() {
+                continue;
+            }
+            if soname.contains(&b'/') {
+                // Path-bearing `DT_NEEDED` (e.g. direct `/nix/store/.../libfoo.so` or `$ORIGIN/...`):
+                // expand `$ORIGIN` and grant/enqueue directly, refusing if relative or unresolvable.
+                let mut expanded = [0u8; PATH_CAP];
+                let exp_len = expand_origin(soname, origin_dir, &mut expanded);
+                // `expand_origin` appends a trailing `/`; trim it for a library file path.
+                let file_len = if exp_len > 1 && expanded.get(exp_len - 1) == Some(&b'/') {
+                    exp_len - 1
+                } else {
+                    exp_len
+                };
+                let exp_slice = expanded.get(..file_len).unwrap_or(&[]);
+                if exp_slice.first() != Some(&b'/') {
+                    return Err(Fault::Host {
+                        call: "landlock (NixOS ELF relative path-bearing DT_NEEDED unsupported)",
+                        code: 2,
+                    });
+                }
+                if !try_grant_and_enqueue_lib(ruleset, b"", exp_slice, &mut queue, &mut q_len)? {
+                    return Err(Fault::Host {
+                        call: "landlock (NixOS ELF path-bearing DT_NEEDED not found)",
+                        code: 2,
+                    });
+                }
+            } else {
                 enqueue_nix_soname(
                     ruleset,
                     soname,
