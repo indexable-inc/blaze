@@ -28,7 +28,10 @@ use crate::persist::{PMap, PVec};
 use crate::protocol::{Answer, EvalOutcome, ExternalMode, Request, Step, StreamChunk};
 use crate::span::Span;
 use crate::state::{DefData, EngineState, VarSlot};
-use crate::value::{Bytes, ClosureData, DateTime, Nanos, PathMember, RangeVal, Record, Table, Value};
+use crate::value::{
+    Bytes, ClosureData, CommandOutput, DateTime, Nanos, OutputChunk, OutputStream, PathMember,
+    RangeVal, Record, Table, Value,
+};
 
 /// Default execution fuel per `Machine::step` evaluation pass (rule 18: bounded progress).
 pub const DEFAULT_FUEL: u32 = 200_000;
@@ -1800,6 +1803,7 @@ impl<'a, 'm> Evaluator<'a, 'm> {
                 v.extend_from_slice(b.as_ref());
                 Some(v)
             }
+            Value::Output(o) => Some(o.stdout_bytes(alloc)),
             Value::String(s) => {
                 let mut v = AVec::with_capacity_in(s.len(), alloc);
                 v.extend_from_slice(s.as_bytes());
@@ -1849,33 +1853,36 @@ impl<'a, 'm> Evaluator<'a, 'm> {
             return Ok(Value::Nothing);
         }
 
-        if res.exit_code != 0 {
-            let mut msg = AString::new_in(alloc);
+        let mut chunks = PVec::new(alloc);
+        if !res.chunks.is_empty() {
+            for ch in res.chunks.iter() {
+                chunks.push(ch.clone());
+            }
+        } else {
+            if !res.stdout.is_empty() {
+                chunks.push(OutputChunk {
+                    at: Nanos(0),
+                    stream: OutputStream::Stdout,
+                    bytes: Rc::from_slice_in(res.stdout.as_slice(), alloc),
+                });
+            }
             if !res.stderr.is_empty() {
-                if let Ok(err_text) = core::str::from_utf8(res.stderr.as_slice()) {
-                    msg.push_str(err_text.trim());
-                }
+                chunks.push(OutputChunk {
+                    at: Nanos(0),
+                    stream: OutputStream::Stderr,
+                    bytes: Rc::from_slice_in(res.stderr.as_slice(), alloc),
+                });
             }
-            if msg.is_empty() {
-                let _ = write!(
-                    msg,
-                    "external command `{}` exited with status {}",
-                    call.head.as_ref(),
-                    res.exit_code
-                );
-            }
-            return Err(Control::Error(ShellError::new(
-                ErrorKind::External,
-                call.head_span,
-                msg.as_str(),
-                alloc,
-            )));
         }
 
-        match core::str::from_utf8(res.stdout.as_slice()) {
-            Ok(text) => Ok(Value::string(text, alloc)),
-            Err(_) => Ok(Value::binary(res.stdout.as_slice(), alloc)),
-        }
+        Ok(Value::Output(Rc::new_in(
+            CommandOutput {
+                exit_code: res.exit_code,
+                duration: Nanos(res.duration_ns.max(0)),
+                chunks,
+            },
+            alloc,
+        )))
     }
 
     fn eval_alias(

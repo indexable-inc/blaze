@@ -521,6 +521,157 @@ pub enum PathKind {
     Symlink,
 }
 
+/// Which stream a timed external-command chunk arrived on.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        }
+    }
+}
+
+/// One timestamped chunk emitted by an external command on `stdout` or `stderr`.
+#[derive(Clone, Debug)]
+pub struct OutputChunk<'a> {
+    /// Monotonic nanoseconds elapsed since the command started.
+    pub at: Nanos,
+    /// Source stream (`Stdout` or `Stderr`).
+    pub stream: OutputStream,
+    /// Raw bytes received in this read.
+    pub bytes: ARc<'a, [u8]>,
+}
+
+impl<'a> Share for OutputChunk<'a> {}
+
+impl PartialEq for OutputChunk<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at
+            && self.stream == other.stream
+            && self.bytes.as_ref() == other.bytes.as_ref()
+    }
+}
+
+/// Structured, time-ordered output of an external command: preserves exact interleaved
+/// `(at, stream, bytes)` arrival order alongside `exit_code` and total `duration`.
+#[derive(Clone, Debug)]
+pub struct CommandOutput<'a> {
+    pub exit_code: i32,
+    pub duration: Nanos,
+    pub chunks: PVec<'a, OutputChunk<'a>>,
+}
+
+impl<'a> CommandOutput<'a> {
+    pub fn stream_bytes(&self, stream: OutputStream, alloc: Alloc<'a>) -> AVec<'a, u8> {
+        let mut out = AVec::new_in(alloc);
+        for i in 0..self.chunks.len() {
+            let ch = self.chunks.get(i).unwrap();
+            if ch.stream == stream {
+                out.extend_from_slice(ch.bytes.as_ref());
+            }
+        }
+        out
+    }
+
+    pub fn stdout_bytes(&self, alloc: Alloc<'a>) -> AVec<'a, u8> {
+        self.stream_bytes(OutputStream::Stdout, alloc)
+    }
+
+    pub fn stderr_bytes(&self, alloc: Alloc<'a>) -> AVec<'a, u8> {
+        self.stream_bytes(OutputStream::Stderr, alloc)
+    }
+
+    pub fn stdout_string(&self, alloc: Alloc<'a>) -> AString<'a> {
+        let raw = self.stdout_bytes(alloc);
+        match core::str::from_utf8(raw.as_slice()) {
+            Ok(s) => AString::from_str_in(s, alloc),
+            Err(_) => {
+                let mut out = AString::new_in(alloc);
+                let _ = write!(out, "<binary {} B>", raw.len());
+                out
+            }
+        }
+    }
+
+    pub fn stderr_string(&self, alloc: Alloc<'a>) -> AString<'a> {
+        let raw = self.stderr_bytes(alloc);
+        match core::str::from_utf8(raw.as_slice()) {
+            Ok(s) => AString::from_str_in(s, alloc),
+            Err(_) => {
+                let mut out = AString::new_in(alloc);
+                let _ = write!(out, "<binary {} B>", raw.len());
+                out
+            }
+        }
+    }
+
+    pub fn stdout_value(&self, alloc: Alloc<'a>) -> Value<'a> {
+        let raw = self.stdout_bytes(alloc);
+        match core::str::from_utf8(raw.as_slice()) {
+            Ok(s) => Value::string(s, alloc),
+            Err(_) => Value::binary(raw.as_slice(), alloc),
+        }
+    }
+
+    pub fn stderr_value(&self, alloc: Alloc<'a>) -> Value<'a> {
+        let raw = self.stderr_bytes(alloc);
+        match core::str::from_utf8(raw.as_slice()) {
+            Ok(s) => Value::string(s, alloc),
+            Err(_) => Value::binary(raw.as_slice(), alloc),
+        }
+    }
+
+    /// Materialize the timed interleaved stream as a typed `Table` (`at`, `stream`, `text`).
+    pub fn events_table(&self, alloc: Alloc<'a>) -> Table<'a> {
+        let mut tbl = Table::from_col_names(&["at", "stream", "text"], alloc);
+        tbl.set_col_display("at", ColDisplay::Duration);
+        tbl.set_col_display("stream", ColDisplay::Status);
+        for i in 0..self.chunks.len() {
+            let ch = self.chunks.get(i).unwrap();
+            let text_val = match core::str::from_utf8(ch.bytes.as_ref()) {
+                Ok(s) => Value::string(s, alloc),
+                Err(_) => Value::binary(ch.bytes.as_ref(), alloc),
+            };
+            tbl.push_row_values(&[
+                Value::Duration(ch.at),
+                Value::string(ch.stream.as_str(), alloc),
+                text_val,
+            ]);
+        }
+        tbl
+    }
+
+    pub fn stdout_len(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|c| c.stream == OutputStream::Stdout)
+            .map(|c| c.bytes.len())
+            .sum()
+    }
+
+    pub fn stderr_len(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|c| c.stream == OutputStream::Stderr)
+            .map(|c| c.bytes.len())
+            .sum()
+    }
+}
+
+impl PartialEq for CommandOutput<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.exit_code == other.exit_code
+            && self.duration == other.duration
+            && self.chunks == other.chunks
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Value<'a> {
     Nothing,
@@ -534,6 +685,8 @@ pub enum Value<'a> {
     Date(DateTime),
     Range(RangeVal),
     Binary(ARc<'a, [u8]>),
+    /// Structured external command output with time-ordered `stdout`/`stderr` chunks + exit code.
+    Output(ARc<'a, CommandOutput<'a>>),
     List(PVec<'a, Value<'a>>),
     Record(Record<'a>),
     Table(Table<'a>),
@@ -574,6 +727,7 @@ impl<'a> Value<'a> {
             Value::Date(_) => "date",
             Value::Range(_) => "range",
             Value::Binary(_) => "binary",
+            Value::Output(_) => "output",
             Value::List(_) => "list",
             Value::Record(_) => "record",
             Value::Table(_) => "table",
@@ -597,6 +751,7 @@ impl<'a> Value<'a> {
             Value::Record(r) => !r.is_empty(),
             Value::Table(t) => !t.is_empty(),
             Value::Binary(b) => !b.is_empty(),
+            Value::Output(o) => o.exit_code == 0,
             Value::Date(_) | Value::Range(_) | Value::Closure(_) | Value::CellPath(_) => true,
         }
     }
@@ -645,6 +800,20 @@ impl<'a> Value<'a> {
                         let mut msg = AString::from_str_in("table has no column `", alloc);
                         msg.push_str(name.as_ref());
                         msg.push('`');
+                        Err(ShellError::new(ErrorKind::MissingColumn, span, msg.as_str(), alloc))
+                    }
+                },
+                Value::Output(o) => match name.as_ref() {
+                    "stdout" => Ok(o.stdout_value(alloc)),
+                    "stderr" => Ok(o.stderr_value(alloc)),
+                    "exit_code" | "status" => Ok(Value::Int(i64::from(o.exit_code))),
+                    "duration" => Ok(Value::Duration(o.duration)),
+                    "events" | "chunks" | "streams" => Ok(Value::Table(o.events_table(alloc))),
+                    _ if *optional => Ok(Value::Nothing),
+                    other => {
+                        let mut msg = AString::from_str_in("output has no field `", alloc);
+                        msg.push_str(other);
+                        msg.push_str("` (expected stdout, stderr, exit_code, duration, or events)");
                         Err(ShellError::new(ErrorKind::MissingColumn, span, msg.as_str(), alloc))
                     }
                 },
@@ -762,6 +931,16 @@ impl<'a> Value<'a> {
                 Ok(())
             }
             Value::Binary(b) => write!(out, "<binary {} B>", b.len()),
+            Value::Output(o) => {
+                for ch in o.chunks.iter() {
+                    if ch.stream == OutputStream::Stdout {
+                        if let Ok(s) = core::str::from_utf8(ch.bytes.as_ref()) {
+                            out.write_str(s)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
             Value::List(l) => write!(out, "[list {} items]", l.len()),
             Value::Record(r) => write!(out, "{{record {} fields}}", r.len()),
             Value::Table(t) => write!(out, "[table {}x{}]", t.nrows(), t.ncols()),
@@ -815,6 +994,26 @@ impl<'a> Value<'a> {
                 let mut v = AVec::with_capacity_in(b.len(), alloc);
                 v.extend_from_slice(b.as_ref());
                 blaze_data::Value::Bytes(v)
+            }
+            Value::Output(o) => {
+                let mut map = blaze_data::Map::new_in(alloc);
+                map.insert(
+                    AString::from_str_in("exit_code", alloc),
+                    blaze_data::Value::Int(blaze_data::Int::from_i64(i64::from(o.exit_code))),
+                );
+                map.insert(
+                    AString::from_str_in("duration_ns", alloc),
+                    blaze_data::Value::Int(blaze_data::Int::from_i64(o.duration.0)),
+                );
+                map.insert(
+                    AString::from_str_in("stdout", alloc),
+                    blaze_data::Value::Text(o.stdout_string(alloc)),
+                );
+                map.insert(
+                    AString::from_str_in("stderr", alloc),
+                    blaze_data::Value::Text(o.stderr_string(alloc)),
+                );
+                blaze_data::Value::Map(map)
             }
             Value::List(items) => {
                 let mut out = AVec::with_capacity_in(items.len(), alloc);
@@ -919,6 +1118,7 @@ impl PartialEq for Value<'_> {
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Range(a), Value::Range(b)) => a == b,
             (Value::Binary(a), Value::Binary(b)) => a.as_ref() == b.as_ref(),
+            (Value::Output(a), Value::Output(b)) => a.as_ref() == b.as_ref(),
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Record(a), Value::Record(b)) => a == b,
             (Value::Table(a), Value::Table(b)) => a == b,
@@ -1009,7 +1209,17 @@ fn write_scaled(val: u64, unit: u64, suffix: &str, out: &mut impl fmt::Write) ->
     }
 }
 
-/// Human-friendly duration formatting (`420ns`, `12.4ms`, `1.8sec`, `4min 12sec`).
+fn write_scaled_tight(val: u64, unit: u64, suffix: &str, out: &mut impl fmt::Write) -> fmt::Result {
+    let whole = val / unit;
+    let frac = ((val % unit) * 10) / unit;
+    if frac == 0 {
+        write!(out, "{whole}{suffix}")
+    } else {
+        write!(out, "{whole}.{frac}{suffix}")
+    }
+}
+
+/// Human-friendly Nushell-style duration formatting (`420ns`, `12.4ms`, `15sec`, `4min 12sec`).
 pub fn format_duration(Nanos(ns): Nanos, out: &mut impl fmt::Write) -> fmt::Result {
     let neg = ns < 0;
     let abs = ns.unsigned_abs();
@@ -1025,11 +1235,11 @@ pub fn format_duration(Nanos(ns): Nanos, out: &mut impl fmt::Write) -> fmt::Resu
     if abs < US {
         write!(out, "{abs}ns")
     } else if abs < MS {
-        write_scaled(abs, US, "us", out)
+        write_scaled_tight(abs, US, "us", out)
     } else if abs < SEC {
-        write_scaled(abs, MS, "ms", out)
+        write_scaled_tight(abs, MS, "ms", out)
     } else if abs < MIN {
-        write_scaled(abs, SEC, "sec", out)
+        write_scaled_tight(abs, SEC, "sec", out)
     } else if abs < HR {
         let m = abs / MIN;
         let s = (abs % MIN) / SEC;

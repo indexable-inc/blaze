@@ -113,6 +113,12 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
         flags: &[],
     },
     BuiltinSpec {
+        name: "sleep",
+        signature: "sleep <duration>",
+        summary: "Pause execution for a typed duration (e.g. `sleep 500ms`, `sleep 15sec`, `sleep 2min`)",
+        flags: &[],
+    },
+    BuiltinSpec {
         name: "env",
         signature: "env",
         summary: "Return the current environment variables as a sorted record",
@@ -1226,6 +1232,10 @@ pub(crate) fn to_text_string<'a>(val: &Value<'a>, alloc: Alloc<'a>) -> AString<'
                 let _ = val.format_cell(&mut out);
             }
         },
+        Value::Output(o) => {
+            let s = o.stdout_string(alloc);
+            out.push_str(s.as_str());
+        }
         _ => {
             let _ = val.format_cell(&mut out);
         }
@@ -1355,6 +1365,7 @@ impl<'a> EvalArgs<'a> {
 fn value_as_word<'a>(v: &Value<'a>, alloc: Alloc<'a>) -> Option<AString<'a>> {
     match v {
         Value::String(s) | Value::Path { path: s, .. } => Some(AString::from_str_in(s.as_ref(), alloc)),
+        Value::Output(o) => Some(o.stdout_string(alloc)),
         Value::CellPath(path) => {
             let mut out = AString::new_in(alloc);
             for (i, m) in path.iter().enumerate() {
@@ -1510,6 +1521,7 @@ pub(crate) fn dispatch_builtin<'a>(
         "mkdir" => builtin_mkdir(eval, args, span)?,
         "touch" => builtin_touch(eval, args, span)?,
         "which" => builtin_which(eval, args, span)?,
+        "sleep" => builtin_sleep(eval, args, span)?,
         "ps" => builtin_ps(eval, span)?,
         "sys" => builtin_sys(eval, span)?,
         "env" => Value::Record(eval.state().env_record()),
@@ -1880,6 +1892,7 @@ fn builtin_save<'a>(
             out.extend_from_slice(b.as_ref());
             out
         }
+        Value::Output(o) => o.stdout_bytes(alloc),
         _ => {
             let text = if !raw_mode {
                 match ext.as_ref().map(|e| e.as_str()) {
@@ -2000,6 +2013,45 @@ fn builtin_touch<'a>(
         let path = resolve_arg_path(eval, v, *s)?;
         let _ = eval.request(Request::FsOp(FsOp::Touch { path }), *s)?;
     }
+    Ok(Value::Nothing)
+}
+
+fn builtin_sleep<'a>(
+    eval: &mut Evaluator<'a, '_>,
+    args: EvalArgs<'a>,
+    span: Span,
+) -> Result<Value<'a>, Control<'a>> {
+    let alloc = eval.alloc();
+    let Some((val, vspan)) = args.pos.first() else {
+        return Err(arity_err("sleep", "expected a duration (e.g. `sleep 500ms`, `sleep 15sec`)", span, alloc));
+    };
+    let duration = match val {
+        Value::Duration(d) => *d,
+        Value::Int(secs) => Nanos(secs.saturating_mul(1_000_000_000)),
+        Value::Float(secs) if secs.is_finite() => Nanos(f64_round(secs * 1_000_000_000.0) as i64),
+        Value::String(s) => parse_duration_str(s.as_ref(), alloc).ok_or_else(|| {
+            Control::Error(ShellError::new(
+                ErrorKind::Type,
+                *vspan,
+                "invalid duration for `sleep` (use e.g. `500ms`, `15sec`, `2min`)",
+                alloc,
+            ))
+        })?,
+        other => {
+            let mut msg = AString::from_str_in("`sleep` expects a duration, got ", alloc);
+            msg.push_str(other.type_name());
+            return Err(Control::Error(ShellError::new(ErrorKind::Type, *vspan, msg.as_str(), alloc)));
+        }
+    };
+    if duration.0 < 0 {
+        return Err(Control::Error(ShellError::new(
+            ErrorKind::Type,
+            *vspan,
+            "`sleep` duration must not be negative",
+            alloc,
+        )));
+    }
+    let _ = eval.request(Request::Sleep { duration }, span)?;
     Ok(Value::Nothing)
 }
 
@@ -3066,6 +3118,7 @@ fn builtin_length<'a>(
         Value::Record(r) => Ok(Value::Int(r.len() as i64)),
         Value::String(s) => Ok(Value::Int(s.as_ref().chars().count() as i64)),
         Value::Binary(b) => Ok(Value::Int(b.len() as i64)),
+        Value::Output(o) => Ok(Value::Int(o.stdout_len() as i64)),
         Value::Range(r) => {
             let Some(end) = r.end else {
                 return Err(Control::Error(ShellError::new(
@@ -4221,7 +4274,11 @@ fn map_str_or_list<'a>(
 ) -> Result<Value<'a>, Control<'a>> {
     let alloc = eval.alloc();
     match input {
-        Value::String(s) => f(s.as_ref(), alloc),
+        Value::String(s) | Value::Path { path: s, .. } => f(s.as_ref(), alloc),
+        Value::Output(o) => {
+            let s = o.stdout_string(alloc);
+            f(s.as_str(), alloc)
+        }
         Value::List(items) => {
             let mut out = PVec::new(alloc);
             for i in 0..items.len() {
@@ -4426,8 +4483,14 @@ fn builtin_lines<'a>(
     span: Span,
 ) -> Result<Value<'a>, Control<'a>> {
     let alloc = eval.alloc();
-    let Some(text) = input.as_str() else {
-        return Err(type_err("`lines` expects a string", span, alloc));
+    let owned;
+    let text = match &input {
+        Value::String(s) | Value::Path { path: s, .. } => s.as_ref(),
+        Value::Output(o) => {
+            owned = o.stdout_string(alloc);
+            owned.as_str()
+        }
+        _ => return Err(type_err("`lines` expects a string or command output", span, alloc)),
     };
     let mut out = PVec::new(alloc);
     for line in text.lines() {
@@ -4448,8 +4511,14 @@ fn builtin_split_row<'a>(
         return Err(arity_err("split row", "expected <separator>", span, alloc));
     };
     let sep = require_string(v, "separator", *s, alloc).map_err(Control::Error)?;
-    let Some(text) = input.as_str() else {
-        return Err(type_err("`split row` expects a string", span, alloc));
+    let owned;
+    let text = match &input {
+        Value::String(s) | Value::Path { path: s, .. } => s.as_ref(),
+        Value::Output(o) => {
+            owned = o.stdout_string(alloc);
+            owned.as_str()
+        }
+        _ => return Err(type_err("`split row` expects a string or command output", span, alloc)),
     };
     let mut out = PVec::new(alloc);
     for part in text.split(sep.as_str()) {
@@ -4722,11 +4791,11 @@ fn parse_duration_str<'a>(s: &str, alloc: Alloc<'a>) -> Option<Nanos> {
         "ns" => 1.0,
         "us" | "µs" => 1_000.0,
         "ms" => 1_000_000.0,
-        "s" | "sec" => 1_000_000_000.0,
-        "min" => 60_000_000_000.0,
-        "h" | "hr" => 3_600_000_000_000.0,
-        "d" | "day" => 86_400_000_000_000.0,
-        "wk" => 604_800_000_000_000.0,
+        "s" | "sec" | "secs" => 1_000_000_000.0,
+        "m" | "min" | "mins" => 60_000_000_000.0,
+        "h" | "hr" | "hrs" => 3_600_000_000_000.0,
+        "d" | "day" | "days" => 86_400_000_000_000.0,
+        "wk" | "wks" => 604_800_000_000_000.0,
         _ => return None,
     };
     if let Ok(i) = num_str.parse::<i64>() {
@@ -5018,6 +5087,10 @@ fn builtin_from<'a>(
         "json" => match &input {
             Value::String(s) => from_json_bytes(s.as_bytes(), span, alloc).map_err(Control::Error),
             Value::Binary(b) => from_json_bytes(b.as_ref(), span, alloc).map_err(Control::Error),
+            Value::Output(o) => {
+                let raw = o.stdout_bytes(alloc);
+                from_json_bytes(raw.as_slice(), span, alloc).map_err(Control::Error)
+            }
             other => {
                 let mut msg = AString::from_str_in("`from json` expects string or binary, got ", alloc);
                 msg.push_str(other.type_name());
@@ -5025,6 +5098,7 @@ fn builtin_from<'a>(
             }
         },
         "toml" => {
+            let owned_out;
             let text = match &input {
                 Value::String(s) => s.as_ref(),
                 Value::Binary(b) => core::str::from_utf8(b.as_ref()).map_err(|_| {
@@ -5035,6 +5109,10 @@ fn builtin_from<'a>(
                         alloc,
                     ))
                 })?,
+                Value::Output(o) => {
+                    owned_out = o.stdout_string(alloc);
+                    owned_out.as_str()
+                }
                 other => {
                     let mut msg = AString::from_str_in("`from toml` expects string or binary, got ", alloc);
                     msg.push_str(other.type_name());
@@ -5052,6 +5130,7 @@ fn builtin_from<'a>(
                 }
                 None => ',',
             };
+            let owned_out;
             let text = match &input {
                 Value::String(s) => s.as_ref(),
                 Value::Binary(b) => core::str::from_utf8(b.as_ref()).map_err(|_| {
@@ -5062,6 +5141,10 @@ fn builtin_from<'a>(
                         alloc,
                     ))
                 })?,
+                Value::Output(o) => {
+                    owned_out = o.stdout_string(alloc);
+                    owned_out.as_str()
+                }
                 other => {
                     let mut msg = AString::from_str_in("`from csv` expects string or binary, got ", alloc);
                     msg.push_str(other.type_name());

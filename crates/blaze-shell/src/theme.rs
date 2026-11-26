@@ -148,6 +148,7 @@ pub fn value_color(val: &Value<'_>) -> [f32; 4] {
         Value::Date(_) => INK_3,
         Value::Range(_) => INK_2,
         Value::Binary(_) => INK_3,
+        Value::Output(_) => INK_1,
         Value::List(_) | Value::Record(_) | Value::Table(_) => INK_2,
         Value::Closure(_) | Value::CellPath(_) => INK_3,
         Value::Error(_) => DANGER,

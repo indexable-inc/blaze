@@ -307,9 +307,33 @@ mod mac_imageio {
             leading: *mut f64,
         ) -> f64;
         pub(super) fn CTLineDraw(line: *const OpaqueCTLine, ctx: *mut OpaqueCGContext);
+        pub(super) fn CTLineGetGlyphRuns(line: *const OpaqueCTLine) -> *const c_void;
+        pub(super) fn CTRunGetGlyphCount(run: *const c_void) -> isize;
+        pub(super) fn CTRunGetGlyphs(
+            run: *const c_void,
+            range: objc2_core_foundation::CFRange,
+            buffer: *mut u16,
+        );
         pub(super) static kCTFontAttributeName: *const c_void;
         pub(super) static kCTForegroundColorAttributeName: *const c_void;
+        pub(super) static kCTLigatureAttributeName: *const c_void;
+        pub(super) static kCTForegroundColorFromContextAttributeName: *const c_void;
     }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        pub(super) fn CFNumberCreate(
+            allocator: *const c_void,
+            the_type: isize,
+            value_ptr: *const c_void,
+        ) -> *mut OpaqueCFNumber;
+        pub(super) fn CFArrayGetCount(arr: *const c_void) -> isize;
+        pub(super) fn CFArrayGetValueAtIndex(arr: *const c_void, idx: isize) -> *const c_void;
+        pub(super) static kCFBooleanTrue: *const c_void;
+    }
+
+    /// `kCFNumberSInt32Type = 3`.
+    pub(super) const CF_SINT32: isize = 3;
 
     /// `kCGImageAlphaPremultipliedLast` (1) | `kCGBitmapByteOrder32Big` (4 << 12).
     pub(super) const RGBA8_PREMUL_LAST: u32 = 1 | (4 << 12);
@@ -1706,6 +1730,132 @@ pub(crate) fn rasterize_coretext_rgba(text: &str, w_px: usize, h_px: usize) -> O
             px[1] = ((f32::from(px[1]) / af).round().clamp(0.0, 255.0)) as u8;
             px[2] = ((f32::from(px[2]) / af).round().clamp(0.0, 255.0)) as u8;
         }
+    }
+    Some(buf)
+}
+
+/// Shape an ASCII operator sequence (`->`, `-->`, `=>`, `!=`, `|>`, etc.) with CoreText OpenType
+/// `calt` + `liga` ligatures. Returns `Some(alpha_bytes)` of size `w * h` ONLY when CoreText
+/// actually substitutes ligature glyphs different from `plain_gids`.
+#[cfg(target_os = "macos")]
+pub(crate) fn shape_and_raster_ligature_alpha(
+    font_ptr: *const c_void,
+    text: &str,
+    plain_gids: &[u16],
+    w: usize,
+    h: usize,
+    baseline: f64,
+) -> Option<Vec<u8>> {
+    use mac_imageio::*;
+    use objc2_core_foundation::CFRange;
+    use objc2_core_graphics::{CGBitmapContextCreate as ObjCGBitmap, CGColorSpace, CGContext};
+
+    if font_ptr.is_null() || text.is_empty() || w == 0 || h == 0 {
+        return None;
+    }
+    let lig_val: i32 = 2;
+    let mut buf = vec![0u8; w * h];
+    let mut ligated = false;
+
+    // SAFETY: Every CF/CT object is checked for null and released before returning; `buf` lives
+    // past the `CGContext` drop so CoreGraphics never writes out of bounds.
+    unsafe {
+        let cf_str = CFStringCreateWithBytes(
+            std::ptr::null(),
+            text.as_ptr(),
+            text.len() as isize,
+            CF_UTF8,
+            0,
+        );
+        if cf_str.is_null() {
+            return None;
+        }
+        let cf_lig = CFNumberCreate(
+            std::ptr::null(),
+            CF_SINT32,
+            (&lig_val as *const i32).cast(),
+        );
+        if cf_lig.is_null() {
+            CFRelease(cf_str.cast());
+            return None;
+        }
+        let keys = [
+            kCTFontAttributeName,
+            kCTLigatureAttributeName,
+            kCTForegroundColorFromContextAttributeName,
+        ];
+        let vals = [font_ptr, cf_lig.cast::<c_void>(), kCFBooleanTrue];
+        let attrs = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            vals.as_ptr(),
+            keys.len() as isize,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        CFRelease(cf_lig.cast());
+        if attrs.is_null() {
+            CFRelease(cf_str.cast());
+            return None;
+        }
+        let attr_str = CFAttributedStringCreate(std::ptr::null(), cf_str, attrs);
+        CFRelease(cf_str.cast());
+        CFRelease(attrs.cast());
+        if attr_str.is_null() {
+            return None;
+        }
+        let line = CTLineCreateWithAttributedString(attr_str);
+        CFRelease(attr_str.cast());
+        if line.is_null() {
+            return None;
+        }
+
+        let runs = CTLineGetGlyphRuns(line);
+        let mut shaped_gids: Vec<u16> = Vec::with_capacity(plain_gids.len());
+        if !runs.is_null() {
+            let run_count = CFArrayGetCount(runs);
+            for ri in 0..run_count {
+                let run = CFArrayGetValueAtIndex(runs, ri);
+                if run.is_null() {
+                    continue;
+                }
+                let gc = CTRunGetGlyphCount(run);
+                if gc > 0 && gc <= 8 {
+                    let mut gbuf = [0u16; 8];
+                    CTRunGetGlyphs(run, CFRange { location: 0, length: gc }, gbuf.as_mut_ptr());
+                    shaped_gids.extend_from_slice(&gbuf[..gc as usize]);
+                }
+            }
+        }
+
+        if shaped_gids.as_slice() != plain_gids {
+            ligated = true;
+            if let Some(space) = CGColorSpace::new_device_gray()
+                && let Some(ctx) = ObjCGBitmap(
+                    buf.as_mut_ptr().cast(),
+                    w,
+                    h,
+                    8,
+                    w,
+                    Some(&space),
+                    7,
+                )
+            {
+                CGContext::set_should_antialias(Some(&ctx), true);
+                CGContext::set_allows_font_smoothing(Some(&ctx), false);
+                CGContext::set_gray_fill_color(Some(&ctx), 1.0, 1.0);
+                let raw_ctx = objc2_core_foundation::CFRetained::as_ptr(&ctx)
+                    .as_ptr()
+                    .cast::<OpaqueCGContext>();
+                CGContextSetTextPosition(raw_ctx, 0.0, h as f64 - baseline);
+                CTLineDraw(line, raw_ctx);
+            }
+        }
+        CFRelease(line.cast());
+    }
+
+    if !ligated || buf.iter().all(|&a| a == 0) {
+        return None;
     }
     Some(buf)
 }

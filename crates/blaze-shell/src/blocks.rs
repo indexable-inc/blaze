@@ -67,6 +67,8 @@ pub struct Block {
     pub state_after: EngineState<'static>,
     pub started_ms: u64,
     pub duration_ms: u64,
+    /// Exact nanosecond execution duration for crisp `ns` / `µs` / `ms` / `s` display.
+    pub duration_ns: u64,
     pub exit_code: i32,
     /// Whether large tables (> 25 rows) are currently folded.
     pub folded: bool,
@@ -214,6 +216,7 @@ impl BlockStore {
             state_after,
             started_ms,
             duration_ms,
+            duration_ns: duration_ms.saturating_mul(1_000_000),
             exit_code,
             folded,
             grid_override: None,

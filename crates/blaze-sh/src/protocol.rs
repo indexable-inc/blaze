@@ -8,7 +8,7 @@ use blaze_own::{ARc, AString, AVec};
 
 use crate::error::ShellError;
 use crate::state::EngineState;
-use crate::value::{Bytes, DateTime, Value};
+use crate::value::{Bytes, DateTime, Nanos, OutputChunk, Value};
 
 /// One step produced by driving [`crate::machine::Machine::step`].
 #[derive(Debug)]
@@ -83,6 +83,9 @@ pub enum Request<'a> {
         name: AString<'a>,
     },
     Now,
+    Sleep {
+        duration: Nanos,
+    },
     SysInfo,
     ProcessList,
     SpawnExternal {
@@ -164,8 +167,12 @@ pub struct SysSnapshot<'a> {
 #[derive(Clone, Debug)]
 pub struct ExternalResult<'a> {
     pub exit_code: i32,
+    pub duration_ns: i64,
     pub stdout: AVec<'a, u8>,
     pub stderr: AVec<'a, u8>,
+    /// Optional time-ordered interleaved `stdout` + `stderr` chunks; if empty, `Machine`
+    /// synthesizes chunks from `stdout` / `stderr`.
+    pub chunks: AVec<'a, OutputChunk<'a>>,
     /// True if the host attached stdout to an interactive `blaze-vt` terminal block.
     pub interactive: bool,
 }
