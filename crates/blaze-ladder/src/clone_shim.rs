@@ -159,6 +159,32 @@ pub(crate) fn language_from<P: FrontEnd>(program: &P, called: Instance, ground: 
     ok.then_some(LanguageFrom { from })
 }
 
+/// Builtin `FnPtr` trait method (`addr`, `as_ptr`, `from_ptr`) for a function pointer `Self`
+/// (`PNode::FnPtr`): the language provides the impl (no impl item in `core`), lowering the
+/// function pointer directly to its address or raw pointer (or back from a pointer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LanguageFnPtr {
+    /// The `FnPtr` trait method (`addr`, `as_ptr`, or `from_ptr`).
+    pub item: ItemKey,
+}
+
+/// Whether `item` is one of the builtin `FnPtr` trait methods (`addr`, `as_ptr`, `from_ptr`).
+pub(crate) fn is_language_fn_ptr_item<P: FrontEnd>(program: &P, item: ItemKey) -> bool {
+    ["addr", "as_ptr", "from_ptr"]
+        .into_iter()
+        .any(|name| program.lang_trait_fn(LangItem::FnPtrTrait, name) == Some(item))
+}
+
+/// Recognizes a call to a builtin `FnPtr` trait method where `Self` is a function pointer.
+pub(crate) fn language_fn_ptr<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<LanguageFnPtr> {
+    if !is_language_fn_ptr_item(program, called.item) {
+        return None;
+    }
+    let view = ground.view();
+    let &[me] = view.list(called.args).ok()? else { return None };
+    matches!(view.node(me).ok()?, PNode::FnPtr(..)).then_some(LanguageFnPtr { item: called.item })
+}
+
 /// Why a builtin clone's `Self: Copy` has no answer: the solver's (a record it could not make),
 /// or a closure's environment that could not be grounded at its arguments.
 #[derive(Debug)]

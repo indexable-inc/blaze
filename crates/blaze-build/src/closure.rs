@@ -35,7 +35,7 @@ pub(crate) use ctor_fn::build_ctor_fn;
 // And the `Clone::clone` it gives a tuple, a closure, a fn item and a fn pointer.
 #[path = "clone_fn.rs"]
 mod clone_fn;
-pub(crate) use clone_fn::{build_builtin_clone, build_builtin_from};
+pub(crate) use clone_fn::{build_builtin_clone, build_builtin_fn_ptr, build_builtin_from};
 
 /// The closures of `body` with their ORDINALS: a closure's position among its owner body's
 /// closures in expression order (typeck.md, "A closure's identity"). The one place the builder

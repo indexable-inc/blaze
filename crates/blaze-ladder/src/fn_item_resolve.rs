@@ -55,6 +55,7 @@ fn resolve_fn_item<'g, P: FrontEnd>(
     if program.ctor_of(target.item).is_some()
         || crate::clone_shim::language_clone_unconditional(program, target, ground).is_some()
         || crate::clone_shim::language_from(program, target, ground).is_some()
+        || crate::clone_shim::language_fn_ptr(program, target, ground).is_some()
     {
         return Ok((target.item, target.args));
     }
