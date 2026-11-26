@@ -2405,6 +2405,7 @@ mod macos_app {
         let mut dragging_split: Option<SplitHandle> = None;
         let mut dragging_agent_sidebar = false;
         let mut last_cli_spec_rev = blaze_shell::cli_spec_driver::spec_revision();
+        let mut last_dust_rev = blaze_shell::dust_driver::dust_revision();
         let mut command_palette: Option<CommandPalette> = None;
         let mut last_cursor_rect: Option<[f32; 4]> = None;
         let mut trail_prev: Option<[f32; 4]> = None;
@@ -4628,6 +4629,11 @@ mod macos_app {
                     shell.refresh_editor_assist(was_open);
                     dirty = true;
                 }
+            }
+            let cur_dust_rev = blaze_shell::dust_driver::dust_revision();
+            if cur_dust_rev != last_dust_rev {
+                last_dust_rev = cur_dust_rev;
+                dirty = true;
             }
             let focused_pid = wm.focused_pane();
             let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);

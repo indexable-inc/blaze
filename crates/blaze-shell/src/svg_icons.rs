@@ -109,6 +109,17 @@ const SERVER_RACK_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16
 <line x1="7.2" y1="11.3" x2="12.0" y2="11.3" stroke="#6E7684" stroke-width="1.0" stroke-linecap="round"/>
 </svg>"##;
 
+/// IntelliJ New UI Dark backup file icon (`.bak`, `.backup`, `.orig`, `.old`, `.swp`, `*~`):
+/// folded dark document sheet + warm-amber circular rewind/history badge.
+const BACKUP_FILE_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M3.0 2.0C2.45 2.0 2.0 2.45 2.0 3.0V13.0C2.0 13.55 2.45 14.0 3.0 14.0H9.2V12.8H3.2V3.2H8.4V5.8C8.4 6.24 8.76 6.6 9.2 6.6H11.8V8.4H13.0V5.6L9.4 2.0H3.0Z" fill="#25272C" stroke="#8C93A1" stroke-width="0.9"/>
+<line x1="4.4" y1="7.8" x2="8.8" y2="7.8" stroke="#6E7684" stroke-width="1.0" stroke-linecap="round"/>
+<line x1="4.4" y1="10.2" x2="7.6" y2="10.2" stroke="#6E7684" stroke-width="1.0" stroke-linecap="round"/>
+<circle cx="11.6" cy="11.6" r="3.4" fill="#3B2B18" stroke="#E5B567" stroke-width="1.15"/>
+<path d="M10.1 11.1C10.3 10.2 11.1 9.6 12.0 9.8C12.8 10.0 13.3 10.8 13.2 11.7C13.1 12.6 12.3 13.2 11.4 13.1C10.9 13.05 10.5 12.8 10.2 12.4" stroke="#F0C987" stroke-width="1.05" stroke-linecap="round"/>
+<path d="M9.6 10.2L10.0 11.4L11.2 11.0" stroke="#F0C987" stroke-width="1.05" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"##;
+
 macro_rules! intellij_dark {
     ($($name:literal),* $(,)?) => {
         &[
@@ -118,10 +129,11 @@ macro_rules! intellij_dark {
             // Modern MacBook Pro & remote server icons for prompt host segment & Agent Hub.
             ("macbook_pro", MACBOOK_PRO_SVG),
             ("server_rack", SERVER_RACK_SVG),
-            // RustRover / IntelliJ New UI Cargo & Blaze manifest/lock icons.
+            // RustRover / IntelliJ New UI Cargo, Blaze, & Backup file icons.
             ("cargo_toml", CARGO_TOML_SVG),
             ("cargo_lock", CARGO_LOCK_SVG),
             ("blaze_lock", BLAZE_LOCK_SVG),
+            ("backup_dark", BACKUP_FILE_SVG),
             // Open-source IntelliJ New UI dark file icons (Apache-2.0, see harness-native-render/icons/files/NOTICE).
             ("gitignore", include_str!("../../harness/harness-native-render/icons/files/gitignore.svg")),
             $(($name, include_str!(concat!("../../harness/harness-native-render/icons/files/", $name, ".svg")))),*
@@ -293,6 +305,8 @@ pub fn icon_name_for_file(path: &str, kind: Option<&str>) -> &'static str {
         "ttf" | "otf" | "woff" | "woff2" => "font_dark",
         "wasm" | "bin" | "o" | "a" | "dylib" | "so" | "dll" | "exe" | "parquet" => "binaryData_dark",
         "ini" | "cfg" | "conf" | "env" => "config_dark",
+        "bak" | "backup" | "orig" | "old" | "swp" | "swo" | "tmp" => "backup_dark",
+        _ if base_raw.ends_with('~') => "backup_dark",
         _ => "text_dark",
     }
 }

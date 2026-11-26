@@ -7,6 +7,7 @@ pub mod agent_hub;
 pub mod blocks;
 pub mod cli_spec_driver;
 pub mod config;
+pub mod dust_driver;
 pub mod editor;
 pub mod host;
 pub mod icons;

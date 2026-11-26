@@ -76,6 +76,7 @@ pub fn sniff_dir(name: &str, markers: DirMarkers) -> SniffResult {
         ".cargo" => "Cargo config",
         ".claude" | ".claude-plugin" | ".agents" | ".cursor" | ".codex" => "Agent config",
         ".vscode" | ".idea" => "IDE config",
+        ".blaze" => "Blaze cache",
         "target" | "build" | "dist" | "out" | "node_modules" | "__pycache__" => "Build output",
         "crates" => "Workspace",
         "docs" | "doc" => "Docs",
@@ -113,6 +114,7 @@ pub fn is_dir_label(label: &str) -> bool {
             | "Cargo config"
             | "Agent config"
             | "IDE config"
+            | "Blaze cache"
             | "Build output"
             | "Workspace"
             | "Docs"
@@ -626,6 +628,9 @@ fn sniff_extension(base: &str) -> Option<SniffResult> {
         "pdf" => (FileCategory::Document, "PDF", true),
         "lock" => (FileCategory::Data, "Lockfile", false),
         "log" => (FileCategory::Document, "Log", false),
+        "bak" | "backup" | "orig" | "old" | "swp" | "swo" | "tmp" => {
+            (FileCategory::Document, "Backup", false)
+        }
         "patch" | "diff" => (FileCategory::Document, "Patch", false),
         "wasm" => (FileCategory::Executable, "WebAssembly", true),
         "dylib" | "so" => (FileCategory::Executable, "Shared lib", true),
