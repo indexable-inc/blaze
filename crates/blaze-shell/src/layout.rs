@@ -1158,6 +1158,10 @@ fn layout_starship_line(
             }
         } else if count > 1 {
             format!("{primary} +{}", count - 1)
+        } else if let Some(first) = fp.items.first()
+            && first.uptime_secs > 0
+        {
+            format!("{primary} · {}", crate::sysmon_view::format_uptime(first.uptime_secs))
         } else {
             primary
         };
@@ -6393,9 +6397,9 @@ fn layout_active_popover(
             (w, h)
         }
         HoverKind::FolderProcs { summary } => {
-            let shown = summary.items.len().clamp(1, 12);
-            let w = 520.0f32.min((vw - 24.0).max(300.0));
-            let proc_row_h = m.ch + 10.0;
+            let shown = summary.items.len().clamp(1, 10);
+            let w = 560.0f32.min((vw - 24.0).max(320.0));
+            let proc_row_h = m.ch * 2.0 + 12.0;
             let foot_h = if summary.items.len() > shown { m.ch + 6.0 } else { 0.0 };
             let h = hdr_h + 4.0 + shown as f32 * proc_row_h + foot_h + pad_y;
             (w, h)
@@ -7161,8 +7165,8 @@ fn layout_active_popover(
                 crate::sysmon_view::format_iec_bytes(summary.total_mem_bytes),
             );
             let mut ry = draw_header(scene, &left_hdr, &right_hdr) + 2.0;
-            let proc_row_h = m.ch + 10.0;
-            for item in summary.items.iter().take(12) {
+            let proc_row_h = m.ch * 2.0 + 12.0;
+            for item in summary.items.iter().take(10) {
                 let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + proc_row_h);
                 if is_hovered(row_rect) {
                     scene.overlay_round_rect(
@@ -7177,9 +7181,10 @@ fn layout_active_popover(
                         0,
                     );
                 }
-                let ty = ry + (proc_row_h - m.ch) * 0.5;
+                let ty1 = ry + 5.0;
+                let ty2 = ty1 + m.ch + 2.0;
                 let ix = x0 + pad_x;
-                let iy = ry + (proc_row_h - icon_s) * 0.5;
+                let iy = ty1 + (m.ch - icon_s) * 0.5;
                 if let Some(app_ic) = item.app_icon_path.as_deref() {
                     scene.overlay_avatar_image(ix, iy, icon_s, app_ic.to_owned(), 0);
                 } else {
@@ -7196,7 +7201,7 @@ fn layout_active_popover(
                     scene.overlay_svg_icon(ix, iy, icon_s, svg, 0);
                 }
 
-                // Right side: clickable action pill (`Pane 2 · alt ↗` or `inspect ↗`), then MEM, GPU%, CPU%.
+                // Line 1 right side: clickable action pill (`Pane N · TUI ↗` or `pid N ↗`), MEM, GPU%, CPU%, Uptime!
                 let (act_lbl, act_fg, act_bg, action) = if let Some(sp) = item.shell_pane {
                     let lbl = if sp.is_alt_screen {
                         format!("Pane {} · TUI ↗", sp.pane_number)
@@ -7224,29 +7229,29 @@ fn layout_active_popover(
                 let act_x0 = x1 - pad_x - act_w;
                 scene.overlay_round_rect(
                     act_x0,
-                    ry + 3.0,
+                    ty1 - 1.5,
                     x1 - pad_x,
-                    ry + proc_row_h - 3.0,
+                    ty1 + m.ch + 1.5,
                     4.5,
                     act_bg,
                     0.0,
                     [0.0; 4],
                     0,
                 );
-                scene.overlay_ui_small(act_x0 + 6.0, ty, &act_lbl, act_fg, item.shell_pane.is_some(), false, 0);
+                scene.overlay_ui_small(act_x0 + 6.0, ty1, &act_lbl, act_fg, item.shell_pane.is_some(), false, 0);
 
                 let mut rx = act_x0 - 8.0;
                 let mem_s = crate::sysmon_view::format_iec_bytes(item.mem_bytes);
                 let mem_w = m.measure(&mem_s, TextFace::UiSmall);
                 rx -= mem_w;
-                scene.overlay_ui_small(rx, ty, &mem_s, theme::INK_3, false, false, 0);
+                scene.overlay_ui_small(rx, ty1, &mem_s, theme::INK_2, false, false, 0);
                 rx -= 10.0;
 
                 if item.gpu_pct >= 0.5 {
                     let gpu_s = format!("G:{:.0}%", item.gpu_pct);
                     let gw = m.measure(&gpu_s, TextFace::UiSmall);
                     rx -= gw;
-                    scene.overlay_ui_small(rx, ty, &gpu_s, theme::rgb(0x56, 0xd8, 0xc8), true, false, 0);
+                    scene.overlay_ui_small(rx, ty1, &gpu_s, theme::rgb(0x56, 0xd8, 0xc8), true, false, 0);
                     rx -= 8.0;
                 }
 
@@ -7260,49 +7265,56 @@ fn layout_active_popover(
                 } else if item.cpu_pct >= 5.0 {
                     theme::rgb(0xe5, 0xc0, 0x7b)
                 } else {
-                    theme::INK_4
+                    theme::INK_3
                 };
                 let cpu_w = m.measure(&cpu_s, TextFace::UiSmall);
                 rx -= cpu_w;
-                scene.overlay_ui_small(rx, ty, &cpu_s, cpu_col, item.is_hot, false, 0);
+                scene.overlay_ui_small(rx, ty1, &cpu_s, cpu_col, item.is_hot, false, 0);
                 rx -= 10.0;
+
+                if item.uptime_secs > 0 {
+                    let up_s = format!("up {}", crate::sysmon_view::format_uptime(item.uptime_secs));
+                    let up_w = m.measure(&up_s, TextFace::UiSmall);
+                    rx -= up_w;
+                    scene.overlay_ui_small(rx, ty1, &up_s, theme::INK_4, false, false, 0);
+                    rx -= 10.0;
+                }
 
                 let name_x = ix + icon_s + 7.0;
                 let avail_ch = ((rx - name_x) / m.cw).floor().max(8.0) as usize;
-                let display_name = if item.rel_dir != "." && !item.rel_dir.is_empty() {
-                    format!("{}  {}", item.name, item.rel_dir)
-                } else {
-                    item.name.clone()
-                };
-                let shown_txt = truncate_chars(&display_name, avail_ch);
-                let name_len = item.name.chars().count().min(shown_txt.chars().count());
-                let (n_part, sub_part): (String, String) = {
-                    let mut chars = shown_txt.chars();
-                    let a: String = chars.by_ref().take(name_len).collect();
-                    let b: String = chars.collect();
-                    (a, b)
-                };
-                scene.overlay_text_run(name_x, ty, &n_part, theme::INK_1, item.is_hot, false, 0);
-                if !sub_part.is_empty() {
-                    scene.overlay_text_run(
-                        name_x + name_len as f32 * m.cw,
-                        ty,
-                        &sub_part,
-                        theme::INK_4,
-                        false,
-                        false,
-                        0,
-                    );
+                let shown_name = truncate_chars(&item.name, avail_ch);
+                scene.overlay_text_run(name_x, ty1, &shown_name, theme::INK_1, true, false, 0);
+
+                // Line 2 subtitle: exact cmdline + parent chain + subfolder + thread count!
+                let mut sub_parts: Vec<String> = Vec::new();
+                if !item.cmdline.is_empty() && item.cmdline != item.name {
+                    sub_parts.push(truncate_chars(&item.cmdline, 44));
                 }
+                if !item.parent_name.is_empty() {
+                    sub_parts.push(format!("via {}", item.parent_name));
+                }
+                if item.rel_dir != "." && !item.rel_dir.is_empty() {
+                    sub_parts.push(format!("in {}/", item.rel_dir));
+                }
+                if item.threads > 0 {
+                    sub_parts.push(format!("{} thr", item.threads));
+                }
+                if sub_parts.is_empty() && !item.exe_path.is_empty() {
+                    sub_parts.push(truncate_middle(&item.exe_path, 48));
+                }
+                let sub_line = sub_parts.join("  ·  ");
+                let max_sub_ch = ((x1 - pad_x - name_x) / (m.cw * 0.85)).floor().max(16.0) as usize;
+                let shown_sub = truncate_chars(&sub_line, max_sub_ch);
+                scene.overlay_ui_small(name_x, ty2, &shown_sub, theme::INK_4, false, false, 0);
 
                 scene.push_hit(row_rect, action);
                 ry += proc_row_h;
             }
-            if summary.items.len() > 12 {
+            if summary.items.len() > 10 {
                 scene.overlay_ui_small(
                     x0 + pad_x,
                     ry + 2.0,
-                    format!("… {} more processes (run `top` for full tree)", summary.items.len() - 12),
+                    format!("… {} more processes (run `top` for full tree)", summary.items.len() - 10),
                     theme::INK_4,
                     false,
                     true,
