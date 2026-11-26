@@ -48,6 +48,12 @@ use crate::{
 /// Maximum threading + coalescing fixpoint rounds per call.
 const MAX_ROUNDS: usize = 64;
 
+/// Mega-function CFG bounds matching `value_info::MAX_BLOCKS` and `layout::EXACT_LOOP_MAX_BLOCKS`
+/// (rule 18): above this size (e.g. generated `cranelift-isle` decision trees), skip the
+/// multi-round fixpoint and run one linear `coalesce_cfg` pass.
+const MAX_THREAD_BLOCKS: usize = 4096;
+const MAX_THREAD_INSTS: usize = 65_536;
+
 /// Maximum non-param, non-terminator pure instructions allowed inside a Pattern A candidate block.
 const MAX_THREAD_BLOCK_INSTS: usize = 16;
 
@@ -3573,6 +3579,9 @@ fn emit_target<A: Allocator>(
 pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
+    }
+    if view.blocks() > MAX_THREAD_BLOCKS || view.len() > MAX_THREAD_INSTS {
+        return coalesce_cfg(view, alloc);
     }
     let mut cur = view.to_func_in(alloc);
     let mut any_coalesced = false;

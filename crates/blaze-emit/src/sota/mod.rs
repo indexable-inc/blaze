@@ -1054,30 +1054,43 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
     let max_rounds = if opts.is_hot { 3 } else { 2 };
     let superopt = if opts.is_hot { Some(SuperoptOpts::apple_silicon()) } else { None };
 
-    let scalarized_mem = scalarize_small_memops(func.view(), alloc).ok().flatten();
+    // Mega-function mid-end bound (rule 18, matching `value_info::MAX_BLOCKS` and
+    // `layout::EXACT_LOOP_MAX_BLOCKS`): above this size (e.g. generated `cranelift-isle` decision
+    // trees with 10k+ blocks), skip multi-round SROA/e-graph/loop passes and emit directly via
+    // `misel` / `isel`'s linear mega-function paths.
+    const SOTA_MIDEND_MAX_BLOCKS: usize = 4096;
+    const SOTA_MIDEND_MAX_INSTS: usize = 65_536;
+    let is_mega_fn =
+        func.view().blocks() > SOTA_MIDEND_MAX_BLOCKS || func.view().len() > SOTA_MIDEND_MAX_INSTS;
+
+    let scalarized_mem = (!is_mega_fn).then(|| scalarize_small_memops(func.view(), alloc).ok().flatten()).flatten();
     let stage0_in = scalarized_mem.as_ref().map_or(func.view(), |f| f.view());
-    let pre_clean = run_sroa_thread_cleanup(stage0_in, alloc);
+    let pre_clean = (!is_mega_fn).then(|| run_sroa_thread_cleanup(stage0_in, alloc)).flatten();
     let mid_in = match &pre_clean {
         Some(f) => f.view(),
         None => stage0_in,
     };
-    let sota_opt = sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, max_rounds, |_| 1, alloc).ok();
+    let sota_opt = (!is_mega_fn)
+        .then(|| sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, max_rounds, |_| 1, alloc).ok())
+        .flatten();
     let chosen_opt = sota_opt.as_ref().and_then(|res| verify(res.func.view()).ok());
     let has_fast_abi_req = opts.internal_fast
         || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
 
-    if let Some(opt_v) = chosen_opt.or_else(|| has_fast_abi_req.then_some(func)) {
-        let late_func = run_sota_loop_and_late_passes(
-            opt_v.view(),
-            machine,
-            RegBudget::AARCH64,
-            true,
-            superopt,
-            alloc,
-        );
-        let full_v = match verify(late_func.view()) {
-            Ok(v) => v,
-            Err(_) => opt_v,
+    if let Some(opt_v) = chosen_opt.or_else(|| (has_fast_abi_req || is_mega_fn).then_some(func)) {
+        let late_func = (!is_mega_fn).then(|| {
+            run_sota_loop_and_late_passes(
+                opt_v.view(),
+                machine,
+                RegBudget::AARCH64,
+                true,
+                superopt,
+                alloc,
+            )
+        });
+        let full_v = match late_func.as_ref().map(|f| verify(f.view())) {
+            Some(Ok(v)) => v,
+            _ => opt_v,
         };
         let is_macos = machine.os == blaze_tier::Os::MacOs;
         let initial_fast_calls = collect_misel_fast_calls(full_v.view(), opts.internal_fast_callees, alloc);
