@@ -227,6 +227,9 @@ pub struct CompletionFsMeta {
     pub path: String,
     pub mtime_ns: Option<i64>,
     pub size_bytes: Option<u64>,
+    /// True when this candidate is a direct filesystem child of the searched directory
+    /// (as opposed to a distant zoxide history entry or deep git subpath).
+    pub is_direct_child: bool,
 }
 
 /// One candidate shown in the IntelliJ-style floating completion popup.
@@ -1962,10 +1965,40 @@ impl Editor {
             return;
         }
 
+        // If the typed prefix uniquely matches ONE direct child of the current/target directory
+        // (e.g. `cd rg<Tab>` inside `big-repos/` with `ripgrep/` even when distant zoxide also
+        // matches `/Volumes/.../rgb`), expand that local child immediately!
+        let direct_children: Vec<usize> = self
+            .completions
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.fs_meta.as_ref().is_some_and(|f| f.is_direct_child))
+            .map(|(i, _)| i)
+            .collect();
+        if !prefix.is_empty() && direct_children.len() == 1 {
+            self.apply_completion(direct_children[0]);
+            return;
+        }
+
         // First-Tab longest-common-prefix completion (classic Fish/Zsh/Nushell ergonomics):
         // e.g. `cd /Vo<Tab>` with `Volumes/` + 20 zoxide `/Volumes/...` descendants immediately
         // completes `/Volumes/` so the user can keep typing `Proj<Tab>` -> `/Volumes/Projects/`.
-        let lcp = longest_common_prefix(&self.completions);
+        // When direct local children exist, compute LCP across them first so distant zoxide
+        // entries can never block local common-prefix expansion.
+        let lcp = if !direct_children.is_empty() && !prefix.is_empty() {
+            let local_items: Vec<CompletionItem> = direct_children
+                .iter()
+                .map(|&i| self.completions[i].clone())
+                .collect();
+            let local_lcp = longest_common_prefix(&local_items);
+            if local_lcp.len() > prefix.len() {
+                local_lcp
+            } else {
+                longest_common_prefix(&self.completions)
+            }
+        } else {
+            longest_common_prefix(&self.completions)
+        };
         if lcp.len() > prefix.len()
             && lcp
                 .get(..prefix.len())
@@ -2806,6 +2839,7 @@ impl Editor {
                                     path: zm.path.clone(),
                                     mtime_ns,
                                     size_bytes: None,
+                                    is_direct_child: false,
                                 }),
                             )
                         } else {
@@ -2822,7 +2856,10 @@ impl Editor {
                             .map(|(_, idxs)| idxs)
                             .unwrap_or_default();
                         scored.push((
-                            (zm.score as i32).clamp(15, 160),
+                            // Rank distant zoxide directories strictly below direct local children
+                            // (which score >= 60 even on long fuzzy names) so `cd rg` inside a
+                            // folder containing `ripgrep/` always prioritizes the local folder!
+                            ((zm.score as i32) / 20).clamp(10, 45),
                             CompletionItem {
                                 label,
                                 insert,
@@ -3466,10 +3503,11 @@ fn collect_path_completions(
         } else {
             raw_insert
         };
-        // Slight boost to directories so navigation feels crisp.
-        let dir_boost = if is_dir { 5 } else { 0 };
+        // Direct children of the searched directory always outrank distant zoxide entries (<= 45)
+        // while still staying below specialized column/subcommand completions on empty prefixes.
+        let local_boost = if is_dir { 30 } else { 25 };
         out.push((
-            score + dir_boost,
+            score + local_boost,
             CompletionItem {
                 label,
                 insert,
@@ -3482,6 +3520,7 @@ fn collect_path_completions(
                     path: full_fs_path,
                     mtime_ns,
                     size_bytes,
+                    is_direct_child: true,
                 }),
                 match_indices: idxs,
             },
@@ -3576,6 +3615,7 @@ fn collect_path_completions(
                 path: full.to_string_lossy().into_owned(),
                 mtime_ns,
                 size_bytes,
+                is_direct_child: false,
             });
         }
         out.extend(sub_hits);
@@ -3834,6 +3874,20 @@ mod tests {
         let meta = note.1.fs_meta.as_ref().expect("fs_meta populated");
         assert_eq!(meta.size_bytes, Some(11));
         assert!(meta.mtime_ns.is_some());
+
+        // 5. Unique direct local folder fuzzy match (`cd rg<Tab>` in `big-repos/` with `ripgrep/`,
+        // `ruff/`, `tokio/`) must beat distant zoxide `/Volumes/Projects/andrewgazelka/rgb` and
+        // expand immediately on first Tab!
+        let big = root.join("big-repos");
+        fs::create_dir_all(big.join("ripgrep")).unwrap();
+        fs::create_dir_all(big.join("ruff")).unwrap();
+        fs::create_dir_all(big.join("tokio")).unwrap();
+        let big_state = EngineState::new(&big.to_string_lossy(), &[], blaze_own::Alloc::global());
+        ed.zoxide.record_visit(&ed.local_host, "/Volumes/Projects/andrewgazelka/rgb", now);
+        ed.set_text_initial("cd rg".to_owned());
+        ed.trigger_completion(&big_state);
+        assert_eq!(ed.text, "cd ripgrep/");
+        assert!(ed.completions.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
