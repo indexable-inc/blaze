@@ -276,8 +276,25 @@ pub(crate) fn inline_guided_with_cache<A: Allocator + Copy>(
     summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
     alloc: A,
 ) -> Result<GuidedInlined<A>, InlineError> {
+    inline_guided_with_base_cache(view, root, bodies, weights, policy, None::<&Map<BodyId, FnSummary, FixedState, A>>, summaries, alloc)
+}
+
+/// Parallel-friendly entry point used by [`crate::lto::lto_optimize_module_par`]: looks up
+/// immutable precomputed module summaries in `base` first and stores any newly computed external
+/// summaries in the worker-local `local` map without mutating `base`.
+#[expect(clippy::too_many_arguments, reason = "internal LTO inliner entry over view, root, bodies, weights, policy, base cache, local cache, and scratch allocator")]
+pub(crate) fn inline_guided_with_base_cache<A: Allocator + Copy, B: Allocator>(
+    view: View<'_>,
+    root: BodyId,
+    bodies: &dyn Bodies,
+    weights: &dyn SiteWeights,
+    policy: InlinePolicy,
+    base: Option<&Map<BodyId, FnSummary, FixedState, B>>,
+    local: &mut Map<BodyId, FnSummary, FixedState, A>,
+    alloc: A,
+) -> Result<GuidedInlined<A>, InlineError> {
     let (nodes, children) =
-        plan_guided(view, root, bodies, weights, policy, summaries, &alloc)?;
+        plan_guided(view, root, bodies, weights, policy, base, local, &alloc)?;
     let (func, imported_refs) =
         emit(&nodes, &children, bodies, policy.allow_external_refs, false, &alloc)?;
     let mut read = Vec::with_capacity_in(nodes.len().saturating_sub(1), alloc);
@@ -298,9 +315,11 @@ struct CallSite<'v> {
     args: &'v [u32],
     /// For `Op::Invoke`, its normal continuation block in the caller; `None` for `Op::Call`.
     invoke_normal: Option<u32>,
+    /// For `Op::Invoke`, its unwind landing block in the caller; `None` for `Op::Call`.
+    invoke_unwind: Option<u32>,
 }
 
-/// Extracts callee ref, signature, arguments, and optional `Op::Invoke` normal block.
+/// Extracts callee ref, signature, arguments, and optional `Op::Invoke` normal/unwind blocks.
 fn call_site(view: View<'_>, at: usize) -> Option<CallSite<'_>> {
     let op = view.op(at);
     let data_word = *view.data.get(at)?;
@@ -313,16 +332,17 @@ fn call_site(view: View<'_>, at: usize) -> Option<CallSite<'_>> {
             let count = usize::try_from(*words.get(2)?).ok()?;
             let end = 3usize.checked_add(count)?;
             let args = words.get(3..end)?;
-            Some(CallSite { reference, sig, args, invoke_normal: None })
+            Some(CallSite { reference, sig, args, invoke_normal: None, invoke_unwind: None })
         }
         Op::Invoke => {
             let reference = RefId(*words.first()?);
             let sig = SigId(*words.get(1)?);
             let normal = *words.get(2)?;
+            let unwind = *words.get(3)?;
             let count = usize::try_from(*words.get(4)?).ok()?;
             let end = 5usize.checked_add(count)?;
             let args = words.get(5..end)?;
-            Some(CallSite { reference, sig, args, invoke_normal: Some(normal) })
+            Some(CallSite { reference, sig, args, invoke_normal: Some(normal), invoke_unwind: Some(unwind) })
         }
         _ => None,
     }
@@ -343,6 +363,10 @@ struct Node<'v> {
     site_weight: u64,
     /// Whether the parent's site instruction is `Op::Invoke` (rather than `Op::Call`).
     is_invoke: bool,
+    /// For `Op::Invoke`, the `BlockKind` of the parent's unwind landing block.
+    invoke_unwind_kind: Option<BlockKind>,
+    /// Whether the parent's call site lies inside a cleanup/terminate path of the parent.
+    in_cleanup: bool,
 }
 
 #[inline]
@@ -368,6 +392,28 @@ fn own_filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> 
     OwnVec::from_elem_in(item, len, *alloc)
 }
 
+/// Cached [`FnSummary`] lookup for `id`/`view`, consulting optional read-only `base` first.
+fn summary_of_with_base<A: Allocator + Copy, B: Allocator>(
+    id: BodyId,
+    view: View<'_>,
+    base: Option<&Map<BodyId, FnSummary, FixedState, B>>,
+    summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
+    alloc: &A,
+) -> Result<FnSummary, InlineError> {
+    if let Some(&summary) = summaries.get(&id) {
+        return Ok(summary);
+    }
+    if let Some(base_map) = base
+        && let Some(&summary) = base_map.get(&id)
+    {
+        return Ok(summary);
+    }
+    let summary = FnSummary::try_compute(view, alloc)
+        .map_err(|e| InlineError::Refused { inst: e.inst, what: e.what })?;
+    summaries.insert(id, summary);
+    Ok(summary)
+}
+
 /// Cached [`FnSummary`] lookup for `id`/`view`.
 fn summary_of<A: Allocator + Copy>(
     id: BodyId,
@@ -375,13 +421,7 @@ fn summary_of<A: Allocator + Copy>(
     summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
     alloc: &A,
 ) -> Result<FnSummary, InlineError> {
-    if let Some(&summary) = summaries.get(&id) {
-        return Ok(summary);
-    }
-    let summary = FnSummary::try_compute(view, alloc)
-        .map_err(|e| InlineError::Refused { inst: e.inst, what: e.what })?;
-    summaries.insert(id, summary);
-    Ok(summary)
+    summary_of_with_base(id, view, None::<&Map<BodyId, FnSummary, FixedState, A>>, summaries, alloc)
 }
 
 /// Hands `f` every reference instruction `at` names.
@@ -439,32 +479,163 @@ fn closed_with<A: Allocator + Copy>(
     Ok(true)
 }
 
-/// Returns whether node `n` (with its currently planned `children`) executes no remaining
-/// potentially-unwinding operation (`Call`, `CallIndirect`, `Invoke`, `InvokeIndirect`, `Resume`).
-fn is_unwind_free_with<A: Allocator + Copy>(
+/// Computes which blocks of `view` are reachable from any `BlockKind::Cleanup` or
+/// `BlockKind::Terminate` landing block via ordinary (non-unwind) edges — matching
+/// `blaze-emit`'s cleanup-call rule (a plain `Op::Call` inside cleanup aborts on panic rather
+/// than unwinding to an outer handler). Returns an empty vector when `view` has no cleanup or
+/// terminate blocks (fast path: zero allocation).
+fn cleanup_blocks<A: Allocator + Copy>(
+    view: View<'_>,
+    alloc: &A,
+) -> Result<OwnVec<bool, A>, InlineError> {
+    let blocks = view.blocks();
+    let mut any = false;
+    for b in 0..blocks {
+        let Ok(b_u32) = u32::try_from(b) else { break };
+        if matches!(view.block_kind(Block(b_u32)), BlockKind::Cleanup | BlockKind::Terminate) {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return Ok(OwnVec::new_in(*alloc));
+    }
+    let mut is_cleanup = own_filled(blocks, false, alloc);
+    let mut todo: OwnVec<u32, A> = OwnVec::new_in(*alloc);
+    for b in 0..blocks {
+        let Ok(b_u32) = u32::try_from(b) else { break };
+        if matches!(view.block_kind(Block(b_u32)), BlockKind::Cleanup | BlockKind::Terminate) {
+            if let Some(slot) = is_cleanup.get_mut(b) {
+                *slot = true;
+            }
+            todo.push(b_u32);
+        }
+    }
+    while let Some(cb) = todo.pop() {
+        let term = view.terminator(Block(cb));
+        let op = view.op(term);
+        if matches!(op, Op::Invoke | Op::InvokeIndirect) {
+            if let Some(start) = view.data.get(term).and_then(|&d| usize::try_from(d).ok())
+                && let Some(&normal) = view.extra.get(start.saturating_add(2))
+                && let Ok(n_idx) = usize::try_from(normal)
+                && let Some(slot) = is_cleanup.get_mut(n_idx)
+                && !*slot
+            {
+                *slot = true;
+                todo.push(normal);
+            }
+        } else {
+            each_successor(view, term, &mut |to| {
+                if let Ok(t_idx) = usize::try_from(to)
+                    && let Some(slot) = is_cleanup.get_mut(t_idx)
+                    && !*slot
+                {
+                    *slot = true;
+                    todo.push(to);
+                }
+            })?;
+        }
+    }
+    Ok(is_cleanup)
+}
+
+/// Returns the block containing instruction `inst` in `view`.
+fn block_of_inst(view: View<'_>, inst: usize) -> Option<u32> {
+    let pos = view.block_starts.partition_point(|&start| usize::try_from(start).ok().is_some_and(|s| s <= inst));
+    let blk = pos.checked_sub(1)?;
+    u32::try_from(blk).ok()
+}
+
+/// Summary of residual exception-handling behavior for node `n` after splicing its planned
+/// `children`, used to decide legality of inlining into `Catch` / `Terminate` invoke sites and
+/// cleanup-path calls.
+#[derive(Clone, Copy, Default)]
+struct ResidualEh {
+    /// Whether `n` (or any spliced child) executes any potentially-unwinding operation.
+    may_unwind: bool,
+    /// Whether `n` (or any spliced child) retains an inner landing-pad handler (`Invoke`,
+    /// `InvokeIndirect`, or `Resume`), which must not shadow an outer `Catch` / `Terminate` pad.
+    has_inner_eh: bool,
+    /// Whether `n` (or any spliced non-cleanup child) executes an `Op::Resume` that propagates
+    /// out of `n`.
+    has_resume: bool,
+}
+
+/// Computes [`ResidualEh`] for node `n` bottom-up from its already-computed `child_eh` entries.
+fn residual_eh_with<A: Allocator + Copy>(
     view: View<'_>,
     n: u32,
     children: &Map<(u32, usize), u32, FixedState, A>,
-    child_unwind_free: &[bool],
-) -> bool {
+    child_eh: &[ResidualEh],
+    cleanup: &[bool],
+) -> ResidualEh {
+    let mut out = ResidualEh::default();
     for at in 0..view.len() {
-        match view.op(at) {
-            Op::Call | Op::Invoke => {
-                let Some(&child) = children.get(&(n, at)) else {
-                    return false;
-                };
-                let Ok(c_idx) = usize::try_from(child) else {
-                    return false;
-                };
-                if !child_unwind_free.get(c_idx).copied().unwrap_or(false) {
-                    return false;
+        let op = view.op(at);
+        match op {
+            Op::Call => {
+                if let Some(&child) = children.get(&(n, at)) {
+                    let c_eh = usize::try_from(child)
+                        .ok()
+                        .and_then(|ci| child_eh.get(ci).copied())
+                        .unwrap_or(ResidualEh { may_unwind: true, has_inner_eh: true, has_resume: true });
+                    let in_clean = block_of_inst(view, at)
+                        .and_then(|b| usize::try_from(b).ok())
+                        .and_then(|bi| cleanup.get(bi).copied())
+                        .unwrap_or(false);
+                    if !in_clean {
+                        out.may_unwind |= c_eh.may_unwind;
+                        out.has_inner_eh |= c_eh.has_inner_eh;
+                        out.has_resume |= c_eh.has_resume;
+                    }
+                } else {
+                    let in_clean = block_of_inst(view, at)
+                        .and_then(|b| usize::try_from(b).ok())
+                        .and_then(|bi| cleanup.get(bi).copied())
+                        .unwrap_or(false);
+                    if !in_clean {
+                        out.may_unwind = true;
+                    }
                 }
             }
-            Op::CallIndirect | Op::InvokeIndirect | Op::Resume => return false,
+            Op::Invoke => {
+                if let Some(&child) = children.get(&(n, at)) {
+                    let c_eh = usize::try_from(child)
+                        .ok()
+                        .and_then(|ci| child_eh.get(ci).copied())
+                        .unwrap_or(ResidualEh { may_unwind: true, has_inner_eh: true, has_resume: true });
+                    if c_eh.may_unwind {
+                        out.may_unwind = true;
+                        out.has_inner_eh = true;
+                    }
+                    out.has_inner_eh |= c_eh.has_inner_eh;
+                } else {
+                    out.may_unwind = true;
+                    out.has_inner_eh = true;
+                }
+            }
+            Op::CallIndirect => {
+                let in_clean = block_of_inst(view, at)
+                    .and_then(|b| usize::try_from(b).ok())
+                    .and_then(|bi| cleanup.get(bi).copied())
+                    .unwrap_or(false);
+                if !in_clean {
+                    out.may_unwind = true;
+                }
+            }
+            Op::InvokeIndirect => {
+                out.may_unwind = true;
+                out.has_inner_eh = true;
+            }
+            Op::Resume => {
+                out.may_unwind = true;
+                out.has_inner_eh = true;
+                out.has_resume = true;
+            }
             _ => {}
         }
     }
-    true
+    out
 }
 
 /// Returns whether every use of multi-return call/invoke value `target` in `view` is an
@@ -738,6 +909,8 @@ fn plan_trivial<'v, A: Allocator + Copy>(
         loop_depth: 0,
         site_weight: 0,
         is_invoke: false,
+        invoke_unwind_kind: None,
+        in_cleanup: false,
     });
     node_summaries.push(None);
     // Per node being walked: the node and its next instruction.
@@ -782,6 +955,8 @@ fn plan_trivial<'v, A: Allocator + Copy>(
                 loop_depth: 0,
                 site_weight: 0,
                 is_invoke: false,
+                invoke_unwind_kind: None,
+                in_cleanup: false,
             });
             node_summaries.push(Some(summary));
             children.insert((n, at), child);
@@ -968,6 +1143,8 @@ struct SiteCandidate<'v> {
     loop_depth: u8,
     site_weight: u64,
     is_invoke: bool,
+    invoke_unwind_kind: Option<BlockKind>,
+    in_cleanup: bool,
     parent: u32,
     site: usize,
     callee_id: BodyId,
@@ -1006,13 +1183,14 @@ impl Ord for SiteCandidate<'_> {
 
 /// Scans node `n`'s blocks and pushes all policy-eligible call/invoke sites onto `heap`.
 #[expect(clippy::too_many_arguments)]
-fn enqueue_sites<'v, A: Allocator + Copy>(
+fn enqueue_sites<'v, A: Allocator + Copy, B: Allocator>(
     nodes: &[Node<'v>],
     n: u32,
     root_site_for_node: usize,
     bodies: &'v dyn Bodies,
     weights: &dyn SiteWeights,
     policy: InlinePolicy,
+    base: Option<&Map<BodyId, FnSummary, FixedState, B>>,
     summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
     heap: &mut MaxHeap<SiteCandidate<'v>, A>,
     alloc: &A,
@@ -1031,6 +1209,7 @@ fn enqueue_sites<'v, A: Allocator + Copy>(
     }
     let view = caller.view;
     let depths = loop_depths(view, alloc)?;
+    let cleanup = cleanup_blocks(view, alloc)?;
     let blocks = view.blocks();
     for b in 0..blocks {
         let Ok(b_u32) = u32::try_from(b) else {
@@ -1038,6 +1217,7 @@ fn enqueue_sites<'v, A: Allocator + Copy>(
         };
         let block = Block(b_u32);
         let block_kind = view.block_kind(block);
+        let in_cleanup = cleanup.get(b).copied().unwrap_or(false);
         let block_loop_depth = depths.get(b).copied().unwrap_or(0);
         let loop_depth = caller.loop_depth.saturating_add(block_loop_depth);
         for at in view.block(block) {
@@ -1045,6 +1225,7 @@ fn enqueue_sites<'v, A: Allocator + Copy>(
                 continue;
             };
             let is_invoke = cs.invoke_normal.is_some();
+            let invoke_unwind_kind = cs.invoke_unwind.map(|u| view.block_kind(Block(u)));
             let Some((id, callee)) = bodies.callee(caller.id, cs.reference) else {
                 continue;
             };
@@ -1055,7 +1236,7 @@ fn enqueue_sites<'v, A: Allocator + Copy>(
                     what: "a callee of another pointer width than its caller",
                 });
             }
-            let summary = summary_of(id, callee, summaries, alloc)?;
+            let summary = summary_of_with_base(id, callee, base, summaries, alloc)?;
             if summary.inline_attr == Inline::Never
                 || summary.has_forbidden_ops
                 || !summary.has_return
@@ -1184,6 +1365,8 @@ fn enqueue_sites<'v, A: Allocator + Copy>(
                 loop_depth,
                 site_weight,
                 is_invoke,
+                invoke_unwind_kind,
+                in_cleanup,
                 parent: n,
                 site: at,
                 callee_id: id,
@@ -1196,12 +1379,14 @@ fn enqueue_sites<'v, A: Allocator + Copy>(
 }
 
 /// Priority-scored planning for [`inline_guided`], canonicalized into DFS preorder for [`emit`].
-fn plan_guided<'v, A: Allocator + Copy>(
+#[expect(clippy::too_many_arguments)]
+fn plan_guided<'v, A: Allocator + Copy, B: Allocator>(
     view: View<'v>,
     root: BodyId,
     bodies: &'v dyn Bodies,
     weights: &dyn SiteWeights,
     policy: InlinePolicy,
+    base: Option<&Map<BodyId, FnSummary, FixedState, B>>,
     summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
     alloc: &A,
 ) -> Result<(Vec<Node<'v>, A>, Map<(u32, usize), u32, FixedState, A>), InlineError> {
@@ -1217,11 +1402,13 @@ fn plan_guided<'v, A: Allocator + Copy>(
         loop_depth: 0,
         site_weight: 0,
         is_invoke: false,
+        invoke_unwind_kind: None,
+        in_cleanup: false,
     });
     raw_summaries.push(None);
 
     let mut heap = MaxHeap::new_in(alloc);
-    enqueue_sites(&raw_nodes, 0, 0, bodies, weights, policy, summaries, &mut heap, alloc)?;
+    enqueue_sites(&raw_nodes, 0, 0, bodies, weights, policy, base, summaries, &mut heap, alloc)?;
 
     let mut used = 0u64;
     while let Some(cand) = heap.pop() {
@@ -1240,6 +1427,8 @@ fn plan_guided<'v, A: Allocator + Copy>(
             loop_depth: cand.loop_depth,
             site_weight: cand.site_weight,
             is_invoke: cand.is_invoke,
+            invoke_unwind_kind: cand.invoke_unwind_kind,
+            in_cleanup: cand.in_cleanup,
         });
         raw_summaries.push(Some(cand.callee_summary));
         raw_children.insert((cand.parent, cand.site), child);
@@ -1250,6 +1439,7 @@ fn plan_guided<'v, A: Allocator + Copy>(
             bodies,
             weights,
             policy,
+            base,
             summaries,
             &mut heap,
             alloc,
@@ -1258,11 +1448,21 @@ fn plan_guided<'v, A: Allocator + Copy>(
 
     // Bottom-up pruning in reverse creation order (every child has index > parent):
     // - when `allow_external_refs` is false, prune open subtrees;
-    // - for any `Op::Invoke` site, prune subtrees that may still unwind.
-    let has_invoke = raw_nodes.iter().skip(1).any(|node| node.is_invoke);
+    // - for `Op::Invoke` targeting `BlockKind::Catch | BlockKind::Terminate`, prune only if the
+    //   subtree retains an inner `Invoke`/`InvokeIndirect`/`Resume` that would shadow the outer
+    //   `Catch`/`Terminate` LSDA action during DWARF Phase 1 (plain `Call`/`CallIndirect` rewrite
+    //   directly to `Invoke`/`InvokeIndirect` targeting the `Catch`/`Terminate` pad and stay!);
+    // - for `Op::Invoke` targeting `BlockKind::Cleanup`, ALL unwinding callees are kept and
+    //   inlined (rewriting inner `Call`/`CallIndirect` -> `Invoke`/`InvokeIndirect` and inner
+    //   `Resume` -> `Jump` to the split cleanup body);
+    // - for plain `Op::Call` inside a cleanup path, prune if the callee retains `Op::Resume`.
+    let needs_eh_prune = raw_nodes.iter().skip(1).any(|node| {
+        matches!(node.invoke_unwind_kind, Some(BlockKind::Catch | BlockKind::Terminate))
+            || (!node.is_invoke && node.in_cleanup)
+    });
     let mut alive = own_filled(raw_nodes.len(), true, alloc);
-    if (!policy.allow_external_refs || has_invoke) && raw_nodes.len() > 1 {
-        let mut unwind_free = own_filled(raw_nodes.len(), true, alloc);
+    if (!policy.allow_external_refs || needs_eh_prune) && raw_nodes.len() > 1 {
+        let mut node_eh = own_filled(raw_nodes.len(), ResidualEh::default(), alloc);
         for i in (1..raw_nodes.len()).rev() {
             if !alive.get(i).copied().unwrap_or(false) {
                 continue;
@@ -1283,12 +1483,18 @@ fn plan_guided<'v, A: Allocator + Copy>(
                     keep = false;
                 }
             }
-            if has_invoke {
-                let uf = is_unwind_free_with(node.view, i_u32, &raw_children, &unwind_free);
-                if let Some(slot) = unwind_free.get_mut(i) {
-                    *slot = uf;
+            if needs_eh_prune {
+                let cleanup = cleanup_blocks(node.view, alloc)?;
+                let eh = residual_eh_with(node.view, i_u32, &raw_children, &node_eh, &cleanup);
+                if let Some(slot) = node_eh.get_mut(i) {
+                    *slot = eh;
                 }
-                if node.is_invoke && !uf {
+                if matches!(node.invoke_unwind_kind, Some(BlockKind::Catch | BlockKind::Terminate))
+                    && eh.has_inner_eh
+                {
+                    keep = false;
+                }
+                if !node.is_invoke && node.in_cleanup && eh.has_resume {
                     keep = false;
                 }
             }
@@ -1296,8 +1502,8 @@ fn plan_guided<'v, A: Allocator + Copy>(
                 if let Some(slot) = alive.get_mut(i) {
                     *slot = false;
                 }
-                if let Some(slot) = unwind_free.get_mut(i) {
-                    *slot = false;
+                if let Some(slot) = node_eh.get_mut(i) {
+                    *slot = ResidualEh { may_unwind: true, has_inner_eh: true, has_resume: true };
                 }
                 raw_children.remove(&(node.parent, node.site));
             }
@@ -1354,12 +1560,22 @@ fn plan_guided<'v, A: Allocator + Copy>(
     Ok((ordered, children))
 }
 
-/// What a fixup names: a value or a block of its frame's body, or its frame's continuation.
+/// What a fixup names: a value or block of its frame's body, its frame's continuation, or the
+/// non-landing body block split off a landing pad targeted by inlined `Op::Resume` jumps.
 #[derive(Clone, Copy)]
 enum Fix {
     Value,
     Block,
     Cont,
+    ResumeBody,
+}
+
+/// Enclosing unwind landing pad inherited by an inlined frame (from the nearest ancestor
+/// `Op::Invoke` site not separated by a cleanup-path call).
+#[derive(Clone, Copy)]
+struct UnwindTarget {
+    frame: u32,
+    block: u32,
 }
 
 /// A word of the output to set once every block is copied: `data[place]` if `in_data`, else
@@ -1377,9 +1593,12 @@ struct Frame<A: Allocator> {
     /// Whether this is the root, whose tables are the output's.
     root: bool,
     /// Per value of the body: its value here.
-    values: Vec<u32, A>,
+    values: OwnVec<u32, A>,
     /// Per block of the body: its block here.
-    blocks: Vec<u32, A>,
+    blocks: OwnVec<u32, A>,
+    /// Per landing block split for inlined `Op::Resume` jumps: its `BlockKind::Cold` body block
+    /// (empty when no `Op::Resume` targets any landing pad in this frame).
+    resume_bodies: OwnVec<u32, A>,
     /// The block the body's returns jump to.
     cont: u32,
     /// Continuation block parameters created for multi-return callees (`rets.len() >= 2`).
@@ -1391,9 +1610,9 @@ struct Frame<A: Allocator> {
     range_off: u32,
     mem_off: u32,
     /// Per row of the body's tables: its row here, [`NONE`] until first named.
-    refs: Vec<u32, A>,
-    sigs: Vec<u32, A>,
-    intrinsics: Vec<u32, A>,
+    refs: OwnVec<u32, A>,
+    sigs: OwnVec<u32, A>,
+    intrinsics: OwnVec<u32, A>,
 }
 
 /// Where the emission is in one frame: its body's block and next instruction.
@@ -1455,6 +1674,15 @@ struct Emit<'p, 'v, 'b, A: Allocator + Copy> {
     allow_external_refs: bool,
     out: Func<A>,
     frames: Vec<Frame<A>, A>,
+    /// Per frame: cleanup/terminate-reachable block flags (empty if the body has no cleanup blocks).
+    frame_cleanup: OwnVec<OwnVec<bool, A>, A>,
+    /// Per frame: enclosing unwind landing pad inherited from an ancestor `Op::Invoke` site.
+    frame_unwind: OwnVec<Option<UnwindTarget>, A>,
+    /// `(frame, block)` landing pads that must be split into `(landing -> Jump(cold_body))`
+    /// because an inlined callee's `Op::Resume` jumps into them.
+    needs_resume_body: Map<(u32, u32), (), FixedState, A>,
+    /// Per frame: whether `needs_resume_body` names at least one landing block in that frame.
+    frame_needs_resume_body: OwnVec<bool, A>,
     fixups: Vec<Fixup, A>,
     /// Deferred `Op::Project(spliced_multi_ret_call, k)` aliases: `(frame, proj_inst, child_frame, ret_idx)`.
     project_aliases: OwnVec<(u32, usize, u32, u8), A>,
@@ -2016,18 +2244,195 @@ impl<A: Allocator + Copy> Emit<'_, '_, '_, A> {
         Ok(())
     }
 
+    fn is_cleanup(&self, frame: u32, block: u32) -> bool {
+        let Ok(f_idx) = usize::try_from(frame) else { return false };
+        let Ok(b_idx) = usize::try_from(block) else { return false };
+        self.frame_cleanup
+            .get(f_idx)
+            .and_then(|v| v.get(b_idx).copied())
+            .unwrap_or(false)
+    }
+
+    /// Rewrites an un-spliced `Op::Call` or `Op::CallIndirect` at `at` in a non-cleanup block of
+    /// `frame` into `Op::Invoke` / `Op::InvokeIndirect` targeting `ut` (enclosing caller unwind
+    /// pad), splitting the current block immediately into a fresh normal/cold continuation block.
+    fn copy_as_invoke(
+        &mut self,
+        frame: u32,
+        block: u32,
+        at: usize,
+        ut: UnwindTarget,
+    ) -> Result<(), InlineError> {
+        let Ok(f_idx) = usize::try_from(frame) else {
+            return Err(InlineError::Refused { inst: at, what: "a frame index past usize" });
+        };
+        let Some(view) = self.nodes.get(f_idx).map(|n| n.view) else {
+            return Err(InlineError::Refused { inst: at, what: "a frame past the plan's nodes" });
+        };
+        let op = view.op(at);
+        let original = Ty(view.tys.get(at).copied().unwrap_or(0));
+        let ty = self.ty(frame, original)?;
+        let Some(extra_start) = view.data.get(at).and_then(|&d| usize::try_from(d).ok()) else {
+            return Err(InlineError::Refused { inst: at, what: "call operands past extra table" });
+        };
+        let Some(words) = view.extra.get(extra_start..) else {
+            return Err(InlineError::Refused { inst: at, what: "call operands past extra table" });
+        };
+        let Some(&callee_word) = words.first() else {
+            return Err(InlineError::Refused { inst: at, what: "call missing callee operand" });
+        };
+        let Some(&sig_word) = words.get(1) else {
+            return Err(InlineError::Refused { inst: at, what: "call missing signature operand" });
+        };
+        let Some(&argc_word) = words.get(2) else {
+            return Err(InlineError::Refused { inst: at, what: "call missing argument count" });
+        };
+        let Ok(argc) = usize::try_from(argc_word) else {
+            return Err(InlineError::Refused { inst: at, what: "call argument count past usize" });
+        };
+        let Some(arg_end) = 3usize.checked_add(argc) else {
+            return Err(InlineError::Refused { inst: at, what: "call arguments overflow" });
+        };
+        let Some(args) = words.get(3..arg_end) else {
+            return Err(InlineError::Refused { inst: at, what: "call arguments past extra table" });
+        };
+
+        let start = row(self.out.extra.len(), "extra")?;
+        let invoke_op = match op {
+            Op::Call => {
+                let reference = self.reference(frame, callee_word, at)?;
+                self.out.extra.push(reference);
+                Op::Invoke
+            }
+            Op::CallIndirect => {
+                self.fix_extra(frame, Fix::Value, callee_word)?;
+                Op::InvokeIndirect
+            }
+            _ => {
+                return Err(InlineError::Refused { inst: at, what: "non-call rewritten as invoke" });
+            }
+        };
+        let sig = self.sig(frame, sig_word)?;
+        self.out.extra.push(sig);
+        let split_blk = row(self.out.block_starts.len(), "blocks")?;
+        self.out.extra.push(split_blk);
+        self.fix_extra(ut.frame, Fix::Block, ut.block)?;
+        self.out.extra.push(argc_word);
+        for &arg in args {
+            self.fix_extra(frame, Fix::Value, arg)?;
+        }
+
+        let attrs = self.attrs(frame, view.attrs.get(at).copied().unwrap_or(0));
+        let loc = self.loc(frame, view.locs.get(at).copied().unwrap_or(0));
+        let flags = view.flags.get(at).copied().unwrap_or(0);
+        let made = self.raw(invoke_op, flags, ty, start, attrs, loc)?;
+        if let Some(slot) = self.frames.get_mut(f_idx).and_then(|f| f.values.get_mut(at)) {
+            *slot = made;
+        }
+        let cont_kind = match view.block_kind(Block(block)) {
+            BlockKind::Normal => BlockKind::Normal,
+            BlockKind::Cold | BlockKind::Cleanup | BlockKind::Catch | BlockKind::Terminate => BlockKind::Cold,
+        };
+        let actual_split = self.begin(cont_kind)?;
+        if actual_split != split_blk {
+            return Err(InlineError::Refused { inst: at, what: "invoke split block id mismatch" });
+        }
+        Ok(())
+    }
+
+    /// Rewrites an inlined frame's `Op::Resume(exc)` into `Op::Jump(resume_body(ut), [exc])`
+    /// so unwinding transfers directly into the enclosing caller's split landing-pad body.
+    fn resume_to_unwind(
+        &mut self,
+        frame: u32,
+        at: usize,
+        ut: UnwindTarget,
+    ) -> Result<(), InlineError> {
+        let Ok(f_idx) = usize::try_from(frame) else {
+            return Err(InlineError::Refused { inst: at, what: "a frame index past usize" });
+        };
+        let Some(view) = self.nodes.get(f_idx).map(|n| n.view) else {
+            return Err(InlineError::Refused { inst: at, what: "a frame past the plan's nodes" });
+        };
+        let Some(&exc) = view.data.get(at) else {
+            return Err(InlineError::Refused { inst: at, what: "resume missing exception operand" });
+        };
+        let start = row(self.out.extra.len(), "extra")?;
+        self.fix_extra(ut.frame, Fix::ResumeBody, ut.block)?;
+        self.out.extra.push(1);
+        self.fix_extra(frame, Fix::Value, exc)?;
+        let loc = self.loc(frame, view.locs.get(at).copied().unwrap_or(0));
+        self.raw(Op::Jump, 0, Ty::NONE, start, 0, loc)?;
+        Ok(())
+    }
+
     /// Begins the output's copy of block `block` of frame `frame`'s body with its parameters;
-    /// where its other instructions start.
+    /// where its other instructions start. When `(frame, block)` is a landing pad targeted by an
+    /// inlined callee's `Op::Resume`, splits it into a 1-instruction landing trampoline
+    /// (`landing_param -> Jump(body_block, [landing_param])`) followed by the `BlockKind::Cold`
+    /// body block whose parameter receives both unwind entries and inlined `Resume` jumps.
     fn body_block(&mut self, frame: u32, block: u32) -> Result<usize, InlineError> {
-        let view = self.nodes[frame as usize].view;
-        let number = self.begin(view.block_kind(Block(block)))?;
-        self.frames[frame as usize].blocks[block as usize] = number;
+        let Ok(f_idx) = usize::try_from(frame) else {
+            return Err(InlineError::Refused { inst: 0, what: "a frame index past usize" });
+        };
+        let Ok(b_idx) = usize::try_from(block) else {
+            return Err(InlineError::Refused { inst: 0, what: "a block index past usize" });
+        };
+        let Some(view) = self.nodes.get(f_idx).map(|n| n.view) else {
+            return Err(InlineError::Refused { inst: 0, what: "a frame past the plan's nodes" });
+        };
+        let kind = view.block_kind(Block(block));
         let params = view.params(Block(block));
+        if self.needs_resume_body.contains_key(&(frame, block)) {
+            if !kind.is_landing() || params.len() != 1 {
+                return Err(InlineError::Refused {
+                    inst: params.start,
+                    what: "an unwind target block that is not a single-param landing block",
+                });
+            }
+            let p0 = params.start;
+            let landing_num = self.begin(kind)?;
+            if let Some(slot) = self.frames.get_mut(f_idx).and_then(|f| f.blocks.get_mut(b_idx)) {
+                *slot = landing_num;
+            }
+            let p_ty = self.ty(frame, Ty(view.tys.get(p0).copied().unwrap_or(0)))?;
+            let p_flags = view.flags.get(p0).copied().unwrap_or(0);
+            let p_attrs = self.attrs(frame, view.attrs.get(p0).copied().unwrap_or(0));
+            let p_loc = self.loc(frame, view.locs.get(p0).copied().unwrap_or(0));
+            let lp_param = self.raw(Op::Param, p_flags, p_ty, 0, p_attrs, p_loc)?;
+            let body_num = row(self.out.block_starts.len(), "blocks")?;
+            let jump_start = row(self.out.extra.len(), "extra")?;
+            self.out.extra.push(body_num);
+            self.out.extra.push(1);
+            self.out.extra.push(lp_param);
+            self.raw(Op::Jump, 0, Ty::NONE, jump_start, 0, p_loc)?;
+
+            let actual_body = self.begin(BlockKind::Cold)?;
+            if actual_body != body_num {
+                return Err(InlineError::Refused { inst: p0, what: "landing split block id mismatch" });
+            }
+            if let Some(slot) = self.frames.get_mut(f_idx).and_then(|f| f.resume_bodies.get_mut(b_idx)) {
+                *slot = actual_body;
+            }
+            let body_param = self.raw(Op::Param, p_flags, p_ty, 0, p_attrs, p_loc)?;
+            if let Some(slot) = self.frames.get_mut(f_idx).and_then(|f| f.values.get_mut(p0)) {
+                *slot = body_param;
+            }
+            return Ok(params.end);
+        }
+        let number = self.begin(kind)?;
+        if let Some(slot) = self.frames.get_mut(f_idx).and_then(|f| f.blocks.get_mut(b_idx)) {
+            *slot = number;
+        }
         for at in params.start..params.end {
-            let ty = self.ty(frame, Ty(view.tys[at]))?;
-            let (attrs, loc) = (self.attrs(frame, view.attrs[at]), self.loc(frame, view.locs[at]));
-            let made = self.raw(Op::Param, view.flags[at], ty, 0, attrs, loc)?;
-            self.frames[frame as usize].values[at] = made;
+            let ty = self.ty(frame, Ty(view.tys.get(at).copied().unwrap_or(0)))?;
+            let flags = view.flags.get(at).copied().unwrap_or(0);
+            let attrs = self.attrs(frame, view.attrs.get(at).copied().unwrap_or(0));
+            let loc = self.loc(frame, view.locs.get(at).copied().unwrap_or(0));
+            let made = self.raw(Op::Param, flags, ty, 0, attrs, loc)?;
+            if let Some(slot) = self.frames.get_mut(f_idx).and_then(|f| f.values.get_mut(at)) {
+                *slot = made;
+            }
         }
         Ok(params.end)
     }
@@ -2106,10 +2511,20 @@ impl<A: Allocator + Copy> Emit<'_, '_, '_, A> {
             });
         }
         let alloc = &self.alloc;
+        let needs_rb = usize::try_from(child)
+            .ok()
+            .and_then(|ci| self.frame_needs_resume_body.get(ci).copied())
+            .unwrap_or(false);
+        let resume_bodies = if needs_rb {
+            own_filled(view.blocks(), NONE, alloc)
+        } else {
+            OwnVec::new_in(*alloc)
+        };
         self.frames.push(Frame {
             root: false,
-            values: filled(view.len(), NONE, alloc),
-            blocks: filled(view.blocks(), NONE, alloc),
+            values: own_filled(view.len(), NONE, alloc),
+            blocks: own_filled(view.blocks(), NONE, alloc),
+            resume_bodies,
             cont: NONE,
             cont_params: [NONE; MAX_MULTI_RET],
             drop_locs,
@@ -2117,9 +2532,9 @@ impl<A: Allocator + Copy> Emit<'_, '_, '_, A> {
             span_off,
             range_off,
             mem_off,
-            refs: filled(view.refs.len(), NONE, alloc),
-            sigs: filled(view.sigs.len(), NONE, alloc),
-            intrinsics: filled(view.intrinsics.len(), NONE, alloc),
+            refs: own_filled(view.refs.len(), NONE, alloc),
+            sigs: own_filled(view.sigs.len(), NONE, alloc),
+            intrinsics: own_filled(view.intrinsics.len(), NONE, alloc),
         });
         Ok(())
     }
@@ -2286,6 +2701,58 @@ fn emit<A: Allocator + Copy>(
     out.locs.clear();
     out.block_starts.clear();
     out.block_kinds.clear();
+    // Precompute per-frame cleanup-path masks, inherited unwind landing pads, and which landing
+    // pads require a split `BlockKind::Cold` body block for inlined `Op::Resume` jumps.
+    let mut frame_cleanup: OwnVec<OwnVec<bool, A>, A> = OwnVec::with_capacity_in(nodes.len(), *alloc);
+    for node in nodes {
+        frame_cleanup.push(cleanup_blocks(node.view, alloc)?);
+    }
+    let mut frame_unwind: OwnVec<Option<UnwindTarget>, A> = OwnVec::with_capacity_in(nodes.len(), *alloc);
+    frame_unwind.push(None);
+    for node in nodes.iter().skip(1) {
+        let p = node.parent;
+        let p_idx = usize::try_from(p).unwrap_or(0);
+        let ut = if node.is_invoke {
+            let parent_view = nodes.get(p_idx).map(|n| n.view);
+            parent_view
+                .and_then(|pv| call_site(pv, node.site))
+                .and_then(|cs| cs.invoke_unwind)
+                .map(|blk| UnwindTarget { frame: p, block: blk })
+        } else {
+            let in_clean = nodes
+                .get(p_idx)
+                .and_then(|pn| block_of_inst(pn.view, node.site))
+                .and_then(|b| usize::try_from(b).ok())
+                .and_then(|bi| frame_cleanup.get(p_idx).and_then(|c| c.get(bi).copied()))
+                .unwrap_or(false);
+            if in_clean {
+                None
+            } else {
+                frame_unwind.get(p_idx).copied().flatten()
+            }
+        };
+        frame_unwind.push(ut);
+    }
+    let mut needs_resume_body: Map<(u32, u32), (), FixedState, A> = new_map(alloc);
+    let mut frame_needs_resume_body = own_filled(nodes.len(), false, alloc);
+    for (f_idx, node) in nodes.iter().enumerate().skip(1) {
+        if let Some(Some(ut)) = frame_unwind.get(f_idx).copied()
+            && (0..node.view.len()).any(|i| node.view.op(i) == Op::Resume)
+        {
+            needs_resume_body.insert((ut.frame, ut.block), ());
+            if let Ok(uf_idx) = usize::try_from(ut.frame)
+                && let Some(slot) = frame_needs_resume_body.get_mut(uf_idx)
+            {
+                *slot = true;
+            }
+        }
+    }
+    let root_resume_bodies = if frame_needs_resume_body.first().copied().unwrap_or(false) {
+        own_filled(view.blocks(), NONE, alloc)
+    } else {
+        OwnVec::new_in(*alloc)
+    };
+
     let mut e = Emit {
         nodes,
         children,
@@ -2293,6 +2760,10 @@ fn emit<A: Allocator + Copy>(
         allow_external_refs,
         out,
         frames: Vec::with_capacity_in(nodes.len(), *alloc),
+        frame_cleanup,
+        frame_unwind,
+        needs_resume_body,
+        frame_needs_resume_body,
         fixups: Vec::new_in(*alloc),
         project_aliases: OwnVec::new_in(*alloc),
         compound_rows: new_map(alloc),
@@ -2311,8 +2782,9 @@ fn emit<A: Allocator + Copy>(
     e.seed_interners();
     e.frames.push(Frame {
         root: true,
-        values: filled(view.len(), NONE, alloc),
-        blocks: filled(view.blocks(), NONE, alloc),
+        values: own_filled(view.len(), NONE, alloc),
+        blocks: own_filled(view.blocks(), NONE, alloc),
+        resume_bodies: root_resume_bodies,
         cont: NONE,
         cont_params: [NONE; MAX_MULTI_RET],
         drop_locs: false,
@@ -2320,9 +2792,9 @@ fn emit<A: Allocator + Copy>(
         span_off: 0,
         range_off: 0,
         mem_off: 0,
-        refs: Vec::new_in(*alloc),
-        sigs: Vec::new_in(*alloc),
-        intrinsics: Vec::new_in(*alloc),
+        refs: OwnVec::new_in(*alloc),
+        sigs: OwnVec::new_in(*alloc),
+        intrinsics: OwnVec::new_in(*alloc),
     });
     let mut stack: OwnVec<Cursor, A> = OwnVec::new_in(*alloc);
     let at = e.body_block(0, 0)?;
@@ -2361,9 +2833,23 @@ fn emit<A: Allocator + Copy>(
             e.project_aliases.push((cursor.frame, at, child, ret_idx));
             continue;
         }
-        match op == Op::Return && cursor.frame != 0 {
-            true => e.ret(cursor.frame, at)?,
-            false => e.copy(cursor.frame, at)?,
+        if op == Op::Return && cursor.frame != 0 {
+            e.ret(cursor.frame, at)?;
+        } else if op == Op::Resume
+            && let Some(ut) = usize::try_from(cursor.frame)
+                .ok()
+                .and_then(|fi| e.frame_unwind.get(fi).copied().flatten())
+        {
+            e.resume_to_unwind(cursor.frame, at, ut)?;
+        } else if matches!(op, Op::Call | Op::CallIndirect)
+            && let Some(ut) = usize::try_from(cursor.frame)
+                .ok()
+                .and_then(|fi| e.frame_unwind.get(fi).copied().flatten())
+            && !e.is_cleanup(cursor.frame, cursor.block)
+        {
+            e.copy_as_invoke(cursor.frame, cursor.block, at, ut)?;
+        } else {
+            e.copy(cursor.frame, at)?;
         }
     }
     // Resolve deferred multi-return `Op::Project` aliases to continuation block parameters.
@@ -2406,6 +2892,7 @@ fn emit<A: Allocator + Copy>(
             Fix::Value => frame.values.get(*word as usize).copied(),
             Fix::Block => frame.blocks.get(*word as usize).copied(),
             Fix::Cont => Some(frame.cont),
+            Fix::ResumeBody => frame.resume_bodies.get(*word as usize).copied(),
         };
         match to {
             Some(to) if to != NONE => *word = to,
@@ -2745,5 +3232,445 @@ mod tests {
                 v
             }));
         }
+    }
+
+    #[test]
+    fn inlines_unwinding_invoke_rewriting_call_and_call_indirect() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // Callee: `helper(x: i64, fn_ptr: ptr) -> i64`: calls opaque extern `ext(x)` and
+        // `call_indirect fn_ptr(r)` — both may unwind!
+        let helper = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let own_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I64)],
+            );
+            let one_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(own_sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let ext_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let fp = b.param(Ty::PTR);
+            let r1 = b.call(Flags::NONE, ext_ref, one_sig, &[x]);
+            let r2 = b.call_indirect(Flags::NONE, fp, one_sig, &[r1]);
+            let sum = b.binary(Op::Add, Flags::NONE, r1, r2);
+            b.ret(&[sum]);
+            b.finish_checked().expect("helper builds")
+        };
+
+        // Caller: `invoke helper(x, fp) -> normal, pad(Cleanup)`
+        let caller = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let helper_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let normal = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let fp = b.param(Ty::PTR);
+            let res = b.invoke(Flags::NONE, helper_ref, sig, &[x, fp], normal, pad);
+            b.begin(normal);
+            b.ret(&[res]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("caller builds")
+        };
+
+        let mut bodies = OwnVec::new_in(alloc);
+        bodies.push((body_id(1), caller));
+        bodies.push((body_id(2), helper));
+        let mut links = OwnVec::new_in(alloc);
+        links.push((body_id(1), RefId(0), body_id(2)));
+        let bank = LocalBank { bodies, links };
+
+        let guided = inline_guided(
+            bank.bodies[0].1.view(),
+            body_id(1),
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .expect("unwinding invoke inline succeeds");
+        let out = guided.func.view();
+        verify(out).expect("rewritten unwinding invoke verifies");
+        assert_eq!(guided.read[..], [body_id(2)]);
+        assert_eq!((0..out.len()).filter(|&i| matches!(out.op(i), Op::Call | Op::CallIndirect)).count(), 0);
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Invoke).count(), 1);
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::InvokeIndirect).count(), 1);
+    }
+
+    #[test]
+    fn inlines_unwinding_invoke_with_callee_cleanup_and_resume() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // Callee has its own `Op::Invoke` -> `callee_pad(Cleanup)` which calls `drop_callee(p)`
+        // (plain `Op::Call` inside cleanup — must NOT be rewritten to `Invoke`!) and then
+        // executes `Op::Resume(exc)` (must be rewritten to `Jump(caller_pad_body, [exc])`).
+        let callee = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let own_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let drop_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[]);
+            b.set_signature(own_sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let may_panic = b.reference(RefKind::Func, 0);
+            let drop_fn = b.reference(RefKind::Func, 1);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.invoke(Flags::NONE, may_panic, own_sig, &[x], norm, pad);
+            b.begin(norm);
+            let one = b.iconst(Ty::I64, 1);
+            let r2 = b.binary(Op::Add, Flags::NONE, r, one);
+            b.ret(&[r2]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.call(Flags::NONE, drop_fn, drop_sig, &[x]);
+            b.resume(exc);
+            b.finish_checked().expect("callee builds")
+        };
+
+        // Caller invokes `callee(x)` with its own `caller_pad(Cleanup)` that runs `drop_caller(x)`
+        // and resumes.
+        let caller = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let own_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let drop_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[]);
+            b.set_signature(own_sig);
+            let callee_ref = b.reference(RefKind::Func, 0);
+            let drop_caller = b.reference(RefKind::Func, 1);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.invoke(Flags::NONE, callee_ref, own_sig, &[x], norm, pad);
+            b.begin(norm);
+            b.ret(&[r]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.call(Flags::NONE, drop_caller, drop_sig, &[x]);
+            b.resume(exc);
+            b.finish_checked().expect("caller builds")
+        };
+
+        let mut bodies = OwnVec::new_in(alloc);
+        bodies.push((body_id(1), caller));
+        bodies.push((body_id(2), callee));
+        let mut links = OwnVec::new_in(alloc);
+        links.push((body_id(1), RefId(0), body_id(2)));
+        let bank = LocalBank { bodies, links };
+
+        let guided = inline_guided(
+            bank.bodies[0].1.view(),
+            body_id(1),
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .expect("callee with cleanup+resume inlines cleanly");
+        let out = guided.func.view();
+        verify(out).expect("inlined cleanup+resume verifies");
+        assert_eq!(guided.read[..], [body_id(2)]);
+        // Only caller's final `Op::Resume` remains; callee's `Op::Resume` became `Op::Jump` into
+        // caller's split `BlockKind::Cold` cleanup body!
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Resume).count(), 1);
+        // Both cleanup drops stay plain `Op::Call` (never rewritten to `Op::Invoke`).
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Call).count(), 2);
+        // `may_panic` stays `Op::Invoke` to callee's cleanup pad.
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Invoke).count(), 1);
+    }
+
+    #[test]
+    fn inlines_three_level_nested_invoke_call_resume_chain() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // Leaf `c`: calls opaque `ext(x)` (plain `Op::Call`) AND invokes `ext2(x)` with cleanup+resume.
+        let leaf_c = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let ext1 = b.reference(RefKind::Func, 0);
+            let ext2 = b.reference(RefKind::Func, 1);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.call(Flags::NONE, ext1, sig, &[x]);
+            let z = b.invoke(Flags::NONE, ext2, sig, &[y], norm, pad);
+            b.begin(norm);
+            b.ret(&[z]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("leaf_c builds")
+        };
+
+        // Mid `mid_b`: calls `leaf_c(x)` via plain `Op::Call` (inherits `top_a`'s unwind pad!).
+        let mid_b = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let c_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.call(Flags::NONE, c_ref, sig, &[x]);
+            b.ret(&[r]);
+            b.finish_checked().expect("mid_b builds")
+        };
+
+        // Top `top_a`: invokes `mid_b(x)` with `pad_a(Cleanup)`.
+        let top_a = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let b_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.invoke(Flags::NONE, b_ref, sig, &[x], norm, pad);
+            b.begin(norm);
+            b.ret(&[r]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("top_a builds")
+        };
+
+        let mut bodies = OwnVec::new_in(alloc);
+        bodies.push((body_id(1), top_a));
+        bodies.push((body_id(2), mid_b));
+        bodies.push((body_id(3), leaf_c));
+        let mut links = OwnVec::new_in(alloc);
+        links.push((body_id(1), RefId(0), body_id(2)));
+        links.push((body_id(2), RefId(0), body_id(3)));
+        let bank = LocalBank { bodies, links };
+
+        let guided = inline_guided(
+            bank.bodies[0].1.view(),
+            body_id(1),
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .expect("3-level nested invoke/call/resume inlines");
+        let out = guided.func.view();
+        verify(out).expect("3-level nested unwinding LIR verifies");
+        assert_eq!(guided.read[..], [body_id(2), body_id(3)]);
+        // `ext1` became `Op::Invoke` to `top_a`'s pad, `ext2` stayed `Op::Invoke` to `leaf_c`'s pad.
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Call).count(), 0);
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Invoke).count(), 2);
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Resume).count(), 1);
+    }
+
+    #[test]
+    fn catch_invoke_inlines_plain_calls_but_refuses_inner_eh_shadowing() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // Plain-call callee: safe to inline into `BlockKind::Catch` (Call -> Invoke(..., catch_pad)).
+        let plain_callee = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let ext = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.call(Flags::NONE, ext, sig, &[x]);
+            b.ret(&[r]);
+            b.finish_checked().expect("plain_callee builds")
+        };
+
+        // Inner-cleanup callee: must NOT inline into `BlockKind::Catch` (would shadow Phase 1 Catch).
+        let eh_callee = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let ext = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.invoke(Flags::NONE, ext, sig, &[x], norm, pad);
+            b.begin(norm);
+            b.ret(&[r]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("eh_callee builds")
+        };
+
+        let make_catch_caller = || {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let target = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let catch = b.create_block(BlockKind::Catch);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.invoke(Flags::NONE, target, sig, &[x], norm, catch);
+            b.begin(norm);
+            b.ret(&[r]);
+            b.begin(catch);
+            let _exc = b.param(Ty::PTR);
+            let zero = b.iconst(Ty::I64, 0);
+            b.ret(&[zero]);
+            b.finish_checked().expect("catch caller builds")
+        };
+
+        let mut bodies = OwnVec::new_in(alloc);
+        bodies.push((body_id(1), make_catch_caller()));
+        bodies.push((body_id(2), plain_callee));
+        bodies.push((body_id(3), make_catch_caller()));
+        bodies.push((body_id(4), eh_callee));
+        let mut links = OwnVec::new_in(alloc);
+        links.push((body_id(1), RefId(0), body_id(2)));
+        links.push((body_id(3), RefId(0), body_id(4)));
+        let bank = LocalBank { bodies, links };
+
+        let ok_inlined = inline_guided(
+            bank.bodies[0].1.view(),
+            body_id(1),
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .expect("plain callee into catch succeeds");
+        verify(ok_inlined.func.view()).expect("plain callee inlined into catch verifies");
+        assert_eq!(ok_inlined.read[..], [body_id(2)]);
+
+        let refused_shadow = inline_guided(
+            bank.bodies[2].1.view(),
+            body_id(3),
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .expect("inner-eh callee into catch stays un-inlined cleanly");
+        verify(refused_shadow.func.view()).expect("un-inlined catch caller verifies");
+        assert!(refused_shadow.read.is_empty());
+    }
+
+    #[test]
+    fn inlines_multi_return_unwinding_invoke() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // Multi-return callee `(ptr, i64) -> (ptr, i64)` with an un-inlined `Call` that may unwind.
+        let callee = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+            );
+            let check_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let check_fn = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let len = b.param(Ty::I64);
+            let new_len = b.call(Flags::NONE, check_fn, check_sig, &[len]);
+            b.ret(&[p, new_len]);
+            b.finish_checked().expect("multi-ret unwinding callee builds")
+        };
+
+        let caller = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let own_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            let call_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+            );
+            b.set_signature(own_sig);
+            let callee_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let len = b.param(Ty::I64);
+            let pair = b.invoke(Flags::NONE, callee_ref, call_sig, &[p, len], norm, pad);
+            b.begin(norm);
+            let _p2 = b.project(pair, 0);
+            let len2 = b.project(pair, 1);
+            b.ret(&[len2]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("multi-ret invoke caller builds")
+        };
+
+        let mut bodies = OwnVec::new_in(alloc);
+        bodies.push((body_id(1), caller));
+        bodies.push((body_id(2), callee));
+        let mut links = OwnVec::new_in(alloc);
+        links.push((body_id(1), RefId(0), body_id(2)));
+        let bank = LocalBank { bodies, links };
+
+        let guided = inline_guided(
+            bank.bodies[0].1.view(),
+            body_id(1),
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .expect("multi-ret unwinding invoke inlines");
+        let out = guided.func.view();
+        verify(out).expect("multi-ret unwinding invoke verifies");
+        assert_eq!(guided.read[..], [body_id(2)]);
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Project).count(), 0);
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Call).count(), 0);
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Invoke).count(), 1);
     }
 }

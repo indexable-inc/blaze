@@ -260,13 +260,46 @@ impl Bound {
         Ok(bound)
     }
 
+    /// Returns a `Copy + Send + Sync` borrowed view of the bound routines table for parallel
+    /// codegen workers.
+    pub fn as_ref(&self) -> BoundRef<'_> {
+        BoundRef {
+            found: self.found,
+            symbols: self.symbols,
+            spans: self.spans,
+            text: self.text.as_slice(),
+        }
+    }
+
     /// Appends one callee per found routine to an instance's function references `funcs` (in
     /// [`SoftFloat::ALL`]'s order, after the instance's own) and gives the emitter's table of
     /// their places.
     pub fn bind<'b>(&'b self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<Routines<'b>, CodeRecordError> {
+        self.as_ref().bind(funcs)
+    }
+
+    #[cfg(test)]
+    fn declared(&self, r: SoftFloat) -> Option<Declared<'_>> {
+        self.as_ref().declared(r)
+    }
+}
+
+/// Borrowed `Copy + Send + Sync` view of [`Bound`] so parallel export LTO workers can bind
+/// soft-float routines without sharing a `!Sync` allocator handle.
+#[derive(Clone, Copy)]
+pub struct BoundRef<'a> {
+    found: Builtins,
+    symbols: [Option<Symbol>; COUNT],
+    spans: [(u32, u32); COUNT],
+    text: &'a [u8],
+}
+
+impl<'a> BoundRef<'a> {
+    /// Appends one callee per found routine to `funcs` and returns the emitter's routine table.
+    pub fn bind(self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<Routines<'a>, CodeRecordError> {
         let mut places = RoutinePlaces::NONE;
         for r in SoftFloat::ALL {
-            let Some(symbol) = self.symbols[r as usize] else { continue };
+            let Some(symbol) = self.symbols.get(r as usize).copied().flatten() else { continue };
             let place = u32::try_from(funcs.len())
                 .ok()
                 .filter(|&p| p != u32::MAX)
@@ -277,11 +310,15 @@ impl Bound {
         Ok(Routines { places, bound: Some(self) })
     }
 
-    fn declared(&self, r: SoftFloat) -> Option<Declared<'_>> {
+    fn declared(self, r: SoftFloat) -> Option<Declared<'a>> {
         let Found::Key(tabled) = self.found.found(r) else { return None };
-        self.symbols[r as usize]?;
-        let (start, len) = self.spans[r as usize];
-        Some(Declared { tabled, name: &self.text[start as usize..][..len as usize] })
+        self.symbols.get(r as usize).copied().flatten()?;
+        let (start, len) = self.spans.get(r as usize).copied()?;
+        let s = usize::try_from(start).ok()?;
+        let l = usize::try_from(len).ok()?;
+        let e = s.checked_add(l)?;
+        let name = self.text.get(s..e)?;
+        Some(Declared { tabled, name })
     }
 }
 
@@ -289,7 +326,7 @@ impl Bound {
 #[derive(Clone, Copy)]
 pub struct Routines<'r> {
     places: RoutinePlaces,
-    bound: Option<&'r Bound>,
+    bound: Option<BoundRef<'r>>,
 }
 
 impl<'r> Routines<'r> {

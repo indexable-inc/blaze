@@ -71,27 +71,27 @@ pub enum BuiltCallee {
 
 /// One instance lowered to verified LIR with all outside references resolved, before machine-code
 /// emission (used by [`export_lto`] for whole-program cross-function inlining and LTO).
-pub struct BuiltLir<'a> {
-    pub func: blaze_lir::Func<Alloc<'a>>,
+pub struct BuiltLir<A: core::alloc::Allocator> {
+    pub func: blaze_lir::Func<A>,
     /// Direct function references in `func.refs` order (without soft-float routines appended yet).
-    pub funcs: AVec<'a, BuiltCallee>,
+    pub funcs: blaze_own::Vec<BuiltCallee, A>,
     /// Static items in `func.refs` order.
-    pub statics: AVec<'a, ItemKey>,
+    pub statics: blaze_own::Vec<ItemKey, A>,
     /// Foreign (`extern`) statics among `statics`: `(item, start, len)` into `c_text`.
-    pub c_statics: AVec<'a, (ItemKey, u32, u32)>,
+    pub c_statics: blaze_own::Vec<(ItemKey, u32, u32), A>,
     /// Vtable symbols in `func.refs` order.
-    pub vtables: AVec<'a, blaze_code::record::Symbol>,
+    pub vtables: blaze_own::Vec<blaze_code::record::Symbol, A>,
     /// Encoded vtable datums needed by `vtables` (and their supertraits).
-    pub vtable_data: AVec<'a, (blaze_code::record::Symbol, AVec<'a, u8>)>,
+    pub vtable_data: blaze_own::Vec<(blaze_code::record::Symbol, blaze_own::Vec<u8, A>), A>,
     /// Thread-local items in `func.refs` order.
-    pub tls: AVec<'a, ItemKey>,
+    pub tls: blaze_own::Vec<ItemKey, A>,
     /// Build-side trap sources for `Op::Unreachable` instructions.
-    pub traps: AVec<'a, blaze_code::record::TrapSource>,
+    pub traps: blaze_own::Vec<blaze_code::record::TrapSource, A>,
     /// Concatenated UTF-8 bytes of all C function and C static names referenced by this body.
-    pub c_text: AVec<'a, u8>,
+    pub c_text: blaze_own::Vec<u8, A>,
 }
 
-impl<'a> BuiltLir<'a> {
+impl<A: core::alloc::Allocator> BuiltLir<A> {
     /// Resolves `BuiltCallee` at `place` into a [`Callee`] borrowing from `self.c_text`.
     pub fn callee_at(&self, place: u32) -> Option<Callee<'_>> {
         let idx = usize::try_from(place).ok()?;
@@ -119,9 +119,9 @@ impl<'a> BuiltLir<'a> {
 
 /// Destination for one built instance inside [`build_one`]: either emit an encoded `CodeStore`
 /// entry, or hand back the verified LIR and resolved reference tables for whole-program LTO.
-enum BuildSink<'e, 'a> {
+enum BuildSink<'e, 'a, A: core::alloc::Allocator = Alloc<'a>> {
     Entry(&'e mut AVec<'a, u8>),
-    Lir { alloc: Alloc<'a>, out: &'e mut Option<BuiltLir<'a>> },
+    Lir { alloc: A, out: &'e mut Option<BuiltLir<A>> },
 }
 
 /// How many bodies were checked for a walk's makes: the claim "a run that finds every record
@@ -612,7 +612,7 @@ fn tables_gone(key: ItemKey) -> RunError {
 /// Whether `view` mentions any `f16` or `f128` scalar, vector, compound member, or signature
 /// parameter whose legalization can call a `compiler_builtins` [`blaze_lir::legalize::SoftFloat`]
 /// routine.
-fn func_needs_soft_float(view: &blaze_lir::View<'_>) -> bool {
+pub(crate) fn func_needs_soft_float(view: &blaze_lir::View<'_>) -> bool {
     use blaze_lir::ty::{Scalar, Ty};
     let is_soft = |bits: u16| matches!(Ty(bits).elem(), Scalar::F16 | Scalar::F128);
     view.tys.iter().any(|&bits| is_soft(bits))
@@ -977,20 +977,20 @@ fn make_instance_timed<'a, P: FrontEnd, T: Typing<P>>(
     name: &[u8],
     entry: &mut AVec<'a, u8>,
 ) -> Result<(), RunError> {
-    let mut sink = BuildSink::Entry(entry);
+    let mut sink = BuildSink::<Alloc<'a>>::Entry(entry);
     run_instance_loop(program, typing, state, checks, tabled, name, &mut sink)
 }
 
 /// Shared instance-lowering loop for both [`make_instance_timed`] (entry emission) and
 /// [`Maker::build_lir`] (LIR extraction for export LTO).
-fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
+fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + Copy>(
     program: &mut P,
     typing: &mut T,
     state: &mut MakerState,
     checks: &mut CheckCount,
     tabled: ItemKey,
     name: &[u8],
-    sink: &mut BuildSink<'_, 'a>,
+    sink: &mut BuildSink<'_, 'a, A>,
 ) -> Result<(), RunError> {
     let alloc = state.work.alloc;
     // The bodies this ONE instance reads: its fn's, and each owner its name holds.
@@ -2319,7 +2319,7 @@ fn build_lir_phase<P: FrontEnd>(
 /// already-built LIR, batch-collecting all missing facts in one sweep, then seals the read log
 /// and emits the entry (or hands back `BuiltLir`). Never re-runs `blaze_build::build`.
 #[allow(clippy::too_many_arguments)]
-fn resolve_and_emit_phase<'a, P: FrontEnd>(
+fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
     program: &P,
     bodies: &Bodies<'_>,
     work: &mut Work,
@@ -2327,7 +2327,7 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
     instance: Instance,
     built_slot: &mut Option<BuiltPhase<Global>>,
     ref_reads: &ReadLog,
-    sink: &mut BuildSink<'_, 'a>,
+    sink: &mut BuildSink<'_, 'a, A>,
 ) -> Result<Phase2, RunError> {
     let function = program.function(i);
     let name = || function.named();
@@ -2415,7 +2415,7 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
     match sink {
         BuildSink::Lir { alloc, out } => {
             let out_alloc = *alloc;
-            let mut c_text: AVec<'a, u8> = blaze_own::Vec::new_in(out_alloc);
+            let mut c_text: blaze_own::Vec<u8, A> = blaze_own::Vec::new_in(out_alloc);
             let mut push_c = |s: &str| -> Result<(u32, u32), RunError> {
                 let start = u32::try_from(c_text.len()).map_err(|_| RunError::CodeRecord {
                     function: name(),
@@ -2428,7 +2428,7 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
                 c_text.extend_from_slice(s.as_bytes());
                 Ok((start, len))
             };
-            let mut lir_funcs: AVec<'a, BuiltCallee> = blaze_own::Vec::with_capacity_in(funcs.len(), out_alloc);
+            let mut lir_funcs: blaze_own::Vec<BuiltCallee, A> = blaze_own::Vec::with_capacity_in(funcs.len(), out_alloc);
             for &callee in funcs.iter() {
                 match callee {
                     Callee::Symbol(s) => lir_funcs.push(BuiltCallee::Symbol(s)),
@@ -2438,24 +2438,24 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
                     }
                 }
             }
-            let mut lir_c_statics: AVec<'a, (ItemKey, u32, u32)> = blaze_own::Vec::with_capacity_in(c_statics.len(), out_alloc);
+            let mut lir_c_statics: blaze_own::Vec<(ItemKey, u32, u32), A> = blaze_own::Vec::with_capacity_in(c_statics.len(), out_alloc);
             for &(item, cname) in c_statics.iter() {
                 let (start, len) = push_c(cname)?;
                 lir_c_statics.push((item, start, len));
             }
-            let mut lir_statics: AVec<'a, ItemKey> = blaze_own::Vec::with_capacity_in(built.statics.len(), out_alloc);
+            let mut lir_statics: blaze_own::Vec<ItemKey, A> = blaze_own::Vec::with_capacity_in(built.statics.len(), out_alloc);
             lir_statics.extend_from_slice(&built.statics);
-            let mut lir_vtables: AVec<'a, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(vtables.len(), out_alloc);
+            let mut lir_vtables: blaze_own::Vec<blaze_code::record::Symbol, A> = blaze_own::Vec::with_capacity_in(vtables.len(), out_alloc);
             lir_vtables.extend_from_slice(vtables.as_slice());
-            let mut lir_vtable_data: AVec<'a, (blaze_code::record::Symbol, AVec<'a, u8>)> = blaze_own::Vec::with_capacity_in(vtable_data.len(), out_alloc);
+            let mut lir_vtable_data: blaze_own::Vec<(blaze_code::record::Symbol, blaze_own::Vec<u8, A>), A> = blaze_own::Vec::with_capacity_in(vtable_data.len(), out_alloc);
             for (vsym, bytes) in vtable_data.iter() {
-                let mut copied: AVec<'a, u8> = blaze_own::Vec::with_capacity_in(bytes.len(), out_alloc);
+                let mut copied: blaze_own::Vec<u8, A> = blaze_own::Vec::with_capacity_in(bytes.len(), out_alloc);
                 copied.extend_from_slice(bytes.as_slice());
                 lir_vtable_data.push((*vsym, copied));
             }
-            let mut lir_tls: AVec<'a, ItemKey> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), out_alloc);
+            let mut lir_tls: blaze_own::Vec<ItemKey, A> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), out_alloc);
             lir_tls.extend_from_slice(&built.thread_locals);
-            let mut lir_traps: AVec<'a, blaze_code::record::TrapSource> = blaze_own::Vec::with_capacity_in(built.traps.len(), out_alloc);
+            let mut lir_traps: blaze_own::Vec<blaze_code::record::TrapSource, A> = blaze_own::Vec::with_capacity_in(built.traps.len(), out_alloc);
             lir_traps.extend_from_slice(&built.traps);
             **out = Some(BuiltLir {
                 func: built.func.view().to_func_in(out_alloc),
@@ -3149,7 +3149,13 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
     /// Builds verified LIR and resolved outside references for one instance without emitting
     /// machine code yet (used by [`export_lto`] for whole-program cross-function inlining).
-    pub fn build_lir<'a>(&mut self, _grant: &G, tabled: ItemKey, name: &[u8], alloc: Alloc<'a>) -> Result<BuiltLir<'a>, RunError> {
+    pub fn build_lir<'a>(&mut self, grant: &G, tabled: ItemKey, name: &[u8], alloc: Alloc<'a>) -> Result<BuiltLir<Alloc<'a>>, RunError> {
+        self.build_lir_in(grant, tabled, name, alloc)
+    }
+
+    /// Allocator-generic variant of [`Self::build_lir`] so parallel export LTO can store
+    /// [`BuiltLir`] in a `Send + Sync` [`blaze_own::SharedAlloc`].
+    pub fn build_lir_in<A: core::alloc::Allocator + Copy>(&mut self, _grant: &G, tabled: ItemKey, name: &[u8], alloc: A) -> Result<BuiltLir<A>, RunError> {
         if let Some(void) = self.void(tabled) {
             return Err(void);
         }
@@ -3160,26 +3166,35 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         made
     }
 
-    fn build_lir_over<'a>(&mut self, tabled: ItemKey, name: &[u8], alloc: Alloc<'a>) -> Result<BuiltLir<'a>, RunError> {
+    fn build_lir_over<A: core::alloc::Allocator + Copy>(&mut self, tabled: ItemKey, name: &[u8], alloc: A) -> Result<BuiltLir<A>, RunError> {
         self.construct(tabled)?;
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::build_lir`)" });
         };
-        let mut out: Option<BuiltLir<'a>> = None;
+        let mut out: Option<BuiltLir<A>> = None;
         let mut sink = BuildSink::Lir { alloc, out: &mut out };
         run_instance_loop(program, &mut self.typing, state, &mut self.checks, tabled, name, &mut sink)?;
         out.ok_or(RunError::OneBody { key: tabled, why: "the LIR build completed without producing a body (make_one.rs `Maker::build_lir`)" })
     }
 
-    /// Binds compiler_builtins soft-float routines onto `funcs` (after all original + LTO-imported
-    /// function references) so host-machine emission can legalize `f128` operations if needed.
-    pub fn bind_routines<'m>(&'m self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<crate::front2::builtins_shim::Routines<'m>, CodeRecordError> {
+    /// Initializes the `compiler_builtins` soft-float routine table once on the calling thread and
+    /// returns a `Copy + Send + Sync` [`BoundRef`] for parallel export LTO workers.
+    pub fn prepare_routines(&self) -> Result<Option<crate::front2::builtins_shim::BoundRef<'_>>, CodeRecordError> {
         match self.made.as_ref() {
             Some((program, state)) => {
                 let bound = get_or_init_routines(&state.work.routines, program, &state.work.ground, state.work.alloc)
                     .map_err(CodeRecordError::Symbol)?;
-                bound.bind(funcs)
+                Ok(Some(bound.as_ref()))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Binds compiler_builtins soft-float routines onto `funcs` (after all original + LTO-imported
+    /// function references) so host-machine emission can legalize `f128` operations if needed.
+    pub fn bind_routines<'m>(&'m self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<crate::front2::builtins_shim::Routines<'m>, CodeRecordError> {
+        match self.prepare_routines()? {
+            Some(bound) => bound.bind(funcs),
             None => Ok(crate::front2::builtins_shim::Routines::NONE),
         }
     }
