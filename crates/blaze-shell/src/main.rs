@@ -2229,7 +2229,9 @@ mod macos_app {
                 }
                 let anim_ms = anim_epoch.elapsed().as_millis() as u64;
                 let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms, vh);
-                *has_animated_images = any_anim;
+                let (overlay_images, any_ov_anim) =
+                    image_atlas.rasterize_quads(&scene.overlay_images, anim_ms, vh);
+                *has_animated_images = any_anim || any_ov_anim;
                 image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
 
                 let vp = ViewportUniform {
@@ -2248,6 +2250,7 @@ mod macos_app {
                     over_rects: &scene.over_rects,
                     overlay_rects: &scene.overlay_rects,
                     overlay_icons: &overlay_icons,
+                    overlay_images: &overlay_images,
                     overlay_glyphs: &overlay_glyphs,
                 };
                 renderer.draw(layer, &frame);
@@ -2262,6 +2265,7 @@ mod macos_app {
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
                 scene.overlay_icons.clear();
+                scene.overlay_images.clear();
                 scene.overlay_text.clear();
                 *composite_scene = scene;
                 *dirty = false;
@@ -2468,6 +2472,7 @@ mod macos_app {
                 renderer.upload_icon(slot, &rgba);
             }
             let (images, _) = image_atlas.rasterize_quads(&scene.image_quads, 0, vh);
+            let (overlay_images, _) = image_atlas.rasterize_quads(&scene.overlay_images, 0, vh);
             image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
             let vp = ViewportUniform {
                 size: [size.width as f32, size.height as f32],
@@ -2485,6 +2490,7 @@ mod macos_app {
                 over_rects: &scene.over_rects,
                 overlay_rects: &scene.overlay_rects,
                 overlay_icons: &overlay_icons,
+                overlay_images: &overlay_images,
                 overlay_glyphs: &overlay_glyphs,
             };
             let w_px = (size.width * scale).round().max(1.0) as usize;
@@ -2508,7 +2514,10 @@ mod macos_app {
         let mut last_cli_spec_rev = blaze_shell::cli_spec_driver::spec_revision();
         let mut last_dust_rev = blaze_shell::dust_driver::dust_revision();
         let mut last_git_meta_rev = blaze_shell::git_meta_driver::git_meta_revision();
+        let mut last_remote_rev = blaze_shell::remote_driver::remote_complete_revision();
         let mut command_palette: Option<CommandPalette> = None;
+        let mut find_bar: Option<blaze_shell::find::FindBar> = None;
+        let mut find_needs_scroll = false;
         let mut last_cursor_rect: Option<[f32; 4]> = None;
         let mut trail_prev: Option<[f32; 4]> = None;
         let mut trail_start: Option<Instant> = None;
@@ -2625,7 +2634,168 @@ mod macos_app {
                                 }
                             }
 
-                            // 0. `Cmd+Shift+P`: toggle Command Palette, and route keys into it when open.
+                            // 0. `Cmd+F` / `Cmd+G` / `Cmd+Shift+G` / `Cmd+E`: native Find in Scrollback & Output!
+                            if flags.contains(NSEventModifierFlags::Command) && !ctrl && !alt {
+                                if !shift && (key == Key::KeyF || lower == "f") {
+                                    let initial = output_selection.and_then(|doc_sel| {
+                                        let sy = panes
+                                            .get(&wm.focused_pane())
+                                            .map_or(0.0, |p| p.scroll_y);
+                                        let screen_sel = TextSelection {
+                                            anchor: [doc_sel.anchor[0], doc_sel.anchor[1] - sy],
+                                            head: [doc_sel.head[0], doc_sel.head[1] - sy],
+                                        };
+                                        let (_, txt) = compute_text_selection(
+                                            &composite_scene.text_runs,
+                                            fonts.cell_metrics(scale),
+                                            screen_sel,
+                                            TOP_BAR_H,
+                                        );
+                                        let t = txt.trim();
+                                        (!t.is_empty() && !t.contains('\n')).then(|| t.to_owned())
+                                    });
+                                    command_palette = None;
+                                    active_popover = None;
+                                    if let Some(fb) = &mut find_bar {
+                                        if let Some(init) = initial {
+                                            *fb = blaze_shell::find::FindBar::new(Some(&init));
+                                            find_needs_scroll = true;
+                                        }
+                                    } else {
+                                        find_bar = Some(blaze_shell::find::FindBar::new(initial.as_deref()));
+                                        find_needs_scroll = true;
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                if !shift && (key == Key::KeyE || lower == "e") {
+                                    if let Some(doc_sel) = output_selection {
+                                        let sy = panes
+                                            .get(&wm.focused_pane())
+                                            .map_or(0.0, |p| p.scroll_y);
+                                        let screen_sel = TextSelection {
+                                            anchor: [doc_sel.anchor[0], doc_sel.anchor[1] - sy],
+                                            head: [doc_sel.head[0], doc_sel.head[1] - sy],
+                                        };
+                                        let (_, txt) = compute_text_selection(
+                                            &composite_scene.text_runs,
+                                            fonts.cell_metrics(scale),
+                                            screen_sel,
+                                            TOP_BAR_H,
+                                        );
+                                        let t = txt.trim();
+                                        if !t.is_empty() && !t.contains('\n') {
+                                            find_bar = Some(blaze_shell::find::FindBar::new(Some(t)));
+                                            find_needs_scroll = true;
+                                            dirty = true;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if key == Key::KeyG || lower == "g" {
+                                    if let Some(fb) = &mut find_bar {
+                                        if shift {
+                                            fb.prev_match();
+                                        } else {
+                                            fb.next_match();
+                                        }
+                                        find_needs_scroll = true;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // 0a. Route keys into the floating `Cmd+F` Find Bar when open.
+                            if let Some(fb) = &mut find_bar {
+                                if key == Key::Escape {
+                                    find_bar = None;
+                                    dirty = true;
+                                    continue;
+                                }
+                                if !flags.contains(NSEventModifierFlags::Command)
+                                    || key == Key::Backspace
+                                    || key == Key::KeyV
+                                    || key == Key::ArrowLeft
+                                    || key == Key::ArrowRight
+                                {
+                                    if matches!(key, Key::Enter | Key::NumpadEnter) {
+                                        if shift {
+                                            fb.prev_match();
+                                        } else {
+                                            fb.next_match();
+                                        }
+                                        find_needs_scroll = true;
+                                        dirty = true;
+                                        continue;
+                                    } else if key == Key::Backspace {
+                                        if flags.contains(NSEventModifierFlags::Command) {
+                                            fb.kill_to_start();
+                                        } else if alt {
+                                            fb.delete_word_back();
+                                        } else {
+                                            fb.backspace();
+                                        }
+                                        find_needs_scroll = true;
+                                        dirty = true;
+                                        continue;
+                                    } else if key == Key::Delete {
+                                        fb.delete_forward();
+                                        find_needs_scroll = true;
+                                        dirty = true;
+                                        continue;
+                                    } else if key == Key::ArrowLeft {
+                                        if flags.contains(NSEventModifierFlags::Command) {
+                                            fb.move_home();
+                                        } else {
+                                            fb.move_left();
+                                        }
+                                        dirty = true;
+                                        continue;
+                                    } else if key == Key::ArrowRight {
+                                        if flags.contains(NSEventModifierFlags::Command) {
+                                            fb.move_end();
+                                        } else {
+                                            fb.move_right();
+                                        }
+                                        dirty = true;
+                                        continue;
+                                    } else if key == Key::Home {
+                                        fb.move_home();
+                                        dirty = true;
+                                        continue;
+                                    } else if key == Key::End {
+                                        fb.move_end();
+                                        dirty = true;
+                                        continue;
+                                    } else if alt && !ctrl && !flags.contains(NSEventModifierFlags::Command) && (key == Key::KeyC || lower == "c") {
+                                        fb.toggle_case();
+                                        find_needs_scroll = true;
+                                        dirty = true;
+                                        continue;
+                                    } else if flags.contains(NSEventModifierFlags::Command) && key == Key::KeyV {
+                                        let pb = NSPasteboard::generalPasteboard();
+                                        // SAFETY: valid static AppKit pasteboard type.
+                                        let t = unsafe { NSPasteboardTypeString };
+                                        if let Some(s) = pb.stringForType(t) {
+                                            fb.insert_str(&s.to_string());
+                                            find_needs_scroll = true;
+                                            dirty = true;
+                                        }
+                                        continue;
+                                    } else if !flags.contains(NSEventModifierFlags::Command) && !ctrl && !alt {
+                                        let text = keys::text_of(&ev);
+                                        if !text.is_empty() && !text.chars().all(|c| c.is_control()) {
+                                            fb.insert_str(&text);
+                                            find_needs_scroll = true;
+                                            dirty = true;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 0b. `Cmd+Shift+P`: toggle Command Palette, and route keys into it when open.
                             if flags.contains(NSEventModifierFlags::Command) && shift && !ctrl && !alt && key == Key::KeyP {
                                 command_palette = if command_palette.is_some() {
                                     None
@@ -4149,6 +4319,31 @@ mod macos_app {
                                                 dirty = true;
                                             }
                                         }
+                                        HitAction::FindToggleCase => {
+                                            if let Some(fb) = &mut find_bar {
+                                                fb.toggle_case();
+                                                find_needs_scroll = true;
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::FindNext => {
+                                            if let Some(fb) = &mut find_bar {
+                                                fb.next_match();
+                                                find_needs_scroll = true;
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::FindPrev => {
+                                            if let Some(fb) = &mut find_bar {
+                                                fb.prev_match();
+                                                find_needs_scroll = true;
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::FindClose => {
+                                            find_bar = None;
+                                            dirty = true;
+                                        }
                                         HitAction::SortTableColumn { block, col } => {
                                             shell.store.toggle_table_sort(block, col);
                                             active_popover = None;
@@ -4876,6 +5071,17 @@ mod macos_app {
                 last_git_meta_rev = cur_git_meta_rev;
                 dirty = true;
             }
+            let cur_remote_rev = blaze_shell::remote_driver::remote_complete_revision();
+            if cur_remote_rev != last_remote_rev {
+                last_remote_rev = cur_remote_rev;
+                if let Some(shell) = panes.get_mut(&wm.focused_pane())
+                    && !shell.editor.text.is_empty()
+                {
+                    let was_open = !shell.editor.completions.is_empty() || popup_engaged;
+                    shell.refresh_editor_assist(was_open);
+                    dirty = true;
+                }
+            }
             let focused_pid = wm.focused_pane();
             let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
             let mut any_running_jobs = false;
@@ -5079,6 +5285,69 @@ mod macos_app {
                 );
                 tile_layout = next_tl;
 
+                if let Some(fb) = &mut find_bar {
+                    let active_hit = blaze_shell::layout::apply_find_overlay(
+                        &mut scene,
+                        fb,
+                        size.width as f32,
+                        TOP_BAR_H,
+                        size.height as f32,
+                        metrics,
+                        cursor_vis,
+                        mouse_pt,
+                    );
+                    if find_needs_scroll {
+                        find_needs_scroll = false;
+                        if let Some(fm) = active_hit {
+                            let delta = blaze_shell::find::scroll_delta_for_match(
+                                &fm,
+                                TOP_BAR_H,
+                                size.height as f32,
+                            );
+                            if delta.abs() > 1.0
+                                && let Some(pane) = panes.get_mut(&wm.focused_pane())
+                            {
+                                let max_scroll = (scene.total_content_height
+                                    - scene.scroll_viewport_height)
+                                    .max(0.0);
+                                pane.auto_scroll_bottom = false;
+                                pane.scroll_y = (pane.scroll_y + delta).clamp(0.0, max_scroll);
+                                let (mut rescene, next_tl2) = build_window_scene(
+                                    &wm,
+                                    &mut panes,
+                                    size.width as f32,
+                                    size.height as f32,
+                                    metrics,
+                                    cursor_vis,
+                                    frame_now,
+                                    zoom_pct,
+                                    true,
+                                    active_drag.as_ref(),
+                                    active_trail,
+                                    output_selection,
+                                    active_popover.as_ref(),
+                                    mouse_pt,
+                                    output_nav,
+                                    dragging_split,
+                                    command_palette.as_ref(),
+                                );
+                                blaze_shell::layout::apply_find_overlay(
+                                    &mut rescene,
+                                    fb,
+                                    size.width as f32,
+                                    TOP_BAR_H,
+                                    size.height as f32,
+                                    metrics,
+                                    cursor_vis,
+                                    mouse_pt,
+                                );
+                                scene = rescene;
+                                tile_layout = next_tl2;
+                            }
+                        }
+                    }
+                }
+
                 // Detect significant cursor jump to trigger Ghostty eased sweep trail!
                 if let (Some(prev), Some(curr)) = (last_cursor_rect, scene.cursor_rect) {
                     let dx = (curr[0] + curr[2] * 0.5) - (prev[0] + prev[2] * 0.5);
@@ -5104,7 +5373,9 @@ mod macos_app {
                 }
                 let anim_ms = anim_epoch.elapsed().as_millis() as u64;
                 let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms, vh);
-                has_animated_images = any_anim;
+                let (overlay_images, any_ov_anim) =
+                    image_atlas.rasterize_quads(&scene.overlay_images, anim_ms, vh);
+                has_animated_images = any_anim || any_ov_anim;
                 image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
                 let vp = ViewportUniform {
                     size: [size.width as f32, size.height as f32],
@@ -5122,6 +5393,7 @@ mod macos_app {
                     over_rects: &scene.over_rects,
                     overlay_rects: &scene.overlay_rects,
                     overlay_icons: &overlay_icons,
+                    overlay_images: &overlay_images,
                     overlay_glyphs: &overlay_glyphs,
                 };
                 renderer.draw(&layer, &frame);
@@ -5134,6 +5406,7 @@ mod macos_app {
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
                 scene.overlay_icons.clear();
+                scene.overlay_images.clear();
                 scene.overlay_text.clear();
                 composite_scene = scene;
                 if let Some((mx, my)) = last_mouse

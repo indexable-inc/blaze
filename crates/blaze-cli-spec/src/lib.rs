@@ -24,6 +24,7 @@ pub mod codec;
 pub mod help_parser;
 pub mod man_parser;
 pub mod manual;
+pub mod remote;
 
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 

@@ -228,6 +228,10 @@ pub enum HitAction {
     ToggleTableView(BlockId),
     ToggleHiddenCols(BlockId),
     TogglePtyFullscreen,
+    FindToggleCase,
+    FindNext,
+    FindPrev,
+    FindClose,
     SortTableColumn { block: BlockId, col: usize },
     ResizeTableColumn { block: BlockId, col: usize, col_x0: i32 },
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
@@ -715,6 +719,8 @@ pub struct Scene {
     pub overlay_rects: Vec<RectInst>,
     /// Floating popup Retina SVG icons drawn above `overlay_rects`.
     pub overlay_icons: Vec<IconQuad>,
+    /// Floating popup Retina images / circular avatars drawn above `overlay_rects`.
+    pub overlay_images: Vec<ImageQuad>,
     /// Floating popup text runs drawn above `overlay_icons`.
     pub overlay_text: Vec<TextRun>,
     /// Fragment-shader rounded-rect clip table (slot 0 is always the unbounded full viewport).
@@ -764,6 +770,7 @@ impl Scene {
             over_rects: Vec::new(),
             overlay_rects: Vec::new(),
             overlay_icons: Vec::new(),
+            overlay_images: Vec::new(),
             overlay_text: Vec::new(),
             clips: vec![infinite_clip],
             hit_regions: Vec::new(),
@@ -1050,6 +1057,27 @@ impl Scene {
         clip_id: u32,
     ) {
         self.overlay_icons.push(IconQuad { x, y, w: size, h: size, name, alpha: 1.0, clip_id });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_avatar_image(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        path: String,
+        clip_id: u32,
+    ) {
+        self.overlay_images.push(ImageQuad {
+            x,
+            y,
+            w: size,
+            h: size,
+            path,
+            alpha: 1.0,
+            circle: true,
+            clip_id,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1482,6 +1510,12 @@ impl Scene {
                 ic.y += dy;
                 ic.clip_id = map_ov_clip(ic.clip_id);
                 self.overlay_icons.push(ic);
+            }
+            for mut img in sub.overlay_images {
+                img.x += dx;
+                img.y += dy;
+                img.clip_id = map_ov_clip(img.clip_id);
+                self.overlay_images.push(img);
             }
             for mut t in sub.overlay_text {
                 t.x += dx;
