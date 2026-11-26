@@ -52,6 +52,9 @@ pub enum CompletionKind {
     Dir,
     File,
     External,
+    RemoteRepo,
+    RemotePackage,
+    Hint,
 }
 
 /// Semantic class of a command-position token for live & block syntax highlighting.
@@ -229,6 +232,8 @@ pub struct CompletionItem {
     pub kind: CompletionKind,
     /// Optional vendored SVG icon name (`"folder_macos"`, `"rust_dark"`, `"toml_dark"`, etc.).
     pub icon: Option<&'static str>,
+    /// Optional local cached Retina circular avatar PNG/JPEG path (e.g. GitHub org/owner avatar).
+    pub avatar_path: Option<String>,
     /// Character indices inside `label` matching the typed query (highlighted IntelliJ-style).
     pub match_indices: Vec<usize>,
 }
@@ -1859,23 +1864,31 @@ impl Editor {
         let prefix = before[token_start..].to_owned();
         let prev_non_ws = before[..token_start].trim_end();
 
-        // Trigger live IntelliJ popup when typing a token (>= 1 char), `$`, `-`, `/`, or after `| `.
+        // Trigger live IntelliJ popup when typing a token (>= 1 char), `$`, `-`, `/`, after `| `,
+        // or right after a remote-search command (`git clone `, `cargo add `, `bun add `, etc.).
         let should_show = !prefix.is_empty()
             || prev_non_ws.ends_with('|')
-            || (before.ends_with(' ') && expects_column_arg(before));
+            || (before.ends_with(' ') && expects_column_arg(before))
+            || (before.ends_with(' ')
+                && blaze_cli_spec::remote::detect_remote_context(before, blaze_own::Alloc::global()).is_some());
 
         if !should_show {
             self.dismiss_completions();
             return;
         }
 
+        let prev_selected_label = self
+            .completions
+            .get(self.completion_selected)
+            .map(|c| c.label.clone());
         let items = self.compute_completions(state, recent_cols, token_start, &prefix);
         // Hide popup if the only candidate is already typed verbatim.
-        if items.len() == 1 && items[0].insert == prefix {
+        if items.len() == 1 && items[0].kind != CompletionKind::Hint && items[0].insert == prefix {
             self.dismiss_completions();
             return;
         }
         if let Some(first) = items.first()
+            && first.kind != CompletionKind::Hint
             && self.ghost.is_none()
             && at_eol
             && !prefix.is_empty()
@@ -1888,10 +1901,14 @@ impl Editor {
         if items.is_empty() {
             self.dismiss_completions();
         } else {
+            let new_sel = prev_selected_label
+                .as_deref()
+                .and_then(|lbl| items.iter().position(|it| it.label == lbl))
+                .unwrap_or(0);
             self.completion_replace_start = token_start;
             self.completions = items;
-            self.completion_selected = 0;
-            self.completion_scroll = 0;
+            self.completion_selected = new_sel;
+            self.sync_completion_scroll();
         }
     }
 
@@ -1929,7 +1946,7 @@ impl Editor {
         self.completion_selected = 0;
         self.completion_scroll = 0;
 
-        if self.completions.len() == 1 {
+        if self.completions.len() == 1 && self.completions[0].kind != CompletionKind::Hint {
             self.apply_selected_completion();
         }
     }
@@ -2049,6 +2066,7 @@ impl Editor {
                             doc: doc.to_owned(),
                             kind: CompletionKind::Variable,
                             icon: None,
+                            avatar_path: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2069,6 +2087,7 @@ impl Editor {
                             doc: format!("session variable · {ty}"),
                             kind: CompletionKind::Variable,
                             icon: None,
+                            avatar_path: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2101,6 +2120,7 @@ impl Editor {
                                 doc: format!("{} {flag} — {}", spec.name, spec.summary),
                                 kind: CompletionKind::Flag,
                                 icon: None,
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2130,6 +2150,7 @@ impl Editor {
                                 },
                                 kind: CompletionKind::Flag,
                                 icon: None,
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2188,6 +2209,7 @@ impl Editor {
                                 doc,
                                 kind: CompletionKind::Flag,
                                 icon: None,
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2218,6 +2240,7 @@ impl Editor {
                                 doc,
                                 kind: CompletionKind::Flag,
                                 icon: None,
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2238,6 +2261,7 @@ impl Editor {
                                 doc: format!("abbr `{abbr}` → `{exp}` (expands on Space/Enter)"),
                                 kind: CompletionKind::Abbrev,
                                 icon: None,
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2255,6 +2279,7 @@ impl Editor {
                             doc: format!("{} — {}", spec.name, spec.summary),
                             kind: CompletionKind::Builtin,
                             icon: None,
+                            avatar_path: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2271,6 +2296,7 @@ impl Editor {
                             doc: format!("user command `{}`", k.as_ref()),
                             kind: CompletionKind::Def,
                             icon: None,
+                            avatar_path: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2287,6 +2313,7 @@ impl Editor {
                             doc: desc.to_owned(),
                             kind: CompletionKind::Keyword,
                             icon: if kw == "rust" { Some("rust_dark") } else { None },
+                            avatar_path: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2308,6 +2335,7 @@ impl Editor {
                                     doc: format!("external command `{bin}` on $PATH"),
                                     kind: CompletionKind::External,
                                     icon: None,
+                                    avatar_path: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2361,6 +2389,7 @@ impl Editor {
                                 doc,
                                 kind: CompletionKind::External,
                                 icon: Some("shell_dark"),
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2382,6 +2411,7 @@ impl Editor {
                                     doc: desc.to_owned(),
                                     kind: CompletionKind::Builtin,
                                     icon: None,
+                                    avatar_path: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2404,6 +2434,7 @@ impl Editor {
                                     doc: format!("local git branch `{br}`"),
                                     kind: CompletionKind::Keyword,
                                     icon: None,
+                                    avatar_path: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2425,6 +2456,7 @@ impl Editor {
                                 doc: desc.to_owned(),
                                 kind: CompletionKind::Subcommand,
                                 icon: Some("rust_dark"),
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2461,6 +2493,7 @@ impl Editor {
                                     doc: entry.desc.as_str().to_owned(),
                                     kind: CompletionKind::Subcommand,
                                     icon: None,
+                                    avatar_path: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2487,6 +2520,7 @@ impl Editor {
                                     doc: s.description.as_str().to_owned(),
                                     kind: CompletionKind::Subcommand,
                                     icon: None,
+                                    avatar_path: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2509,12 +2543,117 @@ impl Editor {
                                 doc: format!("table column `{col_name}` ({col_ty})"),
                                 kind: CompletionKind::Column,
                                 icon: None,
+                                avatar_path: None,
                                 match_indices: idxs,
                             },
                         ));
                     }
                 }
             }
+            // Remote sans-IO repository & package search (`git clone`, `gh repo clone`, `cargo add`,
+            // `bun add`, `npm install`, `brew install`) with live Retina GitHub org/owner avatars!
+            if !handled_specialized
+                && let Some(rctx) = blaze_cli_spec::remote::detect_remote_context(
+                    before,
+                    blaze_own::Alloc::global(),
+                )
+            {
+                handled_specialized = true;
+                let provider_tag = match rctx.provider {
+                    blaze_cli_spec::remote::RemoteProvider::GitHubRepo { .. } => "GitHub",
+                    blaze_cli_spec::remote::RemoteProvider::CratesIo => "crates.io",
+                    blaze_cli_spec::remote::RemoteProvider::NpmRegistry => "npm",
+                    blaze_cli_spec::remote::RemoteProvider::Homebrew => "Homebrew",
+                };
+                match crate::remote_driver::query_remote_completions(
+                    rctx.provider,
+                    rctx.query.as_str(),
+                ) {
+                    crate::remote_driver::RemotePoll::Idle => {
+                        scored.push((
+                            1000,
+                            CompletionItem {
+                                label: rctx.hint.to_owned(),
+                                insert: String::new(),
+                                detail: provider_tag.to_owned(),
+                                doc: format!(
+                                    "Live {provider_tag} search — type a repo or package name (e.g. ripgrep, owner/repo)"
+                                ),
+                                kind: CompletionKind::Hint,
+                                icon: None,
+                                avatar_path: None,
+                                match_indices: Vec::new(),
+                            },
+                        ));
+                    }
+                    crate::remote_driver::RemotePoll::Loading => {
+                        scored.push((
+                            1000,
+                            CompletionItem {
+                                label: format!("Searching {provider_tag} for \"{}\"…", rctx.query.as_str()),
+                                insert: String::new(),
+                                detail: "loading".to_owned(),
+                                doc: format!("Querying {provider_tag} asynchronously (non-blocking)"),
+                                kind: CompletionKind::Hint,
+                                icon: None,
+                                avatar_path: None,
+                                match_indices: Vec::new(),
+                            },
+                        ));
+                    }
+                    crate::remote_driver::RemotePoll::Ready(suggestions) => {
+                        if suggestions.is_empty() {
+                            scored.push((
+                                1000,
+                                CompletionItem {
+                                    label: format!("No {provider_tag} matches for \"{}\"", rctx.query.as_str()),
+                                    insert: String::new(),
+                                    detail: provider_tag.to_owned(),
+                                    doc: "Keep typing or check spelling".to_owned(),
+                                    kind: CompletionKind::Hint,
+                                    icon: None,
+                                    avatar_path: None,
+                                    match_indices: Vec::new(),
+                                },
+                            ));
+                        } else {
+                            for (rank, sug) in suggestions.into_iter().enumerate() {
+                                let (kind, icon) = match sug.provider {
+                                    blaze_cli_spec::remote::RemoteProvider::GitHubRepo { .. } => {
+                                        (CompletionKind::RemoteRepo, None)
+                                    }
+                                    blaze_cli_spec::remote::RemoteProvider::CratesIo => {
+                                        (CompletionKind::RemotePackage, Some("rust_dark"))
+                                    }
+                                    blaze_cli_spec::remote::RemoteProvider::NpmRegistry => {
+                                        (CompletionKind::RemotePackage, Some("javascript_dark"))
+                                    }
+                                    blaze_cli_spec::remote::RemoteProvider::Homebrew => {
+                                        (CompletionKind::RemotePackage, None)
+                                    }
+                                };
+                                let match_indices = fuzzy_match_score(&sug.label, rctx.query.as_str())
+                                    .map(|(_, idxs)| idxs)
+                                    .unwrap_or_default();
+                                scored.push((
+                                    2000 - rank as i32,
+                                    CompletionItem {
+                                        label: sug.label,
+                                        insert: sug.insert,
+                                        detail: sug.detail,
+                                        doc: sug.doc,
+                                        kind,
+                                        icon,
+                                        avatar_path: sug.avatar_path,
+                                        match_indices,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
             // Filesystem completion with macOS folder + IntelliJ New UI dark SVG icons (`cd`/`z` = dirs + cross-host zoxide CRDT).
             if !handled_specialized {
                 if matches!(cmd_base, "cd" | "z") {
@@ -2552,6 +2691,7 @@ impl Editor {
                                 doc,
                                 kind: CompletionKind::Dir,
                                 icon: Some("folder_macos"),
+                                avatar_path: None,
                                 match_indices,
                             },
                         ));
@@ -2586,6 +2726,9 @@ impl Editor {
         let Some(item) = self.completions.get(idx).cloned() else {
             return false;
         };
+        if item.kind == CompletionKind::Hint {
+            return false;
+        }
         self.push_undo(EditOp::Other);
         self.clamp_cursor();
         let start = clamp_char_boundary(&self.text, self.completion_replace_start).min(self.cursor);
@@ -3174,6 +3317,7 @@ fn collect_path_completions(
                 doc,
                 kind: if is_dir { CompletionKind::Dir } else { CompletionKind::File },
                 icon,
+                avatar_path: None,
                 match_indices: idxs,
             },
         ));
@@ -3242,6 +3386,7 @@ fn collect_path_completions(
                     doc,
                     kind: if is_dir { CompletionKind::Dir } else { CompletionKind::File },
                     icon,
+                    avatar_path: None,
                     match_indices: idxs,
                 },
             ));

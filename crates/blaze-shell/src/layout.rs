@@ -5257,7 +5257,9 @@ fn layout_completion_popup(
         let ix = px0 + 13.0;
         let iy = ry + (row_h - icon_s) * 0.5;
 
-        if let Some(svg_name) = item.icon {
+        if let Some(avatar_path) = item.avatar_path.as_deref() {
+            scene.overlay_avatar_image(ix, iy, icon_s, avatar_path.to_owned(), 0);
+        } else if let Some(svg_name) = item.icon {
             scene.overlay_svg_icon(ix, iy, icon_s, svg_name, 0);
         } else {
             // IntelliJ New UI Dark semantic icons: circular/rounded tinted badges with crisp colored borders & glyphs.
@@ -5337,6 +5339,27 @@ fn layout_completion_popup(
                     3.5,
                     theme::BG_TRACK,
                     theme::LINE_STRONG,
+                    theme::INK_3,
+                ),
+                CompletionKind::RemoteRepo => (
+                    "⎇",
+                    icon_s * 0.5,
+                    theme::rgba(0x7c, 0x9c, 0xf5, 0.20),
+                    theme::rgba(0x7c, 0x9c, 0xf5, 0.78),
+                    theme::rgb(0x9b, 0xb8, 0xff),
+                ),
+                CompletionKind::RemotePackage => (
+                    "◈",
+                    4.0,
+                    theme::rgba(0xe5, 0xc0, 0x7b, 0.20),
+                    theme::rgba(0xe5, 0xc0, 0x7b, 0.78),
+                    theme::rgb(0xf0, 0xc8, 0x78),
+                ),
+                CompletionKind::Hint => (
+                    "⌕",
+                    icon_s * 0.5,
+                    theme::rgba(0x88, 0x96, 0xaa, 0.14),
+                    theme::rgba(0x88, 0x96, 0xaa, 0.45),
                     theme::INK_3,
                 ),
             };
@@ -6835,6 +6858,190 @@ pub fn layout_command_palette(
     let fh = "↑↓ navigate  ·  scroll  ·  enter run  ·  esc close";
     let fhw = m.measure(fh, TextFace::UiSmall);
     scene.overlay_ui_small(x1 - pad_x - fhw, fty, fh, theme::INK_4, false, false, 0);
+}
+
+/// Highlight all `Cmd+F` matches across the entire scrollback stream and draw the
+/// floating dark-glass top-right Find Bar (`🔍 query |  3/14  [Aa] [↑] [↓] [×]`).
+///
+/// Returns the currently focused [`crate::find::FindMatch`] (if any) so the caller can
+/// smoothly auto-scroll off-screen matches into view when navigating.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_find_overlay(
+    scene: &mut Scene,
+    fb: &mut crate::find::FindBar,
+    vw: f32,
+    feed_top: f32,
+    feed_bottom: f32,
+    m: CellMetrics,
+    cursor_visible: bool,
+    mouse_pos: Option<[f32; 2]>,
+) -> Option<crate::find::FindMatch> {
+    // 1. Scan all stream text runs (skipping top chrome runs at clip_id == 0).
+    let stream_runs: Vec<crate::view::TextRun> = scene
+        .text_runs
+        .iter()
+        .filter(|r| r.clip_id != 0)
+        .cloned()
+        .collect();
+    let vlines = extract_visual_lines(&stream_runs, m, -1.0e6, 1.0e6);
+    let matches = crate::find::find_matches_in_lines(&vlines, m, &fb.query, fb.case_sensitive);
+    fb.clamp_current(matches.len());
+
+    // 2. Paint amber match highlights (clipped to the visible scrollback viewport).
+    let feed_clip = scene.push_clip(0.0, feed_top, vw, feed_bottom, 0.0);
+    let active_match = if matches.is_empty() {
+        None
+    } else {
+        Some(matches[fb.current])
+    };
+    for (idx, fm) in matches.iter().enumerate() {
+        if fm.y + fm.h < feed_top || fm.y > feed_bottom {
+            continue;
+        }
+        let is_cur = idx == fb.current;
+        if is_cur {
+            scene.over_round_rect(
+                fm.x - 1.5,
+                fm.y - 1.0,
+                fm.x + fm.w + 1.5,
+                fm.y + fm.h + 1.0,
+                3.0,
+                theme::rgba(0xe8, 0x80, 0x3c, 0.56),
+                feed_clip,
+            );
+            scene.overlay_round_rect(
+                fm.x - 1.5,
+                fm.y - 1.0,
+                fm.x + fm.w + 1.5,
+                fm.y + fm.h + 1.0,
+                3.0,
+                theme::rgba(0, 0, 0, 0.0),
+                1.2,
+                theme::rgba(0xff, 0xb8, 0x5c, 0.92),
+                feed_clip,
+            );
+        } else {
+            scene.over_round_rect(
+                fm.x - 1.0,
+                fm.y - 0.5,
+                fm.x + fm.w + 1.0,
+                fm.y + fm.h + 0.5,
+                2.5,
+                theme::rgba(0xe5, 0xb5, 0x67, 0.28),
+                feed_clip,
+            );
+        }
+    }
+
+    // 3. Floating dark-glass Find Bar anchored top-right right under the titlebar.
+    let bar_w = 390.0f32.min((vw - 24.0).max(240.0));
+    let bar_h = (m.ch + 16.0).max(34.0);
+    let x1 = (vw - 14.0).max(bar_w + 12.0);
+    let x0 = x1 - bar_w;
+    let y0 = feed_top + 8.0;
+    let y1 = y0 + bar_h;
+
+    scene.overlay_shadow(x0, y0, x1, y1, 9.0, 14.0, [0.0, 0.0, 0.0, 0.45], 0);
+    scene.overlay_round_rect(
+        x0,
+        y0,
+        x1,
+        y1,
+        9.0,
+        theme::rgba(0x16, 0x18, 0x1d, 0.96),
+        1.0,
+        theme::LINE_STRONG,
+        0,
+    );
+
+    let ty = y0 + (bar_h - m.ch) * 0.5;
+    // Right-side compact controls: [Aa] [↑] [↓] [×]
+    let btn_h = (bar_h - 10.0).max(20.0);
+    let btn_y0 = y0 + (bar_h - btn_h) * 0.5;
+    let btn_y1 = btn_y0 + btn_h;
+    let close_x1 = x1 - 7.0;
+    let close_x0 = close_x1 - 22.0;
+    let next_x1 = close_x0 - 3.0;
+    let next_x0 = next_x1 - 22.0;
+    let prev_x1 = next_x0 - 3.0;
+    let prev_x0 = prev_x1 - 22.0;
+    let case_x1 = prev_x0 - 5.0;
+    let case_x0 = case_x1 - 28.0;
+
+    let draw_btn = |scene: &mut Scene, bx0: f32, bx1: f32, label: &str, active: bool, action: HitAction| {
+        let hovered = mouse_pos.is_some_and(|[mx, my]| mx >= bx0 && mx <= bx1 && my >= btn_y0 && my <= btn_y1);
+        let bg = if active {
+            theme::rgba(0x3a, 0x62, 0xa8, 0.40)
+        } else if hovered {
+            theme::rgba(0xff, 0xff, 0xff, 0.09)
+        } else {
+            theme::rgba(0, 0, 0, 0.0)
+        };
+        let border = if active {
+            theme::rgba(0x64, 0x98, 0xf2, 0.72)
+        } else {
+            theme::rgba(0, 0, 0, 0.0)
+        };
+        if active || hovered {
+            scene.overlay_round_rect(bx0, btn_y0, bx1, btn_y1, 5.0, bg, 1.0, border, 0);
+        }
+        let lw = m.measure(label, TextFace::UiSmall);
+        let lx = bx0 + ((bx1 - bx0) - lw) * 0.5;
+        let col = if active {
+            theme::rgb(0x96, 0xc2, 0xff)
+        } else if hovered {
+            theme::INK_1
+        } else {
+            theme::INK_3
+        };
+        scene.overlay_ui_small(lx, ty, label, col, active, false, 0);
+        scene.push_hit(HitRect::new(bx0, btn_y0, bx1, btn_y1), action);
+    };
+
+    draw_btn(scene, case_x0, case_x1, "Aa", fb.case_sensitive, HitAction::FindToggleCase);
+    draw_btn(scene, prev_x0, prev_x1, "↑", false, HitAction::FindPrev);
+    draw_btn(scene, next_x0, next_x1, "↓", false, HitAction::FindNext);
+    draw_btn(scene, close_x0, close_x1, "×", false, HitAction::FindClose);
+
+    // Match counter (`3/14` or `0/0` in muted coral when query has no matches).
+    let counter = fb.counter_label();
+    let counter_w = if counter.is_empty() {
+        0.0
+    } else {
+        m.measure(&counter, TextFace::UiSmall)
+    };
+    let counter_x = case_x0 - 8.0 - counter_w;
+    if !counter.is_empty() {
+        let ccol = if fb.total_matches == 0 {
+            theme::rgb(0xe0, 0x6c, 0x75)
+        } else {
+            theme::INK_3
+        };
+        scene.overlay_ui_small(counter_x, ty, &counter, ccol, false, false, 0);
+    }
+
+    // Left search glyph + query input text + crisp beam cursor.
+    let qx = x0 + 11.0;
+    scene.overlay_text_run(qx, ty, "⌕", theme::INK_3, false, false, 0);
+    let text_x = qx + m.cw + 7.0;
+    let avail_w = (counter_x - 8.0 - text_x).max(40.0);
+    let max_ch = (avail_w / m.cw).floor().max(4.0) as usize;
+    if fb.query.is_empty() {
+        scene.overlay_ui_small(text_x, ty, "Find in output…  (⌘G next)", theme::INK_4, false, false, 0);
+        if cursor_visible {
+            scene.overlay_round_rect(text_x, ty + 1.0, text_x + 1.5, ty + m.ch - 1.0, 0.5, theme::INK_1, 0.0, [0.0; 4], 0);
+        }
+    } else {
+        let display_q = truncate_chars(&fb.query, max_ch);
+        scene.overlay_text_run(text_x, ty, &display_q, theme::INK_1, false, false, 0);
+        if cursor_visible {
+            let cur_cols = fb.query[..fb.cursor.min(fb.query.len())].chars().count().min(max_ch);
+            let cx = text_x + cur_cols as f32 * m.cw;
+            scene.overlay_round_rect(cx, ty + 1.0, cx + 1.5, ty + m.ch - 1.0, 0.5, theme::INK_1, 0.0, [0.0; 4], 0);
+        }
+    }
+
+    active_match
 }
 
 fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {
