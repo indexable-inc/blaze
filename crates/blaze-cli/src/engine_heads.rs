@@ -2570,17 +2570,19 @@ pub(crate) struct Listings {
     /// the whole `CrateScope` payload: `names`, `items`, and `expansions`), avoiding O(bytes)
     /// BLAKE3 re-hashing of `over.items` and `over.names` in `join_key`.
     scope_keys: blaze_core::SharedMap<blaze_id::CrateItemKey, Key, SharedAlloc<'static>>,
-    made: AtomicU32,
-    read: AtomicU32,
-    parts_made: AtomicU32,
-    parts_read: AtomicU32,
-    damaged: AtomicU32,
-    unstored: AtomicU32,
-    faulted: AtomicU32,
-    twice: AtomicU32,
-    unequal: AtomicU32,
-    asks: AtomicU32,
-    full: AtomicU32,
+    /// Hot atomic counters isolated onto separate 128-byte cache lines ([`CachePadded`], rule 86)
+    /// so 128 workers querying crate listings never false-share `asks` with adjacent fields.
+    made: CachePadded<AtomicU32>,
+    read: CachePadded<AtomicU32>,
+    parts_made: CachePadded<AtomicU32>,
+    parts_read: CachePadded<AtomicU32>,
+    damaged: CachePadded<AtomicU32>,
+    unstored: CachePadded<AtomicU32>,
+    faulted: CachePadded<AtomicU32>,
+    twice: CachePadded<AtomicU32>,
+    unequal: CachePadded<AtomicU32>,
+    asks: CachePadded<AtomicU32>,
+    full: CachePadded<AtomicU32>,
 }
 
 /// A listing record this request holds ([`Listings::held`]): read from the store (named by the
@@ -2616,17 +2618,17 @@ impl Listings {
             held: blaze_core::SharedMap::new_in("engine.heads: each listing record read or made, by key", heap.shared()),
             put: blaze_core::SharedSet::new_in("engine.heads: each listing record put", heap.shared()),
             scope_keys: blaze_core::SharedMap::new_in("engine.heads: each crate scope's CAS key", heap.shared()),
-            made: AtomicU32::new(0),
-            read: AtomicU32::new(0),
-            parts_made: AtomicU32::new(0),
-            parts_read: AtomicU32::new(0),
-            damaged: AtomicU32::new(0),
-            unstored: AtomicU32::new(0),
-            faulted: AtomicU32::new(0),
-            twice: AtomicU32::new(0),
-            unequal: AtomicU32::new(0),
-            asks: AtomicU32::new(0),
-            full: AtomicU32::new(0),
+            made: CachePadded::new(AtomicU32::new(0)),
+            read: CachePadded::new(AtomicU32::new(0)),
+            parts_made: CachePadded::new(AtomicU32::new(0)),
+            parts_read: CachePadded::new(AtomicU32::new(0)),
+            damaged: CachePadded::new(AtomicU32::new(0)),
+            unstored: CachePadded::new(AtomicU32::new(0)),
+            faulted: CachePadded::new(AtomicU32::new(0)),
+            twice: CachePadded::new(AtomicU32::new(0)),
+            unequal: CachePadded::new(AtomicU32::new(0)),
+            asks: CachePadded::new(AtomicU32::new(0)),
+            full: CachePadded::new(AtomicU32::new(0)),
         }
     }
 

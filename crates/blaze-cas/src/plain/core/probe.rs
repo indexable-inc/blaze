@@ -48,6 +48,7 @@ use blaze_keyed::{
 };
 
 use super::super::format::{Entry, LostKind};
+use super::super::par::{Par, Serial};
 use super::super::verified::{Unverified, Verified};
 use super::{GRACE_NS, Got, Phase, Placed, Plain, Plant, Then};
 use crate::Key;
@@ -326,7 +327,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// already moves that row to the end, and a merge replaces a contiguous run of a
     /// namespace's rows in place: `build` and `plan`). Not [`Plain::order_view`]'s order
     /// (largest first), which serves content-keyed records, equal in every row.
-    fn newest_rows(&self, space: Namespace) -> impl Iterator<Item = usize> + '_ {
+    pub(super) fn newest_rows(&self, space: Namespace) -> impl Iterator<Item = usize> + '_ {
         let rows = self.manifest.segments.len();
         let oldest = self.plant() == Plant::PointerOldest;
         (0..rows).map(move |i| if oldest { i } else { rows - 1 - i }).filter(move |&row| {
@@ -443,13 +444,19 @@ impl<A: Allocator + Clone> Plain<A> {
     /// The parked segment `id`'s one full check (its first hit, or [`Plain::map_all`]): proved
     /// into the maps and recorded for the boot by the next flip, or lost by name.
     pub(super) fn check_parked(&mut self, id: u64) {
+        self.check_parked_par(id, &Serial);
+    }
+
+    /// Parallel twin of [`Plain::check_parked`]: verifies large parked segments (`>= 128 KiB`)
+    /// through [`Verified::check_par`] using `par`.
+    pub(super) fn check_parked_par<P: Par>(&mut self, id: u64, par: &P) {
         let Some(unverified) = self.unchecked.remove(&id) else { return };
         let proved = if self.plant() == Plant::TrustsUnchecked {
             // The planted bug: a hit in an unproved run served with no check.
             Ok(self.trust_for_a_plant(unverified))
         } else {
             let mut checks = self.checks.get();
-            let proved = Verified::check(unverified, self.boot, &mut checks);
+            let proved = Verified::check_par(unverified, self.boot, &mut checks, par, &self.alloc);
             self.checks.set(checks);
             self.checked_ids.push(id);
             proved
@@ -475,6 +482,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// map), and before a commit, a compaction or a scrub. `false`: whole already, nothing
     /// asked. Within the grace of the open (see the module's docs).
     pub fn map_all(&mut self, now_ns: u64, effects: &mut Vec<Effect>) -> Result<bool, StoreError> {
+        self.map_all_par(now_ns, &Serial, effects)
+    }
+
+    /// Parallel twin of [`Plain::map_all`]: checks parked earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&mut self, now_ns: u64, par: &P, effects: &mut super::EffectList) -> Result<bool, StoreError> {
         if let Some(why) = &self.broken {
             return Err(why.clone());
         }
@@ -500,7 +512,7 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         if to_map == 0 {
-            self.mapped(Then::All, effects);
+            self.mapped_par(Then::All, par, effects);
             return Ok(true);
         }
         self.reserve_maps(to_map, sealed_to_map, effects);
@@ -515,7 +527,7 @@ impl<A: Allocator + Clone> Plain<A> {
             left = left.saturating_add(1);
         }
         if left == 0 {
-            self.mapped(Then::All, effects);
+            self.mapped_par(Then::All, par, effects);
         } else {
             self.phase = Phase::Mapping { left, then: Then::All };
         }
@@ -524,10 +536,15 @@ impl<A: Allocator + Clone> Plain<A> {
 
     /// [`Then::All`]'s end: every parked row checked, whole from now on.
     pub(super) fn all_mapped(&mut self) {
+        self.all_mapped_par(&Serial);
+    }
+
+    /// Parallel twin of [`Plain::all_mapped`]: checks every parked row through `par`.
+    pub(super) fn all_mapped_par<P: Par>(&mut self, par: &P) {
         let mut parked: Vec<u64, A> = Vec::new_in(self.alloc.clone());
         parked.extend(self.unchecked.keys().copied());
         for id in parked {
-            self.check_parked(id);
+            self.check_parked_par(id, par);
         }
         self.eager = true;
     }

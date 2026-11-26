@@ -36,6 +36,7 @@ use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::SourceTexts;
 use bstd::cx::Cx;
 use bstd::mem::Frame;
+use bstd::sync::CachePadded;
 
 use blaze_scope::expansion_records::{ExpansionRecord, ExpansionRecordsError};
 
@@ -401,9 +402,11 @@ pub(crate) struct ScopeRecords<'r> {
     /// Allocated lazily on first `records()` ask so unused `ScopeRecords` (e.g. `groups` setup
     /// when no dependency crate is opened) perform zero heap allocations.
     slots: OnceLock<blaze_own::Vec<OnceLock<Result<OpenedCrate<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>>,
-    asks: core::sync::atomic::AtomicU64,
-    opened: core::sync::atomic::AtomicU64,
-    bytes: core::sync::atomic::AtomicU64,
+    /// Hot counters isolated onto separate 128-byte cache lines ([`CachePadded`], rule 86) so
+    /// 128 workers opening scope crates never false-share `asks`/`opened`/`bytes` with `slots`.
+    asks: CachePadded<core::sync::atomic::AtomicU64>,
+    opened: CachePadded<core::sync::atomic::AtomicU64>,
+    bytes: CachePadded<core::sync::atomic::AtomicU64>,
 }
 
 /// What a request's [`ScopeRecords`] did: asks of it, records opened (each once) and their bytes.
@@ -422,9 +425,9 @@ impl<'r> ScopeRecords<'r> {
             heap,
             crates,
             slots: OnceLock::new(),
-            asks: core::sync::atomic::AtomicU64::new(0),
-            opened: core::sync::atomic::AtomicU64::new(0),
-            bytes: core::sync::atomic::AtomicU64::new(0),
+            asks: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
+            opened: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
+            bytes: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
         }
     }
 

@@ -1019,8 +1019,112 @@ impl BodyMem {
     }
 }
 
+/// How many largest bodies by recorded reads are tracked for the profile's `bodies memory:` line.
+const LARGEST_BODIES: usize = 3;
+
+/// Total deterministic ordering for ranking a body among the [`LARGEST_BODIES`] largest (rule 25):
+/// higher `recorded` first, ties broken by stable `Name`; for equal `(recorded, name)` (e.g.
+/// multiple slices of one macro entry or a second phase entering the same task), higher
+/// `(scratch, distinct, body_offers, row)` wins so worker merges are associative and commutative
+/// regardless of scheduling order.
+fn largest_better(mem: &BodyMem, name: Name, old_mem: &BodyMem, old_name: Name) -> bool {
+    match (core::cmp::Reverse(mem.recorded), name).cmp(&(core::cmp::Reverse(old_mem.recorded), old_name)) {
+        core::cmp::Ordering::Less => true,
+        core::cmp::Ordering::Greater => false,
+        core::cmp::Ordering::Equal => {
+            (mem.scratch, mem.distinct, mem.body_offers, mem.row)
+                > (old_mem.scratch, old_mem.distinct, old_mem.body_offers, old_mem.row)
+        }
+    }
+}
+
+/// One worker-local candidate among the [`LARGEST_BODIES`] largest bodies by recorded reads.
+/// Borrows `path` and `item` from the phase's outlines and entries so recording a body allocates
+/// nothing and takes no lock.
+#[derive(Clone, Copy)]
+struct LocalLargest<'p, 'i> {
+    name: Option<Name>,
+    path: &'p [u8],
+    item: &'i str,
+    mem: BodyMem,
+}
+
+impl Default for LocalLargest<'_, '_> {
+    fn default() -> Self {
+        Self { name: None, path: &[], item: "", mem: BodyMem::default() }
+    }
+}
+
+/// Per-worker accumulator for [`BodyMemLive`]: tracks count, sums, maxima, and the top
+/// [`LARGEST_BODIES`] largest bodies purely on the worker's stack with zero locking and zero
+/// shared atomic RMWs during the body loop, merged once into [`BodyMemLive`] when the worker exits.
+struct LocalBodyMem<'p, 'i> {
+    bodies: u64,
+    sums: [u64; MEM_PARTS],
+    most: [u64; MEM_PARTS],
+    largest: [LocalLargest<'p, 'i>; LARGEST_BODIES],
+}
+
+impl Default for LocalBodyMem<'_, '_> {
+    fn default() -> Self {
+        Self {
+            bodies: 0,
+            sums: [0; MEM_PARTS],
+            most: [0; MEM_PARTS],
+            largest: core::array::from_fn(|_| LocalLargest::default()),
+        }
+    }
+}
+
+impl<'p, 'i> LocalBodyMem<'p, 'i> {
+    /// Records one completed body into this worker's local totals and top-K table (zero locks).
+    fn record(&mut self, mem: &BodyMem, name: Name, path: &'p [u8], item: &'i str) {
+        self.bodies = self.bodies.saturating_add(1);
+        let parts = mem.parts();
+        for ((&part, sum), most) in parts.iter().zip(self.sums.iter_mut()).zip(self.most.iter_mut()) {
+            *sum = sum.saturating_add(part);
+            *most = (*most).max(part);
+        }
+        let end = self.largest.iter().position(|slot| slot.name == Some(name)).unwrap_or(LARGEST_BODIES - 1);
+        let Some(prefix) = self.largest.get_mut(..=end) else { return };
+        if let Some(at) = prefix.iter().position(|slot| {
+            slot.name.is_none_or(|old| largest_better(mem, name, &slot.mem, old))
+        }) && let Some(window) = prefix.get_mut(at..)
+        {
+            window.rotate_right(1);
+            if let Some(slot) = window.first_mut() {
+                slot.name = Some(name);
+                slot.path = path;
+                slot.item = item;
+                slot.mem = *mem;
+            }
+        }
+    }
+}
+
+/// RAII guard that flushes a worker's [`LocalBodyMem`] into [`BodyMemLive`] exactly once on exit
+/// (normal completion or early stop).
+struct MergeBodyMem<'p, 'i, 'b> {
+    board: &'b BodyMemLive,
+    local: LocalBodyMem<'p, 'i>,
+}
+
+impl<'p, 'i, 'b> MergeBodyMem<'p, 'i, 'b> {
+    fn new(board: &'b BodyMemLive) -> Self {
+        Self { board, local: LocalBodyMem::default() }
+    }
+}
+
+impl Drop for MergeBodyMem<'_, '_, '_> {
+    fn drop(&mut self) {
+        self.board.merge(&self.local);
+    }
+}
+
 /// One of the three largest bodies by recorded reads. The coordinator reserves the label
 /// buffers before any worker runs. Publishing a body and reporting a refusal allocate nothing.
+/// 128-byte aligned so `BodyMemLive::largest` sits on its own cache line (rule 86).
+#[repr(align(128))]
 struct LargestBody {
     name: Option<Name>,
     path: SVec<'static, u8>,
@@ -1028,34 +1132,28 @@ struct LargestBody {
     mem: BodyMem,
 }
 
-/// Every body's [`BodyMem`] summed and at its most, written by the workers as each body ends
-/// (relaxed adds; the counts are a gauge, read whole only after the join or by the status
-/// line, where a body half-counted is one body's difference). Held on the status board
-/// (engine_status.rs `Board::bodies_mem`), so the status, the stop's profile and the end's
-/// profile each say it ([`BodyMemLive::line`]).
+/// Every body's [`BodyMem`] summed and at its most, merged once per worker exit from each
+/// worker's lock-free [`LocalBodyMem`]. Held on the status board (engine_status.rs
+/// `Board::bodies_mem`), so the status, the stop's profile and the end's profile each say it
+/// ([`BodyMemLive::line`]).
 pub(crate) struct BodyMemLive {
-    bodies: core::sync::atomic::AtomicU64,
+    bodies: CachePadded<core::sync::atomic::AtomicU64>,
     sums: [core::sync::atomic::AtomicU64; MEM_PARTS],
     most: [core::sync::atomic::AtomicU64; MEM_PARTS],
-    largest: blaze_core::lock::Lock<Option<[LargestBody; 3]>>,
+    largest: blaze_core::lock::Lock<Option<[LargestBody; LARGEST_BODIES]>>,
 }
 
 impl BodyMemLive {
     pub(crate) const fn new() -> BodyMemLive {
         BodyMemLive {
-            bodies: core::sync::atomic::AtomicU64::new(0),
+            bodies: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
             sums: [const { core::sync::atomic::AtomicU64::new(0) }; MEM_PARTS],
             most: [const { core::sync::atomic::AtomicU64::new(0) }; MEM_PARTS],
             largest: blaze_core::lock::Lock::new("engine.bodies.largest", None),
         }
     }
 
-    fn prepare(&self, ones: &[One<'_>], outlined: &[Outlined<'_>], alloc: SharedAlloc<'static>) -> Result<(), EngineCheckError> {
-        if ones.is_empty() {
-            return Ok(());
-        }
-        let path = ones.iter().map(|one| one.path(outlined).len()).max().unwrap_or(0);
-        let item = ones.iter().map(|one| one.label.len()).max().unwrap_or(0);
+    fn prepare_with_caps(&self, path: usize, item: usize, alloc: SharedAlloc<'static>) -> Result<(), EngineCheckError> {
         let mut largest = self.largest.lock();
         let slots = largest.get_or_insert_with(|| core::array::from_fn(|_| LargestBody {
             name: None,
@@ -1072,31 +1170,59 @@ impl BodyMemLive {
         Ok(())
     }
 
-    /// One body ended with `mem`.
-    fn add(&self, mem: &BodyMem, name: Name, path: &[u8], item: &str) {
-        use core::sync::atomic::Ordering::Relaxed;
-        self.bodies.fetch_add(1, Relaxed);
-        for (at, part) in mem.parts().iter().enumerate() {
-            self.sums[at].fetch_add(*part, Relaxed);
-            self.most[at].fetch_max(*part, Relaxed);
+    fn prepare(&self, ones: &[One<'_>], outlined: &[Outlined<'_>], alloc: SharedAlloc<'static>) -> Result<(), EngineCheckError> {
+        if ones.is_empty() {
+            return Ok(());
         }
+        let path = ones.iter().map(|one| one.path(outlined).len()).max().unwrap_or(0);
+        let item = ones.iter().map(|one| one.label.len()).max().unwrap_or(0);
+        self.prepare_with_caps(path, item, alloc)
+    }
+
+    fn insert_largest(slots: &mut [LargestBody; LARGEST_BODIES], mem: &BodyMem, name: Name, path: &[u8], item: &str) {
         // Equal counts are ordered by stable task name, independent of worker scheduling.
-        // A second phase entering the same task can improve its rank but never lists it twice.
+        // A second phase or macro slice entering the same task can improve its rank but never lists it twice.
+        let end = slots.iter().position(|slot| slot.name == Some(name)).unwrap_or(LARGEST_BODIES - 1);
+        let Some(prefix) = slots.get_mut(..=end) else { return };
+        if let Some(at) = prefix.iter().position(|slot| {
+            slot.name.is_none_or(|old| largest_better(mem, name, &slot.mem, old))
+        }) && let Some(window) = prefix.get_mut(at..)
+        {
+            window.rotate_right(1);
+            if let Some(slot) = window.first_mut() {
+                slot.name = Some(name);
+                slot.mem = *mem;
+                slot.path.clear();
+                slot.path.extend_from_slice(path);
+                slot.item.clear();
+                slot.item.push_str(item);
+            }
+        }
+    }
+
+    /// Merges one worker's accumulated [`LocalBodyMem`] into the shared totals and top-K slots
+    /// once on worker exit (zero locking during the body loop).
+    fn merge(&self, local: &LocalBodyMem<'_, '_>) {
+        if local.bodies == 0 {
+            return;
+        }
+        use core::sync::atomic::Ordering::Relaxed;
+        self.bodies.fetch_add(local.bodies, Relaxed);
+        for ((&sum, &most), (dst_sum, dst_most)) in local.sums.iter().zip(local.most.iter()).zip(self.sums.iter().zip(self.most.iter())) {
+            if sum != 0 {
+                dst_sum.fetch_add(sum, Relaxed);
+            }
+            if most != 0 {
+                dst_most.fetch_max(most, Relaxed);
+            }
+        }
         let mut largest = self.largest.lock();
-        let slots = largest.as_mut().expect("the Bodies phase prepares its status slots before running bodies");
-        let end = slots.iter().position(|slot| slot.name == Some(name)).unwrap_or(slots.len() - 1);
-        let rank = (core::cmp::Reverse(mem.recorded), name);
-        if let Some(at) = slots[..=end].iter().position(|slot| {
-            slot.name.is_none_or(|old| rank < (core::cmp::Reverse(slot.mem.recorded), old))
-        }) {
-            slots[at..=end].rotate_right(1);
-            let slot = &mut slots[at];
-            slot.name = Some(name);
-            slot.mem = *mem;
-            slot.path.clear();
-            slot.path.extend_from_slice(path);
-            slot.item.clear();
-            slot.item.push_str(item);
+        let Some(slots) = largest.as_mut() else {
+            return;
+        };
+        for candidate in local.largest.iter() {
+            let Some(name) = candidate.name else { break };
+            Self::insert_largest(slots, &candidate.mem, name, candidate.path, candidate.item);
         }
     }
 
@@ -7280,10 +7406,6 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
 }
 
 impl<R: ?Sized + CellDigests> Shared<'_, '_, '_, '_, R> {
-    fn record_memory(&self, one: &One<'_>, mem: &BodyMem) {
-        self.board.bodies_mem.add(mem, one.task.planned.name, one.path(self.outlined), one.label);
-    }
-
     fn missing_data(&self, label: &str, path: &str, id: CellId) -> Option<&'static str> {
         (self.reads.row_failed(id.of) != Some(false)).then(|| {
             leak(self.heap.alloc(), format_args!("body `{label}` read `{path}` without an available FileItems record"))
@@ -7567,23 +7689,25 @@ impl<'d, 'a, 'b, 'f> StretchDriver<'d, 'a, 'b, 'f> {
         }
     }
 
-    fn refuse_current<R: ?Sized + CellDigests>(
+    fn refuse_current<'s, R: ?Sized + CellDigests>(
         &mut self,
         why: &'static str,
-        scope: Option<(&Shared<'_, 'a, '_, '_, R>, &Group<'_, '_>)>,
+        scope: Option<(&Shared<'s, 'a, 'f, '_, R>, &Group<'_, '_>)>,
+        local_mem: &mut LocalBodyMem<'s, 'f>,
         clock: &Clock,
         alloc: SharedAlloc<'a>,
     ) -> usize {
+        let scoped = scope.map(|(shared, group)| (shared, group, local_mem));
         match self {
             StretchDriver::Fixed { run, at, out, ran, run_out } => {
-                let took = refuse::<R>(run, why, scope, out, ran, run_out, alloc);
+                let took = refuse::<R>(run, why, scoped, out, ran, run_out, alloc);
                 *at = took;
                 took
             }
             StretchDriver::Stealing { runs, current, worker_items, .. } => {
                 if let Some((mut item, offset)) = current.take() {
                     if let Some(rest) = runs.get(item.at).and_then(|r| r.get(offset..)) {
-                        let _ = refuse::<R>(rest, why, scope, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+                        let _ = refuse::<R>(rest, why, scoped, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
                     }
                     item.span.1 = crate::engine_times::ns(clock.now().since_start());
                     worker_items.push(item);
@@ -7700,9 +7824,9 @@ impl<'d, 'a, 'b, 'f> StretchDriver<'d, 'a, 'b, 'f> {
 /// consecutive stolen items of the same member group (opening a fresh stretch only when the group
 /// changes, `frame.used() > STRETCH_FULL`, or an unwind poisons the stretch).
 #[expect(clippy::too_many_arguments, reason = "a stealing worker's edge: each argument one handle of it")]
-fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
+fn run_worker_stealing<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(
     cx: &Cx,
-    shared: &Shared<'_, 'a, '_, '_, R>,
+    shared: &Shared<'s, 'a, 'f, '_, R>,
     runs: &[&[One<'f>]],
     dispatch: &[usize],
     cursor: &CachePadded<AtomicUsize>,
@@ -7756,6 +7880,7 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
             worker.items.push(item);
         }
     };
+    let mut body_mem = MergeBodyMem::new(&shared.board.bodies_mem);
     let mut pending: Option<Pending<'a, 'b, 'f>> = None;
     loop {
         let next = match pending.take() {
@@ -7811,7 +7936,7 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
         };
         let _ = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
             let stretch: &Frame = &stretch;
-            run_stretch_with(cx, shared, &mut driver, stretch, &mut scratch, freeze_alloc, freeze_reset, clock, &mut worker.tally, alloc, at_phase)
+            run_stretch_with(cx, shared, &mut driver, stretch, &mut scratch, freeze_alloc, freeze_reset, clock, &mut worker.tally, &mut body_mem.local, alloc, at_phase)
         });
         worker.frames.stretch_committed_most = worker.frames.stretch_committed_most.max(u64::try_from(stretch.committed()).unwrap_or(u64::MAX));
         if let StretchDriver::Stealing { pending: carry, .. } = driver {
@@ -7848,9 +7973,9 @@ fn should_run_inline(runs: &[&[One<'_>]], has_wholes: bool) -> bool {
 /// bodies checked in stretches, each over a frame reset between stretches ([`STRETCH_FULL`]), so
 /// small inline multi-run phases reuse one set of frames instead of allocating per run.
 #[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
-fn run_bodies_with_frames<'a, 'b, 'f, R: ?Sized + CellDigests>(
+fn run_bodies_with_frames<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(
     cx: &Cx,
-    shared: &Shared<'_, 'a, '_, '_, R>,
+    shared: &Shared<'s, 'a, 'f, '_, R>,
     run: &[One<'f>],
     clock: &Clock,
     scratch: &mut Frame,
@@ -7866,6 +7991,7 @@ fn run_bodies_with_frames<'a, 'b, 'f, R: ?Sized + CellDigests>(
 ) {
     #[cfg(test)]
     crate::engine_check::stack_probe::at("run_bodies");
+    let mut body_mem = MergeBodyMem::new(&shared.board.bodies_mem);
     // Filing a refusal must work even when the allocation for the successful row failed.
     // Each body consumes at most one slot in each of these four lists.
     out.done.reserve_exact(run.len());
@@ -7891,7 +8017,7 @@ fn run_bodies_with_frames<'a, 'b, 'f, R: ?Sized + CellDigests>(
         let mut driver = StretchDriver::Fixed { run: rest, at: 0, out, ran, run_out };
         let took = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
             let stretch: &Frame = &*stretch;
-            run_stretch_with(cx, shared, &mut driver, stretch, scratch, freeze_alloc, freeze_reset, clock, tally, alloc, at_phase)
+            run_stretch_with(cx, shared, &mut driver, stretch, scratch, freeze_alloc, freeze_reset, clock, tally, &mut body_mem.local, alloc, at_phase)
         });
         run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(u64::try_from(stretch.committed()).unwrap_or(u64::MAX));
         at += took.max(1);
@@ -7902,7 +8028,7 @@ fn run_bodies_with_frames<'a, 'b, 'f, R: ?Sized + CellDigests>(
 /// One run: its bodies checked in stretches, each over a frame of its own that ends with it
 /// ([`STRETCH_FULL`]), so no run uses up a frame however many bodies it holds.
 #[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
-fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_, R>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut SVec<'b, Ran<'f>>, run_out: &mut RunOut<'b>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>, at_phase: SharedAlloc<'b>) {
+fn run_bodies<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'s, 'a, 'f, '_, R>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut SVec<'b, Ran<'f>>, run_out: &mut RunOut<'b>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>, at_phase: SharedAlloc<'b>) {
     // The bodies' scratch: one reservation a run, reset as each body ends (rule 11).
     // (Its own tag, as the stretch's below: the status's `memory by tag` line names each.)
     let caps = WorkerFrameCaps::for_workers(usize::try_from(cx.workers()).unwrap_or(1).max(1));
@@ -7922,21 +8048,33 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
 }
 
 /// Every body of `rest` refused for one reason, each named (rule 3): how many it took (all).
-fn refuse<'a, 'b, 'f, R: ?Sized + CellDigests>(rest: &[One<'f>], why: &'static str, scope: Option<(&Shared<'_, 'a, '_, '_, R>, &Group<'_, '_>)>, out: &mut Buffer<'a>, ran: &mut SVec<'b, Ran<'f>>, run_out: &mut RunOut<'b>, alloc: SharedAlloc<'a>) -> usize {
-    for one in rest {
-        if let Some((shared, group)) = scope {
+fn refuse<'s, 'a, 'b, 'f, R: ?Sized + CellDigests>(
+    rest: &[One<'f>],
+    why: &'static str,
+    scope: Option<(&Shared<'s, 'a, 'f, '_, R>, &Group<'_, '_>, &mut LocalBodyMem<'s, 'f>)>,
+    out: &mut Buffer<'a>,
+    ran: &mut SVec<'b, Ran<'f>>,
+    run_out: &mut RunOut<'b>,
+    alloc: SharedAlloc<'a>,
+) -> usize {
+    if let Some((shared, group, local_mem)) = scope {
+        for one in rest {
             let done = shared.refused_scope(one, group, core::iter::empty(), alloc);
-            let mut mem = BodyMem { scope: group.crates.len() as u64, ..BodyMem::default() };
+            let mut mem = BodyMem { scope: u64::try_from(group.crates.len()).unwrap_or(u64::MAX), ..BodyMem::default() };
             mem.count_scope(&done);
             mem.count_done(&done);
-            shared.record_memory(one, &mem);
+            local_mem.record(&mem, one.task.planned.name, one.path(shared.outlined), one.label);
             out.push(done, Stands::ByReads);
-        } else {
+            run_out.notes.push((ran.len(), Said::Refused(why), None));
+            ran.push(Ran::without_check(one.task.planned.name, one.label, one.file));
+        }
+    } else {
+        for one in rest {
             let (done, stands) = Outcome::owed(&one.task, alloc);
             out.push(done, stands);
+            run_out.notes.push((ran.len(), Said::Refused(why), None));
+            ran.push(Ran::without_check(one.task.planned.name, one.label, one.file));
         }
-        run_out.notes.push((ran.len(), Said::Refused(why), None));
-        ran.push(Ran::without_check(one.task.planned.name, one.label, one.file));
     }
     rest.len()
 }
@@ -8245,9 +8383,9 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, '_, '_, 'n, '_> {
 /// `driver` checked over one view until `driver` stops (group change, [`STRETCH_FULL`], stop
 /// signal, or unwind). Returns how many bodies it checked (or refused for a fixed slice).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
-fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
+fn run_stretch_with<'d, 's, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     cx: &Cx,
-    shared: &Shared<'_, 'a, '_, '_, R>,
+    shared: &Shared<'s, 'a, 'f, '_, R>,
     driver: &mut StretchDriver<'d, 'a, 'b, 'f>,
     frame: &Frame,
     scratch: &mut Frame,
@@ -8255,6 +8393,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
     clock: &Clock,
     tally: &mut crate::engine_seeds::SeedTally,
+    local_mem: &mut LocalBodyMem<'s, 'f>,
     alloc: SharedAlloc<'a>,
     at_phase: SharedAlloc<'b>,
 ) -> usize {
@@ -8262,7 +8401,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     crate::engine_check::stack_probe::at("run_stretch");
     let Some(group_id) = driver.group_id() else { return 0 };
     let Some(group) = usize::try_from(group_id).ok().and_then(|idx| shared.groups.get(idx)) else {
-        return driver.refuse_current::<R>("a body's member group is gone", None, clock, alloc);
+        return driver.refuse_current::<R>("a body's member group is gone", None, local_mem, clock, alloc);
     };
     // The setup's marks (D168 (2) (e)): what the stretch does before its first body begins.
     let set_began = clock.now();
@@ -8287,7 +8426,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     let scope = Some((shared, group));
     let env = match env_in(group.env, frame) {
         Ok(env) => env,
-        Err(error) => return driver.refuse_current(leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, clock, alloc),
+        Err(error) => return driver.refuse_current(leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, local_mem, clock, alloc),
     };
     // Its scope crates past the member opened by need, at their first question, through the
     // request's memo (`shared.by_need`, piece C (a)); the oracle arm's all opened at the setup.
@@ -8376,7 +8515,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
         Ok(GroupFrontState::Ready { front, .. }) => Some(front),
         Ok(GroupFrontState::None) => None,
         Ok(GroupFrontState::Error(why)) => {
-            return driver.refuse_current::<R>(*why, scope, clock, alloc);
+            return driver.refuse_current::<R>(*why, scope, local_mem, clock, alloc);
         }
         Err(_) => None,
     };
@@ -8462,6 +8601,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
                 return driver.refuse_current::<R>(
                     "the heads frame of its run's stretch could not be reserved (engine_bodies.rs `HEADS_STRETCH_FRAME`)",
                     scope,
+                    local_mem,
                     clock,
                     alloc,
                 );
@@ -8512,7 +8652,12 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
         let at_start = frame.used();
         let _body = cx.span("engine: one body");
         let began = clock.now();
-        let running = shared.board.show(Stage::Bodies, crate::engine_status::Label::of(one.label), at_start as u64, shared.board.now(clock));
+        let running = shared.board.show_lazy(
+            Stage::Bodies,
+            || crate::engine_status::Label::of(one.label),
+            u64::try_from(at_start).unwrap_or(u64::MAX),
+            shared.board.now(clock),
+        );
         let name = one.task.planned.name;
         let (made_before, hits_before) = ids.counts();
         let mut body_tally = crate::engine_seeds::SeedTally::default();
@@ -9257,7 +9402,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
         let bytes = frame.used().saturating_sub(at_start) as u64;
         ran.push(Ran { name, label: one.label, ns, bytes, chain: one.place.chain, note: None, found: FindingRange::default(), file: one.file, stretch });
         out.push(result.done, result.stands);
-        shared.record_memory(one, &mem);
+        local_mem.record(&mem, one.task.planned.name, one.path(shared.outlined), one.label);
         running.end(shared.board.now(clock));
         if driver.after_body(stopped, clock) {
             break;
@@ -9971,5 +10116,91 @@ mod worker_frame_caps_tests {
         stage.members_from(Some(k4), 44);
         let v4 = stage.open_members(&cx, &mut store, alloc).expect("open k4").expect("present").expect("valid");
         assert_eq!(v4.len(), 1);
+    }
+
+    #[test]
+    fn local_body_mem_merges_deterministically_across_orders_ties_and_empty_workers() {
+        let make_name = |byte: u8| Name::new(Kind::BodyCheck, ContentId([byte; 32]));
+        let make_mem = |recorded: u64, scratch: u64, row: u64| BodyMem {
+            row,
+            row_floor: row,
+            recorded,
+            distinct: recorded,
+            placed_all: true,
+            body_offers: recorded.saturating_mul(2),
+            before: recorded,
+            after: recorded,
+            scratch,
+            ..BodyMem::default()
+        };
+
+        // Worker 0: empty (must be a clean no-op).
+        let w0 = LocalBodyMem::default();
+
+        // Worker 1: 4 bodies (evicts its own 4th body, includes a tie on `recorded = 500`
+        // and slice 1 of duplicate name `make_name(2)`).
+        let mut w1 = LocalBodyMem::default();
+        w1.record(&make_mem(100, 1000, 128), make_name(9), b"src/low.rs", "low");
+        w1.record(&make_mem(500, 4000, 256), make_name(5), b"src/tie_hi.rs", "tie_hi");
+        w1.record(&make_mem(500, 2000, 256), make_name(3), b"src/tie_lo.rs", "tie_lo");
+        w1.record(&make_mem(800, 3000, 512), make_name(2), b"src/dup.rs", "dup_item");
+
+        // Worker 2: higher `recorded = 900`, tied `recorded = 500` with smallest `Name(1)`,
+        // and slice 2 of duplicate name `make_name(2)` with same `recorded = 800` but larger `scratch = 7000`.
+        let mut w2 = LocalBodyMem::default();
+        w2.record(&make_mem(900, 6000, 1024), make_name(8), b"src/top.rs", "top_item");
+        w2.record(&make_mem(500, 1500, 256), make_name(1), b"src/tie_smallest.rs", "tie_smallest");
+        w2.record(&make_mem(800, 7000, 512), make_name(2), b"src/dup.rs", "dup_item");
+
+        // Worker 3: smaller bodies that should not enter top-3, plus an even higher recorded count
+        // for an existing duplicate name? No, keep separate to check sum/max aggregation.
+        let mut w3 = LocalBodyMem::default();
+        w3.record(&make_mem(50, 500, 64), make_name(10), b"src/tiny.rs", "tiny");
+
+        let heap = blaze_own::testing::heap();
+        let run_order = |order: [&LocalBodyMem<'_, '_>; 4]| -> blaze_own::FixedString<2048> {
+            let live = BodyMemLive::new();
+            live.prepare_with_caps(64, 64, heap.shared()).expect("prepare largest slots");
+            for local in order {
+                live.merge(local);
+            }
+            assert_eq!(live.bodies(), 8, "all bodies counted across non-empty workers");
+            let mut out = blaze_own::FixedString::<2048>::new();
+            live.line(&mut out).expect("line fits");
+            out
+        };
+
+        let fwd = run_order([&w0, &w1, &w2, &w3]);
+        let rev = run_order([&w3, &w2, &w1, &w0]);
+        let rot = run_order([&w2, &w0, &w3, &w1]);
+
+        assert_eq!(fwd.as_str(), rev.as_str(), "merge must be order-independent (fwd vs rev)");
+        assert_eq!(fwd.as_str(), rot.as_str(), "merge must be order-independent (fwd vs rot)");
+
+        let line = fwd.as_str();
+        assert!(line.contains("bodies memory: 8 bodies"), "{line}");
+        assert!(line.contains("· #1 `src/top.rs` item `top_item`: 900 reads recorded"), "{line}");
+        assert!(
+            line.contains("· #2 `src/dup.rs` item `dup_item`: 800 reads recorded, 800 distinct ids, 7000 scratch bytes"),
+            "duplicate Name must appear once with deterministic max-scratch winner:\n{line}"
+        );
+        assert!(
+            line.contains("· #3 `src/tie_smallest.rs` item `tie_smallest`: 500 reads recorded"),
+            "equal recorded counts must tie-break by smallest stable Name:\n{line}"
+        );
+        assert_eq!(line.matches("dup_item").count(), 1, "duplicate Name never listed twice:\n{line}");
+
+        // Control: MergeBodyMem RAII guard flushes once on drop.
+        let guard_live = BodyMemLive::new();
+        guard_live.prepare_with_caps(32, 32, heap.shared()).expect("prepare");
+        {
+            let mut guard = MergeBodyMem::new(&guard_live);
+            guard.local.record(&make_mem(42, 128, 64), make_name(4), b"src/g.rs", "guarded");
+            assert_eq!(guard_live.bodies(), 0, "not flushed until worker exits");
+        }
+        assert_eq!(guard_live.bodies(), 1, "flushed once on guard drop");
+        let mut gline = blaze_own::FixedString::<1024>::new();
+        guard_live.line(&mut gline).expect("fits");
+        assert!(gline.as_str().contains("· #1 `src/g.rs` item `guarded`: 42 reads recorded"), "{}", gline.as_str());
     }
 }

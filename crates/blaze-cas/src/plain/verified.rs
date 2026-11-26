@@ -34,7 +34,9 @@ use blaze_core::{FileName, Mapping};
 use blaze_own::Share;
 use blaze_keyed::store::{ENTRY, Generation, SegmentId, SegmentProof, StoreError};
 
+use super::bloom::BLOOM_ALLOC;
 use super::format::{self, Entry, Segment, record_crc};
+use super::par::{Par, Serial};
 use crate::{Corrupt, Key};
 
 /// What a read returns as its segment's proof ([`blaze_keyed::store::SegmentProof`]): the
@@ -160,13 +162,26 @@ impl Verified {
     /// every byte, and that it is the segment its row names. Consumes it: a proved segment is
     /// never checked again. `Err` names what failed, with the segment and file.
     pub(crate) fn check(it: Unverified, boot: Boot, checks: &mut Checks) -> Result<Verified, (Segment, FileName, StoreError)> {
+        Verified::check_par(it, boot, checks, &Serial, BLOOM_ALLOC)
+    }
+
+    /// Parallel twin of [`Verified::check`]: verifies large segments (`>= 128 KiB`) via
+    /// [`format::check_segment_par`] using `par`, delegating to serial [`format::check_segment`]
+    /// below the threshold or when `par.workers() <= 1`.
+    pub(crate) fn check_par<P: Par, B: Allocator + Copy>(
+        it: Unverified,
+        boot: Boot,
+        checks: &mut Checks,
+        par: &P,
+        alloc: B,
+    ) -> Result<Verified, (Segment, FileName, StoreError)> {
         let len = it.len();
         let segment = SegmentId(it.seg.digest);
         if len != it.seg.file_len() {
             return Err((it.seg, it.file, StoreError::Layout { segment, what: "its file's length is not the one its generation names", at: len }));
         }
         checks.full += 1;
-        let checked = format::check_segment(it.map.bytes()).and_then(|described| {
+        let checked = format::check_segment_par(it.map.bytes(), par, alloc).and_then(|described| {
             (described.digest == it.seg.digest && described.namespace == it.seg.namespace && described.count == it.seg.count)
                 .then_some(())
                 .ok_or(StoreError::Layout { segment, what: "it is a whole segment, but not the one its generation names", at: 0 })

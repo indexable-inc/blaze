@@ -75,8 +75,8 @@ const BORROWS_COUNT: &str = "type-checked whole had the move and borrow check re
 /// The first line the old checker printed (main.rs `CHECK_OLD`, gone 2026-11-19): no command
 /// prints it now.
 const OLD_FIRST: &str = "note: check-old: the OLD checker";
-/// The usage line of a word that is no command (main.rs `command`'s last arm).
-const NO_COMMAND: &str = "the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain";
+/// The usage line of a word that is no command (rendered from `blaze_cli_spec::blaze_app::BLAZE_APP`).
+const NO_COMMAND: &str = "commands: check, build, run, test";
 
 fn write(path: &Path, text: &str) {
     if let Some(dir) = path.parent() {

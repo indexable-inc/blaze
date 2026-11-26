@@ -223,7 +223,7 @@ pub(crate) fn command(
 ) -> Result<Status, CliError> {
     let mut packages = blaze_own::Vec::new_in(cx.frame());
     // `-p` picks from the engine's unit graph for `run` and `test` alike (R3).
-    let flags = crate::parse_flags(args, |name| packages.push(name))?;
+    let flags = crate::parse_flags_in(args, cx.frame(), |name| packages.push(name))?;
     if flags.fix.is_some() {
         return Err(CliError::Usage("--fix is `blaze check`'s"));
     }
@@ -231,7 +231,7 @@ pub(crate) fn command(
         return Err(CliError::Usage("--open is `blaze run`'s"));
     }
     if flags.output.is_some() {
-        return Err(CliError::Usage("-o / --output is `blaze export`'s"));
+        return Err(CliError::Usage("-o / --output is `blaze build`'s"));
     }
     let select = match command {
         Command::Test => run_package::Select { test_packages: packages.as_slice(), bin: flags.select.bin, ..run_package::Select::NONE },
@@ -1036,7 +1036,7 @@ fn native_image_for_cached<'r>(
     Ok(image)
 }
 
-/// Builds `work::Facts` for `run`, `test`, and `export` from `standing` (the one home for
+/// Builds `work::Facts` for `run`, `test`, and `build` from `standing` (the one home for
 /// `Facts` on the start path, rule 30).
 pub(crate) fn start_facts<'f>(
     standing: &Standing<'f, '_>,

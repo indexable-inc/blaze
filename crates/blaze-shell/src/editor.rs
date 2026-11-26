@@ -547,7 +547,7 @@ const DEFAULT_ABBREVIATIONS: &[(&str, &str)] = &[
     ("bc", "blaze check"),
     ("bt", "blaze test"),
     ("br", "blaze run"),
-    ("be", "blaze export"),
+    ("bb", "blaze build"),
     // Git
     ("gs", "git status"),
     ("gd", "git diff"),
@@ -2015,7 +2015,7 @@ impl Editor {
             "blaze check",
             "blaze test",
             "blaze run",
-            "blaze export",
+            "blaze build",
             "agent \"\"",
             "ls -l | sort-by size -r",
             "ps | sort-by cpu -r | first 10",
@@ -2445,15 +2445,18 @@ impl Editor {
                     }
                 }
             } else if cmd_base == "blaze" && subcmd.is_none() {
-                for &(sub, desc) in BLAZE_SUBCOMMANDS {
-                    if let Some((score, idxs)) = fuzzy_match_score(sub, prefix) {
+                for cmd in blaze_cli_spec::blaze_app::BLAZE_APP.commands {
+                    if cmd.hidden {
+                        continue;
+                    }
+                    if let Some((score, idxs)) = fuzzy_match_score(cmd.name, prefix) {
                         scored.push((
                             score + 65,
                             CompletionItem {
-                                label: sub.to_owned(),
-                                insert: sub.to_owned(),
+                                label: cmd.name.to_owned(),
+                                insert: cmd.name.to_owned(),
                                 detail: "blaze".to_owned(),
-                                doc: desc.to_owned(),
+                                doc: cmd.about.to_owned(),
                                 kind: CompletionKind::Subcommand,
                                 icon: Some("rust_dark"),
                                 avatar_path: None,
@@ -3123,24 +3126,6 @@ const GIT_SUBCOMMANDS: &[(&str, &str)] = &[
     ("show", "Show various types of objects"),
     ("cherry-pick", "Apply changes introduced by existing commits"),
     ("worktree", "Manage multiple working trees"),
-];
-
-const BLAZE_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("check", "Check and lint a workspace incrementally"),
-    ("run", "Compile what is reached and run a binary"),
-    ("test", "Run workspace tests incrementally"),
-    ("export", "Export a standalone PGO-optimized native binary"),
-    ("ci", "Run CI checks with structured reporting"),
-    ("inspect", "Inspect lowered MIR/types for a file or function"),
-    ("why", "Explain why a file or item was rechecked"),
-    ("explain", "Explain a diagnostic or lint code"),
-    ("clean", "Remove checkout state (and --store for home store)"),
-    ("gc", "Compact store and evict stale records"),
-    ("peer", "Serve crate records to LAN peers"),
-    ("toolchain", "Print the pinned Rust toolchain"),
-    ("warm-toolchain", "Pre-warm toolchain records into the store"),
-    ("version", "Print blaze and toolchain versions"),
-    ("help", "Show blaze CLI help"),
 ];
 
 /// Load SSH hosts via our sans-IO `blaze-ssh` parser (`~/.ssh/config` + `Include`s + `known_hosts`).

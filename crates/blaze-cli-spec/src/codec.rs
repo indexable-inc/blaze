@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn cache_round_trips_no_std() {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let spec = manual_spec_in("claude", None, alloc).expect("claude spec");
         let encoded = encode_cache_in(&spec, 42, 999, alloc);
         let decoded = decode_cache_in("claude", encoded.as_str(), 42, 999, alloc).expect("decode");

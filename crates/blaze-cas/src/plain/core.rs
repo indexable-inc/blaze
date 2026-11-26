@@ -39,8 +39,12 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as EffectTag};
 /// Effect queue passed into `Plain` state transitions.
-type EffectList = Vec<Effect>;
+pub(super) type EffectList = Vec<Effect>;
 type EffectBuf<E> = Vec<Effect, E>;
+type LaidVec<A> = Vec<Laid<A>, A>;
+type PieceVec<A> = Vec<(u64, Vec<u8>), A>;
+type ReusedVec<A> = Vec<(u64, ContentId), A>;
+type EntryVec<'a, A> = Vec<Entry, &'a A>;
 use blaze_hash::{BuildKeyHasher, Map, MapOpts, hash_map::Entry as HashEntry};
 use blaze_ids::{ContentId, crc32c};
 use blaze_mem::Kept;
@@ -55,6 +59,7 @@ use super::format::{
     self, Entry, FORMAT, HEAD_LEN, HeadRead, Lease, LostKind, LostMark, Manifest, NEVER, OFFSET_MOST, Retired,
     Root, SLOT_AT, Segment, Slot, aligned, record_crc,
 };
+use super::par::{Par, Serial};
 use super::verified::{Boot, Checks, Unverified, Verified};
 use super::lent::two_values;
 use crate::{Corrupt, Key};
@@ -62,6 +67,54 @@ use crate::{Corrupt, Key};
 /// The lazy open's reads: [`Plain::find`], [`Plain::map_all`], the probe order.
 mod probe;
 pub use probe::{Found, Probe, Probes};
+
+/// Minimum unique candidate entries in one commit namespace before parallelizing `TwoValues`
+/// verification probes against prior committed segments via [`Par::for_each_mut_chunks`].
+const PAR_TWO_VALUES_MIN_KEYS: usize = 32;
+
+/// Bits per key for segment Bloom filters (matches `bloom::BITS_PER_KEY`).
+const SEGMENT_BLOOM_BITS_PER_KEY: u64 = 12;
+
+/// Minimum keys in a Bloom filter before using parallel [`BloomBuilder::build_par_from`].
+const PAR_BLOOM_MIN_KEYS: usize = 4096;
+
+/// Outcome of checking one unique candidate commit entry against prior committed segments.
+#[derive(Clone, Copy)]
+enum CommittedCheck {
+    /// Not yet committed (or a replaceable pointer); lay out into the new segment.
+    Keep,
+    /// Already committed with identical tag, length, and CRC; omit from the new segment.
+    SkipSame,
+    /// Clashes with a committed record at `(map_idx, kept_entry)`.
+    Conflict(usize, Entry),
+}
+
+/// Builds a framed segment Bloom filter from a sorted `ENTRY`-byte `run`, using
+/// [`BloomBuilder::build_par_from`] when large and `par.workers() > 1`.
+fn bloom_from_run_par<P: Par, B: Allocator + Copy>(
+    run: &[u8],
+    digest: &ContentId,
+    par: &P,
+    alloc: B,
+) -> blaze_own::Vec<u8, Kept> {
+    let count = run.len() / ENTRY;
+    if par.workers() <= 1 || count < PAR_BLOOM_MIN_KEYS {
+        return BloomBuilder::from_run(run, digest);
+    }
+    BloomBuilder::build_par_from(
+        count,
+        |i| {
+            let at = i.saturating_mul(ENTRY);
+            run.get(at..at.saturating_add(32))
+                .and_then(|slice| <[u8; 32]>::try_from(slice).ok())
+                .unwrap_or([0u8; 32])
+        },
+        SEGMENT_BLOOM_BITS_PER_KEY,
+        digest,
+        par,
+        alloc,
+    )
+}
 
 // The store's own tags are blaze-keyed's reservations ([`ReservedTag`], the one registry):
 // - a root's record ([`ReservedTag::Root`]): a root's sorted keys, always under
@@ -3914,7 +3967,13 @@ impl<A: Allocator + Clone> Plain<A> {
     /// with no lock, then flips the head once to a generation naming them all. The outcome is
     /// [`Plain::take_committed`]'s once the store is ready again.
     pub fn commit(&mut self, batches: &[&Batch], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
-        self.commit_records(batches, &[], now_ns, effects)
+        self.commit_records_par(batches, &[], now_ns, &Serial, effects)
+    }
+
+    /// Parallel twin of [`Plain::commit`]: runs `TwoValues` verification, BLAKE3 segment sealing,
+    /// and Bloom construction through `par`.
+    pub fn commit_with_par<P: Par>(&mut self, batches: &[&Batch], now_ns: u64, par: &P, effects: &mut EffectList) -> Result<(), StoreError> {
+        self.commit_records_par(batches, &[], now_ns, par, effects)
     }
 
     /// [`Plain::commit`] with `records` lent where they lie besides the batches (a `Lent`'s
@@ -3938,10 +3997,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// valid Bloom filter). Returns `Ok(true)` when `Effect::Map` effects were pushed onto
     /// `effects` (caller drives them to completion), `Ok(false)` when all matching segments are
     /// already mapped and verified.
-    fn map_matching_keys<E: Allocator>(
+    fn map_matching_keys_par<P: Par, E: Allocator>(
         &mut self,
         keys: &[(Namespace, [u8; 32])],
         now_ns: u64,
+        par: &P,
         effects: &mut Vec<Effect, E>,
     ) -> Result<bool, StoreError> {
         const LATE_COMMIT_MAP: &str = "named by the generation this process opened, and its first commit-targeted probe came more than the grace period after the open: another process's compaction may have unlinked it since; a command maps every segment (Driven::map_all) before its first pool task";
@@ -3993,7 +4053,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         let checked_any = !to_check_parked.is_empty();
         for id in to_check_parked {
-            self.check_parked(id);
+            self.check_parked_par(id, par);
         }
         if to_map_rows.is_empty() {
             if checked_any {
@@ -4041,6 +4101,18 @@ impl<A: Allocator + Clone> Plain<A> {
         now_ns: u64,
         effects: &mut EffectBuf<E>,
     ) -> Result<bool, StoreError> {
+        self.map_for_commit_par(batches, records, now_ns, &Serial, effects)
+    }
+
+    /// Parallel twin of [`Plain::map_for_commit`]: checks parked matching segments through `par`.
+    pub fn map_for_commit_par<P: Par, E: Allocator>(
+        &mut self,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        now_ns: u64,
+        par: &P,
+        effects: &mut EffectBuf<E>,
+    ) -> Result<bool, StoreError> {
         self.check_ready_for_map()?;
         if self.eager {
             return Ok(false);
@@ -4073,7 +4145,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         keys.sort_unstable();
         keys.dedup();
-        self.map_matching_keys(keys.as_slice(), now_ns, effects)
+        self.map_matching_keys_par(keys.as_slice(), now_ns, par, effects)
     }
 
     /// Maximum number of replaced prior-root page indexes subtracted upfront in `reused` /
@@ -4092,6 +4164,16 @@ impl<A: Allocator + Clone> Plain<A> {
     pub fn map_for_commit_roots<E: Allocator>(
         &mut self,
         now_ns: u64,
+        effects: &mut EffectBuf<E>,
+    ) -> Result<CommitRootMap, StoreError> {
+        self.map_for_commit_roots_par(now_ns, &Serial, effects)
+    }
+
+    /// Parallel twin of [`Plain::map_for_commit_roots`]: checks parked matching segments through `par`.
+    pub fn map_for_commit_roots_par<P: Par, E: Allocator>(
+        &mut self,
+        now_ns: u64,
+        par: &P,
         effects: &mut EffectBuf<E>,
     ) -> Result<CommitRootMap, StoreError> {
         self.check_ready_for_map()?;
@@ -4150,7 +4232,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         r1.sort_unstable();
         r1.dedup();
-        if self.map_matching_keys(r1.as_slice(), now_ns, effects)? {
+        if self.map_matching_keys_par(r1.as_slice(), now_ns, par, effects)? {
             return Ok(CommitRootMap::Mapped);
         }
 
@@ -4210,7 +4292,7 @@ impl<A: Allocator + Clone> Plain<A> {
         changed_indexes.dedup();
         r2.sort_unstable();
         r2.dedup();
-        if self.map_matching_keys(r2.as_slice(), now_ns, effects)? {
+        if self.map_matching_keys_par(r2.as_slice(), now_ns, par, effects)? {
             return Ok(CommitRootMap::Mapped);
         }
 
@@ -4304,7 +4386,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         r3.sort_unstable();
         r3.dedup();
-        if self.map_matching_keys(r3.as_slice(), now_ns, effects)? {
+        if self.map_matching_keys_par(r3.as_slice(), now_ns, par, effects)? {
             return Ok(CommitRootMap::Mapped);
         }
 
@@ -4358,6 +4440,20 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
+        self.commit_records_par(batches, records, now_ns, &Serial, effects)
+    }
+
+    /// Parallel twin of [`Plain::commit_records`]: runs `TwoValues` verification across prior
+    /// segments, BLAKE3 segment sealing ([`format::seal_entries_par`]), and segment/root Bloom
+    /// construction ([`BloomBuilder::build_par_from`]) through `par`.
+    pub fn commit_records_par<P: Par>(
+        &mut self,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        now_ns: u64,
+        par: &P,
+        effects: &mut EffectList,
+    ) -> Result<(), StoreError> {
         let streamed = self.stream_commits || (batches.is_empty() && records.is_empty());
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
@@ -4441,7 +4537,7 @@ impl<A: Allocator + Clone> Plain<A> {
         fresh.extend(self.cfg.writes.iter().map(|it| Held::new(*it)));
         self.sealed = core::mem::replace(&mut self.held, fresh);
         let nexts = if streamed {
-            match self.lay_out_plan(batches, records) {
+            match self.lay_out_plan_par(batches, records, par) {
                 Ok(plans) => {
                     let mut out = self.own_vec_cap(plans.len());
                     for plan in plans {
@@ -4455,7 +4551,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             }
         } else {
-            match self.lay_out(batches, records) {
+            match self.lay_out_par(batches, records, par) {
                 Ok(laid) => {
                     let mut out = self.own_vec_cap(laid.len());
                     for it in laid {
@@ -4512,7 +4608,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.touches = self.alloc_vec();
                 blaze_own::Vec::new_in(BLOOM_ALLOC)
             }
-            Liveness::Reached => match self.reused(&roots, now_ns) {
+            Liveness::Reached => match self.reused_par(&roots, now_ns, par) {
                 Ok((touches, blooms)) => {
                     self.touches = touches;
                     blooms
@@ -4548,16 +4644,121 @@ impl<A: Allocator + Clone> Plain<A> {
                 left.reserve(rest.len());
                 left.extend(rest);
                 let done = self.alloc_vec();
-                self.write_segment(first, Why::Commit { started_ns: now_ns, roots, rest: left, done }, batches, records, effects);
+                self.write_segment_par(first, Why::Commit { started_ns: now_ns, roots, rest: left, done }, batches, records, par, effects);
             }
         }
         Ok(())
     }
 
-    /// Zero-copy twin of [`Plain::lay_out`]: sorts, deduplicates, checks `TwoValues`, computes
-    /// segment digests via [`format::seal_entries`] and Bloom filters directly from sorted
-    /// entries, keeping only `(RecordFrom, pad_len)` + `blaze_own::Vec<Entry>` with zero payload copy.
-    fn lay_out_plan<'b>(&'b self, batches: &[&'b Batch], records: &[LentRecord<'b>]) -> Result<blaze_own::Vec<PlannedSegment<A>, A>, StoreError> {
+    /// Checks `count` unique candidate commit entries (accessed via `entry_at`) against prior
+    /// committed segments in `namespace`, using [`Par::for_each_mut_chunks`] when
+    /// `count >= PAR_TWO_VALUES_MIN_KEYS && par.workers() > 1 && !self.maps.is_empty()`.
+    ///
+    /// Produces bit-for-bit identical [`CommittedCheck`] outcomes per index to serial
+    /// `find_in` / `newest_mapped` regardless of chunk execution order (Rule 25).
+    fn check_committed_par<P: Par>(
+        &self,
+        namespace: Namespace,
+        count: usize,
+        has_pointers: bool,
+        entry_at: impl Fn(usize) -> Entry + Sync,
+        par: &P,
+    ) -> blaze_own::Vec<CommittedCheck, &A> {
+        let mut statuses: blaze_own::Vec<CommittedCheck, &A> = blaze_own::Vec::with_capacity_in(count, &self.alloc);
+        statuses.resize(count, CommittedCheck::Keep);
+        if count == 0 || self.maps.is_empty() {
+            return statuses;
+        }
+        let ignores_ns = self.plant() == Plant::IgnoresNamespace;
+        let mut probe_segs: blaze_own::Vec<(usize, Option<BloomRef>), &A> = blaze_own::Vec::with_capacity_in(self.view.len(), &self.alloc);
+        for &row in self.view.iter() {
+            let Some(seg) = self.manifest.segments.get(row) else { continue };
+            if seg.count == 0 || (!ignores_ns && seg.namespace != namespace) {
+                continue;
+            }
+            if let Some(at) = self.mapped_row(row) {
+                probe_segs.push((at, self.bloom_ref_for(seg)));
+            }
+        }
+        let mut newest_segs: blaze_own::Vec<(usize, Option<BloomRef>), &A> = blaze_own::Vec::new_in(&self.alloc);
+        if has_pointers {
+            for row in self.newest_rows(namespace) {
+                let Some(seg) = self.manifest.segments.get(row) else { continue };
+                if seg.count == 0 {
+                    continue;
+                }
+                if let Some(at) = self.mapped_row(row) {
+                    newest_segs.push((at, self.bloom_ref_for(seg)));
+                }
+            }
+        }
+        let bloom_shared = self.bloom_shared_mapped();
+        let bloom_ref = bloom_shared.as_ref();
+        let maps = self.maps.as_slice();
+        let probe_slice = probe_segs.as_slice();
+        let newest_slice = newest_segs.as_slice();
+        let check_one = |entry: Entry| -> CommittedCheck {
+            if ReservedTag::Pointer.is(entry.tag) {
+                let hit = newest_slice.iter().find_map(|(at, bloom)| {
+                    if bloom.as_ref().is_some_and(|b| !b.may_contain(bloom_ref, &entry.key.0)) {
+                        return None;
+                    }
+                    let mapped = maps.get(*at)?;
+                    let run = mapped.run();
+                    let i = format::find(run, &entry.key)?;
+                    let slice = run.get(i.saturating_mul(ENTRY)..i.saturating_add(1).saturating_mul(ENTRY))?;
+                    Some((*at, Entry::read(slice)))
+                });
+                if let Some((at, kept_entry)) = hit
+                    && !ReservedTag::Pointer.is(kept_entry.tag)
+                {
+                    return CommittedCheck::Conflict(at, kept_entry);
+                }
+                CommittedCheck::Keep
+            } else {
+                let hit = probe_slice.iter().find_map(|(at, bloom)| {
+                    if bloom.as_ref().is_some_and(|b| !b.may_contain(bloom_ref, &entry.key.0)) {
+                        return None;
+                    }
+                    let mapped = maps.get(*at)?;
+                    let run = mapped.run();
+                    let i = format::find(run, &entry.key)?;
+                    let slice = run.get(i.saturating_mul(ENTRY)..i.saturating_add(1).saturating_mul(ENTRY))?;
+                    Some((*at, Entry::read(slice)))
+                });
+                match hit {
+                    Some((_, kept_entry)) if kept_entry.same_record(&entry) => CommittedCheck::SkipSame,
+                    Some((at, kept_entry)) => CommittedCheck::Conflict(at, kept_entry),
+                    None => CommittedCheck::Keep,
+                }
+            }
+        };
+        if count >= PAR_TWO_VALUES_MIN_KEYS && par.workers() > 1 {
+            let grain = count.div_ceil(par.workers().saturating_mul(2)).max(16);
+            par.for_each_mut_chunks(statuses.as_mut_slice(), grain, |start, chunk| {
+                for (offset, status) in chunk.iter_mut().enumerate() {
+                    *status = check_one(entry_at(start.saturating_add(offset)));
+                }
+            });
+        } else {
+            for (idx, status) in statuses.iter_mut().enumerate() {
+                *status = check_one(entry_at(idx));
+            }
+        }
+        statuses
+    }
+
+    /// Zero-copy twin of [`Plain::lay_out_par`]: sorts, deduplicates, checks `TwoValues`
+    /// (in parallel when `>= 32` unique keys), computes segment digests via
+    /// [`format::seal_entries_par`] and Bloom filters via [`BloomBuilder::build_par_from`]
+    /// directly from sorted entries, keeping only `(RecordFrom, pad_len)` + `blaze_own::Vec<Entry>`
+    /// with zero payload copy.
+    fn lay_out_plan_par<'b, P: Par>(
+        &'b self,
+        batches: &[&'b Batch],
+        records: &[LentRecord<'b>],
+        par: &P,
+    ) -> Result<blaze_own::Vec<PlannedSegment<A>, A>, StoreError> {
         let mut out = self.own_vec_cap(self.cfg.writes.len());
         let header_u64 = u64::try_from(HEADER).unwrap_or(128);
         let entry_u64 = u64::try_from(ENTRY).unwrap_or(48);
@@ -4598,37 +4799,54 @@ impl<A: Allocator + Clone> Plain<A> {
                 all.push((rec.entry(), RecordFrom::Lent { index }));
             }
             all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
-            let mut entries = self.own_vec_cap(all.len());
-            let mut kept = self.own_vec_cap(all.len());
-            let mut payload_bytes: u64 = 0;
+            let mut unique: blaze_own::Vec<(Entry, RecordFrom), &A> = blaze_own::Vec::with_capacity_in(all.len(), &self.alloc);
+            let mut has_pointers = false;
+            let mut first_this_proc_err: Option<StoreError> = None;
             let mut last: Option<(Entry, RecordFrom)> = None;
-            let unpadded = self.plant() == Plant::Unpadded;
-            let off_by_one = self.plant() == Plant::IndexOffByOne;
             for (entry, src) in all {
-                let payload = resolve_record(src, &self.sealed, batches, records);
                 if let Some((prev, prev_src)) = last
                     && prev.key == entry.key
                 {
                     if !prev.same_record(&entry) {
                         let prev_payload = resolve_record(prev_src, &self.sealed, batches, records);
-                        return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::ThisProcess, prev.tag, prev_payload, entry.tag, payload)));
+                        let payload = resolve_record(src, &self.sealed, batches, records);
+                        first_this_proc_err = Some(StoreError::TwoValues(two_values(&Key(entry.key), Holder::ThisProcess, prev.tag, prev_payload, entry.tag, payload)));
+                        break;
                     }
                     continue;
                 }
                 last = Some((entry, src));
                 if ReservedTag::Pointer.is(entry.tag) {
-                    if let Some((mapped, kept_entry)) = self.newest_mapped(namespace, &Key(entry.key))
-                        && !ReservedTag::Pointer.is(kept_entry.tag)
-                    {
+                    has_pointers = true;
+                }
+                unique.push((entry, src));
+            }
+            let unique_slice = unique.as_slice();
+            let statuses = self.check_committed_par(
+                namespace,
+                unique_slice.len(),
+                has_pointers,
+                |idx| {
+                    unique_slice
+                        .get(idx)
+                        .map_or(Entry { key: ContentId([0; 32]), tag: Tag(0), at: 0, len: 0, crc: 0 }, |&(e, _)| e)
+                },
+                par,
+            );
+            let mut entries = self.own_vec_cap(unique_slice.len());
+            let mut kept = self.own_vec_cap(unique_slice.len());
+            let mut payload_bytes: u64 = 0;
+            let unpadded = self.plant() == Plant::Unpadded;
+            let off_by_one = self.plant() == Plant::IndexOffByOne;
+            for (&(entry, src), &status) in unique_slice.iter().zip(statuses.iter()) {
+                match status {
+                    CommittedCheck::Conflict(mapped, kept_entry) => {
                         let kept_payload = self.maps.get(mapped).map_or(&[][..], |m| m.payload(&kept_entry));
+                        let payload = resolve_record(src, &self.sealed, batches, records);
                         return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept_entry.tag, kept_payload, entry.tag, payload)));
                     }
-                } else if let Some((mapped, kept_entry)) = self.find_in(core::slice::from_ref(&namespace), &Key(entry.key)) {
-                    if kept_entry.same_record(&entry) {
-                        continue;
-                    }
-                    let kept_payload = self.maps.get(mapped).map_or(&[][..], |m| m.payload(&kept_entry));
-                    return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept_entry.tag, kept_payload, entry.tag, payload)));
+                    CommittedCheck::SkipSame => continue,
+                    CommittedCheck::Keep => {}
                 }
                 let at = header_u64.saturating_add(payload_bytes);
                 let end = at.saturating_add(u64::from(entry.len));
@@ -4646,6 +4864,9 @@ impl<A: Allocator + Clone> Plain<A> {
                 entries.push(placed);
                 kept.push((src, pad_len));
             }
+            if let Some(err) = first_this_proc_err {
+                return Err(err);
+            }
             if entries.is_empty() {
                 continue;
             }
@@ -4656,18 +4877,29 @@ impl<A: Allocator + Clone> Plain<A> {
             if len > most {
                 return Err(StoreError::Shape { namespace, why: RowRefused::TooLong { len, most } });
             }
-            let sealed = format::seal_entries(
+            let sealed_batches = self.sealed.as_slice();
+            let kept_slice = kept.as_slice();
+            let sealed = format::seal_entries_par(
                 namespace,
-                &entries,
+                entries.as_slice(),
                 index_at,
-                kept.iter().map(|&(src, pad_len)| (resolve_record(src, &self.sealed, batches, records), pad_len)),
+                |idx| {
+                    kept_slice
+                        .get(idx)
+                        .map_or((&[][..], 0), |&(src, pad_len)| (resolve_record(src, sealed_batches, batches, records), pad_len))
+                },
+                par,
+                &self.alloc,
             );
-            let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
-            let mut bloom_builder = BloomBuilder::new(count);
-            for entry in entries.iter() {
-                bloom_builder.insert(&entry.key.0);
-            }
-            let bloom = bloom_builder.finish(&sealed.described.digest);
+            let entries_slice = entries.as_slice();
+            let bloom = BloomBuilder::build_par_from(
+                entries_slice.len(),
+                |idx| entries_slice.get(idx).map_or([0u8; 32], |e| e.key.0),
+                SEGMENT_BLOOM_BITS_PER_KEY,
+                &sealed.described.digest,
+                par,
+                &self.alloc,
+            );
             out.push(PlannedSegment { sealed, bloom, kept, entries });
         }
         Ok(out)
@@ -4768,7 +5000,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// their threads interleaved. A key in two batches with equal records is laid once (the
     /// workers converge on one record); with other bytes it is [`StoreError::TwoValues`]. The
     /// payloads are copied into one piece, so no batch is kept by the commit.
-    fn lay_out<'b>(&'b self, batches: &[&'b Batch], records: &[LentRecord<'b>]) -> Result<Vec<Laid<A>, A>, StoreError> {
+    fn lay_out_par<'b, P: Par>(&'b self, batches: &[&'b Batch], records: &[LentRecord<'b>], par: &P) -> Result<LaidVec<A>, StoreError> {
         let mut out = Vec::with_capacity_in(self.cfg.writes.len(), self.alloc.clone());
         for &namespace in self.cfg.writes.iter() {
             let own = self.sealed.iter().find(|it| it.batch.namespace == namespace).map(|it| &it.batch);
@@ -4787,59 +5019,71 @@ impl<A: Allocator + Clone> Plain<A> {
             }
             all.extend(records.iter().filter(|it| it.namespace == namespace).map(|it| (it.entry(), it.bytes)));
             all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
-            let mut entries: Vec<Entry, &A> = Vec::with_capacity_in(all.len(), &self.alloc);
-            let mut kept_payloads: blaze_own::Vec<(&[u8], usize), &A> = blaze_own::Vec::with_capacity_in(all.len(), &self.alloc);
-            let mut payload_bytes: u64 = 0;
+            let mut unique: blaze_own::Vec<(Entry, &[u8]), &A> = blaze_own::Vec::with_capacity_in(all.len(), &self.alloc);
+            let mut has_pointers = false;
+            let mut first_this_proc_err: Option<StoreError> = None;
             let mut last: Option<(Entry, &[u8])> = None;
-            let unpadded = self.plant() == Plant::Unpadded;
-            let off_by_one = self.plant() == Plant::IndexOffByOne;
             for (entry, payload) in all {
                 if let Some((kept, kept_payload)) = last
                     && kept.key == entry.key
                 {
                     if !kept.same_record(&entry) {
                         // Two workers put other bytes under one key: two values (rule 21).
-                        return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::ThisProcess, kept.tag, kept_payload, entry.tag, payload)));
+                        first_this_proc_err = Some(StoreError::TwoValues(two_values(&Key(entry.key), Holder::ThisProcess, kept.tag, kept_payload, entry.tag, payload)));
+                        break;
                     }
                     continue;
                 }
                 last = Some((entry, payload));
                 if ReservedTag::Pointer.is(entry.tag) {
-                    // A pointer replaces, so it is always laid out, even when this process's view
-                    // holds its value: that view may be older than another process's commit of
-                    // another value, and this commit's row, after every row the generation it
-                    // flips on names, must make this value the newest. A key held under another
-                    // tag is two values (rule 21).
-                    if let Some((mapped, kept)) = self.newest_mapped(namespace, &Key(entry.key))
-                        && !ReservedTag::Pointer.is(kept.tag)
-                    {
-                        let kept_payload = self.maps[mapped].payload(&kept);
+                    has_pointers = true;
+                }
+                unique.push((entry, payload));
+            }
+            let unique_slice = unique.as_slice();
+            let statuses = self.check_committed_par(
+                namespace,
+                unique_slice.len(),
+                has_pointers,
+                |idx| {
+                    unique_slice
+                        .get(idx)
+                        .map_or(Entry { key: ContentId([0; 32]), tag: Tag(0), at: 0, len: 0, crc: 0 }, |&(e, _)| e)
+                },
+                par,
+            );
+            let mut entries: EntryVec<'_, A> = EntryVec::with_capacity_in(unique_slice.len(), &self.alloc);
+            let mut kept_payloads: blaze_own::Vec<(&[u8], usize), &A> = blaze_own::Vec::with_capacity_in(unique_slice.len(), &self.alloc);
+            let mut payload_bytes: u64 = 0;
+            let unpadded = self.plant() == Plant::Unpadded;
+            let off_by_one = self.plant() == Plant::IndexOffByOne;
+            for (&(entry, payload), &status) in unique_slice.iter().zip(statuses.iter()) {
+                match status {
+                    CommittedCheck::Conflict(mapped, kept) => {
+                        let kept_payload = self.maps.get(mapped).map_or(&[][..], |m| m.payload(&kept));
                         return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept.tag, kept_payload, entry.tag, payload)));
                     }
-                } else if let Some((mapped, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
-                    if kept.same_record(&entry) {
-                        // Committed already: not laid again.
-                        continue;
-                    }
-                    // A record committed under the key with other bytes (rule 21).
-                    let kept_payload = self.maps[mapped].payload(&kept);
-                    return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept.tag, kept_payload, entry.tag, payload)));
+                    CommittedCheck::SkipSame => continue,
+                    CommittedCheck::Keep => {}
                 }
-                let at = HEADER as u64 + payload_bytes;
-                let end = at + u64::from(entry.len);
+                let at = u64::try_from(HEADER).unwrap_or(128).saturating_add(payload_bytes);
+                let end = at.saturating_add(u64::from(entry.len));
                 if end > OFFSET_MOST {
                     return Err(StoreError::TooLong { tag: entry.tag, key: entry.key, len: end });
                 }
                 let padded = if unpadded { end } else { aligned(end) };
-                let pad_len = usize::try_from(padded - end).unwrap_or(0);
-                payload_bytes = padded - HEADER as u64;
+                let pad_len = usize::try_from(padded.saturating_sub(end)).unwrap_or(0);
+                payload_bytes = padded.saturating_sub(u64::try_from(HEADER).unwrap_or(128));
                 let mut placed = entry;
                 placed.at = at;
                 if off_by_one {
-                    placed.at += ALIGN;
+                    placed.at = placed.at.saturating_add(ALIGN);
                 }
                 entries.push(placed);
                 kept_payloads.push((payload, pad_len));
+            }
+            if let Some(err) = first_this_proc_err {
+                return Err(err);
             }
             if entries.is_empty() {
                 continue;
@@ -4922,6 +5166,10 @@ impl<A: Allocator + Clone> Plain<A> {
     /// made at its length, then each piece written at its offset, in parallel. A segment of the
     /// same bytes already here is not written again (a published file is never rewritten).
     fn write_segment(&mut self, next: NextCommit<A>, why: Why<A>, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut EffectList) {
+        self.write_segment_par(next, why, batches, records, &Serial, effects);
+    }
+
+    fn write_segment_par<P: Par>(&mut self, next: NextCommit<A>, why: Why<A>, batches: &[&Batch], records: &[LentRecord<'_>], par: &P, effects: &mut EffectList) {
         match next {
             NextCommit::Laid(laid) => {
                 let Laid { pieces, index_at, run, namespace } = laid;
@@ -4933,7 +5181,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 let sealed = format::seal_parts(namespace, &run, index_at, pieces.iter().map(|(_, bytes)| bytes.as_slice()));
                 // The measure: every byte before the digest itself was read by it.
                 self.put_path.digested_bytes += sealed.len.saturating_sub(32);
-                self.start_write(sealed, pieces, WriteBody::Run(run), why, batches, records, effects);
+                self.start_write_par(sealed, pieces, WriteBody::Run(run), why, batches, records, par, effects);
             }
             NextCommit::Planned(planned) => {
                 let PlannedSegment { sealed, bloom, kept, entries } = planned;
@@ -4958,7 +5206,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     index_flying: false,
                 };
                 let pieces = self.alloc_vec();
-                self.start_write(sealed, pieces, WriteBody::Stream { bloom, commit }, why, batches, records, effects);
+                self.start_write_par(sealed, pieces, WriteBody::Stream { bloom, commit }, why, batches, records, par, effects);
             }
         }
     }
@@ -5146,14 +5394,15 @@ impl<A: Allocator + Clone> Plain<A> {
     /// one contiguous buffer and written in a single `Effect::WriteUnsynced` syscall; larger
     /// segments pre-size via `Truncate` and stream `pieces` + `run`/index + footer.
     #[expect(clippy::too_many_arguments, reason = "segment write entry point with external borrow slices for zero-copy streaming/coalescing")]
-    fn start_write(
+    fn start_write_par<P: Par>(
         &mut self,
         sealed: format::Sealed,
-        mut pieces: Vec<(u64, Vec<u8>), A>,
+        mut pieces: PieceVec<A>,
         body: WriteBody<A>,
         why: Why<A>,
         batches: &[&Batch],
         records: &[LentRecord<'_>],
+        par: &P,
         effects: &mut EffectList,
     ) {
         let index_at = sealed.described.index_at;
@@ -5171,7 +5420,7 @@ impl<A: Allocator + Clone> Plain<A> {
             return;
         }
         let (bloom_record, run, commit) = match body {
-            WriteBody::Run(run) => (BloomBuilder::from_run(&run, &sealed.described.digest), Some(run), None),
+            WriteBody::Run(run) => (bloom_from_run_par(&run, &sealed.described.digest, par, &self.alloc), Some(run), None),
             WriteBody::Stream { bloom, commit } => (bloom, None, Some(commit)),
         };
         self.record_pending_bloom(sealed.described.digest, bloom_record);
@@ -6002,7 +6251,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// filter proves none of `pending` is present are skipped in O(|pending|); roots lacking a
     /// filter have one built lazily and returned in `new_blooms`.
     #[expect(clippy::too_many_arguments, reason = "internal semi-join probe with bloom acceleration")]
-    fn probe_live_root(
+    fn probe_live_root_par<P: Par>(
         &self,
         idx: usize,
         prioritize_diff: bool,
@@ -6011,6 +6260,7 @@ impl<A: Allocator + Clone> Plain<A> {
         visited_indexes: &mut Map<[u8; 32], (), BuildKeyHasher, &A>,
         pending: &mut Map<[u8; 32], u64, BuildKeyHasher, &A>,
         new_blooms: &mut blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept>,
+        par: &P,
     ) -> Result<(), StoreError> {
         let Some(root) = self.manifest.roots.get(idx) else { return Ok(()) };
         let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
@@ -6065,17 +6315,58 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                 }
             }
-            let mut builder = BloomBuilder::with_bits_per_key(u32::try_from(total_keys).unwrap_or(u32::MAX), ROOT_BITS_PER_KEY);
-            builder.insert(&root.key.0);
-            for (idx_raw, idx_bytes) in index_payloads {
-                builder.insert(&idx_raw);
-                for key_chunk in idx_bytes.chunks_exact(32) {
-                    if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) {
-                        builder.insert(&key_raw);
+            let total_usize = usize::try_from(total_keys).unwrap_or(usize::MAX);
+            let record = if total_usize >= PAR_BLOOM_MIN_KEYS && par.workers() > 1 {
+                let mut starts: blaze_own::Vec<usize, &A> = blaze_own::Vec::with_capacity_in(index_payloads.len().saturating_add(1), &self.alloc);
+                let mut acc = 1usize;
+                for &(_, idx_bytes) in index_payloads.iter() {
+                    starts.push(acc);
+                    acc = acc.saturating_add(1).saturating_add(idx_bytes.len() / 32);
+                }
+                starts.push(acc);
+                let root_raw = root.key.0;
+                let starts_slice = starts.as_slice();
+                let payloads_slice = index_payloads.as_slice();
+                BloomBuilder::build_par_from(
+                    acc,
+                    |i| {
+                        if i == 0 {
+                            return root_raw;
+                        }
+                        let pos = starts_slice.partition_point(|&s| s <= i).saturating_sub(1);
+                        let Some(&(idx_raw, idx_bytes)) = payloads_slice.get(pos) else {
+                            return [0u8; 32];
+                        };
+                        let local = i.saturating_sub(starts_slice.get(pos).copied().unwrap_or(1));
+                        if local == 0 {
+                            idx_raw
+                        } else {
+                            let off = local.saturating_sub(1).saturating_mul(32);
+                            idx_bytes
+                                .get(off..off.saturating_add(32))
+                                .and_then(|slice| <[u8; 32]>::try_from(slice).ok())
+                                .unwrap_or([0u8; 32])
+                        }
+                    },
+                    ROOT_BITS_PER_KEY,
+                    &bloom_id,
+                    par,
+                    &self.alloc,
+                )
+            } else {
+                let mut builder = BloomBuilder::with_bits_per_key(u32::try_from(total_keys).unwrap_or(u32::MAX), ROOT_BITS_PER_KEY);
+                builder.insert(&root.key.0);
+                for (idx_raw, idx_bytes) in index_payloads {
+                    builder.insert(&idx_raw);
+                    for key_chunk in idx_bytes.chunks_exact(32) {
+                        if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) {
+                            builder.insert(&key_raw);
+                        }
                     }
                 }
-            }
-            new_blooms.push((bloom_id, builder.finish(&bloom_id)));
+                builder.finish(&bloom_id)
+            };
+            new_blooms.push((bloom_id, record));
             return Ok(());
         }
         if pending.is_empty() {
@@ -6191,7 +6482,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// too) that this view holds and no unexpired root of this view reaches: a slice planned
     /// from a view like this one may have judged it dead, so the flip marks the segment
     /// touched ([`Segment::touched`]) and a slice that replaces it aborts. Sorted, each once.
-    fn reused(&self, edits: &[RootEdit], now_ns: u64) -> Result<(Vec<(u64, ContentId), A>, blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept>), StoreError> {
+    fn reused_par<P: Par>(&self, edits: &[RootEdit], now_ns: u64, par: &P) -> Result<(ReusedVec<A>, blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept>), StoreError> {
         let mut out = self.alloc_vec();
         let mut new_blooms: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
         let mut sets: blaze_own::Vec<Key, &A> = blaze_own::Vec::new_in(&self.alloc);
@@ -6404,7 +6695,7 @@ impl<A: Allocator + Clone> Plain<A> {
             return Ok((out, new_blooms));
         }
         for &idx in &prior_roots {
-            self.probe_live_root(idx, true, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
+            self.probe_live_root_par(idx, true, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms, par)?;
             if pending.is_empty() {
                 return Ok((out, new_blooms));
             }
@@ -6450,7 +6741,7 @@ impl<A: Allocator + Clone> Plain<A> {
             match self.bloom.may_contain_any_digest(&bloom_id, pending.keys(), trust_corrupt) {
                 Some(false) => continue,
                 Some(true) => {
-                    self.probe_live_root(idx, false, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
+                    self.probe_live_root_par(idx, false, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms, par)?;
                     if pending.is_empty() {
                         return Ok((out, new_blooms));
                     }
@@ -6470,14 +6761,14 @@ impl<A: Allocator + Clone> Plain<A> {
             if is_large_indexed {
                 large_unbloomed.push(idx);
             } else {
-                self.probe_live_root(idx, false, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
+                self.probe_live_root_par(idx, false, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms, par)?;
                 if pending.is_empty() {
                     return Ok((out, new_blooms));
                 }
             }
         }
         for &idx in &large_unbloomed {
-            self.probe_live_root(idx, false, true, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
+            self.probe_live_root_par(idx, false, true, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms, par)?;
             if pending.is_empty() {
                 return Ok((out, new_blooms));
             }
@@ -7653,9 +7944,9 @@ impl<A: Allocator + Clone> Plain<A> {
         }
     }
 
-    /// One segment's map came back: checked (its length always; its CRC once, when it is of
-    /// another boot and not sealed); no page of it is touched.
-    fn on_map(&mut self, index: u32, done: Done) -> Result<(), StoreError> {
+    /// One segment's map came back: checked (its length always; its digest once via
+    /// [`Verified::check_par`], when it is of another boot and not sealed); no page of it is touched.
+    fn on_map_par<P: Par>(&mut self, index: u32, done: Done, par: &P) -> Result<(), StoreError> {
         let row = usize::try_from(index).unwrap_or(usize::MAX);
         let seg = self.manifest.segments[row];
         let file = self
@@ -7711,7 +8002,7 @@ impl<A: Allocator + Clone> Plain<A> {
             Err(unverified) if self.plant() == Plant::TrustBoot => Ok(self.trust_for_a_plant(unverified)),
             Err(unverified) => {
                 let mut checks = self.checks.get();
-                let proved = Verified::check(unverified, self.boot, &mut checks);
+                let proved = Verified::check_par(unverified, self.boot, &mut checks, par, &self.alloc);
                 self.checks.set(checks);
                 self.checked_ids.push(seg.id);
                 proved
@@ -7927,7 +8218,11 @@ impl<A: Allocator + Clone> Plain<A> {
         Some(Scrubbed { segment: at.id, bytes, done: false, rot: None })
     }
 
-    fn mapped(&mut self, then: Then, effects: &mut Vec<Effect>) {
+    pub(super) fn mapped(&mut self, then: Then, effects: &mut EffectList) {
+        self.mapped_par(then, &Serial, effects);
+    }
+
+    pub(super) fn mapped_par<P: Par>(&mut self, then: Then, par: &P, effects: &mut EffectList) {
         self.pending_map_files.clear();
         self.order_view();
         match then {
@@ -7981,9 +8276,9 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.sliced = Some(stats);
             }
             Then::Open | Then::Stamp | Then::Probe | Then::Targeted => {}
-            Then::All => self.all_mapped(),
+            Then::All => self.all_mapped_par(par),
             Then::RetryCommit => {
-                self.all_mapped();
+                self.all_mapped_par(par);
                 if let Some(change) = self.retry_commit.take() {
                     self.start_flip(change, effects);
                     return;
@@ -8002,12 +8297,31 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Takes one of this store's completions; `now_ns` is the wall clock as the driver reads it
     /// (the simulation's own in tests).
     pub fn complete(&mut self, completion: Completion, now_ns: u64, effects: &mut Vec<Effect>) {
-        self.complete_with(completion, now_ns, &[], &[], effects);
+        self.complete_with_par(completion, now_ns, &[], &[], &Serial, effects);
+    }
+
+    /// Parallel twin of [`Plain::complete`]: verifies large earlier-boot segments through `par`.
+    pub fn complete_par<P: Par>(&mut self, completion: Completion, now_ns: u64, par: &P, effects: &mut EffectList) {
+        self.complete_with_par(completion, now_ns, &[], &[], par, effects);
     }
 
     /// [`Plain::complete`] with the external commit `batches` and `records` kept alive by the
-    /// driver across a streamed commit ([`Plain::commit_records_streamed`]).
-    pub(super) fn complete_with(&mut self, completion: Completion, now_ns: u64, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut Vec<Effect>) {
+    /// driver across a streamed commit ([`Plain::commit_records`]).
+    #[allow(dead_code, reason = "serial wrapper over complete_with_par")]
+    pub(super) fn complete_with(&mut self, completion: Completion, now_ns: u64, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut EffectList) {
+        self.complete_with_par(completion, now_ns, batches, records, &Serial, effects);
+    }
+
+    /// Parallel twin of [`Plain::complete_with`]: verifies large earlier-boot segments through `par`.
+    pub(super) fn complete_with_par<P: Par>(
+        &mut self,
+        completion: Completion,
+        now_ns: u64,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        par: &P,
+        effects: &mut EffectList,
+    ) {
         debug_assert!(self.owns(completion.tag));
         let op = ((completion.tag.0 - self.cfg.tags) >> 32) as u8;
         let index = completion.tag.0 as u32;
@@ -8255,10 +8569,10 @@ impl<A: Allocator + Clone> Plain<A> {
             (MAP, Phase::Mapping { left, then }) => {
                 *left -= 1;
                 let (left, then) = (*left, *then);
-                self.on_map(index, done)?;
+                self.on_map_par(index, done, par)?;
                 if left == 0 {
                     if self.unopened.is_empty() {
-                        self.mapped(then, effects);
+                        self.mapped_par(then, par, effects);
                     } else {
                         effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
                         self.phase = Phase::CheckMaps { then };
@@ -8281,7 +8595,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     let why = format!("generation {generation} names it, written in an earlier boot, and it is gone: a power cut before the kernel wrote its directory entry back; its records are dropped");
                     self.lose(seg, file, LostKind::Gone, why);
                 }
-                self.mapped(then, effects);
+                self.mapped_par(then, par, effects);
                 Ok(())
             }
             (BARRIER, Phase::Sealing { left, ids }) => {

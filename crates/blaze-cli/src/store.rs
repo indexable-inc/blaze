@@ -178,7 +178,7 @@ pub trait Store<'m> {
 /// store.
 pub(crate) struct StoreSnapshot {
     inner: Snapshot<blaze_mem::Kept>,
-    expansion_demands: AtomicU64,
+    expansion_demands: bstd::sync::CachePadded<AtomicU64>,
 }
 
 pub(crate) type SharedSnapshot = Arc<StoreSnapshot, blaze_mem::Kept>;
@@ -201,6 +201,197 @@ impl StoreSnapshot {
         self.expansion_demands.load(Ordering::Relaxed)
     }
 
+}
+
+/// Task scratch frame for CAS parallel CPU helpers (BLAKE3 subtrees, Bloom bucketing,
+/// `TwoValues` probes).
+const CAS_PAR_FRAME: usize = 64 << 10;
+
+/// Store-tagged allocator for [`CxPar`] worker scratch vectors (`Send + Sync + Copy`, zero `Global`).
+const CAS_PAR_ALLOC: blaze_mem::Kept = blaze_mem::Kept(blaze_mem::Tag::Store);
+
+/// 100% safe work-stealing [`blaze_cas::plain::Par`] executor backed by `bstd`'s scoped task
+/// pool (`cx.scope().may_overlap`) and a 128B-padded atomic stealing cursor
+/// (`bstd::sync::CachePadded<AtomicUsize>`).
+///
+/// Falls back directly to an inline serial loop with zero scope or worker overhead when
+/// `chunks <= 1` or `workers <= 1` (including simulated/single-worker contexts).
+pub(crate) struct CxPar<'a> {
+    cx: &'a Cx,
+    workers: core::num::NonZeroU32,
+}
+
+impl<'a> CxPar<'a> {
+    /// Creates a [`CxPar`] sized to `cx.workers()`.
+    pub(crate) fn new(cx: &'a Cx) -> CxPar<'a> {
+        let workers = core::num::NonZeroU32::new(cx.workers()).unwrap_or(core::num::NonZeroU32::MIN);
+        CxPar { cx, workers }
+    }
+
+    /// Creates a [`CxPar`] capped to `min(workers, cx.workers().max(1))`.
+    #[allow(dead_code, reason = "explicit worker cap constructor for bounded callers and tests")]
+    pub(crate) fn with_workers(cx: &'a Cx, workers: core::num::NonZeroU32) -> CxPar<'a> {
+        let capped = workers.get().min(cx.workers().max(1));
+        let workers = core::num::NonZeroU32::new(capped).unwrap_or(core::num::NonZeroU32::MIN);
+        CxPar { cx, workers }
+    }
+}
+
+impl blaze_cas::plain::Par for CxPar<'_> {
+    #[inline]
+    fn workers(&self) -> usize {
+        usize::try_from(self.workers.get()).unwrap_or(1)
+    }
+
+    fn map_range<R: Send, A: Allocator + Copy>(
+        &self,
+        count: usize,
+        grain: usize,
+        alloc: A,
+        f: impl Fn(usize, usize) -> R + Sync,
+    ) -> blaze_own::Vec<R, A> {
+        if count == 0 {
+            return blaze_own::Vec::new_in(alloc);
+        }
+        let step = grain.max(1);
+        let chunks = count.div_ceil(step);
+        let w = self.workers();
+        if chunks <= 1 || w <= 1 {
+            let mut out = blaze_own::Vec::with_capacity_in(chunks, alloc);
+            let mut lo = 0usize;
+            while lo < count {
+                let hi = lo.saturating_add(step).min(count);
+                out.push(f(lo, hi));
+                lo = hi;
+            }
+            return out;
+        }
+
+        let worker_count = w.min(chunks);
+        let helpers = worker_count.saturating_sub(1);
+        let cursor = bstd::sync::CachePadded::new(core::sync::atomic::AtomicUsize::new(0));
+        let mut slots: blaze_own::Vec<Option<R>, A> = blaze_own::Vec::with_capacity_in(chunks, alloc);
+        for _ in 0..chunks {
+            slots.push(None);
+        }
+        {
+            let cursor_ref = &cursor;
+            let f_ref = &f;
+            let scope = self.cx.scope();
+            scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+            let mut handles = blaze_own::Vec::with_capacity_in(helpers, CAS_PAR_ALLOC);
+            for _ in 0..helpers {
+                handles.push(scope.may_overlap(
+                    "cas: par map",
+                    CAS_PAR_FRAME,
+                    move |_cx: &Cx| -> Result<blaze_own::Vec<(usize, R), blaze_mem::Kept>, core::convert::Infallible> {
+                        let mut local: blaze_own::Vec<(usize, R), blaze_mem::Kept> = blaze_own::Vec::new_in(CAS_PAR_ALLOC);
+                        loop {
+                            let idx = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                            if idx >= chunks {
+                                break;
+                            }
+                            let lo = idx.saturating_mul(step);
+                            let hi = lo.saturating_add(step).min(count);
+                            local.push((idx, f_ref(lo, hi)));
+                        }
+                        Ok(local)
+                    },
+                ));
+            }
+            // Calling thread participates as worker 0.
+            loop {
+                let idx = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                if idx >= chunks {
+                    break;
+                }
+                let lo = idx.saturating_mul(step);
+                let hi = lo.saturating_add(step).min(count);
+                if let Some(slot) = slots.get_mut(idx) {
+                    *slot = Some(f_ref(lo, hi));
+                }
+            }
+            for handle in handles.into_iter() {
+                if let Ok(local) = handle.join(self.cx) {
+                    for (idx, value) in local.into_iter() {
+                        if let Some(slot) = slots.get_mut(idx) {
+                            *slot = Some(value);
+                        }
+                    }
+                }
+            }
+            let _ = scope.join(self.cx);
+        }
+        let mut out = blaze_own::Vec::with_capacity_in(chunks, alloc);
+        for (idx, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(value) => out.push(value),
+                None => {
+                    let lo = idx.saturating_mul(step);
+                    let hi = lo.saturating_add(step).min(count);
+                    out.push(f(lo, hi));
+                }
+            }
+        }
+        out
+    }
+
+    fn for_each_mut_chunks<T: Send>(
+        &self,
+        items: &mut [T],
+        grain: usize,
+        f: impl Fn(usize, &mut [T]) + Sync,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let step = grain.max(1);
+        let chunks = items.len().div_ceil(step);
+        let w = self.workers();
+        if chunks <= 1 || w <= 1 {
+            for (idx, chunk) in items.chunks_mut(step).enumerate() {
+                f(idx.saturating_mul(step), chunk);
+            }
+            return;
+        }
+
+        let worker_count = w.min(chunks);
+        let base_chunks = chunks / worker_count;
+        let extra_chunks = chunks % worker_count;
+        let f_ref = &f;
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let mut handles = blaze_own::Vec::with_capacity_in(worker_count.saturating_sub(1), CAS_PAR_ALLOC);
+        let mut rest = items;
+        let mut offset = 0usize;
+        // Worker 0 slice runs inline on the calling thread; helpers take disjoint slices via split_at_mut
+        // with zero locks and zero shared chunk-table allocation.
+        let first_len = base_chunks.saturating_add(usize::from(extra_chunks > 0)).saturating_mul(step).min(rest.len());
+        let (first_slice, after_first) = rest.split_at_mut(first_len);
+        rest = after_first;
+        offset = offset.saturating_add(first_len);
+        for worker in 1..worker_count {
+            let my_chunks = base_chunks.saturating_add(usize::from(worker < extra_chunks));
+            let my_len = my_chunks.saturating_mul(step).min(rest.len());
+            let (mine, tail) = rest.split_at_mut(my_len);
+            let my_offset = offset;
+            rest = tail;
+            offset = offset.saturating_add(my_len);
+            handles.push(scope.may_overlap("cas: par chunks", CAS_PAR_FRAME, move |_cx: &Cx| -> Result<(), core::convert::Infallible> {
+                for (local_idx, chunk) in mine.chunks_mut(step).enumerate() {
+                    f_ref(my_offset.saturating_add(local_idx.saturating_mul(step)), chunk);
+                }
+                Ok(())
+            }));
+        }
+        for (local_idx, chunk) in first_slice.chunks_mut(step).enumerate() {
+            f_ref(local_idx.saturating_mul(step), chunk);
+        }
+        for handle in handles.into_iter() {
+            let _ = handle.join(self.cx);
+        }
+        let _ = scope.join(self.cx);
+    }
 }
 
 /// The bytes of records a [`Store`] copied into this process's heap, and holds now (a gauge):
@@ -627,6 +818,16 @@ impl Home {
         Ok(lent)
     }
 
+    /// Parallel twin of [`Home::open_store`]: verifies large earlier-boot segments through [`CxPar`].
+    pub fn open_store_par(&self, cx: &Cx, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
+        let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
+        let dir = driver.dir().share();
+        let par = CxPar::new(cx);
+        let lent = plain_place::open_par(driver, plain_place::config(dir, settings, facts, alloc), alloc, &par)?;
+        lent.set_commit_durability(default_local_durability(settings));
+        Ok(lent)
+    }
+
     /// Opens the store with an explicit [`Liveness`] policy (used by `blaze gc` to sweep
     /// unreachable records with [`Liveness::Reached`]).
     pub(crate) fn open_store_with_liveness(&self, settings: &Settings, facts: Facts, liveness: Liveness, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
@@ -881,7 +1082,7 @@ pub fn open_for_command(
     // A trusted builder's store may name the public namespace ([`TRUSTED_BUILDER`]); a
     // developer's only its own. Budget defaults to 32 GiB unless overridden via env.
     let settings = Settings { max_store_bytes, trusted_writer: TRUSTED_BUILDER, ..Settings::default() };
-    let lent = home.open_store(&settings, Facts { boot, nonce }, heap.alloc())?;
+    let lent = home.open_store_par(cx, &settings, Facts { boot, nonce }, heap.alloc())?;
     if !cx.is_simulated() {
         lent.set_pid(host.pid());
     }
@@ -1170,8 +1371,9 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
 
     /// Puts a record that is always `LOCAL` (answer pages, producer header shards, printed lines,
     /// sealed pointers, bases), skipping [`Sharing::all_names_public`] drive-record parsing.
-    pub fn put_local(&mut self, _cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
-        match self.place.put(key, false, bytes) {
+    pub fn put_local(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
+        let par = CxPar::new(cx);
+        match self.place.put_parts_par(key, false, &[bytes], &par) {
             Ok(()) => Ok(()),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
                 let held = self.place.get(key)?;
@@ -1198,7 +1400,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     fn snapshot(&self) -> Result<Option<SharedSnapshot>, CliError> {
         let alloc = blaze_mem::Kept(blaze_mem::Tag::Store);
         let inner = self.place.snapshot_in(alloc)?;
-        Ok(Some(Arc::new_in(StoreSnapshot { inner, expansion_demands: AtomicU64::new(0) }, alloc)))
+        Ok(Some(Arc::new_in(StoreSnapshot { inner, expansion_demands: bstd::sync::CachePadded::new(AtomicU64::new(0)) }, alloc)))
     }
 
     fn public_crates(&mut self, subjects: &[ContentId]) {
@@ -1274,9 +1476,10 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         self.put_parts(cx, key, &[bytes])
     }
 
-    fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
+    fn put_parts(&mut self, cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
         let public = self.place.is_public_writer() && self.sharing.all_names_public(parts);
-        match self.place.put_parts(key, public, parts) {
+        let par = CxPar::new(cx);
+        match self.place.put_parts_par(key, public, parts, &par) {
             Ok(()) => Ok(()),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
                 let held = self.place.get(key)?;
@@ -1292,9 +1495,10 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         }
     }
 
-    fn put_record(&mut self, _cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
+    fn put_record(&mut self, cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
         let public = self.place.is_public_writer() && self.sharing.all_names_public(owner);
-        match self.place.put_record(key, public, tag, bytes) {
+        let par = CxPar::new(cx);
+        match self.place.put_record_par(key, public, tag, bytes, &par) {
             Ok(put) => Ok(put),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
                 let held = self.place.get(key)?;
@@ -1310,9 +1514,10 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         Ok(())
     }
 
-    fn map_all(&mut self, _cx: &Cx) -> Result<(), CliError> {
+    fn map_all(&mut self, cx: &Cx) -> Result<(), CliError> {
         if !self.mapped_all {
-            self.place.map_all()?;
+            let par = CxPar::new(cx);
+            self.place.map_all_par(&par)?;
             self.mapped_all = true;
         }
         Ok(())
@@ -2082,5 +2287,75 @@ mod after_answer_commit_tests {
         let driven = lent2.into_store();
         assert!(driven.needs_housekeeping(now_ns), "1 unsealed segment keeps needs_housekeeping true");
         assert!(!driven.needs_bg_gc(now_ns), "1 small unsealed segment must not trigger detached bg GC spawn");
+    }
+
+    #[test]
+    fn cx_par_map_range_and_for_each_mut_chunks_match_serial_and_preserve_order() {
+        use blaze_cas::plain::{Par, Serial};
+
+        let io = Io::simulated(SimWorld::new(89, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let alloc = blaze_mem::Kept(blaze_mem::Tag::Store);
+
+        // Exercise both the inline serial fast path (`workers == 1`) and the work-stealing
+        // `scope.may_overlap` + `CachePadded<AtomicUsize>` cursor path (`workers == 4`).
+        let par_one = CxPar::new(&cx);
+        let par_many = CxPar { cx: &cx, workers: core::num::NonZeroU32::new(4).expect("non-zero") };
+
+        let want = Serial.map_range(137, 9, alloc, |lo, hi| (lo, hi, lo.wrapping_mul(31).wrapping_add(hi)));
+        let got_one = par_one.map_range(137, 9, alloc, |lo, hi| (lo, hi, lo.wrapping_mul(31).wrapping_add(hi)));
+        let got_many = par_many.map_range(137, 9, alloc, |lo, hi| (lo, hi, lo.wrapping_mul(31).wrapping_add(hi)));
+        assert_eq!(got_one.as_slice(), want.as_slice());
+        assert_eq!(got_many.as_slice(), want.as_slice());
+
+        // Empty and single-chunk edge cases.
+        assert!(par_many.map_range(0, 8, alloc, |lo, hi| (lo, hi)).is_empty());
+        assert_eq!(par_many.map_range(5, 16, alloc, |lo, hi| (lo, hi)).as_slice(), &[(0, 5)]);
+
+        let mut serial_buf: blaze_own::Vec<usize, _> = blaze_own::Vec::with_capacity_in(137, alloc);
+        let mut one_buf: blaze_own::Vec<usize, _> = blaze_own::Vec::with_capacity_in(137, alloc);
+        let mut many_buf: blaze_own::Vec<usize, _> = blaze_own::Vec::with_capacity_in(137, alloc);
+        for _ in 0..137 {
+            serial_buf.push(0);
+            one_buf.push(0);
+            many_buf.push(0);
+        }
+        let fill = |start: usize, chunk: &mut [usize]| {
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                *slot = start.saturating_add(i).wrapping_mul(17).wrapping_add(3);
+            }
+        };
+        Serial.for_each_mut_chunks(serial_buf.as_mut_slice(), 11, fill);
+        par_one.for_each_mut_chunks(one_buf.as_mut_slice(), 11, fill);
+        par_many.for_each_mut_chunks(many_buf.as_mut_slice(), 11, fill);
+        assert_eq!(one_buf.as_slice(), serial_buf.as_slice());
+        assert_eq!(many_buf.as_slice(), serial_buf.as_slice());
+    }
+
+    #[test]
+    fn store_snapshot_expansion_demands_is_cache_padded() {
+        assert!(
+            core::mem::align_of::<bstd::sync::CachePadded<AtomicU64>>() >= 64,
+            "StoreSnapshot::expansion_demands must be cache-line padded",
+        );
+        let io = Io::simulated(SimWorld::new(91, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let heap = blaze_own::testing::heap();
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+        let lent = home.open_store_par(&cx, &Settings::default(), Facts { boot: Some(1), nonce: 91 }, heap.alloc()).expect("open_store_par");
+        let k = Key(ContentId::of("cx_par snapshot demand key", b"v1"));
+        lent.put(&blaze_cas::Key(k.0), blaze_keyed::kind::Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), b"payload")
+            .expect("put");
+        let par = CxPar { cx: &cx, workers: core::num::NonZeroU32::new(4).expect("non-zero") };
+        lent.commit_par(&par).expect("commit_par");
+        let store = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, heap.alloc()).expect("command store");
+        let snap = store.snapshot().expect("snapshot").expect("some snapshot");
+        assert_eq!(snap.expansion_demands(), 0);
+        let got = snap.expansion_get(k).expect("expansion_get").expect("present");
+        assert_eq!(got, b"payload");
+        assert_eq!(snap.expansion_demands(), 1);
     }
 }

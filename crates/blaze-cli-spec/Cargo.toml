@@ -14,3 +14,9 @@ doctest = false
 
 [dependencies]
 blaze-own = { path = "../blaze-own" }
+
+[dev-dependencies]
+blaze-own = { path = "../blaze-own", features = ["testing"] }
+
+[lints]
+workspace = true

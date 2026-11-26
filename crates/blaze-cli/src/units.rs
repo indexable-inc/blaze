@@ -467,7 +467,7 @@ fn parse_std_policy<'f>(manifest: &str, root_made: &mut Made<'f>, frame: &'f Fra
         } else {
             for entry in allow.children() {
                 match entry.as_str() {
-                    Some(name) => allow_rust.push(frame.alloc_str(name)),
+                    Some(name) => allow_rust.push(&*frame.alloc_str(name)),
                     None => {
                         root_made.find(
                             UNREAD,

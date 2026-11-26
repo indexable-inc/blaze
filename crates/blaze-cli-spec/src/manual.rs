@@ -136,24 +136,6 @@ const GIT_STASH_SUBS: &[SubRow] = &[
     ("clear", "Remove all stash entries"),
 ];
 
-const BLAZE_FLAGS: &[FlagRow] = &[
-    ("--release", "", "", "Optimize artifacts for release"),
-    ("--profile", "", "", "Capture execution profile parquet"),
-    ("--jobs", "-j", "<n>", "Number of parallel worker jobs"),
-    ("--help", "-h", "", "Display help"),
-];
-
-const BLAZE_SUBS: &[SubRow] = &[
-    ("run", "Compile on first call and run the binary"),
-    ("test", "Build and run tests at item grain"),
-    ("check", "Type-check and borrow-check workspace items"),
-    ("export", "Export optimized native binary (PGO by default)"),
-    ("bench", "Run benchmarks"),
-    ("clean", "Clean local store/cache artifacts"),
-    ("explain", "Explain why an item rebuilt from profile"),
-    ("debug", "Inspect build profile tables via DuckDB"),
-];
-
 const CARGO_FLAGS: &[FlagRow] = &[
     ("--offline", "", "", "Run without accessing the network"),
     ("--locked", "", "", "Assert that Cargo.lock will remain unchanged"),
@@ -255,6 +237,13 @@ const VIM_FLAGS: &[FlagRow] = &[
 
 /// Return a curated manual spec for `(cmd, subcmd)` allocated in `alloc`, if one exists.
 pub fn manual_spec_in<'a>(cmd: &str, subcmd: Option<&str>, alloc: Alloc<'a>) -> Option<CliSpec<'a>> {
+    if cmd == "blaze" {
+        if let Some(sub) = subcmd {
+            crate::app::find_command(&crate::blaze_app::BLAZE_APP, sub)?;
+        }
+        return Some(crate::app::to_cli_spec(&crate::blaze_app::BLAZE_APP, subcmd, alloc));
+    }
+
     let (flag_rows, sub_rows): (&[FlagRow], &[SubRow]) = match (cmd, subcmd) {
         ("claude", None) => (CLAUDE_FLAGS, CLAUDE_SUBS),
         ("git", None) => (GIT_FLAGS, GIT_SUBS),
@@ -263,7 +252,6 @@ pub fn manual_spec_in<'a>(cmd: &str, subcmd: Option<&str>, alloc: Alloc<'a>) -> 
         ("git", Some("log")) => (GIT_LOG_FLAGS, &[]),
         ("git", Some("push")) => (GIT_PUSH_FLAGS, &[]),
         ("git", Some("stash")) => (GIT_STASH_FLAGS, GIT_STASH_SUBS),
-        ("blaze", None) => (BLAZE_FLAGS, BLAZE_SUBS),
         ("cargo", None) => (CARGO_FLAGS, CARGO_SUBS),
         ("fd", None) => (FD_FLAGS, &[]),
         ("rg", None) => (RG_FLAGS, &[]),

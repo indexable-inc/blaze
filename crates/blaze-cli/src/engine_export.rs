@@ -121,33 +121,33 @@ impl fmt::Display for Hex<'_> {
 impl fmt::Display for ExportCliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExportCliError::UnsupportedHost => write!(f, "blaze export: only arm64 macOS and arm64 Linux hosts are supported (engine_export.rs)"),
-            ExportCliError::Frame => write!(f, "blaze export: could not reserve the export scratch frame (engine_export.rs)"),
-            ExportCliError::Native { shown } => write!(f, "blaze export: native image: {} (engine_native.rs)", shown.as_str()),
-            ExportCliError::Builder { shown } => write!(f, "blaze export: code builder: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::Roots { shown } => write!(f, "blaze export: program roots: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::UnsupportedHost => write!(f, "blaze build: only arm64 macOS and arm64 Linux hosts are supported (engine_export.rs)"),
+            ExportCliError::Frame => write!(f, "blaze build: could not reserve the build scratch frame (engine_export.rs)"),
+            ExportCliError::Native { shown } => write!(f, "blaze build: native image: {} (engine_native.rs)", shown.as_str()),
+            ExportCliError::Builder { shown } => write!(f, "blaze build: code builder: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::Roots { shown } => write!(f, "blaze build: program roots: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::NotChecked { krate, function, symbol, row, reached, compiled, cached, why } => write!(
                 f,
-                "blaze export: reached fn {:#x} in crate `{}` (symbol {}; row {row}/{reached}, {compiled} compiled, {cached} cached) may not be exported: {why} (engine_export.rs)",
+                "blaze build: reached fn {:#x} in crate `{}` (symbol {}; row {row}/{reached}, {compiled} compiled, {cached} cached) may not be built: {why} (engine_export.rs)",
                 function.0,
                 krate.as_str(),
                 Hex(symbol)
             ),
-            ExportCliError::Walk { symbol, shown } => write!(f, "blaze export: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Lto { shown } => write!(f, "blaze export: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::Special { what, shown } => write!(f, "blaze export: building {what}: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::Store { symbol, shown } => write!(f, "blaze export: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::MissingEntry { symbol } => write!(f, "blaze export: code entry {} missing from store after step (engine_export.rs)", Hex(symbol)),
-            ExportCliError::Decode { symbol, what, shown } => write!(f, "blaze export: decoding {what} {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Position { symbol, shown } => write!(f, "blaze export: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Materialize { symbol, shown } => write!(f, "blaze export: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Export(error) => write!(f, "blaze export: {error}"),
-            ExportCliError::BadOutputPath { path, why } => write!(f, "blaze export: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
-            ExportCliError::OutputHome(error) => write!(f, "blaze export: output directory: {error} (engine_export.rs)"),
-            ExportCliError::OutputPath(error) => write!(f, "blaze export: output path: {error} (engine_export.rs)"),
-            ExportCliError::WriteOutput(error) => write!(f, "blaze export: writing executable: {error} (engine_export.rs)"),
+            ExportCliError::Walk { symbol, shown } => write!(f, "blaze build: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Lto { shown } => write!(f, "blaze build: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::Special { what, shown } => write!(f, "blaze build: building {what}: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::Store { symbol, shown } => write!(f, "blaze build: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::MissingEntry { symbol } => write!(f, "blaze build: code entry {} missing from store after step (engine_export.rs)", Hex(symbol)),
+            ExportCliError::Decode { symbol, what, shown } => write!(f, "blaze build: decoding {what} {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Position { symbol, shown } => write!(f, "blaze build: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Materialize { symbol, shown } => write!(f, "blaze build: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Export(error) => write!(f, "blaze build: {error}"),
+            ExportCliError::BadOutputPath { path, why } => write!(f, "blaze build: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
+            ExportCliError::OutputHome(error) => write!(f, "blaze build: output directory: {error} (engine_export.rs)"),
+            ExportCliError::OutputPath(error) => write!(f, "blaze build: output path: {error} (engine_export.rs)"),
+            ExportCliError::WriteOutput(error) => write!(f, "blaze build: writing executable: {error} (engine_export.rs)"),
             #[cfg(unix)]
-            ExportCliError::Chmod { path, errno } => write!(f, "blaze export: chmod 0755 `{}` failed: {errno:?} (engine_export.rs)", path.as_str()),
+            ExportCliError::Chmod { path, errno } => write!(f, "blaze build: chmod 0755 `{}` failed: {errno:?} (engine_export.rs)", path.as_str()),
         }
     }
 }
@@ -710,7 +710,7 @@ fn export_program<'f>(
                     }
                 },
                 Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
-                    let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
+                    let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {why}");
                     let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
                     stubs += 1;
                     outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
@@ -813,7 +813,7 @@ fn export_program<'f>(
             }
         }
     }
-    end_procs(cx, &maker_procs, standing.err, "export")?;
+    end_procs(cx, &maker_procs, standing.err, "build")?;
 
     let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
     phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
@@ -1058,7 +1058,7 @@ fn export_program<'f>(
     let toolchain_made = codes.toolchain_made();
     drop(codes);
     if let Err(why) = crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[]) {
-        standing.err.line(cx, format_args!("blaze export: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
+        standing.err.line(cx, format_args!("blaze build: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
     }
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
@@ -1235,28 +1235,28 @@ fn print_summary(
         (true, true) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} stubs, {} data, {} tls, {} ms)",
+                "built {} ({} bytes, {} functions, {} stubs, {} data, {} tls, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.stubs, summary.data_count, summary.tls_count, wall_ms
             ),
         )?,
         (true, false) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} data, {} tls, {} ms)",
+                "built {} ({} bytes, {} functions, {} data, {} tls, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.data_count, summary.tls_count, wall_ms
             ),
         )?,
         (false, true) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} stubs, {} data, {} ms)",
+                "built {} ({} bytes, {} functions, {} stubs, {} data, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.stubs, summary.data_count, wall_ms
             ),
         )?,
         (false, false) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} data, {} ms)",
+                "built {} ({} bytes, {} functions, {} data, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.data_count, wall_ms
             ),
         )?,
@@ -1266,12 +1266,12 @@ fn print_summary(
         let mut report = String::new_in(erased.handle());
         let _ = summary.exported.report(&mut report);
         for line in report.as_str().lines() {
-            err.line(cx, format_args!("export: {line}"))?;
+            err.line(cx, format_args!("build: {line}"))?;
         }
         err.line(
             cx,
             format_args!(
-                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} bytes={} wall={}ms",
+                "build stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} bytes={} wall={}ms",
                 summary.exported.functions,
                 summary.exported.folded,
                 summary.stubs,

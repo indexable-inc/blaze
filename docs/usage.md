@@ -21,8 +21,7 @@ blaze's home (docs/v2/plan/design/bottom.md, "The commands"). No `cargo build` a
   passes what follows `--` to your program, and `test` runs and reports the tests as
   `cargo test` does. Neither writes an executable.
 - `blaze check` reports the errors and makes no code.
-- `blaze export` is to write a native executable; until it is built it says so.
-- There is no `blaze build`.
+- `blaze build` writes a standalone PGO-optimized native executable.
 
 A build blaze can't do fails with the reason and is not handed to cargo. Each is a bug
 ([#84](https://github.com/indexable-inc/blaze/issues/84), [the plan](no-rustc.md)). rustc's `-Z`

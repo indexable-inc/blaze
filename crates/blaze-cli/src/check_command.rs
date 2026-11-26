@@ -54,7 +54,7 @@ pub(crate) fn run(
     phases: &mut Phases,
     heap: &'static blaze_own::Heap,
 ) -> Result<Status, CliError> {
-    let flags = crate::flags(args)?;
+    let flags = crate::flags_in(args, cx.frame())?;
     refuse_not_taken(&flags)?;
     crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)
 }
@@ -69,10 +69,10 @@ pub(crate) fn refuse_not_taken(flags: &crate::Flags<'_>) -> Result<(), CliError>
         return Err(CliError::Usage("--grant and the words after -- are `blaze run`'s program's"));
     }
     if flags.select != crate::run_package::Select::NONE {
-        return Err(CliError::Usage("-p and --bin choose `blaze run`'s or `blaze export`'s program"));
+        return Err(CliError::Usage("-p and --bin choose `blaze run`'s or `blaze build`'s program"));
     }
     if flags.output.is_some() {
-        return Err(CliError::Usage("-o / --output is `blaze export`'s"));
+        return Err(CliError::Usage("-o / --output is `blaze build`'s"));
     }
     if flags.open == blaze_run::viewer::OpenExplore::Open {
         return Err(CliError::Usage("--open is `blaze run`'s"));
