@@ -403,6 +403,37 @@ fn walk_nix_elf_closure(
         });
     }
 
+    // Refuse Linux hosts with a non-empty `/etc/ld.so.preload` (rule 3/21): the dynamic loader
+    // preloads those DSOs into every process before `main`, which would either be denied by
+    // Landlock or alter compiler behavior outside the keyed ELF closure.
+    match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.preload"), OpenFlags::CLOSE_ON_EXEC, 0) {
+        Ok(preload_fd) => {
+            let mut preload_buf = [0u8; 4096];
+            let n = read_nix_at(reader, cx, preload_fd.fd(), &mut preload_buf, 0, "pread (/etc/ld.so.preload)")?;
+            let has_entry = preload_buf
+                .get(..n)
+                .unwrap_or(&[])
+                .split(|&b| b == b'\n')
+                .any(|line| {
+                    let trimmed = line.iter().skip_while(|b| b.is_ascii_whitespace()).copied().next();
+                    matches!(trimmed, Some(b) if b != b'#')
+                });
+            if has_entry {
+                return Err(Fault::Host {
+                    call: "landlock (/etc/ld.so.preload unsupported for hermetic probes)",
+                    code: 38,
+                });
+            }
+            if let Some(f) = feed.as_deref_mut() {
+                f(b"/etc/ld.so.preload:empty");
+            }
+        }
+        Err(blaze_sys::Errno::NoEnt) => {}
+        Err(errno) => {
+            return Err(Fault::Host { call: "openat (/etc/ld.so.preload)", code: errno.raw() });
+        }
+    }
+
     // Grant single-file READ_FILE | EXECUTE ONLY on the resolved loader (`PT_INTERP`) and, when
     // the loader is NixOS's `nix-ld` shim, its delegated glibc `ld.so` (and feed both — plus
     // `/etc/ld.so.cache` on non-Nix FHS Linux — into any caller hashing the runtime closure).
@@ -1402,16 +1433,27 @@ fn enqueue_nix_soname<const N: usize>(
                 return Ok(());
             }
         }
-        for fhs_dir in [
-            &b"/lib/aarch64-linux-gnu/"[..],
-            &b"/usr/lib/aarch64-linux-gnu/"[..],
-            &b"/lib/x86_64-linux-gnu/"[..],
-            &b"/usr/lib/x86_64-linux-gnu/"[..],
-            &b"/lib64/"[..],
-            &b"/usr/lib64/"[..],
-            &b"/lib/"[..],
-            &b"/usr/lib/"[..],
-        ] {
+        #[cfg(target_arch = "aarch64")]
+        let fhs_dirs: &[&[u8]] = &[
+            b"/lib/aarch64-linux-gnu/",
+            b"/usr/lib/aarch64-linux-gnu/",
+            b"/lib64/",
+            b"/usr/lib64/",
+            b"/lib/",
+            b"/usr/lib/",
+        ];
+        #[cfg(target_arch = "x86_64")]
+        let fhs_dirs: &[&[u8]] = &[
+            b"/lib/x86_64-linux-gnu/",
+            b"/usr/lib/x86_64-linux-gnu/",
+            b"/lib64/",
+            b"/usr/lib64/",
+            b"/lib/",
+            b"/usr/lib/",
+        ];
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let fhs_dirs: &[&[u8]] = &[b"/lib64/", b"/usr/lib64/", b"/lib/", b"/usr/lib/"];
+        for fhs_dir in fhs_dirs {
             if try_grant_and_enqueue_lib(reader, cx, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
                 return Ok(());
             }
@@ -1450,16 +1492,28 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     let Ok(cstr) = CStr::from_bytes_until_nul(candidate.get(..=total).unwrap_or(&[0])) else {
         return Ok(false);
     };
-    let flags = if feed.is_some() {
-        OpenFlags::CLOSE_ON_EXEC
-    } else {
-        OpenFlags::PATH.with(OpenFlags::CLOSE_ON_EXEC)
-    };
-    let fd = match openat(CWD, blaze_sys::Path::new(cstr), flags, 0) {
+    let fd = match openat(CWD, blaze_sys::Path::new(cstr), OpenFlags::CLOSE_ON_EXEC, 0) {
         Ok(fd) => fd,
         Err(blaze_sys::Errno::NoEnt) => return Ok(false),
         Err(errno) => return Err(Fault::Host { call: "openat (nix runtime file)", code: errno.raw() }),
     };
+    // Verify ELF64 class, little-endian data, and target `e_machine` (`EM_AARCH64=183` /
+    // `EM_X86_64=62`) on the opened fd so cross-arch libraries in shared FHS dirs are skipped
+    // just as glibc `ld.so` skips them.
+    let mut ehdr_head = [0u8; 20];
+    let head_n = read_nix_at(reader, cx, fd.fd(), &mut ehdr_head, 0, "pread (ELF e_machine check)")?;
+    if head_n < 20 || ehdr_head.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
+        return Ok(false);
+    }
+    let e_machine = read_u16_le(&ehdr_head, 18);
+    #[cfg(target_arch = "aarch64")]
+    if e_machine != 183 {
+        return Ok(false);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if e_machine != 62 {
+        return Ok(false);
+    }
     // Ask the kernel for the canonical realpath of the ALREADY-OPENED fd via `/proc/self/fd/<fd>`,
     // resolving every intermediate directory symlink and preventing TOCTOU before authorizing the
     // inode for Landlock or hashing its content.

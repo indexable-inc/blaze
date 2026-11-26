@@ -167,6 +167,12 @@ impl blaze_own::Share for RootReader {}
 #[cfg(target_os = "linux")]
 impl RootReader {
     pub fn new(cx: &Cx) -> Result<Self, Fault> {
+        if !crate::rt::reaper_has_capacity() {
+            return Err(Fault::Host {
+                call: "bstd::fs root io (stalled-reader backlog full)",
+                code: 11,
+            });
+        }
         let io = match cx.io().beside(crate::rt::RootPath::new("/")) {
             Some(Ok(io)) => io,
             Some(Err(_)) | None => {
@@ -538,6 +544,7 @@ pub enum RetireAction<T> {
 #[cfg(target_os = "linux")]
 pub struct ReaperCore<T> {
     max_workers: usize,
+    max_pending: usize,
     active: usize,
     pending: blaze_own::VecDeque<T, blaze_own::SharedAlloc<'static>>,
     plant: ReaperPlant,
@@ -545,13 +552,20 @@ pub struct ReaperCore<T> {
 
 #[cfg(target_os = "linux")]
 impl<T> ReaperCore<T> {
-    pub fn new(max_workers: usize, plant: ReaperPlant) -> Self {
+    pub fn new(max_workers: usize, max_pending: usize, plant: ReaperPlant) -> Self {
         Self {
             max_workers: max_workers.max(1),
+            max_pending: max_pending.max(1),
             active: 0,
             pending: blaze_own::VecDeque::new_in(blaze_own::SharedAlloc::global()),
             plant,
         }
+    }
+
+    /// Whether the stalled-driver backlog still has room to admit another reader without growing
+    /// threads, descriptors, or memory past `max_workers + max_pending`.
+    pub fn has_capacity(&self) -> bool {
+        self.pending.len() < self.max_pending
     }
 
     fn effective_cap(&self) -> usize {
@@ -615,6 +629,107 @@ impl<T> ReaperCore<T> {
 
 #[cfg(target_os = "linux")]
 pub use landlock::{HostLdCaps, feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match};
+
+/// On macOS hosts, hashes the admitted OS runtime closure (`/System/Library/CoreServices/SystemVersion.plist`,
+/// optional Cryptex `SystemVersion.plist`, `/usr/lib/dyld`, and the active `dyld_shared_cache`
+/// 4 KiB header carrying its UUID) under `cx` so macOS, Cryptex, or `libSystem` updates roll
+/// content-addressed probe answerer keys (AGENTS.md rule 21).
+#[cfg(target_os = "macos")]
+pub fn feed_macos_runtime_closure(cx: &Cx, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
+    let io = match cx.io().beside(crate::rt::RootPath::new("/")) {
+        Some(Ok(io)) => io,
+        Some(Err(_)) | None => {
+            return Err(Fault::Host { call: "bstd::fs root io (open / on macOS)", code: 5 });
+        }
+    };
+    let fs = io
+        .need_fs()
+        .map_err(|_| Fault::Host { call: "bstd::fs root io (missing fs on macOS)", code: 5 })?;
+    let root = fs.root().read_only();
+    let deadline = cx.deadline();
+    let left = if deadline.finite().is_some() {
+        let now = cx.io().now();
+        if deadline.passed(now) {
+            return Err(Fault::Host { call: "macos runtime closure (deadline)", code: 60 });
+        }
+        deadline.left(now)
+    } else {
+        Duration::from_secs(30)
+    };
+    let sub_cx = cx.on_beside(blaze_own::Share::share(&io), Deadline::after(io.now(), left));
+
+    let mut hash_file = |rel_str: &str, required: bool, max_bytes: Option<usize>| -> Result<bool, Fault> {
+        let rel = crate::path::Path::new(rel_str)
+            .map_err(|_| Fault::Host { call: "macos runtime closure (path)", code: 22 })?;
+        let file = match root.open_read(&sub_cx, &rel) {
+            Ok(f) => f,
+            Err(e) if e.kind == crate::fs::FsKind::NotFound && !required => {
+                feed(rel_str.as_bytes());
+                feed(b":absent");
+                return Ok(false);
+            }
+            Err(_) => return Err(Fault::Host { call: "open (macos runtime closure)", code: 5 }),
+        };
+        feed(rel_str.as_bytes());
+        let mut buf = [0u8; 64 << 10];
+        let mut off = 0u64;
+        let mut total = 0usize;
+        loop {
+            let cap = match max_bytes {
+                Some(limit) => {
+                    if total >= limit {
+                        break;
+                    }
+                    (limit - total).min(buf.len())
+                }
+                None => buf.len(),
+            };
+            let Some(dst) = buf.get_mut(..cap) else {
+                break;
+            };
+            let n = file
+                .read_into(dst, off)
+                .wait(&sub_cx)
+                .map_err(|_| Fault::Host { call: "read (macos runtime closure)", code: 5 })?;
+            if n == 0 {
+                break;
+            }
+            if let Some(chunk) = buf.get(..n) {
+                feed(chunk);
+            }
+            total += n;
+            let step = u64::try_from(n).map_err(|_| Fault::Host { call: "read (macos runtime overflow)", code: 75 })?;
+            off = off.checked_add(step).ok_or(Fault::Host { call: "read (macos runtime overflow)", code: 75 })?;
+        }
+        feed(&off.to_le_bytes());
+        Ok(true)
+    };
+
+    let _ = hash_file("System/Library/CoreServices/SystemVersion.plist", true, None)?;
+    let _ = hash_file(
+        "System/Volumes/Preboot/Cryptexes/OS/System/Library/CoreServices/SystemVersion.plist",
+        false,
+        None,
+    )?;
+    let _ = hash_file("usr/lib/dyld", true, None)?;
+    // First 4 KiB of the active dyld shared cache holds its header + 16-byte UUID.
+    let mut hashed_cache = false;
+    for cache_rel in [
+        "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
+        "System/Library/dyld/dyld_shared_cache_arm64e",
+        "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h",
+        "System/Library/dyld/dyld_shared_cache_x86_64h",
+    ] {
+        if hash_file(cache_rel, false, Some(4096))? {
+            hashed_cache = true;
+            break;
+        }
+    }
+    if !hashed_cache {
+        feed(b"dyld_shared_cache:none");
+    }
+    Ok(())
+}
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
 pub use machine::{Effect, Event, HermeticMachine, MachineOpts, State, Stream, Usage};
 pub use plan::{Access, Plan, PlanOpts, Rule as PlanRule, Why};

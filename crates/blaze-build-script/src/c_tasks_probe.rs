@@ -225,9 +225,14 @@ fn is_header_search_flag(arg: &str) -> bool {
         return true;
     }
     // Closed-world guard: refuse any `flag=value` option whose value contains a path separator
-    // (other than safe string-rewriting prefix-map flags and `-D` macro definitions) or whose name
-    // explicitly references an external file/list/dir/directory/path/sysroot/plugin/overlay.
-    if !is_prefix_map_flag(arg) && !arg.starts_with("-D") && let Some((name, val)) = arg.split_once('=') {
+    // (other than safe string-rewriting prefix-map / compilation-dir metadata flags and `-D` macro
+    // definitions) or whose name explicitly references an external file/list/dir/directory/path/
+    // sysroot/plugin/overlay.
+    if !is_prefix_map_flag(arg)
+        && !is_metadata_dir_flag(arg)
+        && !arg.starts_with("-D")
+        && let Some((name, val)) = arg.split_once('=')
+    {
         if val.contains('/') || val.contains('\\') {
             return true;
         }
@@ -280,6 +285,10 @@ fn is_extra_output_flag(arg: &str) -> bool {
             | "--serialize-diagnostics"
             | "-save-temps"
             | "--save-temps"
+            | "-save-stats"
+            | "--save-stats"
+            | "-gen-reproducer"
+            | "-mllvm"
             | "-dumpdir"
             | "-dumpbase"
             | "-dumpbase-ext"
@@ -330,6 +339,9 @@ fn is_extra_output_flag(arg: &str) -> bool {
         || arg.starts_with("--serialize-diagnostics=")
         || arg.starts_with("-save-temps=")
         || arg.starts_with("--save-temps=")
+        || arg.starts_with("-save-stats=")
+        || arg.starts_with("--save-stats=")
+        || arg.starts_with("-gen-reproducer=")
         || arg.starts_with("-fdeps-file=")
         || arg.starts_with("-fmodule-output=")
         || arg.starts_with("-fmodules-cache-path=")
@@ -770,6 +782,13 @@ fn is_prefix_map_flag(arg: &str) -> bool {
         || arg.starts_with("-fcoverage-prefix-map=")
 }
 
+/// Whether `arg` sets only output-object compilation-directory metadata (never reads that directory).
+fn is_metadata_dir_flag(arg: &str) -> bool {
+    arg.starts_with("-fdebug-compilation-dir=")
+        || arg.starts_with("-fcoverage-compilation-dir=")
+        || arg.starts_with("-ffile-compilation-dir=")
+}
+
 /// Environment variables in [`CLANG_ENV`] that steer header/file discovery outside `OUT_DIR`.
 fn is_path_steering_env(name: &str) -> bool {
     matches!(
@@ -819,8 +838,16 @@ fn flag_takes_value(arg: &str) -> bool {
 /// `CC_LOG_DIAGNOSTICS`, `CCC_ADD_ARGS`, `FORCE_CLANG_DIAGNOSTICS_COLOR`, `LLVM_PROFILE_FILE`,
 /// `GCOV_PREFIX*`, `LD_*`, `DYLD_*`).
 fn is_unmodeled_clang_control_env(name: &str) -> bool {
-    matches!(name, "FORCE_CLANG_DIAGNOSTICS_COLOR" | "LLVM_PROFILE_FILE" | "GCOV_PREFIX" | "GCOV_PREFIX_STRIP")
-        || name.starts_with("CC_PRINT_")
+    matches!(
+        name,
+        "FORCE_CLANG_DIAGNOSTICS_COLOR"
+            | "LLVM_PROFILE_FILE"
+            | "GCOV_PREFIX"
+            | "GCOV_PREFIX_STRIP"
+            | "GLIBC_TUNABLES"
+            | "GCONV_PATH"
+            | "LOCPATH"
+    ) || name.starts_with("CC_PRINT_")
         || name.starts_with("CC_LOG_")
         || (name.starts_with("CCC_") && name != "CCC_OVERRIDE_OPTIONS")
         || name.starts_with("CLANG_")
@@ -1691,17 +1718,14 @@ fn same_key(a: &Row<'_>, b: &Row<'_>) -> bool {
         && same_set(&a.files, &b.files)
 }
 
-/// Whether `next` is a real path or quoting boundary immediately after a substituted root directory
-/// (never treating valid Unix filename punctuation such as `+`, `:`, `;`, `,`, `=`, `@`, or
-/// non-ASCII UTF-8 bytes as delimiters).
+/// Whether `next` is a genuine path boundary immediately after a substituted root directory
+/// (`None` for end-of-value, `'/'` for a child path component, or `'='` only inside
+/// `-f*-prefix-map=old=new`). Never treats Unix filename punctuation or whitespace as delimiters.
 fn is_root_end_boundary(next: Option<u8>, allow_eq: bool) -> bool {
     match next {
-        None => true,
+        None | Some(b'/') => true,
         Some(b'=') => allow_eq,
-        Some(b) => matches!(
-            b,
-            b'/' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b')' | b']' | b'}' | b'>'
-        ),
+        _ => false,
     }
 }
 

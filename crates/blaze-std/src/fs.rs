@@ -434,26 +434,44 @@ impl Meta {
 /// An exclusive file lock acquired through [`Dir::lock_exclusive`]: call [`FileLock::unlock`] on
 /// the result-bearing path so unlock failures surface as typed [`FsError`]s; `Drop` performs a
 /// bounded fallback unlock only if the lock was dropped early (e.g. on error/unwind).
+enum FileLockKind {
+    Sim { io: Io, tag: blaze_core::Tag },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Native(crate::rt::NativeLock),
+}
+
 pub struct FileLock {
-    io: Io,
+    kind: FileLockKind,
     name: FileName,
-    tag: blaze_core::Tag,
     unlocked: bool,
 }
 
 impl FileLock {
     /// Explicitly releases the file lock under `cx`, surfacing any `Done::Failed` or stop error.
-    /// Marks the lock released ONLY after receiving `Done::Unlocked` so `Drop` still performs its
+    /// Marks the lock released ONLY after receiving confirmation so `Drop` still performs its
     /// bounded fallback unlock if an explicit unlock fails or times out.
     pub fn unlock(mut self, cx: &Cx) -> Result<(), FsError> {
-        let lock = self.tag;
-        match call(&self.io, cx, FsOp::Publish, &self.name, |tag| Effect::Unlock { lock, tag })? {
-            Done::Unlocked => {
+        match &mut self.kind {
+            FileLockKind::Sim { io, tag } => {
+                let lock = *tag;
+                match call(io, cx, FsOp::Publish, &self.name, |t| Effect::Unlock { lock, tag: t })? {
+                    Done::Unlocked => {
+                        self.unlocked = true;
+                        Ok(())
+                    }
+                    Done::Failed(error) => Err(FsError::new(FsOp::Publish, &self.name, FsKind::Driver(error.0))),
+                    other => Err(unexpected(FsOp::Publish, &self.name, other)),
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                crate::rt::unlock_off_thread(cx, native).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &self.name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &self.name, &msg.as_str()),
+                })?;
                 self.unlocked = true;
                 Ok(())
             }
-            Done::Failed(error) => Err(FsError::new(FsOp::Publish, &self.name, FsKind::Driver(error.0))),
-            other => Err(unexpected(FsOp::Publish, &self.name, other)),
         }
     }
 }
@@ -463,10 +481,12 @@ impl Drop for FileLock {
         if self.unlocked {
             return;
         }
-        let lock = self.tag;
-        let tag = self.io.submit(|tag| Effect::Unlock { lock, tag });
-        let until = blaze_core::wait::Deadline::after(self.io.now(), core::time::Duration::from_secs(5));
-        let _ = self.io.settle(tag, until, "bstd::fs::FileLock unlock");
+        if let FileLockKind::Sim { io, tag } = &self.kind {
+            let lock = *tag;
+            let req = io.submit(|t| Effect::Unlock { lock, tag: t });
+            let until = blaze_core::wait::Deadline::after(io.now(), core::time::Duration::from_secs(5));
+            let _ = io.settle(req, until, "bstd::fs::FileLock unlock");
+        }
     }
 }
 
@@ -2260,11 +2280,20 @@ impl Dir<ReadWrite> {
         self.finish_if_absent_inner(cx, staged, durable)
     }
 
-    /// Acquires an exclusive advisory file lock at `path` (creating the lock file if absent) via
-    /// `Effect::Lock`, retrying on `Done::Contended` with scheduler-aware timers until `cx`'s
-    /// deadline or cancellation. Call [`FileLock::unlock`] on the result-bearing path.
+    /// Acquires an exclusive advisory file lock at `path` (creating the lock file if absent),
+    /// keeping native filesystem lock I/O off the driver's polling thread (cancellable/reapable
+    /// under `cx` deadline/cancellation) and using `Effect::Lock` in simulated worlds. Call
+    /// [`FileLock::unlock`] on the result-bearing path.
     pub fn lock_exclusive(&self, cx: &Cx, path: &Path) -> Result<FileLock, FsError> {
         let name = self.beneath(path);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(root) = self.io.native_root() {
+            let native = crate::rt::lock_exclusive_off_thread(cx, root.as_str(), name.as_str()).map_err(|err| match err {
+                crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+            })?;
+            return Ok(FileLock { kind: FileLockKind::Native(native), name, unlocked: false });
+        }
         let backoff = core::time::Duration::from_millis(2);
         loop {
             cx.stopped_by(self.io.now())
@@ -2280,7 +2309,11 @@ impl Dir<ReadWrite> {
                 .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
             match done {
                 Done::Locked => {
-                    return Ok(FileLock { io: self.io.share(), name, tag: acquired_tag, unlocked: false });
+                    return Ok(FileLock {
+                        kind: FileLockKind::Sim { io: self.io.share(), tag: acquired_tag },
+                        name,
+                        unlocked: false,
+                    });
                 }
                 Done::Contended => {
                     let _ = self

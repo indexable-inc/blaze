@@ -67,6 +67,10 @@ fn open_native_in(os: &blaze_core::Os, world: NativeWorld<'_>, workers: Option<c
             hosted: None,
             disk: None,
             plant: Plant::None,
+            native_root: world
+                .root
+                .to_str()
+                .map(|s| blaze_own::String::from_str_in(s, blaze_own::SharedAlloc::global())),
         },
         workers,
     ))

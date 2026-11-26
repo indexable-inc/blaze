@@ -1116,6 +1116,32 @@ pub(crate) fn panicking() -> bool {
     std::thread::panicking()
 }
 
+#[cfg(target_os = "linux")]
+const MAX_REAPERS: usize = 64;
+#[cfg(target_os = "linux")]
+const MAX_REAPER_PENDING: usize = 64;
+
+#[cfg(target_os = "linux")]
+fn reaper_pool() -> &'static self::std::sync::Mutex<crate::procs::hermetic::ReaperCore<(crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>)>> {
+    use self::std::sync::{Mutex, OnceLock};
+    use crate::procs::hermetic::{ReaperCore, ReaperPlant};
+    type Retired = (crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>);
+    static POOL: OnceLock<Mutex<ReaperCore<Retired>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(ReaperCore::new(MAX_REAPERS, MAX_REAPER_PENDING, ReaperPlant::None)))
+}
+
+/// Whether the stalled-reader reaper backlog still has capacity to admit another [`RootReader`]
+/// (bounds total wedged workers, descriptors, and memory at `MAX_REAPERS + MAX_REAPER_PENDING`).
+#[cfg(target_os = "linux")]
+pub(crate) fn reaper_has_capacity() -> bool {
+    let pool = reaper_pool();
+    let guard = match pool.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.has_capacity()
+}
+
 /// Retires an abandoned native `Io` (whose worker thread is still blocked in an uninterruptible
 /// kernel read after cancellation/deadline) through [`crate::procs::hermetic::ReaperCore`]:
 /// 1. Caller stack-drop NEVER drops synchronously (not even at the 64-worker cap or on transient
@@ -1123,16 +1149,13 @@ pub(crate) fn panicking() -> bool {
 ///    reaper finishes),
 /// 2. Up to `MAX_REAPERS = 64` independent reaper threads run concurrently so one permanently
 ///    wedged mount never blocks cleanup of later retired drivers, and
-/// 3. Worker count is strictly bounded by `MAX_REAPERS`.
+/// 3. Total wedged backlog is bounded by `reaper_has_capacity()` (`MAX_REAPERS + MAX_REAPER_PENDING`).
 #[cfg(target_os = "linux")]
 pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::fs::ReadOnly>) {
-    use self::std::sync::{Mutex, OnceLock};
-    use crate::procs::hermetic::{ReaperCore, ReaperPlant, RetireAction};
-    type Retired = (crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>);
-    const MAX_REAPERS: usize = 64;
-    static POOL: OnceLock<Mutex<ReaperCore<Retired>>> = OnceLock::new();
+    use self::std::sync::Mutex;
+    use crate::procs::hermetic::RetireAction;
 
-    let pool = POOL.get_or_init(|| Mutex::new(ReaperCore::new(MAX_REAPERS, ReaperPlant::None)));
+    let pool = reaper_pool();
     let mut to_spawn = {
         let mut guard = match pool.lock() {
             Ok(g) => g,
@@ -1142,7 +1165,6 @@ pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::f
             RetireAction::Spawn(item) => Some(item),
             RetireAction::Queued => None,
             RetireAction::SyncDrop(item) => {
-                // Unreachable under `ReaperPlant::None`; keep off caller regardless.
                 guard.on_spawn_failed(item);
                 None
             }
@@ -1187,6 +1209,190 @@ pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::f
             Err(poisoned) => poisoned.into_inner(),
         };
         to_spawn = guard.take_spawnable();
+    }
+}
+
+/// Exclusive advisory file lock acquired off the driver's polling thread on native Unix hosts so
+/// stalled FUSE/NFS `open` or `try_lock` calls never freeze driver polling and always honor
+/// `Cx::cancelled()` and `Cx::deadline()`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct NativeLock(Option<self::std::fs::File>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_LOCK_WORKERS: usize = 64;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static ACTIVE_LOCK_WORKERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for NativeLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take() {
+            let prev = ACTIVE_LOCK_WORKERS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            if prev < MAX_LOCK_WORKERS {
+                let spawned = self::std::thread::Builder::new()
+                    .name(self::std::string::String::from("bstd-lock-drop"))
+                    .spawn(move || {
+                        let _ = file.unlock();
+                        drop(file);
+                        ACTIVE_LOCK_WORKERS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+                    });
+                if spawned.is_ok() {
+                    return;
+                }
+            }
+            ACTIVE_LOCK_WORKERS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Error returned by [`lock_exclusive_off_thread`] / [`unlock_off_thread`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) enum NativeLockErr {
+    Stopped(crate::Stopped),
+    Driver(blaze_own::String<blaze_own::SharedAlloc<'static>>),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lock_err_static(msg: &str) -> NativeLockErr {
+    NativeLockErr::Driver(blaze_own::String::from_str_in(msg, blaze_own::SharedAlloc::global()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lock_err_display(err: impl core::fmt::Display) -> blaze_own::String<blaze_own::SharedAlloc<'static>> {
+    let mut out = blaze_own::String::new_in(blaze_own::SharedAlloc::global());
+    let _ = core::fmt::write(&mut out, format_args!("{err}"));
+    out
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn lock_exclusive_off_thread(
+    cx: &crate::cx::Cx,
+    root: &str,
+    rel: &str,
+) -> Result<NativeLock, NativeLockErr> {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::time::Duration;
+    use self::std::fs::{OpenOptions, TryLockError};
+    use self::std::path::PathBuf;
+    use self::std::sync::mpsc;
+
+    let mut full = PathBuf::from(root);
+    full.push(rel);
+    let backoff = Duration::from_millis(2);
+    loop {
+        cx.stopped_by(cx.io().now()).map_err(NativeLockErr::Stopped)?;
+        let prev = ACTIVE_LOCK_WORKERS.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_LOCK_WORKERS {
+            ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            return Err(lock_err_static("file-lock worker cap reached (stalled filesystem backlog full)"));
+        }
+        let abandoned = blaze_own::Arc::new_in(AtomicBool::new(false), blaze_own::SharedAlloc::global());
+        let abandoned_w = blaze_own::Share::share(&abandoned);
+        let path_w = PathBuf::from(full.as_os_str());
+        type LockMsg = Result<Option<self::std::fs::File>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+        let (tx, rx) = mpsc::sync_channel::<LockMsg>(1);
+        let spawned = self::std::thread::Builder::new()
+            .name(self::std::string::String::from("bstd-lock-op"))
+            .spawn(move || {
+                let res: LockMsg = (|| {
+                    if let Some(parent) = path_w.parent() {
+                        let _ = self::std::fs::create_dir_all(parent);
+                    }
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&path_w)
+                        .map_err(lock_err_display)?;
+                    #[allow(clippy::disallowed_methods, reason = "NativeLock::unlock unlocks explicitly before close")]
+                    match file.try_lock() {
+                        Ok(()) => Ok(Some(file)),
+                        Err(TryLockError::WouldBlock) => Ok(None),
+                        Err(TryLockError::Error(e)) => Err(lock_err_display(e)),
+                    }
+                })();
+                if abandoned_w.load(Ordering::Acquire) {
+                    if let Ok(Some(file)) = res {
+                        let _ = file.unlock();
+                        drop(file);
+                    }
+                } else if let Err(mpsc::SendError(Ok(Some(file)))) = tx.send(res) {
+                    let _ = file.unlock();
+                    drop(file);
+                }
+                ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            });
+        if spawned.is_err() {
+            ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            return Err(lock_err_static("failed to spawn off-thread file-lock worker"));
+        }
+        loop {
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(Ok(Some(file))) => return Ok(NativeLock(Some(file))),
+                Ok(Ok(None)) => break, // Contended: backoff and retry.
+                Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(stopped) = cx.stopped_by(cx.io().now()) {
+                        abandoned.store(true, Ordering::Release);
+                        return Err(NativeLockErr::Stopped(stopped));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(lock_err_static("file-lock worker exited unexpectedly"));
+                }
+            }
+        }
+        let _ = cx
+            .io()
+            .call(cx, |tag| blaze_core::Effect::Timer { after: backoff, tag })
+            .map_err(NativeLockErr::Stopped)?;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn unlock_off_thread(cx: &crate::cx::Cx, lock: &mut NativeLock) -> Result<(), NativeLockErr> {
+    use core::sync::atomic::Ordering;
+    use core::time::Duration;
+    use self::std::sync::mpsc;
+
+    let Some(file) = lock.0.take() else {
+        return Ok(());
+    };
+    let prev = ACTIVE_LOCK_WORKERS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_LOCK_WORKERS {
+        ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        lock.0 = Some(file);
+        return Err(lock_err_static("file-unlock worker cap reached"));
+    }
+    type UnlockMsg = Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+    let (tx, rx) = mpsc::sync_channel::<UnlockMsg>(1);
+    let spawned = self::std::thread::Builder::new()
+        .name(self::std::string::String::from("bstd-unlock-op"))
+        .spawn(move || {
+            let res = file.unlock().map_err(lock_err_display);
+            drop(file);
+            let _ = tx.send(res);
+            ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        });
+    if spawned.is_err() {
+        ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        return Err(lock_err_static("failed to spawn off-thread file-unlock worker"));
+    }
+    loop {
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(stopped) = cx.stopped_by(cx.io().now()) {
+                    return Err(NativeLockErr::Stopped(stopped));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(lock_err_static("file-unlock worker exited unexpectedly"));
+            }
+        }
     }
 }
 

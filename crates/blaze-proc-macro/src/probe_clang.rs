@@ -342,7 +342,16 @@ impl HermeticClangProbe {
                 h.part(b"no-elf-closure");
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let _ = clang_path;
+            bstd::procs::hermetic::feed_macos_runtime_closure(cx, &mut |chunk| {
+                h.update(chunk);
+            })
+            .map_err(|fault| own_fmt(format_args!("c-probe macOS runtime closure: {fault:?}"), alloc))?;
+            h.part(b"macos-runtime-closure-ok");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (cx, clang_path);
         }
@@ -912,18 +921,19 @@ impl RootFiles for ProbeFiles {
     }
 }
 
-/// Extracts or defaults `SOURCE_DATE_EPOCH` so `owned_env` and `ClockSpec::Fixed` always agree.
+/// Extracts or defaults `SOURCE_DATE_EPOCH` for the hermetic sandbox clock (`ClockSpec::Fixed`).
+/// When the caller provided an invalid/out-of-range `SOURCE_DATE_EPOCH`, preserves that exact
+/// environment variable for Clang (so Clang itself produces its normal exit status 1 and
+/// diagnostic) and uses `0` for the sandbox clock rather than aborting the build.
 fn resolve_source_date_epoch<'a>(
     owned_env: &mut AVec<'a, (AString<'a>, AString<'a>)>,
     alloc: Alloc<'a>,
-) -> Result<u64, AString<'a>> {
+) -> u64 {
     if let Some((_, val)) = owned_env.iter().find(|(k, _)| k.as_str() == "SOURCE_DATE_EPOCH") {
-        val.as_str()
-            .parse::<u64>()
-            .map_err(|_| own_fmt(format_args!("invalid SOURCE_DATE_EPOCH `{}` for compiler probe", val.as_str()), alloc))
+        val.as_str().parse::<u64>().unwrap_or(0)
     } else {
         owned_env.push((own_str("SOURCE_DATE_EPOCH", alloc), own_str("0", alloc)));
-        Ok(0)
+        0
     }
 }
 
@@ -1076,7 +1086,7 @@ impl ProbeAnswerer for HermeticClangProbe {
                 render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc)?,
             ));
         }
-        let epoch_secs = resolve_source_date_epoch(&mut owned_env, alloc)?;
+        let epoch_secs = resolve_source_date_epoch(&mut owned_env, alloc);
         owned_env.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         owned_env.dedup_by(|a, b| a.0.as_str() == b.0.as_str());
         let mut env_refs: AVec<'a, (&str, &str)> = OwnVec::with_capacity_in(owned_env.len(), alloc);
@@ -1719,16 +1729,17 @@ mod tests {
             let _ = std::fs::remove_file(&pin_file);
         }
 
-        // SOURCE_DATE_EPOCH parsing honors nonzero epoch and rejects invalid text.
+        // SOURCE_DATE_EPOCH parsing honors nonzero epoch and preserves invalid text for Clang.
         let mut env_nz = AVec::new_in(alloc);
         env_nz.push((OwnString::from_str_in("SOURCE_DATE_EPOCH", alloc), OwnString::from_str_in("1700000000", alloc)));
-        assert_eq!(resolve_source_date_epoch(&mut env_nz, alloc).expect("nonzero epoch"), 1_700_000_000);
+        assert_eq!(resolve_source_date_epoch(&mut env_nz, alloc), 1_700_000_000);
         let mut env_default = AVec::new_in(alloc);
-        assert_eq!(resolve_source_date_epoch(&mut env_default, alloc).expect("default epoch"), 0);
+        assert_eq!(resolve_source_date_epoch(&mut env_default, alloc), 0);
         assert_eq!(env_default.len(), 1);
         let mut env_bad = AVec::new_in(alloc);
         env_bad.push((OwnString::from_str_in("SOURCE_DATE_EPOCH", alloc), OwnString::from_str_in("not-a-num", alloc)));
-        assert!(resolve_source_date_epoch(&mut env_bad, alloc).is_err());
+        assert_eq!(resolve_source_date_epoch(&mut env_bad, alloc), 0);
+        assert_eq!(env_bad[0].1.as_str(), "not-a-num", "invalid SOURCE_DATE_EPOCH must be preserved for Clang");
 
         // Lazy verification runs through `bstd::sync::Flight` without holding any lock across
         // filesystem waits; concurrent waiters park on its Signal and honor their own deadline.
@@ -1967,6 +1978,7 @@ mod tests {
     fn run_reaper_core_dst(plant: bstd::procs::hermetic::ReaperPlant) -> Result<(), &'static str> {
         use bstd::procs::hermetic::{ReaperCore, RetireAction};
         const MAX_WORKERS: usize = 64;
+        const MAX_PENDING: usize = 64;
         const ITEMS: usize = 110;
         for seed in 0..300u64 {
             let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
@@ -1977,7 +1989,7 @@ mod tests {
                 z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
                 z ^ (z >> 31)
             };
-            let mut core: ReaperCore<(usize, bool)> = ReaperCore::new(MAX_WORKERS, plant);
+            let mut core: ReaperCore<(usize, bool)> = ReaperCore::new(MAX_WORKERS, MAX_PENDING, plant);
             // Active simulated workers: `(item_id, permanently_wedged)`.
             let mut workers = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
             let mut reaped = 0usize;
@@ -2102,6 +2114,21 @@ mod tests {
             if core.active() != stuck_total {
                 return Err("reaper oracle: active worker count diverged from wedged mount count");
             }
+            if !core.has_capacity() {
+                return Err("reaper oracle: drained core must report capacity available");
+            }
+        }
+        // Admission-control bound check: once `MAX_WORKERS + MAX_PENDING` items are wedged,
+        // `has_capacity()` must turn false so stalled-driver backlog is strictly bounded.
+        let mut cap_core: ReaperCore<usize> = ReaperCore::new(MAX_WORKERS, MAX_PENDING, plant);
+        for i in 0..(MAX_WORKERS + MAX_PENDING) {
+            if !cap_core.has_capacity() {
+                return Err("reaper oracle: has_capacity turned false before MAX_WORKERS + MAX_PENDING");
+            }
+            let _ = cap_core.retire(i);
+        }
+        if cap_core.has_capacity() {
+            return Err("reaper oracle: has_capacity stayed true at MAX_WORKERS + MAX_PENDING");
         }
         Ok(())
     }

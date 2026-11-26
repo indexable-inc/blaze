@@ -490,18 +490,24 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         ProbeWhy::PackageInput
     );
 
-    // Literal `-DROOT="$OUT_DIR"` and actual `-DROOT="<OUT_DIR>"` have disjoint structural ProbeKeys
-    // and keep the literal string distinct from the real `Segment::OutDir`.
-    let lit_args = flag_args("-DROOT=\"$OUT_DIR\"");
-    let real_define = std::format!("-DROOT=\"{OUT}\"");
-    let real_args = flag_args(&real_define);
+    // Literal `-fdebug-compilation-dir=$OUT_DIR` and actual `-fdebug-compilation-dir=<OUT_DIR>`
+    // have disjoint structural ProbeKeys and keep the literal string distinct from `Segment::OutDir`
+    // (likewise for `-fdebug-prefix-map=<OUT_DIR>=.`).
+    let lit_args = flag_args("-fdebug-compilation-dir=$OUT_DIR");
+    let real_dir_flag = std::format!("-fdebug-compilation-dir={OUT}");
+    let real_args = flag_args(&real_dir_flag);
+    let pmap_flag = std::format!("-fdebug-prefix-map={OUT}=.");
+    let pmap_args = flag_args(&pmap_flag);
     let sp_lit = Spawn { program: "cc", args: &lit_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
     let sp_real = Spawn { program: "cc", args: &real_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let sp_pmap = Spawn { program: "cc", args: &pmap_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
     let can_lit = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_lit, files, alloc).expect("lit");
     let can_real = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_real, files, alloc).expect("real");
+    let can_pmap = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_pmap, files, alloc).expect("pmap");
     assert_ne!(can_lit.key, can_real.key, "literal $OUT_DIR must not collide with real OUT_DIR");
     assert!(can_lit.exec_args.iter().flatten().all(|s| !matches!(s, crate::c_tasks_probe::Segment::OutDir)));
     assert!(can_real.exec_args.iter().flatten().any(|s| matches!(s, crate::c_tasks_probe::Segment::OutDir)));
+    assert!(can_pmap.exec_args.iter().flatten().any(|s| matches!(s, crate::c_tasks_probe::Segment::OutDir)));
 
     // Inline assembly (`.incbin`) and preprocessor token pasting (`##` / `%:%:`) are refused
     // before caching; deterministic profile-generation flags are allowed while feedback-reading
@@ -613,10 +619,22 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert!(!is_probe("cc", &["-c", "-no-integrated-as", "-o", "/out/flag_check", "/out/flag_check.c"]));
     assert!(!is_probe("cc", &["-c", "-fno-integrated-cc1", "-o", "/out/flag_check", "/out/flag_check.c"]));
     assert!(!is_probe("cc", &["-c", "-no-integrated-cc1", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-save-stats", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-save-stats=obj", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-gen-reproducer=always", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-mllvm", "-stats-file=/out/s", "-o", "/out/flag_check", "/out/flag_check.c"]));
+
+    // Output-metadata compilation-directory flags (`-fdebug-compilation-dir=.`, etc.) do not read
+    // host directories and must be accepted by flag-support probes.
+    for meta_flag in ["-fdebug-compilation-dir=.", "-fcoverage-compilation-dir=.", "-ffile-compilation-dir=."] {
+        let m_args = flag_args(meta_flag);
+        let sp_m = Spawn { program: "cc", args: &m_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        assert!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_m, files, alloc).is_ok(), "{meta_flag} must be allowed");
+    }
 
     // Ambient toolchain discovery flags (`-v`, `-###`, `-print-search-dirs`, `-print-file-name=...`)
-    // and Clang output-control environment variables (`CC_PRINT_OPTIONS`, `CC_PRINT_OPTIONS_FILE`)
-    // are refused as HostDependent before caching.
+    // and Clang/glibc control environment variables (`CC_PRINT_OPTIONS`, `GLIBC_TUNABLES`) are
+    // refused as HostDependent before caching.
     for disc in ["-v", "-###", "--verbose", "-print-search-dirs", "-print-file-name=libc.a"] {
         let d_args = flag_args(disc);
         let sp_d = Spawn { program: "cc", args: &d_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
@@ -625,7 +643,12 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
             ProbeWhy::HostDependent
         );
     }
-    for (env_k, env_v) in [("CC_PRINT_OPTIONS", "1"), ("CC_PRINT_OPTIONS_FILE", "/out/opts.log"), ("CC_LOG_DIAGNOSTICS", "1")] {
+    for (env_k, env_v) in [
+        ("CC_PRINT_OPTIONS", "1"),
+        ("CC_PRINT_OPTIONS_FILE", "/out/opts.log"),
+        ("CC_LOG_DIAGNOSTICS", "1"),
+        ("GLIBC_TUNABLES", "glibc.cpu.hwcaps=-x86-64-v3"),
+    ] {
         let bad_env = [("SDKROOT", SDK), (env_k, env_v)];
         let sp_e = Spawn { program: "cc", args: &ok_args, env: &bad_env, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
         assert_eq!(
@@ -647,14 +670,20 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert_eq!(canon_dot.row.files.len(), 1, "normalized ./flag_check.c must resolve the OUT_DIR input digest");
     assert_eq!(canon_dot.input_rels[0].1.as_str(), "flag_check.c");
 
-    // Root substitution must only occur at real path/quoting boundaries: filename punctuation
-    // (`+`, `:`, `;`, `,`, `=`, non-ASCII) after `OUT_DIR` must NOT be rewritten to `$OUT_DIR`.
+    // Root substitution must only occur at genuine path boundaries (`/` or EOF, plus `=` only in
+    // `-f*-prefix-map=`); filename punctuation, closing brackets, whitespace, and non-ASCII bytes
+    // must NOT rewrite path literals to `$OUT_DIR`.
     for literal_def in [
         "-DROOT=\"/target/debug/build/zstd-sys-1/out+suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/out:suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/out;suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/out,suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/out=suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out)suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out]suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out}suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out>suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/outé\"",
     ] {
         let def_args = flag_args(literal_def);
