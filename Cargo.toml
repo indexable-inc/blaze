@@ -64,6 +64,8 @@ version = "0.20261105.4"
 # A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
 # saying what moved (docs/cargo.md, "Lock files").
 lock = "required"
+# Every internal workspace member must use `bstd` (`edition = "blaze-2026.11"`), never Rust's `std`.
+std = "bstd"
 
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
 # pins/llvm.json names for the target, checks its sha256, unpacks it read-only

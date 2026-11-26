@@ -1175,6 +1175,7 @@ mod tests {
             (Area::Cli, crate::units::UNREAD),
             (Area::Cli, crate::units::TOOLCHAIN_NAMED),
             (Area::Cli, crate::units::TARGET_REFUSED),
+            (Area::Cli, crate::units::STD_NOT_BSTD),
             (Area::Cli, crate::graph::TARGET_SKIPPED),
             (Area::Cli, crate::graph::RUSTFLAGS_NOT_APPLIED),
             (Area::Cli, crate::unused_deps::UNUSED_DEPENDENCY),

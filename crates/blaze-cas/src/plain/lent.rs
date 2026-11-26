@@ -32,6 +32,7 @@ use super::arena::{Arena, ArenaView, RunEntry, Visibility};
 use super::core::{Batch, CommitDurability, Committed, GcPlan, LentRecord, Named, POINTER_LEN, PidCheck, Probes, PutPath, Renewed, Report, Sliced};
 use super::driven::{Driven, HeadIdentity};
 use super::format::record_crc;
+use super::par::{Par, Serial};
 use crate::Key;
 
 /// One arena chunk's blocks (1 MiB); a larger record gets a chunk of its own size.
@@ -958,14 +959,20 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// in place; every arena chunk no get lent from is freed, and what a get lent stays lent
     /// (`lend`'s contract: its chunk is kept, holding no key).
     pub fn commit(&self) -> Result<Committed<A>, LentError> {
+        self.commit_par(&Serial)
+    }
+
+    /// Parallel twin of [`Lent::commit`]: runs `TwoValues` verification, BLAKE3 segment sealing,
+    /// Bloom construction, and targeted prior-boot segment checks through `par`.
+    pub fn commit_par<P: Par>(&self, par: &P) -> Result<Committed<A>, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
         if self.plant == LentPlant::RootFirst {
-            inner.store.commit_with(&[]).map_err(stopped("committing the roots first (planted)"))?;
+            inner.store.commit_with_par(&[], par).map_err(stopped("committing the roots first (planted)"))?;
         }
         let upto = inner.order.len();
         if self.plant == LentPlant::None && inner.committed == upto && !inner.store.core().needs_commit() {
-            let committed = inner.store.commit_records(&[], &[]).map_err(stopped("committing nothing"))?;
+            let committed = inner.store.commit_records_par(&[], &[], par).map_err(stopped("committing nothing"))?;
             inner.counts.commits += 1;
             return Ok(committed);
         }
@@ -977,7 +984,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         // copied into its namespace's batch first, as before. The same segments either way
         // (arena_tests.rs `the_two_visibilities_write_the_same_segments`).
         let (committed, batch_bytes) = if matches!(self.visibility, Visibility::InArena { .. }) {
-            (self.commit_shared(inner, upto)?, 0)
+            (self.commit_shared_par(inner, upto, par)?, 0)
         } else {
             let mut writes: Vec<Namespace, &A> = Vec::with_capacity_in(inner.store.core().writes().len(), &self.alloc);
             writes.extend_from_slice(inner.store.core().writes());
@@ -999,11 +1006,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             }
             let batch_bytes = batches.iter().map(Batch::bytes).sum::<u64>() + first.bytes();
             if !first.is_empty() {
-                inner.store.commit_with(&[&first]).map_err(stopped("committing the pointers first (planted)"))?;
+                inner.store.commit_with_par(&[&first], par).map_err(stopped("committing the pointers first (planted)"))?;
             }
             let mut refs: Vec<&Batch, &A> = Vec::with_capacity_in(batches.len(), &self.alloc);
             refs.extend(batches.iter().filter(|batch| !batch.is_empty()));
-            (inner.store.commit_with(&refs).map_err(stopped("committing"))?, batch_bytes)
+            (inner.store.commit_with_par(&refs, par).map_err(stopped("committing"))?, batch_bytes)
         };
         inner.committed = upto;
         inner.uncommitted_bytes = 0;
@@ -1051,11 +1058,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
 
     /// `Visibility::InArena`'s commit of the puts `order[committed..upto]`: each lent to the
     /// layout from the shared arena where it lies, with the CRC its put made (core.rs
-    /// `LentRecord`, `Plain::commit_records`): its bytes read once, by the layout's one copy
+    /// `LentRecord`, `Plain::commit_records_par`): its bytes read once, by the layout's one copy
     /// into the segment's piece. The list of records is in the handed allocator.
     /// (`LentPlant::PointerFirst`, planted: the pointers committed alone first, as the batch
     /// path's control does.)
-    fn commit_shared(&self, inner: &mut Inner<D, A>, upto: usize) -> Result<Committed<A>, LentError> {
+    fn commit_shared_par<P: Par>(&self, inner: &mut Inner<D, A>, upto: usize, par: &P) -> Result<Committed<A>, LentError> {
         let Inner { store, shared, puts, order, committed, .. } = inner;
         let from = (*committed).min(upto);
         let mut records: Vec<LentRecord<'_>, &A> = Vec::new_in(&self.alloc);
@@ -1078,9 +1085,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             let mut first: Vec<LentRecord<'_>, &A> = Vec::new_in(&self.alloc);
             first.extend(records.iter().filter(|it| it.tag == ReservedTag::Pointer.tag()).copied());
             records.retain(|it| it.tag != ReservedTag::Pointer.tag());
-            store.commit_records(&[], &first).map_err(stopped("committing the pointers first (planted)"))?;
+            store.commit_records_par(&[], &first, par).map_err(stopped("committing the pointers first (planted)"))?;
         }
-        store.commit_records(&[], &records).map_err(stopped("committing"))
+        store.commit_records_par(&[], &records, par).map_err(stopped("committing"))
     }
 
     /// `Visibility::InArena`: the puts since the last take sealed into one run of the current
@@ -1112,7 +1119,12 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// Every segment mapped and every parked one checked (probe.rs): asked once, when the
     /// request's first pool task is about to start.
     pub fn map_all(&self) -> Result<(), LentError> {
-        self.inner.borrow_mut().store.map_all().map_err(stopped("mapping every segment named"))
+        self.map_all_par(&Serial)
+    }
+
+    /// Parallel twin of [`Lent::map_all`]: verifies large earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&self, par: &P) -> Result<(), LentError> {
+        self.inner.borrow_mut().store.map_all_par(par).map_err(stopped("mapping every segment named"))
     }
 
     /// After the answer: the exit tail sealed (`Driven::seal`). Whether a flip was made.
@@ -1152,13 +1164,18 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// `CLEANUP_SLICES_MOST`, the bytes read under this process's work budget). The slices
     /// summed (`Sliced::and`) and how many replaced something.
     pub fn clean_on(&self, first: Option<Sliced>) -> Result<(Option<Sliced>, u32), LentError> {
+        self.clean_on_par(first, &Serial)
+    }
+
+    /// Parallel twin of [`Lent::clean_on`]: commits each folded cleanup slice through `par`.
+    pub fn clean_on_par<P: Par>(&self, first: Option<Sliced>, par: &P) -> Result<(Option<Sliced>, u32), LentError> {
         let Some(mut so_far) = first else { return Ok((None, 0)) };
         let (mut last, mut slices) = (so_far, u32::from(so_far.segments > 0 && !so_far.aborted));
         while self.inner.borrow().store.core().cleanup_goes_on(&so_far, slices, &last) {
             if !self.fold_slice()? {
                 break;
             }
-            self.commit()?;
+            self.commit_par(par)?;
             let Some(next) = self.take_sliced() else { break };
             slices += u32::from(next.segments > 0 && !next.aborted);
             so_far = so_far.and(next);

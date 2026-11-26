@@ -25,6 +25,7 @@ use blaze_keyed::{
 use super::{
     core::{Batch, CommitDurability, CommitRootMap, Committed, Found, GcPlan, Got, LentRecord, Liveness, PidCheck, PidLiveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
+    par::{Par, Serial},
     settings::Settings,
 };
 use crate::{Corrupt, Key};
@@ -219,6 +220,11 @@ impl<A: Allocator + Clone> Driven<Native, A> {
     /// [`Settings::writes`]): everything [`Namespace::LOCAL`] by default. What it keeps is in
     /// `alloc`, the caller's.
     pub fn open(root: &Path, settings: &Settings, alloc: A) -> Result<Driven<Native, A>, StoreError> {
+        Driven::open_with_par(root, settings, alloc, &Serial)
+    }
+
+    /// Parallel twin of [`Driven::open`]: verifies large earlier-boot segments through `par`.
+    pub fn open_with_par<P: Par>(root: &Path, settings: &Settings, alloc: A, par: &P) -> Result<Driven<Native, A>, StoreError> {
         let dir = FileName::new("plain").expect("a relative name");
         let at = root.join(dir.as_str());
         std::fs::create_dir_all(&at).map_err(|e| os("mkdir", "the plain store's directory", &e))?;
@@ -247,7 +253,7 @@ impl<A: Allocator + Clone> Driven<Native, A> {
             liveness: Liveness::Everything,
             lock_step: crate::plain::LockStep::Backoff,
         };
-        let mut it = Driven::with(driver, root, cfg, alloc)?;
+        let mut it = Driven::with_par(driver, root, cfg, alloc, par)?;
         it.set_pid(process::id());
         it.open_files()?;
         Ok(it)
@@ -287,7 +293,13 @@ impl<A: Allocator + Clone> Driven<Native, A> {
 
     /// [`Driven::commit_with`], then the new segments opened for `pread`.
     pub fn commit(&mut self, batches: &[&Batch]) -> Result<Committed<A>, StoreError> {
-        let committed = self.commit_with(batches)?;
+        self.commit_par(batches, &Serial)
+    }
+
+    /// Parallel twin of [`Driven::commit`]: runs `TwoValues` verification, BLAKE3 segment sealing,
+    /// and Bloom construction through `par`, then opens the new segments for `pread`.
+    pub fn commit_par<P: Par>(&mut self, batches: &[&Batch], par: &P) -> Result<Committed<A>, StoreError> {
+        let committed = self.commit_with_par(batches, par)?;
         self.open_files()?;
         Ok(committed)
     }
@@ -297,7 +309,12 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// The store `cfg` names, opened on `driver` (whose root is `root`), what it keeps in
     /// `alloc`.
     pub fn with(driver: D, root: &Path, cfg: PlainConfig<A>, alloc: A) -> Result<Driven<D, A>, StoreError> {
-        Driven::with_core(driver, root, Plain::new(cfg, alloc))
+        Driven::with_par(driver, root, cfg, alloc, &Serial)
+    }
+
+    /// Parallel twin of [`Driven::with`]: verifies large earlier-boot segments through `par`.
+    pub fn with_par<P: Par>(driver: D, root: &Path, cfg: PlainConfig<A>, alloc: A, par: &P) -> Result<Driven<D, A>, StoreError> {
+        Driven::with_core_par(driver, root, Plain::new(cfg, alloc), par)
     }
 
     /// [`Driven::with`], its store opened with `plant`.
@@ -305,7 +322,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     pub(crate) fn planted(driver: D, root: &Path, cfg: PlainConfig<A>, alloc: A, plant: super::core::Plant) -> Result<Driven<D, A>, StoreError> {
         let mut it = Driven::bare(driver, root, Plain::planted(cfg, alloc, plant));
         it.core.open(&mut it.effects);
-        it.opened()
+        it.opened_par(&Serial)
     }
 
     /// A power cut where `at` says (`None`: none).
@@ -338,16 +355,16 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         }
     }
 
-    fn with_core(driver: D, root: &Path, core: Plain<A>) -> Result<Driven<D, A>, StoreError> {
+    fn with_core_par<P: Par>(driver: D, root: &Path, core: Plain<A>, par: &P) -> Result<Driven<D, A>, StoreError> {
         let mut it = Driven::bare(driver, root, core);
         it.core.open(&mut it.effects);
-        it.opened()
+        it.opened_par(par)
     }
 
     /// The open (asked already) run to its end and its report handed.
-    fn opened(mut self) -> Result<Driven<D, A>, StoreError> {
+    fn opened_par<P: Par>(mut self, par: &P) -> Result<Driven<D, A>, StoreError> {
         let it = &mut self;
-        it.run("opening the plain store")?;
+        it.run_par("opening the plain store", par)?;
         if !it.core.ready() {
             // Its driver went idle first.
             return Err(StoreError::Unfinished { what: "an open" });
@@ -360,7 +377,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         // [`Driven::acknowledge`]). An open that fails hands nothing, and the marks stay for
         // the next.
         it.core.handed();
-        it.unroot_holed()?;
+        it.unroot_holed_par(par)?;
         Ok(self)
     }
 
@@ -379,11 +396,11 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// the losses this open reported ([`Plain::handed`]), so a kill before it lands leaves the
     /// roots and the marks both, and the next open, seeing the marks, walks and drops again; a
     /// kill after leaves no root and no mark. Never half a root: a root is one manifest row.
-    fn unroot_holed(&mut self) -> Result<(), StoreError> {
+    fn unroot_holed_par<P: Par>(&mut self, par: &P) -> Result<(), StoreError> {
         if !self.core.names_a_root() || (!self.core.earlier_tail() && self.core.report().lost.is_empty()) {
             return Ok(());
         }
-        self.map_all()?;
+        self.map_all_par(par)?;
         if self.core.report().lost.is_empty() || self.core.keeps_holed_root() {
             return Ok(());
         }
@@ -395,7 +412,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             blaze_trace::warn!(target: "blaze_cas::plain", root = %name, "a root reached a record lost in a power cut: dropped before any reader saw it (D200); what it named is made again as on a first run");
             self.core.unroot(name);
         }
-        self.commit_with(&[])?;
+        self.commit_with_par(&[], par)?;
         Ok(())
     }
 
@@ -412,10 +429,14 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
 
     /// Runs until nothing is in flight, the store's completions to it, the driver's own kept.
     fn run(&mut self, what: &'static str) -> Result<(), StoreError> {
-        self.run_with(what, &[], &[])
+        self.run_with_par(what, &[], &[], &Serial)
     }
 
-    fn run_with(&mut self, what: &'static str, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<(), StoreError> {
+    fn run_par<P: Par>(&mut self, what: &'static str, par: &P) -> Result<(), StoreError> {
+        self.run_with_par(what, &[], &[], par)
+    }
+
+    fn run_with_par<P: Par>(&mut self, what: &'static str, batches: &[&Batch], records: &[LentRecord<'_>], par: &P) -> Result<(), StoreError> {
         let _span = blaze_trace::info_span!("plain.wait", what).entered();
         let mut since = self.driver.now();
         #[cfg(test)]
@@ -452,7 +473,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
                         }
                     }
                     if self.core.owns(completion.tag) {
-                        self.core.complete_with(completion, wall, batches, records, &mut self.effects);
+                        self.core.complete_with_par(completion, wall, batches, records, par, &mut self.effects);
                     } else {
                         self.own.push(completion);
                     }
@@ -568,16 +589,21 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// The command asks it once, when the request's first pool task is about to start (the
     /// handle cannot map); a commit, a compaction slice, a scrub and a fetch ask it first.
     pub fn map_all(&mut self) -> Result<(), StoreError> {
+        self.map_all_par(&Serial)
+    }
+
+    /// Parallel twin of [`Driven::map_all`]: verifies large earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&mut self, par: &P) -> Result<(), StoreError> {
         if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
             return Ok(());
         }
         let lost = self.core.report().lost.len();
         let now = self.driver.wall_ns();
-        if !self.core.map_all(now, &mut self.effects)? {
+        if !self.core.map_all_par(now, par, &mut self.effects)? {
             return Ok(());
         }
         if !self.effects.is_empty() {
-            self.run("mapping every segment named")?;
+            self.run_par("mapping every segment named", par)?;
         }
         if !self.core.whole() {
             return Err(StoreError::Unfinished { what: "mapping every segment named" });
@@ -672,69 +698,81 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// Writes the store's puts and `batches` as one segment for each namespace that holds
     /// records, and flips to a generation naming them, driven until done.
     pub fn commit_with(&mut self, batches: &[&Batch]) -> Result<Committed<A>, StoreError> {
-        self.commit_records(batches, &[])
+        self.commit_records_par(batches, &[], &Serial)
+    }
+
+    /// Parallel twin of [`Driven::commit_with`]: runs `TwoValues` verification, BLAKE3 segment
+    /// sealing, Bloom construction, and targeted prior-boot segment checks through `par`.
+    pub fn commit_with_par<P: Par>(&mut self, batches: &[&Batch], par: &P) -> Result<Committed<A>, StoreError> {
+        self.commit_records_par(batches, &[], par)
     }
 
     /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
     /// least one key being committed in `batches`, `records`, or `self.core.held` (plus any
     /// segment lacking a valid Bloom filter), leaving non-matching prior-boot segments unmapped
-    /// and unhashed during foreground commits ([`Plain::map_for_commit`]).
-    fn map_for_commit(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<(), StoreError> {
+    /// and unhashed during foreground commits ([`Plain::map_for_commit_par`]).
+    fn map_for_commit_par<P: Par>(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], par: &P) -> Result<(), StoreError> {
         if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
             return Ok(());
         }
         let lost = self.core.report().lost.len();
         let now = self.driver.wall_ns();
-        if self.core.map_for_commit(batches, records, now, &mut self.effects)? && !self.effects.is_empty() {
-            self.run("mapping commit-matching segments")?;
+        if self.core.map_for_commit_par(batches, records, now, par, &mut self.effects)? && !self.effects.is_empty() {
+            self.run_par("mapping commit-matching segments", par)?;
         }
         self.hand_losses(lost);
         Ok(())
     }
 
     /// Maps ONLY the Bloom-matching segments needed to probe pending `Liveness::Reached` root
-    /// edits in [`Plain::reused`], falling back to [`Driven::map_all`] only when committed keys
-    /// still require probing unbloomed `other_roots` (dead-key resurrection / cross-checkout).
-    fn map_for_commit_roots(&mut self) -> Result<(), StoreError> {
+    /// edits in [`Plain::reused_par`], falling back to [`Driven::map_all_par`] only when committed
+    /// keys still require probing unbloomed `other_roots` (dead-key resurrection / cross-checkout).
+    fn map_for_commit_roots_par<P: Par>(&mut self, par: &P) -> Result<(), StoreError> {
         if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
             return Ok(());
         }
         // Bounded to 4 targeted rounds (edited+prior roots -> changed+replaced indexes -> leaf
-        // keys -> final check); falls back to `map_all` if still not settled.
+        // keys -> final check); falls back to `map_all_par` if still not settled.
         for _ in 0..4 {
             let lost = self.core.report().lost.len();
             let now = self.driver.wall_ns();
-            match self.core.map_for_commit_roots(now, &mut self.effects)? {
+            match self.core.map_for_commit_roots_par(now, par, &mut self.effects)? {
                 CommitRootMap::Ready => {
                     self.hand_losses(lost);
                     return Ok(());
                 }
                 CommitRootMap::Mapped => {
                     if !self.effects.is_empty() {
-                        self.run("mapping commit-root segments")?;
+                        self.run_par("mapping commit-root segments", par)?;
                     }
                     self.hand_losses(lost);
                 }
                 CommitRootMap::NeedAll => {
                     self.hand_losses(lost);
-                    self.map_all()?;
+                    self.map_all_par(par)?;
                     return Ok(());
                 }
             }
         }
-        self.map_all()
+        self.map_all_par(par)
     }
 
     /// [`Driven::commit_with`] with `records` lent where they lie (core.rs
     /// [`Plain::commit_records`]): a `Lent`'s shared arena, copied once, by the layout.
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
+        self.commit_records_par(batches, records, &Serial)
+    }
+
+    /// Parallel twin of [`Driven::commit_records`]: runs `TwoValues` verification, BLAKE3 segment
+    /// sealing, Bloom construction, and targeted prior-boot segment verification through `par`.
+    pub fn commit_records_par<P: Par>(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], par: &P) -> Result<Committed<A>, StoreError> {
         // After the answer: only map/verify segments that can conflict with the batch or pending
         // roots being committed (Bloom-filtered), unless `Plant::CommitMapsAll` or emergency
         // auto-tier-merge requires a whole store.
         let writing = self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty();
         let mut auto_folded = false;
         if self.core.needs_whole_for_commit() {
-            self.map_all()?;
+            self.map_all_par(par)?;
         }
         if writing {
             #[cfg(test)]
@@ -746,22 +784,22 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             // at the emergency safety ceiling (`Plain::AUTO_TIER_MERGE_FG` = 128) so interactive
             // `blaze check`/`test` commits never stall on multi-hundred-MB tier merges.
             if allow_auto && !self.core.slice_parked() && self.core.needs_auto_tier_merge() {
-                self.map_all()?;
+                self.map_all_par(par)?;
                 let now = self.driver.wall_ns();
                 if self.core.fold_tiered_slice(now, &mut self.effects)? {
-                    self.run("auto-merging tiers on commit")?;
+                    self.run_par("auto-merging tiers on commit", par)?;
                 }
                 auto_folded = self.core.slice_parked();
             } else {
-                self.map_for_commit(batches, records)?;
+                self.map_for_commit_par(batches, records, par)?;
             }
         }
         if !self.core.whole() {
-            self.map_for_commit_roots()?;
+            self.map_for_commit_roots_par(par)?;
         }
         let now = self.driver.wall_ns();
-        self.core.commit_records(batches, records, now, &mut self.effects)?;
-        self.run_with("committing", batches, records)?;
+        self.core.commit_records_par(batches, records, now, par, &mut self.effects)?;
+        self.run_with_par("committing", batches, records, par)?;
         if auto_folded {
             let _ = self.core.take_sliced();
         }
@@ -1719,5 +1757,310 @@ mod sota10_commit_floor_tests {
         store.commit_with(&[]).expect("commit over K");
         let now = store.driver().wall_ns();
         assert!(store.needs_bg_gc(now), "tier overflow (> K) must trigger bg GC immediately");
+    }
+}
+
+#[cfg(test)]
+mod par_commit_and_open_dst_tests {
+    use super::*;
+    use super::super::{
+        core::{LockStep, ROOT_LIFE_NS},
+        par::ShuffledPar,
+        test_root,
+    };
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_mem::Frame;
+
+    const TAG: Tag = Tag(1);
+
+    fn par_cfg<'a>(n: u64, boot: u64, liveness: Liveness, root: &'a Frame) -> PlainConfig<&'a Frame> {
+        let mut writes = Vec::new_in(root);
+        writes.push(Namespace::LOCAL);
+        let mut reads = Vec::new_in(root);
+        reads.push(Namespace::LOCAL);
+        PlainConfig {
+            dir: FileName::new("plain").expect("dir"),
+            tags: n * TAGS,
+            cap_bytes: u64::MAX,
+            boot,
+            nonce: 17_000 + n,
+            durable: true,
+            machine: PlainConfig::empty_machine(root),
+            writes,
+            reads,
+            liveness,
+            lock_step: LockStep::Backoff,
+        }
+    }
+
+    fn k(n: u32) -> Key {
+        Key(ContentId::of("sota12 par dst key", &n.to_le_bytes()))
+    }
+
+    fn payload_bytes(seed: u32, len: usize, root: &Frame) -> Vec<u8, &Frame> {
+        let mut out = Vec::with_capacity_in(len, root);
+        for i in 0..len {
+            let b = u8::try_from((usize::try_from(seed).unwrap_or(0).wrapping_mul(37).wrapping_add(i.wrapping_mul(13))) & 0xff).unwrap_or(0);
+            out.push(b);
+        }
+        out
+    }
+
+    /// Runs a multi-segment workload exercising EVERY parallel CAS seam:
+    /// 1. Commit 1: 4200 x 64B (~268 KiB) via `Batch` -> triggers `seal_entries_par` (>= 128 KiB)
+    ///    and `BloomBuilder::build_par_from` (>= 4096 keys, both Stage 1 and Stage 2).
+    /// 2. Commit 2: 40 new x 8 KiB (~320 KiB) + 24 already-committed duplicates + 8 intra-batch
+    ///    duplicates via `Batch` + indexed reach root + direct root -> triggers `check_committed_par`
+    ///    (>= 32 keys), `seal_entries_par`, and `reused_par`.
+    /// 3. Crash/reboot (`boot: 1 -> 2`) without sealing + `Driven::with_par` + `map_all_par` ->
+    ///    triggers `Verified::check_par` -> `format::check_segment_par` on both >= 128 KiB segments.
+    ///
+    /// Returns the reopened `Driven` (all segments mapped & verified) and segment IDs committed.
+    fn run_workload<'a, P: Par>(
+        sim_seed: u64,
+        par: &P,
+        root: &'a Frame,
+    ) -> (Driven<Sim, &'a Frame>, Vec<u64, &'a Frame>) {
+        let mut store = Driven::with_par(
+            Sim::new(sim_seed, Faults::default()),
+            Path::new("/sim"),
+            par_cfg(1, 1, Liveness::Reached, root),
+            root,
+            par,
+        )
+        .expect("boot 1 open");
+        store.disable_auto_merge();
+
+        // Commit 1: 4200 records x 64 bytes = 268,800 bytes (> 128 KiB and >= 4096 keys).
+        let mut batch1 = Batch::new(Namespace::LOCAL);
+        let mut small = [0u8; 64];
+        for i in 0..4200u32 {
+            for (j, slot) in small.iter_mut().enumerate() {
+                *slot = u8::try_from((usize::try_from(i).unwrap_or(0).wrapping_mul(29).wrapping_add(j)) & 0xff).unwrap_or(0);
+            }
+            batch1.put(k(i), TAG, &small).expect("batch1 put");
+        }
+        let c1 = store.commit_with_par(&[&batch1], par).expect("commit 1");
+        assert_eq!(c1.segments.len(), 1);
+
+        // Commit 2: 40 new records x 8 KiB (320 KiB) + 24 already-committed duplicates + 8
+        // intra-batch duplicates (exercising parallel TwoValues + SkipSame + seal_entries_par).
+        let mut batch2a = Batch::new(Namespace::LOCAL);
+        let mut batch2b = Batch::new(Namespace::LOCAL);
+        let mut root_keys: Vec<Key, &Frame> = Vec::with_capacity_in(64, root);
+        for i in 0..40u32 {
+            let key = k(10_000 + i);
+            let buf = payload_bytes(10_000 + i, 8192, root);
+            batch2a.put(key, TAG, buf.as_slice()).expect("batch2a new");
+            if i < 8 {
+                batch2b.put(key, TAG, buf.as_slice()).expect("batch2b intra-batch dup");
+            }
+            root_keys.push(key);
+        }
+        for i in 0..24u32 {
+            for (j, slot) in small.iter_mut().enumerate() {
+                *slot = u8::try_from((usize::try_from(i).unwrap_or(0).wrapping_mul(29).wrapping_add(j)) & 0xff).unwrap_or(0);
+            }
+            batch2b.put(k(i), TAG, &small).expect("batch2b committed dup");
+            root_keys.push(k(i));
+        }
+        let c2 = store.commit_with_par(&[&batch2a, &batch2b], par).expect("commit 2");
+        assert_eq!(c2.segments.len(), 1);
+
+        // Commit 3: pin an indexed root and a direct root referencing both segments.
+        let idx_key = store.index(root_keys.as_slice()).expect("index");
+        store.root_through("par.reach", &[idx_key], ROOT_LIFE_NS).expect("root_through");
+        store.root_for("par.answer", &[k(0), k(10_000)], ROOT_LIFE_NS).expect("root_for");
+        let c3 = store.commit_with_par(&[], par).expect("commit 3 roots");
+
+        let mut seg_ids = Vec::with_capacity_in(3, root);
+        seg_ids.extend_from_slice(&c1.segments);
+        seg_ids.extend_from_slice(&c2.segments);
+        seg_ids.extend_from_slice(&c3.segments);
+
+        // Simulate crash / reboot (boot 1 -> boot 2, unsealed segments) and verify via check_segment_par.
+        let mut sim = store.into_driver();
+        sim.crash();
+        let mut reopened = Driven::with_par(
+            sim,
+            Path::new("/sim"),
+            par_cfg(2, 2, Liveness::Reached, root),
+            root,
+            par,
+        )
+        .expect("boot 2 reopen");
+        reopened.map_all_par(par).expect("boot 2 map_all_par");
+        assert!(reopened.core().checks().full >= 2, "cold boot must verify unsealed segments");
+        assert!(reopened.scrub().expect("scrub").is_empty(), "scrub must find zero corrupt records");
+
+        // Spot-check payloads from both large segments.
+        let g1 = reopened.get(&k(4199)).expect("get k(4199)").expect("present");
+        assert_eq!(reopened.got(g1).bytes.len(), 64);
+        let g2 = reopened.get(&k(10_039)).expect("get k(10_039)").expect("present");
+        let want2 = payload_bytes(10_039, 8192, root);
+        assert_eq!(reopened.got(g2).bytes, want2.as_slice());
+
+        (reopened, seg_ids)
+    }
+
+    #[test]
+    fn shuffled_par_matches_serial_bit_for_bit_across_large_commits_blooms_roots_and_cold_reopen() {
+        let root = test_root();
+        let (serial_store, serial_segs) = run_workload(4242, &Serial, &root);
+        let serial_gen = serial_store.core().generation();
+        let serial_roots = serial_store.core().roots();
+        let serial_mapped_count = serial_store.core().mapped_count();
+        let mut serial_indexes: Vec<Vec<u8, &Frame>, &Frame> = Vec::with_capacity_in(serial_mapped_count, &root);
+        let mut serial_seg_bytes: Vec<Vec<u8, &Frame>, &Frame> = Vec::with_capacity_in(serial_mapped_count, &root);
+        for i in 0..serial_mapped_count {
+            let mapped = serial_store.core().mapped_at(i);
+            let mut run_copy = Vec::with_capacity_in(mapped.run().len(), &root);
+            run_copy.extend_from_slice(mapped.run());
+            serial_indexes.push(run_copy);
+            let mut bytes_copy = Vec::with_capacity_in(mapped.bytes().len(), &root);
+            bytes_copy.extend_from_slice(mapped.bytes());
+            serial_seg_bytes.push(bytes_copy);
+        }
+        let serial_sim = serial_store.into_driver();
+        let bloom_file = FileName::new("plain/bloom").expect("bloom name");
+        let head_file = FileName::new("plain/head").expect("head name");
+        let serial_bloom = serial_sim.contents(&bloom_file);
+        let serial_head = serial_sim.contents(&head_file);
+        assert!(!serial_bloom.is_empty(), "bloom sidecar must be written");
+
+        for shuffle_seed in 0..4u64 {
+            let par = ShuffledPar::from_seed(8, 0x507a_1200 + shuffle_seed);
+            let (par_store, par_segs) = run_workload(4242, &par, &root);
+            assert_eq!(par_segs.as_slice(), serial_segs.as_slice(), "seed {shuffle_seed}: segment IDs must match Serial");
+            assert_eq!(par_store.core().generation(), serial_gen, "seed {shuffle_seed}: generation must match Serial");
+            assert_eq!(par_store.core().roots(), serial_roots, "seed {shuffle_seed}: roots must match Serial");
+            assert_eq!(par_store.core().mapped_count(), serial_mapped_count, "seed {shuffle_seed}: mapped count must match Serial");
+
+            for i in 0..serial_mapped_count {
+                let mapped = par_store.core().mapped_at(i);
+                assert_eq!(mapped.run(), serial_indexes[i].as_slice(), "seed {shuffle_seed} seg {i}: index bytes must match Serial bit-for-bit");
+                assert_eq!(mapped.bytes(), serial_seg_bytes[i].as_slice(), "seed {shuffle_seed} seg {i}: segment bytes must match Serial bit-for-bit");
+            }
+
+            let par_sim = par_store.into_driver();
+            for &id in serial_segs.iter() {
+                let seg_name = FileName::new(&format!("plain/seg-{id:016x}")).expect("seg name");
+                assert_eq!(
+                    par_sim.contents(&seg_name),
+                    serial_sim.contents(&seg_name),
+                    "seed {shuffle_seed}: on-disk segment {id:016x} must match Serial bit-for-bit",
+                );
+            }
+            assert_eq!(
+                par_sim.contents(&bloom_file),
+                serial_bloom,
+                "seed {shuffle_seed}: bloom sidecar must match Serial bit-for-bit",
+            );
+            assert_eq!(
+                par_sim.contents(&head_file),
+                serial_head,
+                "seed {shuffle_seed}: head file must match Serial bit-for-bit",
+            );
+        }
+    }
+
+    #[test]
+    fn shuffled_par_two_values_collision_order_matches_serial_deterministically() {
+        let root = test_root();
+
+        let seed_base = |sim_seed: u64| -> Driven<Sim, &Frame> {
+            let mut store = Driven::with(
+                Sim::new(sim_seed, Faults::default()),
+                Path::new("/sim"),
+                par_cfg(1, 1, Liveness::Everything, &root),
+                &root,
+            )
+            .expect("open");
+            let mut base = Batch::new(Namespace::LOCAL);
+            for i in 0..64u32 {
+                let buf = payload_bytes(i, 128, &root);
+                base.put(k(i), TAG, buf.as_slice()).expect("base put");
+            }
+            store.commit_with(&[&base]).expect("base commit");
+            store
+        };
+
+        // Case A: multiple Committed collisions + a later ThisProcess collision -> first sorted key wins.
+        let build_case_a = || -> (Batch, Batch) {
+            let mut sorted_keys: Vec<(Key, u32), &Frame> = Vec::with_capacity_in(48, &root);
+            for i in 0..48u32 {
+                sorted_keys.push((k(i), i));
+            }
+            sorted_keys.sort_unstable_by(|a, b| a.0.0.cmp(&b.0.0));
+            let mut b1 = Batch::new(Namespace::LOCAL);
+            let mut b2 = Batch::new(Namespace::LOCAL);
+            for (pos, &(key, id)) in sorted_keys.iter().enumerate() {
+                let mut buf = payload_bytes(id, 128, &root);
+                if pos == 5 || pos == 22 || pos == 41 {
+                    buf[pos % 128] ^= 0xff;
+                }
+                b1.put(key, TAG, buf.as_slice()).expect("b1 put");
+                if pos == 30 {
+                    buf[7] ^= 0x5a;
+                    b2.put(key, TAG, buf.as_slice()).expect("b2 this-proc clash");
+                }
+            }
+            (b1, b2)
+        };
+
+        let (ba1, ba2) = build_case_a();
+        let serial_err_a = match seed_base(5101).commit_with_par(&[&ba1, &ba2], &Serial) {
+            Err(StoreError::TwoValues(tv)) => tv,
+            other => panic!("expected serial TwoValues in Case A, got {other:?}"),
+        };
+        assert_eq!(serial_err_a.held, Holder::Committed);
+
+        for shuffle_seed in 0..8u64 {
+            let par = ShuffledPar::from_seed(8, 0x7000 + shuffle_seed);
+            let par_err_a = match seed_base(5101).commit_with_par(&[&ba1, &ba2], &par) {
+                Err(StoreError::TwoValues(tv)) => tv,
+                other => panic!("seed {shuffle_seed}: expected par TwoValues in Case A, got {other:?}"),
+            };
+            assert_eq!(par_err_a, serial_err_a, "seed {shuffle_seed}: Case A TwoValues must match Serial");
+        }
+
+        // Case B: ThisProcess collision at sorted index 3 BEFORE Committed collisions at 12 and 35.
+        let build_case_b = || -> (Batch, Batch) {
+            let mut sorted_keys: Vec<(Key, u32), &Frame> = Vec::with_capacity_in(48, &root);
+            for i in 0..48u32 {
+                sorted_keys.push((k(i), i));
+            }
+            sorted_keys.sort_unstable_by(|a, b| a.0.0.cmp(&b.0.0));
+            let mut b1 = Batch::new(Namespace::LOCAL);
+            let mut b2 = Batch::new(Namespace::LOCAL);
+            for (pos, &(key, id)) in sorted_keys.iter().enumerate() {
+                let mut buf = payload_bytes(id, 128, &root);
+                if pos == 12 || pos == 35 {
+                    buf[pos % 128] ^= 0xff;
+                }
+                b1.put(key, TAG, buf.as_slice()).expect("b1 put");
+                if pos == 3 {
+                    buf[11] ^= 0xa5;
+                    b2.put(key, TAG, buf.as_slice()).expect("b2 early this-proc clash");
+                }
+            }
+            (b1, b2)
+        };
+
+        let (bb1, bb2) = build_case_b();
+        let serial_err_b = match seed_base(5102).commit_with_par(&[&bb1, &bb2], &Serial) {
+            Err(StoreError::TwoValues(tv)) => tv,
+            other => panic!("expected serial TwoValues in Case B, got {other:?}"),
+        };
+        assert_eq!(serial_err_b.held, Holder::ThisProcess);
+
+        for shuffle_seed in 0..8u64 {
+            let par = ShuffledPar::from_seed(8, 0x8000 + shuffle_seed);
+            let par_err_b = match seed_base(5102).commit_with_par(&[&bb1, &bb2], &par) {
+                Err(StoreError::TwoValues(tv)) => tv,
+                other => panic!("seed {shuffle_seed}: expected par TwoValues in Case B, got {other:?}"),
+            };
+            assert_eq!(par_err_b, serial_err_b, "seed {shuffle_seed}: Case B TwoValues must match Serial");
+        }
     }
 }

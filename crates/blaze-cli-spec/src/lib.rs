@@ -1,11 +1,14 @@
-//! Pure `#![no_std]`, zero-unsafe, sans-IO CLI flag and subcommand completion spec parser
-//! built on `blaze-own` explicit allocators (`Alloc<'a>`, `AVec`, `AString`).
+//! Pure `#![no_std]`, zero-unsafe, sans-IO CLI schema, argv parser, help/usage renderer, and
+//! flag/subcommand completion spec parser built on `blaze-own` explicit allocators
+//! (`Alloc<'a>`, `AVec`, `AString`).
 //!
-//! Combines four pure parsing/data layers with zero OS IO:
-//! 1. **Curated manual specs** ([`manual`]) for popular CLIs & tools with non-standard help
-//! 2. **`--help` / `-h` parser** ([`help_parser`]) across clap, commander (`claude`), cobra, GNU, argparse
-//! 3. **Fish completion & `man` page parsers** ([`man_parser`])
-//! 4. **Cache line codec** ([`codec`]) for thin host drivers to persist parsed specs by binary mtime.
+//! Combines six pure parsing/data layers with zero OS IO:
+//! 1. **Declarative CLI app schema & parser** ([`app`]) — zero proc macros, explicit allocators
+//! 2. **Blaze CLI single source of truth** ([`blaze_app`]) — commands, flags, help, usage, completions
+//! 3. **Curated manual specs** ([`manual`]) for popular CLIs & tools with non-standard help
+//! 4. **`--help` / `-h` parser** ([`help_parser`]) across clap, commander (`claude`), cobra, GNU, argparse
+//! 5. **Fish completion & `man` page parsers** ([`man_parser`])
+//! 6. **Cache line codec** ([`codec`]) for thin host drivers to persist parsed specs by binary mtime.
 
 #![no_std]
 #![feature(register_tool, custom_inner_attributes)]
@@ -20,6 +23,8 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod app;
+pub mod blaze_app;
 pub mod codec;
 pub mod explain;
 pub mod help_parser;

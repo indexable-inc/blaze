@@ -560,6 +560,17 @@ pub const WORDINGS: &[Wording] = &[
         args: 3,
         kind: Kind::Warning,
     },
+    // An internal workspace member whose `std` is Rust's `std` while
+    // `[workspace.metadata.blaze] std = "bstd"` requires bstd (blaze-cli units.rs `STD_NOT_BSTD`).
+    Wording {
+        area: Area::Cli,
+        number: 49,
+        name: "std-not-bstd",
+        headline: "workspace member {code:0} uses Rust edition {code:1} (`std`), but `[workspace.metadata.blaze] std = \"bstd\"` requires bstd",
+        label: "set `edition = \"blaze-2026.11\"` (or `[workspace.package] edition = \"blaze-2026.11\"`)",
+        args: 2,
+        kind: Kind::Error,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,

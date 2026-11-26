@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn parses_claude_commander_help_no_std() {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let sample = r#"
 Usage: claude [options] [command] [prompt]
 

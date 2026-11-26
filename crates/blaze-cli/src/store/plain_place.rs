@@ -25,7 +25,7 @@ use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
 use blaze_own::Alloc;
-use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError, Visibility};
+use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, Par, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Serial, Settings, Snapshot, SnapshotError, Visibility};
 use blaze_core::{Driver, FileName};
 use blaze_drive::Key;
 use blaze_keyed::kind::{Namespace, ReservedTag, Tag};
@@ -200,8 +200,18 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: St
 /// The store opened lazily over `driver` (nothing mapped: a segment is mapped at its first
 /// probe), owned by a [`Lent`] whose arena is in `alloc`, the caller's (rule 75).
 pub fn open<D: Driver>(driver: D, cfg: PlainConfig<StoreAlloc>, alloc: StoreAlloc) -> Result<Lent<D, StoreAlloc>, PlaceError> {
+    open_par(driver, cfg, alloc, &Serial)
+}
+
+/// Parallel twin of [`open`]: verifies large earlier-boot segments through `par`.
+pub fn open_par<D: Driver, P: Par>(
+    driver: D,
+    cfg: PlainConfig<StoreAlloc>,
+    alloc: StoreAlloc,
+    par: &P,
+) -> Result<Lent<D, StoreAlloc>, PlaceError> {
     // The root path is read only by the native pread path, which this module never takes.
-    let store = Driven::with(driver, std::path::Path::new("/"), cfg, alloc).map_err(|why| PlaceError::Open { why })?;
+    let store = Driven::with_par(driver, std::path::Path::new("/"), cfg, alloc, par).map_err(|why| PlaceError::Open { why })?;
     Ok(Lent::with_visibility(store, alloc, VISIBILITY))
 }
 
@@ -409,8 +419,13 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// [`PlainPlace::put`] of the concatenation of `parts`, never joined (blaze-cas
     /// `Lent::put_parts`).
     pub fn put_parts(&mut self, key: Key, all_names_public: bool, parts: &[&[u8]]) -> Result<(), PlaceError> {
+        self.put_parts_par(key, all_names_public, parts, &Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::put_parts`]: commits past [`COMMIT_BYTES`] through `par`.
+    pub fn put_parts_par<P: Par>(&mut self, key: Key, all_names_public: bool, parts: &[&[u8]], par: &P) -> Result<(), PlaceError> {
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
-            self.commit()?;
+            self.commit_par(par)?;
         }
         self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), ReservedTag::Drive.tag(), parts)?;
         Ok(())
@@ -423,6 +438,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// workspace crate's local one share it; else put in the namespace `all_names_public` (its
     /// owner's) says. Other bytes under `key` are refused (rule 21).
     pub fn put_record(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8]) -> Result<blaze_keyed::store::Put, PlaceError> {
+        self.put_record_par(key, all_names_public, tag, bytes, &Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::put_record`]: commits past [`COMMIT_BYTES`] through `par`.
+    pub fn put_record_par<P: Par>(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8], par: &P) -> Result<blaze_keyed::store::Put, PlaceError> {
         // Asked by comparison, never by a get: a get of this command's own put keeps its arena
         // chunk, and every record put beside it, out of place after the commit (blaze-cas
         // lent.rs `holds`). An expansion record two units of one wave both put did that to
@@ -431,7 +451,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
             return Ok(blaze_keyed::store::Put::Same);
         }
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
-            self.commit()?;
+            self.commit_par(par)?;
         }
         Ok(self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), tag, &[bytes])?)
     }
@@ -522,12 +542,23 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// Every segment named mapped, and every one parked checked: asked once, when the
     /// request's first pool task is about to start (blaze-cas `Driven::map_all`).
     pub fn map_all(&self) -> Result<(), PlaceError> {
-        Ok(self.lent.map_all()?)
+        self.map_all_par(&Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::map_all`]: verifies large earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&self, par: &P) -> Result<(), PlaceError> {
+        Ok(self.lent.map_all_par(par)?)
     }
 
     /// What is not yet committed, laid out as one segment per namespace, and one flip.
     pub fn commit(&mut self) -> Result<(), PlaceError> {
-        let committed = self.lent.commit()?;
+        self.commit_par(&Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::commit`]: runs `TwoValues` verification, BLAKE3 segment
+    /// sealing, and Bloom construction through `par`.
+    pub fn commit_par<P: Par>(&mut self, par: &P) -> Result<(), PlaceError> {
+        let committed = self.lent.commit_par(par)?;
         self.aging_since = None;
         self.commits += 1;
         self.segments_written += u32::try_from(committed.segments.len()).unwrap_or(u32::MAX);
@@ -677,8 +708,9 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
     }
     lent.release_lease();
     let committed = {
-        let _cx = cx.span("store after answer: commit (batch copy, layout copy, segment digest, flip)");
-        lent.commit()?
+        let commit_cx = cx.span("store after answer: commit (batch copy, layout copy, segment digest, flip)");
+        let par = super::CxPar::new(&commit_cx);
+        lent.commit_par(&par)?
     };
     let first = lent.take_sliced();
     #[cfg(target_os = "macos")]
@@ -688,8 +720,9 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
         None
     };
     let (slice, swept) = if slices > 0 {
-        let _cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
-        lent.clean_on(first)?
+        let clean_cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
+        let par = super::CxPar::new(&clean_cx);
+        lent.clean_on_par(first, &par)?
     } else {
         (first, 0)
     };

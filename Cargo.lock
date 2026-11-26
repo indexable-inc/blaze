@@ -649,6 +649,7 @@ dependencies = [
  "blaze-body",
  "blaze-build-script",
  "blaze-cas",
+ "blaze-cli-spec",
  "blaze-code",
  "blaze-comptime",
  "blaze-core",
@@ -699,6 +700,13 @@ dependencies = [
  "blaze-world",
  "edition",
  "parser",
+]
+
+[[package]]
+name = "blaze-cli-spec"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -847,6 +855,13 @@ dependencies = [
  "blaze-sim",
  "blaze-text",
  "blaze-unit-graph",
+]
+
+[[package]]
+name = "blaze-dust"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -1095,6 +1110,13 @@ dependencies = [
  "blaze-deflate",
  "blaze-own",
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-git-meta"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -2045,6 +2067,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-shell-config"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-own",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-sim"
 version = "0.0.0"
 dependencies = [
@@ -2282,6 +2313,13 @@ name = "blaze-sys"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "blaze-sysmon"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
