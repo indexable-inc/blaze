@@ -383,6 +383,75 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         self.finish_builtin()
     }
+
+    /// Builtin `FnPtr` trait method (`addr`, `as_ptr`, `from_ptr`) for a function pointer `Self`
+    /// (`self.args = [Self]`): takes a single pointer-sized operand (the fn pointer itself or
+    /// `NonNull<Code>`) and returns it as a pointer, `usize` (`Op::Expose`), or single-pointer
+    /// wrapper (`NonNull<Code>`).
+    fn run_builtin_fn_ptr(&mut self, sig: &FnSig<'_>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let &[me] = self.args else {
+            return Err(malformed("a builtin `FnPtr` method whose instance is not `[Self]`"));
+        };
+        if !matches!(self.ground_node(me).map_err(sig_err)?, PNode::FnPtr(..)) {
+            return Err(malformed("a builtin `FnPtr` method whose `Self` is not a fn pointer"));
+        }
+        let &[in_ty] = sig.inputs else {
+            return Err(malformed("a builtin `FnPtr` method without exactly one parameter"));
+        };
+        let in_g = self.ground_in(sig.types, in_ty).map_err(sig_err)?;
+        let out_g = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+        let in_repr = self.repr(in_g).map_err(sig_err)?;
+        self.ret = self.repr(out_g).map_err(sig_err)?;
+        let in_pass = self.rust_pass(in_repr)?;
+        self.ret_pass = self.rust_pass(self.ret)?;
+        let (params, rets) = self.sig_of(&[in_pass], self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let mut values = blaze_own::Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+        let v = self.take_passed(in_repr, in_pass, &mut next)?;
+        let ptr = match in_repr {
+            Repr::Ptr => self.scalar(v, Ty::PTR)?,
+            Repr::Agg(l) if self.layouts.get(l as usize).is_some_and(|row| row.size == 8) => {
+                let p = self.place(v, in_repr)?;
+                let loaded = self.load(Repr::Ptr, p);
+                self.scalar(loaded, Ty::PTR)?
+            }
+            _ => return Err(malformed("a builtin `FnPtr` input that is not pointer-sized")),
+        };
+        let out = match self.ret {
+            Repr::Ptr => V::Scalar(ptr),
+            Repr::Int { ty, .. } => {
+                let addr = self.b.convert(Op::Expose, Flags::NONE, Ty::I64, ptr);
+                V::Scalar(self.resize(addr, Ty::I64, ty, false))
+            }
+            Repr::Agg(l) if self.layouts.get(l as usize).is_some_and(|row| row.size == 8) => {
+                let dst = self.temp(self.ret);
+                self.store(V::Scalar(ptr), Repr::Ptr, dst)?;
+                V::Place(dst.0, dst.1)
+            }
+            _ => return Err(malformed("a builtin `FnPtr` output that is not a pointer or integer")),
+        };
+        self.ret_value(out)?;
+        self.finish_builtin()
+    }
 }
 
 /// Builds the builtin `clone` of `Self` (`subst.args`, one type: a tuple, a closure, a fn item
@@ -414,5 +483,20 @@ pub(crate) fn build_builtin_from<A: Allocator + Copy>(
     let body = super::empty_view(from, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_builtin_from()?;
+    w.into_built()
+}
+
+/// Builds a builtin `FnPtr` trait method shim (`addr`, `as_ptr`, `from_ptr`) for a fn pointer `Self`.
+pub(crate) fn build_builtin_fn_ptr<A: Allocator + Copy>(
+    method: ItemKey,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = super::empty_record(subst.scratch);
+    let body = super::empty_view(method, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_builtin_fn_ptr(sig)?;
     w.into_built()
 }

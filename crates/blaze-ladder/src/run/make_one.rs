@@ -815,6 +815,7 @@ impl MakerState {
         if program.ctor_of(key).is_some()
             || program.lang_trait_fn(LangItem::Clone, "clone") == Some(key)
             || program.lang_trait_fn(LangItem::From, "from") == Some(key)
+            || crate::clone_shim::is_language_fn_ptr_item(program, key)
         {
             let at = program.head_row(key)?;
             self.asked.insert_shift(slot, (key, at));
@@ -1518,6 +1519,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
             && (instance.item != function.key
                 || crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some()
                 || crate::clone_shim::language_from(&*program, instance, &work.ground).is_some()))
+        || (instance.item == function.key && crate::clone_shim::language_fn_ptr(&*program, instance, &work.ground).is_some())
     {
         return Ok(PullStep::Done);
     }
@@ -2185,6 +2187,11 @@ fn build_lir_phase<P: FrontEnd>(
         None if instance.item == function.key && builtin_clone.is_none() => crate::clone_shim::language_from(program, instance, &work.ground),
         _ => None,
     };
+    let builtin_fn_ptr = if instance.item == function.key && builtin_clone.is_none() && builtin_from.is_none() {
+        crate::clone_shim::language_fn_ptr(program, instance, &work.ground)
+    } else {
+        None
+    };
     let is_vtable_shim = instance.item != function.key && blaze_build::vtable_shim_of(instance, work.ground.view()).is_some();
     let is_reify_shim = instance.item != function.key && blaze_build::reify_shim_of(instance, work.ground.view()).is_some();
     let is_test_report_shim = instance.item != function.key && blaze_build::test_report_shim_of(instance, work.ground.view()).is_some();
@@ -2195,6 +2202,7 @@ fn build_lir_phase<P: FrontEnd>(
         _ if ctor_row.is_some()
             || builtin_clone.is_some()
             || builtin_from.is_some()
+            || builtin_fn_ptr.is_some()
             || is_vtable_shim
             || is_reify_shim
             || is_test_report_shim
@@ -2295,7 +2303,7 @@ fn build_lir_phase<P: FrontEnd>(
         }
     };
     if from_coroutine.is_none() {
-        let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && builtin_clone.is_none() && builtin_from.is_none();
+        let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && builtin_clone.is_none() && builtin_from.is_none() && builtin_fn_ptr.is_none();
         let extra_args = (instance.args != owner_args).then_some(instance.args);
         let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, work.alloc)?;
         if !roots.is_empty() {
@@ -2322,7 +2330,7 @@ fn build_lir_phase<P: FrontEnd>(
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, g),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, g),
             }
-        } else if vtable_shim.is_some() || reify.is_some() || test_report.is_some() || builtin_clone.is_some() || builtin_from.is_some() {
+        } else if vtable_shim.is_some() || reify.is_some() || test_report.is_some() || builtin_clone.is_some() || builtin_from.is_some() || builtin_fn_ptr.is_some() {
             if let Some(plan) = vtable_shim {
                 let sig = plan.needs_sig.then(|| program.sig(i));
                 blaze_build::build_vtable_shim(plan.target, sig.as_ref(), &mut subst, &adts, g)
@@ -2338,6 +2346,8 @@ fn build_lir_phase<P: FrontEnd>(
                 blaze_build::build_builtin_clone(made.clone, made.bytes, &mut subst, &adts, g)
             } else if let Some(made) = builtin_from {
                 blaze_build::build_builtin_from(made.from, &mut subst, &adts, g)
+            } else if let Some(made) = builtin_fn_ptr {
+                blaze_build::build_builtin_fn_ptr(made.item, &program.sig(i), &mut subst, &adts, g)
             } else {
                 Err(BuildError::Malformed { what: "unreachable builtin row" })
             }
@@ -2707,6 +2717,13 @@ fn name_ref<'p, P: FrontEnd>(
         let Some(c) = program.fn_index(from) else {
             let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
             return Ok(Named1::Untabled(from, refusal));
+        };
+        return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
+    }
+    if let Some(crate::clone_shim::LanguageFnPtr { item }) = crate::clone_shim::language_fn_ptr(program, called, ground) {
+        let Some(c) = program.fn_index(item) else {
+            let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+            return Ok(Named1::Untabled(item, refusal));
         };
         return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
     }
