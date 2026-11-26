@@ -534,23 +534,32 @@ fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
         spliced.push(b);
         i += 1;
     }
-    // Phase 3: strip `/* ... */` (replaced by a single space) and `// ...` comments while
-    // respecting quoted literals. An unclosed block comment is rejected conservatively.
+    // Phase 3: strip `/* ... */` (replaced by a single space) and `// ...` comments, and mask
+    // characters inside string/char literals with spaces (preserving quotes so `#include "..."`
+    // still parses while inert literal text like `"__has_include"` or `"__TIMESTAMP__"` is not
+    // misclassified as an active preprocessor operator). An unclosed block comment is rejected
+    // conservatively.
     let mut norm: AVec<'_, u8> = Vec::with_capacity_in(spliced.len(), alloc);
     let mut j = 0usize;
     let mut quote: Option<u8> = None;
     let src = spliced.as_slice();
     while let Some(&b) = src.get(j) {
         if let Some(q) = quote {
-            norm.push(b);
             j += 1;
             if b == b'\\' {
-                if let Some(&esc) = src.get(j) {
-                    norm.push(esc);
+                norm.push(b' ');
+                if src.get(j).is_some() {
+                    norm.push(b' ');
                     j += 1;
                 }
-            } else if b == q || b == b'\n' {
+            } else if b == q {
+                norm.push(b);
                 quote = None;
+            } else if b == b'\n' {
+                norm.push(b'\n');
+                quote = None;
+            } else {
+                norm.push(b' ');
             }
             continue;
         }
@@ -598,7 +607,7 @@ fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
         let after_hash = trimmed.strip_prefix('#').or_else(|| trimmed.strip_prefix("%:"));
         if let Some(after_hash) = after_hash {
             let dir = after_hash.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
-            for kw in ["include_next", "include", "import"] {
+            for kw in ["include_next", "include", "import", "embed"] {
                 if let Some(rest) = dir.strip_prefix(kw) {
                     let boundary = rest.bytes().next().is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_');
                     if boundary {
@@ -643,12 +652,15 @@ pub fn canonicalize<'b, 's>(
     let mut skip_next = false;
     for (idx, &arg) in spawn.args.iter().enumerate() {
         let next = spawn.args.get(idx + 1).copied();
-        if is_host_dependent_flag(arg, next) {
+        if is_host_dependent_flag(arg, next) || contains_ident(arg, "__TIMESTAMP__") {
             has_host_dep_arg = true;
             break;
         }
         if is_header_search_flag(arg)
             || arg.starts_with('@')
+            || contains_ident(arg, "__has_include")
+            || contains_ident(arg, "__has_include_next")
+            || contains_ident(arg, "__has_embed")
             || (!spawn.mount.is_empty() && arg.contains(spawn.mount) && !is_prefix_map_flag(arg))
         {
             has_arg_package_input = true;

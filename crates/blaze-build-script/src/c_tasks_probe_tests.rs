@@ -393,18 +393,33 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         b"#if __has_include(\"sibling.h\")\nint x;\n#endif\n".as_slice(),
         b"#if __has_include_next(<foo.h>)\nint x;\n#endif\n".as_slice(),
         b"#if __has_embed(\"data.bin\")\nint x;\n#endif\n".as_slice(),
+        b"#embed \"sibling.bin\"\n".as_slice(),
+        b"#/**/embed \"sibling.bin\"\n".as_slice(),
         b"const char *t = __TIMESTAMP__;\n".as_slice(),
     ] {
         let mut inc_bytes = |name: &str| (name == "flag_check.c").then_some(bad_src);
         assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut inc_bytes, alloc).is_err());
     }
 
-    // Host-CPU-probing flags (`-march=native`, `-mcpu=native`, `-mtune=native`, split forms)
-    // are refused before caching at `Level::Inputs`.
+    // Inert tokens inside quoted string literals must NOT be rejected.
+    struct OkAnswerer;
+    impl ProbeAnswerer for OkAnswerer {
+        fn id(&self) -> blaze_ids::ContentId { blaze_ids::ContentId([10; 32]) }
+        fn answer<'a, 'b>(&self, _: &CanonicalProbe<'_, '_>, _: &mut dyn FnMut(&str) -> Option<&'b [u8]>, alloc: Alloc<'a>) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+            Ok(ProbeAnswer { code: 0, stdout: blaze_own::String::new_in(alloc), stderr: blaze_own::String::new_in(alloc) })
+        }
+    }
+    let inert_src = b"const char *a = \"__has_include\";\nconst char *b = \"__TIMESTAMP__\";\nint main(void) { return 0; }\n";
+    let mut inert_bytes = |name: &str| (name == "flag_check.c").then_some(inert_src.as_slice());
+    assert!(resolve(&OkAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut inert_bytes, alloc).is_ok());
+
+    // Host-CPU-probing flags and argv `-D` host-dependent macros are refused before caching.
     for native_args in [
         ["-E", "-dM", "-march=native", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
         ["-c", "-mcpu=native", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
         ["-c", "-mtune", "native", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+        ["-c", "-DTS=__TIMESTAMP__", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+        ["-c", "-D", "TS=__TIMESTAMP__", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
     ] {
         let sp = Spawn { program: "cc", args: native_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
         assert_eq!(
@@ -412,6 +427,12 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
             ProbeWhy::HostDependent
         );
     }
+    let argv_has_inc = ["-c", "-DH=__has_include(\"a.h\")", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
+    let sp_argv_inc = Spawn { program: "cc", args: &argv_has_inc, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    assert_eq!(
+        canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_argv_inc, files, alloc).err().expect("argv __has_include").why,
+        ProbeWhy::PackageInput
+    );
 
     // Joined and delegated header/preprocessor flags are refused before caching.
     for bad_flag in [

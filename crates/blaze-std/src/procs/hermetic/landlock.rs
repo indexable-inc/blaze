@@ -166,7 +166,7 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
 /// `READ_FILE | EXECUTE` ONLY on the exact loader and resolved shared library files — never on
 /// `/nix/store` as a directory. Does nothing on non-NixOS hosts or non-ELF scripts.
 fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -> Result<(), Fault> {
-    const MAX_LIBS: usize = 64;
+    const MAX_LIBS: usize = 128;
     const PATH_CAP: usize = 320;
     const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
     const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
@@ -174,7 +174,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
     let Ok(prog_file) = openat(CWD, blaze_sys::Path::new(program), OpenFlags::CLOSE_ON_EXEC, 0) else {
         return Ok(());
     };
-    let Some(hdr) = parse_elf64_meta(prog_file.fd()) else {
+    let Some(hdr) = parse_elf64_meta(prog_file.fd())? else {
         return Ok(());
     };
     if hdr.interp_len == 0 {
@@ -245,10 +245,10 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
     let mut q_len = 0usize;
     let mut q_head = 0usize;
 
-    enqueue_nix_resolved_path(program.to_bytes(), &mut queue, &mut q_len);
-    enqueue_nix_resolved_path(interp_cstr.to_bytes(), &mut queue, &mut q_len);
+    enqueue_nix_resolved_path(program.to_bytes(), &mut queue, &mut q_len)?;
+    enqueue_nix_resolved_path(interp_cstr.to_bytes(), &mut queue, &mut q_len)?;
     if is_nix_ld {
-        enqueue_nix_resolved_path(NIX_LD_SO.to_bytes(), &mut queue, &mut q_len);
+        enqueue_nix_resolved_path(NIX_LD_SO.to_bytes(), &mut queue, &mut q_len)?;
     }
 
     while q_head < q_len {
@@ -269,7 +269,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
         let Ok(elf_fd) = openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0) else {
             continue;
         };
-        let Some(meta) = parse_elf64_meta(elf_fd.fd()) else {
+        let Some(meta) = parse_elf64_meta(elf_fd.fd())? else {
             continue;
         };
         if meta.dyn_len == 0 {
@@ -277,13 +277,13 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
         }
         let mut dyn_buf = [0u8; 8192];
         let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
-            continue;
+            return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
         };
         let dyn_read = pread(elf_fd.fd(), dyn_slice, meta.dyn_off).unwrap_or(0);
         let mut strtab_vaddr = None;
         let mut runpath_off = None;
         let mut rpath_off = None;
-        let mut needed_offs = [0u64; 64];
+        let mut needed_offs = [0u64; 128];
         let mut needed_count = 0usize;
         let mut pos = 0usize;
         while pos + 16 <= dyn_read {
@@ -293,10 +293,11 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
             match tag {
                 0 => break,                // DT_NULL
                 1 => {                     // DT_NEEDED
-                    if let Some(slot) = needed_offs.get_mut(needed_count) {
-                        *slot = val;
-                        needed_count += 1;
-                    }
+                    let Some(slot) = needed_offs.get_mut(needed_count) else {
+                        return Err(Fault::Host { call: "landlock (NixOS ELF DT_NEEDED exceeds cap)", code: 7 });
+                    };
+                    *slot = val;
+                    needed_count += 1;
                 }
                 5 => strtab_vaddr = Some(val), // DT_STRTAB
                 15 => rpath_off = Some(val),   // DT_RPATH
@@ -382,19 +383,22 @@ impl Elf64Meta {
     }
 }
 
-fn parse_elf64_meta(fd: Fd) -> Option<Elf64Meta> {
+fn parse_elf64_meta(fd: Fd) -> Result<Option<Elf64Meta>, Fault> {
     let mut ehdr = [0u8; 64];
     if pread(fd, &mut ehdr, 0).unwrap_or(0) < 64 {
-        return None;
+        return Ok(None);
     }
     if ehdr.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
-        return None;
+        return Ok(None);
     }
     let e_phoff = read_u64_le(&ehdr, 32);
     let e_phentsize = usize::from(read_u16_le(&ehdr, 54));
     let e_phnum = usize::from(read_u16_le(&ehdr, 56));
-    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 64 {
-        return None;
+    if e_phentsize < 56 || e_phnum == 0 {
+        return Ok(None);
+    }
+    if e_phnum > 64 {
+        return Err(Fault::Host { call: "landlock (NixOS ELF program header count exceeds cap)", code: 7 });
     }
     let mut meta = Elf64Meta {
         interp_off: 0,
@@ -406,11 +410,16 @@ fn parse_elf64_meta(fd: Fd) -> Option<Elf64Meta> {
     };
     let mut ph_buf = [0u8; 64];
     for i in 0..e_phnum {
-        let off = u64::try_from(i)
+        let Some(off) = u64::try_from(i)
             .ok()
             .and_then(|n| n.checked_mul(u64::try_from(e_phentsize).unwrap_or(0)))
-            .and_then(|o| e_phoff.checked_add(o))?;
-        let ph_slice = ph_buf.get_mut(..56)?;
+            .and_then(|o| e_phoff.checked_add(o))
+        else {
+            return Ok(None);
+        };
+        let Some(ph_slice) = ph_buf.get_mut(..56) else {
+            return Ok(None);
+        };
         if pread(fd, ph_slice, off).unwrap_or(0) < 56 {
             break;
         }
@@ -420,14 +429,21 @@ fn parse_elf64_meta(fd: Fd) -> Option<Elf64Meta> {
         let p_filesz = read_u64_le(&ph_buf, 32);
         match p_type {
             1 => {
-                if let Some(slot) = meta.loads.get_mut(meta.load_count) {
-                    *slot = (p_vaddr, p_offset, p_filesz);
-                    meta.load_count += 1;
-                }
+                let Some(slot) = meta.loads.get_mut(meta.load_count) else {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF PT_LOAD count exceeds cap)", code: 7 });
+                };
+                *slot = (p_vaddr, p_offset, p_filesz);
+                meta.load_count += 1;
             }
             2 => {
+                let Ok(len) = usize::try_from(p_filesz) else {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
+                };
+                if len > 8192 {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
+                }
                 meta.dyn_off = p_offset;
-                meta.dyn_len = usize::try_from(p_filesz).unwrap_or(0).min(8192);
+                meta.dyn_len = len;
             }
             3 => {
                 meta.interp_off = p_offset;
@@ -436,7 +452,7 @@ fn parse_elf64_meta(fd: Fd) -> Option<Elf64Meta> {
             _ => {}
         }
     }
-    Some(meta)
+    Ok(Some(meta))
 }
 
 fn expand_origin(entry: &[u8], origin_dir: &[u8], out: &mut [u8; 320]) -> usize {
@@ -514,7 +530,7 @@ fn enqueue_nix_resolved_path<const N: usize>(
     raw: &[u8],
     queue: &mut [([u8; 320], usize); N],
     q_len: &mut usize,
-) {
+) -> Result<(), Fault> {
     let mut resolved = [0u8; 320];
     let len = resolve_symlink_path(raw, &mut resolved).unwrap_or_else(|| {
         let l = raw.len().min(319);
@@ -526,19 +542,24 @@ fn enqueue_nix_resolved_path<const N: usize>(
         }
     });
     if len == 0 {
-        return;
+        return Ok(());
     }
     let slice = resolved.get(..len).unwrap_or(&[]);
     let seen = queue
         .get(..*q_len)
         .is_some_and(|used| used.iter().any(|(b, l)| *l == len && b.get(..*l) == Some(slice)));
-    if !seen && let Some(slot) = queue.get_mut(*q_len) {
-        if let (Some(d), Some(s)) = (slot.0.get_mut(..len), resolved.get(..len)) {
-            d.copy_from_slice(s);
-            slot.1 = len;
-            *q_len += 1;
-        }
+    if seen {
+        return Ok(());
     }
+    let Some(slot) = queue.get_mut(*q_len) else {
+        return Err(Fault::Host { call: "landlock (NixOS ELF transitive closure exceeds cap)", code: 7 });
+    };
+    if let (Some(d), Some(s)) = (slot.0.get_mut(..len), resolved.get(..len)) {
+        d.copy_from_slice(s);
+        slot.1 = len;
+        *q_len += 1;
+    }
+    Ok(())
 }
 
 fn enqueue_nix_soname<const N: usize>(
@@ -608,10 +629,13 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         .unwrap_or(&[])
         .iter()
         .any(|(b, l)| b.get(..*l) == Some(res_slice));
-    if !already
-        && let Some(slot) = queue.get_mut(*q_len)
-        && let Some(dst) = slot.0.get_mut(..res_slice.len())
-    {
+    if !already {
+        let Some(slot) = queue.get_mut(*q_len) else {
+            return Err(Fault::Host { call: "landlock (NixOS ELF transitive closure exceeds cap)", code: 7 });
+        };
+        let Some(dst) = slot.0.get_mut(..res_slice.len()) else {
+            return Err(Fault::Host { call: "landlock (NixOS ELF library path exceeds cap)", code: 36 });
+        };
         dst.copy_from_slice(res_slice);
         slot.1 = res_slice.len();
         *q_len += 1;
@@ -677,5 +701,25 @@ impl Confiner for Landlock {
     /// stop) and address space (`RLIMIT_AS`: the child's allocation fails).
     fn meter(&mut self, _pid: i32) -> Result<Option<Usage>, Fault> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod nix_closure_tests {
+    use super::{Fault, enqueue_nix_resolved_path};
+
+    #[test]
+    fn nix_elf_closure_queue_cap_refuses_instead_of_truncating() {
+        let mut queue = [([0u8; 320], 0usize); 2];
+        let mut q_len = 0usize;
+        enqueue_nix_resolved_path(b"/nix/store/aaa-liba/lib/liba.so", &mut queue, &mut q_len).expect("slot 0");
+        enqueue_nix_resolved_path(b"/nix/store/bbb-libb/lib/libb.so", &mut queue, &mut q_len).expect("slot 1");
+        // Duplicate already-seen path still succeeds cleanly.
+        enqueue_nix_resolved_path(b"/nix/store/aaa-liba/lib/liba.so", &mut queue, &mut q_len).expect("dup");
+        assert_eq!(q_len, 2);
+        // Distinct path past cap MUST fail with named Fault::Host rather than silently dropping.
+        let err = enqueue_nix_resolved_path(b"/nix/store/ccc-libc/lib/libc.so", &mut queue, &mut q_len)
+            .expect_err("must refuse when queue cap is exceeded");
+        assert!(matches!(err, Fault::Host { code: 7, .. }));
     }
 }

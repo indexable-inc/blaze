@@ -162,3 +162,100 @@ fn c_probe_dst_catches_planted_blind_overwrite() {
         }
     }
 }
+
+/// Concurrent corrupted-record repair interleaving: places a corrupted file at `c-probe/<k>`,
+/// races two workers repairing it with conflicting answers (`want_a` vs `want_b`) on a shared
+/// store, and asserts exact-one-winner + `OtherBytes` on the loser + winner intact on disk.
+fn run_concurrent_repair_trial(plant: RecordPlant) -> Result<(), &'static str> {
+    let dir_path = std::env::temp_dir().join(std::format!(
+        "blaze-cprobe-repair-{}-{:?}",
+        std::process::id(),
+        plant
+    ));
+    let _ = std::fs::remove_dir_all(&dir_path);
+    std::fs::create_dir_all(&dir_path).map_err(|_| "create repair temp dir")?;
+    let (io, root) = super::native_world(&dir_path).map_err(|_| "repair native world")?;
+    let alloc = blaze_own::testing::heap().alloc();
+    let cx = io.cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME).map_err(|_| "repair cx")?;
+    let k = key(99);
+    let name = DirStore::named(b"c-probe/", &k);
+    let rel = bstd::path::Path::new(name.as_str()).map_err(|_| "rel")?;
+    let want_a = b"answer-A-from-worker-1";
+    let want_b = b"answer-B-from-worker-2-diff";
+
+    for _ in 0..8u32 {
+        // Seed a torn/corrupted record at `c-probe/<k>` so both racing writers lose
+        // `publish_if_absent` and enter the repair path.
+        root.publish(&cx, &rel, bstd::fs::Content::bytes(b"corrupt-short"), bstd::fs::Durable::No)
+            .map_err(|_| "seed corrupt")?;
+        let d1 = io.need_fs().map_err(|_| "fs1")?.root();
+        let d2 = io.need_fs().map_err(|_| "fs2")?.root();
+        let d3 = io.need_fs().map_err(|_| "fs3")?.root();
+        let s1 = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir: d1 }, plant);
+        let s2 = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir: d2 }, plant);
+        let (r1, r2) = std::thread::scope(|s| {
+            let t1 = s.spawn(|| s1.put_c_probe(&k, want_a));
+            let t2 = s.spawn(|| s2.put_c_probe(&k, want_b));
+            (t1.join(), t2.join())
+        });
+        let (Ok(r1), Ok(r2)) = (r1, r2) else {
+            let _ = std::fs::remove_dir_all(&dir_path);
+            return Err("repair thread panicked");
+        };
+        let held = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir: d3 }, RecordPlant::None)
+            .get_c_probe(&k, alloc)
+            .map_err(|_| "read after repair")?
+            .ok_or("record missing after repair")?;
+        match (r1, r2) {
+            (Ok(()), Err(FilesError::OtherBytes { .. })) => {
+                if held.as_slice() != want_a {
+                    let _ = std::fs::remove_dir_all(&dir_path);
+                    return Err("winner A clobbered");
+                }
+            }
+            (Err(FilesError::OtherBytes { .. }), Ok(())) => {
+                if held.as_slice() != want_b {
+                    let _ = std::fs::remove_dir_all(&dir_path);
+                    return Err("winner B clobbered");
+                }
+            }
+            (Ok(()), Ok(())) => {
+                let _ = std::fs::remove_dir_all(&dir_path);
+                return Err("silent overwrite: both conflicting repairers succeeded");
+            }
+            _ => {
+                let _ = std::fs::remove_dir_all(&dir_path);
+                return Err("unexpected repair failure");
+            }
+        }
+    }
+    // Deterministic interleaving check: Worker 1 commits valid A; Worker 2 (having observed
+    // corrupt before Worker 1 committed) enters `repair_c_probe_after_invalid` directly.
+    root.publish(&cx, &rel, bstd::fs::Content::bytes(b"corrupt-short"), bstd::fs::Durable::No)
+        .map_err(|_| "seed corrupt 2")?;
+    let d4 = io.need_fs().map_err(|_| "fs4")?.root();
+    let s_clean = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir: d4 }, plant);
+    s_clean.put_c_probe(&k, want_a).map_err(|_| "first repair")?;
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).map_err(|_| "frame")?;
+    let erased = blaze_own::Erased::new(&frame);
+    let f_alloc = erased.handle();
+    let repair_res = s_clean.repair_c_probe_after_invalid(&name, want_b, f_alloc);
+    let _ = std::fs::remove_dir_all(&dir_path);
+    match repair_res {
+        Err(FilesError::OtherBytes { .. }) => Ok(()),
+        Ok(()) => Err("silent overwrite on interleaved repair after valid commit"),
+        Err(_) => Err("unexpected error on interleaved repair"),
+    }
+}
+
+#[test]
+fn c_probe_concurrent_repair_serializes_and_rejects_conflicts() {
+    run_concurrent_repair_trial(RecordPlant::None).expect("serialized repair must reject conflict");
+}
+
+#[test]
+fn c_probe_concurrent_repair_catches_unserialized_repair() {
+    let err = run_concurrent_repair_trial(RecordPlant::UnserializedRepair)
+        .expect_err("planted UnserializedRepair must be caught");
+    assert!(err.contains("silent overwrite"), "unexpected error: {err}");
+}

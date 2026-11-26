@@ -172,6 +172,13 @@ impl OnDir {
         self.dir.publish_if_absent(&cx, &Self::path(name)?, Content::bytes(whole), Durable::No).map_err(FilesError::Effect)
     }
 
+    /// Acquires an exclusive advisory file lock under the record store for serializing
+    /// corrupted/oversized record repair across concurrent commands.
+    fn lock_exclusive(&self, name: &RecordName) -> Result<bstd::fs::FileLock, FilesError> {
+        let cx = self.cx(name)?;
+        self.dir.lock_exclusive(&cx, &Self::path(name)?).map_err(FilesError::Effect)
+    }
+
     /// [`RecordPlant::FramedPublish`]'s write: `whole` copied into the task's frame, then
     /// published from there, so a record longer than the frame is refused. Never taken but by
     /// the planted bug's test.
@@ -263,6 +270,10 @@ pub enum RecordPlant {
     /// atomic compare-and-publish (`publish_if_absent` + `OtherBytes` on conflict). Never taken
     /// except by the durable-state DST planted-bug control (rule 23).
     BlindOverwrite,
+    /// `put_c_probe` repairs a corrupted/oversized record without acquiring the exclusive repair
+    /// lock (`Effect::Lock`), allowing two concurrent repairers to silently overwrite each other.
+    /// Never taken except by the concurrent-repair DST planted-bug control (rule 23).
+    UnserializedRepair,
 }
 
 /// The folder store of records: each file the record's bytes then their [`SEAL`], published
@@ -362,6 +373,15 @@ pub struct RecordName {
 }
 
 impl RecordName {
+    fn from_ascii(raw: &[u8]) -> RecordName {
+        let mut bytes = [0u8; 72];
+        let n = raw.len().min(bytes.len());
+        if let (Some(dst), Some(src)) = (bytes.get_mut(..n), raw.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        RecordName { bytes, len: u8::try_from(n).unwrap_or(72) }
+    }
+
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("a record name is ASCII by construction")
     }
@@ -448,13 +468,28 @@ impl DirStore {
         if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, alloc)? {
             return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
         }
-        self.files.publish(&name, whole.as_slice())?;
-        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, alloc)?
-            && held.as_slice() != bytes
+        self.repair_c_probe_after_invalid(&name, bytes, alloc)
+    }
+
+    /// Repair path taken after `publish_if_absent` saw an existing entry and the initial bounded
+    /// read found it invalid (torn/corrupted/oversized): acquires `c-probe/.repair.lock`, re-checks
+    /// under the lock so a concurrent valid repair is never overwritten, and atomically publishes.
+    fn repair_c_probe_after_invalid(&self, name: &RecordName, bytes: &[u8], alloc: Alloc<'_>) -> Result<(), FilesError> {
+        let mut whole = blaze_own::Vec::with_capacity_in(bytes.len() + SEAL_LEN, alloc);
+        whole.extend_from_slice(bytes);
+        whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
+        let _repair_guard = if self.plant == RecordPlant::UnserializedRepair {
+            None
+        } else {
+            let lock_name = RecordName::from_ascii(b"c-probe/.repair.lock");
+            Some(self.files.lock_exclusive(&lock_name)?)
+        };
+        if _repair_guard.is_some()
+            && let Some(held) = self.files.read_sealed_bounded(name, crate::probe_clang::MAX_RECORD_BYTES, alloc)?
         {
-            return Err(FilesError::OtherBytes { name });
+            return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) };
         }
-        Ok(())
+        self.files.publish(name, whole.as_slice())
     }
 
     /// The record at `name`, its seal checked: `None` when absent or torn.

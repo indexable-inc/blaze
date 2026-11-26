@@ -357,6 +357,8 @@ impl Clone for Io {
     }
 }
 
+impl blaze_own::Share for Io {}
+
 /// Where an [`Io`]'s world is.
 #[derive(Clone)]
 enum Reach {

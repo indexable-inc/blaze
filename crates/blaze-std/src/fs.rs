@@ -431,6 +431,23 @@ impl Meta {
 }
 
 
+/// An exclusive file lock acquired through [`Dir::lock_exclusive`]: dropping it submits
+/// `Effect::Unlock` with a bounded teardown wait so locks are never leaked within a live process
+/// and release automatically on process crash.
+pub struct FileLock {
+    io: Io,
+    tag: blaze_core::Tag,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let lock = self.tag;
+        let tag = self.io.submit(|tag| Effect::Unlock { lock, tag });
+        let until = blaze_core::wait::Deadline::after(self.io.now(), core::time::Duration::from_secs(5));
+        let _ = self.io.settle(tag, until, "bstd::fs::FileLock unlock");
+    }
+}
+
 /// How durable a change must be when its call returns. A required argument: no file call has
 /// a default (docs/v2/plan/design/std.md, "Files").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -2140,6 +2157,42 @@ impl Dir<ReadWrite> {
         }
         cx.event(how.says());
         Ok(linked)
+    }
+
+    /// Acquires an exclusive advisory file lock at `path` (creating the lock file if absent) via
+    /// `Effect::Lock`, retrying on `Done::Contended` with scheduler-aware timers until `cx`'s
+    /// deadline or cancellation. Releasing the returned [`FileLock`] submits `Effect::Unlock`.
+    pub fn lock_exclusive(&self, cx: &Cx, path: &Path) -> Result<FileLock, FsError> {
+        let name = self.beneath(path);
+        let backoff = core::time::Duration::from_millis(2);
+        loop {
+            cx.stopped_by(self.io.now())
+                .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+            let lock_file = name.share();
+            let mut acquired_tag = blaze_core::Tag(0);
+            let done = self
+                .io
+                .call(cx, |tag| {
+                    acquired_tag = tag;
+                    Effect::Lock { file: lock_file, mode: blaze_core::LockMode::Exclusive, tag }
+                })
+                .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+            match done {
+                Done::Locked => {
+                    return Ok(FileLock { io: self.io.share(), tag: acquired_tag });
+                }
+                Done::Contended => {
+                    let _ = self
+                        .io
+                        .call(cx, |tag| Effect::Timer { after: backoff, tag })
+                        .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+                }
+                Done::Failed(error) => {
+                    return Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0)));
+                }
+                other => return Err(unexpected(FsOp::Publish, &name, other)),
+            }
+        }
     }
 
     /// The file at `path` gone, as durably as `durable` says; gone already is done.

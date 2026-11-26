@@ -620,19 +620,13 @@ impl ProbeAnswerer for HermeticClangProbe {
         };
         self.ensure_verified(&world, &work_root, &clock, probe_began, world.boot().ok(), alloc)?;
 
-        let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir_name = own_fmt(format_args!("p-{}-{seq}", process::id()), alloc);
-        let task_rel = bstd::path::Path::new(dir_name.as_str())
-            .map_err(|_| own_fmt(format_args!("invalid c-probe task dir `{}`", dir_name.as_str()), alloc))?;
         let Some(stage_rem) = remaining() else {
             return Err(own_str("c-probe deadline exhausted before staging", alloc));
         };
         let stage_cx = world
             .cx(stage_rem, bstd::mem::TASK_FRAME)
             .map_err(|_| own_str("c-probe stage context stopped", alloc))?;
-        let task_dir = work_root
-            .make_dir(&stage_cx, &task_rel, bstd::fs::Durable::No)
-            .map_err(|e| own_fmt(format_args!("create probe dir: {e}"), alloc))?;
+        let (dir_name, task_rel, task_dir) = make_unique_task_dir(&work_root, &clock, &stage_cx, alloc)?;
         let task_real = own_fmt(format_args!("{}/{}", self.work_root.as_str(), dir_name.as_str()), alloc);
         let _guard = TaskDirGuard { io: &world, work_root: &work_root, task_rel };
 
@@ -832,6 +826,31 @@ fn render_segments<'a>(
         }
     }
     out
+}
+
+/// Creates a crash- and PID-reuse-safe per-probe task folder under `work_root`, mixing wall-clock
+/// nanoseconds with `pid` and `PROBE_SEQ` and retrying on `FsKind::Exists` so stale directories
+/// left by prior crashes never abort a valid probe.
+fn make_unique_task_dir<'a>(
+    work_root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    clock: &bstd::clock::Clock,
+    cx: &bstd::cx::Cx,
+    alloc: Alloc<'a>,
+) -> Result<(AString<'a>, bstd::path::Path, bstd::fs::Dir<bstd::fs::ReadWrite>), AString<'a>> {
+    let wall = clock.wall().as_ns();
+    let pid = process::id();
+    for _ in 0..32u32 {
+        let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir_name = own_fmt(format_args!("p-{pid}-{wall:x}-{seq}"), alloc);
+        let task_rel = bstd::path::Path::new(dir_name.as_str())
+            .map_err(|_| own_fmt(format_args!("invalid c-probe task dir `{}`", dir_name.as_str()), alloc))?;
+        match work_root.make_dir(cx, &task_rel, bstd::fs::Durable::No) {
+            Ok(dir) => return Ok((dir_name, task_rel, dir)),
+            Err(e) if e.kind == bstd::fs::FsKind::Exists => continue,
+            Err(e) => return Err(own_fmt(format_args!("create probe dir: {e}"), alloc)),
+        }
+    }
+    Err(own_str("create probe dir: exhausted unique task directory attempts", alloc))
 }
 
 fn placeholder_filename<'a>(spelled: &str, alloc: Alloc<'a>) -> AString<'a> {
@@ -1220,5 +1239,19 @@ mod tests {
             alloc,
         );
         assert_eq!(norm.as_str(), "clang: clang-23\nInstalledDir: $CLANG_SHELF/bin\n");
+
+        // Stale task directory collisions recover cleanly across crash / PID reuse.
+        let col_root = std::env::temp_dir().join(format!("blaze-cprobe-col-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&col_root);
+        std::fs::create_dir_all(&col_root).expect("col root");
+        let (col_io, col_dir) = super::native_world(&col_root).expect("col world");
+        let col_clock = col_io.need_clock().expect("col clock");
+        let col_cx = col_io.cx(super::Duration::from_secs(5), bstd::mem::TASK_FRAME).expect("col cx");
+        let (n1, rel1, _) = super::make_unique_task_dir(&col_dir, &col_clock, &col_cx, alloc).expect("dir 1");
+        let (n2, rel2, _) = super::make_unique_task_dir(&col_dir, &col_clock, &col_cx, alloc).expect("dir 2");
+        assert_ne!(n1.as_str(), n2.as_str());
+        let _ = col_dir.remove_dir(&col_cx, &rel1, bstd::fs::Durable::No);
+        let _ = col_dir.remove_dir(&col_cx, &rel2, bstd::fs::Durable::No);
+        let _ = std::fs::remove_dir_all(&col_root);
     }
 }
