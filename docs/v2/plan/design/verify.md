@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: How blaze checks its own store and incremental builds: BLAZE_VERIFY_STORE recomputes a sampled fraction of store hits and compares bytes, and a property-test edit fuzzer holds every incremental build to a clean one through the invalidation oracle (blaze-v2-proof).
+summary: "How blaze checks its own store and incremental builds: BLAZE_VERIFY_STORE recomputes a sampled fraction of store hits and compares bytes, and a property-test edit fuzzer holds every incremental build to a clean one through the invalidation oracle (blaze-v2-proof)."
 date: 2026-11-02
 ---
 # Verifying the store and incremental builds

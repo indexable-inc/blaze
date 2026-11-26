@@ -1,6 +1,6 @@
 ---
 status: current
-summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
+summary: "blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left."
 ---
 # The borrow checker
 

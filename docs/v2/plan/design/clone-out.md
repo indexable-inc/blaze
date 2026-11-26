@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Lane clone-out: a second checkout's build directory costs only its own bytes, because every output of 16 KiB or more is a clone of the store's read-only copy, and each build reports the bytes it cloned, wrote and copied.
+summary: "Lane clone-out: a second checkout's build directory costs only its own bytes, because every output of 16 KiB or more is a clone of the store's read-only copy, and each build reports the bytes it cloned, wrote and copied."
 date: 2026-11-02
 ---
 # Lane clone-out: build directories as clones of the store

@@ -1,6 +1,6 @@
 ---
 status: current
-summary: Installing blaze: the install script, the release channels and what gets installed.
+summary: "Installing blaze: the install script, the release channels and what gets installed."
 ---
 # Installing blaze
 

@@ -285,6 +285,33 @@ fn py_repr(s: &str) -> String {
     out
 }
 
+/// A front matter value as YAML reads it, so GitHub renders the front matter instead of a YAML error.
+/// A plain value must not hold what YAML gives a meaning (`: `, ` #`, a leading indicator); such a
+/// value is written in double quotes, with `\"` and `\\` its only escapes.
+fn yaml_scalar(value: &str) -> Result<String, &'static str> {
+    if let Some(quoted) = value.strip_prefix('"') {
+        let inner = quoted.strip_suffix('"').ok_or("opens a double quote it does not close")?;
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some(c @ ('"' | '\\')) => out.push(c),
+                    _ => return Err("has an escape other than `\\\"` or `\\\\` in double quotes"),
+                },
+                '"' => return Err("has a `\"` in double quotes not written `\\\"`"),
+                c => out.push(c),
+            }
+        }
+        return Ok(out);
+    }
+    const INDICATORS: &[char] = &['`', '[', ']', '{', '}', '*', '&', '!', '|', '>', '\'', '%', '@', '#', ','];
+    if value.contains(": ") || value.contains(" #") || value.starts_with(INDICATORS) {
+        return Err("holds `: `, ` #` or a leading YAML indicator, so it goes in double quotes");
+    }
+    Ok(value.to_owned())
+}
+
 fn parse_front(p: &Patterns, path: &str, text: &str, errors: &mut Vec<String>) -> (Option<Front>, String) {
     if !text.starts_with("---\n") {
         errors.push(format!(
@@ -307,6 +334,14 @@ fn parse_front(p: &Patterns, path: &str, text: &str, errors: &mut Vec<String>) -
                 continue;
             }
         };
+        let value = match yaml_scalar(value) {
+            Ok(value) => value,
+            Err(why) => {
+                errors.push(format!("{path}:{n}: `{key}` {why}: {}", py_repr(line)));
+                continue;
+            }
+        };
+        let value = value.as_str();
         match fields.iter_mut().find(|(k, _)| k == key) {
             Some(field) => {
                 errors.push(format!("{path}:{n}: `{key}` given twice"));
@@ -976,6 +1011,23 @@ fn selftest(p: &Patterns) {
             == ["d.md:4: front matter line is not `key: value`: 'bad'", "d.md: a plan doc needs `date: YYYY-MM-DD`"],
         "a bad line and a missing date are refused, naming the doc",
     );
+    let mut errors = Vec::new();
+    let (front, _) =
+        parse_front(p, "d.md", "---\nstatus: current\nsummary: \"a: b, \\\"c\\\" and `d`\"\n---\n", &mut errors);
+    expect(
+        errors.is_empty() && front.is_some_and(|f| f.summary == "a: b, \"c\" and `d`"),
+        "a double-quoted value is read without its quotes and escapes",
+    );
+    let mut errors = Vec::new();
+    parse_front(p, "d.md", "---\nstatus: current\nsummary: blaze: fast\n---\n", &mut errors);
+    expect(
+        errors.len() == 2
+            && errors[0].starts_with("d.md:3: `summary` holds `: `, ` #` or a leading YAML indicator"),
+        "a plain value YAML would misread is refused, naming the line",
+    );
+    let mut errors = Vec::new();
+    parse_front(p, "d.md", "---\nstatus: current\nsummary: `x` is y\n---\n", &mut errors);
+    expect(errors.len() == 2, "a plain value opening with a YAML indicator is refused");
     // A table's key (agents.json A38).
     let gate = "| workflow | event | what |\n|---|---|---|\n| `blaze.yaml` (`gate`) | pull request | every test |\n";
     expect(duplicate_rows("d.md", gate).is_empty(), "a table whose rows have their own keys holds");

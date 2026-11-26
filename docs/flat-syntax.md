@@ -1,6 +1,6 @@
 ---
 status: record
-summary: Flat syntax trees for files nobody edits (#42): the design and its memory and time, measured.
+summary: "Flat syntax trees for files nobody edits (#42): the design and its memory and time, measured."
 date: 2026-10-22
 ---
 # Flat syntax trees for files nobody edits

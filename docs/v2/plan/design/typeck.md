@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The per-body type-check driver written new (crates/blaze-typeck): one body in, one record out, a pure function that returns its result or the facts it lacks; every fact from outside the body read through one sealed recorder, so a result cannot depend on what its read list does not hold; the walk an explicit work stack in rustc's order; results and diagnostics in portable columns. The type tables, the next-generation trait solver, MIR building and the borrow checker are kept; the old driver (hir-ty's infer and method_resolution) is the referee until every body of core, alloc and std agrees.
+summary: "The per-body type-check driver written new (crates/blaze-typeck): one body in, one record out, a pure function that returns its result or the facts it lacks; every fact from outside the body read through one sealed recorder, so a result cannot depend on what its read list does not hold; the walk an explicit work stack in rustc's order; results and diagnostics in portable columns. The type tables, the next-generation trait solver, MIR building and the borrow checker are kept; the old driver (hir-ty's infer and method_resolution) is the referee until every body of core, alloc and std agrees."
 date: 2026-11-15
 ---
 # The type-check driver, from scratch

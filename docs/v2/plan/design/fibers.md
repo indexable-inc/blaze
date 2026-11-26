@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane sched (2026-10-31): a waiting job never blocks its thread, and the scheduler is a sans-IO state machine. Phase 1 is the synchronous core in crates/blaze-graph/src/sched/ with its property tests (written); phase 2 is stackful fibers (corosensei, decided 18:29): the driver and the query-wait hook are written, the pump's replacement and the thread-local audit follow.
+summary: "lane sched (2026-10-31): a waiting job never blocks its thread, and the scheduler is a sans-IO state machine. Phase 1 is the synchronous core in crates/blaze-graph/src/sched/ with its property tests (written); phase 2 is stackful fibers (corosensei, decided 18:29): the driver and the query-wait hook are written, the pump's replacement and the thread-local audit follow."
 date: 2026-10-31
 ---
 # sched: a scheduler where waiting holds no thread

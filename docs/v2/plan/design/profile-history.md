@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane observe, step 3: the flight recorder's Parquet history, its errors table and `blaze debug diff` (crates/blaze-profile/src/history.rs), the DuckDB views and named queries over it (sql/views.sql, sql/examples.sql, src/views.rs), `blaze debug sql` running the pinned DuckDB CLI (src/sql.rs), and the flush's speed of light.
+summary: "lane observe, step 3: the flight recorder's Parquet history, its errors table and `blaze debug diff` (crates/blaze-profile/src/history.rs), the DuckDB views and named queries over it (sql/views.sql, sql/examples.sql, src/views.rs), `blaze debug sql` running the pinned DuckDB CLI (src/sql.rs), and the flush's speed of light."
 date: 2026-10-31
 ---
 # The history

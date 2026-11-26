@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Compile-time reflection in blaze. Phase 1 completes nightly `core::mem::type_info` in blaze's const evaluator; phase 2 is the opt-in `blaze_comptime` extension (`for const f in fields_of::<T>()`, `self.[f]`, `for<F: Field<T>>` bounds, `fn_info`), and 2b adds `dyn` and fn-pointer calls in const checked at evaluation and `const static { .. }` blocks that run any code at compile time; phase 3 builds types from const code (`type_of!`).
+summary: "Compile-time reflection in blaze. Phase 1 completes nightly `core::mem::type_info` in blaze's const evaluator; phase 2 is the opt-in `blaze_comptime` extension (`for const f in fields_of::<T>()`, `self.[f]`, `for<F: Field<T>>` bounds, `fn_info`), and 2b adds `dyn` and fn-pointer calls in const checked at evaluation and `const static { .. }` blocks that run any code at compile time; phase 3 builds types from const code (`type_of!`)."
 date: 2026-11-09
 ---
 # Compile-time reflection (`comptime`)

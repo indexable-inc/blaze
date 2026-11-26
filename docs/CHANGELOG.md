@@ -1,6 +1,6 @@
 ---
 status: record
-summary: Changelog: every user-visible change, by release, with [Unreleased] on top.
+summary: "Changelog: every user-visible change, by release, with [Unreleased] on top."
 date: 2026-11-03
 ---
 # Changelog

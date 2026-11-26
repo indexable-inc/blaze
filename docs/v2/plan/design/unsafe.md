@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: unsafe where it makes code measurably faster, safe Rust everywhere else, and every unsafe line proved sound by our own tools (a Miri of our own, sanitizers in our code generator, model checking).
+summary: "blaze v2: unsafe where it makes code measurably faster, safe Rust everywhere else, and every unsafe line proved sound by our own tools (a Miri of our own, sanitizers in our code generator, model checking)."
 date: 2026-10-29
 ---
 # Unsafe: where it pays, and proved

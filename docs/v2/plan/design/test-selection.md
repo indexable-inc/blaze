@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze test reruns only the tests that can have changed: a test's result is an outside record keyed by its identity, its asks are the functions it executed and what it read outside, a suite index finds the tests an edit touches, and a no-op is answered by the certificate. One flag runs everything.
+summary: "blaze test reruns only the tests that can have changed: a test's result is an outside record keyed by its identity, its asks are the functions it executed and what it read outside, a suite index finds the tests an edit touches, and a no-op is answered by the certificate. One flag runs everything."
 date: 2026-11-13
 ---
 

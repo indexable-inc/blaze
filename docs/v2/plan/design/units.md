@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The unit graph (crates/blaze-unit-graph): which crates a request compiles and with which features and cfgs, by cargo's documented rules, without cargo; a sans-IO function from the lock, the manifests, two platform descriptions and the ask to units, each crate once per configuration; what the driver's Units task calls; what features as conditions change; what is not covered.
+summary: "The unit graph (crates/blaze-unit-graph): which crates a request compiles and with which features and cfgs, by cargo's documented rules, without cargo; a sans-IO function from the lock, the manifests, two platform descriptions and the ask to units, each crate once per configuration; what the driver's Units task calls; what features as conditions change; what is not covered."
 date: 2026-11-16
 ---
 # The unit graph

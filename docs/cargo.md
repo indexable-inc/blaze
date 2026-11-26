@@ -1,6 +1,6 @@
 ---
 status: current
-summary: Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
+summary: "Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests."
 ---
 # Using blaze
 

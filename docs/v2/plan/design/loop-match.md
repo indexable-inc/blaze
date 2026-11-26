@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane loop-match: `#[loop_match]` / `#[const_continue]` (feature loop_match) lower a constant state transition to a jump into its arm, past the loop head's chain of arm tests; malformed uses are refused with rustc's messages.
+summary: "lane loop-match: `#[loop_match]` / `#[const_continue]` (feature loop_match) lower a constant state transition to a jump into its arm, past the loop head's chain of arm tests; malformed uses are refused with rustc's messages."
 date: 2026-11-13
 ---
 # Direct jumps for `#[loop_match]`

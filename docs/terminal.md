@@ -1,6 +1,6 @@
 ---
 status: current
-summary: What `blaze build`, `run`, `check` and `test` show: on a terminal a region redrawn while a build runs and at most one line when it ends, off one stable `blaze:` lines; and the one sans-IO core (blaze-screen) that makes both from the build's events.
+summary: "What `blaze build`, `run`, `check` and `test` show: on a terminal a region redrawn while a build runs and at most one line when it ends, off one stable `blaze:` lines; and the one sans-IO core (blaze-screen) that makes both from the build's events."
 ---
 # What a build shows
 

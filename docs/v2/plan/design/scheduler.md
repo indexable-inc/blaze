@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The scheduler blaze is moving to: one graph of pure, identity-keyed nodes pulled by what is waited for, cycles as single nodes, no shared mutable state, priority from who waits, memory and cores both admitted, code tiers as nodes, built to scale to hundreds of cores. Replaces the 2026-11-02 plan, with what of it is built and the order of the rest.
+summary: "The scheduler blaze is moving to: one graph of pure, identity-keyed nodes pulled by what is waited for, cycles as single nodes, no shared mutable state, priority from who waits, memory and cores both admitted, code tiers as nodes, built to scale to hundreds of cores. Replaces the 2026-11-02 plan, with what of it is built and the order of the rest."
 date: 2026-11-11
 ---
 # The scheduler: one graph of keyed work, pulled by what is waited for

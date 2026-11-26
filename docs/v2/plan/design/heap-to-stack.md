@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: HeapToStack, blaze's own MIR pass: a Box::new, Rc::new or small vec! whose allocation never leaves its function lives in the function's frame instead, only in programs whose allocator is std's, capped per value and per frame, and never in a frame that can recur.
+summary: "HeapToStack, blaze's own MIR pass: a Box::new, Rc::new or small vec! whose allocation never leaves its function lives in the function's frame instead, only in programs whose allocator is std's, capped per value and per frame, and never in a frame that can recur."
 date: 2026-11-02
 ---
 # HeapToStack: allocations that never leave their function

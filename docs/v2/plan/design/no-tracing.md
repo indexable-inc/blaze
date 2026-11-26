@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze drops the `tracing` crate. Every span and event goes through blaze's own recorder in a new leaf crate `blaze-trace`: one registry for span and event kinds, `span!` and `event!` macros with static call sites, words written straight into the flight ring (no dispatcher, no visitor). The doc gives the grammar, the slot-reuse ordering, the cost budget with its instruction-count bench on the Linux bench runners, the mapping from each tracing form, vendor patch series for third-party crates, a lockfile ban in `blaze check`, and the lanes parallel agents take.
+summary: "blaze drops the `tracing` crate. Every span and event goes through blaze's own recorder in a new leaf crate `blaze-trace`: one registry for span and event kinds, `span!` and `event!` macros with static call sites, words written straight into the flight ring (no dispatcher, no visitor). The doc gives the grammar, the slot-reuse ordering, the cost budget with its instruction-count bench on the Linux bench runners, the mapping from each tracing form, vendor patch series for third-party crates, a lockfile ban in `blaze check`, and the lanes parallel agents take."
 date: 2026-11-04
 ---
 # No tracing: blaze's own spans and events

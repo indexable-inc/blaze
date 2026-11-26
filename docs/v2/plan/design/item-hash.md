@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2's item identities: a body's type check, MIR and borrow check are filed in the store under an a-priori hash of everything they read (its own name-resolved HIR with no spans, the signature hashes of what it names, the crate's inputs) plus a constructive trace of the global facts they read (impl sets, method candidates, field names, constant values), so a result is a store read with no deep verify, shared across branches, machines and reverted edits; the hash is anonymous (Unison-style), with names and positions in a presentation layer, locations as a per-crate data table, debug info off the edit path, and item IDs in blaze's own reports.
+summary: "blaze v2's item identities: a body's type check, MIR and borrow check are filed in the store under an a-priori hash of everything they read (its own name-resolved HIR with no spans, the signature hashes of what it names, the crate's inputs) plus a constructive trace of the global facts they read (impl sets, method candidates, field names, constant values), so a result is a store read with no deep verify, shared across branches, machines and reverted edits; the hash is anonymous (Unison-style), with names and positions in a presentation layer, locations as a per-crate data table, debug info off the edit path, and item IDs in blaze's own reports."
 date: 2026-10-30
 ---
 # Item identities: a front-end result is a lookup by hash

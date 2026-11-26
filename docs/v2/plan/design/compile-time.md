@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: the bigger changes for the fastest compile times: reachability-only codegen, a persistent trait cache, the nightly's own solver, proc macros on our own compiler, tiered compilation and idle cores always working, lazy per-function compilation, copy-and-patch codegen, no link and no rewrite for dev runs, one global cache, semantic edits and declared intent, shared generic code, exact test selection, hash-consing, premapped dependencies, scheduling from history, PGO and BOLT.
+summary: "blaze v2: the bigger changes for the fastest compile times: reachability-only codegen, a persistent trait cache, the nightly's own solver, proc macros on our own compiler, tiered compilation and idle cores always working, lazy per-function compilation, copy-and-patch codegen, no link and no rewrite for dev runs, one global cache, semantic edits and declared intent, shared generic code, exact test selection, hash-consing, premapped dependencies, scheduling from history, PGO and BOLT."
 date: 2026-10-29
 ---
 # The fastest compile times

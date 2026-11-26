@@ -1,6 +1,6 @@
 ---
 status: record
-summary: Results: every number with the harness, commit and report it came from.
+summary: "Results: every number with the harness, commit and report it came from."
 date: 2026-10-27
 ---
 # Results

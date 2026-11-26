@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane safety's model checker for lock-free code (crate blaze-check): shim atomics, locks and threads as coroutines on one OS thread, loom's bounded DPOR over interleavings, every value a load may read under C11, and a model test per lock-free structure against a sequential model.
+summary: "lane safety's model checker for lock-free code (crate blaze-check): shim atomics, locks and threads as coroutines on one OS thread, loom's bounded DPOR over interleavings, every value a load may read under C11, and a model test per lock-free structure against a sequential model."
 date: 2026-10-29
 ---
 # Model checking lock-free code

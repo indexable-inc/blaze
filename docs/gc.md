@@ -2,7 +2,7 @@
 status: superseded
 superseded_by: v2/plan/design/end-state.md#d159-one-body-one-store-one-answer-form-code-made-ahead
 date: 2026-11-20
-summary: (crates/blaze-gc, deleted 2026-11-20 with nothing live calling it) What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed; the daemon's store under the home's budget, its pins and what a build says of it.
+summary: "(crates/blaze-gc, deleted 2026-11-20 with nothing live calling it) What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed; the daemon's store under the home's budget, its pins and what a build says of it."
 ---
 # Collecting what blaze keeps on disk
 

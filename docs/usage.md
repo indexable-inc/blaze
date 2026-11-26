@@ -1,6 +1,6 @@
 ---
 status: current
-summary: Getting started: using blaze on a project, in short.
+summary: "Getting started: using blaze on a project, in short."
 ---
 # Using blaze
 

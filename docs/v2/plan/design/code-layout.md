@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Profile-guided code layout in blaze's own linker: C3 function order from an ix-prof sampling profile mapped back through per-build address maps, cold functions inferred without a profile and placed last, cold blocks weighted unlikely; hot/cold splitting designed, not built; the benchmark.
+summary: "Profile-guided code layout in blaze's own linker: C3 function order from an ix-prof sampling profile mapped back through per-build address maps, cold functions inferred without a profile and placed last, cold blocks weighted unlikely; hot/cold splitting designed, not built; the benchmark."
 date: 2026-11-02
 ---
 # Profile-guided code layout

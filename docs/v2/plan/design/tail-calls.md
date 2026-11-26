@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane tailcall: `become` (explicit_tail_calls) as a guaranteed tail call through the front end, the MIR evaluator, the stencils and LLVM; dev code is stencils, which make one, and wasm refuses it by name.
+summary: "lane tailcall: `become` (explicit_tail_calls) as a guaranteed tail call through the front end, the MIR evaluator, the stencils and LLVM; dev code is stencils, which make one, and wasm refuses it by name."
 date: 2026-11-02
 ---
 # Explicit tail calls (`become`)

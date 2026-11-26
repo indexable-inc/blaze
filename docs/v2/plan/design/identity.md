@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: One portable identity for an item, its item key, and interned ids that cannot leave the snapshot that made them: every record and every table that outlives a snapshot names an item by key, through one pair of functions, and the six other portable forms are deleted.
+summary: "One portable identity for an item, its item key, and interned ids that cannot leave the snapshot that made them: every record and every table that outlives a snapshot names an item by key, through one pair of functions, and the six other portable forms are deleted."
 date: 2026-11-15
 ---
 # Item identity

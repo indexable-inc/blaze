@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's own trait solver, crates/blaze-solve, written from scratch with Rust's semantics as the pinned nightly's next-generation solver implements them (vendor/rustc_next_trait_solver is the reference, ported rule by rule), and a data-oriented engine built for speed: goals, obligations and candidates as fixed-size records in columns, an explicit stack in place of recursion, the reference's search graph for cycles, wake lists for stalled obligations, a ground fast path through canonical bytes and marker bits, a SIMD fingerprint prefilter over impl buckets, and solved goals as records valid by their read lists.
+summary: "blaze's own trait solver, crates/blaze-solve, written from scratch with Rust's semantics as the pinned nightly's next-generation solver implements them (vendor/rustc_next_trait_solver is the reference, ported rule by rule), and a data-oriented engine built for speed: goals, obligations and candidates as fixed-size records in columns, an explicit stack in place of recursion, the reference's search graph for cycles, wake lists for stalled obligations, a ground fast path through canonical bytes and marker bits, a SIMD fingerprint prefilter over impl buckets, and solved goals as records valid by their read lists."
 date: 2026-11-15
 ---
 # The trait solver, from scratch

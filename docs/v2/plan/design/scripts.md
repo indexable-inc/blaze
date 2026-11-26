@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Python leaves the repository: what was deleted, and Rust scripts run by blaze (`blaze run script.rs`, bstd, typed input, stage 0) replacing the rest.
+summary: "Python leaves the repository: what was deleted, and Rust scripts run by blaze (`blaze run script.rs`, bstd, typed input, stage 0) replacing the rest."
 date: 2026-11-11
 ---
 # Scripts in Rust, run by blaze

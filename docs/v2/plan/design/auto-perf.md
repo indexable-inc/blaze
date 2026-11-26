@@ -1,6 +1,6 @@
 ---
 status: current
-summary: Blaze's automatic performance stack: explicit-allocator stdlib primitives, OS-in-the-types Dir<P, S> and comptime IO capabilities, Profile-Guided Linting (PGL) with newtype/tuple-return discipline, and closed-loop cross-run decayed PGO driving LIR bottom-up SCC LTO, live JIT tier-up, and `blaze export` by default.
+summary: "Blaze's automatic performance stack: explicit-allocator stdlib primitives, OS-in-the-types Dir<P, S> and comptime IO capabilities, Profile-Guided Linting (PGL) with newtype/tuple-return discipline, and closed-loop cross-run decayed PGO driving LIR bottom-up SCC LTO, live JIT tier-up, and `blaze export` by default."
 date: 2026-11-22
 ---
 # Automatic Performance, Capability Types & Closed-Loop PGO
