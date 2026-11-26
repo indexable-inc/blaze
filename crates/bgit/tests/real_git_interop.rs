@@ -248,10 +248,16 @@ fn bgit_status_matches_real_git_porcelain_and_works_on_pure_bgit_repos() {
         run_bgit_raw(&["status", repo.join("src").to_str().unwrap(), "--porcelain", "-b"]);
     assert_eq!(bgit_from_sub, git_porcelain, "bgit status from subdir must discover root");
 
-    // 2. Infect the repo, then create a pure `.bgit`-only checkout (removing `.git`) and verify `bgit status` works!
+    // 2. Infect the repo, verify `git status` stays clean (`.bgit/` excluded in `.git/info/exclude`),
+    // then create a pure `.bgit`-only checkout (removing `.git`) and verify `bgit status` works!
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-m", "clean snapshot"]);
     run_bgit(&["infect", repo.to_str().unwrap()]);
+    assert_eq!(
+        run_git_raw(&repo, &["status", "--porcelain=v1"]),
+        "",
+        "git status must stay clean after `bgit infect` (`.bgit/` excluded in `.git/info/exclude`)"
+    );
     // Remove `.git` completely -> pure `.bgit`-only repository!
     fs::remove_dir_all(repo.join(".git")).unwrap();
     let clean_bgit = run_bgit_raw(&["status", repo.to_str().unwrap(), "--porcelain", "-b"]);

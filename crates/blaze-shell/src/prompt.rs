@@ -1183,10 +1183,15 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
         return None;
     }
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.first().copied() != Some("git") {
+    let cmd = parts.first().copied()?;
+    if cmd != "git" && cmd != "bgit" {
         return None;
     }
     let sub = parts.get(1).copied()?;
+    // For `bgit`, only intercept plain `bgit status` / `bgit st` (let `infect`, `mount`, `bench`, etc. run the CLI).
+    if cmd == "bgit" && sub != "status" && sub != "st" {
+        return None;
+    }
     let rest = &parts[2..];
     let alloc = Alloc::global();
 

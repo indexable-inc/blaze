@@ -942,6 +942,10 @@ pub(crate) fn infect_repo_on_disk<'a>(
         .map_err(|e| io::Error::other(format!("{e}")))?;
     write_file_atomic(&bgit_dir.join("refs.bgref"), &reftable_bytes)?;
 
+    // Ensure `.bgit/` is excluded in `.git/info/exclude` (local-only, never touches `.gitignore`)
+    // so `git status` and shell prompts stay clean after infecting a `.git` repository.
+    ensure_bgit_excluded_in_git(&git_dir)?;
+
     Ok(InfectStats {
         loose_objects_in: loose_count,
         packfiles_in,
@@ -952,6 +956,26 @@ pub(crate) fn infect_repo_on_disk<'a>(
         raw_object_bytes,
         stored_slab_bytes,
     })
+}
+
+fn ensure_bgit_excluded_in_git(git_dir: &Path) -> io::Result<()> {
+    let info_dir = git_dir.join("info");
+    let exclude_path = info_dir.join("exclude");
+    let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+    let already = existing
+        .lines()
+        .map(str::trim)
+        .any(|l| l == ".bgit" || l == ".bgit/" || l == "/.bgit" || l == "/.bgit/");
+    if already {
+        return Ok(());
+    }
+    fs::create_dir_all(&info_dir)?;
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(".bgit/\n");
+    write_file_atomic(&exclude_path, updated.as_bytes())
 }
 
 fn walk_loose_refs<'a>(dir: &Path, prefix: &str, builder: &mut InfectBuilder<'a>) -> io::Result<()> {
