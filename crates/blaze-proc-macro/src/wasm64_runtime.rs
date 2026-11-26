@@ -9,14 +9,87 @@
 //! - the 3 `blaze_host_v1` imports (`submit_wait`, `host_caps`, `host_log`), bounds-checked
 //!   against the guest's 64-bit linear memory.
 
-use core::fmt;
+use core::fmt::{self, Write as _};
 
+use blaze_own::{AString, AVec, Alloc};
 use wasmtime::{
     Caller, Config, Engine, Extern, Instance, Linker, Memory, Module, OptLevel, Store, StoreLimits,
     StoreLimitsBuilder, Trap, Val, WasmBacktraceDetails, WasmParams, WasmResults,
 };
 
 use crate::host::{MAX_WASM_STACK, fuel_cost};
+
+/// Formats `args` into an owned `AString<'a>` in `alloc`.
+fn own_fmt<'a>(alloc: Alloc<'a>, args: fmt::Arguments<'_>) -> AString<'a> {
+    let mut out = AString::new_in(alloc);
+    let _ = out.write_fmt(args);
+    out
+}
+
+/// Copies `text` into an owned `AString<'a>` in `alloc`.
+fn own_str<'a>(alloc: Alloc<'a>, text: &str) -> AString<'a> {
+    let mut out = AString::with_capacity_in(text.len(), alloc);
+    out.push_str(text);
+    out
+}
+
+/// Zero-allocation typed error raised by `blaze_host_v1` callbacks into Wasmtime.
+#[derive(Debug)]
+enum HostAbiError {
+    MissingMemory,
+    PtrOutOfRange(i64),
+    NegativeLen(i32),
+    SliceOverflow { start: usize, len: usize },
+    SliceOutOfBounds { start: usize, end: usize, memory_len: usize },
+    NegativeSubmitCount { submit: i32, min_complete: i32 },
+    InvalidRingPtr(i64),
+    RingPtrOutOfBounds { ptr: usize, memory_len: usize },
+    InvalidLogUtf8(core::str::Utf8Error),
+    LogCountLimit(usize),
+    LogBytesLimit(usize),
+}
+
+impl fmt::Display for HostAbiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            HostAbiError::MissingMemory => {
+                f.write_str("wasm64 guest called host import without exporting `memory`")
+            }
+            HostAbiError::PtrOutOfRange(ptr) => {
+                write!(f, "wasm64 guest pointer {ptr} out of host usize range")
+            }
+            HostAbiError::NegativeLen(len) => write!(f, "wasm64 guest slice length {len} is negative"),
+            HostAbiError::SliceOverflow { start, len } => {
+                write!(f, "wasm64 guest slice {start}+{len} overflowed")
+            }
+            HostAbiError::SliceOutOfBounds { start, end, memory_len } => {
+                write!(f, "wasm64 guest slice [{start}..{end}) exceeds linear memory size {memory_len}")
+            }
+            HostAbiError::NegativeSubmitCount { submit, min_complete } => write!(
+                f,
+                "blaze_host_v1::submit_wait negative count (submit={submit}, min_complete={min_complete})"
+            ),
+            HostAbiError::InvalidRingPtr(ptr) => {
+                write!(f, "blaze_host_v1::submit_wait invalid ring_ptr {ptr}")
+            }
+            HostAbiError::RingPtrOutOfBounds { ptr, memory_len } => write!(
+                f,
+                "blaze_host_v1::submit_wait ring_ptr {ptr} out of bounds for {memory_len}-byte memory"
+            ),
+            HostAbiError::InvalidLogUtf8(err) => {
+                write!(f, "blaze_host_v1::host_log invalid UTF-8: {err}")
+            }
+            HostAbiError::LogCountLimit(max) => {
+                write!(f, "blaze_host_v1::host_log exceeded max_logs ({max})")
+            }
+            HostAbiError::LogBytesLimit(max) => {
+                write!(f, "blaze_host_v1::host_log exceeded max_log_bytes ({max})")
+            }
+        }
+    }
+}
+
+impl core::error::Error for HostAbiError {}
 
 /// Canonical import module name for Blaze's Wasm64 sans-IO ring host ABI.
 pub const HOST_MODULE: &str = "blaze_host_v1";
@@ -57,13 +130,14 @@ impl Default for Wasm64Limits {
 #[derive(Debug)]
 pub struct Wasm64HostState {
     /// Captured `(level, message)` entries emitted via `blaze_host_v1::host_log`.
-    pub logs: Vec<(i32, String)>,
+    pub logs: AVec<'static, (i32, AString<'static>)>,
     /// Number of `blaze_host_v1::submit_wait` calls made by the guest.
     pub submit_wait_calls: u64,
     /// Number of `blaze_host_v1::host_caps` calls made by the guest.
     pub host_caps_calls: u64,
     /// Capability bitmask advertised to the guest by `blaze_host_v1::host_caps`.
     pub capabilities: u64,
+    alloc: Alloc<'static>,
     limits: StoreLimits,
     max_logs: usize,
     max_log_bytes: usize,
@@ -71,8 +145,8 @@ pub struct Wasm64HostState {
 }
 
 impl Wasm64HostState {
-    /// Constructs fresh host state enforcing `limits`.
-    pub fn new(limits: Wasm64Limits) -> Wasm64HostState {
+    /// Constructs fresh host state enforcing `limits` using `alloc`.
+    pub fn new(limits: Wasm64Limits, alloc: Alloc<'static>) -> Wasm64HostState {
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes)
             .table_elements(limits.table_elements)
@@ -81,10 +155,11 @@ impl Wasm64HostState {
             .memories(1)
             .build();
         Wasm64HostState {
-            logs: Vec::new(),
+            logs: AVec::new_in(alloc),
             submit_wait_calls: 0,
             host_caps_calls: 0,
             capabilities: 0,
+            alloc,
             limits: store_limits,
             max_logs: limits.max_logs,
             max_log_bytes: limits.max_log_bytes,
@@ -93,8 +168,8 @@ impl Wasm64HostState {
     }
 
     /// Captured `(level, message)` log entries.
-    pub fn logs(&self) -> &[(i32, String)] {
-        &self.logs
+    pub fn logs(&self) -> impl ExactSizeIterator<Item = (i32, &str)> {
+        self.logs.iter().map(|(level, text)| (*level, text.as_str()))
     }
 }
 
@@ -102,25 +177,25 @@ impl Wasm64HostState {
 #[derive(Debug)]
 pub enum Wasm64RunError {
     /// Wasmtime refused the `memory64` engine configuration.
-    Engine(String),
+    Engine(AString<'static>),
     /// Linking `blaze_host_v1` imports failed.
-    Linker(String),
+    Linker(AString<'static>),
     /// Compiling/validating the `.wasm` bytes failed.
-    Compile(String),
+    Compile(AString<'static>),
     /// Instantiating the module failed (missing import, memory limit, etc.).
-    Instantiate(String),
+    Instantiate(AString<'static>),
     /// An expected export (function, memory, or global) is missing or has another type.
-    MissingExport(String),
+    MissingExport(AString<'static>),
     /// The guest ran out of its configured fuel budget.
     OutOfFuel { fuel_limit: u64 },
     /// The guest exceeded its configured linear memory limit.
-    MemoryLimit { limit: usize, why: String },
+    MemoryLimit { limit: usize, why: AString<'static> },
     /// The guest trapped during execution.
-    Trap { code: Option<Trap>, why: String },
+    Trap { code: Option<Trap>, why: AString<'static> },
     /// A host memory read or guest pointer slice was out of linear memory bounds.
     OutOfBounds { offset: u64, len: usize, memory_len: usize },
     /// A guest call failed for another reason (e.g. a host callback refused a bad argument).
-    Call { export: String, why: String },
+    Call { export: AString<'static>, why: AString<'static> },
 }
 
 impl fmt::Display for Wasm64RunError {
@@ -156,11 +231,12 @@ impl core::error::Error for Wasm64RunError {}
 pub struct Wasm64Engine {
     engine: Engine,
     linker: Linker<Wasm64HostState>,
+    alloc: Alloc<'static>,
 }
 
 impl Wasm64Engine {
     /// Builds a deterministic Wasmtime `memory64` engine with `blaze_host_v1` linked.
-    pub fn new() -> Result<Wasm64Engine, Wasm64RunError> {
+    pub fn new(alloc: Alloc<'static>) -> Result<Wasm64Engine, Wasm64RunError> {
         let mut config = Config::new();
         config
             .wasm_memory64(true)
@@ -172,10 +248,12 @@ impl Wasm64Engine {
             .max_wasm_stack(MAX_WASM_STACK)
             .async_stack_size(MAX_WASM_STACK)
             .wasm_backtrace_details(WasmBacktraceDetails::Disable);
-        let engine = Engine::new(&config).map_err(|err| Wasm64RunError::Engine(format!("{err:#}")))?;
+        let engine = Engine::new(&config)
+            .map_err(|err| Wasm64RunError::Engine(own_fmt(alloc, format_args!("{err:#}"))))?;
         let mut linker = Linker::new(&engine);
-        link_blaze_host_v1(&mut linker).map_err(|err| Wasm64RunError::Linker(format!("{err:#}")))?;
-        Ok(Wasm64Engine { engine, linker })
+        link_blaze_host_v1(&mut linker)
+            .map_err(|err| Wasm64RunError::Linker(own_fmt(alloc, format_args!("{err:#}"))))?;
+        Ok(Wasm64Engine { engine, linker, alloc })
     }
 
     /// Underlying Wasmtime [`Engine`].
@@ -185,33 +263,38 @@ impl Wasm64Engine {
 
     /// Compiles and instantiates a `memory64` `.wasm` binary under `limits`.
     pub fn instantiate(&self, wasm: &[u8], limits: Wasm64Limits) -> Result<Wasm64Instance, Wasm64RunError> {
+        let alloc = self.alloc;
         let module = Module::new(&self.engine, wasm)
-            .map_err(|err| Wasm64RunError::Compile(format!("{err:#}")))?;
-        let mut store = Store::new(&self.engine, Wasm64HostState::new(limits));
+            .map_err(|err| Wasm64RunError::Compile(own_fmt(alloc, format_args!("{err:#}"))))?;
+        let mut store = Store::new(&self.engine, Wasm64HostState::new(limits, alloc));
         store.limiter(|state| &mut state.limits);
-        store
-            .set_fuel(limits.fuel)
-            .map_err(|err| Wasm64RunError::Instantiate(format!("set_fuel failed: {err:#}")))?;
+        store.set_fuel(limits.fuel).map_err(|err| {
+            Wasm64RunError::Instantiate(own_fmt(alloc, format_args!("set_fuel failed: {err:#}")))
+        })?;
         let instance = self.linker.instantiate(&mut store, &module).map_err(|err| {
-            let msg = format!("{err:#}");
-            if msg.contains("memory minimum size") || (msg.contains("memory") && msg.contains("limit")) {
+            let msg = own_fmt(alloc, format_args!("{err:#}"));
+            if msg.as_str().contains("memory minimum size")
+                || (msg.as_str().contains("memory") && msg.as_str().contains("limit"))
+            {
                 Wasm64RunError::MemoryLimit { limit: limits.memory_bytes, why: msg }
             } else {
                 Wasm64RunError::Instantiate(msg)
             }
         })?;
         let Some(memory) = instance.get_memory(&mut store, "memory") else {
-            return Err(Wasm64RunError::MissingExport("memory".to_owned()));
+            return Err(Wasm64RunError::MissingExport(own_str(alloc, "memory")));
         };
         if !memory.ty(&store).is_64() {
-            return Err(Wasm64RunError::Instantiate(
-                "exported `memory` is 32-bit; Wasm64Instance requires memory64".to_owned(),
-            ));
+            return Err(Wasm64RunError::Instantiate(own_str(
+                alloc,
+                "exported `memory` is 32-bit; Wasm64Instance requires memory64",
+            )));
         }
         Ok(Wasm64Instance {
             store,
             instance,
             memory,
+            alloc,
             fuel_limit: limits.fuel,
             memory_limit: limits.memory_bytes,
         })
@@ -223,41 +306,31 @@ fn caller_memory(caller: &mut Caller<'_, Wasm64HostState>) -> wasmtime::Result<M
     caller
         .get_export("memory")
         .and_then(Extern::into_memory)
-        .ok_or_else(|| wasmtime::Error::msg("wasm64 guest called host import without exporting `memory`"))
+        .ok_or_else(|| wasmtime::Error::new(HostAbiError::MissingMemory))
 }
 
 /// Validates and extracts an immutable byte slice `[ptr..ptr+len)` from 64-bit guest linear memory.
 fn guest_slice(mem: &[u8], ptr: i64, len: i32) -> wasmtime::Result<&[u8]> {
-    let start = usize::try_from(ptr)
-        .map_err(|_| wasmtime::Error::msg(format!("wasm64 guest pointer {ptr} out of host usize range")))?;
-    let len = usize::try_from(len)
-        .map_err(|_| wasmtime::Error::msg(format!("wasm64 guest slice length {len} is negative")))?;
+    let start = usize::try_from(ptr).map_err(|_| wasmtime::Error::new(HostAbiError::PtrOutOfRange(ptr)))?;
+    let len = usize::try_from(len).map_err(|_| wasmtime::Error::new(HostAbiError::NegativeLen(len)))?;
     let end = start
         .checked_add(len)
-        .ok_or_else(|| wasmtime::Error::msg(format!("wasm64 guest slice {start}+{len} overflowed")))?;
+        .ok_or_else(|| wasmtime::Error::new(HostAbiError::SliceOverflow { start, len }))?;
     mem.get(start..end).ok_or_else(|| {
-        wasmtime::Error::msg(format!(
-            "wasm64 guest slice [{start}..{end}) exceeds linear memory size {}",
-            mem.len()
-        ))
+        wasmtime::Error::new(HostAbiError::SliceOutOfBounds { start, end, memory_len: mem.len() })
     })
 }
 
 /// Validates and extracts a mutable byte slice `[ptr..ptr+len)` from 64-bit guest linear memory.
 fn guest_slice_mut(mem: &mut [u8], ptr: i64, len: i32) -> wasmtime::Result<&mut [u8]> {
-    let mem_len = mem.len();
-    let start = usize::try_from(ptr)
-        .map_err(|_| wasmtime::Error::msg(format!("wasm64 guest pointer {ptr} out of host usize range")))?;
-    let len = usize::try_from(len)
-        .map_err(|_| wasmtime::Error::msg(format!("wasm64 guest slice length {len} is negative")))?;
+    let memory_len = mem.len();
+    let start = usize::try_from(ptr).map_err(|_| wasmtime::Error::new(HostAbiError::PtrOutOfRange(ptr)))?;
+    let len = usize::try_from(len).map_err(|_| wasmtime::Error::new(HostAbiError::NegativeLen(len)))?;
     let end = start
         .checked_add(len)
-        .ok_or_else(|| wasmtime::Error::msg(format!("wasm64 guest slice {start}+{len} overflowed")))?;
-    mem.get_mut(start..end).ok_or_else(|| {
-        wasmtime::Error::msg(format!(
-            "wasm64 guest slice [{start}..{end}) exceeds linear memory size {mem_len}"
-        ))
-    })
+        .ok_or_else(|| wasmtime::Error::new(HostAbiError::SliceOverflow { start, len }))?;
+    mem.get_mut(start..end)
+        .ok_or_else(|| wasmtime::Error::new(HostAbiError::SliceOutOfBounds { start, end, memory_len }))
 }
 
 /// Links the 3 `blaze_host_v1` sans-IO ring host imports onto `linker`.
@@ -273,21 +346,21 @@ fn link_blaze_host_v1(linker: &mut Linker<Wasm64HostState>) -> wasmtime::Result<
          _timeout_ns: i64|
          -> wasmtime::Result<i32> {
             if submit_count < 0 || min_complete < 0 {
-                return Err(wasmtime::Error::msg(format!(
-                    "blaze_host_v1::submit_wait negative count (submit={submit_count}, min_complete={min_complete})"
-                )));
+                return Err(wasmtime::Error::new(HostAbiError::NegativeSubmitCount {
+                    submit: submit_count,
+                    min_complete,
+                }));
             }
             let memory = caller_memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
             if ring_ptr != 0 || submit_count > 0 {
-                let ptr = usize::try_from(ring_ptr).map_err(|_| {
-                    wasmtime::Error::msg(format!("blaze_host_v1::submit_wait invalid ring_ptr {ring_ptr}"))
-                })?;
+                let ptr = usize::try_from(ring_ptr)
+                    .map_err(|_| wasmtime::Error::new(HostAbiError::InvalidRingPtr(ring_ptr)))?;
                 if ptr >= mem.len() {
-                    return Err(wasmtime::Error::msg(format!(
-                        "blaze_host_v1::submit_wait ring_ptr {ptr} out of bounds for {}-byte memory",
-                        mem.len()
-                    )));
+                    return Err(wasmtime::Error::new(HostAbiError::RingPtrOutOfBounds {
+                        ptr,
+                        memory_len: mem.len(),
+                    }));
                 }
             }
             state.submit_wait_calls += 1;
@@ -320,22 +393,17 @@ fn link_blaze_host_v1(linker: &mut Linker<Wasm64HostState>) -> wasmtime::Result<
             let (mem, state) = memory.data_and_store_mut(&mut caller);
             let bytes = guest_slice(mem, ptr, len)?;
             let text = core::str::from_utf8(bytes)
-                .map_err(|err| wasmtime::Error::msg(format!("blaze_host_v1::host_log invalid UTF-8: {err}")))?;
+                .map_err(|err| wasmtime::Error::new(HostAbiError::InvalidLogUtf8(err)))?;
             if state.logs.len() >= state.max_logs {
-                return Err(wasmtime::Error::msg(format!(
-                    "blaze_host_v1::host_log exceeded max_logs ({})",
-                    state.max_logs
-                )));
+                return Err(wasmtime::Error::new(HostAbiError::LogCountLimit(state.max_logs)));
             }
             let next_bytes = state.log_bytes.saturating_add(text.len());
             if next_bytes > state.max_log_bytes {
-                return Err(wasmtime::Error::msg(format!(
-                    "blaze_host_v1::host_log exceeded max_log_bytes ({})",
-                    state.max_log_bytes
-                )));
+                return Err(wasmtime::Error::new(HostAbiError::LogBytesLimit(state.max_log_bytes)));
             }
             state.log_bytes = next_bytes;
-            state.logs.push((level, text.to_owned()));
+            let owned = own_str(state.alloc, text);
+            state.logs.push((level, owned));
             Ok(())
         },
     )?;
@@ -348,6 +416,7 @@ pub struct Wasm64Instance {
     store: Store<Wasm64HostState>,
     instance: Instance,
     memory: Memory,
+    alloc: Alloc<'static>,
     fuel_limit: u64,
     memory_limit: usize,
 }
@@ -358,14 +427,14 @@ impl Wasm64Instance {
         if trap == Some(Trap::OutOfFuel) {
             return Wasm64RunError::OutOfFuel { fuel_limit: self.fuel_limit };
         }
-        let msg = format!("{err:#}");
-        if msg.contains("memory") && msg.contains("limit") {
+        let msg = own_fmt(self.alloc, format_args!("{err:#}"));
+        if msg.as_str().contains("memory") && msg.as_str().contains("limit") {
             return Wasm64RunError::MemoryLimit { limit: self.memory_limit, why: msg };
         }
         if trap.is_some() {
             return Wasm64RunError::Trap { code: trap, why: msg };
         }
-        Wasm64RunError::Call { export: export.to_owned(), why: msg }
+        Wasm64RunError::Call { export: own_str(self.alloc, export), why: msg }
     }
 
     fn call_typed<P, R>(&mut self, name: &str, params: P) -> Result<R, Wasm64RunError>
@@ -373,10 +442,11 @@ impl Wasm64Instance {
         P: WasmParams,
         R: WasmResults,
     {
+        let alloc = self.alloc;
         let func = self
             .instance
             .get_typed_func::<P, R>(&mut self.store, name)
-            .map_err(|err| Wasm64RunError::MissingExport(format!("{name}: {err:#}")))?;
+            .map_err(|err| Wasm64RunError::MissingExport(own_fmt(alloc, format_args!("{name}: {err:#}"))))?;
         func.call(&mut self.store, params)
             .map_err(|err| self.classify_error(name, err))
     }
@@ -448,28 +518,30 @@ impl Wasm64Instance {
 
     /// Reads an exported `i64` global (e.g. `$__stack_pointer` if exported).
     pub fn read_i64_global(&mut self, name: &str) -> Result<i64, Wasm64RunError> {
+        let alloc = self.alloc;
         let Some(global) = self.instance.get_global(&mut self.store, name) else {
-            return Err(Wasm64RunError::MissingExport(name.to_owned()));
+            return Err(Wasm64RunError::MissingExport(own_str(alloc, name)));
         };
         match global.get(&mut self.store) {
             Val::I64(value) => Ok(value),
-            other => Err(Wasm64RunError::MissingExport(format!(
-                "global `{name}` has type {:?}, expected i64",
-                other.ty(&self.store)
+            other => Err(Wasm64RunError::MissingExport(own_fmt(
+                alloc,
+                format_args!("global `{name}` has type {:?}, expected i64", other.ty(&self.store)),
             ))),
         }
     }
 
     /// Reads an exported `i32` global (e.g. `blaze_ring_abi_version`).
     pub fn read_i32_global(&mut self, name: &str) -> Result<i32, Wasm64RunError> {
+        let alloc = self.alloc;
         let Some(global) = self.instance.get_global(&mut self.store, name) else {
-            return Err(Wasm64RunError::MissingExport(name.to_owned()));
+            return Err(Wasm64RunError::MissingExport(own_str(alloc, name)));
         };
         match global.get(&mut self.store) {
             Val::I32(value) => Ok(value),
-            other => Err(Wasm64RunError::MissingExport(format!(
-                "global `{name}` has type {:?}, expected i32",
-                other.ty(&self.store)
+            other => Err(Wasm64RunError::MissingExport(own_fmt(
+                alloc,
+                format_args!("global `{name}` has type {:?}, expected i32", other.ty(&self.store)),
             ))),
         }
     }
@@ -500,7 +572,7 @@ impl Wasm64Instance {
     }
 
     /// Captured `blaze_host_v1::host_log` messages.
-    pub fn logs(&self) -> &[(i32, String)] {
+    pub fn logs(&self) -> impl ExactSizeIterator<Item = (i32, &str)> {
         self.store.data().logs()
     }
 }
@@ -571,7 +643,7 @@ mod tests {
         assert!(checked.has_start_export, "module must export _start");
         assert_eq!(exported.len as usize, wasm.len());
 
-        let engine = Wasm64Engine::new().expect("Wasm64Engine initializes");
+        let engine = Wasm64Engine::new(alloc).expect("Wasm64Engine initializes");
         let mut inst = engine
             .instantiate(&wasm, limits)
             .unwrap_or_else(|err| panic!("Wasmtime instantiation failed for {}: {err}", module.name));
@@ -1488,7 +1560,8 @@ mod tests {
 
         // Call host_log from LIR and assert host captured the exact UTF-8 string from memory64.
         assert_eq!(inst.call_i32_0("emit_log").expect("emit_log runs"), 1);
-        assert_eq!(inst.logs(), &[(2, "hello from wasm64 lir!".to_owned())]);
+        let logs: std::vec::Vec<_> = inst.logs().collect();
+        assert_eq!(logs, [(2, "hello from wasm64 lir!")]);
 
         // Inspect guest memory64 directly via `read_memory`.
         let guest_addr = inst.call_i64_0("static_ptr").expect("static_ptr runs");
