@@ -8,10 +8,9 @@
 #   base     `base`: appends `"base": "<sha>"` to the trailing JSON object; `-`: takes none
 #   command  bash, run from the checkout's root; `$BLAZE_SCRIPTS` is the built scripts' directory
 
-# The agent rules: tools/agents/rules.ts type-checks and AGENTS.md / skills match what it generates.
-site packages | 300 | - | bun install --frozen-lockfile --cwd site
-agent rules types | 300 | - | bun site/node_modules/.bin/tsc -p tools/agents
-agent rules | 120 | - | bun tools/agents/rules.ts --check
+# The agent rules: scripts/src/bin/rules.rs selftest and AGENTS.md / skills match what it generates.
+agent rules selftest | 120 | - | "$BLAZE_SCRIPTS/rules" selftest
+agent rules | 120 | - | "$BLAZE_SCRIPTS/rules" '{"command": "check"}'
 # Docs front matter, index (docs/README.md), and Python allowlist (only shrinks).
 docs selftest | 120 | - | "$BLAZE_SCRIPTS/docs" selftest
 docs | 300 | - | "$BLAZE_SCRIPTS/docs" check
