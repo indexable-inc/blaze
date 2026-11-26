@@ -130,6 +130,10 @@ pub(super) struct Moves<A: Allocator> {
     parts: Vec<Part, A>,
     roots: Vec<Root, A>,
     assigned: Vec<Assigned, A>,
+    /// For each local field-flags `mask` allocated inside a loop, the innermost `Expr::Loop`
+    /// containing its declaration. Any loop at or outside that loop re-declares the local fresh
+    /// on each turn, so its back-edge cannot carry a moved-out bit back to an earlier assignment.
+    mask_decl_loop: Vec<(SlotId, ExprId), A>,
     cx: Option<Cx>,
     /// The effects guarded arms hold until their guards pass, innermost last.
     pending: Vec<Pending, A>,
@@ -151,6 +155,7 @@ impl<A: Allocator + Copy> Moves<A> {
             parts: Vec::new_in(alloc),
             roots: Vec::new_in(alloc),
             assigned: Vec::new_in(alloc),
+            mask_decl_loop: Vec::new_in(alloc),
             cx: None,
             pending: Vec::new_in(alloc),
             alt_owned: Vec::new_in(alloc),
@@ -461,12 +466,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Ok(Some(q.bit));
         }
         let Some(by) = moved_by else { return self.new_part(mask, start, len, base) };
+        let decl_loop = self.moves.mask_decl_loop.iter().find(|&&(m, _)| m == mask).map(|&(_, l)| l);
         for i in 0..self.moves.assigned.len() {
             let a = self.moves.assigned[i];
             let under = a.mask == mask
                 && a.len <= len
                 && self.moves.steps[a.start as usize..(a.start + a.len) as usize] == self.moves.steps[start as usize..(start + a.len) as usize];
-            if under && self.in_one_loop(a.by, by)? {
+            if under && self.in_one_loop(a.by, by, decl_loop)? {
                 self.moves.steps.truncate(start as usize);
                 return Err(unsupported(
                     by,
@@ -503,13 +509,25 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.b.store(Flags::NONE, left, fa, 0, MemAttrs::aligned(3));
     }
 
-    /// Whether expressions `a` and `b` are inside one `loop` (by `scan_flags`'s parents).
-    fn in_one_loop(&self, a: ExprId, b: ExprId) -> Result<bool, BuildError> {
+    /// Records the innermost enclosing `loop` (if any) in which a local's field-flags `mask` was
+    /// declared, so `in_one_loop` ignores loops that re-declare and reset the local each turn.
+    pub(super) fn record_mask_decl_loop(&mut self, mask: SlotId) {
+        if let Some(loop_expr) = self.targets.iter().rev().find(|t| t.header.is_some()).map(|t| t.expr) {
+            self.moves.mask_decl_loop.push((mask, loop_expr));
+        }
+    }
+
+    /// Whether expressions `a` and `b` share an enclosing `loop` strictly inside `stop` (the
+    /// innermost loop in which the local was declared, if any, by `scan_flags`'s parents).
+    fn in_one_loop(&self, a: ExprId, b: ExprId, stop: Option<ExprId>) -> Result<bool, BuildError> {
         let mut x = a.0;
         while let Some(&(up, _)) = self.expr_parent.get(x as usize)
             && up != NO_EXPR
         {
             x = up;
+            if stop == Some(ExprId(x)) {
+                break;
+            }
             if !matches!(self.expr(ExprId(x))?, Expr::Loop { .. }) {
                 continue;
             }
