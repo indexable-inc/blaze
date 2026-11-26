@@ -190,6 +190,26 @@ pub fn lay_state_with_flags<A: Allocator + Copy>(
     scratch: Alloc<'_>,
     alloc: A,
 ) -> Result<Laid<A>, BuildError> {
+    lay_state_with_conflicts(env, saved, None, needs_flag, needs_rest, upvar_has_flag, upvar_has_rest, points, scratch, alloc)
+}
+
+/// [`lay_state_with_flags`] with an optional pairwise storage-conflict bit matrix (`conflicts`,
+/// from `blaze_flow::saved_plan`): non-conflicting saved fields share bytes via deterministic
+/// greedy falling-size packing, while drop flags and partial-move field-flags words stay
+/// non-overlapping past the saved-field region.
+#[expect(clippy::too_many_arguments, reason = "explicit layout slices keep lay_state_with_conflicts allocation-free and clear")]
+pub fn lay_state_with_conflicts<A: Allocator + Copy>(
+    env: (u64, u8),
+    saved: &[(u64, u8)],
+    conflicts: Option<&[u64]>,
+    needs_flag: &[bool],
+    needs_rest: &[bool],
+    upvar_has_flag: &[bool],
+    upvar_has_rest: &[bool],
+    points: u32,
+    scratch: Alloc<'_>,
+    alloc: A,
+) -> Result<Laid<A>, BuildError> {
     // Built at each use: `BuildError` is not `Clone`.
     let too_big = || BuildError::UnsupportedSig { what: "a coroutine state past 4 GiB" };
     let too_aligned = BuildError::UnsupportedSig { what: "a coroutine state field aligned past 2^31" };
@@ -210,22 +230,69 @@ pub fn lay_state_with_flags<A: Allocator + Copy>(
     } else {
         return Err(BuildError::UnsupportedSig { what: "a coroutine with more suspensions than an i32 tag numbers" });
     };
-    // The saved fields by falling alignment, then recipe index.
-    let mut order: Vec<u32, Alloc<'_>> = Vec::with_capacity_in(saved.len(), scratch);
-    order.extend(0..saved.len() as u32);
-    // Keys are unique (the index is in them): an unstable sort is deterministic.
-    order.sort_unstable_by_key(|&i| (core::cmp::Reverse(saved[i as usize].1), i));
     let any_rest = needs_rest.iter().any(|&r| r) || upvar_has_rest.iter().any(|&r| r);
     let region_align = saved.iter().map(|f| f.1).max().unwrap_or(0).max(if any_rest { 3 } else { 0 });
     let start = align_up(env.0, region_align);
     let mut at = start;
     let mut field: Vec<u32, A> = Vec::with_capacity_in(saved.len(), alloc);
     field.resize(saved.len(), 0);
-    for &i in order.iter() {
-        let (size, align) = saved[i as usize];
-        let here = align_up(at, align);
-        field[i as usize] = u32::try_from(here).map_err(|_| too_big())?;
-        at = here.checked_add(size).ok_or_else(too_big)?;
+    let rw = saved.len().div_ceil(64);
+    let valid_matrix = conflicts.filter(|m| !saved.is_empty() && m.len() == saved.len().saturating_mul(rw));
+    if let Some(matrix) = valid_matrix {
+        // Greedy falling-size, falling-align, rising-index placement: each field at the lowest
+        // aligned offset >= `start` overlapping no conflicting already-placed field.
+        let n = saved.len();
+        let mut order: Vec<u32, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
+        order.extend(0..n as u32);
+        order.sort_unstable_by_key(|&i| (core::cmp::Reverse(saved[i as usize].0), core::cmp::Reverse(saved[i as usize].1), i));
+        let mut placed: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
+        placed.resize(n, false);
+        let mut taken: Vec<(u64, u64), Alloc<'_>> = Vec::with_capacity_in(n, scratch);
+        let mut max_end = start;
+        for &i in order.iter() {
+            let idx = i as usize;
+            let (size, align) = saved[idx];
+            taken.clear();
+            if size > 0 {
+                for j in 0..n {
+                    if j != idx && placed[j] && saved[j].0 > 0 && matrix[idx * rw + j / 64] & (1u64 << (j % 64)) != 0 {
+                        let off = u64::from(field[j]);
+                        let end = off.checked_add(saved[j].0).ok_or_else(too_big)?;
+                        taken.push((off, end));
+                    }
+                }
+                taken.sort_unstable();
+            }
+            let mut here = align_up(start, align);
+            for &(first, end) in taken.iter() {
+                if end <= here {
+                    continue;
+                }
+                if first >= here.checked_add(size).ok_or_else(too_big)? {
+                    break;
+                }
+                here = align_up(end, align);
+            }
+            let end = here.checked_add(size).ok_or_else(too_big)?;
+            field[idx] = u32::try_from(here).map_err(|_| too_big())?;
+            placed[idx] = true;
+            if end > max_end {
+                max_end = end;
+            }
+        }
+        at = max_end;
+    } else {
+        // The saved fields by falling alignment, then recipe index.
+        let mut order: Vec<u32, Alloc<'_>> = Vec::with_capacity_in(saved.len(), scratch);
+        order.extend(0..saved.len() as u32);
+        // Keys are unique (the index is in them): an unstable sort is deterministic.
+        order.sort_unstable_by_key(|&i| (core::cmp::Reverse(saved[i as usize].1), i));
+        for &i in order.iter() {
+            let (size, align) = saved[i as usize];
+            let here = align_up(at, align);
+            field[i as usize] = u32::try_from(here).map_err(|_| too_big())?;
+            at = here.checked_add(size).ok_or_else(too_big)?;
+        }
     }
     // The 8-byte partial-move field-flags words (`rest`, align 3), in recipe then upvar order.
     let mut rest: Vec<Option<u32>, A> = Vec::with_capacity_in(saved.len(), alloc);
@@ -408,4 +475,35 @@ pub fn may_partial_move_temps<'a>(body: &blaze_typeck::BodyView<'_>, alloc: Allo
         }
     }
     out
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    #[test]
+    fn lay_state_with_conflicts_overlaps_disjoint_fields_and_keeps_flags_separate() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // Fields 0 and 1 are 1024-byte disjoint sequential sub-futures; field 2 is a 16-byte
+        // local conflicting with both 0 and 1.
+        let saved = [(1024u64, 3u8), (1024u64, 3u8), (16u64, 3u8)];
+        let conflicts = [
+            (1u64 << 0) | (1u64 << 2),
+            (1u64 << 1) | (1u64 << 2),
+            (1u64 << 0) | (1u64 << 1) | (1u64 << 2),
+        ];
+        let flags = [true, true, true];
+        let rests = [false, false, false];
+        let laid = lay_state_with_conflicts((8, 3), &saved, Some(&conflicts), &flags, &rests, &[], &[], 2, alloc, alloc)
+            .expect("lay_state_with_conflicts");
+        assert_eq!(laid.field[0], laid.field[1], "disjoint sequential sub-futures must share the same offset");
+        assert!(laid.field[2] >= laid.field[0] + 1024 || laid.field[2] + 16 <= laid.field[0], "conflicting local must not overlap sub-futures");
+        // Drop flags must be strictly past the saved fields and distinct.
+        let max_field_end = (0..3).map(|i| laid.field[i] + saved[i].0 as u32).max().unwrap_or(0);
+        let f0 = laid.flag[0].expect("flag 0");
+        let f1 = laid.flag[1].expect("flag 1");
+        let f2 = laid.flag[2].expect("flag 2");
+        assert!(f0 >= max_field_end && f1 > f0 && f2 > f1, "drop flags must stay non-overlapping past fields");
+        assert!(laid.state.shape.size < 1200, "overlapping layout must stay near 1 KiB instead of 2+ KiB, got {}", laid.state.shape.size);
+    }
 }

@@ -29,7 +29,7 @@
 
 use core::cell::{Cell, RefCell};
 
-use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_flags, may_partial_move_bindings, may_partial_move_temps};
+use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_conflicts, may_partial_move_bindings, may_partial_move_temps};
 use blaze_build::layout::{LayoutCx, Layouts};
 use blaze_build::{CoroutineOf, coroutines_in};
 use blaze_own::AVec;
@@ -836,7 +836,8 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         };
         needs_rest.push(want);
     }
-    let laid = lay_state_with_flags(env, saved, &flags, &needs_rest, &upvar_has_flag, &upvar_has_rest, points, alloc, alloc)?;
+    let conflicts = (!recipe.conflicts.is_empty()).then_some(recipe.conflicts.as_slice());
+    let laid = lay_state_with_conflicts(env, saved, conflicts, &flags, &needs_rest, &upvar_has_flag, &upvar_has_rest, points, alloc, alloc)?;
     // Every size fits a u32: the state does (`lay_state` refused past 4 GiB).
     let mut rows: AVec<'static, StateName> = AVec::with_capacity_in(saved.len() + upvar_ids.len(), alloc);
     for (s, (&offset, (&(size, _), (&flag, &rest)))) in recipe

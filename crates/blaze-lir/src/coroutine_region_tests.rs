@@ -451,3 +451,100 @@ fn pure_rematerializable_dags_cross_suspend_without_state_fields() {
         panic!("{broke}");
     }
 }
+
+/// Overlapping `SlotName`s in `split_in`: accepted when LIR storage lifetimes are disjoint
+/// (positive), and refused with `NamesOverlap` when both slots are live simultaneously (control).
+#[test]
+fn overlapping_named_slots_allowed_when_disjoint_and_refused_when_conflicting() {
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+
+    // Positive: `s0` lives across suspend 0 and ends via `slot_dead` before `s1` starts across
+    // suspend 1; both share offset 16 inside the 32-byte laid region.
+    let mut b = Builder::<_, Full>::new_in(64, a);
+    own_sig(&mut b);
+    let [entry, r0, c0, r1, c1, unresumed] = [(); 6].map(|_| b.create_block(BlockKind::Normal));
+    let s0 = b.slot(8, 3, SlotKind::Named);
+    let s1 = b.slot(8, 3, SlotKind::Named);
+    b.begin(entry);
+    let (state, _cx) = (b.param(Ty::PTR), b.param(Ty::I64));
+    let u0 = b.load(Ty::I64, Flags::NONE, state, 0, MemAttrs::default());
+    let p0 = b.slot_addr(s0);
+    b.store(Flags::NONE, u0, p0, 0, MemAttrs::default());
+    let pending = b.iconst(Ty::I64, u128::from(PENDING));
+    b.suspend(0, r0, c0, &[pending, pending]);
+
+    b.begin(c0);
+    b.slot_dead(s0);
+    b.cancelled();
+
+    b.begin(r0);
+    let p0_r = b.slot_addr(s0);
+    let v0 = b.load(Ty::I64, Flags::NONE, p0_r, 0, MemAttrs::default());
+    b.slot_dead(s0);
+    let one = b.iconst(Ty::I64, 1);
+    let v1 = b.binary(Op::Add, Flags::NONE, v0, one);
+    let p1 = b.slot_addr(s1);
+    b.store(Flags::NONE, v1, p1, 0, MemAttrs::default());
+    let pending1 = b.iconst(Ty::I64, u128::from(PENDING));
+    b.suspend(1, r1, c1, &[pending1, pending1]);
+
+    b.begin(c1);
+    b.slot_dead(s1);
+    b.cancelled();
+
+    b.begin(r1);
+    let p1_r = b.slot_addr(s1);
+    let out = b.load(Ty::I64, Flags::NONE, p1_r, 0, MemAttrs::default());
+    b.slot_dead(s1);
+    let ready = b.iconst(Ty::I64, u128::from(READY));
+    b.ret(&[ready, out]);
+
+    b.begin(unresumed);
+    b.cancelled();
+
+    let func = b.finish_checked().expect("disjoint LIR");
+    let shared = [SlotName { slot: s0, offset: 16 }, SlotName { slot: s1, offset: 16 }];
+    let split = split_in(func.view(), SHAPE, Panics::NONE, LAID, &shared, a)
+        .expect("disjoint named slots sharing an offset must be accepted");
+    if let Err(broke) = agree(func.view(), SHAPE, &split, [7, 0]) {
+        panic!("{broke}");
+    }
+
+    // Negative control: both `a0` and `a1` are live across suspend 0; sharing offset 16 must be
+    // rejected with `NamesOverlap`.
+    let mut bad = Builder::<_, Full>::new_in(64, a);
+    own_sig(&mut bad);
+    let [b_entry, b_resume, b_cancel, b_unresumed] = [(); 4].map(|_| bad.create_block(BlockKind::Normal));
+    let a0 = bad.slot(8, 3, SlotKind::Named);
+    let a1 = bad.slot(8, 3, SlotKind::Named);
+    bad.begin(b_entry);
+    let (bs, _bcx) = (bad.param(Ty::PTR), bad.param(Ty::I64));
+    let bu = bad.load(Ty::I64, Flags::NONE, bs, 0, MemAttrs::default());
+    let ba0 = bad.slot_addr(a0);
+    let ba1 = bad.slot_addr(a1);
+    bad.store(Flags::NONE, bu, ba0, 0, MemAttrs::default());
+    bad.store(Flags::NONE, bu, ba1, 0, MemAttrs::default());
+    let bp = bad.iconst(Ty::I64, u128::from(PENDING));
+    bad.suspend(0, b_resume, b_cancel, &[bp, bp]);
+    bad.begin(b_resume);
+    let r_a0 = bad.slot_addr(a0);
+    let r_a1 = bad.slot_addr(a1);
+    let x0 = bad.load(Ty::I64, Flags::NONE, r_a0, 0, MemAttrs::default());
+    let x1 = bad.load(Ty::I64, Flags::NONE, r_a1, 0, MemAttrs::default());
+    let sum = bad.binary(Op::Add, Flags::NONE, x0, x1);
+    let br = bad.iconst(Ty::I64, u128::from(READY));
+    bad.ret(&[br, sum]);
+    bad.begin(b_cancel);
+    bad.cancelled();
+    bad.begin(b_unresumed);
+    bad.cancelled();
+
+    let bad_func = bad.finish_checked().expect("conflicting LIR");
+    let bad_shared = [SlotName { slot: a0, offset: 16 }, SlotName { slot: a1, offset: 16 }];
+    let err = split_in(bad_func.view(), SHAPE, Panics::NONE, LAID, &bad_shared, a).err();
+    assert!(
+        matches!(err, Some(CoroutineError::NamesOverlap { .. })),
+        "conflicting named slots sharing bytes must be rejected with NamesOverlap, got {err:?}"
+    );
+}

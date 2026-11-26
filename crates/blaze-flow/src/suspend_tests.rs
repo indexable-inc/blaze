@@ -219,3 +219,50 @@ fn a_local_used_only_on_the_cancel_path_is_saved() {
         "local _1 must not be saved: it was moved out before suspend {s}, so its drop runs nothing",
     );
 }
+
+#[test]
+fn saved_plan_disjoint_suspends_have_no_storage_conflict() {
+    // `_3` lives across both suspends; `_1` lives only across suspend 0; `_2` lives only across
+    // suspend 1 after `StorageDead(_1)`. `_1` and `_2` must NOT conflict, while `_3` conflicts
+    // with both.
+    let mut b = FlowBuilder::new_in(4, 0, Global);
+    let (bb0, r0, c0, r1, c1) = (b.block(), b.block(), b.block(), b.block(), b.block());
+    b.start(bb0);
+    b.stmt(StmtKind::StorageLive(Local(3)), S);
+    b.assign(Place(3), Operand::Const, S);
+    b.stmt(StmtKind::StorageLive(Local(1)), S);
+    b.assign(Place(1), Operand::Const, S);
+    b.suspend(r0, c0);
+
+    b.start(c0);
+    b.stmt(StmtKind::StorageDead(Local(1)), S);
+    b.stmt(StmtKind::StorageDead(Local(3)), S);
+    b.ret(S);
+
+    b.start(r0);
+    b.assign(Place(0), Operand::Copy(Place(1)), S);
+    b.stmt(StmtKind::StorageDead(Local(1)), S);
+    b.stmt(StmtKind::StorageLive(Local(2)), S);
+    b.assign(Place(2), Operand::Const, S);
+    b.suspend(r1, c1);
+
+    b.start(c1);
+    b.stmt(StmtKind::StorageDead(Local(2)), S);
+    b.stmt(StmtKind::StorageDead(Local(3)), S);
+    b.ret(S);
+
+    b.start(r1);
+    b.assign(Place(0), Operand::Copy(Place(2)), S);
+    b.assign(Place(0), Operand::Copy(Place(3)), S);
+    b.stmt(StmtKind::StorageDead(Local(2)), S);
+    b.stmt(StmtKind::StorageDead(Local(3)), S);
+    b.ret(S);
+
+    let flow = finish(b);
+    let plan = crate::suspend::saved_plan(&flow, Global).expect("saved_plan");
+    assert_eq!(plan.locals.as_slice(), &[Local(1), Local(2), Local(3)]);
+    let conflicts = |i: usize, j: usize| plan.conflicts[i] & (1u64 << j) != 0;
+    assert!(!conflicts(0, 1) && !conflicts(1, 0), "_1 and _2 are storage-disjoint and must not conflict");
+    assert!(conflicts(0, 2) && conflicts(2, 0), "_1 and _3 overlap at suspend 0 and must conflict");
+    assert!(conflicts(1, 2) && conflicts(2, 1), "_2 and _3 overlap at suspend 1 and must conflict");
+}
