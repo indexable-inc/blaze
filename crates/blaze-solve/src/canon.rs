@@ -20,7 +20,7 @@ use crate::term::{
 use crate::tys::{Relate, Tys};
 
 /// The most words one canonical form holds (rule 18).
-pub const MAX_WORDS: usize = 1 << 16;
+pub const MAX_WORDS: usize = 1 << 20;
 
 /// The highest variable index a [`Decode`] accepts (rule 18): its slot table's cap, over every
 /// form it decodes until `reset` (a certificate's rows share one numbering).
