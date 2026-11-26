@@ -100,10 +100,12 @@ fn read_c_probe_reply_with(
     let file = match dir.open_read(cx, &rel) {
         Ok(file) => file,
         Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
-        Err(_) => return Ok(crate::engine_script_reads::NONE),
+        Err(error) => return Err(CliError::Fs(error)),
     };
-    let Ok(len_u64) = file.len(cx) else {
-        return Ok(crate::engine_script_reads::NONE);
+    let len_u64 = match file.len(cx) {
+        Ok(len) => len,
+        Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
+        Err(error) => return Err(CliError::Fs(error)),
     };
     if len_u64 > blaze_proc_macro::probe_clang::MAX_RECORD_BYTES {
         return Ok(crate::engine_script_reads::NONE);
@@ -113,8 +115,10 @@ fn read_c_probe_reply_with(
     };
     let mut raw = blaze_own::AVec::new_in(alloc);
     raw.resize(len, 0u8);
-    let Ok(read) = file.read_into(raw.as_mut_slice(), 0).wait(cx) else {
-        return Ok(crate::engine_script_reads::NONE);
+    let read = match file.read_into(raw.as_mut_slice(), 0).wait(cx) {
+        Ok(read) => read,
+        Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
+        Err(error) => return Err(CliError::Fs(error)),
     };
     raw.truncate(read);
     let Some(body) = blaze_proc_macro::record::unseal_record(raw.as_slice()) else {

@@ -56,10 +56,16 @@ mod native;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
-/// Source bytes of the OS confinement backends so callers can derive content-addressed runner
-/// identities directly from the implementation (AGENTS.md rule 69).
+/// Source bytes of the complete hermetic runner and OS confinement backends so callers can derive
+/// content-addressed runner identities directly from the full implementation (AGENTS.md rule 69).
 pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
+    include_bytes!("../procs.rs"),
+    include_bytes!("hermetic.rs"),
+    include_bytes!("hermetic/execution.rs"),
+    include_bytes!("hermetic/machine.rs"),
+    include_bytes!("hermetic/native.rs"),
     include_bytes!("hermetic/plan.rs"),
+    include_bytes!("hermetic/report.rs"),
     include_bytes!("hermetic/landlock.rs"),
     include_bytes!("hermetic/seatbelt.rs"),
 ];

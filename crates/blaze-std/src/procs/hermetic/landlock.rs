@@ -264,11 +264,10 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
         };
         q_head += 1;
         let Ok(cur_cstr) = CStr::from_bytes_until_nul(cur_path.get(..=cur_len).unwrap_or(&[0])) else {
-            continue;
+            return Err(Fault::Host { call: "landlock (NixOS ELF invalid queued path)", code: 22 });
         };
-        let Ok(elf_fd) = openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0) else {
-            continue;
-        };
+        let elf_fd = openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0)
+            .map_err(|errno| Fault::Host { call: "openat (nix ELF closure object)", code: errno.raw() })?;
         let Some(meta) = parse_elf64_meta(elf_fd.fd())? else {
             continue;
         };
@@ -279,7 +278,8 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
         let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
             return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
         };
-        let dyn_read = pread(elf_fd.fd(), dyn_slice, meta.dyn_off).unwrap_or(0);
+        let dyn_read = pread(elf_fd.fd(), dyn_slice, meta.dyn_off)
+            .map_err(|errno| Fault::Host { call: "pread (nix ELF PT_DYNAMIC)", code: errno.raw() })?;
         let mut strtab_vaddr = None;
         let mut runpath_off = None;
         let mut rpath_off = None;
@@ -312,7 +312,8 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
             continue;
         };
 
-        // Extract optional DT_RUNPATH / DT_RPATH search directories (expanding `$ORIGIN`).
+        // Extract optional DT_RUNPATH / DT_RPATH search directories (expanding `$ORIGIN`, refusing
+        // unsupported dynamic-loader `$` tokens such as `$LIB` or `$PLATFORM`).
         let origin_dir = cur_path
             .get(..cur_len)
             .and_then(|p| p.iter().rposition(|&b| b == b'/').and_then(|s| p.get(..s)))
@@ -323,7 +324,8 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
             && let Some(at) = strtab_file_off.checked_add(rp_off)
         {
             let mut rp_buf = [0u8; 2048];
-            let n = pread(elf_fd.fd(), &mut rp_buf, at).unwrap_or(0);
+            let n = pread(elf_fd.fd(), &mut rp_buf, at)
+                .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_RUNPATH)", code: errno.raw() })?;
             let raw = rp_buf.get(..n).unwrap_or(&[]);
             let Some(end) = raw.iter().position(|&b| b == 0) else {
                 return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
@@ -335,7 +337,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
                 let Some(slot) = search_dirs.get_mut(search_count) else {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
                 };
-                let expanded_len = expand_origin(entry, origin_dir, &mut slot.0);
+                let expanded_len = expand_origin(entry, origin_dir, &mut slot.0)?;
                 if expanded_len == 0 {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entry exceeds path cap)", code: 36 });
                 }
@@ -349,7 +351,8 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
             let Some(at) = strtab_file_off.checked_add(str_off) else {
                 continue;
             };
-            let n = pread(elf_fd.fd(), &mut name_buf, at).unwrap_or(0);
+            let n = pread(elf_fd.fd(), &mut name_buf, at)
+                .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_NEEDED)", code: errno.raw() })?;
             let raw = name_buf.get(..n).unwrap_or(&[]);
             let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
             let soname = raw.get(..end).unwrap_or(&[]);
@@ -357,12 +360,11 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
                 continue;
             }
             if soname.contains(&b'/') {
-                // Path-bearing `DT_NEEDED`: expand `$ORIGIN`, require it to resolve beneath an
-                // authorized root (`/nix/store/`, `nix-ld/lib/`, or a declared `plan` root) before
-                // granting, refusing everything else by name (never widening the sandbox to
-                // arbitrary host paths named by untrusted ELF metadata).
+                // Path-bearing `DT_NEEDED`: expand `$ORIGIN` (refusing unsupported `$` tokens),
+                // open via `O_PATH`, and validate the kernel-resolved `/proc/self/fd/<fd>` path
+                // inside `try_grant_and_enqueue_lib` before granting.
                 let mut expanded = [0u8; PATH_CAP];
-                let exp_len = expand_origin(soname, origin_dir, &mut expanded);
+                let exp_len = expand_origin(soname, origin_dir, &mut expanded)?;
                 let file_len = if exp_len > 1 && expanded.get(exp_len - 1) == Some(&b'/') {
                     exp_len - 1
                 } else {
@@ -375,18 +377,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
                         code: 2,
                     });
                 }
-                let mut resolved = [0u8; PATH_CAP];
-                let res_slice = match resolve_symlink_path(exp_slice, &mut resolved) {
-                    Some(res_len) => resolved.get(..res_len).unwrap_or(exp_slice),
-                    None => exp_slice,
-                };
-                if !is_authorized_nix_dep_path(res_slice, NIX_LD_DIR, plan) {
-                    return Err(Fault::Host {
-                        call: "landlock (NixOS ELF path-bearing DT_NEEDED outside authorized roots)",
-                        code: 13,
-                    });
-                }
-                if !try_grant_and_enqueue_lib(ruleset, b"", res_slice, NIX_LD_DIR, plan, &mut queue, &mut q_len)? {
+                if !try_grant_and_enqueue_lib(ruleset, b"", exp_slice, NIX_LD_DIR, plan, &mut queue, &mut q_len)? {
                     return Err(Fault::Host {
                         call: "landlock (NixOS ELF path-bearing DT_NEEDED not found)",
                         code: 2,
@@ -429,7 +420,9 @@ impl Elf64Meta {
 
 fn parse_elf64_meta(fd: Fd) -> Result<Option<Elf64Meta>, Fault> {
     let mut ehdr = [0u8; 64];
-    if pread(fd, &mut ehdr, 0).unwrap_or(0) < 64 {
+    let ehdr_n = pread(fd, &mut ehdr, 0)
+        .map_err(|errno| Fault::Host { call: "pread (nix ELF header)", code: errno.raw() })?;
+    if ehdr_n < 64 {
         return Ok(None);
     }
     if ehdr.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
@@ -464,7 +457,9 @@ fn parse_elf64_meta(fd: Fd) -> Result<Option<Elf64Meta>, Fault> {
         let Some(ph_slice) = ph_buf.get_mut(..56) else {
             return Ok(None);
         };
-        if pread(fd, ph_slice, off).unwrap_or(0) < 56 {
+        let ph_n = pread(fd, ph_slice, off)
+            .map_err(|errno| Fault::Host { call: "pread (nix ELF program header)", code: errno.raw() })?;
+        if ph_n < 56 {
             break;
         }
         let p_type = read_u32_le(&ph_buf, 0);
@@ -499,7 +494,7 @@ fn parse_elf64_meta(fd: Fd) -> Result<Option<Elf64Meta>, Fault> {
     Ok(Some(meta))
 }
 
-fn expand_origin(entry: &[u8], origin_dir: &[u8], out: &mut [u8; 320]) -> usize {
+fn expand_origin(entry: &[u8], origin_dir: &[u8], out: &mut [u8; 320]) -> Result<usize, Fault> {
     let mut len = 0usize;
     let mut i = 0usize;
     while i < entry.len() {
@@ -508,11 +503,16 @@ fn expand_origin(entry: &[u8], origin_dir: &[u8], out: &mut [u8; 320]) -> usize 
             (origin_dir, 7)
         } else if rest.starts_with(b"${ORIGIN}") {
             (origin_dir, 9)
+        } else if rest.first() == Some(&b'$') {
+            return Err(Fault::Host {
+                call: "landlock (NixOS ELF unsupported dynamic-loader token in RUNPATH)",
+                code: 38,
+            });
         } else {
             (rest.get(..1).unwrap_or(&[]), 1)
         };
         if len + chunk.len() + 2 > out.len() {
-            return 0;
+            return Ok(0);
         }
         if let Some(dst) = out.get_mut(len..len + chunk.len()) {
             dst.copy_from_slice(chunk);
@@ -526,7 +526,7 @@ fn expand_origin(entry: &[u8], origin_dir: &[u8], out: &mut [u8; 320]) -> usize 
             len += 1;
         }
     }
-    len
+    Ok(len)
 }
 
 /// Resolves symlinks (up to 8 hops) for `path`, writing a NUL-terminated path into `out` and
@@ -684,13 +684,12 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         Err(errno) => return Err(Fault::Host { call: "openat (nix runtime file, O_PATH)", code: errno.raw() }),
     };
     let granted = AccessFs::READ_FILE.with(AccessFs::EXECUTE).bits();
+    // Ask the kernel for the canonical realpath of the ALREADY-OPENED `O_PATH` fd via
+    // `/proc/self/fd/<fd>`, resolving every intermediate directory symlink and preventing TOCTOU
+    // before authorizing the inode for Landlock.
     let mut resolved = [0u8; 320];
-    let res_len = resolve_symlink_path(candidate.get(..total).unwrap_or(&[]), &mut resolved).unwrap_or(total);
-    let res_slice = if res_len == total && resolved.first() == Some(&0) {
-        candidate.get(..total).unwrap_or(&[])
-    } else {
-        resolved.get(..res_len).unwrap_or(&[])
-    };
+    let res_len = readlink_fd_path(fd.fd(), &mut resolved)?;
+    let res_slice = resolved.get(..res_len).unwrap_or(&[]);
     if !is_authorized_nix_dep_path(res_slice, nix_ld_dir, plan) {
         return Err(Fault::Host {
             call: "landlock (NixOS ELF dependency resolved outside authorized roots)",
@@ -716,6 +715,45 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         *q_len += 1;
     }
     Ok(true)
+}
+
+/// Reads the kernel-canonicalized path of an opened descriptor via `/proc/self/fd/<fd>`, resolving
+/// all intermediate symlinks atomically on the opened inode.
+fn readlink_fd_path(fd: Fd, out: &mut [u8; 320]) -> Result<usize, Fault> {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let mut proc_buf = [0u8; 32];
+    if let Some(dst) = proc_buf.get_mut(..PREFIX.len()) {
+        dst.copy_from_slice(PREFIX);
+    }
+    let mut digits = [0u8; 12];
+    let mut d_at = digits.len();
+    let mut n = u32::try_from(fd.raw()).map_err(|_| Fault::Host { call: "readlinkat (/proc/self/fd)", code: 9 })?;
+    loop {
+        d_at -= 1;
+        if let Some(slot) = digits.get_mut(d_at) {
+            *slot = b'0' + u8::try_from(n % 10).unwrap_or(0);
+        }
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let d_len = digits.len() - d_at;
+    let total = PREFIX.len() + d_len;
+    if let (Some(dst), Some(src)) = (proc_buf.get_mut(PREFIX.len()..total), digits.get(d_at..)) {
+        dst.copy_from_slice(src);
+    }
+    let Ok(proc_cstr) = CStr::from_bytes_until_nul(proc_buf.get(..=total).unwrap_or(&[0])) else {
+        return Err(Fault::Host { call: "readlinkat (/proc/self/fd)", code: 22 });
+    };
+    let cap = out.len();
+    let len = readlinkat(CWD, blaze_sys::Path::new(proc_cstr), out)
+        .map_err(|errno| Fault::Host { call: "readlinkat (/proc/self/fd)", code: errno.raw() })?
+        .len();
+    if len >= cap {
+        return Err(Fault::Host { call: "readlinkat (/proc/self/fd path exceeds cap)", code: 36 });
+    }
+    Ok(len)
 }
 
 fn add_nix_file_rule(ruleset: Fd, path: &CStr) -> Result<(), Fault> {

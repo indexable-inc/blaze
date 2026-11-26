@@ -443,11 +443,15 @@ pub struct FileLock {
 
 impl FileLock {
     /// Explicitly releases the file lock under `cx`, surfacing any `Done::Failed` or stop error.
+    /// Marks the lock released ONLY after receiving `Done::Unlocked` so `Drop` still performs its
+    /// bounded fallback unlock if an explicit unlock fails or times out.
     pub fn unlock(mut self, cx: &Cx) -> Result<(), FsError> {
-        self.unlocked = true;
         let lock = self.tag;
         match call(&self.io, cx, FsOp::Publish, &self.name, |tag| Effect::Unlock { lock, tag })? {
-            Done::Unlocked => Ok(()),
+            Done::Unlocked => {
+                self.unlocked = true;
+                Ok(())
+            }
             Done::Failed(error) => Err(FsError::new(FsOp::Publish, &self.name, FsKind::Driver(error.0))),
             other => Err(unexpected(FsOp::Publish, &self.name, other)),
         }

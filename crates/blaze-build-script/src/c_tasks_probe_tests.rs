@@ -341,11 +341,14 @@ fn binary_probe_answer_round_trips_and_resolves_once_via_cache() {
 #[test]
 fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     let alloc = blaze_own::testing::heap().alloc();
-    // `-E` with header search flags is NOT a zero-header probe, and stays on the deferred C-tool
-    // route during `CMode::Deferred` (while a zero-header `-E` probe goes to `Fact::CcProbe`).
+    // Real preprocessing jobs (`cc -E -I...` AND `cc -E /package/src.c`) are NOT zero-header
+    // compiler-family probes and stay on the deferred C-tool route during `CMode::Deferred`.
     let pp_args = ["-E", "-I", "/package/include", "/package/src/check.c"];
     assert!(!is_probe("cc", &pp_args));
     assert!(crate::probe::is_deferred_tool("cc", &pp_args));
+    let pp_no_inc = ["-E", "/package/src/check.c"];
+    assert!(!is_probe("cc", &pp_no_inc));
+    assert!(crate::probe::is_deferred_tool("cc", &pp_no_inc));
     let fam_args = ["-E", "/target/debug/build/zstd-sys-1/out/1detect_compiler_family.c"];
     assert!(is_probe("cc", &fam_args));
     assert!(!crate::probe::is_deferred_tool("cc", &fam_args));
@@ -399,6 +402,8 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         b"#if __has_embed(\"data.bin\")\nint x;\n#endif\n".as_slice(),
         b"#embed \"sibling.bin\"\n".as_slice(),
         b"#/**/embed \"sibling.bin\"\n".as_slice(),
+        b"#pragma GCC dependency \"sibling.h\"\n".as_slice(),
+        b"_Pragma(\"GCC dependency \\\"sibling.h\\\"\")\n".as_slice(),
         b"const char *t = __TIMESTAMP__;\n".as_slice(),
     ] {
         let mut inc_bytes = |name: &str| (name == "flag_check.c").then_some(bad_src);
@@ -463,6 +468,7 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         "-fmodule-file=m=/target/debug/build/zstd-sys-1/out/m.pcm",
         "-fembed-dir=/target/debug/build/zstd-sys-1/out",
         "-fxray-attr-list=/target/debug/build/zstd-sys-1/out/xray.txt",
+        "-working-directory=generated",
         "-isysroot/host/sysroot",
         "-ivfsoverlay/target/debug/build/zstd-sys-1/out/vfs.yaml",
     ] {

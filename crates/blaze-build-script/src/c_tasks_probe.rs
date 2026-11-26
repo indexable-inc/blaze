@@ -138,6 +138,10 @@ fn is_header_search_flag(arg: &str) -> bool {
         "-fplugin",
         "--config",
         "-resource-dir",
+        "-working-directory",
+        "--working-directory",
+        "-dumpdir",
+        "-save-temps",
         "-B",
         "--gcc-toolchain",
         "--sysroot",
@@ -147,13 +151,32 @@ fn is_header_search_flag(arg: &str) -> bool {
         return true;
     }
     // Closed-world guard: refuse any `flag=value` option whose value contains a path separator
-    // (other than safe string-rewriting prefix-map flags) or whose name explicitly references an
-    // external file/list/dir/path/sysroot/plugin/overlay.
+    // (other than safe string-rewriting prefix-map flags and `-D` macro definitions) or whose name
+    // explicitly references an external file/list/dir/directory/path/sysroot/plugin/overlay.
     if !is_prefix_map_flag(arg) && !arg.starts_with("-D") && let Some((name, val)) = arg.split_once('=') {
         if val.contains('/') || val.contains('\\') {
             return true;
         }
-        for suffix in ["-file", "-list", "-dir", "-path", "sysroot", "include", "embed", "plugin", "config", "allowlist", "ignorelist", "blacklist", "overlay"] {
+        for suffix in [
+            "-file",
+            "-list",
+            "-dir",
+            "-directory",
+            "directory",
+            "-path",
+            "-output",
+            "-input",
+            "-map",
+            "sysroot",
+            "include",
+            "embed",
+            "plugin",
+            "config",
+            "allowlist",
+            "ignorelist",
+            "blacklist",
+            "overlay",
+        ] {
             if name.ends_with(suffix) {
                 return true;
             }
@@ -163,9 +186,10 @@ fn is_header_search_flag(arg: &str) -> bool {
 }
 
 /// Whether the spawn of `program` with `args` is a compiler probe, from its text alone: a C
-/// compiler asked `-?`, writing `-o …/flag_check` (cc's `is_flag_supported`), or preprocessing
-/// (`-E`) with no header-search flags (`-I`, `-isystem`, `-include`, ...). Any other compile or
-/// header-including preprocess job is a C request (`c_tasks`).
+/// compiler asked `-?`, writing `-o …/flag_check` (cc's `is_flag_supported`), or running
+/// cc-rs's zero-header compiler-family detection (`cc -E …detect_compiler_family.c` with no
+/// header-search flags). Real preprocessing jobs (`cc -E /package/src.c`) are NOT probes and
+/// stay on the deferred/build C route.
 pub fn is_probe(program: &str, args: &[&str]) -> bool {
     if !COMPILERS.contains(&name_of(program)) {
         return false;
@@ -173,7 +197,9 @@ pub fn is_probe(program: &str, args: &[&str]) -> bool {
     if args.contains(&"-?") || args.windows(2).any(|pair| pair[0] == "-o" && name_of(pair[1]) == "flag_check") {
         return true;
     }
-    args.contains(&"-E") && !args.iter().any(|arg| is_header_search_flag(arg))
+    args.contains(&"-E")
+        && !args.iter().any(|arg| is_header_search_flag(arg))
+        && args.iter().any(|arg| name_of(arg).ends_with("detect_compiler_family.c"))
 }
 
 /// The table's identity for the base key: its bytes, under this form.
@@ -435,7 +461,8 @@ pub struct CanonicalProbe<'b, 's> {
 
 impl<'b> CanonicalProbe<'b, '_> {
     /// Restores placeholder paths (`$IN<n>`, `$OUT<n>`, `$OUT_DIR`, `$SDKROOT`, `$MOUNT`) back
-    /// into the script's guest paths.
+    /// into the script's guest paths in a single left-to-right pass, unescaping `$$` -> literal
+    /// `$` so literal text like `$OUT_DIR` or `$IN0.c` emitted by Clang is preserved verbatim.
     pub fn unspell(&self, text: &str, spawn: &Spawn<'_>, alloc: Alloc<'b>) -> AString<'b> {
         let mut pairs: AVec<'b, (&str, &str)> = Vec::new_in(alloc);
         for (spelled, actual) in self.paths.iter() {
@@ -449,7 +476,32 @@ impl<'b> CanonicalProbe<'b, '_> {
         if !spawn.mount.is_empty() {
             pairs.push((MOUNT, spawn.mount));
         }
-        replaced(text, &pairs, alloc)
+        let mut out = String::new_in(alloc);
+        let mut at = 0usize;
+        'scan: while let Some(rest) = text.get(at..) {
+            if rest.is_empty() {
+                break;
+            }
+            if rest.starts_with("$$") {
+                out.push('$');
+                at += 2;
+                continue;
+            }
+            for (from, to) in pairs.iter().copied() {
+                if !from.is_empty() && rest.starts_with(from) {
+                    out.push_str(to);
+                    at += from.len();
+                    continue 'scan;
+                }
+            }
+            if let Some(ch) = rest.chars().next() {
+                out.push(ch);
+                at += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        out
     }
 }
 
@@ -694,11 +746,25 @@ fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
                     }
                 }
             }
+            // Allow only `#pragma message` (used by `cc`'s `detect_compiler_family.c`); refuse
+            // every other `#pragma` (such as `#pragma GCC dependency` or `#pragma include_alias`).
+            if let Some(rest) = dir.strip_prefix("pragma")
+                && rest.bytes().next().is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            {
+                let after = rest.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
+                let is_message = after
+                    .strip_prefix("message")
+                    .is_some_and(|tail| tail.bytes().next().is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_'));
+                if !is_message {
+                    return Some(ProbeWhy::PackageInput);
+                }
+            }
         }
     }
     if contains_ident(text, "__has_include")
         || contains_ident(text, "__has_include_next")
         || contains_ident(text, "__has_embed")
+        || contains_ident(text, "_Pragma")
     {
         return Some(ProbeWhy::PackageInput);
     }
