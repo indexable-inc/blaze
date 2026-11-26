@@ -1355,30 +1355,7 @@ impl ScriptSandbox {
                 }
             }
             crate::spawn_route::Route::Fact(fact) => return self.spawn_fact(&fact, program, args, &spawned),
-            crate::spawn_route::Route::Deferred => {
-                // Its inputs the script made are captured now, by content: the script may
-                // remove or rewrite them before the request runs (outputs.rs, THE C INPUTS).
-                let state = self.snap_out()?;
-                // Its relative paths made the guest paths they meant in the spawn's folder
-                // (c_tasks.rs `rooted`): the request runs later, elsewhere.
-                let script_cwd = self.script.cwd();
-                let cwd = match spawned.cwd.as_deref() {
-                    None => script_cwd,
-                    Some(cwd) if cwd.starts_with('/') => cwd.to_owned(),
-                    Some(cwd) => format!("{script_cwd}/{cwd}"),
-                };
-                let argv: Vec<&str> = spawned.argv.iter().map(String::as_str).collect();
-                let mut text = String::new();
-                blaze_build_script::c_tasks::rooted(&argv, &cwd, &mut text).expect("script_sandbox: writing to a String does not fail");
-                // A process tree runs later with the folder and environment it was spawned
-                // with (outputs.rs `CTree`): `configure` reads CC, CFLAGS and the rest.
-                if blaze_build_script::c_tasks::is_tree(program) {
-                    let env = crate::spawn_route::child_env(&self.script.env, &spawned);
-                    self.c_trees.push((self.c_requests.len() as u32, cwd, env));
-                }
-                self.c_requests.push((text, state));
-                (0, Vec::new(), Vec::new())
-            }
+            crate::spawn_route::Route::Deferred => return self.spawn_deferred(program, &spawned),
             crate::spawn_route::Route::Executor => return self.spawn_executor(program, args, &spawned),
             crate::spawn_route::Route::Refused => {
                 let why = self.script.spawn_setting.no_sandbox();
@@ -1386,6 +1363,34 @@ impl ScriptSandbox {
             }
         };
         self.set_reply(code, &stdout, &stderr);
+        Ok(())
+    }
+
+    /// Records a deferred C/native compile request (`CMode::Deferred`) and replies exit 0 with
+    /// empty streams. Shared by `Route::Deferred` and oversized-probe fallthrough.
+    pub(crate) fn spawn_deferred(&mut self, program: &str, spawned: &crate::spawn_route::Decoded) -> Result<(), Stop> {
+        // Its inputs the script made are captured now, by content: the script may remove or
+        // rewrite them before the request runs (outputs.rs, THE C INPUTS).
+        let state = self.snap_out()?;
+        // Its relative paths made the guest paths they meant in the spawn's folder
+        // (c_tasks.rs `rooted`): the request runs later, elsewhere.
+        let script_cwd = self.script.cwd();
+        let cwd = match spawned.cwd.as_deref() {
+            None => script_cwd,
+            Some(cwd) if cwd.starts_with('/') => cwd.to_owned(),
+            Some(cwd) => format!("{script_cwd}/{cwd}"),
+        };
+        let argv: Vec<&str> = spawned.argv.iter().map(String::as_str).collect();
+        let mut text = String::new();
+        blaze_build_script::c_tasks::rooted(&argv, &cwd, &mut text).expect("script_sandbox: writing to a String does not fail");
+        // A process tree runs later with the folder and environment it was spawned with
+        // (outputs.rs `CTree`): `configure` reads CC, CFLAGS and the rest.
+        if blaze_build_script::c_tasks::is_tree(program) {
+            let env = crate::spawn_route::child_env(&self.script.env, spawned);
+            self.c_trees.push((self.c_requests.len() as u32, cwd, env));
+        }
+        self.c_requests.push((text, state));
+        self.set_reply(0, &[], &[]);
         Ok(())
     }
 }

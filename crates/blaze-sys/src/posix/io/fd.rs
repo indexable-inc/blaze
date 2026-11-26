@@ -609,6 +609,36 @@ pub fn mkdirat(dir: Fd, path: Path<'_>, mode: u32) -> Result<(), Errno> {
     }
 }
 
+/// `fchmod` on macOS: sets permission bits `mode` on open descriptor `fd`.
+#[cfg(target_os = "macos")]
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn fchmod(fd: Fd, mode: u32) -> Result<(), Errno> {
+    let mode_u16 = u16::try_from(mode).map_err(|_| Errno::Inval)?;
+    // SAFETY: `fchmod` takes only integer fd and mode bits.
+    said(unsafe { crate::macos::cold::fchmod(fd.raw(), mode_u16) }).map(|_| ())
+}
+
+/// Sets or clears `UF_IMMUTABLE` (`0x2`) on an open descriptor on macOS via `fchflags`.
+#[cfg(target_os = "macos")]
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn set_immutable(fd: Fd, immutable: bool) -> Result<(), Errno> {
+    const UF_IMMUTABLE: u32 = 0x0000_0002;
+    let flags = if immutable { UF_IMMUTABLE } else { 0 };
+    // SAFETY: `fchflags` takes only integer fd and flag bits.
+    said(unsafe { crate::macos::cold::fchflags(fd.raw(), flags) }).map(|_| ())
+}
+
+/// `unlink` on macOS: removes path `path`.
+#[cfg(target_os = "macos")]
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn unlink(path: Path<'_>) -> Result<(), Errno> {
+    // SAFETY: `path` is a live NUL-terminated string read by libSystem's `unlink`.
+    said(unsafe { crate::macos::cold::unlink(path.as_ptr().cast()) }).map(|_| ())
+}
+
 // ---- macOS: fcntl, dup, ioctl, preadv over libSystem ----
 
 /// `F_DUPFD` (sys/fcntl.h).

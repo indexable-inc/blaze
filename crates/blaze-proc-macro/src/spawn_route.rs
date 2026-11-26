@@ -580,6 +580,12 @@ impl ScriptSandbox {
         let held_digest = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
         let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
 
+        // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) stay on the ordinary compiler
+        // route so large generated `-E` or flag-check sources never trip the probe capture cap.
+        if crate::probe_clang::has_oversized_probe_input(&arg_refs, script.out_dir(), &mut held_bytes) {
+            return self.spawn_ordinary_compiler(program, spawned);
+        }
+
         match &script.c_probes {
             Some(crate::probe_clang::CProbeSetting::Ready(c_probes)) => {
                 let configured_sdk = c_probes.sdk_dir.as_ref();
@@ -601,6 +607,9 @@ impl ScriptSandbox {
                 let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
                 let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
                     Ok(resolved) => resolved,
+                    Err(why) if crate::probe_clang::is_stream_overflow_error(why.as_str()) => {
+                        return self.spawn_ordinary_compiler(program, spawned);
+                    }
                     Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
                 };
                 let subject = facts::cc_probe_subject(&resolved.answerer_id, &clang, &c_probes.sdk_digest, &resolved.key, alloc);
@@ -618,6 +627,21 @@ impl ScriptSandbox {
                 "no C compiler probe setting configured on this Script (rule 3)".to_owned(),
             )))),
         }
+    }
+
+    /// Routes a compiler invocation that outgrew probe bounds (input > 64 KiB or stream > 1 MiB)
+    /// onto the ordinary compiler route (`Deferred` in check mode, `Executor` in build mode, or
+    /// `NoSandbox` when no executor is configured).
+    fn spawn_ordinary_compiler(&mut self, program: &str, spawned: &Decoded) -> Result<(), Stop> {
+        if self.script.c_mode == CMode::Deferred {
+            return self.spawn_deferred(program, spawned);
+        }
+        let args = spawned.argv.get(1..).unwrap_or(&[]);
+        if self.script.spawner.is_some() {
+            return self.spawn_executor(program, args, spawned);
+        }
+        let why = self.script.spawn_setting.no_sandbox();
+        Err(self.refuse(Refusal::Spawn(SpawnRefusal::NoSandbox { program: program.to_owned(), args: args.to_vec(), why })))
     }
 
     /// The spawn sent to the executor as a request record; its written files applied to

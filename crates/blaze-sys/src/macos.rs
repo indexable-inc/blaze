@@ -349,6 +349,8 @@ pub mod cold {
         fn exit(status: c_int) -> !;
         /// sys/stat.h.
         fn fchmod(fd: c_int, mode: u16) -> c_int;
+        /// sys/stat.h.
+        fn fchflags(fd: c_int, flags: u32) -> c_int;
         /// dirent.h; returns a `DIR`.
         fn fdopendir(fd: c_int) -> *mut c_void;
         /// sys/file.h.

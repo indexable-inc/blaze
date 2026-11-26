@@ -493,8 +493,125 @@ impl VerifiedExec {
     }
 }
 
+/// Verified, kernel-sealed executable snapshot on macOS: streams a pinned shelf binary through
+/// deadline-aware `bstd::fs` into a freshly created `O_CREAT | O_EXCL | O_NOFOLLOW` private file
+/// while computing the caller's SHA-256 digest, then locks it with `0o500` + `UF_IMMUTABLE`
+/// (`fchflags`) so neither concurrent shelf updates nor writes/renames/unlinks can alter the
+/// verified binary before `seatbelt::start` executes it. `Drop` clears `UF_IMMUTABLE` and unlinks
+/// the snapshot cleanly.
+#[cfg(target_os = "macos")]
+pub struct VerifiedExec {
+    fd: blaze_sys::posix::io::OwnedFd,
+    path: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+    len: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl VerifiedExec {
+    pub fn open_and_seal_macos(
+        cx: &Cx,
+        dir: &crate::fs::Dir<crate::fs::ReadWrite>,
+        rel: &crate::path::Path,
+        snapshot_path: &str,
+        mut on_chunk: impl FnMut(&[u8]),
+    ) -> Result<Self, VerifiedExecError> {
+        use blaze_sys::posix::io::{CWD, OpenFlags, fchmod, openat, pwrite, set_immutable, unlink};
+
+        let raw = snapshot_path.as_bytes();
+        if raw.is_empty() || raw.contains(&0) {
+            return Err(VerifiedExecError::BadPath);
+        }
+        let mut cbuf = blaze_own::Vec::with_capacity_in(raw.len() + 1, blaze_own::SharedAlloc::global());
+        cbuf.extend_from_slice(raw);
+        cbuf.push(0);
+        let cstr = core::ffi::CStr::from_bytes_with_nul(cbuf.as_slice()).map_err(|_| VerifiedExecError::BadPath)?;
+        let cpath = blaze_sys::Path::new(cstr);
+
+        let file = dir.open_read(cx, rel).map_err(VerifiedExecError::from_fs)?;
+        let snap_flags = OpenFlags::READ_WRITE
+            | OpenFlags::CREATE
+            | OpenFlags::EXCLUSIVE
+            | OpenFlags::NO_FOLLOW
+            | OpenFlags::CLOSE_ON_EXEC;
+        let snap_fd = openat(CWD, cpath, snap_flags, 0o700)
+            .map_err(|errno| VerifiedExecError::Os { call: "openat (macOS VerifiedExec snapshot)", errno })?;
+
+        let stream_res = (|| -> Result<u64, VerifiedExecError> {
+            let mut buf = [0u8; 64 << 10];
+            let mut off = 0u64;
+            loop {
+                cx.check().map_err(VerifiedExecError::Stopped)?;
+                let n = file.read_into(&mut buf, off).wait(cx).map_err(VerifiedExecError::from_fs)?;
+                if n == 0 {
+                    break;
+                }
+                let chunk = buf.get(..n).unwrap_or(&[]);
+                on_chunk(chunk);
+                let mut written = 0usize;
+                while written < chunk.len() {
+                    let slice = chunk.get(written..).unwrap_or(&[]);
+                    let at = off
+                        .checked_add(u64::try_from(written).unwrap_or(0))
+                        .ok_or(VerifiedExecError::Os { call: "pwrite offset overflow", errno: blaze_sys::Errno::Overflow })?;
+                    let w = pwrite(snap_fd.fd(), slice, at)
+                        .map_err(|errno| VerifiedExecError::Os { call: "pwrite (macOS VerifiedExec)", errno })?;
+                    if w == 0 {
+                        return Err(VerifiedExecError::Os { call: "pwrite (macOS VerifiedExec short write)", errno: blaze_sys::Errno::Io });
+                    }
+                    written += w;
+                }
+                let step = u64::try_from(n)
+                    .map_err(|_| VerifiedExecError::Os { call: "VerifiedExec len overflow", errno: blaze_sys::Errno::Overflow })?;
+                off = off
+                    .checked_add(step)
+                    .ok_or(VerifiedExecError::Os { call: "VerifiedExec len overflow", errno: blaze_sys::Errno::Overflow })?;
+            }
+            fchmod(snap_fd.fd(), 0o500)
+                .map_err(|errno| VerifiedExecError::Os { call: "fchmod (macOS VerifiedExec 0500)", errno })?;
+            set_immutable(snap_fd.fd(), true)
+                .map_err(|errno| VerifiedExecError::Os { call: "fchflags (macOS VerifiedExec UF_IMMUTABLE)", errno })?;
+            Ok(off)
+        })();
+        match stream_res {
+            Ok(len) => Ok(Self {
+                fd: snap_fd,
+                path: blaze_own::String::from_str_in(snapshot_path, blaze_own::SharedAlloc::global()),
+                len,
+            }),
+            Err(err) => {
+                let _ = set_immutable(snap_fd.fd(), false);
+                drop(snap_fd);
+                let _ = unlink(cpath);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        self.path.as_str()
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for VerifiedExec {
+    fn drop(&mut self) {
+        let _ = blaze_sys::posix::io::set_immutable(self.fd.fd(), false);
+        let raw = self.path.as_str().as_bytes();
+        let mut cbuf = blaze_own::Vec::with_capacity_in(raw.len() + 1, blaze_own::SharedAlloc::global());
+        cbuf.extend_from_slice(raw);
+        cbuf.push(0);
+        if let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(cbuf.as_slice()) {
+            let _ = blaze_sys::posix::io::unlink(blaze_sys::Path::new(cstr));
+        }
+    }
+}
+
 /// Why opening or streaming a [`VerifiedExec`] failed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 pub enum VerifiedExecError {
     BadPath,
@@ -505,7 +622,7 @@ pub enum VerifiedExecError {
     Os { call: &'static str, errno: blaze_sys::Errno },
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl VerifiedExecError {
     fn from_fs(err: crate::fs::FsError) -> Self {
         match err.kind {
@@ -517,7 +634,7 @@ impl VerifiedExecError {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl core::fmt::Display for VerifiedExecError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

@@ -42,11 +42,9 @@ use bstd::procs::{
     Exit,
     hermetic::{
         Budget, Capture, ClockSpec, Fault, FilesError, FilesOp, Hermetic, HermeticCapOpts, HermeticOpts, HermeticSpec,
-        HermeticStreams, Level, Program, ReportSpec, RootFiles,
+        HermeticStreams, Level, Program, ReportSpec, RootFiles, Stop as HermeticStop,
     },
 };
-#[cfg(not(target_os = "linux"))]
-use bstd::procs::hermetic::VerifiedStamp;
 
 use crate::record::{DirStore, FilesError as StoreFilesError};
 
@@ -58,6 +56,39 @@ const HERMETIC_STRATEGY_DOMAIN: &str = "blaze-build-script c-probe shelf clang 1
 /// Maximum captured stdout or stderr bytes for one compiler probe.
 const PROBE_MOST_STREAM: u32 = 1 << 20;
 
+/// Maximum `OUT_DIR` input file size classified for hermetic probe execution; larger generated
+/// sources stay on the ordinary compiler route so they never trip `PROBE_MOST_STREAM`.
+pub(crate) const MAX_PROBE_INPUT_BYTES: usize = 64 << 10;
+
+/// Error prefix emitted when a probe child exceeds `PROBE_MOST_STREAM` (`Stop::Stream`), signaling
+/// `spawn_probe` to route the invocation to the ordinary compiler path instead of aborting.
+pub(crate) const STREAM_OVERFLOW_PREFIX: &str = "c-probe stream limit exceeded:";
+
+/// Returns whether any `OUT_DIR` input file referenced by `args` exceeds `MAX_PROBE_INPUT_BYTES`.
+pub(crate) fn has_oversized_probe_input<'b>(
+    args: &[&str],
+    out_dir: &str,
+    input_bytes: &mut impl FnMut(&str) -> Option<&'b [u8]>,
+) -> bool {
+    let prefix = out_dir.trim_end_matches('/');
+    for &arg in args {
+        let Some(rest) = arg.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) else {
+            continue;
+        };
+        if let Some(bytes) = input_bytes(rest)
+            && bytes.len() > MAX_PROBE_INPUT_BYTES
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns whether a probe answerer error indicates stream-capture overflow (`Stop::Stream`).
+pub(crate) fn is_stream_overflow_error(msg: &str) -> bool {
+    msg.starts_with(STREAM_OVERFLOW_PREFIX)
+}
+
 /// Maximum encoded + sealed `c-probe/<64-hex>` record size accepted from disk (`2 * 1 MiB`
 /// streams + binary header + 32-byte seal + margin).
 pub const MAX_RECORD_BYTES: u64 = 2 * (1 << 20) + 4096;
@@ -67,10 +98,6 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Virtual address-space cap for `clang-23` under `RLIMIT_AS` (342 MB binary + shared libs + LLVM).
 const PROBE_MEMORY_BYTES: u64 = 8 << 30;
-
-/// Domain tag sealing the per-boot `clang-23` metadata verification voucher (non-Linux).
-#[cfg(not(target_os = "linux"))]
-const VERIFY_VOUCHER_DOMAIN: &str = "blaze c-probe clang verified voucher 1";
 
 /// Monotonic sequence counter for per-probe isolated task folders.
 static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -221,17 +248,16 @@ impl CProbeSetting {
 }
 
 /// Proof of verified `clang-23` held in [`HermeticClangProbe::verify_flight`]:
-/// - On Linux, keeps the exact verified inode's `O_RDONLY | O_CLOEXEC` [`bstd::procs::hermetic::VerifiedExec`]
-///   descriptor alive so Landlock and `execveat(..., AT_EMPTY_PATH)` execute that exact inode with
-///   zero path-reopen TOCTOU.
-/// - On non-Linux hosts (macOS), keeps the verified [`VerifiedStamp`] and revalidates it before
-///   and after execution so a replaced binary is refused and never cached.
+/// - On Linux, keeps the kernel-sealed `MFD_EXEC` [`bstd::procs::hermetic::VerifiedExec`]
+///   (`F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`) alive so Landlock and
+///   `execveat(..., AT_EMPTY_PATH)` execute that exact verified snapshot with zero TOCTOU.
+/// - On macOS, keeps the `O_CREAT | O_EXCL | O_NOFOLLOW` `0o500` + `UF_IMMUTABLE`
+///   [`bstd::procs::hermetic::VerifiedExec`] snapshot alive so Seatbelt executes that exact
+///   verified immutable snapshot rather than trusting shared shelf path metadata.
 #[derive(Clone)]
 struct VerifiedClang {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     exec: OwnArc<bstd::procs::hermetic::VerifiedExec, SharedAlloc<'static>>,
-    #[cfg(not(target_os = "linux"))]
-    stamp: VerifiedStamp,
 }
 
 /// Hermetic pinned `clang-23` compiler probe runner (`bstd::procs::hermetic::Hermetic` at
@@ -244,7 +270,6 @@ pub struct HermeticClangProbe {
     sdk_dir: Option<SharedStr>,
     sdk_digest: Option<[u8; 32]>,
     io: bstd::io::Io,
-    #[cfg_attr(target_os = "linux", expect(dead_code, reason = "used on non-Linux hosts without execveat"))]
     shelf_dir_cap: bstd::fs::Dir<bstd::fs::ReadWrite>,
     work_base_dir: bstd::fs::Dir<bstd::fs::ReadWrite>,
     work_rel: SharedStr,
@@ -614,66 +639,52 @@ impl HermeticClangProbe {
                     Ok(VerifiedClang { exec: OwnArc::new_in(exec, shared) })
                 }
 
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
                 {
-                    let voucher_name = own_fmt(format_args!("verified-{}.stamp", hex_bytes(&prog.sha256, alloc)), alloc);
+                    let _ = (work_root, boot);
                     let clang_rel = bstd::path::Path::new(prog.shelf_path)
                         .map_err(|_| fail(own_fmt(format_args!("invalid shelf path `{}`", prog.shelf_path), alloc)))?;
-                    let meta = match self.shelf_dir_cap.stat(vcx, &clang_rel) {
-                        Ok(Some(meta)) if !meta.dir => meta,
-                        Ok(_) => {
-                            return Err(fail(own_fmt(
-                                format_args!(
-                                    "pinned clang-23 shelf binary missing at {} (expected archive sha256 {shelf_hex} from pins/clang.json)",
-                                    self.clang_path.as_str()
-                                ),
-                                alloc,
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(fail(own_fmt(
-                                format_args!("stat pinned clang-23 shelf binary at {}: {e}", self.clang_path.as_str()),
-                                alloc,
-                            )));
-                        }
-                    };
-                    let stamp = stamp_of(&meta);
-                    let expected_voucher = boot.map(|b| verify_voucher_digest(b, &stamp, &prog.sha256));
-                    if let Some(expected) = expected_voucher
-                        && let Ok(voucher_rel) = bstd::path::Path::new(voucher_name.as_str())
-                        && read_voucher_bounded(work_root, vcx, &voucher_rel) == Some(expected.0)
-                    {
-                        return Ok(VerifiedClang { stamp });
-                    }
-                    let got_sha = file_sha256_bounded_on(&self.shelf_dir_cap, vcx, &clang_rel, prog.shelf_path, alloc)
-                        .map_err(fail)?;
+                    let seq = PROBE_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+                    let nanos = clock.now().since_start().as_nanos();
+                    let snap_path = own_fmt(
+                        format_args!(
+                            "{}/.vexec-{}-{}-{}.bin",
+                            self.work_root.as_str(),
+                            std::process::id(),
+                            seq,
+                            nanos
+                        ),
+                        alloc,
+                    );
+                    let mut hasher = blaze_sha256::Sha256::new();
+                    let exec = bstd::procs::hermetic::VerifiedExec::open_and_seal_macos(
+                        vcx,
+                        &self.shelf_dir_cap,
+                        &clang_rel,
+                        snap_path.as_str(),
+                        |chunk| {
+                            hasher.update(chunk);
+                        },
+                    )
+                    .map_err(|e| {
+                        fail(own_fmt(
+                            format_args!(
+                                "pinned clang-23 shelf binary missing or unreadable at {} (expected archive sha256 {shelf_hex} from pins/clang.json): {e}",
+                                self.clang_path.as_str()
+                            ),
+                            alloc,
+                        ))
+                    })?;
+                    let got_sha = hasher.finish();
                     shelf_pins::check_member(self.host.as_str(), prog, got_sha)
                         .map_err(|e| fail(own_fmt(format_args!("{e}"), alloc)))?;
-                    let after = match self.shelf_dir_cap.stat(vcx, &clang_rel) {
-                        Ok(Some(m)) if !m.dir => stamp_of(&m),
-                        _ => return Err(OwnArc::from_str_in("pinned clang-23 changed during SHA-256 verification", shared)),
-                    };
-                    if after != stamp {
-                        return Err(OwnArc::from_str_in("pinned clang-23 changed during SHA-256 verification", shared));
-                    }
-                    if let Some(expected) = expected_voucher {
-                        let voucher_rel = bstd::path::Path::new(voucher_name.as_str())
-                            .map_err(|e| fail(own_fmt(format_args!("invalid clang-23 verification voucher path: {e}"), alloc)))?;
-                        work_root
-                            .publish(
-                                vcx,
-                                &voucher_rel,
-                                bstd::fs::Content::bytes(&expected.0),
-                                bstd::fs::Durable::No,
-                            )
-                            .map_err(|e| {
-                                fail(own_fmt(
-                                    format_args!("publish clang-23 verification voucher {}: {e}", voucher_name.as_str()),
-                                    alloc,
-                                ))
-                            })?;
-                    }
-                    Ok(VerifiedClang { stamp })
+                    Ok(VerifiedClang { exec: OwnArc::new_in(exec, shared) })
+                }
+
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    let _ = (work_root, boot, prog, shelf_hex);
+                    Err(OwnArc::from_str_in("hermetic c-probe verified execution unsupported on this OS", shared))
                 }
             })
             .map_err(|err| match err {
@@ -683,58 +694,6 @@ impl HermeticClangProbe {
                 }
                 other => own_fmt(format_args!("c-probe clang verification failed: {other}"), alloc),
             })
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stamp_of(meta: &bstd::fs::Meta) -> VerifiedStamp {
-    VerifiedStamp {
-        dev: meta.stamp.dev,
-        ino: meta.stamp.ino,
-        len: meta.stamp.len,
-        modified_ns: i128::from(meta.stamp.modified_ns),
-        changed_ns: i128::from(meta.stamp.changed_ns),
-    }
-}
-
-/// Computes a per-boot file-metadata stamp digest binding `(boot_id, expected_sha256, dev, ino,
-/// size, modified_ns, changed_ns)` from a verified executable's inode stamp.
-#[cfg(not(target_os = "linux"))]
-fn verify_voucher_digest(boot: blaze_core::Boot, stamp: &VerifiedStamp, expected_sha256: &[u8; 32]) -> ContentId {
-    let mut h = blaze_ids::Hasher::new(VERIFY_VOUCHER_DOMAIN);
-    h.part(&boot.0)
-        .part(expected_sha256)
-        .update(&stamp.dev.to_le_bytes())
-        .update(&stamp.ino.to_le_bytes())
-        .update(&stamp.len.to_le_bytes())
-        .update(&stamp.modified_ns.to_le_bytes())
-        .update(&stamp.changed_ns.to_le_bytes());
-    h.finish()
-}
-
-/// Reads an exact 32-byte verification voucher through deadline-aware `bstd::fs` into a stack
-/// buffer (rejecting any missing, truncated, or oversized file without allocating).
-#[cfg(not(target_os = "linux"))]
-fn read_voucher_bounded(
-    dir: &bstd::fs::Dir<bstd::fs::ReadWrite>,
-    cx: &bstd::cx::Cx,
-    rel: &bstd::path::Path,
-) -> Option<[u8; 32]> {
-    let file = dir.open_read(cx, rel).ok()?;
-    if file.len(cx).ok()? != 32 {
-        return None;
-    }
-    let mut buf = [0u8; 33];
-    let n = file.read_into(&mut buf, 0).wait(cx).ok()?;
-    if n != 32 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    if let Some(src) = buf.get(..32) {
-        out.copy_from_slice(src);
-        Some(out)
-    } else {
-        None
     }
 }
 
@@ -1028,6 +987,58 @@ impl ProbeAnswerer for HermeticClangProbe {
         let task_real = own_fmt(format_args!("{}/{}", self.work_root.as_str(), dir_name.as_str()), alloc);
         let guard = TaskDirGuard { io: &self.io, work_root: &work_root, task_rel, cleaned: false };
 
+        let run_res = self.run_in_task_dir(
+            probe,
+            input_bytes,
+            &verified,
+            &clock,
+            &remaining,
+            &stage_cx,
+            &task_dir,
+            task_real.as_str(),
+            alloc,
+        );
+        let cleanup_res = match remaining() {
+            Some(cleanup_rem) => match self.io.cx(cleanup_rem, bstd::mem::TASK_FRAME) {
+                Ok(cleanup_cx) => guard.cleanup(&cleanup_cx, alloc),
+                Err(_) => Err(own_str("c-probe cleanup context stopped", alloc)),
+            },
+            None => Err(own_str("c-probe deadline exhausted before cleanup", alloc)),
+        };
+        finish_with_cleanup(run_res, cleanup_res, alloc)
+    }
+}
+
+fn finish_with_cleanup<'a, T>(
+    run_res: Result<T, AString<'a>>,
+    cleanup_res: Result<(), AString<'a>>,
+    alloc: Alloc<'a>,
+) -> Result<T, AString<'a>> {
+    match (run_res, cleanup_res) {
+        (Ok(val), Ok(())) => Ok(val),
+        (Ok(_), Err(clean_err)) => Err(clean_err),
+        (Err(run_err), Ok(())) => Err(run_err),
+        (Err(run_err), Err(clean_err)) => Err(own_fmt(
+            format_args!("{run_err}; task-dir cleanup also failed: {clean_err}"),
+            alloc,
+        )),
+    }
+}
+
+impl HermeticClangProbe {
+    #[expect(clippy::too_many_arguments, reason = "internal helper factoring result-bearing cleanup around probe execution")]
+    fn run_in_task_dir<'a, 'b>(
+        &self,
+        probe: &CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        verified: &VerifiedClang,
+        clock: &bstd::clock::Clock,
+        remaining: &dyn Fn() -> Option<Duration>,
+        stage_cx: &bstd::cx::Cx,
+        task_dir: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+        task_real: &str,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
         // Materialize ONLY the probe's own OUT_DIR input files (`$IN<n><ext>` -> `<task>/in<n><ext>`)
         // through deadline-aware `bstd::fs`.
         let mut placeholders: AVec<'a, (AString<'a>, AString<'a>)> = OwnVec::new_in(alloc);
@@ -1038,9 +1049,9 @@ impl ProbeAnswerer for HermeticClangProbe {
             let local_name = placeholder_filename(spelled.as_str(), alloc);
             let file_rel = bstd::path::Path::new(local_name.as_str())
                 .map_err(|_| own_fmt(format_args!("invalid probe input `{}`", local_name.as_str()), alloc))?;
-            let host_file = own_fmt(format_args!("{}/{}", task_real.as_str(), local_name.as_str()), alloc);
+            let host_file = own_fmt(format_args!("{task_real}/{}", local_name.as_str()), alloc);
             task_dir
-                .publish(&stage_cx, &file_rel, bstd::fs::Content::bytes(bytes), bstd::fs::Durable::No)
+                .publish(stage_cx, &file_rel, bstd::fs::Content::bytes(bytes), bstd::fs::Durable::No)
                 .map_err(|e| own_fmt(format_args!("write probe input {host_file}: {e}"), alloc))?;
             placeholders.push((own_str(spelled.as_str(), alloc), host_file));
         }
@@ -1054,7 +1065,7 @@ impl ProbeAnswerer for HermeticClangProbe {
                     && !placeholders.iter().any(|(k, _)| k.as_str() == spelled.as_str())
                 {
                     let local_name = placeholder_filename(spelled.as_str(), alloc);
-                    let host_file = own_fmt(format_args!("{}/{local_name}", task_real.as_str()), alloc);
+                    let host_file = own_fmt(format_args!("{task_real}/{local_name}"), alloc);
                     placeholders.push((own_str(spelled.as_str(), alloc), host_file));
                 }
             }
@@ -1068,11 +1079,18 @@ impl ProbeAnswerer for HermeticClangProbe {
         }
         owned_args.push(own_str("-fintegrated-cc1", alloc));
         owned_args.push(own_str("--no-default-config", alloc));
+        #[cfg(target_os = "macos")]
+        {
+            // Executing the verified immutable snapshot path outside `<shelf>/bin` requires naming
+            // the shelf's Clang resource directory explicitly so builtin headers resolve identically.
+            owned_args.push(own_str("-resource-dir", alloc));
+            owned_args.push(own_fmt(format_args!("{}/lib/clang/23", self.shelf_dir.as_str()), alloc));
+        }
 
         let mut has_sysroot = false;
         let sdk_str = self.sdk_dir.as_ref().map(OwnString::as_str);
         for segs in probe.exec_args.iter() {
-            let rendered = render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc)?;
+            let rendered = render_segments(segs.as_slice(), task_real, sdk_str, placeholders.as_slice(), alloc)?;
             has_sysroot |= rendered.as_str().starts_with("-isysroot") || rendered.as_str().starts_with("--sysroot");
             owned_args.push(rendered);
         }
@@ -1090,12 +1108,12 @@ impl ProbeAnswerer for HermeticClangProbe {
         for (k, segs) in probe.exec_env.iter() {
             owned_env.push((
                 own_str(k.as_str(), alloc),
-                render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc)?,
+                render_segments(segs.as_slice(), task_real, sdk_str, placeholders.as_slice(), alloc)?,
             ));
         }
         // Always give Clang its own confined output directory as `TMPDIR` (ambient host `TMPDIR`
         // values are intentionally excluded from `CLANG_ENV` / `ProbeKey` for machine independence).
-        owned_env.push((own_str("TMPDIR", alloc), own_str(task_real.as_str(), alloc)));
+        owned_env.push((own_str("TMPDIR", alloc), own_str(task_real, alloc)));
         let epoch_clock = resolve_source_date_epoch(&mut owned_env, alloc);
         owned_env.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         owned_env.dedup_by(|a, b| a.0.as_str() == b.0.as_str());
@@ -1137,13 +1155,18 @@ impl ProbeAnswerer for HermeticClangProbe {
             .cx(run_rem, bstd::mem::TASK_FRAME)
             .map_err(|_| own_str("c-probe context stopped", alloc))?;
 
+        #[cfg(target_os = "macos")]
+        let exec_path = verified.exec.path();
+        #[cfg(not(target_os = "macos"))]
+        let exec_path = self.clang_path.as_str();
+
         let spec = HermeticSpec::new(HermeticOpts {
-            program: Program::Stored { name: "clang-23", digest: Digest(self.shelf_digest), path: self.clang_path.as_str() },
+            program: Program::Stored { name: "clang-23", digest: Digest(self.shelf_digest), path: exec_path },
             args: arg_refs.as_slice(),
             env: env_refs.as_slice(),
             roots,
             mounts: mounts_vec.as_slice(),
-            cwd: task_real.as_str(),
+            cwd: task_real,
             helpers: &[],
             helper_folders: &[],
             channels: &[],
@@ -1168,26 +1191,13 @@ impl ProbeAnswerer for HermeticClangProbe {
             spec.with_verified_exec(&verified.exec)
         };
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            let prog = shelf_pins::shelf_program(CLANG_JSON, self.host.as_str(), "clang-23")
-                .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
-            let clang_rel = bstd::path::Path::new(prog.shelf_path)
-                .map_err(|_| own_fmt(format_args!("invalid shelf path `{}`", prog.shelf_path), alloc))?;
-            let cur = self
-                .shelf_dir_cap
-                .stat(&cx, &clang_rel)
-                .map_err(|e| own_fmt(format_args!("pre-exec stat clang-23: {e}"), alloc))?
-                .filter(|m| !m.dir)
-                .map(|m| stamp_of(&m));
-            if cur != Some(verified.stamp) {
-                return Err(own_str("pinned clang-23 inode changed before probe execution (rule 21)", alloc));
-            }
-        }
-
-        let ran = hermetic
-            .run(&cx, &spec, &ProbeFiles, alloc)
-            .map_err(|e| own_fmt(format_args!("c-probe hermetic run failed: {:?} ({:?})", e.fault, e.rule), alloc))?;
+        let ran = hermetic.run(&cx, &spec, &ProbeFiles, alloc).map_err(|e| match e.fault {
+            Fault::Stopped(HermeticStop::Stream { stream, most }) => own_fmt(
+                format_args!("{STREAM_OVERFLOW_PREFIX} {:?} exceeded {} bytes", stream, most),
+                alloc,
+            ),
+            _ => own_fmt(format_args!("c-probe hermetic run failed: {:?} ({:?})", e.fault, e.rule), alloc),
+        })?;
 
         #[cfg(target_os = "linux")]
         {
@@ -1204,30 +1214,6 @@ impl ProbeAnswerer for HermeticClangProbe {
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            let Some(post_rem) = remaining() else {
-                return Err(own_str("c-probe deadline exhausted before post-exec inode revalidation", alloc));
-            };
-            let post_cx = self
-                .io
-                .cx(post_rem, bstd::mem::TASK_FRAME)
-                .map_err(|_| own_str("c-probe post-exec context stopped", alloc))?;
-            let prog = shelf_pins::shelf_program(CLANG_JSON, self.host.as_str(), "clang-23")
-                .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
-            let clang_rel = bstd::path::Path::new(prog.shelf_path)
-                .map_err(|_| own_fmt(format_args!("invalid shelf path `{}`", prog.shelf_path), alloc))?;
-            let cur = self
-                .shelf_dir_cap
-                .stat(&post_cx, &clang_rel)
-                .map_err(|e| own_fmt(format_args!("post-exec stat clang-23: {e}"), alloc))?
-                .filter(|m| !m.dir)
-                .map(|m| stamp_of(&m));
-            if cur != Some(verified.stamp) {
-                return Err(own_str("pinned clang-23 inode changed during probe execution (rule 21)", alloc));
-            }
-        }
-
         let code = match ran.exit {
             Exit::Exited(code) => code,
             Exit::Signaled(sig) => return Err(own_fmt(format_args!("c-probe clang-23 killed by signal {sig}"), alloc)),
@@ -1239,16 +1225,8 @@ impl ProbeAnswerer for HermeticClangProbe {
         // Normalize host paths back to canonical placeholders (longest match first) while escaping
         // literal `$` -> `$$` so literal `$OUT_DIR`/`$IN0.c` in Clang output round-trip verbatim
         // through `CanonicalProbe::unspell`, and `<shelf>/bin` (`InstalledDir:`) never leaks `$HOME`.
-        let stdout = normalize_reply(raw_out, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc);
-        let stderr = normalize_reply(raw_err, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc);
-        let Some(cleanup_rem) = remaining() else {
-            return Err(own_str("c-probe deadline exhausted before cleanup", alloc));
-        };
-        let cleanup_cx = self
-            .io
-            .cx(cleanup_rem, bstd::mem::TASK_FRAME)
-            .map_err(|_| own_str("c-probe cleanup context stopped", alloc))?;
-        guard.cleanup(&cleanup_cx, alloc)?;
+        let stdout = normalize_reply(raw_out, exec_path, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
+        let stderr = normalize_reply(raw_err, exec_path, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
         Ok(ProbeAnswer { code, stdout, stderr })
     }
 }
@@ -1256,8 +1234,10 @@ impl ProbeAnswerer for HermeticClangProbe {
 /// Stable placeholder replacing host clang shelf root paths (e.g. `InstalledDir: $CLANG_SHELF/bin`).
 const CLANG_SHELF: &str = "$CLANG_SHELF";
 
+#[expect(clippy::too_many_arguments, reason = "explicit host-root normalization arguments")]
 fn normalize_reply<'a>(
     raw: &str,
+    exec_path: &str,
     clang_path: &str,
     shelf_dir: &str,
     task_dir: &str,
@@ -1268,6 +1248,9 @@ fn normalize_reply<'a>(
     let mut rev_pairs: AVec<'a, (&str, &str)> = OwnVec::new_in(alloc);
     for (spelled, host_file) in placeholders.iter() {
         rev_pairs.push((host_file.as_str(), spelled.as_str()));
+    }
+    if exec_path != clang_path {
+        rev_pairs.push((exec_path, "clang-23"));
     }
     rev_pairs.push((clang_path, "clang-23"));
     rev_pairs.push((shelf_dir, CLANG_SHELF));
@@ -1391,32 +1374,6 @@ fn path_utf8<'a>(path: &Path, alloc: Alloc<'a>) -> Result<SharedStr, AString<'a>
         Some(s) => Ok(OwnString::from_str_in(s, SharedAlloc::global())),
         None => Err(own_fmt(format_args!("{}: path is not UTF-8", path.display()), alloc)),
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn file_sha256_bounded_on<'a>(
-    root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
-    cx: &bstd::cx::Cx,
-    rel: &bstd::path::Path,
-    label: &str,
-    alloc: Alloc<'a>,
-) -> Result<[u8; 32], AString<'a>> {
-    let file = root.open_read(cx, rel).map_err(|e| own_fmt(format_args!("{label}: {e}"), alloc))?;
-    let mut hasher = blaze_sha256::Sha256::new();
-    let mut buf = [0u8; 64 << 10];
-    let mut offset = 0u64;
-    loop {
-        let n = file.read_into(&mut buf, offset).wait(cx).map_err(|e| own_fmt(format_args!("{label}: {e}"), alloc))?;
-        if n == 0 {
-            break;
-        }
-        if let Some(chunk) = buf.get(..n) {
-            hasher.update(chunk);
-        }
-        let step = u64::try_from(n).map_err(|_| own_str("c-probe verify offset overflow", alloc))?;
-        offset = offset.checked_add(step).ok_or_else(|| own_str("c-probe verify offset overflow", alloc))?;
-    }
-    Ok(hasher.finish())
 }
 
 fn hex_nibble(n: u8) -> char {
@@ -1936,12 +1893,31 @@ mod tests {
         let norm = super::normalize_reply(
             "clang: /home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23\nInstalledDir: /home/user/.blaze/v2/toolchain/clang/abc/bin\nreal=/tmp/task-1/in0.c dir=/tmp/task-1 lit=$OUT_DIR lit2=$IN0.c\n",
             "/home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23",
+            "/home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23",
             "/home/user/.blaze/v2/toolchain/clang/abc",
             "/tmp/task-1",
             None,
             placeholders.as_slice(),
             alloc,
         );
+        // Cleanup failures on early probe errors must be combined and reported, never discarded.
+        let combined = super::finish_with_cleanup::<()>(
+            Err(super::own_str("probe run failed", alloc)),
+            Err(super::own_str("remove_dir EIO", alloc)),
+            alloc,
+        )
+        .expect_err("combined error");
+        assert!(combined.as_str().contains("probe run failed") && combined.as_str().contains("remove_dir EIO"));
+        // Oversized probe inputs (> 64 KiB) and stream-overflow errors route back to the ordinary
+        // compiler path instead of aborting the build script.
+        let huge = std::vec![b'a'; super::MAX_PROBE_INPUT_BYTES + 1];
+        let small = b"int main(void) { return 0; }";
+        let mut get_huge = |rel: &str| (rel == "1detect_compiler_family.c").then_some(huge.as_slice());
+        let mut get_small = |rel: &str| (rel == "1detect_compiler_family.c").then_some(small.as_slice());
+        assert!(super::has_oversized_probe_input(&["-E", "/out/1detect_compiler_family.c"], "/out", &mut get_huge));
+        assert!(!super::has_oversized_probe_input(&["-E", "/out/1detect_compiler_family.c"], "/out", &mut get_small));
+        assert!(super::is_stream_overflow_error("c-probe stream limit exceeded: Stdout exceeded 1048576 bytes"));
+        assert!(!super::is_stream_overflow_error("c-probe hermetic run failed"));
         assert_eq!(
             norm.as_str(),
             "clang: clang-23\nInstalledDir: $CLANG_SHELF/bin\nreal=$IN0.c dir=$OUT_DIR lit=$$OUT_DIR lit2=$$IN0.c\n"
