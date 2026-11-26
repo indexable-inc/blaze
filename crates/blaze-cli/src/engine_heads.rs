@@ -155,13 +155,13 @@ pub(crate) struct Made {
 }
 
 /// What a worker hands back for one task.
-struct Worked {
+struct Worked<'p> {
     out: ContentId,
-    defines: std::vec::Vec<(Cell, ContentId), Global>,
-    reads: std::vec::Vec<CellId, Global>,
+    defines: SVec<'p, (Cell, ContentId)>,
+    reads: SVec<'p, CellId>,
     /// At cell grain: each header's head read where `Owners::place` put it (a head task's cell,
     /// or a dependency's record whole), read as is ([`HeadsStage::run_phase`]).
-    heads: std::vec::Vec<CellId, Global>,
+    heads: SVec<'p, CellId>,
     payload: std::vec::Vec<u8, Global>,
 }
 
@@ -613,8 +613,16 @@ impl HeadsStage {
         // The per-item head tasks first ([`HeadsStage::run_items`]), then the crates' tables.
         // Closed-dep impl tables (`!member` with no member in scope) depend only on earlier Names
         // records and overlap directly with `HeadsSetup` and `HeadsSplit` on the same worker pool.
-        let (items, tasks): (std::vec::Vec<Task, Global>, std::vec::Vec<Task, Global>) = tasks.iter().copied().partition(|task| task.planned.name.kind == Kind::Signature);
-        let tasks = &tasks[..];
+        let mut items: SVec<'p, Task> = SVec::new_in(at_phase);
+        let mut table_tasks: SVec<'p, Task> = SVec::new_in(at_phase);
+        for &task in tasks.iter() {
+            if task.planned.name.kind == Kind::Signature {
+                items.push(task);
+            } else {
+                table_tasks.push(task);
+            }
+        }
+        let tasks = &table_tasks[..];
         let heap = handles.env.heap;
         let g = heap.alloc();
         let shared = heap.shared();
@@ -725,10 +733,10 @@ impl HeadsStage {
         };
         let cache = scope_cache.get_or_insert_with(|| HeadsScopeCache::new(CrateGraph::len(&list), g));
         // Each crate of the list by its tables' name.
-        let mut by_name: std::vec::Vec<(Name, usize), Global> = std::vec::Vec::with_capacity_in(CrateGraph::len(&list), Global);
+        let mut by_name: SVec<'p, (Name, usize)> = SVec::with_capacity_in(CrateGraph::len(&list), at_phase);
         by_name.extend((0..CrateGraph::len(&list)).map(|at| (impl_tables_name(list.key(at)), at)));
         by_name.sort_unstable();
-        let mut jobs: std::vec::Vec<Job<'r>, Global> = std::vec::Vec::with_capacity_in(tasks.len(), Global);
+        let mut jobs: SVec<'p, Job<'r>> = SVec::with_capacity_in(tasks.len(), at_phase);
         let mut job_indices: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(tasks.len(), g);
         let mut closed_cursor = 0usize;
         let mut pre_refused_cursor = 0usize;
@@ -795,7 +803,7 @@ impl HeadsStage {
         let outlined = handles.outlined;
         let clock = handles.clock;
         let max_workers = handles.workers;
-        let mut worked: std::vec::Vec<(Result<Result<Worked, &'static str>, work::Panicked>, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
+        let mut worked: SVec<'p, (Result<Result<Worked<'p>, &'static str>, work::Panicked>, u64)> = SVec::with_capacity_in(jobs.len(), at_phase);
         if !jobs.is_empty() {
             let mut job_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
             job_dispatch.extend(0..jobs.len());
@@ -812,12 +820,12 @@ impl HeadsStage {
                     at,
                     scope.may_overlap("engine impl tables", HEADS_FRAME, move |cx: &Cx| {
                         let began = clock.now();
-                        let made = work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, at_cells, heap, listings, snapshot, max_workers));
+                        let made = work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, at_cells, heap, listings, snapshot, max_workers, at_phase));
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
                 ));
             }
-            let mut worked_paired: Vec<(usize, (Result<Result<Worked, &'static str>, work::Panicked>, u64)), Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+            let mut worked_paired: SVec<'p, (usize, (Result<Result<Worked<'p>, &'static str>, work::Panicked>, u64))> = SVec::with_capacity_in(jobs.len(), at_phase);
             let mut stopped = None;
             for (at, handle) in running.into_iter() {
                 match handle.join(&cx) {
@@ -1056,8 +1064,8 @@ fn steal_impl_chunks<'n>(
 struct TableReadRefused(&'static str);
 
 /// Result of one closed-dep `ImplBucket` job overlapped with `HeadsSetup`/`HeadsSplit`.
-struct ClosedWorked {
-    made: Result<Result<Worked, &'static str>, work::Panicked>,
+struct ClosedWorked<'p> {
+    made: Result<Result<Worked<'p>, &'static str>, work::Panicked>,
     ns: u64,
 }
 
@@ -1123,7 +1131,7 @@ where
 /// its scope at most once (lazily after stealing a chunk). The member subjects place source reads.
 /// At cell grain, each header's head read is placed too.
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
-fn tables_of(
+fn tables_of<'p>(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     fs: &bstd::fs::Fs,
@@ -1139,7 +1147,8 @@ fn tables_of(
     listings: &Listings,
     snapshot: &crate::store::StoreSnapshot,
     max_workers: NonZeroU32,
-) -> Result<Worked, &'static str> {
+    at_phase: SharedAlloc<'p>,
+) -> Result<Worked<'p>, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
@@ -1305,11 +1314,11 @@ fn tables_of(
         defines_v.extend(done.defines.iter().copied());
         (done.out, defines_v, reads_v, heads_v, tables)
     };
-    let mut reads = std::vec::Vec::with_capacity_in(reads_v.len(), Global);
+    let mut reads = SVec::with_capacity_in(reads_v.len(), at_phase);
     reads.extend_from_slice(&reads_v);
-    let mut heads = std::vec::Vec::with_capacity_in(heads_v.len(), Global);
+    let mut heads = SVec::with_capacity_in(heads_v.len(), at_phase);
     heads.extend_from_slice(&heads_v);
-    let mut defines = std::vec::Vec::with_capacity_in(defines_v.len(), Global);
+    let mut defines = SVec::with_capacity_in(defines_v.len(), at_phase);
     defines.extend_from_slice(&defines_v);
     Ok(Worked { out, defines, reads, heads, payload: framed(&tables, Global) })
 }
@@ -3081,7 +3090,7 @@ fn member_subjects<'r, 'p, 'h>(
 /// One member crate's head tasks, made over its check scope's records (its own opened; every
 /// non-member dependency opened by need through [`HeadsScopeRecords`]): its setup on one worker,
 /// its tasks in split jobs on any.
-struct ItemJob<'r> {
+struct ItemJob<'r, 'p> {
     prefix: [u8; 8],
     own: Crate<'r>,
     rest: SVec<'static, crate::front_load::Unopened>,
@@ -3095,24 +3104,24 @@ struct ItemJob<'r> {
     /// at 1 the member's own names cell.
     cells: SVec<'static, CellId>,
     /// Its tasks, sorted by (file, name) before splitting.
-    tasks: std::vec::Vec<Task, Global>,
+    tasks: SVec<'p, Task>,
 }
 
-impl<'r> ItemJob<'r> {
+impl<'r> ItemJob<'r, '_> {
     fn scope_crates<'s>(&'s self, records: &'s dyn crate::front_load::OpenByNeed) -> crate::run_names::ScopeCrates<'s, 's> {
         crate::run_names::ScopeCrates::ByNeed(crate::run_names::ByNeedScope { own: self.own, rest: &self.rest[..], records })
     }
 }
 
 /// One head task as a worker made it.
-struct WorkedHead {
+struct WorkedHead<'p> {
     out: ContentId,
-    defines: std::vec::Vec<(Cell, ContentId), Global>,
+    defines: SVec<'p, (Cell, ContentId)>,
     /// Each cell's item ([`head_item`]) and its unit's crate prefix, as `defines` lists them:
     /// what the profile counts by. Over the handed heap's `Sync` handle: it crosses back from
     /// the worker.
     items: SVec<'static, (Cell, [u8; 8])>,
-    reads: std::vec::Vec<CellId, Global>,
+    reads: SVec<'p, CellId>,
     /// Each cell's want (front2 head.rs `want_bytes`), its cell ([`head_cell`], 16 bytes), its
     /// frozen bytes' length (u32 LE) and the frozen bytes, in cell order. The row's record adds
     /// the run facts after them ([`ctor_facts`]; engine_seeds.rs `runs_from`).
@@ -3133,9 +3142,9 @@ struct WorkedHead {
 const HEAD_FAILED_DOMAIN: &str = "blaze-cli engine heads: a head not frozen";
 
 /// A head task that could not freeze a head: why (rule 19), and what it read until then.
-struct HeadFailed {
+struct HeadFailed<'p> {
     why: &'static str,
-    reads: std::vec::Vec<CellId, Global>,
+    reads: SVec<'p, CellId>,
     incomplete_reads: bool,
 }
 
@@ -3196,7 +3205,7 @@ struct UnitsMade<'a> {
     reads: SVec<'a, CellId>,
     /// The first unit's freeze, the later units' defines, items, runs and failed heads
     /// appended in unit order ([`WorkedHead::payload`]: one run a (unit, cell)).
-    first: Option<WorkedHead>,
+    first: Option<WorkedHead<'a>>,
 }
 
 impl<'a> UnitsMade<'a> {
@@ -3205,7 +3214,7 @@ impl<'a> UnitsMade<'a> {
     }
 
     /// Unit `prefix`'s freeze of the task (its items carry `prefix` already, `heads_of`).
-    fn take(&mut self, prefix: [u8; 8], mut one: WorkedHead) {
+    fn take(&mut self, prefix: [u8; 8], mut one: WorkedHead<'a>) {
         self.out.update(&prefix).update(&one.out.0);
         self.reads.extend(one.reads.iter().copied());
         // Its list is in the union now: freed here, not kept a second time to the phase's merge
@@ -3317,12 +3326,12 @@ impl HeadsStage {
         by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, Alloc<'static>>>,
         subjects: &mut SVec<'p, Subject>,
         loaded_subjects: &mut Vec<[u8; 8], Alloc<'static>>,
-    ) -> Result<Vec<ClosedWorked, Alloc<'static>>, CliError> {
+    ) -> Result<SVec<'p, ClosedWorked<'p>>, CliError> {
         let heap = handles.env.heap;
         let g = heap.alloc();
         let shared = heap.shared();
         if tasks.is_empty() {
-            return Ok(Vec::new_in(g));
+            return Ok(SVec::new_in(at_phase));
         }
         let refused = &mut self.refused;
         // A refusal with the cells it is a function of, each as the view holds it today (ABSENT
@@ -3346,7 +3355,7 @@ impl HeadsStage {
             for task in tasks.iter() {
                 refuse(task, "this command has no unit graph or no crate's names, so no head", &[], buffer);
             }
-            return Ok(Vec::new_in(g));
+            return Ok(SVec::new_in(at_phase));
         };
         // The crate list, each member's check scope and the packs are the graph record's.
         let graph_cell = CellId { of: graph.name, cell: WHOLE };
@@ -3354,7 +3363,7 @@ impl HeadsStage {
             for task in tasks.iter() {
                 refuse(task, "the crates' inputs could not be made (names.rs `world`; the `UnitGraph` record's finding says why)", &[graph_cell], buffer);
             }
-            return Ok(Vec::new_in(g));
+            return Ok(SVec::new_in(at_phase));
         };
         let (packs, corrected) = match kept.lazy_trees(handles.env, graph.out, list) {
             Ok(trees) => trees,
@@ -3363,7 +3372,7 @@ impl HeadsStage {
                 for task in tasks.iter() {
                     refuse(task, why, &[], buffer);
                 }
-                return Ok(Vec::new_in(g));
+                return Ok(SVec::new_in(at_phase));
             }
         };
         let cache = scope_cache.get_or_insert_with(|| HeadsScopeCache::new(CrateGraph::len(&list), g));
@@ -3376,7 +3385,7 @@ impl HeadsStage {
         task_files.sort_unstable();
         task_files.dedup();
         let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(handles.outlined, g));
-        let mut jobs: std::vec::Vec<ItemJob<'r>, Global> = std::vec::Vec::new_in(Global);
+        let mut jobs: SVec<'p, ItemJob<'r, 'p>> = SVec::new_in(at_phase);
         let mut unvisited_members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
         // Built lazily only if a task's file is in no member crate's items record, avoiding
         // probing `view.cell` for every standing member crate on normal incremental edits.
@@ -3418,7 +3427,7 @@ impl HeadsStage {
             whole,
             cut_words,
             cells,
-            tasks: std::vec::Vec::new_in(Global),
+            tasks: SVec::new_in(at_phase),
         };
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
             let root = list.root(member);
@@ -3544,7 +3553,7 @@ impl HeadsStage {
         }
         // Each task to EVERY member unit (by prefix) whose files hold its file (lane RU1,
         // `head_cell`): each freezes the task's heads under its own records, one cell a unit.
-        let mut by_file: std::vec::Vec<(Name, [u8; 8]), Global> = std::vec::Vec::with_capacity_in(subjects.len(), Global);
+        let mut by_file: SVec<'p, (Name, [u8; 8])> = SVec::with_capacity_in(subjects.len(), at_phase);
         by_file.extend(subjects.iter().map(|row| (row.slot, row.prefix)));
         by_file.sort_unstable();
         by_file.dedup();
@@ -3701,19 +3710,19 @@ impl HeadsStage {
         let clock = handles.clock;
         let subjects = &subjects[..];
         let expansion_reads = self.freeze != HeadUnits::NoExpansionReads;
-        type Ran = Result<Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str>, work::Panicked>;
+        type Ran<'p> = Result<Result<SVec<'p, Result<WorkedHead<'p>, HeadFailed<'p>>>, &'static str>, work::Panicked>;
         type Setup = Result<Result<CrateSetup, &'static str>, work::Panicked>;
         // The request's crate listings, lent to every worker as the frozen heads are.
         let head_jobs = self.jobs;
         let listings: &Listings = self.listings.get_or_insert_with(|| Listings::new(heap, head_jobs.listings, Some(snapshot_owner.clone()), handles.tool));
-        let workers = usize::try_from(handles.workers.get()).unwrap_or(usize::MAX);
+        let workers = usize::try_from(handles.workers.get()).unwrap_or(1).max(1);
         let board = handles.board;
         // Each crate's setup, each split job, and any closed-dep `ImplBucket` jobs overlap inside
         // one worker scope so idle cores during `HeadsSetup` and `HeadsSplit` build dep tables.
         let mut setups: SVec<'static, (Setup, u64)> = SVec::with_capacity_in(jobs.len(), heap.shared());
-        let mut closed_worked: Vec<ClosedWorked, Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
+        let mut closed_worked: SVec<'p, ClosedWorked<'p>> = SVec::with_capacity_in(closed_jobs.len(), at_phase);
         let mut splits: SVec<'static, SplitAt> = SVec::new_in(heap.shared());
-        let mut arrived: SVec<'static, (u32, (Ran, u64))> = SVec::new_in(heap.shared());
+        let mut arrived: SVec<'p, (u32, (Ran<'p>, u64))> = SVec::new_in(at_phase);
         let mut total = 0usize;
         let mut most_splits = 0usize;
         let mut split_files = 0usize;
@@ -3759,7 +3768,7 @@ impl HeadsStage {
                         let made = if board.stopping().is_some() {
                             Ok(Err(NOT_BEGUN))
                         } else {
-                            work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, &[], at_cells, heap, listings, snapshot, max_workers))
+                            work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, &[], at_cells, heap, listings, snapshot, max_workers, at_phase))
                         };
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
@@ -3882,7 +3891,7 @@ impl HeadsStage {
                         scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
                             let began = clock.now();
                             let on_board = OnBoard { board, clock, shows };
-                            let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
+                            let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot, at_phase, workers));
                             Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                         }),
                     ));
@@ -3899,7 +3908,7 @@ impl HeadsStage {
                     }
                 }
             }
-            let mut closed_paired: Vec<(usize, ClosedWorked), Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
+            let mut closed_paired: SVec<'p, (usize, ClosedWorked<'p>)> = SVec::with_capacity_in(closed_jobs.len(), at_phase);
             for (at, handle) in running_closed.into_iter() {
                 match handle.join(cx) {
                     Ok((made, ns, start)) => {
@@ -3920,7 +3929,7 @@ impl HeadsStage {
             closed_paired.sort_unstable_by_key(|(at, _)| *at);
             closed_worked.extend(closed_paired.into_iter().map(|(_, worked)| worked));
         }
-        let worked = in_split_order(arrived, splits.len(), head_jobs.merge, heap.shared()).map_err(|error| CliError::Text { what: crate::engine_head_notes::leak(g, format_args!("{error}")) })?;
+        let worked = in_split_order(arrived, splits.len(), head_jobs.merge, at_phase).map_err(|error| CliError::Text { what: crate::engine_head_notes::leak(g, format_args!("{error}")) })?;
         // 3. Each unit's results gathered by task (units in prefix order, a unit's splits in task
         // order), then each task as the engine's row, in task order.
         let acc = |accs: &[(Task, UnitsMade<'p>)], task: &Task| -> Option<usize> { accs.binary_search_by_key(&task.planned.name, |(one, _)| one.planned.name).ok() };
@@ -4275,7 +4284,7 @@ fn crate_setup(
     packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
-    job: &ItemJob<'_>,
+    job: &ItemJob<'_, '_>,
     scope_records: &dyn crate::front_load::OpenByNeed,
     subjects: &Subjects,
     view: View<'_, '_>,
@@ -4371,9 +4380,29 @@ fn crate_setup(
 /// Reset threshold for `heads_of`'s per-split bump scratch frame: once a batch's scratch
 /// stores, `OwnedRecorder`s, and `SeededHeads` tables pass this mark, the batch finishes,
 /// drops them cleanly, and resets the frame (trimming committed pages back to
-/// [`HEADS_SCRATCH_KEEP`]).
+/// [`HEADS_SCRATCH_KEEP`]). Both scale inversely past [`HEADS_FRAME_CAP_BASE_WORKERS`] cores so
+/// 64–128 core machines stay within a fixed aggregate frame budget while 8–18 core Macs keep full
+/// working-set caps.
 const HEADS_SCRATCH_RESET_AT: usize = 32 << 20;
 const HEADS_SCRATCH_KEEP: usize = 8 << 20;
+const HEADS_FRAME_CAP_BASE_WORKERS: usize = 18;
+const HEADS_SCRATCH_RESET_MIN: usize = 4 << 20;
+const HEADS_SCRATCH_KEEP_MIN: usize = 1 << 20;
+
+/// Returns `(reset_at, keep)` for a `heads_of` worker's scratch frame scaled inversely with
+/// active worker count.
+const fn heads_scratch_caps(workers: usize) -> (usize, usize) {
+    let w = if workers == 0 { 1 } else { workers };
+    if w <= HEADS_FRAME_CAP_BASE_WORKERS {
+        return (HEADS_SCRATCH_RESET_AT, HEADS_SCRATCH_KEEP);
+    }
+    let reset = HEADS_SCRATCH_RESET_AT.saturating_mul(HEADS_FRAME_CAP_BASE_WORKERS) / w;
+    let keep = HEADS_SCRATCH_KEEP.saturating_mul(HEADS_FRAME_CAP_BASE_WORKERS) / w;
+    (
+        if reset < HEADS_SCRATCH_RESET_MIN { HEADS_SCRATCH_RESET_MIN } else { reset },
+        if keep < HEADS_SCRATCH_KEEP_MIN { HEADS_SCRATCH_KEEP_MIN } else { keep },
+    )
+}
 
 /// One run of a member crate's head tasks (`tasks`, a split of `job`'s: [`split_count`]) on a
 /// worker: its scope's records opened again in the job's frame over the crate's `setup`, each
@@ -4383,7 +4412,7 @@ const HEADS_SCRATCH_KEEP: usize = 8 << 20;
 /// the engine enters the reader at the wave after its definer, engine.rs), or its crate's names
 /// record. A panic here fails this split's tasks alone (`run_items`).
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
-fn heads_of(
+fn heads_of<'p>(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     fs: &bstd::fs::Fs,
@@ -4392,7 +4421,7 @@ fn heads_of(
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     list: &blaze_world::crate_list::CrateList<'static>,
-    job: &ItemJob<'_>,
+    job: &ItemJob<'_, '_>,
     scope_records: &dyn crate::front_load::OpenByNeed,
     setup: &CrateSetup,
     tasks: &[Task],
@@ -4405,7 +4434,9 @@ fn heads_of(
     plant: ListingsPlant,
     on_board: OnBoard<'_>,
     snapshot: &crate::store::StoreSnapshot,
-) -> Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str> {
+    at_phase: SharedAlloc<'p>,
+    max_workers: usize,
+) -> Result<SVec<'p, Result<WorkedHead<'p>, HeadFailed<'p>>>, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
@@ -4437,18 +4468,20 @@ fn heads_of(
     crate_scopes.sort_unstable_by_key(|c| c.prefix);
     // Reusable per-worker bump scratch frame for `SeededHeads`, `OwnedRecorder`s, and `Owners`:
     // reset and trimmed between batches so freezing scratch never touches `Global` (rule 11).
-    let mut scratch_frame = blaze_ladder::front2::tables::head::FreezeScratch::new(HEADS_FRAME, HEADS_SCRATCH_KEEP, bstd::mem::Tag::Infer)
+    let active_workers = usize::try_from(cx.workers()).unwrap_or(max_workers).min(max_workers).max(1);
+    let (scratch_reset_at, scratch_keep) = heads_scratch_caps(active_workers);
+    let mut scratch_frame = blaze_ladder::front2::tables::head::FreezeScratch::new(HEADS_FRAME, scratch_keep, bstd::mem::Tag::Infer)
         .map_err(|_| "could not reserve heads scratch frame (engine_heads.rs `heads_of`)")?;
-    let mut done = std::vec::Vec::with_capacity_in(tasks.len(), Global);
+    let mut done = SVec::with_capacity_in(tasks.len(), at_phase);
     let mut total_lowered = 0u32;
     let mut total_eval_lowered = 0u32;
     let mut total_taken = 0u32;
-    struct ActiveTask<'b, 'f> {
+    struct ActiveTask<'b, 'f, 'p> {
         mine: &'static [ListedHead],
         at_head: usize,
         running: Option<crate::engine_status::Running<'b>>,
         out: blaze_ids::Hasher,
-        worked: WorkedHead,
+        worked: WorkedHead<'p>,
         failed: Option<&'static str>,
         incomplete_reads: bool,
         settled: usize,
@@ -4457,7 +4490,7 @@ fn heads_of(
         #[cfg(not(test))]
         _frame: core::marker::PhantomData<&'f ()>,
     }
-    let mut active: Option<ActiveTask<'_, '_>> = None;
+    let mut active: Option<ActiveTask<'_, '_, 'p>> = None;
     let mut at_task = 0usize;
     while at_task < tasks.len() {
         let mut stop_now = false;
@@ -4520,10 +4553,10 @@ fn heads_of(
                     let out = blaze_ids::Hasher::new(HEAD_OUT_DOMAIN);
                     let mut worked = WorkedHead {
                         out: ContentId([0; 32]),
-                        defines: std::vec::Vec::new_in(*job.tasks.allocator()),
+                        defines: SVec::new_in(at_phase),
                         items: SVec::new_in(heap.shared()),
-                        reads: std::vec::Vec::new_in(*job.tasks.allocator()),
-                        payload: std::vec::Vec::new_in(*job.tasks.allocator()),
+                        reads: SVec::new_in(at_phase),
+                        payload: std::vec::Vec::new_in(Global),
                         failed: SVec::new_in(heap.shared()),
                         ctors: SVec::new_in(heap.shared()),
                         adt_failed: false,
@@ -4656,7 +4689,7 @@ fn heads_of(
                     // can exhaust the per-split bump scratch frame within a single task if we wait
                     // until the end of the task to reset. Yield mid-task so `scratch_frame` resets
                     // and trims cleanly between heads while preserving `cur` across batches.
-                    if cur.at_head < cur.mine.len() && batch_frame.used() >= HEADS_SCRATCH_RESET_AT {
+                    if cur.at_head < cur.mine.len() && batch_frame.used() >= scratch_reset_at {
                         if let Some(why) = crate::engine_heads_once::job_refusal(&freeze_names, &eval_names, g) {
                             cur.failed.get_or_insert(why);
                             cur.incomplete_reads = true;
@@ -4711,7 +4744,7 @@ fn heads_of(
                     running.end(on_board.board.now(on_board.clock));
                 }
                 at_task += 1;
-                if batch_frame.used() >= HEADS_SCRATCH_RESET_AT {
+                if batch_frame.used() >= scratch_reset_at {
                     break;
                 }
             }
@@ -4741,7 +4774,7 @@ pub(crate) const MOST_HEAD_READS: usize = 1 << 12;
 /// pushed, the lists of a phase's tasks were 4.6 GB of the 9.0 GB live four minutes into a real
 /// workspace's check (tempo, 2026-11-17: 1125 lists of about 4 MB each, growing until the
 /// memory guard stopped the run).
-fn once_each<A: core::alloc::Allocator>(reads: &mut std::vec::Vec<CellId, A>) {
+fn once_each<A: core::alloc::Allocator>(reads: &mut Vec<CellId, A>) {
     reads.sort_unstable();
     reads.dedup();
 }
@@ -4749,3 +4782,23 @@ fn once_each<A: core::alloc::Allocator>(reads: &mut std::vec::Vec<CellId, A>) {
 /// A read list is settled ([`once_each`]) when it passes this many entries, and then each time
 /// it doubles, so the sorting stays linear in what was pushed.
 const SETTLE_AT: usize = 1 << 10;
+
+#[cfg(test)]
+mod heads_frame_caps_tests {
+    use super::*;
+
+    #[test]
+    fn heads_scratch_caps_scale_inversely_for_128_cores_and_preserve_mac_caps() {
+        for w in [0usize, 1, 8, 12, 18] {
+            assert_eq!(heads_scratch_caps(w), (HEADS_SCRATCH_RESET_AT, HEADS_SCRATCH_KEEP));
+        }
+        let (r64, k64) = heads_scratch_caps(64);
+        assert!(r64 < HEADS_SCRATCH_RESET_AT && r64 >= HEADS_SCRATCH_RESET_MIN);
+        assert!(k64 < HEADS_SCRATCH_KEEP && k64 >= HEADS_SCRATCH_KEEP_MIN);
+
+        let (r128, k128) = heads_scratch_caps(128);
+        assert!(r128 <= r64 && r128 >= HEADS_SCRATCH_RESET_MIN);
+        assert!(k128 <= k64 && k128 >= HEADS_SCRATCH_KEEP_MIN);
+        assert!(128usize.saturating_mul(k128) <= 160 << 20, "128-core heads scratch keep <= 160 MiB, got {}", 128usize.saturating_mul(k128));
+    }
+}

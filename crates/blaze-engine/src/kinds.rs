@@ -626,16 +626,43 @@ impl KindTable {
         self.stood[kind.index()]
     }
 
-    /// Whether a task of `kind`, merged, may grow tasks at or before `stage`.
+    /// Whether a task of `kind`, merged, may grow tasks at `stage` or a stage preceding `stage`.
     pub fn grows_by(&self, kind: Kind, stage: Stage) -> bool {
-        self.of(kind).and_then(|facts| facts.grows_into).is_some_and(|into| into <= stage)
+        self.of(kind)
+            .and_then(|facts| facts.grows_into)
+            .is_some_and(|into| into == stage || stage_precedes(into, stage))
     }
 
-    /// The latest stage a kind sits in whose growth may land at or before `stage`: `None` when no
-    /// registered kind grows into it. Anything unsettled up to that stage may still make such a
-    /// grower merge, and so grow (ready.rs R4).
+    /// The latest stage a kind sits in whose growth may land at `stage` or a stage preceding it:
+    /// `None` when no registered kind grows into it. Anything unsettled up to that stage may
+    /// still make such a grower merge, and so grow (ready.rs R4).
     pub fn grower_stage(&self, stage: Stage) -> Option<Stage> {
-        self.facts.iter().flatten().filter(|facts| facts.grows_into.is_some_and(|into| into <= stage)).map(|facts| facts.stage).max()
+        self.facts
+            .iter()
+            .flatten()
+            .filter(|facts| facts.grows_into.is_some_and(|into| into == stage || stage_precedes(into, stage)))
+            .map(|facts| facts.stage)
+            .max()
+    }
+}
+
+/// Whether `earlier` can produce cells read by (or transitively feeding) `target` (K4).
+/// `Stage::Lints` consumes only `Units` and `Outlines`, never `Scripts`, `Names`, `Heads`, or
+/// `Bodies`, so `Stage::Lints` is independent of those stages and can settle and run
+/// concurrently with them without violating R1.
+pub const fn stage_precedes(earlier: Stage, target: Stage) -> bool {
+    match target {
+        Stage::Lints => matches!(earlier, Stage::Units | Stage::Outlines),
+        _ => earlier.index() < target.index(),
+    }
+}
+
+/// Bitmask of stages that precede `target` (`1u8 << s.index()` for every `s` with
+/// [`stage_precedes`]`(s, target)`).
+pub const fn preceding_stages_mask(target: Stage) -> u8 {
+    match target {
+        Stage::Lints => (1u8 << Stage::Units.index()) | (1u8 << Stage::Outlines.index()),
+        _ => (1u8 << target.index()) - 1,
     }
 }
 
@@ -676,5 +703,40 @@ impl<'k, 'a, C: ?Sized> Kinds<'k, 'a, C> {
             *slot = Some(facts);
         }
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod stage_order_tests {
+    use super::*;
+
+    #[test]
+    fn lints_depends_only_on_units_and_outlines_never_on_scripts_names_heads_or_bodies() {
+        for target in Stage::ALL {
+            let mask = preceding_stages_mask(target);
+            for earlier in Stage::ALL {
+                let bit_set = (mask & (1u8 << earlier.index())) != 0;
+                assert_eq!(bit_set, stage_precedes(earlier, target), "mask agrees with stage_precedes for ({earlier:?}, {target:?})");
+            }
+        }
+        assert!(stage_precedes(Stage::Units, Stage::Lints));
+        assert!(stage_precedes(Stage::Outlines, Stage::Lints));
+        assert!(!stage_precedes(Stage::Scripts, Stage::Lints));
+        assert!(!stage_precedes(Stage::Names, Stage::Lints));
+        assert!(!stage_precedes(Stage::Heads, Stage::Lints));
+        assert!(!stage_precedes(Stage::Bodies, Stage::Lints));
+        assert!(!stage_precedes(Stage::Lints, Stage::Bodies));
+
+        // A grower growing into Stage::Bodies must gate Stage::Bodies, never Stage::Lints.
+        let table = KindTable::new(&[
+            KindFacts { kind: Kind::CrateScope, stage: Stage::Names, grows_into: Some(Stage::Bodies) },
+            KindFacts { kind: Kind::BodyCheck, stage: Stage::Bodies, grows_into: None },
+            KindFacts { kind: Kind::Lint, stage: Stage::Lints, grows_into: None },
+        ])
+        .expect("distinct kinds");
+        assert!(table.grows_by(Kind::CrateScope, Stage::Bodies));
+        assert_eq!(table.grower_stage(Stage::Bodies), Some(Stage::Names));
+        assert!(!table.grows_by(Kind::CrateScope, Stage::Lints));
+        assert_eq!(table.grower_stage(Stage::Lints), None);
     }
 }

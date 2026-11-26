@@ -5741,7 +5741,7 @@ where
         // PHASE-MEM-DEBT(Lints): `LintsStage::made` on the process heap, kept to the command's
         // end for the put and the print; to take `at_phase`.
         (None, Stage::Lints) => {
-            lint_priors(cx, &mut *store, records, rq.fresh, &entered[..], &mut *rq.lints)?;
+            lint_priors(cx, &mut *store, records, rq.fresh, rq.workers, &entered[..], &mut *rq.lints, alloc)?;
             rq.lints.run_phase(cx, rq.root, rq.outlined, rq.workers, clock, &entered[..], &mut rq.buffers[0], &mut *rq.times, alloc)?
         }
     }
@@ -5753,25 +5753,131 @@ where
 /// (engine_lints.rs `Prior`, sparse rows: rule 77). A memo, never a read of the task: a fresh
 /// request reads none, and a task with no last row lints every unit. A row naming a record the
 /// store does not hold is a named stop (rule 3), never a task of no memo.
-fn lint_priors(
+///
+/// Decodes priors in parallel across `workers` using a committed `Store::snapshot` (each worker
+/// reusing one 64 MiB frame reset per item) and merges results in deterministic task order (rule 25).
+#[expect(clippy::too_many_arguments, reason = "the priors decode edge: each argument one handle of it")]
+fn lint_priors<'a>(
     cx: &Cx,
     store: &mut crate::store::CommandStore<'_, '_, bstd::io::LentDriver>,
     records: &RecordKeys<'_>,
     fresh: bool,
+    workers: NonZeroU32,
     tasks: &[Task],
     lints: &mut crate::engine_lints::LintsStage,
+    alloc: SharedAlloc<'a>,
 ) -> Result<(), CliError> {
-    if fresh {
+    if fresh || tasks.is_empty() {
         return Ok(());
     }
+    let mut pairs: blaze_own::Vec<(Name, blaze_drive::Key), &Frame> = blaze_own::Vec::with_capacity_in(tasks.len(), cx.frame());
     for task in tasks.iter() {
         let name = task.planned.name;
         let Some(key) = records.get(name)? else { continue };
-        let record = match crate::store::Store::get(&mut *store, cx, key)? {
-            None => return Err(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name, key }).into()),
-            Some(held) => crate::engine_store::outline_from(name, key, held.bytes, std::alloc::Global).map_err(EngineCheckError::OutlineBack)?,
+        pairs.push((name, key));
+    }
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let snapshot = if pairs.len() > 1 && workers.get() > 1 { crate::store::Store::snapshot(&*store)? } else { None };
+    let Some(snap) = snapshot else {
+        let mut scratch = if pairs.len() > 1 {
+            Some(Frame::with_reserve(64 << 20, bstd::mem::Tag::Other).map_err(|_| CliError::Text { what: "a lint prior's frame could not be reserved (engine_check.rs)" })?)
+        } else {
+            None
         };
-        lints.remember(name, &record);
+        for &(name, key) in pairs.iter() {
+            let decode_frame = scratch.as_ref().unwrap_or_else(|| cx.frame());
+            let record = match crate::store::Store::get(&mut *store, cx, key)? {
+                None => return Err(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name, key }).into()),
+                Some(held) => crate::engine_store::outline_from(name, key, held.bytes, decode_frame).map_err(EngineCheckError::OutlineBack)?,
+            };
+            lints.remember(name, &record);
+            drop(record);
+            if let Some(frame) = scratch.as_mut() {
+                let _ = frame.reset();
+            }
+        }
+        return Ok(());
+    };
+
+    enum PriorOut {
+        Decoded(Name, Result<crate::engine_lints::Prior, &'static str>),
+        NeedStore(Name, blaze_drive::Key),
+        OutlineBack(crate::engine_store::OutlineBack),
+        Snapshot(blaze_cas::plain::SnapshotError),
+    }
+
+    let max_workers = usize::try_from(workers.get()).unwrap_or(1).max(1);
+    let worker_count = pairs.len().min(max_workers).max(1);
+    let pairs_slice = pairs.as_slice();
+    let cursor = core::sync::atomic::AtomicUsize::new(0);
+    let cursor_ref = &cursor;
+    let snap_ref = &*snap;
+    let span = cx.span("engine: decode lint priors");
+    let scope = span.scope();
+    scope.narrow_workers(workers, bstd::task::Class::Foreground);
+    let mut running = blaze_own::Vec::with_capacity_in(worker_count, span.frame());
+    for _ in 0..worker_count {
+        running.push(scope.may_overlap("engine lint prior worker", 64 << 10, move |_cx: &Cx| {
+            let mut scratch = match Frame::with_reserve(64 << 20, bstd::mem::Tag::Other) {
+                Ok(frame) => frame,
+                Err(_) => return Ok::<_, core::convert::Infallible>(Err("a lint prior worker's frame could not be reserved (engine_check.rs)")),
+            };
+            let mut out: SVec<'a, (usize, PriorOut)> = SVec::new_in(alloc);
+            loop {
+                let idx = cursor_ref.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let Some(&(name, key)) = pairs_slice.get(idx) else { break };
+                let item = match snap_ref.get(key) {
+                    Err(error) => PriorOut::Snapshot(error),
+                    Ok(None) => PriorOut::NeedStore(name, key),
+                    Ok(Some(bytes)) => match crate::engine_store::outline_from(name, key, bytes, &scratch) {
+                        Ok(record) => PriorOut::Decoded(name, crate::engine_lints::Prior::of(&record)),
+                        Err(why) => PriorOut::OutlineBack(why),
+                    },
+                };
+                out.push((idx, item));
+                let _ = scratch.reset();
+            }
+            Ok(Ok(out))
+        }));
+    }
+    let mut results: blaze_own::Vec<(usize, PriorOut), &Frame> = blaze_own::Vec::with_capacity_in(pairs.len(), span.frame());
+    let mut stopped = None;
+    let mut frame_err: Option<&'static str> = None;
+    for handle in running.into_iter() {
+        match handle.join(&span) {
+            Ok(Ok(local)) => results.extend(local),
+            Ok(Err(what)) => {
+                frame_err.get_or_insert(what);
+            }
+            Err(error) => {
+                stopped.get_or_insert(error);
+            }
+        }
+    }
+    scope.join(&span).map_err(CliError::Pool)?;
+    drop(snap);
+    if let Some(error) = stopped {
+        return Err(CliError::Pool(error));
+    }
+    if let Some(what) = frame_err {
+        return Err(CliError::Text { what });
+    }
+    results.sort_unstable_by_key(|(idx, _)| *idx);
+    for (_, item) in results {
+        match item {
+            PriorOut::Decoded(name, prior) => lints.remember_prior(name, prior),
+            PriorOut::NeedStore(name, key) => {
+                let record = match crate::store::Store::get(&mut *store, cx, key)? {
+                    None => return Err(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name, key }).into()),
+                    Some(held) => crate::engine_store::outline_from(name, key, held.bytes, span.frame()).map_err(EngineCheckError::OutlineBack)?,
+                };
+                lints.remember(name, &record);
+            }
+            PriorOut::OutlineBack(why) => return Err(EngineCheckError::OutlineBack(why).into()),
+            PriorOut::Snapshot(error) => return Err(crate::store::PlaceError::Snapshot(error).into()),
+        }
     }
     Ok(())
 }
@@ -6735,7 +6841,7 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     let mut puts = ready_put(rq, store, records, Stage::Outlines, &outline_tasks, None, &mem)?;
     // 3b. Each entered file's last lint record, read before the drive (its runs read the stage,
     // never write it), so a unit its key keeps is copied, not linted.
-    lint_priors(cx, &mut *store, &*records, rq.fresh, &lint_tasks, &mut *rq.lints)?;
+    lint_priors(cx, &mut *store, &*records, rq.fresh, rq.workers, &lint_tasks, &mut *rq.lints, alloc)?;
     // 4. The bodies' setup, as `bodies_phase` makes a Bodies phase's, over the engine's view
     // before the drive: the cells of the stages before Bodies stand (the precondition), and a
     // decided row's reads are read again through the host when its task runs.
@@ -6806,8 +6912,12 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     // `Prepared::scope_records`): a body's scope crate past its member opened at its first
     // question, once for every run; its counts read after the join.
     let by_need = prepared.scope_records();
-    let parked = crate::engine_ready_check::walk_lints(cx, &*rq.lints, rq.root, rq.outlined, &lint_tasks, alloc)?;
-    let stages = crate::engine_ready_check::Stages { parked, runner: prepared.runner(rq.bodies.reads_paged(&stored_shelf), &by_need), decided };
+    let stages = crate::engine_ready_check::Stages {
+        lints: &*rq.lints,
+        root: rq.root,
+        runner: prepared.runner(rq.bodies.reads_paged(&stored_shelf), &by_need),
+        decided,
+    };
     let driven = crate::engine_ready_check::drive_edit(engine, given_answers, &given_entering, rq.outlined, stages, &mut pool, alloc, heap.shared())?;
     let crate::engine_ready_check::Driven { finished, mut sunk, panicked } = driven;
     if let Some(&name) = panicked.first() {

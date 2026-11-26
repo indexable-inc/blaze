@@ -499,7 +499,7 @@ pub(crate) enum HeadEntry {
 pub(crate) enum HeadEntries<'p> {
     /// From the whole plan (the phase path): each head task with a record, sorted by name, and
     /// each that failed, sorted.
-    Built { entries: std::vec::Vec<(Name, Key), Global>, failed: std::vec::Vec<Name, Global> },
+    Built { entries: blaze_own::Vec<(Name, Key), SharedAlloc<'static>>, failed: blaze_own::Vec<Name, SharedAlloc<'static>> },
     /// On first ask, from the stored answer's pages (the ready path).
     Paged(PagedHeads<'p>),
 }
@@ -664,7 +664,7 @@ pub(crate) enum CrateNames<'p> {
 /// its maps, which only insert. `Sync`: the snapshot is, and so is every map.
 pub(crate) struct RequestTable<'p> {
     /// The committed store as the Bodies phase began: every head record is read through it.
-    snapshot: Snapshot<Global>,
+    snapshot: Snapshot<SharedAlloc<'static>>,
     /// Each head task's entry: built, or found on its first ask (rule 78).
     heads: HeadEntries<'p>,
     /// The request's crates (as [`crates_of`] lists them; [`crates_unasked`] on the ready driver).
@@ -676,16 +676,16 @@ pub(crate) struct RequestTable<'p> {
     had_root: bool,
     listed_from_root: usize,
     /// Additional dependency head keys from the Heads stage (`list_too`), empty on warm edits.
-    added_listed: std::vec::Vec<Key, Global>,
+    added_listed: blaze_own::Vec<Key, SharedAlloc<'static>>,
     /// What was read of the head tasks' records, by member cell.
-    members: blaze_core::SharedMapBy<CellId, MemberRead, blaze_hash::DigestState, Global>,
+    members: blaze_core::SharedMapBy<CellId, MemberRead, blaze_hash::DigestState, SharedAlloc<'static>>,
     /// The member cells taken from them.
-    taken: blaze_core::SharedSetBy<CellId, blaze_hash::DigestState, Global>,
+    taken: blaze_core::SharedSetBy<CellId, blaze_hash::DigestState, SharedAlloc<'static>>,
     /// What was read of the dependency heads' records, by key.
-    dependencies: blaze_core::SharedMapBy<Key, DependencyRead, blaze_hash::DigestState, Global>,
-    fresh: blaze_core::SharedMap<ContentId, Fresh, Global>,
+    dependencies: blaze_core::SharedMapBy<Key, DependencyRead, blaze_hash::DigestState, SharedAlloc<'static>>,
+    fresh: blaze_core::SharedMap<ContentId, Fresh, SharedAlloc<'static>>,
     /// Every cell asked that no head task's record answered.
-    read: blaze_core::SharedSet<ContentId, Global>,
+    read: blaze_core::SharedSet<ContentId, SharedAlloc<'static>>,
     /// Each cell whose first freeze failed this request, by any stretch (`first_failure`).
     first_failed: blaze_core::SharedMap<ContentId, FirstFailure, blaze_own::SharedAlloc<'static>>,
     /// Failures past [`MOST_FIRST_FAILED`], counted, their reasons not kept.
@@ -750,8 +750,9 @@ impl<'p> RequestTable<'p> {
         heap: &'static blaze_own::Heap,
     ) -> Result<RequestTable<'p>, CliError> {
         let _cx = cx.span("engine: the request's frozen heads");
-        let mut entries: std::vec::Vec<(Name, Key), Global> = std::vec::Vec::new_in(Global);
-        let mut failed: std::vec::Vec<Name, Global> = std::vec::Vec::new_in(Global);
+        let shared = heap.shared();
+        let mut entries: blaze_own::Vec<(Name, Key), SharedAlloc<'static>> = blaze_own::Vec::new_in(shared);
+        let mut failed: blaze_own::Vec<Name, SharedAlloc<'static>> = blaze_own::Vec::new_in(shared);
         for one in planned.iter().filter(|one| one.name.kind == Kind::Signature) {
             let Some(row) = view.row(one.name) else { continue };
             if row.failed {
@@ -795,23 +796,24 @@ impl<'p> RequestTable<'p> {
             }
             None => (false, 0),
         };
+        let shared = heap.shared();
         Ok(RequestTable {
-            snapshot: store.snapshot_in(Global)?,
+            snapshot: store.snapshot_in(shared)?,
             heads,
             crates,
             names,
             tool,
             had_root,
             listed_from_root,
-            added_listed: std::vec::Vec::new_in(Global),
-            members: blaze_core::SharedMapBy::new_in("engine.member heads read from their head tasks' records", Global),
-            taken: blaze_core::SharedSetBy::new_in("engine.member heads taken", Global),
-            dependencies: blaze_core::SharedMapBy::new_in("engine.dependency head records read", Global),
-            fresh: blaze_core::SharedMap::new_in("engine.frozen heads, made this request", Global),
-            read: blaze_core::SharedSet::new_in("engine.heads not in the head tasks' records, read", Global),
-            first_failed: blaze_core::SharedMap::new_in("engine.heads whose first freeze failed, with their reasons", heap.shared()),
+            added_listed: blaze_own::Vec::new_in(shared),
+            members: blaze_core::SharedMapBy::new_in("engine.member heads read from their head tasks' records", shared),
+            taken: blaze_core::SharedSetBy::new_in("engine.member heads taken", shared),
+            dependencies: blaze_core::SharedMapBy::new_in("engine.dependency head records read", shared),
+            fresh: blaze_core::SharedMap::new_in("engine.frozen heads, made this request", shared),
+            read: blaze_core::SharedSet::new_in("engine.heads not in the head tasks' records, read", shared),
+            first_failed: blaze_core::SharedMap::new_in("engine.heads whose first freeze failed, with their reasons", shared),
             first_past_cap: AtomicU32::new(0),
-            refused: blaze_core::SharedMapBy::new_in("engine.member heads refused to a body, as said", heap.shared()),
+            refused: blaze_core::SharedMapBy::new_in("engine.member heads refused to a body, as said", shared),
             twice: AtomicU32::new(0),
             heap,
             body_locals: BodyLocals::Lowered,
@@ -1011,8 +1013,9 @@ impl<'p> RequestTable<'p> {
                 DependencyRead::Bad(why) => return Err(CliError::Text { what: *why }),
             }
         }
+        let g = self.heap.alloc();
         let fresh = self.fresh.pin();
-        let mut puts: std::vec::Vec<(Key, bool, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
+        let mut puts: blaze_own::Vec<(Key, bool, blaze_own::Vec<u8, Alloc<'static>>), Alloc<'static>> = blaze_own::Vec::new_in(g);
         let mut not_put = NotPut::default();
         for (_, one) in fresh.iter() {
             // Only a dependency's: a member's head moves with its crate's every edit, so it
@@ -1032,7 +1035,7 @@ impl<'p> RequestTable<'p> {
                 not_put.no_names = not_put.no_names.saturating_add(1);
                 continue;
             };
-            let mut payload = std::vec::Vec::with_capacity_in(KEY_BYTES + one.bytes.len(), Global);
+            let mut payload = blaze_own::Vec::with_capacity_in(KEY_BYTES + one.bytes.len(), g);
             payload.extend_from_slice(&names_at.0.0);
             payload.extend_from_slice(one.bytes);
             puts.push((dependency_key(names_at, one.cell, tool), krate.toolchain, payload));
@@ -1041,8 +1044,8 @@ impl<'p> RequestTable<'p> {
         puts.dedup_by_key(|(key, _, _)| *key);
         for (key, is_toolchain, payload) in puts.iter() {
             // Its payload is this vector's, freed below: none held after the merge.
-            ledger.put(Stage::Bodies, *key, &[&payload[..]], 0);
-            store.put(&cx, *key, payload)?;
+            ledger.put(Stage::Bodies, *key, &[payload.as_slice()], 0);
+            store.put(&cx, *key, payload.as_slice())?;
             if *is_toolchain {
                 store.keep_with_toolchain(*key)?;
             }
@@ -1060,7 +1063,7 @@ impl<'p> RequestTable<'p> {
                 return Err(CliError::Text { what: "the dependency heads' root expired before merge (engine_seeds.rs `merge`)" });
             }
         } else if !puts.is_empty() || !self.added_listed.is_empty() || self.listed_from_root > 0 {
-            let mut keys: std::vec::Vec<Key, Global> = std::vec::Vec::with_capacity_in(self.listed_from_root + self.added_listed.len() + puts.len(), Global);
+            let mut keys: blaze_own::Vec<Key, Alloc<'static>> = blaze_own::Vec::with_capacity_in(self.listed_from_root + self.added_listed.len() + puts.len(), g);
             if let Some(existing) = store.named(root)? {
                 if existing.len() % 32 != 0 {
                     return Err(CliError::Text { what: "the dependency heads' root lists bytes that are no whole keys (engine_seeds.rs `root_name`)" });
@@ -1103,7 +1106,7 @@ impl<'p> RequestTable<'p> {
             put: u32::try_from(puts.len()).unwrap_or(u32::MAX),
             unlisted,
             not_put,
-            fresh: fresh_digest(&self.fresh),
+            fresh: fresh_digest(&self.fresh, g),
             bodies,
             // The Heads stage's, set by the command after the merge (engine_check.rs).
             units: crate::engine_heads::UnitCounts::default(),
@@ -1115,9 +1118,9 @@ impl<'p> RequestTable<'p> {
 /// The digest of every head frozen this request, each its cell's bytes and its frozen bytes'
 /// digest, in the cells' order (rule 25: a function of what was frozen, never of which worker
 /// froze it first): what the tests compare across worker counts.
-fn fresh_digest(fresh: &blaze_core::SharedMap<ContentId, Fresh, Global>) -> ContentId {
+fn fresh_digest(fresh: &blaze_core::SharedMap<ContentId, Fresh, SharedAlloc<'static>>, alloc: Alloc<'static>) -> ContentId {
     let pinned = fresh.pin();
-    let mut each: std::vec::Vec<([u8; WANT_BYTES], ContentId), Global> = std::vec::Vec::with_capacity_in(pinned.len(), Global);
+    let mut each: blaze_own::Vec<([u8; WANT_BYTES], ContentId), Alloc<'static>> = blaze_own::Vec::with_capacity_in(pinned.len(), alloc);
     each.extend(pinned.iter().map(|(_, one)| (want_bytes(one.cell), ContentId::of(CELL_DOMAIN, one.bytes))));
     each.sort_unstable();
     let mut h = blaze_ids::Hasher::new(FRESH_DOMAIN);
@@ -1662,7 +1665,7 @@ mod renew_tests {
         // Warm edit: 0 new heads frozen, empty `list_too` -> 0 root probes!
         let mut table = RequestTable::of(
             &mut store,
-            HeadEntries::Built { entries: std::vec::Vec::new(), failed: std::vec::Vec::new() },
+            HeadEntries::Built { entries: blaze_own::Vec::new_in(heap.shared()), failed: blaze_own::Vec::new_in(heap.shared()) },
             (std::vec::Vec::new(), CrateNames::Listed),
             root,
             Tool(ContentId([1; 32])),
@@ -1682,7 +1685,7 @@ mod renew_tests {
         store.put(&cx, extra, b"extra-head").expect("put extra head");
         let mut table2 = RequestTable::of(
             &mut store,
-            HeadEntries::Built { entries: std::vec::Vec::new(), failed: std::vec::Vec::new() },
+            HeadEntries::Built { entries: blaze_own::Vec::new_in(heap.shared()), failed: blaze_own::Vec::new_in(heap.shared()) },
             (std::vec::Vec::new(), CrateNames::Listed),
             root,
             Tool(ContentId([1; 32])),

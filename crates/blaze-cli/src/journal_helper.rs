@@ -232,21 +232,28 @@ fn live(
     out: &Out,
 ) -> Result<Death, CliError> {
     out.line(cx, format_args!("journal helper: answering in the home's {}/{} (instance {instance:016x})", crate::store::HOME_FOLDER, helper::SOCKET_FOLDER))?;
+    let tick_ns = as_ns(TICK);
+    let mut last_exe_check_ns = 0u64;
     loop {
         let told = driver.take(cx, core)?;
         if let Some(death) = driver.steps(cx, core, told)? {
             return Ok(death);
         }
-        let ticked = core.tick(driver.now()).map_err(HelperError::Core)?;
+        let now = driver.now();
+        let ticked = core.tick(now).map_err(HelperError::Core)?;
         if let Some(death) = driver.steps(cx, core, ticked)? {
             return Ok(death);
         }
-        // Its own executable, on the same tick: replaced, the core ends it (`Death::Replaced`).
-        if let Some(change) = conns.scope(|frame| own.look(cx, frame)) {
-            out.line(cx, format_args!("journal helper: its executable {change}"))?;
-            let replaced = core.binary_replaced().map_err(HelperError::Core)?;
-            if let Some(death) = driver.steps(cx, core, replaced)? {
-                return Ok(death);
+        // Its own executable, checked at most once per tick (1 s) so rapid back-to-back asks
+        // avoid redundant `stat` syscalls while a replaced build still ends promptly (`Death::Replaced`).
+        if now.0.saturating_sub(last_exe_check_ns) >= tick_ns {
+            last_exe_check_ns = now.0;
+            if let Some(change) = conns.scope(|frame| own.look(cx, frame)) {
+                out.line(cx, format_args!("journal helper: its executable {change}"))?;
+                let replaced = core.binary_replaced().map_err(HelperError::Core)?;
+                if let Some(death) = driver.steps(cx, core, replaced)? {
+                    return Ok(death);
+                }
             }
         }
         let accepted = {

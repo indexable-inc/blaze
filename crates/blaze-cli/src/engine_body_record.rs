@@ -140,6 +140,19 @@ pub(crate) fn typed_key(bytes: &[u8]) -> Key {
     Key(h.finish())
 }
 
+/// Encodes a body's raw `Checked` record bytes through the selective `BZR1` fast-Zstd envelope
+/// (`>= 4 KiB` and `< 85%` of raw size -> compressed; small/incompressible -> raw zero-copy) and
+/// computes its content key [`typed_key`]. Deterministic across runs (rule 25).
+#[allow(dead_code, reason = "called by Bodies stage workers to compress large TypedBody puts")]
+pub(crate) fn prepare_typed_in<'a, A: Allocator + Copy>(
+    raw: &'a [u8],
+    alloc: A,
+) -> Result<(Key, crate::store::record_codec::Encoded<'a, A>), crate::store::record_codec::RecordCodecError> {
+    let encoded = crate::store::record_codec::encode_selective_in(raw, alloc)?;
+    let key = typed_key(encoded.as_slice());
+    Ok((key, encoded))
+}
+
 /// Why the store did not hand a body's typed record over: names the body's check and the key.
 #[derive(Debug)]
 pub(crate) enum TypedReadError {
@@ -152,6 +165,8 @@ pub(crate) enum TypedReadError {
     /// The facts name a typed record the store does not hold: a record lost, never a cue to
     /// check the body again (rule 3).
     Missing { body: Name, key: Key },
+    /// The `BZR1` Zstd envelope wrapping the typed record failed validation or decompression.
+    Decompress { body: Name, key: Key, why: crate::store::record_codec::RecordCodecError },
 }
 
 impl fmt::Display for TypedReadError {
@@ -161,6 +176,7 @@ impl fmt::Display for TypedReadError {
             TypedReadError::Snapshot { body, key, why } => write!(f, "{body:?}: its record {key:?} could not be read from the store snapshot: {why} (rule: engine_body_record.rs)"),
             TypedReadError::Facts { body, what } => write!(f, "{body:?}: its run facts record, which names its typed record, could not be read: {what} (engine_body_facts.rs, engine_body_record.rs)"),
             TypedReadError::Missing { body, key } => write!(f, "{body:?}: its run facts name the typed record {key:?}, which the store does not hold (rule 3: engine_body_record.rs)"),
+            TypedReadError::Decompress { body, key, why } => write!(f, "{body:?}: its typed record {key:?} failed BZR1 decompression: {why} (rule 21: engine_body_record.rs)"),
         }
     }
 }
@@ -299,7 +315,13 @@ fn decode_body_source<'s>(
     // `check` ran and kept no record of it: the run's one check, counted.
     let Some(at) = typed else { return Ok(BodySource::Run(RunChecked::Unrecorded)) };
     let Some(bytes) = get(check, at).map_err(read)? else { return Err(read(TypedReadError::Missing { body: check, key: at })) };
-    blaze_typeck::checked_record::decode(bytes, alloc).map(BodySource::Read).map_err(|why| TypedGap::Record { key, why })
+    let decoded = crate::store::record_codec::decode_if_envelope_in(
+        bytes,
+        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        cx.frame(),
+    )
+    .map_err(|why| read(TypedReadError::Decompress { body: check, key: at, why }))?;
+    blaze_typeck::checked_record::decode(decoded.as_slice(), alloc).map(BodySource::Read).map_err(|why| TypedGap::Record { key, why })
 }
 
 impl blaze_ladder::front2::program::lazy::typed::KeptBodies for StoreTyped<'_> {
@@ -402,5 +424,41 @@ mod tests {
             Err(e) => panic!("refused for another reason: {e}"),
             Ok(_) => panic!("one body's record was read as another's"),
         }
+    }
+
+    /// Selective `BZR1` compression for `TypedBody` records: small payloads stay raw with the
+    /// exact same `typed_key`, large compressible payloads compress cleanly and decode back
+    /// byte-for-byte identically into the caller's scratch allocator.
+    #[test]
+    fn prepare_typed_compresses_large_records_deterministically_and_round_trips() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Small record (< 4 KiB): untouched raw slice, identical key.
+        let small = b"BZCHKD07 small typed body";
+        let (small_key, small_enc) = super::prepare_typed_in(small, alloc).expect("prepare small");
+        assert!(!small_enc.is_compressed());
+        assert_eq!(small_enc.as_slice(), small);
+        assert_eq!(small_key, super::typed_key(small));
+
+        // Large compressible record (16 KiB): compressed into BZR1, deterministic, round-trips.
+        let mut large = blaze_own::Vec::with_capacity_in(16384, alloc);
+        large.extend_from_slice(b"BZCHKD07");
+        for i in 0..4094u32 {
+            let entry = ((i % 8) << 16) | ((i / 32) % 16);
+            large.extend_from_slice(&entry.to_le_bytes());
+        }
+        let (k1, enc1) = super::prepare_typed_in(large.as_slice(), alloc).expect("prepare 1");
+        let (k2, enc2) = super::prepare_typed_in(large.as_slice(), alloc).expect("prepare 2");
+        assert!(enc1.is_compressed(), "large structured typed record should compress");
+        assert_eq!(k1, k2, "prepared typed key must be deterministic");
+        assert_eq!(enc1.as_slice(), enc2.as_slice(), "prepared typed bytes must be deterministic");
+        assert!(enc1.as_slice().len() * 2 < large.len(), "expected >50% size reduction");
+        let dec = crate::store::record_codec::decode_if_envelope_in(
+            enc1.as_slice(),
+            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            alloc,
+        )
+        .expect("decode prepared typed record");
+        assert_eq!(dec.as_slice(), large.as_slice());
     }
 }

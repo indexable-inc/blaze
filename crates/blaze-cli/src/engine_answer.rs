@@ -2067,7 +2067,12 @@ fn save<'m, D: Driver, S: Sharing>(
         };
         let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, Some(&indexed_beside), alloc)?;
         let count = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
-        lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+        if !(rekeyed.whole.is_none()
+            && rekeyed.pages == 0
+            && lent.renew_root(reach_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live())
+        {
+            lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+        }
         // Retire any stale sharded reach roots left over if this answer previously exceeded the
         // radix threshold and shrank back to unsharded, so certified no-ops never renew them.
         unroot_reach_shards(lent, name, 0, true, frame);
@@ -2101,19 +2106,26 @@ fn save<'m, D: Driver, S: Sharing>(
     // Pure function of `key` (every entry is embedded in or content-addressed by the sealed
     // pointer): pinned under `BASES_KEPT_ROOT` and reused by cross-worktree `adopt_certified`.
     let base_direct_index = lent.index_beside(blaze_cas::Key(key.0), &base_direct).map_err(crate::store::PlaceError::from)?;
-    let mut direct = blaze_own::Vec::with_capacity_in(base_direct.len() + row_keys.len(), alloc);
-    if let Some(rest) = base_direct.get(1..) {
-        direct.extend_from_slice(rest);
-    }
-    // The member listing rows this request read or put (engine_bodies.rs `member_row_keys`,
-    // engine_member_rows.rs): named here so they live while the answer does, and the next
-    // command reads them by key instead of opening and listing each member again.
-    direct.extend(row_keys.iter().map(|key| blaze_cas::Key(key.0)));
     // Two roots, one commit: the pages' reach roots (one `{name}.reach` up to 256 pages, or
     // 256-page shards `{name}.reach.00`..`{name}.reach.ff` above that, where unchanged shards
     // renew in O(1)), and the answer's own index, which names this answer's root key: the next
     // commit's proof that the reach roots are this answer's ([`prove_last_reach`]).
-    let answer_index = lent.index(&direct).map_err(crate::store::PlaceError::from)?;
+    // When no extra member listing `row_keys` are attached (the common case on body-only `Ready`
+    // edits), `base_direct_index` already holds `encoded.root`, every tree key, `lines`, and
+    // every header shard, so `{name}.answer` reuses it directly without writing a second CAS index.
+    let answer_index = if row_keys.is_empty() {
+        base_direct_index
+    } else {
+        let mut direct = blaze_own::Vec::with_capacity_in(base_direct.len() + row_keys.len(), alloc);
+        if let Some(rest) = base_direct.get(1..) {
+            direct.extend_from_slice(rest);
+        }
+        // The member listing rows this request read or put (engine_bodies.rs `member_row_keys`,
+        // engine_member_rows.rs): named here so they live while the answer does, and the next
+        // command reads them by key instead of opening and listing each member again.
+        direct.extend(row_keys.iter().map(|key| blaze_cas::Key(key.0)));
+        lent.index(&direct).map_err(crate::store::PlaceError::from)?
+    };
     lent.root_through(answer_name.as_str(), &[answer_index], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     // This root accumulates indexes across commands. Unchanged pages' toolchain
     // payloads were admitted with the page and this renewal extends their lifetime.
@@ -2873,15 +2885,12 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     // (`alloc` reading `core`, `std` reading `alloc`, `ImplBucket` reading `CrateScope`, etc.)
     // see every toolchain cell's digest instead of `ABSENT`.
     tc_kept.answer.cells = blaze_engine::Answer::new_in(alloc).cells;
-    tc_kept.answer.readers = blaze_own::BTreeMap::new_in(alloc);
     for (&name, row) in tc_kept.answer.rows.iter() {
         for &(cell, digest) in row.defines.iter() {
             tc_kept.answer.cells.insert(blaze_engine::CellId { of: name, cell }, (digest, row.serial));
         }
-        for &(id, _) in row.reads.iter() {
-            tc_kept.answer.readers.entry(id).or_insert_with(|| blaze_own::BTreeSet::new_in(alloc)).insert(name);
-        }
     }
+    tc_kept.answer.readers = blaze_engine::engine::Readers::from_rows(&tc_kept.answer.rows, alloc);
     let mut tc_page_err: Option<CliError> = None;
     let encoded = pages::encode_par(&tc_kept, None, alloc, |jobs| {
         match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "toolchain base pages", jobs, alloc, None, |job, scratch| job.run_in(alloc, scratch)) {
@@ -4095,6 +4104,11 @@ mod reach_shard_tests {
         ).expect("save wt_a");
         assert!(matches!(saved.base, BaseKept::Kept { entries: 1 }), "saved base: {:?}", saved.base);
         lent.commit().expect("commit wt_a");
+        // Empty `row_keys` must reuse `beside_key(pointer_key)` for `{name}.answer` (zero redundant Index put).
+        let wt_a_answer = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", wt_a_root.as_str());
+        let expected_index = blaze_cas::plain::beside_key(blaze_cas::Key(saved.pointer_key.0));
+        let answer_bytes = held_root_bytes(&lent, wt_a_answer.as_str()).expect("read answer root").expect("answer root");
+        assert_eq!(answer_bytes, expected_index.0.0.as_slice(), "empty row_keys reuses base_direct_index");
 
         // Worktree B opens the workspace base from `BASES_ROOT` and recovers `BaseAux`.
         let loaded = open_base_for_tools(&cx, &mut store, &wt_b_dir, &tools, None, true, alloc, frame)

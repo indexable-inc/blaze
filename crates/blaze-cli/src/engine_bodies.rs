@@ -752,10 +752,53 @@ const HEADS_STRETCH_KEEP: usize = 8 << 20;
 
 /// Virtual address-space reservation for a Bodies worker's reusable dependency-head freeze
 /// scratch frame ([`LazyBodySeed`]'s `SeededHeads`), reset and trimmed back to
-/// [`FREEZE_SCRATCH_KEEP`] after every freeze call so cold dependency head freezes never churn
-/// the `Global` heap.
+/// [`WorkerFrameCaps::freeze_scratch_keep`] after every freeze call so cold dependency head freezes
+/// never churn the `Global` heap.
 const FREEZE_SCRATCH: usize = 256 << 20;
 const FREEZE_SCRATCH_KEEP: usize = 4 << 20;
+
+/// Baseline worker count where per-worker frame retention caps remain at full Mac working-set
+/// sizes (`18` cores = M3/M4 Max); past this count, per-worker caps scale inversely so 64–128 core
+/// machines stay within a fixed aggregate frame budget instead of pinning gigabytes of idle frames.
+const FRAME_CAP_BASE_WORKERS: usize = 18;
+const SCRATCH_KEEP_MIN: usize = 1 << 20;
+const STRETCH_KEEP_MIN: usize = 2 << 20;
+const HEADS_STRETCH_CAP_MIN: usize = 8 << 20;
+const HEADS_STRETCH_KEEP_MIN: usize = 1 << 20;
+const FREEZE_SCRATCH_KEEP_MIN: usize = 512 << 10;
+
+/// Scales a per-worker byte cap inversely with `workers`, preserving `base` up to
+/// [`FRAME_CAP_BASE_WORKERS`] cores and clamping at `min_cap` on very large core counts.
+const fn scaled_worker_cap(base: usize, min_cap: usize, workers: usize) -> usize {
+    let w = if workers == 0 { 1 } else { workers };
+    if w <= FRAME_CAP_BASE_WORKERS {
+        return base;
+    }
+    let scaled = base.saturating_mul(FRAME_CAP_BASE_WORKERS) / w;
+    if scaled < min_cap { min_cap } else { scaled }
+}
+
+/// Worker-count-scaled frame retention caps for Bodies stretches and scratch frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkerFrameCaps {
+    scratch_keep: usize,
+    stretch_keep: usize,
+    heads_stretch_cap: usize,
+    heads_stretch_keep: usize,
+    freeze_scratch_keep: usize,
+}
+
+impl WorkerFrameCaps {
+    const fn for_workers(workers: usize) -> Self {
+        Self {
+            scratch_keep: scaled_worker_cap(SCRATCH_KEEP, SCRATCH_KEEP_MIN, workers),
+            stretch_keep: scaled_worker_cap(STRETCH_KEEP, STRETCH_KEEP_MIN, workers),
+            heads_stretch_cap: scaled_worker_cap(HEADS_STRETCH_CAP, HEADS_STRETCH_CAP_MIN, workers),
+            heads_stretch_keep: scaled_worker_cap(HEADS_STRETCH_KEEP, HEADS_STRETCH_KEEP_MIN, workers),
+            freeze_scratch_keep: scaled_worker_cap(FREEZE_SCRATCH_KEEP, FREEZE_SCRATCH_KEEP_MIN, workers),
+        }
+    }
+}
 
 /// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
 /// stretch frame's most at a stretch's end, the stretch heads frame's most, and how many times a
@@ -7119,6 +7162,7 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
 ) {
     #[cfg(test)]
     crate::engine_check::stack_probe::at("run_bodies");
+    let caps = WorkerFrameCaps::for_workers(usize::try_from(cx.workers()).unwrap_or(1).max(1));
     let Ok(mut scratch) = Frame::with_reserve(BODY_SCRATCH, bstd::mem::Tag::Diagnostics) else {
         loop {
             if shared.board.stopping().is_some() {
@@ -7133,7 +7177,7 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
             worker.items.push(item);
         }
     };
-    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, FREEZE_SCRATCH_KEEP, bstd::mem::Tag::Infer) else {
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, caps.freeze_scratch_keep, bstd::mem::Tag::Infer) else {
         loop {
             if shared.board.stopping().is_some() {
                 return;
@@ -7201,8 +7245,8 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
             continue;
         };
         stretch.reset();
-        if stretch.committed() > STRETCH_KEEP {
-            stretch.trim(STRETCH_KEEP);
+        if stretch.committed() > caps.stretch_keep {
+            stretch.trim(caps.stretch_keep);
         }
         let mut driver = StretchDriver::Stealing {
             group: first.group,
@@ -7240,11 +7284,12 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
     run_out.notes.reserve_exact(run.len());
     // The bodies' scratch: one reservation a run, reset as each body ends (rule 11).
     // (Its own tag, as the stretch's below: the status's `memory by tag` line names each.)
+    let caps = WorkerFrameCaps::for_workers(usize::try_from(cx.workers()).unwrap_or(1).max(1));
     let Ok(mut scratch) = Frame::with_reserve(BODY_SCRATCH, bstd::mem::Tag::Diagnostics) else {
         refuse::<R>(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", None, out, ran, run_out, alloc);
         return;
     };
-    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, FREEZE_SCRATCH_KEEP, bstd::mem::Tag::Infer) else {
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, caps.freeze_scratch_keep, bstd::mem::Tag::Infer) else {
         refuse::<R>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, out, ran, run_out, alloc);
         return;
     };
@@ -7263,8 +7308,8 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
             return;
         }
         stretch.reset();
-        if stretch.committed() > STRETCH_KEEP {
-            stretch.trim(STRETCH_KEEP);
+        if stretch.committed() > caps.stretch_keep {
+            stretch.trim(caps.stretch_keep);
         }
         let mut driver = StretchDriver::Fixed { run: rest, at: 0, out, ran, run_out };
         let took = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
@@ -7805,11 +7850,12 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
         lang_ns: ns_between(set_heads, set_lang),
         owners_ns: ns_between(set_lang, set_done),
     });
+    let caps = WorkerFrameCaps::for_workers(usize::try_from(cx.workers()).unwrap_or(1).max(1));
     let mut stretch_store = if body_frame.heads.is_some() && driver.wants_stretch_store(group.bodies) {
         match StretchStore::new(StretchStoreOpts {
             reserve: HEADS_STRETCH_FRAME,
-            cap: HEADS_STRETCH_CAP,
-            keep: HEADS_STRETCH_KEEP,
+            cap: caps.heads_stretch_cap,
+            keep: caps.heads_stretch_keep,
             alloc: g,
         }) {
             Ok(store) => Some(store),
@@ -7830,13 +7876,13 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
         taken += 1;
         // The body's scratch starts empty (rule 11): the last body's findings and words were
         // copied out as it ended. Kept only under the plant (the answers must not change).
-        run_out.frames.scratch_committed_most = run_out.frames.scratch_committed_most.max(scratch.committed() as u64);
+        run_out.frames.scratch_committed_most = run_out.frames.scratch_committed_most.max(u64::try_from(scratch.committed()).unwrap_or(u64::MAX));
         if !shared.keep_scratch {
             scratch.reset();
-            // A reset keeps every block the last body grew it to: past `SCRATCH_KEEP` they go
+            // A reset keeps every block the last body grew it to: past `caps.scratch_keep` they go
             // back now, so a large body's high-water is not held through the run's rest.
-            if scratch.committed() > SCRATCH_KEEP {
-                scratch.trim(SCRATCH_KEEP);
+            if scratch.committed() > caps.scratch_keep {
+                scratch.trim(caps.scratch_keep);
                 run_out.frames.scratch_trims += 1;
             }
         }
@@ -8552,12 +8598,23 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
             run_out.untyped_clean = run_out.untyped_clean.saturating_add(result.untyped_clean);
             run_out.typed.reserve(result.typed.len());
             for &(check, bytes) in result.typed.iter() {
-                let key = crate::engine_body_record::typed_key(bytes);
+                let (key, kept) = match crate::engine_body_record::prepare_typed_in(bytes, at_phase) {
+                    Ok((key, crate::store::record_codec::Encoded::Compressed(kept))) => (key, kept),
+                    Ok((key, crate::store::record_codec::Encoded::Raw(raw))) => {
+                        let mut kept = SVec::with_capacity_in(raw.len(), at_phase);
+                        kept.extend_from_slice(raw);
+                        (key, kept)
+                    }
+                    Err(_) => {
+                        let key = crate::engine_body_record::typed_key(bytes);
+                        let mut kept = SVec::with_capacity_in(bytes.len(), at_phase);
+                        kept.extend_from_slice(bytes);
+                        (key, kept)
+                    }
+                };
                 if check == name {
                     entry_typed = Some(key);
                 }
-                let mut kept = SVec::with_capacity_in(bytes.len(), at_phase);
-                kept.extend_from_slice(bytes);
                 run_out.typed.push(TypedPut { check, key, bytes: kept });
             }
         }
@@ -9081,4 +9138,35 @@ fn add_work(into: &mut WorkBytes, more: &WorkBytes) {
     into.said += more.said;
     into.verdict = into.verdict.max(more.verdict);
     into.goal_hits += more.goal_hits;
+}
+
+#[cfg(test)]
+mod worker_frame_caps_tests {
+    use super::*;
+
+    #[test]
+    fn worker_frame_caps_scale_inversely_for_128_cores_and_preserve_mac_caps() {
+        for w in [0usize, 1, 8, 12, 18] {
+            let caps = WorkerFrameCaps::for_workers(w);
+            assert_eq!(caps.scratch_keep, SCRATCH_KEEP);
+            assert_eq!(caps.stretch_keep, STRETCH_KEEP);
+            assert_eq!(caps.heads_stretch_cap, HEADS_STRETCH_CAP);
+            assert_eq!(caps.heads_stretch_keep, HEADS_STRETCH_KEEP);
+            assert_eq!(caps.freeze_scratch_keep, FREEZE_SCRATCH_KEEP);
+        }
+        let c64 = WorkerFrameCaps::for_workers(64);
+        assert!(c64.scratch_keep < SCRATCH_KEEP && c64.scratch_keep >= SCRATCH_KEEP_MIN);
+        assert!(c64.heads_stretch_cap < HEADS_STRETCH_CAP && c64.heads_stretch_cap >= HEADS_STRETCH_CAP_MIN);
+
+        let c128 = WorkerFrameCaps::for_workers(128);
+        assert!(c128.scratch_keep <= c64.scratch_keep && c128.scratch_keep >= SCRATCH_KEEP_MIN);
+        assert!(c128.stretch_keep <= c64.stretch_keep && c128.stretch_keep >= STRETCH_KEEP_MIN);
+        assert!(c128.heads_stretch_cap <= c64.heads_stretch_cap && c128.heads_stretch_cap >= HEADS_STRETCH_CAP_MIN);
+        assert!(c128.heads_stretch_keep <= c64.heads_stretch_keep && c128.heads_stretch_keep >= HEADS_STRETCH_KEEP_MIN);
+        assert!(c128.freeze_scratch_keep <= c64.freeze_scratch_keep && c128.freeze_scratch_keep >= FREEZE_SCRATCH_KEEP_MIN);
+        // Aggregate idle keep across 128 workers stays well under 1 GiB (vs 4.6 GiB unscaled).
+        let idle_total_128 = 128usize
+            .saturating_mul(c128.scratch_keep + c128.stretch_keep + c128.heads_stretch_keep + c128.freeze_scratch_keep);
+        assert!(idle_total_128 <= 700 << 20, "128-core aggregate idle keep should stay <= 700 MiB, got {idle_total_128}");
+    }
 }

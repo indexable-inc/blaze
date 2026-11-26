@@ -979,3 +979,331 @@ fn compaction_conflict_refreshes_manifest_in_place_without_reopen() {
         assert_eq!(got.bytes, value(n).as_slice());
     }
 }
+
+/// The invariant (rules 26, 43):
+/// 1. Under [`CommitDurability::Full`] (`durable: true`), foreground phase commits order every
+///    segment and manifest log via [`Effect::Barrier`] (`F_BARRIERFSYNC` on macOS, `fdatasync` on
+///    Linux) instead of per-segment/per-log `Effect::Sync` (`F_FULLFSYNC`), flushing all prior
+///    barriers together in `Effect::SyncDir` — cutting `F_FULLFSYNC` count while surviving power
+///    cuts and process deaths at every completion step.
+/// 2. Under [`CommitDurability::Barrier`], foreground commits emit ONLY `Effect::Barrier` before
+///    writing the head slot (zero `Effect::Sync` / `Effect::SyncDir`), and after any power cut on
+///    a new boot never serve torn or corrupt bytes; the next request converges byte-for-byte.
+/// 3. Planted-bug control (`Plant::SkipDataSync`): removing the segment `Effect::Barrier` is
+///    caught by the crash oracle under `Sim::crash()`.
+#[test]
+fn barrier_ordered_commits_cut_full_syncs_and_survive_power_cuts_at_every_step() {
+    use blaze_sim::Config;
+    use super::core::CommitDurability;
+
+    // 1. Verify Full durability uses `Effect::Barrier` (not `Effect::Sync`) on segments & logs.
+    let fresh = {
+        let root = test_root();
+        let lent = process(Sim::new(161, Faults::default()), 1, &root);
+        command(&lent, false).expect("fresh full-durable command");
+        let tally = lent.put_tally();
+        assert!(
+            tally.disk.barriers >= 6,
+            "expected >= 6 barriers (3 segments + 3 manifest logs), got {}",
+            tally.disk.barriers
+        );
+        assert_eq!(
+            tally.disk.syncs, 0,
+            "segments/logs must use Effect::Barrier instead of Effect::Sync (got {} syncs)",
+            tally.disk.syncs
+        );
+        let after = process(lent.into_store().into_driver(), 2, &root);
+        read(&after).expect("fresh read")
+    };
+    assert_eq!(broken(&fresh, true), None);
+
+    // 2. Planted-bug control on Full durability: `Plant::SkipDataSync` omits segment barriers
+    //    and MUST be caught by power-cut crash recovery!
+    let mut skip_barrier_caught = false;
+    for seed in 0..32u64 {
+        let root = test_root();
+        let mut w = Driven::planted(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(1, &root), &root, Plant::SkipDataSync).expect("open");
+        for n in 0..8u32 {
+            w.put(record(600_000 + n), Namespace::LOCAL, TAG, &value(600_000 + n)).expect("put");
+        }
+        w.commit_with(&[]).expect("planted commit");
+        let mut sim = w.into_driver();
+        sim.crash();
+        let mut r = Driven::with(sim, Path::new("/sim"), cfg(2, &root), &root).expect("reopen");
+        for n in 0..8u32 {
+            let k = record(600_000 + n);
+            match r.get(&k) {
+                Ok(Some(got)) if r.got(got).bytes == value(600_000 + n).as_slice() => {}
+                _ => {
+                    skip_barrier_caught = true;
+                    break;
+                }
+            }
+        }
+        if skip_barrier_caught {
+            break;
+        }
+    }
+    assert!(skip_barrier_caught, "oracle must catch Plant::SkipDataSync (omitted segment Effect::Barrier)");
+
+    // 3. Randomized DST for `CommitDurability::Barrier` (pure F_BARRIERFSYNC, zero F_FULLFSYNC).
+    blaze_sim::check(Config::cases(48), |tape| {
+        let seed = tape.next_u64("sim seed");
+        let cut_at = u32::try_from(tape.int_in(0..=96, "cut completion")).unwrap_or(0);
+        let power = tape.coin("power cut");
+        let root = test_root();
+        let mut base_cfg = cfg(1, &root);
+        base_cfg.durable = false;
+        let mut driven = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), base_cfg, &root).expect("open");
+        driven.set_commit_durability(CommitDurability::Barrier);
+        let lent = Lent::new(driven, &root);
+        lent.cut(Some(Cut::After(cut_at)));
+        let _reached = command(&lent, false).is_ok();
+        let tally = lent.put_tally();
+        assert_eq!(tally.disk.syncs, 0, "Barrier mode must issue zero Effect::Sync");
+        let mut sim = lent.into_store().into_driver();
+        let next_boot = if power {
+            sim.crash();
+            2
+        } else {
+            sim.processes_died();
+            1
+        };
+        let mut reopen_cfg = cfg(2, &root);
+        reopen_cfg.boot = next_boot;
+        reopen_cfg.durable = false;
+        let mut after_driven = Driven::with(sim, Path::new("/sim"), reopen_cfg, &root).expect("reopen after barrier crash");
+        after_driven.set_commit_durability(CommitDurability::Barrier);
+        let after = Lent::new(after_driven, &root);
+        // Every readable record must match its exact put bytes (never torn/corrupt).
+        let (records, pointed, answer_read) = read(&after).expect("reads after barrier crash");
+        for (got, n) in records.iter().zip(PHASES.iter().flat_map(|p| p.clone())) {
+            if let Some(bytes) = got {
+                assert_eq!(bytes.as_slice(), value(n).as_slice(), "torn record {n} after barrier crash");
+            }
+        }
+        if let Some(ans_key) = pointed {
+            assert_eq!(ans_key, answer().0, "pointer must name the real answer key");
+            if let Some(ans_bytes) = answer_read {
+                assert_eq!(ans_bytes.as_slice(), answer().1.as_slice(), "torn answer record after barrier crash");
+            }
+        }
+        // Next request converges byte-for-byte to a fresh build.
+        command(&after, false).expect("next request after barrier crash");
+        let converged = read(&after).expect("converged read");
+        assert_eq!(converged, fresh, "next request after barrier crash must match fresh build");
+    });
+}
+
+/// Simulated [`PidCheck`] backed by an explicit slice of alive PIDs (rules 14, 75).
+struct SimPidCheck<'a> {
+    alive: &'a [u32],
+    unknown: &'a [u32],
+}
+
+impl super::core::PidCheck for SimPidCheck<'_> {
+    fn check_pid(&self, pid: u32) -> super::core::PidLiveness {
+        if self.alive.contains(&pid) {
+            super::core::PidLiveness::Alive
+        } else if self.unknown.contains(&pid) {
+            super::core::PidLiveness::Unknown
+        } else {
+            super::core::PidLiveness::Dead
+        }
+    }
+}
+
+/// The invariant (rules 43, 53, 75): same-boot dead-PID lease reclamation MUST:
+/// (a) NEVER reap a live process's lease before `LEASE_NS` (control: `Plant::ReapLivePid`),
+/// (b) IMMEDIATELY reclaim a provably dead same-boot process's lease so retired segments past
+///     `GRACE_NS` unlink without waiting 30-min `LEASE_NS` (control: `Plant::IgnoreDeadPid`),
+/// (c) NEVER reap a different-boot or unknown-PID (`pid == 0`) lease before `LEASE_NS`
+///     (control: `Plant::ReapOtherBootPid`),
+/// (d) ALWAYS preserve every live rooted record byte-for-byte.
+#[test]
+fn dead_pid_same_boot_lease_reclamation_dst() {
+    use core::time::Duration;
+    use blaze_sim::Config;
+    use super::core::{GRACE_NS, LEASE_NS, ROOT_LIFE_NS};
+
+    const DEAD_PID: u32 = 10_001;
+    const LIVE_PID: u32 = 10_002;
+    const OTHER_BOOT_PID: u32 = 10_003;
+    const UNKNOWN_STATE_PID: u32 = 10_004;
+
+    struct Outcome {
+        dead_retired_ready: u32,
+        dead_removed: u32,
+        dead_reclaimed_count: u32,
+        live_lease_kept: bool,
+        other_boot_lease_kept: bool,
+        unknown_pid_zero_kept: bool,
+        unknown_liveness_kept: bool,
+        all_expired_after_lease_ns: bool,
+    }
+
+    let run = |seed: u64, gc_boot: u64, plant: Plant| -> Outcome {
+        let root = test_root();
+        let sim = Sim::new(seed, Faults::default());
+
+        let boot_reached = |nonce_id: u64, boot: u64| {
+            let mut c = reached_cfg(nonce_id, &root);
+            c.boot = boot;
+            c
+        };
+
+        // 1. Live rooted record (must always survive).
+        let rooted_k = record(700_001);
+        let sim = {
+            let mut w = Driven::with(sim, Path::new("/sim"), boot_reached(1, gc_boot), &root).expect("root writer");
+            w.set_pid(20_001);
+            w.put(rooted_k, Namespace::LOCAL, TAG, &value(700_001)).expect("put rooted");
+            w.root_for("live.root", &[rooted_k], ROOT_LIFE_NS).expect("root");
+            w.release_lease();
+            w.commit_with(&[]).expect("root commit");
+            w.into_driver()
+        };
+
+        // 2. Dead same-boot process (`DEAD_PID` on `gc_boot`): commits 6 tier-0 segments and dies
+        //    holding a lease (would pin retired segments for 30 min without dead-PID reclamation).
+        let sim = {
+            let mut dead = Driven::with(sim, Path::new("/sim"), boot_reached(2, gc_boot), &root).expect("dead writer");
+            dead.set_pid(DEAD_PID);
+            for i in 0..6u32 {
+                let n = 700_100 + i;
+                dead.put(record(n), Namespace::LOCAL, TAG, &value(n)).expect("dead put");
+                dead.commit_with(&[]).expect("dead commit");
+            }
+            let mut s = dead.into_driver();
+            s.processes_died();
+            s
+        };
+
+        // Merge those 6 tier-0 segments into 1 segment, retiring the 6 originals.
+        let sim = {
+            let mut comp = Driven::with(sim, Path::new("/sim"), boot_reached(3, gc_boot), &root).expect("comp open");
+            comp.set_pid(20_002);
+            let ran = comp.compact_foreground(4).expect("merge tier 0");
+            assert!(ran.iter().any(|s| s.segments >= 5 && !s.aborted), "tier-0 merge must retire originals");
+            comp.into_driver()
+        };
+
+        // Advance past GRACE_NS (still 29 minutes BEFORE LEASE_NS!).
+        let mut sim = sim;
+        sim.advance(Duration::from_nanos(GRACE_NS + 1_000_000_000));
+
+        // 3. Open 4 additional non-dead-reclaimable lease holders AFTER the retirement grace
+        //    (so they don't protect the earlier retired files, letting us verify BOTH retired-file
+        //    unlinking for DEAD_PID AND exact lease retention for live/other-boot/unknown leases).
+        let live_holder_nonce = reached_cfg(4, &root).nonce;
+        let other_boot_nonce = reached_cfg(5, &root).nonce;
+        let zero_pid_nonce = reached_cfg(6, &root).nonce;
+        let unknown_state_nonce = reached_cfg(7, &root).nonce;
+
+        let sim = {
+            let mut live_p = Driven::with(sim, Path::new("/sim"), boot_reached(4, gc_boot), &root).expect("live p");
+            live_p.set_pid(LIVE_PID);
+            live_p.put(record(700_201), Namespace::LOCAL, TAG, &value(700_201)).expect("live put");
+            live_p.commit_with(&[]).expect("live commit");
+            live_p.into_driver()
+        };
+        let sim = {
+            let mut other_b = Driven::with(sim, Path::new("/sim"), boot_reached(5, gc_boot + 1), &root).expect("other boot");
+            other_b.set_pid(OTHER_BOOT_PID);
+            other_b.put(record(700_202), Namespace::LOCAL, TAG, &value(700_202)).expect("other boot put");
+            other_b.commit_with(&[]).expect("other boot commit");
+            other_b.into_driver()
+        };
+        let sim = {
+            let mut zero_p = Driven::with(sim, Path::new("/sim"), boot_reached(6, gc_boot), &root).expect("zero pid");
+            // pid left at 0 (unknown PID).
+            zero_p.put(record(700_203), Namespace::LOCAL, TAG, &value(700_203)).expect("zero pid put");
+            zero_p.commit_with(&[]).expect("zero pid commit");
+            zero_p.into_driver()
+        };
+        let sim = {
+            let mut unk_p = Driven::with(sim, Path::new("/sim"), boot_reached(7, gc_boot), &root).expect("unk state");
+            unk_p.set_pid(UNKNOWN_STATE_PID);
+            unk_p.put(record(700_204), Namespace::LOCAL, TAG, &value(700_204)).expect("unk state put");
+            unk_p.commit_with(&[]).expect("unk state commit");
+            unk_p.into_driver()
+        };
+
+        // 4. Run GC on `gc_boot` with injected `SimPidCheck`:
+        //    `LIVE_PID` is Alive, `UNKNOWN_STATE_PID` is Unknown, `DEAD_PID` and `OTHER_BOOT_PID` are Dead.
+        let check = SimPidCheck { alive: &[LIVE_PID], unknown: &[UNKNOWN_STATE_PID] };
+        let (dead_retired_ready, dead_removed, dead_reclaimed_count, live_lease_kept, other_boot_lease_kept, unknown_pid_zero_kept, unknown_liveness_kept, mut sim) = {
+            let mut gc = Driven::planted(sim, Path::new("/sim"), boot_reached(8, gc_boot), &root, plant).expect("gc open");
+            gc.set_pid(20_008);
+            let reclaimed_count = gc.reclaim_dead_leases(&check);
+            let plan = gc.plan_gc().expect("plan_gc after dead-PID reclaim");
+            let ran = gc.compact_foreground(4).expect("gc compact after dead-PID reclaim");
+            let removed: u32 = ran.iter().map(|s| s.removed).sum();
+            let leases = gc.core().leases();
+            let has = |holder: u64| leases.iter().any(|(h, _)| *h == holder);
+            (
+                plan.retired_ready,
+                removed,
+                reclaimed_count,
+                has(live_holder_nonce),
+                has(other_boot_nonce),
+                has(zero_pid_nonce),
+                has(unknown_state_nonce),
+                gc.into_driver(),
+            )
+        };
+
+        // 5. Advance past LEASE_NS: remaining leases expire normally by wall clock.
+        sim.advance(Duration::from_nanos(LEASE_NS + 1_000_000_000));
+        let all_expired_after_lease_ns = {
+            let mut gc2 = Driven::with(sim, Path::new("/sim"), boot_reached(9, gc_boot), &root).expect("gc2 open");
+            let _ = gc2.compact_foreground(4).expect("post-expiry compact");
+            // Live rooted record MUST still read back byte-for-byte intact.
+            let got = gc2.get(&rooted_k).expect("get rooted").expect("rooted record must survive");
+            assert_eq!(gc2.got(got).bytes, value(700_001).as_slice());
+            gc2.core().leases_len() == 0
+        };
+
+        Outcome {
+            dead_retired_ready,
+            dead_removed,
+            dead_reclaimed_count,
+            live_lease_kept,
+            other_boot_lease_kept,
+            unknown_pid_zero_kept,
+            unknown_liveness_kept,
+            all_expired_after_lease_ns,
+        }
+    };
+
+    // Randomized simulation across seeds and boot tokens.
+    blaze_sim::check(Config::cases(16), |tape| {
+        let seed = tape.next_u64("sim seed");
+        let gc_boot = tape.int_in(1..=100, "gc boot");
+        let out = run(seed, gc_boot, Plant::None);
+        assert_eq!(out.dead_reclaimed_count, 1, "only the single dead same-boot PID lease must be reclaimed");
+        assert!(out.dead_retired_ready >= 5, "dead same-boot lease must unblock retired files immediately (got {})", out.dead_retired_ready);
+        assert!(out.dead_removed >= 5, "GC must immediately unlink retired files after dead-PID reclaim (got {})", out.dead_removed);
+        assert!(out.live_lease_kept, "live same-boot PID lease must NEVER be reaped early");
+        assert!(out.other_boot_lease_kept, "different-boot lease must NEVER be reaped early");
+        assert!(out.unknown_pid_zero_kept, "unknown-PID (pid=0) lease must NEVER be reaped early");
+        assert!(out.unknown_liveness_kept, "Unknown-liveness PID lease must NEVER be reaped early");
+        assert!(out.all_expired_after_lease_ns, "all leases must expire cleanly once LEASE_NS passes");
+    });
+
+    // Planted-bug control 1: `Plant::IgnoreDeadPid` keeps retired segments pinned for 30 min.
+    let ignored = run(201, 1, Plant::IgnoreDeadPid);
+    assert_eq!(
+        (ignored.dead_reclaimed_count, ignored.dead_retired_ready, ignored.dead_removed),
+        (0, 0, 0),
+        "oracle must catch Plant::IgnoreDeadPid pinning retired segments"
+    );
+
+    // Planted-bug control 2: `Plant::ReapLivePid` falsely reaps the live PID's lease.
+    let reaped_live = run(202, 1, Plant::ReapLivePid);
+    assert!(!reaped_live.live_lease_kept, "oracle must catch Plant::ReapLivePid reaping a live process's lease");
+
+    // Planted-bug control 3: `Plant::ReapOtherBootPid` falsely reaps a different boot's lease.
+    let reaped_boot = run(203, 1, Plant::ReapOtherBootPid);
+    assert!(!reaped_boot.other_boot_lease_kept, "oracle must catch Plant::ReapOtherBootPid reaping another boot's lease");
+}

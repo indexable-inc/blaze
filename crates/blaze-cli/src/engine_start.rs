@@ -702,16 +702,16 @@ fn build_page_reuse_oracle<'a, 'm>(
     store: &mut dyn crate::store::Store<'m>,
     prev_root_id: ContentId,
     curr_root_id: ContentId,
-    scratch: blaze_own::SharedAlloc<'_>,
+    scratch: blaze_own::SharedAlloc<'static>,
     alloc: Alloc<'a>,
-) -> Result<Option<PageReuseOracle<'a>>, CliError> {
+) -> Result<(Option<PageReuseOracle<'a>>, Option<blaze_engine::pages::Root<'static>>), CliError> {
     if prev_root_id == curr_root_id {
-        return Ok(None);
+        return Ok((None, None));
     }
-    let Some(prev) = decode_root_from_store(cx, store, Key(prev_root_id), scratch)? else { return Ok(None) };
-    let Some(curr) = decode_root_from_store(cx, store, Key(curr_root_id), scratch)? else { return Ok(None) };
+    let Some(prev) = decode_root_from_store(cx, store, Key(prev_root_id), scratch)? else { return Ok((None, None)) };
+    let Some(curr) = decode_root_from_store(cx, store, Key(curr_root_id), scratch)? else { return Ok((None, None)) };
     if prev.bits != curr.bits {
-        return Ok(None);
+        return Ok((None, Some(curr)));
     }
     let ug_page_u32 = blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), curr.bits);
     let ug_page = usize::try_from(ug_page_u32).unwrap_or(usize::MAX);
@@ -723,10 +723,11 @@ fn build_page_reuse_oracle<'a, 'm>(
         } else {
             false
         };
-        return Ok(PageReuseOracle::from_flat_roots(&prev, &curr, ug_unchanged, alloc));
+        let oracle = PageReuseOracle::from_flat_roots(&prev, &curr, ug_unchanged, alloc);
+        return Ok((oracle, Some(curr)));
     }
     if prev.page_shards.len() != curr.page_shards.len() {
-        return Ok(None);
+        return Ok((None, Some(curr)));
     }
     let words = curr.page_count().div_ceil(64).max(1);
     let mut changed_pages = blaze_own::Vec::with_capacity_in(words, alloc);
@@ -739,12 +740,12 @@ fn build_page_reuse_oracle<'a, 'm>(
         if prev_sk == curr_sk {
             continue;
         }
-        let Ok(shard_u32) = u32::try_from(shard_idx) else { return Ok(None) };
+        let Ok(shard_u32) = u32::try_from(shard_idx) else { return Ok((None, Some(curr))) };
         let prev_shard = if prev_sk == Key::default() {
             None
         } else {
             let Some(decoded) = decode_shard_from_store(cx, store, prev_sk, shard_u32, curr.bits, scratch)? else {
-                return Ok(None);
+                return Ok((None, Some(curr)));
             };
             Some(decoded)
         };
@@ -752,7 +753,7 @@ fn build_page_reuse_oracle<'a, 'm>(
             None
         } else {
             let Some(decoded) = decode_shard_from_store(cx, store, curr_sk, shard_u32, curr.bits, scratch)? else {
-                return Ok(None);
+                return Ok((None, Some(curr)));
             };
             Some(decoded)
         };
@@ -772,10 +773,10 @@ fn build_page_reuse_oracle<'a, 'm>(
     if PageReuseOracle::is_page_changed(changed_pages.as_slice(), ug_page)
         && !unit_graph_row_unchanged(cx, store, prev_ug_key, curr_ug_key, ug_page_u32, curr.bits)?
     {
-        return Ok(None);
+        return Ok((None, Some(curr)));
     }
     let skipped_changed = PageReuseOracle::collect_skipped_diff(&prev, &curr, alloc);
-    Ok(Some(PageReuseOracle { bits: curr.bits, changed_pages, skipped_changed }))
+    Ok((Some(PageReuseOracle { bits: curr.bits, changed_pages, skipped_changed }), Some(curr)))
 }
 
 /// The body ids of the answer at its root (run_ids.rs): one get when a start under this root
@@ -789,6 +790,20 @@ fn build_page_reuse_oracle<'a, 'm>(
 pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     cx: &Cx, standing: &mut Standing<'r, 'm>, list: &blaze_world::crate_list::CrateList<'_>, asked: &'a crate::run_ids::Asked, bump: blaze_own::Bump<'a>,
 ) -> Result<RunIds<'a>, CliError> {
+    let (ids, _) = body_ids_with_root(cx, standing, list, asked, bump)?;
+    Ok(ids)
+}
+
+/// Like [`body_ids`], also returning the decoded current engine [`blaze_engine::pages::Root`]
+/// when the delta fast path decoded it, so `run_tests_status` reuses it without decoding
+/// `standing.root` a second time (rule 77).
+fn body_ids_with_root<'a, 'r: 'a, 'm: 'a>(
+    cx: &Cx,
+    standing: &mut Standing<'r, 'm>,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    asked: &'a crate::run_ids::Asked,
+    bump: blaze_own::Bump<'a>,
+) -> Result<(RunIds<'a>, Option<blaze_engine::pages::Root<'static>>), CliError> {
     let alloc = bump.alloc();
     let frame = standing.frame;
     let refused = |error: RunIdsError<'_>| CliError::Start(StartError::BodyIds { shown: bstd::mem::format_in!(frame, "{error}").as_str().into() });
@@ -810,7 +825,7 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     let reading = |ids: RunIds<'a>| ids.reading::<crate::run_ids::Production>(from).map_err(|why| refused(RunIdsError::Unread(why)));
     if let Some(ids) = RunIds::from_record(cx, &mut *standing.store, cert, toolchain, &tools, bump).map_err(refused)? {
         save_anchors(standing.root, table_cas_key);
-        return reading(ids);
+        return Ok((reading(ids)?, None));
     }
     // Each active member unit's root and view: the walk asks each unit's row of a body at its view (D191).
     let scoped = crate::engine_check::ScopedUnits::of(standing.scope, list, standing.heap.alloc());
@@ -821,6 +836,7 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     // workspace anchor (so a fresh worktree adopting a shared base hits delta `BZRI` on its first
     // edit). Diff `prev_root` vs `curr_root` pages and copy all standing crates/files/checks
     // directly from `prev_ids` without opening their records.
+    let mut cached_curr_root: Option<blaze_engine::pages::Root<'static>> = None;
     let prior_anchor = load_last_body_ids(lent, &last_ptr)
         .or_else(|| ws_ptr.as_ref().and_then(|ptr| load_last_body_ids(lent, ptr)));
     if let Some((prev_root_id, prev_bytes)) = prior_anchor {
@@ -829,7 +845,8 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
         if let Ok(prev_ids) = RunIds::read(prev_bytes, prev_bump)
             && prev_ids.matches_build(toolchain, &tools)
         {
-            let oracle = build_page_reuse_oracle(cx, &mut *standing.store, prev_root_id, standing.root, standing.heap.shared(), alloc)?;
+            let (oracle, decoded_curr) = build_page_reuse_oracle(cx, &mut *standing.store, prev_root_id, standing.root, standing.heap.shared(), alloc)?;
+            cached_curr_root = decoded_curr;
             if let Some(oracle) = oracle {
                 let mut answer = standing.answer();
                 let walk = crate::run_ids::workspace_of_delta(cx, &mut answer, body_tool, &units, walk_from, &prev_ids, &oracle, alloc).map_err(refused)?;
@@ -837,7 +854,7 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
                 drop(answer);
                 ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
                 save_anchors(standing.root, table_cas_key);
-                return reading(ids);
+                return Ok((reading(ids)?, cached_curr_root));
             }
         }
     }
@@ -847,7 +864,177 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     drop(answer);
     ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
     save_anchors(standing.root, table_cas_key);
-    reading(ids)
+    Ok((reading(ids)?, cached_curr_root))
+}
+
+/// CAS memo domain for pure-Rust (`send: None`) native image results keyed by exact closure
+/// `CrateScope` and `Script` record keys (rules 21, 77). Eliminates reading ~24 `CrateScope`
+/// records (~29 MB) and mapping toolchain segments (~137 MB) on every incremental `blaze test`
+/// / `blaze run` body edit when no crate's link table or build script changed.
+const NATIVE_EMPTY_MEMO_DOMAIN: &str = "blaze-cli engine native empty memo 1";
+
+/// Deterministic memo key covering every input to [`crate::engine_native::image_for`] for a
+/// program or test unit without reading any `CrateScope` or `Script` record payload (rule 21).
+fn native_empty_memo_key(
+    platform: blaze_ladder::native_links::Platform,
+    producer: &blaze_ids::producer::ProducerId<blaze_ids::producer::Whole>,
+    sdk: Option<blaze_apple_sdk::SdkId>,
+    program_root: &str,
+    crates: &[(blaze_id::CrateItemKey, &str, Key, Option<(blaze_drive::Name, Key, ContentId)>)],
+) -> blaze_cas::Key {
+    let mut h = blaze_ids::Hasher::new(NATIVE_EMPTY_MEMO_DOMAIN);
+    let platform_byte: u8 = match platform {
+        blaze_ladder::native_links::Platform::MacosArm64 => 0,
+        blaze_ladder::native_links::Platform::LinuxArm64 => 1,
+    };
+    h.update(&[platform_byte]).id(producer.id());
+    match sdk {
+        None => {
+            h.update(&[0]);
+        }
+        Some(id) => {
+            h.update(&[1]).update(&id.key());
+        }
+    }
+    h.part(program_root.as_bytes());
+    h.update(&u64::try_from(crates.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for &(key, name, scope_at, script) in crates {
+        h.id(&key.0).part(name.as_bytes()).id(&scope_at.0);
+        match script {
+            None => {
+                h.update(&[0]);
+            }
+            Some((script_name, run_at, run_out)) => {
+                h.update(&[1])
+                    .part(script_name.kind.name().as_bytes())
+                    .id(&script_name.subject)
+                    .id(&run_at.0)
+                    .id(&run_out);
+            }
+        }
+    }
+    blaze_cas::Key(h.finish())
+}
+
+fn load_native_empty_memo<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    memo_key: &blaze_cas::Key,
+    require_record: bool,
+) -> Option<Key> {
+    let lend = lent.get(memo_key).ok()??;
+    if lend.tag != blaze_keyed::kind::ReservedTag::Drive.tag() {
+        return None;
+    }
+    let arr: [u8; 32] = lend.bytes.try_into().ok()?;
+    let image_key = Key(ContentId(arr));
+    if require_record && lent.get(&blaze_cas::Key(image_key.0)).ok().flatten().is_none() {
+        return None;
+    }
+    Some(image_key)
+}
+
+fn save_native_empty_memo<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    memo_key: &blaze_cas::Key,
+    image_key: Key,
+) {
+    let _ = lent.put(
+        memo_key,
+        blaze_cas::plain::Namespace::LOCAL,
+        blaze_keyed::kind::ReservedTag::Drive.tag(),
+        &image_key.0.0,
+    );
+}
+
+fn script_has_deferred_c<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    script_at: Key,
+) -> bool {
+    let Ok(Some(lend)) = lent.get(&blaze_cas::Key(script_at.0)) else {
+        return true;
+    };
+    let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(lend.bytes) else {
+        return true;
+    };
+    let Some((_, record)) = crate::scripts::payload_parts(view.payload) else {
+        return true;
+    };
+    let Ok(outputs) = blaze_build_script::outputs::OutputsRef::open(record) else {
+        return true;
+    };
+    outputs.c_requests().next().is_some()
+}
+
+/// Memoized wrapper around [`crate::engine_native::image_for`] for pure-Rust programs and test
+/// suites (`send: None`): hits in O(closure) using only `list` and `standing.names` (zero
+/// `CrateScope` or `Script` store reads, zero segment mmaps). Any native-code suite (`send: Some`)
+/// or missing input falls through directly to `engine_native::image_for`.
+fn native_image_for_cached<'r>(
+    cx: &Cx,
+    standing: &mut Standing<'r, '_>,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    closure: &[crate::engine_seeds::CrateAt],
+    require_record: bool,
+    watch: &dyn blaze_screen::Watch,
+    frame: &bstd::mem::Frame,
+) -> Result<crate::engine_native::ProgramImage<'r>, crate::engine_native::NativeError<'r>> {
+    use blaze_world::crate_list::CrateGraph as _;
+
+    let memo_info = (|| -> Option<(blaze_cas::Key, blaze_own::Vec<Key, &bstd::mem::Frame>)> {
+        let platform = crate::native_image::platform()?;
+        let sdk = match (platform, standing.place.sdk) {
+            (blaze_ladder::native_links::Platform::MacosArm64, Ok(sdk)) => Some(sdk.identity()),
+            (blaze_ladder::native_links::Platform::MacosArm64, Err(_)) => return None,
+            (blaze_ladder::native_links::Platform::LinuxArm64, _) => None,
+        };
+        let first = closure.first()?;
+        let root = (0..list.len()).find(|&r| list.key(r) == first.key)?;
+        let program_root = list.root(root).strip_prefix("/0/")?;
+        if !crate::native_image::linked(list, root) {
+            return None;
+        }
+        let mut handed: blaze_own::Vec<[u8; 32], &bstd::mem::Frame> = blaze_own::Vec::with_capacity_in(closure.len(), frame);
+        handed.extend(closure.iter().map(|c| c.key.0.0));
+        handed.sort_unstable();
+        let order = crate::native_image::closure(list, root, handed.as_slice(), frame);
+        let mut inputs = blaze_own::Vec::with_capacity_in(order.len(), frame);
+        let mut script_ats: blaze_own::Vec<Key, &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
+        for &r in order.iter() {
+            let key = list.key(r);
+            if handed.binary_search(&key.0.0).is_err() {
+                return None;
+            }
+            let scope = blaze_drive::key::crate_scope_name(&key);
+            let scope_in = (standing.names)(scope)?;
+            let script = match list.script(r) {
+                None => None,
+                Some(bytes) => {
+                    let name = crate::native_image::script_name(bytes)?;
+                    let run = (standing.names)(name)?;
+                    script_ats.push(run.at);
+                    Some((name, run.at, run.out))
+                }
+            };
+            inputs.push((key, list.name(r), scope_in.at, script));
+        }
+        let memo_key = native_empty_memo_key(platform, &standing.native.producer, sdk, program_root, inputs.as_slice());
+        Some((memo_key, script_ats))
+    })();
+
+    if let Some((ref memo_key, _)) = memo_info
+        && let Some(image_key) = load_native_empty_memo(standing.lent, memo_key, require_record)
+    {
+        return Ok(crate::engine_native::ProgramImage { key: image_key, send: None });
+    }
+
+    let image = crate::engine_native::image_for(cx, standing, closure, watch)?;
+    if image.send.is_none()
+        && let Some((memo_key, script_ats)) = memo_info
+        && !script_ats.iter().any(|&at| script_has_deferred_c(standing.lent, at))
+    {
+        save_native_empty_memo(standing.lent, &memo_key, image.key);
+    }
+    Ok(image)
 }
 
 /// Builds `work::Facts` for `run`, `test`, and `export` from `standing` (the one home for
@@ -900,13 +1087,13 @@ pub(crate) fn run_program(
     let owner = run_names::Owner::At(at);
     let found = run_names::found_answered(cx, &answered, owner, &mut *standing.store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)?;
     let program_found = found.program().ok_or(CliError::Start(StartError::NoProgram))?;
+    let list = found.list().ok_or(CliError::Start(StartError::NoProgram))?;
     // The program's crate first, then its scope's: from the crate list the walk read, so the
-    // unit graph is not read again here (engine_native.rs reads it once more inside).
+    // unit graph is not read again here (pure-Rust programs hit the CAS memo with zero store reads).
     let closure = program_found.closure_in(alloc);
-    let native = crate::engine_native::image_for(cx, &mut standing, &closure, watch)
+    let native = native_image_for_cached(cx, &mut standing, list, &closure, true, watch, frame)
         .map_err(|error| CliError::Start(StartError::Native { shown: bstd::mem::format_in!(frame, "{error}").as_str().into() }))?;
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
-    let list = found.list().ok_or(CliError::Start(StartError::NoProgram))?;
     let asked = crate::run_ids::Asked::default();
     let began = phases.now();
     let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
@@ -937,14 +1124,17 @@ pub(crate) fn run_program(
     let inputs = RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env, frame };
     let maker = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker);
+    let scope_records = crate::front_load::ScopeRecords::new(found.snapshot(), blaze_world::crate_list::CrateGraph::len(list), heap);
     let store = &mut *standing.store;
     let (bodies, reads, seen_ref, dirs_ref) = (&mut facts.bodies, &mut read, &seen, &pack_dirs);
     let mut names = || {
-        run_names::names_of(cx, root, &found, owner, &mut *store, &mut *bodies, &mut *reads, env, dirs_ref, procs, seen_ref, frame, heap)
+        run_names::names_of_by_need(cx, root, &found, owner, &mut *store, &mut *bodies, &mut *reads, &scope_records, env, dirs_ref, procs, seen_ref, frame, heap)
             .map_err(|error| crate::run_parent::ParentError::Names { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
     };
     let mut ids = || made.take().ok_or_else(|| crate::run_parent::ParentError::BodyIds { shown: std::boxed::Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
     let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
+    drop(names);
+    read.add_by_need(scope_records.counts());
     end_procs(cx, &maker, standing.err, "run")?;
     phases.mark_cx(cx, "program_run", frame);
     let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
@@ -1070,7 +1260,7 @@ pub(crate) fn run_tests_status(
             return Err(CliError::Start(StartError::AbortTests { test: shown(test), dependency: shown(dependency) }));
         }
         let began = phases.now();
-        let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
+        let (ids, decoded_curr_root) = body_ids_with_root(cx, &mut standing, list, &asked, bump)?;
         let ids_ns = phases.since(began);
         phases.mark_cx(cx, "body_ids", frame);
         let overflow = program::dev_overflow(cx, root, frame)?;
@@ -1081,23 +1271,28 @@ pub(crate) fn run_tests_status(
         let producer = standing.producers.get::<blaze_ids::producer::CodeBuilder>();
         let certificate = crate::start_list::Certificate::of_answer(&standing);
         let tools_digest = crate::test_cache::tools_digest(&standing.tools);
-        let curr_root = decode_root_from_store(cx, &mut *standing.store, Key(standing.root), standing.heap.shared())?;
+        let curr_root = match decoded_curr_root {
+            Some(root) => Some(root),
+            None => decode_root_from_store(cx, &mut *standing.store, Key(standing.root), standing.heap.shared())?,
+        };
+        let digest_ctx = crate::test_cache::SuiteDigestContext::new(curr_root.as_ref(), standing.errors, alloc);
         let mut specs = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
         for (_, unit) in &inventory.suites {
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
-            let digests = crate::test_cache::compute_suite_digests(
+            let digests = crate::test_cache::compute_suite_digests_with_ctx(
                 *unit,
                 &builder,
                 list,
                 &ids,
                 tools_digest,
                 standing.root,
-                standing.errors,
                 curr_root.as_ref(),
+                &digest_ctx,
                 alloc,
             );
             specs.push(crate::test_drive::SuiteSpec { unit: *unit, builder, digests });
         }
+        drop(digest_ctx);
         drop(curr_root);
         let lent = standing.lent;
         let prep_erased = blaze_own::Erased::new(frame);
@@ -1116,7 +1311,8 @@ pub(crate) fn run_tests_status(
             }
             crate::test_drive::PreparedSuites::Dirty(dirty) => {
                 // Each dirty suite's native image, as `run` has its program's (engine_native.rs `image_for`):
-                // clean cached suites skip native image linking completely.
+                // clean cached suites skip native image linking completely, and pure-Rust dirty suites
+                // hit the CAS memo with zero `CrateScope` reads and zero segment mmaps.
                 let mut images = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
                 for (at, (_, unit)) in inventory.suites.iter().enumerate() {
                     if !dirty.is_suite_dirty(at) || !crate::native_image::linked(list, unit.at) {
@@ -1124,7 +1320,7 @@ pub(crate) fn run_tests_status(
                         continue;
                     }
                     let closure = suite_closure(list, unit.at, alloc);
-                    let image = crate::engine_native::image_for(cx, &mut standing, &closure, watch)
+                    let image = native_image_for_cached(cx, &mut standing, list, &closure, false, watch, frame)
                         .map(|image| image.send)
                         .map_err(|error| crate::work::held_str(bstd::mem::format_in!(frame, "{error}").as_str(), frame));
                     images.push(image);
@@ -1137,6 +1333,12 @@ pub(crate) fn run_tests_status(
                     None => Err("no proc-macro runner: this command has no test suite (engine_start.rs `run_tests`)"),
                 });
                 let procs = crate::job_texts::Procs::ByNeed(&maker);
+                // Command-wide lazy scope-record opener shared across every dirty suite and every
+                // `CodePool` worker: `test_open_suites` opens ZERO dependency/toolchain crates
+                // upfront (rule 77), and touched crates share one `VerifiedModules` + `FileItems` cache.
+                let scope_records = inventory.suites.first().map(|(found, _)| {
+                    crate::front_load::ScopeRecords::new(found.snapshot(), blaze_world::crate_list::CrateGraph::len(list), heap)
+                });
                 let mut runnable = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
                 // Each dirty test unit runs in its package's root, told its package's variables
                 // (test_drive.rs `PackageRun`); clean cached suites skip crates/names loading.
@@ -1149,8 +1351,11 @@ pub(crate) fn run_tests_status(
                     let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), bump)
                         .map_err(|why| CliError::Start(StartError::test_place(bstd::mem::format_in!(frame, "{why}").as_str())))?;
                     let named = cx.span("run names: open the names records");
-                    let crates = run_names::crates_of(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, &pack_dirs, frame, heap)
-                        .map_err(CliError::RunNames)?;
+                    let crates = match scope_records.as_ref() {
+                        Some(sr) => run_names::crates_of_by_need(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, sr, &facts.fetch_env, &pack_dirs, frame, heap),
+                        None => run_names::crates_of(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, &pack_dirs, frame, heap),
+                    }
+                    .map_err(CliError::RunNames)?;
                     drop(named);
                     let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
                     let Some(spec) = specs.get(at) else {
@@ -1165,6 +1370,10 @@ pub(crate) fn run_tests_status(
                     cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err,
                     runnable.as_slice(), &ids, typed, config, launch.args, lent, root, procs, heap, watch, frame,
                 );
+                drop(runnable);
+                if let Some(ref sr) = scope_records {
+                    read.add_by_need(sr.counts());
+                }
                 end_procs(cx, &maker, err, "test")?;
                 phases.mark_cx(cx, "test_run", frame);
                 ids_line = Some(ids.line(&asked, ids_ns));
@@ -1373,5 +1582,63 @@ mod tests {
         let puts_before_hit = lent2.counts().puts;
         super::save_last_body_ids_if_moved(&lent2, &ptr_whole, root1, table_key1);
         assert_eq!(lent2.counts().puts, puts_before_hit, "cache hit after restart must perform zero writes");
+    }
+
+    #[test]
+    fn native_empty_memo_covers_every_input_and_round_trips() {
+        use blaze_cas::plain::{Namespace, Settings as StoreSettings};
+        use blaze_core::FileName;
+        use blaze_core::sim::{Faults, Sim};
+        use blaze_drive::{Key, Kind, Name};
+        use blaze_ids::ContentId;
+        use blaze_ladder::native_links::Platform;
+        use crate::store::plain_place::{Facts, after_answer, config, open, test_cx};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let cx = test_cx();
+        let open_lent = |sim: Sim, nonce: u64| {
+            let Some(store_name) = FileName::new("store") else { panic!("store name") };
+            let cfg = config(store_name, &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+            let Ok(lent) = open(sim, cfg, alloc) else { panic!("open sim lent {nonce}") };
+            lent
+        };
+
+        let producer_a = blaze_ids::producer::Producers::for_tests(b"prod-a").get::<blaze_ids::producer::Whole>();
+        let producer_b = blaze_ids::producer::Producers::for_tests(b"prod-b").get::<blaze_ids::producer::Whole>();
+        let k0 = blaze_id::CrateItemKey(ContentId([1; 32]));
+        let k1 = blaze_id::CrateItemKey(ContentId([2; 32]));
+        let s0 = Key(ContentId([10; 32]));
+        let s1 = Key(ContentId([11; 32]));
+        let s1_moved = Key(ContentId([12; 32]));
+        let script_name = Name::new(Kind::Script, ContentId([20; 32]));
+        let script_a = Some((script_name, Key(ContentId([21; 32])), ContentId([22; 32])));
+        let script_b = Some((script_name, Key(ContentId([21; 32])), ContentId([23; 32])));
+
+        let base = super::native_empty_memo_key(Platform::MacosArm64, &producer_a, None, "src/lib.rs", &[(k0, "app", s0, None), (k1, "core", s1, None)]);
+        let same = super::native_empty_memo_key(Platform::MacosArm64, &producer_a, None, "src/lib.rs", &[(k0, "app", s0, None), (k1, "core", s1, None)]);
+        assert_eq!(base, same, "memo key must be deterministic");
+        assert_ne!(base, super::native_empty_memo_key(Platform::LinuxArm64, &producer_a, None, "src/lib.rs", &[(k0, "app", s0, None), (k1, "core", s1, None)]), "platform must move key");
+        assert_ne!(base, super::native_empty_memo_key(Platform::MacosArm64, &producer_b, None, "src/lib.rs", &[(k0, "app", s0, None), (k1, "core", s1, None)]), "producer must move key");
+        assert_ne!(base, super::native_empty_memo_key(Platform::MacosArm64, &producer_a, None, "src/main.rs", &[(k0, "app", s0, None), (k1, "core", s1, None)]), "program root must move key");
+        assert_ne!(base, super::native_empty_memo_key(Platform::MacosArm64, &producer_a, None, "src/lib.rs", &[(k0, "app", s0, None), (k1, "core", s1_moved, None)]), "CrateScope key must move key");
+        let with_script_a = super::native_empty_memo_key(Platform::MacosArm64, &producer_a, None, "src/lib.rs", &[(k0, "app", s0, script_a), (k1, "core", s1, None)]);
+        let with_script_b = super::native_empty_memo_key(Platform::MacosArm64, &producer_a, None, "src/lib.rs", &[(k0, "app", s0, script_b), (k1, "core", s1, None)]);
+        assert_ne!(base, with_script_a, "adding a script must move key");
+        assert_ne!(with_script_a, with_script_b, "changing script out must move key");
+
+        let lent1 = open_lent(Sim::new(79, Faults::default()), 301);
+        let img_key = Key(ContentId([0x77; 32]));
+        assert_eq!(super::load_native_empty_memo(&lent1, &base, false), None);
+        super::save_native_empty_memo(&lent1, &base, img_key);
+        // Without the image record itself, `require_record = false` (test suites) hits, while
+        // `require_record = true` (`run` start_list) stays a safe miss until the record is present.
+        assert_eq!(super::load_native_empty_memo(&lent1, &base, false), Some(img_key));
+        assert_eq!(super::load_native_empty_memo(&lent1, &base, true), None);
+        assert!(lent1.put(&blaze_cas::Key(img_key.0), Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), b"empty-image").is_ok());
+        assert_eq!(super::load_native_empty_memo(&lent1, &base, true), Some(img_key));
+        assert!(after_answer(&cx, &lent1, 0).is_ok());
+
+        let lent2 = open_lent(lent1.into_store().into_driver(), 302);
+        assert_eq!(super::load_native_empty_memo(&lent2, &base, true), Some(img_key));
     }
 }
