@@ -56,6 +56,16 @@ box, write clean textual IR dumpers and side-by-side instruction/stall diff scri
 single-function harnesses before grinding through blind iterations. Sharpening the tool pays for
 itself on iteration two and compounds across every agent that touches the tree.
 
+## alarm-on-any-compile-failure (rule 90)
+
+Whenever ANY target repository, workspace, or crate fails to compile, exits non-zero, or leaves even
+a single item unchecked (including partial checks, missing `MacroModule`/`CrateScope` records,
+failing build scripts or proc macros, or incomplete typeck/borrowck), PLASTER 🚨🚨🚨 PROMINENTLY ACROSS
+THE TOP AND BODY OF YOUR RESPONSE. Never bury partial compilation failures in footnotes, never treat
+a subset passing as the whole repo working, and never report benchmark timings from an incomplete
+check without 🚨🚨🚨 explicitly naming the repo, exit status, unchecked item count, and exact root
+cause.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 Every `blaze serve` daemon keeps a profile history: Parquet files that say what each build
