@@ -422,4 +422,54 @@ mod through_impl {
         let bad = run(Region::Static);
         assert!(matches!(&bad, Ok(lines) if !lines.is_empty()), "TWIN: second slot 'a does not outlive 'static: {bad:?}");
     }
+
+    /// Regression for forwarding associated types in `tempo-node` (`RpcNodeCore for TempoEthApi<N>`)
+    /// and `tempo-transaction-pool` (`BestTransactions for TempoBestTransactions<T>`):
+    /// `impl<N> Tr for Wrap<N> { type A = <N as Tr>::A; }`, where declared `<Wrap<N> as Tr>::A`
+    /// normalized in the body to `<N as Tr>::A` (same `(trait_, name)` alias head, different Self).
+    /// Positive: `&'a <Wrap<N> as Tr>::A -> &'a <N as Tr>::A` aligns cleanly via `through_impl`.
+    /// Negative twin: `-> &'static <N as Tr>::A` still reports the real outlives error.
+    #[test]
+    fn a_forwarding_alias_projection_normalizes_to_inner_alias() {
+        let run = |ret_reg: Region, with_row: bool| {
+            let mut fx = Fx::new();
+            let wrap = fx.strukt("Wrap", 1, &[]);
+            let p0 = fx.param(0);
+            let wrap_p0 = fx.adt(wrap, &[p0]);
+            let tr = fx.tr("Tr", 1, vec![], &["A"]);
+            let inner_alias = fx.alias(tr, "A", &[p0]);
+            let outer_alias = fx.alias(tr, "A", &[wrap_p0]);
+            let ref_outer = fx.r(blaze_typeck::Mutbl::Not, outer_alias);
+            let ref_inner = fx.r(blaze_typeck::Mutbl::Not, inner_alias);
+            let tr_bound = fx.bound(tr, &[p0]);
+            let imp = fx.imp("impl<N: Tr> Tr for Wrap<N> { type A = <N as Tr>::A; }", 1, wrap_p0, Some((tr, &[])), &[("A", inner_alias)], vec![tr_bound]);
+            let f = fx.func("forward", 1, &[ref_inner], ref_inner, vec![tr_bound]);
+            fx.finish();
+            let mut decls = Decls::new();
+            decls.trait_(tr, 0);
+            decls.alias(tr, "A", 0);
+            decls.func(f, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ref_outer], output: ref_outer, slots: &[P0, ret_reg] });
+            decls.imp(imp, ImplHead { lifetimes: 0, outlives: &[], self_ty: wrap_p0, self_slots: &[], trait_ref: Some((tr, &[], &[])) });
+            decls.impl_assoc(imp, "A", inner_alias, &[]);
+            let heads = Heads { with_lifetime: vec![] };
+            let mut b = Bb::new();
+            let px = b.param("x");
+            let lx = b.local(px);
+            let root = b.block(&[], Some(lx));
+            let view = b.view(f, root);
+            let mut c = region_fixture::checked(&fx, &view);
+            if with_row {
+                let selected = Selected::Impl { imp, args: List::EMPTY };
+                c.selected.push(Projected { expr: root, at: 0, trait_: tr, name: Some(Name::of("A")), args: List::EMPTY, global_env: false, selected });
+                c.selected.sort_by_key(|r| (r.expr, r.name.is_none()));
+            }
+            region_fixture::lower(&fx, &view, &mut c, &heads, &decls, Plant::None).map(|r| r.lines)
+        };
+        let clean = run(P0, true);
+        assert_eq!(clean, Ok(vec::Vec::new()), "forwarding alias with impl row aligns cleanly: {clean:?}");
+        let no_row = run(P0, false);
+        assert_eq!(no_row, Ok(vec::Vec::new()), "forwarding alias without impl row falls back to placeholders cleanly: {no_row:?}");
+        let bad = run(Region::Static, true);
+        assert!(matches!(&bad, Ok(lines) if !lines.is_empty()), "TWIN: &'a does not outlive &'static: {bad:?}");
+    }
 }
