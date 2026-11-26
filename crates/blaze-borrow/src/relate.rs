@@ -147,7 +147,7 @@ pub struct Cx<'c, 'x> {
 }
 
 /// The most steps one call's walks take (rule 18).
-pub const MOST_WALK_STEPS: u32 = 1 << 18;
+pub const MOST_WALK_STEPS: u32 = 1 << 20;
 /// How deep one walk goes, normalizations included.
 pub const MOST_WALK_DEPTH: u32 = 256;
 
@@ -664,6 +664,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             depth: u32,
         }
         let saved = (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v);
+        let saved_budget = self.budget;
+        self.budget = self.budget.min(4096);
         let env_mark = self.envs.len();
         self.in_erased_norm = true;
         let mut stack: [Option<NormFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
@@ -800,6 +802,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         }
         self.in_erased_norm = false;
         self.envs.truncate(env_mark);
+        self.budget = saved_budget.saturating_sub(1);
         (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
         res
     }
@@ -3045,6 +3048,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
         let env_mark = self.envs.len();
+        let (sub_chain, sub_clen) = self.alias_self_chain(subject);
         let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
@@ -3080,7 +3084,6 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
             let next_depth = cur_depth + 1;
             if next_depth < MAX_ELAB_DEPTH {
-                let (sub_chain, sub_clen) = self.alias_self_chain(subject);
                 let start = sp;
                 for cv in views {
                     let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
@@ -3130,6 +3133,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         vlen: &mut usize,
     ) -> Result<Option<Side<'c>>, Refused> {
         let env_mark = self.envs.len();
+        let (sub_chain, sub_clen) = self.alias_self_chain(subject);
         let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
@@ -3165,7 +3169,6 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
             let next_depth = cur_depth + 1;
             if next_depth < MAX_ELAB_DEPTH {
-                let (sub_chain, sub_clen) = self.alias_self_chain(subject);
                 let start = sp;
                 for cv in views {
                     let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
