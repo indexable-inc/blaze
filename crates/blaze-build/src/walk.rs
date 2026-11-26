@@ -592,6 +592,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// Per pattern: a `match` on the binding may move fields out of it, so it gets field
     /// flags if its type needs drop (`scan_flags`).
     partial: Vec<bool, A>,
+    /// Per pattern: whether the binding appears on the left-hand side of any `Expr::Assign` /
+    /// `Expr::AssignOp` in the body (`scan_flags`), so a loop back-edge could re-initialize it.
+    assigned: Vec<bool, A>,
     /// Per expression: its parent (`NO_EXPR` for none) and whether the edge to it is
     /// conditional, from `scan_flags` (walk/temps.rs finds a temporary's scope by it).
     expr_parent: Vec<(u32, bool), A>,
@@ -908,6 +911,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     needs_flag.resize(body.pats.len(), false);
     let mut partial = Vec::with_capacity_in(body.pats.len(), alloc);
     partial.resize(body.pats.len(), false);
+    let mut assigned = Vec::with_capacity_in(body.pats.len(), alloc);
+    assigned.resize(body.pats.len(), false);
     let mut owned = Vec::with_capacity_in(body.pats.len(), alloc);
     owned.resize(body.pats.len(), LocalOwn::None);
     let mut init = Vec::with_capacity_in(body.pats.len(), alloc);
@@ -954,6 +959,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         ref_params: blaze_own::Vec::new_in(alloc),
         needs_flag,
         partial,
+        assigned,
         expr_parent: Vec::new_in(alloc),
         temp_marks: Vec::new_in(alloc),
         let_else_held: Vec::new_in(alloc),
@@ -3223,6 +3229,34 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         for (i, x) in body.exprs.iter().enumerate() {
             let Expr::Local(p) = *x else { continue };
+            // Mark any local reachable on the LHS of an assignment so loop headers conservatively
+            // clear `definitely_uninit[p]` for bindings a back-edge can re-initialize, while
+            // preserving `definitely_uninit[p]` across loops for move-once bindings like `on_ready`.
+            if let Ok(mut cur) = u32::try_from(i) {
+                while cur != NO_EXPR {
+                    let Some(&(up, _)) = usize::try_from(cur).ok().and_then(|ix| parent.get(ix)) else {
+                        break;
+                    };
+                    if up == NO_EXPR {
+                        break;
+                    }
+                    let Some(up_expr) = usize::try_from(up).ok().and_then(|ix| body.exprs.get(ix)) else {
+                        break;
+                    };
+                    match *up_expr {
+                        Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } if lhs.0 == cur => {
+                            if let Some(a) = self.assigned.get_mut(p.ix()) {
+                                *a = true;
+                            }
+                            break;
+                        }
+                        Expr::Paren(_) | Expr::Field { .. } | Expr::Tuple { .. } | Expr::Struct { .. } | Expr::Array { .. } => {
+                            cur = up;
+                        }
+                        _ => break,
+                    }
+                }
+            }
             // The context: the parent of the outermost parenthesis around the use.
             let mut c = i as u32;
             while let (up, _) = parent[c as usize]
@@ -6537,8 +6571,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let exit = self.create();
                 self.jump(header, &[]);
                 self.begin(header);
-                // A back-edge may re-initialize any outer flagged binding on a later iteration.
-                self.definitely_uninit.fill(false);
+                // A back-edge may re-initialize any outer flagged binding that is assigned in the
+                // body; bindings never assigned stay `definitely_uninit` across the loop so
+                // already-moved parameters/locals never emit dead drop-flag reads after `.await`.
+                for (du, &is_assigned) in self.definitely_uninit.iter_mut().zip(self.assigned.iter()) {
+                    if is_assigned {
+                        *du = false;
+                    }
+                }
                 let depth = self.scope_marks.len() as u32;
                 let temp_depth = u32::try_from(self.temp_marks.len()).map_err(|_| malformed("temporary scope depth past `u32`"))?;
                 self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth, temp_depth });

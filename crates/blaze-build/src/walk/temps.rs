@@ -895,9 +895,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         for i in 0..self.scope_pats.len() {
             let Some(&Held::Pat(p)) = self.scope_pats.get(i) else { continue };
-            if self.captured_whole(p) {
-                continue;
-            }
             let Some(LocalOwn::Drop(o)) = self.owned.get(p.ix()).copied() else { continue };
             let moved_out = match o.flag {
                 None => !self.init.get(p.ix()).copied().unwrap_or(false),
@@ -906,7 +903,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             if !moved_out {
                 continue;
             }
-            if let Some((Home::Slot(slot), _)) = self.slots.get(p.ix()).copied().flatten()
+            if !self.captured_whole(p)
+                && let Some((Home::Slot(slot), _)) = self.slots.get(p.ix()).copied().flatten()
                 && !self.vals_use_slot(slot)
                 && !self.slot_is_named(slot)
             {
