@@ -1002,6 +1002,7 @@ mod macos_app {
                 }
                 let snap = blaze_shell::sysmon_driver::sample_snapshot(Alloc::global());
                 sm.engine.ingest(snap);
+                sm.refresh_selected_cmdline();
                 // If an earlier sysmon block was still live in this pane, freeze it cleanly.
                 if let Some(prev_id) = self.active_sysmon.take()
                     && let Some(prev_blk) = self.store.block_mut(prev_id)
@@ -3575,6 +3576,14 @@ mod macos_app {
                                                 sm.move_selection(1, vis_rows);
                                                 true
                                             }
+                                            Key::ArrowLeft => {
+                                                sm.collapse_or_parent(vis_rows);
+                                                true
+                                            }
+                                            Key::ArrowRight => {
+                                                sm.expand_or_child(vis_rows);
+                                                true
+                                            }
                                             Key::PageUp => {
                                                 sm.move_selection(-(vis_rows as isize), vis_rows);
                                                 true
@@ -3604,6 +3613,14 @@ mod macos_app {
                                                 }
                                                 "k" => {
                                                     sm.move_selection(-1, vis_rows);
+                                                    true
+                                                }
+                                                "h" => {
+                                                    sm.collapse_or_parent(vis_rows);
+                                                    true
+                                                }
+                                                "l" => {
+                                                    sm.expand_or_child(vis_rows);
                                                     true
                                                 }
                                                 "t" => {
@@ -4353,6 +4370,8 @@ mod macos_app {
                                                 | HitAction::SysMonToggleCollapse { .. }
                                                 | HitAction::SysMonSort { .. }
                                                 | HitAction::SysMonToggleTree(_)
+                                                | HitAction::SysMonToggleCumulative(_)
+                                                | HitAction::SysMonRequestKill(_)
                                                 | HitAction::SysMonTogglePause(_)
                                         )
                                     ))
@@ -4806,6 +4825,14 @@ mod macos_app {
                                                 && let BlockBody::SysMon(sm) = &mut blk.body
                                             {
                                                 sm.cumulative = !sm.cumulative;
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SysMonRequestKill(bid) => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                sm.begin_kill_selected();
                                                 dirty = true;
                                             }
                                         }

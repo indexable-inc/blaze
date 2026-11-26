@@ -405,21 +405,26 @@ pub fn shallow_find_dir(root: &Path, query: &str) -> Option<PathBuf> {
 
 /// Detect a concise, human-readable local host name (e.g. `hydra`) without spawning a subprocess.
 pub fn detect_local_hostname() -> String {
-    #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn gethostname(name: *mut u8, len: usize) -> i32;
-        }
-        let mut buf = [0u8; 128];
-        // SAFETY: `buf` is writable for `buf.len()` bytes.
-        let rc = unsafe { gethostname(buf.as_mut_ptr(), buf.len() - 1) };
-        if rc == 0 {
-            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            if let Ok(s) = core::str::from_utf8(&buf[..end]) {
-                let short = s.split('.').next().unwrap_or(s).trim();
-                if !short.is_empty() {
-                    return short.to_owned();
-                }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Ok(uts) = blaze_sys::posix::thread::system_name() {
+        #[cfg(target_os = "macos")]
+        let bytes: Vec<u8> = uts
+            .nodename
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        #[cfg(target_os = "linux")]
+        let bytes: Vec<u8> = uts
+            .nodename
+            .iter()
+            .take_while(|&&b| b != 0)
+            .copied()
+            .collect();
+        if let Ok(s) = core::str::from_utf8(&bytes) {
+            let short = s.split('.').next().unwrap_or(s).trim();
+            if !short.is_empty() {
+                return short.to_owned();
             }
         }
     }

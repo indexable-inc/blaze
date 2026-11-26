@@ -651,50 +651,15 @@ pub fn now_datetime() -> DateTime {
 }
 
 fn local_tz_offset_secs() -> i32 {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     {
-        #[repr(C)]
-        struct Tm {
-            tm_sec: i32,
-            tm_min: i32,
-            tm_hour: i32,
-            tm_mday: i32,
-            tm_mon: i32,
-            tm_year: i32,
-            tm_wday: i32,
-            tm_yday: i32,
-            tm_isdst: i32,
-            tm_gmtoff: isize,
-            tm_zone: *const std::ffi::c_char,
-        }
-        unsafe extern "C" {
-            fn time(t: *mut isize) -> isize;
-            fn localtime_r(t: *const isize, out: *mut Tm) -> *mut Tm;
-        }
-        let mut t: isize = 0;
-        let mut tm = Tm {
-            tm_sec: 0,
-            tm_min: 0,
-            tm_hour: 0,
-            tm_mday: 0,
-            tm_mon: 0,
-            tm_year: 0,
-            tm_wday: 0,
-            tm_yday: 0,
-            tm_isdst: 0,
-            tm_gmtoff: 0,
-            tm_zone: core::ptr::null(),
+        let now_secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs().min(i64::MAX as u64) as i64,
+            Err(e) => -(e.duration().as_secs().min(i64::MAX as u64) as i64),
         };
-        // SAFETY: `t` and `tm` are valid stack locals; `localtime_r` is thread-safe.
-        unsafe {
-            time(&mut t);
-            if !localtime_r(&t, &mut tm).is_null() {
-                return tm.tm_gmtoff as i32;
-            }
-        }
-        0
+        blaze_sys::posix::io::localtime(now_secs).map_or(0, |tm| tm.gmtoff as i32)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "macos"))]
     {
         0
     }
@@ -718,21 +683,26 @@ fn collect_sys_snapshot(alloc: Alloc<'static>) -> SysSnapshot<'static> {
 }
 
 fn read_hostname() -> String {
-    #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn gethostname(name: *mut u8, len: usize) -> std::ffi::c_int;
-        }
-        let mut buf = [0u8; 256];
-        // SAFETY: `buf` is writable for 256 bytes; we search for NUL within the buffer.
-        let rc = unsafe { gethostname(buf.as_mut_ptr(), buf.len()) };
-        if rc == 0 {
-            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            if let Ok(s) = core::str::from_utf8(&buf[..end])
-                && !s.is_empty()
-            {
-                return s.to_owned();
-            }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Ok(uts) = blaze_sys::posix::thread::system_name() {
+        #[cfg(target_os = "macos")]
+        let bytes: Vec<u8> = uts
+            .nodename
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        #[cfg(target_os = "linux")]
+        let bytes: Vec<u8> = uts
+            .nodename
+            .iter()
+            .take_while(|&&b| b != 0)
+            .copied()
+            .collect();
+        if let Ok(s) = String::from_utf8(bytes)
+            && !s.is_empty()
+        {
+            return s;
         }
     }
     std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_owned())

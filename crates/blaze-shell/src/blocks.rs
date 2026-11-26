@@ -13,8 +13,8 @@ use blaze_vt::terminal::{Terminal, Which};
 
 use crate::prompt::PromptInfo;
 
-/// Default row threshold after which large tables become scrollable viewports.
-pub const TABLE_FOLD_ROWS: usize = 16;
+/// Default maximum rows shown in a folded table viewport (~1/3 screen height on standard windows).
+pub const TABLE_FOLD_ROWS: usize = 8;
 
 /// Unique identifier for a block in [`BlockStore`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -207,7 +207,14 @@ impl BlockStore {
             BlockBody::Value(Value::Table(t))
             | BlockBody::StreamAndValue { value: Value::Table(t), .. }
             | BlockBody::RustCell { value: Value::Table(t), .. } => {
-                (t.nrows() > TABLE_FOLD_ROWS, t.initial_sort)
+                // Default large tables to folded so layout can cap them at <= 1/3 pane height
+                // (layout only folds when `nrows` actually exceeds the viewport-derived cap).
+                (t.nrows() > 4, t.initial_sort)
+            }
+            BlockBody::Value(Value::List(l))
+            | BlockBody::StreamAndValue { value: Value::List(l), .. }
+            | BlockBody::RustCell { value: Value::List(l), .. } => {
+                (l.len() > TABLE_FOLD_ROWS, None)
             }
             _ => (false, None),
         };
