@@ -147,7 +147,7 @@ pub struct Cx<'c, 'x> {
 }
 
 /// The most steps one call's walks take (rule 18).
-pub const MOST_WALK_STEPS: u32 = 1 << 16;
+pub const MOST_WALK_STEPS: u32 = 1 << 18;
 /// How deep one walk goes, normalizations included.
 pub const MOST_WALK_DEPTH: u32 = 256;
 
@@ -2874,6 +2874,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         visited: &mut [ElabKey; MAX_ELAB_VISITED],
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
+        let env_mark = self.envs.len();
         let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
@@ -2938,6 +2939,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        self.envs.truncate(env_mark);
         Ok(false)
     }
 
@@ -2957,6 +2959,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         visited: &mut [ElabKey; MAX_ELAB_VISITED],
         vlen: &mut usize,
     ) -> Result<Option<Side<'c>>, Refused> {
+        let env_mark = self.envs.len();
         let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
@@ -3021,6 +3024,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        self.envs.truncate(env_mark);
         Ok(None)
     }
 
@@ -3379,6 +3383,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         has_subject: bool,
         trait_: ItemKey,
     ) -> Result<bool, Refused> {
+        let env_mark = self.envs.len();
         let s_own = self.own(alias_side)?;
         let skids = self.kids_of(alias_side)?;
         let lts = at_lts.max(s_own.get());
@@ -3387,10 +3392,14 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             match self.slot(alias_side, k)? {
                 RegAt::Known(r) => {
                     if self.envs.bind_reg(aenv, k, r).is_err() {
+                        self.envs.truncate(env_mark);
                         return Ok(false);
                     }
                 }
-                RegAt::Unbound { .. } => return Ok(false),
+                RegAt::Unbound { .. } => {
+                    self.envs.truncate(env_mark);
+                    return Ok(false);
+                }
             }
         }
         for k in at_lts.min(s_own.get())..lts {
@@ -3432,6 +3441,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        self.envs.truncate(env_mark);
         Ok(false)
     }
 
@@ -3682,6 +3692,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         trait_: ItemKey,
         name: blaze_typeck::Name,
     ) -> Result<Option<Side<'c>>, Refused> {
+        let env_mark = self.envs.len();
         let s_own = self.own(alias_side)?;
         let skids = self.kids_of(alias_side)?;
         let lts = at_lts.max(s_own.get());
@@ -3690,10 +3701,14 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             match self.slot(alias_side, k)? {
                 RegAt::Known(r) => {
                     if self.envs.bind_reg(aenv, k, r).is_err() {
+                        self.envs.truncate(env_mark);
                         return Ok(None);
                     }
                 }
-                RegAt::Unbound { .. } => return Ok(None),
+                RegAt::Unbound { .. } => {
+                    self.envs.truncate(env_mark);
+                    return Ok(None);
+                }
             }
         }
         for k in at_lts.min(s_own.get())..lts {
@@ -3735,6 +3750,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        self.envs.truncate(env_mark);
         Ok(None)
     }
 }
