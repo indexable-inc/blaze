@@ -591,6 +591,10 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// falling back to a full crate-wide `member_rows` scan so `core`/`std` lang trait methods
     /// (e.g. `PartialEq::eq` in `assert_eq!`) resolve in O(lang items) with zero `each_item` scan.
     lang_member_rows: Map<usize, locate::MemberIndex<'n>, Alloc<'n>>,
+    /// Per-crate cache of body-local item derivation chains built once on the first unhinted
+    /// `locate_local` miss in a crate (lazy/locate.rs), turning repeated O(crate_fns) lex-scans
+    /// into O(1) lookups.
+    local_rows: Map<usize, locate::LocalIndex<'n>, Alloc<'n>>,
     /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`,
     /// `FrontEnd::specialize_inline_for`), created on demand per `(orig, concrete_args)`.
     inline_for_specs: AVec<'n, crate::front2::inline_for::SpecRow>,
@@ -718,6 +722,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             site_cache: RefCell::new(seam_rules::SiteCache::new_in(alloc)),
             member_rows: Map::new_in(alloc),
             lang_member_rows: Map::new_in(alloc),
+            local_rows: Map::new_in(alloc),
             inline_for_specs: AVec::new_in(alloc),
             fixed_spell: Spelling::fixed(),
             adt_scanned_tys: 0,
