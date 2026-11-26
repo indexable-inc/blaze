@@ -2249,16 +2249,18 @@ fn body_const_len<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
     if !ident {
         return Ok(None);
     }
-    let Some(scope) = type_scope(v, t)? else { return Ok(None) };
+    let Some((owner, scope)) = body.locals.scope_or_declared(body.owner, type_scope(v, t)?.map(|s| s.0)) else {
+        return Ok(None);
+    };
     super::const_open::local_const_in_scope(
         resolver,
         marks,
         body.locals,
-        body.owner,
+        owner,
         body.module,
         heads,
         v,
-        scope.0,
+        scope,
         None,
         name,
         r,

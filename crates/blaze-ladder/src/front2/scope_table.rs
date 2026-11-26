@@ -263,15 +263,14 @@ pub(super) fn written<'n, S: super::source::NamesSource<'n>>(
     // x0-ref-11-deref-unsized, x0-ref-12-wide-ptr-eq; tests/front2_block_use_types.rs). Any
     // other body's signature path is its module's.
     let declared;
-    let (body, scope) = match view.path(path)?.scope {
-        Some(s) => (body, s.0),
-        None => match body.locals.head(body.owner) {
-            Some(h) => {
-                declared = super::block_type_uses::BodyScope { owner: h.enclosing, ..*body };
-                (&declared, h.scope)
-            }
-            None => return Ok(None),
-        },
+    let Some((owner, scope)) = body.locals.scope_or_declared(body.owner, view.path(path)?.scope.map(|s| s.0)) else {
+        return Ok(None);
+    };
+    let body = if owner == body.owner {
+        body
+    } else {
+        declared = super::block_type_uses::BodyScope { owner, ..*body };
+        &declared
     };
     // Body lowering already put the first token's mark in the path's view. An opaque
     // token names the definition module even if that module also encloses the invocation.
