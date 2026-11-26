@@ -438,6 +438,18 @@ impl TileManager {
         tab.root.nudge_enclosing_split(focused, axis, signed)
     }
 
+    /// Grow (`delta > 0`) or shrink (`delta < 0`) the focused pane relative to its immediate
+    /// enclosing split (`Cmd+` / `Cmd-` on split panes), always expanding/shrinking the focused
+    /// pane regardless of whether it sits in the first or second child of the split.
+    pub fn resize_focused_pane(&mut self, delta: f32) -> bool {
+        let tab = &mut self.tabs[self.active_tab];
+        if tab.zoomed || tab.root.leaf_count() <= 1 {
+            return false;
+        }
+        let focused = tab.focused;
+        tab.root.resize_pane_enclosing(focused, delta)
+    }
+
     /// Reset all split ratios in the active tab to `0.5` (`Cmd+Shift+=`).
     pub fn equalize_splits(&mut self) {
         self.tabs[self.active_tab].root.equalize();
@@ -595,6 +607,35 @@ impl TileNode {
         }
     }
 
+    fn resize_pane_enclosing(&mut self, focused: PaneId, delta: f32) -> bool {
+        match self {
+            TileNode::Leaf(_) => false,
+            TileNode::Split { ratio, first, second, .. } => {
+                let in_first = first.contains(focused);
+                let in_second = second.contains(focused);
+                if !in_first && !in_second {
+                    return false;
+                }
+                let deeper = if in_first {
+                    first.resize_pane_enclosing(focused, delta)
+                } else {
+                    second.resize_pane_enclosing(focused, delta)
+                };
+                if deeper {
+                    return true;
+                }
+                let signed = if in_first { delta } else { -delta };
+                let next = (*ratio + signed).clamp(MIN_RATIO, MAX_RATIO);
+                if (next - *ratio).abs() > 0.0001 {
+                    *ratio = next;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     fn equalize(&mut self) {
         if let TileNode::Split { ratio, first, second, .. } = self {
             *ratio = 0.5;
@@ -662,5 +703,44 @@ impl TileNode {
                 second.layout_into(r2, gap, focused, panes, handles);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_focused_pane_grows_and_shrinks_both_sides() {
+        let (mut wm, _tab, p0) = TileManager::new();
+        let p1 = wm.split_focused(SplitAxis::Vertical);
+        let bounds = HitRect::new(0.0, 0.0, 1000.0, 600.0);
+
+        let width_of = |wm: &TileManager, pid: PaneId| -> f32 {
+            let l = wm.layout(bounds, 4.0);
+            let r = l.panes.iter().find(|p| p.pane == pid).unwrap().rect;
+            r.x1 - r.x0
+        };
+
+        // Focused on p1 (second child): +delta grows p1, -delta shrinks p1.
+        assert_eq!(wm.focused_pane(), p1);
+        let base_p1 = width_of(&wm, p1);
+        assert!(wm.resize_focused_pane(0.10));
+        let grown_p1 = width_of(&wm, p1);
+        assert!(grown_p1 > base_p1, "p1 should grow: {grown_p1} > {base_p1}");
+        assert!(wm.resize_focused_pane(-0.20));
+        let shrunk_p1 = width_of(&wm, p1);
+        assert!(shrunk_p1 < base_p1, "p1 should shrink: {shrunk_p1} < {base_p1}");
+
+        // Equalize then focus p0 (first child): +delta grows p0, -delta shrinks p0.
+        wm.equalize_splits();
+        assert!(wm.focus_pane(p0));
+        let base_p0 = width_of(&wm, p0);
+        assert!(wm.resize_focused_pane(0.10));
+        let grown_p0 = width_of(&wm, p0);
+        assert!(grown_p0 > base_p0, "p0 should grow: {grown_p0} > {base_p0}");
+        assert!(wm.resize_focused_pane(-0.20));
+        let shrunk_p0 = width_of(&wm, p0);
+        assert!(shrunk_p0 < base_p0, "p0 should shrink: {shrunk_p0} < {base_p0}");
     }
 }
