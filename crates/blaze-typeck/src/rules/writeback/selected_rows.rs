@@ -333,6 +333,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         if matches!(selected, Selected::Impl { .. }) {
                             out.push(Projected { expr: e, at: 0, trait_: nt, name: Some(nn), args: list, global_env: rows.env.global, selected });
                             nest.push((out.len() - 1, depth + 1));
+                        } else if let Some(rhs) = self.normalize_from_env_or_assoc(ex, inert, nt, nn, &ps)? {
+                            if self.reads.stopped() {
+                                return Ok(());
+                            }
+                            let _ = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, rhs, 0)?;
+                            if self.reads.stopped() {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -346,17 +354,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Err(Stop::Need(_)) => continue,
                 Err(Stop::Error(err)) => return Err(err),
             };
+            let iargs_len = match u32::try_from(iargs.len()) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
             for &clause in wc.clauses {
-                let (trait_, cname, formal) = match clause {
-                    PClause::Trait { trait_, args: formal } => (trait_, None, formal),
-                    PClause::Projection { trait_, args: formal, name, .. } => (trait_, Some(name), formal),
+                let (trait_, cname, formal, proj_term) = match clause {
+                    PClause::Trait { trait_, args: formal } => (trait_, None, formal, None),
+                    PClause::Projection { trait_, args: formal, name, term } => (trait_, Some(name), formal, Some(term)),
                     _ => continue,
                 };
                 if cname.is_none() && inert.has(trait_) {
                     continue;
                 }
                 let Ok(formal_list) = wc.types.list(formal) else { continue };
-                if !params_in_bounds(wc.types, formal_list, iargs.len() as u32, alloc)? {
+                if !params_in_bounds(wc.types, formal_list, iargs_len, alloc)? {
                     continue;
                 }
                 ps.clear();
@@ -367,6 +379,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         return Ok(());
                     }
                     ps.push(norm);
+                }
+                // Normalize any alias on the RHS `term` of an impl where-clause projection
+                // equality (e.g. `PoolTransaction<Consensus = TxTy<Node::Types>>`) so downstream
+                // impl projection rows are filed for `blaze-borrow`.
+                if let Some(term) = proj_term
+                    && params_in_bounds(wc.types, &[term], iargs_len, alloc)?
+                {
+                    let sub_term = subst_into(wc.types, term, &iargs, &mut ex.out, alloc)?;
+                    let _ = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, sub_term, 0)?;
+                    if self.reads.stopped() {
+                        return Ok(());
+                    }
                 }
                 if cname.is_none() && !may_relate(ex.out.view(), &ps, alloc)? && !self.trait_has_lifetimes(trait_)? {
                     if self.reads.stopped() {
@@ -388,7 +412,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 if self.reads.stopped() {
                     return Ok(());
                 }
-                if cname.is_some() && !matches!(selected, Selected::Impl { .. }) {
+                if let Some(an) = cname && !matches!(selected, Selected::Impl { .. }) {
+                    if let Some(rhs) = self.normalize_from_env_or_assoc(ex, inert, trait_, an, &ps)? {
+                        if self.reads.stopped() {
+                            return Ok(());
+                        }
+                        let _ = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, rhs, 0)?;
+                        if self.reads.stopped() {
+                            return Ok(());
+                        }
+                    }
                     continue;
                 }
                 out.push(Projected { expr: e, at: 0, trait_, name: cname, args: list, global_env: rows.env.global, selected });
