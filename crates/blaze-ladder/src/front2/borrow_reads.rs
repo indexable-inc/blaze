@@ -552,6 +552,23 @@ pub fn inst_drop_trait_read(trait_: u128, digest: u64) -> Read {
     Read { fact: Fact { kind: FactKind::BorrowHead, key: trait_, detail: INST_DROP_TRAIT_DETAIL }, answer: Some(digest) }
 }
 
+/// The detail of a [`FactKind::BorrowHead`] row holding whether a trait named in an ADT field's
+/// `PNode::Alias` has any blanket impls (`Shape::Param`), inspected by `suppressed_alias_fields`
+/// (rule 21).
+pub const FIELD_ALIAS_BLANKET_DETAIL: u64 = 16;
+
+/// The detail of a [`FactKind::BorrowHead`] row holding the projection supertraits of a trait
+/// inspected by `suppressed_alias_fields` (rule 21).
+pub const FIELD_ALIAS_SUPER_DETAIL: u64 = 17;
+
+pub fn field_alias_blanket_read(trait_: u128, digest: u64) -> Read {
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: trait_, detail: FIELD_ALIAS_BLANKET_DETAIL }, answer: Some(digest) }
+}
+
+pub fn field_alias_super_read(trait_: u128, digest: u64) -> Read {
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: trait_, detail: FIELD_ALIAS_SUPER_DETAIL }, answer: Some(digest) }
+}
+
 /// Files the borrow check's `rows` into the body's read list in `verdict` (sorted by fact, one
 /// row per fact) and makes its digest again. A list already refused stays refused; one fact
 /// with two answers refuses the list by name (rule 21), never merged.

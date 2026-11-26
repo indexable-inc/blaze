@@ -1326,6 +1326,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     out.push(SigSlot::Owner(*owner));
                     *owner += 1;
                 }
+                Some(blaze_typeck::WrittenRegion::Elided(id)) => {
+                    out.push(SigSlot::Late(Some((u32::MAX - param, id))));
+                }
                 None if inferred_unannotated => {
                     out.push(SigSlot::Owner(*owner));
                     *owner += 1;

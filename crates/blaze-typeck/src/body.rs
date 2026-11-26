@@ -443,6 +443,10 @@ pub enum WrittenRegion {
     Static,
     /// An explicitly named lifetime from the enclosing item (not `'static`, not `'_`).
     Named,
+    /// A shared elided lifetime group within one closure parameter type (for example a defaulted
+    /// type argument referencing an elided parameter lifetime: `|r: &Records<'_, '_>|` where
+    /// `S = &'n Names<'n>` repeats `'n`'s elided id across multiple slots).
+    Elided(u32),
 }
 
 /// One explicit non-elided lifetime written in a closure parameter type annotation, located by
