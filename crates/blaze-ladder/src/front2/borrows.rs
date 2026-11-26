@@ -543,6 +543,9 @@ pub struct BorrowFacts<'a> {
     /// `Facts::trait_lifetimes` (the one call rule). The read: the names source files the
     /// trait's `Item` cell as it answers (tables/view.rs `declared_lifetimes`, D155).
     trait_counts: AVec<'a, (u128, Option<u32>)>,
+    /// Sorted checker keys of gathered traits marked `auto trait` (`TraitFlags::AUTO`), for
+    /// `blaze_flow_lower::Facts::is_auto_trait`.
+    auto_traits: AVec<'a, u128>,
     /// Each `<_ as trait_>::name` of those types, sorted, and its lifetime count (the trait's
     /// plus the associated type's own, `Arity::alias_lifetimes`), for `Facts::alias_lifetimes`;
     /// its reads the trait's `Item` and `Members` cells, filed by the names source likewise.
@@ -658,6 +661,7 @@ impl<'a> BorrowFacts<'a> {
             shape_refused: AVec::new_in(alloc),
             object_traits: AVec::new_in(alloc),
             trait_counts: AVec::new_in(alloc),
+            auto_traits: AVec::new_in(alloc),
             alias_counts: AVec::new_in(alloc),
             fn_binders: true,
             variance_at: AVec::new_in(alloc),
@@ -829,6 +833,9 @@ impl Facts for ReadBy<'_, '_> {
         self.facts.relates_nothing.contains(&Some(trait_))
             || Some(trait_) == self.facts.discriminant_kind
             || Some(trait_) == self.facts.pointee
+    }
+    fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.auto_traits.binary_search(&trait_.0).is_ok()
     }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.fn_traits.contains(&Some(trait_))
@@ -2774,7 +2781,16 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         };
         for t in g.trait_counts.iter_mut() {
             t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
+            if r.keys
+                .library_in(r.names, tc::ItemKey(t.0))
+                .and_then(|lib| r.store.maps.traits.get(&lib))
+                .is_some_and(|td| td.flags.has(tc::TraitFlags::AUTO))
+            {
+                g.auto_traits.push(t.0);
+            }
         }
+        g.auto_traits.sort_unstable();
+        g.auto_traits.dedup();
         for a in g.alias_counts.iter_mut() {
             a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
         }

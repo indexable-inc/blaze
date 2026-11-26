@@ -800,6 +800,14 @@ pub trait Selected {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is an `auto trait` (`Send`, `Sync`, `Unpin`, `Freeze`, etc.). When
+    /// `blaze-typeck` proved `T: AutoTrait` structurally or from an opaque/generic bound (never a
+    /// manual `impl` with extra `where` clauses, which returns `Selection::Impl`), the proof
+    /// relates no region.
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
     /// Whether `<T as trait_>::name` is a compiler-builtin associated type whose normalized value
     /// always carries zero lifetimes (`DiscriminantKind::Discriminant`, `Pointee::Metadata`).
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
