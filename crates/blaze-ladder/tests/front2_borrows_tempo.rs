@@ -1977,6 +1977,22 @@ fn control_gat_field_destructure_swap_lifetimes<'a, 'b>(
     let GatAssemblerInput { ctx: GatExecCtx(inner), .. } = input;
     inner
 }
+
+// `hashbrown::scopeguard::ScopeGuard::into_inner` pattern: `core::mem::ManuallyDrop<T>` has a
+// private field named `value`, so `guard.value` must autoderef past `ManuallyDrop`'s private
+// field to `ScopeGuard::value: T` (instead of producing E0308 `ScopeGuard<T, F>` vs `T`).
+struct ReproScopeGuard<T, F: FnMut(&mut T)> {
+    dropfn: F,
+    value: T,
+}
+fn repro_manually_drop_private_value_autoderef<T, F: FnMut(&mut T)>(guard: ReproScopeGuard<T, F>) -> T {
+    let guard = core::mem::ManuallyDrop::new(guard);
+    unsafe {
+        let value = core::ptr::read(&guard.value);
+        let _ = core::ptr::read(&guard.dropfn);
+        value
+    }
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

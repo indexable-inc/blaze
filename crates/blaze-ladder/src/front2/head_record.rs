@@ -199,7 +199,9 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 40: ADT `field_regions` lay `PNode::Alias` fields in pre-order again; normalized alias fields
 /// are guarded per body in `borrows.rs` (`suppressed_alias_fields`). Same format, new content for
 /// the same key (rule 21).
-pub const VERSION: u32 = 40;
+/// 41: ADTs carry per-field visibility bytes (`AdtRow::field_vis`) so `World::member_visible`
+/// checks struct/union field visibility during field-access autoderef.
+pub const VERSION: u32 = 41;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1373,6 +1375,10 @@ fn encode_into_scratch<'b>(
             for f in &row.fields {
                 o.name(f.name);
                 o.ty(f.ty)?;
+            }
+            o.count(row.field_vis.len(), "an ADT's field visibilities")?;
+            for &vis in &row.field_vis {
+                o.byte(vis.byte());
             }
             o.repr(row.repr);
             o.opt(row.valid.start, |o, s| {
@@ -3554,6 +3560,10 @@ impl<'r> In<'r, '_, '_, '_> {
             Ok(tc::Variant { key, name, ctor, fields: List { start, len } })
         })?;
         let fields = self.own("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
+        let field_vis = self.own("an ADT's field visibilities", |r| {
+            let byte = r.u8("an ADT's field visibility")?;
+            MemberVis::of_byte(byte).ok_or(E::Byte { what: "an ADT's field visibility", byte })
+        })?;
         let repr = self.repr()?;
         let valid = blaze_build::layout::ValidRange {
             start: self.opt("an ADT's valid range start", |r| r.u128("a valid range start"))?,
@@ -3599,7 +3609,10 @@ impl<'r> In<'r, '_, '_, '_> {
         })?;
         let fieldless = self.opt("a fieldless enum's variant count", |r| r.u32("a fieldless enum's variant count"))?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.alloc);
-        let row = AdtRow { kind, generics, variants, fields, repr, valid, discrs, args, marks, lifetimes, field_regions };
+        let row = AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, marks, lifetimes, field_regions };
+        if row.field_vis.len() != row.fields.len() {
+            return Err(E::Shape { what: "an ADT's field visibilities are not one per field" });
+        }
         for v in &row.variants {
             let end = v.fields.start.checked_add(v.fields.len);
             if end.and_then(|e| usize::try_from(e).ok()).is_none_or(|e| e > row.fields.len()) {
@@ -3939,6 +3952,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(r1.kind == r2.kind && r1.generics == r2.generics, "an ADT's kind or generics");
             need!(r1.variants[..] == r2.variants[..], "an ADT's variants");
             need!(r1.fields[..] == r2.fields[..], "an ADT's fields");
+            need!(r1.field_vis[..] == r2.field_vis[..], "an ADT's field visibilities");
             need!(r1.repr == r2.repr && r1.valid == r2.valid, "an ADT's repr");
             need!(r1.args == r2.args, "an ADT's `#[blaze::args]` mark");
             need!(r1.marks == r2.marks, "an ADT's coherence marks");

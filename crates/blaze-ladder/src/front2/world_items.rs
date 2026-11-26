@@ -816,40 +816,55 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn member_visible_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
-        let Some((i, provisional)) = self.store.impl_or_provisional(container) else {
+        use super::heads::MemberVis;
+        let gap = |why: &'static str| self.gap(Gap::MemberVisibility { impl_: container, name, why });
+        let (vis, home, is_adt) = if let Some((i, provisional)) = self.store.impl_or_provisional(container) {
+            if provisional {
+                self.store.note_provisional_read(container);
+            }
+            let Some(at) = i.fns.iter().position(|(n, _)| *n == name) else { return Ok(true) };
+            let Some(&vis) = i.fn_vis.get(at) else {
+                return gap("its impl's head holds no visibility for it");
+            };
+            if vis == MemberVis::Public {
+                return Ok(true);
+            }
+            let Some(frame) = self.store.member_frame(container) else {
+                return gap("its impl's head holds no members' frame (the impl's module)");
+            };
+            (vis, frame.module, false)
+        } else if let Some(adt) = self.store.adts.get(&container) {
+            let Some(at) = adt.fields.iter().position(|f| f.name == name) else { return Ok(true) };
+            let Some(&vis) = adt.field_vis.get(at) else { return Ok(true) };
+            if vis == MemberVis::Public {
+                return Ok(true);
+            }
+            let Some(lib) = self.keys.library_in(self.names, container) else { return Ok(true) };
+            let Some(home) = self.names.home_of(lib) else { return Ok(true) };
+            (vis, home, true)
+        } else {
             return match self.detail(container) {
-                Some(ItemDetail::Impl) => self.want(container),
-                // No inherent impl: the question was asked of no member, nothing hides it.
+                Some(ItemDetail::Impl | ItemDetail::Struct | ItemDetail::Union) => self.want(container),
+                // Neither an inherent impl nor a struct/union: nothing hides the member.
                 _ => Ok(true),
             };
         };
-        if provisional {
-            self.store.note_provisional_read(container);
-        }
-        let Some(at) = i.fns.iter().position(|(n, _)| *n == name) else { return Ok(true) };
-        let Some(&vis) = i.fn_vis.get(at) else {
-            return self.gap(Gap::MemberVisibility { impl_: container, name, why: "its impl's head holds no visibility for it" });
-        };
-        use super::heads::MemberVis;
-        let gap = |why: &'static str| self.gap(Gap::MemberVisibility { impl_: container, name, why });
-        if vis == MemberVis::Public {
-            return Ok(true);
-        }
-        let Some(frame) = self.store.member_frame(container) else { return gap("its impl's head holds no members' frame (the impl's module)") };
-        let home = frame.module;
         let (Some(home_crate), Some(body_crate)) = (self.names.crate_of(home), self.names.crate_of(self.module)) else {
-            return gap("the names hold no crate for the impl's module or the body's");
+            return if is_adt { Ok(true) } else { gap("the names hold no crate for the impl's module or the body's") };
         };
         // `pub(crate)`, `pub(super)`, `pub(in ..)` and private never reach past the crate.
         if home_crate != body_crate {
             return Ok(false);
+        }
+        if home == self.module {
+            return Ok(true);
         }
         let up = match vis {
             MemberVis::Public | MemberVis::Crate => return Ok(true),
             MemberVis::SelfMod => 0,
             MemberVis::Super => 1,
             MemberVis::Up { up } => up,
-            // The ancestor `depth` modules below the root: the impl's module's own depth, less
+            // The ancestor `depth` modules below the root: the item's module's own depth, less
             // `depth`, steps up (the path names an ancestor: heads.rs `MemberVis::InCrate`).
             MemberVis::InCrate { depth } => {
                 let mut deepest = None;
@@ -857,29 +872,47 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     match self.names.written_module(home, n) {
                         Ok(_) => deepest = Some(n),
                         Err(e) if matches!(e.why, blaze_scope::names::Why::SuperPastRoot) => break,
-                        Err(_) => return gap("the impl's module chain is not held"),
+                        Err(_) => return if is_adt { Ok(true) } else { gap("the impl's module chain is not held") },
                     }
                 }
-                let Some(at_root) = deepest else { return gap("the impl's module chain is not held") };
+                let Some(at_root) = deepest else {
+                    return if is_adt { Ok(true) } else { gap("the impl's module chain is not held") };
+                };
                 match at_root.checked_sub(depth) {
                     Some(up) => up,
-                    None => return gap("its `pub(in crate::..)` path is deeper than the impl's module: no ancestor (rustc E0742)"),
+                    None => {
+                        return if is_adt {
+                            Ok(true)
+                        } else {
+                            gap("its `pub(in crate::..)` path is deeper than the impl's module: no ancestor (rustc E0742)")
+                        };
+                    }
                 }
             }
-            MemberVis::InPath => return gap("it is `pub(in path)` in a form other than `crate::..` or `super::..`, and the body is in the impl's crate"),
+            MemberVis::InPath => {
+                return if is_adt {
+                    Ok(true)
+                } else {
+                    gap("it is `pub(in path)` in a form other than `crate::..` or `super::..`, and the body is in the impl's crate")
+                };
+            }
         };
         let Ok(scope) = self.names.written_module(home, up) else {
-            return gap("the impl's module chain is not held (or `pub(super)` at the crate's root)");
+            return if is_adt {
+                Ok(true)
+            } else {
+                gap("the impl's module chain is not held (or `pub(super)` at the crate's root)")
+            };
         };
         for n in 0..=u8::MAX {
             match self.names.written_module(self.module, n) {
                 Ok(m) if m == scope => return Ok(true),
                 Ok(_) => {}
                 Err(e) if matches!(e.why, blaze_scope::names::Why::SuperPastRoot) => return Ok(false),
-                Err(_) => return gap("the body's module chain is not held"),
+                Err(_) => return if is_adt { Ok(true) } else { gap("the body's module chain is not held") },
             }
         }
-        gap("the body's module is deeper than 256 modules (rule 18)")
+        if is_adt { Ok(true) } else { gap("the body's module is deeper than 256 modules (rule 18)") }
     }
 
     fn adt_once(&self, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
