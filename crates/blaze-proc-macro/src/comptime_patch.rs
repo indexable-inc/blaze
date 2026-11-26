@@ -31,7 +31,7 @@ use blaze_expand::{
 use blaze_own::{AVec, Alloc};
 
 /// Versioned digest domain used when caching pure comptime-patch expansions.
-pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v3";
+pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v4";
 
 /// Cumulative telemetry counters for the built-in comptime patch library.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -1029,6 +1029,26 @@ fn quote_str(s: &str) -> String {
     out
 }
 
+fn quote_bytes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 3);
+    out.push_str("b\"");
+    for &b in s.as_bytes() {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(char::from(b)),
+            _ => {
+                let _ = write!(out, "\\x{b:02x}");
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 // =================================================================================================
 // 1. `serde_derive` Comptime Patch (`Serialize` & `Deserialize`)
 // =================================================================================================
@@ -1697,6 +1717,26 @@ fn gen_serde_struct_visitor(
     );
     let _ = writeln!(
         out,
+        "                fn visit_u64<__E>(self, __v: u64) -> ::core::result::Result<Self::Value, __E> where __E: {sp}::de::Error {{ match __v {{"
+    );
+    for (seq_idx, &(idx, _, _)) in active.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "                    {seq_idx}u64 => ::core::result::Result::Ok(__Field::__f{idx}),"
+        );
+    }
+    if cattrs.deny_unknown_fields {
+        let _ = writeln!(
+            out,
+            "                    _ => ::core::result::Result::Err({sp}::de::Error::invalid_value({sp}::de::Unexpected::Unsigned(__v), &{})),",
+            quote_str(&format!("field index 0 <= i < {}", active.len()))
+        );
+    } else {
+        let _ = writeln!(out, "                    _ => ::core::result::Result::Ok(__Field::__ignore),");
+    }
+    let _ = writeln!(out, "                }} }}");
+    let _ = writeln!(
+        out,
         "                fn visit_str<__E>(self, __v: &str) -> ::core::result::Result<Self::Value, __E> where __E: {sp}::de::Error {{ match __v {{"
     );
     for (idx, _, wire) in &active {
@@ -1710,6 +1750,26 @@ fn gen_serde_struct_visitor(
         let _ = writeln!(
             out,
             "                    _ => ::core::result::Result::Err({sp}::de::Error::unknown_field(__v, __FIELDS)),"
+        );
+    } else {
+        let _ = writeln!(out, "                    _ => ::core::result::Result::Ok(__Field::__ignore),");
+    }
+    let _ = writeln!(out, "                }} }}");
+    let _ = writeln!(
+        out,
+        "                fn visit_bytes<__E>(self, __v: &[u8]) -> ::core::result::Result<Self::Value, __E> where __E: {sp}::de::Error {{ match __v {{"
+    );
+    for (idx, _, wire) in &active {
+        let _ = writeln!(
+            out,
+            "                    {} => ::core::result::Result::Ok(__Field::__f{idx}),",
+            quote_bytes(wire)
+        );
+    }
+    if cattrs.deny_unknown_fields {
+        let _ = writeln!(
+            out,
+            "                    _ => match ::core::str::from_utf8(__v) {{ ::core::result::Result::Ok(__s) => ::core::result::Result::Err({sp}::de::Error::unknown_field(__s, __FIELDS)), ::core::result::Result::Err(_) => ::core::result::Result::Err({sp}::de::Error::invalid_value({sp}::de::Unexpected::Bytes(__v), &self)) }},"
         );
     } else {
         let _ = writeln!(out, "                    _ => ::core::result::Result::Ok(__Field::__ignore),");
@@ -2020,6 +2080,22 @@ fn gen_serde_enum_deserialize(
     );
     let _ = writeln!(
         out,
+        "                fn visit_u64<__E>(self, __v: u64) -> ::core::result::Result<Self::Value, __E> where __E: {sp}::de::Error {{ match __v {{"
+    );
+    for (seq_idx, &(vi, _)) in active_vars.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "                    {seq_idx}u64 => ::core::result::Result::Ok(__Field::__v{vi}),"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "                    _ => ::core::result::Result::Err({sp}::de::Error::invalid_value({sp}::de::Unexpected::Unsigned(__v), &{})),",
+        quote_str(&format!("variant index 0 <= i < {}", active_vars.len()))
+    );
+    let _ = writeln!(out, "                }} }}");
+    let _ = writeln!(
+        out,
         "                fn visit_str<__E>(self, __v: &str) -> ::core::result::Result<Self::Value, __E> where __E: {sp}::de::Error {{ match __v {{"
     );
     for (vi, wire) in &active_vars {
@@ -2032,6 +2108,22 @@ fn gen_serde_enum_deserialize(
     let _ = writeln!(
         out,
         "                    _ => ::core::result::Result::Err({sp}::de::Error::unknown_variant(__v, __VARIANTS)),"
+    );
+    let _ = writeln!(out, "                }} }}");
+    let _ = writeln!(
+        out,
+        "                fn visit_bytes<__E>(self, __v: &[u8]) -> ::core::result::Result<Self::Value, __E> where __E: {sp}::de::Error {{ match __v {{"
+    );
+    for (vi, wire) in &active_vars {
+        let _ = writeln!(
+            out,
+            "                    {} => ::core::result::Result::Ok(__Field::__v{vi}),",
+            quote_bytes(wire)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "                    _ => match ::core::str::from_utf8(__v) {{ ::core::result::Result::Ok(__s) => ::core::result::Result::Err({sp}::de::Error::unknown_variant(__s, __VARIANTS)), ::core::result::Result::Err(_) => ::core::result::Result::Err({sp}::de::Error::invalid_value({sp}::de::Unexpected::Bytes(__v), &self)) }},"
     );
     let _ = writeln!(out, "                }} }}");
     let _ = writeln!(out, "            }}");
@@ -3109,10 +3201,58 @@ mod tests {
     fn comptime_patch_previous_version_is_distinct() {
         assert_ne!(
             COMPTIME_PATCH_VERSION,
-            b"blaze-comptime-patch-v2",
-            "v3 expansion changes struct Deserialize missing-field semantics and must not share v2's digest domain"
+            b"blaze-comptime-patch-v3",
+            "v4 expansion adds visit_u64 and visit_bytes to __FieldVisitor and must not share v3's digest domain"
         );
-        assert_eq!(COMPTIME_PATCH_VERSION, b"blaze-comptime-patch-v3");
+        assert_eq!(COMPTIME_PATCH_VERSION, b"blaze-comptime-patch-v4");
+    }
+
+    #[test]
+    fn serde_deserialize_field_and_variant_visitors_support_u64_and_bytes() {
+        let enum_item = r#"
+            pub enum StaticFileSegment {
+                Headers,
+                Transactions,
+                Receipts,
+            }
+        "#;
+        let enum_de = expand_code("serde_derive", ProcKind::Derive, "Deserialize", enum_item)
+            .expect("enum Deserialize expands");
+        assert!(
+            enum_de.contains("fn visit_u64 <__E>(self, __v: u64)")
+                && enum_de.contains("0u64 =>::core::result::Result::Ok(__Field::__v0)")
+                && enum_de.contains("1u64 =>::core::result::Result::Ok(__Field::__v1)")
+                && enum_de.contains("2u64 =>::core::result::Result::Ok(__Field::__v2)")
+                && enum_de.contains("variant index 0 <= i < 3"),
+            "enum __FieldVisitor must implement visit_u64 for binary deserializers (e.g. bincode):\n{enum_de}"
+        );
+        assert!(
+            enum_de.contains("fn visit_bytes <__E>(self, __v:& [u8])")
+                && enum_de.contains("b\"Headers\" =>::core::result::Result::Ok(__Field::__v0)"),
+            "enum __FieldVisitor must implement visit_bytes:\n{enum_de}"
+        );
+
+        let struct_item = r#"
+            #[serde(deny_unknown_fields)]
+            pub struct SegmentRange {
+                pub start: u64,
+                pub end: u64,
+            }
+        "#;
+        let struct_de = expand_code("serde_derive", ProcKind::Derive, "Deserialize", struct_item)
+            .expect("struct Deserialize expands");
+        assert!(
+            struct_de.contains("fn visit_u64 <__E>(self, __v: u64)")
+                && struct_de.contains("0u64 =>::core::result::Result::Ok(__Field::__f0)")
+                && struct_de.contains("1u64 =>::core::result::Result::Ok(__Field::__f1)")
+                && struct_de.contains("field index 0 <= i < 2"),
+            "struct __FieldVisitor must implement visit_u64:\n{struct_de}"
+        );
+        assert!(
+            struct_de.contains("fn visit_bytes <__E>(self, __v:& [u8])")
+                && struct_de.contains("b\"start\" =>::core::result::Result::Ok(__Field::__f0)"),
+            "struct __FieldVisitor must implement visit_bytes:\n{struct_de}"
+        );
     }
 
     #[test]
@@ -3257,7 +3397,9 @@ mod mini_serde {{
         pub trait Visitor<'de>: Sized {{
             type Value;
             fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;
+            fn visit_u64<E: Error>(self, _v: u64) -> Result<Self::Value, E> {{ Err(E::custom("u64")) }}
             fn visit_str<E: Error>(self, _v: &str) -> Result<Self::Value, E> {{ Err(E::custom("str")) }}
+            fn visit_bytes<E: Error>(self, _v: &[u8]) -> Result<Self::Value, E> {{ Err(E::custom("bytes")) }}
             fn visit_u128<E: Error>(self, _v: u128) -> Result<Self::Value, E> {{ Err(E::custom("u128")) }}
             fn visit_none<E: Error>(self) -> Result<Self::Value, E> {{ Err(E::custom("none")) }}
             fn visit_some<D: super::Deserializer<'de>>(self, _d: D) -> Result<Self::Value, D::Error> {{ Err(D::Error::custom("some")) }}
