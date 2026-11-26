@@ -359,6 +359,7 @@ mod macos_app {
             displays: Vec<ColDisplay>,
             default_grid: bool,
             hidden_mask: u64,
+            initial_sort: Option<(usize, bool)>,
             rows: Vec<Vec<SendValue>>,
         },
         Error {
@@ -417,6 +418,7 @@ mod macos_app {
                         displays,
                         default_grid: t.default_grid,
                         hidden_mask: t.hidden_mask,
+                        initial_sort: t.initial_sort,
                         rows,
                     }
                 }
@@ -476,11 +478,12 @@ mod macos_app {
                     }
                     Value::Record(rec)
                 }
-                Self::Table { columns, displays, default_grid, hidden_mask, rows } => {
+                Self::Table { columns, displays, default_grid, hidden_mask, initial_sort, rows } => {
                     let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
                     let mut t = Table::from_col_names(&col_refs, alloc);
                     t.default_grid = default_grid;
                     t.hidden_mask = hidden_mask;
+                    t.initial_sort = initial_sort;
                     for (col, disp) in columns.iter().zip(displays.into_iter()) {
                         t.set_col_display(col, disp);
                     }
@@ -924,7 +927,12 @@ mod macos_app {
                     }
                 }
             }
+            let display_source = trimmed.to_owned();
             let trimmed = effective_cmd.as_str();
+            let is_standalone_cd = (trimmed == "cd" || trimmed.starts_with("cd "))
+                && !trimmed.contains('|')
+                && !trimmed.contains(';')
+                && !trimmed.contains("&&");
 
             let state_before = self.store.active_state().fork();
             let prompt_snap = self.prompt.clone();
@@ -1078,11 +1086,27 @@ mod macos_app {
 
             let exit_code = res.outcome.exit_code;
             let mut state_after = res.outcome.state;
-            self.bind_output_refs(&mut state_after, &res.outcome.value);
-            let body = body_from_result(res.rust_meta, res.streamed_lines, res.outcome.value);
+            let new_cwd = state_after.cwd.as_ref().to_owned();
+            // Automatically list the destination directory after a standalone `cd` succeeds
+            // (so changing directories immediately shows the sleek compact `ls` grid!).
+            let final_val = if is_standalone_cd
+                && exit_code == 0
+                && matches!(res.outcome.value, Value::Nothing)
+            {
+                let ls_res = run_command_line("ls", state_after.fork(), false);
+                if ls_res.outcome.exit_code == 0 {
+                    ls_res.outcome.value
+                } else {
+                    res.outcome.value
+                }
+            } else {
+                res.outcome.value
+            };
+            self.bind_output_refs(&mut state_after, &final_val);
+            let body = body_from_result(res.rust_meta, res.streamed_lines, final_val);
 
             let block_id = self.store.record_block(
-                trimmed.to_owned(),
+                display_source.clone(),
                 prompt_snap.clone(),
                 state_before,
                 state_after.fork(),
@@ -1095,13 +1119,12 @@ mod macos_app {
                 blk.duration_ns = duration_ns;
             }
             self.store.set_active_state(state_after);
-            let new_cwd = self.store.active_state().cwd.as_ref().to_owned();
             if new_cwd != prompt_snap.cwd {
                 let lh = self.editor.local_host.clone();
                 self.editor.zoxide.record_visit(&lh, &new_cwd, now_ns());
             }
             self.editor.record_history_entry(HistoryEntry {
-                command: trimmed.to_owned(),
+                command: display_source,
                 host: prompt_snap.host,
                 cwd: prompt_snap.cwd,
                 git_branch: prompt_snap.git_branch,
@@ -3466,18 +3489,21 @@ mod macos_app {
                             } else {
                                 match key {
                                     Key::Enter | Key::NumpadEnter => {
-                                        if popup_engaged && !shell.editor.completions.is_empty() {
-                                            shell.editor.apply_selected_completion();
-                                            popup_engaged = false;
-                                            shell.refresh_editor_assist(false);
-                                        } else if shift || shell.editor.is_incomplete() {
+                                        if shift || shell.editor.is_incomplete() {
                                             shell.editor.insert_char('\n');
                                             popup_engaged = false;
                                         } else {
-                                            // Expand trailing command-position abbreviation (`l`, `gs`, `..`) before running.
-                                            shell.editor.try_expand_abbreviation();
+                                            // IntelliJ-style: when a completion item is highlighted in
+                                            // the popup, Enter accepts it AND immediately executes!
+                                            if popup_engaged && !shell.editor.completions.is_empty() {
+                                                shell.editor.apply_selected_completion();
+                                            } else {
+                                                // Expand trailing command-position abbreviation (`l`, `gs`, `..`).
+                                                shell.editor.try_expand_abbreviation();
+                                            }
                                             let cmd = shell.editor.take_submitted();
                                             popup_engaged = false;
+                                            active_popover = None;
                                             let (cols, rows) = grid_for(size, &fonts, scale);
                                             let cpx = (
                                                 fonts.metrics.cell_w as u32,
@@ -3487,19 +3513,26 @@ mod macos_app {
                                         }
                                     }
                                     Key::Tab => {
-                                        if !shell.editor.completions.is_empty() && !popup_engaged {
+                                        if shift && !shell.editor.completions.is_empty() {
+                                            // Shift+Tab cycles backward through the completion popup.
+                                            popup_engaged = true;
+                                            shell.editor.move_up();
+                                        } else if !shell.editor.completions.is_empty() {
+                                            // IntelliJ-style: Tab accepts the selected argument into
+                                            // the prompt without executing so you can keep typing!
                                             shell.editor.apply_selected_completion();
                                             popup_engaged = false;
                                             shell.refresh_editor_assist(false);
-                                        } else if shell.editor.completions.is_empty()
-                                            && shell.editor.tab_out()
-                                        {
+                                        } else if !shift && shell.editor.tab_out() {
                                             shell.refresh_editor_assist(false);
                                         } else {
                                             let st = shell.store.active_state().fork();
                                             let cols = shell.recent_table_columns();
                                             shell.editor.trigger_completion_with_cols(&st, &cols);
                                             popup_engaged = !shell.editor.completions.is_empty();
+                                            if shift && popup_engaged {
+                                                shell.editor.move_up();
+                                            }
                                         }
                                     }
                                     Key::Escape => {

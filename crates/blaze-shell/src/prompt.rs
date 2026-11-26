@@ -259,10 +259,16 @@ pub fn short_dir_display(cwd: &str, home: &str, work_tree: Option<&Path>) -> Str
         return abbr;
     }
     let parts: Vec<&str> = abbr.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() <= 2 {
+    if abbr.starts_with("~/") {
+        // `parts[0]` is `"~"`, so `parts.len() <= 3` (e.g. `~/Downloads/foo`) has ZERO omitted
+        // segments — never emit a spurious `~/…/` ellipsis!
+        if parts.len() <= 3 {
+            abbr
+        } else {
+            format!("~/…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+        }
+    } else if parts.len() <= 2 {
         abbr
-    } else if abbr.starts_with("~/") {
-        format!("~/…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
     } else {
         format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
     }

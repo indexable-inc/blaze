@@ -237,6 +237,9 @@ pub struct Table<'a> {
     /// Bitmask of column indices hidden by default in table views (e.g. `type` in `ls` where
     /// the file icon already communicates it); pipelines (`where`, `select`) still see all columns.
     pub hidden_mask: u64,
+    /// Optional active sort `(col_idx, descending)` produced by `sort-by <col>` so table renderers
+    /// display the sort indicator immediately and keep progressive values (`blaze-dust`) sorted.
+    pub initial_sort: Option<(usize, bool)>,
 }
 
 impl<'a> Share for Table<'a> {}
@@ -249,7 +252,15 @@ impl<'a> Table<'a> {
             cols.push(PVec::new(alloc));
             col_display.push(ColDisplay::Auto);
         }
-        Table { columns, cols, col_display, nrows: 0, default_grid: false, hidden_mask: 0 }
+        Table {
+            columns,
+            cols,
+            col_display,
+            nrows: 0,
+            default_grid: false,
+            hidden_mask: 0,
+            initial_sort: None,
+        }
     }
 
     /// Create an empty table with identical columns, [`ColDisplay`] metadata, and hidden-column defaults.
@@ -266,6 +277,7 @@ impl<'a> Table<'a> {
             nrows: 0,
             default_grid: false,
             hidden_mask: self.hidden_mask,
+            initial_sort: None,
         }
     }
 
@@ -435,6 +447,7 @@ impl<'a> Table<'a> {
             nrows: self.nrows,
             default_grid: false,
             hidden_mask: 0,
+            initial_sort: None,
         })
     }
 
@@ -464,6 +477,7 @@ impl<'a> Table<'a> {
             nrows: self.nrows,
             default_grid: false,
             hidden_mask,
+            initial_sort: None,
         }
     }
 

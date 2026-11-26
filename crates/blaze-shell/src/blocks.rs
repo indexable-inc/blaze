@@ -201,11 +201,13 @@ impl BlockStore {
         exit_code: i32,
         body: BlockBody,
     ) -> BlockId {
-        let folded = match &body {
+        let (folded, initial_sort) = match &body {
             BlockBody::Value(Value::Table(t))
             | BlockBody::StreamAndValue { value: Value::Table(t), .. }
-            | BlockBody::RustCell { value: Value::Table(t), .. } => t.nrows() > TABLE_FOLD_ROWS,
-            _ => false,
+            | BlockBody::RustCell { value: Value::Table(t), .. } => {
+                (t.nrows() > TABLE_FOLD_ROWS, t.initial_sort)
+            }
+            _ => (false, None),
         };
         let block = Block {
             id: BlockId(0),
@@ -223,7 +225,7 @@ impl BlockStore {
             show_hidden_cols: false,
             table_scroll_y: 0.0,
             table_scroll_x: 0.0,
-            table_sort: None,
+            table_sort: initial_sort,
             col_width_overrides: Vec::new(),
             expanded_cells: Vec::new(),
             body,
