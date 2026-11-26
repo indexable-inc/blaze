@@ -202,6 +202,8 @@ pub enum ColDisplay {
     Auto,
     /// File or directory entry (renders with file-type / folder icon).
     FileEntry,
+    /// Hierarchical tree entry with box-drawing branch prefix + file/folder icon.
+    TreeEntry,
     /// Byte size with proportional bar.
     FileSize,
     /// Duration column.

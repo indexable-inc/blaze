@@ -1304,24 +1304,42 @@ impl Editor {
         self.dismiss_completions();
     }
 
-    /// `Cmd+Backspace`: kill from start of current line to cursor.
+    /// `Cmd+Backspace`: delete active selection, kill from start of current line to cursor,
+    /// or join with the line above when at column 0 of a continuation line.
     pub fn kill_to_line_start(&mut self) {
         if self.selection_range().is_some() {
             self.push_undo(EditOp::Other);
             self.delete_selection_raw();
+            if self.vim.visual_selection(&self.text).is_some() {
+                self.vim.set_mode(&self.text, VimMode::Insert);
+            }
+            self.vim.set_cursor(&self.text, self.cursor);
+            self.history_pos = None;
+            self.ghost = None;
             self.dismiss_completions();
             return;
         }
         self.clamp_cursor();
+        if self.cursor == 0 {
+            self.selection_anchor = None;
+            return;
+        }
         let line_start = self.text[..self.cursor].rfind('\n').map_or(0, |p| p + 1);
-        if line_start < self.cursor {
-            self.push_undo(EditOp::Other);
+        self.push_undo(EditOp::Other);
+        if self.cursor > line_start {
             self.text.drain(line_start..self.cursor);
             self.cursor = line_start;
-            self.selection_anchor = None;
-            self.history_pos = None;
-            self.dismiss_completions();
+        } else {
+            // `cursor == line_start && cursor > 0`: remove the single preceding `'\n'`
+            // so `Cmd+Backspace` on an empty continuation line joins with the line above cleanly.
+            self.text.drain(self.cursor - 1..self.cursor);
+            self.cursor -= 1;
         }
+        self.selection_anchor = None;
+        self.vim.set_cursor(&self.text, self.cursor);
+        self.history_pos = None;
+        self.ghost = None;
+        self.dismiss_completions();
     }
 
     /// `Ctrl+W` / `Alt+Backspace`: kill word before cursor.
@@ -3352,4 +3370,87 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
 
 fn nth_char_byte_offset(line: &str, n: usize) -> usize {
     line.char_indices().nth(n).map_or(line.len(), |(idx, _)| idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_to_line_start_single_line_and_undo() {
+        let mut ed = Editor::new();
+        ed.set_text_initial("ls -la /tmp".to_owned());
+        ed.kill_to_line_start();
+        assert_eq!(ed.text, "");
+        assert_eq!(ed.cursor, 0);
+        assert_eq!(ed.selection_range(), None);
+
+        // Undo restores original text and cursor.
+        assert!(ed.undo());
+        assert_eq!(ed.text, "ls -la /tmp");
+        assert_eq!(ed.cursor, 11);
+    }
+
+    #[test]
+    fn kill_to_line_start_middle_of_line() {
+        let mut ed = Editor::new();
+        ed.set_text_initial("echo hello world".to_owned());
+        ed.cursor = 11; // right after "echo hello "
+        ed.kill_to_line_start();
+        assert_eq!(ed.text, "world");
+        assert_eq!(ed.cursor, 0);
+
+        // Calling again at cursor 0 is a no-op and does not pollute undo.
+        ed.kill_to_line_start();
+        assert_eq!(ed.text, "world");
+        assert_eq!(ed.cursor, 0);
+        assert!(ed.undo());
+        assert_eq!(ed.text, "echo hello world");
+        assert_eq!(ed.cursor, 11);
+    }
+
+    #[test]
+    fn kill_to_line_start_multiline_line_two() {
+        let mut ed = Editor::new();
+        ed.set_text_initial("let x = 1\necho hello world".to_owned());
+        ed.cursor = "let x = 1\necho hello".len();
+        ed.kill_to_line_start();
+        assert_eq!(ed.text, "let x = 1\n world");
+        assert_eq!(ed.cursor, "let x = 1\n".len());
+    }
+
+    #[test]
+    fn kill_to_line_start_empty_continuation_line_joins_above() {
+        let mut ed = Editor::new();
+        ed.set_text_initial("let x = 1\n".to_owned());
+        assert_eq!(ed.cursor, 10);
+        ed.kill_to_line_start();
+        assert_eq!(ed.text, "let x = 1");
+        assert_eq!(ed.cursor, 9);
+
+        // Also works at column 0 of a non-empty continuation line.
+        ed.set_text_initial("line1\nline2".to_owned());
+        ed.cursor = 6;
+        ed.kill_to_line_start();
+        assert_eq!(ed.text, "line1line2");
+        assert_eq!(ed.cursor, 5);
+        assert!(ed.undo());
+        assert_eq!(ed.text, "line1\nline2");
+        assert_eq!(ed.cursor, 6);
+    }
+
+    #[test]
+    fn kill_to_line_start_deletes_active_selection() {
+        let mut ed = Editor::new();
+        ed.set_text_initial("hello cruel world".to_owned());
+        ed.selection_anchor = Some(6);
+        ed.cursor = 12;
+        ed.kill_to_line_start();
+        assert_eq!(ed.text, "hello world");
+        assert_eq!(ed.cursor, 6);
+        assert_eq!(ed.selection_range(), None);
+
+        assert!(ed.undo());
+        assert_eq!(ed.text, "hello cruel world");
+    }
 }

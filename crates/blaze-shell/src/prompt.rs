@@ -63,6 +63,24 @@ pub struct GitStashEntry {
     pub total_removed: u32,
 }
 
+/// Rich per-file metadata for uncommitted changes shown in the prompt hover popover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFileDetail {
+    pub path: String,
+    pub icon: &'static str,
+    /// Short single-char status tag (`"+"`, `"M"`, `"D"`, `"?"`, `"!"`).
+    pub tag: &'static str,
+    /// Human-readable status word (`"staged"`, `"modified"`, `"deleted"`, `"untracked"`, `"conflict"`).
+    pub status_label: &'static str,
+    /// Semantic file type from `blaze-sniff` (e.g. `"Lockfile"`, `"Env"`, `"Rust"`, `"TOML"`).
+    pub kind_label: &'static str,
+    /// On-disk byte size when the file exists.
+    pub size_bytes: Option<u64>,
+    /// Diff line additions/deletions for tracked modified/staged files (`+N -M`), when available.
+    pub added_lines: Option<u32>,
+    pub deleted_lines: Option<u32>,
+}
+
 /// Full Starship-class Git prompt summary produced by `blaze-git`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitStatusSummary {
@@ -79,6 +97,8 @@ pub struct GitStatusSummary {
     pub changed_icons: Vec<(&'static str, u32)>,
     /// Representative uncommitted files `(rel_path, icon_name, status_tag)` for hover inspection.
     pub changed_files: Vec<(String, &'static str, &'static str)>,
+    /// Rich per-file metadata for uncommitted files (status, sniffed kind, size, diff stats), max 32.
+    pub changed_details: Vec<ChangedFileDetail>,
     /// Recent stash descriptions parsed directly from `logs/refs/stash` (newest first, max 8).
     pub stashes: Vec<String>,
     /// Rich stash entries with per-file `+`/`-` diff stats (cached by stash reflog mtime).
@@ -423,8 +443,11 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     .unwrap_or_default();
 
                 // Collect distinct IntelliJ SVG icons and representative file paths for uncommitted files.
+                const MAX_CHANGED_DETAILS: usize = 32;
                 let mut changed_icons: Vec<(&'static str, u32)> = Vec::new();
                 let mut changed_files: Vec<(String, &'static str, &'static str)> = Vec::new();
+                let mut changed_details: Vec<ChangedFileDetail> = Vec::new();
+                let mut tracked_diff_paths: Vec<String> = Vec::new();
                 for sample in status.changed_samples.iter() {
                     let p = sample.path.as_str();
                     let leaf = p.rsplit('/').next().unwrap_or(p);
@@ -442,8 +465,41 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     } else {
                         changed_icons.push((icon, 1));
                     }
+                    if changed_details.len() < MAX_CHANGED_DETAILS {
+                        let abs = head.work_tree.join(p);
+                        let size_bytes = fs::metadata(&abs)
+                            .ok()
+                            .filter(|m| m.is_file())
+                            .map(|m| m.len());
+                        let kind_label = classify_changed_file_kind(&abs, leaf);
+                        if tag != "?" {
+                            tracked_diff_paths.push(p.to_owned());
+                        }
+                        changed_details.push(ChangedFileDetail {
+                            path: p.to_owned(),
+                            icon,
+                            tag,
+                            status_label: status_label_for_tag(tag),
+                            kind_label,
+                            size_bytes,
+                            added_lines: None,
+                            deleted_lines: None,
+                        });
+                    }
                 }
                 changed_icons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+                if !tracked_diff_paths.is_empty() {
+                    let diff_stats = read_git_diff_numstat(&head.work_tree, &tracked_diff_paths);
+                    for detail in &mut changed_details {
+                        if detail.tag != "?"
+                            && let Some(&(added, deleted)) = diff_stats.get(detail.path.as_str())
+                        {
+                            detail.added_lines = Some(added);
+                            detail.deleted_lines = Some(deleted);
+                        }
+                    }
+                }
 
                 let stashes = read_git_stashes(&head.common_dir, 8);
                 let stash_entries = if stashes.is_empty() {
@@ -468,6 +524,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     status_badge,
                     changed_icons,
                     changed_files,
+                    changed_details,
                     stashes,
                     stash_entries,
                     branches,
@@ -492,6 +549,104 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
         }
     }
     None
+}
+
+/// Map a short status tag (`"+"`, `"M"`, `"D"`, `"?"`, `"!"`) to its human-readable status word.
+fn status_label_for_tag(tag: &'static str) -> &'static str {
+    match tag {
+        "+" => "staged",
+        "M" => "modified",
+        "D" => "deleted",
+        "?" => "untracked",
+        "!" => "conflict",
+        other => other,
+    }
+}
+
+/// Classify a changed working-tree entry using `blaze-sniff` (reading up to 512 header bytes
+/// when the file exists on disk so magic headers & shebangs are detected).
+fn classify_changed_file_kind(abs: &Path, leaf: &str) -> &'static str {
+    let sym_meta = fs::symlink_metadata(abs).ok();
+    if let Some(ref m) = sym_meta {
+        if m.file_type().is_symlink() {
+            return blaze_sniff::sniff_symlink().label;
+        }
+        if m.is_dir() {
+            return blaze_sniff::sniff_dir(leaf, blaze_sniff::DirMarkers::default()).label;
+        }
+    }
+    let mut head_buf = [0u8; blaze_sniff::SNIFF_HEAD_BYTES];
+    let n = if sym_meta.as_ref().is_some_and(|m| m.is_file()) {
+        File::open(abs)
+            .and_then(|mut f| f.read(&mut head_buf))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let res = blaze_sniff::sniff_file(leaf, &head_buf[..n]);
+    if matches!(res.label, "Plain text" | "Empty") {
+        if let Some((_, ext)) = leaf.rsplit_once('.')
+            && ext.eq_ignore_ascii_case("env")
+        {
+            return "Env";
+        }
+        if sym_meta.is_none() && res.label == "Empty" {
+            return "File";
+        }
+    }
+    res.label
+}
+
+/// Parse `git diff --numstat` lines (`<added>\t<deleted>\t<path>`) into `path -> (added, deleted)`.
+/// Binary entries (`-\t-\t<path>`) are omitted so callers leave line counts `None`.
+fn parse_git_diff_numstat(stdout: &str) -> std::collections::HashMap<String, (u32, u32)> {
+    let mut map = std::collections::HashMap::new();
+    for line in stdout.lines().take(256) {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a_s), Some(d_s), Some(raw_path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let path = raw_path.trim_end_matches('\r');
+        if path.is_empty() || a_s == "-" || d_s == "-" {
+            continue;
+        }
+        if let (Ok(added), Ok(deleted)) = (a_s.parse::<u32>(), d_s.parse::<u32>()) {
+            map.insert(path.to_owned(), (added, deleted));
+        }
+    }
+    map
+}
+
+/// Run one fast bounded `git -C <work_tree> diff --numstat HEAD` for up to 32 tracked paths.
+fn read_git_diff_numstat(
+    work_tree: &Path,
+    tracked_paths: &[String],
+) -> std::collections::HashMap<String, (u32, u32)> {
+    use std::process::{Command, Stdio};
+
+    if tracked_paths.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(work_tree)
+        .args(["-c", "core.quotepath=false", "diff", "--numstat", "--no-renames", "HEAD", "--"]);
+    for p in tracked_paths.iter().take(32) {
+        cmd.arg(p);
+    }
+    let Ok(out) = cmd
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return std::collections::HashMap::new();
+    };
+    if !out.status.success() {
+        return std::collections::HashMap::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_git_diff_numstat(&text)
 }
 
 /// Read local git branch names for `cwd` with zero subprocesses (for prompt popover & `git` tab completion).
@@ -1013,14 +1168,7 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
             tbl.default_grid = false;
 
             for (rel_path, _icon, tag) in &summary.changed_files {
-                let status_label = match *tag {
-                    "+" => "staged",
-                    "M" => "modified",
-                    "D" => "deleted",
-                    "?" => "untracked",
-                    "!" => "conflict",
-                    other => other,
-                };
+                let status_label = status_label_for_tag(*tag);
                 let abs = head.work_tree.join(rel_path);
                 let (size_val, mod_val) = match fs::metadata(&abs) {
                     Ok(meta) => {
@@ -1471,4 +1619,142 @@ pub fn git_ls_entry_statuses(
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_repo(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "blaze-shell-prompt-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let st = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn git");
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn parse_numstat_handles_text_and_binary() {
+        let raw = "12\t3\tsrc/prompt.rs\n-\t-\tassets/logo.png\n0\t5\told.md\r\n\n";
+        let map = parse_git_diff_numstat(raw);
+        assert_eq!(map.get("src/prompt.rs"), Some(&(12, 3)));
+        assert_eq!(map.get("old.md"), Some(&(0, 5)));
+        assert!(!map.contains_key("assets/logo.png"));
+        assert_eq!(status_label_for_tag("+"), "staged");
+        assert_eq!(status_label_for_tag("M"), "modified");
+        assert_eq!(status_label_for_tag("D"), "deleted");
+        assert_eq!(status_label_for_tag("?"), "untracked");
+        assert_eq!(status_label_for_tag("!"), "conflict");
+    }
+
+    #[test]
+    fn changed_details_populates_status_kind_size_and_diff_stats() {
+        let dir = make_temp_repo("changed-details");
+        run_git(&dir, &["init", "-q", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "test@blaze.dev"]);
+        run_git(&dir, &["config", "user.name", "Blaze Test"]);
+
+        fs::create_dir_all(dir.join("src")).expect("mkdir src");
+        fs::write(dir.join("src/lib.rs"), "pub fn a() {}\npub fn b() {}\n").expect("write lib.rs");
+        fs::write(dir.join("config.toml"), "mode = \"slow\"\n").expect("write toml");
+        fs::write(dir.join("old.md"), "# old doc\n").expect("write old.md");
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-q", "-m", "init"]);
+
+        // 1. Untracked-only snapshot first (verifies 0ms no-git-diff path too).
+        fs::write(dir.join("k3-meta.install.lock"), "v1\n").expect("write lock");
+        fs::write(dir.join("local-bf16.env"), "MODEL=bf16\n").expect("write env");
+        let untracked_only = query_blaze_git_status(dir.to_str().unwrap()).expect("git status");
+        assert_eq!(untracked_only.changed_details.len(), 2);
+        let lock = untracked_only
+            .changed_details
+            .iter()
+            .find(|d| d.path == "k3-meta.install.lock")
+            .expect("lock detail");
+        assert_eq!(lock.tag, "?");
+        assert_eq!(lock.status_label, "untracked");
+        assert_eq!(lock.kind_label, "Lockfile");
+        assert_eq!(lock.size_bytes, Some(3));
+        assert_eq!(lock.added_lines, None);
+        assert_eq!(lock.deleted_lines, None);
+
+        let env = untracked_only
+            .changed_details
+            .iter()
+            .find(|d| d.path == "local-bf16.env")
+            .expect("env detail");
+        assert_eq!(env.tag, "?");
+        assert_eq!(env.status_label, "untracked");
+        assert_eq!(env.kind_label, "Env");
+        assert_eq!(env.size_bytes, Some(11));
+        assert_eq!(env.added_lines, None);
+        assert_eq!(env.deleted_lines, None);
+
+        // 2. Mix tracked modified, deleted, and untracked files.
+        fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn a() {}\npub fn c() {}\npub fn d() {}\n",
+        )
+        .expect("modify lib.rs");
+        fs::write(dir.join("config.toml"), "mode = \"fast\"\nworkers = 8\n").expect("modify toml");
+        fs::remove_file(dir.join("old.md")).expect("remove old.md");
+
+        let mixed = query_blaze_git_status(dir.to_str().unwrap()).expect("mixed git status");
+        assert_eq!(mixed.changed_details.len(), mixed.changed_files.len());
+
+        let modified = mixed
+            .changed_details
+            .iter()
+            .find(|d| d.path == "src/lib.rs")
+            .expect("modified lib.rs");
+        assert_eq!(modified.tag, "M");
+        assert_eq!(modified.status_label, "modified");
+        assert_eq!(modified.kind_label, "Rust");
+        assert!(modified.size_bytes.is_some_and(|n| n > 0));
+        assert_eq!(modified.added_lines, Some(2));
+        assert_eq!(modified.deleted_lines, Some(1));
+
+        let toml = mixed
+            .changed_details
+            .iter()
+            .find(|d| d.path == "config.toml")
+            .expect("modified config.toml");
+        assert_eq!(toml.tag, "M");
+        assert_eq!(toml.status_label, "modified");
+        assert_eq!(toml.kind_label, "TOML");
+        assert!(toml.size_bytes.is_some_and(|n| n > 0));
+        assert_eq!(toml.added_lines, Some(2));
+        assert_eq!(toml.deleted_lines, Some(1));
+
+        assert_eq!(mixed.deleted, 1);
+        assert_eq!(
+            classify_changed_file_kind(&dir.join("old.md"), "old.md"),
+            "Markdown"
+        );
+        assert_eq!(
+            classify_changed_file_kind(&dir.join("deleted_noext"), "deleted_noext"),
+            "File"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

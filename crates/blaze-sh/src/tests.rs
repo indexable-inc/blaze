@@ -24,6 +24,7 @@ struct FakeHost {
     now: DateTime,
     streams: StdVec<StdString>,
     rust_calls: StdVec<(StdVec<StdString>, StdString, StdString)>,
+    rm_ops: StdVec<(StdString, bool, bool, bool)>,
     fork_count: usize,
 }
 
@@ -66,6 +67,7 @@ impl FakeHost {
             now: DateTime { utc_ns: 1_732_500_000_000_000_000, offset_secs: 0 },
             streams: StdVec::new(),
             rust_calls: StdVec::new(),
+            rm_ops: StdVec::new(),
             fork_count: 0,
         }
     }
@@ -143,7 +145,13 @@ impl FakeHost {
                     FsOp::Touch { path } => {
                         self.files.entry(StdString::from(path.as_str())).or_default();
                     }
-                    FsOp::Rm { path, force, .. } => {
+                    FsOp::Rm { path, recursive, force, permanent } => {
+                        self.rm_ops.push((
+                            StdString::from(path.as_str()),
+                            recursive,
+                            force,
+                            permanent,
+                        ));
                         let existed = self.files.remove(path.as_str()).is_some()
                             || self.dirs.remove(path.as_str()).is_some();
                         if !existed && !force {
@@ -578,4 +586,182 @@ fn external_command_returns_structured_timed_output() {
     }
     let piped = host.run("\"hi\" | upper | str downcase", st.fork());
     assert_eq!(piped.value, Value::string("hi", alloc()));
+}
+
+#[test]
+fn rm_defaults_to_trash_and_parses_permanent_flag() {
+    let mut host = FakeHost::new();
+    let st = base_state();
+
+    let r1 = host.run("rm hello.txt", st.fork());
+    assert_eq!(r1.exit_code, 0, "got {:?}", r1.value);
+    assert_eq!(
+        host.rm_ops.last(),
+        Some(&(StdString::from("/work/hello.txt"), false, false, false))
+    );
+
+    let r2 = host.run("rm --permanent data.json", st.fork());
+    assert_eq!(r2.exit_code, 0, "got {:?}", r2.value);
+    assert_eq!(
+        host.rm_ops.last(),
+        Some(&(StdString::from("/work/data.json"), false, false, true))
+    );
+
+    let r3 = host.run("rm -P Cargo.toml", st.fork());
+    assert_eq!(r3.exit_code, 0, "got {:?}", r3.value);
+    assert_eq!(
+        host.rm_ops.last(),
+        Some(&(StdString::from("/work/Cargo.toml"), false, false, true))
+    );
+
+    let r4 = host.run("rm -rfP src", st.fork());
+    assert_eq!(r4.exit_code, 0, "got {:?}", r4.value);
+    assert_eq!(
+        host.rm_ops.last(),
+        Some(&(StdString::from("/work/src"), true, true, true))
+    );
+
+    // Spec documents `-P` and `--permanent`.
+    let spec = crate::builtins::find_spec("rm").expect("rm spec");
+    assert!(spec.flags.contains(&"-P"));
+    assert!(spec.flags.contains(&"--permanent"));
+}
+
+#[test]
+fn tree_builtin_builds_hierarchical_dataframe() {
+    let mut host = FakeHost::new();
+    // Extend FakeHost with a nested directory under `/work/src/sub` to test 3 levels and connectors.
+    host.dirs.insert(
+        "/work/src".into(),
+        std::vec![
+            ("main.rs".into(), FileKind::File, 4096),
+            ("sub".into(), FileKind::Dir, 64),
+        ],
+    );
+    host.dirs.insert(
+        "/work/src/sub".into(),
+        std::vec![("deep.rs".into(), FileKind::File, 512)],
+    );
+    let st = base_state();
+
+    // Spec registered with all documented flags.
+    let spec = crate::builtins::find_spec("tree").expect("tree spec");
+    assert!(spec.flags.contains(&"-L"));
+    assert!(spec.flags.contains(&"--depth"));
+    assert!(spec.flags.contains(&"-a"));
+    assert!(spec.flags.contains(&"--all"));
+    assert!(spec.flags.contains(&"-d"));
+    assert!(spec.flags.contains(&"--dirs-only"));
+
+    // Default `tree` (depth 3, dotfiles skipped):
+    // /work -> src (dir), big.bin, Cargo.toml, data.json
+    // /work/src -> sub (dir), main.rs
+    // /work/src/sub -> deep.rs
+    let res = host.run("tree", st.fork());
+    assert_eq!(res.exit_code, 0, "got {:?}", res.value);
+    let Value::Table(tbl) = res.value else {
+        panic!("expected table from `tree`, got {:?}", res.value);
+    };
+    assert!(!tbl.default_grid);
+    let col_names: StdVec<&str> =
+        (0..tbl.ncols()).map(|c| tbl.columns.get(c).unwrap().as_ref()).collect();
+    assert_eq!(
+        col_names,
+        std::vec!["name", "size", "modified", "type", "path", "tree_prefix", "depth"]
+    );
+    assert_eq!(tbl.col_display(0), crate::ColDisplay::TreeEntry);
+    assert_eq!(tbl.col_display(1), crate::ColDisplay::FileSize);
+    assert_eq!(tbl.col_display(2), crate::ColDisplay::HumanTime);
+    assert!(!tbl.is_col_hidden(0));
+    assert!(!tbl.is_col_hidden(1));
+    assert!(!tbl.is_col_hidden(2));
+    assert!(tbl.is_col_hidden(3)); // type
+    assert!(tbl.is_col_hidden(4)); // path
+    assert!(tbl.is_col_hidden(5)); // tree_prefix
+    assert!(tbl.is_col_hidden(6)); // depth
+
+    let rows: StdVec<(&str, &str, &str, i64)> = (0..tbl.nrows())
+        .map(|r| {
+            let name = tbl.get_by_name(r, "name").and_then(Value::as_str).unwrap();
+            let path = tbl.get_by_name(r, "path").and_then(Value::as_str).unwrap();
+            let prefix = tbl.get_by_name(r, "tree_prefix").and_then(Value::as_str).unwrap();
+            let depth = match tbl.get_by_name(r, "depth") {
+                Some(Value::Int(d)) => *d,
+                other => panic!("expected int depth, got {other:?}"),
+            };
+            (name, path, prefix, depth)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        std::vec![
+            ("src", "src", "├── ", 0),
+            ("sub", "src/sub", "│   ├── ", 1),
+            ("deep.rs", "src/sub/deep.rs", "│   │   └── ", 2),
+            ("main.rs", "src/main.rs", "│   └── ", 1),
+            ("big.bin", "big.bin", "├── ", 0),
+            ("Cargo.toml", "Cargo.toml", "├── ", 0),
+            ("data.json", "data.json", "└── ", 0),
+        ]
+    );
+
+    // `tree -L 1` limits traversal to depth 0 entries only.
+    let res_l1 = host.run("tree -L 1", st.fork());
+    assert_eq!(res_l1.exit_code, 0, "got {:?}", res_l1.value);
+    let Value::Table(tbl_l1) = res_l1.value else {
+        panic!("expected table from `tree -L 1`, got {:?}", res_l1.value);
+    };
+    assert_eq!(tbl_l1.nrows(), 4);
+    assert_eq!(tbl_l1.get_by_name(0, "name").and_then(Value::as_str), Some("src"));
+    assert_eq!(tbl_l1.get_by_name(0, "tree_prefix").and_then(Value::as_str), Some("├── "));
+    assert_eq!(tbl_l1.get_by_name(3, "name").and_then(Value::as_str), Some("data.json"));
+    assert_eq!(tbl_l1.get_by_name(3, "tree_prefix").and_then(Value::as_str), Some("└── "));
+
+    // `tree -d` returns directories only with proper last-child connectors (`└── `, `    └── `).
+    let res_d = host.run("tree -d", st.fork());
+    assert_eq!(res_d.exit_code, 0, "got {:?}", res_d.value);
+    let Value::Table(tbl_d) = res_d.value else {
+        panic!("expected table from `tree -d`, got {:?}", res_d.value);
+    };
+    assert_eq!(tbl_d.nrows(), 2);
+    assert_eq!(tbl_d.get_by_name(0, "name").and_then(Value::as_str), Some("src"));
+    assert_eq!(tbl_d.get_by_name(0, "tree_prefix").and_then(Value::as_str), Some("└── "));
+    assert_eq!(tbl_d.get_by_name(1, "name").and_then(Value::as_str), Some("sub"));
+    assert_eq!(tbl_d.get_by_name(1, "path").and_then(Value::as_str), Some("src/sub"));
+    assert_eq!(tbl_d.get_by_name(1, "tree_prefix").and_then(Value::as_str), Some("    └── "));
+
+    // `tree -a -L 1` includes dotfiles (`.hidden`).
+    let res_all = host.run("tree -a -L 1", st.fork());
+    assert_eq!(res_all.exit_code, 0, "got {:?}", res_all.value);
+    let Value::Table(tbl_all) = res_all.value else {
+        panic!("expected table from `tree -a -L 1`, got {:?}", res_all.value);
+    };
+    assert_eq!(tbl_all.nrows(), 5);
+    assert_eq!(tbl_all.get_by_name(1, "name").and_then(Value::as_str), Some(".hidden"));
+
+    // Positional path argument (`tree src --depth 1`).
+    let res_sub = host.run("tree src --depth 1", st.fork());
+    assert_eq!(res_sub.exit_code, 0, "got {:?}", res_sub.value);
+    let Value::Table(tbl_sub) = res_sub.value else {
+        panic!("expected table from `tree src --depth 1`, got {:?}", res_sub.value);
+    };
+    assert_eq!(tbl_sub.nrows(), 2);
+    assert_eq!(tbl_sub.get_by_name(0, "path").and_then(Value::as_str), Some("sub"));
+    assert_eq!(tbl_sub.get_by_name(1, "path").and_then(Value::as_str), Some("main.rs"));
+
+    // Pipeline composability: `tree | where depth == 0` and `tree | sort-by size -r`.
+    let pipe_depth = host.run("tree | where depth == 0 | get name", st.fork());
+    assert_eq!(pipe_depth.exit_code, 0, "got {:?}", pipe_depth.value);
+    match pipe_depth.value {
+        Value::List(l) => {
+            assert_eq!(l.len(), 4);
+            assert_eq!(l.get(0), Some(&Value::string("src", alloc())));
+            assert_eq!(l.get(3), Some(&Value::string("data.json", alloc())));
+        }
+        other => panic!("expected list from `tree | where depth == 0 | get name`, got {other:?}"),
+    }
+
+    let pipe_sort = host.run("tree | sort-by size -r | first | get name", st.fork());
+    assert_eq!(pipe_sort.exit_code, 0, "got {:?}", pipe_sort.value);
+    assert_eq!(pipe_sort.value, Value::string("big.bin", alloc()));
 }

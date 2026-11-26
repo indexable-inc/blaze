@@ -642,6 +642,9 @@ mod macos_app {
         auto_scroll_bottom: bool,
         scroll_to_block: Option<BlockId>,
         active_pty: Option<ActivePty>,
+        /// Alternate-screen TUIs (`claude`, `vim`, `htop`) render inline by default so scrollback
+        /// remains visible; toggle true fullscreen anytime with `Cmd+Shift+F` (or block `⤢` pill).
+        pty_fullscreen: bool,
         yazi: Option<YaziState>,
         agent_hub: Option<AgentHub>,
         managed_agents: Vec<AgentRecord>,
@@ -691,6 +694,7 @@ mod macos_app {
                 auto_scroll_bottom: false,
                 scroll_to_block: None,
                 active_pty: None,
+                pty_fullscreen: false,
                 yazi: None,
                 agent_hub: None,
                 managed_agents: Vec::new(),
@@ -1227,6 +1231,14 @@ mod macos_app {
             argv_owned.push(spawn.program.clone());
             argv_owned.extend(spawn.args.iter().cloned());
             let argv_refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+            let (cols, rows) = if self.pty_fullscreen {
+                (cols, rows)
+            } else {
+                (
+                    cols.saturating_sub(4).max(20),
+                    (rows.saturating_mul(65) / 100).clamp(18, 34),
+                )
+            };
             let px = (
                 cols.saturating_mul(cell_px.0 as u16),
                 rows.saturating_mul(cell_px.1 as u16),
@@ -1237,6 +1249,8 @@ mod macos_app {
                 Ok(pty) => {
                     let child_pid = Some(pty.pid());
                     let mut opts = VtOpts::new(cols, rows, 4 << 20);
+                    opts.xtversion = b"blaze-shell";
+                    opts.device.secondary = blaze_vt::reply::Da2::APP;
                     opts.cell_px = Some(blaze_vt::input::mouse::Pixels {
                         width: cell_px.0,
                         height: cell_px.1,
@@ -1508,7 +1522,15 @@ mod macos_app {
             if let Some(pane) = panes.get_mut(&pl.pane)
                 && let Some(ap) = &pane.active_pty
             {
-                let (cols, rows) = grid_for_rect(content_rect, fonts, scale);
+                let (raw_cols, raw_rows) = grid_for_rect(content_rect, fonts, scale);
+                let (cols, rows) = if pane.pty_fullscreen {
+                    (raw_cols, raw_rows)
+                } else {
+                    (
+                        raw_cols.saturating_sub(4).max(20),
+                        (raw_rows.saturating_mul(65) / 100).clamp(18, 34),
+                    )
+                };
                 let px = (
                     cols.saturating_mul(fonts.metrics.cell_w as u16),
                     rows.saturating_mul(fonts.metrics.cell_h as u16),
@@ -1605,7 +1627,8 @@ mod macos_app {
                 layout_yazi_pane(yazi, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
             } else if let Some(hub) = &pane.agent_hub {
                 layout_agent_hub_pane(hub, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
-            } else if pane.store.is_alternate_screen()
+            } else if pane.pty_fullscreen
+                && pane.store.is_alternate_screen()
                 && let Some(tid) = pane.store.active_running_terminal()
                 && let Some(blk) = pane.store.block(tid)
                 && let BlockBody::Terminal { term, .. } = &blk.body
@@ -2582,6 +2605,16 @@ mod macos_app {
                                     window.miniaturize(None);
                                     continue;
                                 }
+                                if !ctrl && !alt && shift && (key == Key::KeyF || lower == "f") {
+                                    if let Some(pane) = panes.get_mut(&wm.focused_pane())
+                                        && pane.active_pty.is_some()
+                                    {
+                                        pane.pty_fullscreen = !pane.pty_fullscreen;
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
                                 if ctrl && !alt && !shift && (key == Key::KeyF || lower == "f") {
                                     window.toggleFullScreen(None);
                                     continue;
@@ -2905,6 +2938,25 @@ mod macos_app {
                                             popup_engaged = false;
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
+                                } else if let Some(ap) = &shell.active_pty {
+                                    // Standard macOS terminal Command line-editing shortcuts inside PTYs
+                                    // (Claude Code, zsh, vim, etc.): Cmd+Backspace -> Ctrl+U,
+                                    // Cmd+Left -> Ctrl+A, Cmd+Right -> Ctrl+E.
+                                    match key {
+                                        Key::Backspace => {
+                                            ap.pty.write_all(b"\x15");
+                                            continue;
+                                        }
+                                        Key::ArrowLeft => {
+                                            ap.pty.write_all(b"\x01");
+                                            continue;
+                                        }
+                                        Key::ArrowRight => {
+                                            ap.pty.write_all(b"\x05");
                                             continue;
                                         }
                                         _ => {}
@@ -3704,13 +3756,64 @@ mod macos_app {
                                         dirty = true;
                                     }
                                 }
-                            } else if shell.store.is_alternate_screen() {
-                                if let Some(ap) = &shell.active_pty
-                                    && dy.abs() > 0.5
-                                    && let Some(blk) = shell.store.block(ap.block_id)
-                                    && let BlockBody::Terminal { term, .. } = &blk.body
+                            } else if let Some(ap) = &shell.active_pty
+                                && dy.abs() > 0.5
+                                && let Some(blk) = shell.store.block(ap.block_id)
+                                && let BlockBody::Terminal { term, .. } = &blk.body
+                                && (term.flags().mouse_event != blaze_vt::terminal::MouseEvents::None
+                                    || shell.store.is_alternate_screen())
+                            {
+                                let up = dy > 0.0;
+                                if term.flags().mouse_event != blaze_vt::terminal::MouseEvents::None {
+                                    // Send true SGR / X10 mouse wheel events (`\x1b[<64;col;rowM`)
+                                    // whenever the TUI (e.g. Claude Code, vim, htop) enabled mouse
+                                    // reporting — never falling back to arrow keys!
+                                    let pane_rect = hovered_pl
+                                        .map(|p| p.rect)
+                                        .unwrap_or_else(|| {
+                                            HitRect::new(0.0, TOP_BAR_H, size.width as f32, size.height as f32)
+                                        });
+                                    let cw = (fonts.metrics.cell_w as f32 / scale as f32).max(1.0);
+                                    let ch = (fonts.metrics.cell_h as f32 / scale as f32).max(1.0);
+                                    let rel_x = (mx - pane_rect.x0 - 10.0).max(0.0);
+                                    let rel_y = (my - pane_rect.y0 - 6.0).max(0.0);
+                                    let cols = term.screen().cols() as u32;
+                                    let rows = term.screen().rows() as u32;
+                                    let msize = blaze_vt::input::mouse::Size {
+                                        screen: blaze_vt::input::mouse::Pixels {
+                                            width: (cols as f32 * cw).round().max(1.0) as u32,
+                                            height: (rows as f32 * ch).round().max(1.0) as u32,
+                                        },
+                                        cell: blaze_vt::input::mouse::Pixels {
+                                            width: cw.round().max(1.0) as u32,
+                                            height: ch.round().max(1.0) as u32,
+                                        },
+                                        padding: blaze_vt::input::mouse::Padding::default(),
+                                    };
+                                    let mopts = term.mouse_opts(msize, false);
+                                    let mev = blaze_vt::input::mouse::MouseEvent {
+                                        action: blaze_vt::input::mouse::MouseAction::Press,
+                                        button: Some(if up {
+                                            blaze_vt::input::mouse::MouseButton::Four
+                                        } else {
+                                            blaze_vt::input::mouse::MouseButton::Five
+                                        }),
+                                        mods: blaze_vt::input::key::Mods::NONE,
+                                        pos: blaze_vt::input::mouse::SurfacePos {
+                                            x: rel_x,
+                                            y: rel_y,
+                                        },
+                                    };
+                                    let mut buf = [0u8; blaze_vt::input::mouse::MAX_LEN];
+                                    if let Ok(encoded) =
+                                        blaze_vt::input::mouse::encode(&mev, &mopts, None, &mut buf)
+                                        && !encoded.is_empty()
+                                    {
+                                        ap.pty.write_all(encoded);
+                                    }
+                                } else if shell.store.is_alternate_screen()
+                                    && term.mode(blaze_vt::terminal::Mode::MouseAlternateScroll)
                                 {
-                                    let up = dy > 0.0;
                                     let seq: &[u8] = if term.mode(blaze_vt::terminal::Mode::CursorKeys)
                                     {
                                         if up { b"\x1bOA" } else { b"\x1bOB" }
@@ -4038,6 +4141,13 @@ mod macos_app {
                                             shell.store.toggle_hidden_cols(block_id);
                                             active_popover = None;
                                             dirty = true;
+                                        }
+                                        HitAction::TogglePtyFullscreen => {
+                                            if shell.active_pty.is_some() {
+                                                shell.pty_fullscreen = !shell.pty_fullscreen;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                            }
                                         }
                                         HitAction::SortTableColumn { block, col } => {
                                             shell.store.toggle_table_sort(block, col);
@@ -4840,6 +4950,7 @@ mod macos_app {
                     }
                 }
                 if let Some((block_id, code, dur_ms)) = pty_finished {
+                    pane.pty_fullscreen = false;
                     if let Some(ap) = pane.active_pty.take() {
                         let drain_deadline = Instant::now() + std::time::Duration::from_millis(15);
                         loop {

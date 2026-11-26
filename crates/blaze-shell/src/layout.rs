@@ -1025,6 +1025,7 @@ fn layout_starship_line(
                     clip_id,
                     HoverKind::GitChanges {
                         files: st.changed_files.clone(),
+                        details: st.changed_details.clone(),
                         total: total_dirty,
                     },
                 );
@@ -1220,6 +1221,34 @@ fn layout_block(
         _ => None,
     };
     if matches!(&block.body, BlockBody::Running { .. } | BlockBody::Terminal { running: true, .. }) {
+        if matches!(&block.body, BlockBody::Terminal { running: true, .. }) {
+            let fs_lbl = "⤢ ⌘⇧F";
+            let fsw = fs_lbl.chars().count() as f32 * m.cw + 10.0;
+            let fx0 = rx - fsw;
+            scene.round_rect(
+                fx0,
+                cur_y - 1.0,
+                rx,
+                cur_y + m.ch + 1.0,
+                4.0,
+                theme::BG_CHIP,
+                1.0,
+                theme::LINE_FAINT,
+                clip_id,
+            );
+            scene.text(fx0 + 5.0, cur_y, fs_lbl, theme::INK_3, false, false, clip_id);
+            let frect = HitRect::new(fx0, cur_y - 2.0, rx, cur_y + m.ch + 2.0);
+            scene.push_hit_clipped(frect, clip_id, HitAction::TogglePtyFullscreen);
+            scene.push_hover_clipped(
+                frect,
+                clip_id,
+                HoverKind::Tooltip {
+                    title: "Toggle fullscreen terminal (⌘⇧F)".to_owned(),
+                    subtitle: Some("Inline by default so scrollback stays visible".to_owned()),
+                },
+            );
+            rx = fx0 - 10.0;
+        }
         let elapsed_ms = (now_ns.max(0) as u64 / 1_000_000).saturating_sub(block.started_ms);
         let dur = format_duration_ms(elapsed_ms);
         let lbl = match running_pid {
@@ -2036,7 +2065,11 @@ fn layout_table(
     for c in 0..ncols {
         col_displays.push(effective_col_display(table, c, sample_rows));
     }
-    let file_entry_col = col_displays.iter().position(|&d| d == ColDisplay::FileEntry);
+    let file_entry_col = col_displays
+        .iter()
+        .position(|&d| matches!(d, ColDisplay::FileEntry | ColDisplay::TreeEntry));
+    let tree_prefix_col = table.col_index("tree_prefix");
+    let tree_path_col = table.col_index("path");
     let size_col_idx = col_displays.iter().position(|&d| d == ColDisplay::FileSize);
     let time_col_idx = col_displays.iter().position(|&d| d == ColDisplay::HumanTime);
     let mut all_row_dust: Vec<Option<blaze_dust::DustProgress>> = vec![None; total_rows];
@@ -2055,13 +2088,19 @@ fn layout_table(
         };
         for r in 0..dust_scan_rows {
             let fk = type_col_idx.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str);
-            let raw = table
-                .cell(r, fc)
-                .map(|c| format_value_cell_at(c, Some(now_ns)))
-                .unwrap_or_default();
+            let raw = tree_path_col
+                .and_then(|pc| table.cell(r, pc))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    table
+                        .cell(r, fc)
+                        .map(|c| format_value_cell_at(c, Some(now_ns)))
+                        .unwrap_or_default()
+                });
             let is_dir = fk.is_some_and(blaze_sniff::is_dir_label) || raw.ends_with('/');
             if is_dir && !raw.is_empty() {
-                let full_p = full_path_for_entry(&block.prompt_snapshot.cwd, &block.source, &raw);
+                let full_p = full_path_for_entry(block.state_after.cwd.as_ref(), &block.source, &raw);
                 if let Some(prog) = crate::dust_driver::request_dir_size(std::path::Path::new(&full_p))
                 {
                     if prog.bytes > dust_max_bytes {
@@ -2201,10 +2240,21 @@ fn layout_table(
                     } else {
                         format_value_cell_at(cell, Some(now_ns))
                     };
-                    if disp == ColDisplay::FileEntry && row_is_dir && !txt.ends_with('/') {
+                    if matches!(disp, ColDisplay::FileEntry | ColDisplay::TreeEntry)
+                        && row_is_dir
+                        && !txt.ends_with('/')
+                    {
                         txt.push('/');
                     }
-                    max_c = max_c.max(txt.chars().count());
+                    let extra_prefix_c = if disp == ColDisplay::TreeEntry {
+                        tree_prefix_col
+                            .and_then(|pc| table.cell(r, pc))
+                            .and_then(Value::as_str)
+                            .map_or(0, |s| s.chars().count())
+                    } else {
+                        0
+                    };
+                    max_c = max_c.max(txt.chars().count() + extra_prefix_c);
                 }
                 if !matches!(cell, Value::Nothing) {
                     non_empty += 1;
@@ -2244,6 +2294,7 @@ fn layout_table(
         } else {
             match disp {
                 ColDisplay::FileEntry
+                | ColDisplay::TreeEntry
                 | ColDisplay::Crate
                 | ColDisplay::Process
                 | ColDisplay::GitAuthor => icon_pad + 10.0,
@@ -2642,6 +2693,97 @@ fn layout_table(
                         }
                     } else {
                         match disp {
+                            ColDisplay::TreeEntry => {
+                                let leaf_name = format_value_cell_at(cell, Some(now_ns));
+                                let rel_path = tree_path_col
+                                    .and_then(|pc| table.cell(r, pc))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(&leaf_name);
+                                let prefix = tree_prefix_col
+                                    .and_then(|pc| table.cell(r, pc))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let is_dir = row_file_kind.is_some_and(blaze_sniff::is_dir_label)
+                                    || leaf_name.ends_with('/');
+                                let icon_name = icon_name_for_file(rel_path, row_file_kind);
+                                let display_name = if is_dir && !leaf_name.ends_with('/') {
+                                    format!("{leaf_name}/")
+                                } else {
+                                    leaf_name.clone()
+                                };
+                                let pref_w = prefix.chars().count() as f32 * m.cw;
+                                if !prefix.is_empty() {
+                                    scene.text(rx, ty, prefix, theme::INK_4, false, false, clip_id);
+                                }
+                                let item_x = rx + pref_w;
+                                let max_ch = ((content_w - pref_w - icon_pad - 6.0) / m.cw)
+                                    .floor()
+                                    .max(4.0) as usize;
+                                let txt = truncate_chars(&display_name, max_ch);
+                                let txt_w = txt.chars().count() as f32 * m.cw;
+                                let mut name_col = if is_dir { theme::INK_1 } else { theme::INK_2 };
+                                if let Some(mc) = table.col_index("modified")
+                                    && let Some(Value::Date(dt)) = table.cell(r, mc)
+                                {
+                                    let dust_ns = if is_dir {
+                                        all_row_dust.get(r).copied().flatten().map(|p| p.max_mtime_ns).unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    let eff_ns = dt.utc_ns.max(dust_ns);
+                                    let age_secs = (now_ns.saturating_sub(eff_ns)).max(0) as u64 / 1_000_000_000;
+                                    if age_secs < 7_200 {
+                                        let heat = theme::recency_heat_color(age_secs);
+                                        let blend = if age_secs < 600 { 0.42 } else { 0.28 };
+                                        name_col = [
+                                            name_col[0] + (heat[0] - name_col[0]) * blend,
+                                            name_col[1] + (heat[1] - name_col[1]) * blend,
+                                            name_col[2] + (heat[2] - name_col[2]) * blend,
+                                            name_col[3],
+                                        ];
+                                    }
+                                }
+                                scene.svg_icon(item_x, iy, icon_s, icon_name, clip_id);
+                                draw_shaded_filename(
+                                    scene,
+                                    item_x + icon_pad,
+                                    ty,
+                                    &txt,
+                                    is_dir,
+                                    name_col,
+                                    m,
+                                    clip_id,
+                                );
+                                let cell_rect = HitRect::new(
+                                    item_x - 3.0,
+                                    cur_y,
+                                    item_x + icon_pad + txt_w + 6.0,
+                                    cur_y + row_h,
+                                );
+                                scene.push_drag_source_clipped(
+                                    cell_rect,
+                                    clip_id,
+                                    DragPayload {
+                                        label: display_name.clone(),
+                                        insert_text: drag_path_for_entry(&block.source, rel_path),
+                                        icon: Some(icon_name),
+                                    },
+                                );
+                                scene.push_hover_clipped(
+                                    cell_rect,
+                                    clip_id,
+                                    HoverKind::FileEntry {
+                                        full_path: full_path_for_entry(
+                                            block.state_after.cwd.as_ref(),
+                                            &block.source,
+                                            rel_path,
+                                        ),
+                                        name: display_name,
+                                        icon: Some(icon_name),
+                                        is_dir,
+                                    },
+                                );
+                            }
                             ColDisplay::FileEntry => {
                                 let raw_name = format_value_cell_at(cell, Some(now_ns));
                                 let icon_name = icon_name_for_file(&raw_name, row_file_kind);
@@ -4151,14 +4293,20 @@ fn layout_inline_terminal(
     let top = screen.pages.active_top();
     let rows = screen.rows();
 
-    let mut last_non_empty = if cursor_on { screen.cursor.y } else { 0 };
-    for y in 0..rows {
-        let cells = screen.pages.cells(top + y);
-        if cells.iter().any(|c| c.codepoint() > 0x20) {
-            last_non_empty = last_non_empty.max(y);
+    let show_rows = if matches!(term.active(), blaze_vt::terminal::Which::Alternate) {
+        // Alternate-screen TUIs (`claude`, `vim`, `htop`) keep a steady inline frame height
+        // so redraws never bounce vertically while scrollback stays visible above!
+        rows.max(1)
+    } else {
+        let mut last_non_empty = if cursor_on { screen.cursor.y } else { 0 };
+        for y in 0..rows {
+            let cells = screen.pages.cells(top + y);
+            if cells.iter().any(|c| c.codepoint() > 0x20) {
+                last_non_empty = last_non_empty.max(y);
+            }
         }
-    }
-    let show_rows = (last_non_empty + 1).min(rows).max(1);
+        (last_non_empty + 1).min(rows).max(1)
+    };
     let pad = 10.0;
     let total_h = show_rows as f32 * m.ch + pad * 2.0;
     let x1 = x0 + width;
@@ -4312,8 +4460,96 @@ fn draw_terminal_rows(
             let x1 = x0 + m.cw * span;
             let at_cursor = cursor_visible && x == cx && y == cy;
             if at_cursor {
-                scene.round_rect(x0, y0, x1, y0 + m.ch, 1.0, vt_rgbf(cursor_c), 0.0, [0.0; 4], clip_id);
-                fg = bg0;
+                match screen.cursor.shape {
+                    blaze_vt::screen::CursorShape::Bar => {
+                        if has_bg || f.inverse {
+                            scene.round_rect(
+                                x0 - 0.5,
+                                y0 - 0.5,
+                                x1 + 0.5,
+                                y0 + m.ch + 0.5,
+                                0.0,
+                                vt_rgbf(bg),
+                                0.0,
+                                [0.0; 4],
+                                clip_id,
+                            );
+                        }
+                        scene.over_round_rect(
+                            x0,
+                            y0 + 1.0,
+                            x0 + 2.0,
+                            y0 + m.ch - 1.0,
+                            1.0,
+                            vt_rgbf(cursor_c),
+                            clip_id,
+                        );
+                    }
+                    blaze_vt::screen::CursorShape::Underline => {
+                        if has_bg || f.inverse {
+                            scene.round_rect(
+                                x0 - 0.5,
+                                y0 - 0.5,
+                                x1 + 0.5,
+                                y0 + m.ch + 0.5,
+                                0.0,
+                                vt_rgbf(bg),
+                                0.0,
+                                [0.0; 4],
+                                clip_id,
+                            );
+                        }
+                        scene.over_round_rect(
+                            x0,
+                            y0 + m.ch - 2.2,
+                            x1,
+                            y0 + m.ch,
+                            0.75,
+                            vt_rgbf(cursor_c),
+                            clip_id,
+                        );
+                    }
+                    blaze_vt::screen::CursorShape::BlockHollow => {
+                        if has_bg || f.inverse {
+                            scene.round_rect(
+                                x0 - 0.5,
+                                y0 - 0.5,
+                                x1 + 0.5,
+                                y0 + m.ch + 0.5,
+                                0.0,
+                                vt_rgbf(bg),
+                                0.0,
+                                [0.0; 4],
+                                clip_id,
+                            );
+                        }
+                        scene.round_rect(
+                            x0,
+                            y0,
+                            x1,
+                            y0 + m.ch,
+                            1.0,
+                            [0.0; 4],
+                            1.0,
+                            vt_rgbf(cursor_c),
+                            clip_id,
+                        );
+                    }
+                    blaze_vt::screen::CursorShape::Block => {
+                        scene.round_rect(
+                            x0,
+                            y0,
+                            x1,
+                            y0 + m.ch,
+                            1.0,
+                            vt_rgbf(cursor_c),
+                            0.0,
+                            [0.0; 4],
+                            clip_id,
+                        );
+                        fg = bg0;
+                    }
+                }
             } else if has_bg || f.inverse {
                 scene.round_rect(
                     x0 - 0.5,
@@ -5644,17 +5880,26 @@ fn layout_active_popover(
                 (w, h)
             }
         }
-        HoverKind::GitChanges { files, .. } => {
-            let shown = files.len().clamp(1, 10);
-            let max_c = files
-                .iter()
-                .take(shown)
-                .map(|(p, _, _)| p.chars().count() + 6)
-                .max()
-                .unwrap_or(20)
-                .max(26)
-                .min(56);
-            let w = (max_c as f32 * m.cw + pad_x * 2.0 + icon_s + 14.0).clamp(260.0, 500.0);
+        HoverKind::GitChanges { files, details, total } => {
+            let shown = details.len().max(files.len()).clamp(1, 12);
+            let hdr_chars = format!("uncommitted · {total}").chars().count() + "click to insert".len() + 6;
+            let row_chars = if !details.is_empty() {
+                details
+                    .iter()
+                    .take(shown)
+                    .map(|d| d.path.chars().count() + d.status_label.len() + 18)
+                    .max()
+                    .unwrap_or(28)
+            } else {
+                files
+                    .iter()
+                    .take(shown)
+                    .map(|(p, _, _)| p.chars().count() + 16)
+                    .max()
+                    .unwrap_or(28)
+            };
+            let max_c = row_chars.max(hdr_chars).min(68);
+            let w = (max_c as f32 * m.cw + pad_x * 2.0 + icon_s + 18.0).clamp(350.0, 580.0);
             let h = hdr_h + shown as f32 * row_h + pad_y;
             (w, h)
         }
@@ -6099,44 +6344,133 @@ fn layout_active_popover(
                 }
             }
         }
-        HoverKind::GitChanges { files, total } => {
+        HoverKind::GitChanges { files, details, total } => {
             let mut ry = draw_header(scene, &format!("uncommitted · {total}"), "click to insert");
-            let max_c = ((pop_w - pad_x * 2.0 - icon_s - 28.0) / m.cw).floor().max(8.0) as usize;
-            for (path, icon, tag) in files.iter().take(10) {
-                let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
-                if is_hovered(row_rect) {
+            if !details.is_empty() {
+                for d in details.iter().take(12) {
+                    let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
+                    if is_hovered(row_rect) {
+                        scene.overlay_round_rect(
+                            row_rect.x0,
+                            row_rect.y0,
+                            row_rect.x1,
+                            row_rect.y1,
+                            5.0,
+                            theme::rgb(0x20, 0x20, 0x25),
+                            0.0,
+                            [0.0; 4],
+                            0,
+                        );
+                    }
+                    let ty = ry + (row_h - m.ch) * 0.5;
+                    scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, d.icon, 0);
+
+                    // Right-aligned status badge (`untracked`, `modified`, `staged`, `deleted`, `conflict`)
+                    // plus rich diff stats (`+14 -3`) or file size + kind (`4.2 KiB · Env`)!
+                    let (st_fg, st_bg) = match d.tag {
+                        "!" => (theme::DANGER, theme::rgba(0xe8, 0x5d, 0x5d, 0.16)),
+                        "+" => (theme::OK, theme::rgba(0x57, 0xab, 0x5a, 0.16)),
+                        "M" => (theme::rgb(0xe5, 0xb5, 0x67), theme::rgba(0xe5, 0xb5, 0x67, 0.15)),
+                        "D" => (theme::DANGER, theme::rgba(0xe8, 0x5d, 0x5d, 0.14)),
+                        _ => (theme::rgb(0x7c, 0xa8, 0xe8), theme::rgba(0x58, 0x9d, 0xf6, 0.15)),
+                    };
+                    let badge_w = m.measure(d.status_label, TextFace::UiSmall) + 10.0;
+                    let badge_x0 = x1 - pad_x - badge_w;
                     scene.overlay_round_rect(
-                        row_rect.x0,
-                        row_rect.y0,
-                        row_rect.x1,
-                        row_rect.y1,
-                        5.0,
-                        theme::rgb(0x20, 0x20, 0x25),
+                        badge_x0,
+                        ry + 3.0,
+                        x1 - pad_x,
+                        ry + row_h - 3.0,
+                        4.0,
+                        st_bg,
                         0.0,
                         [0.0; 4],
                         0,
                     );
+                    scene.overlay_ui_small(badge_x0 + 5.0, ty, d.status_label, st_fg, false, false, 0);
+
+                    let mut right_edge = badge_x0 - 10.0;
+                    if let (Some(add), Some(del)) = (d.added_lines, d.deleted_lines) {
+                        if del > 0 {
+                            let del_s = format!("-{del}");
+                            let dw = del_s.len() as f32 * m.cw;
+                            right_edge -= dw;
+                            scene.overlay_text_run(right_edge, ty, del_s, theme::DANGER, false, false, 0);
+                            right_edge -= 5.0;
+                        }
+                        if add > 0 {
+                            let add_s = format!("+{add}");
+                            let aw = add_s.len() as f32 * m.cw;
+                            right_edge -= aw;
+                            scene.overlay_text_run(right_edge, ty, add_s, theme::OK, false, false, 0);
+                            right_edge -= 8.0;
+                        }
+                    } else {
+                        let meta_s = match (d.size_bytes, d.kind_label) {
+                            (Some(sz), k) if !k.is_empty() && k != "File" => {
+                                format!("{} · {k}", crate::dust_driver::format_bytes_compact(sz))
+                            }
+                            (Some(sz), _) => crate::dust_driver::format_bytes_compact(sz),
+                            (None, k) if !k.is_empty() => k.to_owned(),
+                            _ => String::new(),
+                        };
+                        if !meta_s.is_empty() {
+                            let mw = m.measure(&meta_s, TextFace::UiSmall);
+                            right_edge -= mw;
+                            scene.overlay_ui_small(right_edge, ty, meta_s, theme::INK_4, false, false, 0);
+                            right_edge -= 8.0;
+                        }
+                    }
+
+                    let name_x = x0 + pad_x + icon_s + 7.0;
+                    let max_c = ((right_edge - name_x) / m.cw).floor().max(8.0) as usize;
+                    let shown_p = if d.path.contains('/') {
+                        truncate_middle(&d.path, max_c)
+                    } else {
+                        truncate_chars(&d.path, max_c)
+                    };
+                    scene.overlay_text_run(name_x, ty, shown_p, theme::INK_2, false, false, 0);
+                    scene.push_hit(row_rect, HitAction::InsertToken(d.path.clone()));
+                    ry += row_h;
                 }
-                let ty = ry + (row_h - m.ch) * 0.5;
-                scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, icon, 0);
-                scene.overlay_text_run(
-                    x0 + pad_x + icon_s + 7.0,
-                    ty,
-                    truncate_chars(path, max_c),
-                    theme::INK_2,
-                    false,
-                    false,
-                    0,
-                );
-                let tag_col = match *tag {
-                    "!" => theme::DANGER,
-                    "+" => theme::OK,
-                    "M" | "D" => theme::FIRE,
-                    _ => theme::INK_3,
-                };
-                scene.overlay_text_run(x1 - pad_x - m.cw, ty, *tag, tag_col, true, false, 0);
-                scene.push_hit(row_rect, HitAction::InsertToken(path.clone()));
-                ry += row_h;
+            } else {
+                let max_c = ((pop_w - pad_x * 2.0 - icon_s - 28.0) / m.cw).floor().max(8.0) as usize;
+                for (path, icon, tag) in files.iter().take(12) {
+                    let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
+                    if is_hovered(row_rect) {
+                        scene.overlay_round_rect(
+                            row_rect.x0,
+                            row_rect.y0,
+                            row_rect.x1,
+                            row_rect.y1,
+                            5.0,
+                            theme::rgb(0x20, 0x20, 0x25),
+                            0.0,
+                            [0.0; 4],
+                            0,
+                        );
+                    }
+                    let ty = ry + (row_h - m.ch) * 0.5;
+                    scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, icon, 0);
+                    scene.overlay_text_run(
+                        x0 + pad_x + icon_s + 7.0,
+                        ty,
+                        truncate_chars(path, max_c),
+                        theme::INK_2,
+                        false,
+                        false,
+                        0,
+                    );
+                    let tag_col = match *tag {
+                        "!" => theme::DANGER,
+                        "+" => theme::OK,
+                        "M" | "D" => theme::FIRE,
+                        _ => theme::INK_3,
+                    };
+                    scene.overlay_text_run(x1 - pad_x - m.cw, ty, *tag, tag_col, true, false, 0);
+                    scene.push_hit(row_rect, HitAction::InsertToken(path.clone()));
+                    ry += row_h;
+                }
             }
         }
         HoverKind::Directory { cwd } => {
@@ -6234,19 +6568,30 @@ fn layout_active_popover(
                 scene.overlay_ui_small(x0 + pad_x + gutter_w, ry + 1.0, "… more lines", theme::INK_4, false, true, 0);
             }
         }
-        HoverKind::DirPreview { name, icon, meta, entries, total_items, hidden_count, .. } => {
+        HoverKind::DirPreview { full_path, name, icon, meta, entries, total_items, hidden_count } => {
             let hy = y0 + (hdr_h - m.ch) * 0.5;
             let mut hx = x0 + pad_x;
             if let Some(ic) = icon {
                 scene.overlay_svg_icon(hx, hy + (m.ch - icon_s) * 0.5, icon_s, ic, 0);
                 hx += icon_s + 7.0;
             }
-            let mw = m.measure(meta, TextFace::UiSmall);
+            let dir_total_lbl = crate::dust_driver::request_dir_size(std::path::Path::new(full_path))
+                .filter(|p| p.bytes > 0)
+                .map(|p| {
+                    let s = crate::dust_driver::format_bytes_compact(p.bytes);
+                    if !p.done { format!("~{s}") } else if p.capped { format!("{s}+") } else { s }
+                });
+            let header_meta = match (meta.is_empty(), dir_total_lbl) {
+                (false, Some(sz)) => format!("{meta} · {sz}"),
+                (true, Some(sz)) => sz,
+                (_, None) => meta.clone(),
+            };
+            let mw = m.measure(&header_meta, TextFace::UiSmall);
             let avg_ui = m.measure("n", TextFace::Ui).max(4.5);
             let max_name = ((x1 - pad_x - mw - 12.0 - hx) / avg_ui).floor().max(8.0) as usize;
             scene.overlay_ui_text(hx, hy, truncate_chars(name, max_name), theme::INK_1, true, false, 0);
-            if !meta.is_empty() {
-                scene.overlay_ui_small(x1 - pad_x - mw, hy, meta, theme::INK_4, false, false, 0);
+            if !header_meta.is_empty() {
+                scene.overlay_ui_small(x1 - pad_x - mw, hy, &header_meta, theme::INK_4, false, false, 0);
             }
             scene.overlay_line(x0 + 1.0, y0 + hdr_h, x1 - 1.0, y0 + hdr_h, 1.0, theme::LINE_FAINT, 0);
 
@@ -6265,14 +6610,16 @@ fn layout_active_popover(
                 ry += dir_row_h;
             } else {
                 let inner_w = pop_w - pad_x * 2.0;
-                let has_size = entries.iter().take(16).any(|e| !e.size_label.is_empty());
-                let size_w = if has_size { 9.0 * m.cw } else { 0.0 };
-                let show_kind = inner_w >= 270.0 && entries.iter().take(16).any(|e| !e.kind_label.is_empty());
+                // Always reserve the live IEC size column inside `DirPreview` so progressive
+                // `blaze-dust` folder sizes stream smoothly right beside every subfolder!
+                let size_w = 10.5 * m.cw;
+                let show_kind = inner_w >= 320.0 && entries.iter().take(16).any(|e| !e.kind_label.is_empty());
                 let kind_w = if show_kind { 11.5 * m.cw } else { 0.0 };
                 let name_x = x0 + pad_x + icon_s + 8.0;
                 let name_max_c = ((x1 - pad_x - size_w - kind_w - 8.0 - name_x) / m.cw)
                     .floor()
                     .max(10.0) as usize;
+                let base_dir = std::path::Path::new(full_path);
 
                 for ent in entries.iter().take(16) {
                     let ty = ry + (dir_row_h - m.ch) * 0.5;
@@ -6304,17 +6651,37 @@ fn layout_active_popover(
                             0,
                         );
                     }
-                    if !ent.size_label.is_empty() {
-                        let sw = ent.size_label.chars().count() as f32 * m.cw;
-                        scene.overlay_text_run(
-                            x1 - pad_x - sw,
-                            ty,
-                            &ent.size_label,
-                            theme::INK_3,
-                            false,
-                            false,
-                            0,
-                        );
+                    let (sz_txt, sz_col) = if ent.is_dir {
+                        let sub_p = base_dir.join(&ent.name);
+                        if let Some(prog) = crate::dust_driver::request_dir_size(&sub_p) {
+                            if !prog.done && prog.bytes == 0 {
+                                ("…".to_owned(), theme::INK_4)
+                            } else {
+                                let base = crate::dust_driver::format_bytes_compact(prog.bytes);
+                                let txt = if !prog.done {
+                                    format!("~{base}")
+                                } else if prog.capped {
+                                    format!("{base}+")
+                                } else {
+                                    base
+                                };
+                                let col = match blaze_dust::size_tier(prog.bytes) {
+                                    blaze_dust::SizeTier::Bytes => theme::INK_3,
+                                    blaze_dust::SizeTier::KiB => theme::rgb(0x7c, 0xb2, 0xf8),
+                                    blaze_dust::SizeTier::MiB => theme::rgb(0xe5, 0xb5, 0x67),
+                                    blaze_dust::SizeTier::GiB => theme::rgb(0xe8, 0x6a, 0x45),
+                                };
+                                (txt, col)
+                            }
+                        } else {
+                            (String::new(), theme::INK_4)
+                        }
+                    } else {
+                        (ent.size_label.clone(), theme::INK_3)
+                    };
+                    if !sz_txt.is_empty() {
+                        let sw = sz_txt.chars().count() as f32 * m.cw;
+                        scene.overlay_text_run(x1 - pad_x - sw, ty, &sz_txt, sz_col, false, false, 0);
                     }
                     ry += dir_row_h;
                 }

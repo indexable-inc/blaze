@@ -51,7 +51,7 @@ Not now:
 
 ## How work is done
 
-- Work in parallel: lanes write in one directory and never wait on a compile or on a yes (35, 48).
+- Parallel subagents by default: 2+ independent pieces on disjoint files, never serialized (35, 48).
 - A merge carries the run, check and test smoke of a release blaze built from its exact tree (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
@@ -151,7 +151,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
 - **46. ledger-decides**: Work comes from the objectives ledger and is done when its row's check passes on a named commit.
 - **47. every-agent-has-a-task**: Every agent starts on one task with its outcome and check; people follow tasks, not agents.
-- **48. agents-are-a-cost**: Start every independent piece now, in parallel, without asking; disjoint files; nothing small.
+- **48. agents-are-a-cost**: Fan out 2+ independent pieces to parallel subagents immediately (disjoint files); never serialize.
 - **69. every-command-has-a-timeout**: Size a timeout to each command; an expiry is a finding, never waited out or retried.
 - **80. act-on-snapshots**: Work starts when asked, on a snapshot; nothing builds, checks or publishes on save or mid-edit.
 - **82. real-run-first**: A new path runs its real command, profile on, on a real project the day it compiles.
