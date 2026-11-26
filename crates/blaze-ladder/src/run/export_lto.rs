@@ -2757,6 +2757,15 @@ where
     let mut callee_clobbers_buf: AVec<'a, (u32, CallClobbers)> = Vec::new_in(alloc);
     let mut internal_fast_callees_buf: AVec<'a, u32> = Vec::new_in(alloc);
     let mut scc_clobbers: AVec<'a, (usize, CallClobbers)> = Vec::new_in(alloc);
+    // Reset scratch per emitted function (memory-and-data: a task's frame, reset per item in a
+    // long task) so whole-workspace SOTA + superopt passes stay O(1) in scratch memory instead of
+    // exhausting the caller's bump frame on large binaries like ripgrep.
+    let mut emit_frame = blaze_mem::Frame::with_reserve(256 << 20, blaze_mem::Tag::Codegen)
+        .map_err(|_| ExportLtoError::BadRef {
+            symbol: [0u8; 32],
+            what: "per-body LTO emit scratch frame",
+            ref_id: 0,
+        })?;
 
     for scc_idx in 0..emit_sccs.len() {
         let comp = emit_sccs.component(scc_idx);
@@ -2823,25 +2832,30 @@ where
                 vtables: prep.vtables.as_slice(),
                 tls: prep.tls.as_slice(),
             };
-            let (record_tmp, called_declared, clobbers) = emit_code_record_for_machine_with_abi(
-                prep.verified,
-                &names,
-                prep.routines,
-                prep.traps,
-                abi_opts,
-                alloc,
-            )
-            .map_err(|error| ExportLtoError::Record { symbol: prep.symbol.0, error })?;
+            let (record, extra_declared, clobbers) = emit_frame.scope(|f| -> Result<_, ExportLtoError> {
+                let erased = blaze_own::Erased::new(f);
+                let fn_alloc = erased.handle();
+                let (record_tmp, called_declared, clobbers) = emit_code_record_for_machine_with_abi(
+                    prep.verified,
+                    &names,
+                    prep.routines,
+                    prep.traps,
+                    abi_opts,
+                    fn_alloc,
+                )
+                .map_err(|error| ExportLtoError::Record { symbol: prep.symbol.0, error })?;
 
-            let mut record: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(record_tmp.len(), shared);
-            record.extend_from_slice(record_tmp.as_slice());
-            let mut extra_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
-                Vec::with_capacity_in(called_declared.len(), shared);
-            for d in called_declared.iter() {
-                let mut name_buf: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(d.name.len(), shared);
-                name_buf.extend_from_slice(d.name);
-                extra_declared.push((d.tabled, name_buf));
-            }
+                let mut record: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(record_tmp.len(), shared);
+                record.extend_from_slice(record_tmp.as_slice());
+                let mut extra_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+                    Vec::with_capacity_in(called_declared.len(), shared);
+                for d in called_declared.iter() {
+                    let mut name_buf: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(d.name.len(), shared);
+                    name_buf.extend_from_slice(d.name);
+                    extra_declared.push((d.tabled, name_buf));
+                }
+                Ok((record, extra_declared, clobbers))
+            })?;
             if let Some(slot) = emitted_records.get_mut(idx) {
                 *slot = Some(EmittedBodyRec { record, extra_declared });
             }

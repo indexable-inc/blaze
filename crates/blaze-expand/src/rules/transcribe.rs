@@ -188,6 +188,26 @@ fn strip_invisible(view: &View<'_, '_>, toks: Toks) -> Toks {
     toks
 }
 
+/// Splits leading outer attributes (`#[...]`) off `toks`, returning `(attrs, body)` with
+/// `attrs.end == body.at`. Keeping outer attributes outside the synthetic parentheses of a
+/// `Fragment::Expr` ensures `#[cfg(...)]` attaches to the parenthesized expression itself (e.g.
+/// inside `vec![#[cfg(windows)] "a".parse().unwrap(), ...]`) rather than leaving an empty
+/// `PAREN_EXPR` (`Expr::Missing`) when the `cfg` is false.
+fn split_leading_outer_attrs(view: &View<'_, '_>, toks: Toks) -> (Toks, Toks) {
+    let mut at = toks.at;
+    while at + 1 < toks.end
+        && view.char(at) == Some('#')
+        && view.kind(at + 1) == TokenKind::Open(Delim::Bracket)
+    {
+        let next = view.after_tree(at + 1);
+        if next > toks.end {
+            break;
+        }
+        at = next;
+    }
+    (Toks { at: toks.at, end: at }, Toks { at, end: toks.end })
+}
+
 /// The top-level trees of `toks`, as their first tokens.
 fn trees(view: &View<'_, '_>, toks: Toks) -> impl Iterator<Item = u32> {
     let mut at = toks.at;
@@ -712,21 +732,25 @@ fn var<B: Copying>(
         }
         Value::Fragment(Fragment::Expr(toks)) => {
             let sub = strip_invisible(view, toks);
-            let len = sub.end - sub.at;
+            let (attrs, body) = split_leading_outer_attrs(view, sub);
+            let len = body.end - body.at;
             let negative_literal = len == 2
-                && view.char(sub.at) == Some('-')
-                && matches!(view.kind(sub.at + 1), TokenKind::Literal { .. });
-            let is_leaf = len == 1 && !matches!(view.kind(sub.at), TokenKind::Open(_));
-            let whole = negative_literal && follower != Follower::Postfix;
-            let parenthesized =
-                !(is_leaf || is_group(view, sub) || is_macro_call(view, sub) || whole);
+                && view.char(body.at) == Some('-')
+                && matches!(view.kind(body.at + 1), TokenKind::Literal { .. });
+            let is_leaf = len == 1 && !matches!(view.kind(body.at), TokenKind::Open(_));
+            let whole = attrs.is_empty() && negative_literal && follower != Follower::Postfix;
+            let parenthesized = !body.is_empty()
+                && !(is_leaf || is_group(view, body) || is_macro_call(view, body) || whole);
             if !whole {
                 invisible(scratch, out, true)?;
+            }
+            if !attrs.is_empty() {
+                push_view(scratch, out, view, attrs, true, B::RANGES)?;
             }
             if parenthesized {
                 paren(scratch, out, true)?;
             }
-            push_view(scratch, out, view, sub, true, B::RANGES)?;
+            push_view(scratch, out, view, body, true, B::RANGES)?;
             if parenthesized {
                 paren(scratch, out, false)?;
             }

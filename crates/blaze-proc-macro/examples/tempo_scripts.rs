@@ -325,6 +325,7 @@ fn main() {
         mode: blaze_build_script::toolchain::Mode::Check,
         native: setup.native.as_ref().ok().map(|run| run.setting()),
         spawn_setting: Arc::clone(&setup.spawn),
+        files_digest: None,
     };
     let units = &graph.units;
     let mut trees: BTreeMap<LockId, (Tree, ScriptRoot)> = BTreeMap::new();

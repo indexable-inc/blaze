@@ -1468,6 +1468,7 @@ impl<'f> ScriptsStage<'f> {
             let wanted = crate::script_modules::Wanted {
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
+                files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
             };
             let compile = if wanted.ran_as == crate::scripts::RanAs::Wasm {
                 queue.ensure_compile_inputs(cx, store, graph_key, handles)?

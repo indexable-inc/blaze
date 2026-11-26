@@ -1070,6 +1070,13 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         (_, Ok(native)) => Some(*native),
         (Runner::Wasm, Err(_)) => None,
     };
+    let files_digest = match (&job.files, shared.checkout) {
+        (Files::Member { dir } | Files::External { dir }, crate::engine_script_reads::Served::Root(checkout)) => {
+            let pkg_dir = if dir.is_empty() { checkout.path().to_path_buf() } else { checkout.path().join(dir) };
+            script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).ok()
+        }
+        _ => None,
+    };
     let setting = Setting {
         store: &shared.store,
         // Its crates' side's target (ruling D115 (2)); native zero-Wasm macro scripts run for host.
@@ -1090,6 +1097,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         mode: MODE,
         native,
         spawn_setting: Arc::clone(&shared.spawn),
+        files_digest: files_digest.as_deref(),
     };
     // A macro-side run is made with its row's cfg (wasm32-wasip1's atoms); a target-side run
     // with the graph's, which its row copies (and a native target-side script may run).
