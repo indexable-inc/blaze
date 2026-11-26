@@ -974,8 +974,9 @@ fn smallest_range(values: &mut [u128], bits: u32) -> WrappingRange {
 /// The layouts of one program's ground types, made on demand.
 pub struct Layouts<A: Allocator + Clone> {
     rows: Vec<Layout, A>,
-    /// By ground type: its row, `NONE`, or `BUSY` while its parts are laid out.
-    by_ty: Vec<u32, A>,
+    /// By ground type: its row, `NONE`, or `BUSY` while its parts are laid out (sparse, never
+    /// `O(max_ty_index)`, so per-function `Layouts` over a large shared ground table stays tiny).
+    by_ty: crate::instance::PtyMap<u32, A>,
     offsets: Vec<u64, A>,
     variant_rows: Vec<LayoutId, A>,
     discrs: Vec<i128, A>,
@@ -1062,7 +1063,7 @@ impl<A: Allocator + Copy> Layouts<A> {
     pub fn new_in(alloc: A) -> Layouts<A> {
         Layouts {
             rows: Vec::new_in(alloc),
-            by_ty: Vec::new_in(alloc),
+            by_ty: crate::instance::PtyMap::new_in(alloc),
             offsets: Vec::new_in(alloc),
             variant_rows: Vec::new_in(alloc),
             discrs: Vec::new_in(alloc),
@@ -1219,16 +1220,8 @@ impl<A: Allocator + Clone> Layouts<A> {
         self.dyn_chain(id).map_or(0, |c| c.depth as usize)
     }
 
-    fn slot(&mut self, t: PTy) -> &mut u32 {
-        let at = t.0 as usize;
-        if self.by_ty.len() <= at {
-            self.by_ty.resize(at + 1, NONE);
-        }
-        &mut self.by_ty[at]
-    }
-
     fn done(&self, t: PTy) -> Option<LayoutId> {
-        match self.by_ty.get(t.0 as usize).copied() {
+        match self.by_ty.get(t) {
             Some(NONE) | Some(BUSY) | None => None,
             Some(id) => Some(LayoutId(id)),
         }
@@ -1252,8 +1245,8 @@ impl<A: Allocator + Clone> Layouts<A> {
             // A refusal caches nothing: the types still on the stack are marked busy, and a
             // later `of` must lay them out afresh (a missing record may be made by then).
             for &t in todo.iter() {
-                if self.by_ty.get(t.0 as usize) == Some(&BUSY) {
-                    *self.slot(t) = NONE;
+                if self.by_ty.get(t) == Some(BUSY) {
+                    self.by_ty.set(t, NONE);
                 }
             }
         }
@@ -1270,14 +1263,14 @@ impl<A: Allocator + Clone> Layouts<A> {
                 todo.pop();
                 continue;
             }
-            *self.slot(t) = BUSY;
+            self.by_ty.set(t, BUSY);
             let err = |why| LayoutError { ty: t, why };
             parts.clear();
             self.parts(t, cx, &mut parts).map_err(err)?;
             let mut missing = None;
             for &p in parts.iter() {
                 if self.done(p).is_none() {
-                    if self.by_ty.get(p.0 as usize) == Some(&BUSY) {
+                    if self.by_ty.get(p) == Some(BUSY) {
                         return Err(err(Refusal::Recursive));
                     }
                     missing = Some(p);
@@ -1289,7 +1282,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 continue;
             }
             let id = self.compute(t, cx, &parts).map_err(err)?;
-            *self.slot(t) = id.0;
+            self.by_ty.set(t, id.0);
             todo.pop();
         }
         Ok(())

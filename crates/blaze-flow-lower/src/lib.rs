@@ -3423,6 +3423,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             };
             info.deref = if mutbl == Some(Mutbl::Mut) { 2 } else { 1 };
         }
+        // Under the slot grain (`RegionSlots`), any projected place whose type carries zero region
+        // slots (e.g. an associated-type field `self.len: O::Len` or `self.remaining: F::Bits`
+        // whose declared `PNode::Alias` has no `field_regions` row, or a zero-slot subfield under
+        // an inexact parent) has an exact empty slot slice. Its `parent`, `deref`, `union_field`,
+        // and `local` remain intact so reborrow and loan walks through enclosing places stay
+        // exact, while any type-parameter outlives on `child` (such as `O::Len: 'static`) is
+        // checked via `Owner::param` in `blaze-borrow`.
+        if !info.exact && <R::Grain as grain::Grain>::SLOTS && self.npos_d(child, e)? == 0 {
+            info.len = 0;
+            info.exact = true;
+        }
         self.ensure_pinfo(p, info);
         Ok(p)
     }
@@ -6554,6 +6565,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// such a coercion, and `relate` applies (a trait with lifetimes keeps the object lifetime
     /// standing for them, every position equal).
     fn unsize_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<UnsizeDone, Refusal> {
+        if !R::RELATES {
+            return Ok(UnsizeDone::Fallback);
+        }
         let (s, d) = (self.info(src), self.info(dst));
         if !s.exact || !d.exact {
             return Ok(UnsizeDone::Fallback);
@@ -6709,7 +6723,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // `'r_src: 'r_dst` (when `&`/`&mut`), every capture slot outlives `'q` (one-way), and every
         // `dyn` `Fn*` / `FnOnce::Output` predicate slot equates with the closure's corresponding
         // signature slot (`SigSlot::Owner` / `SigSlot::Static`).
-        if let PNode::Closure { owner, ordinal, .. } = self.node(from_inner, e)?
+        if <R::Grain as grain::Grain>::SLOTS
+            && let PNode::Closure { owner, ordinal, .. } = self.node(from_inner, e)?
             && owner == self.body.owner
             && let Some(&ce) = self.ck.closures.column::<0>().get(ordinal as usize)
         {

@@ -40,9 +40,10 @@ pub(crate) fn normalize_ground(
     scratch: Alloc<'_>,
 ) -> Result<PTy, BuildError> {
     let mut top = top;
-    let mut reached: Vec<bool, Alloc<'_>> = Vec::new_in(scratch);
+    let mut reached: Vec<u32, Alloc<'_>> = Vec::new_in(scratch);
+    let mut walk = crate::instance::SparseReach::new_in(scratch);
     let mut mapped: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
-    // Whether `mapped[at]` may still hold a projection (a solver's answer, or a node over one):
+    // Whether `mapped[idx]` may still hold a projection (a solver's answer, or a node over one):
     // a projection whose arguments are dirty waits for the next round, so the solver is only
     // ever asked with concrete arguments.
     let mut dirty: Vec<bool, Alloc<'_>> = Vec::new_in(scratch);
@@ -50,96 +51,91 @@ pub(crate) fn normalize_ground(
     let mut list: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     let mut last = None;
     for _ in 0..ROUNDS {
-        let n = top.0 as usize + 1;
-        reached.clear();
-        reached.resize(n, false);
-        reached[n - 1] = true;
-        for at in (0..n).rev() {
-            if !reached[at] {
-                continue;
-            }
-            children.clear();
-            crate::instance::each_child(ground.view(), ground.view().node(PTy(at as u32)).map_err(past)?, &mut children)?;
-            for c in children.iter() {
-                *reached.get_mut(c.0 as usize).ok_or(BuildError::Malformed { what: "a child after its parent" })? = true;
-            }
-        }
+        walk.collect(ground.view(), top, &mut reached, |_| false, "a type index past the ground table")?;
         mapped.clear();
-        mapped.extend((0..n as u32).map(PTy));
+        mapped.extend(reached.iter().map(|&id| PTy(id)));
         dirty.clear();
-        dirty.resize(n, false);
+        dirty.resize(reached.len(), false);
         let mut met = false;
-        for at in 0..n {
-            if !reached[at] {
-                continue;
-            }
-            let node = ground.view().node(PTy(at as u32)).map_err(past)?;
+        for (idx, &at) in reached.iter().enumerate() {
+            let node = ground.view().node(PTy(at)).map_err(past)?;
             children.clear();
             crate::instance::each_child(ground.view(), node, &mut children)?;
-            let changed = children.iter().any(|c| mapped[c.0 as usize] != *c);
-            let child_dirty = children.iter().any(|c| dirty[c.0 as usize]);
+            let mut changed = false;
+            let mut child_dirty = false;
+            for &c in children.iter() {
+                let ci = crate::instance::reach_index(&reached, c)?;
+                changed |= mapped[ci] != c;
+                child_dirty |= dirty[ci];
+            }
             if let PNode::Alias { trait_, name, args } = node {
                 met = true;
                 last = Some((trait_, name));
-                let args = if changed { remap_list(ground, args, &mapped, &mut list)? } else { args };
+                let args = if changed { remap_list(ground, args, &reached, &mapped, &mut list)? } else { args };
                 if child_dirty {
-                    mapped[at] = ground.intern(PNode::Alias { trait_, name, args }).map_err(full)?;
+                    mapped[idx] = ground.intern(PNode::Alias { trait_, name, args }).map_err(full)?;
                 } else {
                     list.clear();
                     list.extend_from_slice(ground.view().list(args).map_err(past)?);
-                    mapped[at] = facts.normalize(trait_, name, &list, ground)?;
+                    mapped[idx] = facts.normalize(trait_, name, &list, ground)?;
                 }
-                dirty[at] = true;
+                dirty[idx] = true;
                 continue;
             }
-            dirty[at] = child_dirty;
+            dirty[idx] = child_dirty;
             if !changed {
                 continue;
             }
-            let m = |t: PTy| mapped[t.0 as usize];
+            let m = |t: PTy| -> Result<PTy, BuildError> { Ok(mapped[crate::instance::reach_index(&reached, t)?]) };
             let new = match node {
-                PNode::Tuple(l) => PNode::Tuple(remap_list(ground, l, &mapped, &mut list)?),
-                PNode::Record(s, l) => PNode::Record(s, remap_list(ground, l, &mapped, &mut list)?),
-                PNode::Union(l) => PNode::Union(remap_list(ground, l, &mapped, &mut list)?),
-                PNode::Adt(k, l) => PNode::Adt(k, remap_list(ground, l, &mapped, &mut list)?),
-                PNode::FnDef(k, l) => PNode::FnDef(k, remap_list(ground, l, &mapped, &mut list)?),
-                PNode::FnPtr(l, h) => PNode::FnPtr(remap_list(ground, l, &mapped, &mut list)?, h),
+                PNode::Tuple(l) => PNode::Tuple(remap_list(ground, l, &reached, &mapped, &mut list)?),
+                PNode::Record(s, l) => PNode::Record(s, remap_list(ground, l, &reached, &mapped, &mut list)?),
+                PNode::Union(l) => PNode::Union(remap_list(ground, l, &reached, &mapped, &mut list)?),
+                PNode::Adt(k, l) => PNode::Adt(k, remap_list(ground, l, &reached, &mapped, &mut list)?),
+                PNode::FnDef(k, l) => PNode::FnDef(k, remap_list(ground, l, &reached, &mapped, &mut list)?),
+                PNode::FnPtr(l, h) => PNode::FnPtr(remap_list(ground, l, &reached, &mapped, &mut list)?, h),
                 PNode::Closure { owner, ordinal, args } => {
-                    PNode::Closure { owner, ordinal, args: remap_list(ground, args, &mapped, &mut list)? }
+                    PNode::Closure { owner, ordinal, args: remap_list(ground, args, &reached, &mapped, &mut list)? }
                 }
                 PNode::Coroutine { owner, ordinal, args } => {
-                    PNode::Coroutine { owner, ordinal, args: remap_list(ground, args, &mapped, &mut list)? }
+                    PNode::Coroutine { owner, ordinal, args: remap_list(ground, args, &reached, &mapped, &mut list)? }
                 }
-                PNode::Opaque(k, l) =>PNode::Opaque(k, remap_list(ground, l, &mapped, &mut list)?),
-                PNode::Dynamic(l) => PNode::Dynamic(remap_list(ground, l, &mapped, &mut list)?),
-                PNode::ExTrait(k, l) => PNode::ExTrait(k, remap_list(ground, l, &mapped, &mut list)?),
+                PNode::Opaque(k, l) => PNode::Opaque(k, remap_list(ground, l, &reached, &mapped, &mut list)?),
+                PNode::Dynamic(l) => PNode::Dynamic(remap_list(ground, l, &reached, &mapped, &mut list)?),
+                PNode::ExTrait(k, l) => PNode::ExTrait(k, remap_list(ground, l, &reached, &mapped, &mut list)?),
                 PNode::ExProj { trait_, name, args, term } => {
-                    PNode::ExProj { trait_, name, args: remap_list(ground, args, &mapped, &mut list)?, term: m(term) }
+                    PNode::ExProj { trait_, name, args: remap_list(ground, args, &reached, &mapped, &mut list)?, term: m(term)? }
                 }
-                PNode::Pat(t, l) => PNode::Pat(m(t), l),
-                PNode::Ref(mu, t) => PNode::Ref(mu, m(t)),
-                PNode::Ptr(mu, t) => PNode::Ptr(mu, m(t)),
-                PNode::Slice(t) => PNode::Slice(m(t)),
-                PNode::Array(t, len) => PNode::Array(m(t), m(len)),
-                PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty), bits },
+                PNode::Pat(t, l) => PNode::Pat(m(t)?, l),
+                PNode::Ref(mu, t) => PNode::Ref(mu, m(t)?),
+                PNode::Ptr(mu, t) => PNode::Ptr(mu, m(t)?),
+                PNode::Slice(t) => PNode::Slice(m(t)?),
+                PNode::Array(t, len) => PNode::Array(m(t)?, m(len)?),
+                PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty)?, bits },
                 _ => return Err(BuildError::UnsupportedSig { what: "a projection inside a closure's or a future's type" }),
             };
-            mapped[at] = ground.intern(new).map_err(full)?;
+            mapped[idx] = ground.intern(new).map_err(full)?;
         }
         if !met {
             return Ok(top);
         }
-        top = mapped[n - 1];
+        top = *mapped.last().ok_or(BuildError::Malformed { what: "a type index past the ground table" })?;
     }
     let (trait_, name) = last.ok_or(BuildError::Malformed { what: "a projection round with no projection" })?;
     Err(BuildError::Projection { trait_, name })
 }
 
 /// List `l` of `ground`, each element replaced by its `mapped` form, interned.
-fn remap_list(ground: &mut PortableTys<'_>, l: List, mapped: &[PTy], list: &mut Vec<PTy, Alloc<'_>>) -> Result<List, BuildError> {
+fn remap_list(
+    ground: &mut PortableTys<'_>,
+    l: List,
+    reached: &[u32],
+    mapped: &[PTy],
+    list: &mut Vec<PTy, Alloc<'_>>,
+) -> Result<List, BuildError> {
     list.clear();
-    for t in ground.view().list(l).map_err(past)? {
-        list.push(*mapped.get(t.0 as usize).ok_or(BuildError::Malformed { what: "a child after its parent" })?);
+    for &t in ground.view().list(l).map_err(past)? {
+        list.push(mapped[crate::instance::reach_index(reached, t)?]);
     }
     ground.intern_list(list).map_err(full)
 }

@@ -106,6 +106,10 @@ struct RegionFields {
     variant_count: usize,
     first_field: usize,
     regions: AdtFieldRegions,
+    /// Per-body slice `(start, len)` into `BorrowFacts::suppressed_field_regions` naming field
+    /// indices whose `PNode::Alias` may normalize in this body and must return `None` from
+    /// `Facts::field_regions`.
+    suppressed: Option<(u32, u32)>,
 }
 
 /// One finding of the move or borrow check: its code (rustc's error code where one names the
@@ -507,6 +511,8 @@ pub struct BorrowFacts<'a> {
     field_leads: AVec<'a, FieldLead>,
     /// Frozen field region columns by ADT, addressed by variant and field in constant time.
     field_regions: blaze_hash::HashMap<tc::ItemKey, RegionFields, Alloc<'a>>,
+    /// Per-body suppressed field indices referenced by [`RegionFields::suppressed`].
+    suppressed_field_regions: AVec<'a, u32>,
     /// Per ADT whose one `Copy` impl was read, sorted by checker key: where its arguments'
     /// needs are in `copy_need` (borrow_fields.rs `copy_args_of`; `Facts::copy_args`).
     copy_args: AVec<'a, (u128, u32, u32)>,
@@ -660,6 +666,7 @@ impl<'a> BorrowFacts<'a> {
             field_params: AVec::new_in(alloc),
             field_leads: AVec::new_in(alloc),
             field_regions: blaze_hash::HashMap::new_in(alloc),
+            suppressed_field_regions: AVec::new_in(alloc),
             copy_args: AVec::new_in(alloc),
             copy_need: AVec::new_in(alloc),
             drop_args: AVec::new_in(alloc),
@@ -800,7 +807,18 @@ impl Facts for ReadBy<'_, '_> {
         if field >= count {
             return None;
         }
-        row.regions.field(first as usize - row.first_field + field as usize)
+        let field_idx = first as usize - row.first_field + field as usize;
+        if let Some((start, len)) = row.suppressed
+            && let Ok(fi) = u32::try_from(field_idx)
+            && self
+                .facts
+                .suppressed_field_regions
+                .get(start as usize..start as usize + len as usize)
+                .is_some_and(|sl| sl.iter().any(|&x| x == fi))
+        {
+            return None;
+        }
+        row.regions.field(field_idx)
     }
     fn copy_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         let at = self.facts.copy_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
@@ -2392,6 +2410,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             });
         }
     }
+    let mut alias_guard: Option<fields::FieldAliasGuard<'a>> = None;
     for &k in adts.iter() {
         let key = tc::ItemKey(k);
         // The store holds only the ADTs something asked for: ask. One that cannot be made stays
@@ -2430,6 +2449,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.variants.push((k, vi as u32, first, g.fields.len() as u32 - first));
         }
         let regions = row.field_regions.clone();
+        let has_alias_field = plant != FactsPlant::NoFieldRegions
+            && fields::adt_has_alias_field(r.store.tys.view(), &row.fields);
         let field_count = row.fields.len();
         let variant_count = row.variants.len();
         let copy_state = copy_impl_state(r, langs.copy, key, alloc);
@@ -2574,9 +2595,25 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let e = usize::try_from(hi).ok()?;
             g.variance_list.get(s..e)
         });
+        let suppressed = if has_alias_field {
+            let guard = alias_guard.get_or_insert_with(|| fields::FieldAliasGuard::new_in(alloc));
+            guard.check_adt(r, owner, c.types.view(), key, &mut g.suppressed_field_regions)
+        } else {
+            None
+        };
         let mut absent = AVec::new_in(alloc);
         let spans = if plant == FactsPlant::NoFieldRegions {
             absent.resize(field_count, NO_ROW);
+            &absent[..]
+        } else if let Some((s, len)) = suppressed {
+            absent.extend_from_slice(&regions.at[..]);
+            if let Some(sl) = g.suppressed_field_regions.get(s as usize..s as usize + len as usize) {
+                for &fi in sl {
+                    if let Some(slot) = absent.get_mut(fi as usize) {
+                        *slot = NO_ROW;
+                    }
+                }
+            }
             &absent[..]
         } else {
             &regions.at[..]
@@ -2603,8 +2640,14 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         );
         g.reads.push(read);
         if plant != FactsPlant::NoFieldRegions {
-            g.field_regions.insert(key, RegionFields { first_variant: variants_from, variant_count, first_field: fields_from, regions });
+            g.field_regions.insert(
+                key,
+                RegionFields { first_variant: variants_from, variant_count, first_field: fields_from, regions, suppressed },
+            );
         }
+    }
+    if let Some(guard) = alias_guard {
+        guard.push_reads(&mut g.reads);
     }
     // Evaluate instantiated structural drop glue for concrete body `PNode::Adt` types whose
     // uninstantiated ADT summary had `needs_drop && !drop_impl` (e.g. `Flatten<...>`,
@@ -5641,6 +5684,338 @@ fn main() {}
             assert!(types.is_clean(), "try_as_dyn_short_as_static_bad types: {types:?}");
             assert!(bad.refused.is_none(), "try_as_dyn_short_as_static_bad refused: {bad:?}");
             assert!(!bad.findings.is_empty(), "try_as_dyn_short_as_static_bad must be rejected: {bad:?}");
+        }
+    }
+}
+
+/// Regression and soundness tests for Wave 6 `front2` fixes:
+/// 1. `InstDropEval::select_impl` scaling past 64 candidates in large `Shape::Ref(Not)` buckets
+///    (`crates/blaze-cli/src/engine_bodies.rs:4005` `to_open.iter().take(count).flatten().any(...)`
+///    inside an `if ... && let Some(slot) = to_open.get_mut(count)` chain with 70+ `IntoIterator`
+///    impls on `&T`), plus negative soundness controls proving dropping inners still reject.
+/// 2. `PNode::Alias` in `field_row` + per-body `FieldAliasGuard`:
+///    - Clears `Lazy<'r, 'a, F, D>` methods (`run_parent.rs`) and `Hit<'s, 'b, K>` (`proof.rs`)
+///      whose `PNode::Alias` fields stay unnormalized.
+///    - Negative soundness controls: swapping lifetimes across `&'r` / `&'a`, returning `&'b K::Root`
+///      as `'s` / `'static`, concrete normalized alias swapping lifetimes (`Pair<'a, 'b>` ->
+///      `(&'b u8, &'a u8)`), blanket-impl normalized alias, and `where F: Front<Maker = RunMaker<'h>>`
+///      returning `'h` as `'static` MUST ALL be rejected!
+#[cfg(test)]
+mod wave6_front2_soundness_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+
+// --- 1. Exact `engine_bodies.rs:4005` if-let chain with >64 `IntoIterator for &` impls ---
+pub struct Unopened {
+    pub world_at: u32,
+}
+
+macro_rules! dummy_into_iters {
+    ($($name:ident),*) => {
+        $(
+            pub struct $name;
+            impl<'a> IntoIterator for &'a $name {
+                type Item = &'a u8;
+                type IntoIter = core::slice::Iter<'a, u8>;
+                fn into_iter(self) -> Self::IntoIter {
+                    [].iter()
+                }
+            }
+        )*
+    };
+}
+
+dummy_into_iters!(
+    D00, D01, D02, D03, D04, D05, D06, D07, D08, D09,
+    D10, D11, D12, D13, D14, D15, D16, D17, D18, D19,
+    D20, D21, D22, D23, D24, D25, D26, D27, D28, D29,
+    D30, D31, D32, D33, D34, D35, D36, D37, D38, D39,
+    D40, D41, D42, D43, D44, D45, D46, D47, D48, D49,
+    D50, D51, D52, D53, D54, D55, D56, D57, D58, D59,
+    D60, D61, D62, D63, D64, D65, D66, D67, D68, D69
+);
+
+pub fn pre_open_chain_ok(rest: &[Unopened], places: &[usize]) {
+    let mut to_open: [Option<&Unopened>; 8] = [None; 8];
+    let mut count = 0usize;
+    for &place in places {
+        if place > 0
+            && let Some(unopened) = rest.get(place - 1)
+            && !to_open.iter().take(count).flatten().any(|prev| prev.world_at == unopened.world_at)
+            && let Some(slot) = to_open.get_mut(count)
+        {
+            *slot = Some(unopened);
+            count += 1;
+        }
+    }
+}
+
+pub struct DropGuard<'a> {
+    slot: &'a mut u32,
+}
+
+impl Drop for DropGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot += 1;
+    }
+}
+
+// NEGATIVE: `Flatten<Take<vec::IntoIter<Option<DropGuard<'_>>>>>` MUST still require drop even
+// with 70+ `IntoIterator` impls in scope, rejecting conflicting mutation before scope exit.
+pub fn flatten_take_vec_drop_bad(x: &mut u32, count: usize) {
+    let mut v = Vec::new();
+    v.push(Some(DropGuard { slot: x }));
+    let _flat = v.into_iter().take(count).flatten();
+    *x = 77;
+}
+
+// --- 2. Exact `run_parent.rs` `Lazy<'r, 'a, F, D>` (2 lifetimes + PNode::Alias field) ---
+pub trait Front {
+    type Start;
+    type Ids;
+    type Maker;
+}
+
+pub struct RunMaker<'h> {
+    pub data: &'h u8,
+}
+
+impl<'h> RunMaker<'h> {
+    pub fn count(&self) -> u8 {
+        *self.data
+    }
+}
+
+pub struct Heavy<I, M> {
+    pub ids: I,
+    pub maker: M,
+}
+
+pub struct Started<'a, S, I, M> {
+    pub start: S,
+    pub heavy: Option<Heavy<I, M>>,
+    pub _marker: PhantomData<&'a ()>,
+}
+
+pub struct Lazy<'r, 'a, F: Front, D> {
+    pub cx: &'r u8,
+    pub front: F,
+    pub folder: D,
+    pub started: Option<Started<'a, F::Start, F::Ids, F::Maker>>,
+}
+
+impl<'r, 'a, F: Front, D> Lazy<'r, 'a, F, D> {
+    pub fn is_cold_ok(&self) -> bool {
+        self.started.is_none()
+    }
+
+    pub fn start_ok(&self) -> Option<&F::Start> {
+        self.started.as_ref().map(|s| &s.start)
+    }
+
+    pub fn is_heavy_ok(&self) -> bool {
+        self.started.as_ref().is_some_and(|s| s.heavy.is_some())
+    }
+
+    pub fn cx_ok(&self) -> &'r u8 {
+        self.cx
+    }
+
+    // NEGATIVE: returning `'r` as `'a` across sibling fields of `Lazy` MUST be rejected.
+    pub fn lazy_bad_r_as_a(&self) -> &'a u8 {
+        self.cx
+    }
+
+    // NEGATIVE: returning `'h` as `'static` through normalized `F::Maker = RunMaker<'h>` MUST
+    // be rejected (suppressed by `FieldAliasGuard`).
+    pub fn lazy_lowering_bad_static<'h>(&self) -> Option<&'static u8>
+    where
+        F: Front<Maker = RunMaker<'h>>,
+    {
+        self.started
+            .as_ref()
+            .and_then(|s| s.heavy.as_ref())
+            .map(|heavy| heavy.maker.data)
+    }
+}
+
+// --- 3. Exact `proof.rs` `Hit<'s, 'b, K: Kind>` (2 lifetimes + `&'b K::Root`) ---
+pub trait Kind {
+    type Root;
+}
+
+pub trait HasPayload {
+    fn payload(&self) -> usize;
+}
+
+#[derive(Clone, Copy)]
+pub struct Brand<'s>(PhantomData<fn(&'s ()) -> &'s ()>);
+
+#[derive(Clone, Copy)]
+pub struct Holds<'s, K> {
+    pub brand: Brand<'s>,
+    pub _k: PhantomData<K>,
+}
+
+pub struct Hit<'s, 'b, K: Kind> {
+    holds: Holds<'s, K>,
+    root: &'b K::Root,
+    bytes: &'b [u8],
+}
+
+pub fn make_hit<'s, 'b, K: Kind>(brand: Brand<'s>, root: &'b K::Root, bytes: &'b [u8]) -> Hit<'s, 'b, K> {
+    Hit { holds: Holds { brand, _k: PhantomData }, root, bytes }
+}
+
+impl<'s, 'b, K: Kind> Hit<'s, 'b, K> {
+    pub fn root_ok(&self) -> &'b K::Root {
+        self.root
+    }
+
+    // NEGATIVE: returning `&'b K::Root` as `&'s K::Root` MUST be rejected.
+    pub fn root_bad_s(&self) -> &'s K::Root {
+        self.root
+    }
+
+    // NEGATIVE: returning `&'b K::Root` as `&'static K::Root` MUST be rejected.
+    pub fn root_bad_static(&self) -> &'static K::Root {
+        self.root
+    }
+}
+
+impl<'s, 'b, K: Kind> Hit<'s, 'b, K>
+where
+    K::Root: HasPayload,
+{
+    pub fn payload_ok(&self) -> (&'b [u8], usize) {
+        (self.bytes, self.root.payload())
+    }
+}
+
+// --- 4. Soundness controls for normalized `PNode::Alias` fields ---
+pub trait SwapTr {
+    type Assoc;
+}
+
+pub struct Pair<'a, 'b>(pub &'a u8, pub &'b u8);
+
+impl<'a, 'b> SwapTr for Pair<'a, 'b> {
+    // Same slot count (2) as `Pair<'a, 'b>`, but SWAPPED order!
+    type Assoc = (&'b u8, &'a u8);
+}
+
+pub struct AliasBox<T: SwapTr> {
+    pub x: T::Assoc,
+}
+
+// NEGATIVE: `f.x.0` has type `&'b u8`, NOT `&'a u8`; unnormalized `[Arg(0)]` would map it to `'a`
+// if `FieldAliasGuard` did not suppress concrete instantiations!
+pub fn alias_swap_bad<'a, 'b>(f: AliasBox<Pair<'a, 'b>>) -> &'a u8 {
+    f.x.0
+}
+
+pub trait BlanketTr {
+    type Assoc;
+}
+
+impl<T> BlanketTr for T {
+    type Assoc = &'static u8;
+}
+
+pub struct BlanketBox<'a, T: BlanketTr> {
+    pub r: &'a u8,
+    pub x: T::Assoc,
+}
+
+// NEGATIVE: `BlanketTr` has a blanket impl, so `FieldAliasGuard` suppresses `x` while keeping
+// `r` sound; returning `r` (`&'a u8`) as `&'static u8` MUST be rejected.
+pub fn alias_blanket_bad<'a, T: BlanketTr>(b: BlanketBox<'a, T>) -> &'static u8 {
+    b.r
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn wave6_front2_blockers_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/w6sound/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "w6sound", dir: "/w6sound/", root: "/w6sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let free = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+        let member = |method: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Member { name, .. } = body else { return None };
+                    (name == method).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture method {method}"))
+        };
+
+        // 1. Positive: `engine_bodies.rs:4005` chain with 70+ `IntoIterator for &` impls + `proof.rs::hit`
+        for name in ["pre_open_chain_ok", "make_hit"] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // 2. Positive: `Lazy<'r, 'a, F, D>` and `Hit<'s, 'b, K>` methods
+        for name in ["is_cold_ok", "start_ok", "is_heavy_ok", "cx_ok", "root_ok", "payload_ok"] {
+            let (types, borrows) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // 3. Negative soundness controls (free functions): MUST be rejected!
+        for name in ["flatten_take_vec_drop_bad", "alias_swap_bad", "alias_blanket_bad"] {
+            let (types, bad) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(!bad.is_clean(), "{name} must NOT be accepted: {bad:?}");
+        }
+        // Specifically verify `flatten_take_vec_drop_bad` produces a real borrow finding (not refusal).
+        {
+            let (_, bad) = world.check_borrows(free("flatten_take_vec_drop_bad"), alloc);
+            assert!(bad.refused.is_none(), "flatten_take_vec_drop_bad refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "flatten_take_vec_drop_bad must report borrow error: {bad:?}");
+        }
+
+        // 4. Negative soundness controls (methods): MUST be rejected!
+        for name in ["lazy_bad_r_as_a", "lazy_lowering_bad_static", "root_bad_s", "root_bad_static"] {
+            let (types, bad) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(!bad.is_clean(), "{name} must NOT be accepted: {bad:?}");
+        }
+        // Specifically verify `lazy_bad_r_as_a`, `root_bad_s`, `root_bad_static` report exact findings.
+        for name in ["lazy_bad_r_as_a", "root_bad_s", "root_bad_static"] {
+            let (_, bad) = world.check_borrows(member(name), alloc);
+            assert!(bad.refused.is_none(), "{name} refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "{name} must report borrow error: {bad:?}");
         }
     }
 }

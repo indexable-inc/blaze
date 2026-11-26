@@ -410,3 +410,267 @@ fn witness_lowering_skips_region_slot_field_alignment() {
     let witness = crate::lower_async_witness(&view, &ck, ab, &WitnessWorld { holder }, region_fixture::alloc());
     assert!(witness.is_ok(), "witness lowering must not refuse RegionSlots field_regions with FieldRegionsUnaligned: {:?}", witness.err());
 }
+
+/// Associated-type ADT fields with zero region slots (the 4 remaining `PositionsNotSlots` bodies:
+/// `blaze-format-core`'s `Slice::count`, `Slice::follow_as`, `Verified<Slice>::items` reading
+/// `self.len: O::Len`, and `blaze-bitflags`'s `IterNames::remaining` reading `self.remaining:
+/// F::Bits`) have no `field_regions` row because `PNode::Alias` is unlaid at the ADT head.
+/// Under `RegionSlots`, a projected field whose instantiated type carries 0 slots is an exact
+/// empty slot slice (`len = 0, exact = true`), while:
+/// - Positive: passing `s.len` to a call `count_len(s.len)` succeeds cleanly (no `PositionsNotSlots`,
+///   no false coupling to `Slice`'s own `'a` lifetime).
+/// - Negative 1 (param outlives): passing `s.len` (`O::Len`) to `need_static<X: 'static>(x: X)`
+///   without `O: 'static` is STILL rejected with `UnprovenOutlives` (`ρ_O: 'static`); with
+///   `O: 'static` it succeeds.
+/// - Negative 2 (reborrow): returning `&s.len` as `&'static O::Len` from `s: &'a Slice<'a, O>`
+///   is STILL rejected with `UnprovenOutlives` (`'a: 'static`), proving `parent`/`deref` stay intact.
+#[test]
+fn associated_type_field_with_zero_slots_passes_one_rule_and_checks_outlives() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        Count,
+        NeedStaticUnbounded,
+        NeedStaticBounded,
+        BadReborrow,
+    }
+
+    fn run_case(case: Case) -> Result<vec::Vec<String>, Refusal> {
+        let mut fx = Fx::new();
+        let u8t = fx.u8();
+        let unit = fx.unit();
+        let ru8 = fx.r(Mutbl::Not, u8t);
+        let offset_tr = fx.tr("Offset", 1, vec![], &["Len"]);
+        let p0 = fx.param(0);
+        let o_len = fx.alias(offset_tr, "Len", &[p0]);
+        let r_o_len = fx.r(Mutbl::Not, o_len);
+        // `struct Slice<'a, O: Offset> { tag: &'a u8, len: O::Len }` (has BOTH a lifetime `'a`
+        // so parent `pi.len == 1 > 0` AND a `PNode::Alias` field with no `field_regions` row).
+        let slice = fx.strukt("Slice", 1, &[("tag", ru8), ("len", o_len)]);
+        let slice_p0 = fx.adt(slice, &[p0]);
+        let r_slice = fx.r(Mutbl::Not, slice_p0);
+        let offset_bound = fx.bound(offset_tr, &[p0]);
+
+        let count_fn = fx.func("count_len", 1, &[o_len], u8t, vec![offset_bound]);
+        let need_static_fn = fx.func("need_static", 1, &[p0], unit, vec![]);
+        let (caller_out, caller_slots): (PTy, &[Region]) = match case {
+            Case::Count => (u8t, &[P0, P0]),
+            Case::NeedStaticUnbounded | Case::NeedStaticBounded => (unit, &[P0, P0]),
+            Case::BadReborrow => (r_o_len, &[P0, P0, Region::Static]),
+        };
+        let caller = fx.func("caller", 1, &[r_slice], caller_out, vec![offset_bound]);
+        fx.finish();
+
+        let mut decls = Decls::new();
+        decls.adt(slice, 1);
+        decls.trait_(offset_tr, 0);
+        decls.alias(offset_tr, "Len", 0);
+        decls.func(count_fn, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[o_len], output: u8t, slots: &[] });
+        decls.func(need_static_fn, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[p0], output: unit, slots: &[] });
+        decls.clause(need_static_fn, 0, 0, p0, &[]);
+        decls.type_outlives(need_static_fn, 0, Region::Static);
+        decls.func(caller, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[r_slice], output: caller_out, slots: caller_slots });
+        if matches!(case, Case::NeedStaticBounded) {
+            decls.clause(caller, 0, 0, p0, &[]);
+            decls.type_outlives(caller, 0, Region::Static);
+        }
+
+        struct AliasWorld {
+            slice: ItemKey,
+            offset_tr: ItemKey,
+            caller: ItemKey,
+            param_static: bool,
+        }
+        impl Facts for AliasWorld {
+            fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+            fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+            fn implied_bounds(&self) -> Option<(&[(u32, Region)], &[(Region, Region)])> { None }
+            fn constant_initializer(&self) -> bool { false }
+            fn fn_binders(&self) -> bool { true }
+            fn closure_bodies_checked(&self) -> bool { false }
+            fn closure_requirements(&self, _: ExprId) -> &[crate::Requirement] { &[] }
+            fn async_bodies_checked(&self) -> bool { false }
+            fn is_future(&self, _: PTy) -> Option<bool> { None }
+            fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+            fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+            fn call_bounds(&self, item: ItemKey) -> Option<crate::CallBounds<'_>> {
+                const P0_STATIC: [(crate::OutlivesType, Region); 1] = [(crate::OutlivesType::Param(0), Region::Static)];
+                if item == self.caller {
+                    Some(crate::CallBounds {
+                        outlives: if self.param_static { &P0_STATIC } else { &[] },
+                        trait_bounded: &[],
+                        unread_below: 0,
+                    })
+                } else {
+                    None
+                }
+            }
+            fn trait_lifetimes(&self, tr: ItemKey) -> Option<u32> { (tr == self.offset_tr).then_some(0) }
+            fn alias_lifetimes(&self, tr: ItemKey, name: Name) -> Option<u32> {
+                (tr == self.offset_tr && name == Name::of("Len")).then_some(0)
+            }
+            fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+            fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+            fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+            fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+            fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+                let lifetimes = u32::from(k == self.slice);
+                Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
+            }
+            fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+                Some(region_fixture::all_co(if k == self.slice { 2 } else { 0 }))
+            }
+            fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+                Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+            }
+            fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
+                if adt != self.slice || variant != 0 {
+                    return None;
+                }
+                if name == Name::of("tag") {
+                    Some(0)
+                } else if name == Name::of("len") {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+            fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
+                (adt == self.slice && variant == 0).then_some(2)
+            }
+            fn field_regions(&self, adt: ItemKey, variant: u32, field: u32) -> Option<&[FieldRegion]> {
+                // `tag` has a row; `len` (`O::Len`) has NO row (exact match to `borrow_fields.rs`).
+                const TAG: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
+                (adt == self.slice && variant == 0 && field == 0).then_some(&TAG[..])
+            }
+            fn param_copy(&self, _: u32) -> bool { true }
+            fn alias_copy(&self, _: PTy) -> bool { true }
+        }
+
+        let mut b = Bb::new();
+        let s = b.param("s");
+        let ls = b.local(s);
+        let read_len = field(&mut b, s, ls, "len");
+        let tail = match case {
+            Case::Count => {
+                let bp0 = b.ty(blaze_typeck::PNode::Param(0));
+                let callee = b.path_args("count_len", &[bp0]);
+                b.call(callee, &[read_len])
+            }
+            Case::NeedStaticUnbounded | Case::NeedStaticBounded => {
+                let callee = b.path(&["need_static"]);
+                b.call(callee, &[read_len])
+            }
+            Case::BadReborrow => b.borrow(Mutbl::Not, read_len),
+        };
+        let root = b.block(&[], Some(tail));
+        let view = b.view(caller, root);
+        region_fixture::run(
+            &fx,
+            &view,
+            &AliasWorld { slice, offset_tr, caller, param_static: matches!(case, Case::NeedStaticBounded) },
+            &decls,
+            Plant::None,
+        )
+        .map(|r| r.lines)
+    }
+
+    let ok_count = run_case(Case::Count);
+    assert_eq!(ok_count, Ok(vec::Vec::new()), "POSITIVE: `count_len(s.len)` must succeed without PositionsNotSlots: {ok_count:?}");
+
+    let bad_static = run_case(Case::NeedStaticUnbounded);
+    assert!(outlives(&bad_static), "NEGATIVE: `need_static(s.len)` without `O: 'static` must report UnprovenOutlives: {bad_static:?}");
+
+    let ok_static = run_case(Case::NeedStaticBounded);
+    assert_eq!(ok_static, Ok(vec::Vec::new()), "POSITIVE: `need_static(s.len)` with `O: 'static` must succeed: {ok_static:?}");
+
+    let bad_reborrow = run_case(Case::BadReborrow);
+    assert!(outlives(&bad_reborrow), "NEGATIVE: `&s.len` returned as `&'static O::Len` must report UnprovenOutlives: {bad_reborrow:?}");
+}
+
+/// NEGATIVE SOUNDNESS: an associated-type field whose trait carries a lifetime (`T: Tr<'a>`,
+/// `out: T::Out`, `RegionSlots::count(T::Out) == 1 > 0`) with no `field_regions` row MUST NOT be
+/// collapsed to `len = 0, exact = true` — passing it to a call must still refuse with
+/// `PositionsNotSlots` rather than silently dropping the trait lifetime `'a`.
+#[test]
+fn associated_type_field_with_nonzero_slots_still_refuses_positions_not_slots() {
+    let mut fx = Fx::new();
+    let unit = fx.unit();
+    let tr = fx.tr("Tr", 1, vec![], &["Out"]);
+    let p0 = fx.param(0);
+    let t_out = fx.alias(tr, "Out", &[p0]);
+    let wrap = fx.strukt("Wrap", 1, &[("out", t_out)]);
+    let wrap_p0 = fx.adt(wrap, &[p0]);
+    let r_wrap = fx.r(Mutbl::Not, wrap_p0);
+    let tr_bound = fx.bound(tr, &[p0]);
+
+    let consume = fx.func("consume", 1, &[p0], unit, vec![]);
+    let caller = fx.func("caller", 1, &[r_wrap], unit, vec![tr_bound]);
+    fx.finish();
+
+    let mut decls = Decls::new();
+    decls.adt(wrap, 1);
+    decls.trait_(tr, 1);
+    decls.alias(tr, "Out", 1);
+    decls.func(consume, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[p0], output: unit, slots: &[] });
+    decls.func(caller, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[r_wrap], output: unit, slots: &[P0, P0] });
+
+    struct NonZeroAliasWorld {
+        wrap: ItemKey,
+        tr: ItemKey,
+    }
+    impl Facts for NonZeroAliasWorld {
+        fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn implied_bounds(&self) -> Option<(&[(u32, Region)], &[(Region, Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: ExprId) -> &[crate::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, k: ItemKey) -> Option<u32> { (k == self.tr).then_some(1) }
+        fn alias_lifetimes(&self, k: ItemKey, name: Name) -> Option<u32> {
+            (k == self.tr && name == Name::of("Out")).then_some(1)
+        }
+        fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+            let lifetimes = u32::from(k == self.wrap);
+            Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
+        }
+        fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+            Some(region_fixture::all_co(if k == self.wrap { 2 } else { 0 }))
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+        }
+        fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
+            (adt == self.wrap && variant == 0 && name == Name::of("out")).then_some(0)
+        }
+        fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
+            (adt == self.wrap && variant == 0).then_some(1)
+        }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[FieldRegion]> { None }
+        fn param_copy(&self, _: u32) -> bool { true }
+        fn alias_copy(&self, _: PTy) -> bool { true }
+    }
+
+    let mut b = Bb::new();
+    let w = b.param("w");
+    let lw = b.local(w);
+    let read_out = field(&mut b, w, lw, "out");
+    let callee = b.path(&["consume"]);
+    let call = b.call(callee, &[read_out]);
+    let root = b.block(&[], Some(call));
+    let view = b.view(caller, root);
+    let got = region_fixture::run(&fx, &view, &NonZeroAliasWorld { wrap, tr }, &decls, Plant::None);
+    assert!(
+        matches!(got, Err(Refusal { form: Form::OneRule { why: crate::OneRuleWhy::PositionsNotSlots { .. }, .. }, .. })),
+        "NEGATIVE: non-zero-slot alias field with no field_regions row must still refuse PositionsNotSlots: {got:?}"
+    );
+}

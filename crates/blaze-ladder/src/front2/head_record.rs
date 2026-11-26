@@ -196,7 +196,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// prefix, `2` inline synthetic text for synthesized fn heads such as RFC 3681 field defaults).
 /// 39: `MemberFrame` carries `is_const` (`const impl` / `const trait` propagates `CONST` to member
 /// fns) and `#[rustc_comptime]` sets `FnQualifiers::CONST`.
-pub const VERSION: u32 = 39;
+/// 40: ADT `field_regions` lay `PNode::Alias` fields in pre-order again; normalized alias fields
+/// are guarded per body in `borrows.rs` (`suppressed_alias_fields`). Same format, new content for
+/// the same key (rule 21).
+pub const VERSION: u32 = 40;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
