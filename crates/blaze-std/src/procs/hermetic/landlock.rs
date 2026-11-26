@@ -226,7 +226,9 @@ pub fn feed_nix_runtime_closure_with(
         return Err(Fault::Host { call: "nix runtime closure (invalid program path)", code: 22 });
     };
     let mut opt_feed = Some(feed);
-    walk_nix_elf_closure(Some(reader), Some(cx), Some(alloc), None, cstr, None, None, false, &mut opt_feed)
+    // `HermeticClangProbe` always launches the verified binary via anonymous sealed `memfd`
+    // (`execveat(..., AT_EMPTY_PATH)`), so model the exact memfd `$ORIGIN` (`"/"`).
+    walk_nix_elf_closure(Some(reader), Some(cx), Some(alloc), None, cstr, None, true, None, false, &mut opt_feed)
 }
 
 fn check_nix_cx(cx: Option<&Cx>) -> Result<(), Fault> {
@@ -313,13 +315,40 @@ fn grant_nix_elf_closure(
     alloc: Option<Alloc<'_>>,
 ) -> Result<(), Fault> {
     let mut no_feed: Option<&mut dyn FnMut(&[u8])> = None;
-    let _ = walk_nix_elf_closure(None, None, alloc, Some(ruleset), program, verified_exec_fd, Some(plan), has_helper_folder, &mut no_feed)?;
+    let memfd_origin = verified_exec_fd.is_some();
+    let _ = walk_nix_elf_closure(None, None, alloc, Some(ruleset), program, verified_exec_fd, memfd_origin, Some(plan), has_helper_folder, &mut no_feed)?;
     Ok(())
 }
 
 /// Maximum size of `/etc/ld.so.cache` buffered for SONAME resolution on non-Nix Linux (4 MiB).
 const MAX_LD_CACHE_BYTES: usize = 4 << 20;
 
+/// Expands and validates a single colon-separated `DT_RPATH` or `DT_RUNPATH` entry:
+/// - Rejects empty entries (e.g. `:/pinned/lib` or `/a::/b`), which glibc interprets as cwd `.`.
+/// - Expands `$ORIGIN`/`$LIB`/`$PLATFORM` (and braced forms) against `origin_dir`.
+/// - Rejects any expanded relative path (not starting with `/`) so cwd-dependent library search
+///   can never diverge from the hashed and Landlock-admitted closure.
+pub fn validate_rpath_entry(
+    raw_entry: &[u8],
+    origin_dir: &[u8],
+    lib_token: &[u8],
+    platform_token: &[u8],
+    out: &mut [u8; 320],
+) -> Result<usize, Fault> {
+    if raw_entry.is_empty() {
+        return Err(Fault::Host { call: "landlock (ELF RPATH/RUNPATH contains empty cwd component)", code: 22 });
+    }
+    let expanded_len = expand_rpath_tokens(raw_entry, origin_dir, lib_token, platform_token, out)?;
+    if expanded_len == 0 {
+        return Err(Fault::Host { call: "landlock (ELF RPATH/RUNPATH entry exceeds path cap)", code: 36 });
+    }
+    if out.first() != Some(&b'/') {
+        return Err(Fault::Host { call: "landlock (ELF RPATH/RUNPATH contains relative cwd component)", code: 22 });
+    }
+    Ok(expanded_len)
+}
+
+#[expect(clippy::too_many_arguments, reason = "internal ELF closure walker shared between Landlock admission and strategy hashing")]
 fn walk_nix_elf_closure(
     reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
@@ -327,6 +356,7 @@ fn walk_nix_elf_closure(
     ruleset: Option<Fd>,
     program: &CStr,
     verified_exec_fd: Option<Fd>,
+    memfd_origin: bool,
     plan: Option<&Plan<'_>>,
     has_helper_folder: bool,
     feed: &mut Option<&mut dyn FnMut(&[u8])>,
@@ -667,10 +697,17 @@ fn walk_nix_elf_closure(
         // - `DT_RPATH` (when `DT_RUNPATH` is absent): THIS object's own `DT_RPATH` entries are
         //   searched FIRST (in colon-separated order), followed by inherited ancestor `DT_RPATH`
         //   entries (newest ancestor first), and this ordered chain is inherited by children.
-        let origin_dir = cur_path
-            .get(..cur_len)
-            .and_then(|p| p.iter().rposition(|&b| b == b'/').and_then(|s| p.get(..s)))
-            .unwrap_or(&[]);
+        // - When launching the primary executable (`cur_idx == 0`) from an anonymous sealed memfd
+        //   via `execveat(..., AT_EMPTY_PATH)`, glibc derives `$ORIGIN` from `/memfd:...` as `"/"`
+        //   (verified with `LD_DEBUG=libs`), NOT the on-disk shelf directory.
+        let origin_dir: &[u8] = if cur_idx == 0 && memfd_origin {
+            b"/"
+        } else {
+            cur_path
+                .get(..cur_len)
+                .and_then(|p| p.iter().rposition(|&b| b == b'/').and_then(|s| p.get(..s)))
+                .unwrap_or(&[])
+        };
         let mut search_dirs = [([0u8; PATH_CAP], 0usize); 16];
         let mut search_count = 0usize;
         let child_chain = if let Some(rp_off) = runpath_off {
@@ -681,19 +718,16 @@ fn walk_nix_elf_closure(
                 let Some(end) = raw.iter().position(|&b| b == 0) else {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
                 };
-                for entry in raw.get(..end).unwrap_or(&[]).split(|&b| b == b':') {
-                    if entry.is_empty() {
-                        continue;
+                let rp_raw = raw.get(..end).unwrap_or(&[]);
+                if !rp_raw.is_empty() {
+                    for entry in rp_raw.split(|&b| b == b':') {
+                        let Some(slot) = search_dirs.get_mut(search_count) else {
+                            return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
+                        };
+                        let expanded_len = validate_rpath_entry(entry, origin_dir, lib_token, platform_token, &mut slot.0)?;
+                        slot.1 = expanded_len;
+                        search_count += 1;
                     }
-                    let Some(slot) = search_dirs.get_mut(search_count) else {
-                        return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
-                    };
-                    let expanded_len = expand_rpath_tokens(entry, origin_dir, lib_token, platform_token, &mut slot.0)?;
-                    if expanded_len == 0 {
-                        return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entry exceeds path cap)", code: 36 });
-                    }
-                    slot.1 = expanded_len;
-                    search_count += 1;
                 }
             }
             inherited_chain
@@ -708,17 +742,14 @@ fn walk_nix_elf_closure(
                 let Some(end) = raw.iter().position(|&b| b == 0) else {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RPATH exceeds buffer cap)", code: 7 });
                 };
-                for entry in raw.get(..end).unwrap_or(&[]).split(|&b| b == b':') {
-                    if entry.is_empty() {
-                        continue;
+                let rp_raw = raw.get(..end).unwrap_or(&[]);
+                if !rp_raw.is_empty() {
+                    for entry in rp_raw.split(|&b| b == b':') {
+                        let mut exp = [0u8; PATH_CAP];
+                        let expanded_len = validate_rpath_entry(entry, origin_dir, lib_token, platform_token, &mut exp)?;
+                        let idx = intern_rpath_dir(exp.get(..expanded_len).unwrap_or(&[]), &mut rpath_pool, &mut rpath_pool_len)?;
+                        eff_chain.push(idx)?;
                     }
-                    let mut exp = [0u8; PATH_CAP];
-                    let expanded_len = expand_rpath_tokens(entry, origin_dir, lib_token, platform_token, &mut exp)?;
-                    if expanded_len == 0 {
-                        return Err(Fault::Host { call: "landlock (NixOS ELF RPATH entry exceeds path cap)", code: 36 });
-                    }
-                    let idx = intern_rpath_dir(exp.get(..expanded_len).unwrap_or(&[]), &mut rpath_pool, &mut rpath_pool_len)?;
-                    eff_chain.push(idx)?;
                 }
             }
             for &anc_idx in inherited_chain.as_slice() {

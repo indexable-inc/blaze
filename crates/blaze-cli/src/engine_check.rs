@@ -640,9 +640,15 @@ impl<'f> LazySdk<'f> {
             Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos }) => {
                 Ok(blaze_build_script::facts::sdk_id_digest(""))
             }
-            Err(_) => Err(CliError::Text {
-                what: "cannot resolve active SDK identity while following a saved c-probe read",
-            }),
+            Err(refused) => {
+                use core::fmt::Write as _;
+                let mut msg = blaze_own::String::new_in(blaze_own::SharedAlloc::global());
+                let _ = write!(
+                    msg,
+                    "cannot resolve active SDK identity while following a saved c-probe read: {refused}"
+                );
+                Err(CliError::Sdk(msg))
+            }
         }
     }
 }

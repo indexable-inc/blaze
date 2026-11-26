@@ -481,6 +481,47 @@ impl Files for SpawnFiles<'_> {
     }
 }
 
+/// Normalizes `cwd_override` (relative to `mount` when not starting with `/`) and returns
+/// whether it denotes the exact same guest directory as `mount`, so spellings like `.`, `./`,
+/// `/package/.`, or `sub/..` are not spuriously refused.
+pub(crate) fn same_guest_dir(cwd_override: &str, mount: &str) -> bool {
+    const MAX_PARTS: usize = 64;
+    fn push_parts<'a>(path: &'a str, out: &mut [&'a str; MAX_PARTS], len: &mut usize) -> bool {
+        for seg in path.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                *len = len.saturating_sub(1);
+                continue;
+            }
+            let Some(slot) = out.get_mut(*len) else {
+                return false;
+            };
+            *slot = seg;
+            *len += 1;
+        }
+        true
+    }
+    let mut norm_mount = [""; MAX_PARTS];
+    let mut mount_len = 0usize;
+    if !push_parts(mount, &mut norm_mount, &mut mount_len) {
+        return cwd_override == mount;
+    }
+    let mut norm_cwd = [""; MAX_PARTS];
+    let mut cwd_len = 0usize;
+    if !cwd_override.starts_with('/') {
+        if let (Some(dst), Some(src)) = (norm_cwd.get_mut(..mount_len), norm_mount.get(..mount_len)) {
+            dst.copy_from_slice(src);
+        }
+        cwd_len = mount_len;
+    }
+    if !push_parts(cwd_override, &mut norm_cwd, &mut cwd_len) {
+        return cwd_override == mount;
+    }
+    cwd_len == mount_len && norm_cwd.get(..cwd_len) == norm_mount.get(..mount_len)
+}
+
 impl ScriptSandbox {
     /// The reply the shim reads: code i32 LE, then stdout and stderr each u32 length-first.
     pub(crate) fn set_reply(&mut self, code: i32, stdout: &[u8], stderr: &[u8]) {
@@ -569,7 +610,7 @@ impl ScriptSandbox {
         let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
         let mount = script.cwd();
         if let Some(ref cwd_override) = spawned.cwd
-            && cwd_override.as_str() != mount.as_str()
+            && !same_guest_dir(cwd_override.as_str(), mount.as_str())
         {
             return Err(self.refuse(Refusal::Spawn(refused(format!(
                 "compiler probe current_dir `{cwd_override}` differs from script cwd `{mount}` (rule 21)"
@@ -617,7 +658,7 @@ impl ScriptSandbox {
             match &script.c_probes {
                 Some(crate::probe_clang::CProbeSetting::Ready(c_probes)) => {
                     let configured_sdk = c_probes.sdk_dir.as_ref();
-                    if !sdk.is_empty() && sdk != configured_sdk {
+                    if sdk != configured_sdk {
                         return Err(self.refuse(Refusal::Spawn(refused(format!(
                             "compiler probe SDKROOT `{sdk}` does not match configured command SDK `{configured_sdk}` (rule 21)"
                         )))));

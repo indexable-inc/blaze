@@ -38,7 +38,7 @@ use blaze_build_script::c_tasks_probe::{
     self, ProbeAnswerer, ProbeKey, canonical_reply_digest, decode_answer,
 };
 #[cfg(target_os = "linux")]
-use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeCache, Segment};
+use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, Segment};
 #[cfg(any(target_os = "linux", test))]
 use blaze_build_script::c_tasks_probe::{OUT_DIR, SDKROOT};
 use blaze_build_script::facts;
@@ -88,9 +88,9 @@ pub(crate) const MAX_PROBE_INPUT_BYTES: usize = 64 << 10;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const STREAM_OVERFLOW_PREFIX: &str = "c-probe stream limit exceeded:";
 
-/// Returns whether any `OUT_DIR` input file referenced by `args` (after `normalize_under_out_dir`
-/// normalization so spellings like `/out/./flag_check.c` match the `OUT_DIR` map key) exceeds
-/// `MAX_PROBE_INPUT_BYTES`.
+/// Returns whether any `OUT_DIR` input file referenced by `args` (excluding `-o` / `--output`
+/// destination paths, and normalized via `normalize_under_out_dir` so spellings like
+/// `/out/./flag_check.c` match the `OUT_DIR` map key) exceeds `MAX_PROBE_INPUT_BYTES`.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn has_oversized_probe_input<'a, 'b>(
     args: &[&str],
@@ -98,7 +98,19 @@ pub(crate) fn has_oversized_probe_input<'a, 'b>(
     input_bytes: &mut impl FnMut(&str) -> Option<&'b [u8]>,
     alloc: Alloc<'a>,
 ) -> bool {
+    let mut skip_output = false;
     for &arg in args {
+        if skip_output {
+            skip_output = false;
+            continue;
+        }
+        if matches!(arg, "-o" | "--output") {
+            skip_output = true;
+            continue;
+        }
+        if arg.starts_with("-o") || arg.starts_with("--output=") {
+            continue;
+        }
         let Some(rel) = c_tasks_probe::normalize_under_out_dir(arg, out_dir, alloc) else {
             continue;
         };
@@ -698,12 +710,10 @@ pub fn open_command_c_probes<'a>(
             return CProbeSetting::Unavailable(OwnArc::from_str_in("c-probe home capability has no fs", shared));
         };
         let home_root = home_fs.root();
-        let Ok(store_rel) = bstd::path::Path::new("build-script/records") else {
-            return CProbeSetting::Unavailable(OwnArc::from_str_in("invalid c-probe records path", shared));
-        };
-        let store_dir = blaze_v2.subdir(&store_rel);
+        // `DirStore::build_scripts` appends `build-script/records` itself, so pass the `.blaze/v2`
+        // root directly (matching `sweep.rs` reading `v2/build-script/records/c-probe/<hex>`).
         let records: OwnArc<dyn CProbeStore, SharedAlloc<'static>> =
-            OwnArc::new_in(DirStore::build_scripts(io.spawner(), io.boot().ok(), &store_dir), shared);
+            OwnArc::new_in(DirStore::build_scripts(io.spawner(), io.boot().ok(), &blaze_v2), shared);
         let shelf_hex = hex_bytes(&pin.sha256, alloc);
         let shelf_sub_str = own_fmt(format_args!("toolchain/clang/{}", shelf_hex.as_str()), alloc);
         let Ok(shelf_sub) = bstd::path::Path::new(shelf_sub_str.as_str()) else {
@@ -1718,6 +1728,18 @@ mod tests {
             let CProbeSetting::Ready(missing_probes) = missing else {
                 panic!("supported host setup must defer shelf check until first probe miss");
             };
+            // Verify `open_command_c_probes` opens `DirStore::build_scripts` at `.blaze/v2` so
+            // records land at `.blaze/v2/build-script/records/c-probe/<64-hex>` (matching `sweep.rs`).
+            let sample_key = blaze_build_script::c_tasks_probe::ProbeKey(blaze_ids::ContentId([0xab; 32]));
+            missing_probes.records.put(&sample_key, b"sample-record").expect("put sample c-probe");
+            let expected_path = empty_home
+                .join(".blaze/v2/build-script/records/c-probe")
+                .join(super::hex_bytes(&sample_key.0.0, alloc).as_str());
+            assert!(
+                expected_path.is_file(),
+                "c-probe store must write directly under .blaze/v2/build-script/records/c-probe/, missing {}",
+                expected_path.display()
+            );
             let err = resolve(&*missing_probes.answerer, &cache, &missing_probes.clang_sha256, &sp_a, dig, &mut bytes, alloc)
                 .expect_err("missing shelf must fail loudly on first probe miss");
             assert!(err.as_str().contains("missing"), "unexpected missing-shelf error: {err}");
@@ -1882,6 +1904,23 @@ mod tests {
             let ok_path = bstd::path::Path::new("sub/.repair.lock").expect("ok path");
             let held = lock_dir.lock_exclusive(&lock_cx, &ok_path).expect("legitimate lock beneath root");
             held.unlock(&lock_cx).expect("unlock legitimate lock");
+
+            // If the native world's root directory is renamed and replaced after opening,
+            // `lock_exclusive` must refuse instead of silently locking the old inode while file I/O
+            // targets the replacement directory.
+            let moved_root = std::env::temp_dir().join(format!("blaze-cprobe-lockmoved-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&moved_root);
+            std::fs::rename(&lock_root, &moved_root).expect("rename lock root");
+            std::fs::create_dir_all(lock_root.join("sub")).expect("recreate lock root");
+            let replaced_err = lock_dir
+                .lock_exclusive(&lock_cx, &ok_path)
+                .err()
+                .expect("lock_exclusive must refuse after root directory replacement");
+            assert!(
+                std::format!("{replaced_err}").contains("replaced"),
+                "unexpected replaced-root lock error: {replaced_err}"
+            );
+            let _ = std::fs::remove_dir_all(&moved_root);
             let _ = std::fs::remove_dir_all(&lock_root);
             let _ = std::fs::remove_dir_all(&lock_outside);
         }
@@ -2003,6 +2042,55 @@ mod tests {
         assert!(super::has_oversized_probe_input(&["-E", "/out/.//1detect_compiler_family.c"], "/out", &mut get_huge, alloc));
         assert!(!super::has_oversized_probe_input(&["-E", "/out/1detect_compiler_family.c"], "/out", &mut get_small, alloc));
         assert!(!super::has_oversized_probe_input(&["-E", "/out/./1detect_compiler_family.c"], "/out", &mut get_small, alloc));
+        // An oversized existing `-o` / `--output` destination must NOT trip the input-size cap.
+        let mut get_huge_out_small_in = |rel: &str| match rel {
+            "flag_check" => Some(huge.as_slice()),
+            "flag_check.c" => Some(small.as_slice()),
+            _ => None,
+        };
+        assert!(!super::has_oversized_probe_input(
+            &["-c", "-o", "/out/flag_check", "/out/flag_check.c"],
+            "/out",
+            &mut get_huge_out_small_in,
+            alloc,
+        ));
+        assert!(!super::has_oversized_probe_input(
+            &["-c", "-o/out/flag_check", "/out/flag_check.c"],
+            "/out",
+            &mut get_huge_out_small_in,
+            alloc,
+        ));
+        assert!(!super::has_oversized_probe_input(
+            &["-c", "--output=/out/flag_check", "/out/flag_check.c"],
+            "/out",
+            &mut get_huge_out_small_in,
+            alloc,
+        ));
+        // Equivalent current_dir spellings resolve to the script mount instead of refusing probes.
+        assert!(crate::spawn_route::same_guest_dir(".", "/package"));
+        assert!(crate::spawn_route::same_guest_dir("./", "/package"));
+        assert!(crate::spawn_route::same_guest_dir("/package/.", "/package"));
+        assert!(crate::spawn_route::same_guest_dir("/package//sub/..", "/package"));
+        assert!(crate::spawn_route::same_guest_dir("sub/..", "/package"));
+        assert!(!crate::spawn_route::same_guest_dir("/package/sub", "/package"));
+        assert!(!crate::spawn_route::same_guest_dir("..", "/package"));
+        // Empty or relative RPATH/RUNPATH entries are rejected, while memfd `$ORIGIN` (`"/"`)
+        // expands to an absolute path matching glibc's memfd runtime search path.
+        #[cfg(target_os = "linux")]
+        {
+            let mut rbuf = [0u8; 320];
+            assert!(
+                bstd::procs::hermetic::validate_rpath_entry(b"", b"/", b"lib", b"aarch64", &mut rbuf).is_err(),
+                "empty RPATH/RUNPATH component must be refused"
+            );
+            assert!(
+                bstd::procs::hermetic::validate_rpath_entry(b"relative/lib", b"/", b"lib", b"aarch64", &mut rbuf).is_err(),
+                "relative RPATH/RUNPATH component must be refused"
+            );
+            let n = bstd::procs::hermetic::validate_rpath_entry(b"$ORIGIN/../lib", b"/", b"lib", b"aarch64", &mut rbuf)
+                .expect("memfd $ORIGIN entry");
+            assert_eq!(&rbuf[..n], b"//../lib/");
+        }
         assert!(super::is_stream_overflow_error("c-probe stream limit exceeded: Stdout exceeded 1048576 bytes"));
         assert!(!super::is_stream_overflow_error("c-probe hermetic run failed"));
         assert_eq!(

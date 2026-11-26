@@ -63,8 +63,11 @@ pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("../fs.rs"),
     include_bytes!("../io.rs"),
     include_bytes!("../io/fast.rs"),
+    include_bytes!("../io/native_in.rs"),
     include_bytes!("../pending.rs"),
     include_bytes!("../procs.rs"),
+    include_bytes!("../rt.rs"),
+    include_bytes!("linked.rs"),
     include_bytes!("linked/run.rs"),
     include_bytes!("hermetic.rs"),
     include_bytes!("hermetic/execution.rs"),
@@ -687,7 +690,7 @@ impl<T> ReaperCore<T> {
 pub use landlock::{
     HostLdCaps, PreloadScanner, dl_dst_lib_token, dl_dst_platform_token, expand_rpath_tokens,
     feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match,
-    x86_64_fhs_hwcap_subdirs,
+    validate_rpath_entry, x86_64_fhs_hwcap_subdirs,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, NativeLockErr};

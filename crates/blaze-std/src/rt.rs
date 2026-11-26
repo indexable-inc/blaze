@@ -1130,43 +1130,11 @@ fn reaper_pool() -> &'static self::std::sync::Mutex<crate::procs::hermetic::Reap
     POOL.get_or_init(|| Mutex::new(ReaperCore::new(MAX_REAPERS, MAX_REAPER_PENDING, ReaperPlant::None)))
 }
 
-/// Atomically reserves a slot in the stalled-reader reaper backlog when admitting a new
-/// [`RootReader`] so live readers + active reapers + pending items NEVER exceed
-/// `MAX_REAPERS + MAX_REAPER_PENDING`.
+/// Spawns workers for any pending retired I/O drivers whenever `active < MAX_REAPERS`, recovering
+/// items previously queued by a transient `thread::spawn` failure even if no later read stalls.
 #[cfg(target_os = "linux")]
-pub(crate) fn try_reserve_reaper_slot() -> bool {
-    let pool = reaper_pool();
-    let mut guard = match pool.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.try_reserve()
-}
-
-/// Releases a previously reserved slot when a [`RootReader`] closes cleanly without stalling.
-#[cfg(target_os = "linux")]
-pub(crate) fn release_reaper_slot() {
-    let pool = reaper_pool();
-    let mut guard = match pool.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.release_reservation();
-}
-
-/// Retires an abandoned native `Io` (whose worker thread is still blocked in an uninterruptible
-/// kernel read after cancellation/deadline) through [`crate::procs::hermetic::ReaperCore`]:
-/// 1. Caller stack-drop NEVER drops synchronously (not even at the 64-worker cap or on transient
-///    `thread::spawn` failure — overflowed items queue in `pending` and drain as soon as any
-///    reaper finishes),
-/// 2. Up to `MAX_REAPERS = 64` independent reaper threads run concurrently so one permanently
-///    wedged mount never blocks cleanup of later retired drivers, and
-/// 3. Total live + wedged backlog is atomically bounded at admission by `try_reserve_reaper_slot()`
-///    (`MAX_REAPERS + MAX_REAPER_PENDING`).
-#[cfg(target_os = "linux")]
-pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::fs::ReadOnly>) {
+fn pump_reaper_pool() {
     use self::std::sync::Mutex;
-    use crate::procs::hermetic::RetireAction;
 
     let pool = reaper_pool();
     let mut to_spawn = {
@@ -1174,14 +1142,7 @@ pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::f
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match guard.retire_reserved((io, root)) {
-            RetireAction::Spawn(item) => Some(item),
-            RetireAction::Queued => None,
-            RetireAction::SyncDrop(item) => {
-                guard.on_spawn_failed(item);
-                None
-            }
-        }
+        guard.take_spawnable()
     };
     while let Some(first) = to_spawn {
         let first_slot = blaze_own::Arc::new_in(Mutex::new(Some(first)), blaze_own::SharedAlloc::global());
@@ -1225,11 +1186,135 @@ pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::f
     }
 }
 
-/// Opened kernel directory descriptor (`O_DIRECTORY | O_CLOEXEC`) cached once when a native Unix
-/// world opens, so off-thread advisory locks resolve strictly beneath the opened root without
-/// reopening a mutable path string or traversing symbolic links.
+/// Atomically reserves a slot in the stalled-reader reaper backlog when admitting a new
+/// [`RootReader`] so live readers + active reapers + pending items NEVER exceed
+/// `MAX_REAPERS + MAX_REAPER_PENDING`. Also repumps any pending drivers queued by an earlier
+/// transient `thread::spawn` failure.
+#[cfg(target_os = "linux")]
+pub(crate) fn try_reserve_reaper_slot() -> bool {
+    pump_reaper_pool();
+    let pool = reaper_pool();
+    let mut guard = match pool.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.try_reserve()
+}
+
+/// Releases a previously reserved slot when a [`RootReader`] closes cleanly without stalling,
+/// and repumps any pending drivers queued by an earlier transient `thread::spawn` failure.
+#[cfg(target_os = "linux")]
+pub(crate) fn release_reaper_slot() {
+    {
+        let pool = reaper_pool();
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.release_reservation();
+    }
+    pump_reaper_pool();
+}
+
+/// Retires an abandoned native `Io` (whose worker thread is still blocked in an uninterruptible
+/// kernel read after cancellation/deadline) through [`crate::procs::hermetic::ReaperCore`]:
+/// 1. Caller stack-drop NEVER drops synchronously (not even at the 64-worker cap or on transient
+///    `thread::spawn` failure — overflowed items queue in `pending` and drain as soon as any
+///    reaper finishes or the next `RootReader` opens/closes),
+/// 2. Up to `MAX_REAPERS = 64` independent reaper threads run concurrently so one permanently
+///    wedged mount never blocks cleanup of later retired drivers, and
+/// 3. Total live + wedged backlog is atomically bounded at admission by `try_reserve_reaper_slot()`
+///    (`MAX_REAPERS + MAX_REAPER_PENDING`).
+#[cfg(target_os = "linux")]
+pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::fs::ReadOnly>) {
+    use crate::procs::hermetic::RetireAction;
+
+    let pool = reaper_pool();
+    let mut spawn_first = {
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.retire_reserved((io, root)) {
+            RetireAction::Spawn(item) => Some(item),
+            RetireAction::Queued => None,
+            RetireAction::SyncDrop(item) => {
+                guard.on_spawn_failed(item);
+                None
+            }
+        }
+    };
+    if let Some(first) = spawn_first.take() {
+        use self::std::sync::Mutex;
+        let first_slot = blaze_own::Arc::new_in(Mutex::new(Some(first)), blaze_own::SharedAlloc::global());
+        let worker_slot = blaze_own::Share::share(&first_slot);
+        let spawned = self::std::thread::Builder::new()
+            .name(self::std::string::String::from("bstd-io-reaper"))
+            .spawn(move || {
+                let mut current = match worker_slot.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                while let Some((retired_io, retired_root)) = current {
+                    drop(retired_root);
+                    drop(retired_io);
+                    let mut guard = match pool.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    current = guard.next_after_drop();
+                }
+            });
+        if spawned.is_err() {
+            let returned = match first_slot.lock() {
+                Ok(mut g) => g.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(item) = returned {
+                let mut guard = match pool.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.on_spawn_failed(item);
+            }
+            return;
+        }
+    }
+    pump_reaper_pool();
+}
+
+/// Opened kernel directory descriptor (`O_DIRECTORY | O_CLOEXEC`) plus its `(dev, ino)` identity
+/// and original path cached once when a native Unix world opens, so off-thread advisory locks
+/// resolve strictly beneath the opened root without traversing symbolic links AND verify the
+/// driver's root pathname still resolves to the exact same directory inode (refusing split-brain
+/// locks if the root directory was renamed or replaced after opening).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) struct NativeRootDir(blaze_sys::posix::io::OwnedFd);
+pub(crate) struct NativeRootDir {
+    fd: blaze_sys::posix::io::OwnedFd,
+    cpath: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fd_dev_ino(fd: blaze_sys::Fd) -> Result<(u64, u64), blaze_sys::Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        let st = blaze_sys::linux::task::fstat(fd)?;
+        Ok((st.st_dev, st.st_ino))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut st = blaze_sys::posix::proc::status::stat::zeroed();
+        // SAFETY: `fstat` writes to valid mutable `stat` buffer for open descriptor `fd`.
+        let rc = unsafe { blaze_sys::posix::proc::status::fstat(fd.raw(), core::ptr::addr_of_mut!(st)) };
+        if rc != 0 {
+            return Err(blaze_sys::Errno::Io);
+        }
+        let dev = u64::try_from(st.st_dev).map_err(|_| blaze_sys::Errno::Overflow)?;
+        Ok((dev, st.st_ino))
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NativeRootDir {
@@ -1245,11 +1330,36 @@ impl NativeRootDir {
         let cstr = core::ffi::CStr::from_bytes_with_nul(buf.as_slice()).map_err(|_| blaze_sys::Errno::Inval)?;
         let flags = blaze_sys::posix::io::OpenFlags::DIRECTORY | blaze_sys::posix::io::OpenFlags::CLOSE_ON_EXEC;
         let fd = blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0)?;
-        Ok(Self(fd))
+        let (dev, ino) = fd_dev_ino(fd.fd())?;
+        Ok(Self { fd, cpath: buf, dev, ino })
     }
 
     fn fd(&self) -> blaze_sys::Fd {
-        self.0.fd()
+        self.fd.fd()
+    }
+
+    /// Verifies that the native world's root pathname (used by `blaze-core` file I/O) still
+    /// resolves to the exact same directory inode `(dev, ino)` as `self.fd`, refusing split-brain
+    /// locks if the root directory was renamed or replaced after opening.
+    fn verify_root_unchanged(&self) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+        let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(self.cpath.as_slice()) else {
+            return Err(blaze_own::String::from_str_in(
+                "invalid native root path",
+                blaze_own::SharedAlloc::global(),
+            ));
+        };
+        let flags = blaze_sys::posix::io::OpenFlags::DIRECTORY | blaze_sys::posix::io::OpenFlags::CLOSE_ON_EXEC;
+        let cur = blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0)
+            .map_err(|e| lock_err_errno("openat (verify native root unchanged)", e))?;
+        let (cur_dev, cur_ino) = fd_dev_ino(cur.fd())
+            .map_err(|e| lock_err_errno("fstat (verify native root unchanged)", e))?;
+        if cur_dev != self.dev || cur_ino != self.ino {
+            return Err(blaze_own::String::from_str_in(
+                "native world root directory was replaced since opening; refusing split-brain lock",
+                blaze_own::SharedAlloc::global(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1926,14 +2036,17 @@ fn open_leaf_beneath_no_symlink(
     })
 }
 
-/// Opens `rel` strictly beneath the already-opened `root_fd` without traversing any symbolic link
-/// in any intermediate directory or at the final leaf, then attempts a non-blocking exclusive
-/// `flock`. Returns `Ok(None)` on contention (`EAGAIN`/`EWOULDBLOCK`).
+/// Opens `rel` strictly beneath the already-opened `root_dir` without traversing any symbolic link
+/// in any intermediate directory or at the final leaf, verifies `root_dir` still matches the
+/// driver's root directory inode both before and after acquiring a non-blocking exclusive `flock`,
+/// and returns `Ok(None)` on contention (`EAGAIN`/`EWOULDBLOCK`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_and_try_lock_beneath(
-    root_fd: blaze_sys::Fd,
+    root_dir: &NativeRootDir,
     rel: &str,
 ) -> Result<Option<blaze_sys::posix::io::OwnedFd>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    root_dir.verify_root_unchanged()?;
+    let root_fd = root_dir.fd();
     let mut parts = rel.split('/').peekable();
     let mut owned_dir: Option<blaze_sys::posix::io::OwnedFd> = None;
     let mut leaf: Option<&str> = None;
@@ -1952,7 +2065,14 @@ fn open_and_try_lock_beneath(
     let cur = owned_dir.as_ref().map_or(root_fd, |d| d.fd());
     let fd = open_leaf_beneath_no_symlink(cur, leaf_name)?;
     match blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::ExclusiveNonBlock) {
-        Ok(()) => Ok(Some(fd)),
+        Ok(()) => {
+            if let Err(err) = root_dir.verify_root_unchanged() {
+                let _ = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
+                drop(fd);
+                return Err(err);
+            }
+            Ok(Some(fd))
+        }
         Err(blaze_sys::Errno::Again) => {
             drop(fd);
             Ok(None)
@@ -1976,7 +2096,7 @@ impl LockBackend<blaze_sys::posix::io::OwnedFd> for RealOpBackend {
         let Some(root_dir) = &self.root_dir else {
             return Err(blaze_own::String::from_str_in("missing native root dir", blaze_own::SharedAlloc::global()));
         };
-        open_and_try_lock_beneath(root_dir.fd(), self.rel.as_str())
+        open_and_try_lock_beneath(root_dir, self.rel.as_str())
     }
 
     fn unlock_and_close(&self, fd: blaze_sys::posix::io::OwnedFd) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {

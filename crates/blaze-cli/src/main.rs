@@ -195,6 +195,9 @@ pub enum CliError {
     Leaves(WireError),
     /// A file the outline cannot read: not UTF-8, or past 4 GiB.
     Text { what: &'static str },
+    /// SDK resolution failed while following a saved `cc-probe` read, preserving the full
+    /// `SdkRefused` diagnostic (path, xcrun status, or underlying I/O error).
+    Sdk(blaze_own::String<blaze_own::SharedAlloc<'static>>),
     /// The program did not run: the stage and the function it stopped at (program.rs's form;
     /// the request names the command in [`CliError::Ran`]).
     /// Its one form: the program's manifest refused ([`ManifestRefused`]); every constructor is
@@ -326,6 +329,7 @@ impl fmt::Display for CliError {
             CliError::MacroFiles(error) => write!(f, "{error}"),
             CliError::Leaves(error) => write!(f, "the checkout's leaf table (in a pointer of .blaze/v2/at), of this build's form, is malformed: {error}"),
             CliError::Text { what } => write!(f, "{what}"),
+            CliError::Sdk(why) => write!(f, "{why}"),
             CliError::Program(error) => write!(f, "the program: {error}"),
             CliError::Ran { command, error } => write!(f, "blaze {command}: {error}"),
             CliError::OwnProcess(error) => write!(f, "{error}"),

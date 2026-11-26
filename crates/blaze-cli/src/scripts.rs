@@ -1125,15 +1125,19 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     let is_checkout = checkout_prefix.is_some();
     // A kept checkout-backed run's failure is a hole: the reads it made are not handed back with
     // its error (`ScriptError`), so no read list makes it stand, and standing on its drive inputs
-    // alone would keep it failed past the edit that fixes it (rule 21). Under
-    // [`CheckoutReads::Hole`] its failure is filed.
-    let failed_hole = is_checkout && matches!(job.checkout, CheckoutReads::Kept { .. });
+    // alone would keep it failed past the edit that fixes it (rule 21). On Linux, wasm runs do
+    // not hash the C-probe table/answerer into `key::base` (probes are tracked per-probe in
+    // `ran.reads`), so a failed Linux wasm script that may have consumed a C probe must likewise
+    // stay a hole rather than filing a failure without `cc-probe` read dependencies.
+    let failed_hole = (is_checkout && matches!(job.checkout, CheckoutReads::Kept { .. }))
+        || (cfg!(target_os = "linux") && ran_as == RanAs::Wasm);
     let ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
     };
     if let Some(error) = ran.outputs.errors.first() {
-        return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), failed_hole);
+        let probed = ran.reads.iter().any(|read| blaze_build_script::facts::parse_cc_probe_subject(read.subject.as_str()).is_some());
+        return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), failed_hole || probed);
     }
     // The record's reads, in the run's frame until the record is made.
     let mut reads: blaze_own::Vec<(Name, ContentId), &Frame> = blaze_own::Vec::with_capacity_in(ran.reads.len() + job.producers.len(), scratch);

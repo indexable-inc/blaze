@@ -46,6 +46,7 @@ pub mod chan;
 pub const SPAWN_SOURCE: &[&[u8]] = &[
     include_bytes!("process.rs"),
     include_bytes!("process/linked.rs"),
+    include_bytes!("process/linked/channel.rs"),
     include_bytes!("process/linked/run.rs"),
     include_bytes!("process/spawn.rs"),
     include_bytes!("process/spawn/streams.rs"),
