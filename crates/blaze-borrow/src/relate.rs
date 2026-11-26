@@ -30,6 +30,7 @@ use core::alloc::Allocator;
 use core::cell::Cell;
 
 use blaze_flow::Origin;
+use blaze_own::Vec;
 use blaze_typeck::region_facts::Outlives;
 use blaze_typeck::regions::Region;
 use blaze_typeck::{ItemKey, PNode, PTy};
@@ -44,6 +45,7 @@ use crate::{Bad, Head, NotSelected, Refused, Reg, ShapeWhy, Variance};
 const MAX_ELAB_VISITED: usize = 256;
 const MAX_ELAB_STACK: usize = 512;
 const MAX_ELAB_DEPTH: u32 = 24;
+const MOST_IMPL_SEEN: usize = 4096;
 type ElabKey = (ItemKey, PTy, bool);
 const ELAB_KEY_ZERO: ElabKey = (ItemKey(0), PTy(0), false);
 
@@ -235,6 +237,10 @@ struct Walk<'w, 'c, A: Allocator + Copy> {
     nested: u32,
     /// Guard against re-entrant alias normalization inside [`Walk::erased_sides_norm`].
     in_erased_norm: bool,
+    /// Active and already-proven `(imp, env)` pairs whose impl parameters are all bound,
+    /// preventing coinductive self-referential `impl_where` cycles and redundant re-proofs
+    /// across giant trait stacks.
+    impl_seen: Vec<(ItemKey, EnvId), A>,
     walk_stack: [Option<WalkFrame<'c>>; WALK_STACK_CAP],
     walk_sp: usize,
     comp_stack: [Option<CompFrame<'c>>; COMP_STACK_CAP],
@@ -667,6 +673,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let saved_budget = self.budget;
         self.budget = self.budget.min(4096);
         let env_mark = self.envs.len();
+        let seen_mark = self.impl_seen.len();
         self.in_erased_norm = true;
         let mut stack: [Option<NormFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
         let mut sp = 0usize;
@@ -801,7 +808,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
         }
         self.in_erased_norm = false;
-        self.envs.truncate(env_mark);
+        self.impl_seen.truncate(seen_mark);
+        self.truncate_envs(env_mark);
         self.budget = saved_budget.saturating_sub(1);
         (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
         res
@@ -2198,10 +2206,156 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// (`impl<'a, T: Tr<'a>> Other for T`) is the proof's choice: a fresh existential origin.
     /// A projection-equality clause has no rule yet: refused by name
     /// ([`NotSelected::WhereProjection`]). The relation's alpha pairs are kept across.
+    fn truncate_envs(&mut self, mark: usize) {
+        self.envs.truncate(mark);
+        self.impl_seen.retain(|&(_, e)| e.index() < mark);
+    }
+
+    /// Region-preserving structural equality between two resolved sides (no normalization).
+    /// Conservative: returns `false` on any unbound parameter, budget exhaustion, or error.
+    fn exact_side_eq(&self, a: Side<'c>, b: Side<'c>) -> bool {
+        const MAX_FRAMES: usize = 64;
+        #[derive(Clone, Copy)]
+        struct EqFrame<'c> {
+            a: Side<'c>,
+            b: Side<'c>,
+            ra: Slots<'c>,
+            rb: Slots<'c>,
+            next_k: u32,
+            depth: u32,
+        }
+        let mut stack: [Option<EqFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
+        let mut sp = 0usize;
+        let mut budget = 256u32;
+        let mut enter = Some((a, b, 0u32));
+        loop {
+            if let Some((a, b, d)) = enter.take() {
+                if d >= 64 || budget == 0 {
+                    return false;
+                }
+                budget -= 1;
+                let (Ok(Resolved::Side(a)), Ok(Resolved::Side(b))) = (self.resolve(a), self.resolve(b)) else {
+                    return false;
+                };
+                if a.ty == b.ty {
+                    let same_slots = match (a.slots, b.slots) {
+                        (Slots::Caller(ra), Slots::Caller(rb)) => ra == rb,
+                        (Slots::Sig { col: ca, env: ea }, Slots::Sig { col: cb, env: eb })
+                        | (Slots::CallerEnv { col: ca, env: ea }, Slots::CallerEnv { col: cb, env: eb }) => {
+                            ea == eb && core::ptr::eq(ca.as_ptr(), cb.as_ptr()) && ca.len() == cb.len()
+                        }
+                        (
+                            Slots::CallerFresh { env: ea, start: sa, len: la },
+                            Slots::CallerFresh { env: eb, start: sb, len: lb },
+                        ) => ea == eb && sa == sb && la == lb,
+                        _ => false,
+                    };
+                    if same_slots {
+                        continue;
+                    }
+                }
+                let (Ok(na), Ok(nb)) = (self.node(a), self.node(b)) else {
+                    return false;
+                };
+                if is_const(na) && is_const(nb) {
+                    continue;
+                }
+                if !head_eq(na, nb) {
+                    return false;
+                }
+                let (Ok(oa), Ok(ob)) = (self.own(a), self.own(b)) else {
+                    return false;
+                };
+                if oa != ob {
+                    return false;
+                }
+                for k in 0..oa.get() {
+                    let (Ok(RegAt::Known(ra)), Ok(RegAt::Known(rb))) = (self.slot(a, k), self.slot(b, k)) else {
+                        return false;
+                    };
+                    if ra != rb {
+                        return false;
+                    }
+                }
+                let (Ok(ka), Ok(kb)) = (self.kids_of(a), self.kids_of(b)) else {
+                    return false;
+                };
+                if ka.len() != kb.len() {
+                    return false;
+                }
+                if ka.len() > 0 {
+                    let (Some((_, ra)), Some((_, rb))) = (a.slots.split(oa), b.slots.split(ob)) else {
+                        return false;
+                    };
+                    let Some(slot) = stack.get_mut(sp) else {
+                        return false;
+                    };
+                    *slot = Some(EqFrame { a, b, ra, rb, next_k: 0, depth: d });
+                    sp += 1;
+                }
+                continue;
+            }
+            let Some(top_idx) = sp.checked_sub(1) else {
+                return true;
+            };
+            let Some(Some(mut frame)) = stack.get(top_idx).copied() else {
+                return false;
+            };
+            let (Ok(ka), Ok(kb)) = (self.kids_of(frame.a), self.kids_of(frame.b)) else {
+                return false;
+            };
+            if frame.next_k < ka.len() {
+                let k = frame.next_k;
+                let (Ok((ca, nra)), Ok((cb, nrb))) = (self.kid(frame.a, &ka, frame.ra, k), self.kid(frame.b, &kb, frame.rb, k)) else {
+                    return false;
+                };
+                frame.ra = nra;
+                frame.rb = nrb;
+                frame.next_k = k + 1;
+                if let Some(slot) = stack.get_mut(top_idx) {
+                    *slot = Some(frame);
+                }
+                enter = Some((ca, cb, frame.depth + 1));
+            } else {
+                sp = top_idx;
+            }
+        }
+    }
+
+    fn impl_env_eq(&self, a: EnvId, b: EnvId) -> bool {
+        let (Some(ra), Some(rb)) = (self.envs.env_regs(a), self.envs.env_regs(b)) else {
+            return false;
+        };
+        if ra != rb {
+            return false;
+        }
+        let (Some(ta), Some(tb)) = (self.envs.env_types(a), self.envs.env_types(b)) else {
+            return false;
+        };
+        if ta.len() != tb.len() {
+            return false;
+        }
+        ta.iter().zip(tb.iter()).all(|(xa, xb)| match (*xa, *xb) {
+            (Some(sa), Some(sb)) => self.exact_side_eq(sa, sb),
+            (None, None) => true,
+            _ => false,
+        })
+    }
+
     fn impl_where(&mut self, imp: ItemKey, trait_: ItemKey, node: PTy, env: EnvId, lifetimes: u32) -> Result<(), Refused> {
         let selected: &'c dyn Selected = self.selected;
         let w = selected.impl_where(imp).map_err(|why| Refused::Unselected { item: self.item, node, trait_, name: None, why })?;
         if w.params.is_empty() && w.outlives.is_empty() && w.views.is_empty() {
+            return Ok(());
+        }
+        // Speculative erased-equality normalization only reads the impl's associated type head;
+        // when all impl type parameters are already bound by the header walk, running `impl_where`
+        // cannot bind any type parameter and would emit redundant speculative work/constraints.
+        if self.in_erased_norm && self.envs.all_types_bound(env) {
+            return Ok(());
+        }
+        let cacheable = self.envs.all_impl_bound(env, lifetimes);
+        if cacheable && self.impl_seen.iter().any(|&(k, prev)| k == imp && self.impl_env_eq(prev, env)) {
             return Ok(());
         }
         if self.nested >= MOST_IMPL_NESTING {
@@ -2213,11 +2367,18 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 self.envs.bind_reg(env, param, Reg::Origin(o)).map_err(|w| self.malformed(node, w))?;
             }
         }
+        let seen_mark = self.impl_seen.len();
+        if cacheable && self.impl_seen.len() < MOST_IMPL_SEEN {
+            self.impl_seen.push((imp, env));
+        }
         let saved = (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v);
         self.nested += 1;
         let res = self.impl_where_in(w, trait_, node, env);
         self.nested -= 1;
         (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
+        if res.is_err() {
+            self.impl_seen.truncate(seen_mark);
+        }
         res
     }
 
@@ -3112,7 +3273,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        self.envs.truncate(env_mark);
+        self.truncate_envs(env_mark);
         Ok(false)
     }
 
@@ -3197,7 +3358,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        self.envs.truncate(env_mark);
+        self.truncate_envs(env_mark);
         Ok(None)
     }
 
@@ -3579,12 +3740,12 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             match self.slot(alias_side, k)? {
                 RegAt::Known(r) => {
                     if self.envs.bind_reg(aenv, k, r).is_err() {
-                        self.envs.truncate(env_mark);
+                        self.truncate_envs(env_mark);
                         return Ok(false);
                     }
                 }
                 RegAt::Unbound { .. } => {
-                    self.envs.truncate(env_mark);
+                    self.truncate_envs(env_mark);
                     return Ok(false);
                 }
             }
@@ -3628,7 +3789,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        self.envs.truncate(env_mark);
+        self.truncate_envs(env_mark);
         Ok(false)
     }
 
@@ -3888,12 +4049,12 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             match self.slot(alias_side, k)? {
                 RegAt::Known(r) => {
                     if self.envs.bind_reg(aenv, k, r).is_err() {
-                        self.envs.truncate(env_mark);
+                        self.truncate_envs(env_mark);
                         return Ok(None);
                     }
                 }
                 RegAt::Unbound { .. } => {
-                    self.envs.truncate(env_mark);
+                    self.truncate_envs(env_mark);
                     return Ok(None);
                 }
             }
@@ -3937,7 +4098,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        self.envs.truncate(env_mark);
+        self.truncate_envs(env_mark);
         Ok(None)
     }
 }
@@ -3987,6 +4148,7 @@ fn is_const(n: PNode) -> bool {
 }
 
 fn walker<'w, 'c, 'k: 'c, A: Allocator + Copy>(cx: &'w mut Cx<'k, '_>, envs: &'w mut Envs<'c, A>, item: ItemKey) -> Walk<'w, 'c, A> {
+    let alloc = envs.alloc();
     Walk {
         types: cx.types,
         sig_types: cx.sig_types,
@@ -4004,6 +4166,7 @@ fn walker<'w, 'c, 'k: 'c, A: Allocator + Copy>(cx: &'w mut Cx<'k, '_>, envs: &'w
         binder_v: BinderCtx::None,
         nested: 0,
         in_erased_norm: false,
+        impl_seen: Vec::new_in(alloc),
         walk_stack: [None; WALK_STACK_CAP],
         walk_sp: 0,
         comp_stack: [None; COMP_STACK_CAP],

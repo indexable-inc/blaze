@@ -154,6 +154,12 @@ pub enum Late {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvId(u32);
 
+impl EnvId {
+    pub(crate) fn index(self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+}
+
 /// Where a side's region slots are.
 #[derive(Clone, Copy, Debug)]
 pub enum Slots<'c> {
@@ -292,8 +298,31 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
         Envs { envs: Vec::new_in(alloc), owner: None, alloc }
     }
 
+    pub(crate) fn alloc(&self) -> A {
+        self.alloc
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.envs.len()
+    }
+
+    pub(crate) fn env_regs(&self, env: EnvId) -> Option<&[Option<Reg>]> {
+        self.envs.get(env.index()).map(|e| e.regs.as_slice())
+    }
+
+    pub(crate) fn env_types(&self, env: EnvId) -> Option<&[Option<Side<'c>>]> {
+        self.envs.get(env.index()).map(|e| e.types.as_slice())
+    }
+
+    pub(crate) fn all_types_bound(&self, env: EnvId) -> bool {
+        self.envs.get(env.index()).is_some_and(|e| e.types.iter().all(Option::is_some))
+    }
+
+    pub(crate) fn all_impl_bound(&self, env: EnvId, lifetimes: u32) -> bool {
+        let Ok(n) = usize::try_from(lifetimes) else { return false };
+        self.envs
+            .get(env.index())
+            .is_some_and(|e| e.regs.get(..n).is_some_and(|rs| rs.iter().all(Option::is_some)) && e.types.iter().all(Option::is_some))
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
