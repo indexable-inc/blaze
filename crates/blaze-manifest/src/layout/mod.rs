@@ -869,7 +869,7 @@ impl<'l, 'a> Passing<'l, 'a> {
     /// listing is still to come.
     fn expand(&mut self, root: &str, glob: &str, span: Span, out: &mut Vec<Text<'a>, Alloc<'a>>) -> Result<bool, LayoutError<'a>> {
         let alloc = self.alloc();
-        let pattern = match blaze_glob::Pattern::new(glob) {
+        let pattern = match blaze_glob::Pattern::new_in(glob, alloc) {
             Ok(pattern) => pattern,
             Err(error) => return Err(LayoutError::Pattern { at: span, error }),
         };
@@ -899,7 +899,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             if *part == "**" {
                 return Err(LayoutError::RecursiveGlob { at: span });
             }
-            let component = match blaze_glob::Pattern::new(part) {
+            let component = match blaze_glob::Pattern::new_in(part, alloc) {
                 Ok(component) => component,
                 Err(error) => return Err(LayoutError::Pattern { at: span, error }),
             };

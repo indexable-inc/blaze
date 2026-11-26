@@ -19,7 +19,8 @@
 //!   macro calls `<ident>::mac!()`, attributes `#[<ident>::attr]`, and derives
 //!   `#[derive(<ident>::Trait)]` (including `r#<ident>` raw identifiers).
 
-use blaze_drive::{Kind, Name};
+use blaze_drive::{Key, Kind, Name};
+use blaze_ids::ContentId;
 use blaze_lex::{Cpu, FrontmatterAllowed, TokenKind, tokenize};
 use blaze_manifest::layout;
 use blaze_own::Vec;
@@ -38,6 +39,16 @@ pub(crate) const UNUSED_DEPENDENCY: u16 = 48;
 
 /// Scratch frame reserve for reading one member source file at a time (reset per file).
 const SCAN_FRAME: usize = 64 << 20;
+
+/// BLAKE3 domain for per-file cached candidate crate-identifier sets (`BUD1`).
+/// Keyed strictly by `(FILE_REFS_MAGIC, file_content_digest)` so unchanged `.rs` files skip
+/// disk `stat`/`read` and `blaze_lex::tokenize` on `Driver::Phases` commands (rules 21, 25, 65).
+const FILE_REFS_DOMAIN: &str = "blaze-cli unused deps file refs";
+const FILE_REFS_MAGIC: &[u8; 4] = b"BUD1";
+/// Cap on distinct candidate crate identifiers cached per file (rule 18).
+const FILE_REFS_MAX_IDENTS: usize = 4096;
+/// Cap on encoded bytes cached per file.
+const FILE_REFS_MAX_BYTES: usize = 64 << 10;
 
 /// One candidate dependency declared in a workspace member's `Cargo.toml`.
 pub(crate) struct DeclaredDep<'f> {
@@ -227,19 +238,15 @@ fn all_used(used: &[bool]) -> bool {
     used.iter().all(|&u| u)
 }
 
-/// Scan one Rust source file `text` with `blaze_lex` and mark every extern crate identifier from
-/// `targets` that is referenced in `text`.
+/// Visits every candidate extern crate identifier referenced in `text` via `blaze_lex`.
+/// Returning `false` from `visit` stops scanning immediately.
 ///
 /// Recognizes:
 /// - `extern crate <ident>` (including `extern crate <ident> as _;` and `#[macro_use] extern crate <ident>;`)
 /// - `<ident>::` (covers `use`, `pub use`, paths, calls, macros `<ident>::m!()`, derives, attributes)
 /// - `::<ident>` (covers absolute paths `::<ident>`, `use ::<ident>;`, etc.)
 /// - `use <ident>` / `use { <ident>, ... }` (bare crate imports without `::`)
-pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) {
-    if targets.is_empty() || all_used(used) {
-        return;
-    }
-
+fn visit_referenced_crates<'t>(text: &'t str, mut visit: impl FnMut(&'t str) -> bool) {
     // Track the two previous non-trivia tokens.
     #[derive(Clone, Copy)]
     struct Prev<'t> {
@@ -248,8 +255,8 @@ pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) 
         end: usize,
     }
 
-    let mut prev2: Option<Prev<'_>> = None;
-    let mut prev1: Option<Prev<'_>> = None;
+    let mut prev2: Option<Prev<'t>> = None;
+    let mut prev1: Option<Prev<'t>> = None;
     let mut in_use = false;
     let mut use_brace_depth: u32 = 0;
     let mut use_expect_root = false;
@@ -280,11 +287,9 @@ pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) 
             && p1.kind == TokenKind::Colon
             && p1.end == start
             && matches!(p2.kind, TokenKind::Ident | TokenKind::RawIdent)
+            && !visit(strip_raw(p2.word))
         {
-            mark_if_target(strip_raw(p2.word), targets, used);
-            if all_used(used) {
-                return;
-            }
+            return;
         }
 
         // 2. `extern crate <ident>`
@@ -294,11 +299,9 @@ pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) 
             && p2.word == "extern"
             && p1.kind == TokenKind::Ident
             && p1.word == "crate"
+            && !visit(ident)
         {
-            mark_if_target(ident, targets, used);
-            if all_used(used) {
-                return;
-            }
+            return;
         }
 
         // 3. `::<ident>` (absolute crate path: two adjacent colons followed by ident).
@@ -307,11 +310,9 @@ pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) 
             && p2.kind == TokenKind::Colon
             && p1.kind == TokenKind::Colon
             && p2.end == p1.end.saturating_sub(1)
+            && !visit(ident)
         {
-            mark_if_target(ident, targets, used);
-            if all_used(used) {
-                return;
-            }
+            return;
         }
 
         // 4. Bare `use <ident>;`, `use <ident> as ...;`, `use { <ident>, ... };`
@@ -344,9 +345,8 @@ pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) 
                     use_expect_root = true;
                 }
                 _ if is_ident && use_expect_root => {
-                    mark_if_target(ident, targets, used);
                     use_expect_root = false;
-                    if all_used(used) {
+                    if !visit(ident) {
                         return;
                     }
                 }
@@ -364,6 +364,207 @@ pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) 
         prev2 = prev1;
         prev1 = Some(Prev { kind, word, end: offset });
     }
+}
+
+/// Scan one Rust source file `text` with `blaze_lex` and mark every extern crate identifier from
+/// `targets` that is referenced in `text`.
+pub(crate) fn scan_used_crates(text: &str, targets: &[&str], used: &mut [bool]) {
+    if targets.is_empty() || all_used(used) {
+        return;
+    }
+    visit_referenced_crates(text, |ident| {
+        mark_if_target(ident, targets, used);
+        !all_used(used)
+    });
+}
+
+/// Computes the CAS record key for a file's cached candidate crate-identifier set.
+fn file_refs_key(file_id: ContentId) -> Key {
+    let mut h = blaze_ids::Hasher::new(FILE_REFS_DOMAIN);
+    h.update(FILE_REFS_MAGIC);
+    h.update(&file_id.0);
+    Key(h.finish())
+}
+
+/// Extracts the sorted, deduplicated list of candidate extern crate identifiers from `text`.
+/// Returns `None` if a giant file exceeds [`FILE_REFS_MAX_IDENTS`] distinct identifiers.
+fn extract_file_refs<'t, 'f>(text: &'t str, frame: &'f Frame) -> Option<Vec<&'t str, &'f Frame>> {
+    let mut idents: Vec<&'t str, &'f Frame> = Vec::new_in(frame);
+    let mut overflow = false;
+    visit_referenced_crates(text, |ident| {
+        if matches!(ident, "self" | "super" | "crate" | "Self") {
+            return true;
+        }
+        idents.push(ident);
+        if idents.len() >= 256 && idents.len() % 256 == 0 {
+            idents.sort_unstable();
+            idents.dedup();
+            if idents.len() > FILE_REFS_MAX_IDENTS {
+                overflow = true;
+                return false;
+            }
+        }
+        true
+    });
+    if overflow {
+        return None;
+    }
+    idents.sort_unstable();
+    idents.dedup();
+    (idents.len() <= FILE_REFS_MAX_IDENTS).then_some(idents)
+}
+
+/// Encodes sorted, deduplicated candidate crate identifiers into the compact `BUD1` CAS form:
+/// `"BUD1" | count u32 LE | count x (len u16 LE | utf8 bytes)`.
+fn encode_file_refs<'f>(idents: &[&str], frame: &'f Frame) -> Option<Vec<u8, &'f Frame>> {
+    let count = u32::try_from(idents.len()).ok()?;
+    let mut total = 8usize;
+    for ident in idents {
+        let _ = u16::try_from(ident.len()).ok()?;
+        total = total.checked_add(2)?.checked_add(ident.len())?;
+        if total > FILE_REFS_MAX_BYTES {
+            return None;
+        }
+    }
+    let mut out = Vec::with_capacity_in(total, frame);
+    out.extend_from_slice(FILE_REFS_MAGIC);
+    out.extend_from_slice(&count.to_le_bytes());
+    for ident in idents {
+        let len = u16::try_from(ident.len()).ok()?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(ident.as_bytes());
+    }
+    Some(out)
+}
+
+/// Decodes a `BUD1` CAS record in place (zero allocations) and marks matching `targets` in `used`.
+/// Returns `true` if `bytes` is a valid whole `BUD1` record, `false` otherwise.
+fn match_file_refs(bytes: &[u8], targets: &[&str], used: &mut [bool]) -> bool {
+    if bytes.get(..4) != Some(FILE_REFS_MAGIC.as_slice()) {
+        return false;
+    }
+    let Some(count_bytes) = bytes.get(4..8).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return false;
+    };
+    let Ok(count) = usize::try_from(u32::from_le_bytes(count_bytes)) else {
+        return false;
+    };
+    let mut at = 8usize;
+    for _ in 0..count {
+        let Some(len_end) = at.checked_add(2) else {
+            return false;
+        };
+        let Some(len_bytes) = bytes.get(at..len_end).and_then(|s| <[u8; 2]>::try_from(s).ok()) else {
+            return false;
+        };
+        let len = usize::from(u16::from_le_bytes(len_bytes));
+        at = len_end;
+        let Some(end) = at.checked_add(len) else {
+            return false;
+        };
+        let Some(ident_bytes) = bytes.get(at..end) else {
+            return false;
+        };
+        let Ok(ident) = core::str::from_utf8(ident_bytes) else {
+            return false;
+        };
+        at = end;
+        if !all_used(used) {
+            mark_if_target(ident, targets, used);
+        }
+    }
+    at == bytes.len()
+}
+
+/// Builds a one-time path -> verified `LeafKind::Slot` file content digest index over `rows`
+/// (direct non-`mod.rs` slots only, keeping the first matching row per path) so file-id lookups
+/// during unused-dependency scanning are O(1) instead of linear-scanning `rows.rows`.
+fn build_row_file_index<'r, 'f>(
+    rows: &'r crate::sweep::Rows<'_>,
+    frame: &'f Frame,
+) -> blaze_hash::Map<&'r str, ContentId, blaze_hash::FixedState, &'f Frame> {
+    let zero = ContentId([0; 32]);
+    let remapped = crate::sweep::AT_MOD_RS | crate::sweep::BOTH;
+    let mut index = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::FixedState,
+        alloc: frame,
+        capacity: Some(rows.rows.len()),
+    });
+    for leaf in rows.rows.iter() {
+        if leaf.kind == crate::sweep::LeafKind::Slot
+            && !leaf.absent()
+            && (leaf.flags & remapped) == 0
+            && leaf.id != zero
+        {
+            index.entry(rows.path(leaf)).or_insert(leaf.id);
+        }
+    }
+    index
+}
+
+/// Scans one `.rs` file for `targets`, hitting the per-file `BUD1` CAS cache when `known_file_id`
+/// is present (zero disk `stat`/`read`/lexing on cache hit). Returns `Ok(true)` if scanned cleanly,
+/// or `Ok(false)` if the file could not be read or was not valid UTF-8.
+#[expect(clippy::too_many_arguments, reason = "cached file scan helper: each argument one input handle")]
+fn scan_file_cached(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    store: &mut dyn crate::store::Store<'_>,
+    path: &str,
+    known_file_id: Option<ContentId>,
+    targets: &[&str],
+    used: &mut [bool],
+    kept_keys: &mut blaze_engine::SVec<'_, Key>,
+    scratch: &mut Option<Frame>,
+) -> Result<bool, CliError> {
+    if let Some(file_id) = known_file_id {
+        let key = file_refs_key(file_id);
+        if let Some(held) = store.get(cx, key)?
+            && match_file_refs(held.bytes, targets, used)
+        {
+            kept_keys.push(key);
+            return Ok(true);
+        }
+    }
+    let frame: &Frame = match scratch {
+        Some(frame) => {
+            frame.reset();
+            frame
+        }
+        None => {
+            let made = Frame::with_reserve(SCAN_FRAME, bstd::mem::Tag::Other)
+                .map_err(|_| CliError::Text { what: "unused_deps: could not reserve scan frame" })?;
+            scratch.insert(made)
+        }
+    };
+    let mut bytes = Bytes::new_in(frame, "unused_deps scan");
+    let Ok(path_obj) = Path::new(path) else {
+        return Ok(false);
+    };
+    if root.read_all(cx, &path_obj, &mut bytes).is_err() {
+        return Ok(false);
+    }
+    let Ok(text) = core::str::from_utf8(bytes.as_slice()) else {
+        return Ok(false);
+    };
+    if let Some(file_id) = known_file_id
+        && let Some(idents) = extract_file_refs(text, frame)
+    {
+        for &ident in idents.iter() {
+            if all_used(used) {
+                break;
+            }
+            mark_if_target(ident, targets, used);
+        }
+        if let Some(encoded) = encode_file_refs(&idents, frame) {
+            let key = file_refs_key(file_id);
+            store.put(cx, key, &encoded)?;
+            kept_keys.push(key);
+        }
+        return Ok(true);
+    }
+    scan_used_crates(text, targets, used);
+    Ok(true)
 }
 
 /// Check whether a member's targets in the engine answer completed cleanly enough to report
@@ -435,18 +636,22 @@ fn member_checked_completely(
             }
         }
     }
-    // Also ensure no MacroModule task failed across the workspace (an unexpanded proc macro
-    // could generate references to declared dependencies).
+    saw_member_crate
+}
+
+/// Checks once across the workspace whether any `Kind::MacroModule` task failed (an unexpanded
+/// proc macro could generate references to declared dependencies). Hoisted out of the per-member
+/// loop so the check is O(F) instead of O(M × F).
+fn any_macro_module_failed(finished: &blaze_engine::Finished<'_>) -> bool {
     for &with_f in finished.answer.with_findings.iter() {
-        if with_f.kind == Kind::MacroModule {
-            if let Ok(Some(row)) = finished.answer.row_facts(with_f)
-                && row.failed
-            {
-                return false;
-            }
+        if with_f.kind == Kind::MacroModule
+            && let Ok(Some(row)) = finished.answer.row_facts(with_f)
+            && row.failed
+        {
+            return true;
         }
     }
-    saw_member_crate
+    false
 }
 
 /// Format the 3-argument finding message for `UNUSED_DEPENDENCY`:
@@ -464,16 +669,23 @@ fn format_finding_words<'f>(key: &str, section: &str, package: &str, frame: &'f 
 
 /// Collect unused-dependency warnings for all completely-checked workspace members on the Phases
 /// path and append them into `lines` under each member's manifest `Kind::Units` block.
+///
+/// Caches each scanned `.rs` file's sorted candidate crate-identifier set in `store` under its
+/// content digest (`BUD1`) and appends used/written cache keys into `kept_keys` for answer GC
+/// pinning, avoiding repeated disk `stat`/`read`/lexing on unchanged files.
 #[expect(clippy::too_many_arguments, reason = "check-end analysis: each argument one engine stage input")]
 pub(crate) fn collect(
     cx: &Cx,
     root: &Dir<ReadWrite>,
+    store: &mut dyn crate::store::Store<'_>,
     laid: &crate::units::Laid<'_>,
     names: Option<&NamesStage<'_>>,
     finished: &blaze_engine::Finished<'_>,
     outlined: &[Outlined<'_>],
+    rows: &crate::sweep::Rows<'_>,
     skipped_roots: &[&str],
     lines: &mut Lines<'_>,
+    kept_keys: &mut blaze_engine::SVec<'_, Key>,
     frame: &Frame,
 ) -> Result<(), CliError> {
     let Some(names) = names else {
@@ -487,9 +699,14 @@ pub(crate) fn collect(
     if !has_any_candidates {
         return Ok(());
     }
+    if any_macro_module_failed(finished) {
+        return Ok(());
+    }
 
-    let mut scratch = Frame::with_reserve(SCAN_FRAME, bstd::mem::Tag::Other)
-        .map_err(|_| CliError::Text { what: "unused_deps: could not reserve scan frame" })?;
+    let row_index = build_row_file_index(rows, frame);
+
+    // Lazily reserved on the first cache miss so all-cached runs allocate zero scan frames.
+    let mut scratch: Option<Frame> = None;
 
     for (member_idx, member) in members.iter().enumerate() {
         if member.deps.is_empty() {
@@ -541,21 +758,13 @@ pub(crate) fn collect(
                     continue;
                 }
                 scanned.push(path);
-                scratch.reset();
-                let mut bytes = Bytes::new_in(&scratch, "unused_deps scan");
-                let Ok(path_obj) = Path::new(path) else {
-                    code_scan_complete = false;
-                    dev_scan_complete = false;
-                    continue;
-                };
-                if root.read_all(cx, &path_obj, &mut bytes).is_err() {
-                    code_scan_complete = false;
-                    dev_scan_complete = false;
-                    continue;
-                }
-                if let Ok(text) = core::str::from_utf8(bytes.as_slice()) {
-                    scan_used_crates(text, &code_idents, &mut code_used);
-                } else {
+                let file_id = one
+                    .made
+                    .as_ref()
+                    .ok()
+                    .and_then(crate::engine_tasks::data_digest_of)
+                    .or_else(|| row_index.get(path).copied());
+                if !scan_file_cached(cx, root, store, path, file_id, &code_idents, &mut code_used, kept_keys, &mut scratch)? {
                     code_scan_complete = false;
                     dev_scan_complete = false;
                 }
@@ -568,19 +777,8 @@ pub(crate) fn collect(
                 if scanned.iter().any(|&p| p == dev_path) {
                     continue;
                 }
-                scratch.reset();
-                let mut bytes = Bytes::new_in(&scratch, "unused_deps dev scan");
-                let Ok(path_obj) = Path::new(dev_path) else {
-                    dev_scan_complete = false;
-                    continue;
-                };
-                if root.read_all(cx, &path_obj, &mut bytes).is_err() {
-                    dev_scan_complete = false;
-                    continue;
-                }
-                if let Ok(text) = core::str::from_utf8(bytes.as_slice()) {
-                    scan_used_crates(text, &code_idents, &mut code_used);
-                } else {
+                let file_id = row_index.get(dev_path).copied();
+                if !scan_file_cached(cx, root, store, dev_path, file_id, &code_idents, &mut code_used, kept_keys, &mut scratch)? {
                     dev_scan_complete = false;
                 }
             }
@@ -590,19 +788,12 @@ pub(crate) fn collect(
         let mut build_scan_complete = true;
         if !build_idents.is_empty() && member.has_build_script {
             if let Some(build_path) = member.build_script_path {
-                scratch.reset();
-                let mut bytes = Bytes::new_in(&scratch, "unused_deps build.rs scan");
-                let read_ok = Path::new(build_path)
-                    .ok()
-                    .and_then(|p| root.read_all(cx, &p, &mut bytes).ok())
-                    .is_some();
-                if read_ok {
-                    if let Ok(text) = core::str::from_utf8(bytes.as_slice()) {
-                        scan_used_crates(text, &build_idents, &mut build_used);
-                    } else {
-                        build_scan_complete = false;
-                    }
-                } else {
+                let file_id = outlined
+                    .iter()
+                    .find(|one| core::str::from_utf8(&one.path).ok() == Some(build_path))
+                    .and_then(|one| one.made.as_ref().ok().and_then(crate::engine_tasks::data_digest_of))
+                    .or_else(|| row_index.get(build_path).copied());
+                if !scan_file_cached(cx, root, store, build_path, file_id, &build_idents, &mut build_used, kept_keys, &mut scratch)? {
                     build_scan_complete = false;
                 }
             } else {
@@ -756,5 +947,65 @@ mod tests {
         let bar_end = bar_start + 18;
         let bar_words = b"bar\x1f[dependencies]\x1fa";
         assert!(line_deletion_fix(toml, bar_start, bar_end, bar_words).is_none());
+    }
+
+    #[test]
+    fn cached_file_refs_round_trip_matches_direct_scan() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+        let src = r#"
+            use alpha::Thing;
+            extern crate beta as _;
+            use {gamma, r#r_dep};
+            #[derive(delta::Derive)]
+            pub fn run() {
+                self::local();
+                super::up();
+                crate::root();
+                let _ = ::zeta::call();
+                my_mac::go!();
+            }
+        "#;
+        let targets = ["alpha", "beta", "gamma", "delta", "zeta", "my_mac", "r_dep", "unused"];
+        let mut direct = [false; 8];
+        scan_used_crates(src, &targets, &mut direct);
+
+        let idents = extract_file_refs(src, &frame).expect("extracted");
+        assert!(!idents.iter().any(|&id| matches!(id, "self" | "super" | "crate" | "Self")));
+        let encoded = encode_file_refs(&idents, &frame).expect("encoded");
+
+        let mut cached = [false; 8];
+        assert!(match_file_refs(&encoded, &targets, &mut cached));
+        assert_eq!(cached, direct, "cached BUD1 scan must match direct scan bit-for-bit");
+
+        // Truncated or wrong-magic records must return false so callers fall back to disk scan.
+        let mut bad = [false; 8];
+        assert!(!match_file_refs(b"BAD1\0\0\0\0", &targets, &mut bad));
+        let truncated = encoded.get(..encoded.len().saturating_sub(1)).expect("truncated");
+        assert!(!match_file_refs(truncated, &targets, &mut bad));
+    }
+
+    #[test]
+    fn row_file_index_maps_direct_slots_and_skips_absent_or_remapped() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+        let mut rows = crate::sweep::Rows::new_in(&frame);
+        let id_a = ContentId([1; 32]);
+        let id_a_dup = ContentId([2; 32]);
+        let id_b = ContentId([3; 32]);
+        let id_c = ContentId([4; 32]);
+        let p_a = u32::try_from(rows.names.push("src/lib.rs")).expect("path idx");
+        let p_b = u32::try_from(rows.names.push("src/mod_remapped.rs")).expect("path idx");
+        let p_c = u32::try_from(rows.names.push("src/absent.rs")).expect("path idx");
+        let p_d = u32::try_from(rows.names.push("Cargo.toml")).expect("path idx");
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: 0, path: p_a, stamp: None, id: id_a });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: 0, path: p_a, stamp: None, id: id_a_dup });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: crate::sweep::AT_MOD_RS, path: p_b, stamp: None, id: id_b });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: crate::sweep::ABSENT, path: p_c, stamp: None, id: id_c });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Manifest, flags: 0, path: p_d, stamp: None, id: id_c });
+
+        let index = build_row_file_index(&rows, &frame);
+        assert_eq!(index.get("src/lib.rs").copied(), Some(id_a), "first matching direct slot wins");
+        assert_eq!(index.get("src/mod_remapped.rs").copied(), None, "AT_MOD_RS slots excluded");
+        assert_eq!(index.get("src/absent.rs").copied(), None, "absent slots excluded");
+        assert_eq!(index.get("Cargo.toml").copied(), None, "non-Slot leaves excluded");
     }
 }

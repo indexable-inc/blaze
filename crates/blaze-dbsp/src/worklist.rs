@@ -1,27 +1,27 @@
-use std::{collections::VecDeque, hash::Hash};
+use core::{alloc::Allocator, hash::Hash};
 
 use blaze_hash::{FixedState, Set, SetOpts};
-use std::alloc::Global;
+use blaze_own::VecDeque as OwnVecDeque;
 
 /// A worklist with set semantics: `push` of a queued item is a no-op; `pop` is FIFO. An item
 /// popped may be pushed again. The ring and the set keep their buffers, so a warm worklist
 /// allocates nothing.
 #[derive(Debug)]
-pub struct Worklist<T> {
-    queue: VecDeque<T>,
-    queued: Set<T, FixedState, Global>,
+pub struct Worklist<T, A: Allocator> {
+    queue: OwnVecDeque<T, A>,
+    queued: Set<T, FixedState, A>,
 }
 
-impl<T: Copy + Eq + Hash> Default for Worklist<T> {
-    fn default() -> Self {
-        Worklist::new()
+impl<T: Copy + Eq + Hash, A: Allocator + Clone> Worklist<T, A> {
+    pub fn new_in(alloc: A) -> Self {
+        Worklist {
+            queue: OwnVecDeque::new_in(alloc.clone()),
+            queued: Set::new(SetOpts { hasher: FixedState, alloc, capacity: None }),
+        }
     }
 }
 
-impl<T: Copy + Eq + Hash> Worklist<T> {
-    pub fn new() -> Self {
-        Worklist { queue: VecDeque::new(), queued: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) }
-    }
+impl<T: Copy + Eq + Hash, A: Allocator> Worklist<T, A> {
 
     /// Queues `t` unless it is queued; whether it was not.
     pub fn push(&mut self, t: T) -> bool {

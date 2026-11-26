@@ -53,22 +53,10 @@ pub(crate) fn run(
     err: &Out,
     phases: &mut Phases,
     heap: &'static blaze_own::Heap,
-    spawn_daemon: bool,
 ) -> Result<Status, CliError> {
-    let flags = crate::flags(args)?;
+    let flags = crate::flags_in(args, cx.frame())?;
     refuse_not_taken(&flags)?;
-    let status = crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)?;
-    if spawn_daemon && !cx.is_simulated() && !flags.dir.is_some_and(crate::single_file::is_script_arg) {
-        let frame = cx.frame();
-        if let Ok(checkout) = crate::checkout::checkout(flags.dir, frame)
-            && let Ok(located) = crate::run_package::locate(cx, fs, &checkout, frame)
-            && let Ok(served) = crate::engine_script_reads::Served::at_edge(false, located.at, frame)
-            && let Some(root_abs) = served.root_text()
-        {
-            crate::daemon_client::spawn_detached_daemon(cx, host, env, root_abs, frame);
-        }
-    }
-    Ok(status)
+    crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)
 }
 
 /// The first flag given that the engine's check does not take, refused by name (rule 3: never
@@ -81,10 +69,10 @@ pub(crate) fn refuse_not_taken(flags: &crate::Flags<'_>) -> Result<(), CliError>
         return Err(CliError::Usage("--grant and the words after -- are `blaze run`'s program's"));
     }
     if flags.select != crate::run_package::Select::NONE {
-        return Err(CliError::Usage("-p and --bin choose `blaze run`'s or `blaze export`'s program"));
+        return Err(CliError::Usage("-p and --bin choose `blaze run`'s or `blaze build`'s program"));
     }
     if flags.output.is_some() {
-        return Err(CliError::Usage("-o / --output is `blaze export`'s"));
+        return Err(CliError::Usage("-o / --output is `blaze build`'s"));
     }
     if flags.open == blaze_run::viewer::OpenExplore::Open {
         return Err(CliError::Usage("--open is `blaze run`'s"));

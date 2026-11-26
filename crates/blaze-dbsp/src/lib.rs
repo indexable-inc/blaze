@@ -15,11 +15,18 @@
 //! Every structure is flat: Hash maps to `u32` rows, buffers kept and reused, and no
 //! allocation on a lookup.
 
-#![forbid(unsafe_code)]
-#![feature(allocator_api)]
-// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
-#![feature(register_tool)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
 
 mod arrangement;
 mod closure;
@@ -36,7 +43,7 @@ mod tests;
 
 pub use crate::{
     arrangement::Arrangement,
-    closure::{Closure, closure},
+    closure::{Closure, closure_in},
     diff::{SeqDiff, diff_seq},
     hash::SliceHasher,
     pos::Pos,

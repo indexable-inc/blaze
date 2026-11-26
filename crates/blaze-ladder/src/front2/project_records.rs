@@ -30,7 +30,7 @@ use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc};
 use blaze_scope::resolve::{At, Names};
-use blaze_surface::{Item, ItemIndex, ItemKind};
+use blaze_surface::{FileItemsView, Item, ItemIndex, ItemKind};
 
 use super::keys::MemberKind;
 use super::project::{BodyAt, BodyRef};
@@ -367,6 +367,55 @@ pub fn index_outlined_by_chain<'n>(
     by_chain_of(rows, 0)
 }
 
+/// [`index_outlined_by_chain`] over an already-serialized [`FileItemsView`], avoiding re-lexing
+/// and re-parsing the file when its `FileItems` record is already in hand.
+///
+/// When `only_entries` is `Some(wanted)` (sorted ascending by outline index), every listed body
+/// in `listed` is still validated for file match, entry bounds, and item kind, while `chain` is
+/// computed only for entries present in `wanted`.
+pub fn index_view_by_chain<'n>(
+    file: u32,
+    listed: &[Listed<'n>],
+    view: FileItemsView<'_>,
+    only_entries: Option<&[u32]>,
+    chain: &dyn Fn(FileItemsView<'_>, ItemIndex) -> ContentId,
+    alloc: Alloc<'n>,
+) -> Result<ByChain<'n>, ChainError<'n>> {
+    let mut placed: AVec<'n, (u32, BodyRef<'n>)> = AVec::with_capacity_in(listed.len(), alloc);
+    for l in listed {
+        match l.entry {
+            Some((at, entry)) if at == file => placed.push((entry.0, l.body)),
+            _ => return Err(ChainError::NoEntry { file, entry: u32::MAX, body: l.body }),
+        }
+    }
+    placed.sort_unstable();
+    let cap = only_entries.map_or(placed.len(), |wanted| wanted.len().min(placed.len()));
+    let mut rows: AVec<'n, (u32, ContentId, BodyRef<'n>)> = AVec::with_capacity_in(cap, alloc);
+    for &(entry, body) in placed.iter() {
+        let idx = ItemIndex(entry);
+        let Some(found) = view.item(idx) else {
+            return Err(ChainError::NoEntry { file, entry, body });
+        };
+        let kind = found.item.kind();
+        if !body_fits_kind(body, kind) {
+            return Err(ChainError::NotItsKind { file, entry, found: kind, body });
+        }
+        if only_entries.is_none_or(|wanted| wanted.binary_search(&entry).is_ok()) {
+            rows.push((file, chain(view, idx), body));
+        }
+    }
+    by_chain_of(rows, 0)
+}
+
+fn body_fits_kind(body: BodyRef<'_>, kind: ItemKind) -> bool {
+    match body {
+        BodyRef::Free(_) => matches!(kind, ItemKind::Function | ItemKind::Const | ItemKind::Static),
+        BodyRef::Member { kind: MemberKind::Fn, .. } => kind == ItemKind::Function,
+        BodyRef::Member { kind: MemberKind::Const, .. } => kind == ItemKind::Const,
+        BodyRef::Member { .. } => false,
+    }
+}
+
 /// Each of `run` (an entry of `file`'s outline and its body, sorted by entry) keyed by its
 /// entry's chain onto `rows`: the one check that the entry is there and is the body's kind.
 fn chain_rows<'n>(
@@ -378,16 +427,10 @@ fn chain_rows<'n>(
     rows: &mut AVec<'n, (u32, ContentId, BodyRef<'n>)>,
 ) -> Result<(), ChainError<'n>> {
     for (entry, body) in run {
-        let Some(item) = outline.items().get(entry as usize) else {
+        let Some(item) = usize::try_from(entry).ok().and_then(|at| outline.items().get(at)) else {
             return Err(ChainError::NoEntry { file, entry, body });
         };
-        let fits = match body {
-            BodyRef::Free(_) => matches!(item.kind(), ItemKind::Function | ItemKind::Const | ItemKind::Static),
-            BodyRef::Member { kind: MemberKind::Fn, .. } => item.kind() == ItemKind::Function,
-            BodyRef::Member { kind: MemberKind::Const, .. } => item.kind() == ItemKind::Const,
-            BodyRef::Member { .. } => false,
-        };
-        if !fits {
+        if !body_fits_kind(body, item.kind()) {
             return Err(ChainError::NotItsKind { file, entry, found: item.kind(), body });
         }
         rows.push((file, chain(outline, item, text), body));

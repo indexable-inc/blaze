@@ -428,24 +428,36 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         self.body_slots(body_t, &mut table, e)?;
         let body = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &table);
 
+        enum FrameKind {
+            Root,
+            /// A substituted impl type parameter (`Param(p)` inside an impl's associated type):
+            /// returns to its parent frame on completion, propagating `!ok` up to the parent
+            /// instead of returning from `lay_slots` early.
+            ParamSub,
+            /// An impl associated-type value laid through a projection (`(trait_, body_ty, before)`).
+            ImplProj { trait_: ItemKey, body_ty: PTy, before: usize },
+        }
+
         struct Frame<'s, Al: Allocator> {
             slots: FrameSlots<'s, Al>,
             at: usize,
             binds: Option<ImplBinds<Al>>,
             stack: Vec<(PTy, PTy), Al>,
             steps: u32,
-            /// `Some((trait_, body_ty, before))` for an impl value laid through a projection.
-            impl_ctx: Option<(ItemKey, PTy, usize)>,
+            failed: bool,
+            kind: FrameKind,
         }
 
         let mut root_stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         root_stack.push((declared, body_t));
         let mut frames: Vec<Frame<'_, A>, A> = Vec::new_in(self.alloc);
-        frames.push(Frame { slots: FrameSlots::Borrowed(slots), at: 0, binds: None, stack: root_stack, steps: 0, impl_ctx: None });
+        frames.push(Frame { slots: FrameSlots::Borrowed(slots), at: 0, binds: None, stack: root_stack, steps: 0, failed: false, kind: FrameKind::Root });
 
         'frames: while let Some(mut frame) = frames.pop() {
-            let mut aligned = true;
-            while let Some((d, b)) = frame.stack.pop() {
+            let mut aligned = !frame.failed;
+            while aligned
+                && let Some((d, b)) = frame.stack.pop()
+            {
                 frame.steps += 1;
                 if frame.steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
                     return self.refuse(Form::Bound, e);
@@ -474,12 +486,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                             binds: None,
                             stack: child_stack,
                             steps: 0,
-                            impl_ctx: None,
+                            failed: false,
+                            kind: FrameKind::ParamSub,
                         });
                         continue 'frames;
                     }
                 }
-                if blaze_borrow::head_eq(dn, bn) {
+                // When declared and body are both `PNode::Alias` of the same `(trait_, name)`
+                // (e.g. `impl<N: RpcNodeCore> RpcNodeCore for TempoEthApi<N> { type Evm = N::Evm; }`
+                // where declared `<TempoEthApi<N> as RpcNodeCore>::Evm` normalized to
+                // `<N as RpcNodeCore>::Evm`), only descend via `head_eq` if their argument
+                // subtrees are structurally compatible; otherwise fall through to `through_impl`
+                // so the outer alias normalizes into the inner alias cleanly.
+                let same_head = blaze_borrow::head_eq(dn, bn)
+                    && (!matches!(dn, PNode::Alias { .. })
+                        || self.alias_args_compatible(&heads, &body, frame.binds.as_ref(), d, b, e)?);
+                if same_head {
                     let (Ok(own), Ok(dk), Ok(bo), Ok(bk)) = (heads.own(d), heads.kids(d), body.own(b), body.kids(b)) else {
                         aligned = false;
                         break;
@@ -526,7 +548,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                                 binds: Some(bound),
                                 stack: child_stack,
                                 steps: 0,
-                                impl_ctx: Some((trait_, b, before)),
+                                failed: false,
+                                kind: FrameKind::ImplProj { trait_, body_ty: b, before },
                             });
                             continue 'frames;
                         }
@@ -574,9 +597,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 }
             }
             let ok = aligned && frame.at == frame.slots.len();
-            match frame.impl_ctx {
-                None => return Ok(ok),
-                Some((trait_, b, before)) => {
+            match frame.kind {
+                FrameKind::Root => return Ok(ok),
+                FrameKind::ParamSub => {
+                    if !ok {
+                        if let Some(parent) = frames.last_mut() {
+                            parent.failed = true;
+                        } else {
+                            return Ok(false);
+                        }
+                    }
+                }
+                FrameKind::ImplProj { trait_, body_ty: b, before } => {
                     if !ok {
                         out.truncate(before);
                         if let Some(rp) = rpit.as_deref_mut() {
@@ -595,6 +627,87 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             }
         }
         Ok(false)
+    }
+
+    /// Checks whether two `PNode::Alias` types with matching `(trait_, name)` have argument
+    /// subtrees that can align directly via `head_eq` without first normalizing the outer alias
+    /// `d` through `through_impl`.
+    ///
+    /// Returns `Ok(false)` only when walking the argument subtrees directly is guaranteed to hit
+    /// the unaligned wildcard in [`Self::lay_slots`] (for example `<TempoEthApi<N> as Tr>::A`
+    /// beside `<N as Tr>::A`, where `Adt` meets `Param`).
+    fn alias_args_compatible(
+        &self,
+        heads: &Columns<'_>,
+        body: &impl RegionTypes,
+        binds: Option<&ImplBinds<A>>,
+        d: PTy,
+        b: PTy,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        const MAX_CHECK_STACK: usize = 32;
+        const MAX_CHECK_STEPS: u32 = 64;
+        let (Ok(own), Ok(dk), Ok(bo), Ok(bk)) = (heads.own(d), heads.kids(d), body.own(b), body.kids(b)) else {
+            return Ok(false);
+        };
+        if own != bo || dk.len() != bk.len() {
+            return Ok(false);
+        }
+        let mut stack: [(PTy, PTy, bool); MAX_CHECK_STACK] = [(d, b, true); MAX_CHECK_STACK];
+        let mut len = 0usize;
+        for k in (0..dk.len()).rev() {
+            if len >= MAX_CHECK_STACK {
+                return Ok(true);
+            }
+            let (Some(x), Some(y)) = (dk.get(k), bk.get(k)) else { return self.refuse(Form::Malformed, e) };
+            stack[len] = (x, y, true);
+            len += 1;
+        }
+        let mut steps = 0u32;
+        while len > 0 {
+            len -= 1;
+            steps += 1;
+            if steps > MAX_CHECK_STEPS {
+                return Ok(true);
+            }
+            let (xd, xb, use_binds) = stack[len];
+            let (xdn, xbn) = (self.head_node(xd, e)?, self.node(xb, e)?);
+            if matches!(xdn, PNode::ConstValue { .. } | PNode::ConstParam(_))
+                && matches!(xbn, PNode::ConstValue { .. } | PNode::ConstParam(_))
+            {
+                continue;
+            }
+            if use_binds
+                && let PNode::Param(p) = xdn
+                && let Some(b_map) = binds
+                && let Some((sub_ty, _)) = b_map.ty_param(p)
+            {
+                stack[len] = (sub_ty, xb, false);
+                len += 1;
+                continue;
+            }
+            if matches!(xdn, PNode::Alias { .. } | PNode::Opaque(..) | PNode::FnDef(..) | PNode::Param(_)) {
+                continue;
+            }
+            if !blaze_borrow::head_eq(xdn, xbn) {
+                return Ok(false);
+            }
+            let (Ok(o1), Ok(k1), Ok(o2), Ok(k2)) = (heads.own(xd), heads.kids(xd), body.own(xb), body.kids(xb)) else {
+                return Ok(false);
+            };
+            if o1 != o2 || k1.len() != k2.len() {
+                return Ok(false);
+            }
+            for k in (0..k1.len()).rev() {
+                if len >= MAX_CHECK_STACK {
+                    return Ok(true);
+                }
+                let (Some(x), Some(y)) = (k1.get(k), k2.get(k)) else { return self.refuse(Form::Malformed, e) };
+                stack[len] = (x, y, use_binds);
+                len += 1;
+            }
+        }
+        Ok(true)
     }
 
     /// The declared projection `d` (`<S as trait_>::name`, `mine` its already-mapped slots in the

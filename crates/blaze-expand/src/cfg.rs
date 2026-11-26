@@ -175,16 +175,27 @@ fn predicate_in<V: Truth, E>(
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<V, E>,
 ) -> Result<V, CfgPredicateError<E>> {
     let list = tokens.tokens().get(..range.end).unwrap_or(&[]);
-    let malformed = |at: usize| CfgPredicateError::Malformed { token: u32::try_from(at).unwrap_or(u32::MAX) };
+    // Macro-by-example captures (`$s:expr`, `$m:meta`, `$l:literal`) wrap substituted tokens in
+    // invisible `Delim::Invisible` groups (e.g. `#[cfg(all(feature = $algo_s))]`); skip them while
+    // preserving original token indices for error reporting.
+    let mut real: AVec<'_, usize> = Vec::new_in(alloc);
+    for i in range.start..list.len() {
+        if !matches!(list[i].kind, TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible)) {
+            real.push(i);
+        }
+    }
+    let raw = |pos: usize| real.get(pos).copied().unwrap_or(range.end);
+    let tok = |pos: usize| real.get(pos).and_then(|&i| list.get(i));
+    let malformed = |pos: usize| CfgPredicateError::Malformed { token: u32::try_from(raw(pos)).unwrap_or(u32::MAX) };
     let mut stack: AVec<'_, Open<V>> = Vec::new_in(alloc);
     let mut value_buf = Buf::new_in(alloc);
-    let mut at = range.start;
+    let mut pos = 0usize;
     loop {
         // A predicate starts here: a group opens, or an atom gives a value.
-        let token = list.get(at).ok_or(malformed(at))?;
-        let TokenKind::Ident { .. } = token.kind else { return Err(malformed(at)) };
+        let token = tok(pos).ok_or(malformed(pos))?;
+        let TokenKind::Ident { .. } = token.kind else { return Err(malformed(pos)) };
         let name = tokens.text_of(token);
-        let next = list.get(at + 1).map(|t| t.kind);
+        let next = tok(pos + 1).map(|t| t.kind);
         let op = match name {
             "any" => Some(Op::Any),
             "all" => Some(Op::All),
@@ -194,25 +205,25 @@ fn predicate_in<V: Truth, E>(
         let mut value = match (op, next) {
             (Some(op), Some(TokenKind::Open(Delim::Paren))) => {
                 let acc = V::of(op == Op::All);
-                stack.push(Open { op, acc, count: 0, at: u32::try_from(at).unwrap_or(u32::MAX) });
-                at += 2;
+                stack.push(Open { op, acc, count: 0, at: u32::try_from(raw(pos)).unwrap_or(u32::MAX) });
+                pos += 2;
                 // An empty group closes at once.
-                if matches!(list.get(at).map(|t| t.kind), Some(TokenKind::Close(Delim::Paren))) {
+                if matches!(tok(pos).map(|t| t.kind), Some(TokenKind::Close(Delim::Paren))) {
                     None
                 } else {
                     continue;
                 }
             }
             (_, Some(TokenKind::Punct { char: '=', .. })) => {
-                let lit = list.get(at + 2).ok_or(malformed(at + 2))?;
-                let TokenKind::Literal { kind, suffix_len, .. } = lit.kind else { return Err(malformed(at + 2)) };
+                let lit = tok(pos + 2).ok_or(malformed(pos + 2))?;
+                let TokenKind::Literal { kind, suffix_len, .. } = lit.kind else { return Err(malformed(pos + 2)) };
                 value_buf.0.clear();
-                string_value(kind, tokens.text_of(lit), suffix_len, &mut value_buf).map_err(|_| malformed(at + 2))?;
-                at += 3;
+                string_value(kind, tokens.text_of(lit), suffix_len, &mut value_buf).map_err(|_| malformed(pos + 2))?;
+                pos += 3;
                 Some(atom(name, Some(value_buf.as_str())).map_err(CfgPredicateError::Atom)?)
             }
             _ => {
-                at += 1;
+                pos += 1;
                 Some(atom(name, None).map_err(CfgPredicateError::Atom)?)
             }
         };
@@ -220,9 +231,9 @@ fn predicate_in<V: Truth, E>(
         loop {
             let Some(top) = stack.last_mut() else {
                 // The whole predicate: nothing may follow it.
-                return match (value, list.get(at)) {
+                return match (value, tok(pos)) {
                     (Some(v), None) => Ok(v),
-                    _ => Err(malformed(at)),
+                    _ => Err(malformed(pos)),
                 };
             };
             if let Some(v) = value.take() {
@@ -237,25 +248,25 @@ fn predicate_in<V: Truth, E>(
                     }
                 }
                 top.count += 1;
-                match list.get(at).map(|t| t.kind) {
+                match tok(pos).map(|t| t.kind) {
                     // astlog-ignore: expand-hand-extent (the separator after a predicate this fold read whole; the cfg grammar holds no generics)
                     Some(TokenKind::Punct { char: ',', .. }) => {
-                        at += 1;
-                        if !matches!(list.get(at).map(|t| t.kind), Some(TokenKind::Close(Delim::Paren))) {
+                        pos += 1;
+                        if !matches!(tok(pos).map(|t| t.kind), Some(TokenKind::Close(Delim::Paren))) {
                             break;
                         }
                     }
                     Some(TokenKind::Close(Delim::Paren)) => {}
-                    _ => return Err(malformed(at)),
+                    _ => return Err(malformed(pos)),
                 }
             }
             // At the group's `)`.
-            let Some(TokenKind::Close(Delim::Paren)) = list.get(at).map(|t| t.kind) else { return Err(malformed(at)) };
-            let done = stack.pop().ok_or(malformed(at))?;
+            let Some(TokenKind::Close(Delim::Paren)) = tok(pos).map(|t| t.kind) else { return Err(malformed(pos)) };
+            let done = stack.pop().ok_or(malformed(pos))?;
             if done.op == Op::Not && done.count != 1 {
                 return Err(CfgPredicateError::NotTakesOne { token: done.at });
             }
-            at += 1;
+            pos += 1;
             value = Some(done.acc);
         }
     }
@@ -291,9 +302,16 @@ pub fn cfg_attr_metas<'a, E>(
     let index = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
     // `name(..)` at `m`: the range inside its parentheses when `name` is `cfg_attr`.
     let cfg_attr_inside = |m: &Range<usize>| -> Option<Range<usize>> {
-        let is_name = matches!(list.get(m.start).map(|t| t.kind), Some(TokenKind::Ident { .. })) && attr.text_at(m.start) == "cfg_attr";
-        let is_paren = matches!(list.get(m.start + 1).map(|t| t.kind), Some(TokenKind::Open(Delim::Paren)));
-        (is_name && is_paren && attr.close_of(m.start + 1) == Some(m.end - 1)).then(|| m.start + 2..m.end - 1)
+        let mut r = m.clone();
+        while r.start < r.end
+            && matches!(list.get(r.start).map(|t| t.kind), Some(TokenKind::Open(Delim::Invisible)))
+            && attr.close_of(r.start) == Some(r.end - 1)
+        {
+            r = r.start + 1..r.end - 1;
+        }
+        let is_name = matches!(list.get(r.start).map(|t| t.kind), Some(TokenKind::Ident { .. })) && attr.text_at(r.start) == "cfg_attr";
+        let is_paren = matches!(list.get(r.start + 1).map(|t| t.kind), Some(TokenKind::Open(Delim::Paren)));
+        (is_name && is_paren && attr.close_of(r.start + 1) == Some(r.end - 1)).then(|| r.start + 2..r.end - 1)
     };
     let whole = 2..list.len() - 1;
     if cfg_attr_inside(&whole).is_none() {
@@ -314,8 +332,8 @@ pub fn cfg_attr_metas<'a, E>(
         let (mut start, mut depth) = (inside.start, 0u32);
         for at in inside.clone() {
             match list[at].kind {
-                TokenKind::Open(_) => depth += 1,
-                TokenKind::Close(_) => depth = depth.saturating_sub(1),
+                TokenKind::Open(d) if d != Delim::Invisible => depth += 1,
+                TokenKind::Close(d) if d != Delim::Invisible => depth = depth.saturating_sub(1),
                 // astlog-ignore: expand-hand-extent (LEFT: cfg_attr's metas by depth-0 commas; to move onto the MetaItem tree's CFG_ATTR_META with a CfgAttrError variant and blaze-ladder foreign_locals.rs in one batch)
                 TokenKind::Punct { char: ',', .. } if depth == 0 => {
                     pieces.push(start..at);

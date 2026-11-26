@@ -608,24 +608,28 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
     }
 
     /// The `macro_rules!` and `macro` the body wrote that are in scope here, in the order
-    /// written: each one's name and its definition's text ([`def_site::form_of`]).
+    /// written: each one's name and its definition's form ([`Machine::local_form`]).
     pub(crate) fn local_macros(&self) -> impl Iterator<Item = crate::driver::LocalMacro<'_>> + '_ {
         let text = self.text();
         self.local_macros
             .iter()
-            .filter_map(move |l| def_site::form_of(text, l).map(|form| crate::driver::LocalMacro { name: l.name.of(text), form }))
+            .filter_map(move |l| self.local_form(l).map(|form| crate::driver::LocalMacro { name: l.name.of(text), form }))
+    }
+
+    /// The marks of the words starting inside `r`, as [`Machine::mark_at`] reads them.
+    pub(super) fn marks_in(&self, r: Range) -> crate::driver::InputMarks<'_> {
+        use blaze_expand::origin_column::MARK;
+        let starts = &self.out.mark_starts;
+        let first = starts.partition_point(|&s| s < r.start);
+        let past = starts.partition_point(|&s| s < r.end);
+        crate::driver::InputMarks::new(r.start, &starts[first..past], &self.out.mark_bytes[first * MARK..past * MARK])
     }
 
     /// The marks of `request`'s input's words, as [`Machine::mark_at`] reads them: the rows
     /// whose start is inside the input (the item's own words', or an expansion's when the input
     /// text spans one; [`Machine::call_input`]).
     pub(crate) fn input_marks(&self, request: &Request) -> crate::driver::InputMarks<'_> {
-        use blaze_expand::origin_column::MARK;
-        let r = request.input;
-        let starts = &self.out.mark_starts;
-        let first = starts.partition_point(|&s| s < r.start);
-        let past = starts.partition_point(|&s| s < r.end);
-        crate::driver::InputMarks::new(r.start, &starts[first..past], &self.out.mark_bytes[first * MARK..past * MARK])
+        self.marks_in(request.input)
     }
 
     /// Where `request`'s input is: the item's text, or tokens of an expansion lowered here.

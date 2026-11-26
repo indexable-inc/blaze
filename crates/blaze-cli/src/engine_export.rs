@@ -52,6 +52,58 @@ use crate::{CliError, program, run_names, run_package};
 /// words, native image layout, and the emitted executable bytes). Untouched pages cost zero RSS.
 const EXPORT_FRAME_RESERVE: usize = 2 << 30;
 
+/// Program root shape domain for `blaze build` (`start_list::ListName::of` -> `RootName::program`),
+/// distinct from `engine_start.rs`'s `RUN_SHAPE` so `blaze build`'s release-profile code root
+/// and `blaze run`'s dev-profile code + start-list root never overwrite or unroot each other.
+const BUILD_SHAPE: &str = "blaze build: the code of a program 1";
+
+/// Computes the checkout-independent program root shape for `blaze build` (`RootName::program`).
+/// Distinct from `engine_start.rs`'s `RUN_SHAPE`, and includes `(workspace, program_crate,
+/// package, bin, root)` without any checkout path so two unrelated workspaces with the same
+/// package/bin/root stay disjoint while two worktrees of the same repository share one root
+/// (rules 25, 30, 36).
+fn build_program_shape(
+    picked: &run_package::Program<'_>,
+    workspace: Option<blaze_ids::ContentId>,
+    program_crate: blaze_id::CrateItemKey,
+) -> blaze_ids::ContentId {
+    let mut h = blaze_ids::Hasher::new(BUILD_SHAPE);
+    match workspace {
+        Some(id) => {
+            h.update(&[1]);
+            h.id(&id);
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    h.id(&program_crate.0);
+    h.part(picked.package.as_bytes());
+    h.part(picked.bin.as_bytes());
+    h.part(picked.root.as_bytes());
+    h.finish()
+}
+
+/// Outcome of persisting `blaze build`'s closing program and toolchain roots.
+struct ExportRootsKept {
+    program: Result<crate::store::roots::Rooted<crate::store::roots::Program>, crate::store::roots::RootError>,
+    toolchain: Result<Option<crate::store::roots::Rooted<crate::store::roots::Toolchain>>, crate::store::roots::RootError>,
+}
+
+/// Roots the program's reached non-toolchain code + `RunIds` table (`keep_program`) and any newly
+/// emitted toolchain code (`keep_toolchain`) before the command's closing store commit.
+fn keep_export_roots<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    today: &crate::start_list::Today,
+    toolchain: blaze_toolchain::ToolchainId,
+    walked: &[blaze_cas::Key],
+    toolchain_made: &[blaze_cas::Key],
+) -> ExportRootsKept {
+    let program = crate::store::roots::keep_program(lent, today, None, walked).map(|(rooted, _)| rooted);
+    let toolchain = crate::store::roots::keep_toolchain(lent, toolchain, toolchain_made, &[]);
+    ExportRootsKept { program, toolchain }
+}
+
 /// Why `blaze export` stopped before writing a valid executable, naming the thing (rule 19).
 #[derive(Debug)]
 pub enum ExportCliError {
@@ -94,6 +146,8 @@ pub enum ExportCliError {
     Materialize { symbol: [u8; 32], shown: AString<'static> },
     /// `blaze_export::export` refused the program.
     Export(ExportError),
+    /// Persisting the closing program or toolchain store root failed (Rule 3: never silently drop roots).
+    KeepRoots { class: &'static str, shown: AString<'static> },
     /// Invalid output path supplied via `-o` / `--output`.
     BadOutputPath { path: AString<'static>, why: OutputPathIssue },
     /// Opening the output folder failed.
@@ -121,33 +175,34 @@ impl fmt::Display for Hex<'_> {
 impl fmt::Display for ExportCliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExportCliError::UnsupportedHost => write!(f, "blaze export: only arm64 macOS and arm64 Linux hosts are supported (engine_export.rs)"),
-            ExportCliError::Frame => write!(f, "blaze export: could not reserve the export scratch frame (engine_export.rs)"),
-            ExportCliError::Native { shown } => write!(f, "blaze export: native image: {} (engine_native.rs)", shown.as_str()),
-            ExportCliError::Builder { shown } => write!(f, "blaze export: code builder: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::Roots { shown } => write!(f, "blaze export: program roots: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::UnsupportedHost => write!(f, "blaze build: only arm64 macOS and arm64 Linux hosts are supported (engine_export.rs)"),
+            ExportCliError::Frame => write!(f, "blaze build: could not reserve the build scratch frame (engine_export.rs)"),
+            ExportCliError::Native { shown } => write!(f, "blaze build: native image: {} (engine_native.rs)", shown.as_str()),
+            ExportCliError::Builder { shown } => write!(f, "blaze build: code builder: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::Roots { shown } => write!(f, "blaze build: program roots: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::NotChecked { krate, function, symbol, row, reached, compiled, cached, why } => write!(
                 f,
-                "blaze export: reached fn {:#x} in crate `{}` (symbol {}; row {row}/{reached}, {compiled} compiled, {cached} cached) may not be exported: {why} (engine_export.rs)",
+                "blaze build: reached fn {:#x} in crate `{}` (symbol {}; row {row}/{reached}, {compiled} compiled, {cached} cached) may not be built: {why} (engine_export.rs)",
                 function.0,
                 krate.as_str(),
                 Hex(symbol)
             ),
-            ExportCliError::Walk { symbol, shown } => write!(f, "blaze export: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Lto { shown } => write!(f, "blaze export: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::Special { what, shown } => write!(f, "blaze export: building {what}: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::Store { symbol, shown } => write!(f, "blaze export: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::MissingEntry { symbol } => write!(f, "blaze export: code entry {} missing from store after step (engine_export.rs)", Hex(symbol)),
-            ExportCliError::Decode { symbol, what, shown } => write!(f, "blaze export: decoding {what} {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Position { symbol, shown } => write!(f, "blaze export: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Materialize { symbol, shown } => write!(f, "blaze export: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
-            ExportCliError::Export(error) => write!(f, "blaze export: {error}"),
-            ExportCliError::BadOutputPath { path, why } => write!(f, "blaze export: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
-            ExportCliError::OutputHome(error) => write!(f, "blaze export: output directory: {error} (engine_export.rs)"),
-            ExportCliError::OutputPath(error) => write!(f, "blaze export: output path: {error} (engine_export.rs)"),
-            ExportCliError::WriteOutput(error) => write!(f, "blaze export: writing executable: {error} (engine_export.rs)"),
+            ExportCliError::Walk { symbol, shown } => write!(f, "blaze build: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Lto { shown } => write!(f, "blaze build: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::Special { what, shown } => write!(f, "blaze build: building {what}: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::Store { symbol, shown } => write!(f, "blaze build: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::MissingEntry { symbol } => write!(f, "blaze build: code entry {} missing from store after step (engine_export.rs)", Hex(symbol)),
+            ExportCliError::Decode { symbol, what, shown } => write!(f, "blaze build: decoding {what} {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Position { symbol, shown } => write!(f, "blaze build: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Materialize { symbol, shown } => write!(f, "blaze build: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Export(error) => write!(f, "blaze build: {error}"),
+            ExportCliError::KeepRoots { class, shown } => write!(f, "blaze build: keeping {class} root failed: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::BadOutputPath { path, why } => write!(f, "blaze build: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
+            ExportCliError::OutputHome(error) => write!(f, "blaze build: output directory: {error} (engine_export.rs)"),
+            ExportCliError::OutputPath(error) => write!(f, "blaze build: output path: {error} (engine_export.rs)"),
+            ExportCliError::WriteOutput(error) => write!(f, "blaze build: writing executable: {error} (engine_export.rs)"),
             #[cfg(unix)]
-            ExportCliError::Chmod { path, errno } => write!(f, "blaze export: chmod 0755 `{}` failed: {errno:?} (engine_export.rs)", path.as_str()),
+            ExportCliError::Chmod { path, errno } => write!(f, "blaze build: chmod 0755 `{}` failed: {errno:?} (engine_export.rs)", path.as_str()),
         }
     }
 }
@@ -632,6 +687,9 @@ fn export_program<'f>(
     let bump = erased.bump();
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
+    // Ensure the store is mapped before reading records: on a warm certificate hit, `engine_check`
+    // skipped pool tasks and never triggered `Store::map_all`.
+    standing.store.map_all(cx)?;
     let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
     let pack_dirs = SyncPackDirs::default();
@@ -661,6 +719,15 @@ fn export_program<'f>(
     let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
     let ids_ns = phases.since(began_ids);
     let ids_line = ids.line(&asked, ids_ns);
+    let cert = crate::engine_start::body_ids_cert(standing.root, standing.scope);
+    let workspace_id = crate::engine_start::workspace_anchor_id(list, alloc);
+    let build_shape = build_program_shape(picked, workspace_id, list.key(at));
+    let ids_table = blaze_cas::Key(crate::run_ids::table_key(cert, standing.toolchain, &standing.tools).0);
+    let today = crate::start_list::Today {
+        certificate: crate::start_list::Certificate::of_answer(&standing),
+        name: crate::start_list::ListName::of(&build_shape),
+        tables: [ids_table, ids_table],
+    };
 
     // `blaze export` produces a release native executable: use `[profile.release]` overflow and
     // panic settings (`OverflowChecks::Off` by default) so hot arithmetic loops compile without
@@ -730,50 +797,53 @@ fn export_program<'f>(
     let root_count = roots.len();
 
     let mut next_row = 0usize;
-    while next_row < walk.len() {
-        let row = next_row;
-        next_row += 1;
-        let tabled = walk.tabled(row);
-        let symbol = walk.symbol(row);
-        let kind = walk.kind(row);
-        let proof = ids.runnable(tabled).map_err(|why| {
-            let krate = crate_of_item(list, tabled, heap.alloc());
-            box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
-        })?;
-        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
-            Ok(one) => match one.stepped {
-                Stepped::Found(key) => {
-                    cached += 1;
-                    outcomes.push(RowOutcome::Keyed(key));
+    {
+        let _walk_span = cx.span("export: walk reachable functions");
+        while next_row < walk.len() {
+            let row = next_row;
+            next_row += 1;
+            let tabled = walk.tabled(row);
+            let symbol = walk.symbol(row);
+            let kind = walk.kind(row);
+            let proof = ids.runnable(tabled).map_err(|why| {
+                let krate = crate_of_item(list, tabled, heap.alloc());
+                box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+            })?;
+            match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+                Ok(one) => match one.stepped {
+                    Stepped::Found(key) => {
+                        cached += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Made(key) => {
+                        compiled += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Unkeyed(_) => {
+                        unkeyed += 1;
+                        let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
+                        copied.extend_from_slice(scratch.made());
+                        outcomes.push(RowOutcome::Unkeyed(copied));
+                    }
+                },
+                Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                    let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {why}");
+                    let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
+                    stubs += 1;
+                    outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
                 }
-                Stepped::Made(key) => {
-                    compiled += 1;
-                    outcomes.push(RowOutcome::Keyed(key));
+                Err(why) => {
+                    return Err(box_err(
+                        ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                        heap,
+                    ));
                 }
-                Stepped::Unkeyed(_) => {
-                    unkeyed += 1;
-                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
-                    copied.extend_from_slice(scratch.made());
-                    outcomes.push(RowOutcome::Unkeyed(copied));
-                }
-            },
-            Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
-                let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
-                let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
-                stubs += 1;
-                outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
-            }
-            Err(why) => {
-                return Err(box_err(
-                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                    heap,
-                ));
             }
         }
     }
 
     // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
-    // workspace functions and their small inlineable callees (kept ephemeral in `export_bump`,
+    // workspace functions and their non-cold reachable callees (kept ephemeral in `export_bump`,
     // never written into portable `HomeCodeStore`).
     let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
     for (row, outcome) in outcomes.iter().enumerate() {
@@ -785,22 +855,25 @@ fn export_program<'f>(
         }
     }
     let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
-    let lto_out = blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
-        &walk,
-        lto_seeds.as_slice(),
-        |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
-        |tabled| ids.runnable(tabled).ok(),
-        &mut maker,
-        lto_opts,
-        alloc,
-        heap.alloc(),
-    )
-    .map_err(|why| {
-        box_err(
-            ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-            heap,
+    let lto_out = {
+        let _lto_span = cx.span("export: workspace LTO");
+        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+            &walk,
+            lto_seeds.as_slice(),
+            |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
+            |tabled| ids.runnable(tabled).ok(),
+            &mut maker,
+            lto_opts,
+            alloc,
+            heap.alloc(),
         )
-    })?;
+        .map_err(|why| {
+            box_err(
+                ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?
+    };
     let lto_bodies = lto_out.bodies.len();
     let lto_inlined = lto_out.total_inlined;
     let lto_hot_symbols = lto_out.hot_symbols;
@@ -860,42 +933,12 @@ fn export_program<'f>(
             }
         }
     }
-    end_procs(cx, &maker_procs, standing.err, "export")?;
+    end_procs(cx, &maker_procs, standing.err, "build")?;
 
     let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
     phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
     if let Some(why) = seen.refused() {
         return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
-    }
-
-    // Multi-pass bottom-up whole-program LTO inlining:
-    // - Passes 0..2 (`populate_only = true`): collect all small closed 0-call LIR leaves (including
-    //   shared `core` helpers discovered early in BFS like `ptr::add` / `read_unaligned`) and
-    //   fold them into mid-level helpers (`hash7_tagged`, `lookup_x2`, etc.) without emitting code.
-    // - Pass 2 (`populate_only = false`): splice all banked helpers into callers and re-emit SOTA
-    //   AArch64 code records for every caller that spliced >= 1 callee.
-    {
-        let mut lto_buf: AVec<'_, u8> = Vec::new_in(alloc);
-        for pass in 0u8..3 {
-            let populate_only = pass < 2;
-            for row in (0..outcomes.len()).rev() {
-                if walk.kind(row) != RowKind::Instance {
-                    continue;
-                }
-                if matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_) | RowOutcome::Lto { .. })) {
-                    continue;
-                }
-                lto_buf.clear();
-                let sym = walk.symbol(row);
-                let tabled = walk.tabled(row);
-                let name = walk.name(row);
-                if let Ok(true) = maker.make_export_lto(sym, tabled, name, populate_only, &mut lto_buf) {
-                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(lto_buf.len(), alloc);
-                    copied.extend_from_slice(lto_buf.as_slice());
-                    outcomes[row] = RowOutcome::Unkeyed(copied);
-                }
-            }
-        }
     }
 
     // Detect whether any walked row or code record touches Rust thread-locals.
@@ -1145,16 +1188,34 @@ fn export_program<'f>(
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(alloc);
     let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, alloc).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
 
-    // Release immutable borrows of `codes` before persisting toolchain code.
+    // Release immutable borrows of `codes` before restoring any concurrently swept entries and
+    // persisting closing program + toolchain roots (Rule 3: refuse instead of silently dropping).
     drop(functions);
     drop(symbol_names);
     drop(data);
     drop(seen_data);
+    codes.ensure_persisted().map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "program code entries", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    let walked = codes.reached();
     let toolchain_made = codes.toolchain_made();
     drop(codes);
-    if let Err(why) = crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[]) {
-        standing.err.line(cx, format_args!("blaze export: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
-    }
+    let kept_roots = keep_export_roots(lent, &today, builder.toolchain, &walked, &toolchain_made);
+    kept_roots.program.map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "program code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    kept_roots.toolchain.map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "toolchain code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
     Ok(ExportSummary {
@@ -1331,28 +1392,28 @@ fn print_summary(
         (true, true) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} stubs, {} data, {} tls, {} ms)",
+                "built {} ({} bytes, {} functions, {} stubs, {} data, {} tls, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.stubs, summary.data_count, summary.tls_count, wall_ms
             ),
         )?,
         (true, false) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} data, {} tls, {} ms)",
+                "built {} ({} bytes, {} functions, {} data, {} tls, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.data_count, summary.tls_count, wall_ms
             ),
         )?,
         (false, true) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} stubs, {} data, {} ms)",
+                "built {} ({} bytes, {} functions, {} stubs, {} data, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.stubs, summary.data_count, wall_ms
             ),
         )?,
         (false, false) => out.line(
             cx,
             format_args!(
-                "exported {} ({} bytes, {} functions, {} data, {} ms)",
+                "built {} ({} bytes, {} functions, {} data, {} ms)",
                 summary.output, summary.exported.len, summary.exported.functions, summary.data_count, wall_ms
             ),
         )?,
@@ -1362,12 +1423,12 @@ fn print_summary(
         let mut report = String::new_in(erased.handle());
         let _ = summary.exported.report(&mut report);
         for line in report.as_str().lines() {
-            err.line(cx, format_args!("export: {line}"))?;
+            err.line(cx, format_args!("build: {line}"))?;
         }
         err.line(
             cx,
             format_args!(
-                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} hot={} bytes={} wall={}ms",
+                "build stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} hot={} bytes={} wall={}ms",
                 summary.exported.functions,
                 summary.exported.folded,
                 summary.stubs,
@@ -1520,5 +1581,173 @@ mod tests {
         with_tls.seal().expect("seal").encode(&mut tls_bytes);
         let tls_view = CodeView::read(tls_bytes.as_slice()).expect("read");
         assert!(code_touches_tls(&tls_view, getter, desc));
+    }
+
+    #[test]
+    fn build_program_shape_is_disjoint_from_run_and_across_workspaces() {
+        let app_a = run_package::Program {
+            package: "app",
+            bin: "app",
+            manifest: "Cargo.toml",
+            root: "src/main.rs",
+            edition: "2024",
+        };
+        let app_b = run_package::Program {
+            package: "app-b",
+            bin: "app-b",
+            manifest: "Cargo.toml",
+            root: "src/main.rs",
+            edition: "2024",
+        };
+        let ws_1 = Some(blaze_ids::ContentId::of("ws test", b"workspace-1"));
+        let ws_2 = Some(blaze_ids::ContentId::of("ws test", b"workspace-2"));
+        let crate_1 = blaze_id::CrateItemKey(blaze_ids::ContentId::of("crate test", b"crate-1"));
+        let crate_2 = blaze_id::CrateItemKey(blaze_ids::ContentId::of("crate test", b"crate-2"));
+
+        let run_shape = blaze_ids::ContentId::of("blaze run: the start list of a program 1", app_a.root.as_bytes());
+        assert_ne!(build_program_shape(&app_a, ws_1, crate_1), run_shape, "blaze build root must not overwrite blaze run root");
+        assert_ne!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_a, ws_2, crate_1),
+            "unrelated workspaces with identical package/bin/root must not clobber each other"
+        );
+        assert_ne!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_a, ws_1, crate_2),
+            "unrelated single-crate projects with different crate identity must not collide"
+        );
+        assert_ne!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_b, ws_1, crate_1),
+            "distinct packages with src/main.rs must not collide"
+        );
+        assert_eq!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_a, ws_1, crate_1),
+            "same program across worktrees shares one root"
+        );
+    }
+
+    #[test]
+    fn export_keep_program_roots_non_toolchain_code_across_gc_and_control_sweeps_it() {
+        use core::time::Duration;
+        use blaze_cas::Key as CasKey;
+        use blaze_cas::plain::{GRACE_NS, LEASE_NS, Liveness, Settings as StoreSettings};
+        use blaze_core::FileName;
+        use blaze_core::sim::{Faults, Sim};
+        use blaze_ids::ContentId;
+        use blaze_keyed::kind::{Namespace, ReservedTag};
+        use blaze_ladder::code_records::{CodeClass, CodeStore};
+        use crate::store::plain_place::{Facts, after_answer, config, open, test_cx};
+
+        let run_history = |root_program: bool| -> (usize, usize, bool) {
+            let alloc = blaze_own::testing::heap().alloc();
+            let open_proc = |sim: Sim, nonce: u64| {
+                let mut cfg = config(FileName::new("store").expect("dir"), &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+                cfg.liveness = Liveness::Reached;
+                open(sim, cfg, alloc).expect("open store")
+            };
+            let code_key = |tag: &'static str, n: u32| CodeKey(ContentId::of(tag, &n.to_le_bytes()));
+            let payload = |n: u32| -> std::vec::Vec<u8> {
+                (0..4096).map(|i| ((n as usize).wrapping_mul(131).wrapping_add(i) & 0xff) as u8).collect()
+            };
+            let content_key = |bytes: &[u8]| CodeKey(ContentId::of("export gc test content", bytes));
+
+            let picked = run_package::Program {
+                package: "tieline-registryd",
+                bin: "tieline-registryd",
+                manifest: "crates/tieline-registryd/Cargo.toml",
+                root: "crates/tieline-registryd/src/main.rs",
+                edition: "2024",
+            };
+            let ws_id = Some(ContentId::of("export gc test ws", b"tieline"));
+            let crate_key = blaze_id::CrateItemKey(ContentId::of("export gc test crate", b"tieline-registryd"));
+            let ids_table = CasKey(ContentId::of("export gc test run_ids", b"table"));
+            let today = crate::start_list::Today {
+                certificate: crate::start_list::Certificate::for_tests([0x42; 32]),
+                name: crate::start_list::ListName::of(&build_program_shape(&picked, ws_id, crate_key)),
+                tables: [ids_table, ids_table],
+            };
+
+            let sim = Sim::new(77, Faults::default());
+            let lent = open_proc(sim, 1);
+            lent.put(&ids_table, Namespace::LOCAL, ReservedTag::Drive.tag(), b"run-ids-table-bytes").expect("put ids table");
+            let mut codes = HomeCodeStore::new(&lent);
+            for i in 0..8u32 {
+                let bytes = payload(i);
+                let ck = content_key(&bytes);
+                codes.put(CodeClass::Program, ck, &bytes).expect("put prog");
+                codes.point(CodeClass::Program, code_key("export prog key", i), ck).expect("point prog");
+            }
+            for i in 100..104u32 {
+                let bytes = payload(i);
+                let ck = content_key(&bytes);
+                codes.put(CodeClass::Toolchain, ck, &bytes).expect("put tool");
+                codes.point(CodeClass::Toolchain, code_key("export tool key", i), ck).expect("point tool");
+            }
+            let walked = codes.reached();
+            let tool_made = codes.toolchain_made();
+            drop(codes);
+            if root_program {
+                let kept = keep_export_roots(&lent, &today, blaze_toolchain::PINNED, &walked, &tool_made);
+                kept.program.expect("program root");
+                kept.toolchain.expect("toolchain root");
+            } else {
+                // Control (rule 23): pre-fix behavior that only called `keep_toolchain`.
+                crate::store::roots::keep_toolchain(&lent, blaze_toolchain::PINNED, &tool_made, &[]).expect("toolchain root");
+            }
+            after_answer(&test_cx(), &lent, 0).expect("commit export");
+            let mut sim = lent.into_store().into_driver();
+
+            // Run GC compaction slices past lease + grace.
+            sim.advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)) + Duration::from_secs(60));
+            let gc = open_proc(sim, 2);
+            let _ = gc.compact_foreground(32).expect("gc compact");
+            let mut sim = gc.into_store().into_driver();
+            sim.advance(Duration::from_nanos(GRACE_NS) + Duration::from_secs(60));
+            let gc2 = open_proc(sim, 3);
+            let _ = gc2.compact_foreground(32).expect("gc2 compact");
+            let sim = gc2.into_store().into_driver();
+
+            // Next `blaze build` probes all entries and the RunIds table.
+            let verify = open_proc(sim, 4);
+            let codes = HomeCodeStore::new(&verify);
+            let mut prog_hits = 0usize;
+            for i in 0..8u32 {
+                if entry_of(&codes, code_key("export prog key", i)).expect("read prog") == Some(payload(i).as_slice()) {
+                    prog_hits += 1;
+                }
+            }
+            let mut tool_hits = 0usize;
+            for i in 100..104u32 {
+                if entry_of(&codes, code_key("export tool key", i)).expect("read tool") == Some(payload(i).as_slice()) {
+                    tool_hits += 1;
+                }
+            }
+            let has_ids_table = verify.get(&ids_table).expect("read ids table").is_some();
+            (prog_hits, tool_hits, has_ids_table)
+        };
+
+        let (prog_hits, tool_hits, has_ids_table) = run_history(true);
+        assert_eq!(prog_hits, 8, "keep_export_roots must keep all 8 non-toolchain program code entries across GC");
+        assert_eq!(tool_hits, 4, "keep_export_roots must keep all 4 toolchain entries across GC");
+        assert!(has_ids_table, "keep_export_roots must keep the RunIds table across GC");
+
+        let (ctrl_prog, ctrl_tool, ctrl_ids) = run_history(false);
+        assert_eq!(ctrl_prog, 0, "control without keep_program must sweep all unrooted program code entries");
+        assert_eq!(ctrl_tool, 4, "control still keeps toolchain entries");
+        assert!(!ctrl_ids, "control without keep_program must sweep the unrooted RunIds table");
+    }
+
+    #[test]
+    fn keep_roots_error_formats_class_and_cause() {
+        let heap = blaze_own::testing::heap();
+        let err = ExportCliError::KeepRoots {
+            class: "program code",
+            shown: owned_str("disk full", heap.alloc()),
+        };
+        let msg = std::format!("{err}");
+        assert!(msg.contains("keeping program code root failed"), "{msg}");
+        assert!(msg.contains("disk full"), "{msg}");
     }
 }

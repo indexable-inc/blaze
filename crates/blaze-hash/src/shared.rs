@@ -45,9 +45,11 @@ pub const SHARED_BATCH: usize = 32;
 mod tests;
 
 /// How many shards a table has: a power of two, fixed so that a table is laid out the same on
-/// every machine; 64 keeps two writers on one shard rare at 128 threads, and an empty table at
-/// 64 lines.
-pub const SHARDS: usize = 64;
+/// every machine; 256 (top 8 bits of the 64-bit hash) keeps writer contention rare on 128-core
+/// machines, with each shard on its own 128-byte cache line.
+pub const SHARDS: usize = 256;
+
+const _: () = assert!(SHARDS.is_power_of_two() && SHARDS >= 2);
 
 /// Retired values a shard holds before a write asks which may be freed: the ask scans every
 /// thread's epoch slot, so it is made once per this many retirements, not per write.
@@ -233,31 +235,54 @@ impl<K, V, A: Allocator> Table<K, V, A> {
     }
 }
 
+/// Batch stride for folding per-shard insert/remove deltas into [`Map::approx_len`]: amortizes
+/// the global approximate counter 16x while bounding drift to `< SHARDS * APPROX_FLUSH`.
+const APPROX_FLUSH: isize = 16;
+const APPROX_FLUSH_USIZE: usize = 16;
+
+/// 128-byte cache-line padded wrapper (rule 86) isolating hot readers, counters, and shard locks.
+#[repr(align(128))]
+struct Padded<T>(T);
+
+const _: () = assert!(align_of::<Padded<AtomicUsize>>() == 128);
+
 /// A shard's writer state, behind its lock.
 struct Writer {
     /// Slots that are not empty: entries and tombstones.
     used: usize,
+    /// Unflushed insert (`+1`) / remove (`-1`) delta not yet folded into [`Map::approx_len`].
+    pending_delta: isize,
     /// What writes unlinked: entries and tables, freed once no reader can hold them.
     limbo: Limbo,
 }
 
-/// One part of a table, by the top bits of the hash, on lines of its own.
-#[repr(align(128))]
-struct Shard<K, V, A: Allocator, L: ShardLock> {
-    table: AtomicPtr<Table<K, V, A>>,
-    len: AtomicUsize,
+/// Writer-only fields of a shard, isolated onto their own 128-byte cache line away from `table`
+/// (read-mostly) and `len` (scanned by `Map::len`).
+struct WriterLine<L: ShardLock> {
     /// How many values `limbo` holds, read before the lock to skip the scan of a collect.
     held: AtomicUsize,
     writer: L::Lock<Writer>,
+}
+
+/// One part of a table, by the top bits of the hash, with read-mostly `table`, `len`, and
+/// `writer_line` separated onto distinct 128-byte cache lines so lock-free readers and `Map::len`
+/// never false-share with concurrent shard writers on 128-core hosts.
+#[repr(C, align(128))]
+struct Shard<K, V, A: Allocator, L: ShardLock> {
+    table: AtomicPtr<Table<K, V, A>>,
+    len: Padded<AtomicUsize>,
+    writer_line: Padded<WriterLine<L>>,
 }
 
 impl<K, V, A: Allocator, L: ShardLock> Shard<K, V, A, L> {
     fn new(name: &'static str) -> Shard<K, V, A, L> {
         Shard {
             table: AtomicPtr::new(ptr::null_mut()),
-            len: AtomicUsize::new(0),
-            held: AtomicUsize::new(0),
-            writer: L::new(name, Writer { used: 0, limbo: Limbo::new() }),
+            len: Padded(AtomicUsize::new(0)),
+            writer_line: Padded(WriterLine {
+                held: AtomicUsize::new(0),
+                writer: L::new(name, Writer { used: 0, pending_delta: 0, limbo: Limbo::new() }),
+            }),
         }
     }
 
@@ -271,6 +296,40 @@ impl<K, V, A: Allocator, L: ShardLock> Shard<K, V, A, L> {
     }
 }
 
+/// Folds one shard insert into `approx_len` every [`APPROX_FLUSH`] inserts.
+#[inline]
+fn note_insert(approx_len: &AtomicUsize, writer: &mut Writer) {
+    writer.pending_delta += 1;
+    if writer.pending_delta >= APPROX_FLUSH {
+        approx_len.fetch_add(APPROX_FLUSH_USIZE, Ordering::Relaxed);
+        writer.pending_delta -= APPROX_FLUSH;
+    }
+}
+
+/// Folds one shard removal into `approx_len` every [`APPROX_FLUSH`] removals.
+#[inline]
+fn note_remove(approx_len: &AtomicUsize, writer: &mut Writer) {
+    writer.pending_delta -= 1;
+    if writer.pending_delta <= -APPROX_FLUSH {
+        approx_len.fetch_sub(APPROX_FLUSH_USIZE, Ordering::Relaxed);
+        writer.pending_delta += APPROX_FLUSH;
+    }
+}
+
+/// Removes a cleared shard's exact previously-contributed share from `approx_len`.
+#[inline]
+fn note_clear(approx_len: &AtomicUsize, writer: &mut Writer, old_len: usize) {
+    let contributed = if writer.pending_delta >= 0 {
+        old_len.saturating_sub(usize::try_from(writer.pending_delta).unwrap_or(0))
+    } else {
+        old_len.saturating_add(usize::try_from(writer.pending_delta.unsigned_abs()).unwrap_or(0))
+    };
+    if contributed > 0 {
+        approx_len.fetch_sub(contributed, Ordering::Relaxed);
+    }
+    writer.pending_delta = 0;
+}
+
 /// A table shared between threads; see the module docs. Made by [`Map::new`] from a
 /// [`MapOpts`] (D126; the hasher is named as a value, D125), in the allocator the caller passes:
 /// the shards, every table and
@@ -279,6 +338,7 @@ impl<K, V, A: Allocator, L: ShardLock> Shard<K, V, A, L> {
 /// (`Send + Sync + 'static` for a write): the global heap, or a region kept for the run.
 pub struct Map<K, V, S, A: Allocator + Clone, L: ShardLock> {
     shards: Box<[Shard<K, V, A, L>], A>,
+    approx_len: Padded<AtomicUsize>,
     hasher: S,
     alloc: A,
     _owns: PhantomData<Box<Entry<K, V>, A>>,
@@ -331,6 +391,7 @@ impl<K, V, S, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
         shards.resize_with(SHARDS, || Shard::new(opts.name));
         let map = Map {
             shards: shards.into_boxed_slice(),
+            approx_len: Padded(AtomicUsize::new(0)),
             hasher: opts.hasher,
             alloc: opts.alloc,
             _owns: PhantomData,
@@ -379,9 +440,34 @@ impl<K, V, S, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
         Pinned { map: self, _task: blaze_reclaim::enter() }
     }
 
-    /// How many entries it holds: a sum of the shards' counts, each read on its own.
+    /// How many entries it holds: a sum of the shards' counts, each read from its own
+    /// 128-byte line isolated from its writer mutex.
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|shard| shard.len.load(Ordering::Relaxed)).sum()
+        self.shards.iter().map(|shard| shard.len.0.load(Ordering::Relaxed)).sum()
+    }
+
+    /// O(1) approximate entry count (1 relaxed load, updated in batches of 16 per shard so
+    /// writers touch no shared counter on 15/16 ops; bounded within `SHARDS * 15` of [`Map::len`]).
+    #[inline]
+    pub fn approx_len(&self) -> usize {
+        self.approx_len.0.load(Ordering::Relaxed)
+    }
+
+    /// O(1) per-shard cap check: returns `true` when `key`'s shard already holds at least its
+    /// fair share (`total_cap.div_ceil(SHARDS)`) of `total_cap`, enforcing caps like `MOST_CELLS`
+    /// or `MOST_LISTINGS` in 1 cache line instead of scanning all 256 shards.
+    #[inline]
+    pub fn shard_len_exceeds<Q: ?Sized>(&self, key: &Q, total_cap: usize) -> bool
+    where
+        S: KeyHash<Q>,
+    {
+        if total_cap == 0 {
+            return true;
+        }
+        let hash = <S as KeyHash<Q>>::hash_key(&self.hasher, key);
+        let idx = usize::try_from(hash >> (u64::BITS - SHARDS.trailing_zeros())).unwrap_or(0);
+        let shard_len = self.shards.get(idx).map_or(0, |shard| shard.len.0.load(Ordering::Relaxed));
+        shard_len >= total_cap.div_ceil(SHARDS)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -447,6 +533,21 @@ impl<V: fmt::Debug> fmt::Debug for OccupiedError<'_, V> {
 impl<K, V, S, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, S, A, L> {
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// O(1) approximate entry count ([`Map::approx_len`]).
+    #[inline]
+    pub fn approx_len(&self) -> usize {
+        self.map.approx_len()
+    }
+
+    /// O(1) per-shard cap check ([`Map::shard_len_exceeds`]).
+    #[inline]
+    pub fn shard_len_exceeds<Q: ?Sized>(&self, key: &Q, total_cap: usize) -> bool
+    where
+        S: KeyHash<Q>,
+    {
+        self.map.shard_len_exceeds(key, total_cap)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -725,7 +826,8 @@ impl<K: Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: KeyHash<K>, A: 
                         let held = unsafe { &*entry };
                         if !keep(&held.key, &held.value) {
                             slot.store(tombstone(), Ordering::Release);
-                            shard.len.fetch_sub(1, Ordering::Relaxed);
+                            shard.len.0.fetch_sub(1, Ordering::Relaxed);
+                            note_remove(&self.map.approx_len.0, &mut writer);
                             retire_entry(shard, &mut writer, &self.map.alloc, entry, NoPlant);
                         }
                     }
@@ -752,7 +854,8 @@ impl<K: Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: KeyHash<K>, A: 
                     retire_entry(shard, &mut writer, &self.map.alloc, entry, NoPlant);
                 }
             }
-            shard.len.store(0, Ordering::Relaxed);
+            let old_len = shard.len.0.swap(0, Ordering::Relaxed);
+            note_clear(&self.map.approx_len.0, &mut writer, old_len);
             writer.used = 0;
             retire_table(shard, &mut writer, &self.map.alloc, table);
         }
@@ -761,7 +864,7 @@ impl<K: Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: KeyHash<K>, A: 
     /// The scan of every thread's epoch slot, taken before the lock (`blaze_reclaim::scans`),
     /// when the shard holds enough retired values to free.
     fn horizon(&self, shard: &Shard<K, V, A, L>) -> Option<Horizon> {
-        (shard.held.load(Ordering::Relaxed) >= COLLECT_AT).then(Horizon::now)
+        (shard.writer_line.0.held.load(Ordering::Relaxed) >= COLLECT_AT).then(Horizon::now)
     }
 
     fn remove_where<Q: ?Sized + Equivalent<K>>(
@@ -793,7 +896,8 @@ impl<K: Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: KeyHash<K>, A: 
                     let held: &Entry<K, V> = unsafe { &*entry };
                     if should(&held.key, &held.value) {
                         table.slots[at].store(tombstone(), Ordering::Release);
-                        shard.len.fetch_sub(1, Ordering::Relaxed);
+                        shard.len.0.fetch_sub(1, Ordering::Relaxed);
+                        note_remove(&self.map.approx_len.0, &mut writer);
                         retire_entry(shard, &mut writer, &self.map.alloc, entry, NoPlant);
                         Ok(Some((&held.key, &held.value)))
                     } else {
@@ -848,7 +952,8 @@ impl<K: Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: KeyHash<K>, A: 
                     if old.is_null() {
                         writer.used += 1;
                     }
-                    shard.len.fetch_add(1, Ordering::Relaxed);
+                    shard.len.0.fetch_add(1, Ordering::Relaxed);
+                    note_insert(&self.map.approx_len.0, &mut writer);
                     Wrote::Inserted(fresh_ref)
                 }
             };
@@ -872,7 +977,7 @@ impl<K: Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: KeyHash<K>, A: 
 /// writer changes a slot with one store, after anything that can panic), so a family that
 /// poisons takes a poisoned lock as it is.
 fn lock<K, V, A: Allocator, L: ShardLock>(shard: &Shard<K, V, A, L>) -> L::Guard<'_, Writer> {
-    L::lock(&shard.writer)
+    L::lock(&shard.writer_line.0.writer)
 }
 
 /// Under the lock: the current table, made or grown in `alloc` so that one more slot can be used.
@@ -888,7 +993,7 @@ fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + C
     if (writer.used + 1) * 4 <= capacity * 3 {
         return table.expect("a table with room");
     }
-    let len = shard.len.load(Ordering::Relaxed);
+    let len = shard.len.0.load(Ordering::Relaxed);
     let grown = Table::new(((len + 1) * 2).next_power_of_two().max(SMALLEST), alloc.clone());
     if let Some(table) = table {
         for slot in &*table.slots {
@@ -935,7 +1040,7 @@ fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator
         return;
     }
     writer.limbo.retire(entry);
-    shard.held.fetch_add(1, Ordering::Relaxed);
+    shard.writer_line.0.held.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Under the lock: `table`, unlinked just now, held until no reader can be in it. Its slots are
@@ -949,14 +1054,14 @@ fn retire_table<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator
     // SAFETY: unlinked under the lock, by this writer alone; boxed in the map's allocator.
     let table = unsafe { Box::from_raw_in(table, alloc.clone()) };
     writer.limbo.retire(table);
-    shard.held.fetch_add(1, Ordering::Relaxed);
+    shard.writer_line.0.held.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Under the lock: what passed its grace by `horizon`, taken out to be dropped once the lock is
 /// let go.
 fn collect<K, V, A: Allocator, L: ShardLock>(shard: &Shard<K, V, A, L>, writer: &mut Writer, horizon: Horizon) -> blaze_reclaim::Passed {
     let passed = writer.limbo.collect_passed(horizon);
-    shard.held.store(writer.limbo.len(), Ordering::Relaxed);
+    shard.writer_line.0.held.store(writer.limbo.len(), Ordering::Relaxed);
     passed
 }
 
@@ -1017,6 +1122,19 @@ impl<K, S, A: Allocator + Clone, L: ShardLock> Set<K, S, A, L> {
         self.0.len()
     }
 
+    #[inline]
+    pub fn approx_len(&self) -> usize {
+        self.0.approx_len()
+    }
+
+    #[inline]
+    pub fn shard_len_exceeds<Q: ?Sized>(&self, key: &Q, total_cap: usize) -> bool
+    where
+        S: KeyHash<Q>,
+    {
+        self.0.shard_len_exceeds(key, total_cap)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -1035,6 +1153,19 @@ pub struct PinnedSet<'m, K, S, A: Allocator + Clone, L: ShardLock>(Pinned<'m, K,
 impl<K, S, A: Allocator + Clone, L: ShardLock> PinnedSet<'_, K, S, A, L> {
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    #[inline]
+    pub fn approx_len(&self) -> usize {
+        self.0.approx_len()
+    }
+
+    #[inline]
+    pub fn shard_len_exceeds<Q: ?Sized>(&self, key: &Q, total_cap: usize) -> bool
+    where
+        S: KeyHash<Q>,
+    {
+        self.0.shard_len_exceeds(key, total_cap)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1110,5 +1241,93 @@ impl<K: Eq + Send + Sync + 'static, S: KeyHash<K>, A: Allocator + Clone + Send +
 
     pub fn clear(&self) {
         self.0.clear();
+    }
+}
+
+#[cfg(all(test, not(blaze_check)))]
+mod cap_tests {
+    use core::mem::offset_of;
+
+    use blaze_own::Alloc;
+
+    use super::{APPROX_FLUSH_USIZE, Map, MapOpts, SHARDS, Set, SetOpts, Shard, tests::TestLock};
+    use crate::FixedState;
+
+    #[test]
+    fn shard_isolates_table_len_and_writer_on_distinct_128b_lines() {
+        type S = Shard<u64, u64, Alloc<'static>, TestLock>;
+        assert_eq!(align_of::<S>(), 128);
+        assert!(offset_of!(S, len) >= 128, "len must be padded away from table");
+        assert!(offset_of!(S, writer_line) >= 256, "writer must be padded away from len");
+        assert_eq!(offset_of!(S, len) % 128, 0);
+        assert_eq!(offset_of!(S, writer_line) % 128, 0);
+    }
+
+    #[test]
+    fn fast_cap_check_and_approx_len_track_inserts_removes_retain_and_clear() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let map: Map<u64, u64, FixedState, Alloc<'static>, TestLock> = Map::new(MapOpts {
+            name: "test.fast_cap",
+            hasher: FixedState,
+            alloc,
+            capacity: None,
+        });
+        let set: Set<u64, FixedState, Alloc<'static>, TestLock> = Set::new(SetOpts {
+            name: "test.fast_cap_set",
+            hasher: FixedState,
+            alloc,
+            capacity: None,
+        });
+        let pin = map.pin();
+        let set_pin = set.pin();
+
+        assert!(pin.shard_len_exceeds(&0u64, 0));
+        assert!(!pin.shard_len_exceeds(&0u64, 1024));
+        assert_eq!(pin.approx_len(), 0);
+
+        const TOTAL: u64 = 16_384;
+        for k in 0..TOTAL {
+            pin.insert(k, k * 3);
+            set_pin.insert(k);
+        }
+        assert_eq!(pin.len(), usize::try_from(TOTAL).unwrap_or(0));
+        assert_eq!(set_pin.len(), usize::try_from(TOTAL).unwrap_or(0));
+
+        let max_drift = SHARDS * APPROX_FLUSH_USIZE;
+        let approx = pin.approx_len();
+        assert!(
+            approx.abs_diff(pin.len()) <= max_drift,
+            "approx_len {approx} drifted from exact {} past {max_drift}",
+            pin.len()
+        );
+        assert!(
+            set_pin.approx_len().abs_diff(set_pin.len()) <= max_drift,
+            "set approx_len drifted past {max_drift}"
+        );
+
+        // Average per shard is 16384 / 256 = 64 entries: cap 8192 (32/shard) should exceed,
+        // cap 1_048_576 (4096/shard) must not exceed.
+        let mut exceeded_low = 0usize;
+        for k in 0..256u64 {
+            if pin.shard_len_exceeds(&k, 8_192) {
+                exceeded_low += 1;
+            }
+            assert!(!pin.shard_len_exceeds(&k, 1 << 20), "cap 1M should not exceed on 16k keys");
+            assert!(!set_pin.shard_len_exceeds(&k, 1 << 20));
+        }
+        assert!(exceeded_low > 200, "most keys should exceed low cap 8192 (got {exceeded_low}/256)");
+
+        // Remove half via remove(), half of rest via retain(), then clear(): approx_len never underflows.
+        for k in (0..TOTAL).step_by(2) {
+            pin.remove(&k);
+        }
+        assert!(pin.approx_len().abs_diff(pin.len()) <= max_drift);
+
+        pin.retain(|k, _| k % 4 == 1);
+        assert!(pin.approx_len().abs_diff(pin.len()) <= max_drift);
+
+        pin.clear();
+        assert_eq!(pin.len(), 0);
+        assert_eq!(pin.approx_len(), 0, "clear must reset approx_len to exact 0");
     }
 }

@@ -54,7 +54,7 @@ use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared,
 use crate::front2::const_at::{ConstNeed, ConstTable, Needs};
 use crate::front2::coroutines::Coroutines;
 use crate::front2::program::lazy::LazyRefusal;
-use super::lay_states::{LaidOnly, Lay, forget_laid_in, lay_and_build, lay_only, roots_of_instance, unchecked_owner};
+use super::lay_states::{LaidOnly, Lay, forget_laid_in, lay_and_build_one, lay_only, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
 
 /// Whole-program demand-driven cross-function LIR inlining and LTO for `blaze export`.
@@ -477,9 +477,11 @@ struct Work {
     /// Whether a made instance touched a thread-local: the program then needs the getter's
     /// and ender's records (code_records.rs `RecordRun::getter`/`ender`).
     thread_locals: bool,
-    /// The program's compiler_builtins soft-float routines as instances, found once a run
-    /// (front2/builtins_shim.rs): every instance's emitter gets their places.
-    routines: crate::front2::builtins_shim::Bound,
+    /// The program's compiler_builtins soft-float routines as instances, found lazily on the
+    /// first function whose LIR actually mentions an `f16`/`f128` value (or on explicit
+    /// `Maker::bind_routines` for LTO export) so typical programs never open `compiler_builtins`
+    /// or walk `names.linked(roots)` during [`MakerState::new`].
+    routines: core::cell::OnceCell<crate::front2::builtins_shim::Bound>,
     /// The clock a make is timed on ([`MakeWatch::clock`]); `None`: no make is timed or
     /// reported.
     clock: Option<blaze_core::wait::Monotonic>,
@@ -500,18 +502,6 @@ struct Work {
     /// `adt_drop_impl`, `resolve`) keyed by interned IDs in `self.ground`. Sits below `Recorded` /
     /// `Asking` so every build's `ReadLog` is unchanged.
     query_cache: core::cell::RefCell<QueryCache>,
-    /// Whole-program bottom-up export LTO mode: builds small closed callees into `inline_bank`
-    /// and splices them into callers via `blaze_lir::inline::inline_guided` before SOTA emission.
-    export_lto: bool,
-    export_lto_populate_only: bool,
-    export_lto_symbol: Option<blaze_code::record::Symbol>,
-    export_lto_inlined: bool,
-    inline_bank: blaze_hash::Map<
-        blaze_code::record::Symbol,
-        blaze_lir::func::Func<Global>,
-        blaze_hash::FixedState,
-        Global,
-    >,
 }
 
 /// Compact stack-inline argument list key for [`QueryCache::normalize`] (99%+ of projections have
@@ -619,6 +609,33 @@ fn tables_gone(key: ItemKey) -> RunError {
     RunError::OneBody { key, why: "the maker's tables were left taken by an earlier failed step (make_one.rs `MakerState::tables`)" }
 }
 
+/// Whether `view` mentions any `f16` or `f128` scalar, vector, compound member, or signature
+/// parameter whose legalization can call a `compiler_builtins` [`blaze_lir::legalize::SoftFloat`]
+/// routine.
+fn func_needs_soft_float(view: &blaze_lir::View<'_>) -> bool {
+    use blaze_lir::ty::{Scalar, Ty};
+    let is_soft = |bits: u16| matches!(Ty(bits).elem(), Scalar::F16 | Scalar::F128);
+    view.tys.iter().any(|&bits| is_soft(bits))
+        || view.compound_tys.iter().any(|&bits| is_soft(bits))
+        || view.sig_params.iter().any(|p| is_soft(p.ty))
+}
+
+/// Lazily binds `program.soft_float_routines` into `slot` on first demand, returning a borrow
+/// tied only to `slot` so callers may still mutably borrow sibling fields of [`Work`].
+fn get_or_init_routines<'r, P: FrontEnd>(
+    slot: &'r core::cell::OnceCell<crate::front2::builtins_shim::Bound>,
+    program: &P,
+    ground: &PortableTys<'_>,
+    alloc: Alloc<'static>,
+) -> Result<&'r crate::front2::builtins_shim::Bound, crate::symbols::SymbolError> {
+    if let Some(bound) = slot.get() {
+        return Ok(bound);
+    }
+    let bound = crate::front2::builtins_shim::Bound::new(program.soft_float_routines(alloc), ground, alloc)?;
+    let _ = slot.set(bound);
+    slot.get().ok_or(crate::symbols::SymbolError::NotGround { what: "soft-float routines slot not initialized" })
+}
+
 impl MakerState {
     /// Build a static datum or TLS template using the same ground names as code entries.
     pub fn static_entry<P: FrontEnd>(
@@ -686,10 +703,6 @@ impl MakerState {
             const_at: ConstTable::new_in(Global),
         };
         let ground = PortableTys::new_in(alloc);
-        let routines = crate::front2::builtins_shim::Bound::new(program.soft_float_routines(alloc), &ground, alloc).map_err(|_| RunError::OneBody {
-            key: first,
-            why: "a compiler_builtins soft-float routine's instance name did not encode (front2/builtins_shim.rs `Bound::new`)",
-        })?;
         let work = Work {
             alloc,
             isa,
@@ -702,22 +715,13 @@ impl MakerState {
             stash: Vec::new_in(Global),
             needs: Needs::new_in(Global),
             thread_locals: false,
-            routines,
+            routines: core::cell::OnceCell::new(),
             clock: None,
             times: MakeTimes::default(),
             reported: None,
             reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
-            export_lto: false,
-            export_lto_populate_only: false,
-            export_lto_symbol: None,
-            export_lto_inlined: false,
-            inline_bank: blaze_hash::Map::new(blaze_hash::MapOpts {
-                hasher: blaze_hash::FixedState,
-                alloc: Global,
-                capacity: None,
-            }),
         };
         Ok(MakerState { asked: blaze_own::Vec::new_in(alloc), checked: blaze_own::Vec::new_in(alloc), tables: Some(tables), work })
     }
@@ -1302,7 +1306,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
 }
 
 /// What an `asks_again` / `object_missing` retry round stopped on, for [`AskProgress`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum AskKey {
     Question(blaze_typeck::Question),
     Adt(ItemKey),
@@ -1313,7 +1317,7 @@ enum AskKey {
 fn build_error_ask_key(error: &BuildError) -> Option<AskKey> {
     match error {
         BuildError::Select(blaze_typeck::ResolveError::Missing(q)) => Some(AskKey::Question(*q)),
-        BuildError::NoAdt { adt } => Some(AskKey::Adt(*adt)),
+        BuildError::NoAdt { adt } | BuildError::MissingRecord { item: adt } => Some(AskKey::Adt(*adt)),
         _ => None,
     }
 }
@@ -1330,6 +1334,7 @@ fn layout_refusal_ask_key(why: &blaze_build::layout::Refusal) -> Option<AskKey> 
 fn ask_key(e: &RunError) -> Option<AskKey> {
     match e {
         RunError::Build { error, .. } => build_error_ask_key(error).or_else(|| object_missing(e).map(AskKey::Object)),
+        RunError::ItemRefused { error, .. } => build_error_ask_key(error),
         RunError::Resolve { error: blaze_typeck::ResolveError::Missing(q), .. } => Some(AskKey::Question(*q)),
         RunError::NoAdt { adt, .. } => Some(AskKey::Adt(*adt)),
         RunError::Vtable { why: VtableFail::Layout(error), .. } => layout_refusal_ask_key(&error.why),
@@ -1520,7 +1525,8 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     // Any coroutine held by value in a constant need's arguments (e.g. `Box::new(async move { .. })`
     // reading `<{coroutine} as SizedTypeProperties>::LAYOUT`): lay out its state from types first
     // (`lay_only`) so constant evaluation observes the exact same `StateShape` as the build.
-    let mut laid_for_const: AVec<'static, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(work.alloc);
+    // Shapes remain recorded in `bodies.coroutines.states` (the coroutine's own `poll`/`resume`/`drop`
+    // entry always forgets its own shape before `lay_and_build_one`), avoiding redundant re-laying.
     let mut unchecked_coro = None;
     let lay_result = if found.is_ok() && !work.needs.is_empty() {
         let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
@@ -1532,13 +1538,10 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         if need_tys.is_empty() {
             Ok(())
         } else {
-            match crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
+            match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
                 Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
                 Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
-                    Ok(LaidOnly::Done(recorded)) => {
-                        laid_for_const = recorded;
-                        Ok(())
-                    }
+                    Ok(LaidOnly::Done(_)) => Ok(()),
                     Ok(LaidOnly::Unchecked(owner)) => {
                         unchecked_coro = Some(owner);
                         Ok(())
@@ -1569,10 +1572,6 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         &mut table.const_at,
         crate::front2::const_at::BuildFacts::new(&table.closures, &table.coroutines),
     );
-    // Forget states laid solely for constant evaluation so `build_one`'s `lay_and_build` still
-    // builds their functions into `stash` (states already laid & built earlier were not in
-    // `laid_for_const` and remain recorded).
-    forget_laid_in(&table.coroutines, &laid_for_const, work.ground.view());
     if let Err(refusal) = pull_res {
         let item = refusal.need.item();
         let path = program.item_named(item);
@@ -1969,7 +1968,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
                 let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
                 let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
-                let found = crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
+                let found = crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
                 *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
                 found
             };
@@ -2225,7 +2224,12 @@ fn build_lir_phase<P: FrontEnd>(
                 work.stash.swap_remove(at);
             }
             if find(&work.stash[..]).is_none() {
-                match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &[of], true, work.alloc)? {
+                // `of` may already have a types-only `StateShape` in `bodies.coroutines.states`
+                // from an earlier non-coroutine caller (`lay_only`). Forget `of`'s own shape
+                // (preserving already-laid child shapes) so `lay_and_build_one` lays and builds
+                // only `of` itself into `work.stash`.
+                bodies.coroutines.states.forget(of.owner, of.ordinal, &args);
+                match lay_and_build_one(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, of, true, work.alloc)? {
                     Lay::Done => {}
                     Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
                     Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
@@ -2243,13 +2247,18 @@ fn build_lir_phase<P: FrontEnd>(
             Some((at, part.index()))
         }
     };
-    if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() {
-        let roots = roots_of_instance(program, bodies, &adts, i, &args, &mut work.ground, work.alloc)?;
+    if from_coroutine.is_none() {
+        let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && builtin_clone.is_none() && builtin_from.is_none();
+        let extra_args = (instance.args != owner_args).then_some(instance.args);
+        let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, work.alloc)?;
         if !roots.is_empty() {
-            match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, true, work.alloc)? {
-                Lay::Done => {}
-                Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
-                Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
+            // Non-coroutine callers (e.g. `Pin::as_mut`, `DerefMut::deref_mut`, `Box::into_pin`,
+            // `drop_glue`, async callers) only need each referenced coroutine's `StateShape`
+            // (types only), never its LIR — each coroutine builds its own LIR lazily when its
+            // `poll`/`resume`/`drop` entry is actually demanded.
+            match lay_only(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, i, &roots, work.alloc)? {
+                LaidOnly::Done(_) => {}
+                LaidOnly::Unchecked(owner) => return Ok(Phase1::Check(owner)),
             }
         }
     }
@@ -2464,7 +2473,15 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
         }
         BuildSink::Entry(entry) => {
             use blaze_core::wait::Clock as _;
-            let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
+            let routines = if func_needs_soft_float(&built.func.view()) {
+                let bound = get_or_init_routines(&work.routines, program, &work.ground, work.alloc).map_err(|_| RunError::OneBody {
+                    key: instance.item,
+                    why: "a compiler_builtins soft-float routine's instance name did not encode (front2/builtins_shim.rs `Bound::new`)",
+                })?;
+                bound.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?
+            } else {
+                crate::front2::builtins_shim::Routines::NONE
+            };
             let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
             let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
             for n in 0..reach.rows.len() {
@@ -2477,139 +2494,14 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
             }
             let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
             let emitted_from = work.clock.map(|c| c.now());
-            let mut inlined_func: Option<blaze_lir::func::Func<Global>> = None;
-            if work.export_lto && from_coroutine.is_none() {
-                struct ExportInlineBodies<'a, 'b> {
-                    root: blaze_lir::body::BodyId,
-                    root_refs: &'a [blaze_lir::func::RefRec],
-                    funcs: &'a [Callee<'b>],
-                    bank: &'a blaze_hash::Map<
-                        blaze_code::record::Symbol,
-                        blaze_lir::func::Func<Global>,
-                        blaze_hash::FixedState,
-                        Global,
-                    >,
-                }
-                impl blaze_lir::body::Bodies for ExportInlineBodies<'_, '_> {
-                    fn callee(
-                        &self,
-                        from: blaze_lir::body::BodyId,
-                        reference: blaze_lir::func::RefId,
-                    ) -> Option<(blaze_lir::body::BodyId, blaze_lir::View<'_>)> {
-                        if from != self.root {
-                            return None;
-                        }
-                        let r = *self.root_refs.get(usize::try_from(reference.0).ok()?)?;
-                        if r.kind != (blaze_lir::func::RefKind::Func as u32) {
-                            return None;
-                        }
-                        let idx = usize::try_from(r.place).ok()?;
-                        let Callee::Symbol(sym) = *self.funcs.get(idx)? else {
-                            return None;
-                        };
-                        let f = self.bank.get(&sym)?;
-                        Some((blaze_lir::body::BodyId(sym.0), f.view()))
-                    }
-                }
-                let has_bank_callee = funcs.iter().any(|c| match c {
-                    Callee::Symbol(sym) => work.inline_bank.contains_key(sym),
-                    Callee::C(_) => false,
-                });
-                if has_bank_callee {
-                    let root_id = blaze_lir::body::BodyId(
-                        work.export_lto_symbol.map_or([0u8; 32], |s| s.0),
-                    );
-                    let root_view = built.func.verified().view();
-                    let bodies = ExportInlineBodies {
-                        root: root_id,
-                        root_refs: root_view.refs,
-                        funcs: &funcs,
-                        bank: &work.inline_bank,
-                    };
-                    let policy = blaze_lir::inline::InlinePolicy {
-                        cost_threshold: 160,
-                        max_callee_insts: 256,
-                        hot_multiplier: 4,
-                        hot_weight_threshold: 1,
-                        max_depth: 6,
-                        max_growth: 4096,
-                        allow_external_refs: false,
-                        allow_loops: true,
-                    };
-                    if let Ok(guided) = blaze_lir::inline::inline_guided(
-                        built.func.verified().view(),
-                        root_id,
-                        &bodies,
-                        &blaze_lir::inline::NoWeights,
-                        policy,
-                        Global,
-                    ) && !guided.read.is_empty()
-                        && blaze_lir::verify(guided.func.view()).is_ok()
-                    {
-                        work.export_lto_inlined = true;
-                        inlined_func = Some(guided.func);
-                    }
-                }
+            let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
+                .map_err(|error| RunError::CodeRecord { function: name(), error })?;
+            if let (Some(c), Some(from)) = (work.clock, emitted_from) {
+                work.times.emit += c.now().saturating_sub(from);
+                work.times.last = Some(MadeSizes::of(name(), built, &made));
             }
-            let made = if work.export_lto && (work.export_lto_populate_only || !work.export_lto_inlined) {
-                None
-            } else if let Some(ref f) = inlined_func
-                && let Ok(v) = blaze_lir::verify(f.view())
-            {
-                Some(
-                    make_entry_with_vtables(v, &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-                        .map_err(|error| RunError::CodeRecord { function: name(), error })?,
-                )
-            } else {
-                Some(
-                    make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-                        .map_err(|error| RunError::CodeRecord { function: name(), error })?,
-                )
-            };
-            if let Some(ref made) = made {
-                if let (Some(c), Some(from)) = (work.clock, emitted_from) {
-                    work.times.emit += c.now().saturating_sub(from);
-                    work.times.last = Some(MadeSizes::of(name(), built, made));
-                }
-                entry.extend_from_slice(made);
-            }
-            let own = built_slot.take().and_then(|bp| bp.own);
-            if work.export_lto
-                && from_coroutine.is_none()
-                && let Some(sym) = work.export_lto_symbol
-                && own.as_ref().is_some_and(|b| b.statics.is_empty() && b.vtables.is_empty() && b.thread_locals.is_empty())
-            {
-                let shrink_for_bank = |raw: blaze_lir::func::Func<Global>| -> Option<blaze_lir::func::Func<Global>> {
-                    if raw.view().ops.len() > 2048 {
-                        return None;
-                    }
-                    let f1 = blaze_lir::simplify::scalar_replace(raw.view(), Global).unwrap_or(raw);
-                    let f2 = blaze_lir::simplify::propagate(f1.view(), Global).unwrap_or(f1);
-                    let f3 = blaze_lir::simplify::dead(f2.view(), Global).unwrap_or(f2);
-                    let v = f3.view();
-                    let is_leaf = v.ops.len() <= 256
-                        && !v.ops.iter().any(|&o| {
-                            matches!(
-                                blaze_lir::Op::from_byte(o),
-                                Some(blaze_lir::Op::Call | blaze_lir::Op::CallIndirect | blaze_lir::Op::Invoke)
-                            )
-                        });
-                    if is_leaf && blaze_lir::verify(v).is_ok() {
-                        Some(f3)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(f) = inlined_func {
-                    if let Some(shrunk) = shrink_for_bank(f) {
-                        let _ = work.inline_bank.insert(sym, shrunk);
-                    }
-                } else if let Some(b) = own
-                    && let Some(shrunk) = shrink_for_bank(b.func.into_func())
-                {
-                    let _ = work.inline_bank.insert(sym, shrunk);
-                }
-            }
+            entry.extend_from_slice(&made);
+            let _ = built_slot.take();
             if let Some((at, part)) = from_coroutine {
                 work.stash[at].parts[part] = None;
             }
@@ -2636,6 +2528,7 @@ fn build_refusal<P: FrontEnd>(program: &P, function: Named, body: Option<&blaze_
         | BuildError::NoStatic { item: adt, .. }
         | BuildError::NoConstValue { item: adt, .. }
         | BuildError::NoPatConstValue { item: adt, .. }
+        | BuildError::MissingRecord { item: adt }
             if let Some(why) = program.left_out(adt) =>
         {
             return RunError::LeftOut { function, item: adt, path: program.item_named(adt), why: Box::from(why) };
@@ -3241,39 +3134,6 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })))
     }
 
-    /// Bottom-up whole-program export LTO helper: builds `tabled`/`name`, splices any closed
-    /// callees already in `inline_bank` via `blaze_lir::inline::inline_guided`, caches small
-    /// 0-call results into `inline_bank`, and emits a new SOTA code entry into `entry` only when
-    /// at least one callee was inlined. Returns `Ok(true)` iff `entry` was populated.
-    pub fn make_export_lto(
-        &mut self,
-        symbol: blaze_code::record::Symbol,
-        tabled: ItemKey,
-        name: &[u8],
-        populate_only: bool,
-        entry: &mut AVec<'_, u8>,
-    ) -> Result<bool, RunError> {
-        self.construct(tabled)?;
-        let Some((program, state)) = self.made.as_mut() else {
-            return Ok(false);
-        };
-        if populate_only && state.work.inline_bank.contains_key(&symbol) {
-            return Ok(false);
-        }
-        state.work.export_lto = true;
-        state.work.export_lto_populate_only = populate_only;
-        state.work.export_lto_symbol = Some(symbol);
-        state.work.export_lto_inlined = false;
-        let res = make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry);
-        let inlined = !populate_only && state.work.export_lto_inlined && !entry.is_empty();
-        state.work.export_lto = false;
-        state.work.export_lto_populate_only = false;
-        state.work.export_lto_symbol = None;
-        state.work.export_lto_inlined = false;
-        res?;
-        Ok(inlined)
-    }
-
     /// The program made on the first call, then the one instance.
     fn make_over(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.construct(tabled)?;
@@ -3315,7 +3175,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// function references) so host-machine emission can legalize `f128` operations if needed.
     pub fn bind_routines<'m>(&'m self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<crate::front2::builtins_shim::Routines<'m>, CodeRecordError> {
         match self.made.as_ref() {
-            Some((_, state)) => state.work.routines.bind(funcs),
+            Some((program, state)) => {
+                let bound = get_or_init_routines(&state.work.routines, program, &state.work.ground, state.work.alloc)
+                    .map_err(CodeRecordError::Symbol)?;
+                bound.bind(funcs)
+            }
             None => Ok(crate::front2::builtins_shim::Routines::NONE),
         }
     }
@@ -3709,9 +3573,11 @@ pub fn walk_records<M: Make<Error = RunError, Grant = Fixture>>(
 
 #[cfg(test)]
 mod ask_progress_tests {
-    use super::{AskKey, AskProgress};
+    use super::{AskKey, AskProgress, ask_key, build_error_ask_key};
     use crate::front2::check::{MOST_PROGRESS_ROUNDS, MOST_ROUNDS};
-    use blaze_typeck::{ItemKey, Question, Shape};
+    use crate::run::{Named, RunError, asks_again, build_error_asks_again};
+    use blaze_build::BuildError;
+    use blaze_typeck::{ExprId, ItemKey, Question, Shape};
 
     #[test]
     fn ask_progress_allows_forward_progress_and_caps_stuck_loops() {
@@ -3737,5 +3603,65 @@ mod ask_progress_tests {
             total += 1;
         }
         assert_eq!(total, MOST_PROGRESS_ROUNDS, "even distinct keys stop at MOST_PROGRESS_ROUNDS");
+    }
+
+    #[test]
+    fn missing_record_asks_again_and_tracks_adt_ask_key() {
+        let item = ItemKey(0xDEAD_BEEF);
+        let named = || Named { path: "test::f".into(), at: crate::front::At { file: 0, place: 0 } };
+        let missing = BuildError::MissingRecord { item };
+        assert!(build_error_asks_again(&missing));
+        assert_eq!(build_error_ask_key(&missing), Some(AskKey::Adt(item)));
+
+        let as_build = RunError::Build { function: named(), error: BuildError::MissingRecord { item }, range: None };
+        assert!(asks_again(&as_build));
+        assert_eq!(ask_key(&as_build), Some(AskKey::Adt(item)));
+
+        let as_refused = RunError::ItemRefused { function: named(), error: BuildError::MissingRecord { item }, item, path: None };
+        assert!(asks_again(&as_refused));
+        assert_eq!(ask_key(&as_refused), Some(AskKey::Adt(item)));
+
+        let non_retryable = RunError::ItemRefused {
+            function: named(),
+            error: BuildError::NoStatic { expr: ExprId(0), item },
+            item,
+            path: None,
+        };
+        assert!(!asks_again(&non_retryable));
+        assert_eq!(ask_key(&non_retryable), None);
+    }
+
+    #[test]
+    fn func_needs_soft_float_skips_ordinary_lir_and_detects_f16_f128() {
+        use super::func_needs_soft_float;
+        use crate::run::Global;
+        use blaze_lir::builder::{Param, Variadic};
+        use blaze_lir::func::Conv;
+        use blaze_lir::{BlockKind, Builder, Flags, Full, Op, Ty};
+
+        let make_binary = |ty: Ty, op: Op| {
+            let mut b = Builder::<Global, Full>::new_in(64, Global);
+            let p = Param::of(ty);
+            let sig = b.sig(Conv::C, Variadic::No, &[p, p], &[p]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let (x, y) = (b.param(ty), b.param(ty));
+            let res = b.binary(op, Flags::NONE, x, y);
+            b.ret(&[res]);
+            b.finish_checked().expect("valid LIR")
+        };
+
+        let plain_i64 = make_binary(Ty::I64, Op::Add);
+        assert!(!func_needs_soft_float(&plain_i64.view()), "i64 arithmetic must not trigger lazy compiler_builtins lookup");
+
+        let plain_f64 = make_binary(Ty::F64, Op::Fadd);
+        assert!(!func_needs_soft_float(&plain_f64.view()), "f64 arithmetic must not trigger lazy compiler_builtins lookup");
+
+        let quad = make_binary(Ty::F128, Op::Fadd);
+        assert!(func_needs_soft_float(&quad.view()), "f128 arithmetic must trigger lazy compiler_builtins lookup");
+
+        let half = make_binary(Ty::F16, Op::Fadd);
+        assert!(func_needs_soft_float(&half.view()), "f16 arithmetic must trigger lazy compiler_builtins lookup");
     }
 }

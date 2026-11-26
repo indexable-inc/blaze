@@ -157,7 +157,7 @@ use blaze_answer::CellDigest;
 use blaze_drive::cells::Cell;
 use blaze_drive::key::{self, ABSENT, Key, Name, Tool};
 use blaze_id::ContentId;
-use blaze_own::{AVec, Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
+use blaze_own::{AVec, Alloc, BTreeMap, BTreeSet, Csr, SharedAlloc, Vec};
 
 use crate::cell_table::CellTable;
 use crate::last::{LastAnswer, LastError, Touched};
@@ -513,6 +513,275 @@ pub fn by_cell<'a>(name: Name, reads: &[(CellId, ContentId)], alloc: SharedAlloc
     Ok(order)
 }
 
+/// Flat Compressed Sparse Row reverse index of cell readers (`CellId -> sorted unique &[Name]`).
+///
+/// Replaces `BTreeMap<CellId, BTreeSet<Name>>`: every cell key lives in one sorted `SVec<CellId>`
+/// and all reader names live contiguously in one zero-unsafe [`Csr<Name, SharedAlloc<'a>>`],
+/// eliminating hundreds of thousands of per-cell `BTreeSet` heap allocations on cold builds while
+/// keeping `O(log C)` lookup (`get`, `range`) and two-buffer linear construction (`apply_edits`,
+/// `from_pairs`, `from_rows`).
+pub struct Readers<'a> {
+    keys: SVec<'a, CellId>,
+    names: Csr<Name, SharedAlloc<'a>>,
+    alloc: SharedAlloc<'a>,
+}
+
+impl<'a> Readers<'a> {
+    pub fn new_in(alloc: SharedAlloc<'a>) -> Readers<'a> {
+        Readers { keys: Vec::new_in(alloc), names: Csr::new_in(alloc), alloc }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[inline]
+    pub fn edges(&self) -> usize {
+        self.names.values_len()
+    }
+
+    #[inline]
+    pub fn get(&self, id: &CellId) -> Option<&[Name]> {
+        let idx = self.keys.binary_search(id).ok()?;
+        self.names.row(idx)
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&CellId, &[Name])> + '_ {
+        self.keys.iter().zip(self.names.rows())
+    }
+
+    #[inline]
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &[Name]> + '_ {
+        self.names.rows()
+    }
+
+    pub fn range(&self, bounds: core::ops::RangeInclusive<CellId>) -> impl Iterator<Item = (&CellId, &[Name])> + '_ {
+        let start = self.keys.partition_point(|k| k < bounds.start());
+        let end = self.keys.partition_point(|k| k <= bounds.end());
+        let keys = self.keys.get(start..end).unwrap_or(&[]);
+        keys.iter().enumerate().filter_map(move |(offset, k)| {
+            self.names.row(start.saturating_add(offset)).map(|row| (k, row))
+        })
+    }
+
+    /// Builds a canonical CSR reverse index from unsorted `(cell, reader)` pairs in two flat
+    /// buffers (zero B-tree nodes).
+    pub fn from_pairs(mut pairs: SVec<'a, (CellId, Name)>, alloc: SharedAlloc<'a>) -> Readers<'a> {
+        if pairs.is_empty() {
+            return Readers::new_in(alloc);
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        let distinct_cells = pairs.chunk_by(|a, b| a.0 == b.0).count();
+        let mut keys = Vec::with_capacity_in(distinct_cells, alloc);
+        let mut names = Csr::with_capacity_in(distinct_cells, pairs.len(), alloc);
+        for run in pairs.chunk_by(|a, b| a.0 == b.0) {
+            if let Some(&(cell, _)) = run.first() {
+                keys.push(cell);
+                names.push_row(run.iter().map(|&(_, reader)| reader));
+            }
+        }
+        Readers { keys, names, alloc }
+    }
+
+    /// Rebuilds a canonical CSR reverse index from every row's reads in `rows`.
+    pub fn from_rows(rows: &SMap<'a, Name, Row<'a>>, alloc: SharedAlloc<'a>) -> Readers<'a> {
+        let total: usize = rows.values().map(|row| row.reads.len()).sum();
+        let mut pairs = Vec::with_capacity_in(total, alloc);
+        for (&name, row) in rows.iter() {
+            for &(id, _) in row.reads.iter() {
+                pairs.push((id, name));
+            }
+        }
+        Readers::from_pairs(pairs, alloc)
+    }
+
+    /// Inserts a single `(cell, reader)` edge while preserving sorted CSR invariants.
+    /// Prefer [`Readers::from_pairs`], [`Readers::from_rows`], or [`Readers::apply_edits`] for
+    /// bulk construction.
+    pub fn insert(&mut self, id: CellId, reader: Name) {
+        if let Some(existing) = self.get(&id)
+            && existing.binary_search(&reader).is_ok()
+        {
+            return;
+        }
+        let mut edits = ReaderEdits::new_in(self.alloc);
+        edits.edits.push(((id, reader), true));
+        self.apply_edits(&edits);
+    }
+
+    /// Applies sorted membership `edits` (`true` = add, `false` = remove) to `self` in one linear
+    /// pass, allocating only two flat buffers (`keys` + `Csr`) and zero per-cell heap nodes.
+    pub fn apply_edits(&mut self, edits: &ReaderEdits<'_>) {
+        if edits.is_empty() {
+            return;
+        }
+        let alloc = self.alloc;
+        if self.is_empty() {
+            let mut cell_count = 0usize;
+            let mut edge_count = 0usize;
+            for (_, delta) in edits.iter() {
+                let mut added_here = 0usize;
+                for (_, &added) in delta.iter() {
+                    if added {
+                        added_here = added_here.saturating_add(1);
+                    }
+                }
+                if added_here > 0 {
+                    cell_count = cell_count.saturating_add(1);
+                    edge_count = edge_count.saturating_add(added_here);
+                }
+            }
+            let mut keys = Vec::with_capacity_in(cell_count, alloc);
+            let mut names = Csr::with_capacity_in(cell_count, edge_count, alloc);
+            for (&id, delta) in edits.iter() {
+                if delta.iter().any(|(_, &added)| added) {
+                    keys.push(id);
+                    names.push_row(delta.iter().filter_map(|(&reader, &added)| added.then_some(reader)));
+                }
+            }
+            self.keys = keys;
+            self.names = names;
+            return;
+        }
+
+        let mut edit_cells = 0usize;
+        let mut added_edges = 0usize;
+        for (_, delta) in edits.iter() {
+            edit_cells = edit_cells.saturating_add(1);
+            for (_, &added) in delta.iter() {
+                if added {
+                    added_edges = added_edges.saturating_add(1);
+                }
+            }
+        }
+        let est_cells = self.keys.len().saturating_add(edit_cells);
+        let est_edges = self.names.values_len().saturating_add(added_edges);
+        let mut new_keys = Vec::with_capacity_in(est_cells, alloc);
+        let mut new_names = Csr::with_capacity_in(est_cells, est_edges, alloc);
+        let mut scratch: SVec<'a, Name> = Vec::new_in(alloc);
+
+        let mut old_iter = self.iter().peekable();
+        let mut edit_iter = edits.iter().peekable();
+        loop {
+            match (old_iter.peek(), edit_iter.peek()) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    if let Some((&id, old_slice)) = old_iter.next() {
+                        new_keys.push(id);
+                        new_names.push_slice(old_slice);
+                    }
+                }
+                (None, Some(_)) => {
+                    if let Some((&id, delta)) = edit_iter.next() {
+                        scratch.clear();
+                        for (&reader, &added) in delta.iter() {
+                            if added {
+                                scratch.push(reader);
+                            }
+                        }
+                        if !scratch.is_empty() {
+                            new_keys.push(id);
+                            new_names.push_slice(&scratch);
+                        }
+                    }
+                }
+                (Some(&(old_id, _)), Some(&(edit_id, _))) => match old_id.cmp(edit_id) {
+                    core::cmp::Ordering::Less => {
+                        if let Some((&id, old_slice)) = old_iter.next() {
+                            new_keys.push(id);
+                            new_names.push_slice(old_slice);
+                        }
+                    }
+                    core::cmp::Ordering::Greater => {
+                        if let Some((&id, delta)) = edit_iter.next() {
+                            scratch.clear();
+                            for (&reader, &added) in delta.iter() {
+                                if added {
+                                    scratch.push(reader);
+                                }
+                            }
+                            if !scratch.is_empty() {
+                                new_keys.push(id);
+                                new_names.push_slice(&scratch);
+                            }
+                        }
+                    }
+                    core::cmp::Ordering::Equal => {
+                        let Some((&id, old_slice)) = old_iter.next() else { break };
+                        let Some((_, delta)) = edit_iter.next() else { break };
+                        scratch.clear();
+                        let mut oi = old_slice.iter().copied().peekable();
+                        let mut di = delta.iter().map(|(&r, &a)| (r, a)).peekable();
+                        loop {
+                            match (oi.peek().copied(), di.peek().copied()) {
+                                (None, None) => break,
+                                (Some(o), None) => {
+                                    scratch.push(o);
+                                    let _ = oi.next();
+                                }
+                                (None, Some((d, added))) => {
+                                    if added {
+                                        scratch.push(d);
+                                    }
+                                    let _ = di.next();
+                                }
+                                (Some(o), Some((d, added))) => match o.cmp(&d) {
+                                    core::cmp::Ordering::Less => {
+                                        scratch.push(o);
+                                        let _ = oi.next();
+                                    }
+                                    core::cmp::Ordering::Greater => {
+                                        if added {
+                                            scratch.push(d);
+                                        }
+                                        let _ = di.next();
+                                    }
+                                    core::cmp::Ordering::Equal => {
+                                        if added {
+                                            scratch.push(o);
+                                        }
+                                        let _ = oi.next();
+                                        let _ = di.next();
+                                    }
+                                },
+                            }
+                        }
+                        if !scratch.is_empty() {
+                            new_keys.push(id);
+                            new_names.push_slice(&scratch);
+                        }
+                    }
+                },
+            }
+        }
+        drop(old_iter);
+        self.keys = new_keys;
+        self.names = new_names;
+    }
+}
+
+impl PartialEq for Readers<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys == other.keys && self.names == other.names
+    }
+}
+
+impl Eq for Readers<'_> {}
+
+impl fmt::Debug for Readers<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
 /// The answer: every row, every cell's digest, the reverse index, and what is owed. `Sync`: a
 /// phase's workers read it at once through a [`View`].
 pub struct Answer<'a> {
@@ -526,13 +795,8 @@ pub struct Answer<'a> {
     pub rows: SMap<'a, Name, Row<'a>>,
     /// Each cell's digest and the request it last moved in.
     pub cells: CellTable<'a, (ContentId, Gen)>,
-    /// Each cell's readers, in order: a SET, so one reader added or dropped costs the logarithm
-    /// of the cell's readers. As a sorted vector each insert moved half the list, and a cell
-    /// that every task of a crate reads (its crate's scope, `core`'s) made the merge quadratic:
-    /// 72% of a 6,111-body crate's check on one worker was that move (2026-11-17, release build
-    /// g190500, sampled: `Engine::apply` under `Engine::merge`; the profile's "merge ms" of the
-    /// Heads and Bodies stages against their "task ms" is where it shows).
-    pub readers: SMap<'a, CellId, SSet<'a, Name>>,
+    /// Each cell's readers, stored flat as sorted keys + [`Csr`] (zero per-cell B-tree nodes).
+    pub readers: Readers<'a>,
     /// Each file's planned tasks, sorted.
     pub by_file: SMap<'a, Name, SVec<'a, Name>>,
     /// Cells that moved while a reader of them was not run, with the request they moved in.
@@ -553,7 +817,7 @@ impl<'a> Answer<'a> {
             serial: Gen(0),
             rows: BTreeMap::new_in(alloc),
             cells: CellTable::new_in(alloc),
-            readers: BTreeMap::new_in(alloc),
+            readers: Readers::new_in(alloc),
             by_file: BTreeMap::new_in(alloc),
             owed_cells: BTreeMap::new_in(alloc),
             owed_tasks: BTreeMap::new_in(alloc),
@@ -1180,8 +1444,9 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             orphans: BTreeSet::new_in(alloc),
             ready: false,
         };
+        let owed_before: SVec<'a, Planned> = engine.view.owed_tasks();
         for (file, plan) in edit.files.iter() {
-            let old = engine.view.take_file(*file)?;
+            let old = engine.view.take_file_members(*file)?;
             let mut names: SVec<'a,Name> = Vec::with_capacity_in(plan.len(), alloc);
             for planned in plan.iter() {
                 names.push(planned.name);
@@ -1190,16 +1455,24 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
                 *count = count.saturating_add(1);
             }
             names.sort_unstable();
-            for name in old.iter() {
+            for name in old.names.iter() {
                 if names.binary_search(name).is_err() {
                     engine.view.unowe(*name);
                     engine.report.retired += u32::from(engine.view.row(*name)?.is_some());
                     engine.remove_row(*name, None)?;
                 }
             }
+            for planned in owed_before.iter() {
+                if planned.file == *file && names.binary_search(&planned.name).is_err() {
+                    engine.view.unowe(planned.name);
+                    engine.report.retired += u32::from(engine.view.row(planned.name)?.is_some());
+                    engine.remove_row(planned.name, None)?;
+                }
+            }
+            let standing = old.standing.as_deref();
             for planned in plan.iter() {
                 let key = tools.key(planned.name, &planned.source);
-                if !engine.view.member_stands(*file, planned.name, key)? {
+                if !engine.view.member_stands_with(*file, standing, planned.name, key)? {
                     engine.candidate(*planned, None)?;
                 }
             }
@@ -1761,8 +2034,8 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
             return Err(EngineError::TwoValues { name: pair[0] });
         }
-        let old = self.view.take_file(by)?;
-        for name in old.iter() {
+        let old = self.view.take_file_members(by)?;
+        for name in old.names.iter() {
             if names.binary_search(name).is_ok() {
                 continue;
             }
@@ -1775,11 +2048,12 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             self.report.retired += u32::from(self.view.row(*name)?.is_some());
             self.remove_row(*name, Some(after))?;
         }
+        let standing = old.standing.as_deref();
         for one in planned.iter() {
             self.planned.insert(one.name, *one);
             self.report.grown += 1;
             let key = self.tools.key(one.name, &one.source);
-            if !self.view.member_stands(by, one.name, key)? {
+            if !self.view.member_stands_with(by, standing, one.name, key)? {
                 self.candidate(*one, None)?;
             }
         }
@@ -1840,8 +2114,8 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         }
         // As a changed file's plan at the request's start (`with_index_in`): what the last answer
         // planned of the file and this plan does not is retired.
-        let old = self.view.take_file(file)?;
-        for name in old.iter() {
+        let old = self.view.take_file_members(file)?;
+        for name in old.names.iter() {
             if names.binary_search(name).is_ok() {
                 continue;
             }
@@ -1854,15 +2128,16 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             self.planned.insert(one.name, *one);
             // Planned again (no outline): only a task the earlier plan did not hold is new to
             // the edit's counts.
-            if outline.is_some() || old.binary_search(&one.name).is_err() {
+            if outline.is_some() || old.names.binary_search(&one.name).is_err() {
                 let count = self.edit_counts.entry(one.phase).or_insert(0);
                 *count = count.saturating_add(1);
             }
         }
+        let standing = old.standing.as_deref();
         // The outline, filed as its phase's merge files a planned result: a planned row (not
         // inline), its cells moved once it is in, each reader that did not see them a candidate.
         if let Some(outline) = outline
-            && !self.view.member_stands(file, file, key)?
+            && !self.view.member_stands_with(file, standing, file, key)?
         {
             let cause = match self.view.row(file)? {
                 Some(_) => Cause::KeyMoved,
@@ -1883,7 +2158,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
                 continue;
             }
             let key = self.tools.key(one.name, &one.source);
-            if !self.view.member_stands(file, one.name, key)? {
+            if !self.view.member_stands_with(file, standing, one.name, key)? {
                 self.candidate(*one, None)?;
             }
         }
@@ -2433,12 +2708,24 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         let mut changes: SVec<'a,(CellId, Option<ContentId>)> = Vec::new_in(alloc);
         let empty: &[(Cell, CellDigest)] = &[];
         let before = old.as_ref().map_or(empty, |old| old.defines.as_slice());
+        let old_from_last = old.as_ref().is_some_and(|old| old.from_last);
+        let absent_digest = CellDigest::of(&ABSENT);
         let (mut i, mut j) = (0, 0);
         while i < before.len() || j < done.defines.len() {
             match (before.get(i), done.defines.get(j)) {
                 (Some(b), Some(n)) if b.0 == n.0 => {
-                    if b.1 != CellDigest::of(&n.1) || !self.view.has_cell(&CellId { of: name, cell: n.0 }) {
-                        changes.push((CellId { of: name, cell: n.0 }, Some(n.1)));
+                    let id = CellId { of: name, cell: n.0 };
+                    // When `old` came from `self.last` with a non-ABSENT digest, every cell in
+                    // `old.defines` is already in `self.last`'s cell table unless tombstoned in
+                    // `self.work.cells` during this request; skip the `Ask::Cell` page lookup.
+                    let changed = b.1 != CellDigest::of(&n.1)
+                        || if old_from_last && b.1 != absent_digest {
+                            self.view.cell_tombstoned(&id)
+                        } else {
+                            !self.view.has_cell(&id)
+                        };
+                    if changed {
+                        changes.push((id, Some(n.1)));
                     }
                     i += 1;
                     j += 1;
@@ -2596,4 +2883,102 @@ pub fn drive_growing<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync, R: ReaderI
         grow(engine)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod readers_csr_tests {
+    use super::*;
+    use blaze_drive::key::Kind;
+    use std::collections::{BTreeMap as StdMap, BTreeSet as StdSet};
+
+    fn cell(owner: u32, tag: u8) -> CellId {
+        CellId {
+            of: Name::new(Kind::Signature, ContentId::of("readers test owner", &owner.to_le_bytes())),
+            cell: Cell([tag; 16]),
+        }
+    }
+
+    fn reader(id: u32) -> Name {
+        Name::new(Kind::BodyCheck, ContentId::of("readers test body", &id.to_le_bytes()))
+    }
+
+    #[test]
+    fn readers_csr_matches_btreemap_oracle_cold_and_incremental() {
+        let alloc = blaze_own::testing::heap().shared();
+        let mut csr = Readers::new_in(alloc);
+        let mut oracle: StdMap<CellId, StdSet<Name>> = StdMap::new();
+
+        // Step 1: cold apply_edits fast path (empty -> populated, with a no-op removal ignored).
+        let mut cold_edits = ReaderEdits::new_in(alloc);
+        for c in 0..8u32 {
+            let cid = cell(c, (c % 3) as u8);
+            for r in 0..6u32 {
+                if (c + r) % 2 == 0 {
+                    cold_edits.edits.push(((cid, reader(r)), true));
+                    oracle.entry(cid).or_default().insert(reader(r));
+                }
+            }
+        }
+        cold_edits.edits.push(((cell(99, 1), reader(0)), false));
+        cold_edits.edits.sort_unstable_by_key(|&(k, _)| k);
+        csr.apply_edits(&cold_edits);
+
+        let check_eq = |csr: &Readers<'_>, oracle: &StdMap<CellId, StdSet<Name>>| {
+            assert_eq!(csr.len(), oracle.len());
+            assert_eq!(csr.is_empty(), oracle.is_empty());
+            for (cid, expected) in oracle.iter() {
+                let got = csr.get(cid).expect("cell present");
+                let want: std::vec::Vec<Name> = expected.iter().copied().collect();
+                assert_eq!(got, want.as_slice());
+            }
+            let all_got: std::vec::Vec<(CellId, std::vec::Vec<Name>)> =
+                csr.iter().map(|(&c, ns)| (c, ns.to_vec())).collect();
+            let all_want: std::vec::Vec<(CellId, std::vec::Vec<Name>)> =
+                oracle.iter().map(|(&c, ns)| (c, ns.iter().copied().collect())).collect();
+            assert_eq!(all_got, all_want);
+        };
+        check_eq(&csr, &oracle);
+
+        // Step 2: incremental two-way merge adding new cells, adding/removing readers, and emptying a cell.
+        let mut inc = ReaderEdits::new_in(alloc);
+        let c0 = cell(0, 0);
+        for &r in oracle[&c0].iter() {
+            inc.edits.push(((c0, r), false));
+        }
+        oracle.remove(&c0);
+
+        let c2 = cell(2, 2);
+        inc.edits.push(((c2, reader(0)), false));
+        inc.edits.push(((c2, reader(10)), true));
+        oracle.entry(c2).or_default().remove(&reader(0));
+        oracle.entry(c2).or_default().insert(reader(10));
+
+        let c_new = cell(50, 7);
+        inc.edits.push(((c_new, reader(3)), true));
+        inc.edits.push(((c_new, reader(1)), true));
+        oracle.entry(c_new).or_default().insert(reader(3));
+        oracle.entry(c_new).or_default().insert(reader(1));
+
+        inc.edits.sort_unstable_by_key(|&(k, _)| k);
+        csr.apply_edits(&inc);
+        check_eq(&csr, &oracle);
+
+        // Step 3: range query and from_pairs equivalence.
+        let owner = cell(2, 2).of;
+        let first = CellId { of: owner, cell: Cell([0; 16]) };
+        let last = CellId { of: owner, cell: Cell([u8::MAX; 16]) };
+        let range_got: std::vec::Vec<CellId> = csr.range(first..=last).map(|(&c, _)| c).collect();
+        let range_want: std::vec::Vec<CellId> = oracle.range(first..=last).map(|(&c, _)| c).collect();
+        assert_eq!(range_got, range_want);
+
+        let mut pairs = Vec::new_in(alloc);
+        for (&c, rs) in oracle.iter() {
+            for &r in rs.iter() {
+                pairs.push((c, r));
+            }
+        }
+        pairs.reverse();
+        let rebuilt = Readers::from_pairs(pairs, alloc);
+        assert_eq!(rebuilt, csr);
+    }
 }

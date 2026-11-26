@@ -336,6 +336,9 @@ struct Target {
     res: Option<SlotId>,
     /// The drop scopes open outside it: leaving it drops every scope from this depth on.
     depth: u32,
+    /// The temporary scopes open outside it: leaving it also drops every temporary scope
+    /// opened inside it (a `loop` body's temporary scope opens before its block's drop scope).
+    temp_depth: u32,
 }
 
 /// A match being built: its arms' blocks are `arm_blocks[first..first + arms + 1]`, the last
@@ -604,11 +607,13 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// drop scopes were open when it began (walk/temps.rs).
     temp_scopes: Vec<(u32, u32), A>,
     /// Non-dropping temporary slots (`SlotKind::Temp`) whose storage ends when their temporary
-    /// scope closes (`(temp_scope_index, slot)`, walk/temps.rs).
-    temp_slots: blaze_own::Vec<(usize, SlotId), A>,
-    /// Extended non-dropping temporary slots whose storage ends when their block's drop scope
-    /// closes (`(scope_depth, slot)`, walk/temps.rs).
-    scope_slots: blaze_own::Vec<(usize, SlotId), A>,
+    /// scope closes (`(temp_scope_index, slot, expr)`, walk/temps.rs). `expr` is `Some(e)` for
+    /// `hold_copy_temp` temporaries (which `end_dead_slots_before_await` may end early when
+    /// unsaved by the flow), and `None` for `super let` binding slots.
+    temp_slots: blaze_own::Vec<(usize, SlotId, Option<ExprId>), A>,
+    /// Extended non-dropping temporary and local slots whose storage ends when their block's drop
+    /// scope closes (`(scope_depth, slot, expr)`, walk/temps.rs).
+    scope_slots: blaze_own::Vec<(usize, SlotId, Option<ExprId>), A>,
     /// Per extending borrow under a branch, of a `let` being built: its temporary's drop flag
     /// (walk/temps.rs `ext_flags_for`).
     ext_flags: Vec<(u32, SlotId), A>,
@@ -634,10 +639,6 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// Parallel to `targets`: running intersection of `definitely_uninit` across `break` edges
     /// reaching `targets[i].exit` (`None` until a live `break` jumps to that target).
     target_du: blaze_own::Vec<Option<blaze_own::Vec<bool, A>>, A>,
-    /// Per pattern: remaining unwalked `Expr::Local(p)` occurrences in `body.exprs` (from
-    /// `scan_flags`, decremented as `place_of` / `raw` visits them), so `end_moved_locals_before_await`
-    /// only ends a non-dropping binding proven both unsaved by `blaze-flow` and never read later.
-    uses_left: blaze_own::Vec<u32, A>,
     /// What needs drop, in declaration order, of every open drop scope.
     scope_pats: Vec<Held, A>,
     /// Per open drop scope (a fn's parameters first, then each block): where its bindings
@@ -979,11 +980,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         short_du: blaze_own::Vec::new_in(alloc),
         let_else_du: blaze_own::Vec::new_in(alloc),
         target_du: blaze_own::Vec::new_in(alloc),
-        uses_left: {
-            let mut ul = blaze_own::Vec::with_capacity_in(body.pats.len(), alloc);
-            ul.resize(body.pats.len(), 0);
-            ul
-        },
         scope_pats: Vec::new_in(alloc),
         scope_marks: Vec::new_in(alloc),
         moves: moves::Moves::new_in(alloc),
@@ -2601,9 +2597,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Home::Indirect(..) => None,
         };
         if let Some(s) = slot
-            && self.scope_slots.scan_for(&(depth, s)).is_none()
+            && self.scope_slots.scan_for(&(depth, s, None)).is_none()
         {
-            self.scope_slots.push((depth, s));
+            self.scope_slots.push((depth, s, None));
         }
     }
 
@@ -2627,8 +2623,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
         if self.co.is_some() {
             let depth = self.scope_marks.len();
-            if depth > 0 && self.scope_slots.scan_for(&(depth, slot)).is_none() {
-                self.scope_slots.push((depth, slot));
+            if depth > 0 && self.scope_slots.scan_for(&(depth, slot, None)).is_none() {
+                self.scope_slots.push((depth, slot, None));
             }
         }
         let at = self.b.slot_addr(slot);
@@ -2851,9 +2847,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
-    /// Where drop scope `depth` starts in `scope_pats` (its end when it is not open).
-    fn scope_start(&self, depth: u32) -> usize {
-        self.scope_marks.get(depth as usize).map_or(self.scope_pats.len(), |&m| m as usize)
+    /// Where leaving `t` (`break` or `continue`) starts dropping in `scope_pats`: the earliest
+    /// drop scope or temporary scope opened inside `t` (a `loop` body's temporary scope opens
+    /// before its block's drop scope, so `insert_held` places its temporaries before
+    /// `scope_marks[t.depth]`).
+    fn target_start(&self, t: Target) -> Result<usize, BuildError> {
+        let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
+        let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
+        let scope = match self.scope_marks.get(scope_depth) {
+            Some(&m) => usize::try_from(m).map_err(|_| malformed("a scope mark past `usize`"))?,
+            None => self.scope_pats.len(),
+        };
+        let temp = match self.temp_marks.get(temp_depth) {
+            Some(&m) => usize::try_from(m).map_err(|_| malformed("a temporary mark past `usize`"))?,
+            None => self.scope_pats.len(),
+        };
+        Ok(scope.min(temp))
     }
 
     /// Whether a binding from `start` of `scope_pats` on may be dropped here.
@@ -2880,7 +2889,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             && matches!(repr, Repr::Agg(_))
             && match v {
                 V::Place(p, _) => self.value_slot(p).is_some_and(|s| {
-                    self.scope_slots.iter().any(|&(d, x)| d >= depth && x == s)
+                    self.scope_slots.iter().any(|&(d, x, _)| d >= depth && x == s)
                         || self.scope_pats.get(mark..).is_some_and(|held| {
                             held.iter().any(|&h| match h {
                                 Held::Pat(pat) => match self.slots.get(pat.ix()).copied().flatten() {
@@ -3003,7 +3012,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         if o.flag.is_some() {
             self.set_flag(p, false);
-            if self.live && o.rest.is_none()
+            if self.live
                 && let Some(du) = self.definitely_uninit.get_mut(p.ix())
             {
                 *du = true;
@@ -3210,46 +3219,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.mark_decl(p, i as u32, &mut decl)?;
             }
         }
-        let in_own_body = |mut cur: u32| -> bool {
-            for _ in 0..=n {
-                if cur == self.body.root.0 {
-                    return true;
-                }
-                let Ok(cur_ix) = usize::try_from(cur) else {
-                    return false;
-                };
-                let Some(&(up, _)) = parent.get(cur_ix) else {
-                    return false;
-                };
-                if up == NO_EXPR {
-                    return false;
-                }
-                let Ok(up_ix) = usize::try_from(up) else {
-                    return false;
-                };
-                if matches!(body.exprs.get(up_ix), Some(Expr::Closure { .. } | Expr::AsyncBlock { .. })) {
-                    return false;
-                }
-                cur = up;
-            }
-            false
-        };
         for (i, x) in body.exprs.iter().enumerate() {
-            if let Ok(i_u32) = u32::try_from(i) {
-                if matches!(*x, Expr::Closure { .. } | Expr::AsyncBlock { .. }) && in_own_body(i_u32) {
-                    for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(ExprId(i_u32)) {
-                        if let Some(cnt) = self.uses_left.get_mut(f.base.ix()) {
-                            *cnt = cnt.saturating_add(1);
-                        }
-                    }
-                }
-                if let Expr::Local(p) = *x
-                    && in_own_body(i_u32)
-                    && let Some(cnt) = self.uses_left.get_mut(p.ix())
-                {
-                    *cnt = cnt.saturating_add(1);
-                }
-            }
             let Expr::Local(p) = *x else { continue };
             // The context: the parent of the outermost parenthesis around the use.
             let mut c = i as u32;
@@ -3453,8 +3423,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     // The function.
 
     fn run(&mut self, sig: &FnSig<'_>, kind: Kind) -> Result<(), BuildError> {
+        let owner = self.body.owner;
+        let c_variadic = kind == Kind::Body && self.adts.c_variadic(owner).is_some();
         // A method's `self` is its first input and its body's first parameter, like any other.
-        if sig.inputs.len() != self.body.params.len() {
+        // A C-variadic fn definition carries one extra body parameter (`mut rest: ...` -> `VaList`).
+        if sig.inputs.len() + usize::from(c_variadic) != self.body.params.len() {
             return Err(malformed("a signature and a body with other numbers of parameters"));
         }
         let sig_err = |error: TyErr| match error {
@@ -3463,7 +3436,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             TyErr::Other(error) => error,
         };
         // Drop glue is of the Rust ABI; a body is of its fn's.
-        let owner = self.body.owner;
         let abi = match kind {
             Kind::DropGlue => Abi::Rust,
             Kind::Body => self.adts.abi(owner).ok_or(BuildError::NoAbi { item: owner })?,
@@ -3504,7 +3476,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             ptr_facts.push(0);
         }
         let (params, rets) = self.sig_of_with_ptr_facts(&passes, &ptr_facts, self.ret_pass);
-        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        let variadic = if c_variadic { Variadic::Yes } else { Variadic::No };
+        let own = self.b.sig(Conv::C, variadic, &params, &rets);
         self.b.set_signature(own);
         self.mark_nounwind(owner, abi, kind == Kind::Body)?;
         let entry = self.create();
@@ -3614,6 +3587,38 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     let g = self.ground_in(sig.types, sig.inputs[i]).map_err(sig_err)?;
                     self.bind_param(p, v, g)?
                 }
+            }
+        }
+        if c_variadic {
+            let &p = self.body.params.get(sig.inputs.len()).ok_or(malformed("a C-variadic function missing its trailing `...` parameter"))?;
+            let pt = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a C-variadic parameter missing its type"))?;
+            let g = self.ground_ty(pt).map_err(sig_err)?;
+            let repr = self.repr(g).map_err(sig_err)?;
+            let va_id = self.ls_of(g).map_err(sig_err)?;
+            let l = *self.ls.get(va_id);
+            if l.size != 8 || l.scalar.map(|s| s.prim) != Some(crate::layout::Prim::Ptr) {
+                return Err(BuildError::UnsupportedSig {
+                    what: "a C-variadic definition on a target whose `VaList` is not a single pointer (Linux AAPCS64 register save area)",
+                });
+            }
+            let va_sig = self.b.sig(Conv::C, Variadic::No, &[], &[blaze_lir::builder::Param::of(Ty::PTR)]);
+            let va_intr = self.b.intrinsic("blaze.va_start", va_sig);
+            let va_ptr = self.b.target_intrinsic(va_intr, &[]);
+            let v = match repr {
+                Repr::Ptr => V::Scalar(va_ptr),
+                Repr::Agg(_) => {
+                    let at = self.temp(repr);
+                    self.b.store(Flags::NONE, va_ptr, at.0, at.1, MemAttrs::aligned(3));
+                    V::Place(at.0, at.1)
+                }
+                _ => return Err(malformed("a pointer-sized `VaList` with a non-pointer representation")),
+            };
+            match v {
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                    self.bind_at(p, (at, off))?;
+                    self.own_pat(p)?;
+                }
+                v => self.bind_param(p, v, g)?,
             }
         }
         self.walk_root()
@@ -4342,15 +4347,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     return Ok(());
                 }
                 self.du_record_break(ti);
-                let start = self.scope_start(t.depth);
-                let depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
+                let start = self.target_start(t)?;
+                let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?.saturating_add(1);
+                let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
                 match t.res {
                     Some(slot) => {
                         let to = (self.b.slot_addr(slot), 0);
                         self.store(v, t.repr, to)?;
                         self.end_temp_val(v);
                         self.drop_from(start)?;
-                        self.end_scope_slots_peek_except(start, depth, Some(slot));
+                        self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), Some(slot));
                         self.jump(t.exit, &[]);
                     }
                     None => {
@@ -4358,7 +4364,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         let arg = self.arg(v, t.repr)?;
                         let kept = arg.and_then(|p| self.value_slot(p));
                         self.drop_from(start)?;
-                        self.end_scope_slots_peek_except(start, depth, kept);
+                        self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), kept);
                         self.jump(t.exit, arg.as_slice());
                     }
                 }
@@ -4382,6 +4388,26 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let body = self.create();
                 self.br(c, (body, &[]), (next, &[]));
                 self.begin(body);
+                if let Ok(Expr::Match { arms, .. }) = self.expr(st.expr)
+                    && let Some(arm) = self
+                        .body
+                        .arms
+                        .get(arms.range())
+                        .and_then(|l| usize::try_from(i).ok().and_then(|ix| l.get(ix)))
+                        .copied()
+                    && !self.pat_has_ref(arm.pat)?
+                {
+                    let scrut_slot = if let Some(at) = st.tested {
+                        (!at.by_ref).then(|| self.whole_slot(at.at)).flatten()
+                    } else if st.by_ref.is_none() && matches!(st.owner, Owner::None) {
+                        st.of_enum.and_then(|(at, ..)| self.whole_slot(at))
+                    } else {
+                        None
+                    };
+                    if let Some(slot) = scrut_slot {
+                        self.end_temp_slot(slot);
+                    }
+                }
             }
             Task::GuardAlts { word, chains, n } => {
                 self.du_intersect_open_entries();
@@ -5728,6 +5754,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             let at = self.adjusted_ty(a)?;
             let g = self.ground_ty(at).map_err(|error| Self::ty_err(a, error))?;
+            if which == Which::VaArg && i == 0 {
+                let PNode::Ref(_, va_ty) = self.ground_node(g).map_err(|error| Self::ty_err(a, error))? else {
+                    return Err(BuildError::Intrinsic { expr: e, which, why: "`va_arg` whose argument is not `&mut VaList`", unsupported: false });
+                };
+                let va_id = self.ls_of(va_ty).map_err(|error| Self::ty_err(a, error))?;
+                let va_l = *self.ls.get(va_id);
+                if va_l.size != 8 || va_l.scalar.map(|s| s.prim) != Some(crate::layout::Prim::Ptr) {
+                    return Err(BuildError::Intrinsic { expr: e, which, why: "a non-pointer `VaList` layout (Linux AAPCS64 register save area)", unsupported: true });
+                }
+            }
             let repr = self.repr_at(a, at)?;
             // `simd_shuffle`'s indices ("`U` must be a **const** vector of `u32`s", stdarch's
             // `const { SimdShuffleIdx(..) }`): the address of the constant's own data row, which
@@ -6233,9 +6269,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         match self.expr(e)? {
             Expr::Local(p) => {
-                if let Some(cnt) = self.uses_left.get_mut(p.ix()) {
-                    *cnt = cnt.saturating_sub(1);
-                }
                 let (home, _) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
                 let at = self.home(home);
                 self.push_val(V::Place(at.0, at.1), None);
@@ -6326,9 +6359,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::Missing => return Err(unsupported(e, "a missing expression")),
             Expr::Lit(lit) => self.lit(e, lit)?,
             Expr::Local(p) => {
-                if let Some(cnt) = self.uses_left.get_mut(p.ix()) {
-                    *cnt = cnt.saturating_sub(1);
-                }
                 let (home, repr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
                 // A use by value: a move, when its type needs drop (its memory is read where
                 // the value lands, before anything else runs that could drop it).
@@ -6403,11 +6433,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::Block { stmts, tail, .. } => {
                 let list = self.body.stmt_lists.get(stmts.range()).ok_or(malformed("a block's statements past `stmt_lists`"))?;
                 let depth = self.scope_marks.len() as u32;
+                let temp_depth = u32::try_from(self.temp_marks.len()).map_err(|_| malformed("temporary scope depth past `u32`"))?;
                 if self.break_target[e.ix()] {
                     let repr = self.expr_repr(e)?;
                     let res = self.join_slot(repr);
                     let exit = self.create();
-                    self.targets.push(Target { expr: e, header: None, exit, repr, res, depth });
+                    self.targets.push(Target { expr: e, header: None, exit, repr, res, depth, temp_depth });
                     self.target_du.push(None);
                     self.work.push(Task::BlockExit(e));
                 }
@@ -6506,7 +6537,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // A back-edge may re-initialize any outer flagged binding on a later iteration.
                 self.definitely_uninit.fill(false);
                 let depth = self.scope_marks.len() as u32;
-                self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth });
+                let temp_depth = u32::try_from(self.temp_marks.len()).map_err(|_| malformed("temporary scope depth past `u32`"))?;
+                self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth, temp_depth });
                 self.target_du.push(None);
                 self.work.push(Task::LoopEnd(e));
                 self.work.push(Task::Discard);
@@ -6526,10 +6558,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     .find(|t| t.expr == target)
                     .ok_or(malformed("a `continue` whose loop is not around it"))?;
                 let header = t.header.ok_or(malformed("a `continue` of a block"))?;
-                let start = self.scope_start(t.depth);
-                let depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
+                let start = self.target_start(t)?;
+                let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?.saturating_add(1);
+                let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
                 self.drop_from(start)?;
-                self.end_scope_slots_peek(start, depth);
+                self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), None);
                 self.jump(header, &[]);
                 self.dead_block();
                 self.push_val(V::None, None);
@@ -7157,9 +7190,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         list.extend(written.iter().enumerate().filter(|&(k, _)| !listed.contains(&(k as u32))).map(|(_, &a)| a));
                         Instance { item, args }
                     }
-                    PNode::FnPtr(_, header) => {
+                    PNode::FnPtr(sig_list, header) => {
                         list.extend_from_slice(written);
-                        return self.call_pointer(e, &list, header.abi);
+                        let declared = if header.c_variadic {
+                            let len = self.types.list(sig_list).map_err(|_| malformed("a fn pointer past the record's types"))?.len();
+                            Some(len.saturating_sub(1))
+                        } else {
+                            None
+                        };
+                        return self.call_pointer(e, &list, header.abi, declared);
                     }
                     // A closure called directly (closure.rs `push_closure_call`).
                     PNode::Closure { .. } if !self.through_fn_trait(e) => return self.closure_call(e, callee, written),
@@ -7408,17 +7447,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// Call `e` through a fn pointer of ABI `abi`: the pointer under the arguments `list` on
     /// the stack; the signature lowered from the arguments' and the result's types, by the
     /// pointer's ABI (lib.rs, "Fn pointers").
-    fn call_pointer(&mut self, e: ExprId, list: &[ExprId], abi: blaze_typeck::Abi) -> Result<(), BuildError> {
-        let abi = pointer_abi(abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
+    fn call_pointer(&mut self, e: ExprId, list: &[ExprId], raw_abi: blaze_typeck::Abi, declared: Option<usize>) -> Result<(), BuildError> {
+        let abi = pointer_abi(raw_abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
+        let nounwind = matches!(raw_abi, blaze_typeck::Abi::C | blaze_typeck::Abi::System);
+        if declared.is_some() {
+            Self::c_variadic_abi(e, abi, Some(nounwind))?;
+        }
         let n = list.len();
         let mut reprs = Vec::with_capacity_in(n, self.alloc);
         let mut passes = Vec::with_capacity_in(n, self.alloc);
-        for &a in list.iter() {
+        for (i, &a) in list.iter().enumerate() {
             let t = self.adjusted_ty(a)?;
             let g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
             let repr = self.repr_at(a, t)?;
             reprs.push(repr);
-            passes.push(self.pass(g, repr, abi, None)?);
+            let pass = if declared.is_some_and(|d| i >= d) { Self::vararg_pass(a, repr)? } else { self.pass(g, repr, abi, None)? };
+            passes.push(pass);
         }
         if abi == Abi::RustCall {
             self.spread_tuple(&mut reprs, &mut passes)?;
@@ -7431,7 +7475,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let at = self.vals.len().checked_sub(reprs.len() + 1).ok_or(malformed("a call's pointer missing from the value stack (a build bug)"))?;
         let p = self.remove_val(at);
         let p = self.scalar(p, Ty::PTR)?;
-        self.emit_call(Callee::Pointer(p), &reprs, &passes, rrepr, rpass)?;
+        self.emit_call_from(Callee::Pointer(p), &reprs, &passes, declared, nounwind, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
             self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));

@@ -103,6 +103,14 @@ blaze-expand.workspace = true
 blaze-core.workspace = true
 
 [dev-dependencies]
+# D119 Wave 4 live cutover & side-by-side ladder oracles (front2/tables/task.rs):
+# `blaze-body` and `blaze-body-lower` are already in `[dependencies]`; the remaining four crates
+# live in `[dev-dependencies]` until Wave 5 resolves D173's `bare` ratchet (`0 -> 1` on `reached`).
+blaze-body-drops.workspace = true
+blaze-body-flow.workspace = true
+blaze-body-build.workspace = true
+blaze-body-eval.workspace = true
+blaze-lir = { workspace = true, features = ["eval"] }
 # The store the command keeps records in (`plain::Driven`, `plain::Lent`), for the tests that
 # write and read records through it.
 blaze-cas.workspace = true

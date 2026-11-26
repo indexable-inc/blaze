@@ -974,7 +974,7 @@ fn a_subject_first_clause_ties_through_the_impl() {
     let sel = Sel { rows: SVec::from([(T_TR, None, Selection::Impl { head, value: None })]) };
     let p = params(1, &[]);
     let inputs = [ty(p0, NONE)];
-    let clauses = [ClauseIn::TraitOf { trait_ref: ty(clause, P0) }];
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(clause, P0), binders: 0 }];
     let sig = Sig { item: F, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &clauses };
     let types = [arg(wrap, 1, 1)];
     let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
@@ -1034,7 +1034,7 @@ fn a_trait_methods_lifetimes_are_the_callers_bounds() {
     let facts = Facts::default().trait_(T_CONV, 2);
     let p = params(2, &[]);
     let inputs = [ty(p0, NONE), ty(r, P0)];
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P01) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P01), binders: 0 }];
     let types = [arg(p0, 2, 0)];
     let generics = GenericArgs { lifetimes: range(0, 2), types: &types };
     let args = [arg(p0, 2, 0), arg(r, 2, 1)];
@@ -1077,7 +1077,7 @@ fn a_lifetime_the_caller_writes_only_in_its_bound_is_tied() {
     let facts = Facts::default().trait_(T_VISITOR, 1);
     let p = params(1, &[]);
     let inputs = [ty(p0, NONE), ty(r, P0)];
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P0) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P0), binders: 0 }];
     let types = [arg(p0, 1, 0)];
     let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
     let args = [arg(p0, 1, 0), arg(r, 1, 1)];
@@ -1117,7 +1117,7 @@ fn a_tie_with_no_answer_is_refused_by_name() {
     let facts = Facts::default().trait_(T_VISITOR, 1).adt(K_PLAIN, 0, &[]);
     let p = params(1, &[]);
     let inputs = [ty(p0, NONE), ty(r, P0)];
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P0) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P0), binders: 0 }];
     let cols = Columns::new(t.t.view(), &facts, &facts);
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &tie };
 
@@ -1211,7 +1211,7 @@ fn an_impls_where_clause_is_related_at_the_call() {
     let facts = Facts::default().trait_(T_VISITOR, 1).adt(K_PLAIN, 0, &[]);
     let p = params(1, &[]);
     let inputs = [ty(p0, NONE), ty(r, P0)];
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P0) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause, P0), binders: 0 }];
     let cols = Columns::new(t.t.view(), &facts, &facts);
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &tie };
     let types = [arg(plain, 1, 0)];
@@ -1280,7 +1280,7 @@ fn an_impls_empty_column_clause_is_tied_where_it_names_a_region() {
     // `fn need<T: Other>(t: T)`.
     let p = params(0, &[]);
     let inputs = [ty(p0, NONE)];
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(other_clause, NONE) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(other_clause, NONE), binders: 0 }];
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &tie };
     let other = Selection::Impl { head: ImplHead { imp: IMP, lifetimes: 0, types: 2, trait_ref: ty(other_header, NONE) }, value: None };
     let marker = Selection::Impl { head: ImplHead { imp: IMP_MARKER, lifetimes: 0, types: 0, trait_ref: ty(marker_header, STATIC) }, value: None };
@@ -1335,7 +1335,7 @@ fn a_projection_clause_naming_a_region_is_never_skipped() {
     // `fn need<T, U>(t: T, u: U) where T: Tr<Output = U>` (its parent `T: Tr` laid apart).
     let p = params(0, &[]);
     let inputs = [ty(p0, NONE), ty(p1, NONE)];
-    let with = [ClauseIn::ProjOf { proj: ty(proj, NONE) }];
+    let with = [ClauseIn::ProjOf { proj: ty(proj, NONE), binders: 0 }];
     let call = |u: PTy, n: u32, clauses: &[ClauseIn<'static>]| {
         let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses };
         let types = [arg(plain, 0, 0), arg(u, 0, n)];
@@ -1371,7 +1371,7 @@ fn a_builtin_proof_ties_only_what_names_nothing() {
 
     let p = params(0, &[]);
     let inputs = [ty(p0, NONE)];
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(marker, NONE) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(marker, NONE), binders: 0 }];
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &tie };
     let types = [arg(plain, 0, 0)];
     let generics = GenericArgs { lifetimes: SlotRange::EMPTY, types: &types };
@@ -1380,7 +1380,7 @@ fn a_builtin_proof_ties_only_what_names_nothing() {
     assert!(rec.subsets.is_empty() && rec.statics.is_empty(), "nothing tied: {:?}", rec.subsets);
 
     let p = params(1, &[]);
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(visitor, P0) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(visitor, P0), binders: 0 }];
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &tie };
     let types = [arg(plain, 1, 0)];
     let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
@@ -1422,7 +1422,7 @@ fn bound_regions_pair_by_renaming_not_by_index() {
     };
 
     const L20: &[Region] = &[Region::Late { binder: 2, var: 0 }];
-    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause_one, L20) }];
+    let tie = [ClauseIn::TraitOf { trait_ref: ty(clause_one, L20), binders: 0 }];
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &tie };
     let (res, rec) = run(&cols, &impl_of(header_one, L20), &Own::default(), 0, Callee::Fn(sig), generics, &args, arg(unit, 0, 0));
     assert_eq!(res, Ok(()), "the impl's binder 2 and the callee's binder 2 are one binder renamed");
@@ -1430,7 +1430,7 @@ fn bound_regions_pair_by_renaming_not_by_index() {
 
     const L20_L20: &[Region] = &[Region::Late { binder: 2, var: 0 }, Region::Late { binder: 2, var: 0 }];
     const L20_L21: &[Region] = &[Region::Late { binder: 2, var: 0 }, Region::Late { binder: 2, var: 1 }];
-    let tie2 = [ClauseIn::TraitOf { trait_ref: ty(clause_two, L20_L20) }];
+    let tie2 = [ClauseIn::TraitOf { trait_ref: ty(clause_two, L20_L20), binders: 0 }];
     let sig2 = Sig { clauses: &tie2, ..sig };
     let (res, _) = run(&cols, &impl_of(header_two, L20_L21), &Own::default(), 0, Callee::Fn(sig2), generics, &args, arg(unit, 0, 0));
     assert!(matches!(res, Err(Refused::HigherRanked { item: METHOD, .. })), "TWIN: `'c` met with two partners: {res:?}");
@@ -1567,7 +1567,7 @@ fn assoc_item_bounds_prove_alias_trait_clauses() {
     // Called with `P = Param(0)`, `'a = slot 0`, `s: P::Searcher<'1>`, `x: &'2 u8`.
     let p = params(1, &[]);
     let inputs = [ty(searcher_alias, P0), ty(r, P0)];
-    let clauses = [ClauseIn::TraitOf { trait_ref: ty(callee_clause, P00) }];
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(callee_clause, P00), binders: 0 }];
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(r, P0), clauses: &clauses };
     let types = [arg(p0, 0, 0)];
     let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
@@ -1625,7 +1625,7 @@ fn higher_ranked_clause_instantiation_and_negative_control() {
     // where `'x` is slot 0 (instantiated by caller's local `arg(r, 1, 1)`).
     let p = params(1, &[]);
     let inputs = [ty(p0, NONE), ty(r, P0)];
-    let callee_clauses = [ClauseIn::TraitOf { trait_ref: ty(tr_r, P0) }];
+    let callee_clauses = [ClauseIn::TraitOf { trait_ref: ty(tr_r, P0), binders: 0 }];
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &callee_clauses };
     let types = [arg(p0, 0, 0)];
     let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
@@ -1640,7 +1640,7 @@ fn higher_ranked_clause_instantiation_and_negative_control() {
     // while callee demands `Param(0): for<'b> Tr<&'b u8>` (`L00` -> rigid placeholder!).
     let p0_none = params(0, &[]);
     let inputs_hr = [ty(p0, NONE)];
-    let clauses_hr = [ClauseIn::TraitOf { trait_ref: ty(tr_r, L00) }];
+    let clauses_hr = [ClauseIn::TraitOf { trait_ref: ty(tr_r, L00), binders: 1 }];
     let sig_hr = Sig { item: METHOD, params: ParamsView::of(&p0_none), inputs: &inputs_hr, output: ty(unit, NONE), clauses: &clauses_hr };
     let generics_hr = GenericArgs { lifetimes: SlotRange::EMPTY, types: &types };
     let args_hr = [arg(p0, 0, 0)];
@@ -1862,7 +1862,7 @@ fn reflexive_projection_equality_relates_invariantly() {
     let cols = Columns::new(t.t.view(), &facts, &facts);
 
     let p = params(1, &[]);
-    let clauses = [ClauseIn::ProjOf { proj: ty(proj_clause, P0) }];
+    let clauses = [ClauseIn::ProjOf { proj: ty(proj_clause, P0), binders: 0 }];
     let sig = Sig { item: F, params: ParamsView::of(&p), inputs: &[], output: ty(unit, NONE), clauses: &clauses };
 
     let types = [arg(p0, 0, 0), arg(alias_out, 1, 1)];
@@ -1877,4 +1877,399 @@ fn reflexive_projection_equality_relates_invariantly() {
     let mismatch_gen = GenericArgs { lifetimes: range(0, 1), types: &mismatch_types };
     let (res, _) = run(&cols, &Sel::default(), &Own::default(), 2, Callee::Fn(sig), mismatch_gen, &[], arg(unit, 2, 0));
     assert!(matches!(res, Err(Refused::Unselected { .. })), "CONTROL: distinct associated types must not equate reflexively: {res:?}");
+}
+
+/// Higher-ranked clause Skolemization (`for<'a> Wrap<'a>: Visitor<'a>`):
+/// a clause with `binders: 1` Skolemizes its `Late { binder: 0, var: 0 }` slots into a fresh
+/// rigid placeholder so `impl<'a> Visitor<'a> for Wrap<'a>` succeeds with zero leaked constraints.
+/// NEGATIVE CONTROL: matching the same `for<'a>` clause against `impl Visitor<'static> for
+/// Wrap<'static>` demands `placeholder: 'static`, which is rejected (a universally quantified
+/// lifetime cannot satisfy `'static`).
+#[test]
+fn higher_ranked_clause_skolemizes_and_rejects_static_escape() {
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let wrap = t.adt(K_WRAP, &[]);
+    let clause_tr = t.extrait(T_VISITOR, &[wrap]);
+    let facts = Facts::default().trait_(T_VISITOR, 1).adt(K_WRAP, 1, &[Variance::Co]);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    const L00_L00: &[Region] = &[Region::Late { binder: 0, var: 0 }, Region::Late { binder: 0, var: 0 }];
+    const P0_P0: &[Region] = &[Region::Param(0), Region::Param(0)];
+    const ST_ST: &[Region] = &[Region::Static, Region::Static];
+
+    let p = params(0, &[]);
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(clause_tr, L00_L00), binders: 1 }];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &[], output: ty(unit, NONE), clauses: &clauses };
+    let generics = GenericArgs { lifetimes: SlotRange::EMPTY, types: &[] };
+
+    let impl_poly = Sel {
+        rows: SVec::from([(
+            T_VISITOR,
+            None,
+            Selection::Impl { head: ImplHead { imp: IMP, lifetimes: 1, types: 0, trait_ref: ty(clause_tr, P0_P0) }, value: None },
+        )]),
+    };
+    let (res, rec) = run(&cols, &impl_poly, &Own::default(), 0, Callee::Fn(sig), generics, &[], arg(unit, 0, 0));
+    assert_eq!(res, Ok(()), "`for<'a> Wrap<'a>: Visitor<'a>` satisfied by `impl<'a> Visitor<'a> for Wrap<'a>`: {res:?}");
+    assert!(!rec.placeholders.is_empty(), "clause binder must Skolemize to a rigid placeholder");
+    assert!(rec.statics.is_empty(), "polymorphic impl must not demand `'static`: {:?}", rec.statics);
+
+    let impl_static = Sel {
+        rows: SVec::from([(
+            T_VISITOR,
+            None,
+            Selection::Impl { head: ImplHead { imp: IMP, lifetimes: 0, types: 0, trait_ref: ty(clause_tr, ST_ST) }, value: None },
+        )]),
+    };
+    let (res, rec) = run(&cols, &impl_static, &Own::default(), 0, Callee::Fn(sig), generics, &[], arg(unit, 0, 0));
+    assert_eq!(res, Ok(()), "constraints emitted for borrow checker");
+    let ph = rec.placeholders[0];
+    assert!(rejects(&rec, &[], &[ph]), "NEGATIVE CONTROL: `for<'a>` placeholder {ph} cannot satisfy `'static` (statics={:?}, subsets={:?})", rec.statics, rec.subsets);
+}
+
+/// Associated type item outlives bound (`trait Database { type Error: 'static; }`):
+/// calling `fn need_static<T: 'static>()` with `T = <DB as Database>::Error` is proved directly
+/// from the associated type's own `Self: 'static` bound without forcing `DB: 'static`.
+/// NEGATIVE CONTROL: without the associated type's `'static` bound, `<DB as Database>::Error:
+/// 'static` falls back to components and demands `ρ_DB: 'static`.
+#[test]
+fn assoc_type_item_outlives_bound_proves_alias_static() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+    use blaze_typeck::regions::RegionCol;
+
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let alias_err = t.alias(T_TR, ERR, &[p0]);
+    let facts = Facts::default().trait_(T_TR, 0).alias(T_TR, ERR, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    let p = params(0, &[]);
+    let clauses = [ClauseIn::TypeOutlives { subject: ty(p0, NONE), region: Region::Static }];
+    let sig = Sig { item: F, params: ParamsView::of(&p), inputs: &[], output: ty(unit, NONE), clauses: &clauses };
+    let types = [arg(alias_err, 0, 0)];
+    let generics = GenericArgs { lifetimes: SlotRange::EMPTY, types: &types };
+
+    struct WithAssocOutlives<'a> {
+        views: &'a [ClauseView<'a>],
+    }
+    impl Selected for WithAssocOutlives<'_> {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::Unanswered)
+        }
+        fn assoc_clauses(&self, trait_: ItemKey, name: Name) -> Option<(u32, &[ClauseView<'_>])> {
+            (trait_ == T_TR && name == ERR).then_some((0, self.views))
+        }
+    }
+
+    let col_self = RegionCol::lay(t.t.view(), alias_err, &facts, NONE, alloc()).expect("empty column");
+    let views = [ClauseView { nth: 0, binders: 0, col: ColView::of(&col_self), outlives: Some(Region::Static) }];
+    let sel_with = WithAssocOutlives { views: &views };
+
+    let (res, rec) = run(&cols, &sel_with, &Own::default(), 0, Callee::Fn(sig), generics, &[], arg(unit, 0, 0));
+    assert_eq!(res, Ok(()), "`type Error: 'static` proves `<DB as Tr>::Error: 'static`");
+    assert!(rec.statics.is_empty(), "`DB` (param origin 20) must NOT be forced `'static`: {:?}", rec.statics);
+
+    let (res, rec_neg) = run(&cols, &Sel::default(), &Own::default(), 0, Callee::Fn(sig), generics, &[], arg(unit, 0, 0));
+    assert_eq!(res, Ok(()), "without item bound, falls back to components");
+    assert!(rec_neg.statics.contains(&20), "NEGATIVE CONTROL: without `type Error: 'static`, `ρ_DB` (20) must outlive `'static`: {:?}", rec_neg.statics);
+}
+
+/// Opaque ancestor clause elaboration for `PNode::Alias` subjects (`test_tx_iterator_for_payload`
+/// shape): `Opaque: SubTrait<'a>` where `SubTrait<'a>` declares `<Self as BaseTrait>::Out:
+/// TargetTrait<'a>`. Proving `<Opaque as BaseTrait>::Out: TargetTrait<'b>` walks
+/// `alias_self_chain` to `Opaque`, elaborates `Opaque`'s opaque clauses through `SubTrait<'a>`,
+/// and equates `'a` with `'b` invariantly.
+/// NEGATIVE CONTROL: `<Opaque as BaseTrait>::Err: TargetTrait<'b>` (not bounded by `SubTrait`)
+/// is refused `Unselected`.
+#[test]
+fn opaque_ancestor_clause_elaborates_for_alias_subject() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+    use blaze_typeck::regions::RegionCol;
+
+    const K_OP: ItemKey = ItemKey(0x0901);
+    const T_BASE: ItemKey = ItemKey(0x0902);
+    const T_SUB: ItemKey = ItemKey(0x0903);
+    const T_TARGET: ItemKey = ItemKey(0x0904);
+
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let op = t.opaque(K_OP, &[]);
+    let op_out = t.alias(T_BASE, OUTPUT, &[op]);
+    let op_err = t.alias(T_BASE, ERR, &[op]);
+    let self_out = t.alias(T_BASE, OUTPUT, &[p0]);
+    let op_is_sub = t.extrait(T_SUB, &[op]);
+    let self_out_is_target = t.extrait(T_TARGET, &[self_out]);
+    let p0_is_target = t.extrait(T_TARGET, &[p0]);
+
+    let facts = Facts::default()
+        .opaque(K_OP, 1)
+        .trait_(T_BASE, 0)
+        .trait_(T_SUB, 1)
+        .trait_(T_TARGET, 1)
+        .alias(T_BASE, OUTPUT, 0)
+        .alias(T_BASE, ERR, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    struct OpSel<'a> {
+        op_views: &'a [ClauseView<'a>],
+        sub_views: &'a [ClauseView<'a>],
+    }
+    impl Selected for OpSel<'_> {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::Unanswered)
+        }
+        fn opaque_clauses(&self, opaque: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+            (opaque == K_OP).then_some((1, self.op_views))
+        }
+        fn trait_clauses(&self, trait_: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+            (trait_ == T_SUB).then_some((1, self.sub_views))
+        }
+    }
+
+    const P0_P0: &[Region] = &[Region::Param(0), Region::Param(0)];
+    let op_col = RegionCol::lay(t.t.view(), op_is_sub, &facts, P0_P0, alloc()).unwrap();
+    let sub_col = RegionCol::lay(t.t.view(), self_out_is_target, &facts, P0, alloc()).unwrap();
+    let op_views = [ClauseView { nth: 0, binders: 0, col: ColView::of(&op_col), outlives: None }];
+    let sub_views = [ClauseView { nth: 0, binders: 0, col: ColView::of(&sub_col), outlives: None }];
+    let sel = OpSel { op_views: &op_views, sub_views: &sub_views };
+
+    let p = params(1, &[]);
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(p0_is_target, P0), binders: 0 }];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &[], output: ty(unit, NONE), clauses: &clauses };
+
+    let types_ok = [arg(op_out, 1, 1)];
+    let (res, rec) = run(&cols, &sel, &Own::default(), 2, Callee::Fn(sig), GenericArgs { lifetimes: range(0, 1), types: &types_ok }, &[], arg(unit, 2, 0));
+    assert_eq!(res, Ok(()), "`<Opaque<'1> as Base>::Out: Target<'0>` proved via `Opaque<'a>: Sub<'a>` elaboration: {res:?}");
+    assert_eq!(set(&rec), pairs(&[(0, 1), (1, 0)]), "elaboration must equate `'0` and `'1` invariantly");
+
+    let types_bad = [arg(op_err, 1, 1)];
+    let (res, _) = run(&cols, &sel, &Own::default(), 2, Callee::Fn(sig), GenericArgs { lifetimes: range(0, 1), types: &types_bad }, &[], arg(unit, 2, 0));
+    assert!(matches!(res, Err(Refused::Unselected { .. })), "NEGATIVE CONTROL: `<Opaque as Base>::Err` has no `Target` bound: {res:?}");
+}
+
+/// Higher-ranked clause over `dyn for<'a> Tr<'a>` Skolemizes via canonical `dyn_placeholder(ord)`
+/// so passing the same `dyn for<'a> Tr<'a>` to two separate calls shares one placeholder instead
+/// of equating two distinct rigid placeholders.
+#[test]
+fn dyn_clause_skolemization_shares_canonical_placeholder_across_calls() {
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let pred = t.extrait(T_VISITOR, &[]);
+    let dyn_tr = t.dynamic(&[pred]);
+    let clause_tr = t.extrait(T_VISITOR, &[p0]);
+    let facts = Facts::default().trait_(T_VISITOR, 1);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    const L00: &[Region] = &[Region::Late { binder: 0, var: 0 }];
+    let p = params(0, &[]);
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(clause_tr, L00), binders: 1 }];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &[], output: ty(unit, NONE), clauses: &clauses };
+
+    struct RecDyn {
+        rec: Rec,
+        dyn_ph: SVec<Origin>,
+    }
+    impl Constraints for RecDyn {
+        fn subset(&mut self, a: Origin, b: Origin) { self.rec.subset(a, b); }
+        fn outlives_static(&mut self, a: Origin) { self.rec.outlives_static(a); }
+        fn fresh(&mut self, kind: Kind) -> Origin { self.rec.fresh(kind) }
+        fn dyn_placeholder(&mut self, ordinal: u32) -> Origin {
+            let idx = ordinal as usize;
+            while self.dyn_ph.len() <= idx {
+                let o = self.rec.fresh(Kind::Placeholder);
+                self.dyn_ph.push(o);
+            }
+            self.dyn_ph[idx]
+        }
+    }
+
+    let origins: SVec<Origin> = (0..2).map(Origin).collect();
+    let mut out = RecDyn {
+        rec: Rec { next: 100, subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new() },
+        dyn_ph: SVec::new(),
+    };
+    let sel = Sel::default();
+    let own = Own::default();
+    let types = [arg(dyn_tr, 0, 2)];
+    let generics = GenericArgs { lifetimes: SlotRange::EMPTY, types: &types };
+    for call_idx in 0..2 {
+        let res = {
+            let mut cx = Cx { types: &cols, sig_types: &cols, selected: &sel, owner: &own, origins: &origins, out: &mut out };
+            call(&mut cx, Callee::Fn(sig), generics, &[], arg(unit, 2, 0), alloc())
+        };
+        assert_eq!(res, Ok(()), "call {call_idx} with `dyn for<'a> Tr<'a>` must succeed: {res:?}");
+    }
+    assert_eq!(out.dyn_ph.len(), 1, "both calls must share one canonical dyn_placeholder(0)");
+    assert_eq!(out.rec.placeholders.len(), 1, "no second distinct rigid placeholder should be minted");
+}
+
+/// Target 1 (`test_tx_iterator_for_payload` shape): an opaque type `Opaque<'a, 'b>` with an
+/// opaque bound `Opaque: SubTrait` whose supertrait is `BaseTrait: 'static` satisfies
+/// `Opaque<'a, 'b>: 'static` without forcing its captured lifetimes `'a, 'b` to outlive `'static`.
+///
+/// NEGATIVE CONTROL: an opaque without any `'static` (direct or supertrait) bound MUST still
+/// constrain its captured lifetimes `'a, 'b: 'static`.
+#[test]
+fn opaque_supertrait_static_outlives_does_not_constrain_captures() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+    use blaze_typeck::regions::RegionCol;
+    const K_OP_STATIC: ItemKey = ItemKey(880);
+    const K_OP_PLAIN: ItemKey = ItemKey(881);
+    const T_SUB: ItemKey = ItemKey(882);
+    const T_BASE: ItemKey = ItemKey(883);
+
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let op_static = t.opaque(K_OP_STATIC, &[]);
+    let op_plain = t.opaque(K_OP_PLAIN, &[]);
+    let op_is_sub = t.extrait(T_SUB, &[op_static]);
+    let self_is_base = t.extrait(T_BASE, &[p0]);
+
+    let facts = Facts::default()
+        .opaque(K_OP_STATIC, 2)
+        .opaque(K_OP_PLAIN, 2)
+        .trait_(T_SUB, 0)
+        .trait_(T_BASE, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    struct OpOutlivesSel<'a> {
+        op_views: &'a [ClauseView<'a>],
+        sub_views: &'a [ClauseView<'a>],
+        base_views: &'a [ClauseView<'a>],
+    }
+    impl Selected for OpOutlivesSel<'_> {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::Unanswered)
+        }
+        fn opaque_clauses(&self, opaque: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+            (opaque == K_OP_STATIC).then_some((2, self.op_views))
+        }
+        fn trait_clauses(&self, trait_: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+            if trait_ == T_SUB {
+                Some((0, self.sub_views))
+            } else if trait_ == T_BASE {
+                Some((0, self.base_views))
+            } else {
+                None
+            }
+        }
+    }
+
+    const P0_P1: &[Region] = &[Region::Param(0), Region::Param(1)];
+    let op_col = RegionCol::lay(t.t.view(), op_is_sub, &facts, P0_P1, alloc()).unwrap();
+    let sub_col = RegionCol::lay(t.t.view(), self_is_base, &facts, NONE, alloc()).unwrap();
+    let base_self_col = RegionCol::lay(t.t.view(), p0, &facts, NONE, alloc()).unwrap();
+    let op_views = [ClauseView { nth: 0, binders: 0, col: ColView::of(&op_col), outlives: None }];
+    let sub_views = [ClauseView { nth: 0, binders: 0, col: ColView::of(&sub_col), outlives: None }];
+    let base_views = [ClauseView { nth: 0, binders: 0, col: ColView::of(&base_self_col), outlives: Some(Region::Static) }];
+    let sel = OpOutlivesSel { op_views: &op_views, sub_views: &sub_views, base_views: &base_views };
+
+    // Callee: `fn require_static<T: 'static>(_x: T)`
+    let p = params(0, &[]);
+    let clauses = [ClauseIn::TypeOutlives { subject: ty(p0, NONE), region: Region::Static }];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &[ty(p0, NONE)], output: ty(unit, NONE), clauses: &clauses };
+
+    // Positive: `OpaqueStatic<'0, '1>: 'static` holds via `Sub -> Base: 'static`; ZERO `'static` on `'0`, `'1`.
+    let types_ok = [arg(op_static, 0, 2)];
+    let (res, rec) = run(&cols, &sel, &Own::default(), 2, Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types_ok }, &[arg(op_static, 0, 2)], arg(unit, 2, 0));
+    assert_eq!(res, Ok(()), "opaque with supertrait `'static` must satisfy `T: 'static`: {res:?}");
+    assert!(rec.statics.is_empty(), "captured lifetimes must NOT be forced `'static`: {:?}", rec.statics);
+
+    // Negative control: `OpaquePlain<'0, '1>: 'static` MUST require both `'0: 'static` and `'1: 'static`.
+    let types_plain = [arg(op_plain, 0, 2)];
+    let (res_plain, rec_plain) = run(&cols, &sel, &Own::default(), 2, Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types_plain }, &[arg(op_plain, 0, 2)], arg(unit, 2, 0));
+    assert_eq!(res_plain, Ok(()));
+    let mut statics: SVec<u32> = rec_plain.statics.clone();
+    statics.sort_unstable();
+    assert_eq!(statics, [0, 1], "NEGATIVE CONTROL: plain opaque must require both captured lifetimes to be `'static`");
+}
+
+/// Target 4 (`validator.rs::validate_each` shape): an assumed higher-ranked GAT projection
+/// supertrait clause `for<'a> <Self::Factory as Factory>::Evm<'a> = Evm<'a>` instantiates its
+/// `for<'a>` binder to an existential origin so normalizing `EvmFor<'x, Self>` to `Evm<'x>`
+/// leaves no raw `Reg::Bound { binder: 0, .. }` when walked outside `BinderCtx::Clause`.
+#[test]
+fn higher_ranked_gat_projection_supertrait_clause_normalizes_cleanly() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+    use blaze_typeck::regions::RegionCol;
+    use crate::inst::SelfHead;
+    const T_CONF: ItemKey = ItemKey(890);
+    const T_BASE: ItemKey = ItemKey(891);
+    const T_FAC: ItemKey = ItemKey(892);
+    const K_EVM: ItemKey = ItemKey(893);
+    let fac_name = Name::of("Factory");
+    let evm_name = Name::of("Evm");
+
+    let mut t = Tys::new();
+    let p0 = t.param(0);
+    let self_fac = t.alias(T_BASE, fac_name, &[p0]);
+    let self_evm = t.alias(T_FAC, evm_name, &[self_fac]);
+    let evm_adt = t.adt(K_EVM, &[]);
+    let self_is_conf = t.extrait(T_CONF, &[p0]);
+    let proj_clause = t.exproj(T_FAC, evm_name, &[self_fac], evm_adt);
+
+    let facts = Facts::default()
+        .adt(K_EVM, 1, &[Variance::In])
+        .trait_(T_CONF, 0)
+        .trait_(T_BASE, 0)
+        .trait_(T_FAC, 0)
+        .alias(T_BASE, fac_name, 0)
+        .alias(T_FAC, evm_name, 1);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    const L00_L00: &[Region] = &[Region::Late { binder: 0, var: 0 }, Region::Late { binder: 0, var: 0 }];
+    let owner_col = RegionCol::lay(t.t.view(), self_is_conf, &facts, NONE, alloc()).unwrap();
+    let conf_proj_col = RegionCol::lay(t.t.view(), proj_clause, &facts, L00_L00, alloc()).unwrap();
+    let owner_clauses = [ClauseView { nth: 0, binders: 0, col: ColView::of(&owner_col), outlives: None }];
+    let conf_views = [ClauseView { nth: 0, binders: 1, col: ColView::of(&conf_proj_col), outlives: None }];
+
+    struct HrGatSel<'a>(&'a [ClauseView<'a>]);
+    impl Selected for HrGatSel<'_> {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::GenericSelf(SelfHead::Alias))
+        }
+        fn trait_clauses(&self, trait_: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+            (trait_ == T_CONF).then_some((0, self.0))
+        }
+    }
+    struct HrGatOwn<'a>(&'a [ClauseView<'a>]);
+    impl Owner for HrGatOwn<'_> {
+        fn item(&self) -> ItemKey { OWNER }
+        fn universal(&self, r: Region) -> Option<Origin> {
+            match r {
+                Region::Param(i) => Some(Origin(50 + i)),
+                _ => None,
+            }
+        }
+        fn param(&self, _p: u32) -> Option<Origin> { None }
+        fn bound(&self, _p: u32, _trait_: ItemKey) -> Option<Typed<'_>> { None }
+        fn body_params(&self, _body: PTy) -> Option<&[u32]> { None }
+        fn clauses(&self) -> &[ClauseView<'_>] {
+            self.0
+        }
+    }
+
+    // Callee: `fn evm_with_env<'a, C: Conf>() -> <<C as Base>::Factory as Factory>::Evm<'a>`
+    // Caller receives `Evm<'1>` (`origin 1`) with `'a` = `origin 0`.
+    let p = params(1, &[]);
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &[], output: ty(self_evm, P0), clauses: &[] };
+    let types = [arg(p0, 2, 0)];
+    let (res, rec) = run(
+        &cols,
+        &HrGatSel(&conf_views),
+        &HrGatOwn(&owner_clauses),
+        2,
+        Callee::Fn(sig),
+        GenericArgs { lifetimes: range(0, 1), types: &types },
+        &[],
+        arg(evm_adt, 1, 1),
+    );
+    assert_eq!(res, Ok(()), "higher-ranked GAT projection supertrait clause must normalize cleanly: {res:?}");
+    // Existential origin `o` for `'a` must tie `0` and `1` invariantly (`0 == o == 1`).
+    assert!(!rec.subsets.is_empty(), "must emit region constraints tying call lifetime `'0` to `Evm<'1>`");
 }

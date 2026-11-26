@@ -1,22 +1,60 @@
-use std::{cell::RefCell, hash::BuildHasher};
+use core::{alloc::Allocator, hash::BuildHasher, ops::Range};
 
 use blaze_hash::FixedState;
+use blaze_own::Vec as OwnVec;
 
 /// Diff of two op sequences: equal prefix and suffix skipped, multiset diff of the middle by
 /// `hash` (the hash of the item) then `==`. Positions are indexes into old/new, ascending. Within
 /// the middle, an item present in both (same hash and equal) as many times is kept, not removed
 /// and re-added.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct SeqDiff {
-    pub removed: Vec<u32>,
-    pub added: Vec<u32>,
+///
+/// Holds reusable scratch buffers for the middle's `(hash, index)` rows so warm calls allocate
+/// nothing and need no thread-local state.
+#[derive(Debug)]
+pub struct SeqDiff<A: Allocator> {
+    pub removed: OwnVec<u32, A>,
+    pub added: OwnVec<u32, A>,
+    olds: OwnVec<(u64, u32), A>,
+    news: OwnVec<(u64, u32), A>,
 }
 
-impl SeqDiff {
-    pub fn new() -> SeqDiff {
-        SeqDiff::default()
+impl<A: Allocator + Clone> Clone for SeqDiff<A> {
+    fn clone(&self) -> Self {
+        let alloc = self.removed.allocator().clone();
+        let mut removed = OwnVec::with_capacity_in(self.removed.len(), alloc.clone());
+        removed.extend_from_slice(&self.removed);
+        let mut added = OwnVec::with_capacity_in(self.added.len(), alloc.clone());
+        added.extend_from_slice(&self.added);
+        SeqDiff {
+            removed,
+            added,
+            olds: OwnVec::new_in(alloc.clone()),
+            news: OwnVec::new_in(alloc),
+        }
     }
+}
 
+impl<A: Allocator, B: Allocator> PartialEq<SeqDiff<B>> for SeqDiff<A> {
+    fn eq(&self, other: &SeqDiff<B>) -> bool {
+        self.removed.as_slice() == other.removed.as_slice()
+            && self.added.as_slice() == other.added.as_slice()
+    }
+}
+
+impl<A: Allocator> Eq for SeqDiff<A> {}
+
+impl<A: Allocator + Clone> SeqDiff<A> {
+    pub fn new_in(alloc: A) -> SeqDiff<A> {
+        SeqDiff {
+            removed: OwnVec::new_in(alloc.clone()),
+            added: OwnVec::new_in(alloc.clone()),
+            olds: OwnVec::new_in(alloc.clone()),
+            news: OwnVec::new_in(alloc),
+        }
+    }
+}
+
+impl<A: Allocator> SeqDiff<A> {
     pub fn is_empty(&self) -> bool {
         self.removed.is_empty() && self.added.is_empty()
     }
@@ -27,20 +65,14 @@ impl SeqDiff {
     }
 }
 
-#[expect(
-    blaze::process_static,
-    reason = "per-thread diff scratch, uncapped: it keeps the largest middle the thread diffed; a cap must bound it"
-)]
-thread_local! {
-    /// The middle's `(hash, index)` rows of each side, kept for the next diff on this thread.
-    static SCRATCH: RefCell<(Vec<(u64, u32)>, Vec<(u64, u32)>)> =
-        const { RefCell::new((Vec::new(), Vec::new())) }; // alloc: a const initializer: empty, grown once per thread and kept
-}
-
 /// [`SeqDiff`] of `old` and `new` into `out` (cleared first). `O(n)` compares for the prefix and
 /// suffix, then `O(k log k)` for a middle of `k` items: one hash each, a sort of the
 /// `(hash, index)` rows, and a merge. A warm call allocates nothing.
-pub fn diff_seq<T: Eq + std::hash::Hash>(old: &[T], new: &[T], out: &mut SeqDiff) {
+pub fn diff_seq<T: Eq + core::hash::Hash, A: Allocator>(
+    old: &[T],
+    new: &[T],
+    out: &mut SeqDiff<A>,
+) {
     out.clear();
     assert!(
         old.len() < u32::MAX as usize && new.len() < u32::MAX as usize,
@@ -62,24 +94,16 @@ pub fn diff_seq<T: Eq + std::hash::Hash>(old: &[T], new: &[T], out: &mut SeqDiff
         out.removed.extend(old_mid.map(|at| at as u32));
         return;
     }
-    let reentered = SCRATCH.with(|scratch| {
-        let Ok(mut scratch) = scratch.try_borrow_mut() else { return true };
-        let (olds, news) = &mut *scratch;
-        rows(old, old_mid, olds);
-        rows(new, new_mid, news);
-        merge(old, new, olds, news, out);
-        false
-    });
-    if reentered {
-        // Only a `Hash` or `Eq` impl that diffs again gets here: it gets buffers of its own.
-        let (mut olds, mut news) = (Vec::new(), Vec::new()); // alloc: a reentrant diff, never on the warm path
-        rows(old, prefix..old.len() - suffix, &mut olds);
-        rows(new, prefix..new.len() - suffix, &mut news);
-        merge(old, new, &mut olds, &mut news, out);
-    }
+    rows(old, old_mid, &mut out.olds);
+    rows(new, new_mid, &mut out.news);
+    merge(old, new, &mut out.olds, &mut out.news, &mut out.removed, &mut out.added);
 }
 
-fn rows<T: std::hash::Hash>(items: &[T], range: std::ops::Range<usize>, out: &mut Vec<(u64, u32)>) {
+fn rows<T: core::hash::Hash, A: Allocator>(
+    items: &[T],
+    range: Range<usize>,
+    out: &mut OwnVec<(u64, u32), A>,
+) {
     out.clear();
     out.extend(range.map(|at| (FixedState.hash_one(&items[at]), at as u32)));
     out.sort_unstable();
@@ -87,12 +111,13 @@ fn rows<T: std::hash::Hash>(items: &[T], range: std::ops::Range<usize>, out: &mu
 
 /// Matches the rows of equal hash and equal item one to one, then writes the unmatched indexes
 /// of each side in ascending order.
-fn merge<T: Eq>(
+fn merge<T: Eq, A: Allocator>(
     old: &[T],
     new: &[T],
     olds: &mut [(u64, u32)],
     news: &mut [(u64, u32)],
-    out: &mut SeqDiff,
+    removed: &mut OwnVec<u32, A>,
+    added: &mut OwnVec<u32, A>,
 ) {
     const MATCHED: u32 = u32::MAX;
     let (mut i, mut j) = (0, 0);
@@ -119,8 +144,8 @@ fn merge<T: Eq>(
             j = j_end;
         }
     }
-    out.removed.extend(olds.iter().filter(|row| row.1 != MATCHED).map(|row| row.1));
-    out.added.extend(news.iter().filter(|row| row.1 != MATCHED).map(|row| row.1));
-    out.removed.sort_unstable();
-    out.added.sort_unstable();
+    removed.extend(olds.iter().filter(|row| row.1 != MATCHED).map(|row| row.1));
+    added.extend(news.iter().filter(|row| row.1 != MATCHED).map(|row| row.1));
+    removed.sort_unstable();
+    added.sort_unstable();
 }

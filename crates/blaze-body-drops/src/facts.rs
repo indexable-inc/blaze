@@ -46,6 +46,16 @@ pub struct Part<'f> {
     pub state: PartState,
 }
 
+/// One variant's remaining drops for a partially-moved enum ([`DropState::Enum`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct VariantDrop<'f> {
+    pub variant: u32,
+    /// The discriminant value matching `Value::Discriminant(place)`.
+    pub discr: u128,
+    /// Remaining parts of `place#variant` to drop in field order (empty if nothing left).
+    pub parts: &'f [Part<'f>],
+}
+
 /// What the move check says of the place a `Drop` row names, at that row.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DropState<'f> {
@@ -59,6 +69,12 @@ pub enum DropState<'f> {
     /// orders them; the answer may list them in any order). Parts initialized on no path are
     /// not listed.
     Partial(&'f [Part<'f>]),
+    /// An enum with some variant field(s) moved out: switch on `Value::Discriminant(place)` (in
+    /// a temporary of type `discr_ty`) and drop each variant's remaining parts.
+    Enum {
+        discr_ty: PTy,
+        variants: &'f [VariantDrop<'f>],
+    },
 }
 
 /// Whether a type's values need drop.

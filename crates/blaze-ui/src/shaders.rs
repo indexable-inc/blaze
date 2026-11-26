@@ -735,7 +735,7 @@ fn emit_sdf_shader(lang: TargetLang, out: &mut dyn fmt::Write) -> fmt::Result {
     }
 }
 
-fn emit_glyph_shader(lang: TargetLang, out: &mut dyn fmt::Write) -> fmt::Result {
+fn emit_glyph_shader(lang: TargetLang, rgba_texture: bool, out: &mut dyn fmt::Write) -> fmt::Result {
     // Helper: sd_round_box for fragment rounded-rect glyph clipping
     let p_var = IrExpr::Var("p");
     let c_var = IrExpr::Var("center");
@@ -854,11 +854,9 @@ fn emit_glyph_shader(lang: TargetLang, out: &mut dyn fmt::Write) -> fmt::Result 
 
     // IMPORTANT for WebGPU WGSL uniformity analysis: `textureSample` MUST run in uniform control
     // flow BEFORE any `if (...) { discard; }` branch!
-    let tex_a_init = IrExpr::Field(
-        &IrExpr::Sample2d { tex: "atlas_tex", smp: "atlas_samp", uv: &v_uv, level: None },
-        "a",
-    );
-    let tex_a_var = IrExpr::Var("tex_a");
+    let tex_sample = IrExpr::Sample2d { tex: "atlas_tex", smp: "atlas_samp", uv: &v_uv, level: None };
+    let tex_var = IrExpr::Var("tex_s");
+    let tex_a_expr = IrExpr::Field(&tex_var, "a");
 
     let clip_var = IrExpr::Var("clip");
     let clip_rect = IrExpr::Field(&clip_var, "rect");
@@ -882,14 +880,20 @@ fn emit_glyph_shader(lang: TargetLang, out: &mut dyn fmt::Write) -> fmt::Result 
     let clip_a_var = IrExpr::Var("clip_a");
     let final_a_init = IrExpr::Binary(
         IrBinOp::Mul,
-        &IrExpr::Binary(IrBinOp::Mul, &IrExpr::Field(&v_col, "a"), &tex_a_var),
+        &IrExpr::Binary(IrBinOp::Mul, &IrExpr::Field(&v_col, "a"), &tex_a_expr),
         &clip_a_var,
     );
     let final_a_var = IrExpr::Var("final_a");
     let discard_stmt = [IrStmt::Discard];
+    let out_rgb_rgba = IrExpr::Binary(
+        IrBinOp::Mul,
+        &IrExpr::Field(&tex_var, "rgb"),
+        &IrExpr::Field(&v_col, "rgb"),
+    );
+    let out_rgb = if rgba_texture { out_rgb_rgba } else { IrExpr::Field(&v_col, "rgb") };
 
     let fs_body = [
-        IrStmt::Let { name: "tex_a", ty: None, mutable: false, init: tex_a_init },
+        IrStmt::Let { name: "tex_s", ty: None, mutable: false, init: tex_sample },
         IrStmt::Let { name: "clip", ty: None, mutable: false, init: IrExpr::Index(&clips, &v_clip_id) },
         IrStmt::Let { name: "clip_a", ty: None, mutable: false, init: clip_a_init },
         IrStmt::Let { name: "final_a", ty: None, mutable: false, init: final_a_init },
@@ -898,10 +902,7 @@ fn emit_glyph_shader(lang: TargetLang, out: &mut dyn fmt::Write) -> fmt::Result 
             then_body: &discard_stmt,
             else_body: &[],
         },
-        IrStmt::Return(Some(IrExpr::Construct(
-            IrTy::Vec4,
-            &[IrExpr::Field(&v_col, "rgb"), final_a_var],
-        ))),
+        IrStmt::Return(Some(IrExpr::Construct(IrTy::Vec4, &[out_rgb, final_a_var]))),
     ];
 
     let entries = [
@@ -940,10 +941,16 @@ pub fn emit_ui_sdf_msl(out: &mut dyn fmt::Write) -> fmt::Result {
 /// Bindings in `@group(0)`: `0 = Viewport`, `1 = glyphs: array<GlyphInst>`, `2 = clips: array<ClipRect>`,
 /// `3 = atlas_samp`, `4 = atlas_tex`.
 pub fn emit_ui_glyph_wgsl(out: &mut dyn fmt::Write) -> fmt::Result {
-    emit_glyph_shader(TargetLang::Wgsl, out)
+    emit_glyph_shader(TargetLang::Wgsl, false, out)
 }
 
 /// Emit the Glyph Atlas UI shader (`ui_glyph_vs` + `ui_glyph_fs`) as Metal Shading Language 2.4.
 pub fn emit_ui_glyph_msl(out: &mut dyn fmt::Write) -> fmt::Result {
-    emit_glyph_shader(TargetLang::Msl, out)
+    emit_glyph_shader(TargetLang::Msl, false, out)
+}
+
+/// Emit the RGBA Sprite/Icon Atlas UI shader (`ui_glyph_vs` + `ui_glyph_fs`) as MSL 2.4.
+/// Samples full RGBA texels modulated by `GlyphInst::color` with rounded-rect clipping.
+pub fn emit_ui_sprite_msl(out: &mut dyn fmt::Write) -> fmt::Result {
+    emit_glyph_shader(TargetLang::Msl, true, out)
 }

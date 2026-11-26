@@ -31,11 +31,12 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::source::{Load, LoadedExpansion};
 use blaze_own::{AVec, Alloc, Bump, SharedAlloc, Vec};
 use blaze_scope::items_record::{CurrentFile, ItemsRecordError, VerifiedItems};
-use blaze_scope::names_record::{NamesRecordError, Verified};
+use blaze_scope::names_record::{NamesRecordError, Verified, VerifiedModules};
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::SourceTexts;
 use bstd::cx::Cx;
 use bstd::mem::Frame;
+use bstd::sync::CachePadded;
 
 use blaze_scope::expansion_records::{ExpansionRecord, ExpansionRecordsError};
 
@@ -142,6 +143,31 @@ pub(crate) fn checked_records<'n>(
     Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
 }
 
+/// O(1) lazy-validated variant of [`checked_records`] for in-place local CAS records
+/// (`engine_records::InPlace`): verifies headers, alignment, all section bounds, column headers,
+/// crate keys, edition, `CrateRoot`, and expansion directory upfront, deferring module scope
+/// `ScopeView::read`, variant UTF-8, and `ItemsRecord` string UTF-8 checks until accessed.
+pub(crate) fn checked_records_lazy<'n>(
+    name: Name,
+    key: CrateItemKey,
+    names: &'n [u8],
+    items: &'n [u8],
+    expansions: &'n [u8],
+) -> Result<CrateRecords<'n>, LoadError> {
+    let expansions = ExpansionTexts::open(expansions).map_err(|error| LoadError::Expansions { name, error })?;
+    let names_proof = Verified::check_header(names).map_err(|error| LoadError::Names { name, error })?;
+    let found = names_proof.key();
+    if found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
+    }
+    let items_proof = VerifiedItems::check_header(items).map_err(|error| LoadError::Items { name, error })?;
+    let (found, edition) = (items_proof.key(), items_proof.edition());
+    if found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
+    }
+    Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
+}
+
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key
 /// (`input.at`) in place and copied into `alloc` ([`crate_records`]). Expansion text records are
 /// opened later by `StoreLoad::expansion`.
@@ -179,6 +205,40 @@ pub(crate) struct Unopened {
     pub(crate) package: &'static str,
 }
 
+/// Toolchain crate names that may declare `#[lang]` items or incoherent inherent impls
+/// (`#![rustc_coherence_is_core]` / `#[rustc_allow_incoherent_impl]`), matching
+/// `blaze-ladder/src/front2/source.rs` (`Records::name_lang_crates`), `personality.rs`, and
+/// `engine_bodies.rs` (`is_lang_crate_name`).
+pub(crate) fn is_lang_crate_name(name: &str) -> bool {
+    matches!(name, "core" | "alloc" | "std" | "bstd" | "blaze_std" | "panic_unwind" | "panic_abort")
+}
+
+/// Selects the actual lang-item crates from `checked.lang_places()` for `run`/`test` programs:
+/// always keeps the owner (place 0), every sysroot slot of `list`, and crates matching
+/// [`is_lang_crate_name`]. Excludes pure-dependency toolchain crates (`libc`, `gimli`, `object`,
+/// `addr2line`, `hashbrown`, `miniz_oxide`, `adler2`, `memchr`, `rustc_demangle`, `cfg_if`,
+/// `unwind`, `std_detect`, `rustc_std_workspace_*`, `compiler_builtins`, `test`) so
+/// `Records::name_lang_crates` and `Index::from_source` never eagerly open ~15 unused toolchain
+/// `CrateScope` records (~29 MB) on every edit.
+pub(crate) fn lang_places_of<A: core::alloc::Allocator>(
+    checked: &blaze_world::check_scope::CheckScope<'_>,
+    list: &blaze_world::crate_list::CrateList<'static>,
+    into: &mut Vec<usize, A>,
+) {
+    use blaze_world::crate_list::CrateGraph;
+    let sysroot = CrateGraph::sysroot(list);
+    let readers = checked.readers();
+    for place in checked.lang_places() {
+        let keep = place == 0
+            || readers.get(place).is_some_and(|&(world_at, _)| {
+                sysroot.contains(&Some(world_at)) || is_lang_crate_name(CrateGraph::name(list, world_at))
+            });
+        if keep {
+            into.push(place);
+        }
+    }
+}
+
 /// THE REQUEST'S SCOPE RECORDS OPENED BY NEED (piece C (a)): each crate's `CrateScope` record
 /// read in place from the committed snapshot and its sections checked once a request
 /// (front_load.rs `checked_records` through engine_records.rs `open_record`, rule 74), at the
@@ -191,37 +251,162 @@ pub(crate) struct Unopened {
 /// [`ByNeedCounts::opened`] over that, 1.0 by construction (a slot opens once). Before, every
 /// crate of every opened scope was opened at the setup (tempo, one edited body: 773 records,
 /// 823 MB checked).
-/// One immutable pack file's encoded `FileItems` buffer (16-aligned slice `bytes[offset..offset + len]`)
-/// and its surface digest, cached once per file slot across all workers of a request.
-struct CachedPackFileItems {
-    edition: u8,
+/// Content-addressed CAS key for a pack/dependency file's encoded `(surface, FileItems)` record.
+/// Built purely from registered `blaze_drive::key` primitives (`FILE_SOURCE_DOMAIN`,
+/// `CONTENT_DOMAIN`, `VALUE_DOMAIN`, `TASK_DOMAIN`) and covering all four `blaze-file-items`
+/// outliner domains, the file edition, and the file text's `FILE_DOMAIN` digest (rule 21).
+pub(crate) fn pack_file_items_key(edition: blaze_surface::Edition, text_digest: ContentId) -> Key {
+    let source = blaze_drive::key::file_source(text_digest, edition.byte());
+    let name = Name::new(blaze_drive::Kind::FileItems, text_digest);
+    let base = blaze_drive::key::content_key(b"pack-file-items-v1");
+    let reads = [
+        (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::SURFACE_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
+        (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::ITEM_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
+        (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::SIGNATURE_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
+        (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::NAMES_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
+    ];
+    let tool = blaze_drive::Tool(blaze_drive::key::value_key(base, &reads).0);
+    blaze_drive::key::task_key(tool, name, &source)
+}
+
+/// Encodes the 16-aligned `blaze_drive::record` header (`PAYLOAD_ALIGN = 16`) for a cached
+/// pack/dependency `FileItems` CAS record, so callers can place `[head | file_items]` into one
+/// 16-aligned buffer and committed CAS reads open `FileItemsView` zero-copy.
+pub(crate) fn pack_file_items_head<'a>(
+    key: Key,
+    text_digest: ContentId,
     surface: ContentId,
-    /// Backing allocation sized `len + 15` (never reallocated), storing the 16-aligned `FileItems` bytes at `offset`.
-    buf: Vec<u8, SharedAlloc<'static>>,
-    offset: usize,
-    len: usize,
+    file_items_len: usize,
+    head_alloc: Alloc<'a>,
+) -> AVec<'a, u8> {
+    let name = Name::new(blaze_drive::Kind::FileItems, key.0);
+    blaze_drive::record::write_plain_head(name, text_digest, surface, &[], file_items_len, head_alloc)
+}
+
+/// Opens a persisted pack/dependency `FileItems` CAS record in place (zero-copy), validating the
+/// drive envelope, matching `text_digest`, and `FileItemsView` columns/alignment (rule 3, 21).
+pub(crate) fn open_pack_file_items<'n>(
+    bytes: &'n [u8],
+    file: u32,
+    text_digest: ContentId,
+) -> Result<(ContentId, blaze_surface::FileItemsView<'n>), ItemsRecordError> {
+    let view = match blaze_drive::record::open(bytes) {
+        Ok(blaze_drive::record::Stored::Whole(view)) => view,
+        Ok(blaze_drive::record::Stored::Shape(_)) => {
+            return Err(ItemsRecordError::FileItemsUnavailable {
+                file,
+                what: "cached pack FileItems record is a shape record without payload (front_load.rs)",
+            });
+        }
+        Err(_) => {
+            return Err(ItemsRecordError::FileItemsUnavailable {
+                file,
+                what: "cached pack FileItems record bytes are malformed (front_load.rs)",
+            });
+        }
+    };
+    if view.source != text_digest {
+        return Err(ItemsRecordError::FileItemsUnavailable {
+            file,
+            what: "cached pack FileItems record source digest disagrees with file text (front_load.rs)",
+        });
+    }
+    let fi = blaze_surface::FileItemsView::read(view.payload)
+        .map_err(|why| ItemsRecordError::FileItemsRead { file, why })?;
+    if fi.file() != text_digest {
+        return Err(ItemsRecordError::FileItemsUnavailable {
+            file,
+            what: "cached pack FileItems view digest disagrees with file text (front_load.rs)",
+        });
+    }
+    Ok((view.out, fi))
+}
+
+/// One immutable pack file's cached `FileItems` entry: either a zero-copy CAS snapshot hit
+/// (no heap buffer copied) or an in-memory 16-aligned buffer built on a CAS miss.
+enum CachedPackFileItems {
+    Snapshot {
+        edition: u8,
+        key: Key,
+        text_digest: ContentId,
+    },
+    Owned {
+        edition: u8,
+        surface: ContentId,
+        /// Backing allocation sized `len + 15` (never reallocated), storing the 16-aligned `FileItems` bytes at `offset`.
+        buf: Vec<u8, SharedAlloc<'static>>,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl CachedPackFileItems {
-    fn aligned_bytes(&self) -> Option<&[u8]> {
-        let end = self.offset.checked_add(self.len)?;
-        self.buf.get(self.offset..end)
+    fn edition(&self) -> u8 {
+        match self {
+            CachedPackFileItems::Snapshot { edition, .. } | CachedPackFileItems::Owned { edition, .. } => *edition,
+        }
+    }
+
+    fn open<'s>(&'s self, snapshot: &'s StoreSnapshot, file: u32, text: &'s str) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+        match self {
+            CachedPackFileItems::Snapshot { key, text_digest, .. } => {
+                let bytes = match snapshot.get(*key) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        return Some(Err(ItemsRecordError::FileItemsUnavailable {
+                            file,
+                            what: "cached pack FileItems record disappeared from committed snapshot (front_load.rs)",
+                        }));
+                    }
+                    Err(_) => {
+                        return Some(Err(ItemsRecordError::FileItemsUnavailable {
+                            file,
+                            what: "reading cached pack FileItems record from committed snapshot failed (front_load.rs)",
+                        }));
+                    }
+                };
+                match open_pack_file_items(bytes, file, *text_digest) {
+                    Ok((surface, view)) => Some(Ok(CurrentFile { text, surface, view })),
+                    Err(err) => Some(Err(err)),
+                }
+            }
+            CachedPackFileItems::Owned { surface, buf, offset, len, .. } => {
+                let end = offset.checked_add(*len)?;
+                let bytes = buf.get(*offset..end)?;
+                let view = match blaze_surface::FileItemsView::read(bytes) {
+                    Ok(v) => v,
+                    Err(why) => return Some(Err(ItemsRecordError::FileItemsRead { file, why })),
+                };
+                Some(Ok(CurrentFile { text, surface: *surface, view }))
+            }
+        }
     }
 }
 
 struct OpenedCrate<'r> {
     records: CrateRecords<'r>,
-    /// Per-file `FileItems` cache for immutable pack crates (indexed by `file_index`).
-    pack_files: blaze_own::Vec<OnceLock<CachedPackFileItems>, blaze_own::SharedAlloc<'static>>,
+    /// Shared lock-free per-module verification bitmap for lazy `names_proof`, populated once per
+    /// accessed module across all workers of the request.
+    module_cache: VerifiedModules<'r, SharedAlloc<'static>>,
+    /// Number of file slots in `records.items_proof`; backing `pack_files` vector is allocated
+    /// lazily on first `cached_pack_file_items` ask so crates whose files are never queried
+    /// allocate zero file slots.
+    nfiles: usize,
+    pack_files: OnceLock<blaze_own::Vec<OnceLock<CachedPackFileItems>, blaze_own::SharedAlloc<'static>>>,
 }
 
 pub(crate) struct ScopeRecords<'r> {
     snapshot: &'r StoreSnapshot,
     heap: &'static blaze_own::Heap,
-    slots: blaze_own::Vec<OnceLock<Result<OpenedCrate<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>,
-    asks: core::sync::atomic::AtomicU64,
-    opened: core::sync::atomic::AtomicU64,
-    bytes: core::sync::atomic::AtomicU64,
+    crates: usize,
+    /// Allocated lazily on first `records()` ask so unused `ScopeRecords` (e.g. `groups` setup
+    /// when no dependency crate is opened) perform zero heap allocations.
+    slots: OnceLock<blaze_own::Vec<OnceLock<Result<OpenedCrate<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>>,
+    /// Hot counters isolated onto separate 128-byte cache lines ([`CachePadded`], rule 86) so
+    /// 128 workers opening scope crates never false-share `asks`/`opened`/`bytes` with `slots`.
+    asks: CachePadded<core::sync::atomic::AtomicU64>,
+    opened: CachePadded<core::sync::atomic::AtomicU64>,
+    bytes: CachePadded<core::sync::atomic::AtomicU64>,
 }
 
 /// What a request's [`ScopeRecords`] did: asks of it, records opened (each once) and their bytes.
@@ -235,18 +420,20 @@ pub(crate) struct ByNeedCounts {
 impl<'r> ScopeRecords<'r> {
     /// No crate opened yet, for a crate list of `crates` crates, over the committed `snapshot`.
     pub(crate) fn new(snapshot: &'r StoreSnapshot, crates: usize, heap: &'static blaze_own::Heap) -> ScopeRecords<'r> {
-        let slots = blaze_own::Vec::from_iter_in((0..crates).map(|_| OnceLock::new()), heap.shared());
         ScopeRecords {
             snapshot,
             heap,
-            slots,
-            asks: core::sync::atomic::AtomicU64::new(0),
-            opened: core::sync::atomic::AtomicU64::new(0),
-            bytes: core::sync::atomic::AtomicU64::new(0),
+            crates,
+            slots: OnceLock::new(),
+            asks: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
+            opened: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
+            bytes: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Build or fetch cached `CurrentFile` for an immutable pack (non-checkout) file at `(world_at, file)`.
+    /// Checks the committed CAS snapshot first (zero-copy `FileItemsView` without re-outlining or
+    /// re-hashing) before falling back to outlining once in a task frame.
     pub(crate) fn cached_pack_file_items<'s>(
         &'s self,
         world_at: usize,
@@ -254,54 +441,71 @@ impl<'r> ScopeRecords<'r> {
         edition: blaze_surface::Edition,
         text: &'s str,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
-        let opened = self.slots.get(world_at)?.get()?.as_ref().ok()?;
-        let cell = opened.pack_files.get(usize::try_from(file).ok()?)?;
+        let opened = self.slots.get()?.get(world_at)?.get()?.as_ref().ok()?;
+        let pack_files = opened
+            .pack_files
+            .get_or_init(|| blaze_own::Vec::from_iter_in((0..opened.nfiles).map(|_| OnceLock::new()), self.heap.shared()));
+        let cell = pack_files.get(usize::try_from(file).ok()?)?;
         if let Some(entry) = cell.get() {
-            if entry.edition != edition.byte() {
+            if entry.edition() != edition.byte() {
                 return None;
             }
-            let bytes = entry.aligned_bytes()?;
-            let view = match blaze_surface::FileItemsView::read(bytes) {
-                Ok(v) => v,
-                Err(why) => return Some(Err(ItemsRecordError::FileItemsRead { file, why })),
-            };
-            return Some(Ok(CurrentFile { text, surface: entry.surface, view }));
+            return entry.open(self.snapshot, file, text);
         }
-        let alloc = self.heap.alloc();
-        let outline = blaze_file_items::outline(text, edition, alloc);
         let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
-        let encoded = match outline.to_file_items(text, digest, alloc) {
-            Ok(e) => e,
-            Err(why) => return Some(Err(ItemsRecordError::FileItemsBuild { file, why })),
+        let key = pack_file_items_key(edition, digest);
+        match self.snapshot.get(key) {
+            Ok(Some(bytes)) => {
+                let (surface, view) = match open_pack_file_items(bytes, file, digest) {
+                    Ok(opened) => opened,
+                    Err(err) => return Some(Err(err)),
+                };
+                let _ = cell.set(CachedPackFileItems::Snapshot { edition: edition.byte(), key, text_digest: digest });
+                return Some(Ok(CurrentFile { text, surface, view }));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Some(Err(ItemsRecordError::FileItemsUnavailable {
+                    file,
+                    what: "reading cached pack FileItems record from committed snapshot failed (front_load.rs)",
+                }));
+            }
+        }
+        let (surface, buf, offset, len) = match blaze_mem::frame::task(blaze_mem::Tag::Parse, |scratch| {
+            let erased = blaze_own::Erased::new(scratch);
+            let alloc = erased.handle();
+            let outline = blaze_file_items::outline(text, edition, alloc);
+            let encoded = match outline.to_file_items(text, digest, alloc) {
+                Ok(e) => e,
+                Err(why) => return Err(ItemsRecordError::FileItemsBuild { file, why }),
+            };
+            let surface = outline.surface();
+            let len = encoded.len();
+            let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
+            buf.resize(len.saturating_add(15), 0);
+            let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
+            let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
+                return Ok(None);
+            };
+            dst.copy_from_slice(&encoded);
+            Ok(Some((surface, buf, offset, len)))
+        }) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(why) => return Some(Err(why)),
         };
-        let surface = outline.surface();
-        let len = encoded.len();
-        let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
-        buf.resize(len.saturating_add(15), 0);
-        let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
-        let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
-            return None;
-        };
-        dst.copy_from_slice(&encoded);
-        drop(encoded);
-        drop(outline);
         let Some(check_slice) = offset.checked_add(len).and_then(|end| buf.get(offset..end)) else {
             return None;
         };
         if let Err(why) = blaze_surface::FileItemsView::read(check_slice) {
             return Some(Err(ItemsRecordError::FileItemsRead { file, why }));
         }
-        let _ = cell.set(CachedPackFileItems { edition: edition.byte(), surface, buf, offset, len });
+        let _ = cell.set(CachedPackFileItems::Owned { edition: edition.byte(), surface, buf, offset, len });
         let entry = cell.get()?;
-        if entry.edition != edition.byte() {
+        if entry.edition() != edition.byte() {
             return None;
         }
-        let bytes = entry.aligned_bytes()?;
-        let view = match blaze_surface::FileItemsView::read(bytes) {
-            Ok(v) => v,
-            Err(why) => return Some(Err(ItemsRecordError::FileItemsRead { file, why })),
-        };
-        Some(Ok(CurrentFile { text, surface: entry.surface, view }))
+        entry.open(self.snapshot, file, text)
     }
 
     /// What it did so far.
@@ -312,10 +516,13 @@ impl<'r> ScopeRecords<'r> {
 
     /// Crate `one`'s records: opened at the first ask, the same after; `Err`: the words of why
     /// its record did not open, the same for every ask.
-    fn records(&self, one: &Unopened) -> Result<CrateRecords<'r>, &'static str> {
+    fn records<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str> {
         use core::sync::atomic::Ordering::Relaxed;
         self.asks.fetch_add(1, Relaxed);
-        let Some(slot) = self.slots.get(one.world_at) else {
+        let slots = self
+            .slots
+            .get_or_init(|| blaze_own::Vec::from_iter_in((0..self.crates).map(|_| OnceLock::new()), self.heap.shared()));
+        let Some(slot) = slots.get(one.world_at) else {
             return Err("its place is past the request's crate list (front_load.rs `ScopeRecords`)");
         };
         let opened = slot.get_or_init(|| {
@@ -324,13 +531,16 @@ impl<'r> ScopeRecords<'r> {
             self.opened.fetch_add(counts.records, Relaxed);
             self.bytes.fetch_add(counts.bytes, Relaxed);
             read.map(|records| {
-                let nfiles = blaze_scope::items_record::ItemsRecord::from_verified(records.items_proof, self.heap.alloc()).files();
-                let pack_files = blaze_own::Vec::from_iter_in((0..nfiles).map(|_| OnceLock::new()), self.heap.shared());
-                OpenedCrate { records, pack_files }
+                let module_cache = records.names_proof.new_module_cache(self.heap.shared());
+                let nfiles = records.items_proof.files();
+                OpenedCrate { records, module_cache, nfiles, pack_files: OnceLock::new() }
             })
             .map_err(|why| crate::engine_head_notes::leak(self.heap.alloc(), format_args!("{why}")))
         });
-        opened.as_ref().map(|o| o.records).map_err(|&e| e)
+        opened
+            .as_ref()
+            .map(|o| CrateRecords { names_proof: o.records.names_proof.bind_cache(&o.module_cache), ..o.records })
+            .map_err(|&e| e)
     }
 
     /// The one read of crate `one`'s record: from the snapshot by its key, in place, opened.
@@ -454,6 +664,36 @@ impl<'n> CratesFrom<'n> {
     }
 }
 
+/// Optional lookup of precomputed checkout file digests (`crate::sweep::FILE_DOMAIN`),
+/// implemented by [`crate::job_texts::JobTexts`] when backed by [`crate::body_types::SyncLazyTrees`].
+pub(crate) trait DigestLookup {
+    fn checkout_digest(&self, inner: &str) -> Option<ContentId>;
+}
+
+impl DigestLookup for crate::job_texts::JobTexts<'_> {
+    fn checkout_digest(&self, inner: &str) -> Option<ContentId> {
+        crate::job_texts::JobTexts::checkout_digest(self, inner)
+    }
+}
+
+/// Source texts accepted by [`StoreLoad::from_crates`]: either a plain `&dyn SourceTexts` or a
+/// [`crate::job_texts::JobTexts`] that also exposes cached `FILE_DOMAIN` checkout digests.
+pub(crate) trait StoreTexts<'n> {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>);
+}
+
+impl<'a: 'n, 'n> StoreTexts<'n> for &'a (dyn SourceTexts<'n> + 'n) {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>) {
+        (self, None)
+    }
+}
+
+impl<'a: 'n, 'n> StoreTexts<'n> for &'a crate::job_texts::JobTexts<'n> {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>) {
+        (self, Some(self))
+    }
+}
+
 /// front2's [`Load`] over crates read from the store: `crates`' crate `i` is the reader's crate
 /// `i` (the program's own at 0, as `Records::new`'s keys), `texts` the world's trees.
 pub(crate) struct StoreLoad<'n> {
@@ -467,6 +707,7 @@ pub(crate) struct StoreLoad<'n> {
     /// `CrateInput::shown_from`): a record's package path is joined onto it to read (D96).
     packages: &'n [&'n str],
     texts: &'n dyn SourceTexts<'n>,
+    digests: Option<&'n dyn DigestLookup>,
     snapshot: Option<&'n StoreSnapshot>,
     expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
     outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
@@ -530,14 +771,31 @@ impl<'n> StoreLoad<'n> {
     pub(crate) fn from_crates(
         crates: CratesFrom<'n>,
         packages: &'n [&'n str],
-        texts: &'n dyn SourceTexts<'n>,
+        texts: impl StoreTexts<'n>,
         snapshot: Option<&'n StoreSnapshot>,
         expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
         outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
         bump: Bump<'n>,
         alloc: Alloc<'n>,
     ) -> Self {
-        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc, bump }
+        let (texts, digests) = texts.split();
+        let crates = match crates {
+            CratesFrom::ByNeed { mut own, rest, records } => {
+                if own.names_proof.needs_module_cache() {
+                    own.names_proof = own.names_proof.bind_bump_cache(bump);
+                }
+                CratesFrom::ByNeed { own, rest, records }
+            }
+            CratesFrom::Opened(list) if list.iter().any(|one| one.names_proof.needs_module_cache()) => {
+                let mut bound = Vec::with_capacity_in(list.len(), bump);
+                for &one in list.iter() {
+                    bound.push(CrateRecords { names_proof: one.names_proof.bind_bump_cache(bump), ..one });
+                }
+                CratesFrom::Opened(bound.into_bump_slice())
+            }
+            CratesFrom::Opened(list) => CratesFrom::Opened(list),
+        };
+        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, digests, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc, bump }
     }
 
     /// The crates' keys in reader order: `Records::new`'s `keys`.
@@ -661,7 +919,7 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         if found != expected { return Err(stale(expected, found)); }
         let payload = record.payload_bytes().map_err(|_| ItemsRecordError::FileItemsUnavailable { file: index, what: "the planned outline payload is unavailable" })?;
         let view = blaze_surface::FileItemsView::read(payload).map_err(|why| ItemsRecordError::FileItemsRead { file: index, why })?;
-        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let digest = self.digests.and_then(|d| d.checkout_digest(real)).unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
         if view.file() != digest { return Err(stale(view.file(), digest)); }
         Ok(Some(CurrentFile { text, surface, view }))
     }
@@ -1042,5 +1300,89 @@ mod tests {
             assert_eq!(format!("{solved:?}"), format!("{stored:?}"), "`{word}` over the store differs from the solved names; the reader logged {:?}", &*log.errors());
         }
         println!("front load: Result and Option through two preludes' globs, solved and over the store");
+    }
+
+    #[test]
+    fn pack_file_items_cas_round_trips_zero_copy_and_checks_every_input() {
+        use crate::store::{CommandStore, Facts, Home};
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let shared = heap.shared();
+        let text = "pub fn add(a: u64, b: u64) -> u64 { a.wrapping_add(b) }\npub struct Pair(pub u64, pub u64);\n";
+        let other_text = "pub fn add(a: u64, b: u64) -> u64 { a.wrapping_sub(b) }\n";
+        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let other_digest = ContentId::of(crate::sweep::FILE_DOMAIN, other_text.as_bytes());
+        let k2021 = pack_file_items_key(Edition::E2021, digest);
+        let k2024 = pack_file_items_key(Edition::E2024, digest);
+        let k_other = pack_file_items_key(Edition::E2021, other_digest);
+        assert_ne!(k2021, k2024, "pack FileItems CAS key must distinguish editions (rule 21)");
+        assert_ne!(k2021, k_other, "pack FileItems CAS key must distinguish file digests (rule 21)");
+
+        let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
+        let raw = outline.to_file_items(text, digest, alloc).expect("to_file_items");
+        let surface = outline.surface();
+        let encode = |k| {
+            let head = pack_file_items_head(k, digest, surface, raw.len(), alloc);
+            assert_eq!(head.len() % blaze_drive::record::PAYLOAD_ALIGN, 0, "record head must be 16-aligned");
+            let mut buf = Vec::with_capacity_in(head.len() + raw.len(), shared);
+            buf.extend_from_slice(&head);
+            buf.extend_from_slice(&raw);
+            buf
+        };
+        let encoded_a = encode(k2021);
+        let encoded_b = encode(k2021);
+        assert_eq!(encoded_a.as_slice(), encoded_b.as_slice(), "encoding must be deterministic (rule 25)");
+
+        let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let err = io.need_err().expect("stderr");
+        let home = Home::of(&cx, &io.need_fs().expect("files"), Some("/h")).expect("test home");
+        let lent = home.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 71 }, alloc).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store");
+        store.put(&cx, k2021, &encoded_a).expect("put cached pack FileItems");
+        let snapshot = store.commit_for_body_reads().expect("committed snapshot");
+        let stored_bytes = snapshot.get(k2021).expect("snapshot get").expect("present in snapshot");
+
+        let (got_surface, view) = open_pack_file_items(stored_bytes, 0, digest).expect("zero-copy open");
+        assert_eq!(got_surface, surface);
+        assert_eq!(view.file(), digest);
+        assert_eq!(view.len(), outline.items().len());
+
+        // Stale / mismatched digest or corrupt record must be refused (rule 3, rule 21).
+        assert!(open_pack_file_items(stored_bytes, 0, other_digest).is_err(), "mismatched digest must be refused");
+        assert!(open_pack_file_items(&stored_bytes[..8], 0, digest).is_err(), "truncated bytes must be refused");
+
+        // Lazy `ScopeRecords::slots` stays unallocated until first crate ask.
+        let scope_records = ScopeRecords::new(&snapshot, 16, heap);
+        assert!(scope_records.slots.get().is_none(), "unused ScopeRecords must not allocate slots");
+    }
+
+    #[test]
+    fn lang_crate_filter_keeps_sysroot_and_skips_pure_toolchain_deps() {
+        for keep in ["core", "alloc", "std", "bstd", "blaze_std", "panic_unwind", "panic_abort"] {
+            assert!(is_lang_crate_name(keep), "`{keep}` must be kept as a lang/incoherent crate");
+        }
+        for skip in [
+            "libc",
+            "gimli",
+            "object",
+            "addr2line",
+            "hashbrown",
+            "miniz_oxide",
+            "adler2",
+            "memchr",
+            "rustc_demangle",
+            "cfg_if",
+            "unwind",
+            "std_detect",
+            "rustc_std_workspace_core",
+            "rustc_std_workspace_alloc",
+            "rustc_std_workspace_std",
+            "compiler_builtins",
+            "test",
+            "proc_macro",
+        ] {
+            assert!(!is_lang_crate_name(skip), "pure toolchain dep `{skip}` must be skipped");
+        }
     }
 }

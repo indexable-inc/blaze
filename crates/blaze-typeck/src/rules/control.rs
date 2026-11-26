@@ -162,6 +162,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                 }
                 self.sig_rows = false;
+                // A C-variadic fn definition (`unsafe extern "C" fn f(x: c_int, mut args: ...)`):
+                // its external signature carries only the fixed parameters (`sig.c_variadic`),
+                // while inside the body the trailing `...` parameter has type `core::ffi::VaList<'_>`.
+                if sig.c_variadic
+                    && self.body.params.len() == inputs.len() + 1
+                    && let Some(&va_pat) = self.body.params.get(inputs.len())
+                {
+                    let va_ty = match self.need_lang(LangItem::VaList, At::Pat(va_pat))? {
+                        Some(va) => {
+                            let none = self.mk_list(&[])?;
+                            self.mk(TyView::Adt(va, none))?
+                        }
+                        None => self.common.err,
+                    };
+                    inputs.push(va_ty);
+                }
                 (inputs, output, sig.header.abi == crate::ids::Abi::RustCall)
             }
             None => (blaze_own::Vec::new_in(self.alloc), self.fresh()?, false),

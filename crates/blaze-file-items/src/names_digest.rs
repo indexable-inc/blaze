@@ -65,14 +65,14 @@ static FILE_NAMES: Domain = Domain::new("blaze v2 file inner attributes names 1"
 /// Whether an attribute named `name` makes the name solver read no item text: a built-in
 /// attribute (`blaze_surface::builtin_attrs::BUILTIN_ATTRS`, the list the solver's lowering
 /// reads), so the solver never calls it as an attribute macro and reads only the attribute's own
-/// text, which the digest holds; or the prelude's `test` or `bench`, which the lowering reads
-/// itself and keeps the item for. Left out on purpose: `cfg_attr` and `unsafe` (each holds another
+/// text, which the digest holds. Left out on purpose: `cfg_attr` and `unsafe` (each holds another
 /// attribute), `derive` and `derive_const` (the item is the derive's input), `global_allocator`
 /// (the item is its expansion's input: blaze-expand global_allocator.rs writes the static back
 /// with the allocator fns), `cfg_eval` and `define_opaque` (built-in attribute macros), and a
-/// derive's helper (`default`).
+/// derive's helper (`default`). Bare `#[test]` / `#[bench]` on a plain `fn` is handled directly in
+/// [`takes_the_item`] so parameterized `#[test(..)]` or non-`fn` uses remain conservatively whole.
 pub(crate) fn inert(name: &str) -> bool {
-    (BUILTIN_ATTRS.binary_search(&name).is_ok() && !matches!(name, "cfg_attr" | "unsafe")) || matches!(name, "test" | "bench")
+    BUILTIN_ATTRS.binary_search(&name).is_ok() && !matches!(name, "cfg_attr" | "unsafe")
 }
 
 /// Each entry of `items` (an outline of `text` in the edition whose hash byte is `edition`, its
@@ -180,7 +180,7 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         }
         let written = item.text(text, attr.range);
         sink.part(&[u8::from(attr.inner)]).part(written.as_bytes());
-        whole |= calls_macros && takes_the_item(attr.kind, written);
+        whole |= calls_macros && takes_the_item(attr.kind, written, item.detail);
     }
     match item.detail {
         ItemDetail::Fn { body_holds_items }
@@ -188,7 +188,15 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         | ItemDetail::Static { body_holds_items } => {
             sink.part(&[u8::from(body_holds_items)]);
             // `BodySrc::of`: a body that holds items is scanned for the modules its blocks make.
-            whole |= body_holds_items && crate::nested::may_write_block(item.range.of(text));
+            // When the body's only block-writing constructs are bare, unqualified std expression
+            // macros (`nested::STD_EXPR_MACROS`), digest only the written-block and call shape so
+            // edits inside `#[test]` / library bodies keep `Outline::surface()` stable; shadowed
+            // macro definitions are guarded in `engine_names.rs` (`has_shadowed_expr_macro`).
+            if body_holds_items {
+                whole |= crate::nested::digest_body_blocks(item.range.of(text), &mut |bytes| {
+                    sink.part(bytes);
+                });
+            }
         }
         ItemDetail::Struct | ItemDetail::Variant { discriminant: _ } => {
             sink.part(&form(text, item));
@@ -255,17 +263,38 @@ fn form(text: &str, item: &Item) -> [u8; 2] {
     }
 }
 
+/// Whether `written` is a bare `#[test]` or `#[bench]` outer attribute with no arguments and no
+/// path prefix. Parameterized (`#[test(args)]`, `#[test = "x"]`), inner (`#![test]`), or
+/// path-qualified (`#[my_macros::test]`) attributes return `false` so [`takes_the_item`]
+/// conservatively hashes the whole item.
+fn is_bare_test_attr(written: &str) -> bool {
+    let Some(rest) = written.trim().strip_prefix('#') else { return false };
+    let Some(rest) = rest.trim_start().strip_prefix('[') else { return false };
+    let Some(inner) = rest.strip_suffix(']') else { return false };
+    matches!(inner.trim(), "test" | "bench")
+}
+
 /// Whether an attribute of `kind` written `written` (`#[..]` or `#![..]`) may hand its entry's
 /// whole text to a macro: a derive, an attribute macro, or one that holds another attribute.
-fn takes_the_item(kind: AttrKind, written: &str) -> bool {
+///
+/// Bare `#[test]` / `#[bench]` on a `fn` item does not set `whole = true` (its attribute text,
+/// name, visibility, and `body_holds_items` are still hashed into `SURFACE`); if a crate shadows
+/// `test` / `bench` with a user attribute proc-macro, `engine_names.rs` records
+/// `definition_cell(entry_name)` in `CrateScope`'s read list (rule 21).
+fn takes_the_item(kind: AttrKind, written: &str, detail: ItemDetail) -> bool {
     match kind {
         AttrKind::Doc | AttrKind::Cfg | AttrKind::Path { literal: _ } | AttrKind::MacroExport => false,
         AttrKind::CfgAttr => true,
-        AttrKind::Other => match head(written) {
-            Head::Name(name) => !(name.starts_with("rustc_") || inert(name)),
-            Head::Path(first) => !TOOLS.contains(&first),
-            Head::Unread => true,
-        },
+        AttrKind::Other => {
+            if matches!(detail, ItemDetail::Fn { .. }) && is_bare_test_attr(written) {
+                return false;
+            }
+            match head(written) {
+                Head::Name(name) => !(name.starts_with("rustc_") || inert(name)),
+                Head::Path(first) => !TOOLS.contains(&first),
+                Head::Unread => true,
+            }
+        }
     }
 }
 
@@ -348,5 +377,78 @@ mod tests {
             let index = ItemIndex(u32::try_from(at).expect("a small fixture"));
             assert_eq!(outline.names_digest(index), one, "entry {at}: {item:?}");
         }
+    }
+
+    #[test]
+    fn bare_test_and_bench_fn_body_edits_do_not_move_surface() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let before = "#[test]\nfn my_test() { let x = 1; }\n#[bench]\nfn my_bench() { let y = 2; }\n";
+        let after = "#[test]\nfn my_test() { let x = 999; }\n#[bench]\nfn my_bench() { let y = 888; }\n";
+        let o_before = crate::outline(before, Edition::E2024, alloc);
+        let o_after = crate::outline(after, Edition::E2024, alloc);
+        assert_eq!(o_before.surface(), o_after.surface(), "editing a bare #[test]/#[bench] plain fn body must not move Outline::surface()");
+
+        // Changing the attribute itself MUST still move Outline::surface().
+        let attr_changed = "#[inline]\nfn my_test() { let x = 1; }\n#[bench]\nfn my_bench() { let y = 2; }\n";
+        let o_attr = crate::outline(attr_changed, Edition::E2024, alloc);
+        assert_ne!(o_before.surface(), o_attr.surface(), "changing #[test] attr must move Outline::surface()");
+
+        // Adding an item/macro inside the body (`body_holds_items = true`) MUST move surface.
+        let with_item = "#[test]\nfn my_test() { struct Inner; }\n#[bench]\nfn my_bench() { let y = 2; }\n";
+        let o_item = crate::outline(with_item, Edition::E2024, alloc);
+        assert_ne!(o_before.surface(), o_item.surface(), "adding an item inside #[test] body must move Outline::surface()");
+
+        // Parameterized `#[test(args)]` or non-`fn` `#[test] struct` MUST conservatively hash whole.
+        let param_before = "#[test(foo)]\nfn p() { let x = 1; }\n";
+        let param_after = "#[test(foo)]\nfn p() { let x = 2; }\n";
+        assert_ne!(
+            crate::outline(param_before, Edition::E2024, alloc).surface(),
+            crate::outline(param_after, Edition::E2024, alloc).surface(),
+            "#[test(args)] must hash the whole item into Outline::surface()"
+        );
+        let struct_before = "#[test]\nstruct S { a: u8 }\n";
+        let struct_after = "#[test]\nstruct S { a: u16 }\n";
+        assert_ne!(
+            crate::outline(struct_before, Edition::E2024, alloc).surface(),
+            crate::outline(struct_after, Edition::E2024, alloc).surface(),
+            "#[test] on non-fn item must hash the whole item into Outline::surface()"
+        );
+    }
+
+    #[test]
+    fn std_expr_macros_in_fn_body_edits_do_not_move_surface() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let before = "#[test]\nfn test_19_9() {\n    let x = 1;\n    assert_eq!(x, 1);\n    assert!(x != 2);\n    let s = format!(\"v={}\", x);\n    let v = vec![1, 2];\n    println!(\"{} {:?}\", s, v);\n}\n";
+        let after = "#[test]\nfn test_19_9() {\n    let x = 42;\n    assert_eq!(x, 42);\n    assert!(x != 99);\n    let s = format!(\"val={} {}\", x, x + 1);\n    let v = vec![10, 20, 30];\n    println!(\"out={} {:?}\", s, v);\n}\n";
+        let o_before = crate::outline(before, Edition::E2024, alloc);
+        let o_after = crate::outline(after, Edition::E2024, alloc);
+        assert_eq!(o_before.surface(), o_after.surface(), "editing expressions inside bare std expr macros in #[test] fn must not move Outline::surface()");
+
+        // Path-qualified `std::assert_eq!` MUST hash whole and move surface.
+        let qual_before = "#[test]\nfn q() { std::assert_eq!(1, 1); }\n";
+        let qual_after = "#[test]\nfn q() { std::assert_eq!(1, 2); }\n";
+        assert_ne!(
+            crate::outline(qual_before, Edition::E2024, alloc).surface(),
+            crate::outline(qual_after, Edition::E2024, alloc).surface(),
+            "path-qualified std::assert_eq! must hash whole into Outline::surface()"
+        );
+
+        // Non-std macro MUST hash whole and move surface.
+        let custom_before = "fn c() { my_macro!(1); }\n";
+        let custom_after = "fn c() { my_macro!(2); }\n";
+        assert_ne!(
+            crate::outline(custom_before, Edition::E2024, alloc).surface(),
+            crate::outline(custom_after, Edition::E2024, alloc).surface(),
+            "unknown macro call must hash whole into Outline::surface()"
+        );
+
+        // Item inside macro arg MUST hash whole and move surface.
+        let arg_item_before = "fn a() { assert_eq!({ struct S; 1 }, 1); }\n";
+        let arg_item_after = "fn a() { assert_eq!({ struct S; 2 }, 1); }\n";
+        assert_ne!(
+            crate::outline(arg_item_before, Edition::E2024, alloc).surface(),
+            crate::outline(arg_item_after, Edition::E2024, alloc).surface(),
+            "nested item inside std macro arg must hash whole into Outline::surface()"
+        );
     }
 }

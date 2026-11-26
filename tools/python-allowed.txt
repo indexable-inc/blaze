@@ -32,7 +32,6 @@ harness/smoke.py
 harness/toolchain_bump.py
 harness/toolchain_pins.py
 harness/unittests.py
-harness/v2/agents.py
 harness/v2/bounds.py
 harness/v2/frontend/borrowck_flow.py
 harness/v2/frontend/cases.py

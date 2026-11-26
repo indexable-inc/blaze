@@ -1,0 +1,22 @@
+[package]
+name = "blaze-cli-spec"
+description = "Pure no_std, zero-unsafe, sans-IO CLI flag & subcommand spec parser (--help, fish completions, man pages, curated manual specs, and cache codec) on blaze-own explicit allocators"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+authors = ["blaze contributors"]
+
+[lib]
+name = "blaze_cli_spec"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+blaze-own = { path = "../blaze-own" }
+
+[dev-dependencies]
+blaze-own = { path = "../blaze-own", features = ["testing"] }
+
+[lints]
+workspace = true

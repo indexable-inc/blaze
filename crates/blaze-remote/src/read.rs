@@ -19,7 +19,7 @@ mod tests;
 
 pub use form::{Ed25519Keys, Head, HeadCheck, Object, Refused, SignatureWhy};
 pub use machine::{Answer, Ask, BatchError, Limits, OriginError, Poll, Reader, Report, Unfetched};
-pub use origin::{Origin, fetch};
+pub use origin::{BatchOutcome, BatchRead, Origin, fetch};
 #[cfg(feature = "sign")]
 pub use publish::{PublishError, Sealed, publish, publish_bound};
 

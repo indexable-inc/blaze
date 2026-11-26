@@ -57,6 +57,7 @@ const MATERIALS: [Material<'static>; 3] = [
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     },
     // 1: Dark graphite recessed pocket & groove interior
     Material {
@@ -68,6 +69,7 @@ const MATERIALS: [Material<'static>; 3] = [
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     },
     // 2: Brushed titanium rim & latch hardware
     Material {
@@ -79,6 +81,7 @@ const MATERIALS: [Material<'static>; 3] = [
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     },
 ];
 

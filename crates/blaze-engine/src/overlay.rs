@@ -159,6 +159,18 @@ pub struct Taken<'a> {
     pub reads: SVec<'a, CellId>,
     /// Its defined cells and their digests, by cell.
     pub defines: SVec<'a, (Cell, CellDigest)>,
+    /// Whether this row came from the last answer rather than written earlier in this request.
+    pub(crate) from_last: bool,
+}
+
+/// A file's old planned members taken out of the tables, optionally paired with each standing
+/// member's certified key from the last answer's single `Ask::File` lookup.
+pub(crate) struct TakenFile<'a> {
+    /// Old planned member names, sorted ascending.
+    pub(crate) names: SVec<'a, Name>,
+    /// Certified standing keys from `self.last` (`Some`), sorted ascending by `Name`, or `None`
+    /// when `self.work.by_file` shadowed the file or the last answer has no batch key column.
+    pub(crate) standing: Option<SVec<'a, (Name, Option<Key>)>>,
 }
 
 /// A membership is undefined iff both its cell and its defining row are absent.
@@ -566,22 +578,7 @@ impl<'a> Work<'a> {
             }
         }
         drop(self.cells);
-        for (id, delta) in self.readers.iter() {
-            let readers = answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc));
-            for (reader, added) in delta.iter() {
-                match *added {
-                    true => {
-                        readers.insert(*reader);
-                    }
-                    false => {
-                        readers.remove(reader);
-                    }
-                }
-            }
-            if readers.is_empty() {
-                answer.readers.remove(id);
-            }
-        }
+        answer.readers.apply_edits(&self.readers);
         for (file, names) in self.by_file.into_iter() {
             match names {
                 Some(names) => {
@@ -824,7 +821,7 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
             for (cell, digest) in row.defines.iter() {
                 defines.push((*cell, CellDigest::of(digest)));
             }
-            return Ok(Some(Taken { facts: RowFacts::of(&row), reads, defines }));
+            return Ok(Some(Taken { facts: RowFacts::of(&row), reads, defines, from_last: false }));
         }
         let Some(task) = self.last.task(&name) else { return Ok(None) };
         let Some(facts) = self.last_facts(task)? else { return Ok(None) };
@@ -858,7 +855,7 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
             }
         }
         self.work.rows.insert(name, None);
-        Ok(Some(Taken { facts, reads, defines }))
+        Ok(Some(Taken { facts, reads, defines, from_last: true }))
     }
 
     /// Puts `name`'s row as this request made it; its stale reads of counted cells join the
@@ -1051,6 +1048,11 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
         self.last.cell(id).is_some_and(|cell| self.last.content(cell) != ABSENT)
     }
 
+    /// Whether this request explicitly tombstoned `id` (`None` in `work.cells`).
+    pub(crate) fn cell_tombstoned(&self, id: &CellId) -> bool {
+        self.work.cells.get(id).is_some_and(Option::is_none)
+    }
+
     /// The cell moved this request: to `digest`, or to absent.
     pub fn set_cell(&mut self, id: CellId, digest: Option<ContentId>) {
         let serial = self.work.serial;
@@ -1103,17 +1105,74 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
 
     // File plans (rule 4).
 
-    /// Compare a planned member's key from the file's proof column. Rows changed or
-    /// retired in this request shadow every proof in the last root. A task newly
+    /// Compare a planned member's key against a batch-read `standing` slice from
+    /// [`Self::take_file_members`] (falling back to `last.planned_key` when `standing` is `None`).
+    /// Rows changed or retired in this request shadow every proof in the last root. A task newly
     /// listed by this file can still have a row elsewhere in the last answer.
-    pub(crate) fn member_stands(&self, file: Name, name: Name, key: Key) -> Result<bool, EngineError> {
+    pub(crate) fn member_stands_with(
+        &self,
+        file: Name,
+        standing: Option<&[(Name, Option<Key>)]>,
+        name: Name,
+        key: Key,
+    ) -> Result<bool, EngineError> {
         if let Some(slot) = self.work.rows.get(&name) {
             return Ok(slot.as_ref().is_some_and(|row| row.key == key));
         }
-        if self.last.planned_key(file, name)? == Some(key) {
-            return Ok(true);
+        match standing {
+            Some(members) => {
+                if members
+                    .binary_search_by_key(&name, |(n, _)| *n)
+                    .ok()
+                    .and_then(|at| members.get(at).and_then(|(_, k)| *k))
+                    == Some(key)
+                {
+                    return Ok(true);
+                }
+            }
+            None => {
+                if self.last.planned_key(file, name)? == Some(key) {
+                    return Ok(true);
+                }
+            }
         }
         Ok(self.row(name)?.is_some_and(|row| row.key == key))
+    }
+
+    /// Takes `file`'s planned tasks out, sorted by name, along with batch-read standing keys
+    /// when the last answer's single `Ask::File` lookup provides them.
+    pub(crate) fn take_file_members(&mut self, file: Name) -> Result<TakenFile<'a>, EngineError> {
+        let alloc = self.work.alloc;
+        if let Some(slot) = self.work.by_file.get_mut(&file) {
+            let names = slot.take().unwrap_or_else(|| Vec::new_in(alloc));
+            return Ok(TakenFile { names, standing: None });
+        }
+        if let Some(task) = self.last.task(&file)
+            && let Some(members) = self.last.file_member_keys(task, Alloc::from(alloc))?
+        {
+            let mut standing: SVec<'a, (Name, Option<Key>)> = Vec::with_capacity_in(members.len(), alloc);
+            let mut sorted = true;
+            let mut prev: Option<Name> = None;
+            for (one, key) in members.iter() {
+                let name = self.name_of(*one, file)?;
+                if prev.is_some_and(|p| p > name) {
+                    sorted = false;
+                }
+                prev = Some(name);
+                standing.push((name, *key));
+            }
+            if !sorted {
+                standing.sort_unstable_by_key(|(name, _)| *name);
+            }
+            let mut names: SVec<'a, Name> = Vec::with_capacity_in(standing.len(), alloc);
+            for (name, _) in standing.iter() {
+                names.push(*name);
+            }
+            self.work.by_file.insert(file, None);
+            return Ok(TakenFile { names, standing: Some(standing) });
+        }
+        let names = self.take_file(file)?;
+        Ok(TakenFile { names, standing: None })
     }
 
     /// Takes `file`'s planned tasks out, sorted by name: this request's, or the last answer's.

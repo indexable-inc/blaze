@@ -286,3 +286,133 @@ fn a_let_chain_drops_each_links_temporary_and_binding_in_reverse_order_of_creati
     assert_eq!(chain(Chain::Second).as_slice(), &[1, 2, 8, 9], "the second fails");
     assert_eq!(chain(Chain::First).as_slice(), &[3, 8, 9], "the first fails");
 }
+
+/// Edition 2021 `while let` (`loop { { if let A(d, _) = <scrut> { ... } else { break } } }`):
+/// mirrors `tokio`'s `Defer::wake` (`while let Some(waker) = self.deferred.borrow_mut().pop()`).
+/// Before edition 2024 `if let` opens no temporary scope of its own, so the scrutinee's
+/// temporaries anchor to the `loop` body's temporary scope (`temp_marks` opened inside `loop`,
+/// BEFORE `body`'s `scope_marks`). Exiting via `else { break }`, `break`, or `continue` must
+/// drop those temporaries too.
+fn assert_while_let_e2021(stop: u128, use_continue: bool, expected: &[i32], label: &str) {
+    let mut w = TestWorld::new();
+    let (g, n, e) = match_world(&mut w);
+    let mut b = BodyBuf::new();
+    b.edition = Edition::E2021;
+    let i = bind_mut(&mut b, "i");
+    let i_init = b.int(1, None);
+    // Scrutinee: `(if i < 3 { A(G{i}, G{i + 10}) } else { B(G{99}) })`.
+    // On miss (`i == 3`), `B(G{99})` MUST drop on the `else { break }` path!
+    let i1 = b.local(i);
+    let three = b.int(3, None);
+    let lt = b.bin(BinOp::Lt, i1, three);
+    let i2 = b.local(i);
+    let g_i = g_of(&mut b, i2);
+    let i3 = b.local(i);
+    let ten = b.int(10, None);
+    let i10 = b.bin(BinOp::Add, i3, ten);
+    let g_i10 = g_of(&mut b, i10);
+    let a = b.call("A", &[g_i, g_i10]);
+    let a_block = b.block(&[], Some(a));
+    let g99 = g_lit(&mut b, 99);
+    let b99 = b.call("B", &[g99]);
+    let b_block = b.block(&[], Some(b99));
+    let pick = b.e(Expr::If { cond: lt, then: a_block, else_: Some(b_block) });
+    let value = b.e(Expr::Paren(pick));
+    let pat = a_bind(&mut b, "d");
+    let cond = b.e(Expr::Let { pat, init: value });
+    let dummy = Stmt::Expr { expr: value, semi: true };
+    let mut body = [dummy; 3];
+    let mut body_len = 0usize;
+    let brk = (stop != 0).then(|| b.e(Expr::Missing));
+    if let Some(brk) = brk {
+        let i4 = b.local(i);
+        let s = b.int(stop, None);
+        let eq = b.bin(BinOp::Eq, i4, s);
+        let brk_s = b.block(&[Stmt::Expr { expr: brk, semi: true }], None);
+        let stop_if = b.e(Expr::If { cond: eq, then: brk_s, else_: None });
+        body[body_len] = Stmt::Expr { expr: stop_if, semi: true };
+        body_len += 1;
+    }
+    let i5 = b.local(i);
+    let one = b.int(1, None);
+    let inc = b.e(Expr::AssignOp { op: BinOp::Add, lhs: i5, rhs: one });
+    body[body_len] = Stmt::Expr { expr: inc, semi: true };
+    body_len += 1;
+    let cont = use_continue.then(|| b.e(Expr::Missing));
+    if let Some(cont) = cont {
+        body[body_len] = Stmt::Expr { expr: cont, semi: true };
+        body_len += 1;
+    }
+    let lp = b.while_(cond, &body[..body_len]);
+    if let Some(brk) = brk {
+        b.set(brk, Expr::Break { value: None, target: lp });
+    }
+    if let Some(cont) = cont {
+        b.set(cont, Expr::Continue { target: lp });
+    }
+    let k = let_g(&mut b, "k", 9);
+    let root = b.block(
+        &[Stmt::Let { pat: i, ty: None, init: Some(i_init), else_: None }, Stmt::Expr { expr: lp, semi: true }, k],
+        None,
+    );
+    let seen = g_drops(&w, &b, root, [g, n, e]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(seen.as_slice(), expected, "{label}");
+}
+
+#[test]
+fn an_edition_2021_while_let_drops_scrutinee_temporaries_on_miss_break_and_continue() {
+    assert_while_let_e2021(0, false, &[1, 11, 2, 12, 99, 9], "miss via else break");
+    assert_while_let_e2021(2, false, &[1, 11, 2, 12, 9], "explicit break");
+    assert_while_let_e2021(0, true, &[1, 11, 2, 12, 99, 9], "continue then miss");
+}
+
+/// Edition 2021 `while let` with a borrowed temporary (`Held::Rest`, exact shape of `tokio`'s
+/// `while let Some(waker) = self.deferred.borrow_mut().pop()`):
+/// ```text
+/// while let A(d, _) = (match (&G { x: i + 100 }).x { 101 => A(G{1}, G{11}), _ => C }) {
+///     i += 1;
+/// }
+/// ```
+/// `match`'s scrutinee is not a temporary scope, so `G { x: i + 100 }` anchors directly to the
+/// `loop` body's temporary scope. On the miss iteration (`i == 2`), `C` drops nothing and
+/// `else { break }` MUST still drop `G { x: 102 }`: [1, 11, 101, 102, 9].
+#[test]
+fn an_edition_2021_while_let_drops_borrowed_scrutinee_temp_on_miss() {
+    let mut w = TestWorld::new();
+    let (g, n, e) = match_world(&mut w);
+    let mut b = BodyBuf::new();
+    b.edition = Edition::E2021;
+    let i = bind_mut(&mut b, "i");
+    let i_init = b.int(1, None);
+    let i1 = b.local(i);
+    let hundred = b.int(100, None);
+    let i100 = b.bin(BinOp::Add, i1, hundred);
+    let g_temp = g_of(&mut b, i100);
+    let ref_g = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: g_temp });
+    let x_field = b.field(ref_g, "x");
+    let g1 = g_lit(&mut b, 1);
+    let g11 = g_lit(&mut b, 11);
+    let a1 = b.call("A", &[g1, g11]);
+    let c_path = b.path("C");
+    let c = b.e(Expr::Path(c_path));
+    let p101 = b.pat_int(101);
+    let pw = b.pat(Pat::Wild);
+    let start = b.arms.len() as u32;
+    b.arms.push(Arm { pat: p101, guard: None, body: a1 });
+    b.arms.push(Arm { pat: pw, guard: None, body: c });
+    let m = b.e(Expr::Match { scrutinee: x_field, arms: List { start, len: 2 } });
+    let value = b.e(Expr::Paren(m));
+    let pat = a_bind(&mut b, "d");
+    let cond = b.e(Expr::Let { pat, init: value });
+    let i2 = b.local(i);
+    let one = b.int(1, None);
+    let inc = b.e(Expr::AssignOp { op: BinOp::Add, lhs: i2, rhs: one });
+    let lp = b.while_(cond, &[Stmt::Expr { expr: inc, semi: true }]);
+    let k = let_g(&mut b, "k", 9);
+    let root = b.block(
+        &[Stmt::Let { pat: i, ty: None, init: Some(i_init), else_: None }, Stmt::Expr { expr: lp, semi: true }, k],
+        None,
+    );
+    let seen = g_drops(&w, &b, root, [g, n, e]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(seen.as_slice(), &[1, 11, 101, 102, 9]);
+}

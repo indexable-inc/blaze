@@ -41,7 +41,7 @@
 
 use core::convert::Infallible;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use blaze_drive::{Kind, Locate, Name, Part, TaskFailure, Why};
 use blaze_engine::{Buffer, Done, Phase, Planned, SVec, Stage, Task};
@@ -51,8 +51,9 @@ use blaze_own::SharedAlloc;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
-use bstd::mem::Frame;
+use bstd::mem::{Frame, Tag};
 use bstd::path::Path;
+use bstd::sync::CachePadded;
 use bstd::task::Class;
 use std::alloc::Global;
 
@@ -65,6 +66,28 @@ use crate::work::{self, Record};
 
 /// A file's lint job's frame: its text, its outline's entries, its units' scopes and findings.
 const LINTS_FRAME: usize = 1 << 28;
+
+/// Maximum relinted (`asked`) unit count for running a single-file lint job inline on the
+/// coordinator's frame without spawning a pool worker or reserving a 256 MiB [`LINTS_FRAME`].
+const INLINE_ASKED_MAX: usize = 256;
+
+/// Minimum task count in a multi-file lint phase before workers claim chunks of
+/// [`LINT_CLAIM_CHUNK`] files per atomic `fetch_add` (cuts bus traffic on 128 cores by 4x).
+const LINT_CHUNK_THRESHOLD: usize = 64;
+
+/// Maximum files claimed per atomic `fetch_add` on the parallel lint cursor.
+const LINT_CLAIM_CHUNK: usize = 4;
+
+/// Files claimed per atomic `fetch_add` for `task_count` files across `worker_count` workers:
+/// `1` below [`LINT_CHUNK_THRESHOLD`], otherwise up to [`LINT_CLAIM_CHUNK`] without starving
+/// workers when `task_count < worker_count * LINT_CLAIM_CHUNK`.
+fn lint_claim_chunk(task_count: usize, worker_count: usize) -> usize {
+    if task_count < LINT_CHUNK_THRESHOLD {
+        return 1;
+    }
+    let per_worker = task_count / worker_count.max(1);
+    per_worker.clamp(1, LINT_CLAIM_CHUNK)
+}
 
 /// 3: one task a FILE (lints.rs `file_part`), its source the file part's; 2: one task a unit, its
 /// record ranges of its own text; 1: ranges of its whole text, holes and all.
@@ -203,7 +226,7 @@ impl<'b> Fields<'b> {
 impl Prior {
     /// `record` (a file's lint record, [`file_record`]'s) read back: every field checked, so a
     /// record of another form or one cut short is a named refusal, never a record of no unit.
-    pub(crate) fn of(record: &Record<Global>) -> Result<Prior, &'static str> {
+    pub(crate) fn of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> Result<Prior, &'static str> {
         let payload = record.payload_bytes().map_err(|_| UNREAD)?;
         let mut at = Fields { bytes: payload };
         if at.take(4).map_err(|_| UNFORMED)? != FILE_FORM {
@@ -247,19 +270,6 @@ impl Prior {
             return Err(UNREAD);
         }
         Ok(Prior { under, units, found })
-    }
-
-    /// Whether unit `name` of key `key` is kept by its key under `under`, and its findings when
-    /// it has any: `None` when it is to be linted.
-    fn kept(&self, under: &Under, name: Name, key: ContentId) -> Option<Option<&Found>> {
-        if self.under != *under {
-            return None;
-        }
-        let at = self.units.binary_search_by_key(&name, |unit| unit.0).ok()?;
-        if self.units[at].1 != key {
-            return None;
-        }
-        Some(self.found.binary_search_by_key(&name, |one| one.name).ok().map(|at| &self.found[at]))
     }
 }
 
@@ -327,7 +337,7 @@ pub(crate) struct Made {
     /// Each found unit's item chain and the run of its findings in the record ([`file_record`]).
     placed: std::vec::Vec<(Option<u64>, usize, usize), Global>,
     /// Each unit this request linted, its item's name as written (`None` for the file's unit).
-    relinted: std::vec::Vec<Option<blaze_own::String<Global>>, Global>,
+    relinted: blaze_own::Vec<Option<blaze_own::String<Global>>, Global>,
     /// The units the record lists.
     units: usize,
     /// What the relinted units' passes cost: their own tokens and each rule's sites.
@@ -340,7 +350,7 @@ pub(crate) struct Made {
 pub(crate) struct FileLinted {
     pub(crate) record: Record<Global>,
     placed: std::vec::Vec<(Option<u64>, usize, usize), Global>,
-    pub(crate) relinted: std::vec::Vec<Option<blaze_own::String<Global>>, Global>,
+    pub(crate) relinted: blaze_own::Vec<Option<blaze_own::String<Global>>, Global>,
     units: usize,
     cost: (u64, Cost),
 }
@@ -368,18 +378,22 @@ pub(crate) struct LintsSeen {
 }
 
 /// [`LintCounts`] summed from the stage's file jobs on any worker (the `Ready` driver's run
-/// reads the stage, never writes it: [`LintsStage::lint_units`]). Each a sum, so its value is
-/// the same in any order the jobs end; read after the jobs are joined.
-struct Tally([AtomicU64; 8]);
+/// reads the stage, never writes it: [`LintsStage::lint_one`]). Padded to a full 128 B cache
+/// line (`CachePadded`, rule 86) to eliminate false sharing with adjacent stage fields, and
+/// skips atomic RMWs for zero counters. Each a sum, so its value is the same in any order the
+/// jobs end; read after the jobs are joined.
+struct Tally(CachePadded<[AtomicU64; 8]>);
 
 impl Tally {
     const fn new() -> Tally {
-        Tally([const { AtomicU64::new(0) }; 8])
+        Tally(CachePadded::new([const { AtomicU64::new(0) }; 8]))
     }
 
     fn add(&self, counts: &LintCounts) {
         for (sum, value) in self.0.iter().zip(counts.row()) {
-            sum.fetch_add(value, Ordering::Relaxed);
+            if value != 0 {
+                sum.fetch_add(value, Ordering::Relaxed);
+            }
         }
     }
 
@@ -388,14 +402,47 @@ impl Tally {
     }
 }
 
+fn add_counts(into: &mut LintCounts, more: &LintCounts) {
+    into.files_read = into.files_read.saturating_add(more.files_read);
+    into.files_outlined = into.files_outlined.saturating_add(more.files_outlined);
+    into.units_walked = into.units_walked.saturating_add(more.units_walked);
+    into.units_linted = into.units_linted.saturating_add(more.units_linted);
+    into.bytes_lexed = into.bytes_lexed.saturating_add(more.bytes_lexed);
+    into.variants_gathered = into.variants_gathered.saturating_add(more.variants_gathered);
+    into.heads_read = into.heads_read.saturating_add(more.heads_read);
+    into.batches = into.batches.saturating_add(more.batches);
+}
+
+/// Counts how many units in `job` must actually be relinted under `under` (miss in `job.prior`).
+fn asked_count(job: &FileJob<'_>, under: &Under) -> usize {
+    let Some(prior) = job.prior.filter(|prior| prior.under == *under) else {
+        return job.units.len();
+    };
+    let mut asked = 0usize;
+    let mut pu = 0usize;
+    for unit in job.units.iter() {
+        while let Some(entry) = prior.units.get(pu)
+            && entry.0 < unit.name
+        {
+            pu += 1;
+        }
+        if !prior.units.get(pu).is_some_and(|entry| entry.0 == unit.name && entry.1 == unit.key) {
+            asked += 1;
+        }
+    }
+    asked
+}
+
 /// The stage: the selected rules and the tool they run under, each entered file's last lint
 /// record, each task's result and refusal.
 pub(crate) struct LintsStage {
     rules: RuleSet,
     /// The `Lint` kind's tool ([`Under::tool`]).
     tool: ContentId,
-    /// Each entered task's last record, read back, by name ([`LintsStage::remember`]).
-    priors: std::vec::Vec<(Name, Result<Prior, &'static str>), Global>,
+    /// Each entered task's last record, read back, keyed by task name ([`LintsStage::remember`]).
+    /// Never iterated into output (only looked up by task name), so O(1) insert/lookup preserves
+    /// deterministic output (rule 25).
+    priors: blaze_hash::Map<Name, Result<Prior, &'static str>, blaze_hash::BuildKeyHasher, Global>,
     /// Each task entered and made, sorted by name after its phase.
     made: std::vec::Vec<Made, Global>,
     /// Each task refused, and why (rule 19).
@@ -406,7 +453,19 @@ pub(crate) struct LintsStage {
 
 impl LintsStage {
     pub(crate) fn new(rules: RuleSet, tool: ContentId) -> LintsStage {
-        LintsStage { rules, tool, priors: std::vec::Vec::new_in(Global), made: std::vec::Vec::new_in(Global), refused: std::vec::Vec::new_in(Global), counts: Tally::new() }
+        let g = Global;
+        LintsStage {
+            rules,
+            tool,
+            priors: blaze_hash::Map::new(blaze_hash::MapOpts {
+                hasher: blaze_hash::BuildKeyHasher::default(),
+                alloc: g,
+                capacity: None,
+            }),
+            made: std::vec::Vec::new_in(g),
+            refused: std::vec::Vec::new_in(g),
+            counts: Tally::new(),
+        }
     }
 
     /// Task `name`'s result, when it was entered and made this request.
@@ -438,12 +497,14 @@ impl LintsStage {
     /// Task `name`'s last record (the stored answer's, engine_check.rs `lint_priors`), kept as
     /// what its units may be kept by key from. Read back here, once; one that does not read
     /// refuses the task by name when it runs (rule 3).
-    pub(crate) fn remember(&mut self, name: Name, record: &Record<Global>) {
-        let prior = Prior::of(record);
-        match self.priors.binary_search_by_key(&name, |one| one.0) {
-            Ok(at) => self.priors[at].1 = prior,
-            Err(at) => self.priors.insert(at, (name, prior)),
-        }
+    pub(crate) fn remember<A: core::alloc::Allocator + Copy>(&mut self, name: Name, record: &Record<A>) {
+        self.priors.insert(name, Prior::of(record));
+    }
+
+    /// Inserts an already-decoded prior (decoded in parallel on workers by `engine_check.rs`
+    /// `lint_priors`) for `name`.
+    pub(crate) fn remember_prior(&mut self, name: Name, prior: Result<Prior, &'static str>) {
+        self.priors.insert(name, prior);
     }
 
     /// Task `task`'s job over the planner's outlines: its file's outline, its units, its last
@@ -457,9 +518,9 @@ impl LintsStage {
             return Err(Why::Refused { what: "a `Lint` task its file's outline lists no `Lint` part of", rule: RULE });
         }
         let items = record.payload_bytes().map_err(|_| Why::Refused { what: "a `Lint` task whose file's outline record holds no payload", rule: RULE })?;
-        let prior = match self.priors.binary_search_by_key(&name, |one| one.0) {
-            Ok(at) => Some(self.priors[at].1.as_ref().map_err(|what| Why::Refused { what: *what, rule: RULE })?),
-            Err(_) => None,
+        let prior = match self.priors.get(&name) {
+            Some(kept) => Some(kept.as_ref().map_err(|what| Why::Refused { what: *what, rule: RULE })?),
+            None => None,
         };
         let text = FileText { path: &one.path[..], source: one.source, edition: one.edition };
         Ok(FileJob { file, task: *task, text, items, units: units_of(&record.parts, name), prior })
@@ -470,20 +531,19 @@ impl LintsStage {
         Under { tool: self.tool, rules: self.rules.id(), edition: job.text.edition }
     }
 
-    /// Job `job` run here, on a worker: its counts added to the stage's.
-    fn run_job(&self, cx: &Cx, root: &Dir<ReadWrite>, job: &FileJob<'_>) -> Result<FileLinted, Why> {
-        let mut counts = LintCounts::default();
+    /// Job `job` run here, on a worker using `frame` for scratch: its counts accumulated into the
+    /// caller's local `counts` so workers fold counts once per batch without contending on
+    /// [`LintsStage::counts`].
+    fn run_job_in(&self, cx: &Cx, frame: &Frame, root: &Dir<ReadWrite>, job: &FileJob<'_>, counts: &mut LintCounts) -> Result<FileLinted, Why> {
         let under = self.under(job);
-        let made = work::unwinding(|| lint_file(cx, root, job, &under, &self.rules, &mut counts));
-        self.counts.add(&counts);
+        let made = work::unwinding(|| lint_file_in(cx, frame, root, job, &under, &self.rules, counts));
         match made {
             Ok(made) => made,
             Err(work::Panicked) => Err(Why::Refused { what: "its file's lint job panicked; that file's lint task alone failed", rule: RULE }),
         }
     }
 
-    /// The Lints phase: each entered file linted at once on the workers, one job a file, each
-    /// task's row in `buffer`.
+    /// The Lints phase: each entered file linted at once on the workers, each task's row in `buffer`.
     #[expect(clippy::too_many_arguments, reason = "a phase's edge: each argument one handle of it")]
     pub(crate) fn run_phase<'a>(
         &mut self,
@@ -497,41 +557,103 @@ impl LintsStage {
         times: &mut crate::engine_times::Times,
         alloc: SharedAlloc<'a>,
     ) -> Result<(), CliError> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
         let cx = cx.span("engine: the lints phase");
         let mut made: std::vec::Vec<Made, Global> = std::vec::Vec::new_in(Global);
         let mut refused: std::vec::Vec<(Name, Why), Global> = std::vec::Vec::new_in(Global);
+        let mut phase_counts = LintCounts::default();
         {
             let stage = &*self;
-            // 1. Each task to its file's job.
-            let mut jobs: std::vec::Vec<FileJob<'_>, Global> = std::vec::Vec::with_capacity_in(tasks.len(), Global);
-            for task in tasks.iter() {
-                match stage.job_of(outlined, task) {
-                    Ok(job) => jobs.push(job),
+            type Ran = Result<(usize, FileLinted), Why>;
+            // Single-file fast path: run inline when relinted units are small and fit in `cx.frame()`,
+            // avoiding worker spawn and 256 MiB `LINTS_FRAME` mmap/munmap.
+            if let [task] = tasks {
+                let began = clock.now();
+                let mut counts = LintCounts::default();
+                let ran: Ran = match stage.job_of(outlined, task) {
+                    Err(why) => Err(why),
+                    Ok(job) => {
+                        let under = stage.under(&job);
+                        let asked = asked_count(&job, &under);
+                        let frame_free = cx.frame().reserved().saturating_sub(cx.frame().used());
+                        let entries_bytes = job.units.len().saturating_mul(core::mem::size_of::<blaze_surface::Item>());
+                        let est_bytes = entries_bytes.saturating_add(job.items.len().saturating_mul(8)).saturating_add(256 << 10);
+                        if asked <= INLINE_ASKED_MAX && est_bytes <= frame_free {
+                            stage.run_job_in(&cx, cx.frame(), root, &job, &mut counts).map(|linted| (job.file, linted))
+                        } else {
+                            let scratch = Frame::with_reserve(LINTS_FRAME, Tag::Other)
+                                .map_err(|_| CliError::Text { what: "a lint file's frame could not be reserved (engine_lints.rs)" })?;
+                            stage.run_job_in(&cx, &scratch, root, &job, &mut counts).map(|linted| (job.file, linted))
+                        }
+                    }
+                };
+                let ns = clock.now().since(began).map_or(0, crate::engine_times::ns);
+                add_counts(&mut phase_counts, &counts);
+                times.push(task.planned.name, ns);
+                match ran.and_then(|(file, linted)| file_done(task, file, linted, alloc)) {
+                    Ok((done, one)) => {
+                        buffer.done.push(done);
+                        made.push(one);
+                    }
                     Err(why) => {
                         buffer.done.push(crate::engine_tasks::failed(task, alloc));
                         refused.push((task.planned.name, why));
                     }
                 }
-            }
-            // 2. Each file's job, at once, on the workers.
-            type Ran = Result<FileLinted, Why>;
-            let mut worked: std::vec::Vec<(Ran, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
-            {
+            } else {
+                // Multi-file phase: dynamic work-stealing across `min(tasks.len(), workers)` workers,
+                // each building `job_of` and reusing one `LINTS_FRAME` reset between files (eliminates
+                // both serial coordinator `job_of` and per-file 256 MiB mmap/munmap churn on 18-128 cores).
+                let max_workers = usize::try_from(workers.get()).unwrap_or(1).max(1);
+                let worker_count = tasks.len().min(max_workers).max(1);
+                let chunk = lint_claim_chunk(tasks.len(), worker_count);
+                let cursor = CachePadded::new(AtomicUsize::new(0));
+                let cursor_ref = &cursor;
                 let scope = cx.scope();
                 scope.narrow_workers(workers, Class::Foreground);
-                let mut running = std::vec::Vec::with_capacity_in(jobs.len(), Global);
-                for job in jobs.iter() {
-                    let clock = clock.clone();
-                    running.push(scope.may_overlap("engine lints", LINTS_FRAME, move |cx: &Cx| {
-                        let began = clock.now();
-                        let ran = stage.run_job(cx, root, job);
-                        Ok::<_, Infallible>((ran, clock.now().since(began).map_or(0, crate::engine_times::ns)))
+                let mut running = blaze_own::Vec::with_capacity_in(worker_count, cx.frame());
+                for _ in 0..worker_count {
+                    running.push(scope.may_overlap("engine lints worker", 64 << 10, move |cx: &Cx| {
+                        let mut scratch = match Frame::with_reserve(LINTS_FRAME, Tag::Other) {
+                            Ok(frame) => frame,
+                            Err(_) => return Ok::<_, Infallible>(Err("a lint worker's frame could not be reserved (engine_lints.rs)")),
+                        };
+                        let mut local_counts = LintCounts::default();
+                        let mut local_out: blaze_own::Vec<(usize, Ran, u64), SharedAlloc<'a>> = blaze_own::Vec::new_in(alloc);
+                        loop {
+                            let start = cursor_ref.fetch_add(chunk, Ordering::Relaxed);
+                            if start >= tasks.len() {
+                                break;
+                            }
+                            let end = start.saturating_add(chunk).min(tasks.len());
+                            for idx in start..end {
+                                let Some(task) = tasks.get(idx) else { break };
+                                let began = clock.now();
+                                let ran = stage
+                                    .job_of(outlined, task)
+                                    .and_then(|job| stage.run_job_in(cx, &scratch, root, &job, &mut local_counts).map(|linted| (job.file, linted)));
+                                let ns = clock.now().since(began).map_or(0, crate::engine_times::ns);
+                                local_out.push((idx, ran, ns));
+                                let _ = scratch.reset();
+                            }
+                        }
+                        Ok(Ok((local_out, local_counts)))
                     }));
                 }
+                let mut worked: blaze_own::Vec<(usize, Ran, u64), SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(tasks.len(), alloc);
                 let mut stopped = None;
+                let mut frame_err: Option<&'static str> = None;
                 for handle in running.into_iter() {
                     match handle.join(&cx) {
-                        Ok(one) => worked.push(one),
+                        Ok(Ok((local_out, counts))) => {
+                            add_counts(&mut phase_counts, &counts);
+                            worked.extend(local_out);
+                        }
+                        Ok(Err(what)) => {
+                            frame_err.get_or_insert(what);
+                        }
                         Err(error) => {
                             stopped.get_or_insert(error);
                         }
@@ -541,22 +663,28 @@ impl LintsStage {
                 if let Some(error) = stopped {
                     return Err(CliError::Pool(error));
                 }
-            }
-            // 3. Each result as the engine's row, in task order.
-            for (job, (ran, ns)) in jobs.iter().zip(worked) {
-                times.push(job.task.planned.name, ns);
-                match ran.and_then(|linted| file_done(&job.task, job.file, linted, alloc)) {
-                    Ok((done, one)) => {
-                        buffer.done.push(done);
-                        made.push(one);
-                    }
-                    Err(why) => {
-                        buffer.done.push(crate::engine_tasks::failed(&job.task, alloc));
-                        refused.push((job.task.planned.name, why));
+                if let Some(what) = frame_err {
+                    return Err(CliError::Text { what });
+                }
+                // Deterministic merge in exact task index order (rule 25).
+                worked.sort_unstable_by_key(|(idx, _, _)| *idx);
+                for (idx, ran, ns) in worked {
+                    let Some(task) = tasks.get(idx) else { continue };
+                    times.push(task.planned.name, ns);
+                    match ran.and_then(|(file, linted)| file_done(task, file, linted, alloc)) {
+                        Ok((done, one)) => {
+                            buffer.done.push(done);
+                            made.push(one);
+                        }
+                        Err(why) => {
+                            buffer.done.push(crate::engine_tasks::failed(task, alloc));
+                            refused.push((task.planned.name, why));
+                        }
                     }
                 }
             }
         }
+        self.counts.add(&phase_counts);
         self.made.extend(made);
         self.refused.extend(refused);
         self.made.sort_unstable_by_key(|one| one.name);
@@ -685,7 +813,7 @@ struct FileText<'p> {
 
 /// One file's row (`WHOLE` defined at the record's out, no read, its findings' count) and what
 /// the request keeps of it: the one conversion from a worker's [`FileLinted`] to the engine's
-/// `Done`, for the phase path's join and the `Ready` driver's [`LintsStage::lint_units`] alike
+/// `Done`, for the phase path's join and the `Ready` driver's [`LintsStage::lint_one`] alike
 /// (rule 30).
 fn file_done<'a>(task: &Task, file: usize, linted: FileLinted, alloc: SharedAlloc<'a>) -> Result<(Done<'a>, Made), Why> {
     let FileLinted { record, placed, relinted, units, cost } = linted;
@@ -697,7 +825,7 @@ fn file_done<'a>(task: &Task, file: usize, linted: FileLinted, alloc: SharedAllo
     Ok((done, Made { name, file, placed, relinted, units, cost, record }))
 }
 
-/// What the request keeps of one task the `Ready` driver ran ([`LintsStage::lint_units`]): its
+/// What the request keeps of one task the `Ready` driver ran ([`LintsStage::lint_one`]): its
 /// result, or its refusal and why, merged into the stage after the drive by [`LintsStage::keep`]
 /// (a run reads the stage, never writes it: it runs on any worker).
 pub(crate) enum UnitKept {
@@ -706,27 +834,31 @@ pub(crate) enum UnitKept {
 }
 
 impl LintsStage {
-    /// A file's entered `Lint` task for the `Ready` driver (D187), on this worker: the file's
-    /// job as the phase path's ([`LintsStage::run_job`]), each task's row with what the request
-    /// keeps of it, in `asked`'s order. `file` is the outline's place in the planner's outlines
-    /// (the job finds it again by the task's file); `asked` each task with its part's source as
-    /// the outline lists it (its key's, not read again: the file's text is checked against the
-    /// outline's id).
-    pub(crate) fn lint_units<'a>(&self, cx: &Cx, root: &Dir<ReadWrite>, file: usize, one: &Outlined<'_>, asked: &[(Task, ContentId)], alloc: SharedAlloc<'a>) -> SVec<'a, (Done<'a>, UnitKept)> {
-        let mut rows: SVec<'a, (Done<'a>, UnitKept)> = SVec::with_capacity_in(asked.len(), alloc);
-        let refused = |task: &Task, why: Why| (crate::engine_tasks::failed(task, alloc), UnitKept::Refused(task.planned.name, why));
+    /// One file's entered `Lint` task for the `Ready` driver (D187), run directly on a `Ready`
+    /// worker concurrently with `BodyCheck`: returns the engine row and what the request keeps.
+    pub(crate) fn lint_one<'a>(&self, cx: &Cx, root: &Dir<ReadWrite>, file: usize, one: &Outlined<'_>, task: &Task, alloc: SharedAlloc<'a>) -> (Done<'a>, UnitKept) {
         let outlined = core::slice::from_ref(one);
-        for (task, _) in asked.iter() {
-            let ran = self.job_of(outlined, task).and_then(|mut job| {
-                job.file = file;
-                self.run_job(cx, root, &job).and_then(|linted| file_done(task, file, linted, alloc))
-            });
-            rows.push(match ran {
-                Ok((done, kept)) => (done, UnitKept::Made(kept)),
-                Err(why) => refused(task, why),
-            });
+        let mut local_counts = LintCounts::default();
+        let ran = self.job_of(outlined, task).and_then(|mut job| {
+            job.file = file;
+            let under = self.under(&job);
+            let asked = asked_count(&job, &under);
+            let frame_free = cx.frame().reserved().saturating_sub(cx.frame().used());
+            let entries_bytes = job.units.len().saturating_mul(core::mem::size_of::<blaze_surface::Item>());
+            let est_bytes = entries_bytes.saturating_add(job.items.len().saturating_mul(8)).saturating_add(1 << 20);
+            let linted = if asked <= INLINE_ASKED_MAX && est_bytes <= frame_free {
+                self.run_job_in(cx, cx.frame(), root, &job, &mut local_counts)?
+            } else {
+                let scratch = Frame::with_reserve(LINTS_FRAME, Tag::Other).map_err(|_| Why::Refused { what: "a ready lint task's frame could not be reserved", rule: RULE })?;
+                self.run_job_in(cx, &scratch, root, &job, &mut local_counts)?
+            };
+            file_done(task, file, linted, alloc)
+        });
+        self.counts.add(&local_counts);
+        match ran {
+            Ok((done, kept)) => (done, UnitKept::Made(kept)),
+            Err(why) => (crate::engine_tasks::failed(task, alloc), UnitKept::Refused(task.planned.name, why)),
         }
-        rows
     }
 
     /// What a `Ready` run of a file made, kept as the phase path keeps it: a result in name order
@@ -734,20 +866,23 @@ impl LintsStage {
     pub(crate) fn keep(&mut self, kept: UnitKept) {
         match kept {
             UnitKept::Made(made) => {
-                let at = self.made.partition_point(|one| one.name < made.name);
-                self.made.insert(at, made);
+                if self.made.last().is_none_or(|last| last.name <= made.name) {
+                    self.made.push(made);
+                } else {
+                    let at = self.made.partition_point(|one| one.name < made.name);
+                    self.made.insert(at, made);
+                }
             }
             UnitKept::Refused(name, why) => self.refused.push((name, why)),
         }
     }
 }
 
-/// One file's lint job on a worker, in its task's frame: its text read once and checked against
+/// One file's lint job on a worker, in `frame`: its text read once and checked against
 /// the id its outline was made from (a difference is [`Why::Changed`]: no re-read, rule 3), then
-/// [`lint_text`] over the planner's outline record. What it did is added to `counts`.
-fn lint_file(cx: &Cx, root: &Dir<ReadWrite>, job: &FileJob<'_>, under: &Under, rules: &RuleSet, counts: &mut LintCounts) -> Result<FileLinted, Why> {
+/// [`lint_text_in`] over the planner's outline record. What it did is added to `counts`.
+fn lint_file_in(cx: &Cx, frame: &Frame, root: &Dir<ReadWrite>, job: &FileJob<'_>, under: &Under, rules: &RuleSet, counts: &mut LintCounts) -> Result<FileLinted, Why> {
     let refused = |what: &'static str| Why::Refused { what, rule: RULE };
-    let frame = cx.frame();
     let path = core::str::from_utf8(job.text.path).map_err(|_| refused("its file's path is not UTF-8"))?;
     let at = Path::new(path).map_err(|_: bstd::path::PathError| refused("its file's path is no path"))?;
     let mut bytes = bstd::mem::Bytes::new_in(frame, "a source file, for its lint units");
@@ -757,7 +892,7 @@ fn lint_file(cx: &Cx, root: &Dir<ReadWrite>, job: &FileJob<'_>, under: &Under, r
     if edition_source(ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()), job.text.edition) != job.text.source {
         return Err(Why::Changed);
     }
-    lint_text(cx, text, path, job.items, job.task.planned.name, &job.units, job.prior, under, rules, counts)
+    lint_text_in(cx, frame, text, path, job.items, job.task.planned.name, &job.units, job.prior, under, rules, counts)
 }
 
 /// File `path`'s lint task `name` over its `text` (checked against its outline) and its
@@ -778,49 +913,86 @@ pub(crate) fn lint_text(
     rules: &RuleSet,
     counts: &mut LintCounts,
 ) -> Result<FileLinted, Why> {
+    lint_text_in(cx, cx.frame(), text, path, items, name, units, prior, under, rules, counts)
+}
+
+#[expect(clippy::too_many_arguments, reason = "one file's facts, each named")]
+fn lint_text_in(
+    cx: &Cx,
+    frame: &Frame,
+    text: &str,
+    path: &str,
+    items: &[u8],
+    name: Name,
+    units: &[UnitPart],
+    prior: Option<&Prior>,
+    under: &Under,
+    rules: &RuleSet,
+    counts: &mut LintCounts,
+) -> Result<FileLinted, Why> {
     let refused = |what: &'static str| Why::Refused { what, rule: RULE };
     let view = blaze_surface::FileItemsView::read(items).map_err(|_| refused("its file's outline record holds no FileItems payload"))?;
-    let erased = blaze_own::Erased::new(cx.frame());
+    let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
     let mut entries: blaze_own::AVec<'_, blaze_surface::Item> = blaze_own::AVec::with_capacity_in(view.len(), alloc);
     entries.extend(view.items().map(|one| one.item));
     let chain_of = |at: usize| work::stored_item_chain(view, blaze_surface::ItemIndex(at as u32));
-    // 1. Each unit kept by its key, or asked.
+    // 1. Each unit kept by its key, or asked (linear merge over sorted `units` and `prior`).
     let mut found: std::vec::Vec<Found, Global> = std::vec::Vec::new_in(Global);
     let mut asked: blaze_own::AVec<'_, AskedUnit> = blaze_own::AVec::new_in(alloc);
-    for unit in units.iter() {
-        match prior.and_then(|prior| prior.kept(under, unit.name, unit.key)) {
-            Some(Some(kept)) => found.push(kept.clone()),
-            Some(None) => {}
-            None => asked.push((unit.name, unit.place)),
+    if let Some(prior) = prior.filter(|prior| prior.under == *under) {
+        let mut pu = 0usize;
+        let mut pf = 0usize;
+        for unit in units.iter() {
+            while let Some(entry) = prior.units.get(pu)
+                && entry.0 < unit.name
+            {
+                pu += 1;
+            }
+            if prior.units.get(pu).is_some_and(|entry| entry.0 == unit.name && entry.1 == unit.key) {
+                while let Some(entry) = prior.found.get(pf)
+                    && entry.name < unit.name
+                {
+                    pf += 1;
+                }
+                if let Some(kept) = prior.found.get(pf).filter(|entry| entry.name == unit.name) {
+                    found.push(kept.clone());
+                }
+            } else {
+                asked.push((unit.name, unit.place));
+            }
         }
+    } else {
+        asked.extend(units.iter().map(|unit| (unit.name, unit.place)));
     }
     // 2. The asked units linted. The same marks the outline's parts were keyed with (work.rs
     // `outline_file`): the file stands as its own crate root, as there.
-    let subject = crate::signature::file_subject(path);
-    let marks = crate::lints::marks_of(text, text);
-    let mut did: blaze_own::AVec<'_, Result<crate::lints::SparseUnit<Global>, Why>> = blaze_own::AVec::with_capacity_in(asked.len(), alloc);
-    crate::lints::lint_units_sparse::<crate::lints::Splitting, _>(cx, &entries, &chain_of, text, path, subject, &asked, rules, marks, alloc, Global, counts, &mut did)
-        .map_err(|err| refused(err.as_str()))?;
-    // 3. Each linted unit's findings, its item named for the profile and the tests.
-    let mut relinted = std::vec::Vec::with_capacity_in(did.len(), Global);
+    let mut relinted = blaze_own::Vec::with_capacity_in(asked.len(), Global);
     let mut cost = (0u64, Cost::NONE);
-    for one in did {
-        let sparse = one?;
-        let entry = sparse.unit.checked_sub(1).and_then(|at| entries.get(at).map(|item| (at, item)));
-        relinted.push(entry.map(|(_, item)| blaze_own::String::from_str_in(crate::item_name::shown_name(item, text), Global)));
-        cost.0 += u64::from(sparse.tokens);
-        cost.1.add_all(&sparse.cost);
-        let Some(unit_found) = sparse.found else {
-            continue;
-        };
-        found.push(Found {
-            name: sparse.name,
-            chain: entry.map(|(at, _)| chain_of(at)),
-            findings: unit_found.findings,
-            words: unit_found.words,
-            fixes: unit_found.fixes,
-        });
+    if !asked.is_empty() {
+        let subject = crate::signature::file_subject(path);
+        let marks = crate::lints::marks_of(text, text);
+        let mut did: blaze_own::AVec<'_, Result<crate::lints::SparseUnit<Global>, Why>> = blaze_own::AVec::with_capacity_in(asked.len(), alloc);
+        crate::lints::lint_units_sparse::<crate::lints::Splitting, _>(cx, &entries, &chain_of, text, path, subject, &asked, rules, marks, alloc, Global, counts, &mut did)
+            .map_err(|err| refused(err.as_str()))?;
+        // 3. Each linted unit's findings, its item named for the profile and the tests.
+        for one in did {
+            let sparse = one?;
+            let entry = sparse.unit.checked_sub(1).and_then(|at| entries.get(at).map(|item| (at, item)));
+            relinted.push(entry.map(|(_, item)| blaze_own::String::from_str_in(crate::item_name::shown_name(item, text), Global)));
+            cost.0 += u64::from(sparse.tokens);
+            cost.1.add_all(&sparse.cost);
+            let Some(unit_found) = sparse.found else {
+                continue;
+            };
+            found.push(Found {
+                name: sparse.name,
+                chain: entry.map(|(at, _)| chain_of(at)),
+                findings: unit_found.findings,
+                words: unit_found.words,
+                fixes: unit_found.fixes,
+            });
+        }
     }
     // 4. The file's record, its found units in name order (kept or linted, the same bytes).
     found.sort_unstable_by_key(|one| one.name);
@@ -833,4 +1005,69 @@ pub(crate) fn lint_text(
 fn part_place(parts: &[Part], name: Name) -> Option<u32> {
     let at = parts.binary_search_by_key(&name, |part| part.name).ok()?;
     matches!(parts[at].locate, Locate::Source(_)).then_some(parts[at].place)
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn lint_claim_chunk_scales_and_bounds_cleanly() {
+        assert_eq!(lint_claim_chunk(0, 8), 1);
+        assert_eq!(lint_claim_chunk(1, 8), 1);
+        assert_eq!(lint_claim_chunk(63, 8), 1);
+        assert_eq!(lint_claim_chunk(64, 8), 4);
+        assert_eq!(lint_claim_chunk(64, 16), 4);
+        assert_eq!(lint_claim_chunk(64, 64), 1);
+        assert_eq!(lint_claim_chunk(256, 128), 2);
+        assert_eq!(lint_claim_chunk(512, 128), 4);
+        assert_eq!(lint_claim_chunk(4096, 128), 4);
+    }
+
+    #[test]
+    fn chunked_claiming_visits_every_index_once_in_deterministic_order() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(17, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("root context");
+        let cases = [(1usize, 1u32), (17, 4), (63, 8), (64, 8), (65, 8), (257, 8), (1024, 8)];
+        for (task_count, workers) in cases {
+            let max_workers = usize::try_from(workers).unwrap_or(1).max(1);
+            let worker_count = task_count.min(max_workers).max(1);
+            let chunk = lint_claim_chunk(task_count, worker_count);
+            let cursor = CachePadded::new(AtomicUsize::new(0));
+            let cursor_ref = &cursor;
+            let scope = cx.scope();
+            scope.narrow_workers(NonZeroU32::new(workers).expect("nonzero workers"), Class::Foreground);
+            let mut running = blaze_own::Vec::with_capacity_in(worker_count, cx.frame());
+            for _ in 0..worker_count {
+                running.push(scope.may_overlap("lint chunk test worker", 64 << 10, move |_cx: &Cx| {
+                    let mut local = blaze_own::Vec::new_in(alloc);
+                    loop {
+                        let start = cursor_ref.fetch_add(chunk, Ordering::Relaxed);
+                        if start >= task_count {
+                            break;
+                        }
+                        let end = start.saturating_add(chunk).min(task_count);
+                        for idx in start..end {
+                            let val = u64::try_from(idx).expect("idx fits u64").wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                            local.push((idx, val));
+                        }
+                    }
+                    Ok::<_, Infallible>(local)
+                }));
+            }
+            let mut results = blaze_own::Vec::with_capacity_in(task_count, alloc);
+            for h in running.into_iter() {
+                results.extend(h.join(&cx).expect("join lint chunk worker"));
+            }
+            scope.join(&cx).expect("join lint chunk scope");
+            results.sort_unstable_by_key(|(idx, _)| *idx);
+            let mut expected = blaze_own::Vec::with_capacity_in(task_count, alloc);
+            for idx in 0..task_count {
+                expected.push((idx, u64::try_from(idx).expect("idx fits u64").wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+            }
+            assert_eq!(results.as_slice(), expected.as_slice(), "mismatch for task_count={task_count}, workers={workers}, chunk={chunk}");
+        }
+    }
 }

@@ -172,9 +172,10 @@ pub(super) struct Co {
     cx: Value,
     /// The number the next `.await`'s `suspend` takes: points count up in emit order.
     pub(super) points: u32,
-    /// `Poll<Output>`'s walk row and its layout in `ls`.
-    poll_row: u32,
-    poll_id: LayoutId,
+    /// `Poll<Output>`'s walk row and its layout in `ls`, or `None` when `Poll<Output>` is
+    /// zero-sized (`Repr::None`: `Output` is uninhabited, so `Poll::Pending` is the only
+    /// inhabited variant and carries no tag or payload bytes).
+    poll: Option<(u32, LayoutId)>,
     items: crate::AsyncItems,
     /// The one slot every `.await` of the body makes its `Pin` in: written before each poll,
     /// read by nothing after the call returns.
@@ -257,13 +258,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.ground.intern(PNode::Adt(items.poll, l)).map_err(full)
     }
 
-    /// The walk row and `ls` layout of a `Poll` held as `repr`.
-    fn poll_row(&self, repr: Repr) -> Result<(u32, LayoutId), TyErr> {
+    /// The walk row and `ls` layout of a `Poll` held as `repr`, or `None` when `Poll<T>` has
+    /// no size (`Repr::None`: `T` is uninhabited, so `Poll::Pending` is the sole inhabited
+    /// variant and holds no tag or payload).
+    fn poll_row(&self, repr: Repr) -> Result<Option<(u32, LayoutId)>, TyErr> {
         let Repr::Agg(row) = repr else {
-            return Err(TyErr::Unsupported("a `Poll` of no size (a coroutine or an `.await` whose output is uninhabited)"));
+            return match repr {
+                Repr::None => Ok(None),
+                _ => Err(TyErr::Malformed("`Poll` not laid out as an enum or zero-sized type")),
+            };
         };
         match self.layouts[row as usize].shape {
-            Shape::Enum { id, .. } => Ok((row, id)),
+            Shape::Enum { id, .. } => Ok(Some((row, id))),
             _ => Err(TyErr::Malformed("`Poll` not laid out as an enum")),
         }
     }
@@ -378,9 +384,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
         let mut caps = Vec::new_in(self.alloc);
         for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(e) {
-            if let Some(cnt) = self.uses_left.get_mut(f.base.ix()) {
-                *cnt = cnt.saturating_sub(1);
-            }
             fields.push(f);
             caps.push((f.base, f.how));
         }
@@ -454,15 +457,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// What both of a coroutine's built functions start from: the block's ground type and
     /// parts, the library's items, and `Poll<Output>` as the result (`self.ret`), which
     /// crosses as every Rust result does.
-    fn co_entry(&mut self, block: ExprId) -> Result<(PTy, CoParts, crate::AsyncItems, u32, LayoutId), BuildError> {
+    fn co_entry(&mut self, block: ExprId) -> Result<(PTy, CoParts, crate::AsyncItems, Option<(u32, LayoutId)>), BuildError> {
         let t = self.expr_ty(block)?;
         let g = self.ground_ty(t).map_err(co_err)?;
         let parts = self.coroutine_parts(g).map_err(co_err)?;
         let items = self.async_items(Some(block))?;
         let polled = self.poll_ty(items, parts.output)?;
         self.ret = self.repr(polled).map_err(co_err)?;
-        let (row, id) = self.poll_row(self.ret).map_err(co_err)?;
-        Ok((g, parts, items, row, id))
+        let poll = self.poll_row(self.ret).map_err(co_err)?;
+        Ok((g, parts, items, poll))
     }
 
     /// Bind the receiver and context and locate the storage RESUME writes its Poll into.
@@ -501,11 +504,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The Reference, "Destructors": "The variables that a closure captures by move are
     /// dropped in an unspecified order": here the upvars' tuple's glue, in capture order.
     pub(super) fn run_coroutine(&mut self, block: ExprId) -> Result<blaze_lir::coroutine::Shape, BuildError> {
-        let (_, parts, items, row, id) = self.co_entry(block)?;
+        let (_, parts, items, poll) = self.co_entry(block)?;
         // RESUME is private to the split pass. Its state parameter is always number one.
         self.ret_pass = Pass::Ref;
         let (_, state, cx) = self.co_params(self.rust_pass(Repr::Ptr)?)?;
-        self.co = Some(Co { cx, points: 0, poll_row: row, poll_id: id, items, pin: None });
+        self.co = Some(Co { cx, points: 0, poll, items, pin: None });
         // The upvars' drop scope, the outermost (a fn's parameters' scope).
         self.scope_marks.push(0);
         // The environment's fields, as `coroutine_value` stores them. A field holding a place
@@ -572,7 +575,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// layout is not a record until this build returns.
     pub(super) fn run_poll_entry(&mut self, block: ExprId) -> Result<(), BuildError> {
         let full = |_| malformed("the ground table is full");
-        let (g, _, items, _, _) = self.co_entry(block)?;
+        let (g, _, items, _) = self.co_entry(block)?;
         let none = self.ground.intern_list(&[]).map_err(full)?;
         let unit = self.ground.intern(PNode::Tuple(none)).map_err(full)?;
         let r = self.ground.intern(PNode::Ref(Mutbl::Mut, unit)).map_err(full)?;
@@ -608,17 +611,19 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// last, as a fn's `return` (`ret_value`). The pass stores `Returned` in the tag.
     pub(super) fn coroutine_return(&mut self, v: V) -> Result<(), BuildError> {
         let co = self.co.ok_or(malformed("a coroutine's return outside a coroutine's body"))?;
-        let to = (self.sret.ok_or(malformed("a coroutine's `Poll` returned without its pointer"))?, 0);
-        let (ff, fl, id) = self.variant_rows(co.poll_row, co.items.ready)?;
-        match fl {
-            0 => {}
-            1 => {
-                let (_, off, frepr) = self.layout_fields[ff as usize];
-                self.store(v, frepr, (to.0, off as i32))?;
+        if let Some((poll_row, _)) = co.poll {
+            let to = (self.sret.ok_or(malformed("a coroutine's `Poll` returned without its pointer"))?, 0);
+            let (ff, fl, id) = self.variant_rows(poll_row, co.items.ready)?;
+            match fl {
+                0 => {}
+                1 => {
+                    let (_, off, frepr) = self.layout_fields[ff as usize];
+                    self.store(v, frepr, (to.0, off as i32))?;
+                }
+                _ => return Err(BuildError::UnsupportedSig { what: "a `Poll` whose `Ready` variant is not one field" }),
             }
-            _ => return Err(BuildError::UnsupportedSig { what: "a `Poll` whose `Ready` variant is not one field" }),
+            self.write_tag(id, co.items.ready, to);
         }
-        self.write_tag(id, co.items.ready, to);
         self.drop_from(0)?;
         self.b.ret(&[]);
         Ok(())
@@ -755,7 +760,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let orepr = self.repr(out).map_err(err)?;
         let polled = self.poll_ty(items, out)?;
         let rrepr = self.repr(polled).map_err(err)?;
-        let (row, id) = self.poll_row(rrepr).map_err(err)?;
+        let awaited_poll = self.poll_row(rrepr).map_err(err)?;
         let rpass = self.rust_pass(rrepr)?;
         let ppass = self.rust_pass(prepr)?;
         let cpass = self.rust_pass(Repr::Ptr)?;
@@ -790,19 +795,34 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.emit_call(Callee::Direct(reference), &[prepr, Repr::Ptr], &[ppass, cpass], rrepr, rpass)?;
         let r = self.pop()?;
         self.b.slot_dead(pin_slot);
-        let rat = self.place(r, rrepr)?;
-        let poll_slot = self.await_slot(e, rat, "`.await` whose `Poll` is not in a slot of its own: its storage cannot end on the Ready edge")?;
-        let d = self.read_discriminant(id, rat)?;
-        let ready_case = self.discriminant_case(id, items.ready)?;
         let ready = self.create();
         let pending = self.create();
-        self.switch(d, pending, &[(ready_case, ready)]);
+        let (rat, poll_slot) = match awaited_poll {
+            Some((_, id)) => {
+                let rat = self.place(r, rrepr)?;
+                let poll_slot = self.await_slot(e, rat, "`.await` whose `Poll` is not in a slot of its own: its storage cannot end on the Ready edge")?;
+                let d = self.read_discriminant(id, rat)?;
+                let ready_case = self.discriminant_case(id, items.ready)?;
+                self.switch(d, pending, &[(ready_case, ready)]);
+                (Some(rat), Some(poll_slot))
+            }
+            // A zero-sized `Poll<T>` has an uninhabited `T`, so `Future::poll` can only ever
+            // return `Poll::Pending`: suspend unconditionally and leave `ready` unreachable.
+            None => {
+                self.jump(pending, &[]);
+                (None, None)
+            }
+        };
 
         // Step 5: this poll returns `Poll::Pending`; the next goes on at the head.
         self.begin(pending);
-        self.b.slot_dead(poll_slot);
-        let to = self.sret.ok_or(malformed("a coroutine's `Poll` returned without its pointer"))?;
-        self.write_tag(Some(co.poll_id), items.pending, (to, 0));
+        if let Some(poll_slot) = poll_slot {
+            self.b.slot_dead(poll_slot);
+        }
+        if let Some((_, poll_id)) = co.poll {
+            let to = self.sret.ok_or(malformed("a coroutine's `Poll` returned without its pointer"))?;
+            self.write_tag(Some(poll_id), items.pending, (to, 0));
+        }
         let cancel = self.create();
         let point = co.points;
         co.points = point.checked_add(1).ok_or(malformed("a coroutine of more suspend points than a `u32` counts"))?;
@@ -831,32 +851,39 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.begin(ready);
         self.reload_waiting(&spilled)?;
         self.plant_after(planted);
-        let (ff, fl, _) = self.variant_rows(row, items.ready)?;
-        let value = match (fl, orepr) {
-            (_, Repr::None) => V::None,
-            (1, _) => {
-                let (_, off, frepr) = self.layout_fields[ff as usize];
-                if frepr != orepr {
-                    return Err(malformed("`Poll::Ready`'s field not held as the awaited output"));
+        let value = match (awaited_poll, rat) {
+            (Some((row, _)), Some(rat)) => {
+                let (ff, fl, _) = self.variant_rows(row, items.ready)?;
+                let value = match (fl, orepr) {
+                    (_, Repr::None) => V::None,
+                    (1, _) => {
+                        let (_, off, frepr) = self.layout_fields[ff as usize];
+                        if frepr != orepr {
+                            return Err(malformed("`Poll::Ready`'s field not held as the awaited output"));
+                        }
+                        self.load(frepr, (rat.0, rat.1 + off as i32))
+                    }
+                    _ => return Err(unsupported(e, "a `Poll` whose `Ready` variant is not one field")),
+                };
+                // The payload is moved out of the `Poll` before its storage ends: an aggregate (held
+                // as a place in the `Poll` slot) is copied to a temporary of its own; a scalar is
+                // already loaded.
+                match value {
+                    V::Place(..) => {
+                        let to = self.temp(orepr);
+                        self.name_at(to, Identity::Temp(e, Role::Result));
+                        self.store(value, orepr, to)?;
+                        V::Place(to.0, to.1)
+                    }
+                    other => other,
                 }
-                self.load(frepr, (rat.0, rat.1 + off as i32))
             }
-            _ => return Err(unsupported(e, "a `Poll` whose `Ready` variant is not one field")),
+            _ => V::None,
         };
-        // The payload is moved out of the `Poll` before its storage ends: an aggregate (held
-        // as a place in the `Poll` slot) is copied to a temporary of its own; a scalar is
-        // already loaded.
-        let value = match value {
-            V::Place(..) => {
-                let to = self.temp(orepr);
-                self.name_at(to, Identity::Temp(e, Role::Result));
-                self.store(value, orepr, to)?;
-                V::Place(to.0, to.1)
-            }
-            other => other,
-        };
-        self.b.slot_dead(poll_slot);
-        if held_drops {
+        if let Some(poll_slot) = poll_slot {
+            self.b.slot_dead(poll_slot);
+        }
+        if held_drops && awaited_poll.is_some() {
             let drop_at = match at {
                 Some(at) => at,
                 None => {

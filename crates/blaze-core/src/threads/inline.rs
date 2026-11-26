@@ -77,6 +77,14 @@ pub enum Lent {
     At(u64),
 }
 
+/// Outcome of [`Inline::entries_confined`], preserving `OutOfMemory` separately from I/O errors.
+pub enum ConfinedEntries {
+    Listed(crate::Listing),
+    NotFound,
+    OutOfMemory,
+    Failed(IoError),
+}
+
 /// What a lent whole-file read ([`Inline::read_all_lent`]) found.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an outcome with an error's text
 pub enum LentRead {
@@ -90,6 +98,8 @@ pub enum LentRead {
     /// "whole" to return, and a second read races the same writer (rule no-fallback: no retry);
     /// the asker learns it by name and decides.
     Moved { stated: u64, read: u64 },
+    /// The file did not exist (`ENOENT`) on a confined read.
+    NotFound,
     /// The call failed, saying this (the text a queued call's `Done::Failed` carries).
     Failed(IoError),
 }
@@ -217,13 +227,17 @@ impl Inline {
         }
     }
 
-    /// Kernel-confined, zero-memset whole-file read: opens `file` strictly beneath this driver's
-    /// cached root `dirfd` via `openat`/`O_NOFOLLOW` (or Linux `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`),
-    /// rejecting any symbolic link in any directory component or final leaf with `ELOOP`, and
-    /// reads straight into `into`'s uninitialized spare capacity.
-    pub fn read_all_confined_into_vec<A: Allocator>(&self, file: &FileName, into: &mut Vec<u8, A>) -> LentRead {
-        let done = crate::lock::io_wait("read all confined", file.as_str(), || {
-            crate::fs::beneath::read_whole_confined_into_vec(&self.root_dir, &self.root, file, into)
+    /// Kernel-confined, zero-memset read (whole file when `range` is `None`, or positional
+    /// `[at..at+len]` when `Some((at, len))`) strictly beneath this driver's cached root `dirfd`
+    /// via `openat`/`O_NOFOLLOW` (Linux: `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`).
+    pub fn read_confined_into_vec<A: Allocator>(
+        &self,
+        file: &FileName,
+        range: Option<(u64, usize)>,
+        into: &mut Vec<u8, A>,
+    ) -> LentRead {
+        let done = crate::lock::io_wait("read confined", file.as_str(), || {
+            crate::fs::beneath::read_confined_into_vec(&self.root_dir, &self.root, file, range, into)
         });
         match done {
             Ok(read) => read,
@@ -232,6 +246,34 @@ impl Inline {
             // alloc: an error path.
             Err(error) => LentRead::Failed(IoError(error.to_string())),
         }
+    }
+
+    /// Kernel-confined directory listing strictly beneath this driver's root `dirfd` (never follows
+    /// symlinks along any path component; preserves `NotFound` and `OutOfMemory`).
+    pub fn entries_confined(&self, rel: &FileName, name: &crate::DirName) -> ConfinedEntries {
+        let done = crate::lock::io_wait("entries confined", rel.as_str(), || {
+            crate::fs::beneath::entries_confined(&self.root_dir, &self.root, rel, name)
+        });
+        match done {
+            Ok(listing) => ConfinedEntries::Listed(listing),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ConfinedEntries::NotFound,
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => ConfinedEntries::OutOfMemory,
+            Err(error) => ConfinedEntries::Failed(IoError(error.to_string())),
+        }
+    }
+
+    /// Streams `readdir` over `rel` (or this driver's root when `None`) in O(1) memory, unlinking
+    /// regular `.part-<tag>` scratch files matching `should_remove`.
+    pub fn sweep_parts_confined(
+        &self,
+        rel: Option<&FileName>,
+        should_remove: impl FnMut(&str, u64) -> bool,
+    ) -> Result<u32, IoError> {
+        let label = rel.map_or(".", FileName::as_str);
+        let done = crate::lock::io_wait("sweep parts", label, || {
+            crate::fs::beneath::sweep_parts_confined(&self.root_dir, &self.root, rel, should_remove)
+        });
+        done.map_err(|error| IoError(error.to_string()))
     }
 
     /// A call's result as the driver's thread hands it back (`work_on`, kqueue.rs): its error

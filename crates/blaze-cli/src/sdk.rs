@@ -61,7 +61,6 @@ use blaze_ids::ContentId;
 use blaze_own::Vec;
 use blaze_own::planted::{NoPlant, Planted, Plants};
 use bstd::Cx;
-use bstd::clock::Clock;
 use bstd::fs::{Content, Dir, Durable, Fs, FsError, HomeError, ReadWrite, SizedError};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::{Path, PathError};
@@ -93,6 +92,8 @@ pub(crate) const XCODE_DEFAULT: &str = "/Applications/Xcode.app/Contents/Develop
 pub(crate) const COMMAND_LINE_TOOLS: &str = "/Library/Developer/CommandLineTools";
 /// The records' folder, beneath the home: one file per key ([`record_name`]).
 pub(crate) const ANSWERS: &str = ".blaze/v2/sdk-answers";
+/// The records' folder relative to an already-opened `~/.blaze` directory (`Home::dir`).
+const ANSWERS_IN_HOME: &str = "v2/sdk-answers";
 /// The record's form.
 pub(crate) const MAGIC: &[u8; 4] = b"BSK2";
 const KEY_DOMAIN: &str = "blaze-cli sdk: xcrun, its arguments and its environment 2";
@@ -298,19 +299,47 @@ pub(crate) trait Machine {
     fn wall_ns(&self) -> u64;
 }
 
-/// The command's macOS SDK: `sdkroot`, else xcrun's answer (recorded under the home in `fs`, or
-/// asked, by `from`), its settings read from the folder chosen; the words of a failure held in
-/// `frame`; and how.
-pub(crate) fn resolve_how<'f>(cx: &Cx, fs: &Fs, sdkroot: Option<&'f str>, env: &XcrunEnv<'_>, from: SdkFrom, clock: &Clock, frame: &'f Frame) -> (Result<Sdk<'f>, SdkRefused<'f>>, SdkHow) {
+/// The command's macOS SDK: `sdkroot`, else xcrun's answer (recorded under `blaze_home` when
+/// already opened, else under the home in `fs`, or asked, by `from`), its settings read from the
+/// folder chosen; the words of a failure held in `frame`; and how. Reusing `blaze_home`
+/// (`Home::dir`) avoids spawning a second `Fs::home` (`io.beside`) driver pool on the hot path.
+#[expect(clippy::too_many_arguments, reason = "the resolve's inputs, each one handle")]
+pub(crate) fn resolve_how<'f>(
+    cx: &Cx,
+    fs: &Fs,
+    blaze_home: Option<&Dir<ReadWrite>>,
+    sdkroot: Option<&'f str>,
+    env: &XcrunEnv<'_>,
+    from: SdkFrom,
+    wall_ns: u64,
+    frame: &'f Frame,
+) -> (Result<Sdk<'f>, SdkRefused<'f>>, SdkHow) {
     let cx = cx.span("sdk: the macOS SDK folder");
-    resolve_on(&cx, fs, &Host { clock }, sdkroot, env, from, NoPlant, frame)
+    resolve_on_in_home(&cx, fs, blaze_home, &Host { wall_ns }, sdkroot, env, from, NoPlant, frame)
 }
 
 /// [`resolve_how`] on `machine`, its records in `fs`, with `plant`.
+#[cfg_attr(not(test), allow(dead_code, reason = "test seam exercised by tests/sdk_tests.rs"))]
 #[expect(clippy::too_many_arguments, reason = "the resolve's inputs, each one handle; the test's seam adds the machine and the plant")]
 pub(crate) fn resolve_on<'f, M: Machine, P: Planted<SdkPlant>>(
     cx: &Cx,
     fs: &Fs,
+    machine: &M,
+    sdkroot: Option<&'f str>,
+    env: &XcrunEnv<'_>,
+    from: SdkFrom,
+    plant: P,
+    frame: &'f Frame,
+) -> (Result<Sdk<'f>, SdkRefused<'f>>, SdkHow) {
+    resolve_on_in_home(cx, fs, None, machine, sdkroot, env, from, plant, frame)
+}
+
+/// [`resolve_on`] optionally reusing an already-opened `~/.blaze` directory (`blaze_home`).
+#[expect(clippy::too_many_arguments, reason = "the resolve's inputs, each one handle; the test's seam adds the machine and the plant")]
+pub(crate) fn resolve_on_in_home<'f, M: Machine, P: Planted<SdkPlant>>(
+    cx: &Cx,
+    fs: &Fs,
+    blaze_home: Option<&Dir<ReadWrite>>,
     machine: &M,
     sdkroot: Option<&'f str>,
     env: &XcrunEnv<'_>,
@@ -324,7 +353,7 @@ pub(crate) fn resolve_on<'f, M: Machine, P: Planted<SdkPlant>>(
         || {
             let (folder, asked) = match from {
                 SdkFrom::Xcrun => (machine.xcrun(cx, env, frame), SdkHow::Asked { why: Ask::Always, kept: Kept::NotAsked }),
-                SdkFrom::Recorded => recorded(cx, fs, machine, env, plant, frame),
+                SdkFrom::Recorded => recorded(cx, fs, blaze_home, machine, env, plant, frame),
             };
             how = asked;
             folder
@@ -393,6 +422,13 @@ impl Answers {
     pub(crate) fn open(cx: &Cx, fs: &Fs, home: &str) -> Result<Answers, RecordError> {
         let folder = Path::new(ANSWERS).map_err(RecordError::Path)?;
         fs.home(cx, home, &folder).map(|dir| Answers { dir }).map_err(RecordError::Home)
+    }
+
+    /// The folder beneath an already-opened `~/.blaze` directory (`Home::dir`), avoiding a second
+    /// `Fs::home` (`io.beside`) driver spawn.
+    pub(crate) fn in_home(blaze_home: &Dir<ReadWrite>) -> Result<Answers, RecordError> {
+        let folder = Path::new(ANSWERS_IN_HOME).map_err(RecordError::Path)?;
+        Ok(Answers { dir: blaze_home.subdir(&folder) })
     }
 
     /// The bytes of the record `name`, held in `frame`; `None` when there is none.
@@ -581,7 +617,15 @@ fn decode(bytes: &[u8], key: ContentId) -> Result<(&str, &[u8]), Ask> {
 }
 
 /// xcrun's answer from the record whose read list reads equal today, else asked and recorded.
-fn recorded<'f, M: Machine, P: Planted<SdkPlant>>(cx: &Cx, fs: &Fs, machine: &M, env: &XcrunEnv<'_>, plant: P, frame: &'f Frame) -> (Result<&'f str, XcrunFailed<'f>>, SdkHow) {
+fn recorded<'f, M: Machine, P: Planted<SdkPlant>>(
+    cx: &Cx,
+    fs: &Fs,
+    blaze_home: Option<&Dir<ReadWrite>>,
+    machine: &M,
+    env: &XcrunEnv<'_>,
+    plant: P,
+    frame: &'f Frame,
+) -> (Result<&'f str, XcrunFailed<'f>>, SdkHow) {
     let Some(home) = env.home.filter(|home| home.starts_with('/')) else { return ask(cx, machine, env, plant, None, Ask::NoHome, frame) };
     if !path_absolute(env.path) {
         return ask(cx, machine, env, plant, None, Ask::PathNotAbsolute, frame);
@@ -591,7 +635,11 @@ fn recorded<'f, M: Machine, P: Planted<SdkPlant>>(cx: &Cx, fs: &Fs, machine: &M,
     let key = key_of(env, plant, frame);
     let (place, why) = {
         let read_cx = cx.span("sdk: xcrun's recorded answer, its read list read");
-        let opened = match Answers::open(&read_cx, fs, home) {
+        let answers = match blaze_home {
+            Some(dir) => Answers::in_home(dir),
+            None => Answers::open(&read_cx, fs, home),
+        };
+        let opened = match answers {
             Ok(answers) => record_name(key).map(|name| (answers, name)).map_err(RecordError::Path),
             Err(error) => Err(error),
         };
@@ -702,9 +750,9 @@ fn keep<M: Machine, P: Planted<SdkPlant>>(
     }
 }
 
-/// The host: its file system, its xcrun, its wall clock (handed in as `clock`).
-pub(crate) struct Host<'c> {
-    clock: &'c Clock,
+/// The host: its file system, its xcrun, its wall clock reading (handed in as `wall_ns`).
+pub(crate) struct Host {
+    wall_ns: u64,
 }
 
 /// Ns since the epoch of a status's seconds and nanoseconds; 0 before it.
@@ -727,7 +775,7 @@ fn not_there(error: &std::io::Error) -> bool {
 // executable bit) and it reads no link's target, and its `Fs` reaches an absolute path only through a second driver
 // (`Fs::home`); these are fixed absolute paths of the system, read at the command's edge.
 // The records are bstd's ([`Answers`]).
-impl Machine for Host<'_> {
+impl Machine for Host {
     fn stat(&self, path: &str, follow: bool, _frame: &Frame) -> Result<Option<Stat>, Unseen> {
         use std::os::unix::fs::MetadataExt as _;
         let read = if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) };
@@ -768,7 +816,7 @@ impl Machine for Host<'_> {
     }
 
     fn wall_ns(&self) -> u64 {
-        self.clock.wall().as_ns()
+        self.wall_ns
     }
 }
 
@@ -864,3 +912,78 @@ pub(crate) const NONE_IN_TESTS: Result<Sdk<'static>, SdkRefused<'static>> =
 #[cfg(test)]
 #[path = "tests/sdk_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod home_dir_tests {
+    use super::*;
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::mem::{Frame, TASK_FRAME};
+    use bstd::test::BUDGET;
+
+    struct FakeMachine {
+        xcrun_calls: core::cell::Cell<u32>,
+    }
+
+    impl Machine for FakeMachine {
+        fn stat(&self, path: &str, _follow: bool, _frame: &Frame) -> Result<Option<Stat>, Unseen> {
+            let mode = if path.ends_with("/xcrun") { 0o100_755 } else { 0o040_755 };
+            if path == "/usr/bin/xcrun" || path == "/sdk/MacOSX.sdk" || path == "/sdk" || path == COMMAND_LINE_TOOLS {
+                Ok(Some(Stat { dev: 1, ino: 42, mode, mtime_ns: 100, ctime_ns: 100 }))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn readlink<'f>(&self, _path: &str, _frame: &'f Frame) -> Result<Option<&'f str>, Unseen> {
+            Ok(None)
+        }
+
+        fn xcrun<'f>(&self, _cx: &Cx, _env: &XcrunEnv<'_>, _frame: &'f Frame) -> Result<&'f str, XcrunFailed<'f>> {
+            self.xcrun_calls.set(self.xcrun_calls.get() + 1);
+            Ok("/sdk/MacOSX.sdk\n")
+        }
+
+        fn settings<'f>(&self, _folder: &str, _frame: &'f Frame) -> Result<&'f str, Unread<'f>> {
+            Ok(r#"{"Version":"27.2"}"#)
+        }
+
+        fn system_version<'f>(&self, _folder: &str, _frame: &'f Frame) -> Result<&'f str, Unread<'f>> {
+            Ok("<key>ProductBuildVersion</key><string>26B118</string>")
+        }
+
+        fn wall_ns(&self) -> u64 {
+            10_000
+        }
+    }
+
+    #[test]
+    fn resolve_on_in_home_shares_exact_answers_dir_with_resolve_on() {
+        let io = Io::simulated(SimWorld::new(91, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+        let env = XcrunEnv { path: Some("/usr/bin"), developer_dir: None, home: Some("/h"), toolchains: None };
+        let machine = FakeMachine { xcrun_calls: core::cell::Cell::new(0) };
+
+        // 1. Cold resolve via already-opened `Home::dir()` writes `v2/sdk-answers/<hex>`.
+        let (sdk1, how1) = resolve_on_in_home(&cx, &fs, Some(home.dir()), &machine, None, &env, SdkFrom::Recorded, NoPlant, &frame);
+        let sdk1 = sdk1.expect("first sdk");
+        assert_eq!(machine.xcrun_calls.get(), 1);
+        assert_eq!(how1, SdkHow::Asked { why: Ask::NoRecord, kept: Kept::Kept });
+
+        // 2. Warm resolve via `resolve_on` (`Answers::open`) hits the exact same record (0 xcrun calls).
+        let (sdk2, how2) = resolve_on(&cx, &fs, &machine, None, &env, SdkFrom::Recorded, NoPlant, &frame);
+        let sdk2 = sdk2.expect("second sdk");
+        assert_eq!(machine.xcrun_calls.get(), 1);
+        assert_eq!(how2, SdkHow::Recorded);
+        assert_eq!(sdk1, sdk2);
+
+        // 3. Warm resolve via `resolve_on_in_home(Some(home.dir()))` also hits Recorded (0 xcrun calls).
+        let (sdk3, how3) = resolve_on_in_home(&cx, &fs, Some(home.dir()), &machine, None, &env, SdkFrom::Recorded, NoPlant, &frame);
+        let sdk3 = sdk3.expect("third sdk");
+        assert_eq!(machine.xcrun_calls.get(), 1);
+        assert_eq!(how3, SdkHow::Recorded);
+        assert_eq!(sdk1, sdk3);
+    }
+}

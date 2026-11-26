@@ -53,9 +53,12 @@ pub use launch::{SPEC_MARK, SPEC_MARK_VALUE, launch, launch_with};
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod testing_native;
 
-/// The threads the native driver runs file calls on where it has a pool (kqueue, IOCP): a
-/// bound bstd picks for a program's entry, named (std.md, "The second rule").
+/// The baseline threads the native driver runs file calls on where it has a pool (kqueue, IOCP):
+/// scaled up to [`MAX_FILE_THREADS`] on wide-core hosts ([`machine::file_threads`], std.md).
 pub(crate) const FILE_THREADS: usize = 4;
+
+/// Upper bound on native driver file threads on large-core servers (e.g. 16 at 128 cores).
+const MAX_FILE_THREADS: usize = 16;
 
 /// What a program of the blaze edition hands Rust std's `lang_start`: its [`Status`], as the
 /// one type of bstd that implements Rust std's `Termination`. Gone with `lang_start`, when
@@ -127,9 +130,16 @@ pub fn run_with_heap_at<R: Outcome>(
         let args = ArgList::process(block);
         // clone: the arguments' list (a borrow of the start block), read once by `level`.
         let chosen = level(&crate::args::Args::new(args.clone()));
-        let io = open_native(os, args, Vars::process(block), start_dir(), u8::MAX)?;
         let alloc = heap.shared();
-        Ok((with_telemetry(io, chosen, alloc)?, AtExit { level: chosen, alloc }))
+        let io = open_native_with_telemetry(
+            os,
+            args,
+            Vars::process(block),
+            start_dir(),
+            u8::MAX,
+            Some(TelemetryOpts { level: chosen, alloc }),
+        )?;
+        Ok((io, AtExit { level: chosen, alloc }))
     });
     let (world, at_exit) = match world {
         Ok((io, at_exit)) => (Ok(io), Some(at_exit)),
@@ -138,16 +148,12 @@ pub fn run_with_heap_at<R: Outcome>(
     run_io_with(world, at_exit, move |cx, io| main(cx, io, heap))
 }
 
-/// `io` over a `Workers` of the same setup whose cells keep telemetry at `level` in `alloc`
-/// (the bare one `open_native` made is dropped: one sparse reservation, nothing backed).
-fn with_telemetry(io: Io, level: crate::telemetry::Level, alloc: blaze_own::SharedAlloc<'static>) -> Result<Io, String> {
-    let setup = io.workers().setup();
-    // alloc: an error's message.
-    let mut opts = crate::workers::WorkersOpts::new(setup).map_err(|error| error.to_string())?;
-    opts.telemetry(level, alloc);
-    // alloc: an error's message.
-    let workers = crate::workers::Workers::new(opts).map_err(|error| error.to_string())?;
-    Ok(io.on_workers(workers))
+/// Telemetry registration passed into [`open_native_with_telemetry`] so the world's
+/// [`Workers`](crate::workers::Workers) reservation is constructed once with telemetry configured.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TelemetryOpts {
+    pub(crate) level: crate::telemetry::Level,
+    pub(crate) alloc: blaze_own::SharedAlloc<'static>,
 }
 
 /// What the runtime does with the run's telemetry when it ends: the level the cells keep and
@@ -242,7 +248,7 @@ pub fn run_with_workers<S, R: Outcome>(
         crate::workers::Workers::new(opts).map(|workers| (workers, keys))
     });
     let (world, keys) = match made {
-        Ok((workers, keys)) => (native(os).map(|io| io.on_workers(workers)), Some(keys)),
+        Ok((workers, keys)) => (native_on(os, workers), Some(keys)),
         // alloc: an error's message, once.
         Err(error) => (Err(error.to_string()), None),
     };
@@ -467,10 +473,13 @@ pub(crate) mod pool {
             .name(format!("bstd-worker-{at}"))
             .stack_size(WORKER_STACK)
             .spawn(move || {
-                if let Some((cpu, class)) = mine.placement(at)
-                    && let Err(why) = machine::place(cpu, class)
-                {
-                    super::fatal(&StartError { worker: at, why }.to_string());
+                if let Some((cpu, class)) = mine.placement(at) {
+                    if let Err(why) = machine::place(cpu, class) {
+                        let mut buf = [0u8; 256];
+                        let msg = machine::fmt_into(&mut buf, format_args!("{}", StartError { worker: at, why }));
+                        super::fatal(msg);
+                    }
+                    let _ = blaze_mem::chunks::set_thread_node(machine::numa_node(cpu));
                 }
                 blaze_mem::frame::size_shelf(blaze_mem::frame::ShelfSize::for_threads(mine.workers() as usize));
                 mine.work(at);
@@ -510,14 +519,66 @@ mod machine {
     //! The machine's cores, and placing a worker on one (rule 45 for macOS's).
 
     // `std` is this module's (bstd is `no_std`: rt.rs is where Rust std is named).
-    use super::std::{self, format, string::String, vec::Vec as StdVec};
+    #[cfg(target_os = "linux")]
+    use super::std::fs;
+    use super::std::{self, format, string::String, thread, vec::Vec as StdVec};
 
     use alloc::{alloc::Global, string::ToString as _};
 
     use blaze_own::Vec;
 
-    use super::TopologyError;
+    use super::{FILE_THREADS, MAX_FILE_THREADS, TopologyError};
     use crate::task::threads::{Class, Group, Topology};
+
+    /// Maximum workers placed in one `GroupState`: unified-LLC CPUs (e.g. 128-core Graviton 4/5)
+    /// are split into virtual groups of at most 16 workers so all cores do not serialize on a
+    /// single `bstd.task.inject` mutex.
+    pub(super) const MAX_GROUP_WORKERS: usize = 16;
+
+    /// Native file-IO thread count for a host of `cores` logical CPUs, bounded to `4..=16`.
+    pub(super) const fn file_threads_for(cores: usize) -> usize {
+        let scaled = cores / 8;
+        if scaled < FILE_THREADS {
+            FILE_THREADS
+        } else if scaled > MAX_FILE_THREADS {
+            MAX_FILE_THREADS
+        } else {
+            scaled
+        }
+    }
+
+    /// Native file-IO thread count for this host (`4..=16`, spawning no threads here).
+    pub(super) fn file_threads() -> usize {
+        file_threads_for(logical_cpus())
+    }
+
+    /// Logical CPU count allowed for this process via one `sched_getaffinity(2)` call (no sysfs
+    /// cache walk or heap allocation at process start).
+    #[cfg(target_os = "linux")]
+    pub(super) fn logical_cpus() -> usize {
+        let mut mask = [0u8; linux::SET_BYTES];
+        // SAFETY: `mask` is `SET_BYTES` writable bytes, the size passed; 0 is this thread.
+        if unsafe { linux::sched_getaffinity(0, linux::SET_BYTES, mask.as_mut_ptr()) } != 0 {
+            return FILE_THREADS;
+        }
+        let mut count = 0usize;
+        for byte in mask {
+            count = count.saturating_add(usize::try_from(byte.count_ones()).unwrap_or(0));
+        }
+        count
+    }
+
+    /// Logical CPU count via a single `hw.logicalcpu` sysctl (no `Topology` allocation or
+    /// per-perflevel sysctl walk at process start).
+    #[cfg(target_os = "macos")]
+    pub(super) fn logical_cpus() -> usize {
+        sysctl(c"hw.logicalcpu").ok().and_then(|n| usize::try_from(n).ok()).unwrap_or(FILE_THREADS)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn logical_cpus() -> usize {
+        FILE_THREADS
+    }
 
     fn failed(what: &'static str, why: impl core::fmt::Display) -> TopologyError {
         TopologyError { what, why: why.to_string() }
@@ -572,13 +633,62 @@ mod machine {
                 continue;
             }
             let shared = last_level(cpu)?;
-            let group: StdVec<u32> = shared.into_iter().filter(|&it| allowed(it) && !seen.contains(&it)).collect();
+            let node = numa_node(cpu);
+            let group: StdVec<u32> = shared
+                .into_iter()
+                .filter(|&it| allowed(it) && !seen.contains(&it) && numa_node(it) == node)
+                .collect();
             seen.extend(group.iter().copied());
             if !group.is_empty() {
                 groups.push(group);
             }
         }
         Ok(made(groups.into_iter().map(|cpus| (Class::Foreground, cpus)), true))
+    }
+
+    /// Formats `args` into a caller-supplied stack buffer without allocating.
+    pub(super) fn fmt_into<'b>(buf: &'b mut [u8], args: core::fmt::Arguments<'_>) -> &'b str {
+        struct Writer<'b> {
+            buf: &'b mut [u8],
+            len: usize,
+        }
+        impl core::fmt::Write for Writer<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let room = self.buf.len().saturating_sub(self.len);
+                let take = bytes.len().min(room);
+                if let Some(dst) = self.buf.get_mut(self.len..self.len + take)
+                    && let Some(src) = bytes.get(..take)
+                {
+                    dst.copy_from_slice(src);
+                    self.len += take;
+                }
+                Ok(())
+            }
+        }
+        let mut writer = Writer { buf, len: 0 };
+        let _ = core::fmt::Write::write_fmt(&mut writer, args);
+        let len = writer.len;
+        core::str::from_utf8(buf.get(..len).unwrap_or(&[])).unwrap_or("")
+    }
+
+    /// The NUMA node of Linux CPU `cpu` from `/sys/devices/system/cpu/cpuN/nodeM`, or `None` when
+    /// sysfs exposes no node or the node is past `blaze_mem::chunks::MAX_NODES`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn numa_node(cpu: u32) -> Option<u32> {
+        let mut buf = [0u8; 64];
+        let dir = fmt_into(&mut buf, format_args!("/sys/devices/system/cpu/cpu{cpu}"));
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(num) = name.to_str().and_then(|it| it.strip_prefix("node"))
+                && let Ok(node) = num.parse::<u32>()
+                && node < blaze_mem::chunks::MAX_NODES
+            {
+                return Some(node);
+            }
+        }
+        None
     }
 
     /// The cores sharing `cpu`'s highest-level cache: itself alone when sysfs names no cache.
@@ -702,26 +812,63 @@ mod machine {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn numa_node(_cpu: u32) -> Option<u32> {
+        None
+    }
+
     fn made(groups: impl Iterator<Item = (Class, StdVec<u32>)>, pin: bool) -> Topology {
-        let mut out = Vec::new_in(Global);
+        let alloc = Global;
+        let mut out = Vec::new_in(alloc);
         for (class, cpus) in groups {
-            let mut own = Vec::with_capacity_in(cpus.len(), Global);
-            for cpu in cpus {
-                own.push(cpu);
+            for chunk in cpus.chunks(MAX_GROUP_WORKERS) {
+                let mut own = Vec::with_capacity_in(chunk.len(), alloc);
+                for &cpu in chunk {
+                    own.push(cpu);
+                }
+                out.push(Group { class, cpus: own });
             }
-            out.push(Group { class, cpus: own });
         }
         Topology { groups: out, pin }
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{cpu_list, std};
+        use super::{Class, MAX_GROUP_WORKERS, StdVec, cpu_list, file_threads_for, made, std};
 
         #[test]
         fn a_cpu_list_reads_ranges_and_singles() {
             assert_eq!(cpu_list("0-3,8,10-11\n"), Ok(std::vec![0, 1, 2, 3, 8, 10, 11]));
             assert!(cpu_list("3-1").is_err());
+        }
+
+        #[test]
+        fn unified_llc_group_splits_into_virtual_groups_of_at_most_16_and_file_threads_scale() {
+            let unified_128: StdVec<u32> = (0..128).collect();
+            let topo = made(core::iter::once((Class::Foreground, unified_128)), true);
+            assert_eq!(topo.workers(), 128);
+            assert_eq!(topo.groups.len(), 8);
+            assert!(topo.groups.iter().all(|g| g.cpus.len() == MAX_GROUP_WORKERS));
+
+            let mixed = made(
+                [
+                    (Class::Foreground, (0..20).collect()),
+                    (Class::Background, (20..28).collect()),
+                ]
+                .into_iter(),
+                false,
+            );
+            assert_eq!(mixed.workers(), 28);
+            assert_eq!(mixed.groups.len(), 3);
+            assert_eq!(mixed.groups[0].cpus.len(), 16);
+            assert_eq!(mixed.groups[1].cpus.len(), 4);
+            assert_eq!(mixed.groups[2].cpus.len(), 8);
+
+            assert_eq!(file_threads_for(1), 4);
+            assert_eq!(file_threads_for(16), 4);
+            assert_eq!(file_threads_for(64), 8);
+            assert_eq!(file_threads_for(128), 16);
+            assert_eq!(file_threads_for(256), 16);
         }
 
         /// Rule 45: the Darwin calls the pool makes exist, and the QoS call works on this
@@ -734,6 +881,7 @@ mod machine {
             assert_eq!(unsafe { darwin::pthread_set_qos_class_self_np(darwin::QOS_USER_INITIATED, 0) }, 0);
             let topology = super::read().expect("the machine's performance levels");
             assert!(topology.workers() >= 1, "at least one core");
+            assert!(super::logical_cpus() >= 1, "hw.logicalcpu reports at least one core");
         }
     }
 }
@@ -742,6 +890,20 @@ mod machine {
 fn native(os: &blaze_core::Os) -> Result<Io, String> {
     let block = process_start()?;
     open_native(os, ArgList::process(block), Vars::process(block), start_dir(), u8::MAX)
+}
+
+type StartError = String;
+
+fn fmt_start_err(error: impl core::fmt::Display) -> StartError {
+    // alloc: an error's message.
+    error.to_string()
+}
+
+/// The process's world over pre-built `workers`, made with the root of real-OS authority `os`,
+/// without constructing a throwaway bare [`Workers`](crate::workers::Workers) reservation first.
+fn native_on(os: &blaze_core::Os, workers: crate::workers::Workers) -> Result<Io, StartError> {
+    let block = process_start()?;
+    open_native_on(os, ArgList::process(block), Vars::process(block), start_dir(), u8::MAX, Some(workers))
 }
 
 /// The root of a world over the directory the process was started in: `.`, so the start reads
@@ -776,6 +938,39 @@ pub(crate) fn process_start() -> Result<&'static block::Block, String> {
 /// read `above` folders above `root` (`u8::MAX`: up to the filesystem's root). Made with the
 /// root of real-OS authority `os`, handed down from the entry.
 pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &RootPath, above: u8) -> Result<Io, String> {
+    open_native_on(os, args, env, root, above, None)
+}
+
+/// [`open_native`] with optional [`TelemetryOpts`] registered directly on the world's
+/// [`Workers`](crate::workers::Workers) so startup makes one reservation instead of two.
+pub(crate) fn open_native_with_telemetry(
+    os: &blaze_core::Os,
+    args: ArgList,
+    env: Vars,
+    root: &RootPath,
+    above: u8,
+    telemetry: Option<TelemetryOpts>,
+) -> Result<Io, StartError> {
+    let workers = match telemetry {
+        Some(telemetry) => {
+            let setup = crate::workers::WorkersSetup { limits: crate::workers::Limits::BARE, seed: None, models: 0 };
+            let mut opts = crate::workers::WorkersOpts::new(setup).map_err(fmt_start_err)?;
+            opts.telemetry(telemetry.level, telemetry.alloc);
+            Some(crate::workers::Workers::new(opts).map_err(fmt_start_err)?)
+        }
+        None => None,
+    };
+    open_native_on(os, args, env, root, above, workers)
+}
+
+fn open_native_on(
+    os: &blaze_core::Os,
+    args: ArgList,
+    env: Vars,
+    root: &RootPath,
+    above: u8,
+    workers: Option<crate::workers::Workers>,
+) -> Result<Io, StartError> {
     // Global `Trace` recording is off by default (`Limits::QUIET`, lock-free fast-path) so
     // `Cx::span` / `Cx::event` never contend on the global world lock in production runs; set
     // `BLAZE_TRACE=1` (any non-empty value other than `0`) to capture global trace records.
@@ -786,7 +981,7 @@ pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &
     let world = NativeWorld {
         root,
         above,
-        threads: FILE_THREADS,
+        threads: machine::file_threads(),
         env,
         args,
         // alloc: once per process, the host's name (empty: see `run`).
@@ -795,8 +990,12 @@ pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &
         seed: None,
         limits,
     };
+    let opened = match workers {
+        Some(workers) => Io::native_in_on(os, world, workers),
+        None => Io::native_in(os, world),
+    };
     // alloc: an error's message.
-    Io::native_in(os, world).map_err(|error| error.to_string())
+    opened.map_err(|error| error.to_string())
 }
 
 /// `said` on standard error, as `error: <said>` and a line feed. A standard error that
@@ -955,4 +1154,44 @@ mod owns {
     // SAFETY: a `LazyLock` holds its initializer `F` and then its value `T` in place, the
     // one replaced by the other through a shared reference on first use.
     unsafe impl<T, F> Owns<Mutably> for LazyLock<T, F> {}
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+    #[test]
+    fn open_native_with_telemetry_configures_workers_in_one_shot() {
+        use super::{ArgList, TelemetryOpts, Vars, open_native_with_telemetry, start_dir};
+
+        let bare = open_native_with_telemetry(
+            blaze_core::testing::os(),
+            ArgList::given(alloc::vec::Vec::new()),
+            Vars::given(alloc::vec::Vec::new()),
+            start_dir(),
+            0,
+            None,
+        )
+        .expect("bare native world");
+        let bare_lease = bare.workers().lease().expect("bare caller cell");
+        let mut bare_held = bare.workers().hold(bare_lease.id()).expect("hold bare cell");
+        assert!(bare_held.worker().telemetry().is_none(), "bare native world has no telemetry cell");
+        drop((bare_held, bare_lease));
+
+        let with_tel = open_native_with_telemetry(
+            blaze_core::testing::os(),
+            ArgList::given(alloc::vec::Vec::new()),
+            Vars::given(alloc::vec::Vec::new()),
+            start_dir(),
+            0,
+            Some(TelemetryOpts {
+                level: crate::telemetry::Level::Spans,
+                alloc: blaze_own::testing::heap().shared(),
+            }),
+        )
+        .expect("telemetry native world");
+        let tel_lease = with_tel.workers().lease().expect("telemetry caller cell");
+        let mut tel_held = with_tel.workers().hold(tel_lease.id()).expect("hold telemetry cell");
+        assert!(tel_held.worker().telemetry().is_some(), "single-shot native world keeps telemetry cell");
+        drop((tel_held, tel_lease));
+    }
 }

@@ -1,0 +1,33 @@
+[package]
+name = "blaze-vt"
+description = "bstd::vt: a terminal emulator core as a sans-IO machine (docs/v2/plan/design/vt.md): bytes in; a screen, replies and effects out as data; key, mouse, focus and paste encoding out; everything ghostty's terminal core accepts (vt-inventory.md), `no_std`, every buffer in the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Vec, Box, String with the allocator named (rule 11).
+blaze-own.workspace = true
+# Display width and grapheme clusters of what is printed.
+blaze-unicode.workspace = true
+# Kitty graphics `o=z` payloads (zlib).
+blaze-deflate.workspace = true
+# The glyph protocol's strict base64 payload; kitty test payloads.
+blaze-base64.workspace = true
+
+[dev-dependencies]
+# Property tests against the reference model, and planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

@@ -18,24 +18,43 @@ impl Io {
     /// test (`bstd::testing::native`) make their world with.
     #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
     pub fn native_in(os: &blaze_core::Os, world: NativeWorld<'_>) -> Result<Io, OpenError> {
-        let refused = |why: String| OpenError {
+        open_native_in(os, world, None)
+    }
+
+    /// [`Io::native_in`] over pre-built `workers` (registered with telemetry or slots): constructs
+    /// the native world directly on `workers` without allocating a throwaway bare
+    /// [`Workers`](crate::workers::Workers) reservation first.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+    pub fn native_in_on(os: &blaze_core::Os, world: NativeWorld<'_>, workers: crate::workers::Workers) -> Result<Io, OpenError> {
+        open_native_in(os, world, Some(workers))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+fn open_native_in(os: &blaze_core::Os, world: NativeWorld<'_>, workers: Option<crate::workers::Workers>) -> Result<Io, OpenError> {
+    let refused = |why: String| OpenError {
+        // alloc: an error's message.
+        root: world.root.display().to_string(),
+        why,
+    };
+    // alloc: an error's message.
+    let driver = blaze_core::native_in(os, world.root, world.threads).map_err(|error| refused(error.to_string()))?;
+    // alloc: an error's message.
+    let host = crate::native::host_facts(world.host_name, driver.now()).map_err(|error| refused(error.to_string()))?;
+    let workers = match workers {
+        Some(workers) => workers,
+        None => {
+            // The world's workers (D171): bstd's own cells, no slots; a program that registers
+            // slots or telemetry hands its own `Workers` (`Io::native_in_on`, `rt::run_with_workers`,
+            // `rt::run_with_heap_at`). One sparse reservation, nothing backed until a task uses its
+            // cell; no seed, as the start draws no randomness.
+            let setup = crate::workers::WorkersSetup { limits: crate::workers::Limits::BARE, seed: world.seed, models: 0 };
             // alloc: an error's message.
-            root: world.root.display().to_string(),
-            why,
-        };
-        // alloc: an error's message.
-        let driver = blaze_core::native_in(os, world.root, world.threads).map_err(|error| refused(error.to_string()))?;
-        // alloc: an error's message.
-        let host = crate::native::host_facts(world.host_name, driver.now()).map_err(|error| refused(error.to_string()))?;
-        // The world's workers (D171): bstd's own cells, no slots; a program that registers
-        // slots hands its own `Workers` (`Io::on_workers`, `rt::run_with_workers`). One sparse
-        // reservation, nothing backed until a task uses its cell; no seed, as the start draws
-        // no randomness.
-        let setup = crate::workers::WorkersSetup { limits: crate::workers::Limits::BARE, seed: world.seed, models: 0 };
-        // alloc: an error's message.
-        let workers = crate::workers::Workers::bare(setup).map_err(|error| refused(error.to_string()))?;
-        Ok(Io::over(
-            Start {
+            crate::workers::Workers::bare(setup).map_err(|error| refused(error.to_string()))?
+        }
+    };
+    Ok(Io::over(
+        Start {
             // alloc: once per process, the driver.
             driver: Backend::Native(Box::new(driver)),
             seed: world.seed,
@@ -48,8 +67,7 @@ impl Io {
             hosted: None,
             disk: None,
             plant: Plant::None,
-            },
-            workers,
-        ))
-    }
+        },
+        workers,
+    ))
 }

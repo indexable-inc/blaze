@@ -635,3 +635,64 @@ fn a_batch_of_adjacent_payloads_is_few_ranges() {
         assert_eq!(reader.found(i), Some(truth[k].as_slice()));
     }
 }
+
+struct ParallelBatchOrigin<'o> {
+    inner: MapOrigin<'o>,
+    batch_calls: usize,
+    max_batch: usize,
+}
+
+impl super::Origin for ParallelBatchOrigin<'_> {
+    fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        self.inner.read(object, at, into, deadline_ns)
+    }
+
+    fn read_batch(
+        &mut self,
+        reads: &mut [super::BatchRead<'_>],
+        clock: &mut dyn FnMut() -> u64,
+        outcomes: &mut [super::BatchOutcome],
+    ) {
+        self.batch_calls += 1;
+        self.max_batch = self.max_batch.max(reads.len());
+        for (req, out) in reads.iter_mut().zip(outcomes.iter_mut()) {
+            let result = self.read(&req.object, req.at, req.into, req.deadline_ns);
+            *out = super::BatchOutcome { result, at_ns: clock() };
+        }
+    }
+}
+
+/// Multi-ask waves (index pages, payload ranges) are dispatched together via `Origin::read_batch`
+/// and produce byte-identical answers to serial `Origin::read`.
+#[test]
+fn fetch_dispatches_multi_ask_waves_through_read_batch() {
+    let (signer, objects, truth) = trusted_world(9, 200);
+    let alloc = blaze_own::testing::heap().alloc();
+    let keys = [signer.public()];
+    let check = Ed25519Keys { namespace: NS, keys: &keys };
+    let mut all = blaze_own::Vec::with_capacity_in(truth.len(), alloc);
+    for &k in truth.keys() {
+        all.push(k);
+    }
+
+    // Use tight gap/range limits so payload fetches split into multiple ranged asks in one wave.
+    let limits = Limits { gap_most: 0, range_most: 256, ..Limits::DEFAULT };
+
+    let mut serial_reader = Reader::new_in(NS, &check, limits, alloc);
+    let mut serial_origin = MapOrigin { objects: &objects };
+    let mut c1 = 0u64;
+    fetch(&mut serial_reader, &mut serial_origin, &mut || { c1 += 1; c1 }, &all, alloc).expect("serial fetch");
+
+    let mut par_reader = Reader::new_in(NS, &check, limits, alloc);
+    let mut par_origin = ParallelBatchOrigin { inner: MapOrigin { objects: &objects }, batch_calls: 0, max_batch: 0 };
+    let mut c2 = 0u64;
+    fetch(&mut par_reader, &mut par_origin, &mut || { c2 += 1; c2 }, &all, alloc).expect("parallel fetch");
+
+    assert!(par_origin.batch_calls >= 1, "expected multi-ask wave to dispatch through read_batch");
+    assert!(par_origin.max_batch >= 2, "expected batch size >= 2, got {}", par_origin.max_batch);
+    assert_eq!(par_reader.report().found, all.len() as u32);
+    for (i, k) in all.iter().enumerate() {
+        assert_eq!(par_reader.found(i), serial_reader.found(i), "key {i} differs between serial and batch");
+        assert_eq!(par_reader.found(i), Some(truth[k].as_slice()));
+    }
+}

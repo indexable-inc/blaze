@@ -59,11 +59,16 @@ impl Kind {
     }
 }
 
+/// Per-kind virtual-memory syscall counters, padded to 128 bytes (rule 86) so concurrent
+/// `mmap`/`mprotect`/`madvise` updates across distinct kinds never false-share a cache line.
+#[repr(align(128))]
 struct Counter {
     calls: AtomicU64,
     ns: AtomicU64,
     max_ns: AtomicU64,
 }
+
+const _: () = assert!(align_of::<Counter>() == 128);
 
 static COUNTERS: [Counter; KINDS.len()] = [const {
     Counter { calls: AtomicU64::new(0), ns: AtomicU64::new(0), max_ns: AtomicU64::new(0) }

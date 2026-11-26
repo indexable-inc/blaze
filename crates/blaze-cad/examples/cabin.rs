@@ -21,6 +21,7 @@ const WOOD_WALL: Material<'static> = Material {
     emissive_strength: None,
     clearcoat: None,
     double_sided: false,
+    ..
 };
 
 const SLATE_ROOF: Material<'static> = Material {
@@ -32,6 +33,7 @@ const SLATE_ROOF: Material<'static> = Material {
     emissive_strength: None,
     clearcoat: None,
     double_sided: false,
+    ..
 };
 
 const STONE: Material<'static> = Material {
@@ -43,6 +45,7 @@ const STONE: Material<'static> = Material {
     emissive_strength: None,
     clearcoat: None,
     double_sided: false,
+    ..
 };
 
 const TRIM: Material<'static> = Material {
@@ -54,6 +57,7 @@ const TRIM: Material<'static> = Material {
     emissive_strength: None,
     clearcoat: None,
     double_sided: false,
+    ..
 };
 
 const DOOR_WOOD: Material<'static> = Material {
@@ -65,6 +69,7 @@ const DOOR_WOOD: Material<'static> = Material {
     emissive_strength: None,
     clearcoat: None,
     double_sided: false,
+    ..
 };
 
 const MATERIALS: [Material<'static>; 5] = [WOOD_WALL, SLATE_ROOF, STONE, TRIM, DOOR_WOOD];

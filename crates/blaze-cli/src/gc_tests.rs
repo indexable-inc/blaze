@@ -12,10 +12,10 @@ use bstd::path::Path;
 use bstd::test::BUDGET;
 
 use super::{
-    AUX_EXPIRY_NS, AuxSweepPlant, CACHE_EXPIRY_NS, DEFAULT_BUDGET, GcError, GcOpts, ORPHAN_GRACE_NS,
-    PidProbe, PidState, VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values, parse_hex_32,
-    parse_meta_pid, parse_pid_prefix, run_with, should_sweep_run, sweep_aux_with,
-    sweep_toolchain_packs, try_acquire_gc_lock,
+    AUX_EXPIRY_NS, AuxCaps, AuxLimits, AuxSweepPlant, CACHE_EXPIRY_NS, DEFAULT_BUDGET, GcError, GcOpts,
+    ORPHAN_GRACE_NS, PidProbe, PidState, VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values,
+    parse_hex_32, parse_meta_pid, parse_native_work_pid, parse_pid_prefix, run_with, should_sweep_run,
+    sweep_aux_with, sweep_aux_with_caps, sweep_aux_with_limits, sweep_toolchain_packs, try_acquire_gc_lock,
 };
 use crate::CliError;
 use crate::store::plain_place::{Facts, STORE_DIR, STORE_ROOT};
@@ -445,4 +445,231 @@ fn gc_sweeps_native_work_caches_and_superseded_toolchain_packs_preserving_active
     // 4. Planted bug control (rule 43): ignoring active toolchain pack set deletes active pack + manifest.
     let planted = sweep_toolchain_packs(&cx, home.dir(), pinned, after_30d, false, AuxSweepPlant::IgnoreActiveToolchain);
     assert_eq!(planted.files, 2, "planted bug must delete pinned manifest + active pack to prove oracle");
+}
+
+#[test]
+fn gc_aux_size_budget_lru_evicts_oldest_and_preserves_newest_and_live_jobs() {
+    use core::time::Duration;
+    use bstd::fs::{Content, Durable};
+
+    let io = Io::simulated(SimWorld::new(76, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let clock = io.need_clock().expect("clock");
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+    let put = |rel: &str, bytes: &[u8]| {
+        home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+    };
+
+    // Seed 3 age-ordered entries (100 bytes each = 300 bytes total) in each of the 3 capped aux
+    // directories, all fresh (< 7 days old), plus a live jobserver FIFO under `native-work/.../jobs`.
+    put("v2/build-script/files/dir-old/a.bin", &[1u8; 100]);
+    put("v2/native-work/build-script/out/oldkey/a.o", &[2u8; 100]);
+    put("v2/run/records/rec-old", &[3u8; 100]);
+    clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 1");
+
+    put("v2/build-script/files/dir-mid/b.bin", &[4u8; 100]);
+    put("v2/native-work/build-script/out/midkey/b.o", &[5u8; 100]);
+    put("v2/run/records/rec-mid", &[6u8; 100]);
+    clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 2");
+
+    put("v2/build-script/files/dir-new/c.bin", &[7u8; 100]);
+    put("v2/native-work/build-script/out/newkey/c.o", &[8u8; 100]);
+    put("v2/run/records/rec-new", &[9u8; 100]);
+    put("v2/native-work/build-script/jobs/1001", b"");
+
+    let now_ns = clock.wall().as_ns();
+    let probe = FixedPids(&[1001]);
+    // Cap = 200 bytes -> 75% low watermark = 150 bytes; 300 bytes > 200 evicts oldest 2 entries
+    // (200 bytes) per directory, leaving the newest 100-byte entry (<= 150) and live FIFO intact.
+    let caps = AuxCaps { build_script_files: 200, native_work: 200, run_records: 200 };
+
+    // Dry-run plans all 6 evictions without deleting anything.
+    let dry = sweep_aux_with_caps(&cx, home.dir(), now_ns, caps, &probe, true, AuxSweepPlant::None);
+    assert_eq!(dry.files, 6, "dry-run must plan 2 oldest entries from each of the 3 capped dirs");
+    assert_eq!(dry.bytes, 600);
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-old").expect("p")).expect("s").is_some());
+
+    // Live sweep evicts oldest + mid in all 3 directories and keeps newest + live jobserver FIFO.
+    let swept = sweep_aux_with_caps(&cx, home.dir(), now_ns, caps, &probe, false, AuxSweepPlant::None);
+    assert_eq!(swept.files, 6);
+    assert_eq!(swept.bytes, 600);
+    assert!(home.dir().stat(&cx, &Path::new("v2/build-script/files/dir-old").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/build-script/files/dir-mid").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/build-script/files/dir-new/c.bin").expect("p")).expect("s").is_some());
+
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/oldkey").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/midkey").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/newkey/c.o").expect("p")).expect("s").is_some());
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/jobs/1001").expect("p")).expect("s").is_some(), "live jobserver FIFO must never be LRU-evicted");
+
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-old").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-mid").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-new").expect("p")).expect("s").is_some());
+}
+
+#[test]
+fn gc_native_work_pid_awareness_sweeps_dead_protects_live_and_fact_shim_with_planted_control() {
+    use bstd::fs::{Content, Durable};
+
+    let hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(parse_native_work_pid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-1001-7"), Some(1001));
+    assert_eq!(parse_native_work_pid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-2002-0.lock"), Some(2002));
+    assert_eq!(parse_native_work_pid("1001-active"), Some(1001));
+    assert_eq!(parse_native_work_pid("oldkey"), None);
+    assert_eq!(parse_native_work_pid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-0-1"), None);
+
+    let io = Io::simulated(SimWorld::new(78, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let clock = io.need_clock().expect("clock");
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+    let put = |rel: &str, bytes: &[u8]| {
+        home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+    };
+
+    // Live PID (1001) native-work run folders/locks + shared fact-shim binary.
+    let live_paths = [
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/out/{hex64}-1001-1/liba.a"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/pkg/{hex64}-1001-1/build.rs"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/deps/{hex64}-1001-1/dep.h"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/facts/{hex64}-1001-1/pins"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/facts/{hex64}-1001-1.lock"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/1001-active/tmp.o"),
+    ];
+    for p in &live_paths {
+        put(p.as_str(), &[1u8; 200]);
+    }
+    let shim_path = bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/fact-shim/{hex64}/blaze-fact-shim");
+    put(shim_path.as_str(), &[3u8; 200]);
+
+    // Dead PID (2002) crash debris across all buckets + top-level PID dir.
+    let dead_paths = [
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/out/{hex64}-2002-1/libdead.a"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/pkg/{hex64}-2002-1/build.rs"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/deps/{hex64}-2002-1/dep.h"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/facts/{hex64}-2002-1/pins"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/facts/{hex64}-2002-1.lock"),
+        bstd::mem::format_in!(cx.frame(), "v2/native-work/2002-orphan/tmp.o"),
+    ];
+    for p in &dead_paths {
+        put(p.as_str(), &[2u8; 200]);
+    }
+
+    let now_ns = clock.wall().as_ns();
+    let probe = FixedPids(&[1001]);
+    // Tight 50-byte cap (smaller than every single live entry & fact-shim!) verifies live PIDs
+    // and fact-shim are NEVER LRU-evicted, while dead-PID entries are pruned immediately.
+    let tight = AuxCaps { build_script_files: 0, native_work: 50, run_records: 0 };
+
+    let immediate = sweep_aux_with_caps(&cx, home.dir(), now_ns, tight, &probe, false, AuxSweepPlant::None);
+    assert_eq!(immediate.files, 6, "all 6 dead-PID native-work entries must be swept immediately");
+    for p in &dead_paths {
+        assert!(home.dir().stat(&cx, &Path::new(p.as_str()).expect("p")).expect("s").is_none(), "dead entry must be gone: {}", p.as_str());
+    }
+    for p in &live_paths {
+        assert!(home.dir().stat(&cx, &Path::new(p.as_str()).expect("p")).expect("s").is_some(), "live PID entry must survive tight cap: {}", p.as_str());
+    }
+    assert!(home.dir().stat(&cx, &Path::new(shim_path.as_str()).expect("p")).expect("s").is_some(), "fact-shim must never be LRU-evicted");
+
+    // Past 7-day AUX_EXPIRY_NS: live PID entries and fact-shim (< CACHE_EXPIRY_NS) STILL survive.
+    let after_7d = now_ns.saturating_add(AUX_EXPIRY_NS).saturating_add(1_000_000_000);
+    let week = sweep_aux_with_caps(&cx, home.dir(), after_7d, tight, &probe, false, AuxSweepPlant::None);
+    assert_eq!(week.files, 0, "live PID work dirs and fresh fact-shim must survive past 7d");
+    for p in &live_paths {
+        assert!(home.dir().stat(&cx, &Path::new(p.as_str()).expect("p")).expect("s").is_some(), "live PID entry must survive past 7d: {}", p.as_str());
+    }
+
+    // Planted-bug control (rule 43): ignoring PidState::Alive deletes all 6 live-PID entries.
+    let planted = sweep_aux_with_caps(&cx, home.dir(), after_7d, tight, &probe, false, AuxSweepPlant::IgnorePidAlive);
+    assert_eq!(planted.files, 6, "planted bug control must delete all 6 live-PID entries to prove oracle");
+    assert!(home.dir().stat(&cx, &Path::new(shim_path.as_str()).expect("p")).expect("s").is_some(), "fact-shim remains immune to IgnorePidAlive");
+}
+
+#[test]
+fn gc_aux_bounded_work_cap_limits_removals_and_converges_cleanly() {
+    use core::time::Duration;
+    use bstd::fs::{Content, Durable};
+
+    let io = Io::simulated(SimWorld::new(79, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let clock = io.need_clock().expect("clock");
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+    let put = |rel: &str, bytes: &[u8]| {
+        home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+    };
+
+    let hex64 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    // Seed 30 stale files across build-script/files (12), native-work dead PIDs (8), run/records (10).
+    for i in 0..12u32 {
+        let rel = bstd::mem::format_in!(cx.frame(), "v2/build-script/files/stale-{i:02}.bin");
+        put(rel.as_str(), &[1u8; 64]);
+    }
+    for i in 0..8u32 {
+        let rel = bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/out/{hex64}-2002-{i}/obj.o");
+        put(rel.as_str(), &[2u8; 64]);
+    }
+    for i in 0..10u32 {
+        let rel = bstd::mem::format_in!(cx.frame(), "v2/run/records/stale-{i:02}");
+        put(rel.as_str(), &[3u8; 64]);
+    }
+
+    // Advance virtual clock so fresh/live files have strictly newer mtime than stale ones.
+    clock.sleep(&cx, Duration::from_millis(50)).expect("sleep");
+    put("v2/build-script/files/fresh-0.bin", &[9u8; 64]);
+    put("v2/build-script/files/fresh-1.bin", &[9u8; 64]);
+    let live_work = bstd::mem::format_in!(cx.frame(), "v2/native-work/blaze/out/{hex64}-1001-0/live.o");
+    put(live_work.as_str(), &[9u8; 64]);
+    put("v2/run/records/fresh-0", &[9u8; 64]);
+    put("v2/run/records/fresh-1", &[9u8; 64]);
+
+    let now_ns = clock.wall().as_ns();
+    let probe = FixedPids(&[1001]);
+    // Cap = 200 bytes (75% low watermark = 150 bytes): evicts all 12 old build-script/files and
+    // all 10 old run/records while keeping the 2 fresh files (128 bytes <= 150) in each, plus
+    // sweeps all 8 dead-PID native-work dirs while keeping the live PID dir intact.
+    let limits = AuxLimits {
+        caps: AuxCaps { build_script_files: 200, native_work: 200, run_records: 200 },
+        max_ops: 8,
+        max_visits: 1024,
+    };
+
+    // Each bounded sweep must remove at most `max_ops` files and never error, converging cleanly
+    // across passes until all 30 stale files are gone.
+    let mut total_removed = 0u32;
+    let mut passes = 0u32;
+    for _ in 0..32u32 {
+        let step = sweep_aux_with_limits(&cx, home.dir(), now_ns, limits, &probe, false, AuxSweepPlant::None);
+        assert!(usize::try_from(step.files).unwrap_or(usize::MAX) <= limits.max_ops, "sweep exceeded max_ops cap: {step:?}");
+        if step.files == 0 {
+            break;
+        }
+        total_removed = total_removed.saturating_add(step.files);
+        passes += 1;
+    }
+    assert!(passes >= 4, "max_ops=8 must split 30 stale files across multiple bounded passes (passes={passes})");
+    assert_eq!(total_removed, 30, "bounded sweeps must converge to remove all 30 stale files");
+
+    // All 5 fresh/live files must remain completely intact.
+    for kept in [
+        "v2/build-script/files/fresh-0.bin",
+        "v2/build-script/files/fresh-1.bin",
+        live_work.as_str(),
+        "v2/run/records/fresh-0",
+        "v2/run/records/fresh-1",
+    ] {
+        assert!(home.dir().stat(&cx, &Path::new(kept).expect("p")).expect("s").is_some(), "fresh/live entry must be preserved: {kept}");
+    }
+
+    // Tight `max_visits` budget during tree measurement must terminate cleanly without errors.
+    let tiny_visit = AuxLimits {
+        caps: AuxCaps { build_script_files: 10, native_work: 10, run_records: 10 },
+        max_ops: 4,
+        max_visits: 1,
+    };
+    let bounded = sweep_aux_with_limits(&cx, home.dir(), now_ns, tiny_visit, &probe, false, AuxSweepPlant::None);
+    assert!(usize::try_from(bounded.files).unwrap_or(usize::MAX) <= tiny_visit.max_ops);
+    assert!(home.dir().stat(&cx, &Path::new(live_work.as_str()).expect("p")).expect("s").is_some(), "live PID entry preserved under tiny caps/visits");
 }

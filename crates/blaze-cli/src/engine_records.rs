@@ -93,6 +93,12 @@ pub(crate) trait Route {
     /// read it before, copied twice (the record out of the store into the wave's frame, then the
     /// section 16-aligned again), each copy counted.
     fn exports<'r>(name: Name, bytes: &'r [u8], counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<&'r [u8], ReadError>;
+
+    /// Whether records opened on this route use O(1) lazy header validation (verifying accessed
+    /// module scopes, enum variants, and strings on demand) instead of eager full-section scans.
+    fn check_lazy() -> bool {
+        false
+    }
 }
 
 /// The section borrowed where it lies in the mapping, refused when it is not aligned.
@@ -105,6 +111,10 @@ impl Route for InPlace {
 
     fn exports<'r>(name: Name, bytes: &'r [u8], _counts: &mut ReadCounts, _alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
         Aligned16::new(bytes).map(Aligned16::bytes).map_err(|why| ReadError::Misaligned { name, which: "exports section", why })
+    }
+
+    fn check_lazy() -> bool {
+        true
     }
 }
 
@@ -170,7 +180,11 @@ pub(crate) fn open_record<'r, R: Route>(
     let names = R::section(name, "names section", parts.names, counts, alloc)?;
     let items = R::section(name, "items section", parts.items, counts, alloc)?;
     let expansions = R::section(name, "expansions directory", parts.expansions, counts, alloc)?;
-    Ok(crate::front_load::checked_records(name, key, names, items, expansions, alloc)?)
+    if R::check_lazy() {
+        Ok(crate::front_load::checked_records_lazy(name, key, names, items, expansions)?)
+    } else {
+        Ok(crate::front_load::checked_records(name, key, names, items, expansions, alloc)?)
+    }
 }
 
 /// A dependency's exports section as a names task is handed it ([`EngineRecords::exports`]),

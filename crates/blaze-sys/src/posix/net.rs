@@ -1239,14 +1239,11 @@ pub fn connect(socket: Fd, at: &sockaddr_storage, len: socklen_t) -> Result<(), 
     }
 }
 
-/// Opens an `AF_UNIX` `SOCK_STREAM` socket with `FD_CLOEXEC` and connects it to `path`.
-///
-/// Refuses empty paths, NUL bytes inside `path`, or paths that do not fit `sockaddr_un::sun_path`
-/// with [`Errno::Inval`] / [`Errno::NameTooLong`] before any syscall. The returned [`super::io::OwnedFd`]
-/// closes automatically on drop.
+/// Encodes `path` into a `sockaddr_un` stored in `sockaddr_storage`. Refuses empty paths, NUL
+/// bytes inside `path`, or paths that do not fit `sockaddr_un::sun_path`.
 #[blaze::noalloc]
 #[blaze::nopanic]
-pub fn connect_unix(path: &[u8]) -> Result<super::io::OwnedFd, Errno> {
+fn unix_sockaddr(path: &[u8]) -> Result<(sockaddr_storage, socklen_t), Errno> {
     if path.is_empty() {
         return Err(Errno::Inval);
     }
@@ -1279,6 +1276,22 @@ pub fn connect_unix(path: &[u8]) -> Result<super::io::OwnedFd, Errno> {
     unsafe {
         ptr::copy_nonoverlapping(ptr::from_ref(&un).cast::<u8>(), ptr::from_mut(&mut storage).cast::<u8>(), size_of::<sockaddr_un>());
     }
+    let socklen = match socklen_t::try_from(addr_len) {
+        Ok(len) => len,
+        Err(_) => return Err(Errno::NameTooLong),
+    };
+    Ok((storage, socklen))
+}
+
+/// Opens an `AF_UNIX` `SOCK_STREAM` socket with `FD_CLOEXEC` and connects it to `path`.
+///
+/// Refuses empty paths, NUL bytes inside `path`, or paths that do not fit `sockaddr_un::sun_path`
+/// with [`Errno::Inval`] / [`Errno::NameTooLong`] before any syscall. The returned [`super::io::OwnedFd`]
+/// closes automatically on drop.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn connect_unix(path: &[u8]) -> Result<super::io::OwnedFd, Errno> {
+    let (storage, socklen) = unix_sockaddr(path)?;
     #[cfg(target_os = "linux")]
     let raw = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)?;
     #[cfg(target_os = "macos")]
@@ -1287,12 +1300,53 @@ pub fn connect_unix(path: &[u8]) -> Result<super::io::OwnedFd, Errno> {
     let owned = unsafe { super::io::OwnedFd::from_raw(raw.raw()) };
     #[cfg(target_os = "macos")]
     super::io::set_close_on_exec(owned.fd(), true)?;
-    let socklen = match socklen_t::try_from(addr_len) {
-        Ok(len) => len,
-        Err(_) => return Err(Errno::NameTooLong),
-    };
     connect(owned.fd(), &storage, socklen)?;
     Ok(owned)
+}
+
+/// Opens a non-blocking, close-on-exec `AF_UNIX` `SOCK_STREAM` listener bound to `path`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn listen_unix(path: &[u8], backlog: c_int) -> Result<super::io::OwnedFd, Errno> {
+    let (storage, socklen) = unix_sockaddr(path)?;
+    #[cfg(target_os = "linux")]
+    let raw = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)?;
+    #[cfg(target_os = "macos")]
+    let raw = socket(AF_UNIX, SOCK_STREAM, 0)?;
+    // SAFETY: `socket` just returned a newly owned open file descriptor.
+    let owned = unsafe { super::io::OwnedFd::from_raw(raw.raw()) };
+    #[cfg(target_os = "macos")]
+    {
+        super::io::set_close_on_exec(owned.fd(), true)?;
+        super::io::set_nonblocking(owned.fd(), true)?;
+    }
+    bind(owned.fd(), &storage, socklen)?;
+    listen(owned.fd(), backlog)?;
+    Ok(owned)
+}
+
+/// Accepts one connection from a non-blocking `AF_UNIX` listener, returning a non-blocking,
+/// close-on-exec [`super::io::OwnedFd`]. Returns [`Errno::Again`] when no connection is queued.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn accept_unix(listener: Fd) -> Result<super::io::OwnedFd, Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::linux::SockFlags;
+        let owned = crate::linux::accept4(listener, SockFlags::NONBLOCK.with(SockFlags::CLOSE_ON_EXEC))?;
+        // SAFETY: `owned` is a freshly accepted open file descriptor.
+        Ok(unsafe { super::io::OwnedFd::from_raw(owned.into_raw()) })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: passing null peer-address pointers tells `accept` not to fill a peer sockaddr.
+        let fd = said(unsafe { c::accept(listener.raw(), ptr::null_mut(), ptr::null_mut()) })?;
+        // SAFETY: `accept` just returned a newly owned open file descriptor.
+        let owned = unsafe { super::io::OwnedFd::from_raw(fd) };
+        super::io::set_close_on_exec(owned.fd(), true)?;
+        super::io::set_nonblocking(owned.fd(), true)?;
+        Ok(owned)
+    }
 }
 
 /// `listen`: the socket takes connections, up to `backlog` waiting ([`SOMAXCONN`] at most).
@@ -1574,6 +1628,18 @@ pub fn peer_ids(socket: Fd) -> Result<(super::types::uid_t, super::types::gid_t)
     // SAFETY: `uid` and `gid` are live and writable for the call, which keeps nothing.
     said(unsafe { c::getpeereid(socket.raw(), &raw mut uid, &raw mut gid) })?;
     Ok((uid, gid))
+}
+
+/// Returns `Ok(true)` if the connected Unix domain socket's peer has the same effective UID as
+/// this process (`SO_PEERCRED` on Linux, `getpeereid` on macOS).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn peer_is_self_uid(socket: Fd) -> Result<bool, Errno> {
+    let me = super::thread::geteuid();
+    #[cfg(target_os = "linux")]
+    return peer_cred(socket).map(|cred| cred.uid == me);
+    #[cfg(target_os = "macos")]
+    return peer_ids(socket).map(|(uid, _)| uid == me);
 }
 
 /// `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` (macOS): a connected Unix socket's peer's audit

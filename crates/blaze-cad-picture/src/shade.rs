@@ -38,6 +38,18 @@ pub(crate) struct ShadeContext {
 
 impl ShadeContext {
     pub(crate) fn new(cam: &Camera, bounds: Aabb3, o: &PictureOpts<'_, '_>) -> ShadeContext {
+        let linear_blend = matches!((o.mode, o.shading), (RenderMode::Shaded, Shading::Studio(s)) if s.srgb)
+            || matches!((o.mode, o.shading), (RenderMode::Shaded, Shading::Pbr(_)));
+        ShadeContext::from_colors(cam, bounds, o.colour, o.background, linear_blend)
+    }
+
+    pub(crate) fn from_colors(
+        cam: &Camera,
+        bounds: Aabb3,
+        colour: [u8; 3],
+        background: [u8; 4],
+        linear_blend: bool,
+    ) -> ShadeContext {
         let classic_light = (cam.up * 0.7 - cam.right * 0.4 - cam.forward * 0.6).normalized().unwrap_or(cam.up);
         let key_dir = (cam.up * 0.72 - cam.right * 0.45 - cam.forward * 0.52).normalized().unwrap_or(cam.up);
         let fill_dir = (cam.up * 0.20 + cam.right * 0.85 - cam.forward * 0.48).normalized().unwrap_or(cam.right);
@@ -67,28 +79,27 @@ impl ShadeContext {
         };
 
         let base_norm = [
-            f64::from(o.colour[0]) / 255.0,
-            f64::from(o.colour[1]) / 255.0,
-            f64::from(o.colour[2]) / 255.0,
+            f64::from(colour[0]) / 255.0,
+            f64::from(colour[1]) / 255.0,
+            f64::from(colour[2]) / 255.0,
         ];
         let base_linear = [
-            srgb_to_linear(o.colour[0]),
-            srgb_to_linear(o.colour[1]),
-            srgb_to_linear(o.colour[2]),
+            srgb_to_linear(colour[0]),
+            srgb_to_linear(colour[1]),
+            srgb_to_linear(colour[2]),
         ];
         let bg_norm = [
-            f64::from(o.background[0]) / 255.0,
-            f64::from(o.background[1]) / 255.0,
-            f64::from(o.background[2]) / 255.0,
-            f64::from(o.background[3]) / 255.0,
+            f64::from(background[0]) / 255.0,
+            f64::from(background[1]) / 255.0,
+            f64::from(background[2]) / 255.0,
+            f64::from(background[3]) / 255.0,
         ];
         let bg_linear = [
-            srgb_to_linear(o.background[0]),
-            srgb_to_linear(o.background[1]),
-            srgb_to_linear(o.background[2]),
+            srgb_to_linear(background[0]),
+            srgb_to_linear(background[1]),
+            srgb_to_linear(background[2]),
             bg_norm[3],
         ];
-        let linear_blend = matches!((o.mode, o.shading), (RenderMode::Shaded, Shading::Studio(s)) if s.srgb);
 
         ShadeContext {
             classic_light,
@@ -301,6 +312,7 @@ pub(crate) fn shade_hit_sample(
                 ]
             }
             Shading::Studio(studio) => shade_studio(full_tape, cam, ctx, &studio, p, dir, n, eps, sc, stats),
+            Shading::Pbr(_) => shade_studio(full_tape, cam, ctx, &StudioOpts::DEFAULT, p, dir, n, eps, sc, stats),
         },
     }
 }

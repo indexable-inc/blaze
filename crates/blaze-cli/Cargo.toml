@@ -38,11 +38,9 @@ blaze-answer.workspace = true
 blaze-cas.workspace = true
 blaze-keyed.workspace = true
 blaze-hash.workspace = true
-# The checkout's journal helper (journal_ask.rs, journal_helper.rs) and resident daemon
-# (daemon_client.rs, daemon_server.rs): wire, lifecycle core, and places.
+# The checkout's journal helper (journal_ask.rs, journal_helper.rs): wire, lifecycle core, and places.
 blaze-watch.workspace = true
-# Safe POSIX syscalls for the resident daemon's pre-runtime Unix socket client (daemon_client.rs)
-# and macOS kqueue vnode watcher (daemon_watch.rs).
+# Safe POSIX syscalls (`openat`, `fchmod`, `stat_at`, `kill`).
 blaze-sys.workspace = true
 # The system, reached only through bstd: the files, the output, the host's core count, frames.
 # `requests`: bstd's `Http` alone (blaze-h1 over `Net`), for the shared cache's http origin.
@@ -78,9 +76,11 @@ blaze-meter.workspace = true
 # `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
 # (tests/ladder/README.md).
 blaze-ladder.workspace = true
-# `blaze export` (engine_export.rs): standalone native AArch64 executable writer (Mach-O on macOS,
+# `blaze build` (engine_export.rs): standalone native AArch64 executable writer (Mach-O on macOS,
 # ELF PIE on Linux), pure `#![no_std]` with zero third-party deps.
 blaze-export.workspace = true
+# Declarative CLI schema, argv parser, and help/usage renderer (single source of truth, rule 30).
+blaze-cli-spec = { path = "../blaze-cli-spec" }
 # The run parent (run_parent.rs): the run wire to the launcher's run mode, the records' ISA, and
 # the BLAKE3 a record's file is named by (blaze-launch-rt `run_mode::Folder`).
 blaze-launch.workspace = true
@@ -168,10 +168,12 @@ blaze-sim.workspace = true
 blaze-wasi.workspace = true
 # `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
 blaze-own = { workspace = true, features = ["std", "testing"] }
-# fetch_tests.rs: a `.crate` made in the test (a gzip of a tar) and its SHA-256, the lock's pin.
+# fetch_tests.rs: a `.crate` made in the test (a gzip of a tar) and its SHA-256, the lock's pin,
+# and a bare git packfile for cargo's `git/db` adoption (fetch.md piece 14).
 blaze-tar.workspace = true
 blaze-deflate.workspace = true
 blaze-sha256.workspace = true
+blaze-git-fetch.workspace = true
 # The HTTP origin's test publishes a signed origin (`read::publish`, behind `sign`) of segments
 # sealed by blaze-cas.
 blaze-remote = { workspace = true, default-features = false, features = ["sign"] }

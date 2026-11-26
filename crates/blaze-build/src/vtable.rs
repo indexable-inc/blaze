@@ -179,6 +179,12 @@ impl<'a> Shape<'a> {
         let mut words = blaze_own::Vec::new_in(alloc);
         let mut prefix = blaze_own::Vec::new_in(alloc);
         let mut tys = PortableTys::new_in(alloc);
+        // A trait object of auto traits alone (`dyn Send + Sync`, no principal trait) has no
+        // methods and no supertrait pointers: its vtable is only the 3-word `[drop, size, align]`
+        // header (the Reference, "Auto traits").
+        if principal == AUTO_ONLY_PRINCIPAL {
+            return Ok(Shape { principal, words, prefix, tys });
+        }
         let mut seen: blaze_own::Vec<(ItemKey, TraitArgs), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
         let mut stack: blaze_own::Vec<(ItemKey, usize, bool, TraitArgs), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
         let mut copied: blaze_own::Vec<PTy, Alloc<'a>> = blaze_own::Vec::new_in(alloc);
@@ -278,6 +284,10 @@ impl<'a> Shape<'a> {
             .map(Upcast::Load)
     }
 }
+
+/// Sentinel principal for a trait object of auto traits alone (e.g. `dyn Send + Sync`), whose
+/// vtable contains only the 3-word `[drop_in_place, size, align]` header.
+pub const AUTO_ONLY_PRINCIPAL: ItemKey = ItemKey(0);
 
 /// A table a built function takes the address of (`RefKind::Vtable`, by place in
 /// `Built::vtables`): the concrete type and the principal trait with its arguments after `Self`,

@@ -178,7 +178,17 @@ const UNSIGNED_SHORT: u64 = 5123;
 const UNSIGNED_INT: u64 = 5125;
 const ARRAY_BUFFER: u64 = 34962;
 const ELEMENT_ARRAY_BUFFER: u64 = 34963;
-const KNOWN_EXTENSIONS: [&str; 3] = ["KHR_materials_clearcoat", "KHR_materials_emissive_strength", "KHR_mesh_quantization"];
+const KNOWN_EXTENSIONS: [&str; 9] = [
+    "KHR_materials_clearcoat",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_anisotropy",
+    "KHR_materials_sheen",
+    "KHR_materials_transmission",
+    "KHR_materials_ior",
+    "KHR_materials_volume",
+    "KHR_texture_transform",
+    "KHR_mesh_quantization",
+];
 
 struct View {
     offset: u64,
@@ -505,7 +515,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
                 if g.views[acc.view].target.is_some_and(|t| t != ARRAY_BUFFER) {
                     return Err(Invalid::Field { at: format!("{here}.{name}"), why: "a vertex view not ARRAY_BUFFER" });
                 }
-                if acc.component != FLOAT {
+                if (name == "POSITION" || name == "NORMAL") && acc.component != FLOAT {
                     quantized = true;
                 }
                 match name {
@@ -549,6 +559,11 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
                             if t[3] != 1.0 && t[3] != -1.0 {
                                 return Err(Invalid::Field { at: format!("{here}.TANGENT"), why: "handedness w not +-1" });
                             }
+                        }
+                    }
+                    "COLOR_0" => {
+                        if acc.comps != 4 || acc.component != 5121 || !acc.normalized {
+                            return Err(Invalid::Field { at: format!("{here}.COLOR_0"), why: "not normalized RGBA8 VEC4" });
                         }
                     }
                     _ => return Err(Invalid::Field { at: format!("{here}.{name}"), why: "an attribute this writer never writes" }),
@@ -820,6 +835,7 @@ fn materials() -> [Material<'static>; 3] {
             emissive_strength: None,
             clearcoat: Some(Clearcoat { factor: 1.0, roughness: 0.125 }),
             double_sided: false,
+            ..
         },
         Material {
             name: "glass.canopy",
@@ -830,6 +846,7 @@ fn materials() -> [Material<'static>; 3] {
             emissive_strength: None,
             clearcoat: None,
             double_sided: true,
+            ..
         },
         Material {
             name: "light.nav",
@@ -840,6 +857,7 @@ fn materials() -> [Material<'static>; 3] {
             emissive_strength: Some(4.0),
             clearcoat: None,
             double_sided: false,
+            ..
         },
     ]
 }
@@ -937,10 +955,11 @@ impl Drawn {
                     ColliderPick::OwnMesh => Collider::Mesh,
                     ColliderPick::Hulls(_) => Collider::Hulls(&hulls[i]),
                 }),
+                ..
             })
             .collect();
         let materials = materials();
-        body(&Scene { parts: &parts, materials: &materials })
+        body(&Scene { parts: &parts, materials: &materials, .. })
     }
 }
 
@@ -1263,6 +1282,7 @@ fn golden_case(plant: GlbPlant) -> Result<(), Broken<OutBroken>> {
         mass: None,
         joint: None,
         collider: None,
+        ..
     }];
     let materials = [Material {
         name: "paint.hull",
@@ -1273,8 +1293,9 @@ fn golden_case(plant: GlbPlant) -> Result<(), Broken<OutBroken>> {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
-    let scene = Scene { parts: &parts, materials: &materials };
+    let scene = Scene { parts: &parts, materials: &materials, .. };
     let opts = GlbOpts { encoding: Encoding::Float, up: Up::Y, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() };
     let got = glb_planted(&scene, opts, plant).map_err(harness)?;
     parse(&got).map_err(|why| Broken::Oracle(OutBroken::Invalid { why }))?;
@@ -2632,6 +2653,7 @@ fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_g
             mass: Some(root_mass),
             joint: None,
             collider: None,
+            ..
         },
         Part {
             name: "mount",
@@ -2642,6 +2664,7 @@ fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_g
             mass: None,
             joint: None,
             collider: None,
+            ..
         },
         Part {
             name: "sensor_group",
@@ -2652,6 +2675,7 @@ fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_g
             mass: None,
             joint: None,
             collider: None,
+            ..
         },
     ];
     let mats = [
@@ -2664,6 +2688,7 @@ fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_g
             emissive_strength: None,
             clearcoat: Some(Clearcoat { factor: 0.5, roughness: 0.125 }),
             double_sided: false,
+            ..
         },
         Material {
             name: "beacon_glass",
@@ -2674,6 +2699,7 @@ fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_g
             emissive_strength: Some(3.0),
             clearcoat: None,
             double_sided: true,
+            ..
         },
     ];
     let mat_textures = [
@@ -2691,7 +2717,7 @@ fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_g
         },
     ];
     let png_slices: [&[u8]; 3] = [&base_png[..], &mr_png[..], &norm_png[..]];
-    let scene = Scene { parts: &parts, materials: &mats };
+    let scene = Scene { parts: &parts, materials: &mats, .. };
     let tex_pack = TexturePack { png_images: &png_slices, material_textures: &mat_textures };
 
     for encoding in [
@@ -2853,4 +2879,168 @@ fn glb_textured_writes_uvs_tangents_embedded_pngs_and_round_trips_through_read_g
         .unwrap_err(),
         GlbReadError::BadMagic,
     );
+}
+
+#[test]
+fn glb_emits_uvs_tangents_colors_textures_pbr_extensions_and_sockets() {
+    let view = MeshView::new(Columns {
+        positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        normals: &[[0.0, 0.0, 1.0]; 3],
+        tangents: &[[1.0, 0.0, 0.0, 1.0]; 3],
+        uvs: &[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        colours: &[[240, 180, 220, 128]; 3],
+        triangles: &[[0, 1, 2]],
+        parts: &[PartId(0)],
+        roles: &[MaterialRole(0)],
+        creases: &[],
+    })
+    .unwrap();
+
+    let albedo_px = [180u8, 120, 80, 255, 190, 130, 90, 255, 170, 110, 70, 255, 185, 125, 85, 255];
+    let normal_px = [128u8, 128, 255, 255, 132, 126, 255, 255, 124, 130, 255, 255, 128, 128, 255, 255];
+    let images = [
+        TextureImage { name: "wood_albedo", data: ImageData::Rgba8 { width: 2, height: 2, pixels: &albedo_px } },
+        TextureImage { name: "wood_normal", data: ImageData::Rgba8 { width: 2, height: 2, pixels: &normal_px } },
+    ];
+    let sockets = [Socket { name: "light.port", transform: Transform::Trs(Trs { translation: [0.5, 0.2, 0.1], ..Trs::IDENTITY }) }];
+    let parts = [Part {
+        name: "hull.plate",
+        parent: None,
+        transform: Transform::IDENTITY,
+        mesh: Some(view),
+        lods: &[],
+        mass: None,
+        joint: None,
+        collider: None,
+        sockets: &sockets,
+    }];
+    let materials = [Material {
+        name: "hull.painted",
+        base_colour: [0.7, 0.72, 0.75, 1.0],
+        metallic: 0.8,
+        roughness: 0.35,
+        pbr_textures: PbrTextures {
+            base_colour: Some(TextureRef { image: ImageId(0), scale: [2.0, 2.0], .. }),
+            normal: Some(NormalTexture { image: ImageId(1), scale: 0.85, .. }),
+            ..PbrTextures::NONE
+        },
+        anisotropy: Some(Anisotropy { strength: 0.6, rotation: 0.25 }),
+        sheen: Some(Sheen { colour: [0.9, 0.9, 0.95], roughness: 0.4 }),
+        transmission: Some(Transmission { factor: 0.15, ior: 1.52, thickness: 0.02, .. }),
+        cc0_pack: Some("cc0://ambientcg/Metal042A_2K"),
+        ..
+    }];
+    let scene = Scene { parts: &parts, materials: &materials, images: &images };
+    let opts = GlbOpts { encoding: Encoding::Float, up: Up::Z, limits: Limits::SHIPPED, alloc: heap(), scratch: heap() };
+    let a = glb(&scene, opts).expect("textured glb");
+    let b = glb(&scene, opts).expect("deterministic glb");
+    assert_eq!(&*a, &*b, "textured GLB must be byte-for-byte deterministic");
+
+    let parsed = parse(&a).expect("valid glTF 2.0");
+    let root = &parsed.json;
+    let prim = &root.get("meshes").unwrap().as_list().unwrap()[0]
+        .get("primitives").unwrap().as_list().unwrap()[0];
+    let attrs = prim.get("attributes").unwrap();
+    assert!(attrs.get("TEXCOORD_0").is_some(), "TEXCOORD_0 must be emitted");
+    assert!(attrs.get("TANGENT").is_some(), "TANGENT must be emitted");
+    assert!(attrs.get("COLOR_0").is_some(), "COLOR_0 must be emitted");
+    assert_eq!(root.get("images").unwrap().as_list().unwrap().len(), 2);
+    assert_eq!(root.get("textures").unwrap().as_list().unwrap().len(), 2);
+    assert_eq!(root.get("samplers").unwrap().as_list().unwrap().len(), 1);
+    let exts = root.get("extensionsUsed").unwrap().as_list().unwrap();
+    let has_ext = |name: &str| exts.iter().any(|v| v.as_str() == Some(name));
+    assert!(has_ext("KHR_materials_anisotropy"));
+    assert!(has_ext("KHR_materials_sheen"));
+    assert!(has_ext("KHR_materials_transmission"));
+    assert!(has_ext("KHR_materials_ior"));
+    assert!(has_ext("KHR_materials_volume"));
+    assert!(has_ext("KHR_texture_transform"));
+
+    let bad_mat = [Material {
+        name: "bad",
+        base_colour: [1.0; 4],
+        metallic: 0.0,
+        roughness: 0.5,
+        pbr_textures: PbrTextures { base_colour: Some(TextureRef { image: ImageId(99), .. }), ..PbrTextures::NONE },
+        ..
+    }];
+    let bad_scene = Scene { parts: &parts, materials: &bad_mat, images: &images };
+    assert_eq!(glb(&bad_scene, opts), Err(GlbError::UnknownImage { material: 0, image: ImageId(99) }));
+}
+
+#[test]
+fn flecs_v42_prefab_emits_hierarchy_materials_sockets_and_catches_planted_bugs() {
+    let view = MeshView::new(Columns {
+        positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        normals: &[[0.0, 0.0, 1.0]; 3],
+        tangents: &[],
+        uvs: &[],
+        colours: &[],
+        triangles: &[[0, 1, 2]],
+        parts: &[PartId(0)],
+        roles: &[MaterialRole(0)],
+        creases: &[],
+    })
+    .unwrap();
+    let sockets = [Socket { name: "nav.port", transform: Transform::IDENTITY }];
+    let parts = [
+        Part {
+            name: "ship.hull",
+            parent: None,
+            transform: Transform::IDENTITY,
+            mesh: Some(view),
+            lods: &[],
+            mass: Some(MassFacts { mass: 420.0, centre: [0.0; 3], inertia: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] }),
+            joint: None,
+            collider: Some(Collider::Mesh),
+            sockets: &sockets,
+        },
+        Part {
+            name: "ship.turret",
+            parent: Some(0),
+            transform: Transform::Trs(Trs { translation: [0.0, 0.0, 1.2], ..Trs::IDENTITY }),
+            mesh: Some(view),
+            lods: &[],
+            mass: None,
+            joint: Some(Joint { name: "yaw", kind: JointKind::Revolute, axis: [0.0, 0.0, 1.0], limits: Some([-3.14, 3.14]) }),
+            collider: None,
+            sockets: &[],
+        },
+    ];
+    let materials = [Material {
+        name: "paint.hull",
+        base_colour: [0.22, 0.28, 0.34, 1.0],
+        metallic: 0.75,
+        roughness: 0.32,
+        cc0_pack: Some("cc0://ambientcg/PaintedMetal017_2K"),
+        ..
+    }];
+    let scene = Scene { parts: &parts, materials: &materials, .. };
+    let opts = FlecsOpts {
+        module: Some("ships"),
+        prefab_name: "Frigate",
+        asset_uri: "assets/frigate.glb",
+        up: Up::Y,
+        include_schema: true,
+        alloc: heap(),
+        scratch: heap(),
+    };
+    let a = flecs_prefab(&scene, opts).expect("flecs prefab");
+    let b = flecs_prefab(&scene, opts).expect("deterministic flecs prefab");
+    assert_eq!(&*a, &*b, "Flecs prefab must be byte-for-byte deterministic");
+    let text = core::str::from_utf8(&a).expect("valid UTF-8");
+    assert!(text.contains("@tree ChildOf"), "Flecs 4.2 prefab must carry @tree ChildOf");
+    assert!(text.contains("(OnInstantiate, Copy)"), "per-instance overrides must use Flecs 4.2 Copy");
+    assert!(!text.contains("Override"), "must never emit removed pre-4.2 Override trait");
+    assert!(text.contains("prefab Frigate"));
+    assert!(text.contains("ship_hull {"));
+    assert!(text.contains("ship_turret {"));
+    assert!(text.contains("socket_nav_port {"));
+    assert!(text.contains("cc0://ambientcg/PaintedMetal017_2K"));
+    assert!(text.contains("(cad.UsesMaterial, materials_Frigate.paint_hull)"));
+
+    let no_tree = flecs_prefab_planted(&scene, opts, FlecsPlant::OmitTreeChildOf).unwrap();
+    assert!(!core::str::from_utf8(&no_tree).unwrap().contains("@tree ChildOf"));
+    let no_sock = flecs_prefab_planted(&scene, opts, FlecsPlant::SkipSockets).unwrap();
+    assert!(!core::str::from_utf8(&no_sock).unwrap().contains("socket_nav_port"));
 }

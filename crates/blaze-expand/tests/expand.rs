@@ -1147,6 +1147,31 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
     assert_eq!(eval("any(unix, unknown)").0, Err(CfgPredicateError::Atom(())));
 }
 
+#[test]
+fn a_cfg_predicate_unwraps_none_delim_groups_from_macro_captures() {
+    // `macro_rules!` `:expr` and `:meta` captures emit invisible `Delim::Invisible` groups around their
+    // substituted tokens (e.g. `async-compression`'s `#[cfg(all(feature = $algo_s))]`).
+    let cx = TestCx::new();
+    let def = rules("($s:expr, $m:meta) => { all(feature = $s, $m) };", 1);
+    let exp = call_fn(&def, "\"gzip\", unix", &cx);
+    assert!(
+        exp.tokens.tokens().iter().any(|t| matches!(t.kind, TokenKind::Open(Delim::Invisible))),
+        "expected invisible Delim::Invisible groups from :expr/:meta captures"
+    );
+    let out = cfg_predicate(&exp.tokens, blaze_own::testing::heap().alloc(), &mut |name, value| -> Result<bool, ()> {
+        Ok(matches!((name, value), ("feature", Some("gzip")) | ("unix", None)))
+    });
+    assert_eq!(out, Ok(true));
+
+    let attr_def = rules("($s:expr) => { #[cfg_attr(all(feature = $s), derive(Debug))] };", 1);
+    let attr_exp = call_fn(&attr_def, "\"gzip\"", &cx);
+    let metas = blaze_expand::cfg_attr_metas(&attr_exp.tokens, blaze_own::testing::heap().alloc(), &mut |name, value| -> Result<bool, ()> {
+        Ok(matches!((name, value), ("feature", Some("gzip"))))
+    })
+    .expect("cfg_attr with :expr capture parses");
+    assert_eq!(metas.len(), 1);
+}
+
 /// A predicate drawn from `tape` over the four atoms of [`TRI_ATOMS`], at most `depth` groups
 /// deep (`any`, `all`, `not`, each with a trailing comma sometimes).
 fn drawn_predicate(tape: &Tape, depth: u32) -> String {

@@ -708,7 +708,26 @@ fn dir_read_all_confined_blocks_leaf_and_intermediate_symlink_escapes() {
     assert!(dir.read_all_confined(&cx, &path("dir_escape/secret.txt"), &mut leak2).is_err(), "dir symlink escape must be refused");
     assert!(leak2.as_slice().is_empty());
 
-    drop((good, leak1, leak2));
+    // Confined range read succeeds on regular inside file and refuses both symlink escapes.
+    let mut range_good = cx.bytes();
+    let rn = dir.read_range_confined(&cx, &path("sub/good.txt"), 2, 4, &mut range_good).expect("confined range read");
+    assert_eq!(rn, 4);
+    assert_eq!(range_good.as_slice(), b"side");
+    let mut range_leak1 = cx.bytes();
+    assert!(dir.read_range_confined(&cx, &path("leaf_escape"), 0, 4, &mut range_leak1).is_err(), "leaf symlink range escape must be refused");
+    assert!(range_leak1.as_slice().is_empty());
+    let mut range_leak2 = cx.bytes();
+    assert!(dir.read_range_confined(&cx, &path("dir_escape/secret.txt"), 0, 4, &mut range_leak2).is_err(), "dir symlink range escape must be refused");
+    assert!(range_leak2.as_slice().is_empty());
+
+    // Confined directory listing succeeds on real subdir, returns None when absent, and refuses symlinked dir.
+    let sub_entries = dir.entries_confined(&cx, &path("sub")).expect("confined entries").expect("sub exists");
+    assert_eq!(sub_entries.len(), 1);
+    assert_eq!(sub_entries.name(0), "good.txt");
+    assert!(dir.entries_confined(&cx, &path("no_such_dir")).expect("missing dir is None").is_none());
+    assert!(dir.entries_confined(&cx, &path("dir_escape")).is_err(), "dir symlink entries escape must be refused");
+
+    drop((good, leak1, leak2, range_good, range_leak1, range_leak2));
     drop((dir, cx, io));
     let _ = std::fs::remove_dir_all(&base);
 }

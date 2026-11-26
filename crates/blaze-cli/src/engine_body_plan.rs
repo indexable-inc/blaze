@@ -578,18 +578,99 @@ pub(crate) fn found_edges(units: &[(Name, bool, Name)], places: &[(Name, blaze_e
     edges
 }
 
+/// Number of distinct file queries before [`LazyReach`] materializes the full sorted
+/// `(file, rank)` table so multi-file edits stay O(N log N) while 1-file `Ready` edits
+/// avoid copying and sorting every unchanged submodule.
+const LAZY_REACH_MATERIALIZE_AT: usize = 16;
+
+/// Backing storage for [`Reach::ranks`]: a flat sorted table (from [`Reach::walk`]) or an
+/// on-demand view over the cached members record (from [`Reach::of_members_shared`]).
+enum ReachFiles {
+    /// (file, rank), sorted, each once.
+    Flat(AVec<'static, (Name, u32)>),
+    /// Queried on demand from the cached `BLZMEMB` view without copying/sorting all files upfront.
+    Lazy(LazyReach),
+}
+
+struct LazyReach {
+    members: blaze_own::Rc<crate::engine_members_record::View<'static>, blaze_own::Alloc<'static>>,
+    /// Crate-list index (`at: u32`) for each ranked unit `0..units.len()`, in rank order.
+    member_at: AVec<'static, u32>,
+    cache: core::cell::RefCell<blaze_hash::Map<Name, &'static [(Name, u32)], blaze_hash::BuildKeyHasher, blaze_own::Alloc<'static>>>,
+    flat: core::cell::OnceCell<AVec<'static, (Name, u32)>>,
+    alloc: blaze_own::Alloc<'static>,
+}
+
+impl LazyReach {
+    fn build_flat(&self) -> AVec<'static, (Name, u32)> {
+        let mut files: AVec<'static, (Name, u32)> = Vec::new_in(self.alloc);
+        for (rank_idx, &at) in self.member_at.iter().enumerate() {
+            let rank = u32::try_from(rank_idx).unwrap_or(u32::MAX);
+            let Some(kept) = self.members.member(at) else { continue };
+            match &kept.state {
+                crate::engine_members_record::MemberState::Held(held) => {
+                    files.extend(held.held.iter().map(|h| (h.slot, rank)));
+                }
+                crate::engine_members_record::MemberState::CutScope(cut) => {
+                    files.extend(cut.held.iter().map(|h| (h.slot, rank)));
+                }
+                crate::engine_members_record::MemberState::Refused(_) => {}
+            }
+            files.extend(kept.not_held.iter().map(|file| (*file, rank)));
+        }
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
+
+    fn ranks(&self, file: Name) -> &[(Name, u32)] {
+        if let Some(flat) = self.flat.get() {
+            return slice_ranks(flat, file);
+        }
+        if let Some(&cached) = self.cache.borrow().get(&file) {
+            return cached;
+        }
+        if self.cache.borrow().len() >= LAZY_REACH_MATERIALIZE_AT {
+            let flat = self.flat.get_or_init(|| self.build_flat());
+            return slice_ranks(flat, file);
+        }
+        let mut matched: AVec<'static, (Name, u32)> = Vec::new_in(self.alloc);
+        for (rank_idx, &at) in self.member_at.iter().enumerate() {
+            let Some(kept) = self.members.member(at) else { continue };
+            let held_has = match &kept.state {
+                crate::engine_members_record::MemberState::Held(held) => held.held.iter().any(|h| h.slot == file),
+                crate::engine_members_record::MemberState::CutScope(cut) => cut.held.iter().any(|h| h.slot == file),
+                crate::engine_members_record::MemberState::Refused(_) => false,
+            };
+            if held_has || kept.not_held.iter().any(|&slot| slot == file) {
+                matched.push((file, u32::try_from(rank_idx).unwrap_or(u32::MAX)));
+            }
+        }
+        let slice: &'static [(Name, u32)] = if matched.is_empty() { &[] } else { matched.leak_static() };
+        self.cache.borrow_mut().insert(file, slice);
+        slice
+    }
+}
+
+fn slice_ranks(files: &[(Name, u32)], file: Name) -> &[(Name, u32)] {
+    let from = files.partition_point(|one| one.0 < file);
+    let rest = files.get(from..).unwrap_or(&[]);
+    let len = rest.partition_point(|one| one.0 == file);
+    rest.get(..len).unwrap_or(&[])
+}
+
 /// WHICH MEMBER UNITS REACH EACH FILE, in rank (D191): what each body's rows are planned from
 /// (engine_bodies.rs `plan_views`, [`task_rows`]) and what the Bodies setup checks each unit it
 /// visits against (engine_bodies.rs `groups`). Made once a request and handed to both (rule 30):
 /// the phase path walks every member's tree over its outlines ([`Reach::walk`]); the ready path,
 /// which outlines only the edited files, reads each member's held and reached files from the
-/// last members record ([`Reach::of_members`]), the same files the walk gave it then.
+/// last members record ([`Reach::of_members_shared`]), the same files the walk gave it then.
 pub(crate) struct Reach {
     /// The member units in rank: non-test units first, then the crate list's order (rule 25:
     /// the graph's record fixes it; no map order).
     units: AVec<'static, Reacher>,
-    /// (file, rank), sorted, each once.
-    files: AVec<'static, (Name, u32)>,
+    /// File-to-rank index (flat or lazy over the cached members record).
+    files: ReachFiles,
     /// The units' crates' names, end to end ([`Reacher`]'s spans).
     names: AVec<'static, u8>,
     /// The member units' found files ([`FoundEdge`]), sorted: what the walk took them from, and
@@ -622,7 +703,7 @@ impl Reach {
         kept.extend_from_slice(found);
         kept.sort_unstable();
         kept.dedup();
-        Reach { units, files, names, found: kept }
+        Reach { units, files: ReachFiles::Flat(files), names, found: kept }
     }
 
     /// The found files of the member unit whose `CrateScope` task is `unit` ([`FoundEdge`]): what
@@ -691,6 +772,7 @@ impl Reach {
     /// (engine_bodies.rs `groups`, [`Reach::disagrees`]). `found`: every member unit's found
     /// files, kept for the setup's walk ([`Reach::found_of`]); the record's files hold them already
     /// (the walk of its visit took them). In `g`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "eager flat oracle kept for unit tests; production uses of_members_shared"))]
     pub(crate) fn of_members(list: &CrateList<'_>, scoped: Option<&crate::engine_check::ScopedUnits>, members: &crate::engine_members_record::View<'_>, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Reach, ReachUnknown> {
         let mut names: AVec<'static, u8> = Vec::new_in(g);
         let ranked = Reach::ranked(list, scoped, &mut names, g);
@@ -712,11 +794,54 @@ impl Reach {
         Ok(Reach::of(&ranked, files, names, found, g))
     }
 
+    /// On-demand version of [`Reach::of_members`] sharing the already-opened `BLZMEMB` view:
+    /// validates every member exists in `members` in O(N_units log N_units) without copying or
+    /// sorting all `N_units * N_files` `(file, rank)` pairs upfront on 1-file `Ready` edits.
+    pub(crate) fn of_members_shared(
+        list: &CrateList<'_>,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
+        members: blaze_own::Rc<crate::engine_members_record::View<'static>, blaze_own::Alloc<'static>>,
+        found: &[FoundEdge],
+        g: blaze_own::Alloc<'static>,
+    ) -> Result<Reach, ReachUnknown> {
+        let mut names: AVec<'static, u8> = Vec::new_in(g);
+        let ranked = Reach::ranked(list, scoped, &mut names, g);
+        let mut member_at: AVec<'static, u32> = Vec::with_capacity_in(ranked.len(), g);
+        for (at, one) in ranked.iter() {
+            let at_u32 = u32::try_from(*at).ok().ok_or(ReachUnknown { unit: one.unit })?;
+            let _ = members.member(at_u32).filter(|kept| kept.unit.name == one.unit).ok_or(ReachUnknown { unit: one.unit })?;
+            member_at.push(at_u32);
+        }
+        let mut units: AVec<'static, Reacher> = Vec::with_capacity_in(ranked.len(), g);
+        units.extend(ranked.iter().map(|(_, one)| *one));
+        let mut kept: AVec<'static, FoundEdge> = Vec::with_capacity_in(found.len(), g);
+        kept.extend_from_slice(found);
+        kept.sort_unstable();
+        kept.dedup();
+        Ok(Reach {
+            units,
+            files: ReachFiles::Lazy(LazyReach {
+                members,
+                member_at,
+                cache: core::cell::RefCell::new(blaze_hash::Map::new(blaze_hash::MapOpts {
+                    hasher: blaze_hash::BuildKeyHasher::default(),
+                    alloc: g,
+                    capacity: None,
+                })),
+                flat: core::cell::OnceCell::new(),
+                alloc: g,
+            }),
+            names,
+            found: kept,
+        })
+    }
+
     /// The units that reach `file`: (file, rank) in rank order.
     pub(crate) fn ranks(&self, file: Name) -> &[(Name, u32)] {
-        let from = self.files.partition_point(|one| one.0 < file);
-        let rest = &self.files[from..];
-        &rest[..rest.partition_point(|one| one.0 == file)]
+        match &self.files {
+            ReachFiles::Flat(files) => slice_ranks(files, file),
+            ReachFiles::Lazy(lazy) => lazy.ranks(file),
+        }
     }
 
     /// How many member units are ranked.
@@ -770,14 +895,49 @@ impl Reach {
     /// does not rank disagrees at its first file.
     pub(crate) fn disagrees(&self, unit: Name, walked: &[Name]) -> Option<Name> {
         let Some(rank) = self.rank_of(unit) else { return walked.first().copied() };
-        let mut mine = self.files.iter().filter(|one| one.1 == rank).map(|one| one.0);
-        let mut today = walked.iter().copied();
-        loop {
-            match (mine.next(), today.next()) {
-                (None, None) => return None,
-                (Some(a), Some(b)) if a == b => {}
-                (Some(a), Some(b)) => return Some(a.min(b)),
-                (a, b) => return a.or(b),
+        match &self.files {
+            ReachFiles::Flat(files) => {
+                let mut mine = files.iter().filter(|one| one.1 == rank).map(|one| one.0);
+                let mut today = walked.iter().copied();
+                loop {
+                    match (mine.next(), today.next()) {
+                        (None, None) => return None,
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(a), Some(b)) => return Some(a.min(b)),
+                        (a, b) => return a.or(b),
+                    }
+                }
+            }
+            ReachFiles::Lazy(lazy) => {
+                let Some(&at) = usize::try_from(rank).ok().and_then(|r| lazy.member_at.get(r)) else {
+                    return walked.first().copied();
+                };
+                let Some(kept) = lazy.members.member(at) else {
+                    return walked.first().copied();
+                };
+                let mut mine: AVec<'static, Name> = Vec::new_in(lazy.alloc);
+                match &kept.state {
+                    crate::engine_members_record::MemberState::Held(held) => {
+                        mine.extend(held.held.iter().map(|h| h.slot));
+                    }
+                    crate::engine_members_record::MemberState::CutScope(cut) => {
+                        mine.extend(cut.held.iter().map(|h| h.slot));
+                    }
+                    crate::engine_members_record::MemberState::Refused(_) => {}
+                }
+                mine.extend(kept.not_held.iter().copied());
+                mine.sort_unstable();
+                mine.dedup();
+                let mut mine_it = mine.iter().copied();
+                let mut today = walked.iter().copied();
+                loop {
+                    match (mine_it.next(), today.next()) {
+                        (None, None) => return None,
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(a), Some(b)) => return Some(a.min(b)),
+                        (a, b) => return a.or(b),
+                    }
+                }
             }
         }
     }
@@ -1167,5 +1327,69 @@ mod tests {
         ];
         expected_both.sort_unstable();
         assert_eq!(edges_both.as_slice(), expected_both.as_slice());
+    }
+
+    #[test]
+    fn lazy_reach_matches_flat_across_single_and_multi_file_queries() {
+        use crate::engine_members_record as rec;
+        let g = blaze_own::testing::heap().alloc();
+        let u0 = Name::new(Kind::CrateScope, ContentId([1; 32]));
+        let u1 = Name::new(Kind::CrateScope, ContentId([2; 32]));
+        let mut h0 = AVec::new_in(g);
+        let mut h1 = AVec::new_in(g);
+        let mut all_files = AVec::new_in(g);
+        for i in 0u32..24 {
+            let path = std::format!("crate/src/m{i:02}.rs");
+            let slot = Name::file(path.as_bytes());
+            all_files.push(slot);
+            if i % 2 == 0 {
+                h0.push(rec::Held { file: i, slot, path: b"crate/src/lib.rs", entries: ContentId([i as u8; 32]) });
+            }
+            h1.push(rec::Held { file: i, slot, path: b"crate/src/lib.rs", entries: ContentId([i as u8; 32]) });
+        }
+        let extra = Name::file(b"crate/src/only_u0_not_held.rs");
+        all_files.push(extra);
+        let mut nh0 = AVec::new_in(g);
+        nh0.push(extra);
+        let mut writer = rec::Writer::new(&rec::Header { graph_out: ContentId([9; 32]), tool: blaze_drive::Tool(ContentId([8; 32])), made_at: 0 }, g);
+        writer.member(&rec::Member {
+            at: 0,
+            unit: Unit { name: u0, prefix: [1; 8], test: false },
+            state: rec::MemberState::Held(rec::HeldMember { names: u0, names_out: ContentId([3; 32]), row: blaze_drive::Key(ContentId([4; 32])), uncovered: 0, named: AVec::new_in(g), held: h0 }),
+            not_held: nh0,
+        });
+        writer.member(&rec::Member {
+            at: 1,
+            unit: Unit { name: u1, prefix: [2; 8], test: true },
+            state: rec::MemberState::Held(rec::HeldMember { names: u1, names_out: ContentId([5; 32]), row: blaze_drive::Key(ContentId([6; 32])), uncovered: 0, named: AVec::new_in(g), held: h1 }),
+            not_held: AVec::new_in(g),
+        });
+        let bytes: &'static [u8] = writer.finish().leak_static();
+        let view = rec::View::open(bytes, g).expect("open members");
+        let rc = blaze_own::Rc::new_in(view, g);
+        let mut member_at = AVec::new_in(g);
+        member_at.push(0);
+        member_at.push(1);
+        let lazy = LazyReach {
+            members: rc,
+            member_at,
+            cache: core::cell::RefCell::new(blaze_hash::Map::new(blaze_hash::MapOpts {
+                hasher: blaze_hash::BuildKeyHasher::default(),
+                alloc: g,
+                capacity: None,
+            })),
+            flat: core::cell::OnceCell::new(),
+            alloc: g,
+        };
+        let flat = lazy.build_flat();
+        // First query does NOT materialize `flat`.
+        assert_eq!(lazy.ranks(all_files[0]), slice_ranks(&flat, all_files[0]));
+        assert!(lazy.flat.get().is_none(), "1-file query must stay lazy without sorting all files");
+        // Querying across `LAZY_REACH_MATERIALIZE_AT` triggers materialization and keeps exact parity.
+        for &file in all_files.iter() {
+            assert_eq!(lazy.ranks(file), slice_ranks(&flat, file), "lazy matches flat for {file:?}");
+        }
+        assert!(lazy.flat.get().is_some(), "multi-file queries materialize flat table");
+        assert_eq!(lazy.ranks(Name::file(b"crate/src/absent.rs")), &[]);
     }
 }

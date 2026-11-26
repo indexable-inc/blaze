@@ -19,6 +19,7 @@
 use blaze_drive::key::crate_scope_name;
 use blaze_engine::CellId;
 use blaze_id::ItemKey as LibKey;
+use blaze_ladder::front2::body_host::BodySources;
 use blaze_ladder::front2::consts::ConstFail;
 use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::index::{Index, LangTwice};
@@ -43,13 +44,21 @@ pub(crate) struct HeadConsts<'r, 'n, S> {
     pub(crate) index: &'r Index<'n>,
     pub(crate) bump: Bump<'n>,
     prepared: Option<&'n Prepares<'n>>,
+    sources: Option<&'n dyn BodySources>,
     /// The constants asked of it.
     pub(crate) asked: u32,
 }
 
 impl<'r, 'n, S> HeadConsts<'r, 'n, S> {
     pub(crate) fn new(names: S, index: &'r Index<'n>, bump: Bump<'n>) -> HeadConsts<'r, 'n, S> {
-        HeadConsts { names, index, bump, prepared: None, asked: 0 }
+        HeadConsts { names, index, bump, prepared: None, sources: None, asked: 0 }
+    }
+
+    /// Attaches the body expansion sources (`include_str!`, `include_bytes!`, `env!`) used while
+    /// lowering constant bodies referenced from heads (e.g. `blaze_pins::ARCHIVES`).
+    pub(crate) fn with_sources(mut self, sources: Option<&'n dyn BodySources>) -> HeadConsts<'r, 'n, S> {
+        self.sources = sources;
+        self
     }
 }
 
@@ -58,7 +67,13 @@ impl<'n, S: NamesSource<'n>> ConstValues<'n> for HeadConsts<'_, 'n, S> {
         self.asked = self.asked.saturating_add(1);
         let bump = self.bump;
         let prepared = *self.prepared.get_or_insert_with(|| Prepares::new_in(bump));
-        StoreConsts { names: self.names, index: self.index, prepared }.eval(store, keys, c)
+        let prev = store.sources;
+        if self.sources.is_some() {
+            store.sources = self.sources;
+        }
+        let res = StoreConsts { names: self.names, index: self.index, prepared }.eval(store, keys, c);
+        store.sources = prev;
+        res
     }
 }
 

@@ -52,13 +52,18 @@
 //! A read-list keeps its reads in its filer's order, and the order is part of the list: a
 //! filer that wants one list per set of reads sorts them.
 
-#![cfg_attr(not(test), no_std)]
-#![forbid(unsafe_code)]
-// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
+#![no_std]
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 
-extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod chain;
 mod keys;

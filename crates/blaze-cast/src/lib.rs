@@ -30,15 +30,24 @@
 //! A leaf crate with no dependencies, so every crate of the workspace can name it, blaze-core
 //! and the crates under it (blaze-mem, blaze-hash) included. bstd re-exports it as `bstd::cast`.
 
-#![cfg_attr(not(test), no_std)]
-#![feature(register_tool)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 // The tests check the compositions `blaze::as_cast` writes with std's `widen` and `truncate`.
 #![cfg_attr(test, feature(integer_widen_truncate))]
 #![expect(
     blaze::as_cast,
     reason = "the one place a numeric `as` is written: each function is the cast it names"
 )]
+
+#[cfg(test)]
+extern crate std;
 
 /// Every target blaze supports has 32- or 64-bit pointers: what makes the lossless names here
 /// lossless.

@@ -8,7 +8,7 @@ use blaze_cad_field::{
 };
 use blaze_cad_mesh::{
     DecimateOpts, Decimated, GridSizing, MaterialRole, MeshLimits, MeshOpts, Meshed, PieceCache, RedistanceOpts, Source, Target,
-    Verified, auto_grid, decimate, mesh, mesh_cached, solve_redistance,
+    UvMode, Verified, auto_grid, decimate, mesh, mesh_cached, solve_redistance,
 };
 use blaze_own::Alloc;
 use blaze_own::planted::{NoPlant, Planted};
@@ -93,6 +93,9 @@ pub struct Part<K: Ex = Bound> {
     pub parent: Option<PartId>,
     /// Per-part triangle budget and tessellation override (defaults to [`PartBudget::Auto`]).
     pub budget: PartBudget,
+    /// Optional per-part UV projection mode override (e.g. vertical wood grain on posts,
+    /// horizontal clapboard siding on walls, or cylindrical wrap on turned barrels/nozzles).
+    pub uv_mode: Option<UvMode>,
 }
 
 /// What [`Part::new`] takes.
@@ -126,6 +129,7 @@ impl<K: Ex> Part<K> {
                 material: MaterialRole(0),
                 parent: None,
                 budget: PartBudget::Auto,
+                uv_mode: None,
             });
         }
         let (placement, local) = g.split_placement(o.solid).map_err(ModelError::Cad)?;
@@ -136,6 +140,7 @@ impl<K: Ex> Part<K> {
             material: MaterialRole(0),
             parent: None,
             budget: PartBudget::Auto,
+            uv_mode: None,
         })
     }
 
@@ -159,6 +164,11 @@ impl<K: Ex> Part<K> {
         Part { budget, ..self }
     }
 
+    /// The same part assigned a semantic UV projection mode (overrides `PbrMeshOpts::uv_mode`).
+    pub fn with_uv_mode(self, uv_mode: UvMode) -> Part<K> {
+        Part { uv_mode: Some(uv_mode), ..self }
+    }
+
     /// The same part at a weaker level (an assembly takes `Part<Bound>`).
     pub fn weaken<J: Ex>(self) -> Part<J>
     where
@@ -171,6 +181,7 @@ impl<K: Ex> Part<K> {
             material: self.material,
             parent: self.parent,
             budget: self.budget,
+            uv_mode: self.uv_mode,
         }
     }
 }

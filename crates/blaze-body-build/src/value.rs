@@ -59,6 +59,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             Union,
             Adt(blaze_typeck::ItemKey),
             FnDef(blaze_typeck::ItemKey),
+            Closure(blaze_typeck::ItemKey, u32),
+            Coroutine(blaze_typeck::ItemKey, u32),
         }
         let mut stack: Vec<(u32, Frame<A>), A> = Vec::new_in(self.alloc);
         let mut cur_ty = ty;
@@ -76,6 +78,10 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     | PNode::Int(_)
                     | PNode::Uint(_)
                     | PNode::Float(_) => self.subst.ground.intern(node).map_err(|_| self.malformed("the ground table is full"))?,
+                    PNode::Param(i) | PNode::ConstParam(i) => {
+                        let idx = usize::try_from(i).map_err(|_| self.malformed("a generic parameter past the instance's arguments"))?;
+                        *self.subst.args.get(idx).ok_or(self.malformed("a generic parameter past the instance's arguments"))?
+                    }
                     PNode::ConstValue { ty: cty, bits } => {
                         stack.push((cur_depth, Frame::ConstValue(bits)));
                         cur_ty = cty;
@@ -106,13 +112,21 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         cur_depth += 1;
                         continue;
                     }
-                    PNode::Tuple(list) | PNode::Record(_, list) | PNode::Union(list) | PNode::Adt(_, list) | PNode::FnDef(_, list) => {
+                    PNode::Tuple(list)
+                    | PNode::Record(_, list)
+                    | PNode::Union(list)
+                    | PNode::Adt(_, list)
+                    | PNode::FnDef(_, list)
+                    | PNode::Closure { args: list, .. }
+                    | PNode::Coroutine { args: list, .. } => {
                         let kind = match node {
                             PNode::Tuple(_) => ListKind::Tuple,
                             PNode::Record(s, _) => ListKind::Record(s),
                             PNode::Union(_) => ListKind::Union,
                             PNode::Adt(k, _) => ListKind::Adt(k),
                             PNode::FnDef(k, _) => ListKind::FnDef(k),
+                            PNode::Closure { owner, ordinal, .. } => ListKind::Closure(owner, ordinal),
+                            PNode::Coroutine { owner, ordinal, .. } => ListKind::Coroutine(owner, ordinal),
                             _ => return Err(self.unsupported("a type of the body's own overlay (not in its record's table)")),
                         };
                         let cap = usize::try_from(list.len).unwrap_or(0);
@@ -136,6 +150,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                             ListKind::Union => PNode::Union(empty),
                             ListKind::Adt(k) => PNode::Adt(k, empty),
                             ListKind::FnDef(k) => PNode::FnDef(k, empty),
+                            ListKind::Closure(owner, ordinal) => PNode::Closure { owner, ordinal, args: empty },
+                            ListKind::Coroutine(owner, ordinal) => PNode::Coroutine { owner, ordinal, args: empty },
                         };
                         self.subst.ground.intern(out).map_err(|_| self.malformed("the ground table is full"))?
                     }
@@ -186,6 +202,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                             ListKind::Union => PNode::Union(interned),
                             ListKind::Adt(k) => PNode::Adt(k, interned),
                             ListKind::FnDef(k) => PNode::FnDef(k, interned),
+                            ListKind::Closure(owner, ordinal) => PNode::Closure { owner, ordinal, args: interned },
+                            ListKind::Coroutine(owner, ordinal) => PNode::Coroutine { owner, ordinal, args: interned },
                         };
                         resolved = self.subst.ground.intern(out).map_err(|_| self.malformed("the ground table is full"))?;
                     }
@@ -224,7 +242,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     }
 
     /// The offset of field `idx` of layout `lay`, an array's element included.
-    fn field_off(&self, lay: LayoutId, idx: u32) -> Result<i32, BuildError> {
+    pub(crate) fn field_off(&self, lay: LayoutId, idx: u32) -> Result<i32, BuildError> {
         let off = match self.layouts.get(lay).fields {
             Fields::Array { stride, .. } => stride.checked_mul(u64::from(idx)),
             _ => self.layouts.field_offset(lay, idx),
@@ -310,7 +328,10 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 let b = c1.ok_or(self.malformed("a read of a value local before it is written"))?;
                 At::Val(V::Two(a, b))
             }
-            Held::Slot(_) | Held::At(_) => At::Mem { ptr: self.base(local)?, off: 0, lay, meta: None },
+            Held::Slot(_) | Held::At(_) | Held::AtOff(..) => {
+                let (ptr, off) = self.base_at(local)?;
+                At::Mem { ptr, off, lay, meta: None }
+            }
         };
         for &proj in chain.iter().rev() {
             match proj {
@@ -831,7 +852,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// Writes the tag that makes the value of layout `lay` at `ptr + off` variant `v`, by the
     /// layout's one encoding (`Layouts::tag_write`); nothing when the layout has no tag or `v`
     /// is the niche's untagged variant.
-    fn store_tag(&mut self, ptr: Value, off: i32, lay: LayoutId, v: u32) -> Result<(), BuildError> {
+    pub(crate) fn store_tag(&mut self, ptr: Value, off: i32, lay: LayoutId, v: u32) -> Result<(), BuildError> {
         let Some(tag) = self.layouts.tag_write(lay, v) else {
             return Ok(());
         };
@@ -1285,7 +1306,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
 
     /// The target instance for a fn-item reification: `ReifyShim` when `instance` is
     /// `#[track_caller]`, else `instance` itself.
-    fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
+    pub(crate) fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
         if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
             return reify_shim_instance(instance, self.subst.ground).map_err(|e| self.facts(e));
         }
@@ -1308,7 +1329,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     Some(v)
                 }
             }
-            AggregateKind::Coroutine => return Err(self.unsupported("a coroutine built from its upvars")),
+            AggregateKind::Coroutine => return self.coroutine_aggregate(dest, ty, operands, dlay),
         };
         let ops: Vec<Operand, A> = {
             let mut out = Vec::with_capacity_in(operands.len() as usize, self.alloc);
@@ -1416,7 +1437,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             (PNode::Dynamic(_), PNode::Dynamic(_), Some(vt)) => {
                 let (pf, pt) = (self.principal(f)?, self.principal(t)?);
                 match (pf, pt) {
-                    (_, None) => return Err(self.unsupported("an unsizing to a trait object of auto traits alone")),
+                    (_, None) => vt,
                     (Some((a_tr, _)), Some((b_tr, _))) if a_tr == b_tr => vt,
                     (Some((a_tr, _)), Some((b_tr, _))) => {
                         let shape = vtable::Shape::of(a_tr, |tr| self.adts.object_trait(tr), self.subst.scratch)
@@ -1435,9 +1456,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 }
             }
             (_, PNode::Dynamic(_), None) => {
-                let Some((principal, args)) = self.principal(t)? else {
-                    return Err(self.unsupported("an unsizing to a trait object of auto traits alone"));
-                };
+                let (principal, args) = self.principal(t)?.unwrap_or((vtable::AUTO_ONLY_PRINCIPAL, List::EMPTY));
                 self.vtable_addr(VtableRef { concrete: f, principal, args })
             }
             _ => return Err(self.unsupported("an unsizing coercion of an unsupported shape")),

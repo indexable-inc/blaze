@@ -98,6 +98,7 @@ pub use blocks::Kept;
 pub use column::{Block, Column};
 pub use error::MemError;
 pub use frame::{Frame, Marker};
+pub use root::SharedBump;
 pub use host::HostMemory;
 pub use handle::{Handle, Slab};
 pub use pool::{Cache, Pool, Pooled, Shared};

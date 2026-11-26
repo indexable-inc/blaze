@@ -398,10 +398,14 @@ fn for_defaults<'u, 'a>(
 /// The workspace the command was given (`checkout`: the start folder, or a folder beneath it),
 /// found as the module says: its root as the checkout, and the package's folder from it.
 ///
-/// COST: one `stat` a folder from the one given up to its package; the layout from the package
-/// (its manifests and members' listings, as [`pick`] reads them again from the root); the folders
-/// above the start folder only when no root was found beneath it (one `getcwd`, one read a
-/// folder, nearest first, as cargo's walk does).
+/// COST: one read a folder from the one given up to its package; a `[workspace]` root stops at
+/// that single manifest read (with zero TOML DOM allocation when `[workspace]` is the leading
+/// table header); a standalone package (no `[workspace]`, no `package.workspace`, no
+/// workspace-inherited keys, and no `[workspace]` in any parent beneath the start folder) checks
+/// only the folders above the start folder (one `getcwd`, one `stat` a folder, nearest first,
+/// zero file reads or error allocations on missing ancestors) with zero `Layout` or directory
+/// listings; only a member inside a workspace beneath the start folder (or a manifest needing
+/// `Layout`'s refusal) walks the layout.
 pub(crate) fn locate<'f>(cx: &Cx, fs: &Fs, checkout: &Checkout, frame: &'f Frame) -> Result<Located<'f>, CliError> {
     let cx = cx.span("blaze: the workspace's root");
     let start: &'f str = match checkout {
@@ -410,13 +414,23 @@ pub(crate) fn locate<'f>(cx: &Cx, fs: &Fs, checkout: &Checkout, frame: &'f Frame
     };
     let here = fs.root();
     // The package's folder: the nearest at or above `start` beneath the start folder with a
-    // manifest (cargo's `find_root_manifest_for_wd`).
+    // manifest (cargo's `find_root_manifest_for_wd`). Read directly so the found manifest is not
+    // `stat`'d twice before its bytes are parsed.
     let mut package = None;
+    let mut package_manifest = MANIFEST;
     let mut dir = start;
+    let mut text = Bytes::new_in(frame, "the package's manifest");
     loop {
-        if here.stat(&cx, &Path::new(manifest_in(dir, frame)?)?)?.is_some_and(|meta| !meta.dir) {
-            package = Some(dir);
-            break;
+        text.clear();
+        let manifest_path = manifest_in(dir, frame);
+        match here.read_all(&cx, &Path::new(manifest_path)?, &mut text) {
+            Ok(_) => {
+                package = Some(dir);
+                package_manifest = manifest_path;
+                break;
+            }
+            Err(error) if matches!(error.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) => {}
+            Err(error) => return Err(error.into()),
         }
         match up(dir) {
             Some(above) => dir = above,
@@ -430,23 +444,50 @@ pub(crate) fn locate<'f>(cx: &Cx, fs: &Fs, checkout: &Checkout, frame: &'f Frame
             None => picked(PickError::NoManifest { start: owned(start) }),
         });
     };
-    let package_manifest = manifest_in(package, frame)?;
-    // The package's own manifest with `[workspace]` is its workspace's root (cargo's
-    // `find_root`: a `[workspace]` manifest is the root, the search stops there), so the root is
-    // the package and the member its root package: one read, no layout. tempo's every command
-    // starts in such a folder: its 17.3 ms `locate` (score-c2315wave73, 212 stats and 53 reads,
-    // 1.4 ms of CPU: waiting on the files) read every member's manifest only to learn this, and
-    // `units::lay` reads them all again after the journal's place. A member's manifest the
-    // layout would refuse is refused there, by the same `Layout`, with its file named.
-    // A manifest that is no UTF-8 or no TOML is the layout's to refuse, with its words: below.
-    let mut text = Bytes::new_in(frame, "the package's manifest");
-    here.read_all(&cx, &Path::new(package_manifest)?, &mut text)?;
-    if core::str::from_utf8(text.as_slice()).is_ok_and(|text| has(text, &["workspace"], frame).unwrap_or(false)) {
+    // Fast paths from the already-read manifest (avoiding `with_layout`, which lists the root and
+    // `src/` with `getattrlistbulk` and maps a 2 MiB buffer on every edit):
+    // 1. Leading `[workspace]` header: no multiline string or array can be open before the first
+    //    non-comment line, so cargo's `find_root` stops here without parsing a large root
+    //    manifest (e.g. thousands of `[workspace.dependencies]`) into a TOML DOM in `frame`.
+    // 2. `[workspace]` anywhere else in a valid TOML manifest: cargo's `find_root` stops here.
+    // 3. Standalone package: no `[workspace]`, no `package.workspace`, no `[workspace]` in any
+    //    parent folder beneath the start folder, and no `[workspace]` above the start folder that
+    //    claims it. When it has `[package]` and no `*.workspace = true` inheritance, it stands
+    //    alone as its own root with zero directory listings; otherwise `with_layout` refuses it
+    //    with its manifest span.
+    if starts_with_workspace_header(text.as_slice()) {
         let root_dir = match package {
             "" => here,
             at => fs.open_dir(&cx, &Path::new(at)?)?,
         };
         return Ok(Located { root: root_dir, at: package, member: "" });
+    }
+    let mut checked_above_none = false;
+    if let Ok(text_str) = core::str::from_utf8(text.as_slice())
+        && let Ok(doc) = blaze_toml::Document::parse_in(text_str, blaze_toml::Limits::CARGO, frame)
+    {
+        if doc.root().get("workspace").is_some() {
+            let root_dir = match package {
+                "" => here,
+                at => fs.open_dir(&cx, &Path::new(at)?)?,
+            };
+            return Ok(Located { root: root_dir, at: package, member: "" });
+        }
+        let pkg = doc.root().get("package");
+        let pkg_workspace = pkg.as_ref().and_then(|pkg| pkg.get("workspace")).is_some();
+        if !pkg_workspace && (package.is_empty() || !workspace_beneath(&cx, &here, package, frame)?) {
+            if let Some(manifest) = above(&cx, fs, package, Want::Workspace, frame)? {
+                return Err(picked(PickError::RootAboveStart { manifest, package: owned(shown_dir(package)) }));
+            }
+            checked_above_none = true;
+            if pkg.is_some() && !uses_workspace_inheritance(&doc) {
+                let root_dir = match package {
+                    "" => here,
+                    at => fs.open_dir(&cx, &Path::new(at)?)?,
+                };
+                return Ok(Located { root: root_dir, at: package, member: "" });
+            }
+        }
     }
     let laid = with_layout(&cx, &here, package, frame, |units, root_text| {
         let root_manifest = units.manifests.get(units.root.0 as usize).ok_or(CliError::Text { what: "the layout names no root manifest (run_package.rs)" })?;
@@ -466,6 +507,7 @@ pub(crate) fn locate<'f>(cx: &Cx, fs: &Fs, checkout: &Checkout, frame: &'f Frame
     });
     let root = match laid {
         Ok((root, true)) => root,
+        Ok((_, false)) if checked_above_none => package,
         Ok((_, false)) => match above(&cx, fs, package, Want::Workspace, frame)? {
             Some(manifest) => return Err(picked(PickError::RootAboveStart { manifest, package: owned(shown_dir(package)) })),
             None => package,
@@ -474,7 +516,8 @@ pub(crate) fn locate<'f>(cx: &Cx, fs: &Fs, checkout: &Checkout, frame: &'f Frame
         // when nothing beneath the start folder names a root, the root above that claims the
         // package is the cause, and is named; else the layout's words stand.
         Err(refused) => {
-            if !root_beneath(&cx, &here, package, frame)?
+            if !checked_above_none
+                && !root_beneath(&cx, &here, package, frame)?
                 && let Some(manifest) = above(&cx, fs, package, Want::Workspace, frame)?
             {
                 return Err(picked(PickError::RootAboveStart { manifest, package: owned(shown_dir(package)) }));
@@ -505,16 +548,69 @@ fn up(dir: &str) -> Option<&str> {
 }
 
 /// `dir`'s manifest (`Cargo.toml` for the start folder, `a/Cargo.toml` beneath it), in `frame`.
-fn manifest_in<'f>(dir: &str, frame: &'f Frame) -> Result<&'f str, CliError> {
-    match dir {
-        "" => Ok(MANIFEST),
-        dir => kept(bstd::mem::format_in!(frame, "{dir}/{MANIFEST}").as_str(), frame),
+fn manifest_in<'f>(dir: &str, frame: &'f Frame) -> &'f str {
+    if dir.is_empty() {
+        return MANIFEST;
     }
+    let mut joined = blaze_own::String::with_capacity_in(dir.len() + 1 + MANIFEST.len(), frame);
+    joined.push_str(dir);
+    joined.push('/');
+    joined.push_str(MANIFEST);
+    joined.into_bump_str()
+}
+
+/// Trim leading ASCII horizontal whitespace (TOML `ws`: space and tab).
+fn trim_toml_ws_start(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = bytes.split_first() {
+        if first == b' ' || first == b'\t' {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+/// Whether `bytes` begins (after optional UTF-8 BOM, blank lines, and `#` comments) with a
+/// top-level `[workspace]` TOML table header.
+///
+/// No multiline string or array can be open before the first non-comment line, so a leading
+/// `[workspace]` header unambiguously marks this manifest as a workspace root (Cargo's
+/// `find_root` stops immediately) without parsing a large root manifest into a TOML DOM. Any
+/// other manifest (`# [workspace]`, `[package]` first, `[workspaces]`, `[[workspace]]`, trailing
+/// tokens) returns `false` and falls through to `blaze_toml::Document::parse_in`.
+fn starts_with_workspace_header(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    for raw_line in bytes.split(|&b| b == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let trimmed = trim_toml_ws_start(line);
+        if trimmed.is_empty() || trimmed.first() == Some(&b'#') {
+            continue;
+        }
+        let Some(after_open) = trimmed.strip_prefix(b"[") else { return false };
+        let after_open = trim_toml_ws_start(after_open);
+        let Some(after_key) = after_open.strip_prefix(b"workspace") else { return false };
+        let after_key = trim_toml_ws_start(after_key);
+        let Some(after_close) = after_key.strip_prefix(b"]") else { return false };
+        let trailing = trim_toml_ws_start(after_close);
+        return trailing.is_empty() || trailing.first() == Some(&b'#');
+    }
+    false
 }
 
 /// A folder beneath the start folder as a refusal shows it: `.` for the start folder.
 fn shown_dir(dir: &str) -> &str {
     if dir.is_empty() { "." } else { dir }
+}
+
+/// Format an ancestor manifest path (`../../Cargo.toml`) for `up` levels above the start folder.
+fn shown_above(up: u8, frame: &Frame) -> Owned {
+    let mut shown = blaze_own::String::with_capacity_in(usize::from(up) * 3 + MANIFEST.len(), frame);
+    for _ in 0..up {
+        shown.push_str("../");
+    }
+    shown.push_str(MANIFEST);
+    owned(shown.as_str())
 }
 
 /// Whether `text` (a manifest) has the key at `path` (`["workspace"]`, `["package",
@@ -528,16 +624,80 @@ fn has(text: &str, path: &[&str], frame: &Frame) -> Result<bool, PickError> {
     Ok(item.is_some())
 }
 
+/// Whether `doc` contains any Cargo workspace-inheritance entry (`*.workspace = true` under
+/// `[package]`, `[lints]`, or any dependency table including `[target.<cfg>.*-dependencies]`).
+/// When true, a standalone package without a workspace root falls through to `Layout` so the
+/// missing inheritance is refused with its manifest span.
+fn uses_workspace_inheritance(doc: &blaze_toml::Document<'_, &Frame>) -> bool {
+    let root = doc.root();
+    if let Some(pkg) = root.get("package")
+        && pkg.children().any(|child| child.is_table() && child.get("workspace").is_some())
+    {
+        return true;
+    }
+    if root.get("lints").is_some_and(|lints| lints.get("workspace").is_some()) {
+        return true;
+    }
+    let dep_table_inherits = |table: blaze_toml::Item<'_, '_, &Frame>| {
+        table.children().any(|dep| dep.is_table() && dep.get("workspace").is_some())
+    };
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if root.get(section).is_some_and(dep_table_inherits) {
+            return true;
+        }
+    }
+    if let Some(targets) = root.get("target") {
+        for target in targets.children() {
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if target.get(section).is_some_and(dep_table_inherits) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether any folder strictly above `package` beneath the start folder has a `Cargo.toml` with
+/// `[workspace]` (or a manifest that cannot be read as UTF-8/TOML, which `Layout` should refuse).
+fn workspace_beneath(cx: &Cx, here: &Dir<ReadWrite>, package: &str, frame: &Frame) -> Result<bool, CliError> {
+    let mut dir = up(package);
+    let mut bytes = Bytes::new_in(frame, "a parent manifest");
+    while let Some(at) = dir {
+        bytes.clear();
+        match here.read_all(cx, &Path::new(manifest_in(at, frame))?, &mut bytes) {
+            Ok(_) => {
+                if starts_with_workspace_header(bytes.as_slice()) {
+                    return Ok(true);
+                }
+                let Ok(text) = core::str::from_utf8(bytes.as_slice()) else { return Ok(true) };
+                match has(text, &["workspace"], frame) {
+                    Ok(true) | Err(_) => return Ok(true),
+                    Ok(false) => {}
+                }
+            }
+            Err(error) if matches!(error.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) => {}
+            Err(error) => return Err(error.into()),
+        }
+        dir = up(at);
+    }
+    Ok(false)
+}
+
 /// Whether a manifest beneath the start folder names the package's root: the package's own
 /// with `[workspace]` or `package.workspace`, or one in a folder above it (up to the start
 /// folder) with `[workspace]`. A manifest that is no TOML counts as naming it: the layout's
 /// refusal is about it. Read only when the layout refused, so its reads are not kept.
 fn root_beneath(cx: &Cx, here: &Dir<ReadWrite>, package: &str, frame: &Frame) -> Result<bool, CliError> {
     let mut dir = Some(package);
+    let mut bytes = Bytes::new_in(frame, "a manifest");
     while let Some(at) = dir {
-        let mut bytes = Bytes::new_in(frame, "a manifest");
-        match here.read_all(cx, &Path::new(manifest_in(at, frame)?)?, &mut bytes) {
+        bytes.clear();
+        match here.read_all(cx, &Path::new(manifest_in(at, frame))?, &mut bytes) {
             Ok(_) => {
+                if starts_with_workspace_header(bytes.as_slice()) {
+                    return Ok(true);
+                }
                 let Ok(text) = core::str::from_utf8(bytes.as_slice()) else { return Ok(true) };
                 let names = match has(text, &["workspace"], frame) {
                     Ok(workspace) => workspace || (at == package && has(text, &["package", "workspace"], frame).unwrap_or(true)),
@@ -547,7 +707,7 @@ fn root_beneath(cx: &Cx, here: &Dir<ReadWrite>, package: &str, frame: &Frame) ->
                     return Ok(true);
                 }
             }
-            Err(error) if error.kind == bstd::fs::FsKind::NotFound => {}
+            Err(error) if matches!(error.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) => {}
             Err(error) => return Err(error.into()),
         }
         dir = up(at);
@@ -571,25 +731,27 @@ fn above(cx: &Cx, fs: &Fs, package: &str, want: Want, frame: &Frame) -> Result<O
     let failed = |error: AncestorError| CliError::RunPackage(PickError::Above(error));
     let ancestors = fs.ancestors(cx).map_err(failed)?;
     let manifest = Path::new(MANIFEST)?;
+    let mut bytes = Bytes::new_in(frame, "a manifest above the start folder");
     for (at, ancestor) in ancestors.iter().enumerate() {
-        let mut bytes = Bytes::new_in(frame, "a manifest above the start folder");
-        match ancestor.read_all(cx, &manifest, &mut bytes) {
-            Ok(_) => {}
-            Err(error) if error.kind == AncestorKind::NotFound => continue,
-            Err(error) => return Err(failed(error)),
-        }
-        let mut shown: Vec<u8, &Frame> = Vec::new_in(frame);
-        for _ in 0..ancestor.up() {
-            shown.extend_from_slice(b"../");
-        }
-        shown.extend_from_slice(MANIFEST.as_bytes());
-        let shown = core::str::from_utf8(shown.as_slice()).map_err(|_| CliError::Text { what: "a path of `..` steps is UTF-8 (run_package.rs)" })?;
-        if want == Want::Manifest {
-            return Ok(Some(owned(shown)));
+        // `stat` first so missing ancestor manifests skip `Ancestor::read_all`'s error-path
+        // formatting allocation, and `Want::Manifest` skips reading the manifest bytes altogether.
+        match ancestor.stat(cx, &manifest).map_err(failed)? {
+            None => continue,
+            Some(meta) if !meta.dir && want == Want::Manifest => {
+                return Ok(Some(shown_above(ancestor.up(), frame)));
+            }
+            Some(_) => {
+                bytes.clear();
+                match ancestor.read_all(cx, &manifest, &mut bytes) {
+                    Ok(_) => {}
+                    Err(error) if error.kind == AncestorKind::NotFound => continue,
+                    Err(error) => return Err(failed(error)),
+                }
+            }
         }
         let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "a manifest above the start folder is not UTF-8 (run_package.rs)" })?;
         let doc = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, frame)
-            .map_err(|error| CliError::RunPackage(PickError::AboveToml { manifest: owned(shown), error }))?;
+            .map_err(|error| CliError::RunPackage(PickError::AboveToml { manifest: shown_above(ancestor.up(), frame), error }))?;
         let Some(workspace) = doc.root().get("workspace") else { continue };
         // The package's path beneath this folder: the folders on the way down to the start
         // folder, then `package`.
@@ -606,7 +768,7 @@ fn above(cx: &Cx, fs: &Fs, package: &str, want: Want, frame: &Frame) -> Result<O
         }
         let path = core::str::from_utf8(path.as_slice()).map_err(|_| CliError::Text { what: "folder names joined by `/` are UTF-8 (run_package.rs)" })?;
         if !left_out(&workspace, path) {
-            return Ok(Some(owned(shown)));
+            return Ok(Some(shown_above(ancestor.up(), frame)));
         }
     }
     Ok(None)
@@ -642,7 +804,7 @@ pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame
         let manifest = units.manifests.get(member.manifest.0 as usize).ok_or(CliError::Text { what: "the layout names a manifest it did not read (run_package.rs)" })?;
         let edition = match member.edition.blaze {
             Some(blaze) => blaze.manifest(),
-            None => kept(bstd::mem::format_in!(frame, "{}", member.edition.syntax).as_str(), frame)?,
+            None => &*bstd::mem::format_in!(frame, "{}", member.edition.syntax).into_bump_str(),
         };
         Ok(Program {
             package: kept(member.name.as_str(), frame)?,
@@ -652,6 +814,80 @@ pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame
             edition,
         })
     })
+}
+
+/// Fast-path classification of default `blaze test` selection from reading ONLY the root
+/// `Cargo.toml` (1 read, 0 `getattrlistbulk`, 0 member manifest reads), avoiding `with_layout()`.
+pub(crate) enum FastTestSelection<'f> {
+    /// Standalone single-package checkout (no `[workspace]`, has `[package]` with literal name
+    /// and no `*.workspace = true` inheritance): `total_members == 1` -> `CheckScope::Whole`.
+    Standalone(&'f str),
+    /// Virtual workspace without `workspace.default-members` (`[workspace]`, no `[package]`):
+    /// default selection ALWAYS covers every member (`packages.len() == total_members`) ->
+    /// `CheckScope::Whole`, and member package names come from `Standing`'s `CrateList`.
+    AllWorkspaceMembers,
+    /// Root-package workspace without `workspace.default-members` (`[workspace]` + `[package]`):
+    /// default selection is always `[package]`; total member count (1 vs >1) can be resolved from
+    /// a standing stored `CrateList` when root `Cargo.toml` has not moved.
+    RootPackage(&'f str),
+    /// Explicit `-p`, `--bin`, subdir `member`, `workspace.default-members`, or a manifest needing
+    /// full layout / error diagnostics.
+    NeedsMembers,
+}
+
+/// Attempts to classify `select` for `blaze test` from ONLY the root `Cargo.toml` without
+/// running `with_layout()` (0 directory listings, 0 member manifest reads). Returns
+/// [`FastTestSelection::NeedsMembers`] whenever member manifests, `default-members`, `--bin`,
+/// `-p`, subdir `member`, or full layout error diagnostics are needed.
+pub(crate) fn fast_test_selection<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame: &'f Frame) -> Result<FastTestSelection<'f>, CliError> {
+    if !select.test_packages.is_empty() || select.bin.is_some() || !select.member.is_empty() {
+        return Ok(FastTestSelection::NeedsMembers);
+    }
+    let cx = cx.span("blaze test: root manifest fast selection");
+    let mut bytes = Bytes::new_in(frame, "the root manifest");
+    match root.read_all(&cx, &Path::new(MANIFEST)?, &mut bytes) {
+        Ok(_) => {}
+        Err(error) if matches!(error.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) => {
+            return Ok(FastTestSelection::NeedsMembers);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let Ok(text) = core::str::from_utf8(bytes.as_slice()) else {
+        return Ok(FastTestSelection::NeedsMembers);
+    };
+    let Ok(doc) = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, frame) else {
+        return Ok(FastTestSelection::NeedsMembers);
+    };
+    let root_table = doc.root();
+    match (root_table.get("workspace"), root_table.get("package")) {
+        (None, Some(pkg)) => {
+            if let Some(name) = pkg.get("name").and_then(|item| item.as_str())
+                && !name.is_empty()
+                && !uses_workspace_inheritance(&doc)
+            {
+                return Ok(FastTestSelection::Standalone(kept(name, frame)?));
+            }
+            Ok(FastTestSelection::NeedsMembers)
+        }
+        (Some(ws), None) => {
+            if ws.get("default-members").is_some() {
+                return Ok(FastTestSelection::NeedsMembers);
+            }
+            Ok(FastTestSelection::AllWorkspaceMembers)
+        }
+        (Some(ws), Some(pkg)) => {
+            if ws.get("default-members").is_some() {
+                return Ok(FastTestSelection::NeedsMembers);
+            }
+            if let Some(name) = pkg.get("name").and_then(|item| item.as_str())
+                && !name.is_empty()
+            {
+                return Ok(FastTestSelection::RootPackage(kept(name, frame)?));
+            }
+            Ok(FastTestSelection::NeedsMembers)
+        }
+        (None, None) => Ok(FastTestSelection::NeedsMembers),
+    }
 }
 
 /// What `blaze test` selected in the workspace: the sorted, deduplicated package names, any
@@ -1150,6 +1386,121 @@ mod tests {
         // No manifest anywhere: refused by the start folder.
         started(&[("src/main.rs", "fn main() {}")], std::vec::Vec::new(), |cx, fs| {
             assert!(matches!(locate(cx, fs, &Checkout::Here, cx.frame()), Err(CliError::RunPackage(PickError::NoManifest { .. }))));
+        });
+    }
+
+    /// A standalone single-crate package (at start, from a subdir `src`, or nested in `sub`)
+    /// locates directly without walking `Layout`, while preserving exact Cargo workspace rules:
+    /// comments mentioning `[workspace]` do not short-circuit parent workspace discovery,
+    /// excluded standalone packages without inheritance succeed, excluded packages with
+    /// dependency/lints workspace inheritance still refuse via `Layout`, and `package.workspace`
+    /// resolves the named root beneath the start folder.
+    #[test]
+    fn standalone_package_locate_preserves_workspace_discovery_rules() {
+        let lone = package("solo");
+        let files = [("Cargo.toml", lone.as_str()), ("src/lib.rs", "pub fn f() {}")];
+        started(&files, std::vec::Vec::new(), |cx, fs| {
+            let here = locate(cx, fs, &Checkout::Here, cx.frame()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!((here.at, here.member), ("", ""));
+            let from_src = locate(cx, fs, &Checkout::Under(Path::new("src").expect("path")), cx.frame()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!((from_src.at, from_src.member), ("", ""));
+        });
+        // Standalone package nested beneath the start folder with no parent workspace.
+        let nested = [("sub/Cargo.toml", lone.as_str()), ("sub/src/lib.rs", "")];
+        started(&nested, std::vec::Vec::new(), |cx, fs| {
+            for given in ["sub", "sub/src"] {
+                let located = locate(cx, fs, &Checkout::Under(Path::new(given).expect("path")), cx.frame()).unwrap_or_else(|e| panic!("{given}: {e}"));
+                assert_eq!((located.at, located.member), ("sub", ""), "given {given}");
+            }
+        });
+        // A comment `# [workspace]` must NOT fool the `[workspace]` fast path: parent workspace
+        // above the start folder is still discovered.
+        let commented = std::format!("# [workspace]\n{lone}");
+        let claims = "[workspace]\nmembers = [\"solo\"]\n";
+        started(&[("Cargo.toml", commented.as_str()), ("src/lib.rs", "")], above_with("solo", claims), |cx, fs| {
+            assert_eq!(
+                locate(cx, fs, &Checkout::Here, cx.frame()).err().and_then(|e| match e {
+                    CliError::RunPackage(why) => Some(why),
+                    _ => None,
+                }),
+                Some(PickError::RootAboveStart { manifest: owned("../Cargo.toml"), package: owned(".") })
+            );
+        });
+        // Excluded by parent workspace above: standalone without inheritance succeeds.
+        let excludes = "[workspace]\nmembers = []\nexclude = [\"solo\"]\n";
+        started(&files, above_with("solo", excludes), |cx, fs| {
+            let located = locate(cx, fs, &Checkout::Here, cx.frame()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!((located.at, located.member), ("", ""));
+        });
+        // Excluded by parent workspace above, but inherits a dependency: falls through to `Layout`
+        // and refuses with `ManifestRefused`.
+        let dep_inherit = std::format!("{lone}\n[dependencies]\nfoo = {{ workspace = true }}\n");
+        started(&[("Cargo.toml", dep_inherit.as_str()), ("src/lib.rs", "")], above_with("solo", excludes), |cx, fs| {
+            assert!(matches!(locate(cx, fs, &Checkout::Here, cx.frame()), Err(CliError::Program(crate::ManifestRefused { .. }))));
+        });
+        // Explicit `package.workspace = ".."` beneath start resolves the named workspace root.
+        let explicit_ws = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\nworkspace = \"..\"\n";
+        let ws_files = [
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\"]\n"),
+            ("a/Cargo.toml", explicit_ws),
+            ("a/src/lib.rs", ""),
+        ];
+        started(&ws_files, std::vec::Vec::new(), |cx, fs| {
+            let located = locate(cx, fs, &Checkout::Under(Path::new("a").expect("path")), cx.frame()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!((located.at, located.member), ("", "a"));
+        });
+    }
+
+    #[test]
+    fn fast_test_selection_classifies_root_manifests_without_layout() {
+        // 1. Standalone package -> Standalone(name) for default select; NeedsMembers for -p/--bin/member.
+        let solo = package("solo");
+        checkout(&[("Cargo.toml", solo.as_str())], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast solo");
+            assert!(matches!(f, FastTestSelection::Standalone("solo")));
+            let with_p = fast_test_selection(cx, root, Select { test_packages: &["solo"], ..Select::NONE }, cx.frame()).expect("with -p");
+            assert!(matches!(with_p, FastTestSelection::NeedsMembers));
+            let with_bin = fast_test_selection(cx, root, Select { bin: Some("app"), ..Select::NONE }, cx.frame()).expect("with --bin");
+            assert!(matches!(with_bin, FastTestSelection::NeedsMembers));
+            let with_member = fast_test_selection(cx, root, Select { member: "sub", ..Select::NONE }, cx.frame()).expect("with member");
+            assert!(matches!(with_member, FastTestSelection::NeedsMembers));
+        });
+
+        // 2. Virtual workspace without default-members -> AllWorkspaceMembers; with default-members -> NeedsMembers.
+        checkout(&[("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n")], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast virtual");
+            assert!(matches!(f, FastTestSelection::AllWorkspaceMembers));
+        });
+        checkout(&[("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\ndefault-members = [\"crates/a\"]\n")], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast virtual defaults");
+            assert!(matches!(f, FastTestSelection::NeedsMembers));
+        });
+
+        // 3. Root-package workspace (ripgrep shape) -> RootPackage(name).
+        let rg_root = std::format!("{}\n[workspace]\nmembers = [\"crates/*\"]\n", package("ripgrep"));
+        checkout(&[("Cargo.toml", rg_root.as_str())], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast ripgrep");
+            assert!(matches!(f, FastTestSelection::RootPackage("ripgrep")));
+        });
+    }
+
+    #[test]
+    fn leading_workspace_header_fast_path_and_edge_cases() {
+        assert!(starts_with_workspace_header(b"[workspace]\nmembers = []\n"));
+        assert!(starts_with_workspace_header(b"\xEF\xBB\xBF\n# header comment\n  \t[ workspace ] # root\r\nmembers = []\r\n"));
+        assert!(!starts_with_workspace_header(b"# [workspace]\n[package]\nname = \"a\"\n"));
+        assert!(!starts_with_workspace_header(b"[package]\nname = \"a\"\n[workspace]\n"));
+        assert!(!starts_with_workspace_header(b"[workspaces]\n"));
+        assert!(!starts_with_workspace_header(b"[[workspace]]\n"));
+        assert!(!starts_with_workspace_header(b"[workspace] trailing\n"));
+        assert!(!starts_with_workspace_header(b"[package]\ndesc = \"\"\"\n[workspace]\n\"\"\"\n"));
+
+        // Leading BOM + comments + `[workspace]` locates directly without scanning parent dirs.
+        let bom_ws = "\u{FEFF}# leading comment\n\n[ workspace ] # root\nmembers = [\"a\"]\n";
+        let files = [("Cargo.toml", bom_ws), ("a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")];
+        started(&files, above_with("child", "[workspace]\nmembers = [\"child\"]\n"), |cx, fs| {
+            let located = locate(cx, fs, &Checkout::Here, cx.frame()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!((located.at, located.member), ("", ""));
         });
     }
 }

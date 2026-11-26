@@ -1,0 +1,23 @@
+[package]
+name = "blaze-preview"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+blaze-data.workspace = true
+blaze-html.workspace = true
+blaze-json.workspace = true
+blaze-toml.workspace = true
+blaze-sniff.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

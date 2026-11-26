@@ -13,8 +13,8 @@ use core::mem::offset_of;
 
 use crate::body::{BodyRef, Span, Table};
 use crate::code::{
-    BlockWords, CalleeWords, CaseWords, ConstWords, LoanWords, LocalWords, OperandWords, PairWords,
-    PlaceWords, StmtWords, SubsetWords, TyWords,
+    AsmOpWords, AsmPieceWords, AsmWords, BlockWords, CalleeWords, CaseWords, ConstWords, LoanWords,
+    LocalWords, OperandWords, PairWords, PlaceWords, StmtWords, SubsetWords, TyWords,
 };
 
 /// What the rows of a body record mean: raised whenever a number in [`crate::code`] changes
@@ -24,7 +24,10 @@ use crate::code::{
 /// (`tys`, `ty_lists`) after `known`; the statement tags 24 (`SET_DISCRIMINANT`) and 25
 /// (`DEINIT`) are new.
 /// 3: the type tag 31 (`FOREIGN`, an extern type: `PNode::Foreign`) is new.
-pub const VERSION: u32 = 3;
+/// 4: the statement tag 51 (`TAIL_CALL`) and inline assembly tables (`asms`, `asm_pieces`,
+/// `asm_ops`) are new.
+/// 5: the statement tag 52 (`CANCELLED`) is new.
+pub const VERSION: u32 = 5;
 
 blaze_format_core::record! {
     /// A body record's root: the version, the overlay's bases, then one slice per table of
@@ -54,6 +57,9 @@ blaze_format_core::record! {
         pub known: Slice<PairWords>,
         pub tys: Slice<TyWords>,
         pub ty_lists: Slice<u32>,
+        pub asms: Slice<AsmWords>,
+        pub asm_pieces: Slice<AsmPieceWords>,
+        pub asm_ops: Slice<AsmOpWords>,
     }
 }
 
@@ -128,6 +134,9 @@ pub(crate) fn write_root<A: Allocator>(out: &mut Writer<Own<A>>, body: &BodyRef<
     let known = Placed::push(out,body.known);
     let tys = Placed::push(out,body.tys);
     let ty_lists = Placed::push(out,body.ty_lists);
+    let asms = Placed::push(out,body.asms);
+    let asm_pieces = Placed::push(out,body.asm_pieces);
+    let asm_ops = Placed::push(out,body.asm_ops);
     let at = out.next::<BodyRoot>();
     let root = BodyRoot {
         version: VERSION,
@@ -153,6 +162,9 @@ pub(crate) fn write_root<A: Allocator>(out: &mut Writer<Own<A>>, body: &BodyRef<
         known: reach(known, at, offset_of!(BodyRoot, known), Table::Known)?,
         tys: reach(tys, at, offset_of!(BodyRoot, tys), Table::Types)?,
         ty_lists: reach(ty_lists, at, offset_of!(BodyRoot, ty_lists), Table::TyLists)?,
+        asms: reach(asms, at, offset_of!(BodyRoot, asms), Table::Asms)?,
+        asm_pieces: reach(asm_pieces, at, offset_of!(BodyRoot, asm_pieces), Table::AsmPieces)?,
+        asm_ops: reach(asm_ops, at, offset_of!(BodyRoot, asm_ops), Table::AsmOps)?,
     };
     let written = out.push(&root);
     debug_assert_eq!(written, at);
@@ -200,5 +212,8 @@ pub(crate) fn body_of<'b>(root: &'b BodyRoot, buffer: &'b [u8]) -> Result<BodyRe
         list_base: root.list_base,
         tys: root.tys.follow(buffer)?,
         ty_lists: root.ty_lists.follow(buffer)?,
+        asms: root.asms.follow(buffer)?,
+        asm_pieces: root.asm_pieces.follow(buffer)?,
+        asm_ops: root.asm_ops.follow(buffer)?,
     })
 }

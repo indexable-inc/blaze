@@ -30,7 +30,10 @@
 //! bytes, an enum's variants a run of rows, the crate root a view. Nothing is decoded, kept or
 //! counted per module: a fresh process answers its first lookup in the time of the searches.
 
+use core::alloc::Allocator;
 use core::cell::OnceCell;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use blaze_format::FormatError;
 use blaze_hash::HashMap;
@@ -565,22 +568,118 @@ impl Head {
     }
 }
 
-/// A names record checked whole, once in this process: the proof every reader takes (rule 74).
-/// Made only by [`Verified::check`]; a `Copy` of a pointer and the header.
+/// How a names record's body sections are verified (rule 74).
 ///
-/// The check is O(the record): the header, each table's key order, every row's ranges, every
-/// module's `ModuleScope` record and the `CrateRoot` record by their own checks
-/// ([`ScopeView::read`], [`CrateRootView::read`]), each variant name as UTF-8. The command makes
-/// it where the bytes enter the process (front_load.rs's one call, or a store fetch whose digest
-/// was checked: the store's `Checked` proof, once it lands, plus this form check), and keeps it
-/// as long as the bytes.
+/// - [`CheckMode::Full`]: [`Verified::check`] verified every module scope, enum variant, crate
+///   root, and failed call eagerly.
+/// - [`CheckMode::Lazy`]: [`Verified::check_header`] verified the header, all section bounds, and
+///   the single `CrateRoot` in O(1); module scopes are verified on first access via
+///   [`ScopeView::read`] and recorded in the optional lock-free bitmap, and enum variants / failed
+///   calls are verified on access.
+#[derive(Clone, Copy, Debug)]
+enum CheckMode<'m> {
+    Full,
+    Lazy(&'m [AtomicU64]),
+}
+
+/// Lock-free per-module verification bitmap for a lazy [`Verified`] names record.
+///
+/// Constructible only via [`Verified::new_module_cache`] (all bits zero) and tied to the immutable
+/// record bytes' lifetime `'m`; bits are set solely inside [`NamesRecord::scope`] after
+/// [`ScopeView::read`] succeeds and proves `view.module() == module`.
+#[derive(Debug)]
+pub struct VerifiedModules<'m, A: Allocator> {
+    words: blaze_own::Vec<AtomicU64, A>,
+    bytes_addr: usize,
+    bytes_len: usize,
+    key: CrateItemKey,
+    _borrow: PhantomData<&'m [u8]>,
+}
+
+/// A names record checked whole ([`Verified::check`]) or header-checked for on-demand verification
+/// ([`Verified::check_header`]): the proof every reader takes (rule 74). A `Copy` of a pointer,
+/// the header, and its verification mode.
 #[derive(Clone, Copy, Debug)]
 pub struct Verified<'m> {
     bytes: &'m [u8],
     head: Head,
+    mode: CheckMode<'m>,
 }
 
 impl<'m> Verified<'m> {
+    /// Checks the header, alignment, all section bounds, and the crate root record in O(1),
+    /// deferring per-module `ScopeView::read`, enum variant UTF-8, and failed-call checks until
+    /// each accessed entry is read through [`NamesRecord`].
+    pub fn check_header(bytes: &'m [u8]) -> Result<Verified<'m>, NamesRecordError> {
+        let head = Head::read(bytes)?;
+        let root_bytes = head
+            .root_at
+            .checked_add(head.root_len)
+            .and_then(|end| bytes.get(head.root_at..end))
+            .ok_or(NamesRecordError::Short { what: "crate root", at: head.root_at })?;
+        CrateRootView::read(root_bytes).map_err(NamesRecordError::Root)?;
+        Ok(Verified { bytes, head, mode: CheckMode::Lazy(&[]) })
+    }
+
+    /// Allocates a zeroed lock-free per-module verification bitmap for this proof (empty for a
+    /// `Full` proof). Bind it with [`Verified::bind_cache`] so each lazily verified module runs
+    /// [`ScopeView::read`] at most once across all workers.
+    pub fn new_module_cache<A: Allocator>(self, alloc: A) -> VerifiedModules<'m, A> {
+        let count = match self.mode {
+            CheckMode::Full => 0,
+            CheckMode::Lazy(_) => self.head.modules.div_ceil(64),
+        };
+        let mut words = blaze_own::Vec::with_capacity_in(count, alloc);
+        words.resize_with(count, || AtomicU64::new(0));
+        VerifiedModules {
+            words,
+            bytes_addr: self.bytes.as_ptr().addr(),
+            bytes_len: self.bytes.len(),
+            key: self.head.key,
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Attaches `cache` (made by [`Verified::new_module_cache`] for this same record) to a lazy
+    /// proof. Returns `self` unchanged if `self` is already `Full` or if `cache` is for another
+    /// record.
+    pub fn bind_cache<'s, A: Allocator>(self, cache: &'s VerifiedModules<'m, A>) -> Verified<'s>
+    where
+        'm: 's,
+    {
+        match self.mode {
+            CheckMode::Full => Verified { bytes: self.bytes, head: self.head, mode: CheckMode::Full },
+            CheckMode::Lazy(_)
+                if cache.bytes_addr == self.bytes.as_ptr().addr()
+                    && cache.bytes_len == self.bytes.len()
+                    && cache.key == self.head.key =>
+            {
+                Verified { bytes: self.bytes, head: self.head, mode: CheckMode::Lazy(cache.words.as_slice()) }
+            }
+            CheckMode::Lazy(prev) => Verified { bytes: self.bytes, head: self.head, mode: CheckMode::Lazy(prev) },
+        }
+    }
+
+    /// Allocates and attaches a zeroed per-module verification bitmap in `bump` when `self` is a
+    /// lazy proof without a cache yet (reclaimed in bulk when `bump` drops).
+    pub fn bind_bump_cache(self, bump: Bump<'m>) -> Verified<'m> {
+        match self.mode {
+            CheckMode::Lazy([]) if self.head.modules > 0 => {
+                let count = self.head.modules.div_ceil(64);
+                let mut words = blaze_own::Vec::with_capacity_in(count, bump);
+                words.resize_with(count, || AtomicU64::new(0));
+                let slice: &'m [AtomicU64] = words.into_bump_slice();
+                Verified { bytes: self.bytes, head: self.head, mode: CheckMode::Lazy(slice) }
+            }
+            _ => self,
+        }
+    }
+
+    /// Whether this proof is lazy and has no per-module verification bitmap attached yet.
+    pub fn needs_module_cache(self) -> bool {
+        matches!(self.mode, CheckMode::Lazy([])) && self.head.modules > 0
+    }
+
     /// `bytes` checked whole as a names record.
     pub fn check(bytes: &'m [u8]) -> Result<Verified<'m>, NamesRecordError> {
         let head = Head::read(bytes)?;
@@ -671,7 +770,7 @@ impl<'m> Verified<'m> {
                 _ => return Err(NamesRecordError::FailedFlags { call }),
             }
         }
-        Ok(Verified { bytes, head })
+        Ok(Verified { bytes, head, mode: CheckMode::Full })
     }
 
     /// The crate the record is of.
@@ -685,18 +784,19 @@ impl<'m> Verified<'m> {
     }
 }
 
-/// One crate's names record, read in place: a `Copy` of the proof's pointer and header. Every
-/// answer is a binary search of the bytes; nothing is decoded or kept.
+/// One crate's names record, read in place: a `Copy` of the proof's pointer, header, and
+/// verification mode. Every answer is a binary search of the bytes; nothing is decoded or kept.
 #[derive(Clone, Copy, Debug)]
 pub struct NamesRecord<'m> {
     bytes: &'m [u8],
     head: Head,
+    mode: CheckMode<'m>,
 }
 
 impl<'m> NamesRecord<'m> {
     /// The record the proof is of: O(1), no allocation, nothing read.
     pub fn open(proof: Verified<'m>) -> NamesRecord<'m> {
-        NamesRecord { bytes: proof.bytes, head: proof.head }
+        NamesRecord { bytes: proof.bytes, head: proof.head, mode: proof.mode }
     }
 
     pub fn key(&self) -> CrateItemKey {
@@ -733,16 +833,38 @@ impl<'m> NamesRecord<'m> {
     /// The module's solved scope, viewed in place; `None` for no such module or a failed one.
     pub fn scope(&self, module: ItemKey) -> Option<ScopeView<'m>> {
         let bytes: &'m [u8] = self.bytes;
-        let row = self.row(module)?;
+        let idx = self.find(HEADER, ROW, self.head.modules, module)?;
+        let row = HEADER + idx * ROW;
         let at = le32(bytes, row + 32);
         if at == NONE {
             return None;
         }
-        let start = self.head.blob_at + at as usize;
-        let part = &bytes[start..start + le32(bytes, row + 36) as usize];
-        // SAFETY: `Verified::check`, the one maker of the proof this record was opened from,
-        // ran `ScopeView::read` on exactly these bytes: the same row of the same immutable
-        // `'m` bytes gives the same range at the same address, and `read` returned `Ok`.
+        let rel = usize::try_from(at).ok()?;
+        let len = usize::try_from(le32(bytes, row + 36)).ok()?;
+        if rel.checked_add(len).is_none_or(|end| end > self.head.blob_len) {
+            return None;
+        }
+        let start = self.head.blob_at.checked_add(rel)?;
+        let part = bytes.get(start..start.checked_add(len)?)?;
+        if let CheckMode::Lazy(verified_modules) = self.mode {
+            let word_idx = idx >> 6;
+            let bit = 1u64 << (idx & 63);
+            let already = verified_modules.get(word_idx).is_some_and(|w| (w.load(Ordering::Acquire) & bit) != 0);
+            if !already {
+                let view = ScopeView::read(part).ok()?;
+                if view.module() != module {
+                    return None;
+                }
+                if let Some(w) = verified_modules.get(word_idx) {
+                    w.fetch_or(bit, Ordering::Release);
+                }
+                return Some(view);
+            }
+        }
+        // SAFETY: Either `Verified::check` ran `ScopeView::read` on these exact immutable `'m`
+        // bytes, or `CheckMode::Lazy` ran `ScopeView::read(part)` (and checked
+        // `view.module() == module`) before setting `verified_modules[idx]` with Release ordering,
+        // paired with the Acquire load above.
         Some(unsafe { ScopeView::trusted(part) })
     }
 
@@ -754,9 +876,14 @@ impl<'m> NamesRecord<'m> {
         if first == NONE {
             return None;
         }
+        let first = usize::try_from(first).ok()?;
         let len = usize::from(le16(bytes, row + 44));
-        let start = self.head.chains_at + first as usize * KEY;
-        let (words, _) = bytes[start..start + len * KEY].as_chunks::<KEY>();
+        if first.checked_add(len).is_none_or(|end| end > self.head.chain_keys) {
+            return None;
+        }
+        let start = self.head.chains_at.checked_add(first.checked_mul(KEY)?)?;
+        let slice = bytes.get(start..start.checked_add(len.checked_mul(KEY)?)?)?;
+        let (words, _) = slice.as_chunks::<KEY>();
         Some(ItemKey::slice_of(words))
     }
 
@@ -785,31 +912,45 @@ impl<'m> NamesRecord<'m> {
         'm: 'b,
     {
         let bytes: &'m [u8] = self.bytes;
-        let s = &bytes[self.head.failed_at..self.head.failed_at + self.head.failed_len];
-        let count = le32(s, 0) as usize;
+        let s = self
+            .head
+            .failed_at
+            .checked_add(self.head.failed_len)
+            .and_then(|end| bytes.get(self.head.failed_at..end))
+            .ok_or(NamesRecordError::Short { what: "failed calls", at: self.head.failed_at })?;
+        let count = usize::try_from(le32(s, 0)).unwrap_or(usize::MAX);
         let Some(i) = self.find(self.head.failed_at + ALIGN, FAILED_ROW, count, call) else { return Ok(None) };
         let row = ALIGN + i * FAILED_ROW;
         let texts_at = ALIGN + count * FAILED_ROW;
-        let text = |at: usize, len: usize| -> &'m str {
-            let start = texts_at + at;
-            // SAFETY: `Verified::check`, the one maker of this record's proof, checked this
-            // row's path, file and item-name ranges inside the section and their bytes UTF-8
-            // (`str::from_utf8`), in the same immutable `'m` bytes.
-            unsafe { core::str::from_utf8_unchecked(&s[start..start + len]) }
+        let text = |what: &'static str, at: usize, len: usize| -> Result<&'m str, NamesRecordError> {
+            let slice = texts_at
+                .checked_add(at)
+                .and_then(|start| Some(start..start.checked_add(len)?))
+                .and_then(|r| s.get(r))
+                .ok_or(NamesRecordError::Short { what, at: self.head.failed_at + row })?;
+            core::str::from_utf8(slice).map_err(|_| NamesRecordError::FailedPath { call })
         };
-        let path = text(le32(s, row + 32) as usize, le32(s, row + 36) as usize);
-        let file = text(le32(s, row + 52) as usize, le32(s, row + 56) as usize);
-        let on = text(le32(s, row + 52) as usize + le32(s, row + 56) as usize, le32(s, row + 60) as usize);
-        let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
-        let record = &s[record_at..record_at + record_len];
+        let path_at = usize::try_from(le32(s, row + 32)).unwrap_or(usize::MAX);
+        let path_len = usize::try_from(le32(s, row + 36)).unwrap_or(usize::MAX);
+        let file_at = usize::try_from(le32(s, row + 52)).unwrap_or(usize::MAX);
+        let file_len = usize::try_from(le32(s, row + 56)).unwrap_or(usize::MAX);
+        let on_len = usize::try_from(le32(s, row + 60)).unwrap_or(usize::MAX);
+        let on_at = file_at.checked_add(file_len).ok_or(NamesRecordError::Short { what: "a failed derive's item name", at: self.head.failed_at + row })?;
+        let path = text("a failed call's path", path_at, path_len)?;
+        let file = text("a failed call's file", file_at, file_len)?;
+        let on = text("a failed derive's item name", on_at, on_len)?;
+        let record_at = usize::try_from(le32(s, row + 40)).unwrap_or(usize::MAX);
+        let record_len = usize::try_from(le32(s, row + 44)).unwrap_or(usize::MAX);
+        let record = record_at
+            .checked_add(record_len)
+            .and_then(|end| s.get(record_at..end))
+            .ok_or(NamesRecordError::Short { what: "a failed call's record", at: self.head.failed_at + row })?;
         let (implicit, shape, kind) = row_flags(le32(s, row + 48));
         let (Some(shape), Some(kind)) = (shape, kind) else { return Err(NamesRecordError::FailedFlags { call }) };
         let why = match kind {
             RefusalKind::Failed => CallRefusal::Failed(blaze_expand::Failed::read_record(record, alloc).map_err(|error| NamesRecordError::FailedRecord { call, error })?),
             kind => {
-                // SAFETY: `Verified::check` checked the words of a row of any kind but
-                // `Failed` UTF-8, in the same immutable `'m` bytes.
-                let words: &'m str = unsafe { core::str::from_utf8_unchecked(record) };
+                let words: &'m str = core::str::from_utf8(record).map_err(|_| NamesRecordError::FailedWords { call })?;
                 CallRefusal::Refused { kind, words }
             }
         };
@@ -820,8 +961,8 @@ impl<'m> NamesRecord<'m> {
     pub fn crate_root(&self) -> CrateRootView<'m> {
         let bytes: &'m [u8] = self.bytes;
         let part = &bytes[self.head.root_at..self.head.root_at + self.head.root_len];
-        // SAFETY: `Verified::check` ran `CrateRootView::read` on exactly these bytes of the
-        // same immutable `'m` record, and it returned `Ok`.
+        // SAFETY: Both `Verified::check` and `Verified::check_header` ran `CrateRootView::read`
+        // on exactly these bytes of the same immutable `'m` record, and it returned `Ok`.
         unsafe { CrateRootView::trusted(part) }
     }
 
@@ -829,12 +970,31 @@ impl<'m> NamesRecord<'m> {
     pub fn variants(&self, owner: ItemKey) -> Option<Variants<'m>> {
         let i = self.find(self.head.enums_at, ENUM_ROW, self.head.enums, owner)?;
         let row = self.head.enums_at + i * ENUM_ROW;
-        let first = le32(self.bytes, row + 32) as usize;
+        let first = usize::try_from(le32(self.bytes, row + 32)).ok()?;
+        let count = usize::try_from(le32(self.bytes, row + 36)).ok()?;
+        let end_variants = first.checked_add(count)?;
+        if end_variants > self.head.variants {
+            return None;
+        }
+        if matches!(self.mode, CheckMode::Lazy(_)) {
+            let strings_len = self.head.root_at.checked_sub(self.head.strings_at)?;
+            for k in first..end_variants {
+                let v = self.head.variants_at.checked_add(k.checked_mul(VARIANT_ROW)?)?;
+                let at = usize::try_from(le32(self.bytes, v + 32)).ok()?;
+                let len = usize::try_from(le32(self.bytes, v + 36)).ok()?;
+                if at.checked_add(len).is_none_or(|end| end > strings_len) {
+                    return None;
+                }
+                let start = self.head.strings_at.checked_add(at)?;
+                let name_slice = self.bytes.get(start..start.checked_add(len)?)?;
+                core::str::from_utf8(name_slice).ok()?;
+            }
+        }
         Some(Variants {
             bytes: self.bytes,
             strings_at: self.head.strings_at,
-            rows_at: self.head.variants_at + first * VARIANT_ROW,
-            count: le32(self.bytes, row + 36) as usize,
+            rows_at: self.head.variants_at.checked_add(first.checked_mul(VARIANT_ROW)?)?,
+            count,
         })
     }
 }
@@ -911,6 +1071,12 @@ pub trait LoadNames<'a> {
     /// The names record of the crate at `krate` (an index of the keys the reader was given), or
     /// `None` when none is kept.
     fn load(&self, krate: usize) -> Option<&'a [u8]>;
+
+    /// An already-verified [`Verified`] proof for `krate` (rule 74), avoiding redundant
+    /// `Verified::check` scans when the caller verified the record once at load time.
+    fn load_verified(&self, _krate: usize) -> Option<Verified<'a>> {
+        None
+    }
 }
 
 /// What a reader opened so far: crates and their records' bytes. Nothing else is counted, as
@@ -960,6 +1126,9 @@ impl<'a, L: LoadNames<'a>> RecordNames<'a, L> {
     /// crate.
     pub fn record(&self, krate: usize) -> Option<NamesRecord<'a>> {
         let proof = self.proofs.get(krate)?.get_or_init(|| {
+            if let Some(proof) = self.load.load_verified(krate) {
+                return Some(proof);
+            }
             let bytes = self.load.load(krate)?;
             Some(Verified::check(bytes).unwrap_or_else(|e| panic!("the names record of crate {:?} does not check: {e:?}", self.keys[krate])))
         });

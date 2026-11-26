@@ -175,11 +175,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             }
                             None => None,
                         },
-                        // Calling through `unsafe extern "C" fn(A, ...)` needs the variable
-                        // arguments' promotions and the variadic call ABI on a fn pointer
-                        // callee (rules/c_variadic.rs reads them from a fn item's signature).
-                        TyView::FnPtr(_, h) if h.c_variadic => {
-                            return Err(crate::error::CheckError::Unported("a call through a C-variadic fn pointer").into());
+                        // Calling through `unsafe extern "C" fn(A, ...)`: extend the formal inputs
+                        // with one fresh variable per extra argument; `check_c_variadic_args` enforces
+                        // C's default argument promotions (E0617) after all arguments are typed.
+                        TyView::FnPtr(l, h) if h.c_variadic => {
+                            let (inputs, output) = self.fn_ptr_sig(l)?;
+                            let inputs = self.c_variadic_extra_inputs(inputs, arg_ids.len())?;
+                            Some((inputs, output))
                         }
                         TyView::FnPtr(l, _) => Some(self.fn_ptr_sig(l)?),
                         TyView::Closure(_, sig) | TyView::ClosureOf { sig, .. } => match self.view(sig) {
@@ -236,7 +238,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(Flow::Wait);
                 }
                 // Every argument is typed: the `...` ones are held to C's promotions (E0617).
-                self.check_c_variadic_args(e, arg_ids)?;
+                self.check_c_variadic_args(e, callee, arg_ids)?;
                 // The arguments at legacy const generic positions give the callee's constants.
                 self.bind_legacy_consts(e, callee, arg_ids)?;
                 Ok(Flow::Done(f.u))

@@ -1,3 +1,7 @@
+use core::alloc::Allocator;
+
+use blaze_own::Vec as OwnVec;
+
 use crate::Weight;
 
 /// A Z-set: (value, weight) consolidated (sorted by value, no zero weights).
@@ -6,24 +10,18 @@ use crate::Weight;
 /// any other push leaves it to [`ZSet::consolidate`]. Reading an unconsolidated set
 /// ([`ZSet::iter`], [`ZSet::len`], [`ZSet::is_empty`]) panics: its rows would not be the set.
 #[derive(Debug)]
-pub struct ZSet<T> {
-    rows: Vec<(T, Weight)>,
+pub struct ZSet<T, A: Allocator> {
+    rows: OwnVec<(T, Weight), A>,
     consolidated: bool,
 }
 
-impl<T: Ord + Clone> Default for ZSet<T> {
-    fn default() -> Self {
-        ZSet::new()
-    }
-}
-
-impl<T: Ord + Clone> ZSet<T> {
-    pub fn new() -> Self {
-        ZSet { rows: Vec::new(), consolidated: true } // alloc: setup: an empty buffer, grown once and kept
+impl<T: Ord + Clone, A: Allocator> ZSet<T, A> {
+    pub fn new_in(alloc: A) -> Self {
+        ZSet { rows: OwnVec::new_in(alloc), consolidated: true }
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        ZSet { rows: Vec::with_capacity(capacity), consolidated: true }
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        ZSet { rows: OwnVec::with_capacity_in(capacity, alloc), consolidated: true }
     }
 
     pub fn push(&mut self, t: T, w: Weight) {
@@ -102,7 +100,7 @@ impl<T: Ord + Clone> ZSet<T> {
     }
 
     /// Adds `other`'s rows to this set's (DBSP's `+`); consolidate after.
-    pub fn add(&mut self, other: &ZSet<T>) {
+    pub fn add<B: Allocator>(&mut self, other: &ZSet<T, B>) {
         for (t, w) in other.iter() {
             // clone: the values of the other set's rows, which it keeps
             self.push(t.clone(), w);

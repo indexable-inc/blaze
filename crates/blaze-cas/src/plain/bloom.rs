@@ -39,6 +39,7 @@ use blaze_mem::{Kept, Tag as MemTag};
 use blaze_own::{Arc, Share, Vec};
 
 use super::format::{Root, Segment};
+use super::par::Par;
 
 /// Shared store-tagged allocator for owned in-memory Bloom buffers (`Send + Sync`, zero `Global`).
 pub(crate) const BLOOM_ALLOC: Kept = Kept(MemTag::Store);
@@ -172,6 +173,23 @@ pub(crate) fn probe_bytes(body: &[u8], blocks: u32, key: &[u8; 32]) -> bool {
     true
 }
 
+/// Minimum key count before parallel block-partitioned Bloom construction engages.
+const PAR_BLOOM_MIN_KEYS: usize = 4096;
+
+/// Pre-hashed `(bits_hash, block_index)` record produced during Stage 1 of [`BloomBuilder::build_par`].
+#[derive(Clone, Copy)]
+struct HashedKey {
+    bits: u64,
+    block: u32,
+}
+
+/// Per-input-stripe bucketed [`HashedKey`] table partitioned by 128B-aligned Bloom block range.
+/// Backed by [`BLOOM_ALLOC`] (`Send + Sync`) so workers never touch a non-`Sync` caller frame.
+struct StripeBuckets {
+    items: Vec<HashedKey, Kept>,
+    starts: Vec<u32, Kept>,
+}
+
 /// Builder for a single segment's blocked Bloom filter.
 pub(crate) struct BloomBuilder {
     blocks: u32,
@@ -226,6 +244,144 @@ impl BloomBuilder {
             at = at.saturating_add(ENTRY);
         }
         builder.finish(digest)
+    }
+
+    /// Parallel zero-contention twin of serial [`BloomBuilder`] over a slice of 32-byte keys.
+    ///
+    /// Below `4096` keys or when `par.workers() <= 1`, delegates directly to serial
+    /// [`BloomBuilder`]. Above `4096` keys, partitions the Bloom body into 128B-aligned disjoint
+    /// block ranges (at least `2 × 64B` blocks per partition — zero atomics and zero cache-line
+    /// bouncing across 128 cores), hashes and buckets keys in parallel via `par.map_range`, and
+    /// sets bits per partition via `par.for_each_mut_chunks`, producing 100% byte-identical Bloom
+    /// bytes and CRC-32C to serial [`BloomBuilder`] (Rule 25).
+    #[allow(dead_code, reason = "wired into plain/core.rs right after SOTA-v10 merges")]
+    pub(crate) fn build_par<P: Par, A: core::alloc::Allocator + Copy>(
+        keys: &[[u8; 32]],
+        digest: &ContentId,
+        par: &P,
+        alloc: A,
+    ) -> Vec<u8, Kept> {
+        BloomBuilder::build_par_from(
+            keys.len(),
+            |i| keys.get(i).copied().unwrap_or([0u8; 32]),
+            BITS_PER_KEY,
+            digest,
+            par,
+            alloc,
+        )
+    }
+
+    /// Parallel zero-contention Bloom builder with caller-chosen `bits_per_key` and random-access
+    /// `key_at` lookup (avoids copying keys out of `&[Entry]` during segment commits).
+    #[allow(dead_code, reason = "wired into plain/core.rs right after SOTA-v10 merges")]
+    pub(crate) fn build_par_from<P: Par, A: core::alloc::Allocator + Copy>(
+        count: usize,
+        key_at: impl Fn(usize) -> [u8; 32] + Sync,
+        bits_per_key: u64,
+        digest: &ContentId,
+        par: &P,
+        alloc: A,
+    ) -> Vec<u8, Kept> {
+        let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
+        let blocks = blocks_for_bits(count_u32, bits_per_key);
+        let blocks_usize = usize::try_from(blocks).unwrap_or(0);
+        if count < PAR_BLOOM_MIN_KEYS || par.workers() <= 1 || blocks_usize < 4 {
+            let mut builder = BloomBuilder::with_bits_per_key(count_u32, bits_per_key);
+            for i in 0..count {
+                let key = key_at(i);
+                builder.insert(&key);
+            }
+            return builder.finish(digest);
+        }
+
+        // Partition blocks into 128B-aligned disjoint ranges (even block count >= 2 per partition).
+        let target_parts = par.workers().saturating_mul(2).clamp(2, 256);
+        let part_blocks = blocks_usize.div_ceil(target_parts).max(2).next_multiple_of(2);
+        let part_bytes = part_blocks.saturating_mul(BLOCK_BYTES);
+        let num_parts = blocks_usize.div_ceil(part_blocks);
+        if num_parts <= 1 {
+            let mut builder = BloomBuilder::with_bits_per_key(count_u32, bits_per_key);
+            for i in 0..count {
+                let key = key_at(i);
+                builder.insert(&key);
+            }
+            return builder.finish(digest);
+        }
+
+        // Stage 1: hash keys and radix-bucket into `num_parts` block partitions in parallel.
+        let key_grain = count.div_ceil(par.workers().saturating_mul(2)).max(1024);
+        let stripes = par.map_range(count, key_grain, alloc, |lo, hi| {
+            let n = hi.saturating_sub(lo);
+            let mut tmp: Vec<HashedKey, Kept> = Vec::with_capacity_in(n, BLOOM_ALLOC);
+            let mut counts: Vec<u32, Kept> = Vec::with_capacity_in(num_parts, BLOOM_ALLOC);
+            counts.resize(num_parts, 0);
+            for i in lo..hi {
+                let key = key_at(i);
+                let (a, b) = key_hashes(&key);
+                let blk = block_index(a, blocks);
+                let part = blk / part_blocks;
+                if let Some(c) = counts.get_mut(part) {
+                    *c = c.saturating_add(1);
+                }
+                tmp.push(HashedKey { bits: b, block: u32::try_from(blk).unwrap_or(0) });
+            }
+            let mut starts: Vec<u32, Kept> = Vec::with_capacity_in(num_parts.saturating_add(1), BLOOM_ALLOC);
+            let mut cursor: Vec<u32, Kept> = Vec::with_capacity_in(num_parts, BLOOM_ALLOC);
+            let mut acc = 0u32;
+            for &c in counts.iter() {
+                starts.push(acc);
+                cursor.push(acc);
+                acc = acc.saturating_add(c);
+            }
+            starts.push(acc);
+
+            let mut items: Vec<HashedKey, Kept> = Vec::with_capacity_in(n, BLOOM_ALLOC);
+            items.resize(n, HashedKey { bits: 0, block: 0 });
+            for hk in tmp.into_iter() {
+                let part = usize::try_from(hk.block).unwrap_or(0) / part_blocks;
+                if let Some(pos_ref) = cursor.get_mut(part) {
+                    let pos = usize::try_from(*pos_ref).unwrap_or(0);
+                    *pos_ref = pos_ref.saturating_add(1);
+                    if let Some(slot) = items.get_mut(pos) {
+                        *slot = hk;
+                    }
+                }
+            }
+            StripeBuckets { items, starts }
+        });
+
+        // Stage 2: set bits independently per 128B-aligned block partition (zero atomics).
+        let byte_len = blocks_usize.saturating_mul(BLOCK_BYTES);
+        let mut body = Vec::with_capacity_in(byte_len, BLOOM_ALLOC);
+        body.resize(byte_len, 0);
+        let stripes_ref = stripes.as_slice();
+        par.for_each_mut_chunks(body.as_mut_slice(), part_bytes, |byte_start, part_slice| {
+            let part_idx = byte_start / part_bytes;
+            let block_lo = part_idx.saturating_mul(part_blocks);
+            for stripe in stripes_ref.iter() {
+                let lo = stripe.starts.get(part_idx).copied().map_or(0, |v| usize::try_from(v).unwrap_or(0));
+                let hi = stripe.starts.get(part_idx.saturating_add(1)).copied().map_or(0, |v| usize::try_from(v).unwrap_or(0));
+                if let Some(items) = stripe.items.get(lo..hi) {
+                    for hk in items.iter() {
+                        let local_blk = usize::try_from(hk.block).unwrap_or(0).saturating_sub(block_lo);
+                        let base = local_blk.saturating_mul(BLOCK_BYTES);
+                        let Some(block) = part_slice.get_mut(base..base.saturating_add(BLOCK_BYTES)) else {
+                            continue;
+                        };
+                        let mut shift = 0u32;
+                        for _ in 0..PROBES {
+                            let bit = usize::try_from((hk.bits >> shift) & 511).unwrap_or(0);
+                            if let Some(slot) = block.get_mut(bit >> 3) {
+                                *slot |= 1u8 << (bit & 7);
+                            }
+                            shift = shift.saturating_add(9);
+                        }
+                    }
+                }
+            }
+        });
+
+        BloomBuilder { blocks, body }.finish(digest)
     }
 
     /// Encodes this filter as one framed record (`RECORD_HEADER + body`).
@@ -445,6 +601,18 @@ impl BloomIndex {
             return;
         };
         let bytes = map.bytes();
+        let expected = segments.len().saturating_add(roots.len());
+        if expected > 0 {
+            if self.entries.is_empty() {
+                self.entries = Map::new(MapOpts {
+                    hasher: BuildKeyHasher::default(),
+                    alloc: BLOOM_ALLOC,
+                    capacity: Some(expected),
+                });
+            } else {
+                self.entries.reserve(expected);
+            }
+        }
         let mut by_seg_id: Option<Map<u64, usize, BuildKeyHasher, Kept>> = if segments.len() > 16 {
             let mut m = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(segments.len()) });
             for (i, seg) in segments.iter().enumerate() {
@@ -748,20 +916,8 @@ impl BloomIndex {
         }
     }
 
-    /// Pre-verifies mapped Bloom records for all live local `segments` and `roots` outside the
-    /// exclusive flip lock so compact sidecar rewrites inside `Plain::build` do zero CRC-32C work.
-    pub(crate) fn verify_live(&self, segments: &[Segment], roots: &[Root]) {
-        for seg in segments.iter().filter(|it| it.local) {
-            let _ = self.raw_record(seg);
-        }
-        for root in roots {
-            let want = root_bloom_digest(&root.key);
-            let _ = self.raw_record_digest(&want);
-        }
-    }
-
-    /// Total live byte size of Bloom records for `segments` and `roots` currently indexed.
-    fn live_bytes(&self, segments: &[Segment], roots: &[Root]) -> u64 {
+    /// Total live byte size of Bloom records for `segments` and `root_keys` currently indexed.
+    pub(crate) fn live_bytes_for_keys(&self, segments: &[Segment], root_keys: &[ContentId]) -> u64 {
         let mut live = 0u64;
         for seg in segments.iter().filter(|it| it.local) {
             if let Some(slot) = self.entries.get(&seg.id) {
@@ -773,8 +929,8 @@ impl BloomIndex {
                 live = live.saturating_add(RECORD_HEADER_U64.saturating_add(u64::from(blocks).saturating_mul(BLOCK_BYTES_U64)));
             }
         }
-        for root in roots {
-            let want = root_bloom_digest(&root.key);
+        for root_key in root_keys {
+            let want = root_bloom_digest(root_key);
             if let Some(slot) = self.entries.get(&segment_id_of(&want)) {
                 let blocks = match slot {
                     BloomSlot::Mapped { digest, blocks, .. } if *digest == want => *blocks,
@@ -788,17 +944,29 @@ impl BloomIndex {
     }
 
     /// Whether the on-disk `bloom` file has accumulated enough dead bytes from retired segments
-    /// and roots (more than 2x live + 64 KiB) to warrant rewriting compactly during GC/compaction.
-    pub(crate) fn needs_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
-        let live = self.live_bytes(segments, roots);
+    /// and roots (more than 2x live + 64 KiB) to warrant rewriting compactly during GC/compaction,
+    /// accounting for `pending_bytes` of newly built records not yet inserted into `self.entries`.
+    pub(crate) fn needs_compact_for(&self, segments: &[Segment], root_keys: &[ContentId], pending_bytes: u64) -> bool {
+        let live = self.live_bytes_for_keys(segments, root_keys).saturating_add(pending_bytes);
         self.mapped_bytes > live.saturating_mul(2).saturating_add(64 << 10)
     }
 
     /// Higher threshold for foreground commits (4x live + 1 MiB) so normal foreground commits
-    /// perform tiny O(1) appends and leave routine `bloom` sidecar compaction to background GC.
-    pub(crate) fn needs_urgent_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
-        let live = self.live_bytes(segments, roots);
+    /// perform tiny O(1) appends and leave routine `bloom` sidecar compaction to background GC,
+    /// accounting for `pending_bytes` of newly built records not yet inserted into `self.entries`.
+    pub(crate) fn needs_urgent_compact_for(&self, segments: &[Segment], root_keys: &[ContentId], pending_bytes: u64) -> bool {
+        let live = self.live_bytes_for_keys(segments, root_keys).saturating_add(pending_bytes);
         self.mapped_bytes > live.saturating_mul(4).saturating_add(1 << 20)
+    }
+
+    /// Whether the on-disk `bloom` file needs compaction (test convenience wrapper).
+    #[cfg(test)]
+    pub(crate) fn needs_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
+        let mut keys = Vec::with_capacity_in(roots.len(), BLOOM_ALLOC);
+        for root in roots {
+            keys.push(root.key);
+        }
+        self.needs_compact_for(segments, &keys, 0)
     }
 }
 
@@ -897,5 +1065,49 @@ mod tests {
         idx.note_written(true, r1_len);
         assert_eq!(idx.mapped_bytes, r1_len);
         assert!(!idx.needs_compact(core::slice::from_ref(&live_seg), &[]));
+    }
+
+    #[test]
+    fn build_par_matches_serial_bytes_and_crc_across_sizes_and_shuffled_order() {
+        use crate::plain::{par::{Serial, ShuffledPar}, test_root};
+
+        let root = test_root();
+        for &(count, workers, seed) in &[
+            (0usize, 16usize, 1u64),
+            (17, 16, 2),
+            (4095, 16, 3),
+            (4096, 16, 4),
+            (5003, 32, 5),
+            (25_000, 128, 6),
+        ] {
+            let mut keys: Vec<[u8; 32], _> = Vec::with_capacity_in(count, &root);
+            for i in 0..count {
+                let mut buf = [0u8; 16];
+                buf[..8].copy_from_slice(&seed.to_le_bytes());
+                buf[8..].copy_from_slice(&(i as u64).to_le_bytes());
+                keys.push(ContentId::of("bloom par key", &buf).0);
+            }
+            let digest = ContentId::of("bloom par seg", &seed.to_le_bytes());
+
+            let mut serial_builder = BloomBuilder::new(u32::try_from(count).expect("count fits"));
+            for key in keys.iter() {
+                serial_builder.insert(key);
+            }
+            let want = serial_builder.finish(&digest);
+
+            let got_serial = BloomBuilder::build_par(keys.as_slice(), &digest, &Serial, &root);
+            let par = ShuffledPar::from_seed(workers, seed.wrapping_mul(0x517c_c1b7_2722_0a95));
+            let got_par = BloomBuilder::build_par(keys.as_slice(), &digest, &par, &root);
+
+            assert_eq!(got_serial.as_slice(), want.as_slice(), "Serial mismatch for count={count}");
+            assert_eq!(got_par.as_slice(), want.as_slice(), "ShuffledPar mismatch for count={count}");
+
+            let hdr = parse_header(got_par.as_slice(), 0).expect("valid parallel bloom header");
+            assert!(record_crc_valid(got_par.as_slice(), hdr.crc), "parallel bloom CRC valid for count={count}");
+            let body = &got_par.as_slice()[RECORD_HEADER..];
+            for key in keys.iter() {
+                assert!(probe_bytes(body, hdr.blocks, key), "zero false negatives for count={count}");
+            }
+        }
     }
 }

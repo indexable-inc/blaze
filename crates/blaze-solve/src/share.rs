@@ -59,6 +59,19 @@ pub const SOLVER_CODE_ID: u32 = 1;
 /// `canon::MAX_WORDS` each.
 pub const MOST_KEY_WORDS: usize = 2 * crate::canon::MAX_WORDS + 8;
 
+/// How a shared goal hit's read list is replayed into the asking body (rule 78, rule 85).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplayMode {
+    /// Cross-scope table: every read of a hit is verified against the asking body's facts and
+    /// refused with [`Refuse::Scope`] if any digest differs.
+    #[default]
+    Standard,
+    /// Group-scoped table: every body using the table shares one crate scope and immutable
+    /// records; reads are replayed through the body's fact cache and group shared facts with
+    /// per-body deduplication.
+    SameScope,
+}
+
 /// The request's sharing options, the table's to give ([`GoalShare::opts`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShareOpts {
@@ -70,6 +83,9 @@ pub struct ShareOpts {
     /// form the engine takes once goals are records with their own rows. Off (and only for
     /// tests) while the engine invalidates a body by its own read list alone.
     pub one_read_only: bool,
+    /// How hits replay their read lists into the asking body ([`ReplayMode::Standard`] by
+    /// default so cross-crate tables are unchanged).
+    pub replay: ReplayMode,
     /// PLANTED BUG, tests only: a hit returns the answer and records NO read, neither the
     /// goal's nor its own. The audit and the read-set controls must catch it.
     #[doc(hidden)]
@@ -121,6 +137,13 @@ pub trait GoalShare: Sync {
     /// Calls `see` with the entry of `key` when the table holds one: `Ok(true)`. An entry of
     /// other words under `key.digest` is `Err(Collision)`.
     fn get(&self, key: GoalKey<'_>, see: &mut dyn FnMut(SharedGoal<'_>)) -> Result<bool, ShareRefused>;
+    /// Whether the table already holds an entry under `key` (fast existence check before
+    /// sorting and hashing a finished goal's read list). An entry of other words under
+    /// `key.digest` is `Err(Collision)`. Default returns `Ok(false)`.
+    fn contains(&self, key: GoalKey<'_>) -> Result<bool, ShareRefused> {
+        let _ = key;
+        Ok(false)
+    }
     /// Puts `goal` under `key` unless an entry is there: `Ok(true)` when this put made it,
     /// `Ok(false)` when one was there (the first put stays: equal by the key, rule 25).
     fn put(&self, key: GoalKey<'_>, goal: SharedGoal<'_>) -> Result<bool, ShareRefused>;

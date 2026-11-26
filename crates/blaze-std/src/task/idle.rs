@@ -43,11 +43,24 @@
 //! worker at a time. At most half the workers search at once ([`Idle::begin_search`]).
 
 #[cfg(blaze_check)]
-use blaze_check::sync::atomic::{AtomicU32, Ordering, fence};
+use blaze_check::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 #[cfg(not(blaze_check))]
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use super::threads::Padded;
+
+/// Words in [`Idle::parked_mask`]: 8 x 64 = 512 workers supported in O(1) via `trailing_zeros`.
+pub(crate) const BITMAP_WORDS: usize = 8;
+
+/// Workers directly covered by [`Idle::parked_mask`].
+pub(crate) const BITMAP_WORKERS: usize = BITMAP_WORDS * 64;
+
+/// Which pass of [`Idle::wake_one_bitmap`] is running: started workers before unstarted ones.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WakePass {
+    Started,
+    Unstarted,
+}
 
 const BUSY: u32 = 0;
 const SEARCHING: u32 = 1;
@@ -101,34 +114,70 @@ impl Mark {
     }
 }
 
-/// The pool's counts.
+/// The pool's counts and O(1) parked-worker bitmap (up to 512 workers).
 pub(crate) struct Idle {
     searching: Padded<AtomicU32>,
     parked: Padded<AtomicU32>,
     most_searching: u32,
     plant: IdlePlant,
+    /// Bit `at` is set while worker `at` (`at < 512`) is parked (or unstarted). Owned solely by
+    /// worker `at` (set before `to_park_at`'s `SeqCst` fence, cleared only by worker `at` in
+    /// `back_at`), so no concurrent waker can ever clear a freshly parked worker's bit.
+    parked_mask: [Padded<AtomicU64>; BITMAP_WORDS],
 }
 
 impl Idle {
+    #[cfg(all(test, blaze_check))]
     pub(crate) fn new(workers: u32, plant: IdlePlant) -> Idle {
+        Idle::with_groups(workers, 1, plant)
+    }
+
+    /// Pool idle protocol sized for `workers` across `groups` LLC/virtual groups: caps
+    /// simultaneous searchers to at most `groups * 2` clamped to `8..=16` (and never more than
+    /// `workers.div_ceil(2)`) so 128-core hosts do not suffer 64-way steal storms.
+    pub(crate) fn with_groups(workers: u32, groups: u32, plant: IdlePlant) -> Idle {
+        let cap = groups.max(1).saturating_mul(2).clamp(8, 16);
         Idle {
             searching: Padded(AtomicU32::new(0)),
             parked: Padded(AtomicU32::new(0)),
-            most_searching: workers.div_ceil(2).max(1),
+            most_searching: workers.div_ceil(2).clamp(1, cap),
             plant,
+            parked_mask: [const { Padded(AtomicU64::new(0)) }; BITMAP_WORDS],
         }
     }
 
     /// The protocol of `workers` whose threads have not started: each counted parked, its
     /// mark [`Mark::unstarted`] (the module's doc).
+    #[cfg(all(test, blaze_check))]
     pub(crate) fn unstarted(workers: u32, plant: IdlePlant) -> Idle {
-        let idle = Idle::new(workers, plant);
+        Idle::unstarted_for(workers, 1, plant)
+    }
+
+    /// [`Idle::unstarted`] sized for `groups` worker groups, initializing [`Idle::parked_mask`]
+    /// with bits `0..workers.min(512)` set.
+    pub(crate) fn unstarted_for(workers: u32, groups: u32, plant: IdlePlant) -> Idle {
+        let idle = Idle::with_groups(workers, groups, plant);
         idle.parked.0.store(workers, Ordering::Relaxed);
+        let capped = usize::try_from(workers).unwrap_or(BITMAP_WORKERS).min(BITMAP_WORKERS);
+        for word_idx in 0..BITMAP_WORDS {
+            let base = word_idx * 64;
+            let rem = capped.saturating_sub(base);
+            let bits = if rem >= 64 {
+                u64::MAX
+            } else if rem > 0 {
+                (1u64 << rem) - 1
+            } else {
+                0
+            };
+            if let Some(slot) = idle.parked_mask.get(word_idx) {
+                slot.0.store(bits, Ordering::Relaxed);
+            }
+        }
         idle
     }
 
-    /// The worker of `mark`, busy, asks to search: granted while fewer than half the workers
-    /// search. Its mark moves `Busy -> Searching`, a store: nobody else moves a busy mark.
+    /// The worker of `mark`, busy, asks to search: granted while fewer than [`Idle::most_searching`]
+    /// workers search. Its mark moves `Busy -> Searching`, a store: nobody else moves a busy mark.
     pub(crate) fn begin_search(&self, mark: &Mark) -> bool {
         if self.searching.0.load(Ordering::SeqCst) >= self.most_searching {
             return false;
@@ -151,12 +200,17 @@ impl Idle {
         self.searching.0.fetch_sub(1, Ordering::SeqCst) == 1
     }
 
-    /// The first half of going to sleep: the mark moves to `Parked` (from `Busy`, or
-    /// `Searching` when `searching`), the worker is counted parked and leaves the search, and a
-    /// `SeqCst` fence follows. `false` when the mark was reserved meanwhile: the worker does
-    /// not sleep (and has left the search). The caller then looks at every queue once more, and
-    /// parks only if it finds nothing.
+    /// The first half of going to sleep (worker 0 shorthand for the model tests).
+    #[cfg(all(test, blaze_check))]
     pub(crate) fn to_park(&self, mark: &Mark, searching: bool) -> bool {
+        self.to_park_at(0, mark, searching)
+    }
+
+    /// The first half of going to sleep for worker `at`: the mark moves to `Parked` (from `Busy`,
+    /// or `Searching` when `searching`), bit `at` is set in [`Idle::parked_mask`], the worker is
+    /// counted parked and leaves the search, and a `SeqCst` fence follows. `false` when the mark
+    /// was reserved meanwhile: the worker does not sleep (and has left the search).
+    pub(crate) fn to_park_at(&self, at: usize, mark: &Mark, searching: bool) -> bool {
         let from = if searching { SEARCHING } else { BUSY };
         let parked = mark.state.compare_exchange(from, PARKED, Ordering::SeqCst, Ordering::Acquire).is_ok();
         if searching {
@@ -165,14 +219,24 @@ impl Idle {
         if !parked {
             return false;
         }
+        if let Some(word) = self.parked_mask.get(at / 64) {
+            word.0.fetch_or(1u64 << (at % 64), Ordering::SeqCst);
+        }
         self.parked.0.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         true
     }
 
-    /// The worker of `mark`, parked (or about to), comes back: how.
+    /// The worker of `mark`, parked (or about to), comes back (worker 0 shorthand for model tests).
+    #[cfg(all(test, blaze_check))]
     pub(crate) fn back(&self, mark: &Mark) -> Woke {
-        match mark.state.compare_exchange(PARKED, BUSY, Ordering::SeqCst, Ordering::Acquire) {
+        self.back_at(0, mark)
+    }
+
+    /// Worker `at` of `mark`, parked (or about to), comes back: transitions out of `Parked` (or
+    /// observes `Searching`/`Reserved`) and clears its own bit in [`Idle::parked_mask`].
+    pub(crate) fn back_at(&self, at: usize, mark: &Mark) -> Woke {
+        let woke = match mark.state.compare_exchange(PARKED, BUSY, Ordering::SeqCst, Ordering::Acquire) {
             Ok(_) => {
                 self.parked.0.fetch_sub(1, Ordering::SeqCst);
                 Woke::Itself
@@ -180,13 +244,142 @@ impl Idle {
             Err(SEARCHING) => Woke::Searching,
             Err(RESERVED) => Woke::Reserved,
             Err(other) => unreachable!("bstd::task::idle: a parked worker's mark was moved to {other}"),
+        };
+        if let Some(word) = self.parked_mask.get(at / 64) {
+            word.0.fetch_and(!(1u64 << (at % 64)), Ordering::Release);
         }
+        woke
+    }
+
+    /// O(1) bitmap wake: finds a parked worker via `trailing_zeros` on [`Idle::parked_mask`],
+    /// trying started workers first (the near group `[near_first, near_first + near_len)` first,
+    /// then the remaining words), then unstarted workers in the same order.
+    pub(crate) fn wake_one_bitmap<'m>(
+        &self,
+        workers: usize,
+        near_first: usize,
+        near_len: usize,
+        started_word: impl Fn(usize) -> u64,
+        mark_of: impl Fn(usize) -> Option<&'m Mark>,
+    ) -> Option<usize> {
+        if self.plant != IdlePlant::WakeSkipsFence {
+            fence(Ordering::SeqCst);
+        }
+        if self.searching.0.load(Ordering::SeqCst) != 0 || self.parked.0.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+        let words = workers.div_ceil(64).min(BITMAP_WORDS);
+        if words == 0 {
+            return None;
+        }
+        let mut parked = [0u64; BITMAP_WORDS];
+        let mut started = [0u64; BITMAP_WORDS];
+        for w in 0..words {
+            if let (Some(p_dst), Some(p_src)) = (parked.get_mut(w), self.parked_mask.get(w)) {
+                *p_dst = p_src.0.load(Ordering::Acquire);
+            }
+            if let Some(s_dst) = started.get_mut(w) {
+                *s_dst = started_word(w);
+            }
+        }
+        let near_end = near_first.saturating_add(near_len);
+        let near_w = (near_first / 64).min(words - 1);
+
+        for pass in [WakePass::Started, WakePass::Unstarted] {
+            if let Some(at) = self.wake_in_range(words, near_first, near_end, &parked, &started, pass, &mark_of) {
+                return Some(at);
+            }
+            for step in 0..words {
+                let w = (near_w + step) % words;
+                let p = parked.get(w).copied().unwrap_or(0);
+                let s = started.get(w).copied().unwrap_or(0);
+                let bits = match pass {
+                    WakePass::Started => p & s,
+                    WakePass::Unstarted => p & !s,
+                };
+                if let Some(at) = self.try_wake_bits(w, bits, &mark_of) {
+                    return Some(at);
+                }
+            }
+        }
+
+        // Tail scan only for machines with more than 512 workers.
+        for at in BITMAP_WORKERS..workers {
+            if let Some(mark) = mark_of(at)
+                && mark.state.compare_exchange(PARKED, SEARCHING, Ordering::SeqCst, Ordering::Relaxed).is_ok()
+            {
+                self.parked.0.fetch_sub(1, Ordering::SeqCst);
+                self.searching.0.fetch_add(1, Ordering::SeqCst);
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    fn wake_in_range<'m>(
+        &self,
+        words: usize,
+        range_start: usize,
+        range_end: usize,
+        parked: &[u64; BITMAP_WORDS],
+        started: &[u64; BITMAP_WORDS],
+        pass: WakePass,
+        mark_of: &impl Fn(usize) -> Option<&'m Mark>,
+    ) -> Option<usize> {
+        if range_start >= range_end {
+            return None;
+        }
+        let first_w = (range_start / 64).min(words);
+        let last_w = ((range_end - 1) / 64 + 1).min(words);
+        for w in first_w..last_w {
+            let w_start = w * 64;
+            let lo = range_start.max(w_start);
+            let hi = range_end.min(w_start + 64);
+            if lo >= hi {
+                continue;
+            }
+            let count = hi - lo;
+            let width_mask = if count >= 64 { u64::MAX } else { (1u64 << count) - 1 };
+            let group_mask = width_mask << (lo - w_start);
+            let p = parked.get(w).copied().unwrap_or(0);
+            let s = started.get(w).copied().unwrap_or(0);
+            let sel = match pass {
+                WakePass::Started => p & s,
+                WakePass::Unstarted => p & !s,
+            };
+            if let Some(at) = self.try_wake_bits(w, sel & group_mask, mark_of) {
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    fn try_wake_bits<'m>(
+        &self,
+        word_idx: usize,
+        mut bits: u64,
+        mark_of: &impl Fn(usize) -> Option<&'m Mark>,
+    ) -> Option<usize> {
+        while bits != 0 {
+            let bit = usize::try_from(bits.trailing_zeros()).unwrap_or(0);
+            let at = word_idx * 64 + bit;
+            if let Some(mark) = mark_of(at)
+                && mark.state.compare_exchange(PARKED, SEARCHING, Ordering::SeqCst, Ordering::Relaxed).is_ok()
+            {
+                self.parked.0.fetch_sub(1, Ordering::SeqCst);
+                self.searching.0.fetch_add(1, Ordering::SeqCst);
+                return Some(at);
+            }
+            bits &= bits - 1;
+        }
+        None
     }
 
     /// The second half of a spawn, after its task is published: the fence, then the index of
     /// the one worker to unpark (its mark moved `Parked -> Searching` and counted a searcher),
     /// or none while a worker searches or none is parked. `marks` is every worker, in the order
     /// the spawner prefers (its own group first).
+    #[cfg(all(test, blaze_check))]
     pub(crate) fn wake_one<'m>(&self, marks: impl Iterator<Item = (usize, &'m Mark)>) -> Option<usize> {
         if self.plant != IdlePlant::WakeSkipsFence {
             fence(Ordering::SeqCst);
@@ -705,5 +898,55 @@ mod model {
     fn model_idle_catches_a_wake_without_its_fence() {
         let found = catch_unwind(AssertUnwindSafe(|| blaze_check::model(|| sleep_and_spawn(IdlePlant::WakeSkipsFence))));
         assert!(found.is_err(), "the model must find the worker asleep with a task published");
+    }
+}
+
+#[cfg(all(test, not(blaze_check)))]
+mod bitmap_tests {
+    use super::{BITMAP_WORDS, Idle, IdlePlant, Mark, Woke};
+
+    #[test]
+    fn most_searching_caps_searchers_on_128_cores() {
+        assert_eq!(Idle::with_groups(1, 1, IdlePlant::None).most_searching, 1);
+        assert_eq!(Idle::with_groups(8, 1, IdlePlant::None).most_searching, 4);
+        assert_eq!(Idle::with_groups(16, 1, IdlePlant::None).most_searching, 8);
+        assert_eq!(Idle::with_groups(128, 1, IdlePlant::None).most_searching, 8);
+        assert_eq!(Idle::with_groups(128, 8, IdlePlant::None).most_searching, 16);
+        assert_eq!(Idle::with_groups(256, 16, IdlePlant::None).most_searching, 16);
+    }
+
+    #[test]
+    fn parked_bitmap_wakes_started_near_group_first_across_128_workers() {
+        const WORKERS: usize = 128;
+        let idle = Idle::unstarted_for(128, 8, IdlePlant::None);
+        let marks: [Mark; WORKERS] = [const { Mark::unstarted() }; WORKERS];
+        let mut started = [0u64; BITMAP_WORDS];
+
+        // Start and park worker 5 (group 0) and worker 100 (group 6, range 96..112).
+        for &w in &[5usize, 100usize] {
+            started[w / 64] |= 1u64 << (w % 64);
+            assert_eq!(idle.back_at(w, &marks[w]), Woke::Itself);
+            assert!(idle.to_park_at(w, &marks[w], false));
+        }
+
+        // Wake with near group 6 (96..112) must pick started worker 100 first.
+        let picked = idle.wake_one_bitmap(WORKERS, 96, 16, |w| started[w], |at| marks.get(at));
+        assert_eq!(picked, Some(100), "must wake started worker in near group first");
+        // While worker 100 is searching, another wake must return None.
+        assert_eq!(idle.wake_one_bitmap(WORKERS, 96, 16, |w| started[w], |at| marks.get(at)), None);
+        // Worker 100 wakes and finds work (leaves search).
+        assert_eq!(idle.back_at(100, &marks[100]), Woke::Searching);
+        assert_eq!(idle.found(&marks[100]), (true, true));
+
+        // Now near group 6 has no started parked worker, so wake must pick started worker 5
+        // (group 0) before any unstarted worker in group 6.
+        let picked = idle.wake_one_bitmap(WORKERS, 96, 16, |w| started[w], |at| marks.get(at));
+        assert_eq!(picked, Some(5), "must wake started worker in another group before unstarted");
+        assert_eq!(idle.back_at(5, &marks[5]), Woke::Searching);
+        assert_eq!(idle.found(&marks[5]), (true, true));
+
+        // Now no started worker is parked; wake for group 6 (96..112) must wake unstarted worker 96.
+        let picked = idle.wake_one_bitmap(WORKERS, 96, 16, |w| started[w], |at| marks.get(at));
+        assert_eq!(picked, Some(96), "must wake first unstarted worker in near group");
     }
 }

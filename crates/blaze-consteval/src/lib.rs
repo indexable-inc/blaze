@@ -296,6 +296,15 @@ pub trait ConstWorld: LayoutFacts {
         FnTraitMethod::Absent
     }
 
+    /// The `Deref::deref` (`Mutbl::Not`) or `DerefMut::deref_mut` (`Mutbl::Mut`) trait method, as
+    /// `blaze_build::Adts::deref_fn` answers the builder (rule 30: the same item). An overloaded
+    /// dereference adjustment in a constant resolves this trait method at `[Self]` via
+    /// [`ConstWorld::resolve`] and dereferences the reference it returns.
+    /// An absent method refuses the dereference. A pending lookup names the trait to load.
+    fn deref_method(&self, _mutbl: blaze_typeck::Mutbl) -> FnTraitMethod {
+        FnTraitMethod::Absent
+    }
+
     /// The names `type_name` prints a type with (blaze-build type_name.rs): the paths of
     /// items. `None`, the default: `type_name` is refused by name, never printed without them.
     fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {

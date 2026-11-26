@@ -90,20 +90,17 @@ fn blaze_cmd(dir: &Path, home: &Path) -> Command {
     cmd.current_dir(dir)
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
-        .env("BLAZE_NO_DAEMON", "1");
+;
     cmd
 }
 
-/// `build` is no command of blaze (the owner, 2026-11-15: the commands are `check`, `run`,
-/// `test` and later `export`): the process says so, names the two commands that do its work,
-/// and fails; it never says `build` is yet to be built. With the old arm
-/// (`CliError::NotBuilt { command: "build" }`) the first assertion fails: "`blaze build` is not
-/// built on the new item layer yet".
+/// `export` was renamed to `build` (1:1 with Cargo: `check`, `build`, `run`, `test`):
+/// `blaze export` says so, points to `blaze build`, and exits non-zero.
 #[test]
-fn build_is_no_command_and_names_run_and_export() {
-    let base = fresh_home("build", false);
+fn export_is_no_command_and_names_build() {
+    let base = fresh_home("export", false);
     let output = Command::new(env!("CARGO_BIN_EXE_blaze"))
-        .arg("build")
+        .arg("export")
         .env("HOME", base.join("home"))
         .env("CARGO_HOME", base.join("home/.cargo"))
         .stdin(Stdio::null())
@@ -111,9 +108,8 @@ fn build_is_no_command_and_names_run_and_export() {
         .expect("blaze starts");
     cleanup(&base);
     let said = utf8(&output.stderr);
-    assert!(said.contains("blaze has no `build` command"), "{said}");
-    assert!(said.contains("`blaze run`") && said.contains("`blaze export`"), "{said}");
-    assert!(!said.contains("is not built on the new item layer"), "{said}");
+    assert!(said.contains("blaze has no `export` command"), "{said}");
+    assert!(said.contains("`blaze build`"), "{said}");
     assert_ne!(output.status.code(), Some(0), "{said}");
 }
 
@@ -185,10 +181,10 @@ fn export_no_core_c_main_runs_standalone() {
     copy_file(&ladder.join("src/main.rs"), &dir.join("src/main.rs"));
 
     let mut cmd = blaze_cmd(&dir, &home);
-    cmd.args(["export", "-o", "out/hello-standalone"]);
-    let exported = run_with_deadline(cmd, "blaze export 3-hello", secs(120));
-    assert_eq!(exported.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&exported.stdout), utf8(&exported.stderr));
-    assert!(utf8(&exported.stdout).contains("exported out/hello-standalone"), "unexpected summary: {}", utf8(&exported.stdout));
+    cmd.args(["build", "-o", "out/hello-standalone"]);
+    let built = run_with_deadline(cmd, "blaze build 3-hello", secs(120));
+    assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
+    assert!(utf8(&built.stdout).contains("built out/hello-standalone"), "unexpected summary: {}", utf8(&built.stdout));
 
     let ran = run_standalone(&dir.join("out/hello-standalone"), "run hello-standalone");
     assert_eq!(ran.status.code(), Some(0), "stderr: {}", utf8(&ran.stderr));
@@ -208,9 +204,9 @@ fn export_std_rust_binary_runs_standalone() {
     );
 
     let mut cmd = blaze_cmd(&dir, &home);
-    cmd.arg("export");
-    let exported = run_with_deadline(cmd, "blaze export hello-std", secs(240));
-    assert_eq!(exported.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&exported.stdout), utf8(&exported.stderr));
+    cmd.arg("build");
+    let built = run_with_deadline(cmd, "blaze build hello-std", secs(240));
+    assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
 
     let ran = run_standalone(&dir.join("hello-std"), "run hello-std");
     assert_eq!(ran.status.code(), Some(42), "stderr: {}", utf8(&ran.stderr));
@@ -312,10 +308,10 @@ fn main() -> ExitCode {
 
     let out_bin = base.join("tls-standalone");
     let mut cmd = blaze_cmd(&dir, &home);
-    cmd.args(["export", "-o"]).arg(&out_bin);
-    let exported = run_with_deadline(cmd, "blaze export tls-app", secs(240));
-    assert_eq!(exported.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&exported.stdout), utf8(&exported.stderr));
-    assert!(utf8(&exported.stdout).contains("tls"), "expected TLS count in summary: {}", utf8(&exported.stdout));
+    cmd.args(["build", "-o"]).arg(&out_bin);
+    let built = run_with_deadline(cmd, "blaze build tls-app", secs(240));
+    assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
+    assert!(utf8(&built.stdout).contains("tls"), "expected TLS count in summary: {}", utf8(&built.stdout));
 
     let ran = run_standalone(&out_bin, "run tls-standalone");
     assert_eq!(ran.status.code(), Some(7), "stderr: {}", utf8(&ran.stderr));
@@ -340,10 +336,10 @@ fn export_workspace_selects_package_bin_output_and_stats() {
 
     let out_bin = base.join("out-dir/second-bin");
     let mut cmd = blaze_cmd(&base, &home);
-    cmd.args(["export", "ws", "-p", "alpha", "--bin", "second", "-o"]).arg(&out_bin).args(["--workers", "2", "--stats"]);
-    let exported = run_with_deadline(cmd, "blaze export ws -p alpha --bin second", secs(240));
-    assert_eq!(exported.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&exported.stdout), utf8(&exported.stderr));
-    assert!(utf8(&exported.stderr).contains("export stats:"), "expected --stats line on stderr: {}", utf8(&exported.stderr));
+    cmd.args(["build", "ws", "-p", "alpha", "--bin", "second", "-o"]).arg(&out_bin).args(["--workers", "2", "--stats"]);
+    let built = run_with_deadline(cmd, "blaze build ws -p alpha --bin second", secs(240));
+    assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
+    assert!(utf8(&built.stderr).contains("build stats:"), "expected --stats line on stderr: {}", utf8(&built.stderr));
 
     let ran = run_standalone(&out_bin, "run second-bin");
     assert_eq!(ran.status.code(), Some(0), "stderr: {}", utf8(&ran.stderr));

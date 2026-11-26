@@ -80,7 +80,7 @@ use core::time::Duration;
 use blaze_own::{Texts, Vec};
 use bstd::clock::Clock;
 use bstd::cx::Cx;
-use bstd::fs::{Changes, Cursor, Dir, FsKind, JournalError, Lost, ReadWrite, ReplayTimes};
+use bstd::fs::{Changes, Cursor, Dir, Fs, FsKind, JournalError, Lost, ReadWrite, ReplayTimes};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
@@ -131,8 +131,6 @@ impl fmt::Display for Refused {
 pub(crate) enum JournalUse {
     /// Every unit replayed from its saved place.
     Used,
-    /// The resident daemon's synchronous `kqueue` vnode watcher vouched for the checkout.
-    Kqueue,
     /// At least one unit's rows were all statted: the first one's why.
     Refused(Refused),
     /// The system keeps no journal across a restart: every row is statted.
@@ -143,7 +141,6 @@ impl fmt::Display for JournalUse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             JournalUse::Used => f.write_str("used"),
-            JournalUse::Kqueue => f.write_str("kqueue"),
             JournalUse::Refused(why) => write!(f, "refused: {why}"),
             JournalUse::NoneOnThisOs => f.write_str("none on this OS"),
         }
@@ -374,7 +371,6 @@ impl fmt::Display for SweepCounts {
             (JournalUse::NoneOnThisOs, _) => f.write_str(
                 "full: none on this OS: the system keeps no journal of changes across a restart, so every row is statted until a helper with an expiry carries an inotify set",
             )?,
-            (JournalUse::Kqueue, _) => write!(f, "by kqueue vnode; {} event(s) in {} folder(s)", self.events, self.streams)?,
             (JournalUse::Used, Some(id)) => write!(f, "by events since id {id}; {} event(s) in {} folder(s)", self.events, self.streams)?,
             (JournalUse::Used, None) => f.write_str("full: the checkout's journal was not replayed")?,
             (JournalUse::Refused(why), Some(id)) => write!(f, "by events since id {id}; {} event(s) in {} folder(s); a folder full, refused: {why}", self.events, self.streams)?,
@@ -479,13 +475,11 @@ pub(crate) struct Taken<'f> {
     /// unit's place by [`Taken::pair_with_helper`].
     helper_place: Option<[u8; HELPER_PLACE]>,
     /// What the helper said, for the `sweep:` line.
-    helper: Option<HelperRow>,
-    /// True when the resident daemon's `kqueue` watcher saw a `.git` change or has unwatched
-    /// script/git leaves, forcing `ServedReach::told = true` even when checkout `dirty_paths` is empty.
-    force_script_asks: bool,
-    /// True when the resident daemon's `kqueue` watcher verified and watched all `FACT_MOUNT`
-    /// inputs with 0 events since arming.
-    facts_vouched: bool,
+    pub(crate) helper: Option<HelperRow>,
+    /// True for a linked git worktree when `.git` is a file pointing to an external gitdir whose
+    /// `HEAD`/ref/index state changed since the stored timestamp (or could not be verified),
+    /// forcing `ScriptGit` / `.git` script rows to be followed even when checkout changes are empty.
+    force_git_asks: bool,
 }
 
 /// Bytes of a helper's place kept beside the checkout unit's (blaze-watch since.rs
@@ -630,10 +624,10 @@ impl<'m> Stored<'m> {
 /// blaze's folder in the home, is not replayed (the module's rule): its two listing rows are
 /// followed by their stamps, cheaper than a stream; it stays in the seam for the helper's
 /// `Asked`, which may hold its stream for nothing ([`ChangedSince`]).
-pub(crate) fn take<'f>(cx: &Cx, root: &Dir<ReadWrite>, _home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame) -> Result<Taken<'f>, CliError> {
+pub(crate) fn take<'f>(cx: &Cx, fs: &Fs, root: &Dir<ReadWrite>, _home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame) -> Result<Taken<'f>, CliError> {
     let cx = cx.span("sweep: the journal of changes replayed from the stored answer's place");
     let cx = cx.until(clock.after(JOURNAL_WAIT));
-    let mut taken = Taken::begin(&cx, root, clock, frame)?;
+    let mut taken = Taken::begin_for(&cx, fs, root, clock, stored, frame)?;
     taken.replay_checkout(&cx, clock, root, stored);
     Ok(taken)
 }
@@ -679,7 +673,7 @@ pub(crate) trait ChangedSince {
     const NAME: &'static str;
 
     fn changed_since<'f>(
-        &self, cx: &Cx, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
+        &self, cx: &Cx, fs: &Fs, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
     ) -> Result<Taken<'f>, CliError>;
 }
 
@@ -690,9 +684,9 @@ impl ChangedSince for Replay {
     const NAME: &'static str = "replayed";
 
     fn changed_since<'f>(
-        &self, cx: &Cx, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
+        &self, cx: &Cx, fs: &Fs, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
     ) -> Result<Taken<'f>, CliError> {
-        take(cx, root, home, clock, stored, frame)
+        take(cx, fs, root, home, clock, stored, frame)
     }
 }
 
@@ -806,14 +800,18 @@ impl<'t> Taken<'t> {
     /// No unit yet: what every strategy does BEFORE its place is taken (blaze's folder's ignore
     /// file read, [`CheckoutChanges::ignored_whole`]'s proof), and the wall time kept beside
     /// the places. `cx` carries the strategy's span and deadline.
-    pub(crate) fn begin(cx: &Cx, root: &Dir<ReadWrite>, clock: &Clock, frame: &'t Frame) -> Result<Taken<'t>, CliError> {
+    pub(crate) fn begin(cx: &Cx, fs: &Fs, root: &Dir<ReadWrite>, clock: &Clock, frame: &'t Frame) -> Result<Taken<'t>, CliError> {
+        Self::begin_for(cx, fs, root, clock, Stored::NONE, frame)
+    }
+
+    /// Like [`Taken::begin`], with `stored` so a linked git worktree's external gitdir can be
+    /// checked against `stored.taken_wall_ns()` instead of unconditionally forcing git script
+    /// re-evaluation on every warm no-op.
+    pub(crate) fn begin_for(cx: &Cx, fs: &Fs, root: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'t Frame) -> Result<Taken<'t>, CliError> {
         let blazes_ignored = blazes_folder_ignores_all(cx, root, frame)?;
         let target_tagged = sweep::cargo_target_tagged(cx, root, frame)?;
-        // A git worktree's `.git` is a regular file pointing to a gitdir outside the watched
-        // checkout, so FSEvents on the checkout never sees HEAD/ref updates there; force script
-        // git reads to be followed on every command in a worktree.
-        let git_worktree = root.stat(cx, &Path::new(sweep::GIT)?)?.is_some_and(|meta| !meta.dir);
         let taken_wall_ns = clock.wall().as_ns();
+        let force_git_asks = worktree_git_needs_check(cx, fs, root, stored.taken_wall_ns(), taken_wall_ns, frame)?;
         Ok(Taken {
             names: Texts::new_in(frame),
             units: Vec::new_in(frame),
@@ -827,66 +825,13 @@ impl<'t> Taken<'t> {
             taken_wall_ns,
             helper_place: None,
             helper: None,
-            force_script_asks: git_worktree,
-            facts_vouched: false,
+            force_git_asks,
         })
-    }
-
-    /// Whether the resident daemon's `kqueue` watcher proved all `FACT_MOUNT` inputs unchanged.
-    pub(crate) fn facts_vouched(&self) -> bool {
-        self.facts_vouched
     }
 
     /// The checkout's own folder replayed from its place in `stored` ([`take`]'s one unit).
     pub(crate) fn replay_checkout(&mut self, cx: &Cx, clock: &Clock, root: &Dir<ReadWrite>, stored: Stored<'_>) {
         self.replay(cx, clock, root, Where::Checkout, "", stored);
-    }
-
-    /// The checkout's own folder answered by the resident daemon's synchronous `kqueue` vnode
-    /// watcher: `dirty_paths` is the exact proven dirty set (possibly empty), and `crash_cursor`
-    /// is the passive in-process FSEvents cursor (`<=` edit time) persisted for `SIGKILL` recovery
-    /// (rule 70). Because `kqueue` proves the dirty set directly from the kernel without relying on
-    /// FSEvents ordering, `judge` is not invoked to reject on FSEvents lag.
-    pub(crate) fn vouched_kqueue(
-        &mut self,
-        dirty_paths: &'t [&'t str],
-        crash_cursor: Option<Cursor>,
-        force_script_asks: bool,
-        facts_vouched: bool,
-    ) {
-        let name_at = self.names.push("");
-        let target_tagged = self.target_tagged;
-        let told = dirty_paths.iter().filter(|it| !own(it, target_tagged)).count();
-        self.journal = JournalUse::Kqueue;
-        self.events = self.events.saturating_add(u64::try_from(told).unwrap_or(u64::MAX));
-        self.streams = self.streams.saturating_add(1);
-        self.force_script_asks |= force_script_asks;
-        self.facts_vouched = facts_vouched;
-        let heard = Heard { replayed: None, asked: dirty_paths };
-        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: crash_cursor, since: None, heard: Some(heard) });
-    }
-
-    /// The resident daemon's watcher requested a full sweep (unarmed watcher or root change),
-    /// while still persisting `crash_cursor` when available.
-    pub(crate) fn full_rescan_daemon(&mut self, crash_cursor: Option<Cursor>) {
-        let name_at = self.names.push("");
-        self.refuse(Refused::NoCursor);
-        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: crash_cursor, since: None, heard: None });
-    }
-
-    /// The resident daemon's `FsEventsHeld` fallback backend: an in-process `HeldChanges::flush`
-    /// result judged by the same [`judge`] rule as [`Taken::replay_checkout`], and accepted only
-    /// when `valid_since` proves this stream's previous flush matches the stored cursor (never
-    /// missing edits made before the daemon started or drained by `take()`).
-    pub(crate) fn in_process_fsevents(&mut self, stored: Stored<'_>, valid_since: Option<Cursor>, changes: Changes, cursor: Cursor) {
-        let name_at = self.names.push("");
-        let since = stored.cursor_of(Where::Checkout, "");
-        let whole = if since.is_some() && valid_since != since {
-            Some(Lost::Reset)
-        } else {
-            changes.lost().find(|(under, _)| under.is_empty()).map(|(_, why)| why)
-        };
-        self.heard(Where::Checkout, "", name_at, since, cursor, whole, Heard::replayed(changes));
     }
 
     /// The checkout's own folder answered by the journal helper (journal_ask.rs `Asked`): it
@@ -921,6 +866,16 @@ impl<'t> Taken<'t> {
         self.refuse(Refused::NoCursor);
         self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: Some(journal), since: None, heard: None });
         self.helper_place = Some(helper);
+    }
+
+    /// Records a refused checkout unit without opening an OS journal replay stream (e.g., when
+    /// no journal helper vouched and a direct batched stat sweep over a small checkout is strictly
+    /// faster than paying FSEvents stream setup). Leaves `cursor: None` so no stale cursor is
+    /// written; every leaf of the checkout is statted.
+    pub(crate) fn refused_without_replay(&mut self) {
+        let name_at = self.names.push("");
+        self.refuse(Refused::NoCursor);
+        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: None, since: None, heard: None });
     }
 
     /// `Both`: the helper's `names` added to what the checkout's replay heard, so the rows
@@ -1074,8 +1029,7 @@ impl<'t> Taken<'t> {
             if skip_own && let (Some(changes), Some(_)) = (&unit.heard, &index) {
                 // `.git` and `target` count here: a script's git fact reads `.git`.
                 let blazes = |path: &str| path.split('/').next() == Some(sweep::HOME);
-                let told = self.force_script_asks
-                    || changes.files().any(|it| !blazes(it))
+                let told = changes.files().any(|it| !blazes(it))
                     || changes.lost().any(|(it, _)| !blazes(it));
                 reach = ServedReach { whole: true, told };
             }
@@ -1086,15 +1040,11 @@ impl<'t> Taken<'t> {
         for (i, mark) in marks.iter_mut().enumerate() {
             let row = last.row(i);
             let path = last.path(i);
-            // The fact mount's files are the runner's, absolute, in no unit: as `marks` has them,
-            // unless the resident daemon's vnode watcher vouched all FACT_MOUNT inputs unchanged.
             let fact_file = row.kind == LeafKind::ScriptFile && path.starts_with(sweep::FACT_MOUNT);
-            if fact_file && self.facts_vouched {
-                *mark = false;
-            }
             let script_asks = script_row_uses_asks(row.kind, row.flags, path, self.target_tagged);
             if script_asks {
-                *mark = reach.asks();
+                let is_git_row = row.kind == LeafKind::ScriptGit || path == sweep::GIT || path.starts_with(".git/");
+                *mark = reach.asks() || (is_git_row && self.force_git_asks);
             }
             if !*mark || row.kind == LeafKind::MacroFiles {
                 // A `MacroFiles` row is decided by its files' rows and not counted (sweep.rs).
@@ -1357,6 +1307,319 @@ impl<'a> Index<'a> {
     }
 }
 
+/// Racy-stamp margin for comparing external linked-worktree gitdir timestamps against
+/// `stored.taken_wall_ns()` (matches `sweep::RACY_NS`).
+#[cfg(unix)]
+const GITDIR_RACY_NS: u64 = 2_000_000_000;
+
+/// Maximum bytes read from `.git`, `HEAD`, or `commondir` when inspecting a linked git worktree.
+#[cfg(unix)]
+const GIT_FILE_MAX_BYTES: usize = 4096;
+
+/// Parses a linked worktree/submodule `.git` file (`gitdir: <path>`) into its trimmed target path.
+fn parse_gitdir(bytes: &[u8]) -> Option<&str> {
+    let text = core::str::from_utf8(bytes).ok()?;
+    let line = text.lines().next()?;
+    let target = line.strip_prefix("gitdir:")?.trim();
+    (!target.is_empty()).then_some(target)
+}
+
+/// Parsed contents of a git `HEAD` file.
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadRef<'a> {
+    /// Symbolic ref (e.g. `ref: refs/heads/main`), validated to be a plain relative ref path.
+    Symbolic(&'a str),
+    /// Detached commit object ID (40 SHA-1 or 64 SHA-256 hex digits).
+    Detached,
+    /// Anything else: fall back conservatively to forcing git script checks.
+    Malformed,
+}
+
+#[cfg(any(unix, test))]
+fn parse_head_ref(bytes: &[u8]) -> HeadRef<'_> {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return HeadRef::Malformed;
+    };
+    let line = text.lines().next().map_or("", str::trim);
+    if let Some(rest) = line.strip_prefix("ref:") {
+        let refname = rest.trim();
+        let plain = !refname.is_empty()
+            && !refname.starts_with('/')
+            && !refname.split('/').any(|part| matches!(part, "" | "." | ".."));
+        if plain {
+            return HeadRef::Symbolic(refname);
+        }
+        return HeadRef::Malformed;
+    }
+    if (line.len() == 40 || line.len() == 64) && line.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return HeadRef::Detached;
+    }
+    HeadRef::Malformed
+}
+
+/// Normalizes `base` + `rel` as a checkout-relative path; returns `None` if `rel` is absolute or
+/// escapes above the checkout root via `..`.
+fn normalize_rel_inside_checkout<'f>(base: &str, rel: &str, frame: &'f Frame) -> Option<blaze_own::String<&'f Frame>> {
+    if rel.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str, &Frame> = Vec::new_in(frame);
+    for part in base.split('/').chain(rel.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = blaze_own::String::new_in(frame);
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    Some(out)
+}
+
+/// Resolves `target` (absolute or relative to `base_abs`) into a normalized absolute path.
+#[cfg(any(unix, test))]
+fn resolve_abs_path<'f>(base_abs: &str, target: &str, frame: &'f Frame) -> Option<blaze_own::String<&'f Frame>> {
+    if !base_abs.starts_with('/') && !target.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str, &Frame> = Vec::new_in(frame);
+    let source = if target.starts_with('/') { "" } else { base_abs };
+    for part in source.split('/').chain(target.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = blaze_own::String::new_in(frame);
+    out.push('/');
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    Some(out)
+}
+
+/// Splits a normalized absolute path with at least two components (e.g. `"/a/b/c"` or `"/a/b"`)
+/// into `(grandparent_abs, parent_leaf, target_leaf)` so `fs.home(cx, grandparent_abs, parent_leaf)`
+/// opens the target's parent directory and `target_leaf` can be statted directly inside it.
+fn split_abs_parent(abs: &str) -> Option<(&str, &str, &str)> {
+    let (parent, leaf) = abs.rsplit_once('/')?;
+    if leaf.is_empty() || parent.is_empty() {
+        return None;
+    }
+    let (gp_raw, p_leaf) = parent.rsplit_once('/')?;
+    if p_leaf.is_empty() {
+        return None;
+    }
+    let gp = if gp_raw.is_empty() { "/" } else { gp_raw };
+    Some((gp, p_leaf, leaf))
+}
+
+/// Opens the parent directory of normalized absolute path `abs` via `bstd::fs::Fs`, returning
+/// `(parent_dir, leaf_name)` so `leaf_name` and paths beneath it can be checked through `bstd`.
+fn open_parent_of_abs<'a>(cx: &Cx, fs: &Fs, abs: &'a str) -> Option<(Dir<ReadWrite>, &'a str)> {
+    let (gp, p_leaf, leaf) = split_abs_parent(abs)?;
+    let p_path = Path::new(p_leaf).ok()?;
+    let dir = fs.home(cx, gp, &p_path).ok()?;
+    Some((dir, leaf))
+}
+
+/// Whether `rel` inside `dir` (an external linked gitdir's parent) may have changed at or after
+/// `cutoff_ns`. Returns `true` conservatively on any unexpected I/O error or missing required path.
+fn dir_path_changed_since(cx: &Cx, dir: &Dir<ReadWrite>, rel: &str, cutoff_ns: u64, required: bool) -> bool {
+    let Ok(path) = Path::new(rel) else {
+        return true;
+    };
+    let meta = match dir.stat(cx, &path) {
+        Ok(Some(meta)) => meta,
+        Ok(None) if !required => return false,
+        Ok(None) | Err(_) => return true,
+    };
+    meta.stamp.modified_ns >= cutoff_ns || meta.stamp.changed_ns >= cutoff_ns
+}
+
+/// Reads a small git metadata file (`HEAD` or `commondir`) into `frame` through `bstd::fs`.
+/// Returns `None` if missing, a directory, unreadable, or larger than `GIT_FILE_MAX_BYTES`.
+fn read_small_dir_file<'f>(cx: &Cx, dir: &Dir<ReadWrite>, rel: &str, frame: &'f Frame) -> Option<Bytes<'f>> {
+    let path = Path::new(rel).ok()?;
+    let meta = dir.stat(cx, &path).ok()??;
+    if meta.dir || usize::try_from(meta.len).ok()? > GIT_FILE_MAX_BYTES {
+        return None;
+    }
+    let mut bytes = Bytes::new_in(frame, "linked worktree external git metadata");
+    dir.read_all(cx, &path, &mut bytes).ok()?;
+    if bytes.as_slice().len() > GIT_FILE_MAX_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Checks whether a linked git worktree's external `gitdir` (and `commondir`) had any commit,
+/// checkout, stage, tag, or pack-refs change since `stored_taken_ns` (with a 2-second racy-stamp
+/// margin). Returns `true` conservatively if no prior timestamp exists, the wall clock stepped
+/// backwards, or any required file could not be verified.
+fn external_gitdir_changed(cx: &Cx, fs: &Fs, gitdir: &str, stored_taken_ns: Option<u64>, now_wall_ns: u64, frame: &Frame) -> bool {
+    let Some(prev_ns) = stored_taken_ns else {
+        return true;
+    };
+    if now_wall_ns < prev_ns {
+        return true;
+    }
+    let Some(cutoff_ns) = prev_ns.checked_sub(GITDIR_RACY_NS) else {
+        return true;
+    };
+    let Some(norm_gitdir) = resolve_abs_path("/", gitdir, frame) else {
+        return true;
+    };
+    let gitdir_str = norm_gitdir.as_str();
+    let Some((gitdir_parent, gitdir_leaf)) = open_parent_of_abs(cx, fs, gitdir_str) else {
+        return true;
+    };
+    let head_rel = bstd::mem::format_in!(frame, "{gitdir_leaf}/HEAD");
+    let index_rel = bstd::mem::format_in!(frame, "{gitdir_leaf}/index");
+    let commondir_rel = bstd::mem::format_in!(frame, "{gitdir_leaf}/commondir");
+    if dir_path_changed_since(cx, &gitdir_parent, gitdir_leaf, cutoff_ns, true)
+        || dir_path_changed_since(cx, &gitdir_parent, head_rel.as_str(), cutoff_ns, true)
+        || dir_path_changed_since(cx, &gitdir_parent, index_rel.as_str(), cutoff_ns, false)
+        || dir_path_changed_since(cx, &gitdir_parent, commondir_rel.as_str(), cutoff_ns, false)
+    {
+        return true;
+    }
+    let commondir_resolved = match Path::new(commondir_rel.as_str()).ok().and_then(|p| gitdir_parent.stat(cx, &p).ok()) {
+        Some(Some(_)) => {
+            let Some(common_bytes) = read_small_dir_file(cx, &gitdir_parent, commondir_rel.as_str(), frame) else {
+                return true;
+            };
+            let Ok(text) = core::str::from_utf8(common_bytes.as_slice()) else {
+                return true;
+            };
+            let rel = text.lines().next().map_or("", str::trim);
+            if rel.is_empty() {
+                return true;
+            }
+            let Some(resolved) = resolve_abs_path(gitdir_str, rel, frame) else {
+                return true;
+            };
+            Some(resolved)
+        }
+        Some(None) => None,
+        None => return true,
+    };
+    let common_str = commondir_resolved.as_ref().map_or(gitdir_str, blaze_own::String::as_str);
+    let common_opened = if common_str != gitdir_str {
+        let Some(opened) = open_parent_of_abs(cx, fs, common_str) else {
+            return true;
+        };
+        Some(opened)
+    } else {
+        None
+    };
+    let (common_parent, common_leaf) = match &common_opened {
+        Some((dir, leaf)) => (dir, *leaf),
+        None => (&gitdir_parent, gitdir_leaf),
+    };
+    let packed_refs = bstd::mem::format_in!(frame, "{common_leaf}/packed-refs");
+    let refs_tags = bstd::mem::format_in!(frame, "{common_leaf}/refs/tags");
+    if (common_str != gitdir_str && dir_path_changed_since(cx, common_parent, common_leaf, cutoff_ns, true))
+        || dir_path_changed_since(cx, common_parent, packed_refs.as_str(), cutoff_ns, false)
+        || dir_path_changed_since(cx, common_parent, refs_tags.as_str(), cutoff_ns, false)
+    {
+        return true;
+    }
+    let Some(head_bytes) = read_small_dir_file(cx, &gitdir_parent, head_rel.as_str(), frame) else {
+        return true;
+    };
+    match parse_head_ref(head_bytes.as_slice()) {
+        HeadRef::Detached => false,
+        HeadRef::Malformed => true,
+        HeadRef::Symbolic(refname) => {
+            let ref_in_common = bstd::mem::format_in!(frame, "{common_leaf}/{refname}");
+            if dir_path_changed_since(cx, common_parent, ref_in_common.as_str(), cutoff_ns, false) {
+                return true;
+            }
+            if let Some((parent, _)) = refname.rsplit_once('/') {
+                let parent_dir = bstd::mem::format_in!(frame, "{common_leaf}/{parent}");
+                if dir_path_changed_since(cx, common_parent, parent_dir.as_str(), cutoff_ns, false) {
+                    return true;
+                }
+            }
+            if common_str != gitdir_str {
+                let ref_in_gitdir = bstd::mem::format_in!(frame, "{gitdir_leaf}/{refname}");
+                if dir_path_changed_since(cx, &gitdir_parent, ref_in_gitdir.as_str(), cutoff_ns, false) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Whether a checkout's `.git` entry requires forcing `ScriptGit` / `.git` script checks because
+/// its git metadata lives outside the watched checkout directory and may have moved.
+fn worktree_git_needs_check(cx: &Cx, fs: &Fs, root: &Dir<ReadWrite>, stored_taken_ns: Option<u64>, now_wall_ns: u64, frame: &Frame) -> Result<bool, CliError> {
+    let Some(meta) = root.stat(cx, &Path::new(sweep::GIT)?)? else {
+        return Ok(false);
+    };
+    if meta.dir {
+        return Ok(false);
+    }
+    let mut bytes = Bytes::new_in(frame, "linked worktree `.git` pointer");
+    match root.read_all(cx, &Path::new(sweep::GIT)?, &mut bytes) {
+        Ok(_) => {}
+        Err(error) if error.kind == FsKind::NotFound => return Ok(false),
+        Err(_) => return Ok(true),
+    }
+    let Some(target) = parse_gitdir(bytes.as_slice()) else {
+        return Ok(true);
+    };
+    if !target.starts_with('/') {
+        // Relative `gitdir:`: if it stays inside the checkout (along with any `commondir`), the
+        // checkout's own journal already covers every file inside it.
+        let Some(rel_gitdir) = normalize_rel_inside_checkout("", target, frame) else {
+            return Ok(true);
+        };
+        if rel_gitdir.is_empty() {
+            return Ok(true);
+        }
+        let commondir_rel = bstd::mem::format_in!(frame, "{}/commondir", rel_gitdir.as_str());
+        let Ok(commondir_path) = Path::new(commondir_rel.as_str()) else {
+            return Ok(true);
+        };
+        let mut common_bytes = Bytes::new_in(frame, "linked worktree `commondir`");
+        return match root.read_all(cx, &commondir_path, &mut common_bytes) {
+            Err(error) if matches!(error.kind, FsKind::NotFound | FsKind::IsADirectory) => Ok(false),
+            Err(_) => Ok(true),
+            Ok(_) => {
+                let Ok(text) = core::str::from_utf8(common_bytes.as_slice()) else {
+                    return Ok(true);
+                };
+                let rel = text.lines().next().map_or("", str::trim);
+                if rel.is_empty() {
+                    return Ok(true);
+                }
+                Ok(normalize_rel_inside_checkout(rel_gitdir.as_str(), rel, frame).is_none())
+            }
+        };
+    }
+    if cx.is_simulated() {
+        return Ok(true);
+    }
+    Ok(external_gitdir_changed(cx, fs, target, stored_taken_ns, now_wall_ns, frame))
+}
+
 /// `a` against `x` followed by `y`, by bytes, with nothing joined.
 fn joined_cmp(a: &str, x: &str, y: &str) -> Ordering {
     a.bytes().cmp(x.bytes().chain(y.bytes()))
@@ -1365,3 +1628,42 @@ fn joined_cmp(a: &str, x: &str, y: &str) -> Ordering {
 #[cfg(test)]
 #[path = "tests/journal_sweep_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod worktree_git_tests {
+    use super::*;
+    use bstd::mem::Tag;
+
+    #[test]
+    fn parse_gitdir_and_head_ref_handle_valid_and_malformed_inputs() {
+        assert_eq!(parse_gitdir(b"gitdir: /repo/.git/worktrees/wt1\n"), Some("/repo/.git/worktrees/wt1"));
+        assert_eq!(parse_gitdir(b"gitdir: ../.git/modules/sub\r\n"), Some("../.git/modules/sub"));
+        assert_eq!(parse_gitdir(b"not a gitdir file\n"), None);
+        assert_eq!(parse_gitdir(b"gitdir:   \n"), None);
+
+        assert_eq!(parse_head_ref(b"ref: refs/heads/main\n"), HeadRef::Symbolic("refs/heads/main"));
+        assert_eq!(parse_head_ref(b"0123456789abcdef0123456789abcdef01234567\n"), HeadRef::Detached);
+        assert_eq!(parse_head_ref(b"ref: ../escape\n"), HeadRef::Malformed);
+        assert_eq!(parse_head_ref(b"ref: /abs/ref\n"), HeadRef::Malformed);
+        assert_eq!(parse_head_ref(b"garbage\n"), HeadRef::Malformed);
+    }
+
+    #[test]
+    fn path_normalization_keeps_inside_checkout_and_resolves_commondir() {
+        let frame = Frame::with_reserve(1 << 20, Tag::Other).expect("test frame");
+        assert_eq!(normalize_rel_inside_checkout("", ".git/modules/a", &frame).as_ref().map(blaze_own::String::as_str), Some(".git/modules/a"));
+        assert_eq!(normalize_rel_inside_checkout(".git/worktrees/wt", "../..", &frame).as_ref().map(blaze_own::String::as_str), Some(".git"));
+        assert_eq!(normalize_rel_inside_checkout(".git/worktrees/wt", "../../../outside", &frame).as_ref().map(blaze_own::String::as_str), Some("outside"));
+        assert_eq!(normalize_rel_inside_checkout(".git/worktrees/wt", "../../../../outside", &frame), None);
+        assert_eq!(normalize_rel_inside_checkout("", "/abs/path", &frame), None);
+
+        assert_eq!(
+            resolve_abs_path("/Volumes/Projects/blaze/.git/worktrees/sota-v4", "../..", &frame).as_ref().map(blaze_own::String::as_str),
+            Some("/Volumes/Projects/blaze/.git"),
+        );
+        assert_eq!(
+            resolve_abs_path("/a/b", "/x/y/../z", &frame).as_ref().map(blaze_own::String::as_str),
+            Some("/x/z"),
+        );
+    }
+}

@@ -65,6 +65,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod bake;
 pub mod cache;
 pub mod canon;
 pub mod check;
@@ -84,12 +85,17 @@ pub mod quant;
 pub mod shade;
 pub mod simplify;
 pub mod uv;
+pub mod uv_project;
 mod vecs;
 pub mod weld;
 
 #[cfg(test)]
 mod tests;
 
+pub use bake::{
+    BakeError, BakeMaskMapOpts, BakeNormalOpts, BakeSurfaceOpts, BakedImage, FieldTransform, SurfaceAlphaMode,
+    bake_sdf_mask_map, bake_sdf_normal_map, bake_sdf_surface, bake_sdf_surface_planted,
+};
 pub use cache::{AcmrOpts, CacheError, CacheOpts, FetchOpts, acmr, optimize_vertex_cache, optimize_vertex_fetch};
 pub use canon::{CanonError, CanonOpts, canonical};
 pub use check::{CheckOpts, Defect, Proof, Verified, check};
@@ -110,7 +116,7 @@ pub use measure::{
     topology,
 };
 pub use mesh::{Column, Columns, Mesh, MeshVecs, MeshView, ShapeError};
-pub use plant::{ClusterPlant, ContourPlant, DecimatePlant, HullPlant, QuantPlant, RedistancePlant, UvPlant};
+pub use plant::{BakePlant, ClusterPlant, ContourPlant, DecimatePlant, HullPlant, QuantPlant, RedistancePlant, UvPlant, UvProjectPlant};
 pub use quant::{
     Dequantize, OCT8_BOUND, OCT16_BOUND, OctBits, OctNormals, QuantError, QuantNormalsOpts, QuantOpts, QuantizedPositions,
     Within, decode_oct8, decode_oct16, encode_oct8, encode_oct16, quantize_normals, quantize_positions,
@@ -119,6 +125,10 @@ pub use quant::{
 pub use shade::{COS_32_DEGREES, ShadeError, ShadeOpts, shade, vertex_normals};
 pub use simplify::{DecimateError, DecimateOpts, DecimateStats, Decimated, Source, Stop, Target, decimate, decimate_planted};
 pub use uv::{UvError, UvMapped, UvOpts, compute_tangents, compute_tangents_planted, unwrap_uvs, unwrap_uvs_planted};
+pub use uv_project::{
+    ProjectUvError, ProjectUvOpts, TangentOpts, UvAxis, UvGrainAxis, UvMode, attach_tangents, attach_tangents_planted,
+    project_uvs, project_uvs_planted,
+};
 pub use weld::{Soup, Twins, WeldError, WeldOpts, Welded, weld};
 
 /// The caps of every algorithm here (D165: a field each, the shipped values one constant, drawn

@@ -524,19 +524,18 @@ fn moduled_on(io: &Io, n: u32, driver: Driver, plant: CommitPlant) -> (Result<en
 }
 
 /// THE READY SETUP'S READS (piece B2, engine_check.rs `read_needed`, engine_bodies.rs
-/// `BodiesStage::ready_reads`): the ready setup reads back the outlines of the members the bodies'
-/// setup visits (each member's tree, closed under its outlines' file parts) and of the entering
-/// tasks' files, never every file's. In a world whose edited crate has a submodule the edit does
-/// not touch, at 8 and at 64 crates:
+/// `BodiesStage::ready_reads`): the ready setup reads back the outlines of the members whose
+/// trees the bodies' setup must walk (`stands` and `stands_below` both `None`) and of the
+/// entering tasks' files, never every file's:
 ///
-/// - THE ORACLE: the ready edit's root, page keys and print are the phase path's (the submodule
-///   read back is the one the member's walk needs);
-/// - THE BAR: one outline read back (the submodule; the edited file is outlined), at both sizes,
-///   and the stored rows read the same at both sizes (the phase path's setup read every file's);
-/// - THE CONTROL (rule 23, `CommitPlant::ReadsNoVisitedTree`): a setup that reads back no visited
-///   member's tree is refused by name (`Unoutlined`, typed: the member's walk reaches the
-///   submodule and no outline holds it), so the reads chosen are the ones the setup needs and the
-///   oracle's equality is evidence, never a member quietly checked over fewer files.
+/// - BODY-ONLY EDIT ON A `Held` MEMBER (`cold_moduled` at 8 and 64 crates, with untouched
+///   submodule `m.rs`): the member stands below its heads (`stands_below`), so `ready_reads`
+///   fetches **0** unchanged submodules (`ready.files.read_back == 0`) while `ready_keys.root`,
+///   `pages`, and `lines` match `Driver::Phases` byte-for-byte.
+/// - VISITED-TREE MEMBER (`CutScope` member `b` with untouched submodule `m.rs`, where
+///   `stands_below` is `None` so `groups` must walk `reached_under`): `ready_reads` reads back
+///   `m.rs` alone (`read_back == 1`) matching `Driver::Phases`, and THE CONTROL (rule 23,
+///   `CommitPlant::ReadsNoVisitedTree`) is refused by name (`Unoutlined`, naming `m.rs`).
 #[test]
 fn the_ready_setup_reads_back_only_the_visited_members_outlines() {
     let mut bars = std::vec::Vec::new();
@@ -549,25 +548,73 @@ fn the_ready_setup_reads_back_only_the_visited_members_outlines() {
         assert_eq!(ready_keys.root, phases_keys.root, "{crates} crates: the ready edit's root is the phase path's");
         assert_eq!(ready_keys.pages, phases_keys.pages, "{crates} crates: every page key equal");
         assert_eq!(ready_lines, phases_lines, "{crates} crates: one print");
-        // Only the visited member's submodule (`m.rs`) is read back: transitive member
-        // dependencies (`c0` to `c{EDITED - 1}`) are never eagerly read back upfront (any file
-        // text a checked body actually asks is outlined lazily on demand).
-        let expected = 1u32;
-        assert_eq!(ready.files.read_back, expected, "{crates} crates: the ready setup reads back the visited member's submodule alone (outlined {}, rows read {})", ready.files.outlined, ready.plan.files_read);
+        // Body-only edit stands below heads (`stands_below`): 0 unchanged submodules read back
+        // from CAS (only the edited file is outlined).
+        assert_eq!(ready.files.read_back, 0, "{crates} crates: body-only edit standing below heads reads back 0 unchanged submodules (outlined {}, rows read {})", ready.files.outlined, ready.plan.files_read);
         assert_eq!(ready.files.outlined, 1, "{crates} crates: the ready setup outlines the edited file alone");
         assert!(phases.files.read_back >= u32::try_from(crates).unwrap_or(u32::MAX), "{crates} crates: the phase path's setup reads back every unedited file ({})", phases.files.read_back);
         bars.push((ready.files.read_back, ready.plan.files_read));
-        // THE CONTROL: no visited member's tree read back.
-        let (planted, _) = moduled_on(&cold_moduled(crates), 1, Driver::Ready, CommitPlant::ReadsNoVisitedTree);
-        match planted {
-            Err(CliError::EngineCheck(engine_check::EngineCheckError::Unoutlined(why))) => {
-                assert_ne!(why.file, why.root, "{crates} crates: CONTROL: the refusal names the submodule, not the edited root: {why}");
-            }
-            Err(other) => panic!("{crates} crates: CONTROL: a setup reading no visited tree: expected the typed refusal `Unoutlined`, got {other:?}"),
-            Ok(_) => panic!("{crates} crates: CONTROL: a setup reading no visited tree was served: the reads are not what the bodies' setup needs, or a missing outline is taken quietly"),
-        }
     }
     assert_eq!(bars[0], bars[1], "the ready setup's outlines read back and rows read do not grow from 8 to 64 crates (read back, rows): {:?} then {:?}", bars[0], bars[1]);
+
+    // Member whose tree MUST be walked (`CutScope`, where `stands_below` is `None`): `ready_reads`
+    // reads back its untouched submodule `b/src/m.rs` (`read_back == 1`), and THE CONTROL
+    // (`CommitPlant::ReadsNoVisitedTree`) is refused with `Unoutlined` naming `b/src/m.rs`.
+    let cold_cut_moduled = || -> Io {
+        let io = Io::simulated(SimWorld::new(107, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"p\", \"b\", \"w\"]\nresolver = \"2\"\n");
+        write(&io, "p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n");
+        write(&io, "p/src/lib.rs", "pub fn nothing() {}\n");
+        write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\np = { path = \"../p\" }\n");
+        write(&io, "b/src/lib.rs", "mod m;\npub fn dep_fn() -> u8 {\n    1\n}\n");
+        write(&io, "b/src/m.rs", "pub fn sub() -> u8 {\n    1\n}\n");
+        write(&io, "w/Cargo.toml", "[package]\nname = \"w\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(&io, "w/src/lib.rs", "pub fn work() -> u8 {\n    1\n}\n");
+        let (_, cold) = engine_opts(&io, opts(&io, 2, true));
+        assert!(cold.stored.is_some(), "cold cut-moduled stored");
+        io
+    };
+    let run_cut_edit = |io: &Io, driver: Driver, plant: CommitPlant| -> (Result<engine_check::Checked, CliError>, std::vec::Vec<std::string::String>) {
+        write(io, "b/src/lib.rs", "mod m;\npub fn dep_fn() -> u8 {\n    2\n}\n");
+        let mut options = opts(io, 2, false);
+        options.driver = driver;
+        options.ready_plant = plant;
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
+        let before = stdout(io).len();
+        let fs = io.need_fs().expect("files");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let args = io.args();
+        let net = io.net();
+        let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err);
+        let text = stdout(io).split_off(before);
+        let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        (checked, lines)
+    };
+    let (cut_phases, cut_phases_lines) = run_cut_edit(&cold_cut_moduled(), Driver::Phases, CommitPlant::None);
+    let cut_phases = cut_phases.unwrap_or_else(|error| panic!("cut-moduled phases edit: {error:?}"));
+    let (cut_ready, cut_ready_lines) = run_cut_edit(&cold_cut_moduled(), Driver::Ready, CommitPlant::None);
+    let cut_ready = cut_ready.unwrap_or_else(|error| panic!("cut-moduled ready edit: {error:?}"));
+    let (cp_keys, cr_keys) = (cut_phases.stored.expect("cut phases stored"), cut_ready.stored.expect("cut ready stored"));
+    assert_eq!(cr_keys.root, cp_keys.root, "cut-moduled ready root equals phases");
+    assert_eq!(cr_keys.pages, cp_keys.pages, "cut-moduled ready pages equal phases");
+    assert_eq!(cut_ready_lines, cut_phases_lines, "cut-moduled ready lines equal phases");
+    assert_eq!(cut_ready.files.read_back, 1, "visited CutScope member reads back its untouched submodule m.rs alone");
+    let (planted, _) = run_cut_edit(&cold_cut_moduled(), Driver::Ready, CommitPlant::ReadsNoVisitedTree);
+    match planted {
+        Err(CliError::EngineCheck(engine_check::EngineCheckError::Unoutlined(why))) => {
+            assert_ne!(why.file, why.root, "CONTROL: the refusal names the submodule, not the edited root: {why}");
+        }
+        Err(other) => panic!("CONTROL: a setup reading no visited tree: expected the typed refusal `Unoutlined`, got {other:?}"),
+        Ok(_) => panic!("CONTROL: a setup reading no visited tree was served: the reads are not what the bodies' setup needs, or a missing outline is taken quietly"),
+    }
 }
 
 /// What one driver commits the other reads: ready, then phases, then ready, each root the phase
@@ -1269,4 +1316,201 @@ fn cut_scope_member_stands_on_ready_edit_and_invalidates_when_dep_fixed() {
     assert_eq!(rs4.root, ps4.root, "step 4: root equals Phases");
     assert_eq!(rs4.pages, ps4.pages, "step 4: pages equal Phases");
     assert_eq!(r4_lines, p4_lines, "step 4: stdout lines equal Phases");
+}
+
+/// Fixture `std` exposing `assert!`, `assert_eq!`, and `println!` in its prelude, matching real
+/// Rust `std` without pulling in extra lang items.
+const STD_WITH_EXPR_MACROS: &str = r#"#![no_std]
+#[macro_export]
+macro_rules! assert_eq {
+    ($left:expr, $right:expr $(,)?) => {{
+        let _ = ($left, $right);
+    }};
+    ($left:expr, $right:expr, $($arg:tt)+) => {{
+        let _ = ($left, $right);
+    }};
+}
+#[macro_export]
+macro_rules! assert {
+    ($cond:expr $(,)?) => {{
+        let _ = $cond;
+    }};
+}
+#[macro_export]
+macro_rules! println {
+    ($($tt:tt)*) => {{}};
+}
+pub mod prelude {
+    pub mod rust_2021 {
+        pub use crate::{assert, assert_eq, println};
+    }
+    pub mod rust_2024 {
+        pub use crate::{assert, assert_eq, println};
+    }
+}
+"#;
+
+/// SOTA-v8: a 1-line body edit inside a `#[test]` fn or a library fn calling bare std expression
+/// macros (`assert_eq!`, `assert!`, `println!`, including an explicit `use std::println;`) MUST
+/// stay 100% on `Driver::Ready` (zero `CrateScope` / `Stage::Names` tasks entered, zero header
+/// shards read, `LintKind` + `BodyKind` pipelined inside `Ready`) and match `Driver::Phases`
+/// byte-for-byte.
+#[test]
+fn test_fn_with_std_expr_macros_body_edit_stays_on_ready_and_matches_phases() {
+    let setup = |seed: u64| -> (Io, blaze_toolchain::ToolchainId) {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        let tc = install_shelf(
+            &io,
+            blaze_world::fixture::shelf(graph::TRIPLE, STD_WITH_EXPR_MACROS, SHELF_CFG, blaze_own::testing::heap().alloc()),
+        );
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(
+            &io,
+            "a/src/lib.rs",
+            "use std::println;\n\npub fn helper(n: u32) -> u32 {\n    println!(\"helper\");\n    assert!(n < 100);\n    n + 1\n}\n\n#[test]\nfn test_19_9() {\n    let x = helper(1);\n    assert_eq!(x, 2);\n}\n",
+        );
+        let mut cold_opts = opts(&io, 2, true);
+        cold_opts.toolchain = tc;
+        let (_, cold) = engine_opts(&io, cold_opts);
+        assert!(cold.stored.is_some(), "cold stored");
+        (io, tc)
+    };
+
+    let run_checked = |io: &Io, tc: blaze_toolchain::ToolchainId, driver: Driver| -> (engine_check::Checked, std::vec::Vec<std::string::String>) {
+        let mut options = opts(io, 2, false);
+        options.toolchain = tc;
+        options.driver = driver;
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
+        let before = stdout(io).len();
+        let fs = io.need_fs().expect("files");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let args = io.args();
+        let net = io.net();
+        let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err)
+            .unwrap_or_else(|e| panic!("{driver:?} failed: {e}"));
+        let text = stdout(io).split_off(before);
+        let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        (checked, lines)
+    };
+
+    let ((ready_io, ready_tc), (phases_io, phases_tc)) = (setup(102), setup(102));
+
+    // Edit 1: 1-line edit inside `#[test] fn test_19_9() { assert_eq!(...); }`.
+    let edit1 = "use std::println;\n\npub fn helper(n: u32) -> u32 {\n    println!(\"helper\");\n    assert!(n < 100);\n    n + 1\n}\n\n#[test]\nfn test_19_9() {\n    let x = helper(1);\n    assert_eq!(x, 3);\n}\n";
+    write(&ready_io, "a/src/lib.rs", edit1);
+    write(&phases_io, "a/src/lib.rs", edit1);
+    let (r1, r1_lines) = run_checked(&ready_io, ready_tc, Driver::Ready);
+    let (p1, p1_lines) = run_checked(&phases_io, phases_tc, Driver::Phases);
+    let (rs1, ps1) = (r1.stored.expect("r1 stored"), p1.stored.expect("p1 stored"));
+    let prof1 = profile(&ready_io);
+    assert!(prof1.contains("driver: ready"), "edit 1 must stay on driver: ready:\n{prof1}");
+    assert_eq!(rs1.header_shards_read, 0, "edit 1: 0 header shards read");
+    assert_eq!(r1.stages[blaze_engine::Stage::Names.index()].entered, 0, "edit 1: 0 CrateScope tasks entered");
+    assert_eq!(r1.stages[blaze_engine::Stage::Heads.index()].entered, 0, "edit 1: 0 Head tasks entered");
+    assert_eq!(r1.stages[blaze_engine::Stage::Outlines.index()].entered, 1, "edit 1: 1 FileItems task entered");
+    assert_eq!(r1.stages[blaze_engine::Stage::Lints.index()].entered, 1, "edit 1: 1 Lint task entered inside Ready");
+    assert!(r1.stages[blaze_engine::Stage::Bodies.index()].entered >= 1, "edit 1: test body checked");
+    assert_eq!(rs1.root, ps1.root, "edit 1: root equals Phases");
+    assert_eq!(rs1.pages, ps1.pages, "edit 1: pages equal Phases");
+    assert_eq!(r1_lines, p1_lines, "edit 1: stdout lines equal Phases");
+
+    // Edit 2: 1-line edit inside library fn calling `println!` and `assert!`.
+    let edit2 = "use std::println;\n\npub fn helper(n: u32) -> u32 {\n    println!(\"helper-v2\");\n    assert!(n < 200);\n    n + 1\n}\n\n#[test]\nfn test_19_9() {\n    let x = helper(1);\n    assert_eq!(x, 3);\n}\n";
+    write(&ready_io, "a/src/lib.rs", edit2);
+    write(&phases_io, "a/src/lib.rs", edit2);
+    let (r2, r2_lines) = run_checked(&ready_io, ready_tc, Driver::Ready);
+    let (p2, p2_lines) = run_checked(&phases_io, phases_tc, Driver::Phases);
+    let (rs2, ps2) = (r2.stored.expect("r2 stored"), p2.stored.expect("p2 stored"));
+    let prof2 = profile(&ready_io);
+    assert!(prof2.contains("driver: ready"), "edit 2 must stay on driver: ready:\n{prof2}");
+    assert_eq!(rs2.header_shards_read, 0, "edit 2: 0 header shards read");
+    assert_eq!(r2.stages[blaze_engine::Stage::Names.index()].entered, 0, "edit 2: 0 CrateScope tasks entered");
+    assert_eq!(r2.stages[blaze_engine::Stage::Lints.index()].entered, 1, "edit 2: 1 Lint task entered inside Ready");
+    assert!(r2.stages[blaze_engine::Stage::Bodies.index()].entered >= 1, "edit 2: helper body checked");
+    assert_eq!(rs2.root, ps2.root, "edit 2: root equals Phases");
+    assert_eq!(rs2.pages, ps2.pages, "edit 2: pages equal Phases");
+    assert_eq!(r2_lines, p2_lines, "edit 2: stdout lines equal Phases");
+}
+
+/// SOTA-v8 soundness control (Rule 21): when a crate shadows a `STD_EXPR_MACROS` name with a local
+/// `macro_rules! assert_eq`, editing a body that calls `assert_eq!(...)` MUST wake `CrateScope`
+/// (`Driver::Ready` refuses with `ReadyRefused::Kind` for `CrateScope`, and `Driver::Auto` falls
+/// back cleanly to `Phases` and matches byte-for-byte).
+#[test]
+fn shadowed_assert_eq_macro_invalidates_crate_scope_soundly() {
+    use crate::engine_ready_edit::ReadyRefused;
+
+    let setup = |seed: u64| -> (Io, blaze_toolchain::ToolchainId) {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        let tc = install_shelf(
+            &io,
+            blaze_world::fixture::shelf(graph::TRIPLE, STD_WITH_EXPR_MACROS, SHELF_CFG, blaze_own::testing::heap().alloc()),
+        );
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(
+            &io,
+            "a/src/lib.rs",
+            "macro_rules! assert_eq {\n    ($left:expr, $right:expr) => {{\n        struct LocalMarker;\n        let _ = ($left, $right);\n    }};\n}\n\npub fn uses_shadowed() -> u32 {\n    assert_eq!(1u32, 1u32);\n    1\n}\n",
+        );
+        let mut cold_opts = opts(&io, 2, true);
+        cold_opts.toolchain = tc;
+        let (_, cold) = engine_opts(&io, cold_opts);
+        assert!(cold.stored.is_some(), "cold stored");
+        (io, tc)
+    };
+
+    let run_checked_res = |io: &Io, tc: blaze_toolchain::ToolchainId, driver: Driver| -> Result<(engine_check::Checked, std::vec::Vec<std::string::String>), CliError> {
+        let mut options = opts(io, 2, false);
+        options.toolchain = tc;
+        options.driver = driver;
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
+        let before = stdout(io).len();
+        let fs = io.need_fs().expect("files");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let args = io.args();
+        let net = io.net();
+        let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err)?;
+        let text = stdout(io).split_off(before);
+        let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        Ok((checked, lines))
+    };
+
+    let ((strict_io, strict_tc), (auto_io, auto_tc), (phases_io, phases_tc)) = (setup(103), setup(103), setup(103));
+    let edited = "macro_rules! assert_eq {\n    ($left:expr, $right:expr) => {{\n        struct LocalMarker;\n        let _ = ($left, $right);\n    }};\n}\n\npub fn uses_shadowed() -> u32 {\n    assert_eq!(1u32, 2u32);\n    1\n}\n";
+    write(&strict_io, "a/src/lib.rs", edited);
+    write(&auto_io, "a/src/lib.rs", edited);
+    write(&phases_io, "a/src/lib.rs", edited);
+
+    let refused = run_checked_res(&strict_io, strict_tc, Driver::Ready);
+    match refused {
+        Err(CliError::EngineCheck(engine_check::EngineCheckError::ReadyRefused(ReadyRefused::Kind { name })))
+            if name.kind == blaze_drive::Kind::CrateScope => {}
+        Ok(_) => panic!("expected ReadyRefused::Kind(CrateScope) when editing body calling shadowed assert_eq!, got Ok"),
+        Err(other) => panic!("expected ReadyRefused::Kind(CrateScope), got Err: {other}"),
+    }
+
+    let (auto, auto_lines) = run_checked_res(&auto_io, auto_tc, Driver::Auto).expect("Driver::Auto falls back cleanly");
+    let (phases, phases_lines) = run_checked_res(&phases_io, phases_tc, Driver::Phases).expect("Driver::Phases succeeds");
+    assert!(auto.stages[blaze_engine::Stage::Names.index()].entered >= 1, "shadowed assert_eq! edit must re-enter Stage::Names");
+    assert_eq!(auto.stored.expect("auto stored").root, phases.stored.expect("phases stored").root, "Auto root equals Phases");
+    assert_eq!(auto.stored.expect("auto stored").pages, phases.stored.expect("phases stored").pages, "Auto pages equal Phases");
+    assert_eq!(auto_lines, phases_lines, "Auto stdout lines equal Phases");
 }

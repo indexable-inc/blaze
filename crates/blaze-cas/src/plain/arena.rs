@@ -99,34 +99,6 @@ pub(super) struct Arena {
     runs: AppendVec<RunAt>,
 }
 
-/// The cursor over a put's parts, one block at a time (a block may take the end of one part and
-/// the start of the next), zero-padded at the end.
-struct Cursor<'a, 'b> {
-    parts: &'a [&'b [u8]],
-    part: usize,
-    at: usize,
-}
-
-impl Cursor<'_, '_> {
-    fn next_block(&mut self) -> Block16 {
-        let mut out = [0u8; 16];
-        let mut fill = 0usize;
-        while fill < 16 && self.part < self.parts.len() {
-            let whole = self.parts[self.part];
-            let rest = &whole[self.at..];
-            let take = (16 - fill).min(rest.len());
-            out[fill..fill + take].copy_from_slice(&rest[..take]);
-            fill += take;
-            self.at += take;
-            if self.at == whole.len() {
-                self.part += 1;
-                self.at = 0;
-            }
-        }
-        out
-    }
-}
-
 fn reserve(what: &'static str, wanted: usize) -> impl FnOnce(blaze_mem::MemError) -> LentError {
     move |_| LentError::ArenaReserve { what, wanted }
 }
@@ -151,12 +123,57 @@ impl Arena {
         self.runs.len()
     }
 
-    /// The concatenation of `parts` (`total` bytes) copied in, whole, with one publish: its
-    /// first block. The one writer is the `Lent`'s thread (`AppendVec::writer` stops a second).
+    /// The concatenation of `parts` (`total` bytes) copied in bulk by 16-byte chunks, padding
+    /// only the final `< 16` byte tail block: returns its first block. The one writer is the
+    /// `Lent`'s thread (`AppendVec::writer` stops a second).
     pub(super) fn append(&self, parts: &[&[u8]], total: usize) -> Result<u32, LentError> {
         let need = total.div_ceil(16).max(1);
-        let mut cursor = Cursor { parts, part: 0, at: 0 };
-        self.blocks.writer().try_extend_with(need, |_| cursor.next_block()).map_err(reserve("bytes past the blocks reserved", need * 16))
+        let wanted_bytes = need.saturating_mul(16);
+        let mut writer = self.blocks.writer();
+        let start = self.blocks.len();
+        let start_usize = usize::try_from(start).unwrap_or(usize::MAX);
+        if start_usize.saturating_add(need) > ARENA_BLOCKS {
+            return Err(LentError::ArenaReserve { what: "bytes past the blocks reserved", wanted: wanted_bytes });
+        }
+        if total == 0 {
+            writer.try_append([0u8; 16]).map_err(reserve("bytes past the blocks reserved", wanted_bytes))?;
+            return Ok(start);
+        }
+        let mut carry = [0u8; 16];
+        let mut fill = 0usize;
+        for &part in parts {
+            let mut rest = part;
+            if fill > 0 {
+                let take = (16 - fill).min(rest.len());
+                if let (Some(dst), Some(src)) = (carry.get_mut(fill..fill + take), rest.get(..take)) {
+                    dst.copy_from_slice(src);
+                }
+                fill += take;
+                rest = rest.get(take..).unwrap_or(&[]);
+                if fill == 16 {
+                    writer.try_append(carry).map_err(reserve("bytes past the blocks reserved", wanted_bytes))?;
+                    carry = [0u8; 16];
+                    fill = 0;
+                }
+            }
+            if !rest.is_empty() {
+                let (chunks, tail) = rest.as_chunks::<16>();
+                if !chunks.is_empty() {
+                    writer.try_extend_from_slice(chunks).map_err(reserve("bytes past the blocks reserved", wanted_bytes))?;
+                }
+                if !tail.is_empty() {
+                    if let Some(dst) = carry.get_mut(..tail.len()) {
+                        dst.copy_from_slice(tail);
+                    }
+                    fill = tail.len();
+                }
+            }
+        }
+        if fill > 0 {
+            writer.try_append(carry).map_err(reserve("bytes past the blocks reserved", wanted_bytes))?;
+        }
+        debug_assert_eq!(self.blocks.len().saturating_sub(start), u32::try_from(need).unwrap_or(u32::MAX));
+        Ok(start)
     }
 
     /// The `len` bytes from `block`, when every block of them is below `upto` (a view's

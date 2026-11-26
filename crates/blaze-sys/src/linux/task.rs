@@ -146,6 +146,10 @@ pub fn pause() -> Errno {
 flag_set! {
     /// The namespaces an [`unshare`] makes new (`CLONE_NEW*`, sched.h).
     Namespaces: u32 {
+        /// `CLONE_NEWNS`: a new mount namespace.
+        NS = 0x0002_0000;
+        /// `CLONE_NEWIPC`: a new System V IPC and POSIX message queue namespace.
+        IPC = 0x0800_0000;
         /// `CLONE_NEWUSER`: a new user namespace.
         USER = 0x1000_0000;
         /// `CLONE_NEWNET`: a new network namespace.
@@ -713,6 +717,15 @@ flag_set! {
 pub fn umount2(target: Path<'_>, flags: UnmountFlags) -> Result<(), Errno> {
     // SAFETY: `target` is a live NUL-terminated string the kernel reads and does not keep.
     raw::check(unsafe { raw::syscall2(nr::UMOUNT2, target.as_ptr() as usize, flags.bits() as usize) }).map(|_| ())
+}
+
+/// `pivot_root(new_root, put_old)`: changes the root mount in the current mount namespace.
+/// replaces libc::SYS_pivot_root
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn pivot_root(new_root: Path<'_>, put_old: Path<'_>) -> Result<(), Errno> {
+    // SAFETY: both paths are live NUL-terminated strings read by the kernel and not kept.
+    raw::check(unsafe { raw::syscall2(nr::PIVOT_ROOT, new_root.as_ptr().addr(), put_old.as_ptr().addr()) }).map(|_| ())
 }
 
 // ---- priorities and load ------------------------------------------------------------------

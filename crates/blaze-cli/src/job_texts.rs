@@ -60,21 +60,80 @@ impl<'n> Packs<'n> {
         }
     }
 
-    /// Reads UTF-8 text of `inner` in pack `k`. On [`Packs::SyncLazy`], serves from the shared
-    /// per-entry decompressed cache with zero `frame` allocation and zero repeat Zstd decode.
+    /// Reads UTF-8 text of `inner` in pack `k`. On [`Packs::SyncLazy`] and [`Packs::Shared`],
+    /// serves from the shared per-entry decompressed cache with zero `frame` allocation and zero
+    /// repeat Zstd decode.
     pub(crate) fn read_str(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n str> {
         match self {
             Packs::SyncLazy(lazy, fs) => lazy.read_str(cx, fs, frame, k, inner),
+            Packs::Shared(shared) => shared.read_str(cx, frame, k, inner),
             _ => self.tree(cx, frame, k)?.read_str_slice(inner, frame).ok()?,
         }
     }
 
-    /// Reads raw bytes of `inner` in pack `k`. On [`Packs::SyncLazy`], serves from the shared
-    /// per-entry decompressed cache with zero `frame` allocation and zero repeat Zstd decode.
+    /// Reads raw bytes of `inner` in pack `k`. On [`Packs::SyncLazy`] and [`Packs::Shared`],
+    /// serves from the shared per-entry decompressed cache with zero `frame` allocation and zero
+    /// repeat Zstd decode.
     pub(crate) fn read_slice(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n [u8]> {
         match self {
             Packs::SyncLazy(lazy, fs) => lazy.read_slice(cx, fs, frame, k, inner),
+            Packs::Shared(shared) => shared.read_slice(cx, frame, k, inner),
             _ => self.tree(cx, frame, k)?.read_slice(inner, frame).ok()?,
+        }
+    }
+
+    /// Reads checkout file `inner` through the shared [`SyncLazyTrees`] cache when active,
+    /// returning `(cached_path, entry)` borrowed at `'n` (zero bytes in any stretch `Frame`).
+    /// Returns `None` when not backed by [`Packs::SyncLazy`].
+    pub(crate) fn read_checkout(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+    ) -> Option<Result<(&'n str, &'n crate::body_types::CachedCheckout), bstd::sync::OnceError<core::convert::Infallible>>> {
+        match self {
+            Packs::SyncLazy(lazy, _) => Some(lazy.read_checkout(cx, root, inner)),
+            _ => None,
+        }
+    }
+
+    /// Reads UTF-8 checkout file `inner` through [`Packs::SyncLazy`] when active (zero `frame`
+    /// allocation, zero repeat disk read or UTF-8 check).
+    pub(crate) fn read_checkout_str(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+    ) -> Option<Result<(&'n str, Option<&'n str>), bstd::sync::OnceError<core::convert::Infallible>>> {
+        self.read_checkout(cx, root, inner).map(|res| res.map(|(path, entry)| (path, entry.as_str())))
+    }
+
+    /// Reads raw bytes of checkout file `inner` through [`Packs::SyncLazy`] when active (zero
+    /// `frame` allocation, zero repeat disk read).
+    pub(crate) fn read_checkout_bytes(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+    ) -> Option<Result<(&'n str, Option<&'n [u8]>), bstd::sync::OnceError<core::convert::Infallible>>> {
+        self.read_checkout(cx, root, inner).map(|res| res.map(|(path, entry)| (path, entry.as_bytes())))
+    }
+
+    /// Returns the precomputed `FILE_DOMAIN` digest for an already-cached UTF-8 checkout file
+    /// `inner` when backed by [`Packs::SyncLazy`].
+    pub(crate) fn checkout_digest(&self, inner: &str) -> Option<blaze_ids::ContentId> {
+        match self {
+            Packs::SyncLazy(lazy, _) => lazy.checkout_digest(inner),
+            _ => None,
+        }
+    }
+
+    /// Returns the cached path slice for an already-cached checkout file `inner` when backed by
+    /// [`Packs::SyncLazy`].
+    pub(crate) fn cached_checkout_path(&self, inner: &str) -> Option<&'n str> {
+        match self {
+            Packs::SyncLazy(lazy, _) => lazy.cached_checkout_path(inner),
+            _ => None,
         }
     }
 }
@@ -319,6 +378,15 @@ impl<'n> JobTexts<'n> {
         let held: &'n Bytes<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Some(held.as_slice())
     }
+
+    /// Returns the precomputed `FILE_DOMAIN` digest for an already-cached checkout file `inner`,
+    /// skipping when `(0, inner)` is overridden by `self.corrected`.
+    pub(crate) fn checkout_digest(&self, inner: &str) -> Option<blaze_ids::ContentId> {
+        if self.corrected.iter().any(|(t, p, _)| *t == 0 && *p == inner) {
+            return None;
+        }
+        self.packs.checkout_digest(inner)
+    }
 }
 
 impl<'n> SourceTexts<'n> for JobTexts<'n> {
@@ -335,8 +403,12 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         if let Some((_, text)) = self.read.borrow().iter().find(|(p, _)| *p == inner) {
             return *text;
         }
-        let text = self.checkout(inner);
-        self.read.borrow_mut().push((held_str(inner, self.frame), text));
+        let (path_held, text) = match self.packs.read_checkout_str(self.cx, self.root, inner) {
+            Some(Ok((cached_path, text))) => (cached_path, text),
+            Some(Err(_)) => (held_str(inner, self.frame), None),
+            None => (held_str(inner, self.frame), self.checkout(inner)),
+        };
+        self.read.borrow_mut().push((path_held, text));
         text
     }
 
@@ -362,6 +434,26 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             self.unread.borrow_mut().push((unread.path, unread));
             Found::Unknown(unread)
         };
+        if let Some(got) = self.packs.read_checkout(self.cx, self.root, inner) {
+            return match got {
+                Ok((cached_path, entry)) => match entry.as_source(cached_path) {
+                    Found::Known(text) => {
+                        self.read.borrow_mut().push((cached_path, Some(text)));
+                        Found::Known(text)
+                    }
+                    Found::Absent => {
+                        self.read.borrow_mut().push((cached_path, None));
+                        Found::Absent
+                    }
+                    Found::Unknown(unread) => unknown(unread),
+                },
+                Err(error) => {
+                    let why: &'n bstd::sync::OnceError<core::convert::Infallible> =
+                        blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
+                    unknown(Unread { path: held_str(inner, self.frame), why })
+                }
+            };
+        }
         let text = match self.checkout_found(inner) {
             Found::Known(bytes) => match core::str::from_utf8(bytes) {
                 Ok(text) => Some(text),
@@ -390,11 +482,16 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         if tree != 0 {
             return self.packs.read_slice(self.cx, self.frame, tree, inner);
         }
-        let bytes = self.checkout_bytes(inner);
+        let (path_held, bytes) = match self.packs.read_checkout_bytes(self.cx, self.root, inner) {
+            Some(Ok((cached_path, bytes))) => (cached_path, bytes),
+            Some(Err(_)) => (held_str(inner, self.frame), None),
+            None => (held_str(inner, self.frame), self.checkout_bytes(inner)),
+        };
         let from = from.strip_prefix("/0/").unwrap_or(from);
+        let from_held = self.packs.cached_checkout_path(from).unwrap_or_else(|| held_str(from, self.frame));
         // What the reader was handed, the one read (rule 77: never read twice), so a body's row
         // holds the digest of what it read whichever cell defines the file.
-        self.data.borrow_mut().push((held_str(inner, self.frame), held_str(from, self.frame), bytes));
+        self.data.borrow_mut().push((path_held, from_held, bytes));
         bytes
     }
 

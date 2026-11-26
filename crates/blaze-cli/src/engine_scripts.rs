@@ -1460,6 +1460,274 @@ fn refusal(name: Name, what: &'static str) -> Failure<'static> {
     Failure { failure: TaskFailure { name, why: Why::Refused { what, rule: RULE } }, words: None }
 }
 
+/// O(out_degree) incremental readiness tracker for `Stage::Names` backed by
+/// [`crate::engine_names::NamesDag`]: tracks each crate's remaining unsettled producer count
+/// (`deps_left`) and cascades finished crates/scripts through reverse CSR `dependents` so
+/// `Pipeline::admit` avoids `O(N^2 * W)` transitive `producers_ready`/`unsettled` scans.
+struct NamesReadiness<'s> {
+    initialized: bool,
+    deps_left: Vec<u32, &'s Frame>,
+    self_unsettled: Vec<bool, &'s Frame>,
+    in_flight: Vec<bool, &'s Frame>,
+    unsettled: Vec<bool, &'s Frame>,
+    script_blocked: Vec<usize, &'s Frame>,
+    just_finished: Vec<usize, &'s Frame>,
+    need_check: Vec<usize, &'s Frame>,
+    ready_pending: usize,
+    scripts_moved: bool,
+    cascade: Vec<usize, &'s Frame>,
+    asked_ready: Vec<usize, &'s Frame>,
+}
+
+impl<'s> NamesReadiness<'s> {
+    fn new(frame: &'s Frame) -> Self {
+        Self {
+            initialized: false,
+            deps_left: Vec::new_in(frame),
+            self_unsettled: Vec::new_in(frame),
+            in_flight: Vec::new_in(frame),
+            unsettled: Vec::new_in(frame),
+            script_blocked: Vec::new_in(frame),
+            just_finished: Vec::new_in(frame),
+            need_check: Vec::new_in(frame),
+            ready_pending: 0,
+            scripts_moved: false,
+            cascade: Vec::new_in(frame),
+            asked_ready: Vec::new_in(frame),
+        }
+    }
+
+    fn note_crate_finished(&mut self, at: usize) {
+        self.just_finished.push(at);
+    }
+
+    fn note_script_finished(&mut self) {
+        self.scripts_moved = true;
+    }
+
+    fn is_ready(&self, at: usize) -> bool {
+        self.deps_left.get(at).copied().unwrap_or(0) == 0
+    }
+
+    fn needs_engine_scan(&self) -> bool {
+        !self.initialized
+            || self.ready_pending > 0
+            || !self.need_check.is_empty()
+            || (self.scripts_moved && !self.script_blocked.is_empty())
+    }
+
+    /// Decrements `deps_left` of direct dependents of every crate finished since the last admit,
+    /// in O(out_degree). Returns immediately with zero engine scans when no dependent reaches 0.
+    fn pre_cascade(&mut self, dag: &crate::engine_names::NamesDag<'_>) {
+        if !self.initialized || self.just_finished.is_empty() {
+            return;
+        }
+        self.cascade.clear();
+        for u in self.just_finished.drain(..) {
+            if let Some(slot) = self.in_flight.get_mut(u) {
+                *slot = false;
+            }
+            if let Some(slot) = self.self_unsettled.get_mut(u) {
+                *slot = false;
+            }
+            if self.unsettled.get(u).copied().unwrap_or(false) && self.deps_left.get(u).copied().unwrap_or(0) == 0 {
+                if let Some(slot) = self.unsettled.get_mut(u) {
+                    *slot = false;
+                }
+                self.cascade.push(u);
+            }
+        }
+        while let Some(u) = self.cascade.pop() {
+            for &v_u32 in dag.dependents_of(u) {
+                let Ok(v) = usize::try_from(v_u32) else { continue };
+                if let Some(left) = self.deps_left.get_mut(v)
+                    && *left > 0
+                {
+                    *left -= 1;
+                    if *left == 0 && self.unsettled.get(v).copied().unwrap_or(false) {
+                        if self.self_unsettled.get(v).copied().unwrap_or(false) {
+                            if !self.in_flight.get(v).copied().unwrap_or(false) {
+                                self.ready_pending = self.ready_pending.saturating_add(1);
+                            }
+                        } else {
+                            self.need_check.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Initializes once in O(V + E) or resolves script/early-cutoff checks using `unsettled_fn`.
+    fn sync_with_engine(
+        &mut self,
+        names: &NamesStage<'_>,
+        scripts: &ScriptsStage<'_>,
+        dag: &crate::engine_names::NamesDag<'_>,
+        unsettled_fn: &dyn Fn(Name) -> bool,
+        script_reads: &mut ScriptReady<'_>,
+    ) {
+        #[cfg(test)]
+        let drop_scripts = runner_clock().is_some_and(|clock| clock.drop_names_producer());
+        #[cfg(not(test))]
+        let drop_scripts = false;
+
+        if !self.initialized {
+            let count = dag.len();
+            self.deps_left.resize(count, 0);
+            self.self_unsettled.resize(count, false);
+            self.in_flight.resize(count, false);
+            self.unsettled.resize(count, false);
+            self.script_blocked.clear();
+            self.ready_pending = 0;
+            for u in 0..count {
+                if let Some(name) = names.crate_name(u)
+                    && let Some(slot) = self.self_unsettled.get_mut(u)
+                {
+                    *slot = unsettled_fn(name);
+                }
+                if !drop_scripts
+                    && let Some(script) = names.names.as_ref().and_then(|world| world.script_of(u))
+                    && (unsettled_fn(script) || !scripts.producers_ready(script, unsettled_fn, script_reads))
+                {
+                    if let Some(left) = self.deps_left.get_mut(u) {
+                        *left = 1;
+                    }
+                    self.script_blocked.push(u);
+                }
+            }
+            for &u_u32 in dag.topo() {
+                let Ok(u) = usize::try_from(u_u32) else { continue };
+                let mut left = self.deps_left.get(u).copied().unwrap_or(0);
+                for &g_u32 in dag.deps_of(u) {
+                    if let Ok(g) = usize::try_from(g_u32)
+                        && self.unsettled.get(g).copied().unwrap_or(false)
+                    {
+                        left = left.saturating_add(1);
+                    }
+                }
+                if let Some(slot) = self.deps_left.get_mut(u) {
+                    *slot = left;
+                }
+                let self_u = self.self_unsettled.get(u).copied().unwrap_or(false);
+                if let Some(slot) = self.unsettled.get_mut(u) {
+                    *slot = self_u || left > 0;
+                }
+                if self_u && left == 0 {
+                    self.ready_pending = self.ready_pending.saturating_add(1);
+                }
+            }
+            self.initialized = true;
+            self.scripts_moved = false;
+            self.just_finished.clear();
+            self.need_check.clear();
+            return;
+        }
+
+        if self.scripts_moved && !self.script_blocked.is_empty() {
+            self.scripts_moved = false;
+            let mut kept = 0usize;
+            for i in 0..self.script_blocked.len() {
+                let Some(&u) = self.script_blocked.get(i) else { continue };
+                let still_blocked = if drop_scripts {
+                    false
+                } else if let Some(script) = names.names.as_ref().and_then(|world| world.script_of(u)) {
+                    unsettled_fn(script) || !scripts.producers_ready(script, unsettled_fn, script_reads)
+                } else {
+                    false
+                };
+                if still_blocked {
+                    if let Some(dst) = self.script_blocked.get_mut(kept) {
+                        *dst = u;
+                    }
+                    kept = kept.saturating_add(1);
+                } else if let Some(left) = self.deps_left.get_mut(u)
+                    && *left > 0
+                {
+                    *left -= 1;
+                    if *left == 0 && self.unsettled.get(u).copied().unwrap_or(false) {
+                        if self.self_unsettled.get(u).copied().unwrap_or(false) {
+                            if !self.in_flight.get(u).copied().unwrap_or(false) {
+                                self.ready_pending = self.ready_pending.saturating_add(1);
+                            }
+                        } else {
+                            self.need_check.push(u);
+                        }
+                    }
+                }
+            }
+            self.script_blocked.truncate(kept);
+        }
+
+        while let Some(v) = self.need_check.pop() {
+            if !self.unsettled.get(v).copied().unwrap_or(false) {
+                continue;
+            }
+            if self.deps_left.get(v).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            let is_pending = names.crate_name(v).is_some_and(unsettled_fn);
+            if is_pending {
+                if let Some(slot) = self.self_unsettled.get_mut(v) {
+                    *slot = true;
+                }
+                if !self.in_flight.get(v).copied().unwrap_or(false) {
+                    self.ready_pending = self.ready_pending.saturating_add(1);
+                }
+            } else {
+                // Early cutoff: `v` stood unrun and all its producers settled; cascade to its dependents.
+                if let Some(slot) = self.unsettled.get_mut(v) {
+                    *slot = false;
+                }
+                for &w_u32 in dag.dependents_of(v) {
+                    let Ok(w) = usize::try_from(w_u32) else { continue };
+                    if let Some(left) = self.deps_left.get_mut(w)
+                        && *left > 0
+                    {
+                        *left -= 1;
+                        if *left == 0 && self.unsettled.get(w).copied().unwrap_or(false) {
+                            if self.self_unsettled.get(w).copied().unwrap_or(false) {
+                                if !self.in_flight.get(w).copied().unwrap_or(false) {
+                                    self.ready_pending = self.ready_pending.saturating_add(1);
+                                }
+                            } else {
+                                self.need_check.push(w);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Marks admitted tasks as `in_flight` and queues any `asked_ready` tasks that `engine.enter`
+    /// decided stood without running into `just_finished` so their dependents unblock immediately.
+    fn settle_admitted(&mut self, entered: &[EngineTask], names: &NamesStage<'_>) -> bool {
+        if !self.initialized {
+            self.asked_ready.clear();
+            return false;
+        }
+        for task in entered {
+            if let Some(at) = names.names.as_ref().and_then(|world| world.crate_at(task.planned.name.subject))
+                && let Some(slot) = self.in_flight.get_mut(at)
+                && !*slot
+            {
+                *slot = true;
+                self.ready_pending = self.ready_pending.saturating_sub(1);
+            }
+        }
+        let mut stood_any = false;
+        for at in self.asked_ready.drain(..) {
+            if !self.in_flight.get(at).copied().unwrap_or(false) {
+                self.ready_pending = self.ready_pending.saturating_sub(1);
+                self.just_finished.push(at);
+                stood_any = true;
+            }
+        }
+        stood_any
+    }
+}
+
 /// The coordinator owns the mutable engine and store. Both kinds of jobs borrow
 /// frozen inputs and return their answers through the same foreground pool.
 pub(crate) struct Pipeline<'s, 'a> {
@@ -1467,6 +1735,7 @@ pub(crate) struct Pipeline<'s, 'a> {
     names: crate::engine_names::NamesQueue<'s, 'a>,
     script_reads: ScriptReady<'s>,
     name_reads: crate::engine_names::ProducerWalk<'s>,
+    names_readiness: NamesReadiness<'s>,
 }
 
 impl<'s, 'a: 's> Pipeline<'s, 'a> {
@@ -1478,6 +1747,7 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             names,
             script_reads: ScriptReady::new(jobs),
             name_reads: crate::engine_names::ProducerWalk::new(jobs),
+            names_readiness: NamesReadiness::new(jobs),
         }
     }
 
@@ -1511,26 +1781,58 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         let runnable_scripts = self.scripts.active_scripts()
             + usize::from(engine.has_pending_stage(Stage::Scripts) && self.scripts.active_scripts() == 0);
         self.names.set_width(self.scripts.scope, handles, runnable_scripts);
-        loop {
+        while engine.has_pending_stage(Stage::Names) {
+            if let Some(dag) = names.dag() {
+                self.names_readiness.pre_cascade(dag);
+                if !self.names_readiness.needs_engine_scan() {
+                    break;
+                }
+            }
             self.name_reads.clear();
             self.script_reads.clear();
+            self.names_readiness.asked_ready.clear();
+            let mut synced = false;
             let phase = engine.next_phase_in(Stage::Names, &mut |name, pending| {
-                names.producers_ready(name, &mut |producer| {
-                    #[cfg(test)]
-                    if producer.kind == Kind::Script && runner_clock().is_some_and(|clock| clock.drop_names_producer()) {
-                        return false;
+                if let Some(dag) = names.dag() {
+                    if !synced {
+                        self.names_readiness.sync_with_engine(names, scripts, dag, pending, &mut self.script_reads);
+                        synced = true;
                     }
-                    pending(producer) || (producer.kind == Kind::Script && !scripts.producers_ready(producer, pending, &mut self.script_reads))
-                }, &mut self.name_reads)
+                    let Some(at) = names.names.as_ref().and_then(|world| world.crate_at(name.subject)) else {
+                        return true;
+                    };
+                    let ready = self.names_readiness.is_ready(at);
+                    if ready {
+                        self.names_readiness.asked_ready.push(at);
+                    }
+                    ready
+                } else {
+                    names.producers_ready(name, &mut |producer| {
+                        #[cfg(test)]
+                        if producer.kind == Kind::Script && runner_clock().is_some_and(|clock| clock.drop_names_producer()) {
+                            return false;
+                        }
+                        pending(producer) || (producer.kind == Kind::Script && !scripts.producers_ready(producer, pending, &mut self.script_reads))
+                    }, &mut self.name_reads)
+                }
             })?;
-            if phase.is_none() { break; }
+            if phase.is_none() {
+                if !self.names_readiness.settle_admitted(&[], names) {
+                    break;
+                }
+                continue;
+            }
             let mark = handles.board.phase_began(Stage::Names, engine.tasks().len() as u64, handles.board.now(&handles.env.clock));
             let view = engine.view();
+            self.names_readiness.settle_admitted(engine.tasks(), names);
             for &task in engine.tasks() {
                 self.names.submit(self.scripts.scope, cx, names, store, read, view, handles, task, alloc, frame, self.scripts.waiter(), runnable_scripts)?;
             }
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
         }
+        // Dispatch all newly enqueued `Names` tasks together in critical-path priority order so
+        // high-fanout hubs claim worker slots ahead of arbitrary hash-first leaf crates.
+        self.names.dispatch();
         Ok(())
     }
 
@@ -1629,8 +1931,12 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             let feeds = !is_script_phase && names.feeds_names(name);
             if is_script_phase {
                 scripts.finish(cx, store, handles, names, &mut self.scripts, name, buffer, times, alloc, frame)?;
+                self.names_readiness.note_script_finished();
             } else {
                 self.names.finish(cx, name, names, buffer, times, frame)?;
+                if let Some(at) = names.names.as_ref().and_then(|world| world.crate_at(name.subject)) {
+                    self.names_readiness.note_crate_finished(at);
+                }
             }
             entered.push(task);
             // A script may immediately release a reader, including one in the same Names wave.
@@ -1652,5 +1958,86 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         let stopped = self.names.wait_running(cx).and(self.scripts.wait_running(cx));
         let joined = self.names.drain(cx).and(self.scripts.drain(cx));
         joined.and(stopped)
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn names_readiness_countdown_skips_scans_for_leaves_and_unblocks_dependents_in_o_out_degree() {
+        // Diamond DAG + unrelated leaf:
+        //   0 (root_a) -> 2 (mid) -> 3 (top)
+        //   1 (root_b) -> 2 (mid)
+        //   4 (leaf_free): no deps, no dependents
+        let edges: [&[usize]; 5] = [&[], &[], &[0, 1], &[2], &[]];
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("readiness test frame");
+        let dag = crate::engine_names::build_names_dag(edges.len(), |_| true, |at| edges[at].iter().copied(), &frame).expect("acyclic");
+
+        // Cold build: all 5 crates initially pending.
+        let mut r = NamesReadiness::new(&frame);
+        r.deps_left.resize(5, 0);
+        r.self_unsettled.resize(5, true);
+        r.in_flight.resize(5, false);
+        r.unsettled.resize(5, false);
+        for &u_u32 in dag.topo() {
+            let u = usize::try_from(u_u32).expect("small");
+            let mut left = 0u32;
+            for &g_u32 in dag.deps_of(u) {
+                let g = usize::try_from(g_u32).expect("small");
+                if r.unsettled[g] {
+                    left += 1;
+                }
+            }
+            r.deps_left[u] = left;
+            r.unsettled[u] = r.self_unsettled[u] || left > 0;
+            if r.self_unsettled[u] && left == 0 {
+                r.ready_pending += 1;
+            }
+        }
+        r.initialized = true;
+
+        assert_eq!(r.deps_left.as_slice(), &[0, 0, 2, 1, 0]);
+        assert_eq!(r.ready_pending, 3);
+        assert!(r.is_ready(0) && r.is_ready(1) && r.is_ready(4));
+        assert!(!r.is_ready(2) && !r.is_ready(3));
+
+        // Admit roots 0, 1, 4.
+        for at in [0usize, 1, 4] {
+            r.in_flight[at] = true;
+            r.ready_pending -= 1;
+        }
+        assert!(!r.needs_engine_scan());
+
+        // Finishing pure leaf 4 triggers ZERO engine scans.
+        r.note_crate_finished(4);
+        r.pre_cascade(&dag);
+        assert!(!r.needs_engine_scan(), "pure leaf completion must not trigger an engine scan");
+        assert_eq!(r.deps_left.as_slice(), &[0, 0, 2, 1, 0]);
+
+        // Finishing root 0 decrements mid(2) from 2 -> 1 (still blocked): ZERO engine scans.
+        r.note_crate_finished(0);
+        r.pre_cascade(&dag);
+        assert!(!r.needs_engine_scan(), "partial dep completion (deps_left 2 -> 1) must not trigger a scan");
+        assert_eq!(r.deps_left[2], 1);
+        assert!(!r.is_ready(2));
+
+        // Finishing root 1 decrements mid(2) from 1 -> 0: immediately unblocks mid(2)!
+        r.note_crate_finished(1);
+        r.pre_cascade(&dag);
+        assert!(r.needs_engine_scan());
+        assert_eq!(r.ready_pending, 1);
+        assert!(r.is_ready(2));
+        assert!(!r.is_ready(3));
+
+        // Admit mid(2), then finish it -> unblocks top(3).
+        r.in_flight[2] = true;
+        r.ready_pending -= 1;
+        r.note_crate_finished(2);
+        r.pre_cascade(&dag);
+        assert!(r.needs_engine_scan());
+        assert_eq!(r.ready_pending, 1);
+        assert!(r.is_ready(3));
     }
 }

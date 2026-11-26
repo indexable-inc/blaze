@@ -30,15 +30,15 @@ use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ladder::body_ids::{
     Begun, DeclaredList, EntryForm, Form as _, How, Make, Order, Pending, RowKind, Scratch, Stepped, Unkeyed, Walk, instance_key,
 };
-use blaze_ladder::code_records::statics::{each_static_named, each_vtable_datum, entry_record};
-use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, content_key};
+use blaze_ladder::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView, each_static_named, each_vtable_datum, entry_record};
+use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, EntryView, content_key};
 use blaze_ladder::code_records::reads::Verdict;
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, MakeWatch, Maker, NamesRecords};
 use blaze_ladder::run::special::{MakerKind, MakerStart, Roots, StartHead};
 use blaze_ladder::run::RunError as LadderRunError;
 use blaze_launch::wire::RecordId;
 use blaze_launch::wire::data::Datum;
-use blaze_launch::wire::run::Symbol;
+use blaze_launch::wire::run::{BYTES_PART_MOST, Symbol};
 use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
 use blaze_run::plan::NotKept;
 use blaze_run::postings::FnName;
@@ -109,9 +109,62 @@ pub(crate) struct StepCounts {
     pub unkeyed: usize,
 }
 
-/// Lazily-initialized [`Make`] adapter that consults `SuiteCache::verified` in O(1) before ever
-/// constructing the command-thread [`RunMaker`]. On warm `BZTV` hits and on cold `Codes::Pooled`
-/// misses (dispatched to off-thread `CodePool` workers), no command-thread `Maker` is constructed.
+/// Returns `true` iff `item` belongs to a settled non-workspace (`Toolchain` or `Dependency`) crate.
+fn is_closed_item(item: ItemKey, ids: &RunIds<'_>) -> bool {
+    matches!(ids.grain(item), Some(crate::run_ids::Grain::Toolchain | crate::run_ids::Grain::Dependency))
+}
+
+/// Returns `true` iff `(tabled, name, entry)` touches ONLY settled `Toolchain` / `Dependency`
+/// crates (zero `Workspace` items in `tabled`, generic args `name`, or any read-list question in
+/// `entry`), proving its `Verdict::Holds` remains valid across workspace edits whenever
+/// `closed_crates_digest` stands (rule 21).
+fn is_closed_verified_entry(tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) -> bool {
+    if !is_closed_item(tabled, ids) {
+        return false;
+    }
+    let mut ok = true;
+    if blaze_ladder::body_ids::each_item(name, |item| {
+        if ok && !is_closed_item(item, ids) {
+            ok = false;
+        }
+    })
+    .is_err()
+        || !ok
+    {
+        return false;
+    }
+    if entry.get(..8).is_some_and(|magic| magic == STATIC_ENTRY_MAGIC) {
+        return StaticEntryView::read(entry).is_ok();
+    }
+    let Ok(view) = EntryView::read(entry) else {
+        return false;
+    };
+    for row in view.reads() {
+        let Ok((question, _)) = row else {
+            return false;
+        };
+        // Read-list question layout (`code_reads.rs::question_head`): 1-byte kind + 8-byte extra + instance name.
+        let Some(q_name) = question.get(9..) else {
+            return false;
+        };
+        if blaze_ladder::body_ids::each_item(q_name, |item| {
+            if ok && !is_closed_item(item, ids) {
+                ok = false;
+            }
+        })
+        .is_err()
+            || !ok
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Lazily-initialized [`Make`] adapter that consults `SuiteCache`'s verified sets in O(1) before
+/// ever constructing the command-thread [`RunMaker`]. On warm `BZTV` hits (including closed
+/// `std`/`core`/`alloc`/dep hits across workspace edits) and on cold `Codes::Pooled` misses
+/// (dispatched to off-thread `CodePool` workers), no command-thread `Maker` is constructed.
 struct LazyVerifyingMaker<'a, 'h> {
     names: NamesRecords<'h>,
     builder: &'a Builder,
@@ -123,7 +176,8 @@ struct LazyVerifyingMaker<'a, 'h> {
     ids: RunIds<'h>,
     enclosers: LocalEnclosers,
     maker: &'a mut Option<RunMaker<'h>>,
-    verified: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_closed: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_workspace: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: &'a mut bool,
 }
 
@@ -188,15 +242,22 @@ impl Make for LazyVerifyingMaker<'_, '_> {
         entry: &[u8],
     ) -> Result<Option<Verdict>, Self::Error> {
         let pair = (key.0.0, under.0.0);
-        if self.verified.contains(&pair) {
+        if self.verified_closed.contains(&pair) || self.verified_workspace.contains(&pair) {
             return Ok(Some(Verdict::Holds));
         }
         let enclosers = self.enclosers;
         let maker = self.ensure_maker()?;
         maker.prepare_local(enclosers.locals(), enclosers.enclosers());
         let verdict = maker.verify(tabled, name, entry)?;
-        if matches!(verdict, Some(Verdict::Holds)) && self.verified.insert(pair) {
-            *self.verified_dirty = true;
+        if matches!(verdict, Some(Verdict::Holds)) {
+            let inserted = if is_closed_verified_entry(tabled, name, entry, &self.ids) {
+                self.verified_closed.insert(pair)
+            } else {
+                self.verified_workspace.insert(pair)
+            };
+            if inserted {
+                *self.verified_dirty = true;
+            }
         }
         Ok(verdict)
     }
@@ -321,7 +382,8 @@ pub(crate) struct SuiteCache<'h> {
     scratch: Scratch<'static>,
     list: DeclaredList<'static>,
     maker: Option<RunMaker<'h>>,
-    verified: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_workspace: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: bool,
     pubs: Map<[u8; 32], CachedPub, BuildKeyHasher, Alloc<'static>>,
     datums: Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>>,
@@ -353,7 +415,8 @@ impl<'h> SuiteCache<'h> {
             scratch: Scratch::new_in(tables),
             list: DeclaredList::new_in(tables),
             maker: None,
-            verified: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            verified_closed: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            verified_workspace: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
             verified_dirty: false,
             pubs: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             datums: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
@@ -365,16 +428,36 @@ impl<'h> SuiteCache<'h> {
         }
     }
 
-    pub(crate) fn verified_mut(&mut self) -> &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> {
-        &mut self.verified
+    pub(crate) fn verified_sets_mut(
+        &mut self,
+    ) -> (
+        &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+        &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    ) {
+        (&mut self.verified_closed, &mut self.verified_workspace)
     }
 
     pub(crate) fn verified_dirty(&self) -> bool {
         self.verified_dirty
     }
 
-    pub(crate) fn verified_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
-        self.verified.iter().copied()
+    pub(crate) fn verified_closed_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
+        self.verified_closed.iter().copied()
+    }
+
+    pub(crate) fn verified_workspace_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
+        self.verified_workspace.iter().copied()
+    }
+
+    fn record_verified_entry(&mut self, pair: ([u8; 32], [u8; 32]), tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) {
+        let inserted = if is_closed_verified_entry(tabled, name, entry, ids) {
+            self.verified_closed.insert(pair)
+        } else {
+            self.verified_workspace.insert(pair)
+        };
+        if inserted {
+            self.verified_dirty = true;
+        }
     }
 
     pub(crate) fn warm_len(&self) -> usize {
@@ -587,16 +670,16 @@ impl<'h> SuiteCache<'h> {
             } else {
                 let s_name = self.walk.name(at);
                 let ik = instance_key(CodeSymbol(static_sym), s_tabled, s_name, ids, &self.builder, &self.builder.producer, self.tables);
-                if let (Stepped::Made(under), Some(ik)) = (s_stepped, ik)
-                    && self.verified.insert((ik.0.0, under.0.0))
-                {
-                    self.verified_dirty = true;
-                }
-                ik.map(|ik| {
+                let entered = ik.map(|ik| {
                     let mut name_copy = Vec::with_capacity_in(s_name.len(), self.tables);
                     name_copy.extend_from_slice(s_name);
                     CachedEntered { symbol: FnName(static_sym), code_key: ik.0.0, tabled: s_tabled, name: name_copy }
-                })
+                });
+                if let (Stepped::Made(under), Some(ik)) = (s_stepped, ik) {
+                    let name_slice = entered.as_ref().map_or(&[][..], |e| e.name.as_slice());
+                    self.record_verified_entry((ik.0.0, under.0.0), s_tabled, name_slice, s_entry, ids);
+                }
+                entered
             };
             let s_unkeyed = s_unkeyed_step || s_entered.is_none();
             let s_purity = if s_unkeyed { Err(NotKept::Untraced) } else { check_datum_purity(s_datum) };
@@ -625,16 +708,16 @@ impl<'h> SuiteCache<'h> {
         } else {
             let name_slice = self.walk.name(row);
             let inst_key = instance_key(code_sym, tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables);
-            if let (Stepped::Made(under), Some(ik)) = (stepped, inst_key)
-                && self.verified.insert((ik.0.0, under.0.0))
-            {
-                self.verified_dirty = true;
-            }
-            inst_key.map(|ik| {
+            let entered = inst_key.map(|ik| {
                 let mut name_copy = Vec::with_capacity_in(name_slice.len(), self.tables);
                 name_copy.extend_from_slice(name_slice);
                 CachedEntered { symbol: FnName(symbol.0), code_key: ik.0.0, tabled, name: name_copy }
-            })
+            });
+            if let (Stepped::Made(under), Some(ik)) = (stepped, inst_key) {
+                let name_bytes = entered.as_ref().map_or(&[][..], |e| e.name.as_slice());
+                self.record_verified_entry((ik.0.0, under.0.0), tabled, name_bytes, entry, ids);
+            }
+            entered
         };
         let unkeyed = unkeyed_step || entered.is_none();
         let purity = if unkeyed { Err(NotKept::Untraced) } else { check_record_purity(record) };
@@ -781,7 +864,8 @@ impl<'h> SuiteCache<'h> {
                     ids: *ids,
                     enclosers,
                     maker: &mut self.maker,
-                    verified: &mut self.verified,
+                    verified_closed: &mut self.verified_closed,
+                    verified_workspace: &mut self.verified_workspace,
                     verified_dirty: &mut self.verified_dirty,
                 };
                 let stepped = match codes {
@@ -940,10 +1024,16 @@ impl<'h> SuiteCache<'h> {
                 watch.see(Step::Answered(Answered::Made));
                 let tabled = self.walk.tabled(row);
                 let name_slice = self.walk.name(row);
-                if let Some(ik) = instance_key(CodeSymbol(flight.symbol), tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables)
-                    && self.verified.insert((ik.0.0, under.0.0))
-                {
-                    self.verified_dirty = true;
+                if let Some(ik) = instance_key(CodeSymbol(flight.symbol), tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables) {
+                    let is_closed = is_closed_verified_entry(tabled, name_slice, entry, ids);
+                    let inserted = if is_closed {
+                        self.verified_closed.insert((ik.0.0, under.0.0))
+                    } else {
+                        self.verified_workspace.insert((ik.0.0, under.0.0))
+                    };
+                    if inserted {
+                        self.verified_dirty = true;
+                    }
                 }
             }
             Stepped::Unkeyed(Unkeyed::NoRecord) => {
@@ -1089,6 +1179,25 @@ impl<'h> SuiteCache<'h> {
         tally: &mut Tally,
         scratch_alloc: Alloc<'_>,
     ) -> Result<usize, ParentError> {
+        self.prepublish_warm_bounded(test_entry, head, child, needs, out, tally, usize::MAX, scratch_alloc)
+    }
+
+    /// Bounded variant of [`Self::prepublish_warm`] that stops before `out.len()` exceeds
+    /// `max_out_len`, preflighting every byte of the complete unsent publication (function bytes,
+    /// all unsent transitive static datums, and wire framing) without mutating `child` so any
+    /// remaining warm functions are published in later turns or served on demand (rule 18).
+    #[expect(clippy::too_many_arguments, reason = "pre-publishes cached suite entries into one impure child's wire buffer under a byte cap")]
+    pub(crate) fn prepublish_warm_bounded<A: Allocator>(
+        &self,
+        test_entry: [u8; 32],
+        head: StartHead,
+        child: &mut ChildSent<'_>,
+        needs: &mut Needs<'_>,
+        out: &mut crate::run_parent::WireOut<A>,
+        tally: &mut Tally,
+        max_out_len: usize,
+        scratch_alloc: Alloc<'_>,
+    ) -> Result<usize, ParentError> {
         let start = child.warm_cursor;
         let total = self.warm_order.len();
         if start >= total {
@@ -1100,13 +1209,28 @@ impl<'h> SuiteCache<'h> {
         let mut inline = Vec::new_in(scratch_alloc);
         let mut entered = Vec::new_in(scratch_alloc);
         let mut published = 0usize;
+        let mut next_cursor = start;
         for &sym in self.warm_order.iter().skip(start) {
+            if out.len() >= max_out_len {
+                break;
+            }
+            next_cursor += 1;
             if sym.0 == test_entry || needs.is_settled(&sym) {
                 continue;
             }
             let Some(entry) = self.pubs.get(&sym.0) else { continue };
             if entry.lands && head.personality.is_none() {
                 continue;
+            }
+            // Preflight EVERY byte the complete unsent publication (function inline bytes, all
+            // unsent transitive static datums, and wire framing) would append BEFORE mutating
+            // `child.sent_records` or `child.told`, including on the very first warm entry.
+            if max_out_len < usize::MAX {
+                let needed = preflight_entry_wire_bytes(entry, &self.datums, child, scratch_alloc);
+                if out.len().saturating_add(needed) > max_out_len {
+                    next_cursor -= 1;
+                    break;
+                }
             }
             let mut any_unkeyed = false;
             let mut datums_purity = Ok(());
@@ -1140,7 +1264,7 @@ impl<'h> SuiteCache<'h> {
                 tally.found += rows;
             }
         }
-        child.warm_cursor = total;
+        child.warm_cursor = next_cursor;
         Ok(published)
     }
 
@@ -1396,5 +1520,195 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
 
     fn watch(&self) -> &dyn Watch {
         self.watch
+    }
+}
+
+/// Computes a strict upper bound on the wire bytes `Needs::publish_precomputed` will append for
+/// `entry` — covering the function's inline bytes, every unsent transitive static/vtable datum's
+/// inline bytes (including `BYTES_PART_MOST` chunk headers), `Down::Declare`, `Down::Data`,
+/// `Down::ThreadLocals`, and `Down::Publish`/`Down::Positioned` — WITHOUT mutating `child`.
+fn preflight_entry_wire_bytes(
+    entry: &CachedPub,
+    datums: &Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>>,
+    child: &ChildSent<'_>,
+    scratch_alloc: Alloc<'_>,
+) -> usize {
+    const FRAME_OVERHEAD: usize = 96;
+    const BYTES_PART_OVERHEAD: usize = 192;
+    const DECLARE_PAIR_BYTES: usize = 64;
+    const DATA_ITEM_BYTES: usize = 96;
+    const TLS_FRAME_BYTES: usize = 256;
+    const PUBLISH_BASE_BYTES: usize = 224;
+
+    let part_limit = usize::try_from(BYTES_PART_MOST).unwrap_or(4 << 20);
+    let inline_bytes_cost = |len: usize| -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let parts = len.div_ceil(part_limit);
+        len.saturating_add(parts.saturating_mul(BYTES_PART_OVERHEAD))
+    };
+
+    let mut seen_told: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
+        Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: scratch_alloc, capacity: None });
+    let mut seen_records: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
+        Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: scratch_alloc, capacity: None });
+    let mut work_named: AVec<'_, Symbol> = Vec::with_capacity_in(entry.named.len(), scratch_alloc);
+    work_named.extend_from_slice(entry.named.as_slice());
+
+    let mut total = 0usize;
+    if !child.sent_records.contains(&entry.record.0) && seen_records.insert(entry.record.0) {
+        total = total.saturating_add(inline_bytes_cost(entry.bytes.len()));
+    }
+
+    let mut declares_count = 1usize.saturating_add(entry.declares.len());
+    let mut data_count = 0usize;
+    let mut touches_tls = false;
+    let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
+    let mut idx = 0usize;
+    while let Some(&static_sym) = work_named.get(idx) {
+        idx += 1;
+        if static_sym.0 == descriptor {
+            touches_tls = true;
+            continue;
+        }
+        if child.told.contains(&static_sym.0) || !seen_told.insert(static_sym.0) {
+            continue;
+        }
+        let Some(datum) = datums.get(&static_sym.0) else {
+            continue;
+        };
+        data_count = data_count.saturating_add(1);
+        declares_count = declares_count.saturating_add(datum.declares.len());
+        if !child.sent_records.contains(&datum.record.0) && seen_records.insert(datum.record.0) {
+            total = total.saturating_add(inline_bytes_cost(datum.bytes.len()));
+        }
+        work_named.extend_from_slice(datum.named.as_slice());
+    }
+
+    total = total.saturating_add(FRAME_OVERHEAD.saturating_add(declares_count.saturating_mul(DECLARE_PAIR_BYTES)));
+    if data_count > 0 {
+        total = total.saturating_add(FRAME_OVERHEAD.saturating_add(data_count.saturating_mul(DATA_ITEM_BYTES)));
+    }
+    if touches_tls {
+        total = total.saturating_add(TLS_FRAME_BYTES);
+    }
+    total = total.saturating_add(PUBLISH_BASE_BYTES.saturating_add(entry.values.len()));
+    total
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use crate::run_parent::wire_out;
+
+    #[test]
+    fn preflight_accounts_for_transitive_datums_and_framing_without_mutating_child() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let fn_sym = Symbol([0x10; 32]);
+        let fn_rec = RecordId([0x11; 32]);
+        let d1_sym = Symbol([0x20; 32]);
+        let d1_rec = RecordId([0x21; 32]);
+        let d2_sym = Symbol([0x30; 32]);
+        let d2_rec = RecordId([0x31; 32]);
+
+        let mut fn_bytes = Vec::with_capacity_in(512, alloc);
+        fn_bytes.resize(512, 0xAA);
+        let mut d1_bytes = Vec::with_capacity_in(256 * 1024, alloc);
+        d1_bytes.resize(256 * 1024, 0xBB);
+        // Second transitive datum spans two `BYTES_PART_MOST` (4 MiB) wire chunks.
+        let mut d2_bytes = Vec::with_capacity_in((4 << 20) + 128 * 1024, alloc);
+        d2_bytes.resize((4 << 20) + 128 * 1024, 0xCC);
+
+        let mut d1_named = Vec::new_in(alloc);
+        d1_named.push(d2_sym);
+        let mut datums: Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>> =
+            Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None });
+        datums.insert(
+            d1_sym.0,
+            CachedDatum {
+                record: d1_rec,
+                bytes: d1_bytes,
+                declares: Vec::new_in(alloc),
+                named: d1_named,
+                entered: None,
+                unkeyed: false,
+                purity: Ok(()),
+            },
+        );
+        datums.insert(
+            d2_sym.0,
+            CachedDatum {
+                record: d2_rec,
+                bytes: d2_bytes,
+                declares: Vec::new_in(alloc),
+                named: Vec::new_in(alloc),
+                entered: None,
+                unkeyed: false,
+                purity: Ok(()),
+            },
+        );
+
+        let mut fn_named = Vec::new_in(alloc);
+        fn_named.push(d1_sym);
+        let mut fn_declares = Vec::new_in(alloc);
+        fn_declares.push(Symbol([0x40; 32]));
+        let entry = CachedPub {
+            key: CodeKey(blaze_ids::ContentId([0x01; 32])),
+            record: fn_rec,
+            bytes: fn_bytes,
+            declares: fn_declares,
+            named: fn_named,
+            values: Vec::new_in(alloc),
+            lands: false,
+            purity: Ok(()),
+            entered: None,
+            unkeyed: false,
+            tabled: None,
+        };
+
+        let child = ChildSent::new(alloc);
+        let estimated = preflight_entry_wire_bytes(&entry, &datums, &child, alloc);
+        // Must NOT mutate `child` and MUST account for both transitive datums (> 4.3 MiB),
+        // not just the 512-byte function record.
+        assert!(child.told.is_empty());
+        assert!(child.sent_records.is_empty());
+        assert!(estimated > (4 << 20) + 384 * 1024, "preflight missed transitive datums: {estimated}");
+
+        // Publish the exact same records via `Needs::publish_precomputed` and verify the
+        // preflight estimate is a true upper bound (`actual <= estimated`).
+        let d1 = datums.get(&d1_sym.0).expect("d1");
+        let d2 = datums.get(&d2_sym.0).expect("d2");
+        let data = [
+            Datum { symbol: d1_sym, record: d1_rec },
+            Datum { symbol: d2_sym, record: d2_rec },
+        ];
+        let named = [d1_sym, d2_sym];
+        let inline = [
+            (fn_rec, entry.bytes.as_slice()),
+            (d1_rec, d1.bytes.as_slice()),
+            (d2_rec, d2.bytes.as_slice()),
+        ];
+        let mut needs = Needs::new(alloc);
+        let mut out = wire_out(alloc);
+        assert!(
+            needs
+                .publish_precomputed(
+                    fn_sym,
+                    fn_rec,
+                    entry.declares.as_slice(),
+                    &data,
+                    &named,
+                    entry.values.as_slice(),
+                    &inline,
+                    &mut out,
+                )
+                .expect("publish_precomputed")
+        );
+        assert!(
+            out.len() <= estimated,
+            "actual encoded wire bytes ({}) exceeded preflight upper bound ({estimated})",
+            out.len(),
+        );
     }
 }

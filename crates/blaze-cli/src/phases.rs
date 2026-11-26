@@ -10,9 +10,10 @@ use bstd::clock::{Clock, Instant};
 
 pub(crate) mod byte_rows;
 
-/// The most phases one command marks: tempo's edit marked 16 when the open checkout was one
-/// phase (2026-11-20, score-c1725wave42), and its parts are four more (engine_check.rs `edge`).
-const MOST: usize = 24;
+/// The most phases one command marks: `blaze test` and `blaze run` mark ~20 check phases plus
+/// SDK resolution and start phases (`body_ids`, `test_prepare`, `test_open_suites`, `test_run`,
+/// `program_run`); 64 leaves ample headroom so no phase is ever merged into the last row.
+const MOST: usize = 64;
 
 pub struct Phases {
     clock: Clock,
@@ -378,6 +379,8 @@ impl Phases {
         self.since(self.began)
     }
 
+
+
     pub(crate) fn write_lowering_stats(&self, cx: &bstd::Cx, err: &bstd::out::Out) -> Result<(), bstd::out::OutError> {
         if let Some(tally) = self.code_records {
             err.line(cx, format_args!("blaze: {}", tally.lowerings))?;
@@ -432,8 +435,10 @@ impl fmt::Display for Phases {
             writeln!(f, "             the mean one: {}", spread.mean())?;
             writeln!(f, "             each counter's most: {}", spread.most)?;
         }
-        reconciled(f, &self.accounted(), &blaze_meter::Process::now())?;
-        floors(f, &self.accounted(), &self.used[..self.len])?;
+        let accounted = self.accounted();
+        let tag_snap = blaze_mem::tag::snapshot();
+        reconciled(f, &accounted, &blaze_meter::Process::now(), &tag_snap)?;
+        floors(f, &accounted, &self.used[..self.len])?;
         writeln!(f, "names        worlds made {}", self.worlds)?;
         let r = self.request;
         writeln!(
@@ -486,7 +491,7 @@ impl fmt::Display for Phases {
             memory_line(f, "by the first chunk", calls)?;
         }
         memory_line(f, "by the profile", &blaze_mem::syscalls::snapshot())?;
-        held_line(f, &blaze_mem::tag::snapshot())
+        held_line(f, &tag_snap)
     }
 }
 
@@ -494,9 +499,13 @@ impl fmt::Display for Phases {
 /// and the stretches beside them accounted; a share under [`ACCOUNTED_PERCENT`] is a line of
 /// its own, `UNACCOUNTED <counter>: <amount>`. The process's heap is blaze-mem's churn, folded
 /// a batch at a time per thread (counted.rs), so it may trail the meter's by a batch a thread.
-fn reconciled(f: &mut fmt::Formatter<'_>, accounted: &blaze_meter::Used, process: &blaze_meter::Process) -> fmt::Result {
+fn reconciled(
+    f: &mut fmt::Formatter<'_>,
+    accounted: &blaze_meter::Used,
+    process: &blaze_meter::Process,
+    s: &blaze_mem::tag::Snapshot,
+) -> fmt::Result {
     use blaze_meter::{Bytes, Count, Large, Ns, Reading};
-    let s = blaze_mem::tag::snapshot();
     let heap = blaze_mem::Tag::ALL.iter().fold(s.heap_outside_allocated, |sum, tag| sum.saturating_add(s.get(*tag).heap_allocated));
     let a = accounted.system;
     let p = process.system;
@@ -658,5 +667,39 @@ mod tests {
         p.worked_used("bodies", &spread);
         assert_eq!(p.beside_len, 1);
         assert_eq!(p.beside[0].1.n, 1);
+    }
+
+    #[test]
+    fn start_phases_past_twenty_four_are_recorded_individually() {
+        let io = Io::simulated(SimWorld::new(9, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("the simulated context");
+        let frame = cx.frame();
+        let mut phases = Phases::new(io.need_clock().expect("clock"));
+        for _ in 0..23 {
+            phases.mark_cx(&cx, "check_phase", frame);
+        }
+        phases.mark_cx(&cx, "test_open_suites", frame);
+        phases.mark_cx(&cx, "test_run", frame);
+        phases.mark_cx(&cx, "program_run", frame);
+        assert_eq!(phases.len, 26);
+        assert_eq!(phases.rows[23].0, "test_open_suites");
+        assert_eq!(phases.rows[24].0, "test_run");
+        assert_eq!(phases.rows[25].0, "program_run");
+        let profile = std::format!("{phases}");
+        assert!(profile.contains("phase used   test_open_suites:"), "{profile}");
+        assert!(profile.contains("phase used   test_run:"), "{profile}");
+        assert!(profile.contains("phase used   program_run:"), "{profile}");
+    }
+
+    #[test]
+    fn in_main_tracks_elapsed_time() {
+        let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
+        let clock = io.need_clock().expect("clock");
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("cx");
+        let phases = Phases::new(io.need_clock().expect("clock"));
+        let before = phases.in_main();
+        clock.sleep(&cx, core::time::Duration::from_millis(5)).expect("sleep");
+        let after = phases.in_main();
+        assert!(after >= before.saturating_add(5_000_000), "expected >= 5ms elapsed, got {before} -> {after}");
     }
 }

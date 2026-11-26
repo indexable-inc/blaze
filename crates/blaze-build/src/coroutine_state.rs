@@ -315,6 +315,7 @@ pub fn may_partial_move_bindings<'a>(body: &blaze_typeck::BodyView<'_>, checked:
                 mark(&mut out, base);
             }
             Expr::Match { scrutinee, .. } => mark(&mut out, scrutinee),
+            Expr::Let { init, .. } => mark(&mut out, init),
             Expr::Struct { base: blaze_typeck::StructBase::Expr(base), .. } | Expr::Record { base: blaze_typeck::StructBase::Expr(base), .. } => mark(&mut out, base),
             Expr::Closure { .. } | Expr::AsyncBlock { .. } => {
                 if let Ok(ix) = u32::try_from(i) {
@@ -333,6 +334,11 @@ pub fn may_partial_move_bindings<'a>(body: &blaze_typeck::BodyView<'_>, checked:
     for s in body.stmts.iter() {
         if let Stmt::Let { init: Some(init), .. } = *s {
             mark(&mut out, init);
+        }
+    }
+    for (&e, kind) in checked.adjusts.column::<0>().iter().zip(checked.adjusts.column::<1>().iter()) {
+        if matches!(kind, blaze_typeck::AdjustKind::Deref { .. }) {
+            mark(&mut out, e);
         }
     }
     out

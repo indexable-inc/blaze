@@ -299,7 +299,16 @@ impl<'h> BodyHost<'h> {
 
 impl<'h, F: FnOnce() -> Option<FilePaths<'h>>, G: FnOnce() -> Option<Placed<'h>>> ExpandCx for BodyHost<'h, F, G> {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
-        self.sources.ok_or(refused(HostAsk::Env))?.env(self.krate, name)
+        let sources = self.sources.ok_or(refused(HostAsk::Env))?;
+        let value = sources.env(self.krate, name)?;
+        if value.is_none()
+            && name == "STD_ENV_ARCH"
+            && sources.env(self.krate, "CARGO_CRATE_NAME").ok().flatten() == Some("std")
+            && let Some(arch) = self.atoms.iter().find_map(|&(k, v)| (k == "target_arch").then_some(v).flatten())
+        {
+            return Ok(Some(arch));
+        }
+        Ok(value)
     }
 
     /// The crate's cfg atoms: a predicate is true exactly when the crate is compiled with it.

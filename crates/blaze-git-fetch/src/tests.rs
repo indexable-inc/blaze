@@ -375,7 +375,7 @@ fn read_back(
     let mut index = PlantedIndex::new_planted(&built.pack, pack, heap(), plant).map_err(ReadBack::Pack)?;
     let mut listed = StdVec::new();
     files(&mut index, built.commit, tree, heap(), |file| {
-        listed.push((file.path.to_string(), file.mode, file.object));
+        listed.push((file.path.to_string(), file.mode, file.object.expect("blob")));
     })
     .map_err(ReadBack::Tree)?;
     let mut got = BTreeMap::new();
@@ -842,8 +842,37 @@ fn names_that_leave_the_checkout_are_refused() {
     for name in [&b".."[..], b".", b".git", b".GIT", b"a\\b", b"", b"\xff"] {
         assert_eq!(walk(name, 0o100644, NoPlant), Err(TreeWhy::Name), "{name:?}");
     }
-    assert_eq!(walk(b"sub", 0o160000, NoPlant), Err(TreeWhy::Submodule));
+    assert_eq!(walk(b"sub", 0o160000, NoPlant), Ok(1));
+    assert_eq!(walk(b"..", 0o160000, NoPlant), Err(TreeWhy::Name));
     assert_eq!(walk(b"odd", 0o100600, NoPlant), Err(TreeWhy::Mode { mode: 0o100600 }));
+}
+
+#[test]
+fn gitlink_submodule_is_reported_with_pinned_oid_and_no_blob() {
+    // Submodule commit OID is NOT present as an object in the parent packfile.
+    let sub_commit = Oid([0xab; 20]);
+    let mut tree = b"160000 third_party/v8\0".to_vec();
+    // Put it inside a directory so we test nested submodule paths cleanly.
+    let _ = tree.drain(..);
+    tree.extend_from_slice(b"160000 v8\0");
+    tree.extend_from_slice(&sub_commit.0);
+    let mut root = b"40000 third_party\0".to_vec();
+    root.extend_from_slice(&Oid::of(Kind::Tree, &tree).0);
+    let commit = format!("tree {}\n\nm\n", Oid::of(Kind::Tree, &root)).into_bytes();
+    let commit_oid = Oid::of(Kind::Commit, &commit);
+    let objects = vec![
+        (Kind::Tree, tree, How::Whole),
+        (Kind::Tree, root, How::Whole),
+        (Kind::Commit, commit, How::Whole),
+    ];
+    let pack = write_pack(&objects, &[StdVec::new(), StdVec::new(), StdVec::new()], &[false; 3]);
+    let mut index = PlantedIndex::new_planted(&pack, PACK, heap(), NoPlant).expect("read");
+    let mut seen = StdVec::new();
+    files(&mut index, commit_oid, TREE, heap(), |file| {
+        seen.push((file.path.to_string(), file.mode, file.oid, file.object));
+    })
+    .expect("walk with gitlink");
+    assert_eq!(seen, vec![("third_party/v8".to_string(), Mode::Submodule, sub_commit, None)]);
 }
 
 /// The invariant of the name `..`.
@@ -993,4 +1022,245 @@ fn answers_are_read_as_v2_says() {
     pkt(b"packfile\n", &mut error);
     pkt(b"\x03fatal: no such object\n", &mut error);
     assert_eq!(fetched_pack(&error, 1 << 20, &mut Vec::new_in(heap())), Err(crate::PktWhy::Remote));
+}
+
+#[test]
+fn v1_pack_index_parses_searches_and_reads_objects() {
+    use crate::store::{Idx, ObjectDb, ObjectSource, StoreWhy};
+
+    let blob_a = b"alpha v1\n";
+    let blob_b = b"beta v1\n";
+    let oid_a = Oid::of(Kind::Blob, blob_a);
+    let oid_b = Oid::of(Kind::Blob, blob_b);
+
+    // Build a minimal packfile containing both blobs and record their offsets.
+    let mut pack = b"PACK".to_vec();
+    pack.extend_from_slice(&2u32.to_be_bytes());
+    pack.extend_from_slice(&2u32.to_be_bytes());
+    let mut items: StdVec<(Oid, u32)> = StdVec::new();
+    for (oid, bytes) in [(oid_a, blob_a.as_slice()), (oid_b, blob_b.as_slice())] {
+        let off = pack.len() as u32;
+        items.push((oid, off));
+        let mut size = bytes.len() as u64;
+        let mut byte = (3u8 << 4) | (size & 0x0f) as u8;
+        size >>= 4;
+        while size > 0 {
+            pack.push(byte | 0x80);
+            byte = (size & 0x7f) as u8;
+            size >>= 7;
+        }
+        pack.push(byte);
+        let mut z = Vec::new_in(heap());
+        blaze_deflate::zlib(bytes, blaze_deflate::Level::Fast, heap(), &mut z).expect("zlib");
+        pack.extend_from_slice(z.as_slice());
+    }
+    let pack_sha = crate::sha1::sha1(&pack);
+    pack.extend_from_slice(&pack_sha);
+
+    // Build a valid Git v1 .idx (no 8-byte signature): 256-entry fanout + sorted (be32 offset, 20-byte oid) + 40-byte trailer.
+    items.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    let mut idx = StdVec::new();
+    for first in 0..=255u8 {
+        let count = items.iter().filter(|(oid, _)| oid.0[0] <= first).count() as u32;
+        idx.extend_from_slice(&count.to_be_bytes());
+    }
+    for (oid, off) in &items {
+        idx.extend_from_slice(&off.to_be_bytes());
+        idx.extend_from_slice(&oid.0);
+    }
+    idx.extend_from_slice(&pack_sha);
+    let idx_sha = crate::sha1::sha1(&idx);
+    idx.extend_from_slice(&idx_sha);
+
+    let parsed = Idx::parse(&idx, 16).expect("v1 idx parses");
+    assert_eq!(parsed.len(), 2);
+    let pack_end = pack.len() as u64 - 20;
+    for (oid, off) in &items {
+        let at = parsed.search(oid).expect("oid found in v1 idx");
+        assert_eq!(parsed.offset(at, pack_end), Ok(*off as u64));
+    }
+
+    struct MemPack<'a>(&'a [u8]);
+    impl ObjectSource<blaze_own::Alloc<'static>> for MemPack<'_> {
+        fn read_loose(&mut self, _: &Oid, _: &mut Vec<u8, blaze_own::Alloc<'static>>) -> Result<bool, StoreWhy> {
+            Ok(false)
+        }
+        fn read_pack_range(
+            &mut self,
+            pack_idx: usize,
+            offset: u64,
+            len: u64,
+            out: &mut Vec<u8, blaze_own::Alloc<'static>>,
+        ) -> Result<bool, StoreWhy> {
+            if pack_idx != 0 {
+                return Ok(false);
+            }
+            let start = offset as usize;
+            let end = start + len as usize;
+            let Some(slice) = self.0.get(start..end) else { return Ok(false) };
+            out.clear();
+            out.extend_from_slice(slice);
+            Ok(true)
+        }
+    }
+
+    let mut db = ObjectDb::new(&[(&idx, pack.len() as u64)], PACK, heap()).expect("odb");
+    let mut src = MemPack(&pack);
+    let mut out = Vec::new_in(heap());
+    assert_eq!(db.read_object(&oid_a, &mut src, &mut out), Ok(Some(Kind::Blob)));
+    assert_eq!(out.as_slice(), blob_a);
+    assert_eq!(db.read_object(&oid_b, &mut src, &mut out), Ok(Some(Kind::Blob)));
+    assert_eq!(out.as_slice(), blob_b);
+
+    // Repeated reads of the same OID charge `most_objects` and `most_total` only once.
+    {
+        let tight = crate::PackLimits {
+            most_objects: 2,
+            most_object: 1024,
+            most_total: (blob_a.len() + blob_b.len()) as u64,
+            most_depth: 8,
+            most_cache: 0,
+        };
+        let mut tight_db = ObjectDb::new(&[(&idx, pack.len() as u64)], tight, heap()).expect("tight odb");
+        for _ in 0..4 {
+            assert_eq!(tight_db.read_object(&oid_a, &mut src, &mut out), Ok(Some(Kind::Blob)));
+            assert_eq!(out.as_slice(), blob_a);
+            assert_eq!(tight_db.read_object(&oid_b, &mut src, &mut out), Ok(Some(Kind::Blob)));
+            assert_eq!(out.as_slice(), blob_b);
+        }
+    }
+
+    // Delta base and intermediates charged during delta resolution are recorded in `charged_oids`
+    // so subsequently reading the base directly does not double-charge it.
+    {
+        let base_bytes = b"0123456789abcdef0123456789abcdef";
+        let derived_bytes = b"0123456789abcdef0123456789abcdef_ext";
+        let base_oid = Oid::of(Kind::Blob, base_bytes);
+        let derived_oid = Oid::of(Kind::Blob, derived_bytes);
+        // Delta stream: base len (32), result len (36), copy 32 bytes from offset 0, insert "_ext".
+        let delta_stream = [32u8, 36u8, 0x80 | 0x10, 32u8, 4u8, b'_', b'e', b'x', b't'];
+        let mut dpack = StdVec::new();
+        dpack.extend_from_slice(b"PACK");
+        dpack.extend_from_slice(&2u32.to_be_bytes());
+        dpack.extend_from_slice(&2u32.to_be_bytes());
+        let base_off = dpack.len() as u32;
+        {
+            let mut size = base_bytes.len() as u64;
+            let mut b = (3u8 << 4) | (size & 0x0f) as u8;
+            size >>= 4;
+            while size > 0 {
+                dpack.push(b | 0x80);
+                b = (size & 0x7f) as u8;
+                size >>= 7;
+            }
+            dpack.push(b);
+            let mut zb = Vec::new_in(heap());
+            blaze_deflate::zlib(base_bytes, blaze_deflate::Level::Fast, heap(), &mut zb).expect("zlib");
+            dpack.extend_from_slice(zb.as_slice());
+        }
+        let delta_off = dpack.len() as u32;
+        // Type 6 = OFS_DELTA, inflated size = delta_stream.len() (9).
+        dpack.push((6u8 << 4) | (delta_stream.len() as u8));
+        // Encoded positive offset back = delta_off - base_off (< 128 -> single byte).
+        let back = delta_off - base_off;
+        assert!(back < 128);
+        dpack.push(back as u8);
+        let mut zdelta = Vec::new_in(heap());
+        blaze_deflate::zlib(delta_stream.as_slice(), blaze_deflate::Level::Fast, heap(), &mut zdelta).expect("zlib");
+        dpack.extend_from_slice(zdelta.as_slice());
+        let dpack_sha = crate::sha1::sha1(&dpack);
+        dpack.extend_from_slice(&dpack_sha);
+
+        let mut ditems = vec![(base_oid, base_off), (derived_oid, delta_off)];
+        ditems.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        let mut didx = StdVec::new();
+        for first in 0..=255u8 {
+            let c = ditems.iter().filter(|(o, _)| o.0[0] <= first).count() as u32;
+            didx.extend_from_slice(&c.to_be_bytes());
+        }
+        for (o, off) in &ditems {
+            didx.extend_from_slice(&off.to_be_bytes());
+            didx.extend_from_slice(&o.0);
+        }
+        didx.extend_from_slice(&dpack_sha);
+        let didx_sha = crate::sha1::sha1(&didx);
+        didx.extend_from_slice(&didx_sha);
+
+        let tight = crate::PackLimits {
+            most_objects: 2,
+            most_object: 1024,
+            most_total: (base_bytes.len() + derived_bytes.len()) as u64,
+            most_depth: 8,
+            most_cache: 0,
+        };
+        let mut ddb = ObjectDb::new(&[(&didx, dpack.len() as u64)], tight, heap()).expect("delta odb");
+        let mut dsrc = MemPack(&dpack);
+        // Read delta FIRST (charges base + derived), then base directly (must NOT double-charge base).
+        assert_eq!(ddb.read_object(&derived_oid, &mut dsrc, &mut out), Ok(Some(Kind::Blob)));
+        assert_eq!(out.as_slice(), derived_bytes);
+        assert_eq!(ddb.read_object(&base_oid, &mut dsrc, &mut out), Ok(Some(Kind::Blob)));
+        assert_eq!(out.as_slice(), base_bytes);
+    }
+
+    // Flipping a bit in a v1 .idx OID table is caught by ObjectDb::new via trailer SHA-1 verification.
+    let mut flipped_v1 = idx.clone();
+    flipped_v1[1024 + 4] ^= 0x01;
+    assert!(matches!(
+        ObjectDb::new(&[(&flipped_v1, pack.len() as u64)], PACK, heap()),
+        Err((_, StoreWhy::Id { .. }))
+    ));
+
+    // Unsorted OID table with a recomputed valid SHA-1 trailer is rejected by verify_ordering.
+    {
+        let mut unsorted = idx.clone();
+        // Swap the two 24-byte v1 entries while keeping the fanout counts unchanged.
+        let mut e0 = [0u8; 24];
+        let mut e1 = [0u8; 24];
+        e0.copy_from_slice(&unsorted[1024..1048]);
+        e1.copy_from_slice(&unsorted[1048..1072]);
+        unsorted[1024..1048].copy_from_slice(&e1);
+        unsorted[1048..1072].copy_from_slice(&e0);
+        let body_len = unsorted.len() - 20;
+        let sha = crate::sha1::sha1(&unsorted[..body_len]);
+        unsorted[body_len..].copy_from_slice(&sha);
+        assert!(matches!(
+            ObjectDb::new(&[(&unsorted, pack.len() as u64)], PACK, heap()),
+            Err((_, StoreWhy::IdxFanout { .. }))
+        ));
+    }
+
+    // Valid v2 .idx with unsorted OIDs in the same bucket (and recomputed valid SHA-1 trailer)
+    // is rejected by verify_ordering.
+    {
+        let mut id_hi = [0x42u8; 20];
+        let mut id_lo = [0x42u8; 20];
+        id_hi[19] = 0x02;
+        id_lo[19] = 0x01;
+        let mut v2 = StdVec::new();
+        v2.extend_from_slice(&[0xff, b't', b'O', b'c']);
+        v2.extend_from_slice(&2u32.to_be_bytes());
+        for b in 0..=255u8 {
+            let c: u32 = if b < 0x42 { 0 } else { 2 };
+            v2.extend_from_slice(&c.to_be_bytes());
+        }
+        // Out of order inside bucket 0x42: id_hi before id_lo.
+        v2.extend_from_slice(&id_hi);
+        v2.extend_from_slice(&id_lo);
+        // 2 CRC32s + 2 offsets (12 and 24).
+        v2.extend_from_slice(&[0u8; 8]);
+        v2.extend_from_slice(&12u32.to_be_bytes());
+        v2.extend_from_slice(&24u32.to_be_bytes());
+        v2.extend_from_slice(&pack_sha);
+        let sha = crate::sha1::sha1(&v2);
+        v2.extend_from_slice(&sha);
+        assert!(matches!(
+            ObjectDb::new(&[(&v2, pack.len() as u64)], PACK, heap()),
+            Err((_, StoreWhy::IdxFanout { byte: 0x42 }))
+        ));
+    }
+
+    // Non-v1 garbage of >= 1064 bytes with monotonic zeros (0 objects) + trailing extra bytes is rejected as IdxMagic.
+    let mut bad = vec![0u8; 1065];
+    bad[0] = 0;
+    assert_eq!(Idx::parse(&bad, 16).err(), Some((0, StoreWhy::IdxMagic)));
 }

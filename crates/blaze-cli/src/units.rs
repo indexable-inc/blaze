@@ -37,11 +37,17 @@ pub const TOOLCHAIN_NAMED: u16 = 9;
 /// rest of the workspace checked. Its arguments: the kind's table name (`test`, `example`,
 /// `bench`), the target's name, the package's name and the rule that refused it.
 pub const TARGET_REFUSED: u16 = 15;
+/// The finding number of an internal workspace member whose `std` is Rust's `std` while
+/// `[workspace.metadata.blaze] std = "bstd"` requires bstd. Its arguments: the member's package
+/// name and its current Rust edition (`2015`, `2018`, `2021`, `2024`).
+pub const STD_NOT_BSTD: u16 = 49;
 /// The workspace's lock, at its root.
 const LOCK: &str = "Cargo.lock";
 
-/// 4: a member's units list the units of each workspace member it depends on (`member_units`).
-const UNITS_OUT_DOMAIN: &str = "blaze-cli units out 4";
+/// 5: includes the workspace `[workspace.metadata.blaze] std` policy flag (`require_bstd`) for
+/// the member (rule 21); 4: a member's units list the units of each workspace member it depends
+/// on (`member_units`).
+const UNITS_OUT_DOMAIN: &str = "blaze-cli units out 5";
 const MEMBER_SOURCE_DOMAIN: &str = "blaze-cli member source 1";
 /// Passes the layout may ask for: the depth of its search (root, globs, path dependencies,
 /// target directories), far under this on any workspace (rule 18).
@@ -172,6 +178,8 @@ pub fn lay<'f, 'l>(
     match laid {
         Ok(units) => {
             member_deps = crate::unused_deps::extract_from_layout(&units, &paths, frame);
+            let root_text = usize::try_from(units.root.0).ok().filter(|&id| id < texts.len()).map_or("", |id| texts.text(id));
+            let std_policy = parse_std_policy(root_text, &mut root_made, frame);
             // With no dependency outside the workspace and the toolchain there is no graph:
             // the lock is not read (nothing in it can change the answer), so a stale one costs
             // nothing and a lock edit moves no key.
@@ -193,7 +201,8 @@ pub fn lay<'f, 'l>(
             for k in deps_first(&units.members, frame).iter().copied() {
                 let member = &units.members[k];
                 let id = member.manifest.0 as usize;
-                let made = member_units(Name::manifest(paths.text(id).as_bytes()), member, texts.text(id), toolchain, (&units.members[..], &listed[..]), frame);
+                let require_bstd = std_policy.requires_bstd(member.name.as_str());
+                let made = member_units(Name::manifest(paths.text(id).as_bytes()), member, texts.text(id), toolchain, require_bstd, (&units.members[..], &listed[..]), frame);
                 listed[k] = Some((made.name, member_source(&made)));
                 made_of[k] = Some(made);
             }
@@ -387,6 +396,102 @@ fn deps_first<'f>(members: &[layout::Member<'_>], frame: &'f Frame) -> Vec<usize
     order
 }
 
+/// Workspace-level standard library policy read from `[workspace.metadata.blaze]` in the root
+/// `Cargo.toml`:
+/// - `std = "bstd"` requires every internal workspace member (except pure proc-macro crates and
+///   members named in `std-allow-rust`) to use a blaze edition (`std` is `bstd`).
+/// - `std = "rust"` (or absent) preserves ordinary Rust workspaces.
+struct StdPolicy<'f> {
+    require_bstd: bool,
+    allow_rust: Vec<&'f str, &'f Frame>,
+}
+
+impl<'f> StdPolicy<'f> {
+    fn rust(frame: &'f Frame) -> StdPolicy<'f> {
+        StdPolicy { require_bstd: false, allow_rust: Vec::new_in(frame) }
+    }
+
+    fn requires_bstd(&self, member_name: &str) -> bool {
+        self.require_bstd && !self.allow_rust.iter().any(|allowed| *allowed == member_name)
+    }
+}
+
+/// A TOML item's byte range narrowed to `(u32, u32)` for a finding's span.
+fn span_u32(span: core::ops::Range<usize>) -> (u32, u32) {
+    (u32::try_from(span.start).unwrap_or(u32::MAX), u32::try_from(span.end).unwrap_or(u32::MAX))
+}
+
+/// Parse `[workspace.metadata.blaze]` `std` and `std-allow-rust` from the root `Cargo.toml` text.
+/// Any malformed value emits a hard [`UNREAD`] finding on `root_made` at the TOML item's byte
+/// span (rules 3 and 19).
+fn parse_std_policy<'f>(manifest: &str, root_made: &mut Made<'f>, frame: &'f Frame) -> StdPolicy<'f> {
+    let doc = match blaze_toml::Document::parse_in(manifest, blaze_toml::Limits::CARGO, frame) {
+        Ok(doc) => doc,
+        Err(error) => {
+            let words = bstd::mem::format_in!(frame, "the root `Cargo.toml` could not be read for `[workspace.metadata.blaze]`: {error}");
+            let at = u32::try_from(error.at).unwrap_or(u32::MAX);
+            root_made.find(UNREAD, (at, at), &[words.as_str()]);
+            return StdPolicy::rust(frame);
+        }
+    };
+    let Some(blaze) = doc.root().get("workspace").and_then(|it| it.get("metadata")).and_then(|it| it.get("blaze")) else {
+        return StdPolicy::rust(frame);
+    };
+    if !blaze.is_table() {
+        root_made.find(UNREAD, span_u32(blaze.span()), &["`[workspace.metadata.blaze]` is not a table"]);
+        return StdPolicy::rust(frame);
+    }
+    let mut require_bstd = false;
+    if let Some(item) = blaze.get("std") {
+        let at = span_u32(item.span());
+        match item.as_str() {
+            Some("bstd") => require_bstd = true,
+            Some("rust") => require_bstd = false,
+            Some(other) => {
+                let words = bstd::mem::format_in!(frame, "`[workspace.metadata.blaze] std` is `{other}`, which is not valid: name `\"bstd\"` or `\"rust\"`");
+                root_made.find(UNREAD, at, &[words.as_str()]);
+            }
+            None => {
+                root_made.find(UNREAD, at, &["`[workspace.metadata.blaze] std` is not a string: name `\"bstd\"` or `\"rust\"`"]);
+            }
+        }
+    }
+    let mut allow_rust = Vec::new_in(frame);
+    if let Some(allow) = blaze.get("std-allow-rust") {
+        if !allow.is_array() {
+            root_made.find(
+                UNREAD,
+                span_u32(allow.span()),
+                &["`[workspace.metadata.blaze] std-allow-rust` is not an array: write member package names, `std-allow-rust = [\"crate-a\"]`"],
+            );
+        } else {
+            for entry in allow.children() {
+                match entry.as_str() {
+                    Some(name) => allow_rust.push(&*frame.alloc_str(name)),
+                    None => {
+                        root_made.find(
+                            UNREAD,
+                            span_u32(entry.span()),
+                            &["an entry of `[workspace.metadata.blaze] std-allow-rust` is not a string: write a workspace member package name"],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    StdPolicy { require_bstd, allow_rust }
+}
+
+/// The manifest spelling of a Rust edition (`2015`, `2018`, `2021`, `2024`).
+fn rust_edition_name(edition: edition::Edition) -> &'static str {
+    match edition {
+        edition::Edition::Edition2015 => "2015",
+        edition::Edition::Edition2018 => "2018",
+        edition::Edition::Edition2021 => "2021",
+        edition::Edition::Edition2024 => "2024",
+    }
+}
+
 /// A member's units: its crate roots, the units of each member it depends on, and a finding on
 /// a blaze-edition line naming the toolchain's crate.
 ///
@@ -399,6 +504,7 @@ fn member_units<'f>(
     member: &layout::Member<'_>,
     text: &str,
     toolchain: blaze_toolchain::ToolchainId,
+    require_bstd: bool,
     (members, listed): (&[layout::Member<'_>], &[Option<(Name, ContentId)>]),
     frame: &'f Frame,
 ) -> Made<'f> {
@@ -460,11 +566,25 @@ fn member_units<'f>(
             made.find(TOOLCHAIN_NAMED, whole_line(text, dep.span), &[dep.name.as_str()]);
         }
     }
+    // Workspace-level `[workspace.metadata.blaze] std = "bstd"` gate: refuse any internal
+    // workspace member whose `std` is Rust's `std`, except pure proc-macro crates (whose targets
+    // are always host-side Rust/wasm units by `blaze-unit-graph::implicit`) and members listed in
+    // `std-allow-rust`.
+    let pure_proc_macro = member.lib.as_ref().is_some_and(|lib| lib.proc_macro) && member.bins.is_empty() && member.extras.is_empty();
+    if require_bstd && !pure_proc_macro && implicit(member.edition, &UnitKind::Lib).std == StdIs::Rust {
+        made.find(
+            STD_NOT_BSTD,
+            (member.span.start, member.span.end),
+            &[member.name.as_str(), "\x1f", rust_edition_name(member.edition.syntax)],
+        );
+    }
     // What reads the units sees what each crate is given with nothing in the manifest, by the
     // one rule (blaze-unit-graph `implicit`), and from which toolchain: the toolchain's id is in
-    // this record's output and in no other key (toolchain.md, section 1).
+    // this record's output and in no other key (toolchain.md, section 1). The member's `std`
+    // policy flag is hashed too so toggling `std = "bstd"` or `std-allow-rust` moves the output
+    // (rule 21).
     let mut out = blaze_ids::Hasher::new(UNITS_OUT_DOMAIN);
-    out.update(&parts_out(&made.parts).0).update(&toolchain.0);
+    out.update(&parts_out(&made.parts).0).update(&toolchain.0).update(&[u8::from(require_bstd)]);
     // A binary, an integration test, an example and a bench are given what a library is.
     let like_lib = member.bins.len() + member.extras.len();
     let kinds = member.lib.iter().map(|lib| if lib.proc_macro { UnitKind::ProcMacro } else { UnitKind::Lib }).chain((0..like_lib).map(|_| UnitKind::Lib));
@@ -918,5 +1038,185 @@ version = \"0.1.0\"
         assert!(units.iter().any(|u| u.as_str() == "helper"), "units: {units:?}");
         let (src_b, _, _, _, _) = run_once(patched_b);
         assert_ne!(src_a, src_b, "editing patched Cargo.toml must invalidate units_source");
+    }
+
+    #[test]
+    fn std_bstd_refuses_rust_edition_workspace_member() {
+        const ROOT_BSTD: &str = "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = \"bstd\"\n";
+        const ROOT_RUST: &str = "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = \"rust\"\n";
+        const ROOT_ABSENT: &str = "[workspace]\nmembers = [\"app\"]\n";
+        const APP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+
+        let mut bstd_out = ContentId([0; 32]);
+        let mut bstd_locate = Locate::Source(ContentId([0; 32]));
+        laid_of(&[("Cargo.toml", ROOT_BSTD), ("app/Cargo.toml", APP), ("app/src/lib.rs", "")], |laid| {
+            assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+            let [(name, member)] = laid.members.as_slice() else { panic!("one member: {}", laid.members.len()) };
+            assert_eq!(*name, Name::manifest(b"app/Cargo.toml"));
+            let [(rule, start, end, at, to)] = member.findings.as_slice() else {
+                panic!("expected one STD_NOT_BSTD finding, got {:?}", member.findings);
+            };
+            let start = usize::try_from(*start).expect("start fits usize");
+            let end = usize::try_from(*end).expect("end fits usize");
+            assert_eq!(*rule, STD_NOT_BSTD);
+            assert_eq!(&APP[start..end], "[package]");
+            assert_eq!(&member.messages[*at..*to], b"app\x1f2024");
+            bstd_out = member.out;
+            bstd_locate = laid.root.parts[0].locate;
+        });
+
+        laid_of(&[("Cargo.toml", ROOT_RUST), ("app/Cargo.toml", APP), ("app/src/lib.rs", "")], |laid| {
+            assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+            let [(_, member)] = laid.members.as_slice() else { panic!("one member") };
+            assert!(member.findings.is_empty(), "{:?}", core::str::from_utf8(&member.messages));
+            assert_ne!(member.out, bstd_out, "std policy flag must move member units out (rule 21)");
+            assert_ne!(laid.root.parts[0].locate, bstd_locate, "member_source must move with policy and findings");
+        });
+
+        laid_of(&[("Cargo.toml", ROOT_ABSENT), ("app/Cargo.toml", APP), ("app/src/lib.rs", "")], |laid| {
+            assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+            let [(_, member)] = laid.members.as_slice() else { panic!("one member") };
+            assert!(member.findings.is_empty(), "{:?}", core::str::from_utf8(&member.messages));
+        });
+    }
+
+    #[test]
+    fn std_bstd_accepts_blaze_edition_workspace_member() {
+        const ROOT_BSTD: &str = "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = \"bstd\"\n";
+        const ROOT_RUST: &str = "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = \"rust\"\n";
+        const APP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"blaze-2026.11\"\n";
+
+        let mut bstd_out = ContentId([0; 32]);
+        laid_of(&[("Cargo.toml", ROOT_BSTD), ("app/Cargo.toml", APP), ("app/src/lib.rs", "")], |laid| {
+            assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+            let [(_, member)] = laid.members.as_slice() else { panic!("one member") };
+            assert!(member.findings.is_empty(), "{:?}", core::str::from_utf8(&member.messages));
+            bstd_out = member.out;
+        });
+
+        laid_of(&[("Cargo.toml", ROOT_RUST), ("app/Cargo.toml", APP), ("app/src/lib.rs", "")], |laid| {
+            let [(_, member)] = laid.members.as_slice() else { panic!("one member") };
+            assert!(member.findings.is_empty(), "{:?}", core::str::from_utf8(&member.messages));
+            assert_ne!(member.out, bstd_out, "member units out must depend on std policy even with 0 findings (rule 21)");
+        });
+    }
+
+    #[test]
+    fn std_bstd_skips_pure_proc_macro_workspace_member() {
+        const ROOT: &str = "[workspace]\nmembers = [\"macros\", \"mixed\"]\n\n[workspace.metadata.blaze]\nstd = \"bstd\"\n";
+        const MACROS: &str = "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n";
+        const MIXED: &str = "[package]\nname = \"mixed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n";
+
+        laid_of(
+            &[
+                ("Cargo.toml", ROOT),
+                ("macros/Cargo.toml", MACROS),
+                ("macros/src/lib.rs", ""),
+                ("mixed/Cargo.toml", MIXED),
+                ("mixed/src/lib.rs", ""),
+                ("mixed/src/main.rs", "fn main() {}"),
+            ],
+            |laid| {
+                assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+                let (_, macros) = laid.members.iter().find(|(name, _)| *name == Name::manifest(b"macros/Cargo.toml")).expect("macros member");
+                assert!(macros.findings.is_empty(), "pure proc-macro must be skipped: {:?}", core::str::from_utf8(&macros.messages));
+                let (_, mixed) = laid.members.iter().find(|(name, _)| *name == Name::manifest(b"mixed/Cargo.toml")).expect("mixed member");
+                let [(rule, _, _, at, to)] = mixed.findings.as_slice() else {
+                    panic!("proc-macro with a bin target must be refused, got {:?}", mixed.findings);
+                };
+                assert_eq!(*rule, STD_NOT_BSTD);
+                assert_eq!(&mixed.messages[*at..*to], b"mixed\x1f2024");
+            },
+        );
+    }
+
+    #[test]
+    fn std_bstd_allow_rust_permits_listed_member_and_refuses_others() {
+        const ROOT: &str = "[workspace]\nmembers = [\"legacy\", \"other\"]\n\n[workspace.metadata.blaze]\nstd = \"bstd\"\nstd-allow-rust = [\"legacy\"]\n";
+        const LEGACY: &str = "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        const OTHER: &str = "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+        laid_of(
+            &[
+                ("Cargo.toml", ROOT),
+                ("legacy/Cargo.toml", LEGACY),
+                ("legacy/src/lib.rs", ""),
+                ("other/Cargo.toml", OTHER),
+                ("other/src/lib.rs", ""),
+            ],
+            |laid| {
+                assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+                let (_, legacy) = laid.members.iter().find(|(name, _)| *name == Name::manifest(b"legacy/Cargo.toml")).expect("legacy member");
+                assert!(legacy.findings.is_empty(), "{:?}", core::str::from_utf8(&legacy.messages));
+                let (_, other) = laid.members.iter().find(|(name, _)| *name == Name::manifest(b"other/Cargo.toml")).expect("other member");
+                let [(rule, _, _, at, to)] = other.findings.as_slice() else {
+                    panic!("expected one STD_NOT_BSTD finding on other, got {:?}", other.findings);
+                };
+                assert_eq!(*rule, STD_NOT_BSTD);
+                assert_eq!(&other.messages[*at..*to], b"other\x1f2021");
+            },
+        );
+    }
+
+    #[test]
+    fn std_policy_malformed_values_emit_unread_on_root_manifest() {
+        const APP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"blaze-2026.11\"\n";
+        let cases = [
+            (
+                "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = \"foo\"\n",
+                "\"foo\"",
+                "[workspace.metadata.blaze] std",
+            ),
+            (
+                "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = 42\n",
+                "42",
+                "[workspace.metadata.blaze] std",
+            ),
+            (
+                "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = \"bstd\"\nstd-allow-rust = 123\n",
+                "123",
+                "[workspace.metadata.blaze] std-allow-rust",
+            ),
+            (
+                "[workspace]\nmembers = [\"app\"]\n\n[workspace.metadata.blaze]\nstd = \"bstd\"\nstd-allow-rust = [\"ok\", 99]\n",
+                "99",
+                "[workspace.metadata.blaze] std-allow-rust",
+            ),
+        ];
+
+        for (root_toml, expected_slice, expected_key) in cases {
+            laid_of(&[("Cargo.toml", root_toml), ("app/Cargo.toml", APP), ("app/src/lib.rs", "")], |laid| {
+                let [(rule, start, end, at, to)] = laid.root.findings.as_slice() else {
+                    panic!("expected one UNREAD finding for `{root_toml}`, got {:?}", laid.root.findings);
+                };
+                let start = usize::try_from(*start).expect("start fits usize");
+                let end = usize::try_from(*end).expect("end fits usize");
+                let words = core::str::from_utf8(&laid.root.messages[*at..*to]).expect("UTF-8 message");
+                assert_eq!(*rule, UNREAD);
+                assert_eq!(&root_toml[start..end], expected_slice);
+                assert!(words.contains(expected_key), "finding message should name key `{expected_key}`: {words}");
+            });
+        }
+    }
+
+    #[test]
+    fn std_not_bstd_wording_exists_and_renders_cleanly() {
+        use blaze_report::frame::words::{Area, Kind, say, wording};
+
+        let row = wording(Area::Cli, STD_NOT_BSTD).expect("STD_NOT_BSTD wording registered in WORDINGS");
+        assert_eq!(row.name, "std-not-bstd");
+        assert_eq!(row.kind, Kind::Error);
+        assert_eq!(row.args, 2);
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut headline = blaze_own::AString::new_in(alloc);
+        let mut label = blaze_own::AString::new_in(alloc);
+        let name = say(Area::Cli, STD_NOT_BSTD, &["legacy", "2024"], &mut headline, &mut label).expect("wording renders with 2 args");
+        assert_eq!(name, "std-not-bstd");
+        assert!(headline.as_str().contains("`legacy`"), "headline: {}", headline.as_str());
+        assert!(headline.as_str().contains("`2024`"), "headline: {}", headline.as_str());
+        assert!(headline.as_str().contains("bstd"), "headline: {}", headline.as_str());
+        assert!(label.as_str().contains("blaze-2026.11"), "label: {}", label.as_str());
+        assert!(label.as_str().contains("[workspace.package]"), "label: {}", label.as_str());
     }
 }

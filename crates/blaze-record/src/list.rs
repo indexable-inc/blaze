@@ -14,10 +14,10 @@
 
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
-use core::fmt;
+use core::{alloc::Allocator, fmt};
 
 use blaze_ids::ContentId;
+use blaze_own::Vec as OwnVec;
 
 /// The layout word of a read-list: `bzrecl`, then the layout's number in two digits. A change
 /// to the bytes above takes the next number; [`ListRef::open`] refuses every other word.
@@ -32,22 +32,21 @@ fn len32(len: usize) -> [u8; 4] {
 }
 
 /// Appends to `out` the read-list of `base` whose reads are named `reads`, in that order.
-pub fn write_list<R: AsRef<[u8]>>(
-    out: &mut Vec<u8>,
+pub fn write_list<A: Allocator, R: AsRef<[u8]>>(
+    out: &mut OwnVec<u8, A>,
     base: &ContentId,
     note: &[u8],
     reads: impl IntoIterator<Item = R>,
 ) {
-    // alloc: the caller's buffer, which it reuses or keeps as the list
     write_list_with(out, base, |out| out.extend_from_slice(note), reads);
 }
 
 /// As [`write_list`], for a note that is not bytes yet: `note` appends it to `out` (and does
 /// nothing else to `out`), so it is encoded once, in place.
-pub fn write_list_with<R: AsRef<[u8]>>(
-    out: &mut Vec<u8>,
+pub fn write_list_with<A: Allocator, R: AsRef<[u8]>>(
+    out: &mut OwnVec<u8, A>,
     base: &ContentId,
-    note: impl FnOnce(&mut Vec<u8>),
+    note: impl FnOnce(&mut OwnVec<u8, A>),
     reads: impl IntoIterator<Item = R>,
 ) {
     let start = out.len();

@@ -245,6 +245,14 @@ pub trait LastAnswer {
     /// The tasks whose row names `file` as the file that lists them (`Answer::by_file`: an
     /// edited file's tasks gone from its plan).
     fn file_tasks<'m>(&self, file: Self::Task, alloc: Alloc<'m>) -> Result<AVec<'m, Self::Task>, LastError>;
+    /// The tasks whose row names `file` as the file that lists them, each paired with its
+    /// certified standing key when the stored file plan carries it (`None`: unmade, owed, or
+    /// uncertified). Returning `Some` lets the engine batch-check standing members from the
+    /// single `Ask::File` lookup instead of issuing per-member `planned_key` lookups; `None`
+    /// (the default) falls back to `file_tasks` + `planned_key`.
+    fn file_member_keys<'m>(&self, _file: Self::Task, _alloc: Alloc<'m>) -> Result<Option<AVec<'m, (Self::Task, Option<Key>)>>, LastError> {
+        Ok(None)
+    }
     /// The actual key of a made row, when the stored file plan certifies it.
     /// A form without this column, a new member or an unmade task has no proof.
     fn planned_key(&self, _file: Name, _name: Name) -> Result<Option<Key>, LastError> {

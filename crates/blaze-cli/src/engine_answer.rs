@@ -209,6 +209,8 @@ pub(crate) fn unroot_checkout<D: Driver>(
         for base in bases.iter() {
             if removed_pointers.scan_for(&base.pointer).is_none() {
                 kept.push(*base);
+            } else {
+                unroot_base_slot(lent, base.workspace, base.layout, frame);
             }
         }
         if kept.len() != bases.len() {
@@ -227,9 +229,12 @@ pub(crate) fn unroot_checkout<D: Driver>(
                     &[bytes.as_slice()],
                 ).map_err(crate::store::PlaceError::from)?;
                 lent.root_for(BASES_ROOT, &[record], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
-                let mut pointers: blaze_own::Vec<blaze_cas::Key, &Frame> = blaze_own::Vec::with_capacity_in(kept.len(), frame);
-                pointers.extend(kept.iter().map(|it| blaze_cas::Key(it.pointer.0)));
-                lent.root_for(BASES_KEPT_ROOT, &pointers, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+                let mut kept_indexes: blaze_own::Vec<blaze_cas::Key, &Frame> = blaze_own::Vec::with_capacity_in(kept.len(), frame);
+                for base in kept.iter() {
+                    kept_indexes.push(kept_index_for_base(lent, base.pointer)?);
+                    renew_base_slot(lent, base.workspace, base.layout, frame);
+                }
+                lent.root_through(BASES_KEPT_ROOT, &kept_indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
             }
         }
     }
@@ -237,12 +242,22 @@ pub(crate) fn unroot_checkout<D: Driver>(
     Ok(unrooted)
 }
 
+/// Auxiliary per-answer record keys (`<root>.members` and `<root>.grains`) carried beside a
+/// saved workspace base so cross-worktree adoption (`adopt_certified`) and `OtherCheckout` starts
+/// inherit standing member reach and `ReadGrains` without rebuilding them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct BaseAux {
+    pub(crate) members: Option<Key>,
+    pub(crate) grains: Option<Key>,
+}
+
 /// Whether a saved answer should update the home's shared workspace bases (`BASES_ROOT`): whole-
-/// workspace checks keep their base; scoped checks skip it so a partial answer never replaces a
-/// workspace base.
+/// workspace checks keep their base (with optional auxiliary `.members`/`.grains` keys); scoped
+/// checks skip it so a partial answer never replaces a workspace base.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SaveBase {
     Keep,
+    KeepWith(BaseAux),
     Skip,
 }
 
@@ -792,6 +807,27 @@ type PageBlock<'a> = blaze_own::Box<[PageSlot<'a>; BLOCK], SharedAlloc<'a>>;
 /// `a_changed_archive_checksum_enters_the_body_through_the_graph`, wave-1119 t26).
 type HeaderSlots<'a> = blaze_own::Box<[OnceLock<Result<IndexedHeaders<'a>, PagesError>>; HeaderPages::COUNT], SharedAlloc<'a>>;
 
+/// Hot atomic read/byte counters for [`Stored`], each padded to its own 128-byte cache line
+/// (`bstd::sync::CachePadded`, rule 86) and boxed off-stack so `Stored` stays `<= 1 KiB` by value
+/// while eliminating 128-core false sharing across parallel readers.
+struct StoredMetrics {
+    task_reads: bstd::sync::CachePadded<core::sync::atomic::AtomicUsize>,
+    header_reads: bstd::sync::CachePadded<core::sync::atomic::AtomicUsize>,
+    /// The bytes of the task and header pages read, and of those hashed (zero on the store's
+    /// proof): the `pages:` line ([`PagesRead`]).
+    task_bytes: bstd::sync::CachePadded<core::sync::atomic::AtomicU64>,
+    header_bytes: bstd::sync::CachePadded<core::sync::atomic::AtomicU64>,
+    hashed_bytes: bstd::sync::CachePadded<core::sync::atomic::AtomicU64>,
+}
+
+/// One cache-line-isolated shard of [`Stored::asked`]: holds both its own ask counter and its
+/// capped entry list so parallel workers pick a shard by `Name`'s hash bytes with zero shared
+/// global `asks.fetch_add(1)` contention across 128 cores (rule 86).
+struct AskedShard<'a> {
+    asks: core::sync::atomic::AtomicUsize,
+    entries: blaze_core::lock::Lock<blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>>>,
+}
+
 pub(crate) struct Stored<'a> {
     pub(crate) root: &'a Root<'a>,
     snapshot: &'a Snapshot<SharedAlloc<'a>>,
@@ -809,29 +845,23 @@ pub(crate) struct Stored<'a> {
     /// ([`pages::Check::Store`], the command's path: no byte hashed, a page's head alone checked)
     /// or every byte hashed and every entry walked ([`pages::Check::Hashed`], `--verify`).
     check: pages::Check,
-    task_reads: core::sync::atomic::AtomicUsize,
-    header_reads: core::sync::atomic::AtomicUsize,
-    /// The bytes of the task and header pages read, and of those hashed (zero on the store's
-    /// proof): the `pages:` line ([`PagesRead`]).
-    task_bytes: core::sync::atomic::AtomicU64,
-    header_bytes: core::sync::atomic::AtomicU64,
-    hashed_bytes: core::sync::atomic::AtomicU64,
-    /// Rows asked by name ([`Stored::asks`]).
-    asks: core::sync::atomic::AtomicUsize,
-    /// Each name asked, sharded across [`ASKED_SHARDS`] locks, the first [`MOST_ASKS_KEPT`]: what
-    /// [`Stored::asked`] tells by kind, repeats and distinct names apart (rule 17: which rows a
-    /// request's reads of the answer are, before why they scale).
+    metrics: blaze_own::Box<StoredMetrics, SharedAlloc<'a>>,
+    /// Each name asked, sharded across [`ASKED_SHARDS`] 128-byte `CachePadded` shards indexed
+    /// directly by `name`'s hash bytes (zero shared atomic counter): what [`Stored::asked`] tells
+    /// by kind, repeats and distinct names apart (rule 17).
     asked: AskedShards<'a>,
 }
 
-/// The names [`Stored::asked`] keeps (rule 18: a table has a cap): a ready edit asks hundreds;
+/// Shards for [`Stored::asked`] so parallel 128-core body workers never serialize on one global
+/// lock or a shared `asks` atomic counter (power of two for bitmask indexing).
+const ASKED_SHARDS: usize = 32;
 
-/// Shards for [`Stored::asked`] so parallel body workers never serialize on one global lock.
-const ASKED_SHARDS: usize = 16;
+/// Per-shard cap on kept ask entries (rule 18: bounded table): `4096` per shard (`131,072` across
+/// all shards), so even a hot repeated `Name` stays told while asks past the cap are counted in
+/// `AskedShard::asks` (`AskedByKind::untold`).
+const MOST_ASKS_PER_SHARD: usize = 4096;
 
-type AskedShards<'a> = blaze_own::Box<[blaze_core::lock::Lock<blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>>>; ASKED_SHARDS], SharedAlloc<'a>>;
-/// asks past it are counted ([`Stored::asks`]) and not told by kind.
-const MOST_ASKS_KEPT: usize = 1 << 16;
+type AskedShards<'a> = blaze_own::Box<[bstd::sync::CachePadded<AskedShard<'a>>; ASKED_SHARDS], SharedAlloc<'a>>;
 
 /// A request's rows asked of the stored answer, by kind ([`Stored::asked`]): each kind's asks
 /// (repeats included) and distinct names, and the asks past the cap not told; and by purpose
@@ -933,34 +963,56 @@ impl<'a> Stored<'a> {
     /// store's proof, plain_place.rs `snapshot_get`), [`pages::Check::Hashed`] for an explicit
     /// verify (every byte hashed, every entry walked: `VerifiedPage::open_whole`).
     pub(crate) fn new(root: &'a Root<'a>, snapshot: &'a Snapshot<SharedAlloc<'a>>, headers: &'a Headers, check: pages::Check, alloc: SharedAlloc<'a>) -> Self {
+        use bstd::sync::CachePadded;
         use core::sync::atomic::{AtomicU64, AtomicUsize};
         let total_pages = root.page_count();
         let blocks = blaze_own::Vec::from_iter_in((0..total_pages.div_ceil(BLOCK)).map(|_| OnceLock::new()), alloc);
         let radix_shards = blaze_own::Vec::from_iter_in((0..root.page_shards.len()).map(|_| OnceLock::new()), alloc);
+        let metrics = blaze_own::Box::new_in(
+            StoredMetrics {
+                task_reads: CachePadded::new(AtomicUsize::new(0)),
+                header_reads: CachePadded::new(AtomicUsize::new(0)),
+                task_bytes: CachePadded::new(AtomicU64::new(0)),
+                header_bytes: CachePadded::new(AtomicU64::new(0)),
+                hashed_bytes: CachePadded::new(AtomicU64::new(0)),
+            },
+            alloc,
+        );
         Self {
             root, snapshot, headers, header_pages: blaze_own::Box::new_in(core::array::from_fn(|_| OnceLock::new()), alloc), alloc, blocks, radix_shards, refused: OnceLock::new(), check,
-            task_reads: AtomicUsize::new(0),
-            header_reads: AtomicUsize::new(0),
-            task_bytes: AtomicU64::new(0),
-            header_bytes: AtomicU64::new(0),
-            hashed_bytes: AtomicU64::new(0),
-            asks: AtomicUsize::new(0),
+            metrics,
             asked: blaze_own::Box::new_in(
-                core::array::from_fn(|_| blaze_core::lock::Lock::new("engine.answer: the rows asked by name", blaze_own::Vec::with_capacity_in(0, alloc))),
+                core::array::from_fn(|_| {
+                    CachePadded::new(AskedShard {
+                        asks: AtomicUsize::new(0),
+                        entries: blaze_core::lock::Lock::new("engine.answer: the rows asked by name", blaze_own::Vec::with_capacity_in(0, alloc)),
+                    })
+                }),
                 alloc,
             ),
         }
     }
 
-    /// One ask of `name`'s page for `ask`: counted, and kept under the cap for [`Stored::asked`].
+    /// Selects a `CachePadded` ask shard directly from `name`'s hash bytes, eliminating shared
+    /// global `asks.fetch_add(1)` cache-line contention across 128 workers.
+    #[inline]
+    fn ask_shard_index(name: Name) -> usize {
+        let b0 = usize::from(name.subject.0[0]);
+        let b1 = usize::from(name.subject.0[1]);
+        let kind = name.kind.index();
+        (b0 ^ b1.rotate_left(3) ^ kind) & (ASKED_SHARDS - 1)
+    }
+
+    /// One ask of `name`'s page for `ask`: counted in its hash-selected `CachePadded` shard and
+    /// kept under the per-shard cap for [`Stored::asked`].
     fn note_ask(&self, name: Name, ask: blaze_engine::Ask) {
-        let slot = self.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if slot >= MOST_ASKS_KEPT {
+        let Some(shard) = self.asked.get(Self::ask_shard_index(name)) else { return };
+        let slot = shard.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if slot >= MOST_ASKS_PER_SHARD {
             return;
         }
-        let Some(shard) = self.asked.get(slot & (ASKED_SHARDS - 1)) else { return };
-        let mut asked = shard.lock();
-        // A refused growth leaves the name untold, counted by `asks` (rule 3: the count
+        let mut asked = shard.entries.lock();
+        // A refused growth leaves the name untold, counted by `shard.asks` (rule 3: the count
         // says so, `AskedByKind::untold`).
         let _ = asked.try_push((name, ask));
     }
@@ -968,13 +1020,20 @@ impl<'a> Stored<'a> {
     /// The rows asked so far by kind (repeats and distinct names apart) and by purpose (asks
     /// and distinct reads apart) ([`AskedByKind`]).
     pub(crate) fn asked(&self) -> AskedByKind {
+        use core::sync::atomic::Ordering::Relaxed;
         let mut by = AskedByKind::default();
-        let total = self.asks().min(MOST_ASKS_KEPT);
-        let mut sorted: blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(total, self.alloc);
+        let mut total_asks = 0usize;
+        let mut kept_cap = 0usize;
+        for shard in self.asked.iter() {
+            let shard_asks = shard.asks.load(Relaxed);
+            total_asks = total_asks.saturating_add(shard_asks);
+            kept_cap = kept_cap.saturating_add(shard_asks.min(MOST_ASKS_PER_SHARD));
+        }
+        let mut sorted: blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(kept_cap, self.alloc);
         let mut kept = 0usize;
         for shard in self.asked.iter() {
-            let asked = shard.lock();
-            kept += asked.len();
+            let asked = shard.entries.lock();
+            kept = kept.saturating_add(asked.len());
             for &(name, ask) in asked.iter() {
                 if let Some(slot) = by.asks.get_mut(name.kind.index()) {
                     *slot += 1;
@@ -988,7 +1047,7 @@ impl<'a> Stored<'a> {
                 let _ = sorted.try_push((name, ask));
             }
         }
-        by.untold = u32::try_from(self.asks().saturating_sub(kept)).unwrap_or(u32::MAX);
+        by.untold = u32::try_from(total_asks.saturating_sub(kept)).unwrap_or(u32::MAX);
         sorted.sort_unstable();
         let mut last_name = None;
         let mut last_read = None;
@@ -1010,7 +1069,12 @@ impl<'a> Stored<'a> {
     /// with, apart from the page packing (a page holds the rows its names' leading bits pick, so
     /// one set of names asked spans more pages in a larger answer: `pages_read` is not the measure).
     pub(crate) fn asks(&self) -> usize {
-        self.asks.load(core::sync::atomic::Ordering::Relaxed)
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut total = 0usize;
+        for shard in self.asked.iter() {
+            total = total.saturating_add(shard.asks.load(Relaxed));
+        }
+        total
     }
 
     /// The page holding `name`'s row, asked by name for `ask` (counted in [`Stored::asks`] and
@@ -1031,7 +1095,7 @@ impl<'a> Stored<'a> {
         match self.check {
             pages::Check::Store => Ok(Sealed::by_store(key, held.bytes, held.proof)),
             pages::Check::Hashed => {
-                self.hashed_bytes.fetch_add(held.bytes.len() as u64, Relaxed);
+                self.metrics.hashed_bytes.fetch_add(held.bytes.len() as u64, Relaxed);
                 Sealed::hashed(key, held.bytes).map_err(|torn| torn.at(page))
             }
         }
@@ -1047,7 +1111,12 @@ impl<'a> Stored<'a> {
     pub(crate) fn pages_read_line(&self) -> PagesRead {
         use core::sync::atomic::Ordering::Relaxed;
         let (task, header) = self.read_counts();
-        PagesRead { task, header, bytes: self.task_bytes.load(Relaxed) + self.header_bytes.load(Relaxed), hashed: self.hashed_bytes.load(Relaxed) }
+        PagesRead {
+            task,
+            header,
+            bytes: self.metrics.task_bytes.load(Relaxed) + self.metrics.header_bytes.load(Relaxed),
+            hashed: self.metrics.hashed_bytes.load(Relaxed),
+        }
     }
 
     pub(crate) fn answer(&self) -> blaze_engine::Answer<'_> {
@@ -1072,9 +1141,9 @@ impl<'a> Stored<'a> {
             return Ok(None);
         }
         let proof = self.header_pages[index].get_or_init(|| {
-            self.header_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.metrics.header_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let page = index as u32;
-            IndexedHeaders::open(self.sealed(key, page, &self.header_bytes)?, index)
+            IndexedHeaders::open(self.sealed(key, page, &self.metrics.header_bytes)?, index)
         });
         match proof {
             Ok(page) => Ok(Some(page)),
@@ -1101,7 +1170,7 @@ impl<'a> Stored<'a> {
 
     pub(crate) fn read_counts(&self) -> (usize, usize) {
         use core::sync::atomic::Ordering::Relaxed;
-        (self.task_reads.load(Relaxed), self.header_reads.load(Relaxed))
+        (self.metrics.task_reads.load(Relaxed), self.metrics.header_reads.load(Relaxed))
     }
 
     #[cfg(test)]
@@ -1135,7 +1204,7 @@ impl<'a> Stored<'a> {
         let cached = shard_cell.get_or_init(|| {
             let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
             let opened = self
-                .sealed(shard_key, pages::ROOT_PAGE, &self.task_bytes)
+                .sealed(shard_key, pages::ROOT_PAGE, &self.metrics.task_bytes)
                 .and_then(|sealed| pages::decode_radix_shard(sealed, shard_u32, self.root.bits, self.alloc));
             match opened {
                 Ok(shard) => Some(shard),
@@ -1172,10 +1241,10 @@ impl<'a> Stored<'a> {
         }
         let block = self.blocks[index / BLOCK].get_or_init(|| blaze_own::Box::new_in(core::array::from_fn(|_| OnceLock::new()), self.alloc));
         let proof = block[index % BLOCK].get_or_init(|| {
-            self.task_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.metrics.task_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // On the store's proof the head alone is checked, no byte hashed and no entry walked
             // (pages/view.rs `open`); an explicit verify hashes and walks every entry.
-            let opened = self.sealed(key, page, &self.task_bytes).and_then(|sealed| match self.check {
+            let opened = self.sealed(key, page, &self.metrics.task_bytes).and_then(|sealed| match self.check {
                 pages::Check::Store => VerifiedPage::open(sealed, page, self.root.bits),
                 pages::Check::Hashed => VerifiedPage::open_whole(sealed, page, self.root.bits),
             });
@@ -1271,6 +1340,57 @@ pub(crate) fn load_answer<'m, 'a, D: Driver, S: Sharing>(cx: &Cx, store: &mut Co
     Ok(Ok((kept, root)))
 }
 
+/// Opens an answer root directory directly from a lent store handle without creating a
+/// [`CommandStore`] (used by pre-check warm selection lookup in `engine_check.rs`).
+pub(crate) fn open_root_from_lent<'a, D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    key: Key,
+    alloc: SharedAlloc<'a>,
+) -> Result<Result<Root<'a>, Unreadable>, CliError> {
+    let Some(held) = lent.get(&blaze_cas::Key(key.0)).map_err(crate::store::PlaceError::from)? else {
+        return Ok(Err(Unreadable::Missing { key }));
+    };
+    let sealed_root = match Sealed::hashed(key, held.bytes) {
+        Ok(s) => s,
+        Err(why) => return Ok(Err(Unreadable::Pages(why.at(pages::ROOT_PAGE)))),
+    };
+    let mut store_err: Option<CliError> = None;
+    let decoded = pages::decode_root_with(
+        sealed_root,
+        |sub_key| match lent.get(&blaze_cas::Key(sub_key.0)) {
+            Ok(Some(h)) => Some(Sealed::hashed(sub_key, h.bytes)),
+            Ok(None) => None,
+            Err(err) => {
+                store_err.get_or_insert(crate::store::PlaceError::from(err).into());
+                None
+            }
+        },
+        alloc,
+    );
+    if let Some(err) = store_err {
+        return Err(err);
+    }
+    Ok(decoded.map_err(Unreadable::Pages))
+}
+
+/// The pointer the root `name` names, read directly from a lent store handle without creating a
+/// [`CommandStore`]: `None` when absent.
+pub(crate) fn load_pointer_from_lent<'m, D: Driver>(
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    name: &str,
+) -> Result<Option<Result<Pointer<'m>, Unreadable>>, CliError> {
+    let Some(root_key) = lent.root_named(name) else { return Ok(None) };
+    let Some(keys) = lent.get(&root_key).map_err(crate::store::PlaceError::from)? else { return Ok(None) };
+    if keys.bytes.len() != 32 {
+        return Ok(Some(Err(Unreadable::Names { bytes: keys.bytes.len() })));
+    }
+    let first = key_at(keys.bytes, 0);
+    let Some(held) = lent.get(&blaze_cas::Key(first.0)).map_err(crate::store::PlaceError::from)? else {
+        return Ok(Some(Err(Unreadable::Missing { key: first })));
+    };
+    decode_pointer_bytes(first, held.bytes).map(Some)
+}
+
 /// The pointer the root `name` names, read in place: `None` when there is none.
 pub(crate) fn load_pointer<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, name: &str) -> Result<Option<Result<Pointer<'m>, Unreadable>>, CliError> {
     let Some(keys) = store.named(name)? else { return Ok(None) };
@@ -1321,13 +1441,32 @@ pub(crate) fn decode_pointer_bytes<'m>(first: Key, sealed: &'m [u8]) -> Result<R
     Ok(Ok(Pointer { key: first, root: key_at(pointer, 4), headers, lines: key_at(pointer, 36), facts, tools, leaves, journal }))
 }
 
-/// The printed lines' record the pointer names, every entry checked (engine_lines.rs `decode`).
-pub(crate) fn load_lines<'m, 'a, D: Driver, S: Sharing>(
+/// The printed lines' record the pointer names, every entry checked (engine_lines.rs
+/// `decode_in_frame`), decompressing `BZR1`-enveloped lines into `frame` while leaving raw/small
+/// records zero-copy.
+pub(crate) fn load_lines_in<'m, 'f, 'b, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     key: Key,
+    frame: &'f Frame,
     alloc: SharedAlloc<'a>,
-) -> Result<Result<crate::engine_lines::Last<'m, 'a>, Unreadable>, CliError> {
+) -> Result<Result<crate::engine_lines::Last<'b, 'a>, Unreadable>, CliError>
+where
+    'm: 'b,
+    'f: 'b,
+{
+    let Some(held) = store.get(cx, key)? else { return Ok(Err(Unreadable::Missing { key })) };
+    let bytes: &'m [u8] = held.bytes;
+    Ok(crate::engine_lines::decode_in_frame(bytes, frame, alloc).map_err(Unreadable::Lines))
+}
+
+/// The printed lines' record the pointer names, every entry checked (engine_lines.rs `decode`).
+pub(crate) fn load_lines<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    key: Key,
+    alloc: SharedAlloc<'static>,
+) -> Result<Result<crate::engine_lines::Last<'m, 'static>, Unreadable>, CliError> {
     let Some(held) = store.get(cx, key)? else { return Ok(Err(Unreadable::Missing { key })) };
     let bytes: &'m [u8] = held.bytes;
     Ok(crate::engine_lines::decode(bytes, alloc).map_err(Unreadable::Lines))
@@ -1562,6 +1701,230 @@ pub(crate) fn save_changes<'m, D: Driver, S: Sharing>(
 }
 
 const SAVE_TASK_FRAME: usize = 64 << 10;
+/// Reusable per-worker bump frame reserved for `BEP6` page dictionary & merge scratch.
+/// Virtual reservation only; pages are committed lazily and trimmed back to [`PAGE_SCRATCH_KEEP`].
+const PAGE_SCRATCH_FRAME: usize = 1 << 30;
+/// Retained warm capacity for per-worker page encoding scratch frames after trimming.
+const PAGE_SCRATCH_KEEP: usize = 256 << 10;
+/// High-water trim threshold for per-worker page encoding scratch frames.
+const PAGE_SCRATCH_TRIM: usize = 2 << 20;
+/// Minimum changed/non-empty answer pages to fan out across workers (0..=3 run inline with zero
+/// thread-spawn overhead on 1-line incremental edits).
+const PAGE_PAR_MIN: usize = 4;
+/// Minimum dirty producer header shards to fan out across workers (0..=1 run inline with zero
+/// thread-spawn overhead on 1-line incremental edits).
+const HEADER_PAR_MIN: usize = 2;
+
+/// Runs independent encoding jobs in parallel when `jobs.len() >= min_par` and more than one
+/// worker is active, returning results in exact `jobs` index order (Rule 25). Below `min_par` or
+/// on 1 worker, runs inline with zero thread-spawn or atomic overhead.
+fn run_jobs_par<'a, J, R, F>(
+    cx: &Cx,
+    workers: core::num::NonZeroU32,
+    min_par: usize,
+    span: &'static str,
+    jobs: &[J],
+    alloc: SharedAlloc<'a>,
+    run: F,
+) -> Result<blaze_own::Vec<R, SharedAlloc<'a>>, CliError>
+where
+    J: Sync,
+    R: Send,
+    F: Fn(&J) -> R + Sync,
+{
+    let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+    let active_workers = workers.get().min(cx.workers());
+    if jobs.len() < min_par || active_workers <= 1 {
+        for job in jobs {
+            out.push(run(job));
+        }
+        return Ok(out);
+    }
+    let n = jobs.len();
+    let worker_count = usize::try_from(active_workers).unwrap_or(1).min(n);
+    // Dynamic work stealing balances skewed page sizes (e.g. hot `READERS` pages) and skewed
+    // header shards (64 heavy `Signature` shards vs tiny `Units`/`Fetch` shards) across 18/128
+    // cores. Batching 8 pages at a time when `n >= worker_count * 16` amortizes atomic fetch_add.
+    let batch = if n >= worker_count.saturating_mul(16) { 8 } else { 1 };
+    let next = core::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next;
+    let run_ref = &run;
+    let scope = cx.scope();
+    scope.narrow_workers(workers, bstd::task::Class::Foreground);
+    let mut handles = blaze_own::Vec::with_capacity_in(worker_count, alloc);
+    let est_per_worker = (n / worker_count).saturating_add(batch);
+    for _ in 0..worker_count {
+        handles.push(scope.may_overlap(span, SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
+            let mut local = blaze_own::Vec::with_capacity_in(est_per_worker, alloc);
+            loop {
+                let start = next_ref.fetch_add(batch, core::sync::atomic::Ordering::Relaxed);
+                if start >= n {
+                    break;
+                }
+                let end = start.saturating_add(batch).min(n);
+                if let Some(slice) = jobs.get(start..end) {
+                    for (offset, job) in slice.iter().enumerate() {
+                        local.push((start + offset, run_ref(job)));
+                    }
+                }
+            }
+            Ok(local)
+        }));
+    }
+    let mut pool_err: Option<CliError> = None;
+    let mut slots: blaze_own::Vec<Option<R>, SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        slots.push(None);
+    }
+    for handle in handles {
+        match handle.join(cx) {
+            Ok(part) => {
+                for (idx, item) in part {
+                    if let Some(slot) = slots.get_mut(idx) {
+                        *slot = Some(item);
+                    }
+                }
+            }
+            Err(error) => {
+                pool_err.get_or_insert(CliError::Pool(error));
+            }
+        }
+    }
+    if let Err(error) = scope.join(cx) {
+        pool_err.get_or_insert(CliError::Pool(error));
+    }
+    if let Some(error) = pool_err {
+        return Err(error);
+    }
+    for slot in slots {
+        if let Some(item) = slot {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
+/// Maximum changed causes in an incremental `save()` that reuse `request_alloc` directly instead
+/// of creating and dropping a fresh 64 GiB `PHASE_RESERVE` `blaze_mem::Root`.
+const SAVE_SCOPED_ARENA_CAUSES: usize = 64;
+
+/// [`run_jobs_par`] giving each worker its own reusable bump [`Frame`] (reset between jobs and
+/// trimmed above [`PAGE_SCRATCH_TRIM`]) so `BEP6` page dictionary & merge scratch never contends
+/// on `save_mem` or allocates on `Global`.
+///
+/// When `reuse_frame` is `Some` and the jobs run inline (`jobs.len() < min_par || active_workers
+/// <= 1`), uses the caller's frame directly so small 1-line incremental edits skip reserving and
+/// unmapping a 1 GiB `PAGE_SCRATCH_FRAME`.
+#[expect(clippy::too_many_arguments, reason = "parallel framed job runner: each argument one scheduling/memory handle")]
+fn run_jobs_par_framed<'a, J, R, F>(
+    cx: &Cx,
+    workers: core::num::NonZeroU32,
+    min_par: usize,
+    span: &'static str,
+    jobs: &[J],
+    alloc: SharedAlloc<'a>,
+    reuse_frame: Option<&Frame>,
+    run: F,
+) -> Result<blaze_own::Vec<R, SharedAlloc<'a>>, CliError>
+where
+    J: Sync,
+    R: Send,
+    F: Fn(&J, &Frame) -> R + Sync,
+{
+    let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+    if jobs.is_empty() {
+        return Ok(out);
+    }
+    let active_workers = workers.get().min(cx.workers());
+    if jobs.len() < min_par || active_workers <= 1 {
+        if let Some(scratch) = reuse_frame {
+            for job in jobs {
+                out.push(run(job, scratch));
+            }
+            return Ok(out);
+        }
+        let mut scratch = Frame::with_reserve(PAGE_SCRATCH_FRAME, blaze_mem::Tag::Query)
+            .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?;
+        for job in jobs {
+            scratch.reset();
+            if scratch.committed() > PAGE_SCRATCH_TRIM {
+                scratch.trim(PAGE_SCRATCH_KEEP);
+            }
+            out.push(run(job, &scratch));
+        }
+        return Ok(out);
+    }
+    let n = jobs.len();
+    let worker_count = usize::try_from(active_workers).unwrap_or(1).min(n);
+    let batch = if n >= worker_count.saturating_mul(16) { 8 } else { 1 };
+    let next = core::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next;
+    let run_ref = &run;
+    let scope = cx.scope();
+    scope.narrow_workers(workers, bstd::task::Class::Foreground);
+    let mut handles = blaze_own::Vec::with_capacity_in(worker_count, alloc);
+    let est_per_worker = (n / worker_count).saturating_add(batch);
+    for _ in 0..worker_count {
+        handles.push(scope.may_overlap(span, SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
+            let mut scratch = match Frame::with_reserve(PAGE_SCRATCH_FRAME, blaze_mem::Tag::Query) {
+                Ok(frame) => frame,
+                Err(error) => return Ok(Err(error)),
+            };
+            let mut local = blaze_own::Vec::with_capacity_in(est_per_worker, alloc);
+            loop {
+                let start = next_ref.fetch_add(batch, core::sync::atomic::Ordering::Relaxed);
+                if start >= n {
+                    break;
+                }
+                let end = start.saturating_add(batch).min(n);
+                if let Some(slice) = jobs.get(start..end) {
+                    for (offset, job) in slice.iter().enumerate() {
+                        scratch.reset();
+                        if scratch.committed() > PAGE_SCRATCH_TRIM {
+                            scratch.trim(PAGE_SCRATCH_KEEP);
+                        }
+                        local.push((start + offset, run_ref(job, &scratch)));
+                    }
+                }
+            }
+            Ok(Ok(local))
+        }));
+    }
+    let mut pool_err: Option<CliError> = None;
+    let mut slots: blaze_own::Vec<Option<R>, SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        slots.push(None);
+    }
+    for handle in handles {
+        match handle.join(cx) {
+            Ok(Ok(part)) => {
+                for (idx, item) in part {
+                    if let Some(slot) = slots.get_mut(idx) {
+                        *slot = Some(item);
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                pool_err.get_or_insert_with(|| CliError::from(crate::engine_phase_mem::PhaseMemError::Request { error }));
+            }
+            Err(error) => {
+                pool_err.get_or_insert(CliError::Pool(error));
+            }
+        }
+    }
+    if let Err(error) = scope.join(cx) {
+        pool_err.get_or_insert(CliError::Pool(error));
+    }
+    if let Some(error) = pool_err {
+        return Err(error);
+    }
+    for slot in slots {
+        if let Some(item) = slot {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
 
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "the write's inputs, each one handle")]
@@ -1579,23 +1942,36 @@ fn save<'m, D: Driver, S: Sharing>(
     writer: Writer,
     rows: &Rows<'_>,
     journal: &crate::journal_sweep::Taken<'_>,
-    _request_alloc: SharedAlloc<'_>,
+    request_alloc: SharedAlloc<'_>,
     frame: &Frame,
     row_keys: &[Key],
     (last_root, rekey): (Option<Key>, Rekey),
     workers: core::num::NonZeroU32,
     save_base: SaveBase,
 ) -> Result<Saved, CliError> {
-    // Scoped arena for all serialization buffers (encoded pages, header shards, reach/direct
-    // indexes, toolchain base merge): none outlives `save()`, so keeping them out of `RequestMem`
-    // (`Tag::Api`) returns 100% of their pages to the OS before `after_answer` commit.
-    let save_mem = blaze_mem::Root::new(blaze_mem::RootOpts {
-        reserve: crate::engine_phase_mem::PHASE_RESERVE,
-        tag: blaze_mem::Tag::Query,
-        live_at_drop: blaze_mem::LiveAtDrop::Refused,
-    })
-    .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?;
-    let alloc = save_mem.shared();
+    // Incremental edits (`last.is_some()` with few changed causes) reuse `request_alloc` and the
+    // caller's scratch frame directly, avoiding the cost of reserving and unmapping a brand-new
+    // 64 GiB `PHASE_RESERVE` `blaze_mem::Root` + 1 GiB `PAGE_SCRATCH_FRAME` on every edit.
+    // Cold or large rebuilds keep a scoped `blaze_mem::Root` so 100% of their serialization
+    // buffers return to the OS before `after_answer` commit.
+    let small_edit = last.is_some() && kept.causes.len() <= SAVE_SCOPED_ARENA_CAUSES;
+    let save_mem = if small_edit {
+        None
+    } else {
+        Some(
+            blaze_mem::Root::new(blaze_mem::RootOpts {
+                reserve: crate::engine_phase_mem::PHASE_RESERVE,
+                tag: blaze_mem::Tag::Query,
+                live_at_drop: blaze_mem::LiveAtDrop::Refused,
+            })
+            .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?,
+        )
+    };
+    let alloc = match save_mem.as_ref() {
+        Some(mem) => mem.shared(),
+        None => request_alloc,
+    };
+    let inline_scratch = small_edit.then_some(frame);
     let result = (|| -> Result<Saved, CliError> {
     let mut encoded = match last {
         Some(stored) => {
@@ -1612,43 +1988,14 @@ fn save<'m, D: Driver, S: Sharing>(
                         None
                     }
                 },
-                |jobs| {
-                let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
-                if jobs.len() <= 4 || workers.get() <= 1 {
-                    for job in jobs {
-                        out.push(job.run(alloc));
+                |jobs| match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, inline_scratch, |job, scratch| job.run_in(alloc, scratch)) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        pool_err = Some(error);
+                        blaze_own::Vec::new_in(alloc)
                     }
-                    return out;
-                }
-                let chunk = jobs.len().div_ceil(usize::try_from(workers.get()).unwrap_or(1)).max(1);
-                let scope = cx.scope();
-                scope.narrow_workers(workers, bstd::task::Class::Foreground);
-                let mut handles = blaze_own::Vec::with_capacity_in(jobs.len().div_ceil(chunk), alloc);
-                for slice in jobs.chunks(chunk) {
-                    handles.push(scope.may_overlap("answer pages", SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
-                        let mut part = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
-                        for job in slice {
-                            part.push(job.run(alloc));
-                        }
-                        Ok(part)
-                    }));
-                }
-                for handle in handles {
-                    match handle.join(cx) {
-                        Ok(part) => out.extend(part),
-                        Err(error) => {
-                            pool_err.get_or_insert(CliError::Pool(error));
-                        }
-                    }
-                }
-                if let Err(error) = scope.join(cx) {
-                    pool_err.get_or_insert(CliError::Pool(error));
-                }
-                if pool_err.is_some() {
-                    out.clear();
-                }
-                out
-            });
+                },
+            );
             if let Some(error) = snap_err {
                 return Err(error);
             }
@@ -1657,7 +2004,22 @@ fn save<'m, D: Driver, S: Sharing>(
             }
             encoded.map_err(page_error)?
         }
-        None => pages::encode(kept, None, alloc),
+        None => {
+            let mut pool_err: Option<CliError> = None;
+            let encoded = pages::encode_par(kept, None, alloc, |jobs| {
+                match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, inline_scratch, |job, scratch| job.run_in(alloc, scratch)) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        pool_err = Some(error);
+                        blaze_own::Vec::new_in(alloc)
+                    }
+                }
+            });
+            if let Some(error) = pool_err {
+                return Err(error);
+            }
+            encoded
+        }
     };
     // The encoder's puts are task pages first (`..task_puts`), then radix/directory sub-records,
     // then the top root last (durable order: children before parent).
@@ -1670,11 +2032,14 @@ fn save<'m, D: Driver, S: Sharing>(
         changed: (encoded.changed_entries, encoded.changed_pages),
         ..Saved::default()
     };
-    for (at, (key, bytes)) in encoded.puts.iter().enumerate() {
-        store.put(cx, *key, bytes)?;
+    // Drain `encoded.puts` as each record is written into `store` so encoded page buffers return
+    // to `save_mem` immediately rather than remaining live until after the whole loop.
+    let puts = core::mem::replace(&mut encoded.puts, blaze_own::Vec::new_in(alloc));
+    for (at, (key, bytes)) in puts.into_iter().enumerate() {
+        store.put_local(cx, key, &bytes)?;
         saved.puts += 1;
         if at < task_puts {
-            let len = bytes.len() as u64;
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             saved.new_page_bytes += len;
             saved.largest_new_page = saved.largest_new_page.max(len);
         }
@@ -1683,56 +2048,23 @@ fn save<'m, D: Driver, S: Sharing>(
     {
         saved.pages_digest = Some(test_pages_digest(lent, &encoded, alloc, frame)?);
     }
-    // Every encoded page and radix sub-record is now in `store`; release their buffers back to
-    // `save_mem`'s free lists before allocating producer header shards or reach indexes.
-    encoded.puts = blaze_own::Vec::new_in(alloc);
     let mut header_pool_err: Option<CliError> = None;
     let (headers, writes) = Headers::after_with(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
         Some(base) => base.headers_at(index),
         None => Ok(None),
-    }, alloc, |jobs| {
-        let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
-        if jobs.len() <= 4 || workers.get() <= 1 {
-            for job in jobs {
-                out.push(job.run(alloc));
-            }
-            return out;
+    }, alloc, |jobs| match run_jobs_par(cx, workers, HEADER_PAR_MIN, "answer headers", jobs, alloc, |job| job.run(alloc)) {
+        Ok(built) => built,
+        Err(error) => {
+            header_pool_err = Some(error);
+            blaze_own::Vec::new_in(alloc)
         }
-        let chunk = jobs.len().div_ceil(usize::try_from(workers.get()).unwrap_or(1)).max(1);
-        let scope = cx.scope();
-        scope.narrow_workers(workers, bstd::task::Class::Foreground);
-        let mut handles = blaze_own::Vec::with_capacity_in(jobs.len().div_ceil(chunk), alloc);
-        for slice in jobs.chunks(chunk) {
-            handles.push(scope.may_overlap("answer headers", SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
-                let mut part = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
-                for job in slice {
-                    part.push(job.run(alloc));
-                }
-                Ok(part)
-            }));
-        }
-        for handle in handles {
-            match handle.join(cx) {
-                Ok(part) => out.extend(part),
-                Err(error) => {
-                    header_pool_err.get_or_insert(CliError::Pool(error));
-                }
-            }
-        }
-        if let Err(error) = scope.join(cx) {
-            header_pool_err.get_or_insert(CliError::Pool(error));
-        }
-        if header_pool_err.is_some() {
-            out.clear();
-        }
-        out
     }).map_err(page_error)?;
     if let Some(error) = header_pool_err {
         return Err(error);
     }
     saved.new_headers = writes.len() as u32;
     for (key, bytes) in &writes {
-        store.put(cx, *key, bytes)?;
+        store.put_local(cx, *key, bytes)?;
         saved.puts += 1;
     }
     drop(writes);
@@ -1740,7 +2072,7 @@ fn save<'m, D: Driver, S: Sharing>(
     // Empty bytes signal that `ViewSlot::render` already proved `lines.0` is held in the store
     // and skipped re-encoding it; `direct` below still pins `lines.0` under `{name}.answer`.
     if !lines.1.is_empty() {
-        store.put(cx, lines.0, lines.1)?;
+        store.put_local(cx, lines.0, lines.1)?;
         saved.puts += 1;
     }
     let leaves = Leaves::bytes_in(rows, frame)?;
@@ -1772,7 +2104,7 @@ fn save<'m, D: Driver, S: Sharing>(
     journal.encode(&mut pointer);
     let sealed = seal::seal(&pointer, &leaves, frame)?;
     let key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
-    store.put(cx, key, &sealed)?;
+    store.put_local(cx, key, &sealed)?;
     saved.puts += 1;
     saved.pointer_key = key;
     saved.lines_key = lines.0;
@@ -1780,79 +2112,144 @@ fn save<'m, D: Driver, S: Sharing>(
     // A page and the payloads of *every* row on it share one immutable reach index.
     // StoreSink also includes each names payload's expansion index and its children.
     // The store follows exactly one index level from an indexed root.
-    use crate::engine_answer_rows::{AnswerSink as _, StoreSink};
-    let mut sink = StoreSink { cx, store, lent, toolchain };
-    let mut records = blaze_own::Vec::new_in(alloc);
-    let mut scopes = blaze_own::Vec::new_in(alloc);
-    let mut toolchain_records = blaze_own::Vec::new_in(alloc);
-    for (page, rows) in encoded.page_records() {
-        records.clear();
-        scopes.clear();
-        records.push(page);
+    // Prepare, sort, and deduplicate per-page CAS key lists in parallel across workers; on the
+    // main thread, publish non-scope pages directly into `lent.index_beside` with zero re-copy or
+    // serial re-sort, and delegate the few `CrateScope` pages to `StoreSink::index_rows_into`.
+    use crate::engine_answer_rows::{PublishError, StoreSink};
+    struct PreparedReach<'a> {
+        page: Key,
+        keys: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'a>>,
+        scopes: blaze_own::Vec<(Name, Key), SharedAlloc<'a>>,
+    }
+    let page_recs: blaze_own::Vec<(Key, &[(Name, Key)]), SharedAlloc<'_>> =
+        blaze_own::Vec::from_iter_in(encoded.page_records(), alloc);
+    let prepared = run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer reach", &page_recs, alloc, |&(page, rows)| {
+        let mut keys: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> =
+            blaze_own::Vec::with_capacity_in(rows.len().saturating_add(1), alloc);
+        let mut scopes: blaze_own::Vec<(Name, Key), SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+        keys.push(blaze_cas::Key(page.0));
         for &(name, record) in rows {
-            records.push(record);
+            keys.push(blaze_cas::Key(record.0));
             if name.kind == blaze_drive::Kind::CrateScope {
                 scopes.push((name, record));
             }
+        }
+        if scopes.is_empty() {
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        PreparedReach { page, keys, scopes }
+    })?;
+    let mut sink = StoreSink { cx, store, lent, toolchain };
+    let mut records = blaze_own::Vec::new_in(alloc);
+    let mut toolchain_records = blaze_own::Vec::new_in(alloc);
+    let mut cas_buf: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+    let mut indexed_beside: BesideCache<'_> = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::BuildKeyHasher::default(),
+        alloc,
+        capacity: Some(task_puts),
+    });
+    for (item, &(_, rows)) in prepared.into_iter().zip(page_recs.iter()) {
+        for &(name, record) in rows {
             if sink.store.is_toolchain(name) {
                 toolchain_records.push(record);
             }
         }
-        sink.index_rows(page, &records, &scopes, alloc.into()).map_err(reach_error)?;
+        let beside = if item.scopes.is_empty() {
+            if item.keys.len() > blaze_cas::plain::INDEX_KEYS_MOST {
+                return Err(reach_error(PublishError::RowsReach {
+                    segment: item.page,
+                    cap: blaze_cas::plain::INDEX_KEYS_MOST,
+                }));
+            }
+            sink.lent
+                .index_beside(blaze_cas::Key(item.page.0), &item.keys)
+                .map_err(|error| reach_error(PublishError::Cas(error)))?
+        } else {
+            records.clear();
+            records.reserve(rows.len().saturating_add(1));
+            records.push(item.page);
+            for &(_, record) in rows {
+                records.push(record);
+            }
+            sink.index_rows_into(item.page, &records, &item.scopes, &mut cas_buf).map_err(reach_error)?
+        };
+        indexed_beside.insert(item.page.0.0, beside);
         saved.puts += 1;
     }
     let reach_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}");
     let answer_name = bstd::mem::format_in!(frame, "{name}.{ANSWER_ROOT}");
+    let last_info = match (last, last_root) {
+        (Some(base), Some(key)) => Some((base.root.page_count(), key)),
+        _ => None,
+    };
+    let mut unsharded_indexes: Option<blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>>> = None;
     let (pages_live, rekeyed) = if !encoded.is_radix() {
         let last_pages = match (last, last_root) {
             (Some(base), Some(key)) if !base.root.is_radix() => Some((&base.root.pages[..], key)),
             _ => None,
         };
-        let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, alloc)?;
+        let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, Some(&indexed_beside), alloc)?;
         let count = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
-        lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+        if !(rekeyed.whole.is_none()
+            && rekeyed.pages == 0
+            && lent.renew_root(reach_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live())
+        {
+            lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+        }
         // Retire any stale sharded reach roots left over if this answer previously exceeded the
         // radix threshold and shrank back to unsharded, so certified no-ops never renew them.
         unroot_reach_shards(lent, name, 0, true, frame);
+        unsharded_indexes = Some(indexes);
         (count, rekeyed)
     } else {
         if lent.has_root(reach_name.as_str()) {
             lent.unroot(reach_name.as_str());
         }
-        let last_info = match (last, last_root) {
-            (Some(base), Some(key)) => Some((base.root.page_count(), key)),
-            _ => None,
-        };
         publish_reach_shards_from(
             lent,
             name,
             answer_name.as_str(),
             ReachSource::Radix { last: last_info, encoded: &encoded },
             rekey,
+            Some(&indexed_beside),
             alloc,
             frame,
         )?
     };
     saved.pages = pages_live;
     saved.rekeyed = rekeyed;
-    let mut direct = blaze_own::Vec::new_in(alloc);
-    direct.push(blaze_cas::Key(encoded.root.0));
-    // Pin every live radix leaf shard (`<= 256`), file shard (`<= 16`), places, and summary
-    // sub-record directly under `{name}.answer` so `blaze gc` always retains the whole root tree.
-    direct.extend(encoded.tree_keys().iter().map(|key| blaze_cas::Key(key.0)));
-    direct.push(blaze_cas::Key(lines.0.0));
+    let mut base_direct = blaze_own::Vec::with_capacity_in(2 + encoded.tree_keys().len() + HeaderPages::COUNT, alloc);
+    base_direct.push(blaze_cas::Key(key.0));
+    base_direct.push(blaze_cas::Key(encoded.root.0));
+    base_direct.extend(encoded.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
+    base_direct.push(blaze_cas::Key(lines.0.0));
     if let Some(keys) = headers.current() {
-        direct.extend(keys.keys.iter().filter(|key| **key != Key::default()).map(|key| blaze_cas::Key(key.0)));
+        base_direct.extend(keys.keys.iter().filter(|k| **k != Key::default()).map(|k| blaze_cas::Key(k.0)));
     }
-    // The member listing rows this request read or put (engine_bodies.rs `member_row_keys`,
-    // engine_member_rows.rs): named here so they live while the answer does, and the next
-    // command reads them by key instead of opening and listing each member again.
-    direct.extend(row_keys.iter().map(|key| blaze_cas::Key(key.0)));
+    // Pure function of `key` (every entry is embedded in or content-addressed by the sealed
+    // pointer): pinned under `BASES_KEPT_ROOT` and reused by cross-worktree `adopt_certified`.
+    let base_direct_index = lent.index_beside(blaze_cas::Key(key.0), &base_direct).map_err(crate::store::PlaceError::from)?;
     // Two roots, one commit: the pages' reach roots (one `{name}.reach` up to 256 pages, or
     // 256-page shards `{name}.reach.00`..`{name}.reach.ff` above that, where unchanged shards
     // renew in O(1)), and the answer's own index, which names this answer's root key: the next
     // commit's proof that the reach roots are this answer's ([`prove_last_reach`]).
-    let answer_index = lent.index(&direct).map_err(crate::store::PlaceError::from)?;
+    // When no extra member listing `row_keys` are attached (the common case on body-only `Ready`
+    // edits), `base_direct_index` already holds `encoded.root`, every tree key, `lines`, and
+    // every header shard, so `{name}.answer` reuses it directly without writing a second CAS index.
+    let answer_index = if row_keys.is_empty() {
+        base_direct_index
+    } else {
+        let mut direct = blaze_own::Vec::with_capacity_in(base_direct.len() + row_keys.len(), alloc);
+        if let Some(rest) = base_direct.get(1..) {
+            direct.extend_from_slice(rest);
+        }
+        // The member listing rows this request read or put (engine_bodies.rs `member_row_keys`,
+        // engine_member_rows.rs): named here so they live while the answer does, and the next
+        // command reads them by key instead of opening and listing each member again.
+        direct.extend(row_keys.iter().map(|key| blaze_cas::Key(key.0)));
+        lent.index(&direct).map_err(crate::store::PlaceError::from)?
+    };
     lent.root_through(answer_name.as_str(), &[answer_index], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     // This root accumulates indexes across commands. Unchanged pages' toolchain
     // payloads were admitted with the page and this renewal extends their lifetime.
@@ -1860,7 +2257,7 @@ fn save<'m, D: Driver, S: Sharing>(
     // Refresh the toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`) whenever
     // this build holds non-failed closed toolchain rows, so any fresh project or git worktree
     // automatically reuses pre-warmed `core`/`alloc`/`std`/`bstd`.
-    keep_toolchain_base(cx, store, lent, toolchain, tools, kept, alloc, frame)?;
+    keep_toolchain_base(cx, store, lent, toolchain, tools, kept, workers, alloc, frame)?;
     store.pin(name, &[key])?;
     // Reset `<name>.journal` to `[key]` (reusing the exact same 32-byte root record as `name`)
     // so subsequent runs do not probe older segments for a stale checkpoint of an earlier answer.
@@ -1868,48 +2265,434 @@ fn save<'m, D: Driver, S: Sharing>(
     // This answer as its workspace's newest base: a checkout of it with none of its own starts
     // from it ([`BASES_ROOT`]). Scoped checks skip this so a partial answer never replaces a
     // workspace base. The control keeps the one home-wide pointer instead.
-    if save_base == SaveBase::Skip {
-        saved.base = BaseKept::NotAsked;
-        return Ok(saved);
-    }
+    let base_aux = match save_base {
+        SaveBase::Skip => {
+            saved.base = BaseKept::NotAsked;
+            return Ok(saved);
+        }
+        SaveBase::Keep => BaseAux::default(),
+        SaveBase::KeepWith(aux) => aux,
+    };
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
         store.pin(LATEST_ROOT, &[key])?;
         return Ok(saved);
     }
-    saved.base = keep_base(cx, store, rows, key, frame)?;
+    saved.base = keep_base(
+        cx,
+        store,
+        lent,
+        rows,
+        key,
+        base_direct_index,
+        base_aux,
+        &encoded,
+        &indexed_beside,
+        unsharded_indexes.as_deref(),
+        last_info,
+        rekey,
+        alloc,
+        frame,
+    )?;
     Ok(saved)
     })();
     drop(save_mem);
     result
 }
 
+/// Prefix for a kept workspace base's own reach and answer roots:
+/// `engine.bases.slot.<16 hex of workspace>.<16 hex of layout>`.
+/// Each entry in [`BASES_ROOT`] has a unique `(workspace, layout)` pair (bounded by
+/// [`BASES_MOST`] = 32), so incremental edits in the same layout reuse the sharded reach fast
+/// path in O(1) while older kept layouts retain all of their pages across GC and `blaze clean`.
+fn base_slot_prefix<'f>(workspace: ContentId, layout: ContentId, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    let mut name = blaze_own::String::new_in(frame);
+    name.push_str("engine.bases.slot.");
+    for byte in workspace.0.iter().take(8) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push('.');
+    for byte in layout.0.iter().take(8) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// Unroots every GC reach root owned by an evicted or pruned workspace base slot.
+fn unroot_base_slot<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    workspace: ContentId,
+    layout: ContentId,
+    frame: &Frame,
+) {
+    let prefix = base_slot_prefix(workspace, layout, frame);
+    let answer_name = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
+    let reach_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
+    let members_name = bstd::mem::format_in!(frame, "{}.members", prefix.as_str());
+    let grains_name = bstd::mem::format_in!(frame, "{}.grains", prefix.as_str());
+    if lent.has_root(answer_name.as_str()) {
+        lent.unroot(answer_name.as_str());
+    }
+    if lent.has_root(reach_name.as_str()) {
+        lent.unroot(reach_name.as_str());
+    }
+    if lent.has_root(members_name.as_str()) {
+        lent.unroot(members_name.as_str());
+    }
+    if lent.has_root(grains_name.as_str()) {
+        lent.unroot(grains_name.as_str());
+    }
+    unroot_reach_shards(lent, prefix.as_str(), 0, true, frame);
+}
+
+/// Renews an already-kept workspace base slot's answer, auxiliary (`.members`/`.grains`), and
+/// reach roots in O(1) so surviving entries in [`BASES_ROOT`] do not expire while another checkout
+/// keeps updating the list.
+fn renew_base_slot<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    workspace: ContentId,
+    layout: ContentId,
+    frame: &Frame,
+) {
+    let prefix = base_slot_prefix(workspace, layout, frame);
+    let answer_name = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
+    let _ = lent.renew_root(answer_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+    let members_name = bstd::mem::format_in!(frame, "{}.members", prefix.as_str());
+    let _ = lent.renew_root(members_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+    let grains_name = bstd::mem::format_in!(frame, "{}.grains", prefix.as_str());
+    let _ = lent.renew_root(grains_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+    let reach_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
+    if lent.renew_root(reach_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+        return;
+    }
+    let first = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}.00", prefix.as_str());
+    if !lent.renew_root(first.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+        return;
+    }
+    let mut shard_name = blaze_own::String::new_in(frame);
+    for shard in 1..REACH_SHARDS_MOST {
+        shard_name.clear();
+        let _ = write!(shard_name, "{}.{REACH_ROOT}.{shard:02x}", prefix.as_str());
+        if !lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+            break;
+        }
+    }
+    let delta_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}", prefix.as_str());
+    let _ = lent.renew_root(delta_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+}
+
+/// Resolves the `Index` record to pin under [`BASES_KEPT_ROOT`] for `pointer`: uses the
+/// deterministic `beside_key(pointer)` index holding `[pointer, root, tree_keys..., lines,
+/// headers...]` when present in `lent`, else falls back to a single-key index `[pointer]`.
+fn kept_index_for_base<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    pointer: Key,
+) -> Result<blaze_cas::Key, CliError> {
+    let cas_ptr = blaze_cas::Key(pointer.0);
+    let beside = blaze_cas::plain::beside_key(cas_ptr);
+    if let Some(held) = lent.get(&beside).map_err(crate::store::PlaceError::from)?
+        && blaze_keyed::kind::ReservedTag::Index.is(held.tag)
+        && held.bytes.len() % 32 == 0
+    {
+        return Ok(beside);
+    }
+    Ok(lent.index(&[cas_ptr]).map_err(crate::store::PlaceError::from)?)
+}
+
 /// The bases with `pointer` as its workspace's newest ([`with_base`]), rewritten and pinned
-/// with every pointer they list under [`BASES_ROOT`]. The workspace is the one this request
-/// read ([`Rows::workspace`]), else the one an entry of its layout or lock names
-/// ([`workspace_of_rows`]).
-fn keep_base<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, rows: &Rows<'_>, pointer: Key, frame: &Frame) -> Result<BaseKept, CliError> {
+/// alongside each base's answer root, lines, header shards, and page reach indexes so GC or
+/// `blaze clean` in another worktree cannot leave any base in [`BASES_ROOT`] dangling.
+#[expect(clippy::too_many_arguments, reason = "base publish edge: each argument one handle or reach input")]
+fn keep_base<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    rows: &Rows<'_>,
+    pointer: Key,
+    base_direct_index: blaze_cas::Key,
+    base_aux: BaseAux,
+    encoded: &pages::Encoded<'_>,
+    indexed_beside: &BesideCache<'_>,
+    unsharded_indexes: Option<&[blaze_cas::Key]>,
+    last_info: Option<(usize, Key)>,
+    rekey: Rekey,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<BaseKept, CliError> {
     let Some(layout) = layout_of(rows, frame) else { return Ok(BaseKept::NoWorkspace) };
     let lock = rows.lock_id().unwrap_or(NO_LOCK);
-    let (bases, replaced) = match read_bases(cx, store, frame)? {
+    let (old_bases, replaced) = match read_bases(cx, store, frame)? {
         Some(Some(bases)) => (bases, false),
         Some(None) => (blaze_own::Vec::new_in(frame), true),
         None => (blaze_own::Vec::new_in(frame), false),
     };
-    let Some(workspace) = workspace_of_rows(&bases, rows.workspace, layout, lock) else { return Ok(BaseKept::Unknown) };
+    let Some(workspace) = workspace_of_rows(&old_bases, rows.workspace, layout, lock) else { return Ok(BaseKept::Unknown) };
     let now = Base { workspace: workspace.id, lock, layout, root: root_of(rows), pointer, seq: 0 };
-    let bases = with_base(&bases, now, frame);
+    let bases = with_base(&old_bases, now, frame);
     let bytes = encode_bases(&bases, frame);
     let record = Key(ContentId::of(BASES_DOMAIN, &bytes));
-    store.put(cx, record, &bytes)?;
+    store.put_local(cx, record, &bytes)?;
     store.pin(BASES_ROOT, &[record])?;
-    let mut pointers = blaze_own::Vec::with_capacity_in(bases.len(), frame);
-    pointers.extend(bases.iter().map(|it| it.pointer));
-    store.pin(BASES_KEPT_ROOT, &pointers)?;
+
+    // Pin this base's page reach roots under its `(workspace, layout)` slot so pages remain live
+    // even if this checkout later moves to another layout or expires.
+    let prefix = base_slot_prefix(now.workspace, now.layout, frame);
+    let base_answer = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
+    let base_reach = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
+    if let Some(indexes) = unsharded_indexes {
+        lent.root_through(base_reach.as_str(), indexes, blaze_cas::plain::ROOT_LIFE_NS)
+            .map_err(crate::store::PlaceError::from)?;
+        unroot_reach_shards(lent, prefix.as_str(), 0, true, frame);
+    } else {
+        if lent.has_root(base_reach.as_str()) {
+            lent.unroot(base_reach.as_str());
+        }
+        let _ = publish_reach_shards_from(
+            lent,
+            prefix.as_str(),
+            base_answer.as_str(),
+            ReachSource::Radix { last: last_info, encoded },
+            rekey,
+            Some(indexed_beside),
+            alloc,
+            frame,
+        )?;
+    }
+    lent.root_through(base_answer.as_str(), &[base_direct_index], blaze_cas::plain::ROOT_LIFE_NS)
+        .map_err(crate::store::PlaceError::from)?;
+    // Propagate standing `.members` and `.grains` keys under this `(workspace, layout)` base slot
+    // (without changing `BEB2` layout) so cross-worktree `adopt_certified` and `OtherCheckout`
+    // starts inherit member reach and `ReadGrains` directly.
+    let base_members = bstd::mem::format_in!(frame, "{}.members", prefix.as_str());
+    match base_aux.members {
+        Some(key) => {
+            if read_single_key(store, base_members.as_str())? != Some(key)
+                || !lent.renew_root(base_members.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live()
+            {
+                store.pin(base_members.as_str(), &[key])?;
+            }
+        }
+        None => {
+            if lent.has_root(base_members.as_str()) {
+                lent.unroot(base_members.as_str());
+            }
+        }
+    }
+    let base_grains = bstd::mem::format_in!(frame, "{}.grains", prefix.as_str());
+    match base_aux.grains {
+        Some(key) => {
+            if read_single_key(store, base_grains.as_str())? != Some(key)
+                || !lent.renew_root(base_grains.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live()
+            {
+                store.pin(base_grains.as_str(), &[key])?;
+            }
+        }
+        None => {
+            if lent.has_root(base_grains.as_str()) {
+                lent.unroot(base_grains.as_str());
+            }
+        }
+    }
+
+    // Unroot evicted base slots and renew surviving base slots in O(1).
+    for old in old_bases.iter() {
+        if !bases.iter().any(|it| it.workspace == old.workspace && it.layout == old.layout) {
+            unroot_base_slot(lent, old.workspace, old.layout, frame);
+        }
+    }
+    let mut kept_indexes: blaze_own::Vec<blaze_cas::Key, &Frame> = blaze_own::Vec::with_capacity_in(bases.len(), frame);
+    for base in bases.iter() {
+        if base.workspace == now.workspace && base.layout == now.layout {
+            kept_indexes.push(base_direct_index);
+        } else {
+            renew_base_slot(lent, base.workspace, base.layout, frame);
+            kept_indexes.push(kept_index_for_base(lent, base.pointer)?);
+        }
+    }
+    lent.root_through(BASES_KEPT_ROOT, &kept_indexes, blaze_cas::plain::ROOT_LIFE_NS)
+        .map_err(crate::store::PlaceError::from)?;
     Ok(match replaced {
         true => BaseKept::Replaced,
         false => BaseKept::Kept { entries: u32::try_from(bases.len()).unwrap_or(u32::MAX) },
     })
+}
+
+/// Reads a single 32-byte key from a named store root, or `None` if absent or another length.
+fn read_single_key<'m, D: Driver, S: Sharing>(
+    store: &mut CommandStore<'m, '_, D, S>,
+    root_name: &str,
+) -> Result<Option<Key>, CliError> {
+    Ok(store.named(root_name)?.filter(|keys| keys.len() == 32).map(|keys| key_at(keys, 0)))
+}
+
+/// Reads the optional `<prefix>.members` and `<prefix>.grains` auxiliary keys for a base or root.
+fn read_base_aux<'m, D: Driver, S: Sharing>(
+    store: &mut CommandStore<'m, '_, D, S>,
+    prefix: &str,
+    frame: &Frame,
+) -> Result<BaseAux, CliError> {
+    let members_root = bstd::mem::format_in!(frame, "{prefix}.members");
+    let grains_root = bstd::mem::format_in!(frame, "{prefix}.grains");
+    Ok(BaseAux {
+        members: read_single_key(store, members_root.as_str())?,
+        grains: read_single_key(store, grains_root.as_str())?,
+    })
+}
+
+/// Adopts an identical stored answer from another checkout (`StoredBase::OtherCheckout`, zero
+/// moved leaves, matching tools, replayable, 0 owed) under this checkout's own root `name`
+/// without re-running the `Phases` driver.
+///
+/// Writes a fresh sealed pointer carrying this checkout's leaf stamps (`rows`) and journal cursor
+/// (`journal`), and pins `{name}`, `{name}.journal`, `{name}.answer`, `{name}.reach` (or
+/// sharded reach roots), and any standing `{name}.members` / `{name}.grains` auxiliary keys from
+/// `aux` so this checkout's answer is completely independent of the source checkout under GC and
+/// `blaze clean` and takes `Ready` on its very first edit with zero `ReadyRefused::Members` and
+/// zero `ReadGrains` rebuild.
+///
+/// Returns `Ok(Some(new_pointer_key))` when adopted, or `Ok(None)` if a legacy radix base lacks
+/// its `beside_key(pointer)` root-tree index (caller falls through to `Phases`).
+#[expect(clippy::too_many_arguments, reason = "cross-worktree adoption edge: each argument one handle")]
+pub(crate) fn adopt_certified<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    name: &str,
+    pointer: &Pointer<'_>,
+    root_dir: &Root<'_>,
+    aux: BaseAux,
+    rows: &Rows<'_>,
+    journal: &crate::journal_sweep::Taken<'_>,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<Option<Key>, CliError> {
+    let old_cas_ptr = blaze_cas::Key(pointer.key.0);
+    let old_beside = blaze_cas::plain::beside_key(old_cas_ptr);
+    let mut direct: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+    if let Some(held) = lent.get(&old_beside).map_err(crate::store::PlaceError::from)?
+        && blaze_keyed::kind::ReservedTag::Index.is(held.tag)
+        && held.bytes.len() % 32 == 0
+    {
+        let count = held.bytes.len() / 32;
+        direct.reserve(count);
+        for i in 0..count {
+            let k = cas_key_at(held.bytes, i);
+            if k != old_cas_ptr {
+                direct.push(k);
+            }
+        }
+    } else if !root_dir.is_radix() {
+        direct.push(blaze_cas::Key(pointer.root.0));
+        direct.push(blaze_cas::Key(pointer.lines.0));
+        if let Some(keys) = pointer.headers.current() {
+            direct.extend(keys.keys.iter().filter(|k| **k != Key::default()).map(|k| blaze_cas::Key(k.0)));
+        }
+    } else {
+        return Ok(None);
+    }
+
+    let leaves = Leaves::bytes_in(rows, frame)?;
+    let mut ptr_bytes: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(POINTER_BYTES, frame);
+    ptr_bytes.extend_from_slice(POINTER_MAGIC);
+    ptr_bytes.extend_from_slice(&pointer.root.0.0);
+    ptr_bytes.extend_from_slice(&pointer.lines.0.0);
+    ptr_bytes.extend_from_slice(&pointer.facts.files.to_le_bytes());
+    ptr_bytes.push(pointer.facts.printed.byte());
+    ptr_bytes.extend_from_slice(&pointer.facts.findings.to_le_bytes());
+    ptr_bytes.extend_from_slice(&pointer.facts.owed.to_le_bytes());
+    ptr_bytes.extend_from_slice(&pointer.tools.0);
+    match &pointer.headers {
+        Headers::Current(keys) => {
+            ptr_bytes.push(HEADERS_CURRENT);
+            ptr_bytes.extend_from_slice(&0u64.to_le_bytes());
+            for key in &keys.keys {
+                ptr_bytes.extend_from_slice(&key.0.0);
+            }
+        }
+        Headers::Absent { since } => {
+            ptr_bytes.push(HEADERS_ABSENT);
+            ptr_bytes.extend_from_slice(&since.0.to_le_bytes());
+            ptr_bytes.extend_from_slice(&[0u8; 32 * HeaderPages::COUNT]);
+        }
+    }
+    journal.encode(&mut ptr_bytes);
+    let sealed = seal::seal(&ptr_bytes, &leaves, frame)?;
+    let new_key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
+    store.put_local(cx, new_key, &sealed)?;
+
+    let reach_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}");
+    let answer_name = bstd::mem::format_in!(frame, "{name}.{ANSWER_ROOT}");
+    if !root_dir.is_radix() {
+        let mut indexes: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+        indexes.extend(
+            root_dir
+                .pages
+                .iter()
+                .filter(|p| **p != Key::default())
+                .map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))),
+        );
+        indexes.sort_unstable();
+        lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS)
+            .map_err(crate::store::PlaceError::from)?;
+        unroot_reach_shards(lent, name, 0, true, frame);
+    } else {
+        if lent.has_root(reach_name.as_str()) {
+            lent.unroot(reach_name.as_str());
+        }
+        let num_shards = root_dir.page_count().div_ceil(REACH_SHARD_PAGES);
+        let leaves_per_reach = REACH_SHARD_PAGES / pages::RADIX_LEAF_PAGES;
+        let mut shard_name = blaze_own::String::new_in(frame);
+        let mut scratch: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::with_capacity_in(REACH_SHARD_PAGES, alloc);
+        for shard in 0..num_shards {
+            shard_name.clear();
+            let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
+            scratch.clear();
+            let from_leaf = shard * leaves_per_reach;
+            let to_leaf = (from_leaf + leaves_per_reach).min(root_dir.page_shards.len());
+            for leaf_idx in from_leaf..to_leaf {
+                let shard_key = root_dir.page_shards.get(leaf_idx).copied().unwrap_or_default();
+                if shard_key == Key::default() {
+                    continue;
+                }
+                let leaf = decode_lent_radix_shard(lent, shard_key, leaf_idx, root_dir.bits, alloc)?;
+                scratch.extend(
+                    leaf.keys
+                        .iter()
+                        .filter(|p| **p != Key::default())
+                        .map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))),
+                );
+            }
+            scratch.sort_unstable();
+            lent.root_through(shard_name.as_str(), &scratch, blaze_cas::plain::ROOT_LIFE_NS)
+                .map_err(crate::store::PlaceError::from)?;
+        }
+        let delta_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
+        lent.root_through(delta_name.as_str(), &[], blaze_cas::plain::ROOT_LIFE_NS)
+            .map_err(crate::store::PlaceError::from)?;
+        unroot_reach_shards(lent, name, num_shards, false, frame);
+    }
+    let answer_index = lent.index(&direct).map_err(crate::store::PlaceError::from)?;
+    lent.root_through(answer_name.as_str(), &[answer_index], blaze_cas::plain::ROOT_LIFE_NS)
+        .map_err(crate::store::PlaceError::from)?;
+    let mut base_direct: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::with_capacity_in(direct.len() + 1, alloc);
+    base_direct.push(blaze_cas::Key(new_key.0));
+    base_direct.extend_from_slice(&direct);
+    let _ = lent.index_beside(blaze_cas::Key(new_key.0), &base_direct).map_err(crate::store::PlaceError::from)?;
+    store.pin(name, &[new_key])?;
+    store.pin(crate::journal_checkpoint::name(name, frame).as_str(), &[new_key])?;
+    let members_name = bstd::mem::format_in!(frame, "{name}.members");
+    match aux.members {
+        Some(key) => store.pin(members_name.as_str(), &[key])?,
+        None if lent.has_root(members_name.as_str()) => lent.unroot(members_name.as_str()),
+        None => {}
+    }
+    let grains_name = bstd::mem::format_in!(frame, "{name}.grains");
+    match aux.grains {
+        Some(key) => store.pin(grains_name.as_str(), &[key])?,
+        None if lent.has_root(grains_name.as_str()) => lent.unroot(grains_name.as_str()),
+        None => {}
+    }
+    Ok(Some(new_key))
 }
 
 /// The bases the home keeps: `None` with no [`BASES_ROOT`]; `Some(None)` for a root or record
@@ -1925,19 +2708,21 @@ fn read_bases<'m, 'f, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'
     Ok(Some(decode_bases(held.bytes, frame)))
 }
 
-/// A fully validated fallback base answer: its sealed pointer, printed lines record, and decoded
-/// root directory all opened cleanly against `store`.
+/// A fully validated fallback base answer: its sealed pointer, printed lines record, decoded
+/// root directory, and optional standing auxiliary keys (`.members`/`.grains`) all opened cleanly
+/// against `store`.
 pub(crate) struct LoadedBase<'m, 'a> {
     pub(crate) pointer: Pointer<'m>,
     pub(crate) lines: crate::engine_lines::Last<'m, 'a>,
     pub(crate) root: Root<'a>,
+    pub(crate) aux: BaseAux,
 }
 
-/// Opens a named root's pointer, lines record, and root directory, returning `Ok(None)` if the
-/// root is absent, unreadable, excluded, or (when `require_current_tools`) written under other
-/// tools.
+/// Opens a named root's pointer, lines record, root directory, and optional `.members`/`.grains`
+/// auxiliary keys, returning `Ok(None)` if the root is absent, unreadable, excluded, or (when
+/// `require_current_tools`) written under other tools.
 #[expect(clippy::too_many_arguments, reason = "base open helper: each argument one handle or constraint")]
-pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
+pub(crate) fn open_named_base<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     name: &str,
@@ -1945,6 +2730,7 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     exclude: Option<Key>,
     require_current_tools: bool,
     alloc: SharedAlloc<'a>,
+    frame: &'f Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     let Some(Ok(pointer)) = load_pointer(cx, store, name)? else { return Ok(None) };
     if exclude == Some(pointer.key) {
@@ -1953,9 +2739,10 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     if require_current_tools && !pointer.certifies_under(tools) {
         return Ok(None);
     }
-    let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { return Ok(None) };
+    let Ok(lines) = load_lines_in(cx, store, pointer.lines, frame, alloc)? else { return Ok(None) };
     let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { return Ok(None) };
-    Ok(Some(LoadedBase { pointer, lines, root }))
+    let aux = read_base_aux(store, name, frame)?;
+    Ok(Some(LoadedBase { pointer, lines, root, aux }))
 }
 
 /// Opens the best readable workspace base from [`BASES_ROOT`] for the checkout at `dir_root`:
@@ -1964,7 +2751,7 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
 /// preferring a base written under `tools` (`certifies_under(tools)`) before falling back to any
 /// readable base when `!require_current_tools`.
 #[expect(clippy::too_many_arguments, reason = "workspace base open helper: each argument one handle or constraint")]
-pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
+pub(crate) fn open_base_for_tools<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     dir_root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
@@ -1972,11 +2759,11 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
     exclude: Option<Key>,
     require_current_tools: bool,
     alloc: SharedAlloc<'a>,
-    frame: &Frame,
+    frame: &'f Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
-        return open_named_base(cx, store, LATEST_ROOT, tools, exclude, require_current_tools, alloc);
+        return open_named_base(cx, store, LATEST_ROOT, tools, exclude, require_current_tools, alloc, frame);
     }
     let Some(Some(bases)) = read_bases(cx, store, frame)? else { return Ok(None) };
     let read = |name: &str, text: &mut bstd::mem::Bytes<'_>| -> Result<bool, CliError> {
@@ -2011,9 +2798,11 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
         if !current && fallback.is_some() {
             continue;
         }
-        let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { continue };
+        let Ok(lines) = load_lines_in(cx, store, pointer.lines, frame, alloc)? else { continue };
         let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { continue };
-        let loaded = LoadedBase { pointer, lines, root };
+        let prefix = base_slot_prefix(base.workspace, base.layout, frame);
+        let aux = read_base_aux(store, prefix.as_str(), frame)?;
+        let loaded = LoadedBase { pointer, lines, root, aux };
         if current {
             return Ok(Some(loaded));
         }
@@ -2024,16 +2813,16 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
 
 /// Opens the pre-warmed toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`),
 /// verifying its pointer, lines, and root directory.
-pub(crate) fn open_toolchain_base<'m, 'a, D: Driver, S: Sharing>(
+pub(crate) fn open_toolchain_base<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     alloc: SharedAlloc<'a>,
-    frame: &Frame,
+    frame: &'f Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     let name = toolchain_base_root(toolchain, tools, frame);
-    open_named_base(cx, store, name.as_str(), tools, None, false, alloc)
+    open_named_base(cx, store, name.as_str(), tools, None, false, alloc, frame)
 }
 
 /// The home-wide toolchain-only answer root: `tool-base.<PINNED>.<TRIPLE>.<tools>`.
@@ -2103,6 +2892,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     kept: &Kept<'_>,
+    workers: core::num::NonZeroU32,
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(), CliError> {
@@ -2219,25 +3009,46 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     // (`alloc` reading `core`, `std` reading `alloc`, `ImplBucket` reading `CrateScope`, etc.)
     // see every toolchain cell's digest instead of `ABSENT`.
     tc_kept.answer.cells = blaze_engine::Answer::new_in(alloc).cells;
-    tc_kept.answer.readers = blaze_own::BTreeMap::new_in(alloc);
     for (&name, row) in tc_kept.answer.rows.iter() {
         for &(cell, digest) in row.defines.iter() {
             tc_kept.answer.cells.insert(blaze_engine::CellId { of: name, cell }, (digest, row.serial));
         }
-        for &(id, _) in row.reads.iter() {
-            tc_kept.answer.readers.entry(id).or_insert_with(|| blaze_own::BTreeSet::new_in(alloc)).insert(name);
+    }
+    tc_kept.answer.readers = blaze_engine::engine::Readers::from_rows(&tc_kept.answer.rows, alloc);
+    let mut tc_page_err: Option<CliError> = None;
+    let encoded = pages::encode_par(&tc_kept, None, alloc, |jobs| {
+        match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "toolchain base pages", jobs, alloc, None, |job, scratch| job.run_in(alloc, scratch)) {
+            Ok(built) => built,
+            Err(error) => {
+                tc_page_err = Some(error);
+                blaze_own::Vec::new_in(alloc)
+            }
         }
+    });
+    if let Some(error) = tc_page_err {
+        return Err(error);
     }
-    let encoded = pages::encode(&tc_kept, None, alloc);
     for (key, bytes) in encoded.puts.iter() {
-        store.put(cx, *key, bytes)?;
+        store.put_local(cx, *key, bytes)?;
     }
-    let (headers, writes) = Headers::after(None, &tc_kept, Writer::Phases, tc_kept.answer.serial, HeadersPlant::None, |_| Ok(None), alloc).map_err(page_error)?;
+    let mut tc_hdr_err: Option<CliError> = None;
+    let (headers, writes) = Headers::after_with(None, &tc_kept, Writer::Phases, tc_kept.answer.serial, HeadersPlant::None, |_| Ok(None), alloc, |jobs| {
+        match run_jobs_par(cx, workers, HEADER_PAR_MIN, "toolchain base headers", jobs, alloc, |job| job.run(alloc)) {
+            Ok(built) => built,
+            Err(error) => {
+                tc_hdr_err = Some(error);
+                blaze_own::Vec::new_in(alloc)
+            }
+        }
+    }).map_err(page_error)?;
+    if let Some(error) = tc_hdr_err {
+        return Err(error);
+    }
     for (key, bytes) in &writes {
-        store.put(cx, *key, bytes)?;
+        store.put_local(cx, *key, bytes)?;
     }
     let (empty_lines_key, empty_lines_bytes) = crate::engine_lines::Lines::new_in(alloc).record();
-    store.put(cx, empty_lines_key, &empty_lines_bytes)?;
+    store.put_local(cx, empty_lines_key, &empty_lines_bytes)?;
     let empty_rows = Rows::new_in(frame);
     let leaves = Leaves::bytes_in(&empty_rows, frame)?;
     let mut pointer: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(POINTER_BYTES, frame);
@@ -2268,11 +3079,17 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     crate::journal_sweep::Stored::encode_units(core::iter::empty(), None, &mut pointer);
     let sealed = seal::seal(&pointer, &leaves, frame)?;
     let ptr_key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
-    store.put(cx, ptr_key, &sealed)?;
-    use crate::engine_answer_rows::{AnswerSink as _, StoreSink};
+    store.put_local(cx, ptr_key, &sealed)?;
+    use crate::engine_answer_rows::StoreSink;
     let mut sink = StoreSink { cx, store, lent, toolchain };
     let mut records = blaze_own::Vec::new_in(alloc);
     let mut scopes = blaze_own::Vec::new_in(alloc);
+    let mut cas_buf: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+    let mut indexed_beside: BesideCache<'_> = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::BuildKeyHasher::default(),
+        alloc,
+        capacity: Some(usize::try_from(encoded.task_puts).unwrap_or(0)),
+    });
     for (page, page_rows) in encoded.page_records() {
         records.clear();
         scopes.clear();
@@ -2283,18 +3100,25 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
                 scopes.push((name, record));
             }
         }
-        sink.index_rows(page, &records, &scopes, alloc.into()).map_err(reach_error)?;
+        let beside = sink.index_rows_into(page, &records, &scopes, &mut cas_buf).map_err(reach_error)?;
+        indexed_beside.insert(page.0.0, beside);
     }
+    let index_of = |p: Key| {
+        indexed_beside
+            .get(&p.0.0)
+            .copied()
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(p.0)))
+    };
     let mut page_idx = blaze_own::Vec::new_in(alloc);
     if !encoded.is_radix() {
-        page_idx.extend(encoded.pages.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+        page_idx.extend(encoded.pages.iter().filter(|p| **p != Key::default()).map(|p| index_of(*p)));
     } else {
         for (shard_idx, &shard_key) in encoded.page_shards.iter().enumerate() {
             if shard_key == Key::default() {
                 continue;
             }
             let shard = decode_lent_radix_shard(lent, shard_key, shard_idx, encoded.bits, alloc)?;
-            page_idx.extend(shard.keys.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+            page_idx.extend(shard.keys.iter().filter(|p| **p != Key::default()).map(|p| index_of(*p)));
         }
     }
     page_idx.sort_unstable();
@@ -2331,7 +3155,12 @@ fn cas_key_at(bytes: &[u8], at: usize) -> blaze_cas::Key {
     blaze_cas::Key(ContentId(bytes[at * 32..at * 32 + 32].try_into().expect("a whole key")))
 }
 
-/// Decodes one radix leaf shard already stored (in arena or committed segment) in `lent`.
+/// Cache of newly indexed pages' `beside_key` digests so reach-root construction avoids
+/// recomputing BLAKE3 over pages just indexed in the same `save()` call.
+type BesideCache<'a> = blaze_hash::Map<[u8; 32], blaze_cas::Key, blaze_hash::BuildKeyHasher, SharedAlloc<'a>>;
+
+/// Decodes one radix leaf shard already stored (in arena or committed segment) in `lent` without
+/// lending its bytes (never pins an uncommitted shared arena) or re-hashing store-proved bytes.
 fn decode_lent_radix_shard<'a, D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     shard_key: Key,
@@ -2339,13 +3168,12 @@ fn decode_lent_radix_shard<'a, D: Driver>(
     bits: u8,
     alloc: SharedAlloc<'a>,
 ) -> Result<pages::RadixShard<'a>, CliError> {
-    let held = lent
-        .get(&blaze_cas::Key(shard_key.0))
-        .map_err(crate::store::PlaceError::from)?
-        .ok_or_else(|| page_error(PagesError::Missing { page: pages::ROOT_PAGE, key: shard_key }))?;
     let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
-    let sealed = Sealed::hashed(shard_key, held.bytes).map_err(|torn| page_error(torn.at(pages::ROOT_PAGE)))?;
-    pages::decode_radix_shard(sealed, shard_u32, bits, alloc).map_err(page_error)
+    crate::store::plain_place::lent_with_checked(lent, shard_key, |bytes, proof| {
+        pages::decode_radix_shard(Sealed::by_store(shard_key, bytes, proof), shard_u32, bits, alloc)
+    })?
+    .ok_or_else(|| page_error(PagesError::Missing { page: pages::ROOT_PAGE, key: shard_key }))?
+    .map_err(page_error)
 }
 
 #[cfg(test)]
@@ -2454,9 +3282,14 @@ fn merge_carried_indexes<'h>(
     old: &[Key],
     now: &[Key],
     last_root: Key,
+    known_beside: Option<&BesideCache<'_>>,
     alloc: SharedAlloc<'h>,
 ) -> Result<(blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>>, u32), CliError> {
-    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let index_of = |page: Key| {
+        known_beside
+            .and_then(|map| map.get(&page.0.0).copied())
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(page.0)))
+    };
     let mut out: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> = blaze_own::Vec::new_in(alloc);
     let mut into: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> = blaze_own::Vec::new_in(alloc);
     let mut pages = 0u32;
@@ -2506,9 +3339,14 @@ fn page_indexes<'h, D: Driver>(
     last: Option<(&[Key], Key)>,
     now: &[Key],
     rekey: Rekey,
+    known_beside: Option<&BesideCache<'_>>,
     alloc: SharedAlloc<'h>,
 ) -> Result<(blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>>, Rekeyed), CliError> {
-    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let index_of = |page: Key| {
+        known_beside
+            .and_then(|map| map.get(&page.0.0).copied())
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(page.0)))
+    };
     let whole = |why: WhyWhole| {
         let mut indexes = blaze_own::Vec::new_in(alloc);
         indexes.extend(now.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
@@ -2521,7 +3359,7 @@ fn page_indexes<'h, D: Driver>(
         Err(why) => return whole(why),
     };
     let Some(carried) = held_root_bytes(lent, names.0)? else { return whole(WhyWhole::NoRoot) };
-    let (indexes, pages) = merge_carried_indexes(carried, old, now, last_root, alloc)?;
+    let (indexes, pages) = merge_carried_indexes(carried, old, now, last_root, known_beside, alloc)?;
     Ok((indexes, Rekeyed { pages, whole: None }))
 }
 
@@ -2570,10 +3408,10 @@ fn merge_sorted_keys<'h>(carried: &[u8], added: &[blaze_cas::Key], alloc: Shared
 /// Source of page keys for [`publish_reach_shards_from`]: either a flat slice (unit tests) or a
 /// 2-level radix [`pages::Encoded`] whose leaf shards live in `lent` and whose incremental deltas
 /// avoid scanning all `1 << bits` slots.
-enum ReachSource<'a> {
+enum ReachSource<'a, 'e> {
     #[cfg(test)]
     Flat { last: Option<(&'a [Key], Key)>, now: &'a [Key] },
-    Radix { last: Option<(usize, Key)>, encoded: &'a pages::Encoded<'a> },
+    Radix { last: Option<(usize, Key)>, encoded: &'a pages::Encoded<'e> },
 }
 
 /// Sharded reach roots (`{name}.reach.00`..`{name}.reach.7f`, [`REACH_SHARD_PAGES`] page slots per
@@ -2591,12 +3429,17 @@ fn publish_reach_shards_from<D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     name: &str,
     answer_name: &str,
-    source: ReachSource<'_>,
+    source: ReachSource<'_, '_>,
     rekey: Rekey,
+    known_beside: Option<&BesideCache<'_>>,
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(u32, Rekeyed), CliError> {
-    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let index_of = |page: Key| {
+        known_beside
+            .and_then(|map| map.get(&page.0.0).copied())
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(page.0)))
+    };
     let (last_info, now_len, total_live) = match source {
         #[cfg(test)]
         ReachSource::Flat { last, now } => (
@@ -2784,7 +3627,7 @@ fn publish_reach_shards<D: Driver>(
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(u32, Rekeyed), CliError> {
-    publish_reach_shards_from(lent, name, answer_name, ReachSource::Flat { last, now }, rekey, alloc, frame)
+    publish_reach_shards_from(lent, name, answer_name, ReachSource::Flat { last, now }, rekey, None, alloc, frame)
 }
 
 /// Appends any live sharded reach root names (`{name}.reach.00`..`{name}.reach.7f` and
@@ -3134,7 +3977,7 @@ mod reach_shard_tests {
         let (live1, rekey1) = publish_reach_shards_from(
             &lent, "big", "big.answer",
             ReachSource::Radix { last: None, encoded: &enc_v1 },
-            Rekey::Changed, alloc, frame,
+            Rekey::Changed, None, alloc, frame,
         ).expect("publish cold radix reach shards");
         assert_eq!(live1, enc_v1.live_pages);
         assert_eq!(rekey1.whole, Some(WhyWhole::NoLast));
@@ -3236,7 +4079,7 @@ mod reach_shard_tests {
         let (live2, rekey2) = publish_reach_shards_from(
             &lent, "big", "big.answer",
             ReachSource::Radix { last: Some((dir_v1.page_count(), enc_v1.root)), encoded: &enc_v2 },
-            Rekey::Changed, alloc, frame,
+            Rekey::Changed, None, alloc, frame,
         ).expect("publish incremental radix reach shards");
         let probes_delta = lent.put_tally().disk.root_probes - probes_before;
         assert_eq!(live2, enc_v2.live_pages);
@@ -3287,5 +4130,206 @@ mod reach_shard_tests {
             );
         }
         let _ = garbage_key;
+    }
+
+    /// Rule 26 round-trip: saving a workspace base with `SaveBase::KeepWith(BaseAux { members,
+    /// grains })` persists `.members`/`.grains` under the `(workspace, layout)` base slot without
+    /// changing `BEB2`; another worktree opening that base via `open_base_for_tools` reads back
+    /// the exact keys and `adopt_certified` pins them under Worktree B's own `<name>.members` and
+    /// `<name>.grains` roots; evicting Worktree A cleans up the base slot's auxiliary roots while
+    /// Worktree B's adopted roots remain live.
+    #[test]
+    fn base_aux_propagates_across_keep_base_and_adopt_certified() {
+        use blaze_drive::{Kind, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage};
+
+        let io = Io::simulated(SimWorld::new(53, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let wt_a_dir = fs.open_dir(&cx, &bstd::path::Path::new("wt_a").expect("wt_a")).expect("open wt_a");
+        let wt_b_dir = fs.open_dir(&cx, &bstd::path::Path::new("wt_b").expect("wt_b")).expect("open wt_b");
+        let manifest_bytes = b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+        let lock_bytes = b"version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+        for dir in [&wt_a_dir, &wt_b_dir] {
+            dir.publish(&cx, &bstd::path::Path::new("Cargo.toml").expect("manifest"), bstd::fs::Content::bytes(manifest_bytes), bstd::fs::Durable::No).expect("write Cargo.toml");
+            dir.publish(&cx, &bstd::path::Path::new("Cargo.lock").expect("lock"), bstd::fs::Content::bytes(lock_bytes), bstd::fs::Durable::No).expect("write Cargo.lock");
+        }
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 53 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+        let tools = Tools([Tool(ContentId([7; 32])); blaze_drive::key::KINDS]);
+        let toolchain = blaze_toolchain::ToolchainId([2; 32]);
+        let journal = crate::journal_sweep::take(&cx, &fs, &wt_a_dir, home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
+        let lines = crate::engine_lines::Lines::new_in(alloc).record();
+
+        let mut rows = Rows::new_in(frame);
+        rows.workspace = Workspace::of_lock(lock_bytes, frame);
+        let manifest_path = u32::try_from(rows.names.push("Cargo.toml")).expect("path idx");
+        let lock_path = u32::try_from(rows.names.push("Cargo.lock")).expect("path idx");
+        rows.rows.push(crate::sweep::Leaf {
+            kind: crate::sweep::LeafKind::Manifest,
+            flags: 0,
+            path: manifest_path,
+            stamp: None,
+            id: ContentId::of(crate::sweep::FILE_DOMAIN, manifest_bytes),
+        });
+        rows.rows.push(crate::sweep::Leaf {
+            kind: crate::sweep::LeafKind::Manifest,
+            flags: 0,
+            path: lock_path,
+            stamp: None,
+            id: ContentId::of(crate::sweep::FILE_DOMAIN, lock_bytes),
+        });
+
+        let payload = blaze_drive::key::content_key(b"row-payload");
+        store.put(&cx, payload, b"row-payload").expect("put payload");
+        let members_key = blaze_drive::key::content_key(b"members-record-bytes");
+        store.put(&cx, members_key, b"members-record-bytes").expect("put members");
+        let grains_key = blaze_drive::key::content_key(b"grains-record-bytes");
+        store.put(&cx, grains_key, b"grains-record-bytes").expect("put grains");
+        let aux = BaseAux { members: Some(members_key), grains: Some(grains_key) };
+
+        let mut cold = Kept::new_in(alloc);
+        cold.answer.serial = Gen(1);
+        let file = Name::new(Kind::FileItems, ContentId::of("base aux test file", b"lib.rs"));
+        let task = Name::new(Kind::BodyCheck, ContentId::of("base aux test body", b"f"));
+        let src = ContentId::of("base aux test src", b"v1");
+        cold.answer.by_file.entry(file).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(task);
+        cold.answer.rows.insert(task, Row {
+            key: tools.key(task, &src),
+            phase: Phase::new(Stage::Bodies, 0),
+            file,
+            source: src,
+            out: payload.0,
+            serial: Gen(1),
+            defines: blaze_own::Vec::new_in(alloc),
+            reads: blaze_own::Vec::new_in(alloc),
+            by_cell: blaze_own::Vec::new_in(alloc),
+            findings: 0,
+            inline: false,
+            failed: false,
+        });
+        cold.causes.insert(task, (Gen(1), Cause::New));
+        cold.records.insert(task, payload);
+
+        let wt_a_root = root_name("/wt_a", frame);
+        let wt_b_root = root_name("/wt_b", frame);
+        let saved = save_edit(
+            &cx, &mut store, &lent, wt_a_root.as_str(), toolchain, &tools, &cold,
+            Printed { names: true, bodies_whole: true, replayable: true },
+            (lines.0, &lines.1), None, &rows, &journal, alloc, frame, &[],
+            (None, core::num::NonZeroU32::MIN), SaveBase::KeepWith(aux),
+        ).expect("save wt_a");
+        assert!(matches!(saved.base, BaseKept::Kept { entries: 1 }), "saved base: {:?}", saved.base);
+        lent.commit().expect("commit wt_a");
+        // Empty `row_keys` must reuse `beside_key(pointer_key)` for `{name}.answer` (zero redundant Index put).
+        let wt_a_answer = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", wt_a_root.as_str());
+        let expected_index = blaze_cas::plain::beside_key(blaze_cas::Key(saved.pointer_key.0));
+        let answer_bytes = held_root_bytes(&lent, wt_a_answer.as_str()).expect("read answer root").expect("answer root");
+        assert_eq!(answer_bytes, expected_index.0.0.as_slice(), "empty row_keys reuses base_direct_index");
+
+        // Worktree B opens the workspace base from `BASES_ROOT` and recovers `BaseAux`.
+        let loaded = open_base_for_tools(&cx, &mut store, &wt_b_dir, &tools, None, true, alloc, frame)
+            .expect("open base")
+            .expect("found base for wt_b");
+        assert_eq!(loaded.aux, aux, "open_base_for_tools must return standing members/grains keys");
+
+        // Worktree B adopts the certified answer: its own `<wt_b>.members` and `<wt_b>.grains` are pinned.
+        let adopted = adopt_certified(
+            &cx, &mut store, &lent, wt_b_root.as_str(), &loaded.pointer, &loaded.root,
+            loaded.aux, &rows, &journal, alloc, frame,
+        ).expect("adopt_certified");
+        assert!(adopted.is_some(), "adopt_certified succeeded");
+        lent.commit().expect("commit wt_b");
+
+        let wt_b_aux = read_base_aux(&mut store, wt_b_root.as_str(), frame).expect("read wt_b aux");
+        assert_eq!(wt_b_aux, aux, "adopted checkout owns its own .members and .grains roots");
+
+        // Unrooting Worktree A removes the base slot's `.members`/`.grains` while Worktree B's stay live.
+        let ws = rows.workspace.expect("workspace");
+        let layout = layout_of(&rows, frame).expect("layout");
+        let slot_prefix = base_slot_prefix(ws.id, layout, frame);
+        drop(loaded);
+        drop(store);
+        unroot_checkout(&lent, "/wt_a", frame).expect("unroot wt_a");
+        let mut store2 = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle()).expect("store2");
+        assert_eq!(read_base_aux(&mut store2, slot_prefix.as_str(), frame).expect("slot aux"), BaseAux::default());
+        assert_eq!(read_base_aux(&mut store2, wt_b_root.as_str(), frame).expect("wt_b aux after clean"), aux);
+    }
+
+    /// 128-core false-sharing elimination in `Stored`: `Stored` stays `<= 1 KiB` by value,
+    /// `AskedShard` is 128-byte cache-line padded (`CachePadded`), `ask_shard_index` distributes
+    /// across shards directly from `Name` bytes without a shared global `asks` atomic, and
+    /// `note_ask` / `asks` / `asked` accurately count repeats, distinct names, purposes, and
+    /// per-shard cap overflow (`untold`).
+    #[test]
+    fn stored_sharded_asks_record_accurately_and_stay_cache_padded() {
+        use blaze_drive::Kind;
+        use blaze_engine::{Ask, Gen};
+
+        assert!(core::mem::size_of::<Stored<'static>>() <= 1 << 10, "Stored must stay <= 1 KiB by value");
+        assert!(
+            core::mem::align_of::<bstd::sync::CachePadded<AskedShard<'static>>>() >= 64,
+            "AskedShard must be cache-line aligned"
+        );
+
+        let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 71 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle()).expect("command store");
+        let empty = Kept::new_in(alloc);
+        let enc = pages::encode_at_bits(&empty, 1, alloc);
+        for (k, b) in enc.puts.iter() {
+            store.put(&cx, *k, b).expect("put empty root");
+        }
+        lent.commit().expect("commit empty root");
+        let root_dir = open_root(&cx, &mut store, enc.root, alloc).expect("open").expect("valid root");
+        let snap = store.snapshot_in(alloc).expect("snapshot");
+        let headers = Headers::Absent { since: Gen(1) };
+        let stored = Stored::new(&root_dir, &snap, &headers, pages::Check::Store, alloc);
+
+        // Spread 256 distinct BodyCheck names + repeated asks across shards.
+        let mut shards_hit = [false; ASKED_SHARDS];
+        for i in 0u32..256 {
+            let name = Name::new(Kind::BodyCheck, ContentId::of("stored shard test", &i.to_le_bytes()));
+            shards_hit[Stored::ask_shard_index(name)] = true;
+            stored.note_ask(name, Ask::Header);
+            if i % 4 == 0 {
+                stored.note_ask(name, Ask::Header);
+            }
+        }
+        let distinct_shards = shards_hit.iter().filter(|&&hit| hit).count();
+        assert!(distinct_shards >= ASKED_SHARDS / 2, "hash-based shard selection must spread across shards, hit {distinct_shards}/{ASKED_SHARDS}");
+        assert_eq!(stored.asks(), 256 + 64, "total sharded ask count matches exact calls");
+        let by = stored.asked();
+        assert_eq!(by.asks[Kind::BodyCheck.index()], 320);
+        assert_eq!(by.distinct[Kind::BodyCheck.index()], 256);
+        assert_eq!(by.by_purpose[Ask::Header.purpose()], 320);
+        assert_eq!(by.purpose_distinct[Ask::Header.purpose()], 256);
+        assert_eq!(by.untold, 0, "no asks past per-shard cap");
+
+        // Exceed MOST_ASKS_PER_SHARD on one hot name and verify untold counts exact overflow.
+        let hot = Name::new(Kind::FileItems, ContentId::of("stored shard hot", b"hot"));
+        let overflow = MOST_ASKS_PER_SHARD + 17;
+        for _ in 0..overflow {
+            stored.note_ask(hot, Ask::Header);
+        }
+        assert_eq!(stored.asks(), 320 + overflow);
+        let after = stored.asked();
+        assert!(after.untold >= 17, "asks past per-shard cap must be counted in untold, got {}", after.untold);
     }
 }

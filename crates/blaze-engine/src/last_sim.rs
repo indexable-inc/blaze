@@ -21,7 +21,7 @@ use std::vec::Vec as StdVec;
 use blaze_answer::{CellDigest, Flags, Serial, TreeDigest};
 use blaze_drive::key::{ABSENT, Key, Name};
 use blaze_id::ContentId;
-use blaze_own::{AVec, Alloc, BTreeSet as OwnSet, SharedAlloc, Vec};
+use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::engine::{Answer, CellId, EngineError, Gen, Phase, Plant, Planned, Row};
@@ -205,9 +205,11 @@ impl SimLast {
         for (cell, digest, at) in self.digests.iter() {
             answer.cells.insert(self.cells[*cell as usize], (*digest, Gen(*at)));
         }
+        let mut reader_pairs = Vec::with_capacity_in(self.readers.len(), alloc);
         for (cell, reader) in self.readers.iter() {
-            answer.readers.entry(self.cells[*cell as usize]).or_insert_with(|| OwnSet::new_in(alloc)).insert(self.names[*reader as usize]);
+            reader_pairs.push((self.cells[*cell as usize], self.names[*reader as usize]));
         }
+        answer.readers = crate::engine::Readers::from_pairs(reader_pairs, alloc);
         for (file, one) in self.by_file.iter() {
             answer.by_file.entry(self.names[*file as usize]).or_insert_with(|| Vec::new_in(alloc)).push(self.names[*one as usize]);
         }

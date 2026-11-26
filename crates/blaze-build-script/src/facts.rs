@@ -3,8 +3,10 @@
 //! (port27/hvbox-1116/READINESS.md 1f; recorded like D54's `git:` facts).
 //!
 //! - `pkg-config` (or `pkgconf`): the sandbox has no system library and no `.pc` file (v1), so
-//!   every query naming modules answers "not found" with pkg-config 0.29.2's own message, and
-//!   `--version` answers the fixed string `0.29.2` (as D54 states `git version 2.51.0`).
+//!   every query naming modules (with or without version constraints) answers "not found", a
+//!   query naming no module (including 0-arg `pkg-config`) exits 1 with pkg-config 0.29.2's
+//!   `Must specify package names on the command line`, and `--version` answers the fixed string
+//!   `0.29.2` (as D54 states `git version 2.51.0`).
 //! - `sw_vers -productVersion` / `-buildVersion` / `-productName`: the declared userland's pins.
 //! - A C compiler's identity probes (`--version`, `-dumpversion`, `-dumpfullversion`): the
 //!   pinned clang's version text, and [`blaze_pins::RUSTC_LLVM`] for the dumped version.
@@ -16,7 +18,7 @@
 
 #![blaze::sans_io]
 
-use blaze_own::{AString, Alloc, String};
+use blaze_own::{AString, Alloc, String, Vec};
 
 use crate::probe;
 
@@ -60,13 +62,14 @@ pub struct FactAnswer<'a> {
 /// handled is refused by name, never guessed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FactRefused<'a> {
-    /// A `pkg-config` argument the derived fact does not know, carried as given. Empty when the
-    /// query names no module at all (pkg-config's own "Must specify package names" case, not
-    /// answered here).
+    /// A `pkg-config` argument the derived fact does not know (an unknown flag, a newline, an
+    /// empty or whitespace-only argument, or a malformed version constraint), carried as given.
     PkgConfigArgs { arg: AString<'a> },
     /// `sw_vers` with arguments other than exactly one of `-productVersion`, `-buildVersion`,
     /// `-productName`: the arguments joined by spaces.
     SwVersArgs { args: AString<'a> },
+    /// `sw_vers` asked on a host that declares no Apple userland (empty macOS version pins).
+    NoAppleUserland,
     /// A compiler probe whose argument is not `--version`, `-dumpversion` or `-dumpfullversion`.
     CompilerArgs { program: AString<'a>, arg: AString<'a> },
     /// A compiler probe asked of [`answer`]: its answer is the table's (`c_tasks_probe`).
@@ -76,14 +79,14 @@ pub enum FactRefused<'a> {
 impl core::fmt::Display for FactRefused<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FactRefused::PkgConfigArgs { arg } if arg.as_str().is_empty() => {
-                f.write_str("pkg-config names no module: not answered as a derived fact (READINESS 1f)")
-            }
             FactRefused::PkgConfigArgs { arg } => {
                 write!(f, "pkg-config argument `{}` is not one the derived fact answers (READINESS 1f)", arg.as_str())
             }
             FactRefused::SwVersArgs { args } => {
                 write!(f, "sw_vers `{}`: only one of -productVersion, -buildVersion, -productName is answered (READINESS 1f)", args.as_str())
+            }
+            FactRefused::NoAppleUserland => {
+                f.write_str("sw_vers: the host declares no Apple userland, so sw_vers is not answered (READINESS 1f)")
             }
             FactRefused::CompilerArgs { program, arg } => {
                 write!(f, "`{} {}`: only --version, -dumpversion, -dumpfullversion are answered for a compiler (READINESS 1f)", program.as_str(), arg.as_str())
@@ -107,6 +110,9 @@ const SW_VERS_OPTIONS: &[&str] = &["-productVersion", "-buildVersion", "-product
 /// What `pkg-config --version` answers: a stated fixed string (the version whose messages
 /// [`not_found`] quotes).
 pub const PKG_CONFIG_VERSION: &str = "0.29.2";
+
+/// What `pkg-config` prints to stderr when no package name is given (main.c).
+const NO_MODULES_STDERR: &str = "Must specify package names on the command line\n";
 
 /// What `sw_vers -productName` prints on every macOS since 11.
 const MACOS_PRODUCT_NAME: &str = "macOS";
@@ -140,9 +146,31 @@ pub fn question<'s>(program: &'s str, args: &'s [&'s str]) -> Option<Fact<'s>> {
     None
 }
 
-/// Whether `arg` is a plain module name (no version constraint, no space, no flag).
-fn is_module(arg: &str) -> bool {
-    !arg.is_empty() && !arg.starts_with('-') && !arg.chars().any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '=' | '!' | ','))
+/// The six version comparison operators `pkg-config` 0.29.2 accepts (`parse.c`).
+fn is_operator(word: &str) -> bool {
+    matches!(word, "=" | "<" | "<=" | ">" | ">=" | "!=")
+}
+
+/// Whether `word` is a plain module name or version token (non-empty, not a flag, no whitespace,
+/// no comparison-operator character, no comma).
+fn is_module_or_version(word: &str) -> bool {
+    !word.is_empty() && !word.starts_with('-') && !word.chars().any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '=' | '!' | ','))
+}
+
+/// State of the `pkg-config` module-list grammar across arguments (`parse.c` `parse_module_list`):
+/// `module [op version]` specs separated by whitespace or commas, in single-arg or split-arg form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleParse {
+    /// Start of input, or after a flag; next token must be a module name.
+    Ready,
+    /// Just saw `,`; a module name must follow (no trailing or double comma).
+    AfterComma,
+    /// Just saw a module name; next may be an operator, `,`, or another module name.
+    AfterModule,
+    /// Just saw a comparison operator; a version token must follow.
+    ExpectVersion,
+    /// Just saw a version token; next may be `,` or another module name (never a second operator).
+    AfterVersion,
 }
 
 /// pkg-config 0.29.2's message for a module it cannot find: pkg.c's `internal_get_package`
@@ -159,18 +187,84 @@ fn not_found(module: &str, out: &mut AString<'_>) {
 
 /// `pkg-config` with `args`. The flags known: `--version`, `--exists`, `--libs`, `--cflags`,
 /// `--modversion`, `--static`, `--print-errors`, none taking a value; any other is refused.
+/// Positional arguments carry module names with optional version constraints (`=`, `<`, `<=`,
+/// `>`, `>=`, `!=`), comma- or space-separated, in single-arg (`"glib-2.0 >= 2.56"`) or
+/// split-arg (`"glib-2.0"`, `">="`, `"2.56"`) form. Newlines and malformed constraints are
+/// refused by name.
 fn pkg_config<'a>(args: &[&str], alloc: Alloc<'a>) -> Result<FactAnswer<'a>, FactRefused<'a>> {
-    let (mut version, mut exists, mut output, mut print_errors, mut modules) = (false, false, false, false, 0usize);
-    for arg in args {
-        match *arg {
-            "--version" => version = true,
-            "--exists" => exists = true,
-            "--libs" | "--cflags" | "--modversion" => output = true,
-            "--static" => {}
-            "--print-errors" => print_errors = true,
-            module if is_module(module) => modules += 1,
-            other => return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(other, alloc) }),
+    let (mut version, mut exists, mut output, mut print_errors) = (false, false, false, false);
+    let mut modules = Vec::new_in(alloc);
+    let mut state = ModuleParse::Ready;
+    let mut last_arg = "";
+
+    for &arg in args {
+        if arg.contains(['\n', '\r']) {
+            return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) });
         }
+        if arg.starts_with('-') {
+            if matches!(state, ModuleParse::ExpectVersion | ModuleParse::AfterComma) {
+                return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) });
+            }
+            match arg {
+                "--version" => version = true,
+                "--exists" => exists = true,
+                "--libs" | "--cflags" | "--modversion" => output = true,
+                "--static" => {}
+                "--print-errors" => print_errors = true,
+                _ => return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) }),
+            }
+            state = ModuleParse::Ready;
+            continue;
+        }
+
+        last_arg = arg;
+        let mut saw_token = false;
+        for (part_index, comma_part) in arg.split(',').enumerate() {
+            if part_index > 0 {
+                saw_token = true;
+                match state {
+                    ModuleParse::AfterModule | ModuleParse::AfterVersion => state = ModuleParse::AfterComma,
+                    ModuleParse::Ready | ModuleParse::AfterComma | ModuleParse::ExpectVersion => {
+                        return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) });
+                    }
+                }
+            }
+            for word in comma_part.split([' ', '\t']).filter(|w| !w.is_empty()) {
+                saw_token = true;
+                match state {
+                    ModuleParse::Ready | ModuleParse::AfterComma | ModuleParse::AfterVersion => {
+                        if !is_module_or_version(word) {
+                            return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) });
+                        }
+                        modules.push(word);
+                        state = ModuleParse::AfterModule;
+                    }
+                    ModuleParse::AfterModule => {
+                        if is_operator(word) {
+                            state = ModuleParse::ExpectVersion;
+                        } else if is_module_or_version(word) {
+                            modules.push(word);
+                            state = ModuleParse::AfterModule;
+                        } else {
+                            return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) });
+                        }
+                    }
+                    ModuleParse::ExpectVersion => {
+                        if !is_module_or_version(word) {
+                            return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) });
+                        }
+                        state = ModuleParse::AfterVersion;
+                    }
+                }
+            }
+        }
+        if !saw_token {
+            return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(arg, alloc) });
+        }
+    }
+
+    if matches!(state, ModuleParse::ExpectVersion | ModuleParse::AfterComma) {
+        return Err(FactRefused::PkgConfigArgs { arg: String::from_str_in(last_arg, alloc) });
     }
     if version {
         // main.c answers `--version` before it reads any module.
@@ -178,15 +272,17 @@ fn pkg_config<'a>(args: &[&str], alloc: Alloc<'a>) -> Result<FactAnswer<'a>, Fac
         stdout.push('\n');
         return Ok(FactAnswer { code: 0, stdout, stderr: String::new_in(alloc) });
     }
-    if modules == 0 {
-        return Err(FactRefused::PkgConfigArgs { arg: String::new_in(alloc) });
+    if modules.is_empty() {
+        // main.c: with no package names (including 0-arg `pkg-config`), pkg-config always prints
+        // this message to stderr (even under `--exists`) and exits 1.
+        return Ok(FactAnswer { code: 1, stdout: String::new_in(alloc), stderr: String::from_str_in(NO_MODULES_STDERR, alloc) });
     }
     // main.c: errors are off by default for `--exists` and for no output option at all
     // (`--print-errors` turns them on), on for every output option.
     let loud = print_errors || (output && !exists);
     let mut stderr = String::new_in(alloc);
     if loud {
-        for module in args.iter().filter(|arg| is_module(arg)) {
+        for module in modules {
             not_found(module, &mut stderr);
         }
     }
@@ -209,6 +305,9 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
     match *fact {
         Fact::PkgConfig { args } => pkg_config(args, alloc),
         Fact::SwVers { args } => {
+            if pins.macos_product_version.is_empty() || pins.macos_build_version.is_empty() {
+                return Err(FactRefused::NoAppleUserland);
+            }
             let value = match args {
                 ["-productVersion"] => pins.macos_product_version,
                 ["-buildVersion"] => pins.macos_build_version,

@@ -469,7 +469,7 @@ pub fn body_value<H: super::types::Heads + ?Sized>(heads: &H, ask: Ask, r: blaze
 /// eligible for batch evaluation, in asking order (e.g. enum discriminants).
 /// A mandatory body need is evaluated by the driver that requested it.
 pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibKey, Global>, FileFail> {
-    let asked = store.maps.anon_asked.take();
+    let asked = core::mem::replace(&mut *store.maps.anon_asked.borrow_mut(), blaze_own::Vec::new_in(store.tys.alloc()));
     let mut needs = Vec::with_capacity_in(asked.len(), Global);
     for a in asked.iter() {
         if a.body.is_none() {
@@ -514,21 +514,21 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
                 header,
                 c_variadic: false,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(text),
-                legacy_const_generics: Vec::new_in(Global),
-                inputs: Vec::new_in(Global),
+                legacy_const_generics: AVec::new_in(alloc),
+                inputs: AVec::new_in(alloc),
                 output,
                 has_body: true,
                 module: a.module,
-                params: Vec::new_in(Global),
-                consts: Vec::new_in(Global),
-                bounds: Vec::new_in(Global),
+                params: AVec::new_in(alloc),
+                consts: AVec::new_in(alloc),
+                bounds: AVec::new_in(alloc),
                 // `Self` for an expression that names it ([`Ask::of_self`]): the ground type
                 // itself, with no trait (the expression is not a member of the impl).
                 self_: match a.self_ty {
                     Some(t) => SelfTy::Ty(t, None),
                     None => SelfTy::None,
                 },
-                self_assoc: Vec::new_in(Global),
+                self_assoc: AVec::new_in(alloc),
             },
         );
     }

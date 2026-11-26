@@ -493,6 +493,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-math",
  "blaze-own",
+ "blaze-pbr",
  "blaze-sim",
  "blaze-text",
  "blaze-units",
@@ -567,6 +568,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-math",
  "blaze-own",
+ "blaze-pbr",
  "blaze-sim",
  "blaze-units",
 ]
@@ -647,6 +649,7 @@ dependencies = [
  "blaze-body",
  "blaze-build-script",
  "blaze-cas",
+ "blaze-cli-spec",
  "blaze-code",
  "blaze-comptime",
  "blaze-core",
@@ -658,6 +661,7 @@ dependencies = [
  "blaze-export",
  "blaze-fetch",
  "blaze-file-items",
+ "blaze-git-fetch",
  "blaze-h1",
  "blaze-hash",
  "blaze-http",
@@ -696,6 +700,13 @@ dependencies = [
  "blaze-world",
  "edition",
  "parser",
+]
+
+[[package]]
+name = "blaze-cli-spec"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -816,6 +827,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-hash",
  "blaze-ids",
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -843,6 +855,13 @@ dependencies = [
  "blaze-sim",
  "blaze-text",
  "blaze-unit-graph",
+]
+
+[[package]]
+name = "blaze-dust"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -1074,12 +1093,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-git"
+version = "0.0.0"
+dependencies = [
+ "blaze-git-fetch",
+ "blaze-hash",
+ "blaze-memchr",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-git-fetch"
 version = "0.0.0"
 dependencies = [
  "blaze-deflate",
  "blaze-own",
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-git-meta"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -1160,6 +1197,14 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
  "blaze-swiss",
+]
+
+[[package]]
+name = "blaze-html"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1288,6 +1333,10 @@ version = "0.0.0"
 dependencies = [
  "blaze-ask",
  "blaze-body",
+ "blaze-body-build",
+ "blaze-body-drops",
+ "blaze-body-eval",
+ "blaze-body-flow",
  "blaze-body-lower",
  "blaze-build",
  "blaze-build-script",
@@ -1567,37 +1616,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-names-demand"
-version = "0.0.0"
-dependencies = [
- "blaze-id",
- "blaze-ids",
- "blaze-mem",
- "blaze-own",
- "blaze-sim",
-]
-
-[[package]]
-name = "blaze-names-source"
-version = "0.0.0"
-dependencies = [
- "blaze-expand",
- "blaze-file-items",
- "blaze-format",
- "blaze-id",
- "blaze-ids",
- "blaze-mem",
- "blaze-names-demand",
- "blaze-own",
- "blaze-scope",
- "blaze-sim",
- "blaze-surface",
- "blaze-tokens",
- "blaze-unit-graph",
- "edition",
-]
-
-[[package]]
 name = "blaze-native"
 version = "0.0.0"
 dependencies = [
@@ -1648,6 +1666,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-pbr"
+version = "0.0.0"
+dependencies = [
+ "blaze-math",
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-pg"
 version = "0.0.0"
 dependencies = [
@@ -1669,6 +1695,19 @@ dependencies = [
 [[package]]
 name = "blaze-pins"
 version = "0.0.0"
+
+[[package]]
+name = "blaze-preview"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-html",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-sniff",
+ "blaze-toml",
+]
 
 [[package]]
 name = "blaze-proc-macro"
@@ -1817,6 +1856,7 @@ name = "blaze-record"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
+ "blaze-own",
  "blaze-rng",
 ]
 
@@ -2005,12 +2045,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-sh"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-glob",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-sniff",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-sha256"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-shell-config"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-own",
+ "blaze-toml",
 ]
 
 [[package]]
@@ -2039,6 +2101,14 @@ version = "0.0.0"
 dependencies = [
  "blaze-own",
  "blaze-site",
+]
+
+[[package]]
+name = "blaze-sniff"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -2124,6 +2194,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ssh"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-stage"
 version = "0.0.0"
 dependencies = [
@@ -2155,6 +2233,7 @@ dependencies = [
  "blaze-ecs",
  "blaze-ed25519",
  "blaze-format",
+ "blaze-git",
  "blaze-glob",
  "blaze-h1",
  "blaze-h2",
@@ -2234,6 +2313,13 @@ name = "blaze-sys"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "blaze-sysmon"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -2420,6 +2506,25 @@ dependencies = [
  "blaze-graph",
  "blaze-ids",
  "blaze-store-check",
+]
+
+[[package]]
+name = "blaze-vim"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-vt"
+version = "0.0.0"
+dependencies = [
+ "blaze-base64",
+ "blaze-deflate",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-unicode",
 ]
 
 [[package]]
@@ -4504,6 +4609,7 @@ name = "target-features"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
+ "blaze-own",
  "blaze-phf",
  "blaze-sim",
 ]

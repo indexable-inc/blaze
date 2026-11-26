@@ -55,6 +55,8 @@ struct BodyBuf {
     /// inside `unsafe`, so its intrinsic calls and `asm!`s need no block (the unsafety check's
     /// own tests are blaze-ladder's tests/front2_unsafety.rs).
     unsafe_blocks: Vec<ExprId, Global>,
+    /// The body's Rust edition (`BodyView::edition`, default 2024).
+    edition: Edition,
 }
 
 impl BodyBuf {
@@ -84,6 +86,7 @@ impl BodyBuf {
             asm_text: "",
             call_arg_ints: Vec::new_in(Global),
             unsafe_blocks: Vec::new_in(Global),
+            edition: Edition::E2024,
         }
     }
 
@@ -211,7 +214,7 @@ impl BodyBuf {
     fn view(&self, owner: ItemKey, root: ExprId) -> BodyView<'_> {
         BodyView {
             owner,
-            edition: Edition::E2024,
+            edition: self.edition,
             params: &self.params,
             root,
             exprs: &self.exprs,

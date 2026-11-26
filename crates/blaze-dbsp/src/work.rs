@@ -17,7 +17,7 @@ pub struct Work {
     pub moved: u64,
 }
 
-impl std::ops::AddAssign for Work {
+impl core::ops::AddAssign for Work {
     fn add_assign(&mut self, other: Work) {
         self.ops += other.ops;
         self.woken += other.woken;

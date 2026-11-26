@@ -32,7 +32,7 @@ use blaze_core::Driver;
 use blaze_own::{Alloc, Arc, Share};
 use blaze_remote::PublicKey;
 use blaze_remote::published::set::SetCheck;
-use blaze_remote::read::{Answer, BatchError, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
+use blaze_remote::read::{Answer, BatchError, BatchOutcome, BatchRead, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
 use bstd::Stopped;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
@@ -53,6 +53,9 @@ use crate::CliError;
 /// The command's store on blaze-cas's plain store: `Lent`, `PlainPlace`, the proof.
 pub(crate) mod plain_place;
 pub use plain_place::{Facts, Held, PlaceError, PlainPlace, StoreAlloc};
+
+/// Selective fast `zstd` (`BZR1`) envelope for large decoded-on-read CAS records.
+pub(crate) mod record_codec;
 
 /// What keeps a record after its command: one typed root per lifetime class.
 pub(crate) mod roots;
@@ -175,7 +178,7 @@ pub trait Store<'m> {
 /// store.
 pub(crate) struct StoreSnapshot {
     inner: Snapshot<blaze_mem::Kept>,
-    expansion_demands: AtomicU64,
+    expansion_demands: bstd::sync::CachePadded<AtomicU64>,
 }
 
 pub(crate) type SharedSnapshot = Arc<StoreSnapshot, blaze_mem::Kept>;
@@ -198,6 +201,197 @@ impl StoreSnapshot {
         self.expansion_demands.load(Ordering::Relaxed)
     }
 
+}
+
+/// Task scratch frame for CAS parallel CPU helpers (BLAKE3 subtrees, Bloom bucketing,
+/// `TwoValues` probes).
+const CAS_PAR_FRAME: usize = 64 << 10;
+
+/// Store-tagged allocator for [`CxPar`] worker scratch vectors (`Send + Sync + Copy`, zero `Global`).
+const CAS_PAR_ALLOC: blaze_mem::Kept = blaze_mem::Kept(blaze_mem::Tag::Store);
+
+/// 100% safe work-stealing [`blaze_cas::plain::Par`] executor backed by `bstd`'s scoped task
+/// pool (`cx.scope().may_overlap`) and a 128B-padded atomic stealing cursor
+/// (`bstd::sync::CachePadded<AtomicUsize>`).
+///
+/// Falls back directly to an inline serial loop with zero scope or worker overhead when
+/// `chunks <= 1` or `workers <= 1` (including simulated/single-worker contexts).
+pub(crate) struct CxPar<'a> {
+    cx: &'a Cx,
+    workers: core::num::NonZeroU32,
+}
+
+impl<'a> CxPar<'a> {
+    /// Creates a [`CxPar`] sized to `cx.workers()`.
+    pub(crate) fn new(cx: &'a Cx) -> CxPar<'a> {
+        let workers = core::num::NonZeroU32::new(cx.workers()).unwrap_or(core::num::NonZeroU32::MIN);
+        CxPar { cx, workers }
+    }
+
+    /// Creates a [`CxPar`] capped to `min(workers, cx.workers().max(1))`.
+    #[allow(dead_code, reason = "explicit worker cap constructor for bounded callers and tests")]
+    pub(crate) fn with_workers(cx: &'a Cx, workers: core::num::NonZeroU32) -> CxPar<'a> {
+        let capped = workers.get().min(cx.workers().max(1));
+        let workers = core::num::NonZeroU32::new(capped).unwrap_or(core::num::NonZeroU32::MIN);
+        CxPar { cx, workers }
+    }
+}
+
+impl blaze_cas::plain::Par for CxPar<'_> {
+    #[inline]
+    fn workers(&self) -> usize {
+        usize::try_from(self.workers.get()).unwrap_or(1)
+    }
+
+    fn map_range<R: Send, A: Allocator + Copy>(
+        &self,
+        count: usize,
+        grain: usize,
+        alloc: A,
+        f: impl Fn(usize, usize) -> R + Sync,
+    ) -> blaze_own::Vec<R, A> {
+        if count == 0 {
+            return blaze_own::Vec::new_in(alloc);
+        }
+        let step = grain.max(1);
+        let chunks = count.div_ceil(step);
+        let w = self.workers();
+        if chunks <= 1 || w <= 1 {
+            let mut out = blaze_own::Vec::with_capacity_in(chunks, alloc);
+            let mut lo = 0usize;
+            while lo < count {
+                let hi = lo.saturating_add(step).min(count);
+                out.push(f(lo, hi));
+                lo = hi;
+            }
+            return out;
+        }
+
+        let worker_count = w.min(chunks);
+        let helpers = worker_count.saturating_sub(1);
+        let cursor = bstd::sync::CachePadded::new(core::sync::atomic::AtomicUsize::new(0));
+        let mut slots: blaze_own::Vec<Option<R>, A> = blaze_own::Vec::with_capacity_in(chunks, alloc);
+        for _ in 0..chunks {
+            slots.push(None);
+        }
+        {
+            let cursor_ref = &cursor;
+            let f_ref = &f;
+            let scope = self.cx.scope();
+            scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+            let mut handles = blaze_own::Vec::with_capacity_in(helpers, CAS_PAR_ALLOC);
+            for _ in 0..helpers {
+                handles.push(scope.may_overlap(
+                    "cas: par map",
+                    CAS_PAR_FRAME,
+                    move |_cx: &Cx| -> Result<blaze_own::Vec<(usize, R), blaze_mem::Kept>, core::convert::Infallible> {
+                        let mut local: blaze_own::Vec<(usize, R), blaze_mem::Kept> = blaze_own::Vec::new_in(CAS_PAR_ALLOC);
+                        loop {
+                            let idx = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                            if idx >= chunks {
+                                break;
+                            }
+                            let lo = idx.saturating_mul(step);
+                            let hi = lo.saturating_add(step).min(count);
+                            local.push((idx, f_ref(lo, hi)));
+                        }
+                        Ok(local)
+                    },
+                ));
+            }
+            // Calling thread participates as worker 0.
+            loop {
+                let idx = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                if idx >= chunks {
+                    break;
+                }
+                let lo = idx.saturating_mul(step);
+                let hi = lo.saturating_add(step).min(count);
+                if let Some(slot) = slots.get_mut(idx) {
+                    *slot = Some(f_ref(lo, hi));
+                }
+            }
+            for handle in handles.into_iter() {
+                if let Ok(local) = handle.join(self.cx) {
+                    for (idx, value) in local.into_iter() {
+                        if let Some(slot) = slots.get_mut(idx) {
+                            *slot = Some(value);
+                        }
+                    }
+                }
+            }
+            let _ = scope.join(self.cx);
+        }
+        let mut out = blaze_own::Vec::with_capacity_in(chunks, alloc);
+        for (idx, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(value) => out.push(value),
+                None => {
+                    let lo = idx.saturating_mul(step);
+                    let hi = lo.saturating_add(step).min(count);
+                    out.push(f(lo, hi));
+                }
+            }
+        }
+        out
+    }
+
+    fn for_each_mut_chunks<T: Send>(
+        &self,
+        items: &mut [T],
+        grain: usize,
+        f: impl Fn(usize, &mut [T]) + Sync,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let step = grain.max(1);
+        let chunks = items.len().div_ceil(step);
+        let w = self.workers();
+        if chunks <= 1 || w <= 1 {
+            for (idx, chunk) in items.chunks_mut(step).enumerate() {
+                f(idx.saturating_mul(step), chunk);
+            }
+            return;
+        }
+
+        let worker_count = w.min(chunks);
+        let base_chunks = chunks / worker_count;
+        let extra_chunks = chunks % worker_count;
+        let f_ref = &f;
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let mut handles = blaze_own::Vec::with_capacity_in(worker_count.saturating_sub(1), CAS_PAR_ALLOC);
+        let mut rest = items;
+        let mut offset = 0usize;
+        // Worker 0 slice runs inline on the calling thread; helpers take disjoint slices via split_at_mut
+        // with zero locks and zero shared chunk-table allocation.
+        let first_len = base_chunks.saturating_add(usize::from(extra_chunks > 0)).saturating_mul(step).min(rest.len());
+        let (first_slice, after_first) = rest.split_at_mut(first_len);
+        rest = after_first;
+        offset = offset.saturating_add(first_len);
+        for worker in 1..worker_count {
+            let my_chunks = base_chunks.saturating_add(usize::from(worker < extra_chunks));
+            let my_len = my_chunks.saturating_mul(step).min(rest.len());
+            let (mine, tail) = rest.split_at_mut(my_len);
+            let my_offset = offset;
+            rest = tail;
+            offset = offset.saturating_add(my_len);
+            handles.push(scope.may_overlap("cas: par chunks", CAS_PAR_FRAME, move |_cx: &Cx| -> Result<(), core::convert::Infallible> {
+                for (local_idx, chunk) in mine.chunks_mut(step).enumerate() {
+                    f_ref(my_offset.saturating_add(local_idx.saturating_mul(step)), chunk);
+                }
+                Ok(())
+            }));
+        }
+        for (local_idx, chunk) in first_slice.chunks_mut(step).enumerate() {
+            f_ref(local_idx.saturating_mul(step), chunk);
+        }
+        for handle in handles.into_iter() {
+            let _ = handle.join(self.cx);
+        }
+        let _ = scope.join(self.cx);
+    }
 }
 
 /// The bytes of records a [`Store`] copied into this process's heap, and holds now (a gauge):
@@ -618,8 +812,20 @@ impl Home {
     /// (one driver a process, drive.md ruling 5): nothing is mapped until a get probes.
     pub fn open_store(&self, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
         let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
-        let dir = driver.dir().clone();
-        Ok(plain_place::open(driver, plain_place::config(dir, settings, facts, alloc), alloc)?)
+        let dir = driver.dir().share();
+        let lent = plain_place::open(driver, plain_place::config(dir, settings, facts, alloc), alloc)?;
+        lent.set_commit_durability(default_local_durability(settings));
+        Ok(lent)
+    }
+
+    /// Parallel twin of [`Home::open_store`]: verifies large earlier-boot segments through [`CxPar`].
+    pub fn open_store_par(&self, cx: &Cx, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
+        let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
+        let dir = driver.dir().share();
+        let par = CxPar::new(cx);
+        let lent = plain_place::open_par(driver, plain_place::config(dir, settings, facts, alloc), alloc, &par)?;
+        lent.set_commit_durability(default_local_durability(settings));
+        Ok(lent)
     }
 
     /// Opens the store with an explicit [`Liveness`] policy (used by `blaze gc` to sweep
@@ -629,7 +835,26 @@ impl Home {
         let dir = driver.dir().share();
         let mut cfg = plain_place::config(dir, settings, facts, alloc);
         cfg.liveness = liveness;
-        Ok(plain_place::open(driver, cfg, alloc)?)
+        let lent = plain_place::open(driver, cfg, alloc)?;
+        lent.set_commit_durability(default_local_durability(settings));
+        Ok(lent)
+    }
+}
+
+/// Default commit durability for a local rebuildable CLI store:
+/// - `settings.durable == false` keeps [`blaze_cas::plain::CommitDurability::Unsynced`] (zero
+///   foreground barriers/syncs; background GC seals segments asynchronously and post-crash opens
+///   verify unsealed segments whole on first read).
+/// - `settings.durable == true` defaults to [`blaze_cas::plain::CommitDurability::Barrier`]
+///   (`F_BARRIERFSYNC` on macOS, `fdatasync` on Linux: ordered crash-consistent commits with zero
+///   `F_FULLFSYNC`, proven across power cuts in `blaze-cas` DST
+///   `barrier_ordered_commits_cut_full_syncs_and_survive_power_cuts_at_every_step`). Callers
+///   requiring `F_FULLFSYNC` can explicitly opt in via `lent.set_commit_durability(Full)`.
+const fn default_local_durability(settings: &Settings) -> blaze_cas::plain::CommitDurability {
+    if settings.durable {
+        blaze_cas::plain::CommitDurability::Barrier
+    } else {
+        blaze_cas::plain::CommitDurability::Unsynced
     }
 }
 
@@ -857,7 +1082,10 @@ pub fn open_for_command(
     // A trusted builder's store may name the public namespace ([`TRUSTED_BUILDER`]); a
     // developer's only its own. Budget defaults to 32 GiB unless overridden via env.
     let settings = Settings { max_store_bytes, trusted_writer: TRUSTED_BUILDER, ..Settings::default() };
-    let lent = home.open_store(&settings, Facts { boot, nonce }, heap.alloc())?;
+    let lent = home.open_store_par(cx, &settings, Facts { boot, nonce }, heap.alloc())?;
+    if !cx.is_simulated() {
+        lent.set_pid(host.pid());
+    }
     let open_ns = ns(clock).saturating_sub(began);
     old_home(cx, &home, checkout_root, checkout, &lent, err)?;
     // Stores of other forms beside this blaze's (D160): said once, never read.
@@ -875,6 +1103,19 @@ pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
     u64::from_le_bytes(first)
 }
 
+/// How [`after_answer_printed_with`] disposes of the closed store once commits and lease release
+/// are complete.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreTeardown {
+    /// Normal `Drop`: unmap read-only segments and free store tables. Always used in tests,
+    /// simulated worlds, multi-check commands (`--fix`), and whenever background GC is spawned.
+    Drop,
+    /// On a one-shot native CLI process about to exit (after all commits/unlocks and when no
+    /// background GC is pending), skip tearing down read-only segment mappings and store tables
+    /// via `core::mem::forget` so the kernel reclaims them in one shot at process exit.
+    ForgetForExit,
+}
+
 /// After the answer is printed, once every handle over `lent` is gone: the ONE commit of this
 /// command's records and roots ([`plain_place::after_answer`]), and with `stats` its line on
 /// `err`: the commit's time, and the time from the answer's last byte to the store's last
@@ -885,19 +1126,35 @@ pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
 /// other forms under `home` (D160, clean.rs `sweep_other_forms`): one unused past forms.rs
 /// `EXPIRY_DAYS` is removed and said; this blaze's own folder never is.
 pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool, clock: &Clock, err: &Out) -> Result<roots::CleanupLine, CliError> {
+    after_answer_printed_with(cx, lent, home, stats, StoreTeardown::Drop, clock, err)
+}
+
+/// [`after_answer_printed`] with an explicit [`StoreTeardown`] policy.
+pub fn after_answer_printed_with(
+    cx: &Cx,
+    lent: CommandLent,
+    home: &Home,
+    stats: bool,
+    teardown: StoreTeardown,
+    clock: &Clock,
+    err: &Out,
+) -> Result<roots::CleanupLine, CliError> {
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let answered = ns(clock);
     // Queue lease release (if this process held one) before testing whether a commit is owed.
     lent.release_lease();
-    let needs_hk = lent.needs_housekeeping(lent.wall_ns());
     let bg_detached = home.bg_gc.is_detached();
-    // Warm no-op fast path: when needs_housekeeping is false, 0 slices and 0 spawns.
-    // On a native host when housekeeping is needed (over budget, tiers over K, expired roots,
-    // or retired files ready), commit immediately with 0 foreground slices (1 flip, 0 seal
-    // barriers, full foreground QoS) and spawn detached `blaze gc --background`
-    // (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI exit is never delayed. In simulated
-    // worlds without a spawner, run inline slices (including exit-tail seal).
-    let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
+    let forget_for_exit = !cfg!(test) && !cx.is_simulated() && teardown == StoreTeardown::ForgetForExit;
+    // On a native host with detached background GC, commit immediately with 0 foreground slices
+    // (1 flip, 0 seal barriers, full foreground QoS) and spawn detached `blaze gc --background`
+    // only when `Driven::needs_bg_gc` fires (urgent triggers immediately, or unsealed segments
+    // batched past `BG_GC_UNSEALED_SEGMENTS` / `BG_GC_UNSEALED_BYTES`). In simulated worlds
+    // without a spawner, run inline slices when `needs_housekeeping` is true.
+    let slices = if !bg_detached && lent.needs_commit() && lent.needs_housekeeping(lent.wall_ns()) {
+        AFTER_ANSWER_SLICES
+    } else {
+        0
+    };
     let has_work = slices > 0 || lent.needs_commit();
     let (after, commit_ns, spawn_bg) = if !has_work {
         let named = lent.named();
@@ -914,29 +1171,54 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         };
         let after = plain_place::AfterAnswer { cleanup, ..plain_place::AfterAnswer::default() };
         let commit_ns = ns(clock).saturating_sub(answered);
-        let spawn_bg = bg_detached && needs_hk;
-        drop(lent);
+        let spawn_bg = if bg_detached {
+            let now_ns = lent.wall_ns();
+            let driven = lent.into_store();
+            let due = driven.needs_bg_gc(now_ns);
+            if !due && forget_for_exit {
+                // Zero writes committed (no lock ever acquired) and no background GC pending on
+                // this one-shot native CLI exit: let the kernel reclaim read-only segment
+                // mappings and store heap tables at process exit.
+                core::mem::forget(driven);
+            } else {
+                drop(driven);
+            }
+            due
+        } else {
+            if forget_for_exit {
+                core::mem::forget(lent);
+            } else {
+                drop(lent);
+            }
+            false
+        };
         (after, commit_ns, spawn_bg)
     } else {
-        // Only lower to the after-answer utility class when running inline cleanup/seal slices
-        // (`slices > 0`). When `slices == 0`, the foreground CLI is waiting to exit after one
-        // commit flip and must not be throttled onto slow E-cores or behind background GC.
-        #[cfg(target_os = "macos")]
-        let _held = if slices > 0 {
-            match plain_place::AFTER_ANSWER_QOS {
-                plain_place::AfterAnswerQos::Scoped => Some(
-                    blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?,
-                ),
-                plain_place::AfterAnswerQos::AsCalled => None,
-            }
-        } else {
-            None
-        };
+        // `plain_place::after_answer` keeps `lent.commit()` at caller QoS (P-cores) and scopes
+        // QoS lowering strictly to inline maintenance (`fold_slice`, `clean_on`, `seal`).
         let after = plain_place::after_answer(cx, &lent, slices)?;
         let commit_ns = ns(clock).saturating_sub(answered);
-        let manifest_changed = after.segments_written > 0 || after.sealed || after.compaction_slices > 0;
-        let spawn_bg = bg_detached && (needs_hk || (manifest_changed && lent.needs_housekeeping(lent.wall_ns())));
-        drop(lent);
+        let spawn_bg = if bg_detached {
+            let now_ns = lent.wall_ns();
+            let driven = lent.into_store();
+            let due = driven.needs_bg_gc(now_ns);
+            if !due && forget_for_exit {
+                // `plain_place::after_answer` already committed and released `flip.lock`, and no
+                // background GC is pending on this one-shot native CLI exit: skip unmapping
+                // read-only segments and freeing store tables.
+                core::mem::forget(driven);
+            } else {
+                drop(driven);
+            }
+            due
+        } else {
+            if forget_for_exit {
+                core::mem::forget(lent);
+            } else {
+                drop(lent);
+            }
+            false
+        };
         (after, commit_ns, spawn_bg)
     };
     if spawn_bg {
@@ -944,6 +1226,13 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         let _ = home.bg_gc.spawn(&cx, home.dir(), err);
     } else if !bg_detached {
         let cx = cx.span("store after answer: sweep of other forms' stores (a listing of the store root)");
+        #[cfg(target_os = "macos")]
+        let _sweep_qos = match plain_place::AFTER_ANSWER_QOS {
+            plain_place::AfterAnswerQos::Scoped => {
+                Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+            }
+            plain_place::AfterAnswerQos::AsCalled => None,
+        };
         crate::clean::sweep_other_forms(&cx, &home.dir, clock.wall().as_ns(), err, crate::clean::SweepPlant::None)?;
     }
     if stats {
@@ -962,64 +1251,6 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         err.line(cx, format_args!("{}", after.cleanup))?;
     }
     Ok(after.cleanup)
-}
-
-/// Commits this request's puts and roots for the resident daemon WITHOUT dropping `lent` or
-/// spawning background GC yet (the daemon sends `ServerFrame::Done` to the client first, then
-/// calls [`post_done_for_daemon`] to reclaim arenas and spawn background GC).
-pub(crate) fn after_answer_for_daemon(
-    cx: &Cx,
-    lent: &CommandLent,
-    home: &Home,
-) -> Result<(roots::CleanupLine, bool), CliError> {
-    // Queue lease release so the idle daemon holds zero leases on disk (never blocking `blaze gc`).
-    lent.release_lease();
-    let needs_hk = lent.needs_housekeeping(lent.wall_ns());
-    let bg_detached = home.bg_gc.is_detached();
-    let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
-    let has_work = slices > 0 || lent.needs_commit();
-    if !has_work {
-        let named = lent.named();
-        let before = lent.put_tally();
-        let cleanup = roots::CleanupLine {
-            roots: named.roots,
-            keys: named.keys,
-            indexed: named.indexed,
-            swept_bytes: 0,
-            slices: 0,
-            carried: lent.carried(),
-            leases: u32::try_from(lent.leases_len()).unwrap_or(u32::MAX),
-            put: roots::PutLine { before_answer: before, after_answer: blaze_cas::plain::PutTally::default() },
-        };
-        return Ok((cleanup, bg_detached && needs_hk));
-    }
-    let after = plain_place::after_answer(cx, lent, slices)?;
-    let manifest_changed = after.segments_written > 0 || after.sealed || after.compaction_slices > 0;
-    let spawn_bg = bg_detached && (needs_hk || (manifest_changed && lent.needs_housekeeping(lent.wall_ns())));
-    Ok((after.cleanup, spawn_bg))
-}
-
-/// Runs post-`Done` store maintenance inside the resident daemon after the client has already
-/// received `ServerFrame::Done`: reclaims per-request arena chunks while keeping mapped segments
-/// warm, and spawns detached background GC if queued.
-pub(crate) fn post_done_for_daemon(
-    cx: &Cx,
-    lent: &mut CommandLent,
-    home: &Home,
-    spawn_bg: bool,
-    err: &Out,
-) {
-    let _ = lent.reclaim_between_requests();
-    // Return idle worker frame shelves, pooled large spans, and warm chunk caches to the OS
-    // (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux) after the client has been answered.
-    blaze_mem::frame::ask_spare_trim();
-    let _ = blaze_mem::frame::trim_spare(0);
-    let _ = blaze_mem::frame::trim_span_pool();
-    let _ = blaze_mem::chunks::trim();
-    if spawn_bg {
-        let cx = cx.span("daemon post-done: spawn detached background gc");
-        let _ = home.bg_gc.spawn(&cx, home.dir(), err);
-    }
 }
 
 /// A planted bug of the nonce's test (`store/nonce_tests.rs`).
@@ -1187,6 +1418,21 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(self.place.renew(name, blaze_cas::plain::ROOT_LIFE_NS)?)
     }
 
+    /// Puts a record that is always `LOCAL` (answer pages, producer header shards, printed lines,
+    /// sealed pointers, bases), skipping [`Sharing::all_names_public`] drive-record parsing.
+    pub fn put_local(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
+        let par = CxPar::new(cx);
+        match self.place.put_parts_par(key, false, &[bytes], &par) {
+            Ok(()) => Ok(()),
+            Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
+                let held = self.place.get(key)?;
+                let clash = Clash::of(held.map(|held| held.bytes), bytes);
+                Err(CliError::Store(StoreFailure::TwoValues { key, lent, clash }))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Whether `name` is a toolchain crate's record ([`Store::toolchain_crates`]): a
     /// `CrateScope`, `ImplBucket`, or closed `Signature` name of one of its subjects.
     pub fn is_toolchain(&self, name: Name) -> bool {
@@ -1203,7 +1449,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     fn snapshot(&self) -> Result<Option<SharedSnapshot>, CliError> {
         let alloc = blaze_mem::Kept(blaze_mem::Tag::Store);
         let inner = self.place.snapshot_in(alloc)?;
-        Ok(Some(Arc::new_in(StoreSnapshot { inner, expansion_demands: AtomicU64::new(0) }, alloc)))
+        Ok(Some(Arc::new_in(StoreSnapshot { inner, expansion_demands: bstd::sync::CachePadded::new(AtomicU64::new(0)) }, alloc)))
     }
 
     fn public_crates(&mut self, subjects: &[ContentId]) {
@@ -1279,9 +1525,10 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         self.put_parts(cx, key, &[bytes])
     }
 
-    fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
-        let public = self.sharing.all_names_public(parts);
-        match self.place.put_parts(key, public, parts) {
+    fn put_parts(&mut self, cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
+        let public = self.place.is_public_writer() && self.sharing.all_names_public(parts);
+        let par = CxPar::new(cx);
+        match self.place.put_parts_par(key, public, parts, &par) {
             Ok(()) => Ok(()),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
                 let held = self.place.get(key)?;
@@ -1297,9 +1544,10 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         }
     }
 
-    fn put_record(&mut self, _cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
-        let public = self.sharing.all_names_public(owner);
-        match self.place.put_record(key, public, tag, bytes) {
+    fn put_record(&mut self, cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
+        let public = self.place.is_public_writer() && self.sharing.all_names_public(owner);
+        let par = CxPar::new(cx);
+        match self.place.put_record_par(key, public, tag, bytes, &par) {
             Ok(put) => Ok(put),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
                 let held = self.place.get(key)?;
@@ -1315,9 +1563,10 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         Ok(())
     }
 
-    fn map_all(&mut self, _cx: &Cx) -> Result<(), CliError> {
+    fn map_all(&mut self, cx: &Cx) -> Result<(), CliError> {
         if !self.mapped_all {
-            self.place.map_all()?;
+            let par = CxPar::new(cx);
+            self.place.map_all_par(&par)?;
             self.mapped_all = true;
         }
         Ok(())
@@ -1370,17 +1619,29 @@ pub struct NamedOrigin {
     check: OneKey,
 }
 
-/// Where a named origin's objects are: a folder, or an `http://` base address.
+/// Where a named origin's objects are: a folder, or an `http://` / `https://` base address.
 enum OriginAt {
     Folder(Dir<ReadWrite>),
     Http(HttpAt),
 }
 
-/// An `http://host:port/prefix` origin: the base it was given, and the network narrowed to
-/// that one address (nothing else is reached; nothing ambient).
+/// Pooled keep-alive HTTPS/HTTP client shared across every read of an [`HttpAt`] origin
+/// (zero redundant TCP/TLS handshakes across waves and records).
+#[cfg(feature = "fetch")]
+struct PooledHttp {
+    handle: blaze_http::driver::Handle,
+    https_only: bool,
+}
+
+/// An `http://` or `https://` origin: the base it was given, the network narrowed to that one
+/// address (for `http://` over bstd's `Net`), and (under `feature = "fetch"`) a shared pooled
+/// keep-alive `blaze-http` client for `https://` R2/S3 origins with TLS verification and bounded
+/// parallel fetches.
 pub struct HttpAt {
     base: Url,
     net: Net,
+    #[cfg(feature = "fetch")]
+    pooled: Option<PooledHttp>,
 }
 
 /// The one trusted key of a named origin, owned, as the read path's head check; for a published
@@ -1429,10 +1690,8 @@ impl NamedOrigin {
             (None, None) => Ok(None),
             (Some(folder), Some(key)) => {
                 let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
-                let at = if folder.starts_with("https://") {
-                    return Err(CliError::Usage("--origin https://: bstd's Http has no TLS yet (D63, stage two); name an http:// origin or a folder"));
-                } else if folder.starts_with("http://") {
-                    let net = net.ok_or(CliError::Usage("--origin http://: this host offers no network"))?;
+                let at = if folder.starts_with("https://") || folder.starts_with("http://") {
+                    let net = net.ok_or(CliError::Usage("--origin http(s)://: this host offers no network"))?;
                     OriginAt::Http(HttpAt::of(folder, net)?)
                 } else {
                     OriginAt::Folder(fs.open_dir(cx, &Path::new(folder)?)?)
@@ -1444,21 +1703,18 @@ impl NamedOrigin {
     }
 
     /// The published set `set` of the origin `origin`: its folder `public/<toolchain>/<target>`
-    /// beneath a folder, or that path joined to an `http://` base (each object then one ranged
-    /// GET of `<base>/public/<toolchain>/<target>/<name>`). Believed when its head is signed over
-    /// the set's id by a key trusted for the origin (blaze-remote trust.rs `trusted_for`: the
-    /// compiled-in published keys, or `key`, the `--origin-key` named for it), at a generation
-    /// no lower than the floor `lent` holds for it. `https://` is refused by name, as for any
-    /// origin (no TLS yet).
+    /// beneath a folder, or that path joined to an `http://` / `https://` base (each object then
+    /// one ranged GET of `<base>/public/<toolchain>/<target>/<name>`). Believed when its head is
+    /// signed over the set's id by a key trusted for the origin (blaze-remote trust.rs
+    /// `trusted_for`: the compiled-in published keys, or `key`, the `--origin-key` named for it),
+    /// at a generation no lower than the floor `lent` holds for it.
     pub fn published<D: Driver>(cx: &Cx, fs: &Fs, net: Option<&Net>, origin: &str, key: Option<&str>, set: blaze_remote::published::set::SetName<'_>, lent: &Lent<D, StoreAlloc>) -> Result<NamedOrigin, CliError> {
         let named = match key {
             Some(key) => Some(PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?),
             None => None,
         };
-        let at = if origin.starts_with("https://") {
-            return Err(CliError::Usage("--origin https://: bstd's Http has no TLS yet (D63, stage two); name an http:// origin or a folder"));
-        } else if origin.starts_with("http://") {
-            let net = net.ok_or(CliError::Usage("--origin http://: this host offers no network"))?;
+        let at = if origin.starts_with("https://") || origin.starts_with("http://") {
+            let net = net.ok_or(CliError::Usage("--origin http(s)://: this host offers no network"))?;
             let [public, toolchain, target] = set.dir();
             // Each part a checked set name (`[0-9a-z._-]`): nothing joined here leaves the base.
             let joined = bstd::mem::format_in!(cx.frame(), "{}/{}/{}/{}", origin.trim_end_matches('/'), public, toolchain, target);
@@ -1485,6 +1741,12 @@ pub enum RemoteError {
     Batch(BatchError),
     /// A fetched record could not be copied into the request's buffer.
     Copy(Stopped),
+    /// System TLS root certificates could not be loaded for an `https://` origin.
+    Tls(blaze_own::String<blaze_mem::Kept>),
+    /// Proxy settings for an `https://` origin were invalid.
+    Proxy(blaze_own::String<blaze_mem::Kept>),
+    /// The pooled HTTP/HTTPS driver thread could not be started.
+    Driver(blaze_own::String<blaze_mem::Kept>),
 }
 
 impl core::fmt::Display for RemoteError {
@@ -1492,6 +1754,9 @@ impl core::fmt::Display for RemoteError {
         match self {
             RemoteError::Batch(error) => write!(f, "the origin's read path: {error}"),
             RemoteError::Copy(stopped) => write!(f, "a record fetched from the origin: {stopped}"),
+            RemoteError::Tls(why) => write!(f, "the origin's HTTPS TLS roots: {why}"),
+            RemoteError::Proxy(why) => write!(f, "the origin's HTTP proxy settings: {why}"),
+            RemoteError::Driver(why) => write!(f, "starting the origin's pooled HTTPS driver: {why}"),
         }
     }
 }
@@ -1515,14 +1780,59 @@ impl Origin for FolderOrigin<'_> {
     }
 }
 
+/// Bounded concurrent ranged requests kept in flight against a pooled HTTP/HTTPS origin (rule 18).
+const ORIGIN_IN_FLIGHT: usize = 16;
+
+/// Extra wait slack past the earliest request deadline in flight when awaiting the HTTP driver.
+#[cfg(feature = "fetch")]
+const ORIGIN_ANSWER_SLACK: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "fetch")]
+fn own_msg(display: impl core::fmt::Display) -> blaze_own::String<blaze_mem::Kept> {
+    let mut msg = blaze_own::String::new_in(blaze_mem::Kept(blaze_mem::Tag::Store));
+    let _ = core::fmt::write(&mut msg, format_args!("{display}"));
+    msg
+}
+
 impl HttpAt {
-    /// The origin at `base` (`http://host:port[/prefix]`), the network narrowed to its address.
+    /// The origin at `base` (`http://host:port[/prefix]` or `https://host[:port][/prefix]`),
+    /// the network narrowed to its address. For `https://` (R2/S3/static HTTPS origins), builds a
+    /// pooled keep-alive `blaze-http` client with verified system TLS roots (no fallback on TLS
+    /// setup or handshake failure, rule 3).
     fn of(base: &str, net: &Net) -> Result<HttpAt, CliError> {
-        let base = Url::parse(base.trim_end_matches('/')).map_err(|_| CliError::Usage("--origin http://: not a URL"))?;
-        let origin = base.origin().ok_or(CliError::Usage("--origin http://: the URL names no host"))?;
+        let trimmed = base.trim_end_matches('/');
+        let is_https = trimmed.starts_with("https://");
+        let parsed = Url::parse(trimmed).map_err(|_| CliError::Usage("--origin http(s)://: not a URL"))?;
+        let origin = parsed.origin().ok_or(CliError::Usage("--origin http(s)://: the URL names no host"))?;
         // clone: the origin's address, a refcount.
         let net = net.connect_only(&Addr::Tcp(origin.at().clone()));
-        Ok(HttpAt { base, net })
+        #[cfg(not(feature = "fetch"))]
+        {
+            if is_https {
+                return Err(CliError::Usage("--origin https:// requires blaze built with the `fetch` (HTTPS/TLS) feature"));
+            }
+            Ok(HttpAt { base: parsed, net })
+        }
+        #[cfg(feature = "fetch")]
+        {
+            let pooled = if is_https {
+                let places = blaze_http::roots::Places { cert_file: None, cert_dir: None };
+                let tls = blaze_http::roots::system(places).map_err(|e| CliError::Remote(RemoteError::Tls(own_msg(e))))?;
+                let proxies = blaze_http::proxy_env::from_env().map_err(|e| CliError::Remote(RemoteError::Proxy(own_msg(e))))?;
+                let config = blaze_http::Config {
+                    idle_most: ORIGIN_IN_FLIGHT,
+                    proxies,
+                    redirects: 0,
+                    ..blaze_http::Config::new(tls, ORIGIN_WIRE.user_agent, ORIGIN_WIRE.wait_most)
+                };
+                let handle = blaze_http::driver::Handle::spawn(blaze_http::Client::new(config), ORIGIN_IN_FLIGHT)
+                    .map_err(|e| CliError::Remote(RemoteError::Driver(own_msg(e))))?;
+                Some(PooledHttp { handle, https_only: true })
+            } else {
+                None
+            };
+            Ok(HttpAt { base: parsed, net, pooled })
+        }
     }
 }
 
@@ -1538,37 +1848,243 @@ const ORIGIN_WIRE: Wire = Wire {
     redirects: NO_REDIRECTS,
 };
 
-/// An `http://` origin: each ask one ranged GET of `<base>/<object name>` through bstd's
-/// `Http` over its `Net` (D63; remote-read.md, "HTTP in the tree"). bstd holds the reply to the
-/// ask's length before a byte past it is taken, takes only a `206` of exactly the range asked
-/// (blaze-h1's `Response::ranged`), refuses a redirect (`NO_REDIRECTS`) and bounds every wait;
-/// its simulation names each refusal (blaze-std tests/requests_servers.rs). A 404 is `Missing`,
-/// a 416 (asked past the object's end) no bytes, anything else `Unreadable`. Nothing here
-/// trusts the bytes: the read machine checks the signed head and the digest chain.
+/// An `http://` or `https://` origin: each ask one ranged GET of `<base>/<object name>`.
+///
+/// - For `https://` (R2/S3/static HTTPS origins under `feature = "fetch"`): dispatches over the
+///   origin's shared pooled keep-alive `blaze-http` client (verified TLS roots, `https_only: true`,
+///   `redirects: 0`, up to [`ORIGIN_IN_FLIGHT`] concurrent ranged GETs in [`Origin::read_batch`]).
+///   TLS handshake/verification failures return typed `OriginError::Unreadable` with zero fallback.
+/// - For `http://` (and simulated single-lane tests via [`HttpOrigin::read_with`]): uses bstd's
+///   `Http` over its `Net`.
+///
+/// A 404 is `Missing`, a 416 (asked past the object's end) no bytes, anything else `Unreadable`.
+/// Nothing here trusts the bytes: the read machine / take verifies the signed head and digest chain.
 struct HttpOrigin<'o> {
     cx: &'o Cx,
     at: &'o HttpAt,
-    /// bstd's client, reaching the origin's address alone.
+    clock: &'o Clock,
+    /// bstd's client, reaching the origin's address alone (used for `http://` and simulated tests).
     http: Http,
     /// The URL's text, reused from ask to ask.
-    url: blaze_own::Vec<u8, Global>,
+    url: blaze_own::Vec<u8, blaze_mem::Kept>,
 }
 
 impl<'o> HttpOrigin<'o> {
-    fn new(cx: &'o Cx, at: &'o HttpAt, clock: &Clock) -> HttpOrigin<'o> {
-        // No TLS yet (`https://` is refused where the origin is named), so no roots are trusted.
+    fn new(cx: &'o Cx, at: &'o HttpAt, clock: &'o Clock) -> HttpOrigin<'o> {
         let http = Http::over(&at.net, clock, &Roots::none(), ORIGIN_WIRE);
         let http = match at.base.origin() {
             Some(origin) => http.only(origin),
             None => http,
         };
-        HttpOrigin { cx, at, http, url: blaze_own::Vec::new_in(Global) }
+        HttpOrigin { cx, at, clock, http, url: blaze_own::Vec::new_in(blaze_mem::Kept(blaze_mem::Tag::Store)) }
+    }
+}
+
+#[cfg(feature = "fetch")]
+fn apply_ranged_fetched(at: u64, into: &mut [u8], fetched: blaze_http::driver::Fetched) -> Result<usize, OriginError> {
+    match fetched {
+        blaze_http::driver::Fetched::Answered { status: 206, headers, body, .. } => {
+            // Verify `Content-Range: bytes <at>-...` starts at the exact offset requested so a
+            // misbehaving origin or proxy cannot silently shift the returned slice.
+            let range_ok = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                .and_then(|(_, v)| v.trim().strip_prefix("bytes "))
+                .and_then(|v| v.split_once('-'))
+                .and_then(|(first, _)| first.parse::<u64>().ok())
+                .is_some_and(|first| first == at);
+            if !range_ok || body.len() > into.len() {
+                return Err(OriginError::Unreadable);
+            }
+            let got = body.len();
+            if let Some(dst) = into.get_mut(..got) {
+                dst.copy_from_slice(body.as_slice());
+                Ok(got)
+            } else {
+                Err(OriginError::Unreadable)
+            }
+        }
+        blaze_http::driver::Fetched::Answered { status: 404, .. } => Err(OriginError::Missing),
+        blaze_http::driver::Fetched::Answered { status: 416, .. } => Ok(0),
+        // 200 on a ranged read, TLS verification/handshake failure, timeout, or any other status:
+        // typed refusal, never silently downgraded or retried (rule 3).
+        blaze_http::driver::Fetched::Answered { .. }
+        | blaze_http::driver::Fetched::Failed(_)
+        | blaze_http::driver::Fetched::TimedOut => Err(OriginError::Unreadable),
+    }
+}
+
+impl HttpOrigin<'_> {
+    fn now_ns(&self) -> u64 {
+        u64::try_from(self.clock.now().since_start().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(feature = "fetch")]
+    fn build_pooled_request<A: core::alloc::Allocator>(
+        base: &Url,
+        url_buf: &mut blaze_own::Vec<u8, A>,
+        object: &Object,
+        at: u64,
+        len: usize,
+        https_only: bool,
+    ) -> Result<blaze_http::Request, OriginError> {
+        let name = object.name();
+        url_buf.clear();
+        for part in [base.as_str().as_bytes(), b"/", name.as_str().as_bytes()] {
+            url_buf.try_extend_from_slice(part).map_err(|_| OriginError::Unreadable)?;
+        }
+        let text = core::str::from_utf8(url_buf.as_slice()).map_err(|_| OriginError::Unreadable)?;
+        let len_u64 = u64::try_from(len).map_err(|_| OriginError::Unreadable)?;
+        let last = at.checked_add(len_u64.saturating_sub(1)).ok_or(OriginError::Unreadable)?;
+        Ok(blaze_http::Request {
+            method: blaze_http::Method::Get,
+            url: text.into(),
+            range: Some(blaze_http::Range { first: at, last: Some(last) }),
+            headers: Default::default(),
+            body: Default::default(),
+            gzip: false,
+            most: len_u64,
+            https_only,
+        })
+    }
+
+    #[cfg(feature = "fetch")]
+    fn read_pooled(&mut self, pooled: &PooledHttp, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        if into.is_empty() {
+            return Ok(0);
+        }
+        let req = Self::build_pooled_request(&self.at.base, &mut self.url, object, at, into.len(), pooled.https_only)?;
+        let now = self.now_ns();
+        let allowed = Duration::from_nanos(deadline_ns.saturating_sub(now));
+        let (tx, rx) = blaze_core::chan::bounded(1);
+        pooled.handle.fetch(req, allowed, 0, &tx);
+        match blaze_http::mailbox::answer("the origin's HTTPS answer", &rx, allowed.saturating_add(ORIGIN_ANSWER_SLACK)) {
+            Ok(Some((_, fetched))) => apply_ranged_fetched(at, into, fetched),
+            Ok(None) | Err(_) => Err(OriginError::Unreadable),
+        }
+    }
+
+    #[cfg(feature = "fetch")]
+    fn read_batch_pooled(
+        &mut self,
+        pooled: &PooledHttp,
+        reads: &mut [BatchRead<'_>],
+        clock: &mut dyn FnMut() -> u64,
+        outcomes: &mut [BatchOutcome],
+    ) {
+        let total = reads.len().min(outcomes.len());
+        let mut offset = 0usize;
+        while offset < total {
+            let chunk_len = (total - offset).min(ORIGIN_IN_FLIGHT);
+            let Some(req_chunk) = reads.get_mut(offset..offset + chunk_len) else { break };
+            let Some(out_chunk) = outcomes.get_mut(offset..offset + chunk_len) else { break };
+            let (tx, rx) = blaze_core::chan::bounded(chunk_len);
+            let mut done = [false; ORIGIN_IN_FLIGHT];
+            let mut in_flight = 0usize;
+            let now = clock();
+
+            for (i, req) in req_chunk.iter().enumerate() {
+                if req.into.is_empty() {
+                    if let Some(slot) = out_chunk.get_mut(i) {
+                        *slot = BatchOutcome { result: Ok(0), at_ns: now };
+                    }
+                    if let Some(flag) = done.get_mut(i) {
+                        *flag = true;
+                    }
+                    continue;
+                }
+                match Self::build_pooled_request(&self.at.base, &mut self.url, &req.object, req.at, req.into.len(), pooled.https_only) {
+                    Ok(http_req) => {
+                        let allowed = Duration::from_nanos(req.deadline_ns.saturating_sub(now));
+                        let key = u64::try_from(i).unwrap_or(0);
+                        pooled.handle.fetch(http_req, allowed, key, &tx);
+                        in_flight += 1;
+                    }
+                    Err(err) => {
+                        if let Some(slot) = out_chunk.get_mut(i) {
+                            *slot = BatchOutcome { result: Err(err), at_ns: now };
+                        }
+                        if let Some(flag) = done.get_mut(i) {
+                            *flag = true;
+                        }
+                    }
+                }
+            }
+
+            while in_flight > 0 {
+                let earliest = req_chunk
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !done.get(*i).copied().unwrap_or(true))
+                    .map(|(_, req)| req.deadline_ns)
+                    .min()
+                    .unwrap_or_else(|| clock());
+                let wait = Duration::from_nanos(earliest.saturating_sub(clock())).saturating_add(ORIGIN_ANSWER_SLACK);
+                match blaze_http::mailbox::answer("the origin's HTTPS batch answers", &rx, wait) {
+                    Ok(Some((key, fetched))) => {
+                        let at_ns = clock();
+                        if let Ok(idx) = usize::try_from(key)
+                            && idx < chunk_len
+                            && !done.get(idx).copied().unwrap_or(true)
+                        {
+                            let result = match req_chunk.get_mut(idx) {
+                                Some(req) => apply_ranged_fetched(req.at, req.into, fetched),
+                                None => Err(OriginError::Unreadable),
+                            };
+                            if let Some(slot) = out_chunk.get_mut(idx) {
+                                *slot = BatchOutcome { result, at_ns };
+                            }
+                            if let Some(flag) = done.get_mut(idx) {
+                                *flag = true;
+                            }
+                            in_flight -= 1;
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        let failed_at = clock();
+                        for i in 0..chunk_len {
+                            if !done.get(i).copied().unwrap_or(true) {
+                                if let Some(slot) = out_chunk.get_mut(i) {
+                                    *slot = BatchOutcome { result: Err(OriginError::Unreadable), at_ns: failed_at };
+                                }
+                                if let Some(flag) = done.get_mut(i) {
+                                    *flag = true;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            offset += chunk_len;
+        }
     }
 }
 
 impl Origin for HttpOrigin<'_> {
     fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        #[cfg(feature = "fetch")]
+        if let Some(pooled) = &self.at.pooled {
+            return self.read_pooled(pooled, object, at, into, deadline_ns);
+        }
         self.read_with(object, at, into, deadline_ns, |_| {})
+    }
+
+    fn read_batch(
+        &mut self,
+        reads: &mut [BatchRead<'_>],
+        clock: &mut dyn FnMut() -> u64,
+        outcomes: &mut [BatchOutcome],
+    ) {
+        #[cfg(feature = "fetch")]
+        if let Some(pooled) = &self.at.pooled {
+            self.read_batch_pooled(pooled, reads, clock, outcomes);
+            return;
+        }
+        for (req, out) in reads.iter_mut().zip(outcomes.iter_mut()) {
+            let result = self.read(&req.object, req.at, req.into, req.deadline_ns);
+            *out = BatchOutcome { result, at_ns: clock() };
+        }
     }
 }
 
@@ -1759,5 +2275,136 @@ mod after_answer_commit_tests {
         assert!(!crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe contended gc.lock"), "gc_lock_is_free returns false while GC holds gc.lock");
         drop(held_lock);
         assert!(crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe released gc.lock"), "gc.lock free again after drop");
+    }
+
+    #[test]
+    fn default_local_durability_uses_unsynced_when_off_and_barrier_when_durable() {
+        use blaze_cas::plain::CommitDurability;
+
+        let unsynced = Settings::default();
+        let durable = Settings { durable: true, ..Settings::default() };
+        assert_eq!(default_local_durability(&unsynced), CommitDurability::Unsynced);
+        assert_eq!(default_local_durability(&durable), CommitDurability::Barrier);
+
+        let io = Io::simulated(SimWorld::new(85, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let heap = blaze_own::testing::heap();
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+
+        let lent = home.open_store(&durable, Facts { boot: Some(1), nonce: 85 }, heap.alloc()).expect("open durable");
+        let k = Key(ContentId::of("barrier default durability key", b"v1"));
+        lent.put(&blaze_cas::Key(k.0), blaze_keyed::kind::Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), b"barrier-payload")
+            .expect("put");
+        let cleanup = after_answer_printed(&cx, lent, &home, false, &clock, &err).expect("commit");
+        assert_eq!(cleanup.put.after_answer.commits, 1);
+        assert!(
+            cleanup.put.after_answer.disk.barriers >= 2,
+            "durable local store commits with ordered barriers (segment + manifest log), got {}",
+            cleanup.put.after_answer.disk.barriers
+        );
+        assert_eq!(cleanup.put.after_answer.disk.syncs, 0, "Barrier mode avoids F_FULLFSYNC");
+
+        let reopened = home.open_store(&durable, Facts { boot: Some(1), nonce: 86 }, heap.alloc()).expect("reopen");
+        let held = reopened.get(&blaze_cas::Key(k.0)).expect("get").expect("record readable");
+        assert_eq!(held.bytes, b"barrier-payload");
+    }
+
+    #[test]
+    fn forms_note_once_uses_has_root_and_single_small_commit_does_not_trigger_bg_gc() {
+        let io = Io::simulated(SimWorld::new(87, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let heap = blaze_own::testing::heap();
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+
+        let lent = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 87 }, heap.alloc()).expect("open");
+        assert!(!lent.has_root(plain_place::forms::OTHER_FORMS_LOOKED));
+        let noted = plain_place::forms::note_once(&cx, &home.dir, &lent, &err).expect("first note_once");
+        assert_eq!(noted, 0);
+        after_answer_printed(&cx, lent, &home, false, &clock, &err).expect("commit note_once");
+
+        let lent2 = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 88 }, heap.alloc()).expect("reopen");
+        assert!(lent2.has_root(plain_place::forms::OTHER_FORMS_LOOKED), "note_once must persist OTHER_FORMS_LOOKED root");
+        let noted2 = plain_place::forms::note_once(&cx, &home.dir, &lent2, &err).expect("second note_once");
+        assert_eq!(noted2, 0);
+        let now_ns = lent2.wall_ns();
+        let driven = lent2.into_store();
+        assert!(driven.needs_housekeeping(now_ns), "1 unsealed segment keeps needs_housekeeping true");
+        assert!(!driven.needs_bg_gc(now_ns), "1 small unsealed segment must not trigger detached bg GC spawn");
+    }
+
+    #[test]
+    fn cx_par_map_range_and_for_each_mut_chunks_match_serial_and_preserve_order() {
+        use blaze_cas::plain::{Par, Serial};
+
+        let io = Io::simulated(SimWorld::new(89, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let alloc = blaze_mem::Kept(blaze_mem::Tag::Store);
+
+        // Exercise both the inline serial fast path (`workers == 1`) and the work-stealing
+        // `scope.may_overlap` + `CachePadded<AtomicUsize>` cursor path (`workers == 4`).
+        let par_one = CxPar::new(&cx);
+        let par_many = CxPar { cx: &cx, workers: core::num::NonZeroU32::new(4).expect("non-zero") };
+
+        let want = Serial.map_range(137, 9, alloc, |lo, hi| (lo, hi, lo.wrapping_mul(31).wrapping_add(hi)));
+        let got_one = par_one.map_range(137, 9, alloc, |lo, hi| (lo, hi, lo.wrapping_mul(31).wrapping_add(hi)));
+        let got_many = par_many.map_range(137, 9, alloc, |lo, hi| (lo, hi, lo.wrapping_mul(31).wrapping_add(hi)));
+        assert_eq!(got_one.as_slice(), want.as_slice());
+        assert_eq!(got_many.as_slice(), want.as_slice());
+
+        // Empty and single-chunk edge cases.
+        assert!(par_many.map_range(0, 8, alloc, |lo, hi| (lo, hi)).is_empty());
+        assert_eq!(par_many.map_range(5, 16, alloc, |lo, hi| (lo, hi)).as_slice(), &[(0, 5)]);
+
+        let mut serial_buf: blaze_own::Vec<usize, _> = blaze_own::Vec::with_capacity_in(137, alloc);
+        let mut one_buf: blaze_own::Vec<usize, _> = blaze_own::Vec::with_capacity_in(137, alloc);
+        let mut many_buf: blaze_own::Vec<usize, _> = blaze_own::Vec::with_capacity_in(137, alloc);
+        for _ in 0..137 {
+            serial_buf.push(0);
+            one_buf.push(0);
+            many_buf.push(0);
+        }
+        let fill = |start: usize, chunk: &mut [usize]| {
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                *slot = start.saturating_add(i).wrapping_mul(17).wrapping_add(3);
+            }
+        };
+        Serial.for_each_mut_chunks(serial_buf.as_mut_slice(), 11, fill);
+        par_one.for_each_mut_chunks(one_buf.as_mut_slice(), 11, fill);
+        par_many.for_each_mut_chunks(many_buf.as_mut_slice(), 11, fill);
+        assert_eq!(one_buf.as_slice(), serial_buf.as_slice());
+        assert_eq!(many_buf.as_slice(), serial_buf.as_slice());
+    }
+
+    #[test]
+    fn store_snapshot_expansion_demands_is_cache_padded() {
+        assert!(
+            core::mem::align_of::<bstd::sync::CachePadded<AtomicU64>>() >= 64,
+            "StoreSnapshot::expansion_demands must be cache-line padded",
+        );
+        let io = Io::simulated(SimWorld::new(91, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let heap = blaze_own::testing::heap();
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+        let lent = home.open_store_par(&cx, &Settings::default(), Facts { boot: Some(1), nonce: 91 }, heap.alloc()).expect("open_store_par");
+        let k = Key(ContentId::of("cx_par snapshot demand key", b"v1"));
+        lent.put(&blaze_cas::Key(k.0), blaze_keyed::kind::Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), b"payload")
+            .expect("put");
+        let par = CxPar { cx: &cx, workers: core::num::NonZeroU32::new(4).expect("non-zero") };
+        lent.commit_par(&par).expect("commit_par");
+        let store = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, heap.alloc()).expect("command store");
+        let snap = store.snapshot().expect("snapshot").expect("some snapshot");
+        assert_eq!(snap.expansion_demands(), 0);
+        let got = snap.expansion_get(k).expect("expansion_get").expect("present");
+        assert_eq!(got, b"payload");
+        assert_eq!(snap.expansion_demands(), 1);
     }
 }

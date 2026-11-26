@@ -72,10 +72,10 @@ use blaze_units::Length;
 use crate::Limits;
 use crate::json::{Json, JsonFault};
 use crate::plant::GlbPlant;
-use crate::png::SIGNATURE as PNG_SIGNATURE;
+use crate::png::{Image as PngImage, PngKind, PngOpts, SIGNATURE as PNG_SIGNATURE, png as encode_png};
 use crate::scene::{
-    Collider, Material, MaterialTextures, Matrix, Part, Scene, TexturePack, Transform, Up, turn, turn_extent, turn_rotation,
-    turn_tensor,
+    Collider, ImageData, ImageId, Material, MaterialTextures, Matrix, Part, Scene, TexturePack, TextureRef, Transform, Up, turn,
+    turn_extent, turn_rotation, turn_tensor,
 };
 use crate::sink::Bytes;
 
@@ -85,6 +85,7 @@ type V<'a, T> = Vec<T, Alloc<'a>>;
 pub const GENERATOR: &str = "blaze-cad-out 1";
 
 const FLOAT: u64 = 5126;
+const UNSIGNED_BYTE: u64 = 5121;
 const BYTE: u64 = 5120;
 const SHORT: u64 = 5122;
 const UNSIGNED_SHORT: u64 = 5123;
@@ -181,6 +182,8 @@ pub enum GlbError {
     InvalidPngImage { image: u32 },
     /// A material texture index past `textures.png_images`.
     UnknownTexture { material: u32, index: u32, count: usize },
+    /// A material `pbr_textures` image id past `scene.images`.
+    UnknownImage { material: u32, image: ImageId },
     EmptyMesh { part: u32, mesh: MeshSlot },
     /// A vertex normal of no direction.
     ZeroNormal { part: u32, mesh: MeshSlot, vertex: u32 },
@@ -277,6 +280,7 @@ struct MeshRec {
     normal: u32,
     texcoord: Option<u32>,
     tangent: Option<u32>,
+    color: Option<u32>,
     prims: (u32, u32),
 }
 
@@ -575,6 +579,25 @@ fn put_mesh<P: Planted<GlbPlant>>(
         }
         None => None,
     };
+    let color = match view.colours() {
+        Some(colours) => {
+            let start = bin.begin_view()?;
+            for &c in colours {
+                bin.put(&c)?;
+            }
+            let cv = bin.end_view(start, 0, Some(ARRAY_BUFFER))?;
+            let acc = bin.accessor(AccRec {
+                view: cv,
+                component: UNSIGNED_BYTE,
+                normalized: true,
+                count: nv,
+                kind: AccType::Vec4,
+                bounds: Bounds::None,
+            })?;
+            Some(acc)
+        }
+        None => None,
+    };
     // Indices, one primitive per role run (or one for a hull), triangles in input order within it.
     let first_prim = count32(bin.prims.len())?;
     let wide_indices = nv > 65_535;
@@ -625,7 +648,7 @@ fn put_mesh<P: Planted<GlbPlant>>(
         at = end;
     }
     let prims = (first_prim, count32(bin.prims.len())?);
-    bin.meshes.try_push(MeshRec { part, slot, position, normal, texcoord, tangent, prims }).map_err(|r| r.why)?;
+    bin.meshes.try_push(MeshRec { part, slot, position, normal, texcoord, tangent, color, prims }).map_err(|r| r.why)?;
     Ok((count32(bin.meshes.len() - 1)?, dequant))
 }
 
@@ -807,6 +830,24 @@ fn check_textures(scene: &Scene<'_>, textures: &TexturePack<'_>) -> Result<(), G
             }
         }
     }
+    let img_count = scene.images.len();
+    for (i, m) in scene.materials.iter().enumerate() {
+        let material = count32(i)?;
+        let pt = &m.pbr_textures;
+        for opt in [
+            pt.base_colour.map(|r| r.image),
+            pt.metallic_roughness.map(|r| r.image),
+            pt.normal.map(|r| r.image),
+            pt.occlusion.map(|r| r.image),
+            pt.emissive.map(|r| r.image),
+        ] {
+            if let Some(image) = opt
+                && idx(image.0) >= img_count
+            {
+                return Err(GlbError::UnknownImage { material, image });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -932,12 +973,37 @@ pub fn glb_textured_planted<'a>(
         recs.try_push(PartRec { main, lods: (lod_start, hull_start), hulls: (hull_start, hull_end), dequant })
             .map_err(|r| r.why)?;
     }
-    let mut image_views: V<'_, u32> = Vec::try_with_capacity_in(textures.png_images.len(), s)?;
+    let mut image_views: V<'_, (u32, &'static str)> = Vec::try_with_capacity_in(textures.png_images.len() + scene.images.len(), s)?;
     for &img in textures.png_images {
         let start = bin.begin_view()?;
         bin.put(img)?;
         let iv = bin.end_view(start, 0, None)?;
-        image_views.try_push(iv).map_err(|r| r.why)?;
+        image_views.try_push((iv, "image/png")).map_err(|r| r.why)?;
+    }
+    let scene_img_base = count32(textures.png_images.len())?;
+    for img in scene.images {
+        let start = bin.begin_view()?;
+        let mime = match img.data {
+            ImageData::Png(bytes) => {
+                bin.put(bytes)?;
+                "image/png"
+            }
+            ImageData::Jpeg(bytes) => {
+                bin.put(bytes)?;
+                "image/jpeg"
+            }
+            ImageData::Rgba8 { width, height, pixels } => {
+                let encoded = encode_png(
+                    PngImage { width, height, kind: PngKind::Rgba8, pixels },
+                    PngOpts { level: blaze_deflate::Level::Fast, alloc: s, scratch: s, limits: opts.limits },
+                )
+                .map_err(|_| GlbError::InvalidPngImage { image: count32(image_views.len()).unwrap_or(0) })?;
+                bin.put(&encoded)?;
+                "image/png"
+            }
+        };
+        let iv = bin.end_view(start, 0, None)?;
+        image_views.try_push((iv, mime)).map_err(|r| r.why)?;
     }
     bin.pad()?;
 
@@ -948,6 +1014,7 @@ pub fn glb_textured_planted<'a>(
             scene,
             material_textures: textures.material_textures,
             image_views: &image_views,
+            scene_img_base,
             quantized,
             up: opts.up,
             node_of: &node_of,
@@ -999,7 +1066,8 @@ pub fn glb_textured_planted<'a>(
 struct Doc<'d> {
     scene: &'d Scene<'d>,
     material_textures: &'d [MaterialTextures],
-    image_views: &'d [u32],
+    image_views: &'d [(u32, &'static str)],
+    scene_img_base: u32,
     quantized: bool,
     up: Up,
     node_of: &'d [u32],
@@ -1023,14 +1091,38 @@ impl Doc<'_> {
         j.end_map();
         let clearcoat = scene.materials.iter().any(|m| m.clearcoat.is_some());
         let strength = scene.materials.iter().any(|m| m.emissive_strength.is_some());
+        let anisotropy = scene.materials.iter().any(|m| m.anisotropy.is_some());
+        let sheen = scene.materials.iter().any(|m| m.sheen.is_some());
+        let transmission = scene.materials.iter().any(|m| m.transmission.is_some());
+        let ior = scene.materials.iter().any(|m| m.transmission.is_some_and(|t| t.ior != 1.5));
+        let volume = scene.materials.iter().any(|m| m.transmission.is_some_and(|t| t.thickness > 0.0));
+        let tex_xform = scene.materials.iter().any(|m| material_uses_tex_transform(m));
         let quant = self.quantized && !self.meshes.is_empty();
-        if clearcoat || strength || quant {
+        if clearcoat || strength || anisotropy || sheen || transmission || ior || volume || tex_xform || quant {
             j.key("extensionsUsed").list();
             if clearcoat {
                 j.str("KHR_materials_clearcoat");
             }
             if strength {
                 j.str("KHR_materials_emissive_strength");
+            }
+            if anisotropy {
+                j.str("KHR_materials_anisotropy");
+            }
+            if sheen {
+                j.str("KHR_materials_sheen");
+            }
+            if transmission {
+                j.str("KHR_materials_transmission");
+            }
+            if ior {
+                j.str("KHR_materials_ior");
+            }
+            if volume {
+                j.str("KHR_materials_volume");
+            }
+            if tex_xform {
+                j.str("KHR_texture_transform");
             }
             if quant {
                 j.str("KHR_mesh_quantization");
@@ -1081,6 +1173,9 @@ impl Doc<'_> {
                     if let Some(tangent) = m.tangent {
                         j.key("TANGENT").uint(u64::from(tangent));
                     }
+                    if let Some(color) = m.color {
+                        j.key("COLOR_0").uint(u64::from(color));
+                    }
                     j.end_map();
                     j.key("indices").uint(u64::from(p.indices));
                     if let Some(material) = p.material {
@@ -1095,7 +1190,7 @@ impl Doc<'_> {
         if !scene.materials.is_empty() {
             j.key("materials").list();
             for (i, m) in scene.materials.iter().enumerate() {
-                material(j, m, self.material_textures.get(i).copied());
+                material(j, m, self.material_textures.get(i).copied(), self.scene_img_base);
             }
             j.end_list();
         }
@@ -1109,10 +1204,10 @@ impl Doc<'_> {
             }
             j.end_list();
             j.key("images").list();
-            for &view in self.image_views {
+            for &(view, mime) in self.image_views {
                 j.map();
                 j.key("bufferView").uint(u64::from(view));
-                j.key("mimeType").str("image/png");
+                j.key("mimeType").str(mime);
                 j.end_map();
             }
             j.end_list();
@@ -1315,22 +1410,73 @@ impl Doc<'_> {
             j.key("scale").nums(&wide(scale));
             j.end_map();
         }
+        if !part.sockets.is_empty() {
+            j.key("sockets").list();
+            for sock in part.sockets {
+                j.map();
+                j.key("name").str(sock.name);
+                match sock.transform {
+                    Transform::Trs(t) => {
+                        j.key("translation").nums(&turn(t.translation, up));
+                        j.key("rotation").nums(&turn_rotation(t.rotation, up));
+                    }
+                    Transform::Matrix(m) => {
+                        let turned = Matrix { linear: turn_tensor(m.linear, up), translation: turn(m.translation, up) };
+                        j.key("matrix").nums(&turned.column_major());
+                    }
+                }
+                j.end_map();
+            }
+            j.end_list();
+        }
         j.end_map();
     }
 }
 
-fn material<W: Put>(j: &mut Json<'_, W>, m: &Material<'_>, textures: Option<MaterialTextures>) {
+fn material_uses_tex_transform(m: &Material<'_>) -> bool {
+    let t = &m.pbr_textures;
+    let ref_has = |r: Option<TextureRef>| r.is_some_and(|x| x.scale != [1.0, 1.0] || x.offset != [0.0, 0.0]);
+    ref_has(t.base_colour)
+        || ref_has(t.metallic_roughness)
+        || ref_has(t.emissive)
+        || t.normal.is_some_and(|n| n.uv_scale != [1.0, 1.0])
+        || t.occlusion.is_some_and(|o| o.uv_scale != [1.0, 1.0])
+}
+
+fn write_tex_ref<W: Put>(j: &mut Json<'_, W>, r: TextureRef, base: u32) {
+    j.map();
+    j.key("index").uint(u64::from(base + r.image.0));
+    if r.scale != [1.0, 1.0] || r.offset != [0.0, 0.0] {
+        j.key("extensions").map().key("KHR_texture_transform").map();
+        if r.offset != [0.0, 0.0] {
+            j.key("offset").nums(&r.offset);
+        }
+        if r.scale != [1.0, 1.0] {
+            j.key("scale").nums(&r.scale);
+        }
+        j.end_map().end_map();
+    }
+    j.end_map();
+}
+
+fn material<W: Put>(j: &mut Json<'_, W>, m: &Material<'_>, textures: Option<MaterialTextures>, img_base: u32) {
     j.map();
     j.key("name").str(m.name);
     j.key("pbrMetallicRoughness").map();
     j.key("baseColorFactor").nums(&m.base_colour);
     if let Some(tex) = textures.and_then(|t| t.base_colour) {
         j.key("baseColorTexture").map().key("index").uint(u64::from(tex)).end_map();
+    } else if let Some(r) = m.pbr_textures.base_colour {
+        j.key("baseColorTexture");
+        write_tex_ref(j, r, img_base);
     }
     j.key("metallicFactor").num(m.metallic);
     j.key("roughnessFactor").num(m.roughness);
     if let Some(tex) = textures.and_then(|t| t.metallic_roughness) {
         j.key("metallicRoughnessTexture").map().key("index").uint(u64::from(tex)).end_map();
+    } else if let Some(r) = m.pbr_textures.metallic_roughness {
+        j.key("metallicRoughnessTexture");
+        write_tex_ref(j, r, img_base);
     }
     j.end_map();
     if let Some(t) = textures
@@ -1342,6 +1488,31 @@ fn material<W: Put>(j: &mut Json<'_, W>, m: &Material<'_>, textures: Option<Mate
             j.key("scale").num(t.normal_scale);
         }
         j.end_map();
+    } else if let Some(n) = m.pbr_textures.normal {
+        j.key("normalTexture").map();
+        j.key("index").uint(u64::from(img_base + n.image.0));
+        if n.scale != 1.0 {
+            j.key("scale").num(n.scale);
+        }
+        if n.uv_scale != [1.0, 1.0] {
+            j.key("extensions").map().key("KHR_texture_transform").map().key("scale").nums(&n.uv_scale).end_map().end_map();
+        }
+        j.end_map();
+    }
+    if let Some(occ) = m.pbr_textures.occlusion {
+        j.key("occlusionTexture").map();
+        j.key("index").uint(u64::from(img_base + occ.image.0));
+        if occ.strength != 1.0 {
+            j.key("strength").num(occ.strength);
+        }
+        if occ.uv_scale != [1.0, 1.0] {
+            j.key("extensions").map().key("KHR_texture_transform").map().key("scale").nums(&occ.uv_scale).end_map().end_map();
+        }
+        j.end_map();
+    }
+    if let Some(em) = m.pbr_textures.emissive {
+        j.key("emissiveTexture");
+        write_tex_ref(j, em, img_base);
     }
     if m.emissive != [0.0; 3] {
         j.key("emissiveFactor").nums(&m.emissive);
@@ -1352,7 +1523,12 @@ fn material<W: Put>(j: &mut Json<'_, W>, m: &Material<'_>, textures: Option<Mate
     if m.double_sided {
         j.key("doubleSided").bool(true);
     }
-    if m.clearcoat.is_some() || m.emissive_strength.is_some() {
+    let has_ext = m.clearcoat.is_some()
+        || m.emissive_strength.is_some()
+        || m.anisotropy.is_some()
+        || m.sheen.is_some()
+        || m.transmission.is_some();
+    if has_ext {
         j.key("extensions").map();
         if let Some(c) = m.clearcoat {
             j.key("KHR_materials_clearcoat").map();
@@ -1365,7 +1541,43 @@ fn material<W: Put>(j: &mut Json<'_, W>, m: &Material<'_>, textures: Option<Mate
             j.key("emissiveStrength").num(e);
             j.end_map();
         }
+        if let Some(a) = m.anisotropy {
+            j.key("KHR_materials_anisotropy").map();
+            j.key("anisotropyStrength").num(a.strength);
+            if a.rotation != 0.0 {
+                j.key("anisotropyRotation").num(a.rotation);
+            }
+            j.end_map();
+        }
+        if let Some(sh) = m.sheen {
+            j.key("KHR_materials_sheen").map();
+            j.key("sheenColorFactor").nums(&sh.colour);
+            j.key("sheenRoughnessFactor").num(sh.roughness);
+            j.end_map();
+        }
+        if let Some(tr) = m.transmission {
+            j.key("KHR_materials_transmission").map();
+            j.key("transmissionFactor").num(tr.factor);
+            j.end_map();
+            if tr.ior != 1.5 {
+                j.key("KHR_materials_ior").map().key("ior").num(tr.ior).end_map();
+            }
+            if tr.thickness > 0.0 {
+                j.key("KHR_materials_volume").map();
+                j.key("thicknessFactor").num(tr.thickness);
+                if tr.attenuation_colour != [1.0, 1.0, 1.0] {
+                    j.key("attenuationColor").nums(&tr.attenuation_colour);
+                }
+                if tr.attenuation_distance > 0.0 {
+                    j.key("attenuationDistance").num(tr.attenuation_distance);
+                }
+                j.end_map();
+            }
+        }
         j.end_map();
+    }
+    if let Some(pack) = m.cc0_pack {
+        j.key("extras").map().key("cc0_pack").str(pack).end_map();
     }
     j.end_map();
 }

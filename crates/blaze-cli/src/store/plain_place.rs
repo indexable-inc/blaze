@@ -25,7 +25,7 @@ use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
 use blaze_own::Alloc;
-use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError, Visibility};
+use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, Par, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Serial, Settings, Snapshot, SnapshotError, Visibility};
 use blaze_core::{Driver, FileName};
 use blaze_drive::Key;
 use blaze_keyed::kind::{Namespace, ReservedTag, Tag};
@@ -200,8 +200,18 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: St
 /// The store opened lazily over `driver` (nothing mapped: a segment is mapped at its first
 /// probe), owned by a [`Lent`] whose arena is in `alloc`, the caller's (rule 75).
 pub fn open<D: Driver>(driver: D, cfg: PlainConfig<StoreAlloc>, alloc: StoreAlloc) -> Result<Lent<D, StoreAlloc>, PlaceError> {
+    open_par(driver, cfg, alloc, &Serial)
+}
+
+/// Parallel twin of [`open`]: verifies large earlier-boot segments through `par`.
+pub fn open_par<D: Driver, P: Par>(
+    driver: D,
+    cfg: PlainConfig<StoreAlloc>,
+    alloc: StoreAlloc,
+    par: &P,
+) -> Result<Lent<D, StoreAlloc>, PlaceError> {
     // The root path is read only by the native pread path, which this module never takes.
-    let store = Driven::with(driver, std::path::Path::new("/"), cfg, alloc).map_err(|why| PlaceError::Open { why })?;
+    let store = Driven::with_par(driver, std::path::Path::new("/"), cfg, alloc, par).map_err(|why| PlaceError::Open { why })?;
     Ok(Lent::with_visibility(store, alloc, VISIBILITY))
 }
 
@@ -242,6 +252,17 @@ pub(crate) fn snapshot_get<'s, A: Allocator>(snapshot: &'s Snapshot<A>, key: Key
         let (bytes, proof) = Checked::of_snapshot(proved);
         Held { bytes, proof, place: blaze_cas::plain::Aligned16::new(bytes).map_err(blaze_cas::plain::NotInPlace::Misaligned) }
     }))
+}
+
+/// Reads `key`'s bytes with the store's proof inside `f` without lending them past the call
+/// (never pins an uncommitted shared arena, and hands `Checked` to readers that skip re-hashing
+/// bytes the store already proved, rule 74).
+pub(crate) fn lent_with_checked<D: Driver, R>(
+    lent: &Lent<D, StoreAlloc>,
+    key: Key,
+    f: impl FnOnce(&[u8], Checked<'_>) -> R,
+) -> Result<Option<R>, PlaceError> {
+    Ok(lent.with_bytes(&CasKey(key.0), |_tag, _ns, bytes| f(bytes, Checked { _private: PhantomData }))?)
 }
 
 /// A record lent in place for `'m`, the life of the [`Lent`] borrowed.
@@ -322,6 +343,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         PlainPlace { lent, public_writer, plant, commits: 0, segments_written: 0, aging_since: None }
     }
 
+    /// Whether this machine is a trusted builder that may write [`Namespace::PUBLIC`].
+    pub fn is_public_writer(&self) -> bool {
+        self.public_writer
+    }
+
     /// The record's namespace (drive.md ruling 2): `PUBLIC` only when every name in it is
     /// public AND this machine is a trusted builder; else `LOCAL`.
     pub fn namespace(&self, all_names_public: bool) -> Namespace {
@@ -393,8 +419,13 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// [`PlainPlace::put`] of the concatenation of `parts`, never joined (blaze-cas
     /// `Lent::put_parts`).
     pub fn put_parts(&mut self, key: Key, all_names_public: bool, parts: &[&[u8]]) -> Result<(), PlaceError> {
+        self.put_parts_par(key, all_names_public, parts, &Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::put_parts`]: commits past [`COMMIT_BYTES`] through `par`.
+    pub fn put_parts_par<P: Par>(&mut self, key: Key, all_names_public: bool, parts: &[&[u8]], par: &P) -> Result<(), PlaceError> {
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
-            self.commit()?;
+            self.commit_par(par)?;
         }
         self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), ReservedTag::Drive.tag(), parts)?;
         Ok(())
@@ -407,6 +438,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// workspace crate's local one share it; else put in the namespace `all_names_public` (its
     /// owner's) says. Other bytes under `key` are refused (rule 21).
     pub fn put_record(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8]) -> Result<blaze_keyed::store::Put, PlaceError> {
+        self.put_record_par(key, all_names_public, tag, bytes, &Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::put_record`]: commits past [`COMMIT_BYTES`] through `par`.
+    pub fn put_record_par<P: Par>(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8], par: &P) -> Result<blaze_keyed::store::Put, PlaceError> {
         // Asked by comparison, never by a get: a get of this command's own put keeps its arena
         // chunk, and every record put beside it, out of place after the commit (blaze-cas
         // lent.rs `holds`). An expansion record two units of one wave both put did that to
@@ -415,7 +451,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
             return Ok(blaze_keyed::store::Put::Same);
         }
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
-            self.commit()?;
+            self.commit_par(par)?;
         }
         Ok(self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), tag, &[bytes])?)
     }
@@ -506,12 +542,23 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// Every segment named mapped, and every one parked checked: asked once, when the
     /// request's first pool task is about to start (blaze-cas `Driven::map_all`).
     pub fn map_all(&self) -> Result<(), PlaceError> {
-        Ok(self.lent.map_all()?)
+        self.map_all_par(&Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::map_all`]: verifies large earlier-boot segments through `par`.
+    pub fn map_all_par<P: Par>(&self, par: &P) -> Result<(), PlaceError> {
+        Ok(self.lent.map_all_par(par)?)
     }
 
     /// What is not yet committed, laid out as one segment per namespace, and one flip.
     pub fn commit(&mut self) -> Result<(), PlaceError> {
-        let committed = self.lent.commit()?;
+        self.commit_par(&Serial)
+    }
+
+    /// Parallel twin of [`PlainPlace::commit`]: runs `TwoValues` verification, BLAKE3 segment
+    /// sealing, and Bloom construction through `par`.
+    pub fn commit_par<P: Par>(&mut self, par: &P) -> Result<(), PlaceError> {
+        let committed = self.lent.commit_par(par)?;
         self.aging_since = None;
         self.commits += 1;
         self.segments_written += u32::try_from(committed.segments.len()).unwrap_or(u32::MAX);
@@ -634,42 +681,48 @@ pub fn after_answer<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32)
 /// caller's class on every exit.
 pub(crate) fn after_answer_at<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, qos: AfterAnswerQos) -> Result<AfterAnswer, PlaceError> {
     let called_at = qos_now()?;
-    #[cfg(target_os = "macos")]
-    let _held = if slices > 0 {
-        match qos {
-            AfterAnswerQos::Scoped => {
-                Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
-            }
-            AfterAnswerQos::AsCalled => None,
-        }
-    } else {
-        None
-    };
-    #[cfg(not(target_os = "macos"))]
-    let (AfterAnswerQos::AsCalled | AfterAnswerQos::Scoped) = qos;
-    let mut done = after_answer_steps(cx, lent, slices)?;
-    done.qos = QosSeen { called_at, ran_at: qos_now()? };
+    let lower_scoped = slices > 0 && qos == AfterAnswerQos::Scoped;
+    let (mut done, ran_at) = after_answer_steps(cx, lent, slices, lower_scoped)?;
+    done.qos = QosSeen { called_at, ran_at };
     Ok(done)
 }
 
-/// [`after_answer`]'s steps, on the calling thread at the class it has.
-fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+/// [`after_answer`]'s steps: keeps `lent.commit()` at caller QoS (P-cores), while scoping
+/// inline cleanup (`fold_slice`, `clean_on`) and exit-tail sealing (`seal`) to `AFTER_ANSWER`
+/// when `lower_scoped` is true.
+fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, lower_scoped: bool) -> Result<(AfterAnswer, u32), PlaceError> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = lower_scoped;
     let cx = cx.span("store after answer");
     // The put path's tally up to here: the phases' commits and every copy before the answer.
     let before = lent.put_tally();
     if slices > 0 {
         let _cx = cx.span("store after answer: fold a cleanup slice (map, merge copy hashed whole)");
+        #[cfg(target_os = "macos")]
+        let _fold_qos = if lower_scoped {
+            Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+        } else {
+            None
+        };
         lent.fold_slice()?;
     }
     lent.release_lease();
     let committed = {
-        let _cx = cx.span("store after answer: commit (batch copy, layout copy, segment digest, flip)");
-        lent.commit()?
+        let commit_cx = cx.span("store after answer: commit (batch copy, layout copy, segment digest, flip)");
+        let par = super::CxPar::new(&commit_cx);
+        lent.commit_par(&par)?
     };
     let first = lent.take_sliced();
+    #[cfg(target_os = "macos")]
+    let _tail_qos = if lower_scoped {
+        Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+    } else {
+        None
+    };
     let (slice, swept) = if slices > 0 {
-        let _cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
-        lent.clean_on(first)?
+        let clean_cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
+        let par = super::CxPar::new(&clean_cx);
+        lent.clean_on_par(first, &par)?
     } else {
         (first, 0)
     };
@@ -685,6 +738,7 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
     } else {
         false
     };
+    let ran_at = qos_now()?;
     let mut cleanup = {
         let _cx = cx.span("store after answer: the cleanup line");
         super::roots::CleanupLine::of(lent, slice)
@@ -693,13 +747,16 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
         cleanup.slices = swept;
     }
     cleanup.put = super::roots::PutLine { before_answer: before, after_answer: lent.put_tally().since(before) };
-    Ok(AfterAnswer {
-        segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX),
-        sealed,
-        compaction_slices: cleanup.slices,
-        cleanup,
-        qos: QosSeen::default(),
-    })
+    Ok((
+        AfterAnswer {
+            segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX),
+            sealed,
+            compaction_slices: cleanup.slices,
+            cleanup,
+            qos: QosSeen::default(),
+        },
+        ran_at,
+    ))
 }
 
 /// The tests' context for [`after_answer`] (its spans): a simulated world's root, its own

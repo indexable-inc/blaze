@@ -21,14 +21,16 @@ use core::cell::Cell;
 use core::hash::BuildHasher;
 
 use crate::body::{
-    Block, BlockKind, BlockRow, Body, BorrowKind, Callee, CalleeId, Const, ConstDecl, ConstKind, List,
-    Local, LocalDecl, LocalKind, Loan, LoanRow, NONE, Operand, Ops, Origin, PTy, Place, PlaceRow,
-    Proj, Span, Stmt, StmtKind, Table, Value,
+    AsmArch, AsmOpKind, AsmOpRow, AsmPiece, AsmRegKind, AsmRow, Block, BlockKind, BlockRow, Body,
+    BorrowKind, Callee, CalleeId, Const, ConstDecl, ConstKind, List, Local, LocalDecl, LocalKind,
+    Loan, LoanRow, NONE, Operand, Ops, Origin, PTy, Place, PlaceRow, Proj, Span, Stmt, StmtKind,
+    Table, Value,
 };
 use crate::code::{
-    ConstWords, PairWords, PlaceWords, SubsetWords, TyWords, encode_block, encode_callee, encode_case,
-    encode_const, encode_loan, encode_local, encode_operand, encode_place, encode_stmt, encode_ty, join,
-    map_ty_lists, ty_children,
+    ConstWords, PairWords, PlaceWords, SubsetWords, TyWords, encode_asm, encode_asm_op,
+    encode_asm_piece, encode_block, encode_callee, encode_case, encode_const, encode_loan,
+    encode_local, encode_operand, encode_place, encode_stmt, encode_ty, join, map_ty_lists,
+    ty_children,
 };
 use crate::verify::{VerifyError, check_refs};
 
@@ -78,6 +80,26 @@ impl From<VerifyError> for BuildError {
     fn from(e: VerifyError) -> BuildError {
         BuildError::Refs(e)
     }
+}
+
+/// Input piece for [`BodyBuilder::new_asm`].
+#[derive(Clone, Copy, Debug)]
+pub enum AsmPieceInput<'a> {
+    Text(&'a str),
+    Line,
+    Operand { index: u32, modifier: Option<char> },
+}
+
+/// Input operand descriptor for [`BodyBuilder::new_asm`].
+#[derive(Clone, Copy, Debug)]
+pub struct AsmOpInput<'a> {
+    pub kind: AsmOpKind,
+    pub reg_kind: AsmRegKind,
+    pub reg: &'a str,
+    pub in_op: Option<u32>,
+    pub out_place: Option<Place>,
+    pub label: Option<Block>,
+    pub discard_out: bool,
 }
 
 /// Builds a body: make locals, constants and blocks, then fill each block in turn, ending it
@@ -349,6 +371,9 @@ impl<A: Allocator + Copy> BodyBuilder<A> {
                 list_base: NONE,
                 tys: Vec::new_in(alloc),
                 ty_lists: Vec::new_in(alloc),
+                asms: Vec::new_in(alloc),
+                asm_pieces: Vec::new_in(alloc),
+                asm_ops: Vec::new_in(alloc),
                 table: None,
             },
             filled: Vec::new_in(alloc),
@@ -373,6 +398,123 @@ impl<A: Allocator + Copy> BodyBuilder<A> {
     /// The body as built so far, to read.
     pub fn body(&self) -> &Body<A> {
         &self.body
+    }
+
+    /// Copies the overlay type columns (`ty_base`, `list_base`, `tys`, `ty_lists`) from `from`
+    /// so a body-to-body pass (such as drop elaboration) preserves every overlay type handle.
+    pub fn copy_overlay(&mut self, from: &crate::body::BodyRef<'_>) {
+        self.body.ty_base = from.ty_base;
+        self.body.list_base = from.list_base;
+        self.body.tys.extend_from_slice(from.tys);
+        self.body.ty_lists.extend_from_slice(from.ty_lists);
+    }
+
+    /// Appends UTF-8 bytes to the body's data table and returns `(start, len)`.
+    fn push_asm_text(&mut self, s: &str) -> (u32, u32) {
+        if s.is_empty() {
+            return (0, 0);
+        }
+        let bytes = s.as_bytes();
+        let (start, len) = match (next(self.body.data.len(), Table::Data), u32::try_from(bytes.len())) {
+            (Ok(s), Ok(l)) if s.checked_add(l).is_some_and(|e| e < NONE) => (s, l),
+            _ => {
+                self.fail(BuildError::Full(Table::Data));
+                return (0, 0);
+            }
+        };
+        self.body.data.extend_from_slice(bytes);
+        (start, len)
+    }
+
+    /// Adds one inline assembly block descriptor and returns its ordinal (`StmtKind::InlineAsm::asm`).
+    pub fn new_asm(
+        &mut self,
+        arch: AsmArch,
+        options: u16,
+        clobbers: &str,
+        pieces: &[AsmPieceInput<'_>],
+        ops: &[AsmOpInput<'_>],
+    ) -> u32 {
+        let pieces_start = match next(self.body.asm_pieces.len(), Table::AsmPieces) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        for piece in pieces {
+            let row = match *piece {
+                AsmPieceInput::Text(t) => {
+                    let (start, len) = self.push_asm_text(t);
+                    AsmPiece::Text { start, len }
+                }
+                AsmPieceInput::Line => AsmPiece::Line,
+                AsmPieceInput::Operand { index, modifier } => AsmPiece::Operand { index, modifier },
+            };
+            self.body.asm_pieces.push(encode_asm_piece(row));
+        }
+        let pieces_end = match next(self.body.asm_pieces.len(), Table::AsmPieces) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        let ops_start = match next(self.body.asm_ops.len(), Table::AsmOps) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        for op in ops {
+            if let Some(p) = op.out_place
+                && p.0 >= self.body.view().places()
+            {
+                self.fail(self.out_of_range(Table::Places, p.0));
+            }
+            if let Some(b) = op.label
+                && b.0 >= self.body.view().blocks()
+            {
+                self.fail(self.out_of_range(Table::Blocks, b.0));
+            }
+            let (reg_start, reg_len) = self.push_asm_text(op.reg);
+            let row = AsmOpRow {
+                kind: op.kind,
+                reg_kind: op.reg_kind,
+                reg_start,
+                reg_len,
+                in_op: op.in_op,
+                out_place: op.out_place,
+                label: op.label,
+                discard_out: op.discard_out,
+            };
+            self.body.asm_ops.push(encode_asm_op(row));
+        }
+        let ops_end = match next(self.body.asm_ops.len(), Table::AsmOps) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        let (clobbers_start, clobbers_len) = self.push_asm_text(clobbers);
+        let id = match next(self.body.asms.len(), Table::Asms) {
+            Ok(n) => n,
+            Err(e) => {
+                self.fail(e);
+                return NONE;
+            }
+        };
+        self.body.asms.push(encode_asm(AsmRow {
+            pieces: Ops { start: pieces_start, end: pieces_end },
+            ops: Ops { start: ops_start, end: ops_end },
+            clobbers_start,
+            clobbers_len,
+            options,
+            arch,
+        }));
+        id
     }
 
     /// A new local; its own place is made with it. Locals come in order: the return place,

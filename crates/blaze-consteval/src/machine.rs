@@ -661,6 +661,9 @@ struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator +
     at: Option<At>,
     /// Parked root return value when `step` returns `Flow::Done`.
     result: Val,
+    /// Minimum log2 alignment from a root place load (e.g. promoted `&ALIGNED_BYTES.bytes`
+    /// inheriting the base struct's alignment at the field's offset).
+    result_align: u8,
     /// Parked stop when `step` returns `Flow::Stop`.
     error: Option<Stop<'a>>,
     plant: Plant,
@@ -680,6 +683,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             steps: 0,
             at: None,
             result: Val::Zst,
+            result_align: 0,
             error: None,
             plant: Plant::None,
         }
@@ -973,7 +977,16 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             }
             Op::Load { dst, src, ty } => {
                 let out = match self.work.regs[(b + src) as usize] {
-                    Out::Place(pl) => Out::val(try_step!(self.load_i(pl, code.tys[ty as usize]))),
+                    Out::Place(pl) => {
+                        if self.work.frames.len() == 1
+                            && matches!(usize::try_from(f.pc).ok().and_then(|pc| code.ops.get(pc + 1)), Some(&Op::Ret { src: r }) if r == dst)
+                        {
+                            let ptr = try_step!(pl.ptr());
+                            try_step!(self.ensure_loaded(ptr.alloc));
+                            self.result_align = try_step!(self.place_align_log2(ptr));
+                        }
+                        Out::val(try_step!(self.load_i(pl, code.tys[ty as usize])))
+                    }
                     other => other,
                 };
                 self.set(b, dst, out);
@@ -1522,6 +1535,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
         Ok(self.work.mem.read(p, n)?)
     }
 
+    /// Guaranteed log2 byte alignment of `ptr` within its allocation: the allocation's own
+    /// alignment when `ptr.offset == 0`, otherwise capped by the lowest set bit of `ptr.offset`.
+    fn place_align_log2(&self, ptr: Pointer) -> R<'a, u8> {
+        let src = self.work.mem.get(ptr.alloc)?.align_log2;
+        Ok(if ptr.offset == 0 { src } else { src.min(u8::try_from(ptr.offset.trailing_zeros()).unwrap_or(u8::MAX)) })
+    }
+
     fn load_i(&mut self, pl: Place, t: TyInfo) -> R<'a, Val> {
         let ptr = pl.ptr()?;
         self.ensure_loaded(ptr.alloc)?;
@@ -1537,7 +1557,10 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             }
             Repr::Pair => Val::pair(self.work.mem.read(ptr, PTR)?, self.work.mem.read(ptr.at(PTR), PTR)?),
             Repr::Mem(n) => {
-                let to = self.temp_i(t)?;
+                let align = t.align.max(self.place_align_log2(ptr)?);
+                let id = self.work.mem.allocate(t.size, align, true, Origin::Data)?;
+                self.work.temps.push(id);
+                let to = Pointer { alloc: id, offset: 0 };
                 self.work.mem.copy(ptr, to, n)?;
                 Val::Mem(to)
             }
@@ -2766,12 +2789,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
     /// `held`: a static's record marks the allocations written in place
     /// ([`Machine::written_in_place`]); a copied value's marks none.
     fn intern(&mut self, v: Val, t: PTy, held: Held) -> R<'a, DataRecord<Alloc<'a>>> {
-        let (size, align) = self.size_align(t)?;
-        // A value already a whole temporary of its size is the root as it is.
+        let (size, ty_align) = self.size_align(t)?;
+        let align = ty_align.max(self.result_align);
+        // A value already a whole temporary of its size and alignment is the root as it is.
         let whole = match v {
             Val::Mem(p) if p.offset == 0 => {
                 let a = self.work.mem.get(p.alloc)?;
-                (a.live && a.origin == Origin::Data && a.len() == size).then_some(p.alloc)
+                (a.live && a.origin == Origin::Data && a.len() == size && a.align_log2 >= align).then_some(p.alloc)
             }
             _ => None,
         };

@@ -9,20 +9,23 @@
 //! A crate's record is a function of its job: the same bytes whichever worker or order made it
 //! (rule 25).
 
-use core::cell::RefCell;
+use core::alloc::{AllocError, Allocator, Layout};
+use core::cell::{RefCell, UnsafeCell};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::alloc::Global;
 use std::string::String;
 
 use blaze_drive::Input;
 use blaze_fetch::pack::PackView;
 use blaze_id::CrateItemKey;
-use blaze_own::{Alloc, Erased};
+use blaze_own::{Alloc, Bump, BumpAlloc, Erased, Headed, Header, Share};
 use blaze_scope::crate_env::EnvLent;
 use blaze_scope::body_scope::BlocksTally;
-use blaze_scope::crate_scope::{CrateScopeError, resolve_crate_verified};
+use blaze_scope::crate_scope::{CrateScopeError, resolve_crate_verified_with};
 use blaze_scope::graph::Sysroot;
 use blaze_scope::prepares::Prepares;
-use blaze_scope::resolve::CrateInput;
+use blaze_scope::resolve::{CrateInput, Found, ProcExport, ProcUnusable, ResolveOpts, SourceTexts, Unread};
 use blaze_scope::scope_record::Verified;
 use blaze_scope::task::Par;
 use bstd::cx::Cx;
@@ -112,10 +115,170 @@ pub(crate) fn sysroot_given(toolchain: bool, at: usize, all: [Option<usize>; 4],
     given
 }
 
+/// Virtual address-space reservation for the stage-wide shared [`SharedPrepares`] arena
+/// (commits 0 bytes until declarative macros are prepared; freed in bulk on drop, rule 70).
+const PREPARES_RESERVE: usize = 2 << 30;
+
+/// Virtual address-space reservation for one crate's parallel intra-crate bump arena
+/// (`lower_modules`, `Cells::scope`, and wave-batched macro expansion; commits lazily and
+/// frees in bulk at end of `resolve_metered`).
+const PAR_CRATE_RESERVE: usize = 1 << 30;
+
+/// Per-item scratch frame reservation inside parallel `FilePar::map` worker calls (virtual
+/// address space reserved, committed on demand; chunk-cached in `blaze_mem`, dropped immediately
+/// after each item). Large proc-macro expansions (`alloy_sol_types::sol!`) exceed 64 MiB.
+const PAR_CALL_SCRATCH: usize = 1 << 30;
+
+/// Stage-scoped compiled declarative macro cache (`Prepares`), shared across all crates in one
+/// `Names` stage so `core`/`std`/`serde`/`cfg_if!` macros are lexed and compiled once per build
+/// and freed cleanly when the stage finishes (rule 70).
+pub(crate) struct SharedPrepares(blaze_scope::resolve::SharedPrepares<bstd::mem::SharedBump>);
+
+impl SharedPrepares {
+    pub(crate) fn new(kept: blaze_own::SharedAlloc<'static>) -> Result<Self, blaze_mem::MemError> {
+        let bump = bstd::mem::SharedBump::new(PREPARES_RESERVE, Tag::Expand)?;
+        Ok(Self(blaze_scope::resolve::SharedPrepares::new(bump, kept)))
+    }
+
+    pub(crate) fn share(&self) -> Self {
+        Self(self.0.share())
+    }
+
+    fn prepares(&self) -> &Prepares<'static> {
+        self.0.prepares()
+    }
+}
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SharedPrepares>();
+};
+
+/// Thin wrapper over `&JobTexts<'n>` adding warmed, thread-safe `par_proc_macro` execution for
+/// wave-batched parallel macro expansion while preserving 100% identical serial `SourceTexts`
+/// behavior on the main thread.
+struct ParTexts<'t, 'n> {
+    inner: &'t JobTexts<'n>,
+    warmed: AtomicBool,
+}
+
+impl<'t, 'n> ParTexts<'t, 'n> {
+    fn new(inner: &'t JobTexts<'n>) -> Self {
+        Self { inner, warmed: AtomicBool::new(false) }
+    }
+}
+
+impl<'t, 'n> SourceTexts<'n> for ParTexts<'t, 'n> {
+    fn read(&self, krate: usize, path: &str) -> Option<&'n str> {
+        self.inner.read(krate, path)
+    }
+
+    fn source(&self, krate: usize, path: &str) -> Found<&'n str, Unread<'n>> {
+        self.inner.source(krate, path)
+    }
+
+    fn read_data(&self, krate: usize, from: &str, path: &str) -> Option<&'n [u8]> {
+        self.inner.read_data(krate, from, path)
+    }
+
+    fn source_data(&self, krate: usize, from: &str, path: &str) -> Found<&'n [u8], Unread<'n>> {
+        self.inner.source_data(krate, from, path)
+    }
+
+    fn left_package(&self, krate: usize, left: blaze_scope::include_place::LeftPackage<'_>) {
+        self.inner.left_package(krate, left);
+    }
+
+    fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+        self.inner.proc_macro_key(krate)
+    }
+
+    fn proc_exports(&self, krate: usize) -> Option<&'n [ProcExport<'n>]> {
+        self.inner.proc_exports(krate)
+    }
+
+    fn run_proc_macro<'b>(
+        &self,
+        krate: usize,
+        def: &blaze_expand::MacroDefinition<'_>,
+        call: blaze_expand::ProcCall<'_>,
+        alloc: Alloc<'b>,
+    ) -> Result<blaze_expand::Produced<'b>, blaze_expand::HostError> {
+        self.inner.run_proc_macro(krate, def, call, alloc)
+    }
+
+    fn proc_macro_unusable(&self, krate: usize, def: &blaze_expand::MacroDefinition<'_>) -> Option<ProcUnusable<'n>> {
+        self.inner.proc_macro_unusable(krate, def)
+    }
+
+    fn crate_env(&self, krate: usize) -> Option<&blaze_scope::crate_env::CrateEnv<'n>> {
+        self.inner.crate_env(krate)
+    }
+
+    fn attr_plant(&self) -> blaze_scope::resolve::AttrPlant {
+        self.inner.attr_plant()
+    }
+
+    fn attr_order(&self) -> blaze_scope::resolve::AttrOrder {
+        self.inner.attr_order()
+    }
+
+    fn reach_plant(&self) -> blaze_scope::resolve::ReachPlant {
+        self.inner.reach_plant()
+    }
+
+    fn prepare_par_proc(&self, krate: usize, def: &blaze_expand::MacroDefinition<'_>) {
+        if self.warmed.load(Ordering::Acquire) {
+            return;
+        }
+        if let crate::job_texts::Procs::Made(procs) = self.inner.procs
+            && matches!(self.inner.packs, crate::job_texts::Packs::Open(_) | crate::job_texts::Packs::SyncLazy(_, _))
+            && let Some(&(_, world_at, _)) = self.inner.callers.iter().find(|&&(k, _, _)| k == krate)
+        {
+            // Populates `ProcRunner::callers`'s `OnceLock` slot for `world_at` on the main
+            // thread so subsequent `par_proc_macro` worker calls never touch `cx` or `packs`.
+            let _ = procs.unusable(self.inner.cx, self.inner.packs, world_at, def);
+            self.warmed.store(true, Ordering::Release);
+        }
+    }
+
+    fn par_proc_macro<'b>(
+        &self,
+        krate: usize,
+        def: &blaze_expand::MacroDefinition<'_>,
+        call: blaze_expand::ProcCall<'_>,
+        alloc: Alloc<'b>,
+    ) -> Option<Result<blaze_expand::Produced<'b>, blaze_expand::HostError>> {
+        if !self.warmed.load(Ordering::Acquire) {
+            return None;
+        }
+        let crate::job_texts::Procs::Made(procs) = self.inner.procs else {
+            return None;
+        };
+        if !matches!(self.inner.packs, crate::job_texts::Packs::Open(_) | crate::job_texts::Packs::SyncLazy(_, _)) {
+            return None;
+        }
+        let &(_, world_at, edition) = self.inner.callers.iter().find(|&&(k, _, _)| k == krate)?;
+        procs.run(self.inner.cx, self.inner.packs, world_at, edition, def, call, alloc).ok().map(Ok)
+    }
+}
+
 /// The crate resolved, on whichever thread runs it, in `frame` (a pool task's own): its record
 /// and read lists, owned, and what its frame held by the stretch of the solve that took it
 /// ([`super::metered`]). Reads nothing but `job` and the checkout files the crate names.
 pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame) -> (Resolution, super::metered::ScopeBytes) {
+    resolve_with_prepares(cx, root, job, None, frame)
+}
+
+/// [`resolve`] sharing a stage-wide [`SharedPrepares`] across all crates in the `Names` stage
+/// so declarative macros from `core`/`std`/dependencies are compiled once per build.
+pub(crate) fn resolve_with_prepares(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    job: &ScopeJob<'_>,
+    prepares: Option<&SharedPrepares>,
+    frame: &Frame,
+) -> (Resolution, super::metered::ScopeBytes) {
     let failed_with = |words| failed_scope(words, job.kept);
     // Each macro call's working memory, beside the crate's frame (blaze-scope task/fill.rs
     // `Par::call_scratch`): reserved here, committed as used, rolled back after each call and
@@ -130,7 +293,7 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
         Err(error) => return (failed_with(std::format!("crate {}: its cell solver's scratch frame ({SCOPE_FRAME} bytes) could not be reserved: {error:?}", job.input.name)), super::metered::ScopeBytes::default()),
     };
     let metered = super::metered::Metered::new(frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
-    let resolution = resolve_metered(cx, root, job, frame, &metered);
+    let resolution = resolve_metered(cx, root, job, prepares, frame, &metered);
     let of = crate::phases::byte_rows::Label::of(format_args!("{}", job.input.name));
     (resolution, metered.finish(of))
 }
@@ -148,6 +311,17 @@ struct FilePar<'p> {
     oracle: NamesOracle,
     now: &'p dyn Fn() -> u64,
     seen: RefCell<Option<Seen>>,
+    /// Active depth of parallel `FilePar::map` scopes; while > 0, `call_scratch` hands each
+    /// worker its own chunk-cached `Frame` instead of touching the single-threaded `Metered`.
+    in_par_map: AtomicUsize,
+}
+
+struct ParMapGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ParMapGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// One crate's check as D116's `DecideCheck` reported it, before its items are named by path.
@@ -200,7 +374,42 @@ impl Par for FilePar<'_> {
     }
 
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut blaze_own::AVec<'_, T>) {
-        self.meter.map(n, f, out);
+        let par_workers = usize::try_from(self.workers.get().min(self.cx.workers())).unwrap_or(1);
+        if par_workers <= 1 || n < 4 {
+            self.meter.map(n, f, out);
+            return;
+        }
+        let mut slots: blaze_own::Vec<UnsafeCell<Option<T>>, blaze_own::SharedAlloc<'static>> =
+            blaze_own::Vec::with_capacity_in(n, self.heap);
+        slots.resize_with(n, || UnsafeCell::new(None));
+        let next = AtomicUsize::new(0);
+        let denom = par_workers.saturating_mul(4).max(1);
+        let stride = if n >= par_workers.saturating_mul(8) { (n / denom).clamp(1, 16) } else { 1 };
+        let shared = blaze_scope::resolve::ParMapWork::new(&f, slots.as_slice(), &next, stride);
+        self.in_par_map.fetch_add(1, Ordering::AcqRel);
+        let guard = ParMapGuard(&self.in_par_map);
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let helpers = par_workers.saturating_sub(1).min(n.saturating_sub(1));
+        let mut jobs = blaze_own::Vec::with_capacity_in(helpers, self.heap);
+        for _ in 0..helpers {
+            jobs.push(scope.may_overlap("names: parallel map", 64 << 10, move |_| {
+                shared.drain();
+                Ok::<_, core::convert::Infallible>(())
+            }));
+        }
+        shared.drain();
+        for job in jobs {
+            let _ = job.join(self.cx);
+        }
+        let _ = scope.join(self.cx);
+        drop(guard);
+        out.reserve(n);
+        for slot in slots {
+            if let Some(value) = slot.into_inner() {
+                out.push(value);
+            }
+        }
     }
 
     fn stage(&self, stage: blaze_scope::task::Stage) {
@@ -212,6 +421,14 @@ impl Par for FilePar<'_> {
     }
 
     fn call_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> blaze_scope::task::Scratch {
+        if self.in_par_map.load(Ordering::Acquire) > 0 {
+            if let Ok(local) = Frame::with_reserve(PAR_CALL_SCRATCH, Tag::Expand) {
+                let erased = Erased::new(&local);
+                work(erased.handle());
+                return blaze_scope::task::Scratch::Reset;
+            }
+            return blaze_scope::task::Scratch::Kept;
+        }
         self.meter.call_scratch(work)
     }
 
@@ -351,7 +568,7 @@ fn blocks_differential(
                 run_stopped: core::cell::Cell::new(None),
                 activity: job.board.map(|board| (board, job.clock)),
             };
-            let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
+            let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None), in_par_map: AtomicUsize::new(0) };
             // The differential's two solves take bytes and check them again: an oracle's path,
             // off the command's (`--block-scopes=bodies` only).
             let deps = blaze_own::AVec::from_iter_in(job.deps.iter().map(|proof| proof.bytes()), alloc);
@@ -399,7 +616,7 @@ fn blocks_differential(
             run_stopped: core::cell::Cell::new(None),
             activity: job.board.map(|board| (board, job.clock)),
         };
-        let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
+        let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None), in_par_map: AtomicUsize::new(0) };
         let deps = blaze_own::AVec::from_iter_in(job.deps.iter().map(|proof| proof.bytes()), alloc);
         match blaze_scope::crate_scope::block_scopes_bodies_side(&modules, &job.input, &deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(bump), bump) {
             Ok(verdict) if verdict.agrees() => (BlocksTally::of(&verdict), None),
@@ -416,9 +633,30 @@ fn blocks_differential(
     }
 }
 
-fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame, metered: &super::metered::Metered<'_>) -> Resolution {
+fn resolve_metered(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    job: &ScopeJob<'_>,
+    shared_prepares: Option<&SharedPrepares>,
+    frame: &Frame,
+    metered: &super::metered::Metered<'_>,
+) -> Resolution {
     let failed_with = |words| failed_scope(words, job.kept);
     let cx = cx.span("crate scope: resolve one crate's names");
+    let par_workers = usize::try_from(job.workers.get().min(cx.workers())).unwrap_or(1);
+    // Declared BEFORE `erased` and `texts` so its backing `Root` outlives `'a` (every
+    // `CrateNames<'a>` / `DeclsBuilder<'a>` / `ExpansionText<'a>` allocated in it).
+    let par_bump_holder: Option<blaze_own::Box<bstd::mem::SharedBump, blaze_own::SharedAlloc<'static>>> = if par_workers > 1 {
+        match bstd::mem::SharedBump::new(PAR_CRATE_RESERVE, Tag::Nameres) {
+            Ok(sb) => Some(blaze_own::Box::new_in(sb, job.kept)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let parallel_bump = par_bump_holder.as_deref().map(Bump::of);
+    let effective_workers = if parallel_bump.is_some() { par_workers } else { 1 };
+    let resolve_opts = ResolveOpts { write_inner: false, parallel_bump, par_workers: effective_workers };
     let erased = Erased::new(frame);
     let bump = erased.bump();
     let alloc = bump.alloc();
@@ -450,12 +688,30 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         run_stopped: core::cell::Cell::new(None),
         activity: job.board.map(|board| (board, job.clock)),
     };
-    let prepares = Prepares::new_in(bump);
     let now = || crate::engine_times::ns(job.clock.now().since_start());
     let (done, seen) = {
+        let par_texts = ParTexts::new(&texts);
         let solve = cx.span("crate scope: resolve_crate");
-        let par = FilePar { cx: &solve, meter: metered, heap: job.kept, workers: job.workers, oracle: job.oracle, now: &now, seen: RefCell::new(None) };
-        let done = resolve_crate_verified(&job.input, job.deps, job.sysroot, &texts, job.at, &par, prepares, bump);
+        let par = FilePar {
+            cx: &solve,
+            meter: metered,
+            heap: job.kept,
+            workers: job.workers,
+            oracle: job.oracle,
+            now: &now,
+            seen: RefCell::new(None),
+            in_par_map: AtomicUsize::new(0),
+        };
+        let done = match shared_prepares {
+            Some(shared) => resolve_crate_verified_with(&job.input, job.deps, job.sysroot, &par_texts, job.at, &par, shared.prepares(), resolve_opts, bump),
+            None => {
+                // When parallel workers are active without a stage-wide `SharedPrepares`, back
+                // the crate's `Prepares` with the thread-safe `parallel_bump` (`Root`) so worker
+                // threads never allocate into the single-threaded `frame`.
+                let local_prepares = Prepares::new_in(parallel_bump.unwrap_or(bump));
+                resolve_crate_verified_with(&job.input, job.deps, job.sysroot, &par_texts, job.at, &par, local_prepares, resolve_opts, bump)
+            }
+        };
         (done, par.seen.into_inner())
     };
     if let crate::job_texts::Packs::SyncLazy(lazy, _) = job.packs
@@ -518,14 +774,13 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
         Ok(done) => match scope_record(&cx, job.workers, &done, crate_name, job.member, has_surface, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), metered, job.kept) {
             Ok(record) => {
-                // Both records (rule 21): a dependent reads the exports, but the crate's own
-                // bodies read its inner names (front_load.rs), so an out over the exports alone
-                // left a private item's removal moving no reader: its body was handed the record
-                // that still resolved the item gone (`SourceError::ItemStale`, lane UN
-                // 2026-11-17; signature_grain_tests `a_name_that_does_not_exist_is_an_error`).
+                // Exports + Section 2 (`names_record`) + Section 3 (`items_record`) + expansion
+                // directory digest (rule 21): replaces the dead `done.inner` serialization while
+                // covering every public and private name, item, and expansion of the crate.
                 let mut out = blaze_ids::Hasher::new(OUT_DOMAIN);
-                out.update(&(done.record.len() as u64).to_le_bytes()).update(&done.record);
-                out.update(&(done.inner.len() as u64).to_le_bytes()).update(&done.inner);
+                out.update(&u64::try_from(done.record.len()).unwrap_or(u64::MAX).to_le_bytes()).update(&done.record);
+                out.id(&record.names_out);
+                out.id(&record.items_out);
                 out.id(&record.expansions_out);
                 (Some(out), record.payload, record.findings, record.tests_refused, true, record.unresolved, record.test_marks, record.expansions)
             }

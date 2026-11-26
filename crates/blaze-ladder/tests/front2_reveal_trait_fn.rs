@@ -242,3 +242,66 @@ fn a_required_trait_fns_future_is_send_by_its_bounds_or_by_its_impl() {
     pair(&got, 2, "a concrete receiver whose impl's future holds nothing");
     pair(&got, 4, "tempo's `advance_one` shape with a `Send` driver");
 }
+
+/// Alloy's `TxFiller::prepare` / `TransportConnect::get_transport` / `NetworkWallet::sign_request`
+/// shape: a trait fn whose return type is a type macro expanding to `impl Future<...> (+ Send)`.
+/// Before expanding macros in `dyn_ty::member`, `opaque_return` stayed `false`, so `rpitit::trait_rows`
+/// created no synthetic associated type and every reveal fell through to `HiddenFail::TraitFnInBounds`.
+const MACRO_RPITIT_PROGRAM: &str = r#"
+use std::future::Future;
+use std::rc::Rc;
+
+fn spawn<F: Future + Send + 'static>(f: F) { drop(f); }
+async fn tick() {}
+
+macro_rules! impl_future_send {
+    (<$($t:tt)+) => { impl Send + std::future::Future<$($t)+ };
+}
+macro_rules! impl_future_local {
+    (<$($t:tt)+) => { impl std::future::Future<$($t)+ };
+}
+
+trait Filler {
+    type Fillable;
+    fn prepare(&self) -> impl_future_send!(<Output = Self::Fillable>);
+}
+
+struct GoodFiller;
+impl Filler for GoodFiller {
+    type Fillable = u32;
+    async fn prepare(&self) -> u32 { tick().await; 7 }
+}
+
+trait LocalFiller {
+    fn prepare(&self) -> impl_future_local!(<Output = u32>);
+}
+struct LocalGood;
+impl LocalFiller for LocalGood { async fn prepare(&self) -> u32 { tick().await; 1 } }
+struct LocalBad;
+impl LocalFiller for LocalBad { async fn prepare(&self) -> u32 { let r = Rc::new(0u8); tick().await; drop(r); 1 } }
+
+async fn call_filler<T: Filler>(t: T) -> T::Fillable { let v = t.prepare().await; drop(t); v }
+async fn call_local<T: LocalFiller>(t: T) -> u32 { let v = t.prepare().await; drop(t); v }
+
+fn macro_generic_send<T: Filler + Send + 'static>(t: T) { spawn(call_filler(t)); }
+fn macro_concrete_send() { spawn(call_filler(GoodFiller)); }
+fn macro_local_good() { spawn(call_local(LocalGood)); }
+fn macro_local_bad() { spawn(call_local(LocalBad)); }
+fn macro_local_generic<T: LocalFiller + Send + 'static>(t: T) { spawn(call_local(t)); }
+
+fn main() {}
+"#;
+
+#[test]
+fn a_macro_wrapped_rpitit_in_a_trait_reveals_through_its_synthetic_assoc() {
+    let names = ["macro_generic_send", "macro_concrete_send", "macro_local_good", "macro_local_bad", "macro_local_generic"];
+    let got = check_program(MACRO_RPITIT_PROGRAM, &names);
+    for (name, g) in names.iter().zip(got.iter()) {
+        println!("{name}: clean {}: {}", g.0, g.1);
+        assert!(!g.1.contains("TraitFnInBounds"), "{name}: must never hit TraitFnInBounds: {}", g.1);
+    }
+    assert!(got[0].0, "macro `+ Send` on trait fn, generic receiver: {}", got[0].1);
+    assert!(got[1].0, "macro `+ Send` on trait fn, concrete receiver: {}", got[1].1);
+    pair(&got, 2, "macro `impl Future` on trait fn, concrete receiver");
+    assert!(!got[4].0 && got[4].1.contains("E0277"), "TWIN: macro `impl Future` without `+ Send` on generic receiver: E0277: {}", got[4].1);
+}

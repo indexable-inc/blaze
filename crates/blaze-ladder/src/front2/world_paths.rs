@@ -3,9 +3,7 @@
 //! module. The library's kind of the item it found picks the checker's [`Def`]; a struct or
 //! variant named as a value needs its ADT's record (its constructor kind).
 
-use std::alloc::Global;
-use std::vec::Vec;
-
+use blaze_own::{Alloc, Vec as OwnVec};
 use blaze_typeck::{Def, Fetch, MissWhy, Name, PNode, PTy, PathAnswer, PathIdx, PathMiss, PathRes, Prim, ScopeId};
 
 use super::locals::{LocalGap, LocalKind, LocalNs};
@@ -16,14 +14,63 @@ use super::types::SelfTy;
 use super::world_items::{BodyWorld, Fill, Gap};
 use crate::resolve::{Kind, Ns, ResolveError};
 
+/// Stack-backed buffer for path segments (<= 8 segments hit zero heap allocations; longer
+/// paths spill into the body's resettable scratch `Alloc<'static>`).
+enum SmallPathBuf<'a> {
+    Inline { buf: [&'a str; 8], len: usize },
+    Spill(OwnVec<&'a str, Alloc<'static>>),
+}
+
+impl<'a> SmallPathBuf<'a> {
+    #[inline]
+    fn with_capacity(cap: usize, alloc: Alloc<'static>) -> Self {
+        if cap <= 8 {
+            Self::Inline { buf: [""; 8], len: 0 }
+        } else {
+            Self::Spill(OwnVec::with_capacity_in(cap, alloc))
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, value: &'a str, alloc: Alloc<'static>) {
+        match self {
+            Self::Inline { buf, len } => {
+                if let Some(slot) = buf.get_mut(*len) {
+                    *slot = value;
+                    *len += 1;
+                } else {
+                    let mut v = OwnVec::with_capacity_in(16, alloc);
+                    v.extend_from_slice(buf.get(..*len).unwrap_or(&[]));
+                    v.push(value);
+                    *self = Self::Spill(v);
+                }
+            }
+            Self::Spill(v) => v.push(value),
+        }
+    }
+}
+
+impl<'a> core::ops::Deref for SmallPathBuf<'a> {
+    type Target = [&'a str];
+
+    #[inline]
+    fn deref(&self) -> &[&'a str] {
+        match self {
+            Self::Inline { buf, len } => buf.get(..*len).unwrap_or(&[]),
+            Self::Spill(v) => v.as_slice(),
+        }
+    }
+}
+
 impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// What `segments`, written in the body, name; when nothing, which segment failed, why,
     /// and what the segments before it named ([`Self::path_miss`]).
     pub(super) fn path(&self, scope: ScopeId, p: PathIdx, segments: &[Name]) -> Fetch<PathAnswer> {
-        let mut written = Vec::with_capacity_in(segments.len(), Global);
+        let alloc = self.store.work_alloc();
+        let mut written = SmallPathBuf::with_capacity(segments.len(), alloc);
         for &s in segments {
             match self.spell.get(s) {
-                Ok(t) => written.push(t),
+                Ok(t) => written.push(t, alloc),
                 Err(u) => return self.gap(Gap::Unspelled(u)),
             }
         }
@@ -86,7 +133,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         let mut at_module = site.module;
         let mut local_type = None;
         let (found, via_glob) = match super::scope_table::value_prefix(
-            &self.resolver(), &self.store.locals, self.owner, self.module, Some(scope.0), first, written.len() == 1, mark, self.store.tys.alloc(),
+            &self.resolver(), &self.store.locals, self.owner, self.module, Some(scope.0), first, written.len() == 1, mark, self.store.work_alloc(),
         ) {
             Ok(prefix) => prefix,
             Err(gap) => return self.gap(Gap::Local(gap)),
@@ -137,23 +184,31 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         let plain = via_use.is_none() && via_glob.is_none() && local_type.is_none() && site.module == self.module && !written.iter().any(|t| *t == "$crate");
         let mut shift = 0u32;
         if let Some(hit) = &via_glob {
-            let mut through = Vec::with_capacity_in(hit.path.len() + written.len() + 1, Global);
+            let mut through = SmallPathBuf::with_capacity(hit.path.len() + written.len() + 1, alloc);
             if hit.abs {
-                through.push("{{root}}");
+                through.push("{{root}}", alloc);
             }
-            through.extend(hit.path.iter().copied());
-            through.extend(written[1..].iter().copied());
+            for &seg in hit.path.iter() {
+                through.push(seg, alloc);
+            }
+            for &seg in written[1..].iter() {
+                through.push(seg, alloc);
+            }
             shift = (through.len() - written.len()) as u32;
             written = through;
             at_module = hit.at;
         }
         if let Some(row) = via_use {
-            let mut through = Vec::with_capacity_in(row.path.len() + written.len(), Global);
+            let mut through = SmallPathBuf::with_capacity(row.path.len() + written.len(), alloc);
             if row.abs {
-                through.push("{{root}}");
+                through.push("{{root}}", alloc);
             }
-            through.extend(row.path.iter().copied());
-            through.extend(written[1..].iter().copied());
+            for &seg in row.path.iter() {
+                through.push(seg, alloc);
+            }
+            for &seg in written[1..].iter() {
+                through.push(seg, alloc);
+            }
             shift = (through.len() - written.len()) as u32;
             written = through;
             // The `use`'s path is read where the `use` is written (super::scope_table states the
@@ -225,6 +280,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         };
         let written = &written[shift as usize..];
         let all = consumed as usize == written.len();
+        let _ = self.keys.item(target.key);
+        if let Kind::Variant { adt, .. } = target.kind {
+            let _ = self.keys.item(adt);
+        }
         let k = checker_of(target.key);
         let def = match target.kind {
             Kind::Fn => Def::Fn(k),
@@ -271,7 +330,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     // conversion expanded it (`plain`, and [`fixed_alias`]'s shape): anywhere
                     // else the segment's arguments are still the alias's own, so the path is
                     // the alias itself.
-                    None => match fixed_alias(self.store.tys.view(), generics, ty) {
+                    None => match fixed_alias(self.store.tys.view(), generics, ty, alloc) {
                         Some((adt, _)) if plain => Def::Adt(adt),
                         _ => Def::Alias(k),
                     },
@@ -326,12 +385,12 @@ const MOST_ALIAS_NODES: u32 = 4096;
 /// `lower_holes`, so several holes in one argument stay apart). An alias of an alias is already its aliased type here: the head
 /// of an alias is made with every alias in it substituted (types.rs `path_ty`). `None`: any
 /// other aliased type (a tuple, a reference, a projection), or one past [`MOST_ALIAS_NODES`].
-pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) -> Option<(blaze_typeck::ItemKey, Vec<PTy, Global>)> {
+pub(super) fn fixed_alias<'a>(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy, alloc: Alloc<'a>) -> Option<(blaze_typeck::ItemKey, OwnVec<PTy, Alloc<'a>>)> {
     let PNode::Adt(adt, args) = *view.get(ty)? else { return None };
     let args = view.list(args).ok()?;
-    let mut used = Vec::with_capacity_in(generics as usize, Global);
+    let mut used = OwnVec::with_capacity_in(generics as usize, alloc);
     used.resize(generics as usize, false);
-    let mut work: Vec<PTy, Global> = Vec::new_in(Global);
+    let mut work: OwnVec<PTy, Alloc<'a>> = OwnVec::new_in(alloc);
     let mut steps = 0u32;
     for &arg in args {
         work.clear();
@@ -373,7 +432,7 @@ pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) 
             }
         }
     }
-    let mut out = Vec::with_capacity_in(args.len(), Global);
+    let mut out = OwnVec::with_capacity_in(args.len(), alloc);
     out.extend_from_slice(args);
     Some((adt, out))
 }
@@ -470,7 +529,8 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
         let made = super::types::Heads::alias(self.builder.heads, target.key).ok_or(Why::Need(target.key))?;
         // A refused alias head is the world's gap naming it (`Gap::AliasHead`).
         let Some((generics, ty)) = made else { return Ok(None) };
-        let Some((_, of)) = fixed_alias(tys.view(), generics, ty) else { return Ok(None) };
+        let alloc = tys.alloc();
+        let Some((_, of)) = fixed_alias(tys.view(), generics, ty, alloc) else { return Ok(None) };
         let same = of.len() == generics as usize && {
             let v = tys.view();
             of.iter().enumerate().all(|(i, a)| matches!(v.get(*a), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i))
@@ -481,7 +541,7 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
         let own = written.get(at as usize).copied().unwrap_or(&[]);
         let args = if own.is_empty() {
             let hole = super::types::intern(tys, PNode::Infer)?;
-            let mut holes = Vec::with_capacity_in(generics as usize, Global);
+            let mut holes = OwnVec::with_capacity_in(generics as usize, alloc);
             holes.resize(generics as usize, hole);
             holes
         } else {

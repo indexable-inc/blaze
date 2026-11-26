@@ -385,6 +385,32 @@ impl<'a> Reader<'a> {
         self.slots.iter_mut().find(|slot| slot.ask.id == id).map(|slot| slot.buf.as_mut_slice())
     }
 
+    /// Borrows the disjoint reply buffers of every active slot whose id appears in `ids`
+    /// simultaneously, in the order of `ids` (skipping any id no longer in flight), so a caller
+    /// can execute a wave of ranged reads in parallel with zero extra copies.
+    pub fn with_pending_buffers<R>(
+        &mut self,
+        ids: &[u32],
+        alloc: Alloc<'_>,
+        f: impl FnOnce(&mut [super::origin::BatchRead<'_>]) -> R,
+    ) -> R {
+        let mut batch: Vec<super::origin::BatchRead<'_>, Alloc<'_>> = Vec::with_capacity_in(ids.len(), alloc);
+        for slot in self.slots.iter_mut() {
+            if ids.contains(&slot.ask.id) {
+                batch.push(super::origin::BatchRead {
+                    id: slot.ask.id,
+                    object: slot.ask.object,
+                    at: slot.ask.at,
+                    into: slot.buf.as_mut_slice(),
+                    deadline_ns: slot.ask.deadline_ns,
+                });
+            }
+        }
+        // Preserve `ids` order deterministically (matching `outcomes` indexing in `origin::fetch`).
+        batch.sort_by_key(|item| ids.iter().position(|&id| id == item.id).unwrap_or(usize::MAX));
+        f(batch.as_mut_slice())
+    }
+
     /// Steps the batch at `now`: expires asks past their deadline, moves to the next wave when
     /// this one is answered, and puts the asks to make into `out`.
     pub fn poll(&mut self, now: u64, out: &mut Vec<Ask, Alloc<'_>>) -> Poll {

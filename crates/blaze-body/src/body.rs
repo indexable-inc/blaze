@@ -18,8 +18,9 @@ pub use blaze_typeck::{ExprId, ItemKey, List, Mutbl, PTy, PatId};
 use blaze_typeck::{PNode, PTys};
 
 use crate::code::{
-    BlockWords, CalleeWords, CaseWords, ConstWords, LoanWords, LocalWords, OperandWords, PairWords,
-    PlaceWords, StmtWords, SubsetWords, TyWords, decode_block, decode_callee, decode_case, decode_const,
+    AsmOpWords, AsmPieceWords, AsmWords, BlockWords, CalleeWords, CaseWords, ConstWords, LoanWords,
+    LocalWords, OperandWords, PairWords, PlaceWords, StmtWords, SubsetWords, TyWords, decode_asm,
+    decode_asm_op, decode_asm_piece, decode_block, decode_callee, decode_case, decode_const,
     decode_loan, decode_local, decode_operand, decode_place, decode_stmt, decode_ty,
 };
 
@@ -432,6 +433,8 @@ pub enum StmtKind {
     /// Terminator: an `.await`'s suspension: polled again, go on at `resume`; dropped while
     /// parked here, go to `cancel` (coroutines.md D2).
     Suspend { resume: Block, cancel: Block },
+    /// Terminator: end of a coroutine cancel path after dropping all live values while suspended.
+    Cancelled,
     /// Terminator: return `_0` to the caller.
     Return,
     /// Terminator: this point is never reached.
@@ -443,6 +446,76 @@ pub enum StmtKind {
     /// Terminator: an `asm!` (its ordinal among the body's `asm!`s) with operands; then
     /// `target`, or none when it is `noreturn`.
     InlineAsm { asm: u32, operands: Ops, target: Option<Block>, unwind: Unwind },
+    /// Terminator: explicit tail call (`become <call_expr>`, RFC 3407) after all local scopes
+    /// have already been dropped.
+    TailCall { callee: CalleeId, args: Ops },
+}
+
+/// Target architecture of an inline `asm!` block.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AsmArch {
+    Aarch64,
+    X86_64,
+}
+
+/// Kind of one `asm!` operand.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AsmOpKind {
+    In,
+    Out,
+    LateOut,
+    InOut,
+    InLateOut,
+    Sym,
+    Const,
+    Label,
+}
+
+/// How an `asm!` operand specifies its register.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AsmRegKind {
+    None,
+    Class,
+    Explicit,
+}
+
+/// One piece of an `asm!` template string.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AsmPiece {
+    /// UTF-8 slice `data[start..start + len]`.
+    Text { start: u32, len: u32 },
+    /// Line separator (`\n` between template strings).
+    Line,
+    /// Placeholder referring to source operand `index` with optional template modifier.
+    Operand { index: u32, modifier: Option<char> },
+}
+
+/// One source operand row of an `asm!` block.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AsmOpRow {
+    pub kind: AsmOpKind,
+    pub reg_kind: AsmRegKind,
+    pub reg_start: u32,
+    pub reg_len: u32,
+    /// Offset within `StmtKind::InlineAsm::operands` for the input / `const` / `sym` operand.
+    pub in_op: Option<u32>,
+    /// Output place for `Out`/`LateOut`/`InOut`/`InLateOut` when not discarded (`_`).
+    pub out_place: Option<Place>,
+    /// Target block for `Label` operands.
+    pub label: Option<Block>,
+    /// True when the output is discarded (`out(reg) _` or `inout(reg) x => _`).
+    pub discard_out: bool,
+}
+
+/// Metadata for one `asm!` block in a body.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AsmRow {
+    pub pieces: Ops,
+    pub ops: Ops,
+    pub clobbers_start: u32,
+    pub clobbers_len: u32,
+    pub options: u16,
+    pub arch: AsmArch,
 }
 
 impl StmtKind {
@@ -532,6 +605,12 @@ pub enum Table {
     Types,
     /// The entries of the body's own type lists, numbered after the record's.
     TyLists,
+    /// Inline assembly blocks.
+    Asms,
+    /// Template pieces of inline assembly blocks.
+    AsmPieces,
+    /// Operand descriptors of inline assembly blocks.
+    AsmOps,
 }
 
 /// A row that is past its table or is no form of it: named by table, row and the code (the
@@ -578,6 +657,12 @@ pub struct Body<A: Allocator> {
     pub(crate) tys: Vec<TyWords, A>,
     /// The overlay's list entries (type handles), the lists its types name.
     pub(crate) ty_lists: Vec<u32, A>,
+    /// Inline assembly block descriptors, indexed by `StmtKind::InlineAsm::asm`.
+    pub(crate) asms: Vec<AsmWords, A>,
+    /// Template pieces of all `asm!` blocks in the body.
+    pub(crate) asm_pieces: Vec<AsmPieceWords, A>,
+    /// Operand descriptors of all `asm!` blocks in the body.
+    pub(crate) asm_ops: Vec<AsmOpWords, A>,
     /// The record table this body's type handles index, as [`crate::kept::TableId::of`]
     /// names it: set by [`crate::BodyBuilder::new_with_types_in`], `None` for a body built
     /// or parsed without one. Not part of the body record's bytes (record.rs): the kept
@@ -616,6 +701,9 @@ impl<A: Allocator> Body<A> {
             list_base: self.list_base,
             tys: &self.tys,
             ty_lists: &self.ty_lists,
+            asms: &self.asms,
+            asm_pieces: &self.asm_pieces,
+            asm_ops: &self.asm_ops,
         }
     }
 }
@@ -644,6 +732,9 @@ pub struct BodyRef<'b> {
     pub(crate) list_base: u32,
     pub(crate) tys: &'b [TyWords],
     pub(crate) ty_lists: &'b [u32],
+    pub(crate) asms: &'b [AsmWords],
+    pub(crate) asm_pieces: &'b [AsmPieceWords],
+    pub(crate) asm_ops: &'b [AsmOpWords],
 }
 
 /// Why a type handle or list does not resolve against a record's table and the body's overlay.
@@ -935,6 +1026,38 @@ impl<'b> BodyRef<'b> {
         }
     }
 
+    /// How many inline assembly blocks.
+    pub fn asms(&self) -> u32 {
+        count(self.asms.len())
+    }
+
+    /// Descriptor of inline assembly block `i`.
+    pub fn asm(&self, i: u32) -> Result<AsmRow, BadRow> {
+        let w = row(Table::Asms, self.asms, i)?;
+        decode_asm(w).ok_or(BadRow { table: Table::Asms, row: i, code: u32::from(w.arch) })
+    }
+
+    /// Template piece `i`.
+    pub fn asm_piece(&self, i: u32) -> Result<AsmPiece, BadRow> {
+        let w = row(Table::AsmPieces, self.asm_pieces, i)?;
+        decode_asm_piece(w).ok_or(BadRow { table: Table::AsmPieces, row: i, code: w.kind })
+    }
+
+    /// Operand descriptor `i`.
+    pub fn asm_op(&self, i: u32) -> Result<AsmOpRow, BadRow> {
+        let w = row(Table::AsmOps, self.asm_ops, i)?;
+        decode_asm_op(w).ok_or(BadRow { table: Table::AsmOps, row: i, code: u32::from(w.kind) })
+    }
+
+    /// UTF-8 slice `data[start..start + len]` for an `asm!` text/register/clobber field.
+    pub fn asm_str(&self, start: u32, len: u32) -> Result<&'b str, BadRow> {
+        let s = usize::try_from(start).map_err(|_| BadRow { table: Table::Data, row: start, code: len })?;
+        let l = usize::try_from(len).map_err(|_| BadRow { table: Table::Data, row: start, code: len })?;
+        let end = s.checked_add(l).ok_or(BadRow { table: Table::Data, row: start, code: len })?;
+        let bytes = self.data.get(s..end).ok_or(BadRow { table: Table::Data, row: start, code: len })?;
+        core::str::from_utf8(bytes).map_err(|_| BadRow { table: Table::Data, row: start, code: len })
+    }
+
     /// Calls `f` on each block edge out of a terminator, with how it is taken; nothing for a
     /// statement (it falls through to the next row).
     pub fn for_each_edge(&self, kind: &StmtKind, mut f: impl FnMut(Block, Edge)) -> Result<(), BadRow> {
@@ -951,9 +1074,23 @@ impl<'b> BodyRef<'b> {
                 }
                 f(otherwise, Edge::Normal);
             }
-            StmtKind::Call { target, unwind: u, .. } | StmtKind::InlineAsm { target, unwind: u, .. } => {
+            StmtKind::Call { target, unwind: u, .. } => {
                 if let Some(t) = target {
                     f(t, Edge::Normal);
+                }
+                unwind(u, &mut f);
+            }
+            StmtKind::InlineAsm { asm, target, unwind: u, .. } => {
+                if let Some(t) = target {
+                    f(t, Edge::Normal);
+                }
+                if asm < self.asms() {
+                    let row = self.asm(asm)?;
+                    for i in row.ops.start..row.ops.end {
+                        if let Some(lbl) = self.asm_op(i)?.label {
+                            f(lbl, Edge::Normal);
+                        }
+                    }
                 }
                 unwind(u, &mut f);
             }
@@ -966,6 +1103,8 @@ impl<'b> BodyRef<'b> {
                 f(cancel, Edge::Normal);
             }
             StmtKind::Return
+            | StmtKind::Cancelled
+            | StmtKind::TailCall { .. }
             | StmtKind::Unreachable
             | StmtKind::Resume
             | StmtKind::Terminate

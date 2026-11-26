@@ -69,6 +69,7 @@ pub fn eval_body<'w, 'a, W: BodyWorld, L: Layout>(
         live_bits: Vec::new_in(alloc),
         inst_tys: Vec::new_in(alloc),
         cached_tys: Vec::new_in(alloc),
+        min_align: Vec::new_in(alloc),
         limits,
         steps: 0,
         alloc,
@@ -428,6 +429,9 @@ pub(crate) struct Machine<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> {
     /// Cached per-instance grounded local types: `(body_id, args, start, len)` indexing `cached_tys`.
     inst_tys: Vec<(BodyId, List, u32, u32), Alloc<'a>>,
     cached_tys: Vec<PTy, Alloc<'a>>,
+    /// Inherited minimum log2 alignments for allocations written whole from a higher-aligned
+    /// base place (e.g. promoted `&ALIGNED_BYTES.bytes` inheriting the base struct's alignment).
+    min_align: Vec<(AllocId, u8), Alloc<'a>>,
     pub(crate) limits: Limits,
     pub(crate) steps: u64,
     pub(crate) alloc: Alloc<'a>,
@@ -511,10 +515,49 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         Ok(self.mem.write(p, size, v)?)
     }
 
+    /// Effective log2 alignment of `id`: its own allocation alignment, or a higher alignment
+    /// inherited from a base-struct field copy (e.g. promoted `&ALIGNED_BYTES.bytes`).
+    pub(crate) fn effective_align_log2(&self, id: AllocId) -> R<'a, u8> {
+        let base = self.mem.get(id)?.align_log2;
+        let extra = self.min_align.iter().find(|&&(a, _)| a == id).map_or(0, |&(_, al)| al);
+        Ok(base.max(extra))
+    }
+
+    /// Guaranteed log2 byte alignment of `ptr` within its allocation: the allocation's effective
+    /// alignment when `ptr.offset == 0`, otherwise capped by the lowest set bit of `ptr.offset`.
+    pub(crate) fn place_align_log2(&self, ptr: Pointer) -> R<'a, u8> {
+        let src = self.effective_align_log2(ptr.alloc)?;
+        Ok(if ptr.offset == 0 {
+            src
+        } else {
+            src.min(u8::try_from(ptr.offset.trailing_zeros()).unwrap_or(u8::MAX))
+        })
+    }
+
+    /// Preserves `src`'s base-place alignment on `dst` when a whole allocation is overwritten
+    /// at offset 0.
+    fn inherit_align(&mut self, src: Pointer, dst: Pointer, size: u64) -> R<'a, ()> {
+        if dst.offset != 0 || size != self.alloc_len(dst.alloc)? {
+            return Ok(());
+        }
+        let align = self.place_align_log2(src)?;
+        let base = self.mem.get(dst.alloc)?.align_log2;
+        if align <= base {
+            return Ok(());
+        }
+        if let Some((_, cur)) = self.min_align.iter_mut().find(|(a, _)| *a == dst.alloc) {
+            *cur = (*cur).max(align);
+        } else {
+            self.min_align.push((dst.alloc, align));
+        }
+        Ok(())
+    }
+
     pub(crate) fn mem_copy(&mut self, src: Pointer, dst: Pointer, size: u64) -> R<'a, ()> {
         self.ensure_loaded(src.alloc)?;
         self.ensure_loaded(dst.alloc)?;
-        Ok(self.mem.copy(src, dst, size)?)
+        self.mem.copy(src, dst, size)?;
+        self.inherit_align(src, dst, size)
     }
 
     pub(crate) fn mem_deinit(&mut self, p: Pointer, size: u64) -> R<'a, ()> {
@@ -580,11 +623,14 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 self.jump(target)?;
             }
             StmtKind::Return => return self.ret(),
+            StmtKind::TailCall { callee, args } => return self.tail_call(callee, args),
             // Undefined behaviour reached (the Reference, "Behavior considered undefined").
             StmtKind::Unreachable => return Err(Refusal::Unreachable.into()),
             StmtKind::Resume => return Err(malformed("`resume` reached: the evaluator follows no unwind edge").into()),
             StmtKind::Terminate => return Err(Stop::Fault(Fault::Abort)),
-            StmtKind::Suspend { .. } => return Err(unsupported("a suspension (a coroutine's) in a constant").into()),
+            StmtKind::Suspend { .. } | StmtKind::Cancelled => {
+                return Err(unsupported("a suspension (a coroutine's) in a constant").into());
+            }
             StmtKind::InlineAsm { .. } => return Err(unsupported("inline assembly in a constant").into()),
         }
         Ok(None)
@@ -848,6 +894,70 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         }
     }
 
+    fn tail_call(&mut self, callee: CalleeId, args: Ops) -> R<'a, Option<DataRecord<Alloc<'a>>>> {
+        let body = self.top()?.body;
+        let ret = self.top()?.ret;
+        let (key, gargs) = match body.callee(callee) {
+            Callee::FnItem { key, args } | Callee::Method { key, args } | Callee::Intrinsic { key, args } => {
+                (key, self.ground_list(args)?)
+            }
+            Callee::Value(op) => self.callee_of_value(op)?,
+        };
+        let (item, iargs) = self.resolve(key, gargs)?;
+        match self.world.fn_kind(item) {
+            FnKind::Const => {
+                let f = self.frame(item, iargs, ret)?;
+                let mut k = 1usize;
+                for op in body.ops(args) {
+                    let Some(id) = f.locals.get(k).copied().flatten() else {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(malformed("a tail call with more arguments than its callee takes").into());
+                    };
+                    if let Err(e) = self.operand_into(op, Pointer { alloc: id, offset: 0 }) {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(e);
+                    }
+                    k += 1;
+                }
+                if k != usize::try_from(f.body.args()).unwrap_or(0) + 1 {
+                    for lid in f.locals.iter().flatten() {
+                        self.mem.kill(*lid);
+                    }
+                    return Err(malformed("a tail call with fewer arguments than its callee takes").into());
+                }
+                if let Some(old) = self.frames.pop() {
+                    for lid in old.locals.iter().flatten() {
+                        self.mem.kill(*lid);
+                    }
+                }
+                self.frames.push(f);
+                Ok(None)
+            }
+            FnKind::NotConst => Err(Refusal::NotConstFn { item }.into()),
+            FnKind::UnknownIntrinsic => Err(Refusal::UnknownIntrinsic { item }.into()),
+            FnKind::Missing(fact) => Err(Refusal::FnFact { item, fact }.into()),
+            FnKind::Ctor { variant, .. } => {
+                let d = self.place(body.local_place(Local(0)))?;
+                self.fields(d.ptr, d.ty, variant, body.ops(args))?;
+                self.set_tag(d.ptr, d.ty, variant)?;
+                self.ret()
+            }
+            FnKind::Panic => Err(Refusal::Panic { parts: Vec::new_in(self.alloc) }.into()),
+            FnKind::Intrinsic(Intrinsic::ConstEvalSelect) => {
+                Err(unsupported("`become const_eval_select` in a constant").into())
+            }
+            FnKind::Intrinsic(i) => {
+                let d = self.place(body.local_place(Local(0)))?;
+                self.intrinsic(i, iargs, args, Some(d))?;
+                self.ret()
+            }
+        }
+    }
+
     fn call_const_eval_select(&mut self, args: Ops, d: Option<Pl>, target: Option<Block>) -> R<'a, ()> {
         let body = self.top()?.body;
         let mut ops = body.ops(args);
@@ -942,7 +1052,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     /// Freezes a sub-body's `_0` allocation into an immutable `Origin::Data` allocation, zeroing
     /// unwritten padding and verifying that no pointer dangles into a dead local of `f`.
     fn freeze_sub_result(&mut self, r0: AllocId) -> R<'a, AllocId> {
-        let align = self.mem.get(r0)?.align_log2;
+        let align = self.effective_align_log2(r0)?;
         let mut bytes: Vec<u8, Alloc<'a>> = Vec::new_in(self.alloc);
         bytes.extend_from_slice(self.mem.bytes(r0)?);
         self.mem.zero_unwritten(r0, &mut bytes);
@@ -965,7 +1075,9 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let f = self.frames.pop().ok_or(Stop::from(malformed("a return with no frame")))?;
         let r0 = f.locals.first().copied().flatten().ok_or(Stop::from(Refusal::Dangling))?;
         if self.frames.is_empty() {
-            return Ok(Some(self.intern(r0)?));
+            let ty0 = self.local_ty(&f, 0)?;
+            let is_static = self.world.is_static(f.item);
+            return Ok(Some(self.intern(r0, ty0, is_static)?));
         }
         match f.ret {
             Ret::Call { dest, target } => {
@@ -1541,6 +1653,9 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 let s = self.read(o)?;
                 let size = self.size(o.ty)?;
                 self.mem_write(dst, size, s)?;
+                if let Src::At(src) = o.src {
+                    self.inherit_align(src, dst, size)?;
+                }
                 return Ok(());
             }
             let size = self.size(o.ty)?;
@@ -2248,9 +2363,11 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     // ---- The value ----
 
     /// The root's `_0` and every allocation it reaches, as a data record: allocation 0 is the
-    /// value. A pointer into a local's storage (other than the value's own) dangles once the
-    /// constant is evaluated, and is refused.
-    fn intern(&mut self, root: AllocId) -> R<'a, DataRecord<Alloc<'a>>> {
+    /// value. A pointer into a dead allocation (such as a scoped local whose storage ended or a
+    /// callee's frame) dangles once the constant is evaluated, and is refused; a live unscoped
+    /// local of the root constant body (such as a promoted borrow inside a constant initializer)
+    /// is interned alongside the root value.
+    fn intern(&mut self, root: AllocId, root_ty: PTy, is_static: bool) -> R<'a, DataRecord<Alloc<'a>>> {
         let mut order: Vec<AllocId, Alloc<'a>> = Vec::new_in(self.alloc);
         order.push(root);
         // blaze-build's data form holds the standard vector (data.rs), so the record is built in
@@ -2259,18 +2376,19 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let mut k = 0;
         while let Some(&id) = order.get(k) {
             k += 1;
-            let align = self.mem.get(id)?.align_log2;
+            let align = self.effective_align_log2(id)?;
             let mut bytes: alloc::vec::Vec<u8, Alloc<'a>> = alloc::vec::Vec::new_in(self.alloc);
             bytes.extend_from_slice(self.mem.bytes(id)?);
             self.mem.zero_unwritten(id, &mut bytes);
             let mut relocs: alloc::vec::Vec<DataReloc, Alloc<'a>> = alloc::vec::Vec::new_in(self.alloc);
             for &(offset, to) in self.mem.relocs(id)? {
-                let target = match self.mem.get(to)?.origin {
+                let target_alloc = self.mem.get(to)?;
+                let target = match target_alloc.origin {
                     Origin::Static(s) => DataTarget::Static(s),
                     Origin::Fn(i) => DataTarget::Fn(i),
                     Origin::Vtable(v) => DataTarget::Vtable(v),
-                    Origin::Local if to != root => return Err(Refusal::Dangling.into()),
-                    _ => {
+                    Origin::Data | Origin::Local => {
+                        let _ = self.mem.bytes(to)?;
                         let n = match order.iter().position(|&x| x == to) {
                             Some(n) => n,
                             None => {
@@ -2286,7 +2404,178 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             }
             allocs.push(DataAlloc { bytes, align, mutable: false, relocs });
         }
+        if is_static {
+            let written = self.written_in_place(&allocs, root_ty)?;
+            for (a, &w) in allocs.iter_mut().zip(written.iter()) {
+                a.mutable = w;
+            }
+        }
         Ok(DataRecord { allocs })
+    }
+
+    /// Which allocations of a static's record, of type `t`, are written in place (matching
+    /// `blaze-consteval`'s `Machine::written_in_place`): non-`Freeze` statics (`UnsafeCell`),
+    /// pointees behind `&mut`/`*mut`, pointees whose type is not `Freeze` (`&AtomicU8`), and
+    /// allocations reached only through untyped/unsized indirections (trait objects, unsized
+    /// structs, closures).
+    fn written_in_place(&mut self, allocs: &[DataAlloc<Alloc<'a>>], t: PTy) -> R<'a, Vec<bool, Alloc<'a>>> {
+        /// The most parts one walk visits (rule 18).
+        const MOST_PARTS: usize = 1 << 20;
+        let n = allocs.len();
+        let mut written: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
+        let mut typed: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
+        for _ in 0..n {
+            written.push(false);
+            typed.push(false);
+        }
+        if n == 0 {
+            return Ok(written);
+        }
+        let root_mut = self.interior_mut(t)?;
+        if let Some(slot) = written.get_mut(0) {
+            *slot = root_mut;
+        }
+        if let Some(slot) = typed.get_mut(0) {
+            *slot = true;
+        }
+        let mut todo: Vec<(u32, u64, PTy), Alloc<'a>> = Vec::new_in(self.alloc);
+        todo.push((0, 0, t));
+        let mut parts = 0usize;
+        let too_many = || Stop::from(unsupported("a static whose value has more than 2^20 parts holding pointers to walk"));
+        while let Some((i, base, ty)) = todo.pop() {
+            parts += 1;
+            if parts > MOST_PARTS || todo.len() > MOST_PARTS {
+                return Err(too_many());
+            }
+            let iu = usize::try_from(i).map_err(|_| malformed("a relocation to an allocation past the record"))?;
+            let a = allocs.get(iu).ok_or(Stop::from(malformed("a relocation to an allocation past the record")))?;
+            let end = base.saturating_add(self.size_align(ty)?.0);
+            if !a.relocs.iter().any(|r| (base..end).contains(&u64::from(r.offset))) {
+                continue;
+            }
+            match self.node(ty)? {
+                PNode::Ref(m, p) | PNode::Ptr(m, p) => {
+                    let Some(r) = a.relocs.iter().find(|r| u64::from(r.offset) == base) else { continue };
+                    let DataTarget::Local(j) = r.target else { continue };
+                    let ju = usize::try_from(j).map_err(|_| malformed("a relocation to an allocation past the record"))?;
+                    let target = allocs.get(ju).ok_or(Stop::from(malformed("a relocation to an allocation past the record")))?;
+                    let addend = data_word(&a.bytes, base)?;
+                    if let Some(slot) = typed.get_mut(ju) {
+                        *slot = true;
+                    }
+                    let mut mark = m == Mutbl::Mut;
+                    match self.node(p)? {
+                        PNode::Str => {}
+                        PNode::Slice(e) => {
+                            mark |= self.interior_mut(e)?;
+                            let len = data_word(&a.bytes, base + PTR)?;
+                            let es = self.size_align(e)?.0;
+                            let to = addend.saturating_add(len.saturating_mul(es));
+                            if es != 0 && target.relocs.iter().any(|r| (addend..to).contains(&u64::from(r.offset))) {
+                                if len > u64::try_from(MOST_PARTS).unwrap_or(u64::MAX) {
+                                    return Err(too_many());
+                                }
+                                for k in 0..len {
+                                    todo.push((j, addend + k * es, e));
+                                }
+                            }
+                        }
+                        PNode::Dynamic(_) => mark = true,
+                        _ if self.is_unsized(p)? => mark = true,
+                        _ => {
+                            mark |= self.interior_mut(p)?;
+                            todo.push((j, addend, p));
+                        }
+                    }
+                    if let Some(slot) = written.get_mut(ju) {
+                        *slot |= mark;
+                    }
+                }
+                PNode::Tuple(l) | PNode::Record(_, l) => {
+                    for f in 0..l.len {
+                        let off = self.field_offset(ty, 0, f)?;
+                        let ft = self.field_ty(ty, 0, f)?;
+                        todo.push((i, base + off, ft));
+                    }
+                }
+                PNode::Union(l) => {
+                    let variants = l.len;
+                    let tag = self.tag_of(ty)?;
+                    let live = match tag.at {
+                        None if variants == 0 => 0..0,
+                        None => {
+                            let index = tag.variant(0, &[])?;
+                            index..index + 1
+                        }
+                        Some(_) => 0..variants,
+                    };
+                    for v in live {
+                        let off = self.field_offset(ty, v, 0)?;
+                        let ft = self.field_ty(ty, v, 0)?;
+                        todo.push((i, base + off, ft));
+                    }
+                }
+                PNode::Array(e, _) => {
+                    let es = self.size_align(e)?.0;
+                    if es != 0 {
+                        let count = (end - base) / es;
+                        if count > u64::try_from(MOST_PARTS).unwrap_or(u64::MAX) {
+                            return Err(too_many());
+                        }
+                        for k in 0..count {
+                            todo.push((i, base + k * es, e));
+                        }
+                    }
+                }
+                PNode::Adt(key, _) => {
+                    let adt = self
+                        .world
+                        .adt(key)
+                        .ok_or(Stop::from(Refusal::Missing { what: "ADT definition", item: key }))?;
+                    let variants = u32::try_from(adt.variants.len()).map_err(|_| malformed("an ADT variant count past u32"))?;
+                    let tag = self.tag_of(ty)?;
+                    let live = match tag.at {
+                        None => {
+                            let index = tag.variant(0, &[])?;
+                            index..index + 1
+                        }
+                        Some(_) => 0..variants,
+                    };
+                    for v in live {
+                        let v_idx = usize::try_from(v).map_err(|_| malformed("a variant past its ADT"))?;
+                        let v_fields = self
+                            .world
+                            .adt(key)
+                            .and_then(|a| a.variants.get(v_idx))
+                            .map(|var| var.fields.len)
+                            .ok_or(Stop::from(malformed("a variant past its ADT")))?;
+                        for f in 0..v_fields {
+                            let off = self.field_offset(ty, v, f)?;
+                            let ft = self.field_ty(ty, v, f)?;
+                            todo.push((i, base + off, ft));
+                        }
+                    }
+                }
+                PNode::Pat(e, _) => todo.push((i, base, e)),
+                // A closure's environment, a coroutine: any allocation they point to stays untyped
+                // and is marked writable below.
+                _ => {}
+            }
+        }
+        for (w, &t) in written.iter_mut().zip(typed.iter()).skip(1) {
+            *w |= !t;
+        }
+        Ok(written)
+    }
+
+    fn interior_mut(&mut self, ty: PTy) -> R<'a, bool> {
+        let mut cx = LayoutCx { ground: &mut *self.ground, facts: self.world, scratch: self.alloc };
+        self.layout.interior_mut(ty, &mut cx).map_err(layout_stop)
+    }
+
+    fn tag_of(&mut self, ty: PTy) -> R<'a, Tag> {
+        let mut cx = LayoutCx { ground: &mut *self.ground, facts: self.world, scratch: self.alloc };
+        self.layout.tag(ty, &mut cx).map_err(layout_stop)
     }
 
     // ---- Types and layouts ----
@@ -2404,6 +2693,15 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let mut cx = LayoutCx { ground: &mut *self.ground, facts: self.world, scratch: self.alloc };
         self.layout.field_offset(ty, variant, field, &mut cx).map_err(layout_stop)
     }
+}
+
+/// The little-endian word at `at` of `bytes` (a relocation's addend, a slice's length).
+fn data_word<'a>(bytes: &[u8], at: u64) -> R<'a, u64> {
+    let at = usize::try_from(at).map_err(|_| malformed("a word past its allocation"))?;
+    let end = at.checked_add(8).ok_or(Stop::from(malformed("a word past its allocation")))?;
+    let w = bytes.get(at..end).ok_or(Stop::from(malformed("a word past its allocation")))?;
+    let arr: [u8; 8] = w.try_into().map_err(|_| malformed("a word past its allocation"))?;
+    Ok(u64::from_le_bytes(arr))
 }
 
 /// Whether `op`, a comparison, holds for `ord` (`None`: unordered, a NaN); `None` for an

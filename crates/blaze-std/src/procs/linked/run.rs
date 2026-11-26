@@ -68,6 +68,45 @@ pub struct RunSpec<'a> {
     pub parent_death: ParentDeath,
 }
 
+/// Descriptor inherited by `blaze-launcher` on Linux for the launcher-owned unwind channel
+/// (never exposed as a filesystem path; set `FD_CLOEXEC` by the launcher before guest code runs).
+#[cfg(target_os = "linux")]
+pub const UNWOUND_FD: u32 = 4;
+
+/// The Linux test sandbox configuration ([`Spawner::start_served_test`]; test.md, piece 9):
+/// the test's own `$TMPDIR` (the sole writable subtree beside `/dev/null`) and whether to attach
+/// a launcher-owned unwind channel on [`UNWOUND_FD`] (for harnessed tests).
+#[cfg(target_os = "linux")]
+pub struct TestSandbox<'a> {
+    pub temp: &'a str,
+    pub unwound_channel: bool,
+}
+
+/// Parent end of the launcher-owned unwind channel (`UNWOUND_FD`), checked after a harnessed
+/// test exits with status 101 to distinguish an uncaught Rust panic unwind from `exit(101)`.
+#[cfg(target_os = "linux")]
+pub struct UnwoundChannel {
+    channel: Channel,
+}
+
+#[cfg(target_os = "linux")]
+impl UnwoundChannel {
+    /// Returns `true` iff the launcher wrote the unwind sentinel (`b"1"`) before exiting.
+    pub fn did_unwind<A: Allocator>(&mut self, alloc: A) -> bool {
+        struct ZeroClock;
+        impl blaze_core::wait::Clock for ZeroClock {
+            fn now(&self) -> Duration {
+                Duration::ZERO
+            }
+        }
+        let mut buf: Vec<u8, A> = Vec::new_in(alloc);
+        matches!(
+            self.channel.recv_message(&mut buf, 16, Deadline::PASSED, &ZeroClock),
+            Ok(Message::Whole { .. }) if buf.get(PREFIX..) == Some(b"1")
+        )
+    }
+}
+
 /// What to start detached in a new session ([`Spawner::start_detached`]): the program, its
 /// arguments, its whole environment (nothing of this process's is inherited), and its directory.
 /// Standard streams are `/dev/null` and every other descriptor is closed on exec, so the parent
@@ -304,6 +343,47 @@ impl Spawner {
         // exit closes the channel for this end's reads.
         drop(child_end);
         Ok(Started { child: Served { run, channel: parent }, pipes })
+    }
+
+    /// `spec` started with its channel as [`CHILD_FD`] for a Linux sandboxed test.
+    ///
+    /// When `sandbox.unwound_channel` is true, also inherits a launcher-owned unwind channel on
+    /// [`UNWOUND_FD`] and returns its parent end. The launcher itself enters the Linux test
+    /// sandbox (`blaze_sys::linux::confine::enter_test_sandbox`: user/net/ipc/mount namespaces,
+    /// read-only root with writable `$TMPDIR`, capability drop, `RLIMIT_CORE=0`, Landlock ABI >= 6,
+    /// and seccomp) while single-threaded before starting its control thread or loading guest code
+    /// (`test.md`, piece 9). Refused steps fail closed; the test never runs unsandboxed (rule 9).
+    #[cfg(target_os = "linux")]
+    pub fn start_served_test(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        sandbox: &TestSandbox<'_>,
+    ) -> Result<(Started<Served>, Option<UnwoundChannel>), RunError> {
+        let _ = sandbox.temp;
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
+        let unwound_pair = if sandbox.unwound_channel {
+            Some(channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?)
+        } else {
+            None
+        };
+        let Started { child: run, pipes } = match &unwound_pair {
+            Some((_, unwound_child)) => {
+                let given = [(child_end.fd(), CHILD_FD), (unwound_child.fd(), UNWOUND_FD)];
+                self.start_with(cx, spec, &given, None)?
+            }
+            None => {
+                let given = [(child_end.fd(), CHILD_FD)];
+                self.start_with(cx, spec, &given, None)?
+            }
+        };
+        drop(child_end);
+        let unwound = unwound_pair.map(|(u_parent, u_child)| {
+            drop(u_child);
+            UnwoundChannel { channel: u_parent }
+        });
+        Ok((Started { child: Served { run, channel: parent }, pipes }, unwound))
     }
 
     fn start_with(

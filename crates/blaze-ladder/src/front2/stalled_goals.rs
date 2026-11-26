@@ -128,7 +128,7 @@ impl<'a> AsyncInteriors<'a> {
             return;
         }
         for (i, x) in view.exprs.iter().enumerate() {
-            if !matches!(x, tc::Expr::AsyncBlock { .. }) {
+            if !matches!(x, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. }) {
                 continue;
             }
             let block = tc::ExprId(i as u32);

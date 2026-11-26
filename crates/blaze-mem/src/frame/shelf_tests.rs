@@ -15,11 +15,11 @@ fn a_shelf_is_sized_by_its_machine() {
     assert_eq!(ShelfSize::for_threads(1), ShelfSize::MOST);
     assert_eq!(ShelfSize::for_threads(8), ShelfSize::MOST, "the 8-thread figure is today's");
     let wide = ShelfSize::for_threads(128);
-    assert_eq!(wide, ShelfSize { chunks: 1, spans: 1 });
-    assert!(128 * wide.bytes() <= 512 << 20, "128 threads keep {} bytes warm at most", 128 * wide.bytes());
+    assert_eq!(wide, ShelfSize { chunks: 2, spans: 2 });
+    assert!(128 * wide.bytes() <= 1024 << 20, "128 threads keep {} bytes warm at most", 128 * wide.bytes());
     for threads in 1..=512 {
         let size = ShelfSize::for_threads(threads);
-        assert!(size.chunks >= 1 && size.spans >= 1 && size.chunks <= SHELF && size.spans <= SPANS);
+        assert!(size.chunks >= 2 && size.spans >= 2 && size.chunks <= SHELF && size.spans <= SPANS);
         assert!(ShelfSize::for_threads(threads + 1).bytes() <= size.bytes(), "more threads never keep more each");
         if (8..=64).contains(&threads) {
             assert!(threads * size.bytes() <= WARM_ALL, "{threads} threads share the machine's budget");
@@ -27,12 +27,12 @@ fn a_shelf_is_sized_by_its_machine() {
     }
 }
 
-/// A task of 64 allocations of 100 KiB, in chunks: about four chunks' worth, given back as it
+/// A task of 100 allocations of 100 KiB, in chunks: about six chunks' worth, given back as it
 /// ends; then what its thread keeps warm, trimmed after.
 fn busy_then_spare() -> usize {
     for _ in 0..2 {
         task(Tag::Codegen, |frame| {
-            for _ in 0..64 {
+            for _ in 0..100 {
                 frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
             }
         });
@@ -43,7 +43,7 @@ fn busy_then_spare() -> usize {
 }
 
 /// Sixteen threads stand for a 128-thread machine's: each sized as one of its workers keeps at
-/// most one chunk and one span warm, so the machine's idle frames are under 512 MiB. The cause,
+/// most two chunks and two spans warm, so the machine's idle frames are under 1 GiB. The cause,
 /// tested by removing it: a thread handed no size (today's shelf) keeps more than that bound
 /// after the same work, and one sized for eight threads keeps exactly what today's does.
 #[test]
@@ -62,7 +62,7 @@ fn a_128_thread_machine_keeps_its_idle_frames_under_its_bound() {
         .max()
         .unwrap_or(0);
     assert!(most <= wide.bytes(), "a 128-thread machine's worker keeps {most} bytes warm, past {}", wide.bytes());
-    assert!(128 * most <= 512 << 20);
+    assert!(128 * most <= 1024 << 20);
     let today = thread::spawn(busy_then_spare).join().expect("the control's thread");
     assert!(today > wide.bytes(), "the control: an unsized shelf keeps {today} bytes, no more than a sized one's {}", wide.bytes());
     assert!(today <= WARM);

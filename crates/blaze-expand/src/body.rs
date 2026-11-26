@@ -113,6 +113,21 @@ pub fn local_hygiene(stream: &TokenStream<'_>, mut ctx: Ctx, this: ContentId) ->
     }
 }
 
+/// If `ctx`'s innermost non-transparent mark is this expansion's own ([`MarkOf::This`]),
+/// returns the local hygiene of `ctx` with that mark stripped — the hygiene the token had at
+/// the macro's definition site (0 if none). Returns `None` for tokens that did not originate
+/// from this expansion's template (e.g. call-site input tokens, including those carrying an
+/// outer or item-level mark).
+pub(crate) fn template_parent_hygiene(stream: &TokenStream<'_>, mut ctx: Ctx, this: ContentId) -> Option<u64> {
+    while let Some(node) = stream.node(ctx) {
+        ctx = node.parent;
+        if node.mark.transparency != Transparency::Transparent {
+            return (node.mark.of == MarkOf::This).then(|| local_hygiene(stream, ctx, this));
+        }
+    }
+    None
+}
+
 /// One parser word of an expansion: its source text (a range of [`BodyWords::text`]), the
 /// stream's tokens it is (`token..end`: two for a lifetime, `'` and its name, else one), and
 /// its [`local_hygiene`] (a lifetime's is its name's).
@@ -123,6 +138,10 @@ pub struct BodyWord {
     /// One past the word's last token.
     pub end: u32,
     pub hygiene: u64,
+    /// If this word came from this expansion's template ([`template_parent_hygiene`]), the
+    /// local hygiene it carried before this expansion (`Some(0)` for an unmarked template
+    /// token, `Some(h)` for one produced by an outer expansion); `None` for an input token.
+    pub parent_hygiene: Option<u64>,
     /// The innermost mark of the word's token (a lifetime's: its name's), `None` for a token
     /// of the call as written: where a path starting at this word resolves (drive.md, "A token
     /// keeps its mark"; blaze-ladder front2 world_paths.rs `site_of`).
@@ -182,6 +201,7 @@ pub fn body_words<'a>(stream: &TokenStream<'_>, this: ContentId, alloc: Alloc<'a
                 token: crate::tokens::index(at),
                 end: crate::tokens::index(at + if quote { 2 } else { 1 }),
                 hygiene: local_hygiene(stream, ctx, this),
+                parent_hygiene: template_parent_hygiene(stream, ctx, this),
                 mark: stream.hygiene(ctx).mark.map(TextMark::of),
                 space_before: !glued,
             });

@@ -34,14 +34,14 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 use core::cmp::Ordering;
 
-use blaze_body::body::Mutbl;
+use blaze_body::body::{ExprId, Mutbl, NONE, Role};
 use blaze_body::{
-    BadRow, Block, BlockKind, Body, BodyBuilder, BuildError, CalleeId, Callee, Const, ConstDecl, ConstKind,
-    Local, LocalDecl, LocalKind, Operand, Ops, Origin, Place, Proj, Span, Stmt, StmtKind, Subset, Table,
-    Unwind, Value, Verified,
+    AsmOpInput, AsmPiece, AsmPieceInput, BadRow, Block, BlockKind, Body, BodyBuilder, BuildError,
+    Callee, CalleeId, Const, ConstDecl, ConstKind, Local, LocalDecl, LocalKind, Operand, Ops,
+    Origin, Place, Proj, Span, Stmt, StmtKind, Subset, Table, Unwind, Value, Verified,
 };
 
-use crate::facts::{DropFacts, DropState, Field, NeedsDrop, PartState};
+use crate::facts::{DropFacts, DropState, Field, NeedsDrop, Part, PartState};
 
 /// Why a body could not be elaborated, naming the row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,11 +93,13 @@ pub fn elaborate_planted<F: DropFacts, A: Allocator + Copy>(
         v: body,
         facts,
         plant,
+        alloc,
         b: BodyBuilder::new_in(alloc),
         flags: Vec::new_in(alloc),
         chains: Vec::new_in(alloc),
         plans: Vec::with_capacity_in(body.stmts() as usize, alloc),
         steps: Vec::new_in(alloc),
+        arms: Vec::new_in(alloc),
         pending: Vec::new_in(alloc),
         subsets: Vec::new_in(alloc),
         next_subset: 0,
@@ -134,6 +136,14 @@ struct Step {
     flag: Option<u32>,
 }
 
+/// One variant's drop chain for a partially-moved enum.
+#[derive(Clone, Copy)]
+struct VariantArm {
+    discr: u128,
+    start: u32,
+    end: u32,
+}
+
 /// What a statement row becomes.
 #[derive(Clone, Copy)]
 enum Plan {
@@ -144,6 +154,8 @@ enum Plan {
     Flag(u32),
     /// The steps `start..end`.
     Parts { start: u32, end: u32 },
+    /// Switch on `discr = Discriminant(place)` across `arms[start..end]`.
+    Enum { discr: Place, start: u32, end: u32 },
 }
 
 /// A block made by the pass, filled after the input block that made it.
@@ -151,10 +163,14 @@ enum Plan {
 enum Pending {
     /// A drop step (a chain's link or a ladder's rung).
     Drop { block: Block, place: Place, flag: Option<u32>, target: Block, unwind: Unwind, kind: BlockKind, span: Span },
+    /// A variant arm's drop chain (`steps[start..end]`).
+    Chain { block: Block, start: u32, end: u32, target: Block, unwind: Unwind, kind: BlockKind, span: Span },
     /// The guarded side of a flag test: clear the flag, drop.
     Guarded { block: Block, flag: u32, place: Place, target: Block, unwind: Unwind, span: Span },
     /// A call's return edge: the flags its destination covers, then the call's target.
     Return { block: Block, dest: Place, target: Block, span: Span },
+    /// An `asm!`'s fall-through edge: sets drop flags for any non-discarded output places, then jumps to `target`.
+    AsmReturn { block: Block, asm: u32, target: Block, span: Span },
     /// The end of a ladder that unwinds out of the body.
     Resume { block: Block, span: Span },
 }
@@ -163,12 +179,14 @@ struct Elab<'v, 'f, F: DropFacts, A: Allocator + Copy> {
     v: Verified<'v>,
     facts: &'f F,
     plant: Plant,
+    alloc: A,
     b: BodyBuilder<A>,
     flags: Vec<Flag, A>,
     chains: Vec<Place, A>,
     /// One per input statement.
     plans: Vec<Plan, A>,
     steps: Vec<Step, A>,
+    arms: Vec<VariantArm, A>,
     pending: Vec<Pending, A>,
     /// The input's subsets, in statement order, and the next one to copy.
     subsets: Vec<Subset, A>,
@@ -202,6 +220,7 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
     /// Every table but the statements, in the order the input's rows are: each id the same.
     fn copy_tables(&mut self) -> Result<(), ElabError> {
         let v = self.v;
+        self.b.copy_overlay(&v.body());
         let mut next_local = 0u32;
         for i in 0..v.places() {
             let row = v.place(Place(i));
@@ -250,6 +269,35 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
         for i in 0..v.blocks() {
             let got = self.b.new_block(v.block(Block(i)).kind);
             self.same(Table::Blocks, got.0, i)?;
+        }
+        let mut pieces: Vec<AsmPieceInput<'_>, A> = Vec::new_in(self.alloc);
+        let mut aops: Vec<AsmOpInput<'_>, A> = Vec::new_in(self.alloc);
+        for i in 0..v.asms() {
+            let row = v.asm(i);
+            pieces.clear();
+            for pi in row.pieces.start..row.pieces.end {
+                pieces.push(match v.asm_piece(pi) {
+                    AsmPiece::Text { start, len } => AsmPieceInput::Text(v.asm_str(start, len)),
+                    AsmPiece::Line => AsmPieceInput::Line,
+                    AsmPiece::Operand { index, modifier } => AsmPieceInput::Operand { index, modifier },
+                });
+            }
+            aops.clear();
+            for oi in row.ops.start..row.ops.end {
+                let op = v.asm_op(oi);
+                aops.push(AsmOpInput {
+                    kind: op.kind,
+                    reg_kind: op.reg_kind,
+                    reg: v.asm_str(op.reg_start, op.reg_len),
+                    in_op: op.in_op,
+                    out_place: op.out_place,
+                    label: op.label,
+                    discard_out: op.discard_out,
+                });
+            }
+            let clobbers = v.asm_str(row.clobbers_start, row.clobbers_len);
+            let got = self.b.new_asm(row.arch, row.options, clobbers, &pieces, &aops);
+            self.same(Table::Asms, got, i)?;
         }
         for s in v.subsets() {
             self.subsets.push(s);
@@ -311,12 +359,40 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
         if facts.needs_drop(ty) == NeedsDrop::No {
             return Ok(Plan::Remove);
         }
-        let parts = match facts.at(stmt) {
-            DropState::Uninit => return Ok(Plan::Remove),
-            DropState::Init => return Ok(Plan::Keep),
-            DropState::Maybe => return Ok(Plan::Flag(self.flag_for(place)?)),
-            DropState::Partial(parts) => parts,
-        };
+        match facts.at(stmt) {
+            DropState::Uninit => Ok(Plan::Remove),
+            DropState::Init => Ok(Plan::Keep),
+            DropState::Maybe => Ok(Plan::Flag(self.flag_for(place)?)),
+            DropState::Partial(parts) => {
+                let (start, end) = self.plan_parts(stmt, place, parts)?;
+                Ok(if start == end { Plan::Remove } else { Plan::Parts { start, end } })
+            }
+            DropState::Enum { discr_ty, variants } => {
+                let arm_start = u32::try_from(self.arms.len()).map_err(|_| ElabError::BadPart { stmt })?;
+                for vd in variants {
+                    if vd.parts.is_empty() {
+                        continue;
+                    }
+                    let vp = self.b.project(place, Proj::Downcast(vd.variant));
+                    let (start, end) = self.plan_parts(stmt, vp, vd.parts)?;
+                    if start < end {
+                        self.arms.push(VariantArm { discr: vd.discr, start, end });
+                    }
+                }
+                let arm_end = u32::try_from(self.arms.len()).map_err(|_| ElabError::BadPart { stmt })?;
+                if arm_start == arm_end {
+                    return Ok(Plan::Remove);
+                }
+                let decl = LocalDecl { ty: discr_ty, kind: LocalKind::Temp(ExprId(NONE), Role::Value), mutbl: Mutbl::Mut };
+                let discr_local = self.b.new_local(decl);
+                let discr = self.b.local_place(discr_local);
+                Ok(Plan::Enum { discr, start: arm_start, end: arm_end })
+            }
+        }
+    }
+
+    fn plan_parts(&mut self, stmt: Stmt, base: Place, parts: &[Part<'_>]) -> Result<(u32, u32), ElabError> {
+        let facts = self.facts;
         self.order.clear();
         for (i, part) in parts.iter().enumerate() {
             if part.path.is_empty() {
@@ -340,11 +416,11 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
                 return Err(ElabError::BadPart { stmt });
             }
         }
-        let start = self.steps.len() as u32;
+        let start = u32::try_from(self.steps.len()).map_err(|_| ElabError::BadPart { stmt })?;
         for k in 0..self.order.len() {
             let Some(&ord) = self.order.get(k) else { continue };
             let Some(&part) = parts.get(ord) else { return Err(ElabError::BadPart { stmt }) };
-            let mut p = place;
+            let mut p = base;
             for f in part.path {
                 p = self.b.project(p, Proj::Field { index: f.index, ty: f.ty });
             }
@@ -358,8 +434,8 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             };
             self.steps.push(Step { place: p, flag });
         }
-        let end = self.steps.len() as u32;
-        Ok(if start == end { Plan::Remove } else { Plan::Parts { start, end } })
+        let end = u32::try_from(self.steps.len()).map_err(|_| ElabError::BadPart { stmt })?;
+        Ok((start, end))
     }
 
     /// The drop flag of `place`, made the first time it is asked for.
@@ -464,7 +540,7 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
     fn moved_in_terminator(&mut self, kind: StmtKind, span: Span) {
         let v = self.v;
         match kind {
-            StmtKind::Call { callee, args, .. } => {
+            StmtKind::Call { callee, args, .. } | StmtKind::TailCall { callee, args } => {
                 if let Callee::Value(o) = v.callee(callee) {
                     self.moved(o, span);
                 }
@@ -527,7 +603,15 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
                 }
             }
         }
+        // Visit input blocks in statement-start order so loans and subsets (both recorded in
+        // original emission order) replay with identical IDs even when blocks were filled out of
+        // block-index order.
+        let mut block_order: Vec<u32, A> = Vec::with_capacity_in(usize::try_from(v.blocks()).unwrap_or(0), self.alloc);
         for bi in 0..v.blocks() {
+            block_order.push(bi);
+        }
+        block_order.sort_unstable_by_key(|&bi| v.block(Block(bi)).stmts.start);
+        for &bi in block_order.iter() {
             let block = Block(bi);
             let row = v.block(block);
             self.b.start(block);
@@ -616,7 +700,33 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             }
             StmtKind::InlineAsm { asm, operands, target, unwind } => {
                 let operands = self.reops(operands);
+                let target = match target {
+                    Some(t) if asm < v.asms() => {
+                        let row = v.asm(asm);
+                        let mut any_flag = false;
+                        for oi in row.ops.start..row.ops.end {
+                            if let Some(p) = v.asm_op(oi).out_place
+                                && self.any_under(p)
+                            {
+                                any_flag = true;
+                                break;
+                            }
+                        }
+                        if any_flag {
+                            let r = self.b.new_block(v.block(t).kind);
+                            self.pending.push(Pending::AsmReturn { block: r, asm, target: t, span });
+                            Some(r)
+                        } else {
+                            Some(t)
+                        }
+                    }
+                    other => other,
+                };
                 self.b.terminate(StmtKind::InlineAsm { asm, operands, target, unwind }, span);
+            }
+            StmtKind::TailCall { callee, args } => {
+                let args = self.reops(args);
+                self.b.terminate(StmtKind::TailCall { callee, args }, span);
             }
             other => {
                 self.b.terminate(other, span);
@@ -644,6 +754,31 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             Some(Plan::Parts { start, end }) => {
                 self.clear_under(place, Some((start, end)), None, span);
                 self.chain(start, end, target, unwind, kind, span);
+            }
+            Some(Plan::Enum { discr, start, end }) => {
+                let first_step = self.arms.get(usize::try_from(start).unwrap_or(0)).map_or(0, |a| a.start);
+                let last_step = self.arms.get(usize::try_from(end).unwrap_or(0).saturating_sub(1)).map_or(0, |a| a.end);
+                self.clear_under(place, Some((first_step, last_step)), None, span);
+                self.b.assign(discr, Value::Discriminant(place), span);
+                self.cases.clear();
+                for ai in start..end {
+                    let Some(arm) = self.arms.get(usize::try_from(ai).unwrap_or(usize::MAX)).copied() else {
+                        continue;
+                    };
+                    let arm_block = self.b.new_block(kind);
+                    self.cases.push((arm.discr, arm_block));
+                    self.pending.push(Pending::Chain {
+                        block: arm_block,
+                        start: arm.start,
+                        end: arm.end,
+                        target,
+                        unwind,
+                        kind,
+                        span,
+                    });
+                }
+                let cases = self.b.cases(&self.cases);
+                self.b.terminate(StmtKind::Switch { on: Operand::Copy(discr), cases, otherwise: target }, span);
             }
         }
         Ok(())
@@ -729,6 +864,10 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
                 self.b.start(block);
                 self.drop_one(place, flag, target, unwind, kind, span);
             }
+            Pending::Chain { block, start, end, target, unwind, kind, span } => {
+                self.b.start(block);
+                self.chain(start, end, target, unwind, kind, span);
+            }
             Pending::Guarded { block, flag, place, target, unwind, span } => {
                 self.b.start(block);
                 self.set(flag as usize, false, span);
@@ -737,6 +876,16 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             Pending::Return { block, dest, target, span } => {
                 self.b.start(block);
                 self.set_under(dest, span);
+                self.b.terminate(StmtKind::Goto(target), span);
+            }
+            Pending::AsmReturn { block, asm, target, span } => {
+                self.b.start(block);
+                let row = self.v.asm(asm);
+                for oi in row.ops.start..row.ops.end {
+                    if let Some(dest) = self.v.asm_op(oi).out_place {
+                        self.set_under(dest, span);
+                    }
+                }
                 self.b.terminate(StmtKind::Goto(target), span);
             }
             Pending::Resume { block, span } => {

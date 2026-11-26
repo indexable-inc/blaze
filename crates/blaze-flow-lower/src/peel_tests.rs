@@ -412,3 +412,85 @@ fn a_peeled_binding_keeps_its_loan_live() {
     let planted = lowered(&w, &b, w.wrap, root, &w.facts, Plant::NoRelate, "loan through the peel, planted NoRelate");
     assert!(!planted.iter().any(|l| l.starts_with("borrow")), "the control hides it: {planted:?}");
 }
+
+/// Owned destructuring under an ADT field whose `field_lead` is unknown (`None`, as for a field
+/// typed as an associated type projection like `BlockAssemblerInput::transactions`): a direct
+/// immutable `ByValue` binding `y` with `local_ty == pat_ty` under `mode == Move` proves 0
+/// references were peeled (`pat_proves_no_peel`), instead of refusing `PeelUnderAdtField`.
+#[test]
+fn owned_by_value_binding_proves_zero_peel_when_field_lead_unknown() {
+    let mut w = world();
+    w.facts.leads = false;
+    let mut b = Bb::new();
+    let wp = b.param("w");
+    let y = b.bind("y");
+    let inner = ev(&mut b, y);
+    let pat = b.variant_pat(&["Wrapper", "W"], &[inner]);
+    let s = b.local(wp);
+    let body = call1(&mut b, "h", y);
+    let wild = b.wild();
+    let none = b.block(&[], None);
+    let m = b.match_(s, &[(pat, body), (wild, none)]);
+    let root = b.block(&[], Some(m));
+    let got = lowered(&w, &b, w.wrap, root, &w.facts, Plant::None, "zero-peel proof");
+    assert!(got.is_empty(), "owned `Wrapper::W(E::V(y))` with unknown field_lead must lower cleanly: {got:?}");
+}
+
+/// Regression for `commonware_runtime::utils::handle::Panicked::interrupt` (`BindingMode`):
+/// `match select(panicked, task).await { Either::Right((output, mut panicked)) => ... }` where
+/// the enum's type argument carries an unnormalized projection (`(<Wrap<T> as Tr>::Out, u8)`)
+/// while the tuple subpattern's checked `pat_ty` has the normalized projection (`(<T as Tr>::Out, u8)`).
+/// `peeled_field_ty` must accept the matching concrete `Tuple` head modulo alias normalization
+/// without refusing `Form::BindingMode`.
+#[test]
+fn peeled_field_ty_accepts_normalized_alias_inside_tuple_variant() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(blaze_typeck::LangItem::Sized, sized);
+    let u8_ = fx.u8();
+    let p0 = fx.param(0);
+    let tr = fx.tr("Tr", 1, vec![], &["Out"]);
+    let wrap = fx.strukt("Wrap", 1, &[]);
+    let wrap_p0 = fx.adt(wrap, &[p0]);
+    let tr_bound = fx.bound(tr, &[p0]);
+    let inner_out = fx.alias(tr, "Out", &[p0]);
+    let outer_out = fx.alias(tr, "Out", &[wrap_p0]);
+    let s_p0 = fx.bound(sized, &[p0]);
+    let s_out = fx.bound(sized, &[inner_out]);
+    let _imp = fx.imp("impl<T: Tr> Tr for Wrap<T> { type Out = <T as Tr>::Out; }", 1, wrap_p0, Some((tr, &[])), &[("Out", inner_out)], vec![tr_bound, s_p0]);
+    let p1 = fx.param(1);
+    let (either, _) = fx.enum_("Either", 2, &[("Left", &[p0]), ("Right", &[p1])]);
+    let pair_unnorm = fx.tuple(&[outer_out, u8_]);
+    let either_ty = fx.adt(either, &[u8_, pair_unnorm]);
+    let unit = fx.unit();
+    let f = fx.func("interrupt", 1, &[either_ty], unit, vec![tr_bound, s_p0, s_out]);
+    fx.finish();
+
+    let mut decls = Decls::new();
+    decls.trait_(tr, 0);
+    decls.alias(tr, "Out", 0);
+    decls.func(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[either_ty], output: unit, slots: &[] });
+
+    let facts = Peel {
+        enums: vec![(either, vec![vec![FieldLead::Param(0)], vec![FieldLead::Param(1)]])],
+        leads: true,
+    };
+
+    let mut b = Bb::new();
+    let e = b.param("e");
+    let out_p = b.bind("output");
+    let rest_p = b.bind("rest");
+    let tup_p = b.tuple_pat(&[out_p, rest_p]);
+    let right_p = b.variant_pat(&["Either", "Right"], &[tup_p]);
+    let wild_p = b.wild();
+    let loc_out = b.local(out_p);
+    let use_out = b.semi(loc_out);
+    let arm1 = b.block(&[use_out], None);
+    let arm2 = b.block(&[], None);
+    let loc_e = b.local(e);
+    let m = b.match_(loc_e, &[(right_p, arm1), (wild_p, arm2)]);
+    let root = b.block(&[], Some(m));
+
+    let got = findings(&fx, &b, f, root, &facts, &decls, Plant::None);
+    assert_eq!(got, Ok(Vec::new()), "normalized alias inside Either::Right tuple must lower cleanly: {got:?}");
+}

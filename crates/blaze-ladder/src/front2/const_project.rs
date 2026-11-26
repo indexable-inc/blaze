@@ -139,7 +139,7 @@ impl<'w> ProjectAsk<'w> {
         };
         let Some(module) = keys.library_in(names, trait_) else { return refuse(ProjectionWhy::NoLibraryTrait) };
         let spell = Spelling::fixed();
-        let alloc = store.tys.alloc();
+        let alloc = store.work_alloc();
         let blocks = BlockTraits::module(alloc);
         let self_ = SelfTy::None;
         let world = BodyWorld {

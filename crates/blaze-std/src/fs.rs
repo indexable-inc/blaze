@@ -96,6 +96,7 @@ use core::{fmt, marker::PhantomData, num::NonZero};
 
 use blaze_core::{DirName, Done, Effect, FileName, Tag};
 use blaze_mem::Frame;
+use blaze_own::Share as _;
 
 use crate::{
     Plant, Stopped,
@@ -126,6 +127,9 @@ pub use read_sized::SizedError;
 
 // A whole file mapped read-only (`Dir::map_read`): a large plain array read in place.
 mod map_read;
+
+// Writing a large record once, in place (`Dir::reserve`): backed by `Effect::MapWrite`.
+mod reserve;
 
 // The boot the files are read in (`Fs::boot`): the files capability's own fact (D104 B1).
 mod boot;
@@ -292,7 +296,7 @@ pub use blaze_core::Kind as EntryKind;
 /// caller that wants one entry's path asks for that one ([`Entries::path`]).
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a test keeping what it saw
 pub struct Entries {
-    listing: alloc::boxed::Box<blaze_core::Listing>,
+    listing: blaze_core::Listing,
     /// The folder listed, beneath the directory it was asked of; `None` for that directory.
     path: Option<Path>,
 }
@@ -333,6 +337,18 @@ impl Entries {
     #[track_caller]
     pub fn executable(&self, i: usize) -> bool {
         self.listing.stamp(i).executable()
+    }
+
+    /// Entry `i`'s full [`Look`] metadata from the directory listing (`getattrlistbulk` on macOS).
+    #[track_caller]
+    pub fn look(&self, i: usize) -> Look {
+        Look::of(&self.listing.stamp(i))
+    }
+
+    /// Entry `i`'s raw Unix mode bits from the directory listing (a link not followed).
+    #[track_caller]
+    pub fn mode(&self, i: usize) -> u32 {
+        self.listing.stamp(i).mode
     }
 
     /// The kinds, in the names' order: a walk that wants the folders reads a byte each.
@@ -838,6 +854,16 @@ impl FsError {
             FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Moved { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
         }
     }
+}
+
+/// Builds an `FsError` carrying a formatted `Display` message as `FsKind::Driver`.
+fn driver_error(op: FsOp, path: &(impl Named + ?Sized), value: &dyn fmt::Display) -> FsError {
+    FsError::new(op, path, FsKind::Driver(format!("{value}")))
+}
+
+/// Builds an `FsError` carrying a formatted `Display` message as `FsKind::Answered`.
+fn answered_error(op: FsOp, path: &(impl Named + ?Sized), value: &dyn fmt::Display) -> FsError {
+    FsError::new(op, path, FsKind::Answered(format!("{value}")))
 }
 
 /// `done`, which was not what `op` expects, as its error.
@@ -1442,12 +1468,102 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         self.list_one(cx, self.base.clone(), None)
     }
 
+    /// List many folders beneath this directory concurrently (`None` = this directory itself),
+    /// overlapping up to 128 `Effect::Entries` in flight at once without a serial `stat` before
+    /// each folder. A missing or non-directory folder returns `None` in its slot.
+    pub fn entries_many<'f>(
+        &self,
+        cx: &Cx,
+        dirs: &[Option<&Path>],
+        frame: &'f Frame,
+    ) -> Result<Vec<Option<Entries>, &'f Frame>, FsError> {
+        let mut out: Vec<Option<Entries>, &'f Frame> = Vec::new_in(frame);
+        out.try_reserve(dirs.len()).map_err(|_| {
+            FsError::new(
+                FsOp::Entries,
+                &self.base,
+                FsKind::Stopped(Stopped::OutOfMemory {
+                    arena: "bstd::fs::entries_many",
+                    asked: dirs.len() * size_of::<Option<Entries>>(),
+                }),
+            )
+        })?;
+        for _ in 0..dirs.len() {
+            out.push(None);
+        }
+        if dirs.is_empty() {
+            cx.check().map_err(|stopped| FsError::new(FsOp::Entries, &self.base, FsKind::Stopped(stopped)))?;
+            return Ok(out);
+        }
+        const WINDOW: usize = 128;
+        let cap = dirs.len().min(WINDOW);
+        let mut tags: Vec<Tag, &Frame> = Vec::new_in(frame);
+        let mut meta: Vec<(usize, DirName, Option<Path>), &Frame> = Vec::new_in(frame);
+        let _ = tags.try_reserve(cap);
+        let _ = meta.try_reserve(cap);
+
+        let submit_one = |io: &Io, base: &DirName, opt_path: Option<&Path>| {
+            let (dir_name, path_owned) = match opt_path {
+                Some(p) => (DirName::Named(self.beneath(p)), Some(p.clone())),
+                None => (base.clone(), None),
+            };
+            let asked = dir_name.clone();
+            let tag = io.submit(|tag| Effect::Entries { dir: asked, tag });
+            (tag, dir_name, path_owned)
+        };
+
+        let mut next = 0usize;
+        while next < dirs.len() && tags.len() < cap {
+            let (tag, dir_name, path_owned) = submit_one(&self.io, &self.base, dirs[next]);
+            tags.push(tag);
+            meta.push((next, dir_name, path_owned));
+            next += 1;
+        }
+
+        while !tags.is_empty() {
+            let (slot, done) = match cx.wait_any(&self.io, &tags) {
+                Ok(pair) => pair,
+                Err(stopped) => {
+                    for &t in &tags {
+                        self.io.forget(t, Ends::Once);
+                    }
+                    return Err(FsError::new(FsOp::Entries, &self.base, FsKind::Stopped(stopped)));
+                }
+            };
+            tags.swap_remove(slot);
+            let (idx, dir_name, path_owned) = meta.swap_remove(slot);
+            match done {
+                Done::Entries(listing) if listing.dir() == &dir_name => {
+                    if let Some(slot) = out.get_mut(idx) {
+                        *slot = Some(Entries { listing: *listing, path: path_owned });
+                    }
+                }
+                Done::Failed(_) => {
+                    // Missing folder or non-directory: leave `None`.
+                }
+                other => {
+                    for &t in &tags {
+                        self.io.forget(t, Ends::Once);
+                    }
+                    return Err(unexpected(FsOp::Entries, &dir_name, other));
+                }
+            }
+            if next < dirs.len() {
+                let (tag, dn, po) = submit_one(&self.io, &self.base, dirs[next]);
+                tags.push(tag);
+                meta.push((next, dn, po));
+                next += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// The one listing of `dir` (named `path` beneath this directory, or this one).
     fn list_one(&self, cx: &Cx, dir: DirName, path: Option<Path>) -> Result<Entries, FsError> {
         // clone: the effect's name, a refcount.
         let asked = dir.clone();
         let listing = match call(&self.io, cx, FsOp::Entries, &dir, |tag| Effect::Entries { dir: asked, tag })? {
-            Done::Entries(listing) => listing,
+            Done::Entries(listing) => *listing,
             done => return Err(unexpected(FsOp::Entries, &dir, done)),
         };
         if listing.dir() != &dir {
@@ -1525,6 +1641,103 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         self.open_read(cx, path)?.read_all(cx, into)
     }
 
+    /// Target bytes of the symbolic link at `path` (not followed) added to `into`; how many bytes.
+    pub fn read_link(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let name = self.beneath(path);
+        let file = name.clone();
+        match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadLink { file, tag })? {
+            Done::Read(bytes) => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            other => Err(unexpected(FsOp::Read, &name, other)),
+        }
+    }
+
+    /// Simulation / non-inline helper: checks every parent component along `path` is a real
+    /// directory (never a symlink) and returns the leaf's [`EntryKind`].
+    fn check_confined_leaf(&self, cx: &Cx, op: FsOp, name: &FileName, path: &Path) -> Result<Option<EntryKind>, FsError> {
+        let raw_rel = path.as_str();
+        let mut prefixes = blaze_own::Vec::new_in(cx.frame());
+        for (idx, _) in raw_rel.match_indices('/') {
+            let Some(prefix) = raw_rel.get(..idx) else { continue };
+            let Ok(sub) = Path::new(prefix) else {
+                return Err(FsError::new(op, name, FsKind::Driver("invalid path prefix".into())));
+            };
+            prefixes.try_reserve(1).map_err(|_| {
+                let stopped = Stopped::OutOfMemory { arena: "bstd::fs confined prefixes", asked: size_of::<Path>() };
+                FsError::new(op, name, FsKind::Stopped(stopped))
+            })?;
+            prefixes.push(sub);
+        }
+        let looks = self.looks(cx, prefixes.iter().chain(core::iter::once(path)))?;
+        for (i, sub) in prefixes.iter().enumerate() {
+            match looks.get(i).map(|l| l.kind) {
+                Some(EntryKind::Dir) => {}
+                Some(EntryKind::Gone) => return Ok(Some(EntryKind::Gone)),
+                _ => return Err(FsError::new(op, &self.beneath(sub), FsKind::Driver("symbolic link refused in confined op".into()))),
+            }
+        }
+        Ok(looks.get(prefixes.len()).map(|l| l.kind))
+    }
+
+    /// Kernel-confined directory listing: opens `path` strictly beneath this directory without
+    /// following any symbolic link in any component (`openat2(O_DIRECTORY | RESOLVE_BENEATH |
+    /// RESOLVE_NO_SYMLINKS)` on Linux, component `openat(O_DIRECTORY | O_NOFOLLOW)` on Unix, or
+    /// component `looks` verification in simulations). Returns `Ok(None)` when absent.
+    pub fn entries_confined(&self, cx: &Cx, path: &Path) -> Result<Option<Entries>, FsError> {
+        let name = self.beneath(path);
+        let dir_name = DirName::Named(name.share());
+        let owned_path = Path::new(path.as_str()).ok();
+        if let Some(listed) = self.io.entries_confined(cx, &name, &dir_name) {
+            return match listed {
+                Ok(Ok(Some(listing))) => Ok(Some(Entries { listing, path: owned_path })),
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(error)) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Stopped(stopped))),
+            };
+        }
+        match self.check_confined_leaf(cx, FsOp::Entries, &name, path)? {
+            Some(EntryKind::Dir) => {}
+            Some(EntryKind::Gone) => return Ok(None),
+            Some(EntryKind::File) => return Err(FsError::new(FsOp::Entries, &dir_name, FsKind::NotADirectory)),
+            _ => return Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Driver("symbolic link refused in confined entries".into()))),
+        }
+        self.list_one(cx, dir_name, owned_path).map(Some)
+    }
+
+    /// Kernel-confined positional range read: opens `path` strictly beneath this directory without
+    /// following any symbolic link in any directory component or final leaf, verifies it is a
+    /// regular file, and reads up to `len` bytes starting at `at` into `into`.
+    pub fn read_range_confined(&self, cx: &Cx, path: &Path, at: u64, len: usize, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let name = self.beneath(path);
+        if let Some(lent) = self.io.read_range_confined(cx, &name, at, len, into) {
+            return match lent {
+                Ok(crate::io::ReadAllLent::Read(read)) => Ok(read),
+                Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+                Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
+            };
+        }
+        match self.check_confined_leaf(cx, FsOp::Read, &name, path)? {
+            Some(EntryKind::File) => {}
+            Some(EntryKind::Dir) => return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
+            Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+            _ => return Err(FsError::new(FsOp::Read, &name, FsKind::Driver("symbolic link refused in confined read".into()))),
+        }
+        let file = name.share();
+        match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::Read { file, at, len, tag })? {
+            Done::Read(bytes) if bytes.len() <= len => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            other => Err(unexpected(FsOp::Read, &name, other)),
+        }
+    }
+
     /// Kernel-confined whole-file read: opens `path` strictly beneath this directory without
     /// following any symbolic link in any directory component or final leaf (`openat`+`O_NOFOLLOW`
     /// on Unix, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux; component `Lstat` check
@@ -1536,33 +1749,18 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             return match lent {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
             };
         }
-        // Simulation / guest fallback: verify no component along `path` is a symlink via batched `looks` (`Effect::Stamp`).
-        let raw_rel = path.as_str();
-        let mut prefixes: Vec<Path, &blaze_mem::Frame> = Vec::new_in(cx.frame());
-        for (idx, _) in raw_rel.match_indices('/') {
-            let sub = Path::new(&raw_rel[..idx]).expect("prefix of valid Path is valid");
-            let _ = prefixes.try_reserve(1);
-            prefixes.push(sub);
-        }
-        let looks = self.looks(cx, prefixes.iter().chain(core::iter::once(path)))?;
-        for (i, sub) in prefixes.iter().enumerate() {
-            match looks.get(i).map(|l| l.kind) {
-                Some(EntryKind::Dir) => {}
-                Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
-                _ => return Err(FsError::new(FsOp::Read, &self.beneath(sub), FsKind::Driver("symbolic link refused in confined read".into()))),
-            }
-        }
-        match looks.get(prefixes.len()).map(|l| l.kind) {
+        match self.check_confined_leaf(cx, FsOp::Read, &name, path)? {
             Some(EntryKind::File) => {}
             Some(EntryKind::Dir) => return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
             Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
             _ => return Err(FsError::new(FsOp::Read, &name, FsKind::Driver("symbolic link refused in confined read".into()))),
         }
-        let file = name.clone();
+        let file = name.share();
         match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadAll { file, tag })? {
             Done::Read(bytes) => {
                 into.try_extend(&bytes)
@@ -2251,6 +2449,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
             return match lent {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Ok(0),
                 // alloc: an error's message.
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped))),

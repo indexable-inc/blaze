@@ -472,6 +472,48 @@ impl<'a> LastAnswer for Answer<'a> {
         Ok(out)
     }
 
+    fn file_member_keys<'m>(&self, file: Name, alloc: Alloc<'m>) -> Result<Option<AVec<'m, (Name, Option<Key>)>>, LastError> {
+        let row_key = |name: Name| -> Option<Option<Key>> {
+            if let Some(slot) = self.work.as_ref().and_then(|work| work.rows.get(&name)) {
+                return Some(slot.as_ref().map(|row| row.key));
+            }
+            if let Some(row) = self.rows.get(&name) {
+                return Some(Some(row.key));
+            }
+            None
+        };
+        if let Some(slot) = self.work.as_ref().and_then(|work| work.by_file.get(&file)) {
+            let mut out = Vec::new_in(alloc);
+            if let Some(names) = slot {
+                out.reserve(names.len());
+                for &name in names.iter() {
+                    out.push((name, row_key(name).flatten()));
+                }
+            }
+            return Ok(Some(out));
+        }
+        if let Some(names) = self.by_file.get(&file) {
+            let mut out = Vec::with_capacity_in(names.len(), alloc);
+            for &name in names.iter() {
+                out.push((name, row_key(name).flatten()));
+            }
+            return Ok(Some(out));
+        }
+        let mut out = Vec::new_in(alloc);
+        if let Some(page) = self.page(file, Ask::File)? {
+            let members = page.file_member_keys(file);
+            out.reserve(members.len());
+            for (name, page_key) in members {
+                let key = match row_key(name) {
+                    Some(overridden) => overridden,
+                    None => page_key,
+                };
+                out.push((name, key));
+            }
+        }
+        Ok(Some(out))
+    }
+
     fn planned_key(&self, file: Name, name: Name) -> Result<Option<Key>, LastError> {
         if let Some(slot) = self.work.as_ref().and_then(|work| work.rows.get(&name)) {
             return Ok(slot.as_ref().map(|row| row.key));

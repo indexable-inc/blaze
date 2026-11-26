@@ -95,13 +95,11 @@ mod journal_checkpoint;
 // The checkout's journal helper: a command's ask (journal_ask.rs) and the helper (journal_helper.rs).
 mod journal_ask;
 mod journal_helper;
-// Wave 7 resident per-checkout daemon: synchronous kernel vnode watcher, server, and pre-runtime client.
-mod daemon_client;
-mod daemon_server;
-mod daemon_watch;
+// Resident daemon removed; cold-process commands use the lightweight `journal-helper`.
 mod graph;
 mod graph_payload;
 mod test_args;
+mod test_bins;
 mod test_cache;
 mod test_drive;
 mod test_loop;
@@ -175,6 +173,9 @@ use crate::phases::Phases;
 #[derive(Debug)]
 pub enum CliError {
     Usage(&'static str),
+    /// Dynamic usage refusal from `blaze-cli-spec::app::parse_argv` (unknown flag/command,
+    /// wrong-command flag, missing value, or disallowed passthrough), kept inline without heap allocation.
+    UsageText(blaze_own::fixed::FixedString<160>),
     /// A word that is no command of blaze and never will be: the commands that do its work.
     NoSuchCommand { command: &'static str, instead: &'static str },
     /// A flag of `check` that the engine's check (check_command.rs) does not honour yet: refused
@@ -266,7 +267,7 @@ pub enum CliError {
     Start(engine_start::StartError),
     /// `blaze inspect` failed (inspect_command.rs). Boxed in the process heap (`CliError`'s size).
     Inspect(blaze_own::Box<blaze_ladder::front2::inspect::InspectError, blaze_own::Alloc<'static>>),
-    /// `blaze export` failed to build or write the standalone executable (engine_export.rs).
+    /// `blaze build` failed to build or write the standalone executable (engine_export.rs).
     /// Boxed in the process heap (`CliError`'s size cap).
     Export(blaze_own::Box<engine_export::ExportCliError, blaze_own::Alloc<'static>>),
 }
@@ -307,10 +308,14 @@ impl fmt::Display for ManifestRefused {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CliError::Usage(what) => write!(
-                f,
-                "usage: blaze check [dir] [--color ...] [--view ...] [--each] [--workers N] [--status-every S], blaze ci [dir] [--format ...] [--todo ...], blaze inspect <file.rs[::fn]> [--json] [--all-exprs], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze export [dir] [-p pkg] [--bin name] [-o path] [--workers N] [--stats], blaze clean|gc|explain: {what}"
-            ),
+            CliError::Usage(what) => {
+                blaze_cli_spec::app::render_usage(&blaze_cli_spec::blaze_app::BLAZE_APP, f)?;
+                write!(f, ": {what}")
+            }
+            CliError::UsageText(what) => {
+                blaze_cli_spec::app::render_usage(&blaze_cli_spec::blaze_app::BLAZE_APP, f)?;
+                write!(f, ": {what}")
+            }
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
             CliError::NoSuchCommand { command, instead } => write!(f, "blaze has no `{command}` command: {instead}"),
             CliError::Missing(missing) => write!(f, "{missing}"),
@@ -411,11 +416,11 @@ struct Flags<'a> {
     view: Option<View>,
     /// `--fix <selector>...`: the arguments that are its selectors, `start..end` of the list.
     fix: Option<(usize, usize)>,
-    /// `-p <package>` and `--bin <name>`: which program `blaze run` or `blaze export` picks (run_package.rs).
+    /// `-p <package>` and `--bin <name>`: which program `blaze run` or `blaze build` picks (run_package.rs).
     select: run_package::Select<'a>,
     /// `--open`: opt-in to opening the Explore web page in the browser on `blaze run` (default: off).
     open: blaze_run::viewer::OpenExplore,
-    /// `-o <path>` / `--output <path>`: where `blaze export` writes the standalone executable.
+    /// `-o <path>` / `--output <path>`: where `blaze build` writes the standalone executable.
     output: Option<&'a str>,
     /// `--names-oracle`: `check` decides every crate's names twice and compares them (D158 step
     /// 1, engine_names.rs `NamesOracle`).
@@ -455,80 +460,142 @@ impl<'a> Flags<'a> {
     }
 }
 
+fn format_usage_text(display: &dyn fmt::Display) -> blaze_own::fixed::FixedString<160> {
+    struct Capped {
+        buf: blaze_own::fixed::FixedString<160>,
+        truncated: bool,
+    }
+    impl fmt::Write for Capped {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            if self.truncated {
+                return Ok(());
+            }
+            let room = self.buf.capacity().saturating_sub(self.buf.len());
+            if s.len() <= room {
+                if self.buf.try_push_str(s).is_err() {
+                    self.truncated = true;
+                }
+                return Ok(());
+            }
+            self.truncated = true;
+            if room >= 3 {
+                let mut take = room - 3;
+                while take > 0 && !s.is_char_boundary(take) {
+                    take -= 1;
+                }
+                if let Some(prefix) = s.get(..take)
+                    && self.buf.try_push_str(prefix).is_ok()
+                    && self.buf.try_push_str("...").is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut out = Capped { buf: blaze_own::fixed::FixedString::new(), truncated: false };
+    if fmt::write(&mut out, format_args!("{display}")).is_err() {
+        out.truncated = true;
+    }
+    out.buf
+}
+
+fn parse_error_to_cli(error: blaze_cli_spec::app::ParseError<'_>) -> CliError {
+    match error {
+        blaze_cli_spec::app::ParseError::Renamed { old, instead } => CliError::NoSuchCommand { command: old, instead },
+        other => CliError::UsageText(format_usage_text(&other)),
+    }
+}
+
 fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
     parse_flags(args, |_| {})
 }
 
-fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<Flags<'a>, CliError> {
+pub(crate) fn flags_in<'a>(args: &'a Args, frame: &Frame) -> Result<Flags<'a>, CliError> {
+    parse_flags_in(args, frame, |_| {})
+}
+
+fn parse_flags<'a>(args: &'a Args, package: impl FnMut(&'a str)) -> Result<Flags<'a>, CliError> {
+    let reserve = args.len().saturating_mul(64).max(1 << 16);
+    let frame = Frame::with_reserve(reserve, bstd::mem::Tag::Other)
+        .map_err(|_| CliError::Text { what: "cannot reserve scratch frame for CLI flags" })?;
+    parse_flags_in(args, &frame, package)
+}
+
+pub(crate) fn parse_flags_in<'a>(args: &'a Args, frame: &Frame, mut package: impl FnMut(&'a str)) -> Result<Flags<'a>, CliError> {
+    if args.len() <= 1 {
+        return Ok(Flags::empty());
+    }
+    let mut argv: Vec<&'a str, &Frame> = Vec::with_capacity_in(args.len(), frame);
+    argv.extend(args.each());
+    let erased = blaze_own::Erased::new(frame);
+    let parsed = match blaze_cli_spec::app::parse_argv(&blaze_cli_spec::blaze_app::BLAZE_APP, argv.as_slice(), erased.handle()) {
+        Ok(blaze_cli_spec::app::ParseOutcome::Command(parsed)) => parsed,
+        Ok(blaze_cli_spec::app::ParseOutcome::Help(_) | blaze_cli_spec::app::ParseOutcome::Version) => return Ok(Flags::empty()),
+        Err(error) => return Err(parse_error_to_cli(error)),
+    };
     let mut flags = Flags::empty();
-    let mut at = 2;
-    while let Some(arg) = args.get(at) {
-        at += 1;
-        if arg == "--" {
-            while let Some(word) = args.get(at) {
-                at += 1;
-                flags.program.push(word);
-            }
-            break;
-        }
-        let mut value = || {
-            at += 1;
-            args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant, --workers, -p, --bin and -o each take a value"))
-        };
-        let selected = match arg {
-            "-p" | "--package" => Some(value()?),
-            _ => arg.strip_prefix("--package="),
-        };
-        if let Some(name) = selected {
-            package(name);
-            flags.select.package = Some(name);
-            continue;
-        }
-        match arg {
-            "--view" => flags.view = Some(View::parse(value()?).ok_or(CliError::Usage("--view is person, agent or json"))?),
-            _ if arg.starts_with("--view=") => flags.view = Some(View::parse(&arg["--view=".len()..]).ok_or(CliError::Usage("--view is person, agent or json"))?),
-            // Every word after `--fix` up to the next flag is a selector: an id or a prefix of
-            // one, a code, a path, or `all` (fix.rs). Bare `--fix` with no selector fixes `all`.
-            "--fix" => {
-                let start = at;
-                while args.get(at).is_some_and(|word| !word.starts_with("--")) {
-                    at += 1;
-                }
-                flags.fix = Some((start, at));
-            }
-            "--grant" => {
-                let grant = value()?;
-                let pair = grant.split_once('=').ok_or(CliError::Usage("--grant takes name=value"))?;
-                flags.grants.push(pair);
-            }
-            "--stats" => flags.stats = true,
-            "--each" => flags.each = true,
-            "--open" => flags.open = blaze_run::viewer::OpenExplore::Open,
-            "--names-oracle" => flags.names_oracle = engine_names::NamesOracle::On,
-            _ if let Some(word) = arg.strip_prefix("--driver=") => flags.driver = engine_ready_edit::Driver::parse(word).ok_or(CliError::Usage("--driver is auto, ready or phases"))?,
-            _ if arg.starts_with("--block-scopes=") => {
-                flags.block_scopes = blaze_scope::surface::BlockScopes::parse(&arg["--block-scopes=".len()..]).ok_or(CliError::Usage("--block-scopes is bodies or modules"))?
-            }
-            "--bin" => flags.select.bin = Some(value()?),
-            _ if arg.starts_with("--bin=") => flags.select.bin = Some(&arg["--bin=".len()..]),
-            "-o" | "--output" => flags.output = Some(value()?),
-            _ if let Some(path) = arg.strip_prefix("--output=") => flags.output = Some(path),
-            "--workers" => {
-                let n = value()?.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a count of at least 1"))?;
-                flags.workers = Some(n);
-            }
-            "--status-every" => {
-                let seconds = value()?.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--status-every takes a count of seconds of at least 1"))?;
-                flags.status_every = Some(seconds);
-            }
-            "--color" => flags.color = choice(value()?)?,
-            "--origin" => flags.origin = Some(value()?),
-            "--origin-key" => flags.origin_key = Some(value()?),
-            _ if arg.starts_with("--color=") => flags.color = choice(&arg["--color=".len()..])?,
-            _ if arg.starts_with("--") => return Err(CliError::Usage("an unknown flag")),
-            _ if flags.dir.is_some() => return Err(CliError::Usage("one checkout directory at most")),
-            _ => flags.dir = Some(arg),
-        }
+    if parsed.positionals.len() > 1 {
+        return Err(CliError::Usage("one checkout directory at most"));
+    }
+    flags.dir = parsed.positionals.first().copied();
+    for &word in parsed.passthrough.iter() {
+        flags.program.push(word);
+    }
+    for name in parsed.values("package") {
+        package(name);
+        flags.select.package = Some(name);
+    }
+    if let Some(name) = parsed.last_value("bin") {
+        flags.select.bin = Some(name);
+    }
+    if let Some(path) = parsed.last_value("output") {
+        flags.output = Some(path);
+    }
+    for word in parsed.values("view") {
+        flags.view = Some(View::parse(word).ok_or(CliError::Usage("--view is person, agent or json"))?);
+    }
+    for word in parsed.values("color") {
+        flags.color = choice(word)?;
+    }
+    if let Some(span) = parsed.span("fix") {
+        flags.fix = Some(span);
+    }
+    for grant in parsed.values("grant") {
+        let pair = grant.split_once('=').ok_or(CliError::Usage("--grant takes name=value"))?;
+        flags.grants.push(pair);
+    }
+    if parsed.has("stats") {
+        flags.stats = true;
+    }
+    if parsed.has("each") {
+        flags.each = true;
+    }
+    if parsed.has("open") {
+        flags.open = blaze_run::viewer::OpenExplore::Open;
+    }
+    if parsed.has("names-oracle") {
+        flags.names_oracle = engine_names::NamesOracle::On;
+    }
+    for word in parsed.values("driver") {
+        flags.driver = engine_ready_edit::Driver::parse(word).ok_or(CliError::Usage("--driver is auto, ready or phases"))?;
+    }
+    for word in parsed.values("block-scopes") {
+        flags.block_scopes = blaze_scope::surface::BlockScopes::parse(word).ok_or(CliError::Usage("--block-scopes is bodies or modules"))?;
+    }
+    for word in parsed.values("workers") {
+        let n = word.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a count of at least 1"))?;
+        flags.workers = Some(n);
+    }
+    for word in parsed.values("status-every") {
+        let seconds = word.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--status-every takes a count of seconds of at least 1"))?;
+        flags.status_every = Some(seconds);
+    }
+    if let Some(origin) = parsed.last_value("origin") {
+        flags.origin = Some(origin);
+    }
+    if let Some(key) = parsed.last_value("origin-key") {
+        flags.origin_key = Some(key);
     }
     // D189 step 4: the block-scopes differential reports inside the names oracle, so without
     // the oracle it would have no place to report and is refused (rule 3).
@@ -568,15 +635,9 @@ fn choice(word: &str) -> Result<Choice, CliError> {
 static HEAP: blaze_mem::counted::Counted = blaze_mem::counted::Counted;
 
 fn main() -> bstd::entry::Exit {
-    // Wave 7: try the resident per-checkout daemon BEFORE initializing `bstd::rt` so warm
-    // `blaze check` commands skip the runtime, worker pool, and driver startup/teardown tax.
-    let spawn_daemon = match daemon_client::try_run() {
-        daemon_client::ClientOutcome::Exit(status) => return bstd::entry::Exit(status),
-        daemon_client::ClientOutcome::Fallthrough { spawn_daemon } => spawn_daemon,
-    };
     // The process's heap is a grant bstd's entry hands `main` (D102, D120), never reached for
     // here or below: every allocator under the command is its handle, a frame, or an arena.
-    bstd::entry::run_with_heap_at(bstd::entry::Os::process(), telemetry_level, |cx, io, heap| run(cx, io, heap, spawn_daemon))
+    bstd::entry::run_with_heap_at(bstd::entry::Os::process(), telemetry_level, |cx, io, heap| run(cx, io, heap))
 }
 
 /// The run's telemetry level, chosen before the runtime starts (D178): `--stats` among the
@@ -591,7 +652,7 @@ fn telemetry_level(args: &bstd::args::Args) -> bstd::telemetry::Level {
 }
 
 /// The status: 0 for a check that passed; `blaze run`'s, the status its program's `main` ended with.
-fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap, spawn_daemon: bool) -> Result<Status, Error> {
+fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap) -> Result<Status, Error> {
     let heap = heap.root();
     let clock = io.need_clock()?;
     let mut phases = Phases::new(clock.clone());
@@ -615,7 +676,7 @@ fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap, spawn_daemon: bool) -> Result<Sta
     // (A `Ran` holding `RunError::Trapped` was matched here: no constructor ever made one, as
     // `Ran` is made only from `Program`, whose every constructor is a manifest refusal; a trap
     // in the program's own process is the run loop's words, run_loop.rs `LoopError`.)
-    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, clock, &mut rng, &out, &err, &mut phases, heap, spawn_daemon) {
+    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, clock, &mut rng, &out, &err, &mut phases, heap) {
         // D86 and the ladder's L6: any failure of `run` or `test` before the program starts
         // (manifest, check, build, start, or a stub that stopped it) exits `program::NOT_RUN`,
         // never 1, which a program's `main` returning `Err` also exits with (std's
@@ -638,8 +699,14 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
     }
 }
 
-/// What `blaze build` is told: the two commands that do what it would.
-const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` writes the program as a standalone executable";
+fn print_help(cx: &Cx, sub: Option<&str>, out: &Out) -> Result<Status, CliError> {
+    let mut buf = blaze_own::String::new_in(cx.frame());
+    if blaze_cli_spec::app::render_help(&blaze_cli_spec::blaze_app::BLAZE_APP, sub, &mut buf).is_err() {
+        return Err(CliError::Text { what: "cannot render CLI help text" });
+    }
+    out.line(cx, format_args!("{}", buf.as_str().trim_end_matches('\n')))?;
+    Ok(Status::OK)
+}
 
 #[expect(clippy::too_many_arguments, reason = "top-level command dispatcher: each argument one specific capability extracted at main")]
 fn command(
@@ -655,52 +722,66 @@ fn command(
     err: &Out,
     phases: &mut Phases,
     heap: &'static blaze_own::Heap,
-    spawn_daemon: bool,
 ) -> Result<Status, CliError> {
-    match args.get(1) {
-        // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
-        // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
-        // are moved.
-        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, spawn_daemon),
-        Some("ci") => ci_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
-        Some("inspect") => inspect_command::run(cx, args, fs, out, err, heap),
-        Some("why") => engine_check::why(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
-        // Hidden: the edit path's forward wake over the stored answer, dry (D187; engine_dry.rs).
-        Some("engine-dry") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Dry),
-        // Hidden: the stored answer's root and page keys, to compare two drivers' answers.
-        Some("engine-keys") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Keys),
-        // `run` and `test` start from the engine's answer (engine_start.rs, D147): the engine's
-        // check, then the program or the tests over what it stored.
-        Some("run") => engine_start::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, Command::Run),
-        Some("test") => engine_start::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, Command::Test),
-        // The commands are `check`, `run`, `test` and `export`: there is no `build`.
-        Some("build") => Err(CliError::NoSuchCommand { command: "build", instead: NO_BUILD }),
-        Some("export") => engine_export::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
-        Some("explain") => explain(cx, args.get(2), out),
-        // The checkout's state, and with `--store` the home's store, removed (clean.rs).
-        Some("clean") => clean::run(cx, fs, env, args, host, rng, out, heap),
-        // Bounded store compaction, root-LRU budget eviction, and stale old-format cleanup (gc.rs).
-        Some("gc") => gc::run(cx, args, fs, env, host, &clock, rng, out, err, heap),
-        // Hidden: the checkout's journal helper, run by hand until a command starts one
-        // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
-        Some("journal-helper") => journal_helper::run(cx, fs, &clock, host, rng, env, args, out),
-        // Hidden: resident per-checkout daemon (Wave 7, daemon_server.rs).
-        Some("daemon") => daemon_server::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
-        Some("--version" | "-V" | "version") => {
+    let Some(sub) = args.get(1) else {
+        return print_help(cx, None, out);
+    };
+    match sub {
+        "--help" | "-h" => return print_help(cx, None, out),
+        "help" => return print_help(cx, args.get(2), out),
+        "--version" | "-V" | "version" => {
             let ver = option_env!("BLAZE_RELEASE").unwrap_or(env!("CARGO_PKG_VERSION"));
             let tc = include_str!("../../../pins/toolchain").trim();
             out.line(cx, format_args!("blaze {ver} ({tc})"))?;
-            Ok(Status::OK)
+            return Ok(Status::OK);
         }
-        Some("toolchain") => {
+        _ => {}
+    }
+    if let Some(renamed) = blaze_cli_spec::blaze_app::BLAZE_APP.renamed.iter().find(|r| r.old == sub) {
+        return Err(CliError::NoSuchCommand { command: renamed.old, instead: renamed.message });
+    }
+    let Some(spec) = blaze_cli_spec::app::find_command(&blaze_cli_spec::blaze_app::BLAZE_APP, sub) else {
+        return Err(parse_error_to_cli(blaze_cli_spec::app::ParseError::UnknownCommand { got: sub }));
+    };
+    if spec.name != "warm-toolchain"
+        && args.each().skip(2).take_while(|a| *a != "--").any(|a| matches!(a, "-h" | "--help"))
+    {
+        return print_help(cx, Some(spec.name), out);
+    }
+    match spec.name {
+        // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
+        // (rule 30). `engine-check` is its alias in `BLAZE_APP`.
+        "check" => check_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
+        "ci" => ci_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
+        "inspect" => inspect_command::run(cx, args, fs, out, err, heap),
+        "why" => engine_check::why(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
+        // Hidden: the edit path's forward wake over the stored answer, dry (D187; engine_dry.rs).
+        "engine-dry" => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Dry),
+        // Hidden: the stored answer's root and page keys, to compare two drivers' answers.
+        "engine-keys" => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Keys),
+        // `run` and `test` start from the engine's answer (engine_start.rs, D147): the engine's
+        // check, then the program or the tests over what it stored.
+        "run" => engine_start::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, Command::Run),
+        "test" => engine_start::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, Command::Test),
+        // The commands are `check`, `build`, `run` and `test` (1:1 with Cargo).
+        "build" => engine_export::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
+        "explain" => explain(cx, args.get(2), out),
+        // The checkout's state, and with `--store` the home's store, removed (clean.rs).
+        "clean" => clean::run(cx, fs, env, args, host, rng, out, heap),
+        // Bounded store compaction, root-LRU budget eviction, and stale old-format cleanup (gc.rs).
+        "gc" => gc::run(cx, args, fs, env, host, &clock, rng, out, err, heap),
+        // Hidden: the checkout's journal helper, run by hand until a command starts one
+        // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
+        "journal-helper" => journal_helper::run(cx, fs, &clock, host, rng, env, args, out),
+        "toolchain" => {
             let tc = include_str!("../../../pins/toolchain").trim();
             out.line(cx, format_args!("Rust {tc}"))?;
             Ok(Status::OK)
         }
-        Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
-        Some("store") => store::publish_command::run(cx, args, fs, env, &clock, host, rng, out, err, heap),
-        Some("peer") => peer::run(cx, args, fs, env, net, &clock, rng, out),
-        Some(_) | None => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
+        "warm-toolchain" => engine_check::warm_toolchain(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
+        "store" => store::publish_command::run(cx, args, fs, env, &clock, host, rng, out, err, heap),
+        "peer" => peer::run(cx, args, fs, env, net, &clock, rng, out),
+        _ => Err(parse_error_to_cli(blaze_cli_spec::app::ParseError::UnknownCommand { got: sub })),
     }
 }
 
@@ -1743,7 +1824,58 @@ mod tests {
         assert_eq!(parsed.program, ["--open"]);
 
         let open_check = args_of(&["blaze", "check", "--open"]);
-        let parsed_check = flags(&open_check).expect("check flags parse before command check");
-        assert!(matches!(check_command::refuse_not_taken(&parsed_check), Err(CliError::Usage(_))));
+        assert!(
+            matches!(flags(&open_check), Err(CliError::Usage(_) | CliError::UsageText(_))),
+            "check refuses --open directly via BLAZE_APP"
+        );
+        let manual_open = Flags { open: OpenExplore::Open, ..Flags::empty() };
+        assert!(matches!(check_command::refuse_not_taken(&manual_open), Err(CliError::Usage(_))));
+    }
+
+    /// `blaze-cli-spec::blaze_app::BLAZE_APP` is the single source of truth for help, `export -> build`
+    /// refusal, flag tokenization, `--fix` span, and multi-`-p` package selection.
+    #[test]
+    fn cli_spec_wires_help_build_rename_and_flags() {
+        let args_of = |words: &[&str]| {
+            let mut world = SimWorld::new(1, Limits::USUAL);
+            world.args = words.iter().map(|&s| s.into()).collect();
+            Io::simulated(world).need_args().expect("args")
+        };
+
+        let empty = args_of(&[]);
+        assert!(flags(&empty).expect("empty args").dir.is_none());
+
+        let build = args_of(&["blaze", "build", "app_dir", "-p", "a", "--package=b", "--bin", "main", "-o", "./out", "--workers", "4", "--stats"]);
+        let mut pkgs = std::vec::Vec::new();
+        let parsed = parse_flags(&build, |name| pkgs.push(name)).expect("build flags");
+        assert_eq!(parsed.dir, Some("app_dir"));
+        assert_eq!(pkgs, ["a", "b"]);
+        assert_eq!(parsed.select.package, Some("b"));
+        assert_eq!(parsed.select.bin, Some("main"));
+        assert_eq!(parsed.output, Some("./out"));
+        assert_eq!(parsed.workers.map(core::num::NonZeroU32::get), Some(4));
+        assert!(parsed.stats);
+
+        let check = args_of(&["blaze", "check", "--fix", "id1", "id2", "--view=json", "--color=never", "--driver=ready", "--names-oracle", "--block-scopes=bodies"]);
+        let parsed = flags(&check).expect("check flags");
+        assert_eq!(parsed.fix, Some((3, 5)));
+        assert_eq!(parsed.view, Some(View::Json));
+        assert_eq!(parsed.color, Choice::Never);
+        assert_eq!(parsed.driver, engine_ready_edit::Driver::Ready);
+        assert_eq!(parsed.names_oracle, engine_names::NamesOracle::Blocks);
+
+        let export = args_of(&["blaze", "export"]);
+        assert!(
+            matches!(flags(&export), Err(CliError::NoSuchCommand { command: "export", instead }) if instead.contains("blaze build")),
+            "export maps to NoSuchCommand pointing to blaze build"
+        );
+
+        let io = Io::simulated(SimWorld::new(2, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let out = io.need_out().expect("out");
+        assert_eq!(print_help(&cx, None, &out).expect("top help"), Status::OK);
+        assert_eq!(print_help(&cx, Some("build"), &out).expect("build help"), Status::OK);
+        let rendered = stdout(&io);
+        assert!(rendered.contains("build"), "help lists build:\n{rendered}");
     }
 }

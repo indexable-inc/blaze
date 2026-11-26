@@ -167,6 +167,23 @@ pub trait Types {
         let _ = (view, path, position, arg, tys);
         Ok(None)
     }
+
+    /// Records explicitly written non-elided lifetimes (`'static` or a named enclosing lifetime)
+    /// of a closure parameter type `t` after expanding any type aliases (`Text<'a>` ->
+    /// `String<Alloc<'a>>`), in structural `(path, own)` order matching `lay_written_param`.
+    /// Returns `true` when handled; `false` falls back to syntactic `record_closure_param_regions`.
+    fn closure_param_regions(
+        &mut self,
+        view: &View<'_>,
+        t: TypeId,
+        tys: &mut PortableTys<'_>,
+        closure: tc::ExprId,
+        param: u32,
+        out: &mut dyn FnMut(tc::ClosureParamRegion),
+    ) -> bool {
+        let _ = (view, t, tys, closure, param, out);
+        false
+    }
 }
 
 impl ConstGapWhy {
@@ -775,47 +792,69 @@ impl Conv<'_, '_, '_, '_, '_> {
 
     /// Walks a closure parameter's written type `root` by structural child-index path, recording
     /// every explicitly written non-elided lifetime (`'static` or a named enclosing lifetime,
-    /// never `'_` or an omitted lifetime). Keying by structural `(path, own)` avoids depending on
-    /// sibling types' lifetime slot counts (e.g. `&mut Vec<(X64Loc, X64Loc), Alloc<'a>>`).
+    /// never `'_`, an omitted lifetime, or a lifetime bound by an inner `for<..>` binder).
+    /// Keying by structural `(path, own)` avoids depending on sibling types' lifetime slot counts
+    /// (e.g. `&mut Vec<(X64Loc, X64Loc), Alloc<'a>>`).
     fn record_closure_param_regions(&mut self, closure: ExprId, param: u32, root: TypeId) -> Result<(), Refused> {
-        let mut stack: [(TypeId, u64); 64] = [(TypeId(0), 0); 64];
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Visit(TypeId, u64),
+            PopBound(usize),
+        }
+        let classify = |v: &View<'_>, nm: NameIdx, bound: &[Name; 32], bound_len: usize| -> Result<Option<tc::WrittenRegion>, Refused> {
+            let text = v.name_text(nm)?;
+            if text == "'static" {
+                Ok(Some(tc::WrittenRegion::Static))
+            } else if text == "'_" {
+                Ok(None)
+            } else {
+                let name = Name(v.name(nm)?);
+                if bound.iter().take(bound_len).any(|&b| b == name) {
+                    Ok(None)
+                } else {
+                    Ok(Some(tc::WrittenRegion::Named))
+                }
+            }
+        };
+        let mut stack: [Frame; 64] = [Frame::PopBound(0); 64];
         let mut sp = 1usize;
         if let Some(slot) = stack.get_mut(0) {
-            *slot = (root, tc::ClosureParamRegion::ROOT);
+            *slot = Frame::Visit(root, tc::ClosureParamRegion::ROOT);
         }
+        let mut bound: [Name; 32] = [Name(0); 32];
+        let mut bound_len = 0usize;
         let mut steps = 0u32;
         while let Some(top) = sp.checked_sub(1) {
             sp = top;
+            let Some(&frame) = stack.get(top) else { break };
+            let (tid, path) = match frame {
+                Frame::PopBound(prev) => {
+                    bound_len = prev;
+                    continue;
+                }
+                Frame::Visit(tid, path) => (tid, path),
+            };
             steps += 1;
-            if steps > 64 {
+            if steps > 128 {
                 break;
             }
-            let Some(&(tid, path)) = stack.get(top) else { break };
             match self.v.ty(tid)? {
                 TypeRef::Ref { lifetime, inner, .. } => {
-                    if let Some(nm) = lifetime {
-                        let text = self.v.name_text(nm)?;
-                        let kind = if text == "'static" {
-                            Some(tc::WrittenRegion::Static)
-                        } else if text != "'_" {
-                            Some(tc::WrittenRegion::Named)
-                        } else {
-                            None
-                        };
-                        if let Some(kind) = kind {
-                            self.out.closure_param_regions.push(tc::ClosureParamRegion {
-                                closure,
-                                param,
-                                path,
-                                own: 0,
-                                kind,
-                            });
-                        }
+                    if let Some(nm) = lifetime
+                        && let Some(kind) = classify(self.v, nm, &bound, bound_len)?
+                    {
+                        self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                            closure,
+                            param,
+                            path,
+                            own: 0,
+                            kind,
+                        });
                     }
                     if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
                         && let Some(slot) = stack.get_mut(sp)
                     {
-                        *slot = (inner, next);
+                        *slot = Frame::Visit(inner, next);
                         sp += 1;
                     }
                 }
@@ -826,7 +865,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                     if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
                         && let Some(slot) = stack.get_mut(sp)
                     {
-                        *slot = (inner, next);
+                        *slot = Frame::Visit(inner, next);
                         sp += 1;
                     }
                 }
@@ -837,9 +876,74 @@ impl Conv<'_, '_, '_, '_, '_> {
                             && let Some(next) = tc::ClosureParamRegion::push_step(path, ci_u32)
                             && let Some(slot) = stack.get_mut(sp)
                         {
-                            *slot = (TypeId(id), next);
+                            *slot = Frame::Visit(TypeId(id), next);
                             sp += 1;
                         }
+                    }
+                }
+                TypeRef::FnPtr { params, ret, .. } => {
+                    let mut children: [(TypeId, u32); 16] = [(TypeId(0), 0); 16];
+                    let mut clen = 0usize;
+                    let mut ci = 0u32;
+                    for &row in self.v.rows(params)? {
+                        let p = Param::decode(row)?;
+                        if p.variadic {
+                            continue;
+                        }
+                        if let Some(ty) = p.ty {
+                            if let Some(slot) = children.get_mut(clen) {
+                                *slot = (ty, ci);
+                                clen += 1;
+                            }
+                            ci += 1;
+                        }
+                    }
+                    if let Some(ret_ty) = ret
+                        && let Some(slot) = children.get_mut(clen)
+                    {
+                        *slot = (ret_ty, ci);
+                        clen += 1;
+                    }
+                    if let Some(slice) = children.get(..clen) {
+                        for &(t, child_idx) in slice.iter().rev() {
+                            if let Some(next) = tc::ClosureParamRegion::push_step(path, child_idx)
+                                && let Some(slot) = stack.get_mut(sp)
+                            {
+                                *slot = Frame::Visit(t, next);
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+                TypeRef::For { binder, inner } => {
+                    let prev_bound = bound_len;
+                    for &row in self.v.rows(binder)? {
+                        if let GenericParam::Lifetime { name, .. } = GenericParam::decode(row)? {
+                            let nm = self.name(name)?;
+                            if let Some(dst) = bound.get_mut(bound_len) {
+                                *dst = nm;
+                                bound_len += 1;
+                            }
+                        }
+                    }
+                    let pushed_pop = if bound_len != prev_bound {
+                        if let Some(slot) = stack.get_mut(sp) {
+                            *slot = Frame::PopBound(prev_bound);
+                            sp += 1;
+                            true
+                        } else {
+                            bound_len = prev_bound;
+                            continue;
+                        }
+                    } else {
+                        false
+                    };
+                    if let Some(slot) = stack.get_mut(sp) {
+                        *slot = Frame::Visit(inner, path);
+                        sp += 1;
+                    } else if pushed_pop {
+                        sp -= 1;
+                        bound_len = prev_bound;
                     }
                 }
                 TypeRef::Path(path_idx) => {
@@ -869,15 +973,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                     for &row in rows {
                         match GenericArg::decode(row)? {
                             GenericArg::Lifetime(nm) => {
-                                let text = self.v.name_text(nm)?;
-                                let kind = if text == "'static" {
-                                    Some(tc::WrittenRegion::Static)
-                                } else if text != "'_" {
-                                    Some(tc::WrittenRegion::Named)
-                                } else {
-                                    None
-                                };
-                                if let Some(kind) = kind {
+                                if let Some(kind) = classify(self.v, nm, &bound, bound_len)? {
                                     self.out.closure_param_regions.push(tc::ClosureParamRegion {
                                         closure,
                                         param,
@@ -908,7 +1004,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                             if let Some(next) = tc::ClosureParamRegion::push_step(path, ci)
                                 && let Some(slot) = stack.get_mut(sp)
                             {
-                                *slot = (t, next);
+                                *slot = Frame::Visit(t, next);
                                 sp += 1;
                             }
                         }
@@ -1423,10 +1519,18 @@ impl Conv<'_, '_, '_, '_, '_> {
                 for (pi, &n) in self.v.rows(c.params)?.iter().enumerate() {
                     let p = Param::decode(n)?;
                     let Some(pat) = p.pat else { return self.refuse("a closure parameter with no pattern", r) };
-                    if let Some(tid) = p.ty {
-                        self.record_closure_param_regions(e, len(pi), tid)?;
-                    }
                     let ty = self.opt_ty(p.ty)?;
+                    if let Some(tid) = p.ty {
+                        let p_idx = len(pi);
+                        let before = self.out.closure_param_regions.len();
+                        let handled = self.types.closure_param_regions(self.v, tid, self.tys, e, p_idx, &mut |r| {
+                            self.out.closure_param_regions.push(r);
+                        });
+                        if !handled {
+                            self.out.closure_param_regions.truncate(before);
+                            self.record_closure_param_regions(e, p_idx, tid)?;
+                        }
+                    }
                     self.out.pat_lists.push(pat);
                     self.out.opt_types.push(ty);
                 }

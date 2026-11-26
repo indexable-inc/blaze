@@ -91,7 +91,7 @@ pub(super) fn drop_impl<'n, S: NamesSource<'n>>(
     let drop_trait = checker_of(drop_lib);
     let spell = Spelling::fixed();
     // An empty block list, as const_select.rs's: no block's `use` is in the trait's scope.
-    let blocks = BlockTraits::module(store.tys.alloc());
+    let blocks = BlockTraits::module(store.work_alloc());
     let self_ = SelfTy::None;
     let world = BodyWorld {
         names,

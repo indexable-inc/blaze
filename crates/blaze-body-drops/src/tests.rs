@@ -58,8 +58,12 @@ fn print(b: &Body<Global>) -> String {
     out
 }
 
+fn test_alloc() -> impl core::alloc::Allocator + Copy {
+    Global
+}
+
 fn try_run<F: DropFacts>(text: &str, facts: &F, plant: Plant) -> Result<Body<Global>, crate::ElabError> {
-    let a = Global;
+    let a = Default::default();
     let input = blaze_body::parse(text, a).unwrap_or_else(|e| panic!("{e:?} in:\n{text}"));
     let v = verify(&input).unwrap_or_else(|e| panic!("the input is refused: {e:?}:\n{text}"));
     elaborate_planted(v, facts, a, plant)
@@ -549,4 +553,147 @@ bb4:
     assert!(printed.contains("drop _2.*"), "droppable Deref drop must stay:\n{printed}");
     assert!(!printed.contains("drop _3[_4]"), "u32 Index drop must be removed:\n{printed}");
     assert!(printed.contains("drop _5[0 of 2]"), "droppable ConstIndex drop must stay:\n{printed}");
+}
+
+#[test]
+fn enum_partial_drop_switches_on_discriminant() {
+    use crate::VariantDrop;
+    let v0_fields = [Part { path: &[Field { index: 0, ty: PTy(2) }], state: PartState::Init }];
+    let v1_fields = [
+        Part { path: &[Field { index: 0, ty: PTy(2) }], state: PartState::Maybe },
+        Part { path: &[Field { index: 1, ty: PTy(2) }], state: PartState::Init },
+    ];
+    let variants = [
+        VariantDrop { discr: 0, variant: 0, parts: &v0_fields },
+        VariantDrop { discr: 1, variant: 1, parts: &v1_fields },
+    ];
+    struct EnumFacts<'a>(&'a [VariantDrop<'a>]);
+    impl<'a> DropFacts for EnumFacts<'a> {
+        fn at(&self, _: Stmt) -> DropState<'_> {
+            DropState::Enum { discr_ty: PTy(4), variants: self.0 }
+        }
+        fn needs_drop(&self, ty: PTy) -> NeedsDrop {
+            if ty == PTy(4) || ty == PTy(0) || ty == PTy(1) { NeedsDrop::No } else { NeedsDrop::Yes }
+        }
+        fn bool_ty(&self) -> PTy {
+            PTy(1)
+        }
+    }
+    let text = "\
+local _0: t0 return
+local _1: t3 arg 0
+bb0:
+  drop _1 then bb1 unwind continue
+bb1:
+  return
+";
+    let out = try_run(text, &EnumFacts(&variants), Plant::None).unwrap();
+    verify(&out).expect("enum partial drop body verifies");
+    let printed = print(&out);
+    assert!(printed.contains("discr _1"), "expected discriminant read:\n{printed}");
+    assert!(printed.contains("switch"), "expected discriminant switch:\n{printed}");
+    assert!(printed.contains("_1#0.0:t2"), "expected variant 0 field 0 drop:\n{printed}");
+    assert!(printed.contains("_1#1.0:t2"), "expected variant 1 field 0 drop:\n{printed}");
+    assert!(printed.contains("_1#1.1:t2"), "expected variant 1 field 1 drop:\n{printed}");
+    assert!(printed.contains("cleanup:"), "expected unwind cleanup ladder:\n{printed}");
+}
+
+#[test]
+fn out_of_block_order_loans_replay_without_id_mismatch() {
+    use blaze_body::body::{ExprId, Mutbl};
+    use blaze_body::{BlockKind, BodyBuilder, BorrowKind, LocalDecl, Role, Span};
+
+    let a = test_alloc();
+    let mut b = BodyBuilder::new_in(a);
+    let _r0 = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let x = b.new_local(LocalDecl { ty: PTy(1), kind: LocalKind::Temp(ExprId(0), Role::Value), mutbl: Mutbl::Not });
+    let r1 = b.new_local(LocalDecl { ty: PTy(2), kind: LocalKind::Temp(ExprId(1), Role::Borrow), mutbl: Mutbl::Not });
+    let r2 = b.new_local(LocalDecl { ty: PTy(2), kind: LocalKind::Temp(ExprId(2), Role::Borrow), mutbl: Mutbl::Not });
+    let xp = b.local_place(x);
+    let r1p = b.local_place(r1);
+    let r2p = b.local_place(r2);
+    let o0 = b.origin(false);
+    let o1 = b.origin(false);
+
+    let bb0 = b.new_block(BlockKind::Normal);
+    let bb1 = b.new_block(BlockKind::Normal);
+    let bb2 = b.new_block(BlockKind::Normal);
+
+    // Fill bb0, then bb2 (emitting L0), then bb1 (emitting L1): loan IDs follow statement order,
+    // not block index order.
+    b.start(bb0);
+    b.terminate(StmtKind::Goto(bb2), Span::default());
+
+    b.start(bb2);
+    let _l0 = b.borrow(r1p, BorrowKind::Shared, xp, o0, Span::default());
+    b.terminate(StmtKind::Goto(bb1), Span::default());
+
+    b.start(bb1);
+    let _l1 = b.borrow(r2p, BorrowKind::Shared, xp, o1, Span::default());
+    b.terminate(StmtKind::Return, Span::default());
+
+    let body = b.finish().expect("build body");
+    let v = verify(&body).expect("verify input");
+    struct NoDrops;
+    impl DropFacts for NoDrops {
+        fn at(&self, _: Stmt) -> DropState<'_> { DropState::Uninit }
+        fn needs_drop(&self, _: PTy) -> NeedsDrop { NeedsDrop::No }
+        fn bool_ty(&self) -> PTy { PTy(1) }
+    }
+    let out = crate::elaborate(v, &NoDrops, a).expect("elaborate out-of-order loans");
+    verify(&out).expect("elaborated body verifies");
+}
+
+/// A non-`Copy` local conditionally moved before `StmtKind::Suspend` gets one drop flag checked on
+/// BOTH the `cancel` path (ending in `StmtKind::Cancelled`) and the `resume` path (ending in
+/// `StmtKind::Return`), with zero double-drops and zero leaked drops.
+#[test]
+fn coroutine_suspend_elaborates_cancel_and_resume_drop_flags() {
+    let text = "\
+local _0: t0 return mut
+local _1: t1 arg 0
+local _2: t2 binding pat0 mut
+local _3: t2 temp e0 value
+const c0 = scalar 0x0: t0
+const c1 = scalar 0x1: t2
+bb0:
+  live _2
+  _2 = const c1
+  switch copy _1 [0 -> bb2] else bb1
+bb1:
+  _3 = move _2
+  goto bb2
+bb2:
+  suspend resume bb3 cancel bb4
+bb3:
+  drop _2 then bb5 unwind continue
+bb5:
+  dead _2
+  _0 = const c0
+  return
+bb4:
+  drop _2 then bb6 unwind continue
+bb6:
+  dead _2
+  cancelled
+";
+    struct MaybeOnDrops;
+    impl DropFacts for MaybeOnDrops {
+        fn at(&self, _: Stmt) -> DropState<'_> {
+            DropState::Maybe
+        }
+        fn needs_drop(&self, ty: PTy) -> NeedsDrop {
+            if ty == PTy(2) { NeedsDrop::Yes } else { NeedsDrop::No }
+        }
+        fn bool_ty(&self) -> PTy {
+            PTy(1)
+        }
+    }
+    let out = try_run(text, &MaybeOnDrops, Plant::None).expect("elaborates coroutine drops");
+    verify(&out).expect("elaborated coroutine body verifies");
+    let printed = print(&out);
+    assert!(printed.contains("suspend resume"), "suspend preserved:\n{printed}");
+    assert!(printed.contains("cancelled"), "cancelled preserved:\n{printed}");
+    assert!(printed.contains("flag _2"), "drop flag created for _2:\n{printed}");
+    assert_eq!(first_bad_drop(&out), None, "zero double-drops or leaked drops on both resume and cancel:\n{printed}");
 }

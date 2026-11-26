@@ -543,6 +543,7 @@ fn export_glb_gpu_optimized_lods_colliders_materials_and_hierarchy() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     };
     let materials = [STEEL, COPPER];
     let steel = Density::kg_per_m3(7850.0);
@@ -1281,6 +1282,7 @@ fn game_asset_workflow_budgets_fidelity_report_and_mesh_preview() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     };
     const SLATE: Material<'static> = Material {
         name: "slate.roof",
@@ -1291,6 +1293,7 @@ fn game_asset_workflow_budgets_fidelity_report_and_mesh_preview() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     };
     const STONE: Material<'static> = Material {
         name: "stone.chimney",
@@ -1301,6 +1304,7 @@ fn game_asset_workflow_budgets_fidelity_report_and_mesh_preview() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     };
     let materials = [WOOD, SLATE, STONE];
 
@@ -1897,6 +1901,7 @@ fn power_cell_milestone_curvature_edit_keeps_cover_decal_and_highlights_aligned(
             emissive_strength: None,
             clearcoat: None,
             double_sided: false,
+            ..
         },
         Material {
             name: "graphite",
@@ -1907,6 +1912,7 @@ fn power_cell_milestone_curvature_edit_keeps_cover_decal_and_highlights_aligned(
             emissive_strength: None,
             clearcoat: None,
             double_sided: false,
+            ..
         },
         Material {
             name: "titanium",
@@ -1917,6 +1923,7 @@ fn power_cell_milestone_curvature_edit_keeps_cover_decal_and_highlights_aligned(
             emissive_strength: None,
             clearcoat: None,
             double_sided: false,
+            ..
         },
     ];
 
@@ -2253,4 +2260,176 @@ fn power_cell_milestone_curvature_edit_keeps_cover_decal_and_highlights_aligned(
     assert!(eval_point(&t_sel, Vec3::new(0.020, 0.020, 0.0), &mut sc) > 0.0005);
     // Unselected opposite corner (-20, -20, 0) stays sharp (f ≈ 0)!
     assert!(eval_point(&t_sel, Vec3::new(-0.020, -0.020, 0.0), &mut sc).abs() < 1e-4);
+}
+
+#[test]
+fn game_asset_pbr_cc0_sdf_bake_flecs_v42_and_pbr_preview_end_to_end() {
+    use blaze_cad_out::{
+        Anisotropy, FlecsOpts, ImageData, ImageId, Material, NormalTexture, OcclusionTexture, PbrTextures, TextureImage,
+        TextureRef, Transmission, Up,
+    };
+    use blaze_cad_picture::{MaterialLook, PbrOpts, Projection, View};
+    use blaze_pbr::{ProceduralKind, SmartMaterial, synthesize_cc0_pack};
+
+    let alloc = heap();
+    let mut model = Model::new(ModelOpts { alloc, .. });
+    let (hull, canopy) = {
+        let g = model.graph();
+        let body = g.cuboid(BoxOpts { size: mm3(320.0, 180.0, 110.0), round: Length::mm(14.0), .. }).expect("body");
+        let groove = g.cuboid(BoxOpts { size: mm3(160.0, 90.0, 60.0), round: Length::mm(8.0), .. }).expect("groove");
+        let groove = g.place(groove, Placement::shift(Length::mm(30.0), Length::ZERO, Length::mm(55.0))).expect("place groove");
+        let hull = g.difference(body, groove).expect("carve");
+        let glass = g.cuboid(BoxOpts { size: mm3(130.0, 76.0, 48.0), round: Length::mm(10.0), .. }).expect("glass");
+        let glass = g.place(glass, Placement::shift(Length::mm(30.0), Length::ZERO, Length::mm(60.0))).expect("place glass");
+        (hull, glass)
+    };
+    let (hull_id, _) = model.add(PartOpts { solid: hull, name: "hull" }).expect("add hull");
+    model.set_material(hull_id, MaterialRole(0)).expect("mat hull");
+    let (canopy_id, _) = model.add(PartOpts { solid: canopy, name: "canopy" }).expect("add canopy");
+    model.set_material(canopy_id, MaterialRole(1)).expect("mat canopy");
+    model.set_parent(canopy_id, Some(hull_id)).expect("parent");
+
+    let asm_tape = model.assembly_tape(alloc).expect("assembly tape");
+    let pack = synthesize_cc0_pack(
+        ProceduralKind::HullPlating { base_rgb: [0.32, 0.40, 0.48], metallic: 0.72, roughness: 0.34, panels: 2 },
+        64,
+        alloc,
+        alloc,
+    )
+    .expect("synth cc0");
+
+    let images = [
+        TextureImage { name: "hull_albedo", data: ImageData::Rgba8 { width: 64, height: 64, pixels: &pack.albedo.pixels } },
+        TextureImage { name: "hull_normal", data: ImageData::Rgba8 { width: 64, height: 64, pixels: &pack.normal.pixels } },
+        TextureImage { name: "hull_orm", data: ImageData::Rgba8 { width: 64, height: 64, pixels: &pack.orm.pixels } },
+    ];
+    let materials = [
+        Material {
+            name: "hull.titanium",
+            base_colour: [1.0, 1.0, 1.0, 1.0],
+            metallic: 1.0,
+            roughness: 1.0,
+            anisotropy: Some(Anisotropy { strength: 0.55, rotation: 0.0 }),
+            pbr_textures: PbrTextures {
+                base_colour: Some(TextureRef { image: ImageId(0), .. }),
+                normal: Some(NormalTexture { image: ImageId(1), scale: 1.0, .. }),
+                metallic_roughness: Some(TextureRef { image: ImageId(2), .. }),
+                occlusion: Some(OcclusionTexture { image: ImageId(2), strength: 0.9, .. }),
+                ..PbrTextures::NONE
+            },
+            cc0_pack: Some("cc0://blaze/TestHull_64"),
+            ..
+        },
+        Material {
+            name: "canopy.glass",
+            base_colour: [0.35, 0.65, 0.80, 1.0],
+            metallic: 0.0,
+            roughness: 0.06,
+            transmission: Some(Transmission { factor: 0.80, ior: 1.52, thickness: 0.015, .. }),
+            ..
+        },
+    ];
+    let sockets = [
+        PartSocket::new("hull", "thruster.main", Placement::shift(Length::mm(-160.0), Length::ZERO, Length::ZERO)),
+    ];
+
+    let asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc,
+            scratch: alloc,
+            preset: AssetPreset::GameProp,
+            total_budget: Some(TriangleBudget(4_000)),
+            materials: &materials,
+            images: &images,
+            sockets: &sockets,
+            pbr_mesh: Some(PbrMeshOpts::DEFAULT),
+            assembly_tape: Some(&asm_tape),
+            fidelity: None,
+            ..
+        },
+        None,
+    )
+    .expect("build pbr game asset");
+
+    for part in asset.parts.iter() {
+        let v = part.mesh.view();
+        assert!(v.uvs().is_some(), "part {} must have TEXCOORD_0", part.name.as_str());
+        assert!(v.tangents().is_some(), "part {} must have TANGENT", part.name.as_str());
+        assert!(v.colours().is_some(), "part {} must have baked SDF COLOR_0", part.name.as_str());
+    }
+
+    let json_len = u32::from_le_bytes([asset.glb[12], asset.glb[13], asset.glb[14], asset.glb[15]]) as usize;
+    let gltf_json = core::str::from_utf8(&asset.glb[20..20 + json_len]).expect("valid utf8 gltf json");
+    for needle in [
+        "\"TEXCOORD_0\"",
+        "\"TANGENT\"",
+        "\"COLOR_0\"",
+        "\"images\"",
+        "\"KHR_materials_anisotropy\"",
+        "\"KHR_materials_transmission\"",
+        "\"cc0://blaze/TestHull_64\"",
+        "\"thruster.main\"",
+    ] {
+        assert!(gltf_json.contains(needle), "GLB JSON missing {needle}");
+    }
+
+    let flecs = asset
+        .export_flecs_prefab(
+            &materials,
+            &sockets,
+            FlecsOpts {
+                module: Some("ships"),
+                prefab_name: "MiniScout",
+                asset_uri: "assets/mini_scout.glb",
+                up: Up::Y,
+                include_schema: true,
+                alloc,
+                scratch: alloc,
+            },
+        )
+        .expect("export flecs");
+    let flecs_txt = core::str::from_utf8(&flecs).expect("valid utf8 flecs");
+    for needle in [
+        "module ships",
+        "@tree ChildOf",
+        "(OnInstantiate, Copy)",
+        "(OnInstantiate, Inherit)",
+        "prefab MiniScout",
+        "cc0://blaze/TestHull_64",
+        "thruster.main",
+    ] {
+        assert!(flecs_txt.contains(needle), "Flecs v4.2 prefab missing {needle}:\n{flecs_txt}");
+    }
+
+    let looks = [
+        MaterialLook { textures: pack.view(1.0, false), smart: SmartMaterial::PAINTED_METAL },
+        MaterialLook::NONE,
+    ];
+    let view = View {
+        eye: mm3(480.0, -420.0, 260.0),
+        target: mm3(0.0, 0.0, 20.0),
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 96,
+        height: 72,
+        ..
+    };
+    let pbr = PbrOpts { ao_steps: 4, shadow_samples: 2, ..PbrOpts::STUDIO };
+    let pic_a = asset.preview_pbr(&materials, &looks, view, pbr, 1, alloc, alloc).expect("pbr preview a");
+    let pic_b = asset.preview_pbr(&materials, &looks, view, pbr, 1, alloc, alloc).expect("pbr preview b");
+    assert_eq!(&*pic_a.pixels, &*pic_b.pixels, "PBR+GI preview must be bit-for-bit deterministic");
+    assert!(pic_a.stats.hits > 100, "preview must hit the asset: {}", pic_a.stats.hits);
+
+    let prepared = asset.prepare_pbr_scene(&materials, alloc, alloc).expect("prepare_pbr_scene");
+    let scene_ref = prepared.as_ref();
+    let params = blaze_cad_picture::PbrRenderParams { material_looks: &looks, supersample: 1, .. };
+    let n = (view.width * view.height) as usize;
+    let mut hdr = std::vec![[0.0f64; 3]; n];
+    let mut gbuf = std::vec![blaze_cad_picture::GBufferPixel::SKY; n];
+    let mut depth = std::vec![f64::INFINITY; n];
+    let st = scene_ref
+        .render_pbr_rows(view, &params, &pbr, 0, view.height, &mut hdr, &mut gbuf, &mut depth)
+        .expect("render_pbr_rows");
+    assert_eq!(st.hits, pic_a.stats.hits, "PreparedMeshScene ray hits must match preview_pbr");
 }

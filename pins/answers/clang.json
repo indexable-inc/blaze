@@ -665,6 +665,712 @@
         "stdout": "",
         "stderr": ""
       }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-?"
+      ],
+      "env": {},
+      "files": {},
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "c++",
+      "args": [
+        "-?"
+      ],
+      "env": {},
+      "files": {},
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-E",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 430 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
+        "stderr": "$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "c++",
+      "args": [
+        "-E",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 500 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
+        "stderr": "clang-23: warning: treating 'c' input as 'c++' when in C++ mode, this behavior is deprecated [-Wdeprecated]\n$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-overriding-option",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-overriding-t-option",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": "warning: unknown warning option '-Wno-overriding-t-option'; did you mean '-Wno-overriding-option'? [-Wunknown-warning-option]\n1 warning generated.\n"
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-command-line-argument",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-function",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fdata-sections",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-ffunction-sections",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fmerge-all-constants",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fno-builtin",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fsanitize-undefined-strip-path-components=-1",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fstack-clash-protection",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-ftls-model=initial-exec",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-march=armv8-a+crc",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-mno-avx",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unsupported option '-mno-avx' for target 'aarch64-unknown-linux-gnu'\n"
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-mno-omit-leaf-frame-pointer",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-pedantic",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "c++",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-mno-omit-leaf-frame-pointer",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.cpp"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "c++",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-std=c++17",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.cpp"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-ffile-prefix-map=/package=",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wbad-function-cast",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-value",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fvisibility=hidden",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-std=c11",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
     }
   ]
 }

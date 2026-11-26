@@ -193,6 +193,7 @@ mod format;
 mod handle;
 mod image;
 mod lent;
+pub mod par;
 mod snapshot;
 mod verified;
 
@@ -237,15 +238,17 @@ pub(crate) fn test_root() -> blaze_mem::Frame {
 }
 
 pub use self::core::{
-    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, DEFAULT_MAX_STORE_BYTES, Found, GRACE_NS, GcPlan, Got, INDEX_KEYS_MOST, LEASE_NS, LentRecord, Liveness, LockStep, LockWaited,
-    Lost, MIN_MAX_STORE_BYTES, Named, POINTER_LEN, Placed, Plain, PlainConfig, Probe, Probes, PutError, PutPath, ROOT_INDEXES_MOST, ROOT_LIFE_NS, Renewed, Report, SEGMENTS_MOST, SLICE_BYTES,
-    SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WATERMARK_HIGH_PCT, WATERMARK_LOW_PCT, WINDOW, beside_key, store_leaf, watermark_bytes,
+    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, CommitDurability, Committed, DEFAULT_MAX_STORE_BYTES, Found, GRACE_NS, GcPlan, Got, INDEX_KEYS_MOST, LEASE_NS, LentRecord, Liveness,
+    LockStep, LockWaited, Lost, MIN_MAX_STORE_BYTES, Named, NoPidCheck, POINTER_LEN, PidCheck, PidLiveness, Placed, Plain, PlainConfig, Probe, Probes, PutError, PutPath, ROOT_INDEXES_MOST,
+    ROOT_LIFE_NS, Renewed, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WATERMARK_HIGH_PCT, WATERMARK_LOW_PCT, WINDOW, beside_key, store_leaf,
+    watermark_bytes,
 };
 pub use self::arena::Visibility;
 pub use self::lent::{Aligned16, CommittedLend, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, PutTally, first_difference};
 pub use self::snapshot::{Proved, SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};
-pub use self::driven::{Driven, ExclusiveLock, HeadIdentity, LocalDir, lower_this_thread};
-pub use self::format::{Described, Entry, FORMAT, FORMS, PlaceName, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
+pub use self::driven::{Driven, ExclusiveLock, HeadIdentity, LocalDir, OsPidCheck, lower_this_thread};
+pub use self::format::{Described, Entry, FORMAT, FORMS, PlaceName, SEGMENT_DIGEST, SEGMENT_FORMAT, Segment, check_segment, check_segment_par, describe, find_many, record_crc, seal_segment};
+pub use self::par::{Par, Serial};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};
 pub use self::image::{ImageError, Placement, StartupImage};
 pub use self::settings::Settings;

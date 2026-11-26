@@ -232,7 +232,7 @@ impl Maker for SeedMaker<'_, '_> {
 
     fn step(&mut self, _: Need, _: &mut (), _: Option<Given>) -> Step {
         let _cost = super::tables::cost::Cost::enter_want(self.store.cost, self.want);
-        let filed = self.seeds.seed(self.store, self.keys, self.want, self.store.tys.alloc());
+        let filed = self.seeds.seed(self.store, self.keys, self.want, self.store.work_alloc());
         if matches!(filed, Ok(Seeded::Filed)) && self.store.made(self.want) { Step::Made(0) } else { Step::Failed(0) }
     }
 }
@@ -245,7 +245,7 @@ pub fn ask_seed<'n>(store: &Store<'n>, keys: &Keys, seeds: &dyn HeadSeed<'n>, wa
         return Err(AskRefused { need, why: "the store meets its heads again (`AsksMet::Again`); the one ask is the `Once` path" });
     };
     let mut maker = SeedMaker { store, keys, seeds, want };
-    let mut asker: Asker<'_, Alloc<'static>, ()> = Asker::new(AskerOpts { board, me: ONE_TASK, alloc: store.tys.alloc(), most: blaze_ask::ask::MOST_DEPTH, plant: Plant::Clean });
+    let mut asker: Asker<'_, Alloc<'static>, ()> = Asker::new(AskerOpts { board, me: ONE_TASK, alloc: store.work_alloc(), most: blaze_ask::ask::MOST_DEPTH, plant: Plant::Clean });
     // One task: a publish of this store's asks wakes nobody.
     let got = asker.ask(&mut maker, need, FUEL, &mut |_| {});
     let counts: Counts = *asker.counts();
@@ -281,10 +281,13 @@ fn refused_why(error: &AskError<Alloc<'static>>) -> &'static str {
     }
 }
 
-/// A body's gate: off outside a check, collecting the round-0 prefetch, then its set.
+/// A body's gate: off outside a check (or when unmeasured), collecting the round-0 prefetch
+/// questions without hashing, deferred until a later `Outcome::Need` actually inspects it, then
+/// materialized as its [`GateSet`].
 pub enum Gate {
     Off,
-    Collecting(AVec<'static, Need>),
+    Collecting(AVec<'static, tc::Question>),
+    Deferred(AVec<'static, tc::Question>),
     Set(GateSet<Alloc<'static>>),
 }
 
@@ -295,17 +298,30 @@ impl Gate {
     }
 
     /// The prefetch's questions, while collecting (a later round's prefetch of its hints is
-    /// the last round's reads, not the gate's).
+    /// the last round's reads, not the gate's). Questions are stored raw here and only formatted
+    /// and hashed into [`Need`]s if a round actually ends in `Outcome::Need` ([`Self::materialize`]).
     pub fn note(&mut self, questions: &[tc::Question]) {
-        if let Gate::Collecting(needs) = self {
-            needs.extend(questions.iter().map(|&q| need_of_question(q)));
+        if let Gate::Collecting(qs) = self {
+            qs.extend_from_slice(questions);
         }
     }
 
-    /// Round 0's walk is over: the set, sorted and each need once.
-    pub fn freeze(&mut self, alloc: Alloc<'static>) {
-        if let Gate::Collecting(needs) = core::mem::replace(self, Gate::Off) {
-            *self = Gate::Set(GateSet::of(needs.iter().copied(), alloc));
+    /// Round 0's walk is over: stops collecting and defers building the [`GateSet`] until a
+    /// round actually inspects the gate (a clean round-0 check hashes nothing).
+    pub fn freeze(&mut self, _alloc: Alloc<'static>) {
+        if matches!(self, Gate::Collecting(_))
+            && let Gate::Collecting(qs) = core::mem::replace(self, Gate::Off)
+        {
+            *self = Gate::Deferred(qs);
+        }
+    }
+
+    /// Builds the [`GateSet`] from the deferred round-0 prefetch questions on demand.
+    pub fn materialize(&mut self, alloc: Alloc<'static>) {
+        if matches!(self, Gate::Deferred(_))
+            && let Gate::Deferred(qs) = core::mem::replace(self, Gate::Off)
+        {
+            *self = Gate::Set(GateSet::of(qs.iter().copied().map(need_of_question), alloc));
         }
     }
 
@@ -315,16 +331,25 @@ impl Gate {
     pub fn class(&self, need: &Need) -> After {
         match self {
             Gate::Set(set) => set.after_entry(need),
+            Gate::Deferred(qs) => {
+                if !need.fact.gated(need.detail) {
+                    After::Expected
+                } else if qs.iter().any(|&q| need_of_question(q) == *need) {
+                    After::Named
+                } else {
+                    After::Gap
+                }
+            }
             Gate::Off | Gate::Collecting(_) if need.fact.gated(need.detail) => After::Gap,
             Gate::Off | Gate::Collecting(_) => After::Expected,
         }
     }
 
-    /// The set's needs (empty until frozen).
+    /// The set's needs (empty until materialized).
     pub fn needs(&self) -> &[Need] {
         match self {
             Gate::Set(set) => set.needs(),
-            Gate::Off | Gate::Collecting(_) => &[],
+            Gate::Off | Gate::Collecting(_) | Gate::Deferred(_) => &[],
         }
     }
 }

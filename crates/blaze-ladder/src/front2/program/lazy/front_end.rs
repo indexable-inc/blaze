@@ -541,7 +541,17 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         let names = self.front.names;
         let lib = self.front.keys.library_in(names, tr)?;
         let mut declared = false;
-        names.each_member(lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some(name));
+        names.each_member_matching(
+            lib,
+            &mut |kind, mname| {
+                if kind == blaze_surface::ItemKind::Function && mname == Some(name) {
+                    crate::front2::source::MemberWant::NameOnly
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |_| declared = true,
+        );
         declared.then(|| crate::front2::keys::member_key_of(tr, MemberKind::Fn, name))
     }
 
@@ -552,7 +562,17 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
             return Some(filed);
         }
         let mut declared = false;
-        self.front.names.each_member(lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some("report"));
+        self.front.names.each_member_matching(
+            lib,
+            &mut |kind, mname| {
+                if kind == blaze_surface::ItemKind::Function && mname == Some("report") {
+                    crate::front2::source::MemberWant::NameOnly
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |_| declared = true,
+        );
         declared.then(|| crate::front2::keys::member_key_of(tr, MemberKind::Fn, "report"))
     }
 

@@ -21,6 +21,9 @@ exclude = [
     # build steps on macOS. Its own workspace with its own lock; nothing depends on it and
     # nothing selects it.
     "crates/blaze-hvbox",
+    # Native macOS shell app (docs/v2/plan/design/sh.md): AppKit/Metal/CoreText through objc2;
+    # its own workspace with its own lock while blaze-sh and blaze-vt stay workspace members.
+    "crates/blaze-shell",
     "demo",
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
@@ -61,6 +64,8 @@ version = "0.20261105.4"
 # A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
 # saying what moved (docs/cargo.md, "Lock files").
 lock = "required"
+# Every internal workspace member must use `bstd` (`edition = "blaze-2026.11"`), never Rust's `std`.
+std = "bstd"
 
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
 # pins/llvm.json names for the target, checks its sha256, unpacks it read-only
@@ -205,8 +210,12 @@ blaze-bitflags.opt-level = 2
 blaze-sys.opt-level = 2
 
 [profile.release]
-# Set this to 1 or 2 to get more useful backtraces in debugger.
-debug = 0
+# Emit line-table DWARF packed into a side `.dSYM`/`.dwp` bundle and strip the running binary's
+# symbol table: shrinks macOS `__LINKEDIT` by ~13.6 MB and cuts `LC_CODE_SIGNATURE` hashing and
+# page-ins at startup while preserving full symbols in `.dSYM` for `lldb`/`samply`/crash reports.
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = "symbols"
 # Incremental: `release` is the bootstrap binary the harnesses, the runner and the self-build rebuild
 # after every edit, so its rebuild time is the edit loop ("make release mode at least incremental",
 # Andrew, 2026-11-03; a release rebuild took 5-12 min). The shipped binary is `dist`, built from
@@ -218,7 +227,7 @@ incremental = true
 [profile.release.build-override]
 opt-level = 3
 codegen-units = 16
-debug = 0
+debug = "line-tables-only"
 incremental = true
 
 # As in `profile.dev.package`: build dependencies are built at opt-level 0 otherwise.
@@ -339,6 +348,7 @@ blaze-lower = { path = "crates/blaze-lower" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-math = { path = "crates/blaze-math" }
 blaze-native = { path = "crates/blaze-native" }
+blaze-pbr = { path = "crates/blaze-pbr" }
 blaze-pins = { path = "crates/blaze-pins" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-producers = { path = "crates/blaze-producers" }
@@ -396,6 +406,8 @@ blaze-ed25519 = { path = "crates/blaze-ed25519" } # Ed25519 verification written
 # The SwissTable group probe and `Index`, re-exported as `blaze_mem::swiss`.
 blaze-swiss = { path = "crates/blaze-swiss" }
 blaze-hash = { path = "crates/blaze-hash", features = ["shared"] }
+# Pure no_std, zero-unsafe, sans-IO HTML5 tokenizer, arena DOM, and document renderer.
+blaze-html = { path = "crates/blaze-html" }
 # blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids", features = ["serde"] }
@@ -443,6 +455,8 @@ blaze-h2 = { path = "crates/blaze-h2" }
 blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: checked addresses, the one home; bstd re-exports them.
 # A commit's files over git's smart HTTP protocol v2: pkt-lines, packs with deltas, SHA-1 object ids.
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
+# Sans-IO, hardware-floor Git prompt and status engine for Starship-class tools.
+blaze-git = { path = "crates/blaze-git" }
 # What a run may see and what it saw: roots, RelPath, the read list and its one check (no_std, sans-IO).
 blaze-roots = { path = "crates/blaze-roots" }
 blaze-rung-tiers = { path = "crates/blaze-rung-tiers" }
@@ -485,8 +499,6 @@ blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-meter = { path = "crates/blaze-meter" } # D169: each stretch's use (allocations, faults, instructions, effects, store, hashing, waits) from thread-local counters, read without a lock.
-blaze-names-demand = { path = "crates/blaze-names-demand" } # Names by demand: a sans-IO machine that asks a `Source` for one module's entries at a time.
-blaze-names-source = { path = "crates/blaze-names-source" } # blaze-names-demand's `Source` over real inputs (outlines, macro write summaries).
 blaze-malloc = { path = "crates/blaze-malloc" } # blaze's general-purpose allocator: a heap per thread, size-class spans, remote frees by queue (docs/v2/plan/design/malloc.md).
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.
@@ -519,14 +531,20 @@ blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR
 blaze-ecs = { path = "crates/blaze-ecs" } # Pure no_std, zero-unsafe, sans-IO relational ECS + Explorer API & WASM/WebGPU UI engine.
 blaze-ecs-wasm = { path = "crates/blaze-ecs-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ecs::ui.
 blaze-json = { path = "crates/blaze-json" }
+blaze-preview = { path = "crates/blaze-preview" } # Pure no_std, sans-IO syntax highlighting, Markdown, and structured file previews.
 blaze-semver = { path = "crates/blaze-semver" }
+blaze-sh = { path = "crates/blaze-sh" } # bstd::sh: a sans-IO nushell-like structured shell core with O(1) CoW forkable state (docs/v2/plan/design/sh.md).
 blaze-site = { path = "crates/blaze-site" } # Pure no_std, zero-unsafe, sans-IO Blaze website engine over blaze-ecs + blaze-ui + den Slug GPU text.
 blaze-site-wasm = { path = "crates/blaze-site-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-site + generated WebGPU Slug/SDF shaders.
+blaze-sniff = { path = "crates/blaze-sniff" } # Pure no_std, sans-IO file/directory content and metadata sniffer.
+blaze-ssh = { path = "crates/blaze-ssh" } # Pure no_std, sans-IO SSH config, known_hosts, and session protocol parser.
 blaze-tab = { path = "crates/blaze-tab" } # Blaze's LLM-first tabular data format inspired by NUON (sparse schemas, lossless Value).
 blaze-toml = { path = "crates/blaze-toml" }
 blaze-ui = { path = "crates/blaze-ui" } # Pure no_std, zero-unsafe, sans-IO relational ECS UI library + Rust->WGSL/MSL WebGPU renderer.
 blaze-ui-wasm = { path = "crates/blaze-ui-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ui + generated WebGPU shaders.
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
+blaze-vim = { path = "crates/blaze-vim" } # Pure no_std, sans-IO Vim modal editing engine with pluggable text objects.
+blaze-vt = { path = "crates/blaze-vt" } # bstd::vt: a sans-IO terminal emulator core with ghostty's coverage (docs/v2/plan/design/vt.md).
 # WASI preview 1 for wasm guests at both pointer widths.
 blaze-wasi = { path = "crates/blaze-wasi" }
 # blaze's own RFC 8878 Zstandard with raw-content dictionaries and XXH64: no_std, sans-IO, zero-unsafe, bounded.
@@ -683,10 +701,10 @@ zip = { version = "9.1.3", default-features = false }
 
 # astlog, ix's Datalog over tree-sitter trees (tools/astlog/UPSTREAM), and what only it uses. The
 # grammars are the languages blaze lints: Rust, TOML and Python.
-astlog-core = { path = "tools/astlog/core" }
 ast-merge-langs = { path = "tools/astlog/langs" }
-edit-applier = { path = "tools/astlog/edit-applier" }
+astlog-core = { path = "tools/astlog/core" }
 astlog-engine = { path = "tools/astlog/engine" }
+edit-applier = { path = "tools/astlog/edit-applier" }
 error-chain = { path = "tools/astlog/error-chain" }
 similar = "3.2.1"
 tree-sitter = "0.26.13"

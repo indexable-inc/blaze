@@ -34,6 +34,7 @@ struct CustomAdt {
     kind: AdtKind,
     variants: StdVec<Variant>,
     fields: StdVec<Field>,
+    repr: ReprAttrs,
 }
 
 /// The fixture world, plus bodies in the text form by item.
@@ -200,7 +201,7 @@ impl Tw {
             ctor: CtorKind::Braces,
             fields: List { start: 0, len: fs.len() as u32 },
         }]);
-        self.custom_adts.push(CustomAdt { key, kind: AdtKind::Union, variants: vs, fields: fs });
+        self.custom_adts.push(CustomAdt { key, kind: AdtKind::Union, variants: vs, fields: fs, repr: ReprAttrs::RUST });
         self
     }
 
@@ -210,7 +211,26 @@ impl Tw {
             kind: AdtKind::Enum,
             variants: StdVec::new(),
             fields: StdVec::new(),
+            repr: ReprAttrs::RUST,
         });
+        self
+    }
+
+    fn with_aligned_struct(mut self, key: ItemKey, align_log2: u8, fields: &[(&str, PTy)]) -> Tw {
+        let mut fs = StdVec::new();
+        for &(name, ty) in fields {
+            fs.push(Field { name: Name::of(name), ty });
+        }
+        let vs = StdVec::from([Variant {
+            key,
+            name: Name::of("Aligned"),
+            ctor: CtorKind::Braces,
+            fields: List { start: 0, len: fs.len() as u32 },
+        }]);
+        let mut repr = ReprAttrs::RUST;
+        repr.c = true;
+        repr.align = Some(align_log2);
+        self.custom_adts.push(CustomAdt { key, kind: AdtKind::Struct, variants: vs, fields: fs, repr });
         self
     }
 }
@@ -260,8 +280,8 @@ impl LayoutFacts for Tw {
         self.w.adt(key)
     }
     fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
-        if self.custom_adts.iter().any(|c| c.key == key) {
-            return Ok(ReprAttrs::RUST);
+        if let Some(c) = self.custom_adts.iter().find(|c| c.key == key) {
+            return Ok(c.repr);
         }
         self.w.repr(key)
     }
@@ -1958,4 +1978,361 @@ bb6:
         .with_intrinsic(I_SGET, Intrinsic::SliceGetUnchecked)
         .with(ROOT, &body);
     assert_eq!(u32_value(&tw), 76);
+}
+
+#[test]
+fn intern_live_root_local_and_refuse_dangling_local() {
+    let (mut tw, t) = world();
+    let ref_u32 = tw.w.ty("&u32").0;
+
+    // Live unscoped root local (e.g., promoted borrow `&42` in a constant initializer) interns as
+    // a second allocation pointed to by `_0`.
+    let live_body = format!(
+        "\
+local _0: t{r} return mut
+local _1: t{u} temp e0 value
+origin 'o0
+const c0 = scalar 0x2a: t{u}
+bb0:
+  _1 = const c0
+  _0 = borrow shared _1 L0 'o0
+  return
+",
+        r = ref_u32,
+        u = t.u32,
+    );
+    let tw_live = tw.with(ROOT, &live_body);
+    let rec = run(&tw_live, Limits::DEFAULT).expect("expected Done for live root local borrow");
+    assert_eq!(rec.allocs.len(), 2);
+    assert_eq!(rec.allocs[0].relocs.len(), 1);
+    assert_eq!(rec.allocs[0].relocs[0].target, DataTarget::Local(1));
+    assert_eq!(rec.allocs[1].bytes.as_slice(), &42u32.to_le_bytes());
+
+    // Scoped local whose storage ends before `return` must be refused as `Dangling`.
+    let (mut tw2, t2) = world();
+    let ref_u32_2 = tw2.w.ty("&u32").0;
+    let dead_body = format!(
+        "\
+local _0: t{r} return mut
+local _1: t{u} temp e0 value
+origin 'o0
+const c0 = scalar 0x2a: t{u}
+bb0:
+  live _1
+  _1 = const c0
+  _0 = borrow shared _1 L0 'o0
+  dead _1
+  return
+",
+        r = ref_u32_2,
+        u = t2.u32,
+    );
+    tw2 = tw2.with(ROOT, &dead_body);
+    let e = refused(&tw2, Limits::DEFAULT);
+    assert!(matches!(e.fault, Fault::Refused(Refusal::Dangling)), "{e:?}");
+}
+
+/// Static interior mutability (`written_in_place` / `DataAlloc::mutable`):
+/// matches `blaze-consteval` on `UnsafeCell` structs, tuples, arrays, enums, `&AtomicU8`,
+/// `&mut`/`*mut` pointees, plain values, and constants (always read-only), plus the causal
+/// control with `UnsafeCell` unmarked.
+#[test]
+fn static_written_in_place_matches_interior_mutability() {
+    let check_case = |cells: bool| {
+        let mut w = World::new();
+        let cell = w.strukt("UnsafeCell", &[("value", "u8")]);
+        if cells {
+            w.unsafe_cell_is(cell);
+        }
+        let atomic = w.strukt("AtomicU8", &[("v", "UnsafeCell")]);
+        let slot = w.enum_("Slot", None, &[("Empty", &[][..], None), ("Full", &["UnsafeCell"][..], None)]);
+        w.stat("S_ATOMIC", "AtomicU8", "AtomicU8 { v: UnsafeCell { value: 1 } }");
+        w.stat("S_TUPLE", "(u8, AtomicU8)", "(2, AtomicU8 { v: UnsafeCell { value: 3 } })");
+        w.stat("S_ARR", "[AtomicU8; 2]", "[AtomicU8 { v: UnsafeCell { value: 4 } }, AtomicU8 { v: UnsafeCell { value: 5 } }]");
+        w.stat("S_ENUM", "Slot", "Slot::Full(UnsafeCell { value: 6 })");
+        w.stat("S_REF_ATOMIC", "&AtomicU8", "&AtomicU8 { v: UnsafeCell { value: 7 } }");
+        w.stat("S_MUT_PTR", "*mut u8", "0 as *mut u8");
+        w.stat("S_PLAIN", "u32", "9");
+        w.konst("K_ATOMIC", "AtomicU8", "AtomicU8 { v: UnsafeCell { value: 1 } }");
+        w.build();
+
+        let u8_ty = w.ty("u8").0;
+        let u32_ty = w.ty("u32").0;
+        let cell_ty = w.ty("UnsafeCell").0;
+        let atomic_ty = w.ty("AtomicU8").0;
+        let tup_ty = w.ty("(u8, AtomicU8)").0;
+        let arr_ty = w.ty("[AtomicU8; 2]").0;
+        let slot_ty = w.ty("Slot").0;
+        let ref_atomic_ty = w.ty("&AtomicU8").0;
+        let mut_ptr_u8 = w.ty("*mut u8").0;
+
+        let s_atomic = w.key("S_ATOMIC");
+        let s_tuple = w.key("S_TUPLE");
+        let s_arr = w.key("S_ARR");
+        let s_enum = w.key("S_ENUM");
+        let s_ref_atomic = w.key("S_REF_ATOMIC");
+        let s_mut_ptr = w.key("S_MUT_PTR");
+        let s_plain = w.key("S_PLAIN");
+        let k_atomic = w.key("K_ATOMIC");
+
+        let mut tw = Tw {
+            w,
+            bodies: StdVec::new(),
+            promoted_bodies: StdVec::new(),
+            promoted_records: StdVec::new(),
+            anon_bodies: StdVec::new(),
+            anon_records: StdVec::new(),
+            extra_records: StdVec::new(),
+            mut_statics: StdVec::new(),
+            closures: StdVec::new(),
+            custom_adts: StdVec::new(),
+            extra_intrinsics: StdVec::new(),
+            drop_adts: StdVec::new(),
+            fn_once_item: None,
+            type_names_on: false,
+        };
+        let _ = (atomic, slot);
+        let mk_atomic = format!(
+            "\
+local _0: t{atomic_ty} return mut
+local _1: t{cell_ty} temp e0 value
+const c0 = scalar 0x1: t{u8_ty}
+bb0:
+  _1 = adt t{cell_ty}#0(const c0)
+  _0 = adt t{atomic_ty}#0(move _1)
+  return
+",
+        );
+        let mk_tuple = format!(
+            "\
+local _0: t{tup_ty} return mut
+local _1: t{cell_ty} temp e0 value
+local _2: t{atomic_ty} temp e1 value
+const c0 = scalar 0x2: t{u8_ty}
+const c1 = scalar 0x3: t{u8_ty}
+bb0:
+  _1 = adt t{cell_ty}#0(const c1)
+  _2 = adt t{atomic_ty}#0(move _1)
+  _0 = tuple t{tup_ty}(const c0, move _2)
+  return
+",
+        );
+        let mk_arr = format!(
+            "\
+local _0: t{arr_ty} return mut
+local _1: t{cell_ty} temp e0 value
+local _2: t{atomic_ty} temp e1 value
+local _3: t{cell_ty} temp e2 value
+local _4: t{atomic_ty} temp e3 value
+const c0 = scalar 0x4: t{u8_ty}
+const c1 = scalar 0x5: t{u8_ty}
+bb0:
+  _1 = adt t{cell_ty}#0(const c0)
+  _2 = adt t{atomic_ty}#0(move _1)
+  _3 = adt t{cell_ty}#0(const c1)
+  _4 = adt t{atomic_ty}#0(move _3)
+  _0 = array t{arr_ty}(move _2, move _4)
+  return
+",
+        );
+        let mk_enum = format!(
+            "\
+local _0: t{slot_ty} return mut
+local _1: t{cell_ty} temp e0 value
+const c0 = scalar 0x6: t{u8_ty}
+bb0:
+  _1 = adt t{cell_ty}#0(const c0)
+  _0 = adt t{slot_ty}#1(move _1)
+  return
+",
+        );
+        let mk_ref_atomic = format!(
+            "\
+local _0: t{ref_atomic_ty} return mut
+local _1: t{cell_ty} temp e0 value
+local _2: t{atomic_ty} temp e1 value
+origin 'o0
+const c0 = scalar 0x7: t{u8_ty}
+bb0:
+  _1 = adt t{cell_ty}#0(const c0)
+  _2 = adt t{atomic_ty}#0(move _1)
+  _0 = borrow shared _2 L0 'o0
+  return
+",
+        );
+        let mk_mut_ptr = format!(
+            "\
+local _0: t{mut_ptr_u8} return mut
+local _1: t{u8_ty} temp e0 value mut
+const c0 = scalar 0x8: t{u8_ty}
+bb0:
+  _1 = const c0
+  _0 = raw mut _1
+  return
+",
+        );
+        let mk_plain = format!(
+            "\
+local _0: t{u32_ty} return mut
+const c0 = scalar 0x9: t{u32_ty}
+bb0:
+  _0 = const c0
+  return
+",
+        );
+
+        tw = tw
+            .with(s_atomic, &mk_atomic)
+            .with(s_tuple, &mk_tuple)
+            .with(s_arr, &mk_arr)
+            .with(s_enum, &mk_enum)
+            .with(s_ref_atomic, &mk_ref_atomic)
+            .with(s_mut_ptr, &mk_mut_ptr)
+            .with(s_plain, &mk_plain)
+            .with(k_atomic, &mk_atomic);
+
+        let eval_marks = |item: ItemKey| -> OwnVec<bool, Alloc<'static>> {
+            let a = heap().alloc();
+            let mut layout = Layouts::new_in(a);
+            let mut ground = PortableTys::new_in(a);
+            let rec = match eval_body(&tw, &mut layout, &mut ground, item, List::EMPTY, Limits::DEFAULT, a).expect("eval") {
+                Answer::Done(r) => r,
+                Answer::Need(n) => panic!("unexpected need {n:?}"),
+            };
+            let mut out = OwnVec::with_capacity_in(rec.allocs.len(), a);
+            for al in &rec.allocs {
+                out.push(al.mutable);
+            }
+            out
+        };
+
+        if cells {
+            assert_eq!(eval_marks(s_atomic).as_slice(), &[true]);
+            assert_eq!(eval_marks(s_tuple).as_slice(), &[true]);
+            assert_eq!(eval_marks(s_arr).as_slice(), &[true]);
+            assert_eq!(eval_marks(s_enum).as_slice(), &[true]);
+            assert_eq!(eval_marks(s_ref_atomic).as_slice(), &[false, true]);
+            assert_eq!(eval_marks(s_mut_ptr).as_slice(), &[false, true]);
+            assert_eq!(eval_marks(s_plain).as_slice(), &[false]);
+            assert_eq!(eval_marks(k_atomic).as_slice(), &[false]);
+        } else {
+            assert_eq!(eval_marks(s_atomic).as_slice(), &[false]);
+            assert_eq!(eval_marks(s_tuple).as_slice(), &[false]);
+            assert_eq!(eval_marks(s_arr).as_slice(), &[false]);
+            assert_eq!(eval_marks(s_enum).as_slice(), &[false]);
+            assert_eq!(eval_marks(s_ref_atomic).as_slice(), &[false, false]);
+            // `*mut u8` still marks its pointee writable even without `UnsafeCell`.
+            assert_eq!(eval_marks(s_mut_ptr).as_slice(), &[false, true]);
+            assert_eq!(eval_marks(s_plain).as_slice(), &[false]);
+            assert_eq!(eval_marks(k_atomic).as_slice(), &[false]);
+        }
+    };
+    check_case(true);
+    check_case(false);
+}
+
+/// Mirror of `#2466`: promoted field borrows (`&ALIGNED_BYTES.bytes` at offset 0 and an offset-8
+/// field inside an align(16) struct) preserve the base struct's alignment (`align == 4` at offset
+/// 0, `align == 3` at offset 8) in the interned `DataAlloc`, matching `hashbrown::Group::static_empty()`.
+#[test]
+fn promoted_field_borrow_preserves_base_struct_alignment() {
+    let (mut tw, t) = world();
+    let arr16 = tw.w.ty("[u8; 16]");
+    let arr8 = tw.w.ty("[u8; 8]");
+    let ref_arr16 = tw.w.ty("&[u8; 16]");
+    let ref_arr8 = tw.w.ty("&[u8; 8]");
+    let u64_t = PTy(t.u64);
+    let u8_t = PTy(t.u8);
+
+    // `#[repr(C, align(16))] struct AlignedBytes { bytes: [u8; 16] }` (offset 0 -> align_log2 = 4)
+    let k_aligned = ItemKey(0xaa01);
+    let aligned_ty = tw.w.fx.t.intern(PNode::Adt(k_aligned, List::EMPTY)).unwrap();
+    // `#[repr(C, align(16))] struct AlignedSplit { head: u64, tail: [u8; 8] }` (tail at offset 8 -> align_log2 = 3)
+    let k_split = ItemKey(0xaa02);
+    let _split_ty = tw.w.fx.t.intern(PNode::Adt(k_split, List::EMPTY)).unwrap();
+
+    tw = tw
+        .with_aligned_struct(k_aligned, 4, &[("bytes", arr16)])
+        .with_aligned_struct(k_split, 4, &[("head", u64_t), ("tail", arr8)]);
+
+    // Promoted borrow e10: returns `ALIGNED_BYTES.bytes` (`[u8; 16]`, natural align 0 -> must inherit 4).
+    let promo_zero = format!(
+        "\
+local _0: t{a16} return mut
+local _1: t{s} temp e0 value
+local _2: t{a16} temp e1 value
+const c0 = scalar 0x80: t{u8}
+const c1 = scalar 0x10: t{us}
+bb0:
+  _2 = repeat(const c0, c1)
+  _1 = adt t{s}#0(move _2)
+  _0 = copy _1.0:t{a16}
+  return
+",
+        a16 = arr16.0,
+        s = aligned_ty.0,
+        u8 = u8_t.0,
+        us = t.usize,
+    );
+    // Root returns `&ALIGNED_BYTES.bytes` via `ConstKind::Promoted(10)`.
+    let root_zero = format!(
+        "\
+local _0: t{r} return mut
+const c0 = promoted 10: t{r}
+bb0:
+  _0 = const c0
+  return
+",
+        r = ref_arr16.0,
+    );
+    let tw_zero = tw.with(ROOT, &root_zero).with_promoted_body(ROOT, ExprId(10), &promo_zero);
+    let rec_zero = run(&tw_zero, Limits::DEFAULT).expect("promoted &ALIGNED_BYTES.bytes evaluates");
+    assert_eq!(rec_zero.allocs.len(), 2, "expected pointer root + promoted pointee allocation");
+    assert_eq!(rec_zero.allocs[1].bytes.as_slice(), &[0x80u8; 16]);
+    assert_eq!(rec_zero.allocs[1].align, 4, "offset-0 field borrow must preserve align(16) (log2 == 4)");
+
+    // Promoted borrow e11: returns `ALIGNED_SPLIT.tail` at offset 8 (`[u8; 8]` -> must inherit min(4, 3) == 3).
+    let (mut tw2, t2) = world();
+    let arr8_2 = tw2.w.ty("[u8; 8]");
+    let ref_arr8_2 = tw2.w.ty("&[u8; 8]");
+    let u64_2 = PTy(t2.u64);
+    let u8_2 = PTy(t2.u8);
+    let split_ty_2 = tw2.w.fx.t.intern(PNode::Adt(k_split, List::EMPTY)).unwrap();
+    tw2 = tw2.with_aligned_struct(k_split, 4, &[("head", u64_2), ("tail", arr8_2)]);
+    let promo_off8 = format!(
+        "\
+local _0: t{a8} return mut
+local _1: t{s} temp e0 value
+local _2: t{a8} temp e1 value
+const c0 = scalar 0x55: t{u8}
+const c1 = scalar 0x8: t{us}
+const c2 = scalar 0x11223344: t{u64}
+bb0:
+  _2 = repeat(const c0, c1)
+  _1 = adt t{s}#0(const c2, move _2)
+  _0 = copy _1.1:t{a8}
+  return
+",
+        a8 = arr8_2.0,
+        s = split_ty_2.0,
+        u8 = u8_2.0,
+        us = t2.usize,
+        u64 = t2.u64,
+    );
+    let root_off8 = format!(
+        "\
+local _0: t{r} return mut
+const c0 = promoted 11: t{r}
+bb0:
+  _0 = const c0
+  return
+",
+        r = ref_arr8_2.0,
+    );
+    let tw_off8 = tw2.with(ROOT, &root_off8).with_promoted_body(ROOT, ExprId(11), &promo_off8);
+    let rec_off8 = run(&tw_off8, Limits::DEFAULT).expect("promoted &ALIGNED_SPLIT.tail evaluates");
+    assert_eq!(rec_off8.allocs.len(), 2);
+    assert_eq!(rec_off8.allocs[1].bytes.as_slice(), &[0x55u8; 8]);
+    assert_eq!(rec_off8.allocs[1].align, 3, "offset-8 field borrow must preserve align(8) (log2 == 3)");
+    let _ = ref_arr8;
 }

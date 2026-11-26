@@ -31,9 +31,11 @@
 
 mod comptime;
 
-use std::ffi::{CString, OsString, c_char, c_int};
+use std::env;
+use std::ffi::{CString, OsStr, OsString, c_char, c_int};
 use std::io::Write;
-use std::os::unix::ffi::OsStringExt;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -52,45 +54,181 @@ fn stop(status: i32, why: &str) -> ! {
 }
 
 /// What a sidecar says.
-struct Sidecar {
-    /// The socket of the process that serves the program's code records.
-    socket: PathBuf,
-    program: ProgramId,
+enum Sidecar {
+    /// Legacy daemon sidecar: `socket` + `program` (64 hex digits).
+    Daemon {
+        /// The socket of the process that serves the program's code records.
+        socket: PathBuf,
+        program: ProgramId,
+    },
+    /// `mode=run` stub sidecar (e.g. `blaze test` `CARGO_BIN_EXE_*` launcher stubs): connects to
+    /// `socket`, writes the 12-byte little-endian `[bin, owner_suite, owner_row]` handshake, then
+    /// speaks the `run_mode` wire protocol (`blaze_launch::wire::run`) directly over that stream.
+    Run {
+        socket: PathBuf,
+        bin: u32,
+        owner: (u32, u32),
+        store: PathBuf,
+        entry: OsString,
+        native: Option<OsString>,
+    },
 }
 
-/// The sidecar beside `exe`, `<exe>.blaze-program`: one `name=value` a line.
+/// Decodes an even-length hex string into a `PathBuf` using a stack buffer (used for `store_hex=`
+/// so arbitrary Unix paths containing newlines or non-UTF-8 bytes survive line-oriented sidecars).
+fn hex_path(hex: &str) -> Option<PathBuf> {
+    let digits = hex.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    let out_len = digits.len() / 2;
+    let mut buf = [0u8; 4096];
+    let dst = buf.get_mut(..out_len)?;
+    let digit = |it: u8| match it {
+        b'0'..=b'9' => Some(it - b'0'),
+        b'a'..=b'f' => Some(it - b'a' + 10),
+        b'A'..=b'F' => Some(it - b'A' + 10),
+        _ => None,
+    };
+    for (slot, pair) in dst.iter_mut().zip(digits.chunks_exact(2)) {
+        let high = digit(pair[0])?;
+        let low = digit(pair[1])?;
+        *slot = (high << 4) | low;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(dst)))
+}
+
+/// Capacity of the in-binary stub configuration slot patched by `blaze test` when creating
+/// self-describing `CARGO_BIN_EXE_*` launcher stubs (16 KiB, 4 KiB-aligned so macOS Mach-O
+/// ad-hoc page re-hashing touches at most 4 code pages).
+const STUB_SLOT_SIZE: usize = 16 * 1024;
+const STUB_SLOT_HEADER: usize = 36; // 16-byte magic + 16-byte state tag + 4-byte LE length
+const STUB_SLOT_MAGIC: &[u8; 16] = b"BLAZE_STUB_SLOT1";
+const STUB_SLOT_PATCHED: &[u8; 16] = b"PATCHED_STUB_001";
+
+#[repr(C)]
+struct StubSlotBytes {
+    header: [u8; 32],
+    rest: [u8; STUB_SLOT_SIZE - 32],
+}
+
+#[repr(C, align(4096))]
+pub struct EmbeddedStubSlot(core::cell::UnsafeCell<StubSlotBytes>);
+
+// SAFETY: `EMBEDDED_STUB_SLOT` is patched offline in the stub executable before process start
+// and is only ever read at startup (never mutated at runtime).
+unsafe impl Sync for EmbeddedStubSlot {}
+
+#[unsafe(no_mangle)]
+#[used]
+pub static EMBEDDED_STUB_SLOT: EmbeddedStubSlot = EmbeddedStubSlot(core::cell::UnsafeCell::new(StubSlotBytes {
+    // Magic (16 bytes) + unpatched tag (16 bytes). `blaze test` locates this exact 36-byte header
+    // (including the trailing 0u32 length) once in `blaze-launcher`, replaces the tag with
+    // `STUB_SLOT_PATCHED`, and writes the length + UTF-8 config payload so stubs stay runnable
+    // even if copied to another path without an adjacent `.blaze-program` file.
+    header: *b"BLAZE_STUB_SLOT1UNPATCHED_CFG_01",
+    rest: [0u8; STUB_SLOT_SIZE - 32],
+}));
+
+/// Reads the stub's embedded configuration slot when patched by `blaze test`, otherwise reads the
+/// adjacent `<exe>.blaze-program` sidecar (`name=value` per line).
 fn sidecar(exe: &Path) -> Result<Sidecar, String> {
-    let mut path = exe.as_os_str().to_owned();
-    path.push(".blaze-program");
-    let path = PathBuf::from(path);
-    let text = std::fs::read_to_string(&path).map_err(|why| {
-        format!(
-            "{} is a clone of blaze's launcher and its sidecar {} does not read: {why}. Run it with \
-             `blaze run`",
-            exe.display(),
-            path.display()
-        )
-    })?;
+    // Pass the slot pointer through `black_box` so LLVM cannot constant-fold the initial bytes
+    // even under LTO.
+    let ptr: *const StubSlotBytes = core::hint::black_box(EMBEDDED_STUB_SLOT.0.get().cast_const());
+    // SAFETY: `EMBEDDED_STUB_SLOT` is a `'static`, 4096-byte aligned `StubSlotBytes` of
+    // `STUB_SLOT_SIZE` bytes, never mutated at runtime.
+    let slot: &[u8] = unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), STUB_SLOT_SIZE) };
+    let (label, owned_text);
+    let text: &str = if slot.get(..16) == Some(STUB_SLOT_MAGIC.as_slice())
+        && slot.get(16..32) == Some(STUB_SLOT_PATCHED.as_slice())
+    {
+        let Some(&[b0, b1, b2, b3]) = slot.get(32..36) else {
+            return Err(format!("{} has a truncated embedded stub header", exe.display()));
+        };
+        let Ok(len) = usize::try_from(u32::from_le_bytes([b0, b1, b2, b3])) else {
+            return Err(format!("{} has an out-of-range embedded stub length", exe.display()));
+        };
+        let end = match STUB_SLOT_HEADER.checked_add(len) {
+            Some(end) if end <= STUB_SLOT_SIZE => end,
+            _ => return Err(format!("{} has an invalid embedded stub length ({len})", exe.display())),
+        };
+        let Some(payload) = slot.get(STUB_SLOT_HEADER..end) else {
+            return Err(format!("{} has an unreadable embedded stub payload", exe.display()));
+        };
+        label = exe.display().to_string();
+        core::str::from_utf8(payload)
+            .map_err(|why| format!("{} has non-UTF-8 embedded stub config: {why}", exe.display()))?
+    } else {
+        let mut path = exe.as_os_str().to_owned();
+        path.push(".blaze-program");
+        let path = PathBuf::from(path);
+        owned_text = std::fs::read_to_string(&path).map_err(|why| {
+            format!(
+                "{} is a clone of blaze's launcher and its sidecar {} does not read: {why}. Run it with \
+                 `blaze run`",
+                exe.display(),
+                path.display()
+            )
+        })?;
+        label = path.display().to_string();
+        &owned_text
+    };
+
     let line = |name: &str| text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix('='));
     let field = |name: &str| {
-        line(name).ok_or_else(|| format!("the sidecar {} has no `{name}`: run the program with `blaze run`", path.display()))
+        line(name).ok_or_else(|| format!("the sidecar {label} has no `{name}`: run the program with `blaze run`"))
     };
     let socket = PathBuf::from(field("socket")?);
+    if line("mode") == Some("run") {
+        let bin_raw = field("bin")?;
+        let bin = bin_raw.parse::<u32>().map_err(|_| {
+            format!("the sidecar {label} names bin `{bin_raw}`, which is no u32")
+        })?;
+        let owner = match line("owner") {
+            None => (u32::MAX, u32::MAX),
+            Some(raw) => {
+                let (s, r) = raw.split_once(':').ok_or_else(|| {
+                    format!("the sidecar {label} names owner `{raw}`, expected `<suite>:<row>`")
+                })?;
+                let suite = s.parse::<u32>().map_err(|_| {
+                    format!("the sidecar {label} names owner suite `{s}`, which is no u32")
+                })?;
+                let row = r.parse::<u32>().map_err(|_| {
+                    format!("the sidecar {label} names owner row `{r}`, which is no u32")
+                })?;
+                (suite, row)
+            }
+        };
+        let store = match line("store_hex") {
+            Some(hex) => hex_path(hex).ok_or_else(|| {
+                format!("the sidecar {label} has malformed `store_hex`")
+            })?,
+            None => PathBuf::from(field("store")?),
+        };
+        let entry = OsString::from(field("entry")?);
+        let native = line("native").map(OsString::from);
+        return Ok(Sidecar::Run { socket, bin, owner, store, entry, native });
+    }
     let hex = field("program")?;
     let Some(id) = hex32(hex) else {
         return Err(format!(
-            "the sidecar {} names program `{hex}`, which is no 64 hex digits: run the program with `blaze run`",
-            path.display()
+            "the sidecar {label} names program `{hex}`, which is no 64 hex digits: run the program with `blaze run`"
         ));
     };
-    Ok(Sidecar { socket, program: ProgramId(id) })
+    Ok(Sidecar::Daemon { socket, program: ProgramId(id) })
 }
 
 /// 64 hex digits as 32 bytes.
 fn hex32(hex: &str) -> Option<[u8; 32]> {
     let mut id = [0u8; 32];
     let digits = hex.as_bytes();
-    let digit = |it: u8| (it as char).to_digit(16).map(|it| it as u8);
+    let digit = |it: u8| match it {
+        b'0'..=b'9' => Some(it - b'0'),
+        b'a'..=b'f' => Some(it - b'a' + 10),
+        b'A'..=b'F' => Some(it - b'A' + 10),
+        _ => None,
+    };
     let whole = digits.len() == 64
         && id.iter_mut().zip(digits.chunks(2)).all(|(byte, pair)| match (digit(pair[0]), digit(pair[1])) {
             (Some(high), Some(low)) => {
@@ -222,23 +360,172 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         ),
         (Some(path), _) => Some(path),
     };
-    let open_explore = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
-    if let Some(raw_stride) = std::env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
+    // Optional unwind marker path (`BLAZE_LAUNCH_UNWOUND_FILE`, set only by `blaze test` for
+    // harnessed tests): runs the entry with `End::Return` so an uncaught Rust panic unwinding
+    // out of the test entry writes the marker and exits 101 instead of aborting with SIGABRT,
+    // keeping genuine SIGABRTs (C `abort()`, double-panic, allocator abort) distinct.
+    enum UnwoundSink {
+        File(PathBuf),
+        Fd(OwnedFd),
+    }
+    let unwound_sink = match (std::env::var_os("BLAZE_LAUNCH_UNWOUND_FILE"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_UNWOUND_FILE is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => {
+            if let Some(fd_str) = raw.to_str().and_then(|s| s.strip_prefix("fd:")) {
+                let fd: i32 = match fd_str.parse() {
+                    Ok(n) if n > 3 => n,
+                    _ => stop(CANNOT_RUN, "BLAZE_LAUNCH_UNWOUND_FILE fd target is invalid"),
+                };
+                // SAFETY: validates `fd` is open and immediately marks it close-on-exec so no
+                // subprocess spawned by the test inherits the launcher-owned unwind channel.
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1
+                    || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+                {
+                    stop(CANNOT_RUN, "BLAZE_LAUNCH_UNWOUND_FILE fd is not open");
+                }
+                // SAFETY: `fd` was inherited from `blaze test` exclusively for this launcher.
+                Some(UnwoundSink::Fd(unsafe { OwnedFd::from_raw_fd(fd) }))
+            } else {
+                Some(UnwoundSink::File(PathBuf::from(raw)))
+            }
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let sandbox_temp = match (std::env::var_os("BLAZE_LAUNCH_SANDBOX_TEMP"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_SANDBOX_TEMP is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
+    };
+    #[cfg(target_os = "linux")]
+    let bins_dir = match (env::var_os("BLAZE_LAUNCH_BINS_DIR"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_BINS_DIR is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
+    };
+    #[cfg(target_os = "linux")]
+    let bins_sock_dir = match (env::var_os("BLAZE_LAUNCH_BINS_SOCK_DIR"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_BINS_SOCK_DIR is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
+    };
+    let bin_map = match (env::var_os("BLAZE_LAUNCH_BIN_MAP"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_BIN_MAP is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
+    };
+    let open_explore = env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
+    if let Some(raw_stride) = env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
         if let Some(stride) = raw_stride.to_str().and_then(|s| s.parse::<u64>().ok()) {
             blaze_launch_rt::telemetry::set_alloc_sample_bytes(stride);
         }
     }
     // SAFETY: one thread runs (nothing has been started yet), so nothing reads the environment
     // while it changes.
-    unsafe {
-        std::env::remove_var("BLAZE_LAUNCH_FD");
-        std::env::remove_var("BLAZE_LAUNCH_STORE");
-        std::env::remove_var("BLAZE_LAUNCH_ENTRY");
-        std::env::remove_var("BLAZE_LAUNCH_NATIVE");
-        std::env::remove_var(grants::VAR);
-        std::env::remove_var(telemetry::VAR);
-        std::env::remove_var("BLAZE_LAUNCH_EXPLORE");
-        std::env::remove_var("BLAZE_ALLOC_SAMPLE_BYTES");
+    const LAUNCH_VARS: &[&str] = &[
+        "BLAZE_LAUNCH_FD",
+        "BLAZE_LAUNCH_STORE",
+        "BLAZE_LAUNCH_ENTRY",
+        "BLAZE_LAUNCH_NATIVE",
+        "BLAZE_LAUNCH_UNWOUND_FILE",
+        "BLAZE_LAUNCH_SANDBOX_TEMP",
+        "BLAZE_LAUNCH_BINS_DIR",
+        "BLAZE_LAUNCH_BINS_SOCK_DIR",
+        "BLAZE_LAUNCH_BIN_MAP",
+        grants::VAR,
+        telemetry::VAR,
+        "BLAZE_LAUNCH_EXPLORE",
+        "BLAZE_ALLOC_SAMPLE_BYTES",
+    ];
+    for var in LAUNCH_VARS {
+        unsafe { env::remove_var(var) };
+    }
+    let remap_bins = match bin_map {
+        None => false,
+        Some(raw) => match run_mode::bin_remap::install(raw.as_encoded_bytes(), shared.local()) {
+            Ok(active) => active,
+            Err(why) => stop(CANNOT_RUN, &why.to_string()),
+        },
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(raw_temp) = sandbox_temp {
+        let Ok(temp_c) = CString::new(raw_temp.into_vec()) else {
+            stop(CANNOT_RUN, "BLAZE_LAUNCH_SANDBOX_TEMP holds a NUL byte");
+        };
+        let Ok(store_c) = CString::new(store.as_encoded_bytes()) else {
+            stop(CANNOT_RUN, "BLAZE_LAUNCH_STORE holds a NUL byte");
+        };
+        let cwd_c = match std::env::current_dir() {
+            Ok(p) => match CString::new(p.into_os_string().into_vec()) {
+                Ok(c) => c,
+                Err(_) => stop(CANNOT_RUN, "current working directory holds a NUL byte"),
+            },
+            Err(why) => stop(CANNOT_RUN, &format!("current working directory could not be read: {why}")),
+        };
+        let bins_c = match bins_dir {
+            None => None,
+            Some(raw) => match CString::new(raw.into_vec()) {
+                Ok(c) => Some(c),
+                Err(_) => stop(CANNOT_RUN, "BLAZE_LAUNCH_BINS_DIR holds a NUL byte"),
+            },
+        };
+        let sock_c = match bins_sock_dir {
+            None => None,
+            Some(raw) => match CString::new(raw.into_vec()) {
+                Ok(c) => Some(c),
+                Err(_) => stop(CANNOT_RUN, "BLAZE_LAUNCH_BINS_SOCK_DIR holds a NUL byte"),
+            },
+        };
+        let mut keep_ro_buf: [&core::ffi::CStr; 4] = [store_c.as_c_str(); 4];
+        let mut keep_ro_len = 1usize;
+        if let Some(slot) = keep_ro_buf.get_mut(keep_ro_len) {
+            *slot = cwd_c.as_c_str();
+            keep_ro_len += 1;
+        }
+        if let Some(bins) = bins_c.as_ref()
+            && let Some(slot) = keep_ro_buf.get_mut(keep_ro_len)
+        {
+            *slot = bins.as_c_str();
+            keep_ro_len += 1;
+        }
+        if let Some(sock) = sock_c.as_ref()
+            && let Some(slot) = keep_ro_buf.get_mut(keep_ro_len)
+        {
+            *slot = sock.as_c_str();
+            keep_ro_len += 1;
+        }
+        let keep_ro = keep_ro_buf.get(..keep_ro_len).unwrap_or(&[]);
+        let temp_mount = match blaze_sys::linux::confine::enter_test_sandbox(
+            temp_c.as_c_str(),
+            keep_ro,
+            Some(cwd_c.as_c_str()),
+            bins_c.as_deref(),
+        ) {
+            Ok(mount) => mount,
+            Err(why) => stop(CANNOT_RUN, &format!("Linux test sandbox refused: {why:?}")),
+        };
+        if let Ok(mount_str) = temp_mount.to_str() {
+            // SAFETY: still single-threaded before any launcher/guest thread starts; point
+            // `$TMPDIR` at the exact non-colliding short mount chosen for this test's temp folder.
+            unsafe {
+                env::set_var("TMPDIR", mount_str);
+            }
+        }
     }
     let telemetry_on = match telemetry_path {
         Some(path) => {
@@ -297,6 +584,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     // span_exit frames). When `BLAZE_LAUNCH_TELEMETRY` is set, `ObservedBind` layers zero-touch
     // alloc/IO/mutex telemetry on top; otherwise plain `LauncherOwn<Dlsym>` pays zero overhead.
     let ordinary = |socket, handed| {
+        let end = if unwound_sink.is_some() { End::ExitOrReturnUnwound } else { End::Exit };
         let ran = if telemetry_on {
             run_mode::run(
                 socket,
@@ -304,8 +592,8 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 start.entry,
                 native,
                 handed,
-                ObservedBind::new(LauncherOwn::new(Dlsym)),
-                End::Exit,
+                ObservedBind::new(LauncherOwn::with_bin_remap(Dlsym, remap_bins)),
+                end,
                 shared,
             )
         } else {
@@ -315,13 +603,36 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 start.entry,
                 native,
                 handed,
-                LauncherOwn::new(Dlsym),
-                End::Exit,
+                LauncherOwn::with_bin_remap(Dlsym, remap_bins),
+                end,
                 shared,
             )
         };
         match ran {
-            Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
+            Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process")),
+            Err(run_mode::RunModeError::Unwound) => {
+                if let Some(sink) = unwound_sink.as_ref() {
+                    match sink {
+                        UnwoundSink::File(path) => {
+                            let _ = std::fs::write(path, b"1");
+                        }
+                        UnwoundSink::Fd(fd) => {
+                            use std::os::fd::AsRawFd;
+                            let frame: [u8; 5] = [0, 0, 0, 1, b'1'];
+                            // SAFETY: `fd` is the open launcher-owned unwind socket; writes a
+                            // single 5-byte length-prefixed sentinel frame before exiting 101.
+                            let _ = unsafe { libc::write(fd.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+                        }
+                    }
+                    // SAFETY: flush stdio buffers and exit directly with `_exit(101)` so dyld TLS
+                    // destructors cannot attempt JIT stub resolution after the control thread stopped.
+                    unsafe {
+                        libc::fflush(core::ptr::null_mut());
+                        libc::_exit(101);
+                    }
+                }
+                stop(STOPPED, "an uncaught panic unwound out of the program's entry")
+            }
             Err(why) => why.to_string(),
         }
     };
@@ -526,8 +837,69 @@ fn main() {
         Ok(found) => found,
         Err(why) => stop(CANNOT_RUN, &why),
     };
-    let program = side.program;
-    let socket = match UnixStream::connect(&side.socket) {
+    let (socket_path, program) = match side {
+        Sidecar::Daemon { socket, program } => (socket, program),
+        Sidecar::Run { socket, bin, owner: (owner_suite, owner_row), store, entry, native } => {
+            use blaze_launch_rt::run_mode::{self, Dlsym, End, EntryForm, Folder, Handed, LauncherOwn, STOPPED, Start};
+
+            let start = match Start::parse(entry.as_encoded_bytes()) {
+                Ok(start) => start,
+                Err(why) => stop(CANNOT_RUN, &why.to_string()),
+            };
+            let handed = match start.form {
+                EntryForm::Unit => Handed::Unit,
+                EntryForm::CMain => Handed::CMain,
+                EntryForm::Hosted | EntryForm::Comptime => {
+                    stop(CANNOT_RUN, "sidecar `mode=run` supports `unit` and `c-main` entries only")
+                }
+            };
+            let native = match native {
+                None => None,
+                Some(raw) => match run_mode::parse_native_start(raw.as_encoded_bytes()) {
+                    Ok(start) => Some(start),
+                    Err(why) => stop(CANNOT_RUN, &format!("sidecar `native`: {why}")),
+                },
+            };
+            let mut stream = match UnixStream::connect(&socket) {
+                Ok(stream) => stream,
+                Err(why) => stop(
+                    CANNOT_RUN,
+                    &format!(
+                        "{} runs under blaze's launcher, and nothing serves its code at {}: {why}",
+                        exe.display(),
+                        socket.display()
+                    ),
+                ),
+            };
+            let [b0, b1, b2, b3] = bin.to_le_bytes();
+            let [s0, s1, s2, s3] = owner_suite.to_le_bytes();
+            let [r0, r1, r2, r3] = owner_row.to_le_bytes();
+            let hello = [b0, b1, b2, b3, s0, s1, s2, s3, r0, r1, r2, r3];
+            if let Err(why) = stream.write_all(&hello) {
+                stop(
+                    CANNOT_RUN,
+                    &format!("{} could not identify bin {bin} to {}: {why}", exe.display(), socket.display()),
+                );
+            }
+            let fd: OwnedFd = stream.into();
+            let store_bytes = store.into_os_string().into_vec();
+            let folder = Folder::new(&store_bytes);
+            match run_mode::run(
+                fd,
+                &folder,
+                start.entry,
+                native,
+                handed,
+                LauncherOwn::new(Dlsym),
+                End::Exit,
+                shared,
+            ) {
+                Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
+                Err(why) => stop(STOPPED, &why.to_string()),
+            }
+        }
+    };
+    let socket = match UnixStream::connect(&socket_path) {
         Ok(socket) => socket,
         Err(why) => stop(
             CANNOT_RUN,
@@ -535,7 +907,7 @@ fn main() {
                 "{} runs under blaze's launcher, and nothing serves its code at {}: {why}. Run it with \
                  `blaze run`",
                 exe.display(),
-                side.socket.display()
+                socket_path.display()
             ),
         ),
     };

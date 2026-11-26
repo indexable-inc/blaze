@@ -1,0 +1,18 @@
+[package]
+name = "blaze-shell-config"
+description = "Pure no_std, zero-unsafe, sans-IO user configuration parser (~/.config/blaze-shell/config.toml) using blaze-own explicit allocators and blaze-toml"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+authors = ["blaze contributors"]
+
+[lib]
+name = "blaze_shell_config"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+blaze-own = { path = "../blaze-own" }
+blaze-toml = { path = "../blaze-toml" }
+blaze-data = { path = "../blaze-data" }

@@ -56,10 +56,15 @@ use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc};
 
 use crate::engine_body_plan::Unit;
-use crate::engine_heads::Subject;
+use crate::engine_heads::{Subject, SubjectFile};
 
 /// The form's first bytes; the last is its version.
 const MAGIC: [u8; 8] = *b"BLZMEMB\x03";
+
+/// Sentinel `Header::made_at` value for content-stable members records: unchanged body edits
+/// reuse the exact prior `BLZMEMB` key across answer serials with zero re-encoding, hashing,
+/// or CAS puts (validity is checked by `graph_out`, `tool`, `unit`, `names_out`, and `moved`).
+pub(crate) const CONTENT_STABLE_SERIAL: u64 = 0;
 
 /// The setup's strategy (rule 78: a type parameter at one seam, engine_bodies.rs `groups`).
 pub(crate) trait SetupInputs {
@@ -176,8 +181,17 @@ pub(crate) struct Held<'r> {
 impl Held<'_> {
     /// The head subject of the file in the unit of crate `prefix`: [`Subject::new`]'s, from the
     /// kept parts.
+    #[cfg_attr(not(test), expect(dead_code, reason = "eager subject constructor kept for non-'static views and tests"))]
     pub(crate) fn subject(&self, prefix: [u8; 8]) -> Subject {
-        Subject { prefix, file: self.file, slot: self.slot, signature_file: crate::signature::SignatureFile::new(self.path), entries: self.entries }
+        Subject { prefix, file: self.file, slot: self.slot, signature_file: SubjectFile::Resolved(crate::signature::SignatureFile::new(self.path)), entries: self.entries }
+    }
+}
+
+impl Held<'static> {
+    /// Zero-hash head subject borrowing `self.path` lazily from the cached `BLZMEMB` bytes:
+    /// avoids `O(N_held_files)` BLAKE3 `SignatureFile::new` digests on every body edit.
+    pub(crate) fn subject_lazy(&self, prefix: [u8; 8]) -> Subject {
+        Subject { prefix, file: self.file, slot: self.slot, signature_file: SubjectFile::Path(self.path), entries: self.entries }
     }
 }
 
@@ -186,8 +200,20 @@ impl Held<'_> {
 pub(crate) struct Header {
     pub(crate) graph_out: ContentId,
     pub(crate) tool: Tool,
-    /// The serial of the answer of the request that made it.
+    /// The serial of the answer of the request that made it, or [`CONTENT_STABLE_SERIAL`] (`0`)
+    /// for content-stable records reused across unchanged body edits.
     pub(crate) made_at: u64,
+}
+
+impl Header {
+    /// Whether a record written with `self` is valid for `today`: content-stable records
+    /// (`made_at == CONTENT_STABLE_SERIAL`) match any answer serial when `graph_out` and `tool`
+    /// match; non-zero serial-pinned records require exact `made_at` equality too.
+    pub(crate) fn matches(&self, today: &Header) -> bool {
+        self.graph_out == today.graph_out
+            && self.tool == today.tool
+            && (self.made_at == CONTENT_STABLE_SERIAL || self.made_at == today.made_at)
+    }
 }
 
 /// Why a stored members record does not open: each names the byte it is about (rule 19).
@@ -487,7 +513,7 @@ impl<'r> View<'r> {
     /// as [`RefusedWhy::Unstood`] never stands. The caller still compares the unit and the names
     /// input (or refusal state) with today's.
     pub(crate) fn standing(&self, at: u32, today: &Header, moved: &[Name]) -> Option<&Member<'r>> {
-        if self.header != *today {
+        if !self.header.matches(today) {
             return None;
         }
         let place = self.members.binary_search_by_key(&at, |m| m.at).ok()?;
@@ -524,7 +550,7 @@ impl<'r> View<'r> {
     /// would add is the owed files' claims alone: the caller visits it only when a decision
     /// needs them. `None`: it stands whole ([`View::standing`]) or is visited.
     pub(crate) fn standing_below_heads(&self, at: u32, today: &Header, moved: &[Name], entries_now: impl Fn(Name) -> Option<ContentId>) -> Option<&Member<'r>> {
-        if self.header != *today {
+        if !self.header.matches(today) {
             return None;
         }
         let member = self.member(at)?;
@@ -760,5 +786,43 @@ mod tests {
         assert!(view.standing_below_heads(3, &header(9), &both, same).is_none(), "CONTROL: a moved reached file");
         assert!(view.standing_below_heads(3, &header(10), &[held_slot], same).is_none(), "CONTROL: another answer's record");
         assert!(view.standing_below_heads(3, &header(9), &[other], same).is_none(), "no held file moved: a whole stand, not this one");
+    }
+
+    /// CONTENT-STABLE MEMBERS RECORD (`CONTENT_STABLE_SERIAL == 0`): a record written with
+    /// `made_at == 0` stands and stands below heads across advancing answer serials without
+    /// rewriting its bytes, while still refusing a changed `graph_out` or `tool`.
+    #[test]
+    fn content_stable_members_record_stands_across_serials_and_refuses_graph_or_tool_change() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let kind = blaze_drive::Kind::FileItems;
+        let (held_slot, other) = (name(kind, 40), name(kind, 41));
+        let entries = ContentId([11; 32]);
+        let mut held = AVec::new_in(alloc);
+        held.push(Held { file: 0, slot: held_slot, path: b"c/src/lib.rs", entries });
+        let member = Member {
+            at: 0,
+            unit: Unit { name: name(blaze_drive::Kind::CrateScope, 1), prefix: [1; 8], test: false },
+            state: MemberState::Held(HeldMember {
+                names: name(blaze_drive::Kind::CrateScope, 1),
+                names_out: ContentId([2; 32]),
+                row: Key(ContentId([3; 32])),
+                uncovered: 0,
+                named: AVec::new_in(alloc),
+                held,
+            }),
+            not_held: AVec::new_in(alloc),
+        };
+        let mut writer = Writer::new(&header(CONTENT_STABLE_SERIAL), alloc);
+        writer.member(&member);
+        let bytes = writer.finish();
+        let view = View::open(&bytes, alloc).expect("opens");
+        assert!(view.standing(0, &header(1), &[other]).is_some(), "stands at serial 1");
+        assert!(view.standing(0, &header(42), &[other]).is_some(), "stands at serial 42");
+        assert!(view.standing_below_heads(0, &header(99), &[held_slot], |_| Some(entries)).is_some(), "stands below heads at serial 99");
+        let diff_graph = Header { graph_out: ContentId([99; 32]), ..header(42) };
+        let diff_tool = Header { tool: Tool(ContentId([98; 32])), ..header(42) };
+        assert!(view.standing(0, &diff_graph, &[other]).is_none(), "CONTROL: changed graph_out is refused");
+        assert!(view.standing(0, &diff_tool, &[other]).is_none(), "CONTROL: changed tool is refused");
+        assert!(view.standing_below_heads(0, &diff_graph, &[held_slot], |_| Some(entries)).is_none(), "CONTROL: changed graph_out refused below heads");
     }
 }

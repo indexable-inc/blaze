@@ -11,6 +11,7 @@ use std::vec::Vec;
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::View;
 use blaze_lower::form as lf;
+use blaze_own::Alloc;
 use blaze_surface::Range;
 use blaze_typeck::dyn_compat::{FnFacts, MemberShape, Receiver, Unread};
 use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PathIdx, PortableTys};
@@ -25,7 +26,16 @@ use crate::resolve::{Ns, Paths};
 /// `Arc` and `Pin` a typed receiver (`self: Pin<&mut Self>`) is read against
 /// ([`super::receiver::classify`]). The checker decides from them
 /// (`blaze_typeck::dyn_compat`, the rule's one home), through `TraitDef.members`.
-pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized: Option<LibKey>, pointers: &super::receiver::Pointers, detail: Member, v: &View<'_>) -> Result<MemberShape, Why> {
+pub fn member<'n, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    module: LibKey,
+    sized: Option<LibKey>,
+    pointers: &super::receiver::Pointers,
+    marks: Option<blaze_scope::crate_roots::TextMarks<'_>>,
+    alloc: Alloc<'_>,
+    detail: Member,
+    v: &View<'_>,
+) -> Result<MemberShape, Why> {
     use blaze_lower::head;
     match detail {
         Member::Const => return Ok(MemberShape::Const),
@@ -107,6 +117,43 @@ pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized
             match in_return {
                 true => f.opaque_return = true,
                 false => f.own_non_lifetime_params += 1,
+            }
+            continue;
+        }
+        // A type macro in a trait method's signature (e.g. alloy's `-> impl_future!(<Output = T>)`
+        // expanding to `impl Send + Future<Output = T>`): expand it once to inspect its real
+        // `impl Trait` / `Self` occurrences for both dyn compatibility and RPITIT detection
+        // (`rpitit::may_have_rows`). Without expanding, `children` sees zero children and leaves
+        // `opaque_return = false`, hiding the trait fn's RPITIT from `rpitit::trait_rows`.
+        if let lf::TypeRef::Macro(_) = v.ty(t)? {
+            let r = v.site(v.type_range(t)?)?;
+            let text = v.text_at(v.type_range(t)?)?;
+            let Ok(x) = super::type_expand::expand_type_text(resolver.names, module, text, marks, r, alloc) else {
+                return Ok(MemberShape::Unread(Unread::SignatureType));
+            };
+            let xv = x.view();
+            let mut inner = Vec::new_in(Global);
+            inner.push(x.root);
+            while let Some(xt) = inner.pop() {
+                if is_self(&xv, xt)? {
+                    f.self_outside_receiver = true;
+                    continue;
+                }
+                if let lf::TypeRef::Impl(_) = xv.ty(xt)? {
+                    match in_return {
+                        true => f.opaque_return = true,
+                        false => f.own_non_lifetime_params += 1,
+                    }
+                    continue;
+                }
+                if matches!(xv.ty(xt)?, lf::TypeRef::Macro(_)) {
+                    return Ok(MemberShape::Unread(Unread::SignatureType));
+                }
+                kids.clear();
+                if children(&xv, xt, &mut kids).is_err() {
+                    return Ok(MemberShape::Unread(Unread::SignatureType));
+                }
+                inner.extend(kids.iter().copied());
             }
             continue;
         }

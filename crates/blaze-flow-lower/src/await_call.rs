@@ -1,35 +1,28 @@
-//! Step 1 of an `.await` whose future is not its operand, `fut = into_future(op)`, related
-//! through the head the type check recorded at the `.await` (piece await-intofuture).
+//! Step 1 of an `.await` whose future is not its operand, `fut = into_future(op)`, and
+//! awaited-value shadow lowering, both routed through D156's unified `one_call.rs` seam.
 //!
 //! The type check selects the operand's `IntoFuture` impl with the body's solver and records
 //! that impl's `into_future` at the impl's arguments as the `.await`'s callee
-//! (blaze-typeck rules/await_impl.rs); a parameter's bound keeps the trait's `into_future`. So
-//! the call is one of a KNOWN head, and is related as `call_done` relates any known head
-//! (lib.rs), in the same order and by the same pieces: a declared type-outlives bound is
-//! checked by the generic signature or refused by name; the head's lifetime part when it lines up
-//! (`call_by_signature`), or instantiated with the generic arguments
-//! (`call_by_generic_signature`, generic_call.rs); a head that writes lifetimes neither could
-//! line up is refused by name (`Form::CallWritesLifetimes`: it may demand `'static`, which one
-//! origin for all cannot say); else every position through one origin (`unify_call`), the
-//! superset of any relation a signature that writes no lifetime can state. No head at all (a
-//! record without the row) is refused by name (`Form::AwaitOperand`): never related as an
-//! unknown call by default.
+//! (blaze-typeck rules/await_impl.rs); a parameter's bound keeps the trait's `into_future`. No
+//! head at all (a record without the row) is refused by name (`Form::AwaitOperand`): never
+//! related as an unknown call by default.
 //!
 //! The Reference, "Await expressions": "Create a future by calling `IntoFuture::into_future` on
 //! the future operand"; the head's own signature (`fn into_future(self) -> Self::IntoFuture`)
 //! is what its call may relate.
 
+use blaze_borrow::{Columns, RegionTypes, SlotCount};
 use blaze_flow::{Local, Place};
 use core::alloc::Allocator;
 
 use blaze_typeck::{ExprId, ItemKey, List, Name, PNode, PTy};
 
-use crate::generic_call::{CallBounds, ShapeBuf};
-use crate::{AwaitUnrelated, CallValue, Facts, Form, Lower, Plant, Refusal, Region, SigLife, TyD, Val};
+use crate::one_call::FactsArity;
+use crate::{AwaitUnrelated, Facts, Form, Lower, Refusal, Region, SigLife, TyD, Val};
 
 impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// Relates `dest = into_future(v)` (the call statement just added) through the callee the
-    /// record names at the `.await` `e` (the module doc).
+    /// record names at the `.await` `e` via D156's unified [`crate::one_call::CallRule`] seam.
     pub(crate) fn relate_into_future(&mut self, v: Val, dest: Place, dest_ty: TyD, e: ExprId) -> Result<(), Refusal> {
         let Some((item, g)) = self.callee_of(e) else {
             return self.refuse(Form::AwaitOperand, e);
@@ -40,65 +33,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             return Ok(());
         }
         let vs = [v];
-        let facts: &'b F = self.facts;
-        let sig = facts.callee(item);
-        let mut generic_origins = false;
-        for &a in self.list(g, e)? {
-            generic_origins |= self.npos(a, e)? > 0;
-        }
-        // A head whose regions were not read (D148: `Facts::sig` is the one source): where the
-        // operand or the future carries a lifetime, refused by name with why, as `call_done`
-        // refuses any call of such a head; never related under a guess.
-        if let Err(unread) = facts.sig(item)
-            && self.plant != Plant::UnknownUnified
-            && (self.npos_d(v.ty, e)? > 0 || self.info(dest).len > 0)
-        {
-            return self.refuse(Form::RegionsUnread { item: unread.item, why: unread.why }, e);
-        }
-        let owes = if facts.sig(item).is_ok() {
-            match facts.call_bounds(item) {
-                Some(b) => self.owes_type_outlives(b, g, e)?,
-                None => self.owes_type_outlives(CallBounds { outlives: &[], unread_below: u32::MAX, trait_bounded: &[] }, g, e)?,
-            }
-        } else {
-            None
-        };
-        if !generic_origins && owes.is_none()
-            && let Ok(life) = facts.sig(item)
-            && self.call_by_signature(life, Some((item, g)), &vs, dest, dest_ty, e)?
-        {
-            self.stats.calls_by_signature += 1;
-            return Ok(());
-        }
-        if sig.is_some_and(|s| generic_origins || owes.is_some() || s.writes_lifetimes)
-            && let Ok(life) = facts.sig(item)
-            && let Some(shape) = facts.shape(item)
-            && let Some(bounds) = facts.call_bounds(item)
-            && self.call_by_generic_signature(item, life, shape, bounds, g, &vs, dest, dest_ty, e)?
-        {
-            self.stats.calls_by_signature += 1;
-            return Ok(());
-        }
-        if let Some(param) = owes {
-            return self.refuse(Form::CallOutlivesUnread { callee: item, param, why: crate::OutlivesUnreadWhy::Owed { lacks: self.call_lacks(item) } }, e);
-        }
-        if let Ok(life) = facts.sig(item)
-            && !self.sig_laid(life, e)?
-        {
-            self.stats.calls_hidden += 1;
-        }
-        if sig.is_some_and(|s| s.writes_lifetimes) {
-            return self.refuse(Form::CallWritesLifetimes { callee: item, lacks: self.call_lacks(item) }, e);
-        }
-        // A known head no signature related: the one origin, a STRICTER relation than its
-        // signature's, noted as `Form::CallGenericUnaligned` (lib.rs `call_old`'s last arm,
-        // `Lowered::coarse`): the body is refused by it only if it has a finding.
-        if self.npos_d(v.ty, e)? > 0 || self.info(dest).len > 0 {
-            self.coarse_step(Form::CallGenericUnaligned { callee: item, lacks: self.call_lacks(item) }, e);
-        }
-        self.unify_call(&vs, dest, e)?;
-        self.stats.calls_unified += 1;
-        Ok(())
+        let out = self.info(dest);
+        let site = crate::one_call::CallSite { e, vs: &vs, ins: &[], tp: dest, ty: dest_ty, out, callee: Some((item, g)) };
+        R::call(self, &site)
     }
 
     /// The call `site` (its destination the local `t`) is the operand of the innermost
@@ -156,11 +93,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
 
     /// Relates `dest`, of the awaited value's type, to the call's arguments `vs` through the
     /// written return type of `item`'s head (`SigRegions::written_output`), or else its opaque
-    /// output's `Output = T` binding ([`Self::opaque_output`]), at the call's
-    /// instantiation `g`, as `call_old` relates a call's output: by the head's lifetime part
-    /// when no type argument carries an origin and no type-outlives bound is owed, else by its
-    /// generic signature. `None` when related; else why nothing was related (the head is not
-    /// an `async fn`'s, is not read, or does not line up), one [`AwaitUnrelated`] per exit.
+    /// output's `Output = T` binding ([`Self::opaque_output`]), at the call's instantiation `g`
+    /// via D156's unified `call_one`. `None` when related; else why nothing was related (the
+    /// head is not an `async fn`'s, is not read, or does not line up), one [`AwaitUnrelated`]
+    /// per exit.
     fn relate_awaited(&mut self, item: ItemKey, g: List, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<Option<AwaitUnrelated>, Refusal> {
         let facts: &'b F = self.facts;
         let Ok(life) = facts.sig(item) else { return Ok(Some(AwaitUnrelated::HeadUnread)) };
@@ -171,35 +107,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 Err(why) => return Ok(Some(why)),
             },
         };
-        let value = CallValue::Awaited { ty: written, slots };
-        let args = self.list(g, e)?;
-        let mut generic_origins = false;
-        for &a in args {
-            generic_origins |= self.npos(a, e)? > 0;
+        let out = self.info(dest);
+        let site = crate::one_call::CallSite { e, vs, ins: &[], tp: dest, ty: dest_ty, out, callee: Some((item, g)) };
+        let output_override = Some(blaze_borrow::Typed { ty: written, col: slots });
+        match self.call_one(&site, output_override, false, true) {
+            Ok(()) => Ok(None),
+            Err(r @ Refusal { form: Form::Malformed | Form::Bound | Form::Builder, .. }) => Err(r),
+            Err(_) => Ok(Some(AwaitUnrelated::SignatureUnaligned)),
         }
-        let owes = match facts.call_bounds(item) {
-            Some(b) => self.owes_type_outlives(b, g, e)?,
-            None => self.owes_type_outlives(CallBounds { outlives: &[], unread_below: u32::MAX, trait_bounded: &[] }, g, e)?,
-        };
-        if !generic_origins && owes.is_none() {
-            let related = self.call_by_signature_to(life, value, Some((item, g)), vs, dest, dest_ty, e)?;
-            return Ok((!related).then_some(AwaitUnrelated::SignatureUnaligned));
-        }
-        let Some(bounds) = facts.call_bounds(item) else { return Ok(Some(AwaitUnrelated::NoBounds)) };
-        // A type argument with positions under a bound not read: the generic path refuses it
-        // by name. The call itself was related (or refused) by `call_old` already; its value
-        // is refused by `await_done` under this name when it carries a lifetime.
-        for i in 0..(bounds.unread_below as usize).min(args.len()) {
-            if self.npos(args[i], e)? > 0 {
-                return Ok(Some(AwaitUnrelated::BoundUnread { param: i as u32 }));
-            }
-        }
-        let mut shape = ShapeBuf::new_in(self.alloc);
-        if !self.awaited_shape(life, written, &mut shape, e)? {
-            return Ok(Some(AwaitUnrelated::ShapeUnread));
-        }
-        let related = self.call_by_generic_signature_to(item, life, value, shape.shape(), bounds, g, vs, dest, dest_ty, e)?;
-        Ok((!related).then_some(AwaitUnrelated::GenericUnaligned(self.misfit)))
     }
 
     /// The awaited value of a call of head `life` whose output is an opaque type, `fn f(..) ->
@@ -225,7 +140,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let facts: &'b F = self.facts;
         let out_ty = self.sig_declared(life, life.inputs(), e)?;
         let PNode::Opaque(k, _) = self.head_node(out_ty, e)? else {
-            return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+            return self.dyn_future_output(life, out_ty, e);
         };
         let regions = facts.regions();
         let (Ok(captures), Ok(clauses)) = (regions.opaque_captures(k), regions.clauses(k)) else {
@@ -257,5 +172,85 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
         }
         Ok(found.ok_or(AwaitUnrelated::OpaqueOutputUnread { opaque: k }))
+    }
+
+    /// The awaited value of a sync call whose return type is a trait-object future wrapped in
+    /// transparent pointer layers (`Pin<Box<dyn Future<Output = T> + Send + 'a>>`,
+    /// `Box<dyn Future<Output = T> + 'a>`, `Pin<&mut dyn Future<Output = T>>`, or
+    /// `&mut dyn Future<Output = T>`): extracts `T` and its exact slot slice from the
+    /// `ExProj { name: "Output", args: [], term: T }` predicate inside `PNode::Dynamic`, so the
+    /// awaited value carries only the lifetimes `T` names and never the future object's `'a`.
+    fn dyn_future_output(
+        &self,
+        life: SigLife<'b>,
+        out_ty: PTy,
+        e: ExprId,
+    ) -> Result<Result<(PTy, &'b [Region]), AwaitUnrelated>, Refusal> {
+        let Some(mut cur_slots) = life.output() else {
+            return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+        };
+        let facts: &'b F = self.facts;
+        let arity = FactsArity { facts };
+        let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        let mut cur_ty = out_ty;
+        for _ in 0..4 {
+            match self.head_node(cur_ty, e)? {
+                PNode::Dynamic(preds) => {
+                    let Ok(own) = heads.own(cur_ty) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    let Some(mut rest) = cur_slots.get(own.len()..) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    let mut found: Option<(PTy, &'b [Region])> = None;
+                    for &pred in self.head_list(preds, e)? {
+                        let Ok(pc) = heads.count(pred) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                        let Some((pslots, next_rest)) = rest.split_at_checked(pc.len()) else {
+                            return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                        };
+                        rest = next_rest;
+                        if let PNode::ExProj { name, args, term, .. } = self.head_node(pred, e)?
+                            && name == Name::of("Output")
+                        {
+                            if !self.head_list(args, e)?.is_empty()
+                                || heads.own(pred).ok() != Some(SlotCount::ZERO)
+                                || found.is_some()
+                            {
+                                return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                            }
+                            let Ok(tc) = heads.count(term) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                            if pslots.len() != tc.len() {
+                                return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                            }
+                            found = Some((term, pslots));
+                        }
+                    }
+                    return Ok(found.ok_or(AwaitUnrelated::NoWrittenReturn));
+                }
+                PNode::Ref(_, inner) => {
+                    let Ok(own) = heads.own(cur_ty) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    let Some(next) = cur_slots.get(own.len()..) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    cur_ty = inner;
+                    cur_slots = next;
+                }
+                PNode::Adt(k, args) => {
+                    let Ok(own) = heads.own(cur_ty) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    if own != SlotCount::ZERO {
+                        return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                    }
+                    let list = self.head_list(args, e)?;
+                    let is_box = facts.adt(k).is_some_and(|a| a.is_box);
+                    // Only peel `Pin<P>` (single-param zero-lifetime wrapper) or `Box<T, A>`
+                    // (`is_box`); `call_one` still checks `term` against the `.await` expr's type.
+                    if (is_box && !list.is_empty()) || list.len() == 1 {
+                        let inner = list[0];
+                        let Ok(ic) = heads.count(inner) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                        let Some(next) = cur_slots.get(..ic.len()) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                        cur_ty = inner;
+                        cur_slots = next;
+                    } else {
+                        return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                    }
+                }
+                _ => return Ok(Err(AwaitUnrelated::NoWrittenReturn)),
+            }
+        }
+        Ok(Err(AwaitUnrelated::NoWrittenReturn))
     }
 }

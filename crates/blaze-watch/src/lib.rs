@@ -49,7 +49,6 @@
 /// blaze's one deterministic CBOR, by the name every module here uses.
 pub use blaze_cbor as cbor;
 pub mod conn;
-pub mod daemon;
 pub mod feed;
 pub mod frame;
 pub mod helper;

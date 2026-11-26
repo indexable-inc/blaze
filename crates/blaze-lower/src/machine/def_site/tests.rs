@@ -177,3 +177,114 @@ fn a_shadowing_template_let_is_its_own() {
     assert_eq!(logs.len(), 2);
     assert_eq!(locals(&v), vec![logs[1]], "the template's own `let log` comes first\n{}", dump_of(&l));
 }
+
+#[track_caller]
+fn lowered_with(defs: &[(&'static str, &str)], text: &'static str) -> Lowered<'static, 'static> {
+    let a = alloc();
+    let built: StdVec<(&'static str, blaze_expand::MacroDefinition<'static>)> = defs
+        .iter()
+        .map(|&(name, body)| {
+            let stream = blaze_expand::lex(body, Edition::E2024, a).expect("the rules lex");
+            (name, blaze_expand::MacroDefinition::rules(stream, at()))
+        })
+        .collect();
+    let prepared: StdVec<(&'static str, blaze_expand::Prepared<'_>)> = built
+        .iter()
+        .map(|(name, def)| (*name, blaze_expand::prepare(def).expect("the rules prepare")))
+        .collect();
+    let mut expander = ByName::new(&prepared, at(), Host, a);
+    let l = match lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, a) {
+        Ok(l) => l,
+        Err(need) => panic!("{text}: needs {:?}", need.atoms),
+    };
+    let unhandled: StdVec<_> = l.view().unhandled().collect();
+    assert!(unhandled.is_empty(), "{text}: unhandled {unhandled:?}\n{}", dump_of(&l));
+    l
+}
+
+/// A module-level macro-generating macro (matchit 0.8.4's `backtracker!` inside `Node::at`)
+/// defines a body-local `macro_rules! try_backtrack` whose template splices call-site
+/// `$walk:lifetime` and local `$path:ident` alongside the outer macro's own `skipped` binding.
+/// The generated local macro keeps per-token hygiene from its defining expansion, so
+/// `continue 'walk` resolves `'walk` at the call site without `UndeclaredLabel`, call-site
+/// locals resolve to the fn's locals, and outer-macro template tokens stay hygienic.
+#[test]
+fn macro_generated_local_macro_keeps_call_site_label_and_local_hygiene() {
+    let backtracker = r#"
+        ($stack:ident, $path:ident, $walk:lifetime) => {
+            macro_rules! try_backtrack {
+                () => {
+                    while let Some(skipped) = $stack.pop() {
+                        $path = skipped;
+                        continue $walk;
+                    }
+                };
+            }
+        };
+    "#;
+    let text = r#"
+        fn at(mut stack: Vec<u8>, mut path: u8) -> u8 {
+            let skipped = 99u8;
+            'walk: loop {
+                backtracker!(stack, path, 'walk);
+                if path == 0 {
+                    try_backtrack!();
+                    return skipped;
+                }
+                try_backtrack!();
+                return path;
+            }
+        }
+    "#;
+    let l = lowered_with(&[("backtracker", backtracker)], text);
+    let v = l.view();
+    let diags: StdVec<_> = v.diags().filter_map(Result::ok).map(|d| d.kind).collect();
+    assert!(diags.is_empty(), "expected no UndeclaredLabel or other diags, got {diags:?}\n{}", dump_of(&l));
+    let stacks = binds(&v, "stack");
+    let paths = binds(&v, "path");
+    let skippeds = binds(&v, "skipped");
+    assert_eq!(stacks.len(), 1);
+    assert_eq!(paths.len(), 1);
+    // fn's `let skipped` + two `while let Some(skipped)` expansions.
+    assert_eq!(skippeds.len(), 3, "expected fn's skipped plus two macro bindings\n{}", dump_of(&l));
+    let reads = locals(&v);
+    assert!(reads.contains(&stacks[0]), "call-site `stack` must resolve to fn param\n{}", dump_of(&l));
+    assert!(reads.contains(&paths[0]), "call-site `path` must resolve to fn param\n{}", dump_of(&l));
+    assert!(reads.contains(&skippeds[0]), "fn's own `return skipped` resolves to fn's binding\n{}", dump_of(&l));
+    assert!(reads.contains(&skippeds[1]), "first expansion's `skipped` resolves to its own while-let\n{}", dump_of(&l));
+    assert!(reads.contains(&skippeds[2]), "second expansion's `skipped` resolves to its own while-let\n{}", dump_of(&l));
+}
+
+/// Hygiene isolation for a macro-generated local macro: an identifier written by an outer
+/// module-level macro inside the generated `macro_rules!` sees the outer macro's own bindings
+/// and never leaks into the caller's locals, whereas a call-site `$x:ident` does.
+#[test]
+fn macro_generated_local_macro_preserves_outer_macro_hygiene_isolation() {
+    let make = r#"
+        ($x:ident) => {
+            let secret = 2u8;
+            macro_rules! inner {
+                () => { $x + secret + leaked };
+            }
+        };
+    "#;
+    let text = r#"
+        fn f() -> u8 {
+            let x = 10u8;
+            let secret = 1u8;
+            let leaked = 99u8;
+            make!(x);
+            inner!()
+        }
+    "#;
+    let l = lowered_with(&[("make", make)], text);
+    let v = l.view();
+    let xs = binds(&v, "x");
+    let secrets = binds(&v, "secret");
+    assert_eq!(xs.len(), 1);
+    assert_eq!(secrets.len(), 2, "caller's secret and outer macro's secret\n{}", dump_of(&l));
+    // `$x` resolves to caller's `x`, `secret` resolves to `make!`'s `let secret = 2u8` (secrets[1]),
+    // and `leaked` stays an unresolved path (never capturing caller's `let leaked = 99u8`).
+    assert_eq!(locals(&v), vec![xs[0], secrets[1]], "dump:\n{}", dump_of(&l));
+    assert!(dump_of(&l).contains("(path leaked)"), "outer macro's unbound `leaked` must not capture caller's local\n{}", dump_of(&l));
+}

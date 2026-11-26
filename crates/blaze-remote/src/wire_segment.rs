@@ -31,8 +31,8 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_cas::plain::{ALIGN, ENTRY, Entry, FOOTER, HEADER, Namespace, SEGMENT_FORMAT, SEGMENT_MOST, check_segment, record_crc};
-use blaze_ids::ContentId;
+use blaze_cas::plain::{ALIGN, Described, ENTRY, Entry, FOOTER, HEADER, Namespace, SEGMENT_FORMAT, SEGMENT_MOST, check_segment, record_crc};
+use blaze_ids::{ContentId, Hasher};
 use blaze_keyed::kind::Tag;
 use blaze_keyed::store::StoreError;
 use blaze_own::{AllocFailure, Vec};
@@ -56,6 +56,8 @@ const WINDOW_MOST: usize = 8 << 20;
 const COUNT_MOST: u32 = 1 << 26;
 /// Zero padding bytes for 16-byte `BLPS` payload alignment.
 const ZEROS: [u8; 16] = [0; 16];
+/// Domain tag of `blaze_cas::plain::check_segment`'s segment BLAKE3 digest (format 3).
+use blaze_cas::plain::SEGMENT_DIGEST as BLPS_SEGMENT_DIGEST;
 
 /// Per-stream codec selector: `Raw` avoids expansion on incompressible or tiny streams.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -100,6 +102,8 @@ pub enum WireSegmentError {
     Malformed { what: &'static str, at: u64 },
     /// `blaze-zstd` failed compressing or decompressing a column or tag stream.
     Codec { stream: &'static str, error: ZstdError },
+    /// Reconstructed canonical `BLPS` BLAKE3 digest did not match the segment's header digest.
+    DigestMismatch { claimed: ContentId, computed: ContentId },
     /// Allocator refused an allocation.
     Alloc(AllocFailure),
 }
@@ -126,6 +130,7 @@ impl fmt::Display for WireSegmentError {
             Self::TooLarge { what, len, most } => write!(f, "wire segment: {what} is {len}, past limit {most}"),
             Self::Malformed { what, at } => write!(f, "wire segment at byte {at}: {what}"),
             Self::Codec { stream, error } => write!(f, "wire segment {stream} stream: {error}"),
+            Self::DigestMismatch { claimed, computed } => write!(f, "wire segment digest mismatch: claimed {claimed}, computed {computed}"),
             Self::Alloc(error) => write!(f, "wire segment allocation failed: {error}"),
         }
     }
@@ -862,6 +867,407 @@ pub fn decode_wire_segment<A: Allocator + Copy>(
     Ok(())
 }
 
+/// Where a verified wire record's payload bytes live (zero-copy into the Zstd-decoded buffer or
+/// the raw wire buffer, avoiding a second whole-segment `BLPS` RAM copy).
+#[derive(Clone, Copy)]
+enum PayloadLoc {
+    Wire { start: usize, len: usize },
+    Decoded { start: usize, len: usize },
+}
+
+/// One record entry inside a [`VerifiedWireSegment`].
+#[derive(Clone, Copy)]
+struct VerifiedRecord {
+    key: ContentId,
+    tag: Tag,
+    loc: PayloadLoc,
+}
+
+/// A `BZS1` wire segment decoded and verified ONCE against the exact canonical `BLPS` format-3
+/// BLAKE3 digest (streaming over header, payloads, alignment padding, sorted index entries, and
+/// footer) WITHOUT materializing a redundant contiguous `BLPS` copy in RAM.
+pub struct VerifiedWireSegment<'w, A: Allocator + Copy> {
+    wire: &'w [u8],
+    described: Described,
+    decoded_streams: Vec<u8, A>,
+    records: Vec<VerifiedRecord, A>,
+}
+
+impl<'w, A: Allocator + Copy> VerifiedWireSegment<'w, A> {
+    /// Segment metadata verified against the streaming `BLPS` BLAKE3 digest.
+    pub fn described(&self) -> Described {
+        self.described
+    }
+
+    /// Number of verified records in this segment.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Iterates over every verified `(key, tag, payload)` in ascending key order.
+    pub fn iter(&self) -> impl Iterator<Item = (ContentId, Tag, &[u8])> + '_ {
+        self.records.as_slice().iter().filter_map(|rec| {
+            let payload = match rec.loc {
+                PayloadLoc::Wire { start, len } => self.wire.get(start..start.saturating_add(len))?,
+                PayloadLoc::Decoded { start, len } => self.decoded_streams.as_slice().get(start..start.saturating_add(len))?,
+            };
+            Some((rec.key, rec.tag, payload))
+        })
+    }
+}
+
+/// Decode `BZS1` wire bytes and verify the exact canonical `BLPS` format-3 BLAKE3 digest and
+/// sorted-key invariants in one pass, WITHOUT allocating a second whole-segment `BLPS` buffer.
+///
+/// The caller MUST still compare `verified.described().digest`, `count`, `index_at`, and
+/// `namespace` against its authenticated manifest row or expected segment digest before trusting
+/// the records.
+pub fn decode_wire_segment_verified<'w, A: Allocator + Copy>(
+    wire: &'w [u8],
+    max_raw_len: u64,
+    alloc: A,
+) -> Result<VerifiedWireSegment<'w, A>, WireSegmentError> {
+    if wire.len() < WIRE_HEADER {
+        return Err(WireSegmentError::Malformed { what: "wire segment shorter than 64-byte header", at: u64::try_from(wire.len()).unwrap_or(u64::MAX) });
+    }
+    let magic_slice = wire.get(0..4).ok_or(WireSegmentError::Malformed { what: "missing magic", at: 0 })?;
+    let found_magic: [u8; 4] = magic_slice.try_into().map_err(|_| WireSegmentError::Malformed { what: "magic bytes", at: 0 })?;
+    if found_magic != MAGIC {
+        return Err(WireSegmentError::BadMagic { found: found_magic });
+    }
+    let version = read_u32(wire, 4)?;
+    if version != VERSION {
+        return Err(WireSegmentError::UnsupportedVersion { found: version, wanted: VERSION });
+    }
+
+    let namespace = Namespace(read_u64(wire, 8)?);
+    let count_u32 = read_u32(wire, 16)?;
+    let stream_count_u32 = read_u32(wire, 20)?;
+    let raw_len = read_u64(wire, 24)?;
+    let digest_slice = wire.get(32..64).ok_or(WireSegmentError::Malformed { what: "missing digest", at: 32 })?;
+    let digest_arr: [u8; 32] = digest_slice.try_into().map_err(|_| WireSegmentError::Malformed { what: "digest bytes", at: 32 })?;
+    let claimed = ContentId(digest_arr);
+
+    let effective_max = max_raw_len.min(SEGMENT_MOST);
+    let min_blps = u64::try_from(HEADER + FOOTER).unwrap_or(176);
+    if raw_len > effective_max {
+        return Err(WireSegmentError::TooLarge { what: "raw segment length", len: raw_len, most: effective_max });
+    }
+    if raw_len < min_blps {
+        return Err(WireSegmentError::Malformed { what: "declared raw length smaller than BLPS header + footer", at: 24 });
+    }
+    if count_u32 > COUNT_MOST {
+        return Err(WireSegmentError::TooLarge { what: "record count", len: u64::from(count_u32), most: u64::from(COUNT_MOST) });
+    }
+    if stream_count_u32 > count_u32 || stream_count_u32 > u32::from(u16::MAX) + 1 {
+        return Err(WireSegmentError::Malformed { what: "stream count exceeds record count or Tag domain", at: 20 });
+    }
+
+    let count = usize::try_from(count_u32).map_err(|_| WireSegmentError::TooLarge {
+        what: "record count",
+        len: u64::from(count_u32),
+        most: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })?;
+    let stream_count = usize::try_from(stream_count_u32).map_err(|_| WireSegmentError::TooLarge {
+        what: "stream count",
+        len: u64::from(stream_count_u32),
+        most: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })?;
+
+    let mut cursor = WIRE_HEADER;
+    let keys_bytes = count.checked_mul(32).ok_or(WireSegmentError::Malformed { what: "keys length overflow", at: 16 })?;
+    let keys_end = cursor.checked_add(keys_bytes).ok_or(WireSegmentError::Malformed { what: "keys end overflow", at: 16 })?;
+    let keys_slice = wire.get(cursor..keys_end).ok_or(WireSegmentError::Malformed { what: "wire truncated inside keys", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?;
+    cursor = keys_end;
+
+    // Enforce strictly ascending keys (identical to `check_segment`'s sorted-index invariant).
+    for i in 1..count {
+        let prev = keys_slice.get(i.saturating_sub(1).saturating_mul(32)..i.saturating_mul(32)).ok_or(WireSegmentError::Malformed { what: "prev key slice", at: 0 })?;
+        let curr = keys_slice.get(i.saturating_mul(32)..i.saturating_add(1).saturating_mul(32)).ok_or(WireSegmentError::Malformed { what: "curr key slice", at: 0 })?;
+        if prev >= curr {
+            return Err(WireSegmentError::Malformed { what: "wire segment keys are not strictly ascending", at: u64::try_from(i).unwrap_or(u64::MAX) });
+        }
+    }
+
+    let tags_codec = Codec::decode(*wire.get(cursor).ok_or(WireSegmentError::Malformed { what: "missing tags codec", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?)
+        .ok_or(WireSegmentError::Malformed { what: "unknown tags codec", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?;
+    let tags_wire_len = usize::try_from(read_u32(wire, cursor.saturating_add(1))?).map_err(|_| WireSegmentError::Malformed { what: "tags wire len", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?;
+    cursor = cursor.checked_add(5).ok_or(WireSegmentError::Malformed { what: "tags header overflow", at: 0 })?;
+    let tags_end = cursor.checked_add(tags_wire_len).ok_or(WireSegmentError::Malformed { what: "tags end overflow", at: 0 })?;
+    let tags_wire = wire.get(cursor..tags_end).ok_or(WireSegmentError::Malformed { what: "wire truncated inside tags column", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?;
+    cursor = tags_end;
+
+    let lens_codec = Codec::decode(*wire.get(cursor).ok_or(WireSegmentError::Malformed { what: "missing lens codec", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?)
+        .ok_or(WireSegmentError::Malformed { what: "unknown lens codec", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?;
+    let lens_wire_len = usize::try_from(read_u32(wire, cursor.saturating_add(1))?).map_err(|_| WireSegmentError::Malformed { what: "lens wire len", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?;
+    cursor = cursor.checked_add(5).ok_or(WireSegmentError::Malformed { what: "lens header overflow", at: 0 })?;
+    let lens_end = cursor.checked_add(lens_wire_len).ok_or(WireSegmentError::Malformed { what: "lens end overflow", at: 0 })?;
+    let lens_wire = wire.get(cursor..lens_end).ok_or(WireSegmentError::Malformed { what: "wire truncated inside lens column", at: u64::try_from(cursor).unwrap_or(u64::MAX) })?;
+    cursor = lens_end;
+
+    let dir_bytes = stream_count.checked_mul(STREAM_DIR_ENTRY).ok_or(WireSegmentError::Malformed { what: "stream directory overflow", at: 20 })?;
+    let dir_end = cursor.checked_add(dir_bytes).ok_or(WireSegmentError::Malformed { what: "stream directory end overflow", at: 20 })?;
+    if dir_end > wire.len() {
+        return Err(WireSegmentError::Malformed { what: "wire truncated inside stream directory", at: u64::try_from(cursor).unwrap_or(u64::MAX) });
+    }
+
+    let mut streams: Vec<StreamDir, A> = Vec::try_with_capacity_in(stream_count, alloc)?;
+    let mut stream_wire_cursor = dir_end;
+    let mut dir_record_sum: u64 = 0;
+    let mut dir_raw_sum: u64 = 0;
+    let mut zstd_decoded_total: usize = 0;
+    let max_payload_budget = raw_len.saturating_sub(min_blps);
+
+    for s in 0..stream_count {
+        let entry_at = cursor.saturating_add(s.saturating_mul(STREAM_DIR_ENTRY));
+        let tag = read_u16(wire, entry_at)?;
+        let codec_byte = *wire.get(entry_at.saturating_add(2)).ok_or(WireSegmentError::Malformed { what: "missing stream codec", at: u64::try_from(entry_at).unwrap_or(u64::MAX) })?;
+        let reserved = *wire.get(entry_at.saturating_add(3)).ok_or(WireSegmentError::Malformed { what: "missing stream reserved byte", at: u64::try_from(entry_at).unwrap_or(u64::MAX) })?;
+        let codec = Codec::decode(codec_byte).ok_or(WireSegmentError::Malformed { what: "unknown stream codec", at: u64::try_from(entry_at).unwrap_or(u64::MAX) })?;
+        if reserved != 0 {
+            return Err(WireSegmentError::Malformed { what: "non-zero reserved byte in stream directory", at: u64::try_from(entry_at.saturating_add(3)).unwrap_or(u64::MAX) });
+        }
+        let record_count = read_u32(wire, entry_at.saturating_add(4))?;
+        let raw_bytes = read_u64(wire, entry_at.saturating_add(8))?;
+        let wire_bytes = read_u64(wire, entry_at.saturating_add(16))?;
+        if record_count == 0 {
+            return Err(WireSegmentError::Malformed { what: "empty tag stream in directory", at: u64::try_from(entry_at).unwrap_or(u64::MAX) });
+        }
+        if let Some(prev) = streams.as_slice().last()
+            && prev.tag >= tag
+        {
+            return Err(WireSegmentError::Malformed { what: "stream directory tags are not strictly ascending", at: u64::try_from(entry_at).unwrap_or(u64::MAX) });
+        }
+        if codec == Codec::Raw && wire_bytes != raw_bytes {
+            return Err(WireSegmentError::Malformed { what: "raw stream wire_bytes disagrees with raw_bytes", at: u64::try_from(entry_at).unwrap_or(u64::MAX) });
+        }
+        dir_record_sum = dir_record_sum.checked_add(u64::from(record_count)).ok_or(WireSegmentError::Malformed { what: "stream record sum overflow", at: u64::try_from(entry_at).unwrap_or(u64::MAX) })?;
+        dir_raw_sum = dir_raw_sum.checked_add(raw_bytes).ok_or(WireSegmentError::Malformed { what: "stream raw byte sum overflow", at: u64::try_from(entry_at).unwrap_or(u64::MAX) })?;
+        if dir_raw_sum > max_payload_budget {
+            return Err(WireSegmentError::TooLarge { what: "declared tag streams raw bytes", len: dir_raw_sum, most: max_payload_budget });
+        }
+        let wire_bytes_usize = usize::try_from(wire_bytes).map_err(|_| WireSegmentError::TooLarge {
+            what: "stream wire bytes",
+            len: wire_bytes,
+            most: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+        })?;
+        let wire_end = stream_wire_cursor.checked_add(wire_bytes_usize).ok_or(WireSegmentError::Malformed { what: "stream wire end overflow", at: u64::try_from(entry_at).unwrap_or(u64::MAX) })?;
+        if wire_end > wire.len() {
+            return Err(WireSegmentError::Malformed { what: "wire truncated inside tag payload stream", at: u64::try_from(stream_wire_cursor).unwrap_or(u64::MAX) });
+        }
+        if codec == Codec::Zstd {
+            let raw_usize = usize::try_from(raw_bytes).map_err(|_| WireSegmentError::TooLarge {
+                what: "tag stream raw bytes",
+                len: raw_bytes,
+                most: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            })?;
+            zstd_decoded_total = zstd_decoded_total.checked_add(raw_usize).ok_or(WireSegmentError::TooLarge {
+                what: "decoded streams buffer",
+                len: u64::MAX,
+                most: max_payload_budget,
+            })?;
+        }
+        streams.try_push(StreamDir { tag, codec, record_count, raw_bytes, wire_bytes, wire_start: stream_wire_cursor }).map_err(|r| r.why)?;
+        stream_wire_cursor = wire_end;
+    }
+
+    if dir_record_sum != u64::from(count_u32) {
+        return Err(WireSegmentError::Malformed { what: "stream directory record counts do not sum to segment count", at: 20 });
+    }
+    if stream_wire_cursor != wire.len() {
+        return Err(WireSegmentError::Malformed { what: "trailing bytes after tag payload streams", at: u64::try_from(stream_wire_cursor).unwrap_or(u64::MAX) });
+    }
+
+    let mut decoder = ZstdDecoder::new_in(alloc);
+    let expected_tags_bytes = count.checked_mul(2).ok_or(WireSegmentError::Malformed { what: "tags byte length overflow", at: 16 })?;
+    let expected_lens_bytes = count.checked_mul(4).ok_or(WireSegmentError::Malformed { what: "lens byte length overflow", at: 16 })?;
+
+    let mut tags_buf: Vec<u8, A> = Vec::try_with_capacity_in(expected_tags_bytes, alloc)?;
+    decode_column(&mut decoder, tags_codec, tags_wire, expected_tags_bytes, "tags", &mut tags_buf)?;
+
+    let mut lens_buf: Vec<u8, A> = Vec::try_with_capacity_in(expected_lens_bytes, alloc)?;
+    decode_column(&mut decoder, lens_codec, lens_wire, expected_lens_bytes, "lens", &mut lens_buf)?;
+
+    let mut record_stream: Vec<u16, A> = Vec::try_with_capacity_in(count, alloc)?;
+    let mut seen_records: Vec<u32, A> = Vec::try_with_capacity_in(stream_count, alloc)?;
+    seen_records.resize(stream_count, 0);
+    let mut seen_bytes: Vec<u64, A> = Vec::try_with_capacity_in(stream_count, alloc)?;
+    seen_bytes.resize(stream_count, 0);
+
+    let mut at = u64::try_from(HEADER).unwrap_or(128);
+    for i in 0..count {
+        let tag = read_u16(tags_buf.as_slice(), i.saturating_mul(2))?;
+        let len = read_u32(lens_buf.as_slice(), i.saturating_mul(4))?;
+        let stream_idx = streams.as_slice().binary_search_by_key(&tag, |s| s.tag).map_err(|_| WireSegmentError::Malformed {
+            what: "record tag not present in stream directory",
+            at: u64::try_from(i).unwrap_or(u64::MAX),
+        })?;
+        if let Some(rc) = seen_records.as_mut_slice().get_mut(stream_idx) {
+            *rc = rc.saturating_add(1);
+        }
+        if let Some(sb) = seen_bytes.as_mut_slice().get_mut(stream_idx) {
+            *sb = sb.saturating_add(u64::from(len));
+        }
+        let s_u16 = u16::try_from(stream_idx).map_err(|_| WireSegmentError::Malformed { what: "stream index", at: 0 })?;
+        record_stream.try_push(s_u16).map_err(|r| r.why)?;
+        at = align_up(at.saturating_add(u64::from(len))).ok_or(WireSegmentError::Malformed { what: "reconstructed payload offset overflow", at: 24 })?;
+    }
+
+    let index_at = at;
+    let expected_raw_len = index_at
+        .checked_add(u64::from(count_u32).saturating_mul(u64::try_from(ENTRY).unwrap_or(48)))
+        .and_then(|v| v.checked_add(u64::try_from(FOOTER).unwrap_or(48)))
+        .ok_or(WireSegmentError::Malformed { what: "reconstructed raw length overflow", at: 24 })?;
+    if expected_raw_len != raw_len {
+        return Err(WireSegmentError::Malformed { what: "reconstructed BLPS length disagrees with wire header raw_len", at: 24 });
+    }
+    for (s, dir) in streams.as_slice().iter().enumerate() {
+        if seen_records.as_slice().get(s).copied() != Some(dir.record_count) || seen_bytes.as_slice().get(s).copied() != Some(dir.raw_bytes) {
+            return Err(WireSegmentError::Malformed { what: "record tags/lengths disagree with stream directory totals", at: 20 });
+        }
+    }
+
+    let mut decoded_streams: Vec<u8, A> = Vec::try_with_capacity_in(zstd_decoded_total, alloc)?;
+    let mut stream_slices: Vec<StreamSlice, A> = Vec::try_with_capacity_in(stream_count, alloc)?;
+    for dir in streams.as_slice() {
+        let raw_usize = usize::try_from(dir.raw_bytes).map_err(|_| WireSegmentError::TooLarge {
+            what: "tag stream raw bytes",
+            len: dir.raw_bytes,
+            most: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+        })?;
+        let wire_usize = usize::try_from(dir.wire_bytes).map_err(|_| WireSegmentError::TooLarge {
+            what: "tag stream wire bytes",
+            len: dir.wire_bytes,
+            most: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+        })?;
+        match dir.codec {
+            Codec::Raw => {
+                stream_slices.try_push(StreamSlice::Raw { wire_start: dir.wire_start, len: raw_usize }).map_err(|r| r.why)?;
+            }
+            Codec::Zstd => {
+                let buf_start = decoded_streams.len();
+                let wire_slice = wire
+                    .get(dir.wire_start..dir.wire_start.saturating_add(wire_usize))
+                    .ok_or(WireSegmentError::Malformed { what: "tag stream wire slice", at: u64::try_from(dir.wire_start).unwrap_or(u64::MAX) })?;
+                let limits = ZstdLimits { most_output_bytes: raw_usize, most_window_bytes: WINDOW_MOST, most_frames: 1 };
+                decoder.decompress_into(wire_slice, limits, &mut decoded_streams).map_err(|error| WireSegmentError::Codec { stream: "payload", error })?;
+                let got = decoded_streams.len().saturating_sub(buf_start);
+                if got != raw_usize {
+                    return Err(WireSegmentError::Malformed { what: "decompressed tag stream length disagrees with directory", at: u64::try_from(dir.wire_start).unwrap_or(u64::MAX) });
+                }
+                stream_slices.try_push(StreamSlice::Decoded { buf_start, len: raw_usize }).map_err(|r| r.why)?;
+            }
+        }
+    }
+
+    // Stream the exact canonical BLPS bytes through BLAKE3 without copying payloads into a second
+    // whole-segment buffer.
+    let mut hasher = Hasher::new(BLPS_SEGMENT_DIGEST);
+    let mut blps_header = [0u8; HEADER];
+    blps_header[0..4].copy_from_slice(b"BLPS");
+    blps_header[4..8].copy_from_slice(&SEGMENT_FORMAT.to_le_bytes());
+    blps_header[8..16].copy_from_slice(&namespace.0.to_le_bytes());
+    blps_header[16..20].copy_from_slice(&count_u32.to_le_bytes());
+    blps_header[24..32].copy_from_slice(&index_at.to_le_bytes());
+    if count > 0 {
+        if let Some(first_key) = keys_slice.get(0..32) {
+            blps_header[32..64].copy_from_slice(first_key);
+        }
+        let last_off = count.saturating_sub(1).saturating_mul(32);
+        if let Some(last_key) = keys_slice.get(last_off..last_off.saturating_add(32)) {
+            blps_header[64..96].copy_from_slice(last_key);
+        }
+    }
+    hasher.update(&blps_header);
+
+    let mut index_buf: Vec<u8, A> = Vec::try_with_capacity_in(count.saturating_mul(ENTRY), alloc)?;
+    let mut records: Vec<VerifiedRecord, A> = Vec::try_with_capacity_in(count, alloc)?;
+    let mut stream_pos: Vec<usize, A> = Vec::try_with_capacity_in(stream_count, alloc)?;
+    stream_pos.resize(stream_count, 0);
+
+    let mut payload_at = u64::try_from(HEADER).unwrap_or(128);
+    let align_usize = usize::try_from(ALIGN).unwrap_or(16);
+
+    for i in 0..count {
+        let key_off = i.saturating_mul(32);
+        let key_slice = keys_slice.get(key_off..key_off.saturating_add(32)).ok_or(WireSegmentError::Malformed { what: "key slice", at: 0 })?;
+        let key_arr: [u8; 32] = key_slice.try_into().map_err(|_| WireSegmentError::Malformed { what: "key array", at: 0 })?;
+        let key = ContentId(key_arr);
+        let tag = Tag(read_u16(tags_buf.as_slice(), i.saturating_mul(2))?);
+        let len_u32 = read_u32(lens_buf.as_slice(), i.saturating_mul(4))?;
+        let len = usize::try_from(len_u32).map_err(|_| WireSegmentError::Malformed { what: "record length", at: 0 })?;
+
+        let s = usize::from(*record_stream.as_slice().get(i).ok_or(WireSegmentError::Malformed { what: "stream index", at: 0 })?);
+        let pos = *stream_pos.as_slice().get(s).ok_or(WireSegmentError::Malformed { what: "stream cursor", at: 0 })?;
+        let next_pos = pos.checked_add(len).ok_or(WireSegmentError::Malformed { what: "stream cursor overflow", at: 0 })?;
+        let slice_desc = *stream_slices.as_slice().get(s).ok_or(WireSegmentError::Malformed { what: "stream slice", at: 0 })?;
+        let (loc, payload) = match slice_desc {
+            StreamSlice::Raw { wire_start, len: slen } => {
+                if next_pos > slen {
+                    return Err(WireSegmentError::Malformed { what: "record exceeds raw tag stream", at: 0 });
+                }
+                let start = wire_start.saturating_add(pos);
+                let slice = wire.get(start..start.saturating_add(len)).ok_or(WireSegmentError::Malformed { what: "raw payload slice", at: 0 })?;
+                (PayloadLoc::Wire { start, len }, slice)
+            }
+            StreamSlice::Decoded { buf_start, len: slen } => {
+                if next_pos > slen {
+                    return Err(WireSegmentError::Malformed { what: "record exceeds decoded tag stream", at: 0 });
+                }
+                let start = buf_start.saturating_add(pos);
+                let slice = decoded_streams.as_slice().get(start..start.saturating_add(len)).ok_or(WireSegmentError::Malformed { what: "decoded payload slice", at: 0 })?;
+                (PayloadLoc::Decoded { start, len }, slice)
+            }
+        };
+        if let Some(p) = stream_pos.as_mut_slice().get_mut(s) {
+            *p = next_pos;
+        }
+
+        hasher.update(payload);
+        let entry_at = payload_at;
+        payload_at = payload_at.saturating_add(u64::from(len_u32));
+        let rem = usize::try_from(payload_at % ALIGN).unwrap_or(0);
+        if rem != 0 {
+            let pad = align_usize.saturating_sub(rem);
+            if let Some(z) = ZEROS.get(..pad) {
+                hasher.update(z);
+                payload_at = payload_at.saturating_add(u64::try_from(pad).unwrap_or(0));
+            }
+        }
+
+        let entry = Entry { key, tag, at: entry_at, len: len_u32, crc: record_crc(&key, tag, payload) };
+        index_buf.try_extend_from_slice(&entry.encode_array())?;
+        records.try_push(VerifiedRecord { key, tag, loc }).map_err(|r| r.why)?;
+    }
+
+    if payload_at != index_at {
+        return Err(WireSegmentError::Malformed { what: "streamed payload end disagrees with index_at", at: 24 });
+    }
+    hasher.update(index_buf.as_slice());
+
+    let mut blps_footer_prefix = [0u8; 16];
+    blps_footer_prefix[0..4].copy_from_slice(b"BLPE");
+    blps_footer_prefix[4..8].copy_from_slice(&count_u32.to_le_bytes());
+    blps_footer_prefix[8..16].copy_from_slice(&index_at.to_le_bytes());
+    hasher.update(&blps_footer_prefix);
+
+    let computed = hasher.finish();
+    if computed != claimed {
+        return Err(WireSegmentError::DigestMismatch { claimed, computed });
+    }
+
+    Ok(VerifiedWireSegment {
+        wire,
+        described: Described { namespace, count: count_u32, index_at, digest: claimed },
+        decoded_streams,
+        records,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_cas::plain::{Namespace, check_segment, seal_segment};
@@ -1062,6 +1468,51 @@ mod tests {
                 },
             };
             assert!(!accepted, "bit flip at wire byte {pos} slipped past decode + check_segment!");
+        }
+    }
+
+    #[test]
+    fn decode_wire_segment_verified_matches_check_segment_and_rejects_every_bit_flip() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let raw = make_segment(
+            &[
+                (Tag(1), b"alpha payload alpha payload alpha payload alpha payload"),
+                (Tag(2), b"beta payload beta payload beta payload beta payload"),
+                (Tag(1), b"gamma payload gamma payload gamma payload gamma payload"),
+                (Tag(9), b"tiny"),
+            ],
+            alloc,
+        );
+        let mut wire = OwnVec::new_in(alloc);
+        encode_wire_segment(raw.as_slice(), &mut wire, alloc).expect("encode");
+        let want_desc = check_segment(raw.as_slice()).expect("raw check");
+
+        let verified = decode_wire_segment_verified(wire.as_slice(), raw.len() as u64, alloc).expect("verified decode");
+        assert_eq!(verified.described(), want_desc);
+        assert_eq!(verified.len(), want_desc.count as usize);
+
+        // Compare every record byte-for-byte with reconstructed BLPS.
+        let mut blps = OwnVec::new_in(alloc);
+        decode_wire_segment(wire.as_slice(), raw.len() as u64, &mut blps, alloc).expect("decode");
+        assert_eq!(blps.as_slice(), raw.as_slice());
+        for (i, (key, tag, payload)) in verified.iter().enumerate() {
+            let at = want_desc.index_at as usize + i * ENTRY;
+            let entry = Entry::decode(&blps.as_slice()[at..at + ENTRY]).expect("entry");
+            assert_eq!(key, entry.key);
+            assert_eq!(tag, entry.tag);
+            assert_eq!(payload, &blps.as_slice()[entry.at as usize..entry.at as usize + entry.len as usize]);
+        }
+
+        // Flip every byte of `wire`: `decode_wire_segment_verified` must reject every single one.
+        let mut mutated = OwnVec::with_capacity_in(wire.len(), alloc);
+        for pos in 0..wire.len() {
+            mutated.clear();
+            mutated.extend_from_slice(wire.as_slice());
+            mutated.as_mut_slice()[pos] ^= 0x01;
+            assert!(
+                decode_wire_segment_verified(mutated.as_slice(), SEGMENT_MOST, alloc).is_err(),
+                "bit flip at wire byte {pos} slipped past decode_wire_segment_verified!"
+            );
         }
     }
 }

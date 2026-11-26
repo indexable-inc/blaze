@@ -2255,6 +2255,7 @@ pub fn baked_material(name: &str) -> Material<'_> {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }
 }
 

@@ -794,6 +794,12 @@ The launcher and `blaze run` parent exchange run-mode parameters and telemetry c
 - `BLAZE_LAUNCH_NATIVE`: 64-hex-digit native library record ID when the program links C code.
 - `BLAZE_LAUNCH_TELEMETRY`: path to the per-run shared-memory telemetry ring file (`crates/blaze-launch/src/telemetry.rs`).
 - `BLAZE_LAUNCH_EXPLORE`: when set to `1` (by `blaze run --open`), instructs the launcher to ensure the local viewer daemon is running and open Explore if no tab is connected.
+- `BLAZE_LAUNCH_SANDBOX_TEMP`: per-test `$TMPDIR` root passed by `blaze test` on Linux so `blaze-launcher` enters the Landlock + seccomp + mount/net/IPC/user namespace sandbox before guest code starts (removed from env before guest execution).
+- `BLAZE_LAUNCH_UNWOUND_FILE`: per-test unwind sentinel path or `fd:4` passed by `blaze test` for harnessed tests so uncaught Rust panics are distinguished from `SIGABRT` (removed from env before guest execution).
+- `BLAZE_LAUNCH_BIN_MAP`: newline-separated `<guest_path>\t<host_stub_path>` map passed by `blaze test` on macOS when an integration-test or benchmark suite exposes `CARGO_BIN_EXE_*` binaries, enabling async-signal-safe path remapping of compile-time `/target/debug/bin/<package>/<name>` literals in `LauncherOwn` (removed from env before guest execution).
+- `BLAZE_LAUNCH_BINS_DIR`: directory holding the test command's `CARGO_BIN_EXE_*` launcher stubs, bind-mounted read-only at `/target/debug/bin` inside the Linux test sandbox so compile-time paths exist as real kernel-visible files (removed from env before guest execution).
+- `BLAZE_LAUNCH_BINS_SOCK_DIR`: short, user-private (`0o700`) directory holding the `BinServer` Unix domain socket, preserved read-only across the Linux test sandbox `/tmp` mask (removed from env before guest execution).
+- `BLAZE_LAUNCH_BIN_OWNER`: `<suite_id>:<row>` tag inherited by spawned workspace binaries so `BinServer` joins their entered functions and purity back to the spawning test row.
 - `BLAZE_ALLOC_SAMPLE_BYTES`: byte-stride override for allocation telemetry sampling in `blaze-launcher`.
 - `BLAZE_EXPLORE_LOCAL`: when set, opens the local loopback `/explore` URL instead of `https://ix.dev/blaze/explore`.
 - `BLAZE_NO_TELEMETRY`: opt-out of per-run live shared-memory telemetry.

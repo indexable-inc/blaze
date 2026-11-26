@@ -14,6 +14,10 @@ repository.workspace = true
 name = "bstd"
 doctest = false
 
+[[example]]
+name = "git_prompt"
+required-features = ["git"]
+
 [dependencies]
 blaze-core.workspace = true
 blaze-mem.workspace = true
@@ -74,7 +78,7 @@ blaze-columns.workspace = true
 blaze-deflate.workspace = true
 blaze-ecs.workspace = true
 blaze-ed25519.workspace = true
-blaze-glob = { workspace = true, default-features = false }
+blaze-glob.workspace = true
 blaze-h2.workspace = true
 blaze-int.workspace = true
 blaze-math.workspace = true
@@ -86,6 +90,8 @@ blaze-tar.workspace = true
 blaze-toml.workspace = true
 blaze-unicode.workspace = true
 blaze-units.workspace = true
+# bstd::git: sans-IO Starship-class Git prompt and status core driven over bstd::fs.
+blaze-git = { workspace = true, optional = true }
 
 # bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
 # The runtime's own system calls (a stream's terminal facts; on macOS the topology and QoS,
@@ -119,6 +125,8 @@ requests = ["dep:blaze-h1"]
 sim-draws = ["dep:blaze-sim"]
 # `bstd::image`: PNG decode and encode (zlib/deflate is always available via `bstd::compress`).
 image = []
+# `bstd::git`: fast sans-IO Starship-class Git prompt and status driven over `bstd::fs`.
+git = ["dep:blaze-git"]
 # `bstd::test::native`: a test's native world, from a test's root of real-OS authority
 # (`blaze_core::testing::os()`); a crate's dev-dependencies turn it on, never its build.
 testing = ["blaze-core/testing", "blaze-own/testing"]

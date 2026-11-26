@@ -522,11 +522,12 @@ impl ClosureTable {
 /// The front end's normalization as the builder asks it: an answer not given is the builder's
 /// own refusal naming the projection.
 /// Whether `e` is a need the front end can fill (`FrontEnd::make_asked`) before the step is
-/// taken again: an instance question's `Missing` (an answer no check made), or an ADT whose
-/// row is not made (`NoAdt`: the lazy program's `adt` noted its head). A front end that noted
-/// nothing makes nothing, and `e` is the refusal.
+/// taken again: an instance question's `Missing` (an answer no check made), an ADT whose row
+/// is not made (`NoAdt`: the lazy program's `adt` noted its head), or an unmade ADT/record
+/// fact (`MissingRecord`: the lazy program's `discriminant` / `repr` / `valid_range` noted
+/// its head). A front end that noted nothing makes nothing, and `e` is the refusal.
 fn build_error_asks_again(error: &BuildError) -> bool {
-    matches!(error, BuildError::Select(blaze_typeck::ResolveError::Missing(_)) | BuildError::NoAdt { .. })
+    matches!(error, BuildError::Select(blaze_typeck::ResolveError::Missing(_)) | BuildError::NoAdt { .. } | BuildError::MissingRecord { .. })
 }
 
 fn layout_refusal_asks_again(why: &blaze_build::layout::Refusal) -> bool {
@@ -540,7 +541,7 @@ fn layout_refusal_asks_again(why: &blaze_build::layout::Refusal) -> bool {
 
 fn asks_again(e: &RunError) -> bool {
     match e {
-        RunError::Build { error, .. } => build_error_asks_again(error),
+        RunError::Build { error, .. } | RunError::ItemRefused { error, .. } => build_error_asks_again(error),
         RunError::Resolve { error: blaze_typeck::ResolveError::Missing(_), .. } => true,
         RunError::NoAdt { .. } => true,
         RunError::Vtable { why: VtableFail::Layout(error), .. } => layout_refusal_asks_again(&error.why),
@@ -743,6 +744,15 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
     fn fn_trait_method(&self, which: blaze_build::FnTrait) -> blaze_consteval::FnTraitMethod {
         use blaze_consteval::FnTraitMethod::{Absent, Found};
         let (lang, name) = crate::front2::langs::fn_trait_method(which);
+        self.program.lang_trait_fn(lang, name).map_or(Absent, Found)
+    }
+
+    fn deref_method(&self, mutbl: Mutbl) -> blaze_consteval::FnTraitMethod {
+        use blaze_consteval::FnTraitMethod::{Absent, Found};
+        let (lang, name) = match mutbl {
+            Mutbl::Not => (LangItem::Deref, "deref"),
+            Mutbl::Mut => (LangItem::DerefMut, "deref_mut"),
+        };
         self.program.lang_trait_fn(lang, name).map_or(Absent, Found)
     }
 }
@@ -2742,7 +2752,7 @@ fn build_from<P: FrontEnd>(
             let mut laid_for_const: blaze_own::AVec<'static, blaze_build::CoroutineOf> = blaze_own::AVec::new_in(alloc);
             if !need_tys.is_empty() {
                 let facts = FrontAdts(&*program_mut, i, &consts, &langs, &checked_bodies);
-                let coro_roots = match crate::front2::coroutine_needs::held_coroutines(&mut ground, &need_tys, &facts, alloc) {
+                let coro_roots = match crate::front2::coroutine_needs::referenced_coroutines(&mut ground, &need_tys, &facts, alloc) {
                     Ok(roots) => roots,
                     Err(error) => {
                         filed(&mut survey, RunError::Build { function: named, error, range: None })?;
@@ -2949,7 +2959,7 @@ fn build_from<P: FrontEnd>(
                 let mut laid_for_const: blaze_own::AVec<'static, blaze_build::CoroutineOf> = blaze_own::AVec::new_in(alloc);
                 if !need_tys.is_empty() {
                     let ofacts = FrontAdts(&*program_mut, ci, &consts, &langs, checked_bodies);
-                    let coro_roots = crate::front2::coroutine_needs::held_coroutines(ground, &need_tys, &ofacts, alloc)
+                    let coro_roots = crate::front2::coroutine_needs::referenced_coroutines(ground, &need_tys, &ofacts, alloc)
                         .map_err(|error| RunError::Build { function: program_mut.function(ci).named(), error, range: None })?;
                     if !coro_roots.is_empty() {
                         match lay_states::lay_only(&*program_mut, &consts, &langs, checked_bodies, ground, layouts, ci, &coro_roots, alloc)? {
@@ -3027,10 +3037,12 @@ fn build_from<P: FrontEnd>(
         // built into its state BEFORE this build (run/lay_states.rs): the build never meets a
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
-        if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none() {
+        if from_coroutine.is_none() {
+            let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none();
+            let extra_args = (instance.args != owner_args).then_some(instance.args);
             let roots = {
                 let adts = FrontAdts(&*program_mut, i, &consts, &langs, &checked_bodies);
-                match lay_states::roots_of_instance(&*program_mut, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
+                match lay_states::roots_of_instance(&*program_mut, &checked_bodies, &adts, i, &args, extra_args, include_body, &mut ground, alloc) {
                     Ok(roots) => roots,
                     Err(e) => step_refused!(e),
                 }
@@ -3148,6 +3160,7 @@ fn build_from<P: FrontEnd>(
                 | BuildError::NoStatic { item: adt, .. }
                 | BuildError::NoConstValue { item: adt, .. }
                 | BuildError::NoPatConstValue { item: adt, .. }
+                | BuildError::MissingRecord { item: adt }
                     if let Some(why) = program.left_out(adt) =>
                 {
                     return RunError::LeftOut { function: name(), item: adt, path: program.item_named(adt), why: Box::from(why) };
@@ -3292,10 +3305,6 @@ fn build_from<P: FrontEnd>(
                             }
                             continue;
                         }
-                        Some(Err(crate::clone_shim::NoteError::Resolve(blaze_typeck::ResolveError::Missing(_)))) if may_ask => {
-                            ask_again = true;
-                            break;
-                        }
                         Some(Err(e)) => {
                             let refusal = match e {
                                 crate::clone_shim::NoteError::Resolve(error) => {
@@ -3304,6 +3313,10 @@ fn build_from<P: FrontEnd>(
                                 }
                                 crate::clone_shim::NoteError::Build(error) => RunError::Build { function: name(), error, range: None },
                             };
+                            if may_ask && asks_again(&refusal) {
+                                ask_again = true;
+                                break;
+                            }
                             match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                                 Some(slot) => {
                                     via.push(Via::Slot);
@@ -3753,4 +3766,278 @@ fn static_fn_slots(image: &StaticImage<Global>, keys: &[Option<InstanceKey>], st
         out.insert(at, (key, slot));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod missing_record_retry_tests {
+    use core::cell::RefCell;
+
+    use super::*;
+    use crate::seam::{CheckedBodies, FnFacts, FrontEnd, LangRefusal};
+    use blaze_build::layout::{Missing, ReprAttrs, ValidRange};
+    use blaze_typeck::{Adt, ExprId, FnSig, ItemKey, LangItem, List, PTy, PTys, PatId, PortableTys, ResolveError};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AskedKind {
+        Repr,
+        ValidRange,
+        Discriminant,
+    }
+
+    struct LazyMissingFront<'a> {
+        inner: Front<'a>,
+        prechecked: Option<CheckedBodies>,
+        withhold_repr: bool,
+        withhold_valid_range: bool,
+        withhold_discriminant: bool,
+        can_fill: bool,
+        left_out_why: Option<&'static str>,
+        asked: RefCell<blaze_own::AVec<'static, (AskedKind, ItemKey)>>,
+        filled: blaze_own::AVec<'static, (AskedKind, ItemKey)>,
+        make_asked_calls: usize,
+        alloc: Alloc<'static>,
+    }
+
+    impl<'a> LazyMissingFront<'a> {
+        fn new(inner: Front<'a>, alloc: Alloc<'static>) -> Self {
+            Self {
+                inner,
+                prechecked: None,
+                withhold_repr: false,
+                withhold_valid_range: false,
+                withhold_discriminant: false,
+                can_fill: true,
+                left_out_why: None,
+                asked: RefCell::new(blaze_own::AVec::new_in(alloc)),
+                filled: blaze_own::AVec::new_in(alloc),
+                make_asked_calls: 0,
+                alloc,
+            }
+        }
+
+        fn note_missing(&self, kind: AskedKind, item: ItemKey) -> Missing {
+            let mut asked = self.asked.borrow_mut();
+            if asked.scan_for(&(kind, item)).is_none() {
+                asked.push((kind, item));
+            }
+            Missing { item }
+        }
+    }
+
+    impl FrontEnd for LazyMissingFront<'_> {
+        fn fn_count(&self) -> usize { self.inner.fn_count() }
+        fn function(&self, i: usize) -> FnFacts<'_> { self.inner.function(i) }
+        fn entry(&self) -> Option<usize> { self.inner.entry() }
+        fn types(&self) -> PTys<'_> { self.inner.types() }
+        fn body_types(&self, i: usize) -> PTys<'_> { self.inner.body_types(i) }
+        fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError> {
+            self.inner.resolve(i, item, args, ground)
+        }
+        fn holds(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
+            self.inner.holds(i, trait_, ty, ground)
+        }
+        fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
+            self.inner.adt_drop_impl(i, drop_trait, adt, alloc)
+        }
+        fn make_asked(&mut self, _i: usize) -> Result<bool, RunError> {
+            self.make_asked_calls += 1;
+            let pending = core::mem::replace(self.asked.get_mut(), blaze_own::AVec::new_in(self.alloc));
+            if !self.can_fill || pending.is_empty() {
+                return Ok(false);
+            }
+            let mut added = false;
+            for entry in pending.iter().copied() {
+                if self.filled.scan_for(&entry).is_none() {
+                    self.filled.push(entry);
+                    added = true;
+                }
+            }
+            Ok(added)
+        }
+        fn sig(&self, i: usize) -> FnSig<'_> { self.inner.sig(i) }
+        fn fn_index(&self, key: ItemKey) -> Option<usize> { self.inner.fn_index(key) }
+        fn check_all(&mut self) -> Result<CheckedBodies, RunError> { self.inner.check_all() }
+        fn body_reads(&self, i: usize, checked: &Checked<'static>) -> Option<crate::front2::body_reads::ReadsDigest> {
+            self.inner.body_reads(i, checked)
+        }
+        fn check_one(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
+            if self.prechecked.is_none() {
+                self.prechecked = Some(self.inner.check_all()?);
+            }
+            let Some(i) = self.inner.fn_index(key) else {
+                return Ok(None);
+            };
+            let done = self.prechecked.as_mut().and_then(|v| v.get_mut(i)).and_then(Option::take);
+            Ok(done.map(|c| (i, c)))
+        }
+        fn evaluates_at_args(&self) -> bool { self.prechecked.is_some() }
+        fn fn_lang(&self, l: FnLang) -> Option<ItemKey> { self.inner.fn_lang(l) }
+        fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)> { self.inner.drop_trait() }
+        fn lang_item(&self, item: LangItem) -> Result<Option<ItemKey>, LangRefusal> { <Front<'_> as FrontEnd>::lang_item(&self.inner, item) }
+        fn lang_trait_fn(&self, trait_: LangItem, name: &str) -> Option<ItemKey> { self.inner.lang_trait_fn(trait_, name) }
+        fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> { self.inner.object_trait(t) }
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> { self.inner.adt(key) }
+        fn item_named(&self, key: ItemKey) -> Option<crate::front2::by_origin::Shown> { self.inner.item_named(key) }
+        fn left_out(&self, _key: ItemKey) -> Option<&str> { self.left_out_why }
+        fn int_lit(&self, owner: ItemKey, e: ExprId) -> Option<u128> { self.inner.int_lit(owner, e) }
+        fn int_pat(&self, owner: ItemKey, p: PatId) -> Option<u128> { self.inner.int_pat(owner, p) }
+        fn string(&self, owner: ItemKey, e: ExprId) -> Option<&[u8]> { self.inner.string(owner, e) }
+        fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
+            if self.withhold_repr && self.filled.scan_for(&(AskedKind::Repr, key)).is_none() {
+                return Err(self.note_missing(AskedKind::Repr, key));
+            }
+            <Front<'_> as FrontEnd>::repr(&self.inner, key)
+        }
+        fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing> {
+            if self.withhold_valid_range && self.filled.scan_for(&(AskedKind::ValidRange, key)).is_none() {
+                return Err(self.note_missing(AskedKind::ValidRange, key));
+            }
+            <Front<'_> as FrontEnd>::valid_range(&self.inner, key)
+        }
+        fn intrinsic(&self, item: ItemKey) -> Option<blaze_build::Intrinsic> { self.inner.intrinsic(item) }
+        fn static_item(&self, key: ItemKey) -> Option<StaticItem> { self.inner.static_item(key) }
+        fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, Missing> {
+            if self.withhold_discriminant && self.filled.scan_for(&(AskedKind::Discriminant, adt)).is_none() {
+                return Err(self.note_missing(AskedKind::Discriminant, adt));
+            }
+            <Front<'_> as FrontEnd>::discriminant(&self.inner, adt, variant)
+        }
+        fn ctor_of(&self, key: ItemKey) -> Option<(ItemKey, u32)> { self.inner.ctor_of(key) }
+        fn code_of(&self, i: usize) -> ContentId { self.inner.code_of(i) }
+    }
+
+    const SAMPLE: &str = "
+        struct Wrap(u8);
+        enum Tag { A, B }
+        fn main() {
+            let w = Wrap(1);
+            let t = Tag::B;
+            let _ = match t {
+                Tag::A => w.0,
+                Tag::B => 2u8,
+            };
+        }
+    ";
+
+    const SAMPLE_FILES: [SourceFile<'static>; 1] = [SourceFile { path: "main.rs", text: SAMPLE }];
+
+    fn sample_front(alloc: Alloc<'static>) -> Front<'static> {
+        let mut blaze = BlazeAttrs::default();
+        Front::new(&SAMPLE_FILES, "main.rs", &mut blaze, alloc).expect("sample program lowers")
+    }
+
+    #[test]
+    fn build_with_retries_missing_discriminant_repr_and_valid_range() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut lazy = LazyMissingFront::new(sample_front(alloc), alloc);
+        lazy.withhold_repr = true;
+        lazy.withhold_valid_range = true;
+        lazy.withhold_discriminant = true;
+
+        build_with(&mut lazy, OverflowChecks::Off, alloc).expect("build_with retries MissingRecord/NoAdt and succeeds");
+        assert!(lazy.make_asked_calls >= 3, "expected retries for repr, valid_range, and discriminant, got {}", lazy.make_asked_calls);
+        assert!(lazy.filled.iter().any(|(k, _)| *k == AskedKind::Repr));
+        assert!(lazy.filled.iter().any(|(k, _)| *k == AskedKind::ValidRange));
+        assert!(lazy.filled.iter().any(|(k, _)| *k == AskedKind::Discriminant));
+    }
+
+    #[test]
+    fn build_with_stops_cleanly_when_missing_discriminant_cannot_be_filled() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut lazy = LazyMissingFront::new(sample_front(alloc), alloc);
+        lazy.withhold_discriminant = true;
+        lazy.can_fill = false;
+
+        let err = build_with(&mut lazy, OverflowChecks::Off, alloc).err().expect("unfillable MissingRecord must fail");
+        assert_eq!(lazy.make_asked_calls, 1, "must stop after make_asked returns Ok(false) without looping");
+        assert!(
+            matches!(err, RunError::ItemRefused { error: BuildError::MissingRecord { .. }, .. }),
+            "expected ItemRefused(MissingRecord), got {err}"
+        );
+    }
+
+    #[test]
+    fn build_with_reports_left_out_for_missing_record_without_retrying() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut lazy = LazyMissingFront::new(sample_front(alloc), alloc);
+        lazy.withhold_discriminant = true;
+        lazy.left_out_why = Some("adt head refused during survey");
+
+        let err = build_with(&mut lazy, OverflowChecks::Off, alloc).err().expect("left_out ADT must report LeftOut");
+        assert_eq!(lazy.make_asked_calls, 0, "left_out ADT must not invoke make_asked");
+        assert!(
+            matches!(err, RunError::LeftOut { ref why, .. } if why.as_ref() == "adt head refused during survey"),
+            "expected LeftOut, got {err}"
+        );
+    }
+
+    #[test]
+    fn make_one_retries_missing_discriminant_repr_and_valid_range_and_stops_when_unfillable() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // Retry succeeds when make_asked fills withheld repr / valid_range / discriminant.
+        let mut lazy = LazyMissingFront::new(sample_front(alloc), alloc);
+        lazy.prechecked = Some(lazy.inner.check_all().expect("check_all"));
+        lazy.withhold_repr = true;
+        lazy.withhold_valid_range = true;
+        lazy.withhold_discriminant = true;
+        let main_i = lazy.entry().expect("main entry");
+        let main_key = lazy.function(main_i).key;
+        let mut name = blaze_own::Vec::new_in(alloc);
+        let ground = PortableTys::new_in(alloc);
+        crate::symbols::encode_instance(main_key, List::EMPTY, ground.view(), alloc, &mut name).expect("encode main");
+
+        let mut state = make_one::MakerState::new(&lazy, main_key, isa(), OverflowChecks::Off, blaze_build::UbChecks::Off, blaze_build::Panic::Abort, alloc)
+            .expect("MakerState::new");
+        let mut checks = make_one::CheckCount::default();
+        let mut entry = blaze_own::Vec::new_in(alloc);
+        make_one::make_instance(&mut lazy, &mut make_one::SecondCheck, &mut state, &mut checks, main_key, &name, &mut entry)
+            .expect("make_instance retries MissingRecord/NoAdt and succeeds");
+        assert!(lazy.make_asked_calls >= 3, "expected make_one retries for repr, valid_range, and discriminant, got {}", lazy.make_asked_calls);
+        assert!(lazy.filled.iter().any(|(k, _)| *k == AskedKind::Repr));
+        assert!(lazy.filled.iter().any(|(k, _)| *k == AskedKind::ValidRange));
+        assert!(lazy.filled.iter().any(|(k, _)| *k == AskedKind::Discriminant));
+        assert!(!entry.is_empty());
+
+        // Stops cleanly without looping when make_asked returns Ok(false).
+        let mut unfillable = LazyMissingFront::new(sample_front(alloc), alloc);
+        unfillable.prechecked = Some(unfillable.inner.check_all().expect("check_all"));
+        unfillable.withhold_discriminant = true;
+        unfillable.can_fill = false;
+        let main_i = unfillable.entry().expect("main entry");
+        let main_key = unfillable.function(main_i).key;
+        let mut name = blaze_own::Vec::new_in(alloc);
+        crate::symbols::encode_instance(main_key, List::EMPTY, ground.view(), alloc, &mut name).expect("encode main");
+        let mut state = make_one::MakerState::new(&unfillable, main_key, isa(), OverflowChecks::Off, blaze_build::UbChecks::Off, blaze_build::Panic::Abort, alloc)
+            .expect("MakerState::new");
+        let mut checks = make_one::CheckCount::default();
+        let mut entry = blaze_own::Vec::new_in(alloc);
+        let err = make_one::make_instance(&mut unfillable, &mut make_one::SecondCheck, &mut state, &mut checks, main_key, &name, &mut entry)
+            .expect_err("unfillable MissingRecord must fail cleanly");
+        assert_eq!(unfillable.make_asked_calls, 1, "must stop after make_asked returns Ok(false)");
+        assert!(
+            matches!(err, RunError::ItemRefused { error: BuildError::MissingRecord { .. }, .. }),
+            "expected ItemRefused(MissingRecord), got {err}"
+        );
+
+        // Left-out ADT short-circuits to RunError::LeftOut without calling make_asked.
+        let mut left = LazyMissingFront::new(sample_front(alloc), alloc);
+        left.prechecked = Some(left.inner.check_all().expect("check_all"));
+        left.withhold_discriminant = true;
+        left.left_out_why = Some("adt head refused");
+        let main_i = left.entry().expect("main entry");
+        let main_key = left.function(main_i).key;
+        let mut name = blaze_own::Vec::new_in(alloc);
+        crate::symbols::encode_instance(main_key, List::EMPTY, ground.view(), alloc, &mut name).expect("encode main");
+        let mut state = make_one::MakerState::new(&left, main_key, isa(), OverflowChecks::Off, blaze_build::UbChecks::Off, blaze_build::Panic::Abort, alloc)
+            .expect("MakerState::new");
+        let mut checks = make_one::CheckCount::default();
+        let mut entry = blaze_own::Vec::new_in(alloc);
+        let err = make_one::make_instance(&mut left, &mut make_one::SecondCheck, &mut state, &mut checks, main_key, &name, &mut entry)
+            .expect_err("left_out ADT must report LeftOut");
+        assert_eq!(left.make_asked_calls, 0, "left_out ADT must not invoke make_asked");
+        assert!(
+            matches!(err, RunError::LeftOut { ref why, .. } if why.as_ref() == "adt head refused"),
+            "expected LeftOut, got {err}"
+        );
+    }
 }

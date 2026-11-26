@@ -733,20 +733,55 @@ pub enum GapWhy<'h> {
 }
 
 impl GapWhy<'_> {
-    /// Its text, written into `out` (a `Why` by its `Debug`, a record's as held).
+    /// Its text, written directly into `out` with zero `Global` allocation (a `Why` by its
+    /// `Debug`, a record's as held).
     fn write_into(self, out: &mut RecordBytes<'_>) {
+        struct BytesWrite<'a, 'b>(&'a mut RecordBytes<'b>);
+        impl core::fmt::Write for BytesWrite<'_, '_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.0.extend_from_slice(s.as_bytes());
+                Ok(())
+            }
+        }
         match self {
             GapWhy::Text(text) => out.extend_from_slice(text),
-            GapWhy::Made(why) => out.extend_from_slice(std::format!("{why:?}").as_bytes()),
+            GapWhy::Made(why) => {
+                let _ = core::fmt::Write::write_fmt(&mut BytesWrite(out), format_args!("{why:?}"));
+            }
         }
     }
 
-    /// Whether two say the same text.
+    /// Whether two say the same text, without allocating on `Global`.
     fn same(self, other: GapWhy<'_>) -> bool {
+        struct TextMatch<'a> {
+            rest: &'a [u8],
+            matched: bool,
+        }
+        impl core::fmt::Write for TextMatch<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                if !self.matched {
+                    return Ok(());
+                }
+                match self.rest.strip_prefix(s.as_bytes()) {
+                    Some(tail) => self.rest = tail,
+                    None => self.matched = false,
+                }
+                Ok(())
+            }
+        }
+        let matches_text = |why: &super::types::Why, text: &[u8]| -> bool {
+            let mut m = TextMatch { rest: text, matched: true };
+            let _ = core::fmt::Write::write_fmt(&mut m, format_args!("{why:?}"));
+            m.matched && m.rest.is_empty()
+        };
         match (self, other) {
             (GapWhy::Text(a), GapWhy::Text(b)) => a == b,
-            (GapWhy::Made(a), GapWhy::Made(b)) => std::format!("{a:?}") == std::format!("{b:?}"),
-            (GapWhy::Made(why), GapWhy::Text(text)) | (GapWhy::Text(text), GapWhy::Made(why)) => std::format!("{why:?}").as_bytes() == text,
+            (GapWhy::Made(a), GapWhy::Made(b)) => blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+                let mut buf = blaze_own::String::new_in(frame);
+                let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{a:?}"));
+                matches_text(b, buf.as_bytes())
+            }),
+            (GapWhy::Made(why), GapWhy::Text(text)) | (GapWhy::Text(text), GapWhy::Made(why)) => matches_text(why, text),
         }
     }
 }
@@ -990,6 +1025,9 @@ enum Parts {
 enum Text {
     Kept,
     Zeroed,
+    /// In-process store-to-store transfer: preserves `text_prefix` mode and length without
+    /// hashing fn text with BLAKE3 (never persisted).
+    InProcess,
 }
 
 /// A prefix ends immediately before the brace recorded by the parser. Checking the brace
@@ -1151,6 +1189,31 @@ pub fn encode_with_digests_into<'b>(
     Ok((meaning, regions))
 }
 
+/// Fast in-process head transfer encoding: writes a complete `BZHD` record into `out` reusing
+/// `scratch` with `Text::InProcess` and zero BLAKE3 digest computations (`TEXT_DOMAIN`,
+/// `REGIONS_DOMAIN`, `DIGEST_DOMAIN`). Never persisted to CAS; paired with
+/// [`decode_with_origins_boxed_inline_verified`] in the same process over the same `NamesSource`.
+pub(crate) fn encode_in_process_into<'b>(
+    head: HeadRef<'_, '_>,
+    tys: PTys<'_>,
+    origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, HeadRecordError>,
+    scratch: &mut EncodeScratch<'b>,
+    out: &mut RecordBytes<'_>,
+) -> Result<(), HeadRecordError> {
+    let meta = encode_into_scratch(head, tys, Text::InProcess, Parts::WithRegions, origin, scratch)?;
+    let [m0, m1, m2, m3] = MAGIC;
+    let [v0, v1, v2, v3] = VERSION.to_le_bytes();
+    let header_end = [m0, m1, m2, m3, v0, v1, v2, v3, meta.kind];
+    let count_le = meta.count.to_le_bytes();
+    out.clear();
+    out.reserve(header_end.len() + count_le.len() + scratch.terms.len() + scratch.body.len());
+    out.extend_from_slice(&header_end);
+    out.extend_from_slice(&count_le);
+    out.extend_from_slice(&scratch.terms);
+    out.extend_from_slice(&scratch.body);
+    Ok(())
+}
+
 struct EncodedMeta {
     kind: u8,
     count: u32,
@@ -1227,6 +1290,15 @@ fn encode_into_scratch<'b>(
                     Text::Zeroed => {
                         o.byte(0);
                         o.u32(0);
+                        o.body.extend_from_slice(&[0; 32]);
+                    }
+                    Text::InProcess => {
+                        o.byte(u8::from(head.text_prefix.is_some()));
+                        let len = match head.text_prefix {
+                            Some(end) => end,
+                            None => u32::try_from(head.text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?,
+                        };
+                        o.u32(len);
                         o.body.extend_from_slice(&[0; 32]);
                     }
                 }
@@ -2508,16 +2580,103 @@ pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableT
     decode_retaining_with(bytes, text, tys, alloc, None, None)
 }
 
-fn decode_retaining_with<'n>(
+/// Stack-inline `PTy` buffer used by [`In`] so decoding typical head records (<= 64 terms,
+/// <= 16 list items) avoids both `blaze_mem::frame::task` setup and heap scratch allocations.
+enum SmallPTys<'s, const N: usize> {
+    Inline { len: usize, buf: [PTy; N] },
+    Heap(Vec<PTy, Alloc<'s>>),
+}
+
+impl<'s, const N: usize> SmallPTys<'s, N> {
+    fn new() -> Self {
+        Self::Inline { len: 0, buf: [PTy(0); N] }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    fn get(&self, at: usize) -> Option<&PTy> {
+        match self {
+            Self::Inline { len, buf } => buf.get(..*len).and_then(|s| s.get(at)),
+            Self::Heap(v) => v.get(at),
+        }
+    }
+
+    fn as_slice(&self) -> &[PTy] {
+        match self {
+            Self::Inline { len, buf } => buf.get(..*len).unwrap_or(&[]),
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Inline { len, .. } => *len = 0,
+            Self::Heap(v) => v.clear(),
+        }
+    }
+
+    fn reserve(&mut self, additional: usize, alloc: Alloc<'s>) {
+        match self {
+            Self::Inline { len, buf } => {
+                let needed = len.saturating_add(additional);
+                if needed > N {
+                    let mut v = Vec::with_capacity_in(needed, alloc);
+                    if let Some(s) = buf.get(..*len) {
+                        v.extend_from_slice(s);
+                    }
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => v.reserve(additional),
+        }
+    }
+
+    fn push(&mut self, value: PTy, alloc: Alloc<'s>) {
+        match self {
+            Self::Inline { len, buf } => {
+                if let Some(slot) = buf.get_mut(*len) {
+                    *slot = value;
+                    *len += 1;
+                    return;
+                }
+                let mut v = Vec::with_capacity_in(N.saturating_mul(2).max(8), alloc);
+                v.extend_from_slice(buf.as_slice());
+                v.push(value);
+                *self = Self::Heap(v);
+            }
+            Self::Heap(v) => v.push(value),
+        }
+    }
+}
+
+const INLINE_DECODE_TERMS: usize = 64;
+const INLINE_DECODE_SCRATCH: usize = 16;
+
+fn decode_retaining_body<'n, 's>(
     bytes: &[u8],
     text: Option<&'n str>,
     tys: &PortableTys<'_>,
     alloc: Mem,
+    scratch_alloc: Alloc<'s>,
     keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
     verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
 ) -> Result<DecodedHead<'n>, HeadRecordError> {
-    let mut r = In { bytes, at: 0, tys, locals: Vec::new_in(alloc), scratch: Vec::new_in(alloc), origins: Vec::new_in(alloc), alloc };
-    if r.take(4, "the magic")? != &MAGIC[..] {
+    let mut r = In {
+        bytes,
+        at: 0,
+        tys,
+        locals: SmallPTys::new(),
+        scratch: SmallPTys::new(),
+        origins: Vec::new_in(alloc),
+        alloc,
+        scratch_alloc,
+    };
+    if r.take(4, "the magic")? != MAGIC.as_slice() {
         return Err(E::NotThisRecord);
     }
     let found = r.u32("the version")?;
@@ -2526,11 +2685,12 @@ fn decode_retaining_with<'n>(
     }
     let kind = r.u8("the head's kind")?;
     let terms = r.count("the term table")?;
+    // Each term starts with at least a 1-byte tag, so `bytes.len()` safely bounds capacity.
+    r.locals.reserve(terms.min(bytes.len()), scratch_alloc);
     for _ in 0..terms {
         r.node()?;
     }
-    let head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
-    let mut head = head;
+    let mut head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
     // Form 22: the regions section, every column laid again over its type here, once.
     if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
         regions_fit_head((*head).as_ref(), filed.regions(), tys.view())?;
@@ -2543,19 +2703,47 @@ fn decode_retaining_with<'n>(
     Ok(DecodedHead { head, origins: r.origins })
 }
 
+fn decode_retaining_with<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
+) -> Result<DecodedHead<'n>, HeadRecordError> {
+    // Peek `terms` in the 13-byte header (`magic[4] + version[4] + kind[1] + terms[4]`) so
+    // heads with `<= INLINE_DECODE_TERMS` terms decode entirely on the stack without opening a
+    // `blaze_mem::frame::task` scratch frame.
+    let small_terms = bytes
+        .get(9..13)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(|b| usize::try_from(u32::from_le_bytes(b)).unwrap_or(usize::MAX))
+        .is_none_or(|terms| terms <= INLINE_DECODE_TERMS);
+    if small_terms {
+        decode_retaining_body(bytes, text, tys, alloc, alloc, keep_text, verify_text)
+    } else {
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, |decode_frame| {
+            let erased = blaze_own::Erased::new(decode_frame);
+            decode_retaining_body(bytes, text, tys, alloc, erased.handle(), keep_text, verify_text)
+        })
+    }
+}
+
 /// The reader: the bytes, where it is, and the record's terms as interned so far.
-struct In<'r, 't, 'a> {
+struct In<'r, 't, 'a, 's> {
     bytes: &'r [u8],
     at: usize,
     tys: &'t PortableTys<'a>,
-    /// The record's term `i` is `locals[i]` in `tys`.
-    locals: Vec<PTy, Mem>,
-    scratch: Vec<PTy, Mem>,
+    /// The record's term `i` is `locals[i]` in `tys` (stack-inline for <= 64 terms, spilling to
+    /// `scratch_alloc` for larger records).
+    locals: SmallPTys<'s, INLINE_DECODE_TERMS>,
+    scratch: SmallPTys<'s, INLINE_DECODE_SCRATCH>,
     origins: Vec<(ItemKey, OpaqueOrigin), Mem>,
     alloc: Mem,
+    scratch_alloc: Alloc<'s>,
 }
 
-impl<'r> In<'r, '_, '_> {
+impl<'r> In<'r, '_, '_, '_> {
     fn box_head<'n>(&self, head: Head<'n>) -> blaze_own::Box<Head<'n>, Mem> {
         blaze_own::Box::new_in(head, self.alloc)
     }
@@ -2602,7 +2790,7 @@ impl<'r> In<'r, '_, '_> {
         let key = self.key("a constructor's key")?;
         let adt = self.key("a constructor's ADT")?;
         let generics = self.u32("a constructor's generics")?;
-        let inputs = self.many("a constructor's inputs", |r| r.ty("a constructor's input"))?;
+        let inputs = self.own("a constructor's inputs", |r| r.ty("a constructor's input"))?;
         let output = self.ty("a constructor's output")?;
         Ok(self.box_head(Head::Ctor { key, sig: CtorSig { adt, generics, inputs, output }, regions: None }))
     }
@@ -2655,8 +2843,8 @@ impl<'r> In<'r, '_, '_> {
     fn trait_alias<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("a trait alias's key")?;
         let generics = self.u32("a trait alias's generics")?;
-        let clauses = self.many("a trait alias's clauses", |r| r.clause())?;
-        let traits = self.many("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
+        let clauses = self.own("a trait alias's clauses", |r| r.clause())?;
+        let traits = self.own("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
         Ok(self.box_head(Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits } }))
     }
 
@@ -2759,16 +2947,6 @@ impl<'r> In<'r, '_, '_> {
     fn opt<T>(&mut self, what: &'static str, one: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<Option<T>, E> {
         if self.flag(what)? { Ok(Some(one(self)?)) } else { Ok(None) }
     }
-    /// `n` entries into a list of the head types' own kind (their allocator is theirs).
-    fn many<T, C: Default + Extend<T>>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<C, E> {
-        let n = self.count(what)?;
-        let mut c = C::default();
-        for _ in 0..n {
-            let v = one(self)?;
-            c.extend(core::iter::once(v));
-        }
-        Ok(c)
-    }
     /// `n` entries into a list in the reader's allocator.
     fn own<T>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<Vec<T, Mem>, E> {
         let n = self.count(what)?;
@@ -2791,18 +2969,18 @@ impl<'r> In<'r, '_, '_> {
         self.scratch.clear();
         for _ in 0..n {
             let t = self.ty(what)?;
-            self.scratch.push(t);
+            self.scratch.push(t, self.scratch_alloc);
         }
         Ok(())
     }
     /// A list, interned into the table.
     fn list(&mut self, what: &'static str) -> Result<List, E> {
         self.tys_into_scratch(what)?;
-        self.tys.intern_list_shared(&self.scratch).map_err(E::Table)
+        self.tys.intern_list_shared(self.scratch.as_slice()).map_err(E::Table)
     }
     fn intern(&mut self, n: PNode) -> Result<(), E> {
         let t = self.tys.intern_shared(n).map_err(E::Table)?;
-        self.locals.push(t);
+        self.locals.push(t, self.scratch_alloc);
         Ok(())
     }
 
@@ -2826,8 +3004,8 @@ impl<'r> In<'r, '_, '_> {
     fn node_dynamic(&mut self) -> Result<(), E> {
         // Through the table's own constructor, which keeps the one canonical form.
         self.tys_into_scratch("a trait object's predicates")?;
-        let t = self.tys.dynamic_shared(&self.scratch).map_err(E::Table)?;
-        self.locals.push(t);
+        let t = self.tys.dynamic_shared(self.scratch.as_slice()).map_err(E::Table)?;
+        self.locals.push(t, self.scratch_alloc);
         Ok(())
     }
 
@@ -2946,7 +3124,7 @@ impl<'r> In<'r, '_, '_> {
             T_RECORD => {
                 let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
                 let n = self.u32("a record's field name count")?;
-                let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0), self.tys.alloc());
+                let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0).min(self.bytes.len()), self.scratch_alloc);
                 for _ in 0..n {
                     names.push(self.name("a record's field name")?);
                 }
@@ -2960,11 +3138,11 @@ impl<'r> In<'r, '_, '_> {
         })
     }
 
-    fn named_tys<C: Default + Extend<(Name, PTy)>>(&mut self, what: &'static str) -> Result<C, E> {
-        self.many(what, |r| Ok((r.name(what)?, r.ty(what)?)))
+    fn named_tys_own(&mut self, what: &'static str) -> Result<Vec<(Name, PTy), Mem>, E> {
+        self.own(what, |r| Ok((r.name(what)?, r.ty(what)?)))
     }
-    fn named_keys<C: Default + Extend<(Name, ItemKey)>>(&mut self, what: &'static str) -> Result<C, E> {
-        self.many(what, |r| Ok((r.name(what)?, r.key(what)?)))
+    fn named_keys_own(&mut self, what: &'static str) -> Result<Vec<(Name, ItemKey), Mem>, E> {
+        self.own(what, |r| Ok((r.name(what)?, r.key(what)?)))
     }
     fn defaults(&mut self) -> Result<Vec<Option<PTy>, Mem>, E> {
         self.own("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))
@@ -2972,30 +3150,28 @@ impl<'r> In<'r, '_, '_> {
     fn const_params_own(&mut self) -> Result<Vec<(u32, PTy), Mem>, E> {
         self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))
     }
-    /// `Out::scope`'s fields, into the store's own lists.
-    fn scope<P, C, B>(&mut self) -> Result<(P, C, B, SelfTy), E>
-    where
-        P: Default + Extend<(Name, u32)>,
-        C: Default + Extend<(u32, PTy)>,
-        B: Default + Extend<ParamBound>,
-    {
-        let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
-        let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
-        let bounds = self.many("a fn's parameter bounds", |r| {
+    fn self_ty(&mut self) -> Result<SelfTy, E> {
+        match self.u8("a fn's `Self`")? {
+            0 => Ok(SelfTy::None),
+            1 => Ok(SelfTy::Trait(self.lib("a fn's `Self` trait")?)),
+            2 => {
+                let t = self.ty("a fn's `Self` type")?;
+                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
+                Ok(SelfTy::Ty(t, tr))
+            }
+            byte => Err(E::Byte { what: "a fn's `Self`", byte }),
+        }
+    }
+    /// `Out::scope`'s fields, into the reader's allocator (`FnHead`, `MemberFrame`).
+    fn scope_own(&mut self) -> Result<(Vec<(Name, u32), Mem>, Vec<(u32, PTy), Mem>, Vec<ParamBound, Mem>, SelfTy), E> {
+        let params = self.own("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
+        let consts = self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
+        let bounds = self.own("a fn's parameter bounds", |r| {
             let param = r.u32("a bound's parameter")?;
             let trait_ = r.lib("a bound's trait")?;
             Ok(ParamBound { param, trait_, args: r.list("a parameter bound's arguments")? })
         })?;
-        let self_ = match self.u8("a fn's `Self`")? {
-            0 => SelfTy::None,
-            1 => SelfTy::Trait(self.lib("a fn's `Self` trait")?),
-            2 => {
-                let t = self.ty("a fn's `Self` type")?;
-                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
-                SelfTy::Ty(t, tr)
-            }
-            byte => return Err(E::Byte { what: "a fn's `Self`", byte }),
-        };
+        let self_ = self.self_ty()?;
         Ok((params, consts, bounds, self_))
     }
     fn clause(&mut self) -> Result<PClause, E> {
@@ -3033,8 +3209,8 @@ impl<'r> In<'r, '_, '_> {
     /// A head's clauses, boxed where they are made ([`HeadPreds`]): what `opt` and the head's
     /// constructor move is the box.
     fn preds(&mut self) -> Result<HeadPreds, E> {
-        let clauses = self.many("where-clauses", |r| r.clause())?;
-        let conds = self.many("`where const` conditions", |r| Ok(lf::ConstIdx(r.u32("a `where const` condition")?)))?;
+        let clauses = self.own("where-clauses", |r| r.clause())?;
+        let conds = self.own("`where const` conditions", |r| Ok(lf::ConstIdx(r.u32("a `where const` condition")?)))?;
         Ok(blaze_own::Box::new_in(Preds::decoded(clauses, conds, self.alloc), self.alloc))
     }
     fn region(&mut self) -> Result<Region, E> {
@@ -3292,16 +3468,16 @@ impl<'r> In<'r, '_, '_> {
         let declared = self.u32("a fn's declared generics")?;
         let self_param = self.flag("a fn's `self` parameter")?;
         let header = header_of(self.u8("a fn's header")?)?;
-        let inputs = self.many("a fn's inputs", |r| r.ty("a fn's input"))?;
+        let inputs = self.own("a fn's inputs", |r| r.ty("a fn's input"))?;
         let output = self.ty("a fn's output")?;
         let has_body = self.flag("a fn's body flag")?;
         let c_variadic = self.flag("a fn's C-variadic flag")?;
         let byte = self.u8("a fn's qualifiers")?;
         let qualifiers = super::heads::FnQualifiers::from_byte(byte).ok_or(E::Byte { what: "a fn's qualifiers", byte })?;
-        let legacy_const_generics = self.many("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
+        let legacy_const_generics = self.own("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
         let module = self.lib("a fn's module")?;
-        let (params, consts, bounds, self_) = self.scope()?;
-        let self_assoc = self.named_tys("a fn's `Self` associated types")?;
+        let (params, consts, bounds, self_) = self.scope_own()?;
+        let self_assoc = self.named_tys_own("a fn's `Self` associated types")?;
         Ok((
             key,
             FnHead {
@@ -3361,7 +3537,7 @@ impl<'r> In<'r, '_, '_> {
         };
         let generics = self.u32("an ADT's generics")?;
         // Both lists' types are the row's (inferred from it below), never named here.
-        let variants = self.many("an ADT's variants", |r| {
+        let variants = self.own("an ADT's variants", |r| {
             let key = r.key("a variant's key")?;
             let name = r.name("a variant's name")?;
             let ctor = match r.u8("a variant's constructor kind")? {
@@ -3374,7 +3550,7 @@ impl<'r> In<'r, '_, '_> {
             let len = r.u32("a variant's field count")?;
             Ok(tc::Variant { key, name, ctor, fields: List { start, len } })
         })?;
-        let fields: std::vec::Vec<tc::Field> = self.many("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
+        let fields = self.own("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
         let repr = self.repr()?;
         let valid = blaze_build::layout::ValidRange {
             start: self.opt("an ADT's valid range start", |r| r.u128("a valid range start"))?,
@@ -3398,7 +3574,7 @@ impl<'r> In<'r, '_, '_> {
                 field_region_at.push(super::borrows::NO_ROW);
             }
         }
-        let discrs = self.many("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
+        let discrs = self.own("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
         let defaults = self.defaults()?;
         let const_params = self.const_params_own()?;
         let field_defaults = self.own("an ADT's field defaults", |r| r.opt("a field default", |r| r.key("a field default's key")))?;
@@ -3503,26 +3679,26 @@ impl<'r> In<'r, '_, '_> {
     fn trait_<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("a trait's key")?;
         let generics = self.u32("a trait's generics")?;
-        let defaults = self.many("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))?;
-        let assoc = self.many("a trait's associated types", |r| r.name("an associated type's name"))?;
-        let fns = self.named_keys("a trait's fns")?;
+        let defaults = self.own("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))?;
+        let assoc = self.own("a trait's associated types", |r| r.name("an associated type's name"))?;
+        let fns = self.named_keys_own("a trait's fns")?;
         let flags = tc::TraitFlags(self.u32("a trait's flags")?);
         let marks = self.coherence_marks()?;
         let all_self_defaults = self.flag("a trait's parameters all default to Self")?;
-        let members = self.many("a trait's member facts", |r| r.member())?;
+        let members = self.own("a trait's member facts", |r| r.member())?;
         let head = TraitHead { generics, defaults, assoc, fns, flags, members, marks, all_self_defaults };
         if head.all_self_defaults != super::heads::all_self_defaults(&head.defaults, self.tys.view()) {
             return Err(E::Shape { what: "a trait's Self-default flag disagrees with its parameter defaults" });
         }
         let extra = self.opt("a trait's members part", |r| {
-            let supertraits = r.many("a trait's supertrait clauses", |r| r.clause())?;
-            let assoc = r.many("a trait's associated type rows", |r| {
+            let supertraits = r.own("a trait's supertrait clauses", |r| r.clause())?;
+            let assoc = r.own("a trait's associated type rows", |r| {
                 let name = r.name("an associated type's name")?;
                 let item = r.key("an associated type's key")?;
                 let default = r.opt("an associated type's default", |r| r.ty("an associated type's default"))?;
                 Ok(tc::AssocTyDef { name, item, default })
             })?;
-            let consts = r.named_keys("a trait's associated constants")?;
+            let consts = r.named_keys_own("a trait's associated constants")?;
             Ok(TraitExtra { supertraits, assoc, consts })
         })?;
         let supers = self.own("a trait's supertraits", |r| Ok((r.lib("a supertrait")?, r.list("a supertrait's arguments")?)))?;
@@ -3580,39 +3756,39 @@ impl<'r> In<'r, '_, '_> {
         let trait_ = self.opt("an impl's trait", |r| r.key("an impl's trait"))?;
         let n = self.count("an impl's trait arguments")?;
         self.scratch.clear();
-        self.scratch.push(self_ty);
+        self.scratch.push(self_ty, self.scratch_alloc);
         for _ in 0..n {
             let t = self.ty("an impl's trait argument")?;
-            self.scratch.push(t);
+            self.scratch.push(t, self.scratch_alloc);
         }
         let trait_args = match trait_ {
             None if n == 0 => tc::ArgsAfterSelf::NONE,
             None => return Err(E::Shape { what: "an inherent impl with trait arguments" }),
             Some(_) => {
                 // The trait reference's whole list, `Self` first, split as the lowering does.
-                let with_self = self.tys.intern_list_shared(&self.scratch).map_err(E::Table)?;
+                let with_self = self.tys.intern_list_shared(self.scratch.as_slice()).map_err(E::Table)?;
                 tc::ArgsAfterSelf::split(self.tys.view(), with_self, self_ty)
                     .map_err(|_| E::Shape { what: "an impl's trait arguments do not follow its self type" })?
             }
         };
-        let assoc = self.named_tys("an impl's associated types")?;
-        let fns = self.named_keys("an impl's fns")?;
-        let fn_self = self.many("an impl's fn `self` flags", |r| match r.u8("an impl's fn `self` flag")? {
+        let assoc = self.named_tys_own("an impl's associated types")?;
+        let fns = self.named_keys_own("an impl's fns")?;
+        let fn_self = self.own("an impl's fn `self` flags", |r| match r.u8("an impl's fn `self` flag")? {
             0 => Ok(false),
             1 => Ok(true),
             byte => Err(E::Byte { what: "an impl's fn `self` flag", byte }),
         })?;
-        let fn_vis = self.many("an impl's fn visibilities", |r| {
+        let fn_vis = self.own("an impl's fn visibilities", |r| {
             let byte = r.u8("an impl's fn visibility")?;
             MemberVis::of_byte(byte).ok_or(E::Byte { what: "an impl's fn visibility", byte })
         })?;
-        let unstable = self.many("an impl's unstable members", |r| {
+        let unstable = self.own("an impl's unstable members", |r| {
             let name = r.name("an unstable member's name")?;
             let feature = Box::<str>::from(r.text("an unstable member's feature")?);
             let implied_by = r.opt("an unstable member's `implied_by`", |r| Ok(Box::<str>::from(r.text("an unstable member's `implied_by`")?)))?;
             Ok((name, super::heads::Unstable { feature, implied_by }))
         })?;
-        let consts = self.named_keys("an impl's constants")?;
+        let consts = self.named_keys_own("an impl's constants")?;
         let polarity = match self.u8("an impl's polarity")? {
             0 => tc::ImplPolarity::Positive,
             1 => tc::ImplPolarity::Negative,
@@ -3624,7 +3800,7 @@ impl<'r> In<'r, '_, '_> {
             let module = r.lib("a frame's module")?;
             let generics = r.u32("a frame's generics")?;
             let is_const = r.flag("a frame's const")?;
-            let (params, consts, bounds, self_) = r.scope()?;
+            let (params, consts, bounds, self_) = r.scope_own()?;
             Ok(MemberFrame { module, generics, is_const, params, consts, bounds, self_ })
         })?;
         let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity };
@@ -4626,7 +4802,9 @@ mod region_tests {
     }
 
     fn ctor(t: &Tys) -> CtorSig {
-        CtorSig { adt: S, generics: 0, inputs: std::vec![t.r], output: t.s }
+        let mut inputs = Vec::with_capacity_in(1, a());
+        inputs.push(t.r);
+        CtorSig { adt: S, generics: 0, inputs, output: t.s }
     }
 
     fn record(t: &Tys, sig: &CtorSig, regions: Option<&FiledRegions>) -> std::vec::Vec<u8> {
@@ -4776,7 +4954,9 @@ mod region_tests {
         // CONTROL: an erased edit, `fn(&u8) -> &u8` in place of `fn(&u8) -> S`, moves both.
         let io = t.tys.intern_list_shared(&[t.r, t.r]).unwrap();
         let f2 = t.tys.intern_shared(PNode::FnPtr(io, RUST)).unwrap();
-        let sig2 = CtorSig { adt: S, generics: 0, inputs: std::vec![t.r], output: t.r };
+        let mut sig2_inputs = Vec::with_capacity_in(1, a());
+        sig2_inputs.push(t.r);
+        let sig2 = CtorSig { adt: S, generics: 0, inputs: sig2_inputs, output: t.r };
         let mut r2 = HeadRegions::new_in(LifetimeParams::new_in(2, a()), a());
         r2.sig = Some(lay(&t, f2, &[RRegion::Param(0), RRegion::Param(0)]));
         let z = FiledRegions::new(r2, &Toy, t.tys.view(), a()).unwrap_or_else(|e| panic!("filed: {e}"));

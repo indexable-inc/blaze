@@ -285,6 +285,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
     let mut kept = Kept::new_in(a);
     kept.answer.serial = Gen(serial);
     let names: StdVec<u64> = rows.keys().copied().collect();
+    let mut reader_pairs = Vec::new_in(a);
     for (&i, &version) in rows.iter() {
         let me = name(Kind::ModuleScope, seed, i);
         let file = name(Kind::FileItems, seed, i % 7);
@@ -299,7 +300,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
         read_ids.dedup();
         for read in read_ids {
             reads.push((read, id(seed, version, 9)));
-            kept.answer.readers.entry(read).or_insert_with(|| blaze_own::BTreeSet::new_in(a)).insert(me);
+            reader_pairs.push((read, me));
         }
         let findings = u32::from(version % 5 == 0);
         if findings > 0 {
@@ -337,6 +338,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
         };
         kept.causes.insert(me, (Gen(serial), cause));
     }
+    kept.answer.readers = crate::engine::Readers::from_pairs(reader_pairs, a);
     kept
 }
 
@@ -590,16 +592,126 @@ fn a_flipped_or_cut_page_is_refused_by_name() {
     }
 }
 
-/// Previous persisted root layout (`BER3`) is rejected cleanly by magic (rule 26 / `layouts.txt`).
+/// Previous persisted root layout (`BER4`) is rejected cleanly by magic (rule 26 / `layouts.txt`).
 #[test]
-fn previous_root_magic_ber3_is_rejected() {
-    let mut ber3 = StdVec::from(&b"BER3"[..]);
-    ber3.extend_from_slice(&[0u8; 64]);
-    let key = content_key(&ber3);
-    let err = crate::pages::decode_root_hashed(key, &ber3, alloc())
+fn previous_root_magic_ber4_is_rejected() {
+    let mut ber4 = StdVec::from(&b"BER4"[..]);
+    ber4.extend_from_slice(&[0u8; 64]);
+    let key = content_key(&ber4);
+    let err = crate::pages::decode_root_hashed(key, &ber4, alloc())
         .err()
-        .expect("previous BER3 root magic must be rejected");
+        .expect("previous BER4 root magic must be rejected");
     assert_eq!(err, PagesError::Magic { page: crate::pages::ROOT_PAGE });
+}
+
+/// Previous persisted page layout (`BEP5`) is rejected cleanly by magic (rule 3 & rule 26 / `layouts.txt`).
+#[test]
+fn previous_page_magic_bep5_is_rejected() {
+    let mut bep5 = StdVec::from(&b"BEP5"[..]);
+    bep5.push(0); // bits
+    bep5.extend_from_slice(&0u32.to_le_bytes()); // index
+    bep5.extend_from_slice(&[0u8; 4 * 8]); // 8 zero section counts
+    bep5.extend_from_slice(&[0u8; 4]); // start[0]
+    let sealed = Sealed::hashed(content_key(&bep5), &bep5).expect("hashed");
+    assert_eq!(
+        crate::pages::VerifiedPage::open(sealed, 0, 0).err(),
+        Some(PagesError::Magic { page: 0 }),
+        "previous BEP5 page magic must be rejected by VerifiedPage::open"
+    );
+    assert_eq!(
+        crate::pages::VerifiedPage::open_whole(sealed, 0, 0).err(),
+        Some(PagesError::Magic { page: 0 }),
+        "previous BEP5 page magic must be rejected by VerifiedPage::open_whole"
+    );
+}
+
+/// `BEP6` per-page dictionary + sparse `CAUSES` shrinks a representative answer significantly
+/// while preserving exact round-trip and incremental merge determinism (Rule 25 & Rule 26).
+#[test]
+fn bep6_compact_page_density_and_sparse_causes() {
+    let kept = answer(&(0..600).map(|i| (i, i)).collect(), 11, 1);
+    let encoded = crate::pages::encode(&kept, None, alloc());
+    let task_puts = encoded.task_puts as usize;
+    assert!(task_puts > 0);
+    for (_, bytes) in encoded.puts.iter().take(task_puts) {
+        assert!(bytes.starts_with(b"BEP6"), "page must use BEP6 magic");
+    }
+    let a = alloc();
+    let mut store: blaze_own::BTreeMap<Key, blaze_own::Vec<u8, _>, _> = blaze_own::BTreeMap::new_in(a);
+    for (k, b) in encoded.puts.iter() {
+        let mut copy = blaze_own::Vec::with_capacity_in(b.len(), a);
+        copy.extend_from_slice(b);
+        store.insert(*k, copy);
+    }
+    let back = decode(encoded.root, |k| store.get(&k).map(|b| Sealed::hashed(k, b)), a).expect("decode BEP6");
+    assert_eq!(crate::pages::encode(&back, None, a).root, encoded.root);
+
+    // Realistic workspace fixture: 400 body tasks in 4 files sharing 16 common cells and `Cause::New`.
+    let mut ws = Kept::new_in(a);
+    ws.answer.serial = Gen(1);
+    let shared_cells: StdVec<(CellId, ContentId)> = (0..16u64)
+        .map(|k| (CellId { of: name(Kind::CrateScope, 7, k / 4), cell: Cell([k as u8; 16]) }, id(7, k, 1)))
+        .collect();
+    let mut ws_reader_pairs = Vec::with_capacity_in(400 * shared_cells.len(), a);
+    for i in 0..400u64 {
+        let me = name(Kind::BodyCheck, 7, i);
+        let file = name(Kind::FileItems, 7, i % 4);
+        let mut reads = Vec::with_capacity_in(shared_cells.len(), a);
+        for &(cid, dig) in shared_cells.iter() {
+            reads.push((cid, dig));
+            ws_reader_pairs.push((cid, me));
+        }
+        reads.sort_unstable_by_key(|(c, _)| *c);
+        let by_cell = crate::engine::by_cell(me, &reads, a).expect("sorted reads");
+        ws.answer.rows.insert(
+            me,
+            Row {
+                key: Key(id(7, i, 2)),
+                phase: Phase::new(Stage::Bodies, 0),
+                file,
+                source: id(7, i, 3),
+                out: id(7, i, 4),
+                serial: Gen(1),
+                defines: Vec::new_in(a),
+                reads,
+                by_cell,
+                findings: 0,
+                inline: false,
+                failed: false,
+            },
+        );
+        ws.causes.insert(me, (Gen(1), Cause::New));
+        ws.records.insert(me, Key(id(7, i, 5)));
+        ws.answer.by_file.entry(file).or_insert_with(|| Vec::new_in(a)).push(me);
+    }
+    ws.answer.readers = crate::engine::Readers::from_pairs(ws_reader_pairs, a);
+    for members in ws.answer.by_file.values_mut() {
+        members.sort_unstable();
+    }
+    let ws_enc = crate::pages::encode(&ws, None, a);
+    // Uncompressed BEP5 lower bound:
+    //   400 rows * (186 + 16*81 = 1482) = 592,800 B
+    // + 400 causes * 155               =  62,000 B
+    // + 400 records * 65               =  26,000 B
+    // + 400 file members * 101         =  40,400 B
+    // + 16 * 400 readers * 33          = 211,200 B
+    // Total BEP5 >= 932,400 bytes!
+    let bep5_lower_bound = 932_400u64;
+    assert!(
+        ws_enc.bytes * 3 <= bep5_lower_bound,
+        "BEP6 must achieve >= 3x compression on shared-cell/sparse-cause workload: got {} bytes vs BEP5 >= {} bytes ({:.2}x)",
+        ws_enc.bytes,
+        bep5_lower_bound,
+        bep5_lower_bound as f64 / ws_enc.bytes.max(1) as f64,
+    );
+    let mut ws_store: blaze_own::BTreeMap<Key, blaze_own::Vec<u8, _>, _> = blaze_own::BTreeMap::new_in(a);
+    for (k, b) in ws_enc.puts.iter() {
+        let mut copy = blaze_own::Vec::with_capacity_in(b.len(), a);
+        copy.extend_from_slice(b);
+        ws_store.insert(*k, copy);
+    }
+    let ws_back = decode(ws_enc.root, |k| ws_store.get(&k).map(|b| Sealed::hashed(k, b)), a).expect("decode ws BEP6");
+    assert_eq!(crate::pages::encode(&ws_back, None, a).root, ws_enc.root);
 }
 
 /// A 65,536-page (`bits = 16`) 2-level 256×256 radix answer round-trips deterministically,

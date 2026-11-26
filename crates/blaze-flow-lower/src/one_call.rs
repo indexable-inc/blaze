@@ -111,7 +111,7 @@ impl CallRule for OneRule {
     const RELATES: bool = true;
     type Grain = RegionSlots;
     fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
-        l.call_one(site, false, true)?;
+        l.call_one(site, None, false, true)?;
         l.stats.calls_by_signature += 1;
         Ok(())
     }
@@ -408,6 +408,11 @@ impl<F: Facts> Variances for FactsArity<'_, F> {
 /// two are [`NotSelected::TwoSources`], never a pick.
 struct CallSel<'s, F: Facts> {
     rows: &'s [Projected],
+    /// All selections recorded across the body (`Checked::selected`): consulted only on exact
+    /// structural `Keyed::Same` match when `rows` (the call's own expression) has no entry
+    /// (e.g. `Expr::Await`, where `blaze-typeck::rules::await_impl` selects `IntoFuture` without
+    /// duplicating its operand call's `projected` rows at the `.await` expression).
+    body_rows: &'s [Projected],
     facts: &'s F,
     /// The checked record's table: a row's arguments and impl arguments are its types, and the
     /// caller's values' types are its types too (the walk's `Cx::types`).
@@ -493,6 +498,9 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     /// needed.
     fn relates_nothing(&self, trait_: ItemKey) -> bool {
         self.facts.trait_relates_nothing(trait_)
+    }
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_auto_trait(trait_)
     }
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.facts.is_zero_slot_builtin_assoc(trait_, name)
@@ -646,8 +654,31 @@ impl<F: Facts> Selected for CallSel<'_, F> {
             exact
         } else if loose_conflict {
             return Selection::Not(NotSelected::TwoSources);
-        } else {
+        } else if loose.is_some() {
             loose
+        } else if args.count().is_some() {
+            // Fall back to exact `Keyed::Same` rows recorded elsewhere in the same body
+            // (sound by Rust trait coherence: `(trait_, erased_args)` has one unique impl).
+            let mut body_exact: Option<&Projected> = None;
+            let mut body_conflict = false;
+            for r in self.body_rows.iter().filter(answers) {
+                if matches!(r.selected, blaze_typeck::Selected::Unanswered) {
+                    continue;
+                }
+                if self.match_row(r, args) == Keyed::Same {
+                    match body_exact {
+                        None => body_exact = Some(r),
+                        Some(f) if f.selected == r.selected => {}
+                        Some(_) => body_conflict = true,
+                    }
+                }
+            }
+            if body_conflict {
+                return Selection::Not(NotSelected::TwoSources);
+            }
+            body_exact
+        } else {
+            None
         };
         let Some(r) = found else {
             // If no call row answers, check the body owner's own enclosing trait impl (and its
@@ -905,9 +936,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
     /// the call's generic arguments' and values' slots in one origin column, the selected
     /// impls), `blaze_borrow::call` run, its constraints into the same flow.
     ///
+    /// `output_override`: when `Some`, relates `site.tp` against this declared return type and
+    /// slots instead of the fn signature's own output (used by `await_call::relate_awaited` for
+    /// an `async fn`'s written output or an opaque `impl Future<Output = T>`'s `Output` term).
+    ///
     /// `closures_related`: `false` only under the census's control ([`OneRuleUntied`]): no
     /// closure-argument tie, and every body type taken to hold no type parameter.
-    fn call_one(&mut self, site: &CallSite<'_>, drop_first: bool, closures_related: bool) -> Result<(), Refusal> {
+    pub(crate) fn call_one(&mut self, site: &CallSite<'_>, output_override: Option<Typed<'_>>, drop_first: bool, closures_related: bool) -> Result<(), Refusal> {
         let e = site.e;
         let facts: &'b F = self.facts;
         let Some((item, g)) = site.callee else {
@@ -1052,10 +1087,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         }
 
         // The callee's signature and clauses, in the heads' table.
-        let (inputs, output) = match blaze_borrow::split_fn_col(&heads, item, life.regions().col, self.alloc) {
+        let (inputs, sig_output) = match blaze_borrow::split_fn_col(&heads, item, life.regions().col, self.alloc) {
             Ok(io) => io,
             Err(r) => return self.one_refuse(item, OneRuleWhy::of(r), e),
         };
+        let output = output_override.unwrap_or(sig_output);
         let views: &[ClauseView<'_>] = match regions.clauses(item) {
             Ok(v) => v,
             Err(unread) => return self.refuse(Form::RegionsUnread { item: unread.item, why: unread.why }, e),
@@ -1120,8 +1156,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             }
             let clause = Typed { ty: cv.col.ty(), col: cv.col.as_slice() };
             match heads.node(cv.col.ty()) {
-                Ok(PNode::ExTrait(..)) => clauses.push(ClauseIn::TraitOf { trait_ref: clause }),
-                Ok(PNode::ExProj { .. }) => clauses.push(ClauseIn::ProjOf { proj: clause }),
+                Ok(PNode::ExTrait(..)) => clauses.push(ClauseIn::TraitOf { trait_ref: clause, binders: cv.binders }),
+                Ok(PNode::ExProj { .. }) => clauses.push(ClauseIn::ProjOf { proj: clause, binders: cv.binders }),
                 Ok(_) => {}
                 Err(u) => return self.one_refuse(item, OneRuleWhy::counted(u, CountAt::HeadClause), e),
             }
@@ -1156,7 +1192,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             Ok(b) => b,
             Err(unread) => return self.refuse(Form::RegionsUnread { item: unread.item, why: unread.why }, e),
         };
-        let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
+        let sel = CallSel { rows: self.ck.call_selections(e), body_rows: &self.ck.selected, facts, tys: self.tys };
         let res = {
             let who = CallOwner {
                 item: owner,
@@ -1293,7 +1329,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             self.param_origin(p);
         }
         let Ok(bounds) = regions.clauses(owner) else { return Ok(false) };
-        let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
+        let sel = CallSel { rows: self.ck.call_selections(e), body_rows: &self.ck.selected, facts, tys: self.tys };
         let output = match out_match {
             Some((ty, col)) => Typed { ty, col },
             // When the callable has no `Output = ..` clause (so returns `()`, 0 slots), pass
@@ -1765,7 +1801,7 @@ mod keyed {
     }
 
     fn ask(r: &Rows, args: &dyn AskArgs) -> Selection<'static> {
-        let sel = CallSel { rows: &r.rows, facts: &World, tys: r.fx.t.view() };
+        let sel = CallSel { rows: &r.rows, body_rows: &[], facts: &World, tys: r.fx.t.view() };
         match sel.select_keyed(Ask { trait_: r.trait_, name: None, written: r.u8_ }, args) {
             Selection::Not(why) => Selection::Not(why),
             Selection::Impl { .. } => panic!("no row here selects an impl"),

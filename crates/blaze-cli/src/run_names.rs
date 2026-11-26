@@ -286,6 +286,163 @@ pub(crate) fn names_records_envs<'n>(
 /// The record's first 16 bytes.
 pub(crate) const MAGIC: [u8; 16] = *b"blaze run names1";
 
+/// Magic bytes of the CAS-persisted per-unit-graph `TestsRecord` delta cache (`BZTI`):
+/// stores 16-byte-aligned raw `TestsRecord` slices keyed by `(scope_at, crate_key)` so
+/// unchanged suites on an incremental `blaze test` reuse their test inventories in 1 small
+/// CAS read instead of opening every suite's full `CrateScope` record.
+pub(crate) const TEST_INVENTORY_MAGIC: [u8; 4] = *b"BZTI";
+
+/// Version of [`TEST_INVENTORY_MAGIC`].
+pub(crate) const TEST_INVENTORY_VERSION: u32 = 1;
+
+const TEST_INVENTORY_ALIGN: usize = 16;
+const TEST_INVENTORY_HEADER: usize = 16;
+const TEST_INVENTORY_ENTRY: usize = 80;
+
+/// Zero-copy reader over a 16-byte-aligned `BZTI` delta cache buffer.
+pub(crate) struct TestsDeltaCache<'b> {
+    bytes: &'b [u8],
+    count: usize,
+}
+
+impl<'b> TestsDeltaCache<'b> {
+    /// Validates `bytes` as a 16-byte-aligned `BZTI` record (magic, version, directory bounds,
+    /// strict `(scope_at, crate_key)` ordering, and 16-byte-aligned entry slices). Returns `None`
+    /// on any mismatch so callers cleanly rebuild from `CrateScope` records.
+    pub(crate) fn open(bytes: &'b [u8]) -> Option<Self> {
+        if !bytes.as_ptr().addr().is_multiple_of(TEST_INVENTORY_ALIGN) {
+            return None;
+        }
+        if bytes.len() < TEST_INVENTORY_HEADER {
+            return None;
+        }
+        if bytes.get(0..4) != Some(TEST_INVENTORY_MAGIC.as_slice()) {
+            return None;
+        }
+        let version = u32::from_le_bytes(<[u8; 4]>::try_from(bytes.get(4..8)?).ok()?);
+        if version != TEST_INVENTORY_VERSION {
+            return None;
+        }
+        let count = usize::try_from(u32::from_le_bytes(<[u8; 4]>::try_from(bytes.get(8..12)?).ok()?)).ok()?;
+        let reserved = u32::from_le_bytes(<[u8; 4]>::try_from(bytes.get(12..16)?).ok()?);
+        if reserved != 0 || count > MOST_ROWS {
+            return None;
+        }
+        let dir_end = count.checked_mul(TEST_INVENTORY_ENTRY)?.checked_add(TEST_INVENTORY_HEADER)?;
+        if dir_end > bytes.len() {
+            return None;
+        }
+        let mut prev_key: Option<([u8; 32], [u8; 32])> = None;
+        for i in 0..count {
+            let base = TEST_INVENTORY_HEADER + i * TEST_INVENTORY_ENTRY;
+            let scope_at = <[u8; 32]>::try_from(bytes.get(base..base + 32)?).ok()?;
+            let crate_key = <[u8; 32]>::try_from(bytes.get(base + 32..base + 64)?).ok()?;
+            let offset = usize::try_from(u32::from_le_bytes(<[u8; 4]>::try_from(bytes.get(base + 64..base + 68)?).ok()?)).ok()?;
+            let len = usize::try_from(u32::from_le_bytes(<[u8; 4]>::try_from(bytes.get(base + 68..base + 72)?).ok()?)).ok()?;
+            if bytes.get(base + 72..base + 80) != Some([0u8; 8].as_slice()) {
+                return None;
+            }
+            if prev_key.is_some_and(|prev| prev >= (scope_at, crate_key)) {
+                return None;
+            }
+            prev_key = Some((scope_at, crate_key));
+            if offset < dir_end || !offset.is_multiple_of(TEST_INVENTORY_ALIGN) {
+                return None;
+            }
+            if offset.checked_add(len)? > bytes.len() {
+                return None;
+            }
+        }
+        Some(Self { bytes, count })
+    }
+
+    fn entry_keys(&self, i: usize) -> Option<([u8; 32], [u8; 32])> {
+        let base = TEST_INVENTORY_HEADER + i * TEST_INVENTORY_ENTRY;
+        let scope_at = <[u8; 32]>::try_from(self.bytes.get(base..base + 32)?).ok()?;
+        let crate_key = <[u8; 32]>::try_from(self.bytes.get(base + 32..base + 64)?).ok()?;
+        Some((scope_at, crate_key))
+    }
+
+    fn entry_slice(&self, i: usize) -> Option<&'b [u8]> {
+        let base = TEST_INVENTORY_HEADER + i * TEST_INVENTORY_ENTRY;
+        let offset = usize::try_from(u32::from_le_bytes(<[u8; 4]>::try_from(self.bytes.get(base + 64..base + 68)?).ok()?)).ok()?;
+        let len = usize::try_from(u32::from_le_bytes(<[u8; 4]>::try_from(self.bytes.get(base + 68..base + 72)?).ok()?)).ok()?;
+        self.bytes.get(offset..offset.checked_add(len)?)
+    }
+
+    /// Looks up the 16-byte-aligned raw `TestsRecord` slice for `(scope_at, crate_key)` in O(log N).
+    pub(crate) fn get(&self, scope_at: Key, crate_key: blaze_id::CrateItemKey) -> Option<&'b [u8]> {
+        let target = (scope_at.0.0, crate_key.0.0);
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let key = self.entry_keys(mid)?;
+            match key.cmp(&target) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return self.entry_slice(mid),
+            }
+        }
+        None
+    }
+
+    /// Iterates `(scope_at, crate_key, raw_tests_record)` in sorted order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Key, blaze_id::CrateItemKey, &'b [u8])> + '_ {
+        (0..self.count).filter_map(|i| {
+            let (scope_at, crate_key) = self.entry_keys(i)?;
+            let slice = self.entry_slice(i)?;
+            Some((Key(ContentId(scope_at)), blaze_id::CrateItemKey(ContentId(crate_key)), slice))
+        })
+    }
+
+    /// Deterministically encodes `(scope_at, crate_key, tests_bytes)` entries into a `BZTI` record
+    /// with every payload slice padded to a 16-byte boundary (rule 25).
+    pub(crate) fn encode<'a>(
+        entries: &[(Key, blaze_id::CrateItemKey, &[u8])],
+        alloc: Alloc<'a>,
+    ) -> Option<AVec<'a, u8>> {
+        let mut sorted: AVec<'a, (Key, blaze_id::CrateItemKey, &[u8])> = AVec::with_capacity_in(entries.len(), alloc);
+        sorted.extend_from_slice(entries);
+        sorted.sort_unstable_by(|a, b| (a.0.0.0, a.1.0.0).cmp(&(b.0.0.0, b.1.0.0)));
+        sorted.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        let count_u32 = u32::try_from(sorted.len()).ok()?;
+        let dir_end = TEST_INVENTORY_HEADER.checked_add(sorted.len().checked_mul(TEST_INVENTORY_ENTRY)?)?;
+        let mut total = dir_end;
+        for &(_, _, slice) in sorted.iter() {
+            let padded = slice.len().checked_add(TEST_INVENTORY_ALIGN - 1)? & !(TEST_INVENTORY_ALIGN - 1);
+            total = total.checked_add(padded)?;
+        }
+        let mut out: AVec<'a, u8> = AVec::with_capacity_in(total, alloc);
+        out.extend_from_slice(&TEST_INVENTORY_MAGIC);
+        out.extend_from_slice(&TEST_INVENTORY_VERSION.to_le_bytes());
+        out.extend_from_slice(&count_u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut offset = dir_end;
+        for &(scope_at, crate_key, slice) in sorted.iter() {
+            let off_u32 = u32::try_from(offset).ok()?;
+            let len_u32 = u32::try_from(slice.len()).ok()?;
+            out.extend_from_slice(&scope_at.0.0);
+            out.extend_from_slice(&crate_key.0.0);
+            out.extend_from_slice(&off_u32.to_le_bytes());
+            out.extend_from_slice(&len_u32.to_le_bytes());
+            out.extend_from_slice(&[0u8; 8]);
+            let padded = slice.len().checked_add(TEST_INVENTORY_ALIGN - 1)? & !(TEST_INVENTORY_ALIGN - 1);
+            offset = offset.checked_add(padded)?;
+        }
+        for &(_, _, slice) in sorted.iter() {
+            out.extend_from_slice(slice);
+            let rem = slice.len() % TEST_INVENTORY_ALIGN;
+            if rem != 0 {
+                let pad = TEST_INVENTORY_ALIGN - rem;
+                const ZERO_PAD: [u8; 16] = [0u8; 16];
+                out.extend_from_slice(ZERO_PAD.get(..pad)?);
+            }
+        }
+        Some(out)
+    }
+}
+
 /// The head: the magic, the `UnitGraph` row, the count.
 const HEAD: usize = 16 + 32 + 32 + 4;
 
@@ -603,6 +760,9 @@ pub(crate) struct TestUnit<'m> {
     /// Its edition, as its items record says (front_load.rs `CrateRecords::edition`): what its
     /// code is built for (run_parent.rs `builder_for`).
     pub(crate) edition: blaze_surface::Edition,
+    /// Whether Cargo/Blaze exposes `CARGO_BIN_EXE_<name>` to this unit (integration tests and
+    /// benchmarks only; `blaze_scope::crate_env::env_of`).
+    pub(crate) expose_bins: bool,
 }
 
 /// A harness supplies one row per marked function. A custom harness supplies its own main
@@ -633,8 +793,20 @@ impl<'m> TestRows<'m> {
     }
 }
 
+/// A workspace binary target (`[[bin]]`) belonging to a selected package, served via a
+/// `CARGO_BIN_EXE_<bin_name>` launcher stub when any selected test suite exposes it (`test.md` piece 17).
+#[derive(Clone, Copy)]
+pub(crate) struct BinUnit<'m> {
+    pub(crate) at: usize,
+    pub(crate) key: blaze_id::CrateItemKey,
+    pub(crate) package: &'m str,
+    pub(crate) bin_name: &'m str,
+    pub(crate) edition: blaze_surface::Edition,
+}
+
 pub(crate) struct TestInventory<'m> {
     pub(crate) suites: AVec<'static, (Found<'m>, TestUnit<'m>)>,
+    pub(crate) bins: AVec<'static, (Found<'m>, BinUnit<'m>)>,
     walked: Option<CrateList<'static>>,
 }
 
@@ -677,16 +849,210 @@ fn unit_map<'f, 'm>(
     Ok(frame.alloc_slice_copy(&made))
 }
 
+/// Structural identity of a target-side workspace-member crate row shared between `UnitGraph`'s
+/// `Unit` and `CrateList`'s row encoding (`blaze-world/src/list.rs`). When a target unit and a
+/// target-side member crate row match uniquely on this signature, [`program_row`] and [`tests_of`]
+/// resolve the row directly in O(units + crates) with zero `unit_map` store reads and zero
+/// `names_world` / `units::lay` filesystem walks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MemberUnitSig<'a> {
+    pub(crate) package: &'a str,
+    pub(crate) version: &'a str,
+    pub(crate) crate_name: &'a str,
+    pub(crate) root: &'a str,
+    pub(crate) test: bool,
+    pub(crate) bin: Option<&'a str>,
+    pub(crate) test_or_bench: bool,
+    pub(crate) proc_macro: bool,
+    pub(crate) build_script: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberRowSlot {
+    One(usize),
+    Ambiguous,
+}
+
+/// Direct O(units + crates) bijection between target-side workspace-member units and `CrateList`
+/// rows. Any unit or crate-list row that is not uniquely identified returns `None` from
+/// [`MemberUnitIndex::resolve`], falling back cleanly to [`unit_map`].
+pub(crate) struct MemberUnitIndex<'k, 'a> {
+    unit_counts: blaze_hash::Map<MemberUnitSig<'k>, u32, blaze_hash::FixedState, Alloc<'a>>,
+    by_sig: blaze_hash::Map<MemberUnitSig<'k>, MemberRowSlot, blaze_hash::FixedState, Alloc<'a>>,
+}
+
+pub(crate) fn unit_member_sig<'a>(unit: &'a blaze_unit_graph::Unit<'_>) -> Option<MemberUnitSig<'a>> {
+    if unit.for_host || matches!(unit.kind, blaze_unit_graph::UnitKind::BuildScript) {
+        return None;
+    }
+    Some(MemberUnitSig {
+        package: unit.name.as_str(),
+        version: unit.version.as_str(),
+        crate_name: unit.crate_name.as_str(),
+        root: unit.root.as_str(),
+        test: unit.cfg.iter().any(|c| c.name == "test" && c.value.is_none()),
+        bin: match &unit.kind {
+            blaze_unit_graph::UnitKind::Bin(name) => Some(name.as_str()),
+            _ => None,
+        },
+        test_or_bench: matches!(
+            unit.kind,
+            blaze_unit_graph::UnitKind::IntegrationTest(_) | blaze_unit_graph::UnitKind::Bench(_)
+        ),
+        proc_macro: matches!(unit.kind, blaze_unit_graph::UnitKind::ProcMacro),
+        build_script: unit.build_script.is_some(),
+    })
+}
+
+pub(crate) fn scanned_unit_member_sig<'a>(unit: &blaze_unit_graph::record::ScannedUnit<'a>) -> Option<MemberUnitSig<'a>> {
+    use blaze_unit_graph::record::ScannedKind;
+    if unit.for_host || matches!(unit.kind, ScannedKind::BuildScript) {
+        return None;
+    }
+    Some(MemberUnitSig {
+        package: unit.name,
+        version: unit.version,
+        crate_name: unit.crate_name,
+        root: unit.root,
+        test: unit.has_test_cfg,
+        bin: match unit.kind {
+            ScannedKind::Bin(name) => Some(name),
+            _ => None,
+        },
+        test_or_bench: matches!(unit.kind, ScannedKind::IntegrationTest { .. } | ScannedKind::Bench { .. }),
+        proc_macro: matches!(unit.kind, ScannedKind::ProcMacro),
+        build_script: unit.has_build_script,
+    })
+}
+
+fn list_member_sig<'a>(list: &'a CrateList<'_>, r: usize) -> Option<MemberUnitSig<'a>> {
+    if !list.member(r) || CrateGraph::toolchain(list, r) || CrateGraph::side(list, r) != blaze_world::Side::Target {
+        return None;
+    }
+    let env = list.env_facts(r);
+    let (package, version) = env.package?;
+    let root = list.root(r).strip_prefix(list.shown_from(r))?;
+    Some(MemberUnitSig {
+        package,
+        version,
+        crate_name: CrateGraph::name(list, r),
+        root,
+        test: list.test(r),
+        bin: env.bin,
+        test_or_bench: env.test_or_bench,
+        proc_macro: CrateGraph::proc_macro(list, r),
+        build_script: env.build_script,
+    })
+}
+
+impl<'k, 'a> MemberUnitIndex<'k, 'a> {
+    pub(crate) fn build(units: &'k [blaze_unit_graph::Unit<'_>], list: &'k CrateList<'_>, alloc: Alloc<'a>) -> Self {
+        let rows = (0..CrateGraph::len(list)).filter_map(|r| list_member_sig(list, r).map(|sig| (r, sig)));
+        Self::build_from_rows(units, rows, CrateGraph::len(list), alloc)
+    }
+
+    pub(crate) fn build_from_rows(
+        units: &'k [blaze_unit_graph::Unit<'_>],
+        rows: impl IntoIterator<Item = (usize, MemberUnitSig<'k>)>,
+        rows_cap: usize,
+        alloc: Alloc<'a>,
+    ) -> Self {
+        let mut unit_counts: blaze_hash::Map<MemberUnitSig<'k>, u32, blaze_hash::FixedState, Alloc<'a>> = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc,
+            capacity: Some(units.len()),
+        });
+        for unit in units {
+            if let Some(sig) = unit_member_sig(unit) {
+                match unit_counts.get_mut(&sig) {
+                    Some(count) => *count = count.saturating_add(1),
+                    None => {
+                        unit_counts.insert(sig, 1u32);
+                    }
+                }
+            }
+        }
+        let mut by_sig = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc,
+            capacity: Some(rows_cap),
+        });
+        for (r, sig) in rows {
+            match by_sig.get_mut(&sig) {
+                Some(slot) => *slot = MemberRowSlot::Ambiguous,
+                None => {
+                    by_sig.insert(sig, MemberRowSlot::One(r));
+                }
+            }
+        }
+        Self { unit_counts, by_sig }
+    }
+
+    pub(crate) fn resolve(&self, unit: &'k blaze_unit_graph::Unit<'_>) -> Option<usize> {
+        let sig = unit_member_sig(unit)?;
+        if self.unit_counts.get(&sig).copied() != Some(1) {
+            return None;
+        }
+        match self.by_sig.get(&sig).copied() {
+            Some(MemberRowSlot::One(row)) => Some(row),
+            Some(MemberRowSlot::Ambiguous) | None => None,
+        }
+    }
+
+    pub(crate) fn build_scanned(units: &[blaze_unit_graph::record::ScannedUnit<'k>], list: &'k CrateList<'_>, alloc: Alloc<'a>) -> Self {
+        let mut unit_counts: blaze_hash::Map<MemberUnitSig<'k>, u32, blaze_hash::FixedState, Alloc<'a>> = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc,
+            capacity: Some(units.len()),
+        });
+        for unit in units {
+            if let Some(sig) = scanned_unit_member_sig(unit) {
+                match unit_counts.get_mut(&sig) {
+                    Some(count) => *count = count.saturating_add(1),
+                    None => {
+                        unit_counts.insert(sig, 1u32);
+                    }
+                }
+            }
+        }
+        let rows_cap = CrateGraph::len(list);
+        let mut by_sig = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc,
+            capacity: Some(rows_cap),
+        });
+        for r in 0..rows_cap {
+            if let Some(sig) = list_member_sig(list, r) {
+                match by_sig.get_mut(&sig) {
+                    Some(slot) => *slot = MemberRowSlot::Ambiguous,
+                    None => {
+                        by_sig.insert(sig, MemberRowSlot::One(r));
+                    }
+                }
+            }
+        }
+        Self { unit_counts, by_sig }
+    }
+
+    pub(crate) fn resolve_scanned(&self, unit: &blaze_unit_graph::record::ScannedUnit<'k>) -> Option<usize> {
+        let sig = scanned_unit_member_sig(unit)?;
+        if self.unit_counts.get(&sig).copied() != Some(1) {
+            return None;
+        }
+        match self.by_sig.get(&sig).copied() {
+            Some(MemberRowSlot::One(row)) => Some(row),
+            Some(MemberRowSlot::Ambiguous) | None => None,
+        }
+    }
+}
+
 /// `run`'s program crate: the crate list's row of the unit of kind `Bin` (never `for_host`)
 /// whose crate root is `program_root` (checkout-relative: run_package.rs `Program::root`).
 ///
-/// Chosen by the UNIT's kind, through the unit map: the engine's unit graph is made with test
-/// units (engine_check.rs `checking`, `Graph::new(.., true, ..)`), so a binary's file is the
-/// root of two crates, its `Bin` unit's and its `Test { bin }` unit's. Their two rows of the
-/// crate list hold the same name, root, package, binary name and member; only their keys
-/// differ (the test unit's cfg holds `test`: blaze-world list.rs `unit_crate_key`), and the
-/// list holds no cfg, so the row alone cannot say which is the program.
-/// COST: [`unit_map`], the unit graph's decode on a map hit, O(units).
+/// Resolved directly via [`MemberUnitIndex`] (matching `list.test(r)`, `env_facts(r).bin`,
+/// package, version, crate name, and relative root) with zero `unit_map` reads or `units::lay`
+/// filesystem walks; falls back to [`unit_map`] only if a unit signature is ambiguous.
+/// COST: one unit-graph payload decode, O(units + crates).
 #[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
 pub(crate) fn program_row<'f, 'm>(
     cx: &Cx,
@@ -701,25 +1067,34 @@ pub(crate) fn program_row<'f, 'm>(
     let _cx = cx.span("run names: the program's unit");
     let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
     let list = facts.bodies.list(cx, store, &graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
-    let mapping = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
-    let decoded;
-    let units = match facts.names.as_ref().and_then(|names| names.made()) {
-        Some(made) => &made.graph().units,
-        None => {
-            let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
-            decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
-            &decoded.graph.units
-        }
-    };
-    if mapping.len() != units.len() * 4 {
-        return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
-    }
+    let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
+    let erased = blaze_own::Erased::new(frame);
+    let units = blaze_unit_graph::record::scan_units(bytes.unit_graph(graph.name).map_err(stored)?.graph, erased.handle()).map_err(RunNamesError::TestGraph)?;
+    let direct = MemberUnitIndex::build_scanned(&units, &list, erased.handle());
+    let mut mapping: Option<&'f [u8]> = None;
     let mut owner: Option<usize> = None;
-    for (index, unit) in units.iter().enumerate() {
-        if unit.for_host || !matches!(unit.kind, blaze_unit_graph::UnitKind::Bin(_)) {
+    for unit in units.iter() {
+        let index = unit.index;
+        if unit.for_host || !matches!(unit.kind, blaze_unit_graph::record::ScannedKind::Bin(_)) {
             continue;
         }
-        let at = u32_at(mapping, index * 4) as usize;
+        let at = match direct.resolve_scanned(unit) {
+            Some(at) => at,
+            None => {
+                let map_bytes = match mapping {
+                    Some(map_bytes) => map_bytes,
+                    None => {
+                        let map_bytes = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
+                        if map_bytes.len() != units.len() * 4 {
+                            return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+                        }
+                        mapping = Some(map_bytes);
+                        map_bytes
+                    }
+                };
+                usize::try_from(u32_at(map_bytes, index * 4)).unwrap_or(usize::MAX)
+            }
+        };
         // `u32::MAX`: a unit that is no crate of the list.
         if at >= CrateGraph::len(&list) || !list.member(at) || list.root(at).strip_prefix("/0/") != Some(program_root) {
             continue;
@@ -755,24 +1130,21 @@ fn test_map(
     Ok(bytes)
 }
 
-/// Cargo's runnable targets. The graph includes extra targets compiled only to check them,
-/// including examples and benches by default. A required feature has to be enabled on the unit.
-fn test_target<'a>(unit: &'a blaze_unit_graph::Unit<'_>) -> Option<(&'static str, &'a str, bool)> {
-    use blaze_unit_graph::UnitKind;
-    let (kind, extra) = match &unit.kind {
-        UnitKind::Test { bin: None } => {
-            // `package/lib` names its sole library. Show a distinct manifest library name too.
-            let target = if unit.crate_name == unit.name { "" } else { unit.crate_name.as_str() };
+/// Cargo's runnable targets over a zero-copy [`blaze_unit_graph::record::ScannedUnit`].
+fn scanned_test_target<'a>(unit: &blaze_unit_graph::record::ScannedUnit<'a>) -> Option<(&'static str, &'a str, bool)> {
+    use blaze_unit_graph::record::ScannedKind;
+    let (kind, name, harness, test, met) = match unit.kind {
+        ScannedKind::Test { bin: None } => {
+            let target = if unit.crate_name == unit.name { "" } else { unit.crate_name };
             return Some(("lib", target, true));
         }
-        UnitKind::Test { bin: Some(name) } => return Some(("bin", name.as_str(), true)),
-        UnitKind::IntegrationTest(extra) => ("test", extra),
-        UnitKind::Example(extra) => ("example", extra),
-        UnitKind::Bench(extra) => ("bench", extra),
+        ScannedKind::Test { bin: Some(name) } => return Some(("bin", name, true)),
+        ScannedKind::IntegrationTest { name, harness, test, required_features_met } => ("test", name, harness, test, required_features_met),
+        ScannedKind::Example { name, harness, test, required_features_met } => ("example", name, harness, test, required_features_met),
+        ScannedKind::Bench { name, harness, test, required_features_met } => ("bench", name, harness, test, required_features_met),
         _ => return None,
     };
-    (extra.test && extra.required_features.iter().all(|f| unit.features.binary_search(f).is_ok()))
-        .then_some((kind, extra.name.as_str(), extra.harness))
+    (test && met).then_some((kind, name, harness))
 }
 
 /// Find the user-written main by the same item facts as the program entry. An associated
@@ -810,8 +1182,29 @@ pub(crate) fn found_tests_answered<'s, 'f: 's, 'm: 's>(
     heap: &'static blaze_own::Heap,
     frame: &'f Frame,
 ) -> Result<TestInventory<'s>, RunNamesError> {
+    let (inventory, _) = found_tests_answered_cached(cx, root, answered, store, facts, read, selected, bin, None, heap, frame)?;
+    Ok(inventory)
+}
+
+/// [`found_tests_answered`] using an optional 16-byte-aligned `BZTI` delta cache (`prev_cache`)
+/// so unchanged harnessed suites with identical `(scope_at, crate_key)` reuse their `TestsRecord`
+/// slices with zero `CrateScope` store reads. Returns updated `BZTI` bytes when any suite missed.
+#[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
+pub(crate) fn found_tests_answered_cached<'s, 'f: 's, 'm: 's, 'c: 's>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    answered: &dyn Answered,
+    store: &mut dyn Store<'m>,
+    facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
+    read: &mut EngineRecords<'m>,
+    selected: &[&str],
+    bin: Option<&str>,
+    prev_cache: Option<&'c [u8]>,
+    heap: &'static blaze_own::Heap,
+    frame: &'f Frame,
+) -> Result<(TestInventory<'s>, Option<AVec<'static, u8>>), RunNamesError> {
     let (answer, list) = rows_of(cx, answered, store, facts, heap, frame)?;
-    tests_of(cx, root, answer, list, store, facts, read, selected, bin, heap, frame)
+    tests_of(cx, root, answer, list, store, facts, read, selected, bin, prev_cache, heap, frame)
 }
 
 /// The graph's row and each listed crate's row of `answered`, in [`Stood`]'s form (in `frame`),
@@ -855,7 +1248,7 @@ fn rows_of<'f, 'm>(
 /// The suites of `selected` over `answer`'s rows and the graph's crate list `list`; with `bin`
 /// (`--bin <name>`), only that binary target's suite (R3).
 #[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
-fn tests_of<'s, 'f: 's, 'm: 's>(
+fn tests_of<'s, 'f: 's, 'm: 's, 'c: 's>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     answer: Stood<'s>,
@@ -865,70 +1258,178 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
     read: &mut EngineRecords<'m>,
     selected: &[&str],
     bin: Option<&str>,
+    prev_cache: Option<&'c [u8]>,
     heap: &'static blaze_own::Heap,
     frame: &'f Frame,
-) -> Result<TestInventory<'s>, RunNamesError> {
+) -> Result<(TestInventory<'s>, Option<AVec<'static, u8>>), RunNamesError> {
     let graph = answer.graph;
-    let mapping = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
-    let decoded;
-    let units = match facts.names.as_ref().and_then(|names| names.made()) {
-        Some(made) => &made.graph().units,
-        None => {
-            let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
-            decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
-            &decoded.graph.units
-        }
-    };
-    if mapping.len() != units.len() * 4 {
-        return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
-    }
+    let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
+    let erased = blaze_own::Erased::new(frame);
+    let units = blaze_unit_graph::record::scan_units(bytes.unit_graph(graph.name).map_err(stored)?.graph, erased.handle()).map_err(RunNamesError::TestGraph)?;
+    let direct = MemberUnitIndex::build_scanned(&units, &list, erased.handle());
+    let mut mapping: Option<&'f [u8]> = None;
     let snapshot = run_snapshot(store)?;
+    let delta = prev_cache.and_then(TestsDeltaCache::open);
+    let mut delta_entries: AVec<'_, (Key, blaze_id::CrateItemKey, &'s [u8])> = AVec::new_in(erased.handle());
+    let mut delta_dirty = false;
     let mut suites = AVec::new_in(heap.alloc());
-    for (index, unit) in units.iter().enumerate() {
-        let Some((kind, target_name, harness)) = test_target(unit) else { continue };
+    let mut bins = AVec::new_in(heap.alloc());
+    let mut bin_packages: AVec<'_, &str> = AVec::new_in(heap.alloc());
+    for unit in units.iter() {
+        let index = unit.index;
+        let Some((kind, target_name, harness)) = scanned_test_target(unit) else { continue };
         if let Some(bin) = bin && (kind != "bin" || target_name != bin) {
             continue;
         }
         // run_package::test_packages orders the selection by package name.
-        if selected.binary_search(&unit.name.as_str()).is_err() {
+        if selected.binary_search(&unit.name).is_err() {
             continue;
         }
-        let at = u32_at(mapping, index * 4) as usize;
+        let at = match direct.resolve_scanned(unit) {
+            Some(at) => at,
+            None => {
+                let map_bytes = match mapping {
+                    Some(map_bytes) => map_bytes,
+                    None => {
+                        let map_bytes = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
+                        if map_bytes.len() != units.len() * 4 {
+                            return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+                        }
+                        mapping = Some(map_bytes);
+                        map_bytes
+                    }
+                };
+                usize::try_from(u32_at(map_bytes, index * 4)).unwrap_or(usize::MAX)
+            }
+        };
         if at >= CrateGraph::len(&list) || !list.member(at) {
             return Err(RunNamesError::TestMap { unit: index, why: "the selected target has no member crate at its mapped index" });
         }
         let name = CrateGraph::name(&list, at);
         let key = list.key(at);
         let input = answer.crate_input(at, blaze_drive::key::crate_scope_name(&key)).ok_or(RunNamesError::NotAnswered { crate_name: name })?;
-        let records = read.records(cx, store, &input, key, heap.alloc()).map_err(|why| unread(name, why))?;
         let Some((package, version)) = list.env_facts(at).package else {
             return Err(RunNamesError::TestMap { unit: index, why: "the selected target's crate has no package" });
         };
-        if package != unit.name.as_str() || version != unit.version.as_str() || name != unit.crate_name.as_str() {
+        if package != unit.name || version != unit.version || name != unit.crate_name {
             return Err(RunNamesError::TestMap { unit: index, why: "the mapped crate does not belong to this unit" });
         }
-        let tests = if harness {
-            let bytes = read.tests(cx, store, &input).map_err(|why| unread(name, why))?;
-            if bytes.is_empty() {
-                return Err(RunNamesError::TestTarget { package, crate_name: name, why: "the harnessed target's scope has no tests record" });
-            }
+        // Harnessed suites first probe the `BZTI` delta cache by `(input.at, key)` (zero
+        // `CrateScope` store reads for unchanged suites); misses read ONLY the `tests` section
+        // (`1` store get per changed suite) and take their edition directly from
+        // `unit.edition.syntax`. Only harnessless targets open `records` to locate `fn main`.
+        let (tests, edition) = if harness {
+            let bytes: &'s [u8] = if let Some(cached) = delta.as_ref().and_then(|c| c.get(input.at, key)) {
+                cached
+            } else {
+                let bytes = read.tests(cx, store, &input).map_err(|why| unread(name, why))?;
+                if bytes.is_empty() {
+                    return Err(RunNamesError::TestTarget { package, crate_name: name, why: "the harnessed target's scope has no tests record" });
+                }
+                delta_dirty = true;
+                bytes
+            };
             let rows = TestsRecord::open(bytes).map_err(|why| RunNamesError::TestRecord { package, crate_name: name, why })?;
             if rows.key() != key {
                 return Err(RunNamesError::TestTarget { package, crate_name: name, why: "the tests record belongs to a different unit" });
             }
-            TestRows::Harness(rows)
+            delta_entries.push((input.at, key, bytes));
+            (TestRows::Harness(rows), crate::units::syntax_of(unit.edition.syntax))
         } else {
-            TestRows::Main(main_test(records, package, name, heap.alloc())?)
+            let records = read.records(cx, store, &input, key, heap.alloc()).map_err(|why| unread(name, why))?;
+            (TestRows::Main(main_test(records, package, name, heap.alloc())?), records.edition)
         };
         let target = if target_name.is_empty() {
             kind
         } else {
             crate::work::held_str(bstd::mem::format_in!(frame, "{kind}:{target_name}").as_str(), frame)
         };
-        suites.push((Found::Stood(answer, snapshot.clone()), TestUnit { at, key, package, target, tests, edition: records.edition }));
+        let expose_bins = matches!(
+            unit.kind,
+            blaze_unit_graph::record::ScannedKind::IntegrationTest { .. } | blaze_unit_graph::record::ScannedKind::Bench { .. }
+        );
+        if expose_bins && !bin_packages.iter().any(|&p| p == package) {
+            bin_packages.push(package);
+        }
+        suites.push((
+            Found::Stood(answer, blaze_own::Share::share(&snapshot)),
+            TestUnit { at, key, package, target, tests, edition, expose_bins },
+        ));
+    }
+    // Collect advertised workspace `[[bin]]` targets for packages with selected integration/bench
+    // suites, propagating missing or unreadable engine records rather than silently omitting them.
+    if !bin_packages.is_empty() {
+        for unit in units.iter() {
+            let index = unit.index;
+            if unit.for_host {
+                continue;
+            }
+            let blaze_unit_graph::record::ScannedKind::Bin(bin_name) = unit.kind else { continue };
+            if !bin_packages.iter().any(|&p| p == unit.name) {
+                continue;
+            }
+            let at = match direct.resolve_scanned(unit) {
+                Some(at) => at,
+                None => {
+                    let map_bytes = match mapping {
+                        Some(map_bytes) => map_bytes,
+                        None => {
+                            let map_bytes = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
+                            if map_bytes.len() != units.len() * 4 {
+                                return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+                            }
+                            mapping = Some(map_bytes);
+                            map_bytes
+                        }
+                    };
+                    usize::try_from(u32_at(map_bytes, index * 4)).unwrap_or(usize::MAX)
+                }
+            };
+            if at >= CrateGraph::len(&list) || !list.member(at) {
+                return Err(RunNamesError::TestMap { unit: index, why: "the advertised binary target has no member crate at its mapped index" });
+            }
+            let name = CrateGraph::name(&list, at);
+            let key = list.key(at);
+            let input = answer.crate_input(at, blaze_drive::key::crate_scope_name(&key)).ok_or(RunNamesError::NotAnswered { crate_name: name })?;
+            let records = read.records(cx, store, &input, key, heap.alloc()).map_err(|why| unread(name, why))?;
+            let Some((package, version)) = list.env_facts(at).package else {
+                return Err(RunNamesError::TestMap { unit: index, why: "the advertised binary target's crate has no package" });
+            };
+            if package != unit.name || version != unit.version || name != unit.crate_name {
+                return Err(RunNamesError::TestMap { unit: index, why: "the mapped binary crate does not belong to this unit" });
+            }
+            let bin_name = crate::work::held_str(bin_name, frame);
+            bins.push((
+                Found::Stood(answer, blaze_own::Share::share(&snapshot)),
+                BinUnit { at, key, package, bin_name, edition: records.edition },
+            ));
+        }
     }
     suites.sort_unstable_by(|(_, a), (_, b)| (a.package, a.target, a.key).cmp(&(b.package, b.target, b.key)));
-    Ok(TestInventory { suites, walked: Some(list) })
+    bins.sort_unstable_by(|(_, a), (_, b)| (a.package, a.bin_name, a.key).cmp(&(b.package, b.bin_name, b.key)));
+    bins.dedup_by(|(_, a), (_, b)| a.package == b.package && a.bin_name == b.bin_name);
+    let updated_cache = if delta_dirty && !delta_entries.is_empty() {
+        // Preserve untouched suites from the prior `BZTI` cache for this unit graph (e.g. when a
+        // filtered `-p <pkg>` run updates one suite) while replacing stale entries for any
+        // `crate_key` refreshed in this run.
+        if let Some(prev) = delta {
+            let mut refreshed_keys: AVec<'_, blaze_id::CrateItemKey> = AVec::with_capacity_in(delta_entries.len(), erased.handle());
+            for &(_, ck, _) in delta_entries.iter() {
+                refreshed_keys.push(ck);
+            }
+            refreshed_keys.sort_unstable();
+            refreshed_keys.dedup();
+            for (scope_at, ck, raw) in prev.iter() {
+                if refreshed_keys.binary_search(&ck).is_err() {
+                    delta_entries.push((scope_at, ck, raw));
+                }
+            }
+        }
+        TestsDeltaCache::encode(delta_entries.as_slice(), heap.alloc())
+    } else {
+        None
+    };
+    Ok((TestInventory { suites, bins, walked: Some(list) }, updated_cache))
 }
 
 /// The program's crates from `answered`: the crate list of its `UnitGraph` row (read once a
@@ -976,7 +1477,7 @@ pub(crate) fn program_of<'m>(
     }
     scripts.sort_unstable_by_key(|(at, _)| *at);
     let mut lang: AVec<'static, usize> = AVec::new_in(heap.alloc());
-    lang.extend(scope.lang_places());
+    crate::front_load::lang_places_of(&scope, &list, &mut lang);
     Ok(Program { graph, list, crates, scripts, lang, owner })
 }
 
@@ -1060,6 +1561,31 @@ pub(crate) fn names_of<'n, 'm: 'n>(
     names_in(cx, root, crates, procs, seen, frame)
 }
 
+/// [`names_of`], opening every dependency crate past the owner on demand through `by_need`
+/// (`front_load::ScopeRecords`, rule 77) instead of eagerly reading and mapping every crate in
+/// the check scope upfront.
+#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
+pub(crate) fn names_of_by_need<'n, 'm: 'n>(
+    cx: &'n Cx,
+    root: &'n Dir<ReadWrite>,
+    found: &'n Found<'_>,
+    owner: Owner,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    by_need: &'n dyn crate::front_load::OpenByNeed,
+    env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
+    procs: crate::job_texts::Procs<'n>,
+    seen: &'n TreesSeen,
+    frame: &'n Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<NamesRecords<'n>, RunNamesError> {
+    let _cx = cx.span("run names: open the names records");
+    let crates = crates_of_by_need(cx, found, owner, store, kept, read, by_need, env, dirs, frame, heap)?;
+    names_in(cx, root, crates, procs, seen, frame)
+}
+
 /// The [`RunCrates`] of `found` ([`names_of`]'s first half, on the command thread): what every
 /// names records of the program are made of, each code worker's too (test_drive.rs `CodePool`).
 #[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
@@ -1080,6 +1606,33 @@ pub(crate) fn crates_of<'n, 'm: 'n>(
         Found::Stood(rows, snapshot) => {
             let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
             read_crates(cx, &program, snapshot, store, kept, read, env, dirs, frame, heap)
+        }
+    }
+}
+
+/// [`crates_of`] opening only the owner crate upfront and deferring every other crate in the
+/// check scope (`core`, `alloc`, `std`, deps) to `by_need` (`front_load::ScopeRecords`, shared
+/// across all suites and `CodePool` workers so each touched crate, module bitmap, and pack
+/// `FileItems` is opened at most once per command; rules 74 and 77).
+#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
+pub(crate) fn crates_of_by_need<'n, 'm: 'n>(
+    cx: &Cx,
+    found: &'n Found<'_>,
+    owner: Owner,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    by_need: &'n dyn crate::front_load::OpenByNeed,
+    env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
+    frame: &'n Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<RunCrates<'n>, RunNamesError> {
+    match found {
+        Found::Walked(program, snapshot) => read_crates_by_need(cx, program, snapshot, store, kept, read, by_need, env, dirs, frame, heap),
+        Found::Stood(rows, snapshot) => {
+            let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
+            read_crates_by_need(cx, &program, snapshot, store, kept, read, by_need, env, dirs, frame, heap)
         }
     }
 }
@@ -1191,23 +1744,35 @@ impl<'n> crate::job_texts::EnvsByNeed<'n> for RunEnvs<'n> {
     }
 }
 
+/// How [`RunCrates`] holds the program's crates: either every crate opened upfront (`Opened`), or
+/// only the owner opened upfront with dependencies opened lazily by need (`ByNeed`) through a
+/// command-wide [`crate::front_load::ScopeRecords`].
+#[derive(Clone, Copy)]
+enum RunScope<'n> {
+    Opened(&'n [Crate<'n>]),
+    ByNeed(ByNeedScope<'n>),
+}
+
 /// What every names records of one program are made of, read ONCE on the command thread
-/// ([`read_crates`]: each crate's records read in place through the store's mapping): the crate
-/// list, the crates, each crate's list row and build-script row, the lang crates, the list's
-/// corrected texts and where its trees are opened from. All borrowed and read only, so it is
-/// `Sync`: the command's code workers (test_drive.rs `CodePool`, D194) each make their own names
-/// records of it ([`names_in`]), and the command thread makes its own the same way ([`names_of`]).
+/// ([`read_crates`] / [`read_crates_by_need`]: each crate's records read in place through the
+/// store's mapping): the crate list, the crates, each crate's list row and build-script row, the
+/// lang crates, the list's corrected texts and where its trees are opened from. All borrowed and
+/// read only, so it is `Sync`: the command's code workers (test_drive.rs `CodePool`, D194) each
+/// make their own names records of it ([`names_in`]), and the command thread makes its own the
+/// same way ([`names_of`]).
 ///
 /// WHAT IS SHARED, AND WHAT IS NOT (D194 piece 2): shared read only are the crates' records
-/// (views of the store's mapping), the list, the snapshot, the corrected texts, the command-wide
-/// lazy pack cache ([`SyncLazyTrees`]), the command-scoped pack directories ([`SyncPackDirs`]),
-/// and the packs' home; per maker of names records ([`names_in`], one a worker a suite) are its
-/// open/refusal counter ([`TreesSeen`]), the environments made by need ([`RunEnvs`]: `OnceCell`),
-/// and the records' own memo (`Records`, the `Log`, the job texts), all in that maker's frame.
+/// (views of the store's mapping, or opened lazily on demand through `ScopeRecords` with shared
+/// `VerifiedModules` and `FileItems` caches), the list, the snapshot, the corrected texts, the
+/// command-wide lazy pack cache ([`SyncLazyTrees`]), the command-scoped pack directories
+/// ([`SyncPackDirs`]), and the packs' home; per maker of names records ([`names_in`], one a worker
+/// a suite) are its open/refusal counter ([`TreesSeen`]), the environments made by need
+/// ([`RunEnvs`]: `OnceCell`), and the records' own memo (`Records`, the `Log`, the job texts), all
+/// in that maker's frame.
 #[derive(Clone, Copy)]
 pub(crate) struct RunCrates<'n> {
     list: &'n CrateList<'static>,
-    crates: &'n [Crate<'n>],
+    crates: RunScope<'n>,
     /// Reader crate `k`'s row of `list` (the owner at 0).
     rows: &'n [usize],
     /// [`Program::scripts`], sorted by row.
@@ -1265,7 +1830,67 @@ pub(crate) fn read_crates<'n, 'm: 'n>(
     scripts.extend_from_slice(&program.scripts);
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
     lang.extend_from_slice(&program.lang);
-    Ok(RunCrates { list, crates: crates.into_bump_slice(), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, packs, dirs, snapshot, from: PackHome::of(env), heap })
+    Ok(RunCrates { list, crates: RunScope::Opened(crates.into_bump_slice()), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, packs, dirs, snapshot, from: PackHome::of(env), heap })
+}
+
+/// Like [`read_crates`], opening only the owner crate upfront (typically already cached in `read`
+/// from `program_of` / `tests_of`) and deferring all dependency/toolchain crates to `by_need`.
+#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
+pub(crate) fn read_crates_by_need<'n, 'm: 'n>(
+    cx: &Cx,
+    program: &Program,
+    snapshot: &'n StoreSnapshot,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    by_need: &'n dyn crate::front_load::OpenByNeed,
+    env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
+    frame: &'n Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<RunCrates<'n>, RunNamesError> {
+    let list: &'n CrateList<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(program.list, frame));
+    let scope = match program.crates.split_first() {
+        Some((&(own_at, own_input), rest_rows)) => {
+            let own_name = CrateGraph::name(list, own_at);
+            let own_records: CrateRecords<'m> = read
+                .records(cx, store, &own_input, list.key(own_at), heap.alloc())
+                .map_err(|error| unread(own_name, error))?;
+            let own = Crate { records: own_records, name: own_name, package: list.shown_from(own_at), world_at: own_at };
+            let mut rest: Vec<crate::front_load::Unopened, &'n Frame> = Vec::with_capacity_in(rest_rows.len(), frame);
+            for &(at, input) in rest_rows {
+                rest.push(crate::front_load::Unopened {
+                    input,
+                    key: list.key(at),
+                    world_at: at,
+                    name: CrateGraph::name(list, at),
+                    package: list.shown_from(at),
+                });
+            }
+            RunScope::ByNeed(ByNeedScope { own, rest: rest.into_bump_slice(), records: by_need })
+        }
+        None => RunScope::Opened(&[]),
+    };
+    let (packs, corrected) = kept.lazy_trees(env, program.graph.out, program.list).map_err(|why| RunNamesError::Trees { why })?;
+    let mut rows: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.crates.len(), frame);
+    rows.extend(program.crates.iter().map(|(at, _)| *at));
+    let mut scripts: Vec<(usize, Input), &'n Frame> = Vec::with_capacity_in(program.scripts.len(), frame);
+    scripts.extend_from_slice(&program.scripts);
+    let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
+    lang.extend_from_slice(&program.lang);
+    Ok(RunCrates {
+        list,
+        crates: scope,
+        rows: rows.into_bump_slice(),
+        scripts: scripts.into_bump_slice(),
+        lang: lang.into_bump_slice(),
+        corrected,
+        packs,
+        dirs,
+        snapshot,
+        from: PackHome::of(env),
+        heap,
+    })
 }
 
 /// The names records over `crates`, in `frame`, on the calling thread (`cx`'s): the list's trees
@@ -1290,8 +1915,92 @@ pub(crate) fn names_in<'n>(
     let envs: &'n RunEnvs<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, frame), frame));
     let envs = Envs { owner: None, rest: Some(envs) };
     let trees = (trees, None);
-    let made = names_records_envs(cx, root, ScopeCrates::Opened(opened), trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {
-        NamesError::Items { at, why } => RunNamesError::Items { crate_name: opened.get(at).map_or("?", |one| CrateGraph::name(list, one.world_at)), why },
+    let scope = match opened {
+        RunScope::Opened(crates) => ScopeCrates::Opened(crates),
+        RunScope::ByNeed(scope) => ScopeCrates::ByNeed(scope),
+    };
+    let made = names_records_envs(cx, root, scope, trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {
+        NamesError::Items { at, why } => RunNamesError::Items { crate_name: rows.get(at).map_or("?", |&world_at| CrateGraph::name(list, world_at)), why },
     })?;
     Ok(NamesRecords { records: made.records, frame, lang_crates: lang, body_sources: Some(made.sources) })
+}
+
+#[cfg(test)]
+mod delta_tests {
+    use blaze_drive::Key;
+    use blaze_id::CrateItemKey;
+    use blaze_ids::ContentId;
+    use blaze_own::AVec;
+    use blaze_scope::tests_record::TestsRecord;
+
+    use super::{TEST_INVENTORY_MAGIC, TEST_INVENTORY_VERSION, TestsDeltaCache};
+
+    /// Builds a valid 67-byte `BZTS` record (64-byte header + 3-byte strings tail, intentionally
+    /// non-16-byte-multiple so inter-entry 16-byte padding in `BZTI` is exercised).
+    fn make_bzts<'a>(ck: CrateItemKey, alloc: blaze_own::Alloc<'a>) -> AVec<'a, u8> {
+        let mut out = AVec::with_capacity_in(67, alloc);
+        out.extend_from_slice(b"BZTS");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // count = 0
+        out.extend_from_slice(&64u32.to_le_bytes()); // strings_at = HEADER
+        out.extend_from_slice(&3u32.to_le_bytes()); // strings_len = 3
+        out.extend_from_slice(&[0u8; 12]); // padding to KEY_AT = 32
+        out.extend_from_slice(&ck.0.0);
+        out.extend_from_slice(b"abc");
+        out
+    }
+
+    #[test]
+    fn tests_delta_cache_round_trips_aligned_and_opens_zero_copy() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+
+        let ck0 = CrateItemKey(ContentId::of("delta test", b"suite0"));
+        let ck1 = CrateItemKey(ContentId::of("delta test", b"suite1"));
+        let s0 = Key(ContentId::of("delta scope", b"s0"));
+        let s1 = Key(ContentId::of("delta scope", b"s1"));
+        let s1_new = Key(ContentId::of("delta scope", b"s1_new"));
+
+        let tr0 = make_bzts(ck0, alloc);
+        let tr1 = make_bzts(ck1, alloc);
+
+        // Unsorted input must encode deterministically in sorted order.
+        let enc_a = TestsDeltaCache::encode(&[(s1, ck1, tr1.as_slice()), (s0, ck0, tr0.as_slice())], alloc).expect("encode a");
+        let enc_b = TestsDeltaCache::encode(&[(s0, ck0, tr0.as_slice()), (s1, ck1, tr1.as_slice())], alloc).expect("encode b");
+        assert_eq!(enc_a.as_slice(), enc_b.as_slice(), "BZTI encoding must be deterministic (rule 25)");
+
+        let aligned = blaze_scope::resolve::aligned(enc_a.as_slice(), bump);
+        let opened = TestsDeltaCache::open(aligned).expect("open BZTI");
+        let hit0 = opened.get(s0, ck0).expect("hit suite0");
+        let hit1 = opened.get(s1, ck1).expect("hit suite1");
+        assert!(opened.get(s1_new, ck1).is_none(), "edited suite scope_at must miss");
+        assert_eq!(TestsRecord::open(hit0).expect("aligned open tr0").key(), ck0);
+        assert_eq!(TestsRecord::open(hit1).expect("aligned open tr1").key(), ck1);
+    }
+
+    #[test]
+    fn previous_inventory_magic_is_refused() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+
+        let empty = TestsDeltaCache::encode(&[], alloc).expect("encode empty");
+        assert_eq!(&empty[0..4], &TEST_INVENTORY_MAGIC);
+        assert_eq!(u32::from_le_bytes([empty[4], empty[5], empty[6], empty[7]]), TEST_INVENTORY_VERSION);
+
+        let mut old_magic: AVec<'_, u8> = AVec::new_in(alloc);
+        old_magic.extend_from_slice(empty.as_slice());
+        old_magic[3] = b'0';
+        assert!(TestsDeltaCache::open(blaze_scope::resolve::aligned(old_magic.as_slice(), bump)).is_none(), "old magic must be refused");
+
+        let mut old_ver: AVec<'_, u8> = AVec::new_in(alloc);
+        old_ver.extend_from_slice(empty.as_slice());
+        old_ver[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(TestsDeltaCache::open(blaze_scope::resolve::aligned(old_ver.as_slice(), bump)).is_none(), "previous version 0 must be refused");
+    }
 }

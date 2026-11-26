@@ -98,9 +98,18 @@ impl ReadGrain {
 /// stored answer (the measurement of 2026-11-20 on tempo: 1,240 task pages and all 128 producer
 /// header shards for a one-function edit, a third of its CPU).
 ///
-/// At most two entries per crate. An ID outside these records keeps its original grain.
+/// At most two coarse entries per non-cell-table crate (`ReadGrain::Cell` entries are omitted
+/// because absence defaults to `ReadGrain::Cell`), plus one O(1) crate-prefix entry per unique
+/// non-member immutable crate for direct `Kind::Signature` widening. An ID outside these records
+/// keeps its original grain.
 pub(crate) struct ReadGrains<'a> {
-    by_name: blaze_hash::HashMap<Name, ReadGrain, blaze_own::SharedAlloc<'a>>,
+    by_name: blaze_hash::Map<Name, ReadGrain, blaze_hash::BuildKeyHasher, blaze_own::SharedAlloc<'a>>,
+    /// Maps each unique 8-byte crate prefix (`u64::from_ne_bytes(key.prefix())`) of a non-member
+    /// crate without a `CELLS` cell table (toolchain `core`/`alloc`/`std`, registry crates)
+    /// directly to its widened `CellId` (`Graph(crate_cell)` when settled, `CrateScope::WHOLE`
+    /// otherwise), so unplaced `Kind::Signature` reads widen in O(1) without scanning `records`
+    /// or re-hashing `crate_scope_name`.
+    by_prefix: blaze_hash::Map<u64, CellId, blaze_hash::BuildKeyHasher, blaze_own::SharedAlloc<'a>>,
     graph: CellId,
 }
 
@@ -262,72 +271,114 @@ impl<'a> ReadGrains<'a> {
         let mut record = blaze_own::Vec::with_capacity_in(GRAINS_HEAD + n, alloc.local());
         record.extend_from_slice(GRAINS_MAGIC);
         record.extend_from_slice(&from.graph_out.0);
+        // `made_at` must advance with every saved answer serial so the next request's
+        // `stored_facts` (`made == from.last_serial`) still rejects a BRG2 record left stale by an
+        // intervening request that modified `CrateScope`/`ImplBucket` and saved without running `Bodies`.
         record.extend_from_slice(&from.last_serial.saturating_add(1).to_le_bytes());
         record.extend_from_slice(&line.crates.to_le_bytes());
         // The crate cells byte, set below once it is known.
         record.push(0);
         let mut settled = blaze_own::Vec::with_capacity_in(n, alloc.local());
         let mut crates = blaze_own::Vec::with_capacity_in(n, alloc.local());
+        let mut prefixes = blaze_own::Vec::with_capacity_in(n, alloc.local());
+        let no_entered = from.entered.is_empty();
+        let copy_held = no_entered && stored.is_ok();
+        if let Ok((_, held)) = stored
+            && copy_held
+        {
+            record.extend_from_slice(held);
+        }
+        // Of the graph's record alone: whether the graph could settle crate `at`. Short-circuits
+        // members, refused crates, build-script crates and proc macros before parsing the root
+        // tree index string.
+        let is_candidate = |at: usize, is_member: bool| -> bool {
+            !is_member && !list.refused(at) && list.script(at).is_none() && !list.proc_macro(at) && {
+                // A tree is one-based in the checked crate list. The pack's kind distinguishes
+                // registry archives from git records (both have PackOrigin::Source); it is the tree
+                // row's (crate_list.rs `TreeRow::kind`, version 7), so no pack is mapped here.
+                let tree = list.root(at).strip_prefix('/').and_then(|s| s.split_once('/'))
+                    .and_then(|(tree, _)| tree.parse::<usize>().ok());
+                let origin = tree.and_then(|k| list.tree(k)).map(|row| (row.origin, row.kind));
+                matches!((list.toolchain(at), origin),
+                    (true, Some((PackOrigin::Shelf { .. }, blaze_fetch::pack::Kind::Tree)))
+                    | (false, Some((PackOrigin::Source { .. }, blaze_fetch::pack::Kind::Crate))))
+            }
+        };
+        let mut any_settled = false;
         for at in 0..n {
             let key = list.key(at);
-            let scope = crate_scope_name(&key);
-            let tables = blaze_ladder::front2::buckets::impl_tables_name(key);
-            // A tree is one-based in the checked crate list. The pack's kind distinguishes
-            // registry archives from git records (both have PackOrigin::Source); it is the tree
-            // row's (crate_list.rs `TreeRow::kind`, version 7), so no pack is mapped here.
-            let tree = list.root(at).strip_prefix('/').and_then(|s| s.split_once('/'))
-                .and_then(|(tree, _)| tree.parse::<usize>().ok());
-            let origin = tree.and_then(|k| list.tree(k)).map(|row| (row.origin, row.kind));
-            let pinned = matches!((list.toolchain(at), origin),
-                (true, Some((PackOrigin::Shelf { .. }, blaze_fetch::pack::Kind::Tree)))
-                | (false, Some((PackOrigin::Source { .. }, blaze_fetch::pack::Kind::Crate))));
-            // Of the graph's record alone: whether the graph could settle this crate.
-            let candidate = pinned && !list.member(at) && !list.refused(at) && list.script(at).is_none() && !list.proc_macro(at);
-            let moved = |name: &Name| from.entered.binary_search(name).is_ok();
-            let facts = match stored {
-                Ok((_, held)) if !moved(&scope) && !moved(&tables) => held[at],
+            let is_member = list.member(at);
+            let mut cached_names: Option<(Name, Name)> = None;
+            let (facts, candidate_opt) = match stored {
+                Ok((_, held)) if no_entered => (held.get(at).copied().unwrap_or(0), None),
                 _ => {
-                    line.refreshed += 1;
-                    let mut facts = 0u8;
-                    line.answer_reads += 1;
-                    if view.cell(&CellId { of: scope, cell: CELLS }) != ABSENT {
-                        facts |= CELL_TABLE;
-                    }
-                    if candidate && facts & CELL_TABLE == 0 {
-                        line.answer_reads += 1;
-                        if view.row_failed(scope) == Some(false) {
-                            facts |= NAMES_STAND;
-                            // Read wherever the graph could settle the crate (not only where it
-                            // does): a dependency's facts moving settles or unsettles this one
-                            // with no task of its own entered.
+                    let scope = crate_scope_name(&key);
+                    let tables = blaze_ladder::front2::buckets::impl_tables_name(key);
+                    cached_names = Some((scope, tables));
+                    let moved = |name: &Name| from.entered.binary_search(name).is_ok();
+                    match stored {
+                        Ok((_, held)) if !moved(&scope) && !moved(&tables) => (held.get(at).copied().unwrap_or(0), None),
+                        _ => {
+                            line.refreshed += 1;
+                            let mut facts = 0u8;
                             line.answer_reads += 1;
-                            if view.row_failed(tables) == Some(false) {
-                                facts |= TABLES_STAND;
+                            if view.cell(&CellId { of: scope, cell: CELLS }) != ABSENT {
+                                facts |= CELL_TABLE;
                             }
+                            let candidate = if facts & CELL_TABLE == 0 {
+                                let cand = is_candidate(at, is_member);
+                                if cand {
+                                    line.answer_reads += 1;
+                                    if view.row_failed(scope) == Some(false) {
+                                        facts |= NAMES_STAND;
+                                        // Read wherever the graph could settle the crate (not only where it
+                                        // does): a dependency's facts moving settles or unsettles this one
+                                        // with no task of its own entered.
+                                        line.answer_reads += 1;
+                                        if view.row_failed(tables) == Some(false) {
+                                            facts |= TABLES_STAND;
+                                        }
+                                    }
+                                }
+                                Some(cand)
+                            } else {
+                                Some(false)
+                            };
+                            (facts, candidate)
                         }
                     }
-                    facts
                 }
             };
-            record.push(facts);
+            if !copy_held {
+                record.push(facts);
+            }
             let cells = facts & CELL_TABLE != 0;
-            crates.push((scope, tables, cells, facts & TABLES_STAND != 0));
-            settled.push(candidate && !cells && facts & NAMES_STAND != 0);
+            let is_settled = !cells && facts & NAMES_STAND != 0 && candidate_opt.unwrap_or_else(|| is_candidate(at, is_member));
+            any_settled |= is_settled;
+            crates.push((key, cached_names, is_member, cells, facts & TABLES_STAND != 0));
+            settled.push(is_settled);
+            prefixes.push((u64::from_ne_bytes(key.prefix()), at));
         }
         // An immutable archive can resolve a path through a patched dependency or import
         // names generated by its build script. Its derived records then have a mutable input.
         // Each changing pass removes at least one of the n candidates.
-        for _ in 0..n {
-            let mut changed = false;
-            let sysroot_settled = list.sysroot().into_iter().flatten().all(|dep| settled[dep]);
-            for at in 0..n {
-                if settled[at] && (list.deps(at).any(|dep| !settled[dep])
-                    || (list.side(at) == Side::Target && !sysroot_settled)) {
-                    settled[at] = false;
-                    changed = true;
+        if any_settled {
+            for _ in 0..n {
+                let mut changed = false;
+                let sysroot_settled = list.sysroot().into_iter().flatten().all(|dep| settled.get(dep).copied().unwrap_or(false));
+                for at in 0..n {
+                    if settled.get(at).copied().unwrap_or(false)
+                        && (list.deps(at).any(|dep| !settled.get(dep).copied().unwrap_or(false))
+                            || (list.side(at) == Side::Target && !sysroot_settled))
+                    {
+                        if let Some(slot) = settled.get_mut(at) {
+                            *slot = false;
+                        }
+                        changed = true;
+                    }
                 }
+                if !changed { break }
             }
-            if !changed { break }
         }
         // Whether the graph defines a cell per crate (engine_units.rs `CRATE_CELLS`): a function
         // of the graph's record alone, so taken from the stored record with the facts (that
@@ -342,29 +393,103 @@ impl<'a> ReadGrains<'a> {
                 view.cell(&CellId { of: graph.of, cell: crate::engine_units::CRATE_CELLS }) != ABSENT
             }
         };
-        record[GRAINS_HEAD - 1] = u8::from(defined);
+        if let Some(slot) = record.get_mut(GRAINS_HEAD - 1) {
+            *slot = u8::from(defined);
+        }
         #[cfg(test)]
         let planted = PLANT_WHOLE_GRAPH.with(core::cell::Cell::get);
         #[cfg(not(test))]
         let planted = false;
         let crate_cells = !planted && defined;
-        let settled_at = |at: usize| if crate_cells { crate::engine_units::crate_cell(&list.key(at)) } else { graph.cell };
-        let mut by_name = blaze_hash::HashMap::with_capacity_in(2 * n, alloc);
-        for (at, &(scope, tables, cells, tables_stand)) in crates.iter().enumerate() {
-            let grain = if settled[at] { ReadGrain::Graph(settled_at(at)) } else if cells { ReadGrain::Cell } else { ReadGrain::Record };
-            by_name.insert(scope, grain);
+        let coarse_count = crates.iter().enumerate().filter(|&(at, &(_, _, _, cells, _))| {
+            settled.get(at).copied().unwrap_or(false) || !cells
+        }).count();
+        let mut by_name = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::BuildKeyHasher::default(),
+            alloc,
+            capacity: Some(coarse_count.saturating_mul(2)),
+        });
+        let mut sig_targets: blaze_own::Vec<Option<CellId>, _> = blaze_own::Vec::with_capacity_in(n, alloc.local());
+        for (at, &(key, cached_names, is_member, cells, tables_stand)) in crates.iter().enumerate() {
+            let is_settled = settled.get(at).copied().unwrap_or(false);
+            let settled_cell = is_settled.then(|| if crate_cells { crate::engine_units::crate_cell(&key) } else { graph.cell });
+            let grain = match settled_cell {
+                Some(cell) => ReadGrain::Graph(cell),
+                None if cells => ReadGrain::Cell,
+                None => ReadGrain::Record,
+            };
             // Missing/failed tables may become available independently of a graph edit.
-            let tables_grain = if settled[at] && !tables_stand { ReadGrain::Record } else { grain };
-            by_name.insert(tables, tables_grain);
+            let tables_grain = if is_settled && !tables_stand { ReadGrain::Record } else { grain };
+            if grain == ReadGrain::Cell && tables_grain == ReadGrain::Cell {
+                sig_targets.push(None);
+                continue;
+            }
+            let (scope, tables) = match cached_names {
+                Some(pair) => pair,
+                None => (crate_scope_name(&key), blaze_ladder::front2::buckets::impl_tables_name(key)),
+            };
+            if grain != ReadGrain::Cell {
+                by_name.insert(scope, grain);
+            }
+            if tables_grain != ReadGrain::Cell {
+                by_name.insert(tables, tables_grain);
+            }
+            // Non-member crates without a `CELLS` cell table never own member head tasks
+            // (`Owners::place` returns `HeadAt::Dependency(scope)`), so their unplaced
+            // `Kind::Signature` reads widen directly to `Graph(cell)` or `CrateScope::WHOLE`.
+            let sig_target = (!is_member && !cells).then(|| match settled_cell {
+                Some(cell) => CellId { of: graph.of, cell },
+                None => CellId { of: scope, cell: WHOLE },
+            });
+            sig_targets.push(sig_target);
         }
-        MadeGrains { grains: Self { by_name, graph }, record, line }
+        prefixes.sort_unstable_by_key(|&(prefix, _)| prefix);
+        let mut by_prefix = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::BuildKeyHasher::default(),
+            alloc,
+            capacity: Some(coarse_count),
+        });
+        for i in 0..prefixes.len() {
+            let Some(&(prefix, at)) = prefixes.get(i) else { continue };
+            let dup_prev = i > 0 && prefixes.get(i - 1).is_some_and(|&(p, _)| p == prefix);
+            let dup_next = prefixes.get(i + 1).is_some_and(|&(p, _)| p == prefix);
+            if dup_prev || dup_next {
+                continue;
+            }
+            if let Some(Some(target)) = sig_targets.get(at) {
+                by_prefix.insert(prefix, *target);
+            }
+        }
+        MadeGrains { grains: Self { by_name, by_prefix, graph }, record, line }
+    }
+
+    /// O(1) widening for an unplaced `Kind::Signature` read (`tables/head.rs::signature_name`,
+    /// whose trailing 16 subject bytes are zero) belonging to a unique non-member immutable crate.
+    /// Placed member head tasks carry a full 32-byte BLAKE3 subject and always return `None`.
+    pub(crate) fn place_signature(&self, id: &CellId) -> Option<CellId> {
+        if id.of.kind != blaze_drive::Kind::Signature || self.by_prefix.is_empty() {
+            return None;
+        }
+        let tail = id.of.subject.0.last_chunk::<16>()?;
+        if *tail != [0u8; 16] {
+            return None;
+        }
+        let head = id.of.subject.0.first_chunk::<8>()?;
+        let prefix = u64::from_ne_bytes(*head);
+        self.by_prefix.get(&prefix).copied()
     }
 
     pub(crate) fn place(&self, id: CellId, fine_buckets: bool) -> CellId {
         match id.of.kind {
             blaze_drive::Kind::CrateScope => {}
-            blaze_drive::Kind::ImplBucket if !fine_buckets => {}
+            blaze_drive::Kind::ImplBucket if !fine_buckets && id.of.subject != blaze_drive::key::ABSENT => {}
+            blaze_drive::Kind::Signature => {
+                return self.place_signature(&id).unwrap_or(id);
+            }
             _ => return id,
+        }
+        if self.by_name.is_empty() {
+            return id;
         }
         self.by_name.get(&id.of).copied().unwrap_or(ReadGrain::Cell).place(id, self.graph)
     }

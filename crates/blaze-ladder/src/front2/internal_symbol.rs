@@ -392,7 +392,7 @@ pub(crate) fn record_search<'n>(
     let searches = facts.rows.iter().filter(|r| r.fact.kind == FactKind::Head).any(|r| {
         // A type check can finish before linkage is decided. An unread declaration keeps
         // the covering reads too. Linkage reports its own typed refusal at the call.
-        !matches!(declares(tables, store, ItemKey(r.fact.key), store.tys.alloc()), Ok(None))
+        !matches!(declares(tables, store, ItemKey(r.fact.key), store.work_alloc()), Ok(None))
     });
     if searches {
         for k in 0..tables.crate_count() {

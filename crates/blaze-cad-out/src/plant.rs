@@ -76,3 +76,15 @@ pub enum SvgPlant {
 }
 
 impl Plants for SvgPlant {}
+
+/// The Flecs v4.2 prefab writer's planted bugs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlecsPlant {
+    None,
+    /// Omit `@tree ChildOf` on the root prefab (breaking named child paths in Flecs 4.2).
+    OmitTreeChildOf,
+    /// Omit named socket entities from parts.
+    SkipSockets,
+}
+
+impl Plants for FlecsPlant {}

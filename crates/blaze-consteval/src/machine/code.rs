@@ -2426,6 +2426,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 cc.tasks.push(C::Field(e));
                 cc.tasks.push(C::Eval(base, Mode::Place));
             }
+            // `*x` overloaded: the dereference is `x`'s own last adjustment (rules/op.rs), so
+            // `*x`'s place is `x`'s adjusted place, never dereferenced a second time.
+            Expr::Unary { op: UnOp::Deref, operand } if self.deref_on_operand(cc, operand) => {
+                cc.tasks.push(C::Eval(operand, Mode::Place));
+            }
             Expr::Unary { op: UnOp::Deref, operand } => {
                 cc.tasks.push(C::Deref(e));
                 cc.tasks.push(C::Eval(operand, Mode::Value));
@@ -2583,8 +2588,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
     /// (`repr(C)`, `packed` and `align` included); core's `mem::offset_of!`: "Expands to the
     /// offset in bytes of a field from the beginning of the given type", nested fields allowed
     /// (`a.0.b`). A tuple's or tuple struct's step is named by its digits (`Name::of_index`), a
-    /// struct's or union's by its field name. A step through an enum variant (unstable
-    /// `offset_of_enum`) is refused by name.
+    /// struct's or union's by its field name, and an enum variant (`offset_of_enum`) by the
+    /// variant's name followed by its field name or tuple index.
     fn offset_of(&mut self, cc: &mut Cc<'w, '_>, ty: PTy, fields: List) -> R<'a, u64> {
         let body = cc.typed.body;
         let steps = body.segments.get(fields.range()).ok_or(malformed("an `offset_of!` path past the body's segments"))?;
@@ -2601,34 +2606,142 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             _ => unsupported("an `offset_of!` type with no ground form at the instance (an alias, an opaque type, a closure)"),
         })?;
         let mut total: u64 = 0;
+        // The variant the step before named, when traversing an enum (`offset_of_enum`), matching
+        // `blaze-typeck` `rules/field.rs` `expr_offset_of`.
+        let mut variant: Option<u32> = None;
         for step in steps {
-            let index = match self.node(t)? {
-                PNode::Tuple(l) => {
+            let (vi, index) = match self.node(t)? {
+                PNode::Tuple(l) if variant.is_none() => {
                     let n = self.ground.view().list(l).map_err(|_| malformed("a tuple's list past the ground table"))?.len() as u32;
-                    (0..n).find(|&i| blaze_typeck::Name::of_index(i) == step.name)
+                    (0, (0..n).find(|&i| blaze_typeck::Name::of_index(i) == step.name))
                 }
-                PNode::Record(schema, _) => self
-                    .ground
-                    .view()
-                    .record_field_index(schema, step.name)
-                    .or_else(|| cc.typed.types.record_field_index(schema, step.name)),
+                PNode::Record(schema, _) if variant.is_none() => (
+                    0,
+                    self.ground
+                        .view()
+                        .record_field_index(schema, step.name)
+                        .or_else(|| cc.typed.types.record_field_index(schema, step.name)),
+                ),
                 PNode::Adt(key, _) => {
                     let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
-                    if adt.kind == AdtKind::Enum {
-                        return Err(unsupported("`offset_of!` through an enum variant (`offset_of_enum`)"));
+                    if adt.kind == AdtKind::Enum && variant.is_none() {
+                        let vi = adt
+                            .variants
+                            .iter()
+                            .position(|v| v.name == step.name)
+                            .ok_or(malformed("an `offset_of!` step naming a variant its enum lacks"))?;
+                        variant = Some(u32::try_from(vi).map_err(|_| malformed("an `offset_of!` variant past `u32`"))?);
+                        continue;
                     }
-                    let v = adt.variants.first().ok_or(malformed("a struct with no variant"))?;
+                    let vi = variant.take().unwrap_or(0);
+                    let vi_usize = usize::try_from(vi).map_err(|_| malformed("an `offset_of!` variant past `usize`"))?;
+                    let v = adt.variants.get(vi_usize).ok_or(malformed("an `offset_of!` variant past its ADT"))?;
                     let own = adt.fields.get(v.fields.range()).ok_or(malformed("a variant's fields past its ADT"))?;
-                    own.iter().position(|f| f.name == step.name).map(|i| i as u32)
+                    (vi, own.iter().position(|f| f.name == step.name).and_then(|i| u32::try_from(i).ok()))
                 }
                 _ => return Err(unsupported("`offset_of!` through a field of a type with no fields")),
             };
             let index = index.ok_or(malformed("an `offset_of!` step naming a field its container lacks"))?;
-            let off = self.field_offset(t, 0, index)?;
+            let off = self.field_offset(t, vi, index)?;
             total = total.checked_add(off).ok_or(malformed("an `offset_of!` past `u64`"))?;
-            t = self.field_ty(t, 0, index)?;
+            t = self.field_ty(t, vi, index)?;
+        }
+        if variant.is_some() {
+            return Err(malformed("an `offset_of!` ending on an enum variant with no field"));
         }
         Ok(total)
+    }
+
+    /// Whether `operand`'s last adjustment is an overloaded dereference: the checker records
+    /// overloaded `*x` on `x` itself (rules/op.rs `expr_unary`), so `x`'s adjusted place IS `*x`.
+    fn deref_on_operand(&self, cc: &Cc<'w, '_>, operand: ExprId) -> bool {
+        rows(cc.typed.adjusts.0, operand)
+            .last()
+            .and_then(|i| cc.typed.adjusts.1.get(i))
+            .is_some_and(|k| matches!(k, AdjustKind::Deref { overloaded: Some(_) }))
+    }
+
+    /// An overloaded dereference adjustment (`*x` or autoderef through `Deref::deref` /
+    /// `DerefMut::deref_mut`): borrows `out` (of ground type `ty`) as `&Self` / `&mut Self`,
+    /// resolves the trait method at `[Self]` and calls it, then dereferences the returned
+    /// `&Target` / `&mut Target` into a place of type `next`.
+    fn overloaded_deref<A: Allocator + Clone>(
+        &mut self,
+        cc: &mut Cc<'w, '_>,
+        code: &mut Code<A>,
+        out: Reg,
+        ty: PTy,
+        next: PTy,
+        mutbl: Mutbl,
+    ) -> R<'a, Reg> {
+        let method = match self.world.deref_method(mutbl) {
+            FnTraitMethod::Found(item) => item,
+            FnTraitMethod::Absent => {
+                return Err(unsupported(
+                    "an overloaded `Deref` in a constant in a world that names no `Deref::deref` (ConstWorld::deref_method)",
+                ));
+            }
+            FnTraitMethod::Pending { trait_ } => {
+                return Err(Stop::Refused(Refusal::Missing {
+                    what: "the trait members for `Deref` (ConstWorld::deref_method)",
+                    item: trait_,
+                }));
+            }
+        };
+        let self_args = self.ground.intern_list(&[ty]).map_err(|_| malformed("the ground table is full"))?;
+        let (item, args) = self.resolve(method, self_args)?;
+        enum DerefCall {
+            Const,
+            Panic,
+            Intrinsic(Intrinsic),
+        }
+        let call_kind = match self.world.fn_kind(item) {
+            FnKind::Const => DerefCall::Const,
+            FnKind::Panic => DerefCall::Panic,
+            FnKind::Intrinsic(i) => DerefCall::Intrinsic(i),
+            FnKind::NotConst => return Err(Stop::Refused(Refusal::NotConstFn { item })),
+            FnKind::UnknownIntrinsic => return Err(Stop::Refused(Refusal::UnknownIntrinsic { item })),
+            FnKind::Missing(fact) => return Err(Stop::Refused(Refusal::FnFact { item, fact })),
+            FnKind::Ctor { .. } => return Err(malformed("a `Deref` impl that is a constructor")),
+        };
+        let self_ref_ty = self.ground.intern(PNode::Ref(mutbl, ty)).map_err(|_| malformed("the ground table is full"))?;
+        let ret_ref_ty = self.ground.intern(PNode::Ref(mutbl, next)).map_err(|_| malformed("the ground table is full"))?;
+        let place = self.as_place(cc, code, out, ty)?;
+        let unsized_ = matches!(self.node(ty)?, PNode::Str | PNode::Slice(_));
+        let thin = !layout::is_unsized(self.world, self.ground, ty, self.alloc)?;
+        let meta = if thin {
+            Meta::Drop
+        } else if unsized_ {
+            Meta::Need
+        } else {
+            Meta::Keep
+        };
+        let self_ref = self.reg(cc, Kind::V);
+        self.emit(code, cc, Op::Borrow { dst: self_ref, src: place, meta });
+        let regs = self.arg_regs(cc, code, &[(self_ref, self_ref_ty)])?;
+        let k = u32::try_from(code.calls.len()).map_err(|_| malformed("too many calls in a constant"))?;
+        let ret_ref = match call_kind {
+            DerefCall::Const => {
+                code.calls.push(Call { item, args, regs, link: Cell::new(u32::MAX), intrinsic: None, ret: ret_ref_ty });
+                let dst = self.reg(cc, Kind::V);
+                self.emit(code, cc, Op::Call { dst, k });
+                dst
+            }
+            DerefCall::Panic => {
+                code.calls.push(Call { item, args, regs, link: Cell::new(u32::MAX), intrinsic: None, ret: ret_ref_ty });
+                self.emit(code, cc, Op::Panic { k });
+                self.reg(cc, Kind::V)
+            }
+            DerefCall::Intrinsic(i) => {
+                code.calls.push(Call { item, args, regs, link: Cell::new(u32::MAX), intrinsic: Some(i), ret: ret_ref_ty });
+                let dst = self.reg(cc, Kind::V);
+                self.emit(code, cc, Op::Intrinsic { dst, k });
+                dst
+            }
+        };
+        let dst = self.reg(cc, Kind::P);
+        self.emit(code, cc, Op::Deref { dst, src: ret_ref });
+        Ok(dst)
     }
 
     /// Whether pattern `top` binds anything by reference (`ref`, `ref mut`).
@@ -2659,7 +2772,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                     self.emit(code, cc, Op::Deref { dst, src });
                     dst
                 }
-                AdjustKind::Deref { overloaded: Some(_) } => return Err(unsupported("an overloaded `Deref` in a constant (a const trait)")),
+                AdjustKind::Deref { overloaded: Some(mutbl) } => self.overloaded_deref(cc, code, out, ty, next, mutbl)?,
                 AdjustKind::Borrow { .. } => {
                     let src = self.as_place(cc, code, out, ty)?;
                     let unsized_ = matches!(self.node(ty)?, PNode::Str | PNode::Slice(_));

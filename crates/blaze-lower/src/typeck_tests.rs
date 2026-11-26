@@ -2024,3 +2024,82 @@ mod pattern_types {
         assert_eq!(what(lower(t, PNode::Bool, "bool is true")), "a range pattern type over a type that is not an integer or `char`");
     }
 }
+
+/// `record_closure_param_regions` descends into `fn(...) -> ...` and `for<..> fn(...) -> ...`
+/// closure parameter annotations, skipping lifetimes bound by an inner `for<..>` binder while
+/// preserving `'static` and enclosing named lifetimes at their exact structural child-index paths.
+#[test]
+fn closure_param_regions_descend_into_fn_ptr_and_for_binders() {
+    use blaze_typeck::{ClosureParamRegion, PNode, WrittenRegion};
+
+    struct DummyTypes;
+    impl Types for DummyTypes {
+        fn ty(&mut self, _: &View<'_>, _: TypeId, tys: &mut PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Ok(tys.intern(PNode::Bool).expect("intern bool"))
+        }
+        fn repeat_len(&mut self, _: &View<'_>, _: ExprId) -> Result<u64, Refused> {
+            Ok(0)
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: crate::ConstIdx, _: &mut PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Err(crate::typeck::no_const_arg(view, c))
+        }
+    }
+
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let regions_of = |text: &str| {
+        let lowered = lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc).expect("lower");
+        let view = lowered.view();
+        let mut tys = PortableTys::new_in(alloc);
+        let body = to_typeck(&view, ItemKey(0), &mut tys, &mut DummyTypes, alloc).expect("to_typeck");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+        out
+    };
+
+    let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+    let root = ClosureParamRegion::ROOT;
+
+    // Elided fn pointer: no explicit free lifetimes.
+    assert_eq!(regions_of("fn f() { let _ = |edit: fn(&mut u8) -> &u8| {}; }"), []);
+
+    // Explicit `'a` input + `'static` output on a bare fn pointer.
+    assert_eq!(
+        regions_of("fn f<'a>() { let _ = |cb: fn(&'a u8) -> &'static u8| {}; }"),
+        [
+            (0, step(root, 0), 0, WrittenRegion::Named),
+            (0, step(root, 1), 0, WrittenRegion::Static),
+        ]
+    );
+
+    // Higher-ranked `for<'a> fn(&'a u8, &'b u8) -> &'a u8`: `'a` is bound by `for<'a>` and must
+    // NOT be recorded as an enclosing named lifetime; `'b` is free and IS recorded at child 1.
+    assert_eq!(
+        regions_of("fn f<'b>() { let _ = |cb: for<'a> fn(&'a u8, &'b u8) -> &'a u8| {}; }"),
+        [(0, step(root, 1), 0, WrittenRegion::Named)]
+    );
+
+    // Nested binders + sibling restoration:
+    // - param 0: `for<'a> fn(&'a u8, for<'b> fn(&'b u8, &'a u8, &'c u8))` -> only `'c` at [1, 2]
+    // - param 1: `(for<'a> fn(&'a u8), &'a u8)` -> `'a` bound in tuple[0], free in tuple[1]!
+    assert_eq!(
+        regions_of(
+            "fn f<'a, 'c>() { let _ = |p0: for<'a> fn(&'a u8, for<'b> fn(&'b u8, &'a u8, &'c u8)), p1: (for<'a> fn(&'a u8), &'a u8)| {}; }"
+        ),
+        [
+            (0, step(step(root, 1), 2), 0, WrittenRegion::Named),
+            (1, step(root, 1), 0, WrittenRegion::Named),
+        ]
+    );
+
+    // ADT lifetime args inside `for<'a> fn(Wrap<'a, 'b>)` and C-variadic `extern "C" fn(&'a u8, ...)`.
+    assert_eq!(
+        regions_of("fn f<'a, 'b>() { let _ = |p0: for<'a> fn(Wrap<'a, 'b>), p1: extern \"C\" fn(&'a u8, ...)| {}; }"),
+        [
+            (0, step(root, 0), 1, WrittenRegion::Named),
+            (1, step(root, 0), 0, WrittenRegion::Named),
+        ]
+    );
+}

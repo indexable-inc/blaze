@@ -86,8 +86,9 @@ use blaze_drive::key::{Key, Kind, Name, content_key};
 use blaze_id::ContentId;
 use blaze_own::{BTreeMap, BTreeSet, SharedAlloc, Vec};
 
-use crate::engine::{Answer, Cause, CellId, Entered, Gen, Phase, Planned, Row, SMap, SVec, Stage};
+use crate::engine::{Answer, Cause, CellId, Entered, Gen, Phase, Planned, Readers, Row, SMap, SVec, Stage};
 
+mod bep6;
 mod view;
 mod changes;
 mod headers;
@@ -97,11 +98,11 @@ pub use view::{StoredDefines, StoredNames, StoredReads, StoredRow, VerifiedPage}
 
 /// A page's form. A page of another form is never read: it is a [`PagesError::Magic`]. `BEP3`
 /// had no start table: each open walked every entry to find them. `BEP4` kept a cell's readers
-/// on its task's page, so every cell of a task many read (a std crate's names) shared one page
-/// of every reader of them all, and a body that gained or lost one read of one such cell put
-/// that whole page again (tempo, a refused body's read list moved: 7 pages, 68 MB hashed, the
-/// commit 108 ms against the phase path's 15). `BEP5` places it by [`readers_slot`].
-pub const PAGE_MAGIC: &[u8; 4] = b"BEP5";
+/// on its task's page. `BEP5` placed readers by [`readers_slot`] with uncompressed 33-byte names,
+/// 49-byte cell ids, and 155-byte fixed causes. `BEP6` adds per-page sorted unique dictionaries
+/// (`names`, `cells`, `ids`) and sparse `causes` encoding while remaining zero-alloc in-place.
+/// `BEP5` is refused cleanly by magic (Rule 3, Rule 26).
+pub const PAGE_MAGIC: &[u8; 4] = b"BEP6";
 
 /// The name whose page ([`page_of`]) holds `id`'s readers entry: a placement key, never a task's
 /// name. Its subject is the task's with its first eight bytes replaced by a mix of the task's
@@ -124,11 +125,11 @@ pub fn readers_slot(id: &CellId) -> Name {
     Name::new(id.of.kind, ContentId(subject))
 }
 /// The root's form. `BER3` stored a flat array of up to 65,536 page keys (2 MiB) plus all
-/// directory sections inline; `BER4` keeps small answers (`bits <= RADIX_FLAT_MAX_BITS`) inline
-/// and stores large answers (`bits > RADIX_FLAT_MAX_BITS`) as a 2-level 256-way radix tree with
-/// sharded file directory and immutable `places`/`summary` sub-records. A `BER3` root is a
-/// [`PagesError::Magic`], reported, and the answer made again (D160), never read as this one.
-pub const ROOT_MAGIC: &[u8; 4] = b"BER4";
+/// directory sections inline; `BER4` kept small answers inline and stored large answers as a
+/// 2-level 256-way radix tree over `BEP5` pages; `BER5` stores the same directory over `BEP6`
+/// dictionary-encoded pages. A `BER4` root is a [`PagesError::Magic`], reported at `open_root`
+/// and rebuilt cleanly (D160), never failing mid-engine on a `BEP5` page.
+pub const ROOT_MAGIC: &[u8; 4] = b"BER5";
 /// Leaf-shard form of a 2-level radix answer root: 256 page keys (8,192 bytes + 9-byte header).
 pub const RADIX_SHARD_MAGIC: &[u8; 4] = b"BEX1";
 /// File-directory shard form of a radix answer root (16 shards by subject's leading nibble).
@@ -183,7 +184,6 @@ const CAUSES: usize = 5;
 const RECORDS: usize = 6;
 const READERS: usize = 7;
 const SECTION_NAMES: [&str; SECTIONS] = ["rows", "cells", "owed cells", "owed tasks", "files", "causes", "records", "readers"];
-const HEAD: usize = 4 + 1 + 4 + 4 * SECTIONS;
 const ROW_FIXED: usize = NAME + ID + 1 + 2 + NAME + ID + ID + 8 + 4 + 1 + 4 + 4;
 const DEFINE: usize = CELL + ID;
 const READ: usize = CELL_ID + ID;
@@ -574,7 +574,15 @@ fn put_u32(out: &mut SVec<'_, u8>, value: usize) {
     out.extend_from_slice(&u32::try_from(value).expect("a page's counts fit u32 (a page holds about PAGE_BYTES)").to_le_bytes());
 }
 
+fn row_is_indexed(row: &Row<'_>) -> bool {
+    row.by_cell.iter().enumerate().any(|(i, &at)| i != usize::try_from(at).unwrap_or(usize::MAX))
+}
+
 fn put_row(out: &mut SVec<'_, u8>, name: Name, row: &Row<'_>) {
+    put_row_indexed(out, name, row, row_is_indexed(row));
+}
+
+fn put_row_indexed(out: &mut SVec<'_, u8>, name: Name, row: &Row<'_>, indexed: bool) {
     put_name(out, name);
     put_id(out, &row.key.0);
     put_phase(out, row.phase);
@@ -584,7 +592,6 @@ fn put_row(out: &mut SVec<'_, u8>, name: Name, row: &Row<'_>) {
     out.extend_from_slice(&row.serial.0.to_le_bytes());
     out.extend_from_slice(&row.findings.to_le_bytes());
     // Preserve observation order. Canonically sorted reads are their own index.
-    let indexed = row.by_cell.iter().enumerate().any(|(i, &at)| i != at as usize);
     out.push(u8::from(row.inline) * INLINE | u8::from(row.failed) * FAILED | u8::from(indexed) * INDEXED);
     put_u32(out, row.defines.len());
     put_u32(out, row.reads.len());
@@ -617,65 +624,79 @@ fn put_cause(out: &mut SVec<'_, u8>, name: Name, serial: Gen, cause: Cause) {
     put_id(out, &now);
 }
 
-/// A page being written: each section's bytes, and each entry's start in its section's bytes
-/// (an entry's count is its starts'). [`encode`] fills the sections in any order of pages;
-/// [`changes`]' merge fills one page's sections in order. Both finish by [`PageBuf::finish`].
-struct PageBuf<'a> {
-    parts: [SVec<'a, u8>; SECTIONS],
-    starts: [SVec<'a, usize>; SECTIONS],
+#[derive(Clone, Copy)]
+enum BufEntry<'p> {
+    Flat { start: usize, end: usize },
+    Dict { dicts: view::PageDicts<'p>, bytes: &'p [u8] },
 }
 
-impl<'a> PageBuf<'a> {
-    fn new_in(alloc: SharedAlloc<'a>) -> PageBuf<'a> {
-        PageBuf { parts: core::array::from_fn(|_| Vec::new_in(alloc)), starts: core::array::from_fn(|_| Vec::new_in(alloc)) }
+/// A page being written during re-paging: flat newly written entries in `parts`, plus zero-copy
+/// references to surviving `BEP6` entries from old pages in `entries`. Finished via
+/// [`PageBuf::finish_in`] into canonical `BEP6` bytes.
+struct PageBuf<'p, 'a> {
+    parts: [SVec<'a, u8>; SECTIONS],
+    entries: [SVec<'a, BufEntry<'p>>; SECTIONS],
+}
+
+impl<'p, 'a> PageBuf<'p, 'a> {
+    fn new_in(alloc: SharedAlloc<'a>) -> PageBuf<'p, 'a> {
+        PageBuf {
+            parts: core::array::from_fn(|_| Vec::new_in(alloc)),
+            entries: core::array::from_fn(|_| Vec::new_in(alloc)),
+        }
     }
 
-    /// The bytes of a new entry of `section`, appended by the caller.
-    fn entry(&mut self, section: usize) -> &mut SVec<'a, u8> {
-        self.starts[section].push(self.parts[section].len());
-        &mut self.parts[section]
+    /// Append a newly serialized flat entry into `section`.
+    fn push_flat(&mut self, section: usize, write: impl FnOnce(&mut SVec<'a, u8>)) {
+        let start = self.parts[section].len();
+        write(&mut self.parts[section]);
+        let end = self.parts[section].len();
+        self.entries[section].push(BufEntry::Flat { start, end });
     }
 
-    fn entries(&self) -> usize {
-        self.starts.iter().map(|starts| starts.len()).sum()
+    /// Forward a surviving `BEP6` entry from an old page without copying its bytes.
+    fn push_dict(&mut self, section: usize, page: &'p VerifiedPage<'p>, bytes: &'p [u8]) {
+        self.entries[section].push(BufEntry::Dict { dicts: page.dicts(), bytes });
     }
 
-    /// The page in its form: its head, its start table, its sections. `None` when it holds
-    /// nothing (a root names no page there).
-    fn finish(&self, bits: u8, index: u32, alloc: SharedAlloc<'a>) -> Option<SVec<'a, u8>> {
-        let entries = self.entries();
-        if entries == 0 {
+    fn entries_count(&self) -> usize {
+        self.entries.iter().map(Vec::len).sum()
+    }
+
+    /// The page in its `BEP6` form: its head, start table, sorted dictionaries, and sections.
+    /// `None` when it holds nothing (a root names no page there).
+    fn finish_in<'out, A: core::alloc::Allocator + Copy>(
+        &self,
+        bits: u8,
+        index: u32,
+        alloc: SharedAlloc<'out>,
+        scratch: A,
+    ) -> Option<(SVec<'out, u8>, SVec<'out, (Name, Key)>)> {
+        if self.entries_count() == 0 {
             return None;
         }
-        let body_at = starts_end(entries);
-        let len = body_at + self.parts.iter().map(|part| part.len()).sum::<usize>();
-        let mut page: SVec<'a, u8> = Vec::with_capacity_in(len, alloc);
-        page.extend_from_slice(PAGE_MAGIC);
-        page.push(bits);
-        page.extend_from_slice(&index.to_le_bytes());
-        for starts in self.starts.iter() {
-            put_u32(&mut page, starts.len());
-        }
-        let mut at = body_at;
-        for (part, starts) in self.parts.iter().zip(self.starts.iter()) {
-            for start in starts.iter() {
-                put_u32(&mut page, at + start);
+        let mut sources: [Vec<bep6::EntrySource<'_>, A>; SECTIONS] =
+            core::array::from_fn(|s| Vec::with_capacity_in(self.entries[s].len(), scratch));
+        for s in 0..SECTIONS {
+            let part = self.parts[s].as_slice();
+            for &entry in self.entries[s].iter() {
+                match entry {
+                    BufEntry::Flat { start, end } => {
+                        if let Some(slice) = part.get(start..end) {
+                            sources[s].push(bep6::EntrySource::Flat(slice));
+                        }
+                    }
+                    BufEntry::Dict { dicts, bytes } => {
+                        sources[s].push(bep6::EntrySource::Dict { dicts, bytes });
+                    }
+                }
             }
-            at += part.len();
         }
-        put_u32(&mut page, len);
-        for part in self.parts.iter() {
-            page.extend_from_slice(part);
-        }
-        debug_assert_eq!(page.len(), len, "a page's start table ends at its length");
-        Some(page)
+        let slices: [&[bep6::EntrySource<'_>]; SECTIONS] =
+            core::array::from_fn(|s| sources[s].as_slice());
+        let (page, records) = bep6::encode_page_from_sources(bits, index, slices, alloc, scratch);
+        if page.is_empty() { None } else { Some((page, records)) }
     }
-}
-
-/// Where a page of `entries` entries in all has its first section: after its head and its
-/// start table of `entries + 1` words.
-fn starts_end(entries: usize) -> usize {
-    HEAD + 4 * (entries + 1)
 }
 
 /// A bug the simulations plant to show their oracles catch it. Always `None` outside the tests.
@@ -689,6 +710,310 @@ pub enum PagesPlant {
     PagesNotPinned,
 }
 
+/// One non-empty page of a whole-answer encode ([`encode_par`]), holding only borrowed slices into
+/// its eight already-sorted sections so serialization, per-file plan digests, and page BLAKE3
+/// hashing run independently across worker threads with zero intermediate `PageBuf` copies.
+pub struct WholePageJob<'k, 'm> {
+    index: u32,
+    bits: u8,
+    last_flat_key: Option<Key>,
+    all_rows: &'k SMap<'m, Name, Row<'m>>,
+    all_owed_tasks: &'k SMap<'m, Name, Planned>,
+    rows: &'k [(&'k Name, &'k Row<'m>)],
+    cells: &'k [(&'k CellId, &'k (ContentId, Gen))],
+    owed_cells: &'k [(&'k CellId, &'k Gen)],
+    owed_tasks: &'k [(&'k Name, &'k Planned)],
+    files: &'k [(&'k Name, &'k SVec<'m, Name>)],
+    causes: &'k [(&'k Name, &'k (Gen, Cause))],
+    records: &'k [(&'k Name, &'k Key)],
+    readers: &'k [(&'k CellId, &'k [Name])],
+}
+
+/// The serialized and content-hashed result of one [`WholePageJob`].
+pub struct WholePageBuilt<'a> {
+    index: u32,
+    byte_len: u64,
+    key: Key,
+    bytes: SVec<'a, u8>,
+    records: SVec<'a, (Name, Key)>,
+    files: SVec<'a, (Name, Option<ContentId>)>,
+    changed: bool,
+}
+
+impl WholePageJob<'_, '_> {
+    /// Directly serialize all eight sections of this page into one exact-sized `BEP6` buffer,
+    /// compute per-file plan digests for any `FILES` entries on this page, and BLAKE3-hash the
+    /// finished page.
+    pub fn run<'a>(&self, alloc: SharedAlloc<'a>) -> WholePageBuilt<'a> {
+        self.run_in(alloc, alloc)
+    }
+
+    /// [`WholePageJob::run`] with a separate reusable `scratch` allocator (such as a per-worker
+    /// bump `Frame` reset between pages) so temporary dictionary tables never contend on the
+    /// shared output allocator.
+    pub fn run_in<'a, A: core::alloc::Allocator + Copy>(&self, alloc: SharedAlloc<'a>, scratch: A) -> WholePageBuilt<'a> {
+        let counts = [
+            self.rows.len(),
+            self.cells.len(),
+            self.owed_cells.len(),
+            self.owed_tasks.len(),
+            self.files.len(),
+            self.causes.len(),
+            self.records.len(),
+            self.readers.len(),
+        ];
+        let entries: usize = counts.iter().sum();
+        let mut dicts = bep6::DictBuilder::new_in(scratch);
+        let mut row_indexed: Vec<bool, A> = Vec::with_capacity_in(self.rows.len(), scratch);
+        let mut lengths: Vec<usize, A> = Vec::with_capacity_in(entries, scratch);
+        let mut body_len = 0usize;
+
+        for &(&name, row) in self.rows {
+            let indexed = row_is_indexed(row);
+            row_indexed.push(indexed);
+            let len = bep6::collect_row_v6(name, row, indexed, &mut dicts);
+            lengths.push(len);
+            body_len = body_len.saturating_add(len);
+        }
+        for &(id, &(digest, _)) in self.cells {
+            dicts.add_cell(*id);
+            dicts.add_id(digest);
+            lengths.push(bep6::CELL_ENTRY_V6);
+            body_len = body_len.saturating_add(bep6::CELL_ENTRY_V6);
+        }
+        for &(id, _) in self.owed_cells {
+            dicts.add_cell(*id);
+            lengths.push(bep6::OWED_CELL_V6);
+            body_len = body_len.saturating_add(bep6::OWED_CELL_V6);
+        }
+        for &(&name, planned) in self.owed_tasks {
+            dicts.add_name(name);
+            dicts.add_id(planned.source);
+            dicts.add_name(planned.file);
+            lengths.push(bep6::OWED_TASK_V6);
+            body_len = body_len.saturating_add(bep6::OWED_TASK_V6);
+        }
+        let total_file_members: usize = self.files.iter().map(|&(_, names)| names.len()).sum();
+        let mut file_claims: Vec<Option<changes::Claim>, A> = Vec::with_capacity_in(total_file_members, scratch);
+        let mut file_digests: SVec<'a, (Name, Option<ContentId>)> = Vec::with_capacity_in(self.files.len(), alloc);
+        let mut file_buf: Vec<u8, A> = Vec::new_in(scratch);
+        for &(&file, names) in self.files {
+            dicts.add_name(file);
+            file_buf.clear();
+            file_buf.push(bep6::kind_u8(file.kind));
+            file_buf.extend_from_slice(&file.subject.0);
+            file_buf.extend_from_slice(&u32::try_from(names.len()).unwrap_or(u32::MAX).to_le_bytes());
+            let mut standing = true;
+            for &name in names.iter() {
+                dicts.add_name(name);
+                let claim = self
+                    .all_rows
+                    .get(&name)
+                    .and_then(|row| changes::claim(row, file, self.all_owed_tasks.contains_key(&name)));
+                standing &= claim.is_some();
+                file_claims.push(claim);
+                file_buf.push(bep6::kind_u8(name.kind));
+                file_buf.extend_from_slice(&name.subject.0);
+                match claim {
+                    Some(c) => {
+                        dicts.add_id(c.key.0);
+                        dicts.add_id(c.source);
+                        file_buf.push(1);
+                        file_buf.extend_from_slice(&c.key.0.0);
+                        file_buf.push(c.phase.stage as u8);
+                        file_buf.extend_from_slice(&c.phase.wave.to_le_bytes());
+                        file_buf.extend_from_slice(&c.source.0);
+                    }
+                    None => {
+                        file_buf.push(0);
+                        file_buf.extend_from_slice(&[0u8; ID + 3 + ID]);
+                    }
+                }
+            }
+            file_digests.push((file, standing.then(|| changes::file_digest(&file_buf))));
+            let len = bep6::IDX + 4 + bep6::FILE_MEMBER_V6 * names.len();
+            lengths.push(len);
+            body_len = body_len.saturating_add(len);
+        }
+        for &(&name, &(_, cause)) in self.causes {
+            let len = bep6::collect_cause_v6(name, cause, &mut dicts);
+            lengths.push(len);
+            body_len = body_len.saturating_add(len);
+        }
+        for &(&name, &rec_key) in self.records {
+            dicts.add_name(name);
+            dicts.add_id(rec_key.0);
+            lengths.push(bep6::RECORD_V6);
+            body_len = body_len.saturating_add(bep6::RECORD_V6);
+        }
+        for &(id, names) in self.readers {
+            dicts.add_cell(*id);
+            for &name in names.iter() {
+                dicts.add_name(name);
+            }
+            let len = bep6::IDX + 4 + bep6::IDX * names.len();
+            lengths.push(len);
+            body_len = body_len.saturating_add(len);
+        }
+
+        dicts.finalize();
+        let body_at = bep6::body_start_v6(entries, dicts.names_len(), dicts.cells_len(), dicts.ids_len()).unwrap_or(0);
+        let total_len = body_at.saturating_add(body_len);
+        let mut page: SVec<'a, u8> = Vec::with_capacity_in(total_len, alloc);
+        bep6::write_header_v6(&mut page, self.bits, self.index, &dicts, counts);
+
+        let mut at = body_at;
+        for &len in lengths.iter() {
+            put_u32(&mut page, at);
+            at = at.saturating_add(len);
+        }
+        put_u32(&mut page, total_len);
+        debug_assert_eq!(at, total_len, "a page's start table reaches its total length");
+
+        dicts.write_dicts(&mut page);
+
+        for (&(&name, row), &indexed) in self.rows.iter().zip(row_indexed.iter()) {
+            bep6::write_row_v6(&mut page, name, row, indexed, &dicts);
+        }
+        for &(id, &(digest, moved)) in self.cells {
+            bep6::put_idx(&mut page, dicts.cell_idx(id));
+            bep6::put_idx(&mut page, dicts.id_idx(&digest));
+            page.extend_from_slice(&moved.0.to_le_bytes());
+        }
+        for &(id, &moved) in self.owed_cells {
+            bep6::put_idx(&mut page, dicts.cell_idx(id));
+            page.extend_from_slice(&moved.0.to_le_bytes());
+        }
+        for &(&name, planned) in self.owed_tasks {
+            bep6::put_idx(&mut page, dicts.name_idx(name));
+            put_phase(&mut page, planned.phase);
+            bep6::put_idx(&mut page, dicts.id_idx(&planned.source));
+            bep6::put_idx(&mut page, dicts.name_idx(planned.file));
+        }
+        let mut claim_cursor = 0usize;
+        for &(&file, names) in self.files {
+            bep6::put_idx(&mut page, dicts.name_idx(file));
+            put_u32(&mut page, names.len());
+            for &name in names.iter() {
+                bep6::put_idx(&mut page, dicts.name_idx(name));
+                let claim = file_claims.get(claim_cursor).copied().flatten();
+                claim_cursor = claim_cursor.saturating_add(1);
+                match claim {
+                    Some(c) => {
+                        page.push(1);
+                        bep6::put_idx(&mut page, dicts.id_idx(&c.key.0));
+                        put_phase(&mut page, c.phase);
+                        bep6::put_idx(&mut page, dicts.id_idx(&c.source));
+                    }
+                    None => {
+                        page.push(0);
+                        page.extend_from_slice(&[0u8; bep6::IDX + 3 + bep6::IDX]);
+                    }
+                }
+            }
+        }
+        for &(&name, &(serial, cause)) in self.causes {
+            bep6::write_cause_v6(&mut page, name, serial, cause, &dicts);
+        }
+        for &(&name, &rec_key) in self.records {
+            bep6::put_idx(&mut page, dicts.name_idx(name));
+            bep6::put_idx(&mut page, dicts.id_idx(&rec_key.0));
+        }
+        for &(id, names) in self.readers {
+            bep6::put_idx(&mut page, dicts.cell_idx(id));
+            put_u32(&mut page, names.len());
+            for &name in names.iter() {
+                bep6::put_idx(&mut page, dicts.name_idx(name));
+            }
+        }
+        debug_assert_eq!(page.len(), total_len, "a BEP6 page's start table ends at its length");
+
+        let key = content_key(&page);
+        let byte_len = u64::try_from(page.len()).unwrap_or(u64::MAX);
+        let changed = self.last_flat_key != Some(key);
+        let (bytes, records) = if changed {
+            let mut recs: SVec<'a, (Name, Key)> = Vec::with_capacity_in(self.records.len(), alloc);
+            for &(&name, &rec_key) in self.records {
+                recs.push((name, rec_key));
+            }
+            (page, recs)
+        } else {
+            (Vec::new_in(alloc), Vec::new_in(alloc))
+        };
+        WholePageBuilt { index: self.index, byte_len, key, bytes, records, files: file_digests, changed }
+    }
+}
+
+/// Stable CSR partition of an already-sorted stream into `count` page buckets, preserving exact
+/// ascending key order within every page while allocating only two flat buffers (zero for empty
+/// sections).
+struct Partitioned<'a, T> {
+    items: SVec<'a, T>,
+    offsets: SVec<'a, usize>,
+}
+
+impl<'a, T> Partitioned<'a, T> {
+    fn empty(alloc: SharedAlloc<'a>) -> Self {
+        Self { items: Vec::new_in(alloc), offsets: Vec::new_in(alloc) }
+    }
+
+    fn slice(&self, page: usize) -> &[T] {
+        let start = self.offsets.get(page).copied().unwrap_or(0);
+        let end = self.offsets.get(page + 1).copied().unwrap_or(start);
+        self.items.get(start..end).unwrap_or(&[])
+    }
+}
+
+fn partition_by_page<'a, T: Copy>(
+    count: usize,
+    iter: impl Iterator<Item = (u32, T)>,
+    alloc: SharedAlloc<'a>,
+) -> Partitioned<'a, T> {
+    let mut iter = iter.peekable();
+    if iter.peek().is_none() {
+        return Partitioned::empty(alloc);
+    }
+    let (lower, _) = iter.size_hint();
+    let mut tagged: SVec<'a, (u32, T)> = Vec::with_capacity_in(lower, alloc);
+    let mut counts: SVec<'a, usize> = Vec::from_elem_in(0usize, count + 1, alloc);
+    for (page, item) in iter {
+        let p = usize::try_from(page).unwrap_or(0);
+        if let Some(slot) = counts.get_mut(p + 1) {
+            *slot += 1;
+        }
+        tagged.push((page, item));
+    }
+    let mut sum = 0usize;
+    for slot in counts.iter_mut() {
+        sum += *slot;
+        *slot = sum;
+    }
+    let Some(&(_, first_item)) = tagged.first() else {
+        return Partitioned::empty(alloc);
+    };
+    let mut cursors: SVec<'a, usize> = Vec::from_slice_in(counts.get(..count).unwrap_or(&[]), alloc);
+    let mut items: SVec<'a, T> = Vec::from_elem_in(first_item, tagged.len(), alloc);
+    for (page, item) in tagged {
+        let p = usize::try_from(page).unwrap_or(0);
+        if let Some(cursor) = cursors.get_mut(p) {
+            let at = *cursor;
+            *cursor = at + 1;
+            if let Some(dst) = items.get_mut(at) {
+                *dst = item;
+            }
+        }
+    }
+    Partitioned { items, offsets: counts }
+}
+
+fn run_whole_serial<'a>(jobs: &[WholePageJob<'_, '_>], alloc: SharedAlloc<'a>) -> SVec<'a, WholePageBuilt<'a>> {
+    let mut out = Vec::with_capacity_in(jobs.len(), alloc);
+    for job in jobs {
+        out.push(job.run(alloc));
+    }
+    out
+}
+
 /// `kept` as pages of about [`PAGE_BYTES`](blaze_drive::answers::PAGE_BYTES), paged as the last
 /// root was while its bits still fit (answers.rs `bits_kept`); `last` is that root, whose pages
 /// are not put again.
@@ -696,174 +1021,216 @@ pub fn encode<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, alloc: SharedAlloc<'
     encode_planted(kept, last, PagesPlant::None, alloc)
 }
 
+/// [`encode`] with a caller-supplied executor for independent [`WholePageJob`]s so a
+/// multi-threaded driver can serialize, compute per-file plan digests, and BLAKE3-hash every
+/// non-empty page in parallel while producing output byte-for-byte identical to serial [`encode`]
+/// (Rule 25).
+pub fn encode_par<'a, F>(kept: &Kept<'_>, last: Option<&Root<'_>>, alloc: SharedAlloc<'a>, run_pages: F) -> Encoded<'a>
+where
+    F: FnOnce(&[WholePageJob<'_, '_>]) -> SVec<'a, WholePageBuilt<'a>>,
+{
+    encode_inner(kept, last, None, PagesPlant::None, alloc, run_pages)
+}
+
 /// `kept` encoded at an explicit `bits` count (clamped to `MOST_BITS`), primarily for testing
 /// large-paging radix trees (`bits = 10..=16`) without allocating gigabytes of synthetic rows.
 pub fn encode_at_bits<'a>(kept: &Kept<'_>, bits: u8, alloc: SharedAlloc<'a>) -> Encoded<'a> {
-    encode_inner(kept, None, Some(bits.min(blaze_drive::answers::MOST_BITS)), PagesPlant::None, alloc)
+    encode_inner(kept, None, Some(bits.min(blaze_drive::answers::MOST_BITS)), PagesPlant::None, alloc, |jobs| run_whole_serial(jobs, alloc))
 }
 
 /// [`encode`] with a planted bug ([`PagesPlant`]).
 pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: PagesPlant, alloc: SharedAlloc<'a>) -> Encoded<'a> {
-    encode_inner(kept, last, None, plant, alloc)
+    encode_inner(kept, last, None, plant, alloc, |jobs| run_whole_serial(jobs, alloc))
 }
 
-fn encode_inner<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, forced_bits: Option<u8>, plant: PagesPlant, alloc: SharedAlloc<'a>) -> Encoded<'a> {
+fn encode_inner<'a, F>(
+    kept: &Kept<'_>,
+    last: Option<&Root<'_>>,
+    forced_bits: Option<u8>,
+    plant: PagesPlant,
+    alloc: SharedAlloc<'a>,
+    run_pages: F,
+) -> Encoded<'a>
+where
+    F: FnOnce(&[WholePageJob<'_, '_>]) -> SVec<'a, WholePageBuilt<'a>>,
+{
     let answer = &kept.answer;
     let files_kept = plant != PagesPlant::FilesDropped;
     let has_row = |name: &Name| answer.rows.contains_key(name);
     let bits = match forced_bits {
         Some(bits) => bits,
         None => {
-            // The bytes in all, which size the paging.
+            // The estimated BEP6 bytes in all, which size the paging.
             let mut total = 0u64;
             for row in answer.rows.values() {
-                total += (ROW_FIXED + DEFINE * row.defines.len() + READ * row.reads.len()) as u64;
+                total = total.saturating_add(bep6::estimate_row_v6(row.defines.len(), row.reads.len()));
             }
-            total += (CELL_ENTRY * answer.cells.len() + OWED_CELL * answer.owed_cells.len() + OWED_TASK * answer.owed_tasks.len()) as u64;
+            let fixed = (bep6::CELL_ENTRY_V6 + bep6::DICT_CELL) * answer.cells.len()
+                + (bep6::OWED_CELL_V6 + bep6::DICT_CELL) * answer.owed_cells.len()
+                + (bep6::OWED_TASK_V6 + NAME) * answer.owed_tasks.len();
+            total = total.saturating_add(u64::try_from(fixed).unwrap_or(u64::MAX));
             for names in answer.by_file.values().filter(|_| files_kept) {
-                total += (NAME + 4 + FILE_MEMBER * names.len()) as u64;
+                let f = NAME + 4 + bep6::FILE_MEMBER_V6 * names.len();
+                total = total.saturating_add(u64::try_from(f).unwrap_or(u64::MAX));
             }
             for names in answer.readers.values() {
-                total += (CELL_ID + 4 + NAME * names.len()) as u64;
+                let r = bep6::IDX + 4 + bep6::IDX * names.len();
+                total = total.saturating_add(u64::try_from(r).unwrap_or(u64::MAX));
             }
-            total += (CAUSE * kept.causes.keys().filter(|name| has_row(*name)).count()) as u64;
-            total += ((NAME + ID) * kept.records.keys().filter(|name| has_row(*name)).count()) as u64;
+            let cause_bytes: usize = kept
+                .causes
+                .iter()
+                .filter(|(name, _)| has_row(name))
+                .map(|(_, &(_, cause))| bep6::cause_len_v6(cause))
+                .sum();
+            let rec_bytes = (bep6::RECORD_V6 + ID) * kept.records.keys().filter(|name| has_row(*name)).count();
+            total = total.saturating_add(u64::try_from(cause_bytes.saturating_add(rec_bytes)).unwrap_or(u64::MAX));
             bits_kept(total, last.map(|root| root.bits))
         }
     };
     let count = 1usize << bits;
-    let mut bufs: SVec<'a, PageBuf<'a>> = Vec::with_capacity_in(count, alloc);
-    for _ in 0..count {
-        bufs.push(PageBuf::new_in(alloc));
-    }
-    fn at<'b, 'a>(bufs: &'b mut [PageBuf<'a>], bits: u8, name: Name, section: usize) -> &'b mut SVec<'a, u8> {
-        bufs[page_of(name, bits) as usize].entry(section)
-    }
-    for (name, row) in answer.rows.iter() {
-        let out = at(&mut bufs, bits, *name, ROWS);
-        put_row(out, *name, row);
-    }
-    for (id, (digest, moved)) in answer.cells.iter() {
-        let out = at(&mut bufs, bits, id.of, CELLS);
-        put_cell_id(out, id);
-        put_id(out, digest);
-        out.extend_from_slice(&moved.0.to_le_bytes());
-    }
-    for (id, moved) in answer.owed_cells.iter() {
-        let out = at(&mut bufs, bits, id.of, OWED_CELLS);
-        put_cell_id(out, id);
-        out.extend_from_slice(&moved.0.to_le_bytes());
-    }
-    for (name, planned) in answer.owed_tasks.iter() {
-        let out = at(&mut bufs, bits, *name, OWED_TASKS);
-        put_name(out, *name);
-        put_phase(out, planned.phase);
-        put_id(out, &planned.source);
-        put_name(out, planned.file);
-    }
-    let mut directory = changes::directory(kept, alloc);
-    for (file, names) in answer.by_file.iter().filter(|_| files_kept) {
-        let out = at(&mut bufs, bits, *file, FILES);
-        let start = out.len();
-        put_name(out, *file);
-        put_u32(out, names.len());
-        let mut standing = true;
-        for name in names.iter() {
-            let claim = answer.rows.get(name).and_then(|row| changes::claim(row, *file, answer.owed_tasks.contains_key(name)));
-            standing &= claim.is_some();
-            changes::put_member(out, *name, claim);
-        }
-        directory.files.insert(*file, standing.then(|| changes::file_digest(&out[start..])));
-    }
-    // Each planned file's place beside its digest; a place of no file the root plans is not kept.
-    directory.places.extend(kept.places.iter().filter(|(file, _)| directory.files.contains_key(*file)).map(|(&file, &place)| (file, place)));
-    for (name, (serial, cause)) in kept.causes.iter() {
-        if !has_row(name) {
-            continue;
-        }
-        let out = at(&mut bufs, bits, *name, CAUSES);
-        put_cause(out, *name, *serial, *cause);
-    }
-    for (name, key) in kept.records.iter() {
-        if !has_row(name) {
-            continue;
-        }
-        let out = at(&mut bufs, bits, *name, RECORDS);
-        put_name(out, *name);
-        put_id(out, &key.0);
-    }
-    for (id, names) in &answer.readers {
-        let out = at(&mut bufs, bits, readers_slot(id), READERS);
-        put_cell_id(out, id);
-        put_u32(out, names.len());
-        for &name in names { put_name(out, name); }
-    }
-    // Each page whole, keyed by its bytes; put when the last root did not name it.
+    let rows_part = partition_by_page(count, answer.rows.iter().map(|(name, row)| (page_of(*name, bits), (name, row))), alloc);
+    let cells_part = partition_by_page(count, answer.cells.iter().map(|(id, val)| (page_of(id.of, bits), (id, val))), alloc);
+    let owed_cells_part = partition_by_page(count, answer.owed_cells.iter().map(|(id, moved)| (page_of(id.of, bits), (id, moved))), alloc);
+    let owed_tasks_part = partition_by_page(count, answer.owed_tasks.iter().map(|(name, planned)| (page_of(*name, bits), (name, planned))), alloc);
+    let files_part = if files_kept {
+        partition_by_page(count, answer.by_file.iter().map(|(file, names)| (page_of(*file, bits), (file, names))), alloc)
+    } else {
+        Partitioned::empty(alloc)
+    };
+    let causes_part = partition_by_page(
+        count,
+        kept.causes.iter().filter(|(name, _)| has_row(name)).map(|(name, cause)| (page_of(*name, bits), (name, cause))),
+        alloc,
+    );
+    let records_part = partition_by_page(
+        count,
+        kept.records.iter().filter(|(name, _)| has_row(name)).map(|(name, key)| (page_of(*name, bits), (name, key))),
+        alloc,
+    );
+    let readers_part = partition_by_page(
+        count,
+        answer.readers.iter().map(|(id, names)| (page_of(readers_slot(id), bits), (id, names))),
+        alloc,
+    );
+
     let same_paging = last.filter(|root| root.bits == bits);
-    let mut pages: SVec<'a, Key> = Vec::with_capacity_in(count, alloc);
+    let radix_same_paging = bits > RADIX_FLAT_MAX_BITS && same_paging.is_some();
+    let mut jobs: SVec<'_, WholePageJob<'_, '_>> = Vec::new_in(alloc);
+    for index in 0..count {
+        let rows = rows_part.slice(index);
+        let cells = cells_part.slice(index);
+        let owed_cells = owed_cells_part.slice(index);
+        let owed_tasks = owed_tasks_part.slice(index);
+        let files = files_part.slice(index);
+        let causes = causes_part.slice(index);
+        let records = records_part.slice(index);
+        let readers = readers_part.slice(index);
+        if rows.is_empty()
+            && cells.is_empty()
+            && owed_cells.is_empty()
+            && owed_tasks.is_empty()
+            && files.is_empty()
+            && causes.is_empty()
+            && records.is_empty()
+            && readers.is_empty()
+        {
+            continue;
+        }
+        let last_flat_key = if radix_same_paging {
+            None
+        } else {
+            same_paging.and_then(|root| root.pages.get(index).copied())
+        };
+        jobs.push(WholePageJob {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            bits,
+            last_flat_key,
+            all_rows: &answer.rows,
+            all_owed_tasks: &answer.owed_tasks,
+            rows,
+            cells,
+            owed_cells,
+            owed_tasks,
+            files,
+            causes,
+            records,
+            readers,
+        });
+    }
+
+    let mut built = run_pages(&jobs);
+    drop(jobs);
+    drop(rows_part);
+    drop(cells_part);
+    drop(owed_cells_part);
+    drop(owed_tasks_part);
+    drop(files_part);
+    drop(causes_part);
+    drop(records_part);
+    drop(readers_part);
+
+    // Guarantee deterministic ascending page-index order regardless of worker completion order (Rule 25).
+    if !built.windows(2).all(|pair| pair.first().map(|a| a.index) < pair.get(1).map(|b| b.index)) {
+        built.sort_unstable_by_key(|one| one.index);
+    }
+
+    let mut directory = changes::directory(kept, alloc);
+    let mut pages: SVec<'a, Key> = Vec::from_elem_in(Key::default(), count, alloc);
     let mut puts: SVec<'a, (Key, SVec<'a, u8>)> = Vec::new_in(alloc);
     let mut records = Vec::new_in(alloc);
     let mut bytes = 0u64;
     let mut live_pages = 0u32;
-    if bits > RADIX_FLAT_MAX_BITS && same_paging.is_some() {
-        // Radix whole encode against a same-bits root: build one 256-page shard at a time and
-        // skip emitting page puts/records for any shard whose combined shard key matches `last`.
-        let mut shard_keys: [Key; RADIX_LEAF_PAGES] = [Key::default(); RADIX_LEAF_PAGES];
-        let mut shard_built: SVec<'a, (Key, SVec<'a, u8>, SVec<'a, u8>)> = Vec::with_capacity_in(RADIX_LEAF_PAGES, alloc);
-        let mut bufs_iter = bufs.into_iter();
-        let shard_count = 1usize << (bits - RADIX_LEAF_BITS);
-        for shard_idx in 0..shard_count {
-            shard_keys.fill(Key::default());
-            shard_built.clear();
-            for offset in 0..RADIX_LEAF_PAGES {
-                let index = shard_idx * RADIX_LEAF_PAGES + offset;
-                let index32 = u32::try_from(index).unwrap_or(u32::MAX);
-                let Some(mut buf) = bufs_iter.next() else { break };
-                let Some(page) = buf.finish(bits, index32, alloc) else {
-                    pages.push(Key::default());
-                    continue;
-                };
-                bytes += u64::try_from(page.len()).unwrap_or(u64::MAX);
-                live_pages = live_pages.saturating_add(1);
-                let key = content_key(&page);
-                pages.push(key);
-                if let Some(slot) = shard_keys.get_mut(offset) {
-                    *slot = key;
-                }
-                let rec_part = match buf.parts.get_mut(RECORDS) {
-                    Some(part) => core::mem::replace(part, Vec::new_in(alloc)),
-                    None => Vec::new_in(alloc),
-                };
-                shard_built.push((key, page, rec_part));
+
+    if radix_same_paging {
+        for one in built.iter_mut() {
+            let idx = usize::try_from(one.index).unwrap_or(0);
+            if let Some(slot) = pages.get_mut(idx) {
+                *slot = one.key;
             }
+            bytes += one.byte_len;
+            live_pages = live_pages.saturating_add(1);
+            for (file, digest) in one.files.drain(..) {
+                directory.files.insert(file, digest);
+            }
+        }
+        let shard_count = 1usize << (bits - RADIX_LEAF_BITS);
+        let mut shard_unchanged: SVec<'a, bool> = Vec::with_capacity_in(shard_count, alloc);
+        for shard_idx in 0..shard_count {
+            let from = shard_idx * RADIX_LEAF_PAGES;
+            let to = from + RADIX_LEAF_PAGES;
             let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
-            let unchanged = changes::encode_radix_shard(bits, shard_u32, &shard_keys, alloc)
+            let slice = pages.get(from..to).unwrap_or(&[]);
+            let unchanged = changes::encode_radix_shard(bits, shard_u32, slice, alloc)
                 .is_some_and(|(shard_key, _)| same_paging.is_some_and(|r| r.page_shards.get(shard_idx) == Some(&shard_key)));
-            if !unchanged {
-                for (key, page, rec_part) in shard_built.drain(..) {
-                    records.push((key, view::page_records(&rec_part, alloc)));
-                    puts.push((key, page));
-                }
+            shard_unchanged.push(unchanged);
+        }
+        for one in built {
+            let (shard_idx, _) = Root::shard_of(usize::try_from(one.index).unwrap_or(0));
+            if !shard_unchanged.get(shard_idx).copied().unwrap_or(false) {
+                records.push((one.key, one.records));
+                puts.push((one.key, one.bytes));
             }
         }
     } else {
-        for (index, buf) in bufs.into_iter().enumerate() {
-            let index32 = u32::try_from(index).unwrap_or(u32::MAX);
-            let Some(page) = buf.finish(bits, index32, alloc) else {
-                pages.push(Key::default());
-                continue;
-            };
-            bytes += u64::try_from(page.len()).unwrap_or(u64::MAX);
+        for one in built {
+            let idx = usize::try_from(one.index).unwrap_or(0);
+            if let Some(slot) = pages.get_mut(idx) {
+                *slot = one.key;
+            }
+            bytes += one.byte_len;
             live_pages = live_pages.saturating_add(1);
-            let key = content_key(&page);
-            pages.push(key);
-            if same_paging.is_none_or(|root| root.pages.get(index) != Some(&key)) {
-                let rec_bytes = buf.parts.get(RECORDS).map_or(&[][..], Vec::as_slice);
-                records.push((key, view::page_records(rec_bytes, alloc)));
-                puts.push((key, page));
+            for (file, digest) in one.files {
+                directory.files.insert(file, digest);
+            }
+            if one.changed {
+                records.push((one.key, one.records));
+                puts.push((one.key, one.bytes));
             }
         }
     }
+    // Each planned file's place beside its digest; a place of no file the root plans is not kept.
+    directory.places.extend(kept.places.iter().filter(|(file, _)| directory.files.contains_key(*file)).map(|(&file, &place)| (file, place)));
     directory.serial = answer.serial;
     directory.bits = bits;
     directory.bytes = bytes;
@@ -1071,13 +1438,14 @@ pub fn decode_at<'a, 'g>(root: &Root<'_>, mut get: impl FnMut(Key) -> Got<'g>, a
     let mut kept = Kept::new_in(alloc);
     kept.answer.serial = root.serial;
     kept.places.extend(root.places.iter().map(|(&file, &place)| (file, place)));
+    let mut reader_pairs: SVec<'a, (CellId, Name)> = Vec::new_in(alloc);
     if !root.is_radix() {
         for (index, &key) in root.pages.iter().enumerate() {
             if key == Key::default() { continue; }
             let index = u32::try_from(index).unwrap_or(u32::MAX);
             let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
             let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
-            page.restore(&mut kept, alloc);
+            page.restore(&mut kept, &mut reader_pairs, alloc);
         }
     } else {
         for (shard_idx, &shard_key) in root.page_shards.iter().enumerate() {
@@ -1091,10 +1459,11 @@ pub fn decode_at<'a, 'g>(root: &Root<'_>, mut get: impl FnMut(Key) -> Got<'g>, a
                 let index = u32::try_from(base_index + slot).unwrap_or(u32::MAX);
                 let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
                 let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
-                page.restore(&mut kept, alloc);
+                page.restore(&mut kept, &mut reader_pairs, alloc);
             }
         }
     }
+    kept.answer.readers = Readers::from_pairs(reader_pairs, alloc);
     Ok(kept)
 }
 
@@ -1150,5 +1519,86 @@ mod codex_regression_tests {
             matches!(decode_root_hashed(key2, &flat_mismatch, alloc), Err(PagesError::Count { page: ROOT_PAGE, .. })),
             "flat root whose live_pages disagrees with nonzero page keys must be rejected"
         );
+    }
+
+    #[test]
+    fn encode_par_matches_serial_and_round_trips_out_of_order() {
+        let alloc = blaze_own::testing::heap().shared();
+        let mut kept = Kept::new_in(alloc);
+        kept.answer.serial = Gen(7);
+        let phase = Phase::new(Stage::Bodies, 0);
+        let mut reader_pairs = Vec::new_in(alloc);
+        for i in 0..96u32 {
+            let file = Name::new(Kind::FileItems, ContentId::of("par file", &(i % 8).to_le_bytes()));
+            let name = Name::new(Kind::BodyCheck, ContentId::of("par task", &i.to_le_bytes()));
+            let src = ContentId::of("par src", &i.to_le_bytes());
+            let out = ContentId::of("par out", &i.to_le_bytes());
+            let rec_key = Key(ContentId::of("par rec", &i.to_le_bytes()));
+            let cell = Cell(*ContentId::of("par cell", &i.to_le_bytes()).0.first_chunk::<16>().unwrap_or(&[0; 16]));
+            let cid = CellId { of: name, cell };
+            let mut defines = Vec::new_in(alloc);
+            defines.push((cell, out));
+            let mut reads = Vec::new_in(alloc);
+            let mut by_cell = Vec::new_in(alloc);
+            if i > 0 {
+                let prev = Name::new(Kind::BodyCheck, ContentId::of("par task", &(i - 1).to_le_bytes()));
+                let prev_cell = Cell(*ContentId::of("par cell", &(i - 1).to_le_bytes()).0.first_chunk::<16>().unwrap_or(&[0; 16]));
+                let prev_id = CellId { of: prev, cell: prev_cell };
+                reads.push((prev_id, ContentId::of("par out", &(i - 1).to_le_bytes())));
+                by_cell.push(0u32);
+                reader_pairs.push((prev_id, name));
+            }
+            kept.answer.cells.insert(cid, (out, Gen(7)));
+            kept.answer.by_file.entry(file).or_insert_with(|| Vec::new_in(alloc)).push(name);
+            kept.places.insert(file, FilePlace { unit: file, edition: 3, flags: 1 });
+            kept.answer.rows.insert(name, Row {
+                key: Key(src), phase, file, source: src, out, serial: Gen(7),
+                defines, reads, by_cell, findings: i % 3, inline: i % 5 == 0, failed: i % 7 == 0,
+            });
+            kept.causes.insert(name, (Gen(7), Cause::New));
+            kept.records.insert(name, rec_key);
+        }
+        kept.answer.readers = Readers::from_pairs(reader_pairs, alloc);
+        for names in kept.answer.by_file.values_mut() {
+            names.sort_unstable();
+        }
+        let owed_file = Name::new(Kind::FileItems, ContentId::of("par owed file", b"f"));
+        let owed_name = Name::new(Kind::BodyCheck, ContentId::of("par owed task", b"t"));
+        kept.answer.owed_tasks.insert(owed_name, Planned { name: owed_name, phase, source: ContentId::of("par owed src", b"s"), file: owed_file });
+        let owed_cid = CellId { of: owed_name, cell: Cell([3; 16]) };
+        kept.answer.owed_cells.insert(owed_cid, Gen(7));
+
+        let serial = encode(&kept, None, alloc);
+        let par_rev = encode_par(&kept, None, alloc, |jobs| {
+            let mut out = Vec::with_capacity_in(jobs.len(), alloc);
+            for job in jobs.iter().rev() {
+                out.push(job.run(alloc));
+            }
+            out
+        });
+        assert_eq!(serial.root, par_rev.root, "encode_par must match serial encode root byte-for-byte");
+        assert_eq!(serial.bits, par_rev.bits);
+        assert_eq!(serial.bytes, par_rev.bytes);
+        assert_eq!(serial.live_pages, par_rev.live_pages);
+        assert_eq!(serial.pages, par_rev.pages);
+        assert_eq!(serial.page_shards, par_rev.page_shards);
+        assert_eq!(serial.tree_keys, par_rev.tree_keys);
+        assert_eq!(serial.puts.len(), par_rev.puts.len());
+        for ((sk, sb), (pk, pb)) in serial.puts.iter().zip(par_rev.puts.iter()) {
+            assert_eq!(sk, pk);
+            assert_eq!(sb.as_slice(), pb.as_slice());
+        }
+
+        // Round-trip decode over `par_rev.puts` must produce the exact same root (Rule 26).
+        let mut store: BTreeMap<Key, &[u8], _> = BTreeMap::new_in(alloc);
+        for (k, bytes) in par_rev.puts.iter() {
+            store.insert(*k, bytes.as_slice());
+        }
+        let decoded = match decode(par_rev.root, |k| store.get(&k).map(|b| Sealed::hashed(k, b)), alloc) {
+            Ok(back) => back,
+            Err(why) => panic!("decode after encode_par failed: {why}"),
+        };
+        let reencoded = encode(&decoded, None, alloc);
+        assert_eq!(reencoded.root, par_rev.root, "round-trip after encode_par must preserve root");
     }
 }

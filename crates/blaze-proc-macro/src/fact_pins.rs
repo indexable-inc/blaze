@@ -139,16 +139,27 @@ pub fn pinned_setting<'a>(host: &str, text: &UserlandText<'_>, alloc: Alloc<'a>)
     Ok(SpawnSetting::facts_only(FactPins::from_owned(&pins)))
 }
 
+/// The spawn setting with the derived facts' pins for Linux scripts whose guest is `host`, from
+/// the clang pin table ([`CLANG_JSON`], at `pins/clang.json`).
+pub fn linux_pinned_setting<'a>(host: &str, alloc: Alloc<'a>) -> Result<SpawnSetting, CommandPinsError<'a>> {
+    let pins = fact_pins::linux_fact_pins(CLANG_JSON, host, CLANG_GUEST_DIR, alloc).map_err(|e| owned_pin(e, alloc))?;
+    Ok(SpawnSetting::facts_only(FactPins::from_owned(&pins)))
+}
+
 /// The command's spawn setting (chosen once per command beside its executor): for a macOS host,
-/// the derived facts' pins from the host's userland, read here; a read or a pin that fails stops
-/// the command naming it. Any other host declares no Apple userland (READINESS Q1 is open), so it
-/// gets [`SpawnSetting::off`] and each fact is refused by name at its spawn.
+/// the derived facts' pins from the host's userland, read here; for a pinned Linux host, the
+/// derived facts' pins from `pins/clang.json` (no Apple userland); a read or a pin that fails stops
+/// the command naming it. Any other host gets [`SpawnSetting::off`] and each fact is refused by
+/// name at its spawn.
 pub fn command_spawn_setting<'a>(host: &str, alloc: Alloc<'a>) -> Result<SpawnSetting, CommandPinsError<'a>> {
-    if !host.ends_with("-apple-darwin") {
-        return Ok(SpawnSetting::off());
+    if host.ends_with("-apple-darwin") {
+        let text = read_apple_userland(alloc)?;
+        return pinned_setting(host, &text, alloc);
     }
-    let text = read_apple_userland(alloc)?;
-    pinned_setting(host, &text, alloc)
+    if host == "aarch64-unknown-linux-gnu" {
+        return linux_pinned_setting(host, alloc);
+    }
+    Ok(SpawnSetting::off())
 }
 
 /// What a read subject says now, when it is a derived fact's.
