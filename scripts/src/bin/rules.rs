@@ -554,7 +554,7 @@ const RULES: &[Rule<'static>] = &[
     Rule {
         id: "worktree-per-lane",
         skill: "build-and-test",
-        line: "One directory, each lane in its own files; a worktree is the exception; never `git stash`.",
+        line: "Prefer one directory with disjoint files per lane (NOT a worktree per lane); never `git stash`.",
         info: "The default is one directory: the integration checkout on the Mac (how-to `H12` under `agents/howto/` names it), on the integration branch. Every lane edits there, within the paths its brief gives it, and does not run git: the main agent commits (one commit per lane's piece, crediting it), compiles each piece as it is reported (`fan-out-write-only`), pushes, and has the one VM build and test the whole tree at once. A lane's paths are new files, or the files of one area (one crate, one module) that no other lane touches; a brief that would have two lanes edit one area's old code in place is split differently, or the rewrite gets a fresh core beside the old code (`agents-are-a-cost`). A lane says when its piece is ready to be built and what test shows it; until then its half-written files must not break the build for the others (add new code beside the old and switch over last, or keep it behind a module that is not yet referenced). Two lanes never write the same file: the brief's paths say who owns what, and a lane that needs a line in another's file asks the main agent. A worktree (uniquely named, with its own branch) is for the cases the one directory cannot serve: two lanes that must rewrite the same file, a bisect or a causal test that needs a variant tree, a long-lived rewrite that cannot keep the tree building; the brief says which. Never `git stash`: it is one stack shared by every worktree.",
         reason: Some(r#"The stash is shared by every worktree. Andrew, 2026-11-12, with seventeen worktrees and as many branches to merge, most conflicting only in one JSON file: "often makes sense to write code in one dir, no worktree, and then test all at once"."#),
         link: None,
@@ -599,8 +599,8 @@ const RULES: &[Rule<'static>] = &[
     Rule {
         id: "docs-say-what-they-are",
         skill: "docs-and-scripts",
-        line: "Front matter says current, plan, record or superseded; current docs are kept true.",
-        info: "Every doc under `docs/` has front matter: `current` (kept true), `plan`, `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read plans and records as of their date. A change that makes a current doc untrue fixes it or marks it superseded in the same change; `blaze run -q -p scripts --bin docs -- check` holds them to the tree.",
+        line: "Names & front matter state exact role/action (current|plan|record|superseded); no vague nouns.",
+        info: "Every doc under `docs/` has front matter: `current` (kept true), `plan`, `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read plans and records as of their date. A change that makes a current doc untrue fixes it or marks it superseded in the same change; `blaze run -q -p scripts --bin docs -- check` holds them to the tree. Every doc, skill, rule, and interface name states its exact action or role unambiguously (e.g. `authoring-prompts`, never a vague topic noun that hides direction or purpose).",
         reason: Some(r#"Andrew, 2026-10-28: docs should "be structured or something so can say things are outdated filter those out". Agents followed AGENTS.md's stale `vendor/rust-analyzer` after the front end moved to crates/."#),
         link: Some("docs/contributing.md#documents"),
         also_in: &[],
@@ -608,8 +608,8 @@ const RULES: &[Rule<'static>] = &[
     Rule {
         id: "scripts-take-typed-input",
         skill: "docs-and-scripts",
-        line: "A script takes one JSON value parsed into a frozen dataclass, not flags or env vars.",
-        info: "A script takes one JSON value (a file path, `-` or inline), parsed into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment variables. An existing script moves to this when next changed.",
+        line: "A script takes one JSON value parsed into a typed `blaze_script::Input` struct, not flags or env.",
+        info: "A script takes one JSON value (a file path, `-` or inline), parsed into a typed Rust struct implementing `blaze_script::Input` (refusing unknown fields), not a set of flags or hidden environment variables. An existing script moves to this when next changed.",
         reason: Some(r#"Andrew, 2026-10-28: "for parser things it should be typed like json instead of cli args, json through a file or stdin or a single value". Flags drift and are untyped; one JSON value is checkable and the same from a workflow, a person or another script."#),
         link: None,
         also_in: &[],
