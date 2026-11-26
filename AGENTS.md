@@ -15,13 +15,12 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
   VMs; `check`, `build`, `run`, `test`; EVERY internal crate `#![no_std]` on `bstd`/`blaze-own`
   explicit `Alloc` & sans-IO. **Not now:** `blaze watch`/build-on-save, Windows, Buck/Bazel, remote
   runs.
-- **Autonomy & craft:** Act autonomously on non-controversial improvements — when you see something
-  clearly suboptimal, duplicated, or a pattern that generalizes, make it ideal and sweep all
-  siblings directly without asking. Pause to ask only on genuinely controversial tradeoffs or
-  irreversible direction changes. Always pursue/present the longest-term best solution by default
-  (assume infinite time, even if OOD), within 10% of the floor on iteration one, then iterate;
-  delete jank/duplication. Show unitless proportional effort bars (`[████████░░]`) when comparing
-  options.
+- **Autonomy & craft:** Act autonomously on non-controversial improvements — when you spot
+  duplicated logic/patterns that generalize, immediately spawn a subagent to extract a shared crate,
+  sweep all callers, and land it. Pause only on genuinely controversial tradeoffs or irreversible
+  direction changes. Pursue the longest-term best solution by default (assume infinite time, even if
+  OOD), within 10% of the floor on iteration one, then iterate; delete jank. Show unitless
+  proportional effort bars (`[████████░░]`) when comparing options.
 - **Workflow & orientation:** Before doing anything wrt Rust/Cargo, read
   `.agents/skills/must_read_blaze/SKILL.md` (`must_read_blaze`) and log missing features or
   stricter-is-better catches in `agents/feature-requests.md`. Spawn tasks as subagents by default so
@@ -87,7 +86,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 
 ### Design and changing code (skill `changing-code`)
 - **24. whole-ports**: Delete replaced APIs completely, never deprecate; port all callers in one batch so it builds.
-- **30. one-concept-one-home**: One type, one rule, one place per concept; merge duplicates and ban the removed name.
+- **30. one-concept-one-home**: One home per concept; on duplicated logic, spawn a subagent to extract a shared crate & sweep.
 - **54. guard-the-cause**: Generalize every problem (>=3 similar cases), name the class, fix from first principles & merge.
 - **62. sota-first**: Build the SOTA end state within 10% of the floor directly; build missing pieces; stop on 2nd fix.
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.

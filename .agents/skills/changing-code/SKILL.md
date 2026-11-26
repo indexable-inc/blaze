@@ -65,11 +65,14 @@ See [docs/contributing.md#documents](../../../docs/contributing.md#documents).
 
 Each concept has one type, one rule and one place it is computed: two types for the same thing (a
 `BuiltFor` in two crates), two copies of a rule (where code runs, what a key covers), two paths that
-do the same job (two schedulers, two evaluators, two tiers for one level) are a bug. Merge them into
-the better one, delete the other, and ban its name with a `replacement` (`fix-through-blaze-lints`);
-a change that finds a duplicate removes it or files an issue naming both. For the CLI,
-`blaze-cli-spec` (`BLAZE_APP`) is the single source of truth for commands, flags, help text, usage,
-and shell completions — never hand-duplicate help strings or reach for proc macros.
+do the same job (two schedulers, two evaluators, two tiers for one level) are a bug. Whenever you
+spot duplicated logic or patterns across the repo that can be generalized into a shared crate,
+ALWAYS immediately spawn a subagent to extract and generalize it into one shared crate, sweep all
+callers, ban the removed duplicates with a `replacement` (`fix-through-blaze-lints`), and
+land/admin-merge it cleanly (`agents-are-a-cost`) — never leave duplicates behind or merely file an
+issue. For the CLI, `blaze-cli-spec` (`BLAZE_APP`) is the single source of truth for commands,
+flags, help text, usage, and shell completions — never hand-duplicate help strings or reach for proc
+macros.
 
 ## guard-the-cause (rule 54)
 
