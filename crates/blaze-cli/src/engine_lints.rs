@@ -53,6 +53,7 @@ use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::Frame;
 use bstd::path::Path;
+use bstd::sync::CachePadded;
 use bstd::task::Class;
 use std::alloc::Global;
 
@@ -65,6 +66,10 @@ use crate::work::{self, Record};
 
 /// A file's lint job's frame: its text, its outline's entries, its units' scopes and findings.
 const LINTS_FRAME: usize = 1 << 28;
+
+/// Maximum relinted (`asked`) unit count for running a single-file lint job inline on the
+/// coordinator's frame without spawning a pool worker or reserving a 256 MiB [`LINTS_FRAME`].
+const INLINE_ASKED_MAX: usize = 256;
 
 /// 3: one task a FILE (lints.rs `file_part`), its source the file part's; 2: one task a unit, its
 /// record ranges of its own text; 1: ranges of its whole text, holes and all.
@@ -355,18 +360,22 @@ pub(crate) struct LintsSeen {
 }
 
 /// [`LintCounts`] summed from the stage's file jobs on any worker (the `Ready` driver's run
-/// reads the stage, never writes it: [`LintsStage::lint_units`]). Each a sum, so its value is
-/// the same in any order the jobs end; read after the jobs are joined.
-struct Tally([AtomicU64; 8]);
+/// reads the stage, never writes it: [`LintsStage::lint_units`]). Padded to a full 128 B cache
+/// line (`CachePadded`, rule 86) to eliminate false sharing with adjacent stage fields, and
+/// skips atomic RMWs for zero counters. Each a sum, so its value is the same in any order the
+/// jobs end; read after the jobs are joined.
+struct Tally(CachePadded<[AtomicU64; 8]>);
 
 impl Tally {
     const fn new() -> Tally {
-        Tally([const { AtomicU64::new(0) }; 8])
+        Tally(CachePadded::new([const { AtomicU64::new(0) }; 8]))
     }
 
     fn add(&self, counts: &LintCounts) {
         for (sum, value) in self.0.iter().zip(counts.row()) {
-            sum.fetch_add(value, Ordering::Relaxed);
+            if value != 0 {
+                sum.fetch_add(value, Ordering::Relaxed);
+            }
         }
     }
 
@@ -375,14 +384,47 @@ impl Tally {
     }
 }
 
+fn add_counts(into: &mut LintCounts, more: &LintCounts) {
+    into.files_read = into.files_read.saturating_add(more.files_read);
+    into.files_outlined = into.files_outlined.saturating_add(more.files_outlined);
+    into.units_walked = into.units_walked.saturating_add(more.units_walked);
+    into.units_linted = into.units_linted.saturating_add(more.units_linted);
+    into.bytes_lexed = into.bytes_lexed.saturating_add(more.bytes_lexed);
+    into.variants_gathered = into.variants_gathered.saturating_add(more.variants_gathered);
+    into.heads_read = into.heads_read.saturating_add(more.heads_read);
+    into.batches = into.batches.saturating_add(more.batches);
+}
+
+/// Counts how many units in `job` must actually be relinted under `under` (miss in `job.prior`).
+fn asked_count(job: &FileJob<'_>, under: &Under) -> usize {
+    let Some(prior) = job.prior.filter(|prior| prior.under == *under) else {
+        return job.units.len();
+    };
+    let mut asked = 0usize;
+    let mut pu = 0usize;
+    for unit in job.units.iter() {
+        while let Some(entry) = prior.units.get(pu)
+            && entry.0 < unit.name
+        {
+            pu += 1;
+        }
+        if !prior.units.get(pu).is_some_and(|entry| entry.0 == unit.name && entry.1 == unit.key) {
+            asked += 1;
+        }
+    }
+    asked
+}
+
 /// The stage: the selected rules and the tool they run under, each entered file's last lint
 /// record, each task's result and refusal.
 pub(crate) struct LintsStage {
     rules: RuleSet,
     /// The `Lint` kind's tool ([`Under::tool`]).
     tool: ContentId,
-    /// Each entered task's last record, read back, by name ([`LintsStage::remember`]).
-    priors: std::vec::Vec<(Name, Result<Prior, &'static str>), Global>,
+    /// Each entered task's last record, read back, keyed by task name ([`LintsStage::remember`]).
+    /// Never iterated into output (only looked up by task name), so O(1) insert/lookup preserves
+    /// deterministic output (rule 25).
+    priors: blaze_hash::Map<Name, Result<Prior, &'static str>, blaze_hash::BuildKeyHasher, Global>,
     /// Each task entered and made, sorted by name after its phase.
     made: std::vec::Vec<Made, Global>,
     /// Each task refused, and why (rule 19).
@@ -393,7 +435,19 @@ pub(crate) struct LintsStage {
 
 impl LintsStage {
     pub(crate) fn new(rules: RuleSet, tool: ContentId) -> LintsStage {
-        LintsStage { rules, tool, priors: std::vec::Vec::new_in(Global), made: std::vec::Vec::new_in(Global), refused: std::vec::Vec::new_in(Global), counts: Tally::new() }
+        let g = Global;
+        LintsStage {
+            rules,
+            tool,
+            priors: blaze_hash::Map::new(blaze_hash::MapOpts {
+                hasher: blaze_hash::BuildKeyHasher::default(),
+                alloc: g,
+                capacity: None,
+            }),
+            made: std::vec::Vec::new_in(g),
+            refused: std::vec::Vec::new_in(g),
+            counts: Tally::new(),
+        }
     }
 
     /// Task `name`'s result, when it was entered and made this request.
@@ -426,11 +480,7 @@ impl LintsStage {
     /// what its units may be kept by key from. Read back here, once; one that does not read
     /// refuses the task by name when it runs (rule 3).
     pub(crate) fn remember(&mut self, name: Name, record: &Record<Global>) {
-        let prior = Prior::of(record);
-        match self.priors.binary_search_by_key(&name, |one| one.0) {
-            Ok(at) => self.priors[at].1 = prior,
-            Err(at) => self.priors.insert(at, (name, prior)),
-        }
+        self.priors.insert(name, Prior::of(record));
     }
 
     /// Task `task`'s job over the planner's outlines: its file's outline, its units, its last
@@ -444,9 +494,9 @@ impl LintsStage {
             return Err(Why::Refused { what: "a `Lint` task its file's outline lists no `Lint` part of", rule: RULE });
         }
         let items = record.payload_bytes().map_err(|_| Why::Refused { what: "a `Lint` task whose file's outline record holds no payload", rule: RULE })?;
-        let prior = match self.priors.binary_search_by_key(&name, |one| one.0) {
-            Ok(at) => Some(self.priors[at].1.as_ref().map_err(|what| Why::Refused { what: *what, rule: RULE })?),
-            Err(_) => None,
+        let prior = match self.priors.get(&name) {
+            Some(kept) => Some(kept.as_ref().map_err(|what| Why::Refused { what: *what, rule: RULE })?),
+            None => None,
         };
         let text = FileText { path: &one.path[..], source: one.source, edition: one.edition };
         Ok(FileJob { file, task: *task, text, items, units: units_of(&record.parts, name), prior })
@@ -457,12 +507,11 @@ impl LintsStage {
         Under { tool: self.tool, rules: self.rules.id(), edition: job.text.edition }
     }
 
-    /// Job `job` run here, on a worker: its counts added to the stage's.
-    fn run_job(&self, cx: &Cx, root: &Dir<ReadWrite>, job: &FileJob<'_>) -> Result<FileLinted, Why> {
-        let mut counts = LintCounts::default();
+    /// Job `job` run here, on a worker: its counts accumulated into the caller's local `counts`
+    /// so workers fold counts once per file/batch without contending on [`LintsStage::counts`].
+    fn run_job_into(&self, cx: &Cx, root: &Dir<ReadWrite>, job: &FileJob<'_>, counts: &mut LintCounts) -> Result<FileLinted, Why> {
         let under = self.under(job);
-        let made = work::unwinding(|| lint_file(cx, root, job, &under, &self.rules, &mut counts));
-        self.counts.add(&counts);
+        let made = work::unwinding(|| lint_file(cx, root, job, &under, &self.rules, counts));
         match made {
             Ok(made) => made,
             Err(work::Panicked) => Err(Why::Refused { what: "its file's lint job panicked; that file's lint task alone failed", rule: RULE }),
@@ -487,6 +536,7 @@ impl LintsStage {
         let cx = cx.span("engine: the lints phase");
         let mut made: std::vec::Vec<Made, Global> = std::vec::Vec::new_in(Global);
         let mut refused: std::vec::Vec<(Name, Why), Global> = std::vec::Vec::new_in(Global);
+        let mut phase_counts = LintCounts::default();
         {
             let stage = &*self;
             // 1. Each task to its file's job.
@@ -500,16 +550,27 @@ impl LintsStage {
                     }
                 }
             }
-            // 2. Each file's job: run a normal single-file edit inline to avoid spawning a worker
-            // and reserving a 256 MiB `LINTS_FRAME`; fan out multi-file phases (or massive single
-            // files whose unit list would overflow the caller's frame) across the pool.
+            // 2. Each file's job: run a single-file edit inline when the number of actually
+            // relinted (`asked`) units is small and the caller's frame has room (even on a 50K-line
+            // file where 1 unit changed out of 5,000), avoiding worker spawn and 256 MiB
+            // `LINTS_FRAME` mmap/munmap; fan out multi-file phases or large relints across the pool.
             type Ran = Result<FileLinted, Why>;
-            let mut worked: std::vec::Vec<(Ran, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
-            if jobs.len() <= 1 && jobs.first().is_none_or(|job| job.units.len() <= 2048) {
+            let mut worked: std::vec::Vec<(Ran, LintCounts, u64), _> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
+            let inline_ok = jobs.len() <= 1
+                && jobs.first().is_none_or(|job| {
+                    let under = stage.under(job);
+                    let asked = asked_count(job, &under);
+                    let frame_free = cx.frame().reserved().saturating_sub(cx.frame().used());
+                    let entries_bytes = job.units.len().saturating_mul(core::mem::size_of::<blaze_surface::Item>());
+                    let est_bytes = entries_bytes.saturating_add(job.items.len().saturating_mul(8)).saturating_add(256 << 10);
+                    asked <= INLINE_ASKED_MAX && est_bytes <= frame_free
+                });
+            if inline_ok {
                 for job in jobs.iter() {
                     let began = clock.now();
-                    let ran = stage.run_job(&cx, root, job);
-                    worked.push((ran, clock.now().since(began).map_or(0, crate::engine_times::ns)));
+                    let mut counts = LintCounts::default();
+                    let ran = stage.run_job_into(&cx, root, job, &mut counts);
+                    worked.push((ran, counts, clock.now().since(began).map_or(0, crate::engine_times::ns)));
                 }
             } else {
                 let scope = cx.scope();
@@ -519,8 +580,9 @@ impl LintsStage {
                     let clock = clock.clone();
                     running.push(scope.may_overlap("engine lints", LINTS_FRAME, move |cx: &Cx| {
                         let began = clock.now();
-                        let ran = stage.run_job(cx, root, job);
-                        Ok::<_, Infallible>((ran, clock.now().since(began).map_or(0, crate::engine_times::ns)))
+                        let mut counts = LintCounts::default();
+                        let ran = stage.run_job_into(cx, root, job, &mut counts);
+                        Ok::<_, Infallible>((ran, counts, clock.now().since(began).map_or(0, crate::engine_times::ns)))
                     }));
                 }
                 let mut stopped = None;
@@ -537,8 +599,9 @@ impl LintsStage {
                     return Err(CliError::Pool(error));
                 }
             }
-            // 3. Each result as the engine's row, in task order.
-            for (job, (ran, ns)) in jobs.iter().zip(worked) {
+            // 3. Each result as the engine's row, in task order; fold worker counts once.
+            for (job, (ran, counts, ns)) in jobs.iter().zip(worked) {
+                add_counts(&mut phase_counts, &counts);
                 times.push(job.task.planned.name, ns);
                 match ran.and_then(|linted| file_done(&job.task, job.file, linted, alloc)) {
                     Ok((done, one)) => {
@@ -552,6 +615,7 @@ impl LintsStage {
                 }
             }
         }
+        self.counts.add(&phase_counts);
         self.made.extend(made);
         self.refused.extend(refused);
         self.made.sort_unstable_by_key(|one| one.name);
@@ -711,16 +775,18 @@ impl LintsStage {
         let mut rows: SVec<'a, (Done<'a>, UnitKept)> = SVec::with_capacity_in(asked.len(), alloc);
         let refused = |task: &Task, why: Why| (crate::engine_tasks::failed(task, alloc), UnitKept::Refused(task.planned.name, why));
         let outlined = core::slice::from_ref(one);
+        let mut local_counts = LintCounts::default();
         for (task, _) in asked.iter() {
             let ran = self.job_of(outlined, task).and_then(|mut job| {
                 job.file = file;
-                self.run_job(cx, root, &job).and_then(|linted| file_done(task, file, linted, alloc))
+                self.run_job_into(cx, root, &job, &mut local_counts).and_then(|linted| file_done(task, file, linted, alloc))
             });
             rows.push(match ran {
                 Ok((done, kept)) => (done, UnitKept::Made(kept)),
                 Err(why) => refused(task, why),
             });
         }
+        self.counts.add(&local_counts);
         rows
     }
 
@@ -729,8 +795,12 @@ impl LintsStage {
     pub(crate) fn keep(&mut self, kept: UnitKept) {
         match kept {
             UnitKept::Made(made) => {
-                let at = self.made.partition_point(|one| one.name < made.name);
-                self.made.insert(at, made);
+                if self.made.last().is_none_or(|last| last.name <= made.name) {
+                    self.made.push(made);
+                } else {
+                    let at = self.made.partition_point(|one| one.name < made.name);
+                    self.made.insert(at, made);
+                }
             }
             UnitKept::Refused(name, why) => self.refused.push((name, why)),
         }

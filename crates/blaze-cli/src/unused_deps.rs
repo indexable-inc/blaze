@@ -476,21 +476,30 @@ fn match_file_refs(bytes: &[u8], targets: &[&str], used: &mut [bool]) -> bool {
     at == bytes.len()
 }
 
-/// Finds a verified `LeafKind::Slot` file content digest for `target_path` in `rows` (if present
-/// as a direct non-`mod.rs` slot).
-fn row_file_id(rows: &crate::sweep::Rows<'_>, target_path: &str) -> Option<ContentId> {
+/// Builds a one-time path -> verified `LeafKind::Slot` file content digest index over `rows`
+/// (direct non-`mod.rs` slots only, keeping the first matching row per path) so file-id lookups
+/// during unused-dependency scanning are O(1) instead of linear-scanning `rows.rows`.
+fn build_row_file_index<'r, 'f>(
+    rows: &'r crate::sweep::Rows<'_>,
+    frame: &'f Frame,
+) -> blaze_hash::Map<&'r str, ContentId, blaze_hash::FixedState, &'f Frame> {
     let zero = ContentId([0; 32]);
     let remapped = crate::sweep::AT_MOD_RS | crate::sweep::BOTH;
-    rows.rows
-        .iter()
-        .find(|leaf| {
-            leaf.kind == crate::sweep::LeafKind::Slot
-                && !leaf.absent()
-                && (leaf.flags & remapped) == 0
-                && leaf.id != zero
-                && rows.path(leaf) == target_path
-        })
-        .map(|leaf| leaf.id)
+    let mut index = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::FixedState,
+        alloc: frame,
+        capacity: Some(rows.rows.len()),
+    });
+    for leaf in rows.rows.iter() {
+        if leaf.kind == crate::sweep::LeafKind::Slot
+            && !leaf.absent()
+            && (leaf.flags & remapped) == 0
+            && leaf.id != zero
+        {
+            index.entry(rows.path(leaf)).or_insert(leaf.id);
+        }
+    }
+    index
 }
 
 /// Scans one `.rs` file for `targets`, hitting the per-file `BUD1` CAS cache when `known_file_id`
@@ -627,18 +636,22 @@ fn member_checked_completely(
             }
         }
     }
-    // Also ensure no MacroModule task failed across the workspace (an unexpanded proc macro
-    // could generate references to declared dependencies).
+    saw_member_crate
+}
+
+/// Checks once across the workspace whether any `Kind::MacroModule` task failed (an unexpanded
+/// proc macro could generate references to declared dependencies). Hoisted out of the per-member
+/// loop so the check is O(F) instead of O(M × F).
+fn any_macro_module_failed(finished: &blaze_engine::Finished<'_>) -> bool {
     for &with_f in finished.answer.with_findings.iter() {
-        if with_f.kind == Kind::MacroModule {
-            if let Ok(Some(row)) = finished.answer.row_facts(with_f)
-                && row.failed
-            {
-                return false;
-            }
+        if with_f.kind == Kind::MacroModule
+            && let Ok(Some(row)) = finished.answer.row_facts(with_f)
+            && row.failed
+        {
+            return true;
         }
     }
-    saw_member_crate
+    false
 }
 
 /// Format the 3-argument finding message for `UNUSED_DEPENDENCY`:
@@ -686,6 +699,11 @@ pub(crate) fn collect(
     if !has_any_candidates {
         return Ok(());
     }
+    if any_macro_module_failed(finished) {
+        return Ok(());
+    }
+
+    let row_index = build_row_file_index(rows, frame);
 
     // Lazily reserved on the first cache miss so all-cached runs allocate zero scan frames.
     let mut scratch: Option<Frame> = None;
@@ -745,7 +763,7 @@ pub(crate) fn collect(
                     .as_ref()
                     .ok()
                     .and_then(crate::engine_tasks::data_digest_of)
-                    .or_else(|| row_file_id(rows, path));
+                    .or_else(|| row_index.get(path).copied());
                 if !scan_file_cached(cx, root, store, path, file_id, &code_idents, &mut code_used, kept_keys, &mut scratch)? {
                     code_scan_complete = false;
                     dev_scan_complete = false;
@@ -759,7 +777,7 @@ pub(crate) fn collect(
                 if scanned.iter().any(|&p| p == dev_path) {
                     continue;
                 }
-                let file_id = row_file_id(rows, dev_path);
+                let file_id = row_index.get(dev_path).copied();
                 if !scan_file_cached(cx, root, store, dev_path, file_id, &code_idents, &mut code_used, kept_keys, &mut scratch)? {
                     dev_scan_complete = false;
                 }
@@ -774,7 +792,7 @@ pub(crate) fn collect(
                     .iter()
                     .find(|one| core::str::from_utf8(&one.path).ok() == Some(build_path))
                     .and_then(|one| one.made.as_ref().ok().and_then(crate::engine_tasks::data_digest_of))
-                    .or_else(|| row_file_id(rows, build_path));
+                    .or_else(|| row_index.get(build_path).copied());
                 if !scan_file_cached(cx, root, store, build_path, file_id, &build_idents, &mut build_used, kept_keys, &mut scratch)? {
                     build_scan_complete = false;
                 }
@@ -964,5 +982,30 @@ mod tests {
         assert!(!match_file_refs(b"BAD1\0\0\0\0", &targets, &mut bad));
         let truncated = encoded.get(..encoded.len().saturating_sub(1)).expect("truncated");
         assert!(!match_file_refs(truncated, &targets, &mut bad));
+    }
+
+    #[test]
+    fn row_file_index_maps_direct_slots_and_skips_absent_or_remapped() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+        let mut rows = crate::sweep::Rows::new_in(&frame);
+        let id_a = ContentId([1; 32]);
+        let id_a_dup = ContentId([2; 32]);
+        let id_b = ContentId([3; 32]);
+        let id_c = ContentId([4; 32]);
+        let p_a = u32::try_from(rows.names.push("src/lib.rs")).expect("path idx");
+        let p_b = u32::try_from(rows.names.push("src/mod_remapped.rs")).expect("path idx");
+        let p_c = u32::try_from(rows.names.push("src/absent.rs")).expect("path idx");
+        let p_d = u32::try_from(rows.names.push("Cargo.toml")).expect("path idx");
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: 0, path: p_a, stamp: None, id: id_a });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: 0, path: p_a, stamp: None, id: id_a_dup });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: crate::sweep::AT_MOD_RS, path: p_b, stamp: None, id: id_b });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Slot, flags: crate::sweep::ABSENT, path: p_c, stamp: None, id: id_c });
+        rows.rows.push(crate::sweep::Leaf { kind: crate::sweep::LeafKind::Manifest, flags: 0, path: p_d, stamp: None, id: id_c });
+
+        let index = build_row_file_index(&rows, &frame);
+        assert_eq!(index.get("src/lib.rs").copied(), Some(id_a), "first matching direct slot wins");
+        assert_eq!(index.get("src/mod_remapped.rs").copied(), None, "AT_MOD_RS slots excluded");
+        assert_eq!(index.get("src/absent.rs").copied(), None, "absent slots excluded");
+        assert_eq!(index.get("Cargo.toml").copied(), None, "non-Slot leaves excluded");
     }
 }

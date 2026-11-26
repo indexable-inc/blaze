@@ -2776,7 +2776,7 @@ fn checking<'f, 's: 'f>(
         frame: &Frame,
     ) -> Result<Option<(crate::engine_answer::LoadedBase<'m, 'a>, FallbackFrom)>, CliError> {
         if !check_scope.is_whole()
-            && let Some(loaded) = crate::engine_answer::open_named_base(cx, store, whole_root, tools, exclude, require_current_tools, alloc)?
+            && let Some(loaded) = crate::engine_answer::open_named_base(cx, store, whole_root, tools, exclude, require_current_tools, alloc, frame)?
         {
             return Ok(Some((loaded, FallbackFrom::OwnWhole)));
         }
@@ -2795,13 +2795,14 @@ fn checking<'f, 's: 'f>(
     #[cfg(not(test))]
     let allow_stale_fallback = true;
     // The pointer and the last request's lines, in a frame of their own ([`own_frame`]).
-    let (mut unreadable, mut pointer, mut last_lines, mut preopened_root, mut other_checkout, mut own_whole) = own_frame(|| -> Result<_, CliError> {
+    let (mut unreadable, mut pointer, mut last_lines, mut preopened_root, mut other_checkout, mut own_whole, mut base_aux) = own_frame(|| -> Result<_, CliError> {
         let mut unreadable: Option<crate::engine_answer::Unreadable> = prior_unreadable;
         let mut pointer = None;
         let mut last_lines = None;
         let mut preopened_root: Option<blaze_engine::pages::Root<'_>> = None;
         let mut other_checkout = false;
         let mut own_whole = false;
+        let mut base_aux = crate::engine_answer::BaseAux::default();
         if !fresh {
             match recovery {
                 StoredRecovery::SkipOwn { exclude } => {
@@ -2811,6 +2812,7 @@ fn checking<'f, 's: 'f>(
                         pointer = Some(loaded.pointer);
                         last_lines = Some(loaded.lines);
                         preopened_root = Some(loaded.root);
+                        base_aux = loaded.aux;
                         other_checkout = from != FallbackFrom::OwnWhole;
                         own_whole = from == FallbackFrom::OwnWhole;
                         unreadable = None;
@@ -2841,6 +2843,7 @@ fn checking<'f, 's: 'f>(
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
                                 preopened_root = Some(loaded.root);
+                                base_aux = loaded.aux;
                                 other_checkout = from != FallbackFrom::OwnWhole;
                                 own_whole = from == FallbackFrom::OwnWhole;
                             }
@@ -2858,6 +2861,7 @@ fn checking<'f, 's: 'f>(
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
                                 preopened_root = Some(loaded.root);
+                                base_aux = loaded.aux;
                                 other_checkout = from != FallbackFrom::OwnWhole;
                                 own_whole = from == FallbackFrom::OwnWhole;
                                 if from == FallbackFrom::Toolchain {
@@ -2886,6 +2890,7 @@ fn checking<'f, 's: 'f>(
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
                                 preopened_root = Some(loaded.root);
+                                base_aux = loaded.aux;
                                 other_checkout = from != FallbackFrom::OwnWhole;
                                 own_whole = from == FallbackFrom::OwnWhole;
                                 used_fallback = true;
@@ -2903,6 +2908,7 @@ fn checking<'f, 's: 'f>(
                                             pointer = Some(loaded.pointer);
                                             last_lines = Some(loaded.lines);
                                             preopened_root = Some(loaded.root);
+                                            base_aux = loaded.aux;
                                             other_checkout = from != FallbackFrom::OwnWhole;
                                             own_whole = from == FallbackFrom::OwnWhole;
                                             if from == FallbackFrom::Toolchain {
@@ -2921,7 +2927,7 @@ fn checking<'f, 's: 'f>(
                 StoredRecovery::Fresh => {}
             }
         }
-        Ok((unreadable, pointer, last_lines, preopened_root, other_checkout, own_whole))
+        Ok((unreadable, pointer, last_lines, preopened_root, other_checkout, own_whole, base_aux))
     })?;
     // The planted control (engine_answer.rs `RootPlant::PerTools`): an answer under other tools
     // is not read, as when the root's name held the tools.
@@ -2934,6 +2940,7 @@ fn checking<'f, 's: 'f>(
         preopened_root = None;
         other_checkout = false;
         own_whole = false;
+        base_aux = crate::engine_answer::BaseAux::default();
     }
     // What the stored answer is to this request: the one decision of the certificate and the
     // wake (engine_ready_edit.rs `StoredBase`). Another checkout's answer, or one under other
@@ -3048,6 +3055,7 @@ fn checking<'f, 's: 'f>(
                     answer_root.as_str(),
                     pointer,
                     root_dir,
+                    base_aux,
                     &followed.now,
                     &journal,
                     request,
@@ -3184,6 +3192,7 @@ fn checking<'f, 's: 'f>(
             preopened_root = None;
             own_whole = true;
             base = crate::engine_ready_edit::StoredBase::Own;
+            base_aux = crate::engine_answer::BaseAux::default();
             *used_pointer = pointer.as_ref().map(|p| (p.key, false));
             followed_kept = Some(whole_followed);
             sweep_counts = whole_sweep_counts;
@@ -3208,6 +3217,7 @@ fn checking<'f, 's: 'f>(
                 if let Some((loaded, from)) = fallback {
                     pointer = Some(loaded.pointer);
                     last_lines = Some(loaded.lines);
+                    base_aux = loaded.aux;
                     own_whole = from == FallbackFrom::OwnWhole;
                     base = if own_whole {
                         if pointer.as_ref().is_some_and(|p| p.certifies_under(&tools)) {
@@ -3321,19 +3331,24 @@ fn checking<'f, 's: 'f>(
     scripts.status_view = script_sweep.as_ref().map(crate::engine_script_reads::CheckoutSweep::view);
     let aux_read_root = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
     let grains_root = bstd::mem::format_in!(frame, "{answer_root}.grains");
-    let read_grains_root = bstd::mem::format_in!(frame, "{aux_read_root}.grains");
-    let grains_record = store.named(read_grains_root.as_str())?.filter(|keys| keys.len() == 32).map(|keys| {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(keys);
-        blaze_drive::Key(blaze_ids::ContentId(id))
-    });
     let members_root = bstd::mem::format_in!(frame, "{answer_root}.members");
-    let read_members_root = bstd::mem::format_in!(frame, "{aux_read_root}.members");
-    let members_record = store.named(read_members_root.as_str())?.filter(|keys| keys.len() == 32).map(|keys| {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(keys);
-        blaze_drive::Key(blaze_ids::ContentId(id))
-    });
+    let (grains_record, members_record) = if base == crate::engine_ready_edit::StoredBase::OtherCheckout {
+        (base_aux.grains, base_aux.members)
+    } else {
+        let read_grains_root = bstd::mem::format_in!(frame, "{aux_read_root}.grains");
+        let grains = store.named(read_grains_root.as_str())?.filter(|keys| keys.len() == 32).map(|keys| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(keys);
+            blaze_drive::Key(blaze_ids::ContentId(id))
+        });
+        let read_members_root = bstd::mem::format_in!(frame, "{aux_read_root}.members");
+        let members = store.named(read_members_root.as_str())?.filter(|keys| keys.len() == 32).map(|keys| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(keys);
+            blaze_drive::Key(blaze_ids::ContentId(id))
+        });
+        (grains, members)
+    };
     let mut bodies = made_boxed(heap, || crate::engine_bodies::BodiesStage::new(scope_reads));
     bodies.grains_from(grains_record, last_serial);
     bodies.members_from(members_record, last_serial);
@@ -3807,7 +3822,7 @@ fn checking<'f, 's: 'f>(
             let names_missing: std::sync::OnceLock<Name> = std::sync::OnceLock::new();
             let inputs = crate::engine_names::NamesInputs::stood(stage, crate::engine_names::Stood { pages: last, missing: &names_missing });
             let body_tool = tools.of(Name { kind: Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
-            let closed = bodies.ready_reads(cx, &mut store, graph, inputs, scoped, body_tool, &moved, frame, g)?;
+            let closed = bodies.ready_reads(cx, &mut store, graph, inputs, scoped, body_tool, &moved, outlined, ready_plant, frame, g)?;
             if let Some(&name) = names_missing.get() {
                 return Err(EngineCheckError::MissingRecord { name }.into());
             }
@@ -4046,7 +4061,11 @@ fn checking<'f, 's: 'f>(
             }
         }
         // 3. Print: the whole answer's lines, in a call of their own ([`lines_of`]).
-        let made = lines_of(cx, root, &mut store, laid_now, &finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
+        let topology_changed = own_whole
+            || base != crate::engine_ready_edit::StoredBase::Own
+            || followed_kept.as_ref().is_none_or(|f| f.layout_moved)
+            || serving.served.get().is_some();
+        let made = lines_of(cx, root, &mut store, laid_now, topology_changed, &finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
         phases.mark_cx(cx, "lines made", frame);
         let heap_lines_made = crate::engine_phase_mem::heap_now();
         // The closing line's count: every file the request has an outline of (on the ready setup,
@@ -4131,10 +4150,23 @@ fn checking<'f, 's: 'f>(
         drop(unused_dep_keys);
         kept_beside.sort_unstable();
         kept_beside.dedup();
+        // Carry forward the standing `.grains` / `.members` keys when this request did not enter a
+        // Bodies phase (e.g. scoped `blaze test -p` narrowing `own_whole` with zero entered bodies
+        // or a Lint/FileItems-only edit) so the next request stays on `Ready` with zero
+        // `ReadyRefused::Members` and whole-workspace bases propagate them to other worktrees.
+        let next_grains = bodies.grains_record().or(grains_record);
+        let next_members = bodies.members_record().or(members_record);
         // One commit call for both drivers, so what follows it (the scripts' status keep) follows
         // either: the ready path's writes the pages its changed rows sit on and no header shard
         // (engine_answer.rs `save_changes`); the phase path's rewrites the shards too (`save_edit`).
-        let save_base = if check_scope.is_whole() { crate::engine_answer::SaveBase::Keep } else { crate::engine_answer::SaveBase::Skip };
+        let save_base = if check_scope.is_whole() {
+            crate::engine_answer::SaveBase::KeepWith(crate::engine_answer::BaseAux {
+                members: next_members,
+                grains: next_grains,
+            })
+        } else {
+            crate::engine_answer::SaveBase::Skip
+        };
         let saved = match (chosen, stored.as_ref()) {
             (crate::engine_ready_edit::Chosen::Wake { .. }, Some(last)) => crate::engine_answer::save_changes(cx, &mut store, &opened.lent, &answer_root, toolchain, &tools, &kept_answer, printed, (lines_key, &lines_bytes), last, &rows, &journal, alloc, frame, &kept_beside[..], (pointer.as_ref().map(|pointer| pointer.root), workers), save_base),
             _ => crate::engine_answer::save_edit(cx, &mut store, &opened.lent, &answer_root, toolchain, &tools, &kept_answer, printed, (lines_key, &lines_bytes), stored.as_ref(), &rows, &journal, alloc, frame, &kept_beside[..], (pointer.as_ref().map(|pointer| pointer.root), workers), save_base),
@@ -4143,15 +4175,21 @@ fn checking<'f, 's: 'f>(
         let stored_keys = crate::engine_answer::StoredKeys::of(&saved, stored.as_ref());
         let (task_pages_read, header_pages_read) = stored.as_ref().map_or((0, 0), |one| one.read_counts());
         let pages_read = stored.as_ref().map(|one| one.pages_read_line()).unwrap_or_default();
-        // The read grains' record this request put, named under the checkout's grains root from
-        // the commit on: the next request takes its grains from it (engine_scope_reads.rs).
-        if let Some(key) = bodies.grains_record() {
-            store.pin(grains_root.as_str(), &[key])?;
+        // Pin or O(1)-renew `<answer_root>.grains` and `<answer_root>.members`: skip rewriting the
+        // 32-byte root record when this checkout's own root already names the exact same key, and
+        // re-pin the standing key from `aux_read_root` on scoped `own_whole` / `OtherCheckout` runs.
+        let same_own_root = !fresh && !own_whole && base != crate::engine_ready_edit::StoredBase::OtherCheckout;
+        if let Some(key) = next_grains {
+            let unchanged = same_own_root && grains_record == Some(key);
+            if !unchanged || !opened.lent.renew_root(grains_root.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                store.pin(grains_root.as_str(), &[key])?;
+            }
         }
-        // The members record this request put, named under the checkout's members root: the next
-        // ready request takes its standing members from it (engine_members_record.rs).
-        if let Some(key) = bodies.members_record() {
-            store.pin(members_root.as_str(), &[key])?;
+        if let Some(key) = next_members {
+            let unchanged = same_own_root && members_record == Some(key);
+            if !unchanged || !opened.lent.renew_root(members_root.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                store.pin(members_root.as_str(), &[key])?;
+            }
         }
         phases.mark_cx(cx, "answer stored", frame);
         #[cfg(test)]
@@ -4372,6 +4410,7 @@ fn lines_of<'a, 'f>(
     root: &Dir<ReadWrite>,
     store: &mut dyn crate::store::Store<'_>,
     laid: Option<&crate::units::Laid<'_>>,
+    topology_changed: bool,
     finished: &blaze_engine::Finished<'_>,
     last_lines: Option<&crate::engine_lines::Last<'a, '_>>,
     (names, scripts, bodies, heads, lints): LineStages<'_, 'f, '_>,
@@ -4389,9 +4428,22 @@ fn lines_of<'a, 'f>(
     #[cfg(test)]
     stack_probe::at("lines_of");
     let mut entered_now: SSet<'_, Name> = SSet::new_in(alloc);
+    let mut units_or_scope_entered = false;
     for one in finished.causes.iter() {
         entered_now.insert(one.name);
+        if matches!(one.name.kind, Kind::Units | Kind::UnitGraph | Kind::CrateScope) {
+            units_or_scope_entered = true;
+        }
     }
+    // Standing `Kind::BodyCheck` rows only need a `VIEW` header refresh when target/module reach
+    // topology may have shifted (the Phases path with narrowing `own_whole`, another checkout's
+    // base, moved layout, found files, or an entered Units/UnitGraph/CrateScope task). On the
+    // `Ready` path (`laid.is_none()`) and on non-topology Phases edits, every standing body's
+    // reaching unit set is unchanged, so keep its block in O(1) zero-copy without opening BEP6
+    // pages (`row_facts`) or re-lexing files (`standing_view` -> `file_cuts`).
+    let refresh_standing_view = laid.is_some()
+        && bodies.reach().is_some()
+        && (topology_changed || units_or_scope_entered);
     let mut lines = crate::engine_lines::Lines::new_in(alloc);
     let mut unprinted = 0u32;
     let mut first_unprinted: Option<Name> = None;
@@ -4419,7 +4471,7 @@ fn lines_of<'a, 'f>(
                         blaze_drive::Kind::Units => {
                             lines.keep_split_rule(*name, block, crate::unused_deps::UNUSED_DEPENDENCY, false).map_err(EngineCheckError::Lines)?;
                         }
-                        blaze_drive::Kind::BodyCheck => {
+                        blaze_drive::Kind::BodyCheck if refresh_standing_view => {
                             let file = finished.answer.row_facts(*name).map_err(EngineError::from)?.map(|row| row.file);
                             match file.map(|file| bodies.standing_view(*name, outlined, file, frame)).transpose()? {
                                 Some(Some(Some((base, row_at, units)))) => {

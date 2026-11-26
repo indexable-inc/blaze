@@ -672,15 +672,35 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.commit_records(batches, &[])
     }
 
+    /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
+    /// least one key being committed in `batches`, `records`, or `self.core.held` (plus any
+    /// segment lacking a valid Bloom filter), leaving non-matching prior-boot segments unmapped
+    /// and unhashed during foreground commits ([`Plain::map_for_commit`]).
+    fn map_for_commit(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<(), StoreError> {
+        if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
+            return Ok(());
+        }
+        let lost = self.core.report().lost.len();
+        let now = self.driver.wall_ns();
+        if self.core.map_for_commit(batches, records, now, &mut self.effects)? && !self.effects.is_empty() {
+            self.run("mapping commit-matching segments")?;
+        }
+        self.hand_losses(lost);
+        Ok(())
+    }
+
     /// [`Driven::commit_with`] with `records` lent where they lie (core.rs
     /// [`Plain::commit_records`]): a `Lent`'s shared arena, copied once, by the layout.
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
-        // After the answer: what is left unmapped is mapped, so the layout refuses two values
-        // under one key against every row. A commit with nothing to lay out maps nothing.
+        // After the answer: only map/verify segments that can conflict with the batch being
+        // committed (Bloom-filtered), unless a `Liveness::Reached` root-set or emergency
+        // auto-tier-merge requires a whole store.
         let writing = self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty();
         let mut auto_folded = false;
-        if writing {
+        if self.core.needs_whole_for_commit() {
             self.map_all()?;
+        }
+        if writing {
             #[cfg(test)]
             let allow_auto = self.auto_merge;
             #[cfg(not(test))]
@@ -690,11 +710,14 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             // at the emergency safety ceiling (`Plain::AUTO_TIER_MERGE_FG` = 128) so interactive
             // `blaze check`/`test` commits never stall on multi-hundred-MB tier merges.
             if allow_auto && !self.core.slice_parked() && self.core.needs_auto_tier_merge() {
+                self.map_all()?;
                 let now = self.driver.wall_ns();
                 if self.core.fold_tiered_slice(now, &mut self.effects)? {
                     self.run("auto-merging tiers on commit")?;
                 }
                 auto_folded = self.core.slice_parked();
+            } else {
+                self.map_for_commit(batches, records)?;
             }
         }
         let now = self.driver.wall_ns();

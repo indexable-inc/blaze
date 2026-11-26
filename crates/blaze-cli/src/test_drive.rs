@@ -2978,6 +2978,14 @@ impl<'c> Launched<'c, '_, '_> {
         let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
         // If this test is already impure at launch (eager native C image or custom harness), batch
         // pre-publish the suite's warm functions into `ahead` before spawning.
+        //
+        // Pure tests (`keep.is_ok()`) intentionally NEVER receive pre-published warm functions
+        // (not even pure `CodeClass::Toolchain` / closed functions): pure tests derive their
+        // `entered_fns` set — and therefore their `BZTR` `Address` and `Postings` asks — from the
+        // child's demand-driven `Up::Need` stream. Pre-publishing any function would suppress its
+        // `Up::Need` and make `entered_fns` depend on sibling test execution order (`warm_order`),
+        // violating Rule 25 determinism and breaking `Effect::Look` undo-cache and flakiness
+        // address matching (and for impure functions, bypassing per-test `NotKept` tracking).
         if keep.is_err() {
             let prep = self.suite_cache.borrow().prepublish_warm(
                 test_entry,
@@ -4069,6 +4077,7 @@ impl RunOne for Selected<'_, Option<Launched<'_, '_, '_>>> {
 pub(crate) struct SuiteSpec<'s> {
     pub unit: TestUnit<'s>,
     pub builder: Builder,
+    pub digests: crate::test_cache::SuiteDigests,
 }
 
 /// Outcome of the pure `TestCache` + `TestLoop` planning pass ([`prepare_suites`]).
@@ -4164,27 +4173,30 @@ pub(crate) fn prepare_suites_with<'a, 'm: 'a, D: blaze_core::Driver>(
     bump: blaze_own::Bump<'a>,
 ) -> Result<PreparedSuites<'a, 'm, D>, DriveError> {
     let alloc = bump.alloc();
-    let mut suite_specs = Vec::with_capacity_in(specs.len(), alloc);
-    for spec in specs {
-        suite_specs.push((spec.unit, spec.builder));
-    }
     let (mut cache, heads_vec, postings_list, moved) =
-        crate::test_cache::TestCache::open(lent, suite_specs.as_slice(), ids, certificate, tools_digest, alloc);
+        crate::test_cache::TestCache::open(lent, specs, ids, certificate, tools_digest, alloc);
     let mut heads_bump: Vec<Head<'a>, blaze_own::Bump<'a>> = Vec::with_capacity_in(heads_vec.len(), bump);
     for head in heads_vec {
         heads_bump.push(head);
     }
     let heads: &'a [Head<'a>] = heads_bump.into_bump_slice();
-    let postings: Postings<'a> = if postings_list.len() == 1 {
-        postings_list.first().copied().unwrap_or(Postings::EMPTY)
-    } else if postings_list.is_empty() {
+    // `TestLoop::begin_inventory` / `Plan::decide` only ever queries `postings.tests_of(ask)` for
+    // `ask` in `moved`: skip O(all suites * all asks) full postings re-encoding completely when
+    // `moved` is empty, and for multi-suite edits probe ONLY the moved asks directly against each
+    // suite's already-opened `BZPS` postings record (O(|moved| * suites * log P)).
+    let postings: Postings<'a> = if moved.is_empty() || postings_list.is_empty() {
         Postings::EMPTY
+    } else if postings_list.len() == 1 {
+        postings_list.first().copied().unwrap_or(Postings::EMPTY)
     } else {
         let mut pairs: AVec<'a, (Ask, TestId)> = Vec::new_in(alloc);
-        for head in heads.iter() {
-            for row in head.rows() {
-                for ask in head.asks(row) {
-                    pairs.push((ask, row.kept.test));
+        let mut named: AVec<'a, TestId> = Vec::new_in(alloc);
+        for &ask in moved.iter() {
+            for suite_postings in postings_list.iter() {
+                named.clear();
+                suite_postings.tests_of(ask, &mut named);
+                for &test in named.iter() {
+                    pairs.push((ask, test));
                 }
             }
         }
@@ -4355,7 +4367,6 @@ impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
         suites: &[Option<Suite<'_, 'h>>],
         ids: &RunIds<'h>,
         typed: crate::engine_body_record::TypedFrom<'h>,
-        certificate: crate::start_list::Certificate,
         config: LoopConfig<'a>,
         args: &[&str],
         lent: &CommandLent,
@@ -4393,7 +4404,7 @@ impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
                 let sync_typed = typed.sync_over(*ids);
                 pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
                     run_dirty(
-                        &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                        &sel_cx, fs, env, host, clock, err, suites, ids, typed, config, args, lent,
                         tables, watch, make_watch, frame, self.alloc, Some(relay), &mut self.machine, self.pending_runs,
                         self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
                     )
@@ -4401,7 +4412,7 @@ impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
             }
             Codes::Serial | Codes::Pooled => {
                 run_dirty(
-                    &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                    &sel_cx, fs, env, host, clock, err, suites, ids, typed, config, args, lent,
                     tables, watch, make_watch, frame, self.alloc, None, &mut self.machine, self.pending_runs,
                     self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
                 )
@@ -4502,7 +4513,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
     err: &bstd::out::Out,
-    suites: &[Option<Suite<'_, 'h>>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
+    suites: &[Option<Suite<'_, 'h>>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, config: LoopConfig<'r>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     alloc: Alloc<'a>, relay: Option<&CodeRelay<'_>>, machine: &mut TestLoop<'a, 'r>, pending_runs: AVec<'a, Effect<'a>>,
     steps_left: usize, most: usize, locations: &[Location], cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
@@ -4609,7 +4620,9 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         {
             *loaded = true;
             if let Some(Some(sc)) = suite_caches.get(suite_idx) {
-                let _ = active_cache.load_verified(loc.suite, &certificate, sc.borrow_mut().verified_mut());
+                let mut sc = sc.borrow_mut();
+                let (closed_set, ws_set) = sc.verified_sets_mut();
+                let _ = active_cache.load_verified(loc.suite, closed_set, ws_set);
             }
         }
     };
@@ -4659,7 +4672,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         let sc = sc.borrow();
         if sc.verified_dirty() {
             let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-            cache.record_verified(suite_id, certificate, sc.verified_pairs());
+            cache.record_verified(suite_id, sc.verified_closed_pairs(), sc.verified_workspace_pairs());
         }
     }
     Ok(status)
@@ -5267,7 +5280,12 @@ mod zero_spawn_tests {
             tests: TestRows::Main(LibKey(ContentId([0x82; 32]))),
             edition: blaze_surface::Edition::E2024,
         };
-        let specs = [SuiteSpec { unit: unit0, builder }, SuiteSpec { unit: unit1, builder }];
+        let make_specs = |ids: &RunIds<'_>| {
+            [
+                SuiteSpec { unit: unit0, builder, digests: crate::test_cache::test_suite_digests(unit0.key, &builder, ids, tools_digest) },
+                SuiteSpec { unit: unit1, builder, digests: crate::test_cache::test_suite_digests(unit1.key, &builder, ids, tools_digest) },
+            ]
+        };
         let make_config = |root_byte: u8| LoopConfig {
             plan: blaze_run::plan::Config {
                 width: 2,
@@ -5287,6 +5305,7 @@ mod zero_spawn_tests {
         let proofs = StandingProofs;
         let asked1 = IdsAsked::default();
         let Some(ids1) = build_ids(&cx, &tools, chk0, ContentId([0x11; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked1, blaze_own::testing::bump()) else { panic!("ids1") };
+        let specs1 = make_specs(&ids1);
         let name0 = instance_name_bytes(item0);
         let name1 = instance_name_bytes(item1);
         let Some(code_key0) = blaze_ladder::body_ids::instance_key(blaze_code::record::Symbol(sym0.0), item0, &name0, &ids1, &builder, &builder.producer, heap).map(|k| k.0.0) else { panic!("instance_key 0") };
@@ -5311,7 +5330,7 @@ mod zero_spawn_tests {
                 Ok(())
             };
             let cfg1 = make_config(0xaa);
-            let prepared1 = prepare_suites_with(&specs, &ids1, &cert1, tools_digest, cfg1, &[], &lent1, &clock, &mut cold_print, blaze_own::testing::bump());
+            let prepared1 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, cfg1, &[], &lent1, &clock, &mut cold_print, blaze_own::testing::bump());
             let Ok(PreparedSuites::Dirty(mut dirty1)) = prepared1 else { panic!("cold run must be Dirty") };
             assert!(dirty1.is_suite_dirty(0) && dirty1.is_suite_dirty(1), "both suites dirty on cold run");
             assert_eq!(dirty1.pending_count(), 2);
@@ -5364,7 +5383,7 @@ mod zero_spawn_tests {
             }
             Ok(())
         };
-        let prepared2 = prepare_suites_with(&specs, &ids1, &cert1, tools_digest, make_config(0xaa), &[], &lent2, &clock, &mut warm_print, blaze_own::testing::bump());
+        let prepared2 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, make_config(0xaa), &[], &lent2, &clock, &mut warm_print, blaze_own::testing::bump());
         match prepared2 {
             Ok(PreparedSuites::Done(status)) => {
                 assert_eq!(status, Status { passed: 2, failed: 0, ignored: 0, not_run: 0, check_errors: 0 });
@@ -5378,6 +5397,7 @@ mod zero_spawn_tests {
         // 3. Partial edit: only suite 0's body key moves (`0x11` -> `0x99`); suite 1 stays identical.
         let asked2 = IdsAsked::default();
         let Some(ids2) = build_ids(&cx, &tools, chk0, ContentId([0x99; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked2, blaze_own::testing::bump()) else { panic!("ids2") };
+        let specs2 = make_specs(&ids2);
         let cert2 = crate::start_list::Certificate::for_tests([0xbb; 32]);
         let mut partial_out = String::new_in(heap);
         let mut partial_print = |bytes: &[u8]| -> Result<(), DriveError> {
@@ -5386,12 +5406,17 @@ mod zero_spawn_tests {
             }
             Ok(())
         };
-        let prepared3 = prepare_suites_with(&specs, &ids2, &cert2, tools_digest, make_config(0xbb), &[], &lent2, &clock, &mut partial_print, blaze_own::testing::bump());
+        let prepared3 = prepare_suites_with(&specs2, &ids2, &cert2, tools_digest, make_config(0xbb), &[], &lent2, &clock, &mut partial_print, blaze_own::testing::bump());
         match prepared3 {
             Ok(PreparedSuites::Dirty(dirty3)) => {
                 assert!(dirty3.is_suite_dirty(0), "changed suite 0 must be dirty");
                 assert!(!dirty3.is_suite_dirty(1), "unchanged suite 1 must NOT be dirty (zero setup)");
                 assert_eq!(dirty3.pending_count(), 1, "only 1 dirty test queued");
+                assert_eq!(
+                    asked2.bodies(),
+                    1,
+                    "untouched suite 1 must hit per-suite SuiteCert in O(1) without opening its BodyCheck proof",
+                );
             }
             Ok(PreparedSuites::Done(status)) => panic!("edited suite 0 must not be Done: {status:?}"),
             Err(err) => panic!("partial prepare failed: {err}"),

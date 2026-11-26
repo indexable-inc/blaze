@@ -14,18 +14,20 @@
 use core::alloc::Allocator;
 use core::fmt;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use blaze_cas::plain::{Namespace, check_segment};
+use blaze_core::lock::Lock;
 use blaze_fetch::local::{CARGO_CACHE, crates_io_folder};
 use blaze_fetch::peer::{
     DEFAULT_UDP_PORT, HAS_BYTES, HAVE_HEADER_BYTES, HAVE_MAX_BYTES, HAVE_MAX_HASHES, HasPacket, MAGIC,
     MAX_REQUEST_HEAD, MULTICAST_GROUP, PeerRequest, VERSION, decode_have, encode_has, error_response,
     is_lan_ip, parse_http_request, parse_lower_hex_32, sha256, write_ok_head,
 };
+use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_ids::ContentId;
-use blaze_own::Vec as OwnVec;
+use blaze_own::{Arc, Share, Vec as OwnVec};
 use blaze_remote::wire_segment::{
     MAGIC as BZS1_MAGIC, VERSION as BZS1_VERSION, VerifiedWireSegment, WIRE_HEADER, WIRE_MIN_LEN,
     WireSegmentError, decode_wire_segment_verified, encode_wire_segment,
@@ -37,7 +39,7 @@ use bstd::cx::Cx;
 use bstd::entry::Status;
 use bstd::env::{Env, VarName};
 use bstd::fs::{Dir, Fs, FsError, HomeError, ReadOnly};
-use bstd::mem::{Bytes, Frame, MemError, Tag};
+use bstd::mem::{Bytes, Frame, MemError, TASK_FRAME, Tag};
 use bstd::net::{
     Addr, Ask, Batch, Conn, Datagrams, DatagramsOrAccept, DgramOptions, Ecn, HostPort, Listener, MulticastV4, Net,
     NetKind, RecvArm, Slots, UdpOptions,
@@ -45,6 +47,7 @@ use bstd::net::{
 use bstd::out::Out;
 use bstd::path::{Path, PathError};
 use bstd::rng::Rng;
+use bstd::sync::CachePadded;
 
 use crate::CliError;
 
@@ -72,6 +75,20 @@ const WATCHDOG_STOP_TICK: Duration = Duration::from_millis(20);
 const CONN_WAIT: Duration = Duration::from_secs(5);
 /// Shutdown close timeout for sockets.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// Maximum concurrent HTTP worker tasks serving accepted TCP clients (rule 18: bounded pool).
+const PEER_WORKERS_MOST: usize = 16;
+/// Maximum queued accepted TCP connections awaiting a peer HTTP worker (rule 18).
+const PEER_QUEUE_CAP: usize = 64;
+/// Bounded worker poll interval waiting on the accept queue so shutdown never stalls (rule 18).
+const WORKER_RECV_WAIT: Duration = Duration::from_millis(100);
+/// Maximum sequential HTTP/1.1 keep-alive requests served on one TCP connection (rule 18).
+const KEEP_ALIVE_REQUESTS_MOST: usize = 64;
+/// Idle deadline waiting for the next HTTP/1.1 keep-alive request on an open TCP connection.
+const KEEP_ALIVE_IDLE_WAIT: Duration = Duration::from_secs(5);
+/// Bounded in-memory cache of `BZS1`-compressed payloads for `SegzKind::RawBlps` entries (rule 18).
+const BZS1_CACHE_ALLOC: blaze_mem::Kept = blaze_mem::Kept(blaze_mem::Tag::Other);
+const BZS1_CACHE_MAX_BYTES: usize = 128 << 20;
+const BZS1_CACHE_MAX_ENTRIES: usize = 64;
 /// Ephemeral port range probed when `--bind <ip>:0` is requested (`HostPort` requires port >= 1).
 const EPHEMERAL_START: u16 = 41730;
 const EPHEMERAL_SPAN: u16 = 18000;
@@ -679,10 +696,186 @@ fn open_udp(
     Ok((sock, false))
 }
 
-/// Serves one HTTP/1.1 connection (`GET /v1/crate/<sha256>` or `GET /v1/segz/<blake3>`),
-/// enforcing bounded header length (`MAX_REQUEST_HEAD`) and bounded per-connection deadline
-/// (`CONN_WAIT`). Segment transfers are ALWAYS `BZS1`-compressed on the wire.
-#[expect(clippy::too_many_arguments, reason = "connection handler takes explicit directories and tables")]
+/// Bounded in-memory cache of `BZS1`-encoded payloads for `SegzKind::RawBlps` segments so
+/// repeated GETs never re-compress the same canonical `BLPS` segment (rule 18, rule 70).
+struct Bzs1CacheInner {
+    entries: Map<ContentId, Arc<OwnVec<u8, blaze_mem::Kept>, blaze_mem::Kept>, BuildKeyHasher, blaze_mem::Kept>,
+    order: OwnVec<(ContentId, usize), blaze_mem::Kept>,
+    bytes: usize,
+    #[cfg(test)]
+    encodes: u32,
+}
+
+struct Bzs1Cache {
+    inner: Lock<Bzs1CacheInner>,
+}
+
+impl Bzs1Cache {
+    fn new() -> Bzs1Cache {
+        Bzs1Cache {
+            inner: Lock::new(
+                "peer.bzs1_cache",
+                Bzs1CacheInner {
+                    entries: Map::new(MapOpts {
+                        hasher: BuildKeyHasher::default(),
+                        alloc: BZS1_CACHE_ALLOC,
+                        capacity: None,
+                    }),
+                    order: OwnVec::new_in(BZS1_CACHE_ALLOC),
+                    bytes: 0,
+                    #[cfg(test)]
+                    encodes: 0,
+                },
+            ),
+        }
+    }
+
+    fn get(&self, digest: &ContentId) -> Option<Arc<OwnVec<u8, blaze_mem::Kept>, blaze_mem::Kept>> {
+        let guard = self.inner.lock();
+        guard.entries.get(digest).map(Share::share)
+    }
+
+    fn insert(&self, digest: ContentId, payload: Arc<OwnVec<u8, blaze_mem::Kept>, blaze_mem::Kept>) {
+        let len = payload.len();
+        let mut guard = self.inner.lock();
+        #[cfg(test)]
+        {
+            guard.encodes = guard.encodes.saturating_add(1);
+        }
+        if len > BZS1_CACHE_MAX_BYTES || guard.entries.contains_key(&digest) {
+            return;
+        }
+        while (guard.bytes.saturating_add(len) > BZS1_CACHE_MAX_BYTES || guard.order.len() >= BZS1_CACHE_MAX_ENTRIES)
+            && !guard.order.is_empty()
+        {
+            let (evict_id, evict_len) = guard.order.remove(0);
+            if guard.entries.remove(&evict_id).is_some() {
+                guard.bytes = guard.bytes.saturating_sub(evict_len);
+            }
+        }
+        guard.entries.insert(digest, payload);
+        guard.order.push((digest, len));
+        guard.bytes = guard.bytes.saturating_add(len);
+    }
+
+    #[cfg(test)]
+    fn encodes(&self) -> u32 {
+        self.inner.lock().encodes
+    }
+}
+
+/// Writes an HTTP/1.1 `200 OK` response head with exact `Content-Length` and explicit
+/// `Connection: keep-alive` or `Connection: close`.
+fn write_ok_head_conn(content_len: u64, keep_alive: bool, out: &mut [u8; 160]) -> usize {
+    if !keep_alive {
+        return write_ok_head(content_len, out);
+    }
+    const PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ";
+    const SUFFIX: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
+
+    let mut at = 0usize;
+    if let Some(dst) = out.get_mut(at..at + PREFIX.len()) {
+        dst.copy_from_slice(PREFIX);
+        at += PREFIX.len();
+    }
+    let mut digits = [0u8; 20];
+    let mut n = content_len;
+    let mut dlen = 0usize;
+    if n == 0 {
+        if let Some(slot) = digits.first_mut() {
+            *slot = b'0';
+            dlen = 1;
+        }
+    } else {
+        while n > 0 {
+            let rem = u8::try_from(n % 10).unwrap_or(0);
+            if let Some(slot) = digits.get_mut(dlen) {
+                *slot = b'0' + rem;
+                dlen += 1;
+            }
+            n /= 10;
+        }
+        if let Some(slice) = digits.get_mut(..dlen) {
+            slice.reverse();
+        }
+    }
+    if let (Some(src), Some(dst)) = (digits.get(..dlen), out.get_mut(at..at + dlen)) {
+        dst.copy_from_slice(src);
+        at += dlen;
+    }
+    if let Some(dst) = out.get_mut(at..at + SUFFIX.len()) {
+        dst.copy_from_slice(SUFFIX);
+        at += SUFFIX.len();
+    }
+    at
+}
+
+/// Static HTTP/1.1 404 response keeping a persistent connection alive.
+const NOT_FOUND_KEEP_ALIVE: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+
+/// Determines whether an HTTP/1.x request head (`head_bytes` up to `\r\n\r\n`) requests a
+/// persistent connection (HTTP/1.1 defaults to keep-alive unless `Connection: close`; HTTP/1.0
+/// defaults to close unless `Connection: keep-alive`).
+fn request_wants_keep_alive(head_bytes: &[u8]) -> bool {
+    let Ok(head) = core::str::from_utf8(head_bytes) else {
+        return false;
+    };
+    let mut lines = head.split("\r\n");
+    let Some(req_line) = lines.next() else {
+        return false;
+    };
+    let is_http_11 = req_line.ends_with(" HTTP/1.1");
+    let mut saw_keep_alive = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        for token in value.split(',') {
+            let tok = token.trim();
+            if tok.eq_ignore_ascii_case("close") {
+                return false;
+            }
+            if tok.eq_ignore_ascii_case("keep-alive") {
+                saw_keep_alive = true;
+            }
+        }
+    }
+    is_http_11 || saw_keep_alive
+}
+
+/// Determines whether an HTTP/1.1 response head allows reusing the TCP connection.
+fn response_allows_keep_alive(head_str: &str) -> bool {
+    let mut lines = head_str.lines();
+    let Some(status_line) = lines.next() else {
+        return false;
+    };
+    let is_http_11 = status_line.starts_with("HTTP/1.1 ");
+    let mut saw_keep_alive = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        for token in value.split(',') {
+            let tok = token.trim();
+            if tok.eq_ignore_ascii_case("close") {
+                return false;
+            }
+            if tok.eq_ignore_ascii_case("keep-alive") {
+                saw_keep_alive = true;
+            }
+        }
+    }
+    is_http_11 || saw_keep_alive
+}
+
+/// Serves one HTTP/1.1 connection (`GET /v1/crate/<sha256>` or `GET /v1/segz/<blake3>`) with
+/// HTTP/1.1 keep-alive support (up to [`KEEP_ALIVE_REQUESTS_MOST`] sequential requests),
+/// enforcing bounded header length (`MAX_REQUEST_HEAD`) and bounded per-request deadlines
+/// (`CONN_WAIT`). Segment transfers are ALWAYS `BZS1`-compressed on the wire, with
+/// `SegzKind::RawBlps` payloads cached in `bzs1_cache`.
+#[expect(clippy::too_many_arguments, reason = "connection handler takes explicit directories, tables, and cache")]
 fn serve_conn(
     cx: &Cx,
     clock: &Clock,
@@ -691,119 +884,208 @@ fn serve_conn(
     index: CrateTable<'_>,
     segments_dir: Option<&Dir<ReadOnly>>,
     segz_index: SegzTable<'_>,
+    bzs1_cache: &Bzs1Cache,
+    shutdown: &AtomicBool,
+    stop: Option<&AtomicBool>,
+    allow_keep_alive: bool,
     corrupt_for_test: bool,
 ) {
-    let conn_cx = cx.until(clock.after(CONN_WAIT));
     let mut head_buf = [0u8; MAX_REQUEST_HEAD];
     let mut got = 0usize;
-    let parsed = loop {
-        let so_far = head_buf.get(..got).unwrap_or(&[]);
-        match parse_peer_http_request(so_far) {
-            PeerHttpRequest::NeedMore => {
-                let Some(tail) = head_buf.get_mut(got..) else {
-                    break PeerHttpRequest::BadRequest;
-                };
-                if tail.is_empty() {
-                    break PeerHttpRequest::BadRequest;
-                }
-                match conn.read_into(tail).wait(&conn_cx) {
-                    Ok(0) => break PeerHttpRequest::BadRequest,
-                    Ok(n) => got += n,
-                    Err(_) => {
-                        let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-                        return;
-                    }
-                }
-            }
-            req => break req,
-        }
-    };
+    let is_stopping = || shutdown.load(Ordering::Relaxed) || stop.is_some_and(|flag| flag.load(Ordering::Relaxed));
 
-    match parsed {
-        PeerHttpRequest::GetCrate(digest) => match lookup_crate(index, &digest) {
-            None => {
-                let _ = conn.send_all(&conn_cx, error_response(404));
-            }
-            Some(entry) => {
-                let reserve = usize::try_from(entry.len).unwrap_or(1 << 16);
-                if let Ok(scratch) = Frame::with_reserve(reserve.max(1 << 16).saturating_add(1 << 16), Tag::Other) {
-                    let mut body = Bytes::new_in(&scratch, "blaze peer: read .crate for client");
-                    if registry.read_all(&conn_cx, &entry.path, &mut body).is_ok() {
-                        let mut head = [0u8; 160];
-                        let payload = body.as_slice();
-                        let payload_len = u64::try_from(payload.len()).unwrap_or(0);
-                        let head_len = write_ok_head(payload_len, &mut head);
-                        let head_slice = head.get(..head_len).unwrap_or(&[]);
-                        if corrupt_for_test
-                            && let Some((&first, rest)) = payload.split_first()
-                        {
-                            let flipped = [first ^ 0xff];
-                            let _ = conn.send_vectored(&conn_cx, &[head_slice, &flipped, rest]);
-                        } else {
-                            let _ = conn.send_vectored(&conn_cx, &[head_slice, payload]);
-                        }
-                    } else {
-                        let _ = conn.send_all(&conn_cx, error_response(503));
+    for req_idx in 0..KEEP_ALIVE_REQUESTS_MOST {
+        if is_stopping() {
+            break;
+        }
+        let wait_limit = if req_idx == 0 { CONN_WAIT } else { KEEP_ALIVE_IDLE_WAIT };
+        let req_cx = cx.until(clock.after(wait_limit));
+        let mut clean_eof = false;
+        let parsed = loop {
+            let so_far = head_buf.get(..got).unwrap_or(&[]);
+            match parse_peer_http_request(so_far) {
+                PeerHttpRequest::NeedMore => {
+                    let Some(tail) = head_buf.get_mut(got..) else {
+                        break PeerHttpRequest::BadRequest;
+                    };
+                    if tail.is_empty() {
+                        break PeerHttpRequest::BadRequest;
                     }
-                } else {
-                    let _ = conn.send_all(&conn_cx, error_response(503));
-                }
-            }
-        },
-        PeerHttpRequest::GetSegz(digest) => match (segments_dir, lookup_segz(segz_index, &digest)) {
-            (Some(seg_dir), Some(entry)) => {
-                let reserve = usize::try_from(entry.len).unwrap_or(1 << 16);
-                // Extra headroom when compressing raw BLPS to BZS1 inside the connection frame.
-                let frame_cap = match entry.kind {
-                    SegzKind::PreEncoded => reserve.max(1 << 16).saturating_add(1 << 16),
-                    SegzKind::RawBlps => reserve.saturating_mul(3).max(4 << 20).saturating_add(2 << 20),
-                };
-                if let Ok(scratch) = Frame::with_reserve(frame_cap, Tag::Other) {
-                    let mut raw_body = Bytes::new_in(&scratch, "blaze peer: read BZS1 segment for client");
-                    if seg_dir.read_all(&conn_cx, &entry.path, &mut raw_body).is_ok() {
-                        let mut encoded = OwnVec::new_in(&scratch);
-                        let wire_payload: Option<&[u8]> = match entry.kind {
-                            SegzKind::PreEncoded => Some(raw_body.as_slice()),
-                            SegzKind::RawBlps => encode_wire_segment(raw_body.as_slice(), &mut encoded, &scratch)
-                                .ok()
-                                .map(|()| encoded.as_slice()),
-                        };
-                        if let Some(payload) = wire_payload {
-                            let mut head = [0u8; 160];
-                            let payload_len = u64::try_from(payload.len()).unwrap_or(0);
-                            let head_len = write_ok_head(payload_len, &mut head);
-                            let head_slice = head.get(..head_len).unwrap_or(&[]);
-                            if corrupt_for_test && let Some((&last, init)) = payload.split_last() {
-                                let flipped = [last ^ 0x5a];
-                                let _ = conn.send_vectored(&conn_cx, &[head_slice, init, &flipped]);
-                            } else {
-                                let _ = conn.send_vectored(&conn_cx, &[head_slice, payload]);
+                    // Issue one bounded `read_into` per request head (never cancel-and-retry
+                    // `Effect::Recv`, which could drop bytes that arrive during cancellation).
+                    match conn.read_into(tail).wait(&req_cx) {
+                        Ok(0) => {
+                            if got == 0 && req_idx > 0 {
+                                clean_eof = true;
                             }
+                            break PeerHttpRequest::BadRequest;
+                        }
+                        Ok(n) => got += n,
+                        Err(_) => {
+                            if req_idx > 0 {
+                                clean_eof = true;
+                                break PeerHttpRequest::BadRequest;
+                            }
+                            let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
+                            return;
+                        }
+                    }
+                }
+                req => break req,
+            }
+        };
+        if clean_eof {
+            break;
+        }
+
+        let head_end = head_buf
+            .get(..got)
+            .and_then(|s| s.windows(4).position(|w| w == b"\r\n\r\n"));
+        let wants_keep_alive = head_end
+            .and_then(|end| head_buf.get(..end))
+            .is_some_and(request_wants_keep_alive);
+        let can_keep_alive = allow_keep_alive && wants_keep_alive && req_idx + 1 < KEEP_ALIVE_REQUESTS_MOST;
+
+        // Preserve any pipelined next-request bytes past `\r\n\r\n` before reusing `head_buf`.
+        if let Some(end) = head_end {
+            let consumed = end + 4;
+            if consumed < got {
+                head_buf.copy_within(consumed..got, 0);
+                got -= consumed;
+            } else {
+                got = 0;
+            }
+        } else {
+            got = 0;
+        }
+
+        let send_cx = cx.until(clock.after(CONN_WAIT));
+        let keep_open = match parsed {
+            PeerHttpRequest::GetCrate(digest) => match lookup_crate(index, &digest) {
+                None => {
+                    let resp = if can_keep_alive { NOT_FOUND_KEEP_ALIVE } else { error_response(404) };
+                    conn.send_all(&send_cx, resp).is_ok() && can_keep_alive
+                }
+                Some(entry) => {
+                    let reserve = usize::try_from(entry.len).unwrap_or(1 << 16);
+                    if let Ok(scratch) = Frame::with_reserve(reserve.max(1 << 16).saturating_add(1 << 16), Tag::Other) {
+                        let mut body = Bytes::new_in(&scratch, "blaze peer: read .crate for client");
+                        if registry.read_all(&send_cx, &entry.path, &mut body).is_ok() {
+                            let mut head = [0u8; 160];
+                            let payload = body.as_slice();
+                            let payload_len = u64::try_from(payload.len()).unwrap_or(0);
+                            let head_len = write_ok_head_conn(payload_len, can_keep_alive, &mut head);
+                            let head_slice = head.get(..head_len).unwrap_or(&[]);
+                            let sent = if corrupt_for_test
+                                && let Some((&first, rest)) = payload.split_first()
+                            {
+                                let flipped = [first ^ 0xff];
+                                conn.send_vectored(&send_cx, &[head_slice, &flipped, rest])
+                            } else {
+                                conn.send_vectored(&send_cx, &[head_slice, payload])
+                            };
+                            sent.is_ok() && can_keep_alive
                         } else {
-                            let _ = conn.send_all(&conn_cx, error_response(503));
+                            let _ = conn.send_all(&send_cx, error_response(503));
+                            false
                         }
                     } else {
-                        let _ = conn.send_all(&conn_cx, error_response(503));
+                        let _ = conn.send_all(&send_cx, error_response(503));
+                        false
                     }
-                } else {
-                    let _ = conn.send_all(&conn_cx, error_response(503));
                 }
+            },
+            PeerHttpRequest::GetSegz(digest) => match (segments_dir, lookup_segz(segz_index, &digest)) {
+                (Some(seg_dir), Some(entry)) => {
+                    let sent_ok = match entry.kind {
+                        SegzKind::PreEncoded => {
+                            let reserve = usize::try_from(entry.len).unwrap_or(1 << 16);
+                            let frame_cap = reserve.max(1 << 16).saturating_add(1 << 16);
+                            if let Ok(scratch) = Frame::with_reserve(frame_cap, Tag::Other) {
+                                let mut raw_body = Bytes::new_in(&scratch, "blaze peer: read BZS1 segment for client");
+                                if seg_dir.read_all(&send_cx, &entry.path, &mut raw_body).is_ok() {
+                                    send_segz_payload(&conn, &send_cx, raw_body.as_slice(), can_keep_alive, corrupt_for_test)
+                                } else {
+                                    let _ = conn.send_all(&send_cx, error_response(503));
+                                    false
+                                }
+                            } else {
+                                let _ = conn.send_all(&send_cx, error_response(503));
+                                false
+                            }
+                        }
+                        SegzKind::RawBlps => {
+                            let cached = bzs1_cache.get(&digest).or_else(|| {
+                                let reserve = usize::try_from(entry.len).unwrap_or(1 << 16);
+                                let frame_cap = reserve.saturating_mul(2).max(4 << 20).saturating_add(2 << 20);
+                                let scratch = Frame::with_reserve(frame_cap, Tag::Other).ok()?;
+                                let mut raw_body = Bytes::new_in(&scratch, "blaze peer: read raw BLPS segment for BZS1 cache");
+                                seg_dir.read_all(&send_cx, &entry.path, &mut raw_body).ok()?;
+                                let mut encoded = OwnVec::new_in(BZS1_CACHE_ALLOC);
+                                encode_wire_segment(raw_body.as_slice(), &mut encoded, BZS1_CACHE_ALLOC).ok()?;
+                                let arc = Arc::new_in(encoded, BZS1_CACHE_ALLOC);
+                                bzs1_cache.insert(digest, arc.share());
+                                Some(arc)
+                            });
+                            if let Some(payload_arc) = cached {
+                                send_segz_payload(&conn, &send_cx, payload_arc.as_slice(), can_keep_alive, corrupt_for_test)
+                            } else {
+                                let _ = conn.send_all(&send_cx, error_response(503));
+                                false
+                            }
+                        }
+                    };
+                    sent_ok && can_keep_alive
+                }
+                _ => {
+                    let resp = if can_keep_alive { NOT_FOUND_KEEP_ALIVE } else { error_response(404) };
+                    conn.send_all(&send_cx, resp).is_ok() && can_keep_alive
+                }
+            },
+            PeerHttpRequest::NotFound => {
+                let resp = if can_keep_alive { NOT_FOUND_KEEP_ALIVE } else { error_response(404) };
+                conn.send_all(&send_cx, resp).is_ok() && can_keep_alive
             }
-            _ => {
-                let _ = conn.send_all(&conn_cx, error_response(404));
+            PeerHttpRequest::MethodNotAllowed => {
+                let _ = conn.send_all(&send_cx, error_response(405));
+                false
             }
-        },
-        PeerHttpRequest::NotFound => {
-            let _ = conn.send_all(&conn_cx, error_response(404));
-        }
-        PeerHttpRequest::MethodNotAllowed => {
-            let _ = conn.send_all(&conn_cx, error_response(405));
-        }
-        PeerHttpRequest::BadRequest | PeerHttpRequest::NeedMore => {
-            let _ = conn.send_all(&conn_cx, error_response(400));
+            PeerHttpRequest::BadRequest | PeerHttpRequest::NeedMore => {
+                let _ = conn.send_all(&send_cx, error_response(400));
+                false
+            }
+        };
+
+        if !keep_open {
+            break;
         }
     }
     let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
+}
+
+fn send_segz_payload(
+    conn: &Conn,
+    send_cx: &Cx,
+    payload: &[u8],
+    keep_alive: bool,
+    corrupt_for_test: bool,
+) -> bool {
+    let mut head = [0u8; 160];
+    let payload_len = u64::try_from(payload.len()).unwrap_or(0);
+    let head_len = write_ok_head_conn(payload_len, keep_alive, &mut head);
+    let head_slice = head.get(..head_len).unwrap_or(&[]);
+    let sent = if corrupt_for_test && let Some((&last, init)) = payload.split_last() {
+        let flipped = [last ^ 0x5a];
+        conn.send_vectored(send_cx, &[head_slice, init, &flipped])
+    } else {
+        conn.send_vectored(send_cx, &[head_slice, payload])
+    };
+    sent.is_ok()
+}
+
+/// Monotonic nanoseconds since clock start for cross-thread idle-activity tracking.
+fn peer_now_ns(clock: &Clock) -> u64 {
+    u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[expect(clippy::too_many_arguments, reason = "peer server loop takes explicit capabilities (rule 75)")]
@@ -822,10 +1104,143 @@ fn serve_loop(
     stop: Option<&AtomicBool>,
     corrupt_for_test: bool,
 ) -> Result<(), PeerError> {
-    let mut last_active = clock.now();
+    let bzs1_cache = Bzs1Cache::new();
+    serve_loop_with_cache(
+        cx,
+        clock,
+        &mut listener,
+        &udp,
+        tcp_port,
+        first_conn,
+        registry,
+        index,
+        segments_dir,
+        segz_index,
+        &bzs1_cache,
+        idle_expiry,
+        stop,
+        corrupt_for_test,
+    )?;
+    let close_cx = cx.until(clock.after(CLOSE_WAIT));
+    let _ = udp.close(&close_cx);
+    let _ = listener.close(&close_cx);
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments, reason = "peer server loop takes explicit capabilities and shared cache (rule 75)")]
+fn serve_loop_with_cache(
+    cx: &Cx,
+    clock: &Clock,
+    listener: &mut Listener,
+    udp: &Datagrams,
+    tcp_port: u16,
+    first_conn: Option<Conn>,
+    registry: &Dir<ReadOnly>,
+    index: CrateTable<'_>,
+    segments_dir: Option<&Dir<ReadOnly>>,
+    segz_index: SegzTable<'_>,
+    bzs1_cache: &Bzs1Cache,
+    idle_expiry: Duration,
+    stop: Option<&AtomicBool>,
+    corrupt_for_test: bool,
+) -> Result<(), PeerError> {
+    let active_transfers = CachePadded::new(AtomicU32::new(0));
+    let last_active_ns = CachePadded::new(AtomicU64::new(peer_now_ns(clock)));
+    let shutdown = AtomicBool::new(false);
+
+    // Dispatch accepted TCP connections to a bounded worker pool (up to `PEER_WORKERS_MOST`)
+    // when worker threads are available, so one 32 MiB GET never blocks UDP `HAVE`/`HAVE_SEGZ`
+    // replies or concurrent clients.
+    let mut conn_rx: Option<blaze_core::chan::Receiver<Conn>> = None;
+    let scope = cx.scope();
+    let max_workers = usize::try_from(scope.workers().saturating_sub(1))
+        .unwrap_or(0)
+        .min(PEER_WORKERS_MOST);
+    let mut conn_tx: Option<blaze_core::chan::Sender<Conn>> = None;
+    let mut worker_tasks: OwnVec<bstd::task::Task<'_, ()>, &Frame> = OwnVec::new_in(cx.frame());
+    if max_workers > 0 {
+        let (tx, rx) = blaze_core::chan::bounded::<Conn>(PEER_QUEUE_CAP);
+        let rx_ref: &blaze_core::chan::Receiver<Conn> = &*conn_rx.insert(rx);
+        for _ in 0..max_workers {
+            let active_ref = &active_transfers;
+            let last_ref = &last_active_ns;
+            let shutdown_ref = &shutdown;
+            let spawned_res = scope.must_overlap("blaze-peer-http-worker", TASK_FRAME, move |worker_cx| -> Result<(), PeerError> {
+                loop {
+                    match rx_ref.recv_timeout_named("blaze peer: waiting for TCP client", WORKER_RECV_WAIT) {
+                        Ok(conn) => {
+                            active_ref.fetch_add(1, Ordering::Relaxed);
+                            serve_conn(
+                                worker_cx,
+                                clock,
+                                conn,
+                                registry,
+                                index,
+                                segments_dir,
+                                segz_index,
+                                bzs1_cache,
+                                shutdown_ref,
+                                stop,
+                                true,
+                                corrupt_for_test,
+                            );
+                            active_ref.fetch_sub(1, Ordering::Relaxed);
+                            last_ref.fetch_max(peer_now_ns(clock), Ordering::Relaxed);
+                        }
+                        Err(blaze_core::chan::RecvTimeoutError::Timeout) => {
+                            if shutdown_ref.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        Err(blaze_core::chan::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                Ok(())
+            });
+            match spawned_res {
+                Ok(task) => worker_tasks.push(task),
+                Err(_) => break,
+            }
+        }
+        if !worker_tasks.is_empty() {
+            conn_tx = Some(tx);
+        }
+    }
+
+    let dispatch_conn = |conn: Conn| {
+        if let Some(tx) = &conn_tx {
+            match tx.try_send(conn) {
+                Ok(()) => {}
+                Err(blaze_core::chan::TrySendError::Full(conn) | blaze_core::chan::TrySendError::Disconnected(conn)) => {
+                    let send_cx = cx.until(clock.after(CLOSE_WAIT));
+                    let _ = conn.send_all(&send_cx, error_response(503));
+                    let _ = conn.finish(&send_cx);
+                }
+            }
+        } else {
+            active_transfers.fetch_add(1, Ordering::Relaxed);
+            serve_conn(
+                cx,
+                clock,
+                conn,
+                registry,
+                index,
+                segments_dir,
+                segz_index,
+                bzs1_cache,
+                &shutdown,
+                stop,
+                false,
+                corrupt_for_test,
+            );
+            active_transfers.fetch_sub(1, Ordering::Relaxed);
+            last_active_ns.fetch_max(peer_now_ns(clock), Ordering::Relaxed);
+        }
+    };
+
     if let Some(conn) = first_conn {
-        serve_conn(cx, clock, conn, registry, index, segments_dir, segz_index, corrupt_for_test);
-        last_active = clock.now();
+        last_active_ns.fetch_max(peer_now_ns(clock), Ordering::Relaxed);
+        dispatch_conn(conn);
     }
 
     let mut recv_arm = RecvArm::new();
@@ -840,16 +1255,23 @@ fn serve_loop(
         {
             break;
         }
-        let now = clock.now();
-        let idle_for = now.since(last_active).unwrap_or(Duration::ZERO);
-        if idle_for >= idle_expiry {
+        let now_ns = peer_now_ns(clock);
+        let active = active_transfers.load(Ordering::Relaxed);
+        let last_ns = last_active_ns.load(Ordering::Relaxed);
+        let idle_for = Duration::from_nanos(now_ns.saturating_sub(last_ns));
+        if active == 0 && idle_for >= idle_expiry {
             break;
         }
-        let wait_for = tick.min(idle_expiry.saturating_sub(idle_for));
+        let wait_for = if active > 0 {
+            tick
+        } else {
+            tick.min(idle_expiry.saturating_sub(idle_for))
+        };
         let wait_cx = cx.until(clock.after(wait_for));
-        match recv_arm.wait_or_accept(&wait_cx, &udp, &mut listener, &mut rx_batch, slots) {
+        match recv_arm.wait_or_accept(&wait_cx, udp, listener, &mut rx_batch, slots) {
             Ok(DatagramsOrAccept::Datagrams(batch)) => {
                 tx_batch.clear();
+                let current_active = active_transfers.load(Ordering::Relaxed);
                 for (head, raw) in batch.each() {
                     if let Some(have) = decode_have(raw) {
                         let mut mask = 0u32;
@@ -866,7 +1288,7 @@ fn serve_loop(
                                 tcp_port,
                                 nonce: have.nonce,
                                 mask,
-                                active_transfers: 0,
+                                active_transfers: current_active,
                             });
                             tx_batch.push(head.peer, Ecn::NotEct, &reply);
                         }
@@ -887,7 +1309,7 @@ fn serve_loop(
                                 tcp_port,
                                 nonce: have.nonce,
                                 mask,
-                                active_transfers: 0,
+                                active_transfers: current_active,
                             });
                             tx_batch.push(head.peer, Ecn::NotEct, &reply);
                         }
@@ -895,7 +1317,7 @@ fn serve_loop(
                 }
                 rx_batch = Some(batch);
                 if !tx_batch.is_empty() {
-                    last_active = clock.now();
+                    last_active_ns.fetch_max(peer_now_ns(clock), Ordering::Relaxed);
                     let send_cx = cx.until(clock.after(Duration::from_millis(200)));
                     if let Ok(cleared) = udp.send(&send_cx, tx_batch) {
                         tx_batch = cleared;
@@ -905,24 +1327,26 @@ fn serve_loop(
                 }
             }
             Ok(DatagramsOrAccept::Accepted(conn)) => {
-                serve_conn(cx, clock, conn, registry, index, segments_dir, segz_index, corrupt_for_test);
-                last_active = clock.now();
+                last_active_ns.fetch_max(peer_now_ns(clock), Ordering::Relaxed);
+                dispatch_conn(conn);
             }
             Err(err) if matches!(err.kind, NetKind::Stopped(Stopped::Deadline { .. })) => {}
             Err(_) => break,
         }
     }
 
-    recv_arm.disarm(&udp);
-    let close_cx = cx.until(clock.after(CLOSE_WAIT));
-    let _ = udp.close(&close_cx);
-    let _ = listener.close(&close_cx);
+    recv_arm.disarm(udp);
+    shutdown.store(true, Ordering::Relaxed);
+    drop(conn_tx);
+    for task in worker_tasks {
+        let _ = task.join(cx);
+    }
+    let _ = scope.join(cx);
     Ok(())
 }
 
 /// Typed failure discovering or fetching a verified `BZS1` (`segz-`) segment from a LAN peer.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code, reason = "LAN P2P BZS1 segment client surface; exercised in peer tests and ready for store take"))]
 pub(crate) enum SegzFetchError {
     /// Refused non-LAN peer IP (SSRF protection).
     NotLanPeer(IpAddr),
@@ -938,23 +1362,42 @@ pub(crate) enum SegzFetchError {
     NotPublic(Namespace),
 }
 
+impl fmt::Display for SegzFetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SegzFetchError::NotLanPeer(ip) => write!(f, "refused non-LAN peer address {ip}"),
+            SegzFetchError::EmptyQuery => f.write_str("empty HAVE_SEGZ digest query"),
+            SegzFetchError::TooManyDigests(n) => write!(f, "too many HAVE_SEGZ digests ({n} > {HAVE_MAX_HASHES})"),
+            SegzFetchError::Net(kind) => write!(f, "LAN peer network error: {kind:?}"),
+            SegzFetchError::InvalidHost => f.write_str("invalid LAN peer host/port"),
+            SegzFetchError::HttpStatus(code) => write!(f, "LAN peer HTTP status {code}"),
+            SegzFetchError::BadResponse(msg) => write!(f, "bad LAN peer HTTP response: {msg}"),
+            SegzFetchError::TooLarge { len, most } => write!(f, "LAN peer BZS1 segment too large ({len} > {most})"),
+            SegzFetchError::Wire(err) => write!(f, "LAN peer BZS1 wire error: {err}"),
+            SegzFetchError::DigestMismatch { wanted, got } => write!(f, "LAN peer BZS1 digest mismatch (wanted {wanted}, got {got})"),
+            SegzFetchError::NotPublic(ns) => write!(f, "LAN peer segment namespace {ns:?} is not PUBLIC"),
+        }
+    }
+}
+
 /// Best LAN peer answering a `HAVE_SEGZ` probe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(test), allow(dead_code, reason = "LAN P2P BZS1 segment discovery result"))]
 pub(crate) struct DiscoveredSegzPeer {
     pub addr: SocketAddr,
     pub mask: u32,
     pub active_transfers: u32,
 }
 
-/// Sends a `BLZP` `HAVE_SEGZ` probe over UDP and waits up to `wait` for unicast `HAS_SEGZ`
-/// replies from LAN peers (`is_lan_ip` enforced), selecting the best match deterministically.
-#[cfg_attr(not(test), allow(dead_code, reason = "LAN P2P BZS1 segment discovery client"))]
+/// Sends a `BLZP` `HAVE_SEGZ` probe over UDP using caller-provided `nonce` and `port_seed`
+/// (rule 75: no ambient randomness) and waits up to `wait` for unicast `HAS_SEGZ` replies from
+/// LAN peers (`is_lan_ip` enforced), selecting the best match deterministically.
+#[expect(clippy::too_many_arguments, reason = "explicit capability + seed probe entry (rule 75)")]
 pub(crate) fn probe_lan_segz(
     cx: &Cx,
     net: &Net,
     clock: &Clock,
-    rng: &mut Rng,
+    nonce: u64,
+    port_seed: u64,
     targets: &[SocketAddr],
     digests: &[ContentId],
     wait: Duration,
@@ -965,13 +1408,12 @@ pub(crate) fn probe_lan_segz(
     if digests.len() > HAVE_MAX_HASHES {
         return Err(SegzFetchError::TooManyDigests(digests.len()));
     }
-    let nonce = rng.next_u64();
     let mut wire = [0u8; HAVE_MAX_BYTES];
     let len = encode_have_segz(nonce, digests, &mut wire).ok_or(SegzFetchError::EmptyQuery)?;
     let payload = wire.get(..len).ok_or(SegzFetchError::BadResponse("encoded HAVE_SEGZ slice"))?;
 
     let bind_ip = if targets.iter().all(|t| t.ip().is_loopback()) { "127.0.0.1" } else { "0.0.0.0" };
-    let start_offset = u16::try_from(rng.next_u64() % u64::from(EPHEMERAL_SPAN)).unwrap_or(0);
+    let start_offset = u16::try_from(port_seed % u64::from(EPHEMERAL_SPAN)).unwrap_or(0);
     let mut sock = None;
     let mut last_err = NetKind::NotAllowed;
     for attempt in 0..PORT_TRIES {
@@ -1038,10 +1480,218 @@ pub(crate) fn probe_lan_segz(
     Ok(best)
 }
 
+/// Persistent HTTP/1.1 keep-alive connection to a LAN `blaze peer` for fetching multiple verified
+/// `BZS1` (`segz-`) segments without paying a fresh TCP handshake per segment.
+pub(crate) struct SegzPeerConn {
+    peer: SocketAddr,
+    conn: Option<Conn>,
+}
+
+impl SegzPeerConn {
+    /// Connects to a LAN `blaze peer` (enforcing `is_lan_ip` SSRF protection).
+    pub(crate) fn connect(
+        cx: &Cx,
+        net: &Net,
+        clock: &Clock,
+        peer: SocketAddr,
+    ) -> Result<SegzPeerConn, SegzFetchError> {
+        if !is_lan_ip(peer.ip()) {
+            return Err(SegzFetchError::NotLanPeer(peer.ip()));
+        }
+        let host_str = ip_to_host_str(peer.ip(), cx.frame());
+        let hp = HostPort::new(host_str.as_str(), peer.port()).map_err(|_| SegzFetchError::InvalidHost)?;
+        let conn_cx = cx.until(clock.after(CONN_WAIT));
+        let conn = net.connect(&conn_cx, &Addr::Tcp(hp)).map_err(|e| SegzFetchError::Net(e.kind))?;
+        Ok(SegzPeerConn { peer, conn: Some(conn) })
+    }
+
+    /// Whether the underlying HTTP/1.1 keep-alive TCP connection is still open for reuse.
+    pub(crate) fn is_open(&self) -> bool {
+        self.conn.is_some()
+    }
+
+    fn close_now(&mut self, cx: &Cx, clock: &Clock) {
+        if let Some(conn) = self.conn.take() {
+            let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
+        }
+    }
+
+    /// Fetches one `BZS1` segment over this connection (sending `Connection: keep-alive` when
+    /// `keep_alive == true`, or `Connection: close` otherwise) and cryptographically verifies its
+    /// full canonical `BLPS` BLAKE3 digest and `Namespace::PUBLIC` BEFORE returning any bytes.
+    #[expect(clippy::too_many_arguments, reason = "verified keep-alive segment fetch takes explicit capabilities and buffer")]
+    pub(crate) fn fetch_verified<'w, A: Allocator + Copy>(
+        &mut self,
+        cx: &Cx,
+        clock: &Clock,
+        expected: ContentId,
+        max_raw_len: u64,
+        keep_alive: bool,
+        wire_out: &'w mut OwnVec<u8, A>,
+        alloc: A,
+    ) -> Result<VerifiedWireSegment<'w, A>, SegzFetchError> {
+        let conn_cx = cx.until(clock.after(CONN_WAIT));
+        let hex_bytes = lower_hex_64(&expected.0);
+        let hex_str = core::str::from_utf8(&hex_bytes).map_err(|_| SegzFetchError::BadResponse("digest hex"))?;
+        let conn_hdr = if keep_alive { "keep-alive" } else { "close" };
+        let req = bstd::mem::format_in!(
+            cx.frame(),
+            "GET {SEGZ_ROUTE_PREFIX}{hex_str} HTTP/1.1\r\nHost: {}\r\nConnection: {conn_hdr}\r\n\r\n",
+            self.peer,
+        );
+        let conn = self
+            .conn
+            .take()
+            .ok_or(SegzFetchError::BadResponse("peer connection already closed"))?;
+        let finish_conn = |c: Conn| {
+            let _ = c.finish(&cx.until(clock.after(CLOSE_WAIT)));
+        };
+        if let Err(err) = conn.send_all(&conn_cx, req.as_str().as_bytes()) {
+            finish_conn(conn);
+            return Err(SegzFetchError::Net(err.kind));
+        }
+
+        let mut head_buf = [0u8; MAX_REQUEST_HEAD];
+        let mut head_got = 0usize;
+        let head_end = loop {
+            let so_far = head_buf.get(..head_got).unwrap_or(&[]);
+            if let Some(pos) = so_far.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            let Some(tail) = head_buf.get_mut(head_got..) else {
+                finish_conn(conn);
+                return Err(SegzFetchError::BadResponse("response head exceeded bound"));
+            };
+            if tail.is_empty() {
+                finish_conn(conn);
+                return Err(SegzFetchError::BadResponse("response head exceeded bound"));
+            }
+            match conn.read_into(tail).wait(&conn_cx) {
+                Ok(0) => {
+                    finish_conn(conn);
+                    return Err(SegzFetchError::BadResponse("truncated response head"));
+                }
+                Ok(n) => head_got += n,
+                Err(err) => {
+                    finish_conn(conn);
+                    return Err(SegzFetchError::Net(err.kind));
+                }
+            }
+        };
+
+        let head_str = match head_buf.get(..head_end).and_then(|b| core::str::from_utf8(b).ok()) {
+            Some(s) => s,
+            None => {
+                finish_conn(conn);
+                return Err(SegzFetchError::BadResponse("non-UTF-8 response head"));
+            }
+        };
+        let status = match head_str
+            .lines()
+            .next()
+            .and_then(|l| l.split_ascii_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+        {
+            Some(code) => code,
+            None => {
+                finish_conn(conn);
+                return Err(SegzFetchError::BadResponse("missing HTTP status"));
+            }
+        };
+        let server_keep_alive = keep_alive && response_allows_keep_alive(head_str);
+        if status != 200 {
+            if server_keep_alive {
+                self.conn = Some(conn);
+            } else {
+                finish_conn(conn);
+            }
+            return Err(SegzFetchError::HttpStatus(status));
+        }
+        let content_len = match head_str.lines().skip(1).find_map(|line| {
+            let (name, val) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("content-length").then(|| val.trim().parse::<u64>().ok())?
+        }) {
+            Some(len) => len,
+            None => {
+                finish_conn(conn);
+                return Err(SegzFetchError::BadResponse("missing Content-Length"));
+            }
+        };
+        if content_len > MAX_SEGZ_BYTES {
+            finish_conn(conn);
+            return Err(SegzFetchError::TooLarge { len: content_len, most: MAX_SEGZ_BYTES });
+        }
+        let target_len = match usize::try_from(content_len) {
+            Ok(len) => len,
+            Err(_) => {
+                finish_conn(conn);
+                return Err(SegzFetchError::TooLarge { len: content_len, most: MAX_SEGZ_BYTES });
+            }
+        };
+
+        wire_out.clear();
+        wire_out.resize(target_len, 0);
+        let body_start = head_end + 4;
+        let initial = head_buf.get(body_start..head_got).unwrap_or(&[]);
+        if initial.len() > target_len {
+            finish_conn(conn);
+            return Err(SegzFetchError::BadResponse("extra bytes past Content-Length"));
+        }
+        if let Some(dst) = wire_out.as_mut_slice().get_mut(..initial.len()) {
+            dst.copy_from_slice(initial);
+        }
+        let mut filled = initial.len();
+        let mut reads = 0usize;
+        while filled < target_len {
+            if reads >= SEGZ_FETCH_READS_MOST {
+                finish_conn(conn);
+                return Err(SegzFetchError::BadResponse("exceeded bounded read count"));
+            }
+            reads += 1;
+            let Some(tail) = wire_out.as_mut_slice().get_mut(filled..target_len) else {
+                finish_conn(conn);
+                return Err(SegzFetchError::BadResponse("body slice"));
+            };
+            match conn.read_into(tail).wait(&conn_cx) {
+                Ok(0) => {
+                    finish_conn(conn);
+                    return Err(SegzFetchError::BadResponse("truncated BZS1 body"));
+                }
+                Ok(n) => filled += n,
+                Err(err) => {
+                    finish_conn(conn);
+                    return Err(SegzFetchError::Net(err.kind));
+                }
+            }
+        }
+        if server_keep_alive {
+            self.conn = Some(conn);
+        } else {
+            finish_conn(conn);
+        }
+
+        // Verify full BZS1 structure AND streaming BLPS BLAKE3 digest BEFORE returning any record!
+        let verified = decode_wire_segment_verified(wire_out.as_slice(), max_raw_len, alloc).map_err(SegzFetchError::Wire)?;
+        let described = verified.described();
+        if described.namespace != Namespace::PUBLIC {
+            return Err(SegzFetchError::NotPublic(described.namespace));
+        }
+        if described.digest != expected {
+            return Err(SegzFetchError::DigestMismatch { wanted: expected, got: described.digest });
+        }
+        Ok(verified)
+    }
+
+    /// Explicitly finishes the linear TCP connection.
+    pub(crate) fn finish(mut self, cx: &Cx, clock: &Clock) {
+        self.close_now(cx, clock);
+    }
+}
+
 /// Fetches a `BZS1` compressed segment (`GET /v1/segz/<64-lower-hex>`) from a LAN peer and
 /// cryptographically verifies its full canonical `BLPS` BLAKE3 digest and `Namespace::PUBLIC`
 /// BEFORE returning any bytes (zero-trust P2P, rule Trust).
-#[cfg_attr(not(test), allow(dead_code, reason = "LAN P2P BZS1 verified segment fetcher"))]
+#[expect(clippy::too_many_arguments, reason = "single-shot verified peer segment fetch takes explicit capabilities")]
 pub(crate) fn fetch_verified_segz_from_peer<'w, A: Allocator + Copy>(
     cx: &Cx,
     net: &Net,
@@ -1052,128 +1702,10 @@ pub(crate) fn fetch_verified_segz_from_peer<'w, A: Allocator + Copy>(
     wire_out: &'w mut OwnVec<u8, A>,
     alloc: A,
 ) -> Result<VerifiedWireSegment<'w, A>, SegzFetchError> {
-    if !is_lan_ip(peer.ip()) {
-        return Err(SegzFetchError::NotLanPeer(peer.ip()));
-    }
-    let host_str = ip_to_host_str(peer.ip(), cx.frame());
-    let hp = HostPort::new(host_str.as_str(), peer.port()).map_err(|_| SegzFetchError::InvalidHost)?;
-    let conn_cx = cx.until(clock.after(CONN_WAIT));
-    let conn = net.connect(&conn_cx, &Addr::Tcp(hp)).map_err(|e| SegzFetchError::Net(e.kind))?;
-
-    let hex_bytes = lower_hex_64(&expected.0);
-    let hex_str = core::str::from_utf8(&hex_bytes).map_err(|_| SegzFetchError::BadResponse("digest hex"))?;
-    let req = bstd::mem::format_in!(
-        cx.frame(),
-        "GET {SEGZ_ROUTE_PREFIX}{hex_str} HTTP/1.1\r\nHost: {peer}\r\nConnection: close\r\n\r\n"
-    );
-    if let Err(err) = conn.send_all(&conn_cx, req.as_str().as_bytes()) {
-        let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-        return Err(SegzFetchError::Net(err.kind));
-    }
-
-    let mut head_buf = [0u8; MAX_REQUEST_HEAD];
-    let mut head_got = 0usize;
-    let head_end = loop {
-        let so_far = head_buf.get(..head_got).unwrap_or(&[]);
-        if let Some(pos) = so_far.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        let Some(tail) = head_buf.get_mut(head_got..) else {
-            let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-            return Err(SegzFetchError::BadResponse("response head exceeded bound"));
-        };
-        if tail.is_empty() {
-            let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-            return Err(SegzFetchError::BadResponse("response head exceeded bound"));
-        }
-        match conn.read_into(tail).wait(&conn_cx) {
-            Ok(0) => {
-                let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-                return Err(SegzFetchError::BadResponse("truncated response head"));
-            }
-            Ok(n) => head_got += n,
-            Err(err) => {
-                let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-                return Err(SegzFetchError::Net(err.kind));
-            }
-        }
-    };
-
-    let head_str = head_buf
-        .get(..head_end)
-        .and_then(|b| core::str::from_utf8(b).ok())
-        .ok_or(SegzFetchError::BadResponse("non-UTF-8 response head"))?;
-    let status = head_str
-        .lines()
-        .next()
-        .and_then(|l| l.split_ascii_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or(SegzFetchError::BadResponse("missing HTTP status"))?;
-    if status != 200 {
-        let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-        return Err(SegzFetchError::HttpStatus(status));
-    }
-    let content_len = head_str
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let (name, val) = line.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("content-length").then(|| val.trim().parse::<u64>().ok())?
-        })
-        .ok_or(SegzFetchError::BadResponse("missing Content-Length"))?;
-    if content_len > MAX_SEGZ_BYTES {
-        let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-        return Err(SegzFetchError::TooLarge { len: content_len, most: MAX_SEGZ_BYTES });
-    }
-    let target_len = usize::try_from(content_len).map_err(|_| SegzFetchError::TooLarge { len: content_len, most: MAX_SEGZ_BYTES })?;
-
-    wire_out.clear();
-    wire_out.resize(target_len, 0);
-    let body_start = head_end + 4;
-    let initial = head_buf.get(body_start..head_got).unwrap_or(&[]);
-    if initial.len() > target_len {
-        let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-        return Err(SegzFetchError::BadResponse("extra bytes past Content-Length"));
-    }
-    if let Some(dst) = wire_out.as_mut_slice().get_mut(..initial.len()) {
-        dst.copy_from_slice(initial);
-    }
-    let mut filled = initial.len();
-    let mut reads = 0usize;
-    while filled < target_len {
-        if reads >= SEGZ_FETCH_READS_MOST {
-            let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-            return Err(SegzFetchError::BadResponse("exceeded bounded read count"));
-        }
-        reads += 1;
-        let Some(tail) = wire_out.as_mut_slice().get_mut(filled..target_len) else {
-            let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-            return Err(SegzFetchError::BadResponse("body slice"));
-        };
-        match conn.read_into(tail).wait(&conn_cx) {
-            Ok(0) => {
-                let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-                return Err(SegzFetchError::BadResponse("truncated BZS1 body"));
-            }
-            Ok(n) => filled += n,
-            Err(err) => {
-                let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-                return Err(SegzFetchError::Net(err.kind));
-            }
-        }
-    }
-    let _ = conn.finish(&cx.until(clock.after(CLOSE_WAIT)));
-
-    // Verify full BZS1 structure AND streaming BLPS BLAKE3 digest BEFORE returning any record!
-    let verified = decode_wire_segment_verified(wire_out.as_slice(), max_raw_len, alloc).map_err(SegzFetchError::Wire)?;
-    let described = verified.described();
-    if described.namespace != Namespace::PUBLIC {
-        return Err(SegzFetchError::NotPublic(described.namespace));
-    }
-    if described.digest != expected {
-        return Err(SegzFetchError::DigestMismatch { wanted: expected, got: described.digest });
-    }
-    Ok(verified)
+    let mut client = SegzPeerConn::connect(cx, net, clock, peer)?;
+    let result = client.fetch_verified(cx, clock, expected, max_raw_len, false, wire_out, alloc);
+    client.finish(cx, clock);
+    result
 }
 
 /// Entry point for `blaze peer [--bind <ip>:0] [--udp-port 41729] [--idle-secs 1800] [--segments <dir>]`.
@@ -1672,7 +2204,7 @@ mod tests {
                 .expect("spawn peer segz task");
 
             let udp_addr = ready_rx.recv_timeout(Duration::from_secs(5)).expect("peer started");
-            let found = probe_lan_segz(cx, &net, &clock, &mut rng, &[udp_addr], &[digest], Duration::from_secs(2))
+            let found = probe_lan_segz(cx, &net, &clock, rng.next_u64(), rng.next_u64(), &[udp_addr], &[digest], Duration::from_secs(2))
                 .expect("probe_lan_segz")
                 .expect("peer must answer HAS_SEGZ");
             assert_eq!(found.mask, 1);
@@ -1736,5 +2268,161 @@ mod tests {
         let dir = fs.open_dir(&cx, &Path::new("priv").expect("p")).expect("dir").read_only();
         let indexed = scan_segz_dir(&cx, &dir, cx.frame()).expect("scan");
         assert!(indexed.is_empty(), "Namespace::LOCAL segments must NEVER be advertised over LAN P2P");
+    }
+
+    #[test]
+    fn keep_alive_segz_client_reuses_connection_and_caches_raw_blps_compression() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let (raw1, wire1, digest1, records1) = make_test_segment(Namespace::PUBLIC, alloc);
+        // Build a second distinct public raw BLPS segment.
+        let mut recs2: OwnVec<(ContentId, blaze_keyed::kind::Tag, OwnVec<u8, Alloc<'static>>), Alloc<'static>> = OwnVec::new_in(alloc);
+        for i in 10..18u8 {
+            let key = ContentId::of("peer bzs1 segment record two", &[i]);
+            let mut payload = OwnVec::new_in(alloc);
+            for _ in 0..32 {
+                payload.extend_from_slice(b"second segment repetitive bytes ");
+                payload.push(i);
+            }
+            recs2.push((key, blaze_keyed::kind::Tag(3), payload));
+        }
+        recs2.sort_by_key(|(k, _, _)| *k);
+        let mut refs2: OwnVec<(blaze_keyed::exec::RecordRef, &[u8]), Alloc<'static>> = OwnVec::with_capacity_in(recs2.len(), alloc);
+        for (k, t, p) in recs2.iter() {
+            refs2.push((blaze_keyed::exec::RecordRef { key: *k, tag: *t }, p.as_slice()));
+        }
+        let mut raw2_buf = Default::default();
+        blaze_cas::plain::seal_segment(Namespace::PUBLIC, &refs2, &mut raw2_buf).expect("seal segment 2");
+        let desc2 = check_segment(&raw2_buf).expect("check segment 2");
+        let digest2 = desc2.digest;
+
+        let io: Io = bstd::test::native("/tmp".as_ref()).expect("native world over /tmp");
+        let workers = NonZeroU32::new(2).expect("two workers");
+        io.with_test_workers(workers, |cx| {
+            let fs = io.need_fs().expect("fs");
+            let net = io.need_net().expect("net");
+            let clock = io.need_clock().expect("clock");
+            let mut rng = io.need_rng().expect("rng");
+            let udp_port = 47729u16;
+            let tag = rng.next_u64() ^ u64::from(udp_port);
+
+            let sub = bstd::mem::format_in!(cx.frame(), "blaze-peer-ka-{tag:x}");
+            let peer_cargo_abs = bstd::mem::format_in!(cx.frame(), "/tmp/{}/peer-cargo", sub.as_str());
+            let cargo_marker_rel = bstd::mem::format_in!(cx.frame(), "{}/peer-cargo/registry/.keep", sub.as_str());
+            let hex1 = lower_hex_64(&digest1.0);
+            let hex1_str = core::str::from_utf8(&hex1).expect("hex1");
+            let hex2 = lower_hex_64(&digest2.0);
+            let hex2_str = core::str::from_utf8(&hex2).expect("hex2");
+            // Publish BOTH as raw `seg-` BLPS files to exercise `SegzKind::RawBlps` + `Bzs1Cache`.
+            let seg1_rel = bstd::mem::format_in!(cx.frame(), "{}/segs/seg-{hex1_str}", sub.as_str());
+            let seg2_rel = bstd::mem::format_in!(cx.frame(), "{}/segs/seg-{hex2_str}", sub.as_str());
+            let segs_dir_rel = bstd::mem::format_in!(cx.frame(), "{}/segs", sub.as_str());
+
+            fs.root().publish(cx, &Path::new(cargo_marker_rel.as_str()).expect("p"), Content::bytes(b""), Durable::No).expect("w");
+            fs.root().publish(cx, &Path::new(seg1_rel.as_str()).expect("p"), Content::bytes(raw1.as_slice()), Durable::No).expect("w");
+            fs.root().publish(cx, &Path::new(seg2_rel.as_str()).expect("p"), Content::bytes(&raw2_buf), Durable::No).expect("w");
+
+            let short_cx = cx.until(clock.after(Duration::from_secs(10)));
+            let cx = &short_cx;
+            let stop = AtomicBool::new(false);
+            let (ready_tx, ready_rx) = blaze_core::chan::bounded::<SocketAddr>(1);
+            let (encodes_tx, encodes_rx) = blaze_core::chan::bounded::<u32>(1);
+            let scope = cx.scope();
+            let peer_cargo_str = peer_cargo_abs.as_str();
+            let segs_rel_str = segs_dir_rel.as_str();
+            let stop_ref = &stop;
+
+            let peer_task = scope
+                .must_overlap("blaze-peer-ka-server", TASK_FRAME, move |_| -> Result<(), PeerError> {
+                    let peer_io: Io = bstd::test::native("/tmp".as_ref()).expect("peer native world");
+                    let peer_workers = NonZeroU32::new(4).expect("four peer workers");
+                    peer_io.with_test_workers(peer_workers, |peer_cx| -> Result<(), PeerError> {
+                        let peer_fs = peer_io.need_fs().expect("peer fs");
+                        let peer_net = peer_io.need_net().expect("peer net");
+                        let peer_clock = peer_io.need_clock().expect("peer clock");
+                        let mut peer_rng = peer_io.need_rng().expect("peer rng");
+                        let (registry, index) = scan_cargo_cache(peer_cx, &peer_fs, peer_cargo_str, peer_cx.frame())?;
+                        let seg_dir = peer_fs.open_dir(peer_cx, &Path::new(segs_rel_str)?)?.read_only();
+                        let segz_index = scan_segz_dir(peer_cx, &seg_dir, peer_cx.frame())?;
+                        assert_eq!(segz_index.len(), 2, "peer must index both raw BLPS segments");
+                        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+                        let (mut listener, tcp_port, first_conn) =
+                            open_listener(peer_cx, &peer_net, &peer_clock, &mut peer_rng, ip, 0, peer_cx.frame())?;
+                        let (udp, _) = open_udp(peer_cx, &peer_net, ip, udp_port, peer_cx.frame())?;
+                        let cache = Bzs1Cache::new();
+                        _ = ready_tx.send(SocketAddr::new(ip, udp_port));
+                        let res = serve_loop_with_cache(
+                            peer_cx,
+                            &peer_clock,
+                            &mut listener,
+                            &udp,
+                            tcp_port,
+                            first_conn,
+                            &registry,
+                            index.as_slice(),
+                            Some(&seg_dir),
+                            segz_index.as_slice(),
+                            &cache,
+                            Duration::from_secs(30),
+                            Some(stop_ref),
+                            false,
+                        );
+                        _ = encodes_tx.send(cache.encodes());
+                        let close_cx = peer_cx.until(peer_clock.after(CLOSE_WAIT));
+                        let _ = udp.close(&close_cx);
+                        let _ = listener.close(&close_cx);
+                        res
+                    })
+                })
+                .expect("spawn peer ka server");
+
+            let udp_addr = ready_rx.recv_timeout(Duration::from_secs(5)).expect("peer started");
+            let found = probe_lan_segz(cx, &net, &clock, rng.next_u64(), rng.next_u64(), &[udp_addr], &[digest1, digest2], Duration::from_secs(2))
+                .expect("probe_lan_segz")
+                .expect("peer must answer HAS_SEGZ");
+            assert_eq!(found.mask, 0b11, "peer must advertise both raw BLPS segments");
+
+            // Reuse ONE HTTP/1.1 keep-alive connection for 3 requests: seg1, seg2, seg1 again.
+            let mut client = SegzPeerConn::connect(cx, &net, &clock, found.addr).expect("connect keep-alive");
+            let mut wire_buf = OwnVec::new_in(alloc);
+
+            {
+                let v1 = client
+                    .fetch_verified(cx, &clock, digest1, u64::try_from(raw1.len()).unwrap_or(MAX_SEGZ_BYTES), true, &mut wire_buf, alloc)
+                    .expect("first GET seg1");
+                assert_eq!(v1.described().digest, digest1);
+                assert_eq!(v1.len(), records1.len());
+            }
+            assert!(client.is_open(), "keep-alive connection must remain open after first GET");
+            assert_eq!(wire_buf.len(), wire1.len());
+
+            {
+                let v2 = client
+                    .fetch_verified(cx, &clock, digest2, u64::try_from(raw2_buf.len()).unwrap_or(MAX_SEGZ_BYTES), true, &mut wire_buf, alloc)
+                    .expect("second GET seg2 on same keep-alive connection");
+                assert_eq!(v2.described().digest, digest2);
+                assert_eq!(v2.len(), recs2.len());
+            }
+            assert!(client.is_open(), "keep-alive connection must remain open after second GET");
+
+            {
+                let v1_again = client
+                    .fetch_verified(cx, &clock, digest1, u64::try_from(raw1.len()).unwrap_or(MAX_SEGZ_BYTES), false, &mut wire_buf, alloc)
+                    .expect("third GET seg1 (cached BZS1) on same keep-alive connection");
+                assert_eq!(v1_again.described().digest, digest1);
+                assert_eq!(v1_again.len(), records1.len());
+            }
+            assert!(!client.is_open(), "Connection: close must close the client connection");
+            client.finish(cx, &clock);
+
+            stop.store(true, Ordering::Relaxed);
+            let _ = peer_task.join(cx);
+            let _ = scope.join(cx);
+            let encodes = encodes_rx.recv_timeout(Duration::from_secs(5)).expect("encode count");
+            assert_eq!(encodes, 2, "Bzs1Cache must compress each RawBlps segment once (3 GETs -> 2 encodes, got {encodes})");
+
+            let _ = fs.root().remove(cx, &Path::new(seg1_rel.as_str()).expect("p"), Durable::No);
+            let _ = fs.root().remove(cx, &Path::new(seg2_rel.as_str()).expect("p"), Durable::No);
+            let _ = fs.root().remove(cx, &Path::new(cargo_marker_rel.as_str()).expect("p"), Durable::No);
+        });
     }
 }

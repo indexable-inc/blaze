@@ -75,10 +75,10 @@ crates/blaze-cli/src/start_list.rs	VERSION	none
 crates/blaze-cli/src/store/published.rs	FLOOR_MAGIC	none
 crates/blaze-cli/src/sweep.rs	LEAVES_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	STATE_MAGIC	none
-crates/blaze-cli/src/test_cache.rs	STATE_VERSION	test decode_state_refuses_previous_v1_layout
+crates/blaze-cli/src/test_cache.rs	STATE_VERSION	test decode_state_refuses_previous_v2_layout
 crates/blaze-cli/src/unused_deps.rs	FILE_REFS_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	VERIFIED_MAGIC	none
-crates/blaze-cli/src/test_cache.rs	VERIFIED_VERSION	none
+crates/blaze-cli/src/test_cache.rs	VERIFIED_VERSION	test decode_verified_refuses_previous_v1_layout
 crates/blaze-code/src/datum.rs	DATUM_MAGIC	none
 crates/blaze-code/src/record.rs	MAGIC	none
 crates/blaze-cunit/src/index.rs	INDEX_MAGIC	none

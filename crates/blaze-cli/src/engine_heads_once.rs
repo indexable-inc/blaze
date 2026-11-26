@@ -118,6 +118,7 @@ use blaze_ladder::front2::receiver::Pointers;
 use blaze_own::{Alloc, SharedAlloc, Vec};
 use bstd::cx::Cx;
 use bstd::mem::Frame;
+use bstd::sync::CachePadded;
 
 use crate::CliError;
 use crate::engine_seeds::{DependencyFinder, HeadRecords, KEY_BYTES, Keyed};
@@ -137,7 +138,7 @@ struct SliceRef(u32);
 /// Every slice lives as long as `&self` (zero `leak_static()`, zero `unsafe`) and is freed in
 /// full when [`HeadsOnce`] drops at the end of `Stage::Heads`.
 struct SliceSlab<T> {
-    next: AtomicU32,
+    next: CachePadded<AtomicU32>,
     outer: Vec<OnceLock<Vec<OnceLock<blaze_own::Box<[T], SharedAlloc<'static>>>, SharedAlloc<'static>>>, SharedAlloc<'static>>,
     alloc: SharedAlloc<'static>,
 }
@@ -148,7 +149,7 @@ impl<T: Copy> SliceSlab<T> {
         for _ in 0..SLAB_OUTER {
             outer.push(OnceLock::new());
         }
-        SliceSlab { next: AtomicU32::new(0), outer, alloc }
+        SliceSlab { next: CachePadded::new(AtomicU32::new(0)), outer, alloc }
     }
 
     fn push(&self, items: &[T]) -> Option<SliceRef> {
@@ -349,9 +350,9 @@ pub(crate) struct HeadsOnce<R = CommandRecords> {
     deps: Option<DependencyFinder<R>>,
     /// Each closed dependency cell looked up under its key, by its bytes ([`Looked`]).
     looked: blaze_core::SharedMap<[u8; WANT_BYTES], Looked, SharedAlloc<'static>>,
-    /// Closed dependency heads found under their keys (each once), and frozen here.
-    deps_found: AtomicU32,
-    deps_frozen: AtomicU32,
+    /// Closed dependency heads found under their keys (each once), and frozen here (128B padded, rule 86).
+    deps_found: CachePadded<AtomicU32>,
+    deps_frozen: CachePadded<AtomicU32>,
     /// The keys this request put (sorted), for the root (engine_seeds.rs `RequestTable::list_too`).
     put_keys: Vec<Key, SharedAlloc<'static>>,
     /// The bytes of the dependency heads whose records were committed: answered from the store
@@ -365,8 +366,8 @@ pub(crate) struct HeadsOnce<R = CommandRecords> {
     failures: blaze_core::SharedMap<[u8; WANT_BYTES], StoredFailedEntry, blaze_own::SharedAlloc<'static>>,
     /// Failures published by the job sources (each put, kept or twice), and seconds of equal
     /// words counted.
-    failed: AtomicU32,
-    failed_twice: AtomicU32,
+    failed: CachePadded<AtomicU32>,
+    failed_twice: CachePadded<AtomicU32>,
     /// Each constant evaluated, by its key and the unit it was evaluated for.
     consts: blaze_core::SharedSet<([u8; 8], LibKey), blaze_own::SharedAlloc<'static>>,
     heap: &'static blaze_own::Heap,
@@ -377,33 +378,33 @@ pub(crate) struct HeadsOnce<R = CommandRecords> {
     consts_slab: SliceSlab<(LibKey, u128)>,
     plant: OncePlant,
     /// Freezes done by the job sources (each put, kept or twice).
-    frozen: AtomicU32,
-    twice: AtomicU32,
+    frozen: CachePadded<AtomicU32>,
+    twice: CachePadded<AtomicU32>,
     /// Seconds whose bytes were equal but whose reads were not (a fact of a race; module docs).
-    reads_unequal: AtomicU32,
+    reads_unequal: CachePadded<AtomicU32>,
     /// Wants lowered by every source of the phase (heads.rs `Store::lowered`).
-    lowered: AtomicU64,
+    lowered: CachePadded<AtomicU64>,
     /// Cells a job source took from the table.
-    found: AtomicU32,
+    found: CachePadded<AtomicU32>,
     /// Heads frozen over a source of their own ([`alone`]): every head under [`Sources::Head`],
     /// none under [`Sources::Job`] (lane HF1: the floor 0).
-    alone: AtomicU32,
+    alone: CachePadded<AtomicU32>,
     /// Constants evaluated (each ask of an evaluator).
-    evaluated: AtomicU32,
+    evaluated: CachePadded<AtomicU32>,
     /// Head tasks whose read list was kept, the cells in all of them, the most in one: the
     /// memory the reader index is built from (coordinator, 2026-11-18: 892 MB in 1,408 lists).
-    read_lists: AtomicU32,
-    read_cells: AtomicU64,
-    read_most: AtomicU32,
+    read_lists: CachePadded<AtomicU32>,
+    read_cells: CachePadded<AtomicU64>,
+    read_most: CachePadded<AtomicU32>,
     /// Each dependency head's [`Cover`], made on its first read by a head task ([`cover`]).
     covers: blaze_core::SharedMap<[u8; WANT_BYTES], StoredCover, blaze_own::SharedAlloc<'static>>,
     /// Entries kept of a member's head and of a dependency's, and the frozen bytes they hold.
-    members: AtomicU32,
-    dependencies: AtomicU32,
-    bytes_held: AtomicU64,
+    members: CachePadded<AtomicU32>,
+    dependencies: CachePadded<AtomicU32>,
+    bytes_held: CachePadded<AtomicU64>,
     /// Two covers of one dependency head made with other cells (a fact of the walk: never, as
     /// a cover is a function of the table's entries, which only insert).
-    covers_unequal: AtomicU32,
+    covers_unequal: CachePadded<AtomicU32>,
 }
 
 /// What a read of a DEPENDENCY's head is, for a head task (lane H8; rule 77): the `WHOLE` cell
@@ -530,16 +531,16 @@ impl<R: HeadRecords> HeadsOnce<R> {
         HeadsOnce {
             deps: None,
             looked: blaze_core::SharedMap::new_in("engine.dependency heads looked up by key", shared),
-            deps_found: AtomicU32::new(0),
-            deps_frozen: AtomicU32::new(0),
+            deps_found: CachePadded::new(AtomicU32::new(0)),
+            deps_frozen: CachePadded::new(AtomicU32::new(0)),
             put_keys: Vec::new_in(shared),
             committed_bytes: 0,
             forgot: blaze_core::SharedSet::new_in("engine.dependency heads forgotten at their put (planted)", shared),
             sources,
             cells: blaze_core::SharedMap::new_in("engine.heads frozen once a request, with their reads", shared),
             failures: blaze_core::SharedMap::new_in("engine.heads failed once a request, with their reads", shared),
-            failed: AtomicU32::new(0),
-            failed_twice: AtomicU32::new(0),
+            failed: CachePadded::new(AtomicU32::new(0)),
+            failed_twice: CachePadded::new(AtomicU32::new(0)),
             consts: blaze_core::SharedSet::new_in("engine.head constants evaluated, by unit", shared),
             heap,
             bytes_slab: SliceSlab::new(shared),
@@ -547,21 +548,21 @@ impl<R: HeadRecords> HeadsOnce<R> {
             heads_slab: SliceSlab::new(shared),
             consts_slab: SliceSlab::new(shared),
             plant,
-            frozen: AtomicU32::new(0),
-            twice: AtomicU32::new(0),
-            reads_unequal: AtomicU32::new(0),
-            lowered: AtomicU64::new(0),
-            found: AtomicU32::new(0),
-            alone: AtomicU32::new(0),
-            evaluated: AtomicU32::new(0),
-            read_lists: AtomicU32::new(0),
-            read_cells: AtomicU64::new(0),
-            read_most: AtomicU32::new(0),
+            frozen: CachePadded::new(AtomicU32::new(0)),
+            twice: CachePadded::new(AtomicU32::new(0)),
+            reads_unequal: CachePadded::new(AtomicU32::new(0)),
+            lowered: CachePadded::new(AtomicU64::new(0)),
+            found: CachePadded::new(AtomicU32::new(0)),
+            alone: CachePadded::new(AtomicU32::new(0)),
+            evaluated: CachePadded::new(AtomicU32::new(0)),
+            read_lists: CachePadded::new(AtomicU32::new(0)),
+            read_cells: CachePadded::new(AtomicU64::new(0)),
+            read_most: CachePadded::new(AtomicU32::new(0)),
             covers: blaze_core::SharedMap::new_in("engine.dependency heads' covers, by cell", shared),
-            members: AtomicU32::new(0),
-            dependencies: AtomicU32::new(0),
-            bytes_held: AtomicU64::new(0),
-            covers_unequal: AtomicU32::new(0),
+            members: CachePadded::new(AtomicU32::new(0)),
+            dependencies: CachePadded::new(AtomicU32::new(0)),
+            bytes_held: CachePadded::new(AtomicU64::new(0)),
+            covers_unequal: CachePadded::new(AtomicU32::new(0)),
         }
     }
 
