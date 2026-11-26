@@ -13,7 +13,7 @@ use blaze_memchr::memchr;
 use blaze_own::{AString, AVec, Alloc, Heap4, String, Vec, planted::Planted};
 
 use crate::{
-    Detail, Divergence, ErrorKind, GitError, GitFile, GitStatusPlant, Limits,
+    Detail, Divergence, ErrorKind, FileStatus, GitError, GitFile, GitStatusPlant, Limits,
     commit_graph::CommitGraph,
     index::{IndexEntry, IndexView},
 };
@@ -153,6 +153,8 @@ pub struct DiffDir<'a> {
 pub struct StagedDiff<'a> {
     queue: AVec<'a, DiffDir<'a>>,
     pub counts: StagedCounts,
+    /// Per-path staged changes (populated only when `detail == Detail::Full`).
+    pub staged_entries: AVec<'a, (AString<'a>, FileStatus)>,
     detail: Detail,
     limits: Limits,
     alloc: Alloc<'a>,
@@ -173,9 +175,10 @@ impl<'a> StagedDiff<'a> {
     ) -> StagedDiff<'a> {
         let mut queue = Vec::new_in(alloc);
         let mut counts = StagedCounts::default();
+        let mut staged_entries = Vec::new_in(alloc);
 
         if plant.has(GitStatusPlant::SkipStagedDiff) {
-            return StagedDiff { queue, counts, detail, limits, alloc };
+            return StagedDiff { queue, counts, staged_entries, detail, limits, alloc };
         }
 
         let Some(root_tree) = head_tree else {
@@ -183,17 +186,22 @@ impl<'a> StagedDiff<'a> {
             for entry in index.entries.iter() {
                 if !entry.intent_to_add {
                     counts.added = counts.added.saturating_add(1);
+                    if detail == Detail::Full
+                        && let Some(s) = index.path_str(entry)
+                    {
+                        staged_entries.push((String::from_str_in(s, alloc), FileStatus::Added));
+                    }
                     if detail == Detail::Presence {
                         break;
                     }
                 }
             }
-            return StagedDiff { queue, counts, detail, limits, alloc };
+            return StagedDiff { queue, counts, staged_entries, detail, limits, alloc };
         };
 
         // O(1) cache-tree root check!
         if index.cache_tree_root_oid() == Some(root_tree) {
-            return StagedDiff { queue, counts, detail, limits, alloc };
+            return StagedDiff { queue, counts, staged_entries, detail, limits, alloc };
         }
 
         let root_node = index.cache_tree.and_then(|nodes| (!nodes.is_empty()).then_some(0u32));
@@ -205,7 +213,7 @@ impl<'a> StagedDiff<'a> {
             index_end: index.entries.len(),
             depth: 0,
         });
-        StagedDiff { queue, counts, detail, limits, alloc }
+        StagedDiff { queue, counts, staged_entries, detail, limits, alloc }
     }
 
     pub fn is_done(&self) -> bool {
@@ -299,21 +307,21 @@ impl<'a> StagedDiff<'a> {
             match (next_tree, idx_group) {
                 (None, None) => break,
                 (Some(te), None) => {
-                    self.record_head_only(te, dir)?;
+                    self.record_head_only(index, te, dir)?;
                     next_tree = tree_iter.next_entry()?;
                 }
                 (None, Some((_, _, g_start, g_end))) => {
-                    self.record_index_only(&index.entries[g_start..g_end]);
+                    self.record_index_only(index, &index.entries[g_start..g_end]);
                     idx_pos = g_end;
                 }
                 (Some(te), Some((idx_name, idx_is_dir, g_start, g_end))) => {
                     match git_name_cmp(te.name, te.is_dir(), idx_name, idx_is_dir) {
                         Ordering::Less => {
-                            self.record_head_only(te, dir)?;
+                            self.record_head_only(index, te, dir)?;
                             next_tree = tree_iter.next_entry()?;
                         }
                         Ordering::Greater => {
-                            self.record_index_only(&index.entries[g_start..g_end]);
+                            self.record_index_only(index, &index.entries[g_start..g_end]);
                             idx_pos = g_end;
                         }
                         Ordering::Equal => {
@@ -346,21 +354,29 @@ impl<'a> StagedDiff<'a> {
                                     if head_type != idx_type {
                                         self.counts.typechanged =
                                             self.counts.typechanged.saturating_add(1);
+                                        self.record_staged_bytes(
+                                            index.path_bytes(entry),
+                                            FileStatus::TypeChanged,
+                                        );
                                     } else if te.oid != entry.oid
                                         || normalize_mode(te.mode) != normalize_mode(entry.mode)
                                     {
                                         self.counts.modified =
                                             self.counts.modified.saturating_add(1);
+                                        self.record_staged_bytes(
+                                            index.path_bytes(entry),
+                                            FileStatus::Modified,
+                                        );
                                     }
                                 }
                             } else if te.is_dir() && !idx_is_dir {
                                 // Directory replaced by file in index.
-                                self.record_head_only(te, dir)?;
-                                self.record_index_only(&index.entries[g_start..g_end]);
+                                self.record_head_only(index, te, dir)?;
+                                self.record_index_only(index, &index.entries[g_start..g_end]);
                             } else {
                                 // File replaced by directory in index.
-                                self.counts.deleted = self.counts.deleted.saturating_add(1);
-                                self.record_index_only(&index.entries[g_start..g_end]);
+                                self.record_head_only(index, te, dir)?;
+                                self.record_index_only(index, &index.entries[g_start..g_end]);
                             }
                             next_tree = tree_iter.next_entry()?;
                             idx_pos = g_end;
@@ -372,24 +388,58 @@ impl<'a> StagedDiff<'a> {
         Ok(())
     }
 
-    fn record_head_only(&mut self, te: TreeEntry<'_>, dir: &DiffDir<'a>) -> Result<(), GitError> {
+    fn record_staged_bytes(&mut self, path: &[u8], status: FileStatus) {
+        if self.detail != Detail::Full {
+            return;
+        }
+        if let Ok(s) = core::str::from_utf8(path) {
+            self.staged_entries.push((String::from_str_in(s, self.alloc), status));
+        }
+    }
+
+    fn record_head_only(
+        &mut self,
+        index: IndexView<'_>,
+        te: TreeEntry<'_>,
+        dir: &DiffDir<'a>,
+    ) -> Result<(), GitError> {
         if te.is_dir() {
-            if self.detail == Detail::Presence {
+            if self.detail == Detail::Presence && index.conflicts.is_empty() {
                 // Any non-empty tree in Git has at least 1 blob leaf.
                 self.counts.deleted = self.counts.deleted.saturating_add(1);
                 return Ok(());
             }
             self.enqueue_subdir(dir, te.name, te.oid, None, 0, 0)
         } else {
-            self.counts.deleted = self.counts.deleted.saturating_add(1);
+            // Skip paths that are unmerged conflicts in the index (stages 1..=3): Git reports
+            // them as unmerged (`UU`/`UD`/etc.), not as staged deletions.
+            if !index.conflicts.is_empty() || self.detail == Detail::Full {
+                let mut full = String::from_str_in(dir.prefix.as_str(), self.alloc);
+                if !full.is_empty() {
+                    full.push('/');
+                }
+                if let Ok(s) = core::str::from_utf8(te.name) {
+                    full.push_str(s);
+                }
+                if !index.conflicts.is_empty() && index.has_conflict(full.as_bytes()) {
+                    return Ok(());
+                }
+                self.counts.deleted = self.counts.deleted.saturating_add(1);
+                if self.detail == Detail::Full && !full.is_empty() {
+                    self.staged_entries.push((full, FileStatus::Deleted));
+                }
+            } else {
+                self.counts.deleted = self.counts.deleted.saturating_add(1);
+            }
             Ok(())
         }
     }
 
-    fn record_index_only(&mut self, entries: &[IndexEntry]) {
+    fn record_index_only(&mut self, index: IndexView<'_>, entries: &[IndexEntry]) {
         for entry in entries {
             if !entry.intent_to_add {
                 self.counts.added = self.counts.added.saturating_add(1);
+                self.record_staged_bytes(index.path_bytes(entry), FileStatus::Added);
                 if self.detail == Detail::Presence {
                     return;
                 }
