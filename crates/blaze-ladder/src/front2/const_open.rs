@@ -51,16 +51,18 @@
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::View;
 use blaze_lower::form as lf;
+use blaze_scope::crate_roots::TextMarks;
 use blaze_surface::Range;
-use blaze_typeck::{ExprId, ItemKey, Name, PNode, PTy, PTys};
+use blaze_typeck::{ExprId, ItemKey, Name, PNode, PTy, PTys, PathIdx};
 
 use super::body::BodyError;
 use super::check::{CheckFail, Records};
 use super::consts::ConstFail;
 use super::heads::{HeadError, Want};
-use super::locals::{LocalKind, LocalNs, Locals};
+use super::locals::{LocalKind, LocalNs, Locals, Row};
 use super::source::NamesSource;
 use super::types::{Env, Heads, SelfTy, Why};
+use crate::resolve::{Kind, Ns, Paths, ResolveError, Target};
 
 /// The most constants one evaluation may have evaluated FIRST (`Consts::value_at`'s work
 /// list: each is a constant a head named while a body of the evaluation was checked, e.g.
@@ -153,16 +155,170 @@ pub(super) fn ground_self_in(tys: PTys<'_>, self_: SelfTy, params: &[(Name, u32)
 /// The most parentheses and braces around a repeat length's name that are looked through.
 const MOST_WRAPS: u32 = 8;
 
+/// Resolves a block-local `use` binding (`row.kind == LocalKind::Use`) in namespace `ns`,
+/// following the same scoping rules as [`super::block_type_uses::through_use`] and
+/// [`super::world_paths`]: refuses if a nearer block between `scope` and `row.scope` contains
+/// a glob `use`, places the `use` at the written path's site (or `module` when no path is
+/// given), redirects to a block-local item's module when `row.path[0]` names one
+/// (`LocalKind::in_block_module`), and preserves `$crate` hygiene via `row.first_mark`.
+///
+/// Returns `Ok(Some(target))` when `row.path` resolves whole (`consumed == row.path.len()`),
+/// `Ok(None)` when `row.path` does not resolve in `ns` or stops short.
+#[expect(clippy::too_many_arguments, reason = "one lookup of a block-local use binding")]
+fn resolve_use_target<'n, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    marks: Option<TextMarks<'_>>,
+    locals: &Locals<'_>,
+    owner: ItemKey,
+    module: LibKey,
+    view: &View<'_>,
+    scope: u32,
+    path: Option<PathIdx>,
+    name: &str,
+    row: &Row<'_>,
+    ns: Ns,
+    range: Range,
+) -> Result<Option<Target>, Why> {
+    super::block_type_uses::glob_nearer(locals, owner, scope, row).map_err(|form| Why::Unsupported(form, range))?;
+    let mut at_module = match path {
+        Some(p) => super::item_site::written_site(resolver, marks, module, view, p, false, name, range)?.module,
+        None => module,
+    };
+    if let Some(&head) = row.path.first()
+        && !row.abs
+        && let Some(item) = locals.find(owner, Some(row.scope), head, LocalNs::Type).filter(|i| i.kind.in_block_module())
+    {
+        at_module = item.module.ok_or(Why::Unsupported(item.kind.unplaced(), range))?;
+    }
+    let dollar = if row.abs { None } else { super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark) };
+    match resolver.path_with(at_module, dollar, row.abs, row.path, ns) {
+        Ok(t) if t.consumed as usize == row.path.len() => Ok(Some(t)),
+        Ok(_) | Err(ResolveError::Path(_)) => Ok(None),
+        Err(e @ ResolveError::NoText { .. }) => Err(Why::Resolve(e, range)),
+    }
+}
+
+/// Reads the evaluated bits of a `const` item `key` from `heads`, surfacing a recorded
+/// evaluation failure by name or requesting evaluation via [`Why::NeedConst`].
+fn const_item_bits<H: Heads + ?Sized>(heads: &H, key: LibKey, name: &str, range: Range) -> Result<u128, Why> {
+    if let Some(bits) = heads.const_bits(key) {
+        return Ok(bits);
+    }
+    if let Some(why) = heads.anon_failed(key) {
+        return Err(Why::ConstPath(std::format!("{name}: {why}").into_boxed_str(), range));
+    }
+    Err(Why::NeedConst(key, range))
+}
+
+/// Whether `local_const_in_scope` is checking an array repeat length (`[x; N]`) or an array
+/// type length (`[T; N]`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayLenSite {
+    Repeat,
+    Type,
+}
+
+/// Resolves a single-identifier array length `name` in block `scope` of `owner` when a `const`
+/// or `use` item declared in the body takes the name ([`Locals::find`], from `scope` outwards).
+/// Shared by [`local_const`] (`[x; N]`) and `types::body_const_len` (`[T; N]`).
+#[expect(clippy::too_many_arguments, reason = "one lookup of a body-local constant length")]
+pub(super) fn local_const_in_scope<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    marks: Option<TextMarks<'_>>,
+    locals: &Locals<'_>,
+    owner: ItemKey,
+    module: LibKey,
+    heads: &H,
+    view: &View<'_>,
+    scope: u32,
+    path: Option<PathIdx>,
+    name: &str,
+    range: Range,
+    site: ArrayLenSite,
+) -> Result<Option<u128>, Why> {
+    let Some(row) = locals.find(owner, Some(scope), name, LocalNs::Value) else { return Ok(None) };
+    let repeat = site == ArrayLenSite::Repeat;
+    match row.kind {
+        LocalKind::Const => {
+            let bits = const_item_bits(heads, row.key, name, range)?;
+            if bits > u128::from(u64::MAX) {
+                return Err(Why::Unsupported(
+                    if repeat {
+                        "an array repeat length past `usize` (a constant declared in the body)"
+                    } else {
+                        "an array length past `usize` (a constant declared in the body)"
+                    },
+                    range,
+                ));
+            }
+            Ok(Some(bits))
+        }
+        LocalKind::Use => match resolve_use_target(resolver, marks, locals, owner, module, view, scope, path, name, &row, Ns::Value, range)? {
+            Some(target) if target.kind == Kind::Const => {
+                let bits = const_item_bits(heads, target.key, name, range)?;
+                if bits > u128::from(u64::MAX) {
+                    return Err(Why::Unsupported(
+                        if repeat {
+                            "an array repeat length past `usize` (a constant named through a `use` declared in the body)"
+                        } else {
+                            "an array length past `usize` (a constant named through a `use` declared in the body)"
+                        },
+                        range,
+                    ));
+                }
+                Ok(Some(bits))
+            }
+            Some(_) => Err(Why::Unsupported(
+                if repeat {
+                    "an array repeat length named through a `use` declared in the body that is not a constant"
+                } else {
+                    "an array length named through a `use` declared in the body that is not a constant"
+                },
+                range,
+            )),
+            None => {
+                // If the `use` only imported into the type namespace (e.g. a braced struct),
+                // it does not shadow the value namespace: let the caller read the module's
+                // value namespace (which resolves any module const or reports unresolved).
+                if resolve_use_target(resolver, marks, locals, owner, module, view, scope, path, name, &row, Ns::Type, range)?.is_some() {
+                    return Ok(None);
+                }
+                Err(Why::Unsupported(super::block_type_uses::NAMED_TYPE_TARGET, range))
+            }
+        },
+        _ => Err(Why::Unsupported(
+            if repeat {
+                "an array repeat length naming an item of the body that is not a constant"
+            } else {
+                "an array length naming an item of the body that is not a constant"
+            },
+            range,
+        )),
+    }
+}
+
 /// The value of the array repeat length `len` of the body `owner` (its text `text`, at
-/// `range`) when it is ONE name that a `const` item declared in the body takes
+/// `range`) when it is ONE name that a `const` or `use` item declared in the body takes
 /// ([`Locals::find`], from the block the name is written in outwards: a block's item shadows
 /// the module's and the fn's generic parameters, the Reference, "Names", "Scopes"): the
 /// constant's bits once evaluated, [`Why::NeedConst`] naming its key until then (the driver
 /// evaluates it and converts the body again, as for a module's constant). `Ok(None)`: no item
 /// of the body has the name, and the caller reads it as before (a const parameter, the
-/// module's names). A body's item of that name that is no constant is refused by name, never
-/// looked up at the module, where the name would mean another item.
-pub(super) fn local_const<H: Heads + ?Sized>(locals: &Locals<'_>, owner: ItemKey, heads: &H, view: &View<'_>, len: ExprId, text: &str, range: Range) -> Result<Option<u128>, Why> {
+/// module's names). A body's item (or imported value) of that name that is no constant is
+/// refused by name, never looked up at the module, where the name would mean another item.
+#[expect(clippy::too_many_arguments, reason = "one lookup of a body-local array repeat length")]
+pub(super) fn local_const<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    marks: Option<TextMarks<'_>>,
+    locals: &Locals<'_>,
+    owner: ItemKey,
+    module: LibKey,
+    heads: &H,
+    view: &View<'_>,
+    len: ExprId,
+    text: &str,
+    range: Range,
+) -> Result<Option<u128>, Why> {
     let mut name = text.trim();
     if let Some(inner) = name.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
         name = inner.trim();
@@ -173,10 +329,12 @@ pub(super) fn local_const<H: Heads + ?Sized>(locals: &Locals<'_>, owner: ItemKey
     }
     // The name's path, through the parentheses and the block a written `{ NAME }` is.
     let mut at = len;
+    let mut found_path = None;
     let mut scope = None;
     for _ in 0..MOST_WRAPS {
         match view.expr(at)? {
             lf::Expr::Path(p) => {
+                found_path = Some(p);
                 scope = view.path(p)?.scope;
                 break;
             }
@@ -186,51 +344,196 @@ pub(super) fn local_const<H: Heads + ?Sized>(locals: &Locals<'_>, owner: ItemKey
         }
     }
     let Some(scope) = scope else { return Ok(None) };
-    let Some(row) = locals.find(owner, Some(scope.0), name, LocalNs::Value) else { return Ok(None) };
-    match row.kind {
-        LocalKind::Const => match heads.const_bits(row.key) {
-            Some(bits) if bits > u128::from(u64::MAX) => Err(Why::Unsupported("an array repeat length past `usize` (a constant declared in the body)", range)),
-            Some(bits) => Ok(Some(bits)),
-            None => Err(Why::NeedConst(row.key, range)),
-        },
-        LocalKind::Use => Err(Why::Unsupported("an array repeat length named through a `use` declared in the body", range)),
-        _ => Err(Why::Unsupported("an array repeat length naming an item of the body that is not a constant", range)),
-    }
+    local_const_in_scope(resolver, marks, locals, owner, module, heads, view, scope.0, found_path, name, range, ArrayLenSite::Repeat)
 }
 
 /// What a generic argument written as ONE plain name means when an item declared in the body
 /// takes the name ([`Locals::find`], from the block the name is written in outwards).
 pub(super) enum LocalArg {
-    /// A type the body declares: the argument is a type (the Reference, "Generic parameters",
-    /// "Const generics": "When there is ambiguity if a generic argument could be resolved as
-    /// either a type or const argument, it is always resolved as a type.").
+    /// A type the body declares (or imports via a block `use`): the argument is a type (the
+    /// Reference, "Generic parameters", "Const generics": "When there is ambiguity if a
+    /// generic argument could be resolved as either a type or const argument, it is always
+    /// resolved as a type.").
     Type,
-    /// A `const` the body declares, by its evaluated bits (`foo::<CHUNK_SIZE>()` with `const
-    /// CHUNK_SIZE: usize = ..;` in the body: the pinned core's ptr::swap_nonoverlapping_bytes).
+    /// A `const` the body declares (or imports via a block `use`), by its evaluated bits
+    /// (`foo::<CHUNK_SIZE>()` with `const CHUNK_SIZE: usize = ..;` or `use m::CHUNK_SIZE;` in
+    /// the body: the pinned core's ptr::swap_nonoverlapping_bytes).
     Const(u128),
 }
 
 /// The local item that the plain-name generic argument `t` (its text `name`, at `range`) of
 /// the body `owner` names. The type namespace is asked first: [`LocalArg::Type`] when a block
-/// around the argument declares a type of that name. Otherwise [`LocalArg::Const`] when one
-/// declares a `const`, once that constant is evaluated, and [`Why::NeedConst`] naming its key
-/// until then: the driver evaluates it and converts the body again, as [`local_const`] does.
-/// `Ok(None)`: no item of the body takes the name, and the caller reads the module's names.
-/// A local value item that is no `const` is refused by name, never looked up at the module,
-/// where the name would mean another item.
-pub(super) fn local_arg<H: Heads + ?Sized>(locals: &Locals<'_>, owner: ItemKey, heads: &H, view: &View<'_>, t: lf::TypeId, name: &str, range: Range) -> Result<Option<LocalArg>, Why> {
+/// around the argument declares or imports a type of that name. Otherwise [`LocalArg::Const`]
+/// when one declares or imports a `const`, once that constant is evaluated, and
+/// [`Why::NeedConst`] naming its key until then: the driver evaluates it and converts the body
+/// again, as [`local_const`] does. `Ok(None)`: no item of the body takes the name, and the
+/// caller reads the module's names. A local value item (or imported value) that is no `const`
+/// is refused by name, never looked up at the module, where the name would mean another item.
+#[expect(clippy::too_many_arguments, reason = "one lookup of a body-local generic argument")]
+pub(super) fn local_arg<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    marks: Option<TextMarks<'_>>,
+    locals: &Locals<'_>,
+    owner: ItemKey,
+    module: LibKey,
+    heads: &H,
+    view: &View<'_>,
+    t: lf::TypeId,
+    name: &str,
+    range: Range,
+) -> Result<Option<LocalArg>, Why> {
     let lf::TypeRef::Path(p) = view.ty(t)? else { return Ok(None) };
     let Some(scope) = view.path(p)?.scope else { return Ok(None) };
-    if locals.find(owner, Some(scope.0), name, LocalNs::Type).is_some() {
-        return Ok(Some(LocalArg::Type));
+    if let Some(row) = locals.find(owner, Some(scope.0), name, LocalNs::Type) {
+        if row.kind != LocalKind::Use {
+            return Ok(Some(LocalArg::Type));
+        }
+        let ty_target = resolve_use_target(resolver, marks, locals, owner, module, view, scope.0, Some(p), name, &row, Ns::Type, range)?;
+        if let Some(target) = ty_target
+            && matches!(target.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. })
+        {
+            return Ok(Some(LocalArg::Type));
+        }
+        return match resolve_use_target(resolver, marks, locals, owner, module, view, scope.0, Some(p), name, &row, Ns::Value, range)? {
+            Some(target) if target.kind == Kind::Const => {
+                let bits = const_item_bits(heads, target.key, name, range)?;
+                Ok(Some(LocalArg::Const(bits)))
+            }
+            Some(_) => Err(Why::Unsupported("a const argument named through a `use` declared in the body that is not a constant", range)),
+            None => {
+                if ty_target.is_some() {
+                    Ok(Some(LocalArg::Type))
+                } else {
+                    Err(Why::Unsupported(super::block_type_uses::NAMED_TYPE_TARGET, range))
+                }
+            }
+        };
     }
     let Some(row) = locals.find(owner, Some(scope.0), name, LocalNs::Value) else { return Ok(None) };
     match row.kind {
-        LocalKind::Const => match heads.const_bits(row.key) {
-            Some(bits) => Ok(Some(LocalArg::Const(bits))),
-            None => Err(Why::NeedConst(row.key, range)),
-        },
-        LocalKind::Use => Err(Why::Unsupported("a const argument named through a `use` declared in the body", range)),
+        LocalKind::Const => {
+            let bits = const_item_bits(heads, row.key, name, range)?;
+            Ok(Some(LocalArg::Const(bits)))
+        }
         _ => Err(Why::Unsupported("a const argument naming an item of the body that is not a constant", range)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::front2::source::NamesSource;
+    use crate::front2::tables::head_tests::{a, world_of};
+    use std::format;
+    use std::string::String;
+
+    fn check_fn(app: &'static str, name: &str) -> Result<std::vec::Vec<&'static str>, String> {
+        let (names, _, frame) = world_of(app);
+        let mut world = ProjectWorld::from_records(names, frame, &[1], a()).expect("project world");
+        let mut target = None;
+        NamesSource::each_item(names, 0, &mut |key, _| {
+            if NamesSource::name_of(names, key) == Some(name) {
+                target = Some(key);
+            }
+        });
+        let lib = target.unwrap_or_else(|| panic!("fn `{name}` not found"));
+        let verdict = world.check(BodyRef::Free(lib), a());
+        if let Some(refused) = verdict.refused {
+            return Err(format!("{refused:?}"));
+        }
+        assert!(verdict.gaps.is_empty(), "`{name}` had gaps: {:?}", verdict.gaps);
+        Ok(verdict.diagnostics.iter().map(|d| d.code).collect())
+    }
+
+    const APP: &str = "#![no_std]
+pub mod diag {
+    pub const MOST_PENDING_SHOWN: usize = 4;
+    pub struct Marker;
+    pub fn not_a_const() -> usize { 4 }
+}
+pub struct Wrap<const N: usize>(pub [u8; N]);
+pub fn take<const N: usize>() -> [u8; N] { [0u8; N] }
+pub fn id<T>(x: T) -> T { x }
+
+pub fn repeat_use_ok() -> [u8; 4] {
+    use crate::diag::MOST_PENDING_SHOWN;
+    [0u8; MOST_PENDING_SHOWN]
+}
+pub fn repeat_use_wrong_len() -> [u8; 5] {
+    use crate::diag::MOST_PENDING_SHOWN;
+    [0u8; MOST_PENDING_SHOWN]
+}
+pub fn repeat_and_type_use_ok() -> [u8; 4] {
+    use crate::diag::MOST_PENDING_SHOWN;
+    let buf: [u8; MOST_PENDING_SHOWN] = [0u8; MOST_PENDING_SHOWN];
+    buf
+}
+pub fn repeat_use_renamed_ok() -> [u8; 4] {
+    use crate::diag::MOST_PENDING_SHOWN as LIMIT;
+    [0u8; LIMIT]
+}
+pub fn block_mod_use_ok() -> [u8; 3] {
+    mod inner { pub const K: usize = 3; }
+    use inner::K;
+    [0u8; K]
+}
+pub fn turbofish_use_const_ok() -> [u8; 4] {
+    use crate::diag::MOST_PENDING_SHOWN;
+    take::<MOST_PENDING_SHOWN>()
+}
+pub fn turbofish_use_const_wrong_len() -> [u8; 5] {
+    use crate::diag::MOST_PENDING_SHOWN;
+    take::<MOST_PENDING_SHOWN>()
+}
+pub fn type_arg_use_const_ok() -> Wrap<4> {
+    use crate::diag::MOST_PENDING_SHOWN;
+    let w: Wrap<MOST_PENDING_SHOWN> = Wrap([0u8; 4]);
+    w
+}
+pub fn turbofish_use_type_ok() -> crate::diag::Marker {
+    use crate::diag::Marker;
+    id::<Marker>(Marker)
+}
+pub fn repeat_use_fn_refused() {
+    use crate::diag::not_a_const;
+    let _ = [0u8; not_a_const];
+}
+pub fn type_len_use_fn_refused() {
+    use crate::diag::not_a_const;
+    let _: [u8; not_a_const] = [0u8; 4];
+}
+pub fn turbofish_use_fn_refused() {
+    use crate::diag::not_a_const;
+    let _ = take::<not_a_const>();
+}
+";
+
+    #[test]
+    fn body_use_const_resolves_for_repeat_type_len_and_const_generic_args() {
+        for ok in [
+            "repeat_use_ok",
+            "repeat_and_type_use_ok",
+            "repeat_use_renamed_ok",
+            "block_mod_use_ok",
+            "turbofish_use_const_ok",
+            "type_arg_use_const_ok",
+            "turbofish_use_type_ok",
+        ] {
+            let diags = check_fn(APP, ok).unwrap_or_else(|e| panic!("`{ok}` was refused: {e}"));
+            assert!(diags.is_empty(), "`{ok}` had unexpected diagnostics: {diags:?}");
+        }
+        // Negative type-check controls: verify the evaluated value (4), not a hole, was used.
+        let wrong_repeat = check_fn(APP, "repeat_use_wrong_len").expect("repeat_use_wrong_len should typecheck with E0308");
+        assert!(wrong_repeat.contains(&"E0308"), "expected E0308, got {wrong_repeat:?}");
+        let wrong_arg = check_fn(APP, "turbofish_use_const_wrong_len").expect("turbofish_use_const_wrong_len should typecheck with E0308");
+        assert!(wrong_arg.contains(&"E0308"), "expected E0308, got {wrong_arg:?}");
+    }
+
+    #[test]
+    fn body_use_non_const_still_refuses_by_name() {
+        for bad in ["repeat_use_fn_refused", "type_len_use_fn_refused", "turbofish_use_fn_refused"] {
+            let err = check_fn(APP, bad).expect_err(&format!("`{bad}` must be refused"));
+            assert!(err.contains("is not a constant"), "`{bad}` refusal did not name non-const: {err}");
+        }
     }
 }

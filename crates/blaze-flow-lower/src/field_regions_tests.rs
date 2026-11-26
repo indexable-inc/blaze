@@ -674,3 +674,356 @@ fn associated_type_field_with_nonzero_slots_still_refuses_positions_not_slots() 
         "NEGATIVE: non-zero-slot alias field with no field_regions row must still refuse PositionsNotSlots: {got:?}"
     );
 }
+
+/// Shared `Facts` table for normalized-alias field tests (one `Facts` type avoids redundant
+/// monomorphizations of `Lower<F, A, R>` in the test binary).
+struct FieldAliasWorld {
+    traits: vec::Vec<(ItemKey, u32)>,
+    aliases: vec::Vec<(ItemKey, &'static str, u32)>,
+    adts: vec::Vec<(ItemKey, u32, u32, &'static [&'static str])>,
+    field_regions: vec::Vec<(ItemKey, u32, &'static [FieldRegion])>,
+    writes_lifetimes: bool,
+}
+
+impl Facts for FieldAliasWorld {
+    fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+    fn implied_bounds(&self) -> Option<(&[(u32, Region)], &[(Region, Region)])> { None }
+    fn constant_initializer(&self) -> bool { false }
+    fn fn_binders(&self) -> bool { true }
+    fn closure_bodies_checked(&self) -> bool { false }
+    fn closure_requirements(&self, _: ExprId) -> &[crate::Requirement] { &[] }
+    fn async_bodies_checked(&self) -> bool { false }
+    fn is_future(&self, _: PTy) -> Option<bool> { None }
+    fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+    fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+    fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+    fn trait_lifetimes(&self, tr: ItemKey) -> Option<u32> {
+        self.traits.iter().find(|&&(k, _)| k == tr).map(|&(_, n)| n)
+    }
+    fn alias_lifetimes(&self, tr: ItemKey, name: Name) -> Option<u32> {
+        self.aliases.iter().find(|&&(k, s, _)| k == tr && Name::of(s) == name).map(|&(_, _, n)| n)
+    }
+    fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+    fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+    fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+    fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+    fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+        let lifetimes = self.adts.iter().find(|&&(a, ..)| a == k).map_or(0, |&(_, lts, ..)| lts);
+        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
+    }
+    fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+        let n = self.adts.iter().find(|&&(a, ..)| a == k).map_or(0, |&(_, _, v, _)| v);
+        Some(region_fixture::all_co(n))
+    }
+    fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+        Some(CalleeFacts { writes_lifetimes: self.writes_lifetimes, self_ref: false, c_variadic: false })
+    }
+    fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
+        if variant != 0 {
+            return None;
+        }
+        let &(_, _, _, names) = self.adts.iter().find(|&&(a, ..)| a == adt)?;
+        names.iter().position(|n| Name::of(n) == name).map(|i| i as u32)
+    }
+    fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
+        if variant != 0 {
+            return None;
+        }
+        let &(_, _, _, names) = self.adts.iter().find(|&&(a, ..)| a == adt)?;
+        Some(names.len() as u32)
+    }
+    fn field_regions(&self, adt: ItemKey, variant: u32, field: u32) -> Option<&[FieldRegion]> {
+        if variant != 0 {
+            return None;
+        }
+        self.field_regions.iter().find(|&&(a, f, _)| a == adt && f == field).map(|&(_, _, r)| r)
+    }
+    fn param_copy(&self, _: u32) -> bool { false }
+}
+
+/// Exact `run_parent.rs::lowering_counts` shape:
+/// `struct Lazy<'r, 'a, F: Front> { cx: &'r u8, started: Started<'a, F::Start, F::Maker> }`
+/// under `fn f<'r, 'a, 'h, F: Front<Maker = RunMaker<'h>>>(self_: &Lazy<'r, 'a, F>)`:
+/// `FieldAliasGuard` suppresses `field_regions(Lazy, 0, 1)` to `None` because `F::Maker`
+/// normalizes to `RunMaker<'h>` in this body. `field_slot_with_aliases` resolves `self_.started`
+/// from `Facts::regions().field(Lazy, 0, 1)` + owner `ExProj` clauses to exact slots `['a, 'h]`
+/// (never touching `'r`), avoiding `Unified::BorrowInexact` on `&self_.started` while preserving
+/// exact outlives and conflict checking:
+/// - POSITIVE 1: borrowing `&self_.started` succeeds with `coarse.is_none()` and 0 findings.
+/// - POSITIVE 2: reading `(&self_.started).heavy.maker.data` as `&'h u8` succeeds with `coarse.is_none()`.
+/// - CONTROL (rule 23): omitting `regions().field(Lazy, 0, 1)` reproduces `Unified::BorrowInexact`.
+/// - NEGATIVE 1..3: escaping `&'h u8` as `&'static u8`, `&'a u8`, or `&'r u8` reports `UnprovenOutlives`.
+/// - NEGATIVE 4: conflicting `&self_.started` and `&mut self_.started` reports a borrow conflict.
+#[test]
+fn normalized_alias_field_under_where_projection_bound_avoids_borrow_inexact() {
+    const P3: Region = Region::Param(3);
+
+    #[derive(Clone, Copy)]
+    enum Case {
+        BorrowStarted,
+        ReturnH,
+        ControlNoFieldCol,
+        EscapeStatic,
+        EscapeA,
+        EscapeR,
+        ConflictingBorrow,
+    }
+
+    fn run_case(case: Case) -> Result<region_fixture::Run, Refusal> {
+        let mut fx = Fx::new();
+        let u8t = fx.u8();
+        let ru8 = fx.r(Mutbl::Not, u8t);
+        let front = fx.tr("Front", 1, vec![], &["Start", "Maker"]);
+        let p0 = fx.param(0);
+        let p1 = fx.param(1);
+        let f_start = fx.alias(front, "Start", &[p0]);
+        let f_maker = fx.alias(front, "Maker", &[p0]);
+        let run_maker = fx.strukt("RunMaker", 0, &[("data", ru8)]);
+        let run_maker_ty = fx.adt(run_maker, &[]);
+        let heavy = fx.strukt("Heavy", 1, &[("maker", p0)]);
+        let heavy_p1 = fx.adt(heavy, &[p1]);
+        let started = fx.strukt("Started", 2, &[("tag", ru8), ("start", p0), ("heavy", heavy_p1)]);
+        let started_decl = fx.adt(started, &[f_start, f_maker]);
+        let started_norm = fx.adt(started, &[f_start, run_maker_ty]);
+        let r_started_norm = fx.r(Mutbl::Not, started_norm);
+        let lazy = fx.strukt("Lazy", 1, &[("cx", ru8), ("started", started_decl)]);
+        let lazy_f = fx.adt(lazy, &[p0]);
+        let self_mut = matches!(case, Case::ConflictingBorrow);
+        let r_lazy = fx.r(if self_mut { Mutbl::Mut } else { Mutbl::Not }, lazy_f);
+
+        let front_bound = fx.bound(front, &[p0]);
+        let maker_proj = fx.proj(front, &[p0], "Maker", run_maker_ty);
+        let use_started = fx.func("use_started", 1, &[r_started_norm], u8t, vec![front_bound, maker_proj]);
+
+        // Owner lifetimes: P0 = 'r, P1 = 'a, P2 = 'h, P3 = 'self.
+        let (ret_ty, caller_slots): (PTy, &[Region]) = match case {
+            Case::BorrowStarted | Case::ControlNoFieldCol | Case::ConflictingBorrow => (u8t, &[P3, P0, P1]),
+            Case::ReturnH => (ru8, &[P3, P0, P1, P2]),
+            Case::EscapeStatic => (ru8, &[P3, P0, P1, Region::Static]),
+            Case::EscapeA => (ru8, &[P3, P0, P1, P1]),
+            Case::EscapeR => (ru8, &[P3, P0, P1, P0]),
+        };
+        let caller = fx.func("lowering_counts", 1, &[r_lazy], ret_ty, vec![front_bound, maker_proj]);
+        let ex_maker_args = fx.list(&[p0]);
+        let ex_maker = fx.ty(blaze_typeck::PNode::ExProj {
+            trait_: front,
+            name: Name::of("Maker"),
+            args: ex_maker_args,
+            term: run_maker_ty,
+        });
+        fx.finish();
+
+        let mut decls = Decls::new();
+        decls.adt(run_maker, 1);
+        decls.adt(heavy, 0);
+        decls.adt(started, 1);
+        decls.adt(lazy, 2);
+        decls.trait_(front, 0);
+        decls.alias(front, "Start", 0);
+        decls.alias(front, "Maker", 0);
+        if !matches!(case, Case::ControlNoFieldCol) {
+            // Declared column of `Lazy<'r, 'a, F>::started`: `Started<'a, F::Start, F::Maker>` -> `[P1]`.
+            decls.field(lazy, 0, 1, started_decl, &[P1]);
+        }
+        decls.func(
+            use_started,
+            FnHead { lifetimes: 3, late: &[0, 1, 2], outlives: &[], inputs: &[r_started_norm], output: u8t, slots: &[P0, P1, P2] },
+        );
+        decls.func(
+            caller,
+            FnHead { lifetimes: 4, late: &[0, 1, 3], outlives: &[], inputs: &[r_lazy], output: ret_ty, slots: caller_slots },
+        );
+        decls.clause(caller, 1, 0, ex_maker, &[P2]);
+
+        const RM_DATA: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
+        const HEAVY_MAKER: [FieldRegion; 1] = [FieldRegion::Arg(0)];
+        const STARTED_TAG: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
+        const STARTED_START: [FieldRegion; 1] = [FieldRegion::Arg(0)];
+        const STARTED_HEAVY: [FieldRegion; 1] = [FieldRegion::Arg(1)];
+        const LAZY_CX: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
+
+        let world = FieldAliasWorld {
+            traits: vec![(front, 0)],
+            aliases: vec![(front, "Start", 0), (front, "Maker", 0)],
+            adts: vec![
+                (run_maker, 1, 1, &["data"]),
+                (heavy, 0, 1, &["maker"]),
+                (started, 1, 3, &["tag", "start", "heavy"]),
+                (lazy, 2, 3, &["cx", "started"]),
+            ],
+            // `Lazy::started` (field 1) intentionally omitted (FieldAliasGuard).
+            field_regions: vec![
+                (run_maker, 0, &RM_DATA),
+                (heavy, 0, &HEAVY_MAKER),
+                (started, 0, &STARTED_TAG),
+                (started, 1, &STARTED_START),
+                (started, 2, &STARTED_HEAVY),
+                (lazy, 0, &LAZY_CX),
+            ],
+            writes_lifetimes: true,
+        };
+
+        let mut b = Bb::new();
+        let s = b.param("self_");
+        let root = match case {
+            Case::BorrowStarted | Case::ControlNoFieldCol => {
+                let ls = b.local(s);
+                let st = field(&mut b, s, ls, "started");
+                let r_st = b.borrow(Mutbl::Not, st);
+                let bp0 = b.ty(blaze_typeck::PNode::Param(0));
+                let callee = b.path_args("use_started", &[bp0]);
+                let call = b.call(callee, &[r_st]);
+                b.block(&[], Some(call))
+            }
+            Case::ReturnH | Case::EscapeStatic | Case::EscapeA | Case::EscapeR => {
+                let ls = b.local(s);
+                let st = field(&mut b, s, ls, "started");
+                let r_st = b.borrow(Mutbl::Not, st);
+                let hv = field(&mut b, s, r_st, "heavy");
+                let mk = field(&mut b, s, hv, "maker");
+                let dt = field(&mut b, s, mk, "data");
+                b.block(&[], Some(dt))
+            }
+            Case::ConflictingBorrow => {
+                let ls1 = b.local(s);
+                let st1 = field(&mut b, s, ls1, "started");
+                let r1 = b.borrow(Mutbl::Not, st1);
+                let rp = b.bind("r");
+                let let_r = b.let_(rp, None, r1);
+                let ls2 = b.local(s);
+                let st2 = field(&mut b, s, ls2, "started");
+                let m = b.borrow(Mutbl::Mut, st2);
+                let mp = b.bind("m");
+                let let_m = b.let_(mp, None, m);
+                let lr = b.local(rp);
+                let bp0 = b.ty(blaze_typeck::PNode::Param(0));
+                let callee = b.path_args("use_started", &[bp0]);
+                let call = b.call(callee, &[lr]);
+                b.block(&[let_r, let_m], Some(call))
+            }
+        };
+        let view = b.view(caller, root);
+        region_fixture::run(&fx, &view, &world, &decls, Plant::None)
+    }
+
+    let ok_borrow = run_case(Case::BorrowStarted).expect("POSITIVE 1: &self.started must not refuse");
+    assert!(ok_borrow.lines.is_empty(), "POSITIVE 1: expected 0 findings, got {:?}", ok_borrow.lines);
+    assert!(ok_borrow.coarse.is_none(), "POSITIVE 1: expected coarse.is_none(), got {:?}", ok_borrow.coarse);
+
+    let ok_h = run_case(Case::ReturnH).expect("POSITIVE 2: returning &'h u8 must not refuse");
+    assert!(ok_h.lines.is_empty(), "POSITIVE 2: expected 0 findings, got {:?}", ok_h.lines);
+    assert!(ok_h.coarse.is_none(), "POSITIVE 2: expected coarse.is_none(), got {:?}", ok_h.coarse);
+
+    let control = run_case(Case::ControlNoFieldCol);
+    assert!(
+        matches!(control, Err(Refusal { form: Form::Unified { why: crate::Unified::BorrowInexact }, .. })),
+        "CONTROL: without regions().field(Lazy::started), &self.started must hit BorrowInexact: {control:?}"
+    );
+
+    let bad_static = run_case(Case::EscapeStatic).expect("NEGATIVE 1: must produce finding, not refusal");
+    assert!(bad_static.lines.iter().any(|l| l.contains("UnprovenOutlives")), "NEGATIVE 1: &'h as &'static must fail: {:?}", bad_static.lines);
+
+    let bad_a = run_case(Case::EscapeA).expect("NEGATIVE 2: must produce finding, not refusal");
+    assert!(bad_a.lines.iter().any(|l| l.contains("UnprovenOutlives")), "NEGATIVE 2: &'h as &'a must fail: {:?}", bad_a.lines);
+
+    let bad_r = run_case(Case::EscapeR).expect("NEGATIVE 3: must produce finding, not refusal");
+    assert!(bad_r.lines.iter().any(|l| l.contains("UnprovenOutlives")), "NEGATIVE 3: &'h as &'r must fail: {:?}", bad_r.lines);
+
+    let bad_conflict = run_case(Case::ConflictingBorrow).expect("NEGATIVE 4: must produce finding, not refusal");
+    assert!(!bad_conflict.lines.is_empty(), "NEGATIVE 4: &mut self.started while &self.started is live must fail");
+}
+
+/// Concrete impl normalization of a `PNode::Alias` field:
+/// `struct Holder<'r, 'a, F: Front> { cx: &'r u8, started: Started<'a, F::Maker> }`
+/// instantiated as `Holder<'r, 'a, MyFront<'x>>` with `impl<'t> Front for MyFront<'t> { type Maker = RunMaker<'t>; }`:
+/// - POSITIVE: borrowing `&h.started` and reading `(&h.started).maker.data` as `&'x u8` succeeds with `coarse.is_none()`.
+/// - NEGATIVE: escaping `&'x u8` as `&'a u8` reports `UnprovenOutlives`.
+#[test]
+fn normalized_alias_field_via_selected_impl_avoids_borrow_inexact() {
+    use crate::region_fixture::ImplHead;
+    const P3: Region = Region::Param(3);
+
+    fn run_case(escape_a: bool) -> Result<region_fixture::Run, Refusal> {
+        let mut fx = Fx::new();
+        let u8t = fx.u8();
+        let ru8 = fx.r(Mutbl::Not, u8t);
+        let front = fx.tr("Front", 1, vec![], &["Maker"]);
+        let p0 = fx.param(0);
+        let f_maker = fx.alias(front, "Maker", &[p0]);
+        let run_maker = fx.strukt("RunMaker", 0, &[("data", ru8)]);
+        let run_maker_ty = fx.adt(run_maker, &[]);
+        let my_front = fx.strukt("MyFront", 0, &[("tag", ru8)]);
+        let my_front_ty = fx.adt(my_front, &[]);
+        let imp = fx.imp("Front_MyFront", 0, my_front_ty, Some((front, &[])), &[("Maker", run_maker_ty)], vec![]);
+        let started = fx.strukt("Started", 1, &[("tag", ru8), ("maker", p0)]);
+        let started_decl = fx.adt(started, &[f_maker]);
+        let holder = fx.strukt("Holder", 1, &[("cx", ru8), ("started", started_decl)]);
+        let holder_concrete = fx.adt(holder, &[my_front_ty]);
+        let r_holder = fx.r(Mutbl::Not, holder_concrete);
+        // P0 = 'r, P1 = 'a, P2 = 'x, P3 = 'self.
+        let ret_slot = if escape_a { P1 } else { P2 };
+        let caller = fx.func("get_x", 0, &[r_holder], ru8, vec![]);
+        fx.finish();
+
+        let mut decls = Decls::new();
+        decls.adt(run_maker, 1);
+        decls.adt(my_front, 1);
+        decls.adt(started, 1);
+        decls.adt(holder, 2);
+        decls.trait_(front, 0);
+        decls.alias(front, "Maker", 0);
+        decls.field(holder, 0, 1, started_decl, &[P1]);
+        decls.imp(
+            imp,
+            ImplHead { lifetimes: 1, outlives: &[], self_ty: my_front_ty, self_slots: &[P0], trait_ref: Some((front, &[], &[])) },
+        );
+        decls.impl_assoc(imp, "Maker", run_maker_ty, &[P0]);
+        decls.func(
+            caller,
+            FnHead { lifetimes: 4, late: &[0, 1, 2, 3], outlives: &[], inputs: &[r_holder], output: ru8, slots: &[P3, P0, P1, P2, ret_slot] },
+        );
+
+        const RM_DATA: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
+        const STARTED_TAG: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
+        const STARTED_MAKER: [FieldRegion; 1] = [FieldRegion::Arg(0)];
+        const HOLDER_CX: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
+
+        let world = FieldAliasWorld {
+            traits: vec![(front, 0)],
+            aliases: vec![(front, "Maker", 0)],
+            adts: vec![
+                (run_maker, 1, 1, &["data"]),
+                (my_front, 1, 1, &["tag"]),
+                (started, 1, 2, &["tag", "maker"]),
+                (holder, 2, 3, &["cx", "started"]),
+            ],
+            // `Holder::started` (field 1) intentionally omitted (FieldAliasGuard).
+            field_regions: vec![
+                (run_maker, 0, &RM_DATA),
+                (started, 0, &STARTED_TAG),
+                (started, 1, &STARTED_MAKER),
+                (holder, 0, &HOLDER_CX),
+            ],
+            writes_lifetimes: false,
+        };
+
+        let mut b = Bb::new();
+        let h = b.param("h");
+        let lh = b.local(h);
+        let st = field(&mut b, h, lh, "started");
+        let r_st = b.borrow(Mutbl::Not, st);
+        let mk = field(&mut b, h, r_st, "maker");
+        let dt = field(&mut b, h, mk, "data");
+        let root = b.block(&[], Some(dt));
+        let view = b.view(caller, root);
+        region_fixture::run(&fx, &view, &world, &decls, Plant::None)
+    }
+
+    let ok = run_case(false).expect("POSITIVE: concrete impl field alias must not refuse");
+    assert!(ok.lines.is_empty(), "POSITIVE: expected 0 findings, got {:?}", ok.lines);
+    assert!(ok.coarse.is_none(), "POSITIVE: expected coarse.is_none(), got {:?}", ok.coarse);
+
+    let bad = run_case(true).expect("NEGATIVE: &'x as &'a must produce finding, not refusal");
+    assert!(bad.lines.iter().any(|l| l.contains("UnprovenOutlives")), "NEGATIVE: expected UnprovenOutlives, got {:?}", bad.lines);
+}

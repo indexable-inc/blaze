@@ -6212,39 +6212,36 @@ impl<'n> Store<'n> {
         res.map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?
     }
 
-    /// Makes the rows of the impl constants that waited on the leaf `need` ([`ConstWait`]),
-    /// now that it is answered or refused (front2/const_inherent.rs `file`): each in its
-    /// impl's kept frame, by the maker its head used ([`Store::impl_const`]). A row refused now
-    /// is that constant's own gap (`fn_gaps`), by why, never its impl's; one that waits on
-    /// another leaf being evaluated waits on that one.
-    pub(super) fn remake_waiting<S: NamesSource<'n>>(&mut self, names: S, need: LibKey) {
+    /// Takes the impl constants waiting on the leaf `need` ([`ConstWait`]), now that it is
+    /// answered or refused (front2/const_inherent.rs `file`).
+    pub(super) fn take_const_waits(&mut self, need: LibKey) -> blaze_own::Vec<(ItemKey, ConstWait), Alloc<'static>> {
         let mut due: blaze_own::Vec<(ItemKey, ConstWait), Alloc<'static>> = blaze_own::Vec::new_in(self.work_alloc());
         due.extend(self.const_waits.iter().filter(|(_, w)| w.need == need).map(|(k, w)| (*k, *w)));
-        for (mk, w) in due {
+        for &(mk, _) in &due {
             self.const_waits.remove(&mk);
-            match self.remake_const(names, w, mk) {
-                Ok(()) => {
-                    self.fn_gaps.remove(&mk);
-                }
-                Err(why) => {
-                    let ck = checker_of(w.impl_);
-                    let again = match self.impls.get(&ck) {
-                        Some(h) => self.waits_on_running(h.self_ty, &h.consts, &why),
-                        None => None,
-                    };
-                    if let Some(next) = again {
-                        self.const_waits.insert(mk, ConstWait { need: next, ..w });
-                    }
-                    self.fn_gaps.insert(mk, why);
-                    self.regions.file_refused(mk);
-                }
-            }
         }
+        due
     }
 
-    /// One waiting constant's row ([`Store::remake_waiting`]), in the frame its impl's head
-    /// kept, as [`Store::member_fn`] makes a fn's signature.
-    fn remake_const<S: NamesSource<'n>>(&mut self, names: S, w: ConstWait, mk: ItemKey) -> Result<(), Why> {
+    /// Files the refusal of a waiting impl constant `mk` whose remake failed with `why`: if it
+    /// waits on another running sibling leaf, re-registers the wait; in either case records the
+    /// gap in `fn_gaps` and marks its regions refused.
+    pub(super) fn record_remake_refusal(&mut self, mk: ItemKey, w: ConstWait, why: Why) {
+        let ck = checker_of(w.impl_);
+        let again = match self.impls.get(&ck) {
+            Some(h) => self.waits_on_running(h.self_ty, &h.consts, &why),
+            None => None,
+        };
+        if let Some(next) = again {
+            self.const_waits.insert(mk, ConstWait { need: next, ..w });
+        }
+        self.fn_gaps.insert(mk, why);
+        self.regions.file_refused(mk);
+    }
+
+    /// One waiting constant's row (front2/const_inherent.rs `remake_waiting`), in the frame its
+    /// impl's head kept, as [`Store::member_fn`] makes a fn's signature.
+    pub(super) fn remake_const<S: NamesSource<'n>>(&mut self, names: S, w: ConstWait, mk: ItemKey) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let ck = checker_of(w.impl_);
         let alloc = self.tys.alloc();

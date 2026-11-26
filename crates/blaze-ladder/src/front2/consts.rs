@@ -1018,6 +1018,52 @@ impl<'n> Consts<'n> {
         self.records.iter().find(|x| x.record.key == key).map(|x| &x.record).ok_or(ConstFail::MissingRecord { item, key })
     }
 
+    /// Evaluates `c` (and any constants it needs first, via `const_open::needed_first`) using
+    /// this evaluator and files its value in `r.store.maps`, as `check::eval_len` does. Called
+    /// when remaking waiting impl constants inside [`super::const_inherent::first`], where
+    /// `r.consts` is currently taken by this evaluator.
+    pub(super) fn eval_const_need<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, c: LibKey) -> Result<(), ConstFail> {
+        let active_before = r.store.active_consts_len();
+        let mut firsts: Vec<LibKey, Global> = Vec::new_in(Global);
+        firsts.push(c);
+        r.store.push_active_const(c);
+        let mut rounds = 0u32;
+        let result = loop {
+            let Some(&top) = firsts.last() else { break Ok(()) };
+            match self.first(r, prepared, top) {
+                Ok(()) => {
+                    if let Some(done_c) = firsts.pop() {
+                        r.store.pop_active_const(done_c);
+                        if r.store.clear_provisional_for(done_c)
+                            && let Some(b) = r.buckets.as_ref()
+                        {
+                            b.clear_provisional();
+                        }
+                    }
+                }
+                Err(e) => {
+                    let Some(next) = super::const_open::needed_first(&e) else { break Err(e) };
+                    let fileable = !r.store.maps.qpaths.borrow().is_leaf(next);
+                    if rounds >= super::const_open::MOST_FIRSTS || firsts.contains(&next) || !fileable {
+                        break Err(e);
+                    }
+                    rounds += 1;
+                    firsts.push(next);
+                    r.store.push_active_const(next);
+                }
+            }
+        };
+        r.store.truncate_active_consts(active_before);
+        let mut cleared = false;
+        while let Some(done_c) = firsts.pop() {
+            cleared |= r.store.clear_provisional_for(done_c);
+        }
+        if cleared && let Some(b) = r.buckets.as_ref() {
+            b.clear_provisional();
+        }
+        result
+    }
+
     /// Evaluates the constant `c` a head or a body's conversion needs before an evaluation
     /// can go on ([`Consts::value_at`]'s work list) and files it exactly as `check::eval_len`
     /// files the one it is asked: its bits in `Maps::const_bits` (and `const_lens` when they
