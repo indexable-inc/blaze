@@ -513,11 +513,6 @@ impl SeqDecEntry {
     }
 
     #[inline(always)]
-    pub(crate) fn extra_bits_u64(self) -> u64 {
-        (self.0 >> 48) & 0xFF
-    }
-
-    #[inline(always)]
     pub(crate) fn num_bits_u64(self) -> u64 {
         self.0 >> 56
     }

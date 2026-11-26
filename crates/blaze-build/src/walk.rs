@@ -501,6 +501,16 @@ enum Task {
     AsmJoin(Block),
 }
 
+/// A pre-allocated aggregate destination slot for an expression constructed directly in place,
+/// keyed by the exact [`ExprId`] so nested sub-expressions can never consume it.
+#[derive(Clone, Copy)]
+struct DestSlot {
+    expr: ExprId,
+    slot: SlotId,
+    off: i32,
+    repr: Repr,
+}
+
 struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     body: &'x BodyView<'x>,
     checked: &'x Checked<'c>,
@@ -547,6 +557,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     unsized_tails: Vec<u32, A>,
     /// Per pattern: the binding's home and how its value is held.
     slots: Vec<Option<(Home, Repr)>, A>,
+    /// Pending in-place destination slots for fresh aggregate initializers (LIFO stack, keyed by
+    /// the exact `ExprId` of the constructor expression).
+    dest_slots: blaze_own::Vec<DestSlot, A>,
     /// Per block made: whether a reachable edge leads to it.
     reached: Vec<bool, A>,
     /// Whether the code being built is reachable.
@@ -924,6 +937,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         layout_variants: Vec::new_in(alloc),
         unsized_tails: Vec::new_in(alloc),
         slots,
+        dest_slots: blaze_own::Vec::new_in(alloc),
         reached: Vec::new_in(alloc),
         live: true,
         break_target,
@@ -1906,12 +1920,20 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Whether two places name the exact same `(slot, offset)` or `(value, offset)`.
+    fn same_place(&self, a: (Value, i32), b: (Value, i32)) -> bool {
+        if a == b {
+            return true;
+        }
+        a.1 == b.1 && self.value_slot(a.0).is_some_and(|s| self.value_slot(b.0) == Some(s))
+    }
+
     fn store(&mut self, v: V, repr: Repr, to: (Value, i32)) -> Result<(), BuildError> {
         match repr {
             Repr::None => Ok(()),
             Repr::Agg(_) => {
                 let from = self.place(v, repr)?;
-                if from != to {
+                if !self.same_place(from, to) {
                     self.copy(repr, from, to)?;
                 }
                 Ok(())
@@ -1954,7 +1976,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // The walk's `Layout::size` is a `u32`; its `align` and `MemAttrs::align` are both log2
         // of the alignment in bytes.
         let (size, align) = (self.layouts[l as usize].size, self.layouts[l as usize].align);
-        if size == 0 || from == to {
+        if size == 0 || self.same_place(from, to) {
             return;
         }
         let op = if self.copy_disjoint(from, to, size) { Op::Memcpy } else { Op::Memmove };
@@ -2030,6 +2052,163 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let slot = self.b.slot(size, align, SlotKind::Temp);
         self.name_temp(slot);
         (self.b.slot_addr(slot), 0)
+    }
+
+    /// Consumes the pending in-place destination slot registered for exact expression `e` and
+    /// representation `repr`, returning `(slot_addr, off)` in the current block.
+    fn take_dest(&mut self, e: ExprId, repr: Repr) -> Option<(Value, i32)> {
+        let i = self.dest_slots.iter().rposition(|d| d.expr == e)?;
+        let dest = self.dest_slots.remove_shift(i);
+        if dest.repr != repr {
+            return None;
+        }
+        Some((self.b.slot_addr(dest.slot), dest.off))
+    }
+
+    /// Removes any unconsumed destination slot entries targeting `slot`.
+    fn clear_dest_slot(&mut self, slot: SlotId) {
+        let mut i = self.dest_slots.len();
+        while i > 0 {
+            i -= 1;
+            if self.dest_slots.get(i).is_some_and(|d| d.slot == slot) {
+                self.dest_slots.remove_shift(i);
+            }
+        }
+    }
+
+    /// Returns the exact inner constructor [`ExprId`] of `e` when `e` can be safely constructed
+    /// directly in place into a fresh, uninitialized destination of `repr` (`Repr::Agg(l)` with
+    /// `size > 0`):
+    /// - `Expr::Repeat { .. }` is always safe into a fresh uninitialized slot (its element
+    ///   evaluates first and cannot read the uninitialized binding),
+    /// - `Expr::Array`, `Expr::Tuple`, `Expr::Struct`/`Expr::Record` (without `..base`), and
+    ///   tuple struct/variant ctors are safe when the aggregate has no drop glue (`!needs_drop &&
+    ///   !placed`), so a mid-construction panic cannot leak partially initialized elements.
+    fn dest_target(&mut self, e: ExprId, repr: Repr) -> Result<Option<ExprId>, BuildError> {
+        if !self.live || self.co.is_some() {
+            return Ok(None);
+        }
+        let Repr::Agg(l) = repr else {
+            return Ok(None);
+        };
+        let Ok(l_ix) = usize::try_from(l) else {
+            return Ok(None);
+        };
+        let Some(layout) = self.layouts.get(l_ix) else {
+            return Ok(None);
+        };
+        let (size, no_drop) = (layout.size, !layout.needs_drop && !layout.placed);
+        if size == 0 {
+            return Ok(None);
+        }
+        let mut cur = e;
+        loop {
+            if !self.adjust_rows(cur).is_empty() {
+                return Ok(None);
+            }
+            if let Expr::Paren(inner) = self.expr(cur)? {
+                cur = inner;
+                continue;
+            }
+            break;
+        }
+        if self.expr_repr(cur)? != repr {
+            return Ok(None);
+        }
+        match self.expr(cur)? {
+            Expr::Repeat { .. } => Ok(Some(cur)),
+            Expr::Array { .. }
+            | Expr::Tuple { .. }
+            | Expr::Struct { base: blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults, .. }
+            | Expr::Record { base: blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults, .. }
+                if no_drop =>
+            {
+                Ok(Some(cur))
+            }
+            Expr::Call { callee, .. } if no_drop => {
+                if matches!(self.expr_def(callee), Some(Def::Ctor { kind: CtorKind::Tuple, .. })) {
+                    let t = self.adjusted_ty(callee)?;
+                    if matches!(self.node_at(callee, t)?, PNode::FnDef(..)) {
+                        return Ok(Some(cur));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Pre-allocates the named local slot for a fresh uninitialized `Stmt::Let` binding `pat` and
+    /// registers it as the in-place destination for `init` when `init` is a supported direct
+    /// constructor, eliminating the intermediate `SlotKind::Temp` and `Op::Memcpy`.
+    fn try_let_dest(&mut self, pat: PatId, init: ExprId) -> Result<(), BuildError> {
+        if !self.live || self.co.is_some() {
+            return Ok(());
+        }
+        let Pat::Bind { ann, sub: None, .. } = self.pat(pat)? else {
+            return Ok(());
+        };
+        if ann.by_ref.is_some() {
+            return Ok(());
+        }
+        if self.slots.get(pat.ix()).copied().flatten().is_some() {
+            return Ok(());
+        }
+        let local_repr = self.local_repr(pat)?;
+        let Some(target) = self.dest_target(init, local_repr)? else {
+            return Ok(());
+        };
+        let (Home::Slot(slot), _) = self.bind(pat)? else {
+            return Ok(());
+        };
+        self.b.slot_live(slot);
+        self.dest_slots.push(DestSlot { expr: target, slot, off: 0, repr: local_repr });
+        Ok(())
+    }
+
+    /// Registers a sub-field/element destination `(slot, base_off + field_off)` for `expr` inside
+    /// a freshly constructed non-dropping aggregate when `expr` is a direct in-place constructor
+    /// and the sub-place satisfies alignment and bounds within `slot`.
+    fn try_sub_dest(
+        &mut self,
+        expr: ExprId,
+        slot: SlotId,
+        base_off: i32,
+        field_off: u32,
+        frepr: Repr,
+    ) -> Result<(), BuildError> {
+        let Some(target) = self.dest_target(expr, frepr)? else {
+            return Ok(());
+        };
+        let Ok(field_off_i32) = i32::try_from(field_off) else {
+            return Ok(());
+        };
+        let Some(total_off) = base_off.checked_add(field_off_i32) else {
+            return Ok(());
+        };
+        if total_off < 0 {
+            return Ok(());
+        }
+        let (fsize, falign) = self.size_align(frepr);
+        let Ok(fsize_i32) = i32::try_from(fsize) else {
+            return Ok(());
+        };
+        if total_off.checked_add(fsize_i32).is_none() {
+            return Ok(());
+        }
+        let Ok(total_off_u32) = u32::try_from(total_off) else {
+            return Ok(());
+        };
+        let aligned = self.b.func().view().slots.get(slot.index()).is_some_and(|s| {
+            falign <= s.align
+                && total_off_u32.trailing_zeros() >= u32::from(falign)
+                && total_off_u32.checked_add(fsize).is_some_and(|end| end <= s.size)
+        });
+        if !aligned {
+            return Ok(());
+        }
+        self.dest_slots.push(DestSlot { expr: target, slot, off: total_off, repr: frepr });
+        Ok(())
     }
 
     /// A `bool` (`i8`) as an `i1` to branch on.
@@ -3844,7 +4023,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // `*index(&a, i)`), a `?` (its value is a place in the matched temporary), and,
                 // until a test shows the slot left alive, an `.await`'s result and an overloaded
                 // operator's call.
-                Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Tuple { .. } | Expr::Array { .. } | Expr::Repeat { .. } | Expr::Struct { .. } => {
+                Expr::Call { .. }
+                | Expr::MethodCall { .. }
+                | Expr::Tuple { .. }
+                | Expr::Array { .. }
+                | Expr::Repeat { .. }
+                | Expr::Struct { .. }
+                | Expr::Record { .. } => {
                     return Ok(true);
                 }
                 _ => return Ok(false),
@@ -3959,30 +4144,47 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     None => false,
                 };
                 let borrows_value = !borrows_place && init.is_some() && self.pat_has_ref_bind(p)?;
+                let prebound_slot = match self.slots.get(p.ix()).copied().flatten() {
+                    Some((Home::Slot(slot), _)) => Some(slot),
+                    _ => None,
+                };
+                if let Some(slot) = prebound_slot {
+                    self.clear_dest_slot(slot);
+                }
+                let already_in_place = !borrows_place
+                    && !borrows_value
+                    && match (prebound_slot, v, self.pat(p)?) {
+                        (Some(slot), V::Place(at, off), Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() => {
+                            self.whole_slot((at, off)) == Some(slot)
+                        }
+                        _ => false,
+                    };
                 let fresh = match (init, v, self.pat(p)?) {
-                    _ if borrows_place || borrows_value => None,
+                    _ if borrows_place || borrows_value || prebound_slot.is_some() => None,
                     (Some(e), V::Place(at, off), Pat::Bind { .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
                     _ => None,
                 };
-                match fresh {
-                    Some(at) => self.bind_at(p, at)?,
-                    None if borrows_place => self.bind_let_place(p, v)?,
-                    None if borrows_value => {
-                        let e = init.ok_or(malformed("a `let` value ref binding without an initializer"))?;
-                        self.bind_let_value_ref(p, e, v)?;
-                    }
-                    // The initializer's own type: a pattern that peels a reference is recorded
-                    // at the peeled one (`bind_value_of`).
-                    None => {
-                        match init {
-                            Some(e) => {
-                                let t = self.adjusted_ty(e)?;
-                                let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
-                                self.bind_value_of(p, v, g)?
-                            }
-                            None => self.bind_value(p, v)?,
+                if !already_in_place {
+                    match fresh {
+                        Some(at) => self.bind_at(p, at)?,
+                        None if borrows_place => self.bind_let_place(p, v)?,
+                        None if borrows_value => {
+                            let e = init.ok_or(malformed("a `let` value ref binding without an initializer"))?;
+                            self.bind_let_value_ref(p, e, v)?;
                         }
-                        self.end_temp_val(v);
+                        // The initializer's own type: a pattern that peels a reference is recorded
+                        // at the peeled one (`bind_value_of`).
+                        None => {
+                            match init {
+                                Some(e) => {
+                                    let t = self.adjusted_ty(e)?;
+                                    let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+                                    self.bind_value_of(p, v, g)?
+                                }
+                                None => self.bind_value(p, v)?,
+                            }
+                            self.end_temp_val(v);
+                        }
                     }
                 }
                 let from = self.scope_pats.len();
@@ -4449,8 +4651,17 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let V::Place(p, at) = *self.vals.last().ok_or(malformed("an aggregate literal without its place"))? else {
                     return Err(malformed("an aggregate literal without its place"));
                 };
-                self.store(v, repr, (p, at + off as i32))?;
-                self.end_temp_val(v);
+                let off_i32 = i32::try_from(off).map_err(|_| malformed("an aggregate literal field offset past `i32`"))?;
+                let dst_off = at.checked_add(off_i32).ok_or(malformed("an aggregate literal field offset overflow"))?;
+                let dst = (p, dst_off);
+                let already = match v {
+                    V::Place(vp, voff) => self.same_place((vp, voff), dst),
+                    _ => false,
+                };
+                if !already {
+                    self.store(v, repr, dst)?;
+                    self.end_temp_val(v);
+                }
                 // The literal owns it now (walk/val_stack.rs).
                 self.stored_part(off, repr)?;
             }
@@ -5285,14 +5496,29 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                     return Ok(());
                 }
-                let at = self.temp(repr);
+                let at = match self.take_dest(e, repr) {
+                    Some(dest) => dest,
+                    None => self.temp(repr),
+                };
                 self.write_tag(tag, variant, at);
                 // Partly built while its arguments run, owned part by part (walk/val_stack.rs).
                 self.push_literal(at);
                 self.work.push(Task::LitBuilt { l });
+                let at_slot = self.value_slot(at.0);
+                let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                let can_sub_dest = self.live
+                    && at_slot.is_some()
+                    && self.layouts.get(l_ix).is_some_and(|row| !row.needs_drop && !row.placed);
+                let first_ix = usize::try_from(first).map_err(|_| malformed("a variant's field index past `usize`"))?;
                 for (i, &a) in args.iter().enumerate().rev() {
-                    let (_, off, repr) = self.layout_fields[first as usize + i];
-                    self.work.push(Task::InitAt { off, repr });
+                    let row_ix = first_ix.checked_add(i).ok_or(malformed("a ctor field index overflow"))?;
+                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a ctor field past `layout_fields`"))?;
+                    if can_sub_dest
+                        && let Some(slot) = at_slot
+                    {
+                        self.try_sub_dest(a, slot, at.1, off, frepr)?;
+                    }
+                    self.work.push(Task::InitAt { off, repr: frepr });
                     self.work.push(Task::Eval(a));
                 }
             }
@@ -5896,8 +6122,62 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// If `v` is a scalar constant whose exact `stride`-byte representation consists of a single
+    /// repeated byte, returns that byte so `[v; N]` lowers to one `Op::Memset`.
+    fn repeat_byte_fill(&self, v: V, elem: Repr, stride: u32) -> Option<u8> {
+        let elem_ty = elem.scalar()?;
+        let width = elem_ty.bits(self.b.ptr_bits());
+        if stride == 0 || width != stride.checked_mul(8)? {
+            return None;
+        }
+        let bytes_len = usize::try_from(stride).ok()?;
+        let V::Scalar(val) = v else {
+            return None;
+        };
+        let view = self.b.func().view();
+        let ix = val.index();
+        if ix >= view.len() || view.ty(val) != elem_ty {
+            return None;
+        }
+        let uniform_byte = |bytes: &[u8]| -> Option<u8> {
+            let (&first, rest) = bytes.split_first()?;
+            rest.iter().all(|&b| b == first).then_some(first)
+        };
+        match view.op(ix) {
+            Op::Null => Some(0),
+            Op::Iconst => {
+                let word = *view.data.get(ix)?;
+                let bytes = if width <= 32 {
+                    u128::from(word).to_le_bytes()
+                } else {
+                    i128::from(i32::from_le_bytes(word.to_le_bytes())).to_le_bytes()
+                };
+                uniform_byte(bytes.get(..bytes_len)?)
+            }
+            Op::Fconst => {
+                let word = *view.data.get(ix)?;
+                let bytes = word.to_le_bytes();
+                uniform_byte(bytes.get(..bytes_len)?)
+            }
+            Op::IconstWide | Op::FconstWide => {
+                let words_len = usize::try_from(elem_ty.const_words()).ok()?;
+                if words_len == 0 || words_len.checked_mul(4) != Some(bytes_len) {
+                    return None;
+                }
+                let start = usize::try_from(*view.data.get(ix)?).ok()?;
+                let end = start.checked_add(words_len)?;
+                let words = view.extra.get(start..end)?;
+                let first = words.first()?.to_le_bytes()[0];
+                let uniform = u32::from_le_bytes([first; 4]);
+                words.iter().all(|&w| w == uniform).then_some(first)
+            }
+            _ => None,
+        }
+    }
+
     /// `[x; N]`: the value on top stored `N` times into the array's temporary under it,
-    /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
+    /// unrolled up to `UNROLL_LEAVES` leaves, as a single `Op::Memset` for uniform-byte scalar
+    /// constants beyond that, and in a loop otherwise.
     fn repeat(&mut self, e: ExprId) -> Result<(), BuildError> {
         let v = self.pop()?;
         let repr = self.expr_repr(e)?;
@@ -5906,14 +6186,34 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             self.push_val(V::None, None);
             return Ok(());
         };
-        let Shape::Array { elem, len, stride } = self.layouts[l as usize].shape else {
-            return Err(malformed("an array literal of a type that is not an array"));
-        };
-        let to = self.temp(repr);
-        if self.layouts[l as usize].leaves <= UNROLL_LEAVES {
-            for i in 0..len {
-                self.store(v, elem, (to.0, to.1 + (i * stride) as i32))?;
+        let (elem, len, stride, leaves, align) = match &self.layouts[l as usize] {
+            Layout { shape: Shape::Array { elem, len, stride }, leaves, align, .. } => {
+                (*elem, *len, *stride, *leaves, *align)
             }
+            _ => return Err(malformed("an array literal of a type that is not an array")),
+        };
+        let to = match self.take_dest(e, repr) {
+            Some(dest) => dest,
+            None => self.temp(repr),
+        };
+        if leaves <= UNROLL_LEAVES {
+            for i in 0..len {
+                let off = i
+                    .checked_mul(stride)
+                    .and_then(|o| i32::try_from(o).ok())
+                    .and_then(|o| to.1.checked_add(o))
+                    .ok_or(malformed("an array repeat element offset past `i32`"))?;
+                self.store(v, elem, (to.0, off))?;
+            }
+        } else if let Some(byte) = self.repeat_byte_fill(v, elem, stride)
+            && let Some(total) = u64::from(len).checked_mul(u64::from(stride))
+            && total > 0
+        {
+            let dst = self.address(to);
+            let fill = self.b.iconst(Ty::I8, u128::from(byte));
+            let bytes = self.b.iconst(Ty::I64, u128::from(total));
+            let attrs = MemAttrs::aligned(align);
+            self.b.bulk(Op::Memset, Flags::NONE, dst, fill, bytes, attrs);
         } else {
             // The loop's source is the element itself: the same place at every index.
             let (i, _, tp, header, exit) = self.array_loop(len, stride, to, to);
@@ -6029,6 +6329,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     // `push_scrutinee`; walk/matches/irrefutable.rs `bind_let_owned`).
                     self.push_scrutinee(init)?;
                 } else {
+                    self.try_let_dest(pat, init)?;
                     self.work.push(Task::Eval(init));
                 }
             }
@@ -6511,7 +6812,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                             }
                             return Ok(());
                         }
-                        let at = self.temp(repr);
+                        let at = match self.take_dest(e, repr) {
+                            Some(dest) => dest,
+                            None => self.temp(repr),
+                        };
                         self.write_tag(tag, variant, at);
                         // Partly built while its fields run, owned part by part
                         // (walk/val_stack.rs); one value once the last is stored.
@@ -6522,12 +6826,23 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         if defaults {
                             self.work.push(Task::InitDefaults(e));
                         }
+                        let at_slot = self.value_slot(at.0);
+                        let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                        let can_sub_dest = self.live
+                            && at_slot.is_some()
+                            && self.layouts.get(l_ix).is_some_and(|row| !row.needs_drop && !row.placed);
                         for init in inits.iter().rev() {
                             let row = (first..first + len)
                                 .find(|&i| self.layout_fields[i as usize].0 == init.name)
                                 .ok_or(malformed("a struct literal naming a field its struct lacks"))?;
-                            let (_, off, repr) = self.layout_fields[row as usize];
-                            self.work.push(Task::InitAt { off, repr });
+                            let row_ix = usize::try_from(row).map_err(|_| malformed("a field row past `usize`"))?;
+                            let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a struct field past `layout_fields`"))?;
+                            if can_sub_dest
+                                && let Some(slot) = at_slot
+                            {
+                                self.try_sub_dest(init.expr, slot, at.1, off, frepr)?;
+                            }
+                            self.work.push(Task::InitAt { off, repr: frepr });
                             self.work.push(Task::Eval(init.expr));
                         }
                     }
@@ -6557,22 +6872,41 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                             }
                             return Ok(());
                         }
-                        let shape = self.layouts[l as usize].shape;
-                        let at = self.temp(repr);
+                        let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                        let (shape, no_drop) = match self.layouts.get(l_ix) {
+                            Some(row) => (row.shape, !row.needs_drop && !row.placed),
+                            None => return Err(malformed("a layout past `layouts`")),
+                        };
+                        let at = match self.take_dest(e, repr) {
+                            Some(dest) => dest,
+                            None => self.temp(repr),
+                        };
                         // Partly built while its elements run, owned element by element
                         // (walk/val_stack.rs).
                         self.push_literal(at);
                         self.work.push(Task::LitBuilt { l });
+                        let at_slot = self.value_slot(at.0);
+                        let can_sub_dest = self.live && at_slot.is_some() && no_drop;
                         for (i, &x) in list.iter().enumerate().rev() {
-                            let (off, repr) = match shape {
-                                Shape::Fields { first, len } if (i as u32) < len => {
-                                    let (_, off, repr) = self.layout_fields[(first + i as u32) as usize];
-                                    (off, repr)
+                            let i_u32 = u32::try_from(i).map_err(|_| malformed("a literal element index past `u32`"))?;
+                            let (off, frepr) = match shape {
+                                Shape::Fields { first, len } if i_u32 < len => {
+                                    let row_ix = usize::try_from(first.saturating_add(i_u32)).map_err(|_| malformed("a tuple field index past `usize`"))?;
+                                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a tuple field past `layout_fields`"))?;
+                                    (off, frepr)
                                 }
-                                Shape::Array { elem, len, stride } if (i as u32) < len => (i as u32 * stride, elem),
+                                Shape::Array { elem, len, stride } if i_u32 < len => {
+                                    let off = i_u32.checked_mul(stride).ok_or(malformed("an array element offset overflow"))?;
+                                    (off, elem)
+                                }
                                 _ => return Err(malformed("a literal with more elements than its type")),
                             };
-                            self.work.push(Task::InitAt { off, repr });
+                            if can_sub_dest
+                                && let Some(slot) = at_slot
+                            {
+                                self.try_sub_dest(x, slot, at.1, off, frepr)?;
+                            }
+                            self.work.push(Task::InitAt { off, repr: frepr });
                             self.work.push(Task::Eval(x));
                         }
                     }

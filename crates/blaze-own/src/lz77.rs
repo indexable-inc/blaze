@@ -1399,7 +1399,7 @@ const _: () = {
 #[inline(always)]
 unsafe fn fse_step_indexed<const TT_OFF: usize, const ST_OFF: usize>(
     tables: &FseSeqEncTables,
-    sym: u8,
+    sym: u32,
     state: u32,
 ) -> (u32, u32, u32) {
     let base = ptr::from_ref(tables);
@@ -1409,7 +1409,7 @@ unsafe fn fse_step_indexed<const TT_OFF: usize, const ST_OFF: usize>(
     // `ll_st`/`of_st`/`ml_st` (256 entries each, disjoint from `idx & 255`) within
     // `#[repr(C)] FseSeqEncTables` (`align >= 8`). `nb <= 9 < 32`.
     unsafe {
-        let tt_idx = (usize::from(sym) & 63) | TT_OFF;
+        let tt_idx = (sym.widen_to::<usize>() & 63) | TT_OFF;
         let packed = *base.cast::<u64>().add(tt_idx);
         let delta_nb_bits = packed.truncate_to::<u32>();
         let delta_find_state = (packed >> 32).truncate_to::<u32>();
@@ -1423,39 +1423,43 @@ unsafe fn fse_step_indexed<const TT_OFF: usize, const ST_OFF: usize>(
 }
 
 #[inline(always)]
-unsafe fn encode_ll_lut_raw(lit_len: u32, ll_lut: *const u32) -> (u8, u32, u32) {
+unsafe fn encode_ll_lut_raw(lit_len: u32, ll_lut: *const u32) -> (u32, u32, u32) {
     if lit_len < 64 {
-        // SAFETY: `lit_len < 64` is within `ll_lut: &[u32; 64]`.
+        // SAFETY: `lit_len < 64` is within `ll_lut: &[u32; 64]`. Low 6 bits of `p` hold the LL
+        // code (`0..=24 < 64`); caller masks `& 63` in `fse_step_indexed` (zero `& 0xFF`).
         let p = unsafe { *ll_lut.add(lit_len.widen_to::<usize>()) };
-        return (p.truncate_to::<u8>(), lit_len.wrapping_sub(p >> 16), (p >> 8) & 0xFF);
+        return (p, lit_len.wrapping_sub(p >> 16), (p >> 8) & 0xFF);
     }
     let bits = 31u32 - lit_len.leading_zeros();
     let base = 1u32 << bits;
-    ((bits + 19).truncate_to::<u8>(), lit_len - base, bits)
+    (bits + 19, lit_len - base, bits)
 }
 
 #[inline(always)]
-unsafe fn encode_ml_lut_raw(match_len: u32, ml_lut: *const u32) -> (u8, u32, u32) {
+unsafe fn encode_ml_lut_raw(match_len: u32, ml_lut: *const u32) -> (u32, u32, u32) {
     let adj = match_len.wrapping_sub(3);
     if adj < 128 {
-        // SAFETY: `adj < 128` is within `ml_lut: &[u32; 128]`.
+        // SAFETY: `adj < 128` is within `ml_lut: &[u32; 128]`. Low 6 bits of `p` hold the ML code
+        // (`0..=42 < 64`); caller masks `& 63` in `fse_step_indexed` (zero `& 0xFF`).
         let p = unsafe { *ml_lut.add(adj.widen_to::<usize>()) };
-        return (p.truncate_to::<u8>(), match_len.wrapping_sub(p >> 16), (p >> 8) & 0xFF);
+        return (p, match_len.wrapping_sub(p >> 16), (p >> 8) & 0xFF);
     }
     let bits = 31u32 - adj.leading_zeros();
     let base = (1u32 << bits) + 3;
-    ((bits + 36).truncate_to::<u8>(), match_len - base, bits)
+    (bits + 36, match_len - base, bits)
 }
 
 /// Zero-call leaf kernel for [`fse_pack_sequences_fast`].
 ///
 /// Keeping `try_reserve` and `set_len` in the outer wrapper makes this a zero-call leaf function
 /// (unlocking all 27 AArch64 GPRs); indexing all six FSE tables off one `noalias`
-/// `&FseSeqEncTables` base pointer and staging `OF -> ML -> LL` emission keeps peak live values
-/// well below 27 GPRs so zero table pointers spill to the stack. Walks `raw_seqs` via raw pointer
-/// decrement (`sp = sp.sub(1)` -> 1-instruction `sub x, x, #12`), uses
-/// `state & !u32::MAX.wrapping_shl(nb)` (`lsl` + `bic`), and performs two unconditional branchless
-/// 64-bit flushes per sequence:
+/// `&FseSeqEncTables` base pointer and resolving all three symbol encodes (and collapsing
+/// `ml_extra`/`of_extra` into `p_mo`/`n_mo`) up front keeps peak live values well below 27 GPRs
+/// while placing all three FSE transitions back-to-back in a single branch-free basic block so
+/// table loads overlap in OoO and `of_state`/`ml_state`/`ll_state` co-color with zero back-edge
+/// moves. Walks `raw_seqs` via raw pointer decrement (`sp = sp.sub(1)` -> 1-instruction
+/// `sub x, x, #12`), uses `state & !u32::MAX.wrapping_shl(nb)` (`lsl` + `bic`), and performs two
+/// unconditional branchless 64-bit flushes per sequence:
 /// - Chunk 1 (`of_st_bits [<=8] + ml_st_bits [<=9] + ll_st_bits [<=9] + ll_extra [<=16]`):
 ///   `7 + 8 + 9 + 9 + 16 = 49 <= 63` bits before Flush #1 (leaving `bits <= 7`).
 /// - Chunk 2 (`ml_extra [<=16] + of_extra [<=31]`):
@@ -1520,44 +1524,56 @@ unsafe fn fse_pack_sequences_leaf(
         let mut sp = seq_start.add(n - 1);
         while sp != seq_start {
             sp = sp.sub(1);
-            let off = (*sp).offset;
-            let of_b = 31u32 - off.max(1).leading_zeros();
-            let of_extra = off & !u32::MAX.wrapping_shl(of_b);
-            let (next_of, of_st_bits, of_st_nb) =
-                fse_step_indexed::<64, 1024>(tables, of_b.truncate_to::<u8>(), of_state);
-            of_state = next_of;
 
+            // Stage 1: Resolve all 3 symbol encodes up front (hoisting both LUT branches above the
+            // FSE core) and collapse `(ml_extra, of_extra, ml_b, of_b)` into `(p_mo, n_mo)` before
+            // the LL branch to keep register pressure well below 27 GPRs.
+            let off = (*sp).offset;
             let ml_len = (*sp).match_len;
+            let of_b = 31u32 ^ (off | 1).leading_zeros();
+            let of_extra = off & !u32::MAX.wrapping_shl(of_b);
+
             let (ml_code, ml_extra, ml_b) = encode_ml_lut_raw(ml_len, ml_lut_ptr);
-            let (next_ml, ml_st_bits, ml_st_nb) =
-                fse_step_indexed::<128, 1280>(tables, ml_code, ml_state);
-            ml_state = next_ml;
-            let p_om = u64::from(of_st_bits) | (u64::from(ml_st_bits) << of_st_nb);
-            let n_om = of_st_nb + ml_st_nb;
+            let p_mo = u64::from(ml_extra) | (u64::from(of_extra) << ml_b);
+            let n_mo = ml_b + of_b;
 
             let ll_len = (*sp).lit_len;
             let (ll_code, ll_extra, ll_b) = encode_ll_lut_raw(ll_len, ll_lut_ptr);
+
+            // Stage 2: Execute all 3 FSE state transitions back-to-back in one branch-free basic
+            // block so OoO overlaps all 6 table loads and `next_{of,ml,ll}` stay back-edge-only
+            // for in-place co-coloring with zero back-edge state moves.
+            let (next_of, of_st_bits, of_st_nb) =
+                fse_step_indexed::<64, 1024>(tables, of_b, of_state);
+            let (next_ml, ml_st_bits, ml_st_nb) =
+                fse_step_indexed::<128, 1280>(tables, ml_code, ml_state);
             let (next_ll, ll_st_bits, ll_st_nb) =
                 fse_step_indexed::<0, 768>(tables, ll_code, ll_state);
+            of_state = next_of;
+            ml_state = next_ml;
             ll_state = next_ll;
 
+            // Stage 3: Pack & flush Chunk 1 + Chunk 2.
             // Chunk 1: `of_st_bits (<=8) + ml_st_bits (<=9) + ll_st_bits (<=9) + ll_extra (<=16)`
             // + residual `bits (<=7)` <= 49 <= 63 bits -> unconditional branchless Flush #1.
+            let p_om = u64::from(of_st_bits) | (u64::from(ml_st_bits) << of_st_nb);
+            let n_om = of_st_nb + ml_st_nb;
             let p_ll = u64::from(ll_st_bits) | (u64::from(ll_extra) << ll_st_nb);
             let n_ll = ll_st_nb + ll_b;
+            let n_om_ll = n_om + n_ll;
             buf |= p_om << bits;
             buf |= p_ll << (bits + n_om);
-            bits += n_om + n_ll;
+            bits += n_om_ll;
             ptr::write_unaligned(out_ptr.cast::<u64>(), buf.to_le());
             out_ptr = out_ptr.add((bits >> 3).widen_to::<usize>());
             buf >>= bits & !7u32;
             bits &= 7;
 
             // Chunk 2: `ml_extra (<=16) + of_extra (<=31)` + residual `bits (<=7)` <= 54 <= 63 bits
-            // -> unconditional branchless Flush #2.
-            let p_mo = u64::from(ml_extra) | (u64::from(of_extra) << ml_b);
+            // -> unconditional branchless Flush #2 (`p_mo` and `n_mo` precomputed above so `bits`
+            // takes a single 1-cycle `add`).
             buf |= p_mo << bits;
-            bits += ml_b + of_b;
+            bits += n_mo;
             ptr::write_unaligned(out_ptr.cast::<u64>(), buf.to_le());
             out_ptr = out_ptr.add((bits >> 3).widen_to::<usize>());
             buf >>= bits & !7u32;
@@ -1668,40 +1684,42 @@ pub fn count_seq_symbols_fast(
     // - `ll_lut_ptr` points to 64 `u32`s and is dereferenced only when `ll < 64`; `ml_lut_ptr`
     //   points to 128 `u32`s and is dereferenced only when `adj < 128`.
     // - `ll_cnt` (64 `u32`s), `of_cnt` (32 `u32`s), and `ml_cnt` (64 `u32`s) come from disjoint
-    //   `&mut` array references and are indexed with `& 63`, `& 31`, and `& 63`, guaranteeing
-    //   in-bounds exclusive access for arbitrary `SeqOp` and LUT inputs.
+    //   `&mut` array references. Every branch guarantees `ll_c < 64` (fast arm masks `& 63`, slow
+    //   arm clamps `.min(35)`), `ml_c < 64` (fast arm masks `& 63`, slow arms return `0` or clamp
+    //   `.min(52)`), and `of_c < 32` (`(of | 1).leading_zeros() <= 31`, so `31 ^ lz <= 31`),
+    //   guaranteeing in-bounds exclusive access for arbitrary `SeqOp` and LUT inputs.
     unsafe {
         let mut p = raw_seqs.as_ptr();
         let end = p.add(raw_seqs.len());
         while p < end {
             let ll = (*p).lit_len;
+            let ml = (*p).match_len;
+            let of = (*p).offset;
+            p = p.add(1);
+
             let ll_c = if ll < 64 {
-                (*ll_lut_ptr.add(ll.widen_to::<usize>()) & 0xFF).widen_to::<usize>()
+                (*ll_lut_ptr.add(ll.widen_to::<usize>()) & 63).widen_to::<usize>()
             } else {
                 50u32.wrapping_sub(ll.leading_zeros()).min(35).widen_to::<usize>()
             };
 
-            let ml = (*p).match_len;
             let adj = ml.wrapping_sub(3);
             let ml_c = if adj < 128 {
-                (*ml_lut_ptr.add(adj.widen_to::<usize>()) & 0xFF).widen_to::<usize>()
+                (*ml_lut_ptr.add(adj.widen_to::<usize>()) & 63).widen_to::<usize>()
             } else if ml < 3 {
                 0
             } else {
                 67u32.wrapping_sub(adj.leading_zeros()).min(52).widen_to::<usize>()
             };
 
-            let of = (*p).offset;
-            let of_c = (31u32 - (of | 1).leading_zeros()).widen_to::<usize>();
+            let of_c = (31u32 ^ (of | 1).leading_zeros()).widen_to::<usize>();
 
-            let ll_slot = ll_cnt.add(ll_c & 63);
+            let ll_slot = ll_cnt.add(ll_c);
             *ll_slot = (*ll_slot).wrapping_add(1);
-            let of_slot = of_cnt.add(of_c & 31);
+            let of_slot = of_cnt.add(of_c);
             *of_slot = (*of_slot).wrapping_add(1);
-            let ml_slot = ml_cnt.add(ml_c & 63);
+            let ml_slot = ml_cnt.add(ml_c);
             *ml_slot = (*ml_slot).wrapping_add(1);
-
-            p = p.add(1);
         }
     }
 }

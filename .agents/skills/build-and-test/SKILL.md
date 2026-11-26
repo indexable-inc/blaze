@@ -268,6 +268,16 @@ new key rule, the real project gathered) instead of a fixture. When finding each
 run would cost one release build, first write the test that finds every such case in one run (key
 every crate of std, check every item), then fix what it lists.
 
+## sharpen-your-tools (rule 88)
+
+Whenever you are iterating on performance, codegen, debugging, or a multi-wave fix and feel blind or
+slow — stripped binaries without function symbols, raw hex instead of readable IR (`mfmt`), missing
+diff/regression harnesses, or slow rebuild-measure loops — stop and build the fast tool first. Emit
+local Mach-O/ELF `N_SECT` function symbols so `sample`, `nm`, `objdump`, and `lldb` work out of the
+box, write clean textual IR dumpers and side-by-side instruction/stall diff scripts, and wire fast
+single-function harnesses before grinding through blind iterations. Sharpening the tool pays for
+itself on iteration two and compounds across every agent that touches the tree.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 ## How a lane runs

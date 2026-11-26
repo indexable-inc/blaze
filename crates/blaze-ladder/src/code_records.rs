@@ -641,7 +641,42 @@ pub fn emit_code_record_for_machine<'a, 'd>(
     machine: blaze_tier::Machine,
     alloc: Alloc<'a>,
 ) -> Result<(AVec<'a, u8>, AVec<'a, Declared<'d>>), CodeRecordError> {
-    let (record, _insts, called) = blaze_emit::emit_sota_record_for_machine(func, names, routines.places(), machine, traps, alloc)
+    let (code, extra_declared, _clobbers) = emit_code_record_for_machine_with_abi(
+        func,
+        names,
+        routines,
+        traps,
+        blaze_emit::SotaRecordAbiOpts::for_machine(machine),
+        alloc,
+    )?;
+    Ok((code, extra_declared))
+}
+
+/// Emits a sealed canonical `CodeRecord` for `func` with explicit Zero-ABI, bottom-up IPRA, and
+/// 2-tier hot/cold options ([`blaze_emit::SotaRecordAbiOpts`]), returning the encoded `CodeRecord`
+/// bytes, any `SoftFloat` routines called by legalization, and the emitted function's exact
+/// [`blaze_tier::CallClobbers`] summary for downstream callers.
+///
+/// Unlike [`make_entry_with_vtables`], this produces raw `CodeRecord` bytes (not an `ENTRY`
+/// wrapper for `CodeStore`) so host-specific LTO records stay ephemeral in the export buffer and
+/// never pollute portable cached store entries (Rule 25).
+pub fn emit_code_record_for_machine_with_abi<'a, 'd>(
+    func: Verified<'_>,
+    names: &InstanceNames<'_>,
+    routines: crate::front2::builtins_shim::Routines<'d>,
+    traps: &[TrapSource],
+    abi_opts: blaze_emit::SotaRecordAbiOpts<'_>,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, u8>, AVec<'a, Declared<'d>>, blaze_tier::CallClobbers), CodeRecordError> {
+    let (record, _insts, called, clobbers) =
+        blaze_emit::emit_sota_record_for_machine_with_abi(
+            func,
+            names,
+            routines.places(),
+            abi_opts,
+            traps,
+            alloc,
+        )
         .map_err(|why| routines.refusal(why))?;
     let mut extra_declared: AVec<'a, Declared<'d>> = Vec::new_in(alloc);
     for r in called.iter() {
@@ -650,7 +685,7 @@ pub fn emit_code_record_for_machine<'a, 'd>(
     let sealed = record.seal().map_err(CodeRecordError::Seal)?;
     let mut code: AVec<'a, u8> = Vec::new_in(alloc);
     sealed.encode(&mut code);
-    Ok((code, extra_declared))
+    Ok((code, extra_declared, clobbers))
 }
 
 /// The declared statics block onto `out`: their count (4), then each item key (16), ascending

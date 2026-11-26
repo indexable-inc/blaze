@@ -260,4 +260,13 @@ Higher-level OS framework bindings that are not kernel syscalls
 
 See [docs/v2/plan/design/sys.md](../../../docs/v2/plan/design/sys.md).
 
+## flag-jank-or-monumentous-in-all-caps (rule 89)
+
+Never quietly slip in a hacky workaround, partial stopgap, or silently sink into a monumental
+multi-day architectural undertaking without telling the user clearly. If you cannot solve something
+the proper way (you are considering a jank workaround just to get it working) OR you discover the
+proper fix is a monumental task whose scope the user may not yet realize, STOP AND WRITE IT IN ALL
+CAPS clearly explaining: (1) WHAT IS JANK OR MONUMENTAL, (2) WHY THE PROPER WAY IS HUGE OR BLOCKED,
+and (3) THE EXACT OPTIONS BEFORE PROCEEDING OR MERGING.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

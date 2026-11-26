@@ -26,7 +26,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 
 ## Core Rules
 
-34 always-on principles below; all 87 rules with full detail live in each heading's skill
+36 always-on principles below; all 89 rules with full detail live in each heading's skill
 (`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run
 `write`.
 
@@ -57,6 +57,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 ### Speed and tracing (skill `perf-and-tracing`)
 - **16. slow-is-p0-traced**: Anything slow/large is P0 until traced; quote before/after in per-core units naming core count.
 - **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
+- **88. sharpen-your-tools**: Invest early in tools, symbols, IR dumps and harnesses that cut iteration time 10x.
 
 ### Evidence and debugging (skill `debugging`)
 - **17. ask-the-profile-first**: Say why a build was slow, reran or grew from its profile, before guessing or measuring.
@@ -69,6 +70,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **62. sota-first**: Build the SOTA end state within 10% of the floor directly; build missing pieces; stop on 2nd fix.
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent mistakes by newtype/proof types first, then lints with fixes; a prompt rule comes last.
+- **89. flag-jank-or-monumentous-in-all-caps**: IF FORCED INTO A JANK WORKAROUND OR A MONUMENTAL TASK, SHOUT IT IN ALL CAPS TO THE USER.
 
 ### Building, lanes and machines (skill `build-and-test`)
 - **2. blaze-builds-blaze**: Dogfood blaze (check/test/build) for inner loops, never cold cargo; fix any self-hosting gap.

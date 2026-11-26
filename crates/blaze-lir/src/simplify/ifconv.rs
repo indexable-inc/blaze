@@ -19,35 +19,164 @@ use blaze_own::Vec;
 
 use super::{
     SimplifyError,
-    dce::{Item, NONE, coalesce_cfg, dead, each, filled},
+    dce::{Item, NONE, coalesce_cfg, constant_of, dead, each, filled, incoming, reachable},
 };
 use crate::{
     Block, BlockKind, Flags, Func, IntCond, Op, Ty, View,
+    arith::{compare, iconst_value, mask, sext, wide_value},
     op::{Field, Layout},
     verify,
 };
 
-/// Telemetry returned by [`if_convert`].
+/// Microarchitecture-aware cost model for branch vs. speculative `Op::Select` lowering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IfConvTarget {
+    pub max_arm_insts: usize,
+    pub max_arm_raw_insts: usize,
+    pub max_diamond_insts: usize,
+    /// Approximate branch misprediction penalty in cycles (Apple M5 ~14, Graviton 5 / Neoverse V3 ~12).
+    pub mispredict_cycles: u16,
+    /// Permille (`0..=1000`) threshold above which a branch is considered predictable
+    /// (i.e. `taken_permille >= predictable_permille` or `taken_permille <= 1000 - predictable_permille`).
+    /// Predictable guards stay branches (0-cycle TAGE prediction on M5 / Graviton 5);
+    /// unpredictable branches (`15%..85%` taken) convert to branchless `Select`.
+    pub predictable_permille: u16,
+}
+
+impl IfConvTarget {
+    /// Apple M5 microarchitecture cost profile (~14-cycle branch misprediction penalty).
+    pub const APPLE_M5: Self = Self {
+        max_arm_insts: 12,
+        max_arm_raw_insts: 22,
+        max_diamond_insts: 14,
+        mispredict_cycles: 14,
+        predictable_permille: 900,
+    };
+
+    /// AWS Graviton 5 / Arm Neoverse V3 microarchitecture cost profile (~12-cycle branch misprediction penalty).
+    pub const GRAVITON5: Self = Self {
+        max_arm_insts: 12,
+        max_arm_raw_insts: 22,
+        max_diamond_insts: 14,
+        mispredict_cycles: 12,
+        predictable_permille: 900,
+    };
+}
+
+impl Default for IfConvTarget {
+    fn default() -> Self {
+        Self::APPLE_M5
+    }
+}
+
+/// Optional per-block taken probability in permille (`0..=1000`; `u16::MAX` = unknown/static).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct BranchProfile<'a> {
+    pub taken_permille_by_block: &'a [u16],
+}
+
+/// Configuration options for [`if_convert_with_opts`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IfConvOpts<'a> {
+    pub max_rounds: u32,
+    pub target: IfConvTarget,
+    pub profile: BranchProfile<'a>,
+}
+
+/// Telemetry returned by [`if_convert`] and [`if_convert_with_opts`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct IfConvStats {
     pub branches_converted: u32,
     pub reductions_canonicalized: u32,
+    pub predictable_branches_preserved: u32,
 }
 
-/// Output of [`if_convert`].
+/// Output of [`if_convert`] and [`if_convert_with_opts`].
 #[derive(Debug)]
 pub struct IfConvOutput<A: Allocator> {
     pub func: Func<A>,
     pub stats: IfConvStats,
 }
 
-const MAX_ARM_INSTS: usize = 8;
+const PERMILLE_SCALE: u16 = 1000;
+const TRIVIAL_PREDICTABLE_OPS: usize = 2;
+const HIGH_ENTROPY_MIN_PERMILLE: u16 = 250;
+const HIGH_ENTROPY_MAX_PERMILLE: u16 = 750;
+const HIGH_ENTROPY_ARM_BONUS: usize = 4;
+const HIGH_ENTROPY_DIAMOND_BONUS: usize = 4;
+const HIGH_ENTROPY_RAW_BONUS: usize = 6;
 const MIN_SWITCH_CASES: usize = 2;
 const MAX_SWITCH_CASES: usize = 8;
 const MAX_SWITCH_ARMS: usize = MAX_SWITCH_CASES + 1;
 const MAX_SWITCH_ARM_INSTS: usize = 4;
 const MAX_SWITCH_TOTAL_INSTS: usize = 20;
 const MAX_SWITCH_DIFF_PARAMS: usize = 2;
+
+#[derive(Clone, Copy)]
+struct BranchBudget {
+    max_arm_insts: usize,
+    max_arm_raw_insts: usize,
+    max_diamond_insts: usize,
+    is_predictable: bool,
+}
+
+#[inline]
+fn branch_budget(target: IfConvTarget, taken_permille: u16) -> BranchBudget {
+    if taken_permille > PERMILLE_SCALE {
+        return BranchBudget {
+            max_arm_insts: target.max_arm_insts,
+            max_arm_raw_insts: target.max_arm_raw_insts,
+            max_diamond_insts: target.max_diamond_insts,
+            is_predictable: false,
+        };
+    }
+    let low_threshold = PERMILLE_SCALE.saturating_sub(target.predictable_permille);
+    let is_predictable = taken_permille >= target.predictable_permille || taken_permille <= low_threshold;
+    if is_predictable {
+        return BranchBudget {
+            max_arm_insts: target.max_arm_insts,
+            max_arm_raw_insts: target.max_arm_raw_insts,
+            max_diamond_insts: target.max_diamond_insts,
+            is_predictable: true,
+        };
+    }
+    if (HIGH_ENTROPY_MIN_PERMILLE..=HIGH_ENTROPY_MAX_PERMILLE).contains(&taken_permille) {
+        BranchBudget {
+            max_arm_insts: target.max_arm_insts.saturating_add(HIGH_ENTROPY_ARM_BONUS),
+            max_arm_raw_insts: target.max_arm_raw_insts.saturating_add(HIGH_ENTROPY_RAW_BONUS),
+            max_diamond_insts: target.max_diamond_insts.saturating_add(HIGH_ENTROPY_DIAMOND_BONUS),
+            is_predictable: false,
+        }
+    } else {
+        BranchBudget {
+            max_arm_insts: target.max_arm_insts,
+            max_arm_raw_insts: target.max_arm_raw_insts,
+            max_diamond_insts: target.max_diamond_insts,
+            is_predictable: false,
+        }
+    }
+}
+
+enum FindOutcome {
+    Matched {
+        pat: IfPattern,
+        predictable_preserved: u32,
+    },
+    Done {
+        predictable_preserved: u32,
+    },
+}
+
+struct AppliedPattern<A: Allocator> {
+    func: Func<A>,
+    reductions_canonicalized: u32,
+    taken_by_block: Vec<u16, A>,
+}
+
+#[inline]
+fn is_zero_cost_const(op: Op) -> bool {
+    matches!(op, Op::Iconst | Op::IconstWide | Op::Fconst | Op::FconstWide)
+}
 
 #[inline]
 fn is_speculable_pure(op: Op, flags: Flags) -> bool {
@@ -540,7 +669,8 @@ fn try_match_switch(
     view: &View<'_>,
     head: u32,
     term: usize,
-    arm_ok: &impl Fn(u32, u32, usize, usize) -> Option<(u32, usize, usize)>,
+    max_arm_raw_insts: usize,
+    arm_ok: &impl Fn(u32, u32, usize, usize, usize) -> Option<(u32, usize, usize)>,
 ) -> Option<SwitchPattern> {
     let at = to_idx(at_u32(view.data, term));
     let scrut = at_u32(view.extra, at);
@@ -581,7 +711,7 @@ fn try_match_switch(
     // Identify the shared `join` block: either the jump target of an arm, or a single direct target.
     let mut join_opt = None;
     if default_argc == 0 {
-        if let Some((j, _, _)) = arm_ok(head, default_blk, 0, MAX_SWITCH_ARM_INSTS) {
+        if let Some((j, _, _)) = arm_ok(head, default_blk, 0, MAX_SWITCH_ARM_INSTS, max_arm_raw_insts) {
             join_opt = Some(j);
         }
     }
@@ -589,7 +719,7 @@ fn try_match_switch(
         for i in 0..case_count {
             let rc = raw_cases.get(i).copied()?;
             if rc.argc == 0 {
-                if let Some((j, _, _)) = arm_ok(head, rc.block, 0, MAX_SWITCH_ARM_INSTS) {
+                if let Some((j, _, _)) = arm_ok(head, rc.block, 0, MAX_SWITCH_ARM_INSTS, max_arm_raw_insts) {
                     join_opt = Some(j);
                     break;
                 }
@@ -636,7 +766,7 @@ fn try_match_switch(
                 return Some(jat + 2);
             }
         }
-        let (j, body_len, jat) = arm_ok(head, blk, 0, MAX_SWITCH_ARM_INSTS)?;
+        let (j, body_len, jat) = arm_ok(head, blk, 0, MAX_SWITCH_ARM_INSTS, max_arm_raw_insts)?;
         if j != join {
             return None;
         }
@@ -696,15 +826,21 @@ fn try_match_switch(
     })
 }
 
-/// Finds one pure triangle/diamond `if` or small pure `switch` eligible for branchless if-conversion.
+/// Finds one pure triangle/diamond `if` or small pure `switch` eligible for branchless
+/// if-conversion, gated by target microarchitecture limits and optional PGO branch entropy.
 ///
 /// Works for ANY `join` block regardless of how many other predecessors `join` has
 /// (for example, a loop header with a preheader edge plus all branch/switch arms).
-fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfPattern> {
+fn find_if_pattern<A: Allocator + Copy>(
+    view: &View<'_>,
+    target: IfConvTarget,
+    profile: BranchProfile<'_>,
+    alloc: A,
+) -> FindOutcome {
     let blocks = view.blocks();
     let len = view.len();
     if blocks < 2 {
-        return None;
+        return FindOutcome::Done { predictable_preserved: 0 };
     }
 
     let mut inst_block = filled(len, 0u32, &alloc);
@@ -730,8 +866,13 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
         });
     }
 
-    let arm_ok = |head: u32, arm: u32, expected_argc: usize, max_insts: usize| -> Option<(u32, usize, usize)> {
-        if arm == head || view.block_kind(Block(arm)) != BlockKind::Normal {
+    let arm_ok = |head: u32,
+                  arm: u32,
+                  expected_argc: usize,
+                  max_insts: usize,
+                  max_raw_insts: usize|
+     -> Option<(u32, usize, usize)> {
+        if arm == 0 || arm == head || view.block_kind(Block(arm)) != BlockKind::Normal {
             return None;
         }
         let arm_preds = preds.get(to_idx(arm))?;
@@ -748,13 +889,21 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
             return None;
         }
         let body_len = term.checked_sub(arm_params.end)?;
-        if body_len > max_insts {
+        if body_len > max_raw_insts {
             return None;
         }
+        let mut non_const_insts = 0usize;
         for inst in arm_params.end..term {
-            if !is_speculable_pure(view.op(inst), Flags(at_u8(view.flags, inst))) {
+            let op = view.op(inst);
+            if !is_speculable_pure(op, Flags(at_u8(view.flags, inst))) {
                 return None;
             }
+            if !is_zero_cost_const(op) {
+                non_const_insts += 1;
+            }
+        }
+        if non_const_insts > max_insts {
+            return None;
         }
         // Ensure no instruction or parameter defined inside `arm` is used directly in any other block.
         for b in 0..blocks {
@@ -791,7 +940,7 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
         if join == arm {
             return None;
         }
-        Some((join, body_len, jat))
+        Some((join, non_const_insts, jat))
     };
 
     let join_args_selectable = |join: u32, t_args_at: usize, e_args_at: usize| -> bool {
@@ -809,6 +958,8 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
         true
     };
 
+    let mut predictable_preserved = 0u32;
+
     for b in 0..blocks {
         let head = to_u32(b);
         if view.block_kind(Block(head)) != BlockKind::Normal {
@@ -817,14 +968,23 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
         let term = view.terminator(Block(head));
         let term_op = view.op(term);
         if term_op == Op::Switch {
-            if let Some(sw) = try_match_switch(view, head, term, &arm_ok) {
-                return Some(IfPattern::Switch(sw));
+            if let Some(sw) = try_match_switch(view, head, term, target.max_arm_raw_insts, &arm_ok) {
+                return FindOutcome::Matched {
+                    pat: IfPattern::Switch(sw),
+                    predictable_preserved,
+                };
             }
             continue;
         }
         if term_op != Op::Br {
             continue;
         }
+        let taken = profile
+            .taken_permille_by_block
+            .get(b)
+            .copied()
+            .unwrap_or(u16::MAX);
+        let budget = branch_budget(target, taken);
         let at = to_idx(at_u32(view.data, term));
         let cond = at_u32(view.extra, at);
         let t_blk = at_u32(view.extra, at + 1);
@@ -840,14 +1000,19 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
                     && e_argc == params.len()
                     && join_args_selectable(join, at + 3, e_at + 2)
                 {
-                    return Some(IfPattern::DirectSelect { head, cond, join });
+                    return FindOutcome::Matched {
+                        pat: IfPattern::DirectSelect { head, cond, join },
+                        predictable_preserved,
+                    };
                 }
             }
             continue;
         }
 
         // 1. Triangle: `head -> t_arm -> e_blk`
-        if let Some((join, _, t_jat)) = arm_ok(head, t_blk, t_argc, MAX_ARM_INSTS) {
+        if let Some((join, n1, t_jat)) =
+            arm_ok(head, t_blk, t_argc, budget.max_arm_insts, budget.max_arm_raw_insts)
+        {
             if join == e_blk {
                 let params = view.params(Block(join));
                 let arm_argc = to_idx(at_u32(view.extra, t_jat + 1));
@@ -855,19 +1020,28 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
                     && arm_argc == params.len()
                     && join_args_selectable(join, t_jat + 2, e_at + 2)
                 {
-                    return Some(IfPattern::Triangle {
-                        head,
-                        cond,
-                        arm: t_blk,
-                        join,
-                        arm_is_then: true,
-                    });
+                    if budget.is_predictable && n1 > TRIVIAL_PREDICTABLE_OPS {
+                        predictable_preserved += 1;
+                        continue;
+                    }
+                    return FindOutcome::Matched {
+                        pat: IfPattern::Triangle {
+                            head,
+                            cond,
+                            arm: t_blk,
+                            join,
+                            arm_is_then: true,
+                        },
+                        predictable_preserved,
+                    };
                 }
             }
         }
 
         // 2. Triangle: `head -> e_arm -> t_blk`
-        if let Some((join, _, e_jat)) = arm_ok(head, e_blk, e_argc, MAX_ARM_INSTS) {
+        if let Some((join, n2, e_jat)) =
+            arm_ok(head, e_blk, e_argc, budget.max_arm_insts, budget.max_arm_raw_insts)
+        {
             if join == t_blk {
                 let params = view.params(Block(join));
                 let arm_argc = to_idx(at_u32(view.extra, e_jat + 1));
@@ -875,13 +1049,20 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
                     && arm_argc == params.len()
                     && join_args_selectable(join, at + 3, e_jat + 2)
                 {
-                    return Some(IfPattern::Triangle {
-                        head,
-                        cond,
-                        arm: e_blk,
-                        join,
-                        arm_is_then: false,
-                    });
+                    if budget.is_predictable && n2 > TRIVIAL_PREDICTABLE_OPS {
+                        predictable_preserved += 1;
+                        continue;
+                    }
+                    return FindOutcome::Matched {
+                        pat: IfPattern::Triangle {
+                            head,
+                            cond,
+                            arm: e_blk,
+                            join,
+                            arm_is_then: false,
+                        },
+                        predictable_preserved,
+                    };
                 }
             }
         }
@@ -889,10 +1070,10 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
         // 3. Diamond: `head -> t_arm -> join` AND `head -> e_arm -> join`
         //    (works for ANY `join`, including multi-predecessor loop headers!).
         if let (Some((j1, n1, t_jat)), Some((j2, n2, e_jat))) = (
-            arm_ok(head, t_blk, t_argc, MAX_ARM_INSTS),
-            arm_ok(head, e_blk, e_argc, MAX_ARM_INSTS),
+            arm_ok(head, t_blk, t_argc, budget.max_arm_insts, budget.max_arm_raw_insts),
+            arm_ok(head, e_blk, e_argc, budget.max_arm_insts, budget.max_arm_raw_insts),
         ) {
-            if j1 == j2 && n1 + n2 <= MAX_ARM_INSTS {
+            if j1 == j2 && n1 + n2 <= budget.max_diamond_insts {
                 let params = view.params(Block(j1));
                 let t_jargc = to_idx(at_u32(view.extra, t_jat + 1));
                 let e_jargc = to_idx(at_u32(view.extra, e_jat + 1));
@@ -900,18 +1081,26 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
                     && e_jargc == params.len()
                     && join_args_selectable(j1, t_jat + 2, e_jat + 2)
                 {
-                    return Some(IfPattern::Diamond {
-                        head,
-                        cond,
-                        t_arm: t_blk,
-                        e_arm: e_blk,
-                        join: j1,
-                    });
+                    if budget.is_predictable && n1 + n2 > TRIVIAL_PREDICTABLE_OPS {
+                        predictable_preserved += 1;
+                        continue;
+                    }
+                    return FindOutcome::Matched {
+                        pat: IfPattern::Diamond {
+                            head,
+                            cond,
+                            t_arm: t_blk,
+                            e_arm: e_blk,
+                            join: j1,
+                        },
+                        predictable_preserved,
+                    };
                 }
             }
         }
     }
-    None
+
+    FindOutcome::Done { predictable_preserved }
 }
 
 /// If `val` is `op(acc, x)` (or `op(x, acc)`) for an associative integer reduction `Add`/`Xor`/`Or`/`And`
@@ -1073,11 +1262,121 @@ fn emit_switch_head<A: Allocator + Copy>(
     push_inst(ctx.func, Op::Jump, Flags::NONE, Ty::NONE, jat);
 }
 
+fn trivial_target(view: &View<'_>, inst: usize) -> u32 {
+    match view.op(inst) {
+        Op::Br => {
+            let mut o = view.operands(inst);
+            let cond = o.value();
+            let (then, otherwise) = (o.target(), o.target());
+            match constant_of(view, cond.0) {
+                Some(value) => {
+                    if value != 0 {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                None if then.block == otherwise.block && then.args.0 == otherwise.args.0 => 0,
+                None => NONE,
+            }
+        }
+        Op::Switch => {
+            let mut o = view.operands(inst);
+            let scrutinee = o.value();
+            let Some(value) = constant_of(view, scrutinee.0) else {
+                return NONE;
+            };
+            let width = Ty(at_u16(view.tys, scrutinee.index())).bits(view.head.ptr_bits);
+            let _ = o.target();
+            let found = o
+                .cases(scrutinee)
+                .position(|(words, _)| wide_value(words, width) == value);
+            match found {
+                Some(case) => to_u32(case).saturating_add(1),
+                None => 0,
+            }
+        }
+        _ => NONE,
+    }
+}
+
+/// Remaps per-block PGO taken-permille biases across `dead` (`fold_trivial = true`) or
+/// `coalesce_cfg` (`fold_trivial = false`), preserving each surviving block's terminator bias.
+fn remap_taken_for_cleanup<A: Allocator + Copy>(
+    view: &View<'_>,
+    taken: &[u16],
+    fold_trivial: bool,
+    alloc: A,
+) -> Vec<u16, A> {
+    let blocks = view.blocks();
+    let len = view.len();
+    let mut jump = filled(len, NONE, &alloc);
+    if fold_trivial {
+        for b in 0..blocks {
+            let end = view.terminator(Block(to_u32(b)));
+            let chosen = trivial_target(view, end);
+            if chosen != NONE {
+                set_at(&mut jump, end, chosen);
+            }
+        }
+    }
+    let reached = reachable(view, &jump, &alloc);
+    let into = incoming(view, &reached, &jump, &alloc);
+    let mut merge_next = filled(blocks, NONE, &alloc);
+    let mut merged_into_pred = filled(blocks, false, &alloc);
+    for a in 0..blocks {
+        if !reached.get(a).copied().unwrap_or(false) {
+            continue;
+        }
+        let term = view.terminator(Block(to_u32(a)));
+        if view.op(term) != Op::Jump {
+            continue;
+        }
+        let b = at_u32(view.extra, to_idx(at_u32(view.data, term)));
+        let b_idx = to_idx(b);
+        if b != 0
+            && b_idx != a
+            && reached.get(b_idx).copied().unwrap_or(false)
+            && into.targets_only.get(b_idx).copied().unwrap_or(false)
+            && into.edges_into(b_idx).len() == 1
+            && !view.block_kind(Block(b)).is_landing()
+        {
+            set_at(&mut merge_next, a, b);
+            set_at(&mut merged_into_pred, b_idx, true);
+        }
+    }
+    let mut out: Vec<u16, A> = Vec::with_capacity_in(blocks, alloc);
+    for head in 0..blocks {
+        if !reached.get(head).copied().unwrap_or(false)
+            || merged_into_pred.get(head).copied().unwrap_or(false)
+        {
+            continue;
+        }
+        let mut tail = head;
+        for _ in 0..blocks {
+            let next = at_u32(&merge_next, tail);
+            if next == NONE {
+                break;
+            }
+            tail = to_idx(next);
+        }
+        let tail_term = view.terminator(Block(to_u32(tail)));
+        let bias = if at_u32(&jump, tail_term) != NONE {
+            u16::MAX
+        } else {
+            taken.get(tail).copied().unwrap_or(u16::MAX)
+        };
+        out.push(bias);
+    }
+    out
+}
+
 fn apply_if_pattern<A: Allocator + Copy>(
     view: &View<'_>,
     pat: IfPattern,
+    taken_by_block: &[u16],
     alloc: A,
-) -> Result<(Func<A>, u32), SimplifyError> {
+) -> Result<AppliedPattern<A>, SimplifyError> {
     let blocks = view.blocks();
     let len = view.len();
     let mut func = view.to_func_in(alloc);
@@ -1320,31 +1619,623 @@ fn apply_if_pattern<A: Allocator + Copy>(
     }
     apply_val_fixups(&mut func, &val_map, &fixups)?;
     verify(func.view()).map_err(SimplifyError::Verify)?;
-    let d = dead(func.view(), alloc)?;
-    let c = coalesce_cfg(d.view(), alloc)?;
-    Ok((c, canonicalized))
+    let (d, d_taken) = if taken_by_block.is_empty() {
+        (dead(func.view(), alloc)?, Vec::new_in(alloc))
+    } else {
+        let mut func_taken: Vec<u16, A> = Vec::with_capacity_in(blocks, alloc);
+        for b in 0..blocks {
+            let bias = if to_u32(b) == head {
+                u16::MAX
+            } else {
+                taken_by_block.get(b).copied().unwrap_or(u16::MAX)
+            };
+            func_taken.push(bias);
+        }
+        let remapped = remap_taken_for_cleanup(&func.view(), &func_taken, true, alloc);
+        (dead(func.view(), alloc)?, remapped)
+    };
+    let (c, c_taken) = if d_taken.is_empty() {
+        (coalesce_cfg(d.view(), alloc)?, Vec::new_in(alloc))
+    } else {
+        let remapped = remap_taken_for_cleanup(&d.view(), &d_taken, false, alloc);
+        (coalesce_cfg(d.view(), alloc)?, remapped)
+    };
+    Ok(AppliedPattern {
+        func: c,
+        reductions_canonicalized: canonicalized,
+        taken_by_block: c_taken,
+    })
+}
+
+const MAX_SELECT_BALANCE_ITERS: u32 = 4;
+
+#[derive(Clone, Copy)]
+struct ConstCmp {
+    lhs: u32,
+    ty: Ty,
+    pred: IntCond,
+    rhs: u128,
+}
+
+#[inline]
+const fn swap_int_cond(cc: IntCond) -> IntCond {
+    match cc {
+        IntCond::Eq => IntCond::Eq,
+        IntCond::Ne => IntCond::Ne,
+        IntCond::Ult => IntCond::Ugt,
+        IntCond::Ule => IntCond::Uge,
+        IntCond::Ugt => IntCond::Ult,
+        IntCond::Uge => IntCond::Ule,
+        IntCond::Slt => IntCond::Sgt,
+        IntCond::Sle => IntCond::Sge,
+        IntCond::Sgt => IntCond::Slt,
+        IntCond::Sge => IntCond::Sle,
+    }
+}
+
+#[inline]
+const fn invert_int_cond(cc: IntCond) -> IntCond {
+    match cc {
+        IntCond::Eq => IntCond::Ne,
+        IntCond::Ne => IntCond::Eq,
+        IntCond::Ult => IntCond::Uge,
+        IntCond::Ule => IntCond::Ugt,
+        IntCond::Ugt => IntCond::Ule,
+        IntCond::Uge => IntCond::Ult,
+        IntCond::Slt => IntCond::Sge,
+        IntCond::Sle => IntCond::Sgt,
+        IntCond::Sgt => IntCond::Sle,
+        IntCond::Sge => IntCond::Slt,
+    }
+}
+
+fn extract_iconst(view: &View<'_>, val: u32, width: u32) -> Option<u128> {
+    let vi = to_idx(val);
+    if vi >= view.len() {
+        return None;
+    }
+    match view.op(vi) {
+        Op::Iconst => Some(iconst_value(at_u32(view.data, vi), width)),
+        Op::IconstWide => {
+            let ty = Ty(at_u16(view.tys, vi));
+            let words = to_idx(ty.const_words());
+            let at = to_idx(at_u32(view.data, vi));
+            let slice = view.extra.get(at..at.checked_add(words)?)?;
+            Some(wide_value(slice, width))
+        }
+        _ => None,
+    }
+}
+
+fn extract_const_cmp(view: &View<'_>, cond_val: u32) -> Option<ConstCmp> {
+    let ci = to_idx(cond_val);
+    if ci >= view.len() || view.op(ci) != Op::Icmp {
+        return None;
+    }
+    if Ty(at_u16(view.tys, ci)) != Ty::I1 {
+        return None;
+    }
+    let at = to_idx(at_u32(view.data, ci));
+    let pred = IntCond::from_word(at_u32(view.extra, at))?;
+    let lhs = at_u32(view.extra, at + 1);
+    let rhs = at_u32(view.extra, at + 2);
+    let lhs_idx = to_idx(lhs);
+    let rhs_idx = to_idx(rhs);
+    if lhs_idx >= view.len() || rhs_idx >= view.len() {
+        return None;
+    }
+    let ty = Ty(at_u16(view.tys, lhs_idx));
+    if !ty.is_scalar() || !ty.is_int() {
+        return None;
+    }
+    let width = ty.bits(64);
+    if !(1..=128).contains(&width) {
+        return None;
+    }
+    if let Some(k) = extract_iconst(view, rhs, width) {
+        if view.op(lhs_idx) == Op::Uninit {
+            return None;
+        }
+        return Some(ConstCmp { lhs, ty, pred, rhs: k });
+    }
+    if let Some(k) = extract_iconst(view, lhs, width) {
+        if view.op(rhs_idx) == Op::Uninit {
+            return None;
+        }
+        return Some(ConstCmp { lhs: rhs, ty, pred: swap_int_cond(pred), rhs: k });
+    }
+    None
+}
+
+/// Returns `Some(None)` for the empty set, `Some(Some((lo, hi)))` for `[lo, hi]`, or `None` if
+/// `pred` does not represent a single unsigned interval.
+fn unsigned_interval(pred: IntCond, k: u128, max_u: u128) -> Option<Option<(u128, u128)>> {
+    match pred {
+        IntCond::Eq => Some(Some((k, k))),
+        IntCond::Ult => Some(k.checked_sub(1).map(|hi| (0, hi))),
+        IntCond::Ule => Some(Some((0, k))),
+        IntCond::Ugt => Some(if k == max_u { None } else { Some((k + 1, max_u)) }),
+        IntCond::Uge => Some(Some((k, max_u))),
+        IntCond::Ne | IntCond::Slt | IntCond::Sle | IntCond::Sgt | IntCond::Sge => None,
+    }
+}
+
+/// Returns `Some(None)` for the empty set, `Some(Some((lo, hi)))` for `[lo, hi]`, or `None` if
+/// `pred` does not represent a single signed interval.
+fn signed_interval(pred: IntCond, k: i128, min_s: i128, max_s: i128) -> Option<Option<(i128, i128)>> {
+    match pred {
+        IntCond::Eq => Some(Some((k, k))),
+        IntCond::Slt => Some(if k == min_s { None } else { Some((min_s, k - 1)) }),
+        IntCond::Sle => Some(Some((min_s, k))),
+        IntCond::Sgt => Some(if k == max_s { None } else { Some((k + 1, max_s)) }),
+        IntCond::Sge => Some(Some((k, max_s))),
+        IntCond::Ne | IntCond::Ult | IntCond::Ule | IntCond::Ugt | IntCond::Uge => None,
+    }
+}
+
+/// Returns `Some(true)` if for every `width`-bit integer `x`, `x a_pred a_k => x b_pred b_k`.
+/// Returns `Some(false)` if for every `width`-bit integer `x`, `x a_pred a_k => !(x b_pred b_k)`.
+/// Returns `None` otherwise.
+fn cmp_implies(a_pred: IntCond, a_k: u128, b_pred: IntCond, b_k: u128, width: u32) -> Option<bool> {
+    if !(1..=128).contains(&width) {
+        return None;
+    }
+    let m = mask(width);
+    let a_k = a_k & m;
+    let b_k = b_k & m;
+    if a_pred == IntCond::Eq {
+        return Some(compare(b_pred, a_k, b_k, width));
+    }
+    if let Some(a_set) = unsigned_interval(a_pred, a_k, m) {
+        let Some((a_lo, a_hi)) = a_set else {
+            return Some(true);
+        };
+        if b_pred == IntCond::Ne {
+            if a_lo == b_k && a_hi == b_k {
+                return Some(false);
+            }
+            if b_k < a_lo || b_k > a_hi {
+                return Some(true);
+            }
+            return None;
+        }
+        if let Some(b_set) = unsigned_interval(b_pred, b_k, m) {
+            return match b_set {
+                None => Some(false),
+                Some((b_lo, b_hi)) => {
+                    if a_lo >= b_lo && a_hi <= b_hi {
+                        Some(true)
+                    } else if a_hi < b_lo || a_lo > b_hi {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
+    }
+    let min_s = sext(1u128 << (width - 1), width);
+    let max_s = sext(mask(width - 1), width);
+    let a_sk = sext(a_k, width);
+    let b_sk = sext(b_k, width);
+    if let Some(a_set) = signed_interval(a_pred, a_sk, min_s, max_s) {
+        let Some((a_lo, a_hi)) = a_set else {
+            return Some(true);
+        };
+        if b_pred == IntCond::Ne {
+            if a_lo == b_sk && a_hi == b_sk {
+                return Some(false);
+            }
+            if b_sk < a_lo || b_sk > a_hi {
+                return Some(true);
+            }
+            return None;
+        }
+        if let Some(b_set) = signed_interval(b_pred, b_sk, min_s, max_s) {
+            return match b_set {
+                None => Some(false),
+                Some((b_lo, b_hi)) => {
+                    if a_lo >= b_lo && a_hi <= b_hi {
+                        Some(true)
+                    } else if a_hi < b_lo || a_lo > b_hi {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct BalancedSelect {
+    s1: usize,
+    s2: usize,
+    s3: usize,
+    ty: Ty,
+    /// First leaf select (emitted first, using `c1`).
+    first_cond: u32,
+    first_t: u32,
+    first_f: u32,
+    /// Second leaf select (emitted second, using `c2`).
+    second_cond: u32,
+    second_t: u32,
+    second_f: u32,
+    /// Root select condition (`c3`).
+    root_cond: u32,
+    /// If `true`, `root = Select(c3, first, second)`; else `root = Select(c3, second, first)`.
+    first_is_true_arm: bool,
+}
+
+fn has_select_chain_candidate(view: &View<'_>) -> bool {
+    for b in 0..view.blocks() {
+        let mut count = 0u32;
+        for inst in view.block(Block(to_u32(b))) {
+            if view.op(inst) == Op::Select {
+                count += 1;
+                if count >= 3 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn try_match_select_chain(
+    view: &View<'_>,
+    block_range: core::ops::Range<usize>,
+    s1: usize,
+    use_count: &[u32],
+    sel_depth: &[u32],
+    claimed: &[bool],
+) -> Option<BalancedSelect> {
+    if view.op(s1) != Op::Select
+        || at_u8(view.flags, s1) != Flags::NONE.0
+        || claimed.get(s1).copied().unwrap_or(true)
+    {
+        return None;
+    }
+    let orig_depth = at_u32(sel_depth, s1);
+    if orig_depth < 3 {
+        return None;
+    }
+    let ty = Ty(at_u16(view.tys, s1));
+    let at1 = to_idx(at_u32(view.data, s1));
+    let c1 = at_u32(view.extra, at1);
+    let t1 = at_u32(view.extra, at1 + 1);
+    let f1 = at_u32(view.extra, at1 + 2);
+    let cmp1 = extract_const_cmp(view, c1)?;
+
+    // Check `s2` on the false arm (`s1_leaf_on_true = true`) first, then on the true arm.
+    for (s1_leaf_on_true, a, s2_val) in [(true, t1, f1), (false, f1, t1)] {
+        let s2 = to_idx(s2_val);
+        if s2 < block_range.start
+            || s2 >= s1
+            || claimed.get(s2).copied().unwrap_or(true)
+            || at_u32(use_count, s2) != 1
+            || view.op(s2) != Op::Select
+            || at_u8(view.flags, s2) != Flags::NONE.0
+            || Ty(at_u16(view.tys, s2)) != ty
+        {
+            continue;
+        }
+        let at2 = to_idx(at_u32(view.data, s2));
+        let c2 = at_u32(view.extra, at2);
+        let t2 = at_u32(view.extra, at2 + 1);
+        let f2 = at_u32(view.extra, at2 + 2);
+        let Some(cmp2) = extract_const_cmp(view, c2) else {
+            continue;
+        };
+        if cmp2.lhs != cmp1.lhs || cmp2.ty != cmp1.ty {
+            continue;
+        }
+
+        // Check `s3` on the false arm (`s2_leaf_on_true = true`) first, then on the true arm.
+        for (s2_leaf_on_true, b, s3_val) in [(true, t2, f2), (false, f2, t2)] {
+            let s3 = to_idx(s3_val);
+            if s3 < block_range.start
+                || s3 >= s2
+                || claimed.get(s3).copied().unwrap_or(true)
+                || at_u32(use_count, s3) != 1
+                || view.op(s3) != Op::Select
+                || at_u8(view.flags, s3) != Flags::NONE.0
+                || Ty(at_u16(view.tys, s3)) != ty
+            {
+                continue;
+            }
+            let at3 = to_idx(at_u32(view.data, s3));
+            let c3 = at_u32(view.extra, at3);
+            let c = at_u32(view.extra, at3 + 1);
+            let d = at_u32(view.extra, at3 + 2);
+            let Some(cmp3) = extract_const_cmp(view, c3) else {
+                continue;
+            };
+            if cmp3.lhs != cmp1.lhs || cmp3.ty != cmp1.ty {
+                continue;
+            }
+
+            let leaf_depth = |v: u32| -> u32 {
+                let vi = to_idx(v);
+                if block_range.contains(&vi) {
+                    at_u32(sel_depth, vi)
+                } else {
+                    0
+                }
+            };
+            let max_leaf_depth = leaf_depth(a)
+                .max(leaf_depth(b))
+                .max(leaf_depth(c))
+                .max(leaf_depth(d));
+            if max_leaf_depth.saturating_add(2) >= orig_depth {
+                continue;
+            }
+
+            let width = cmp1.ty.bits(64);
+            let p1_pred = if s1_leaf_on_true { cmp1.pred } else { invert_int_cond(cmp1.pred) };
+            let p2_pred = if s2_leaf_on_true { cmp2.pred } else { invert_int_cond(cmp2.pred) };
+            let Some(imp1) = cmp_implies(p1_pred, cmp1.rhs, cmp3.pred, cmp3.rhs, width) else {
+                continue;
+            };
+            let Some(imp2) = cmp_implies(p2_pred, cmp2.rhs, cmp3.pred, cmp3.rhs, width) else {
+                continue;
+            };
+            if imp1 == imp2 {
+                continue;
+            }
+
+            let (first_t, first_f, second_t, second_f, first_is_true_arm) = if imp1 {
+                // `P1 => c3` and `P2 => !c3`:
+                //   first  = if P1 { a } else { c }  (true arm of root)
+                //   second = if P2 { b } else { d }  (false arm of root)
+                let (ft, ff) = if s1_leaf_on_true { (a, c) } else { (c, a) };
+                let (st, sf) = if s2_leaf_on_true { (b, d) } else { (d, b) };
+                (ft, ff, st, sf, true)
+            } else {
+                // `P1 => !c3` and `P2 => c3`:
+                //   first  = if P1 { a } else { d }  (false arm of root)
+                //   second = if P2 { b } else { c }  (true arm of root)
+                let (ft, ff) = if s1_leaf_on_true { (a, d) } else { (d, a) };
+                let (st, sf) = if s2_leaf_on_true { (b, c) } else { (c, b) };
+                (ft, ff, st, sf, false)
+            };
+
+            return Some(BalancedSelect {
+                s1,
+                s2,
+                s3,
+                ty,
+                first_cond: c1,
+                first_t,
+                first_f,
+                second_cond: c2,
+                second_t,
+                second_f,
+                root_cond: c3,
+                first_is_true_arm,
+            });
+        }
+    }
+    None
+}
+
+fn balance_select_chains_once<A: Allocator + Copy>(
+    view: &View<'_>,
+    alloc: A,
+) -> Result<Option<Func<A>>, SimplifyError> {
+    let blocks = view.blocks();
+    let len = view.len();
+
+    let mut use_count = filled(len, 0u32, &alloc);
+    for inst in 0..len {
+        each(view, inst, |item| match item {
+            Item::Value(v) => {
+                if let Some(slot) = use_count.get_mut(to_idx(v)) {
+                    *slot = slot.saturating_add(1);
+                }
+            }
+            Item::Edge(edge) => {
+                if let Some((arg_start, arg_len)) = edge.args {
+                    for k in 0..arg_len {
+                        let v = at_u32(view.extra, arg_start + k);
+                        if let Some(slot) = use_count.get_mut(to_idx(v)) {
+                            *slot = slot.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let mut sel_depth = filled(len, 0u32, &alloc);
+    for b in 0..blocks {
+        let range = view.block(Block(to_u32(b)));
+        let (start, end) = (range.start, range.end);
+        for inst in start..end {
+            if view.op(inst) == Op::Select {
+                let at = to_idx(at_u32(view.data, inst));
+                let tv = to_idx(at_u32(view.extra, at + 1));
+                let fv = to_idx(at_u32(view.extra, at + 2));
+                let td = if tv >= start && tv < end { at_u32(&sel_depth, tv) } else { 0 };
+                let fd = if fv >= start && fv < end { at_u32(&sel_depth, fv) } else { 0 };
+                set_at(&mut sel_depth, inst, td.max(fd).saturating_add(1));
+            }
+        }
+    }
+
+    let mut claimed = filled(len, false, &alloc);
+    let mut skip = filled(len, false, &alloc);
+    let mut rewrite_idx = filled(len, NONE, &alloc);
+    let mut rewrites: Vec<BalancedSelect, A> = Vec::new_in(alloc);
+
+    for b in 0..blocks {
+        let range = view.block(Block(to_u32(b)));
+        let (start, end) = (range.start, range.end);
+        for inst in (start..end).rev() {
+            if let Some(bs) = try_match_select_chain(view, start..end, inst, &use_count, &sel_depth, &claimed) {
+                set_at(&mut claimed, bs.s1, true);
+                set_at(&mut claimed, bs.s2, true);
+                set_at(&mut claimed, bs.s3, true);
+                set_at(&mut skip, bs.s2, true);
+                set_at(&mut skip, bs.s3, true);
+                let ri = to_u32(rewrites.len());
+                rewrites.push(bs);
+                set_at(&mut rewrite_idx, bs.s1, ri);
+            }
+        }
+    }
+
+    if rewrites.is_empty() {
+        return Ok(None);
+    }
+
+    let mut func = view.to_func_in(alloc);
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+
+    let mut val_map = filled(len, NONE, &alloc);
+    let mut fixups: Vec<ValFixup, A> = Vec::new_in(alloc);
+
+    for b in 0..blocks {
+        let b32 = to_u32(b);
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(at_u8(view.block_kinds, b));
+        for inst in view.block(Block(b32)) {
+            if skip.get(inst).copied().unwrap_or(false) {
+                continue;
+            }
+            let ri = at_u32(&rewrite_idx, inst);
+            if ri != NONE
+                && let Some(bs) = rewrites.get(to_idx(ri)).copied()
+            {
+                let first_at = to_u32(func.extra.len());
+                push_mapped_val(&val_map, bs.first_cond, &mut fixups, &mut func);
+                push_mapped_val(&val_map, bs.first_t, &mut fixups, &mut func);
+                push_mapped_val(&val_map, bs.first_f, &mut fixups, &mut func);
+                let first = push_inst(&mut func, Op::Select, Flags::NONE, bs.ty, first_at);
+
+                let second_at = to_u32(func.extra.len());
+                push_mapped_val(&val_map, bs.second_cond, &mut fixups, &mut func);
+                push_mapped_val(&val_map, bs.second_t, &mut fixups, &mut func);
+                push_mapped_val(&val_map, bs.second_f, &mut fixups, &mut func);
+                let second = push_inst(&mut func, Op::Select, Flags::NONE, bs.ty, second_at);
+
+                let (root_t, root_f) = if bs.first_is_true_arm { (first, second) } else { (second, first) };
+                let root_at = to_u32(func.extra.len());
+                push_mapped_val(&val_map, bs.root_cond, &mut fixups, &mut func);
+                func.extra.push(root_t);
+                func.extra.push(root_f);
+                let root = push_inst(&mut func, Op::Select, Flags::NONE, bs.ty, root_at);
+                set_at(&mut val_map, inst, root);
+            } else {
+                let mapped = copy_remapped(view, inst, &val_map, &mut fixups, &mut func);
+                set_at(&mut val_map, inst, mapped);
+            }
+        }
+    }
+
+    apply_val_fixups(&mut func, &val_map, &fixups)?;
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok(Some(func))
+}
+
+/// Rebalances linear 3-deep `Op::Select` cascades into balanced depth-2 `Op::Select` trees when
+/// the integer comparison predicates provably partition the domain (`P1 => c3` and `P2 => !c3`, or
+/// dual), preserving exact instruction count (3 selects -> 3 selects) while strictly reducing
+/// critical-path select depth.
+fn balance_select_chains<A: Allocator + Copy>(
+    mut cur: Func<A>,
+    alloc: A,
+) -> Result<Func<A>, SimplifyError> {
+    for _ in 0..MAX_SELECT_BALANCE_ITERS {
+        if !has_select_chain_candidate(&cur.view()) {
+            break;
+        }
+        let Some(next) = balance_select_chains_once(&cur.view(), alloc)? else {
+            break;
+        };
+        cur = next;
+    }
+    Ok(cur)
 }
 
 /// Converts same-target branches (`Br(c, (join, t), (join, e))`), pure diamond/triangle branches,
-/// and small pure `Op::Switch` dispatches into branchless `Op::Select`s (up to `max_converts`),
-/// canonicalizing conditional reductions and coalescing resulting straight-line blocks.
-pub fn if_convert<A: Allocator + Copy>(
+/// and small pure `Op::Switch` dispatches into branchless `Op::Select`s using target
+/// microarchitecture limits and optional PGO branch-entropy data (`opts`), canonicalizing
+/// conditional reductions and coalescing resulting straight-line blocks.
+pub fn if_convert_with_opts<A: Allocator + Copy>(
     view: View<'_>,
-    max_converts: u32,
+    opts: IfConvOpts<'_>,
     alloc: A,
 ) -> Result<IfConvOutput<A>, SimplifyError> {
     let mut cur = view.to_func_in(alloc);
     let mut stats = IfConvStats::default();
-    for _ in 0..max_converts {
-        let Some(pat) = find_if_pattern(&cur.view(), alloc) else {
-            break;
+    let mut tracked_taken: Vec<u16, A> = if opts.profile.taken_permille_by_block.is_empty() {
+        Vec::new_in(alloc)
+    } else {
+        let blocks = cur.view().blocks();
+        let mut buf: Vec<u16, A> = Vec::with_capacity_in(blocks, alloc);
+        for b in 0..blocks {
+            let bias = opts
+                .profile
+                .taken_permille_by_block
+                .get(b)
+                .copied()
+                .unwrap_or(u16::MAX);
+            buf.push(bias);
+        }
+        buf
+    };
+    for _ in 0..opts.max_rounds {
+        let profile = BranchProfile {
+            taken_permille_by_block: &tracked_taken,
         };
-        let (next, canon) = apply_if_pattern(&cur.view(), pat, alloc)?;
-        cur = next;
+        let pat = match find_if_pattern(&cur.view(), opts.target, profile, alloc) {
+            FindOutcome::Matched { pat, predictable_preserved } => {
+                stats.predictable_branches_preserved = predictable_preserved;
+                pat
+            }
+            FindOutcome::Done { predictable_preserved } => {
+                stats.predictable_branches_preserved = predictable_preserved;
+                break;
+            }
+        };
+        let applied = apply_if_pattern(&cur.view(), pat, &tracked_taken, alloc)?;
+        cur = applied.func;
+        tracked_taken = applied.taken_by_block;
         stats.branches_converted += 1;
-        stats.reductions_canonicalized += canon;
+        stats.reductions_canonicalized += applied.reductions_canonicalized;
     }
+    cur = balance_select_chains(cur, alloc)?;
     Ok(IfConvOutput { func: cur, stats })
+}
+
+/// Converts same-target branches (`Br(c, (join, t), (join, e))`), pure diamond/triangle branches,
+/// and small pure `Op::Switch` dispatches into branchless `Op::Select`s (up to `max_rounds`),
+/// canonicalizing conditional reductions and coalescing resulting straight-line blocks.
+pub fn if_convert<A: Allocator + Copy>(
+    view: View<'_>,
+    max_rounds: u32,
+    alloc: A,
+) -> Result<IfConvOutput<A>, SimplifyError> {
+    if_convert_with_opts(
+        view,
+        IfConvOpts {
+            max_rounds,
+            target: IfConvTarget::APPLE_M5,
+            profile: BranchProfile::default(),
+        },
+        alloc,
+    )
 }
 
 #[cfg(test)]
@@ -2023,6 +2914,768 @@ mod tests {
                     eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
                     eval::run_in(out.func.view(), &args, 10_000, TestHeap).unwrap(),
                     "loop-latch DirectSelect mismatch at n={nv}, thresh={tv}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn balance_select_chain_rebalances_repeat_offset_cascade() {
+        // 1. Canonical Zstd repeat-offset cascade:
+        //    Select(x == 0, r0, Select(x == 2, r2, Select(x <u 2, r1, r0_m1)))
+        //    -> Select(x <u 2, Select(x == 0, r0, r1), Select(x == 2, r2, r0_m1)).
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r0 = b.param(Ty::I64);
+            let r1 = b.param(Ty::I64);
+            let r2 = b.param(Ty::I64);
+            let r0_m1 = b.param(Ty::I64);
+            let k0 = b.iconst(Ty::I64, 0);
+            let k2 = b.iconst(Ty::I64, 2);
+            let c3 = b.icmp(IntCond::Ult, x, k2);
+            let s3 = b.select(Flags::NONE, c3, r1, r0_m1);
+            let c2 = b.icmp(IntCond::Eq, x, k2);
+            let s2 = b.select(Flags::NONE, c2, r2, s3);
+            let c1 = b.icmp(IntCond::Eq, x, k0);
+            let s1 = b.select(Flags::NONE, c1, r0, s2);
+            b.ret(&[s1]);
+            let func = b.finish_checked().unwrap();
+
+            let out = if_convert(func.view(), 4, TestHeap).unwrap();
+            let v = out.func.view();
+            assert!(verify(v).is_ok());
+            let selects = (0..v.len()).filter(|&i| v.op(i) == Op::Select).count();
+            assert_eq!(selects, 3);
+
+            let ret_inst = v.terminator(Block(0));
+            assert_eq!(v.op(ret_inst), Op::Return);
+            let ret_at = to_idx(at_u32(v.data, ret_inst));
+            let root = to_idx(at_u32(v.extra, ret_at + 1));
+            assert_eq!(v.op(root), Op::Select);
+            let root_at = to_idx(at_u32(v.data, root));
+            let root_cond = at_u32(v.extra, root_at);
+            let root_t = to_idx(at_u32(v.extra, root_at + 1));
+            let root_f = to_idx(at_u32(v.extra, root_at + 2));
+
+            let root_cmp = extract_const_cmp(&v, root_cond).expect("root select cond should be x <u 2");
+            assert_eq!(root_cmp.lhs, x.0);
+            assert_eq!(root_cmp.pred, IntCond::Ult);
+            assert_eq!(root_cmp.rhs, 2);
+
+            assert_eq!(v.op(root_t), Op::Select);
+            let lo_at = to_idx(at_u32(v.data, root_t));
+            let lo_cmp = extract_const_cmp(&v, at_u32(v.extra, lo_at)).expect("lo select cond should be x == 0");
+            assert_eq!(lo_cmp.lhs, x.0);
+            assert_eq!(lo_cmp.pred, IntCond::Eq);
+            assert_eq!(lo_cmp.rhs, 0);
+            assert_eq!(at_u32(v.extra, lo_at + 1), r0.0);
+            assert_eq!(at_u32(v.extra, lo_at + 2), r1.0);
+
+            assert_eq!(v.op(root_f), Op::Select);
+            let hi_at = to_idx(at_u32(v.data, root_f));
+            let hi_cmp = extract_const_cmp(&v, at_u32(v.extra, hi_at)).expect("hi select cond should be x == 2");
+            assert_eq!(hi_cmp.lhs, x.0);
+            assert_eq!(hi_cmp.pred, IntCond::Eq);
+            assert_eq!(hi_cmp.rhs, 2);
+            assert_eq!(at_u32(v.extra, hi_at + 1), r2.0);
+            assert_eq!(at_u32(v.extra, hi_at + 2), r0_m1.0);
+
+            for &xv in &[0u128, 1, 2, 3, 4, 100, u128::from(u64::MAX)] {
+                let args = [Val::Int(xv), Val::Int(11), Val::Int(22), Val::Int(33), Val::Int(44)];
+                assert_eq!(
+                    eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                    eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
+                    "balanced select mismatch at x={xv}",
+                );
+            }
+        }
+
+        // 2. Inverted-arm + dual polarity:
+        //    Select(x != 2, Select(x != 0, Select(x <u 2, c, d), b), a)
+        //    -> Select(x <u 2, Select(x != 0, c, b), Select(x != 2, d, a)).
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let c = b.param(Ty::I64);
+            let d = b.param(Ty::I64);
+            let k0 = b.iconst(Ty::I64, 0);
+            let k2 = b.iconst(Ty::I64, 2);
+            let c3 = b.icmp(IntCond::Ult, x, k2);
+            let s3 = b.select(Flags::NONE, c3, c, d);
+            let c2 = b.icmp(IntCond::Ne, x, k0);
+            let s2 = b.select(Flags::NONE, c2, s3, bv);
+            let c1 = b.icmp(IntCond::Ne, x, k2);
+            let s1 = b.select(Flags::NONE, c1, s2, a);
+            b.ret(&[s1]);
+            let func = b.finish_checked().unwrap();
+
+            let out = if_convert(func.view(), 4, TestHeap).unwrap();
+            let v = out.func.view();
+            assert!(verify(v).is_ok());
+            let selects = (0..v.len()).filter(|&i| v.op(i) == Op::Select).count();
+            assert_eq!(selects, 3);
+
+            let ret_inst = v.terminator(Block(0));
+            let ret_at = to_idx(at_u32(v.data, ret_inst));
+            let root = to_idx(at_u32(v.extra, ret_at + 1));
+            assert_eq!(v.op(root), Op::Select);
+            let root_at = to_idx(at_u32(v.data, root));
+            let root_cmp = extract_const_cmp(&v, at_u32(v.extra, root_at)).expect("root cond should be x <u 2");
+            assert_eq!(root_cmp.lhs, x.0);
+            assert_eq!(root_cmp.pred, IntCond::Ult);
+            assert_eq!(root_cmp.rhs, 2);
+
+            for &xv in &[0u128, 1, 2, 3, 4, 100, u128::from(u64::MAX)] {
+                let args = [Val::Int(xv), Val::Int(11), Val::Int(22), Val::Int(33), Val::Int(44)];
+                assert_eq!(
+                    eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                    eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
+                    "inverted dual balanced select mismatch at x={xv}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn balance_select_chain_skips_when_implication_does_not_hold() {
+        // `x == 3` implies `!(x <u 2)` and `x == 2` ALSO implies `!(x <u 2)` (same side, not a
+        // domain partition), so the cascade MUST remain unchanged.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let a = b.param(Ty::I64);
+        let bv = b.param(Ty::I64);
+        let c = b.param(Ty::I64);
+        let d = b.param(Ty::I64);
+        let k2 = b.iconst(Ty::I64, 2);
+        let k3 = b.iconst(Ty::I64, 3);
+        let c3 = b.icmp(IntCond::Ult, x, k2);
+        let s3 = b.select(Flags::NONE, c3, c, d);
+        let c2 = b.icmp(IntCond::Eq, x, k2);
+        let s2 = b.select(Flags::NONE, c2, bv, s3);
+        let c1 = b.icmp(IntCond::Eq, x, k3);
+        let s1 = b.select(Flags::NONE, c1, a, s2);
+        b.ret(&[s1]);
+        let func = b.finish_checked().unwrap();
+
+        let out = if_convert(func.view(), 4, TestHeap).unwrap();
+        let v = out.func.view();
+        assert!(verify(v).is_ok());
+        let selects = (0..v.len()).filter(|&i| v.op(i) == Op::Select).count();
+        assert_eq!(selects, 3);
+
+        let ret_inst = v.terminator(Block(0));
+        let ret_at = to_idx(at_u32(v.data, ret_inst));
+        let root = to_idx(at_u32(v.extra, ret_at + 1));
+        assert_eq!(v.op(root), Op::Select);
+        let root_at = to_idx(at_u32(v.data, root));
+        let root_cmp = extract_const_cmp(&v, at_u32(v.extra, root_at)).expect("root cond should stay x == 3");
+        assert_eq!(root_cmp.lhs, x.0);
+        assert_eq!(root_cmp.pred, IntCond::Eq);
+        assert_eq!(root_cmp.rhs, 3);
+        assert_eq!(at_u32(v.extra, root_at + 1), a.0);
+
+        let mid = to_idx(at_u32(v.extra, root_at + 2));
+        assert_eq!(v.op(mid), Op::Select);
+        let mid_at = to_idx(at_u32(v.data, mid));
+        let mid_cmp = extract_const_cmp(&v, at_u32(v.extra, mid_at)).expect("mid cond should stay x == 2");
+        assert_eq!(mid_cmp.lhs, x.0);
+        assert_eq!(mid_cmp.pred, IntCond::Eq);
+        assert_eq!(mid_cmp.rhs, 2);
+        assert_eq!(at_u32(v.extra, mid_at + 1), bv.0);
+
+        let inner = to_idx(at_u32(v.extra, mid_at + 2));
+        assert_eq!(v.op(inner), Op::Select);
+        let inner_at = to_idx(at_u32(v.data, inner));
+        let inner_cmp = extract_const_cmp(&v, at_u32(v.extra, inner_at)).expect("inner cond should stay x <u 2");
+        assert_eq!(inner_cmp.lhs, x.0);
+        assert_eq!(inner_cmp.pred, IntCond::Ult);
+        assert_eq!(inner_cmp.rhs, 2);
+        assert_eq!(at_u32(v.extra, inner_at + 1), c.0);
+        assert_eq!(at_u32(v.extra, inner_at + 2), d.0);
+
+        for &xv in &[0u128, 1, 2, 3, 4, 100] {
+            let args = [Val::Int(xv), Val::Int(11), Val::Int(22), Val::Int(33), Val::Int(44)];
+            assert_eq!(
+                eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
+                "unchanged select chain mismatch at x={xv}",
+            );
+        }
+    }
+
+    #[test]
+    fn if_converts_deep_repcode_ladder_ignoring_iconsts() {
+        // 3-level nested repcode ladder with live `Op::Iconst` nodes in every arm:
+        //   if off == rep1 { ... }
+        //   else if off == rep2 { ... }
+        //   else if off == rep3 { ... }
+        //   else { ... off + 3 ... }
+        // After collapsing the inner two levels, the outer else arm holds 8 non-const ops
+        // (`<= MAX_ARM_INSTS`) plus 4 live `Iconst`s (12 raw ops, `<= MAX_ARM_RAW_INSTS`),
+        // exercising zero-cost constant exclusion so all 3 levels collapse to 0 `Op::Br`.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, b_eq1, b_ne1, b_eq2, b_ne2, b_eq3, b_else, join] =
+            [(); 8].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let off = b.param(Ty::I64);
+        let rep1 = b.param(Ty::I64);
+        let rep2 = b.param(Ty::I64);
+        let rep3 = b.param(Ty::I64);
+        let c1 = b.icmp(IntCond::Eq, off, rep1);
+        b.br(Flags::NONE, c1, (b_eq1, &[]), (b_ne1, &[]));
+
+        b.begin(b_eq1);
+        let k1 = b.iconst(Ty::I64, 11);
+        let v1 = b.binary(Op::Add, Flags::NONE, rep1, k1);
+        b.jump((join, &[v1, rep1, rep2, rep3]));
+
+        b.begin(b_ne1);
+        let c2 = b.icmp(IntCond::Eq, off, rep2);
+        b.br(Flags::NONE, c2, (b_eq2, &[]), (b_ne2, &[]));
+
+        b.begin(b_eq2);
+        let k2 = b.iconst(Ty::I64, 21);
+        b.jump((join, &[k2, rep2, rep1, rep3]));
+
+        b.begin(b_ne2);
+        let c3 = b.icmp(IntCond::Eq, off, rep3);
+        b.br(Flags::NONE, c3, (b_eq3, &[]), (b_else, &[]));
+
+        b.begin(b_eq3);
+        let k3 = b.iconst(Ty::I64, 31);
+        b.jump((join, &[k3, rep3, rep1, rep2]));
+
+        b.begin(b_else);
+        let k_off = b.iconst(Ty::I64, 3);
+        let lit = b.binary(Op::Add, Flags::NONE, off, k_off);
+        let k4 = b.iconst(Ty::I64, 41);
+        b.jump((join, &[k4, lit, rep1, rep2]));
+
+        b.begin(join);
+        let out_v = b.param(Ty::I64);
+        let nr1 = b.param(Ty::I64);
+        let nr2 = b.param(Ty::I64);
+        let nr3 = b.param(Ty::I64);
+        let k7 = b.iconst(Ty::I64, 7);
+        let k13 = b.iconst(Ty::I64, 13);
+        let k5 = b.iconst(Ty::I64, 5);
+        let m0 = b.binary(Op::Mul, Flags::NONE, out_v, k7);
+        let m1 = b.binary(Op::Mul, Flags::NONE, nr1, k13);
+        let m2 = b.binary(Op::Mul, Flags::NONE, nr2, k5);
+        let x0 = b.binary(Op::Xor, Flags::NONE, m0, m1);
+        let x1 = b.binary(Op::Add, Flags::NONE, x0, m2);
+        let res = b.binary(Op::Add, Flags::NONE, x1, nr3);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().unwrap();
+        let out = if_convert(func.view(), 16, TestHeap).unwrap();
+        let v = out.func.view();
+        assert!(verify(v).is_ok());
+        assert_eq!(out.stats.branches_converted, 3, "expected all 3 ladder branches converted");
+        let brs = (0..v.len()).filter(|&i| v.op(i) == Op::Br).count();
+        assert_eq!(brs, 0, "expected 0 Op::Br remaining after constant-excluding if-conversion");
+        assert_eq!(v.blocks(), 1, "expected entire ladder collapsed into 1 straight-line block");
+        let selects = (0..v.len()).filter(|&i| v.op(i) == Op::Select).count();
+        assert!(selects >= 3, "expected branchless Op::Selects, got {selects}");
+
+        for &off_v in &[10u128, 20, 30, 99, 0] {
+            let args = [Val::Int(off_v), Val::Int(10), Val::Int(20), Val::Int(30)];
+            assert_eq!(
+                eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
+                "repcode ladder mismatch at off={off_v}",
+            );
+        }
+    }
+
+    #[test]
+    fn if_converts_three_tier_repcode_ten_op_outer_else_to_zero_br() {
+        // 3-tier Zstd repcode dispatch (`if off == rep1 { ... } else if off == rep2 { ... }
+        // else if off == rep3 { ... } else { ... }`) where:
+        // - `t_arm` (`b_eq1`) has 0 non-const ops + 2 `Op::Iconst`s,
+        // - after inner if-conversion of the `rep2`/`rep3` tiers, the outer `else` arm (`b_ne1`)
+        //   has 10 non-const ops + 6 `Op::Iconst`s (16 raw ops).
+        // With `MAX_ARM_INSTS = 12`, `MAX_ARM_RAW_INSTS = 22`, and `MAX_DIAMOND_INSTS = 14`,
+        // all 3 tiers convert into straight-line `Op::Select`s with 0 `Op::Br` remaining.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, b_eq1, b_ne1, b_eq2, b_ne2, b_eq3, b_else, join] =
+            [(); 8].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let off = b.param(Ty::I64);
+        let rep1 = b.param(Ty::I64);
+        let rep2 = b.param(Ty::I64);
+        let rep3 = b.param(Ty::I64);
+        let c1 = b.icmp(IntCond::Eq, off, rep1);
+        b.br(Flags::NONE, c1, (b_eq1, &[]), (b_ne1, &[]));
+
+        b.begin(b_eq1);
+        let k1 = b.iconst(Ty::I64, 1);
+        let k1_tag = b.iconst(Ty::I64, 10);
+        b.jump((join, &[k1, rep1, rep2, rep3, k1_tag]));
+
+        b.begin(b_ne1);
+        let c2 = b.icmp(IntCond::Eq, off, rep2);
+        b.br(Flags::NONE, c2, (b_eq2, &[]), (b_ne2, &[]));
+
+        b.begin(b_eq2);
+        let k2 = b.iconst(Ty::I64, 2);
+        let k2_tag = b.iconst(Ty::I64, 20);
+        b.jump((join, &[k2, rep2, rep1, rep3, k2_tag]));
+
+        b.begin(b_ne2);
+        let c3 = b.icmp(IntCond::Eq, off, rep3);
+        b.br(Flags::NONE, c3, (b_eq3, &[]), (b_else, &[]));
+
+        b.begin(b_eq3);
+        let k3 = b.iconst(Ty::I64, 3);
+        let k3_tag = b.iconst(Ty::I64, 30);
+        b.jump((join, &[k3, rep3, rep1, rep2, k3_tag]));
+
+        b.begin(b_else);
+        let k_off = b.iconst(Ty::I64, 3);
+        let lit = b.binary(Op::Add, Flags::NONE, off, k_off);
+        let k4_tag = b.iconst(Ty::I64, 40);
+        b.jump((join, &[lit, off, rep1, rep2, k4_tag]));
+
+        b.begin(join);
+        let out_v = b.param(Ty::I64);
+        let nr1 = b.param(Ty::I64);
+        let nr2 = b.param(Ty::I64);
+        let nr3 = b.param(Ty::I64);
+        let tag = b.param(Ty::I64);
+        let k7 = b.iconst(Ty::I64, 7);
+        let k13 = b.iconst(Ty::I64, 13);
+        let k5 = b.iconst(Ty::I64, 5);
+        let k17 = b.iconst(Ty::I64, 17);
+        let m0 = b.binary(Op::Mul, Flags::NONE, out_v, k7);
+        let m1 = b.binary(Op::Mul, Flags::NONE, nr1, k13);
+        let m2 = b.binary(Op::Mul, Flags::NONE, nr2, k5);
+        let m3 = b.binary(Op::Mul, Flags::NONE, tag, k17);
+        let x0 = b.binary(Op::Xor, Flags::NONE, m0, m1);
+        let x1 = b.binary(Op::Add, Flags::NONE, x0, m2);
+        let x2 = b.binary(Op::Xor, Flags::NONE, x1, m3);
+        let res = b.binary(Op::Add, Flags::NONE, x2, nr3);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().unwrap();
+
+        // After collapsing the inner 2 tiers, verify `t_arm` has 0 non-const ops + 2 consts
+        // and the outer `else` arm has 10 non-const ops + 6 consts (16 raw ops).
+        let mid = if_convert(func.view(), 2, TestHeap).unwrap();
+        let mv = mid.func.view();
+        assert!(verify(mv).is_ok());
+        assert_eq!(mid.stats.branches_converted, 2);
+        assert_eq!(mv.blocks(), 4);
+        let count_arm = |blk: u32| -> (usize, usize) {
+            let range = mv.block(Block(blk));
+            let params = mv.params(Block(blk));
+            let term = range.end - 1;
+            let mut non_const = 0usize;
+            let mut consts = 0usize;
+            for inst in params.end..term {
+                if is_zero_cost_const(mv.op(inst)) {
+                    consts += 1;
+                } else {
+                    non_const += 1;
+                }
+            }
+            (non_const, consts)
+        };
+        assert_eq!(count_arm(1), (0, 2), "t_arm should have 0 non-const ops + 2 consts");
+        assert_eq!(count_arm(2), (10, 6), "outer else arm should have 10 non-const ops + 6 consts");
+
+        // Full if-conversion collapses all 3 tiers into 1 block with 0 `Op::Br`.
+        let out = if_convert(func.view(), 16, TestHeap).unwrap();
+        let v = out.func.view();
+        assert!(verify(v).is_ok());
+        assert_eq!(out.stats.branches_converted, 3, "expected all 3 repcode branches converted");
+        let brs = (0..v.len()).filter(|&i| v.op(i) == Op::Br).count();
+        assert_eq!(brs, 0, "expected 0 Op::Br remaining after 3-tier repcode if-conversion");
+        assert_eq!(v.blocks(), 1, "expected 3-tier repcode dispatch collapsed into 1 block");
+        let selects = (0..v.len()).filter(|&i| v.op(i) == Op::Select).count();
+        assert_eq!(selects, 12, "expected 12 Op::Selects across all 3 tiers");
+
+        for &(off_v, r1_v, r2_v, r3_v) in &[
+            (10u128, 10u128, 20u128, 30u128),
+            (20, 10, 20, 30),
+            (30, 10, 20, 30),
+            (99, 10, 20, 30),
+            (0, 10, 20, 30),
+            (10, 10, 10, 30),
+            (20, 10, 20, 20),
+        ] {
+            let args = [Val::Int(off_v), Val::Int(r1_v), Val::Int(r2_v), Val::Int(r3_v)];
+            assert_eq!(
+                eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
+                "3-tier repcode mismatch at off={off_v}, reps=({r1_v}, {r2_v}, {r3_v})",
+            );
+        }
+    }
+
+    fn build_six_op_diamond() -> Func<TestHeap> {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, t_blk, e_blk, join] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I64);
+        let z = b.param(Ty::I64);
+        let k3 = b.iconst(Ty::I64, 3);
+        let k5 = b.iconst(Ty::I64, 5);
+        let k7 = b.iconst(Ty::I64, 7);
+        let k11 = b.iconst(Ty::I64, 11);
+        let cond = b.icmp(IntCond::Ult, x, y);
+        b.br(Flags::NONE, cond, (t_blk, &[]), (e_blk, &[]));
+
+        // 3 non-const ops in `t_blk`
+        b.begin(t_blk);
+        let t0 = b.binary(Op::Add, Flags::NONE, x, z);
+        let t1 = b.binary(Op::Mul, Flags::NONE, t0, k3);
+        let t2 = b.binary(Op::Xor, Flags::NONE, t1, k5);
+        b.jump((join, &[t2]));
+
+        // 3 non-const ops in `e_blk` (6 non-const ops total across the diamond)
+        b.begin(e_blk);
+        let e0 = b.binary(Op::Sub, Flags::NONE, y, z);
+        let e1 = b.binary(Op::Mul, Flags::NONE, e0, k7);
+        let e2 = b.binary(Op::Add, Flags::NONE, e1, k11);
+        b.jump((join, &[e2]));
+
+        b.begin(join);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        b.finish_checked().unwrap()
+    }
+
+    #[test]
+    fn pgo_predictable_guard_stays_branch() {
+        let func = build_six_op_diamond();
+
+        // 98/2 predictable guard on Apple M5 stays a branch so TAGE predicts it at 0 speculative cycles.
+        let taken_hi = [980u16, u16::MAX, u16::MAX, u16::MAX];
+        let out_hi = if_convert_with_opts(
+            func.view(),
+            IfConvOpts {
+                max_rounds: 8,
+                target: IfConvTarget::APPLE_M5,
+                profile: BranchProfile { taken_permille_by_block: &taken_hi },
+            },
+            TestHeap,
+        )
+        .unwrap();
+        let v_hi = out_hi.func.view();
+        assert!(verify(v_hi).is_ok());
+        assert_eq!(out_hi.stats.branches_converted, 0);
+        assert_eq!(out_hi.stats.predictable_branches_preserved, 1);
+        let brs_hi = (0..v_hi.len()).filter(|&i| v_hi.op(i) == Op::Br).count();
+        assert_eq!(brs_hi, 1, "predictable 98/2 guard must remain a branch");
+
+        // Symmetric 2/98 predictable guard on Graviton 5 also stays a branch.
+        let taken_lo = [20u16, u16::MAX, u16::MAX, u16::MAX];
+        let out_lo = if_convert_with_opts(
+            func.view(),
+            IfConvOpts {
+                max_rounds: 8,
+                target: IfConvTarget::GRAVITON5,
+                profile: BranchProfile { taken_permille_by_block: &taken_lo },
+            },
+            TestHeap,
+        )
+        .unwrap();
+        let v_lo = out_lo.func.view();
+        assert!(verify(v_lo).is_ok());
+        assert_eq!(out_lo.stats.branches_converted, 0);
+        assert_eq!(out_lo.stats.predictable_branches_preserved, 1);
+        let brs_lo = (0..v_lo.len()).filter(|&i| v_lo.op(i) == Op::Br).count();
+        assert_eq!(brs_lo, 1, "predictable 2/98 guard must remain a branch");
+
+        for &(xv, yv, zv) in &[(1u128, 5u128, 3u128), (10, 2, 4), (7, 7, 9)] {
+            let args = [Val::Int(xv), Val::Int(yv), Val::Int(zv)];
+            let orig = eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap();
+            assert_eq!(orig, eval::run_in(v_hi, &args, 10_000, TestHeap).unwrap());
+            assert_eq!(orig, eval::run_in(v_lo, &args, 10_000, TestHeap).unwrap());
+        }
+    }
+
+    #[test]
+    fn pgo_unpredictable_diamond_converts_branchless() {
+        let func = build_six_op_diamond();
+        let taken = [500u16, u16::MAX, u16::MAX, u16::MAX];
+        let out = if_convert_with_opts(
+            func.view(),
+            IfConvOpts {
+                max_rounds: 8,
+                target: IfConvTarget::APPLE_M5,
+                profile: BranchProfile { taken_permille_by_block: &taken },
+            },
+            TestHeap,
+        )
+        .unwrap();
+        let v = out.func.view();
+        assert!(verify(v).is_ok());
+        assert_eq!(out.stats.branches_converted, 1);
+        assert_eq!(out.stats.predictable_branches_preserved, 0);
+        let brs = (0..v.len()).filter(|&i| v.op(i) == Op::Br).count();
+        assert_eq!(brs, 0, "unpredictable 50/50 diamond must convert to branchless Select");
+        let selects = (0..v.len()).filter(|&i| v.op(i) == Op::Select).count();
+        assert_eq!(selects, 1);
+        assert_eq!(v.blocks(), 1);
+
+        for &(xv, yv, zv) in &[(1u128, 5u128, 3u128), (10, 2, 4), (7, 7, 9), (0, 1, 99), (100, 50, 17)] {
+            let args = [Val::Int(xv), Val::Int(yv), Val::Int(zv)];
+            assert_eq!(
+                eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
+                "pgo unpredictable diamond mismatch at ({xv}, {yv}, {zv})",
+            );
+        }
+    }
+
+    #[test]
+    fn pgo_high_entropy_widens_budget_and_remaps_across_rounds() {
+        // 1. A 16-op diamond (8 + 8) exceeds the static 14-op diamond budget, but converts under
+        //    near-50/50 high-entropy PGO (`250..=750` permille grants +4 diamond budget -> 18).
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [entry, t_blk, e_blk, join] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let z = b.param(Ty::I64);
+            let k1 = b.iconst(Ty::I64, 1);
+            let k3 = b.iconst(Ty::I64, 3);
+            let k5 = b.iconst(Ty::I64, 5);
+            let k7 = b.iconst(Ty::I64, 7);
+            let cond = b.icmp(IntCond::Ult, x, y);
+            b.br(Flags::NONE, cond, (t_blk, &[]), (e_blk, &[]));
+
+            b.begin(t_blk);
+            let t0 = b.binary(Op::Add, Flags::NONE, x, z);
+            let t1 = b.binary(Op::Mul, Flags::NONE, t0, k3);
+            let t2 = b.binary(Op::Xor, Flags::NONE, t1, k5);
+            let t3 = b.binary(Op::Add, Flags::NONE, t2, y);
+            let t4 = b.binary(Op::Mul, Flags::NONE, t3, k7);
+            let t5 = b.binary(Op::Sub, Flags::NONE, t4, k1);
+            let t6 = b.binary(Op::Xor, Flags::NONE, t5, x);
+            let t7 = b.binary(Op::Add, Flags::NONE, t6, z);
+            b.jump((join, &[t7]));
+
+            b.begin(e_blk);
+            let e0 = b.binary(Op::Sub, Flags::NONE, y, z);
+            let e1 = b.binary(Op::Mul, Flags::NONE, e0, k5);
+            let e2 = b.binary(Op::Add, Flags::NONE, e1, k7);
+            let e3 = b.binary(Op::Xor, Flags::NONE, e2, x);
+            let e4 = b.binary(Op::Mul, Flags::NONE, e3, k3);
+            let e5 = b.binary(Op::Add, Flags::NONE, e4, k1);
+            let e6 = b.binary(Op::Sub, Flags::NONE, e5, y);
+            let e7 = b.binary(Op::Xor, Flags::NONE, e6, z);
+            b.jump((join, &[e7]));
+
+            b.begin(join);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let static_out = if_convert(func.view(), 8, TestHeap).unwrap();
+            assert_eq!(static_out.stats.branches_converted, 0);
+
+            let taken = [500u16, u16::MAX, u16::MAX, u16::MAX];
+            let pgo_out = if_convert_with_opts(
+                func.view(),
+                IfConvOpts {
+                    max_rounds: 8,
+                    target: IfConvTarget::APPLE_M5,
+                    profile: BranchProfile { taken_permille_by_block: &taken },
+                },
+                TestHeap,
+            )
+            .unwrap();
+            let v = pgo_out.func.view();
+            assert!(verify(v).is_ok());
+            assert_eq!(pgo_out.stats.branches_converted, 1);
+            let brs = (0..v.len()).filter(|&i| v.op(i) == Op::Br).count();
+            assert_eq!(brs, 0);
+
+            for &(xv, yv, zv) in &[(1u128, 5u128, 3u128), (10, 2, 4), (7, 7, 9)] {
+                let args = [Val::Int(xv), Val::Int(yv), Val::Int(zv)];
+                assert_eq!(
+                    eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                    eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
+                );
+            }
+        }
+
+        // 2. Two sequential 6-op diamonds: block 0 is 50/50 unpredictable, block 3 is 98/2 predictable.
+        //    Converting block 0 coalesces block 3 into block 0; remapped profile still preserves block 3.
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [entry, t1, e1, mid, t2, e2, exit] = [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let z = b.param(Ty::I64);
+            let k3 = b.iconst(Ty::I64, 3);
+            let k5 = b.iconst(Ty::I64, 5);
+            let k7 = b.iconst(Ty::I64, 7);
+            let k11 = b.iconst(Ty::I64, 11);
+            let c1 = b.icmp(IntCond::Ult, x, y);
+            b.br(Flags::NONE, c1, (t1, &[]), (e1, &[]));
+
+            b.begin(t1);
+            let a0 = b.binary(Op::Add, Flags::NONE, x, z);
+            let a1 = b.binary(Op::Mul, Flags::NONE, a0, k3);
+            let a2 = b.binary(Op::Xor, Flags::NONE, a1, k5);
+            b.jump((mid, &[a2]));
+
+            b.begin(e1);
+            let b0 = b.binary(Op::Sub, Flags::NONE, y, z);
+            let b1 = b.binary(Op::Mul, Flags::NONE, b0, k7);
+            let b2 = b.binary(Op::Add, Flags::NONE, b1, k11);
+            b.jump((mid, &[b2]));
+
+            b.begin(mid);
+            let m = b.param(Ty::I64);
+            let c2 = b.icmp(IntCond::Ugt, m, z);
+            b.br(Flags::NONE, c2, (t2, &[]), (e2, &[]));
+
+            b.begin(t2);
+            let p0 = b.binary(Op::Add, Flags::NONE, m, k3);
+            let p1 = b.binary(Op::Mul, Flags::NONE, p0, k5);
+            let p2 = b.binary(Op::Xor, Flags::NONE, p1, k7);
+            b.jump((exit, &[p2]));
+
+            b.begin(e2);
+            let q0 = b.binary(Op::Sub, Flags::NONE, m, k11);
+            let q1 = b.binary(Op::Mul, Flags::NONE, q0, k3);
+            let q2 = b.binary(Op::Add, Flags::NONE, q1, k5);
+            b.jump((exit, &[q2]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let taken = [500u16, u16::MAX, u16::MAX, 980, u16::MAX, u16::MAX, u16::MAX];
+            let out = if_convert_with_opts(
+                func.view(),
+                IfConvOpts {
+                    max_rounds: 8,
+                    target: IfConvTarget::APPLE_M5,
+                    profile: BranchProfile { taken_permille_by_block: &taken },
+                },
+                TestHeap,
+            )
+            .unwrap();
+            let v = out.func.view();
+            assert!(verify(v).is_ok());
+            assert_eq!(out.stats.branches_converted, 1);
+            assert_eq!(out.stats.predictable_branches_preserved, 1);
+            let brs = (0..v.len()).filter(|&i| v.op(i) == Op::Br).count();
+            assert_eq!(brs, 1, "second predictable diamond must remain a branch after first coalesces");
+
+            for &(xv, yv, zv) in &[(1u128, 5u128, 3u128), (10, 2, 4), (7, 7, 1000)] {
+                let args = [Val::Int(xv), Val::Int(yv), Val::Int(zv)];
+                assert_eq!(
+                    eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                    eval::run_in(v, &args, 10_000, TestHeap).unwrap(),
                 );
             }
         }

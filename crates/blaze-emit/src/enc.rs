@@ -152,6 +152,24 @@ pub(crate) const fn add_lsr(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
     0x8b40_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
 }
 
+/// `add xd, xn, wm, uxtb` (C6.2.3: ADD extended register, `option = 000`, `imm3 = 0`).
+/// Note: `rd == 31` or `rn == 31` encodes `sp`, never `xzr`.
+pub(crate) const fn add_uxtb(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x8b20_0000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)
+}
+
+/// `add xd, xn, wm, uxth` (C6.2.3: ADD extended register, `option = 001`, `imm3 = 0`).
+/// Note: `rd == 31` or `rn == 31` encodes `sp`, never `xzr`.
+pub(crate) const fn add_uxth(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x8b20_2000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)
+}
+
+/// `add xd, xn, wm, uxtw` (C6.2.3: ADD extended register, `option = 010`, `imm3 = 0`).
+/// Note: `rd == 31` or `rn == 31` encodes `sp`, never `xzr`.
+pub(crate) const fn add_uxtw(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x8b20_4000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)
+}
+
 pub(crate) const fn sub(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0xcb00_0000 | (rm << 16) | (rn << 5) | rd
 }
@@ -159,6 +177,24 @@ pub(crate) const fn sub(rd: Reg, rn: Reg, rm: Reg) -> u32 {
 /// `sub xd, xn, xm, lsl #shift` (`shift` in `0..=63`).
 pub(crate) const fn sub_lsl(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
     0xcb00_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
+}
+
+/// `sub xd, xn, wm, uxtb` (C6.2.387: SUB extended register, `option = 000`, `imm3 = 0`).
+/// Note: `rd == 31` or `rn == 31` encodes `sp`, never `xzr`.
+pub(crate) const fn sub_uxtb(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xcb20_0000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)
+}
+
+/// `sub xd, xn, wm, uxth` (C6.2.387: SUB extended register, `option = 001`, `imm3 = 0`).
+/// Note: `rd == 31` or `rn == 31` encodes `sp`, never `xzr`.
+pub(crate) const fn sub_uxth(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xcb20_2000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)
+}
+
+/// `sub xd, xn, wm, uxtw` (C6.2.387: SUB extended register, `option = 010`, `imm3 = 0`).
+/// Note: `rd == 31` or `rn == 31` encodes `sp`, never `xzr`.
+pub(crate) const fn sub_uxtw(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xcb20_4000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)
 }
 
 /// `subs xzr, xn, xm`.
@@ -206,6 +242,19 @@ pub(crate) const fn bic(rd: Reg, rn: Reg, rm: Reg) -> u32 {
 /// `orn xd, xn, xm`: `xn | !xm` (C6.2.244).
 pub(crate) const fn orn(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0xaa20_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `orn xd/wd, xn/wn, xm/wm, {lsl,lsr,asr,ror} #shift` (C6.2.244): `rn | !(rm <shift> imm)`.
+/// `shift_kind`: `0 = LSL, 1 = LSR, 2 = ASR, 3 = ROR`; `imm` in `0..=63` (`is64`) or `0..=31` (`!is64`).
+pub(crate) const fn orn_shifted(is64: bool, rd: Reg, rn: Reg, rm: Reg, shift_kind: u32, imm: u32) -> u32 {
+    let sf_bit = if is64 { 1u32 << 31 } else { 0 };
+    let imm_masked = if is64 { imm & 63 } else { imm & 31 };
+    sf_bit | 0x2a20_0000 | ((shift_kind & 3) << 22) | (rm << 16) | (imm_masked << 10) | (rn << 5) | rd
+}
+
+/// `mvn xd/wd, xm/wm{, {lsl,lsr,asr,ror} #shift}` (C6.2.237: alias of `orn` with `rn = xzr/wzr`).
+pub(crate) const fn mvn_shifted(is64: bool, rd: Reg, rm: Reg, shift_kind: u32, imm: u32) -> u32 {
+    orn_shifted(is64, rd, ZR, rm, shift_kind, imm)
 }
 
 /// `eon xd, xn, xm`: `xn ^ !xm` (C6.2.101).
@@ -278,6 +327,16 @@ pub(crate) const fn csneg(rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
     0xda80_0400 | (rm << 16) | (cond.bits() << 12) | (rn << 5) | rd
 }
 
+/// `ccmp xn, #imm5, #nzcv, cond` (C6.2.47: conditional compare immediate).
+pub(crate) const fn ccmp_imm(rn: Reg, imm5: u32, nzcv: u32, cond: Cond) -> u32 {
+    0xfa40_0800 | ((imm5 & 0x1f) << 16) | (cond.bits() << 12) | (rn << 5) | (nzcv & 0xf)
+}
+
+/// `ccmp xn, xm, #nzcv, cond` (C6.2.48: conditional compare register).
+pub(crate) const fn ccmp_reg(rn: Reg, rm: Reg, nzcv: u32, cond: Cond) -> u32 {
+    0xfa40_0000 | (rm << 16) | (cond.bits() << 12) | (rn << 5) | (nzcv & 0xf)
+}
+
 /// `stp xt, xt2, [rn, #off]` (signed offset, no writeback), `off` a multiple of 8 in -512..=504.
 pub(crate) const fn stp_off(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0xa900_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
@@ -286,6 +345,16 @@ pub(crate) const fn stp_off(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
 /// `ldp xt, xt2, [rn, #off]` (signed offset, no writeback), `off` a multiple of 8 in -512..=504.
 pub(crate) const fn ldp_off(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0xa940_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `ldp wt, wt2, [rn, #off]` (signed offset, no writeback), `off` a multiple of 4 in -256..=252.
+pub(crate) const fn ldp_w_off(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0x2940_0000 | (((off / 4).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `stp wt, wt2, [rn, #off]` (signed offset, no writeback), `off` a multiple of 4 in -256..=252.
+pub(crate) const fn stp_w_off(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0x2900_0000 | (((off / 4).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
 /// `ldr{b,h,,} rt, [rn, rm, lsl #size]` (scaled register-index load).
@@ -575,6 +644,16 @@ pub(crate) const fn stp_post_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0x6c80_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
+/// `ldr xt, [rn], #simm9` (C6.2.160, 64-bit post-index), `simm9` in -256..=255.
+pub(crate) const fn ldr_post(rt: Reg, rn: Reg, simm9: i32) -> u32 {
+    0xf840_0400 | ((simm9.cast_unsigned() & 0x1ff) << 12) | (rn << 5) | rt
+}
+
+/// `str xt, [rn], #simm9` (C6.2.324, 64-bit post-index), `simm9` in -256..=255.
+pub(crate) const fn str_post(rt: Reg, rn: Reg, simm9: i32) -> u32 {
+    0xf800_0400 | ((simm9.cast_unsigned() & 0x1ff) << 12) | (rn << 5) | rt
+}
+
 // PC-relative (C6.2.168, 10): `words` and `bytes` from this instruction.
 
 /// `ldr xt, <pc + 4 * words>`.
@@ -655,6 +734,16 @@ pub(crate) const fn ret() -> u32 {
 
 pub(crate) const fn brk(imm16: u32) -> u32 {
     0xd420_0000 | (imm16 << 5)
+}
+
+/// True iff `w` is an unconditional AArch64 control-transfer or trap instruction
+/// (`b`, `ret`, `br`, `brk`, or `udf`) that never falls through to the next word.
+pub(crate) const fn is_unconditional_terminator(w: u32) -> bool {
+    (w & 0xfc00_0000) == 0x1400_0000
+        || (w & 0xffff_fc1f) == 0xd65f_0000
+        || (w & 0xffff_fc1f) == 0xd61f_0000
+        || (w & 0xffe0_001f) == 0xd420_0000
+        || (w & 0xffff_0000) == 0x0000_0000
 }
 
 // The forms below are pinned by `new_encodings` (src/enc_tests.rs) against words computed by
@@ -1296,6 +1385,16 @@ pub(crate) const fn stur_q(rt: Reg, rn: Reg, imm9: i32) -> u32 {
     0x3c80_0000 | ((imm9.cast_unsigned() & 0x1ff) << 12) | (rn << 5) | rt
 }
 
+/// `ldr qt, [rn], #simm9` (C7.2.163, SIMD&FP 128-bit post-index), `simm9` in -256..=255.
+pub(crate) const fn ldr_q_post(rt: Reg, rn: Reg, simm9: i32) -> u32 {
+    0x3cc0_0400 | ((simm9.cast_unsigned() & 0x1ff) << 12) | (rn << 5) | rt
+}
+
+/// `str qt, [rn], #simm9` (C7.2.313, SIMD&FP 128-bit post-index), `simm9` in -256..=255.
+pub(crate) const fn str_q_post(rt: Reg, rn: Reg, simm9: i32) -> u32 {
+    0x3c80_0400 | ((simm9.cast_unsigned() & 0x1ff) << 12) | (rn << 5) | rt
+}
+
 /// `ldr qt, [rn, rm, lsl #(4 if scaled else 0)]` (C7.2 LDR register, SIMD&FP 128-bit).
 pub(crate) const fn ldr_q_reg(rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
     0x3ce0_6800 | (rm << 16) | (bit(scaled) << 12) | (rn << 5) | rt
@@ -1449,6 +1548,12 @@ pub(crate) const fn cssc_minmax(unsigned: bool, is_min: bool, rd: Reg, rn: Reg, 
     0x9ac0_6000 | (rm << 16) | (opc << 10) | (rn << 5) | rd
 }
 
+/// `smax`/`umax`/`smin`/`umin xd, xn, #imm8` (CSSC 1-instruction scalar integer min/max immediate).
+pub(crate) const fn cssc_minmax_imm(unsigned: bool, is_min: bool, rd: Reg, rn: Reg, imm8: u32) -> u32 {
+    let opc = (bit(is_min) << 1) | bit(unsigned);
+    0x91c0_0000 | (opc << 18) | ((imm8 & 0xff) << 10) | (rn << 5) | rd
+}
+
 /// `cnt xd, xn` (CSSC 1-instruction scalar integer popcount without NEON domain crossing).
 pub(crate) const fn cssc_cnt(rd: Reg, rn: Reg) -> u32 {
     0xdac0_1c00 | (rn << 5) | rd
@@ -1595,10 +1700,22 @@ pub(crate) const fn ldp_d_off(rt1: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0x6d40_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1
 }
 
+/// `ldp st1, st2, [rn, #off]` (`off` in `-256..=252`, 4-byte aligned).
+pub(crate) const fn ldp_s_off(rt1: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    let imm7 = (off >> 2).cast_unsigned() & 0x7f;
+    0x2d40_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
 /// `stp dt1, dt2, [rn, #off]` (`off` in `-512..=504`, 8-byte aligned).
 pub(crate) const fn stp_d_off(rt1: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     let imm7 = (off >> 3).cast_unsigned() & 0x7f;
     0x6d00_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `stp st1, st2, [rn, #off]` (`off` in `-256..=252`, 4-byte aligned).
+pub(crate) const fn stp_s_off(rt1: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    let imm7 = (off >> 2).cast_unsigned() & 0x7f;
+    0x2d00_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1
 }
 
 /// `xtn vd.2s, vn.2d` (C7.2.383: extract low 32 bits of each 64-bit lane into `vd.2s`).
@@ -1651,4 +1768,98 @@ pub(crate) const fn ushr_2d_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
 /// `shl vd.2d, vn.2d, #shift` (`shift` in `0..=63`, C7.2.266).
 pub(crate) const fn shl_2d_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
     0x4f40_5400 | ((shift & 63) << 16) | (rn << 5) | rd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        X0, X1, X2, X10, X11, X12, X13, X15, ZR, add_uxtb, add_uxth, add_uxtw, ldp_q_post, ldp_s_off, ldp_w_off,
+        ldr_post, ldr_q_post, mvn_shifted, orn_shifted, stp_q_post, stp_s_off, stp_w_off, str_post, str_q_post,
+        sub_uxtb, sub_uxth, sub_uxtw,
+    };
+
+    #[test]
+    fn add_sub_ext_encodings_match_arm64_isa() {
+        // Verified against llvm-objdump (`rustc_w29`):
+        // `add x12, x12, w23, uxtb`: sf=1, op=0, S=0, opt=00, Rm=23, option=000, imm3=0, Rn=12, Rd=12.
+        assert_eq!(add_uxtb(X12, X12, 23), 0x8b37_018c);
+        // `add x15, x13, w15, uxth`: sf=1, op=0, S=0, opt=00, Rm=15, option=001, imm3=0, Rn=13, Rd=15.
+        assert_eq!(add_uxth(X15, X13, X15), 0x8b2f_21af);
+        // `add x1, x2, w3, uxtw`: sf=1, op=0, S=0, opt=00, Rm=3, option=010, imm3=0, Rn=2, Rd=1.
+        assert_eq!(add_uxtw(X1, X2, 3), 0x8b23_4041);
+        // `sub` extended register mirrors `add` with `op = 1` (bit 30 set).
+        assert_eq!(sub_uxtb(X12, X12, 23), 0xcb37_018c);
+        assert_eq!(sub_uxth(X15, X13, X15), 0xcb2f_21af);
+        assert_eq!(sub_uxtw(X1, X2, 3), 0xcb23_4041);
+    }
+
+    #[test]
+    fn orn_and_mvn_shifted_encodings_match_arm64_isa() {
+        // `mvn x13, x13, lsr #56` = `orn x13, xzr, x13, lsr #56`:
+        // sf=1, opc=01, 01010, shift=01 (LSR), N=1, Rm=13, imm6=56, Rn=31, Rd=13.
+        assert_eq!(mvn_shifted(true, X13, X13, 1, 56), 0xaa6d_e3ed);
+        assert_eq!(orn_shifted(true, X13, ZR, X13, 1, 56), 0xaa6d_e3ed);
+        // `mvn w1, w2` = `orn w1, wzr, w2, lsl #0`:
+        // sf=0, opc=01, 01010, shift=00 (LSL), N=1, Rm=2, imm6=0, Rn=31, Rd=1.
+        assert_eq!(mvn_shifted(false, X1, X2, 0, 0), 0x2a22_03e1);
+        // `mvn x1, x2, lsl #3` = `orn x1, xzr, x2, lsl #3`:
+        assert_eq!(mvn_shifted(true, X1, X2, 0, 3), 0xaa22_0fe1);
+        // `mvn w3, w4, asr #17` = `orn w3, wzr, w4, asr #17`:
+        assert_eq!(mvn_shifted(false, 3, 4, 2, 17), 0x2aa4_47e3);
+    }
+
+    #[test]
+    fn ldp_w_and_s_off_encodings_match_arm64_isa() {
+        // `ldp w11, w14, [x9, #4]`: opc=00, 101, V=0, 010, L=1, imm7=1, Rt2=14, Rn=9, Rt=11.
+        assert_eq!(ldp_w_off(11, 14, 9, 4), 0x2940_b92b);
+        // `ldp w0, w1, [x2, #0]`
+        assert_eq!(ldp_w_off(X0, X1, X2, 0), 0x2940_0440);
+        // `ldp w4, w5, [x6, #252]` (max positive offset, imm7 = +63 = 0x3f)
+        assert_eq!(ldp_w_off(4, 5, 6, 252), 0x295f_94c4);
+        // `ldp w1, w2, [x3, #-4]` (imm7 = -1 = 0x7f)
+        assert_eq!(ldp_w_off(X1, X2, 3, -4), 0x297f_8861);
+        // `ldp w0, w1, [x2, #-256]` (min negative offset, imm7 = -64 = 0x40)
+        assert_eq!(ldp_w_off(X0, X1, X2, -256), 0x2960_0440);
+        // `ldp s1, s2, [x9, #4]` and `ldp s0, s1, [x2, #-4]`
+        assert_eq!(ldp_s_off(1, 2, 9, 4), 0x2d40_8921);
+        assert_eq!(ldp_s_off(0, 1, 2, -4), 0x2d7f_8440);
+    }
+
+    #[test]
+    fn stp_w_and_s_off_encodings_match_arm64_isa() {
+        // `stp w5, w19, [x13, #0]`: opc=00, 101, V=0, 010, L=0, imm7=0, Rt2=19, Rn=13, Rt=5.
+        assert_eq!(stp_w_off(5, 19, X13, 0), 0x2900_4da5);
+        // `stp w11, w14, [x9, #4]`: symmetric to `ldp_w_off` with bit 22 (`L`) cleared.
+        assert_eq!(stp_w_off(11, 14, 9, 4), 0x2900_b92b);
+        // `stp w0, w1, [x2, #0]`
+        assert_eq!(stp_w_off(X0, X1, X2, 0), 0x2900_0440);
+        // `stp w4, w5, [x6, #252]` (max positive offset, imm7 = +63 = 0x3f)
+        assert_eq!(stp_w_off(4, 5, 6, 252), 0x291f_94c4);
+        // `stp w1, w2, [x3, #-4]` (imm7 = -1 = 0x7f)
+        assert_eq!(stp_w_off(X1, X2, 3, -4), 0x293f_8861);
+        // `stp w0, w1, [x2, #-256]` (min negative offset, imm7 = -64 = 0x40)
+        assert_eq!(stp_w_off(X0, X1, X2, -256), 0x2920_0440);
+        // `stp wzr, w1, [x2, #8]` (zero register in Rt1, imm7 = +2)
+        assert_eq!(stp_w_off(ZR, X1, X2, 8), 0x2901_045f);
+        // `stp s1, s2, [x9, #4]`, `stp s0, s1, [x2, #-4]`, and `stp s0, s1, [x2, #-256]`
+        assert_eq!(stp_s_off(1, 2, 9, 4), 0x2d00_8921);
+        assert_eq!(stp_s_off(0, 1, 2, -4), 0x2d3f_8440);
+        assert_eq!(stp_s_off(0, 1, 2, -256), 0x2d20_0440);
+    }
+
+    #[test]
+    fn post_index_ldst_encodings_match_arm64_isa() {
+        // 64-bit GPR post-index: `ldr x1, [x2], #8`, `str x1, [x2], #8`, `ldr x3, [x4], #-8`, `str x3, [x4], #-8`.
+        assert_eq!(ldr_post(X1, X2, 8), 0xf840_8441);
+        assert_eq!(str_post(X1, X2, 8), 0xf800_8441);
+        assert_eq!(ldr_post(3, 4, -8), 0xf85f_8483);
+        assert_eq!(str_post(3, 4, -8), 0xf81f_8483);
+        // 128-bit SIMD&FP post-index: `ldr q30, [x11], #16`, `str q30, [x10], #16`, `ldr q0, [x1], #-16`.
+        assert_eq!(ldr_q_post(30, X11, 16), 0x3cc1_057e);
+        assert_eq!(str_q_post(30, X10, 16), 0x3c81_055e);
+        assert_eq!(ldr_q_post(0, X1, -16), 0x3cdf_0420);
+        // 128-bit SIMD&FP pair post-index: `ldp q29, q30, [x11], #32`, `stp q29, q30, [x10], #32`.
+        assert_eq!(ldp_q_post(29, 30, X11, 2), 0xacc1_797d);
+        assert_eq!(stp_q_post(29, 30, X10, 2), 0xac81_795d);
+    }
 }

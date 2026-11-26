@@ -29,7 +29,7 @@ use blaze_lir::{
 use blaze_own::Vec;
 use blaze_tier::{CallClobbers, Reg as TierReg, RegSet};
 
-use crate::enc::{Reg, X0, X1, X2, X8, X9, X10, X11, X12, X13, X14, X15};
+use crate::enc::{FP, Reg, X0, X1, X2, X8, X9, X10, X11, X12, X13, X14, X15};
 use crate::pass::{Loc, Regs};
 
 const X3: Reg = 3;
@@ -59,6 +59,32 @@ const EXACT_CFG_MAX_VALS: usize = 6144;
 /// Maximum basic blocks for exact-CFG backward liveness mode
 /// (`3072 * 6144 / 8 = 2.25 MiB` worst-case `live_in` table).
 const EXACT_CFG_MAX_BLOCKS: usize = 3072;
+
+/// Maximum parallel-copy pairs on one CFG edge tracked for 2-cycle swap cost modeling (Rule 18).
+const MAX_PARALLEL_COPY_GROUP: usize = 16;
+
+/// Maximum parallel-copy CFG edge groups tracked per function in `refine_gpr_moves` (Rule 18).
+const MAX_EDGE_GROUPS: usize = 4096;
+
+/// Safe upper ceiling for solved `BlockLayout` edge/block weights fed into `u64` cost sums.
+const MAX_EDGE_WEIGHT: u64 = 1u64 << 44;
+
+/// Priority bit marking back-edge phi copies so they strictly dominate all forward edges.
+const BACK_EDGE_PRIO_BIT: u32 = 1u32 << 31;
+
+/// Maximum forward-edge phi-coalescing priority (one below [`BACK_EDGE_PRIO_BIT`]).
+const FWD_EDGE_PRIO_MAX: u32 = BACK_EDGE_PRIO_BIT - 1;
+
+/// Combines two phi-copy edge priorities for the same `(u, v)` value pair, preserving
+/// [`BACK_EDGE_PRIO_BIT`] and saturating the depth-weighted payload at [`FWD_EDGE_PRIO_MAX`].
+#[inline]
+fn merge_phi_prio(a: u32, b: u32) -> u32 {
+    let back = (a | b) & BACK_EDGE_PRIO_BIT;
+    let sum = (a & FWD_EDGE_PRIO_MAX)
+        .saturating_add(b & FWD_EDGE_PRIO_MAX)
+        .min(FWD_EDGE_PRIO_MAX);
+    back | sum
+}
 
 #[inline]
 fn idx(n: u32) -> usize {
@@ -91,6 +117,68 @@ const CALLEE_SAVED_GPR: &[Reg] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, 
 /// the very end of the pool so it is used only once all 26 other GPRs are busy (`stp/ldp x29, x30`
 /// saves and restores `X30`).
 const CALLEE_SAVED_GPR_WITH_LR: &[Reg] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X30];
+
+/// Callee-saved allocatable GPRs for provably zero-call, non-unwinding, fixed-frame (`most_align <= 16`)
+/// leaf functions: appends `X30` (`LR`) and `X29` (`FP`) at the very end of the pool so `FP` is used
+/// ONLY once all 27 other GPRs are busy (`stp/ldp x29, x30` saves and restores both, stacked entry
+/// args load via `[sp, #offset]`, and epilogue restores `sp` via `add sp, sp, #frame_size`).
+const CALLEE_SAVED_GPR_WITH_LR_FP: &[Reg] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X30, FP];
+
+/// Returns `true` iff `r` is tracked in `used_callee_gpr` (`X19..=X28`, `X30`, or `FP`).
+#[inline]
+fn is_tracked_callee_gpr(r: Reg) -> bool {
+    (X19..=X28).contains(&r) || r == X30 || r == FP
+}
+
+/// Returns `true` iff `X29` (`FP`) may safely be allocated as the 28th callee-saved GPR.
+///
+/// Requires a provably zero-call, non-unwinding, fixed-frame (`most_align <= 16`) leaf function
+/// with no inline assembly, coroutine suspension, or SME2 helper calls.
+fn can_use_fp_as_gpr(view: &View<'_>, allow_lr: bool) -> bool {
+    if !allow_lr {
+        return false;
+    }
+    if view.slots.iter().any(|s| s.align > 4) {
+        return false;
+    }
+    let blocks = view.blocks();
+    for b in 0..blocks {
+        if view.block_kind(Block(u32_of(b))).is_landing() {
+            return false;
+        }
+    }
+    let len = view.len();
+    for i in 0..len {
+        let op = view.op(i);
+        if matches!(
+            op,
+            Op::Invoke
+                | Op::InvokeIndirect
+                | Op::Resume
+                | Op::Asm
+                | Op::AsmBr
+                | Op::Suspend
+        ) {
+            return false;
+        }
+        if op == Op::TargetIntrinsic
+            && view
+                .data
+                .get(i)
+                .and_then(|&d| view.extra.get(idx(d)))
+                .is_some_and(|&id| {
+                    let name = view.intrinsic_name(blaze_lir::func::IntrinsicId(id));
+                    name == b"blaze.sme2.gemm_f32"
+                        || name == b"blaze.sme2.gemm_f64"
+                        || name == b"blaze.sme2.gemm_i8_i32"
+                        || name == b"blaze.sme2.gemm_u8_u32"
+                })
+        {
+            return false;
+        }
+    }
+    true
+}
 
 /// Caller-saved allocatable FP registers (`V29`/`V30`/`V31` stay permanently free as FP scratch/reload/cycle-breakers).
 const CALLER_SAVED_FP: &[Reg] = &[
@@ -385,6 +473,10 @@ pub(crate) struct Allocation<A: Allocator> {
     /// `true` iff `X30` (`LR`) was allocated as a GPR in a zero-call leaf function (requiring
     /// `stp/ldp x29, x30` frame record so `LR` is saved on entry and restored before `ret`/`b`).
     pub(crate) uses_lr: bool,
+    /// `true` iff `X29` (`FP`) was allocated as a 28th GPR in a provably zero-call, fixed-frame
+    /// leaf function (requires `stp/ldp x29, x30` frame save/restore, `SP`-relative stacked
+    /// entry-arg loads, and `add sp, sp, #frame_size` epilogue instead of `FP`-based `SP` restore).
+    pub(crate) uses_fp: bool,
     /// Exact IPRA physical register clobber summary for callers of this function.
     pub(crate) clobbers: CallClobbers,
     /// Number of constants rematerialized instead of spilled to the stack.
@@ -1148,7 +1240,13 @@ fn is_folded_imm_use(view: &View<'_>, user: usize, vi: usize, cval: u64) -> bool
             };
             super::isel::is_addsub_imm12(delta.unsigned_abs()).is_some()
         }
-        Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr if bits == 64 || bits == 32 => {
+        Op::Shl | Op::Lshr | Op::Ashr if bits == 64 || bits == 32 || bits == 16 || bits == 8 => {
+            let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                return false;
+            };
+            idx(b) == vi && idx(a) != vi
+        }
+        Op::Rotl | Op::Rotr if bits == 64 || bits == 32 => {
             let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
                 return false;
             };
@@ -1180,12 +1278,16 @@ fn is_clobbering_call_inst(view: &View<'_>, tail_calls: &[bool], inst: usize) ->
     }
     let op = view.op(inst);
     let is_runtime_bulk = matches!(op, Op::Memcpy | Op::Memset | Op::Memcmp) && {
+        let limit = match op {
+            Op::Memset => super::isel::SOTA_MEMSET_INLINE_LOOP_MOST,
+            _ => super::isel::SOTA_BULK_INLINE_MOST,
+        };
         let const_ok = view
             .data
             .get(inst)
             .and_then(|&d| view.extra.get(idx(d) + 2))
             .map(|&v| idx(v))
-            .is_some_and(|len_v| extract_remat_const(view, len_v).is_some_and(|n| n <= 256));
+            .is_some_and(|len_v| extract_remat_const(view, len_v).is_some_and(|n| n <= limit));
         !const_ok
     };
     let is_i128_div = view.tys.get(inst).copied().map(Ty) == Some(Ty::I128)
@@ -1527,6 +1629,78 @@ fn propagate_extract_lane0_hints(view: &View<'_>, hint: &mut [u8], rev_insts: im
     }
 }
 
+/// Computes the full set of physical registers clobbered at a non-tail call site `inst`, unioning
+/// the callee's IPRA [`CallClobbers`] with every register written by the caller's own ABI argument
+/// setup (`X0..X(ng-1)`, `V0..V(nf-1)`, `X8` for `sret`, return registers, and `X16`/`X17`/`X30`).
+/// Any non-`Op::Call` clobbering site (`Invoke`, `CallIndirect`, runtime `_memcpy`/`_memset`,
+/// `TlsAddr`, `Frem`, `I128` div, SME2 helper) conservatively returns `CallClobbers::C_ABI_ARM64`.
+fn effective_call_clobbers(view: &View<'_>, inst: usize, callee: CallClobbers) -> CallClobbers {
+    if view.op(inst) != Op::Call {
+        return CallClobbers::C_ABI_ARM64;
+    }
+    let mut clob = callee
+        .clobbered
+        .with(TierReg(16))
+        .with(TierReg(17))
+        .with(TierReg(30));
+    let Some(&data_at) = view.data.get(inst) else {
+        return CallClobbers::C_ABI_ARM64;
+    };
+    let Some(&sig_word) = view.extra.get(idx(data_at) + 1) else {
+        return CallClobbers::C_ABI_ARM64;
+    };
+    let sig = view.sig(SigId(sig_word));
+    let mut ng = 0u8;
+    let mut nf = 0u8;
+    for p in sig.params {
+        match ParamKind::from_byte(p.kind) {
+            Some(ParamKind::Sret) => {
+                clob = clob.with(TierReg(8));
+            }
+            Some(ParamKind::Byval) => {
+                clob = clob.with(TierReg(32 + 29)).with(TierReg(32 + 30));
+            }
+            _ => {
+                let ty = Ty(p.ty);
+                if is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some() {
+                    if nf < 8 {
+                        clob = clob.with(TierReg(32 + nf));
+                        nf += 1;
+                    }
+                } else if ty == Ty::I128 || is_gpr_pair_ty(view, ty) {
+                    if ng < 8 {
+                        clob = clob.with(TierReg(ng));
+                    }
+                    if ng + 1 < 8 {
+                        clob = clob.with(TierReg(ng + 1));
+                    }
+                    if ng + 2 < 8 {
+                        // Conservative for 16B-aligned odd-GPR bump on AAPCS64 Linux.
+                        clob = clob.with(TierReg(ng + 2));
+                    }
+                    ng = ng.saturating_add(2);
+                } else if ng < 8 {
+                    clob = clob.with(TierReg(ng));
+                    ng += 1;
+                }
+            }
+        }
+    }
+    for (ri, r) in sig.rets.iter().enumerate() {
+        let rty = Ty(r.ty);
+        if is_fp_ty(rty).is_some() || is_vec128_ty(rty).is_some() {
+            if ri < 4 {
+                clob = clob.with(TierReg(32 + u8::try_from(ri).unwrap_or(0)));
+            }
+        } else if rty == Ty::I128 || is_gpr_pair_ty(view, rty) {
+            clob = clob.with(TierReg(0)).with(TierReg(1));
+        } else if ri < 2 {
+            clob = clob.with(TierReg(u8::try_from(ri).unwrap_or(0)));
+        }
+    }
+    CallClobbers { clobbered: clob }
+}
+
 /// Builds the final [`Allocation`] with exact ARM64 unwind pair masks and IPRA clobber summary.
 fn finalize_allocation<A: Allocator>(
     view: &View<'_>,
@@ -1563,14 +1737,25 @@ fn finalize_allocation<A: Allocator>(
     let mut clob = RegSet::EMPTY
         .with(TierReg(16))
         .with(TierReg(17));
+    let mut uses_fp = false;
     for &loc in &loc_of {
         match loc {
-            AllocLoc::Gpr(r) if !(19..=28).contains(&r) => clob = clob.with(TierReg(r)),
+            AllocLoc::Gpr(r) => {
+                if u32::from(r) == FP {
+                    uses_fp = true;
+                } else if !(19..=28).contains(&r) {
+                    clob = clob.with(TierReg(r));
+                }
+            }
             AllocLoc::GprPair(lo, hi) => {
-                if !(19..=28).contains(&lo) {
+                if u32::from(lo) == FP {
+                    uses_fp = true;
+                } else if !(19..=28).contains(&lo) {
                     clob = clob.with(TierReg(lo));
                 }
-                if !(19..=28).contains(&hi) {
+                if u32::from(hi) == FP {
+                    uses_fp = true;
+                } else if !(19..=28).contains(&hi) {
                     clob = clob.with(TierReg(hi));
                 }
             }
@@ -1583,6 +1768,7 @@ fn finalize_allocation<A: Allocator>(
             _ => {}
         }
     }
+    debug_assert_eq!(uses_fp, used_callee_gpr.get(idx(FP)).copied().unwrap_or(false));
     if let Some(first_ret) = func_sig.rets.first() {
         let r0 = Ty(first_ret.ty);
         if is_fp_ty(r0).is_some() || is_vec128_ty(r0).is_some() {
@@ -1596,7 +1782,13 @@ fn finalize_allocation<A: Allocator>(
     }
     for &c in call_positions {
         clob = clob.with(TierReg(30));
-        clob = clob.union(call_clobbers(c).clobbered);
+        clob = clob.union(effective_call_clobbers(view, c, call_clobbers(c)).clobbered);
+    }
+    for i in 0..view.len() {
+        if matches!(view.op(i), Op::Memcpy | Op::Memmove | Op::Memset) {
+            clob = clob.with(TierReg(32 + 29)).with(TierReg(32 + 30)).with(TierReg(32 + 31));
+            break;
+        }
     }
 
     Allocation {
@@ -1606,6 +1798,7 @@ fn finalize_allocation<A: Allocator>(
         num_spill_slots,
         has_calls: !call_positions.is_empty(),
         uses_lr: used_callee_gpr.get(idx(X30)).copied().unwrap_or(false),
+        uses_fp,
         clobbers: CallClobbers { clobbered: clob },
         remat_count,
     }
@@ -1698,12 +1891,14 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
         os,
         call_clobbers,
         None,
+        None,
         alloc,
     )
 }
 
 /// IPRA-aware register allocation with optional interprocedural register-avoidance scratch order
-/// (`scratch_order`): callees allocate caller-untouched GPR/FP registers before caller-hot ones.
+/// (`scratch_order`) and optional Pillar-2 `BlockLayout` solved edge weights (`layout`): callees
+/// allocate caller-untouched GPR/FP registers before caller-hot ones.
 ///
 /// Dispatches to exact-CFG backward liveness + symmetric SSA interference bitmatrix coloring
 /// whenever `blocks <= EXACT_CFG_MAX_BLOCKS` and allocated SSA values `<= EXACT_CFG_MAX_VALS`
@@ -1719,6 +1914,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
     os: crate::Os,
     call_clobbers: impl Fn(usize) -> CallClobbers,
     scratch_order: Option<&ScratchOrder>,
+    layout: Option<&super::layout::BlockLayout<'_>>,
     alloc: A,
 ) -> Result<Allocation<A>, RegAllocError> {
     let caller_gpr_order = build_caller_gpr_order(scratch_order);
@@ -1734,6 +1930,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             call_clobbers,
             &caller_gpr_order,
             &caller_fp_order,
+            layout,
             alloc,
         )
     } else {
@@ -1752,6 +1949,1521 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
     }
 }
 
+/// Picks the first GPR satisfying `ok` from `caller_gpr_order` and `callee_gpr_pool`.
+///
+/// When `avoid_mask` is non-zero (anti-hinting against registers wanted by interfering uncolored
+/// `phi_adj` values), prefers registers outside `avoid_mask` within each cost tier:
+/// 1. Non-avoided caller-saved GPRs, then non-avoided already-saved callee-saved GPRs
+/// 2. Avoided caller-saved GPRs, then avoided already-saved callee-saved GPRs
+/// 3. Non-avoided fresh callee-saved GPRs
+/// 4. Avoided fresh callee-saved GPRs
+///
+/// This guarantees zero extra callee-saved prologue/epilogue pairs and zero extra spills.
+#[inline]
+fn pick_gpr_from_pool(
+    caller_gpr_order: &[Reg; 16],
+    callee_gpr_pool: &[Reg],
+    used_callee_gpr: &[bool; 32],
+    avoid_mask: u32,
+    mut ok: impl FnMut(Reg) -> bool,
+) -> Option<Reg> {
+    if avoid_mask == 0 {
+        return caller_gpr_order
+            .iter()
+            .copied()
+            .chain(callee_gpr_pool.iter().copied())
+            .find(|&r| ok(r));
+    }
+    let is_avoided = |r: Reg| -> bool { r < 32 && (avoid_mask & (1u32 << r)) != 0 };
+    let is_paid_callee = |r: Reg| -> bool {
+        if used_callee_gpr.get(idx(r)).copied().unwrap_or(false) {
+            return true;
+        }
+        if (X19..=X28).contains(&r) {
+            let mate = if (r & 1) != 0 { r + 1 } else { r - 1 };
+            return used_callee_gpr.get(idx(mate)).copied().unwrap_or(false);
+        }
+        false
+    };
+    if let Some(r) = caller_gpr_order
+        .iter()
+        .copied()
+        .find(|&r| !is_avoided(r) && ok(r))
+    {
+        return Some(r);
+    }
+    if let Some(r) = callee_gpr_pool
+        .iter()
+        .copied()
+        .find(|&r| is_paid_callee(r) && !is_avoided(r) && ok(r))
+    {
+        return Some(r);
+    }
+    if let Some(r) = caller_gpr_order
+        .iter()
+        .copied()
+        .find(|&r| is_avoided(r) && ok(r))
+    {
+        return Some(r);
+    }
+    if let Some(r) = callee_gpr_pool
+        .iter()
+        .copied()
+        .find(|&r| is_paid_callee(r) && is_avoided(r) && ok(r))
+    {
+        return Some(r);
+    }
+    if let Some(r) = callee_gpr_pool
+        .iter()
+        .copied()
+        .find(|&r| !is_paid_callee(r) && !is_avoided(r) && ok(r))
+    {
+        return Some(r);
+    }
+    callee_gpr_pool
+        .iter()
+        .copied()
+        .find(|&r| !is_paid_callee(r) && is_avoided(r) && ok(r))
+}
+
+/// Post-coloring bounded GPR move-cost refinement (single-value recolor + 2-cycle pair-swap +
+/// bounded colliding edge-group pairwise color-swap, with zero-affinity scratch-blocker eviction
+/// and parallel-copy 2-cycle swap cost modeling).
+///
+/// Runs at most `MAX_REFINE_ROUNDS` rounds on functions with `<= MAX_REFINE_GPR_VALS` scalar GPR
+/// values. Every committed move, eviction, or swap is verified bit-for-bit against the exact
+/// symmetric interference matrix (`interf`) and `gpr_busy`, call-clobber safety
+/// (`val_crosses_call` / `val_crossed_clobbers`), non-expansion of callee-saved pairs, and strict
+/// reduction in total weighted phi + parallel-copy 2-cycle swap + ABI move cost.
+/// Returns `true` iff at least one GPR assignment changed.
+#[allow(clippy::too_many_arguments)]
+fn refine_gpr_moves<A: Allocator + Copy>(
+    view: &View<'_>,
+    alias_of: &[u32],
+    os: crate::Os,
+    val_id: &[u32],
+    val_inst: &[usize],
+    val_words: usize,
+    interf: &[u64],
+    val_crosses_call: &[bool],
+    val_crossed_clobbers: &[CallClobbers],
+    coalesce_edges: &[(u32, u32, u64)],
+    edge_groups: &[(u32, u32)],
+    abi_weight: u64,
+    allow_lr: bool,
+    allow_fp: bool,
+    callee_gpr_pool: &[Reg],
+    loc: &mut [AllocLoc],
+    used_callee_gpr: &mut [bool; 32],
+    alloc: A,
+) -> bool {
+    const MAX_REFINE_ROUNDS: usize = 4;
+    const MAX_REFINE_GPR_VALS: usize = 2048;
+    const MAX_SCRATCH_EVICTS: usize = 4;
+    const MAX_BLOCKERS: usize = 1 + MAX_SCRATCH_EVICTS;
+    const MAX_TOTAL_SCRATCH_EVICTS: usize = MAX_SCRATCH_EVICTS * 2;
+    const MAX_ACTION_MOVES: usize = 2 + MAX_TOTAL_SCRATCH_EVICTS;
+    const MAX_ACTION_GROUPS: usize = 64;
+    const MAX_PAIR_SWAP_RAW: usize = 2048;
+    const MAX_PAIR_SWAP_CANDS: usize = 256;
+
+    if val_words == 0 || coalesce_edges.is_empty() {
+        return false;
+    }
+
+    let len = view.len();
+    let mut num_gpr_vals = 0usize;
+    for &l in loc.iter() {
+        if matches!(l, AllocLoc::Gpr(_)) {
+            num_gpr_vals += 1;
+            if num_gpr_vals > MAX_REFINE_GPR_VALS {
+                return false;
+            }
+        }
+    }
+    if num_gpr_vals == 0 {
+        return false;
+    }
+
+    // Build symmetric weighted scalar-GPR coalesce adjacency CSR (`w_off`, `w_adj`).
+    let mut w_raw: Vec<(u32, u32, u64), A> =
+        Vec::with_capacity_in(coalesce_edges.len().saturating_mul(2), alloc);
+    for &(a, p, weight) in coalesce_edges {
+        if a == p || weight == 0 {
+            continue;
+        }
+        let ai = idx(a);
+        let pi = idx(p);
+        let a_ty = view.tys.get(ai).copied().map_or(Ty::NONE, Ty);
+        let p_ty = view.tys.get(pi).copied().map_or(Ty::NONE, Ty);
+        if reg_bank(view, a_ty) == 3 && reg_bank(view, p_ty) == 3 {
+            w_raw.push((a, p, weight));
+            w_raw.push((p, a, weight));
+        }
+    }
+    if w_raw.is_empty() {
+        return false;
+    }
+    w_raw.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut w_dedup: Vec<(u32, u32, u64), A> = Vec::with_capacity_in(w_raw.len(), alloc);
+    for &(u, v, weight) in &w_raw {
+        if let Some(last) = w_dedup.last_mut()
+            && last.0 == u
+            && last.1 == v
+        {
+            last.2 = last.2.saturating_add(weight);
+            continue;
+        }
+        w_dedup.push((u, v, weight));
+    }
+    let mut w_off: Vec<u32, A> = Vec::with_capacity_in(len + 1, alloc);
+    let mut w_adj: Vec<(u32, u64), A> = Vec::with_capacity_in(w_dedup.len(), alloc);
+    let mut edge_nodes: Vec<usize, A> = Vec::new_in(alloc);
+    let mut cur = 0usize;
+    for u in 0..len {
+        let start_len = w_adj.len();
+        w_off.push(u32_of(start_len));
+        let u_u32 = u32_of(u);
+        while let Some(&(src, dst, weight)) = w_dedup.get(cur) {
+            if src != u_u32 {
+                break;
+            }
+            w_adj.push((dst, weight));
+            cur += 1;
+        }
+        if w_adj.len() > start_len && matches!(loc.get(u).copied(), Some(AllocLoc::Gpr(_))) {
+            edge_nodes.push(u);
+        }
+    }
+    w_off.push(u32_of(w_adj.len()));
+    if edge_nodes.is_empty() {
+        return false;
+    }
+
+    // Build bounded per-value CSR (`vg_off`, `vg_adj`) mapping each SSA instruction to the
+    // parallel-copy CFG edge groups (`valid_groups`) in which it participates, sorted hottest-first
+    // so both 2-cycle swap penalties (`reg[a_i] == reg[p_j] && reg[a_j] == reg[p_i]`, costing `+1`
+    // extra `X16` `mov`) and bounded pairwise edge-group swaps prioritize hot inner loops.
+    let mut valid_groups: Vec<(u32, u32, u64), A> = Vec::new_in(alloc);
+    for &(s_u32, e_u32) in edge_groups {
+        if valid_groups.len() >= MAX_EDGE_GROUPS {
+            break;
+        }
+        let si = idx(s_u32);
+        let ei = idx(e_u32);
+        if ei <= si || ei > coalesce_edges.len() {
+            continue;
+        }
+        let group_len = ei - si;
+        if !(2..=MAX_PARALLEL_COPY_GROUP).contains(&group_len) {
+            continue;
+        }
+        let Some(pairs) = coalesce_edges.get(si..ei) else {
+            continue;
+        };
+        let mut gpr_pairs = 0usize;
+        let mut max_w = 0u64;
+        for &(a, p, weight) in pairs {
+            if a == p || weight == 0 {
+                continue;
+            }
+            let a_ty = view.tys.get(idx(a)).copied().map_or(Ty::NONE, Ty);
+            let p_ty = view.tys.get(idx(p)).copied().map_or(Ty::NONE, Ty);
+            if reg_bank(view, a_ty) == 3 && reg_bank(view, p_ty) == 3 {
+                gpr_pairs += 1;
+                if weight > max_w {
+                    max_w = weight;
+                }
+            }
+        }
+        if gpr_pairs >= 2 {
+            valid_groups.push((s_u32, e_u32, max_w));
+        }
+    }
+    valid_groups.sort_unstable_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let (vg_off, vg_adj): (Vec<u32, A>, Vec<u32, A>) = if valid_groups.is_empty() {
+        (Vec::new_in(alloc), Vec::new_in(alloc))
+    } else {
+        let mut vg_raw: Vec<(u32, u32), A> =
+            Vec::with_capacity_in(valid_groups.len().saturating_mul(4), alloc);
+        for (gid, &(s_u32, e_u32, _)) in valid_groups.iter().enumerate() {
+            let gid_u32 = u32_of(gid);
+            if let Some(pairs) = coalesce_edges.get(idx(s_u32)..idx(e_u32)) {
+                for &(a, p, weight) in pairs {
+                    if a == p || weight == 0 {
+                        continue;
+                    }
+                    let a_ty = view.tys.get(idx(a)).copied().map_or(Ty::NONE, Ty);
+                    let p_ty = view.tys.get(idx(p)).copied().map_or(Ty::NONE, Ty);
+                    if reg_bank(view, a_ty) == 3 && reg_bank(view, p_ty) == 3 {
+                        vg_raw.push((a, gid_u32));
+                        vg_raw.push((p, gid_u32));
+                    }
+                }
+            }
+        }
+        vg_raw.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut off: Vec<u32, A> = Vec::with_capacity_in(len + 1, alloc);
+        let mut adj: Vec<u32, A> = Vec::with_capacity_in(vg_raw.len(), alloc);
+        let mut g_cur = 0usize;
+        for u in 0..len {
+            off.push(u32_of(adj.len()));
+            let u_u32 = u32_of(u);
+            let mut last_gid = u32::MAX;
+            while let Some(&(inst_u, gid)) = vg_raw.get(g_cur) {
+                if inst_u != u_u32 {
+                    break;
+                }
+                if gid != last_gid {
+                    adj.push(gid);
+                    last_gid = gid;
+                }
+                g_cur += 1;
+            }
+        }
+        off.push(u32_of(adj.len()));
+        (off, adj)
+    };
+
+    // Direct entry/landing-pad/return ABI register hints (`abi_weight` each) so depth-0 moves
+    // never pointlessly shift a prologue or epilogue copy without strict net gain.
+    let mut abi_reg: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        abi_reg.push(NO_REG);
+    }
+    seed_abi_and_return_hints(view, alias_of, os, &mut abi_reg);
+
+    // Reconstruct exact `gpr_busy` bitmatrix from `loc` (covering both `Gpr` and `GprPair`).
+    let busy_len = 32usize.saturating_mul(val_words);
+    let mut gpr_busy: Vec<u64, A> = Vec::with_capacity_in(busy_len, alloc);
+    for _ in 0..busy_len {
+        gpr_busy.push(0);
+    }
+    for (v_vid, &v_inst) in val_inst.iter().enumerate() {
+        let bit = 1u64 << (v_vid & 63);
+        let word = v_vid >> 6;
+        match loc.get(v_inst).copied().unwrap_or(AllocLoc::None) {
+            AllocLoc::Gpr(r) if usize::from(r) < 32 => {
+                if let Some(slot) = gpr_busy.get_mut(usize::from(r).saturating_mul(val_words) + word)
+                {
+                    *slot |= bit;
+                }
+            }
+            AllocLoc::GprPair(lo, hi) => {
+                if usize::from(lo) < 32
+                    && let Some(slot) =
+                        gpr_busy.get_mut(usize::from(lo).saturating_mul(val_words) + word)
+                {
+                    *slot |= bit;
+                }
+                if usize::from(hi) < 32
+                    && let Some(slot) =
+                        gpr_busy.get_mut(usize::from(hi).saturating_mul(val_words) + word)
+                {
+                    *slot |= bit;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut caller_saved_mask = 0u32;
+    for &r in CALLER_SAVED_GPR {
+        if r < 32 {
+            caller_saved_mask |= 1u32 << r;
+        }
+    }
+    let mut allocatable_mask = caller_saved_mask;
+    for &r in callee_gpr_pool {
+        if r < 32 {
+            allocatable_mask |= 1u32 << r;
+        }
+    }
+
+    let is_paid_callee_reg = |r: u8, used: &[bool; 32]| -> bool {
+        let ri = usize::from(r);
+        if used.get(ri).copied().unwrap_or(false) {
+            return true;
+        }
+        if (19..=28).contains(&r) {
+            let mate = if (r & 1) != 0 { ri + 1 } else { ri - 1 };
+            return used.get(mate).copied().unwrap_or(false);
+        }
+        false
+    };
+
+    let is_paid_reg = |r: u8, used: &[bool; 32]| -> bool {
+        r < 32
+            && ((caller_saved_mask & (1u32 << u32::from(r))) != 0
+                || is_paid_callee_reg(r, used))
+    };
+
+    let gpr_reg_safe = |u_inst: usize, r: u8| -> bool {
+        if r >= 32 || (allocatable_mask & (1u32 << u32::from(r))) == 0 {
+            return false;
+        }
+        if u32::from(r) == X30 && !allow_lr {
+            return false;
+        }
+        if u32::from(r) == FP && !allow_fp {
+            return false;
+        }
+        if !val_crosses_call.get(u_inst).copied().unwrap_or(false) {
+            return true;
+        }
+        if (19..=28).contains(&r) {
+            return true;
+        }
+        let clob = val_crossed_clobbers
+            .get(u_inst)
+            .copied()
+            .unwrap_or(CallClobbers::EMPTY);
+        !clob.clobbers_gpr(r)
+    };
+
+    let is_zero_affinity_scratch =
+        |loc_cur: &[AllocLoc], inst_idx: usize, expected_reg: u8| -> bool {
+            if loc_cur.get(inst_idx).copied() != Some(AllocLoc::Gpr(expected_reg)) {
+                return false;
+            }
+            let start = w_off.get(inst_idx).copied().map_or(0, idx);
+            let end = w_off.get(inst_idx + 1).copied().map_or(start, idx);
+            start == end && abi_reg.get(inst_idx).copied().unwrap_or(NO_REG) == NO_REG
+        };
+
+    let set_busy = |busy: &mut [u64], reg: u8, vid: usize| {
+        let off = usize::from(reg).saturating_mul(val_words) + (vid >> 6);
+        if let Some(slot) = busy.get_mut(off) {
+            *slot |= 1u64 << (vid & 63);
+        }
+    };
+
+    let clear_busy = |busy: &mut [u64], reg: u8, vid: usize| {
+        let off = usize::from(reg).saturating_mul(val_words) + (vid >> 6);
+        if let Some(slot) = busy.get_mut(off) {
+            *slot &= !(1u64 << (vid & 63));
+        }
+    };
+
+    let is_free_in_busy = |busy: &[u64], reg: u8, vid: usize| -> bool {
+        let r_base = usize::from(reg).saturating_mul(val_words);
+        let v_base = vid.saturating_mul(val_words);
+        let self_bit = 1u64 << (vid & 63);
+        if (busy.get(r_base + (vid >> 6)).copied().unwrap_or(0) & self_bit) != 0 {
+            return false;
+        }
+        for w in 0..val_words {
+            let bw = busy.get(r_base + w).copied().unwrap_or(0);
+            let iw = interf.get(v_base + w).copied().unwrap_or(0);
+            if (bw & iw) != 0 {
+                return false;
+            }
+        }
+        true
+    };
+
+    let find_evict_reg = |busy: &[u64],
+                          w_inst: usize,
+                          w_vid: usize,
+                          forbid_a: u8,
+                          forbid_b: u8,
+                          used: &[bool; 32]|
+     -> Option<u8> {
+        for &r_raw in CALLER_SAVED_GPR {
+            let r = reg_u8(r_raw);
+            if r == forbid_a || r == forbid_b {
+                continue;
+            }
+            if gpr_reg_safe(w_inst, r) && is_free_in_busy(busy, r, w_vid) {
+                return Some(r);
+            }
+        }
+        for &r_raw in callee_gpr_pool {
+            let r = reg_u8(r_raw);
+            if r == forbid_a || r == forbid_b {
+                continue;
+            }
+            if is_paid_callee_reg(r, used)
+                && gpr_reg_safe(w_inst, r)
+                && is_free_in_busy(busy, r, w_vid)
+            {
+                return Some(r);
+            }
+        }
+        None
+    };
+
+    let node_move_cost = |loc_cur: &[AllocLoc], u_inst: usize, r: u8, skip_nb: usize| -> u64 {
+        let start = w_off.get(u_inst).copied().map_or(0, idx);
+        let end = w_off.get(u_inst + 1).copied().map_or(start, idx);
+        let mut cost = 0u64;
+        if let Some(edges) = w_adj.get(start..end) {
+            for &(nb_u32, w) in edges {
+                let nb = idx(nb_u32);
+                if nb == skip_nb {
+                    continue;
+                }
+                if loc_cur.get(nb).copied() != Some(AllocLoc::Gpr(r)) {
+                    cost = cost.saturating_add(w);
+                }
+            }
+        }
+        let abi = abi_reg.get(u_inst).copied().unwrap_or(NO_REG);
+        if abi != NO_REG && abi != r {
+            cost = cost.saturating_add(abi_weight);
+        }
+        cost
+    };
+
+    // Exact combined weighted coalesce + ABI move cost for a pair `(u_inst, v_inst)` evaluated
+    // directly against `loc_cur` without double-counting any direct `(u_inst, v_inst)` edge.
+    let pair_edge_and_abi_cost = |loc_cur: &[AllocLoc], u_inst: usize, v_inst: usize| -> u64 {
+        let mut cost = 0u64;
+        let u_loc = loc_cur.get(u_inst).copied().unwrap_or(AllocLoc::None);
+        let v_loc = loc_cur.get(v_inst).copied().unwrap_or(AllocLoc::None);
+        let u_start = w_off.get(u_inst).copied().map_or(0, idx);
+        let u_end = w_off.get(u_inst + 1).copied().map_or(u_start, idx);
+        if let Some(edges) = w_adj.get(u_start..u_end) {
+            for &(nb_u32, w) in edges {
+                if loc_cur.get(idx(nb_u32)).copied().unwrap_or(AllocLoc::None) != u_loc {
+                    cost = cost.saturating_add(w);
+                }
+            }
+        }
+        let v_start = w_off.get(v_inst).copied().map_or(0, idx);
+        let v_end = w_off.get(v_inst + 1).copied().map_or(v_start, idx);
+        if let Some(edges) = w_adj.get(v_start..v_end) {
+            for &(nb_u32, w) in edges {
+                let nb = idx(nb_u32);
+                if nb == u_inst {
+                    continue;
+                }
+                if loc_cur.get(nb).copied().unwrap_or(AllocLoc::None) != v_loc {
+                    cost = cost.saturating_add(w);
+                }
+            }
+        }
+        let u_abi = abi_reg.get(u_inst).copied().unwrap_or(NO_REG);
+        if u_abi != NO_REG && u_loc != AllocLoc::Gpr(u_abi) {
+            cost = cost.saturating_add(abi_weight);
+        }
+        let v_abi = abi_reg.get(v_inst).copied().unwrap_or(NO_REG);
+        if v_abi != NO_REG && v_loc != AllocLoc::Gpr(v_abi) {
+            cost = cost.saturating_add(abi_weight);
+        }
+        cost
+    };
+
+    // Parallel-copy 2-cycle swap penalty for one CFG edge group (`gid`), counting `+w` per
+    // swapping pair `(a_i -> p_i, a_j -> p_j)` where `reg[a_i] == reg[p_j]` and
+    // `reg[a_j] == reg[p_i]` with `reg[a_i] != reg[p_i]` (1 extra `X16` temp `mov`).
+    let group_swap_penalty = |gid: u32,
+                              loc_cur: &[AllocLoc],
+                              ov1_inst: usize,
+                              ov1_reg: u8,
+                              ov2_inst: usize,
+                              ov2_reg: u8|
+     -> u64 {
+        let Some(&(s_u32, e_u32, _)) = valid_groups.get(idx(gid)) else {
+            return 0;
+        };
+        let Some(pairs) = coalesce_edges.get(idx(s_u32)..idx(e_u32)) else {
+            return 0;
+        };
+        let reg_of = |inst_u32: u32| -> u8 {
+            let i = idx(inst_u32);
+            if i == ov1_inst {
+                return ov1_reg;
+            }
+            if i == ov2_inst {
+                return ov2_reg;
+            }
+            match loc_cur.get(i).copied() {
+                Some(AllocLoc::Gpr(r)) => r,
+                _ => NO_REG,
+            }
+        };
+        let mut penalty = 0u64;
+        for (i, &(a_i, p_i, w_i)) in pairs.iter().enumerate() {
+            if a_i == p_i || w_i == 0 {
+                continue;
+            }
+            let ra_i = reg_of(a_i);
+            let rp_i = reg_of(p_i);
+            if ra_i == NO_REG || rp_i == NO_REG || ra_i == rp_i {
+                continue;
+            }
+            for &(a_j, p_j, w_j) in pairs.iter().skip(i + 1) {
+                if a_j == p_j || w_j == 0 {
+                    continue;
+                }
+                let ra_j = reg_of(a_j);
+                let rp_j = reg_of(p_j);
+                if ra_j == NO_REG || rp_j == NO_REG || ra_j == rp_j {
+                    continue;
+                }
+                if ra_i == rp_j && ra_j == rp_i {
+                    penalty = penalty.saturating_add(w_i.min(w_j));
+                }
+            }
+        }
+        penalty
+    };
+
+    let eval_single_swap = |loc_cur: &[AllocLoc], u_inst: usize, new_r: u8| -> u64 {
+        let g_start = vg_off.get(u_inst).copied().map_or(0, idx);
+        let g_end = vg_off.get(u_inst + 1).copied().map_or(g_start, idx);
+        let Some(gids) = vg_adj.get(g_start..g_end) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for &gid in gids.iter().take(MAX_ACTION_GROUPS) {
+            total = total.saturating_add(group_swap_penalty(
+                gid,
+                loc_cur,
+                u_inst,
+                new_r,
+                usize::MAX,
+                NO_REG,
+            ));
+        }
+        total
+    };
+
+    // Exact 2-pointer union over sorted incident groups of `u_inst` and `v_inst` (zero
+    // double-counting when both values share the same parallel-copy CFG edge).
+    let eval_pair_swap = |loc_cur: &[AllocLoc],
+                          u_inst: usize,
+                          u_new_r: u8,
+                          v_inst: usize,
+                          v_new_r: u8|
+     -> (u64, u64) {
+        let us = vg_off.get(u_inst).copied().map_or(0, idx);
+        let ue = vg_off.get(u_inst + 1).copied().map_or(us, idx);
+        let vs = vg_off.get(v_inst).copied().map_or(0, idx);
+        let ve = vg_off.get(v_inst + 1).copied().map_or(vs, idx);
+        let ug = vg_adj.get(us..ue).unwrap_or(&[]);
+        let vg = vg_adj.get(vs..ve).unwrap_or(&[]);
+        if ug.is_empty() && vg.is_empty() {
+            return (0, 0);
+        }
+        let mut i = 0usize;
+        let mut j = 0usize;
+        let mut checked = 0usize;
+        let mut before = 0u64;
+        let mut after = 0u64;
+        while (i < ug.len() || j < vg.len()) && checked < MAX_ACTION_GROUPS {
+            let gid = match (ug.get(i).copied(), vg.get(j).copied()) {
+                (Some(a), Some(b)) if a < b => {
+                    i += 1;
+                    a
+                }
+                (Some(a), Some(b)) if b < a => {
+                    j += 1;
+                    b
+                }
+                (Some(a), Some(_)) => {
+                    i += 1;
+                    j += 1;
+                    a
+                }
+                (Some(a), None) => {
+                    i += 1;
+                    a
+                }
+                (None, Some(b)) => {
+                    j += 1;
+                    b
+                }
+                (None, None) => break,
+            };
+            before = before.saturating_add(group_swap_penalty(
+                gid,
+                loc_cur,
+                usize::MAX,
+                NO_REG,
+                usize::MAX,
+                NO_REG,
+            ));
+            after = after.saturating_add(group_swap_penalty(
+                gid,
+                loc_cur,
+                u_inst,
+                u_new_r,
+                v_inst,
+                v_new_r,
+            ));
+            checked += 1;
+        }
+        (before, after)
+    };
+
+    #[derive(Clone, Copy)]
+    struct GprMove {
+        inst: usize,
+        vid: usize,
+        from: u8,
+        to: u8,
+    }
+
+    impl GprMove {
+        const EMPTY: Self = Self {
+            inst: 0,
+            vid: 0,
+            from: NO_REG,
+            to: NO_REG,
+        };
+    }
+
+    #[derive(Clone, Copy)]
+    struct RefineAction {
+        moves: [GprMove; MAX_ACTION_MOVES],
+        len: usize,
+    }
+
+    impl RefineAction {
+        const EMPTY: Self = Self {
+            moves: [GprMove::EMPTY; MAX_ACTION_MOVES],
+            len: 0,
+        };
+
+        #[inline]
+        fn push(&mut self, mv: GprMove) {
+            if let Some(slot) = self.moves.get_mut(self.len) {
+                *slot = mv;
+                self.len += 1;
+            }
+        }
+    }
+
+    let mut pair_raw: Vec<(u32, u32, u64), A> = if valid_groups.is_empty() {
+        Vec::new_in(alloc)
+    } else {
+        Vec::with_capacity_in(valid_groups.len().saturating_mul(4).min(MAX_PAIR_SWAP_RAW), alloc)
+    };
+    let mut pair_cands: Vec<(u32, u32, u64), A> = if valid_groups.is_empty() {
+        Vec::new_in(alloc)
+    } else {
+        Vec::with_capacity_in(MAX_PAIR_SWAP_CANDS, alloc)
+    };
+
+    let push_pair_cand =
+        |raw: &mut Vec<(u32, u32, u64), A>, x: u32, y: u32, w: u64| {
+            if x != y && raw.len() < MAX_PAIR_SWAP_RAW {
+                let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+                raw.push((lo, hi, w));
+            }
+        };
+
+    let mut any_changed = false;
+    for _round in 0..MAX_REFINE_ROUNDS {
+        let mut round_changed = false;
+        for &u_inst in &edge_nodes {
+            let Some(AllocLoc::Gpr(r_u)) = loc.get(u_inst).copied() else {
+                continue;
+            };
+            if r_u >= 32 {
+                continue;
+            }
+            let u_vid_raw = val_id.get(u_inst).copied().unwrap_or(NO_VAL);
+            if u_vid_raw == NO_VAL {
+                continue;
+            }
+            let u_vid = idx(u_vid_raw);
+            let start = w_off.get(u_inst).copied().map_or(0, idx);
+            let end = w_off.get(u_inst + 1).copied().map_or(start, idx);
+            let mut cand_mask = 0u32;
+            let mut has_uncoalesced = false;
+            if let Some(edges) = w_adj.get(start..end) {
+                for &(nb_u32, _w) in edges {
+                    if let Some(AllocLoc::Gpr(nr)) = loc.get(idx(nb_u32)).copied() {
+                        if nr != r_u && nr < 32 {
+                            has_uncoalesced = true;
+                            cand_mask |= 1u32 << u32::from(nr);
+                        }
+                    }
+                }
+            }
+            if !has_uncoalesced {
+                continue;
+            }
+            let u_abi = abi_reg.get(u_inst).copied().unwrap_or(NO_REG);
+            if u_abi != NO_REG && u_abi != r_u && u_abi < 32 {
+                cand_mask |= 1u32 << u32::from(u_abi);
+            }
+
+            let mut best_gain = 0u64;
+            let mut best_action: Option<RefineAction> = None;
+            let u_swap_before = eval_single_swap(loc, u_inst, r_u);
+            let u_single_before =
+                node_move_cost(loc, u_inst, r_u, usize::MAX).saturating_add(u_swap_before);
+            let u_base = u_vid.saturating_mul(val_words);
+            let u_word = u_vid >> 6;
+            let u_bit = 1u64 << (u_vid & 63);
+            let ru_base = usize::from(r_u).saturating_mul(val_words);
+
+            let mut rem_mask = cand_mask;
+            while rem_mask != 0 {
+                let r_cand_u32 = rem_mask.trailing_zeros();
+                rem_mask &= rem_mask - 1;
+                let r_cand = reg_u8(r_cand_u32);
+                if r_cand == r_u || !gpr_reg_safe(u_inst, r_cand) {
+                    continue;
+                }
+                let rc_base = usize::from(r_cand).saturating_mul(val_words);
+
+                // Collect interfering values currently holding `r_cand` (up to `MAX_BLOCKERS`).
+                let mut rc_blockers = [0usize; MAX_BLOCKERS];
+                let mut rc_blocker_count = 0usize;
+                let mut rc_too_many = false;
+                for w in 0..val_words {
+                    let mut bits = gpr_busy.get(rc_base + w).copied().unwrap_or(0)
+                        & interf.get(u_base + w).copied().unwrap_or(0);
+                    while bits != 0 {
+                        if rc_blocker_count >= MAX_BLOCKERS {
+                            rc_too_many = true;
+                            break;
+                        }
+                        let b_vid = w.saturating_mul(64) + idx(bits.trailing_zeros());
+                        bits &= bits - 1;
+                        if let Some(slot) = rc_blockers.get_mut(rc_blocker_count) {
+                            *slot = b_vid;
+                        }
+                        rc_blocker_count += 1;
+                    }
+                    if rc_too_many {
+                        break;
+                    }
+                }
+                if rc_too_many {
+                    continue;
+                }
+
+                if rc_blocker_count == 0 {
+                    // Case A: single-value move — never expand callee-saved pairs or `uses_lr`.
+                    if !is_paid_reg(r_cand, used_callee_gpr) {
+                        continue;
+                    }
+                    let swap_after = eval_single_swap(loc, u_inst, r_cand);
+                    let after =
+                        node_move_cost(loc, u_inst, r_cand, usize::MAX).saturating_add(swap_after);
+                    let gain = u_single_before.saturating_sub(after);
+                    if gain > best_gain {
+                        let mut act = RefineAction::EMPTY;
+                        act.push(GprMove {
+                            inst: u_inst,
+                            vid: u_vid,
+                            from: r_u,
+                            to: r_cand,
+                        });
+                        best_gain = gain;
+                        best_action = Some(act);
+                    }
+                    continue;
+                }
+
+                // Classify `r_cand` blockers into at most 1 non-scratch scalar GPR `v` and up to
+                // `MAX_SCRATCH_EVICTS` zero-affinity scratch temporaries.
+                let mut non_scratch: Option<(usize, usize)> = None;
+                let mut rc_scratch = [GprMove::EMPTY; MAX_SCRATCH_EVICTS];
+                let mut rc_scratch_count = 0usize;
+                let mut blockers_ok = true;
+                for &b_vid in rc_blockers.iter().take(rc_blocker_count) {
+                    let Some(&b_inst) = val_inst.get(b_vid) else {
+                        blockers_ok = false;
+                        break;
+                    };
+                    if b_inst == u_inst {
+                        blockers_ok = false;
+                        break;
+                    }
+                    if is_zero_affinity_scratch(loc, b_inst, r_cand) {
+                        if rc_scratch_count >= MAX_SCRATCH_EVICTS {
+                            blockers_ok = false;
+                            break;
+                        }
+                        if let Some(slot) = rc_scratch.get_mut(rc_scratch_count) {
+                            *slot = GprMove {
+                                inst: b_inst,
+                                vid: b_vid,
+                                from: r_cand,
+                                to: NO_REG,
+                            };
+                        }
+                        rc_scratch_count += 1;
+                    } else if non_scratch.is_none()
+                        && loc.get(b_inst).copied() == Some(AllocLoc::Gpr(r_cand))
+                    {
+                        non_scratch = Some((b_inst, b_vid));
+                    } else {
+                        blockers_ok = false;
+                        break;
+                    }
+                }
+                if !blockers_ok {
+                    continue;
+                }
+
+                if let Some((v_inst, v_vid)) = non_scratch {
+                    // Case C: 2-cycle pair-swap `(u, r_u) <-> (v, r_cand)` with optional eviction
+                    // of up to 2 zero-affinity scratch blockers on `r_cand` and up to 2 on `r_u`.
+                    if !gpr_reg_safe(v_inst, r_u) {
+                        continue;
+                    }
+                    let (swap_before, swap_after) =
+                        eval_pair_swap(loc, u_inst, r_cand, v_inst, r_u);
+                    let before = node_move_cost(loc, u_inst, r_u, v_inst)
+                        .saturating_add(node_move_cost(loc, v_inst, r_cand, u_inst))
+                        .saturating_add(swap_before);
+                    let after = node_move_cost(loc, u_inst, r_cand, v_inst)
+                        .saturating_add(node_move_cost(loc, v_inst, r_u, u_inst))
+                        .saturating_add(swap_after);
+                    let gain = before.saturating_sub(after);
+                    if gain <= best_gain {
+                        continue;
+                    }
+
+                    // Collect interfering blockers of `v` in `r_u` (excluding `u`).
+                    let v_base = v_vid.saturating_mul(val_words);
+                    let mut ru_blockers = [0usize; MAX_SCRATCH_EVICTS];
+                    let mut ru_blocker_count = 0usize;
+                    let mut ru_too_many = false;
+                    for w in 0..val_words {
+                        let mut bw = gpr_busy.get(ru_base + w).copied().unwrap_or(0);
+                        if w == u_word {
+                            bw &= !u_bit;
+                        }
+                        let mut bits = bw & interf.get(v_base + w).copied().unwrap_or(0);
+                        while bits != 0 {
+                            if ru_blocker_count >= MAX_SCRATCH_EVICTS {
+                                ru_too_many = true;
+                                break;
+                            }
+                            let b_vid = w.saturating_mul(64) + idx(bits.trailing_zeros());
+                            bits &= bits - 1;
+                            if let Some(slot) = ru_blockers.get_mut(ru_blocker_count) {
+                                *slot = b_vid;
+                            }
+                            ru_blocker_count += 1;
+                        }
+                        if ru_too_many {
+                            break;
+                        }
+                    }
+                    if ru_too_many {
+                        continue;
+                    }
+
+                    let mut evicts = [GprMove::EMPTY; MAX_TOTAL_SCRATCH_EVICTS];
+                    let mut evict_count = 0usize;
+                    for &mv in rc_scratch.iter().take(rc_scratch_count) {
+                        if let Some(slot) = evicts.get_mut(evict_count) {
+                            *slot = mv;
+                        }
+                        evict_count += 1;
+                    }
+                    let mut ru_ok = true;
+                    for &b_vid in ru_blockers.iter().take(ru_blocker_count) {
+                        let Some(&b_inst) = val_inst.get(b_vid) else {
+                            ru_ok = false;
+                            break;
+                        };
+                        if b_inst == u_inst
+                            || b_inst == v_inst
+                            || !is_zero_affinity_scratch(loc, b_inst, r_u)
+                        {
+                            ru_ok = false;
+                            break;
+                        }
+                        if let Some(slot) = evicts.get_mut(evict_count) {
+                            *slot = GprMove {
+                                inst: b_inst,
+                                vid: b_vid,
+                                from: r_u,
+                                to: NO_REG,
+                            };
+                        }
+                        evict_count += 1;
+                    }
+                    if !ru_ok {
+                        continue;
+                    }
+
+                    if evict_count == 0 {
+                        let mut act = RefineAction::EMPTY;
+                        act.push(GprMove {
+                            inst: u_inst,
+                            vid: u_vid,
+                            from: r_u,
+                            to: r_cand,
+                        });
+                        act.push(GprMove {
+                            inst: v_inst,
+                            vid: v_vid,
+                            from: r_cand,
+                            to: r_u,
+                        });
+                        best_gain = gain;
+                        best_action = Some(act);
+                    } else {
+                        // Tentatively apply swap + clear scratch blockers to find non-interfering
+                        // free paid GPRs (excluding `r_u` and `r_cand`), then restore `gpr_busy`.
+                        clear_busy(&mut gpr_busy, r_u, u_vid);
+                        clear_busy(&mut gpr_busy, r_cand, v_vid);
+                        for ev in evicts.iter().take(evict_count) {
+                            clear_busy(&mut gpr_busy, ev.from, ev.vid);
+                        }
+                        set_busy(&mut gpr_busy, r_cand, u_vid);
+                        set_busy(&mut gpr_busy, r_u, v_vid);
+
+                        let mut placed = 0usize;
+                        let mut all_evicted = true;
+                        for ev in evicts.iter_mut().take(evict_count) {
+                            if let Some(r_evict) = find_evict_reg(
+                                &gpr_busy,
+                                ev.inst,
+                                ev.vid,
+                                r_cand,
+                                r_u,
+                                used_callee_gpr,
+                            ) {
+                                ev.to = r_evict;
+                                set_busy(&mut gpr_busy, r_evict, ev.vid);
+                                placed += 1;
+                            } else {
+                                all_evicted = false;
+                                break;
+                            }
+                        }
+
+                        // Restore `gpr_busy` bit-for-bit before evaluating remaining candidates.
+                        for ev in evicts.iter().take(placed) {
+                            clear_busy(&mut gpr_busy, ev.to, ev.vid);
+                        }
+                        clear_busy(&mut gpr_busy, r_u, v_vid);
+                        clear_busy(&mut gpr_busy, r_cand, u_vid);
+                        for ev in evicts.iter().take(evict_count) {
+                            set_busy(&mut gpr_busy, ev.from, ev.vid);
+                        }
+                        set_busy(&mut gpr_busy, r_cand, v_vid);
+                        set_busy(&mut gpr_busy, r_u, u_vid);
+
+                        if all_evicted {
+                            let mut act = RefineAction::EMPTY;
+                            act.push(GprMove {
+                                inst: u_inst,
+                                vid: u_vid,
+                                from: r_u,
+                                to: r_cand,
+                            });
+                            act.push(GprMove {
+                                inst: v_inst,
+                                vid: v_vid,
+                                from: r_cand,
+                                to: r_u,
+                            });
+                            for &ev in evicts.iter().take(evict_count) {
+                                act.push(ev);
+                            }
+                            best_gain = gain;
+                            best_action = Some(act);
+                        }
+                    }
+                } else if rc_scratch_count > 0 {
+                    // Case B: all blockers on `r_cand` are 1..=2 zero-affinity scratch temps.
+                    if !is_paid_reg(r_cand, used_callee_gpr) {
+                        continue;
+                    }
+                    let swap_after = eval_single_swap(loc, u_inst, r_cand);
+                    let after =
+                        node_move_cost(loc, u_inst, r_cand, usize::MAX).saturating_add(swap_after);
+                    let gain = u_single_before.saturating_sub(after);
+                    if gain <= best_gain {
+                        continue;
+                    }
+
+                    // Tentatively move `u -> r_cand` and clear scratch blockers; note `r_u` IS
+                    // eligible as an eviction target once `u` leaves `r_u`.
+                    clear_busy(&mut gpr_busy, r_u, u_vid);
+                    for ev in rc_scratch.iter().take(rc_scratch_count) {
+                        clear_busy(&mut gpr_busy, r_cand, ev.vid);
+                    }
+                    set_busy(&mut gpr_busy, r_cand, u_vid);
+
+                    let mut placed = 0usize;
+                    let mut all_evicted = true;
+                    for ev in rc_scratch.iter_mut().take(rc_scratch_count) {
+                        if let Some(r_evict) = find_evict_reg(
+                            &gpr_busy,
+                            ev.inst,
+                            ev.vid,
+                            r_cand,
+                            NO_REG,
+                            used_callee_gpr,
+                        ) {
+                            ev.to = r_evict;
+                            set_busy(&mut gpr_busy, r_evict, ev.vid);
+                            placed += 1;
+                        } else {
+                            all_evicted = false;
+                            break;
+                        }
+                    }
+
+                    // Restore `gpr_busy` bit-for-bit before evaluating remaining candidates.
+                    for ev in rc_scratch.iter().take(placed) {
+                        clear_busy(&mut gpr_busy, ev.to, ev.vid);
+                    }
+                    clear_busy(&mut gpr_busy, r_cand, u_vid);
+                    for ev in rc_scratch.iter().take(rc_scratch_count) {
+                        set_busy(&mut gpr_busy, r_cand, ev.vid);
+                    }
+                    set_busy(&mut gpr_busy, r_u, u_vid);
+
+                    if all_evicted {
+                        let mut act = RefineAction::EMPTY;
+                        act.push(GprMove {
+                            inst: u_inst,
+                            vid: u_vid,
+                            from: r_u,
+                            to: r_cand,
+                        });
+                        for &ev in rc_scratch.iter().take(rc_scratch_count) {
+                            act.push(ev);
+                        }
+                        best_gain = gain;
+                        best_action = Some(act);
+                    }
+                }
+            }
+
+            // If `u_inst` currently participates in an active parallel-copy 2-cycle swap, also
+            // consider any completely free already-paid GPR outside `cand_mask`: moving one side
+            // of a pinned 2-cycle swap to a free register eliminates the extra `X16` temp `mov`
+            // (3 -> 2 moves) with zero spills and zero callee-saved expansion.
+            if u_swap_before > 0 {
+                for &r_raw in CALLER_SAVED_GPR.iter().chain(callee_gpr_pool.iter()) {
+                    let r = reg_u8(r_raw);
+                    if r == r_u
+                        || r >= 32
+                        || (cand_mask & (1u32 << u32::from(r))) != 0
+                        || !is_paid_reg(r, used_callee_gpr)
+                        || !gpr_reg_safe(u_inst, r)
+                        || !is_free_in_busy(&gpr_busy, r, u_vid)
+                    {
+                        continue;
+                    }
+                    let swap_after = eval_single_swap(loc, u_inst, r);
+                    let after =
+                        node_move_cost(loc, u_inst, r, usize::MAX).saturating_add(swap_after);
+                    let gain = u_single_before.saturating_sub(after);
+                    if gain > best_gain {
+                        let mut act = RefineAction::EMPTY;
+                        act.push(GprMove {
+                            inst: u_inst,
+                            vid: u_vid,
+                            from: r_u,
+                            to: r,
+                        });
+                        best_gain = gain;
+                        best_action = Some(act);
+                    }
+                }
+            }
+
+            if let Some(action) = best_action {
+                // Transactional commit: remove all moved values from their old `gpr_busy` rows,
+                // verify every target row has 0 interference overlap before marking it busy, and
+                // roll back `gpr_busy` untouched without mutating `loc` if any check fails.
+                let count = action.len.min(MAX_ACTION_MOVES);
+                for mv in action.moves.iter().take(count) {
+                    clear_busy(&mut gpr_busy, mv.from, mv.vid);
+                }
+                let mut placed = 0usize;
+                let mut verified = true;
+                for mv in action.moves.iter().take(count) {
+                    if !is_free_in_busy(&gpr_busy, mv.to, mv.vid) {
+                        verified = false;
+                        break;
+                    }
+                    set_busy(&mut gpr_busy, mv.to, mv.vid);
+                    placed += 1;
+                }
+                if verified {
+                    for mv in action.moves.iter().take(count) {
+                        if let Some(slot) = loc.get_mut(mv.inst) {
+                            *slot = AllocLoc::Gpr(mv.to);
+                        }
+                    }
+                    round_changed = true;
+                    any_changed = true;
+                } else {
+                    for mv in action.moves.iter().take(placed) {
+                        clear_busy(&mut gpr_busy, mv.to, mv.vid);
+                    }
+                    for mv in action.moves.iter().take(count) {
+                        set_busy(&mut gpr_busy, mv.from, mv.vid);
+                    }
+                }
+            }
+        }
+
+        // Phase 2: bounded pairwise color-swap pass for colliding edge-group vregs.
+        // Catches any pair `(u, v)` (`u < v`) sharing an uncoalesced parallel-copy CFG edge group
+        // (e.g., `pos` holding `X4` while `word` arrives in `X4` and wants `X4` from `X20`),
+        // evaluating exact before-vs-after weighted move + parallel-copy swap + ABI cost via a
+        // temporary color swap so direct `(u, v)` edges are never double-counted.
+        if !valid_groups.is_empty() {
+            pair_raw.clear();
+            pair_cands.clear();
+            for &(s_u32, e_u32, _) in &valid_groups {
+                if pair_raw.len() >= MAX_PAIR_SWAP_RAW {
+                    break;
+                }
+                let Some(pairs) = coalesce_edges.get(idx(s_u32)..idx(e_u32)) else {
+                    continue;
+                };
+                for (i, &(a_i, p_i, w_i)) in pairs.iter().enumerate() {
+                    if a_i == p_i || w_i == 0 {
+                        continue;
+                    }
+                    let (Some(AllocLoc::Gpr(ra_i)), Some(AllocLoc::Gpr(rp_i))) = (
+                        loc.get(idx(a_i)).copied(),
+                        loc.get(idx(p_i)).copied(),
+                    ) else {
+                        continue;
+                    };
+                    if ra_i >= 32 || rp_i >= 32 {
+                        continue;
+                    }
+                    for &(a_j, p_j, w_j) in pairs.iter().skip(i + 1) {
+                        if a_j == p_j || w_j == 0 {
+                            continue;
+                        }
+                        let (Some(AllocLoc::Gpr(ra_j)), Some(AllocLoc::Gpr(rp_j))) = (
+                            loc.get(idx(a_j)).copied(),
+                            loc.get(idx(p_j)).copied(),
+                        ) else {
+                            continue;
+                        };
+                        if ra_j >= 32 || rp_j >= 32 {
+                            continue;
+                        }
+                        if ra_i == rp_i && ra_j == rp_j {
+                            continue;
+                        }
+                        let collides = rp_i == ra_j || rp_j == ra_i;
+                        let base_w = w_i.max(w_j);
+                        let prio_w = if collides {
+                            base_w.saturating_mul(2)
+                        } else {
+                            base_w
+                        };
+                        if rp_i != rp_j {
+                            push_pair_cand(&mut pair_raw, p_i, p_j, prio_w);
+                        }
+                        if ra_i != ra_j {
+                            push_pair_cand(&mut pair_raw, a_i, a_j, prio_w);
+                        }
+                        if collides {
+                            if ra_i != rp_j {
+                                push_pair_cand(&mut pair_raw, a_i, p_j, base_w);
+                            }
+                            if rp_i != ra_j {
+                                push_pair_cand(&mut pair_raw, p_i, a_j, base_w);
+                            }
+                        }
+                        if pair_raw.len() >= MAX_PAIR_SWAP_RAW {
+                            break;
+                        }
+                    }
+                    if pair_raw.len() >= MAX_PAIR_SWAP_RAW {
+                        break;
+                    }
+                }
+            }
+
+            if !pair_raw.is_empty() {
+                pair_raw.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for &(u, v, w) in &pair_raw {
+                    if let Some(last) = pair_cands.last_mut()
+                        && last.0 == u
+                        && last.1 == v
+                    {
+                        last.2 = last.2.saturating_add(w);
+                        continue;
+                    }
+                    pair_cands.push((u, v, w));
+                }
+                pair_cands.sort_unstable_by(|a, b| {
+                    b.2.cmp(&a.2)
+                        .then_with(|| a.0.cmp(&b.0))
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+
+                for &(u_u32, v_u32, _prio) in pair_cands.iter().take(MAX_PAIR_SWAP_CANDS) {
+                    let u_inst = idx(u_u32);
+                    let v_inst = idx(v_u32);
+                    if u_inst >= v_inst {
+                        continue;
+                    }
+                    let (Some(AllocLoc::Gpr(cu)), Some(AllocLoc::Gpr(cv))) = (
+                        loc.get(u_inst).copied(),
+                        loc.get(v_inst).copied(),
+                    ) else {
+                        continue;
+                    };
+                    if cu == cv || cu >= 32 || cv >= 32 {
+                        continue;
+                    }
+                    let u_vid_raw = val_id.get(u_inst).copied().unwrap_or(NO_VAL);
+                    let v_vid_raw = val_id.get(v_inst).copied().unwrap_or(NO_VAL);
+                    if u_vid_raw == NO_VAL || v_vid_raw == NO_VAL || u_vid_raw == v_vid_raw {
+                        continue;
+                    }
+                    if !gpr_reg_safe(u_inst, cv) || !gpr_reg_safe(v_inst, cu) {
+                        continue;
+                    }
+                    let u_vid = idx(u_vid_raw);
+                    let v_vid = idx(v_vid_raw);
+
+                    // Exact combined before-vs-after cost via temporary color swap.
+                    let (swap_before, swap_after) = eval_pair_swap(loc, u_inst, cv, v_inst, cu);
+                    let old_cost =
+                        pair_edge_and_abi_cost(loc, u_inst, v_inst).saturating_add(swap_before);
+                    if let Some(slot) = loc.get_mut(u_inst) {
+                        *slot = AllocLoc::Gpr(cv);
+                    }
+                    if let Some(slot) = loc.get_mut(v_inst) {
+                        *slot = AllocLoc::Gpr(cu);
+                    }
+                    let new_cost =
+                        pair_edge_and_abi_cost(loc, u_inst, v_inst).saturating_add(swap_after);
+                    if let Some(slot) = loc.get_mut(u_inst) {
+                        *slot = AllocLoc::Gpr(cu);
+                    }
+                    if let Some(slot) = loc.get_mut(v_inst) {
+                        *slot = AllocLoc::Gpr(cv);
+                    }
+                    if new_cost >= old_cost {
+                        continue;
+                    }
+
+                    // Verify interference legality against `gpr_busy` after temporarily vacating
+                    // `u` from `cu` and `v` from `cv` (so `w != v` in `interf[u]` cannot hold `cv`
+                    // and `w != u` in `interf[v]` cannot hold `cu`).
+                    clear_busy(&mut gpr_busy, cu, u_vid);
+                    clear_busy(&mut gpr_busy, cv, v_vid);
+                    if is_free_in_busy(&gpr_busy, cv, u_vid)
+                        && is_free_in_busy(&gpr_busy, cu, v_vid)
+                    {
+                        set_busy(&mut gpr_busy, cv, u_vid);
+                        set_busy(&mut gpr_busy, cu, v_vid);
+                        if let Some(slot) = loc.get_mut(u_inst) {
+                            *slot = AllocLoc::Gpr(cv);
+                        }
+                        if let Some(slot) = loc.get_mut(v_inst) {
+                            *slot = AllocLoc::Gpr(cu);
+                        }
+                        round_changed = true;
+                        any_changed = true;
+                        continue;
+                    }
+
+                    // Otherwise allow evicting up to `MAX_SCRATCH_EVICTS` zero-affinity scratch
+                    // blockers per side into free paid GPRs (excluding `cu` and `cv`).
+                    let mut evicts = [GprMove::EMPTY; MAX_TOTAL_SCRATCH_EVICTS];
+                    let mut evict_count = 0usize;
+                    let mut evict_ok = true;
+                    let cv_base = usize::from(cv).saturating_mul(val_words);
+                    let u_base = u_vid.saturating_mul(val_words);
+                    let mut cv_count = 0usize;
+                    for w in 0..val_words {
+                        let mut bits = gpr_busy.get(cv_base + w).copied().unwrap_or(0)
+                            & interf.get(u_base + w).copied().unwrap_or(0);
+                        while bits != 0 {
+                            if cv_count >= MAX_SCRATCH_EVICTS {
+                                evict_ok = false;
+                                break;
+                            }
+                            let b_vid = w.saturating_mul(64) + idx(bits.trailing_zeros());
+                            bits &= bits - 1;
+                            let Some(&b_inst) = val_inst.get(b_vid) else {
+                                evict_ok = false;
+                                break;
+                            };
+                            if b_inst == u_inst
+                                || b_inst == v_inst
+                                || !is_zero_affinity_scratch(loc, b_inst, cv)
+                            {
+                                evict_ok = false;
+                                break;
+                            }
+                            if let Some(slot) = evicts.get_mut(evict_count) {
+                                *slot = GprMove {
+                                    inst: b_inst,
+                                    vid: b_vid,
+                                    from: cv,
+                                    to: NO_REG,
+                                };
+                            }
+                            evict_count += 1;
+                            cv_count += 1;
+                        }
+                        if !evict_ok {
+                            break;
+                        }
+                    }
+
+                    if evict_ok {
+                        let cu_base = usize::from(cu).saturating_mul(val_words);
+                        let v_base = v_vid.saturating_mul(val_words);
+                        let mut cu_count = 0usize;
+                        for w in 0..val_words {
+                            let mut bits = gpr_busy.get(cu_base + w).copied().unwrap_or(0)
+                                & interf.get(v_base + w).copied().unwrap_or(0);
+                            while bits != 0 {
+                                if cu_count >= MAX_SCRATCH_EVICTS {
+                                    evict_ok = false;
+                                    break;
+                                }
+                                let b_vid = w.saturating_mul(64) + idx(bits.trailing_zeros());
+                                bits &= bits - 1;
+                                let Some(&b_inst) = val_inst.get(b_vid) else {
+                                    evict_ok = false;
+                                    break;
+                                };
+                                if b_inst == u_inst
+                                    || b_inst == v_inst
+                                    || !is_zero_affinity_scratch(loc, b_inst, cu)
+                                {
+                                    evict_ok = false;
+                                    break;
+                                }
+                                if let Some(slot) = evicts.get_mut(evict_count) {
+                                    *slot = GprMove {
+                                        inst: b_inst,
+                                        vid: b_vid,
+                                        from: cu,
+                                        to: NO_REG,
+                                    };
+                                }
+                                evict_count += 1;
+                                cu_count += 1;
+                            }
+                            if !evict_ok {
+                                break;
+                            }
+                        }
+                    }
+
+                    if evict_ok && evict_count > 0 {
+                        for ev in evicts.iter().take(evict_count) {
+                            clear_busy(&mut gpr_busy, ev.from, ev.vid);
+                        }
+                        if is_free_in_busy(&gpr_busy, cv, u_vid)
+                            && is_free_in_busy(&gpr_busy, cu, v_vid)
+                        {
+                            set_busy(&mut gpr_busy, cv, u_vid);
+                            set_busy(&mut gpr_busy, cu, v_vid);
+                            let mut placed = 0usize;
+                            let mut all_evicted = true;
+                            for ev in evicts.iter_mut().take(evict_count) {
+                                if let Some(r_evict) = find_evict_reg(
+                                    &gpr_busy,
+                                    ev.inst,
+                                    ev.vid,
+                                    cv,
+                                    cu,
+                                    used_callee_gpr,
+                                ) {
+                                    ev.to = r_evict;
+                                    set_busy(&mut gpr_busy, r_evict, ev.vid);
+                                    placed += 1;
+                                } else {
+                                    all_evicted = false;
+                                    break;
+                                }
+                            }
+                            if all_evicted {
+                                if let Some(slot) = loc.get_mut(u_inst) {
+                                    *slot = AllocLoc::Gpr(cv);
+                                }
+                                if let Some(slot) = loc.get_mut(v_inst) {
+                                    *slot = AllocLoc::Gpr(cu);
+                                }
+                                for ev in evicts.iter().take(evict_count) {
+                                    if let Some(slot) = loc.get_mut(ev.inst) {
+                                        *slot = AllocLoc::Gpr(ev.to);
+                                    }
+                                }
+                                round_changed = true;
+                                any_changed = true;
+                            } else {
+                                for ev in evicts.iter().take(placed) {
+                                    clear_busy(&mut gpr_busy, ev.to, ev.vid);
+                                }
+                                clear_busy(&mut gpr_busy, cv, u_vid);
+                                clear_busy(&mut gpr_busy, cu, v_vid);
+                                for ev in evicts.iter().take(evict_count) {
+                                    set_busy(&mut gpr_busy, ev.from, ev.vid);
+                                }
+                                set_busy(&mut gpr_busy, cu, u_vid);
+                                set_busy(&mut gpr_busy, cv, v_vid);
+                            }
+                        } else {
+                            for ev in evicts.iter().take(evict_count) {
+                                set_busy(&mut gpr_busy, ev.from, ev.vid);
+                            }
+                            set_busy(&mut gpr_busy, cu, u_vid);
+                            set_busy(&mut gpr_busy, cv, v_vid);
+                        }
+                    } else {
+                        set_busy(&mut gpr_busy, cu, u_vid);
+                        set_busy(&mut gpr_busy, cv, v_vid);
+                    }
+                }
+            }
+        }
+        if !round_changed {
+            break;
+        }
+    }
+
+    if any_changed {
+        *used_callee_gpr = [false; 32];
+        for &l in loc.iter() {
+            match l {
+                AllocLoc::Gpr(r) => {
+                    let ru = u32::from(r);
+                    if is_tracked_callee_gpr(ru) {
+                        if let Some(slot) = used_callee_gpr.get_mut(usize::from(r)) {
+                            *slot = true;
+                        }
+                    }
+                }
+                AllocLoc::GprPair(lo, hi) => {
+                    for r in [lo, hi] {
+                        let ru = u32::from(r);
+                        if is_tracked_callee_gpr(ru) {
+                            if let Some(slot) = used_callee_gpr.get_mut(usize::from(r)) {
+                                *slot = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    any_changed
+}
+
 /// Exact-CFG backward liveness + symmetric SSA interference bitmatrix allocator with
 /// call-crossing 1-inst constant rematerialization (`AllocLoc::RematConst`), cold-only
 /// global/func address rematerialization (`AllocLoc::RematGlobal`), and aggressive
@@ -1767,6 +3479,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     call_clobbers: impl Fn(usize) -> CallClobbers,
     caller_gpr_order: &[Reg; 16],
     caller_fp_order: &[Reg; 21],
+    layout: Option<&super::layout::BlockLayout<'_>>,
     alloc: A,
 ) -> Result<Allocation<A>, RegAllocError> {
     let len = view.len();
@@ -2087,11 +3800,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                 }
                 // Only values genuinely live AFTER this clobbering call in the CFG cross it!
                 if is_clobbering_call.get(inst).copied().unwrap_or(false) {
-                    let clob = if matches!(view.op(inst), Op::Invoke | Op::InvokeIndirect) {
-                        CallClobbers::C_ABI_ARM64
-                    } else {
-                        call_clobbers(inst)
-                    };
+                    let clob = effective_call_clobbers(view, inst, call_clobbers(inst));
                     for w in 0..val_words {
                         let mut lw = live.get(w).copied().unwrap_or(0);
                         while lw != 0 {
@@ -2212,88 +3921,185 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
 
     seed_abi_and_return_hints(view, alias_of, os, &mut hint);
 
-    for b in 0..blocks {
-        let term = view.terminator(Block(u32_of(b)));
-        if view.op(term) == Op::Return {
-            continue;
-        }
-        let b_depth = block_depth.get(b).copied().unwrap_or(0);
-        let b_rpo = rpo_idx.get(b).copied().unwrap_or(0);
-        for_each_edge(view, term, |target_block, args_start, args_len| {
-            let target_params = view.params(Block(target_block));
-            let n = args_len.min(target_params.len());
-            let is_back = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks) <= b_rpo;
-            let edge_prio = if is_back { b_depth.saturating_add(2) } else { 1 };
-            if let Some(args) = view.extra.get(args_start..args_start + n) {
-                for (k, &arg_raw) in args.iter().enumerate() {
-                    let p = target_params.start + k;
-                    let arg = resolve_alias(alias_of, idx(arg_raw));
-                    if arg >= len
-                        || p >= len
-                        || arg == p
-                        || pre_remat.get(arg).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
-                        || pre_remat.get(p).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
-                    {
-                        continue;
+    // Compact symmetric per-value phi-copy affinity CSR (`phi_adj_off`, `phi_adj`), coalescable
+    // edge cost list (`coalesce_edges`), and per-CFG-edge parallel-copy ranges (`edge_groups`)
+    // for bidirectional multi-edge coalescing, immediate joint co-coloring, and cycle-swap cost
+    // modeling.
+    let mut coalesce_edges: Vec<(u32, u32, u64), A> = Vec::new_in(alloc);
+    let mut edge_groups: Vec<(u32, u32), A> = Vec::new_in(alloc);
+    let (phi_adj_off, phi_adj) = {
+        let mut phi_raw: Vec<(u32, u32, u32, u32), A> = Vec::new_in(alloc);
+        for b in 0..blocks {
+            let term = view.terminator(Block(u32_of(b)));
+            if view.op(term) == Op::Return {
+                continue;
+            }
+            let b_depth = block_depth.get(b).copied().unwrap_or(0);
+            let b_rpo = rpo_idx.get(b).copied().unwrap_or(0);
+            let b_rpo_u32 = u32_of(b_rpo);
+            for_each_edge(view, term, |target_block, args_start, args_len| {
+                let target_params = view.params(Block(target_block));
+                let n = args_len.min(target_params.len());
+                let is_back = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks) <= b_rpo;
+                let target_cold = if let Some(bl) = layout {
+                    bl.is_cold.get(idx(target_block)).copied().unwrap_or(false)
+                } else {
+                    is_cold_block.get(idx(target_block)).copied().unwrap_or(false)
+                };
+                let eff_depth = if target_cold && !is_back { 0 } else { b_depth };
+                let depth_prio = eff_depth.saturating_add(1).min(FWD_EDGE_PRIO_MAX);
+                let edge_prio = if is_back { BACK_EDGE_PRIO_BIT | depth_prio } else { depth_prio };
+                let fallback_weight = (1u64 << eff_depth.min(3).saturating_mul(7))
+                    .saturating_mul(if is_back { 2 } else { 1 });
+                let edge_weight = if let Some(bl) = layout {
+                    let solved_w = bl
+                        .edge_weight_between(b, idx(target_block))
+                        .min(MAX_EDGE_WEIGHT);
+                    if solved_w > 0 {
+                        solved_w.saturating_mul(if is_back { 2 } else { 1 })
+                    } else {
+                        fallback_weight
                     }
-                    let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
-                    let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
-                    let bank = reg_bank(view, arg_ty);
-                    if bank == 0 || bank != reg_bank(view, p_ty) {
-                        continue;
-                    }
-                    if vals_interfere(arg, p) {
-                        continue;
-                    }
-                    if arg > p {
-                        let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
-                        let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
-                        if cur == u32::MAX || edge_prio > cur_prio {
-                            if let Some(slot) = phi_partner.get_mut(arg) {
-                                *slot = u32_of(p);
-                            }
-                            if let Some(pslot) = phi_prio.get_mut(arg) {
-                                *pslot = edge_prio;
-                            }
-                            if is_back
-                                && !skip_alloc.get(arg).copied().unwrap_or(false)
-                                && remat_val.get(arg).copied().flatten().is_none()
-                                && !matches!(view.op(arg), Op::DataAddr | Op::FuncAddr)
-                            {
-                                if let Some(bslot) = is_back_phi_arg.get_mut(arg) {
-                                    *bslot = true;
-                                }
-                                let cur_bp = back_partner_of.get(p).copied().unwrap_or(u32::MAX);
-                                let cur_bp_prio = back_partner_prio.get(p).copied().unwrap_or(0);
-                                if cur_bp == u32::MAX || edge_prio > cur_bp_prio {
-                                    if let Some(bpslot) = back_partner_of.get_mut(p) {
-                                        *bpslot = u32_of(arg);
-                                    }
-                                    if let Some(bppslot) = back_partner_prio.get_mut(p) {
-                                        *bppslot = edge_prio;
-                                    }
-                                }
-                            }
+                } else {
+                    fallback_weight
+                };
+                let group_start = coalesce_edges.len();
+                if let Some(args) = view.extra.get(args_start..args_start + n) {
+                    for (k, &arg_raw) in args.iter().enumerate() {
+                        let p = target_params.start + k;
+                        let arg = resolve_alias(alias_of, idx(arg_raw));
+                        if arg >= len
+                            || p >= len
+                            || arg == p
+                            || pre_remat.get(arg).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
+                            || pre_remat.get(p).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
+                        {
+                            continue;
                         }
-                    } else if remat_val.get(arg).copied().flatten().is_none()
-                        && (!val_crosses_call.get(p).copied().unwrap_or(false)
-                            || val_crosses_call.get(arg).copied().unwrap_or(false))
-                    {
-                        let cur = phi_partner.get(p).copied().unwrap_or(u32::MAX);
-                        let cur_prio = phi_prio.get(p).copied().unwrap_or(0);
-                        if cur == u32::MAX || edge_prio > cur_prio {
-                            if let Some(slot) = phi_partner.get_mut(p) {
-                                *slot = u32_of(arg);
+                        let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
+                        let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
+                        let bank = reg_bank(view, arg_ty);
+                        if bank == 0 || bank != reg_bank(view, p_ty) {
+                            continue;
+                        }
+                        if vals_interfere(arg, p) {
+                            continue;
+                        }
+                        let arg_u32 = u32_of(arg);
+                        let p_u32 = u32_of(p);
+                        if !skip_alloc.get(arg).copied().unwrap_or(false)
+                            && !skip_alloc.get(p).copied().unwrap_or(false)
+                            && val_id.get(arg).copied().unwrap_or(NO_VAL) != NO_VAL
+                            && val_id.get(p).copied().unwrap_or(NO_VAL) != NO_VAL
+                        {
+                            phi_raw.push((arg_u32, p_u32, edge_prio, b_rpo_u32));
+                            phi_raw.push((p_u32, arg_u32, edge_prio, b_rpo_u32));
+                            coalesce_edges.push((arg_u32, p_u32, edge_weight));
+                        }
+                        if arg > p {
+                            let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
+                            let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
+                            if cur == u32::MAX || edge_prio > cur_prio {
+                                if let Some(slot) = phi_partner.get_mut(arg) {
+                                    *slot = p_u32;
+                                }
+                                if let Some(pslot) = phi_prio.get_mut(arg) {
+                                    *pslot = edge_prio;
+                                }
+                                if is_back
+                                    && !skip_alloc.get(arg).copied().unwrap_or(false)
+                                    && remat_val.get(arg).copied().flatten().is_none()
+                                    && !matches!(view.op(arg), Op::DataAddr | Op::FuncAddr)
+                                {
+                                    if let Some(bslot) = is_back_phi_arg.get_mut(arg) {
+                                        *bslot = true;
+                                    }
+                                    let cur_bp = back_partner_of.get(p).copied().unwrap_or(u32::MAX);
+                                    let cur_bp_prio = back_partner_prio.get(p).copied().unwrap_or(0);
+                                    if cur_bp == u32::MAX || edge_prio > cur_bp_prio {
+                                        if let Some(bpslot) = back_partner_of.get_mut(p) {
+                                            *bpslot = arg_u32;
+                                        }
+                                        if let Some(bppslot) = back_partner_prio.get_mut(p) {
+                                            *bppslot = edge_prio;
+                                        }
+                                    }
+                                }
                             }
-                            if let Some(pslot) = phi_prio.get_mut(p) {
-                                *pslot = edge_prio;
+                        } else if remat_val.get(arg).copied().flatten().is_none()
+                            && (!val_crosses_call.get(p).copied().unwrap_or(false)
+                                || val_crosses_call.get(arg).copied().unwrap_or(false))
+                        {
+                            let cur = phi_partner.get(p).copied().unwrap_or(u32::MAX);
+                            let cur_prio = phi_prio.get(p).copied().unwrap_or(0);
+                            if cur == arg_u32 {
+                                if let Some(pslot) = phi_prio.get_mut(p) {
+                                    *pslot = merge_phi_prio(cur_prio, edge_prio);
+                                }
+                            } else if cur == u32::MAX || edge_prio > cur_prio {
+                                if let Some(slot) = phi_partner.get_mut(p) {
+                                    *slot = arg_u32;
+                                }
+                                if let Some(pslot) = phi_prio.get_mut(p) {
+                                    *pslot = edge_prio;
+                                }
                             }
                         }
                     }
                 }
+                let group_end = coalesce_edges.len();
+                let group_len = group_end.saturating_sub(group_start);
+                if (2..=MAX_PARALLEL_COPY_GROUP).contains(&group_len)
+                    && edge_groups.len() < MAX_EDGE_GROUPS
+                {
+                    edge_groups.push((u32_of(group_start), u32_of(group_end)));
+                }
+            });
+        }
+
+        // Deduplicate & accumulate priorities per `(src, dst)` pair, keeping earliest edge RPO,
+        // then sort each node's neighbors by descending priority, ascending edge RPO (favoring
+        // earlier branches such as Position 0 over Position 1 at equal loop depth), and
+        // deterministic ascending `neighbor_inst` tie-break.
+        phi_raw.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut phi_dedup: Vec<(u32, u32, u32, u32), A> = Vec::with_capacity_in(phi_raw.len(), alloc);
+        for &(u, v, prio, edge_rpo) in &phi_raw {
+            if let Some(last) = phi_dedup.last_mut()
+                && last.0 == u
+                && last.1 == v
+            {
+                last.2 = merge_phi_prio(last.2, prio);
+                if edge_rpo < last.3 {
+                    last.3 = edge_rpo;
+                }
+                continue;
             }
+            phi_dedup.push((u, v, prio, edge_rpo));
+        }
+        phi_dedup.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.1.cmp(&b.1))
         });
-    }
+
+        let mut off: Vec<u32, A> = Vec::with_capacity_in(len + 1, alloc);
+        let mut adj: Vec<(u32, u32), A> = Vec::with_capacity_in(phi_dedup.len(), alloc);
+        let mut cur_idx = 0usize;
+        for u in 0..len {
+            off.push(u32_of(adj.len()));
+            let u_u32 = u32_of(u);
+            while let Some(&(src, dst, prio, _)) = phi_dedup.get(cur_idx) {
+                if src != u_u32 {
+                    break;
+                }
+                adj.push((dst, prio));
+                cur_idx += 1;
+            }
+        }
+        off.push(u32_of(adj.len()));
+        (off, adj)
+    };
 
     // Propagate loop back-edge `phi_partner` backward through in-place accumulator chains.
     for inst in (0..len).rev() {
@@ -2412,9 +4218,60 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     }
 
     let allow_lr = call_positions.is_empty();
-    let callee_gpr_pool = if allow_lr { CALLEE_SAVED_GPR_WITH_LR } else { CALLEE_SAVED_GPR };
+    let allow_fp = can_use_fp_as_gpr(view, allow_lr);
+    let callee_gpr_pool = if allow_lr && allow_fp {
+        CALLEE_SAVED_GPR_WITH_LR_FP
+    } else if allow_lr {
+        CALLEE_SAVED_GPR_WITH_LR
+    } else {
+        CALLEE_SAVED_GPR
+    };
 
-    let run_coloring = |order: &[Candidate]| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
+    #[derive(Clone, Copy)]
+    struct CoColorPartner {
+        inst: usize,
+        vid: usize,
+        crosses_call: bool,
+        clobbers: CallClobbers,
+        prio: u32,
+    }
+
+    struct ColoringResult<A: Allocator> {
+        loc: Vec<AllocLoc, A>,
+        used_callee_gpr: [bool; 32],
+        used_callee_fp: [bool; 32],
+        num_spill_slots: u32,
+        remat_count: u32,
+        spill_cost: u64,
+        move_cost: u64,
+    }
+
+    let adj_slice = |u: usize| -> &[(u32, u32)] {
+        let start = phi_adj_off.get(u).copied().map_or(0, idx);
+        let end = phi_adj_off.get(u + 1).copied().map_or(start, idx);
+        phi_adj.get(start..end).unwrap_or(&[])
+    };
+
+    // Precompute bitmask of scalar GPR values with at least one `phi_adj` coalescing partner so
+    // `run_coloring` can compute anti-hint `avoid_mask` in O(words) via `interf[vid] & val_has_phi_adj`.
+    let mut val_has_phi_adj: Vec<u64, A> = Vec::with_capacity_in(val_words, alloc);
+    for _ in 0..val_words {
+        val_has_phi_adj.push(0);
+    }
+    let mut has_any_gpr_phi_adj = false;
+    for (u_vid, &u_inst) in val_inst.iter().enumerate() {
+        if !adj_slice(u_inst).is_empty() {
+            let u_ty = view.tys.get(u_inst).copied().map_or(Ty::NONE, Ty);
+            if reg_bank(view, u_ty) == 3
+                && let Some(slot) = val_has_phi_adj.get_mut(u_vid >> 6)
+            {
+                *slot |= 1u64 << (u_vid & 63);
+                has_any_gpr_phi_adj = true;
+            }
+        }
+    }
+
+    let run_coloring = |order: &[Candidate]| -> Result<ColoringResult<A>, RegAllocError> {
         let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
         for &loc in &pre_remat {
             loc_try.push(loc);
@@ -2450,6 +4307,62 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
             if let Some(slot) = busy.get_mut(off) {
                 *slot |= 1u64 << (vid & 63);
             }
+        };
+        // Anti-hinting: collect GPRs wanted by uncolored interfering `phi_adj` values so an
+        // unhinted fallback pool scan avoids stealing a partner's register and forcing an edge mov.
+        let compute_avoid_mask = |loc_try: &[AllocLoc], target_vid: usize| -> u32 {
+            if !has_any_gpr_phi_adj {
+                return 0;
+            }
+            let mut avoid_mask = 0u32;
+            let mut checked = 0u32;
+            let v_base = target_vid.saturating_mul(val_words);
+            for w in 0..val_words {
+                let mut bits = interf.get(v_base + w).copied().unwrap_or(0)
+                    & val_has_phi_adj.get(w).copied().unwrap_or(0);
+                while bits != 0 {
+                    let tz = idx(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let u_vid = w.saturating_mul(64) + tz;
+                    let Some(&u_inst) = val_inst.get(u_vid) else {
+                        continue;
+                    };
+                    if loc_try.get(u_inst).copied().unwrap_or(AllocLoc::None) != AllocLoc::None {
+                        continue;
+                    }
+                    let u_crosses_call = val_crosses_call.get(u_inst).copied().unwrap_or(false);
+                    let u_clobbers = if u_crosses_call {
+                        val_crossed_clobbers
+                            .get(u_inst)
+                            .copied()
+                            .unwrap_or(CallClobbers::EMPTY)
+                    } else {
+                        CallClobbers::EMPTY
+                    };
+                    for &(partner, _prio) in adj_slice(u_inst).iter().take(2) {
+                        let p_inst = idx(partner);
+                        let wanted = match loc_try.get(p_inst).copied() {
+                            Some(AllocLoc::Gpr(r)) if r < 32 => r,
+                            Some(AllocLoc::None) | None => {
+                                hint.get(p_inst).copied().unwrap_or(NO_REG)
+                            }
+                            _ => NO_REG,
+                        };
+                        if wanted < 32
+                            && (!u_crosses_call
+                                || (19..=28).contains(&wanted)
+                                || !u_clobbers.clobbers_gpr(wanted))
+                        {
+                            avoid_mask |= 1u32 << u32::from(wanted);
+                        }
+                    }
+                    checked += 1;
+                    if checked >= 32 {
+                        return avoid_mask;
+                    }
+                }
+            }
+            avoid_mask
         };
         let mut spill_busy: Vec<u64, A> = Vec::new_in(alloc);
         let mut used_callee_gpr = [false; 32];
@@ -2488,9 +4401,13 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
 
         for cand in order {
             let inst = cand.inst;
+            if loc_try.get(inst).copied().unwrap_or(AllocLoc::None) != AllocLoc::None {
+                continue;
+            }
             let vid = cand.vid;
             let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
             let bank = reg_bank(view, ty);
+            let adj = adj_slice(inst);
 
             let partner = phi_partner.get(inst).copied().unwrap_or(u32::MAX);
             let primary_hint = if partner != u32::MAX {
@@ -2533,12 +4450,12 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     }
                     mark_reg_busy(&mut gpr_busy, idx(lo), vid);
                     mark_reg_busy(&mut gpr_busy, idx(hi), vid);
-                    if (X19..=X28).contains(&lo) || lo == X30 {
+                    if is_tracked_callee_gpr(lo) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(lo)) {
                             *u = true;
                         }
                     }
-                    if (X19..=X28).contains(&hi) || hi == X30 {
+                    if is_tracked_callee_gpr(hi) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(hi)) {
                             *u = true;
                         }
@@ -2571,7 +4488,12 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     }
                     None
                 };
-                let chosen = try_vec(primary_hint)
+                let adj_vec = adj.iter().find_map(|&(nb, _)| match loc_try.get(idx(nb)).copied() {
+                    Some(AllocLoc::Vec(r)) => try_vec(r),
+                    _ => None,
+                });
+                let chosen = adj_vec
+                    .or_else(|| try_vec(primary_hint))
                     .or_else(|| try_vec(secondary_hint))
                     .or_else(|| {
                         let (avoid0, avoid1) = vec_fma_avoid_regs(view, skip_alloc, &loc_try, inst);
@@ -2641,7 +4563,12 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                         None
                     }
                 };
-                let chosen = try_fp(primary_hint)
+                let adj_fp = adj.iter().find_map(|&(nb, _)| match loc_try.get(idx(nb)).copied() {
+                    Some(AllocLoc::Fp(r)) => try_fp(r),
+                    _ => None,
+                });
+                let chosen = adj_fp
+                    .or_else(|| try_fp(primary_hint))
                     .or_else(|| try_fp(secondary_hint))
                     .or_else(|| try_fp(extract_lane0_hint))
                     .or_else(|| {
@@ -2693,27 +4620,10 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     None
                 }
                 .unwrap_or(NO_REG);
-                let bp_raw = back_partner_of.get(inst).copied().unwrap_or(u32::MAX);
-                let bp_info = if bp_raw != u32::MAX {
-                    let bpi = idx(bp_raw);
-                    let bp_uncolored = loc_try.get(bpi).copied().unwrap_or(AllocLoc::None) == AllocLoc::None;
-                    let bp_vid_raw = val_id.get(bpi).copied().unwrap_or(NO_VAL);
-                    if bp_uncolored && bp_vid_raw != NO_VAL {
-                        let bp_crosses = val_crosses_call.get(bpi).copied().unwrap_or(false);
-                        let bp_clobbers = val_crossed_clobbers
-                            .get(bpi)
-                            .copied()
-                            .unwrap_or(CallClobbers::EMPTY);
-                        Some((idx(bp_vid_raw), bp_crosses, bp_clobbers))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
                 let try_gpr = |h: u8| -> Option<Reg> {
                     if h != NO_REG
                         && (u32::from(h) != X30 || allow_lr)
+                        && (u32::from(h) != FP || allow_fp)
                         && gpr_safe(u32::from(h))
                         && is_reg_free(&gpr_busy, usize::from(h), vid)
                     {
@@ -2722,49 +4632,159 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                         None
                     }
                 };
-                let joint_chosen = if let Some((bp_vid, bp_crosses, bp_clobbers)) = bp_info {
+                let best_colored = adj.iter().find_map(|&(nb, prio)| match loc_try.get(idx(nb)).copied() {
+                    Some(AllocLoc::Gpr(r)) => try_gpr(r).map(|reg| (reg, prio)),
+                    _ => None,
+                });
+                let can_cocolor_gpr = |bpi: usize, prio: u32| -> Option<CoColorPartner> {
+                    if bpi == inst || bpi >= len {
+                        return None;
+                    }
+                    if loc_try.get(bpi).copied().unwrap_or(AllocLoc::None) != AllocLoc::None {
+                        return None;
+                    }
+                    if skip_alloc.get(bpi).copied().unwrap_or(false)
+                        || remat_val.get(bpi).copied().flatten().is_some()
+                        || matches!(view.op(bpi), Op::DataAddr | Op::FuncAddr)
+                    {
+                        return None;
+                    }
+                    let bp_vid_raw = val_id.get(bpi).copied().unwrap_or(NO_VAL);
+                    if bp_vid_raw == NO_VAL {
+                        return None;
+                    }
+                    let bp_ty = view.tys.get(bpi).copied().map_or(Ty::NONE, Ty);
+                    if reg_bank(view, bp_ty) != 3 || is_gpr_pair_ty(view, bp_ty) {
+                        return None;
+                    }
+                    if vals_interfere(inst, bpi) {
+                        return None;
+                    }
+                    let crosses_call = val_crosses_call.get(bpi).copied().unwrap_or(false);
+                    let clobbers = val_crossed_clobbers
+                        .get(bpi)
+                        .copied()
+                        .unwrap_or(CallClobbers::EMPTY);
+                    Some(CoColorPartner {
+                        inst: bpi,
+                        vid: idx(bp_vid_raw),
+                        crosses_call,
+                        clobbers,
+                        prio,
+                    })
+                };
+                // Pick the highest-priority uncolored non-interfering GPR partner from
+                // `back_partner_of` or loop/back-edge `phi_adj` (`prio >= 2`, which covers both
+                // back-edges with `BACK_EDGE_PRIO_BIT` and forward edges inside loops, while
+                // keeping single depth-0 edges out of joint co-coloring).
+                let mut bp_cand: Option<CoColorPartner> = None;
+                let bp_raw = back_partner_of.get(inst).copied().unwrap_or(u32::MAX);
+                if bp_raw != u32::MAX {
+                    let prio = back_partner_prio
+                        .get(inst)
+                        .copied()
+                        .unwrap_or(BACK_EDGE_PRIO_BIT);
+                    bp_cand = can_cocolor_gpr(idx(bp_raw), prio);
+                }
+                for &(nb, prio) in adj {
+                    if prio < 2 {
+                        break;
+                    }
+                    if bp_cand.is_some_and(|cur| prio <= cur.prio) {
+                        break;
+                    }
+                    if let Some(partner) = can_cocolor_gpr(idx(nb), prio) {
+                        bp_cand = Some(partner);
+                        break;
+                    }
+                }
+                let joint_chosen: Option<(Reg, (usize, usize))> = if let Some(bp) = bp_cand {
                     let bp_safe = |r: Reg| -> bool {
-                        !bp_crosses || (X19..=X28).contains(&r) || !bp_clobbers.clobbers_gpr(reg_u8(r))
+                        !bp.crosses_call
+                            || (X19..=X28).contains(&r)
+                            || !bp.clobbers.clobbers_gpr(reg_u8(r))
                     };
                     let try_gpr_joint = |h: u8| -> Option<Reg> {
                         let r = try_gpr(h)?;
-                        (bp_safe(r) && is_reg_free(&gpr_busy, idx(r), bp_vid)).then_some(r)
+                        (bp_safe(r) && is_reg_free(&gpr_busy, idx(r), bp.vid)).then_some(r)
                     };
-                    try_gpr_joint(primary_hint)
-                        .or_else(|| try_gpr_joint(secondary_hint))
-                        .or_else(|| try_gpr_joint(pair_trunc_hint))
-                        .or_else(|| {
-                            caller_gpr_order
-                                .iter()
-                                .copied()
-                                .chain(callee_gpr_pool.iter().copied())
-                                .find(|&r| {
-                                    gpr_safe(r)
-                                        && bp_safe(r)
-                                        && is_reg_free(&gpr_busy, idx(r), vid)
-                                        && is_reg_free(&gpr_busy, idx(r), bp_vid)
+                    let pool_joint = || -> Option<Reg> {
+                        let avoid_mask = compute_avoid_mask(&loc_try, vid)
+                            | compute_avoid_mask(&loc_try, bp.vid);
+                        pick_gpr_from_pool(
+                            caller_gpr_order,
+                            callee_gpr_pool,
+                            &used_callee_gpr,
+                            avoid_mask,
+                            |r| {
+                                gpr_safe(r)
+                                    && bp_safe(r)
+                                    && is_reg_free(&gpr_busy, idx(r), vid)
+                                    && is_reg_free(&gpr_busy, idx(r), bp.vid)
+                            },
+                        )
+                    };
+                    let reg = if let Some((colored_reg, colored_prio)) = best_colored {
+                        if colored_prio > bp.prio {
+                            // A higher-priority partner is already colored: co-color `bp`
+                            // only if that register is also safe & free for `bp`.
+                            try_gpr_joint(reg_u8(colored_reg))
+                        } else {
+                            adj.iter()
+                                .find_map(|&(nb, _)| match loc_try.get(idx(nb)).copied() {
+                                    Some(AllocLoc::Gpr(hr)) => try_gpr_joint(hr),
+                                    _ => None,
                                 })
-                        })
+                                .or_else(|| try_gpr_joint(primary_hint))
+                                .or_else(|| try_gpr_joint(secondary_hint))
+                                .or_else(|| try_gpr_joint(pair_trunc_hint))
+                                .or_else(pool_joint)
+                        }
+                    } else {
+                        try_gpr_joint(primary_hint)
+                            .or_else(|| try_gpr_joint(secondary_hint))
+                            .or_else(|| try_gpr_joint(pair_trunc_hint))
+                            .or_else(pool_joint)
+                    };
+                    reg.map(|r| (r, (bp.inst, bp.vid)))
                 } else {
                     None
                 };
-                let chosen = joint_chosen
-                    .or_else(|| try_gpr(primary_hint))
-                    .or_else(|| try_gpr(secondary_hint))
-                    .or_else(|| try_gpr(pair_trunc_hint))
-                    .or_else(|| {
-                        caller_gpr_order
-                            .iter()
-                            .copied()
-                            .chain(callee_gpr_pool.iter().copied())
-                            .find(|&r| gpr_safe(r) && is_reg_free(&gpr_busy, idx(r), vid))
-                    });
+                let (chosen, cocolor_bp) = if let Some((reg, bp_pair)) = joint_chosen {
+                    (Some(reg), Some(bp_pair))
+                } else {
+                    let reg = best_colored
+                        .map(|(r, _)| r)
+                        .or_else(|| try_gpr(primary_hint))
+                        .or_else(|| try_gpr(secondary_hint))
+                        .or_else(|| try_gpr(pair_trunc_hint))
+                        .or_else(|| {
+                            let avoid_mask = compute_avoid_mask(&loc_try, vid);
+                            pick_gpr_from_pool(
+                                caller_gpr_order,
+                                callee_gpr_pool,
+                                &used_callee_gpr,
+                                avoid_mask,
+                                |r| gpr_safe(r) && is_reg_free(&gpr_busy, idx(r), vid),
+                            )
+                        });
+                    (reg, None)
+                };
                 if let Some(reg) = chosen {
+                    let reg_byte = reg_u8(reg);
                     if let Some(slot) = loc_try.get_mut(inst) {
-                        *slot = AllocLoc::Gpr(reg_u8(reg));
+                        *slot = AllocLoc::Gpr(reg_byte);
                     }
                     mark_reg_busy(&mut gpr_busy, idx(reg), vid);
-                    if (X19..=X28).contains(&reg) || reg == X30 {
+                    // Immediately lock the co-colored partner into `reg` in the order-independent
+                    // interference bitmatrix so intervening temps cannot steal `reg`.
+                    if let Some((bpi, bp_vid)) = cocolor_bp {
+                        if let Some(bp_slot) = loc_try.get_mut(bpi) {
+                            *bp_slot = AllocLoc::Gpr(reg_byte);
+                        }
+                        mark_reg_busy(&mut gpr_busy, idx(reg), bp_vid);
+                    }
+                    if is_tracked_callee_gpr(reg) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(reg)) {
                             *u = true;
                         }
@@ -2790,17 +4810,68 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                 }
             }
         }
-        Ok((loc_try, used_callee_gpr, used_callee_fp, num_spill_slots, remat_count, spill_cost))
+        let mut move_cost = 0u64;
+        for &(arg, p, weight) in &coalesce_edges {
+            let a_loc = loc_try.get(idx(arg)).copied().unwrap_or(AllocLoc::None);
+            let p_loc = loc_try.get(idx(p)).copied().unwrap_or(AllocLoc::None);
+            if a_loc != p_loc {
+                move_cost = move_cost.saturating_add(weight);
+            }
+        }
+        for &(s_u32, e_u32) in &edge_groups {
+            let Some(pairs) = coalesce_edges.get(idx(s_u32)..idx(e_u32)) else {
+                continue;
+            };
+            for (i, &(a_i, p_i, w_i)) in pairs.iter().enumerate() {
+                if a_i == p_i || w_i == 0 {
+                    continue;
+                }
+                let (Some(AllocLoc::Gpr(ra_i)), Some(AllocLoc::Gpr(rp_i))) = (
+                    loc_try.get(idx(a_i)).copied(),
+                    loc_try.get(idx(p_i)).copied(),
+                ) else {
+                    continue;
+                };
+                if ra_i == rp_i {
+                    continue;
+                }
+                for &(a_j, p_j, w_j) in pairs.iter().skip(i + 1) {
+                    if a_j == p_j || w_j == 0 {
+                        continue;
+                    }
+                    let (Some(AllocLoc::Gpr(ra_j)), Some(AllocLoc::Gpr(rp_j))) = (
+                        loc_try.get(idx(a_j)).copied(),
+                        loc_try.get(idx(p_j)).copied(),
+                    ) else {
+                        continue;
+                    };
+                    if ra_j != rp_j && ra_i == rp_j && ra_j == rp_i {
+                        move_cost = move_cost.saturating_add(w_i.min(w_j));
+                    }
+                }
+            }
+        }
+        Ok(ColoringResult {
+            loc: loc_try,
+            used_callee_gpr,
+            used_callee_fp,
+            num_spill_slots,
+            remat_count,
+            spill_cost,
+            move_cost,
+        })
     };
 
     // Phase 1: exact chordal-SSA program-order coloring (provably minimal register count!).
-    let (mut final_loc, mut used_callee_gpr, mut used_callee_fp, mut num_spill_slots, mut remat_count, spill_cost) =
-        run_coloring(&prog_order)?;
+    let mut best = run_coloring(&prog_order)?;
 
-    // Phase 2: if register pressure overflowed (spills > 0 or remat > 0), run loop-weighted
-    // Greedy Priority Coloring so hot inner loops stay register-resident while cold outer
-    // values/constants yield & rematerialize.
-    if num_spill_slots > 0 || remat_count > 0 {
+    // Phase 2: if register pressure overflowed (spills > 0 or remat > 0), OR Phase 1 left
+    // uncoalesced phi moves in a small/medium function, run loop-weighted Greedy Priority
+    // Coloring and adopt it strictly when `(spill_cost, num_spill_slots, move_cost)` improves.
+    if best.num_spill_slots > 0
+        || best.remat_count > 0
+        || (best.move_cost > 0 && prog_order.len() <= 512)
+    {
         let mut greedy_order: Vec<Candidate, A> = Vec::with_capacity_in(prog_order.len(), alloc);
         for &c in &prog_order {
             greedy_order.push(c);
@@ -2811,24 +4882,52 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                 .then_with(|| b.weight.cmp(&a.weight))
                 .then_with(|| a.inst.cmp(&b.inst))
         });
-        if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order) {
-            if g_cost < spill_cost || (g_cost == spill_cost && g_spills <= num_spill_slots) {
-                final_loc = g_loc;
-                used_callee_gpr = g_cgpr;
-                used_callee_fp = g_cfp;
-                num_spill_slots = g_spills;
-                remat_count = g_remat;
+        if let Ok(greedy) = run_coloring(&greedy_order) {
+            if (greedy.spill_cost, greedy.num_spill_slots, greedy.move_cost)
+                < (best.spill_cost, best.num_spill_slots, best.move_cost)
+            {
+                best = greedy;
             }
         }
     }
-    remat_count = remat_count.saturating_add(pre_remat_count);
+
+    // Post-coloring bounded GPR refinement: single-value recolor + 2-cycle pair-swap to
+    // eliminate residual merge-block moves and 2-cycle swap stubs without increasing spills
+    // or callee-saved pairs.
+    if best.move_cost > 0 {
+        let abi_weight = layout
+            .and_then(|bl| bl.block_freq.first().copied())
+            .filter(|&f| f > 0)
+            .map_or(1, |f| f.min(MAX_EDGE_WEIGHT));
+        refine_gpr_moves(
+            view,
+            alias_of,
+            os,
+            &val_id,
+            &val_inst,
+            val_words,
+            &interf,
+            &val_crosses_call,
+            &val_crossed_clobbers,
+            &coalesce_edges,
+            &edge_groups,
+            abi_weight,
+            allow_lr,
+            allow_fp,
+            callee_gpr_pool,
+            &mut best.loc,
+            &mut best.used_callee_gpr,
+            alloc,
+        );
+    }
+    let remat_count = best.remat_count.saturating_add(pre_remat_count);
 
     Ok(finalize_allocation(
         view,
-        final_loc,
-        used_callee_gpr,
-        used_callee_fp,
-        num_spill_slots,
+        best.loc,
+        best.used_callee_gpr,
+        best.used_callee_fp,
+        best.num_spill_slots,
         remat_count,
         &call_positions,
         call_clobbers,
@@ -3072,7 +5171,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         }
     }
 
-    // 2. Coalescing hints in RPO order: entry params, return values, block-param back-edges,
+    // 2. Coalescing hints in RPO order: entry params, return values, block-param forward/back edges,
     //    and in-place 2-address accumulators.
     let mut hint: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
     let mut phi_partner: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
@@ -3099,6 +5198,10 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
             || (end == s && !s_rbw)
     }
 
+    let interval_crosses_call = |s_pos: usize, e_pos: usize| -> bool {
+        let first_call = call_rpo_positions.partition_point(|&(c_pos, _)| c_pos <= s_pos);
+        call_rpo_positions.get(first_call).is_some_and(|&(c_pos, _)| c_pos < e_pos)
+    };
     for (rank, &b) in rpo_blocks.iter().enumerate() {
         let term = view.terminator(Block(u32_of(b)));
         if view.op(term) == Op::Return {
@@ -3109,58 +5212,120 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
             let target_params = view.params(Block(target_block));
             let n = args_len.min(target_params.len());
             let is_back = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks) <= rank;
-            let edge_prio = if is_back { b_depth.saturating_add(1) } else { 0 };
+            let depth_prio = b_depth.saturating_add(1).min(FWD_EDGE_PRIO_MAX);
+            let back_prio = if is_back { BACK_EDGE_PRIO_BIT | depth_prio } else { 0 };
             if let Some(args) = view.extra.get(args_start..args_start + n) {
                 for (k, &arg_raw) in args.iter().enumerate() {
                     let p = target_params.start + k;
                     let arg = resolve_alias(alias_of, idx(arg_raw));
-                    if arg < len
-                        && p < len
-                        && rpo_pos.get(arg).copied().unwrap_or(0) > rpo_pos.get(p).copied().unwrap_or(usize::MAX)
-                    {
-                        let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
-                        let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
-                        let bank = reg_bank(view, arg_ty);
-                        if bank != 0 && bank == reg_bank(view, p_ty) {
-                            let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
-                            let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
-                            if cur == u32::MAX || edge_prio > cur_prio {
-                                if let Some(slot) = phi_partner.get_mut(arg) {
-                                    *slot = u32_of(p);
+                    if arg >= len || p >= len || arg == p {
+                        continue;
+                    }
+                    let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
+                    let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
+                    let bank = reg_bank(view, arg_ty);
+                    if bank == 0 || bank != reg_bank(view, p_ty) {
+                        continue;
+                    }
+                    let (Some(&p_start), Some(&arg_start)) = (rpo_pos.get(p), rpo_pos.get(arg)) else {
+                        continue;
+                    };
+                    if arg_start > p_start {
+                        let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
+                        let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
+                        if cur == u32::MAX || back_prio > cur_prio {
+                            if let Some(slot) = phi_partner.get_mut(arg) {
+                                *slot = u32_of(p);
+                            }
+                            if let Some(pslot) = phi_prio.get_mut(arg) {
+                                *pslot = back_prio;
+                            }
+                            if is_back
+                                && !skip_alloc.get(arg).copied().unwrap_or(false)
+                                && remat_val.get(arg).copied().flatten().is_none()
+                                && !matches!(view.op(arg), Op::DataAddr | Op::FuncAddr)
+                            {
+                                if let Some(bslot) = is_back_phi_arg.get_mut(arg) {
+                                    *bslot = true;
                                 }
-                                if let Some(pslot) = phi_prio.get_mut(arg) {
-                                    *pslot = edge_prio;
-                                }
-                                if is_back
-                                    && !skip_alloc.get(arg).copied().unwrap_or(false)
-                                    && remat_val.get(arg).copied().flatten().is_none()
-                                    && !matches!(view.op(arg), Op::DataAddr | Op::FuncAddr)
-                                {
-                                    if let Some(bslot) = is_back_phi_arg.get_mut(arg) {
-                                        *bslot = true;
-                                    }
-                                    let p_start = rpo_pos.get(p).copied().unwrap_or(0);
-                                    let p_end = last_use_pos.get(p).copied().unwrap_or(p_start).max(p_start);
-                                    let arg_start = rpo_pos.get(arg).copied().unwrap_or(0);
-                                    let arg_end = last_use_pos.get(arg).copied().unwrap_or(arg_start).max(arg_start);
-                                    if !intervals_conflict(
-                                        p_start,
-                                        p_end,
-                                        is_rbw(view, p),
-                                        arg_start,
-                                        arg_end,
-                                        is_rbw(view, arg),
-                                    ) {
-                                        let cur_bp = back_partner_of.get(p).copied().unwrap_or(u32::MAX);
-                                        let cur_bp_prio = back_partner_prio.get(p).copied().unwrap_or(0);
-                                        if cur_bp == u32::MAX || edge_prio > cur_bp_prio {
-                                            if let Some(bpslot) = back_partner_of.get_mut(p) {
-                                                *bpslot = u32_of(arg);
-                                            }
-                                            if let Some(bppslot) = back_partner_prio.get_mut(p) {
-                                                *bppslot = edge_prio;
-                                            }
+                                let p_end = last_use_pos.get(p).copied().unwrap_or(p_start).max(p_start);
+                                let arg_end = last_use_pos.get(arg).copied().unwrap_or(arg_start).max(arg_start);
+                                if !intervals_conflict(
+                                    p_start,
+                                    p_end,
+                                    is_rbw(view, p),
+                                    arg_start,
+                                    arg_end,
+                                    is_rbw(view, arg),
+                                ) {
+                                    let cur_bp = back_partner_of.get(p).copied().unwrap_or(u32::MAX);
+                                    let cur_bp_prio = back_partner_prio.get(p).copied().unwrap_or(0);
+                                    if cur_bp == u32::MAX || back_prio > cur_bp_prio {
+                                        if let Some(bpslot) = back_partner_of.get_mut(p) {
+                                            *bpslot = u32_of(arg);
                                         }
+                                        if let Some(bppslot) = back_partner_prio.get_mut(p) {
+                                            *bppslot = back_prio;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if arg_start < p_start
+                        && !skip_alloc.get(arg).copied().unwrap_or(false)
+                        && !skip_alloc.get(p).copied().unwrap_or(false)
+                        && has_any_use.get(p).copied().unwrap_or(false)
+                        && remat_val.get(arg).copied().flatten().is_none()
+                        && !matches!(view.op(arg), Op::DataAddr | Op::FuncAddr)
+                    {
+                        let p_end = last_use_pos.get(p).copied().unwrap_or(p_start).max(p_start);
+                        let arg_end = last_use_pos.get(arg).copied().unwrap_or(arg_start).max(arg_start);
+                        if !intervals_conflict(
+                            p_start,
+                            p_end,
+                            is_rbw(view, p),
+                            arg_start,
+                            arg_end,
+                            is_rbw(view, arg),
+                        ) && (!interval_crosses_call(p_start, p_end)
+                            || interval_crosses_call(arg_start, arg_end))
+                        {
+                            let arg_u32 = u32_of(arg);
+                            let cur = phi_partner.get(p).copied().unwrap_or(u32::MAX);
+                            let cur_prio = phi_prio.get(p).copied().unwrap_or(0);
+                            if cur == arg_u32 {
+                                if let Some(pslot) = phi_prio.get_mut(p) {
+                                    if cur_prio < BACK_EDGE_PRIO_BIT {
+                                        *pslot = merge_phi_prio(cur_prio, depth_prio);
+                                    }
+                                }
+                            } else if cur == u32::MAX || depth_prio > cur_prio {
+                                if let Some(slot) = phi_partner.get_mut(p) {
+                                    *slot = arg_u32;
+                                }
+                                if let Some(pslot) = phi_prio.get_mut(p) {
+                                    *pslot = depth_prio;
+                                }
+                            }
+                            // Also seed read-only joint-free lookup on `arg` for loop forward
+                            // edges (strictly lower priority than back-edges; never inserts out
+                            // of order into `BusySet::Monotonic`).
+                            if bank == 3 && depth_prio >= 2 {
+                                let p_u32 = u32_of(p);
+                                let cur_bp = back_partner_of.get(arg).copied().unwrap_or(u32::MAX);
+                                let cur_bp_prio = back_partner_prio.get(arg).copied().unwrap_or(0);
+                                if cur_bp == p_u32 {
+                                    if let Some(bppslot) = back_partner_prio.get_mut(arg) {
+                                        if cur_bp_prio < BACK_EDGE_PRIO_BIT {
+                                            *bppslot = merge_phi_prio(cur_bp_prio, depth_prio);
+                                        }
+                                    }
+                                } else if cur_bp == u32::MAX || depth_prio > cur_bp_prio {
+                                    if let Some(bpslot) = back_partner_of.get_mut(arg) {
+                                        *bpslot = p_u32;
+                                    }
+                                    if let Some(bppslot) = back_partner_prio.get_mut(arg) {
+                                        *bppslot = depth_prio;
                                     }
                                 }
                             }
@@ -3363,7 +5528,14 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
     }
 
     let allow_lr = call_positions.is_empty();
-    let callee_gpr_pool = if allow_lr { CALLEE_SAVED_GPR_WITH_LR } else { CALLEE_SAVED_GPR };
+    let allow_fp = can_use_fp_as_gpr(view, allow_lr);
+    let callee_gpr_pool = if allow_lr && allow_fp {
+        CALLEE_SAVED_GPR_WITH_LR_FP
+    } else if allow_lr {
+        CALLEE_SAVED_GPR_WITH_LR
+    } else {
+        CALLEE_SAVED_GPR
+    };
 
     let run_coloring = |order: &[Candidate], monotonic: bool| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
         let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
@@ -3443,12 +5615,8 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                             break;
                         }
                         crosses = true;
-                        // Unwinding out of an `Invoke` clobbers all caller-saved regs regardless of IPRA.
-                        let clob = if matches!(view.op(c_inst), Op::Invoke | Op::InvokeIndirect) {
-                            CallClobbers::C_ABI_ARM64
-                        } else {
-                            call_clobbers(c_inst)
-                        };
+                        // Unwinding out of an `Invoke` and caller-side arg setup both clobber regs.
+                        let clob = effective_call_clobbers(view, c_inst, call_clobbers(c_inst));
                         clobbers.clobbered = clobbers.clobbered.union(clob.clobbered);
                         if clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
                             == clobbers.clobbered
@@ -3492,12 +5660,12 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(b) = gpr_busy.get_mut(idx(hi)) {
                         b.insert(start, end, cur_rbw);
                     }
-                    if (X19..=X28).contains(&lo) || lo == X30 {
+                    if is_tracked_callee_gpr(lo) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(lo)) {
                             *u = true;
                         }
                     }
-                    if (X19..=X28).contains(&hi) || hi == X30 {
+                    if is_tracked_callee_gpr(hi) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(hi)) {
                             *u = true;
                         }
@@ -3691,6 +5859,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                 let try_gpr = |h: u8| -> Option<Reg> {
                     if h != NO_REG
                         && (u32::from(h) != X30 || allow_lr)
+                        && (u32::from(h) != FP || allow_fp)
                         && gpr_safe(u32::from(h))
                         && gpr_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                     {
@@ -3753,7 +5922,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(b) = gpr_busy.get_mut(idx(reg)) {
                         b.insert(start, end, cur_rbw);
                     }
-                    if (X19..=X28).contains(&reg) || reg == X30 {
+                    if is_tracked_callee_gpr(reg) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(reg)) {
                             *u = true;
                         }
@@ -3910,6 +6079,7 @@ mod tests {
             crate::Os::MacOs,
             |_| CallClobbers::C_ABI_ARM64,
             None,
+            None,
             alloc,
         )
         .expect("default regalloc succeeds");
@@ -3928,6 +6098,7 @@ mod tests {
             crate::Os::MacOs,
             |_| CallClobbers::C_ABI_ARM64,
             Some(&avoid_x9),
+            None,
             alloc,
         )
         .expect("register-avoidance regalloc succeeds");
@@ -5208,12 +7379,12 @@ mod tests {
         let x = b.param(Ty::I64);
         let n = b.param(Ty::I64);
         // Define 1-inst constant `#0x10` FIRST so Phase 1 program-order coloring tries to give it
-        // a GPR before the 24 loop-invariant scalars, forcing Phase 2 to evict `#0x10` instead.
+        // a GPR before the 25 loop-invariant scalars, forcing Phase 2 to evict `#0x10` instead.
         let c16 = b.iconst(Ty::I64, 0x10);
         let c1 = b.iconst(Ty::I64, 1);
-        let mut loop_scalars = Vec::with_capacity_in(24, alloc);
+        let mut loop_scalars = Vec::with_capacity_in(25, alloc);
         let mut cur = x;
-        for _ in 0..24usize {
+        for _ in 0..25usize {
             cur = b.binary(Op::Add, Flags::NONE, cur, c1);
             loop_scalars.push(cur);
         }
@@ -5248,7 +7419,7 @@ mod tests {
             tail.push(false);
         }
         // Fold `c1` (add_imm) and `cond` (CmpBr) just like `isel.rs` so peak non-remat GPR
-        // pressure inside `loop_hdr` is exactly 27 (`n`, `iv`, `acc`, and 24 `loop_scalars`).
+        // pressure inside `loop_hdr` is exactly 28 (`n`, `iv`, `acc`, and 25 `loop_scalars`).
         skip[c1.index()] = true;
         skip[cond.index()] = true;
 
@@ -5501,6 +7672,208 @@ mod tests {
     }
 
     #[test]
+    fn leaf_function_can_allocate_fp_only_when_zero_call_fixed_frame() {
+        use blaze_lir::func::SlotKind;
+
+        let alloc = test_alloc();
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let uses_x29 = |locs: &[AllocLoc]| {
+            locs.iter().any(|&loc| {
+                matches!(
+                    loc,
+                    AllocLoc::Gpr(29) | AllocLoc::GprPair(29, _) | AllocLoc::GprPair(_, 29)
+                )
+            })
+        };
+
+        // 1. Zero-call, fixed-frame leaf with 28 simultaneously live GPRs allocates X29 (FP) with 0 spills!
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let mut live = Vec::with_capacity_in(27, alloc);
+            let mut cur = x;
+            for _ in 0..27usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                live.push(cur);
+            }
+            let mut acc = b.binary(Op::Xor, Flags::NONE, x, live[0]);
+            for &v in &live[1..] {
+                acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+
+            let func = b.finish_checked().expect("28-GPR leaf LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG 28-GPR leaf regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &[],
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan 28-GPR leaf regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert_eq!(ra.num_spill_slots, 0, "{label}: 28 live GPRs in leaf must have 0 spills");
+                assert!(!ra.has_calls, "{label}: leaf function must have has_calls == false");
+                assert!(ra.uses_lr, "{label}: 28 live GPRs in leaf must set uses_lr = true");
+                assert!(ra.uses_fp, "{label}: 28 live GPRs in leaf must set uses_fp = true");
+                assert!(uses_x29(&ra.loc_of), "{label}: expected one value allocated to Gpr(29)");
+                assert_eq!(ra.x_pairs, 0x1f, "{label}: FP must only be used after all 5 x19..x28 pairs");
+                assert!(
+                    !ra.clobbers.clobbers_gpr(29),
+                    "{label}: callee-saved FP must not be reported as clobbered"
+                );
+            }
+        }
+
+        // 2. Function with an `Op::Call` MUST NEVER allocate X29 (FP)!
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let callee_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let mut live = Vec::with_capacity_in(27, alloc);
+            let mut cur = x;
+            for _ in 0..27usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                live.push(cur);
+            }
+            let call_res = b.call(Flags::NONE, callee_ref, callee_sig, &[x]);
+            let mut acc = b.binary(Op::Xor, Flags::NONE, call_res, x);
+            for &v in &live {
+                acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+
+            let func = b.finish_checked().expect("28-GPR call LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG call regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &[],
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan call regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert!(ra.has_calls, "{label}: call function must report has_calls = true");
+                assert!(!ra.uses_fp, "{label}: function with Op::Call must never set uses_fp");
+                assert!(!uses_x29(&ra.loc_of), "{label}: function with Op::Call must never allocate X29");
+            }
+        }
+
+        // 3. Leaf with an over-aligned stack slot (`align = 32`, `align_log2 = 5 > 4`) MUST NEVER allocate X29 (FP)!
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot32 = b.slot(32, 5, SlotKind::Temp);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let sptr = b.slot_addr(slot32);
+            b.store(Flags::NONE, x, sptr, 0, MemAttrs::aligned(5));
+            let mut live = Vec::with_capacity_in(27, alloc);
+            let mut cur = x;
+            for _ in 0..27usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                live.push(cur);
+            }
+            let mut acc = b.binary(Op::Xor, Flags::NONE, x, live[0]);
+            for &v in &live[1..] {
+                acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+            }
+            let reloaded = b.load(Ty::I64, Flags::NONE, sptr, 0, MemAttrs::aligned(5));
+            let out = b.binary(Op::Xor, Flags::NONE, acc, reloaded);
+            b.ret(&[out]);
+
+            let func = b.finish_checked().expect("28-GPR over-aligned leaf LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+            skip[sptr.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG over-aligned leaf regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &[],
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan over-aligned leaf regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert!(!ra.has_calls, "{label}: over-aligned leaf still has has_calls == false");
+                assert!(ra.uses_lr, "{label}: over-aligned 28-GPR leaf may still allocate X30");
+                assert!(!ra.uses_fp, "{label}: over-aligned (align 32) leaf must never set uses_fp");
+                assert!(
+                    !uses_x29(&ra.loc_of),
+                    "{label}: over-aligned (align 32) leaf must never allocate X29"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn depth1_loop_invariant_beats_40_depth0_uses_of_epilogue_ptr() {
         let alloc = test_alloc();
         let gpr_ord = build_caller_gpr_order(None);
@@ -5537,9 +7910,9 @@ mod tests {
             let c1 = b.iconst(Ty::I64, 1);
             let c0 = b.iconst(Ty::I64, 0);
             let lit_limit = b.binary(Op::Add, Flags::NONE, x, n);
-            let mut invs = Vec::with_capacity_in(21, alloc);
+            let mut invs = Vec::with_capacity_in(22, alloc);
             let mut cur = x;
-            for _ in 0..21usize {
+            for _ in 0..22usize {
                 cur = b.binary(Op::Add, Flags::NONE, cur, c1);
                 invs.push(cur);
             }
@@ -5833,6 +8206,1966 @@ mod tests {
                 ra.loc_of[p.index()],
                 ra.loc_of[p_next.index()],
                 "{label}: loop header `p` and back-edge `p_next` must share one GPR (0 back-edge mov)"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_scan_rpo_coalesces_forward_merge_block_params() {
+        let alloc = test_alloc();
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let check1 = b.create_block(BlockKind::Normal);
+        let latch = b.create_block(BlockKind::Normal);
+        let done = b.create_block(BlockKind::Normal);
+        let merge = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let limit = b.param(Ty::I64);
+        let seed = b.param(Ty::I64);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c3 = b.iconst(Ty::I64, 3);
+        let init_pos = b.binary(Op::Add, Flags::NONE, seed, c1);
+        let init_acc = b.binary(Op::Xor, Flags::NONE, seed, limit);
+        let init_cond = b.icmp(IntCond::Ult, seed, limit);
+        b.br(
+            Flags::NONE,
+            init_cond,
+            (loop_hdr, &[init_pos, init_acc]),
+            (merge, &[init_pos, seed]),
+        );
+
+        b.begin(loop_hdr);
+        let pos = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let guard = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+        let pos0 = b.binary(Op::Add, Flags::NONE, pos, c1);
+        let cur8 = b.load(Ty::I64, Flags::NONE, ptr, 8, MemAttrs::aligned(8));
+        let tag0 = b.binary(Op::Xor, Flags::NONE, cur8, acc);
+        let no_hit0 = b.icmp(IntCond::Ne, tag0, guard);
+        b.br(Flags::NONE, no_hit0, (check1, &[]), (merge, &[pos0, cur8]));
+
+        b.begin(check1);
+        let pos1 = b.binary(Op::Add, Flags::NONE, pos, c3);
+        let tag1 = b.binary(Op::Add, Flags::NONE, cur8, pos1);
+        let no_hit1 = b.icmp(IntCond::Ne, tag1, guard);
+        b.br(Flags::NONE, no_hit1, (latch, &[]), (merge, &[pos1, cur8]));
+
+        b.begin(latch);
+        let pos_next = b.binary(Op::Add, Flags::NONE, pos, c1);
+        let acc_next = b.binary(Op::Xor, Flags::NONE, acc, guard);
+        let cont = b.icmp(IntCond::Ult, pos_next, limit);
+        b.br(Flags::NONE, cont, (loop_hdr, &[pos_next, acc_next]), (done, &[acc_next]));
+
+        b.begin(done);
+        let final_acc = b.param(Ty::I64);
+        let out = b.binary(Op::Xor, Flags::NONE, final_acc, seed);
+        b.ret(&[out]);
+
+        b.begin(merge);
+        let hit_pos = b.param(Ty::I64);
+        let cur8_m = b.param(Ty::I64);
+        let res = b.binary(Op::Add, Flags::NONE, hit_pos, cur8_m);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().expect("forward merge coalescing LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        skip[c1.index()] = true;
+        skip[c3.index()] = true;
+
+        let ra = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &[],
+            &tail,
+            64,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan forward merge regalloc succeeds");
+
+        assert!(
+            matches!(ra.loc_of[cur8.index()], AllocLoc::Gpr(_)),
+            "shared loop value `cur8` must live in a GPR, got {:?}",
+            ra.loc_of[cur8.index()]
+        );
+        assert_eq!(
+            ra.loc_of[cur8_m.index()],
+            ra.loc_of[cur8.index()],
+            "merge param `cur8_m` must coalesce into shared incoming `cur8` GPR (0 moves on both loop exits)"
+        );
+        assert_ne!(
+            ra.loc_of[cur8_m.index()],
+            ra.loc_of[seed.index()],
+            "deeper loop-exit `cur8` must beat cold depth-0 entry edge `seed`"
+        );
+        assert!(
+            matches!(ra.loc_of[hit_pos.index()], AllocLoc::Gpr(_)),
+            "merge param `hit_pos` must live in a GPR, got {:?}",
+            ra.loc_of[hit_pos.index()]
+        );
+        assert!(
+            ra.loc_of[hit_pos.index()] == ra.loc_of[pos0.index()]
+                || ra.loc_of[hit_pos.index()] == ra.loc_of[pos1.index()],
+            "merge param `hit_pos` ({:?}) must coalesce into incoming `pos0` ({:?}) or `pos1` ({:?})",
+            ra.loc_of[hit_pos.index()],
+            ra.loc_of[pos0.index()],
+            ra.loc_of[pos1.index()]
+        );
+    }
+
+    #[test]
+    fn exact_cfg_coalesces_loop_diamond_forward_edges_zero_moves() {
+        let alloc = test_alloc();
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let fast = b.create_block(BlockKind::Normal);
+        let slow = b.create_block(BlockKind::Normal);
+        let merge = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let seed = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c3 = b.iconst(Ty::I64, 3);
+        let c5 = b.iconst(Ty::I64, 5);
+        b.jump((loop_hdr, &[c0, seed, n]));
+
+        b.begin(loop_hdr);
+        let iv = b.param(Ty::I64);
+        let st0 = b.param(Ty::I64);
+        let st1 = b.param(Ty::I64);
+        let w = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+        let tag = b.binary(Op::And, Flags::NONE, w, c1);
+        let take_fast = b.icmp(IntCond::Eq, tag, c0);
+        b.br(Flags::NONE, take_fast, (fast, &[]), (slow, &[]));
+
+        b.begin(fast);
+        let f0 = b.binary(Op::Add, Flags::NONE, st0, w);
+        let tmp_a = b.binary(Op::Xor, Flags::NONE, st1, c3);
+        let f1 = b.binary(Op::Add, Flags::NONE, tmp_a, f0);
+        let tmp_b = b.binary(Op::Add, Flags::NONE, w, c5);
+        let f2 = b.binary(Op::Xor, Flags::NONE, st1, tmp_b);
+        b.jump((merge, &[f0, f1, f2]));
+
+        b.begin(slow);
+        let s0 = b.binary(Op::Xor, Flags::NONE, st0, c5);
+        let s1 = b.binary(Op::Sub, Flags::NONE, st1, w);
+        let s2 = b.binary(Op::Add, Flags::NONE, s0, s1);
+        b.jump((merge, &[s0, s1, s2]));
+
+        b.begin(merge);
+        let p0 = b.param(Ty::I64);
+        let p1 = b.param(Ty::I64);
+        let p2 = b.param(Ty::I64);
+        let mix = b.binary(Op::Xor, Flags::NONE, p0, p1);
+        let next0 = b.binary(Op::Add, Flags::NONE, mix, p2);
+        let next1 = b.binary(Op::Xor, Flags::NONE, p1, p2);
+        let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+        let cont = b.icmp(IntCond::Ult, iv_next, n);
+        b.br(
+            Flags::NONE,
+            cont,
+            (loop_hdr, &[iv_next, next0, next1]),
+            (exit, &[next0]),
+        );
+
+        b.begin(exit);
+        let out = b.param(Ty::I64);
+        b.ret(&[out]);
+
+        let func = b.finish_checked().expect("loop diamond forward-edge LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        skip[c1.index()] = true;
+        skip[c3.index()] = true;
+        skip[c5.index()] = true;
+
+        let ra = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG loop diamond regalloc succeeds");
+
+        for (name, arg, param) in [("p0", f0, p0), ("p1", f1, p1), ("p2", f2, p2)] {
+            assert!(
+                matches!(ra.loc_of[param.index()], AllocLoc::Gpr(_)),
+                "merge param `{name}` must live in a GPR, got {:?}",
+                ra.loc_of[param.index()]
+            );
+            assert_eq!(
+                ra.loc_of[arg.index()],
+                ra.loc_of[param.index()],
+                "fast-arm arg for `{name}` must coalesce with `{name}` (0 forward-edge movs, no cycle swap)"
+            );
+        }
+        for (name, arg, param) in [("p0", s0, p0), ("p1", s1, p1), ("p2", s2, p2)] {
+            assert_eq!(
+                ra.loc_of[arg.index()],
+                ra.loc_of[param.index()],
+                "slow-arm arg for `{name}` must also coalesce with `{name}` (0 forward-edge movs)"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_cfg_bidirectional_coalescing_when_param_colored_first() {
+        let alloc = test_alloc();
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        // Lay out `merge` before `arm_a`/`arm_b` (still a forward edge in RPO) so `p` has
+        // strictly higher weight than `arg_a` and `arg_b` in Phase 2 and is colored first.
+        let merge = b.create_block(BlockKind::Normal);
+        let arm_a = b.create_block(BlockKind::Normal);
+        let arm_b = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let a0 = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c3 = b.iconst(Ty::I64, 3);
+        let c5 = b.iconst(Ty::I64, 5);
+        // 25 cold depth-0 values live into `exit` so Phase 1 overflows and Phase 2 greedy runs.
+        let mut cold = Vec::with_capacity_in(25, alloc);
+        let mut cur = a0;
+        for _ in 0..25usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            cold.push(cur);
+        }
+        b.jump((loop_hdr, &[c0, a0]));
+
+        b.begin(loop_hdr);
+        let iv = b.param(Ty::I64);
+        let st = b.param(Ty::I64);
+        let w = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+        let tag = b.binary(Op::And, Flags::NONE, w, c1);
+        let cond = b.icmp(IntCond::Eq, tag, c0);
+        b.br(Flags::NONE, cond, (arm_a, &[]), (arm_b, &[]));
+
+        b.begin(merge);
+        let p = b.param(Ty::I64);
+        // 5 depth-1 uses of `p` so Phase 2 colors `p` before `st`, `w`, `mid_tmp`, `arg_a`, `arg_b`.
+        let u1 = b.binary(Op::Add, Flags::NONE, p, st);
+        let u2 = b.binary(Op::Xor, Flags::NONE, u1, p);
+        let u3 = b.binary(Op::Add, Flags::NONE, u2, p);
+        let u4 = b.binary(Op::Xor, Flags::NONE, u3, p);
+        let next_st = b.binary(Op::Add, Flags::NONE, u4, p);
+        let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+        let keep = b.icmp(IntCond::Ult, iv_next, n);
+        b.br(
+            Flags::NONE,
+            keep,
+            (loop_hdr, &[iv_next, next_st]),
+            (exit, &[next_st]),
+        );
+
+        b.begin(arm_a);
+        let mid_tmp = b.binary(Op::Xor, Flags::NONE, st, w);
+        let arg_a = b.binary(Op::Add, Flags::NONE, st, c3);
+        // 3 depth-1 uses of `mid_tmp` after `arg_a` so `mid_tmp` interferes with `arg_a` (not `p`)
+        // and sorts between `p` and `arg_a` in Phase 2.
+        let m1 = b.binary(Op::Add, Flags::NONE, mid_tmp, w);
+        let m2 = b.binary(Op::Xor, Flags::NONE, m1, mid_tmp);
+        let m3 = b.binary(Op::Add, Flags::NONE, m2, mid_tmp);
+        b.store(Flags::NONE, m3, ptr, 8, MemAttrs::aligned(8));
+        b.jump((merge, &[arg_a]));
+
+        b.begin(arm_b);
+        let arg_b = b.binary(Op::Xor, Flags::NONE, st, c5);
+        b.jump((merge, &[arg_b]));
+
+        b.begin(exit);
+        let mut out = b.param(Ty::I64);
+        out = b.binary(Op::Xor, Flags::NONE, out, a0);
+        for &cv in &cold {
+            out = b.binary(Op::Xor, Flags::NONE, out, cv);
+        }
+        b.ret(&[out]);
+
+        let func = b
+            .finish_checked()
+            .expect("bidirectional param-first coalescing LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        skip[c1.index()] = true;
+        skip[c3.index()] = true;
+        skip[c5.index()] = true;
+
+        let ra = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG bidirectional coalescing regalloc succeeds");
+
+        assert!(
+            ra.num_spill_slots > 0,
+            "must trigger Phase 2 greedy coloring via cold depth-0 pressure"
+        );
+        assert!(
+            matches!(ra.loc_of[p.index()], AllocLoc::Gpr(_)),
+            "hot merge param `p` must stay in a GPR, got {:?}",
+            ra.loc_of[p.index()]
+        );
+        assert_eq!(
+            ra.loc_of[arg_a.index()],
+            ra.loc_of[p.index()],
+            "forward arg `arg_a` must coalesce with higher-weight `p` without `mid_tmp` ({:?}) stealing its GPR",
+            ra.loc_of[mid_tmp.index()]
+        );
+        assert_eq!(
+            ra.loc_of[arg_b.index()],
+            ra.loc_of[p.index()],
+            "second forward arg `arg_b` must also coalesce with `p` via bidirectional affinity"
+        );
+        assert_ne!(
+            ra.loc_of[mid_tmp.index()],
+            ra.loc_of[p.index()],
+            "interfering `mid_tmp` must not collide with co-colored `(p, arg_a)`"
+        );
+    }
+
+    #[test]
+    fn exact_cfg_anti_hint_avoids_stealing_phi_partner_reg() {
+        let alloc = test_alloc();
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let check1 = b.create_block(BlockKind::Normal);
+        let hit = b.create_block(BlockKind::Normal);
+        let latch = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let a0 = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c3 = b.iconst(Ty::I64, 3);
+        // 25 cold depth-0 values live into `exit` so Phase 1 overflows and Phase 2 greedy runs.
+        let mut cold = Vec::with_capacity_in(25, alloc);
+        let mut cur = a0;
+        for _ in 0..25usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            cold.push(cur);
+        }
+        b.jump((loop_hdr, &[a0, c0]));
+
+        b.begin(loop_hdr);
+        let p0 = b.param(Ty::I64);
+        let iv = b.param(Ty::I64);
+        // High-weight loop header param `p0` colors first in Phase 2 and co-colors with its
+        // back-edge `p0_next` (leaving forward merge param `hit_pos` uncolored).
+        let u1 = b.binary(Op::Add, Flags::NONE, p0, n);
+        let u2 = b.binary(Op::Xor, Flags::NONE, u1, p0);
+        let u3 = b.binary(Op::Add, Flags::NONE, u2, p0);
+        let u4 = b.binary(Op::Xor, Flags::NONE, u3, p0);
+        let u5 = b.binary(Op::Add, Flags::NONE, u4, p0);
+        let u6 = b.binary(Op::Xor, Flags::NONE, u5, p0);
+        let cond_hit0 = b.icmp(IntCond::Eq, u6, c0);
+        b.br(Flags::NONE, cond_hit0, (hit, &[p0]), (check1, &[]));
+
+        b.begin(check1);
+        // Position 1 forward edge at the same depth; `p0` dies here so `p0` never interferes
+        // with `hit_pos` or `hot_tmp`.
+        let p1 = b.binary(Op::Add, Flags::NONE, p0, c3);
+        let cond_hit1 = b.icmp(IntCond::Eq, p1, c0);
+        b.br(Flags::NONE, cond_hit1, (hit, &[p1]), (latch, &[p1]));
+
+        b.begin(hit);
+        let hit_pos = b.param(Ty::I64);
+        // Unhinted `hot_tmp` has higher weight than `hit_pos` (colors BEFORE `hit_pos` in Phase 2),
+        // interferes with `hit_pos` (NOT `p0` or `p0_next`), so without anti-hinting it would grab
+        // `p0`'s register and block `hit_pos` from coalescing into `p0`.
+        let hot_tmp = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+        let t1 = b.binary(Op::Add, Flags::NONE, hot_tmp, hot_tmp);
+        let t2 = b.binary(Op::Xor, Flags::NONE, t1, hot_tmp);
+        let t3 = b.binary(Op::Add, Flags::NONE, t2, hot_tmp);
+        let t4 = b.binary(Op::Xor, Flags::NONE, t3, hot_tmp);
+        let hit_out = b.binary(Op::Add, Flags::NONE, t4, hit_pos);
+        b.jump((latch, &[hit_out]));
+
+        b.begin(latch);
+        let acc = b.param(Ty::I64);
+        b.store(Flags::NONE, acc, ptr, 8, MemAttrs::aligned(8));
+        let p0_next = b.load(Ty::I64, Flags::NONE, ptr, 16, MemAttrs::aligned(8));
+        let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+        let cont = b.icmp(IntCond::Ult, iv_next, n);
+        b.br(
+            Flags::NONE,
+            cont,
+            (loop_hdr, &[p0_next, iv_next]),
+            (exit, &[acc]),
+        );
+
+        b.begin(exit);
+        let mut out = b.param(Ty::I64);
+        out = b.binary(Op::Xor, Flags::NONE, out, a0);
+        for &cv in &cold {
+            out = b.binary(Op::Xor, Flags::NONE, out, cv);
+        }
+        b.ret(&[out]);
+
+        let func = b
+            .finish_checked()
+            .expect("anti-hint exact-CFG coalescing LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        skip[c1.index()] = true;
+        skip[c3.index()] = true;
+
+        let ra = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG anti-hint regalloc succeeds");
+
+        assert!(
+            ra.num_spill_slots > 0,
+            "must trigger Phase 2 greedy coloring via cold depth-0 pressure"
+        );
+        assert!(
+            matches!(ra.loc_of[p0.index()], AllocLoc::Gpr(_)),
+            "loop param `p0` must stay in a GPR, got {:?}",
+            ra.loc_of[p0.index()]
+        );
+        assert_eq!(
+            ra.loc_of[p0_next.index()],
+            ra.loc_of[p0.index()],
+            "back-edge `p0_next` must co-color with loop param `p0`"
+        );
+        assert_ne!(
+            ra.loc_of[hot_tmp.index()],
+            ra.loc_of[p0.index()],
+            "interfering unhinted `hot_tmp` must avoid stealing `p0`'s GPR ({:?})",
+            ra.loc_of[p0.index()]
+        );
+        assert_eq!(
+            ra.loc_of[hit_pos.index()],
+            ra.loc_of[p0.index()],
+            "merge param `hit_pos` must coalesce into `p0`'s GPR (0 moves on Position 0 hit)"
+        );
+    }
+
+    #[test]
+    fn exact_cfg_phi_sibling_affinity_coalesces_merge_args_zero_moves() {
+        let alloc = test_alloc();
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let arm0 = b.create_block(BlockKind::Normal);
+        let arm1 = b.create_block(BlockKind::Normal);
+        let merge = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let cond = b.icmp(IntCond::Eq, x, c0);
+        b.br(Flags::NONE, cond, (arm0, &[]), (arm1, &[]));
+
+        b.begin(arm0);
+        // `u0` stays live across `val0` (stored after `val0`), forcing `val0` off `X9` onto `X10`.
+        let u0 = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+        let val0 = b.binary(Op::Add, Flags::NONE, x, y);
+        b.store(Flags::NONE, u0, ptr, 8, MemAttrs::aligned(8));
+        b.jump((merge, &[val0]));
+
+        b.begin(arm1);
+        // In `arm1`, `u0` is dead so `X9` is free; without phi-sibling affinity, `val1`
+        // (colored before `merge` param `m`) would grab `X9` instead of matching `val0`'s `X10`.
+        let val1 = b.binary(Op::Xor, Flags::NONE, x, y);
+        b.jump((merge, &[val1]));
+
+        b.begin(merge);
+        let m = b.param(Ty::I64);
+        let t = b.binary(Op::Add, Flags::NONE, m, x);
+        let out = b.binary(Op::Xor, Flags::NONE, t, y);
+        b.ret(&[out]);
+
+        let func = b
+            .finish_checked()
+            .expect("phi-sibling diamond merge LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        skip[c0.index()] = true;
+
+        let ra = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG phi-sibling regalloc succeeds");
+
+        assert!(
+            matches!(ra.loc_of[m.index()], AllocLoc::Gpr(_)),
+            "merge param `m` must live in a GPR, got {:?}",
+            ra.loc_of[m.index()]
+        );
+        assert_eq!(
+            ra.loc_of[val0.index()],
+            ra.loc_of[val1.index()],
+            "non-interfering phi-sibling args `val0` and `val1` must receive the same GPR"
+        );
+        assert_eq!(
+            ra.loc_of[val0.index()],
+            ra.loc_of[m.index()],
+            "merge param `m` must coalesce with `val0` (0 moves on arm0 -> merge)"
+        );
+        assert_eq!(
+            ra.loc_of[val1.index()],
+            ra.loc_of[m.index()],
+            "merge param `m` must coalesce with `val1` (0 moves on arm1 -> merge)"
+        );
+        assert_ne!(
+            ra.loc_of[u0.index()],
+            ra.loc_of[val0.index()],
+            "interfering `u0` and `val0` must hold distinct GPRs"
+        );
+        assert_ne!(ra.loc_of[m.index()], ra.loc_of[x.index()]);
+        assert_ne!(ra.loc_of[m.index()], ra.loc_of[y.index()]);
+    }
+
+    #[test]
+    fn exact_cfg_pair_swap_refinement_untangles_two_cycle_swap() {
+        let alloc = test_alloc();
+
+        // 1. Direct verification on `refine_gpr_moves`: every node in the 2-cycle swap
+        //    (`pos0/pos1 = X2, val0/val1 = X4` feeding `hit_pos = X4, hit_val = X2`) is
+        //    blocked for single-variable moves, so only pair-swap refinement can untangle it.
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let pred0 = b.create_block(BlockKind::Normal);
+            let pred1 = b.create_block(BlockKind::Normal);
+            let merge = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let ptr = b.param(Ty::PTR);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let live_x = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+            let cond = b.icmp(IntCond::Eq, x, c0);
+            b.br(Flags::NONE, cond, (pred0, &[]), (pred1, &[]));
+
+            b.begin(pred0);
+            let pos0 = b.binary(Op::Add, Flags::NONE, x, y);
+            let val0 = b.binary(Op::Xor, Flags::NONE, x, live_x);
+            b.jump((merge, &[pos0, val0]));
+
+            b.begin(pred1);
+            let pos1 = b.binary(Op::Sub, Flags::NONE, x, y);
+            let val1 = b.binary(Op::Or, Flags::NONE, y, live_x);
+            b.jump((merge, &[pos1, val1]));
+
+            b.begin(merge);
+            let hit_pos = b.param(Ty::I64);
+            let hit_val = b.param(Ty::I64);
+            let sum = b.binary(Op::Add, Flags::NONE, hit_pos, hit_val);
+            let out = b.binary(Op::Xor, Flags::NONE, sum, live_x);
+            b.ret(&[out]);
+
+            let func = b
+                .finish_checked()
+                .expect("2-cycle swap refinement LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+
+            let mut val_id: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut val_inst: Vec<usize, Alloc<'static>> = Vec::new_in(alloc);
+            for _ in 0..n_inst {
+                val_id.push(super::NO_VAL);
+            }
+            for inst in 0..n_inst {
+                let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+                if ty != Ty::NONE && inst != c0.index() {
+                    let id = u32_of(val_inst.len());
+                    val_inst.push(inst);
+                    val_id[inst] = id;
+                }
+            }
+            let num_vals = val_inst.len();
+            assert!(num_vals <= 64);
+            let val_words = 1usize;
+            let mut interf: Vec<u64, Alloc<'static>> = Vec::with_capacity_in(num_vals, alloc);
+            for _ in 0..num_vals {
+                interf.push(0);
+            }
+            let mut add_interf = |a: usize, c: usize| {
+                let ua = super::idx(val_id[a]);
+                let uc = super::idx(val_id[c]);
+                interf[ua] |= 1u64 << uc;
+                interf[uc] |= 1u64 << ua;
+            };
+            add_interf(pos0.index(), val0.index());
+            add_interf(pos1.index(), val1.index());
+            add_interf(hit_pos.index(), hit_val.index());
+            for v in [
+                x.index(),
+                y.index(),
+                pos0.index(),
+                val0.index(),
+                pos1.index(),
+                val1.index(),
+                hit_pos.index(),
+                hit_val.index(),
+                sum.index(),
+            ] {
+                add_interf(live_x.index(), v);
+            }
+            add_interf(x.index(), y.index());
+            add_interf(x.index(), pos0.index());
+            add_interf(y.index(), pos1.index());
+
+            let mut loc: Vec<AllocLoc, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut crosses: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut clobbers: Vec<CallClobbers, Alloc<'static>> =
+                Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                loc.push(AllocLoc::None);
+                crosses.push(false);
+                clobbers.push(CallClobbers::EMPTY);
+            }
+            loc[ptr.index()] = AllocLoc::Gpr(0);
+            loc[x.index()] = AllocLoc::Gpr(1);
+            loc[y.index()] = AllocLoc::Gpr(3);
+            loc[live_x.index()] = AllocLoc::Gpr(9);
+            loc[cond.index()] = AllocLoc::Gpr(10);
+            // 2-cycle swap: preds hold (pos = X2, val = X4), merge holds (hit_pos = X4, hit_val = X2).
+            loc[pos0.index()] = AllocLoc::Gpr(2);
+            loc[val0.index()] = AllocLoc::Gpr(4);
+            loc[pos1.index()] = AllocLoc::Gpr(2);
+            loc[val1.index()] = AllocLoc::Gpr(4);
+            loc[hit_pos.index()] = AllocLoc::Gpr(4);
+            loc[hit_val.index()] = AllocLoc::Gpr(2);
+            loc[sum.index()] = AllocLoc::Gpr(4);
+            loc[out.index()] = AllocLoc::Gpr(0);
+
+            let coalesce_edges = [
+                (u32_of(pos0.index()), u32_of(hit_pos.index()), 128u64),
+                (u32_of(val0.index()), u32_of(hit_val.index()), 128u64),
+                (u32_of(pos1.index()), u32_of(hit_pos.index()), 128u64),
+                (u32_of(val1.index()), u32_of(hit_val.index()), 128u64),
+            ];
+            let mut used_callee_gpr = [false; 32];
+
+            let changed = super::refine_gpr_moves(
+                &view,
+                &[],
+                crate::Os::MacOs,
+                &val_id,
+                &val_inst,
+                val_words,
+                &interf,
+                &crosses,
+                &clobbers,
+                &coalesce_edges,
+                &[],
+                1,
+                true,
+                false,
+                super::CALLEE_SAVED_GPR_WITH_LR,
+                &mut loc,
+                &mut used_callee_gpr,
+                alloc,
+            );
+            assert!(changed, "pair-swap refinement must untangle the 2-cycle swap");
+
+            let residual_cost: u64 = coalesce_edges
+                .iter()
+                .filter(|&&(a, p, _)| loc[super::idx(a)] != loc[super::idx(p)])
+                .map(|&(_, _, w)| w)
+                .sum();
+            assert_eq!(
+                residual_cost, 0,
+                "expected 0 residual move cost after pair-swap refinement (hit_pos={:?}, hit_val={:?}, pos0={:?}, val0={:?}, pos1={:?}, val1={:?})",
+                loc[hit_pos.index()],
+                loc[hit_val.index()],
+                loc[pos0.index()],
+                loc[val0.index()],
+                loc[pos1.index()],
+                loc[val1.index()],
+            );
+            assert_ne!(loc[hit_pos.index()], loc[hit_val.index()]);
+            assert!(
+                used_callee_gpr.iter().all(|&u| !u),
+                "pair-swap must not allocate any callee-saved GPRs"
+            );
+            for (u_vid, &u_inst) in val_inst.iter().enumerate() {
+                let mut bits = interf[u_vid];
+                while bits != 0 {
+                    let v_vid = super::idx(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let v_inst = val_inst[v_vid];
+                    assert_ne!(
+                        loc[u_inst], loc[v_inst],
+                        "interference violation between inst {u_inst} and {v_inst}: both hold {:?}",
+                        loc[u_inst]
+                    );
+                }
+            }
+        }
+
+        // 2. End-to-end `allocate` verification: reversed entry edge `(a, b) -> merge` vs
+        //    `(b, a) -> loop_hdr` must align `merge(m0, m1)` with the hot loop-exit `(lp0, lp1)`
+        //    with zero moves on all loop-exit and back-edges.
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::PTR),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let loop_hdr = b.create_block(BlockKind::Normal);
+            let check1 = b.create_block(BlockKind::Normal);
+            let latch = b.create_block(BlockKind::Normal);
+            let merge = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let ptr = b.param(Ty::PTR);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let n = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let empty = b.icmp(IntCond::Eq, n, c0);
+            b.br(
+                Flags::NONE,
+                empty,
+                (merge, &[a, bv]),
+                (loop_hdr, &[bv, a, c0]),
+            );
+
+            b.begin(loop_hdr);
+            let lp0 = b.param(Ty::I64);
+            let lp1 = b.param(Ty::I64);
+            let iv = b.param(Ty::I64);
+            let w = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+            let hit0 = b.icmp(IntCond::Eq, w, lp0);
+            b.br(Flags::NONE, hit0, (merge, &[lp0, lp1]), (check1, &[]));
+
+            b.begin(check1);
+            let hit1 = b.icmp(IntCond::Eq, w, lp1);
+            b.br(Flags::NONE, hit1, (merge, &[lp0, lp1]), (latch, &[]));
+
+            b.begin(latch);
+            let lp0_next = b.binary(Op::Add, Flags::NONE, lp0, c1);
+            let lp1_next = b.binary(Op::Xor, Flags::NONE, lp1, w);
+            let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+            let cont = b.icmp(IntCond::Ult, iv_next, n);
+            b.br(
+                Flags::NONE,
+                cont,
+                (loop_hdr, &[lp0_next, lp1_next, iv_next]),
+                (merge, &[lp0_next, lp1_next]),
+            );
+
+            b.begin(merge);
+            let m0 = b.param(Ty::I64);
+            let m1 = b.param(Ty::I64);
+            let diff = b.binary(Op::Sub, Flags::NONE, m0, m1);
+            b.ret(&[diff]);
+
+            let func = b
+                .finish_checked()
+                .expect("loop-exit 2-param merge LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+
+            let ra = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG loop-exit 2-param merge regalloc succeeds");
+
+            assert!(matches!(ra.loc_of[m0.index()], AllocLoc::Gpr(_)));
+            assert!(matches!(ra.loc_of[m1.index()], AllocLoc::Gpr(_)));
+            assert_ne!(ra.loc_of[m0.index()], ra.loc_of[m1.index()]);
+            assert_eq!(
+                ra.loc_of[lp0.index()],
+                ra.loc_of[lp0_next.index()],
+                "loop back-edge `lp0_next` must coalesce with `lp0`"
+            );
+            assert_eq!(
+                ra.loc_of[lp1.index()],
+                ra.loc_of[lp1_next.index()],
+                "loop back-edge `lp1_next` must coalesce with `lp1`"
+            );
+            assert_eq!(
+                ra.loc_of[m0.index()],
+                ra.loc_of[lp0.index()],
+                "merge param `m0` must align with hot loop-exit `lp0` (0 swap moves)"
+            );
+            assert_eq!(
+                ra.loc_of[m1.index()],
+                ra.loc_of[lp1.index()],
+                "merge param `m1` must align with hot loop-exit `lp1` (0 swap moves)"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_cfg_pair_swap_evicts_zero_affinity_scratch_blocker() {
+        let alloc = test_alloc();
+
+        // 1. Exact `short_hit` + `xor_diff` scenario (`lz77_scan_default_leaf`):
+        //    - `pos0 = X2, val0 = X4` anchored to `long_hit(long_pos = X2, long_val = X4)`.
+        //    - `short_hit` holds swapped `(short_pos = X4, short_val = X2)` AND a pure 1-block
+        //      zero-affinity scratch `xor_diff = xor(short_val, loaded)` also in `X2` that
+        //      interferes with `short_pos`.
+        //    - `pred1` holds `val1 = X2` feeding both `short_val` and `long_val` (weight 128 each),
+        //      so `val1` cannot move in Round 1.
+        //    - Round 1 evicts `xor_diff` to a free caller-saved GPR and swaps
+        //      `(short_pos, short_val) -> (X2, X4)`; Round 2 then moves `val1: X2 -> X4` cleanly.
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let pred0 = b.create_block(BlockKind::Normal);
+            let pred1 = b.create_block(BlockKind::Normal);
+            let long_hit = b.create_block(BlockKind::Normal);
+            let short_hit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let ptr = b.param(Ty::PTR);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let live_x = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+            let cond = b.icmp(IntCond::Eq, x, c0);
+            b.br(Flags::NONE, cond, (pred0, &[]), (pred1, &[]));
+
+            b.begin(pred0);
+            let pos0 = b.binary(Op::Add, Flags::NONE, x, y);
+            let val0 = b.binary(Op::Xor, Flags::NONE, x, live_x);
+            let cond0 = b.icmp(IntCond::Eq, pos0, c0);
+            b.br(
+                Flags::NONE,
+                cond0,
+                (long_hit, &[pos0, val0]),
+                (short_hit, &[pos0, val0]),
+            );
+
+            b.begin(pred1);
+            let pos1 = b.binary(Op::Sub, Flags::NONE, x, y);
+            let val1 = b.binary(Op::Or, Flags::NONE, y, live_x);
+            let cond1 = b.icmp(IntCond::Eq, pos1, c0);
+            b.br(
+                Flags::NONE,
+                cond1,
+                (long_hit, &[pos1, val1]),
+                (short_hit, &[pos1, val1]),
+            );
+
+            b.begin(long_hit);
+            let long_pos = b.param(Ty::I64);
+            let long_val = b.param(Ty::I64);
+            let lsum = b.binary(Op::Add, Flags::NONE, long_pos, long_val);
+            let lout = b.binary(Op::Xor, Flags::NONE, lsum, live_x);
+            b.ret(&[lout]);
+
+            b.begin(short_hit);
+            let short_pos = b.param(Ty::I64);
+            let short_val = b.param(Ty::I64);
+            let loaded = b.load(Ty::I64, Flags::NONE, ptr, 8, MemAttrs::aligned(8));
+            let xor_diff = b.binary(Op::Xor, Flags::NONE, short_val, loaded);
+            let sout = b.binary(Op::Add, Flags::NONE, short_pos, xor_diff);
+            b.ret(&[sout]);
+
+            let func = b
+                .finish_checked()
+                .expect("short_hit + xor_diff scratch eviction LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+
+            let mut val_id: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut val_inst: Vec<usize, Alloc<'static>> = Vec::new_in(alloc);
+            for _ in 0..n_inst {
+                val_id.push(super::NO_VAL);
+            }
+            for inst in 0..n_inst {
+                let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+                if ty != Ty::NONE && inst != c0.index() {
+                    let id = u32_of(val_inst.len());
+                    val_inst.push(inst);
+                    val_id[inst] = id;
+                }
+            }
+            let num_vals = val_inst.len();
+            assert!(num_vals <= 64);
+            let val_words = 1usize;
+            let mut interf: Vec<u64, Alloc<'static>> = Vec::with_capacity_in(num_vals, alloc);
+            for _ in 0..num_vals {
+                interf.push(0);
+            }
+            let mut add_interf = |a: usize, c: usize| {
+                let ua = super::idx(val_id[a]);
+                let uc = super::idx(val_id[c]);
+                interf[ua] |= 1u64 << uc;
+                interf[uc] |= 1u64 << ua;
+            };
+            for v in [
+                x.index(),
+                y.index(),
+                live_x.index(),
+                cond.index(),
+                pos0.index(),
+                val0.index(),
+                cond0.index(),
+                pos1.index(),
+                val1.index(),
+                cond1.index(),
+                short_pos.index(),
+                short_val.index(),
+            ] {
+                add_interf(ptr.index(), v);
+            }
+            for v in [
+                x.index(),
+                y.index(),
+                cond.index(),
+                pos0.index(),
+                val0.index(),
+                cond0.index(),
+                pos1.index(),
+                val1.index(),
+                cond1.index(),
+                long_pos.index(),
+                long_val.index(),
+                lsum.index(),
+            ] {
+                add_interf(live_x.index(), v);
+            }
+            add_interf(x.index(), y.index());
+            add_interf(x.index(), pos0.index());
+            add_interf(y.index(), pos1.index());
+            add_interf(pos0.index(), val0.index());
+            add_interf(pos0.index(), cond0.index());
+            add_interf(val0.index(), cond0.index());
+            add_interf(pos1.index(), val1.index());
+            add_interf(pos1.index(), cond1.index());
+            add_interf(val1.index(), cond1.index());
+            add_interf(long_pos.index(), long_val.index());
+            // In `short_hit`, `short_val` dies at `xor_diff` (so both legally occupy `X2`), while
+            // `short_pos` stays live across `xor_diff` and interferes with BOTH `short_val` and `xor_diff`.
+            add_interf(short_pos.index(), short_val.index());
+            add_interf(short_pos.index(), loaded.index());
+            add_interf(short_val.index(), loaded.index());
+            add_interf(short_pos.index(), xor_diff.index());
+            add_interf(loaded.index(), xor_diff.index());
+
+            let mut loc: Vec<AllocLoc, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut crosses: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut clobbers: Vec<CallClobbers, Alloc<'static>> =
+                Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                loc.push(AllocLoc::None);
+                crosses.push(false);
+                clobbers.push(CallClobbers::EMPTY);
+            }
+            loc[ptr.index()] = AllocLoc::Gpr(0);
+            loc[x.index()] = AllocLoc::Gpr(1);
+            loc[y.index()] = AllocLoc::Gpr(3);
+            loc[live_x.index()] = AllocLoc::Gpr(12);
+            loc[cond.index()] = AllocLoc::Gpr(13);
+            loc[pos0.index()] = AllocLoc::Gpr(2);
+            loc[val0.index()] = AllocLoc::Gpr(4);
+            loc[cond0.index()] = AllocLoc::Gpr(13);
+            loc[pos1.index()] = AllocLoc::Gpr(5);
+            loc[val1.index()] = AllocLoc::Gpr(2);
+            loc[cond1.index()] = AllocLoc::Gpr(13);
+            loc[long_pos.index()] = AllocLoc::Gpr(2);
+            loc[long_val.index()] = AllocLoc::Gpr(4);
+            loc[lsum.index()] = AllocLoc::Gpr(14);
+            loc[lout.index()] = AllocLoc::Gpr(0);
+            loc[short_pos.index()] = AllocLoc::Gpr(4);
+            loc[short_val.index()] = AllocLoc::Gpr(2);
+            loc[loaded.index()] = AllocLoc::Gpr(11);
+            loc[xor_diff.index()] = AllocLoc::Gpr(2);
+            loc[sout.index()] = AllocLoc::Gpr(0);
+
+            let coalesce_edges = [
+                (u32_of(pos0.index()), u32_of(long_pos.index()), 512u64),
+                (u32_of(val0.index()), u32_of(long_val.index()), 512u64),
+                (u32_of(pos0.index()), u32_of(short_pos.index()), 256u64),
+                (u32_of(val0.index()), u32_of(short_val.index()), 256u64),
+                (u32_of(val1.index()), u32_of(long_val.index()), 128u64),
+                (u32_of(val1.index()), u32_of(short_val.index()), 128u64),
+            ];
+            let initial_cost: u64 = coalesce_edges
+                .iter()
+                .filter(|&&(a, p, _)| loc[super::idx(a)] != loc[super::idx(p)])
+                .map(|&(_, _, w)| w)
+                .sum();
+            assert_eq!(initial_cost, 640);
+
+            let mut used_callee_gpr = [false; 32];
+            let changed = super::refine_gpr_moves(
+                &view,
+                &[],
+                crate::Os::MacOs,
+                &val_id,
+                &val_inst,
+                val_words,
+                &interf,
+                &crosses,
+                &clobbers,
+                &coalesce_edges,
+                &[],
+                1,
+                true,
+                false,
+                super::CALLEE_SAVED_GPR_WITH_LR,
+                &mut loc,
+                &mut used_callee_gpr,
+                alloc,
+            );
+            assert!(
+                changed,
+                "refine_gpr_moves must evict zero-affinity `xor_diff` and swap `(short_pos, short_val)`"
+            );
+
+            assert_eq!(
+                loc[short_pos.index()],
+                AllocLoc::Gpr(2),
+                "`short_pos` must swap from X4 to X2"
+            );
+            assert_eq!(
+                loc[short_val.index()],
+                AllocLoc::Gpr(4),
+                "`short_val` must swap from X2 to X4"
+            );
+            assert_eq!(
+                loc[val1.index()],
+                AllocLoc::Gpr(4),
+                "`val1` must follow `short_val` and `long_val` to X4 on the next round"
+            );
+            assert!(
+                matches!(loc[xor_diff.index()], AllocLoc::Gpr(r) if r != 2 && r != 4),
+                "`xor_diff` must be evicted out of X2/X4 into a free caller-saved GPR, got {:?}",
+                loc[xor_diff.index()]
+            );
+
+            let residual_cost: u64 = coalesce_edges
+                .iter()
+                .filter(|&&(a, p, _)| loc[super::idx(a)] != loc[super::idx(p)])
+                .map(|&(_, _, w)| w)
+                .sum();
+            assert!(
+                residual_cost < initial_cost,
+                "expected strictly lower move cost ({residual_cost} < {initial_cost})"
+            );
+            assert_eq!(
+                residual_cost, 0,
+                "expected 0 residual move cost after scratch eviction + swap + round-2 follow-up"
+            );
+            assert!(
+                used_callee_gpr.iter().all(|&u| !u),
+                "scratch-evicting pair-swap must not allocate any callee-saved GPRs"
+            );
+            for (u_vid, &u_inst) in val_inst.iter().enumerate() {
+                let mut bits = interf[u_vid];
+                while bits != 0 {
+                    let v_vid = super::idx(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let v_inst = val_inst[v_vid];
+                    assert_ne!(
+                        loc[u_inst], loc[v_inst],
+                        "interference violation between inst {u_inst} and {v_inst}: both hold {:?}",
+                        loc[u_inst]
+                    );
+                }
+            }
+        }
+
+        // 2. Pair-swap with mutually-interfering zero-affinity scratch blockers on BOTH `r_cand`
+        //    (`w_c` in `X2` interfering with `u`) AND `r_u` (`w_u` in `X4` interfering with `v`,
+        //    plus `w_c <-> w_u`): verifies both evict to distinct free caller-saved GPRs with
+        //    zero interference violations and zero callee-saved expansion.
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let long_hit = b.create_block(BlockKind::Normal);
+            let short_hit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let ptr = b.param(Ty::PTR);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let pos0 = b.binary(Op::Add, Flags::NONE, x, y);
+            let val0 = b.binary(Op::Xor, Flags::NONE, x, y);
+            let cond = b.icmp(IntCond::Eq, pos0, c0);
+            b.br(
+                Flags::NONE,
+                cond,
+                (long_hit, &[pos0, val0]),
+                (short_hit, &[pos0, val0]),
+            );
+
+            b.begin(long_hit);
+            let lpos = b.param(Ty::I64);
+            let lval = b.param(Ty::I64);
+            let lout = b.binary(Op::Add, Flags::NONE, lpos, lval);
+            b.ret(&[lout]);
+
+            b.begin(short_hit);
+            let u = b.param(Ty::I64);
+            let v = b.param(Ty::I64);
+            let w_c = b.load(Ty::I64, Flags::NONE, ptr, 8, MemAttrs::aligned(8));
+            let w_u = b.load(Ty::I64, Flags::NONE, ptr, 16, MemAttrs::aligned(8));
+            let t0 = b.binary(Op::Xor, Flags::NONE, u, w_c);
+            let t1 = b.binary(Op::Add, Flags::NONE, v, w_u);
+            let sout = b.binary(Op::Xor, Flags::NONE, t0, t1);
+            b.ret(&[sout]);
+
+            let func = b
+                .finish_checked()
+                .expect("dual-side scratch eviction LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+
+            let mut val_id: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut val_inst: Vec<usize, Alloc<'static>> = Vec::new_in(alloc);
+            for _ in 0..n_inst {
+                val_id.push(super::NO_VAL);
+            }
+            for inst in 0..n_inst {
+                let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+                if ty != Ty::NONE && inst != c0.index() {
+                    let id = u32_of(val_inst.len());
+                    val_inst.push(inst);
+                    val_id[inst] = id;
+                }
+            }
+            let num_vals = val_inst.len();
+            assert!(num_vals <= 64);
+            let val_words = 1usize;
+            let mut interf: Vec<u64, Alloc<'static>> = Vec::with_capacity_in(num_vals, alloc);
+            for _ in 0..num_vals {
+                interf.push(0);
+            }
+            let mut add_interf = |a: usize, c: usize| {
+                let ua = super::idx(val_id[a]);
+                let uc = super::idx(val_id[c]);
+                interf[ua] |= 1u64 << uc;
+                interf[uc] |= 1u64 << ua;
+            };
+            add_interf(pos0.index(), val0.index());
+            add_interf(lpos.index(), lval.index());
+            add_interf(u.index(), v.index());
+            add_interf(u.index(), w_c.index());
+            add_interf(v.index(), w_u.index());
+            add_interf(w_c.index(), w_u.index());
+
+            let mut loc: Vec<AllocLoc, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut crosses: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut clobbers: Vec<CallClobbers, Alloc<'static>> =
+                Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                loc.push(AllocLoc::None);
+                crosses.push(false);
+                clobbers.push(CallClobbers::EMPTY);
+            }
+            loc[ptr.index()] = AllocLoc::Gpr(0);
+            loc[x.index()] = AllocLoc::Gpr(1);
+            loc[y.index()] = AllocLoc::Gpr(3);
+            loc[pos0.index()] = AllocLoc::Gpr(2);
+            loc[val0.index()] = AllocLoc::Gpr(4);
+            loc[cond.index()] = AllocLoc::Gpr(13);
+            loc[lpos.index()] = AllocLoc::Gpr(2);
+            loc[lval.index()] = AllocLoc::Gpr(4);
+            loc[lout.index()] = AllocLoc::Gpr(0);
+            loc[u.index()] = AllocLoc::Gpr(4);
+            loc[v.index()] = AllocLoc::Gpr(2);
+            loc[w_c.index()] = AllocLoc::Gpr(2);
+            loc[w_u.index()] = AllocLoc::Gpr(4);
+            loc[t0.index()] = AllocLoc::Gpr(11);
+            loc[t1.index()] = AllocLoc::Gpr(12);
+            loc[sout.index()] = AllocLoc::Gpr(0);
+
+            let coalesce_edges = [
+                (u32_of(pos0.index()), u32_of(lpos.index()), 512u64),
+                (u32_of(val0.index()), u32_of(lval.index()), 512u64),
+                (u32_of(pos0.index()), u32_of(u.index()), 256u64),
+                (u32_of(val0.index()), u32_of(v.index()), 256u64),
+            ];
+            let mut used_callee_gpr = [false; 32];
+            let changed = super::refine_gpr_moves(
+                &view,
+                &[],
+                crate::Os::MacOs,
+                &val_id,
+                &val_inst,
+                val_words,
+                &interf,
+                &crosses,
+                &clobbers,
+                &coalesce_edges,
+                &[],
+                1,
+                true,
+                false,
+                super::CALLEE_SAVED_GPR_WITH_LR,
+                &mut loc,
+                &mut used_callee_gpr,
+                alloc,
+            );
+            assert!(changed, "dual-side scratch eviction pair-swap must succeed");
+            assert_eq!(loc[u.index()], AllocLoc::Gpr(2));
+            assert_eq!(loc[v.index()], AllocLoc::Gpr(4));
+            assert_ne!(
+                loc[w_c.index()],
+                loc[w_u.index()],
+                "mutually-interfering evicted scratch temps must receive distinct GPRs"
+            );
+            assert!(matches!(loc[w_c.index()], AllocLoc::Gpr(r) if r != 2 && r != 4));
+            assert!(matches!(loc[w_u.index()], AllocLoc::Gpr(r) if r != 2 && r != 4));
+            assert!(used_callee_gpr.iter().all(|&used| !used));
+            for (u_vid, &u_inst) in val_inst.iter().enumerate() {
+                let mut bits = interf[u_vid];
+                while bits != 0 {
+                    let v_vid = super::idx(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let v_inst = val_inst[v_vid];
+                    assert_ne!(
+                        loc[u_inst], loc[v_inst],
+                        "interference violation between inst {u_inst} and {v_inst}: both hold {:?}",
+                        loc[u_inst]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_cfg_parallel_copy_cycle_swap_cost_breaks_tied_and_pinned_swaps() {
+        let alloc = test_alloc();
+
+        // Build a compact LIR CFG with a 2-param `short_hit(short_pos, short_val)` receiving
+        // `(pos, val)` on one edge (`entry -> short_hit`) and forwarding `short_pos` and
+        // `short_val` along two separate outgoing edges (`ext_pos_blk` and `other_val_blk`).
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let short_hit = b.create_block(BlockKind::Normal);
+        let ext_pos_blk = b.create_block(BlockKind::Normal);
+        let other_val_blk = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let a = b.param(Ty::I64);
+        let bv = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let pos = b.binary(Op::Add, Flags::NONE, a, bv);
+        let val = b.binary(Op::Xor, Flags::NONE, a, bv);
+        let anchor_pos = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+        let anchor_val = b.load(Ty::I64, Flags::NONE, ptr, 8, MemAttrs::aligned(8));
+        let anchor_ext = b.load(Ty::I64, Flags::NONE, ptr, 16, MemAttrs::aligned(8));
+        let anchor_oth = b.load(Ty::I64, Flags::NONE, ptr, 24, MemAttrs::aligned(8));
+        b.jump((short_hit, &[pos, val]));
+
+        b.begin(short_hit);
+        let short_pos = b.param(Ty::I64);
+        let short_val = b.param(Ty::I64);
+        let cond = b.icmp(IntCond::Eq, short_pos, c0);
+        b.br(
+            Flags::NONE,
+            cond,
+            (ext_pos_blk, &[short_pos]),
+            (other_val_blk, &[short_val]),
+        );
+
+        b.begin(ext_pos_blk);
+        let ext_pos = b.param(Ty::I64);
+        let r1a = b.binary(Op::Add, Flags::NONE, ext_pos, anchor_pos);
+        let r1 = b.binary(Op::Xor, Flags::NONE, r1a, anchor_ext);
+        b.ret(&[r1]);
+
+        b.begin(other_val_blk);
+        let other_val = b.param(Ty::I64);
+        let r2a = b.binary(Op::Add, Flags::NONE, other_val, anchor_val);
+        let r2 = b.binary(Op::Xor, Flags::NONE, r2a, anchor_oth);
+        b.ret(&[r2]);
+
+        let func = b
+            .finish_checked()
+            .expect("parallel-copy cycle-swap test LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+
+        let mut val_id: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut val_inst: Vec<usize, Alloc<'static>> = Vec::new_in(alloc);
+        for _ in 0..n_inst {
+            val_id.push(super::NO_VAL);
+        }
+        for inst in 0..n_inst {
+            let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+            if ty != Ty::NONE && inst != c0.index() {
+                let id = u32_of(val_inst.len());
+                val_inst.push(inst);
+                val_id[inst] = id;
+            }
+        }
+        let num_vals = val_inst.len();
+        assert!(num_vals <= 64);
+        let val_words = 1usize;
+        let mut interf: Vec<u64, Alloc<'static>> = Vec::with_capacity_in(num_vals, alloc);
+        for _ in 0..num_vals {
+            interf.push(0);
+        }
+        let mut add_interf = |x: usize, y: usize| {
+            let ux = super::idx(val_id[x]);
+            let uy = super::idx(val_id[y]);
+            interf[ux] |= 1u64 << uy;
+            interf[uy] |= 1u64 << ux;
+        };
+        add_interf(pos.index(), val.index());
+        add_interf(short_pos.index(), short_val.index());
+        add_interf(short_pos.index(), cond.index());
+        add_interf(short_val.index(), cond.index());
+
+        let mut base_loc: Vec<AllocLoc, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut crosses: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut clobbers: Vec<CallClobbers, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            base_loc.push(AllocLoc::None);
+            crosses.push(false);
+            clobbers.push(CallClobbers::EMPTY);
+        }
+        base_loc[ptr.index()] = AllocLoc::Gpr(0);
+        base_loc[a.index()] = AllocLoc::Gpr(1);
+        base_loc[bv.index()] = AllocLoc::Gpr(3);
+        base_loc[pos.index()] = AllocLoc::Gpr(2);
+        base_loc[val.index()] = AllocLoc::Gpr(4);
+        base_loc[anchor_pos.index()] = AllocLoc::Gpr(2);
+        base_loc[anchor_val.index()] = AllocLoc::Gpr(4);
+        base_loc[anchor_ext.index()] = AllocLoc::Gpr(4);
+        base_loc[anchor_oth.index()] = AllocLoc::Gpr(2);
+        base_loc[short_pos.index()] = AllocLoc::Gpr(4);
+        base_loc[short_val.index()] = AllocLoc::Gpr(2);
+        base_loc[cond.index()] = AllocLoc::Gpr(13);
+        base_loc[ext_pos.index()] = AllocLoc::Gpr(4);
+        base_loc[r1a.index()] = AllocLoc::Gpr(11);
+        base_loc[r1.index()] = AllocLoc::Gpr(0);
+        base_loc[other_val.index()] = AllocLoc::Gpr(2);
+        base_loc[r2a.index()] = AllocLoc::Gpr(12);
+        base_loc[r2.index()] = AllocLoc::Gpr(0);
+
+        // 1. Naive-tie 2-cycle swap: `(pos=X2 -> short_pos=X4, val=X4 -> short_val=X2)` on edge 0
+        //    vs separate outgoing anchors `(short_pos -> ext_pos=X4)` and `(short_val -> other_val=X2)`.
+        //    Under naive 1-move accounting, swapping ties at `256 vs 256` (delta 0, never taken);
+        //    with `edge_groups = &[(0, 2)]`, true parallel-copy cost drops `384 -> 256` (3 -> 2 movs)
+        //    and breaks the 2-cycle swap cleanly.
+        {
+            let coalesce_edges = [
+                (u32_of(pos.index()), u32_of(short_pos.index()), 128u64),
+                (u32_of(val.index()), u32_of(short_val.index()), 128u64),
+                (u32_of(short_pos.index()), u32_of(ext_pos.index()), 128u64),
+                (u32_of(short_val.index()), u32_of(other_val.index()), 128u64),
+                (u32_of(anchor_pos.index()), u32_of(pos.index()), 512u64),
+                (u32_of(anchor_val.index()), u32_of(val.index()), 512u64),
+                (u32_of(anchor_ext.index()), u32_of(ext_pos.index()), 512u64),
+                (u32_of(anchor_oth.index()), u32_of(other_val.index()), 512u64),
+            ];
+
+            let mut naive_loc: Vec<AllocLoc, Alloc<'static>> =
+                Vec::with_capacity_in(n_inst, alloc);
+            for &l in &base_loc {
+                naive_loc.push(l);
+            }
+            let mut naive_callee = [false; 32];
+            let naive_changed = super::refine_gpr_moves(
+                &view,
+                &[],
+                crate::Os::MacOs,
+                &val_id,
+                &val_inst,
+                val_words,
+                &interf,
+                &crosses,
+                &clobbers,
+                &coalesce_edges,
+                &[],
+                1,
+                true,
+                false,
+                super::CALLEE_SAVED_GPR_WITH_LR,
+                &mut naive_loc,
+                &mut naive_callee,
+                alloc,
+            );
+            assert!(
+                !naive_changed,
+                "without parallel-copy edge groups, tied 2-vs-2 swap must not trigger"
+            );
+
+            let mut loc: Vec<AllocLoc, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for &l in &base_loc {
+                loc.push(l);
+            }
+            let mut used_callee_gpr = [false; 32];
+            let edge_groups = [(0u32, 2u32)];
+            let changed = super::refine_gpr_moves(
+                &view,
+                &[],
+                crate::Os::MacOs,
+                &val_id,
+                &val_inst,
+                val_words,
+                &interf,
+                &crosses,
+                &clobbers,
+                &coalesce_edges,
+                &edge_groups,
+                1,
+                true,
+                false,
+                super::CALLEE_SAVED_GPR_WITH_LR,
+                &mut loc,
+                &mut used_callee_gpr,
+                alloc,
+            );
+            assert!(
+                changed,
+                "parallel-copy cycle-swap cost must break the tied 2-cycle swap (3 -> 2 moves)"
+            );
+            assert_eq!(loc[short_pos.index()], AllocLoc::Gpr(2));
+            assert_eq!(loc[short_val.index()], AllocLoc::Gpr(4));
+            assert!(used_callee_gpr.iter().all(|&u| !u));
+            for (u_vid, &u_inst) in val_inst.iter().enumerate() {
+                let mut bits = interf[u_vid];
+                while bits != 0 {
+                    let v_vid = super::idx(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let v_inst = val_inst[v_vid];
+                    assert_ne!(loc[u_inst], loc[v_inst]);
+                }
+            }
+        }
+
+        // 2. Heavily-pinned 2-cycle swap: `short_pos` is pinned to X4 (weight 512) while
+        //    `short_val` has no outgoing X2 anchor. Pair-swap is unprofitable (loses 512), but
+        //    moving `short_val` to a free caller-saved GPR breaks the `X16` 2-cycle swap (3 -> 2
+        //    moves, true cost `384 -> 256`) while preserving `short_pos = X4`.
+        {
+            let coalesce_edges = [
+                (u32_of(pos.index()), u32_of(short_pos.index()), 128u64),
+                (u32_of(val.index()), u32_of(short_val.index()), 128u64),
+                (u32_of(short_pos.index()), u32_of(ext_pos.index()), 512u64),
+                (u32_of(anchor_pos.index()), u32_of(pos.index()), 512u64),
+                (u32_of(anchor_val.index()), u32_of(val.index()), 512u64),
+                (u32_of(anchor_ext.index()), u32_of(ext_pos.index()), 512u64),
+            ];
+
+            let mut loc: Vec<AllocLoc, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for &l in &base_loc {
+                loc.push(l);
+            }
+            let mut used_callee_gpr = [false; 32];
+            let edge_groups = [(0u32, 2u32)];
+            let changed = super::refine_gpr_moves(
+                &view,
+                &[],
+                crate::Os::MacOs,
+                &val_id,
+                &val_inst,
+                val_words,
+                &interf,
+                &crosses,
+                &clobbers,
+                &coalesce_edges,
+                &edge_groups,
+                1,
+                true,
+                false,
+                super::CALLEE_SAVED_GPR_WITH_LR,
+                &mut loc,
+                &mut used_callee_gpr,
+                alloc,
+            );
+            assert!(
+                changed,
+                "free-register cycle-breaker must break pinned 2-cycle swap (3 -> 2 moves)"
+            );
+            assert_eq!(
+                loc[short_pos.index()],
+                AllocLoc::Gpr(4),
+                "heavily-anchored `short_pos` must remain in X4"
+            );
+            assert!(
+                matches!(loc[short_val.index()], AllocLoc::Gpr(r) if r != 2 && r != 4),
+                "`short_val` must move out of X2/X4 to a free GPR to eliminate X16 swap, got {:?}",
+                loc[short_val.index()]
+            );
+            assert!(used_callee_gpr.iter().all(|&u| !u));
+            for (u_vid, &u_inst) in val_inst.iter().enumerate() {
+                let mut bits = interf[u_vid];
+                while bits != 0 {
+                    let v_vid = super::idx(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let v_inst = val_inst[v_vid];
+                    assert_ne!(loc[u_inst], loc[v_inst]);
+                }
+            }
+        }
+
+        // 3. End-to-end `allocate_with_ipra_and_order` with `Some(&BlockLayout)`: verifies solved
+        //    edge weights and cold flags wire cleanly through `allocate_exact_cfg`.
+        {
+            let layout = super::super::layout::compute_block_layout(&view, alloc);
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            let ra = allocate_with_ipra_and_order(
+                &view,
+                &skip,
+                &[],
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                None,
+                Some(&layout),
+                alloc,
+            )
+            .expect("exact-CFG regalloc with BlockLayout succeeds");
+            assert!(matches!(ra.loc_of[short_pos.index()], AllocLoc::Gpr(_)));
+            assert!(matches!(ra.loc_of[short_val.index()], AllocLoc::Gpr(_)));
+            assert_ne!(ra.loc_of[short_pos.index()], ra.loc_of[short_val.index()]);
+        }
+    }
+
+    #[test]
+    fn exact_cfg_pairwise_edge_group_swap_eliminates_short_hit_moves() {
+        let alloc = test_alloc();
+
+        // Models the 2-predecessor `short_hit(short_pos, short_word)` merge block from
+        // `lz77_scan_default_leaf`:
+        // - `lane1` passes `(pos1 = X2, word1 = X4)`
+        // - `lane2` passes `(pos2 = X0, word2 = X4)`
+        // - `short_hit` initially holds `(short_pos = X4, short_word = X20)` while `X2`/`X0`
+        //   are occupied across `short_pos` by pinned values (`blk_x2`, `blk_x0`).
+        // Single-vreg recoloring cannot move `short_word` to `X4` (blocked by `short_pos`) or
+        // `short_pos` to `X2`/`X0` (blocked by `blk_x2`/`blk_x0`), so pairwise swap of
+        // `(short_pos, short_word)` -> `(X20, X4)` eliminates BOTH `mov x20, x4` edge copies
+        // (weighted move cost `512 -> 256`).
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let lane1 = b.create_block(BlockKind::Normal);
+        let lane2 = b.create_block(BlockKind::Normal);
+        let short_hit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let anchor_x2 = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(8));
+        let anchor_x0 = b.load(Ty::I64, Flags::NONE, ptr, 8, MemAttrs::aligned(8));
+        let anchor_x4 = b.load(Ty::I64, Flags::NONE, ptr, 16, MemAttrs::aligned(8));
+        let cond = b.icmp(IntCond::Eq, x, c0);
+        b.br(Flags::NONE, cond, (lane1, &[]), (lane2, &[]));
+
+        b.begin(lane1);
+        let pos1 = b.binary(Op::Add, Flags::NONE, x, y);
+        let word1 = b.load(Ty::I64, Flags::NONE, ptr, 24, MemAttrs::aligned(8));
+        b.jump((short_hit, &[pos1, word1]));
+
+        b.begin(lane2);
+        let pos2 = b.binary(Op::Sub, Flags::NONE, x, y);
+        let word2 = b.load(Ty::I64, Flags::NONE, ptr, 32, MemAttrs::aligned(8));
+        b.jump((short_hit, &[pos2, word2]));
+
+        b.begin(short_hit);
+        let short_pos = b.param(Ty::I64);
+        let short_word = b.param(Ty::I64);
+        let blk_x2 = b.load(Ty::I64, Flags::NONE, ptr, 40, MemAttrs::aligned(8));
+        let blk_x0 = b.load(Ty::I64, Flags::NONE, ptr, 48, MemAttrs::aligned(8));
+        let s0 = b.load(Ty::I64, Flags::NONE, ptr, 56, MemAttrs::aligned(8));
+        let s1 = b.load(Ty::I64, Flags::NONE, ptr, 64, MemAttrs::aligned(8));
+        let s2 = b.load(Ty::I64, Flags::NONE, ptr, 72, MemAttrs::aligned(8));
+        let t0 = b.binary(Op::Add, Flags::NONE, short_pos, short_word);
+        let t1 = b.binary(Op::Xor, Flags::NONE, t0, blk_x2);
+        let t2 = b.binary(Op::Add, Flags::NONE, t1, blk_x0);
+        let t3 = b.binary(Op::Xor, Flags::NONE, t2, s0);
+        let t4 = b.binary(Op::Add, Flags::NONE, t3, s1);
+        let t5 = b.binary(Op::Xor, Flags::NONE, t4, s2);
+        let t6 = b.binary(Op::Add, Flags::NONE, t5, anchor_x2);
+        let t7 = b.binary(Op::Xor, Flags::NONE, t6, anchor_x0);
+        let out = b.binary(Op::Add, Flags::NONE, t7, anchor_x4);
+        b.ret(&[out]);
+
+        let func = b
+            .finish_checked()
+            .expect("2-predecessor short_hit merge LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+
+        let mut val_id: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut val_inst: Vec<usize, Alloc<'static>> = Vec::new_in(alloc);
+        for _ in 0..n_inst {
+            val_id.push(super::NO_VAL);
+        }
+        for inst in 0..n_inst {
+            let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+            if ty != Ty::NONE && inst != c0.index() {
+                let id = u32_of(val_inst.len());
+                val_inst.push(inst);
+                val_id[inst] = id;
+            }
+        }
+        let num_vals = val_inst.len();
+        assert!(num_vals <= 64);
+        let val_words = 1usize;
+
+        let coalesce_edges = [
+            (u32_of(pos1.index()), u32_of(short_pos.index()), 128u64),
+            (u32_of(word1.index()), u32_of(short_word.index()), 128u64),
+            (u32_of(pos2.index()), u32_of(short_pos.index()), 128u64),
+            (u32_of(word2.index()), u32_of(short_word.index()), 128u64),
+            (u32_of(anchor_x2.index()), u32_of(pos1.index()), 512u64),
+            (u32_of(anchor_x0.index()), u32_of(pos2.index()), 512u64),
+            (u32_of(anchor_x4.index()), u32_of(word1.index()), 512u64),
+            (u32_of(anchor_x4.index()), u32_of(word2.index()), 512u64),
+            (u32_of(anchor_x2.index()), u32_of(blk_x2.index()), 512u64),
+            (u32_of(anchor_x0.index()), u32_of(blk_x0.index()), 512u64),
+        ];
+        let edge_groups = [(0u32, 2u32), (2u32, 4u32)];
+
+        let mut crosses: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut clobbers: Vec<CallClobbers, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            crosses.push(false);
+            clobbers.push(CallClobbers::EMPTY);
+        }
+
+        // 1. Clean colliding merge: `(short_pos=X4, short_word=X20)` swaps to `(X20, X4)`.
+        // 2. Same merge with 3 zero-affinity scratch temps (`s0`, `s1`, `s2`) also in `X4`
+        //    interfering with `short_word`: all 3 evict cleanly and `(short_pos, short_word)`
+        //    still swaps to `(X20, X4)`.
+        for with_three_scratch_blockers in [false, true] {
+            let mut interf: Vec<u64, Alloc<'static>> = Vec::with_capacity_in(num_vals, alloc);
+            for _ in 0..num_vals {
+                interf.push(0);
+            }
+            let mut add_interf = |u: usize, v: usize| {
+                let uu = super::idx(val_id[u]);
+                let uv = super::idx(val_id[v]);
+                interf[uu] |= 1u64 << uv;
+                interf[uv] |= 1u64 << uu;
+            };
+            add_interf(pos1.index(), word1.index());
+            add_interf(pos2.index(), word2.index());
+            add_interf(short_pos.index(), short_word.index());
+            add_interf(short_pos.index(), blk_x2.index());
+            add_interf(short_pos.index(), blk_x0.index());
+            add_interf(short_word.index(), blk_x2.index());
+            add_interf(short_word.index(), blk_x0.index());
+            if with_three_scratch_blockers {
+                add_interf(short_word.index(), s0.index());
+                add_interf(short_word.index(), s1.index());
+                add_interf(short_word.index(), s2.index());
+            }
+
+            let mut loc: Vec<AllocLoc, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                loc.push(AllocLoc::None);
+            }
+            loc[ptr.index()] = AllocLoc::Gpr(3);
+            loc[x.index()] = AllocLoc::Gpr(1);
+            loc[y.index()] = AllocLoc::Gpr(5);
+            loc[anchor_x2.index()] = AllocLoc::Gpr(2);
+            loc[anchor_x0.index()] = AllocLoc::Gpr(0);
+            loc[anchor_x4.index()] = AllocLoc::Gpr(4);
+            loc[cond.index()] = AllocLoc::Gpr(13);
+            loc[pos1.index()] = AllocLoc::Gpr(2);
+            loc[word1.index()] = AllocLoc::Gpr(4);
+            loc[pos2.index()] = AllocLoc::Gpr(0);
+            loc[word2.index()] = AllocLoc::Gpr(4);
+            loc[short_pos.index()] = AllocLoc::Gpr(4);
+            loc[short_word.index()] = AllocLoc::Gpr(20);
+            loc[blk_x2.index()] = AllocLoc::Gpr(2);
+            loc[blk_x0.index()] = AllocLoc::Gpr(0);
+            let scratch_reg = if with_three_scratch_blockers { 4 } else { 6 };
+            loc[s0.index()] = AllocLoc::Gpr(scratch_reg);
+            loc[s1.index()] = AllocLoc::Gpr(scratch_reg);
+            loc[s2.index()] = AllocLoc::Gpr(scratch_reg);
+            loc[t0.index()] = AllocLoc::Gpr(9);
+            loc[t1.index()] = AllocLoc::Gpr(10);
+            loc[t2.index()] = AllocLoc::Gpr(11);
+            loc[t3.index()] = AllocLoc::Gpr(12);
+            loc[t4.index()] = AllocLoc::Gpr(14);
+            loc[t5.index()] = AllocLoc::Gpr(15);
+            loc[t6.index()] = AllocLoc::Gpr(8);
+            loc[t7.index()] = AllocLoc::Gpr(7);
+            loc[out.index()] = AllocLoc::Gpr(0);
+
+            let initial_cost: u64 = coalesce_edges
+                .iter()
+                .filter(|&&(a, p, _)| loc[super::idx(a)] != loc[super::idx(p)])
+                .map(|&(_, _, w)| w)
+                .sum();
+            assert_eq!(initial_cost, 512);
+
+            let mut used_callee_gpr = [false; 32];
+            used_callee_gpr[20] = true;
+            let changed = super::refine_gpr_moves(
+                &view,
+                &[],
+                crate::Os::MacOs,
+                &val_id,
+                &val_inst,
+                val_words,
+                &interf,
+                &crosses,
+                &clobbers,
+                &coalesce_edges,
+                &edge_groups,
+                1,
+                true,
+                false,
+                super::CALLEE_SAVED_GPR_WITH_LR,
+                &mut loc,
+                &mut used_callee_gpr,
+                alloc,
+            );
+            assert!(
+                changed,
+                "pairwise swap must eliminate colliding `mov x20, x4` copies (scratch={with_three_scratch_blockers})"
+            );
+            assert_eq!(
+                loc[short_word.index()],
+                AllocLoc::Gpr(4),
+                "`short_word` must coalesce with both incoming lanes' X4"
+            );
+            assert_eq!(
+                loc[short_pos.index()],
+                AllocLoc::Gpr(20),
+                "`short_pos` must swap into X20"
+            );
+            let residual_cost: u64 = coalesce_edges
+                .iter()
+                .filter(|&&(a, p, _)| loc[super::idx(a)] != loc[super::idx(p)])
+                .map(|&(_, _, w)| w)
+                .sum();
+            assert_eq!(
+                residual_cost, 256,
+                "expected weighted move cost to drop 512 -> 256 (4 moves -> 2 moves)"
+            );
+            for (r, &used) in used_callee_gpr.iter().enumerate() {
+                if used {
+                    assert!(
+                        r == 19 || r == 20,
+                        "pairwise swap must not expand callee-saved pairs beyond X19:X20, got X{r}"
+                    );
+                }
+            }
+            for (u_vid, &u_inst) in val_inst.iter().enumerate() {
+                let mut bits = interf[u_vid];
+                while bits != 0 {
+                    let v_vid = super::idx(bits.trailing_zeros());
+                    bits &= bits - 1;
+                    let v_inst = val_inst[v_vid];
+                    assert_ne!(
+                        loc[u_inst], loc[v_inst],
+                        "interference violation between inst {u_inst} and {v_inst}: both hold {:?}",
+                        loc[u_inst]
+                    );
+                }
+            }
+        }
+
+        // 3. End-to-end `allocate` on a 2-predecessor merge where both lanes pass `word` in the
+        //    same register and distinct `pos1`/`pos2` values: verifies `short_word` matches `word`
+        //    with zero `word` copies and at most 1 move across both predecessors.
+        {
+            let mut b2 = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig2 = b2.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b2.set_signature(sig2);
+            let e2 = b2.create_block(BlockKind::Normal);
+            let l1 = b2.create_block(BlockKind::Normal);
+            let l2 = b2.create_block(BlockKind::Normal);
+            let merge = b2.create_block(BlockKind::Normal);
+
+            b2.begin(e2);
+            let p2 = b2.param(Ty::PTR);
+            let a2 = b2.param(Ty::I64);
+            let bv2 = b2.param(Ty::I64);
+            let z2 = b2.iconst(Ty::I64, 0);
+            let p1_val = b2.binary(Op::Add, Flags::NONE, a2, bv2);
+            let p2_val = b2.binary(Op::Sub, Flags::NONE, a2, bv2);
+            let word_val = b2.load(Ty::I64, Flags::NONE, p2, 0, MemAttrs::aligned(8));
+            let c2 = b2.icmp(IntCond::Eq, a2, z2);
+            b2.br(Flags::NONE, c2, (l1, &[]), (l2, &[]));
+
+            b2.begin(l1);
+            b2.jump((merge, &[p1_val, word_val]));
+
+            b2.begin(l2);
+            b2.jump((merge, &[p2_val, word_val]));
+
+            b2.begin(merge);
+            let m_pos = b2.param(Ty::I64);
+            let m_word = b2.param(Ty::I64);
+            let m_out = b2.binary(Op::Xor, Flags::NONE, m_pos, m_word);
+            b2.ret(&[m_out]);
+
+            let func2 = b2
+                .finish_checked()
+                .expect("end-to-end 2-predecessor merge LIR builds");
+            let view2 = func2.view();
+            let n2 = view2.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n2, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n2, alloc);
+            for _ in 0..n2 {
+                skip.push(false);
+                tail.push(false);
+            }
+            let ra = allocate(&view2, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("end-to-end 2-predecessor merge regalloc succeeds");
+            assert!(matches!(ra.loc_of[m_pos.index()], AllocLoc::Gpr(_)));
+            assert!(matches!(ra.loc_of[m_word.index()], AllocLoc::Gpr(_)));
+            assert_ne!(ra.loc_of[m_pos.index()], ra.loc_of[m_word.index()]);
+            assert_eq!(
+                ra.loc_of[m_word.index()],
+                ra.loc_of[word_val.index()],
+                "`short_word` must stay in `word_val`'s register across both predecessors"
+            );
+            let total_moves = usize::from(ra.loc_of[p1_val.index()] != ra.loc_of[m_pos.index()])
+                + usize::from(ra.loc_of[word_val.index()] != ra.loc_of[m_word.index()])
+                + usize::from(ra.loc_of[p2_val.index()] != ra.loc_of[m_pos.index()])
+                + usize::from(ra.loc_of[word_val.index()] != ra.loc_of[m_word.index()]);
+            assert!(
+                total_moves <= 1,
+                "expected at most 1 parallel-copy move across both lanes, got {total_moves}"
             );
         }
     }

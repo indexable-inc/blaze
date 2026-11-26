@@ -10,9 +10,11 @@
 //!    (`v0..v31`) outside their return slots so hot callers incur zero spills across cold edges,
 //!    while [`cold_preserve_save_set`] lets the cold callee save only the registers it actually
 //!    touches.
-//! 3. **Wide Internal Fast ABI** ([`CallConvKind::InternalFast`]): packs up to 16 GPR arguments
-//!    (`x0..x15`), 16 FP/NEON arguments (`v0..v15`), and 8 register returns (`x0..x7` / `v0..v7`),
-//!    eliminating stack argument traffic and `x8` `sret` memory round-trips.
+//! 3. **Wide Internal Fast ABI** ([`CallConvKind::InternalFast`]): packs up to 15 GPR arguments
+//!    (`x0..x7`, `x9..x15`, keeping `x8` dedicated to `sret`), 16 FP/NEON arguments
+//!    (`v0..v7`, `v16..v23`, excluding callee-saved `v8..v15` and scratch `v29..v31`), and multi-reg
+//!    returns (`x0..x7` / `v0..v7`), eliminating stack argument traffic and `x8` `sret` memory
+//!    round-trips.
 //! 4. **Interprocedural Register-Avoidance Coloring**: aggregates caller live-register pressure
 //!    across all direct callers of each callee and reorders `scratch_gpr_order` /
 //!    `scratch_fp_order` so callees allocate caller-untouched registers first and caller-hot
@@ -25,7 +27,7 @@ use core::alloc::Allocator;
 
 use blaze_lir::{
     Op, Ty, View,
-    func::{FnAttrs, ParamFactsRec, ParamKind, ParamRec, RefKind},
+    func::{Conv, FnAttrs, ParamFactsRec, ParamKind, ParamRec, RefKind, SigRec},
     lto::tarjan_sccs,
     ty::Form,
 };
@@ -43,9 +45,25 @@ const C_ABI_MAX_FP_RETS: u8 = 4;
 /// AAPCS64 indirect result pointer register (`x8`).
 const A64_SRET_REG: u8 = 8;
 
-/// Hardware cap on `InternalFast` argument GPRs (`x0..x15`; excludes `x16`/`x17` scratch & `x18`).
-const MAX_HW_FAST_GPR_ARGS: u8 = 16;
-/// Hardware cap on `InternalFast` argument FP/NEON registers (`v0..v15`).
+/// Canonical `InternalFast` GPR argument register pool (`x0..x7`, `x9..x15`):
+/// - Indices `0..8` match AAPCS64 (`x0..x7`) so 1..=8-arg calls remain zero-cost compatible.
+/// - Strictly excludes `x8` (dedicated `Sret` pointer), `x16`/`x17` (linker / `GotSlot` scratch),
+///   `x18` (macOS platform register), and `x19..x28` (callee-saved).
+pub const INTERNAL_FAST_GPR_ARGS: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15];
+
+/// Canonical `InternalFast` FP/NEON argument register pool (`v0..v7`, `v16..v23`):
+/// - Indices `0..8` match AAPCS64 (`v0..v7`).
+/// - Strictly excludes `v8..v15` (AAPCS64 callee-saved) and `v29..v31` (inline NEON / RA spill
+///   scratch).
+pub const INTERNAL_FAST_FP_ARGS: [u8; 16] =
+    [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23];
+
+/// Direct multi-word GPR return register pool (`x0..x3`) for `InternalFast` struct return lowering.
+pub const INTERNAL_FAST_MAX_GPR_RETS: usize = 4;
+
+/// Hardware cap on `InternalFast` argument GPRs (`INTERNAL_FAST_GPR_ARGS.len()`).
+const MAX_HW_FAST_GPR_ARGS: u8 = 15;
+/// Hardware cap on `InternalFast` argument FP/NEON registers (`INTERNAL_FAST_FP_ARGS.len()`).
 const MAX_HW_FAST_FP_ARGS: u8 = 16;
 /// Hardware cap on `InternalFast` return registers per class (`x0..x7` / `v0..v7`).
 const MAX_HW_FAST_RETS: u8 = 8;
@@ -78,8 +96,9 @@ pub enum CallConvKind {
     /// Standard AAPCS64 C ABI (`x0..x7` / `v0..v7` args, `x0..x1` / `v0..v3` returns, `x8` sret).
     /// Mandatory for exported and address-taken functions.
     CAbi,
-    /// Module-internal wide register ABI: up to 16 GPR args (`x0..x15`), 16 FP/NEON args
-    /// (`v0..v15`), and 8 register returns (`x0..x7` / `v0..v7`).
+    /// Module-internal wide register ABI: up to 15 GPR args (`x0..x7`, `x9..x15`, keeping `x8`
+    /// dedicated to `sret`), 16 FP/NEON args (`v0..v7`, `v16..v23`), and multi-reg returns
+    /// (`x0..x7` / `v0..v7`).
     InternalFast,
     /// Module-internal cold ABI preserving all 28 GPRs (`x0..x17`, `x19..x28`) and all 32 NEON
     /// registers (`v0..v31`) outside return slots so hot callers suffer zero spills.
@@ -123,6 +142,7 @@ pub struct CustomCallPlan<A: Allocator> {
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct ZeroAbiStats {
     pub internal_fast_fns: usize,
+    pub wide_arg_fast_fns: usize,
     pub cold_preserve_all_fns: usize,
     pub stack_args_eliminated: usize,
     pub sret_eliminated: usize,
@@ -148,8 +168,9 @@ pub struct ZeroAbiOpts {
 }
 
 impl ZeroAbiOpts {
-    /// Release AArch64 export defaults: 16 GPR args (`x0..x15`), 16 FP/NEON args (`v0..v15`),
-    /// 8 register returns (`x0..x7` / `v0..v7`), cold `preserve_all`, and global SCC pinning.
+    /// Release AArch64 export defaults: 15 GPR args (`x0..x7`, `x9..x15`), 16 FP/NEON args
+    /// (`v0..v7`, `v16..v23`), 8 register returns (`x0..x7` / `v0..v7`), cold `preserve_all`, and
+    /// global SCC pinning.
     pub const fn arm64_export() -> Self {
         Self {
             max_fast_gpr_args: MAX_HW_FAST_GPR_ARGS,
@@ -196,6 +217,46 @@ pub fn cold_preserve_save_set<A: Allocator>(
     RegSet(actual_touched.0 & plan.preserved_regs.0)
 }
 
+/// Counts scalar/pointer GPR arguments and FP/NEON arguments in `view`'s own signature
+/// (excluding `ParamKind::Sret`, which occupies dedicated `x8`).
+pub fn count_sig_arg_classes(view: View<'_>) -> (u8, u8) {
+    let (params, _) = sig_slices(view, view.head.sig);
+    let mut gpr = 0u8;
+    let mut fp = 0u8;
+    for param in params {
+        let kind = ParamKind::from_byte(param.kind).unwrap_or(ParamKind::Value);
+        if kind == ParamKind::Sret {
+            continue;
+        }
+        let ty = Ty(param.ty);
+        if kind == ParamKind::Value && is_fp_or_vec(ty) {
+            fp = fp.saturating_add(1);
+        } else {
+            gpr = gpr.saturating_add(1);
+        }
+    }
+    (gpr, fp)
+}
+
+/// Returns `true` when `input` is eligible for wide-register [`CallConvKind::InternalFast`]
+/// argument promotion (`> 8` GPR or `> 8` FP/NEON scalar args passed via
+/// [`INTERNAL_FAST_GPR_ARGS`] / [`INTERNAL_FAST_FP_ARGS`]).
+///
+/// Strictly refuses exported, address-taken, cold (`ColdPreserveAll`), variadic, foreign-ABI
+/// (`Conv != Conv::C`), and `ParamKind::Byval` functions.
+pub fn is_internal_fast_eligible(input: &AbiFnInput<'_>, gpr_args: u8, fp_args: u8) -> bool {
+    if input.is_exported || input.address_taken {
+        return false;
+    }
+    if is_cold_candidate(input) {
+        return false;
+    }
+    if requires_fixed_c_abi(input.view) {
+        return false;
+    }
+    gpr_args > C_ABI_MAX_GPR_ARGS || fp_args > C_ABI_MAX_FP_ARGS
+}
+
 /// Plans whole-module AArch64 calling conventions, interprocedural register-avoidance ordering,
 /// global SCC pointer pinning, and cold `preserve_all` preservation sets.
 pub fn plan_module_abi<A: Allocator + Copy>(
@@ -218,7 +279,10 @@ pub fn plan_module_abi<A: Allocator + Copy>(
     // Phase 1: Classify baseline convention per function (Rule 1 ABI safety + Rule 2 ColdPreserveAll).
     let mut base_convs: Vec<CallConvKind, A> = Vec::with_capacity_in(n, alloc);
     for input in fns {
-        let conv = if input.is_exported || input.address_taken {
+        let conv = if input.is_exported
+            || input.address_taken
+            || requires_fixed_c_abi(input.view)
+        {
             CallConvKind::CAbi
         } else if opts.enable_cold_preserve_all && is_cold_candidate(input) {
             CallConvKind::ColdPreserveAll
@@ -359,10 +423,15 @@ pub fn plan_module_abi<A: Allocator + Copy>(
             base_conv
         };
 
+        let (gpr_args, fp_args) = count_sig_arg_classes(input.view);
+        let has_internal_caller = caller_counts.get(idx).copied().unwrap_or(0) > 0;
         match conv {
             CallConvKind::CAbi => {}
             CallConvKind::InternalFast | CallConvKind::PinnedScc => {
                 stats.internal_fast_fns += 1;
+                if has_internal_caller && is_internal_fast_eligible(input, gpr_args, fp_args) {
+                    stats.wide_arg_fast_fns += 1;
+                }
             }
             CallConvKind::ColdPreserveAll => {
                 stats.cold_preserve_all_fns += 1;
@@ -474,12 +543,37 @@ fn body_ends_in_trap_or_unwind(view: View<'_>) -> bool {
     saw_trap_or_unwind
 }
 
+/// Safely reads the [`SigRec`] for `sig_word` in `view`.
+fn sig_rec<'a>(view: View<'a>, sig_word: u32) -> Option<&'a SigRec> {
+    let sig_idx = usize::try_from(sig_word).ok()?;
+    view.sigs.get(sig_idx)
+}
+
+/// Returns `true` when `view`'s own signature requires strict C/foreign ABI handling:
+/// variadic `...`, explicit non-default calling convention (`Conv != Conv::C`), or
+/// `ParamKind::Byval` stack-copied C aggregates.
+fn requires_fixed_c_abi(view: View<'_>) -> bool {
+    let Some(rec) = sig_rec(view, view.head.sig) else {
+        return true;
+    };
+    if (rec.bits & SigRec::VARIADIC) != 0 {
+        return true;
+    }
+    if Conv::from_byte(rec.conv) != Some(Conv::C) {
+        return true;
+    }
+    let (params, _) = sig_slices(view, view.head.sig);
+    for param in params {
+        if ParamKind::from_byte(param.kind) == Some(ParamKind::Byval) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Safely reads `(params, rets)` slices for signature `sig_word` in `view`.
 fn sig_slices<'a>(view: View<'a>, sig_word: u32) -> (&'a [ParamRec], &'a [ParamRec]) {
-    let Some(sig_idx) = usize::try_from(sig_word).ok() else {
-        return (&[], &[]);
-    };
-    let Some(rec) = view.sigs.get(sig_idx) else {
+    let Some(rec) = sig_rec(view, sig_word) else {
         return (&[], &[]);
     };
     let Some(first) = usize::try_from(rec.first).ok() else {
@@ -626,8 +720,13 @@ fn assign_slots<A: Allocator + Copy>(
         let ty = Ty(param.ty);
         let use_fp = kind == ParamKind::Value && is_fp_or_vec(ty);
         if use_fp {
-            if next_fp < fp_cap {
-                param_slots.push(ArgSlot::Fp(next_fp));
+            let reg = if next_fp < fp_cap {
+                INTERNAL_FAST_FP_ARGS.get(usize::from(next_fp)).copied()
+            } else {
+                None
+            };
+            if let Some(fp_reg) = reg {
+                param_slots.push(ArgSlot::Fp(fp_reg));
                 next_fp += 1;
             } else {
                 let step = stack_arg_step(ty);
@@ -636,15 +735,22 @@ fn assign_slots<A: Allocator + Copy>(
                 stack_off = stack_off.saturating_add(step);
                 custom_stack_args += 1;
             }
-        } else if next_gpr < gpr_cap {
-            param_slots.push(ArgSlot::Gpr(next_gpr));
-            next_gpr += 1;
         } else {
-            let step = stack_arg_step(ty);
-            stack_off = align_up(stack_off, step);
-            param_slots.push(ArgSlot::StackOff(stack_off));
-            stack_off = stack_off.saturating_add(step);
-            custom_stack_args += 1;
+            let reg = if next_gpr < gpr_cap {
+                INTERNAL_FAST_GPR_ARGS.get(usize::from(next_gpr)).copied()
+            } else {
+                None
+            };
+            if let Some(gpr_reg) = reg {
+                param_slots.push(ArgSlot::Gpr(gpr_reg));
+                next_gpr += 1;
+            } else {
+                let step = stack_arg_step(ty);
+                stack_off = align_up(stack_off, step);
+                param_slots.push(ArgSlot::StackOff(stack_off));
+                stack_off = stack_off.saturating_add(step);
+                custom_stack_args += 1;
+            }
         }
     }
 
@@ -1415,7 +1521,9 @@ mod tests {
     use blaze_tier::{CallClobbers, Reg, RegSet};
 
     use super::{
-        AbiFnInput, ArgSlot, CallConvKind, PinnedReg, ZeroAbiOpts, cold_preserve_save_set,
+        A64_SRET_REG, AbiFnInput, ArgSlot, C_ABI_PRESERVED, CallConvKind, INTERNAL_FAST_FP_ARGS,
+        INTERNAL_FAST_GPR_ARGS, INTERNAL_FAST_MAX_GPR_RETS, PinnedReg, ZeroAbiOpts,
+        cold_preserve_save_set, count_sig_arg_classes, is_internal_fast_eligible,
         plan_call_clobbers, plan_module_abi,
     };
 
@@ -1423,7 +1531,13 @@ mod tests {
         blaze_own::testing::heap().alloc()
     }
 
-    fn build_i64_fn(n_params: usize, n_rets: usize, attrs: FnAttrs) -> Func<Alloc<'static>> {
+    fn build_i64_fn_with_sig(
+        n_params: usize,
+        n_rets: usize,
+        conv: Conv,
+        variadic: Variadic,
+        attrs: FnAttrs,
+    ) -> Func<Alloc<'static>> {
         let alloc = test_alloc();
         let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
         let mut params = Vec::with_capacity_in(n_params, alloc);
@@ -1434,7 +1548,7 @@ mod tests {
         for _ in 0..n_rets {
             rets.push(Param::of(Ty::I64));
         }
-        let sig = b.sig(Conv::C, Variadic::No, &params, &rets);
+        let sig = b.sig(conv, variadic, &params, &rets);
         b.set_signature(sig);
         b.set_attrs(attrs);
         let entry = b.create_block(BlockKind::Normal);
@@ -1448,10 +1562,70 @@ mod tests {
             if let Some(&v) = vals.get(i) {
                 ret_vals.push(v);
             } else {
-                ret_vals.push(b.iconst(Ty::I64, i as u128));
+                ret_vals.push(b.iconst(Ty::I64, u128::try_from(i).unwrap_or(0)));
             }
         }
         b.ret(&ret_vals);
+        b.finish_checked().unwrap()
+    }
+
+    fn build_i64_fn(n_params: usize, n_rets: usize, attrs: FnAttrs) -> Func<Alloc<'static>> {
+        build_i64_fn_with_sig(n_params, n_rets, Conv::C, Variadic::No, attrs)
+    }
+
+    fn build_f64_fn(n_params: usize) -> Func<Alloc<'static>> {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let mut params = Vec::with_capacity_in(n_params, alloc);
+        for _ in 0..n_params {
+            params.push(Param::of(Ty::F64));
+        }
+        let sig = b.sig(Conv::C, Variadic::No, &params, &[Param::of(Ty::F64)]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let mut first_val = None;
+        for _ in 0..n_params {
+            let v = b.param(Ty::F64);
+            if first_val.is_none() {
+                first_val = Some(v);
+            }
+        }
+        let ret_v = first_val.unwrap();
+        b.ret(&[ret_v]);
+        b.finish_checked().unwrap()
+    }
+
+    fn build_sret_and_i64_fn(size_bytes: u32, n_i64_params: usize) -> Func<Alloc<'static>> {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sret = Param {
+            ty: Ty::PTR,
+            ext: Ext::None,
+            kind: ParamKind::Sret,
+            facts: Facts { size: size_bytes, align: 3, ..Facts::default() },
+        };
+        let mut params = Vec::with_capacity_in(1 + n_i64_params, alloc);
+        params.push(sret);
+        for _ in 0..n_i64_params {
+            params.push(Param::of(Ty::I64));
+        }
+        let sig = b.sig(Conv::C, Variadic::No, &params, &[]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let out_ptr = b.param(Ty::PTR);
+        let mut first_x = None;
+        for _ in 0..n_i64_params {
+            let x = b.param(Ty::I64);
+            if first_x.is_none() {
+                first_x = Some(x);
+            }
+        }
+        if let Some(x) = first_x {
+            b.store(Flags::NONE, x, out_ptr, 0, MemAttrs::aligned(3));
+        }
+        b.ret(&[]);
         b.finish_checked().unwrap()
     }
 
@@ -1584,9 +1758,10 @@ mod tests {
         let plan = &out.plans[0];
         assert_eq!(plan.conv, CallConvKind::InternalFast);
         assert_eq!(plan.param_slots.len(), 12);
-        for r in 0..12u8 {
-            assert_eq!(plan.param_slots[usize::from(r)], ArgSlot::Gpr(r));
+        for (idx, &expected_reg) in INTERNAL_FAST_GPR_ARGS[..12].iter().enumerate() {
+            assert_eq!(plan.param_slots[idx], ArgSlot::Gpr(expected_reg));
         }
+        assert_eq!(plan.param_slots[8], ArgSlot::Gpr(9));
         assert_eq!(out.stats.internal_fast_fns, 1);
         assert_eq!(out.stats.stack_args_eliminated, 4);
     }
@@ -1827,5 +2002,220 @@ mod tests {
             assert_eq!(plan.conv, CallConvKind::InternalFast);
             assert!(plan.pinned_globals.is_empty());
         }
+    }
+
+    #[test]
+    fn internal_fast_gpr_pool_invariants() {
+        assert_eq!(INTERNAL_FAST_GPR_ARGS.len(), 15);
+        assert_eq!(INTERNAL_FAST_MAX_GPR_RETS, 4);
+        assert_eq!(&INTERNAL_FAST_GPR_ARGS[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let mut seen = 0u32;
+        for &reg in &INTERNAL_FAST_GPR_ARGS {
+            assert!(reg < 32, "GPR index out of range: {reg}");
+            assert_ne!(reg, A64_SRET_REG, "X8 must stay dedicated to Sret");
+            assert_ne!(reg, 16, "X16 is linker/GotSlot scratch");
+            assert_ne!(reg, 17, "X17 is linker/GotSlot scratch");
+            assert_ne!(reg, 18, "X18 is macOS platform register");
+            assert!(reg < 19, "X19..=X31 must never appear in InternalFast GPR arg pool: {reg}");
+            assert!(!C_ABI_PRESERVED.contains(Reg(reg)), "GPR arg must not be callee-saved: {reg}");
+
+            let bit = 1u32 << u32::from(reg);
+            assert_eq!(seen & bit, 0, "duplicate GPR in INTERNAL_FAST_GPR_ARGS: {reg}");
+            seen |= bit;
+        }
+    }
+
+    #[test]
+    fn internal_fast_fp_pool_invariants() {
+        assert_eq!(INTERNAL_FAST_FP_ARGS.len(), 16);
+        assert_eq!(&INTERNAL_FAST_FP_ARGS[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let mut seen = 0u32;
+        for &reg in &INTERNAL_FAST_FP_ARGS {
+            assert!(reg < 32, "FP index out of range: {reg}");
+            assert!(
+                !(8..=15).contains(&reg),
+                "V8..=V15 are callee-saved and must never appear in InternalFast FP pool: {reg}"
+            );
+            assert!(
+                !(29..=31).contains(&reg),
+                "V29..=V31 are inline NEON / RA spill scratch: {reg}"
+            );
+            assert!(
+                !C_ABI_PRESERVED.contains(Reg(32 + reg)),
+                "FP arg must not be callee-saved: {reg}"
+            );
+
+            let bit = 1u32 << u32::from(reg);
+            assert_eq!(seen & bit, 0, "duplicate FP reg in INTERNAL_FAST_FP_ARGS: {reg}");
+            seen |= bit;
+        }
+    }
+
+    #[test]
+    fn fourteen_arg_private_leaf_uses_internal_fast_while_exported_addr_taken_variadic_stay_c_abi()
+    {
+        let f_caller = build_i64_fn(2, 1, FnAttrs::default());
+        let f_private_leaf = build_i64_fn(14, 1, FnAttrs::default());
+        let f_exported_leaf = build_i64_fn(14, 1, FnAttrs::default());
+        let f_addr_taken_leaf = build_i64_fn(14, 1, FnAttrs::default());
+        let f_variadic_leaf =
+            build_i64_fn_with_sig(14, 1, Conv::C, Variadic::Yes, FnAttrs::default());
+        let f_foreign_leaf =
+            build_i64_fn_with_sig(14, 1, Conv::SysV64, Variadic::No, FnAttrs::default());
+
+        let inputs = [
+            AbiFnInput {
+                view: f_caller.view(),
+                is_exported: true,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[1, 2, 3, 4, 5],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+            AbiFnInput {
+                view: f_private_leaf.view(),
+                is_exported: false,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+            AbiFnInput {
+                view: f_exported_leaf.view(),
+                is_exported: true,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+            AbiFnInput {
+                view: f_addr_taken_leaf.view(),
+                is_exported: false,
+                address_taken: true,
+                is_cold: false,
+                direct_callees: &[],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+            AbiFnInput {
+                view: f_variadic_leaf.view(),
+                is_exported: false,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+            AbiFnInput {
+                view: f_foreign_leaf.view(),
+                is_exported: false,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+        ];
+
+        assert_eq!(count_sig_arg_classes(inputs[1].view), (14, 0));
+        assert!(is_internal_fast_eligible(&inputs[1], 14, 0));
+        assert!(!is_internal_fast_eligible(&inputs[1], 8, 8));
+        assert!(!is_internal_fast_eligible(&inputs[2], 14, 0));
+        assert!(!is_internal_fast_eligible(&inputs[3], 14, 0));
+        assert!(!is_internal_fast_eligible(&inputs[4], 14, 0));
+        assert!(!is_internal_fast_eligible(&inputs[5], 14, 0));
+
+        let out = plan_module_abi(&inputs, ZeroAbiOpts::arm64_export(), test_alloc());
+        assert_eq!(out.plans[0].conv, CallConvKind::CAbi);
+
+        // Private 14-arg leaf: upgraded to InternalFast with zero stack args and no X8 collision.
+        let leaf_plan = &out.plans[1];
+        assert_eq!(leaf_plan.conv, CallConvKind::InternalFast);
+        assert_eq!(leaf_plan.param_slots.len(), 14);
+        for (idx, &expected_reg) in INTERNAL_FAST_GPR_ARGS[..14].iter().enumerate() {
+            assert_eq!(leaf_plan.param_slots[idx], ArgSlot::Gpr(expected_reg));
+        }
+
+        // Exported, address-taken, variadic, and foreign-Conv 14-arg leaves stay strictly CAbi.
+        for idx in 2..=5 {
+            let plan = &out.plans[idx];
+            assert_eq!(plan.conv, CallConvKind::CAbi);
+            assert_eq!(plan.param_slots[7], ArgSlot::Gpr(7));
+            assert_eq!(plan.param_slots[8], ArgSlot::StackOff(0));
+            assert_eq!(plan.param_slots[13], ArgSlot::StackOff(40));
+        }
+
+        assert_eq!(out.stats.internal_fast_fns, 1);
+        assert_eq!(out.stats.wide_arg_fast_fns, 1);
+        assert_eq!(out.stats.stack_args_eliminated, 6);
+    }
+
+    #[test]
+    fn sixteen_fp_arg_and_unpromotable_sret_avoid_v8_v15_and_x8() {
+        let f_caller = build_i64_fn(2, 1, FnAttrs::default());
+        let f_fp_leaf = build_f64_fn(16);
+        // 128-byte Sret (> 8*8 bytes) cannot be register-promoted, so it retains X8 alongside 14 GPR args.
+        let f_sret_leaf = build_sret_and_i64_fn(128, 14);
+
+        let inputs = [
+            AbiFnInput {
+                view: f_caller.view(),
+                is_exported: true,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[1, 2],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+            AbiFnInput {
+                view: f_fp_leaf.view(),
+                is_exported: false,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+            AbiFnInput {
+                view: f_sret_leaf.view(),
+                is_exported: false,
+                address_taken: false,
+                is_cold: false,
+                direct_callees: &[],
+                caller_live_pressure_gprs: RegSet::EMPTY,
+                caller_live_pressure_fps: RegSet::EMPTY,
+            },
+        ];
+
+        assert_eq!(count_sig_arg_classes(inputs[1].view), (0, 16));
+        assert_eq!(count_sig_arg_classes(inputs[2].view), (14, 0));
+        assert!(is_internal_fast_eligible(&inputs[1], 0, 16));
+        assert!(is_internal_fast_eligible(&inputs[2], 14, 0));
+
+        let out = plan_module_abi(&inputs, ZeroAbiOpts::arm64_export(), test_alloc());
+
+        let fp_plan = &out.plans[1];
+        assert_eq!(fp_plan.conv, CallConvKind::InternalFast);
+        assert_eq!(fp_plan.param_slots.len(), 16);
+        for (idx, &expected_reg) in INTERNAL_FAST_FP_ARGS.iter().enumerate() {
+            assert_eq!(fp_plan.param_slots[idx], ArgSlot::Fp(expected_reg));
+        }
+
+        let sret_plan = &out.plans[2];
+        assert_eq!(sret_plan.conv, CallConvKind::InternalFast);
+        assert_eq!(sret_plan.param_slots.len(), 15);
+        assert_eq!(sret_plan.param_slots[0], ArgSlot::Gpr(A64_SRET_REG));
+        for (idx, &expected_reg) in INTERNAL_FAST_GPR_ARGS[..14].iter().enumerate() {
+            assert_eq!(sret_plan.param_slots[1 + idx], ArgSlot::Gpr(expected_reg));
+        }
+
+        assert_eq!(out.stats.internal_fast_fns, 2);
+        assert_eq!(out.stats.wide_arg_fast_fns, 2);
+        assert_eq!(out.stats.stack_args_eliminated, 14);
     }
 }

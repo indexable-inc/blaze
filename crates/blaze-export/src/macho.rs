@@ -24,6 +24,7 @@
 //! with a minimum macOS of 12.0 is bound by every dyld that runs arm64 executables of that
 //! minimum; that each `dyld_chained_starts_in_segment` may sit 8-aligned.
 
+use blaze_code::record::Symbol;
 use blaze_ids::Hasher;
 use blaze_own::{AString, AVec, Alloc, Vec};
 
@@ -94,6 +95,8 @@ const DYLD_CHAINED_PTR_START_NONE: u16 = 0xFFFF;
 /// A chain's `next` counts 4-byte strides.
 const STRIDE: u64 = 4;
 
+/// `N_SECT`: a local symbol defined in section `n_sect` (`1` = `__TEXT,__text`, `t` in `nm`).
+const N_SECT: u8 = 0x0e;
 /// `N_EXT` with `N_UNDF`: an undefined external symbol.
 const N_UNDEF_EXT: u8 = 0x01;
 /// `SET_LIBRARY_ORDINAL(n_desc, 1)`: libSystem, the first `LC_LOAD_DYLIB`.
@@ -143,12 +146,15 @@ pub fn command_room(native_libraries: Option<&[AString<'_>]>) -> u64 {
 }
 
 /// What the executable's commands after its segments say: `__LINKEDIT`'s pieces as file
-/// offsets and sizes, the import count, the entry.
+/// offsets and sizes, the symbol counts (local function symbols then undefined imports), the entry.
 #[derive(Clone, Copy, Default)]
 struct Tail {
     fixups: (u64, u64),
-    /// `symoff` and `nsyms` (one undefined symbol per import, also one indirect row each).
-    symtab: (u64, u64),
+    /// `symoff`, local function symbol count (`nlocalsym`), and undefined import count (`nundefsym`,
+    /// also `nindirectsyms`).
+    symtab_at: u64,
+    n_local: u64,
+    n_imports: u64,
     strtab: (u64, u64),
     indirect_at: u64,
     entry: u64,
@@ -160,10 +166,22 @@ struct Tail {
 /// the file's values and [`command_room`] with zeros, so the room is this list's size.
 fn tail<'n>(t: &Tail, libraries: &'n [AString<'_>], mut push: impl FnMut(Command<'n>)) {
     push(Command::LinkeditData { cmd: LC_DYLD_CHAINED_FIXUPS, off: t.fixups.0, size: t.fixups.1 });
-    push(Command::Symtab { symoff: t.symtab.0, nsyms: t.symtab.1, stroff: t.strtab.0, strsize: t.strtab.1 });
-    // Every symbol undefined (iundefsym 0, nundefsym n), one indirect row per GOT cell.
-    let n = t.symtab.1;
-    push(Command::Dysymtab { fields: [0, 0, 0, 0, 0, n, 0, 0, 0, 0, 0, 0, t.indirect_at, n, 0, 0, 0, 0] });
+    push(Command::Symtab { symoff: t.symtab_at, nsyms: t.n_local + t.n_imports, stroff: t.strtab.0, strsize: t.strtab.1 });
+    // Local function symbols first (0..n_local), then undefined imports (n_local..n_local + n_imports),
+    // one indirect row per GOT cell pointing at its undefined symbol index.
+    push(Command::Dysymtab {
+        fields: [
+            0, t.n_local,
+            t.n_local, 0,
+            t.n_local, t.n_imports,
+            0, 0,
+            0, 0,
+            0, 0,
+            t.indirect_at, t.n_imports,
+            0, 0,
+            0, 0,
+        ],
+    });
     push(Command::Dylinker { name: DYLD });
     push(Command::Uuid);
     push(Command::BuildVersion { platform: PLATFORM_MACOS, minos: MIN_MACOS, sdk: MIN_MACOS });
@@ -471,23 +489,29 @@ fn section(name: &'static str, seg: &'static str, addr: u64, size: u64, offset: 
     Section { name, seg, addr: BASE + addr, size, offset, align, flags, reserved1: 0 }
 }
 
+/// Byte length of `name` after stripping embedded NUL bytes (for Mach-O `strtab`).
+fn sanitized_len(name: &str) -> usize {
+    name.as_bytes().iter().filter(|&&b| b != 0).count()
+}
+
 /// Writes `laid` as a Mach-O executable into `out` (its contents replaced): the file, whole,
 /// signed. `identifier` is the signature's; `seed` joins the content in the file's `LC_UUID`
 /// (the profile's digest, or zeros). Returns the UUID.
 pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, seed: &[u8; 32], out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<[u8; 16], ExportError> {
-    write_native(laid, eh, None, identifier, seed, out, alloc)
+    write_native(laid, eh, None, &[], identifier, seed, out, alloc)
 }
 
-/// [`write`] with the program's native image merged (native_merge.rs): its two segments after
-/// the program's, its libraries after libSystem, its fixups and import rows in the one chained
-/// blob, `MH_HAS_TLV_DESCRIPTORS` when it has thread-locals. The layout's plan must be
-/// [`plan_for`] of the image's libraries: a header past the room it kept is
-/// `ExportError::HeaderRoom`.
+/// [`write`] with the program's native image merged (native_merge.rs) and optional local
+/// `N_SECT` function symbol names (`symbol_names`): its two segments after the program's, its
+/// libraries after libSystem, its fixups and import rows in the one chained blob,
+/// `MH_HAS_TLV_DESCRIPTORS` when it has thread-locals. The layout's plan must be [`plan_for`]
+/// of the image's libraries: a header past the room it kept is `ExportError::HeaderRoom`.
 #[allow(clippy::too_many_arguments)]
 pub fn write_native<'a>(
     laid: &Laid<'_, '_>,
     eh: &EhSections<'_>,
     native: Option<&Merged<'_, '_>>,
+    symbol_names: &[(Symbol, &str)],
     identifier: &str,
     seed: &[u8; 32],
     out: &mut AVec<'a, u8>,
@@ -589,9 +613,47 @@ pub fn write_native<'a>(
     link.push(0);
     bytes::pad(&mut link, 8);
     let starts_len = link.len() as u64 - starts_at;
-    let symtab_at = link.len() as u64;
+    let symtab_at = u64::try_from(link.len()).map_err(|_| ExportError::TooLarge { what: "the Mach-O symbol table offset", len: u64::MAX })?;
+    // Build a deterministic sorted index of `symbol_names` (O(N log N), zero recursion) and
+    // resolve each placed function in placement order (`laid.placed`). Empty or NUL-only names
+    // are skipped; embedded NUL bytes are stripped when advancing `strx` and writing `strtab`.
+    let mut local_syms: AVec<'_, (&str, u64)> = Vec::new_in(alloc);
+    if !symbol_names.is_empty() {
+        let mut name_index: AVec<'_, (Symbol, &str)> = Vec::with_capacity_in(symbol_names.len(), alloc);
+        for &(sym, name) in symbol_names {
+            if sanitized_len(name) > 0 {
+                name_index.push((sym, name));
+            }
+        }
+        name_index.sort_unstable();
+        name_index.dedup_by_key(|entry| entry.0);
+        local_syms.reserve(laid.placed.len().min(name_index.len()));
+        for p in laid.placed.iter() {
+            if let Ok(idx) = name_index.binary_search_by_key(&p.symbol, |&(sym, _)| sym)
+                && let Some(&(_, name)) = name_index.get(idx)
+            {
+                local_syms.push((name, BASE + p.at));
+            }
+        }
+    }
+    let n_local = local_syms.len();
     let n = laid.imports.len();
     let mut strx = 2u32;
+    for &(name, value) in local_syms.iter() {
+        // `nlist_64`: n_strx, n_type (`N_SECT`), n_sect (`1` = `__TEXT,__text`), n_desc, n_value.
+        bytes::u32(&mut link, strx);
+        bytes::u8(&mut link, N_SECT);
+        bytes::u8(&mut link, 1);
+        bytes::u16(&mut link, 0);
+        bytes::u64(&mut link, value);
+        let step = sanitized_len(name)
+            .checked_add(2)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(ExportError::TooLarge { what: "the Mach-O string table", len: u64::from(strx) })?;
+        strx = strx
+            .checked_add(step)
+            .ok_or(ExportError::TooLarge { what: "the Mach-O string table", len: u64::from(strx) })?;
+    }
     for import in laid.imports.iter() {
         // `nlist_64`: n_strx, n_type, n_sect, n_desc, n_value.
         bytes::u32(&mut link, strx);
@@ -599,21 +661,46 @@ pub fn write_native<'a>(
         bytes::u8(&mut link, 0);
         bytes::u16(&mut link, LIBSYSTEM_ORDINAL);
         bytes::u64(&mut link, 0);
-        strx += import.name.len() as u32 + 2;
+        let step = import
+            .name
+            .len()
+            .checked_add(2)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(ExportError::TooLarge { what: "the Mach-O string table", len: u64::from(strx) })?;
+        strx = strx
+            .checked_add(step)
+            .ok_or(ExportError::TooLarge { what: "the Mach-O string table", len: u64::from(strx) })?;
     }
-    let indirect_at = link.len() as u64;
+    let indirect_at = u64::try_from(link.len()).map_err(|_| ExportError::TooLarge { what: "the indirect symbol table offset", len: u64::MAX })?;
     for k in 0..n {
-        bytes::u32(&mut link, k as u32);
+        let sym_idx = n_local
+            .checked_add(k)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(ExportError::TooLarge { what: "the indirect symbol table index", len: u64::MAX })?;
+        bytes::u32(&mut link, sym_idx);
     }
-    let strtab_at = link.len() as u64;
+    let strtab_at = u64::try_from(link.len()).map_err(|_| ExportError::TooLarge { what: "the Mach-O string table offset", len: u64::MAX })?;
     link.extend_from_slice(b" \0");
+    for &(name, _) in local_syms.iter() {
+        link.push(b'_');
+        if !name.as_bytes().contains(&0) {
+            link.extend_from_slice(name.as_bytes());
+        } else {
+            for &b in name.as_bytes() {
+                if b != 0 {
+                    link.push(b);
+                }
+            }
+        }
+        link.push(0);
+    }
     for import in laid.imports.iter() {
         link.push(b'_');
         link.extend_from_slice(import.name.as_bytes());
         link.push(0);
     }
     bytes::pad(&mut link, 8);
-    let strtab_len = link.len() as u64 - strtab_at;
+    let strtab_len = u64::try_from(link.len()).map_err(|_| ExportError::TooLarge { what: "the Mach-O string table size", len: u64::MAX })? - strtab_at;
     bytes::pad(&mut link, 16);
     let code_limit = link_off + link.len() as u64;
     let sig_len = sign::len(identifier, code_limit);
@@ -685,9 +772,13 @@ pub fn write_native<'a>(
             _ => cmds.segment(segment(seg), []),
         }
     }
+    let n_local_u64 = u64::try_from(n_local).map_err(|_| ExportError::TooLarge { what: "the Mach-O local symbol count", len: u64::MAX })?;
+    let n_imports_u64 = u64::try_from(n).map_err(|_| ExportError::TooLarge { what: "the Mach-O import symbol count", len: u64::MAX })?;
     let t = Tail {
         fixups: (link_off + fixups_at, fixups_blob.len() as u64),
-        symtab: (link_off + symtab_at, n as u64),
+        symtab_at: link_off + symtab_at,
+        n_local: n_local_u64,
+        n_imports: n_imports_u64,
         strtab: (link_off + strtab_at, strtab_len),
         indirect_at: link_off + indirect_at,
         entry: laid.entry,

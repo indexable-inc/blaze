@@ -993,7 +993,7 @@ fn derive_edge_facts(
     }
 }
 
-/// Walks up to 4 dominators from `cur`, collecting branch facts from every unique-incoming-edge
+/// Walks up to 6 dominators from `cur`, collecting branch facts from every unique-incoming-edge
 /// block that dominates `cur`. Sound because every path from entry (and from each refined SSA
 /// value's definition) to `cur` must traverse each such unique incoming edge.
 fn collect_dom_edge_facts<A: Allocator + Copy>(
@@ -1003,7 +1003,7 @@ fn collect_dom_edge_facts<A: Allocator + Copy>(
     global_vals: &[EvalVal],
     out: &mut EdgeFacts,
 ) {
-    for _ in 0..4 {
+    for _ in 0..6 {
         if cur == 0 || cur == NONE || out.is_full() {
             break;
         }
@@ -1256,7 +1256,7 @@ fn eval_terminator_static(view: &View<'_>, term: usize, lookup: impl Fn(u32) -> 
 /// to `PtrAdd[INBOUNDS](entry_base, off)` cannot overshoot `end` and wrap through address 0.
 fn offset_is_step_multiple(
     view: &View<'_>,
-    mut off: usize,
+    off: usize,
     step: i128,
     step_u128: u128,
     is_ult: bool,
@@ -1265,107 +1265,172 @@ fn offset_is_step_multiple(
         return false;
     }
     let ptr_bits = view.head.ptr_bits;
-    for _ in 0..4 {
-        if off >= view.len() {
+    let mut stack = [(0usize, 0u8); 16];
+    let mut sp = 1usize;
+    set_at(&mut stack, 0, (off, 4u8));
+
+    // Bounded iterative DFS (max depth 4 -> at most 31 nodes visited, max stack depth 5).
+    for _ in 0..32 {
+        if sp == 0 {
+            return true;
+        }
+        sp -= 1;
+        let (cur, depth) = at(&stack, sp, (usize::MAX, 0));
+        if cur >= view.len() {
             return false;
         }
-        if let Some(c) = signed_const(view, off) {
+        if let Some(c) = signed_const(view, cur) {
             if c < 0 {
                 return false;
             }
-            return (is_ult && step == 1) || (c % step) == 0;
+            if !((is_ult && step == 1) || (c % step) == 0) {
+                return false;
+            }
+            continue;
         }
-        match view.op(off) {
-            Op::Freeze | Op::Zext | Op::Sext if at(view.flags, off, 0) == 0 => {
-                off = to_idx(view.operands(off).value().0);
+        if depth == 0 {
+            if step != 1 {
+                return false;
+            }
+            continue;
+        }
+        let flags = view.flags(cur);
+        match view.op(cur) {
+            Op::Freeze | Op::Zext | Op::Sext if flags == Flags::NONE => {
+                if sp >= stack.len() {
+                    return false;
+                }
+                let inner = to_idx(view.operands(cur).value().0);
+                set_at(&mut stack, sp, (inner, depth - 1));
+                sp += 1;
             }
             Op::Shl => {
                 if step == 1 {
-                    return true;
+                    continue;
                 }
-                let mut o = view.operands(off);
+                let mut o = view.operands(cur);
                 let _v = o.value();
                 let sh_idx = to_idx(o.value().0);
-                if let Some(sh) = signed_const(view, sh_idx) {
-                    if sh >= 0 && sh < i128::from(ptr_bits) {
-                        if let Ok(sh_u32) = u32::try_from(sh) {
-                            if let Some(stride) = 1u128.checked_shl(sh_u32) {
-                                return (stride % step_u128) == 0;
-                            }
-                        }
-                    }
+                let ok = signed_const(view, sh_idx).is_some_and(|sh| {
+                    sh >= 0
+                        && sh < i128::from(ptr_bits)
+                        && u32::try_from(sh)
+                            .ok()
+                            .and_then(|sh_u32| 1u128.checked_shl(sh_u32))
+                            .is_some_and(|stride| (stride % step_u128) == 0)
+                });
+                if !ok {
+                    return false;
                 }
-                return false;
             }
             Op::Mul => {
                 if step == 1 {
-                    return true;
+                    continue;
                 }
-                let mut o = view.operands(off);
+                let mut o = view.operands(cur);
                 let a = to_idx(o.value().0);
                 let b = to_idx(o.value().0);
                 let a_ok = signed_const(view, a).is_some_and(|m| m > 0 && (m % step) == 0);
                 let b_ok = signed_const(view, b).is_some_and(|m| m > 0 && (m % step) == 0);
-                return a_ok || b_ok;
+                if !(a_ok || b_ok) {
+                    return false;
+                }
             }
-            _ => return step == 1,
+            Op::And => {
+                if step == 1 {
+                    continue;
+                }
+                if !step_u128.is_power_of_two() {
+                    return false;
+                }
+                let mut o = view.operands(cur);
+                let a = to_idx(o.value().0);
+                let b = to_idx(o.value().0);
+                let low_mask = step_u128 - 1;
+                let a_ok = unsigned_const(view, a).is_some_and(|m| (m & low_mask) == 0);
+                let b_ok = unsigned_const(view, b).is_some_and(|m| (m & low_mask) == 0);
+                if !(a_ok || b_ok) {
+                    return false;
+                }
+            }
+            Op::Add | Op::Sub => {
+                let mut o = view.operands(cur);
+                let a = to_idx(o.value().0);
+                let b = to_idx(o.value().0);
+                if view.op(cur) == Op::Sub {
+                    if let (Some(ca), Some(cb)) = (signed_const(view, a), signed_const(view, b)) {
+                        if ca < cb {
+                            return false;
+                        }
+                    }
+                }
+                if step == 1 {
+                    continue;
+                }
+                let preserves_div = step_u128.is_power_of_two()
+                    || flags.contains(Flags::NUW)
+                    || flags.contains(Flags::NSW);
+                if !preserves_div || sp + 2 > stack.len() {
+                    return false;
+                }
+                set_at(&mut stack, sp, (b, depth - 1));
+                set_at(&mut stack, sp + 1, (a, depth - 1));
+                sp += 2;
+            }
+            _ => {
+                if step != 1 {
+                    return false;
+                }
+            }
         }
     }
-    step == 1
+    sp == 0
 }
 
-/// Checks whether `inst = PtrAdd(base, by)` (even without `INBOUNDS`/`NUW`) is the induction step
-/// of a loop header `hdr(p, ...)` whose entry arg `entry_base` is `PtrNonNull`, whose header tests
-/// `p != end` or `p < end` with `end = PtrAdd[INBOUNDS | NUW](entry_base, byte_len)` where
-/// `byte_len` is a non-negative multiple of `step > 0`, and `inst` is dominated by the loop body
-/// arm. Under these conditions `p` stays strictly in `[entry_base, end)` and `p + step <= end`
-/// inside the inbounds allocation, so `inst` cannot wrap through address 0.
-fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
-    view: &View<'_>,
-    cfg: &Cfg<A>,
-    vals: &[EvalVal],
-    inst: usize,
-    inst_block: u32,
-    base: usize,
-    by: usize,
-) -> bool {
-    let Some(step) = signed_const(view, by) else {
-        return false;
-    };
-    if step <= 0 {
-        return false;
-    }
-    let Ok(step_u128) = u128::try_from(step) else {
-        return false;
-    };
-    if base >= view.len() || view.op(base) != Op::Param {
-        return false;
-    }
-    let hdr = at(&cfg.owner, base, NONE);
-    if hdr == NONE || hdr == 0 || !at(&cfg.plain_only, to_idx(hdr), false) {
-        return false;
-    }
-    let hdr_params = view.params(Block(hdr));
-    if base < hdr_params.start || base >= hdr_params.end {
-        return false;
-    }
-    let param_k = base - hdr_params.start;
-    let base_u32 = to_u32(base);
+/// Result of recognizing a branch edge `(term_inst, ordinal)` as guarding `ptr_v != end_v` or
+/// `ptr_v < end_v` (unsigned).
+#[derive(Clone, Copy, Debug)]
+struct PtrEndGuard {
+    end_v: u32,
+    is_ult: bool,
+}
 
-    let hdr_term = view.terminator(Block(hdr));
-    if view.op(hdr_term) != Op::Br {
-        return false;
+/// Checks whether taking branch `ordinal` out of `Op::Br` terminator `term_inst` guarantees
+/// `ptr_v != end_v` or `ptr_v < end_v` (unsigned), returning `Some(PtrEndGuard)`.
+fn match_ptr_end_guard(
+    view: &View<'_>,
+    term_inst: usize,
+    ordinal: u32,
+    ptr_v: u32,
+) -> Option<PtrEndGuard> {
+    if term_inst >= view.len() || view.op(term_inst) != Op::Br || ordinal > 1 {
+        return None;
     }
-    let mut to = view.operands(hdr_term);
-    let cond_v = to.value().0;
-    let then_blk = to.target().block.0;
-    let else_blk = to.target().block.0;
+    let mut cond_v = view.operands(term_inst).value().0;
+    let mut taken_true = ordinal == 0;
+    for _ in 0..4 {
+        let idx = to_idx(cond_v);
+        if idx >= view.len() {
+            return None;
+        }
+        let flagless = at(view.flags, idx, 0) == 0;
+        match view.op(idx) {
+            Op::Freeze => {
+                cond_v = view.operands(idx).value().0;
+            }
+            Op::Not if flagless && Ty(at(view.tys, idx, 0)) == Ty::I1 => {
+                cond_v = view.operands(idx).value().0;
+                taken_true = !taken_true;
+            }
+            _ => break,
+        }
+    }
     let cond_idx = to_idx(cond_v);
     if cond_idx >= view.len() || view.op(cond_idx) != Op::Icmp || at(view.flags, cond_idx, 0) != 0 {
-        return false;
+        return None;
     }
     let mut co = view.operands(cond_idx);
-    let icond = co.int_cond();
+    let raw_cond = co.int_cond();
     let raw_lhs = co.value().0;
     let raw_rhs = co.value().0;
     let cmp_ty = Ty(at(view.tys, to_idx(raw_lhs), 0));
@@ -1373,7 +1438,7 @@ fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
         && cmp_ty.is_int()
         && cmp_ty.bits(view.head.ptr_bits) == view.head.ptr_bits;
     if cmp_ty != Ty::PTR && !ptr_int_cmp {
-        return false;
+        return None;
     }
     let strip_ptr_addr = |v: u32| -> u32 {
         let idx = to_idx(v);
@@ -1385,20 +1450,253 @@ fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
     };
     let lhs = strip_ptr_addr(raw_lhs);
     let rhs = strip_ptr_addr(raw_rhs);
-    let (end_v, p_on_left) = if lhs == base_u32 {
+    let (end_v, p_on_left) = if lhs == ptr_v {
         (rhs, true)
-    } else if rhs == base_u32 {
+    } else if rhs == ptr_v {
         (lhs, false)
     } else {
+        return None;
+    };
+    let eff = if taken_true { raw_cond } else { invert_cond(raw_cond) };
+    match (eff, p_on_left) {
+        (IntCond::Ne, _) => Some(PtrEndGuard { end_v, is_ult: false }),
+        (IntCond::Ult, true) | (IntCond::Ugt, false) => Some(PtrEndGuard { end_v, is_ult: true }),
+        _ => None,
+    }
+}
+
+/// Checks whether taking branch `ordinal` out of `Op::Br` terminator `term_inst` guarantees
+/// `end_off != 0` (directly on `end_off`, or on `x` when `end_off = Shl[NUW|NSW](x, sh)` with
+/// `0 <= sh < ptr_bits`), implying `entry_base != PtrAdd[INBOUNDS|NUW](entry_base, end_off)`.
+fn match_nonzero_len_guard(
+    view: &View<'_>,
+    term_inst: usize,
+    ordinal: u32,
+    end_off: usize,
+) -> bool {
+    if term_inst >= view.len() || view.op(term_inst) != Op::Br || ordinal > 1 || end_off >= view.len() {
+        return false;
+    }
+    let mut cond_v = view.operands(term_inst).value().0;
+    let mut taken_true = ordinal == 0;
+    for _ in 0..4 {
+        let idx = to_idx(cond_v);
+        if idx >= view.len() {
+            return false;
+        }
+        let flagless = at(view.flags, idx, 0) == 0;
+        match view.op(idx) {
+            Op::Freeze => {
+                cond_v = view.operands(idx).value().0;
+            }
+            Op::Not if flagless && Ty(at(view.tys, idx, 0)) == Ty::I1 => {
+                cond_v = view.operands(idx).value().0;
+                taken_true = !taken_true;
+            }
+            _ => break,
+        }
+    }
+    let cond_idx = to_idx(cond_v);
+    if cond_idx >= view.len() || view.op(cond_idx) != Op::Icmp || at(view.flags, cond_idx, 0) != 0 {
+        return false;
+    }
+    let mut co = view.operands(cond_idx);
+    let raw_cond = co.int_cond();
+    let lhs = co.value().0;
+    let rhs = co.value().0;
+    let cmp_ty = Ty(at(view.tys, to_idx(lhs), 0));
+    if !cmp_ty.is_scalar() || !cmp_ty.is_int() {
+        return false;
+    }
+    let eff = if taken_true { raw_cond } else { invert_cond(raw_cond) };
+    let nonzero_var = match eff {
+        IntCond::Ne => {
+            if unsigned_const(view, to_idx(rhs)) == Some(0) {
+                Some(lhs)
+            } else if unsigned_const(view, to_idx(lhs)) == Some(0) {
+                Some(rhs)
+            } else {
+                None
+            }
+        }
+        IntCond::Ugt | IntCond::Sgt if unsigned_const(view, to_idx(rhs)) == Some(0) => Some(lhs),
+        IntCond::Ult | IntCond::Slt if unsigned_const(view, to_idx(lhs)) == Some(0) => Some(rhs),
+        _ => None,
+    };
+    let Some(nz_v) = nonzero_var else {
         return false;
     };
+    let mut cur = end_off;
+    let ptr_bits = view.head.ptr_bits;
+    for _ in 0..4 {
+        if cur >= view.len() {
+            return false;
+        }
+        if to_u32(cur) == nz_v {
+            return true;
+        }
+        let flags = view.flags(cur);
+        match view.op(cur) {
+            Op::Freeze | Op::Zext | Op::Sext if flags == Flags::NONE => {
+                cur = to_idx(view.operands(cur).value().0);
+            }
+            Op::Shl if flags.contains(Flags::NUW) || flags.contains(Flags::NSW) => {
+                let mut o = view.operands(cur);
+                let inner = to_idx(o.value().0);
+                let sh_idx = to_idx(o.value().0);
+                if signed_const(view, sh_idx).is_some_and(|sh| sh >= 0 && sh < i128::from(ptr_bits)) {
+                    cur = inner;
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
 
-    let (body_blk, is_ult) = match (icond, p_on_left) {
-        (IntCond::Ne, _) => (then_blk, false),
-        (IntCond::Eq, _) => (else_blk, false),
-        (IntCond::Ult, true) | (IntCond::Ugt, false) => (then_blk, true),
-        (IntCond::Uge, true) | (IntCond::Ule, false) => (else_blk, true),
-        _ => return false,
+/// Checks whether backedge `edge` (`edge.pred -> hdr`) passing `arg` is guarded by `arg != end_v`
+/// or `arg < end_v` (unsigned), either directly on `edge` or on a unique-incoming-edge dominator
+/// strictly dominated by `hdr`.
+fn find_backedge_ptr_end_guard<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    edge: InEdge,
+    arg: u32,
+    hdr: u32,
+) -> Option<PtrEndGuard> {
+    let pred_term = view.terminator(Block(edge.pred));
+    if let Some(guard) = match_ptr_end_guard(view, pred_term, edge.ordinal, arg) {
+        return Some(guard);
+    }
+    let mut cur = edge.pred;
+    for _ in 0..8 {
+        if cur == hdr || cur == 0 || cur == NONE {
+            break;
+        }
+        if at(&cfg.plain_only, to_idx(cur), false) {
+            if let [sole] = cfg.incoming_of(cur) {
+                if sole.pred != cur && at(&cfg.unique_pred, to_idx(cur), NONE) == sole.pred {
+                    let term = view.terminator(Block(sole.pred));
+                    if let Some(guard) = match_ptr_end_guard(view, term, sole.ordinal, arg) {
+                        return Some(guard);
+                    }
+                }
+            }
+        }
+        let parent = at(&cfg.idom, to_idx(cur), NONE);
+        if parent == NONE || parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// Checks whether entry edge `edge` (`edge.pred -> hdr`) is guarded (directly or via a dominating
+/// unique-incoming-edge ancestor) by `entry_base != end_v`, `entry_base < end_v` (unsigned), or
+/// `end_off != 0`. Returns `Some(is_ult)` when guarded.
+fn find_entry_ptr_end_guard<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    edge: InEdge,
+    entry_base: u32,
+    end_v: u32,
+    end_off: usize,
+) -> Option<bool> {
+    let check = |term: usize, ord: u32| -> Option<bool> {
+        if let Some(g) = match_ptr_end_guard(view, term, ord, entry_base) {
+            if g.end_v == end_v {
+                return Some(g.is_ult);
+            }
+        }
+        if match_nonzero_len_guard(view, term, ord, end_off) {
+            return Some(false);
+        }
+        None
+    };
+
+    let pred_term = view.terminator(Block(edge.pred));
+    if let Some(is_ult) = check(pred_term, edge.ordinal) {
+        return Some(is_ult);
+    }
+    let mut cur = edge.pred;
+    for _ in 0..8 {
+        if cur == 0 || cur == NONE {
+            break;
+        }
+        if at(&cfg.plain_only, to_idx(cur), false) {
+            if let [sole] = cfg.incoming_of(cur) {
+                if sole.pred != cur && at(&cfg.unique_pred, to_idx(cur), NONE) == sole.pred {
+                    let term = view.terminator(Block(sole.pred));
+                    if let Some(is_ult) = check(term, sole.ordinal) {
+                        return Some(is_ult);
+                    }
+                }
+            }
+        }
+        let parent = at(&cfg.idom, to_idx(cur), NONE);
+        if parent == NONE || parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// Returns whether `arg` is provably `PtrNonNull` along incoming edge `edge`, either globally in
+/// `vals` or via dominating branch guards (`p != null` / `ptr_addr(p) >u 0`) along `edge.pred`.
+fn is_edge_arg_nonnull<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    vals: &[EvalVal],
+    edge: InEdge,
+    arg: u32,
+) -> bool {
+    if at(vals, to_idx(arg), EvalVal::Unknown) == EvalVal::PtrNonNull {
+        return true;
+    }
+    let mut facts = EdgeFacts::empty();
+    let pred_term = view.terminator(Block(edge.pred));
+    derive_edge_facts(view, pred_term, edge.ordinal, vals, &mut facts);
+    collect_dom_edge_facts(view, cfg, edge.pred, vals, &mut facts);
+    facts.lookup(arg, vals) == EvalVal::PtrNonNull
+}
+
+/// Top-tested loop case: `hdr(p, ...)` ends in `Op::Br(p != end | p < end, body_blk, exit)` and
+/// `inst = PtrAdd(p, step)` is dominated by `body_blk`.
+#[allow(clippy::too_many_arguments)]
+fn is_top_tested_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    vals: &[EvalVal],
+    inst: usize,
+    inst_block: u32,
+    base: usize,
+    step: i128,
+    step_u128: u128,
+    hdr: u32,
+    param_k: usize,
+) -> bool {
+    let base_u32 = to_u32(base);
+    let hdr_term = view.terminator(Block(hdr));
+    if view.op(hdr_term) != Op::Br {
+        return false;
+    }
+    let mut to = view.operands(hdr_term);
+    let _cond_v = to.value();
+    let then_blk = to.target().block.0;
+    let else_blk = to.target().block.0;
+    if then_blk == else_blk {
+        return false;
+    }
+    let (body_blk, guard) = if let Some(g) = match_ptr_end_guard(view, hdr_term, 0, base_u32) {
+        (then_blk, g)
+    } else if let Some(g) = match_ptr_end_guard(view, hdr_term, 1, base_u32) {
+        (else_blk, g)
+    } else {
+        return false;
     };
     if body_blk == hdr || at(&cfg.unique_pred, to_idx(body_blk), NONE) != hdr {
         return false;
@@ -1440,7 +1738,7 @@ fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
                 has_self_inst_edge = true;
             }
         } else {
-            if at(vals, to_idx(arg), EvalVal::Unknown) != EvalVal::PtrNonNull {
+            if !is_edge_arg_nonnull(view, cfg, vals, *edge, arg) {
                 return false;
             }
             match entry_base {
@@ -1451,6 +1749,111 @@ fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
         }
     }
     let Some(entry_base) = entry_base else {
+        return false;
+    };
+    if !has_self_inst_edge {
+        return false;
+    }
+
+    let end_idx = to_idx(guard.end_v);
+    if end_idx >= view.len() || view.op(end_idx) != Op::PtrAdd {
+        return false;
+    }
+    let end_flags = view.flags(end_idx);
+    if !end_flags.contains(Flags::INBOUNDS) && !end_flags.contains(Flags::NUW) {
+        return false;
+    }
+    let mut eo = view.operands(end_idx);
+    let end_base = eo.value().0;
+    let end_off = to_idx(eo.value().0);
+    if end_base != entry_base {
+        return false;
+    }
+    offset_is_step_multiple(view, end_off, step, step_u128, guard.is_ult)
+}
+
+/// Bottom-tested (rotated) loop case: every entry edge to `hdr(p, ...)` passes the same
+/// `PtrNonNull` `entry_base` and is guarded by `entry_base != end` / `entry_base < end` (or
+/// statically positive `end_off`), and every incrementing backedge passes `arg = PtrAdd(p, step)`
+/// guarded by `arg != end` / `arg < end` (with `end = PtrAdd[INBOUNDS|NUW](entry_base, end_off)`
+/// where `end_off` is a non-negative multiple of `step`). Thus every execution of `hdr(p)` has
+/// `p in [entry_base, end)` aligned to `step`, so `inst = PtrAdd(p, step)` is in `(entry_base, end]`
+/// and cannot wrap through address 0.
+#[allow(clippy::too_many_arguments)]
+fn is_bottom_tested_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    vals: &[EvalVal],
+    inst: usize,
+    inst_block: u32,
+    base: usize,
+    step: i128,
+    step_u128: u128,
+    hdr: u32,
+    param_k: usize,
+) -> bool {
+    if !cfg.is_dom(inst_block, hdr) {
+        return false;
+    }
+    let base_u32 = to_u32(base);
+    let inst_u32 = to_u32(inst);
+    let edges = cfg.incoming_of(hdr);
+    if edges.is_empty() {
+        return false;
+    }
+
+    let mut entry_base: Option<u32> = None;
+    let mut end_v: Option<u32> = None;
+    let mut all_ult = true;
+    let mut has_self_inst_edge = false;
+
+    for edge in edges {
+        if param_k >= edge.args_len {
+            return false;
+        }
+        let arg = at(view.extra, edge.args_start + param_k, NONE);
+        if cfg.is_dom(edge.pred, hdr) {
+            if arg == base_u32 {
+                continue;
+            }
+            let arg_idx = to_idx(arg);
+            if arg_idx >= view.len() || view.op(arg_idx) != Op::PtrAdd {
+                return false;
+            }
+            if !cfg.is_dom(at(&cfg.owner, arg_idx, NONE), hdr) {
+                return false;
+            }
+            let mut ao = view.operands(arg_idx);
+            let a_base = ao.value().0;
+            let a_by = to_idx(ao.value().0);
+            if a_base != base_u32 || signed_const(view, a_by) != Some(step) {
+                return false;
+            }
+            let Some(guard) = find_backedge_ptr_end_guard(view, cfg, *edge, arg, hdr) else {
+                return false;
+            };
+            match end_v {
+                None => end_v = Some(guard.end_v),
+                Some(prev) if prev == guard.end_v => {}
+                Some(_) => return false,
+            }
+            all_ult &= guard.is_ult;
+            if arg == inst_u32 {
+                has_self_inst_edge = true;
+            }
+        } else {
+            if !is_edge_arg_nonnull(view, cfg, vals, *edge, arg) {
+                return false;
+            }
+            match entry_base {
+                None => entry_base = Some(arg),
+                Some(prev) if prev == arg => {}
+                Some(_) => return false,
+            }
+        }
+    }
+
+    let (Some(entry_base), Some(end_v)) = (entry_base, end_v) else {
         return false;
     };
     if !has_self_inst_edge {
@@ -1471,7 +1874,69 @@ fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
     if end_base != entry_base {
         return false;
     }
-    offset_is_step_multiple(view, end_off, step, step_u128, is_ult)
+
+    // Verify every entry edge guarantees `entry_base < end_v` (non-empty range) before entering `hdr`.
+    let statically_nonempty = signed_const(view, end_off).is_some_and(|c| c > 0);
+    if !statically_nonempty {
+        for edge in edges {
+            if cfg.is_dom(edge.pred, hdr) {
+                continue;
+            }
+            let Some(entry_ult) = find_entry_ptr_end_guard(view, cfg, *edge, entry_base, end_v, end_off) else {
+                return false;
+            };
+            all_ult &= entry_ult;
+        }
+    }
+
+    offset_is_step_multiple(view, end_off, step, step_u128, all_ult)
+}
+
+/// Checks whether `inst = PtrAdd(base, by)` (even without `INBOUNDS`/`NUW`) is the induction step
+/// of a top-tested or rotated (bottom-tested) loop header `hdr(p, ...)` whose entry arg
+/// `entry_base` is `PtrNonNull`, bounded by `end = PtrAdd[INBOUNDS | NUW](entry_base, byte_len)`
+/// where `byte_len` is a non-negative multiple of `step > 0`. Under these conditions `p` stays
+/// strictly in `[entry_base, end)` and `p + step <= end` inside the inbounds allocation, so `inst`
+/// cannot wrap through address 0.
+fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    vals: &[EvalVal],
+    inst: usize,
+    inst_block: u32,
+    base: usize,
+    by: usize,
+) -> bool {
+    let Some(step) = signed_const(view, by) else {
+        return false;
+    };
+    if step <= 0 {
+        return false;
+    }
+    let Ok(step_u128) = u128::try_from(step) else {
+        return false;
+    };
+    if base >= view.len() || view.op(base) != Op::Param {
+        return false;
+    }
+    let hdr = at(&cfg.owner, base, NONE);
+    if hdr == NONE || hdr == 0 || !at(&cfg.plain_only, to_idx(hdr), false) {
+        return false;
+    }
+    let hdr_params = view.params(Block(hdr));
+    if base < hdr_params.start || base >= hdr_params.end {
+        return false;
+    }
+    let param_k = base - hdr_params.start;
+
+    if is_top_tested_loop_bounded_nonnull_ptr_add(
+        view, cfg, vals, inst, inst_block, base, step, step_u128, hdr, param_k,
+    ) {
+        return true;
+    }
+    is_bottom_tested_loop_bounded_nonnull_ptr_add(
+        view, cfg, vals, inst, inst_block, base, step, step_u128, hdr, param_k,
+    )
 }
 
 /// Computes sound global static facts (integer constants, `null`, and provably non-null pointers,
@@ -1647,7 +2112,7 @@ fn compute_global_vals<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc
                     if arg == inst_u32 {
                         continue;
                     }
-                    if at(&vals, to_idx(arg), EvalVal::Unknown) != EvalVal::PtrNonNull {
+                    if !is_edge_arg_nonnull(view, cfg, &vals, *edge, arg) {
                         all_nonnull = false;
                         break;
                     }
@@ -1862,6 +2327,254 @@ fn fold_terminators<A: Allocator + Copy>(
         fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
+}
+
+/// A planned rewrite of a 2-valued `Op::Switch` terminator into `Op::Br` (or `Op::Jump` when
+/// both resolved targets and argument lists are identical).
+#[derive(Clone, Copy, Debug)]
+struct SwitchRewrite {
+    cond: u32,
+    target_t: TargetSlice,
+    target_f: TargetSlice,
+    is_jump: bool,
+}
+
+/// If scalar integer instruction `inst` evaluates to `c_true` when `i1` value `cond` is true and
+/// `c_false` when `cond` is false, returns `Some((cond, c_true, c_false))` with both constants
+/// masked to `inst`'s bit width. Never relies on `Op::Uninit` being consistent across uses.
+fn eval_two_valued_switch_scrutinee(
+    view: &View<'_>,
+    inst: usize,
+) -> Option<(u32, u128, u128)> {
+    const MAX_DEPTH: usize = 4;
+    let ptr_bits = view.head.ptr_bits;
+    let mut convs = [(Op::Freeze, 0u32, 0u32); MAX_DEPTH];
+    let mut conv_len = 0usize;
+    let mut cur = inst;
+    let mut base: Option<(u32, u128, u128)> = None;
+
+    for step in 0..=MAX_DEPTH {
+        if cur >= view.len() {
+            return None;
+        }
+        let op = view.op(cur);
+        if op == Op::Uninit {
+            return None;
+        }
+        let ty = Ty(at(view.tys, cur, 0));
+        if !ty.is_scalar() || !ty.is_int() {
+            return None;
+        }
+        let width = ty.bits(ptr_bits);
+        let flagless = at(view.flags, cur, 0) == 0;
+
+        if op == Op::Select {
+            let mut o = view.operands(cur);
+            let cond_u32 = o.value().0;
+            let cond = to_idx(cond_u32);
+            let t_v = to_idx(o.value().0);
+            let f_v = to_idx(o.value().0);
+            if cond >= view.len() || view.op(cond) == Op::Uninit || Ty(at(view.tys, cond, 0)) != Ty::I1 {
+                return None;
+            }
+            let t_c = unsigned_const(view, t_v).or_else(|| {
+                if t_v < view.len() && view.op(t_v) != Op::Uninit {
+                    cond_implies_eq(view, cond, true, to_u32(t_v))
+                } else {
+                    None
+                }
+            });
+            let f_c = unsigned_const(view, f_v).or_else(|| {
+                if f_v < view.len() && view.op(f_v) != Op::Uninit {
+                    cond_implies_eq(view, cond, false, to_u32(f_v))
+                } else {
+                    None
+                }
+            });
+            let (ct, cf) = (t_c?, f_c?);
+            let m = mask(width);
+            base = Some((cond_u32, ct & m, cf & m));
+            break;
+        }
+
+        if ty == Ty::I1 {
+            base = Some((to_u32(cur), 1, 0));
+            break;
+        }
+
+        if step == MAX_DEPTH {
+            return None;
+        }
+
+        match op {
+            Op::Freeze => {
+                cur = to_idx(view.operands(cur).value().0);
+            }
+            Op::Zext | Op::Sext | Op::Trunc if flagless => {
+                let inner = to_idx(view.operands(cur).value().0);
+                if inner >= view.len() {
+                    return None;
+                }
+                let from_ty = Ty(at(view.tys, inner, 0));
+                if !from_ty.is_scalar() || !from_ty.is_int() {
+                    return None;
+                }
+                if conv_len >= convs.len() {
+                    return None;
+                }
+                set_at(&mut convs, conv_len, (op, from_ty.bits(ptr_bits), width));
+                conv_len += 1;
+                cur = inner;
+            }
+            _ => return None,
+        }
+    }
+
+    let (cond_u32, mut ct, mut cf) = base?;
+    for idx in (0..conv_len).rev() {
+        let (op, from_bits, to_bits) = at(&convs, idx, (Op::Freeze, 0, 0));
+        ct = convert(op, ct, from_bits, to_bits);
+        cf = convert(op, cf, from_bits, to_bits);
+    }
+    Some((cond_u32, ct, cf))
+}
+
+/// Returns the target ordinal (`0` = default, `1 + k` = case `k`) selected by `Op::Switch`
+/// terminator `term` when its scrutinee equals `val`.
+fn switch_ordinal_for_const(view: &View<'_>, term: usize, val: u128) -> u32 {
+    let mut o = view.operands(term);
+    let scrut = o.value();
+    let width = Ty(at(view.tys, scrut.index(), 0)).bits(view.head.ptr_bits);
+    let _default = o.target();
+    for (idx, (words, _)) in o.cases(scrut).enumerate() {
+        if wide_value(words, width) == val {
+            return 1 + to_u32(idx);
+        }
+    }
+    0
+}
+
+#[inline]
+fn targets_equal(view: &View<'_>, a: TargetSlice, b: TargetSlice) -> bool {
+    if a.block != b.block || a.args_len != b.args_len {
+        return false;
+    }
+    let sa = view.extra.get(a.args_start..a.args_start.saturating_add(a.args_len));
+    let sb = view.extra.get(b.args_start..b.args_start.saturating_add(b.args_len));
+    sa.is_some() && sa == sb
+}
+
+/// Checks whether `Op::Switch` terminator `term` switches on a 2-valued `Select` (or `i1` /
+/// conversion of one) and returns its `Op::Br` / `Op::Jump` replacement plan.
+fn plan_two_valued_switch_rewrite(view: &View<'_>, term: usize) -> Option<SwitchRewrite> {
+    if term >= view.len() || view.op(term) != Op::Switch {
+        return None;
+    }
+    let scrut = view.operands(term).value();
+    let (cond, ct, cf) = eval_two_valued_switch_scrutinee(view, scrut.index())?;
+    let ord_t = switch_ordinal_for_const(view, term, ct);
+    let ord_f = switch_ordinal_for_const(view, term, cf);
+    let target_t = target_by_ordinal(view, term, ord_t)?;
+    let target_f = target_by_ordinal(view, term, ord_f)?;
+    let is_jump = targets_equal(view, target_t, target_f);
+    Some(SwitchRewrite { cond, target_t, target_f, is_jump })
+}
+
+fn push_target_slice<A: Allocator>(
+    view: &View<'_>,
+    target: TargetSlice,
+    func: &mut Func<A>,
+) {
+    func.extra.push(target.block);
+    func.extra.push(to_u32(target.args_len));
+    if let Some(args) = view.extra.get(target.args_start..target.args_start.saturating_add(target.args_len)) {
+        func.extra.extend_from_slice(args);
+    }
+}
+
+/// Rewrites every `Op::Switch` listed in `rewrites` (sorted by instruction index) into
+/// `Op::Br(Flags::NONE, cond, target_t, target_f)` or `Op::Jump(target_t)`, preserving all
+/// instruction indices, block ranges, and target block arguments, returning verified LIR.
+fn rewrite_two_valued_switches<A: Allocator + Copy>(
+    view: &View<'_>,
+    rewrites: &[(usize, SwitchRewrite)],
+    alloc: A,
+) -> Result<Func<A>, SimplifyError> {
+    let len = view.len();
+    let mut func = view.to_func_in(alloc);
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+
+    let mut rew_idx = 0usize;
+    for inst in 0..len {
+        let rew_match = rewrites.get(rew_idx).copied().filter(|&(r_inst, _)| r_inst == inst);
+        if let Some((_, rew)) = rew_match {
+            rew_idx += 1;
+            let extra_start = to_u32(func.extra.len());
+            if rew.is_jump {
+                push_target_slice(view, rew.target_t, &mut func);
+                func.ops.push(op_byte(Op::Jump));
+            } else {
+                func.extra.push(rew.cond);
+                push_target_slice(view, rew.target_t, &mut func);
+                push_target_slice(view, rew.target_f, &mut func);
+                func.ops.push(op_byte(Op::Br));
+            }
+            func.flags.push(Flags::NONE.bits());
+            func.tys.push(Ty::NONE.0);
+            func.data.push(extra_start);
+            func.attrs.push(0);
+            func.locs.push(at(view.locs, inst, 0));
+            continue;
+        }
+
+        let op = view.op(inst);
+        let data = match op.info().layout {
+            Layout::None | Layout::Data(_) => at(view.data, inst, 0),
+            Layout::Extra(fields) => {
+                let extra_start = to_u32(func.extra.len());
+                let src_start = to_idx(at(view.data, inst, 0));
+                let rest = view.extra.get(src_start..).unwrap_or(&[]);
+                let taken = crate::op::walk(
+                    rest,
+                    fields,
+                    Ty(at(view.tys, inst, 0)),
+                    view.tys,
+                    &mut |_| Ok::<(), ()>(()),
+                )
+                .map_err(|_| SimplifyError::Refused {
+                    inst,
+                    what: "malformed extra operands in jump_thread",
+                })?;
+                if let Some(slice) = rest.get(..taken) {
+                    func.extra.extend_from_slice(slice);
+                }
+                extra_start
+            }
+        };
+        func.ops.push(at(view.ops, inst, 0));
+        func.flags.push(at(view.flags, inst, 0));
+        func.tys.push(at(view.tys, inst, 0));
+        func.data.push(data);
+        func.attrs.push(at(view.attrs, inst, 0));
+        func.locs.push(at(view.locs, inst, 0));
+    }
+
+    if u32::try_from(func.extra.len()).is_err() {
+        return Err(SimplifyError::Refused {
+            inst: 0,
+            what: "an output past LIR's extra column in jump_thread",
+        });
+    }
+    if cfg!(debug_assertions) {
+        verify(func.view()).map_err(SimplifyError::Verify)?;
+    }
+    Ok(func)
 }
 
 /// Evaluates `M`'s pure body and terminator for one incoming edge `edge`, returning the resolved
@@ -2888,6 +3601,29 @@ pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         if any_fold {
             let folded = fold_terminators(v, &fold_jumps, alloc)?;
             let cleaned = dead(folded.view(), alloc)?;
+            cur = coalesce_cfg(cleaned.view(), alloc)?;
+            any_coalesced = true;
+            continue;
+        }
+
+        // Phase 1b: lower reachable `Op::Switch` on a 2-valued `Select` (or `i1` / conversion of
+        // one) directly into `Op::Br(Flags::NONE, cond, target_t, target_f)` (or `Op::Jump` when
+        // both resolved targets and argument lists match), immediately cleaning up dead `Select`s
+        // and unreachable trap blocks.
+        let mut switch_rewrites: Vec<(usize, SwitchRewrite), A> = Vec::new_in(alloc);
+        for &b in cfg.rpo.iter() {
+            let term = v.terminator(Block(b));
+            if v.op(term) != Op::Switch {
+                continue;
+            }
+            if let Some(rew) = plan_two_valued_switch_rewrite(&v, term) {
+                switch_rewrites.push((term, rew));
+            }
+        }
+        if !switch_rewrites.is_empty() {
+            switch_rewrites.sort_unstable_by_key(|&(inst, _)| inst);
+            let lowered = rewrite_two_valued_switches(&v, &switch_rewrites, alloc)?;
+            let cleaned = dead(lowered.view(), alloc)?;
             cur = coalesce_cfg(cleaned.view(), alloc)?;
             any_coalesced = true;
             continue;
@@ -4329,6 +5065,409 @@ mod tests {
                 matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(expected)]),
                 "unexpected result for {args:?}: {after:?}"
             );
+        }
+    }
+
+    /// Bottom-tested (rotated) `slice::IterMut` / `slice::fill` loop on `&mut [u16]`:
+    /// entry guard `p0 != end`, header `hdr(p)` containing `p_next = PtrAdd(p, 2)` and
+    /// `Switch(Select(Ule(PtrAddr(p), 0), addr, 1), trap, [0=>exit, 1=>body])`, and latch `body`
+    /// testing `p_next != end -> hdr(p_next) else exit`. Verifies:
+    /// 1. Direct rotated loop with both `Flags::INBOUNDS` and `Flags::NONE` eliminates `Switch`,
+    ///    `Trap`, `Select`, and `PtrAddr`.
+    /// 2. Sub-slice rotated loop with a dedicated preheader and `Op::Sub` of two `Shl` offsets
+    ///    eliminates `Switch`, `Trap`, `Select`, `PtrAddr` and preserves exact fill semantics.
+    /// 3. Soundness control: without an entry guard, non-null propagation refuses to fold `p`,
+    ///    preserving the null check (`PtrAddr == 1`, `Br == 2`) while lowering `Switch -> Br`.
+    #[test]
+    fn folds_rotated_slice_iter_nonnull_switch_niche_tag() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // 1. Direct rotated `slice::fill` loop on `&mut [u16]` (step = 2).
+        for step_flags in [Flags::INBOUNDS, Flags::NONE] {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let mut ptr_param = Param::of(Ty::PTR);
+            ptr_param.facts = Facts { bits: ParamFactsRec::NONNULL, ..Facts::default() };
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[ptr_param, Param::of(Ty::I64), Param::of(Ty::I16)],
+                &[],
+            );
+            b.set_signature(sig);
+
+            let [entry, hdr, trap_blk, body, exit] = [(); 5].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let p0 = b.param(Ty::PTR);
+            let len = b.param(Ty::I64);
+            let fill_val = b.param(Ty::I16);
+            let sh1 = b.iconst(Ty::I64, 1);
+            let byte_len = b.binary(Op::Shl, Flags::NONE, len, sh1);
+            let end = b.ptr_add(Flags::INBOUNDS, p0, byte_len);
+            let has_any = b.icmp(IntCond::Ne, p0, end);
+            b.br(Flags::NONE, has_any, (hdr, &[p0]), (exit, &[]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let two = b.iconst(Ty::I64, 2);
+            let p_next = b.ptr_add(step_flags, p, two);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            b.switch(tag, (trap_blk, &[]), &[(0, (exit, &[])), (1, (body, &[]))]);
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(body);
+            b.store(Flags::NONE, fill_val, p, 0, MemAttrs::aligned(1));
+            let cont = b.icmp(IntCond::Ne, p_next, end);
+            b.br(Flags::NONE, cont, (hdr, &[p_next]), (exit, &[]));
+
+            b.begin(exit);
+            b.ret(&[]);
+
+            let input = b.finish_checked().expect("valid rotated slice fill input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Switch), 0, "expected 0 switches ({step_flags:?}):\n{}", print(v));
+            assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps ({step_flags:?}):\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects ({step_flags:?}):\n{}", print(v));
+            assert_eq!(count_op(v, Op::PtrAddr), 0, "expected 0 ptr_addrs ({step_flags:?}):\n{}", print(v));
+            assert_eq!(count_op(v, Op::Br), 2, "expected entry + latch branches ({step_flags:?}):\n{}", print(v));
+            assert_eq!(v.blocks(), 3, "expected 3 blocks (entry, hdr+body, exit) ({step_flags:?}):\n{}", print(v));
+        }
+
+        // 2. Rotated sub-slice fill `&mut buf[start..end]` with a preheader and `Op::Sub` of two
+        //    `Shl` byte offsets, evaluated via `run_in` on a real stack slot `[u16; 8]`.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I16)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+
+            let [entry, preheader, hdr, trap_blk, body, exit] =
+                [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let start_i = b.param(Ty::I64);
+            let end_i = b.param(Ty::I64);
+            let fill_val = b.param(Ty::I16);
+            let data_slot = b.slot(16, 1, SlotKind::Temp);
+            let base = b.slot_addr(data_slot);
+            let zero16 = b.iconst(Ty::I16, 0);
+            for lane in 0..8i32 {
+                b.store(Flags::NONE, zero16, base, lane * 2, MemAttrs::aligned(1));
+            }
+            let sh1 = b.iconst(Ty::I64, 1);
+            let start_bytes = b.binary(Op::Shl, Flags::NONE, start_i, sh1);
+            let end_bytes = b.binary(Op::Shl, Flags::NONE, end_i, sh1);
+            let sub_bytes = b.binary(Op::Sub, Flags::NONE, end_bytes, start_bytes);
+            let p0 = b.ptr_add(Flags::INBOUNDS, base, start_bytes);
+            let end = b.ptr_add(Flags::INBOUNDS, p0, sub_bytes);
+            let has_any = b.icmp(IntCond::Ne, p0, end);
+            b.br(Flags::NONE, has_any, (preheader, &[]), (exit, &[]));
+
+            b.begin(preheader);
+            b.jump((hdr, &[p0]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let two = b.iconst(Ty::I64, 2);
+            let p_next = b.ptr_add(Flags::NONE, p, two);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            b.switch(tag, (trap_blk, &[]), &[(0, (exit, &[])), (1, (body, &[]))]);
+
+            b.begin(trap_blk);
+            b.trap(2);
+
+            b.begin(body);
+            b.store(Flags::NONE, fill_val, p, 0, MemAttrs::aligned(1));
+            let cont = b.icmp(IntCond::Ne, p_next, end);
+            b.br(Flags::NONE, cont, (hdr, &[p_next]), (exit, &[]));
+
+            b.begin(exit);
+            let mut sum = b.iconst(Ty::I64, 0);
+            for lane in 0..8i32 {
+                let elem = b.load(Ty::I16, Flags::NONE, base, lane * 2, MemAttrs::aligned(1));
+                let ext = b.convert(Op::Zext, Flags::NONE, Ty::I64, elem);
+                sum = b.binary(Op::Add, Flags::NONE, sum, ext);
+            }
+            b.ret(&[sum]);
+
+            let input = b.finish_checked().expect("valid rotated sub-slice fill input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Switch), 0, "expected 0 switches:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects:\n{}", print(v));
+            assert_eq!(count_op(v, Op::PtrAddr), 0, "expected 0 ptr_addrs:\n{}", print(v));
+
+            for (start_v, end_v, val) in [(0u128, 0u128, 7u128), (2, 2, 7), (0, 1, 7), (1, 5, 11), (0, 8, 3)] {
+                let expected = (end_v - start_v) * val;
+                let args = [Val::Int(start_v), Val::Int(end_v), Val::Int(val)];
+                // Input uses `PtrAddr` on a stack slot (refused by the abstract evaluator);
+                // after folding away the niche `PtrAddr`/`Switch`, the optimized loop runs
+                // directly on the slot and must produce the exact filled sum.
+                let after = run_in(v, &args, FUEL, alloc).expect("eval output");
+                assert!(
+                    matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(expected)]),
+                    "unexpected result for [{start_v}..{end_v}] = {val}: {after:?}"
+                );
+            }
+        }
+
+        // 3. Soundness control: missing entry guard with dynamic `byte_len` and flagless `PtrAdd`
+        //    MUST NOT assume `p_next` is non-null (preserves `PtrAddr` null check while lowering
+        //    the 2-valued `Switch` to `Op::Br`).
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let mut ptr_param = Param::of(Ty::PTR);
+            ptr_param.facts = Facts { bits: ParamFactsRec::NONNULL, ..Facts::default() };
+            let sig = b.sig(Conv::C, Variadic::No, &[ptr_param, Param::of(Ty::I64)], &[]);
+            b.set_signature(sig);
+
+            let [entry, hdr, trap_blk, body, exit] = [(); 5].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let p0 = b.param(Ty::PTR);
+            let len = b.param(Ty::I64);
+            let sh1 = b.iconst(Ty::I64, 1);
+            let byte_len = b.binary(Op::Shl, Flags::NONE, len, sh1);
+            let end = b.ptr_add(Flags::INBOUNDS, p0, byte_len);
+            b.jump((hdr, &[p0]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let two = b.iconst(Ty::I64, 2);
+            let p_next = b.ptr_add(Flags::NONE, p, two);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            b.switch(tag, (trap_blk, &[]), &[(0, (exit, &[])), (1, (body, &[]))]);
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(body);
+            let cont = b.icmp(IntCond::Ne, p_next, end);
+            b.br(Flags::NONE, cont, (hdr, &[p_next]), (exit, &[]));
+
+            b.begin(exit);
+            b.ret(&[]);
+
+            let input = b.finish_checked().expect("valid unguarded rotated control input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Switch), 0, "2-valued switch should still lower to br:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Trap), 0, "unreachable trap should be cleaned up:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "dead select should be cleaned up:\n{}", print(v));
+            assert_eq!(
+                count_op(v, Op::PtrAddr),
+                1,
+                "unguarded rotated loop MUST preserve null check:\n{}",
+                print(v)
+            );
+            assert_eq!(
+                count_op(v, Op::Br),
+                2,
+                "expected null-check branch + latch branch:\n{}",
+                print(v)
+            );
+        }
+    }
+
+    /// Lowers 2-valued `Op::Switch` on niche `Op::Select` directly into `Op::Br` (or `Op::Jump`
+    /// when both arms share the same target and block arguments) even for a nullable `ptr` with
+    /// NO `ParamFactsRec::NONNULL` fact, eliminating `Switch`, `Trap`, and `Select` while
+    /// preserving block arguments and exact `p == null` / `p != null` semantics.
+    #[test]
+    fn lowers_two_valued_niche_select_switch_to_br() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // 1. Primary niche form: `Select(Icmp(Ule, PtrAddr(p), 0), addr, 1)` -> `Switch` with
+        //    block arguments on `none_blk` and `some_blk`.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+
+            let [entry, trap_blk, none_blk, some_blk] =
+                [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let none_val = b.param(Ty::I64);
+            let some_val = b.param(Ty::I64);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            b.switch(
+                tag,
+                (trap_blk, &[]),
+                &[(0, (none_blk, &[none_val])), (1, (some_blk, &[some_val]))],
+            );
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(none_blk);
+            let nv = b.param(Ty::I64);
+            b.ret(&[nv]);
+
+            b.begin(some_blk);
+            let sv = b.param(Ty::I64);
+            let ten = b.iconst(Ty::I64, 10);
+            let res = b.binary(Op::Add, Flags::NONE, sv, ten);
+            b.ret(&[res]);
+
+            let input = b.finish_checked().expect("valid nullable niche switch input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Switch), 0, "expected 0 switches:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Br), 1, "expected 1 lowered branch:\n{}", print(v));
+
+            for (offset, expected) in [(0i128, 7u128), (0x1000, 52u128)] {
+                let args = [Val::Ptr { slot: Val::NO_SLOT, offset }, Val::Int(7), Val::Int(42)];
+                let before = run_in(input.view(), &args, FUEL, alloc).expect("eval input");
+                let after = run_in(v, &args, FUEL, alloc).expect("eval output");
+                assert_eq!(before, after, "semantics diverged for offset={offset}");
+                assert!(
+                    matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(expected)]),
+                    "unexpected result for offset={offset}: {after:?}"
+                );
+            }
+        }
+
+        // 2. Reversed `Ugt` / false-arm `addr` form with default-arm fallback:
+        //    `Select(Icmp(Ugt, PtrAddr(p), 0), 1, addr)` -> `Switch(tag, default=some_blk, [0=>none_blk])`.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+
+            let [entry, none_blk, some_blk] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c_nz = b.icmp(IntCond::Ugt, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c_nz, c1, addr);
+            b.switch(tag, (some_blk, &[]), &[(0, (none_blk, &[]))]);
+
+            b.begin(none_blk);
+            let r0 = b.iconst(Ty::I64, 100);
+            b.ret(&[r0]);
+
+            b.begin(some_blk);
+            let r1 = b.iconst(Ty::I64, 200);
+            b.ret(&[r1]);
+
+            let input = b.finish_checked().expect("valid reversed niche switch input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Switch), 0, "expected 0 switches:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Br), 1, "expected 1 branch:\n{}", print(v));
+
+            for (offset, expected) in [(0i128, 100u128), (0x2000, 200u128)] {
+                let args = [Val::Ptr { slot: Val::NO_SLOT, offset }];
+                let before = run_in(input.view(), &args, FUEL, alloc).expect("eval input");
+                let after = run_in(v, &args, FUEL, alloc).expect("eval output");
+                assert_eq!(before, after, "semantics diverged for offset={offset}");
+                assert!(
+                    matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(expected)]),
+                    "unexpected result for offset={offset}: {after:?}"
+                );
+            }
+        }
+
+        // 3. Same-target collapse: both resolved cases match `(join, &[x])`, so `Op::Switch`
+        //    lowers straight to `Op::Jump` and coalesces into a single block.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+
+            let [entry, trap_blk, join] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let x = b.param(Ty::I64);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            b.switch(tag, (trap_blk, &[]), &[(0, (join, &[x])), (1, (join, &[x]))]);
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(join);
+            let out_x = b.param(Ty::I64);
+            b.ret(&[out_x]);
+
+            let input = b.finish_checked().expect("valid same-target niche switch input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Switch), 0, "expected 0 switches:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Br), 0, "expected 0 branches:\n{}", print(v));
+            assert_eq!(count_op(v, Op::PtrAddr), 0, "expected 0 ptr_addrs:\n{}", print(v));
+            assert_eq!(v.blocks(), 1, "expected single coalesced block:\n{}", print(v));
+
+            for offset in [0i128, 0x1000] {
+                let args = [Val::Ptr { slot: Val::NO_SLOT, offset }, Val::Int(99)];
+                let before = run_in(input.view(), &args, FUEL, alloc).expect("eval input");
+                let after = run_in(v, &args, FUEL, alloc).expect("eval output");
+                assert_eq!(before, after, "semantics diverged for offset={offset}");
+                assert!(
+                    matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(99)]),
+                    "unexpected result for offset={offset}: {after:?}"
+                );
+            }
         }
     }
 }

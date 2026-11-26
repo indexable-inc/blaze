@@ -71,9 +71,12 @@ impl HuffEntryX2 {
         (self.0 & 0xFFFF).widen_to::<u64>()
     }
 
+    /// Packed metadata `(num_bits as u32) | ((sym_bits as u32) << 8)` in bits `0..16`:
+    /// low 6 bits hold `num_bits` (`<= 11 < 64`), and summing 4 entries never carries out of
+    /// the low byte (`<= 44 < 256`) or upper byte (`<= 64 < 256`).
     #[inline(always)]
-    fn num_bits_u64(self) -> u64 {
-        ((self.0 >> 16) & 0xFF).widen_to::<u64>()
+    fn meta(self) -> u32 {
+        self.0 >> 16
     }
 
     #[inline(always)]
@@ -102,11 +105,6 @@ impl HuffTable {
     #[inline(always)]
     fn lookup_fast(&self, idx: usize) -> HuffEntry {
         self.entries.get_masked(idx)
-    }
-
-    #[inline(always)]
-    fn lookup_x2(&self, idx: usize) -> HuffEntryX2 {
-        self.entries_x2.get_masked(idx)
     }
 
     fn decode_description_inner(&mut self, src: &[u8]) -> Option<usize> {
@@ -464,7 +462,7 @@ impl HuffTable {
                 let Some(b) = bf.reload_window_slack8() else {
                     break;
                 };
-                self.decode_x2_quad(b, &mut bf, &mut sw, shift_r);
+                decode_x2_quad(&self.entries_x2, b, &mut bf, &mut sw, shift_r);
             }
             bf.commit_to(&mut br);
         }
@@ -478,52 +476,6 @@ impl HuffTable {
             *slot = entry.symbol();
         }
         br.is_empty()
-    }
-
-    /// Execute 4 double-symbol `X2` lookups (`4..=8` decoded symbols, consuming
-    /// `<= 4 * max_bits <= 44` bits) from an MSB-aligned 64-bit bit window `b` (`>= 57` live
-    /// bits), advance `bf`, and emit one batched 64-bit little-endian store into `sw`.
-    ///
-    /// Indexes `entries_x2` directly via `(b >> shift_r).truncate_to::<usize>()` with no
-    /// intermediate `u16` truncation; when `shift_r == 53` (`max_bits == 11`), `b >> 53` is
-    /// already in `0..2048` so LLVM eliminates `Pow2Array::get_masked`'s `& 0x7ff` mask too.
-    #[inline(always)]
-    fn decode_x2_quad(
-        &self,
-        mut b: u64,
-        bf: &mut RevBitSlack8<'_>,
-        sw: &mut SliceWriter<'_>,
-        shift_r: u32,
-    ) {
-        let e0 = self.lookup_x2((b >> shift_r).truncate_to::<usize>());
-        let n0 = e0.num_bits_u64();
-        b <<= n0;
-        bf.advance(n0);
-        let mut out_word = e0.packed_u64();
-        let mut sh = e0.sym_bits();
-
-        let e1 = self.lookup_x2((b >> shift_r).truncate_to::<usize>());
-        let n1 = e1.num_bits_u64();
-        b <<= n1;
-        bf.advance(n1);
-        out_word |= e1.packed_u64() << sh;
-        sh += e1.sym_bits();
-
-        let e2 = self.lookup_x2((b >> shift_r).truncate_to::<usize>());
-        let n2 = e2.num_bits_u64();
-        b <<= n2;
-        bf.advance(n2);
-        out_word |= e2.packed_u64() << sh;
-        sh += e2.sym_bits();
-
-        let e3 = self.lookup_x2((b >> shift_r).truncate_to::<usize>());
-        bf.advance(e3.num_bits_u64());
-        // Upper metadata bits of `e3.0` shift strictly past `sh + e3.sym_bits()` and are never
-        // committed by `write_u64_le_adv`, avoiding a redundant `0xFFFF` mask on the final lookup.
-        out_word |= u64::from(e3.0) << sh;
-        sh += e3.sym_bits();
-
-        let _ = sw.write_u64_le_adv(out_word, (sh >> 3).widen_to::<usize>());
     }
 
     /// Decode a single reverse Huffman bitstream directly into pre-sized `dst` using a
@@ -547,7 +499,7 @@ impl HuffTable {
                 let Some(b) = bf.reload_window_slack8() else {
                     break;
                 };
-                self.decode_x2_quad(b, &mut bf, &mut sw, shift_r);
+                decode_x2_quad(&self.entries_x2, b, &mut bf, &mut sw, shift_r);
             }
             bf.commit_to(&mut br);
         }
@@ -558,8 +510,7 @@ impl HuffTable {
         Ok(())
     }
 
-    #[inline(always)]
-    fn decode_4_streams_loop(&self, src: &[u8], dst: &mut [u8], shift_r: u32) -> bool {
+    fn decode_4_streams_inner(&self, src: &[u8], dst: &mut [u8]) -> bool {
         let Some((jump, rest)) = src.split_at_checked(6) else {
             return false;
         };
@@ -602,80 +553,60 @@ impl HuffTable {
             return false;
         }
 
-        let Some(mut br1) = RevBitCursor::new(st1) else {
+        let Some(br1) = RevBitCursor::new(st1) else {
             return false;
         };
-        let Some(mut br2) = RevBitCursor::new(st2) else {
+        let Some(br2) = RevBitCursor::new(st2) else {
             return false;
         };
-        let Some(mut br3) = RevBitCursor::new(st3) else {
+        let Some(br3) = RevBitCursor::new(st3) else {
             return false;
         };
-        let Some(mut br4) = RevBitCursor::new(st4) else {
+        let Some(br4) = RevBitCursor::new(st4) else {
             return false;
         };
-        let mut sw1 = SliceWriter::new(d1);
-        let mut sw2 = SliceWriter::new(d2);
-        let mut sw3 = SliceWriter::new(d3);
-        let mut sw4 = SliceWriter::new(d4);
 
-        if sw1.has_8()
-            && sw2.has_8()
-            && sw3.has_8()
-            && sw4.has_8()
-            && br1.has_slack8()
-            && br2.has_slack8()
-            && br3.has_slack8()
-            && br4.has_slack8()
+        let rem = [d1.len(), d2.len(), d3.len(), d4.len()];
+        let mut st = Huff4FastState { br1, br2, br3, br4, d1, d2, d3, d4, rem };
+
+        if st.d1.len() >= 8
+            && st.d2.len() >= 8
+            && st.d3.len() >= 8
+            && st.d4.len() >= 8
+            && st.br1.has_slack8()
+            && st.br2.has_slack8()
+            && st.br3.has_slack8()
+            && st.br4.has_slack8()
         {
-            let mut bf1 = br1.open_slack8();
-            let mut bf2 = br2.open_slack8();
-            let mut bf3 = br3.open_slack8();
-            let mut bf4 = br4.open_slack8();
-
-            // 1x round-robin across the 4 independent streams (16..32 symbols per iteration):
-            // keeps all 4 stream states register-resident on AArch64 while `has_8()` statically
-            // proves `rem >= 8` for each `write_u64_le_adv` call (advances by `<= 8` bytes).
-            while sw1.has_8() && sw2.has_8() && sw3.has_8() && sw4.has_8() {
-                let Some(b1) = bf1.reload_window_slack8() else {
-                    break;
-                };
-                self.decode_x2_quad(b1, &mut bf1, &mut sw1, shift_r);
-                let Some(b2) = bf2.reload_window_slack8() else {
-                    break;
-                };
-                self.decode_x2_quad(b2, &mut bf2, &mut sw2, shift_r);
-                let Some(b3) = bf3.reload_window_slack8() else {
-                    break;
-                };
-                self.decode_x2_quad(b3, &mut bf3, &mut sw3, shift_r);
-                let Some(b4) = bf4.reload_window_slack8() else {
-                    break;
-                };
-                self.decode_x2_quad(b4, &mut bf4, &mut sw4, shift_r);
+            match self.max_bits {
+                11 => decode_4_streams_fast_leaf_11(&self.entries_x2, &mut st),
+                10 => decode_4_streams_fast_leaf_10(&self.entries_x2, &mut st),
+                mb => {
+                    let shift_r = 64u32 - u32::from(mb);
+                    decode_4_streams_fast_leaf_var(&self.entries_x2, shift_r, &mut st);
+                }
             }
-
-            bf1.commit_to(&mut br1);
-            bf2.commit_to(&mut br2);
-            bf3.commit_to(&mut br3);
-            bf4.commit_to(&mut br4);
         }
 
+        let [rem1, rem2, rem3, rem4] = st.rem;
+        let w1 = st.d1.len().saturating_sub(rem1);
+        let w2 = st.d2.len().saturating_sub(rem2);
+        let w3 = st.d3.len().saturating_sub(rem3);
+        let w4 = st.d4.len().saturating_sub(rem4);
+        let (Some(t1), Some(t2), Some(t3), Some(t4)) = (
+            st.d1.get_mut(w1..),
+            st.d2.get_mut(w2..),
+            st.d3.get_mut(w3..),
+            st.d4.get_mut(w4..),
+        ) else {
+            return false;
+        };
+
         // Drain the exact remaining tail of each stream (X2 fast drain + X1 exact checking).
-        self.decode_tail(br1, sw1.into_rest())
-            && self.decode_tail(br2, sw2.into_rest())
-            && self.decode_tail(br3, sw3.into_rest())
-            && self.decode_tail(br4, sw4.into_rest())
-    }
-
-    #[inline(never)]
-    fn decode_4_streams_11(&self, src: &[u8], dst: &mut [u8]) -> bool {
-        self.decode_4_streams_loop(src, dst, 53)
-    }
-
-    #[inline(never)]
-    fn decode_4_streams_var(&self, src: &[u8], dst: &mut [u8], shift_r: u32) -> bool {
-        self.decode_4_streams_loop(src, dst, shift_r)
+        self.decode_tail(st.br1, t1)
+            && self.decode_tail(st.br2, t2)
+            && self.decode_tail(st.br3, t3)
+            && self.decode_tail(st.br4, t4)
     }
 
     /// Decode an RFC 8878 §4.2.2 4-stream Huffman literals payload directly into pre-sized `dst`
@@ -689,17 +620,147 @@ impl HuffTable {
         if self.max_bits == 0 || self.max_bits > MAX_HUFF_BITS {
             return Err(ZstdError::CorruptHuffman);
         }
-        let ok = if self.max_bits == 11 {
-            self.decode_4_streams_11(src, dst)
-        } else {
-            let shift_r = 64u32 - u32::from(self.max_bits);
-            self.decode_4_streams_var(src, dst, shift_r)
-        };
-        if !ok {
+        if !self.decode_4_streams_inner(src, dst) {
             return Err(ZstdError::CorruptHuffman);
         }
         Ok(())
     }
+}
+
+/// Out-of-loop handoff state passed by `&mut` (one pointer, zero aggregate copy) into the
+/// zero-call 4-stream Huffman fast-loop leaves.
+struct Huff4FastState<'a, 'b> {
+    br1: RevBitCursor<'a>,
+    br2: RevBitCursor<'a>,
+    br3: RevBitCursor<'a>,
+    br4: RevBitCursor<'a>,
+    d1: &'b mut [u8],
+    d2: &'b mut [u8],
+    d3: &'b mut [u8],
+    d4: &'b mut [u8],
+    rem: [usize; 4],
+}
+
+/// Execute 4 double-symbol `X2` lookups (`4..=8` decoded symbols, consuming
+/// `<= 4 * max_bits <= 44` bits) from an MSB-aligned 64-bit bit window `b` (`>= 57` live
+/// bits), advance `bf`, and emit one batched 64-bit little-endian store into `sw`.
+///
+/// Indexes `table` directly via `(b >> shift_r).truncate_to::<usize>()` with no intermediate
+/// `u16` truncation; when `shift_r >= 53` (`max_bits <= 11`) is a compile-time constant,
+/// `b >> shift_r` is already in `0..2048` so the compiler eliminates `Pow2Array::get_masked`'s
+/// `& 0x7ff` mask too.
+///
+/// Accumulates packed metadata `meta = (e0 >> 16) + (e1 >> 16) + (e2 >> 16) + (e3 >> 16)` in one
+/// SWAR register (`low 6 bits = total bits consumed <= 44 < 64`, `bits 8..16 = total output bits
+/// <= 64`, zero carry) and packs symbols in reverse Horner order (`e3 -> e2 -> e1 -> e0`),
+/// eliminating both the separate `sh` accumulator and per-entry `n0..n2` live values so peak
+/// scratch pressure stays within a zero-call leaf's 27-GPR budget with zero stack spills.
+#[inline(always)]
+fn decode_x2_quad(
+    table: &Pow2Array<HuffEntryX2, MAX_HUFF_TABLE_SIZE>,
+    b: u64,
+    bf: &mut RevBitSlack8<'_>,
+    sw: &mut SliceWriter<'_>,
+    shift_r: u32,
+) {
+    let e0 = table.get_masked((b >> shift_r).truncate_to::<usize>());
+    let mut meta = e0.meta();
+    let b1 = b.wrapping_shl(meta);
+
+    let e1 = table.get_masked((b1 >> shift_r).truncate_to::<usize>());
+    meta = meta.wrapping_add(e1.meta());
+    let b2 = b.wrapping_shl(meta);
+
+    let e2 = table.get_masked((b2 >> shift_r).truncate_to::<usize>());
+    meta = meta.wrapping_add(e2.meta());
+    let b3 = b.wrapping_shl(meta);
+
+    let e3 = table.get_masked((b3 >> shift_r).truncate_to::<usize>());
+    meta = meta.wrapping_add(e3.meta());
+
+    // Reverse Horner packing (`e3 -> e2 -> e1 -> e0`): upper metadata bits of `e3.0` stay
+    // strictly past `meta >> 8` (`total_sym_bits`) and are never committed by `write_u64_le_adv`,
+    // avoiding both an `e3 & 0xFFFF` mask and a separate `sh` accumulator.
+    let out_word = u64::from(e3.0);
+    let out_word = out_word.wrapping_shl(e2.sym_bits()) | e2.packed_u64();
+    let out_word = out_word.wrapping_shl(e1.sym_bits()) | e1.packed_u64();
+    let out_word = out_word.wrapping_shl(e0.sym_bits()) | e0.packed_u64();
+
+    bf.advance(u64::from(meta & 0xFF));
+    let _ = sw.write_u64_le_adv(out_word, (meta >> 11).widen_to::<usize>());
+}
+
+#[inline(always)]
+fn decode_4_streams_fast_leaf_inner(
+    table: &Pow2Array<HuffEntryX2, MAX_HUFF_TABLE_SIZE>,
+    shift_r: u32,
+    st: &mut Huff4FastState<'_, '_>,
+) {
+    let mut bf1 = st.br1.open_slack8();
+    let mut bf2 = st.br2.open_slack8();
+    let mut bf3 = st.br3.open_slack8();
+    let mut bf4 = st.br4.open_slack8();
+    let mut sw1 = SliceWriter::new(st.d1);
+    let mut sw2 = SliceWriter::new(st.d2);
+    let mut sw3 = SliceWriter::new(st.d3);
+    let mut sw4 = SliceWriter::new(st.d4);
+
+    // 1x round-robin across the 4 independent streams (16..32 symbols per iteration):
+    // zero-call leaf unlocks `X30` (27 GPRs on AArch64) and takes `&entries_x2` directly (21
+    // loop-carried GPRs for constant `shift_r`, 22 for variable `shift_r`), while `has_8()`
+    // statically proves `rem >= 8` for each `write_u64_le_adv` call (advances by `<= 8` bytes).
+    while sw1.has_8() && sw2.has_8() && sw3.has_8() && sw4.has_8() {
+        let Some(b1) = bf1.reload_window_slack8() else {
+            break;
+        };
+        decode_x2_quad(table, b1, &mut bf1, &mut sw1, shift_r);
+        let Some(b2) = bf2.reload_window_slack8() else {
+            break;
+        };
+        decode_x2_quad(table, b2, &mut bf2, &mut sw2, shift_r);
+        let Some(b3) = bf3.reload_window_slack8() else {
+            break;
+        };
+        decode_x2_quad(table, b3, &mut bf3, &mut sw3, shift_r);
+        let Some(b4) = bf4.reload_window_slack8() else {
+            break;
+        };
+        decode_x2_quad(table, b4, &mut bf4, &mut sw4, shift_r);
+    }
+
+    bf1.commit_to(&mut st.br1);
+    bf2.commit_to(&mut st.br2);
+    bf3.commit_to(&mut st.br3);
+    bf4.commit_to(&mut st.br4);
+    st.rem = [sw1.rem(), sw2.rem(), sw3.rem(), sw4.rem()];
+}
+
+/// Zero-call leaf fast loop specialized for 11-bit Huffman tables (`shift_r == 53`).
+#[inline(never)]
+fn decode_4_streams_fast_leaf_11(
+    table: &Pow2Array<HuffEntryX2, MAX_HUFF_TABLE_SIZE>,
+    st: &mut Huff4FastState<'_, '_>,
+) {
+    decode_4_streams_fast_leaf_inner(table, 53, st);
+}
+
+/// Zero-call leaf fast loop specialized for 10-bit Huffman tables (`shift_r == 54`).
+#[inline(never)]
+fn decode_4_streams_fast_leaf_10(
+    table: &Pow2Array<HuffEntryX2, MAX_HUFF_TABLE_SIZE>,
+    st: &mut Huff4FastState<'_, '_>,
+) {
+    decode_4_streams_fast_leaf_inner(table, 54, st);
+}
+
+/// Zero-call leaf fast loop for general `<= 9`-bit Huffman tables (`shift_r == 64 - max_bits`).
+#[inline(never)]
+fn decode_4_streams_fast_leaf_var(
+    table: &Pow2Array<HuffEntryX2, MAX_HUFF_TABLE_SIZE>,
+    shift_r: u32,
+    st: &mut Huff4FastState<'_, '_>,
+) {
+    decode_4_streams_fast_leaf_inner(table, shift_r, st);
 }
 
 // ---------------------------------------------------------------------------

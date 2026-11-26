@@ -33,6 +33,7 @@ use blaze_own::Vec;
 use super::{
     SimplifyError,
     dce::{NONE, each, filled, Item},
+    value_info::ValueInfo,
 };
 use crate::{
     Block, Flags, Func, IntCond, Op, Ty, View,
@@ -506,6 +507,107 @@ fn inbounds_ptr_byte_offset(view: &View<'_>, iv_init: u32, bound: u32) -> Option
     }
 }
 
+/// Adaptive unroll factor: 2x (32 bytes = 1 `stp q, q` / iter) for pure fill store loops
+/// (`loads_len == 0`, so 32-byte fills vectorize with zero scalar tail and full store bandwidth);
+/// 4x (64 bytes = 1 cache line / iter) for small/medium load-bearing bodies; 2x (32 bytes / iter)
+/// for larger bodies to keep vector register pressure 0-spill.
+#[inline]
+const fn vec_unroll_factor(loads_len: usize, reductions_len: usize, vec_exprs_len: usize) -> usize {
+    if loads_len > 0 && loads_len <= 2 && reductions_len <= 2 && vec_exprs_len <= 8 {
+        4
+    } else {
+        2
+    }
+}
+
+/// Returns the `I64` byte-length operand `byte_off` when `bound` is `PtrAdd(iv_init, byte_off)`
+/// or `Add(PtrAddr(iv_init), byte_off)` (commuted). Whenever `addr(iv_init) < addr(bound)`
+/// holds unsigned, modular wraparound did not occur and `addr(bound) - addr(iv_init) == byte_off`.
+fn ptr_range_byte_len(view: &View<'_>, iv_init: u32, bound: u32) -> Option<u32> {
+    let bi = to_idx(bound);
+    let off = match view.op(bi) {
+        Op::PtrAdd => {
+            let pos = to_idx(at(view.data, bi));
+            if at(view.extra, pos) == iv_init {
+                Some(at(view.extra, pos + 1))
+            } else {
+                None
+            }
+        }
+        Op::Add => {
+            let pos = to_idx(at(view.data, bi));
+            let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+            if view.op(to_idx(l)) == Op::PtrAddr && unwrap_ptr_addr(view, l) == iv_init {
+                Some(r)
+            } else if view.op(to_idx(r)) == Op::PtrAddr && unwrap_ptr_addr(view, r) == iv_init {
+                Some(l)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }?;
+    if Ty(at(view.tys, to_idx(off))) == Ty::I64 {
+        Some(off)
+    } else {
+        None
+    }
+}
+
+/// Returns `true` when the loop's trip count (or byte span for `IvKind::Pointer`) is statically
+/// provably strictly below the minimum vectorized chunk (`min_iters` / `min_bytes`), so emitting
+/// a SIMD loop and runtime guard would only produce dead code.
+fn trip_count_provably_below<A: Allocator>(
+    view: &View<'_>,
+    vi: &ValueInfo<A>,
+    header: u32,
+    iv_kind: IvKind,
+    iv_init: u32,
+    bound: u32,
+    min_iters: u64,
+    min_bytes: u64,
+) -> bool {
+    if min_iters == 0 || min_bytes == 0 {
+        return false;
+    }
+    if iv_init == bound {
+        return true;
+    }
+    let hdr = Block(header);
+    match iv_kind {
+        IvKind::Counted { .. } => {
+            let bi = to_idx(bound);
+            if bi < view.len() && view.op(bi) == Op::Add {
+                let pos = to_idx(at(view.data, bi));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                let count_opt = if l == iv_init {
+                    Some(r)
+                } else if r == iv_init {
+                    Some(l)
+                } else {
+                    None
+                };
+                if let Some(count) = count_opt
+                    && vi.max_u64(hdr, to_idx(count)).is_some_and(|m| m < min_iters)
+                {
+                    return true;
+                }
+            }
+            let Some(max_b) = vi.max_u64(hdr, bi) else {
+                return false;
+            };
+            let min_init = u64::try_from(vi.range(hdr, to_idx(iv_init)).lo).unwrap_or(0);
+            max_b.saturating_sub(min_init) < min_iters
+        }
+        IvKind::Pointer => {
+            let Some(byte_off) = ptr_range_byte_len(view, iv_init, bound) else {
+                return false;
+            };
+            vi.max_u64(hdr, to_idx(byte_off)).is_some_and(|m| m < min_bytes)
+        }
+    }
+}
+
 /// Matches a conditional-count reduction update on `acc` (`p_inst`) of type `acc_ty` (`I8..I64`)
 /// over integer elements of type `elem_ty` (`elem_ty.bits <= acc_ty.bits`):
 /// - `acc + Select(cond, 1, 0)` or `acc + Select(cond, 0, 1)`
@@ -945,6 +1047,7 @@ fn is_reduction_op(op: Op, flags: Flags, elem_ty: Ty) -> bool {
 fn find_vectorizable_loop<A: Allocator + Copy>(
     view: &View<'_>,
     vec_bytes: u32,
+    vi: &mut Option<ValueInfo<A>>,
     alloc: A,
 ) -> Option<VecLoopPlan<A>> {
     if view.head.ptr_bits != 64 {
@@ -1209,6 +1312,7 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
         let mut vec_ty_info: Option<(Ty, u32, u32)> = None;
         let mut loads: Vec<UnitStrideMem, A> = Vec::new_in(alloc);
         let mut store: Option<UnitStrideMem> = None;
+        let mut seen_store = false;
         let mut bad_body = false;
 
         for inst in body_start..body_end {
@@ -1236,10 +1340,11 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                     }
                 }
                 Op::Store => {
-                    if flags.contains(Flags::VOLATILE) || store.is_some() {
+                    if flags.contains(Flags::VOLATILE) || seen_store {
                         bad_body = true;
                         break;
                     }
+                    seen_store = true;
                     let idx = to_idx(at(view.data, inst));
                     let st = Ty(at(view.tys, to_idx(at(view.extra, idx))));
                     let Some(info) = supported_elem(st, vec_bytes) else {
@@ -1340,7 +1445,7 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                     None
                 };
                 if let Some(bnd) = bound_opt
-                    && !is_not_inv_blk(at(&inst_block, to_idx(bnd)))
+                    && (!is_not_inv_blk(at(&inst_block, to_idx(bnd))) || const_u64(view, to_idx(bnd)).is_some())
                     && Ty(at(view.tys, to_idx(bnd))) == p_ty
                 {
                     found_iv = Some((pos, p_inst, back_v, bnd, IvKind::Counted { iv_ty: p_ty }));
@@ -1622,6 +1727,10 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                     mem_attr: at(view.attrs, inst),
                 });
             } else if op == Op::Store {
+                if store.is_some() {
+                    bad_body = true;
+                    break;
+                }
                 let idx = to_idx(at(view.data, inst));
                 let sv = at(view.extra, idx);
                 let ptr = at(view.extra, idx + 1);
@@ -1656,7 +1765,10 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                 });
             }
         }
-        if bad_body || loads.is_empty() || (reductions.is_empty() && store.is_none()) || (!reductions.is_empty() && store.is_some()) {
+        if bad_body
+            || (store.is_none() && (loads.is_empty() || reductions.is_empty()))
+            || (store.is_some() && !reductions.is_empty())
+        {
             continue;
         }
         // Only vectorize SingleBlock loops when all exit args are either outside values (<= preheader) or reduction updates.
@@ -1823,6 +1935,14 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
         }
 
         let mut vec_exprs: Vec<u32, A> = Vec::new_in(alloc);
+        if body_block != header {
+            let h_end = view.block(Block(header)).end - 1;
+            for inst in h_params.end..h_end {
+                if at(&needed, inst) && !at(&is_mem_inst, inst) {
+                    vec_exprs.push(to_u32(inst));
+                }
+            }
+        }
         for inst in body_start..body_end {
             if at(&needed, inst) && !at(&is_mem_inst, inst) {
                 vec_exprs.push(to_u32(inst));
@@ -1842,6 +1962,36 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             if alias_unsafe {
                 continue;
             }
+        }
+
+        // Skip vectorizing loops whose trip count (or pointer span) is statically provably below
+        // one vectorized iteration (`unroll * lanes` elements / `unroll * vec_bytes` bytes).
+        let unroll = vec_unroll_factor(loads.len(), reductions.len(), vec_exprs.len());
+        let min_iters = u64::from(lanes) * u64::try_from(unroll).unwrap_or(2);
+        let min_bytes = u64::from(vec_bytes) * u64::try_from(unroll).unwrap_or(2);
+        let Ok(max_off) = i32::try_from(min_bytes) else {
+            continue;
+        };
+        if let Some(st) = store
+            && st.const_off.checked_add(max_off).is_none()
+        {
+            continue;
+        }
+        if loads.iter().any(|ld| ld.const_off.checked_add(max_off).is_none()) {
+            continue;
+        }
+        let info = vi.get_or_insert_with(|| ValueInfo::analyze(*view, alloc));
+        if trip_count_provably_below(
+            view,
+            info,
+            header,
+            iv_kind,
+            iv_init,
+            bound,
+            min_iters,
+            min_bytes,
+        ) {
+            continue;
         }
 
         return Some(VecLoopPlan {
@@ -2177,6 +2327,7 @@ struct PrefixScanPlan<A: Allocator> {
 /// transformation (`1` loop-carried `add` per 8 elements).
 fn find_prefix_scan_loop<A: Allocator + Copy>(
     view: &View<'_>,
+    vi: &mut Option<ValueInfo<A>>,
     alloc: A,
 ) -> Option<PrefixScanPlan<A>> {
     if view.head.ptr_bits != 64 {
@@ -2544,7 +2695,7 @@ fn find_prefix_scan_loop<A: Allocator + Copy>(
                     None
                 };
                 if let Some(bnd) = bound_opt
-                    && !is_not_inv_blk(at(&inst_block, to_idx(bnd)))
+                    && (!is_not_inv_blk(at(&inst_block, to_idx(bnd))) || const_u64(view, to_idx(bnd)).is_some())
                     && Ty(at(view.tys, to_idx(bnd))) == p_ty
                 {
                     found_iv = Some((pos, p_inst, bnd, IvKind::Counted { iv_ty: p_ty }));
@@ -2697,6 +2848,19 @@ fn find_prefix_scan_loop<A: Allocator + Copy>(
         if ld_const_off.checked_add(max_delta).is_none() {
             continue;
         }
+        let info = vi.get_or_insert_with(|| ValueInfo::analyze(*view, alloc));
+        if trip_count_provably_below(
+            view,
+            info,
+            header,
+            iv_kind,
+            iv_init,
+            bound,
+            8,
+            8 * elem_bytes,
+        ) {
+            continue;
+        }
 
         return Some(PrefixScanPlan {
             preheader,
@@ -2823,7 +2987,12 @@ fn emit_prefix_scan_loop<A: Allocator + Copy>(
 
             let iv_init_new = at(&val_map, to_idx(plan.iv_init));
             let acc_init_new = at(&val_map, to_idx(plan.acc_init));
-            let bound_new = at(&val_map, to_idx(plan.bound));
+            let bound_new = match const_u64(view, to_idx(plan.bound)) {
+                Some(c) if at(&val_map, to_idx(plan.bound)) == NONE => {
+                    push_iconst(&mut func, Ty(at(view.tys, to_idx(plan.bound))), c)
+                }
+                _ => at(&val_map, to_idx(plan.bound)),
+            };
             let (rem_val, go_scan) = match plan.iv_kind {
                 IvKind::Counted { iv_ty } => {
                     let k_step = push_iconst(&mut func, iv_ty, SCAN_K);
@@ -3080,8 +3249,9 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
     vec_bytes: u32,
     alloc: A,
 ) -> Result<VectorizeOutput<A>, SimplifyError> {
-    let Some(plan) = find_vectorizable_loop(&view, vec_bytes, alloc) else {
-        if let Some(scan_plan) = find_prefix_scan_loop(&view, alloc) {
+    let mut vi: Option<ValueInfo<A>> = None;
+    let Some(plan) = find_vectorizable_loop(&view, vec_bytes, &mut vi, alloc) else {
+        if let Some(scan_plan) = find_prefix_scan_loop(&view, &mut vi, alloc) {
             return emit_prefix_scan_loop(&view, scan_plan, alloc);
         }
         return Ok(VectorizeOutput {
@@ -3092,15 +3262,13 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
 
     let blocks = view.blocks();
     let len = view.len();
-    // Adaptive unroll factor: 4x (64 bytes = 1 cache line / iter, TWO `ldp q, q` / `stp q, q`
-    // pairs, 4 independent accumulators saturating all 4 NEON pipes; also matches rustc's 4x
-    // unroll for small strict-IEEE ordered FP reductions) for small/medium bodies; 2x (32 bytes /
-    // iter, 1 `ldp q, q` pair) for larger bodies to keep vector register pressure 0-spill.
-    let unroll: usize = if plan.loads.len() <= 2 && plan.reductions.len() <= 2 && plan.vec_exprs.len() <= 8 {
-        4
-    } else {
-        2
-    };
+    // Adaptive unroll factor: 2x (32 bytes = 1 `stp q, q` pair / iter) for pure store-fill loops
+    // (`loads.is_empty()` so 32-byte fills vectorize with zero scalar tail); 4x (64 bytes = 1
+    // cache line / iter, TWO `ldp q, q` / `stp q, q` pairs, 4 independent accumulators saturating
+    // all 4 NEON pipes; also matches rustc's 4x unroll for small strict-IEEE ordered FP reductions)
+    // for small/medium load-bearing bodies; 2x (32 bytes / iter, 1 `ldp q, q` pair) for larger
+    // bodies to keep vector register pressure 0-spill.
+    let unroll = vec_unroll_factor(plan.loads.len(), plan.reductions.len(), plan.vec_exprs.len());
     let unroll_step = u64::from(plan.lanes) * u64::try_from(unroll).unwrap_or(2);
     let step_bytes = u64::from(vec_bytes) * u64::try_from(unroll).unwrap_or(2);
     let iv_starts_zero = match plan.iv_kind {
@@ -3259,7 +3427,12 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             }
             // Emit vectorization guard at end of `preheader` (or `vec_guard` when `preheader` ends in `Br`).
             let iv_init_new = at(&val_map, to_idx(plan.iv_init));
-            let bound_new = at(&val_map, to_idx(plan.bound));
+            let bound_new = match const_u64(&view, to_idx(plan.bound)) {
+                Some(c) if at(&val_map, to_idx(plan.bound)) == NONE => {
+                    push_iconst(&mut func, Ty(at(view.tys, to_idx(plan.bound))), c)
+                }
+                _ => at(&val_map, to_idx(plan.bound)),
+            };
             let (rem_val, mut go_vec) = match plan.iv_kind {
                 IvKind::Counted { iv_ty } => {
                     let k_step = push_iconst(&mut func, iv_ty, unroll_step);
@@ -3276,7 +3449,9 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 }
                 IvKind::Pointer => {
                     let (has_rem, byte_rem) =
-                        if let Some(byte_off) = inbounds_ptr_byte_offset(&view, plan.iv_init, plan.bound) {
+                        if let Some(byte_off) = inbounds_ptr_byte_offset(&view, plan.iv_init, plan.bound)
+                            && at(&val_map, to_idx(byte_off)) != NONE
+                        {
                             let off_new = at(&val_map, to_idx(byte_off));
                             let hr = push_icmp(&mut func, IntCond::Ult, iv_init_new, bound_new);
                             (hr, off_new)
@@ -4222,6 +4397,7 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
         body_insts: Vec<u32, A>,
     }
 
+    let mut vi: Option<ValueInfo<A>> = None;
     let mut found: Option<IvDivPlan<A>> = None;
     for h in 1..blocks {
         let header = to_u32(h);
@@ -4474,6 +4650,19 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
         }
 
         let iv_init = at(&pre_args, iv_pos);
+        let info = vi.get_or_insert_with(|| ValueInfo::analyze(view, alloc));
+        if trip_count_provably_below(
+            &view,
+            info,
+            header,
+            IvKind::Counted { iv_ty: Ty::I64 },
+            iv_init,
+            bound,
+            8,
+            64,
+        ) {
+            continue;
+        }
         found = Some(IvDivPlan {
             preheader,
             header,
@@ -4651,6 +4840,22 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
             }
             ok32
         };
+
+    if can_use_4xi32
+        && let Some(info) = vi.as_ref()
+        && trip_count_provably_below(
+            &view,
+            info,
+            plan.header,
+            IvKind::Counted { iv_ty: Ty::I64 },
+            plan.iv_init,
+            plan.bound,
+            16,
+            128,
+        )
+    {
+        return Ok(VectorizeOutput { func: view.to_func_in(alloc), stats: VectorizeStats::default() });
+    }
 
     const UNROLL: usize = 4; // 4 x <4 x i32> = 16 iters/iter (fast) or 4 x <2 x i64> = 8 iters/iter!
     let (Some(vec_ty), Some(vec32_ty)) = (
@@ -7840,5 +8045,746 @@ mod tests {
             out.stats.loops_vectorized, 0,
             "mismatched load/store base pointers must not be transformed into an unguarded prefix scan"
         );
+    }
+
+    #[test]
+    fn skips_byte_copy_vectorization_when_dominating_branch_bounds_trip_count_below_64() {
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+        };
+
+        let build_seed_copy = |guard: Option<(IntCond, u64, bool)>, use_ptr_iv: bool| -> Func<TestHeap> {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I8)],
+            );
+            b.set_signature(sig);
+            let src_slot = b.slot(32, 0, SlotKind::Temp);
+            let dst_slot = b.slot(32, 0, SlotKind::Temp);
+            let entry = b.create_block(BlockKind::Normal);
+            let seed_pre = guard.map(|_| b.create_block(BlockKind::Normal));
+            let header = b.create_block(BlockKind::Normal);
+            let body = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let offset = b.param(Ty::I64);
+            let check_idx = b.param(Ty::I64);
+            let src = b.slot_addr(src_slot);
+            let dst = b.slot_addr(dst_slot);
+            let z8 = b.iconst(Ty::I8, 0);
+            for k in 0..32u32 {
+                let off_i32 = i32::try_from(k).unwrap();
+                let pat = u8::try_from(((k + 1) * 7) & 0xff).unwrap();
+                let cv = b.iconst(Ty::I8, u128::from(pat));
+                b.store(Flags::NONE, cv, src, off_i32, MemAttrs::aligned(0));
+                b.store(Flags::NONE, z8, dst, off_i32, MemAttrs::aligned(0));
+            }
+            let k0 = b.iconst(Ty::I64, 0);
+            let k1 = b.iconst(Ty::I64, 1);
+            let k3 = b.iconst(Ty::I64, 3);
+            let k9 = b.iconst(Ty::I64, 9);
+
+            if let (Some((cond, limit, true_enters)), Some(pre_blk)) = (guard, seed_pre) {
+                let klim = b.iconst(Ty::I64, u128::from(limit));
+                let cmp = b.icmp(cond, offset, klim);
+                if true_enters {
+                    b.br(Flags::NONE, cmp, (pre_blk, &[]), (exit, &[]));
+                } else {
+                    b.br(Flags::NONE, cmp, (exit, &[]), (pre_blk, &[]));
+                }
+                b.begin(pre_blk);
+            }
+
+            let is3 = b.icmp(IntCond::Eq, offset, k3);
+            let off2 = b.binary(Op::Shl, Flags::NONE, offset, k1);
+            let step = b.select(Flags::NONE, is3, k9, off2);
+
+            if use_ptr_iv {
+                let end_p = b.ptr_add(Flags::INBOUNDS, dst, step);
+                b.jump((header, &[dst, src]));
+
+                b.begin(header);
+                let dp = b.param(Ty::PTR);
+                let sp = b.param(Ty::PTR);
+                let keep = b.icmp(IntCond::Ult, dp, end_p);
+                b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+                b.begin(body);
+                let byte = b.load(Ty::I8, Flags::NONE, sp, 0, MemAttrs::aligned(0));
+                b.store(Flags::NONE, byte, dp, 0, MemAttrs::aligned(0));
+                let dp_next = b.ptr_add(Flags::INBOUNDS, dp, k1);
+                let sp_next = b.ptr_add(Flags::INBOUNDS, sp, k1);
+                b.jump((header, &[dp_next, sp_next]));
+            } else {
+                b.jump((header, &[k0]));
+
+                b.begin(header);
+                let i = b.param(Ty::I64);
+                let keep = b.icmp(IntCond::Ult, i, step);
+                b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+                b.begin(body);
+                let sp = b.ptr_add(Flags::NONE, src, i);
+                let dp = b.ptr_add(Flags::NONE, dst, i);
+                let byte = b.load(Ty::I8, Flags::NONE, sp, 0, MemAttrs::aligned(0));
+                b.store(Flags::NONE, byte, dp, 0, MemAttrs::aligned(0));
+                let i_next = b.binary(Op::Add, Flags::NONE, i, k1);
+                b.jump((header, &[i_next]));
+            }
+
+            b.begin(exit);
+            let chk_p = b.ptr_add(Flags::NONE, dst, check_idx);
+            let out_b = b.load(Ty::I8, Flags::NONE, chk_p, 0, MemAttrs::aligned(0));
+            b.ret(&[out_b]);
+            b.finish_checked().unwrap()
+        };
+
+        let v16i8 = Ty::vector(crate::ty::Scalar::I8, 16).unwrap();
+
+        // 1. Positive (skip): all 4 dominating branch forms proving `offset <= 7` -> `step <= 14 < 64`
+        //    must NOT emit a 64-byte SIMD copy loop, and must preserve exact evaluator behavior.
+        let small_guards = [
+            (IntCond::Ult, 8u64, true),
+            (IntCond::Ule, 7u64, true),
+            (IntCond::Uge, 8u64, false),
+            (IntCond::Ugt, 7u64, false),
+        ];
+        for use_ptr_iv in [false, true] {
+            for &guard in &small_guards {
+                let func = build_seed_copy(Some(guard), use_ptr_iv);
+                let out = auto_vectorize_loops(func.view(), TestHeap).unwrap();
+                verify(out.func.view()).unwrap();
+                assert_eq!(
+                    out.stats.loops_vectorized, 0,
+                    "bounded step <= 14 < 64 must skip 64B vectorization (guard={guard:?}, ptr_iv={use_ptr_iv})"
+                );
+                let v = out.func.view();
+                assert!(
+                    !(0..v.len()).any(|k| Ty(v.tys[k]).is_vector()),
+                    "expected zero vector ops when trip count is provably < 64 (guard={guard:?}, ptr_iv={use_ptr_iv})"
+                );
+            }
+
+            // Evaluator equivalence on `offset < 8`: `offset in {3, 5, 6, 7}` copies `step` bytes, `offset == 8` skips.
+            let func = build_seed_copy(Some((IntCond::Ult, 8, true)), use_ptr_iv);
+            let out = auto_vectorize_loops(func.view(), TestHeap).unwrap();
+            for &off in &[3u64, 5, 6, 7, 8] {
+                let expected_step = if off < 8 {
+                    if off == 3 { 9 } else { off << 1 }
+                } else {
+                    0
+                };
+                for &idx in &[0u64, 8, 9, 13, 14, 15] {
+                    let args = [Val::Int(u128::from(off)), Val::Int(u128::from(idx))];
+                    let Outcome::Returned(orig) = eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap() else {
+                        panic!("orig eval failed");
+                    };
+                    let Outcome::Returned(got) = eval::run_in(out.func.view(), &args, 10_000, TestHeap).unwrap() else {
+                        panic!("out eval failed");
+                    };
+                    let want = if idx < expected_step { ((idx + 1) * 7) & 0xff } else { 0 };
+                    assert_eq!(orig.as_slice(), &[Val::Int(u128::from(want))]);
+                    assert_eq!(got.as_slice(), orig.as_slice());
+                }
+            }
+
+            // Exact threshold: `offset <= 31` -> `step <= 62 < 64` skips; `offset <= 32` -> `step <= 64` vectorizes!
+            let skip_62 = build_seed_copy(Some((IntCond::Ule, 31, true)), use_ptr_iv);
+            let out_62 = auto_vectorize_loops(skip_62.view(), TestHeap).unwrap();
+            assert_eq!(out_62.stats.loops_vectorized, 0, "step <= 62 < 64 must skip (ptr_iv={use_ptr_iv})");
+
+            let vec_64 = build_seed_copy(Some((IntCond::Ule, 32, true)), use_ptr_iv);
+            let out_64 = auto_vectorize_loops(vec_64.view(), TestHeap).unwrap();
+            verify(out_64.func.view()).unwrap();
+            assert_eq!(out_64.stats.loops_vectorized, 1, "step <= 64 must still vectorize (ptr_iv={use_ptr_iv})");
+
+            // 2. Negative controls: unguarded (`None`) and `offset < 128` (`step <= 254 >= 64`) MUST still vectorize!
+            for guard in [None, Some((IntCond::Ult, 128u64, true))] {
+                let func = build_seed_copy(guard, use_ptr_iv);
+                let out = auto_vectorize_loops(func.view(), TestHeap).unwrap();
+                verify(out.func.view()).unwrap();
+                assert_eq!(
+                    out.stats.loops_vectorized, 1,
+                    "unbounded / large-bound byte copy must still vectorize (guard={guard:?}, ptr_iv={use_ptr_iv})"
+                );
+                let v = out.func.view();
+                let vloads = (0..v.len())
+                    .filter(|&k| v.op(k) == Op::Load && Ty(v.tys[k]) == v16i8)
+                    .count();
+                let vstores = (0..v.len())
+                    .filter(|&k| {
+                        v.op(k) == Op::Store
+                            && Ty(v.tys[to_idx(v.extra[to_idx(v.data[k])])]) == v16i8
+                    })
+                    .count();
+                assert_eq!(vloads, 4, "expected 4x <16 x i8> vector loads (guard={guard:?}, ptr_iv={use_ptr_iv})");
+                assert_eq!(vstores, 4, "expected 4x <16 x i8> vector stores (guard={guard:?}, ptr_iv={use_ptr_iv})");
+            }
+        }
+    }
+
+    #[test]
+    fn skips_vectorization_for_and_mask_add_and_zext_bounded_trip_counts() {
+        let build_masked_copy = |mask: u64, add_const: u64| -> Func<TestHeap> {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[],
+            );
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let k0 = b.iconst(Ty::I64, 0);
+            let k1 = b.iconst(Ty::I64, 1);
+            let km = b.iconst(Ty::I64, u128::from(mask));
+            let masked = b.binary(Op::And, Flags::NONE, n, km);
+            let bound = if add_const > 0 {
+                let ka = b.iconst(Ty::I64, u128::from(add_const));
+                b.binary(Op::Add, Flags::NONE, masked, ka)
+            } else {
+                masked
+            };
+            b.jump((header, &[k0]));
+
+            b.begin(header);
+            let i = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, bound);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let sp = b.ptr_add(Flags::NONE, src, i);
+            let dp = b.ptr_add(Flags::NONE, dst, i);
+            let byte = b.load(Ty::I8, Flags::NONE, sp, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, byte, dp, 0, MemAttrs::aligned(0));
+            let i_next = b.binary(Op::Add, Flags::NONE, i, k1);
+            b.jump((header, &[i_next]));
+
+            b.begin(exit);
+            b.ret(&[]);
+            b.finish_checked().unwrap()
+        };
+
+        // `(n & 15) + 4 <= 19 < 64` -> skip; `(n & 63) <= 63 < 64` -> skip; `(n & 63) + 1 <= 64` -> vectorize!
+        let f_small = build_masked_copy(15, 4);
+        assert_eq!(auto_vectorize_loops(f_small.view(), TestHeap).unwrap().stats.loops_vectorized, 0);
+
+        let f_63 = build_masked_copy(63, 0);
+        assert_eq!(auto_vectorize_loops(f_63.view(), TestHeap).unwrap().stats.loops_vectorized, 0);
+
+        let f_64 = build_masked_copy(63, 1);
+        let out_64 = auto_vectorize_loops(f_64.view(), TestHeap).unwrap();
+        verify(out_64.func.view()).unwrap();
+        assert_eq!(out_64.stats.loops_vectorized, 1);
+
+        // `Zext(u8)` with `u8 < 16` -> `<= 15 < 64` skips; unbounded `Zext(u8)` -> `<= 255 >= 64` vectorizes!
+        for bounded_u8 in [true, false] {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I8)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let pre = bounded_u8.then(|| b.create_block(BlockKind::Normal));
+            let header = b.create_block(BlockKind::Normal);
+            let body = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let n8 = b.param(Ty::I8);
+            let k0 = b.iconst(Ty::I64, 0);
+            let k1 = b.iconst(Ty::I64, 1);
+            if let Some(pre_blk) = pre {
+                let k16 = b.iconst(Ty::I8, 16);
+                let cmp = b.icmp(IntCond::Ult, n8, k16);
+                b.br(Flags::NONE, cmp, (pre_blk, &[]), (exit, &[]));
+                b.begin(pre_blk);
+            }
+            let n64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, n8);
+            b.jump((header, &[k0]));
+
+            b.begin(header);
+            let i = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, n64);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let sp = b.ptr_add(Flags::NONE, src, i);
+            let dp = b.ptr_add(Flags::NONE, dst, i);
+            let byte = b.load(Ty::I8, Flags::NONE, sp, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, byte, dp, 0, MemAttrs::aligned(0));
+            let i_next = b.binary(Op::Add, Flags::NONE, i, k1);
+            b.jump((header, &[i_next]));
+
+            b.begin(exit);
+            b.ret(&[]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), TestHeap).unwrap();
+            verify(out.func.view()).unwrap();
+            let want = if bounded_u8 { 0 } else { 1 };
+            assert_eq!(out.stats.loops_vectorized, want, "bounded_u8={bounded_u8}");
+        }
+    }
+
+    #[test]
+    fn vectorizes_pointer_iter_slice_fill_u16_and_u32() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+            legalize::legalize,
+            ty::Scalar,
+        };
+
+        const CAP: usize = 68;
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        const LENGTHS: [usize; 12] = [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 64, 65];
+
+        let cases = [
+            (Ty::I16, Ty::vector(Scalar::I16, 8).unwrap(), 1u32, 2usize, 1u8, 0x3412u64, 0xA500u64),
+            (Ty::I32, Ty::vector(Scalar::I32, 4).unwrap(), 2u32, 4usize, 2u8, 0x0807_3412u64, 0xDEAD_0000u64),
+        ];
+
+        for (elem_ty, vec_ty, elem_shift, elem_bytes, align, fill_val, sentinel_base) in cases {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(elem_ty)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let slot = b.slot(u32::try_from(CAP * elem_bytes).unwrap(), align, SlotKind::Temp);
+            let [entry, body, exit] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let val = b.param(elem_ty);
+            let base = b.slot_addr(slot);
+            for k in 0..CAP {
+                let sent = sentinel_base.wrapping_add(u64::try_from(k).unwrap());
+                let sv = b.iconst(elem_ty, u128::from(sent));
+                b.store(
+                    Flags::NONE,
+                    sv,
+                    base,
+                    i32::try_from(k * elem_bytes).unwrap(),
+                    MemAttrs::aligned(align),
+                );
+            }
+            let shift_c = b.iconst(Ty::I64, u128::from(elem_shift));
+            let bytes = b.binary(Op::Shl, Flags::NONE, len, shift_c);
+            let end = b.ptr_add(Flags::INBOUNDS, base, bytes);
+            let step = b.iconst(Ty::I64, u128::try_from(elem_bytes).unwrap());
+            let non_empty = b.icmp(IntCond::Ne, base, end);
+            b.br(Flags::NONE, non_empty, (body, &[base]), (exit, &[]));
+
+            b.begin(body);
+            let p = b.param(Ty::PTR);
+            b.store(Flags::NONE, val, p, 0, MemAttrs::aligned(align));
+            let p_next = b.ptr_add(Flags::INBOUNDS, p, step);
+            let keep = b.icmp(IntCond::Ne, p_next, end);
+            b.br(Flags::NONE, keep, (body, &[p_next]), (exit, &[]));
+
+            b.begin(exit);
+            let mut hash = b.iconst(Ty::I64, u128::from(FNV_OFFSET));
+            let prime = b.iconst(Ty::I64, u128::from(FNV_PRIME));
+            for k in 0..CAP {
+                let elem = b.load(
+                    elem_ty,
+                    Flags::NONE,
+                    base,
+                    i32::try_from(k * elem_bytes).unwrap(),
+                    MemAttrs::aligned(align),
+                );
+                let elem64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, elem);
+                hash = b.binary(Op::Xor, Flags::NONE, hash, elem64);
+                hash = b.binary(Op::Mul, Flags::NONE, hash, prime);
+            }
+            b.ret(&[hash]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 1, "expected pointer-IV fill to vectorize for {elem_ty:?}");
+            verify(out.func.view()).unwrap();
+
+            // Must not re-vectorize on a second pass.
+            let second = auto_vectorize_loops(out.func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            assert_eq!(second.stats.loops_vectorized, 0, "fill loop must not re-vectorize");
+
+            let v = out.func.view();
+            // `PreTerm::Br` inserts `vec_guard` (Block 1), `vec_pre` (Block 2), `vec_loop` (Block 3).
+            assert_eq!(
+                v.block(Block(2)).filter(|&k| v.op(k) == Op::Splat && Ty(v.tys[k]) == vec_ty).count(),
+                1,
+                "expected 1 hoisted Op::Splat in vec_pre for {vec_ty:?}"
+            );
+            assert_eq!(
+                v.block(Block(3)).filter(|&k| v.op(k) == Op::Splat).count(),
+                0,
+                "Op::Splat must be hoisted out of vec_loop"
+            );
+            assert_eq!(v.params(Block(3)).len(), 1, "expected single running pointer IV in vec_loop");
+            let vec_stores: usize = v
+                .block(Block(3))
+                .filter(|&k| {
+                    v.op(k) == Op::Store && Ty(v.tys[to_idx(v.extra[to_idx(v.data[k])])]) == vec_ty
+                })
+                .count();
+            assert_eq!(vec_stores, 2, "expected 2x-unrolled 128-bit vector stores (32B = 1x stp q, q)");
+            for k in v.block(Block(3)) {
+                if v.op(k) == Op::Store {
+                    assert_eq!(
+                        v.mem_attrs(k).map(|m| m.align),
+                        Some(align),
+                        "vector store must preserve original scalar alignment"
+                    );
+                }
+            }
+            assert_eq!(
+                (0..v.len()).filter(|&k| matches!(v.op(k), Op::Umin | Op::Neg)).count(),
+                0,
+                "pure fill loop needs zero runtime alias check"
+            );
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::PtrAddr).count(),
+                0,
+                "inbounds slice fill needs zero Op::PtrAddr"
+            );
+
+            let mut legalized = out.func;
+            legalize(&mut legalized, &NoRoutines, blaze_own::testing::heap().alloc()).unwrap();
+            verify(legalized.view()).unwrap();
+
+            for n in LENGTHS {
+                let mut expected_hash = FNV_OFFSET;
+                for k in 0..CAP {
+                    let elem = if k < n {
+                        fill_val
+                    } else {
+                        sentinel_base.wrapping_add(u64::try_from(k).unwrap())
+                    };
+                    expected_hash = (expected_hash ^ elem).wrapping_mul(FNV_PRIME);
+                }
+                let args = [Val::Int(u128::try_from(n).unwrap()), Val::Int(u128::from(fill_val))];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig fill eval failed for {elem_ty:?} at n={n}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(legalized.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("vec fill eval failed for {elem_ty:?} at n={n}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected_hash))]);
+                assert_eq!(
+                    got.as_slice(),
+                    orig.as_slice(),
+                    "pointer-IV slice fill mismatch for {elem_ty:?} at n={n}"
+                );
+            }
+        }
+
+        // Negative control 1: a loop with TWO stores must NOT drop one store or vectorize.
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I16)],
+                &[],
+            );
+            b.set_signature(sig);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let d0 = b.param(Ty::PTR);
+            let d1 = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let val = b.param(Ty::I16);
+            let z = b.iconst(Ty::I64, 0);
+            let one = b.iconst(Ty::I64, 1);
+            b.jump((hdr, &[z]));
+            b.begin(hdr);
+            let i = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+            b.begin(body);
+            let off = b.binary(Op::Shl, Flags::NONE, i, one);
+            let p0 = b.ptr_add(Flags::NONE, d0, off);
+            let p1 = b.ptr_add(Flags::NONE, d1, off);
+            b.store(Flags::NONE, val, p0, 0, MemAttrs::aligned(1));
+            b.store(Flags::NONE, val, p1, 0, MemAttrs::aligned(1));
+            let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+            b.jump((hdr, &[i_next]));
+            b.begin(exit);
+            b.ret(&[]);
+            let func = b.finish_checked().unwrap();
+            let out = auto_vectorize_loops(func.view(), TestHeap).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 0, "two-store loop must not vectorize");
+        }
+
+        // Negative control 2: storing an IV-dependent value must NOT vectorize as a constant fill.
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[],
+            );
+            b.set_signature(sig);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let z = b.iconst(Ty::I64, 0);
+            let one = b.iconst(Ty::I64, 1);
+            let three = b.iconst(Ty::I64, 3);
+            b.jump((hdr, &[z]));
+            b.begin(hdr);
+            let i = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+            b.begin(body);
+            let off = b.binary(Op::Shl, Flags::NONE, i, three);
+            let p = b.ptr_add(Flags::NONE, dst, off);
+            b.store(Flags::NONE, i, p, 0, MemAttrs::aligned(3));
+            let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+            b.jump((hdr, &[i_next]));
+            b.begin(exit);
+            b.ret(&[]);
+            let func = b.finish_checked().unwrap();
+            let out = auto_vectorize_loops(func.view(), TestHeap).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 0, "IV-dependent store must not vectorize as constant fill");
+        }
+    }
+
+    #[test]
+    fn vectorizes_counted_slice_fill_u8_and_i64() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+            legalize::legalize,
+            ty::Scalar,
+        };
+
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let u8_lengths: &[usize] = &[0, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 70];
+        let i64_lengths: &[usize] = &[0, 1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33];
+
+        let cases: [(Ty, Ty, u32, usize, u8, usize, u64, u64, Option<u64>, &[usize]); 3] = [
+            (
+                Ty::I8,
+                Ty::vector(Scalar::I8, 16).unwrap(),
+                0,
+                1,
+                0,
+                72,
+                0x5Au64,
+                0x80u64,
+                None,
+                u8_lengths,
+            ),
+            (
+                Ty::I64,
+                Ty::vector(Scalar::I64, 2).unwrap(),
+                3,
+                8,
+                3,
+                36,
+                0x1122_3344_5566_7788u64,
+                0xCAFE_BABE_0000_0000u64,
+                None,
+                i64_lengths,
+            ),
+            (
+                Ty::I64,
+                Ty::vector(Scalar::I64, 2).unwrap(),
+                3,
+                8,
+                3,
+                36,
+                0xDEAD_BEEF_CAFE_BABEu64,
+                0x1357_9BDF_0000_0000u64,
+                Some(0xDEAD_BEEF_CAFE_BABEu64),
+                i64_lengths,
+            ),
+        ];
+
+        for (elem_ty, vec_ty, elem_shift, elem_bytes, align, cap, fill_val, sentinel_base, body_const, lengths) in cases {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(elem_ty)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let slot = b.slot(u32::try_from(cap * elem_bytes).unwrap(), align, SlotKind::Temp);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let val_param = b.param(elem_ty);
+            let base = b.slot_addr(slot);
+            for k in 0..cap {
+                let sent = if elem_ty == Ty::I8 {
+                    (sentinel_base.wrapping_add(u64::try_from(k).unwrap())) & 0xFF
+                } else {
+                    sentinel_base.wrapping_add(u64::try_from(k).unwrap())
+                };
+                let sv = b.iconst(elem_ty, u128::from(sent));
+                b.store(
+                    Flags::NONE,
+                    sv,
+                    base,
+                    i32::try_from(k * elem_bytes).unwrap(),
+                    MemAttrs::aligned(align),
+                );
+            }
+            let z64 = b.iconst(Ty::I64, 0);
+            let one64 = b.iconst(Ty::I64, 1);
+            b.jump((hdr, &[z64]));
+
+            b.begin(hdr);
+            let i = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let dp = if elem_shift == 0 {
+                b.ptr_add(Flags::NONE, base, i)
+            } else {
+                let sh = b.iconst(Ty::I64, u128::from(elem_shift));
+                let off = b.binary(Op::Shl, Flags::NONE, i, sh);
+                b.ptr_add(Flags::NONE, base, off)
+            };
+            let to_store = match body_const {
+                Some(c) => b.iconst(elem_ty, u128::from(c)),
+                None => val_param,
+            };
+            b.store(Flags::NONE, to_store, dp, 0, MemAttrs::aligned(align));
+            let i_next = b.binary(Op::Add, Flags::NONE, i, one64);
+            b.jump((hdr, &[i_next]));
+
+            b.begin(exit);
+            let mut hash = b.iconst(Ty::I64, u128::from(FNV_OFFSET));
+            let prime = b.iconst(Ty::I64, u128::from(FNV_PRIME));
+            for k in 0..cap {
+                let elem = b.load(
+                    elem_ty,
+                    Flags::NONE,
+                    base,
+                    i32::try_from(k * elem_bytes).unwrap(),
+                    MemAttrs::aligned(align),
+                );
+                let elem64 = if elem_ty == Ty::I64 {
+                    elem
+                } else {
+                    b.convert(Op::Zext, Flags::NONE, Ty::I64, elem)
+                };
+                hash = b.binary(Op::Xor, Flags::NONE, hash, elem64);
+                hash = b.binary(Op::Mul, Flags::NONE, hash, prime);
+            }
+            b.ret(&[hash]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            assert_eq!(
+                out.stats.loops_vectorized, 1,
+                "expected counted fill to vectorize for {elem_ty:?} (body_const={})",
+                body_const.is_some()
+            );
+            verify(out.func.view()).unwrap();
+
+            let second = auto_vectorize_loops(out.func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            assert_eq!(second.stats.loops_vectorized, 0, "counted fill must not re-vectorize");
+
+            let v = out.func.view();
+            // `PreTerm::Jump` inserts `vec_pre` (Block 1), `vec_loop` (Block 2), `vec_reduce` (Block 3).
+            assert_eq!(
+                v.block(Block(1)).filter(|&k| v.op(k) == Op::Splat && Ty(v.tys[k]) == vec_ty).count(),
+                1,
+                "expected 1 hoisted Op::Splat in vec_pre for {vec_ty:?}"
+            );
+            assert_eq!(
+                v.block(Block(2)).filter(|&k| v.op(k) == Op::Splat).count(),
+                0,
+                "Op::Splat must be hoisted out of vec_loop"
+            );
+            assert_eq!(
+                v.block(Block(2)).filter(|&k| v.op(k) == Op::Shl).count(),
+                0,
+                "pointer-induction vec_loop must have zero Op::Shl"
+            );
+            let vec_stores: usize = v
+                .block(Block(2))
+                .filter(|&k| {
+                    v.op(k) == Op::Store && Ty(v.tys[to_idx(v.extra[to_idx(v.data[k])])]) == vec_ty
+                })
+                .count();
+            assert_eq!(vec_stores, 2, "expected 2x-unrolled 128-bit vector stores for {vec_ty:?}");
+            assert_eq!(
+                (0..v.len()).filter(|&k| matches!(v.op(k), Op::Umin | Op::Neg)).count(),
+                0,
+                "pure fill loop needs zero runtime alias check"
+            );
+
+            let mut legalized = out.func;
+            legalize(&mut legalized, &NoRoutines, blaze_own::testing::heap().alloc()).unwrap();
+            verify(legalized.view()).unwrap();
+
+            for &len_val in lengths {
+                let mut expected_hash = FNV_OFFSET;
+                for k in 0..cap {
+                    let elem = if k < len_val {
+                        fill_val
+                    } else if elem_ty == Ty::I8 {
+                        (sentinel_base.wrapping_add(u64::try_from(k).unwrap())) & 0xFF
+                    } else {
+                        sentinel_base.wrapping_add(u64::try_from(k).unwrap())
+                    };
+                    expected_hash = (expected_hash ^ elem).wrapping_mul(FNV_PRIME);
+                }
+                let args = [Val::Int(u128::try_from(len_val).unwrap()), Val::Int(u128::from(fill_val))];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig counted fill eval failed for {elem_ty:?} at n={len_val}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(legalized.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("vec counted fill eval failed for {elem_ty:?} at n={len_val}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected_hash))]);
+                assert_eq!(
+                    got.as_slice(),
+                    orig.as_slice(),
+                    "counted slice fill mismatch for {elem_ty:?} at n={len_val}"
+                );
+            }
+        }
     }
 }

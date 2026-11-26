@@ -15,7 +15,7 @@ blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
 blaze-bstd-convert	109
-blaze-build	516
+blaze-build	515
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
@@ -30,7 +30,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1253
+blaze-cli	1239
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -80,7 +80,7 @@ blaze-launcher	2
 blaze-lex	63
 blaze-lint	270
 blaze-lint-defs	109
-blaze-lir	1439
+blaze-lir	1408
 blaze-lower	319
 blaze-macro-run	4
 blaze-malloc	65

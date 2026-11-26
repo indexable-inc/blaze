@@ -24,7 +24,7 @@ use core::fmt;
 
 use blaze_code::datum::{DatumView, OWN_DATUM, Place as DatumPlace};
 use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, SiteKind, Space, Symbol as CodeSymbol, Target};
-use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime};
+use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{CodeKey, entry_of, statics};
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker};
@@ -215,15 +215,67 @@ fn owned_str(text: &str, alloc: Alloc<'static>) -> AString<'static> {
     s
 }
 
-fn crate_of_item(list: &blaze_world::crate_list::CrateList<'_>, item: ItemKey, alloc: Alloc<'static>) -> AString<'static> {
+fn crate_name_of_item<'a>(list: &'a blaze_world::crate_list::CrateList<'_>, item: ItemKey) -> &'a str {
     let b = item.0.to_be_bytes();
     let prefix = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
     for at in 0..blaze_world::crate_list::CrateGraph::len(list) {
         if list.key(at).prefix() == prefix {
-            return owned_str(blaze_world::crate_list::CrateGraph::name(list, at), alloc);
+            return blaze_world::crate_list::CrateGraph::name(list, at);
         }
     }
-    owned_str("<unknown>", alloc)
+    "<unknown>"
+}
+
+fn crate_of_item(list: &blaze_world::crate_list::CrateList<'_>, item: ItemKey, alloc: Alloc<'static>) -> AString<'static> {
+    owned_str(crate_name_of_item(list, item), alloc)
+}
+
+/// Formats a deterministic, human-readable Rust symbol name for one reached function instance
+/// into `bump` (for Mach-O local `N_SECT` symbols so `nm`, `lldb`, `sample`, `xctrace`, and
+/// `otool`/`llvm-objdump` show Rust function names instead of raw addresses).
+fn format_symbol_name<'a, 'n>(
+    symbol: CodeSymbol,
+    tabled: ItemKey,
+    shown: Option<blaze_ladder::run::make_one::InstanceShown>,
+    records: &'n blaze_ladder::front2::source::Records<'n>,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    buf: &mut AString<'_>,
+    bump: Bump<'a>,
+) -> &'a str {
+    use core::fmt::Write as _;
+    use blaze_ladder::front2::source::NamesSource as _;
+
+    buf.clear();
+    if let Some(shown) = shown
+        && let Some(path) = shown.item.path()
+    {
+        buf.push_str(path);
+        if let Some(args) = shown.args.as_deref()
+            && !args.is_empty()
+        {
+            if let Some(inner) = args.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                buf.push('<');
+                buf.push_str(inner);
+                buf.push('>');
+            } else {
+                buf.push_str(args);
+            }
+        }
+        return bump.alloc_str(buf.as_str());
+    }
+    if let Some(lib) = records.key_beginning(tabled.0.to_be_bytes()) {
+        let item = blaze_ladder::front2::item_shown::ItemShown::of_lib(records, lib);
+        if let Some(path) = item.path() {
+            return bump.alloc_str(path);
+        }
+    }
+    let krate = crate_name_of_item(list, tabled);
+    let short = u64::from_be_bytes([
+        symbol.0[0], symbol.0[1], symbol.0[2], symbol.0[3],
+        symbol.0[4], symbol.0[5], symbol.0[6], symbol.0[7],
+    ]);
+    let _ = write!(buf, "{krate}::fn_{short:016x}");
+    bump.alloc_str(buf.as_str())
 }
 
 fn owned_fmt(args: fmt::Arguments<'_>, frame: &Frame, alloc: Alloc<'static>) -> AString<'static> {
@@ -323,6 +375,7 @@ struct ExportSummary<'f> {
     stubs: usize,
     lto_bodies: usize,
     lto_inlined: usize,
+    lto_hot: usize,
 }
 
 /// How one walked row's entry bytes are held until assembly.
@@ -1000,6 +1053,9 @@ fn export_program<'f>(
     };
     let lto_bodies = lto_out.bodies.len();
     let lto_inlined = lto_out.total_inlined;
+    let lto_hot_symbols = lto_out.hot_symbols;
+    let lto_profile_digest = lto_out.profile_digest;
+    let lto_hot = lto_hot_symbols.len();
     let mut extra_roots: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(heap.shared());
     for body in lto_out.bodies {
         if let Some(slot) = outcomes.get_mut(body.row) {
@@ -1120,12 +1176,20 @@ fn export_program<'f>(
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
+    let mut symbol_names: AVec<'_, (CodeSymbol, &'_ str)> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
+    let mut sym_name_buf: AString<'_> = String::new_in(alloc);
     let mut data: AVec<'_, Data<'_>> = Vec::new_in(alloc);
     let mut seen_data: AVec<'_, Target> = Vec::new_in(alloc);
     let mut tls_count = 0usize;
 
     for (row, outcome) in outcomes.iter().enumerate() {
         let symbol = walk.symbol(row);
+        if walk.kind(row) == RowKind::Instance {
+            let tabled = walk.tabled(row);
+            let shown = maker.instance_shown(tabled, walk.name(row));
+            let sym_name = format_symbol_name(symbol, tabled, shown, names.records, list, &mut sym_name_buf, export_bump);
+            symbol_names.push((symbol, sym_name));
+        }
         if let RowOutcome::Lto { record, vtable_data } = outcome {
             let raw_view = CodeView::read(record.as_slice())
                 .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "LTO code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
@@ -1260,7 +1324,10 @@ fn export_program<'f>(
 
     let tls_runtime = match tls_keys {
         Some((getter_key, ender_key)) => {
-            for (sym, key, what) in [(tls_getter_sym, getter_key, "TLS getter"), (tls_ender_sym, ender_key, "TLS ender")] {
+            for (sym, key, what, sym_name) in [
+                (tls_getter_sym, getter_key, "TLS getter", "__blaze_tls_getter"),
+                (tls_ender_sym, ender_key, "TLS ender", "__blaze_tls_ender"),
+            ] {
                 let entry_bytes = entry_of(&codes, key)
                     .map_err(|why| box_err(ExportCliError::Store { symbol: sym.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
                     .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: sym.0 }, heap))?;
@@ -1269,12 +1336,17 @@ fn export_program<'f>(
                 let view = CodeView::read(rec_bytes)
                     .map_err(|why| box_err(ExportCliError::Decode { symbol: sym.0, what, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
                 functions.push(Function { symbol: sym, record: view, tier: Tier::Fast });
+                symbol_names.push((sym, sym_name));
             }
             Some(TlsRuntime { descriptor: tls_desc_sym, ender: tls_ender_sym })
         }
         None => None,
     };
 
+    let export_profile = (!lto_hot_symbols.is_empty()).then_some(Profile {
+        digest: lto_profile_digest,
+        hot: lto_hot_symbols.as_slice(),
+    });
     let data_count = data.len();
     let program_in = ProgramIn {
         name: picked.bin,
@@ -1284,9 +1356,10 @@ fn export_program<'f>(
         panic: export_panic,
         personality,
         tls: tls_runtime,
-        profile: None,
+        profile: export_profile,
         natives: native_export.as_ref().map(|n| &n.image),
         exports: native_export.as_ref().map_or(&[], |n| n.exports.as_slice()),
+        symbol_names: symbol_names.as_slice(),
     };
 
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(alloc);
@@ -1295,6 +1368,7 @@ fn export_program<'f>(
     // Release immutable borrows of `codes` before restoring any concurrently swept entries and
     // persisting closing program + toolchain roots (Rule 3: refuse instead of silently dropping).
     drop(functions);
+    drop(symbol_names);
     drop(data);
     drop(seen_data);
     codes.ensure_persisted().map_err(|why| {
@@ -1332,6 +1406,7 @@ fn export_program<'f>(
         stubs,
         lto_bodies,
         lto_inlined,
+        lto_hot,
     })
 }
 
@@ -1530,7 +1605,7 @@ fn print_summary(
         err.line(
             cx,
             format_args!(
-                "build stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} bytes={} wall={}ms",
+                "build stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} hot={} bytes={} wall={}ms",
                 summary.exported.functions,
                 summary.exported.folded,
                 summary.stubs,
@@ -1541,6 +1616,7 @@ fn print_summary(
                 summary.unkeyed,
                 summary.lto_bodies,
                 summary.lto_inlined,
+                summary.lto_hot,
                 summary.exported.len,
                 wall_ms
             ),

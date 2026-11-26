@@ -85,6 +85,7 @@ const CORE_RULES: &[&str] = &[
     // Speed and tracing
     "slow-is-p0-traced",
     "incremental-first",
+    "sharpen-your-tools",
     // Evidence and debugging
     "ask-the-profile-first",
     "claims-from-evidence",
@@ -95,6 +96,7 @@ const CORE_RULES: &[&str] = &[
     "sota-first",
     "edit-rust-by-syntax",
     "type-then-lint-then-rule",
+    "flag-jank-or-monumentous-in-all-caps",
     // Building, lanes and machines
     "blaze-builds-blaze",
     "work-in-ix-vms",
@@ -242,7 +244,7 @@ Vertically integrated Rust stack (language, comptime reflection, pinned std, bst
 
 ## Core Rules
 
-34 always-on principles below; all 87 rules with full detail live in each heading's skill (`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run `write`."#;
+36 always-on principles below; all 89 rules with full detail live in each heading's skill (`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run `write`."#;
 
 const RULES: &[Rule<'static>] = &[
     Rule {
@@ -1027,6 +1029,24 @@ const RULES: &[Rule<'static>] = &[
         reason: Some(r#"2026-11-25: inline `extern "C"` libproc/sysctl/Mach declarations and duplicated raw kernel struct layouts crept into shell/driver crates instead of going through `crates/blaze-sys` (`docs/v2/plan/design/sys.md`). Centralizing all OS syscalls and kernel ABI layouts in `blaze-sys` keeps `#![no_std]`/zero-alloc guarantees, symbol ratchets, and struct layout verification in one place."#),
         link: Some("docs/v2/plan/design/sys.md"),
         also_in: &[],
+    },
+    Rule {
+        id: "sharpen-your-tools",
+        skill: "perf-and-tracing",
+        line: "Invest early in tools, symbols, IR dumps and harnesses that cut iteration time 10x.",
+        info: r#"Whenever you are iterating on performance, codegen, debugging, or a multi-wave fix and feel blind or slow — stripped binaries without function symbols, raw hex instead of readable IR (`mfmt`), missing diff/regression harnesses, or slow rebuild-measure loops — stop and build the fast tool first. Emit local Mach-O/ELF `N_SECT` function symbols so `sample`, `nm`, `objdump`, and `lldb` work out of the box, write clean textual IR dumpers and side-by-side instruction/stall diff scripts, and wire fast single-function harnesses before grinding through blind iterations. Sharpening the tool pays for itself on iteration two and compounds across every agent that touches the tree."#,
+        reason: Some(r#"Andrew, 2026-11-25: "any better tool or disassembler to iterate faster here? if so maybe make one etc" and "ok do all of these things and then i think in AGENTS.md be clear always do things to iterate faster etc yea do this"."#),
+        link: None,
+        also_in: &["debugging", "build-and-test"],
+    },
+    Rule {
+        id: "flag-jank-or-monumentous-in-all-caps",
+        skill: "changing-code",
+        line: "IF FORCED INTO A JANK WORKAROUND OR A MONUMENTAL TASK, SHOUT IT IN ALL CAPS TO THE USER.",
+        info: r#"Never quietly slip in a hacky workaround, partial stopgap, or silently sink into a monumental multi-day architectural undertaking without telling the user clearly. If you cannot solve something the proper way (you are considering a jank workaround just to get it working) OR you discover the proper fix is a monumental task whose scope the user may not yet realize, STOP AND WRITE IT IN ALL CAPS clearly explaining: (1) WHAT IS JANK OR MONUMENTAL, (2) WHY THE PROPER WAY IS HUGE OR BLOCKED, and (3) THE EXACT OPTIONS BEFORE PROCEEDING OR MERGING."#,
+        reason: Some(r#"Andrew, 2026-11-26: "i think also AGENTS.md should be clear if you cant do something a proper way (you are going a jank solution to kinda get it or it is monumentous task and i dont really understand what getting into) be clear about this and write in all caps and then merge that in"."#),
+        link: None,
+        also_in: &["runtime-code"],
     },
 ];
 

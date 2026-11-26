@@ -181,4 +181,8 @@ pub struct ProgramIn<'r> {
     /// Every C name the program exports, sorted by name, each once (two exporters of one name
     /// are refused by name). The front end gives it; only `natives`' words read it.
     pub exports: &'r [CExport<'r>],
+    /// Optional human-readable names for reached functions (emitted as local Mach-O `N_SECT`
+    /// symbols so `nm`, `lldb`, `sample`, `xctrace`, and `otool`/`llvm-objdump` resolve addresses
+    /// to Rust function names). Any order; empty leaves the symbol table with imports only.
+    pub symbol_names: &'r [(Symbol, &'r str)],
 }

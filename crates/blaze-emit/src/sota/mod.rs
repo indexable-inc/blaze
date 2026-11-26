@@ -29,6 +29,14 @@ pub mod abi;
 pub mod bolt;
 mod enc_x64;
 mod isel;
+mod layout;
+pub mod memitter;
+pub mod mfmt;
+pub mod mfunc;
+pub mod misel;
+pub mod mopt;
+pub mod mra;
+pub mod msched;
 pub mod module;
 mod regalloc;
 mod release_opts;
@@ -42,12 +50,13 @@ mod tests;
 
 use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, TrapRow, TrapSource, Word};
 use blaze_lir::{
-    Op, Verified,
+    Block, BlockKind, Op, Verified,
     amac::{AmacOpts, interleave_amac_loops},
     bce::eliminate_redundant_checks,
     bce_hoist::{BceHoistOpts, hoist_loop_bounds_checks},
     coldsplit::{partition_cold_blocks, reorder_blocks_rpo},
     egraph::{RegBudget, sota_optimize_fixpoint},
+    func::{FnAttrs, RefId, RefKind},
     gemm::{GemmOpts, optimize_gemm_loops},
     ifconv::if_convert,
     loopnest::{fuse_adjacent_loops, interchange_and_tile_loops},
@@ -555,9 +564,17 @@ fn run_sota_loop_and_late_passes<'a>(
         None => post_mach,
     };
 
-    // Stage 1f: Intra-block critical-path latency-aware DAG list scheduler (skipped after
-    // vectorization, unrolling, GEMM, AMAC, SIMD idioms, modulo pipelining, or dispatch tail-dup).
-    let sched_func = if !did_vectorize && !did_unroll && !did_taildup && !did_gemm && !did_amac && !did_simd_idiom && !did_modulo {
+    // Stage 1f: Pre-RA intra-block critical-path latency-aware DAG list scheduler.
+    // Provides register-pressure-bounded SSA ILP overlap before RA (while `mach_a64::mach_sched_m5`
+    // performs post-RA Apple-M5 microarchitectural scheduling on AArch64). Runs even when a cold
+    // inner loop was unrolled; skipped only after GEMM, AMAC, SIMD idioms, modulo pipelining, or
+    // dispatch tail-dup.
+    let sched_func = if !did_taildup
+        && !did_gemm
+        && !did_amac
+        && !did_simd_idiom
+        && !did_modulo
+    {
         schedule_dag(post_super, alloc).ok().filter(|o| o.stats.insts_reordered > 0).map(|o| o.func)
     } else {
         None
@@ -772,24 +789,261 @@ fn emitted_to_code_record<'a>(
     Some((rec, insts))
 }
 
-/// Explicit-`Machine` AArch64 optimizing record emitter for `blaze run`, `blaze test`, and
-/// `blaze export`: runs SROA + fixed-point Aegraph/Reassociation/Strength-Reduction/LICM/DCE +
-/// full SOTA loop, vectorization, GEMM, Apple-M5 machine-op e-graph, and superoptimization
-/// passes, emits native fused AArch64 `Sota` code directly whenever the function fits `Sota`'s
-/// subset (preserving 0..=N surviving/cloned trap rows via [`emitted_to_code_record`]), and
-/// delegates exotic ops cleanly to `emit_record_sourced`.
-///
-/// Callers targeting Apple M4/M5 can pass explicit hardware feature flags
-/// (`Machine::LSE | Machine::DOTPROD | Machine::CSSC | Machine::SME | Machine::SME2`)
-/// deterministically.
-pub fn emit_sota_record_for_machine<'a>(
+/// Preferred caller-saved scratch allocation order for interprocedural register-avoidance
+/// coloring (from [`abi::CustomCallPlan::scratch_gpr_order`] and
+/// [`abi::CustomCallPlan::scratch_fp_order`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScratchOrder {
+    pub gpr: [u8; 16],
+    pub fp: [u8; 24],
+}
+
+impl ScratchOrder {
+    /// Default caller-saved allocation order matching AArch64 caller-saved pools.
+    pub const DEFAULT: Self = Self {
+        gpr: regalloc::ScratchOrder::DEFAULT.gpr,
+        fp: regalloc::ScratchOrder::DEFAULT.fp,
+    };
+
+    #[inline]
+    pub(crate) const fn to_regalloc(self) -> regalloc::ScratchOrder {
+        regalloc::ScratchOrder { gpr: self.gpr, fp: self.fp }
+    }
+}
+
+/// Configuration for [`emit_sota_record_for_machine_with_abi`] (Rule 83: one options struct).
+#[derive(Clone, Copy, Debug)]
+pub struct SotaRecordAbiOpts<'a> {
+    /// Target host machine architecture, OS, and ISA feature flags.
+    pub machine: Machine,
+    /// 2-tier hot/cold classification: hot bodies run bounded AArch64 e-graph superoptimization
+    /// (`SuperoptOpts::apple_silicon()`) with 3 fixed-point rounds; cold 0-loop straight-line
+    /// bodies skip `superopt_a64` and use 2 fixed-point rounds.
+    pub is_hot: bool,
+    /// Optional interprocedural caller-avoidance register allocation order.
+    pub scratch_order: Option<ScratchOrder>,
+    /// When `true`, saves and restores modified caller-saved GPR/FP registers outside return
+    /// slots (`CallConvKind::ColdPreserveAll`) so hot callers keep loop values live across cold
+    /// calls with zero spills. Automatically suppressed if the body can unwind or tail-call.
+    pub preserve_all_cold: bool,
+    /// Sorted `(Outside::Func(place), CallClobbers)` table of already-emitted direct internal
+    /// callees for bottom-up Interprocedural Register Allocation (IPRA). Keyed by `RefRec::place`,
+    /// which stays invariant across intra-function LIR optimization passes.
+    pub callee_clobbers: &'a [(u32, CallClobbers)],
+    /// When `true`, this function's own signature uses `CallConvKind::InternalFast`
+    /// (`X0..X7, X9..X15` GPR args and `V0..V7, V16..V23` FP args, keeping `X8` for `Sret`).
+    pub internal_fast: bool,
+    /// Sorted slice of `RefRec::place` indices (`RefKind::Func`) whose callee uses
+    /// `CallConvKind::InternalFast`.
+    pub internal_fast_callees: &'a [u32],
+}
+
+impl SotaRecordAbiOpts<'static> {
+    /// Conservative hot defaults matching [`emit_sota_record_for_machine`]: C ABI clobbers,
+    /// default scratch order, no `ColdPreserveAll`, full hot superopt tier.
+    pub const fn for_machine(machine: Machine) -> Self {
+        Self {
+            machine,
+            is_hot: true,
+            scratch_order: None,
+            preserve_all_cold: false,
+            callee_clobbers: &[],
+            internal_fast: false,
+            internal_fast_callees: &[],
+        }
+    }
+}
+
+/// Role a function plays in `CallConvKind::InternalFast` eligibility checking (Rule 85).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InternalFastRole {
+    /// Function may call `InternalFast` callees via `Op::Call` / `Op::Invoke` / `Op::TailCall`.
+    Caller,
+    /// Function's own entry signature uses `InternalFast` (`X0..X7, X9..X15`, `V0..V7, V16..V23`).
+    Callee,
+}
+
+/// Returns `true` iff `view` targets AArch64 and passes `misel`'s strict supported-subset check
+/// for `role` so it can soundly participate in `CallConvKind::InternalFast` without ever falling
+/// back to C-ABI emission.
+pub fn can_use_internal_fast_a64(
+    view: blaze_lir::View<'_>,
+    names: &dyn Names,
+    machine: Machine,
+    role: InternalFastRole,
+) -> bool {
+    if machine.arch != Arch::Arm64 {
+        return false;
+    }
+    misel::check_misel_subset(
+        &view,
+        names,
+        misel::MIseOpts {
+            machine,
+            call_mode: CallMode::GotSlot,
+            scratch_gpr_order: None,
+            preserve_all_cold: false,
+            call_clobbers: &[],
+            internal_fast: role == InternalFastRole::Callee,
+            internal_fast_calls: &[],
+        },
+    )
+    .is_ok()
+}
+
+/// Returns `true` iff `view` can soundly use `CallConvKind::ColdPreserveAll` without breaking
+/// compact/DWARF unwinding or tail-call lowering:
+/// - no `Op::Invoke` / `Op::InvokeIndirect` / `Op::Resume` / non-normal landing-pad blocks,
+/// - no `Op::TailCall` / `Op::TailCallIndirect` (refused by `isel` under `preserve_all_cold`),
+/// - no inline `Op::Asm` / `Op::AsmBr`, and
+/// - either explicitly `FnAttrs::NOUNWIND` or a strict zero-call leaf that cannot unwind.
+fn is_safe_for_cold_preserve_all(view: blaze_lir::View<'_>) -> bool {
+    for b in 0..view.blocks() {
+        let Ok(b_u32) = u32::try_from(b) else {
+            return false;
+        };
+        if view.block_kind(Block(b_u32)) != BlockKind::Normal {
+            return false;
+        }
+    }
+    let mut has_call = false;
+    for inst in 0..view.len() {
+        match view.op(inst) {
+            Op::Invoke
+            | Op::InvokeIndirect
+            | Op::Resume
+            | Op::TailCall
+            | Op::TailCallIndirect
+            | Op::Asm
+            | Op::AsmBr => return false,
+            Op::Call | Op::CallIndirect => {
+                has_call = true;
+            }
+            _ => {}
+        }
+    }
+    !has_call || (view.head.attrs & FnAttrs::NOUNWIND) != 0
+}
+
+/// Looks up a direct `Op::Call` / `Op::Invoke` / `Op::TailCall` instruction's IPRA callee
+/// [`CallClobbers`] by its invariant `Outside::Func(place)` index in `callee_clobbers`.
+fn lookup_direct_callee_clobbers(
+    view: blaze_lir::View<'_>,
+    inst: usize,
+    callee_clobbers: &[(u32, CallClobbers)],
+) -> Option<CallClobbers> {
+    if callee_clobbers.is_empty() {
+        return None;
+    }
+    if !matches!(view.op(inst), Op::Call | Op::Invoke | Op::TailCall) {
+        return None;
+    }
+    let &data_at = view.data.get(inst)?;
+    let &ref_word = usize::try_from(data_at).ok().and_then(|at| view.extra.get(at))?;
+    let r = view.refs.get(RefId(ref_word).index())?;
+    if RefKind::from_word(r.kind) != Some(RefKind::Func) {
+        return None;
+    }
+    let pos = callee_clobbers.binary_search_by_key(&r.place, |&(p, _)| p).ok()?;
+    callee_clobbers.get(pos).map(|&(_, clob)| clob)
+}
+
+/// Collects sorted LIR instruction indices of direct `Op::Call` / `Op::Invoke` / `Op::TailCall`
+/// sites targeting any `RefKind::Func` whose invariant `RefRec::place` appears in sorted
+/// `internal_fast_callees`.
+fn collect_misel_fast_calls<'a>(
+    view: blaze_lir::View<'_>,
+    internal_fast_callees: &[u32],
+    alloc: Alloc<'a>,
+) -> blaze_own::Vec<u32, Alloc<'a>> {
+    let mut out: blaze_own::Vec<u32, Alloc<'a>> = blaze_own::Vec::new_in(alloc);
+    if internal_fast_callees.is_empty() {
+        return out;
+    }
+    for inst in 0..view.len() {
+        if !matches!(view.op(inst), Op::Call | Op::Invoke | Op::TailCall) {
+            continue;
+        }
+        let Some(&data_at) = view.data.get(inst) else {
+            continue;
+        };
+        let Some(&ref_word) = usize::try_from(data_at).ok().and_then(|at| view.extra.get(at)) else {
+            continue;
+        };
+        let Some(r) = view.refs.get(RefId(ref_word).index()) else {
+            continue;
+        };
+        if RefKind::from_word(r.kind) == Some(RefKind::Func)
+            && internal_fast_callees.binary_search(&r.place).is_ok()
+            && let Ok(inst_u32) = u32::try_from(inst)
+        {
+            out.push(inst_u32);
+        }
+    }
+    out
+}
+
+/// Checks whether `view` fits `misel`'s strict subset under `opts` and `fast_calls`.
+fn misel_subset_ok(
+    view: blaze_lir::View<'_>,
+    names: &dyn Names,
+    opts: SotaRecordAbiOpts<'_>,
+    fast_calls: &[u32],
+) -> bool {
+    let effective_preserve_all_cold =
+        opts.preserve_all_cold && !opts.internal_fast && is_safe_for_cold_preserve_all(view);
+    misel::check_misel_subset(
+        &view,
+        names,
+        misel::MIseOpts {
+            machine: opts.machine,
+            call_mode: CallMode::GotSlot,
+            scratch_gpr_order: opts.scratch_order.map(|o| o.gpr),
+            preserve_all_cold: effective_preserve_all_cold,
+            call_clobbers: &[],
+            internal_fast: opts.internal_fast,
+            internal_fast_calls: fast_calls,
+        },
+    )
+    .is_ok()
+}
+
+/// Converts a `misel` [`TierError`] into a typed [`RecordEmitError`] when `InternalFast` ABI is
+/// active so we never silently fall back to C-ABI emission (Rule 3).
+fn map_internal_fast_tier_err(err: TierError) -> RecordEmitError {
+    match err {
+        TierError::NoName { of, .. } => RecordEmitError::NoSymbol { of },
+        TierError::TooLarge { what, .. } => RecordEmitError::Emit(crate::EmitError::TooLarge { what }),
+        TierError::Refused { what, .. } => RecordEmitError::Emit(crate::EmitError::Record { why: what }),
+        TierError::Machine { .. } => {
+            RecordEmitError::Emit(crate::EmitError::Record { why: "InternalFast requires AArch64 misel" })
+        }
+        TierError::Table { .. } => {
+            RecordEmitError::Emit(crate::EmitError::Record { why: "misel table error under InternalFast" })
+        }
+        TierError::Record { .. } => {
+            RecordEmitError::Emit(crate::EmitError::Record { why: "misel record error under InternalFast" })
+        }
+    }
+}
+
+/// Explicit-`Machine` + Zero-ABI / IPRA / 2-tier hot-cold AArch64 optimizing record emitter for
+/// `blaze export` (and [`emit_sota_record_for_machine`]): runs SROA + fixed-point Aegraph/
+/// Reassociation/Strength-Reduction/LICM/DCE + SOTA loop/vector/GEMM/mach-egraph passes (gating
+/// multi-round `superopt_a64` and fixed-point rounds on `opts.is_hot`), emits native fused AArch64
+/// `Sota` code via `misel` / `isel::emit_sota_a64_with_abi` with interprocedural `ScratchOrder`,
+/// `InternalFast`, `ColdPreserveAll` (guarded strictly to non-unwinding/leaf bodies), and bottom-up
+/// IPRA `callee_clobbers`, and returns the emitted function's exact [`CallClobbers`] summary
+/// alongside `(CodeRecord, insts, Called)`.
+pub fn emit_sota_record_for_machine_with_abi<'a>(
     func: Verified<'_>,
     names: &dyn Names,
     routines: &RoutinePlaces,
-    machine: Machine,
+    opts: SotaRecordAbiOpts<'_>,
     traps: &[TrapSource],
     alloc: Alloc<'a>,
-) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+) -> Result<(CodeRecord<'a>, u32, Called, CallClobbers), RecordEmitError> {
+    let machine = opts.machine;
     let isa = Isa {
         lse: (machine.features & Machine::LSE) != 0,
         os: match machine.os {
@@ -797,6 +1051,8 @@ pub fn emit_sota_record_for_machine<'a>(
             blaze_tier::Os::Linux => crate::Os::Linux,
         },
     };
+    let max_rounds = if opts.is_hot { 3 } else { 2 };
+    let superopt = if opts.is_hot { Some(SuperoptOpts::apple_silicon()) } else { None };
 
     let scalarized_mem = scalarize_small_memops(func.view(), alloc).ok().flatten();
     let stage0_in = scalarized_mem.as_ref().map_or(func.view(), |f| f.view());
@@ -805,16 +1061,18 @@ pub fn emit_sota_record_for_machine<'a>(
         Some(f) => f.view(),
         None => stage0_in,
     };
-    let sota_opt = sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, 3, |_| 1, alloc).ok();
+    let sota_opt = sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, max_rounds, |_| 1, alloc).ok();
     let chosen_opt = sota_opt.as_ref().and_then(|res| verify(res.func.view()).ok());
+    let has_fast_abi_req = opts.internal_fast
+        || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
 
-    if let Some(opt_v) = chosen_opt {
+    if let Some(opt_v) = chosen_opt.or_else(|| has_fast_abi_req.then_some(func)) {
         let late_func = run_sota_loop_and_late_passes(
             opt_v.view(),
             machine,
             RegBudget::AARCH64,
             true,
-            Some(SuperoptOpts::apple_silicon()),
+            superopt,
             alloc,
         );
         let full_v = match verify(late_func.view()) {
@@ -822,12 +1080,125 @@ pub fn emit_sota_record_for_machine<'a>(
             Err(_) => opt_v,
         };
         let is_macos = machine.os == blaze_tier::Os::MacOs;
-        if let Ok(emitted) =
-            isel::emit_sota_a64(full_v.view(), names, CallMode::GotSlot, machine.features, is_macos, alloc)
+        let initial_fast_calls = collect_misel_fast_calls(full_v.view(), opts.internal_fast_callees, alloc);
+        let need_misel_retry = opts.internal_fast || !initial_fast_calls.is_empty();
+        let late_no_vec: Option<blaze_lir::Func<Alloc<'a>>>;
+        let emit_v: Verified<'_> = if need_misel_retry
+            && !misel_subset_ok(full_v.view(), names, opts, initial_fast_calls.as_slice())
         {
-            if let Some((rec, insts)) = emitted_to_code_record(emitted, traps, alloc) {
-                return Ok((rec, insts, Called::NONE));
+            // Late auto-vectorization / GEMM / SIMD passes introduced an op outside `misel`'s
+            // subset while `InternalFast` ABI is active: re-run late scalar passes with
+            // `auto_vectorize = false` so BCE, unswitch, if-conv, and superopt still apply,
+            // falling back to `opt_v` or original `func` if needed — never to C-ABI `isel`.
+            late_no_vec = Some(run_sota_loop_and_late_passes(
+                opt_v.view(),
+                machine,
+                RegBudget::AARCH64,
+                false,
+                superopt,
+                alloc,
+            ));
+            if let Some(nv) = late_no_vec.as_ref().and_then(|f| verify(f.view()).ok())
+                && {
+                    let nv_fast = collect_misel_fast_calls(nv.view(), opts.internal_fast_callees, alloc);
+                    misel_subset_ok(nv.view(), names, opts, nv_fast.as_slice())
+                }
+            {
+                nv
+            } else {
+                let opt_fast = collect_misel_fast_calls(opt_v.view(), opts.internal_fast_callees, alloc);
+                if misel_subset_ok(opt_v.view(), names, opts, opt_fast.as_slice()) {
+                    opt_v
+                } else {
+                    func
+                }
             }
+        } else {
+            full_v
+        };
+
+        let full_view = emit_v.view();
+        let effective_preserve_all_cold =
+            opts.preserve_all_cold && !opts.internal_fast && is_safe_for_cold_preserve_all(full_view);
+        let ra_order = opts.scratch_order.map(ScratchOrder::to_regalloc);
+        let lookup_clobbers = |inst: usize| -> Option<CallClobbers> {
+            lookup_direct_callee_clobbers(full_view, inst, opts.callee_clobbers)
+        };
+        // Primary V3 SOTA AArch64 pure-SSA `MFunc` pipeline (`misel -> mopt -> msched -> mra ->
+        // prologue/epilogue -> mopt -> msched -> mencode`).
+        let mut misel_call_clobs: blaze_own::Vec<(u32, CallClobbers), Alloc<'a>> =
+            blaze_own::Vec::new_in(alloc);
+        if !opts.callee_clobbers.is_empty() {
+            for inst in 0..full_view.len() {
+                if let Some(clob) = lookup_clobbers(inst)
+                    && let Ok(inst_u32) = u32::try_from(inst)
+                {
+                    misel_call_clobs.push((inst_u32, clob));
+                }
+            }
+        }
+        let misel_fast_calls = collect_misel_fast_calls(full_view, opts.internal_fast_callees, alloc);
+        let must_use_misel = opts.internal_fast || !misel_fast_calls.is_empty();
+        let misel_result = misel::emit_mfunc_ssa_a64(
+            emit_v,
+            names,
+            misel::MIseOpts {
+                machine,
+                call_mode: CallMode::GotSlot,
+                scratch_gpr_order: opts.scratch_order.map(|o| o.gpr),
+                preserve_all_cold: effective_preserve_all_cold,
+                call_clobbers: misel_call_clobs.as_slice(),
+                internal_fast: opts.internal_fast,
+                internal_fast_calls: misel_fast_calls.as_slice(),
+            },
+            alloc,
+        )
+        .map(|(emitted, clobbers, _stats)| (emitted, clobbers));
+        let emit_result = match misel_result {
+            Ok(pair) => Ok(pair),
+            Err(err) if must_use_misel => return Err(map_internal_fast_tier_err(err)),
+            Err(_) => isel::emit_sota_a64_with_abi(
+                full_view,
+                names,
+                CallMode::GotSlot,
+                machine.features,
+                is_macos,
+                |inst| lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64),
+                ra_order.as_ref(),
+                effective_preserve_all_cold,
+                alloc,
+            ),
+        };
+        if let Ok((emitted, mut clobbers)) = emit_result {
+            if let Some((rec, insts)) = emitted_to_code_record(emitted, traps, alloc) {
+                // Soundly union callee clobbers for tail-called `Op::Call`/`Op::CallIndirect` sites
+                // (which `regalloc` excludes from `call_positions` since they do not clobber locals).
+                // `effective_preserve_all_cold` disables TCO and saves/restores modified scratch regs.
+                if !effective_preserve_all_cold {
+                    for inst in 0..full_view.len() {
+                        match full_view.op(inst) {
+                            Op::Call | Op::Invoke | Op::TailCall => {
+                                let callee_clob = lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64);
+                                clobbers.clobbered = clobbers.clobbered.union(callee_clob.clobbered);
+                            }
+                            Op::CallIndirect | Op::InvokeIndirect | Op::TailCallIndirect => {
+                                clobbers.clobbered = clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                return Ok((rec, insts, Called::NONE, clobbers));
+            }
+            if must_use_misel {
+                return Err(RecordEmitError::Emit(crate::EmitError::Record {
+                    why: "misel InternalFast emitted record conversion failed",
+                }));
+            }
+        } else if must_use_misel {
+            return Err(RecordEmitError::Emit(crate::EmitError::Record {
+                why: "misel InternalFast emission refused",
+            }));
         }
         // `emit_record_sourced` indexes `form.unreachables` by `TrapSource::ordinal`; if `opt_v`
         // changed the `Op::Unreachable` count while traps are present, delegate `func` so ordinals
@@ -840,10 +1211,35 @@ pub fn emit_sota_record_for_machine<'a>(
         } else {
             func
         };
-        return emit_record_sourced(fallback_v, names, routines, isa, BULK_INLINE_MOST, traps, alloc);
+        let (rec, insts, called) =
+            emit_record_sourced(fallback_v, names, routines, isa, BULK_INLINE_MOST, traps, alloc)?;
+        return Ok((rec, insts, called, CallClobbers::C_ABI_ARM64));
     }
 
-    emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)
+    let (rec, insts, called) = emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)?;
+    Ok((rec, insts, called, CallClobbers::C_ABI_ARM64))
+}
+
+/// Explicit-`Machine` AArch64 optimizing record emitter for `blaze run`, `blaze test`, and
+/// `blaze export`: delegates to [`emit_sota_record_for_machine_with_abi`] with conservative hot
+/// defaults (`is_hot: true`, C ABI clobbers, default scratch order, no `ColdPreserveAll`).
+pub fn emit_sota_record_for_machine<'a>(
+    func: Verified<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    machine: Machine,
+    traps: &[TrapSource],
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+    let (rec, insts, called, _clobbers) = emit_sota_record_for_machine_with_abi(
+        func,
+        names,
+        routines,
+        SotaRecordAbiOpts::for_machine(machine),
+        traps,
+        alloc,
+    )?;
+    Ok((rec, insts, called))
 }
 
 /// Default AArch64 optimizing record emitter for `blaze-ladder` (`blaze run` / `blaze test`):

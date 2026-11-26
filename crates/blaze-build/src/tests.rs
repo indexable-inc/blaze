@@ -3889,6 +3889,381 @@ fn guarded_arms_move_only_after_the_guard_passes() {
     assert!(failed.is_empty(), "{failed}");
 }
 
+/// Builds `fn main() { let a = [elem; len]; }` and `fn main(i: usize) -> T { let a = [elem; len]; a[i] }`,
+/// passes the bare body's LIR view to `check_bare`, and returns `(a[0], a[len - 1])`.
+fn run_repeat_bodies(
+    elem_node: PNode,
+    make_elem: impl Fn(&mut BodyBuf) -> ExprId,
+    len: u64,
+    check_bare: impl FnOnce(blaze_lir::View<'_>),
+) -> (u128, u128) {
+    let mut w_bare = TestWorld::new();
+    w_bare.func(1, "main", &[], UNIT);
+    let mut b_bare = BodyBuf::new();
+    let a = b_bare.bind("a");
+    let elem = make_elem(&mut b_bare);
+    let len_ty = b_bare.types.usize_value(len).expect("a length interns");
+    let arr = b_bare.e(Expr::Repeat { elem, len: len_ty, count: None });
+    let root = b_bare.block(&[Stmt::Let { pat: a, ty: None, init: Some(arr), else_: None }], None);
+    let bare = build(&w_bare, &b_bare, root).unwrap_or_else(|e| panic!("{e}"));
+    check_bare(bare.func.view());
+
+    let mut w_idx = TestWorld::new();
+    w_idx.func(1, "main", &[USIZE], elem_node);
+    w_idx.bounds_fn();
+    let mut b_idx = BodyBuf::new();
+    let i = b_idx.bind("i");
+    b_idx.params.push(i);
+    let a = b_idx.bind("a");
+    let elem = make_elem(&mut b_idx);
+    let len_ty = b_idx.types.usize_value(len).expect("a length interns");
+    let arr = b_idx.e(Expr::Repeat { elem, len: len_ty, count: None });
+    let a_e = b_idx.local(a);
+    let i_e = b_idx.local(i);
+    let at = b_idx.index(a_e, i_e);
+    let root = b_idx.block(&[Stmt::Let { pat: a, ty: None, init: Some(arr), else_: None }], Some(at));
+    let indexed = build(&w_idx, &b_idx, root).unwrap_or_else(|e| panic!("{e}"));
+
+    let first = one(&indexed, &[Val::Int(0)]);
+    let last = one(&indexed, &[Val::Int(u128::from(len - 1))]);
+    (first, last)
+}
+
+/// Uniform-byte scalar constant repeats `[c; N]` past `UNROLL_LEAVES` lower directly to one
+/// `Op::Memset` in a single block (no `array_loop`) and preserve the exact element bits.
+#[test]
+fn uniform_byte_const_repeats_lower_to_memset() {
+    let f32_node = PNode::Float(blaze_typeck::FloatTy::F32);
+    let cases: &[(&str, PNode, u64, u8, u32, u128, fn(&mut BodyBuf) -> ExprId)] = &[
+        ("[0u32; 256]", U32, 256, 0x00, 256 * 4, 0, |b| b.int(0, SU32)),
+        (
+            "[0u16; 256]",
+            PNode::Uint(UintTy::U16),
+            256,
+            0x00,
+            256 * 2,
+            0,
+            |b| b.int(0, Some(IntSuffix::Uint(UintTy::U16))),
+        ),
+        (
+            "[0x5Au8; 64]",
+            U8,
+            64,
+            0x5A,
+            64,
+            0x5A,
+            |b| b.int(0x5A, Some(IntSuffix::Uint(UintTy::U8))),
+        ),
+        (
+            "[u32::MAX; 64]",
+            U32,
+            64,
+            0xFF,
+            64 * 4,
+            u128::from(u32::MAX),
+            |b| b.int(u128::from(u32::MAX), SU32),
+        ),
+        ("[0.0f32; 64]", f32_node, 64, 0x00, 64 * 4, 0, |b| {
+            let e = b.e(Expr::Lit(Lit::Float(Some(blaze_typeck::FloatTy::F32))));
+            b.lits.push((e, u128::from(0.0f32.to_bits())));
+            e
+        }),
+    ];
+
+    for &(name, elem_node, len, want_byte, want_bytes, want_bits, make_elem) in cases {
+        let (first, last) = run_repeat_bodies(elem_node, make_elem, len, |view| {
+            let text = blaze_lir::print(view);
+            assert_eq!(view.blocks(), 1, "{name}: expected single block (no array_loop):\n{text}");
+            let mut memset_count = 0usize;
+            let mut memset_inst = 0usize;
+            for inst in 0..view.len() {
+                if view.op(inst) == blaze_lir::Op::Memset {
+                    memset_count += 1;
+                    memset_inst = inst;
+                }
+            }
+            assert_eq!(memset_count, 1, "{name}: expected exactly one Op::Memset:\n{text}");
+            let mut o = view.operands(memset_inst);
+            let (_dst, fill, bytes) = (o.value(), o.value(), o.value());
+            assert_eq!(view.op(fill.index()), blaze_lir::Op::Iconst, "{name}: fill op:\n{text}");
+            assert_eq!(view.ty(fill), Ty::I8, "{name}: fill ty:\n{text}");
+            assert_eq!(view.data[fill.index()], u32::from(want_byte), "{name}: fill byte:\n{text}");
+            assert_eq!(view.op(bytes.index()), blaze_lir::Op::Iconst, "{name}: length op:\n{text}");
+            assert_eq!(view.ty(bytes), Ty::I64, "{name}: length ty:\n{text}");
+            assert_eq!(view.data[bytes.index()], want_bytes, "{name}: total bytes:\n{text}");
+        });
+
+        assert_eq!(first, want_bits, "{name}: a[0]");
+        assert_eq!(last, want_bits, "{name}: a[len - 1]");
+    }
+}
+
+/// Non-uniform-byte scalar constant repeats (`[1u32; 64]`, `[-0.0f32; 64]`) must not lower to
+/// `Op::Memset`; they keep `array_loop` and preserve exact element bit patterns.
+#[test]
+fn non_uniform_const_repeats_keep_array_loop() {
+    let f32_node = PNode::Float(blaze_typeck::FloatTy::F32);
+    let neg_zero_bits = u128::from((-0.0f32).to_bits());
+    let cases: &[(&str, PNode, u64, u128, fn(&mut BodyBuf) -> ExprId)] = &[
+        ("[1u32; 64]", U32, 64, 1, |b| b.int(1, SU32)),
+        ("[-0.0f32; 64]", f32_node, 64, neg_zero_bits, |b| {
+            let e = b.e(Expr::Lit(Lit::Float(Some(blaze_typeck::FloatTy::F32))));
+            b.lits.push((e, u128::from((-0.0f32).to_bits())));
+            e
+        }),
+    ];
+
+    for &(name, elem_node, len, want_bits, make_elem) in cases {
+        let (first, last) = run_repeat_bodies(elem_node, make_elem, len, |view| {
+            let text = blaze_lir::print(view);
+            let has_memset = (0..view.len()).any(|inst| view.op(inst) == blaze_lir::Op::Memset);
+            assert!(!has_memset, "{name}: must not lower to Op::Memset:\n{text}");
+            assert_eq!(view.blocks(), 4, "{name}: expected 4-block array_loop:\n{text}");
+        });
+
+        assert_eq!(first, want_bits, "{name}: a[0]");
+        assert_eq!(last, want_bits, "{name}: a[len - 1]");
+    }
+}
+
+/// Counts `(slot_live, memset, memcpy, memmove)` instructions in `view` and returns the first
+/// instruction index of `SlotLive` and `Memset` (if any).
+fn count_dest_pass_ops(view: blaze_lir::View<'_>) -> (usize, usize, usize, usize, Option<usize>, Option<usize>) {
+    let (mut slot_live, mut memset, mut memcpy, mut memmove) = (0usize, 0usize, 0usize, 0usize);
+    let (mut first_live, mut first_memset) = (None, None);
+    for inst in 0..view.len() {
+        match view.op(inst) {
+            blaze_lir::Op::SlotLive => {
+                slot_live += 1;
+                if first_live.is_none() {
+                    first_live = Some(inst);
+                }
+            }
+            blaze_lir::Op::Memset => {
+                memset += 1;
+                if first_memset.is_none() {
+                    first_memset = Some(inst);
+                }
+            }
+            blaze_lir::Op::Memcpy => memcpy += 1,
+            blaze_lir::Op::Memmove => memmove += 1,
+            _ => {}
+        }
+    }
+    (slot_live, memset, memcpy, memmove, first_live, first_memset)
+}
+
+/// Destination-passing lowering for `fn zero_arr() -> u8 { let a = [0u8; 512]; a[7] }`:
+/// lowers in `walk.rs` (before any LIR optimization) to 1 named stack slot (for `a`),
+/// 1 `Op::SlotLive` before 1 `Op::Memset`, and zero `Op::Memcpy`/`Op::Memmove`.
+#[test]
+fn destination_passing_zero_arr_u8_uses_one_named_slot_and_no_memcpy() {
+    let mut w = TestWorld::new();
+    w.func(1, "zero_arr", &[], U8);
+    w.bounds_fn();
+    let mut b = BodyBuf::new();
+    let a = b.bind("a");
+    let elem = b.int(0, Some(IntSuffix::Uint(UintTy::U8)));
+    let len_ty = b.types.usize_value(512).expect("a length interns");
+    let arr = b.e(Expr::Repeat { elem, len: len_ty, count: None });
+    let a_e = b.local(a);
+    let idx = b.int(7, None);
+    let at = b.index(a_e, idx);
+    let root = b.block(&[Stmt::Let { pat: a, ty: None, init: Some(arr), else_: None }], Some(at));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let view = built.func.view();
+    let text = blaze_lir::print(view);
+    assert_eq!(view.slots.len(), 1, "expected 1 stack slot for `a`:\n{text}");
+    assert_eq!(
+        blaze_lir::func::SlotKind::from_byte(view.slots[0].kind),
+        Some(blaze_lir::func::SlotKind::Named),
+        "expected Named slot for `a`:\n{text}",
+    );
+    assert_eq!(view.slots[0].size, 512, "expected 512-byte slot for `a`:\n{text}");
+    let (slot_live, memset, memcpy, memmove, first_live, first_memset) = count_dest_pass_ops(view);
+    assert_eq!(slot_live, 1, "expected 1 Op::SlotLive:\n{text}");
+    assert_eq!(memset, 1, "expected 1 Op::Memset:\n{text}");
+    assert_eq!(memcpy, 0, "expected 0 Op::Memcpy:\n{text}");
+    assert_eq!(memmove, 0, "expected 0 Op::Memmove:\n{text}");
+    assert!(first_live < first_memset, "Op::SlotLive must precede Op::Memset:\n{text}");
+    assert_eq!(one(&built, &[]), 0);
+}
+
+/// Destination-passing lowering for `let mut buf = [0u16; 256]; buf[7] = 42u16; buf[7]`:
+/// lowers in `walk.rs` to 1 named stack slot, 1 `Op::Memset`, and zero `Op::Memcpy`.
+#[test]
+fn destination_passing_mut_u16_repeat_uses_one_named_slot_and_no_memcpy() {
+    let u16_node = PNode::Uint(UintTy::U16);
+    let su16 = Some(IntSuffix::Uint(UintTy::U16));
+    let mut w = TestWorld::new();
+    w.func(1, "mut_buf", &[], u16_node);
+    w.bounds_fn();
+    let mut b = BodyBuf::new();
+    let buf = b.bind("buf");
+    let elem = b.int(0, su16);
+    let len_ty = b.types.usize_value(256).expect("a length interns");
+    let arr = b.e(Expr::Repeat { elem, len: len_ty, count: None });
+    let buf_w = b.local(buf);
+    let idx_w = b.int(7, None);
+    let slot_w = b.index(buf_w, idx_w);
+    let val = b.int(42, su16);
+    let set = b.e(Expr::Assign { lhs: slot_w, rhs: val });
+    let buf_r = b.local(buf);
+    let idx_r = b.int(7, None);
+    let at = b.index(buf_r, idx_r);
+    let root = b.block(
+        &[
+            Stmt::Let { pat: buf, ty: None, init: Some(arr), else_: None },
+            Stmt::Expr { expr: set, semi: true },
+        ],
+        Some(at),
+    );
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let view = built.func.view();
+    let text = blaze_lir::print(view);
+    assert_eq!(view.slots.len(), 1, "expected 1 stack slot for `buf`:\n{text}");
+    assert_eq!(
+        blaze_lir::func::SlotKind::from_byte(view.slots[0].kind),
+        Some(blaze_lir::func::SlotKind::Named),
+        "expected Named slot for `buf`:\n{text}",
+    );
+    assert_eq!(view.slots[0].size, 512, "expected 512-byte slot for `buf`:\n{text}");
+    let (slot_live, memset, memcpy, memmove, first_live, first_memset) = count_dest_pass_ops(view);
+    assert_eq!(slot_live, 1, "expected 1 Op::SlotLive:\n{text}");
+    assert_eq!(memset, 1, "expected 1 Op::Memset:\n{text}");
+    assert_eq!(memcpy, 0, "expected 0 Op::Memcpy:\n{text}");
+    assert_eq!(memmove, 0, "expected 0 Op::Memmove:\n{text}");
+    assert!(first_live < first_memset, "Op::SlotLive must precede Op::Memset:\n{text}");
+    assert_eq!(one(&built, &[]), 42);
+}
+
+/// Negative control (aliasing): `a = [a[0]; 64]` MUST keep using a temporary slot so reading
+/// `a[0]` is never clobbered by overwriting `a`.
+#[test]
+fn assign_aliasing_repeat_does_not_clobber_lhs_before_reading_elem() {
+    // 1. Parameter-aliasing form: `fn reassign(mut a: [u8; 64]) -> u8 { a = [a[0]; 64]; a[1] }`.
+    let mut w_param = TestWorld::new();
+    let arr64 = w_param.array(U8, 64);
+    w_param.func(1, "reassign", &[arr64], U8);
+    w_param.bounds_fn();
+    let mut b_param = BodyBuf::new();
+    let a = b_param.bind("a");
+    b_param.params.push(a);
+    let a_lhs = b_param.local(a);
+    let a_read = b_param.local(a);
+    let zero = b_param.int(0, None);
+    let a0 = b_param.index(a_read, zero);
+    let len_ty = b_param.types.usize_value(64).expect("a length interns");
+    let rep = b_param.e(Expr::Repeat { elem: a0, len: len_ty, count: None });
+    let assign = b_param.e(Expr::Assign { lhs: a_lhs, rhs: rep });
+    let a_ret = b_param.local(a);
+    let one_idx = b_param.int(1, None);
+    let a1 = b_param.index(a_ret, one_idx);
+    let root = b_param.block(&[Stmt::Expr { expr: assign, semi: true }], Some(a1));
+    let built_param = build(&w_param, &b_param, root).unwrap_or_else(|e| panic!("{e}"));
+    let pview = built_param.func.view();
+    let ptext = blaze_lir::print(pview);
+    assert_eq!(pview.slots.len(), 1, "expected 1 temp slot for `a = [a[0]; 64]`:\n{ptext}");
+    assert_eq!(
+        blaze_lir::func::SlotKind::from_byte(pview.slots[0].kind),
+        Some(blaze_lir::func::SlotKind::Temp),
+        "assignment RHS must use a Temp slot:\n{ptext}",
+    );
+    let (_, _, p_memcpy, p_memmove, _, _) = count_dest_pass_ops(pview);
+    assert!(p_memcpy + p_memmove >= 1, "expected bulk copy from temp into `a`:\n{ptext}");
+
+    // 2. Executable eval form: `fn main(x: u8) -> u8 { let mut a = [0x2Au8; 64]; a[0] = x; a = [a[0]; 64]; a[1] }`.
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[U8], U8);
+    w.bounds_fn();
+    let mut b = BodyBuf::new();
+    let x = b.bind("x");
+    b.params.push(x);
+    let a = b.bind("a");
+    let init_byte = b.int(0x2A, Some(IntSuffix::Uint(UintTy::U8)));
+    let len_init = b.types.usize_value(64).expect("a length interns");
+    let init_arr = b.e(Expr::Repeat { elem: init_byte, len: len_init, count: None });
+    let a_w = b.local(a);
+    let idx0_w = b.int(0, None);
+    let a0_w = b.index(a_w, idx0_w);
+    let x_e = b.local(x);
+    let set0 = b.e(Expr::Assign { lhs: a0_w, rhs: x_e });
+    let a_lhs = b.local(a);
+    let a_r = b.local(a);
+    let idx0_r = b.int(0, None);
+    let a0_r = b.index(a_r, idx0_r);
+    let len_rep = b.types.usize_value(64).expect("a length interns");
+    let rep = b.e(Expr::Repeat { elem: a0_r, len: len_rep, count: None });
+    let reassign = b.e(Expr::Assign { lhs: a_lhs, rhs: rep });
+    let a_out = b.local(a);
+    let idx1 = b.int(1, None);
+    let a1 = b.index(a_out, idx1);
+    let root = b.block(
+        &[
+            Stmt::Let { pat: a, ty: None, init: Some(init_arr), else_: None },
+            Stmt::Expr { expr: set0, semi: true },
+            Stmt::Expr { expr: reassign, semi: true },
+        ],
+        Some(a1),
+    );
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(one(&built, &[Val::Int(0x7B)]), 0x7B);
+    assert_eq!(one(&built, &[Val::Int(0x00)]), 0x00);
+    assert_eq!(one(&built, &[Val::Int(0xFF)]), 0xFF);
+}
+
+/// Destination-passing lowering for a non-dropping struct literal whose fields are array repeats:
+/// `struct Pair { a: [u8; 128], b: [u8; 128] }; let p = Pair { a: [0u8; 128], b: [0x33u8; 128] }; p.a[3] + p.b[5]`
+/// lowers to 1 named stack slot (256 bytes), 2 `Op::Memset`, and zero `Op::Memcpy`/`Op::Memmove`.
+#[test]
+fn destination_passing_nested_struct_repeats_use_one_slot_and_no_memcpy() {
+    let mut w = TestWorld::new();
+    let arr128 = w.array(U8, 128);
+    w.strukt(10, "Pair", &[("a", arr128), ("b", arr128)]);
+    w.func(1, "main", &[], U8);
+    w.bounds_fn();
+    let mut b = BodyBuf::new();
+    let p = b.bind("p");
+    let z = b.int(0, Some(IntSuffix::Uint(UintTy::U8)));
+    let len_a = b.types.usize_value(128).expect("a length interns");
+    let rep_a = b.e(Expr::Repeat { elem: z, len: len_a, count: None });
+    let c33 = b.int(0x33, Some(IntSuffix::Uint(UintTy::U8)));
+    let len_b = b.types.usize_value(128).expect("a length interns");
+    let rep_b = b.e(Expr::Repeat { elem: c33, len: len_b, count: None });
+    let path = b.path("Pair");
+    let start = u32::try_from(b.field_inits.len()).expect("field_inits len fits in u32");
+    b.field_inits.push(FieldInit { name: Name::of("a"), expr: rep_a });
+    b.field_inits.push(FieldInit { name: Name::of("b"), expr: rep_b });
+    let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
+    let p_a = b.local(p);
+    let fa = b.field(p_a, "a");
+    let i3 = b.int(3, None);
+    let a3 = b.index(fa, i3);
+    let p_b = b.local(p);
+    let fb = b.field(p_b, "b");
+    let i5 = b.int(5, None);
+    let b5 = b.index(fb, i5);
+    let sum = b.bin(BinOp::Add, a3, b5);
+    let root = b.block(&[Stmt::Let { pat: p, ty: None, init: Some(lit), else_: None }], Some(sum));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let view = built.func.view();
+    let text = blaze_lir::print(view);
+    assert_eq!(view.slots.len(), 1, "expected 1 stack slot for `p`:\n{text}");
+    assert_eq!(
+        blaze_lir::func::SlotKind::from_byte(view.slots[0].kind),
+        Some(blaze_lir::func::SlotKind::Named),
+        "expected Named slot for `p`:\n{text}",
+    );
+    assert_eq!(view.slots[0].size, 256, "expected 256-byte slot for `p`:\n{text}");
+    let (slot_live, memset, memcpy, memmove, first_live, first_memset) = count_dest_pass_ops(view);
+    assert_eq!(slot_live, 1, "expected 1 Op::SlotLive:\n{text}");
+    assert_eq!(memset, 2, "expected 2 Op::Memset (one per field):\n{text}");
+    assert_eq!(memcpy, 0, "expected 0 Op::Memcpy:\n{text}");
+    assert_eq!(memmove, 0, "expected 0 Op::Memmove:\n{text}");
+    assert!(first_live < first_memset, "Op::SlotLive must precede Op::Memset:\n{text}");
+    assert_eq!(one(&built, &[]), 0x33);
+}
+
 #[cfg(target_arch = "aarch64")]
 mod objects;
 
