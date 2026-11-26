@@ -472,7 +472,7 @@ pub fn is_probe(program: &str, args: &[&str]) -> bool {
     if program.contains('/') || !COMPILERS.contains(&program) {
         return false;
     }
-    args.contains(&"-?") || is_flag_check_probe(args) || is_family_probe(args)
+    args == ["-?"] || is_flag_check_probe(args) || is_family_probe(args)
 }
 
 /// The table's identity for the base key: its bytes, under this form.

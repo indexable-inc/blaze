@@ -261,6 +261,11 @@ pub enum FilesError {
     OtherBytes { name: RecordName },
     /// The task's frame refused the bytes of `name`'s record.
     Stopped { name: RecordName },
+    /// Both the primary record repair operation and releasing its repair lock failed.
+    RepairAndUnlock {
+        op: blaze_own::Box<FilesError, blaze_own::SharedAlloc<'static>>,
+        unlock: blaze_own::Box<FilesError, blaze_own::SharedAlloc<'static>>,
+    },
 }
 
 impl core::fmt::Display for FilesError {
@@ -272,6 +277,29 @@ impl core::fmt::Display for FilesError {
             FilesError::Name { name } => write!(f, "the record name {name} is no path under the store"),
             FilesError::Stopped { name } => write!(f, "the record {name}: the task's frame refused its bytes"),
             FilesError::OtherBytes { name } => write!(f, "the record {name} holds other bytes than its put's (rule 21)"),
+            FilesError::RepairAndUnlock { op, unlock } => {
+                write!(f, "{op}; releasing repair lock also failed: {unlock}")
+            }
+        }
+    }
+}
+
+/// Combines a locked record-repair outcome with the result of releasing its repair lock so an
+/// unlock failure is never discarded when the repair itself also failed.
+fn combine_repair_and_unlock(
+    result: Result<(), FilesError>,
+    unlocked: Result<(), FilesError>,
+) -> Result<(), FilesError> {
+    match (result, unlocked) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(unlock)) => Err(unlock),
+        (Err(op), Ok(())) => Err(op),
+        (Err(op), Err(unlock)) => {
+            let shared = blaze_own::SharedAlloc::global();
+            Err(FilesError::RepairAndUnlock {
+                op: blaze_own::Box::new_in(op, shared),
+                unlock: blaze_own::Box::new_in(unlock, shared),
+            })
         }
     }
 }
@@ -522,11 +550,11 @@ impl DirStore {
             self.files.publish(name, whole.as_slice())
         };
         if let Some(guard) = repair_guard {
-            let unlock_cx = self.files.cx(&lock_name)?;
-            let unlocked = guard.unlock(&unlock_cx).map_err(FilesError::Effect);
-            result?;
-            unlocked?;
-            return Ok(());
+            let unlocked = match self.files.cx(&lock_name) {
+                Ok(unlock_cx) => guard.unlock(&unlock_cx).map_err(FilesError::Effect),
+                Err(err) => Err(err),
+            };
+            return combine_repair_and_unlock(result, unlocked);
         }
         result
     }

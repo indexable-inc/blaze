@@ -186,6 +186,8 @@ fn only_probe_shaped_compiler_spawns_are_probes() {
     assert!(!is_probe("/opt/gcc/bin/gcc", &["-E", "/out/1detect_compiler_family.c"]), "explicit compiler path must not route to pinned clang");
     assert!(!is_probe("/missing/cc", &flag_args("-fno-builtin")), "missing path-qualified compiler must not route to pinned clang");
     assert!(is_probe("cc", &["-?"]));
+    assert!(!is_probe("cc", &["-?", "/package/check.c"]), "-? with extra args must stay on normal compiler route");
+    assert!(!is_probe("cc", &["-c", "-?", "/out/flag_check.c"]), "-? combined with other flags is not a bare -? probe");
     assert!(!is_probe("cc", &["-c", "/pkg/src/a.c", "-o", "/out/a.o"]), "an object compile is a C request");
     assert!(!is_probe("ar", &["cq", "/out/libz.a", "/out/a.o"]));
     assert!(!is_probe("cc", &["--version"]), "a fact (facts.rs), not a probe");

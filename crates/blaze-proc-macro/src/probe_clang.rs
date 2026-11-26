@@ -87,6 +87,11 @@ pub(crate) const MAX_PROBE_INPUT_BYTES: usize = 64 << 10;
 /// `spawn_probe` to route the invocation to the ordinary compiler path instead of aborting.
 pub(crate) const STREAM_OVERFLOW_PREFIX: &str = "c-probe stream limit exceeded:";
 
+/// Error prefix emitted when [`PinnedTableAnswerer`] has no known row in `pins/answers/clang.json`
+/// for a probe, signaling `spawn_probe` to leave unlisted probes on the ordinary compiler route
+/// instead of aborting the build script.
+pub(crate) const UNLISTED_TABLE_PROBE_PREFIX: &str = "c-probe unlisted in pinned table:";
+
 /// Returns whether any `OUT_DIR` input file referenced by `args` exceeds `MAX_PROBE_INPUT_BYTES`.
 pub(crate) fn has_oversized_probe_input<'b>(
     args: &[&str],
@@ -110,6 +115,12 @@ pub(crate) fn has_oversized_probe_input<'b>(
 /// Returns whether a probe answerer error indicates stream-capture overflow (`Stop::Stream`).
 pub(crate) fn is_stream_overflow_error(msg: &str) -> bool {
     msg.starts_with(STREAM_OVERFLOW_PREFIX)
+}
+
+/// Returns whether a probe answerer error indicates an unlisted or pending table row that should
+/// stay on the ordinary compiler route.
+pub(crate) fn is_unlisted_table_probe_error(msg: &str) -> bool {
+    msg.starts_with(UNLISTED_TABLE_PROBE_PREFIX)
 }
 
 /// Maximum encoded + sealed `c-probe/<64-hex>` record size accepted from disk (`2 * 1 MiB`
@@ -309,8 +320,48 @@ impl ProbeAnswerer for PinnedTableAnswerer {
         let table = c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc)
             .map_err(|e| own_fmt(format_args!("pins/answers/clang.json: {e}"), alloc))?;
         let inner = c_tasks_probe::TableAnswerer::new(&table);
-        inner.answer(probe, input_bytes, alloc)
+        let ans = inner
+            .answer(probe, input_bytes, alloc)
+            .map_err(|why| own_fmt(format_args!("{UNLISTED_TABLE_PROBE_PREFIX} {why}"), alloc))?;
+        let requested = probe.row.program.as_str();
+        Ok(ProbeAnswer {
+            code: ans.code,
+            stdout: rewrite_driver_prefix(ans.stdout.as_str(), requested, alloc),
+            stderr: rewrite_driver_prefix(ans.stderr.as_str(), requested, alloc),
+        })
     }
+}
+
+/// Rewrites Clang's driver diagnostic prefix (`clang-23:`) at the start of any line to the
+/// requested compiler spelling (e.g. `cc:`, `c++:`, `gcc:`, `clang:`) so stderr/stdout match the
+/// spawned driver `argv[0]` rather than exposing the internal shelf binary name `clang-23`.
+fn rewrite_driver_prefix<'a>(text: &str, requested_program: &str, alloc: Alloc<'a>) -> AString<'a> {
+    if requested_program.is_empty() || requested_program == "clang-23" || !text.contains("clang-23:") {
+        return OwnString::from_str_in(text, alloc);
+    }
+    let mut out = OwnString::with_capacity_in(text.len(), alloc);
+    let mut at_line_start = true;
+    let mut pos = 0usize;
+    while let Some(rest) = text.get(pos..) {
+        if rest.is_empty() {
+            break;
+        }
+        if at_line_start && rest.starts_with("clang-23:") {
+            out.push_str(requested_program);
+            out.push(':');
+            pos += "clang-23:".len();
+            at_line_start = false;
+            continue;
+        }
+        if let Some(ch) = rest.chars().next() {
+            out.push(ch);
+            pos += ch.len_utf8();
+            at_line_start = ch == '\n';
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Default strategy id for this host OS (used when no home/runtime-closure context is available
@@ -1209,9 +1260,11 @@ impl HermeticClangProbe {
 
         // Normalize host paths back to canonical placeholders (longest match first) while escaping
         // literal `$` -> `$$` so literal `$OUT_DIR`/`$IN0.c` in Clang output round-trip verbatim
-        // through `CanonicalProbe::unspell`, and `<shelf>/bin` (`InstalledDir:`) never leaks `$HOME`.
-        let stdout = normalize_reply(raw_out, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
-        let stderr = normalize_reply(raw_err, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
+        // through `CanonicalProbe::unspell`, `<shelf>/bin` (`InstalledDir:`) never leaks `$HOME`,
+        // and driver diagnostics preserve the requested compiler spelling (`cc:`, `c++:`, etc.).
+        let requested = probe.row.program.as_str();
+        let stdout = normalize_reply(raw_out, requested, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
+        let stderr = normalize_reply(raw_err, requested, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
         Ok(ProbeAnswer { code, stdout, stderr })
     }
 }
@@ -1221,8 +1274,10 @@ impl HermeticClangProbe {
 const CLANG_SHELF: &str = "$CLANG_SHELF";
 
 #[cfg(any(target_os = "linux", test))]
+#[expect(clippy::too_many_arguments, reason = "explicit host-root normalization arguments")]
 fn normalize_reply<'a>(
     raw: &str,
+    requested_program: &str,
     clang_path: &str,
     shelf_dir: &str,
     task_dir: &str,
@@ -1234,14 +1289,16 @@ fn normalize_reply<'a>(
     for (spelled, host_file) in placeholders.iter() {
         rev_pairs.push((host_file.as_str(), spelled.as_str()));
     }
-    rev_pairs.push((clang_path, "clang-23"));
+    let driver_name = if requested_program.is_empty() { "clang-23" } else { requested_program };
+    rev_pairs.push((clang_path, driver_name));
     rev_pairs.push((shelf_dir, CLANG_SHELF));
     rev_pairs.push((task_dir, OUT_DIR));
     if let Some(sdk) = sdk_dir {
         rev_pairs.push((sdk, SDKROOT));
     }
     rev_pairs.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()));
-    replace_pairs_escape_dollar(raw, rev_pairs.as_slice(), alloc)
+    let replaced = replace_pairs_escape_dollar(raw, rev_pairs.as_slice(), alloc);
+    rewrite_driver_prefix(replaced.as_str(), driver_name, alloc)
 }
 
 #[cfg(target_os = "linux")]
@@ -1497,8 +1554,18 @@ mod tests {
             let raw_cached = store.get(&resolved.key, alloc).expect("read cache").expect("cached");
             let canonical = c_tasks_probe::decode_answer(raw_cached.as_slice(), alloc).expect("decode");
             assert_eq!(canonical.code, *code, "code mismatch for {:?}", row.args);
-            assert_eq!(canonical.stdout.as_str(), stdout.as_str(), "stdout mismatch for {:?}", row.args);
-            assert_eq!(canonical.stderr.as_str(), stderr.as_str(), "stderr mismatch for {:?}", row.args);
+            let expected_stdout = super::rewrite_driver_prefix(stdout.as_str(), row.program.as_str(), alloc);
+            let expected_stderr = super::rewrite_driver_prefix(stderr.as_str(), row.program.as_str(), alloc);
+            assert_eq!(canonical.stdout.as_str(), expected_stdout.as_str(), "stdout mismatch for {:?}", row.args);
+            assert_eq!(canonical.stderr.as_str(), expected_stderr.as_str(), "stderr mismatch for {:?}", row.args);
+            if row.args.len() == 1 && row.args[0].as_str() == "-?" {
+                let want_prefix = format!("{}: error:", row.program.as_str());
+                assert!(
+                    canonical.stderr.as_str().starts_with(want_prefix.as_str()),
+                    "diagnostic must preserve requested driver spelling `{want_prefix}`, got: {}",
+                    canonical.stderr.as_str()
+                );
+            }
 
             let empty_sdk = blaze_build_script::facts::sdk_id_digest("");
             let aid = answerer.id(alloc).expect("answerer id");
@@ -1690,6 +1757,11 @@ mod tests {
             let resolved = resolve(&PinnedTableAnswerer, &table_cache, &darwin_pin, &sp_q, |_| None, &mut no_bytes, alloc)
                 .expect("pinned table resolves known darwin probe");
             assert_eq!(resolved.answerer_id, PinnedTableAnswerer::strategy_id());
+            assert!(
+                resolved.answered.stderr.as_str().starts_with("cc: error:"),
+                "pinned table answerer must preserve requested driver spelling, got: {}",
+                resolved.answered.stderr.as_str()
+            );
             assert_eq!(table_store.len(), 1);
             let table_subj = cc_probe_subject(
                 &resolved.answerer_id,
@@ -1720,8 +1792,15 @@ mod tests {
                 stdin: &[],
             };
             let unknown_err = resolve(&PinnedTableAnswerer, &table_cache, &darwin_pin, &sp_unknown, dig, &mut bytes, alloc)
-                .expect_err("unknown probe must be refused by pinned table");
-            assert!(unknown_err.as_str().contains("PENDING"), "expected row refusal, got: {unknown_err}");
+                .expect_err("unlisted probe must signal handoff to ordinary compiler route");
+            assert!(
+                super::is_unlisted_table_probe_error(unknown_err.as_str()),
+                "unlisted table probe must carry UNLISTED_TABLE_PROBE_PREFIX so spawn_probe hands off to ordinary compiler, got: {unknown_err}"
+            );
+            assert!(
+                !super::is_unlisted_table_probe_error("pins/answers/clang.json: invalid json"),
+                "parse errors must NOT be misclassified as unlisted table rows"
+            );
         }
         let _ = std::fs::remove_dir_all(&empty_home);
 
@@ -1955,7 +2034,8 @@ mod tests {
             OwnString::from_str_in("/tmp/task-1/in0.c", alloc),
         )];
         let norm = super::normalize_reply(
-            "clang: /home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23\nInstalledDir: /home/user/.blaze/v2/toolchain/clang/abc/bin\nreal=/tmp/task-1/in0.c dir=/tmp/task-1 lit=$OUT_DIR lit2=$IN0.c\n",
+            "clang: /home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23\nclang-23: error: unknown argument\nliteral clang-23: stays\nInstalledDir: /home/user/.blaze/v2/toolchain/clang/abc/bin\nreal=/tmp/task-1/in0.c dir=/tmp/task-1 lit=$OUT_DIR lit2=$IN0.c\n",
+            "cc",
             "/home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23",
             "/home/user/.blaze/v2/toolchain/clang/abc",
             "/tmp/task-1",
@@ -1999,13 +2079,13 @@ mod tests {
         assert!(!super::is_stream_overflow_error("c-probe hermetic run failed"));
         assert_eq!(
             norm.as_str(),
-            "clang: clang-23\nInstalledDir: $CLANG_SHELF/bin\nreal=$IN0.c dir=$OUT_DIR lit=$$OUT_DIR lit2=$$IN0.c\n"
+            "clang: cc\ncc: error: unknown argument\nliteral clang-23: stays\nInstalledDir: $CLANG_SHELF/bin\nreal=$IN0.c dir=$OUT_DIR lit=$$OUT_DIR lit2=$$IN0.c\n"
         );
         let canon = c_tasks_probe::canonicalize(stub_id, &pin, &sp_a, dig, alloc).expect("canon");
         let restored = canon.unspell(norm.as_str(), &sp_a, alloc);
         assert_eq!(
             restored.as_str(),
-            "clang: clang-23\nInstalledDir: $CLANG_SHELF/bin\nreal=/out/flag_check.c dir=/out lit=$OUT_DIR lit2=$IN0.c\n"
+            "clang: cc\ncc: error: unknown argument\nliteral clang-23: stays\nInstalledDir: $CLANG_SHELF/bin\nreal=/out/flag_check.c dir=/out lit=$OUT_DIR lit2=$IN0.c\n"
         );
 
         // Stale task directory collisions recover cleanly across crash / PID reuse, and explicit

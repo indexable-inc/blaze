@@ -630,3 +630,25 @@ fn c_probe_cross_world_dst_catches_planted_shared_temp_collision() {
         }
     }
 }
+
+#[test]
+fn c_probe_repair_preserves_both_op_and_unlock_errors() {
+    let name = super::RecordName::from_ascii(b"c-probe/test");
+    let lock_name = super::RecordName::from_ascii(b"c-probe/.repair.lock");
+    let combined = super::combine_repair_and_unlock(
+        Err(FilesError::OtherBytes { name }),
+        Err(FilesError::Stopped { name: lock_name }),
+    )
+    .expect_err("combined repair + unlock error");
+    assert!(matches!(combined, FilesError::RepairAndUnlock { .. }));
+    let text = std::format!("{combined}");
+    assert!(
+        text.contains("holds other bytes") && text.contains("releasing repair lock also failed"),
+        "combined repair/unlock error must report both causes: {text}"
+    );
+    assert!(super::combine_repair_and_unlock(Ok(()), Ok(())).is_ok());
+    assert!(matches!(
+        super::combine_repair_and_unlock(Ok(()), Err(FilesError::Stopped { name: lock_name })),
+        Err(FilesError::Stopped { .. })
+    ));
+}

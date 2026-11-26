@@ -607,7 +607,10 @@ impl ScriptSandbox {
                 let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
                 let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
                     Ok(resolved) => resolved,
-                    Err(why) if crate::probe_clang::is_stream_overflow_error(why.as_str()) => {
+                    Err(why)
+                        if crate::probe_clang::is_stream_overflow_error(why.as_str())
+                            || crate::probe_clang::is_unlisted_table_probe_error(why.as_str()) =>
+                    {
                         return self.spawn_ordinary_compiler(program, spawned);
                     }
                     Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
