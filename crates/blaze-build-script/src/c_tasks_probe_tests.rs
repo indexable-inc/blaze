@@ -499,6 +499,28 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert!(can_lit.exec_args.iter().flatten().all(|s| !matches!(s, crate::c_tasks_probe::Segment::OutDir)));
     assert!(can_real.exec_args.iter().flatten().any(|s| matches!(s, crate::c_tasks_probe::Segment::OutDir)));
 
+    // Inline assembly (`.incbin`) and preprocessor token pasting (`##` / `%:%:`) are refused
+    // before caching; deterministic profile-generation flags are allowed while feedback-reading
+    // profile-use flags remain refused.
+    for bad_src in [
+        &b"void f(void) { __asm__(\".incbin \\\"/package/blob\\\"\"); }"[..],
+        &b"#define CAT(a, b) a##b\n#if CAT(__has_,include)(\"sibling.h\")\n#endif\n"[..],
+        &b"#define CAT(a, b) a%:%:b\nint main(void) { return 0; }\n"[..],
+    ] {
+        let mut bad_bytes = |rel: &str| (rel == "flag_check.c").then_some(bad_src);
+        assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut bad_bytes, alloc).is_err());
+    }
+    for ok_prof in ["-fprofile-instr-generate", "-fprofile-generate", "-fprofile-arcs"] {
+        let prof_args = flag_args(ok_prof);
+        let sp_prof = Spawn { program: "cc", args: &prof_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        assert!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_prof, files, alloc).is_ok(), "{ok_prof} should be allowed");
+    }
+    for bad_prof in ["-fprofile-use=/tmp/p.profdata", "-fprofile-instr-use=default.profdata", "-fprofile-sample-use=a.prof"] {
+        let prof_args = flag_args(bad_prof);
+        let sp_prof = Spawn { program: "cc", args: &prof_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        assert!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_prof, files, alloc).is_err(), "{bad_prof} must be refused");
+    }
+
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
     let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");

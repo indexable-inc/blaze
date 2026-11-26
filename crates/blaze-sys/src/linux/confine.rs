@@ -99,13 +99,16 @@ pub struct Filter {
     pub processes: bool,
 }
 
-/// What the parent made for one child: the ruleset, the filter's instructions and the limits.
+/// What the parent made for one child: the ruleset, the filter's instructions, the limits, and
+/// an optional pre-opened, pre-verified executable descriptor (`O_RDONLY | O_CLOEXEC`) executed
+/// via `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` so the child runs the exact verified inode.
 /// Borrowed by the child between `clone` and `execve`: it is the parent's memory (`CLONE_VM`)
 /// and lives until the start returns.
 pub struct ChildConfine<'a> {
     pub ruleset: Fd,
     pub filter: &'a [SockFilter],
     pub limits: &'a [(Resource, Rlimit)],
+    pub exec_fd: Option<Fd>,
 }
 
 /// Which step of [`enter`] the kernel refused.
@@ -1026,7 +1029,7 @@ pub fn enter_test_sandbox(
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
     let filter_slice = build_test(&mut filter);
     let limits = [(Resource::Core, Rlimit { soft: 0, hard: 0 })];
-    let confine = ChildConfine { ruleset: ruleset.fd(), filter: filter_slice, limits: &limits };
+    let confine = ChildConfine { ruleset: ruleset.fd(), filter: filter_slice, limits: &limits, exec_fd: None };
     enter(&confine).map_err(|(step, errno)| TestConfineError::Enter { step, errno })?;
     Ok(temp_mount)
 }

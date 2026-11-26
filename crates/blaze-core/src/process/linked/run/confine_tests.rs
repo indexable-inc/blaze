@@ -65,7 +65,7 @@ fn the_child_enters_its_confinement_before_its_program() {
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
     let filter = build(Filter { processes: true }, &mut filter);
     let limits = [(Resource::Core, Rlimit { soft: 0, hard: 0 })];
-    let confine = ChildConfine { ruleset: ruleset.fd(), filter, limits: &limits };
+    let confine = ChildConfine { ruleset: ruleset.fd(), filter, limits: &limits, exec_fd: None };
 
     // `cat` of the inside file succeeds (3 otherwise); of the file beside it fails (4 otherwise).
     let script = "cat inside/in.txt >/dev/null || exit 3; cat beside.txt >/dev/null 2>&1 && exit 4; exit 0";
@@ -89,7 +89,7 @@ fn the_child_enters_its_confinement_before_its_program() {
     // A ruleset that is no descriptor: the kernel refuses `landlock_restrict_self`, the start
     // names that step, and the program never ran (it would have made `ran`).
     let ran = base.join("ran");
-    let broken = ChildConfine { ruleset: blaze_sys::Fd::new(-1), filter, limits: &limits };
+    let broken = ChildConfine { ruleset: blaze_sys::Fd::new(-1), filter, limits: &limits, exec_fd: None };
     let error = exit_of(&sh("touch ran", &base), &broken).expect_err("a refused confinement");
     assert_eq!(error.op, LinkOp::Confine(Step::Landlock));
     assert!(!ran.exists(), "the program ran after its confinement was refused");

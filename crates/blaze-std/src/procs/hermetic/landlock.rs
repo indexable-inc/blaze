@@ -90,18 +90,30 @@ pub struct Prepared {
     filter: [SockFilter; MOST_FILTER],
     filter_len: usize,
     limits: [(Resource, Rlimit); confine::MOST_LIMITS],
+    exec_fd: Option<Fd>,
 }
 
 impl Prepared {
     /// What the child enters (blaze-sys `linux::confine::enter`).
     pub fn confine(&self) -> ChildConfine<'_> {
-        ChildConfine { ruleset: self.ruleset.fd(), filter: &self.filter[..self.filter_len], limits: &self.limits }
+        ChildConfine {
+            ruleset: self.ruleset.fd(),
+            filter: self.filter.get(..self.filter_len).unwrap_or(&[]),
+            limits: &self.limits,
+            exec_fd: self.exec_fd,
+        }
     }
 }
 
 /// The confinement of `plan`, with `budget`'s limits; `processes` lets the child start the
-/// spec's helpers.
+/// spec's helpers. When `exec_fd` is `Some`, the primary program's Landlock rule and NixOS ELF
+/// closure use that exact opened descriptor and the child executes it via `execveat(...,
+/// AT_EMPTY_PATH)`.
 pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepared, Fault> {
+    prepare_with_exec(plan, budget, processes, None)
+}
+
+pub(super) fn prepare_with_exec(plan: &Plan<'_>, budget: Budget, processes: bool, exec_fd: Option<Fd>) -> Result<Prepared, Fault> {
     let abi = landlock_abi().map_err(|errno| Fault::Host { call: "landlock_create_ruleset (version)", code: errno.raw() })?;
     if abi < LEAST_ABI {
         return Err(Fault::LandlockAbi { abi, least: LEAST_ABI });
@@ -122,6 +134,16 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         name[..bytes.len()].copy_from_slice(bytes);
         name[bytes.len()] = 0;
         let path = CStr::from_bytes_with_nul(&name[..=bytes.len()]).map_err(|_| Fault::PathRefused { at: at as u32 })?;
+        if rule.why == Why::Program
+            && let Some(efd) = exec_fd
+        {
+            let granted = rights(rule.access, false).bits();
+            let pb = PathBeneath { allowed_access: granted, parent_fd: efd.raw() };
+            landlock_add_rule_path(ruleset.fd(), &pb)
+                .map_err(|errno| Fault::Host { call: "landlock_add_rule (verified exec)", code: errno.raw() })?;
+            grant_nix_elf_closure(ruleset.fd(), path, Some(efd), plan, has_helper_folder)?;
+            continue;
+        }
         // A folder rule is opened as a folder; a path that is a file (a whole-subtree rule on a
         // file, as `/etc/ld.so.cache`) is then a file rule: the kernel takes only file rights
         // on a file. The kind is asked of the kernel, never guessed from the spelling.
@@ -145,7 +167,7 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
         landlock_add_rule_path(ruleset.fd(), &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule", code: errno.raw() })?;
         if matches!(rule.why, Why::Program | Why::Helper) {
-            grant_nix_elf_closure(ruleset.fd(), path, plan, has_helper_folder)?;
+            grant_nix_elf_closure(ruleset.fd(), path, None, plan, has_helper_folder)?;
         }
     }
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
@@ -156,25 +178,41 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         (Resource::AddressSpace, Rlimit { soft: budget.memory, hard: budget.memory }),
         (Resource::Core, Rlimit { soft: 0, hard: 0 }),
     ];
-    Ok(Prepared { ruleset, filter, filter_len, limits })
+    Ok(Prepared { ruleset, filter, filter_len, limits, exec_fd })
 }
 
 /// On NixOS hosts where an ELF program's `PT_INTERP` (e.g. `/lib/ld-linux-aarch64.so.1`) symlinks
 /// into `/nix/store/...` (`nix-ld`), walks the full transitive ELF64 dependency closure
-/// (`DT_NEEDED`, `DT_RUNPATH`/`DT_RPATH` with `$ORIGIN` expansion, `/run/current-system/sw/share/nix-ld/lib`,
-/// and `ld.so`'s resolved glibc `lib/` directory) and grants Landlock single-file
-/// `READ_FILE | EXECUTE` ONLY on the exact loader and resolved shared library files — never on
-/// `/nix/store` as a directory. Does nothing on non-NixOS hosts or non-ELF scripts.
-fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helper_folder: bool) -> Result<(), Fault> {
+/// (`DT_NEEDED`, inherited `DT_RPATH` vs non-transitive `DT_RUNPATH` with `$ORIGIN` expansion,
+/// `/run/current-system/sw/share/nix-ld/lib`, and `ld.so`'s resolved glibc `lib/` directory) and
+/// grants Landlock single-file `READ_FILE | EXECUTE` ONLY on the exact loader and resolved shared
+/// library files — never on `/nix/store` as a directory. Does nothing on non-NixOS hosts or
+/// non-ELF scripts.
+fn grant_nix_elf_closure(
+    ruleset: Fd,
+    program: &CStr,
+    verified_exec_fd: Option<Fd>,
+    plan: &Plan<'_>,
+    has_helper_folder: bool,
+) -> Result<(), Fault> {
     const MAX_LIBS: usize = 128;
     const PATH_CAP: usize = 320;
     const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
     const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
 
-    let Ok(prog_file) = openat(CWD, blaze_sys::Path::new(program), OpenFlags::CLOSE_ON_EXEC, 0) else {
-        return Ok(());
+    let opened_prog = match verified_exec_fd {
+        Some(_) => None,
+        None => match openat(CWD, blaze_sys::Path::new(program), OpenFlags::CLOSE_ON_EXEC, 0) {
+            Ok(fd) => Some(fd),
+            Err(_) => return Ok(()),
+        },
     };
-    let Some(hdr) = parse_elf64_meta(prog_file.fd())? else {
+    let prog_fd = match (verified_exec_fd, &opened_prog) {
+        (Some(fd), _) => fd,
+        (None, Some(owned)) => owned.fd(),
+        (None, None) => return Ok(()),
+    };
+    let Some(hdr) = parse_elf64_meta(prog_fd)? else {
         return Ok(());
     };
     if hdr.interp_len == 0 {
@@ -184,7 +222,8 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
     let Some(interp_slice) = interp_buf.get_mut(..hdr.interp_len) else {
         return Ok(());
     };
-    let n = pread(prog_file.fd(), interp_slice, hdr.interp_off).unwrap_or(0);
+    let n = pread(prog_fd, interp_slice, hdr.interp_off)
+        .map_err(|errno| Fault::Host { call: "pread (nix ELF PT_INTERP)", code: errno.raw() })?;
     let Some(interp_bytes) = interp_buf.get(..n) else {
         return Ok(());
     };
@@ -238,37 +277,56 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
         None
     };
 
-    // Bounded BFS queue of canonical ELF paths to parse strictly for actual `DT_NEEDED`
-    // dependencies: seeded ONLY with the executable itself, its `PT_INTERP`, and (for `nix-ld`)
-    // `NIX_LD_SO` — never any unreferenced host libraries.
-    let mut queue = [([0u8; PATH_CAP], 0usize); MAX_LIBS];
+    // Bounded BFS queue of `(canonical ELF path, len, inherited DT_RPATH bitmask)` seeded ONLY
+    // with the executable itself, its `PT_INTERP`, and (for `nix-ld`) `NIX_LD_SO`.
+    let mut queue = [([0u8; PATH_CAP], 0usize, 0u16); MAX_LIBS];
     let mut q_len = 0usize;
     let mut q_head = 0usize;
+    let mut rpath_pool = [([0u8; PATH_CAP], 0usize); 16];
+    let mut rpath_pool_len = 0usize;
 
-    enqueue_nix_resolved_path(program.to_bytes(), &mut queue, &mut q_len)?;
-    enqueue_nix_resolved_path(interp_cstr.to_bytes(), &mut queue, &mut q_len)?;
+    if let Some(efd) = verified_exec_fd {
+        let mut prog_real = [0u8; PATH_CAP];
+        let prog_len = readlink_fd_path(efd, &mut prog_real)?;
+        enqueue_nix_resolved_path(prog_real.get(..prog_len).unwrap_or(&[]), 0, &mut queue, 0, &mut q_len)?;
+    } else {
+        enqueue_nix_resolved_path(program.to_bytes(), 0, &mut queue, 0, &mut q_len)?;
+    }
+    enqueue_nix_resolved_path(interp_cstr.to_bytes(), 0, &mut queue, 0, &mut q_len)?;
     if is_nix_ld {
-        enqueue_nix_resolved_path(NIX_LD_SO.to_bytes(), &mut queue, &mut q_len)?;
+        enqueue_nix_resolved_path(NIX_LD_SO.to_bytes(), 0, &mut queue, 0, &mut q_len)?;
     }
 
     while q_head < q_len {
+        let cur_idx = q_head;
         let mut cur_path = [0u8; PATH_CAP];
-        let cur_len = match queue.get(q_head) {
-            Some((buf, len)) => {
+        let (cur_len, inherited_rpath_mask) = match queue.get(cur_idx) {
+            Some((buf, len, mask)) => {
                 if let (Some(d), Some(s)) = (cur_path.get_mut(..*len), buf.get(..*len)) {
                     d.copy_from_slice(s);
                 }
-                *len
+                (*len, *mask)
             }
             None => break,
         };
         q_head += 1;
-        let Ok(cur_cstr) = CStr::from_bytes_until_nul(cur_path.get(..=cur_len).unwrap_or(&[0])) else {
-            return Err(Fault::Host { call: "landlock (NixOS ELF invalid queued path)", code: 22 });
+        let opened_cur = if cur_idx == 0 && verified_exec_fd.is_some() {
+            None
+        } else {
+            let Ok(cur_cstr) = CStr::from_bytes_until_nul(cur_path.get(..=cur_len).unwrap_or(&[0])) else {
+                return Err(Fault::Host { call: "landlock (NixOS ELF invalid queued path)", code: 22 });
+            };
+            Some(
+                openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0)
+                    .map_err(|errno| Fault::Host { call: "openat (nix ELF closure object)", code: errno.raw() })?,
+            )
         };
-        let elf_fd = openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0)
-            .map_err(|errno| Fault::Host { call: "openat (nix ELF closure object)", code: errno.raw() })?;
-        let Some(meta) = parse_elf64_meta(elf_fd.fd())? else {
+        let elf_fd = match (cur_idx == 0, verified_exec_fd, &opened_cur) {
+            (true, Some(fd), _) => fd,
+            (_, _, Some(owned)) => owned.fd(),
+            _ => continue,
+        };
+        let Some(meta) = parse_elf64_meta(elf_fd)? else {
             continue;
         };
         if meta.dyn_len == 0 {
@@ -278,7 +336,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
         let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
             return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
         };
-        let dyn_read = pread(elf_fd.fd(), dyn_slice, meta.dyn_off)
+        let dyn_read = pread(elf_fd, dyn_slice, meta.dyn_off)
             .map_err(|errno| Fault::Host { call: "pread (nix ELF PT_DYNAMIC)", code: errno.raw() })?;
         let mut strtab_vaddr = None;
         let mut runpath_off = None;
@@ -312,46 +370,88 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
             continue;
         };
 
-        // Extract optional DT_RUNPATH / DT_RPATH search directories (expanding `$ORIGIN`, refusing
-        // unsupported dynamic-loader `$` tokens such as `$LIB` or `$PLATFORM`).
+        // Resolve search directories with glibc ELF semantics:
+        // - `DT_RUNPATH` applies ONLY to direct dependencies of this object (non-transitive);
+        //   when present, it overrides `DT_RPATH` for direct lookups while leaving ancestor
+        //   `DT_RPATH` available to transitive children that lack `DT_RUNPATH`.
+        // - `DT_RPATH` (when `DT_RUNPATH` is absent) is inherited by all transitive dependencies.
         let origin_dir = cur_path
             .get(..cur_len)
             .and_then(|p| p.iter().rposition(|&b| b == b'/').and_then(|s| p.get(..s)))
             .unwrap_or(&[]);
         let mut search_dirs = [([0u8; PATH_CAP], 0usize); 16];
         let mut search_count = 0usize;
-        if let Some(rp_off) = runpath_off.or(rpath_off)
-            && let Some(at) = strtab_file_off.checked_add(rp_off)
-        {
-            let mut rp_buf = [0u8; 2048];
-            let n = pread(elf_fd.fd(), &mut rp_buf, at)
-                .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_RUNPATH)", code: errno.raw() })?;
-            let raw = rp_buf.get(..n).unwrap_or(&[]);
-            let Some(end) = raw.iter().position(|&b| b == 0) else {
-                return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
-            };
-            for entry in raw.get(..end).unwrap_or(&[]).split(|&b| b == b':') {
-                if entry.is_empty() {
-                    continue;
-                }
-                let Some(slot) = search_dirs.get_mut(search_count) else {
-                    return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
+        let child_rpath_mask = if let Some(rp_off) = runpath_off {
+            if let Some(at) = strtab_file_off.checked_add(rp_off) {
+                let mut rp_buf = [0u8; 2048];
+                let n = pread(elf_fd, &mut rp_buf, at)
+                    .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_RUNPATH)", code: errno.raw() })?;
+                let raw = rp_buf.get(..n).unwrap_or(&[]);
+                let Some(end) = raw.iter().position(|&b| b == 0) else {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
                 };
-                let expanded_len = expand_origin(entry, origin_dir, &mut slot.0)?;
-                if expanded_len == 0 {
-                    return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entry exceeds path cap)", code: 36 });
+                for entry in raw.get(..end).unwrap_or(&[]).split(|&b| b == b':') {
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let Some(slot) = search_dirs.get_mut(search_count) else {
+                        return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
+                    };
+                    let expanded_len = expand_origin(entry, origin_dir, &mut slot.0)?;
+                    if expanded_len == 0 {
+                        return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entry exceeds path cap)", code: 36 });
+                    }
+                    slot.1 = expanded_len;
+                    search_count += 1;
                 }
-                slot.1 = expanded_len;
-                search_count += 1;
             }
-        }
+            inherited_rpath_mask
+        } else {
+            let mut eff_mask = inherited_rpath_mask;
+            if let Some(rp_off) = rpath_off
+                && let Some(at) = strtab_file_off.checked_add(rp_off)
+            {
+                let mut rp_buf = [0u8; 2048];
+                let n = pread(elf_fd, &mut rp_buf, at)
+                    .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_RPATH)", code: errno.raw() })?;
+                let raw = rp_buf.get(..n).unwrap_or(&[]);
+                let Some(end) = raw.iter().position(|&b| b == 0) else {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF RPATH exceeds buffer cap)", code: 7 });
+                };
+                for entry in raw.get(..end).unwrap_or(&[]).split(|&b| b == b':') {
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let mut exp = [0u8; PATH_CAP];
+                    let expanded_len = expand_origin(entry, origin_dir, &mut exp)?;
+                    if expanded_len == 0 {
+                        return Err(Fault::Host { call: "landlock (NixOS ELF RPATH entry exceeds path cap)", code: 36 });
+                    }
+                    let bit = intern_rpath_dir(exp.get(..expanded_len).unwrap_or(&[]), &mut rpath_pool, &mut rpath_pool_len)?;
+                    eff_mask |= bit;
+                }
+            }
+            for bit_idx in 0..rpath_pool_len {
+                if eff_mask & (1u16 << bit_idx) != 0
+                    && let Some((src_buf, src_len)) = rpath_pool.get(bit_idx)
+                    && let Some(slot) = search_dirs.get_mut(search_count)
+                {
+                    if let (Some(d), Some(s)) = (slot.0.get_mut(..*src_len), src_buf.get(..*src_len)) {
+                        d.copy_from_slice(s);
+                        slot.1 = *src_len;
+                        search_count += 1;
+                    }
+                }
+            }
+            eff_mask
+        };
 
         let mut name_buf = [0u8; 320];
         for &str_off in needed_offs.get(..needed_count).unwrap_or(&[]) {
             let Some(at) = strtab_file_off.checked_add(str_off) else {
                 continue;
             };
-            let n = pread(elf_fd.fd(), &mut name_buf, at)
+            let n = pread(elf_fd, &mut name_buf, at)
                 .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_NEEDED)", code: errno.raw() })?;
             let raw = name_buf.get(..n).unwrap_or(&[]);
             let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -377,7 +477,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
                         code: 2,
                     });
                 }
-                if !try_grant_and_enqueue_lib(ruleset, b"", exp_slice, NIX_LD_DIR, plan, &mut queue, &mut q_len)? {
+                if !try_grant_and_enqueue_lib(ruleset, b"", exp_slice, child_rpath_mask, NIX_LD_DIR, plan, &mut queue, q_head, &mut q_len)? {
                     return Err(Fault::Host {
                         call: "landlock (NixOS ELF path-bearing DT_NEEDED not found)",
                         code: 2,
@@ -388,10 +488,12 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helpe
                     ruleset,
                     soname,
                     search_dirs.get(..search_count).unwrap_or(&[]),
+                    child_rpath_mask,
                     NIX_LD_DIR,
                     glibc_dir,
                     plan,
                     &mut queue,
+                    q_head,
                     &mut q_len,
                 )?;
             }
@@ -593,9 +695,33 @@ fn is_authorized_nix_dep_path(path: &[u8], nix_ld_dir: &[u8], plan: &Plan<'_>) -
     false
 }
 
+fn intern_rpath_dir(dir: &[u8], pool: &mut [([u8; 320], usize); 16], pool_len: &mut usize) -> Result<u16, Fault> {
+    for idx in 0..*pool_len {
+        if let Some((buf, len)) = pool.get(idx)
+            && *len == dir.len()
+            && buf.get(..*len) == Some(dir)
+        {
+            return Ok(1u16 << idx);
+        }
+    }
+    let idx = *pool_len;
+    let Some(slot) = pool.get_mut(idx) else {
+        return Err(Fault::Host { call: "landlock (NixOS ELF inherited DT_RPATH pool exceeds cap)", code: 7 });
+    };
+    let Some(dst) = slot.0.get_mut(..dir.len()) else {
+        return Err(Fault::Host { call: "landlock (NixOS ELF RPATH entry exceeds path cap)", code: 36 });
+    };
+    dst.copy_from_slice(dir);
+    slot.1 = dir.len();
+    *pool_len += 1;
+    Ok(1u16 << idx)
+}
+
 fn enqueue_nix_resolved_path<const N: usize>(
     raw: &[u8],
-    queue: &mut [([u8; 320], usize); N],
+    rpath_mask: u16,
+    queue: &mut [([u8; 320], usize, u16); N],
+    q_head: usize,
     q_len: &mut usize,
 ) -> Result<(), Fault> {
     let mut resolved = [0u8; 320];
@@ -612,44 +738,77 @@ fn enqueue_nix_resolved_path<const N: usize>(
         return Ok(());
     }
     let slice = resolved.get(..len).unwrap_or(&[]);
-    let seen = queue
-        .get(..*q_len)
-        .is_some_and(|used| used.iter().any(|(b, l)| *l == len && b.get(..*l) == Some(slice)));
-    if seen {
+    enqueue_nix_canonical_slice(slice, rpath_mask, queue, q_head, q_len)
+}
+
+fn enqueue_nix_canonical_slice<const N: usize>(
+    slice: &[u8],
+    rpath_mask: u16,
+    queue: &mut [([u8; 320], usize, u16); N],
+    q_head: usize,
+    q_len: &mut usize,
+) -> Result<(), Fault> {
+    let mut covered_mask = 0u16;
+    let mut pending_idx = None;
+    let mut seen_any = false;
+    for idx in 0..*q_len {
+        if let Some((b, l, m)) = queue.get(idx)
+            && *l == slice.len()
+            && b.get(..*l) == Some(slice)
+        {
+            seen_any = true;
+            covered_mask |= *m;
+            if idx >= q_head {
+                pending_idx = Some(idx);
+            }
+        }
+    }
+    let missing_bits = rpath_mask & !covered_mask;
+    if seen_any && missing_bits == 0 {
+        return Ok(());
+    }
+    if let Some(idx) = pending_idx
+        && let Some(slot) = queue.get_mut(idx)
+    {
+        slot.2 |= missing_bits;
         return Ok(());
     }
     let Some(slot) = queue.get_mut(*q_len) else {
         return Err(Fault::Host { call: "landlock (NixOS ELF transitive closure exceeds cap)", code: 7 });
     };
-    if let (Some(d), Some(s)) = (slot.0.get_mut(..len), resolved.get(..len)) {
-        d.copy_from_slice(s);
-        slot.1 = len;
-        *q_len += 1;
-    }
+    let Some(dst) = slot.0.get_mut(..slice.len()) else {
+        return Err(Fault::Host { call: "landlock (NixOS ELF library path exceeds cap)", code: 36 });
+    };
+    dst.copy_from_slice(slice);
+    slot.1 = slice.len();
+    slot.2 = if seen_any { missing_bits } else { rpath_mask };
+    *q_len += 1;
     Ok(())
 }
 
 fn enqueue_nix_soname<const N: usize>(
     ruleset: Fd,
     soname: &[u8],
-    runpath_dirs: &[([u8; 320], usize)],
+    search_dirs: &[([u8; 320], usize)],
+    child_rpath_mask: u16,
     nix_ld_dir: &[u8],
     glibc_dir: Option<&[u8]>,
     plan: &Plan<'_>,
-    queue: &mut [([u8; 320], usize); N],
+    queue: &mut [([u8; 320], usize, u16); N],
+    q_head: usize,
     q_len: &mut usize,
 ) -> Result<(), Fault> {
-    for (dir_buf, dir_len) in runpath_dirs {
+    for (dir_buf, dir_len) in search_dirs {
         let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
-        if try_grant_and_enqueue_lib(ruleset, dir, soname, nix_ld_dir, plan, queue, q_len)? {
+        if try_grant_and_enqueue_lib(ruleset, dir, soname, child_rpath_mask, nix_ld_dir, plan, queue, q_head, q_len)? {
             return Ok(());
         }
     }
-    if try_grant_and_enqueue_lib(ruleset, nix_ld_dir, soname, nix_ld_dir, plan, queue, q_len)? {
+    if try_grant_and_enqueue_lib(ruleset, nix_ld_dir, soname, child_rpath_mask, nix_ld_dir, plan, queue, q_head, q_len)? {
         return Ok(());
     }
     if let Some(dir) = glibc_dir {
-        let _ = try_grant_and_enqueue_lib(ruleset, dir, soname, nix_ld_dir, plan, queue, q_len)?;
+        let _ = try_grant_and_enqueue_lib(ruleset, dir, soname, child_rpath_mask, nix_ld_dir, plan, queue, q_head, q_len)?;
     }
     Ok(())
 }
@@ -658,9 +817,11 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     ruleset: Fd,
     dir_prefix: &[u8],
     soname: &[u8],
+    child_rpath_mask: u16,
     nix_ld_dir: &[u8],
     plan: &Plan<'_>,
-    queue: &mut [([u8; 320], usize); N],
+    queue: &mut [([u8; 320], usize, u16); N],
+    q_head: usize,
     q_len: &mut usize,
 ) -> Result<bool, Fault> {
     let mut candidate = [0u8; 320];
@@ -698,22 +859,7 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     }
     let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
     landlock_add_rule_path(ruleset, &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule (nix runtime file)", code: errno.raw() })?;
-    let already = queue
-        .get(..*q_len)
-        .unwrap_or(&[])
-        .iter()
-        .any(|(b, l)| b.get(..*l) == Some(res_slice));
-    if !already {
-        let Some(slot) = queue.get_mut(*q_len) else {
-            return Err(Fault::Host { call: "landlock (NixOS ELF transitive closure exceeds cap)", code: 7 });
-        };
-        let Some(dst) = slot.0.get_mut(..res_slice.len()) else {
-            return Err(Fault::Host { call: "landlock (NixOS ELF library path exceeds cap)", code: 36 });
-        };
-        dst.copy_from_slice(res_slice);
-        slot.1 = res_slice.len();
-        *q_len += 1;
-    }
+    enqueue_nix_canonical_slice(res_slice, child_rpath_mask, queue, q_head, q_len)?;
     Ok(true)
 }
 
@@ -804,9 +950,10 @@ impl Confiner for Landlock {
         let Program::Stored { path, .. } = spec.program() else {
             return Err(Fault::RecordsNeedExecution);
         };
-        let prepared = prepare(plan, spec.budget(), spec.starts_programs())?;
-        // `prepared` (the ruleset descriptor, the filter, the limits) lives until the start
-        // returns, by which time the child has exec'd (CLONE_VFORK) and holds its own domain.
+        let prepared = prepare_with_exec(plan, spec.budget(), spec.starts_programs(), spec.verified_exec_fd())?;
+        // `prepared` (the ruleset descriptor, the filter, the limits, and any verified exec fd)
+        // lives until the start returns, by which time the child has exec'd (CLONE_VFORK) and
+        // holds its own domain.
         spawner.start_confined(cx, &run_spec(path, spec.args(), start, streams), &prepared.confine()).map_err(Fault::Run)
     }
 
@@ -823,15 +970,16 @@ mod nix_closure_tests {
 
     #[test]
     fn nix_elf_closure_queue_cap_refuses_instead_of_truncating() {
-        let mut queue = [([0u8; 320], 0usize); 2];
+        let mut queue = [([0u8; 320], 0usize, 0u16); 2];
         let mut q_len = 0usize;
-        enqueue_nix_resolved_path(b"/nix/store/aaa-liba/lib/liba.so", &mut queue, &mut q_len).expect("slot 0");
-        enqueue_nix_resolved_path(b"/nix/store/bbb-libb/lib/libb.so", &mut queue, &mut q_len).expect("slot 1");
-        // Duplicate already-seen path still succeeds cleanly.
-        enqueue_nix_resolved_path(b"/nix/store/aaa-liba/lib/liba.so", &mut queue, &mut q_len).expect("dup");
+        enqueue_nix_resolved_path(b"/nix/store/aaa-liba/lib/liba.so", 0b01, &mut queue, 0, &mut q_len).expect("slot 0");
+        enqueue_nix_resolved_path(b"/nix/store/bbb-libb/lib/libb.so", 0b01, &mut queue, 0, &mut q_len).expect("slot 1");
+        // Duplicate already-seen path merges inherited DT_RPATH bits in place when still pending.
+        enqueue_nix_resolved_path(b"/nix/store/aaa-liba/lib/liba.so", 0b10, &mut queue, 0, &mut q_len).expect("dup merge");
         assert_eq!(q_len, 2);
+        assert_eq!(queue[0].2, 0b11);
         // Distinct path past cap MUST fail with named Fault::Host rather than silently dropping.
-        let err = enqueue_nix_resolved_path(b"/nix/store/ccc-libc/lib/libc.so", &mut queue, &mut q_len)
+        let err = enqueue_nix_resolved_path(b"/nix/store/ccc-libc/lib/libc.so", 0, &mut queue, 0, &mut q_len)
             .expect_err("must refuse when queue cap is exceeded");
         assert!(matches!(err, Fault::Host { code: 7, .. }));
     }

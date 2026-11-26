@@ -557,13 +557,20 @@ fn flag_takes_value(arg: &str) -> bool {
     )
 }
 
-/// Whether `arg` (and optional `next`) requests host CPU auto-detection or profile feedback not
-/// determined at `Level::Inputs` (`-march=native`, `-mcpu=native`, `-mtune=native`,
-/// `--target=native`, `-Xarch_host`, `-fprofile-*`).
+/// Whether `arg` (and optional `next`) requests host CPU auto-detection or profile feedback input
+/// not determined at `Level::Inputs` (`-march=native`, `-mcpu=native`, `-mtune=native`,
+/// `--target=native`, `-Xarch_host`, `-fprofile-use*`, `-fprofile-instr-use*`,
+/// `-fprofile-sample-use*`, `-fprofile-remapping-file*`, `-fauto-profile*`). Deterministic
+/// instrumentation-generation flags such as `-fprofile-instr-generate` and `-fprofile-arcs` are
+/// allowed in flag-support probes.
 fn is_host_dependent_flag(arg: &str, next: Option<&str>) -> bool {
     if matches!(arg, "-march=native" | "-mcpu=native" | "-mtune=native" | "--target=native")
         || arg.starts_with("-Xarch_host")
-        || arg.starts_with("-fprofile-")
+        || arg.starts_with("-fprofile-use")
+        || arg.starts_with("-fprofile-instr-use")
+        || arg.starts_with("-fprofile-sample-use")
+        || arg.starts_with("-fprofile-remapping-file")
+        || arg.starts_with("-fauto-profile")
     {
         return true;
     }
@@ -761,10 +768,15 @@ fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
             }
         }
     }
-    if contains_ident(text, "__has_include")
+    if text.contains("##")
+        || text.contains("%:%:")
+        || contains_ident(text, "__has_include")
         || contains_ident(text, "__has_include_next")
         || contains_ident(text, "__has_embed")
         || contains_ident(text, "_Pragma")
+        || contains_ident(text, "asm")
+        || contains_ident(text, "__asm")
+        || contains_ident(text, "__asm__")
     {
         return Some(ProbeWhy::PackageInput);
     }

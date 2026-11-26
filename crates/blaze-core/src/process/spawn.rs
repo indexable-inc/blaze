@@ -700,10 +700,28 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
             unsafe { libc::_exit(crate::exit::Exit::ExecFailed.code()) }
         }
     }
-    // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
-    // all kept by the parent until the program runs. Async-signal-safe; on success the child
-    // leaves the shared memory and the parent runs again.
-    unsafe { libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr()) };
+    if let Some(exec_fd) = child.confine.and_then(|c| c.exec_fd) {
+        // SAFETY: `exec_fd` is an open `O_RDONLY | O_CLOEXEC` descriptor kept alive by the parent
+        // across `CLONE_VFORK`, and `argv`/`envp` are NULL-terminated arrays of NUL-terminated
+        // strings kept by the parent. `SYS_execveat` with `AT_EMPTY_PATH` is a single raw syscall
+        // (async-signal-safe) that launches the exact verified inode without reopening `program`
+        // by path; on success the child leaves shared memory and the kernel closes `exec_fd`.
+        let _ = unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                exec_fd.raw(),
+                c"".as_ptr(),
+                child.plan.argv.as_ptr(),
+                child.plan.envp.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+    } else {
+        // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
+        // all kept by the parent until the program runs. Async-signal-safe; on success the child
+        // leaves the shared memory and the parent runs again.
+        unsafe { libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr()) };
+    }
     fail(child, 4)
 }
 

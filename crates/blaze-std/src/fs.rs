@@ -1273,6 +1273,8 @@ impl<#[blaze::linear] P: Rights, S: Scope> Clone for Dir<P, S> {
     }
 }
 
+impl<#[blaze::linear] P: Rights, S: Scope> blaze_own::Share for Dir<P, S> {}
+
 impl<#[blaze::linear] P: Rights, S: Scope> fmt::Debug for Dir<P, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rights = if P::WRITE { "ReadWrite" } else { "ReadOnly" };
@@ -1422,6 +1424,15 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         };
         // clone: the quota shared, a refcount.
         Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+
+    /// The world it is in: for deriving sibling capabilities (clock, spawner, contexts) from an
+    /// already-open directory capability without creating a second native world outside a context.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn world(&self) -> &Io {
+        &self.io
     }
 
     /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).

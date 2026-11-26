@@ -56,10 +56,10 @@ mod native;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
-/// Source bytes of the complete hermetic runner and OS confinement backends so callers can derive
-/// content-addressed runner identities directly from the full implementation (AGENTS.md rule 69).
+/// Source bytes of the hermetic runner and process-launch modules in `blaze-std` (AGENTS.md rule 69).
 pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("../procs.rs"),
+    include_bytes!("linked/run.rs"),
     include_bytes!("hermetic.rs"),
     include_bytes!("hermetic/execution.rs"),
     include_bytes!("hermetic/machine.rs"),
@@ -69,6 +69,130 @@ pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("hermetic/landlock.rs"),
     include_bytes!("hermetic/seatbelt.rs"),
 ];
+
+/// Complete transitive runner/launcher/confinement implementation source bytes across `blaze-std`,
+/// `blaze-core`, and `blaze-sys` so content-addressed runner keys roll on any change to argument,
+/// environment, stream, spawn, or confinement code (AGENTS.md rule 69).
+pub const TRANSITIVE_CONFINEMENT_SOURCE: &[&[&[u8]]] = &[
+    CONFINEMENT_SOURCE,
+    blaze_core::SPAWN_SOURCE,
+    blaze_sys::CONFINEMENT_SOURCE,
+];
+
+/// File metadata stamp of a verified executable inode (device, inode, size, mtime, ctime).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VerifiedStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub modified_ns: i128,
+    pub changed_ns: i128,
+}
+
+/// A pre-opened executable descriptor on Linux (`O_RDONLY | O_CLOEXEC`) bound to a single kernel
+/// inode so verification (SHA-256) and execution (`execveat(..., AT_EMPTY_PATH)` + Landlock) act
+/// on the exact same inode with zero path-reopen TOCTOU.
+#[cfg(target_os = "linux")]
+pub struct VerifiedExec {
+    fd: blaze_sys::linux::OwnedFd,
+    stamp: VerifiedStamp,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedExec {
+    /// Opens `path` read-only (`O_CLOEXEC`), checks `cx` before starting, verifies it is a regular
+    /// file via `statx(fd, "", AT_EMPTY_PATH, BASIC)`, and returns the bound handle and stamp.
+    pub fn open(cx: &Cx, path: &str) -> Result<VerifiedExec, VerifiedExecError> {
+        cx.check().map_err(VerifiedExecError::Stopped)?;
+        let bytes = path.as_bytes();
+        if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= 4096 {
+            return Err(VerifiedExecError::BadPath);
+        }
+        let mut buf = [0u8; 4096];
+        if let Some(dst) = buf.get_mut(..bytes.len()) {
+            dst.copy_from_slice(bytes);
+        }
+        let Ok(cstr) = core::ffi::CStr::from_bytes_until_nul(buf.get(..=bytes.len()).unwrap_or(&[0])) else {
+            return Err(VerifiedExecError::BadPath);
+        };
+        let fd = blaze_sys::linux::openat(
+            blaze_sys::linux::CWD,
+            blaze_sys::Path::new(cstr),
+            blaze_sys::linux::OpenFlags::CLOSE_ON_EXEC,
+            0,
+        )
+        .map_err(|errno| VerifiedExecError::Os { call: "openat", errno })?;
+        let st = blaze_sys::linux::statx(
+            fd.fd(),
+            blaze_sys::Path::EMPTY,
+            blaze_sys::linux::AtFlags::EMPTY_PATH,
+            blaze_sys::linux::StatxMask::BASIC,
+        )
+        .map_err(|errno| VerifiedExecError::Os { call: "statx", errno })?;
+        if st.mode & blaze_sys::linux::Statx::TYPE_MASK != blaze_sys::linux::Statx::REGULAR {
+            return Err(VerifiedExecError::NotRegular);
+        }
+        let dev = (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor);
+        let modified_ns = i128::from(st.mtime.sec) * 1_000_000_000 + i128::from(st.mtime.nsec);
+        let changed_ns = i128::from(st.ctime.sec) * 1_000_000_000 + i128::from(st.ctime.nsec);
+        Ok(VerifiedExec {
+            fd,
+            stamp: VerifiedStamp { dev, ino: st.ino, len: st.size, modified_ns, changed_ns },
+        })
+    }
+
+    /// The kernel metadata stamp of the opened inode.
+    pub fn stamp(&self) -> VerifiedStamp {
+        self.stamp
+    }
+
+    /// Streams the entire opened inode in bounded 64 KiB chunks into `on_chunk`, checking `cx`
+    /// before every chunk so cancellation or deadline expiry aborts promptly.
+    pub fn stream_chunks(&self, cx: &Cx, mut on_chunk: impl FnMut(&[u8])) -> Result<(), VerifiedExecError> {
+        let mut buf = [0u8; 64 << 10];
+        let mut offset = 0u64;
+        loop {
+            cx.check().map_err(VerifiedExecError::Stopped)?;
+            let n = blaze_sys::linux::pread(self.fd.fd(), &mut buf, offset)
+                .map_err(|errno| VerifiedExecError::Os { call: "pread", errno })?;
+            if n == 0 {
+                break;
+            }
+            if let Some(chunk) = buf.get(..n) {
+                on_chunk(chunk);
+            }
+            let step = u64::try_from(n).map_err(|_| VerifiedExecError::BadPath)?;
+            offset = offset.checked_add(step).ok_or(VerifiedExecError::BadPath)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn fd(&self) -> blaze_sys::Fd {
+        self.fd.fd()
+    }
+}
+
+/// Why opening or streaming a [`VerifiedExec`] failed.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum VerifiedExecError {
+    BadPath,
+    NotRegular,
+    Stopped(crate::Stopped),
+    Os { call: &'static str, errno: blaze_sys::Errno },
+}
+
+#[cfg(target_os = "linux")]
+impl core::fmt::Display for VerifiedExecError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            VerifiedExecError::BadPath => f.write_str("invalid executable path"),
+            VerifiedExecError::NotRegular => f.write_str("executable path is not a regular file"),
+            VerifiedExecError::Stopped(s) => write!(f, "stopped: {s}"),
+            VerifiedExecError::Os { call, errno } => write!(f, "{call} failed (errno {})", errno.raw()),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;
@@ -197,6 +321,8 @@ pub struct HermeticSpec<'a> {
     streams: HermeticStreams,
     level: Level,
     report: ReportSpec<'a>,
+    #[cfg(target_os = "linux")]
+    verified_exec_fd: Option<blaze_sys::Fd>,
 }
 
 /// The fields of a [`HermeticSpec`], every one required.
@@ -313,7 +439,23 @@ impl<'a> HermeticSpec<'a> {
             streams: opts.streams,
             level: opts.level,
             report: opts.report,
+            #[cfg(target_os = "linux")]
+            verified_exec_fd: None,
         })
+    }
+
+    /// Binds this spec to a pre-opened, pre-verified executable inode on Linux so Landlock and
+    /// `execveat(..., AT_EMPTY_PATH)` act on that exact descriptor without reopening `program`
+    /// by path.
+    #[cfg(target_os = "linux")]
+    pub fn with_verified_exec(mut self, exec: &VerifiedExec) -> Self {
+        self.verified_exec_fd = Some(exec.fd());
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn verified_exec_fd(&self) -> Option<blaze_sys::Fd> {
+        self.verified_exec_fd
     }
 
     pub fn program(&self) -> Program<'a> {

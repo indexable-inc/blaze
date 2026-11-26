@@ -629,7 +629,7 @@ impl<'f> Scripts<'f> {
             let id_str = core::str::from_utf8(&sdk_hex).unwrap_or("");
             (sdk.folder(), id_str)
         });
-        let c_probes = blaze_proc_macro::probe_clang::open_command_c_probes(home, host, sdk_pair, &store, alloc);
+        let c_probes = blaze_proc_macro::probe_clang::open_command_c_probes(cx, &env.fs, home, host, sdk_pair, alloc);
         let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, c_probes, native, no_sdk, graph_record }, frame));
         Ok(shared)
     }
