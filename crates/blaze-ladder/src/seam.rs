@@ -379,6 +379,16 @@ pub trait FrontEnd {
     fn opaque_of(&self, _opaque: ItemKey) -> Option<(ItemKey, u32)> {
         None
     }
+    /// If `opaque` is an RPITIT default-body twin (`rpitit::default_key`), returns the source
+    /// opaque key stored in `store.opaques` and `done.hidden`; otherwise returns `opaque`.
+    fn opaque_filed(&self, opaque: ItemKey) -> ItemKey {
+        opaque
+    }
+    /// Ensures the defining head (and RPITIT default row, if a twin) for `opaque` is loaded in
+    /// the front end's store. Returns `Ok(true)` if new state was loaded.
+    fn opaque_head(&mut self, _opaque: ItemKey) -> Result<bool, crate::run::RunError> {
+        Ok(false)
+    }
     /// The fn that defines the `impl Trait` types of type alias `alias` (an [`Self::opaque_of`]
     /// owner whose index is an alias's: front2 tait.rs `of_alias`), by its checker key: the fn
     /// whose check record holds their hidden types (front2 tait.rs `defining_fn`, the

@@ -2436,6 +2436,7 @@ fn build_from<P: FrontEnd>(
     };
     let mut tables = Tables { refs: Vec::new_in(Global), images: Vec::new_in(Global) };
     let mut layouts = Layouts::new_in(alloc);
+    let query_cache = core::cell::RefCell::new(make_one::QueryCache::new_in(alloc));
     if let Some(main) = entry {
         let root_inst = if test_report_entry {
             blaze_build::test_report_shim_instance(program.function(main).key, &mut ground)
@@ -2760,7 +2761,7 @@ fn build_from<P: FrontEnd>(
                     }
                 };
                 if !coro_roots.is_empty() {
-                    match lay_states::lay_only(&*program_mut, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, i, &coro_roots, alloc) {
+                    match lay_states::lay_only(&*program_mut, &consts, &langs, &checked_bodies, &query_cache, &mut ground, &mut layouts, i, &coro_roots, alloc) {
                         Ok(lay_states::LaidOnly::Done(recorded)) => laid_for_const = recorded,
                         Ok(lay_states::LaidOnly::Unchecked(owner)) => {
                             filed(&mut survey, lay_states::unchecked_owner(&*program_mut, i, owner))?;
@@ -2962,7 +2963,7 @@ fn build_from<P: FrontEnd>(
                     let coro_roots = crate::front2::coroutine_needs::referenced_coroutines(ground, &need_tys, &ofacts, alloc)
                         .map_err(|error| RunError::Build { function: program_mut.function(ci).named(), error, range: None })?;
                     if !coro_roots.is_empty() {
-                        match lay_states::lay_only(&*program_mut, &consts, &langs, checked_bodies, ground, layouts, ci, &coro_roots, alloc)? {
+                        match lay_states::lay_only(&*program_mut, &consts, &langs, checked_bodies, &query_cache, ground, layouts, ci, &coro_roots, alloc)? {
                             lay_states::LaidOnly::Done(recorded) => laid_for_const = recorded,
                             lay_states::LaidOnly::Unchecked(u) => return Ok(Some(u)),
                         }
@@ -2993,7 +2994,7 @@ fn build_from<P: FrontEnd>(
                     // into its state (run/lay_states.rs).
                     let mut rounds = 0usize;
                     let laid_res: Result<Option<ItemKey>, RunError> = loop {
-                        let laid = lay_states::lay_and_build(&*program_mut, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &[of], false, alloc);
+                        let laid = lay_states::lay_and_build(&*program_mut, &consts, &langs, &checked_bodies, &query_cache, &mut ground, &mut layouts, &mut coroutine_stash, i, &[of], false, alloc);
                         match laid {
                             Ok(lay_states::Lay::Done) => break Ok(None),
                             Ok(lay_states::Lay::Unchecked(owner)) => break Ok(Some(owner)),
@@ -3050,7 +3051,7 @@ fn build_from<P: FrontEnd>(
             if !roots.is_empty() {
                 let mut rounds = 0usize;
                 let laid_res: Result<Option<ItemKey>, RunError> = loop {
-                    let laid = lay_states::lay_and_build(&*program_mut, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &roots, false, alloc);
+                    let laid = lay_states::lay_and_build(&*program_mut, &consts, &langs, &checked_bodies, &query_cache, &mut ground, &mut layouts, &mut coroutine_stash, i, &roots, false, alloc);
                     match laid {
                         Ok(lay_states::Lay::Done) => break Ok(None),
                         Ok(lay_states::Lay::Unchecked(owner)) => break Ok(Some(owner)),

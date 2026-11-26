@@ -144,6 +144,17 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         for &callee in checked.callees.column::<1>() {
             self.callee_row(callee)?;
         }
+        // Any opaque type named by the body's checked types (including RPITIT default twins
+        // `rpitit::default_key` or opaques whose owner was not a direct callee when the body
+        // was read from a typed record): ensure its defining head and RPITIT default row exist.
+        for n in checked.types.view().nodes() {
+            if let tc::PNode::Opaque(k, _) = *n {
+                let filed = crate::front2::rpitit::filed_as(&self.store, k);
+                if !self.store.opaques.contains_key(&filed) {
+                    self.ensure_opaque(k)?;
+                }
+            }
+        }
         self.async_rows(&made)?;
         self.closure_rows(checked)?;
         self.fmt_rows(&made, fmt_owner, function)?;
@@ -1100,6 +1111,137 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         // check_body already read this overlay over this very store. Both head columns
         // are append-only and the store is never replaced.
         live.made.tys.view(&self.store.tys).expect("a checked body's head prefix must still exist")
+    }
+
+    /// Ensures the defining head (and RPITIT default twin row, if `opaque` is an
+    /// `rpitit::default_key`) for `opaque` is loaded into `self.store`. Returns `Ok(true)` if new
+    /// state was loaded and `opaque` is now resolvable via `opaque_of`.
+    pub(super) fn ensure_opaque(&mut self, opaque: ItemKey) -> Result<bool, LazyRefusal> {
+        let already = |store: &crate::front2::heads::Store<'_>| {
+            let filed = crate::front2::rpitit::filed_as(store, opaque);
+            store.opaques.contains_key(&filed)
+        };
+        if already(&self.store) {
+            return Ok(false);
+        }
+        // Fast path: `opaque` is an RPITIT default twin whose source opaque is already loaded.
+        let twin_owner = self
+            .store
+            .opaques
+            .iter()
+            .find_map(|(&o, &(owner, _))| (crate::front2::rpitit::default_key(o) == opaque).then_some(owner));
+        if let Some(owner) = twin_owner {
+            self.ensure_rpitit_for_member(owner)?;
+            return Ok(already(&self.store));
+        }
+        // Locate `opaque`'s crate from its 8-byte crate prefix (`keys::opaque_key` /
+        // `rpitit::default_key` preserve the defining fn/alias's crate prefix).
+        let names = self.front.names;
+        let mut whole = [0u8; 32];
+        if let Some(head) = whole.get_mut(..16) {
+            head.copy_from_slice(&opaque.0.to_be_bytes());
+        }
+        let Some(krate) = names.crate_of(LibKey(blaze_ids::ContentId(whole))) else {
+            return Ok(false);
+        };
+        // Check free fns & type aliases in `krate`.
+        let mut free_hit: Option<(LibKey, ItemKey, bool)> = None;
+        let _ = names.each_item(krate, &mut |lib, _| {
+            if free_hit.is_some() {
+                return;
+            }
+            let Some(kind) = names.kind_of_item(lib) else { return };
+            let is_alias = match kind {
+                blaze_surface::ItemKind::Function => false,
+                blaze_surface::ItemKind::TypeAlias => true,
+                _ => return,
+            };
+            let fk = checker_of(lib);
+            for idx in 0u32..4 {
+                let ok = crate::front2::keys::opaque_key(fk, idx);
+                if ok == opaque {
+                    free_hit = Some((lib, fk, is_alias));
+                    return;
+                }
+            }
+        });
+        if let Some((lib, fk, is_alias)) = free_hit {
+            if is_alias {
+                self.make_want(Want::Head(lib), fk, "ensure_opaque (type alias)")?;
+            } else {
+                self.head_row_key(fk)?;
+            }
+            return Ok(already(&self.store));
+        }
+        // Check member fns (traits and impls) in `krate` via the cached per-crate member index.
+        let _ = self.member_index(krate)?;
+        let member_hit = self.member_rows.get(&krate).and_then(|ix| {
+            ix.rows.iter().find_map(|(&fk, row)| {
+                let row = (*row)?;
+                if row.kind != MemberKind::Fn {
+                    return None;
+                }
+                for idx in 0u32..4 {
+                    let ok = crate::front2::keys::opaque_key(fk, idx);
+                    if ok == opaque {
+                        return Some((fk, false));
+                    }
+                    if crate::front2::rpitit::default_key(ok) == opaque {
+                        return Some((fk, true));
+                    }
+                }
+                None
+            })
+        });
+        if let Some((fk, is_twin)) = member_hit {
+            self.head_row_key(fk)?;
+            if is_twin {
+                self.ensure_rpitit_for_member(fk)?;
+            }
+            return Ok(already(&self.store));
+        }
+        Ok(false)
+    }
+
+    /// Populates `store.rpitit_traits` and `store.rpitit_defaults` for the trait owning member
+    /// fn `fk`, if `fk` is a trait member whose trait has RPITIT rows.
+    fn ensure_rpitit_for_member(&mut self, fk: ItemKey) -> Result<(), LazyRefusal> {
+        let Some(Origin::Member { container, kind: MemberKind::Fn, .. }) = self.front.keys.origin(fk) else {
+            return Ok(());
+        };
+        let trait_ck = *container;
+        if self.store.rpitit_traits.contains_key(&trait_ck) {
+            return Ok(());
+        }
+        let Some(lib) = self.front.keys.library_in(self.front.names, trait_ck) else {
+            return Ok(());
+        };
+        if !matches!(self.front.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait)) {
+            return Ok(());
+        }
+        if !self.store.maps.traits.contains_key(&lib) {
+            self.make_want(Want::Head(lib), trait_ck, "ensure_rpitit_for_member (trait head)")?;
+        }
+        if !self.store.trait_defs.contains_key(&trait_ck) {
+            self.make_want(Want::Members(lib), trait_ck, "ensure_rpitit_for_member (trait members)")?;
+        }
+        if !self.store.maps.traits.get(&lib).is_some_and(crate::front2::rpitit::may_have_rows) {
+            return Ok(());
+        }
+        for _ in 0..256 {
+            let step = {
+                let Some(t) = self.store.maps.traits.get(&lib) else { return Ok(()) };
+                let Some(extra) = self.store.trait_defs.get(&trait_ck) else { return Ok(()) };
+                match crate::front2::rpitit::trait_rows(&self.store, trait_ck, t, &extra.assoc) {
+                    Ok(_) => None,
+                    Err(crate::front2::rpitit::Need::Fn(need_fk)) => Some(need_fk),
+                    Err(crate::front2::rpitit::Need::Refused(..)) => None,
+                }
+            };
+            let Some(need_fk) = step else { break };
+            self.head_row_key(need_fk)?;
+        }
+        Ok(())
     }
 
     fn keep_body(&mut self, i: usize, made: Body<'n>, function: &str) -> Result<(), LazyRefusal> {

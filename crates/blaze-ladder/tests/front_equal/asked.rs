@@ -384,6 +384,14 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
+    fn opaque_filed(&self, opaque: ItemKey) -> ItemKey {
+        self.inner.opaque_filed(opaque)
+    }
+
+    fn opaque_head(&mut self, opaque: ItemKey) -> Result<bool, blaze_ladder::run::RunError> {
+        self.inner.opaque_head(opaque)
+    }
+
     fn alias_definer(&self, alias: ItemKey) -> Result<ItemKey, blaze_ladder::front2::tait::DefinerMiss> {
         let r = self.inner.alias_definer(alias);
         self.note(format_args!("alias_definer {alias:?}"), |o| write!(o, "{r:?}"));

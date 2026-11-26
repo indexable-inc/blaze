@@ -642,7 +642,16 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> {
-        self.store.opaques.get(&opaque).copied()
+        let filed = crate::front2::rpitit::filed_as(&self.store, opaque);
+        self.store.opaques.get(&filed).copied()
+    }
+
+    fn opaque_filed(&self, opaque: ItemKey) -> ItemKey {
+        crate::front2::rpitit::filed_as(&self.store, opaque)
+    }
+
+    fn opaque_head(&mut self, opaque: ItemKey) -> Result<bool, crate::run::RunError> {
+        self.ensure_opaque(opaque).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
     }
 
     fn alias_definer(&self, alias: ItemKey) -> Result<ItemKey, crate::front2::tait::DefinerMiss> {

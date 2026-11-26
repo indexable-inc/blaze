@@ -531,19 +531,21 @@ impl SmallArgs {
 }
 
 /// Memoization cache for pure ground-type front-end queries over `Work::ground`.
-struct QueryCache {
+pub(super) struct QueryCache {
     alloc: Alloc<'static>,
     normalize: blaze_hash::HashMap<(ItemKey, blaze_typeck::Name, SmallArgs), PTy, Alloc<'static>>,
+    opaque_hidden: blaze_hash::HashMap<(ItemKey, SmallArgs), PTy, Alloc<'static>>,
     drop_impl: blaze_hash::HashMap<ItemKey, Option<ItemKey>, Alloc<'static>>,
     resolve: blaze_hash::HashMap<(ItemKey, List), (ItemKey, List), Alloc<'static>>,
     track_caller: blaze_hash::HashMap<ItemKey, bool, Alloc<'static>>,
 }
 
 impl QueryCache {
-    fn new_in(alloc: Alloc<'static>) -> Self {
+    pub(super) fn new_in(alloc: Alloc<'static>) -> Self {
         Self {
             alloc,
             normalize: blaze_hash::HashMap::new_in(alloc),
+            opaque_hidden: blaze_hash::HashMap::new_in(alloc),
             drop_impl: blaze_hash::HashMap::new_in(alloc),
             resolve: blaze_hash::HashMap::new_in(alloc),
             track_caller: blaze_hash::HashMap::new_in(alloc),
@@ -1006,7 +1008,15 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // checked body's types. Read from the ground tree, not by the program's rows: a lazy front
     // end has no row for an owner until it is checked (front2/program/lazy `fn_index`), so a
     // filter by row skipped `rand::rngs::thread::rng` for `LocalKey::try_with` at its closure.
-    let Held { owners, items, objects } = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    let Held { owners, items, objects, missing_opaques } = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    for &opaque in missing_opaques.iter() {
+        if program.opaque_head(opaque)?
+            && let Some(Ok(owner)) = program.opaque_definer(opaque)
+            && owner != tabled
+        {
+            state.ensure(program, typing, owner, checks)?;
+        }
+    }
     // Each `dyn` principal the arguments hold: its object table asked by name BEFORE the build
     // (D194, D197): core's `<&mut F as FnMut>::call_mut` at `F = dyn FnMut(..)` reads the table
     // of a trait no body of this instance names, which before came only from the check of the
@@ -1090,24 +1100,16 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
                     return Err(unchecked_owner(&*program, build_i, owner));
                 }
             }
-            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner, .. }, .. })
+            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
                 if pull_owners < MOST_HELD_COROUTINES
-                    && match state.asked.binary_search_by_key(&owner, |r| r.0) {
-                        Err(_) => true,
-                        Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
-                    } =>
+                    && (opaque == owner
+                        || match state.asked.binary_search_by_key(&owner, |r| r.0) {
+                            Err(_) => true,
+                            Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
+                        }) =>
             {
                 pull_owners += 1;
-                if state.ensure(program, typing, owner, checks)?.is_none() {
-                    let Some(row) = program.head_row(owner)? else {
-                        return Err(unchecked_owner(&*program, build_i, owner));
-                    };
-                    if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
-                        && let Some(entry) = state.asked.get_mut(slot)
-                    {
-                        entry.1 = Some(row);
-                    }
-                }
+                ensure_opaque_owner(program, typing, state, checks, build_i, opaque, owner)?;
             }
             Err(e) if asks_again(&e) && pulled.allow(&e) => {
                 if !program.make_asked(build_i)? {
@@ -1164,24 +1166,16 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
                                     return Err(unchecked_owner(&*program, build_i, co_owner));
                                 }
                             }
-                            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner: op_owner, .. }, .. })
+                            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner: op_owner }, .. })
                                 if pull_owners < MOST_HELD_COROUTINES
-                                    && match state.asked.binary_search_by_key(&op_owner, |r| r.0) {
-                                        Err(_) => true,
-                                        Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(op_owner).is_none(),
-                                    } =>
+                                    && (opaque == op_owner
+                                        || match state.asked.binary_search_by_key(&op_owner, |r| r.0) {
+                                            Err(_) => true,
+                                            Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(op_owner).is_none(),
+                                        }) =>
                             {
                                 pull_owners += 1;
-                                if state.ensure(program, typing, op_owner, checks)?.is_none() {
-                                    let Some(row) = program.head_row(op_owner)? else {
-                                        return Err(unchecked_owner(&*program, build_i, op_owner));
-                                    };
-                                    if let Ok(slot) = state.asked.binary_search_by_key(&op_owner, |r| r.0)
-                                        && let Some(entry) = state.asked.get_mut(slot)
-                                    {
-                                        entry.1 = Some(row);
-                                    }
-                                }
+                                ensure_opaque_owner(program, typing, state, checks, build_i, opaque, op_owner)?;
                             }
                             Err(e) if asks_again(&e) && owner_pulled.allow(&e) => {
                                 if !program.make_asked(owner_i)? {
@@ -1199,24 +1193,16 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
                 }
                 return Err(e);
             }
-            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner, .. }, .. })
+            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
                 if owners < MOST_HELD_COROUTINES
-                    && match state.asked.binary_search_by_key(&owner, |r| r.0) {
-                        Err(_) => true,
-                        Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
-                    } =>
+                    && (opaque == owner
+                        || match state.asked.binary_search_by_key(&owner, |r| r.0) {
+                            Err(_) => true,
+                            Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
+                        }) =>
             {
                 owners += 1;
-                if state.ensure(program, typing, owner, checks)?.is_none() {
-                    let Some(row) = program.head_row(owner)? else {
-                        return Err(unchecked_owner(&*program, build_i, owner));
-                    };
-                    if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
-                        && let Some(entry) = state.asked.get_mut(slot)
-                    {
-                        entry.1 = Some(row);
-                    }
-                }
+                ensure_opaque_owner(program, typing, state, checks, build_i, opaque, owner)?;
             }
             Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                 if program.object_table(t)? {
@@ -1409,6 +1395,7 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
     let mut owners: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
     let mut items: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
     let mut objects: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
+    let mut missing_opaques: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
     let mut seen: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
     let mut todo: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
     todo.extend_from_slice(ground.list(args).map_err(malformed)?);
@@ -1432,8 +1419,18 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
         }
         let owner = match node {
             blaze_typeck::PNode::Closure { owner, .. } | blaze_typeck::PNode::Coroutine { owner, .. } => Some(owner),
-            // Its defining fn (`FrontEnd::opaque_definer`); a miss is the build's refusal.
-            blaze_typeck::PNode::Opaque(opaque, _) => program.opaque_definer(opaque).and_then(Result::ok),
+            // Its defining fn (`FrontEnd::opaque_definer`); if its head is not loaded yet, note
+            // it for `program.opaque_head` before the build.
+            blaze_typeck::PNode::Opaque(opaque, _) => match program.opaque_definer(opaque) {
+                Some(Ok(owner)) => Some(owner),
+                Some(Err(_)) => None,
+                None => {
+                    if !missing_opaques.contains(&opaque) {
+                        missing_opaques.push(opaque);
+                    }
+                    None
+                }
+            },
             _ => None,
         };
         if let Some(owner) = owner
@@ -1444,7 +1441,7 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
         }
         ground.children_of(node, &mut todo).map_err(malformed)?;
     }
-    Ok(Held { owners, items, objects })
+    Ok(Held { owners, items, objects, missing_opaques })
 }
 
 /// What an instance's ground arguments hold that its make must have before its build
@@ -1457,6 +1454,41 @@ struct Held<'a> {
     /// Each `dyn` principal: its object table (`FrontEnd::object_table`), so the build's
     /// vtables and dynamic calls at these arguments find it (D194).
     objects: AVec<'a, ItemKey>,
+    /// Each `Opaque` whose head has not been loaded into the front end yet.
+    missing_opaques: AVec<'a, ItemKey>,
+}
+
+/// Handles `BuildError::OpaqueOwnerUnchecked { opaque, owner }`: when `opaque == owner` and
+/// `program.opaque_of(opaque)` is still `None`, loads the opaque's defining head (and RPITIT
+/// default twin row if applicable) via `FrontEnd::opaque_head`; otherwise ensures `owner`'s
+/// checked body (or head-only row for trait methods without a body).
+fn ensure_opaque_owner<P: FrontEnd, T: Typing<P>>(
+    program: &mut P,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    build_i: usize,
+    opaque: ItemKey,
+    owner: ItemKey,
+) -> Result<(), RunError> {
+    if opaque == owner && program.opaque_of(opaque).is_none() {
+        if !program.opaque_head(opaque)? {
+            let error = BuildError::UnsupportedSig { what: "an `impl Trait` type no fn head of the program made (the seam's `opaque_of`)" };
+            return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
+        }
+        return Ok(());
+    }
+    if state.ensure(program, typing, owner, checks)?.is_none() {
+        let Some(row) = program.head_row(owner)? else {
+            return Err(unchecked_owner(&*program, build_i, owner));
+        };
+        if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
+            && let Some(entry) = state.asked.get_mut(slot)
+        {
+            entry.1 = Some(row);
+        }
+    }
+    Ok(())
 }
 
 /// Result of [`pull_constants`]: either every constant need was pulled, or a coroutine held by
@@ -1540,7 +1572,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         } else {
             match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
                 Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
-                Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
+                Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
                     Ok(LaidOnly::Done(_)) => Ok(()),
                     Ok(LaidOnly::Unchecked(owner)) => {
                         unchecked_coro = Some(owner);
@@ -1583,9 +1615,9 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
 /// Caching wrapper around [`FrontAdts`] backed by [`Work::query_cache`]. Sits strictly below
 /// [`Recorded`] so every build's [`ReadLog`] records the exact same questions and answers while
 /// repeated `normalize` and `drop_impl` queries over `Work::ground` hit in O(1).
-struct CachedFront<'w, P> {
-    front: FrontAdts<'w, P>,
-    cache: &'w core::cell::RefCell<QueryCache>,
+pub(super) struct CachedFront<'w, P> {
+    pub(super) front: FrontAdts<'w, P>,
+    pub(super) cache: &'w core::cell::RefCell<QueryCache>,
 }
 
 impl<P: FrontEnd> blaze_build::layout::LayoutFacts for CachedFront<'_, P> {
@@ -1629,7 +1661,14 @@ impl<P: FrontEnd> blaze_build::layout::LayoutFacts for CachedFront<'_, P> {
     }
 
     fn opaque_hidden(&self, opaque: ItemKey, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
-        crate::front2::coroutines::opaque_hidden(self.front.0, self.front.4.checked, self, opaque, args, ground, self.front.4.alloc)
+        let alloc = self.cache.borrow().alloc;
+        let key = (opaque, SmallArgs::of(args, alloc));
+        if let Some(&hit) = self.cache.borrow().opaque_hidden.get(&key) {
+            return Ok(hit);
+        }
+        let res = crate::front2::coroutines::opaque_hidden(self.front.0, self.front.4.checked, self, opaque, args, ground, self.front.4.alloc)?;
+        self.cache.borrow_mut().opaque_hidden.insert(key, res);
+        Ok(res)
     }
 }
 
@@ -2009,7 +2048,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             let MakerState { checked, tables, work, .. } = &mut *state;
             let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
             let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-            let out = super::lay_states::relay(&*program, &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &roots, work.alloc);
+            let out = super::lay_states::relay(&*program, &work.langs, &bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &roots, work.alloc);
             *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
             out
         };
@@ -2229,7 +2268,7 @@ fn build_lir_phase<P: FrontEnd>(
                 // (preserving already-laid child shapes) so `lay_and_build_one` lays and builds
                 // only `of` itself into `work.stash`.
                 bodies.coroutines.states.forget(of.owner, of.ordinal, &args);
-                match lay_and_build_one(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, of, true, work.alloc)? {
+                match lay_and_build_one(program, &[], &work.langs, bodies, &work.query_cache, &mut work.ground, &mut work.layouts, &mut work.stash, i, of, true, work.alloc)? {
                     Lay::Done => {}
                     Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
                     Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
@@ -2256,7 +2295,7 @@ fn build_lir_phase<P: FrontEnd>(
             // `drop_glue`, async callers) only need each referenced coroutine's `StateShape`
             // (types only), never its LIR — each coroutine builds its own LIR lazily when its
             // `poll`/`resume`/`drop` entry is actually demanded.
-            match lay_only(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, i, &roots, work.alloc)? {
+            match lay_only(program, &[], &work.langs, bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &roots, work.alloc)? {
                 LaidOnly::Done(_) => {}
                 LaidOnly::Unchecked(owner) => return Ok(Phase1::Check(owner)),
             }
