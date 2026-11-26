@@ -70,28 +70,20 @@ a change that finds a duplicate removes it or files an issue naming both.
 
 ## guard-the-cause (rule 54)
 
-Bad code is a symptom. When you find some (jank, a subpar design, a bug that sat unseen, a wait
-nobody named, a second way to do one thing), fix it, then ask why it was written that way and why
-nothing caught it: a missing lint, a harness that was broken or bypassed, a rule that did not say, a
-skill that told nobody how, an interface that made the wrong thing the easy thing, a measurement
-nobody ran. Remove that cause in the same change or the next: a blaze lint with a fix that finds
-every other instance (`fix-through-blaze-lints`), a check that joins the gate, a rule or skill
-instruction that says what to do instead, or a change to the interface so the mistake cannot be
-expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it
-proactively: you do not wait to be asked, and you say in your report what the cause was and what now
-guards it. A guard that only describes the one instance you found is not one; state the general rule
-it enforces. Do it for small things as much as large: a command that needed a flag you forgot, a
-test that passed while running nothing, a number that had to be retracted, a file that two lanes
-both edited. The method is five whys, written down: why did it happen; why was that possible; why
-did nothing catch it; why was the easy path the wrong one; why does the system have that shape. Stop
-when the answer is a property of the design rather than an event (`the test filter matched nothing`
-is an event; `a run that executes zero checks reports success` is a property). Then name the class
-(every instance that property allows, not the one you met), and choose the strongest prevention you
-can build, in the order `type-then-lint-then-rule` gives. Then solve it: build the prevention in the
-same change or the next, run it over the whole tree, and land it; do not stop at the write-up.
-Record the chain in the annoyance's row under `agents/annoyances/` (`whys`, `class`, `prevention`),
-so the next agent sees the class, not the anecdote. When several rows share a class, that class is
-the work: one architectural change, not one patch per row.
+Bad code or a single bug is a symptom — never patch just the one instance you tripped over. When you
+find a problem (a bug, a performance gap, jank, a subpar design, a wait nobody named, a second way
+to do one thing), generalize before fixing: (1) actively hunt for at least 3 similar cases across
+the codebase, IR, or pipeline that share the same underlying cause; (2) find the unifying
+abstraction and explicitly name the generalized problem class; (3) solve that entire category from
+first principles (the clean architectural fix, newtype, general pass, or invariant that eliminates
+the whole class at once rather than one point patch); and (4) add the strongest prevention
+(`type-then-lint-then-rule`: a type so the mistake cannot compile, a blaze lint with a fix run over
+the whole tree via `fix-through-blaze-lints`, a gate check, or a rule/skill update), verify it, and
+merge it in. Ask five whys down to a property of the design rather than an event (`the test filter
+matched nothing` is an event; `a run that executes zero checks reports success` is a property). Do
+it proactively without waiting to be asked, state the 3+ cases, the named class, and the
+first-principles fix in your PR/report, and record the chain (`whys`, `class`, `prevention`) under
+`agents/annoyances/` when an annoyance occurs.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
@@ -324,5 +316,16 @@ anonymous stateful tuple like `(Option<T>, bool)` or `Option<(A, B, C)>`
 Flat>`, `Leaf`, `Budget`).
 
 See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
+
+## flag-jank-or-monumentous-in-all-caps (rule 88)
+
+NEVER QUIETLY SHIP A JANK WORKAROUND OR SILENTLY EMBARK ON A MONUMENTAL TASK THE USER DID NOT
+REALIZE THEY WERE SIGNING UP FOR. Whenever you cannot do something the proper first-principles way —
+either (1) you are resorting to a jank hack, partial band-aid, or compromise just to get something
+working, OR (2) doing it properly is a monumental architectural undertaking with hidden scope, risk,
+or multi-hour/multi-PR cost that the user may not realize — BE COMPLETELY EXPLICIT AND WRITE THE
+WARNING IN ALL CAPS directly to the user. Name what is jank or why the proper solution is
+monumental, lay out the exact scope and tradeoffs, and let the user decide before sneaking in a hack
+or disappearing into an unexpectedly massive rewrite.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

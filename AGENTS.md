@@ -7,9 +7,8 @@ bare-metal/unikernel VMs (kernel too). Verticalize across all of them; fix anyth
 
 ## The standard
 
-Build only what you are proud of, on the first iteration too. Aim every design at the right end
-state, and within 10% of the floor, from the start: it is fine to miss, not to aim low. Then
-iterate. Rules 28, 62, 66 and 67 say how.
+Build only what you are proud of, first iteration too. Aim at the right end state and within 10% of
+the floor from the start: fine to miss, not to aim low; then iterate (28, 62, 66, 67).
 
 ## The goal
 
@@ -59,8 +58,7 @@ Not now:
 
 ## Rules
 
-One line per rule; the full text is in its heading's skill (.agents/skills/): load it before work it
-covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it with `--write`.
+One line per rule (full text in .agents/skills/). Edit tools/agents/rules.ts, run `--write`.
 
 ### Memory and data (skill `memory-and-data`)
 - **11. bump-allocate**: Name the allocator (`Frame`/`Bump`, `Global`); use `into_bump_slice`, never general `.leak()`.
@@ -125,7 +123,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **28. best-long-term-design**: Pick the best long-term design, not the least work; be proud of the first iteration, then prove it.
 - **29. spec-then-build**: A change that needs a design gets a short spec, then the same lane builds it at once.
 - **30. one-concept-one-home**: One type, one rule, one place per concept; merge duplicates and ban the removed name.
-- **54. guard-the-cause**: Ask why down to the root, name the class, and change the design so the class cannot happen.
+- **54. guard-the-cause**: Find >= 3 similar cases, name the generalized class, and fix that category from first principles.
 - **58. build-the-missing-piece**: When the right design needs a piece the tree lacks, build it; never ship the weaker form.
 - **59. unease-is-work**: See 54: unease is an issue too; find its root cause and fix it there.
 - **62. sota-first**: Design the end state and build it directly, its pieces in parallel; then prove it on real targets.
@@ -139,6 +137,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **79. interfaces-first**: A rewrite starts as one small crate of types and state machines that compiles and is simulated.
 - **83. options-struct**: One constructor a type, `new(Opts { .. })`: choices required, tunables defaulted; no `with_*` names.
 - **85. newtypes-and-named-returns**: Use newtypes, enums and named return structs instead of bare primitives or `(Option<T>, bool)`.
+- **88. flag-jank-or-monumentous-in-all-caps**: IF YOU MUST USE A JANK WORKAROUND OR FACE A MONUMENTAL TASK, SHOUT IT IN ALL CAPS TO THE USER.
 
 ### Building, lanes and machines (skill `build-and-test`)
 - **2. blaze-builds-blaze**: Dogfood blaze (check/test/export) for inner loops, never cold cargo; fix any self-hosting gap.
@@ -155,6 +154,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **69. every-command-has-a-timeout**: Size a timeout to each command; an expiry is a finding, never waited out or retried.
 - **80. act-on-snapshots**: Work starts when asked, on a snapshot; nothing builds, checks or publishes on save or mid-edit.
 - **82. real-run-first**: A new path runs its real command, profile on, on a real project the day it compiles.
+- **87. sharpen-your-tools**: When profiling, debugging or iterating is slow or blind, build the missing tool first.
 
 ### Landing (skill `landing`)
 - **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.

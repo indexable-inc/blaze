@@ -70,6 +70,16 @@ interp_search_by_prefix}` on hot paths so one code path scales from Macs to 128-
 
 See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
 
+## sharpen-your-tools (rule 87)
+
+Never grind blind against stripped addresses, hex words, or minute-long rebuild loops when a small
+tool makes every subsequent iteration 10× faster and sharper. Before repeating a slow manual
+diagnostic, build or fix the observability and iteration infrastructure itself: emit real local
+symbols (`LC_SYMTAB` / `.symtab`) so `nm`, `lldb`, `sample`, `xctrace` and `objdump` show Rust
+names; add typed IR pretty-printers (`mfmt`, LIR dumps) and diff views; run sub-5-second in-process
+differential/perf micro-harnesses instead of full rebuild+export cycles; and keep those tools
+checked in so every future lane benefits.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 ## Hot-leaf SOTA checklist (hit >100% of C on attempt #1)

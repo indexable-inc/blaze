@@ -240,4 +240,15 @@ Flat>`, `Leaf`, `Budget`).
 
 See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
 
+## flag-jank-or-monumentous-in-all-caps (rule 88)
+
+NEVER QUIETLY SHIP A JANK WORKAROUND OR SILENTLY EMBARK ON A MONUMENTAL TASK THE USER DID NOT
+REALIZE THEY WERE SIGNING UP FOR. Whenever you cannot do something the proper first-principles way —
+either (1) you are resorting to a jank hack, partial band-aid, or compromise just to get something
+working, OR (2) doing it properly is a monumental architectural undertaking with hidden scope, risk,
+or multi-hour/multi-PR cost that the user may not realize — BE COMPLETELY EXPLICIT AND WRITE THE
+WARNING IN ALL CAPS directly to the user. Name what is jank or why the proper solution is
+monumental, lay out the exact scope and tradeoffs, and let the user decide before sneaking in a hack
+or disappearing into an unexpectedly massive rewrite.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

@@ -20,27 +20,31 @@
 
 use core::fmt;
 
-use blaze_code::record::{Symbol, TrapSource};
-use blaze_emit::Isa;
+use blaze_code::datum::DatumView;
+use blaze_code::record::{Space, Symbol, TrapSource};
+use blaze_emit::{
+    AbiFnInput, CallConvKind, InternalFastRole, Isa, ScratchOrder, SotaRecordAbiOpts, ZeroAbiOpts,
+    can_use_internal_fast_a64, plan_module_abi,
+};
 use blaze_lir::{
     Block, BlockKind, Field, Flags, Layout, Op, Ty, VerifyError,
     body::{Bodies, BodyId, DatumId, Target},
     func::{Conv, FnAttrs, Inline, ParamKind, RefId, RefKind, RefRec, SigId, SigRec},
     inline::InlinePolicy,
-    lto::{ModuleBody, OptimizedBody, lto_optimize_module},
+    lto::{ModuleBody, OptimizedBody, lto_optimize_module, tarjan_sccs},
     op::{Word, walk},
     pgo::{PgoRecordError, PgoSiteTable},
     simplify::SimplifyError,
     verify,
 };
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_tier::{Arch, Machine};
+use blaze_tier::{Arch, CallClobbers, Machine, Reg, RegSet};
 use blaze_typeck::ItemKey;
 
 use super::{BuiltCallee, BuiltLir, Maker, RecordsProgram, Typing};
-use crate::body_ids::{Grant, Walk};
+use crate::body_ids::{Grant, RowKind, Walk};
 pub use crate::code_records::export_machine;
-use crate::code_records::{Callee, CodeRecordError, InstanceNames, emit_code_record_for_machine};
+use crate::code_records::{Callee, CodeRecordError, InstanceNames, emit_code_record_for_machine_with_abi};
 use crate::run::RunError;
 use crate::symbols::{static_symbol, tls_symbol};
 
@@ -1479,6 +1483,202 @@ fn compute_profile_digest<'s>(
     hasher.finish().0
 }
 
+/// Prepared post-LTO surviving body ready for whole-module Zero-ABI planning and bottom-up
+/// Tarjan SCC IPRA emission.
+struct PreparedBody<'a, 's, 'o, 'm> {
+    row: usize,
+    symbol: Symbol,
+    inlined_bodies: usize,
+    is_hot: bool,
+    verified: blaze_lir::Verified<'o>,
+    funcs: AVec<'s, Callee<'o>>,
+    statics: AVec<'s, ItemKey>,
+    c_statics: AVec<'s, (ItemKey, &'o str)>,
+    vtables: AVec<'s, Symbol>,
+    vtable_data: AVec<'a, (Symbol, AVec<'a, u8>)>,
+    tls: AVec<'s, ItemKey>,
+    traps: &'o [TrapSource],
+    routines: crate::front2::builtins_shim::Routines<'m>,
+}
+
+/// Returns `true` iff `view` can soundly use `CallConvKind::ColdPreserveAll` without breaking
+/// compact/DWARF unwinding or tail-call lowering:
+/// - no `Op::Invoke` / `Op::InvokeIndirect` / `Op::Resume` / non-normal landing-pad blocks,
+/// - no `Op::TailCall` / `Op::TailCallIndirect`,
+/// - no inline `Op::Asm` / `Op::AsmBr`, and
+/// - either explicitly `FnAttrs::NOUNWIND` or a strict zero-call leaf that cannot unwind.
+fn is_safe_cold_preserve_all(view: blaze_lir::View<'_>) -> bool {
+    for b in 0..view.blocks() {
+        let Ok(b_u32) = u32::try_from(b) else {
+            return false;
+        };
+        if view.block_kind(Block(b_u32)) != BlockKind::Normal {
+            return false;
+        }
+    }
+    let mut has_call = false;
+    for inst in 0..view.len() {
+        match view.op(inst) {
+            Op::Invoke
+            | Op::InvokeIndirect
+            | Op::Resume
+            | Op::TailCall
+            | Op::TailCallIndirect
+            | Op::Asm
+            | Op::AsmBr => return false,
+            Op::Call | Op::CallIndirect => {
+                has_call = true;
+            }
+            _ => {}
+        }
+    }
+    !has_call || (view.head.attrs & FnAttrs::NOUNWIND) != 0
+}
+
+/// Returns `true` iff `view`'s own signature has more than 8 scalar GPR or more than 8 FP/NEON
+/// arguments (excluding `ParamKind::Sret`), so `CallConvKind::InternalFast` actually promotes
+/// stacked arguments into `X9..X15` / `V16..V23`.
+fn has_wide_args(view: blaze_lir::View<'_>) -> bool {
+    let sig = view.sig(SigId(view.head.sig));
+    let mut gpr = 0u32;
+    let mut fp = 0u32;
+    for p in sig.params {
+        if ParamKind::from_byte(p.kind) == Some(ParamKind::Sret) {
+            continue;
+        }
+        let ty = Ty(p.ty);
+        if ty.is_float() || ty.is_vector() {
+            fp += 1;
+        } else {
+            gpr += 1;
+        }
+    }
+    gpr > 8 || fp > 8
+}
+
+/// Estimates caller live-register pressure (`(gpr_pressure, fp_pressure)`) from post-LTO LIR
+/// before emission so [`plan_module_abi`] can assign interprocedural register-avoidance
+/// [`ScratchOrder`]s to callees prior to code generation.
+fn estimate_caller_live_pressure(view: blaze_lir::View<'_>) -> (RegSet, RegSet) {
+    const SCRATCH_GPRS: [u8; 7] = [9, 10, 11, 12, 13, 14, 15];
+    const SCRATCH_FPS: [u8; 13] = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+
+    let mut last_call: Option<usize> = None;
+    for inst in 0..view.len() {
+        if matches!(
+            view.op(inst),
+            Op::Call
+                | Op::Invoke
+                | Op::CallIndirect
+                | Op::InvokeIndirect
+                | Op::TailCall
+                | Op::TailCallIndirect
+        ) {
+            last_call = Some(inst);
+        }
+    }
+    let Some(last_call_idx) = last_call else {
+        return (RegSet::EMPTY, RegSet::EMPTY);
+    };
+
+    let mut gpr_args = 0usize;
+    let mut fp_args = 0usize;
+    let mut gpr_temps = 0usize;
+    let mut fp_temps = 0usize;
+    let entry_params = view.params(Block(0));
+    for inst in 0..last_call_idx {
+        let Some(&ty_raw) = view.tys.get(inst) else {
+            break;
+        };
+        let ty = Ty(ty_raw);
+        if ty == Ty::NONE {
+            continue;
+        }
+        let op = view.op(inst);
+        if matches!(op, Op::Iconst | Op::IconstWide | Op::Fconst | Op::FconstWide) {
+            continue;
+        }
+        let is_entry_param = inst >= entry_params.start && inst < entry_params.end;
+        if ty.is_float() || ty.is_vector() {
+            if is_entry_param {
+                fp_args += 1;
+            } else {
+                fp_temps += 1;
+            }
+        } else if is_entry_param {
+            gpr_args += 1;
+        } else {
+            gpr_temps += 1;
+        }
+    }
+
+    let mut gpr_set = RegSet::EMPTY;
+    for &r in SCRATCH_GPRS.get(..gpr_temps.min(4)).unwrap_or(&[]) {
+        gpr_set = gpr_set.with(Reg(r));
+    }
+    for r in 0..u8::try_from(gpr_args.min(4)).unwrap_or(0) {
+        gpr_set = gpr_set.with(Reg(r));
+    }
+
+    let mut fp_set = RegSet::EMPTY;
+    for &v in SCRATCH_FPS.get(..fp_temps.min(6)).unwrap_or(&[]) {
+        fp_set = fp_set.with(Reg(32 + v));
+    }
+    for v in 0..u8::try_from(fp_args.min(4)).unwrap_or(0) {
+        fp_set = fp_set.with(Reg(32 + v));
+    }
+    (gpr_set, fp_set)
+}
+
+/// 2-tier hot/cold classification for post-LTO emission: non-cold, non-noreturn bodies containing
+/// at least one loop or PGO/static heat strictly above [`STATIC_STRAIGHT_LINE_WEIGHT`] run the
+/// full hot superopt tier; cold 0-loop straight-line bodies skip multi-round `superopt_a64`.
+fn body_is_hot_tier<'s>(
+    view: blaze_lir::View<'_>,
+    symbol: Symbol,
+    pgo: &PgoSiteTable<Alloc<'s>>,
+    scratch: Alloc<'s>,
+) -> bool {
+    if (view.head.attrs & (FnAttrs::COLD | FnAttrs::NORETURN)) != 0 {
+        return false;
+    }
+    let pgo_w = pgo.body_weight(BodyId(symbol.0));
+    let heat = compute_loop_heat(view, scratch);
+    let loop_score = if heat.max_depth > 0 {
+        10u64
+            .saturating_pow(heat.max_depth.min(MAX_LOOP_DEPTH_EXP))
+            .saturating_mul(heat.loop_blocks)
+    } else {
+        0
+    };
+    let body_heat = loop_score.saturating_add(pgo_w);
+    heat.max_depth > 0 || body_heat > STATIC_STRAIGHT_LINE_WEIGHT
+}
+
+/// Resolves a direct `Op::Call` / `Op::Invoke` / `Op::TailCall` instruction to its surviving-body
+/// index in `0..prepared.len()` via `funcs` and sorted `surv_by_sym`.
+fn direct_internal_callee_idx(
+    view: blaze_lir::View<'_>,
+    inst: usize,
+    funcs: &[Callee<'_>],
+    surv_by_sym: &[([u8; 32], usize)],
+) -> Option<usize> {
+    if !matches!(view.op(inst), Op::Call | Op::Invoke | Op::TailCall) {
+        return None;
+    }
+    let &data_at = view.data.get(inst)?;
+    let &ref_word = usize::try_from(data_at).ok().and_then(|at| view.extra.get(at))?;
+    let r = view.refs.get(RefId(ref_word).index())?;
+    if RefKind::from_word(r.kind) != Some(RefKind::Func) {
+        return None;
+    }
+    let place = usize::try_from(r.place).ok()?;
+    let &Callee::Symbol(sym) = funcs.get(place)? else {
+        return None;
+    };
+    find_body_idx(surv_by_sym, sym.0)
+}
+
 /// Runs demand-driven whole-program cross-function LIR inlining and host-ISA SOTA emission over
 /// workspace seed rows and their small inlineable callees.
 #[expect(clippy::too_many_arguments, reason = "whole-program export LTO over walk, seeds, gate, maker, options, output allocator, and scratch allocator")]
@@ -1700,8 +1900,11 @@ where
     let hot_symbols = rank_hot_symbols(hot_inputs.as_slice(), call_edges.as_slice(), &pgo, alloc, scratch);
     let profile_digest = compute_profile_digest(&pgo, hot_symbols.as_slice(), scratch);
 
-    // 3. Expand reference tables transitively for every `ImportedRef` and emit host-ISA records.
-    let mut out_bodies: AVec<'a, LtoBodyOut<'a>> = Vec::with_capacity_in(n, alloc);
+    // 3. Expand reference tables transitively for every surviving post-LTO body, plan whole-module
+    //    Zero-ABI (`ScratchOrder` + guarded `ColdPreserveAll`) & bottom-up Tarjan SCC emission order,
+    //    and emit ephemeral host-ISA records with IPRA + 2-tier cold-fast classification (never
+    //    written to portable `CodeStore`, preserving exact deterministic output order — Rule 25).
+    let mut prepared: AVec<'s, PreparedBody<'a, 's, '_, '_>> = Vec::with_capacity_in(n, scratch);
     for (idx, (orig, opt)) in origins.iter().zip(lto.bodies.iter()).enumerate() {
         if !orig.is_seed && !orig.lowered_libm && opt.read.is_empty() {
             continue;
@@ -1845,13 +2048,6 @@ where
         let routines = maker
             .bind_routines(&mut funcs)
             .map_err(|error| ExportLtoError::Record { symbol: orig.symbol.0, error })?;
-        let names = InstanceNames {
-            funcs: funcs.as_slice(),
-            statics: statics.as_slice(),
-            c_statics: c_statics.as_slice(),
-            vtables: vtables.as_slice(),
-            tls: tls.as_slice(),
-        };
         let verified = verify(opt.func.view())
             .map_err(|error| ExportLtoError::Verify { symbol: orig.symbol.0, error })?;
         let post_unreachables = opt.func.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count();
@@ -1860,24 +2056,423 @@ where
         } else {
             &[]
         };
-        let (record_tmp, called_declared) = emit_code_record_for_machine(verified, &names, routines, traps, opts.machine, scratch)
-            .map_err(|error| ExportLtoError::Record { symbol: orig.symbol.0, error })?;
-        let mut record: AVec<'a, u8> = Vec::with_capacity_in(record_tmp.len(), alloc);
-        record.extend_from_slice(record_tmp.as_slice());
-        let mut extra_declared: AVec<'a, (ItemKey, AVec<'a, u8>)> = Vec::with_capacity_in(called_declared.len(), alloc);
-        for d in called_declared.iter() {
-            let mut name_buf: AVec<'a, u8> = Vec::with_capacity_in(d.name.len(), alloc);
-            name_buf.extend_from_slice(d.name);
-            extra_declared.push((d.tabled, name_buf));
-        }
-        out_bodies.push(LtoBodyOut {
+        let is_hot = body_is_hot_tier(verified.view(), orig.symbol, &pgo, scratch);
+        prepared.push(PreparedBody {
             row: orig.row,
             symbol: orig.symbol,
-            record,
-            vtable_data,
-            extra_declared,
             inlined_bodies: opt.read.len(),
+            is_hot,
+            verified,
+            funcs,
+            statics,
+            c_statics,
+            vtables,
+            vtable_data,
+            tls,
+            traps,
+            routines,
         });
+    }
+
+    let m = prepared.len();
+    if m == 0 {
+        return Ok(ExportLtoOut {
+            bodies: Vec::new_in(alloc),
+            hot_symbols,
+            profile_digest,
+            module_bodies: n,
+            total_inlined: lto.total_inlined_bodies,
+        });
+    }
+
+    // 3b. Index surviving bodies, construct post-LTO direct call graph CSR, and compute
+    //     reverse-topological (callees-first) Tarjan SCCs.
+    let mut surv_by_sym: AVec<'s, ([u8; 32], usize)> = Vec::with_capacity_in(m, scratch);
+    let mut walk_row_to_surv: AVec<'s, u32> = Vec::with_capacity_in(walk.len(), scratch);
+    walk_row_to_surv.resize(walk.len(), u32::MAX);
+    for (i, prep) in prepared.iter().enumerate() {
+        surv_by_sym.push((prep.symbol.0, i));
+        if let Ok(i_u32) = u32::try_from(i)
+            && let Some(slot) = walk_row_to_surv.get_mut(prep.row)
+        {
+            *slot = i_u32;
+        }
+    }
+    surv_by_sym.sort_unstable();
+
+    let mut adj_offsets: AVec<'s, u32> = Vec::with_capacity_in(m.saturating_add(1), scratch);
+    let mut adj: AVec<'s, u32> = Vec::with_capacity_in(m.saturating_mul(2), scratch);
+    let mut in_degree: AVec<'s, usize> = Vec::with_capacity_in(m, scratch);
+    in_degree.resize(m, 0);
+    let mut callees_per_fn: AVec<'s, AVec<'s, usize>> = Vec::with_capacity_in(m, scratch);
+    adj_offsets.push(0);
+
+    for prep in prepared.iter() {
+        let view = prep.verified.view();
+        let edge_start = adj.len();
+        for inst in 0..view.len() {
+            if let Some(callee_idx) =
+                direct_internal_callee_idx(view, inst, prep.funcs.as_slice(), surv_by_sym.as_slice())
+                && let Ok(callee_u32) = u32::try_from(callee_idx)
+            {
+                adj.push(callee_u32);
+            }
+        }
+        if let Some(slice) = adj.get_mut(edge_start..) {
+            slice.sort_unstable();
+        }
+        let mut w = edge_start;
+        let mut prev: Option<u32> = None;
+        for r in edge_start..adj.len() {
+            let Some(&val) = adj.get(r) else {
+                break;
+            };
+            if prev != Some(val) {
+                if let Some(dst) = adj.get_mut(w) {
+                    *dst = val;
+                }
+                w = w.saturating_add(1);
+                prev = Some(val);
+            }
+        }
+        adj.truncate(w);
+
+        let mut row_callees: AVec<'s, usize> = Vec::with_capacity_in(w.saturating_sub(edge_start), scratch);
+        for &callee_u32 in adj.get(edge_start..w).unwrap_or(&[]) {
+            if let Ok(cidx) = usize::try_from(callee_u32)
+                && cidx < m
+            {
+                row_callees.push(cidx);
+                if let Some(deg) = in_degree.get_mut(cidx) {
+                    *deg = deg.saturating_add(1);
+                }
+            }
+        }
+        callees_per_fn.push(row_callees);
+
+        let next_off = u32::try_from(adj.len()).map_err(|_| ExportLtoError::BadRef {
+            symbol: prep.symbol.0,
+            what: "post-LTO call graph CSR offset",
+            ref_id: 0,
+        })?;
+        adj_offsets.push(next_off);
+    }
+
+    let emit_sccs = tarjan_sccs(m, adj_offsets.as_slice(), adj.as_slice(), scratch);
+
+    // 3c. Identify ABI-pinned roots (walk roots such as `main`/`lang_start`/personality, bodies
+    //     declared by any non-surviving walk row or static, bodies with zero internal callers,
+    //     and any symbol address-taken via `Op::FuncAddr`, `data_relocs`, or vtable datums) and
+    //     run whole-module Zero-ABI planning (`ScratchOrder` + guarded `ColdPreserveAll`).
+    let mut is_exported: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    let mut address_taken: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    for i in 0..m {
+        let root_or_uncalled = prepared
+            .get(i)
+            .is_none_or(|p| walk.declarer(p.row).is_none())
+            || in_degree.get(i).copied().unwrap_or(0) == 0;
+        is_exported.push(root_or_uncalled);
+        address_taken.push(false);
+    }
+    for r in 0..walk.len() {
+        let r_is_surv = walk_row_to_surv.get(r).copied().unwrap_or(u32::MAX) != u32::MAX;
+        if r_is_surv {
+            continue;
+        }
+        let from_non_instance = walk.kind(r) != RowKind::Instance;
+        for &decl_u32 in walk.declared(r) {
+            if let Ok(decl_row) = usize::try_from(decl_u32)
+                && let Some(&s_u32) = walk_row_to_surv.get(decl_row)
+                && s_u32 != u32::MAX
+                && let Ok(si) = usize::try_from(s_u32)
+            {
+                if let Some(slot) = is_exported.get_mut(si) {
+                    *slot = true;
+                }
+                if from_non_instance
+                    && let Some(slot) = address_taken.get_mut(si)
+                {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    for prep in prepared.iter() {
+        let view = prep.verified.view();
+        for inst in 0..view.len() {
+            if view.op(inst) == Op::FuncAddr
+                && let Some(&ref_word) = view.data.get(inst)
+                && let Some(r) = view.refs.get(RefId(ref_word).index())
+                && RefKind::from_word(r.kind) == Some(RefKind::Func)
+                && let Ok(place) = usize::try_from(r.place)
+                && let Some(&Callee::Symbol(sym)) = prep.funcs.get(place)
+                && let Some(tidx) = find_body_idx(surv_by_sym.as_slice(), sym.0)
+                && let Some(slot) = address_taken.get_mut(tidx)
+            {
+                *slot = true;
+            }
+        }
+        for reloc in view.data_relocs {
+            if let Some(r) = view.refs.get(RefId(reloc.target).index())
+                && RefKind::from_word(r.kind) == Some(RefKind::Func)
+                && let Ok(place) = usize::try_from(r.place)
+                && let Some(&Callee::Symbol(sym)) = prep.funcs.get(place)
+                && let Some(tidx) = find_body_idx(surv_by_sym.as_slice(), sym.0)
+                && let Some(slot) = address_taken.get_mut(tidx)
+            {
+                *slot = true;
+            }
+        }
+        for (_, bytes) in prep.vtable_data.iter() {
+            if let Ok(dv) = DatumView::read(bytes.as_slice()) {
+                for ti in 0..dv.targets() {
+                    let target = dv.target(ti);
+                    if target.space == Space::Func
+                        && let Some(tidx) = find_body_idx(surv_by_sym.as_slice(), target.symbol.0)
+                        && let Some(slot) = address_taken.get_mut(tidx)
+                    {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let abi_plan = {
+        const EMPTY_CALLEES: &[usize] = &[];
+        let mut abi_inputs: AVec<'s, AbiFnInput<'_>> = Vec::with_capacity_in(m, scratch);
+        for (i, prep) in prepared.iter().enumerate() {
+            let view = prep.verified.view();
+            let (caller_live_pressure_gprs, caller_live_pressure_fps) = estimate_caller_live_pressure(view);
+            abi_inputs.push(AbiFnInput {
+                view,
+                is_exported: is_exported.get(i).copied().unwrap_or(true),
+                address_taken: address_taken.get(i).copied().unwrap_or(true),
+                is_cold: (view.head.attrs & FnAttrs::COLD) != 0,
+                direct_callees: callees_per_fn.get(i).map_or(EMPTY_CALLEES, Vec::as_slice),
+                caller_live_pressure_gprs,
+                caller_live_pressure_fps,
+            });
+        }
+        let mut zero_abi_opts = ZeroAbiOpts::arm64_export();
+        zero_abi_opts.enable_scc_pinning = false;
+        plan_module_abi(abi_inputs.as_slice(), zero_abi_opts, scratch)
+    };
+
+    // 3d. Emit surviving bodies in callees-first Tarjan SCC order with bottom-up IPRA,
+    //     `InternalFast` (15 GPR + 16 FP args when callee and all direct callers fit `misel`),
+    //     interprocedural `ScratchOrder`, guarded `ColdPreserveAll`, and 2-tier cold-fast mode.
+    let is_arm64 = opts.machine.arch == Arch::Arm64;
+
+    let mut scc_size: AVec<'s, usize> = Vec::with_capacity_in(m, scratch);
+    scc_size.resize(m, 0);
+    for scc_idx in 0..emit_sccs.len() {
+        let comp = emit_sccs.component(scc_idx);
+        let sz = comp.len();
+        for &node_u32 in comp {
+            if let Ok(node_idx) = usize::try_from(node_u32)
+                && let Some(slot) = scc_size.get_mut(node_idx)
+            {
+                *slot = sz;
+            }
+        }
+    }
+
+    let mut misel_caller_ok: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    let mut misel_callee_ok: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    for prep in prepared.iter() {
+        let (caller_ok, callee_ok) = if is_arm64 {
+            let names = InstanceNames {
+                funcs: prep.funcs.as_slice(),
+                statics: prep.statics.as_slice(),
+                c_statics: prep.c_statics.as_slice(),
+                vtables: prep.vtables.as_slice(),
+                tls: prep.tls.as_slice(),
+            };
+            (
+                can_use_internal_fast_a64(
+                    prep.verified.view(),
+                    &names,
+                    opts.machine,
+                    InternalFastRole::Caller,
+                ),
+                can_use_internal_fast_a64(
+                    prep.verified.view(),
+                    &names,
+                    opts.machine,
+                    InternalFastRole::Callee,
+                ),
+            )
+        } else {
+            (false, false)
+        };
+        misel_caller_ok.push(caller_ok);
+        misel_callee_ok.push(callee_ok);
+    }
+
+    let mut callers_per_fn: AVec<'s, AVec<'s, usize>> = Vec::with_capacity_in(m, scratch);
+    for _ in 0..m {
+        callers_per_fn.push(Vec::new_in(scratch));
+    }
+    for (caller_idx, callees) in callees_per_fn.iter().enumerate() {
+        for &callee_idx in callees.iter() {
+            if let Some(callers) = callers_per_fn.get_mut(callee_idx) {
+                callers.push(caller_idx);
+            }
+        }
+    }
+
+    let mut use_internal_fast: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    for (f, prep) in prepared.iter().enumerate() {
+        let ok = is_arm64
+            && abi_plan.plans.get(f).is_some_and(|p| p.conv == CallConvKind::InternalFast)
+            && has_wide_args(prep.verified.view())
+            && misel_callee_ok.get(f).copied().unwrap_or(false)
+            && scc_size.get(f).copied().unwrap_or(0) == 1
+            && callers_per_fn.get(f).is_some_and(|callers| {
+                !callers.is_empty()
+                    && callers
+                        .iter()
+                        .all(|&c| misel_caller_ok.get(c).copied().unwrap_or(false))
+            });
+        use_internal_fast.push(ok);
+    }
+
+    let mut known_clobbers: AVec<'s, Option<CallClobbers>> = Vec::with_capacity_in(m, scratch);
+    let mut emitted_records: AVec<'s, Option<(AVec<'a, u8>, AVec<'a, (ItemKey, AVec<'a, u8>)>)>> =
+        Vec::with_capacity_in(m, scratch);
+    for _ in 0..m {
+        known_clobbers.push(None);
+        emitted_records.push(None);
+    }
+    let mut callee_clobbers_buf: AVec<'s, (u32, CallClobbers)> = Vec::new_in(scratch);
+    let mut internal_fast_callees_buf: AVec<'s, u32> = Vec::new_in(scratch);
+    let mut scc_clobbers: AVec<'s, (usize, CallClobbers)> = Vec::new_in(scratch);
+
+    for scc_idx in 0..emit_sccs.len() {
+        let comp = emit_sccs.component(scc_idx);
+        scc_clobbers.clear();
+        for &node_u32 in comp {
+            let idx = usize::try_from(node_u32).map_err(|_| ExportLtoError::BadRef {
+                symbol: [0u8; 32],
+                what: "SCC node index",
+                ref_id: node_u32,
+            })?;
+            let Some(prep) = prepared.get(idx) else {
+                return Err(ExportLtoError::BadRef {
+                    symbol: [0u8; 32],
+                    what: "prepared body index",
+                    ref_id: node_u32,
+                });
+            };
+            callee_clobbers_buf.clear();
+            internal_fast_callees_buf.clear();
+            if is_arm64 {
+                for (place, callee) in prep.funcs.iter().enumerate() {
+                    if let &Callee::Symbol(callee_sym) = callee
+                        && let Some(callee_idx) = find_body_idx(surv_by_sym.as_slice(), callee_sym.0)
+                        && let Ok(place_u32) = u32::try_from(place)
+                    {
+                        if let Some(Some(clob)) = known_clobbers.get(callee_idx) {
+                            callee_clobbers_buf.push((place_u32, *clob));
+                        }
+                        if use_internal_fast.get(callee_idx).copied().unwrap_or(false) {
+                            internal_fast_callees_buf.push(place_u32);
+                        }
+                    }
+                }
+            }
+
+            let fn_plan = abi_plan.plans.get(idx);
+            let scratch_order = if is_arm64 {
+                fn_plan.map(|p| ScratchOrder {
+                    gpr: p.scratch_gpr_order,
+                    fp: p.scratch_fp_order,
+                })
+            } else {
+                None
+            };
+            let internal_fast = use_internal_fast.get(idx).copied().unwrap_or(false);
+            let preserve_all_cold = is_arm64
+                && !internal_fast
+                && fn_plan.is_some_and(|p| p.conv == CallConvKind::ColdPreserveAll)
+                && is_safe_cold_preserve_all(prep.verified.view());
+
+            let abi_opts = SotaRecordAbiOpts {
+                machine: opts.machine,
+                is_hot: prep.is_hot,
+                scratch_order,
+                preserve_all_cold,
+                callee_clobbers: callee_clobbers_buf.as_slice(),
+                internal_fast,
+                internal_fast_callees: internal_fast_callees_buf.as_slice(),
+            };
+            let names = InstanceNames {
+                funcs: prep.funcs.as_slice(),
+                statics: prep.statics.as_slice(),
+                c_statics: prep.c_statics.as_slice(),
+                vtables: prep.vtables.as_slice(),
+                tls: prep.tls.as_slice(),
+            };
+            let (record_tmp, called_declared, clobbers) = emit_code_record_for_machine_with_abi(
+                prep.verified,
+                &names,
+                prep.routines,
+                prep.traps,
+                abi_opts,
+                scratch,
+            )
+            .map_err(|error| ExportLtoError::Record { symbol: prep.symbol.0, error })?;
+
+            let mut record: AVec<'a, u8> = Vec::with_capacity_in(record_tmp.len(), alloc);
+            record.extend_from_slice(record_tmp.as_slice());
+            let mut extra_declared: AVec<'a, (ItemKey, AVec<'a, u8>)> =
+                Vec::with_capacity_in(called_declared.len(), alloc);
+            for d in called_declared.iter() {
+                let mut name_buf: AVec<'a, u8> = Vec::with_capacity_in(d.name.len(), alloc);
+                name_buf.extend_from_slice(d.name);
+                extra_declared.push((d.tabled, name_buf));
+            }
+            if let Some(slot) = emitted_records.get_mut(idx) {
+                *slot = Some((record, extra_declared));
+            }
+            scc_clobbers.push((idx, clobbers));
+        }
+
+        // Publish finalized SCC clobbers only AFTER every node in the SCC has been emitted so
+        // recursive peers never observe optimistic intra-SCC masks.
+        if scc_clobbers.len() == 1 {
+            if let Some(&(node_idx, clob)) = scc_clobbers.first()
+                && let Some(slot) = known_clobbers.get_mut(node_idx)
+            {
+                *slot = Some(clob);
+            }
+        } else if scc_clobbers.len() > 1 {
+            let mut scc_union = CallClobbers::EMPTY;
+            for &(_, clob) in scc_clobbers.iter() {
+                scc_union.clobbered = scc_union.clobbered.union(clob.clobbered);
+            }
+            for &(node_idx, _) in scc_clobbers.iter() {
+                if let Some(slot) = known_clobbers.get_mut(node_idx) {
+                    *slot = Some(scc_union);
+                }
+            }
+        }
+    }
+
+    // 3e. Reassemble `out_bodies` in exact original body order (Rule 25).
+    let mut out_bodies: AVec<'a, LtoBodyOut<'a>> = Vec::with_capacity_in(m, alloc);
+    for (prep, rec_opt) in prepared.into_iter().zip(emitted_records.into_iter()) {
+        if let Some((record, extra_declared)) = rec_opt {
+            out_bodies.push(LtoBodyOut {
+                row: prep.row,
+                symbol: prep.symbol,
+                record,
+                vtable_data: prep.vtable_data,
+                extra_declared,
+                inlined_bodies: prep.inlined_bodies,
+            });
+        }
     }
 
     Ok(ExportLtoOut {
@@ -2575,6 +3170,118 @@ mod tests {
                 sym_caller_depth1,
                 sym_warm_straight_leaf,
             ]
+        );
+    }
+
+    #[test]
+    fn emit_code_record_with_abi_narrows_leaf_clobbers_and_supports_hot_and_cold_tiers() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let leaf = build_straight_line_fn(false, alloc);
+        let cold_leaf = build_straight_line_fn(true, alloc);
+        let verified_leaf = verify(leaf.view()).expect("leaf LIR must verify");
+        let verified_cold = verify(cold_leaf.view()).expect("cold leaf LIR must verify");
+        let names = InstanceNames { funcs: &[], statics: &[], c_statics: &[], vtables: &[], tls: &[] };
+        let machine = arm64_machine();
+
+        // 1. 2-tier hot (`is_hot: true`) vs cold-fast (`is_hot: false`) both emit valid sealed
+        //    `CodeRecord`s and produce strictly narrower `CallClobbers` than conservative C ABI.
+        let (cold_bytes, cold_decl, cold_clobbers) = emit_code_record_for_machine_with_abi(
+            verified_leaf,
+            &names,
+            crate::front2::builtins_shim::Routines::NONE,
+            &[],
+            SotaRecordAbiOpts {
+                machine,
+                is_hot: false,
+                scratch_order: Some(ScratchOrder::DEFAULT),
+                preserve_all_cold: false,
+                callee_clobbers: &[],
+                internal_fast: false,
+                internal_fast_callees: &[],
+            },
+            alloc,
+        )
+        .expect("cold-fast leaf emission must succeed");
+        let (hot_bytes, hot_decl, hot_clobbers) = emit_code_record_for_machine_with_abi(
+            verified_leaf,
+            &names,
+            crate::front2::builtins_shim::Routines::NONE,
+            &[],
+            SotaRecordAbiOpts {
+                machine,
+                is_hot: true,
+                scratch_order: None,
+                preserve_all_cold: false,
+                callee_clobbers: &[],
+                internal_fast: false,
+                internal_fast_callees: &[],
+            },
+            alloc,
+        )
+        .expect("hot leaf emission must succeed");
+
+        assert!(cold_decl.is_empty());
+        assert!(hot_decl.is_empty());
+        let cold_view = blaze_code::record::CodeView::read(cold_bytes.as_slice())
+            .expect("cold-fast record must decode as valid sealed CodeRecord");
+        let hot_view = blaze_code::record::CodeView::read(hot_bytes.as_slice())
+            .expect("hot record must decode as valid sealed CodeRecord");
+        assert!(!cold_view.code().is_empty());
+        assert!(!hot_view.code().is_empty());
+
+        let saved_cold_regs = CallClobbers::C_ABI_ARM64.clobbered.0 & !cold_clobbers.clobbered.0;
+        let saved_hot_regs = CallClobbers::C_ABI_ARM64.clobbered.0 & !hot_clobbers.clobbered.0;
+        assert_ne!(saved_cold_regs, 0, "leaf helper must have strictly narrower clobbers than C ABI (cold tier)");
+        assert_ne!(saved_hot_regs, 0, "leaf helper must have strictly narrower clobbers than C ABI (hot tier)");
+
+        // 2. Guarded `ColdPreserveAll` succeeds on a safe cold leaf and is rejected on unwinding LIR.
+        assert!(is_safe_cold_preserve_all(verified_cold.view()));
+        let (preserve_bytes, _preserve_decl, preserve_clobbers) = emit_code_record_for_machine_with_abi(
+            verified_cold,
+            &names,
+            crate::front2::builtins_shim::Routines::NONE,
+            &[],
+            SotaRecordAbiOpts {
+                machine,
+                is_hot: false,
+                scratch_order: Some(ScratchOrder::DEFAULT),
+                preserve_all_cold: true,
+                callee_clobbers: &[],
+                internal_fast: false,
+                internal_fast_callees: &[],
+            },
+            alloc,
+        )
+        .expect("ColdPreserveAll cold leaf emission must succeed");
+        let preserve_view = blaze_code::record::CodeView::read(preserve_bytes.as_slice())
+            .expect("ColdPreserveAll record must decode as valid sealed CodeRecord");
+        assert!(!preserve_view.code().is_empty());
+        assert_ne!(
+            CallClobbers::C_ABI_ARM64.clobbered.0 & !preserve_clobbers.clobbered.0,
+            0,
+            "ColdPreserveAll leaf must expose narrowed clobbers"
+        );
+
+        let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        b.set_attrs(FnAttrs(FnAttrs::COLD));
+        let callee_ref = b.reference(RefKind::Func, 0);
+        let entry = b.create_block(BlockKind::Normal);
+        let normal = b.create_block(BlockKind::Normal);
+        let cleanup = b.create_block(BlockKind::Cleanup);
+        b.begin(entry);
+        let arg = b.param(Ty::I64);
+        let res = b.invoke(Flags::NONE, callee_ref, sig, &[arg], normal, cleanup);
+        b.begin(normal);
+        b.ret(&[res]);
+        b.begin(cleanup);
+        let exc = b.param(Ty::PTR);
+        b.resume(exc);
+        let unwinding_fn = b.finish_checked().expect("unwinding LIR must verify");
+        assert!(
+            !is_safe_cold_preserve_all(unwinding_fn.view()),
+            "functions with Op::Invoke / Op::Resume must keep preserve_all_cold disabled"
         );
     }
 }

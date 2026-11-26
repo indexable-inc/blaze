@@ -1629,6 +1629,78 @@ fn propagate_extract_lane0_hints(view: &View<'_>, hint: &mut [u8], rev_insts: im
     }
 }
 
+/// Computes the full set of physical registers clobbered at a non-tail call site `inst`, unioning
+/// the callee's IPRA [`CallClobbers`] with every register written by the caller's own ABI argument
+/// setup (`X0..X(ng-1)`, `V0..V(nf-1)`, `X8` for `sret`, return registers, and `X16`/`X17`/`X30`).
+/// Any non-`Op::Call` clobbering site (`Invoke`, `CallIndirect`, runtime `_memcpy`/`_memset`,
+/// `TlsAddr`, `Frem`, `I128` div, SME2 helper) conservatively returns `CallClobbers::C_ABI_ARM64`.
+fn effective_call_clobbers(view: &View<'_>, inst: usize, callee: CallClobbers) -> CallClobbers {
+    if view.op(inst) != Op::Call {
+        return CallClobbers::C_ABI_ARM64;
+    }
+    let mut clob = callee
+        .clobbered
+        .with(TierReg(16))
+        .with(TierReg(17))
+        .with(TierReg(30));
+    let Some(&data_at) = view.data.get(inst) else {
+        return CallClobbers::C_ABI_ARM64;
+    };
+    let Some(&sig_word) = view.extra.get(idx(data_at) + 1) else {
+        return CallClobbers::C_ABI_ARM64;
+    };
+    let sig = view.sig(SigId(sig_word));
+    let mut ng = 0u8;
+    let mut nf = 0u8;
+    for p in sig.params {
+        match ParamKind::from_byte(p.kind) {
+            Some(ParamKind::Sret) => {
+                clob = clob.with(TierReg(8));
+            }
+            Some(ParamKind::Byval) => {
+                clob = clob.with(TierReg(32 + 29)).with(TierReg(32 + 30));
+            }
+            _ => {
+                let ty = Ty(p.ty);
+                if is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some() {
+                    if nf < 8 {
+                        clob = clob.with(TierReg(32 + nf));
+                        nf += 1;
+                    }
+                } else if ty == Ty::I128 || is_gpr_pair_ty(view, ty) {
+                    if ng < 8 {
+                        clob = clob.with(TierReg(ng));
+                    }
+                    if ng + 1 < 8 {
+                        clob = clob.with(TierReg(ng + 1));
+                    }
+                    if ng + 2 < 8 {
+                        // Conservative for 16B-aligned odd-GPR bump on AAPCS64 Linux.
+                        clob = clob.with(TierReg(ng + 2));
+                    }
+                    ng = ng.saturating_add(2);
+                } else if ng < 8 {
+                    clob = clob.with(TierReg(ng));
+                    ng += 1;
+                }
+            }
+        }
+    }
+    for (ri, r) in sig.rets.iter().enumerate() {
+        let rty = Ty(r.ty);
+        if is_fp_ty(rty).is_some() || is_vec128_ty(rty).is_some() {
+            if ri < 4 {
+                clob = clob.with(TierReg(32 + u8::try_from(ri).unwrap_or(0)));
+            }
+        } else if rty == Ty::I128 || is_gpr_pair_ty(view, rty) {
+            clob = clob.with(TierReg(0)).with(TierReg(1));
+        } else if ri < 2 {
+            clob = clob.with(TierReg(u8::try_from(ri).unwrap_or(0)));
+        }
+    }
+    CallClobbers { clobbered: clob }
+}
+
 /// Builds the final [`Allocation`] with exact ARM64 unwind pair masks and IPRA clobber summary.
 fn finalize_allocation<A: Allocator>(
     view: &View<'_>,
@@ -1710,7 +1782,13 @@ fn finalize_allocation<A: Allocator>(
     }
     for &c in call_positions {
         clob = clob.with(TierReg(30));
-        clob = clob.union(call_clobbers(c).clobbered);
+        clob = clob.union(effective_call_clobbers(view, c, call_clobbers(c)).clobbered);
+    }
+    for i in 0..view.len() {
+        if matches!(view.op(i), Op::Memcpy | Op::Memmove | Op::Memset) {
+            clob = clob.with(TierReg(32 + 29)).with(TierReg(32 + 30)).with(TierReg(32 + 31));
+            break;
+        }
     }
 
     Allocation {
@@ -3722,11 +3800,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                 }
                 // Only values genuinely live AFTER this clobbering call in the CFG cross it!
                 if is_clobbering_call.get(inst).copied().unwrap_or(false) {
-                    let clob = if matches!(view.op(inst), Op::Invoke | Op::InvokeIndirect) {
-                        CallClobbers::C_ABI_ARM64
-                    } else {
-                        call_clobbers(inst)
-                    };
+                    let clob = effective_call_clobbers(view, inst, call_clobbers(inst));
                     for w in 0..val_words {
                         let mut lw = live.get(w).copied().unwrap_or(0);
                         while lw != 0 {
@@ -5541,12 +5615,8 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                             break;
                         }
                         crosses = true;
-                        // Unwinding out of an `Invoke` clobbers all caller-saved regs regardless of IPRA.
-                        let clob = if matches!(view.op(c_inst), Op::Invoke | Op::InvokeIndirect) {
-                            CallClobbers::C_ABI_ARM64
-                        } else {
-                            call_clobbers(c_inst)
-                        };
+                        // Unwinding out of an `Invoke` and caller-side arg setup both clobber regs.
+                        let clob = effective_call_clobbers(view, c_inst, call_clobbers(c_inst));
                         clobbers.clobbered = clobbers.clobbered.union(clob.clobbered);
                         if clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
                             == clobbers.clobbered

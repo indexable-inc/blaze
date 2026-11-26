@@ -29,6 +29,7 @@ pub mod jump_thread;
 pub mod loopnest;
 pub mod mach_egraph;
 pub mod memopt;
+pub mod memssa;
 pub mod modulo_sched;
 pub mod prefetch;
 mod prop;
@@ -78,6 +79,10 @@ pub use mach_egraph::{
     SuperoptCache, optimize_mach_egraph,
 };
 pub use memopt::{MemOptOutput, MemOptStats, optimize_memory};
+pub use memssa::{
+    AliasAnalysis, MemLoc, MemNodeKind, MemSsaGraph, MemSsaOutput, MemSsaStats, MemVersion,
+    SlotEscape, compact_dead_slots, optimize_memssa,
+};
 pub use modulo_sched::{ModuloSchedOpts, ModuloSchedOutput, ModuloSchedStats, swing_modulo_schedule};
 pub use prefetch::{
     PREFETCH_READ_L1_INTRINSIC, PrefetchOutput, PrefetchStats, build_fast_utoa_u64, build_swisstable_probe_16b,

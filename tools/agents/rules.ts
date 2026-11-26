@@ -134,7 +134,7 @@ blaze is a vertically integrated Rust stack for edit-to-result speed and hardwar
 
 ## The standard
 
-Build only what you are proud of, on the first iteration too. Aim every design at the right end state, and within 10% of the floor, from the start: it is fine to miss, not to aim low. Then iterate. Rules 28, 62, 66 and 67 say how.
+Build only what you are proud of, first iteration too. Aim at the right end state and within 10% of the floor from the start: fine to miss, not to aim low; then iterate (28, 62, 66, 67).
 
 ## The goal
 
@@ -181,7 +181,7 @@ Not now:
 
 ## Rules
 
-One line per rule; the full text is in its heading's skill (.agents/skills/): load it before work it covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it with \`--write\`.`;
+One line per rule (full text in .agents/skills/). Edit tools/agents/rules.ts, run \`--write\`.`;
 
 export const rules = [
 	{
@@ -582,9 +582,9 @@ export const rules = [
 	{
 		id: "guard-the-cause",
 		skill: "changing-code",
-		line: "Ask why down to the root, name the class, and change the design so the class cannot happen.",
-		info: "Bad code is a symptom. When you find some (jank, a subpar design, a bug that sat unseen, a wait nobody named, a second way to do one thing), fix it, then ask why it was written that way and why nothing caught it: a missing lint, a harness that was broken or bypassed, a rule that did not say, a skill that told nobody how, an interface that made the wrong thing the easy thing, a measurement nobody ran. Remove that cause in the same change or the next: a blaze lint with a fix that finds every other instance (`fix-through-blaze-lints`), a check that joins the gate, a rule or skill instruction that says what to do instead, or a change to the interface so the mistake cannot be expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it proactively: you do not wait to be asked, and you say in your report what the cause was and what now guards it. A guard that only describes the one instance you found is not one; state the general rule it enforces. Do it for small things as much as large: a command that needed a flag you forgot, a test that passed while running nothing, a number that had to be retracted, a file that two lanes both edited. The method is five whys, written down: why did it happen; why was that possible; why did nothing catch it; why was the easy path the wrong one; why does the system have that shape. Stop when the answer is a property of the design rather than an event (`the test filter matched nothing` is an event; `a run that executes zero checks reports success` is a property). Then name the class (every instance that property allows, not the one you met), and choose the strongest prevention you can build, in the order `type-then-lint-then-rule` gives. Then solve it: build the prevention in the same change or the next, run it over the whole tree, and land it; do not stop at the write-up. Record the chain in the annoyance's row under `agents/annoyances/` (`whys`, `class`, `prevention`), so the next agent sees the class, not the anecdote. When several rows share a class, that class is the work: one architectural change, not one patch per row.",
-		reason: "Andrew, 2026-11-10, after a day of finding that every edit dropped the front end, held its answer for a disk sync and hung inside the sandbox, none of it seen because the budget harness was broken and the gate bypassed: \"think about why these design decisions were made and try to fix root cause ... if see bad code proactively make lints or etc or better instructions to avoid it or systems to avoid\". Andrew, 2026-11-12: \"for every small issue you find or annoyance think of the actual core reason, like five whys, and figure out architecturally how you prevent this whole class of problems, and then solve it\". That night alone: a test filter that matched nothing was counted as six passes on main, a fake-terminal check that never ran blaze was reported as proof, and three measurements were retracted, each a member of one class (a check that runs nothing reports success) that no row had named.",
+		line: "Find >= 3 similar cases, name the generalized class, and fix that category from first principles.",
+		info: "Bad code or a single bug is a symptom — never patch just the one instance you tripped over. When you find a problem (a bug, a performance gap, jank, a subpar design, a wait nobody named, a second way to do one thing), generalize before fixing: (1) actively hunt for at least 3 similar cases across the codebase, IR, or pipeline that share the same underlying cause; (2) find the unifying abstraction and explicitly name the generalized problem class; (3) solve that entire category from first principles (the clean architectural fix, newtype, general pass, or invariant that eliminates the whole class at once rather than one point patch); and (4) add the strongest prevention (`type-then-lint-then-rule`: a type so the mistake cannot compile, a blaze lint with a fix run over the whole tree via `fix-through-blaze-lints`, a gate check, or a rule/skill update), verify it, and merge it in. Ask five whys down to a property of the design rather than an event (`the test filter matched nothing` is an event; `a run that executes zero checks reports success` is a property). Do it proactively without waiting to be asked, state the 3+ cases, the named class, and the first-principles fix in your PR/report, and record the chain (`whys`, `class`, `prevention`) under `agents/annoyances/` when an annoyance occurs.",
+		reason: "Andrew, 2026-11-10, after a day of finding that every edit dropped the front end, held its answer for a disk sync and hung inside the sandbox, none of it seen because the budget harness was broken and the gate bypassed: \"think about why these design decisions were made and try to fix root cause ... if see bad code proactively make lints or etc or better instructions to avoid it or systems to avoid\". Andrew, 2026-11-12: \"for every small issue you find or annoyance think of the actual core reason, like five whys, and figure out architecturally how you prevent this whole class of problems, and then solve it\". Andrew, 2026-11-26: \"modify agents.md when u find a problem try to generlaize find class of problem at leat 3 similar things and find something genalizes and hten name it and fix that cateogory of roblems frm first princples and merge that thing in\".",
 		link: "docs/contributing.md#what-a-change-needs",
 	},
 	{
@@ -825,6 +825,22 @@ export const rules = [
 		reason: "Andrew, 2026-11-22: \"ideally JIT shuodl ahve some estimate cross run or something to go off of for PGO or reuse thigns etc ideally and if you blaze export it hsould use that PGO data by default etc\" and \"please make guide or AGNETS.md change based on what i have said too\".",
 		link: "docs/v2/plan/design/auto-perf.md",
 		alsoIn: ["memory-and-data"],
+	},
+	{
+		id: "sharpen-your-tools",
+		skill: "build-and-test",
+		line: "When profiling, debugging or iterating is slow or blind, build the missing tool first.",
+		info: "Never grind blind against stripped addresses, hex words, or minute-long rebuild loops when a small tool makes every subsequent iteration 10× faster and sharper. Before repeating a slow manual diagnostic, build or fix the observability and iteration infrastructure itself: emit real local symbols (`LC_SYMTAB` / `.symtab`) so `nm`, `lldb`, `sample`, `xctrace` and `objdump` show Rust names; add typed IR pretty-printers (`mfmt`, LIR dumps) and diff views; run sub-5-second in-process differential/perf micro-harnesses instead of full rebuild+export cycles; and keep those tools checked in so every future lane benefits.",
+		reason: "Andrew, 2026-11-25, when profiling stripped AArch64 binaries against `rustc`: \"any better tool or idsassmebler to tierate faster here? if so maybe make one etc\" and \"ok do all of these things and the ni thikn in agents.md be clear always do things to iterate faster etc yea do this\".",
+		alsoIn: ["debugging", "perf-and-tracing"],
+	},
+	{
+		id: "flag-jank-or-monumentous-in-all-caps",
+		skill: "changing-code",
+		line: "IF YOU MUST USE A JANK WORKAROUND OR FACE A MONUMENTAL TASK, SHOUT IT IN ALL CAPS TO THE USER.",
+		info: "NEVER QUIETLY SHIP A JANK WORKAROUND OR SILENTLY EMBARK ON A MONUMENTAL TASK THE USER DID NOT REALIZE THEY WERE SIGNING UP FOR. Whenever you cannot do something the proper first-principles way — either (1) you are resorting to a jank hack, partial band-aid, or compromise just to get something working, OR (2) doing it properly is a monumental architectural undertaking with hidden scope, risk, or multi-hour/multi-PR cost that the user may not realize — BE COMPLETELY EXPLICIT AND WRITE THE WARNING IN ALL CAPS directly to the user. Name what is jank or why the proper solution is monumental, lay out the exact scope and tradeoffs, and let the user decide before sneaking in a hack or disappearing into an unexpectedly massive rewrite.",
+		reason: "Andrew, 2026-11-26: \"i think also anget.smd should be clear if you cant do something a proper way (you are going a jank solution to kinda get it or it is monumentous task and i dont really understand what gteting into) be clear about this and write in all caps and the ermge that in\".",
+		alsoIn: ["runtime-code", "build-and-test"],
 	},
 ] as const satisfies readonly Rule[];
 

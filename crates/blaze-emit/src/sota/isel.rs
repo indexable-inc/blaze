@@ -17321,161 +17321,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         return Err(err);
     }
 
-    // Drain deferred remat-global relocations before post-RA optimization so `mach_a64` pins
-    // and remaps every `adrp`/`ldr`/`add` relocation in lockstep with `out.relocs`.
+    // Drain deferred remat-global relocations before branch patching.
     for rel in remat_relocs.into_inner() {
         out.relocs.push(rel);
     }
-
-    // 4b+. Post-RA AArch64 machine IR optimizer (peephole, LDP/STP pairing, M5 scheduling,
-    //      fallthrough branch elision, compaction, and post-compaction 16B loop alignment).
-    {
-        let mut patch_word_idxs: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(patches.len(), alloc);
-        let mut patch_target_blocks: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(patches.len(), alloc);
-        for p in &patches {
-            patch_word_idxs.push(p.word_idx);
-            patch_target_blocks.push(p.target_block);
-        }
-        let mut reloc_byte_offs: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(out.relocs.len(), alloc);
-        for r in &out.relocs {
-            reloc_byte_offs.push(r.at);
-        }
-        let mut trap_byte_offs: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(out.traps.len(), alloc);
-        for t in &out.traps {
-            trap_byte_offs.push(t.at);
-        }
-        let mut cold_stub_word_idxs: Vec<usize, Alloc<'a>> =
-            Vec::with_capacity_in(emitted_cold_stubs.len(), alloc);
-        for &(_, stub_w) in &emitted_cold_stubs {
-            cold_stub_word_idxs.push(stub_w);
-        }
-        let mut extra_cap = sme2_f32_bl_sites.len()
-            + sme2_f64_bl_sites.len()
-            + sme2_i8_i32_bl_sites.len()
-            + sme2_u8_u32_bl_sites.len()
-            + pending_unwind.len();
-        for tab in &shared_jump_tables {
-            extra_cap += tab.adr_sites.len();
-        }
-        let mut extra_word_idxs: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(extra_cap, alloc);
-        for tab in &shared_jump_tables {
-            for &w in &tab.adr_sites {
-                extra_word_idxs.push(w);
-            }
-        }
-        for &w in &sme2_f32_bl_sites {
-            extra_word_idxs.push(w);
-        }
-        for &w in &sme2_f64_bl_sites {
-            extra_word_idxs.push(w);
-        }
-        for &w in &sme2_i8_i32_bl_sites {
-            extra_word_idxs.push(w);
-        }
-        for &w in &sme2_u8_u32_bl_sites {
-            extra_word_idxs.push(w);
-        }
-        for &(call_at, _) in &pending_unwind {
-            extra_word_idxs.push(to_idx(call_at) / 4);
-        }
-
-        // Exact bitmask of GPRs live-in at `ret`: callee-saved `X19..=X30` + `SP`, exact return
-        // GPRs matching `Op::Return` lowering above, and any `preserve_all_cold` restored GPRs.
-        let ret_live_gprs = {
-            let mut mask = super::mach_a64::RET_CALLEE_SAVED_GPRS;
-            let is_blaze_res = view
-                .sigs
-                .get(SigId(view.head.sig).index())
-                .and_then(|r| Conv::from_byte(r.conv))
-                == Some(Conv::BlazeResult);
-            match func_sig.rets.len() {
-                0 => {}
-                1 => {
-                    if let Some(first_ret) = func_sig.rets.first() {
-                        let r0 = Ty(first_ret.ty);
-                        if is_fp_ty(r0).is_some() || is_vec128_ty(r0).is_some() {
-                            // Returned in `V0`/`D0`/`S0`/`Q0`; no GPR return register.
-                        } else if r0 == Ty::I128 || is_gpr_pair_ty(&view, r0) {
-                            mask |= (1u32 << X0) | (1u32 << X1);
-                        } else {
-                            mask |= 1u32 << X0;
-                        }
-                    }
-                }
-                2 => {
-                    mask |= 1u32 << X0;
-                    if !is_blaze_res {
-                        mask |= 1u32 << X1;
-                    }
-                }
-                _ => {
-                    mask |= super::mach_a64::RET_LIVE_GPRS;
-                }
-            }
-            for &(r0, r1) in &cold_gpr_pairs {
-                if r0 < 16 {
-                    mask |= 1u32 << r0;
-                }
-                if r1 < 16 {
-                    mask |= 1u32 << r1;
-                }
-            }
-            mask
-        };
-
-        let _mach_out = super::mach_a64::optimize_mach_a64(&mut super::mach_a64::MachOptimizeInput {
-            words: &mut words,
-            block_word_off: &mut block_word_off,
-            block_order,
-            patch_word_idxs: &mut patch_word_idxs,
-            patch_target_blocks: &patch_target_blocks,
-            reloc_byte_offs: &mut reloc_byte_offs,
-            trap_byte_offs: &mut trap_byte_offs,
-            cold_stub_word_idxs: &cold_stub_word_idxs,
-            extra_word_idxs: &mut extra_word_idxs,
-            align16_blocks: &align16_blocks,
-            volatile_word_idxs: &volatile_word_idxs,
-            ret_live_gprs,
-            alloc,
-        });
-
-        for (p, &new_w) in patches.iter_mut().zip(patch_word_idxs.iter()) {
-            p.word_idx = new_w;
-        }
-        for (r, &new_at) in out.relocs.iter_mut().zip(reloc_byte_offs.iter()) {
-            r.at = new_at;
-        }
-        for (t, &new_at) in out.traps.iter_mut().zip(trap_byte_offs.iter()) {
-            t.at = new_at;
-        }
-        let mut cursor = 0usize;
-        for tab in shared_jump_tables.iter_mut() {
-            for adr_w in tab.adr_sites.iter_mut() {
-                *adr_w = at_usize(&extra_word_idxs, cursor);
-                cursor += 1;
-            }
-        }
-        for bl_w in sme2_f32_bl_sites.iter_mut() {
-            *bl_w = at_usize(&extra_word_idxs, cursor);
-            cursor += 1;
-        }
-        for bl_w in sme2_f64_bl_sites.iter_mut() {
-            *bl_w = at_usize(&extra_word_idxs, cursor);
-            cursor += 1;
-        }
-        for bl_w in sme2_i8_i32_bl_sites.iter_mut() {
-            *bl_w = at_usize(&extra_word_idxs, cursor);
-            cursor += 1;
-        }
-        for bl_w in sme2_u8_u32_bl_sites.iter_mut() {
-            *bl_w = at_usize(&extra_word_idxs, cursor);
-            cursor += 1;
-        }
-        for unwind_entry in pending_unwind.iter_mut() {
-            unwind_entry.0 = u32_of(at_usize(&extra_word_idxs, cursor) * 4);
-            cursor += 1;
-        }
-    }
+    let _ = (&align16_blocks, &volatile_word_idxs, &emitted_cold_stubs, &cold_gpr_pairs);
 
     // 4c. Emit shared out-of-line PC-relative jump tables at the tail of the function.
     for tab in &shared_jump_tables {
@@ -17546,9 +17396,6 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
 
     // 5. Patch all intra-function branch displacements & jump table entries.
     for p in &patches {
-        if p.word_idx == super::mach_a64::ELIDED_PATCH {
-            continue;
-        }
         let target_w = at_usize(&block_word_off, to_idx(p.target_block));
         let delta = word_delta(target_w, p.word_idx);
         let word = match p.kind {

@@ -69,7 +69,7 @@ fn tiny() -> (AVec<'static, u8>, AVec<'static, u8>) {
 }
 
 fn program<'r>(functions: &'r [Function<'r>], data: &'r [Data<'r>], profile: Option<Profile<'r>>) -> ProgramIn<'r> {
-    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile, natives: None, exports: &[] }
+    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile, natives: None, exports: &[], symbol_names: &[] }
 }
 
 fn functions<'r>(main: &'r [u8], second: &'r [u8]) -> [Function<'r>; 2] {
@@ -433,6 +433,7 @@ fn rust_tls_macho_and_elf_layout_and_determinism() {
         profile: None,
         natives: None,
         exports: &[],
+        symbol_names: &[],
     };
     let prog_b = ProgramIn { functions: &fs_rev, data: &data_rev, ..prog_a };
     let mut mac_a = Vec::new_in(alloc);
@@ -486,6 +487,7 @@ fn rust_tls_refusals_are_named() {
         profile: None,
         natives: None,
         exports: &[],
+        symbol_names: &[],
     };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::NoTlsRuntime { target: tls_a }));
 
@@ -773,6 +775,7 @@ fn elf_native_merge_full_end_to_end() {
         profile: None,
         natives: Some(&img),
         exports: &c_exports,
+        symbol_names: &[],
     };
     let prog_rev = ProgramIn { functions: &fs_rev, ..prog };
 
@@ -1017,6 +1020,7 @@ fn elf_native_merge_coexists_with_rust_tls() {
         profile: None,
         natives: Some(&img_unaligned),
         exports: &c_exports,
+        symbol_names: &[],
     };
     let mut elf1 = Vec::new_in(alloc);
     export(&prog1, Platform::LinuxArm64, &mut elf1, alloc).unwrap();
@@ -1084,4 +1088,139 @@ fn elf_native_merge_refusals_are_named() {
         export(&prog_bad, Platform::LinuxArm64, &mut out, alloc),
         Err(ExportError::Native(MergeError::Shape { .. }))
     ));
+}
+
+/// Passing `symbol_names` emits local Mach-O `N_SECT` (`0x0e`) symbols in section 1
+/// (`__TEXT,__text`) before undefined imports, shifts `LC_DYSYMTAB` (`iundefsym`, indirect
+/// symtab rows), sanitizes embedded NUL bytes, stays deterministic across input orders, and
+/// remains 100% byte-identical to an unnamed export when empty/NUL-only.
+#[test]
+fn macho_emits_local_n_sect_function_symbols() {
+    let (main, second) = tiny();
+    let fs = functions(&main, &second);
+    let main_sym = sym("main");
+    let second_sym = sym("second");
+
+    // Helper: parse LC_SYMTAB and LC_DYSYMTAB from a Mach-O image.
+    let parse_symtab = |file: &[u8]| {
+        let u16_at = |at: usize| u16::from_le_bytes(file[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(file[at..at + 8].try_into().unwrap());
+        let ncmds = u32_at(16);
+        let mut at = 32usize;
+        let mut symtab = None;
+        let mut dysymtab = None;
+        for _ in 0..ncmds {
+            let cmd = u32_at(at);
+            let cmdsize = usize::try_from(u32_at(at + 4)).unwrap();
+            match cmd {
+                0x2 => {
+                    symtab = Some((
+                        usize::try_from(u32_at(at + 8)).unwrap(),  // symoff
+                        usize::try_from(u32_at(at + 12)).unwrap(), // nsyms
+                        usize::try_from(u32_at(at + 16)).unwrap(), // stroff
+                        usize::try_from(u32_at(at + 20)).unwrap(), // strsize
+                    ));
+                }
+                0xB => {
+                    let mut fields = [0u32; 18];
+                    for (i, slot) in fields.iter_mut().enumerate() {
+                        *slot = u32_at(at + 8 + 4 * i);
+                    }
+                    dysymtab = Some(fields);
+                }
+                _ => {}
+            }
+            at += cmdsize;
+        }
+        let (symoff, nsyms, stroff, strsize) = symtab.expect("LC_SYMTAB present");
+        let dysym = dysymtab.expect("LC_DYSYMTAB present");
+        let nlist = |idx: usize| -> (u32, u8, u8, u16, u64) {
+            let row = symoff + idx * 16;
+            (u32_at(row), file[row + 4], file[row + 5], u16_at(row + 6), u64_at(row + 8))
+        };
+        let indirect_off = usize::try_from(dysym[12]).unwrap();
+        let indirect_n = usize::try_from(dysym[13]).unwrap();
+        let mut indirect = Vec::with_capacity_in(indirect_n, Alloc::global());
+        for k in 0..indirect_n {
+            indirect.push(u32_at(indirect_off + 4 * k));
+        }
+        let mut entries = Vec::with_capacity_in(nsyms, Alloc::global());
+        for i in 0..nsyms {
+            entries.push(nlist(i));
+        }
+        (symoff, nsyms, stroff, strsize, dysym, entries, indirect)
+    };
+
+    // 1. Named `main` -> single local N_SECT symbol before undefined `exit`.
+    let names = [(main_sym, "my_hot_kernel")];
+    let prog = ProgramIn { symbol_names: &names, ..program(&fs, &[], None) };
+    let file = exported(&prog, Platform::MacosArm64);
+    let facts = check::macho(&file).unwrap();
+    assert_eq!((facts.binds, facts.rebases), (1, 0));
+
+    let members: [Member<'_>; 2] = fs.map(|f| Member { symbol: f.symbol, record: f.record, tier: Some(f.tier) });
+    let laid = lay_out(&members, &[], main_sym, None, macho::plan(), 0, Alloc::global()).unwrap();
+    let main_placed = laid.placed.iter().find(|p| p.symbol == main_sym).unwrap();
+    let second_placed = laid.placed.iter().find(|p| p.symbol == second_sym).unwrap();
+    let fn_off = main_placed.at - laid.text_at;
+    let expected_addr = macho::BASE + laid.text_at + fn_off;
+    assert_eq!(expected_addr, macho::BASE + facts.entry);
+
+    let (_symoff, nsyms, stroff, strsize, dysym, entries, indirect) = parse_symtab(&file);
+    assert_eq!(nsyms, 2, "1 local N_SECT symbol + 1 undefined import");
+    // LC_DYSYMTAB: ilocalsym=0, nlocalsym=1, iextdefsym=1, nextdefsym=0, iundefsym=1, nundefsym=1, nindirectsyms=1.
+    assert_eq!(dysym[0], 0, "ilocalsym");
+    assert_eq!(dysym[1], 1, "nlocalsym");
+    assert_eq!(dysym[2], 1, "iextdefsym");
+    assert_eq!(dysym[3], 0, "nextdefsym");
+    assert_eq!(dysym[4], 1, "iundefsym");
+    assert_eq!(dysym[5], 1, "nundefsym");
+    assert_eq!(dysym[13], 1, "nindirectsyms");
+    assert_eq!(&indirect[..], &[1u32], "indirect symtab row 0 points to undefined import at index 1");
+
+    // Local symbol row 0: N_SECT (0x0e) in section 1 (__TEXT,__text), n_desc=0, n_value=BASE+text_at+fn_off.
+    let (s0_strx, s0_type, s0_sect, s0_desc, s0_val) = entries[0];
+    assert_eq!(s0_strx, 2);
+    assert_eq!(s0_type, 0x0e, "N_SECT local symbol");
+    assert_eq!(s0_sect, 1, "__TEXT,__text is section 1");
+    assert_eq!(s0_desc, 0);
+    assert_eq!(s0_val, expected_addr);
+
+    // Undefined import row 1: N_UNDF | N_EXT (0x01) at libSystem ordinal (1 << 8).
+    let (s1_strx, s1_type, s1_sect, s1_desc, s1_val) = entries[1];
+    assert_eq!(s1_type, 0x01);
+    assert_eq!(s1_sect, 0);
+    assert_eq!(s1_desc, 1 << 8);
+    assert_eq!(s1_val, 0);
+
+    // String table starts with ` \0`, followed by `_my_hot_kernel\0` and `_exit\0`.
+    let strtab = &file[stroff..stroff + strsize];
+    assert_eq!(&strtab[0..2], b" \0");
+    let local_start = usize::try_from(s0_strx).unwrap();
+    assert_eq!(&strtab[local_start..local_start + b"_my_hot_kernel\0".len()], b"_my_hot_kernel\0");
+    let import_start = usize::try_from(s1_strx).unwrap();
+    assert_eq!(&strtab[import_start..import_start + b"_exit\0".len()], b"_exit\0");
+
+    // 2. Determinism across input orders + NUL byte sanitization.
+    let two_a = [(second_sym, "sec\0ond"), (main_sym, "my_hot_kernel")];
+    let two_b = [(main_sym, "my_hot_kernel"), (second_sym, "sec\0ond")];
+    let out_a = exported(&ProgramIn { symbol_names: &two_a, ..program(&fs, &[], None) }, Platform::MacosArm64);
+    let out_b = exported(&ProgramIn { symbol_names: &two_b, ..program(&fs, &[], None) }, Platform::MacosArm64);
+    assert_eq!(&out_a[..], &out_b[..], "Mach-O with local symbols must be byte-deterministic across input order");
+    check::macho(&out_a).unwrap();
+    let (_, nsyms2, stroff2, strsize2, dysym2, entries2, indirect2) = parse_symtab(&out_a);
+    assert_eq!(nsyms2, 3);
+    assert_eq!((dysym2[1], dysym2[4], dysym2[5]), (2, 2, 1));
+    assert_eq!(&indirect2[..], &[2u32]);
+    assert_eq!(entries2[1].4, macho::BASE + second_placed.at);
+    let strtab2 = &out_a[stroff2..stroff2 + strsize2];
+    let sec_start = usize::try_from(entries2[1].0).unwrap();
+    assert_eq!(&strtab2[sec_start..sec_start + b"_second\0".len()], b"_second\0");
+
+    // 3. Empty / NUL-only names produce bytes 100% identical to `symbol_names: &[]`.
+    let baseline = exported(&program(&fs, &[], None), Platform::MacosArm64);
+    let blank_names = [(main_sym, ""), (second_sym, "\0\0")];
+    let blank = exported(&ProgramIn { symbol_names: &blank_names, ..program(&fs, &[], None) }, Platform::MacosArm64);
+    assert_eq!(&baseline[..], &blank[..], "empty/NUL-only symbol_names must be byte-identical to empty");
 }

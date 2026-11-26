@@ -264,6 +264,27 @@ new key rule, the real project gathered) instead of a fixture. When finding each
 run would cost one release build, first write the test that finds every such case in one run (key
 every crate of std, check every item), then fix what it lists.
 
+## sharpen-your-tools (rule 87)
+
+Never grind blind against stripped addresses, hex words, or minute-long rebuild loops when a small
+tool makes every subsequent iteration 10× faster and sharper. Before repeating a slow manual
+diagnostic, build or fix the observability and iteration infrastructure itself: emit real local
+symbols (`LC_SYMTAB` / `.symtab`) so `nm`, `lldb`, `sample`, `xctrace` and `objdump` show Rust
+names; add typed IR pretty-printers (`mfmt`, LIR dumps) and diff views; run sub-5-second in-process
+differential/perf micro-harnesses instead of full rebuild+export cycles; and keep those tools
+checked in so every future lane benefits.
+
+## flag-jank-or-monumentous-in-all-caps (rule 88)
+
+NEVER QUIETLY SHIP A JANK WORKAROUND OR SILENTLY EMBARK ON A MONUMENTAL TASK THE USER DID NOT
+REALIZE THEY WERE SIGNING UP FOR. Whenever you cannot do something the proper first-principles way —
+either (1) you are resorting to a jank hack, partial band-aid, or compromise just to get something
+working, OR (2) doing it properly is a monumental architectural undertaking with hidden scope, risk,
+or multi-hour/multi-PR cost that the user may not realize — BE COMPLETELY EXPLICIT AND WRITE THE
+WARNING IN ALL CAPS directly to the user. Name what is jank or why the proper solution is
+monumental, lay out the exact scope and tradeoffs, and let the user decide before sneaking in a hack
+or disappearing into an unexpectedly massive rewrite.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 ## How a lane runs

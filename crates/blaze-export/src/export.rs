@@ -170,7 +170,7 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
                 _ => None,
             };
             let eh = eh_sections_with(&laid, &members, program.personality, platform, outside.as_ref(), alloc)?;
-            let identity = macho::write_native(&laid, &eh, merged.as_ref(), program.name, &seed, out, alloc)?;
+            let identity = macho::write_native(&laid, &eh, merged.as_ref(), program.symbol_names, program.name, &seed, out, alloc)?;
             let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len()));
             (eh, identity, bound)
         }
