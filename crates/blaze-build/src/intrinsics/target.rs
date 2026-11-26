@@ -31,6 +31,7 @@ use blaze_lir::{Builder, Full, Op, Ty, Value};
 
 use crate::BuildError;
 
+pub mod crc32;
 pub mod float;
 #[cfg(test)]
 mod float_tests;
@@ -67,6 +68,9 @@ pub enum Target {
     /// `llvm.aarch64.crypto.sha256{h,h2,su0,su1}` and `llvm.aarch64.crypto.sha512{h,h2,su0,su1}`
     /// of target/sha2.rs: LIR scalar operations on the lanes, no `target_intrinsic`.
     Sha2(sha2::Sha2Fn),
+    /// `llvm.aarch64.crc32{b,h,w,x}` and `llvm.aarch64.crc32c{b,h,w,x}` of target/crc32.rs:
+    /// branchless LIR scalar operations, no `target_intrinsic`.
+    Crc32(crc32::Crc32Fn),
     /// `llvm.aarch64.isb`: instruction synchronization barrier, `isb #imm`.
     Aarch64Isb,
     /// `llvm.aarch64.dmb`: data memory barrier, `dmb #imm`.
@@ -136,6 +140,9 @@ pub fn named(link_name: &str) -> Result<Target, UnknownTarget> {
     if let Some(f) = sha2::named(link_name) {
         return Ok(Target::Sha2(f));
     }
+    if let Some(f) = crc32::named(link_name) {
+        return Ok(Target::Crc32(f));
+    }
     ALL.iter().copied().find(|t| t.link_name() == link_name).ok_or_else(|| UnknownTarget::of(link_name))
 }
 
@@ -151,6 +158,7 @@ impl Target {
             Target::Neon(call) => call.link_name(),
             Target::Sha3(call) => call.link_name(),
             Target::Sha2(f) => f.link_name(),
+            Target::Crc32(f) => f.link_name(),
         }
     }
 }
@@ -173,7 +181,7 @@ pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, t: Target, imm: Val
         Target::Sha3(_) => {
             return Err(BuildError::Target { target: t, expr: None, why: "a SHA3 function built as a barrier (a build bug)" });
         }
-        Target::Sha2(_) => {
+        Target::Sha2(_) | Target::Crc32(_) => {
             return Err(BuildError::Target { target: t, expr: None, why: "a SHA-2 function built as a barrier (a build bug)" });
         }
         Target::Aarch64Isb | Target::Aarch64Dmb | Target::Aarch64Dsb | Target::Aarch64Hint => {}
