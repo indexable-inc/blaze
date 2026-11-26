@@ -493,125 +493,8 @@ impl VerifiedExec {
     }
 }
 
-/// Verified, kernel-sealed executable snapshot on macOS: streams a pinned shelf binary through
-/// deadline-aware `bstd::fs` into a freshly created `O_CREAT | O_EXCL | O_NOFOLLOW` private file
-/// while computing the caller's SHA-256 digest, then locks it with `0o500` + `UF_IMMUTABLE`
-/// (`fchflags`) so neither concurrent shelf updates nor writes/renames/unlinks can alter the
-/// verified binary before `seatbelt::start` executes it. `Drop` clears `UF_IMMUTABLE` and unlinks
-/// the snapshot cleanly.
-#[cfg(target_os = "macos")]
-pub struct VerifiedExec {
-    fd: blaze_sys::posix::io::OwnedFd,
-    path: blaze_own::String<blaze_own::SharedAlloc<'static>>,
-    len: u64,
-}
-
-#[cfg(target_os = "macos")]
-impl VerifiedExec {
-    pub fn open_and_seal_macos(
-        cx: &Cx,
-        dir: &crate::fs::Dir<crate::fs::ReadWrite>,
-        rel: &crate::path::Path,
-        snapshot_path: &str,
-        mut on_chunk: impl FnMut(&[u8]),
-    ) -> Result<Self, VerifiedExecError> {
-        use blaze_sys::posix::io::{CWD, OpenFlags, fchmod, openat, pwrite, set_immutable, unlink};
-
-        let raw = snapshot_path.as_bytes();
-        if raw.is_empty() || raw.contains(&0) {
-            return Err(VerifiedExecError::BadPath);
-        }
-        let mut cbuf = blaze_own::Vec::with_capacity_in(raw.len() + 1, blaze_own::SharedAlloc::global());
-        cbuf.extend_from_slice(raw);
-        cbuf.push(0);
-        let cstr = core::ffi::CStr::from_bytes_with_nul(cbuf.as_slice()).map_err(|_| VerifiedExecError::BadPath)?;
-        let cpath = blaze_sys::Path::new(cstr);
-
-        let file = dir.open_read(cx, rel).map_err(VerifiedExecError::from_fs)?;
-        let snap_flags = OpenFlags::READ_WRITE
-            | OpenFlags::CREATE
-            | OpenFlags::EXCLUSIVE
-            | OpenFlags::NO_FOLLOW
-            | OpenFlags::CLOSE_ON_EXEC;
-        let snap_fd = openat(CWD, cpath, snap_flags, 0o700)
-            .map_err(|errno| VerifiedExecError::Os { call: "openat (macOS VerifiedExec snapshot)", errno })?;
-
-        let stream_res = (|| -> Result<u64, VerifiedExecError> {
-            let mut buf = [0u8; 64 << 10];
-            let mut off = 0u64;
-            loop {
-                cx.check().map_err(VerifiedExecError::Stopped)?;
-                let n = file.read_into(&mut buf, off).wait(cx).map_err(VerifiedExecError::from_fs)?;
-                if n == 0 {
-                    break;
-                }
-                let chunk = buf.get(..n).unwrap_or(&[]);
-                on_chunk(chunk);
-                let mut written = 0usize;
-                while written < chunk.len() {
-                    let slice = chunk.get(written..).unwrap_or(&[]);
-                    let at = off
-                        .checked_add(u64::try_from(written).unwrap_or(0))
-                        .ok_or(VerifiedExecError::Os { call: "pwrite offset overflow", errno: blaze_sys::Errno::Overflow })?;
-                    let w = pwrite(snap_fd.fd(), slice, at)
-                        .map_err(|errno| VerifiedExecError::Os { call: "pwrite (macOS VerifiedExec)", errno })?;
-                    if w == 0 {
-                        return Err(VerifiedExecError::Os { call: "pwrite (macOS VerifiedExec short write)", errno: blaze_sys::Errno::Io });
-                    }
-                    written += w;
-                }
-                let step = u64::try_from(n)
-                    .map_err(|_| VerifiedExecError::Os { call: "VerifiedExec len overflow", errno: blaze_sys::Errno::Overflow })?;
-                off = off
-                    .checked_add(step)
-                    .ok_or(VerifiedExecError::Os { call: "VerifiedExec len overflow", errno: blaze_sys::Errno::Overflow })?;
-            }
-            fchmod(snap_fd.fd(), 0o500)
-                .map_err(|errno| VerifiedExecError::Os { call: "fchmod (macOS VerifiedExec 0500)", errno })?;
-            set_immutable(snap_fd.fd(), true)
-                .map_err(|errno| VerifiedExecError::Os { call: "fchflags (macOS VerifiedExec UF_IMMUTABLE)", errno })?;
-            Ok(off)
-        })();
-        match stream_res {
-            Ok(len) => Ok(Self {
-                fd: snap_fd,
-                path: blaze_own::String::from_str_in(snapshot_path, blaze_own::SharedAlloc::global()),
-                len,
-            }),
-            Err(err) => {
-                let _ = set_immutable(snap_fd.fd(), false);
-                drop(snap_fd);
-                let _ = unlink(cpath);
-                Err(err)
-            }
-        }
-    }
-
-    pub fn path(&self) -> &str {
-        self.path.as_str()
-    }
-
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for VerifiedExec {
-    fn drop(&mut self) {
-        let _ = blaze_sys::posix::io::set_immutable(self.fd.fd(), false);
-        let raw = self.path.as_str().as_bytes();
-        let mut cbuf = blaze_own::Vec::with_capacity_in(raw.len() + 1, blaze_own::SharedAlloc::global());
-        cbuf.extend_from_slice(raw);
-        cbuf.push(0);
-        if let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(cbuf.as_slice()) {
-            let _ = blaze_sys::posix::io::unlink(blaze_sys::Path::new(cstr));
-        }
-    }
-}
-
 /// Why opening or streaming a [`VerifiedExec`] failed.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub enum VerifiedExecError {
     BadPath,
@@ -622,7 +505,7 @@ pub enum VerifiedExecError {
     Os { call: &'static str, errno: blaze_sys::Errno },
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl VerifiedExecError {
     fn from_fs(err: crate::fs::FsError) -> Self {
         match err.kind {
@@ -634,7 +517,7 @@ impl VerifiedExecError {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl core::fmt::Display for VerifiedExecError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -808,107 +691,6 @@ pub use landlock::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, NativeLockErr};
-
-/// On macOS hosts, hashes the admitted OS runtime closure (`/System/Library/CoreServices/SystemVersion.plist`,
-/// optional Cryptex `SystemVersion.plist`, `/usr/lib/dyld`, and the active `dyld_shared_cache`
-/// 4 KiB header carrying its UUID) under `cx` so macOS, Cryptex, or `libSystem` updates roll
-/// content-addressed probe answerer keys (AGENTS.md rule 21).
-#[cfg(target_os = "macos")]
-pub fn feed_macos_runtime_closure(cx: &Cx, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
-    let io = match cx.io().beside(crate::rt::RootPath::new("/")) {
-        Some(Ok(io)) => io,
-        Some(Err(_)) | None => {
-            return Err(Fault::Host { call: "bstd::fs root io (open / on macOS)", code: 5 });
-        }
-    };
-    let fs = io
-        .need_fs()
-        .map_err(|_| Fault::Host { call: "bstd::fs root io (missing fs on macOS)", code: 5 })?;
-    let root = fs.root().read_only();
-    let deadline = cx.deadline();
-    let left = if deadline.finite().is_some() {
-        let now = cx.io().now();
-        if deadline.passed(now) {
-            return Err(Fault::Host { call: "macos runtime closure (deadline)", code: 60 });
-        }
-        deadline.left(now)
-    } else {
-        Duration::from_secs(30)
-    };
-    let sub_cx = cx.on_beside(blaze_own::Share::share(&io), Deadline::after(io.now(), left));
-
-    let mut hash_file = |rel_str: &str, required: bool, max_bytes: Option<usize>| -> Result<bool, Fault> {
-        let rel = crate::path::Path::new(rel_str)
-            .map_err(|_| Fault::Host { call: "macos runtime closure (path)", code: 22 })?;
-        let file = match root.open_read(&sub_cx, &rel) {
-            Ok(f) => f,
-            Err(e) if e.kind == crate::fs::FsKind::NotFound && !required => {
-                feed(rel_str.as_bytes());
-                feed(b":absent");
-                return Ok(false);
-            }
-            Err(_) => return Err(Fault::Host { call: "open (macos runtime closure)", code: 5 }),
-        };
-        feed(rel_str.as_bytes());
-        let mut buf = [0u8; 64 << 10];
-        let mut off = 0u64;
-        let mut total = 0usize;
-        loop {
-            let cap = match max_bytes {
-                Some(limit) => {
-                    if total >= limit {
-                        break;
-                    }
-                    (limit - total).min(buf.len())
-                }
-                None => buf.len(),
-            };
-            let Some(dst) = buf.get_mut(..cap) else {
-                break;
-            };
-            let n = file
-                .read_into(dst, off)
-                .wait(&sub_cx)
-                .map_err(|_| Fault::Host { call: "read (macos runtime closure)", code: 5 })?;
-            if n == 0 {
-                break;
-            }
-            if let Some(chunk) = buf.get(..n) {
-                feed(chunk);
-            }
-            total += n;
-            let step = u64::try_from(n).map_err(|_| Fault::Host { call: "read (macos runtime overflow)", code: 75 })?;
-            off = off.checked_add(step).ok_or(Fault::Host { call: "read (macos runtime overflow)", code: 75 })?;
-        }
-        feed(&off.to_le_bytes());
-        Ok(true)
-    };
-
-    let _ = hash_file("System/Library/CoreServices/SystemVersion.plist", true, None)?;
-    let _ = hash_file(
-        "System/Volumes/Preboot/Cryptexes/OS/System/Library/CoreServices/SystemVersion.plist",
-        false,
-        None,
-    )?;
-    let _ = hash_file("usr/lib/dyld", true, None)?;
-    // First 4 KiB of the active dyld shared cache holds its header + 16-byte UUID.
-    let mut hashed_cache = false;
-    for cache_rel in [
-        "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-        "System/Library/dyld/dyld_shared_cache_arm64e",
-        "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h",
-        "System/Library/dyld/dyld_shared_cache_x86_64h",
-    ] {
-        if hash_file(cache_rel, false, Some(4096))? {
-            hashed_cache = true;
-            break;
-        }
-    }
-    if !hashed_cache {
-        feed(b"dyld_shared_cache:none");
-    }
-    Ok(())
-}
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
 pub use machine::{Effect, Event, HermeticMachine, MachineOpts, State, Stream, Usage};
 pub use plan::{Access, Plan, PlanOpts, Rule as PlanRule, Why};

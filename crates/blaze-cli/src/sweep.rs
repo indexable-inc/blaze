@@ -165,20 +165,20 @@ impl<'a> FactFiles<'a> {
     }
 
     fn active_answerer_id(&mut self, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
-        // Recompute live on every saved `cc-probe` leaf (matching `HermeticClangProbe::id`) so a
-        // mid-sweep `/run/current-system` switch cannot let later leaves pass under the old closure,
-        // while still reusing `self.root_reader` across leaves.
-        let id = match (self.home, self.home_path) {
-            (Some((cx, _)), Some(home)) => {
-                #[cfg(target_os = "linux")]
-                let computed = {
+        #[cfg(target_os = "linux")]
+        {
+            // Recompute live on every saved `cc-probe` leaf (matching `HermeticClangProbe::id`) so a
+            // mid-sweep `/run/current-system` switch cannot let later leaves pass under the old closure,
+            // while still reusing `self.root_reader` across leaves.
+            let id = match (self.home, self.home_path) {
+                (Some((cx, _)), Some(home)) => {
                     if self.root_reader.as_ref().is_none_or(|r| r.is_stalled()) {
                         let created = bstd::procs::hermetic::RootReader::new(cx).map_err(|_| {
                             CliError::Text { what: "cannot open root reader for c-probe runtime closure identity" }
                         })?;
                         self.root_reader = Some(created);
                     }
-                    match self.root_reader.as_ref() {
+                    let computed = match self.root_reader.as_ref() {
                         Some(reader) => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home_with(
                             reader,
                             cx,
@@ -192,22 +192,20 @@ impl<'a> FactFiles<'a> {
                             crate::graph::TRIPLE,
                             alloc,
                         ),
-                    }
-                };
-                #[cfg(not(target_os = "linux"))]
-                let computed = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(
-                    cx,
-                    home,
-                    crate::graph::TRIPLE,
-                    alloc,
-                );
-                computed
-                    .map_err(|_| CliError::Text { what: "cannot compute active c-probe runtime closure identity" })?
-                    .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id)
-            }
-            _ => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id(),
-        };
-        Ok(id)
+                    };
+                    computed
+                        .map_err(|_| CliError::Text { what: "cannot compute active c-probe runtime closure identity" })?
+                        .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id)
+                }
+                _ => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id(),
+            };
+            Ok(id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = alloc;
+            Ok(blaze_proc_macro::probe_clang::PinnedTableAnswerer::strategy_id())
+        }
     }
 
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
@@ -2059,7 +2057,7 @@ mod tests {
         blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_a, enc_a.as_slice()).expect("put A");
         blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_b, enc_b.as_slice()).expect("put B");
 
-        let active_answerer = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id();
+        let active_answerer = blaze_proc_macro::probe_clang::default_answerer_strategy_id();
         let active_pin = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).unwrap_or([0x55u8; 32]);
         let active_sdk = blaze_build_script::facts::sdk_id_digest("");
         let stale_sdk = blaze_build_script::facts::sdk_id_digest("macos-sdk-14.5");

@@ -1425,8 +1425,35 @@ impl<'t> TableAnswerer<'t> {
     }
 
     pub fn strategy_id(table_id: ContentId) -> ContentId {
-        ContentId::of("blaze-build-script c-probe table answerer 1", &table_id.0)
+        let mut h = Hasher::new("blaze-build-script c-probe table answerer 1");
+        h.id(&table_id).id(&implementation_id());
+        h.finish()
     }
+}
+
+/// Escapes literal `$$` to `$$$$` so table-supplied replies round-trip verbatim through
+/// [`CanonicalProbe::unspell`] (which unescapes `$$` -> `$` while restoring placeholders).
+fn escape_double_dollar<'a>(text: &str, alloc: Alloc<'a>) -> AString<'a> {
+    if !text.contains("$$") {
+        return String::from_str_in(text, alloc);
+    }
+    let mut out = String::new_in(alloc);
+    let mut at = 0usize;
+    while let Some(rest) = text.get(at..) {
+        if rest.is_empty() {
+            break;
+        }
+        if rest.starts_with("$$") {
+            out.push_str("$$$$");
+            at += 2;
+        } else if let Some(ch) = rest.chars().next() {
+            out.push(ch);
+            at += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 impl ProbeAnswerer for TableAnswerer<'_> {
@@ -1457,8 +1484,8 @@ impl ProbeAnswerer for TableAnswerer<'_> {
         };
         Ok(ProbeAnswer {
             code: *code,
-            stdout: String::from_str_in(stdout.as_str(), alloc),
-            stderr: String::from_str_in(stderr.as_str(), alloc),
+            stdout: escape_double_dollar(stdout.as_str(), alloc),
+            stderr: escape_double_dollar(stderr.as_str(), alloc),
         })
     }
 }
