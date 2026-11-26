@@ -22,6 +22,7 @@ use blaze_git::{
     commit_graph::CommitGraph,
     merge::{MergeOpts, MergeStatus},
     objects::TreeIter,
+    pack_write::encode_loose_object,
     slab::SlabCompression,
     storage::{ObjectStore, RefStore, RefTarget, RefUpdate, Signature, encode_commit},
     worktree::{
@@ -202,6 +203,7 @@ fn cmd_wt_add<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             )
             .map_err(|e| io::Error::other(format!("{e}")))?;
         store.flush()?;
+        mirror_ref_to_git(&canon_repo, &branch_ref, base_oid);
         (base_oid, base_oid)
     };
 
@@ -263,6 +265,10 @@ fn cmd_wt_add<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
         auto_delete_on_merge: auto_delete,
     });
     save_worktrees(&store.bgit_dir, &records, alloc)?;
+    // Install lightweight `.git/hooks/reference-transaction` hook so plain `git merge` / `git pull`
+    // / `git commit` automatically updates tracking worktrees and deletes merged worktrees with
+    // zero daemon and zero manual `sync`!
+    let _ = install_git_worktree_hooks(&canon_repo);
     Ok(())
 }
 
@@ -301,10 +307,12 @@ fn cmd_wt_sync<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     let mut repo_dir = PathBuf::from(".");
     let mut dry_run = false;
     let mut force = false;
+    let mut from_hook = false;
     for a in args {
         match a.as_str() {
             "--dry-run" => dry_run = true,
             "--force" | "-f" => force = true,
+            "--from-hook" => from_hook = true,
             other if other.starts_with('-') => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -314,7 +322,7 @@ fn cmd_wt_sync<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             other => repo_dir = PathBuf::from(other),
         }
     }
-    sync_all_worktrees(&repo_dir, None, dry_run, force, alloc)?;
+    sync_all_worktrees(&repo_dir, None, dry_run, force, from_hook, alloc)?;
     Ok(())
 }
 
@@ -350,12 +358,12 @@ fn cmd_wt_watch<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
 
     let mut last_fp = ref_tree_fingerprint(&canon_repo);
     // Run an initial sync immediately on startup.
-    let _ = sync_all_worktrees(&canon_repo, None, false, false, alloc);
+    let _ = sync_all_worktrees(&canon_repo, None, false, false, false, alloc);
     loop {
         thread::sleep(Duration::from_millis(interval_ms));
         let fp = ref_tree_fingerprint(&canon_repo);
         if fp != last_fp {
-            if let Err(e) = sync_all_worktrees(&canon_repo, None, false, false, alloc) {
+            if let Err(e) = sync_all_worktrees(&canon_repo, None, false, false, true, alloc) {
                 eprintln!("worktree watch sync error: {e}");
             }
             last_fp = ref_tree_fingerprint(&canon_repo);
@@ -473,7 +481,7 @@ pub(crate) fn on_branch_merged<'a>(
     }
 
     if !no_sync && let Some(target_ref) = into_branch_ref {
-        sync_all_worktrees(repo_dir, Some(target_ref), false, false, alloc)?;
+        sync_all_worktrees(repo_dir, Some(target_ref), false, false, false, alloc)?;
     }
     Ok(())
 }
@@ -484,10 +492,17 @@ pub(crate) fn sync_all_worktrees<'a>(
     only_tracking_ref: Option<&str>,
     dry_run: bool,
     force: bool,
+    force_git_refresh: bool,
     alloc: Alloc<'a>,
 ) -> io::Result<()> {
-    // If `.git` refs updated more recently than `.bgit/refs.bgref`, refresh `.bgit` automatically!
-    refresh_bgit_if_git_refs_newer(repo_dir, alloc)?;
+    // Fast-path: if no worktrees are registered, do zero work (< 0.5 ms in Git hooks!).
+    let wt_file = repo_dir.join(".bgit").join(WORKTREES_FILE);
+    if !wt_file.is_file() {
+        return Ok(());
+    }
+
+    // Refresh `.bgit` from `.git` when triggered by a Git hook or when `.git` refs are newer!
+    refresh_bgit_if_git_refs_newer(repo_dir, force_git_refresh, alloc)?;
 
     let mut store = open_or_infect(repo_dir, alloc)?;
     let records = load_worktrees(&store.bgit_dir, alloc)?;
@@ -619,6 +634,7 @@ pub(crate) fn sync_all_worktrees<'a>(
                         alloc,
                     )
                     .map_err(|e| io::Error::other(format!("{e}")))?;
+                mirror_ref_to_git(repo_dir, rec.branch.as_str(), new_commit);
                 store_dirty = true;
                 if rec.head_commit == rec.base_commit {
                     rec.base_commit = new_commit;
@@ -731,6 +747,8 @@ pub(crate) fn sync_all_worktrees<'a>(
                     )
                     .map_err(|e| io::Error::other(format!("{e}")))?;
                 apply_fs_actions(wt_dir, &plan.actions)?;
+                mirror_overlay_objects_to_git(&store, repo_dir, alloc);
+                mirror_ref_to_git(repo_dir, rec.branch.as_str(), merge_oid);
                 store_dirty = true;
                 rec.head_commit = merge_oid;
                 rec.head_tree = merged_tree;
@@ -995,19 +1013,170 @@ fn collect_tree_blobs<'a>(
     Ok(())
 }
 
-/// If a sibling `.git` directory has refs modified more recently than `.bgit/refs.bgref`,
-/// refresh `.bgit` so worktree sync/watch picks up plain `git` commits/merges/pulls automatically.
-fn refresh_bgit_if_git_refs_newer<'a>(repo_dir: &Path, alloc: Alloc<'a>) -> io::Result<()> {
+/// Install idempotent, non-destructive `.git/hooks/reference-transaction` so plain `git merge`,
+/// `git pull`, `git commit`, `git fetch`, and `git reset` automatically update tracking worktrees
+/// and auto-delete merged worktree folders with zero daemon and zero manual `sync`.
+pub(crate) fn install_git_worktree_hooks(repo_root: &Path) -> io::Result<()> {
+    let git_dir = resolve_common_git_dir(repo_root);
+    let Some(git_dir) = git_dir else {
+        return Ok(());
+    };
+    let hooks_dir = git_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir)?;
+    let hook_path = hooks_dir.join("reference-transaction");
+    const MARKER: &str = "# bgit-worktree-hook";
+
+    let existing = fs::read_to_string(&hook_path).unwrap_or_default();
+    if existing.contains(MARKER) {
+        return Ok(());
+    }
+
+    let exe_str = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "bgit".to_string());
+    let escaped_exe = exe_str.replace('\'', "'\\''");
+    let canon_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let escaped_root = canon_root.to_string_lossy().replace('\'', "'\\''");
+    let snippet = format!(
+        "{MARKER}\n\
+         if [ \"${{1:-}}\" = \"committed\" ] && [ -z \"${{BGIT_HOOK_ACTIVE:-}}\" ]; then\n\
+           BGIT_REPO=\"$(cd \"$(dirname \"$0\")/../..\" 2>/dev/null && pwd)\"\n\
+           if [ ! -d \"$BGIT_REPO/.bgit\" ]; then\n\
+             BGIT_REPO='{escaped_root}'\n\
+           fi\n\
+           if [ -f \"$BGIT_REPO/.bgit/worktrees.bgwt\" ]; then\n\
+             if [ -z \"${{BGIT_BIN:-}}\" ]; then\n\
+               BGIT_BIN='{escaped_exe}'\n\
+             fi\n\
+             if [ ! -x \"$BGIT_BIN\" ]; then\n\
+               BGIT_BIN=\"$(command -v bgit 2>/dev/null || true)\"\n\
+             fi\n\
+             if [ -n \"$BGIT_BIN\" ]; then\n\
+               BGIT_HOOK_ACTIVE=1 \"$BGIT_BIN\" worktree sync \"$BGIT_REPO\" --from-hook || true\n\
+             fi\n\
+           fi\n\
+         fi\n"
+    );
+
+    let mut content = if existing.is_empty() {
+        String::from("#!/bin/sh\n")
+    } else {
+        let mut s = existing;
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s
+    };
+    content.push_str(&snippet);
+
+    let tmp = hooks_dir.join("reference-transaction.bgit.tmp");
+    fs::write(&tmp, content)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+    fs::rename(tmp, &hook_path)
+}
+
+fn resolve_common_git_dir(repo_root: &Path) -> Option<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    if dot_git.is_file() {
+        let raw = fs::read(&dot_git).ok()?;
+        let target = blaze_git::refs::parse_gitdir_file(&raw).ok()?;
+        let gd = {
+            let p = Path::new(target);
+            if p.is_absolute() { p.to_path_buf() } else { repo_root.join(p) }
+        };
+        let common = gd.join("commondir");
+        if common.is_file() {
+            let c = fs::read_to_string(&common).ok()?;
+            let c = c.trim();
+            let p = Path::new(c);
+            return Some(if p.is_absolute() { p.to_path_buf() } else { gd.join(p) });
+        }
+        return Some(gd);
+    }
+    None
+}
+
+/// Mirror newly written overlay objects (merge commit + merged trees/blobs) into `.git/objects`
+/// as loose zlib objects so plain `git` commands immediately see `bgit` auto-merge commits.
+fn mirror_overlay_objects_to_git<'a>(
+    store: &BgitDiskStore<'a>,
+    repo_root: &Path,
+    alloc: Alloc<'a>,
+) {
+    let Some(git_dir) = resolve_common_git_dir(repo_root) else {
+        return;
+    };
+    let obj_root = git_dir.join("objects");
+    if !obj_root.is_dir() {
+        return;
+    }
+    let mut oids = OwnVec::new_in(alloc);
+    if store.overlay_oids(&mut oids).is_err() {
+        return;
+    }
+    let mut body = OwnVec::new_in(alloc);
+    let mut loose = OwnVec::new_in(alloc);
+    for oid in oids {
+        let hex = oid.hex();
+        let hex_str = core::str::from_utf8(&hex).expect("ascii hex");
+        let dir = obj_root.join(&hex_str[..2]);
+        let dst = dir.join(&hex_str[2..]);
+        if dst.is_file() {
+            continue;
+        }
+        let Ok(Some(kind)) = store.read_object(&oid, &mut body) else {
+            continue;
+        };
+        if encode_loose_object(kind, &body, alloc, &mut loose).is_err() {
+            continue;
+        }
+        let _ = fs::create_dir_all(&dir);
+        let tmp = dir.join(format!("tmp_bgit_{}", &hex_str[2..]));
+        if fs::write(&tmp, loose.as_slice()).is_ok() {
+            let _ = fs::rename(&tmp, &dst);
+        }
+    }
+}
+
+/// Mirror a branch ref update into `.git/<ref>` when `.git` exists so `git` and `bgit` stay in sync.
+fn mirror_ref_to_git(repo_root: &Path, full_ref: &str, oid: Oid) {
+    let Some(git_dir) = resolve_common_git_dir(repo_root) else {
+        return;
+    };
+    if !full_ref.starts_with("refs/") || full_ref.contains("..") {
+        return;
+    }
+    let ref_path = git_dir.join(full_ref);
+    if let Some(parent) = ref_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&ref_path, format!("{oid}\n"));
+}
+
+/// If a sibling `.git` directory has refs modified more recently than `.bgit/refs.bgref`
+/// (or when invoked from a Git `reference-transaction` hook), refresh `.bgit` automatically.
+fn refresh_bgit_if_git_refs_newer<'a>(
+    repo_dir: &Path,
+    force_refresh: bool,
+    alloc: Alloc<'a>,
+) -> io::Result<()> {
     let dot_git = repo_dir.join(".git");
     if !dot_git.is_dir() {
         return Ok(());
     }
-    let bgref = repo_dir.join(".bgit/refs.bgref");
-    let bg_mtime = fs::metadata(&bgref).and_then(|m| m.modified()).ok();
-    let git_latest = newest_git_ref_mtime(&dot_git);
-    if let (Some(bm), Some(gm)) = (bg_mtime, git_latest)
-        && gm > bm
-    {
+    let should_refresh = if force_refresh {
+        true
+    } else {
+        let bgref = repo_dir.join(".bgit/refs.bgref");
+        let bg_mtime = fs::metadata(&bgref).and_then(|m| m.modified()).ok();
+        let git_latest = newest_git_ref_mtime(&dot_git);
+        matches!((bg_mtime, git_latest), (Some(bm), Some(gm)) if gm >= bm)
+    };
+    if should_refresh {
         let _ = infect_repo_on_disk(repo_dir, SlabCompression::AutoZstd, alloc)?;
     }
     Ok(())

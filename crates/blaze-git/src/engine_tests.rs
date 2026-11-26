@@ -1030,4 +1030,18 @@ fn worktree_bgwt_sync_auto_merge_auto_delete_and_fs_three_way_plan() {
         WorktreeSyncDecision::MergedIntoTracked { branch_oid, track_oid }
             if branch_oid == c2 && track_oid == c3
     ));
+
+    // Fast-forward merge: `main` fast-forwards directly to `c2` (so `branch_oid == track_oid != base_commit`) -> MergedIntoTracked!
+    store.set_ref("refs/heads/main", RefTarget::Direct(c2)).unwrap();
+    let d_ff_merged = evaluate_worktree_sync(&rec, &mut store, None, MergeOpts::DEFAULT, alloc).unwrap();
+    assert!(matches!(
+        d_ff_merged,
+        WorktreeSyncDecision::MergedIntoTracked { branch_oid, track_oid }
+            if branch_oid == c2 && track_oid == c2
+    ));
+
+    // Brand-new branch with 0 commits (`branch_oid == track_oid == base_commit`) -> UpToDate (never falsely deleted!).
+    rec.base_commit = c2;
+    let d_fresh = evaluate_worktree_sync(&rec, &mut store, None, MergeOpts::DEFAULT, alloc).unwrap();
+    assert!(matches!(d_fresh, WorktreeSyncDecision::UpToDate));
 }
