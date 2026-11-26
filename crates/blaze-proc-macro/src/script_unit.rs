@@ -44,8 +44,8 @@ pub struct Setting<'s> {
     /// The probe checker and its records when the command's setting turns it on
     /// (script_probes.rs); `None`: the table answers the probes.
     pub probes: Option<crate::script_probes::ScriptProbes>,
-    /// The C compiler probe answerer and cache (`probe_clang.rs`).
-    pub c_probes: Option<crate::probe_clang::CScriptProbes>,
+    /// The C compiler probe setting (`probe_clang.rs`: `Ready` or deferred `Unavailable`).
+    pub c_probes: Option<crate::probe_clang::CProbeSetting>,
     pub c_mode: CMode,
     /// What the command asked for: with each script's closure, where it runs (D69 (3),
     /// [`crate::native_unit::placed`]).

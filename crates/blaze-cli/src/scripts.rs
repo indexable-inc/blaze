@@ -272,9 +272,9 @@ pub(crate) struct Shared<'f> {
     table: Arc<std::vec::Vec<Row>>,
     macro_table: Arc<std::vec::Vec<Row>>,
     spawn: Arc<SpawnSetting>,
-    /// Hermetic pinned `clang-23` probe runner (or offline table when shelf is absent) and its
-    /// content-addressed `c-probe/<64-hex>` record store.
-    c_probes: blaze_proc_macro::probe_clang::CScriptProbes,
+    /// Hermetic pinned `clang-23` probe runner and CAS store, or retained refusal when the host
+    /// has no clang pin or unpacked shelf (fails only scripts that actually ask a C probe).
+    c_probes: blaze_proc_macro::probe_clang::CProbeSetting,
     /// The native setting, or why the command has none (its words, naming the path).
     native: Result<NativeSetting<'f>, &'f str>,
     /// The command resolved no macOS SDK (sdk.rs). A native run's key then holds "no SDK"
@@ -629,8 +629,7 @@ impl<'f> Scripts<'f> {
             let id_str = core::str::from_utf8(&sdk_hex).unwrap_or("");
             (sdk.folder(), id_str)
         });
-        let c_probes = blaze_proc_macro::probe_clang::open_command_c_probes(home, host, sdk_pair, &store, alloc)
-            .map_err(|error| SetupError::Setting(said(frame, format_args!("c-probes: {error}"))))?;
+        let c_probes = blaze_proc_macro::probe_clang::open_command_c_probes(home, host, sdk_pair, &store, alloc);
         let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, c_probes, native, no_sdk, graph_record }, frame));
         Ok(shared)
     }
@@ -1149,7 +1148,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // dependent. Under [`CheckoutReads::Hole`] every read of the checkout is a hole: its outputs
     // serve nothing and it runs again next command.
     match job.checkout {
-        CheckoutReads::Kept { plant, status } => match admit_reads_with_probes(&ran.reads, ran_as, &shared.spawn, Some(&*shared.c_probes.records), checkout_prefix, plant, status, checkout, alloc) {
+        CheckoutReads::Kept { plant, status } => match admit_reads_with_probes(&ran.reads, ran_as, &shared.spawn, shared.c_probes.ready(), checkout_prefix, plant, status, checkout, alloc) {
             Ok(()) => {
                 for read in checkout.iter() {
                     reads.push((read.name(), read.answer));
@@ -1234,7 +1233,7 @@ pub(crate) fn admit_reads_with_probes(
     observed: &[blaze_proc_macro::script_sandbox::Read],
     ran_as: RanAs,
     setting: &SpawnSetting,
-    c_probes: Option<&dyn blaze_proc_macro::probe_clang::CProbeStore>,
+    c_probes: Option<&blaze_proc_macro::probe_clang::CScriptProbes>,
     checkout_prefix: Option<&str>,
     plant: crate::engine_script_reads::ReadsPlant,
     status: Option<crate::engine_script_reads::StatusView>,

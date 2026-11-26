@@ -176,12 +176,12 @@ pub enum FactNow {
 
 /// `subject` ([`facts::subject`]'s form: the program's word, then one argument per line, or a
 /// missing program's `absent-program\n<host>\n<name>`, or a compiler probe's
-/// `cc-probe\n<64 hex of ProbeKey>`) answered now with `pins` and optional C probe cache
-/// `c_probes`.
+/// `cc-probe\n<answerer>\n<clang>\n<key>`) answered now with `pins` and optional active
+/// [`crate::probe_clang::CScriptProbes`].
 pub fn fact_now_with_probes(
     subject: &str,
     pins: Option<&FactPins>,
-    c_probes: Option<&dyn crate::probe_clang::CProbeStore>,
+    c_probes: Option<&crate::probe_clang::CScriptProbes>,
     alloc: Alloc<'_>,
 ) -> FactNow {
     // A program found missing (spawn_route.rs `ABSENT_HEAD`, D192): a fact of the pinned base
@@ -190,10 +190,11 @@ pub fn fact_now_with_probes(
         return FactNow::Answer(now);
     }
     if facts::parse_cc_probe_subject(subject).is_some() {
-        let Some(store) = c_probes else {
+        let Some(probes) = c_probes else {
             return FactNow::NoPins;
         };
-        let now = crate::probe_clang::c_probe_reply_now(subject, Some(store), alloc).flatten();
+        let active_answerer = probes.answerer.id();
+        let now = crate::probe_clang::c_probe_reply_now(subject, &active_answerer, &probes.clang_sha256, Some(&*probes.records), alloc).flatten();
         return FactNow::Answer(now);
     }
     let mut lines = subject.split('\n');

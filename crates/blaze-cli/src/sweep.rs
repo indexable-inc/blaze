@@ -48,23 +48,43 @@ struct FactFiles<'a> {
     home: Option<(&'a Cx, &'a Dir<ReadWrite>)>,
 }
 
-/// Reads a sealed `c-probe/<64-hex>` record from the command's `.blaze` home capability and
-/// returns its canonical answer digest (or [`crate::engine_script_reads::NONE`] on miss/torn).
+/// Reads a sealed `c-probe/<64-hex>` record from the command's `.blaze` home capability after
+/// verifying the subject's `(answerer, clang)` against the active command's hermetic answerer and
+/// `pins/clang.json` host pin, capping on-disk size before allocating.
 fn read_c_probe_reply(
     home: Option<(&Cx, &Dir<ReadWrite>)>,
-    hex: &str,
+    parsed: blaze_build_script::facts::CcProbeSubject,
+    key_hex: &str,
     alloc: blaze_own::Alloc<'_>,
 ) -> Result<ContentId, CliError> {
+    let active_answerer = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id();
+    let Some(active_pin) = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    read_c_probe_reply_with(home, parsed, key_hex, &active_answerer, &active_pin, alloc)
+}
+
+fn read_c_probe_reply_with(
+    home: Option<(&Cx, &Dir<ReadWrite>)>,
+    parsed: blaze_build_script::facts::CcProbeSubject,
+    key_hex: &str,
+    active_answerer: &ContentId,
+    active_pin: &[u8; 32],
+    alloc: blaze_own::Alloc<'_>,
+) -> Result<ContentId, CliError> {
+    if parsed.answerer != *active_answerer || parsed.clang != *active_pin {
+        return Ok(crate::engine_script_reads::NONE);
+    }
     let Some((cx, dir)) = home else {
         return Ok(crate::engine_script_reads::NONE);
     };
     const PREFIX: &[u8] = b"v2/build-script/records/c-probe/";
-    if hex.len() != 64 || !hex.is_ascii() {
+    if key_hex.len() != 64 || !key_hex.is_ascii() {
         return Ok(crate::engine_script_reads::NONE);
     }
     let mut path_buf = [0u8; PREFIX.len() + 64];
     path_buf[..PREFIX.len()].copy_from_slice(PREFIX);
-    path_buf[PREFIX.len()..].copy_from_slice(hex.as_bytes());
+    path_buf[PREFIX.len()..].copy_from_slice(key_hex.as_bytes());
     let Ok(path_str) = core::str::from_utf8(&path_buf) else {
         return Ok(crate::engine_script_reads::NONE);
     };
@@ -79,6 +99,9 @@ fn read_c_probe_reply(
     let Ok(len_u64) = file.len(cx) else {
         return Ok(crate::engine_script_reads::NONE);
     };
+    if len_u64 > blaze_proc_macro::probe_clang::MAX_RECORD_BYTES {
+        return Ok(crate::engine_script_reads::NONE);
+    }
     let Ok(len) = usize::try_from(len_u64) else {
         return Ok(crate::engine_script_reads::NONE);
     };
@@ -100,10 +123,10 @@ fn read_c_probe_reply(
 impl<'a> FactFiles<'a> {
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
         if let Some(subject) = path.strip_prefix(REPLY_FILES)
-            && blaze_build_script::facts::parse_cc_probe_subject(subject).is_some()
-            && let Some(hex) = subject.strip_prefix("cc-probe\n")
+            && let Some(parsed) = blaze_build_script::facts::parse_cc_probe_subject(subject)
+            && let Some(key_hex) = subject.rsplit('\n').next()
         {
-            return read_c_probe_reply(self.home, hex, alloc);
+            return read_c_probe_reply(self.home, parsed, key_hex, alloc);
         }
         if path == SHIM_FILE {
             let installed = || {
@@ -1893,24 +1916,47 @@ mod tests {
         blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_a, enc_a.as_slice()).expect("put A");
         blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_b, enc_b.as_slice()).expect("put B");
 
-        let subj_a = cc_probe_subject(&key_a, alloc);
-        let subj_b = cc_probe_subject(&key_b, alloc);
-        let path_a = std::format!("{REPLY_FILES}{}", subj_a.as_str());
-        let path_b = std::format!("{REPLY_FILES}{}", subj_b.as_str());
+        let active_answerer = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id();
+        let active_pin = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).unwrap_or([0x55u8; 32]);
+        let subj_a = cc_probe_subject(&active_answerer, &active_pin, &key_a, alloc);
+        let subj_b = cc_probe_subject(&active_answerer, &active_pin, &key_b, alloc);
+        let stale_pin = [0x99u8; 32];
+        let subj_stale = cc_probe_subject(&active_answerer, &stale_pin, &key_b, alloc);
+        let key_a_hex = subj_a.as_str().rsplit('\n').next().unwrap();
+        let key_b_hex = subj_b.as_str().rsplit('\n').next().unwrap();
         let dig_a = canonical_reply_digest(&ans_a);
         let dig_b = canonical_reply_digest(&ans_b);
 
+        // Direct validation (runs on every platform, including hosts without a clang.json pin).
+        let parsed_a = blaze_build_script::facts::parse_cc_probe_subject(subj_a.as_str()).unwrap();
+        let parsed_b = blaze_build_script::facts::parse_cc_probe_subject(subj_b.as_str()).unwrap();
+        let parsed_stale = blaze_build_script::facts::parse_cc_probe_subject(subj_stale.as_str()).unwrap();
+        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, alloc).unwrap(), dig_a);
+        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(), dig_b);
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_stale, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            crate::engine_script_reads::NONE,
+            "stale clang pin must invalidate"
+        );
+
+        let path_a = std::format!("{REPLY_FILES}{}", subj_a.as_str());
+        let path_b = std::format!("{REPLY_FILES}{}", subj_b.as_str());
+        let path_stale = std::format!("{REPLY_FILES}{}", subj_stale.as_str());
         let mut rows = Rows::new_in(frame);
         rows.push(LeafKind::ScriptFile, 0, &path_a, None, dig_a);
         rows.push(LeafKind::ScriptFile, 0, &path_b, None, dig_b);
+        rows.push(LeafKind::ScriptFile, 0, &path_stale, None, dig_b);
         let table = Leaves::bytes_in(&rows, frame).expect("table");
         let (last, _) = Leaves::of(&table).expect("leaves");
         let model = Model { now: Cell::new(10 * TICK), mtimes: RefCell::new(StdMap::new()) };
 
-        // Both rows stand unchanged when records match.
-        let followed = Follow { stamps: &model, plant: Plant::None }.follow(&cx, &root, Some(&home), &last, frame).expect("follow 1");
-        assert_eq!(followed.now.rows[0].id, dig_a, "probe A stands");
-        assert_eq!(followed.now.rows[1].id, dig_b, "probe B stands");
+        if blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).is_some() {
+            let followed = Follow { stamps: &model, plant: Plant::None }.follow(&cx, &root, Some(&home), &last, frame).expect("follow 1");
+            let id_of = |p: &str| followed.now.rows.iter().find(|r| followed.now.path(r) == p).expect("row").id;
+            assert_eq!(id_of(&path_a), dig_a, "probe A stands");
+            assert_eq!(id_of(&path_b), dig_b, "probe B stands");
+            assert_eq!(id_of(&path_stale), crate::engine_script_reads::NONE, "stale clang pin must invalidate");
+        }
 
         // Replace ONLY probe A's sealed file with a different answer; probe B stays valid.
         let ans_a2 = ProbeAnswer { code: 1, stdout: OwnString::new_in(alloc), stderr: OwnString::from_str_in("bad flag", alloc) };
@@ -1919,13 +1965,33 @@ mod tests {
         let mut sealed = std::vec::Vec::with_capacity(enc_a2.len() + 32);
         sealed.extend_from_slice(enc_a2.as_slice());
         sealed.extend_from_slice(&ContentId::of("blaze expansion record seal 1", enc_a2.as_slice()).0);
-        let rel_a = std::format!("v2/build-script/records/c-probe/{}", subj_a.as_str().strip_prefix("cc-probe\n").unwrap());
+        let rel_a = std::format!("v2/build-script/records/c-probe/{key_a_hex}");
         home.publish(&cx, &Path::new(&rel_a).expect("rel_a"), Content::bytes(&sealed), Durable::No).expect("overwrite A");
 
-        let followed2 = Follow { stamps: &model, plant: Plant::None }.follow(&cx, &root, Some(&home), &last, frame).expect("follow 2");
-        assert_eq!(followed2.now.rows[0].id, canonical_reply_digest(&ans_a2), "probe A reflects new answer");
-        assert_ne!(followed2.now.rows[0].id, dig_a, "probe A invalidated");
-        assert_eq!(followed2.now.rows[1].id, dig_b, "probe B untouched");
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            canonical_reply_digest(&ans_a2),
+            "probe A reflects new answer"
+        );
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            dig_b,
+            "probe B untouched"
+        );
+
+        // Oversized corrupted record (> MAX_RECORD_BYTES) is rejected as NONE before allocating.
+        let oversized = std::vec![0u8; (blaze_proc_macro::probe_clang::MAX_RECORD_BYTES as usize) + 1];
+        home.publish(&cx, &Path::new(&rel_a).expect("rel_a"), Content::bytes(&oversized), Durable::No).expect("oversized A");
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            crate::engine_script_reads::NONE,
+            "oversized c-probe record must return NONE"
+        );
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            dig_b,
+            "probe B still untouched"
+        );
     }
 }
 

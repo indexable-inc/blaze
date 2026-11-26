@@ -339,7 +339,8 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
     }
 }
 
-/// The head of a per-probe compiler read subject: `cc-probe\n<64 lowercase hex of ProbeKey>`.
+/// The head of a per-probe compiler read subject:
+/// `cc-probe\n<answerer 64-hex>\n<clang pin 64-hex>\n<probe key 64-hex>`.
 pub const CC_PROBE_HEAD: &str = "cc-probe";
 
 fn hex_nibble(n: u8) -> char {
@@ -349,20 +350,14 @@ fn hex_nibble(n: u8) -> char {
     }
 }
 
-/// The read subject for a resolved compiler probe, keyed by its canonical [`crate::c_tasks_probe::ProbeKey`].
-pub fn cc_probe_subject<'a>(key: &crate::c_tasks_probe::ProbeKey, alloc: Alloc<'a>) -> AString<'a> {
-    let mut out = String::from_str_in(CC_PROBE_HEAD, alloc);
-    out.push('\n');
-    for byte in key.0.0 {
+fn push_hex32(bytes: &[u8; 32], out: &mut AString<'_>) {
+    for byte in bytes {
         out.push(hex_nibble(byte >> 4));
         out.push(hex_nibble(byte & 15));
     }
-    out
 }
 
-/// Parses a `cc-probe\n<64 lowercase hex>` read subject back into its [`crate::c_tasks_probe::ProbeKey`].
-pub fn parse_cc_probe_subject(subject: &str) -> Option<crate::c_tasks_probe::ProbeKey> {
-    let hex = subject.strip_prefix(CC_PROBE_HEAD)?.strip_prefix('\n')?;
+fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return None;
     }
@@ -370,7 +365,50 @@ pub fn parse_cc_probe_subject(subject: &str) -> Option<crate::c_tasks_probe::Pro
     for (i, slot) in bytes.iter_mut().enumerate() {
         *slot = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
-    Some(crate::c_tasks_probe::ProbeKey(blaze_ids::ContentId(bytes)))
+    Some(bytes)
+}
+
+/// Parsed fields of a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<key 64-hex>` read subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CcProbeSubject {
+    pub answerer: blaze_ids::ContentId,
+    pub clang: [u8; 32],
+    pub key: crate::c_tasks_probe::ProbeKey,
+}
+
+/// The read subject for a resolved compiler probe, binding the active answerer strategy, pinned
+/// clang archive SHA-256, and canonical [`crate::c_tasks_probe::ProbeKey`].
+pub fn cc_probe_subject<'a>(
+    answerer: &blaze_ids::ContentId,
+    clang: &[u8; 32],
+    key: &crate::c_tasks_probe::ProbeKey,
+    alloc: Alloc<'a>,
+) -> AString<'a> {
+    let mut out = String::from_str_in(CC_PROBE_HEAD, alloc);
+    out.push('\n');
+    push_hex32(&answerer.0, &mut out);
+    out.push('\n');
+    push_hex32(clang, &mut out);
+    out.push('\n');
+    push_hex32(&key.0.0, &mut out);
+    out
+}
+
+/// Parses a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<key 64-hex>` read subject.
+pub fn parse_cc_probe_subject(subject: &str) -> Option<CcProbeSubject> {
+    let rest = subject.strip_prefix(CC_PROBE_HEAD)?.strip_prefix('\n')?;
+    let mut parts = rest.split('\n');
+    let answerer_hex = parts.next()?;
+    let clang_hex = parts.next()?;
+    let key_hex = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(CcProbeSubject {
+        answerer: blaze_ids::ContentId(parse_hex32(answerer_hex)?),
+        clang: parse_hex32(clang_hex)?,
+        key: crate::c_tasks_probe::ProbeKey(blaze_ids::ContentId(parse_hex32(key_hex)?)),
+    })
 }
 
 /// The fact's record subject for the script's read list (as D54's `git:` subjects): the whole

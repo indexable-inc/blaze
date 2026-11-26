@@ -192,6 +192,8 @@ pub enum ProbeWhy {
     Pending,
     /// The probe was given standard input, which no row holds.
     Stdin,
+    /// The probe references headers, response files, or package paths outside `OUT_DIR`.
+    PackageInput,
 }
 
 impl fmt::Display for ProbeRefused<'_> {
@@ -201,6 +203,9 @@ impl fmt::Display for ProbeRefused<'_> {
             ProbeWhy::Pending => write!(f, "a compiler probe whose row in {PATH} is still PENDING")?,
             ProbeWhy::Stdin => {
                 return write!(f, "a compiler probe given standard input: {PATH} keys no input but the arguments, the environment and the files (rule 21): {}", self.row.as_str());
+            }
+            ProbeWhy::PackageInput => {
+                return write!(f, "a compiler probe references headers or package paths outside OUT_DIR, which a zero-header probe does not key or mount (rule 21): {}", self.row.as_str());
             }
         }
         write!(f, "; add or keep the row and run scripts/src/bin/clang_answers.rs: {}", self.row.as_str())
@@ -359,6 +364,14 @@ impl<'b> CanonicalProbe<'b, '_> {
     }
 }
 
+/// Whether `arg` is a safe string-rewriting prefix-map flag that never reads package files.
+fn is_prefix_map_flag(arg: &str) -> bool {
+    arg.starts_with("-ffile-prefix-map=")
+        || arg.starts_with("-fdebug-prefix-map=")
+        || arg.starts_with("-fmacro-prefix-map=")
+        || arg.starts_with("-fcoverage-prefix-map=")
+}
+
 /// Builds a [`CanonicalProbe`] and its [`ProbeKey`] from a script spawn.
 pub fn canonicalize<'b, 's>(
     answerer_id: ContentId,
@@ -371,6 +384,14 @@ pub fn canonicalize<'b, 's>(
     let asked = asked(clang_hex.as_str(), spawn, &mut file, alloc);
     if !spawn.stdin.is_empty() {
         return Err(ProbeRefused { why: ProbeWhy::Stdin, row: row_json(&asked.row, alloc) });
+    }
+    let has_package_input = spawn.args.iter().any(|arg| {
+        is_header_search_flag(arg)
+            || arg.starts_with('@')
+            || (!spawn.mount.is_empty() && arg.contains(spawn.mount) && !is_prefix_map_flag(arg))
+    });
+    if has_package_input {
+        return Err(ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&asked.row, alloc) });
     }
     let key = probe_key(answerer_id, clang, spawn.sdk_id, &asked.row);
     Ok(CanonicalProbe {
@@ -483,14 +504,14 @@ impl<'t> TableAnswerer<'t> {
         TableAnswerer { table }
     }
 
-    pub fn strategy_id() -> ContentId {
-        ContentId::of("blaze-build-script c-probe table answerer 1", b"v1")
+    pub fn strategy_id(table_id: ContentId) -> ContentId {
+        ContentId::of("blaze-build-script c-probe table answerer 1", &table_id.0)
     }
 }
 
 impl ProbeAnswerer for TableAnswerer<'_> {
     fn id(&self) -> ContentId {
-        Self::strategy_id()
+        Self::strategy_id(self.table.id())
     }
 
     fn answer<'a, 'b>(

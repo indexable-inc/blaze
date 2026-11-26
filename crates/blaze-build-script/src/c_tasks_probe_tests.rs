@@ -251,7 +251,7 @@ fn the_pinned_table_answers_a_linux_arm64_family_probe() {
 #[test]
 fn mount_normalization_shares_probe_key_across_package_and_vendored_workspace() {
     let alloc = blaze_own::testing::heap().alloc();
-    let id = TableAnswerer::strategy_id();
+    let id = TableAnswerer::strategy_id(blaze_ids::ContentId([0; 32]));
     let pkg_args = flag_args("-ffile-prefix-map=/package=");
     let ws_args = flag_args("-ffile-prefix-map=/workspace/vendored/aws-lc-sys=");
     let pkg_spawn = Spawn { program: "cc", args: &pkg_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
@@ -336,4 +336,31 @@ fn binary_probe_answer_round_trips_and_resolves_once_via_cache() {
     assert_eq!(first.key, second.key);
     assert_eq!(first.canonical_digest, second.canonical_digest);
     assert_eq!(first.answered.stdout.as_str(), "ok /target/debug/build/zstd-sys-1/out/flag_check.c\n");
+}
+
+#[test]
+fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
+    let alloc = blaze_own::testing::heap().alloc();
+    // `-E` with header search flags is neither a zero-header probe nor a deferred C tool.
+    let pp_args = ["-E", "-I", "/package/include", "/package/src/check.c"];
+    assert!(!is_probe("cc", &pp_args));
+    assert!(!crate::probe::is_deferred_tool("cc", &pp_args));
+
+    // `flag_check` referencing package headers or non-prefix-map `$MOUNT` paths is refused cleanly.
+    let files = |name: &str| (name == "flag_check.c").then_some(FLAG_SRC);
+    let bad_inc = ["-c", "-I/package/include", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
+    let sp_inc = Spawn { program: "cc", args: &bad_inc, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    let err = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_inc, files, alloc).err().expect("must refuse -I in flag_check");
+    assert_eq!(err.why, ProbeWhy::PackageInput);
+
+    // Non-prefix-map reference to `$MOUNT` is refused, while `-ffile-prefix-map=<mount>=` is allowed.
+    let bad_mount = ["-c", "/workspace/vendored/foo/header.h", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
+    let sp_mount = Spawn { program: "cc", args: &bad_mount, env: ENV, out_dir: OUT, sdk: SDK, mount: "/workspace/vendored/foo", sdk_id: "", stdin: &[] };
+    let err2 = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_mount, files, alloc).err().expect("must refuse mount path in flag_check");
+    assert_eq!(err2.why, ProbeWhy::PackageInput);
+
+    // TableAnswerer strategy id changes when the table bytes change.
+    let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
+    let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");
+    assert_ne!(TableAnswerer::new(&t1).id(), TableAnswerer::new(&t2).id());
 }

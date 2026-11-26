@@ -29,10 +29,11 @@ use core::ffi::CStr;
 
 use blaze_own::{Alloc, planted::NoPlant};
 use blaze_sys::{
+    Fd,
     linux::{
         AccessFs, AccessNet, CWD, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter,
         confine::{self, ChildConfine, Filter, MOST_FILTER, Resource, Rlimit},
-        landlock_abi, landlock_add_rule_path, landlock_create_ruleset, openat,
+        landlock_abi, landlock_add_rule_path, landlock_create_ruleset, openat, pread, readlinkat,
     },
 };
 
@@ -48,27 +49,13 @@ use crate::{
 };
 
 /// The loader and the system libraries: read whole (and the loader run: see `prepare`).
-/// `/lib64` holds x86-64's loader (`/lib64/ld-linux-x86-64.so.2`); `/nix/store` and
-/// `/run/current-system/sw/share/nix-ld/lib` hold NixOS's dynamic loader and libraries.
+/// `/lib64` holds x86-64's loader (`/lib64/ld-linux-x86-64.so.2`).
 /// Missing optional system paths are skipped in [`prepare`] (`Errno::NoEnt` on `Why::System`
 /// rules only); every user root and program path is still strictly required.
 #[cfg(target_arch = "x86_64")]
-pub const SYSTEM: [&str; 6] = [
-    "/usr/lib",
-    "/lib",
-    "/lib64",
-    "/etc/ld.so.cache",
-    "/nix/store",
-    "/run/current-system/sw/share/nix-ld/lib",
-];
+pub const SYSTEM: [&str; 4] = ["/usr/lib", "/lib", "/lib64", "/etc/ld.so.cache"];
 #[cfg(not(target_arch = "x86_64"))]
-pub const SYSTEM: [&str; 5] = [
-    "/usr/lib",
-    "/lib",
-    "/etc/ld.so.cache",
-    "/nix/store",
-    "/run/current-system/sw/share/nix-ld/lib",
-];
+pub const SYSTEM: [&str; 3] = ["/usr/lib", "/lib", "/etc/ld.so.cache"];
 
 /// The oldest Landlock ABI that confines a child here.
 pub const LEAST_ABI: u32 = 3;
@@ -154,8 +141,11 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         if rule.why == Why::System {
             granted |= AccessFs::EXECUTE.bits();
         }
-        let rule = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
-        landlock_add_rule_path(ruleset.fd(), &rule).map_err(|errno| Fault::Host { call: "landlock_add_rule", code: errno.raw() })?;
+        let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
+        landlock_add_rule_path(ruleset.fd(), &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule", code: errno.raw() })?;
+        if matches!(rule.why, Why::Program | Why::Helper) {
+            grant_nix_elf_closure(ruleset.fd(), path)?;
+        }
     }
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
     let filter_len = confine::build(Filter { processes }, &mut filter).len();
@@ -166,6 +156,227 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         (Resource::Core, Rlimit { soft: 0, hard: 0 }),
     ];
     Ok(Prepared { ruleset, filter, filter_len, limits })
+}
+
+/// On NixOS hosts where an ELF program's `PT_INTERP` (e.g. `/lib/ld-linux-aarch64.so.1`) symlinks
+/// into `/nix/store/...` (`nix-ld`), grants Landlock single-file `READ_FILE | EXECUTE` ONLY on the
+/// exact loader binary and the shared libraries referenced by that binary's `DT_NEEDED` entries
+/// (plus core libc/libm/libgcc_s/ld.so under `/run/current-system/sw/share/nix-ld/lib`), never on
+/// `/nix/store` as a directory. Does nothing on non-NixOS hosts or non-ELF scripts.
+fn grant_nix_elf_closure(ruleset: Fd, program: &CStr) -> Result<(), Fault> {
+    let Ok(file) = openat(CWD, blaze_sys::Path::new(program), OpenFlags::CLOSE_ON_EXEC, 0) else {
+        return Ok(());
+    };
+    let mut ehdr = [0u8; 64];
+    if pread(file.fd(), &mut ehdr, 0).unwrap_or(0) < 64 {
+        return Ok(());
+    }
+    // ELF64 little-endian magic check.
+    if ehdr.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
+        return Ok(());
+    }
+    let e_phoff = read_u64_le(&ehdr, 32);
+    let e_phentsize = usize::from(read_u16_le(&ehdr, 54));
+    let e_phnum = usize::from(read_u16_le(&ehdr, 56));
+    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 64 {
+        return Ok(());
+    }
+    let mut interp_off = 0u64;
+    let mut interp_len = 0usize;
+    let mut dyn_off = 0u64;
+    let mut dyn_len = 0usize;
+    // Track up to 16 PT_LOAD segments to map DT_STRTAB vaddr -> file offset.
+    let mut loads = [(0u64, 0u64, 0u64); 16]; // (p_vaddr, p_offset, p_filesz)
+    let mut load_count = 0usize;
+    let mut ph_buf = [0u8; 64];
+    for i in 0..e_phnum {
+        let Some(off) = u64::try_from(i).ok().and_then(|n| n.checked_mul(u64::try_from(e_phentsize).unwrap_or(0))).and_then(|o| e_phoff.checked_add(o)) else {
+            break;
+        };
+        if pread(file.fd(), &mut ph_buf[..56], off).unwrap_or(0) < 56 {
+            break;
+        }
+        let p_type = read_u32_le(&ph_buf, 0);
+        let p_offset = read_u64_le(&ph_buf, 8);
+        let p_vaddr = read_u64_le(&ph_buf, 16);
+        let p_filesz = read_u64_le(&ph_buf, 32);
+        match p_type {
+            1 => {
+                // PT_LOAD
+                if let Some(slot) = loads.get_mut(load_count) {
+                    *slot = (p_vaddr, p_offset, p_filesz);
+                    load_count += 1;
+                }
+            }
+            3 => {
+                // PT_INTERP
+                interp_off = p_offset;
+                interp_len = usize::try_from(p_filesz).unwrap_or(0).min(512);
+            }
+            2 => {
+                // PT_DYNAMIC
+                dyn_off = p_offset;
+                dyn_len = usize::try_from(p_filesz).unwrap_or(0).min(8192);
+            }
+            _ => {}
+        }
+    }
+    if interp_len == 0 {
+        return Ok(());
+    }
+    let mut interp_buf = [0u8; 512];
+    let Some(interp_slice) = interp_buf.get_mut(..interp_len) else {
+        return Ok(());
+    };
+    let n = pread(file.fd(), interp_slice, interp_off).unwrap_or(0);
+    let Some(interp_bytes) = interp_buf.get(..n) else {
+        return Ok(());
+    };
+    let nul_pos = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+    let mut interp_c = [0u8; 513];
+    let Some(dst) = interp_c.get_mut(..nul_pos) else {
+        return Ok(());
+    };
+    let Some(src) = interp_bytes.get(..nul_pos) else {
+        return Ok(());
+    };
+    dst.copy_from_slice(src);
+    let Ok(interp_cstr) = CStr::from_bytes_until_nul(&interp_c) else {
+        return Ok(());
+    };
+    // Only engage on NixOS where the ELF interpreter symlinks into `/nix/store/`.
+    let mut link_buf = [0u8; 512];
+    let Ok(target) = readlinkat(CWD, blaze_sys::Path::new(interp_cstr), &mut link_buf) else {
+        return Ok(());
+    };
+    if !target.starts_with(b"/nix/store/") {
+        return Ok(());
+    }
+    // Grant single-file READ_FILE | EXECUTE on the resolved loader (`nix-ld`) and glibc `ld.so`.
+    add_nix_file_rule(ruleset, interp_cstr)?;
+    const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
+    const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
+    add_nix_file_rule(ruleset, NIX_LD_SO)?;
+    // Resolve `ld.so`'s target (`/nix/store/<hash>-glibc-.../lib/ld-linux-*.so.*`) to find the
+    // exact glibc `lib/` prefix where `libc.so.6` and `libm.so.6` live (never granting `/nix/store`).
+    let mut glibc_buf = [0u8; 512];
+    let glibc_dir: Option<&[u8]> = readlinkat(CWD, blaze_sys::Path::new(NIX_LD_SO), &mut glibc_buf)
+        .ok()
+        .and_then(|resolved| {
+            let slash = resolved.iter().rposition(|&b| b == b'/')?;
+            resolved.get(..=slash)
+        });
+    for base in [b"libc.so.6".as_slice(), b"libm.so.6", b"libgcc_s.so.1", b"libpthread.so.0", b"libdl.so.2", b"librt.so.1"] {
+        add_nix_lib_rule(ruleset, NIX_LD_DIR, base)?;
+        if let Some(dir) = glibc_dir {
+            add_nix_lib_rule(ruleset, dir, base)?;
+        }
+    }
+    if dyn_len == 0 {
+        return Ok(());
+    }
+    // Read PT_DYNAMIC to locate DT_STRTAB and DT_NEEDED sonames.
+    let mut dyn_buf = [0u8; 8192];
+    let Some(dyn_slice) = dyn_buf.get_mut(..dyn_len) else {
+        return Ok(());
+    };
+    let dyn_read = pread(file.fd(), dyn_slice, dyn_off).unwrap_or(0);
+    let mut strtab_vaddr = None;
+    let mut needed_offs = [0u64; 64];
+    let mut needed_count = 0usize;
+    let mut pos = 0usize;
+    while pos + 16 <= dyn_read {
+        let tag = read_u64_le(&dyn_buf, pos);
+        let val = read_u64_le(&dyn_buf, pos + 8);
+        pos += 16;
+        if tag == 0 {
+            break; // DT_NULL
+        } else if tag == 5 {
+            strtab_vaddr = Some(val); // DT_STRTAB
+        } else if tag == 1 {
+            // DT_NEEDED
+            if let Some(slot) = needed_offs.get_mut(needed_count) {
+                *slot = val;
+                needed_count += 1;
+            }
+        }
+    }
+    let Some(strtab_vaddr) = strtab_vaddr else {
+        return Ok(());
+    };
+    let strtab_file_off = loads.get(..load_count).and_then(|ls| {
+        ls.iter().find_map(|&(vaddr, foff, filesz)| {
+            let delta = strtab_vaddr.checked_sub(vaddr)?;
+            (delta < filesz).then(|| foff.checked_add(delta))?
+        })
+    });
+    let Some(strtab_file_off) = strtab_file_off else {
+        return Ok(());
+    };
+    let mut name_buf = [0u8; 192];
+    for &str_off in needed_offs.get(..needed_count).unwrap_or(&[]) {
+        let Some(at) = strtab_file_off.checked_add(str_off) else {
+            continue;
+        };
+        let n = pread(file.fd(), &mut name_buf, at).unwrap_or(0);
+        let Some(raw) = name_buf.get(..n) else {
+            continue;
+        };
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let Some(soname) = raw.get(..end) else {
+            continue;
+        };
+        if !soname.is_empty() && !soname.contains(&b'/') {
+            add_nix_lib_rule(ruleset, NIX_LD_DIR, soname)?;
+            if let Some(dir) = glibc_dir {
+                add_nix_lib_rule(ruleset, dir, soname)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_nix_lib_rule(ruleset: Fd, dir_prefix: &[u8], soname: &[u8]) -> Result<(), Fault> {
+    let mut path_buf = [0u8; 256];
+    let total = dir_prefix.len().saturating_add(soname.len());
+    if total + 1 > path_buf.len() {
+        return Ok(());
+    }
+    if let Some(head) = path_buf.get_mut(..dir_prefix.len()) {
+        head.copy_from_slice(dir_prefix);
+    }
+    if let Some(tail) = path_buf.get_mut(dir_prefix.len()..total) {
+        tail.copy_from_slice(soname);
+    }
+    if let Ok(cstr) = CStr::from_bytes_until_nul(&path_buf) {
+        add_nix_file_rule(ruleset, cstr)?;
+    }
+    Ok(())
+}
+
+fn add_nix_file_rule(ruleset: Fd, path: &CStr) -> Result<(), Fault> {
+    let flags = OpenFlags::PATH.with(OpenFlags::CLOSE_ON_EXEC);
+    let fd = match openat(CWD, blaze_sys::Path::new(path), flags, 0) {
+        Ok(fd) => fd,
+        Err(blaze_sys::Errno::NoEnt) => return Ok(()),
+        Err(errno) => return Err(Fault::Host { call: "openat (nix runtime file, O_PATH)", code: errno.raw() }),
+    };
+    let granted = AccessFs::READ_FILE.with(AccessFs::EXECUTE).bits();
+    let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
+    landlock_add_rule_path(ruleset, &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule (nix runtime file)", code: errno.raw() })?;
+    Ok(())
+}
+
+fn read_u16_le(buf: &[u8], at: usize) -> u16 {
+    buf.get(at..at + 2).and_then(|s| s.try_into().ok()).map_or(0, u16::from_le_bytes)
+}
+
+fn read_u32_le(buf: &[u8], at: usize) -> u32 {
+    buf.get(at..at + 4).and_then(|s| s.try_into().ok()).map_or(0, u32::from_le_bytes)
+}
+
+fn read_u64_le(buf: &[u8], at: usize) -> u64 {
+    buf.get(at..at + 8).and_then(|s| s.try_into().ok()).map_or(0, u64::from_le_bytes)
 }
 
 /// `spec` run confined (module docs).

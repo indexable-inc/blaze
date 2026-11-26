@@ -393,7 +393,7 @@ pub fn fact_reply_matches_with_probes(
     subject: &str,
     observed: Option<ContentId>,
     pins: Option<&FactPins>,
-    c_probes: Option<&dyn crate::probe_clang::CProbeStore>,
+    c_probes: Option<&crate::probe_clang::CScriptProbes>,
     alloc: Alloc<'_>,
 ) -> bool {
     if observed.is_none() || !is_fact_reply(subject, alloc) {
@@ -548,29 +548,36 @@ impl ScriptSandbox {
         let held_digest = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
         let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
 
-        if let Some(c_probes) = &script.c_probes {
-            let probe = c_tasks_probe::Spawn {
-                program,
-                args: &arg_refs,
-                env: &env,
-                out_dir: script.out_dir(),
-                sdk,
-                mount: mount.as_str(),
-                sdk_id: &c_probes.sdk_id,
-                stdin: &spawned.stdin,
-            };
-            let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
-            let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
-                Ok(resolved) => resolved,
-                Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
-            };
-            let subject = facts::cc_probe_subject(&resolved.key, alloc);
-            let code = resolved.answered.code;
-            let stdout = resolved.answered.stdout.as_bytes().to_vec();
-            let stderr = resolved.answered.stderr.as_bytes().to_vec();
-            let subject_owned = subject.as_str().to_owned();
-            self.record(subject_owned, Some(resolved.canonical_digest));
-            return self.deliver(program, spawned.modes, code, &stdout, &stderr);
+        match &script.c_probes {
+            Some(crate::probe_clang::CProbeSetting::Ready(c_probes)) => {
+                let probe = c_tasks_probe::Spawn {
+                    program,
+                    args: &arg_refs,
+                    env: &env,
+                    out_dir: script.out_dir(),
+                    sdk,
+                    mount: mount.as_str(),
+                    sdk_id: &c_probes.sdk_id,
+                    stdin: &spawned.stdin,
+                };
+                let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
+                let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
+                    Ok(resolved) => resolved,
+                    Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
+                };
+                let answerer_id = c_probes.answerer.id();
+                let subject = facts::cc_probe_subject(&answerer_id, &clang, &resolved.key, alloc);
+                let code = resolved.answered.code;
+                let stdout = resolved.answered.stdout.as_bytes().to_vec();
+                let stderr = resolved.answered.stderr.as_bytes().to_vec();
+                let subject_owned = subject.as_str().to_owned();
+                self.record(subject_owned, Some(resolved.canonical_digest));
+                return self.deliver(program, spawned.modes, code, &stdout, &stderr);
+            }
+            Some(crate::probe_clang::CProbeSetting::Unavailable(why)) => {
+                return Err(self.refuse(Refusal::Spawn(refused(why.as_ref().to_owned()))));
+            }
+            None => {}
         }
 
         let probe = c_tasks_probe::Spawn {
