@@ -1717,9 +1717,25 @@ mod tests {
         let tmp_cx = tmp_io.cx(super::Duration::from_secs(5), bstd::mem::TASK_FRAME).expect("tmp cx");
         let unsupported = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "riscv64-unknown-linux-gnu", None, alloc);
         assert!(matches!(unsupported, CProbeSetting::Unavailable(_)), "unsupported host must return Unavailable");
-        // Opening a native world over a missing root must fail loudly (never silently drop `native_root_dir`).
-        assert!(crate::record::native_world(&empty_home).is_err(), "native_world over nonexistent root must fail");
+        // Opening a native world over a non-directory file must fail loudly (ENOTDIR), while a
+        // not-yet-created directory is allowed (matching `blaze-core` lazy folder creation on a
+        // fresh `$HOME`) and refuses `lock_exclusive` until the directory exists.
+        let not_a_dir = std::env::temp_dir().join(format!("blaze-cprobe-notdir-{}", std::process::id()));
+        std::fs::write(&not_a_dir, b"file").expect("write non-dir file");
+        assert!(crate::record::native_world(&not_a_dir).is_err(), "native_world over regular file must fail");
+        let _ = std::fs::remove_file(&not_a_dir);
+        let (lazy_io, lazy_dir) = crate::record::native_world(&empty_home).expect("native_world over not-yet-created root");
+        let lazy_cx = lazy_io.cx(super::Duration::from_secs(5), bstd::mem::TASK_FRAME).expect("lazy cx");
+        let lazy_lock_path = bstd::path::Path::new("sub/.repair.lock").expect("lazy lock path");
+        assert!(
+            lazy_dir.lock_exclusive(&lazy_cx, &lazy_lock_path).is_err(),
+            "lock_exclusive must fail with ENOENT while root directory does not exist"
+        );
         std::fs::create_dir_all(&empty_home).expect("create empty home");
+        let lazy_held = lazy_dir.lock_exclusive(&lazy_cx, &lazy_lock_path).expect("lock_exclusive after root created");
+        lazy_held.unlock(&lazy_cx).expect("unlock lazy lock");
+        let _ = std::fs::remove_dir_all(&empty_home);
+        std::fs::create_dir_all(&empty_home).expect("recreate clean empty home");
         #[cfg(target_os = "linux")]
         {
             let x64_ready = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "x86_64-unknown-linux-gnu", None, alloc);

@@ -1934,6 +1934,7 @@ mod tests {
             limits: RunLimits { fuel: 1 << 26, memory: 16 << 20, out_dir_bytes: 1 << 20, out_dir_files: 16, output: 1 << 20, line: 256 << 10 },
             table: Arc::new(Vec::new()),
             probes: None,
+            c_probes: None,
             spawner: None,
             step: blaze_ids::ContentId::default(),
             spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),
