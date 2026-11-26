@@ -1873,6 +1873,43 @@ where
     let _ = cs;
     conv.erased();
 }
+
+// alloy-sol-types `SolCall` pattern: `type Parameters<'a>: SolType<Token<'a> = Self::Token<'a>>`
+// with concrete `impl SolCall for CyTransferCall { type Parameters<'a> = (CySolAddr, CySolU256);
+// type Token<'a> = <Self::Parameters<'a> as CySolTy>::Token<'a>; }`. Normalizing
+// `<CyTransferCall::Parameters<'a> as CySolTy>::Token<'a>` must select the concrete tuple impl
+// rather than falling back to the cyclic trait bound `Parameters<'a>: CySolTy<Token<'a> = Self::Token<'a>>`.
+trait CySolTokSeq<'a> {}
+trait CySolTy {
+    type Token<'a>: CySolTokSeq<'a>;
+}
+struct CySolAddr;
+struct CySolU256;
+struct CySolWord<'a>(core::marker::PhantomData<&'a ()>);
+impl<'a> CySolTokSeq<'a> for CySolWord<'a> {}
+impl<'a, A: CySolTokSeq<'a>, B: CySolTokSeq<'a>> CySolTokSeq<'a> for (A, B) {}
+impl CySolTy for CySolAddr {
+    type Token<'a> = CySolWord<'a>;
+}
+impl CySolTy for CySolU256 {
+    type Token<'a> = CySolWord<'a>;
+}
+impl<A: CySolTy, B: CySolTy> CySolTy for (A, B) {
+    type Token<'a> = (A::Token<'a>, B::Token<'a>);
+}
+trait CySolCall: Sized {
+    type Parameters<'a>: CySolTy<Token<'a> = Self::Token<'a>>;
+    type Token<'a>: CySolTokSeq<'a>;
+}
+struct CyTransferCall;
+impl CySolCall for CyTransferCall {
+    type Parameters<'a> = (CySolAddr, CySolU256);
+    type Token<'a> = <Self::Parameters<'a> as CySolTy>::Token<'a>;
+}
+fn use_cy_sol_call<C: CySolCall>(_c: &C) {}
+fn repro_sol_call_cyclic_assoc_bound() {
+    use_cy_sol_call(&CyTransferCall);
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();
