@@ -895,20 +895,28 @@ fn should_keep_non_seed(
 }
 
 /// Enqueues a candidate target symbol into either `call_queue` (direct `Call`/`Invoke` edges) or
-/// `indirect_queue` (`FuncAddr` and vtable method targets) if eligible and not yet queued at that
-/// priority.
+/// `indirect_queue` (`FuncAddr` and vtable/relocated-data targets) while preserving the shallowest
+/// observed BFS depth (`min_depth`). If a row was already scanned at `depth >= max_depth` without
+/// expanding its callees (`PROCESSED_UNEXPANDED`) and is later reached at a strictly shallower
+/// depth `< max_depth`, it is re-queued in `QUEUED_EXPAND_ONLY` mode so its downstream callees are
+/// expanded without duplicating the row in `origins`.
 const UNSEEN: u8 = 0;
 const QUEUED_INDIRECT: u8 = 1;
 const QUEUED_CALL: u8 = 2;
-const PROCESSED: u8 = 3;
+const PROCESSED_UNEXPANDED: u8 = 3;
+const QUEUED_EXPAND_ONLY: u8 = 4;
+const PROCESSED: u8 = 5;
 
+#[expect(clippy::too_many_arguments, reason = "BFS enqueue helper threading explicit queues and state slices without extra allocations")]
 fn enqueue_sym(
     walk: &Walk<'_>,
     sym: Symbol,
     direct: bool,
     next_depth: u8,
+    max_depth: u8,
     is_eligible_callee: &impl Fn(usize) -> bool,
     visited: &mut [u8],
+    min_depth: &mut [u8],
     call_queue: &mut AVec<'_, (usize, u8, bool)>,
     indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
 ) {
@@ -918,13 +926,27 @@ fn enqueue_sym(
     if !is_eligible_callee(callee_row) {
         return;
     }
+    let eff_depth = if let Some(best) = min_depth.get_mut(callee_row) {
+        let updated = (*best).min(next_depth);
+        *best = updated;
+        updated
+    } else {
+        next_depth
+    };
     if let Some(state) = visited.get_mut(callee_row) {
         if direct && *state < QUEUED_CALL {
             *state = QUEUED_CALL;
-            call_queue.push((callee_row, next_depth, false));
+            call_queue.push((callee_row, eff_depth, false));
         } else if !direct && *state == UNSEEN {
             *state = QUEUED_INDIRECT;
-            indirect_queue.push((callee_row, next_depth, false));
+            indirect_queue.push((callee_row, eff_depth, false));
+        } else if *state == PROCESSED_UNEXPANDED && eff_depth < max_depth {
+            *state = QUEUED_EXPAND_ONLY;
+            if direct {
+                call_queue.push((callee_row, eff_depth, false));
+            } else {
+                indirect_queue.push((callee_row, eff_depth, false));
+            }
         }
     }
 }
@@ -932,13 +954,16 @@ fn enqueue_sym(
 /// Enqueues every concrete `Space::Func` method symbol referenced by vtable `vsym` in
 /// `built.vtable_data` into `indirect_queue` so `&dyn Trait` hot implementations (e.g.
 /// `serde_json::read::SliceRead`, `std::io::Read`) are discovered by export LTO BFS.
+#[expect(clippy::too_many_arguments, reason = "vtable BFS enqueue helper threading explicit queues and state slices")]
 fn enqueue_vtable_methods<A: core::alloc::Allocator>(
     built: &BuiltLir<A>,
     vsym: Symbol,
     walk: &Walk<'_>,
     next_depth: u8,
+    max_depth: u8,
     is_eligible_callee: &impl Fn(usize) -> bool,
     visited: &mut [u8],
+    min_depth: &mut [u8],
     call_queue: &mut AVec<'_, (usize, u8, bool)>,
     indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
 ) {
@@ -952,7 +977,103 @@ fn enqueue_vtable_methods<A: core::alloc::Allocator>(
         for i in 0..dv.targets() {
             let target = dv.target(i);
             if target.space == Space::Func {
-                enqueue_sym(walk, target.symbol, false, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                enqueue_sym(
+                    walk,
+                    target.symbol,
+                    false,
+                    next_depth,
+                    max_depth,
+                    is_eligible_callee,
+                    visited,
+                    min_depth,
+                    call_queue,
+                    indirect_queue,
+                );
+            }
+        }
+    }
+}
+
+/// Iteratively traverses local `RefKind::Data` relocations starting from `root_data` (following
+/// nested `Data -> Data -> Func/Vtable` chains while guarding against cycles via `visited_data`)
+/// and enqueues every discovered function or vtable method target into `indirect_queue`.
+#[expect(clippy::too_many_arguments, reason = "iterative data-reloc traversal helper threading explicit queues and per-body visited state")]
+fn enqueue_data_relocs<A: core::alloc::Allocator>(
+    built: &BuiltLir<A>,
+    root_data: u32,
+    walk: &Walk<'_>,
+    next_depth: u8,
+    max_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    min_depth: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+    visited_data: &mut [bool],
+    data_stack: &mut AVec<'_, u32>,
+) {
+    let Ok(root_idx) = usize::try_from(root_data) else {
+        return;
+    };
+    let Some(seen_root) = visited_data.get_mut(root_idx) else {
+        return;
+    };
+    if *seen_root {
+        return;
+    }
+    *seen_root = true;
+    data_stack.clear();
+    data_stack.push(root_data);
+
+    let view = built.func.view();
+    while let Some(data_place) = data_stack.pop() {
+        for reloc in view.data_relocs_of(DataId(data_place)) {
+            let Some(trec) = view.refs.get(RefId(reloc.target).index()) else {
+                continue;
+            };
+            match RefKind::from_word(trec.kind) {
+                Some(RefKind::Func) => {
+                    let Ok(place_idx) = usize::try_from(trec.place) else { continue };
+                    let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
+                    enqueue_sym(
+                        walk,
+                        callee_sym,
+                        false,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
+                }
+                Some(RefKind::Vtable) => {
+                    let Ok(place_idx) = usize::try_from(trec.place) else { continue };
+                    let Some(&vsym) = built.vtables.get(place_idx) else { continue };
+                    enqueue_vtable_methods(
+                        built,
+                        vsym,
+                        walk,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
+                }
+                Some(RefKind::Data) => {
+                    let Ok(next_idx) = usize::try_from(trec.place) else { continue };
+                    if let Some(seen) = visited_data.get_mut(next_idx)
+                        && !*seen
+                    {
+                        *seen = true;
+                        data_stack.push(trec.place);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -961,18 +1082,24 @@ fn enqueue_vtable_methods<A: core::alloc::Allocator>(
 /// Enqueues every non-cold callee reachable from `BlockKind::Normal` blocks of `built`:
 /// - direct `Op::Call` and `Op::Invoke` targets into `call_queue` (now that unwinding `Op::Invoke`
 ///   inlines cleanly, normal-block `Op::Invoke` is a first-class hot edge);
-/// - `Op::FuncAddr` function-pointer targets and `Op::DataAddr` vtable / relocated-data targets
-///   into `indirect_queue`.
+/// - `Op::FuncAddr` function-pointer targets and `Op::DataAddr` vtable / nested relocated-data
+///   targets into `indirect_queue`.
+#[expect(clippy::too_many_arguments, reason = "BFS callee discovery helper threading explicit queues, depth bounds, and scratch allocator")]
 fn enqueue_normal_callees<A: core::alloc::Allocator>(
     built: &BuiltLir<A>,
     walk: &Walk<'_>,
     next_depth: u8,
+    max_depth: u8,
     is_eligible_callee: &impl Fn(usize) -> bool,
     visited: &mut [u8],
+    min_depth: &mut [u8],
     call_queue: &mut AVec<'_, (usize, u8, bool)>,
     indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+    scratch: Alloc<'_>,
 ) {
     let view = built.func.view();
+    let mut visited_data: AVec<'_, bool> = Vec::new_in(scratch);
+    let mut data_stack: AVec<'_, u32> = Vec::new_in(scratch);
     for b in 0..view.blocks() {
         let Ok(b_u32) = u32::try_from(b) else { break };
         let block = Block(b_u32);
@@ -995,7 +1122,18 @@ fn enqueue_normal_callees<A: core::alloc::Allocator>(
                     }
                     let Ok(place_idx) = usize::try_from(rec.place) else { continue };
                     let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
-                    enqueue_sym(walk, callee_sym, true, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                    enqueue_sym(
+                        walk,
+                        callee_sym,
+                        true,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
                 }
                 Op::FuncAddr => {
                     let Some(&ref_word) = view.data.get(at) else { continue };
@@ -1005,7 +1143,18 @@ fn enqueue_normal_callees<A: core::alloc::Allocator>(
                     }
                     let Ok(place_idx) = usize::try_from(rec.place) else { continue };
                     let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
-                    enqueue_sym(walk, callee_sym, false, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                    enqueue_sym(
+                        walk,
+                        callee_sym,
+                        false,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
                 }
                 Op::DataAddr => {
                     let Some(&ref_word) = view.data.get(at) else { continue };
@@ -1014,25 +1163,37 @@ fn enqueue_normal_callees<A: core::alloc::Allocator>(
                         Some(RefKind::Vtable) => {
                             let Ok(place_idx) = usize::try_from(rec.place) else { continue };
                             let Some(&vsym) = built.vtables.get(place_idx) else { continue };
-                            enqueue_vtable_methods(built, vsym, walk, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                            enqueue_vtable_methods(
+                                built,
+                                vsym,
+                                walk,
+                                next_depth,
+                                max_depth,
+                                is_eligible_callee,
+                                visited,
+                                min_depth,
+                                call_queue,
+                                indirect_queue,
+                            );
                         }
                         Some(RefKind::Data) => {
-                            for reloc in view.data_relocs_of(DataId(rec.place)) {
-                                let Some(trec) = view.refs.get(RefId(reloc.target).index()) else { continue };
-                                match RefKind::from_word(trec.kind) {
-                                    Some(RefKind::Func) => {
-                                        let Ok(place_idx) = usize::try_from(trec.place) else { continue };
-                                        let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
-                                        enqueue_sym(walk, callee_sym, false, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
-                                    }
-                                    Some(RefKind::Vtable) => {
-                                        let Ok(place_idx) = usize::try_from(trec.place) else { continue };
-                                        let Some(&vsym) = built.vtables.get(place_idx) else { continue };
-                                        enqueue_vtable_methods(built, vsym, walk, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
-                                    }
-                                    _ => {}
-                                }
+                            if visited_data.is_empty() && !view.datas.is_empty() {
+                                visited_data.resize(view.datas.len(), false);
                             }
+                            enqueue_data_relocs(
+                                built,
+                                rec.place,
+                                walk,
+                                next_depth,
+                                max_depth,
+                                is_eligible_callee,
+                                visited,
+                                min_depth,
+                                call_queue,
+                                indirect_queue,
+                                visited_data.as_mut_slice(),
+                                &mut data_stack,
+                            );
                         }
                         _ => {}
                     }
@@ -1321,6 +1482,8 @@ where
 
     let mut visited: AVec<'s, u8> = Vec::with_capacity_in(walk.len(), scratch);
     visited.resize(walk.len(), UNSEEN);
+    let mut min_depth: AVec<'s, u8> = Vec::with_capacity_in(walk.len(), scratch);
+    min_depth.resize(walk.len(), u8::MAX);
     let mut call_queue: AVec<'s, (usize, u8, bool)> = Vec::with_capacity_in(seeds.len().min(opts.max_bodies), scratch);
     let mut indirect_queue: AVec<'s, (usize, u8, bool)> = Vec::new_in(scratch);
     for &row in seeds {
@@ -1329,6 +1492,9 @@ where
             && is_eligible_callee(row)
         {
             *state = QUEUED_CALL;
+            if let Some(best) = min_depth.get_mut(row) {
+                *best = 0;
+            }
             call_queue.push((row, 0, true));
         }
     }
@@ -1362,16 +1528,18 @@ where
         } else {
             break;
         };
-        let (row, depth, is_seed) = next;
+        let (row, queued_depth, is_seed) = next;
         let Some(state) = visited.get_mut(row) else {
             continue;
         };
-        if *state == PROCESSED {
+        if *state == PROCESSED || *state == PROCESSED_UNEXPANDED {
             continue;
         }
-        *state = PROCESSED;
+        let expand_only = *state == QUEUED_EXPAND_ONLY;
+        let depth = min_depth.get(row).copied().unwrap_or(queued_depth).min(queued_depth);
+        *state = if depth < opts.max_depth { PROCESSED } else { PROCESSED_UNEXPANDED };
         total_scanned += 1;
-        if in_tiny_reserve && !is_seed {
+        if in_tiny_reserve && !is_seed && !expand_only {
             reserve_scans += 1;
         }
         let tabled = walk.tabled(row);
@@ -1391,6 +1559,9 @@ where
 
         let view = built.func.view();
         if !is_seed && !should_expand_non_seed(view.head.attrs) {
+            if let Some(st) = visited.get_mut(row) {
+                *st = PROCESSED;
+            }
             continue;
         }
 
@@ -1403,11 +1574,18 @@ where
                 &built,
                 walk,
                 next_depth,
+                opts.max_depth,
                 &is_eligible_callee,
                 visited.as_mut_slice(),
+                min_depth.as_mut_slice(),
                 &mut call_queue,
                 &mut indirect_queue,
+                scratch,
             );
+        }
+
+        if expand_only {
+            continue;
         }
 
         if !is_seed && !should_keep_non_seed(view.head.attrs, view.len(), in_tiny_reserve, TINY_INLINE_LEAF_INSTS, &opts) {
@@ -1848,13 +2026,205 @@ mod tests {
 
         let mut visited: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
         visited.resize(walk.len(), UNSEEN);
+        let mut min_depth: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        min_depth.resize(walk.len(), u8::MAX);
         let mut call_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
         let mut indirect_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
-        enqueue_normal_callees(&built, &walk, 1, &|_| true, visited.as_mut_slice(), &mut call_queue, &mut indirect_queue);
+        enqueue_normal_callees(
+            &built,
+            &walk,
+            1,
+            24,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+            alloc,
+        );
 
         assert!(call_queue.iter().any(|&(r, d, _)| r == row_call && d == 1));
         assert!(call_queue.iter().any(|&(r, d, _)| r == row_invoke && d == 1));
         assert!(indirect_queue.iter().any(|&(r, d, _)| r == row_fnptr && d == 1));
         assert!(indirect_queue.iter().any(|&(r, d, _)| r == row_vmethod && d == 1));
+    }
+
+    #[test]
+    fn enqueue_sym_preserves_shallowest_depth_on_promotion_and_reexpands_unexpanded() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut walk = Walk::new_in(alloc);
+        let row_promoted = walk.root::<RunError>((ItemKey(11), b"promoted_target"), 64).expect("row_promoted");
+        let row_unexpanded = walk.root::<RunError>((ItemKey(12), b"unexpanded_target"), 64).expect("row_unexpanded");
+        let sym_promoted = walk.symbol(row_promoted);
+        let sym_unexpanded = walk.symbol(row_unexpanded);
+
+        let max_depth = 4u8;
+        let mut visited: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        visited.resize(walk.len(), UNSEEN);
+        let mut min_depth: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        min_depth.resize(walk.len(), u8::MAX);
+        let mut call_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        let mut indirect_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+
+        // 1. Shallow indirect edge (depth 1) followed by deep direct-call promotion (depth == max_depth):
+        //    promotion into `call_queue` MUST retain the shallowest depth (`1`), never overwrite with `4`.
+        enqueue_sym(
+            &walk,
+            sym_promoted,
+            false,
+            1,
+            max_depth,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+        );
+        enqueue_sym(
+            &walk,
+            sym_promoted,
+            true,
+            max_depth,
+            max_depth,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+        );
+        assert_eq!(visited[row_promoted], QUEUED_CALL);
+        assert_eq!(min_depth[row_promoted], 1);
+        assert!(
+            call_queue.iter().any(|&(r, d, _)| r == row_promoted && d == 1),
+            "promoted direct-queue entry must preserve shallowest depth 1, got {call_queue:?}"
+        );
+
+        // 2. A row previously processed at `max_depth` (`PROCESSED_UNEXPANDED`) that is later
+        //    reached at depth `2 < max_depth` MUST be re-queued as `QUEUED_EXPAND_ONLY`.
+        visited[row_unexpanded] = PROCESSED_UNEXPANDED;
+        min_depth[row_unexpanded] = max_depth;
+        enqueue_sym(
+            &walk,
+            sym_unexpanded,
+            false,
+            2,
+            max_depth,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+        );
+        assert_eq!(visited[row_unexpanded], QUEUED_EXPAND_ONLY);
+        assert_eq!(min_depth[row_unexpanded], 2);
+        assert!(
+            indirect_queue.iter().any(|&(r, d, _)| r == row_unexpanded && d == 2),
+            "unexpanded row reached at shallower depth must re-queue for expansion, got {indirect_queue:?}"
+        );
+    }
+
+    #[test]
+    fn enqueue_normal_callees_follows_nested_data_relocs_and_breaks_cycles() {
+        use blaze_code::datum::{Datum, Place as DatumPlace};
+        use blaze_code::record::{Target as CodeTarget, Word as CodeWord};
+        use blaze_lir::builder::DataReloc;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut walk = Walk::new_in(alloc);
+        let row_nested_fn = walk.root::<RunError>((ItemKey(21), b"nested_data_fn"), 64).expect("row_nested_fn");
+        let row_nested_vt = walk.root::<RunError>((ItemKey(22), b"nested_data_vt_method"), 64).expect("row_nested_vt");
+        let sym_nested_fn = walk.symbol(row_nested_fn);
+        let sym_nested_vt = walk.symbol(row_nested_vt);
+        let vsym = Symbol::of_name("nested_test_vtable");
+
+        let mut vt_datum = Datum::new_in(DatumPlace::ReadOnly, 3, alloc);
+        vt_datum.bytes.extend_from_slice(&[0u8; 8]);
+        let t_idx = vt_datum.target(CodeTarget { space: Space::Func, symbol: sym_nested_vt });
+        vt_datum.words.push(CodeWord { at: 0, target: t_idx, addend: 0 });
+        let mut vt_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        vt_datum.seal().expect("seal").encode(&mut vt_bytes);
+
+        // Build `outer_data -> mid_data -> (nested_fn, vtable, self-reference cycle)`.
+        let func = {
+            let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+            b.set_signature(sig);
+            let r_fn = b.reference(RefKind::Func, 0);
+            let r_vt = b.reference(RefKind::Vtable, 0);
+            let inner_data = b.data(
+                &[0u8; 16],
+                3,
+                &[
+                    DataReloc { offset: 0, target: r_fn, addend: 0 },
+                    DataReloc { offset: 8, target: r_vt, addend: 0 },
+                ],
+            );
+            let mid_data = b.data(
+                &[0u8; 8],
+                3,
+                &[DataReloc { offset: 0, target: inner_data, addend: 0 }],
+            );
+            // Include a duplicate/back-edge reference alongside `mid_data` to exercise cycle/dedup.
+            let outer_data = b.data(
+                &[0u8; 16],
+                3,
+                &[
+                    DataReloc { offset: 0, target: mid_data, addend: 0 },
+                    DataReloc { offset: 8, target: inner_data, addend: 0 },
+                ],
+            );
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let _p = b.data_addr(outer_data);
+            b.ret(&[]);
+            b.finish_checked().expect("valid nested data caller")
+        };
+
+        let mut funcs_tbl: AVec<'static, BuiltCallee> = Vec::new_in(alloc);
+        funcs_tbl.push(BuiltCallee::Symbol(sym_nested_fn));
+        let mut vtables_tbl: AVec<'static, Symbol> = Vec::new_in(alloc);
+        vtables_tbl.push(vsym);
+        let mut vtable_data: AVec<'static, (Symbol, AVec<'static, u8>)> = Vec::new_in(alloc);
+        vtable_data.push((vsym, vt_bytes));
+
+        let built = BuiltLir {
+            func,
+            funcs: funcs_tbl,
+            statics: Vec::new_in(alloc),
+            c_statics: Vec::new_in(alloc),
+            vtables: vtables_tbl,
+            vtable_data,
+            tls: Vec::new_in(alloc),
+            traps: Vec::new_in(alloc),
+            c_text: Vec::new_in(alloc),
+        };
+
+        let mut visited: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        visited.resize(walk.len(), UNSEEN);
+        let mut min_depth: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        min_depth.resize(walk.len(), u8::MAX);
+        let mut call_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        let mut indirect_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        enqueue_normal_callees(
+            &built,
+            &walk,
+            2,
+            24,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+            alloc,
+        );
+
+        assert!(
+            indirect_queue.iter().any(|&(r, d, _)| r == row_nested_fn && d == 2),
+            "expected nested Data -> Data -> Func target in indirect_queue, got {indirect_queue:?}"
+        );
+        assert!(
+            indirect_queue.iter().any(|&(r, d, _)| r == row_nested_vt && d == 2),
+            "expected nested Data -> Data -> Vtable method in indirect_queue, got {indirect_queue:?}"
+        );
     }
 }

@@ -282,6 +282,134 @@ fn from_inline(error: InlineError) -> SimplifyError {
     }
 }
 
+/// Builds the intra-module call graph in CSR form, including transitive edges through external
+/// bodies (`A -> E1 -> ... -> B` where `E*` are provided by `external.callee` and `B` is in
+/// `module`). Including transitive external callback edges ensures that both
+/// [`lto_optimize_module`] and [`lto_optimize_module_par`] order `B`'s SCC before `A`'s SCC (or
+/// place them in the same SCC if mutually recursive) so sequential and parallel LTO observe
+/// identical pre-simplified and post-inlined bodies.
+fn build_module_call_graph<A: Allocator + Copy>(
+    module: &[ModuleBody<A>],
+    id_to_index: &Map<BodyId, usize, FixedState, A>,
+    external: &dyn Bodies,
+    alloc: A,
+) -> (OwnVec<u32, A>, OwnVec<u32, A>) {
+    let n = module.len();
+    let mut adj_offsets: OwnVec<u32, A> = OwnVec::with_capacity_in(n + 1, alloc);
+    let mut adj: OwnVec<u32, A> = OwnVec::with_capacity_in(n.saturating_mul(2), alloc);
+    let mut ext_cache: Map<BodyId, (usize, usize), FixedState, A> = Map::new(MapOpts {
+        hasher: FixedState,
+        alloc,
+        capacity: None,
+    });
+    let mut ext_pool: OwnVec<u32, A> = OwnVec::new_in(alloc);
+    adj_offsets.push(0);
+
+    for mb in module.iter() {
+        let view = mb.func.view();
+        let edge_start = adj.len();
+        for at in 0..view.len() {
+            if !matches!(view.op(at), Op::Call | Op::Invoke) {
+                continue;
+            }
+            let Some(extra_start) = view.data.get(at).and_then(|&d| usize::try_from(d).ok()) else {
+                continue;
+            };
+            let Some(&ref_word) = view.extra.get(extra_start) else {
+                continue;
+            };
+            let reference = RefId(ref_word);
+            let Some((callee_id, callee_view)) = external.callee(mb.id, reference) else {
+                continue;
+            };
+            if let Some(&callee_idx) = id_to_index.get(&callee_id) {
+                if let Ok(c_u32) = u32::try_from(callee_idx) {
+                    adj.push(c_u32);
+                }
+                continue;
+            }
+            if let Some(&(pool_start, pool_end)) = ext_cache.get(&callee_id) {
+                if let Some(slice) = ext_pool.get(pool_start..pool_end) {
+                    adj.extend_from_slice(slice);
+                }
+                continue;
+            }
+            // Transitive external closure: walk external bodies reachable from `callee_id` until
+            // hitting module bodies, caching the discovered module target indices for `callee_id`.
+            let mut seen_ext: Map<BodyId, (), FixedState, A> = Map::new(MapOpts {
+                hasher: FixedState,
+                alloc,
+                capacity: None,
+            });
+            let mut ext_stack: OwnVec<(BodyId, View<'_>), A> = OwnVec::new_in(alloc);
+            let mut found: OwnVec<u32, A> = OwnVec::new_in(alloc);
+            seen_ext.insert(callee_id, ());
+            ext_stack.push((callee_id, callee_view));
+            while let Some((cur_id, cur_view)) = ext_stack.pop() {
+                for cur_at in 0..cur_view.len() {
+                    if !matches!(cur_view.op(cur_at), Op::Call | Op::Invoke) {
+                        continue;
+                    }
+                    let Some(es) = cur_view.data.get(cur_at).and_then(|&d| usize::try_from(d).ok()) else {
+                        continue;
+                    };
+                    let Some(&rw) = cur_view.extra.get(es) else {
+                        continue;
+                    };
+                    let Some((next_id, next_view)) = external.callee(cur_id, RefId(rw)) else {
+                        continue;
+                    };
+                    if let Some(&next_idx) = id_to_index.get(&next_id) {
+                        if let Ok(c_u32) = u32::try_from(next_idx) {
+                            found.push(c_u32);
+                        }
+                    } else if !seen_ext.contains_key(&next_id) {
+                        seen_ext.insert(next_id, ());
+                        ext_stack.push((next_id, next_view));
+                    }
+                }
+            }
+            if let Some(slice) = found.get_mut(..) {
+                slice.sort_unstable();
+            }
+            let mut fw = 0usize;
+            for fr in 0..found.len() {
+                let cur = found.get(fr).copied().unwrap_or(0);
+                let prev = fw.checked_sub(1).and_then(|p| found.get(p).copied());
+                if fw == 0 || prev != Some(cur) {
+                    if let Some(slot) = found.get_mut(fw) {
+                        *slot = cur;
+                    }
+                    fw += 1;
+                }
+            }
+            found.truncate(fw);
+            let pool_start = ext_pool.len();
+            ext_pool.extend_from_slice(found.as_slice());
+            let pool_end = ext_pool.len();
+            ext_cache.insert(callee_id, (pool_start, pool_end));
+            adj.extend_from_slice(found.as_slice());
+        }
+        if let Some(edge_slice) = adj.get_mut(edge_start..) {
+            edge_slice.sort_unstable();
+        }
+        let mut w = edge_start;
+        for r in edge_start..adj.len() {
+            let cur = adj.get(r).copied().unwrap_or(0);
+            let prev = w.checked_sub(1).and_then(|p| adj.get(p).copied());
+            if w == edge_start || prev != Some(cur) {
+                if let Some(slot) = adj.get_mut(w) {
+                    *slot = cur;
+                }
+                w += 1;
+            }
+        }
+        adj.truncate(w);
+        adj_offsets.push(u32_of(adj.len()));
+    }
+    (adj_offsets, adj)
+}
+
 /// Performs deterministic bottom-up SCC ThinLTO optimization over all functions in `module`.
 ///
 /// Every callee SCC is simplified and summarized before its callers run PGO-guided inlining
@@ -303,51 +431,28 @@ pub fn lto_optimize_module<A: Allocator + Copy>(
         id_to_index.insert(mb.id, idx);
     }
 
-    // Build intra-module direct call graph in CSR form.
-    let mut adj_offsets: OwnVec<u32, A> = OwnVec::with_capacity_in(n + 1, alloc);
-    let mut adj: OwnVec<u32, A> = OwnVec::with_capacity_in(n * 2, alloc);
-    adj_offsets.push(0);
-    for mb in module.iter() {
-        let view = mb.func.view();
-        let edge_start = adj.len();
-        for at in 0..view.len() {
-            if !matches!(view.op(at), Op::Call | Op::Invoke) {
-                continue;
-            }
-            let words = &view.extra[view.data[at] as usize..];
-            let reference = RefId(words[0]);
-            if let Some((callee_id, _)) = external.callee(mb.id, reference)
-                && let Some(&callee_idx) = id_to_index.get(&callee_id)
-            {
-                adj.push(callee_idx as u32);
-            }
-        }
-        adj[edge_start..].sort_unstable();
-        let mut w = edge_start;
-        for r in edge_start..adj.len() {
-            if w == edge_start || adj[r] != adj[w - 1] {
-                adj[w] = adj[r];
-                w += 1;
-            }
-        }
-        adj.truncate(w);
-        adj_offsets.push(adj.len() as u32);
-    }
+    // Build intra-module call graph (including transitive external callback edges) in CSR form.
+    let (adj_offsets, adj) = build_module_call_graph(module.as_slice(), &id_to_index, external, alloc);
 
     // Condense call graph into reverse-topological SCCs (callees before callers).
     let sccs = tarjan_sccs(n, &adj_offsets, &adj, alloc);
 
-    // Compute initial summaries for early-cutoff comparison.
+    // Phase 0 + Phase 1 (100% intra-procedural): compute initial summaries for early-cutoff
+    // comparison, run pre-inline `simplify_body` on every module body, and refresh summaries.
+    // Running Phase 1 across all bodies up front matches `lto_optimize_module_par` identically.
     let mut prev_summaries: OwnVec<FnSummary, A> = OwnVec::with_capacity_in(n, alloc);
     let mut summaries: Map<BodyId, FnSummary, FixedState, A> = Map::new(MapOpts {
         hasher: FixedState,
         alloc: alloc,
         capacity: Some(n),
     });
-    for mb in module.iter() {
-        let s = FnSummary::compute(mb.func.view(), &alloc);
-        prev_summaries.push(s);
-        summaries.insert(mb.id, s);
+    for mb in module.iter_mut() {
+        let prev = FnSummary::compute(mb.func.view(), &alloc);
+        prev_summaries.push(prev);
+        let simplified = simplify_body(mb.func.view(), alloc)?;
+        let post = FnSummary::compute(simplified.view(), &alloc);
+        summaries.insert(mb.id, post);
+        mb.func = simplified;
     }
 
     let mut reads: OwnVec<Vec<BodyId, A>, A> = OwnVec::with_capacity_in(n, alloc);
@@ -362,15 +467,6 @@ pub fn lto_optimize_module<A: Allocator + Copy>(
     // Optimize SCC by SCC, bottom-up.
     for scc_idx in 0..sccs.len() {
         let comp = sccs.component(scc_idx);
-
-        // Phase 1: pre-inline simplify each body in the SCC and refresh its summary.
-        for &node in comp {
-            let idx = node as usize;
-            let simplified = simplify_body(module[idx].func.view(), alloc)?;
-            let sum = FnSummary::compute(simplified.view(), &alloc);
-            summaries.insert(module[idx].id, sum);
-            module[idx].func = simplified;
-        }
 
         // Phase 2: PGO-guided priority inlining + post-inline simplify (SROA + const-fold + DCE).
         for &node in comp {
@@ -684,48 +780,8 @@ pub fn lto_optimize_module_par<R: LtoRunner>(
         id_to_index.insert(mb.id, idx);
     }
 
-    // Build intra-module direct call graph in CSR form.
-    let mut adj_offsets: OwnVec<u32, SharedAlloc<'static>> = OwnVec::with_capacity_in(n + 1, alloc);
-    let mut adj: OwnVec<u32, SharedAlloc<'static>> = OwnVec::with_capacity_in(n.saturating_mul(2), alloc);
-    adj_offsets.push(0);
-    for mb in module.iter() {
-        let view = mb.func.view();
-        let edge_start = adj.len();
-        for at in 0..view.len() {
-            if !matches!(view.op(at), Op::Call | Op::Invoke) {
-                continue;
-            }
-            let Some(extra_start) = view.data.get(at).and_then(|&d| usize::try_from(d).ok()) else {
-                continue;
-            };
-            let Some(&ref_word) = view.extra.get(extra_start) else {
-                continue;
-            };
-            let reference = RefId(ref_word);
-            if let Some((callee_id, _)) = external.callee(mb.id, reference)
-                && let Some(&callee_idx) = id_to_index.get(&callee_id)
-                && let Ok(c_u32) = u32::try_from(callee_idx)
-            {
-                adj.push(c_u32);
-            }
-        }
-        if let Some(edge_slice) = adj.get_mut(edge_start..) {
-            edge_slice.sort_unstable();
-        }
-        let mut w = edge_start;
-        for r in edge_start..adj.len() {
-            let cur = adj.get(r).copied().unwrap_or(0);
-            let prev = w.checked_sub(1).and_then(|p| adj.get(p).copied());
-            if w == edge_start || prev != Some(cur) {
-                if let Some(slot) = adj.get_mut(w) {
-                    *slot = cur;
-                }
-                w += 1;
-            }
-        }
-        adj.truncate(w);
-        adj_offsets.push(u32_of(adj.len()));
-    }
+    // Build intra-module call graph (including transitive external callback edges) in CSR form.
+    let (adj_offsets, adj) = build_module_call_graph(module.as_slice(), &id_to_index, external, alloc);
 
     // Condense call graph into reverse-topological SCCs (callees before callers).
     let sccs = tarjan_sccs(n, &adj_offsets, &adj, alloc);
@@ -2973,5 +3029,162 @@ mod tests {
             assert_eq!(p.func.view().extra, s.func.view().extra);
             verify(p.func.view()).unwrap();
         }
+    }
+
+    #[test]
+    fn lto_optimize_module_par_matches_sequential_with_transitive_external_callback() {
+        let shared = blaze_own::testing::heap().shared();
+        let alloc = Alloc::from(shared);
+
+        // Module contains `[A, B, C]` in that order (`A` at index 0, `B` at index 1, `C` at index 2).
+        // `A(x)` calls external `E(x)` (not in module, provided by `Bodies::callee`), which calls
+        // back into module body `B(x)`, which has a local stack-slot store/load simplified by
+        // `simplify_body` AND calls module body `C(x)`.
+        //
+        // Without transitive external callback edges `A -> E -> B`, `A` would have no edge to `B`
+        // and parallel wavefronts could run `A` before `B`'s pre-simplification/inlining finished.
+        let a_id = BodyId([21u8; 32]);
+        let b_id = BodyId([22u8; 32]);
+        let c_id = BodyId([23u8; 32]);
+        let ext_id = BodyId([24u8; 32]);
+
+        let c_func = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c5 = b.iconst(Ty::I64, 5);
+            let y = b.binary(Op::Add, Flags::NONE, x, c5);
+            b.ret(&[y]);
+            b.finish_checked().unwrap()
+        };
+
+        let (b_func, b_to_c) = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let c_ref = b.reference(RefKind::Func, 0);
+            let slot = b.slot(8, 3, SlotKind::Named);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            // Stack-slot store + reload transformed by `simplify_body` (SROA).
+            let sp = b.slot_addr(slot);
+            b.store(Flags::NONE, x, sp, 0, MemAttrs::aligned(3));
+            let reloaded = b.load(Ty::I64, Flags::NONE, sp, 0, MemAttrs::aligned(3));
+            let from_c = b.call(Flags::NONE, c_ref, sig, &[reloaded]);
+            let c2 = b.iconst(Ty::I64, 2);
+            let res = b.binary(Op::Mul, Flags::NONE, from_c, c2);
+            b.ret(&[res]);
+            (b.finish_checked().unwrap(), c_ref)
+        };
+
+        let (ext_func, ext_to_b) = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let b_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.call(Flags::NONE, b_ref, sig, &[x]);
+            b.ret(&[r]);
+            (b.finish_checked().unwrap(), b_ref)
+        };
+
+        let (a_func, a_to_ext) = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let ext_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.call(Flags::NONE, ext_ref, sig, &[x]);
+            let c1 = b.iconst(Ty::I64, 1);
+            let out = b.binary(Op::Add, Flags::NONE, r, c1);
+            b.ret(&[out]);
+            (b.finish_checked().unwrap(), ext_ref)
+        };
+
+        struct ExtCallbackBodies<'a> {
+            a_id: BodyId,
+            b_id: BodyId,
+            c_id: BodyId,
+            ext_id: BodyId,
+            a_to_ext: RefId,
+            ext_to_b: RefId,
+            b_to_c: RefId,
+            b_view: View<'a>,
+            c_view: View<'a>,
+            ext_view: View<'a>,
+        }
+
+        impl Bodies for ExtCallbackBodies<'_> {
+            fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+                if from == self.a_id && reference == self.a_to_ext {
+                    return Some((self.ext_id, self.ext_view));
+                }
+                if from == self.ext_id && reference == self.ext_to_b {
+                    return Some((self.b_id, self.b_view));
+                }
+                if from == self.b_id && reference == self.b_to_c {
+                    return Some((self.c_id, self.c_view));
+                }
+                None
+            }
+
+            fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+                self.callee(from, reference).map(|(id, _)| Target::Func(id))
+            }
+        }
+
+        let bank = ExtCallbackBodies {
+            a_id,
+            b_id,
+            c_id,
+            ext_id,
+            a_to_ext,
+            ext_to_b,
+            b_to_c,
+            b_view: b_func.view(),
+            c_view: c_func.view(),
+            ext_view: ext_func.view(),
+        };
+
+        let mut seq_mod = OwnVec::with_capacity_in(3, alloc);
+        seq_mod.push(ModuleBody { id: a_id, func: a_func.view().to_func_in(alloc) });
+        seq_mod.push(ModuleBody { id: b_id, func: b_func.view().to_func_in(alloc) });
+        seq_mod.push(ModuleBody { id: c_id, func: c_func.view().to_func_in(alloc) });
+
+        let mut par_mod = OwnVec::with_capacity_in(3, shared);
+        par_mod.push(ModuleBody { id: a_id, func: a_func.view().to_func_in(shared) });
+        par_mod.push(ModuleBody { id: b_id, func: b_func.view().to_func_in(shared) });
+        par_mod.push(ModuleBody { id: c_id, func: c_func.view().to_func_in(shared) });
+
+        let policy = InlinePolicy::default();
+        let seq = lto_optimize_module(seq_mod, &bank, &NoWeights, policy, alloc).unwrap();
+        let par = lto_optimize_module_par(par_mod, &bank, &NoWeights, policy, shared, &SequentialLtoRunner).unwrap();
+
+        assert_eq!(par.scc_count, seq.scc_count);
+        assert_eq!(par.total_inlined_bodies, seq.total_inlined_bodies);
+        assert_eq!(par.bodies.len(), seq.bodies.len());
+        for (p, s) in par.bodies.iter().zip(seq.bodies.iter()) {
+            assert_eq!(p.id, s.id);
+            assert_eq!(p.summary.summary_hash, s.summary.summary_hash);
+            assert_eq!(p.prev_summary.summary_hash, s.prev_summary.summary_hash);
+            assert_eq!(p.read.as_slice(), s.read.as_slice());
+            assert_eq!(p.imported_refs.as_slice(), s.imported_refs.as_slice());
+            assert_eq!(p.func.view().ops, s.func.view().ops);
+            assert_eq!(p.func.view().data, s.func.view().data);
+            assert_eq!(p.func.view().extra, s.func.view().extra);
+            verify(p.func.view()).unwrap();
+        }
+        // `A` should have inlined `E -> B -> C` completely, evaluating `(x + 5) * 2 + 1`.
+        let a_par = &par.bodies[0].func;
+        let eval_res = eval::run_in(a_par.view(), &[Val::Int(10)], 10_000, alloc).unwrap();
+        assert_eq!(eval_res, Outcome::Returned(alloc::vec![Val::Int(31)]));
     }
 }
