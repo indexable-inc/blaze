@@ -253,15 +253,234 @@ fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, include_
     stmt_def(flow, s)
 }
 
+const EVENT_FLAG: u32 = 1u32 << 31;
+const EVENT_STMT_MASK: u32 = !EVENT_FLAG;
+
+/// Block-grain origin liveness: stores only cross-block local liveness bitsets (`nb × cross_ol`,
+/// `nb × cross_dl`) plus compact intra-block event/interval CSRs. Eliminates the dense
+/// `2 * stmts × origins` matrix while answering exact `Start(s)` / `Mid(s)` queries in `O(log k)`.
+struct LiveFacts<A: Allocator> {
+    /// For each `origin` (`0..o`), the `ol_idx`s whose local mentions `origin`.
+    ol_by_origin: Csr<u32, A>,
+    /// Maps `ol_idx -> cross_ol` column, or `u32::MAX` if never upward-exposed in any block.
+    ol_to_cross: Vec<u32, A>,
+    /// Block-exit regular liveness (`nb × cross_ol`).
+    block_live_out: Bits<A>,
+    /// Per `ol_idx`, sorted ascending events (at most one per stmt):
+    /// `EVENT_FLAG` = 1 for Use / UseAndDef, 0 for pure Def; low 31 bits = `stmt.0`.
+    ol_events: Csr<u32, A>,
+
+    /// For each `origin` (`0..o`), the `dl_idx`s whose drop-live local mentions `origin`.
+    dl_by_origin: Csr<u32, A>,
+    /// Maps `dl_idx -> cross_dl` column, or `u32::MAX` if never constant-true across any block.
+    dl_to_cross: Vec<u32, A>,
+    /// `block_d_out & block_drop_trans` (`nb × cross_dl`): when set on a reached block, `dl` is
+    /// drop-live at every point in that block.
+    block_d_const: Bits<A>,
+    /// Per `dl_idx`, sorted ascending disjoint half-open `Point` intervals `(p_lo, p_hi)` for
+    /// blocks where drop-liveness varies within the block.
+    dl_intervals: Csr<(u32, u32), A>,
+}
+
+impl<A: Allocator + Copy> LiveFacts<A> {
+    fn empty_in(alloc: A) -> Self {
+        Self {
+            ol_by_origin: Csr::empty_in(alloc),
+            ol_to_cross: Vec::new_in(alloc),
+            block_live_out: Bits::new_in(0, 0, alloc),
+            ol_events: Csr::empty_in(alloc),
+            dl_by_origin: Csr::empty_in(alloc),
+            dl_to_cross: Vec::new_in(alloc),
+            block_d_const: Bits::new_in(0, 0, alloc),
+            dl_intervals: Csr::empty_in(alloc),
+        }
+    }
+}
+
+impl<A: Allocator> LiveFacts<A> {
+    #[inline]
+    fn is_ol_live<B: Allocator>(&self, flow: &Flow<B>, p: Point, oi: usize) -> bool {
+        let s = p.stmt();
+        let b = flow.stmt_block[s.index()].index();
+        let block_end = flow.blocks[b].end;
+        let evs = self.ol_events.row(oi);
+        let idx = evs.partition_point(|&e| (e & EVENT_STMT_MASK) < s.0);
+        let cross_out = || {
+            let ci = self.ol_to_cross[oi];
+            ci != u32::MAX && self.block_live_out.get(b, ci as usize)
+        };
+        let in_live = match evs.get(idx) {
+            Some(&e) if (e & EVENT_STMT_MASK) < block_end => (e & EVENT_FLAG) != 0,
+            _ => cross_out(),
+        };
+        if !p.is_mid() || in_live {
+            return in_live;
+        }
+        // `in(s)` is false and we want `Mid(s)` (`in(s) || out(s)`): `out(s)` can only differ
+        // when statement `s` itself had a pure Def event (`evs[idx]` at `s.0`).
+        if evs.get(idx).is_some_and(|&e| (e & EVENT_STMT_MASK) == s.0) {
+            match evs.get(idx + 1) {
+                Some(&e2) if (e2 & EVENT_STMT_MASK) < block_end => (e2 & EVENT_FLAG) != 0,
+                _ => cross_out(),
+            }
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    fn is_dl_live<B: Allocator>(&self, flow: &Flow<B>, init: &Inits<A>, p: Point, di: usize) -> bool {
+        let b = flow.stmt_block[p.stmt().index()].index();
+        if !init.reached[b] {
+            return false;
+        }
+        let ci = self.dl_to_cross[di];
+        if ci != u32::MAX && self.block_d_const.get(b, ci as usize) {
+            return true;
+        }
+        let ivs = self.dl_intervals.row(di);
+        let pt = p.0;
+        let idx = ivs.partition_point(|&(lo, _)| lo <= pt);
+        idx > 0 && pt < ivs[idx - 1].1
+    }
+}
+
+/// Block-grain two-phase activation: tracks only loans that appear in at least one
+/// `StmtKind::Activate`, eliminating the dense `stmts × loans` matrix.
+struct ActiveFacts<A: Allocator> {
+    /// Maps `loan.index() -> al_idx`, or `u32::MAX` if never activated. Empty when `al == 0`.
+    loan_to_al: Vec<u32, A>,
+    /// Reachability from entry block (empty when `al == 0`).
+    reached: Vec<bool, A>,
+    /// Block-entry activation bits (`nb × al`).
+    block_active: Bits<A>,
+    /// Per `al_idx`, sorted ascending events: `EVENT_FLAG` = 1 for Activate, 0 for Borrow;
+    /// low 31 bits = `stmt.0`.
+    events: Csr<u32, A>,
+}
+
+impl<A: Allocator + Copy> ActiveFacts<A> {
+    fn empty_in(alloc: A) -> Self {
+        Self {
+            loan_to_al: Vec::new_in(alloc),
+            reached: Vec::new_in(alloc),
+            block_active: Bits::new_in(0, 0, alloc),
+            events: Csr::empty_in(alloc),
+        }
+    }
+}
+
+impl<A: Allocator> ActiveFacts<A> {
+    #[inline]
+    fn is_active<B: Allocator>(&self, flow: &Flow<B>, s: Stmt, loan: Loan) -> bool {
+        let Some(&al) = self.loan_to_al.get(loan.index()) else {
+            return false;
+        };
+        if al == u32::MAX {
+            return false;
+        }
+        let b = flow.stmt_block[s.index()].index();
+        if !self.reached[b] {
+            return false;
+        }
+        let start = flow.blocks[b].start;
+        if s.0 > start {
+            let evs = self.events.row(al as usize);
+            let end = evs.partition_point(|&e| (e & EVENT_STMT_MASK) < s.0);
+            if end > 0 {
+                let last = evs[end - 1];
+                if (last & EVENT_STMT_MASK) >= start {
+                    return (last & EVENT_FLAG) != 0;
+                }
+            }
+        }
+        self.block_active.get(b, al as usize)
+    }
+}
+
 /// What both tiers read: origins live at each point, and two-phase loans activated on entry.
 pub struct Facts<A: Allocator> {
-    /// Rows are points, columns origins: `origin_live_on_entry` or a placeholder.
-    pub live: Bits<A>,
-    /// Rows are statements, columns loans.
-    pub active: Bits<A>,
+    live: LiveFacts<A>,
+    active: ActiveFacts<A>,
     /// Where each drop may run (the move check's dataflow, unplanted): drop-liveness read it,
     /// and [`loan_parts`] reads it again to find the use that kept a loan live.
     pub init: Inits<A>,
+}
+
+impl<A: Allocator> Facts<A> {
+    /// Whether `origin` is live at `p`: either a placeholder, or mentioned by a local that is
+    /// regular-live or drop-live at `p`.
+    #[inline]
+    pub fn is_live<B: Allocator>(&self, flow: &Flow<B>, p: Point, origin: Origin) -> bool {
+        let oi = origin.index();
+        if oi >= flow.placeholder.len() || p.stmt().index() >= flow.stmts.len() {
+            return false;
+        }
+        if flow.placeholder[oi] {
+            return true;
+        }
+        for &ol_idx in self.live.ol_by_origin.row(oi) {
+            if self.live.is_ol_live(flow, p, ol_idx as usize) {
+                return true;
+            }
+        }
+        for &dl_idx in self.live.dl_by_origin.row(oi) {
+            if self.live.is_dl_live(flow, &self.init, p, dl_idx as usize) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether two-phase loan `loan` is activated on entry to statement `s`.
+    #[inline]
+    pub fn is_active<B: Allocator>(&self, flow: &Flow<B>, s: Stmt, loan: Loan) -> bool {
+        if s.index() >= flow.stmts.len() {
+            return false;
+        }
+        self.active.is_active(flow, s, loan)
+    }
+
+    /// Sound inclusive statement range `(lo, hi)` bounding every `Start(s)` where `origin` can be
+    /// live, when `origin` is purely intra-block (not a placeholder, no drop-live locals, and no
+    /// cross-block origin-bearing locals). Returns `Some((1, 0))` if `origin` is never live at any
+    /// `Start(s)`, or `None` if it may be live across block boundaries.
+    pub(crate) fn origin_start_bounds<B: Allocator>(&self, flow: &Flow<B>, origin: Origin) -> Option<(u32, u32)> {
+        let oi = origin.index();
+        if oi >= flow.placeholder.len() || flow.placeholder[oi] {
+            return None;
+        }
+        if !self.live.dl_by_origin.row(oi).is_empty() {
+            return None;
+        }
+        let ols = self.live.ol_by_origin.row(oi);
+        if ols.is_empty() {
+            return Some((1, 0));
+        }
+        let (mut lo, mut hi) = (u32::MAX, 0u32);
+        for &ol_idx in ols {
+            let idx = ol_idx as usize;
+            if self.live.ol_to_cross[idx] != u32::MAX {
+                return None;
+            }
+            let evs = self.live.ol_events.row(idx);
+            let Some(&first) = evs.first() else {
+                continue;
+            };
+            // Because `ol_to_cross[idx] == u32::MAX`, the earliest event in every block is a pure
+            // Def, so `Start(s)` cannot be live for `s <= first_stmt` or after the last Use event.
+            let Some(&last_use) = evs.iter().rev().find(|&&e| (e & EVENT_FLAG) != 0) else {
+                continue;
+            };
+            let first_stmt = first & EVENT_STMT_MASK;
+            let last_stmt = last_use & EVENT_STMT_MASK;
+            if first_stmt < last_stmt {
+                lo = lo.min(first_stmt + 1);
+                hi = hi.max(last_stmt);
+            }
+        }
+        if lo <= hi { Some((lo, hi)) } else { Some((1, 0)) }
+    }
 }
 
 /// Compact CSR grouping of `(row_key, value)` pairs, built in two linear passes.
@@ -271,6 +490,10 @@ struct Csr<T, A: Allocator> {
 }
 
 impl<T: Copy, A: Allocator + Copy> Csr<T, A> {
+    fn empty_in(alloc: A) -> Self {
+        Self { offsets: Vec::new_in(alloc), entries: Vec::new_in(alloc) }
+    }
+
     fn from_iter(
         rows: usize,
         iter: impl ExactSizeIterator<Item = (usize, T)> + Clone,
@@ -300,6 +523,9 @@ impl<T: Copy, A: Allocator + Copy> Csr<T, A> {
 impl<T, A: Allocator> Csr<T, A> {
     #[inline]
     fn row(&self, key: usize) -> &[T] {
+        if key + 1 >= self.offsets.len() {
+            return &[];
+        }
         &self.entries[self.offsets[key] as usize..self.offsets[key + 1] as usize]
     }
 }
@@ -366,7 +592,9 @@ fn init_tracked_block<A: Allocator>(
     }
 }
 
-/// Advances `(cur_init, init_count, mi_row)` across statement `s` for tracked drop-origin locals.
+/// Advances `(cur_init, init_count, mi_row)` across statement `s` for tracked drop-origin locals,
+/// notifying `on_flip(dli)` whenever `mi_row[dli]` toggles between `false` and `true`.
+#[allow(clippy::too_many_arguments)]
 fn step_tracked_init<A: Allocator>(
     flow: &Flow<A>,
     init: &Inits<A>,
@@ -375,12 +603,14 @@ fn step_tracked_init<A: Allocator>(
     cur_init: &mut [u64],
     init_count: &mut [u32],
     mi_row: &mut [u64],
+    mut on_flip: impl FnMut(u32),
 ) {
     let mut set_sub = |p: Place, on: bool| {
         let dli = local_to_dl[flow.place(p).local.index()];
         if dli == u32::MAX {
             return;
         }
+        let dli_u32 = dli;
         let dli = dli as usize;
         for &q in init.subtrees.subtree(p) {
             let qi = q as usize;
@@ -391,11 +621,13 @@ fn step_tracked_init<A: Allocator>(
                     init_count[dli] += 1;
                     if init_count[dli] == 1 {
                         bits::put(mi_row, dli, true);
+                        on_flip(dli_u32);
                     }
                 } else {
                     init_count[dli] -= 1;
                     if init_count[dli] == 0 {
                         bits::put(mi_row, dli, false);
+                        on_flip(dli_u32);
                     }
                 }
             }
@@ -426,47 +658,37 @@ fn step_tracked_init<A: Allocator>(
     }
 }
 
-fn mark_origins<A: Allocator>(
-    in_row: &[u64],
-    out_row: &[u64],
-    idx_to_local: &[Local],
-    origins_by_local: &Csr<Origin, A>,
-    live: &mut Bits<A>,
-    start_p: usize,
-    mid_p: usize,
-) {
-    for w in 0..in_row.len() {
-        let in_w = in_row[w];
-        let base = w * 64;
-        // Locals in `in_row`: origins live at both Start and Mid.
-        let mut b = in_w;
-        while b != 0 {
-            let idx = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
-            b &= b - 1;
-            let local = idx_to_local[idx].index();
-            for &origin in origins_by_local.row(local) {
-                let oi = origin.index();
-                live.set(start_p, oi);
-                live.set(mid_p, oi);
-            }
-        }
-        // Locals only in `out_row`: origins live at Mid only.
-        let mut b = out_row[w] & !in_w;
-        while b != 0 {
-            let idx = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
-            b &= b - 1;
-            let local = idx_to_local[idx].index();
-            for &origin in origins_by_local.row(local) {
-                live.set(mid_p, origin.index());
-            }
-        }
+fn build_block_preds<A: Allocator + Copy>(flow: &Flow<A>, nb: usize, alloc: A) -> Csr<u32, A> {
+    let mut pred_off = Vec::with_capacity_in(nb + 1, alloc);
+    pred_off.resize(nb + 1, 0u32);
+    for b in 0..nb {
+        flow.for_each_block_succ(Block(b as u32), |tb| {
+            pred_off[tb.index()] += 1;
+        });
     }
+    let mut total_edges = 0u32;
+    for c in pred_off[..nb].iter_mut() {
+        total_edges += *c;
+        *c = total_edges;
+    }
+    pred_off[nb] = total_edges;
+    let mut pred_entries = Vec::with_capacity_in(total_edges as usize, alloc);
+    pred_entries.resize(total_edges as usize, 0u32);
+    for b in 0..nb {
+        flow.for_each_block_succ(Block(b as u32), |tb| {
+            let ti = tb.index();
+            pred_off[ti] -= 1;
+            pred_entries[pred_off[ti] as usize] = b as u32;
+        });
+    }
+    Csr { offsets: pred_off, entries: pred_entries }
 }
 
-/// Local liveness (backward, block-grain postorder worklist over origin-bearing locals; bound
-/// `2 * blocks * origin_locals + 1`), origin liveness from it (RFC 2094: "a lifetime L is live at
-/// a point P if there is some variable `p` which is live at P, and L appears in the type of `p`"),
-/// and activation (forward, block-grain RPO worklist; bound `blocks * loans + blocks + 1`).
+/// Local liveness (backward, block-grain postorder worklist over cross-block origin-bearing
+/// locals; bound `2 * blocks * cross_origin_locals + 1`), origin liveness from it (RFC 2094:
+/// "a lifetime L is live at a point P if there is some variable `p` which is live at P, and L
+/// appears in the type of `p`"), and activation (forward, block-grain RPO worklist over activated
+/// two-phase loans; bound `blocks * activated_loans + blocks + 1`).
 pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, Bound> {
     // Where each drop may run: the move check's dataflow, unplanted (a planted move bug is
     // the move check's control, not liveness's).
@@ -483,9 +705,11 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
     let locals = flow.locals as usize;
 
     if n == 0 || nb == 0 {
-        let live = Bits::new_in(0, o, alloc);
-        let active = Bits::new_in(0, nl, alloc);
-        return Ok(Facts { live, active, init });
+        return Ok(Facts {
+            live: LiveFacts::empty_in(alloc),
+            active: ActiveFacts::empty_in(alloc),
+            init,
+        });
     }
 
     let has_activate = nl > 0
@@ -493,9 +717,11 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
 
     // Fast exit when there are neither origins nor two-phase activations to solve.
     if o == 0 && !has_activate {
-        let live = Bits::new_in(2 * n, 0, alloc);
-        let active = Bits::new_in(n, nl, alloc);
-        return Ok(Facts { live, active, init });
+        return Ok(Facts {
+            live: LiveFacts::empty_in(alloc),
+            active: ActiveFacts::empty_in(alloc),
+            init,
+        });
     }
 
     // Full-CFG block DFS forest postorder (entry block first, then any disconnected blocks).
@@ -542,178 +768,184 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
     }
 
     let mut worklist = BitWorklist::new_in(nb, alloc);
-    let mut live = Bits::new_in(2 * n, o, alloc);
+    let mut live = LiveFacts::empty_in(alloc);
 
     if o > 0 {
-        let ow = live.words();
-        let mut ph_mask = Vec::with_capacity_in(ow, alloc);
-        ph_mask.resize(ow, 0u64);
-        let mut has_ph = false;
-        for origin in 0..o {
-            if flow.placeholder[origin] {
-                bits::put(&mut ph_mask, origin, true);
-                has_ph = true;
-            }
-        }
-        if has_ph {
-            for p in 0..(2 * n) {
-                live.row_mut(p).copy_from_slice(&ph_mask);
-            }
-        }
-        drop(ph_mask);
-
-        let origins_by_local = Csr::from_iter(
-            locals,
-            flow.local_origins.iter().map(|&(l, origin)| (l.index(), origin)),
-            alloc,
-        );
         // Project liveness to only locals whose types mention at least one origin.
         let mut local_to_ol = Vec::with_capacity_in(locals, alloc);
         local_to_ol.resize(locals, u32::MAX);
-        let mut ol_to_local = Vec::new_in(alloc);
-        for l in 0..locals {
-            if !origins_by_local.row(l).is_empty() {
-                local_to_ol[l] = ol_to_local.len() as u32;
-                ol_to_local.push(Local(l as u32));
+        let mut ol_count = 0u32;
+        for &(l, _) in &flow.local_origins {
+            let li = l.index();
+            if local_to_ol[li] == u32::MAX {
+                local_to_ol[li] = ol_count;
+                ol_count += 1;
             }
         }
-        let ol = ol_to_local.len();
+        let ol = ol_count as usize;
 
         if ol > 0 {
-            // Build block predecessor CSR in two linear passes.
-            let mut pred_off = Vec::with_capacity_in(nb + 1, alloc);
-            pred_off.resize(nb + 1, 0u32);
-            for b in 0..nb {
-                flow.for_each_block_succ(Block(b as u32), |tb| {
-                    pred_off[tb.index()] += 1;
+            live.ol_by_origin = Csr::from_iter(
+                o,
+                flow.local_origins.iter().map(|&(l, origin)| (origin.index(), local_to_ol[l.index()])),
+                alloc,
+            );
+
+            // Build per-`ol` sorted statement event CSR (at most one entry per `(oi, stmt)`,
+            // with `EVENT_FLAG` set for Use/UseAndDef and clear for pure Def).
+            let mut ev_off = Vec::with_capacity_in(ol + 1, alloc);
+            ev_off.resize(ol + 1, 0u32);
+            let mut seen_stmt = Vec::with_capacity_in(ol, alloc);
+            seen_stmt.resize(ol, u32::MAX);
+            for s in 0..n {
+                let su = s as u32;
+                let stmt = Stmt(su);
+                for_each_stmt_use_no_drop(flow, stmt, |l| {
+                    let oi = local_to_ol[l.index()];
+                    if oi != u32::MAX && seen_stmt[oi as usize] != su {
+                        seen_stmt[oi as usize] = su;
+                        ev_off[oi as usize] += 1;
+                    }
                 });
+                if let Some(d) = stmt_def(flow, stmt) {
+                    let oi = local_to_ol[d.index()];
+                    if oi != u32::MAX && seen_stmt[oi as usize] != su {
+                        seen_stmt[oi as usize] = su;
+                        ev_off[oi as usize] += 1;
+                    }
+                }
             }
-            let mut total_edges = 0u32;
-            for c in pred_off[..nb].iter_mut() {
-                total_edges += *c;
-                *c = total_edges;
+            let mut total_ev = 0u32;
+            for c in ev_off[..ol].iter_mut() {
+                total_ev += *c;
+                *c = total_ev;
             }
-            pred_off[nb] = total_edges;
-            let mut pred_entries = Vec::with_capacity_in(total_edges as usize, alloc);
-            pred_entries.resize(total_edges as usize, 0u32);
-            for b in 0..nb {
-                flow.for_each_block_succ(Block(b as u32), |tb| {
-                    let ti = tb.index();
-                    pred_off[ti] -= 1;
-                    pred_entries[pred_off[ti] as usize] = b as u32;
+            ev_off[ol] = total_ev;
+            let mut ev_entries = Vec::with_capacity_in(total_ev as usize, alloc);
+            ev_entries.resize(total_ev as usize, 0u32);
+            seen_stmt.fill(u32::MAX);
+            // Reverse iteration with decrementing offsets keeps each row strictly ascending by `stmt`.
+            for s in (0..n).rev() {
+                let su = s as u32;
+                let stmt = Stmt(su);
+                for_each_stmt_use_no_drop(flow, stmt, |l| {
+                    let oi = local_to_ol[l.index()];
+                    if oi != u32::MAX && seen_stmt[oi as usize] != su {
+                        let oiu = oi as usize;
+                        seen_stmt[oiu] = su;
+                        ev_off[oiu] -= 1;
+                        ev_entries[ev_off[oiu] as usize] = su | EVENT_FLAG;
+                    }
                 });
+                if let Some(d) = stmt_def(flow, stmt) {
+                    let oi = local_to_ol[d.index()];
+                    if oi != u32::MAX && seen_stmt[oi as usize] != su {
+                        let oiu = oi as usize;
+                        seen_stmt[oiu] = su;
+                        ev_off[oiu] -= 1;
+                        ev_entries[ev_off[oiu] as usize] = su;
+                    }
+                }
             }
-            let block_preds = Csr { offsets: pred_off, entries: pred_entries };
+            drop(seen_stmt);
+            live.ol_events = Csr { offsets: ev_off, entries: ev_entries };
 
-            // Block-grain backward liveness over origin-bearing locals:
-            // `live_in(b) = block_use(b) | (live_out(b) & block_trans(b))`.
-            let mut block_live_in = Bits::new_in(nb, ol, alloc);
-            let mut block_live_out = Bits::new_in(nb, ol, alloc);
-            let mut block_trans = Bits::new_in(nb, ol, alloc);
-            for b in 0..nb {
-                let range = flow.blocks[b];
-                fill_all_bits(block_trans.row_mut(b), ol);
-                let mut any_use = false;
-                for s in range.start..range.end {
-                    let stmt = Stmt(s);
-                    for_each_stmt_use_no_drop(flow, stmt, |l| {
-                        let oi = local_to_ol[l.index()];
-                        if oi != u32::MAX && block_trans.get(b, oi as usize) {
-                            block_live_in.set(b, oi as usize);
-                            any_use = true;
-                        }
-                    });
-                    if let Some(d) = stmt_def(flow, stmt) {
-                        let oi = local_to_ol[d.index()];
-                        if oi != u32::MAX {
-                            block_trans.clear(b, oi as usize);
-                        }
-                    }
-                }
-                if any_use {
-                    for &pred in block_preds.row(b) {
-                        let p = pred as usize;
-                        if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
-                            worklist.push(post_rank[p] as usize);
+            // Only locals upward-exposed in at least one basic block can ever be live across a
+            // block boundary; purely block-local temporaries need zero columns in `block_live_out`.
+            let mut ol_to_cross = Vec::with_capacity_in(ol, alloc);
+            ol_to_cross.resize(ol, u32::MAX);
+            let mut cross_to_ol = Vec::new_in(alloc);
+            for oi in 0..ol {
+                let mut last_b = u32::MAX;
+                for &e in live.ol_events.row(oi) {
+                    let b = flow.stmt_block[(e & EVENT_STMT_MASK) as usize].0;
+                    if b != last_b {
+                        last_b = b;
+                        if (e & EVENT_FLAG) != 0 {
+                            ol_to_cross[oi] = cross_to_ol.len() as u32;
+                            cross_to_ol.push(oi as u32);
+                            break;
                         }
                     }
                 }
             }
+            let cross_ol = cross_to_ol.len();
+            live.ol_to_cross = ol_to_cross;
 
-            let olw = block_live_in.words();
-            let mut scratch_l = Vec::with_capacity_in(olw, alloc);
-            scratch_l.resize(olw, 0u64);
-            let limit = (nb as u64)
-                .saturating_mul(ol as u64)
-                .saturating_mul(2)
-                .saturating_add(1);
-            let mut pops = 0u64;
-            while let Some(rank) = worklist.pop_min() {
-                pops += 1;
-                if pops > limit {
-                    return Err(Bound::Passes { what: "liveness passes", limit });
+            let mut block_preds: Option<Csr<u32, A>> = None;
+            if cross_ol > 0 {
+                let preds = build_block_preds(flow, nb, alloc);
+                // Block-grain backward liveness over cross-block origin-bearing locals:
+                // `live_in(b) = block_use(b) | (live_out(b) & block_trans(b))`.
+                let mut block_live_in = Bits::new_in(nb, cross_ol, alloc);
+                let mut block_live_out = Bits::new_in(nb, cross_ol, alloc);
+                let mut block_trans = Bits::new_in(nb, cross_ol, alloc);
+                for b in 0..nb {
+                    fill_all_bits(block_trans.row_mut(b), cross_ol);
                 }
-                let b = postorder[rank] as usize;
-                for ((dst, &out_w), &tr_w) in scratch_l
-                    .iter_mut()
-                    .zip(block_live_out.row(b).iter())
-                    .zip(block_trans.row(b).iter())
-                {
-                    *dst = out_w & tr_w;
-                }
-                if bits::union_into(block_live_in.row_mut(b), &scratch_l) {
-                    for &pred in block_preds.row(b) {
-                        let p = pred as usize;
-                        if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
-                            worklist.push(post_rank[p] as usize);
+                for (ci, &oi) in cross_to_ol.iter().enumerate() {
+                    let mut last_b = u32::MAX;
+                    for &e in live.ol_events.row(oi as usize) {
+                        let b = flow.stmt_block[(e & EVENT_STMT_MASK) as usize].0;
+                        if b != last_b {
+                            last_b = b;
+                            let bu = b as usize;
+                            if (e & EVENT_FLAG) != 0 {
+                                block_live_in.set(bu, ci);
+                            } else {
+                                block_trans.clear(bu, ci);
+                            }
                         }
                     }
                 }
-            }
-            drop(block_trans);
-            drop(block_live_in);
+                for b in 0..nb {
+                    if block_live_in.row(b).iter().any(|&w| w != 0) {
+                        for &pred in preds.row(b) {
+                            let p = pred as usize;
+                            if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
+                                worklist.push(post_rank[p] as usize);
+                            }
+                        }
+                    }
+                }
 
-            // Expand block-exit liveness backward through each block to populate `facts.live`.
-            let mut cur_out = Vec::with_capacity_in(olw, alloc);
-            cur_out.resize(olw, 0u64);
-            let mut cur_in = scratch_l;
-            for b in 0..nb {
-                let range = flow.blocks[b];
-                if range.end <= range.start {
-                    continue;
-                }
-                cur_out.copy_from_slice(block_live_out.row(b));
-                for s in (range.start..range.end).rev() {
-                    let stmt = Stmt(s);
-                    cur_in.copy_from_slice(&cur_out);
-                    if let Some(d) = stmt_def(flow, stmt) {
-                        let oi = local_to_ol[d.index()];
-                        if oi != u32::MAX {
-                            bits::put(&mut cur_in, oi as usize, false);
+                let olw = block_live_in.words();
+                let mut scratch_l = Vec::with_capacity_in(olw, alloc);
+                scratch_l.resize(olw, 0u64);
+                let limit = (nb as u64)
+                    .saturating_mul(cross_ol as u64)
+                    .saturating_mul(2)
+                    .saturating_add(1);
+                let mut pops = 0u64;
+                while let Some(rank) = worklist.pop_min() {
+                    pops += 1;
+                    if pops > limit {
+                        return Err(Bound::Passes { what: "liveness passes", limit });
+                    }
+                    let b = postorder[rank] as usize;
+                    for ((dst, &out_w), &tr_w) in scratch_l
+                        .iter_mut()
+                        .zip(block_live_out.row(b).iter())
+                        .zip(block_trans.row(b).iter())
+                    {
+                        *dst = out_w & tr_w;
+                    }
+                    if bits::union_into(block_live_in.row_mut(b), &scratch_l) {
+                        for &pred in preds.row(b) {
+                            let p = pred as usize;
+                            if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
+                                worklist.push(post_rank[p] as usize);
+                            }
                         }
                     }
-                    for_each_stmt_use_no_drop(flow, stmt, |l| {
-                        let oi = local_to_ol[l.index()];
-                        if oi != u32::MAX {
-                            bits::put(&mut cur_in, oi as usize, true);
-                        }
-                    });
-                    let su = s as usize;
-                    mark_origins(
-                        &cur_in,
-                        &cur_out,
-                        &ol_to_local,
-                        &origins_by_local,
-                        &mut live,
-                        2 * su,
-                        2 * su + 1,
-                    );
-                    cur_out.copy_from_slice(&cur_in);
                 }
+                drop(scratch_l);
+                drop(block_trans);
+                drop(block_live_in);
+                live.block_live_out = block_live_out;
+                block_preds = Some(preds);
             }
-            drop(cur_out);
-            drop(cur_in);
-            drop(block_live_out);
+            drop(cross_to_ol);
 
             // Second backward liveness pass for drop-only uses: a local is drop-live along paths
             // reaching `StmtKind::Drop(p)` ONLY where the local may be initialized (RFC 2094,
@@ -721,45 +953,57 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
             // drop-liveness back from the join block's `Drop(p)`. Solved at block grain over only
             // the locals that both appear in a reachable `Drop` and carry a drop-live origin.
             let split_drop = !flow.local_no_drop_origins.is_empty();
-            let drop_origins_owned = split_drop.then(|| {
-                let mut drop_pairs: Vec<(usize, Origin), A> = Vec::new_in(alloc);
-                for &(l, origin) in &flow.local_origins {
-                    if flow.local_no_drop_origins.binary_search(&(l, origin)).is_err() {
-                        drop_pairs.push((l.index(), origin));
-                    }
+            let mut has_drop_origin = Vec::with_capacity_in(locals, alloc);
+            has_drop_origin.resize(locals, false);
+            for &(l, origin) in &flow.local_origins {
+                if !split_drop || flow.local_no_drop_origins.binary_search(&(l, origin)).is_err() {
+                    has_drop_origin[l.index()] = true;
                 }
-                Csr::from_iter(locals, drop_pairs.iter().copied(), alloc)
-            });
-            let drop_origins_by_local = drop_origins_owned.as_ref().unwrap_or(&origins_by_local);
+            }
 
             let mut local_to_dl = Vec::with_capacity_in(locals, alloc);
             local_to_dl.resize(locals, u32::MAX);
-            let mut dl_to_local = Vec::new_in(alloc);
+            let mut dl_count = 0u32;
             let mut drop_uses: Vec<(Stmt, u32), A> = Vec::new_in(alloc);
-            let mut block_has_drop = Vec::with_capacity_in(nb, alloc);
-            block_has_drop.resize(nb, false);
             for s in 0..n {
                 let stmt = Stmt(s as u32);
                 if let StmtKind::Drop(p) = flow.stmt(stmt).kind {
                     let l = flow.place(p).local;
-                    if !drop_origins_by_local.row(l.index()).is_empty()
-                        && init.drop_may_run(flow, stmt, p)
-                    {
+                    if has_drop_origin[l.index()] && init.drop_may_run(flow, stmt, p) {
                         let dli = if local_to_dl[l.index()] == u32::MAX {
-                            let idx = dl_to_local.len() as u32;
+                            let idx = dl_count;
                             local_to_dl[l.index()] = idx;
-                            dl_to_local.push(l);
+                            dl_count += 1;
                             idx
                         } else {
                             local_to_dl[l.index()]
                         };
                         drop_uses.push((stmt, dli));
-                        block_has_drop[flow.stmt_block[s].index()] = true;
                     }
                 }
             }
-            let dl = dl_to_local.len();
+            drop(has_drop_origin);
+            let dl = dl_count as usize;
+
             if dl > 0 {
+                let mut dl_orig_pairs: Vec<(usize, u32), A> = Vec::new_in(alloc);
+                for &(l, origin) in &flow.local_origins {
+                    let dli = local_to_dl[l.index()];
+                    if dli != u32::MAX
+                        && (!split_drop
+                            || flow.local_no_drop_origins.binary_search(&(l, origin)).is_err())
+                    {
+                        dl_orig_pairs.push((origin.index(), dli));
+                    }
+                }
+                live.dl_by_origin = Csr::from_iter(o, dl_orig_pairs.iter().copied(), alloc);
+                drop(dl_orig_pairs);
+
+                let preds = match block_preds {
+                    Some(preds) => preds,
+                    None => build_block_preds(flow, nb, alloc),
+                };
+
                 let mut block_d_in = Bits::new_in(nb, dl, alloc);
                 let mut block_d_out = Bits::new_in(nb, dl, alloc);
                 let mut block_drop_trans = Bits::new_in(nb, dl, alloc);
@@ -819,6 +1063,7 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                             &mut cur_init,
                             &mut init_count,
                             &mut mi_row,
+                            |_| {},
                         );
                         if s + 1 < range.end {
                             bits::intersect_into(block_drop_trans.row_mut(b), &mi_row);
@@ -826,12 +1071,13 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     }
                     block_mi_out.row_mut(b).copy_from_slice(&mi_row);
                 }
+
                 // Seed backward worklist from blocks whose `block_d_in` has any upward-exposed drop.
                 for b in 0..nb {
                     if !init.reached[b] || !block_d_in.row(b).iter().any(|&w| w != 0) {
                         continue;
                     }
-                    for &pred in block_preds.row(b) {
+                    for &pred in preds.row(b) {
                         let p = pred as usize;
                         if union_masked_into(
                             block_d_out.row_mut(p),
@@ -863,7 +1109,7 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                         *dst = out_w & tr_w;
                     }
                     if bits::union_into(block_d_in.row_mut(b), &scratch_d) {
-                        for &pred in block_preds.row(b) {
+                        for &pred in preds.row(b) {
                             let p = pred as usize;
                             if union_masked_into(
                                 block_d_out.row_mut(p),
@@ -875,15 +1121,70 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                         }
                     }
                 }
-                drop(block_drop_trans);
                 drop(block_mi_out);
                 drop(block_d_in);
 
-                // Expand block-exit drop-liveness backward through each active block to `facts.live`.
-                let mut block_mi: Vec<u64, A> = Vec::new_in(alloc);
+                // Compress constant-true blocks (`block_d_out & block_drop_trans`) into `block_d_const`.
+                let mut dl_to_cross = Vec::with_capacity_in(dl, alloc);
+                dl_to_cross.resize(dl, u32::MAX);
+                let mut cross_to_dl = Vec::new_in(alloc);
+                for b in 0..nb {
+                    if !init.reached[b] {
+                        continue;
+                    }
+                    let out_r = block_d_out.row(b);
+                    let tr_r = block_drop_trans.row(b);
+                    for w in 0..dlw {
+                        let mut c = out_r[w] & tr_r[w];
+                        let base = w * 64;
+                        while c != 0 {
+                            let dli = base + usize::try_from(c.trailing_zeros()).unwrap_or(0);
+                            c &= c - 1;
+                            if dl_to_cross[dli] == u32::MAX {
+                                dl_to_cross[dli] = cross_to_dl.len() as u32;
+                                cross_to_dl.push(dli as u32);
+                            }
+                        }
+                    }
+                }
+                let cross_dl = cross_to_dl.len();
+                if cross_dl > 0 {
+                    let mut block_d_const = Bits::new_in(nb, cross_dl, alloc);
+                    for b in 0..nb {
+                        if !init.reached[b] {
+                            continue;
+                        }
+                        let out_r = block_d_out.row(b);
+                        let tr_r = block_drop_trans.row(b);
+                        for w in 0..dlw {
+                            let mut c = out_r[w] & tr_r[w];
+                            let base = w * 64;
+                            while c != 0 {
+                                let dli = base + usize::try_from(c.trailing_zeros()).unwrap_or(0);
+                                c &= c - 1;
+                                block_d_const.set(b, dl_to_cross[dli] as usize);
+                            }
+                        }
+                    }
+                    live.block_d_const = block_d_const;
+                }
+                live.dl_to_cross = dl_to_cross;
+                drop(cross_to_dl);
+
+                // Record compact half-open `Point` intervals only for `(block, dl)` pairs whose
+                // drop-liveness varies within the block (either `d_out && !drop_trans`, or a
+                // reachable `Drop` in the block while not `block_d_const`).
+                let mut raw_intervals: Vec<(u32, u32, u32), A> = Vec::new_in(alloc);
+                let mut case3_mask = Vec::with_capacity_in(dlw, alloc);
+                case3_mask.resize(dlw, 0u64);
+                let mut case3_dls: Vec<u32, A> = Vec::new_in(alloc);
+                let mut open_hi = Vec::with_capacity_in(dl, alloc);
+                open_hi.resize(dl, u32::MAX);
+                let mut mi_flips: Vec<(u32, u32), A> = Vec::new_in(alloc);
                 let mut cur_out = Vec::with_capacity_in(dlw, alloc);
                 cur_out.resize(dlw, 0u64);
                 let mut cur_in = scratch_d;
+
                 for b in 0..nb {
                     if !init.reached[b] {
                         continue;
@@ -892,14 +1193,40 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     if range.end <= range.start {
                         continue;
                     }
-                    if !block_has_drop[b] && !block_d_out.row(b).iter().any(|&w| w != 0) {
+                    let out_r = block_d_out.row(b);
+                    let tr_r = block_drop_trans.row(b);
+                    let mut any_case3 = false;
+                    for w in 0..dlw {
+                        let m = out_r[w] & !tr_r[w];
+                        case3_mask[w] = m;
+                        any_case3 |= m != 0;
+                    }
+                    let du_start = drop_uses.partition_point(|&(ds, _)| ds.0 < range.start);
+                    let mut du_end = du_start;
+                    while du_end < drop_uses.len() && drop_uses[du_end].0.0 < range.end {
+                        let dli = drop_uses[du_end].1 as usize;
+                        if !(bits::test(out_r, dli) && bits::test(tr_r, dli)) {
+                            bits::put(&mut case3_mask, dli, true);
+                            any_case3 = true;
+                        }
+                        du_end += 1;
+                    }
+                    if !any_case3 {
                         continue;
                     }
-                    let len = (range.end - range.start) as usize;
-                    let needed = (len + 1) * dlw;
-                    if block_mi.len() < needed {
-                        block_mi.resize(needed, 0u64);
+                    case3_dls.clear();
+                    for w in 0..dlw {
+                        let mut m = case3_mask[w];
+                        let base = w * 64;
+                        while m != 0 {
+                            let dli = base + usize::try_from(m.trailing_zeros()).unwrap_or(0);
+                            m &= m - 1;
+                            case3_dls.push(dli as u32);
+                        }
                     }
+
+                    let len = (range.end - range.start) as usize;
+                    mi_flips.clear();
                     init_tracked_block(
                         flow,
                         &init,
@@ -909,7 +1236,6 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                         &mut init_count,
                         &mut mi_row,
                     );
-                    block_mi[0..dlw].copy_from_slice(&mi_row);
                     for i in 0..len {
                         let stmt = Stmt(range.start + i as u32);
                         step_tracked_init(
@@ -920,13 +1246,23 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                             &mut cur_init,
                             &mut init_count,
                             &mut mi_row,
+                            |dli| mi_flips.push((i as u32, dli)),
                         );
-                        let off = (i + 1) * dlw;
-                        block_mi[off..off + dlw].copy_from_slice(&mi_row);
                     }
-                    let mut du_end = drop_uses.partition_point(|&(ds, _)| ds.0 < range.end);
+
                     cur_out.copy_from_slice(block_d_out.row(b));
+                    let mut du_cur = du_end;
                     for i in (0..len).rev() {
+                        // Undo statement `i`'s flips so `mi_row` holds `mi_in[i]`.
+                        while let Some(&(si, dli)) = mi_flips.last() {
+                            if si != i as u32 {
+                                break;
+                            }
+                            mi_flips.pop();
+                            let d = dli as usize;
+                            let was = bits::test(&mi_row, d);
+                            bits::put(&mut mi_row, d, !was);
+                        }
                         let s = range.start + i as u32;
                         let stmt = Stmt(s);
                         cur_in.copy_from_slice(&cur_out);
@@ -936,96 +1272,177 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                                 bits::put(&mut cur_in, dli as usize, false);
                             }
                         }
-                        let mi_in_slice = &block_mi[i * dlw..(i + 1) * dlw];
-                        bits::intersect_into(&mut cur_in, mi_in_slice);
-                        while du_end > 0 && drop_uses[du_end - 1].0 == stmt {
-                            du_end -= 1;
-                            bits::put(&mut cur_in, drop_uses[du_end].1 as usize, true);
+                        bits::intersect_into(&mut cur_in, &mi_row);
+                        while du_cur > du_start && drop_uses[du_cur - 1].0 == stmt {
+                            du_cur -= 1;
+                            bits::put(&mut cur_in, drop_uses[du_cur].1 as usize, true);
                         }
-                        let su = s as usize;
-                        mark_origins(
-                            &cur_in,
-                            &cur_out,
-                            &dl_to_local,
-                            drop_origins_by_local,
-                            &mut live,
-                            2 * su,
-                            2 * su + 1,
-                        );
-                        // For the previous statement `i - 1`, `d_out[i - 1] = d_in[i] & maybe_init_out[i - 1]`,
-                        // and `maybe_init_out[i - 1] == maybe_init_in[i] == mi_in_slice`.
+
+                        let p_start = s * 2;
+                        let p_mid = p_start + 1;
+                        for &dli in &case3_dls {
+                            let d = dli as usize;
+                            let in_bit = bits::test(&cur_in, d);
+                            let mid_bit = in_bit || bits::test(&cur_out, d);
+                            if mid_bit {
+                                if open_hi[d] == u32::MAX {
+                                    open_hi[d] = p_mid + 1;
+                                }
+                            } else if open_hi[d] != u32::MAX {
+                                raw_intervals.push((dli, p_mid + 1, open_hi[d]));
+                                open_hi[d] = u32::MAX;
+                            }
+                            if in_bit {
+                                if open_hi[d] == u32::MAX {
+                                    open_hi[d] = p_start + 1;
+                                }
+                            } else if open_hi[d] != u32::MAX {
+                                raw_intervals.push((dli, p_start + 1, open_hi[d]));
+                                open_hi[d] = u32::MAX;
+                            }
+                        }
+
                         for ((dst, &in_w), &m) in
-                            cur_out.iter_mut().zip(cur_in.iter()).zip(mi_in_slice.iter())
+                            cur_out.iter_mut().zip(cur_in.iter()).zip(mi_row.iter())
                         {
                             *dst = in_w & m;
                         }
                     }
+                    let b_start_pt = range.start * 2;
+                    for &dli in &case3_dls {
+                        let d = dli as usize;
+                        if open_hi[d] != u32::MAX {
+                            raw_intervals.push((dli, b_start_pt, open_hi[d]));
+                            open_hi[d] = u32::MAX;
+                        }
+                    }
+                }
+                if !raw_intervals.is_empty() {
+                    raw_intervals.sort_unstable();
+                    // `Csr::from_iter` fills each row backwards, so iterate in reverse to keep
+                    // every `dl`'s disjoint intervals strictly ascending by `p_lo`.
+                    live.dl_intervals = Csr::from_iter(
+                        dl,
+                        raw_intervals.iter().rev().map(|&(d, lo, hi)| (d as usize, (lo, hi))),
+                        alloc,
+                    );
                 }
             }
         }
     }
 
-    let mut active = Bits::new_in(n, nl, alloc);
+    let mut active = ActiveFacts::empty_in(alloc);
     if has_activate && nl > 0 {
-        let mut block_active = Bits::new_in(nb, nl, alloc);
-        let mut reached = Vec::with_capacity_in(nb, alloc);
-        reached.resize(nb, false);
-        reached[eb] = true;
-        let mut scratch = Vec::with_capacity_in(active.words(), alloc);
-        scratch.resize(active.words(), 0u64);
-        // Reuse the now-empty `worklist` in forward block RPO (`(nb - 1) - post_rank`).
-        worklist.push(nb - 1 - post_rank[eb] as usize);
-        let limit = (nb as u64)
-            .saturating_mul(nl as u64)
-            .saturating_add(nb as u64)
-            .saturating_add(1);
-        let mut pops = 0u64;
-        while let Some(rpo_r) = worklist.pop_min() {
-            pops += 1;
-            if pops > limit {
-                return Err(Bound::Passes { what: "activation passes", limit });
-            }
-            let b = postorder[nb - 1 - rpo_r] as usize;
-            let range = flow.blocks[b];
-            scratch.copy_from_slice(block_active.row(b));
-            for s in range.start..range.end {
-                match flow.stmt(Stmt(s)).kind {
-                    StmtKind::Activate(l) => bits::put(&mut scratch, l.index(), true),
-                    StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } => {
-                        bits::put(&mut scratch, loan.index(), false)
-                    }
-                    _ => {}
+        // Compress activation tracking to only loans that actually appear in `StmtKind::Activate`.
+        let mut loan_to_al = Vec::with_capacity_in(nl, alloc);
+        loan_to_al.resize(nl, u32::MAX);
+        let mut al_count = 0u32;
+        for s in 0..n {
+            if let StmtKind::Activate(l) = flow.stmt(Stmt(s as u32)).kind {
+                let li = l.index();
+                if loan_to_al[li] == u32::MAX {
+                    loan_to_al[li] = al_count;
+                    al_count += 1;
                 }
             }
-            flow.for_each_block_succ(Block(b as u32), |tb| {
-                let t = tb.index();
-                let first = !reached[t];
-                if first {
-                    reached[t] = true;
-                }
-                let grew = bits::union_into(block_active.row_mut(t), &scratch);
-                if first || grew {
-                    worklist.push(nb - 1 - post_rank[t] as usize);
-                }
-            });
         }
-        // Expand block-entry activation forward into per-statement `active`.
-        for b in 0..nb {
-            if !reached[b] {
-                continue;
-            }
-            let range = flow.blocks[b];
-            scratch.copy_from_slice(block_active.row(b));
-            for s in range.start..range.end {
-                active.row_mut(s as usize).copy_from_slice(&scratch);
-                match flow.stmt(Stmt(s)).kind {
-                    StmtKind::Activate(l) => bits::put(&mut scratch, l.index(), true),
-                    StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } => {
-                        bits::put(&mut scratch, loan.index(), false)
+        let al = al_count as usize;
+        if al > 0 {
+            let mut ev_off = Vec::with_capacity_in(al + 1, alloc);
+            ev_off.resize(al + 1, 0u32);
+            for s in 0..n {
+                match flow.stmt(Stmt(s as u32)).kind {
+                    StmtKind::Activate(l)
+                    | StmtKind::Assign { value: Value::Borrow { loan: l, .. }, .. } => {
+                        let ai = loan_to_al[l.index()];
+                        if ai != u32::MAX {
+                            ev_off[ai as usize] += 1;
+                        }
                     }
                     _ => {}
                 }
             }
+            let mut total_ev = 0u32;
+            for c in ev_off[..al].iter_mut() {
+                total_ev += *c;
+                *c = total_ev;
+            }
+            ev_off[al] = total_ev;
+            let mut ev_entries = Vec::with_capacity_in(total_ev as usize, alloc);
+            ev_entries.resize(total_ev as usize, 0u32);
+            for s in (0..n).rev() {
+                let su = s as u32;
+                match flow.stmt(Stmt(su)).kind {
+                    StmtKind::Activate(l) => {
+                        let ai = loan_to_al[l.index()];
+                        if ai != u32::MAX {
+                            ev_off[ai as usize] -= 1;
+                            ev_entries[ev_off[ai as usize] as usize] = su | EVENT_FLAG;
+                        }
+                    }
+                    StmtKind::Assign { value: Value::Borrow { loan: l, .. }, .. } => {
+                        let ai = loan_to_al[l.index()];
+                        if ai != u32::MAX {
+                            ev_off[ai as usize] -= 1;
+                            ev_entries[ev_off[ai as usize] as usize] = su;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let events = Csr { offsets: ev_off, entries: ev_entries };
+
+            let mut block_active = Bits::new_in(nb, al, alloc);
+            let mut reached = Vec::with_capacity_in(nb, alloc);
+            reached.resize(nb, false);
+            reached[eb] = true;
+            let mut scratch = Vec::with_capacity_in(block_active.words(), alloc);
+            scratch.resize(block_active.words(), 0u64);
+            // Reuse the now-empty `worklist` in forward block RPO (`(nb - 1) - post_rank`).
+            worklist.push(nb - 1 - post_rank[eb] as usize);
+            let limit = (nb as u64)
+                .saturating_mul(al as u64)
+                .saturating_add(nb as u64)
+                .saturating_add(1);
+            let mut pops = 0u64;
+            while let Some(rpo_r) = worklist.pop_min() {
+                pops += 1;
+                if pops > limit {
+                    return Err(Bound::Passes { what: "activation passes", limit });
+                }
+                let b = postorder[nb - 1 - rpo_r] as usize;
+                let range = flow.blocks[b];
+                scratch.copy_from_slice(block_active.row(b));
+                for s in range.start..range.end {
+                    match flow.stmt(Stmt(s)).kind {
+                        StmtKind::Activate(l) => {
+                            let ai = loan_to_al[l.index()];
+                            if ai != u32::MAX {
+                                bits::put(&mut scratch, ai as usize, true);
+                            }
+                        }
+                        StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } => {
+                            let ai = loan_to_al[loan.index()];
+                            if ai != u32::MAX {
+                                bits::put(&mut scratch, ai as usize, false);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                flow.for_each_block_succ(Block(b as u32), |tb| {
+                    let t = tb.index();
+                    let first = !reached[t];
+                    if first {
+                        reached[t] = true;
+                    }
+                    let grew = bits::union_into(block_active.row_mut(t), &scratch);
+                    if first || grew {
+                        worklist.push(nb - 1 - post_rank[t] as usize);
+                    }
+                });
+            }
+            active = ActiveFacts { loan_to_al, reached, block_active, events };
         }
     }
     Ok(Facts { live, active, init })
@@ -1033,7 +1450,7 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
 
 /// Statement `s` invalidates loan `l` at its Start.
 pub fn invalidated<A: Allocator>(flow: &Flow<A>, facts: &Facts<A>, s: Stmt, l: Loan) -> bool {
-    let activated = facts.active.get(s.index(), l.index());
+    let activated = facts.is_active(flow, s, l);
     let mut hit = false;
     for_each_access(flow, s, |a| hit |= conflicts(flow, l, a, activated));
     hit
@@ -1143,13 +1560,12 @@ pub fn loan_parts<A: Allocator + Copy>(
                 }
             }
         }
-        let p = at.index();
         let s = at.stmt();
         let mut best: Option<(u32, Stmt, Local)> = None;
         seen.clear();
         seen.resize(flow.locals as usize, false);
         for &(local, origin) in flow.local_origins.iter() {
-            if !holds[origin.index()] || !facts.live.get(p, origin.index()) || seen[local.index()] {
+            if !holds[origin.index()] || !facts.is_live(flow, at, origin) || seen[local.index()] {
                 continue;
             }
             seen[local.index()] = true;
@@ -1210,6 +1626,7 @@ pub enum TierOne {
 
 /// Closes `rows` over CSR outgoing edges (`from -> into`: row `into` |= row `from`) with a
 /// bounded FIFO ring buffer. Bound: pops are at most `origins + origins * columns`.
+#[cfg(test)]
 fn close_csr<A: Allocator + Copy>(
     outgoing: &Csr<Origin, A>,
     rows: &mut Bits<A>,
@@ -1329,86 +1746,246 @@ pub fn tier_one<A: Allocator + Copy>(
     let mut outgoing: Option<Csr<Origin, A>> = None;
 
     if nl > 0 {
-        let loans_by_local = Csr::from_iter(
-            flow.locals as usize,
-            flow.loans.iter().enumerate().map(|(i, row)| (flow.place(row.place).local.index(), Loan(i as u32))),
-            alloc,
-        );
+        const SHORT_SPAN_MAX: u32 = 64;
+        const SHORT_REACH_MAX: usize = 16;
         // The planted control keeps each loan in the origin it was issued into only (as does an
         // empty subset table).
         if plant == Plant::TierOneUnclosed || flow.subsets.is_empty() {
-            for s in 0..flow.stmts.len() {
-                let stmt = Stmt(s as u32);
-                let p = Point::start(stmt).index();
-                let mut refused = false;
-                for_each_access(flow, stmt, |a| {
-                    if refused {
-                        return;
+            let mut long_loans: Vec<(usize, Loan), A> = Vec::new_in(alloc);
+            for (i, row) in flow.loans.iter().enumerate() {
+                let loan = Loan(i as u32);
+                if let Some((lo, hi)) = facts.origin_start_bounds(flow, row.origin) {
+                    if lo > hi {
+                        continue;
                     }
-                    let local = flow.place(a.place).local.index();
-                    for &loan in loans_by_local.row(local) {
-                        let l = loan.index();
-                        if conflicts(flow, loan, a, facts.active.get(s, l))
-                            && facts.live.get(p, flow.loan(loan).origin.index())
-                        {
-                            refused = true;
+                    if hi - lo <= SHORT_SPAN_MAX {
+                        let mut refused = false;
+                        for s in lo..=hi {
+                            let stmt = Stmt(s);
+                            let p = Point::start(stmt);
+                            if !facts.is_live(flow, p, row.origin) {
+                                continue;
+                            }
+                            let act = facts.is_active(flow, stmt, loan);
+                            for_each_access(flow, stmt, |a| {
+                                if !refused && conflicts(flow, loan, a, act) {
+                                    refused = true;
+                                }
+                            });
+                            if refused {
+                                return Ok(TierOne::Refused);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                long_loans.push((flow.place(row.place).local.index(), loan));
+            }
+            if !long_loans.is_empty() {
+                let loans_by_local =
+                    Csr::from_iter(flow.locals as usize, long_loans.iter().copied(), alloc);
+                for s in 0..flow.stmts.len() {
+                    let stmt = Stmt(s as u32);
+                    let p = Point::start(stmt);
+                    let mut refused = false;
+                    for_each_access(flow, stmt, |a| {
+                        if refused {
                             return;
                         }
+                        let local = flow.place(a.place).local.index();
+                        for &loan in loans_by_local.row(local) {
+                            if conflicts(flow, loan, a, facts.is_active(flow, stmt, loan))
+                                && facts.is_live(flow, p, flow.loan(loan).origin)
+                            {
+                                refused = true;
+                                return;
+                            }
+                        }
+                    });
+                    if refused {
+                        return Ok(TierOne::Refused);
                     }
-                });
-                if refused {
-                    return Ok(TierOne::Refused);
                 }
             }
         } else {
             let edges = subset_edges(flow, alloc);
             let out = Csr::from_iter(o, edges.iter().map(|&(a, b)| (a.index(), b)), alloc);
-            drop(edges);
-            let mut contains = Bits::new_in(o, nl, alloc);
-            for (l, row) in flow.loans.iter().enumerate() {
-                contains.set(row.origin.index(), l);
-            }
-            close_csr(&out, &mut contains, o, nl, alloc)?;
-            // Transpose `contains[origin][loan]` into `contains_t[loan][origin]` for word-wise live checks.
-            let mut contains_t = Bits::new_in(nl, o, alloc);
-            let lw = contains.words();
-            for x in 0..o {
-                let row = contains.row(x);
-                for w in 0..lw {
-                    let mut b = row[w];
-                    let base = w * 64;
-                    while b != 0 {
-                        let l = base + b.trailing_zeros() as usize;
-                        b &= b - 1;
-                        contains_t.set(l, x);
-                    }
+            // Any origin that can globally reach a placeholder is live at every point; precompute
+            // that set once in `O(O + E)` without allocating `O × L` matrices.
+            let mut reaches_placeholder = Vec::with_capacity_in(o, alloc);
+            reaches_placeholder.resize(o, false);
+            let mut dfs_stack = Vec::new_in(alloc);
+            let mut has_ph = false;
+            for (i, &is_ph) in flow.placeholder.iter().enumerate() {
+                if is_ph {
+                    reaches_placeholder[i] = true;
+                    dfs_stack.push(Origin(i as u32));
+                    has_ph = true;
                 }
             }
-            drop(contains);
-            outgoing = Some(out);
-            for s in 0..flow.stmts.len() {
-                let stmt = Stmt(s as u32);
-                let live_row = facts.live.row(Point::start(stmt).index());
-                let mut refused = false;
-                for_each_access(flow, stmt, |a| {
-                    if refused {
-                        return;
-                    }
-                    let local = flow.place(a.place).local.index();
-                    for &loan in loans_by_local.row(local) {
-                        let l = loan.index();
-                        if conflicts(flow, loan, a, facts.active.get(s, l))
-                            && bits::intersects(contains_t.row(l), live_row)
-                        {
-                            refused = true;
-                            return;
+            if has_ph {
+                let inc = Csr::from_iter(o, edges.iter().map(|&(a, b)| (b.index(), a)), alloc);
+                while let Some(u) = dfs_stack.pop() {
+                    for &v in inc.row(u.index()) {
+                        if !reaches_placeholder[v.index()] {
+                            reaches_placeholder[v.index()] = true;
+                            dfs_stack.push(v);
                         }
                     }
-                });
-                if refused {
-                    return Ok(TierOne::Refused);
                 }
             }
+            drop(edges);
+
+            let mut visit_epoch = Vec::with_capacity_in(o, alloc);
+            visit_epoch.resize(o, 0u64);
+            let mut epoch = 0u64;
+            let mut visited_buf = Vec::new_in(alloc);
+            let mut long_loans: Vec<(usize, Loan), A> = Vec::new_in(alloc);
+
+            // Check short-lived intra-block loans directly over their exact live statement window,
+            // avoiding `O(K^2)` scans on hot locals with thousands of temporary borrows.
+            for (i, row) in flow.loans.iter().enumerate() {
+                let loan = Loan(i as u32);
+                let orig = row.origin;
+                if !reaches_placeholder[orig.index()] {
+                    epoch += 1;
+                    visited_buf.clear();
+                    dfs_stack.clear();
+                    let mut bounded = true;
+                    let (mut lo, mut hi) = (u32::MAX, 0u32);
+                    visit_epoch[orig.index()] = epoch;
+                    visited_buf.push(orig);
+                    dfs_stack.push(orig);
+                    while let Some(u) = dfs_stack.pop() {
+                        match facts.origin_start_bounds(flow, u) {
+                            Some((u_lo, u_hi)) => {
+                                if u_lo <= u_hi {
+                                    lo = lo.min(u_lo);
+                                    hi = hi.max(u_hi);
+                                    if hi - lo > SHORT_SPAN_MAX {
+                                        bounded = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                bounded = false;
+                                break;
+                            }
+                        }
+                        for &v in out.row(u.index()) {
+                            let vi = v.index();
+                            if visit_epoch[vi] != epoch {
+                                if visited_buf.len() >= SHORT_REACH_MAX {
+                                    bounded = false;
+                                    break;
+                                }
+                                visit_epoch[vi] = epoch;
+                                visited_buf.push(v);
+                                dfs_stack.push(v);
+                            }
+                        }
+                        if !bounded {
+                            break;
+                        }
+                    }
+                    if bounded {
+                        if lo <= hi {
+                            let mut refused = false;
+                            for s in lo..=hi {
+                                let stmt = Stmt(s);
+                                let p = Point::start(stmt);
+                                if !visited_buf.iter().any(|&v| facts.is_live(flow, p, v)) {
+                                    continue;
+                                }
+                                let act = facts.is_active(flow, stmt, loan);
+                                for_each_access(flow, stmt, |a| {
+                                    if !refused && conflicts(flow, loan, a, act) {
+                                        refused = true;
+                                    }
+                                });
+                                if refused {
+                                    return Ok(TierOne::Refused);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+                long_loans.push((flow.place(row.place).local.index(), loan));
+            }
+
+            if !long_loans.is_empty() {
+                let loans_by_local =
+                    Csr::from_iter(flow.locals as usize, long_loans.iter().copied(), alloc);
+                // Per-statement forward DFS with `dead_at[v] == s` memoization: each origin is
+                // visited at most once per conflicting statement, with zero `O × L` bitset.
+                let mut dead_at = Vec::with_capacity_in(o, alloc);
+                dead_at.resize(o, u32::MAX);
+
+                for s in 0..flow.stmts.len() {
+                    let su = s as u32;
+                    let stmt = Stmt(su);
+                    let p = Point::start(stmt);
+                    let mut refused = false;
+                    for_each_access(flow, stmt, |a| {
+                        if refused {
+                            return;
+                        }
+                        let local = flow.place(a.place).local.index();
+                        for &loan in loans_by_local.row(local) {
+                            if !conflicts(flow, loan, a, facts.is_active(flow, stmt, loan)) {
+                                continue;
+                            }
+                            let orig = flow.loan(loan).origin;
+                            let oi = orig.index();
+                            if reaches_placeholder[oi] || facts.is_live(flow, p, orig) {
+                                refused = true;
+                                return;
+                            }
+                            if out.row(oi).is_empty() || dead_at[oi] == su {
+                                continue;
+                            }
+                            epoch += 1;
+                            visited_buf.clear();
+                            dfs_stack.clear();
+                            visit_epoch[oi] = epoch;
+                            visited_buf.push(orig);
+                            dfs_stack.push(orig);
+                            let mut hit = false;
+                            while let Some(u) = dfs_stack.pop() {
+                                for &v in out.row(u.index()) {
+                                    let vi = v.index();
+                                    if visit_epoch[vi] == epoch || dead_at[vi] == su {
+                                        continue;
+                                    }
+                                    if facts.is_live(flow, p, v) {
+                                        hit = true;
+                                        break;
+                                    }
+                                    visit_epoch[vi] = epoch;
+                                    visited_buf.push(v);
+                                    dfs_stack.push(v);
+                                }
+                                if hit {
+                                    break;
+                                }
+                            }
+                            if hit {
+                                refused = true;
+                                return;
+                            }
+                            for &v in &visited_buf {
+                                dead_at[v.index()] = su;
+                            }
+                        }
+                    });
+                    if refused {
+                        return Ok(TierOne::Refused);
+                    }
+                }
+            }
+            outgoing = Some(out);
         }
     }
 
@@ -1496,8 +2073,15 @@ pub fn tier_two<A: Allocator + Copy>(
     let result = solver::solve((), flow, facts, plant, alloc, &mut solver::Meter::new(solver::LIMIT));
     #[cfg(test)]
     if let Ok(found) = &result {
-        let expected = tier_two_oracle(flow, facts, plant, alloc)?;
-        assert_eq!(found.as_slice(), expected.as_slice(), "tier two disagrees with the pointwise rules");
+        let points = 2usize.saturating_mul(flow.stmts.len());
+        let o = flow.origins as usize;
+        let nl = flow.loans.len();
+        // Cross-check against the dense `O(P * O * (O + L))` pointwise oracle whenever its dense
+        // tables fit comfortably in memory (covers all unit and `blaze-sim` property tests).
+        if points.saturating_mul(o).saturating_mul(o.saturating_add(nl)) <= 16_000_000 {
+            let expected = tier_two_oracle(flow, facts, plant, alloc)?;
+            assert_eq!(found.as_slice(), expected.as_slice(), "tier two disagrees with the pointwise rules");
+        }
     }
     result
 }
@@ -1532,7 +2116,7 @@ fn tier_two_oracle_counted<A: Allocator + Copy>(
     let points = 2 * n;
     let mut subset = Bits::new_in(points, o * o, alloc);
     let mut contains = Bits::new_in(points, o * nl, alloc);
-    let live = |p: usize, x: usize| facts.live.get(p, x);
+    let live = |p: usize, x: usize| facts.is_live(flow, Point(p as u32), Origin(x as u32));
     // subset(O1, O2, P) :- subset_base(O1, O2, P).
     for &(s, from, into) in flow.subsets.iter() {
         subset.set(Point::mid(s).index(), from.index() * o + into.index());

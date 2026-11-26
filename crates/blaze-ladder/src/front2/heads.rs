@@ -5927,9 +5927,12 @@ impl<'n> Store<'n> {
         let impl_marked = if trait_.is_none() { Marked::of(v)? } else { Marked::Unmarked };
         let mut unstable = blaze_own::Vec::new_in(alloc);
         let mut const_texts = blaze_own::Vec::new_in(alloc);
-        // Each `type X = U;` value's column (D148, `HeadRegions::impl_assoc`), or why not: filed
-        // with the impl's regions below, a refusal refusing them.
-        let mut assoc_cols: blaze_own::Vec<Result<(Name, RegionCol<Alloc<'static>>), RegionsRefusal>, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        // Each `type X = U;` value's text/type, laid into `HeadRegions::impl_assoc` AFTER
+        // `preds` and `with_own_param_bounds` below so associated types projecting through an
+        // impl type parameter's lifetime-carrying bound (e.g. `impl<'de, A: ?Sized +
+        // SeqAccess<'de>> SeqAccess<'de> for &mut A { type Error = A::Error; }`) receive
+        // `impl_given.param_bounds` instead of `&[]`.
+        let mut assoc_to_lay: blaze_own::Vec<(Name, &'n str, Option<LibKey>, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // For a trait impl, `Self::X` in where-clauses and members lowers to `<SelfTy as Trait>::X`
         // (types.rs `self_assoc_path`), never reading `env.self_assoc`. When an associated type's
         // value needs a constant (`Why::NeedConst`), we still lower the impl's header, where-clauses
@@ -5961,14 +5964,8 @@ impl<'n> Store<'n> {
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
                         let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
                         let written_t = lf::TypeId(t);
-                        let mut own_lifetimes = false;
-                        for &row in mv.rows(mv.list(head::GENERICS))? {
-                            own_lifetimes |= matches!(lf::GenericParam::decode(row)?, lf::GenericParam::Lifetime { .. });
-                        }
                         let lowered_assoc = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
-                            mb.ty(&mut self.tys, &env, mv, written_t).and_then(|value| {
-                                lay_written(&mb, &mut self.tys, &env, mv, &[written_t], given, Captures::NONE, alloc).map(|laid| (value, laid))
-                            })
+                            mb.ty(&mut self.tys, &env, mv, written_t)
                         } else {
                             let mut own_ps = blaze_own::Vec::new_in(alloc);
                             own_ps.extend_from_slice(&ps);
@@ -5976,12 +5973,11 @@ impl<'n> Store<'n> {
                             own_cs.extend_from_slice(&cs);
                             own_generics(&mb, &mut self.tys, module, mv, generics, &mut own_ps, &mut own_cs).and_then(|_| {
                                 let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
-                                let value = mb.ty(&mut self.tys, &own_env, mv, written_t)?;
-                                lay_written(&mb, &mut self.tys, &own_env, mv, &[written_t], given, Captures::NONE, alloc).map(|laid| (value, laid))
+                                mb.ty(&mut self.tys, &own_env, mv, written_t)
                             })
                         };
-                        let (value, laid) = match lowered_assoc {
-                            Ok(pair) => pair,
+                        let value = match lowered_assoc {
+                            Ok(value) => value,
                             Err(why @ Why::NeedConst(need, _)) if trait_.is_some() => {
                                 if first_assoc_const.is_none() {
                                     first_assoc_const = Some((need, why));
@@ -5992,17 +5988,9 @@ impl<'n> Store<'n> {
                             Err(why) => return Err(why),
                         };
                         super::gat::member_where(mv, m.name)?;
-                        let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
-                        if !own_lifetimes {
-                            let cx = hreg::Cx { v: mv, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
-                            assoc_cols.push(hreg::impl_assoc(&cx, self.tys.view(), hreg::AssocAt { name: Name::of(m.name), written: written_t, ty: value }));
-                        } else if let Ok(gat_scope) = scope.with_gat_lifetimes(mv, alloc) {
-                            let cx = hreg::Cx { v: mv, facts: &arity, written: &laid, scope: &gat_scope, made: &[], alloc };
-                            if let Ok(col) = hreg::impl_assoc(&cx, self.tys.view(), hreg::AssocAt { name: Name::of(m.name), written: written_t, ty: value }) {
-                                assoc_cols.push(Ok(col));
-                            }
-                        }
-                        assoc.push((Name::of(m.name), value));
+                        let assoc_name = Name::of(m.name);
+                        assoc.push((assoc_name, value));
+                        assoc_to_lay.push((assoc_name, m.text, m.written_by, value));
                     }
                     ItemDetail::Const { .. } => {
                         let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
@@ -6056,6 +6044,51 @@ impl<'n> Store<'n> {
             let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
             let own_bounds = with_own_param_bounds(&b, &mut self.tys, &self.regions, &arity, &env, v, &preds, &scope, given, Captures::NONE, alloc)?;
             let impl_given = SelfGiven { param_bounds: &own_bounds, ..given };
+            let mut assoc_cols: blaze_own::Vec<Result<(Name, RegionCol<Alloc<'static>>), RegionsRefusal>, Alloc<'static>> =
+                blaze_own::Vec::with_capacity_in(assoc_to_lay.len(), alloc);
+            if !assoc_to_lay.is_empty() {
+                let mut scratch = self.take_parse_scratch();
+                let res: Result<(), Why> = (|| {
+                    for &(assoc_name, m_text, m_written_by, value) in &assoc_to_lay {
+                        with_lowered_in(&mut scratch, names, key, m_text, |mv| -> Result<(), Why> {
+                            let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
+                            let marks = super::item_site::member_marks(names, key, m_written_by, m_text).map_err(MarksLost::why)?;
+                            let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+                            let written_t = lf::TypeId(t);
+                            let mut own_lifetimes = false;
+                            for &row in mv.rows(mv.list(head::GENERICS))? {
+                                own_lifetimes |= matches!(lf::GenericParam::decode(row)?, lf::GenericParam::Lifetime { .. });
+                            }
+                            let laid = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
+                                lay_written(&mb, &mut self.tys, &env, mv, &[written_t], impl_given, Captures::NONE, alloc)?
+                            } else {
+                                let mut own_ps = blaze_own::Vec::new_in(alloc);
+                                own_ps.extend_from_slice(&ps);
+                                let mut own_cs = blaze_own::Vec::new_in(alloc);
+                                own_cs.extend_from_slice(&cs);
+                                own_generics(&mb, &mut self.tys, module, mv, generics, &mut own_ps, &mut own_cs)?;
+                                let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
+                                lay_written(&mb, &mut self.tys, &own_env, mv, &[written_t], impl_given, Captures::NONE, alloc)?
+                            };
+                            let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
+                            if !own_lifetimes {
+                                let cx = hreg::Cx { v: mv, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
+                                assoc_cols.push(hreg::impl_assoc(&cx, self.tys.view(), hreg::AssocAt { name: assoc_name, written: written_t, ty: value }));
+                            } else if let Ok(gat_scope) = scope.with_gat_lifetimes(mv, alloc) {
+                                let cx = hreg::Cx { v: mv, facts: &arity, written: &laid, scope: &gat_scope, made: &[], alloc };
+                                if let Ok(col) = hreg::impl_assoc(&cx, self.tys.view(), hreg::AssocAt { name: assoc_name, written: written_t, ty: value }) {
+                                    assoc_cols.push(Ok(col));
+                                }
+                            }
+                            Ok(())
+                        })
+                        .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))??;
+                    }
+                    Ok(())
+                })();
+                self.put_parse_scratch(scratch);
+                res?;
+            }
             let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &[]), impl_given, Captures::NONE, alloc)?;
             let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
             let head = header_head.and_then(|mut h| {

@@ -1421,6 +1421,19 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.ty.may_hold(Goal::Trait { trait_: drop, args }, &mut self.reads)
     }
 
+    /// The first projection of `place` that dereferences `Box<T>` (`LangItem::OwnedBox`), if any.
+    fn first_box_deref(&mut self, cp: &CapturePlaces<'a>, place: PlaceRef) -> Option<u32> {
+        let owned_box = cp.owned_box?;
+        for i in 0..place.len {
+            if cp.proj(place, i).kind == ProjKind::Deref
+                && matches!(self.view(cp.ty_before(place, i)), TyView::Adt(k, _) if k == owned_box)
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// `truncate_place_to_len_and_update_capture_kind`.
     fn truncate(&mut self, cp: &CapturePlaces<'a>, place: PlaceRef, mode: PlaceMode, len: u32) -> (PlaceRef, PlaceMode) {
         if len >= place.len {
@@ -1468,6 +1481,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             // `restrict_capture_precision`: an index captures the whole indexed place.
             if let Some(i) = cp.first(place, ProjKind::Index) {
+                (place, mode) = self.truncate(cp, place, mode, i);
+            }
+            // `blaze-build` does not lower a captured place through `Box`'s contents (`(*b).f`),
+            // so stop the place at the `Box` itself (just before its deref) instead of widening
+            // the entire root binding in `widen`. That preserves disjoint sibling captures like
+            // `self.command.program` (capturing `self.command`) while `self.limit` is moved.
+            if let Some(i) = self.first_box_deref(cp, place) {
                 (place, mode) = self.truncate(cp, place, mode, i);
             }
             // `truncate_capture_for_optimization`: through a shared reference, the reference.
