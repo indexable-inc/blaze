@@ -391,7 +391,7 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
             input.now_ns,
         );
     } else if let Some(pop) = input.active_popover {
-        layout_active_popover(&mut scene, pop, vw, vh, m, input.mouse_pos);
+        layout_active_popover(&mut scene, pop, vw, vh, m, input.mouse_pos, input.now_ns);
     }
     if let Some(drag) = input.drag {
         layout_drag_overlay(&mut scene, drag, m);
@@ -1100,10 +1100,14 @@ fn layout_starship_line(
             .map(|s| s.branches.clone())
             .filter(|b| !b.is_empty())
             .unwrap_or_else(|| vec![branch.clone()]);
+        let relation = prompt
+            .git_status
+            .as_ref()
+            .and_then(|s| s.branch_relation.clone());
         scene.push_hover_clipped(
             branch_rect,
             clip_id,
-            HoverKind::GitBranch { current: branch.clone(), branches },
+            HoverKind::GitBranch { current: branch.clone(), branches, relation },
         );
         scene.push_hit_clipped(branch_rect, clip_id, HitAction::OpenBranchPicker);
 
@@ -7131,6 +7135,7 @@ fn layout_active_popover(
     vh: f32,
     m: CellMetrics,
     mouse_pos: Option<[f32; 2]>,
+    now_ns: i64,
 ) {
     let pad_x = 11.0;
     let pad_y = 8.0;
@@ -7155,18 +7160,37 @@ fn layout_active_popover(
             let h = pad_y * 2.0 + m.ch + if subtitle.is_some() { m.ch + 2.0 } else { 0.0 };
             (w, h)
         }
-        HoverKind::GitBranch { branches, .. } => {
+        HoverKind::GitBranch { branches, relation, .. } => {
             let shown = branches.len().clamp(1, 10);
-            let max_c = branches
+            let max_br = branches
                 .iter()
                 .take(shown)
                 .map(|b| b.chars().count())
                 .max()
-                .unwrap_or(10)
-                .max(24)
-                .min(42);
-            let w = (max_c as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(220.0, 380.0);
-            let h = hdr_h + shown as f32 * row_h + pad_y;
+                .unwrap_or(10);
+            let (rel_h, rel_chars) = if let Some(rel) = relation {
+                let has_mb = !rel.merge_base_short.is_empty();
+                let card_h = if has_mb {
+                    m.ch * 2.0 + 22.0
+                } else {
+                    m.ch + 16.0
+                };
+                let line1_c = 3 + rel.base_ref.chars().count() + 18;
+                let line2_c = if has_mb {
+                    (5 + rel.merge_base_short.chars().count() + 10 + rel.merge_base_subject.chars().count())
+                        .min(52)
+                } else {
+                    0
+                };
+                (card_h + 6.0, line1_c.max(line2_c))
+            } else {
+                (0.0, 0)
+            };
+            let max_c = max_br.max(rel_chars).max(24).min(52);
+            let min_w = if relation.is_some() { 300.0 } else { 220.0 };
+            let max_w = if relation.is_some() { 450.0 } else { 380.0 };
+            let w = (max_c as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(min_w, max_w);
+            let h = hdr_h + rel_h + shown as f32 * row_h + pad_y;
             (w, h)
         }
         HoverKind::GitStashes { stashes, entries, .. } => {
@@ -7480,12 +7504,180 @@ fn layout_active_popover(
                 );
             }
         }
-        HoverKind::GitBranch { current, branches } => {
+        HoverKind::GitBranch { current, branches, relation } => {
             let mut ry = draw_header(scene, "git branches", "click to switch");
-            let max_c = ((pop_w - pad_x * 2.0 - 28.0) / m.cw).floor().max(8.0) as usize;
+            if let Some(rel) = relation {
+                let has_mb = !rel.merge_base_short.is_empty();
+                let card_x0 = x0 + 8.0;
+                let card_x1 = x1 - 8.0;
+                let card_h = if has_mb {
+                    m.ch * 2.0 + 22.0
+                } else {
+                    m.ch + 16.0
+                };
+                scene.overlay_round_rect(
+                    card_x0,
+                    ry,
+                    card_x1,
+                    ry + card_h,
+                    6.0,
+                    theme::rgb(0x16, 0x16, 0x1b),
+                    1.0,
+                    theme::LINE,
+                    0,
+                );
+
+                // Row 1: `vs <base_ref>` on the left + right-aligned ahead/behind status pills.
+                let inner_x0 = card_x0 + 8.0;
+                let inner_x1 = card_x1 - 8.0;
+                let row1_y = ry + 6.0;
+                let pill_h = m.ch + 2.0;
+                let pill_y0 = row1_y - 1.0;
+
+                let mut rx = inner_x1;
+                let draw_badge = |scene: &mut Scene,
+                                  rx: &mut f32,
+                                  label: &str,
+                                  fg: [f32; 4],
+                                  bg: [f32; 4]| {
+                    let bw = label.chars().count() as f32 * m.cw + 10.0;
+                    let bx0 = *rx - bw;
+                    scene.overlay_round_rect(bx0, pill_y0, *rx, pill_y0 + pill_h, 4.0, bg, 0.0, [0.0; 4], 0);
+                    scene.overlay_text_run(bx0 + 5.0, row1_y, label, fg, true, false, 0);
+                    *rx = bx0 - 5.0;
+                };
+
+                if rel.ahead == 0 && rel.behind == 0 {
+                    draw_badge(
+                        scene,
+                        &mut rx,
+                        "up to date",
+                        theme::OK,
+                        theme::rgba(0x46, 0xc9, 0x7a, 0.14),
+                    );
+                } else {
+                    if rel.behind > 0 {
+                        let lbl = if rel.ahead == 0 {
+                            format!("↓{} behind", rel.behind)
+                        } else {
+                            format!("↓{}", rel.behind)
+                        };
+                        draw_badge(
+                            scene,
+                            &mut rx,
+                            &lbl,
+                            theme::rgb(0xe8, 0xa8, 0x48),
+                            theme::rgba(0xe5, 0x9b, 0x45, 0.15),
+                        );
+                    }
+                    if rel.ahead > 0 {
+                        let lbl = if rel.behind == 0 {
+                            format!("↑{} ahead", rel.ahead)
+                        } else {
+                            format!("↑{}", rel.ahead)
+                        };
+                        draw_badge(
+                            scene,
+                            &mut rx,
+                            &lbl,
+                            theme::OK,
+                            theme::rgba(0x46, 0xc9, 0x7a, 0.15),
+                        );
+                    }
+                }
+
+                scene.overlay_text_run(inner_x0, row1_y, "vs ", theme::INK_4, false, false, 0);
+                let base_x = inner_x0 + 3.0 * m.cw;
+                let max_base_c = ((rx - base_x - 4.0) / m.cw).floor().max(6.0) as usize;
+                scene.overlay_text_run(
+                    base_x,
+                    row1_y,
+                    truncate_chars(&rel.base_ref, max_base_c),
+                    theme::INK_1,
+                    true,
+                    false,
+                    0,
+                );
+
+                // Row 2: common ancestor (`merge-base`) clickable SHA + relative age + subject.
+                if has_mb {
+                    let row2_y = row1_y + m.ch + 6.0;
+                    let mut cx = inner_x0;
+                    scene.overlay_text_run(cx, row2_y, "base ", theme::INK_4, false, false, 0);
+                    cx += 5.0 * m.cw;
+
+                    let sha_w = rel.merge_base_short.chars().count() as f32 * m.cw;
+                    let sha_rect = HitRect::new(cx - 2.0, row2_y - 1.0, cx + sha_w + 2.0, row2_y + m.ch + 1.0);
+                    let sha_bg = if is_hovered(sha_rect) {
+                        theme::rgba(0x6e, 0xb5, 0xff, 0.22)
+                    } else {
+                        theme::rgba(0x6e, 0xb5, 0xff, 0.10)
+                    };
+                    scene.overlay_round_rect(
+                        sha_rect.x0,
+                        sha_rect.y0,
+                        sha_rect.x1,
+                        sha_rect.y1,
+                        3.5,
+                        sha_bg,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                    scene.overlay_text_run(
+                        cx,
+                        row2_y,
+                        &rel.merge_base_short,
+                        theme::rgb(0x74, 0xb9, 0xff),
+                        false,
+                        false,
+                        0,
+                    );
+                    scene.push_hit(sha_rect, HitAction::CopyText(rel.merge_base_short.clone()));
+                    cx += sha_w + 3.0;
+
+                    if rel.merge_base_time_secs > 0 && now_ns > 0 {
+                        let mut age = String::new();
+                        let _ = format_relative_time(
+                            DateTime {
+                                utc_ns: rel.merge_base_time_secs.saturating_mul(1_000_000_000),
+                                offset_secs: 0,
+                            },
+                            now_ns,
+                            &mut age,
+                        );
+                        let age_lbl = format!(" · {age}");
+                        let age_w = age_lbl.chars().count() as f32 * m.cw;
+                        if cx + age_w < inner_x1 {
+                            scene.overlay_text_run(cx, row2_y, &age_lbl, theme::INK_4, false, false, 0);
+                            cx += age_w;
+                        }
+                    }
+
+                    if !rel.merge_base_subject.is_empty() && cx + 6.0 * m.cw < inner_x1 {
+                        scene.overlay_text_run(cx, row2_y, " · ", theme::INK_4, false, false, 0);
+                        cx += 3.0 * m.cw;
+                        let rem_c = ((inner_x1 - cx) / m.cw).floor().max(0.0) as usize;
+                        if rem_c >= 4 {
+                            scene.overlay_text_run(
+                                cx,
+                                row2_y,
+                                truncate_chars(&rel.merge_base_subject, rem_c),
+                                theme::INK_3,
+                                false,
+                                false,
+                                0,
+                            );
+                        }
+                    }
+                }
+
+                ry += card_h + 6.0;
+            }
             for br in branches.iter().take(10) {
                 let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
                 let is_cur = br == current;
+                let is_base = !is_cur && relation.as_ref().is_some_and(|r| r.base_ref == *br);
                 if is_hovered(row_rect) {
                     scene.overlay_round_rect(
                         row_rect.x0,
@@ -7513,13 +7705,24 @@ fn layout_active_popover(
                         0,
                     );
                 }
+                let right_tag = if is_cur {
+                    Some("current")
+                } else if is_base {
+                    Some("base")
+                } else {
+                    None
+                };
+                let right_reserve = right_tag.map_or(0.0, |t| (t.len() as f32 + 2.0) * m.cw);
+                let max_c = ((pop_w - pad_x * 2.0 - 18.0 - right_reserve) / m.cw)
+                    .floor()
+                    .max(8.0) as usize;
                 let col = if is_cur { theme::INK_1 } else { theme::INK_2 };
                 scene.overlay_text_run(x0 + pad_x + 14.0, ty, truncate_chars(br, max_c), col, is_cur, false, 0);
-                if is_cur {
-                    let tag = "current";
+                if let Some(tag) = right_tag {
                     let tw = tag.len() as f32 * m.cw;
                     scene.overlay_text_run(x1 - pad_x - tw, ty, tag, theme::INK_4, false, false, 0);
-                } else {
+                }
+                if !is_cur {
                     scene.push_hit(row_rect, HitAction::SwitchGitBranch(br.clone()));
                 }
                 ry += row_h;

@@ -574,6 +574,7 @@ const DEFAULT_ABBREVIATIONS: &[(&str, &str)] = &[
     ("gp", "git push"),
     ("gpl", "git pull"),
     ("gco", "git checkout"),
+    ("gw", "git switch"),
     ("gb", "git branch"),
     ("gfa", "git fetch --all --prune"),
     ("gwa", "git worktree add"),
