@@ -64,6 +64,7 @@ fn print_usage() {
          \tbgit init [dir]\n\
          \tbgit infect [dir] [--raw]\n\
          \tbgit disinfect <dir> <out-git-dir>\n\
+         \tbgit verify [dir]\n\
          \tbgit log [dir] [rev] [-n N]\n\
          \tbgit merge-base <dir> <revA> <revB>\n\
          \tbgit merge <dir> <ours> <theirs> [--write-commit]\n\
@@ -138,6 +139,18 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
                 "Disinfected {} -> {} in {:.2} ms",
                 dir.display(),
                 out.display(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+            Ok(())
+        }
+        "verify" => {
+            let dir = args.get(1).map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let t0 = Instant::now();
+            let store = BgitDiskStore::open(&dir, alloc)?;
+            let checked = store.verify_full()?;
+            println!(
+                "Verified {} objects (BGIX CRC-32 + per-record CRC-32 + SHA-1) in {:.2} ms",
+                checked,
                 t0.elapsed().as_secs_f64() * 1000.0
             );
             Ok(())
@@ -292,13 +305,13 @@ fn cmd_merge<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {theirs_rev}")))?;
 
     let t0 = Instant::now();
-    // Run merge using a snapshot of the commit-graph if present.
+    // Run merge using an O(1) cloned handle to the read-only mmap'd commit-graph (zero file read!).
     let result = {
-        let cg_bytes_opt = std::fs::read(store.bgit_dir.join("graph.bggp")).ok();
-        let cg = cg_bytes_opt
-            .as_deref()
-            .filter(|b| !b.is_empty())
-            .and_then(|b| blaze_git::commit_graph::CommitGraph::from_layers(&[b], alloc).ok());
+        let cg_map = store.graph_mapping();
+        let cg = cg_map
+            .as_ref()
+            .filter(|m| !m.bytes().is_empty())
+            .and_then(|m| blaze_git::commit_graph::CommitGraph::from_layers(&[m.bytes()], alloc).ok());
         merge_commits(&mut store, cg.as_ref(), ours, theirs, MergeOpts::DEFAULT, alloc)
             .map_err(|e| io::Error::other(format!("{e}")))?
     };
@@ -434,7 +447,36 @@ fn cmd_bench<'a>(repo_dir: &Path, alloc: Alloc<'a>) -> io::Result<()> {
         );
     }
 
-    // 3. merge-base + 3-way tree merge on HEAD vs HEAD~1 (if >= 2 commits)
+    // 3. Parallel PACK v2 encoding of ALL objects vs `git pack-objects --stdout`
+    if !oids.is_empty() {
+        let mut pack_out = OwnVec::new_in(alloc);
+        let t0 = Instant::now();
+        let _ = store
+            .write_pack_parallel(&oids, blaze_git::pack_write::PackWriteOpts::FAST, &mut pack_out)
+            .map_err(|e| io::Error::other(format!("{e}")))?;
+        let bgit_pack_us = t0.elapsed().as_micros() as u64;
+
+        let t1 = Instant::now();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir)
+            .args(["pack-objects", "--all", "--stdout", "-q"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()?;
+        let git_pack_us = t1.elapsed().as_micros() as u64;
+        println!(
+            "pack all ({:>4} objs):   bgit = {:>6} us  vs  git = {:>6} us  ({:.1}x faster, {} B)",
+            oids.len(),
+            bgit_pack_us,
+            git_pack_us,
+            git_pack_us as f64 / bgit_pack_us.max(1) as f64,
+            pack_out.len(),
+        );
+    }
+
+    // 4. merge-base + 3-way tree merge on HEAD vs HEAD~1 (if >= 2 commits)
     if let Some(head_oid) = store.resolve_ref("HEAD").map_err(|e| io::Error::other(format!("{e}")))? {
         let mut buf = OwnVec::new_in(alloc);
         if store.read_object(&head_oid, &mut buf).ok().flatten() == Some(ObjectKind::Commit)

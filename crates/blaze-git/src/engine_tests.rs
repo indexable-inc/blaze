@@ -618,3 +618,87 @@ fn infect_and_disinfect_preserve_every_object_and_ref() {
     let direct = build_bgit_image_from_store(&orig, SlabCompression::RawOnly, alloc).unwrap();
     assert_eq!(direct.stats.unique_objects_out, 3);
 }
+
+#[test]
+fn parallel_slab_records_and_chunked_pack_match_reference() {
+    let alloc = test_alloc();
+    let mut store = MemStore::new(alloc);
+    let mut oids = Vec::new_in(alloc);
+    for i in 0..24usize {
+        let mut body = Vec::new_in(alloc);
+        for _ in 0..20 {
+            body.extend_from_slice(b"compressible line repeated for zstd + delta testing ");
+            body.push(b'a' + (i % 26) as u8);
+            body.push(b'\n');
+        }
+        oids.push(store.write_object(ObjectKind::Blob, &body).unwrap());
+    }
+    oids.sort_unstable();
+
+    // 1. Standalone `encode_slab_record_with_oid` must match `SlabWriter` byte-for-byte!
+    let mut seq_writer = SlabWriter::new(0, SlabCompression::AutoZstd, alloc);
+    let mut par_bytes = Vec::new_in(alloc);
+    crate::slab::write_slab_header(&mut par_bytes);
+    let mut obj_buf = Vec::new_in(alloc);
+    for &oid in &oids {
+        let kind = store.read_object(&oid, &mut obj_buf).unwrap().unwrap();
+        seq_writer.append_with_oid(oid, kind, &obj_buf).unwrap();
+        crate::slab::encode_slab_record_with_oid(
+            oid,
+            kind,
+            &obj_buf,
+            SlabCompression::AutoZstd,
+            alloc,
+            &mut par_bytes,
+        )
+        .unwrap();
+    }
+    let (seq_bytes, seq_entries) = seq_writer.into_parts();
+    assert_eq!(par_bytes.as_slice(), seq_bytes.as_slice());
+
+    // `SlabIndex::parse_header_fast` agrees with full `SlabIndex::parse`.
+    let mut idx_bytes = Vec::new_in(alloc);
+    encode_slab_index(&seq_entries, alloc, &mut idx_bytes).unwrap();
+    let full = SlabIndex::parse(&idx_bytes, 1024).unwrap();
+    let fast = SlabIndex::parse_header_fast(&idx_bytes, 1024).unwrap();
+    assert_eq!(full.len(), fast.len());
+    for &oid in &oids {
+        assert_eq!(full.lookup(&oid), fast.lookup(&oid));
+    }
+
+    // 2. Multi-chunk PACK v2 assembly unpacks and indexes identically!
+    let mid = oids.len() / 2;
+    let c1 = crate::pack_write::encode_pack_chunk(&store, &oids[..mid], PackWriteOpts::FAST, alloc)
+        .unwrap();
+    let c2 = crate::pack_write::encode_pack_chunk(&store, &oids[mid..], PackWriteOpts::FAST, alloc)
+        .unwrap();
+    let mut assembled_pack = Vec::new_in(alloc);
+    let written = crate::pack_write::assemble_pack_from_chunks(
+        &[(&c1.bytes, &c1.entries), (&c2.bytes, &c2.entries)],
+        1024,
+        alloc,
+        &mut assembled_pack,
+    )
+    .unwrap();
+    let mut pidx_bytes = Vec::new_in(alloc);
+    write_pack_index_v2(&assembled_pack, &written, alloc, &mut pidx_bytes).unwrap();
+    let pidx = Idx::parse(&pidx_bytes, 1024).unwrap();
+    pidx.verify_checksum().unwrap();
+    pidx.verify_ordering().unwrap();
+
+    let mut dst = MemStore::new(alloc);
+    let stats = crate::pack_write::unpack_pack_into_store(
+        &assembled_pack,
+        &mut dst,
+        PackLimits::SHIPPED,
+        alloc,
+    )
+    .unwrap();
+    assert_eq!(stats.objects_unpacked as usize, oids.len());
+    let mut a_buf = Vec::new_in(alloc);
+    let mut b_buf = Vec::new_in(alloc);
+    for &oid in &oids {
+        assert_eq!(store.read_object(&oid, &mut a_buf).unwrap(), dst.read_object(&oid, &mut b_buf).unwrap());
+        assert_eq!(a_buf.as_slice(), b_buf.as_slice());
+    }
+}
