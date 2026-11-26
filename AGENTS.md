@@ -65,7 +65,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 ### Design and changing code (skill `changing-code`)
 - **24. whole-ports**: Delete replaced APIs completely, never deprecate; port all callers in one batch so it builds.
 - **30. one-concept-one-home**: One type, one rule, one place per concept; merge duplicates and ban the removed name.
-- **54. guard-the-cause**: Find root cause, name the class, fix the design, and proactively sweep all siblings in one batch.
+- **54. guard-the-cause**: Generalize every problem (>=3 similar cases), name the class, fix from first principles & merge.
 - **62. sota-first**: Build the SOTA end state within 10% of the floor directly; build missing pieces; stop on 2nd fix.
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent mistakes by newtype/proof types first, then lints with fixes; a prompt rule comes last.

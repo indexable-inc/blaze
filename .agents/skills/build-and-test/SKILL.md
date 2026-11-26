@@ -232,11 +232,11 @@ deadline on each step of a VM job, not one for the whole job. On expiry, before 
 status: a stack sample of the process still running (`sample <pid>` on macOS, `gdb -p <pid> -batch
 -ex 'thread apply all bt'` on Linux) and the flight recording the watchdog names
 (`bounded-progress`); the report quotes that line. A timeout is a finding: a hang in blaze is a bug
-to report with that line and file (an annoyance row at least), and the fix is in blaze. Never wait a
-hang out, never rerun with a longer limit hoping it passes (`no-fallback`), and never let a script
-sleep and poll with no bound. A wait of more than a minute (a build, a job on the VM, a pull
-request's checks) runs in the background with a notification when it ends; the main agent never sits
-in a foreground wait while lanes and jobs need it.
+to report with that line and file (an `agents/kb/` entry via `scripts/src/bin/kb.rs` at least), and
+the fix is in blaze. Never wait a hang out, never rerun with a longer limit hoping it passes
+(`no-fallback`), and never let a script sleep and poll with no bound. A wait of more than a minute
+(a build, a job on the VM, a pull request's checks) runs in the background with a notification when
+it ends; the main agent never sits in a foreground wait while lanes and jobs need it.
 
 ## act-on-snapshots (rule 80)
 

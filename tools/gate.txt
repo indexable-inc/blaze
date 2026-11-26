@@ -11,6 +11,9 @@
 # The agent rules: scripts/src/bin/rules.rs selftest and AGENTS.md / skills match what it generates.
 agent rules selftest | 120 | - | "$BLAZE_SCRIPTS/rules" selftest
 agent rules | 120 | - | "$BLAZE_SCRIPTS/rules" '{"command": "check"}'
+# The agent knowledge base: scripts/src/bin/kb.rs selftest and agents/kb/*.jsonl schema + sort check.
+kb selftest | 120 | - | "$BLAZE_SCRIPTS/kb" selftest
+kb check | 120 | - | "$BLAZE_SCRIPTS/kb" '{"command": "check"}'
 # Docs front matter, index (docs/README.md), and Python allowlist (only shrinks).
 docs selftest | 120 | - | "$BLAZE_SCRIPTS/docs" selftest
 docs | 300 | - | "$BLAZE_SCRIPTS/docs" check

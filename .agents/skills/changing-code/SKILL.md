@@ -72,28 +72,33 @@ and shell completions — never hand-duplicate help strings or reach for proc ma
 
 ## guard-the-cause (rule 54)
 
-Bad code is a symptom. When you find some (jank, a subpar design, a bug that sat unseen, a wait
-nobody named, a second way to do one thing), fix it, then ask why it was written that way and why
-nothing caught it: a missing lint, a harness that was broken or bypassed, a rule that did not say, a
-skill that told nobody how, an interface that made the wrong thing the easy thing, a measurement
-nobody ran. Remove that cause in the same change or the next: a blaze lint with a fix that finds
-every other instance (`fix-through-blaze-lints`), a check that joins the gate, a rule or skill
-instruction that says what to do instead, or a change to the interface so the mistake cannot be
-expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it
-proactively: you do not wait to be asked, and you say in your report what the cause was and what now
-guards it. A guard that only describes the one instance you found is not one; state the general rule
-it enforces. Do it for small things as much as large: a command that needed a flag you forgot, a
-test that passed while running nothing, a number that had to be retracted, a file that two lanes
-both edited. The method is five whys, written down: why did it happen; why was that possible; why
-did nothing catch it; why was the easy path the wrong one; why does the system have that shape. Stop
-when the answer is a property of the design rather than an event (`the test filter matched nothing`
-is an event; `a run that executes zero checks reports success` is a property). Then name the class
-(every instance that property allows, not the one you met), and choose the strongest prevention you
-can build, in the order `type-then-lint-then-rule` gives. Then solve it: build the prevention in the
-same change or the next, run it over the whole tree, and land it; do not stop at the write-up.
-Record the chain in the annoyance's row under `agents/annoyances/` (`whys`, `class`, `prevention`),
-so the next agent sees the class, not the anecdote. When several rows share a class, that class is
-the work: one architectural change, not one patch per row.
+Bad code is a symptom. Whenever you find a problem (jank, a subpar design, a bug that sat unseen, a
+wait nobody named, a second way to do one thing, an agent mistake), generalize it before patching:
+find at least 3 similar cases across the codebase or system, extract the shared root cause, name
+that problem class, and fix the entire category from first principles (then proactively sweep all
+remaining instances and merge the fix in — never stop at patching the one instance or at a
+write-up). Ask why it was written that way and why nothing caught it: a missing type/invariant, a
+missing lint, a harness that was broken or bypassed, a rule that did not say, a skill that told
+nobody how, an interface that made the wrong thing the easy thing, a measurement nobody ran. Remove
+that cause in the same change or the next: a blaze lint with a fix that finds every other instance
+(`fix-through-blaze-lints`), a check that joins the gate, a rule or skill instruction that says what
+to do instead, or a change to the interface so the mistake cannot be expressed. The fix is not done
+until the guard exists and has been run over the whole tree. Do it proactively: you do not wait to
+be asked, and you say in your report what the cause was and what now guards it. A guard that only
+describes the one instance you found is not one; state the general rule it enforces. Do it for small
+things as much as large: a command that needed a flag you forgot, a test that passed while running
+nothing, a number that had to be retracted, a file that two lanes both edited. The method is five
+whys, written down: why did it happen; why was that possible; why did nothing catch it; why was the
+easy path the wrong one; why does the system have that shape. Stop when the answer is a property of
+the design rather than an event (`the test filter matched nothing` is an event; `a run that executes
+zero checks reports success` is a property). Then name the class (every instance that property
+allows, not the one you met), and choose the strongest prevention you can build, in the order
+`type-then-lint-then-rule` gives. Then solve it: build the prevention in the same change or the
+next, run it over the whole tree, and land it; do not stop at the write-up. Record the root cause
+and class in `agents/kb/` via `scripts/src/bin/kb.rs` (`facts.jsonl` for code-anchored gotchas/facts
+or `dead_ends.jsonl` for tried-and-reverted approaches), so the next agent sees the class, not the
+anecdote. When several entries share a class, that class is the work: one architectural change, not
+one patch per entry.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
@@ -143,29 +148,25 @@ comparison is won, or when what still blocks that is written down with its evide
 
 ## agents-json (rule 63)
 
-`agents/howto/<name>.json` is the right way to do a recurring task here (build blaze, time it,
-replace a running binary, where work runs): `id`, `date`, `who`, `task`, `do` (the exact command or
-a short recipe), `why`, `state` (current, or superseded by another row). They are few: read all of
-them before starting (`python3 -I harness/v2/agents.py '{"howto": true}'`) and do the task their
-way; when you find a better way, add a row under a new name and set the old one's state.
-`agents/annoyances/<lane>-<n>.json` is whatever slowed, surprised or annoyed you, however slightly
-(a tool's quirk, a trap in the tree, a missing command, your own repeated mistake): `id`, `date`,
-`who` (the model id and name and whether you are the main agent or a lane, or the person's name),
-`where` (the tool or the part of blaze), `what` happened in one or two sentences with the exact
-command or message, `cost`, `cause` if known, `whys` (the chain down to a property of the design:
-`guard-the-cause`), `class` (the whole kind of problem that property allows), `prevention` (the
-architectural change that makes the class impossible, and its state), `workaround`, `fix`, and
-`state` (open, accepted, or fixed with the commit). There are hundreds, so never read them all:
-before working in an area, search it (`'{"find": "watcher flush"}'` prints one line per row;
-`"full": true` or `'{"show": "<id>"}'` the whole row; `'{"classes": true}'` the open classes). Add a
-row the moment it happens, without waiting to be asked and without judging whether it is important:
-`'{"add": {"kind": "annoyance", "lane": "<your lane>", "row": {...}}}'` picks the next free number
-and prints the id. A row's id is its file name, so two lanes never take one id and adding a row
-never conflicts with anyone's; a row is never overwritten or deleted: set its state. Do not tidy an
-annoyance into a lesson; say what happened. What must always hold is a rule
-(scripts/src/bin/rules.rs), not a row; a how-to that keeps being broken, or a class with several
-rows, becomes a rule or an architectural change (`guard-the-cause`, `unease-is-work`). `'{"check":
-true}'` holds the files to their fields.
+`agents/kb/` holds three git-tracked, code-anchored JSONL tables managed by `scripts/src/bin/kb.rs`
+(canonical 1-line JSON, sorted by `id`): `agents/kb/facts.jsonl` (operational, build, test, and
+codebase facts, gotchas, and how-tos anchored to file SHA-256 `path_hashes`),
+`agents/kb/dead_ends.jsonl` (tried-and-reverted experiments with measured effect, root cause, and
+failure class so agents never repeat dead ends), and `agents/kb/baselines.jsonl` (measured
+hardware-floor and Amdahl decompositions per machine/workload/commit, also populated by
+`bench_wave.rs`). Before working in an area, query the knowledge base by target paths, crates,
+symbols, or keywords: `blaze run -q -p scripts --bin kb --
+'{"command":"query","paths":[...],"crates":[...]}'` (ranked by exact path > prefix > crate > symbol
+> text). Every returned `facts` entry is checked against current file SHA-256 `path_hashes` on disk;
+if a file changed or disappeared, `kb` flags `[STALE: ...]`. When you verify or update a stale fact
+against the current tree, refresh its hashes with `blaze run -q -p scripts --bin kb --
+'{"command":"refresh","id":"<id>","commit":"<sha>","date":"YYYY-MM-DD"}'`. Record new facts/gotchas,
+reverted dead ends, or measured baselines the moment you discover them via `blaze run -q -p scripts
+--bin kb -- '{"command":"add","table":"facts"|"dead_ends"|"baselines","entry":{...}}'` (`kb` hashes
+anchored `paths`, refuses missing paths and duplicate IDs unless `"overwrite":true`, and writes
+canonically sorted JSONL). `kb '{"command":"check"}'` validates all three tables in CI. What must
+always hold belongs in a type, lint, or rule (`type-then-lint-then-rule`, `guard-the-cause`), not a
+KB entry; when several entries share a failure class, fix the class architecturally.
 
 ## end-state-not-hill-climb (rule 66)
 
