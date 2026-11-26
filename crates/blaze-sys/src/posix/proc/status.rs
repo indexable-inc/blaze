@@ -456,7 +456,7 @@ pub fn make_dir_mode(path: Path<'_>, mode: mode_t) -> Result<(), Errno> {
     return crate::linux::mkdirat(crate::linux::CWD, path, mode);
     // SAFETY: `path` is a live NUL-terminated C string read by the call and not kept.
     #[cfg(target_os = "macos")]
-    return super::said(unsafe { mkdir(path.as_ptr(), mode) }).map(|_| ());
+    return super::said(unsafe { mkdir(path.as_ptr().cast(), mode) }).map(|_| ());
 }
 
 /// `utimensat` (sys/stat.h), from the table of calls found at first use:

@@ -938,7 +938,7 @@ pub(crate) extern "C" fn remap_execvP(
         return -1;
     };
     // SAFETY: `remap_cstr`, `new_path`, and `new_argv` stay live across Darwin `execvP`.
-    unsafe { libc::execvP(remap_cstr(file), new_path, new_argv) }
+    unsafe { libc::execvP(remap_cstr(file), new_path, new_argv.cast()) }
 }
 
 /// Collects variadic `execl`/`execlp`/`execle` arguments into a tiny 32-pointer stack buffer
