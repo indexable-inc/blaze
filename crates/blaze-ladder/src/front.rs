@@ -928,9 +928,9 @@ pub(crate) fn repr_parts(args: &str, out: &mut ReprAttrs) -> Result<(), &'static
             "u64" => out.int = uint(tc::UintTy::U64),
             "u128" => out.int = uint(tc::UintTy::U128),
             "usize" => out.int = uint(tc::UintTy::Usize),
-            p => match p.split_once('(') {
-                Some(("packed", n)) => out.packed = Some(pow2(n.trim_end_matches(')'))?),
-                Some(("align", n)) => out.align = Some(pow2(n.trim_end_matches(')'))?),
+            p => match p.split_once('(').map(|(k, v)| (k.trim(), v.trim().strip_suffix(')'))) {
+                Some(("packed", Some(n))) => out.packed = Some(pow2(n)?),
+                Some(("align", Some(n))) => out.align = Some(pow2(n)?),
                 _ => return Err("this `repr`"),
             },
         }
@@ -2943,5 +2943,13 @@ mod tests {
         assert_eq!(repr_parts("(Rust)", &mut plain), Ok(()));
         assert_eq!(plain, ReprAttrs::default());
         assert_eq!(repr_parts("(rust)", &mut ReprAttrs::default()), Err("this `repr`"));
+        // Macro-expanded `#[repr(C, align(16))]` renders with spaces around `(` and `)`.
+        let mut aligned = ReprAttrs::default();
+        assert_eq!(repr_parts("(C , align ( 16 ))", &mut aligned), Ok(()));
+        assert_eq!(aligned, ReprAttrs { c: true, align: Some(4), ..ReprAttrs::default() });
+        let mut packed_spaced = ReprAttrs::default();
+        assert_eq!(repr_parts("(packed ( 4 ))", &mut packed_spaced), Ok(()));
+        assert_eq!(packed_spaced, ReprAttrs { packed: Some(2), ..ReprAttrs::default() });
+        assert_eq!(repr_parts("(align(16)", &mut ReprAttrs::default()), Err("this `repr`"));
     }
 }

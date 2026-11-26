@@ -110,6 +110,16 @@ impl Wasm64Opts {
         stack_top: 256 * 1024,
         heap_base: 256 * 1024,
     };
+
+    /// Full user-program / build-script / proc-macro layout: 16 MiB shadow stack (matching deep
+    /// recursive Rust compilers and code generators such as `cranelift-isle` and `syn`),
+    /// 8 GiB max (`memory64`).
+    pub const USER_PROGRAM: Wasm64Opts = Wasm64Opts {
+        min_pages: 256,
+        max_pages: Some(131_072),
+        stack_top: 16 * 1024 * 1024,
+        heap_base: 16 * 1024 * 1024,
+    };
 }
 
 /// One imported host function declared in the Wasm64 Import section.

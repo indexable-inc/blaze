@@ -593,7 +593,13 @@ fn stopped_by(host: &mut ScriptHost, error: &wasmtime::Error, out_of_fuel: bool)
     }
     let trap = error.downcast_ref::<Trap>().copied();
     if trap == Some(Trap::OutOfFuel) || out_of_fuel {
-        return Err(ScriptWhy::Limit(ScriptLimit::Fuel, "ran out of fuel: it may loop forever".to_owned()));
+        let err_tail = stderr();
+        let why = if err_tail.is_empty() {
+            format!("ran out of fuel: it may loop forever ({error:#})")
+        } else {
+            format!("ran out of fuel: it may loop forever ({error:#}); its standard error ends:\n{err_tail}")
+        };
+        return Err(ScriptWhy::Limit(ScriptLimit::Fuel, why));
     }
     if host.limiter.over {
         return Err(ScriptWhy::Limit(ScriptLimit::Memory, format!("asked for more than {} bytes of memory: {error:#}", host.limiter.memory)));
