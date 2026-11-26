@@ -118,6 +118,17 @@ unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
         sys::init(argc, argv, sigpipe)
     };
 
+    // blaze: a wasm64 build script runs in its package's folder, as Cargo runs it; wasi_rt starts
+    // in `/`. If CARGO_MANIFEST_DIR is set, enter it before `main` runs.
+    #[cfg(all(target_os = "wasi", target_env = "p1", target_arch = "wasm64"))]
+    {
+        if let Some(dir) = crate::env::var_os("CARGO_MANIFEST_DIR") {
+            if crate::env::set_current_dir(&dir).is_err() {
+                rtabort!("blaze: CARGO_MANIFEST_DIR could not be entered");
+            }
+        }
+    }
+
     // blaze: the provider this process was given, read before `main` can change the
     // environment (`sys::provider`).
     sys::provider::init();

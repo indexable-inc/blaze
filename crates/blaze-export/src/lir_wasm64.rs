@@ -563,6 +563,11 @@ fn flatten_sig<'a>(
     for p in sig.params {
         push_ty_wasm_types(view, Ty(p.ty), func, inst, &mut params)?;
     }
+    if sig.bits & blaze_lir::func::SigRec::VARIADIC != 0 {
+        // Wasm64 C-variadic ABI: fixed params followed by a single `i64` va_list pointer to the
+        // caller's stack-allocated variadic argument buffer (8-byte slots, 16-byte aligned for i128).
+        params.push(ValType::I64);
+    }
     let mut results = Vec::new_in(alloc);
     for r in sig.rets {
         push_ty_wasm_types(view, Ty(r.ty), func, inst, &mut results)?;
@@ -1188,6 +1193,7 @@ struct FuncEmitter<'a, 'm, 'c, 'v> {
     frame_size: u64,
     sp_local: Option<u32>,
     pc_local: Option<u32>,
+    va_param_local: Option<u32>,
     temps_i32: AVec<'a, u32>,
     temps_i64: AVec<'a, u32>,
     temps_f32: AVec<'a, u32>,
@@ -1221,6 +1227,10 @@ fn lower_func<'a, 'm, 'v>(
     let mut val_locals = Vec::with_capacity_in(view.len(), alloc);
     val_locals.resize(view.len(), ValLocals::default());
 
+    let is_variadic = view.sig(SigId(view.head.sig)).bits & blaze_lir::func::SigRec::VARIADIC != 0;
+    let expected_entry_params = if is_variadic { param_local_count - 1 } else { param_local_count };
+    let va_param_local = is_variadic.then_some(expected_entry_params);
+
     let entry_params = view.params(Block(0));
     let mut param_cursor = 0u32;
     for inst in entry_params.clone() {
@@ -1229,7 +1239,7 @@ fn lower_func<'a, 'm, 'v>(
         val_locals[inst] = ValLocals { first: param_cursor, count };
         param_cursor += u32::from(count);
     }
-    if param_cursor != param_local_count {
+    if param_cursor != expected_entry_params {
         return Err(LirWasm64Error::InvalidSignature {
             func: place,
             inst: 0,
@@ -1309,6 +1319,7 @@ fn lower_func<'a, 'm, 'v>(
         frame_size,
         sp_local,
         pc_local,
+        va_param_local,
         temps_i32: Vec::new_in(alloc),
         temps_i64: Vec::new_in(alloc),
         temps_f32: Vec::new_in(alloc),
@@ -2090,9 +2101,11 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
             }
             Op::SlotAddr => {
                 let slot_id: SlotId = self.view.operands(inst).slot();
-                let sp = self.sp_local.ok_or(LirWasm64Error::Overflow { what: "missing stack frame" })?;
                 let slot_off = self.slot_offsets[slot_id.index()];
-                self.local_get(sp);
+                match self.sp_local {
+                    Some(sp) => self.local_get(sp),
+                    None => self.global_get(GLOBAL_STACK_POINTER),
+                }
                 if slot_off != 0 {
                     self.i64_const(slot_off as i64);
                     self.op(OP_I64_ADD);
@@ -2176,11 +2189,57 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 let args = o.values();
                 let target = self.resolve_call_ref(inst, callee_ref)?;
                 self.check_direct_call_sig(inst, sig_id, target)?;
-                for arg in args.iter() {
-                    self.push_val(arg);
-                }
+                let va_frame = self.push_call_args_and_va(inst, sig_id, args)?;
                 self.emit_direct_call_target(target);
+                self.pop_va_frame(va_frame);
                 self.pop_val(inst);
+            }
+            Op::TargetIntrinsic => {
+                let mut o = self.view.operands(inst);
+                let intr_id = o.intrinsic();
+                let args = o.values();
+                let name = self.view.intrinsic_name(intr_id);
+                match name {
+                    b"blaze.va_start" => {
+                        let Some(va_local) = self.va_param_local else {
+                            return Err(LirWasm64Error::InvalidSignature {
+                                func: self.place,
+                                inst,
+                                what: "blaze.va_start in non-variadic function",
+                            });
+                        };
+                        self.local_get(va_local);
+                        self.pop_val(inst);
+                    }
+                    b"llvm.wasm.memory.grow.i64" => {
+                        let mut it = args.iter();
+                        let (_mem, Some(pages), None) = (it.next(), it.next(), it.next()) else {
+                            return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op });
+                        };
+                        self.push_val(pages);
+                        self.op(OP_MEMORY_GROW);
+                        self.code.push(0x00);
+                        self.pop_val(inst);
+                    }
+                    b"llvm.wasm.memory.size.i64" => {
+                        let mut it = args.iter();
+                        let (Some(_mem), None) = (it.next(), it.next()) else {
+                            return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op });
+                        };
+                        self.op(OP_MEMORY_SIZE);
+                        self.code.push(0x00);
+                        self.pop_val(inst);
+                    }
+                    b"llvm.aarch64.isb"
+                    | b"llvm.aarch64.dmb"
+                    | b"llvm.aarch64.dsb"
+                    | b"llvm.aarch64.hint" => {
+                        // Single-threaded Wasm64: barriers and spin hints are no-ops.
+                    }
+                    _ => {
+                        return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op });
+                    }
+                }
             }
             Op::CallIndirect => {
                 let mut o = self.view.operands(inst);
@@ -2307,10 +2366,9 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 let depth = dispatch_depth.expect("invoke requires dispatcher");
                 let target = self.resolve_call_ref(inst, callee_ref)?;
                 self.check_direct_call_sig(inst, sig_id, target)?;
-                for arg in args.iter() {
-                    self.push_val(arg);
-                }
+                let va_frame = self.push_call_args_and_va(inst, sig_id, args)?;
                 self.emit_direct_call_target(target);
+                self.pop_va_frame(va_frame);
                 self.pop_val(inst);
                 let pc = self.pc_local.expect("pc_local for invoke");
                 self.i32_const(normal_block.0 as i32);
@@ -2430,6 +2488,121 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         }
     }
 
+    fn push_call_args_and_va(
+        &mut self,
+        inst: usize,
+        sig_id: SigId,
+        args: blaze_lir::op::Values<'_>,
+    ) -> Result<Option<(u32, u64)>, LirWasm64Error> {
+        let sig = self.view.sig(sig_id);
+        let is_variadic = sig.bits & blaze_lir::func::SigRec::VARIADIC != 0;
+        if !is_variadic {
+            for arg in args.iter() {
+                self.push_val(arg);
+            }
+            return Ok(None);
+        }
+        let fixed_count = sig.params.len();
+        let mut iter = args.iter();
+        for _ in 0..fixed_count {
+            let Some(arg) = iter.next() else {
+                return Err(LirWasm64Error::InvalidSignature {
+                    func: self.place,
+                    inst,
+                    what: "variadic call has fewer arguments than fixed parameters",
+                });
+            };
+            self.push_val(arg);
+        }
+        let mut varargs: AVec<'a, Value> = Vec::new_in(self.ctx.alloc);
+        varargs.extend(iter);
+        if varargs.is_empty() {
+            self.i64_const(0);
+            return Ok(None);
+        }
+        let mut offsets: AVec<'a, u64> = Vec::with_capacity_in(varargs.len(), self.ctx.alloc);
+        let mut cursor = 0u64;
+        for &arg in varargs.as_slice() {
+            let ty = self.view.ty(arg);
+            let is_128 = ty.is_scalar() && ty.elem() == Scalar::I128;
+            if is_128 {
+                cursor = align_up(cursor, 16)?;
+                offsets.push(cursor);
+                cursor = cursor
+                    .checked_add(16)
+                    .ok_or(LirWasm64Error::Overflow { what: "variadic call frame" })?;
+            } else {
+                offsets.push(cursor);
+                cursor = cursor
+                    .checked_add(8)
+                    .ok_or(LirWasm64Error::Overflow { what: "variadic call frame" })?;
+            }
+        }
+        let frame_bytes = align_up(cursor, 16)?;
+        let va_sp = self.temp_i64(0);
+        self.global_get(GLOBAL_STACK_POINTER);
+        self.i64_const(frame_bytes as i64);
+        self.op(OP_I64_SUB);
+        self.local_tee(va_sp);
+        self.global_set(GLOBAL_STACK_POINTER);
+
+        for (&arg, &off) in varargs.as_slice().iter().zip(offsets.as_slice().iter()) {
+            let ty = self.view.ty(arg);
+            if !ty.is_scalar() {
+                return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
+            }
+            match ty.elem() {
+                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
+                    self.local_get(va_sp);
+                    self.push_val(arg);
+                    self.op(OP_I32_STORE);
+                    self.memarg(2, off);
+                }
+                Scalar::I64 | Scalar::Ptr => {
+                    self.local_get(va_sp);
+                    self.push_val(arg);
+                    self.op(OP_I64_STORE);
+                    self.memarg(3, off);
+                }
+                Scalar::I128 => {
+                    let (lo, hi) = self.loc_pair(arg);
+                    self.local_get(va_sp);
+                    self.local_get(lo);
+                    self.op(OP_I64_STORE);
+                    self.memarg(3, off);
+                    self.local_get(va_sp);
+                    self.local_get(hi);
+                    self.op(OP_I64_STORE);
+                    self.memarg(3, off + 8);
+                }
+                Scalar::F32 => {
+                    self.local_get(va_sp);
+                    self.push_val(arg);
+                    self.op(OP_F32_STORE);
+                    self.memarg(2, off);
+                }
+                Scalar::F64 => {
+                    self.local_get(va_sp);
+                    self.push_val(arg);
+                    self.op(OP_F64_STORE);
+                    self.memarg(3, off);
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
+            }
+        }
+        self.local_get(va_sp);
+        Ok(Some((va_sp, frame_bytes)))
+    }
+
+    fn pop_va_frame(&mut self, va_frame: Option<(u32, u64)>) {
+        if let Some((va_sp, frame_bytes)) = va_frame {
+            self.local_get(va_sp);
+            self.i64_const(frame_bytes as i64);
+            self.op(OP_I64_ADD);
+            self.global_set(GLOBAL_STACK_POINTER);
+        }
+    }
+
     fn emit_call_indirect(
         &mut self,
         inst: usize,
@@ -2446,9 +2619,7 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         let (call_p, call_r) = flatten_sig(self.view, sig_id, self.place, inst, self.ctx.alloc)?;
         let type_idx = self.ctx.intern_type(call_p.as_slice(), call_r.as_slice());
 
-        for arg in args.iter() {
-            self.push_val(arg);
-        }
+        let va_frame = self.push_call_args_and_va(inst, sig_id, args)?;
         // Convert 64-bit callee slot to 32-bit table index; any non-zero high 32 bits map to
         // slot 0 (null trap) instead of wrapping into a valid table slot.
         let c_loc = self.loc(callee);
@@ -2465,6 +2636,7 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         self.op(OP_CALL_INDIRECT);
         push_u32_leb(&mut self.code, type_idx);
         push_u32_leb(&mut self.code, 0); // table 0
+        self.pop_va_frame(va_frame);
         Ok(())
     }
 

@@ -64,6 +64,63 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             Target::Sha3(call) => self.sha3_intrinsic(e, list, t, call),
             Target::Sha2(f) => self.sha2_intrinsic(e, list, t, f),
             Target::Crc32(f) => self.crc32_intrinsic(e, list, t, f),
+            Target::Wasm64MemoryGrow => {
+                let &[mem_arg, pages_arg] = list else {
+                    return Err(BuildError::Target { target: t, expr: Some(e), why: "llvm.wasm.memory.grow.i64 expects (u32, usize)" });
+                };
+                let base = self.vals.len().checked_sub(2).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+                let mem_v = self.vals[base];
+                let pages_v = self.vals[base + 1];
+                self.truncate_vals(base);
+                let out = if self.live {
+                    let mem_ty = self.adjusted_ty(mem_arg)?;
+                    let mem_repr = self.repr_at(mem_arg, mem_ty)?;
+                    let mem_s = mem_repr.scalar().ok_or(BuildError::Target { target: t, expr: Some(e), why: "memory index is not scalar" })?;
+                    let mem = self.scalar(mem_v, mem_s)?;
+                    let pages_ty = self.adjusted_ty(pages_arg)?;
+                    let pages_repr = self.repr_at(pages_arg, pages_ty)?;
+                    let pages_s = pages_repr.scalar().ok_or(BuildError::Target { target: t, expr: Some(e), why: "pages delta is not scalar" })?;
+                    let pages = self.scalar(pages_v, pages_s)?;
+                    let sig = self.b.sig(
+                        blaze_lir::func::Conv::C,
+                        blaze_lir::builder::Variadic::No,
+                        &[blaze_lir::builder::Param::of(Ty::I32), blaze_lir::builder::Param::of(Ty::I64)],
+                        &[blaze_lir::builder::Param::of(Ty::I64)],
+                    );
+                    let id = self.b.intrinsic(t.link_name(), sig);
+                    V::Scalar(self.b.target_intrinsic(id, &[mem, pages]))
+                } else {
+                    V::None
+                };
+                self.push_val(out, None);
+                Ok(())
+            }
+            Target::Wasm64MemorySize => {
+                let &[mem_arg] = list else {
+                    return Err(BuildError::Target { target: t, expr: Some(e), why: "llvm.wasm.memory.size.i64 expects (u32)" });
+                };
+                let base = self.vals.len().checked_sub(1).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+                let mem_v = self.vals[base];
+                self.truncate_vals(base);
+                let out = if self.live {
+                    let mem_ty = self.adjusted_ty(mem_arg)?;
+                    let mem_repr = self.repr_at(mem_arg, mem_ty)?;
+                    let mem_s = mem_repr.scalar().ok_or(BuildError::Target { target: t, expr: Some(e), why: "memory index is not scalar" })?;
+                    let mem = self.scalar(mem_v, mem_s)?;
+                    let sig = self.b.sig(
+                        blaze_lir::func::Conv::C,
+                        blaze_lir::builder::Variadic::No,
+                        &[blaze_lir::builder::Param::of(Ty::I32)],
+                        &[blaze_lir::builder::Param::of(Ty::I64)],
+                    );
+                    let id = self.b.intrinsic(t.link_name(), sig);
+                    V::Scalar(self.b.target_intrinsic(id, &[mem]))
+                } else {
+                    V::None
+                };
+                self.push_val(out, None);
+                Ok(())
+            }
             // A barrier or hint (THREADS.md D1, intrinsics/target.rs): `fn(i32 imm)`, the
             // immediate a constant (the library passes `arg::SY` and the like), no result.
             _ => {

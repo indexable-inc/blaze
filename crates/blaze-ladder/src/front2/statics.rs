@@ -173,31 +173,44 @@ pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: 
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    let (thread_local, _) = static_attrs_of(r, k)?;
-    Ok((record, StaticItem { thread_local, mutable: matches!(m, tc::Mutbl::Mut), extern_weak: false }))
+    let (thread_local, _, single_threaded_wasm) = static_attrs_of(r, k)?;
+    Ok((record, StaticItem { thread_local: thread_local && !single_threaded_wasm, mutable: matches!(m, tc::Mutbl::Mut), extern_weak: false }))
 }
 
 /// Static `k`'s kind when an `extern` block declares it: its head's mutability, nothing
 /// evaluated (it has no initializer: the Reference, "External blocks", "Statics"). A foreign
-/// `#[thread_local]` is refused by name: no foreign thread-local is built.
+/// `#[thread_local]` is refused on multi-threaded targets (no foreign TLS is built), while on
+/// single-threaded WebAssembly targets (`target_family = "wasm"` without `target_feature = "atomics"`)
+/// thread-locals are plain statics (e.g. `wasi_rt`'s `errno`).
 pub(crate) fn foreign_kind<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<StaticItem, Box<str>> {
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    let (thread_local, extern_weak) = static_attrs_of(r, k)?;
-    if thread_local {
+    let (thread_local, extern_weak, single_threaded_wasm) = static_attrs_of(r, k)?;
+    if thread_local && !single_threaded_wasm {
         return Err(Box::from("a `#[thread_local]` static an `extern` block declares: no foreign thread-local is built (statics.rs `foreign_kind`)"));
     }
     Ok(StaticItem { thread_local: false, mutable: matches!(m, tc::Mutbl::Mut), extern_weak })
 }
 
 /// Whether static `k`'s signature carries `#[thread_local]` and/or `#[linkage = "extern_weak"]`
-/// (its attribute rows, read as program.rs `symbols_of` reads a fn's).
-fn static_attrs_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<(bool, bool), Box<str>> {
+/// (its attribute rows, read as program.rs `symbols_of` reads a fn's), plus whether its crate
+/// targets single-threaded WebAssembly (`target_family = "wasm"` without `target_feature = "atomics"`).
+fn static_attrs_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<(bool, bool, bool), Box<str>> {
     let refuse = |why: String| Box::<str>::from(format!("its attributes: {why}"));
     let f = r.store.fns.get(&k).ok_or_else(|| refuse(String::from("no head in the store")))?;
     let krate = r.names.crate_of(f.lib).ok_or_else(|| refuse(format!("no crate holds {:x}", f.lib)))?;
     let atoms = r.names.cfg_atoms(krate).ok_or_else(|| refuse(format!("crate {krate}'s cfg was not answered by the names source")))?;
+    let mut is_wasm = false;
+    let mut has_atomics = false;
+    for &(name, value) in atoms {
+        if name == "target_family" && value == Some("wasm") {
+            is_wasm = true;
+        } else if name == "target_feature" && value == Some("atomics") {
+            has_atomics = true;
+        }
+    }
+    let single_threaded_wasm = is_wasm && !has_atomics;
     let edition = r.names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition was not answered by the names source")))?;
     let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.work_alloc())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
@@ -217,5 +230,5 @@ fn static_attrs_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -
             }
         }
     }
-    Ok((thread_local, extern_weak))
+    Ok((thread_local, extern_weak, single_threaded_wasm))
 }
