@@ -14,8 +14,10 @@
 //! - `bgit push <http-url> <dir> <ref>`       Git `receive-pack` push client
 //! - `bgit bench <repo>`                      Head-to-head `.bgit` vs `git` macOS benchmark
 
+#![feature(default_field_values)]
 #![forbid(unsafe_code)]
 
+mod cli;
 mod disk;
 mod net_driver;
 mod status_driver;
@@ -40,6 +42,7 @@ use blaze_git::{
 };
 use blaze_git_fetch::{Kind as ObjectKind, store::Commit};
 use blaze_own::{Alloc, Erased, String as OwnString, Vec as OwnVec};
+use bstd::cli::{Matches, ParseOutcome, format_help_with_path_in, parse_in};
 
 use crate::{
     disk::{BgitDiskStore, disinfect_repo_on_disk, infect_repo_on_disk, open_or_infect},
@@ -52,67 +55,74 @@ use crate::{
 fn main() -> ExitCode {
     let erased = Erased::new(Global);
     let alloc = erased.handle();
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        print_usage();
-        return ExitCode::SUCCESS;
-    }
-    match run(&args, alloc) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("bgit error: {e}");
-            ExitCode::FAILURE
+    let owned_args: Vec<String> = env::args().skip(1).collect();
+    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+    let use_color = io::stdout().is_terminal();
+
+    let outcome = match parse_in(&cli::BGIT_CLI, &arg_refs, alloc) {
+        Ok(o) => o,
+        Err(err) => {
+            eprintln!("bgit error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match outcome {
+        ParseOutcome::Help { command, path } => {
+            print_help(command, path.as_slice(), use_color, alloc);
+            ExitCode::SUCCESS
+        }
+        ParseOutcome::Version { name, version } => {
+            println!("{name} {version}");
+            ExitCode::SUCCESS
+        }
+        ParseOutcome::Matched(matches) => {
+            if matches.command_path().len() == 1 {
+                print_help(matches.active_command(), matches.command_path(), use_color, alloc);
+                return ExitCode::SUCCESS;
+            }
+            match dispatch(&matches, use_color, alloc) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("bgit error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }
 
-fn print_usage() {
-    println!(
-        "bgit — sans-IO, Git-wire-compatible VCS engine (macOS / APFS native .bgit store)\n\n\
-         USAGE:\n\
-         \tbgit status [dir] [-s|--short] [--porcelain] [-b|--branch] [-uno|-unormal|-uall] [--prompt] [--timing]\n\
-         \tbgit worktree <add|list|sync|watch|remove> ...  (alias: `bgit wt`)\n\
-         \tbgit mount <repo> <mountpoint> [rev] [--ro] [--foreground]  (or `bgit mount --list`)\n\
-         \tbgit unmount <mountpoint> [--force]\n\
-         \tbgit init [dir]\n\
-         \tbgit infect [dir] [--raw]\n\
-         \tbgit disinfect <dir> <out-git-dir>\n\
-         \tbgit verify [dir]\n\
-         \tbgit log [dir] [rev] [-n N]\n\
-         \tbgit merge-base <dir> <revA> <revB>\n\
-         \tbgit merge <dir> <ours> <theirs> [--write-commit] [--keep-worktree] [--no-sync]\n\
-         \tbgit serve --http <addr> <repo>\n\
-         \tbgit serve --stdio <upload-pack|receive-pack> <repo>\n\
-         \tbgit ls-remote <http-url>\n\
-         \tbgit clone [--vfs] <http-url> <dest-dir>\n\
-         \tbgit push <http-url> <dir> <ref>\n\
-         \tbgit bench <repo>"
-    );
+pub(crate) fn print_help<'a>(
+    spec: &bstd::cli::CommandSpec<'_>,
+    path: &[&str],
+    color: bool,
+    alloc: Alloc<'a>,
+) {
+    if let Ok(text) = format_help_with_path_in(spec, path, color, alloc) {
+        print!("{}", text.as_str());
+    }
 }
 
-fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    match args[0].as_str() {
-        "status" | "st" => cmd_status(&args[1..], alloc),
-        "worktree" | "wt" => cmd_worktree(&args[1..], alloc),
-        "mount" => cmd_mount(&args[1..], alloc),
-        "unmount" | "umount" => cmd_unmount(&args[1..]),
-        "__vfs-serve" => cmd_internal_vfs_serve(&args[1..], alloc),
+fn dispatch<'a>(matches: &Matches<'_, Alloc<'a>>, use_color: bool, alloc: Alloc<'a>) -> io::Result<()> {
+    match matches.command_path().get(1).copied().unwrap_or("") {
+        "status" => cmd_status(matches, alloc),
+        "worktree" => cmd_worktree(matches, use_color, alloc),
+        "mount" => cmd_mount(matches, alloc),
+        "unmount" => cmd_unmount(matches),
+        "__vfs-serve" => cmd_internal_vfs_serve(matches, alloc),
         "init" => {
-            let dir = args.get(1).map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let dir = PathBuf::from(matches.positional(0).unwrap_or("."));
             let store = BgitDiskStore::init(&dir, alloc)?;
             println!("Initialized empty .bgit repository in {}", store.bgit_dir.display());
             Ok(())
         }
         "infect" => {
-            let mut dir = PathBuf::from(".");
-            let mut compression = SlabCompression::AutoZstd;
-            for a in &args[1..] {
-                if a == "--raw" {
-                    compression = SlabCompression::RawOnly;
-                } else {
-                    dir = PathBuf::from(a);
-                }
-            }
+            let dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+            let compression = if matches.flag("raw") {
+                SlabCompression::RawOnly
+            } else {
+                SlabCompression::AutoZstd
+            };
             let t0 = Instant::now();
             let stats = infect_repo_on_disk(&dir, compression, alloc)?;
             let elapsed = t0.elapsed();
@@ -143,14 +153,8 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             Ok(())
         }
         "disinfect" => {
-            if args.len() < 3 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "usage: bgit disinfect <dir> <out-git-dir>",
-                ));
-            }
-            let dir = Path::new(&args[1]);
-            let out = Path::new(&args[2]);
+            let dir = Path::new(matches.positional(0).expect("required DIR"));
+            let out = Path::new(matches.positional(1).expect("required OUT_GIT_DIR"));
             let t0 = Instant::now();
             disinfect_repo_on_disk(dir, out, alloc)?;
             println!(
@@ -162,7 +166,7 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             Ok(())
         }
         "verify" => {
-            let dir = args.get(1).map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let dir = PathBuf::from(matches.positional(0).unwrap_or("."));
             let t0 = Instant::now();
             let store = BgitDiskStore::open(&dir, alloc)?;
             let checked = store.verify_full()?;
@@ -173,23 +177,20 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             );
             Ok(())
         }
-        "log" => cmd_log(&args[1..], alloc),
+        "log" => cmd_log(matches, alloc),
         "merge-base" => {
-            if args.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "usage: bgit merge-base <dir> <revA> <revB>",
-                ));
-            }
-            let store = open_or_infect(Path::new(&args[1]), alloc)?;
+            let dir = Path::new(matches.positional(0).expect("required DIR"));
+            let rev_a = matches.positional(1).expect("required REV_A");
+            let rev_b = matches.positional(2).expect("required REV_B");
+            let store = open_or_infect(dir, alloc)?;
             let a = store
-                .resolve_rev(&args[2])
+                .resolve_rev(rev_a)
                 .map_err(|e| io::Error::other(format!("{e}")))?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {}", args[2])))?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {rev_a}")))?;
             let b = store
-                .resolve_rev(&args[3])
+                .resolve_rev(rev_b)
                 .map_err(|e| io::Error::other(format!("{e}")))?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {}", args[3])))?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {rev_b}")))?;
             let cg = store.commit_graph();
             let bases = find_merge_bases(&store, cg.as_ref(), a, b, MergeLimits::SHIPPED, alloc)
                 .map_err(|e| io::Error::other(format!("{e}")))?;
@@ -198,48 +199,27 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             }
             Ok(())
         }
-        "merge" => cmd_merge(&args[1..], alloc),
+        "merge" => cmd_merge(matches, alloc),
         "serve" => {
-            if args.len() < 4 {
-                return Err(io::Error::new(
+            let repo = Path::new(matches.positional(0).expect("required REPO"));
+            match (matches.opt("http"), matches.opt("stdio")) {
+                (Some(addr), None) => serve_http(addr, repo, alloc),
+                (None, Some(service)) => serve_stdio(service, repo, alloc),
+                (Some(_), Some(_)) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "usage: bgit serve --http <addr> <repo> | bgit serve --stdio <upload-pack|receive-pack> <repo>",
-                ));
-            }
-            match args[1].as_str() {
-                "--http" => serve_http(&args[2], Path::new(&args[3]), alloc),
-                "--stdio" => serve_stdio(&args[2], Path::new(&args[3]), alloc),
-                other => Err(io::Error::new(
+                    "specify only one of --http or --stdio",
+                )),
+                (None, None) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("unknown serve mode `{other}` (use --http or --stdio)"),
+                    "specify --http <addr> or --stdio <upload-pack|receive-pack>",
                 )),
             }
         }
-        "ls-remote" => {
-            if args.len() < 2 {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "usage: bgit ls-remote <http-url>"));
-            }
-            http_ls_remote(&args[1], alloc)
-        }
+        "ls-remote" => http_ls_remote(matches.positional(0).expect("required HTTP_URL"), alloc),
         "clone" => {
-            let mut use_vfs = false;
-            let mut pos = Vec::new();
-            for a in &args[1..] {
-                if a == "--vfs" {
-                    use_vfs = true;
-                } else {
-                    pos.push(a.as_str());
-                }
-            }
-            if pos.len() < 2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "usage: bgit clone [--vfs] <http-url> <dest-dir>",
-                ));
-            }
-            let url = pos[0];
-            let dest = Path::new(pos[1]);
-            if use_vfs {
+            let url = matches.positional(0).expect("required HTTP_URL");
+            let dest = Path::new(matches.positional(1).expect("required DEST_DIR"));
+            if matches.flag("vfs") {
                 // Store `.bgit` objects in sibling `<dest>.bgit-store` with 0 checked-out files,
                 // then lazily mount onto `<dest>` via NFSv3!
                 let mut store_name = dest
@@ -255,18 +235,12 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             }
         }
         "push" => {
-            if args.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "usage: bgit push <http-url> <dir> <ref>",
-                ));
-            }
-            http_push(&args[1], Path::new(&args[2]), &args[3], alloc)
+            let url = matches.positional(0).expect("required HTTP_URL");
+            let dir = Path::new(matches.positional(1).expect("required DIR"));
+            let ref_name = matches.positional(2).expect("required REF");
+            http_push(url, dir, ref_name, alloc)
         }
-        "bench" => {
-            let dir = args.get(1).map_or_else(|| PathBuf::from("."), PathBuf::from);
-            cmd_bench(&dir, alloc)
-        }
+        "bench" => cmd_bench(Path::new(matches.positional(0).unwrap_or(".")), alloc),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown command `{other}` (run `bgit --help`)"),
@@ -274,30 +248,17 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     }
 }
 
-fn cmd_log<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    let mut dir = PathBuf::from(".");
-    let mut rev = String::from("HEAD");
-    let mut limit = 20usize;
-    let mut i = 0;
-    let mut positional = 0;
-    while i < args.len() {
-        if args[i] == "-n" && i + 1 < args.len() {
-            limit = args[i + 1].parse().unwrap_or(20);
-            i += 2;
-        } else {
-            if positional == 0 {
-                dir = PathBuf::from(&args[i]);
-            } else if positional == 1 {
-                rev = args[i].clone();
-            }
-            positional += 1;
-            i += 1;
-        }
-    }
+fn cmd_log<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    let dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+    let rev = matches.positional(1).unwrap_or("HEAD");
+    let limit = matches
+        .opt_parse::<usize>("max-count")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?
+        .unwrap_or(20);
 
     let store = open_or_infect(&dir, alloc)?;
     let mut cur = store
-        .resolve_rev(&rev)
+        .resolve_rev(rev)
         .map_err(|e| io::Error::other(format!("{e}")))?;
     let mut buf = OwnVec::new_in(alloc);
     let mut shown = 0usize;
@@ -324,19 +285,13 @@ fn cmd_log<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_merge<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    if args.len() < 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: bgit merge <dir> <ours> <theirs> [--write-commit]",
-        ));
-    }
-    let dir = Path::new(&args[0]);
-    let ours_rev = &args[1];
-    let theirs_rev = &args[2];
-    let write_commit = args.iter().any(|a| a == "--write-commit");
-    let keep_worktree = args.iter().any(|a| a == "--keep-worktree");
-    let no_sync = args.iter().any(|a| a == "--no-sync");
+fn cmd_merge<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    let dir = Path::new(matches.positional(0).expect("required DIR"));
+    let ours_rev = matches.positional(1).expect("required OURS");
+    let theirs_rev = matches.positional(2).expect("required THEIRS");
+    let write_commit = matches.flag("write-commit");
+    let keep_worktree = matches.flag("keep-worktree");
+    let no_sync = matches.flag("no-sync");
 
     let mut store = open_or_infect(dir, alloc)?;
     let ours = store
@@ -444,7 +399,7 @@ fn cmd_merge<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_status<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
+fn cmd_status<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mode {
         Long,
@@ -453,51 +408,55 @@ fn cmd_status<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
         Prompt,
     }
 
-    let mut dir = PathBuf::from(".");
-    let mut mode = Mode::Long;
-    let mut show_branch = false;
-    let mut untracked = UntrackedMode::Normal;
-    let mut color_override: Option<bool> = None;
-    let mut show_timing = false;
+    let dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+    let show_branch = matches.flag("branch");
+    let show_timing = matches.flag("timing");
 
-    for arg in args {
-        match arg.as_str() {
-            "-s" | "--short" => mode = Mode::Short,
-            "--porcelain" | "--porcelain=v1" | "--porcelain=1" => mode = Mode::Porcelain,
-            "--prompt" => mode = Mode::Prompt,
-            "-b" | "--branch" => show_branch = true,
-            "-sb" | "-bs" => {
-                mode = Mode::Short;
-                show_branch = true;
-            }
-            "-uno" | "-u=no" | "--untracked-files=no" => untracked = UntrackedMode::Off,
-            "-unormal" | "-u=normal" | "--untracked-files=normal" => {
-                untracked = UntrackedMode::Normal;
-            }
-            "-u" | "-uall" | "-u=all" | "--untracked-files=all" => {
-                untracked = UntrackedMode::All;
-            }
-            "--color" | "--color=always" => color_override = Some(true),
-            "--no-color" | "--color=never" => color_override = Some(false),
-            "--color=auto" => color_override = None,
-            "--timing" => show_timing = true,
-            "-h" | "--help" => {
-                println!(
-                    "USAGE:\n\
-                     \tbgit status [dir] [-s|--short] [--porcelain] [-b|--branch] \
-                     [-uno|-unormal|-uall] [--prompt] [--color|--no-color] [--timing]"
-                );
-                return Ok(());
-            }
-            other if other.starts_with('-') => {
+    let mode = if let Some(ver) = matches.opt("porcelain") {
+        match ver {
+            "v1" | "1" => Mode::Porcelain,
+            other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("unknown status flag: {other}"),
+                    format!("unsupported --porcelain version `{other}` (supported: v1)"),
                 ));
             }
-            other => dir = PathBuf::from(other),
         }
-    }
+    } else if matches.flag("prompt") {
+        Mode::Prompt
+    } else if matches.flag("short") {
+        Mode::Short
+    } else {
+        Mode::Long
+    };
+
+    let untracked = match matches.opt("untracked-files").map(|v| v.strip_prefix('=').unwrap_or(v)) {
+        None | Some("normal") => UntrackedMode::Normal,
+        Some("no") => UntrackedMode::Off,
+        Some("all") => UntrackedMode::All,
+        Some(other) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --untracked-files mode `{other}` (use no, normal, or all)"),
+            ));
+        }
+    };
+
+    let color_override = if matches.flag("no-color") {
+        Some(false)
+    } else {
+        match matches.opt("color") {
+            None | Some("auto") => None,
+            Some("always") => Some(true),
+            Some("never") => Some(false),
+            Some(other) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid --color value `{other}` (use always, auto, or never)"),
+                ));
+            }
+        }
+    };
 
     let detail = if mode == Mode::Prompt { Detail::Counts } else { Detail::Full };
     let opts = StatusOpts { untracked, detail, ..StatusOpts::FULL };

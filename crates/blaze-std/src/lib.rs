@@ -90,6 +90,7 @@
 //! | [`rng`] | the seeded generator | blaze-rng |
 //! | [`record`] | zero-copy records | blaze-format |
 //! | [`report`] | what a program says, as data | blaze-report |
+//! | [`cli`] | declarative `#![no_std]` CLI parser (clap replacement: nested subcommands, aliases, typo hints, ANSI `--help`) | new |
 //! | [`quic`], [`http`] | sans-IO QUIC (WebTransport over HTTP/3) and HTTP/1.1 | blaze-http |
 //! | [`test`] | `#[bstd::test]` and its runner, the simulation, the model checker, allocation counting | new, blaze-core, blaze-check, blaze-alloc-count |
 //!
@@ -123,6 +124,7 @@
     contracts,
     core_intrinsics,
     custom_inner_attributes,
+    default_field_values,
     fn_static,
     freeze,
     generic_atomic,

@@ -30,6 +30,7 @@ use blaze_git::{
 };
 use blaze_git_fetch::{Kind as ObjectKind, Oid, store::Commit};
 use blaze_own::{Alloc, Vec as OwnVec};
+use bstd::cli::Matches;
 
 use crate::disk::{BgitDiskStore, open_or_infect};
 
@@ -176,8 +177,8 @@ pub(crate) fn try_vfs_mount_status<'a>(
 }
 
 /// Public entry point for `bgit mount` (supports background mount, `--foreground`, `--ro`, `--list`).
-pub(crate) fn cmd_mount<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    if args.iter().any(|a| a == "--list" || a == "-l") {
+pub(crate) fn cmd_mount<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    if matches.flag("list") {
         let active = list_active_mounts();
         if active.is_empty() {
             println!("No active bgit VFS mounts.");
@@ -200,41 +201,18 @@ pub(crate) fn cmd_mount<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()>
         return Ok(());
     }
 
-    let mut pos = Vec::new();
-    let mut read_only = false;
-    let mut foreground = false;
-    for a in args {
-        match a.as_str() {
-            "--ro" | "--read-only" => read_only = true,
-            "--foreground" | "-f" => foreground = true,
-            "-h" | "--help" => {
-                println!(
-                    "USAGE:\n\
-                     \tbgit mount <repo> <mountpoint> [rev] [--ro] [--foreground]\n\
-                     \tbgit mount --list"
-                );
-                return Ok(());
-            }
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown mount flag: {other}"),
-                ));
-            }
-            other => pos.push(other.to_string()),
-        }
-    }
-
+    let pos = matches.positionals();
     if pos.len() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "usage: bgit mount <repo> <mountpoint> [rev] [--ro] [--foreground]",
         ));
     }
-
-    let repo_dir = PathBuf::from(&pos[0]);
-    let mountpoint = PathBuf::from(&pos[1]);
-    let rev = pos.get(2).map_or("HEAD", String::as_str);
+    let repo_dir = PathBuf::from(pos[0]);
+    let mountpoint = PathBuf::from(pos[1]);
+    let rev = pos.get(2).copied().unwrap_or("HEAD");
+    let read_only = matches.flag("ro") || matches.flag("read-only");
+    let foreground = matches.flag("foreground");
 
     if foreground {
         serve_vfs_mount(&repo_dir, &mountpoint, rev, read_only, None, alloc)
@@ -329,62 +307,26 @@ pub(crate) fn spawn_background_mount(
 }
 
 /// Internal entry point (`bgit __vfs-serve`) used by background mounts.
-pub(crate) fn cmd_internal_vfs_serve<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    if args.len() < 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "internal: __vfs-serve <repo> <mountpoint> <rev> [--ro] [--ready-file <path>]",
-        ));
-    }
-    let repo_dir = PathBuf::from(&args[0]);
-    let mountpoint = PathBuf::from(&args[1]);
-    let rev = &args[2];
-    let mut read_only = false;
-    let mut ready_file: Option<PathBuf> = None;
-    let mut i = 3;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--ro" => read_only = true,
-            "--ready-file" => {
-                i += 1;
-                if let Some(p) = args.get(i) {
-                    ready_file = Some(PathBuf::from(p));
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+pub(crate) fn cmd_internal_vfs_serve<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    alloc: Alloc<'a>,
+) -> io::Result<()> {
+    let repo_dir = PathBuf::from(matches.positional(0).expect("required REPO"));
+    let mountpoint = PathBuf::from(matches.positional(1).expect("required MOUNTPOINT"));
+    let rev = matches.positional(2).expect("required REV");
+    let read_only = matches.flag("ro");
+    let ready_file = matches.opt("ready-file").map(PathBuf::from);
     serve_vfs_mount(&repo_dir, &mountpoint, rev, read_only, ready_file.as_deref(), alloc)
 }
 
 /// Public entry point for `bgit unmount <mountpoint> [--force]`.
-pub(crate) fn cmd_unmount(args: &[String]) -> io::Result<()> {
-    let mut force = false;
-    let mut target: Option<PathBuf> = None;
-    for a in args {
-        match a.as_str() {
-            "-f" | "--force" => force = true,
-            "-h" | "--help" => {
-                println!("USAGE:\n\tbgit unmount <mountpoint> [--force]");
-                return Ok(());
-            }
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown unmount flag: {other}"),
-                ));
-            }
-            other => target = Some(PathBuf::from(other)),
-        }
-    }
-    let Some(mnt) = target else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: bgit unmount <mountpoint> [--force]",
-        ));
-    };
-    let canon_mnt = fs::canonicalize(&mnt).unwrap_or(mnt);
+pub(crate) fn cmd_unmount<'a>(matches: &Matches<'_, Alloc<'a>>) -> io::Result<()> {
+    let mnt = Path::new(matches.positional(0).expect("required MOUNTPOINT"));
+    cmd_unmount_path(mnt, matches.flag("force"))
+}
+
+pub(crate) fn cmd_unmount_path(mnt: &Path, force: bool) -> io::Result<()> {
+    let canon_mnt = fs::canonicalize(mnt).unwrap_or_else(|_| mnt.to_path_buf());
     let state_dir = vfs_registry_root().join(mount_id_for(&canon_mnt));
 
     let mut cmd = Command::new("/sbin/umount");

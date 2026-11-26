@@ -13,8 +13,8 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
   default); precomputed R2 `std` records; no migrations on home upgrade.
 - **Scope:** Cargo workspaces (`reth`, `tempo`, `blaze`); macOS/Linux arm64 & bare-metal/unikernel
   VMs; `check`, `build`, `run`, `test`; EVERY internal crate `#![no_std]` on `bstd`/`blaze-own`
-  explicit `Alloc` & sans-IO. **Not now:** `blaze watch`/build-on-save, Windows, Buck/Bazel, remote
-  runs.
+  explicit `Alloc` & sans-IO (`bstd::cli` for CLI binaries). **Not now:** `blaze
+  watch`/build-on-save, Windows, Buck/Bazel, remote runs.
 - **Autonomy & craft:** Act autonomously on non-controversial improvements — when you spot
   duplicated logic/patterns that generalize, immediately spawn a subagent to extract a shared crate,
   sweep all callers, and land it. Pause only on genuinely controversial tradeoffs or irreversible
