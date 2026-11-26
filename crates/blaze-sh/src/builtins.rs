@@ -2616,6 +2616,7 @@ fn builtin_sort_by<'a>(
             }
             let n = t.nrows();
             let mut keys: AVec<'a, (usize, AVec<'a, Value<'a>>)> = AVec::with_capacity_in(n, alloc);
+            let mut first_sort_col: Option<usize> = None;
             if let Value::Closure(c) = &args.pos[0].0 {
                 let c = c.share();
                 for r in 0..n {
@@ -2641,6 +2642,9 @@ fn builtin_sort_by<'a>(
                             alloc,
                         )));
                     };
+                    if first_sort_col.is_none() {
+                        first_sort_col = Some(ci);
+                    }
                     col_idxs.push(ci);
                 }
                 for r in 0..n {
@@ -2664,6 +2668,7 @@ fn builtin_sort_by<'a>(
             });
 
             let mut out = t.empty_like();
+            out.initial_sort = first_sort_col.map(|ci| (ci, reverse));
             for (r, _) in keys.iter() {
                 eval.charge(1, span)?;
                 out.push_record(&t.row_record(*r).unwrap());

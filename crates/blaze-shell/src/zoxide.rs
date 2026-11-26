@@ -164,13 +164,57 @@ impl FrecencyStore {
             .map(|t| t.to_ascii_lowercase())
             .collect();
 
-        let mut scored: Vec<ZoxideMatch> = Vec::new();
-        for entry in self.entries.values() {
+        let mut candidates: BTreeMap<(String, String), FrecencyEntry> = self.entries.clone();
+
+        // Synthesize existing ancestor directories of visited local paths (e.g. `/Volumes/Projects`
+        // when the user visited `/Volumes/Projects/blaze` 50 times) so `cd Proj` can jump directly
+        // to `/Volumes/Projects` even if it wasn't explicitly visited before!
+        if let Some(last_tok) = tokens.last() {
+            let mut ancestors: Vec<FrecencyEntry> = Vec::new();
+            for entry in self.entries.values() {
+                if entry.host != local_host {
+                    continue;
+                }
+                let mut cur = Path::new(&entry.path).parent();
+                while let Some(anc) = cur {
+                    let anc_str = anc.to_string_lossy();
+                    if anc_str.is_empty() || anc_str == "/" {
+                        break;
+                    }
+                    if let Some(name) = anc.file_name().and_then(|n| n.to_str())
+                        && name.to_ascii_lowercase().contains(last_tok.as_str())
+                        && anc.is_dir()
+                    {
+                        ancestors.push(FrecencyEntry {
+                            host: entry.host.clone(),
+                            path: anc_str.into_owned(),
+                            visits: (entry.visits / 4).max(1),
+                            last_ns: entry.last_ns,
+                        });
+                    }
+                    cur = anc.parent();
+                }
+            }
+            for anc in ancestors {
+                let key = (anc.host.clone(), anc.path.clone());
+                candidates
+                    .entry(key)
+                    .and_modify(|e| {
+                        e.visits = e.visits.max(anc.visits);
+                        e.last_ns = e.last_ns.max(anc.last_ns);
+                    })
+                    .or_insert(anc);
+            }
+        }
+
+        let mut scored: Vec<(u8, ZoxideMatch)> = Vec::new();
+        for entry in candidates.values() {
             let is_local = entry.host == local_host;
             let hay_path = entry.path.to_ascii_lowercase();
             let hay_full = format!("{}:{}", entry.host.to_ascii_lowercase(), hay_path);
             let leaf = hay_path.rsplit('/').next().unwrap_or(&hay_path);
 
+            let mut tier = 1u8;
             let mut match_bonus = 1.0f64;
             if !tokens.is_empty() {
                 let mut cursor = 0usize;
@@ -178,10 +222,17 @@ impl FrecencyStore {
                 for (ti, tok) in tokens.iter().enumerate() {
                     if let Some(pos) = hay_full[cursor..].find(tok.as_str()) {
                         cursor += pos + tok.len();
-                        if ti + 1 == tokens.len() && leaf == tok.as_str() {
-                            match_bonus += 6.0;
-                        } else if ti + 1 == tokens.len() && leaf.contains(tok.as_str()) {
-                            match_bonus += 3.0;
+                        if ti + 1 == tokens.len() {
+                            if leaf == tok.as_str() {
+                                tier = 4;
+                                match_bonus += 8.0;
+                            } else if leaf.starts_with(tok.as_str()) {
+                                tier = 3;
+                                match_bonus += 5.0;
+                            } else if leaf.contains(tok.as_str()) {
+                                tier = 2;
+                                match_bonus += 3.0;
+                            }
                         }
                     } else if let Some(pos) = hay_full.find(tok.as_str()) {
                         cursor = pos + tok.len();
@@ -200,21 +251,31 @@ impl FrecencyStore {
             }
             let local_boost = if is_local { 1.35 } else { 1.0 };
             let score = (entry.frecency(now_ns) + 1.0) * match_bonus * local_boost;
-            scored.push(ZoxideMatch {
-                host: entry.host.clone(),
-                path: entry.path.clone(),
-                is_local,
-                score,
-            });
+            scored.push((
+                tier,
+                ZoxideMatch {
+                    host: entry.host.clone(),
+                    path: entry.path.clone(),
+                    is_local,
+                    score,
+                },
+            ));
         }
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
+        // Strict leaf-match tiering (exact leaf > leaf prefix > leaf substring > ancestor-only),
+        // then frecency score, then shorter path — mirrors upstream zoxide so `cd Proj` always
+        // jumps to `/Volumes/Projects` instead of `/Volumes/Projects/blaze`!
+        scored.sort_by(|(ta, a), (tb, b)| {
+            tb.cmp(ta)
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.path.len().cmp(&b.path.len()))
                 .then_with(|| a.path.cmp(&b.path))
         });
         scored.truncate(limit);
-        scored
+        scored.into_iter().map(|(_, m)| m).collect()
     }
 }
 

@@ -928,7 +928,7 @@ fn layout_starship_line(
     }
 
     if !raw_dir_lbl.is_empty() {
-        let max_dir = ((max_w * 0.42) / m.cw).floor().max(12.0) as usize;
+        let max_dir = ((max_w * 0.58) / m.cw).floor().max(16.0) as usize;
         let dir_lbl = truncate_chars(raw_dir_lbl, max_dir);
         if let Some(slash) = dir_lbl.rfind('/')
             && slash + 1 < dir_lbl.len()
@@ -1712,7 +1712,7 @@ fn cached_ls_git_statuses(
     if let Some(hit) = cached {
         return hit;
     }
-    let dir = resolve_ls_target_dir(&block.prompt_snapshot.cwd, &block.source);
+    let dir = resolve_ls_target_dir(block.state_after.cwd.as_ref(), &block.source);
     let computed =
         crate::prompt::git_ls_entry_statuses(&dir, entries, block.prompt_snapshot.git_status.as_ref());
     CACHE.with(|c| {
@@ -1933,7 +1933,7 @@ fn layout_file_grid(
                     item_rect,
                     clip_id,
                     HoverKind::FileEntry {
-                        full_path: full_path_for_entry(&block.prompt_snapshot.cwd, &block.source, &item.raw),
+                        full_path: full_path_for_entry(block.state_after.cwd.as_ref(), &block.source, &item.raw),
                         name: item.label.clone(),
                         icon: Some(item.icon),
                         is_dir: item.is_dir,
@@ -2345,7 +2345,7 @@ fn layout_table(
         && file_entry_col.is_some()
         && table.col_index("commit").is_none()
     {
-        let dir = resolve_ls_target_dir(&block.prompt_snapshot.cwd, &block.source);
+        let dir = resolve_ls_target_dir(block.state_after.cwd.as_ref(), &block.source);
         crate::git_meta_driver::request_dir_commits(&dir)
             .filter(|snap| !snap.entries.is_empty())
     } else {
@@ -2653,10 +2653,43 @@ fn layout_table(
                                     raw_name.clone()
                                 };
                                 let row_git = table_git_statuses.as_ref().and_then(|v| v.get(r).copied());
-                                let (icon_alpha, name_col, badge, tracked_dot) = match row_git {
+                                let (icon_alpha, mut name_col, badge, tracked_dot) = match row_git {
                                     Some(st) => git_status_style(st, is_dir),
                                     None => (1.0, theme::INK_1, None, false),
                                 };
+                                // Subtle warm recency glow on freshly modified files/folders (< 2h)
+                                // when not already colored by git status (`M`, `A`, `?`, ignored).
+                                let is_neutral_git =
+                                    matches!(row_git, None | Some(GitFileStatus::Tracked));
+                                if is_neutral_git
+                                    && let Some(mc) = table.col_index("modified")
+                                    && let Some(Value::Date(dt)) = table.cell(r, mc)
+                                {
+                                    let dust_ns = if is_dir {
+                                        all_row_dust
+                                            .get(r)
+                                            .copied()
+                                            .flatten()
+                                            .map(|p| p.max_mtime_ns)
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    let eff_ns = dt.utc_ns.max(dust_ns);
+                                    let age_secs =
+                                        (now_ns.saturating_sub(eff_ns)).max(0) as u64 / 1_000_000_000;
+                                    if age_secs < 7_200 {
+                                        let heat = theme::recency_heat_color(age_secs);
+                                        // Gentle 32% blend so names stay crisp while recent items glow!
+                                        let blend = if age_secs < 600 { 0.42 } else { 0.28 };
+                                        name_col = [
+                                            name_col[0] + (heat[0] - name_col[0]) * blend,
+                                            name_col[1] + (heat[1] - name_col[1]) * blend,
+                                            name_col[2] + (heat[2] - name_col[2]) * blend,
+                                            name_col[3],
+                                        ];
+                                    }
+                                }
                                 let git_pad = if badge.is_some() { m.cw * 1.8 } else { 0.0 };
                                 let max_ch = ((content_w - icon_pad - 8.0 - git_pad) / m.cw).floor().max(4.0) as usize;
                                 // Middle-truncate nested paths (`crates/…/layout.rs`) so filenames stay visible!
