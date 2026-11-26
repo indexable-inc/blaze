@@ -1612,6 +1612,11 @@ mod macos_app {
                 host: host.to_owned(),
                 is_remote,
                 name: format!("agent #{id_num} ({host})"),
+                kind_label: if is_remote {
+                    "server".to_owned()
+                } else {
+                    "claude".to_owned()
+                },
                 prompt_summary: prompt_text
                     .clone()
                     .unwrap_or_else(|| format!("{short_cwd} · interactive")),
@@ -1625,11 +1630,18 @@ mod macos_app {
                     format!("cwd:    {short_cwd}"),
                     format!("cmd:    {display_cmd}"),
                 ],
+                cmdline: display_cmd.clone(),
+                ..AgentRecord::default()
             });
+            let spawn_cwd = if !is_remote && std::path::Path::new(cwd).is_dir() {
+                cwd.to_owned()
+            } else {
+                self.prompt.cwd.clone()
+            };
             let spawn = InteractiveSpawn {
                 program,
                 args,
-                cwd: self.prompt.cwd.clone(),
+                cwd: spawn_cwd,
                 env: Vec::new(),
             };
             self.spawn_pty_block(
@@ -1826,7 +1838,7 @@ mod macos_app {
 
             let sub = if let Some(yazi) = &mut pane.yazi {
                 layout_yazi_pane(yazi, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
-            } else if let Some(hub) = &pane.agent_hub {
+            } else if let Some(hub) = &mut pane.agent_hub {
                 layout_agent_hub_pane(hub, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
             } else if pane.sysmon_fullscreen
                 && let Some(sid) = pane.active_sysmon
@@ -2743,6 +2755,7 @@ mod macos_app {
         let mut last_git_meta_rev = blaze_shell::git_meta_driver::git_meta_revision();
         let mut last_remote_rev = blaze_shell::remote_driver::remote_complete_revision();
         let mut last_app_icon_rev = blaze_shell::sysmon_driver::app_icon_revision();
+        let mut last_agent_probe_rev = blaze_shell::agent_probe::probe_revision();
         let mut last_folder_proc_rev = blaze_shell::sysmon_driver::folder_proc_revision();
         let mut last_folder_poll = Instant::now() - std::time::Duration::from_secs(5);
         let mut command_palette: Option<CommandPalette> = None;
@@ -3744,6 +3757,8 @@ mod macos_app {
                                     Key::Backspace => "Backspace",
                                     Key::ArrowUp => "Up",
                                     Key::ArrowDown => "Down",
+                                    Key::PageUp => "PageUp",
+                                    Key::PageDown => "PageDown",
                                     _ => "",
                                 };
                                 let ch = if !ctrl && !alt { text.chars().next() } else { None };
@@ -4354,6 +4369,7 @@ mod macos_app {
                                 .map(|p| p.pane)
                                 .unwrap_or_else(|| wm.focused_pane());
                             let pane_x0 = hovered_pl.map_or(0.0, |p| p.rect.x0);
+                            let pane_w = hovered_pl.map_or(size.width as f32, |p| p.rect.x1 - p.rect.x0);
                             let Some(shell) = panes.get_mut(&scroll_pid) else {
                                 continue;
                             };
@@ -4390,14 +4406,10 @@ mod macos_app {
                                 sm.scroll_by(rows_delta as isize, vis_rows);
                                 dirty = true;
                             } else if let Some(hub) = &mut shell.agent_hub {
-                                if dy.abs() > 0.5 && !hub.agents.is_empty() {
-                                    if dy < 0.0 && hub.selected + 1 < hub.agents.len() {
-                                        hub.selected += 1;
-                                        dirty = true;
-                                    } else if dy > 0.0 && hub.selected > 0 {
-                                        hub.selected -= 1;
-                                        dirty = true;
-                                    }
+                                if step_px.abs() > 0.1
+                                    && hub.scroll_at(mx - pane_x0, pane_w, -step_px)
+                                {
+                                    dirty = true;
                                 }
                             } else if let Some(ap) = &shell.active_pty
                                 && dy.abs() > 0.5
@@ -4744,9 +4756,69 @@ mod macos_app {
                                         }
                                         HitAction::SelectAgent(idx) => {
                                             if let Some(hub) = &mut shell.agent_hub
-                                                && idx < hub.agents.len()
+                                                && hub.select_index(idx)
                                             {
-                                                hub.selected = idx;
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::AgentToggleOffline => {
+                                            if let Some(hub) = &mut shell.agent_hub {
+                                                hub.toggle_show_offline();
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::AgentReprobeServers => {
+                                            if let Some(hub) = &mut shell.agent_hub {
+                                                hub.reprobe_servers();
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::AgentAttachSelected => {
+                                            if let Some(AgentHubAction::EnterAgent {
+                                                host,
+                                                is_remote,
+                                                cwd,
+                                                prompt,
+                                                ..
+                                            }) = shell
+                                                .agent_hub
+                                                .as_ref()
+                                                .and_then(|hub| hub.attach_selected_action())
+                                            {
+                                                shell.agent_hub = None;
+                                                let (cols, rows) = grid_for(size, &fonts, scale);
+                                                let cpx = (
+                                                    fonts.metrics.cell_w as u32,
+                                                    fonts.metrics.cell_h as u32,
+                                                );
+                                                shell.launch_agent_session(
+                                                    &host, is_remote, &cwd, prompt, cols, rows,
+                                                    cpx,
+                                                );
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::AgentNewTaskSelected => {
+                                            if let Some(hub) = &mut shell.agent_hub {
+                                                hub.start_compose_new();
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::AgentRequestKill => {
+                                            if let Some(hub) = &mut shell.agent_hub {
+                                                hub.begin_kill_selected();
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::AgentConfirmKill { sigkill } => {
+                                            if let Some(hub) = &mut shell.agent_hub {
+                                                let _ = hub.confirm_kill_selected(sigkill);
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::AgentCancelKill => {
+                                            if let Some(hub) = &mut shell.agent_hub {
+                                                hub.cancel_kill();
                                                 dirty = true;
                                             }
                                         }
@@ -5134,7 +5206,14 @@ mod macos_app {
                                         | HitAction::FocusPane(_)
                                         | HitAction::ClosePane(_)
                                         | HitAction::ToggleZoomPane(_)
-                                        | HitAction::SelectPalette(_) => {}
+                                        | HitAction::SelectPalette(_)
+                                        | HitAction::AgentToggleOffline
+                                        | HitAction::AgentReprobeServers
+                                        | HitAction::AgentAttachSelected
+                                        | HitAction::AgentNewTaskSelected
+                                        | HitAction::AgentRequestKill
+                                        | HitAction::AgentConfirmKill { .. }
+                                        | HitAction::AgentCancelKill => {}
                                     }
                                     continue;
                                 }
@@ -5733,6 +5812,17 @@ mod macos_app {
             if cur_app_icon_rev != last_app_icon_rev {
                 last_app_icon_rev = cur_app_icon_rev;
                 dirty = true;
+            }
+            let cur_agent_probe_rev = blaze_shell::agent_probe::probe_revision();
+            if cur_agent_probe_rev != last_agent_probe_rev {
+                last_agent_probe_rev = cur_agent_probe_rev;
+                for pane in panes.values_mut() {
+                    if let Some(hub) = &mut pane.agent_hub
+                        && hub.sync_reachability()
+                    {
+                        dirty = true;
+                    }
+                }
             }
             let cur_fp_rev = blaze_shell::sysmon_driver::folder_proc_revision();
             if cur_fp_rev != last_folder_proc_rev
