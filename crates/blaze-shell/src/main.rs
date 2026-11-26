@@ -351,6 +351,7 @@ mod macos_app {
             columns: Vec<String>,
             displays: Vec<ColDisplay>,
             default_grid: bool,
+            hidden_mask: u64,
             rows: Vec<Vec<SendValue>>,
         },
         Error {
@@ -395,7 +396,13 @@ mod macos_app {
                         }
                         rows.push(row);
                     }
-                    Self::Table { columns, displays, default_grid: t.default_grid, rows }
+                    Self::Table {
+                        columns,
+                        displays,
+                        default_grid: t.default_grid,
+                        hidden_mask: t.hidden_mask,
+                        rows,
+                    }
                 }
                 Value::Error(e) => Self::Error {
                     kind: e.kind,
@@ -439,10 +446,11 @@ mod macos_app {
                     }
                     Value::Record(rec)
                 }
-                Self::Table { columns, displays, default_grid, rows } => {
+                Self::Table { columns, displays, default_grid, hidden_mask, rows } => {
                     let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
                     let mut t = Table::from_col_names(&col_refs, alloc);
                     t.default_grid = default_grid;
+                    t.hidden_mask = hidden_mask;
                     for (col, disp) in columns.iter().zip(displays.into_iter()) {
                         t.set_col_display(col, disp);
                     }
@@ -3942,6 +3950,11 @@ mod macos_app {
                                         }
                                         HitAction::ToggleTableView(block_id) => {
                                             shell.store.toggle_table_view(block_id);
+                                            active_popover = None;
+                                            dirty = true;
+                                        }
+                                        HitAction::ToggleHiddenCols(block_id) => {
+                                            shell.store.toggle_hidden_cols(block_id);
                                             active_popover = None;
                                             dirty = true;
                                         }

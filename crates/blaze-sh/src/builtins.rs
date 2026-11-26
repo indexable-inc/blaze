@@ -1645,6 +1645,9 @@ fn builtin_ls<'a>(
     table.set_col_display("name", crate::value::ColDisplay::FileEntry);
     table.set_col_display("size", crate::value::ColDisplay::FileSize);
     table.set_col_display("modified", crate::value::ColDisplay::HumanTime);
+    // File icons already communicate entry kind; keep `type` in the table for pipelines/sorting
+    // and one-click expansion, but hide it by default in table view.
+    table.hide_col_by_name("type");
     if long {
         table.set_col_display("readonly", crate::value::ColDisplay::Status);
     }

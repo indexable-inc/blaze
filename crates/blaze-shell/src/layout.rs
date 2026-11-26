@@ -1919,6 +1919,51 @@ fn layout_table(
     let total_rows = table.nrows();
     let is_scrollable = depth <= 1 && block.folded && total_rows > TABLE_FOLD_ROWS;
     let visible_rows = if is_scrollable { TABLE_FOLD_ROWS } else { total_rows };
+    let type_col_idx = table.col_index("type");
+    let sample_rows = total_rows.min(256);
+
+    // Pre-compute column displays & non-blocking `blaze-dust` folder sizes BEFORE sorting so
+    // clicking `size ↓` / `size ↑` sorts folders by their real progressive disk usage (`43.9 MiB`)
+    // instead of the raw directory inode `st_size` (`96 B`)!
+    let mut col_displays: Vec<ColDisplay> = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        col_displays.push(effective_col_display(table, c, sample_rows));
+    }
+    let file_entry_col = col_displays.iter().position(|&d| d == ColDisplay::FileEntry);
+    let size_col_idx = col_displays.iter().position(|&d| d == ColDisplay::FileSize);
+    let mut all_row_dust: Vec<Option<blaze_dust::DustProgress>> = vec![None; total_rows];
+    let mut dust_max_bytes: u64 = 0;
+    if size_col_idx.is_some()
+        && let Some(fc) = file_entry_col
+    {
+        // Always scan up to 256 rows (or all rows if sorting by size) so `size ↓` is exact!
+        let dust_scan_rows = if block
+            .table_sort
+            .is_some_and(|(sc, _)| Some(sc) == size_col_idx)
+        {
+            total_rows.min(512)
+        } else {
+            total_rows.min(64)
+        };
+        for r in 0..dust_scan_rows {
+            let fk = type_col_idx.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str);
+            let raw = table
+                .cell(r, fc)
+                .map(|c| format_value_cell_at(c, Some(now_ns)))
+                .unwrap_or_default();
+            let is_dir = fk.is_some_and(blaze_sniff::is_dir_label) || raw.ends_with('/');
+            if is_dir && !raw.is_empty() {
+                let full_p = full_path_for_entry(&block.prompt_snapshot.cwd, &block.source, &raw);
+                if let Some(prog) = crate::dust_driver::request_dir_size(std::path::Path::new(&full_p))
+                {
+                    if prog.bytes > dust_max_bytes {
+                        dust_max_bytes = prog.bytes;
+                    }
+                    all_row_dust[r] = Some(prog);
+                }
+            }
+        }
+    }
 
     // Non-mutating row permutation when the user clicks a column header to sort!
     let mut row_order: Vec<usize> = (0..total_rows).collect();
@@ -1926,22 +1971,46 @@ fn layout_table(
         && let Some((sort_col, desc)) = block.table_sort
         && sort_col < ncols
     {
+        let sort_is_file_size = col_displays.get(sort_col) == Some(&ColDisplay::FileSize);
         row_order.sort_by(|&a, &b| {
-            let va = table.cell(a, sort_col);
-            let vb = table.cell(b, sort_col);
-            let ord = match (va, vb) {
-                (Some(x), Some(y)) => x.compare(y).unwrap_or_else(|| {
-                    format_value_cell_at(x, Some(now_ns)).cmp(&format_value_cell_at(y, Some(now_ns)))
-                }),
-                (Some(_), None) => core::cmp::Ordering::Greater,
-                (None, Some(_)) => core::cmp::Ordering::Less,
-                (None, None) => core::cmp::Ordering::Equal,
+            let ord = if sort_is_file_size {
+                let eff_bytes = |row_idx: usize| -> i64 {
+                    if let Some(prog) = all_row_dust.get(row_idx).copied().flatten() {
+                        return prog.bytes.min(i64::MAX as u64) as i64;
+                    }
+                    match table.cell(row_idx, sort_col) {
+                        Some(Value::Size(Bytes(n))) => *n,
+                        Some(Value::Int(n)) => *n,
+                        _ => -1,
+                    }
+                };
+                eff_bytes(a).cmp(&eff_bytes(b))
+            } else {
+                let va = table.cell(a, sort_col);
+                let vb = table.cell(b, sort_col);
+                match (va, vb) {
+                    (Some(x), Some(y)) => x.compare(y).unwrap_or_else(|| {
+                        format_value_cell_at(x, Some(now_ns))
+                            .cmp(&format_value_cell_at(y, Some(now_ns)))
+                    }),
+                    (Some(_), None) => core::cmp::Ordering::Greater,
+                    (None, Some(_)) => core::cmp::Ordering::Less,
+                    (None, None) => core::cmp::Ordering::Equal,
+                }
             };
             if desc { ord.reverse() } else { ord }
         });
     }
 
-    let type_col_idx = table.col_index("type");
+    let hidden_col_names: Vec<&str> = (0..ncols)
+        .filter(|&c| table.is_col_hidden(c))
+        .filter_map(|c| table.columns.get(c).map(|s| s.as_ref()))
+        .collect();
+    let has_hidden_toggle = depth <= 1 && !hidden_col_names.is_empty();
+    let col_visible: Vec<bool> = (0..ncols)
+        .map(|c| block.show_hidden_cols || !table.is_col_hidden(c))
+        .collect();
+
     let icon_s = m.icon_md();
     let icon_pad = icon_s + (m.cw * 0.85).round().max(6.0);
 
@@ -1949,18 +2018,16 @@ fn layout_table(
     let idx_w = idx_chars as f32 * m.cw + 16.0;
     let col_gap = 22.0;
     let scrollbar_reserve = if is_scrollable { 12.0 } else { 0.0 };
-    let avail_w = (width - idx_w - scrollbar_reserve).max(80.0);
+    let hidden_toggle_reserve = if has_hidden_toggle { 58.0 } else { 0.0 };
+    let avail_w = (width - idx_w - scrollbar_reserve - hidden_toggle_reserve).max(80.0);
 
-    let mut col_displays: Vec<ColDisplay> = Vec::with_capacity(ncols);
     let mut col_chars: Vec<usize> = Vec::with_capacity(ncols);
     let mut col_right_align: Vec<bool> = Vec::with_capacity(ncols);
     let mut col_extra_px: Vec<f32> = Vec::with_capacity(ncols);
     let mut col_max_num: Vec<f64> = Vec::with_capacity(ncols);
 
-    let sample_rows = total_rows.min(256);
     for c in 0..ncols {
-        let disp = effective_col_display(table, c, sample_rows);
-        col_displays.push(disp);
+        let disp = col_displays[c];
 
         let hdr = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
         let is_icon_only_bool = hdr == "readonly"
@@ -2018,7 +2085,9 @@ fn layout_table(
             match disp {
                 ColDisplay::FileEntry | ColDisplay::Crate | ColDisplay::Process => icon_pad + 10.0,
                 ColDisplay::Status => 14.0,
-                ColDisplay::FileSize | ColDisplay::Percent if max_num > 0.0 => SIZE_BAR_W + 10.0,
+                ColDisplay::HumanTime => 11.0,
+                ColDisplay::FileSize if max_num > 0.0 || dust_max_bytes > 0 => SIZE_BAR_W + 10.0,
+                ColDisplay::Percent if max_num > 0.0 => SIZE_BAR_W + 10.0,
                 _ => 0.0,
             }
         };
@@ -2026,15 +2095,24 @@ fn layout_table(
         col_max_num.push(max_num);
     }
 
-    // Priority-based responsive column widths: preserve exact intrinsic widths for short fixed
-    // columns (`status`, `size`, `modified`, `readonly`) and flex/middle-truncate path columns!
+    // Priority-based responsive column widths: hidden columns take 0px; visible columns preserve
+    // intrinsic widths for short fixed columns (`size`, `modified`, `readonly`) & flex paths!
     let mut col_widths: Vec<f32> = (0..ncols)
-        .map(|c| col_chars[c] as f32 * m.cw + col_extra_px[c] + col_gap)
+        .map(|c| {
+            if !col_visible[c] {
+                0.0
+            } else {
+                col_chars[c] as f32 * m.cw + col_extra_px[c] + col_gap
+            }
+        })
         .collect();
     let total_w: f32 = col_widths.iter().sum();
     if total_w > avail_w && total_w > 0.0 {
         let is_flex: Vec<bool> = (0..ncols)
             .map(|c| {
+                if !col_visible[c] {
+                    return false;
+                }
                 let col_name = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
                 col_name != "readonly"
                     && !matches!(
@@ -2047,7 +2125,7 @@ fn layout_table(
             })
             .collect();
         let fixed_sum: f32 = (0..ncols)
-            .filter(|&c| !is_flex[c])
+            .filter(|&c| col_visible[c] && !is_flex[c])
             .map(|c| col_widths[c])
             .sum();
         let flex_sum: f32 = total_w - fixed_sum;
@@ -2062,7 +2140,8 @@ fn layout_table(
         } else {
             // Very narrow pane: compact status column to single-letter badge first before shrinking sizes/times!
             for c in 0..ncols {
-                if col_displays[c] == ColDisplay::Status
+                if col_visible[c]
+                    && col_displays[c] == ColDisplay::Status
                     && table.columns.get(c).map(|s| s.as_ref()) != Some("readonly")
                 {
                     col_widths[c] = (m.cw * 3.2 + col_gap).min(col_widths[c]);
@@ -2081,14 +2160,17 @@ fn layout_table(
                     }
                 } else {
                     let scale = avail_w / new_total;
-                    for w in &mut col_widths {
-                        *w = (*w * scale).max(38.0);
+                    for c in 0..ncols {
+                        if col_visible[c] {
+                            col_widths[c] = (col_widths[c] * scale).max(38.0);
+                        }
                     }
                 }
             }
         }
     }
-    let table_w = (idx_w + col_widths.iter().sum::<f32>() - col_gap * 0.4).min(width - scrollbar_reserve);
+    let table_w = (idx_w + col_widths.iter().sum::<f32>() + hidden_toggle_reserve - col_gap * 0.4)
+        .min(width - scrollbar_reserve);
     let x1 = x0 + table_w;
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
@@ -2097,6 +2179,9 @@ fn layout_table(
     scene.ui_small(x0, y0, "#", theme::INK_4, false, false, clip_id);
     let mut cx = x0 + idx_w;
     for c in 0..ncols {
+        if !col_visible[c] {
+            continue;
+        }
         let cw = col_widths[c];
         let content_w = (cw - col_gap).max(m.cw * 2.0);
         let col_raw = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
@@ -2153,6 +2238,56 @@ fn layout_table(
         cx += cw;
     }
 
+    // Sleek clickable pill to reveal or re-hide default-hidden columns (e.g. `+1 col` -> `type`).
+    if has_hidden_toggle {
+        let n_hid = hidden_col_names.len();
+        let pill_lbl = if block.show_hidden_cols {
+            format!("−{}", hidden_col_names[0])
+        } else if n_hid == 1 {
+            format!("+{}", hidden_col_names[0])
+        } else {
+            format!("+{n_hid} cols")
+        };
+        let pw = m.measure(&pill_lbl, TextFace::UiSmall) + 12.0;
+        let px0 = (x1 - pw).max(cx - 8.0);
+        let py0 = y0 - 1.0;
+        let py1 = y0 + m.ch + 1.0;
+        scene.round_rect(
+            px0,
+            py0,
+            px0 + pw,
+            py1,
+            4.0,
+            theme::BG_CHIP,
+            1.0,
+            theme::LINE_FAINT,
+            clip_id,
+        );
+        scene.ui_small(
+            px0 + 6.0,
+            y0,
+            pill_lbl,
+            if block.show_hidden_cols { theme::INK_2 } else { theme::INK_4 },
+            false,
+            false,
+            clip_id,
+        );
+        let pill_rect = HitRect::new(px0, py0 - 2.0, px0 + pw, py1 + 2.0);
+        scene.push_hit_clipped(pill_rect, clip_id, HitAction::ToggleHiddenCols(block.id));
+        scene.push_hover_clipped(
+            pill_rect,
+            clip_id,
+            HoverKind::Tooltip {
+                title: if block.show_hidden_cols {
+                    format!("hide default-hidden: {}", hidden_col_names.join(", "))
+                } else {
+                    format!("show hidden columns: {}", hidden_col_names.join(", "))
+                },
+                subtitle: None,
+            },
+        );
+    }
+
     let hdr_line_y = y0 + m.ch + 6.0;
     scene.line(x0, hdr_line_y, x1, hdr_line_y, 1.0, theme::LINE, clip_id);
 
@@ -2170,7 +2305,6 @@ fn layout_table(
 
     // Pre-compute cached per-row git statuses for `ls -l` / file tables (skipping `git status` tables
     // that already display an explicit `status` column).
-    let file_entry_col = col_displays.iter().position(|&d| d == ColDisplay::FileEntry);
     let has_status_col = table.col_index("status").is_some();
     let table_git_statuses: Option<Vec<GitFileStatus>> = if !has_status_col
         && let Some(fc) = file_entry_col
@@ -2190,16 +2324,15 @@ fn layout_table(
         None
     };
 
-    // Pre-compute non-blocking progressive folder sizes via `#![no_std]` `blaze-dust` for any
-    // visible directory rows in `ll` / `ls -l` file tables!
-    let size_col_idx = col_displays.iter().position(|&d| d == ColDisplay::FileSize);
-    let mut row_dust: Vec<Option<blaze_dust::DustProgress>> = vec![None; visible_rows];
-    let mut dust_max_bytes: u64 = 0;
+    // Ensure scrolled-into-view directories beyond the initial 64-row window also trigger `blaze-dust`.
     if size_col_idx.is_some()
         && let Some(fc) = file_entry_col
     {
         for vis_i in 0..visible_rows {
             let r = row_order[first_row + vis_i];
+            if all_row_dust[r].is_some() {
+                continue;
+            }
             let fk = type_col_idx.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str);
             let raw = table
                 .cell(r, fc)
@@ -2213,7 +2346,7 @@ fn layout_table(
                     if prog.bytes > dust_max_bytes {
                         dust_max_bytes = prog.bytes;
                     }
-                    row_dust[vis_i] = Some(prog);
+                    all_row_dust[r] = Some(prog);
                 }
             }
         }
@@ -2237,6 +2370,9 @@ fn layout_table(
             let mut expanded_for_row: Vec<(usize, &Value<'_>)> = Vec::new();
             let mut rx = x0 + idx_w;
             for c in 0..ncols {
+                if !col_visible[c] {
+                    continue;
+                }
                 let cw = col_widths[c];
                 let content_w = (cw - col_gap).max(m.cw * 2.0);
                 let disp = col_displays[c];
@@ -2469,7 +2605,7 @@ fn layout_table(
                                     }
                                 };
                                 if row_is_dir {
-                                    if let Some(prog) = row_dust.get(vis_i).copied().flatten() {
+                                    if let Some(prog) = all_row_dust.get(r).copied().flatten() {
                                         if !prog.done && prog.bytes == 0 {
                                             let tx = rx + text_area_w - m.cw;
                                             scene.text(tx, ty, "…", theme::INK_4, false, false, clip_id);
@@ -2548,10 +2684,19 @@ fn layout_table(
                             }
                             ColDisplay::HumanTime => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));
-                                let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+                                let max_ch = ((content_w - 11.0).max(m.cw * 2.0) / m.cw).floor().max(2.0) as usize;
                                 let txt = truncate_chars(&raw, max_ch);
-                                let tx = rx + content_w - txt.chars().count() as f32 * m.cw;
-                                scene.text(tx, ty, txt, theme::INK_3, false, false, clip_id);
+                                let txt_w = txt.chars().count() as f32 * m.cw;
+                                let tx = rx + content_w - txt_w;
+                                if let Value::Date(dt) = cell {
+                                    let age_secs = (now_ns.saturating_sub(dt.utc_ns)).max(0) as u64 / 1_000_000_000;
+                                    let (txt_col, dot_col) = theme::recency_heat_color(age_secs);
+                                    let dot_x = (tx - 7.5).max(rx + 2.5);
+                                    scene.over_circle(dot_x, ty + m.ch * 0.52, 2.2, dot_col, clip_id);
+                                    scene.text(tx, ty, txt, txt_col, false, false, clip_id);
+                                } else {
+                                    scene.text(tx, ty, txt, theme::INK_3, false, false, clip_id);
+                                }
                             }
                             _ => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));

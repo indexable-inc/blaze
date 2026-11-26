@@ -294,6 +294,21 @@ pub fn bar_fraction(bytes: u64, max_bytes: u64) -> f32 {
     (num / den).clamp(0.0, 1.0) as f32
 }
 
+/// Pure `#![no_std]` $\log_2$-scale recency heat (`1.0` = just modified / red-hot, `0.0` = `>= 1 year` / cold).
+///
+/// Maps `age_secs` smoothly across orders of magnitude (`seconds -> minutes -> hours -> days ->
+/// weeks -> months -> year`) so `5h ago` and `3d ago` stand out clearly from `13d ago` and `6mo ago`.
+pub fn recency_heat(age_secs: u64) -> f32 {
+    const FLOOR_SECS: f64 = 60.0; // 1 minute anchor
+    const MAX_SECS: f64 = 365.0 * 86_400.0; // 1 year cold floor
+    let a = (age_secs as f64).min(MAX_SECS);
+    let lo = log2_pos(FLOOR_SECS);
+    let hi = log2_pos(MAX_SECS + FLOOR_SECS);
+    let cur = log2_pos(a + FLOOR_SECS);
+    let t = ((cur - lo) / (hi - lo)).clamp(0.0, 1.0);
+    (1.0 - t) as f32
+}
+
 /// Format `bytes` in IEC binary units (`8 B`, `44.9 KiB`, `43.9 MiB`, `2.1 GiB`, `1.4 TiB`) into `alloc`.
 pub fn format_iec_bytes_in<'a>(bytes: u64, alloc: Alloc<'a>) -> AString<'a> {
     use core::fmt::Write as _;
@@ -443,5 +458,16 @@ mod tests {
         assert_eq!(size_tier(92 * 1024), SizeTier::KiB);
         assert_eq!(size_tier(44 * 1024 * 1024), SizeTier::MiB);
         assert_eq!(size_tier(2 * 1024 * 1024 * 1024), SizeTier::GiB);
+
+        // Log-scale recency heatmap is strictly decreasing with age.
+        let h_now = recency_heat(0);
+        let h_5m = recency_heat(300);
+        let h_5h = recency_heat(5 * 3600);
+        let h_3d = recency_heat(3 * 86_400);
+        let h_13d = recency_heat(13 * 86_400);
+        let h_1y = recency_heat(365 * 86_400);
+        assert_eq!(h_now, 1.0);
+        assert!(h_now > h_5m && h_5m > h_5h && h_5h > h_3d && h_3d > h_13d && h_13d > h_1y);
+        assert_eq!(h_1y, 0.0);
     }
 }

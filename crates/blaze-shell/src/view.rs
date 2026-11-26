@@ -225,6 +225,7 @@ pub enum HitAction {
     ForkBlock(BlockId),
     ToggleFold(BlockId),
     ToggleTableView(BlockId),
+    ToggleHiddenCols(BlockId),
     SortTableColumn { block: BlockId, col: usize },
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
     SelectCompletion(usize),
