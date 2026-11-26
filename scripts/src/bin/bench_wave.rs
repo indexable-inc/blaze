@@ -30,7 +30,7 @@ The input is one JSON object (rule 42, unknown fields refused):
     trials        alternating A/B trials per workload (default 3, capped 1..=20)
     hello_world   path to hello-world fixture (default "/Volumes/Projects/tmp/hello-world")
     ripgrep       optional path to ripgrep checkout (benchmarks crates/regex cold + 1-file edit)
-    workloads     subset of ["smoke", "cold_hello", "mod500", "ripgrep", "build"]
+    workloads     subset of ["smoke", "cold_hello", "mod500", "ripgrep", "build", "noop_startup"]
                   (default ["smoke", "cold_hello", "mod500"])
     timeout_secs  per-command timeout in seconds (default 120, capped 1..=3600; rule 69)
 "#;
@@ -51,7 +51,14 @@ use blaze_script::{
 };
 
 const SCRIPT: &str = "bench_wave";
-const WORKLOADS: [&str; 5] = ["smoke", "cold_hello", "mod500", "ripgrep", "build"];
+const WORKLOADS: [&str; 6] = [
+    "smoke",
+    "cold_hello",
+    "mod500",
+    "ripgrep",
+    "build",
+    "noop_startup",
+];
 const DEFAULT_WORKLOADS: [&str; 3] = ["smoke", "cold_hello", "mod500"];
 const DEFAULT_HELLO_WORLD: &str = "/Volumes/Projects/tmp/hello-world";
 const DEFAULT_TRIALS: i64 = 3;
@@ -59,6 +66,9 @@ const MAX_TRIALS: i64 = 20;
 const DEFAULT_TIMEOUT_SECS: i64 = 120;
 const MAX_TIMEOUT_SECS: i64 = 3600;
 const MOD500_COUNT: usize = 500;
+const NOOP_STARTUP_RUNS: usize = 10;
+const REMOVE_RETRY_ATTEMPTS: usize = 5;
+const REMOVE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_COPY_DEPTH: usize = 64;
 const ERROR_TAIL_LINES: usize = 20;
 
@@ -229,19 +239,39 @@ struct WorkRoot {
     path: PathBuf,
 }
 
+/// Whether `err` is `ENOTEMPTY` (`DirectoryNotEmpty`, macOS os error 66, Linux os error 39).
+fn is_dir_not_empty(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || matches!(err.raw_os_error(), Some(66 | 39))
+}
+
 /// Recursively make a directory tree owner-writable (needed for read-only cloned toolchain/native
-/// directories) and remove it cleanly.
+/// directories) and remove it cleanly, retrying briefly when a detached background `blaze gc`
+/// leaves a transient `DirectoryNotEmpty` (os error 66).
 fn remove_tree_writable(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            let _ = std::process::Command::new("/bin/chmod")
-                .args(["-R", "u+w"])
-                .arg(path)
-                .status();
-            std::fs::remove_dir_all(path)
+    let mut chmod_done = false;
+    let mut retries = 0usize;
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && !chmod_done => {
+                chmod_done = true;
+                let _ = std::process::Command::new("/bin/chmod")
+                    .args(["-R", "u+w"])
+                    .arg(path)
+                    .status();
+            }
+            Err(err) if is_dir_not_empty(&err) && retries < REMOVE_RETRY_ATTEMPTS => {
+                retries += 1;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "bench_wave is a standalone script retrying temp-dir cleanup after a detached child exits"
+                )]
+                std::thread::sleep(REMOVE_RETRY_BACKOFF);
+            }
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -694,6 +724,111 @@ fn render_markdown(
                 ),
             );
         }
+    }
+    out
+}
+
+/// Aggregated results for the `"noop_startup"` workload (10 alternating warm no-op `blaze check`
+/// runs + 10 alternating `blaze --version` runs + binary sizes in bytes).
+#[derive(Debug, Clone)]
+struct NoopStartupSummary {
+    runs: usize,
+    check_row: RowSummary,
+    version_row: RowSummary,
+    old_bin_bytes: Option<u64>,
+    new_bin_bytes: u64,
+}
+
+fn format_mb(bytes: u64) -> String {
+    format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+}
+
+fn format_size_delta(old_bytes: u64, new_bytes: u64) -> String {
+    let delta_mb = (new_bytes as f64 - old_bytes as f64) / 1_000_000.0;
+    if old_bytes > 0 {
+        let pct = (new_bytes as f64 - old_bytes as f64) * 100.0 / (old_bytes as f64);
+        format!("{delta_mb:+.2} MB ({pct:+.1}%)")
+    } else {
+        format!("{delta_mb:+.2} MB")
+    }
+}
+
+/// Render the concise `"noop_startup"` summary (high-precision median ms, speedup, and binary size
+/// in MB).
+fn render_noop_startup_section(
+    platform: &str,
+    cores: usize,
+    summary: &NoopStartupSummary,
+) -> String {
+    let mut out = String::new();
+    let runs = summary.runs;
+    if let (Some(old_check), Some(old_ver), Some(old_bytes)) = (
+        summary.check_row.old,
+        summary.version_row.old,
+        summary.old_bin_bytes,
+    ) {
+        push_line(
+            &mut out,
+            format_args!(
+                "## No-op Startup & Binary Size ({platform}, {cores} cores, {runs} alternating runs)"
+            ),
+        );
+        out.push('\n');
+        out.push_str("| Metric | Old | New | Speedup / Delta |\n");
+        out.push_str("|---|---:|---:|---:|\n");
+        let check_sp = speedup(old_check.wall_ms, summary.check_row.new.wall_ms)
+            .map_or_else(|| "-".to_owned(), |s| format!("{s:.2}x"));
+        let ver_sp = speedup(old_ver.wall_ms, summary.version_row.new.wall_ms)
+            .map_or_else(|| "-".to_owned(), |s| format!("{s:.2}x"));
+        push_line(
+            &mut out,
+            format_args!(
+                "| warm no-op `blaze check` (median) | {:.2} ms | {:.2} ms | {check_sp} |",
+                old_check.wall_ms, summary.check_row.new.wall_ms
+            ),
+        );
+        push_line(
+            &mut out,
+            format_args!(
+                "| `blaze --version` (median) | {:.2} ms | {:.2} ms | {ver_sp} |",
+                old_ver.wall_ms, summary.version_row.new.wall_ms
+            ),
+        );
+        push_line(
+            &mut out,
+            format_args!(
+                "| binary size | {} | {} | {} |",
+                format_mb(old_bytes),
+                format_mb(summary.new_bin_bytes),
+                format_size_delta(old_bytes, summary.new_bin_bytes),
+            ),
+        );
+    } else {
+        push_line(
+            &mut out,
+            format_args!("## No-op Startup & Binary Size ({platform}, {cores} cores, {runs} runs)"),
+        );
+        out.push('\n');
+        out.push_str("| Metric | New |\n");
+        out.push_str("|---|---:|\n");
+        push_line(
+            &mut out,
+            format_args!(
+                "| warm no-op `blaze check` (median) | {:.2} ms |",
+                summary.check_row.new.wall_ms
+            ),
+        );
+        push_line(
+            &mut out,
+            format_args!(
+                "| `blaze --version` (median) | {:.2} ms |",
+                summary.version_row.new.wall_ms
+            ),
+        );
+        push_line(
+            &mut out,
+            format_args!("| binary size | {} |", format_mb(summary.new_bin_bytes)),
+        );
     }
     out
 }
@@ -1502,6 +1637,159 @@ fn bench_build(
     })
 }
 
+struct NoopSide {
+    proj_dir: PathBuf,
+    log_dir: PathBuf,
+    env: Vec<(&'static str, OsString)>,
+}
+
+fn setup_noop_side(
+    base_dir: &Path,
+    tag: &str,
+    bin: &Path,
+    hello_fixture: &Path,
+    host_env: &HostEnv,
+    timeout: Duration,
+) -> Result<NoopSide, String> {
+    let side_dir = base_dir.join(tag);
+    let iso_home = side_dir.join("home");
+    let proj_dir = side_dir.join("proj");
+    let log_dir = side_dir.join("logs");
+    seed_isolated_home(&host_env.user_home, &iso_home, timeout)?;
+    copy_tree_excluding(hello_fixture, &proj_dir, &[".blaze", "target"], 0)?;
+    let env = host_env.child_env(&iso_home);
+    // Warmup outside timing to populate this binary's store & certificate.
+    let _warmup = measure_blaze(
+        bin,
+        &["check"],
+        &proj_dir,
+        &[proj_dir.as_path()],
+        &env,
+        &log_dir.join("warmup"),
+        timeout,
+        &format!("noop_startup warmup [{tag}]"),
+    )?;
+    Ok(NoopSide { proj_dir, log_dir, env })
+}
+
+fn bench_noop_startup(
+    old_bin: Option<&Path>,
+    new_bin: &Path,
+    hello_fixture: &Path,
+    work_root: &Path,
+    host_env: &HostEnv,
+    timeout: Duration,
+) -> Result<NoopStartupSummary, String> {
+    if !hello_fixture.is_dir() {
+        return Err(format!(
+            "hello_world fixture directory does not exist: {}",
+            hello_fixture.display()
+        ));
+    }
+    let new_bin_bytes = std::fs::metadata(new_bin)
+        .map_err(|e| format!("failed to stat new binary {}: {e}", new_bin.display()))?
+        .len();
+    let old_bin_bytes = match old_bin {
+        Some(bin) => Some(
+            std::fs::metadata(bin)
+                .map_err(|e| format!("failed to stat old binary {}: {e}", bin.display()))?
+                .len(),
+        ),
+        None => None,
+    };
+
+    let work_bytes = count_rust_bytes(hello_fixture, 0);
+    let base_dir = work_root.join("noop_startup");
+    // Each side gets its own isolated home & warmed checkout so differing `build_id`s between
+    // `old` and `new` never invalidate each other's standing certificate during alternating runs.
+    let old_side = match old_bin {
+        Some(bin) => Some(setup_noop_side(&base_dir, "old", bin, hello_fixture, host_env, timeout)?),
+        None => None,
+    };
+    let new_side = setup_noop_side(&base_dir, "new", new_bin, hello_fixture, host_env, timeout)?;
+
+    let mut old_check = Vec::with_capacity(NOOP_STARTUP_RUNS);
+    let mut new_check = Vec::with_capacity(NOOP_STARTUP_RUNS);
+    for run in 0..NOOP_STARTUP_RUNS {
+        for &side in trial_order(run, old_bin.is_some()) {
+            let (bin, side_env) = match side {
+                Side::Old => (
+                    old_bin.ok_or_else(|| "missing old binary".to_owned())?,
+                    old_side.as_ref().ok_or_else(|| "missing old noop side".to_owned())?,
+                ),
+                Side::New => (new_bin, &new_side),
+            };
+            let sample = measure_blaze(
+                bin,
+                &["check"],
+                &side_env.proj_dir,
+                &[side_env.proj_dir.as_path()],
+                &side_env.env,
+                &side_env.log_dir.join(format!("check-{run}")),
+                timeout,
+                &format!("noop_startup check[r{run} {}]", side.tag()),
+            )?;
+            match side {
+                Side::Old => old_check.push(sample),
+                Side::New => new_check.push(sample),
+            }
+        }
+    }
+
+    let mut old_version = Vec::with_capacity(NOOP_STARTUP_RUNS);
+    let mut new_version = Vec::with_capacity(NOOP_STARTUP_RUNS);
+    for run in 0..NOOP_STARTUP_RUNS {
+        for &side in trial_order(run, old_bin.is_some()) {
+            let (bin, side_env) = match side {
+                Side::Old => (
+                    old_bin.ok_or_else(|| "missing old binary".to_owned())?,
+                    old_side.as_ref().ok_or_else(|| "missing old noop side".to_owned())?,
+                ),
+                Side::New => (new_bin, &new_side),
+            };
+            let sample = measure_blaze(
+                bin,
+                &["--version"],
+                &side_env.proj_dir,
+                &[],
+                &side_env.env,
+                &side_env.log_dir.join(format!("version-{run}")),
+                timeout,
+                &format!("noop_startup --version[r{run} {}]", side.tag()),
+            )?;
+            match side {
+                Side::Old => old_version.push(sample),
+                Side::New => new_version.push(sample),
+            }
+        }
+    }
+
+    if let Err(err) = remove_tree_writable(&base_dir) {
+        write_stderr(&format!(
+            "{SCRIPT}: warning: failed to clean {}: {err}\n",
+            base_dir.display()
+        ));
+    }
+
+    Ok(NoopStartupSummary {
+        runs: NOOP_STARTUP_RUNS,
+        check_row: RowSummary {
+            workload: "noop_startup (warm check)".to_owned(),
+            work_bytes,
+            old: old_bin.map(|_| summarize_samples(&old_check)),
+            new: summarize_samples(&new_check),
+        },
+        version_row: RowSummary {
+            workload: "noop_startup (--version)".to_owned(),
+            work_bytes: 0,
+            old: old_bin.map(|_| summarize_samples(&old_version)),
+            new: summarize_samples(&new_version),
+        },
+        old_bin_bytes,
+        new_bin_bytes,
+    })
+}
+
 fn canonical_binary(label: &str, raw: &str) -> Result<PathBuf, String> {
     let path = std::fs::canonicalize(raw)
         .map_err(|e| format!("{label} binary `{raw}` not accessible: {e}"))?;
@@ -1525,6 +1813,7 @@ fn run_wave_inner(args: &Args, work_root: &WorkRoot) -> Result<i32, String> {
     let workloads = args.effective_workloads();
 
     let mut smoke_steps: Option<Vec<SmokeStep>> = None;
+    let mut noop_startup: Option<NoopStartupSummary> = None;
     let mut rows: Vec<RowSummary> = Vec::new();
     let mut exit_code = 0i32;
 
@@ -1597,6 +1886,19 @@ fn run_wave_inner(args: &Args, work_root: &WorkRoot) -> Result<i32, String> {
                     timeout,
                 )?);
             }
+            "noop_startup" => {
+                let summary = bench_noop_startup(
+                    old_bin.as_deref(),
+                    &new_bin,
+                    hello_fixture,
+                    work_root.path(),
+                    &host_env,
+                    timeout,
+                )?;
+                rows.push(summary.check_row.clone());
+                rows.push(summary.version_row.clone());
+                noop_startup = Some(summary);
+            }
             other => {
                 return Err(format!("unknown workload `{other}`"));
             }
@@ -1615,6 +1917,12 @@ fn run_wave_inner(args: &Args, work_root: &WorkRoot) -> Result<i32, String> {
             &new_display,
             &rows,
         ));
+    }
+    if let Some(summary) = &noop_startup {
+        if !report.is_empty() {
+            report.push('\n');
+        }
+        report.push_str(&render_noop_startup_section(&platform, cores, summary));
     }
     if let Some(steps) = &smoke_steps {
         if !report.is_empty() {
@@ -1674,7 +1982,7 @@ fn run_selftest_cases() {
             "trials": 7,
             "hello_world": "/custom/hw",
             "ripgrep": "/custom/rg",
-            "workloads": ["smoke", "cold_hello", "mod500", "ripgrep", "build"],
+            "workloads": ["smoke", "cold_hello", "mod500", "ripgrep", "build", "noop_startup"],
             "timeout_secs": 45
         }"#,
     )
@@ -1685,9 +1993,17 @@ fn run_selftest_cases() {
             && full.trials == 7
             && full.hello_world == "/custom/hw"
             && full.ripgrep.as_deref() == Some("/custom/rg")
-            && full.workloads == ["smoke", "cold_hello", "mod500", "ripgrep", "build"]
+            && full.workloads
+                == ["smoke", "cold_hello", "mod500", "ripgrep", "build", "noop_startup"]
             && full.timeout_secs == 45,
-        "full A/B JSON input parses every field",
+        "full A/B JSON input parses every field including noop_startup",
+    );
+
+    let noop_only = parse_args_json(r#"{"new": "/b/blaze", "workloads": ["noop_startup"]}"#)
+        .unwrap_or_else(|e| fail(SCRIPT, &format!("noop_startup input failed: {}", e.0)));
+    check(
+        noop_only.workloads == ["noop_startup"],
+        "noop_startup workload parses standalone",
     );
 
     let unknown_err = parse_args_json(r#"{"new": "/b/blaze", "unknown_flag": 1}"#);
@@ -1843,6 +2159,57 @@ Names ran 0.0 s beside Scripts
         "single-binary markdown table omits baseline columns",
     );
 
+    let noop_ab = NoopStartupSummary {
+        runs: NOOP_STARTUP_RUNS,
+        check_row: RowSummary {
+            workload: "noop_startup (warm check)".to_owned(),
+            work_bytes: 120,
+            old: Some(SideSummary { wall_ms: 18.4, peak_rss_bytes: 12_000_000, ..SideSummary::default() }),
+            new: SideSummary { wall_ms: 9.2, peak_rss_bytes: 10_000_000, ..SideSummary::default() },
+        },
+        version_row: RowSummary {
+            workload: "noop_startup (--version)".to_owned(),
+            work_bytes: 0,
+            old: Some(SideSummary { wall_ms: 3.1, peak_rss_bytes: 4_000_000, ..SideSummary::default() }),
+            new: SideSummary { wall_ms: 1.55, peak_rss_bytes: 3_500_000, ..SideSummary::default() },
+        },
+        old_bin_bytes: Some(52_400_000),
+        new_bin_bytes: 48_100_000,
+    };
+    let noop_md_ab = render_noop_startup_section("macos-aarch64", 16, &noop_ab);
+    check(
+        noop_md_ab.contains("10 alternating runs")
+            && noop_md_ab.contains("| warm no-op `blaze check` (median) | 18.40 ms | 9.20 ms | 2.00x |")
+            && noop_md_ab.contains("| `blaze --version` (median) | 3.10 ms | 1.55 ms | 2.00x |")
+            && noop_md_ab.contains("| binary size | 52.40 MB | 48.10 MB | -4.30 MB (-8.2%) |"),
+        &format!("noop_startup A/B section formats medians, speedups, and binary sizes:\n{noop_md_ab}"),
+    );
+
+    let noop_single = NoopStartupSummary {
+        runs: NOOP_STARTUP_RUNS,
+        check_row: RowSummary { old: None, ..noop_ab.check_row.clone() },
+        version_row: RowSummary { old: None, ..noop_ab.version_row.clone() },
+        old_bin_bytes: None,
+        new_bin_bytes: 48_100_000,
+    };
+    let noop_md_single = render_noop_startup_section("linux-aarch64", 128, &noop_single);
+    check(
+        noop_md_single.contains("10 runs")
+            && noop_md_single.contains("| warm no-op `blaze check` (median) | 9.20 ms |")
+            && noop_md_single.contains("| `blaze --version` (median) | 1.55 ms |")
+            && noop_md_single.contains("| binary size | 48.10 MB |")
+            && !noop_md_single.contains("Speedup"),
+        &format!("noop_startup single-binary section omits baseline columns:\n{noop_md_single}"),
+    );
+
+    check(
+        is_dir_not_empty(&std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty))
+            && is_dir_not_empty(&std::io::Error::from_raw_os_error(66))
+            && is_dir_not_empty(&std::io::Error::from_raw_os_error(39))
+            && !is_dir_not_empty(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        "is_dir_not_empty recognizes DirectoryNotEmpty and macOS/Linux ENOTEMPTY",
+    );
+
     let quote = render_smoke_quote(
         "/new/blaze",
         "macos-aarch64",
@@ -1889,6 +2256,9 @@ Names ran 0.0 s beside Scripts
         && mod_dir.join("src").join("lib.rs").is_file()
         && mod_dir.join("src").join("m004.rs").is_file()
         && count_rust_bytes(&mod_dir, 0) > 0;
+    let removed_ok = remove_tree_writable(&mod_dir).is_ok()
+        && !mod_dir.exists()
+        && remove_tree_writable(&mod_dir).is_ok();
     drop(tmp);
 
     check(
@@ -1897,6 +2267,7 @@ Names ran 0.0 s beside Scripts
         &format!("hanging child is killed at timeout ({ended:?}, elapsed {elapsed:?})"),
     );
     check(generated_ok, "mod500 fixture generator writes valid crate layout");
+    check(removed_ok, "remove_tree_writable removes populated and already-absent directories");
 }
 
 fn selftest() {

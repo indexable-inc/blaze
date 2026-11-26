@@ -6,6 +6,12 @@ lint = "clippy --all-targets -- --cap-lints warn"
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
 
+# Rust defaults to `MACOSX_DEPLOYMENT_TARGET=11.0`, emitting legacy opcode `LC_DYLD_INFO_ONLY`
+# which forces dyld to eagerly rebase ~49,830 pointers before `main()`. Passing `-Wl,-fixup_chains`
+# emits `LC_DYLD_CHAINED_FIXUPS` for XNU lazy page-in linking, cutting warm and cold startup time.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-fixup_chains"]
+
 # Frame pointers on Linux, for bstd's sampler (D178, telemetry/sampler.rs "Frame pointers"):
 # its walk follows the frame-pointer chain, and rustc omits it there by default. About 1 to 2%
 # in speed and a little code size (one register kept, a push and pop a call). arm64 macOS keeps

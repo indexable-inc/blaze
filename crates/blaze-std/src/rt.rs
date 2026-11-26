@@ -130,9 +130,16 @@ pub fn run_with_heap_at<R: Outcome>(
         let args = ArgList::process(block);
         // clone: the arguments' list (a borrow of the start block), read once by `level`.
         let chosen = level(&crate::args::Args::new(args.clone()));
-        let io = open_native(os, args, Vars::process(block), start_dir(), u8::MAX)?;
         let alloc = heap.shared();
-        Ok((with_telemetry(io, chosen, alloc)?, AtExit { level: chosen, alloc }))
+        let io = open_native_with_telemetry(
+            os,
+            args,
+            Vars::process(block),
+            start_dir(),
+            u8::MAX,
+            Some(TelemetryOpts { level: chosen, alloc }),
+        )?;
+        Ok((io, AtExit { level: chosen, alloc }))
     });
     let (world, at_exit) = match world {
         Ok((io, at_exit)) => (Ok(io), Some(at_exit)),
@@ -141,16 +148,12 @@ pub fn run_with_heap_at<R: Outcome>(
     run_io_with(world, at_exit, move |cx, io| main(cx, io, heap))
 }
 
-/// `io` over a `Workers` of the same setup whose cells keep telemetry at `level` in `alloc`
-/// (the bare one `open_native` made is dropped: one sparse reservation, nothing backed).
-fn with_telemetry(io: Io, level: crate::telemetry::Level, alloc: blaze_own::SharedAlloc<'static>) -> Result<Io, String> {
-    let setup = io.workers().setup();
-    // alloc: an error's message.
-    let mut opts = crate::workers::WorkersOpts::new(setup).map_err(|error| error.to_string())?;
-    opts.telemetry(level, alloc);
-    // alloc: an error's message.
-    let workers = crate::workers::Workers::new(opts).map_err(|error| error.to_string())?;
-    Ok(io.on_workers(workers))
+/// Telemetry registration passed into [`open_native_with_telemetry`] so the world's
+/// [`Workers`](crate::workers::Workers) reservation is constructed once with telemetry configured.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TelemetryOpts {
+    pub(crate) level: crate::telemetry::Level,
+    pub(crate) alloc: blaze_own::SharedAlloc<'static>,
 }
 
 /// What the runtime does with the run's telemetry when it ends: the level the cells keep and
@@ -245,7 +248,7 @@ pub fn run_with_workers<S, R: Outcome>(
         crate::workers::Workers::new(opts).map(|workers| (workers, keys))
     });
     let (world, keys) = match made {
-        Ok((workers, keys)) => (native(os).map(|io| io.on_workers(workers)), Some(keys)),
+        Ok((workers, keys)) => (native_on(os, workers), Some(keys)),
         // alloc: an error's message, once.
         Err(error) => (Err(error.to_string()), None),
     };
@@ -546,8 +549,35 @@ mod machine {
 
     /// Native file-IO thread count for this host (`4..=16`, spawning no threads here).
     pub(super) fn file_threads() -> usize {
-        let cores = read().map_or(FILE_THREADS, |topology| topology.workers() as usize);
-        file_threads_for(cores)
+        file_threads_for(logical_cpus())
+    }
+
+    /// Logical CPU count allowed for this process via one `sched_getaffinity(2)` call (no sysfs
+    /// cache walk or heap allocation at process start).
+    #[cfg(target_os = "linux")]
+    pub(super) fn logical_cpus() -> usize {
+        let mut mask = [0u8; linux::SET_BYTES];
+        // SAFETY: `mask` is `SET_BYTES` writable bytes, the size passed; 0 is this thread.
+        if unsafe { linux::sched_getaffinity(0, linux::SET_BYTES, mask.as_mut_ptr()) } != 0 {
+            return FILE_THREADS;
+        }
+        let mut count = 0usize;
+        for byte in mask {
+            count = count.saturating_add(usize::try_from(byte.count_ones()).unwrap_or(0));
+        }
+        count
+    }
+
+    /// Logical CPU count via a single `hw.logicalcpu` sysctl (no `Topology` allocation or
+    /// per-perflevel sysctl walk at process start).
+    #[cfg(target_os = "macos")]
+    pub(super) fn logical_cpus() -> usize {
+        sysctl(c"hw.logicalcpu").ok().and_then(|n| usize::try_from(n).ok()).unwrap_or(FILE_THREADS)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn logical_cpus() -> usize {
+        FILE_THREADS
     }
 
     fn failed(what: &'static str, why: impl core::fmt::Display) -> TopologyError {
@@ -851,6 +881,7 @@ mod machine {
             assert_eq!(unsafe { darwin::pthread_set_qos_class_self_np(darwin::QOS_USER_INITIATED, 0) }, 0);
             let topology = super::read().expect("the machine's performance levels");
             assert!(topology.workers() >= 1, "at least one core");
+            assert!(super::logical_cpus() >= 1, "hw.logicalcpu reports at least one core");
         }
     }
 }
@@ -859,6 +890,20 @@ mod machine {
 fn native(os: &blaze_core::Os) -> Result<Io, String> {
     let block = process_start()?;
     open_native(os, ArgList::process(block), Vars::process(block), start_dir(), u8::MAX)
+}
+
+type StartError = String;
+
+fn fmt_start_err(error: impl core::fmt::Display) -> StartError {
+    // alloc: an error's message.
+    error.to_string()
+}
+
+/// The process's world over pre-built `workers`, made with the root of real-OS authority `os`,
+/// without constructing a throwaway bare [`Workers`](crate::workers::Workers) reservation first.
+fn native_on(os: &blaze_core::Os, workers: crate::workers::Workers) -> Result<Io, StartError> {
+    let block = process_start()?;
+    open_native_on(os, ArgList::process(block), Vars::process(block), start_dir(), u8::MAX, Some(workers))
 }
 
 /// The root of a world over the directory the process was started in: `.`, so the start reads
@@ -893,6 +938,39 @@ pub(crate) fn process_start() -> Result<&'static block::Block, String> {
 /// read `above` folders above `root` (`u8::MAX`: up to the filesystem's root). Made with the
 /// root of real-OS authority `os`, handed down from the entry.
 pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &RootPath, above: u8) -> Result<Io, String> {
+    open_native_on(os, args, env, root, above, None)
+}
+
+/// [`open_native`] with optional [`TelemetryOpts`] registered directly on the world's
+/// [`Workers`](crate::workers::Workers) so startup makes one reservation instead of two.
+pub(crate) fn open_native_with_telemetry(
+    os: &blaze_core::Os,
+    args: ArgList,
+    env: Vars,
+    root: &RootPath,
+    above: u8,
+    telemetry: Option<TelemetryOpts>,
+) -> Result<Io, StartError> {
+    let workers = match telemetry {
+        Some(telemetry) => {
+            let setup = crate::workers::WorkersSetup { limits: crate::workers::Limits::BARE, seed: None, models: 0 };
+            let mut opts = crate::workers::WorkersOpts::new(setup).map_err(fmt_start_err)?;
+            opts.telemetry(telemetry.level, telemetry.alloc);
+            Some(crate::workers::Workers::new(opts).map_err(fmt_start_err)?)
+        }
+        None => None,
+    };
+    open_native_on(os, args, env, root, above, workers)
+}
+
+fn open_native_on(
+    os: &blaze_core::Os,
+    args: ArgList,
+    env: Vars,
+    root: &RootPath,
+    above: u8,
+    workers: Option<crate::workers::Workers>,
+) -> Result<Io, StartError> {
     // Global `Trace` recording is off by default (`Limits::QUIET`, lock-free fast-path) so
     // `Cx::span` / `Cx::event` never contend on the global world lock in production runs; set
     // `BLAZE_TRACE=1` (any non-empty value other than `0`) to capture global trace records.
@@ -912,8 +990,12 @@ pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &
         seed: None,
         limits,
     };
+    let opened = match workers {
+        Some(workers) => Io::native_in_on(os, world, workers),
+        None => Io::native_in(os, world),
+    };
     // alloc: an error's message.
-    Io::native_in(os, world).map_err(|error| error.to_string())
+    opened.map_err(|error| error.to_string())
 }
 
 /// `said` on standard error, as `error: <said>` and a line feed. A standard error that
@@ -1072,4 +1154,44 @@ mod owns {
     // SAFETY: a `LazyLock` holds its initializer `F` and then its value `T` in place, the
     // one replaced by the other through a shared reference on first use.
     unsafe impl<T, F> Owns<Mutably> for LazyLock<T, F> {}
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+    #[test]
+    fn open_native_with_telemetry_configures_workers_in_one_shot() {
+        use super::{ArgList, TelemetryOpts, Vars, open_native_with_telemetry, start_dir};
+
+        let bare = open_native_with_telemetry(
+            blaze_core::testing::os(),
+            ArgList::given(alloc::vec::Vec::new()),
+            Vars::given(alloc::vec::Vec::new()),
+            start_dir(),
+            0,
+            None,
+        )
+        .expect("bare native world");
+        let bare_lease = bare.workers().lease().expect("bare caller cell");
+        let mut bare_held = bare.workers().hold(bare_lease.id()).expect("hold bare cell");
+        assert!(bare_held.worker().telemetry().is_none(), "bare native world has no telemetry cell");
+        drop((bare_held, bare_lease));
+
+        let with_tel = open_native_with_telemetry(
+            blaze_core::testing::os(),
+            ArgList::given(alloc::vec::Vec::new()),
+            Vars::given(alloc::vec::Vec::new()),
+            start_dir(),
+            0,
+            Some(TelemetryOpts {
+                level: crate::telemetry::Level::Spans,
+                alloc: blaze_own::testing::heap().shared(),
+            }),
+        )
+        .expect("telemetry native world");
+        let tel_lease = with_tel.workers().lease().expect("telemetry caller cell");
+        let mut tel_held = with_tel.workers().hold(tel_lease.id()).expect("hold telemetry cell");
+        assert!(tel_held.worker().telemetry().is_some(), "single-shot native world keeps telemetry cell");
+        drop((tel_held, tel_lease));
+    }
 }

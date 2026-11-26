@@ -1103,6 +1103,19 @@ pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
     u64::from_le_bytes(first)
 }
 
+/// How [`after_answer_printed_with`] disposes of the closed store once commits and lease release
+/// are complete.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreTeardown {
+    /// Normal `Drop`: unmap read-only segments and free store tables. Always used in tests,
+    /// simulated worlds, multi-check commands (`--fix`), and whenever background GC is spawned.
+    Drop,
+    /// On a one-shot native CLI process about to exit (after all commits/unlocks and when no
+    /// background GC is pending), skip tearing down read-only segment mappings and store tables
+    /// via `core::mem::forget` so the kernel reclaims them in one shot at process exit.
+    ForgetForExit,
+}
+
 /// After the answer is printed, once every handle over `lent` is gone: the ONE commit of this
 /// command's records and roots ([`plain_place::after_answer`]), and with `stats` its line on
 /// `err`: the commit's time, and the time from the answer's last byte to the store's last
@@ -1113,11 +1126,25 @@ pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
 /// other forms under `home` (D160, clean.rs `sweep_other_forms`): one unused past forms.rs
 /// `EXPIRY_DAYS` is removed and said; this blaze's own folder never is.
 pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool, clock: &Clock, err: &Out) -> Result<roots::CleanupLine, CliError> {
+    after_answer_printed_with(cx, lent, home, stats, StoreTeardown::Drop, clock, err)
+}
+
+/// [`after_answer_printed`] with an explicit [`StoreTeardown`] policy.
+pub fn after_answer_printed_with(
+    cx: &Cx,
+    lent: CommandLent,
+    home: &Home,
+    stats: bool,
+    teardown: StoreTeardown,
+    clock: &Clock,
+    err: &Out,
+) -> Result<roots::CleanupLine, CliError> {
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let answered = ns(clock);
     // Queue lease release (if this process held one) before testing whether a commit is owed.
     lent.release_lease();
     let bg_detached = home.bg_gc.is_detached();
+    let forget_for_exit = !cfg!(test) && !cx.is_simulated() && teardown == StoreTeardown::ForgetForExit;
     // On a native host with detached background GC, commit immediately with 0 foreground slices
     // (1 flip, 0 seal barriers, full foreground QoS) and spawn detached `blaze gc --background`
     // only when `Driven::needs_bg_gc` fires (urgent triggers immediately, or unsealed segments
@@ -1148,10 +1175,21 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
             let now_ns = lent.wall_ns();
             let driven = lent.into_store();
             let due = driven.needs_bg_gc(now_ns);
-            drop(driven);
+            if !due && forget_for_exit {
+                // Zero writes committed (no lock ever acquired) and no background GC pending on
+                // this one-shot native CLI exit: let the kernel reclaim read-only segment
+                // mappings and store heap tables at process exit.
+                core::mem::forget(driven);
+            } else {
+                drop(driven);
+            }
             due
         } else {
-            drop(lent);
+            if forget_for_exit {
+                core::mem::forget(lent);
+            } else {
+                drop(lent);
+            }
             false
         };
         (after, commit_ns, spawn_bg)
@@ -1164,10 +1202,21 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
             let now_ns = lent.wall_ns();
             let driven = lent.into_store();
             let due = driven.needs_bg_gc(now_ns);
-            drop(driven);
+            if !due && forget_for_exit {
+                // `plain_place::after_answer` already committed and released `flip.lock`, and no
+                // background GC is pending on this one-shot native CLI exit: skip unmapping
+                // read-only segments and freeing store tables.
+                core::mem::forget(driven);
+            } else {
+                drop(driven);
+            }
             due
         } else {
-            drop(lent);
+            if forget_for_exit {
+                core::mem::forget(lent);
+            } else {
+                drop(lent);
+            }
             false
         };
         (after, commit_ns, spawn_bg)

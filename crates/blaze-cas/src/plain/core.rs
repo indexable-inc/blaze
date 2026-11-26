@@ -2083,6 +2083,9 @@ enum Phase<A: Allocator + Clone> {
     /// The maps are in and some of an earlier boot failed: the directory is listed to tell a
     /// file a power cut took from one that failed to map.
     CheckMaps { then: Then },
+    /// Deferred `bloom` sidecar map in flight; once mapped and indexed, resumes readiness or a
+    /// parked targeted commit key-map / flip.
+    LoadingBloom,
     Ready,
     Writing(Box<Writing<A>>, Box<Why<A>>),
     /// A streamed copy's temporary file renamed to its digest's name, before its sync.
@@ -2151,6 +2154,10 @@ pub struct Plain<A: Allocator + Clone> {
     bloom_file: FileName,
     bloom: BloomIndex,
     bloom_loading: bool,
+    bloom_deferred: bool,
+    bloom_probe_get: Option<u64>,
+    bloom_parked_keys: Option<blaze_own::Vec<(Namespace, [u8; 32]), A>>,
+    bloom_parked_flip: Option<Change<A>>,
     open_parked: Option<OpenParked>,
     /// Framed Bloom records built for segments and large indexed roots written by this process,
     /// awaiting flip.
@@ -2624,6 +2631,10 @@ impl<A: Allocator + Clone> Plain<A> {
             bloom_file: name(BLOOM),
             bloom: BloomIndex::new(),
             bloom_loading: false,
+            bloom_deferred: false,
+            bloom_probe_get: None,
+            bloom_parked_keys: None,
+            bloom_parked_flip: None,
             open_parked: None,
             pending_bloom: blaze_own::Vec::new_in(BLOOM_ALLOC),
             replaced_index_hints: blaze_own::Vec::new_in(a()),
@@ -2854,6 +2865,50 @@ impl<A: Allocator + Clone> Plain<A> {
         self.prefixed_hex_file(b"/bloom-tmp-", id)
     }
 
+    /// Emits a deferred `BLOOM_MAP` effect if `bloom` was skipped at lazy open (`!self.eager`)
+    /// and is not already in flight.
+    fn request_deferred_bloom<E: Allocator>(&mut self, effects: &mut EffectBuf<E>) -> bool {
+        if !self.bloom_deferred || self.bloom_loading {
+            return false;
+        }
+        self.bloom_deferred = false;
+        self.bloom_loading = true;
+        effects.push(Effect::Map {
+            file: self.bloom_file.share(),
+            extent: Extent::Whole,
+            tag: self.tag(BLOOM_MAP, 0),
+        });
+        true
+    }
+
+    /// Whether `row` matches the active creation-generation locality hint (`self.hint_gen`).
+    fn is_hinted_row(&self, row: usize) -> bool {
+        let Some(target_gen) = self.hint_gen else {
+            return false;
+        };
+        self.manifest.segments.get(row).is_some_and(|seg| seg.generation == target_gen)
+    }
+
+    /// Whether more than one non-empty local segment in the current manifest is still unmapped.
+    fn has_multiple_unmapped_local(&self) -> bool {
+        let mut found = 0u8;
+        for seg in &self.manifest.segments {
+            if !seg.local
+                || seg.count == 0
+                || self.by_id.contains_key(&seg.id)
+                || self.dropped.contains(&seg.id)
+                || self.unchecked.contains_key(&seg.id)
+            {
+                continue;
+            }
+            found += 1;
+            if found > 1 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Formats `seg-<id>` once into a [`FileName`], caches a shared handle in
     /// `self.pending_map_files[row]` so [`Plain::on_map`] avoids re-allocating it, and appends
     /// the [`Effect::Map`].
@@ -2867,6 +2922,14 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         let idx = u32::try_from(row).unwrap_or(u32::MAX);
         effects.push(Effect::Map { file, extent: Extent::Whole, tag: self.tag(MAP, idx) });
+        if self.bloom_deferred && !self.is_hinted_row(row) && self.has_multiple_unmapped_local() {
+            let get_id = self.probes.gets;
+            if self.bloom_probe_get == Some(get_id) {
+                let _ = self.request_deferred_bloom(effects);
+            } else {
+                self.bloom_probe_get = Some(get_id);
+            }
+        }
     }
 
     /// Pre-reserves per-segment tables for `additional` upcoming `Effect::Map`s so `map_all` /
@@ -2875,6 +2938,7 @@ impl<A: Allocator + Clone> Plain<A> {
         if additional == 0 {
             return;
         }
+        let _ = self.request_deferred_bloom(effects);
         effects.reserve(additional);
         self.maps.reserve(additional);
         self.by_id.reserve(additional);
@@ -3380,6 +3444,8 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     fn stop(&mut self, why: StoreError) {
+        self.bloom_parked_keys = None;
+        self.bloom_parked_flip = None;
         self.broken = Some(why);
         self.phase = Phase::Broken;
     }
@@ -4008,6 +4074,22 @@ impl<A: Allocator + Clone> Plain<A> {
         if keys.is_empty() {
             return Ok(false);
         }
+        if self.bloom_deferred {
+            let has_unmapped = self.manifest.segments.iter().any(|s| {
+                s.local
+                    && s.count > 0
+                    && !self.by_id.contains_key(&s.id)
+                    && !self.dropped.contains(&s.id)
+            });
+            if has_unmapped {
+                let mut parked: blaze_own::Vec<(Namespace, [u8; 32]), A> = self.own_vec_cap(keys.len());
+                parked.extend_from_slice(keys);
+                self.bloom_parked_keys = Some(parked);
+                let _ = self.request_deferred_bloom(effects);
+                self.phase = Phase::LoadingBloom;
+                return Ok(true);
+            }
+        }
         let all_ns = self.plant() == Plant::IgnoresNamespace;
         let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
         let late = now_ns.saturating_sub(self.opened_ns) > GRACE_NS;
@@ -4193,6 +4275,11 @@ impl<A: Allocator + Clone> Plain<A> {
             .iter()
             .any(|s| s.local && s.count > 0 && !self.by_id.contains_key(&s.id) && !self.dropped.contains(&s.id));
         if !has_unmapped_local {
+            if self.bloom_deferred {
+                let _ = self.request_deferred_bloom(effects);
+                self.phase = Phase::LoadingBloom;
+                return Ok(CommitRootMap::Mapped);
+            }
             return Ok(CommitRootMap::Ready);
         }
 
@@ -5150,6 +5237,7 @@ impl<A: Allocator + Clone> Plain<A> {
             Phase::New => "not opened",
             Phase::ReadHead(_) | Phase::MakeHead | Phase::ReadManifest { .. } | Phase::CheckLog { .. } | Phase::Orphans { .. } => "opening",
             Phase::Mapping { .. } | Phase::CheckMaps { .. } | Phase::Removing { .. } => "mapping a new generation",
+            Phase::LoadingBloom => "mapping the bloom sidecar",
             Phase::Ready => "ready",
             Phase::Listing => "compacting",
             Phase::Writing(..) | Phase::Renaming(..) | Phase::Unwriting { .. } | Phase::SyncingSegment(..) => "writing a segment",
@@ -7046,6 +7134,12 @@ impl<A: Allocator + Clone> Plain<A> {
     // ---- the flip: the one lock, held for it alone ----
 
     fn start_flip(&mut self, change: Change<A>, effects: &mut Vec<Effect>) {
+        if self.bloom_deferred || self.bloom_loading {
+            self.bloom_parked_flip = Some(change);
+            let _ = self.request_deferred_bloom(effects);
+            self.phase = Phase::LoadingBloom;
+            return;
+        }
         let (bloom_staged, stage_effect) = match self.prepare_staged_bloom(&change) {
             Some((info, effect)) => (Some(info), Some(effect)),
             None => (None, None),
@@ -8276,9 +8370,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.sliced = Some(stats);
             }
             Then::Open | Then::Stamp | Then::Probe | Then::Targeted => {}
-            Then::All => self.all_mapped_par(par),
+            Then::All => {
+                self.all_mapped_par(par);
+                let _ = self.request_deferred_bloom(effects);
+            }
             Then::RetryCommit => {
                 self.all_mapped_par(par);
+                let _ = self.request_deferred_bloom(effects);
                 if let Some(change) = self.retry_commit.take() {
                     self.start_flip(change, effects);
                     return;
@@ -8289,7 +8387,7 @@ impl<A: Allocator + Clone> Plain<A> {
             self.start_flip(Change::Stamp, effects);
             return;
         }
-        self.phase = Phase::Ready;
+        self.phase = if self.bloom_loading { Phase::LoadingBloom } else { Phase::Ready };
     }
 
     // ---- completions ----
@@ -8346,9 +8444,20 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.bloom_loading = false;
                 if let Done::Mapped(map) = done {
                     self.bloom.set_mapping(map);
+                    if self.slot.is_some() {
+                        self.bloom.index_manifest(&self.manifest.segments, &self.manifest.roots);
+                    }
                 }
                 if let Some(parked) = self.open_parked.take() {
                     return self.resolved(Ctx::Open, parked.base, false, parked.fell_back, now_ns, effects);
+                }
+                if matches!(self.phase, Phase::LoadingBloom) {
+                    self.phase = Phase::Ready;
+                    if let Some(keys) = self.bloom_parked_keys.take() {
+                        let _ = self.map_matching_keys_par(keys.as_slice(), now_ns, par, effects)?;
+                    } else if let Some(change) = self.bloom_parked_flip.take() {
+                        self.start_flip(change, effects);
+                    }
                 }
                 Ok(())
             }
@@ -8433,8 +8542,12 @@ impl<A: Allocator + Clone> Plain<A> {
                         // A torn slot beside it: a newer flip was cut, and the segments it
                         // named are found and reported by the directory's look.
                         if ctx == Ctx::Open && !self.bloom_loading {
-                            self.bloom_loading = true;
-                            effects.push(Effect::Map { file: self.bloom_file.share(), extent: Extent::Whole, tag: self.tag(BLOOM_MAP, 0) });
+                            if self.eager || self.plant() == Plant::MapsAllAtOpen {
+                                self.bloom_loading = true;
+                                effects.push(Effect::Map { file: self.bloom_file.share(), extent: Extent::Whole, tag: self.tag(BLOOM_MAP, 0) });
+                            } else {
+                                self.bloom_deferred = true;
+                            }
                         }
                         self.read_manifest(ctx, [Some(newest), older], 0, ctx == Ctx::Open && torn.is_some(), effects);
                         Ok(())
