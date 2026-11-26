@@ -194,7 +194,7 @@ pub fn fact_now_with_probes(
             return FactNow::NoPins;
         };
         let active_answerer = probes.answerer.id();
-        let now = crate::probe_clang::c_probe_reply_now(subject, &active_answerer, &probes.clang_sha256, Some(&*probes.records), alloc).flatten();
+        let now = crate::probe_clang::c_probe_reply_now(subject, &active_answerer, &probes.clang_sha256, &probes.sdk_digest, Some(&*probes.records), alloc).flatten();
         return FactNow::Answer(now);
     }
     let mut lines = subject.split('\n');

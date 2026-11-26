@@ -185,6 +185,8 @@ pub struct CScriptProbes {
     pub records: OwnArc<dyn CProbeStore, SharedAlloc<'static>>,
     /// SDK / sysroot identity hashed into every [`ProbeKey`] (`""` on Linux with no sysroot).
     pub sdk_id: OwnArc<str, SharedAlloc<'static>>,
+    /// Digest of `sdk_id` (`facts::sdk_id_digest`) verified in `cc-probe` read revalidation.
+    pub sdk_digest: [u8; 32],
     /// Host pinned clang archive SHA-256 (verified in `cc-probe` read revalidation).
     pub clang_sha256: [u8; 32],
 }
@@ -414,9 +416,11 @@ pub fn open_command_c_probes<'a>(
     };
     let records: OwnArc<dyn CProbeStore, SharedAlloc<'static>> =
         OwnArc::new_in(DirStore::build_scripts(io.spawner(), io.boot().ok(), &root), shared);
-    let sdk_id: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk.map_or("", |(_, id)| id), shared);
+    let sdk_str = sdk.map_or("", |(_, id)| id);
+    let sdk_id: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_str, shared);
+    let sdk_digest = facts::sdk_id_digest(sdk_str);
     let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = OwnArc::new_in(hermetic, shared);
-    CProbeSetting::Ready(CScriptProbes { answerer, records, sdk_id, clang_sha256 })
+    CProbeSetting::Ready(CScriptProbes { answerer, records, sdk_id, sdk_digest, clang_sha256 })
 }
 
 /// Host's pinned clang archive SHA-256 from `pins/clang.json`, or `None` when `host` has no pin.
@@ -424,21 +428,22 @@ pub fn active_clang_pin(host: &str) -> Option<[u8; 32]> {
     toolchain::clang_pin(CLANG_JSON, host).ok().map(|pin| pin.sha256)
 }
 
-/// Re-checks a recorded `cc-probe\n<answerer>\n<clang>\n<key>` read subject against the command's
-/// active `(answerer_id, clang_sha256)` and `store`:
+/// Re-checks a recorded `cc-probe\n<answerer>\n<clang>\n<sdk>\n<key>` read subject against the
+/// command's active `(answerer_id, clang_sha256, sdk_digest)` and `store`:
 /// - `None`: `subject` is not a `cc-probe` subject.
-/// - `Some(None)`: active answerer or clang pin changed, or cache miss/unreadable record (differs
-///   from any recorded digest, so only scripts that asked this probe re-run).
+/// - `Some(None)`: active answerer, clang pin, or SDK changed, or cache miss/unreadable record
+///   (differs from any recorded digest, so only scripts that asked this probe re-run).
 /// - `Some(Some(digest))`: active identity matches and cached canonical probe answer hashes to `digest`.
 pub fn c_probe_reply_now(
     subject: &str,
     active_answerer: &ContentId,
     active_clang: &[u8; 32],
+    active_sdk: &[u8; 32],
     store: Option<&dyn CProbeStore>,
     alloc: Alloc<'_>,
 ) -> Option<Option<ContentId>> {
     let parsed = facts::parse_cc_probe_subject(subject)?;
-    if parsed.answerer != *active_answerer || parsed.clang != *active_clang {
+    if parsed.answerer != *active_answerer || parsed.clang != *active_clang || parsed.sdk != *active_sdk {
         return Some(None);
     }
     let store = store?;
@@ -843,13 +848,14 @@ mod tests {
             assert_eq!(canonical.stdout.as_str(), stdout.as_str(), "stdout mismatch for {:?}", row.args);
             assert_eq!(canonical.stderr.as_str(), stderr.as_str(), "stderr mismatch for {:?}", row.args);
 
-            let subject = cc_probe_subject(&answerer.id(), &pin.sha256, &resolved.key, alloc);
+            let empty_sdk = blaze_build_script::facts::sdk_id_digest("");
+            let subject = cc_probe_subject(&answerer.id(), &pin.sha256, &empty_sdk, &resolved.key, alloc);
             assert_eq!(
                 parse_cc_probe_subject(subject.as_str()),
-                Some(CcProbeSubject { answerer: answerer.id(), clang: pin.sha256, key: resolved.key })
+                Some(CcProbeSubject { answerer: answerer.id(), clang: pin.sha256, sdk: empty_sdk, key: resolved.key })
             );
             assert_eq!(
-                c_probe_reply_now(subject.as_str(), &answerer.id(), &pin.sha256, Some(store.as_ref()), alloc),
+                c_probe_reply_now(subject.as_str(), &answerer.id(), &pin.sha256, &empty_sdk, Some(store.as_ref()), alloc),
                 Some(Some(resolved.canonical_digest))
             );
             checked += 1;
@@ -940,18 +946,21 @@ mod tests {
 
         let res_a = resolve(&StubAnswerer, &cache, &pin, &sp_a, dig, &mut bytes, alloc).expect("probe A");
         let res_b = resolve(&StubAnswerer, &cache, &pin, &sp_b, dig, &mut bytes, alloc).expect("probe B");
-        let subj_a = cc_probe_subject(&StubAnswerer.id(), &pin, &res_a.key, alloc);
-        let subj_b = cc_probe_subject(&StubAnswerer.id(), &pin, &res_b.key, alloc);
+        let sdk_a = blaze_build_script::facts::sdk_id_digest("macos-sdk-15.2");
+        let subj_a = cc_probe_subject(&StubAnswerer.id(), &pin, &sdk_a, &res_a.key, alloc);
+        let subj_b = cc_probe_subject(&StubAnswerer.id(), &pin, &sdk_a, &res_b.key, alloc);
 
-        assert_eq!(c_probe_reply_now(subj_a.as_str(), &StubAnswerer.id(), &pin, Some(&store), alloc), Some(Some(res_a.canonical_digest)));
-        assert_eq!(c_probe_reply_now(subj_b.as_str(), &StubAnswerer.id(), &pin, Some(&store), alloc), Some(Some(res_b.canonical_digest)));
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &StubAnswerer.id(), &pin, &sdk_a, Some(&store), alloc), Some(Some(res_a.canonical_digest)));
+        assert_eq!(c_probe_reply_now(subj_b.as_str(), &StubAnswerer.id(), &pin, &sdk_a, Some(&store), alloc), Some(Some(res_b.canonical_digest)));
 
-        // Upgrading clang pin or answerer id invalidates recorded probe reads even though the old
-        // record file still exists on disk.
+        // Upgrading clang pin, answerer id, or macOS SDK invalidates recorded probe reads even
+        // though the old record file still exists on disk.
         let new_pin = [8u8; 32];
-        assert_eq!(c_probe_reply_now(subj_a.as_str(), &StubAnswerer.id(), &new_pin, Some(&store), alloc), Some(None));
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &StubAnswerer.id(), &new_pin, &sdk_a, Some(&store), alloc), Some(None));
         let new_answerer = blaze_ids::ContentId::of("stub-cprobe-selective-test", b"2");
-        assert_eq!(c_probe_reply_now(subj_a.as_str(), &new_answerer, &pin, Some(&store), alloc), Some(None));
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &new_answerer, &pin, &sdk_a, Some(&store), alloc), Some(None));
+        let new_sdk = blaze_build_script::facts::sdk_id_digest("macos-sdk-15.4");
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &StubAnswerer.id(), &pin, &new_sdk, Some(&store), alloc), Some(None));
 
         // Mutating ONLY probe A's cached record invalidates A and leaves B intact.
         let mut mutated = AVec::new_in(alloc);
@@ -962,12 +971,12 @@ mod tests {
         store.overwrite(res_a.key, mutated.as_slice());
 
         assert_ne!(
-            c_probe_reply_now(subj_a.as_str(), &StubAnswerer.id(), &pin, Some(&store), alloc),
+            c_probe_reply_now(subj_a.as_str(), &StubAnswerer.id(), &pin, &sdk_a, Some(&store), alloc),
             Some(Some(res_a.canonical_digest)),
             "mutated probe A must invalidate its asking script"
         );
         assert_eq!(
-            c_probe_reply_now(subj_b.as_str(), &StubAnswerer.id(), &pin, Some(&store), alloc),
+            c_probe_reply_now(subj_b.as_str(), &StubAnswerer.id(), &pin, &sdk_a, Some(&store), alloc),
             Some(Some(res_b.canonical_digest)),
             "unrelated probe B must remain valid"
         );

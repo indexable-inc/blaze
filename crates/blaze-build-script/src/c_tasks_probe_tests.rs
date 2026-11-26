@@ -359,6 +359,34 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     let err2 = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_mount, files, alloc).err().expect("must refuse mount path in flag_check");
     assert_eq!(err2.why, ProbeWhy::PackageInput);
 
+    // Relative source path (`probe.c`) and include-steering env (`CPATH`, `C_INCLUDE_PATH`) are refused.
+    let rel_args = ["-c", "probe.c", "-o", "/target/debug/build/zstd-sys-1/out/flag_check"];
+    let sp_rel = Spawn { program: "cc", args: &rel_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    assert_eq!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_rel, files, alloc).err().unwrap().why, ProbeWhy::PackageInput);
+
+    let ok_args = flag_args("-Wshadow");
+    let bad_env = [("CPATH", "/package/include")];
+    let sp_env = Spawn { program: "cc", args: &ok_args, env: &bad_env, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    assert_eq!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_env, files, alloc).err().unwrap().why, ProbeWhy::PackageInput);
+
+    // OUT_DIR source containing `#include` is refused in `resolve` before caching or running.
+    struct PanicAnswerer;
+    impl ProbeAnswerer for PanicAnswerer {
+        fn id(&self) -> blaze_ids::ContentId { blaze_ids::ContentId([9; 32]) }
+        fn answer<'a, 'b>(&self, _: &CanonicalProbe<'_, '_>, _: &mut dyn FnMut(&str) -> Option<&'b [u8]>, _: Alloc<'a>) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+            panic!("must not invoke answerer for #include probe");
+        }
+    }
+    struct NoCache;
+    impl ProbeCache for NoCache {
+        fn get<'a>(&self, _: &ProbeKey, _: Alloc<'a>) -> Result<Option<blaze_own::AVec<'a, u8>>, blaze_own::AString<'a>> { Ok(None) }
+        fn put<'a>(&self, _: &ProbeKey, _: &[u8], _: Alloc<'a>) -> Result<(), blaze_own::AString<'a>> { Ok(()) }
+    }
+    let inc_src = b"#include \"local.h\"\nint main(void) { return 0; }\n";
+    let mut inc_bytes = |name: &str| (name == "flag_check.c").then_some(inc_src.as_slice());
+    let sp_ok = Spawn { program: "cc", args: &ok_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut inc_bytes, alloc).is_err());
+
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
     let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");

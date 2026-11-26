@@ -159,88 +159,41 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
 }
 
 /// On NixOS hosts where an ELF program's `PT_INTERP` (e.g. `/lib/ld-linux-aarch64.so.1`) symlinks
-/// into `/nix/store/...` (`nix-ld`), grants Landlock single-file `READ_FILE | EXECUTE` ONLY on the
-/// exact loader binary and the shared libraries referenced by that binary's `DT_NEEDED` entries
-/// (plus core libc/libm/libgcc_s/ld.so under `/run/current-system/sw/share/nix-ld/lib`), never on
+/// into `/nix/store/...` (`nix-ld`), walks the full transitive ELF64 dependency closure
+/// (`DT_NEEDED`, `DT_RUNPATH`/`DT_RPATH` with `$ORIGIN` expansion, `/run/current-system/sw/share/nix-ld/lib`,
+/// and `ld.so`'s resolved glibc `lib/` directory) and grants Landlock single-file
+/// `READ_FILE | EXECUTE` ONLY on the exact loader and resolved shared library files — never on
 /// `/nix/store` as a directory. Does nothing on non-NixOS hosts or non-ELF scripts.
 fn grant_nix_elf_closure(ruleset: Fd, program: &CStr) -> Result<(), Fault> {
-    let Ok(file) = openat(CWD, blaze_sys::Path::new(program), OpenFlags::CLOSE_ON_EXEC, 0) else {
+    const MAX_LIBS: usize = 64;
+    const PATH_CAP: usize = 320;
+    const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
+    const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
+
+    let Ok(prog_file) = openat(CWD, blaze_sys::Path::new(program), OpenFlags::CLOSE_ON_EXEC, 0) else {
         return Ok(());
     };
-    let mut ehdr = [0u8; 64];
-    if pread(file.fd(), &mut ehdr, 0).unwrap_or(0) < 64 {
+    let Some(hdr) = parse_elf64_meta(prog_file.fd()) else {
         return Ok(());
-    }
-    // ELF64 little-endian magic check.
-    if ehdr.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
-        return Ok(());
-    }
-    let e_phoff = read_u64_le(&ehdr, 32);
-    let e_phentsize = usize::from(read_u16_le(&ehdr, 54));
-    let e_phnum = usize::from(read_u16_le(&ehdr, 56));
-    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 64 {
-        return Ok(());
-    }
-    let mut interp_off = 0u64;
-    let mut interp_len = 0usize;
-    let mut dyn_off = 0u64;
-    let mut dyn_len = 0usize;
-    // Track up to 16 PT_LOAD segments to map DT_STRTAB vaddr -> file offset.
-    let mut loads = [(0u64, 0u64, 0u64); 16]; // (p_vaddr, p_offset, p_filesz)
-    let mut load_count = 0usize;
-    let mut ph_buf = [0u8; 64];
-    for i in 0..e_phnum {
-        let Some(off) = u64::try_from(i).ok().and_then(|n| n.checked_mul(u64::try_from(e_phentsize).unwrap_or(0))).and_then(|o| e_phoff.checked_add(o)) else {
-            break;
-        };
-        if pread(file.fd(), &mut ph_buf[..56], off).unwrap_or(0) < 56 {
-            break;
-        }
-        let p_type = read_u32_le(&ph_buf, 0);
-        let p_offset = read_u64_le(&ph_buf, 8);
-        let p_vaddr = read_u64_le(&ph_buf, 16);
-        let p_filesz = read_u64_le(&ph_buf, 32);
-        match p_type {
-            1 => {
-                // PT_LOAD
-                if let Some(slot) = loads.get_mut(load_count) {
-                    *slot = (p_vaddr, p_offset, p_filesz);
-                    load_count += 1;
-                }
-            }
-            3 => {
-                // PT_INTERP
-                interp_off = p_offset;
-                interp_len = usize::try_from(p_filesz).unwrap_or(0).min(512);
-            }
-            2 => {
-                // PT_DYNAMIC
-                dyn_off = p_offset;
-                dyn_len = usize::try_from(p_filesz).unwrap_or(0).min(8192);
-            }
-            _ => {}
-        }
-    }
-    if interp_len == 0 {
+    };
+    if hdr.interp_len == 0 {
         return Ok(());
     }
     let mut interp_buf = [0u8; 512];
-    let Some(interp_slice) = interp_buf.get_mut(..interp_len) else {
+    let Some(interp_slice) = interp_buf.get_mut(..hdr.interp_len) else {
         return Ok(());
     };
-    let n = pread(file.fd(), interp_slice, interp_off).unwrap_or(0);
+    let n = pread(prog_file.fd(), interp_slice, hdr.interp_off).unwrap_or(0);
     let Some(interp_bytes) = interp_buf.get(..n) else {
         return Ok(());
     };
     let nul_pos = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
     let mut interp_c = [0u8; 513];
-    let Some(dst) = interp_c.get_mut(..nul_pos) else {
+    if let (Some(dst), Some(src)) = (interp_c.get_mut(..nul_pos), interp_bytes.get(..nul_pos)) {
+        dst.copy_from_slice(src);
+    } else {
         return Ok(());
-    };
-    let Some(src) = interp_bytes.get(..nul_pos) else {
-        return Ok(());
-    };
-    dst.copy_from_slice(src);
+    }
     let Ok(interp_cstr) = CStr::from_bytes_until_nul(&interp_c) else {
         return Ok(());
     };
@@ -252,106 +205,385 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr) -> Result<(), Fault> {
     if !target.starts_with(b"/nix/store/") {
         return Ok(());
     }
+
     // Grant single-file READ_FILE | EXECUTE on the resolved loader (`nix-ld`) and glibc `ld.so`.
     add_nix_file_rule(ruleset, interp_cstr)?;
-    const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
-    const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
     add_nix_file_rule(ruleset, NIX_LD_SO)?;
+
     // Resolve `ld.so`'s target (`/nix/store/<hash>-glibc-.../lib/ld-linux-*.so.*`) to find the
-    // exact glibc `lib/` prefix where `libc.so.6` and `libm.so.6` live (never granting `/nix/store`).
-    let mut glibc_buf = [0u8; 512];
-    let glibc_dir: Option<&[u8]> = readlinkat(CWD, blaze_sys::Path::new(NIX_LD_SO), &mut glibc_buf)
-        .ok()
-        .and_then(|resolved| {
-            let slash = resolved.iter().rposition(|&b| b == b'/')?;
-            resolved.get(..=slash)
-        });
-    for base in [b"libc.so.6".as_slice(), b"libm.so.6", b"libgcc_s.so.1", b"libpthread.so.0", b"libdl.so.2", b"librt.so.1"] {
-        add_nix_lib_rule(ruleset, NIX_LD_DIR, base)?;
-        if let Some(dir) = glibc_dir {
-            add_nix_lib_rule(ruleset, dir, base)?;
+    // exact glibc `lib/` prefix where `libc.so.6` and `libm.so.6` live.
+    let mut glibc_buf = [0u8; PATH_CAP];
+    let glibc_dir: Option<&[u8]> = resolve_symlink_path(NIX_LD_SO.to_bytes(), &mut glibc_buf).and_then(|len| {
+        let resolved = glibc_buf.get(..len)?;
+        let slash = resolved.iter().rposition(|&b| b == b'/')?;
+        resolved.get(..=slash)
+    });
+
+    // Bounded BFS queue of canonical ELF paths to parse for transitive `DT_NEEDED` dependencies.
+    let mut queue = [([0u8; PATH_CAP], 0usize); MAX_LIBS];
+    let mut q_len = 0usize;
+    let mut q_head = 0usize;
+
+    // Seed queue with the main executable itself (resolving symlinks so `$ORIGIN` works).
+    let mut prog_resolved = [0u8; PATH_CAP];
+    let prog_len = resolve_symlink_path(program.to_bytes(), &mut prog_resolved).unwrap_or_else(|| {
+        let raw = program.to_bytes();
+        let l = raw.len().min(PATH_CAP - 1);
+        if let (Some(d), Some(s)) = (prog_resolved.get_mut(..l), raw.get(..l)) {
+            d.copy_from_slice(s);
+            l
+        } else {
+            0
+        }
+    });
+    if prog_len > 0 && let Some(slot) = queue.get_mut(0) {
+        if let (Some(d), Some(s)) = (slot.0.get_mut(..prog_len), prog_resolved.get(..prog_len)) {
+            d.copy_from_slice(s);
+            slot.1 = prog_len;
+            q_len = 1;
         }
     }
-    if dyn_len == 0 {
-        return Ok(());
+
+    // Also seed core glibc runtime libraries so their transitive deps (if any) are covered.
+    for base in [b"libc.so.6".as_slice(), b"libm.so.6", b"libgcc_s.so.1"] {
+        enqueue_nix_soname(ruleset, base, &[], NIX_LD_DIR, glibc_dir, &mut queue, &mut q_len)?;
     }
-    // Read PT_DYNAMIC to locate DT_STRTAB and DT_NEEDED sonames.
-    let mut dyn_buf = [0u8; 8192];
-    let Some(dyn_slice) = dyn_buf.get_mut(..dyn_len) else {
-        return Ok(());
-    };
-    let dyn_read = pread(file.fd(), dyn_slice, dyn_off).unwrap_or(0);
-    let mut strtab_vaddr = None;
-    let mut needed_offs = [0u64; 64];
-    let mut needed_count = 0usize;
-    let mut pos = 0usize;
-    while pos + 16 <= dyn_read {
-        let tag = read_u64_le(&dyn_buf, pos);
-        let val = read_u64_le(&dyn_buf, pos + 8);
-        pos += 16;
-        if tag == 0 {
-            break; // DT_NULL
-        } else if tag == 5 {
-            strtab_vaddr = Some(val); // DT_STRTAB
-        } else if tag == 1 {
-            // DT_NEEDED
-            if let Some(slot) = needed_offs.get_mut(needed_count) {
-                *slot = val;
-                needed_count += 1;
+
+    while q_head < q_len {
+        let mut cur_path = [0u8; PATH_CAP];
+        let cur_len = match queue.get(q_head) {
+            Some((buf, len)) => {
+                if let (Some(d), Some(s)) = (cur_path.get_mut(..*len), buf.get(..*len)) {
+                    d.copy_from_slice(s);
+                }
+                *len
+            }
+            None => break,
+        };
+        q_head += 1;
+        let Ok(cur_cstr) = CStr::from_bytes_until_nul(cur_path.get(..=cur_len).unwrap_or(&[0])) else {
+            continue;
+        };
+        let Ok(elf_fd) = openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0) else {
+            continue;
+        };
+        let Some(meta) = parse_elf64_meta(elf_fd.fd()) else {
+            continue;
+        };
+        if meta.dyn_len == 0 {
+            continue;
+        }
+        let mut dyn_buf = [0u8; 8192];
+        let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
+            continue;
+        };
+        let dyn_read = pread(elf_fd.fd(), dyn_slice, meta.dyn_off).unwrap_or(0);
+        let mut strtab_vaddr = None;
+        let mut runpath_off = None;
+        let mut rpath_off = None;
+        let mut needed_offs = [0u64; 64];
+        let mut needed_count = 0usize;
+        let mut pos = 0usize;
+        while pos + 16 <= dyn_read {
+            let tag = read_u64_le(&dyn_buf, pos);
+            let val = read_u64_le(&dyn_buf, pos + 8);
+            pos += 16;
+            match tag {
+                0 => break,                // DT_NULL
+                1 => {                     // DT_NEEDED
+                    if let Some(slot) = needed_offs.get_mut(needed_count) {
+                        *slot = val;
+                        needed_count += 1;
+                    }
+                }
+                5 => strtab_vaddr = Some(val), // DT_STRTAB
+                15 => rpath_off = Some(val),   // DT_RPATH
+                29 => runpath_off = Some(val), // DT_RUNPATH
+                _ => {}
             }
         }
-    }
-    let Some(strtab_vaddr) = strtab_vaddr else {
-        return Ok(());
-    };
-    let strtab_file_off = loads.get(..load_count).and_then(|ls| {
-        ls.iter().find_map(|&(vaddr, foff, filesz)| {
-            let delta = strtab_vaddr.checked_sub(vaddr)?;
-            (delta < filesz).then(|| foff.checked_add(delta))?
-        })
-    });
-    let Some(strtab_file_off) = strtab_file_off else {
-        return Ok(());
-    };
-    let mut name_buf = [0u8; 192];
-    for &str_off in needed_offs.get(..needed_count).unwrap_or(&[]) {
-        let Some(at) = strtab_file_off.checked_add(str_off) else {
+        let Some(strtab_vaddr) = strtab_vaddr else {
             continue;
         };
-        let n = pread(file.fd(), &mut name_buf, at).unwrap_or(0);
-        let Some(raw) = name_buf.get(..n) else {
+        let Some(strtab_file_off) = meta.vaddr_to_offset(strtab_vaddr) else {
             continue;
         };
-        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-        let Some(soname) = raw.get(..end) else {
-            continue;
-        };
-        if !soname.is_empty() && !soname.contains(&b'/') {
-            add_nix_lib_rule(ruleset, NIX_LD_DIR, soname)?;
-            if let Some(dir) = glibc_dir {
-                add_nix_lib_rule(ruleset, dir, soname)?;
+
+        // Extract optional DT_RUNPATH / DT_RPATH search directories (expanding `$ORIGIN`).
+        let origin_dir = cur_path
+            .get(..cur_len)
+            .and_then(|p| p.iter().rposition(|&b| b == b'/').and_then(|s| p.get(..s)))
+            .unwrap_or(&[]);
+        let mut search_dirs = [([0u8; PATH_CAP], 0usize); 8];
+        let mut search_count = 0usize;
+        if let Some(rp_off) = runpath_off.or(rpath_off)
+            && let Some(at) = strtab_file_off.checked_add(rp_off)
+        {
+            let mut rp_buf = [0u8; 1024];
+            let n = pread(elf_fd.fd(), &mut rp_buf, at).unwrap_or(0);
+            let raw = rp_buf.get(..n).unwrap_or(&[]);
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            for entry in raw.get(..end).unwrap_or(&[]).split(|&b| b == b':') {
+                if entry.is_empty() {
+                    continue;
+                }
+                if let Some(slot) = search_dirs.get_mut(search_count) {
+                    let expanded_len = expand_origin(entry, origin_dir, &mut slot.0);
+                    if expanded_len > 0 {
+                        slot.1 = expanded_len;
+                        search_count += 1;
+                    }
+                }
+            }
+        }
+
+        let mut name_buf = [0u8; 192];
+        for &str_off in needed_offs.get(..needed_count).unwrap_or(&[]) {
+            let Some(at) = strtab_file_off.checked_add(str_off) else {
+                continue;
+            };
+            let n = pread(elf_fd.fd(), &mut name_buf, at).unwrap_or(0);
+            let raw = name_buf.get(..n).unwrap_or(&[]);
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            let soname = raw.get(..end).unwrap_or(&[]);
+            if !soname.is_empty() && !soname.contains(&b'/') {
+                enqueue_nix_soname(
+                    ruleset,
+                    soname,
+                    search_dirs.get(..search_count).unwrap_or(&[]),
+                    NIX_LD_DIR,
+                    glibc_dir,
+                    &mut queue,
+                    &mut q_len,
+                )?;
             }
         }
     }
     Ok(())
 }
 
-fn add_nix_lib_rule(ruleset: Fd, dir_prefix: &[u8], soname: &[u8]) -> Result<(), Fault> {
-    let mut path_buf = [0u8; 256];
-    let total = dir_prefix.len().saturating_add(soname.len());
-    if total + 1 > path_buf.len() {
+struct Elf64Meta {
+    interp_off: u64,
+    interp_len: usize,
+    dyn_off: u64,
+    dyn_len: usize,
+    loads: [(u64, u64, u64); 16],
+    load_count: usize,
+}
+
+impl Elf64Meta {
+    fn vaddr_to_offset(&self, vaddr: u64) -> Option<u64> {
+        self.loads.get(..self.load_count)?.iter().find_map(|&(pv, po, psz)| {
+            let delta = vaddr.checked_sub(pv)?;
+            (delta < psz).then(|| po.checked_add(delta))?
+        })
+    }
+}
+
+fn parse_elf64_meta(fd: Fd) -> Option<Elf64Meta> {
+    let mut ehdr = [0u8; 64];
+    if pread(fd, &mut ehdr, 0).unwrap_or(0) < 64 {
+        return None;
+    }
+    if ehdr.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
+        return None;
+    }
+    let e_phoff = read_u64_le(&ehdr, 32);
+    let e_phentsize = usize::from(read_u16_le(&ehdr, 54));
+    let e_phnum = usize::from(read_u16_le(&ehdr, 56));
+    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 64 {
+        return None;
+    }
+    let mut meta = Elf64Meta {
+        interp_off: 0,
+        interp_len: 0,
+        dyn_off: 0,
+        dyn_len: 0,
+        loads: [(0, 0, 0); 16],
+        load_count: 0,
+    };
+    let mut ph_buf = [0u8; 64];
+    for i in 0..e_phnum {
+        let off = u64::try_from(i)
+            .ok()
+            .and_then(|n| n.checked_mul(u64::try_from(e_phentsize).unwrap_or(0)))
+            .and_then(|o| e_phoff.checked_add(o))?;
+        let ph_slice = ph_buf.get_mut(..56)?;
+        if pread(fd, ph_slice, off).unwrap_or(0) < 56 {
+            break;
+        }
+        let p_type = read_u32_le(&ph_buf, 0);
+        let p_offset = read_u64_le(&ph_buf, 8);
+        let p_vaddr = read_u64_le(&ph_buf, 16);
+        let p_filesz = read_u64_le(&ph_buf, 32);
+        match p_type {
+            1 => {
+                if let Some(slot) = meta.loads.get_mut(meta.load_count) {
+                    *slot = (p_vaddr, p_offset, p_filesz);
+                    meta.load_count += 1;
+                }
+            }
+            2 => {
+                meta.dyn_off = p_offset;
+                meta.dyn_len = usize::try_from(p_filesz).unwrap_or(0).min(8192);
+            }
+            3 => {
+                meta.interp_off = p_offset;
+                meta.interp_len = usize::try_from(p_filesz).unwrap_or(0).min(512);
+            }
+            _ => {}
+        }
+    }
+    Some(meta)
+}
+
+fn expand_origin(entry: &[u8], origin_dir: &[u8], out: &mut [u8; 320]) -> usize {
+    let mut len = 0usize;
+    let mut i = 0usize;
+    while i < entry.len() {
+        let rest = entry.get(i..).unwrap_or(&[]);
+        let (chunk, step) = if rest.starts_with(b"$ORIGIN") {
+            (origin_dir, 7)
+        } else if rest.starts_with(b"${ORIGIN}") {
+            (origin_dir, 9)
+        } else {
+            (rest.get(..1).unwrap_or(&[]), 1)
+        };
+        if len + chunk.len() + 2 > out.len() {
+            return 0;
+        }
+        if let Some(dst) = out.get_mut(len..len + chunk.len()) {
+            dst.copy_from_slice(chunk);
+        }
+        len += chunk.len();
+        i += step;
+    }
+    if len > 0 && out.get(len - 1) != Some(&b'/') {
+        if let Some(slot) = out.get_mut(len) {
+            *slot = b'/';
+            len += 1;
+        }
+    }
+    len
+}
+
+/// Resolves symlinks (up to 8 hops) for `path`, writing a NUL-terminated path into `out` and
+/// returning its byte length (excluding NUL).
+fn resolve_symlink_path(path: &[u8], out: &mut [u8; 320]) -> Option<usize> {
+    if path.is_empty() || path.len() >= out.len() {
+        return None;
+    }
+    out.fill(0);
+    out.get_mut(..path.len())?.copy_from_slice(path);
+    let mut cur_len = path.len();
+    let mut link = [0u8; 320];
+    for _ in 0..8 {
+        let cstr = CStr::from_bytes_until_nul(out.get(..=cur_len)?).ok()?;
+        let Ok(target) = readlinkat(CWD, blaze_sys::Path::new(cstr), &mut link) else {
+            break;
+        };
+        if target.is_empty() {
+            break;
+        }
+        let mut next = [0u8; 320];
+        let next_len = if target.first() == Some(&b'/') {
+            if target.len() >= next.len() {
+                return None;
+            }
+            next.get_mut(..target.len())?.copy_from_slice(target);
+            target.len()
+        } else {
+            let parent_end = out.get(..cur_len)?.iter().rposition(|&b| b == b'/').map_or(0, |s| s + 1);
+            let total = parent_end.checked_add(target.len())?;
+            if total >= next.len() {
+                return None;
+            }
+            next.get_mut(..parent_end)?.copy_from_slice(out.get(..parent_end)?);
+            next.get_mut(parent_end..total)?.copy_from_slice(target);
+            total
+        };
+        out.copy_from_slice(&next);
+        cur_len = next_len;
+    }
+    Some(cur_len)
+}
+
+fn enqueue_nix_soname<const N: usize>(
+    ruleset: Fd,
+    soname: &[u8],
+    runpath_dirs: &[([u8; 320], usize)],
+    nix_ld_dir: &[u8],
+    glibc_dir: Option<&[u8]>,
+    queue: &mut [([u8; 320], usize); N],
+    q_len: &mut usize,
+) -> Result<(), Fault> {
+    for (dir_buf, dir_len) in runpath_dirs {
+        let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
+        if try_grant_and_enqueue_lib(ruleset, dir, soname, queue, q_len)? {
+            return Ok(());
+        }
+    }
+    if try_grant_and_enqueue_lib(ruleset, nix_ld_dir, soname, queue, q_len)? {
         return Ok(());
     }
-    if let Some(head) = path_buf.get_mut(..dir_prefix.len()) {
-        head.copy_from_slice(dir_prefix);
-    }
-    if let Some(tail) = path_buf.get_mut(dir_prefix.len()..total) {
-        tail.copy_from_slice(soname);
-    }
-    if let Ok(cstr) = CStr::from_bytes_until_nul(&path_buf) {
-        add_nix_file_rule(ruleset, cstr)?;
+    if let Some(dir) = glibc_dir {
+        let _ = try_grant_and_enqueue_lib(ruleset, dir, soname, queue, q_len)?;
     }
     Ok(())
+}
+
+fn try_grant_and_enqueue_lib<const N: usize>(
+    ruleset: Fd,
+    dir_prefix: &[u8],
+    soname: &[u8],
+    queue: &mut [([u8; 320], usize); N],
+    q_len: &mut usize,
+) -> Result<bool, Fault> {
+    let mut candidate = [0u8; 320];
+    let total = dir_prefix.len().saturating_add(soname.len());
+    if total + 1 > candidate.len() {
+        return Ok(false);
+    }
+    if let Some(head) = candidate.get_mut(..dir_prefix.len()) {
+        head.copy_from_slice(dir_prefix);
+    }
+    if let Some(tail) = candidate.get_mut(dir_prefix.len()..total) {
+        tail.copy_from_slice(soname);
+    }
+    let Ok(cstr) = CStr::from_bytes_until_nul(candidate.get(..=total).unwrap_or(&[0])) else {
+        return Ok(false);
+    };
+    let flags = OpenFlags::PATH.with(OpenFlags::CLOSE_ON_EXEC);
+    let fd = match openat(CWD, blaze_sys::Path::new(cstr), flags, 0) {
+        Ok(fd) => fd,
+        Err(blaze_sys::Errno::NoEnt) => return Ok(false),
+        Err(errno) => return Err(Fault::Host { call: "openat (nix runtime file, O_PATH)", code: errno.raw() }),
+    };
+    let granted = AccessFs::READ_FILE.with(AccessFs::EXECUTE).bits();
+    let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
+    landlock_add_rule_path(ruleset, &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule (nix runtime file)", code: errno.raw() })?;
+
+    let mut resolved = [0u8; 320];
+    let res_len = resolve_symlink_path(candidate.get(..total).unwrap_or(&[]), &mut resolved).unwrap_or(total);
+    let res_slice = if res_len == total && resolved.first() == Some(&0) {
+        candidate.get(..total).unwrap_or(&[])
+    } else {
+        resolved.get(..res_len).unwrap_or(&[])
+    };
+    let already = queue
+        .get(..*q_len)
+        .unwrap_or(&[])
+        .iter()
+        .any(|(b, l)| b.get(..*l) == Some(res_slice));
+    if !already
+        && let Some(slot) = queue.get_mut(*q_len)
+        && let Some(dst) = slot.0.get_mut(..res_slice.len())
+    {
+        dst.copy_from_slice(res_slice);
+        slot.1 = res_slice.len();
+        *q_len += 1;
+    }
+    Ok(true)
 }
 
 fn add_nix_file_rule(ruleset: Fd, path: &CStr) -> Result<(), Fault> {

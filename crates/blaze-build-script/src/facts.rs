@@ -368,19 +368,28 @@ fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
     Some(bytes)
 }
 
-/// Parsed fields of a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<key 64-hex>` read subject.
+/// Stable 32-byte digest of a probe's SDK / sysroot identity (empty string on Linux with no
+/// sysroot, or the macOS SDK identity hex).
+pub fn sdk_id_digest(sdk_id: &str) -> [u8; 32] {
+    blaze_ids::ContentId::of("blaze c-probe sdk id 1", sdk_id.as_bytes()).0
+}
+
+/// Parsed fields of a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<sdk 64-hex>\n<key 64-hex>`
+/// read subject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CcProbeSubject {
     pub answerer: blaze_ids::ContentId,
     pub clang: [u8; 32],
+    pub sdk: [u8; 32],
     pub key: crate::c_tasks_probe::ProbeKey,
 }
 
 /// The read subject for a resolved compiler probe, binding the active answerer strategy, pinned
-/// clang archive SHA-256, and canonical [`crate::c_tasks_probe::ProbeKey`].
+/// clang archive SHA-256, active SDK identity digest, and canonical [`crate::c_tasks_probe::ProbeKey`].
 pub fn cc_probe_subject<'a>(
     answerer: &blaze_ids::ContentId,
     clang: &[u8; 32],
+    sdk: &[u8; 32],
     key: &crate::c_tasks_probe::ProbeKey,
     alloc: Alloc<'a>,
 ) -> AString<'a> {
@@ -390,16 +399,19 @@ pub fn cc_probe_subject<'a>(
     out.push('\n');
     push_hex32(clang, &mut out);
     out.push('\n');
+    push_hex32(sdk, &mut out);
+    out.push('\n');
     push_hex32(&key.0.0, &mut out);
     out
 }
 
-/// Parses a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<key 64-hex>` read subject.
+/// Parses a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<sdk 64-hex>\n<key 64-hex>` read subject.
 pub fn parse_cc_probe_subject(subject: &str) -> Option<CcProbeSubject> {
     let rest = subject.strip_prefix(CC_PROBE_HEAD)?.strip_prefix('\n')?;
     let mut parts = rest.split('\n');
     let answerer_hex = parts.next()?;
     let clang_hex = parts.next()?;
+    let sdk_hex = parts.next()?;
     let key_hex = parts.next()?;
     if parts.next().is_some() {
         return None;
@@ -407,6 +419,7 @@ pub fn parse_cc_probe_subject(subject: &str) -> Option<CcProbeSubject> {
     Some(CcProbeSubject {
         answerer: blaze_ids::ContentId(parse_hex32(answerer_hex)?),
         clang: parse_hex32(clang_hex)?,
+        sdk: parse_hex32(sdk_hex)?,
         key: crate::c_tasks_probe::ProbeKey(blaze_ids::ContentId(parse_hex32(key_hex)?)),
     })
 }

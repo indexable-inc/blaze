@@ -86,6 +86,14 @@ fn name_of(program: &str) -> &str {
 
 /// Include/header search flags that indicate a real preprocessing job rather than a compiler
 /// family detection probe (`cc -E <OUT_DIR>/...detect_compiler_family.c`).
+fn under_out_dir<'a>(path: &'a str, out_dir: &str) -> Option<&'a str> {
+    let rel = path.strip_prefix(out_dir)?.strip_prefix('/')?;
+    if rel.is_empty() || rel.ends_with('/') || rel.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some(rel)
+}
+
 fn is_header_search_flag(arg: &str) -> bool {
     matches!(arg, "-I" | "-isystem" | "-iquote" | "-idirafter" | "-include" | "-imacros")
         || arg.starts_with("-I")
@@ -372,6 +380,73 @@ fn is_prefix_map_flag(arg: &str) -> bool {
         || arg.starts_with("-fcoverage-prefix-map=")
 }
 
+/// Environment variables in [`CLANG_ENV`] that steer header/file discovery outside `OUT_DIR`.
+fn is_path_steering_env(name: &str) -> bool {
+    matches!(
+        name,
+        "CPATH"
+            | "C_INCLUDE_PATH"
+            | "CPLUS_INCLUDE_PATH"
+            | "OBJC_INCLUDE_PATH"
+            | "OBJCPLUS_INCLUDE_PATH"
+            | "COMPILER_PATH"
+            | "CCC_OVERRIDE_OPTIONS"
+    )
+}
+
+/// Compiler flags that take the next argv element as a non-source value.
+fn flag_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-o" | "-x"
+            | "-target"
+            | "--target"
+            | "-arch"
+            | "-mcpu"
+            | "-march"
+            | "-mtune"
+            | "-isysroot"
+            | "--sysroot"
+            | "-mllvm"
+            | "-Xclang"
+            | "-Xassembler"
+            | "-Xlinker"
+            | "-D"
+            | "-U"
+            | "-u"
+            | "-L"
+            | "-l"
+            | "-F"
+            | "-framework"
+            | "-MF"
+            | "-MT"
+            | "-MQ"
+    )
+}
+
+/// Whether `bytes` contains a preprocessor `#include`, `#include_next`, or `#import` directive
+/// that could pull headers outside the probe's keyed `OUT_DIR` inputs.
+fn has_include_directive(bytes: &[u8]) -> bool {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return true;
+    };
+    for line in text.lines() {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if let Some(after_hash) = trimmed.strip_prefix('#') {
+            let dir = after_hash.trim_start_matches([' ', '\t']);
+            for kw in ["include_next", "include", "import"] {
+                if let Some(rest) = dir.strip_prefix(kw) {
+                    let boundary = rest.bytes().next().is_none_or(|b| matches!(b, b' ' | b'\t' | b'"' | b'<' | b'/'));
+                    if boundary {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Builds a [`CanonicalProbe`] and its [`ProbeKey`] from a script spawn.
 pub fn canonicalize<'b, 's>(
     answerer_id: ContentId,
@@ -385,12 +460,36 @@ pub fn canonicalize<'b, 's>(
     if !spawn.stdin.is_empty() {
         return Err(ProbeRefused { why: ProbeWhy::Stdin, row: row_json(&asked.row, alloc) });
     }
-    let has_package_input = spawn.args.iter().any(|arg| {
-        is_header_search_flag(arg)
+    let has_env_package_input = asked
+        .row
+        .env
+        .iter()
+        .any(|(k, v)| is_path_steering_env(k.as_str()) && !v.as_str().is_empty());
+    let mut has_arg_package_input = false;
+    let mut skip_next = false;
+    for &arg in spawn.args {
+        if is_header_search_flag(arg)
             || arg.starts_with('@')
             || (!spawn.mount.is_empty() && arg.contains(spawn.mount) && !is_prefix_map_flag(arg))
-    });
-    if has_package_input {
+        {
+            has_arg_package_input = true;
+            break;
+        }
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if flag_takes_value(arg) {
+            skip_next = true;
+            continue;
+        }
+        if !arg.starts_with('-') && arg != "/dev/null" && under_out_dir(arg, spawn.out_dir).is_none() {
+            // Relative source path (`probe.c`) or absolute path outside `OUT_DIR`.
+            has_arg_package_input = true;
+            break;
+        }
+    }
+    if has_env_package_input || has_arg_package_input {
         return Err(ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&asked.row, alloc) });
     }
     let key = probe_key(answerer_id, clang, spawn.sdk_id, &asked.row);
@@ -470,6 +569,16 @@ pub fn resolve<'a, 'b>(
         let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{r}"));
         msg
     })?;
+    for (_, rel) in probe.input_rels.iter() {
+        if let Some(bytes) = file_bytes(rel.as_str())
+            && has_include_directive(bytes)
+        {
+            let refused = ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&probe.row, alloc) };
+            let mut msg = String::new_in(alloc);
+            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{refused}"));
+            return Err(msg);
+        }
+    }
     let canonical = match cache.get(&probe.key, alloc)? {
         Some(bytes) => decode_answer(bytes.as_slice(), alloc).map_err(|e| {
             let mut msg = String::new_in(alloc);
@@ -712,8 +821,7 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
     let mut input_rels: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
     let (mut inputs, mut outputs) = (0u32, 0u32);
     for arg in spawn.args.iter().copied() {
-        let rel = arg.strip_prefix(spawn.out_dir).and_then(|rest| rest.strip_prefix('/')).filter(|rel| !rel.is_empty() && !rel.ends_with('/'));
-        let Some(rel) = rel else {
+        let Some(rel) = under_out_dir(arg, spawn.out_dir) else {
             args.push(spelled_roots(arg, &roots, alloc));
             continue;
         };

@@ -87,6 +87,45 @@ impl OnDir {
         self.cx.cx(RECORD_BUDGET, TASK_FRAME).map_err(|_| FilesError::Stopped { name: *name })
     }
 
+    /// Reads `name` directly into `alloc`, returning `Ok(None)` without allocating if the file is
+    /// absent, exceeds `max_bytes`, or has a missing/mismatched trailing [`SEAL`].
+    fn read_sealed_bounded<'a>(&self, name: &RecordName, max_bytes: u64, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, FilesError> {
+        let cx = self.cx(name)?;
+        let file = match self.dir.open_read(&cx, &Self::path(name)?) {
+            Ok(file) => file,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(None),
+            Err(error) => return Err(FilesError::Effect(error)),
+        };
+        let len_u64 = match file.len(&cx) {
+            Ok(len) => len,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(None),
+            Err(error) => return Err(FilesError::Effect(error)),
+        };
+        if len_u64 > max_bytes {
+            return Ok(None);
+        }
+        let len = usize::try_from(len_u64).map_err(|_| FilesError::Stopped { name: *name })?;
+        let cap = len.checked_add(1).ok_or(FilesError::Stopped { name: *name })?;
+        let mut bytes = AVec::with_capacity_in(cap, alloc);
+        bytes.resize(cap, 0u8);
+        let read = file.read_into(bytes.as_mut_slice(), 0).wait(&cx).map_err(FilesError::Effect)?;
+        if read > len {
+            return Err(FilesError::OtherBytes { name: *name });
+        }
+        bytes.truncate(read);
+        let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else {
+            return Ok(None);
+        };
+        let Some((body, seal)) = bytes.as_slice().split_at_checked(body_len) else {
+            return Ok(None);
+        };
+        if ContentId::of(SEAL, body).0 != seal {
+            return Ok(None);
+        }
+        bytes.truncate(body_len);
+        Ok(Some(bytes))
+    }
+
     /// The bytes at `name`, in a buffer of the file's own length (no frame, no fixed block: a
     /// file of any length is read): [`Held::Absent`] when nothing is there.
     ///
@@ -368,14 +407,10 @@ impl DirStore {
     }
 
     /// A build script's C compiler probe's answer record (`c_tasks_probe::encode_answer`):
-    /// `c-probe/<64 hex of the canonical ProbeKey>`.
+    /// `c-probe/<64 hex of the canonical ProbeKey>`, bounded at [`crate::probe_clang::MAX_RECORD_BYTES`]
+    /// before allocating.
     pub(crate) fn get_c_probe<'a>(&self, key: &ContentId, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, FilesError> {
-        let Some(bytes) = self.get_at(Self::named(b"c-probe/", key))? else {
-            return Ok(None);
-        };
-        let mut out = AVec::with_capacity_in(bytes.len(), alloc);
-        out.extend_from_slice(&bytes);
-        Ok(Some(out))
+        self.files.read_sealed_bounded(&Self::named(b"c-probe/", key), crate::probe_clang::MAX_RECORD_BYTES, alloc)
     }
 
     /// Keeps a C compiler probe's answer record, written once: other bytes under the key are

@@ -46,22 +46,27 @@ struct FactFiles<'a> {
     setting: Option<blaze_proc_macro::spawn_route::SpawnSetting>,
     exe_dir: Option<&'a str>,
     home: Option<(&'a Cx, &'a Dir<ReadWrite>)>,
+    /// Lazy active SDK identity digest (`facts::sdk_id_digest`): resolved at most once when a
+    /// `cc-probe` leaf row is actually followed (zero overhead on pure-Rust workspaces).
+    sdk_digest: Option<&'a dyn Fn() -> [u8; 32]>,
+    cached_sdk: Option<[u8; 32]>,
 }
 
 /// Reads a sealed `c-probe/<64-hex>` record from the command's `.blaze` home capability after
-/// verifying the subject's `(answerer, clang)` against the active command's hermetic answerer and
-/// `pins/clang.json` host pin, capping on-disk size before allocating.
+/// verifying the subject's `(answerer, clang, sdk)` against the active command's hermetic answerer,
+/// `pins/clang.json` host pin, and active SDK identity, capping on-disk size before allocating.
 fn read_c_probe_reply(
     home: Option<(&Cx, &Dir<ReadWrite>)>,
     parsed: blaze_build_script::facts::CcProbeSubject,
     key_hex: &str,
+    active_sdk: &[u8; 32],
     alloc: blaze_own::Alloc<'_>,
 ) -> Result<ContentId, CliError> {
     let active_answerer = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id();
     let Some(active_pin) = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE) else {
         return Ok(crate::engine_script_reads::NONE);
     };
-    read_c_probe_reply_with(home, parsed, key_hex, &active_answerer, &active_pin, alloc)
+    read_c_probe_reply_with(home, parsed, key_hex, &active_answerer, &active_pin, active_sdk, alloc)
 }
 
 fn read_c_probe_reply_with(
@@ -70,9 +75,10 @@ fn read_c_probe_reply_with(
     key_hex: &str,
     active_answerer: &ContentId,
     active_pin: &[u8; 32],
+    active_sdk: &[u8; 32],
     alloc: blaze_own::Alloc<'_>,
 ) -> Result<ContentId, CliError> {
-    if parsed.answerer != *active_answerer || parsed.clang != *active_pin {
+    if parsed.answerer != *active_answerer || parsed.clang != *active_pin || parsed.sdk != *active_sdk {
         return Ok(crate::engine_script_reads::NONE);
     }
     let Some((cx, dir)) = home else {
@@ -121,12 +127,25 @@ fn read_c_probe_reply_with(
 }
 
 impl<'a> FactFiles<'a> {
+    fn active_sdk_digest(&mut self) -> [u8; 32] {
+        if let Some(cached) = self.cached_sdk {
+            return cached;
+        }
+        let digest = match self.sdk_digest {
+            Some(resolve) => resolve(),
+            None => blaze_build_script::facts::sdk_id_digest(""),
+        };
+        self.cached_sdk = Some(digest);
+        digest
+    }
+
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
         if let Some(subject) = path.strip_prefix(REPLY_FILES)
             && let Some(parsed) = blaze_build_script::facts::parse_cc_probe_subject(subject)
             && let Some(key_hex) = subject.rsplit('\n').next()
         {
-            return read_c_probe_reply(self.home, parsed, key_hex, alloc);
+            let active_sdk = self.active_sdk_digest();
+            return read_c_probe_reply(self.home, parsed, key_hex, &active_sdk, alloc);
         }
         if path == SHIM_FILE {
             let installed = || {
@@ -179,7 +198,7 @@ impl<'a> FactFiles<'a> {
 /// iff every `FACT_MOUNT` row matches its stored digest.
 pub(crate) fn verify_fact_leaves(leaves: &Leaves<'_>, exe_dir: Option<&str>, frame: &Frame) -> bool {
     let erased = blaze_own::Erased::new(frame);
-    let mut fact_files = FactFiles { setting: None, exe_dir, home: None };
+    let mut fact_files = FactFiles { setting: None, exe_dir, home: None, sdk_digest: None, cached_sdk: None };
     for i in 0..leaves.len() {
         let row = leaves.row(i);
         let path = leaves.path(i);
@@ -1140,7 +1159,24 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, frame)
+        self.follow_served_with_sdk(cx, root, home, last, marked, served, None, frame)
+    }
+
+    /// [`Follow::follow_served`] carrying a lazy active SDK identity resolver for `cc-probe`
+    /// revalidation (invoked at most once, only if `last` contains a `cc-probe` leaf).
+    #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
+    pub(crate) fn follow_served_with_sdk<'f>(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        home: Option<&Dir<ReadWrite>>,
+        last: &Leaves<'_>,
+        marked: Option<&[bool]>,
+        served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        sdk_digest: Option<&dyn Fn() -> [u8; 32]>,
+        frame: &'f Frame,
+    ) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served_by_with_sdk::<Batched>(cx, root, home, last, marked, served, sdk_digest, frame)
     }
 
     /// A served script observation can depend on paths beyond its recorded name, including
@@ -1156,7 +1192,22 @@ impl<S: Stamps> Follow<S> {
         home: Option<&Dir<ReadWrite>>,
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
+        served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        frame: &'f Frame,
+    ) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served_by_with_sdk::<W>(cx, root, home, last, marked, served, None, frame)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
+    fn follow_served_by_with_sdk<'f, W: Walk>(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        home: Option<&Dir<ReadWrite>>,
+        last: &Leaves<'_>,
+        marked: Option<&[bool]>,
         mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        sdk_digest: Option<&dyn Fn() -> [u8; 32]>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
@@ -1166,7 +1217,7 @@ impl<S: Stamps> Follow<S> {
         let mut bytes = Bytes::new_in(frame, "a file the last answer read");
         let mut layout_moved = false;
         let erased = blaze_own::Erased::new(frame);
-        let mut fact_files = FactFiles { setting: None, exe_dir: None, home: home.map(|dir| (&cx, dir)) };
+        let mut fact_files = FactFiles { setting: None, exe_dir: None, home: home.map(|dir| (&cx, dir)), sdk_digest, cached_sdk: None };
         // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
         // after them in the table's (kind, path) order.
         let mut crates: Vec<usize, &Frame> = Vec::new_in(frame);
@@ -1918,10 +1969,13 @@ mod tests {
 
         let active_answerer = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id();
         let active_pin = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).unwrap_or([0x55u8; 32]);
-        let subj_a = cc_probe_subject(&active_answerer, &active_pin, &key_a, alloc);
-        let subj_b = cc_probe_subject(&active_answerer, &active_pin, &key_b, alloc);
+        let active_sdk = blaze_build_script::facts::sdk_id_digest("");
+        let stale_sdk = blaze_build_script::facts::sdk_id_digest("macos-sdk-14.5");
+        let subj_a = cc_probe_subject(&active_answerer, &active_pin, &active_sdk, &key_a, alloc);
+        let subj_b = cc_probe_subject(&active_answerer, &active_pin, &active_sdk, &key_b, alloc);
         let stale_pin = [0x99u8; 32];
-        let subj_stale = cc_probe_subject(&active_answerer, &stale_pin, &key_b, alloc);
+        let subj_stale = cc_probe_subject(&active_answerer, &stale_pin, &active_sdk, &key_b, alloc);
+        let subj_stale_sdk = cc_probe_subject(&active_answerer, &active_pin, &stale_sdk, &key_b, alloc);
         let key_a_hex = subj_a.as_str().rsplit('\n').next().unwrap();
         let key_b_hex = subj_b.as_str().rsplit('\n').next().unwrap();
         let dig_a = canonical_reply_digest(&ans_a);
@@ -1931,12 +1985,18 @@ mod tests {
         let parsed_a = blaze_build_script::facts::parse_cc_probe_subject(subj_a.as_str()).unwrap();
         let parsed_b = blaze_build_script::facts::parse_cc_probe_subject(subj_b.as_str()).unwrap();
         let parsed_stale = blaze_build_script::facts::parse_cc_probe_subject(subj_stale.as_str()).unwrap();
-        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, alloc).unwrap(), dig_a);
-        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(), dig_b);
+        let parsed_stale_sdk = blaze_build_script::facts::parse_cc_probe_subject(subj_stale_sdk.as_str()).unwrap();
+        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(), dig_a);
+        assert_eq!(read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(), dig_b);
         assert_eq!(
-            read_c_probe_reply_with(Some((&cx, &home)), parsed_stale, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_stale, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
             crate::engine_script_reads::NONE,
             "stale clang pin must invalidate"
+        );
+        assert_eq!(
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_stale_sdk, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
+            crate::engine_script_reads::NONE,
+            "stale SDK identity must invalidate"
         );
 
         let path_a = std::format!("{REPLY_FILES}{}", subj_a.as_str());
@@ -1969,26 +2029,31 @@ mod tests {
         home.publish(&cx, &Path::new(&rel_a).expect("rel_a"), Content::bytes(&sealed), Durable::No).expect("overwrite A");
 
         assert_eq!(
-            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
             canonical_reply_digest(&ans_a2),
             "probe A reflects new answer"
         );
         assert_eq!(
-            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
             dig_b,
             "probe B untouched"
         );
 
-        // Oversized corrupted record (> MAX_RECORD_BYTES) is rejected as NONE before allocating.
+        // Oversized corrupted record (> MAX_RECORD_BYTES) is rejected as NONE before allocating in
+        // BOTH sweep and primary DirStore::get_c_probe readers.
         let oversized = std::vec![0u8; (blaze_proc_macro::probe_clang::MAX_RECORD_BYTES as usize) + 1];
         home.publish(&cx, &Path::new(&rel_a).expect("rel_a"), Content::bytes(&oversized), Durable::No).expect("oversized A");
         assert_eq!(
-            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_a, key_a_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
             crate::engine_script_reads::NONE,
-            "oversized c-probe record must return NONE"
+            "oversized c-probe record must return NONE in sweep"
+        );
+        assert!(
+            blaze_proc_macro::probe_clang::CProbeStore::get(&dir_store, &key_a, alloc).unwrap().is_none(),
+            "oversized c-probe record must return None in DirStore::get_c_probe"
         );
         assert_eq!(
-            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, alloc).unwrap(),
+            read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
             dig_b,
             "probe B still untouched"
         );

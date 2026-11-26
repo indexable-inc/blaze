@@ -566,7 +566,7 @@ impl ScriptSandbox {
                     Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
                 };
                 let answerer_id = c_probes.answerer.id();
-                let subject = facts::cc_probe_subject(&answerer_id, &clang, &resolved.key, alloc);
+                let subject = facts::cc_probe_subject(&answerer_id, &clang, &c_probes.sdk_digest, &resolved.key, alloc);
                 let code = resolved.answered.code;
                 let stdout = resolved.answered.stdout.as_bytes().to_vec();
                 let stderr = resolved.answered.stderr.as_bytes().to_vec();
