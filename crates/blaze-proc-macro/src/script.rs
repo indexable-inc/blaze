@@ -317,6 +317,60 @@ fn imports<W: ScriptWidth>(l: &mut Linker<ScriptHost>) -> wasmtime::Result<()> {
     l.func_wrap(wasi, "fd_filestat_set_size", |mut c: Caller<'_, ScriptHost>, fd: u32, size: u64| {
         with(&mut c, |_, host| errno(host.sandbox.set_size(fd, size)))
     })?;
+    // For 64-bit `wasm64-blaze-wasip1` guests, `library/wasi_rt` issues filesystem mutations
+    // through `blaze_seed` with absolute paths (root preopen fd = 3). Route them straight into
+    // `ScriptSandbox`'s existing `OUT_DIR`-only policy.
+    if W::WASI_MODULE == WASI_64 {
+        const SEED: &str = "blaze_seed";
+        const ROOT_FD: u32 = 3;
+        l.func_wrap(SEED, "create_dir", |mut c: Caller<'_, ScriptHost>, path: u64, len: u64| {
+            with(&mut c, |mem, host| {
+                let path = blaze_wasi::bytes(mem, path, len)?;
+                errno(host.sandbox.create_dir(ROOT_FD, path))
+            })
+        })?;
+        l.func_wrap(SEED, "remove_dir", |mut c: Caller<'_, ScriptHost>, path: u64, len: u64| {
+            with(&mut c, |mem, host| {
+                let path = blaze_wasi::bytes(mem, path, len)?;
+                errno(host.sandbox.remove(ROOT_FD, path, true))
+            })
+        })?;
+        l.func_wrap(SEED, "unlink", |mut c: Caller<'_, ScriptHost>, path: u64, len: u64| {
+            with(&mut c, |mem, host| {
+                let path = blaze_wasi::bytes(mem, path, len)?;
+                errno(host.sandbox.remove(ROOT_FD, path, false))
+            })
+        })?;
+        l.func_wrap(
+            SEED,
+            "rename",
+            |mut c: Caller<'_, ScriptHost>, from: u64, from_len: u64, to: u64, to_len: u64| {
+                with(&mut c, |mem, host| {
+                    let from = blaze_wasi::bytes(mem, from, from_len)?;
+                    let to = blaze_wasi::bytes(mem, to, to_len)?;
+                    errno(host.sandbox.rename(ROOT_FD, from, ROOT_FD, to))
+                })
+            },
+        )?;
+        l.func_wrap(SEED, "hard_link", |_: Caller<'_, ScriptHost>, _: u64, _: u64, _: u64, _: u64| -> i32 {
+            i32::from(Errno::NOTSUP.0)
+        })?;
+        l.func_wrap(SEED, "symlink", |_: Caller<'_, ScriptHost>, _: u64, _: u64, _: u64, _: u64| -> i32 {
+            i32::from(Errno::NOTSUP.0)
+        })?;
+        l.func_wrap(SEED, "set_times", |_: Caller<'_, ScriptHost>, _: u64, _: u64, _: u32, _: u64, _: u64| -> i32 {
+            i32::from(Errno::NOTSUP.0)
+        })?;
+        l.func_wrap(SEED, "fd_set_times", |_: Caller<'_, ScriptHost>, _: u32, _: u64, _: u64| -> i32 {
+            i32::from(Errno::NOTSUP.0)
+        })?;
+        l.func_wrap(SEED, "set_len", |mut c: Caller<'_, ScriptHost>, fd: u32, len: u64| {
+            with(&mut c, |_, host| errno(host.sandbox.set_size(fd, len)))
+        })?;
+        l.func_wrap(SEED, "sync", |mut c: Caller<'_, ScriptHost>, fd: u32, _data_only: u32| {
+            with(&mut c, |_, host| errno(blaze_wasi::System::fd_filetype(&mut host.sandbox, fd).map(|it| it.map(|_| ()))))
+        })?;
+    }
     Ok(())
 }
 
@@ -354,7 +408,7 @@ impl ScriptRuntime {
             .wasm_memory64(true);
         let engine = Engine::new(&config).map_err(RuntimeError::Engine)?;
         let mut bytes = Bytes::default();
-        bytes.write(b"blaze build-script host 2\n");
+        bytes.write(b"blaze build-script host 3\n");
         engine.precompile_compatibility_hash().hash(&mut bytes);
         bytes.write(std::env::consts::ARCH.as_bytes());
         bytes.write(std::env::consts::OS.as_bytes());

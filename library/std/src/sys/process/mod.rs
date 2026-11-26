@@ -15,6 +15,10 @@ cfg_select! {
         mod motor;
         use motor as imp;
     }
+    all(target_os = "wasi", target_env = "p1", target_arch = "wasm64") => {
+        mod blaze_wasi64;
+        use blaze_wasi64 as imp;
+    }
     _ => {
         mod unsupported;
         use unsupported as imp;
