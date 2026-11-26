@@ -440,6 +440,14 @@ enum FileLockKind {
     Native(crate::rt::NativeLock),
 }
 
+/// Outcome of a bounded read performed through a held [`FileLock`]'s root capability.
+pub enum BoundedRead<'a> {
+    Absent,
+    Oversized,
+    Grew,
+    Whole(blaze_own::Vec<u8, blaze_own::Alloc<'a>>),
+}
+
 pub struct FileLock {
     kind: FileLockKind,
     name: FileName,
@@ -447,6 +455,98 @@ pub struct FileLock {
 }
 
 impl FileLock {
+    /// Reads `path` (bounded at `max_bytes` before allocating) through the exact same root
+    /// directory capability that holds this lock — eliminating any TOCTOU window if the root
+    /// pathname is renamed or replaced while the lock is held.
+    pub fn read_bounded<'a>(
+        &self,
+        cx: &Cx,
+        dir: &Dir<ReadWrite>,
+        path: &Path,
+        max_bytes: u64,
+        single_read_plant: bool,
+        alloc: blaze_own::Alloc<'a>,
+    ) -> Result<BoundedRead<'a>, FsError> {
+        let name = dir.beneath(path);
+        match &self.kind {
+            FileLockKind::Sim { .. } => {
+                let file = match dir.open_read(cx, path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind == FsKind::NotFound => return Ok(BoundedRead::Absent),
+                    Err(error) => return Err(error),
+                };
+                let len_u64 = match file.len(cx) {
+                    Ok(len) => len,
+                    Err(error) if error.kind == FsKind::NotFound => return Ok(BoundedRead::Absent),
+                    Err(error) => return Err(error),
+                };
+                if len_u64 > max_bytes {
+                    return Ok(BoundedRead::Oversized);
+                }
+                let len = usize::try_from(len_u64).map_err(|_| driver_error(FsOp::Read, &name, &"record length overflow"))?;
+                let cap = len.checked_add(1).ok_or_else(|| driver_error(FsOp::Read, &name, &"record capacity overflow"))?;
+                let mut bytes = blaze_own::Vec::with_capacity_in(cap, alloc);
+                bytes.resize(cap, 0u8);
+                let mut filled = 0usize;
+                while filled < cap {
+                    let step_off = u64::try_from(filled).map_err(|_| driver_error(FsOp::Read, &name, &"read offset overflow"))?;
+                    let Some(dst) = bytes.as_mut_slice().get_mut(filled..) else {
+                        break;
+                    };
+                    let n = file.read_into(dst, step_off).wait(cx)?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                    if single_read_plant {
+                        break;
+                    }
+                }
+                if filled > len {
+                    return Ok(BoundedRead::Grew);
+                }
+                bytes.truncate(filled);
+                Ok(BoundedRead::Whole(bytes))
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                cx.stopped_by(dir.io.now())
+                    .map_err(|s| FsError::new(FsOp::Read, &name, FsKind::Stopped(s)))?;
+                match crate::rt::read_bounded_under_lock(native, name.as_str(), max_bytes, single_read_plant, alloc) {
+                    Ok(crate::rt::NativeBoundedRead::Absent) => Ok(BoundedRead::Absent),
+                    Ok(crate::rt::NativeBoundedRead::Oversized) => Ok(BoundedRead::Oversized),
+                    Ok(crate::rt::NativeBoundedRead::Grew) => Ok(BoundedRead::Grew),
+                    Ok(crate::rt::NativeBoundedRead::Whole(bytes)) => Ok(BoundedRead::Whole(bytes)),
+                    Err(msg) => Err(driver_error(FsOp::Read, &name, &msg.as_str())),
+                }
+            }
+        }
+    }
+
+    /// Atomically publishes `whole` at `path` through the exact same root directory capability
+    /// that holds this lock — eliminating any TOCTOU window if the root pathname is renamed or
+    /// replaced while the lock is held.
+    pub fn publish(
+        &self,
+        cx: &Cx,
+        dir: &Dir<ReadWrite>,
+        path: &Path,
+        whole: &[u8],
+        durable: Durable,
+    ) -> Result<(), FsError> {
+        match &self.kind {
+            FileLockKind::Sim { .. } => dir.publish(cx, path, Content::bytes(whole), durable).map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                let name = dir.beneath(path);
+                cx.stopped_by(dir.io.now())
+                    .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+                crate::rt::publish_under_lock(native, name.as_str(), whole, durable == Durable::Yes)
+                    .map_err(|msg| driver_error(FsOp::Publish, &name, &msg.as_str()))
+            }
+        }
+    }
+
     /// Explicitly releases the file lock under `cx`, surfacing any `Done::Failed` or stop error.
     /// Marks the lock released ONLY after receiving confirmation so `Drop` still performs its
     /// bounded fallback unlock if an explicit unlock fails or times out.

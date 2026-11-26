@@ -503,6 +503,9 @@ pub(crate) fn same_guest_dir(cwd_override: &str, mount: &str) -> bool {
         }
         true
     }
+    if cwd_override.is_empty() {
+        return false;
+    }
     let mut norm_mount = [""; MAX_PARTS];
     let mut mount_len = 0usize;
     if !push_parts(mount, &mut norm_mount, &mut mount_len) {

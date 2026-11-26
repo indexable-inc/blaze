@@ -202,6 +202,42 @@ impl OnDir {
         self.dir.lock_exclusive(&cx, &Self::path(name)?).map_err(FilesError::Effect)
     }
 
+    /// Reads and seal-verifies `name` (bounded at `max_bytes`) through `guard`'s opened root
+    /// capability so the read and lock always target the exact same directory inode.
+    fn read_sealed_bounded_under_lock<'a>(
+        &self,
+        guard: &bstd::fs::FileLock,
+        name: &RecordName,
+        max_bytes: u64,
+        single_read_plant: bool,
+        alloc: Alloc<'a>,
+    ) -> Result<Option<AVec<'a, u8>>, FilesError> {
+        let cx = self.cx(name)?;
+        let mut bytes = match guard.read_bounded(&cx, &self.dir, &Self::path(name)?, max_bytes, single_read_plant, alloc).map_err(FilesError::Effect)? {
+            bstd::fs::BoundedRead::Absent | bstd::fs::BoundedRead::Oversized => return Ok(None),
+            bstd::fs::BoundedRead::Grew => return Err(FilesError::OtherBytes { name: *name }),
+            bstd::fs::BoundedRead::Whole(bytes) => bytes,
+        };
+        let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else {
+            return Ok(None);
+        };
+        let Some((body, seal)) = bytes.as_slice().split_at_checked(body_len) else {
+            return Ok(None);
+        };
+        if ContentId::of(SEAL, body).0 != seal {
+            return Ok(None);
+        }
+        bytes.truncate(body_len);
+        Ok(Some(bytes))
+    }
+
+    /// Atomically publishes `whole` at `name` through `guard`'s opened root capability so the
+    /// publish and lock always target the exact same directory inode.
+    fn publish_under_lock(&self, guard: &bstd::fs::FileLock, name: &RecordName, whole: &[u8]) -> Result<(), FilesError> {
+        let cx = self.cx(name)?;
+        guard.publish(&cx, &self.dir, &Self::path(name)?, whole, Durable::No).map_err(FilesError::Effect)
+    }
+
     /// [`RecordPlant::FramedPublish`]'s write: `whole` copied into the task's frame, then
     /// published from there, so a record longer than the frame is refused. Never taken but by
     /// the planted bug's test.
@@ -542,12 +578,12 @@ impl DirStore {
             Some(self.files.lock_exclusive(&lock_name)?)
         };
         let single_read = self.plant == RecordPlant::SingleReadCProbe;
-        let result = if repair_guard.is_some() {
-            match self.files.read_sealed_bounded(name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc) {
+        let result = if let Some(guard) = repair_guard.as_ref() {
+            match self.files.read_sealed_bounded_under_lock(guard, name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc) {
                 Ok(Some(held)) => {
                     if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) }
                 }
-                Ok(None) => self.files.publish(name, whole.as_slice()),
+                Ok(None) => self.files.publish_under_lock(guard, name, whole.as_slice()),
                 Err(err) => Err(err),
             }
         } else {

@@ -1902,16 +1902,46 @@ mod tests {
                 "refused symlink locks must never create files outside native root"
             );
             let ok_path = bstd::path::Path::new("sub/.repair.lock").expect("ok path");
+            let rec_path = bstd::path::Path::new("sub/rec").expect("rec path");
+            std::fs::create_dir_all(lock_root.join("sub")).expect("create sub");
+            std::fs::write(lock_root.join("sub/rec"), b"corrupt-on-old-inode").expect("write old inode record");
             let held = lock_dir.lock_exclusive(&lock_cx, &ok_path).expect("legitimate lock beneath root");
-            held.unlock(&lock_cx).expect("unlock legitimate lock");
 
-            // If the native world's root directory is renamed and replaced after opening,
-            // `lock_exclusive` must refuse instead of silently locking the old inode while file I/O
-            // targets the replacement directory.
+            // Rename and replace the native world's root directory WHILE `held` is active:
+            // protected read & publish through `held` must stay pinned to the exact opened root
+            // directory inode holding the flock and NEVER touch the replacement tree.
             let moved_root = std::env::temp_dir().join(format!("blaze-cprobe-lockmoved-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&moved_root);
-            std::fs::rename(&lock_root, &moved_root).expect("rename lock root");
-            std::fs::create_dir_all(lock_root.join("sub")).expect("recreate lock root");
+            std::fs::rename(&lock_root, &moved_root).expect("rename lock root while locked");
+            std::fs::create_dir_all(lock_root.join("sub")).expect("recreate replacement lock root");
+            std::fs::write(lock_root.join("sub/rec"), b"sentinel-on-new-inode").expect("write new inode sentinel");
+
+            let seen = held
+                .read_bounded(&lock_cx, &lock_dir, &rec_path, 4096, false, alloc)
+                .expect("read_bounded under held lock");
+            let bstd::fs::BoundedRead::Whole(seen_bytes) = seen else {
+                panic!("expected Whole read from locked old inode");
+            };
+            assert_eq!(
+                seen_bytes.as_slice(),
+                b"corrupt-on-old-inode",
+                "locked read must stay on the locked inode rather than the replacement path"
+            );
+            held.publish(&lock_cx, &lock_dir, &rec_path, b"repaired-on-old-inode", bstd::fs::Durable::No)
+                .expect("publish under held lock");
+            assert_eq!(
+                std::fs::read(moved_root.join("sub/rec")).expect("read old inode"),
+                b"repaired-on-old-inode",
+                "locked publish must update the locked inode"
+            );
+            assert_eq!(
+                std::fs::read(lock_root.join("sub/rec")).expect("read replacement inode"),
+                b"sentinel-on-new-inode",
+                "locked publish must never modify the replacement root directory"
+            );
+            held.unlock(&lock_cx).expect("unlock legitimate lock");
+
+            // Any subsequent lock attempt on the stale world must also refuse after root replacement.
             let replaced_err = lock_dir
                 .lock_exclusive(&lock_cx, &ok_path)
                 .err()
@@ -2067,6 +2097,7 @@ mod tests {
             alloc,
         ));
         // Equivalent current_dir spellings resolve to the script mount instead of refusing probes.
+        assert!(!crate::spawn_route::same_guest_dir("", "/package"));
         assert!(crate::spawn_route::same_guest_dir(".", "/package"));
         assert!(crate::spawn_route::same_guest_dir("./", "/package"));
         assert!(crate::spawn_route::same_guest_dir("/package/.", "/package"));
