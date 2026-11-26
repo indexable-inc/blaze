@@ -1201,6 +1201,8 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                     let krate = crate_of_item(list, tabled, heap.alloc());
                     box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled: *compiled, cached: *cached, why }, heap)
                 })?;
+                let enclosers = crate::test_drive::suite_cache::local_enclosers_of(walk, row, tabled);
+                maker.prepare_local(enclosers.locals(), enclosers.enclosers());
                 match walk.one(row, ids, codes, builder, &builder.producer, maker, &proof, &body_ids::EntryForm, MOST_WALKED, scratch) {
                     Ok(one) => match one.stepped {
                         Stepped::Found(key) => {
@@ -1319,6 +1321,8 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                     let krate = crate_of_item(list, tabled, heap.alloc());
                     box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled: *compiled, cached: *cached, why }, heap)
                 })?;
+                let enclosers = crate::test_drive::suite_cache::local_enclosers_of(walk, row, tabled);
+                maker.prepare_local(enclosers.locals(), enclosers.enclosers());
                 match walk.begin(row, ids, codes, builder, &builder.producer, maker, &body_ids::EntryForm, MOST_WALKED, scratch) {
                     Ok(blaze_ladder::body_ids::Begun::Stepped(one)) => match one.stepped {
                         Stepped::Found(key) => {
@@ -1340,7 +1344,6 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                         let name_slice = walk.name(row);
                         let mut name = Vec::with_capacity_in(name_slice.len(), shared);
                         name.extend_from_slice(name_slice);
-                        let enclosers = crate::test_drive::suite_cache::local_enclosers_of(walk, row, tabled);
                         let job = ExportJob { row, order: pend.order(), proof, name, enclosers };
                         // Route by `ItemKey` home affinity so repeated monomorphizations of the
                         // same generic body (`Vec::push`, `Iterator::next`, etc.) reuse one
@@ -1692,6 +1695,8 @@ fn export_program<'f>(
                 let krate = crate_of_item(list, tabled, heap.alloc());
                 box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
             })?;
+            let enclosers = crate::test_drive::suite_cache::local_enclosers_of(&walk, row, tabled);
+            maker.prepare_local(enclosers.locals(), enclosers.enclosers());
             match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
                 Ok(one) => match one.stepped {
                     Stepped::Found(key) => {
