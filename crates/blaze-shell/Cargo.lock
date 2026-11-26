@@ -25,6 +25,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-cli-spec"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-data"
 version = "0.0.0"
 dependencies = [
@@ -166,6 +173,7 @@ dependencies = [
 name = "blaze-shell"
 version = "0.0.0"
 dependencies = [
+ "blaze-cli-spec",
  "blaze-data",
  "blaze-git",
  "blaze-html",
@@ -173,6 +181,7 @@ dependencies = [
  "blaze-own",
  "blaze-preview",
  "blaze-sh",
+ "blaze-shell-config",
  "blaze-sniff",
  "blaze-ssh",
  "blaze-ui",
@@ -186,6 +195,15 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "objc2-quartz-core",
+]
+
+[[package]]
+name = "blaze-shell-config"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-own",
+ "blaze-toml",
 ]
 
 [[package]]

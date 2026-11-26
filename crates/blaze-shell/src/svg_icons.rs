@@ -737,8 +737,10 @@ pub struct IconSlot {
 pub struct IconAtlas {
     cell_px: usize,
     slots: HashMap<&'static str, Option<IconSlot>>,
+    emoji_slots: HashMap<(String, usize), Option<IconSlot>>,
     next_x: usize,
     next_y: usize,
+    row_h: usize,
     /// Newly rasterized `(slot, straight RGBA8 bytes)` waiting for Metal upload.
     pub pending: Vec<(IconSlot, Vec<u8>)>,
 }
@@ -750,8 +752,10 @@ impl IconAtlas {
         Self {
             cell_px,
             slots: HashMap::new(),
+            emoji_slots: HashMap::new(),
             next_x: 0,
             next_y: 0,
+            row_h: 0,
             pending: Vec::new(),
         }
     }
@@ -781,6 +785,75 @@ impl IconAtlas {
         out
     }
 
+    /// Rasterize full-color Apple Color Emoji / custom Unicode symbols (e.g. `"🦑"`, `"👋🌎"`)
+    /// directly into the RGBA8 Metal icon atlas and append their quads into `out`.
+    pub fn rasterize_emoji_quads_into(
+        &mut self,
+        quads: &[crate::view::EmojiQuad],
+        out: &mut Vec<blaze_ui::shaders::GlyphInst>,
+    ) {
+        let inv = 1.0 / ICON_ATLAS_SIZE as f32;
+        for q in quads {
+            if q.text.is_empty() || q.h <= 0.0 {
+                continue;
+            }
+            let aspect = (q.w / q.h).clamp(0.8, 6.0);
+            let w_px = ((self.cell_px as f32) * aspect).round().clamp(16.0, 224.0) as usize;
+            let Some(slot) = self.emoji_slot(&q.text, w_px) else {
+                continue;
+            };
+            out.push(blaze_ui::shaders::GlyphInst {
+                rect: [q.x, q.y, q.x + q.w, q.y + q.h],
+                uv: [
+                    slot.x as f32 * inv,
+                    slot.y as f32 * inv,
+                    (slot.x + slot.w) as f32 * inv,
+                    (slot.y + slot.h) as f32 * inv,
+                ],
+                color: [1.0, 1.0, 1.0, q.alpha],
+                clip_info: [q.clip_id, 0, 0, 0],
+            });
+        }
+    }
+
+    fn alloc_rect(&mut self, w_px: usize, h_px: usize) -> Option<IconSlot> {
+        let step_w = w_px + 2;
+        let step_h = h_px + 2;
+        if step_w > ICON_ATLAS_SIZE || step_h > ICON_ATLAS_SIZE {
+            return None;
+        }
+        if self.next_x + step_w > ICON_ATLAS_SIZE {
+            self.next_x = 0;
+            self.next_y += self.row_h;
+            self.row_h = 0;
+        }
+        if self.next_y + step_h > ICON_ATLAS_SIZE {
+            return None;
+        }
+        let slot = IconSlot { x: self.next_x + 1, y: self.next_y + 1, w: w_px, h: h_px };
+        self.next_x += step_w;
+        self.row_h = self.row_h.max(step_h);
+        Some(slot)
+    }
+
+    fn emoji_slot(&mut self, text: &str, w_px: usize) -> Option<IconSlot> {
+        let key = (text.to_owned(), w_px);
+        if let Some(&cached) = self.emoji_slots.get(&key) {
+            return cached;
+        }
+        let s = self.rasterize_emoji(text, w_px);
+        self.emoji_slots.insert(key, s);
+        s
+    }
+
+    fn rasterize_emoji(&mut self, text: &str, w_px: usize) -> Option<IconSlot> {
+        let h_px = self.cell_px;
+        let rgba = rasterize_coretext_rgba(text, w_px, h_px)?;
+        let slot = self.alloc_rect(w_px, h_px)?;
+        self.pending.push((slot, rgba));
+        Some(slot)
+    }
+
     fn slot(&mut self, name: &'static str) -> Option<IconSlot> {
         if let Some(&cached) = self.slots.get(name) {
             return cached;
@@ -793,15 +866,7 @@ impl IconAtlas {
     fn rasterize(&mut self, name: &'static str) -> Option<IconSlot> {
         let art = get_svg(name)?;
         let sz = self.cell_px;
-        // 1px transparent padding prevents bilinear bleeding between adjacent atlas slots.
-        let step = sz + 2;
-        if self.next_x + step > ICON_ATLAS_SIZE {
-            self.next_x = 0;
-            self.next_y += step;
-        }
-        if self.next_y + step > ICON_ATLAS_SIZE {
-            return None;
-        }
+        let slot = self.alloc_rect(sz, sz)?;
 
         let mut buf = vec![0u8; sz * sz * 4];
         {
@@ -897,9 +962,14 @@ impl IconAtlas {
             }
         }
 
-        let slot = IconSlot { x: self.next_x + 1, y: self.next_y + 1, w: sz, h: sz };
-        self.next_x += step;
         self.pending.push((slot, buf));
         Some(slot)
     }
+}
+
+/// Rasterize a UTF-8 emoji or custom symbol string (`"🦑"`, `"👋🌎"`, `"🔥"`, `"λ"`) into a
+/// straight-RGBA8 Retina bitmap using CoreText + Apple Color Emoji cascade.
+#[cfg(target_os = "macos")]
+fn rasterize_coretext_rgba(text: &str, w_px: usize, h_px: usize) -> Option<Vec<u8>> {
+    crate::image_atlas::rasterize_coretext_rgba(text, w_px, h_px)
 }

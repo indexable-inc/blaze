@@ -5,6 +5,8 @@
 
 pub mod agent_hub;
 pub mod blocks;
+pub mod cli_spec_driver;
+pub mod config;
 pub mod editor;
 pub mod host;
 pub mod icons;
@@ -990,6 +992,7 @@ mod tests {
                 is_remote: false,
                 name: "claude #1".to_owned(),
                 prompt_summary: "test".to_owned(),
+                metric_badge: "12%".to_owned(),
                 cwd: "/tmp".to_owned(),
                 pid: Some(1),
                 status: crate::agent_hub::AgentStatus::Running,
@@ -997,6 +1000,7 @@ mod tests {
                 preview_lines: vec!["ok".to_owned()],
             }],
             selected: 0,
+            sidebar_ratio: 0.34,
             composing_new: false,
             new_prompt: String::new(),
         };
@@ -1222,6 +1226,7 @@ mod tests {
         let tabs = [TabBarItem {
             id: wm.active_tab().id,
             slot: 1,
+            symbol: None,
             title: "tmp",
             active: true,
             pane_count: l.pane_count_in_tab,
@@ -1423,5 +1428,89 @@ mod tests {
                 "direct cwd matches should outrank subfolder matches: {labels:?}"
             );
         }
+    }
+
+    #[test]
+    fn user_config_toml_host_and_project_symbols() {
+        let toml = r#"
+[host]
+symbol = "🦑"
+label = ""
+
+[hosts.prod]
+symbol = "⚡"
+label = "prod-gpu"
+
+[projects."/Volumes/Projects/tmp/hello-world"]
+symbol = "👋🌎"
+
+[projects]
+"~/Projects/blaze" = "🔥"
+"#;
+        let alloc = blaze_own::Alloc::global();
+        let cfg = crate::config::UserConfig::parse_in(toml, alloc);
+        let h_local = cfg.resolve_host("hydra", false).expect("local host");
+        assert_eq!(h_local.symbol_str(), Some("🦑"));
+        assert_eq!(h_local.label_str(), Some(""));
+
+        let h_prod = cfg.resolve_host("prod", true).expect("prod host");
+        assert_eq!(h_prod.symbol_str(), Some("⚡"));
+        assert_eq!(h_prod.label_str(), Some("prod-gpu"));
+
+        // Exact match AND nested subdir prefix match both inherit `👋🌎`!
+        let p_exact = cfg
+            .resolve_project("/Volumes/Projects/tmp/hello-world", "/Users/test")
+            .expect("exact project match");
+        assert_eq!(p_exact.symbol_str(), Some("👋🌎"));
+        let p_sub = cfg
+            .resolve_project("/Volumes/Projects/tmp/hello-world/src", "/Users/test")
+            .expect("subdir prefix match");
+        assert_eq!(p_sub.symbol_str(), Some("👋🌎"));
+
+        // Tilde shorthand rule works too!
+        let p_tilde = cfg
+            .resolve_project("/Users/test/Projects/blaze/crates", "/Users/test")
+            .expect("tilde shorthand match");
+        assert_eq!(p_tilde.symbol_str(), Some("🔥"));
+
+        assert_eq!(crate::config::symbol_cluster_count("🦑"), 1);
+        assert_eq!(crate::config::symbol_cluster_count("👋🌎"), 2);
+    }
+
+    #[test]
+    fn cl_abbreviation_dynamic_claude_flags_and_command_syntax_classes() {
+        let mut ed = crate::editor::Editor::new();
+        ed.text = "cl".to_owned();
+        ed.cursor = ed.text.len();
+        assert!(ed.try_expand_abbreviation());
+        assert_eq!(ed.text, "claude --dangerously-skip-permissions");
+
+        // Dynamic/curated flag completion for `claude --dangerou`.
+        let alloc = blaze_own::Alloc::global();
+        let state = blaze_sh::EngineState::new("/", &[], alloc);
+        ed.text = "claude --dangerou".to_owned();
+        ed.cursor = ed.text.len();
+        ed.refresh_assist(&state, &[], true);
+        assert!(
+            ed.completions
+                .iter()
+                .any(|c| c.label == "--dangerously-skip-permissions"),
+            "expected --dangerously-skip-permissions in {:?}",
+            ed.completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+
+        // Builtin vs Abbrev vs External syntax classification.
+        assert_eq!(
+            crate::editor::classify_command_token("ls", Some(&ed.abbreviations)),
+            crate::editor::CommandHighlightKind::Builtin
+        );
+        assert_eq!(
+            crate::editor::classify_command_token("cl", Some(&ed.abbreviations)),
+            crate::editor::CommandHighlightKind::Abbrev
+        );
+        assert_eq!(
+            crate::editor::classify_command_token("/bin/sh", Some(&ed.abbreviations)),
+            crate::editor::CommandHighlightKind::External
+        );
     }
 }

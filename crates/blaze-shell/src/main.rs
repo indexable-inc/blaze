@@ -299,8 +299,11 @@ mod macos_app {
         if alt_screen || selecting_text {
             return CursorKind::IBeam;
         }
-        if scene.hit_test(x, y).is_some() {
-            return CursorKind::Pointer;
+        if let Some(act) = scene.hit_test(x, y) {
+            return match act {
+                HitAction::ResizeAgentSidebar => CursorKind::ResizeEW,
+                _ => CursorKind::Pointer,
+            };
         }
         if scene.composer_rect.contains(x, y) {
             return CursorKind::IBeam;
@@ -618,6 +621,7 @@ mod macos_app {
                         .unwrap_or_else(|_| "/".to_owned())
                 });
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_owned());
+            let _ = blaze_shell::config::ensure_default_config(&home);
             let env_owned: Vec<(String, String)> = std::env::vars().collect();
             let env_refs: Vec<(&str, &str)> = env_owned
                 .iter()
@@ -1310,6 +1314,7 @@ mod macos_app {
                 )
             };
             let id_num = self.managed_agents.len() + 1;
+            let short_cwd = blaze_shell::prompt::abbreviate_home(cwd, &self.home);
             self.managed_agents.push(AgentRecord {
                 id: format!("agent-{id_num}"),
                 host: host.to_owned(),
@@ -1317,14 +1322,15 @@ mod macos_app {
                 name: format!("agent #{id_num} ({host})"),
                 prompt_summary: prompt_text
                     .clone()
-                    .unwrap_or_else(|| "interactive session".to_owned()),
+                    .unwrap_or_else(|| format!("{short_cwd} · interactive")),
+                metric_badge: "live".to_owned(),
                 cwd: cwd.to_owned(),
                 pid: None,
                 status: AgentStatus::Running,
                 pty_session_idx: Some(id_num - 1),
                 preview_lines: vec![
                     format!("host:   {host}"),
-                    format!("cwd:    {cwd}"),
+                    format!("cwd:    {short_cwd}"),
                     format!("cmd:    {display_cmd}"),
                 ],
             });
@@ -1639,11 +1645,18 @@ mod macos_app {
             .enumerate()
             .map(|(i, tab)| {
                 let p = panes.get(&tab.focused);
-                let title = p.map_or("shell", |s| s.prompt.dir_short.as_str());
+                let title = p.map_or("shell", |s| {
+                    s.prompt
+                        .project_label_override
+                        .as_deref()
+                        .unwrap_or(s.prompt.dir_short.as_str())
+                });
+                let symbol = p.and_then(|s| s.prompt.project_symbol.as_deref());
                 let process_tag = p.and_then(|s| s.process_tag());
                 TabBarItem {
                     id: tab.id,
                     slot: i + 1,
+                    symbol,
                     title,
                     active: i == wm.active_tab_index(),
                     pane_count: tab.root.leaf_count(),
@@ -2108,7 +2121,8 @@ mod macos_app {
                 for (slot, bytes) in fonts.pending.drain(..) {
                     renderer.upload(slot, &bytes);
                 }
-                let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
                 let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
@@ -2143,6 +2157,7 @@ mod macos_app {
                 }
                 scene.rects.clear();
                 scene.icon_quads.clear();
+                scene.emoji_quads.clear();
                 scene.image_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
@@ -2346,7 +2361,8 @@ mod macos_app {
             for (slot, bytes) in fonts.pending.drain(..) {
                 renderer.upload(slot, &bytes);
             }
-            let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+            let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+            icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
             let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
             for (slot, rgba) in icon_atlas.pending.drain(..) {
                 renderer.upload_icon(slot, &rgba);
@@ -2387,6 +2403,8 @@ mod macos_app {
         let mut composite_scene = Scene::new();
         let mut tile_layout = TileLayout::default();
         let mut dragging_split: Option<SplitHandle> = None;
+        let mut dragging_agent_sidebar = false;
+        let mut last_cli_spec_rev = blaze_shell::cli_spec_driver::spec_revision();
         let mut command_palette: Option<CommandPalette> = None;
         let mut last_cursor_rect: Option<[f32; 4]> = None;
         let mut trail_prev: Option<[f32; 4]> = None;
@@ -3864,6 +3882,28 @@ mod macos_app {
                                 .get_mut(&wm.focused_pane())
                                 .expect("focused pane must exist");
                             if !on_resize_edge(x, y, size.width as f32, size.height as f32)
+                                && shell.agent_hub.is_some()
+                            {
+                                if let Some(action) = composite_scene.hit_test(x, y) {
+                                    match action {
+                                        HitAction::ResizeAgentSidebar => {
+                                            dragging_agent_sidebar = true;
+                                            apply_cursor(&mut cur_cursor, CursorKind::ResizeEW);
+                                        }
+                                        HitAction::SelectAgent(idx) => {
+                                            if let Some(hub) = &mut shell.agent_hub
+                                                && idx < hub.agents.len()
+                                            {
+                                                hub.selected = idx;
+                                                dirty = true;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                continue;
+                            }
+                            if !on_resize_edge(x, y, size.width as f32, size.height as f32)
                                 && !shell.store.is_alternate_screen()
                                 && shell.yazi.is_none()
                                 && shell.agent_hub.is_none()
@@ -3993,6 +4033,18 @@ mod macos_app {
                                         }
                                         HitAction::CopyText(txt) => {
                                             copy_to_pasteboard(&txt);
+                                        }
+                                        HitAction::ResizeAgentSidebar => {
+                                            dragging_agent_sidebar = true;
+                                            apply_cursor(&mut cur_cursor, CursorKind::ResizeEW);
+                                        }
+                                        HitAction::SelectAgent(idx) => {
+                                            if let Some(hub) = &mut shell.agent_hub
+                                                && idx < hub.agents.len()
+                                            {
+                                                hub.selected = idx;
+                                                dirty = true;
+                                            }
                                         }
                                         HitAction::OpenLink { href, base_dir } => {
                                             active_popover = None;
@@ -4297,6 +4349,26 @@ mod macos_app {
                                 );
                                 continue;
                             }
+                            if dragging_agent_sidebar {
+                                let pane_rect = tile_layout
+                                    .panes
+                                    .iter()
+                                    .find(|p| p.focused)
+                                    .map(|p| p.rect)
+                                    .unwrap_or_else(|| {
+                                        HitRect::new(0.0, 0.0, size.width as f32, size.height as f32)
+                                    });
+                                let pw = (pane_rect.x1 - pane_rect.x0).max(240.0);
+                                let ratio = (x - pane_rect.x0) / pw;
+                                if let Some(shell) = panes.get_mut(&wm.focused_pane())
+                                    && let Some(hub) = &mut shell.agent_hub
+                                    && hub.set_sidebar_ratio(ratio)
+                                {
+                                    dirty = true;
+                                }
+                                apply_cursor(&mut cur_cursor, CursorKind::ResizeEW);
+                                continue;
+                            }
                             let shell = panes
                                 .get_mut(&wm.focused_pane())
                                 .expect("focused pane must exist");
@@ -4340,6 +4412,11 @@ mod macos_app {
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
                             last_mouse = Some((x, y));
+                            if dragging_agent_sidebar {
+                                dragging_agent_sidebar = false;
+                                apply_cursor(&mut cur_cursor, CursorKind::Arrow);
+                                continue;
+                            }
                             if dragging_split.take().is_some() {
                                 pty_sizes_dirty = true;
                                 dirty = true;
@@ -4541,6 +4618,17 @@ mod macos_app {
             }
 
             // Poll ALL panes in the window so unfocused tiled panes stream git/jobs/PTYs live at 60fps!
+            let cur_cli_rev = blaze_shell::cli_spec_driver::spec_revision();
+            if cur_cli_rev != last_cli_spec_rev {
+                last_cli_spec_rev = cur_cli_rev;
+                if let Some(shell) = panes.get_mut(&wm.focused_pane())
+                    && !shell.editor.text.is_empty()
+                {
+                    let was_open = !shell.editor.completions.is_empty() || popup_engaged;
+                    shell.refresh_editor_assist(was_open);
+                    dirty = true;
+                }
+            }
             let focused_pid = wm.focused_pane();
             let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
             let mut any_running_jobs = false;
@@ -4760,7 +4848,8 @@ mod macos_app {
                 for (slot, bytes) in fonts.pending.drain(..) {
                     renderer.upload(slot, &bytes);
                 }
-                let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
                 let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
@@ -4792,6 +4881,7 @@ mod macos_app {
                 // for instant mouse hover, output text selection, and `Cmd+C` extraction!
                 scene.rects.clear();
                 scene.icon_quads.clear();
+                scene.emoji_quads.clear();
                 scene.image_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();

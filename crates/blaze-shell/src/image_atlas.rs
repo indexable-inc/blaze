@@ -1530,3 +1530,129 @@ mod tests {
         }
     }
 }
+
+/// Rasterize a UTF-8 emoji or custom symbol string (`"🦑"`, `"👋🌎"`, `"🔥"`, `"λ"`) into a
+/// straight-RGBA8 Retina bitmap using CoreText + Apple Color Emoji cascade.
+#[cfg(target_os = "macos")]
+pub(crate) fn rasterize_coretext_rgba(text: &str, w_px: usize, h_px: usize) -> Option<Vec<u8>> {
+    use mac_imageio::*;
+    if text.is_empty() || w_px == 0 || h_px == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; w_px * h_px * 4];
+    // SAFETY: every CF/CG/CT object is checked for null and released before returning; `buf`
+    // lives past `CGContextRelease`.
+    unsafe {
+        let space = CGColorSpaceCreateDeviceRGB();
+        if space.is_null() {
+            return None;
+        }
+        let ctx = CGBitmapContextCreate(
+            buf.as_mut_ptr().cast(),
+            w_px,
+            h_px,
+            8,
+            w_px * 4,
+            space,
+            RGBA8_PREMUL_LAST,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
+            return None;
+        }
+        CGContextSetShouldAntialias(ctx, true);
+
+        let cf_text = CFStringCreateWithBytes(
+            std::ptr::null(),
+            text.as_ptr(),
+            text.len() as isize,
+            CF_UTF8,
+            0,
+        );
+        if cf_text.is_null() {
+            CGContextRelease(ctx);
+            return None;
+        }
+
+        let build_line = |pt: f64| -> (*mut OpaqueCTFont, *mut OpaqueCTLine, f64, f64, f64) {
+            let font = CTFontCreateUIFontForLanguage(2, pt, std::ptr::null());
+            if font.is_null() {
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let fg = CGColorCreateGenericRGB(0.93, 0.94, 0.96, 1.0);
+            let keys = [kCTFontAttributeName, kCTForegroundColorAttributeName];
+            let vals = [font as *const c_void, fg as *const c_void];
+            let attrs = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                vals.as_ptr(),
+                if fg.is_null() { 1 } else { 2 },
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
+            if !fg.is_null() {
+                CGColorRelease(fg);
+            }
+            if attrs.is_null() {
+                CFRelease(font.cast());
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let attr_s = CFAttributedStringCreate(std::ptr::null(), cf_text, attrs);
+            CFRelease(attrs.cast());
+            if attr_s.is_null() {
+                CFRelease(font.cast());
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let line = CTLineCreateWithAttributedString(attr_s);
+            CFRelease(attr_s.cast());
+            if line.is_null() {
+                CFRelease(font.cast());
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let (mut asc, mut desc, mut lead) = (0.0f64, 0.0f64, 0.0f64);
+            let lw = CTLineGetTypographicBounds(line, &mut asc, &mut desc, &mut lead);
+            (font, line, lw, asc, desc)
+        };
+
+        let mut pt = (h_px as f64) * 0.80;
+        let (mut font, mut line, mut lw, mut asc, mut desc) = build_line(pt);
+        if !line.is_null() && lw > (w_px as f64 - 2.0) && lw > 1.0 {
+            let fit_scale = ((w_px as f64 - 2.0) / lw).clamp(0.35, 1.0);
+            CFRelease(line.cast());
+            CFRelease(font.cast());
+            pt *= fit_scale;
+            let (f2, l2, w2, a2, d2) = build_line(pt);
+            font = f2;
+            line = l2;
+            lw = w2;
+            asc = a2;
+            desc = d2;
+        }
+
+        if !line.is_null() {
+            let draw_x = ((w_px as f64 - lw) * 0.5).max(0.5);
+            let total_h = (asc + desc).max(1.0);
+            let draw_y = ((h_px as f64 - total_h) * 0.5 + desc).max(0.5);
+            CGContextSetTextPosition(ctx, draw_x, draw_y);
+            CTLineDraw(line, ctx);
+            CFRelease(line.cast());
+        }
+        if !font.is_null() {
+            CFRelease(font.cast());
+        }
+        CFRelease(cf_text.cast());
+        CGContextRelease(ctx);
+    }
+
+    // Un-premultiply RGBA for `ui_sprite_fs` straight-alpha blending.
+    for px in buf.chunks_exact_mut(4) {
+        let a = px[3];
+        if a > 0 && a < 255 {
+            let af = f32::from(a) / 255.0;
+            px[0] = ((f32::from(px[0]) / af).round().clamp(0.0, 255.0)) as u8;
+            px[1] = ((f32::from(px[1]) / af).round().clamp(0.0, 255.0)) as u8;
+            px[2] = ((f32::from(px[2]) / af).round().clamp(0.0, 255.0)) as u8;
+        }
+    }
+    Some(buf)
+}

@@ -185,6 +185,25 @@ pub struct IconQuad {
     pub clip_id: u32,
 }
 
+/// A full-color Retina Apple Color Emoji / custom Unicode symbol quad resolved through `IconAtlas`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmojiQuad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub text: String,
+    pub alpha: f32,
+    pub clip_id: u32,
+}
+
+/// Logical display width for a custom emoji / symbol badge of height `h`.
+#[inline]
+pub fn symbol_badge_width(text: &str, h: f32) -> f32 {
+    let clusters = crate::config::symbol_cluster_count(text).clamp(1, 6) as f32;
+    (clusters * h * 1.12).max(h)
+}
+
 /// A decoded raster image quad (`webp`, `png`, `jpg`, `gif`) positioned in logical pixels,
 /// resolved through `ImageAtlas` for rendered Markdown & HTML `<picture>` / `<img>` elements.
 #[derive(Clone, Debug, PartialEq)]
@@ -230,6 +249,9 @@ pub enum HitAction {
     /// Rendered Markdown/HTML interactive actions.
     OpenLink { href: String, base_dir: String },
     CopyText(String),
+    /// Agent Hub interactive actions (resizable sidebar divider + clickable agent rows).
+    ResizeAgentSidebar,
+    SelectAgent(usize),
 }
 
 /// Clickable UI target recorded during layout.
@@ -273,7 +295,11 @@ pub enum HoverKind {
     Directory { cwd: String },
     GitBranch { current: String, branches: Vec<String> },
     GitChanges { files: Vec<(String, &'static str, &'static str)>, total: u32 },
-    GitStashes { stashes: Vec<String>, total: u32 },
+    GitStashes {
+        stashes: Vec<String>,
+        entries: Vec<crate::prompt::GitStashEntry>,
+        total: u32,
+    },
     Toolchains { items: Vec<(&'static str, &'static str, &'static str)> },
     /// Hovering a file entry in `ls` grid or table; lazily hydrated into `FilePreview` / `DirPreview`.
     FileEntry { full_path: String, name: String, icon: Option<&'static str>, is_dir: bool },
@@ -672,6 +698,8 @@ pub struct Scene {
     pub text_runs: Vec<TextRun>,
     /// Retina RGBA SVG icons rasterized from `svg_icons::IconAtlas`.
     pub icon_quads: Vec<IconQuad>,
+    /// Full-color Retina Apple Color Emoji / custom symbol quads rasterized via `IconAtlas`.
+    pub emoji_quads: Vec<EmojiQuad>,
     pub image_quads: Vec<ImageQuad>,
     /// Foreground overlays (underlines, error carets, beam cursor, hairlines) drawn over text.
     pub over_rects: Vec<RectInst>,
@@ -723,6 +751,7 @@ impl Scene {
             rects: Vec::new(),
             text_runs: Vec::new(),
             icon_quads: Vec::new(),
+            emoji_quads: Vec::new(),
             image_quads: Vec::new(),
             over_rects: Vec::new(),
             overlay_rects: Vec::new(),
@@ -957,6 +986,31 @@ impl Scene {
         clip_id: u32,
     ) {
         self.icon_quads.push(IconQuad { x, y, w: size, h: size, name, alpha, clip_id });
+    }
+
+    /// Draw a full-color Retina emoji or custom Unicode symbol (e.g. `"🦑"`, `"👋🌎"`), returning
+    /// its logical horizontal width in pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emoji_symbol(
+        &mut self,
+        x: f32,
+        y: f32,
+        height: f32,
+        text: &str,
+        alpha: f32,
+        clip_id: u32,
+    ) -> f32 {
+        let w = symbol_badge_width(text, height);
+        self.emoji_quads.push(EmojiQuad {
+            x,
+            y,
+            w,
+            h: height,
+            text: text.to_owned(),
+            alpha,
+            clip_id,
+        });
+        w
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1349,6 +1403,12 @@ impl Scene {
             ic.y += dy;
             ic.clip_id = map_clip(ic.clip_id);
             self.icon_quads.push(ic);
+        }
+        for mut em in sub.emoji_quads {
+            em.x += dx;
+            em.y += dy;
+            em.clip_id = map_clip(em.clip_id);
+            self.emoji_quads.push(em);
         }
         for mut img in sub.image_quads {
             img.x += dx;

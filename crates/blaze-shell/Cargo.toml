@@ -30,6 +30,8 @@ blaze-vt = { path = "../blaze-vt" }
 blaze-sh = { path = "../blaze-sh" }
 blaze-ui = { path = "../blaze-ui" }
 blaze-json = { path = "../blaze-json" }
+blaze-shell-config = { path = "../blaze-shell-config" }
+blaze-cli-spec = { path = "../blaze-cli-spec" }
 blaze-data = { path = "../blaze-data" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
