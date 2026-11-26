@@ -581,6 +581,15 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert!(is_probe("cc", &["-E", "/out/12345detect_compiler_family.c"]));
     assert!(!is_probe("cc", &["-E", "/out/xdetect_compiler_family.c"]));
     assert!(!is_probe("cc", &["-E", "/out/12345detect_compiler_family.c", "-o", "/out/generated.i"]));
+    assert!(!is_probe("cc", &["-E", "-MD", "-MF", "/out/deps.d", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-E", "-MMD", "-MF/out/deps.d", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-E", "-M", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-E", "-MJ", "/out/cdb.json", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-E", "-save-temps", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-E", "--serialize-diagnostics", "/out/diag.dia", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-c", "-MD", "-MF", "/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-save-temps=obj", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "--coverage", "-o", "/out/flag_check", "/out/flag_check.c"]));
 
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");

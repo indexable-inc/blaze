@@ -27,7 +27,7 @@
 
 use core::ffi::CStr;
 
-use blaze_own::{Alloc, planted::NoPlant};
+use blaze_own::{AVec, Alloc, planted::NoPlant};
 use blaze_sys::{
     Fd,
     linux::{
@@ -182,14 +182,31 @@ pub(super) fn prepare_with_exec(plan: &Plan<'_>, budget: Budget, processes: bool
     Ok(Prepared { ruleset, filter, filter_len, limits, exec_fd })
 }
 
-/// On NixOS hosts where `program_path`'s `PT_INTERP` symlinks into `/nix/store/`, walks the exact
-/// same transitive ELF64 runtime closure as [`grant_nix_elf_closure`] (bounded by `cx` before
-/// every open and 64 KiB read chunk) and feeds the canonical resolved path and file contents of
-/// the ELF interpreter, delegated glibc `ld.so`, and every transitive shared library into `feed` so
-/// callers can bind the host Nix runtime closure into content-addressed keys (AGENTS.md rule 21).
-/// Returns `Ok(true)` when a NixOS closure was hashed, or `Ok(false)` on non-NixOS hosts or
-/// non-ELF files.
-pub fn feed_nix_runtime_closure(cx: &Cx, program_path: &str, feed: &mut dyn FnMut(&[u8])) -> Result<bool, Fault> {
+/// On Linux hosts (NixOS and standard FHS), walks the exact transitive ELF64 runtime closure of
+/// `program_path` (bounded by `cx` before every open and 64 KiB read chunk) and feeds the
+/// canonical resolved path and file contents of the ELF interpreter, delegated glibc `ld.so` or
+/// `/etc/ld.so.cache`, and every transitive shared library into `feed` so callers can bind the
+/// host runtime closure into content-addressed keys (AGENTS.md rule 21).
+/// Returns `Ok(true)` when a runtime closure was hashed, or `Ok(false)` on non-ELF files.
+pub fn feed_nix_runtime_closure(
+    cx: &Cx,
+    program_path: &str,
+    alloc: Alloc<'_>,
+    feed: &mut dyn FnMut(&[u8]),
+) -> Result<bool, Fault> {
+    let reader = super::RootReader::new(cx)?;
+    feed_nix_runtime_closure_with(&reader, cx, program_path, alloc, feed)
+}
+
+/// Same as [`feed_nix_runtime_closure`], reusing a caller-owned [`super::RootReader`] so
+/// cancelled/stalled reads never allocate or leak a fresh async driver per probe.
+pub fn feed_nix_runtime_closure_with(
+    reader: &super::RootReader,
+    cx: &Cx,
+    program_path: &str,
+    alloc: Alloc<'_>,
+    feed: &mut dyn FnMut(&[u8]),
+) -> Result<bool, Fault> {
     check_nix_cx(Some(cx))?;
     let bytes = program_path.as_bytes();
     if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= 4096 {
@@ -203,7 +220,7 @@ pub fn feed_nix_runtime_closure(cx: &Cx, program_path: &str, feed: &mut dyn FnMu
         return Err(Fault::Host { call: "nix runtime closure (invalid program path)", code: 22 });
     };
     let mut opt_feed = Some(feed);
-    walk_nix_elf_closure(Some(cx), None, cstr, None, None, false, &mut opt_feed)
+    walk_nix_elf_closure(Some(reader), Some(cx), Some(alloc), None, cstr, None, None, false, &mut opt_feed)
 }
 
 fn check_nix_cx(cx: Option<&Cx>) -> Result<(), Fault> {
@@ -215,14 +232,14 @@ fn check_nix_cx(cx: Option<&Cx>) -> Result<(), Fault> {
 }
 
 fn read_nix_at(
-    reader: &Option<super::RootFdReader>,
+    reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
     fd: Fd,
     out: &mut [u8],
     offset: u64,
     call: &'static str,
 ) -> Result<usize, Fault> {
-    if let (Some(r), Some(cx)) = (reader.as_ref(), cx) {
+    if let (Some(r), Some(cx)) = (reader, cx) {
         r.read_exact_or_eof(cx, fd, out, offset, call)
     } else {
         let mut filled = 0usize;
@@ -289,12 +306,17 @@ fn grant_nix_elf_closure(
     has_helper_folder: bool,
 ) -> Result<(), Fault> {
     let mut no_feed: Option<&mut dyn FnMut(&[u8])> = None;
-    let _ = walk_nix_elf_closure(None, Some(ruleset), program, verified_exec_fd, Some(plan), has_helper_folder, &mut no_feed)?;
+    let _ = walk_nix_elf_closure(None, None, None, Some(ruleset), program, verified_exec_fd, Some(plan), has_helper_folder, &mut no_feed)?;
     Ok(())
 }
 
+/// Maximum size of `/etc/ld.so.cache` buffered for SONAME resolution on non-Nix Linux (4 MiB).
+const MAX_LD_CACHE_BYTES: usize = 4 << 20;
+
 fn walk_nix_elf_closure(
+    reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
+    alloc: Option<Alloc<'_>>,
     ruleset: Option<Fd>,
     program: &CStr,
     verified_exec_fd: Option<Fd>,
@@ -308,10 +330,6 @@ fn walk_nix_elf_closure(
     const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
 
     check_nix_cx(cx)?;
-    let reader = match cx {
-        Some(cx) => Some(super::RootFdReader::new(cx)?),
-        None => None,
-    };
 
     let opened_prog = match verified_exec_fd {
         Some(_) => None,
@@ -329,7 +347,7 @@ fn walk_nix_elf_closure(
         (None, Some(owned)) => owned.fd(),
         (None, None) => return Ok(false),
     };
-    let Some(hdr) = parse_elf64_meta(&reader, cx, prog_fd)? else {
+    let Some(hdr) = parse_elf64_meta(reader, cx, prog_fd)? else {
         return Ok(false);
     };
     if hdr.interp_len == 0 {
@@ -339,7 +357,7 @@ fn walk_nix_elf_closure(
     let Some(interp_slice) = interp_buf.get_mut(..hdr.interp_len) else {
         return Ok(false);
     };
-    let n = read_nix_at(&reader, cx, prog_fd, interp_slice, hdr.interp_off, "pread (nix ELF PT_INTERP)")?;
+    let n = read_nix_at(reader, cx, prog_fd, interp_slice, hdr.interp_off, "pread (nix ELF PT_INTERP)")?;
     let Some(interp_bytes) = interp_buf.get(..n) else {
         return Ok(false);
     };
@@ -394,15 +412,46 @@ fn walk_nix_elf_closure(
             add_nix_loader_rule(rs, NIX_LD_SO)?;
         }
     }
+    let mut ld_cache_bytes: Option<AVec<'_, u8>> = None;
     if let Some(f) = feed.as_deref_mut() {
-        feed_nix_file_by_path(&reader, cx, interp_cstr, f)?;
+        feed_nix_file_by_path(reader, cx, interp_cstr, f)?;
         if is_nix_ld {
-            feed_nix_file_by_path(&reader, cx, NIX_LD_SO, f)?;
+            feed_nix_file_by_path(reader, cx, NIX_LD_SO, f)?;
         }
         if !is_nix {
             match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.cache"), OpenFlags::CLOSE_ON_EXEC, 0) {
                 Ok(cache_fd) => {
-                    feed_nix_fd(&reader, cx, b"/etc/ld.so.cache", cache_fd.fd(), f)?;
+                    if let Some(a) = alloc {
+                        let framing = 4 + b"/etc/ld.so.cache".len() + 8;
+                        let mut captured = AVec::new_in(a);
+                        let mut overflow = false;
+                        feed_nix_fd(reader, cx, b"/etc/ld.so.cache", cache_fd.fd(), &mut |chunk| {
+                            f(chunk);
+                            if captured.len().saturating_add(chunk.len()) <= MAX_LD_CACHE_BYTES + framing {
+                                captured.extend_from_slice(chunk);
+                            } else {
+                                overflow = true;
+                            }
+                        })?;
+                        // `feed_nix_fd` frames the stream with a 4-byte path len + 16-byte path
+                        // prefix and an 8-byte total-length trailer; strip those framing bytes so
+                        // `captured` holds ONLY the exact raw `/etc/ld.so.cache` file contents.
+                        if overflow {
+                            return Err(Fault::Host { call: "read (/etc/ld.so.cache exceeds 4 MiB cap)", code: 27 });
+                        }
+                        let prefix = 4 + b"/etc/ld.so.cache".len();
+                        let trailer = 8;
+                        if captured.len() >= prefix + trailer {
+                            let body_len = captured.len() - prefix - trailer;
+                            let mut raw = AVec::with_capacity_in(body_len, a);
+                            if let Some(body) = captured.as_slice().get(prefix..prefix + body_len) {
+                                raw.extend_from_slice(body);
+                            }
+                            ld_cache_bytes = Some(raw);
+                        }
+                    } else {
+                        feed_nix_fd(reader, cx, b"/etc/ld.so.cache", cache_fd.fd(), f)?;
+                    }
                 }
                 Err(blaze_sys::Errno::NoEnt) => {}
                 Err(errno) => {
@@ -472,7 +521,7 @@ fn walk_nix_elf_closure(
             (_, _, Some(owned)) => owned.fd(),
             _ => continue,
         };
-        let Some(meta) = parse_elf64_meta(&reader, cx, elf_fd)? else {
+        let Some(meta) = parse_elf64_meta(reader, cx, elf_fd)? else {
             continue;
         };
         if meta.dyn_len == 0 {
@@ -482,7 +531,7 @@ fn walk_nix_elf_closure(
         let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
             return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
         };
-        let dyn_read = read_nix_at(&reader, cx, elf_fd, dyn_slice, meta.dyn_off, "pread (nix ELF PT_DYNAMIC)")?;
+        let dyn_read = read_nix_at(reader, cx, elf_fd, dyn_slice, meta.dyn_off, "pread (nix ELF PT_DYNAMIC)")?;
         let mut strtab_vaddr = None;
         let mut runpath_off = None;
         let mut rpath_off = None;
@@ -531,7 +580,7 @@ fn walk_nix_elf_closure(
         let child_chain = if let Some(rp_off) = runpath_off {
             if let Some(at) = strtab_file_off.checked_add(rp_off) {
                 let mut rp_buf = [0u8; 2048];
-                let n = read_nix_at(&reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RUNPATH)")?;
+                let n = read_nix_at(reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RUNPATH)")?;
                 let raw = rp_buf.get(..n).unwrap_or(&[]);
                 let Some(end) = raw.iter().position(|&b| b == 0) else {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
@@ -558,7 +607,7 @@ fn walk_nix_elf_closure(
                 && let Some(at) = strtab_file_off.checked_add(rp_off)
             {
                 let mut rp_buf = [0u8; 2048];
-                let n = read_nix_at(&reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RPATH)")?;
+                let n = read_nix_at(reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RPATH)")?;
                 let raw = rp_buf.get(..n).unwrap_or(&[]);
                 let Some(end) = raw.iter().position(|&b| b == 0) else {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RPATH exceeds buffer cap)", code: 7 });
@@ -598,7 +647,7 @@ fn walk_nix_elf_closure(
             let Some(at) = strtab_file_off.checked_add(str_off) else {
                 continue;
             };
-            let n = read_nix_at(&reader, cx, elf_fd, &mut name_buf, at, "pread (nix ELF DT_NEEDED)")?;
+            let n = read_nix_at(reader, cx, elf_fd, &mut name_buf, at, "pread (nix ELF DT_NEEDED)")?;
             let raw = name_buf.get(..n).unwrap_or(&[]);
             let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
             let soname = raw.get(..end).unwrap_or(&[]);
@@ -621,7 +670,7 @@ fn walk_nix_elf_closure(
                     });
                 }
                 if !try_grant_and_enqueue_lib(
-                    &reader,
+                    reader,
                     cx,
                     ruleset,
                     b"",
@@ -640,7 +689,7 @@ fn walk_nix_elf_closure(
                 }
             } else {
                 enqueue_nix_soname(
-                    &reader,
+                    reader,
                     cx,
                     ruleset,
                     soname,
@@ -648,6 +697,7 @@ fn walk_nix_elf_closure(
                     child_chain,
                     NIX_LD_DIR,
                     glibc_dir,
+                    ld_cache_bytes.as_deref(),
                     plan,
                     &mut queue,
                     &mut q_len,
@@ -678,7 +728,7 @@ impl Elf64Meta {
 }
 
 fn parse_elf64_meta(
-    reader: &Option<super::RootFdReader>,
+    reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
     fd: Fd,
 ) -> Result<Option<Elf64Meta>, Fault> {
@@ -924,8 +974,120 @@ fn enqueue_nix_canonical_slice<const N: usize>(
     Ok(())
 }
 
+/// Whether a glibc `ld.so.cache` entry's `flags` field matches an ELF shared library for the
+/// current target architecture (`FLAG_ELF_LIBC6` / `FLAG_ELF` + target `FLAG_ARCH`).
+fn matches_target_ld_cache_flags(flags: u32) -> bool {
+    let kind = flags & 0x00ff;
+    if kind != 0x0003 && kind != 0x0001 {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        (flags & 0xff00) == 0x0a00
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        (flags & 0xff00) == 0x0300
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        true
+    }
+}
+
+/// Parses glibc's `/etc/ld.so.cache` (`glibc-ld.so.cache1.1`, either standalone at offset 0 or
+/// 8-byte-aligned after a compat `ld.so-1.7.0` header) and invokes `on_path` for EVERY
+/// target-architecture entry whose key equals `soname` (covering both `/etc/ld.so.conf.d`
+/// directories and `glibc-hwcaps` ISA variants). Returns `Ok(true)` if at least one `on_path`
+/// invocation resolved an existing library file.
+pub fn parse_ld_so_cache_matches(
+    cache_bytes: &[u8],
+    soname: &[u8],
+    mut on_path: impl FnMut(&[u8]) -> Result<bool, Fault>,
+) -> Result<bool, Fault> {
+    const NEW_MAGIC: &[u8] = b"glibc-ld.so.cache1.1";
+    const OLD_MAGIC: &[u8] = b"ld.so-1.7.0";
+    const NEW_HDR_LEN: usize = 48;
+    const NEW_ENTRY_LEN: usize = 24;
+
+    let base_off = if cache_bytes.starts_with(NEW_MAGIC) {
+        0usize
+    } else if cache_bytes.starts_with(OLD_MAGIC) && cache_bytes.len() >= 16 {
+        let old_nlibs = usize::try_from(read_u32_le(cache_bytes, 12))
+            .map_err(|_| Fault::Host { call: "ld.so.cache (invalid compat nlibs)", code: 22 })?;
+        let old_table_end = old_nlibs
+            .checked_mul(12)
+            .and_then(|n| n.checked_add(16))
+            .ok_or(Fault::Host { call: "ld.so.cache (compat table overflow)", code: 22 })?;
+        let aligned = old_table_end
+            .checked_add(7)
+            .map(|n| n & !7)
+            .ok_or(Fault::Host { call: "ld.so.cache (compat align overflow)", code: 22 })?;
+        if cache_bytes.get(aligned..aligned + NEW_MAGIC.len()) != Some(NEW_MAGIC) {
+            return Err(Fault::Host { call: "ld.so.cache (missing glibc-ld.so.cache1.1 header)", code: 22 });
+        }
+        aligned
+    } else {
+        return Err(Fault::Host { call: "ld.so.cache (unrecognized magic)", code: 22 });
+    };
+
+    let hdr_end = base_off
+        .checked_add(NEW_HDR_LEN)
+        .ok_or(Fault::Host { call: "ld.so.cache (header overflow)", code: 22 })?;
+    if hdr_end > cache_bytes.len() {
+        return Err(Fault::Host { call: "ld.so.cache (truncated header)", code: 22 });
+    }
+    let nlibs = usize::try_from(read_u32_le(cache_bytes, base_off + 20))
+        .map_err(|_| Fault::Host { call: "ld.so.cache (invalid nlibs)", code: 22 })?;
+    let table_bytes = nlibs
+        .checked_mul(NEW_ENTRY_LEN)
+        .and_then(|n| hdr_end.checked_add(n))
+        .ok_or(Fault::Host { call: "ld.so.cache (table overflow)", code: 22 })?;
+    if table_bytes > cache_bytes.len() {
+        return Err(Fault::Host { call: "ld.so.cache (truncated entry table)", code: 22 });
+    }
+
+    let mut resolved_any = false;
+    for idx in 0..nlibs {
+        let entry_off = hdr_end + idx * NEW_ENTRY_LEN;
+        let flags = read_u32_le(cache_bytes, entry_off);
+        if !matches_target_ld_cache_flags(flags) {
+            continue;
+        }
+        let Ok(key_rel) = usize::try_from(read_u32_le(cache_bytes, entry_off + 4)) else {
+            continue;
+        };
+        let Ok(val_rel) = usize::try_from(read_u32_le(cache_bytes, entry_off + 8)) else {
+            continue;
+        };
+        let (Some(key_off), Some(val_off)) = (base_off.checked_add(key_rel), base_off.checked_add(val_rel)) else {
+            continue;
+        };
+        let Some(key_tail) = cache_bytes.get(key_off..) else {
+            continue;
+        };
+        let Some(key_end) = key_tail.iter().position(|&b| b == 0) else {
+            continue;
+        };
+        if key_tail.get(..key_end) != Some(soname) {
+            continue;
+        }
+        let Some(val_tail) = cache_bytes.get(val_off..) else {
+            continue;
+        };
+        let Some(val_end) = val_tail.iter().position(|&b| b == 0) else {
+            continue;
+        };
+        let path = val_tail.get(..val_end).unwrap_or(&[]);
+        if !path.is_empty() && on_path(path)? {
+            resolved_any = true;
+        }
+    }
+    Ok(resolved_any)
+}
+
 fn enqueue_nix_soname<const N: usize>(
-    reader: &Option<super::RootFdReader>,
+    reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
     ruleset: Option<Fd>,
     soname: &[u8],
@@ -933,6 +1095,7 @@ fn enqueue_nix_soname<const N: usize>(
     child_chain: RpathChain,
     nix_ld_dir: &[u8],
     glibc_dir: Option<&[u8]>,
+    ld_cache: Option<&[u8]>,
     plan: Option<&Plan<'_>>,
     queue: &mut [([u8; 320], usize, RpathChain); N],
     q_len: &mut usize,
@@ -952,9 +1115,33 @@ fn enqueue_nix_soname<const N: usize>(
             return Ok(());
         }
     }
-    // On non-Nix FHS Linux (runtime closure hashing mode, where `ruleset` is `None`), also search
-    // the standard dynamic-linker library directories so glibc/libstdc++/libgcc are hashed.
+    // On non-Nix FHS Linux (runtime closure hashing mode, where `ruleset` is `None`), resolve
+    // through `/etc/ld.so.cache` FIRST (hashing every matching arch path including custom
+    // `/etc/ld.so.conf.d` dirs and `glibc-hwcaps` variants), falling back to standard FHS dirs
+    // only when no matching cache entry exists.
     if ruleset.is_none() {
+        if let Some(cache_bytes) = ld_cache
+            && !cache_bytes.is_empty()
+        {
+            let found = parse_ld_so_cache_matches(cache_bytes, soname, |resolved_path| {
+                try_grant_and_enqueue_lib(
+                    reader,
+                    cx,
+                    ruleset,
+                    b"",
+                    resolved_path,
+                    child_chain,
+                    nix_ld_dir,
+                    plan,
+                    queue,
+                    q_len,
+                    feed,
+                )
+            })?;
+            if found {
+                return Ok(());
+            }
+        }
         for fhs_dir in [
             &b"/lib/aarch64-linux-gnu/"[..],
             &b"/usr/lib/aarch64-linux-gnu/"[..],
@@ -974,7 +1161,7 @@ fn enqueue_nix_soname<const N: usize>(
 }
 
 fn try_grant_and_enqueue_lib<const N: usize>(
-    reader: &Option<super::RootFdReader>,
+    reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
     ruleset: Option<Fd>,
     dir_prefix: &[u8],
@@ -1042,7 +1229,7 @@ fn try_grant_and_enqueue_lib<const N: usize>(
 }
 
 fn feed_nix_file_by_path(
-    reader: &Option<super::RootFdReader>,
+    reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
     path: &CStr,
     feed: &mut dyn FnMut(&[u8]),
@@ -1056,7 +1243,7 @@ fn feed_nix_file_by_path(
 }
 
 fn feed_nix_fd(
-    reader: &Option<super::RootFdReader>,
+    reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
     canonical_path: &[u8],
     fd: Fd,
@@ -1065,7 +1252,7 @@ fn feed_nix_fd(
     let path_len = u32::try_from(canonical_path.len()).unwrap_or(u32::MAX);
     feed(&path_len.to_le_bytes());
     feed(canonical_path);
-    let offset = if let (Some(r), Some(cx)) = (reader.as_ref(), cx) {
+    let offset = if let (Some(r), Some(cx)) = (reader, cx) {
         r.stream_fd(cx, fd, "bstd::fs read (nix runtime closure hash)", |chunk| feed(chunk))?
     } else {
         let mut buf = [0u8; 64 << 10];
@@ -1195,7 +1382,9 @@ impl Confiner for Landlock {
 
 #[cfg(test)]
 mod nix_closure_tests {
-    use super::{Fault, RpathChain, enqueue_nix_resolved_path};
+    use alloc::vec::Vec;
+
+    use super::{Fault, RpathChain, enqueue_nix_resolved_path, parse_ld_so_cache_matches};
 
     #[test]
     fn nix_elf_closure_queue_cap_refuses_instead_of_truncating() {
@@ -1214,5 +1403,82 @@ mod nix_closure_tests {
         let err = enqueue_nix_resolved_path(b"/nix/store/ccc-libc/lib/libc.so", RpathChain::EMPTY, &mut queue, &mut q_len)
             .expect_err("must refuse when queue cap is exceeded");
         assert!(matches!(err, Fault::Host { code: 7, .. }));
+    }
+
+    #[test]
+    fn ld_so_cache_parser_resolves_custom_dirs_and_hwcaps_in_both_formats() {
+        #[cfg(target_arch = "aarch64")]
+        let (target_flags, other_flags) = (0x0a03u32, 0x0303u32);
+        #[cfg(target_arch = "x86_64")]
+        let (target_flags, other_flags) = (0x0303u32, 0x0a03u32);
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let (target_flags, other_flags) = (0x0003u32, 0x0000u32);
+
+        let build_new_cache = || -> Vec<u8> {
+            let entries: &[(u32, &[u8], &[u8])] = &[
+                (target_flags, b"libz.so.1", b"/opt/custom/glibc-hwcaps/v3/libz.so.1"),
+                (target_flags, b"libz.so.1", b"/opt/custom/libz.so.1"),
+                (other_flags, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
+                (target_flags, b"libc.so.6", b"/usr/lib/libc.so.6"),
+            ];
+            let str_base = 48 + entries.len() * 24;
+            let mut strings = Vec::new();
+            let mut offsets = Vec::new();
+            for &(flags, key, val) in entries {
+                let k_off = str_base + strings.len();
+                strings.extend_from_slice(key);
+                strings.push(0);
+                let v_off = str_base + strings.len();
+                strings.extend_from_slice(val);
+                strings.push(0);
+                offsets.push((flags, k_off as u32, v_off as u32));
+            }
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"glibc-ld.so.cache1.1");
+            buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+            buf.resize(48, 0);
+            for (flags, k_off, v_off) in offsets {
+                buf.extend_from_slice(&flags.to_le_bytes());
+                buf.extend_from_slice(&k_off.to_le_bytes());
+                buf.extend_from_slice(&v_off.to_le_bytes());
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(&0u64.to_le_bytes());
+            }
+            buf.extend_from_slice(&strings);
+            buf
+        };
+
+        let new_only = build_new_cache();
+        // Compat format: `ld.so-1.7.0` + 1 legacy 12-byte entry + 4-byte padding to 8-byte boundary.
+        let mut compat = Vec::new();
+        compat.extend_from_slice(b"ld.so-1.7.0\0");
+        compat.extend_from_slice(&1u32.to_le_bytes());
+        compat.extend_from_slice(&[0u8; 12]);
+        while compat.len() % 8 != 0 {
+            compat.push(0);
+        }
+        compat.extend_from_slice(&new_only);
+
+        for buf in [&new_only, &compat] {
+            let mut found: Vec<Vec<u8>> = Vec::new();
+            let ok = parse_ld_so_cache_matches(buf, b"libz.so.1", |path| {
+                found.push(path.to_vec());
+                Ok(true)
+            })
+            .expect("valid ld.so.cache must parse");
+            assert!(ok);
+            assert_eq!(
+                found,
+                alloc::vec![
+                    b"/opt/custom/glibc-hwcaps/v3/libz.so.1".to_vec(),
+                    b"/opt/custom/libz.so.1".to_vec(),
+                ]
+            );
+        }
+        // Corrupt magic must fail loudly rather than silently falling back.
+        let err = parse_ld_so_cache_matches(b"not-an-ld-cache", b"libz.so.1", |_| Ok(true))
+            .expect_err("corrupt ld.so.cache must fail");
+        assert!(matches!(err, Fault::Host { code: 22, .. }));
     }
 }

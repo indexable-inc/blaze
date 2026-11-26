@@ -125,37 +125,29 @@ pub(super) fn remaining_for_cx(cx: &Cx) -> Result<Duration, crate::Stopped> {
     }
 }
 
-/// Deadline-aware async file-descriptor reader built on `bstd::fs` (`blaze-core`'s kernel-probed
-/// `Uring`/`Threads` driver + `Cx::wait` / `blaze_core::wait`) rooted at `/` reading
-/// `/proc/self/fd/<fd>` so reads target the exact already-opened inode with zero TOCTOU and zero
-/// bespoke blocking syscalls.
+/// Reusable, deadline-aware async file-descriptor reader built on `bstd::fs` (`blaze-core`'s
+/// kernel-probed `Uring`/`Threads` driver + `Cx::wait` / `blaze_core::wait`) rooted at `/`
+/// reading `/proc/self/fd/<fd>` so reads target the exact already-opened inode with zero TOCTOU
+/// and zero bespoke blocking syscalls.
+///
+/// Hold one instance across probes (e.g. on `HermeticClangProbe` or `FactFiles`): when a read is
+/// cancelled or expires on a stalled filesystem, `Pending::cancel` bounds the wait to 50 ms and
+/// retires the stale tag via `Io::forget` without dropping or leaking the reader's worker thread;
+/// once the stalled syscall eventually returns, the single worker thread is reused and cleanly
+/// reclaimed on normal owner drop.
 #[cfg(target_os = "linux")]
-pub(super) struct RootFdReader {
-    io: Option<crate::io::Io>,
-    root: Option<crate::fs::Dir<crate::fs::ReadOnly>>,
-    abandoned: core::cell::Cell<bool>,
+#[derive(Clone)]
+pub struct RootReader {
+    io: crate::io::Io,
+    root: crate::fs::Dir<crate::fs::ReadOnly>,
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for RootFdReader {
-    fn drop(&mut self) {
-        if self.abandoned.get() {
-            // A cancelled/expired read did not settle within the 50 ms abandon bound (e.g. a
-            // stalled FUSE/NFS mount in uninterruptible kernel wait): detach the secondary `Io`
-            // handle instead of letting `Threads::drop` join the blocked file worker indefinitely.
-            if let Some(root) = self.root.take() {
-                core::mem::forget(root);
-            }
-            if let Some(io) = self.io.take() {
-                core::mem::forget(io);
-            }
-        }
-    }
-}
+impl blaze_own::Share for RootReader {}
 
 #[cfg(target_os = "linux")]
-impl RootFdReader {
-    pub(super) fn new(cx: &Cx) -> Result<Self, Fault> {
+impl RootReader {
+    pub fn new(cx: &Cx) -> Result<Self, Fault> {
         let io = match cx.io().beside(crate::rt::RootPath::new("/")) {
             Some(Ok(io)) => io,
             Some(Err(_)) | None => {
@@ -166,15 +158,7 @@ impl RootFdReader {
             .need_fs()
             .map_err(|_| Fault::Host { call: "bstd::fs root io (missing fs)", code: 5 })?;
         let root = fs.root().read_only();
-        Ok(Self { io: Some(io), root: Some(root), abandoned: core::cell::Cell::new(false) })
-    }
-
-    fn io_ref(&self) -> Result<&crate::io::Io, Fault> {
-        self.io.as_ref().ok_or(Fault::Host { call: "bstd::fs root io (detached)", code: 5 })
-    }
-
-    fn root_ref(&self) -> Result<&crate::fs::Dir<crate::fs::ReadOnly>, Fault> {
-        self.root.as_ref().ok_or(Fault::Host { call: "bstd::fs root io (detached)", code: 5 })
+        Ok(Self { io, root })
     }
 
     fn fd_rel(fd: blaze_sys::Fd) -> Result<crate::path::Path, Fault> {
@@ -208,18 +192,17 @@ impl RootFdReader {
     }
 
     fn sub_cx(&self, cx: &Cx) -> Result<(Cx, Deadline), Fault> {
-        let io = self.io_ref()?;
         let left = remaining_for_cx(cx)
             .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
-        let deadline = Deadline::after(io.now(), left);
-        Ok((cx.on_beside(blaze_own::Share::share(io), deadline), deadline))
+        let deadline = Deadline::after(self.io.now(), left);
+        Ok((cx.on_beside(blaze_own::Share::share(&self.io), deadline), deadline))
     }
 
     /// Waits for `pending` on `self.io` while polling in bounded 10 ms slices so parent
     /// cancellation (`cx.cancelled()`) abandons a stalled read within a short 50 ms settle bound
-    /// instead of waiting out the full remaining probe deadline. If the read still has not
-    /// completed after `Pending::cancel`, marks `self.abandoned` so `Drop` detaches the secondary
-    /// `Io` instead of blocking in `Threads::drop`.
+    /// instead of waiting out the full remaining probe deadline. When the caller reuses this
+    /// [`RootReader`] across probes, a stalled syscall whose tag was retired via `Io::forget`
+    /// never leaks a worker thread and is cleanly reclaimed once it returns.
     fn wait_read_cancellable<'buf>(
         &self,
         cx: &Cx,
@@ -228,28 +211,23 @@ impl RootFdReader {
         mut pending: crate::pending::Pending<'buf, crate::fs::ReadInto<'buf>>,
         call: &'static str,
     ) -> Result<usize, Fault> {
-        let io = self.io_ref()?;
         loop {
             match pending.try_wait() {
                 Ok(res) => return res.map_err(|e| fs_err_to_fault(call, &e)),
                 Err(still) => pending = still,
             }
             if cx.cancelled() {
-                let give_up = Deadline::after(io.now(), Duration::from_millis(50));
-                if matches!(pending.cancel(read_cx, give_up), Err(crate::fs::FsError { kind: crate::fs::FsKind::Stopped(_), .. })) {
-                    self.abandoned.set(true);
-                }
+                let give_up = Deadline::after(self.io.now(), Duration::from_millis(50));
+                let _ = pending.cancel(read_cx, give_up);
                 return Err(Fault::Host { call: "nix runtime closure (cancelled)", code: 125 });
             }
-            let now = io.now();
+            let now = self.io.now();
             if deadline.passed(now) {
-                if matches!(pending.cancel(read_cx, Deadline::PASSED), Err(crate::fs::FsError { kind: crate::fs::FsKind::Stopped(_), .. })) {
-                    self.abandoned.set(true);
-                }
+                let _ = pending.cancel(read_cx, Deadline::PASSED);
                 return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
             }
             let slice = deadline.min(Deadline::after(now, Duration::from_millis(10)));
-            let _ = io.poll(slice);
+            let _ = self.io.poll(slice);
         }
     }
 
@@ -269,7 +247,7 @@ impl RootFdReader {
         }
         let rel = Self::fd_rel(fd)?;
         let (open_cx, _) = self.sub_cx(cx)?;
-        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let file = self.root.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
         let mut filled = 0usize;
         while filled < out.len() {
             let step_off = u64::try_from(filled)
@@ -300,7 +278,7 @@ impl RootFdReader {
     ) -> Result<u64, Fault> {
         let rel = Self::fd_rel(fd)?;
         let (open_cx, _) = self.sub_cx(cx)?;
-        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let file = self.root.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
         let mut buf = [0u8; 64 << 10];
         let mut offset = 0u64;
         loop {
@@ -414,7 +392,7 @@ impl VerifiedExec {
     /// Streams the sealed snapshot in bounded 64 KiB chunks through `bstd::fs` into `on_chunk`
     /// (used by tests to verify immutability of the sealed `memfd`).
     pub fn stream_chunks(&self, cx: &Cx, mut on_chunk: impl FnMut(&[u8])) -> Result<(), VerifiedExecError> {
-        let reader = RootFdReader::new(cx)
+        let reader = RootReader::new(cx)
             .map_err(|_| VerifiedExecError::Os { call: "bstd::fs root io", errno: blaze_sys::Errno::Io })?;
         let _ = reader
             .stream_fd(cx, self.fd.fd(), "read (sealed memfd)", |chunk| on_chunk(chunk))
@@ -482,7 +460,7 @@ mod tests;
 mod process_tests;
 
 #[cfg(target_os = "linux")]
-pub use landlock::feed_nix_runtime_closure;
+pub use landlock::{feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_matches};
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
 pub use machine::{Effect, Event, HermeticMachine, MachineOpts, State, Stream, Usage};
 pub use plan::{Access, Plan, PlanOpts, Rule as PlanRule, Why};

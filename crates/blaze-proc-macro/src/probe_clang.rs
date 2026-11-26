@@ -251,6 +251,8 @@ pub struct HermeticClangProbe {
     work_root: SharedStr,
     deadline: Duration,
     verify_flight: bstd::sync::Flight<(), VerifiedClang, OwnArc<str, SharedAlloc<'static>>, SharedAlloc<'static>>,
+    #[cfg(target_os = "linux")]
+    root_reader: Mutex<Option<bstd::procs::hermetic::RootReader>>,
 }
 
 impl HermeticClangProbe {
@@ -284,6 +286,37 @@ impl HermeticClangProbe {
         clang_path: &str,
         alloc: Alloc<'a>,
     ) -> Result<ContentId, AString<'a>> {
+        Self::strategy_id_for_clang_inner(
+            #[cfg(target_os = "linux")]
+            None,
+            cx,
+            host,
+            clang_path,
+            alloc,
+        )
+    }
+
+    /// Same as [`Self::strategy_id_for_clang`], reusing a caller-owned
+    /// [`bstd::procs::hermetic::RootReader`] so cancelled/stalled reads never allocate or leak a
+    /// fresh async driver per probe.
+    #[cfg(target_os = "linux")]
+    pub fn strategy_id_for_clang_with<'a>(
+        reader: &bstd::procs::hermetic::RootReader,
+        cx: &bstd::cx::Cx,
+        host: &str,
+        clang_path: &str,
+        alloc: Alloc<'a>,
+    ) -> Result<ContentId, AString<'a>> {
+        Self::strategy_id_for_clang_inner(Some(reader), cx, host, clang_path, alloc)
+    }
+
+    fn strategy_id_for_clang_inner<'a>(
+        #[cfg(target_os = "linux")] reader: Option<&bstd::procs::hermetic::RootReader>,
+        cx: &bstd::cx::Cx,
+        host: &str,
+        clang_path: &str,
+        alloc: Alloc<'a>,
+    ) -> Result<ContentId, AString<'a>> {
         let base = Self::strategy_id();
         let prog = shelf_pins::shelf_program(CLANG_JSON, host, "clang-23")
             .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
@@ -294,9 +327,14 @@ impl HermeticClangProbe {
             .part(&prog.sha256);
         #[cfg(target_os = "linux")]
         {
-            let engaged = bstd::procs::hermetic::feed_nix_runtime_closure(cx, clang_path, &mut |chunk| {
-                h.update(chunk);
-            })
+            let engaged = match reader {
+                Some(r) => bstd::procs::hermetic::feed_nix_runtime_closure_with(r, cx, clang_path, alloc, &mut |chunk| {
+                    h.update(chunk);
+                }),
+                None => bstd::procs::hermetic::feed_nix_runtime_closure(cx, clang_path, alloc, &mut |chunk| {
+                    h.update(chunk);
+                }),
+            }
             .map_err(|fault| own_fmt(format_args!("c-probe runtime closure for `{clang_path}`: {fault:?}"), alloc))?;
             if engaged {
                 h.part(b"linux-elf-closure-ok");
@@ -319,6 +357,36 @@ impl HermeticClangProbe {
         host: &str,
         alloc: Alloc<'a>,
     ) -> Result<Option<ContentId>, AString<'a>> {
+        Self::strategy_id_for_home_inner(
+            #[cfg(target_os = "linux")]
+            None,
+            cx,
+            home,
+            host,
+            alloc,
+        )
+    }
+
+    /// Same as [`Self::strategy_id_for_home`], reusing a caller-owned
+    /// [`bstd::procs::hermetic::RootReader`].
+    #[cfg(target_os = "linux")]
+    pub fn strategy_id_for_home_with<'a>(
+        reader: &bstd::procs::hermetic::RootReader,
+        cx: &bstd::cx::Cx,
+        home: &str,
+        host: &str,
+        alloc: Alloc<'a>,
+    ) -> Result<Option<ContentId>, AString<'a>> {
+        Self::strategy_id_for_home_inner(Some(reader), cx, home, host, alloc)
+    }
+
+    fn strategy_id_for_home_inner<'a>(
+        #[cfg(target_os = "linux")] reader: Option<&bstd::procs::hermetic::RootReader>,
+        cx: &bstd::cx::Cx,
+        home: &str,
+        host: &str,
+        alloc: Alloc<'a>,
+    ) -> Result<Option<ContentId>, AString<'a>> {
         let Ok(pin) = toolchain::clang_pin(CLANG_JSON, host) else {
             return Ok(None);
         };
@@ -333,7 +401,15 @@ impl HermeticClangProbe {
         let Some(path_str) = clang_path.to_str() else {
             return Err(own_str("c-probe clang shelf path is not UTF-8", alloc));
         };
-        Self::strategy_id_for_clang(cx, host, path_str, alloc).map(Some)
+        Self::strategy_id_for_clang_inner(
+            #[cfg(target_os = "linux")]
+            reader,
+            cx,
+            host,
+            path_str,
+            alloc,
+        )
+        .map(Some)
     }
 
     /// Opens [`HermeticClangProbe`] for `host` using already-open deadline-aware directory
@@ -385,6 +461,8 @@ impl HermeticClangProbe {
                 NonZeroUsize::MIN,
                 SharedAlloc::global(),
             ),
+            #[cfg(target_os = "linux")]
+            root_reader: Mutex::new(None),
         };
         Ok((probe, pin.sha256))
     }
@@ -435,6 +513,8 @@ impl HermeticClangProbe {
                 NonZeroUsize::MIN,
                 SharedAlloc::global(),
             ),
+            #[cfg(target_os = "linux")]
+            root_reader: Mutex::new(None),
         })
     }
 
@@ -847,6 +927,35 @@ fn resolve_source_date_epoch<'a>(
     }
 }
 
+impl HermeticClangProbe {
+    #[cfg(target_os = "linux")]
+    fn shared_root_reader<'a>(
+        &self,
+        cx: &bstd::cx::Cx,
+        alloc: Alloc<'a>,
+    ) -> Result<bstd::procs::hermetic::RootReader, AString<'a>> {
+        if let Some(existing) = crate::host::lock(&self.root_reader).as_ref() {
+            return Ok(existing.share());
+        }
+        let created = bstd::procs::hermetic::RootReader::new(cx)
+            .map_err(|fault| own_fmt(format_args!("c-probe root reader: {fault:?}"), alloc))?;
+        let mut slot = crate::host::lock(&self.root_reader);
+        Ok(slot.get_or_insert(created).share())
+    }
+
+    fn live_strategy_id<'a>(&self, cx: &bstd::cx::Cx, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+        #[cfg(target_os = "linux")]
+        {
+            let reader = self.shared_root_reader(cx, alloc)?;
+            Self::strategy_id_for_clang_with(&reader, cx, self.host.as_str(), self.clang_path.as_str(), alloc)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::strategy_id_for_clang(cx, self.host.as_str(), self.clang_path.as_str(), alloc)
+        }
+    }
+}
+
 impl ProbeAnswerer for HermeticClangProbe {
     fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
         // Recompute the live runtime-closure identity on every lookup so a mid-command
@@ -855,7 +964,7 @@ impl ProbeAnswerer for HermeticClangProbe {
             .io
             .cx(self.deadline, bstd::mem::TASK_FRAME)
             .map_err(|_| own_str("c-probe strategy id context stopped", alloc))?;
-        Self::strategy_id_for_clang(&cx, self.host.as_str(), self.clang_path.as_str(), alloc)
+        self.live_strategy_id(&cx, alloc)
     }
 
     fn answer<'a, 'b>(
@@ -1024,7 +1133,7 @@ impl ProbeAnswerer for HermeticClangProbe {
             // Re-hash the Nix runtime closure under `cx` immediately before launching to ensure
             // `/run/current-system` did not switch since `probe.answerer_id` was computed.
             // `verified.exec` itself is already a kernel-sealed immutable `memfd`.
-            let pre_id = Self::strategy_id_for_clang(&cx, self.host.as_str(), self.clang_path.as_str(), alloc)?;
+            let pre_id = self.live_strategy_id(&cx, alloc)?;
             if pre_id != probe.answerer_id {
                 return Err(own_str("host Nix runtime closure changed before probe execution (rule 21)", alloc));
             }
@@ -1061,7 +1170,7 @@ impl ProbeAnswerer for HermeticClangProbe {
                 .io
                 .cx(post_rem, bstd::mem::TASK_FRAME)
                 .map_err(|_| own_str("c-probe post-exec context stopped", alloc))?;
-            let post_id = Self::strategy_id_for_clang(&post_cx, self.host.as_str(), self.clang_path.as_str(), alloc)?;
+            let post_id = self.live_strategy_id(&post_cx, alloc)?;
             if post_id != probe.answerer_id {
                 return Err(own_str("host Nix runtime closure changed during probe execution (rule 21)", alloc));
             }
@@ -1631,6 +1740,8 @@ mod tests {
                 super::NonZeroUsize::MIN,
                 super::SharedAlloc::global(),
             ),
+            #[cfg(target_os = "linux")]
+            root_reader: super::Mutex::new(None),
         });
         let clock = tmp_io.need_clock().expect("clock");
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1716,6 +1827,78 @@ mod tests {
         guard1.cleanup(&col_cx, alloc).expect("explicit cleanup succeeds");
         let _ = col_dir.remove_dir(&col_cx, &rel2, bstd::fs::Durable::No);
         let _ = std::fs::remove_dir_all(&col_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ld_so_cache_parser_resolves_custom_dirs_and_hwcaps() {
+        #[cfg(target_arch = "aarch64")]
+        let (target_flags, other_flags) = (0x0a03u32, 0x0303u32);
+        #[cfg(target_arch = "x86_64")]
+        let (target_flags, other_flags) = (0x0303u32, 0x0a03u32);
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let (target_flags, other_flags) = (0x0003u32, 0x0000u32);
+
+        let entries: &[(u32, &[u8], &[u8])] = &[
+            (target_flags, b"libz.so.1", b"/opt/custom/glibc-hwcaps/v3/libz.so.1"),
+            (target_flags, b"libz.so.1", b"/opt/custom/libz.so.1"),
+            (other_flags, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
+            (target_flags, b"libc.so.6", b"/usr/lib/libc.so.6"),
+        ];
+        let str_base = 48 + entries.len() * 24;
+        let mut strings = std::vec::Vec::new();
+        let mut offsets = std::vec::Vec::new();
+        for &(flags, key, val) in entries {
+            let k_off = str_base + strings.len();
+            strings.extend_from_slice(key);
+            strings.push(0);
+            let v_off = str_base + strings.len();
+            strings.extend_from_slice(val);
+            strings.push(0);
+            offsets.push((flags, k_off as u32, v_off as u32));
+        }
+        let mut new_only = std::vec::Vec::new();
+        new_only.extend_from_slice(b"glibc-ld.so.cache1.1");
+        new_only.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        new_only.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        new_only.resize(48, 0);
+        for (flags, k_off, v_off) in offsets {
+            new_only.extend_from_slice(&flags.to_le_bytes());
+            new_only.extend_from_slice(&k_off.to_le_bytes());
+            new_only.extend_from_slice(&v_off.to_le_bytes());
+            new_only.extend_from_slice(&0u32.to_le_bytes());
+            new_only.extend_from_slice(&0u64.to_le_bytes());
+        }
+        new_only.extend_from_slice(&strings);
+
+        let mut compat = std::vec::Vec::new();
+        compat.extend_from_slice(b"ld.so-1.7.0\0");
+        compat.extend_from_slice(&1u32.to_le_bytes());
+        compat.extend_from_slice(&[0u8; 12]);
+        while compat.len() % 8 != 0 {
+            compat.push(0);
+        }
+        compat.extend_from_slice(&new_only);
+
+        for buf in [&new_only, &compat] {
+            let mut found: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+            let ok = bstd::procs::hermetic::parse_ld_so_cache_matches(buf, b"libz.so.1", |path| {
+                found.push(path.to_vec());
+                Ok(true)
+            })
+            .expect("valid ld.so.cache must parse");
+            assert!(ok);
+            assert_eq!(
+                found,
+                std::vec![
+                    b"/opt/custom/glibc-hwcaps/v3/libz.so.1".to_vec(),
+                    b"/opt/custom/libz.so.1".to_vec(),
+                ]
+            );
+        }
+        let err = bstd::procs::hermetic::parse_ld_so_cache_matches(b"not-an-ld-cache", b"libz.so.1", |_| Ok(true))
+            .expect_err("corrupt ld.so.cache must fail loudly");
+        assert!(matches!(err, bstd::procs::hermetic::Fault::Host { code: 22, .. }));
     }
 
     #[test]

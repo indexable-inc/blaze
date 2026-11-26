@@ -1136,15 +1136,29 @@ fn copy_file(
     }
 }
 
-/// A name beside `name`, in its directory, that no other call of this world was given: a
-/// publish's temporary file, `.<leaf>.<n>.bstd-new`.
+/// Formats the unique suffix of a publish temporary filename: `<nonce-hex>.<seq>` in a native
+/// world (preventing cross-process collisions across independent `Io` worlds sharing a directory)
+/// or `<seq>` in simulated/hosted worlds (preserving deterministic simulation names).
+struct TempTag(Option<u64>, u64);
+
+impl core::fmt::Display for TempTag {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(nonce) => write!(f, "{nonce:016x}.{}", self.1),
+            None => write!(f, "{}", self.1),
+        }
+    }
+}
+
+/// A name beside `name`, in its directory, unique within this world and (on native worlds)
+/// across concurrent OS processes sharing the same directory: `.<leaf>.<tag>.bstd-new`.
 fn beside(io: &Io, name: &FileName) -> FileName {
-    let fresh = io.fresh();
+    let tag = TempTag(io.fresh_nonce(), io.fresh());
     let joined = match name.as_str().rsplit_once('/') {
         // alloc: once per publish, its temporary file's name.
-        Some((dir, leaf)) => format!("{dir}/.{leaf}.{fresh}.bstd-new"),
+        Some((dir, leaf)) => format!("{dir}/.{leaf}.{tag}.bstd-new"),
         // alloc: once per publish, its temporary file's name.
-        None => format!(".{name}.{fresh}.bstd-new"),
+        None => format!(".{name}.{tag}.bstd-new"),
     };
     FileName::new(&joined).expect("a name beside a name is a name")
 }

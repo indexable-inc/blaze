@@ -292,6 +292,9 @@ pub(crate) enum Ends {
 struct World {
     driver: Backend,
     next: u64,
+    /// Per-world 64-bit OS random nonce for native temporary filenames (`beside`), drawn lazily
+    /// once so independent processes sharing a directory never collide on `.<leaf>.0.bstd-new`.
+    temp_nonce: Option<u64>,
     /// Effects made and not yet handed to the driver.
     effects: Vec<Effect>,
     /// What the last poll moved, before it is sorted into `got`.
@@ -891,6 +894,7 @@ impl World {
             driver,
             above,
             next: 0,
+            temp_nonce: None,
             // alloc: the effects' queue, grown once to the most made between waits.
             effects: Vec::new(),
             // alloc: the poll's buffer, grown once to the most a poll moves.
@@ -1772,6 +1776,29 @@ impl Io {
         let fresh = world.next;
         world.next += 1;
         fresh
+    }
+
+    /// An inter-process-unique 64-bit nonce for temporary filenames in a native world, drawn lazily
+    /// once via `Effect::Random` so independent processes sharing a directory (such as `~/.blaze`)
+    /// never collide on sibling `.bstd-new` temporary files. Returns `None` in simulated and
+    /// hosted worlds so simulated temporary names stay deterministic.
+    pub(crate) fn fresh_nonce(&self) -> Option<u64> {
+        #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+        let is_native = match &self.reach {
+            Reach::Shared { world, .. } => matches!(world.lock().driver, Backend::Native(_)),
+            Reach::Hosted => false,
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi")))]
+        let is_native = false;
+        if !is_native {
+            return None;
+        }
+        if let Some(nonce) = self.world().lock().temp_nonce {
+            return Some(nonce);
+        }
+        let drawn = self.draw_seed();
+        let mut world = self.world().lock();
+        Some(*world.temp_nonce.get_or_insert(drawn))
     }
 
     /// What the simulated disk was asked to do so far ([`DiskCounts`]): bytes written and

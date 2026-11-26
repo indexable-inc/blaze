@@ -404,3 +404,76 @@ fn c_probe_short_reads_dst_catches_planted_single_read() {
         .expect_err("planted SingleReadCProbe must be caught under Sim::short_reads");
     assert!(err.contains("c-probe short-read oracle"), "unexpected failure: {err}");
 }
+
+/// Cross-world (multi-process) concurrency test for `publish_if_absent`: creates two completely
+/// independent `native_world` instances (each starting its own `Io::fresh()` sequence at `0`)
+/// sharing the same on-disk directory, synchronizes them on a barrier, and races conflicting
+/// `put_c_probe` writes on the same missing key across 32 rounds. Proves sibling temporary
+/// filenames include a per-world nonce so independent processes never collide on `.<key>.0.bstd-new`
+/// or corrupt the winning sealed record.
+fn run_cross_world_publish_race() -> Result<(), &'static str> {
+    let dir_path = std::env::temp_dir().join(std::format!("blaze-cprobe-cross-world-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_path);
+    std::fs::create_dir_all(&dir_path).map_err(|_| "create cross-world dir")?;
+    let alloc = blaze_own::testing::heap().alloc();
+    let want_a = b"cross-process-answer-A-from-independent-world-1-0123456789abcdef";
+    let want_b = b"cross-process-answer-B-from-independent-world-2-fedcba9876543210-extra";
+
+    for round in 0..32u32 {
+        let k = key(500 + round);
+        let (io_a, root_a) = super::native_world(&dir_path).map_err(|_| "native world A")?;
+        let (io_b, root_b) = super::native_world(&dir_path).map_err(|_| "native world B")?;
+        let s_a = DirStore::on(OnDir { cx: io_a.spawner(), boot: io_a.boot().ok(), dir: root_a }, RecordPlant::None);
+        let s_b = DirStore::on(OnDir { cx: io_b.spawner(), boot: io_b.boot().ok(), dir: root_b }, RecordPlant::None);
+        let barrier = std::sync::Barrier::new(2);
+        let (ra, rb) = std::thread::scope(|scope| {
+            let ta = scope.spawn(|| {
+                barrier.wait();
+                s_a.put_c_probe(&k, want_a)
+            });
+            let tb = scope.spawn(|| {
+                barrier.wait();
+                s_b.put_c_probe(&k, want_b)
+            });
+            (ta.join(), tb.join())
+        });
+        let (Ok(ra), Ok(rb)) = (ra, rb) else {
+            let _ = std::fs::remove_dir_all(&dir_path);
+            return Err("cross-world thread panicked");
+        };
+        let verify_dir = io_a.need_fs().map_err(|_| "verify fs")?.root();
+        let held = DirStore::on(OnDir { cx: io_a.spawner(), boot: io_a.boot().ok(), dir: verify_dir }, RecordPlant::None)
+            .get_c_probe(&k, alloc)
+            .map_err(|_| "read after cross-world race")?
+            .ok_or("record missing after cross-world race")?;
+        match (ra, rb) {
+            (Ok(()), Err(FilesError::OtherBytes { .. })) => {
+                if held.as_slice() != want_a {
+                    let _ = std::fs::remove_dir_all(&dir_path);
+                    return Err("cross-world winner A corrupted by racing world B temp file");
+                }
+            }
+            (Err(FilesError::OtherBytes { .. }), Ok(())) => {
+                if held.as_slice() != want_b {
+                    let _ = std::fs::remove_dir_all(&dir_path);
+                    return Err("cross-world winner B corrupted by racing world A temp file");
+                }
+            }
+            (Ok(()), Ok(())) => {
+                let _ = std::fs::remove_dir_all(&dir_path);
+                return Err("cross-world race allowed both conflicting puts to succeed");
+            }
+            _ => {
+                let _ = std::fs::remove_dir_all(&dir_path);
+                return Err("unexpected error in cross-world publish race");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir_path);
+    Ok(())
+}
+
+#[test]
+fn c_probe_cross_world_publish_if_absent_isolates_temp_files() {
+    run_cross_world_publish_race().expect("independent native worlds must never collide on sibling temp files");
+}

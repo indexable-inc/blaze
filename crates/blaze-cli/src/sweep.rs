@@ -54,6 +54,8 @@ struct FactFiles<'a> {
     sdk_digest: Option<&'a dyn Fn() -> [u8; 32]>,
     cached_sdk: Option<[u8; 32]>,
     cached_answerer: Option<ContentId>,
+    #[cfg(target_os = "linux")]
+    root_reader: Option<bstd::procs::hermetic::RootReader>,
 }
 
 /// Reads a sealed `c-probe/<64-hex>` record from the command's `.blaze` home capability after
@@ -168,14 +170,42 @@ impl<'a> FactFiles<'a> {
             return Ok(cached);
         }
         let id = match (self.home, self.home_path) {
-            (Some((cx, _)), Some(home)) => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(
-                cx,
-                home,
-                crate::graph::TRIPLE,
-                alloc,
-            )
-            .map_err(|_| CliError::Text { what: "cannot compute active c-probe runtime closure identity" })?
-            .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id),
+            (Some((cx, _)), Some(home)) => {
+                #[cfg(target_os = "linux")]
+                let computed = {
+                    if self.root_reader.is_none() {
+                        let created = bstd::procs::hermetic::RootReader::new(cx).map_err(|_| {
+                            CliError::Text { what: "cannot open root reader for c-probe runtime closure identity" }
+                        })?;
+                        self.root_reader = Some(created);
+                    }
+                    match self.root_reader.as_ref() {
+                        Some(reader) => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home_with(
+                            reader,
+                            cx,
+                            home,
+                            crate::graph::TRIPLE,
+                            alloc,
+                        ),
+                        None => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(
+                            cx,
+                            home,
+                            crate::graph::TRIPLE,
+                            alloc,
+                        ),
+                    }
+                };
+                #[cfg(not(target_os = "linux"))]
+                let computed = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(
+                    cx,
+                    home,
+                    crate::graph::TRIPLE,
+                    alloc,
+                );
+                computed
+                    .map_err(|_| CliError::Text { what: "cannot compute active c-probe runtime closure identity" })?
+                    .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id)
+            }
             _ => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id(),
         };
         self.cached_answerer = Some(id);
@@ -242,7 +272,17 @@ impl<'a> FactFiles<'a> {
 /// iff every `FACT_MOUNT` row matches its stored digest.
 pub(crate) fn verify_fact_leaves(leaves: &Leaves<'_>, exe_dir: Option<&str>, frame: &Frame) -> bool {
     let erased = blaze_own::Erased::new(frame);
-    let mut fact_files = FactFiles { setting: None, exe_dir, home: None, home_path: None, sdk_digest: None, cached_sdk: None, cached_answerer: None };
+    let mut fact_files = FactFiles {
+        setting: None,
+        exe_dir,
+        home: None,
+        home_path: None,
+        sdk_digest: None,
+        cached_sdk: None,
+        cached_answerer: None,
+        #[cfg(target_os = "linux")]
+        root_reader: None,
+    };
     for i in 0..leaves.len() {
         let row = leaves.row(i);
         let path = leaves.path(i);
@@ -1271,6 +1311,8 @@ impl<S: Stamps> Follow<S> {
             sdk_digest,
             cached_sdk: None,
             cached_answerer: None,
+            #[cfg(target_os = "linux")]
+            root_reader: None,
         };
         // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
         // after them in the table's (kind, path) order.

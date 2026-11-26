@@ -185,11 +185,71 @@ fn is_header_search_flag(arg: &str) -> bool {
     false
 }
 
+/// Whether `arg` causes the compiler to write additional output files (depfiles, serialized
+/// diagnostics, temporary intermediates, trace/stats/optimization records, module outputs, or
+/// coverage notes) that a probe runner does not return to the build script.
+fn is_extra_output_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-M" | "-MM"
+            | "-MD"
+            | "-MMD"
+            | "-MG"
+            | "-MP"
+            | "-MV"
+            | "-H"
+            | "--write-dependencies"
+            | "--write-user-dependencies"
+            | "-dependency-file"
+            | "--dependency-file"
+            | "-serialize-diagnostics"
+            | "--serialize-diagnostics"
+            | "-save-temps"
+            | "--save-temps"
+            | "-dumpdir"
+            | "-dumpbase"
+            | "-dumpbase-ext"
+            | "-auxbase"
+            | "-auxbase-strip"
+            | "-fsave-optimization-record"
+            | "-foptimization-record-file"
+            | "-fdeps-file"
+            | "-fmodule-output"
+            | "-fmodules-cache-path"
+            | "-fprebuilt-module-path"
+            | "-fcrash-diagnostics-dir"
+            | "-ftime-trace"
+            | "-fproc-stat-report"
+            | "-ftest-coverage"
+            | "--coverage"
+            | "--output"
+    ) || arg.starts_with("-MF")
+        || arg.starts_with("-MQ")
+        || arg.starts_with("-MT")
+        || arg.starts_with("-MJ")
+        || arg.starts_with("-dependency-file=")
+        || arg.starts_with("--dependency-file=")
+        || arg.starts_with("-serialize-diagnostics=")
+        || arg.starts_with("--serialize-diagnostics=")
+        || arg.starts_with("-save-temps=")
+        || arg.starts_with("--save-temps=")
+        || arg.starts_with("-fdeps-file=")
+        || arg.starts_with("-fmodule-output=")
+        || arg.starts_with("-fmodules-cache-path=")
+        || arg.starts_with("-fprebuilt-module-path=")
+        || arg.starts_with("-fcrash-diagnostics-dir=")
+        || arg.starts_with("-ftime-trace=")
+        || arg.starts_with("-fproc-stat-report=")
+        || arg.starts_with("-fsave-optimization-record=")
+        || arg.starts_with("-foptimization-record-file=")
+        || arg.starts_with("--output=")
+}
+
 /// Matches the exact `cc-rs` `is_flag_supported` probe shape: compile-only (`-c`), with
-/// **exactly one** `-o <dir>/flag_check` output option (no duplicate `-o` or attached `-o...`)
-/// and ONLY the companion `<dir>/flag_check.<c-ext>` source input in the same directory so custom
-/// build scripts that happen to name a real object/binary `flag_check` stay on the normal
-/// compiler route and preserve their output file.
+/// **exactly one** `-o <dir>/flag_check` output option (no duplicate `-o`, attached `-o...`, or
+/// extra side-effect output flags) and ONLY the companion `<dir>/flag_check.<c-ext>` source input
+/// in the same directory so custom build scripts that happen to name a real object/binary
+/// `flag_check` stay on the normal compiler route and preserve their output files.
 fn is_flag_check_probe(args: &[&str]) -> bool {
     if !args.contains(&"-c") {
         return false;
@@ -207,8 +267,8 @@ fn is_flag_check_probe(args: &[&str]) -> bool {
             }
             continue;
         }
-        if arg.starts_with("-o") && arg.len() > 2 {
-            // Attached `-o<path>` (either duplicate or non-cc-rs shape): not a flag_check probe.
+        if (arg.starts_with("-o") && arg.len() > 2) || is_extra_output_flag(arg) {
+            // Attached `-o<path>` or side-effect output flag: not a discardable flag_check probe.
             return false;
         }
         if flag_takes_value(arg) {
@@ -252,9 +312,9 @@ fn is_flag_check_probe(args: &[&str]) -> bool {
     saw_flag_src
 }
 
-/// Matches the exact `cc-rs` compiler-family detection probe shape: `-E`, no `-o` output flag,
-/// no header-search flags, and ONLY ONE positional source input whose basename is
-/// `<0+ ascii digits>detect_compiler_family.c`.
+/// Matches the exact `cc-rs` compiler-family detection probe shape: `-E`, no `-o` or extra
+/// output-producing flags, no header-search flags, and ONLY ONE positional source input whose
+/// basename is `<0+ ascii digits>detect_compiler_family.c`.
 fn is_family_probe(args: &[&str]) -> bool {
     if !args.contains(&"-E") {
         return false;
@@ -266,7 +326,11 @@ fn is_family_probe(args: &[&str]) -> bool {
             skip_next = false;
             continue;
         }
-        if arg == "-o" || (arg.starts_with("-o") && arg.len() > 2) || is_header_search_flag(arg) {
+        if arg == "-o"
+            || (arg.starts_with("-o") && arg.len() > 2)
+            || is_header_search_flag(arg)
+            || is_extra_output_flag(arg)
+        {
             return false;
         }
         if flag_takes_value(arg) {
