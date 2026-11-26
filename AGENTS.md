@@ -126,7 +126,7 @@ covers. Numbers are stable ids, not an order. Edit scripts/src/bin/rules.rs, run
 - **28. best-long-term-design**: Pick the best long-term design, not the least work; be proud of the first iteration, then prove it.
 - **29. spec-then-build**: A change that needs a design gets a short spec, then the same lane builds it at once.
 - **30. one-concept-one-home**: One type, one rule, one place per concept; merge duplicates and ban the removed name.
-- **54. guard-the-cause**: Ask why down to the root, name the class, and change the design so the class cannot happen.
+- **54. guard-the-cause**: Find root cause, name the class, fix the design, and proactively sweep all siblings in one batch.
 - **58. build-the-missing-piece**: When the right design needs a piece the tree lacks, build it; never ship the weaker form.
 - **59. unease-is-work**: See 54: unease is an issue too; find its root cause and fix it there.
 - **62. sota-first**: Design the end state and build it directly, its pieces in parallel; then prove it on real targets.
