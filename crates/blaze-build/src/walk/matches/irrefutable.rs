@@ -394,20 +394,35 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// function's exit the bindings drop first, last declared first, then what is left of the
     /// argument, its parts in declaration order (walk/moves.rs `drop_moved`).
     pub(in crate::walk) fn bind_param(&mut self, p: PatId, v: V, g: PTy) -> Result<(), BuildError> {
-        let leaves = !matches!(self.pat(p)?, Pat::Bind { .. })
-            && self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))?
-            && self.let_leaves_drops(p)?;
-        if !leaves {
+        let has_ref = self.pat_has_ref_bind(p)?;
+        let drops = self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let leaves = !matches!(self.pat(p)?, Pat::Bind { .. }) && drops && self.let_leaves_drops(p)?;
+        if !leaves && !has_ref {
             self.bind_value_of(p, v, g)?;
             return self.own_pat(p);
         }
         self.refuse_refutable(p)?;
-        let V::Place(base, off) = v else { return Err(malformed("a parameter that needs drop not held in memory")) };
+        let (base, off) = match v {
+            V::Place(base, off) => (base, off),
+            other if !drops => {
+                let repr = self.repr(g).map_err(|error| Self::pat_ty_err(p, error))?;
+                let (size, align) = self.size_align(repr);
+                let slot = self.b.slot(size, align, blaze_lir::func::SlotKind::Named);
+                let at = (self.b.slot_addr(slot), 0);
+                self.store(other, repr, at)?;
+                at
+            }
+            _ => return Err(malformed("a parameter that needs drop not held in memory")),
+        };
         let m = self.matches.len() as u32;
-        self.own_param(m, (base, off), g);
-        self.move_arm(m, p, false);
+        if drops {
+            self.own_param(m, (base, off), g);
+            self.move_arm(m, p, false);
+        }
         let bound = self.bind_tested(p, At { at: (base, off), g, by_ref: false, copy: false });
-        self.move_arm_end();
+        if drops {
+            self.move_arm_end();
+        }
         bound
     }
 

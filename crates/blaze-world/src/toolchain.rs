@@ -61,6 +61,7 @@ pub struct Needs {
     pub std: bool,
     pub bstd: bool,
     pub proc_macro: bool,
+    pub test: bool,
 }
 
 /// One toolchain crate: its input's parts, owned by the allocator the toolchain was opened in.
@@ -144,6 +145,11 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
         if needs.proc_macro {
             todo.push(sys.proc_macro.0 as usize);
         }
+        if needs.test
+            && let Some(test_u) = blaze_toolchain::test_unit(&view, triple, false)
+        {
+            todo.push(test_u.0 as usize);
+        }
         while let Some(u) = todo.pop() {
             if keep_unit[u] {
                 continue;
@@ -203,7 +209,14 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
             cfg.extend_from_slice(&cfg_target);
             cfg.extend_from_slice(PROFILE);
             cfg.extend(features.iter().map(|f| ("feature", Some(*f))));
-            let script = if krate.role == Role::Std { std_script_cfg(triple)? } else { &[] };
+            let script: &[&str] = if krate.role == Role::Std {
+                std_script_cfg(triple)?
+            } else if krate.role == Role::Library && krate.lib == "test" {
+                // library/test/build.rs:10 emits `cargo:rustc-cfg=enable_unstable_features` on nightly.
+                &["enable_unstable_features"]
+            } else {
+                &[]
+            };
             cfg.extend(script.iter().map(|atom| (*atom, None)));
             let mut key_bytes: AVec<'w, u8> = AVec::new_in(alloc);
             key_bytes.extend_from_slice(&krate.pack);

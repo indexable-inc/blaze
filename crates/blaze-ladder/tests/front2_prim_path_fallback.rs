@@ -99,9 +99,11 @@ fn a(v: Option<&'static str>) -> Option<String> { v.map(str::to_owned) }
 fn d(v: &str) -> String { str::to_ascii_lowercase(v) }
 fn c() { str::nothing() }
 fn b() -> bool { str::from_utf8(b\"x\").is_ok() }
+fn e(s: &str) -> Option<u8> { use std::u8; u8::from_str_radix(s, 16).ok() }
+fn f() { use std::u8; u8::nothing(); }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["a", "d", "c", "b"]);
+    let got = check_fns(TEXT, &["a", "d", "c", "b", "e", "f"]);
     let lines: Vec<String> = got.iter().map(|(n, o)| format!("prim path: {n}: {o}")).collect();
     for l in &lines {
         println!("{l}");
@@ -111,4 +113,6 @@ fn main() {}
     assert_eq!(outcome("d"), "clean", "{}", lines.join("\n"));
     assert!(outcome("c").contains("E0599") && !outcome("c").contains("E0425"), "{}", lines.join("\n"));
     assert_eq!(outcome("b"), "clean", "{}", lines.join("\n"));
+    assert_eq!(outcome("e"), "clean", "{}", lines.join("\n"));
+    assert!(outcome("f").contains("E0599") && !outcome("f").contains("E0425"), "{}", lines.join("\n"));
 }

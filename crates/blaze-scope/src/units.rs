@@ -361,9 +361,16 @@ pub fn unit_crates<'a>(
         .iter()
         .enumerate()
         .any(|(at, _)| reached[at] && kept(at) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Rust));
+    let rust_test = units.iter().enumerate().any(|(at, u)| {
+        reached[at]
+            && kept(at)
+            && !macro_code(at)
+            && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Rust)
+            && matches!(u.kind, UnitKind::Bench(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_))
+    });
 
     let mut crates: AVec<'a, UnitCrate<'a>> = AVec::new_in(alloc);
-    let sysroot = toolchain_crates(toolchain, triple, rust_std, blaze, &mut crates, alloc)?;
+    let (sysroot, test_crate) = toolchain_crates(toolchain, triple, rust_std, blaze, rust_test, &mut crates, alloc)?;
     let first = crates.len();
 
     let mut at_of: AVec<'a, usize> = AVec::new_in(alloc);
@@ -400,6 +407,13 @@ pub fn unit_crates<'a>(
                     });
                 }
                 deps.push((d.name.as_str(), to));
+            }
+            if let Some(tc_test) = test_crate
+                && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Rust)
+                && matches!(u.kind, UnitKind::Bench(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_))
+                && !deps.iter().any(|(n, _)| *n == "test")
+            {
+                deps.push(("test", tc_test));
             }
         }
         let mut features = AVec::with_capacity_in(u.features.len(), alloc);
@@ -444,11 +458,13 @@ fn toolchain_crates<'a>(
     triple: &'a str,
     rust_std: bool,
     blaze: bool,
+    rust_test: bool,
     out: &mut AVec<'a, UnitCrate<'a>>,
     alloc: Alloc<'a>,
-) -> Result<Sysroot, UnitsError<'a>> {
+) -> Result<(Sysroot, Option<usize>), UnitsError<'a>> {
     let no_target = || UnitsError::NoTarget { triple };
     let sys = blaze_toolchain::sysroot(&view, triple, false).ok_or_else(no_target)?;
+    let test_unit = if rust_test { blaze_toolchain::test_unit(&view, triple, false) } else { None };
     let mut all = AVec::new_in(alloc);
     all.extend(view.units(triple).ok_or_else(no_target)?);
     let mut keep: AVec<'a, bool> = AVec::new_in(alloc);
@@ -460,6 +476,9 @@ fn toolchain_crates<'a>(
     }
     if blaze {
         todo.push(sys.bstd.0 as usize);
+    }
+    if let Some(tu) = test_unit {
+        todo.push(tu.0 as usize);
     }
     while let Some(u) = todo.pop() {
         if keep[u] {
@@ -486,6 +505,7 @@ fn toolchain_crates<'a>(
     cfg_base.extend(target_cfg);
     cfg_base.extend(PROFILE.iter().copied());
     let mut sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+    let mut test_crate: Option<usize> = None;
     for (u, row) in all.iter().enumerate() {
         if at_of[u] == usize::MAX {
             continue;
@@ -523,9 +543,14 @@ fn toolchain_crates<'a>(
         }
         let mut features = AVec::new_in(alloc);
         features.extend(row.features());
-        let mut cfg = AVec::with_capacity_in(cfg_base.len() + features.len(), alloc);
+        let mut cfg = AVec::with_capacity_in(cfg_base.len() + features.len() + 1, alloc);
         cfg.extend(cfg_base.iter().copied());
         cfg.extend(features.iter().map(|f| ("feature", Some(*f))));
+        if krate.role == Role::Library && krate.lib == "test" && !row.for_host {
+            // library/test/build.rs:10 emits `cargo:rustc-cfg=enable_unstable_features` on nightly.
+            cfg.push(("enable_unstable_features", None));
+            test_crate = Some(at_of[u]);
+        }
         let id = Some(CrateId(at_of[u] as u32));
         match krate.role {
             Role::Core if !row.for_host => sysroot.core = id,
@@ -556,7 +581,7 @@ fn toolchain_crates<'a>(
             script: None,
         });
     }
-    Ok(sysroot)
+    Ok((sysroot, test_crate))
 }
 
 /// A workspace unit's key: its package as the lock writes it, its kind, side and features.

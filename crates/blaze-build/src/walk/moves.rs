@@ -517,11 +517,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// Pre-registers moved part bits for every `match` in this body whose scrutinee is local `p`
-    /// (of type `g`, with field-flags slot `mask`) so earlier whole-local or field assignments in
-    /// the same loop (e.g. `loop { if cond { v = Some(Quit); } match v { Some(Work(w)) => ... } }`)
-    /// already test those parts' bits when dropping the overwritten value.
-    pub(super) fn preregister_local_match_parts(&mut self, p: PatId, g: PTy, mask: SlotId) {
+    /// Pre-registers moved part bits for every `match` scrutinee, field/tuple-field move, and
+    /// `Box` deref move rooted at local `p` (of type `g`, with field-flags slot `mask`) so earlier
+    /// whole-local or parent assignments in the same loop (e.g. `ignore::walk::Worker::get_work`
+    /// and `regex_automata::nfa::thompson::literal_trie::LiteralTrie::compile`) already test those
+    /// parts' bits when dropping the overwritten value.
+    pub(super) fn preregister_local_parts(&mut self, p: PatId, g: PTy, mask: SlotId) {
         let layout_id = self.layout(g).ok();
         let base = match layout_id.map(|l| self.layouts[l as usize].shape) {
             Some(Shape::Enum { first, len, .. }) => (0..len).map(|v| self.layout_variants[(first + v) as usize].1).sum(),
@@ -530,81 +531,126 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let mut pat_stack: Vec<PatId, A> = Vec::new_in(self.alloc);
         let expr_count = self.body.exprs.len();
         for i in 0..expr_count {
-            let Ok(Expr::Match { scrutinee, arms }) = self.expr(ExprId(i as u32)) else { continue };
-            let mut s = scrutinee;
-            let mut ok = true;
-            for _ in 0..16 {
-                if !self.adjust_rows(s).is_empty() {
-                    ok = false;
-                    break;
-                }
-                match self.expr(s) {
-                    Ok(Expr::Paren(inner)) => s = inner,
-                    Ok(Expr::Local(q)) if q == p => break,
-                    _ => {
-                        ok = false;
-                        break;
+            let eid = ExprId(i as u32);
+            let Ok(expr) = self.expr(eid) else { continue };
+            match expr {
+                Expr::Field { .. } | Expr::TupleField { .. } => {
+                    let adj_kinds = self.checked.adjusts.column::<1>();
+                    let borrowed = self
+                        .adjust_rows(eid)
+                        .any(|r| matches!(adj_kinds[r], blaze_typeck::AdjustKind::Borrow { .. }))
+                        || self
+                            .expr_parent
+                            .get(i)
+                            .and_then(|&(up, _)| (up != NO_EXPR).then_some(ExprId(up)))
+                            .is_some_and(|up| match self.expr(up) {
+                                Ok(Expr::Ref { .. }) => true,
+                                Ok(Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. }) => lhs == eid,
+                                _ => false,
+                            });
+                    if borrowed {
+                        continue;
                     }
-                }
-            }
-            if !ok {
-                continue;
-            }
-            let Some(arm_list) = self.body.arms.get(arms.range()) else { continue };
-            for arm_idx in 0..arm_list.len() {
-                let arm_pat = self.body.arms[arms.start as usize + arm_idx].pat;
-                pat_stack.clear();
-                pat_stack.push(arm_pat);
-                let mut steps = 0usize;
-                while let Some(q) = pat_stack.pop() {
-                    steps += 1;
-                    if steps > self.body.pats.len() + 1 {
-                        break;
+                    let Ok(et) = self.expr_ty(eid) else { continue };
+                    let Ok(eg) = self.ground_ty(et) else { continue };
+                    if !matches!(self.needs_drop(eg), Ok(true)) {
+                        continue;
                     }
-                    let Ok(pat) = self.pat(q) else { continue };
-                    match pat {
-                        Pat::Bind { ann, sub, .. } => {
-                            if ann.by_ref.is_none()
-                                && let Some(&bt) = self.checked.local_ty.get(q.ix())
-                                && let Ok(bg) = self.ground_in(self.checked.types.view(), bt)
-                                && matches!(self.needs_drop(bg), Ok(true))
-                                && let Ok(bl) = self.layout(bg)
-                                && self.layouts[bl as usize].size > 0
-                            {
-                                let mark = self.moves.steps.len();
-                                if let Ok((start, len)) = self.move_path(arm_pat, g, q) {
-                                    let direct_enum_field = len == 1
-                                        && matches!(self.moves.steps.get(start as usize), Some(Step::Variant { .. }))
-                                        && layout_id.is_some_and(|l| matches!(self.layouts[l as usize].shape, Shape::Enum { .. }));
-                                    if len == 0 || direct_enum_field {
-                                        self.moves.steps.truncate(mark);
-                                    } else if self.part_bit(mask, start, len, base, None).ok().flatten().is_none() {
-                                        self.moves.steps.truncate(mark);
+                    let Ok(el) = self.layout(eg) else { continue };
+                    if self.layouts[el as usize].size == 0 {
+                        continue;
+                    }
+                    let mark = self.moves.steps.len();
+                    if let Ok(Some((q, _, start, len, false))) = self.field_path(eid)
+                        && q == p
+                        && len > 0
+                    {
+                        if self.part_bit(mask, start, len, base, None).ok().flatten().is_none() {
+                            self.moves.steps.truncate(mark);
+                        }
+                    } else {
+                        self.moves.steps.truncate(mark);
+                    }
+                    continue;
+                }
+                Expr::Match { scrutinee, arms } => {
+                    let mut s = scrutinee;
+                    let mut ok = true;
+                    for _ in 0..16 {
+                        if !self.adjust_rows(s).is_empty() {
+                            ok = false;
+                            break;
+                        }
+                        match self.expr(s) {
+                            Ok(Expr::Paren(inner)) => s = inner,
+                            Ok(Expr::Local(q)) if q == p => break,
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let Some(arm_list) = self.body.arms.get(arms.range()) else { continue };
+                    for arm_idx in 0..arm_list.len() {
+                        let arm_pat = self.body.arms[arms.start as usize + arm_idx].pat;
+                        pat_stack.clear();
+                        pat_stack.push(arm_pat);
+                        let mut steps = 0usize;
+                        while let Some(q) = pat_stack.pop() {
+                            steps += 1;
+                            if steps > self.body.pats.len() + 1 {
+                                break;
+                            }
+                            let Ok(pat) = self.pat(q) else { continue };
+                            match pat {
+                                Pat::Bind { ann, sub, .. } => {
+                                    if ann.by_ref.is_none()
+                                        && let Some(&bt) = self.checked.local_ty.get(q.ix())
+                                        && let Ok(bg) = self.ground_in(self.checked.types.view(), bt)
+                                        && matches!(self.needs_drop(bg), Ok(true))
+                                        && let Ok(bl) = self.layout(bg)
+                                        && self.layouts[bl as usize].size > 0
+                                    {
+                                        let mark = self.moves.steps.len();
+                                        if let Ok((start, len)) = self.move_path(arm_pat, g, q) {
+                                            let direct_enum_field = len == 1
+                                                && matches!(self.moves.steps.get(start as usize), Some(Step::Variant { .. }))
+                                                && layout_id.is_some_and(|l| matches!(self.layouts[l as usize].shape, Shape::Enum { .. }));
+                                            if len == 0 || direct_enum_field {
+                                                self.moves.steps.truncate(mark);
+                                            } else if self.part_bit(mask, start, len, base, None).ok().flatten().is_none() {
+                                                self.moves.steps.truncate(mark);
+                                            }
+                                        } else {
+                                            self.moves.steps.truncate(mark);
+                                        }
                                     }
-                                } else {
-                                    self.moves.steps.truncate(mark);
+                                    if let Some(sub_p) = sub {
+                                        pat_stack.push(sub_p);
+                                    }
                                 }
-                            }
-                            if let Some(sub_p) = sub {
-                                pat_stack.push(sub_p);
-                            }
-                        }
-                        Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
-                            if let Some(subs) = self.body.pat_lists.get(elems.range()) {
-                                pat_stack.extend_from_slice(subs);
-                            }
-                        }
-                        Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
-                            if let Some(fps) = self.body.field_pats.get(fields.range()) {
-                                for fp in fps {
-                                    pat_stack.push(fp.pat);
+                                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                                    if let Some(subs) = self.body.pat_lists.get(elems.range()) {
+                                        pat_stack.extend_from_slice(subs);
+                                    }
                                 }
+                                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                                    if let Some(fps) = self.body.field_pats.get(fields.range()) {
+                                        for fp in fps {
+                                            pat_stack.push(fp.pat);
+                                        }
+                                    }
+                                }
+                                // Behind a reference pattern nothing moves out of `p`.
+                                Pat::Ref { .. } | Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
                             }
                         }
-                        // Behind a reference pattern nothing moves out of `p`.
-                        Pat::Ref { .. } | Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
                     }
                 }
+                _ => continue,
             }
         }
     }

@@ -72,6 +72,21 @@ pub fn sysroot(view: &ToolchainView<'_>, triple: &str, for_host: bool) -> Option
     Some(blaze_unit_graph::Sysroot { core: found[0]?, alloc: found[1]?, std: found[2]?, proc_macro: found[3]?, bstd: found[4]? })
 }
 
+/// The toolchain's `test` library unit (`library/test`, `Role::Library`, `lib == "test"`) for
+/// `triple` on one side, if the manifest holds one.
+pub fn test_unit(view: &ToolchainView<'_>, triple: &str, for_host: bool) -> Option<blaze_unit_graph::ToolchainUnit> {
+    for (at, unit) in view.units(triple)?.enumerate() {
+        if unit.kind != UnitKind::Lib || unit.for_host != for_host {
+            continue;
+        }
+        let krate = view.krate(unit.krate);
+        if krate.role == Role::Library && krate.lib == "test" {
+            return Some(blaze_unit_graph::ToolchainUnit(at as u32));
+        }
+    }
+    None
+}
+
 /// 32 bytes as 64 lower-case hex digits, on the stack.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Hex([u8; 64]);
