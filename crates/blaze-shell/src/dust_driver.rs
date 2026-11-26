@@ -157,12 +157,18 @@ fn run_dust_scan(root: &Path, dir_mtime_ns: u128) {
                 } else {
                     (EntryKind::Other, 0, None, 1)
                 };
+                let mtime_ns = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos().min(i64::MAX as u128) as i64);
                 if !machine.feed_entry(DirEntryMeta {
                     name: &name,
                     kind,
                     bytes,
                     inode,
                     nlink,
+                    mtime_ns,
                 }) {
                     break;
                 }

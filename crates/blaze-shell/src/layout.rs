@@ -1931,15 +1931,16 @@ fn layout_table(
     }
     let file_entry_col = col_displays.iter().position(|&d| d == ColDisplay::FileEntry);
     let size_col_idx = col_displays.iter().position(|&d| d == ColDisplay::FileSize);
+    let time_col_idx = col_displays.iter().position(|&d| d == ColDisplay::HumanTime);
     let mut all_row_dust: Vec<Option<blaze_dust::DustProgress>> = vec![None; total_rows];
     let mut dust_max_bytes: u64 = 0;
-    if size_col_idx.is_some()
+    if (size_col_idx.is_some() || time_col_idx.is_some())
         && let Some(fc) = file_entry_col
     {
-        // Always scan up to 256 rows (or all rows if sorting by size) so `size ↓` is exact!
+        // Always scan up to 512 rows when sorting by size or modified so folder order is exact!
         let dust_scan_rows = if block
             .table_sort
-            .is_some_and(|(sc, _)| Some(sc) == size_col_idx)
+            .is_some_and(|(sc, _)| Some(sc) == size_col_idx || Some(sc) == time_col_idx)
         {
             total_rows.min(512)
         } else {
@@ -1972,6 +1973,7 @@ fn layout_table(
         && sort_col < ncols
     {
         let sort_is_file_size = col_displays.get(sort_col) == Some(&ColDisplay::FileSize);
+        let sort_is_human_time = col_displays.get(sort_col) == Some(&ColDisplay::HumanTime);
         row_order.sort_by(|&a, &b| {
             let ord = if sort_is_file_size {
                 let eff_bytes = |row_idx: usize| -> i64 {
@@ -1985,6 +1987,21 @@ fn layout_table(
                     }
                 };
                 eff_bytes(a).cmp(&eff_bytes(b))
+            } else if sort_is_human_time {
+                let eff_ns = |row_idx: usize| -> i64 {
+                    let base = match table.cell(row_idx, sort_col) {
+                        Some(Value::Date(dt)) => dt.utc_ns,
+                        _ => i64::MIN,
+                    };
+                    if let Some(prog) = all_row_dust.get(row_idx).copied().flatten()
+                        && prog.max_mtime_ns > base
+                    {
+                        prog.max_mtime_ns
+                    } else {
+                        base
+                    }
+                };
+                eff_ns(a).cmp(&eff_ns(b))
             } else {
                 let va = table.cell(a, sort_col);
                 let vb = table.cell(b, sort_col);
@@ -2682,17 +2699,35 @@ fn layout_table(
                                 }
                             }
                             ColDisplay::HumanTime => {
-                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let row_is_dir = row_file_kind.is_some_and(blaze_sniff::is_dir_label);
+                                let dust_mtime = if row_is_dir {
+                                    all_row_dust
+                                        .get(r)
+                                        .copied()
+                                        .flatten()
+                                        .map(|p| p.max_mtime_ns)
+                                        .unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                let (raw, txt_col) = if let Value::Date(dt) = cell {
+                                    let eff_ns = dt.utc_ns.max(dust_mtime);
+                                    let eff_val = Value::Date(blaze_sh::DateTime {
+                                        utc_ns: eff_ns,
+                                        offset_secs: dt.offset_secs,
+                                    });
+                                    let age_secs =
+                                        (now_ns.saturating_sub(eff_ns)).max(0) as u64 / 1_000_000_000;
+                                    (
+                                        format_value_cell_at(&eff_val, Some(now_ns)),
+                                        theme::recency_heat_color(age_secs),
+                                    )
+                                } else {
+                                    (format_value_cell_at(cell, Some(now_ns)), theme::INK_3)
+                                };
                                 let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
                                 let txt = truncate_chars(&raw, max_ch);
                                 let tx = rx + content_w - txt.chars().count() as f32 * m.cw;
-                                let txt_col = if let Value::Date(dt) = cell {
-                                    let age_secs =
-                                        (now_ns.saturating_sub(dt.utc_ns)).max(0) as u64 / 1_000_000_000;
-                                    theme::recency_heat_color(age_secs)
-                                } else {
-                                    theme::INK_3
-                                };
                                 scene.text(tx, ty, txt, txt_col, false, false, clip_id);
                             }
                             _ => {
