@@ -1069,6 +1069,79 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
             }
             Some(blaze_sh::Value::Table(tbl))
         }
+        "blame" if !rest.is_empty() => {
+            // Let explicit porcelain / raw / help flags pass straight through to external `git`.
+            if rest.iter().any(|a| {
+                matches!(
+                    *a,
+                    "--porcelain" | "-p" | "--line-porcelain" | "--incremental" | "-h" | "--help"
+                )
+            }) {
+                return None;
+            }
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .arg("blame")
+                .arg("--porcelain")
+                .args(rest)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let raw = String::from_utf8_lossy(&out.stdout);
+            let lines = blaze_git_meta::parse_blame_porcelain_in(&raw, 2000, alloc);
+            if lines.is_empty() {
+                return None;
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["line", "commit", "author", "modified", "code", "summary", "email", "sha"],
+                alloc,
+            );
+            tbl.set_col_display("commit", blaze_sh::ColDisplay::GitCommit);
+            tbl.set_col_display("author", blaze_sh::ColDisplay::GitAuthor);
+            tbl.set_col_display("modified", blaze_sh::ColDisplay::HumanTime);
+            tbl.hide_col_by_name("summary");
+            tbl.hide_col_by_name("email");
+            tbl.hide_col_by_name("sha");
+            tbl.default_grid = false;
+
+            let gh_repo = crate::git_meta_driver::github_repo_for_dir(Path::new(cwd));
+            let mut warmed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for bl in &lines {
+                let email = bl.author_email.as_str();
+                if !email.is_empty() && warmed.len() < 16 && warmed.insert(email.to_owned()) {
+                    let _ = crate::git_meta_driver::request_avatar(
+                        email,
+                        Some(bl.full_sha.as_str()),
+                        gh_repo.as_ref(),
+                    );
+                }
+                let dt_val = if bl.author_time_secs > 0 {
+                    blaze_sh::Value::Date(blaze_sh::DateTime {
+                        utc_ns: bl.author_time_secs.saturating_mul(1_000_000_000),
+                        offset_secs: 0,
+                    })
+                } else {
+                    blaze_sh::Value::Nothing
+                };
+                tbl.push_row_values(&[
+                    blaze_sh::Value::Int(i64::from(bl.line_no)),
+                    blaze_sh::Value::string(bl.short_sha.as_str(), alloc),
+                    blaze_sh::Value::string(bl.author_name.as_str(), alloc),
+                    dt_val,
+                    blaze_sh::Value::string(bl.code.as_str(), alloc),
+                    blaze_sh::Value::string(bl.summary.as_str(), alloc),
+                    blaze_sh::Value::string(email, alloc),
+                    blaze_sh::Value::string(bl.full_sha.as_str(), alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
         _ => None,
     }
 }

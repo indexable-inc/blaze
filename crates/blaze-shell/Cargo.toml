@@ -33,6 +33,7 @@ blaze-json = { path = "../blaze-json" }
 blaze-shell-config = { path = "../blaze-shell-config" }
 blaze-cli-spec = { path = "../blaze-cli-spec" }
 blaze-dust = { path = "../blaze-dust" }
+blaze-git-meta = { path = "../blaze-git-meta" }
 blaze-data = { path = "../blaze-data" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

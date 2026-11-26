@@ -2122,7 +2122,12 @@ fn layout_table(
         if disp == ColDisplay::FileSize && (max_num > 0.0 || dust_max_bytes > 0 || has_dust_dirs) {
             max_c = max_c.max(10);
         }
-        col_chars.push(max_c.min(40));
+        let col_cap = if matches!(hdr, "code" | "message" | "subject" | "summary") {
+            110
+        } else {
+            40
+        };
+        col_chars.push(max_c.min(col_cap));
         col_right_align.push(
             matches!(disp, ColDisplay::FileSize | ColDisplay::Percent | ColDisplay::HumanTime)
                 || (!is_icon_only_bool && non_empty > 0 && numeric_votes * 2 >= non_empty),
@@ -2131,7 +2136,10 @@ fn layout_table(
             10.0
         } else {
             match disp {
-                ColDisplay::FileEntry | ColDisplay::Crate | ColDisplay::Process => icon_pad + 10.0,
+                ColDisplay::FileEntry
+                | ColDisplay::Crate
+                | ColDisplay::Process
+                | ColDisplay::GitAuthor => icon_pad + 10.0,
                 ColDisplay::Status => 14.0,
                 ColDisplay::FileSize if max_num > 0.0 || dust_max_bytes > 0 || has_dust_dirs => {
                     SIZE_BAR_W + 10.0
@@ -2222,7 +2230,37 @@ fn layout_table(
             }
         }
     }
-    let table_w = (idx_w + col_widths.iter().sum::<f32>() + hidden_toggle_reserve - col_gap * 0.4)
+    // Progressive git last-commit column for `ls -l` / `ll` inside any git repository
+    // (mirrors GitHub's repo tree view: circular GitHub avatar + short SHA + commit subject!).
+    let has_status_col = table.col_index("status").is_some();
+    let ls_dir_commits = if depth <= 1
+        && !has_status_col
+        && file_entry_col.is_some()
+        && table.col_index("commit").is_none()
+    {
+        let dir = resolve_ls_target_dir(&block.prompt_snapshot.cwd, &block.source);
+        crate::git_meta_driver::request_dir_commits(&dir)
+            .filter(|snap| !snap.entries.is_empty())
+    } else {
+        None
+    };
+    let base_cols_w: f32 = col_widths.iter().sum();
+    let ls_commit_col_w: f32 = if ls_dir_commits.is_some() {
+        if let Some(&(_, custom_w)) = block.col_width_overrides.iter().find(|&&(oc, _)| oc == ncols) {
+            custom_w
+        } else {
+            let remaining = avail_w - base_cols_w;
+            if remaining >= 140.0 {
+                remaining.clamp(160.0, 380.0)
+            } else {
+                0.0
+            }
+        }
+    } else {
+        0.0
+    };
+    let show_ls_commit_col = ls_dir_commits.is_some() && ls_commit_col_w >= 80.0;
+    let table_w = (idx_w + base_cols_w + ls_commit_col_w + hidden_toggle_reserve - col_gap * 0.4)
         .min(width - scrollbar_reserve);
     let x1 = x0 + table_w;
 
@@ -2304,6 +2342,22 @@ fn layout_table(
         cx += cw;
     }
 
+    if show_ls_commit_col {
+        scene.ui_small(cx, y0, "commit", theme::INK_3, false, false, clip_id);
+        let resize_x = cx + ls_commit_col_w - col_gap * 0.5;
+        scene.line(resize_x, y0 + 2.0, resize_x, y0 + m.ch - 1.0, 1.0, theme::LINE_FAINT, clip_id);
+        scene.push_hit_clipped(
+            HitRect::new(resize_x - 5.0, y0 - 2.0, resize_x + 5.0, y0 + m.ch + 4.0),
+            clip_id,
+            HitAction::ResizeTableColumn {
+                block: block.id,
+                col: ncols,
+                col_x0: cx.round() as i32,
+            },
+        );
+        cx += ls_commit_col_w;
+    }
+
     // Sleek clickable pill to reveal or re-hide default-hidden columns (e.g. `+2 cols` -> `type, readonly`).
     if has_hidden_toggle {
         let n_hid = hidden_col_names.len();
@@ -2375,7 +2429,14 @@ fn layout_table(
 
     // Pre-compute cached per-row git statuses for `ls -l` / file tables (skipping `git status` tables
     // that already display an explicit `status` column).
-    let has_status_col = table.col_index("status").is_some();
+    let email_col_idx = table.col_index("email");
+    let sha_col_idx = table.col_index("sha");
+    let summary_col_idx = table.col_index("summary");
+    let table_gh_repo = if col_displays.iter().any(|&d| d == ColDisplay::GitAuthor) {
+        crate::git_meta_driver::github_repo_for_dir(std::path::Path::new(&block.prompt_snapshot.cwd))
+    } else {
+        None
+    };
     let table_git_statuses: Option<Vec<GitFileStatus>> = if !has_status_col
         && let Some(fc) = file_entry_col
     {
@@ -2568,6 +2629,82 @@ fn layout_table(
                                 let txt = truncate_chars(&raw, max_ch);
                                 draw_icon(scene, Icon::Terminal, rx, iy, icon_s, theme::INK_3, clip_id);
                                 scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                            }
+                            ColDisplay::GitAuthor => {
+                                let author = format_value_cell_at(cell, Some(now_ns));
+                                let email = email_col_idx
+                                    .and_then(|ec| table.cell(r, ec))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let full_sha = sha_col_idx
+                                    .and_then(|sc| table.cell(r, sc))
+                                    .and_then(Value::as_str);
+                                let avatar_s = 15.0f32.min(m.ch + 1.0);
+                                let av_pad = avatar_s + 7.0;
+                                let av = crate::git_meta_driver::request_avatar(
+                                    email,
+                                    full_sha,
+                                    table_gh_repo.as_ref(),
+                                );
+                                draw_git_avatar(
+                                    scene,
+                                    rx,
+                                    ty + (m.ch - avatar_s) * 0.5,
+                                    avatar_s,
+                                    &author,
+                                    email,
+                                    av.image_path.as_deref(),
+                                    clip_id,
+                                );
+                                let max_ch = ((content_w - av_pad) / m.cw).floor().max(2.0) as usize;
+                                let txt = truncate_chars(&author, max_ch);
+                                scene.text(rx + av_pad, ty, txt, theme::INK_2, false, false, clip_id);
+                                let title = if let Some(login) = av.github_login.as_deref() {
+                                    format!("{author} (@{login})")
+                                } else {
+                                    author
+                                };
+                                scene.push_hover_clipped(
+                                    HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h),
+                                    clip_id,
+                                    HoverKind::Tooltip {
+                                        title,
+                                        subtitle: (!email.is_empty()).then(|| email.to_owned()),
+                                    },
+                                );
+                            }
+                            ColDisplay::GitCommit => {
+                                let short_sha = format_value_cell_at(cell, Some(now_ns));
+                                let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+                                let txt = truncate_chars(&short_sha, max_ch);
+                                scene.text(rx, ty, txt, theme::rgb(0x8a, 0xa8, 0xd4), false, false, clip_id);
+                                let cell_rect = HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h);
+                                scene.push_hit_clipped(
+                                    cell_rect,
+                                    clip_id,
+                                    HitAction::CopyText(short_sha.clone()),
+                                );
+                                let summary = summary_col_idx
+                                    .and_then(|sc| table.cell(r, sc))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let full_sha = sha_col_idx
+                                    .and_then(|sc| table.cell(r, sc))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(&short_sha)
+                                    .to_owned();
+                                scene.push_hover_clipped(
+                                    cell_rect,
+                                    clip_id,
+                                    HoverKind::Tooltip {
+                                        title: if summary.is_empty() {
+                                            short_sha
+                                        } else {
+                                            summary.to_owned()
+                                        },
+                                        subtitle: Some(format!("{full_sha} · click to copy SHA")),
+                                    },
+                                );
                             }
                             ColDisplay::Status => {
                                 let col_name = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
@@ -2827,6 +2964,82 @@ fn layout_table(
                 }
                 rx += cw;
             }
+            if show_ls_commit_col
+                && let Some(snap) = ls_dir_commits.as_ref()
+                && let Some(fc) = file_entry_col
+            {
+                let content_w = (ls_commit_col_w - col_gap).max(m.cw * 6.0);
+                let raw_name = table
+                    .cell(r, fc)
+                    .map(|c| format_value_cell_at(c, Some(now_ns)))
+                    .unwrap_or_default();
+                let entry_key = raw_name.trim_end_matches('/');
+                if let Some(cm) = snap.entries.get(entry_key) {
+                    let avatar_s = 15.0f32.min(m.ch + 1.0);
+                    let av_pad = avatar_s + 7.0;
+                    let av = crate::git_meta_driver::request_avatar(
+                        &cm.author_email,
+                        Some(&cm.full_sha),
+                        snap.github_repo.as_ref(),
+                    );
+                    draw_git_avatar(
+                        scene,
+                        rx,
+                        ty + (m.ch - avatar_s) * 0.5,
+                        avatar_s,
+                        &cm.author_name,
+                        &cm.author_email,
+                        av.image_path.as_deref(),
+                        clip_id,
+                    );
+                    let sha_x = rx + av_pad;
+                    let sha_w = cm.short_sha.chars().count() as f32 * m.cw;
+                    scene.text(sha_x, ty, &cm.short_sha, theme::rgb(0x8a, 0xa8, 0xd4), false, false, clip_id);
+                    let subj_x = sha_x + sha_w + m.cw;
+                    let subj_avail = (rx + content_w - subj_x).max(0.0);
+                    let subj_max_ch = (subj_avail / m.cw).floor() as usize;
+                    if subj_max_ch >= 3 {
+                        let subj_txt = truncate_chars(&cm.subject, subj_max_ch);
+                        scene.text(subj_x, ty, subj_txt, theme::INK_3, false, false, clip_id);
+                    }
+                    let cell_rect = HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h);
+                    scene.push_hit_clipped(
+                        cell_rect,
+                        clip_id,
+                        HitAction::CopyText(cm.short_sha.clone()),
+                    );
+                    let mut iso = String::new();
+                    if cm.author_time_secs > 0 {
+                        let _ = blaze_sh::format_date(
+                            blaze_sh::DateTime {
+                                utc_ns: cm.author_time_secs.saturating_mul(1_000_000_000),
+                                offset_secs: 0,
+                            },
+                            &mut iso,
+                        );
+                    }
+                    let who = if let Some(login) = av.github_login.as_deref() {
+                        format!("{} (@{login})", cm.author_name)
+                    } else {
+                        cm.author_name.clone()
+                    };
+                    let sub = if iso.is_empty() {
+                        format!("{} · {who} · click to copy SHA", cm.short_sha)
+                    } else {
+                        format!("{} · {who} · {iso}", cm.short_sha)
+                    };
+                    scene.push_hover_clipped(
+                        cell_rect,
+                        clip_id,
+                        HoverKind::Tooltip {
+                            title: cm.subject.clone(),
+                            subtitle: Some(sub),
+                        },
+                    );
+                } else {
+                    scene.text(rx, ty, "—", theme::INK_4, false, false, clip_id);
+                }
+            }
             cur_y += row_h;
 
             for (col_idx, nested) in expanded_for_row {
@@ -2923,6 +3136,45 @@ fn layout_table(
     }
 
     cur_y - y0
+}
+
+/// Draw a circular Retina GitHub user avatar (when cached on disk) or an instant deterministic
+/// colored monogram circle (`AG`) with a subtle 1px border ring.
+#[allow(clippy::too_many_arguments)]
+fn draw_git_avatar(
+    scene: &mut Scene,
+    x: f32,
+    y: f32,
+    size: f32,
+    author_name: &str,
+    author_email: &str,
+    image_path: Option<&str>,
+    clip_id: u32,
+) {
+    let cx = x + size * 0.5;
+    let cy = y + size * 0.5;
+    let r = size * 0.5;
+    if let Some(path) = image_path {
+        scene.avatar_image(x, y, size, path.to_owned(), clip_id);
+        scene.over_ring(cx, cy, r, 0.85, theme::rgba(0xff, 0xff, 0xff, 0.14), clip_id);
+    } else {
+        let key = if author_email.is_empty() { author_name } else { author_email };
+        let [cr, cg, cb] = blaze_git_meta::author_badge_rgb(key);
+        let bg = theme::rgba(cr, cg, cb, 0.22);
+        let fg = theme::rgb(cr, cg, cb);
+        scene.over_circle(cx, cy, r, bg, clip_id);
+        scene.over_ring(cx, cy, r, 0.85, theme::rgba(cr, cg, cb, 0.45), clip_id);
+        let (init_bytes, len) = blaze_git_meta::author_initials(author_name);
+        // Fit cleanly inside the 15-16px circle: 1 centered bold letter looks crisp & balanced.
+        if len >= 1
+            && let Ok(init_str) = core::str::from_utf8(&init_bytes[..1])
+        {
+            let tw = 6.2;
+            let tx = cx - tw * 0.5;
+            let ty = cy - 6.8;
+            scene.ui_small(tx, ty, init_str, fg, true, false, clip_id);
+        }
+    }
 }
 
 /// Reusable exact-value hover tooltip for byte sizes (both individual files and recursive
