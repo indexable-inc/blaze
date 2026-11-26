@@ -701,7 +701,7 @@ fn held_types<P: FrontEnd>(
     let facts = bodies.coroutines.table.get(c.owner, c.ordinal).ok_or_else(not_answered)?;
     let recipe = match program.coroutine_recipe(c.owner, c.ordinal) {
         Some(Ok(r)) => r,
-        Some(Err(_)) => return Err(BuildError::UnsupportedSig { what: "an async block whose flow was refused: its state recipe was not made" }),
+        Some(Err(refusal)) => return Err(BuildError::CoroutineRecipe { owner: c.owner, ordinal: c.ordinal, refusal }),
         None => return Err(not_answered()),
     };
     let mut args: AVec<'_, PTy> = AVec::new_in(alloc);
@@ -732,7 +732,8 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     let types = held_types(program, bodies, adts, ci, c, &mut *ground, alloc)?;
     let recipe = match program.coroutine_recipe(c.owner, c.ordinal) {
         Some(Ok(r)) => r,
-        _ => return Err(BuildError::UnsupportedSig { what: "an async block whose flow was refused: its state recipe was not made" }),
+        Some(Err(refusal)) => return Err(BuildError::CoroutineRecipe { owner: c.owner, ordinal: c.ordinal, refusal }),
+        None => return Err(not_answered()),
     };
     let points = recipe.points;
     // Needs the lazy program fills (`NoAdt`, `Select(Missing(_))`, `OpaqueOwnerUnchecked`) and

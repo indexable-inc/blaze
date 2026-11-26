@@ -1500,7 +1500,8 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     // Any coroutine held by value in a constant need's arguments (e.g. `Box::new(async move { .. })`
     // reading `<{coroutine} as SizedTypeProperties>::LAYOUT`): lay out its state from types first
     // (`lay_only`) so constant evaluation observes the exact same `StateShape` as the build.
-    let mut laid_for_const: AVec<'static, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(work.alloc);
+    // Shapes remain recorded in `bodies.coroutines.states` (the coroutine's own `poll`/`resume`/`drop`
+    // entry always forgets its own shape before `lay_and_build_one`), avoiding redundant re-laying.
     let mut unchecked_coro = None;
     let lay_result = if found.is_ok() && !work.needs.is_empty() {
         let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
@@ -1515,10 +1516,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
             match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
                 Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
                 Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
-                    Ok(LaidOnly::Done(recorded)) => {
-                        laid_for_const = recorded;
-                        Ok(())
-                    }
+                    Ok(LaidOnly::Done(_)) => Ok(()),
                     Ok(LaidOnly::Unchecked(owner)) => {
                         unchecked_coro = Some(owner);
                         Ok(())
@@ -1549,10 +1547,6 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         &mut table.const_at,
         crate::front2::const_at::BuildFacts::new(&table.closures, &table.coroutines),
     );
-    // Forget states laid solely for constant evaluation so `build_one`'s `lay_and_build` still
-    // builds their functions into `stash` (states already laid & built earlier were not in
-    // `laid_for_const` and remain recorded).
-    forget_laid_in(&table.coroutines, &laid_for_const, work.ground.view());
     if let Err(refusal) = pull_res {
         let item = refusal.need.item();
         let path = program.item_named(item);
