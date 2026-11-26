@@ -403,8 +403,10 @@ pub(crate) fn built_for<'s, 'm: 's>(
         let Some(payload) = c_tasks_built::open_built(held.bytes) else {
             return Err(CTaskWhy::Built { words: kept(scratch, format_args!("the record at {key:?} is no built record (c_tasks_built.rs `BUILT_MAGIC`)")) });
         };
-        let report = Report { requests, built_hit: true, ..Report::default() };
-        return Ok((ScriptIn { name: script.name, out: key, payload }, Some(report)));
+        if built_stored_files_present(c.home, payload, alloc) {
+            let report = Report { requests, built_hit: true, ..Report::default() };
+            return Ok((ScriptIn { name: script.name, out: key, payload }, Some(report)));
+        }
     }
 
     // A miss: the package laid, the tasks run, the built record put.
@@ -475,6 +477,46 @@ pub(crate) fn built_for<'s, 'm: 's>(
     on.store.put(&cx, Key(key), &bytes).map_err(|e| CTaskWhy::Built { words: kept(scratch, format_args!("the store: {e}")) })?;
     let payload: &'s [u8] = scratch.alloc_slice_copy(&body);
     Ok((ScriptIn { name: script.name, out: key, payload }, Some(run.report)))
+}
+
+/// Whether every stored file referenced by a cached built-C `payload` still exists in
+/// `<home>/.blaze/v2/build-script/files/<sha256>` with its recorded length.
+/// Auxiliary GC (`gc.rs`) evicts `v2/build-script/files` independently of the KV store, so a
+/// built record whose archive or process-tree blob was evicted must be treated as a cache miss.
+fn built_stored_files_present(home: Option<&str>, payload: &[u8], alloc: Alloc<'_>) -> bool {
+    let Some((_, record)) = crate::scripts::payload_parts(payload) else {
+        return false;
+    };
+    let Ok(outputs) = OutputsRef::open(record) else {
+        return false;
+    };
+    let mut stored = outputs.stored();
+    let Some(first) = stored.next() else {
+        return true;
+    };
+    let Some(home) = home else {
+        return false;
+    };
+    let mut path = String::new_in(alloc);
+    path.push_str(home);
+    path.push('/');
+    path.push_str(crate::scripts::STORE_UNDER_HOME);
+    path.push('/');
+    path.push_str(blaze_build_script::outputs::FILE_AREA);
+    path.push('/');
+    let prefix_len = path.len();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for file in core::iter::once(first).chain(stored) {
+        path.truncate(prefix_len);
+        for &b in file.sha256 {
+            path.push(HEX[usize::from(b >> 4)] as char);
+            path.push(HEX[usize::from(b & 15)] as char);
+        }
+        if !std::fs::metadata(path.as_str()).is_ok_and(|m| m.is_file() && m.len() == file.len) {
+            return false;
+        }
+    }
+    true
 }
 
 /// What the image holds for its readers' `links` trees (engine_native.rs `image_for`): every

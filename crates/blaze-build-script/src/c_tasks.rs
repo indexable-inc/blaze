@@ -1166,6 +1166,10 @@ pub struct StoreFailed;
 pub trait Area {
     fn put(&mut self, bytes: &[u8]) -> Result<FileRef, StoreFailed>;
     fn read(&self, file: FileRef, into: &mut AVec<'_, u8>) -> Result<(), StoreFailed>;
+    /// Whether `file` is still present in the area with its expected byte length.
+    /// Auxiliary GC (`v2/build-script/files`) can evict blobs independently of the key-value
+    /// store, so a store hit is only valid while its referenced file still exists in the area.
+    fn has(&self, file: FileRef) -> bool;
 }
 
 /// Why one crate's C tasks gave no archives. Each names the crate (rule 19); a failed compile
@@ -1197,8 +1201,16 @@ pub enum Looked {
 }
 
 /// Looks `unit` up: its pre key from today's source, then each recorded path set in slot
-/// order, the first whose object key today holds an object.
-pub fn look<'a, 'b>(package: &'b str, unit: &Compile<'_, 'b>, toolchain: &Toolchain<'_>, today: &dyn Today, store: &mut dyn CStore, alloc: Alloc<'_>) -> Result<Looked, TaskError<'a, 'b>> {
+/// order, the first whose object key today holds an object still present in `area`.
+pub fn look<'a, 'b>(
+    package: &'b str,
+    unit: &Compile<'_, 'b>,
+    toolchain: &Toolchain<'_>,
+    today: &dyn Today,
+    area: &dyn Area,
+    store: &mut dyn CStore,
+    alloc: Alloc<'_>,
+) -> Result<Looked, TaskError<'a, 'b>> {
     let source = match today.file(unit.source) {
         Ok(Some(digest)) => digest,
         Ok(None) => return Err(TaskError::NoSource { package, source: unit.source }),
@@ -1215,7 +1227,10 @@ pub fn look<'a, 'b>(package: &'b str, unit: &Compile<'_, 'b>, toolchain: &Toolch
         let Some(set) = PathSet::open(&held) else { return Err(TaskError::Damaged { package, key: set_key }) };
         let key = object_key(pre, &set, today).map_err(|error| TaskError::Fact { package, path: unit.source, error })?;
         if store.get(key, &mut object).map_err(|_| TaskError::Store { package, what: "an object" })? {
-            return decode_file_record(&object).map(Looked::Hit).ok_or(TaskError::Damaged { package, key });
+            let file = decode_file_record(&object).ok_or(TaskError::Damaged { package, key })?;
+            if area.has(file) {
+                return Ok(Looked::Hit(file));
+            }
         }
     }
     Err(TaskError::PathSets { package, source: unit.source })
@@ -1311,7 +1326,9 @@ pub fn archive<'a, 'b>(
     let mut held = Vec::new_in(alloc);
     if store.get(key, &mut held).map_err(|_| TaskError::Store { package, what: "an archive" })? {
         let file = decode_file_record(&held).ok_or(TaskError::Damaged { package, key })?;
-        return Ok((Made { name: plan.name, file }, false));
+        if area.has(file) {
+            return Ok((Made { name: plan.name, file }, false));
+        }
     }
     let mut bodies: AVec<'_, AVec<'_, u8>> = Vec::with_capacity_in(members.len(), alloc);
     for (_, file) in members.iter() {
@@ -1471,7 +1488,7 @@ pub fn run_crate<'a, 'b, C: CCompiler>(
     for (at, unit) in plan.units.iter().enumerate() {
         let assumed = at as u32 >= plan.planned;
         let today = todays.of(unit.state);
-        let file = match look(package, unit, toolchain, today, store, alloc)? {
+        let file = match look(package, unit, toolchain, today, area, store, alloc)? {
             Looked::Hit(file) => file,
             Looked::Miss { pre, free_slot } => {
                 objects_ran += 1;

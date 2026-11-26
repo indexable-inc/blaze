@@ -284,6 +284,14 @@ impl Area for FileArea<'_> {
         }
         Ok(())
     }
+
+    fn has(&self, file: FileRef) -> bool {
+        let mut at = [0u8; PATH_MOST];
+        let Ok(at) = self.path(&file.sha256, "", &mut at) else {
+            return false;
+        };
+        std::fs::metadata(at).is_ok_and(|meta| meta.is_file() && meta.len() == file.len)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

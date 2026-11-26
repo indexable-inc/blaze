@@ -225,6 +225,10 @@ impl Area for AreaOf<'_> {
         into.extend_from_slice(self.0.borrow().bytes(file).ok_or(StoreFailed)?);
         Ok(())
     }
+
+    fn has(&self, file: FileRef) -> bool {
+        self.0.borrow().bytes(file).is_some()
+    }
 }
 
 /// The store: written once per key, equal bytes again left as they are, other bytes refused.
@@ -719,4 +723,43 @@ fn the_dependency_trees_a_request_names_are_found() {
     let found = crate::c_tasks::dep_roots(&opened, &roots(), alloc);
     assert_eq!(found.as_slice(), ["/deps/lz4", "/deps/zstd", "/target/debug/build/lz4-sys-2/out"]);
     assert_eq!(roots().root_of("/deps"), None, "CONTROL: `/deps` itself names no producer");
+}
+
+/// When auxiliary GC evicts an archive or object blob from `Area` while the KV store still holds
+/// its index record, `c_tasks::run` treats the missing blob as a cache miss and rebuilds it
+/// instead of returning a dangling `FileRef`.
+#[test]
+fn evicted_area_blobs_trigger_clean_rebuild() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let bytes = script_record(alloc);
+    let outputs = OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
+    let demand = script_demand(&outputs, alloc);
+    let demand_strs: std::vec::Vec<&str> = demand.iter().map(|d| d.as_str()).collect();
+    let files = core::cell::RefCell::new(Files::default());
+    let mut store = Store::default();
+    let world = World::new("/host/a");
+    let tc = toolchain(7);
+    let mut compiler = Fake { world: &world, area: &files, ran: 0, leaks_host: false };
+
+    // Cold run builds 4 units (3 planned + 1 assumption) and 1 archive.
+    let cold = run_crate("foo", &outputs, &roots(), &demand_strs, &tc, &mut compiler, &world, &mut AreaOf(&files), &mut store, alloc)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!((cold.objects_ran, cold.archives_ran), (4, 1));
+    let archive_ref = cold.made[0].file;
+    assert!(AreaOf(&files).has(archive_ref));
+
+    // Evict ONLY the archive blob from `Area` (simulating auxiliary GC of `v2/build-script/files`).
+    files.borrow_mut().held.retain(|(f, _)| *f != archive_ref);
+    assert!(!AreaOf(&files).has(archive_ref));
+    let re_arch = run_crate("foo", &outputs, &roots(), &demand_strs, &tc, &mut compiler, &world, &mut AreaOf(&files), &mut store, alloc)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!((re_arch.objects_ran, re_arch.archives_ran), (0, 1), "objects hit, evicted archive rebuilt");
+    assert!(AreaOf(&files).has(re_arch.made[0].file));
+
+    // Evict ALL blobs from `Area` (objects + archive) while keeping the KV store intact.
+    files.borrow_mut().held.clear();
+    let re_all = run_crate("foo", &outputs, &roots(), &demand_strs, &tc, &mut compiler, &world, &mut AreaOf(&files), &mut store, alloc)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!((re_all.objects_ran, re_all.archives_ran), (4, 1), "evicted objects and archive both rebuilt");
+    assert!(AreaOf(&files).has(re_all.made[0].file));
 }
