@@ -62,6 +62,10 @@ pub struct Fonts {
     ui_small_m: FaceMetrics,
     heading_m: FaceMetrics,
     chrome_m: FaceMetrics,
+    /// Exact device-pixel CoreText advances for ASCII `32..=126` in `ui[0]`.
+    ui_adv_px: [f32; 95],
+    /// Ratio `chrome_px / (points * scale * 0.94)`.
+    chrome_ratio: f32,
     slots: HashMap<Key, Option<Slot>>,
     next_x: usize,
     next_y: usize,
@@ -196,6 +200,15 @@ impl Fonts {
             ..measure_face_metrics(&chrome[0], cell_h, baseline)
         };
 
+        let mut ui_adv_px = [0.0f32; 95];
+        for code in 32u8..=126u8 {
+            let ch = code as char;
+            ui_adv_px[(code - 32) as usize] = glyph_of(&ui[0], ch)
+                .map(|g| advance_of(&ui[0], g) as f32)
+                .unwrap_or(ui_m.space_adv);
+        }
+        let chrome_ratio = (chrome_px / (px * 0.94).max(1.0)) as f32;
+
         Fonts {
             mono,
             ui,
@@ -207,6 +220,8 @@ impl Fonts {
             ui_small_m,
             heading_m,
             chrome_m,
+            ui_adv_px,
+            chrome_ratio,
             slots: HashMap::new(),
             next_x: 0,
             next_y: 0,
@@ -215,12 +230,18 @@ impl Fonts {
         }
     }
 
-    /// Logical CSS-pixel cell metrics for the layout engine.
+    /// Logical CSS-pixel cell metrics for the layout engine, carrying exact CoreText advances.
     pub fn cell_metrics(&self, scale: f64) -> CellMetrics {
         let inv_scale = 1.0 / (scale as f32).max(1.0);
+        let mut ui_adv = [0.0f32; 95];
+        for (dst, &src) in ui_adv.iter_mut().zip(self.ui_adv_px.iter()) {
+            *dst = src * inv_scale;
+        }
         CellMetrics {
             cw: self.metrics.cell_w as f32 * inv_scale,
             ch: self.metrics.cell_h as f32 * inv_scale,
+            ui_adv,
+            chrome_ratio: self.chrome_ratio,
         }
     }
 

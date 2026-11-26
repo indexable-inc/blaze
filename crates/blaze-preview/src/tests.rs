@@ -44,11 +44,66 @@ fn previews_markdown_as_rendered_blocks_with_inline_formatting() {
     assert!(blocks.iter().any(|b| matches!(b, MdBlock::Bullet { .. })));
     assert!(blocks.iter().any(|b| matches!(b, MdBlock::CodeFence { .. })));
     let para = blocks.iter().find_map(|b| match b {
-        MdBlock::Paragraph { spans } => Some(spans),
+        MdBlock::Paragraph { spans, .. } => Some(spans),
         _ => None,
     }).expect("paragraph");
     assert!(para.iter().any(|s| s.style == MdStyle::Bold && s.text.as_str() == "incremental"));
     assert!(para.iter().any(|s| s.style == MdStyle::Code && s.text.as_str() == "zero"));
+}
+
+#[test]
+fn previews_markdown_with_embedded_html_picture_comments_and_gfm_table() {
+    let md = r##"
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/fire/header-dark.webp">
+    <img alt="blaze" src="docs/brand/fire/header-light.webp" width="344" height="184">
+  </picture>
+</p>
+
+<h3 align="center">Rebuild Rust in milliseconds.</h3>
+
+<p align="center">Type <code>blaze</code> wherever you'd type <code>cargo</code>.<br>Blazingly fast Rust, literally.</p>
+
+<!-- benchpick:start -->
+| Project | `cargo build` | `blaze build` |
+|---|---:|---:|
+| ripgrep | 508 ms | **56 ms** |
+<!-- benchpick:end -->
+"##;
+    let alloc = blaze_own::testing::heap().alloc();
+    let doc = build_preview("README.md", md.as_bytes(), md.len() as u64, PreviewLimits::SHIPPED, alloc);
+    let PreviewBody::Markdown { blocks, .. } = doc.body else {
+        panic!("expected markdown doc");
+    };
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        MdBlock::Image { src, width: Some(344), height: Some(184), align: crate::TextAlign::Center, .. }
+            if src.as_str() == "docs/brand/fire/header-dark.webp"
+    )));
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        MdBlock::Heading { level: 3, align: crate::TextAlign::Center, .. }
+    )));
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        MdBlock::Table(t) if t.headers.len() == 3 && t.rows.len() == 1 && t.alignments.get(2) == Some(&crate::TextAlign::Right)
+    )));
+}
+
+#[test]
+fn previews_standalone_html_document() {
+    let html = "<!DOCTYPE html><html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
+    let alloc = blaze_own::testing::heap().alloc();
+    let doc = build_preview("index.html", html.as_bytes(), html.len() as u64, PreviewLimits::SHIPPED, alloc);
+    let PreviewBody::Markdown { blocks, .. } = doc.body else {
+        panic!("expected rendered HTML document preview");
+    };
+    assert!(matches!(blocks.first(), Some(MdBlock::Heading { level: 1, .. })));
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        MdBlock::Paragraph { spans, .. } if spans.iter().any(|s| s.style == MdStyle::Bold && s.text.as_str() == "world")
+    )));
 }
 
 #[test]

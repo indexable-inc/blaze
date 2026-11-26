@@ -400,6 +400,8 @@ blaze-ed25519 = { path = "crates/blaze-ed25519" } # Ed25519 verification written
 # The SwissTable group probe and `Index`, re-exported as `blaze_mem::swiss`.
 blaze-swiss = { path = "crates/blaze-swiss" }
 blaze-hash = { path = "crates/blaze-hash", features = ["shared"] }
+# Pure no_std, zero-unsafe, sans-IO HTML5 tokenizer, arena DOM, and document renderer.
+blaze-html = { path = "crates/blaze-html" }
 # blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids", features = ["serde"] }

@@ -10,6 +10,7 @@ doctest = false
 [dependencies]
 blaze-own.workspace = true
 blaze-data.workspace = true
+blaze-html.workspace = true
 blaze-json.workspace = true
 blaze-toml.workspace = true
 blaze-sniff.workspace = true

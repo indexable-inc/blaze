@@ -24,17 +24,21 @@ pub enum TextFace {
     Chrome,
 }
 
-/// Logical CSS-pixel dimensions of one monospace cell, with calibrated proportional measurement &
-/// font-relative icon sizing helpers so icons always scale in lockstep with text on `Cmd+`/`Cmd-`.
+/// Logical CSS-pixel dimensions of one monospace cell, with exact CoreText ASCII advance widths
+/// for Apple SF Pro proportional faces so inline spans (`<a>`, `<code>`, `<b>`) never overlap.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellMetrics {
     pub cw: f32,
     pub ch: f32,
+    /// Exact logical-pixel CoreText advances for ASCII `32..=126` in `TextFace::Ui` (`0.0` = heuristic fallback).
+    pub ui_adv: [f32; 95],
+    /// Exact logical-pixel advance ratio `Chrome / Ui`.
+    pub chrome_ratio: f32,
 }
 
 impl Default for CellMetrics {
     fn default() -> Self {
-        Self { cw: 8.0, ch: 18.0 }
+        Self { cw: 8.0, ch: 18.0, ui_adv: [0.0; 95], chrome_ratio: 0.92 }
     }
 }
 
@@ -51,33 +55,65 @@ impl CellMetrics {
         (self.ch * 0.68).round().max(10.0)
     }
 
-    /// Deterministic logical width of `text` in `face` (exact `len * cw` for `Mono`,
-    /// calibrated proportional glyph advance estimator for Apple SF Pro sans faces).
+    /// Exact logical width of `text` in `face` (`len * cw` for `Mono`; calibrated CoreText advances for SF Pro).
     pub fn measure(&self, text: &str, face: TextFace) -> f32 {
+        self.measure_styled(text, face, false)
+    }
+
+    /// Exact logical width of `text` in `face` with optional bold weight adjustment.
+    pub fn measure_styled(&self, text: &str, face: TextFace, bold: bool) -> f32 {
         if face == TextFace::Mono {
             return text.chars().count() as f32 * self.cw;
         }
+        let bold_mul = if bold && face != TextFace::Heading { 1.075 } else { 1.0 };
+        // Use exact measured CoreText glyph advances when populated (`Fonts::cell_metrics`).
+        if self.ui_adv[b'n' as usize - 32] > 0.0 {
+            let ratio = match face {
+                TextFace::Mono => 1.0,
+                TextFace::Ui => 1.0,
+                TextFace::UiSmall => 0.84 / 0.94,
+                TextFace::Heading => (1.18 / 0.94) * 1.04,
+                TextFace::Chrome => self.chrome_ratio,
+            };
+            let fallback_non_ascii = self.ui_adv[b'm' as usize - 32].max(self.cw * 0.85);
+            let mut sum = 0.0f32;
+            for ch in text.chars() {
+                let code = ch as u32;
+                if (32..=126).contains(&code) {
+                    sum += self.ui_adv[(code - 32) as usize];
+                } else if ch == '·' {
+                    sum += self.ui_adv[b'.' as usize - 32] * 1.05;
+                } else if ch == '—' || ch == '…' {
+                    sum += self.ui_adv[b'M' as usize - 32] * 1.1;
+                } else {
+                    sum += fallback_non_ascii;
+                }
+            }
+            return sum * ratio * bold_mul;
+        }
+
+        // Heuristic fallback for headless unit tests without CoreText.
         let base_cw = if face == TextFace::Chrome { 7.8 } else { self.cw };
         let scale = match face {
             TextFace::Mono => 1.0,
-            TextFace::Ui => 0.84,
-            TextFace::UiSmall => 0.77,
-            TextFace::Heading => 1.06,
-            TextFace::Chrome => 0.82,
+            TextFace::Ui => 0.92,
+            TextFace::UiSmall => 0.82,
+            TextFace::Heading => 1.15,
+            TextFace::Chrome => 0.86,
         };
         let mut units = 0.0f32;
         for ch in text.chars() {
             units += match ch {
                 ' ' => 0.42,
-                'i' | 'l' | 'I' | '!' | '|' | '.' | ',' | ':' | ';' | '\'' | '`' => 0.42,
-                'f' | 'j' | 'r' | 't' | '(' | ')' | '[' | ']' | '/' | '\\' | '-' | '·' => 0.56,
+                'i' | 'l' | 'I' | '!' | '|' | '.' | ',' | ':' | ';' | '\'' | '`' => 0.44,
+                'f' | 'j' | 'r' | 't' | '(' | ')' | '[' | ']' | '/' | '\\' | '-' | '·' => 0.58,
                 'm' | 'w' | 'M' | 'W' | '…' | '—' => 1.24,
                 c if c.is_ascii_uppercase() => 1.04,
                 c if !c.is_ascii() => 1.15,
                 _ => 0.88,
             };
         }
-        units * base_cw * scale
+        units * base_cw * scale * bold_mul
     }
 
     /// Logical line height for `face`.
@@ -135,6 +171,19 @@ pub struct IconQuad {
     pub w: f32,
     pub h: f32,
     pub name: &'static str,
+    pub alpha: f32,
+    pub clip_id: u32,
+}
+
+/// A decoded raster image quad (`webp`, `png`, `jpg`, `gif`) positioned in logical pixels,
+/// resolved through `ImageAtlas` for rendered Markdown & HTML `<picture>` / `<img>` elements.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageQuad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub path: String,
     pub alpha: f32,
     pub clip_id: u32,
 }
@@ -610,6 +659,7 @@ pub struct Scene {
     pub text_runs: Vec<TextRun>,
     /// Retina RGBA SVG icons rasterized from `svg_icons::IconAtlas`.
     pub icon_quads: Vec<IconQuad>,
+    pub image_quads: Vec<ImageQuad>,
     /// Foreground overlays (underlines, error carets, beam cursor, hairlines) drawn over text.
     pub over_rects: Vec<RectInst>,
     /// Floating popup backgrounds (completion dropdown, Ctrl+R bar, drag chip) drawn above all content.
@@ -656,6 +706,7 @@ impl Scene {
             rects: Vec::new(),
             text_runs: Vec::new(),
             icon_quads: Vec::new(),
+            image_quads: Vec::new(),
             over_rects: Vec::new(),
             overlay_rects: Vec::new(),
             overlay_icons: Vec::new(),
@@ -887,6 +938,11 @@ impl Scene {
         clip_id: u32,
     ) {
         self.icon_quads.push(IconQuad { x, y, w: size, h: size, name, alpha, clip_id });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image(&mut self, x: f32, y: f32, w: f32, h: f32, path: String, clip_id: u32) {
+        self.image_quads.push(ImageQuad { x, y, w, h, path, alpha: 1.0, clip_id });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1274,6 +1330,12 @@ impl Scene {
             ic.y += dy;
             ic.clip_id = map_clip(ic.clip_id);
             self.icon_quads.push(ic);
+        }
+        for mut img in sub.image_quads {
+            img.x += dx;
+            img.y += dy;
+            img.clip_id = map_clip(img.clip_id);
+            self.image_quads.push(img);
         }
         for r in sub.over_rects {
             let cid = map_clip(r.clip_info[0]);

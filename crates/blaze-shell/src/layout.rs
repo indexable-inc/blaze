@@ -1441,16 +1441,36 @@ fn layout_value(
         }
         Value::String(s) if depth == 0 && open_target_filename(&block.source).is_some() => {
             let fname = open_target_filename(&block.source).unwrap_or("file");
+            let open_limits = blaze_preview::PreviewLimits {
+                max_rows: 64,
+                max_cols: 8,
+                max_lines: 240,
+                max_cell_chars: 96,
+            };
             let doc = blaze_preview::build_preview(
                 fname,
                 s.as_ref().as_bytes(),
                 s.as_ref().len() as u64,
-                blaze_preview::PreviewLimits::SHIPPED,
+                open_limits,
                 Alloc::global(),
             );
-            let max_h = if block.folded { 520.0 } else { 2400.0 };
-            crate::yazi::render_rich_preview(scene, &doc, x0, y0, width, y0 + max_h, m, clip_id)
-                .max(m.ch)
+            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
+            let base_dir = target_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
+            let max_h = if block.folded { 520.0 } else { 6400.0 };
+            crate::yazi::render_rich_preview(
+                scene,
+                &doc,
+                Some(base_dir),
+                x0,
+                y0,
+                width,
+                y0 + max_h,
+                m,
+                clip_id,
+            )
+            .max(m.ch)
         }
         Value::Binary(b) if depth == 0 && open_target_filename(&block.source).is_some() => {
             let fname = open_target_filename(&block.source).unwrap_or("file");
@@ -1461,8 +1481,22 @@ fn layout_value(
                 blaze_preview::PreviewLimits::SHIPPED,
                 Alloc::global(),
             );
-            crate::yazi::render_rich_preview(scene, &doc, x0, y0, width, y0 + 260.0, m, clip_id)
-                .max(m.ch)
+            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
+            let base_dir = target_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
+            crate::yazi::render_rich_preview(
+                scene,
+                &doc,
+                Some(base_dir),
+                x0,
+                y0,
+                width,
+                y0 + 260.0,
+                m,
+                clip_id,
+            )
+            .max(m.ch)
         }
         scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
     }

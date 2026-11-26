@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use blaze_own::Alloc;
 use blaze_preview::{
-    CodeLine, MdBlock, MdStyle, PreviewBody, PreviewDoc, PreviewKv, PreviewLimits, PreviewTable,
-    TokenKind, build_preview,
+    CodeLine, MdBlock, MdSpan, MdStyle, MdTable, PreviewBody, PreviewDoc, PreviewKv,
+    PreviewLimits, PreviewTable, TextAlign, TokenKind, build_preview,
 };
 
 use crate::blocks::BlockStore;
@@ -532,6 +532,16 @@ pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<Pr
                 }
                 PreviewBody::Markdown { blocks, truncated } => {
                     let mut lines = Vec::new();
+                    let style_to_preview = |style: MdStyle| match style {
+                        MdStyle::Bold => (theme::INK_1, true, false),
+                        MdStyle::BoldItalic => (theme::INK_1, true, true),
+                        MdStyle::Italic => (theme::INK_2, false, true),
+                        MdStyle::Code => (theme::rgb(0x7c, 0xc9, 0x8b), false, false),
+                        MdStyle::Kbd => (theme::INK_1, true, false),
+                        MdStyle::Strike => (theme::INK_4, false, false),
+                        MdStyle::Link => (theme::rgb(0x7c, 0xc4, 0xea), false, false),
+                        MdStyle::Plain => (theme::INK_2, false, false),
+                    };
                     for b in blocks.iter().take(max_lines) {
                         let pl = match b {
                             MdBlock::Heading { spans, .. } => PreviewLine {
@@ -546,22 +556,24 @@ pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<Pr
                                     })
                                     .collect(),
                             },
-                            MdBlock::Paragraph { spans } | MdBlock::Quote { spans } => PreviewLine {
+                            MdBlock::Paragraph { spans, .. } | MdBlock::Quote { spans } => PreviewLine {
                                 line_no: None,
                                 spans: spans
                                     .iter()
                                     .map(|sp| {
-                                        let (color, bold, italic) = match sp.style {
-                                            MdStyle::Bold => (theme::INK_1, true, false),
-                                            MdStyle::Italic => (theme::INK_2, false, true),
-                                            MdStyle::Code => (theme::rgb(0x7c, 0xc9, 0x8b), false, false),
-                                            MdStyle::Link => (theme::rgb(0x7c, 0xc4, 0xea), false, false),
-                                            MdStyle::Plain => (theme::INK_2, false, false),
-                                        };
+                                        let (color, bold, italic) = style_to_preview(sp.style);
                                         PreviewSpan { text: sp.text.as_str().to_owned(), color, bold, italic }
                                     })
                                     .collect(),
                             },
+                            MdBlock::Image { alt, src, .. } => {
+                                let lbl = if !alt.is_empty() {
+                                    format!("[image: {}]", alt.as_str())
+                                } else {
+                                    format!("[image: {}]", src.as_str())
+                                };
+                                plain(lbl, theme::INK_3, false)
+                            }
                             MdBlock::Bullet { marker, spans, .. } => {
                                 let mut out = vec![PreviewSpan {
                                     text: format!("{} ", marker.as_str()),
@@ -570,14 +582,33 @@ pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<Pr
                                     italic: false,
                                 }];
                                 for sp in spans.iter() {
-                                    let (color, bold, italic) = match sp.style {
-                                        MdStyle::Bold => (theme::INK_1, true, false),
-                                        MdStyle::Code => (theme::rgb(0x7c, 0xc9, 0x8b), false, false),
-                                        MdStyle::Italic => (theme::INK_2, false, true),
-                                        MdStyle::Link => (theme::rgb(0x7c, 0xc4, 0xea), false, false),
-                                        MdStyle::Plain => (theme::INK_2, false, false),
-                                    };
+                                    let (color, bold, italic) = style_to_preview(sp.style);
                                     out.push(PreviewSpan { text: sp.text.as_str().to_owned(), color, bold, italic });
+                                }
+                                PreviewLine { line_no: None, spans: out }
+                            }
+                            MdBlock::Table(tbl) => {
+                                let summary = format!(
+                                    "[table: {} cols × {} rows]",
+                                    tbl.headers.len().max(tbl.rows.first().map_or(0, |r| r.len())),
+                                    tbl.rows.len()
+                                );
+                                plain(summary, theme::INK_3, false)
+                            }
+                            MdBlock::Details { summary, open } => {
+                                let mut out = vec![PreviewSpan {
+                                    text: if *open { "▾ " } else { "▸ " }.to_owned(),
+                                    color: theme::INK_3,
+                                    bold: true,
+                                    italic: false,
+                                }];
+                                for sp in summary.iter() {
+                                    out.push(PreviewSpan {
+                                        text: sp.text.as_str().to_owned(),
+                                        color: theme::INK_1,
+                                        bold: true,
+                                        italic: false,
+                                    });
                                 }
                                 PreviewLine { line_no: None, spans: out }
                             }
@@ -943,6 +974,7 @@ fn layout_yazi_inner(
             let (_, max_s) = render_rich_preview_scrolled(
                 &mut scene,
                 doc,
+                Some(yazi.cwd.as_path()),
                 px,
                 body_top + 10.0,
                 pw,
@@ -1022,6 +1054,7 @@ fn draw_mini_scrollbar(
 pub(crate) fn render_rich_preview(
     scene: &mut Scene,
     doc: &PreviewDoc<'_>,
+    base_dir: Option<&Path>,
     x0: f32,
     y0: f32,
     w: f32,
@@ -1029,13 +1062,14 @@ pub(crate) fn render_rich_preview(
     m: CellMetrics,
     clip: u32,
 ) -> f32 {
-    render_rich_preview_scrolled(scene, doc, x0, y0, w, max_y, m, clip, 0).0
+    render_rich_preview_scrolled(scene, doc, base_dir, x0, y0, w, max_y, m, clip, 0).0
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_rich_preview_scrolled(
     scene: &mut Scene,
     doc: &PreviewDoc<'_>,
+    base_dir: Option<&Path>,
     x0: f32,
     y0: f32,
     w: f32,
@@ -1058,8 +1092,19 @@ fn render_rich_preview_scrolled(
             let est_vis = (((max_y - y0) / (m.ch + 5.0)).floor().max(1.0) as usize).min(slice.len());
             let max_s = slice.len().saturating_sub(est_vis);
             let sc = scroll.min(max_s);
-            let end_y = render_preview_markdown(scene, &slice[sc..], *truncated, x0, y0, w - 8.0, max_y, m, clip);
-            if max_s > 0 {
+            let end_y = render_preview_markdown(
+                scene,
+                &slice[sc..],
+                *truncated,
+                base_dir,
+                x0,
+                y0,
+                w - 8.0,
+                max_y,
+                m,
+                clip,
+            );
+            if max_s > 0 && scroll > 0 {
                 draw_mini_scrollbar(scene, x0 + w + 4.0, y0, max_y, sc, max_s, est_vis, slice.len(), clip);
             }
             (end_y - y0, max_s)
@@ -1236,6 +1281,7 @@ fn render_preview_markdown(
     scene: &mut Scene,
     blocks: &[MdBlock<'_>],
     truncated: bool,
+    base_dir: Option<&Path>,
     x0: f32,
     mut y: f32,
     w: f32,
@@ -1243,6 +1289,7 @@ fn render_preview_markdown(
     m: CellMetrics,
     clip: u32,
 ) -> f32 {
+    let content_w = w.clamp(120.0, 920.0);
     for blk in blocks {
         if y + m.ch > max_y {
             break;
@@ -1252,49 +1299,177 @@ fn render_preview_markdown(
                 y += m.ch * 0.55;
             }
             MdBlock::Rule => {
-                let ry = y + m.ch * 0.4;
-                scene.line(x0, ry, x0 + w, ry, 1.0, theme::LINE, clip);
-                y += m.ch * 0.9;
+                let ry = y + m.ch * 0.45;
+                scene.line(x0, ry, x0 + content_w, ry, 1.0, theme::LINE, clip);
+                y += m.ch * 0.95;
             }
-            MdBlock::Heading { level, spans } => {
+            MdBlock::Heading { level, align, spans } => {
                 if y > 60.0 {
-                    y += 5.0;
+                    y += if *level <= 2 { 8.0 } else { 5.0 };
                 }
                 let col = if *level <= 2 { [1.0, 1.0, 1.0, 1.0] } else { theme::INK_1 };
                 let face = if *level <= 2 { TextFace::Heading } else { TextFace::Ui };
-                render_md_spans(scene, spans.as_slice(), x0, y, w, col, true, face, m, clip);
-                y += m.line_h(face) + 4.0;
-                if *level <= 2 {
-                    scene.line(x0, y - 1.0, x0 + w, y - 1.0, 1.0, theme::LINE_FAINT, clip);
-                    y += 5.0;
+                let used = render_md_spans_wrapped(
+                    scene,
+                    spans.as_slice(),
+                    x0,
+                    y,
+                    content_w,
+                    max_y,
+                    col,
+                    true,
+                    face,
+                    *align,
+                    m,
+                    clip,
+                );
+                y += used + 3.0;
+                if *level <= 2 && *align == TextAlign::Left {
+                    scene.line(x0, y - 1.0, x0 + content_w, y - 1.0, 1.0, theme::LINE_FAINT, clip);
+                    y += 6.0;
                 }
             }
-            MdBlock::Paragraph { spans } => {
-                render_md_spans(scene, spans.as_slice(), x0, y, w, theme::INK_2, false, TextFace::Ui, m, clip);
-                y += m.ch + 4.0;
+            MdBlock::Paragraph { align, spans } => {
+                let used = render_md_spans_wrapped(
+                    scene,
+                    spans.as_slice(),
+                    x0,
+                    y,
+                    content_w,
+                    max_y,
+                    theme::INK_2,
+                    false,
+                    TextFace::Ui,
+                    *align,
+                    m,
+                    clip,
+                );
+                y += used + 4.0;
+            }
+            MdBlock::Image { src, alt, width, height, align } => {
+                y = render_md_image(
+                    scene,
+                    src.as_str(),
+                    alt.as_str(),
+                    *width,
+                    *height,
+                    *align,
+                    base_dir,
+                    x0,
+                    y,
+                    content_w,
+                    max_y,
+                    m,
+                    clip,
+                );
             }
             MdBlock::Bullet { indent, marker, spans } => {
-                let ix = x0 + (*indent as f32) * 14.0;
+                let ix = x0 + (*indent as f32) * 16.0;
                 scene.ui_text(ix, y, marker.as_str(), theme::INK_3, true, false, clip);
                 let bx = ix + m.measure(marker.as_str(), TextFace::Ui) + 7.0;
-                let avail_w = (x0 + w - bx).max(60.0);
-                render_md_spans(scene, spans.as_slice(), bx, y, avail_w, theme::INK_2, false, TextFace::Ui, m, clip);
-                y += m.ch + 4.0;
+                let avail_w = (x0 + content_w - bx).max(80.0);
+                let used = render_md_spans_wrapped(
+                    scene,
+                    spans.as_slice(),
+                    bx,
+                    y,
+                    avail_w,
+                    max_y,
+                    theme::INK_2,
+                    false,
+                    TextFace::Ui,
+                    TextAlign::Left,
+                    m,
+                    clip,
+                );
+                y += used + 4.0;
             }
             MdBlock::Quote { spans } => {
-                scene.over_round_rect(x0, y + 1.0, x0 + 2.0, y + m.ch - 1.0, 1.0, theme::LINE_STRONG, clip);
-                render_md_spans(scene, spans.as_slice(), x0 + 12.0, y, (w - 14.0).max(60.0), theme::INK_3, false, TextFace::Ui, m, clip);
-                y += m.ch + 4.0;
+                let start_y = y;
+                let used = render_md_spans_wrapped(
+                    scene,
+                    spans.as_slice(),
+                    x0 + 13.0,
+                    y,
+                    (content_w - 15.0).max(80.0),
+                    max_y,
+                    theme::INK_3,
+                    false,
+                    TextFace::Ui,
+                    TextAlign::Left,
+                    m,
+                    clip,
+                );
+                scene.over_round_rect(
+                    x0,
+                    start_y + 1.0,
+                    x0 + 2.5,
+                    (start_y + used - 2.0).max(start_y + m.ch - 2.0),
+                    1.25,
+                    theme::LINE_STRONG,
+                    clip,
+                );
+                y += used + 5.0;
             }
             MdBlock::CodeFence { lang, lines } => {
-                let box_h = (lines.len().max(1) as f32 * (m.ch + 2.0) + 12.0).min((max_y - y).max(20.0));
-                scene.round_rect(x0, y, x0 + w, y + box_h, 6.0, theme::rgb(0x15, 0x15, 0x18), 1.0, theme::LINE_FAINT, clip);
+                let box_h = (lines.len().max(1) as f32 * (m.ch + 2.0) + 14.0).min((max_y - y).max(20.0));
+                scene.round_rect(
+                    x0,
+                    y,
+                    x0 + content_w,
+                    y + box_h,
+                    7.0,
+                    theme::rgb(0x15, 0x15, 0x18),
+                    1.0,
+                    theme::LINE_FAINT,
+                    clip,
+                );
                 if !lang.is_empty() {
                     let lw = m.measure(lang.as_str(), TextFace::UiSmall);
-                    scene.ui_small(x0 + w - 10.0 - lw, y + 5.0, lang.as_str(), theme::INK_4, false, false, clip);
+                    scene.ui_small(
+                        x0 + content_w - 12.0 - lw,
+                        y + 5.0,
+                        lang.as_str(),
+                        theme::INK_4,
+                        false,
+                        false,
+                        clip,
+                    );
                 }
-                render_code_lines(scene, lines.as_slice(), x0 + 10.0, y + 6.0, w - 20.0, y + box_h - 4.0, m, clip, false);
-                y += box_h + 6.0;
+                render_code_lines(
+                    scene,
+                    lines.as_slice(),
+                    x0 + 12.0,
+                    y + 7.0,
+                    content_w - 24.0,
+                    y + box_h - 4.0,
+                    m,
+                    clip,
+                    false,
+                );
+                y += box_h + 8.0;
+            }
+            MdBlock::Table(tbl) => {
+                y = render_md_table(scene, tbl, x0, y, content_w, max_y, m, clip);
+            }
+            MdBlock::Details { summary, open } => {
+                let tri = if *open { "▾" } else { "▸" };
+                scene.ui_text(x0, y, tri, theme::INK_3, true, false, clip);
+                let used = render_md_spans_wrapped(
+                    scene,
+                    summary.as_slice(),
+                    x0 + 15.0,
+                    y,
+                    (content_w - 15.0).max(80.0),
+                    max_y,
+                    theme::INK_1,
+                    true,
+                    TextFace::Ui,
+                    TextAlign::Left,
+                    m,
+                    clip,
+                );
+                y += used + 4.0;
             }
         }
     }
@@ -1306,50 +1481,493 @@ fn render_preview_markdown(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_md_spans(
+fn render_md_image(
     scene: &mut Scene,
-    spans: &[blaze_preview::MdSpan<'_>],
+    src: &str,
+    alt: &str,
+    attr_w: Option<u32>,
+    attr_h: Option<u32>,
+    align: TextAlign,
+    base_dir: Option<&Path>,
+    x0: f32,
+    y: f32,
+    max_w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+) -> f32 {
+    let is_remote = src.starts_with("http://") || src.starts_with("https://");
+    let resolved = if !is_remote && !src.is_empty() {
+        let p = Path::new(src);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else if let Some(base) = base_dir {
+            base.join(p)
+        } else {
+            p.to_path_buf()
+        };
+        full.is_file().then_some(full)
+    } else {
+        None
+    };
+
+    let is_raster = resolved.as_ref().is_some_and(|p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "webp" | "png" | "jpg" | "jpeg" | "gif" | "heic" | "bmp" | "tif" | "tiff"
+                )
+            })
+    });
+
+    if let Some(full) = resolved.as_ref().filter(|_| is_raster) {
+        let probed = crate::image_atlas::probe_image_size(full);
+        let (nat_w, nat_h) = match (attr_w, attr_h, probed) {
+            (Some(w), Some(h), _) => (w as f32, h as f32),
+            (Some(w), None, Some((pw, ph))) if pw > 0 => (w as f32, w as f32 * (ph as f32 / pw as f32)),
+            (None, Some(h), Some((pw, ph))) if ph > 0 => (h as f32 * (pw as f32 / ph as f32), h as f32),
+            (_, _, Some((pw, ph))) => (pw as f32, ph as f32),
+            (Some(w), None, None) => (w as f32, (w as f32) * 0.5),
+            _ => (320.0, 160.0),
+        };
+        let mut dw = nat_w.min(max_w);
+        let mut dh = if nat_w > 0.0 { nat_h * (dw / nat_w) } else { 160.0 };
+        let max_h = (max_y - y - 8.0).clamp(48.0, 360.0);
+        if dh > max_h && dh > 0.0 {
+            dw *= max_h / dh;
+            dh = max_h;
+        }
+        let ix = match align {
+            TextAlign::Left => x0,
+            TextAlign::Center => x0 + ((max_w - dw) * 0.5).max(0.0),
+            TextAlign::Right => x0 + (max_w - dw).max(0.0),
+        };
+        scene.image(ix, y + 2.0, dw, dh, full.to_string_lossy().into_owned(), clip);
+        return y + dh + 10.0;
+    }
+
+    // Crisp dark media pill for SVG charts / remote images / missing assets.
+    let caption = if !alt.is_empty() {
+        alt
+    } else if !src.is_empty() {
+        src
+    } else {
+        "image"
+    };
+    let short_src = Path::new(src)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(src);
+    let badge_w = (m.measure(caption, TextFace::UiSmall) + 38.0).clamp(140.0, max_w);
+    let badge_h = m.ch + 14.0;
+    let bx = match align {
+        TextAlign::Left => x0,
+        TextAlign::Center => x0 + ((max_w - badge_w) * 0.5).max(0.0),
+        TextAlign::Right => x0 + (max_w - badge_w).max(0.0),
+    };
+    scene.round_rect(
+        bx,
+        y + 2.0,
+        bx + badge_w,
+        y + 2.0 + badge_h,
+        6.0,
+        theme::rgb(0x16, 0x17, 0x1c),
+        1.0,
+        theme::LINE,
+        clip,
+    );
+    let ico_s = m.icon_sm();
+    scene.svg_icon(bx + 9.0, y + 2.0 + (badge_h - ico_s) * 0.5, ico_s, "image_dark", clip);
+    let label_max = ((badge_w - 34.0) / m.measure("n", TextFace::UiSmall).max(4.5)).floor().max(8.0) as usize;
+    let shown = truncate_chars(if alt.len() > 80 { short_src } else { caption }, label_max);
+    scene.ui_small(bx + 28.0, y + 9.0, shown, theme::INK_2, false, false, clip);
+    y + badge_h + 8.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_md_table(
+    scene: &mut Scene,
+    tbl: &MdTable<'_>,
+    x0: f32,
+    y0: f32,
+    max_w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+) -> f32 {
+    let ncols = tbl
+        .headers
+        .len()
+        .max(tbl.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if ncols == 0 {
+        return y0;
+    }
+
+    // Compute natural width of every column from headers and rows.
+    let mut col_w = vec![48.0f32; ncols];
+    let measure_cell = |spans: &[MdSpan<'_>], bold_hdr: bool| -> f32 {
+        let mut total = 0.0f32;
+        for sp in spans {
+            let (face, bold) = span_face_bold(sp.style, bold_hdr, TextFace::Ui);
+            total += m.measure_styled(sp.text.as_str(), face, bold);
+            if matches!(sp.style, MdStyle::Code | MdStyle::Kbd) {
+                total += 8.0;
+            }
+        }
+        total + 22.0
+    };
+    for (ci, h) in tbl.headers.iter().enumerate() {
+        if ci < ncols {
+            col_w[ci] = col_w[ci].max(measure_cell(h.as_slice(), true));
+        }
+    }
+    for row in tbl.rows.iter() {
+        for (ci, c) in row.iter().enumerate() {
+            if ci < ncols {
+                col_w[ci] = col_w[ci].max(measure_cell(c.as_slice(), false));
+            }
+        }
+    }
+    let sum_w: f32 = col_w.iter().sum();
+    let table_w = sum_w.min(max_w);
+    if sum_w > max_w && sum_w > 0.0 {
+        let ratio = max_w / sum_w;
+        for w in &mut col_w {
+            *w = (*w * ratio).max(40.0);
+        }
+    }
+
+    let row_h = m.ch + 9.0;
+    let has_hdr = !tbl.headers.is_empty();
+    let vis_rows = tbl
+        .rows
+        .len()
+        .min((((max_y - y0 - if has_hdr { row_h } else { 0.0 }) / row_h).floor().max(0.0)) as usize);
+    let total_h = (if has_hdr { row_h } else { 0.0 }) + (vis_rows as f32) * row_h + 2.0;
+
+    // Outer table frame.
+    scene.round_rect(
+        x0,
+        y0,
+        x0 + table_w,
+        y0 + total_h,
+        7.0,
+        theme::rgb(0x13, 0x14, 0x18),
+        1.0,
+        theme::LINE,
+        clip,
+    );
+
+    let mut y = y0 + 1.0;
+    if has_hdr {
+        scene.round_rect(
+            x0 + 1.0,
+            y,
+            x0 + table_w - 1.0,
+            y + row_h,
+            6.0,
+            theme::rgb(0x1a, 0x1b, 0x22),
+            0.0,
+            [0.0; 4],
+            clip,
+        );
+        let mut cx = x0;
+        for (ci, h) in tbl.headers.iter().enumerate().take(ncols) {
+            let align = tbl.alignments.get(ci).copied().unwrap_or(TextAlign::Left);
+            render_md_spans_single_line(
+                scene,
+                h.as_slice(),
+                cx + 10.0,
+                y + (row_h - m.ch) * 0.5,
+                (col_w[ci] - 20.0).max(20.0),
+                theme::INK_1,
+                true,
+                TextFace::Ui,
+                align,
+                m,
+                clip,
+            );
+            cx += col_w[ci];
+        }
+        y += row_h;
+        scene.line(x0 + 1.0, y, x0 + table_w - 1.0, y, 1.0, theme::LINE, clip);
+    }
+
+    for (ri, row) in tbl.rows.iter().take(vis_rows).enumerate() {
+        if ri > 0 {
+            scene.line(x0 + 1.0, y, x0 + table_w - 1.0, y, 1.0, theme::LINE_FAINT, clip);
+        }
+        let mut cx = x0;
+        for (ci, cell) in row.iter().enumerate().take(ncols) {
+            let align = tbl.alignments.get(ci).copied().unwrap_or(TextAlign::Left);
+            render_md_spans_single_line(
+                scene,
+                cell.as_slice(),
+                cx + 10.0,
+                y + (row_h - m.ch) * 0.5,
+                (col_w[ci] - 20.0).max(20.0),
+                theme::INK_2,
+                false,
+                TextFace::Ui,
+                align,
+                m,
+                clip,
+            );
+            cx += col_w[ci];
+        }
+        y += row_h;
+    }
+
+    y0 + total_h + 8.0
+}
+
+fn span_face_bold(style: MdStyle, force_bold: bool, prose_face: TextFace) -> (TextFace, bool) {
+    match style {
+        MdStyle::Code | MdStyle::Kbd => (TextFace::Mono, false),
+        MdStyle::Bold | MdStyle::BoldItalic => (prose_face, true),
+        _ => (prose_face, force_bold),
+    }
+}
+
+struct WrappedRun {
+    text: String,
+    style: MdStyle,
+    width: f32,
+    pad_l: f32,
+    pad_r: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_md_spans_wrapped(
+    scene: &mut Scene,
+    spans: &[MdSpan<'_>],
+    x0: f32,
+    y0: f32,
+    max_w: f32,
+    max_y: f32,
+    base_col: [f32; 4],
+    force_bold: bool,
+    prose_face: TextFace,
+    align: TextAlign,
+    m: CellMetrics,
+    clip: u32,
+) -> f32 {
+    let line_h = (m.line_h(prose_face) + 3.5).max(m.ch + 2.0);
+    if spans.is_empty() {
+        return line_h;
+    }
+
+    // Break spans into word/whitespace pieces and pack them cleanly into wrapped lines.
+    let mut lines: Vec<Vec<WrappedRun>> = vec![Vec::new()];
+    let mut cur_w = 0.0f32;
+
+    for sp in spans {
+        let is_chip = matches!(sp.style, MdStyle::Code | MdStyle::Kbd);
+        let (face, bold) = span_face_bold(sp.style, force_bold, prose_face);
+        if is_chip {
+            let sw = m.measure_styled(sp.text.as_str(), face, bold);
+            let pad_l = 3.5;
+            let pad_r = 3.5;
+            let total = sw + pad_l + pad_r;
+            if cur_w > 0.0 && cur_w + total > max_w {
+                lines.push(Vec::new());
+                cur_w = 0.0;
+            }
+            lines.last_mut().unwrap().push(WrappedRun {
+                text: sp.text.as_str().to_owned(),
+                style: sp.style,
+                width: sw,
+                pad_l,
+                pad_r,
+            });
+            cur_w += total;
+            continue;
+        }
+
+        // Tokenize prose spans into words + preserving spaces so inline links/bold never glue together.
+        let s = sp.text.as_str();
+        let mut pos = 0usize;
+        let bytes = s.as_bytes();
+        while pos < bytes.len() {
+            let start = pos;
+            let is_ws = bytes[pos].is_ascii_whitespace();
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() == is_ws {
+                pos += 1;
+            }
+            let piece = &s[start..pos];
+            if is_ws && cur_w == 0.0 {
+                continue; // Drop leading spaces on freshly wrapped lines.
+            }
+            let pw = m.measure_styled(piece, face, bold);
+            if !is_ws && cur_w > 0.0 && cur_w + pw > max_w {
+                // Trim trailing whitespace on the line being closed.
+                if let Some(last_line) = lines.last_mut()
+                    && let Some(last_run) = last_line.last()
+                    && last_run.text.trim().is_empty()
+                {
+                    last_line.pop();
+                }
+                lines.push(Vec::new());
+                cur_w = 0.0;
+            }
+            let cur_line = lines.last_mut().unwrap();
+            if let Some(prev) = cur_line.last_mut()
+                && prev.style == sp.style
+                && prev.pad_l == 0.0
+                && prev.pad_r == 0.0
+            {
+                prev.text.push_str(piece);
+                prev.width += pw;
+            } else {
+                cur_line.push(WrappedRun {
+                    text: piece.to_owned(),
+                    style: sp.style,
+                    width: pw,
+                    pad_l: 0.0,
+                    pad_r: 0.0,
+                });
+            }
+            cur_w += pw;
+        }
+    }
+
+    let mut y = y0;
+    let mut drawn = 0usize;
+    for line in &lines {
+        if y + m.ch > max_y {
+            break;
+        }
+        let line_w: f32 = line.iter().map(|r| r.pad_l + r.width + r.pad_r).sum();
+        let mut cx = match align {
+            TextAlign::Left => x0,
+            TextAlign::Center => x0 + ((max_w - line_w) * 0.5).max(0.0),
+            TextAlign::Right => x0 + (max_w - line_w).max(0.0),
+        };
+        for run in line {
+            cx += run.pad_l;
+            draw_styled_md_run(scene, &run.text, run.style, run.width, cx, y, base_col, force_bold, prose_face, m, clip);
+            cx += run.width + run.pad_r;
+        }
+        y += line_h;
+        drawn += 1;
+    }
+
+    (drawn.max(1) as f32) * line_h
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_md_spans_single_line(
+    scene: &mut Scene,
+    spans: &[MdSpan<'_>],
     x0: f32,
     y: f32,
     max_w: f32,
     base_col: [f32; 4],
     force_bold: bool,
     prose_face: TextFace,
+    align: TextAlign,
     m: CellMetrics,
     clip: u32,
 ) {
-    let mut cx = x0;
+    let mut total_w = 0.0f32;
+    for sp in spans {
+        let (face, bold) = span_face_bold(sp.style, force_bold, prose_face);
+        total_w += m.measure_styled(sp.text.as_str(), face, bold);
+        if matches!(sp.style, MdStyle::Code | MdStyle::Kbd) {
+            total_w += 8.0;
+        }
+    }
+    let mut cx = match align {
+        TextAlign::Left => x0,
+        TextAlign::Center => x0 + ((max_w - total_w) * 0.5).max(0.0),
+        TextAlign::Right => x0 + (max_w - total_w).max(0.0),
+    };
     let x_end = x0 + max_w;
     for sp in spans {
         let rem_w = x_end - cx;
-        if rem_w < m.cw * 2.0 {
+        if rem_w < m.cw * 1.5 {
             break;
         }
-        let face = if matches!(sp.style, MdStyle::Code) { TextFace::Mono } else { prose_face };
+        let (face, bold) = span_face_bold(sp.style, force_bold, prose_face);
+        let pad = if matches!(sp.style, MdStyle::Code | MdStyle::Kbd) { 4.0 } else { 0.0 };
         let avg_cw = m.measure("n", face).max(4.0);
-        let max_c = (rem_w / avg_cw).floor().max(2.0) as usize;
+        let max_c = ((rem_w - pad * 2.0) / avg_cw).floor().max(2.0) as usize;
         let txt = truncate_chars(sp.text.as_str(), max_c);
-        let sw = m.measure(&txt, face);
-        match sp.style {
-            MdStyle::Plain => {
-                scene.text_with_face(cx, y, &txt, base_col, force_bold, false, face, clip);
-            }
-            MdStyle::Bold => {
-                scene.text_with_face(cx, y, &txt, theme::INK_1, true, false, face, clip);
-            }
-            MdStyle::Italic => {
-                scene.text_with_face(cx, y, &txt, theme::INK_2, force_bold, true, face, clip);
-            }
-            MdStyle::Code => {
-                scene.round_rect(cx - 2.5, y, cx + sw + 2.5, y + m.ch, 3.5, theme::rgb(0x1f, 0x1f, 0x24), 0.0, [0.0; 4], clip);
-                scene.text(cx, y, &txt, theme::rgb(0x7c, 0xc9, 0x8b), false, false, clip);
-                cx += 3.0;
-            }
-            MdStyle::Link => {
-                scene.text_with_face(cx, y, &txt, theme::rgb(0x9a, 0xc2, 0xe8), force_bold, false, face, clip);
-            }
+        let sw = m.measure_styled(&txt, face, bold);
+        cx += pad;
+        draw_styled_md_run(scene, &txt, sp.style, sw, cx, y, base_col, force_bold, prose_face, m, clip);
+        cx += sw + pad;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_styled_md_run(
+    scene: &mut Scene,
+    txt: &str,
+    style: MdStyle,
+    sw: f32,
+    cx: f32,
+    y: f32,
+    base_col: [f32; 4],
+    force_bold: bool,
+    prose_face: TextFace,
+    m: CellMetrics,
+    clip: u32,
+) {
+    match style {
+        MdStyle::Plain => {
+            scene.text_with_face(cx, y, txt, base_col, force_bold, false, prose_face, clip);
         }
-        cx += sw;
+        MdStyle::Bold => {
+            scene.text_with_face(cx, y, txt, theme::INK_1, true, false, prose_face, clip);
+        }
+        MdStyle::Italic => {
+            scene.text_with_face(cx, y, txt, theme::INK_2, force_bold, true, prose_face, clip);
+        }
+        MdStyle::BoldItalic => {
+            scene.text_with_face(cx, y, txt, theme::INK_1, true, true, prose_face, clip);
+        }
+        MdStyle::Code => {
+            scene.round_rect(
+                cx - 3.0,
+                y,
+                cx + sw + 3.0,
+                y + m.ch,
+                4.0,
+                theme::rgb(0x1f, 0x20, 0x27),
+                1.0,
+                theme::rgba(0x3a, 0x3c, 0x48, 0.55),
+                clip,
+            );
+            scene.text(cx, y, txt, theme::rgb(0x7c, 0xc9, 0x8b), false, false, clip);
+        }
+        MdStyle::Kbd => {
+            scene.round_rect(
+                cx - 3.5,
+                y,
+                cx + sw + 3.5,
+                y + m.ch,
+                4.0,
+                theme::rgb(0x25, 0x26, 0x2d),
+                1.0,
+                theme::rgb(0x46, 0x48, 0x54),
+                clip,
+            );
+            scene.text(cx, y, txt, theme::INK_1, true, false, clip);
+        }
+        MdStyle::Strike => {
+            scene.text_with_face(cx, y, txt, theme::INK_4, force_bold, false, prose_face, clip);
+            let sy = y + m.ch * 0.52;
+            scene.line(cx, sy, cx + sw, sy, 1.0, theme::INK_4, clip);
+        }
+        MdStyle::Link => {
+            let link_col = theme::rgb(0x79, 0xb8, 0xff);
+            scene.text_with_face(cx, y, txt, link_col, force_bold, false, prose_face, clip);
+            let uy = y + m.ch - 1.5;
+            scene.line(cx, uy, cx + sw, uy, 1.0, theme::rgba(0x79, 0xb8, 0xff, 0.38), clip);
+        }
     }
 }
 

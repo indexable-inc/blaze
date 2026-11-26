@@ -8,6 +8,7 @@ pub mod blocks;
 pub mod editor;
 pub mod host;
 pub mod icons;
+pub mod image_atlas;
 pub mod layout;
 pub mod prompt;
 pub mod rust_cell;
