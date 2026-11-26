@@ -431,6 +431,174 @@ impl Meta {
 }
 
 
+/// An exclusive file lock acquired through [`Dir::lock_exclusive`]: call [`FileLock::unlock`] on
+/// the result-bearing path so unlock failures surface as typed [`FsError`]s; `Drop` performs a
+/// bounded fallback unlock only if the lock was dropped early (e.g. on error/unwind).
+enum FileLockKind {
+    Sim { io: Io, tag: blaze_core::Tag },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Native(crate::rt::NativeLock),
+}
+
+/// Outcome of a bounded read performed through a held [`FileLock`]'s root capability.
+pub enum BoundedRead<'a> {
+    Absent,
+    Oversized,
+    Grew,
+    Whole(blaze_own::Vec<u8, blaze_own::Alloc<'a>>),
+}
+
+pub struct FileLock {
+    kind: FileLockKind,
+    dir: Dir<ReadWrite>,
+    name: FileName,
+    unlocked: bool,
+}
+
+impl FileLock {
+    /// Reads `path` (bounded at `max_bytes` before allocating) through the exact directory and
+    /// root capability that acquired this lock — eliminating both cross-world misuse and any
+    /// TOCTOU window if the root pathname is renamed or replaced while the lock is held.
+    pub fn read_bounded<'a>(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        max_bytes: u64,
+        single_read_plant: bool,
+        alloc: blaze_own::Alloc<'a>,
+    ) -> Result<BoundedRead<'a>, FsError> {
+        let name = self.dir.beneath(path);
+        match &self.kind {
+            FileLockKind::Sim { .. } => {
+                let file = match self.dir.open_read(cx, path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind == FsKind::NotFound => return Ok(BoundedRead::Absent),
+                    Err(error) => return Err(error),
+                };
+                let len_u64 = match file.len(cx) {
+                    Ok(len) => len,
+                    Err(error) if error.kind == FsKind::NotFound => return Ok(BoundedRead::Absent),
+                    Err(error) => return Err(error),
+                };
+                if len_u64 > max_bytes {
+                    return Ok(BoundedRead::Oversized);
+                }
+                let len = usize::try_from(len_u64).map_err(|_| driver_error(FsOp::Read, &name, &"record length overflow"))?;
+                let cap = len.checked_add(1).ok_or_else(|| driver_error(FsOp::Read, &name, &"record capacity overflow"))?;
+                let mut bytes = blaze_own::Vec::with_capacity_in(cap, alloc);
+                bytes.resize(cap, 0u8);
+                let mut filled = 0usize;
+                while filled < cap {
+                    let step_off = u64::try_from(filled).map_err(|_| driver_error(FsOp::Read, &name, &"read offset overflow"))?;
+                    let Some(dst) = bytes.as_mut_slice().get_mut(filled..) else {
+                        break;
+                    };
+                    let n = file.read_into(dst, step_off).wait(cx)?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                    if single_read_plant {
+                        break;
+                    }
+                }
+                if filled > len {
+                    return Ok(BoundedRead::Grew);
+                }
+                bytes.truncate(filled);
+                Ok(BoundedRead::Whole(bytes))
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                match crate::rt::read_bounded_under_lock_off_thread(cx, native, name.as_str(), max_bytes, single_read_plant, alloc) {
+                    Ok(crate::rt::NativeBoundedRead::Absent) => Ok(BoundedRead::Absent),
+                    Ok(crate::rt::NativeBoundedRead::Oversized) => Ok(BoundedRead::Oversized),
+                    Ok(crate::rt::NativeBoundedRead::Grew) => Ok(BoundedRead::Grew),
+                    Ok(crate::rt::NativeBoundedRead::Whole(bytes)) => Ok(BoundedRead::Whole(bytes)),
+                    Err(crate::rt::NativeLockErr::Stopped(s)) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(s))),
+                    Err(crate::rt::NativeLockErr::Driver(msg)) => Err(driver_error(FsOp::Read, &name, &msg.as_str())),
+                }
+            }
+        }
+    }
+
+    /// Atomically publishes `whole` at `path` (unsynced, [`Durable::No`]) through the exact
+    /// directory and root capability that acquired this lock — never waiting for device flush and
+    /// eliminating both cross-world misuse and post-lock root-rename TOCTOU windows.
+    pub fn publish_unsynced(&self, cx: &Cx, path: &Path, whole: &[u8]) -> Result<(), FsError> {
+        match &self.kind {
+            FileLockKind::Sim { .. } => self.dir.publish(cx, path, Content::bytes(whole), Durable::No).map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                let name = self.dir.beneath(path);
+                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, false).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+                })
+            }
+        }
+    }
+
+    /// Atomically publishes `whole` at `path` (synced, [`Durable::Yes`]: file synced before rename
+    /// and parent directory synced after) through the exact directory and root capability that
+    /// acquired this lock.
+    pub fn publish_synced(&self, cx: &Cx, path: &Path, whole: &[u8]) -> Result<(), FsError> {
+        match &self.kind {
+            FileLockKind::Sim { .. } => self.dir.publish_synced(cx, path, Content::bytes(whole)).map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                let name = self.dir.beneath(path);
+                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, true).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+                })
+            }
+        }
+    }
+
+    /// Explicitly releases the file lock under `cx`, surfacing any `Done::Failed` or stop error.
+    /// Marks the lock released ONLY after receiving confirmation so `Drop` still performs its
+    /// bounded fallback unlock if an explicit unlock fails or times out.
+    pub fn unlock(mut self, cx: &Cx) -> Result<(), FsError> {
+        match &mut self.kind {
+            FileLockKind::Sim { io, tag } => {
+                let lock = *tag;
+                match call(io, cx, FsOp::Publish, &self.name, |t| Effect::Unlock { lock, tag: t })? {
+                    Done::Unlocked => {
+                        self.unlocked = true;
+                        Ok(())
+                    }
+                    Done::Failed(error) => Err(FsError::new(FsOp::Publish, &self.name, FsKind::Driver(error.0))),
+                    other => Err(unexpected(FsOp::Publish, &self.name, other)),
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                crate::rt::unlock_off_thread(cx, native).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &self.name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &self.name, &msg.as_str()),
+                })?;
+                self.unlocked = true;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if self.unlocked {
+            return;
+        }
+        if let FileLockKind::Sim { io, tag } = &self.kind {
+            let lock = *tag;
+            let req = io.submit(|t| Effect::Unlock { lock, tag: t });
+            let until = blaze_core::wait::Deadline::after(io.now(), core::time::Duration::from_secs(5));
+            let _ = io.settle(req, until, "bstd::fs::FileLock unlock");
+        }
+    }
+}
+
 /// How durable a change must be when its call returns. A required argument: no file call has
 /// a default (docs/v2/plan/design/std.md, "Files").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1097,15 +1265,37 @@ fn copy_file(
     }
 }
 
-/// A name beside `name`, in its directory, that no other call of this world was given: a
-/// publish's temporary file, `.<leaf>.<n>.bstd-new`.
+/// Formats the unique suffix of a publish temporary filename: `<nonce-hex>.<seq>` in a native
+/// world (preventing cross-process collisions across independent `Io` worlds sharing a directory)
+/// or `<seq>` in simulated/hosted worlds (preserving deterministic simulation names).
+struct TempTag(Option<u64>, u64);
+
+/// A staged sibling temporary file produced by [`Dir::stage_publish_if_absent`] awaiting atomic
+/// `Effect::Link` publication in [`Dir::finish_publish_if_absent`].
+pub struct StagedPublish {
+    name: FileName,
+    temp: FileName,
+    how: How,
+}
+
+impl core::fmt::Display for TempTag {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(nonce) => write!(f, "{nonce:016x}.{}", self.1),
+            None => write!(f, "{}", self.1),
+        }
+    }
+}
+
+/// A name beside `name`, in its directory, unique within this world and (on native worlds)
+/// across concurrent OS processes sharing the same directory: `.<leaf>.<tag>.bstd-new`.
 fn beside(io: &Io, name: &FileName) -> FileName {
-    let fresh = io.fresh();
+    let tag = TempTag(io.fresh_nonce(), io.fresh());
     let joined = match name.as_str().rsplit_once('/') {
         // alloc: once per publish, its temporary file's name.
-        Some((dir, leaf)) => format!("{dir}/.{leaf}.{fresh}.bstd-new"),
+        Some((dir, leaf)) => format!("{dir}/.{leaf}.{tag}.bstd-new"),
         // alloc: once per publish, its temporary file's name.
-        None => format!(".{name}.{fresh}.bstd-new"),
+        None => format!(".{name}.{tag}.bstd-new"),
     };
     FileName::new(&joined).expect("a name beside a name is a name")
 }
@@ -1233,6 +1423,8 @@ impl<#[blaze::linear] P: Rights, S: Scope> Clone for Dir<P, S> {
         Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
     }
 }
+
+impl<#[blaze::linear] P: Rights, S: Scope> blaze_own::Share for Dir<P, S> {}
 
 impl<#[blaze::linear] P: Rights, S: Scope> fmt::Debug for Dir<P, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1383,6 +1575,15 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         };
         // clone: the quota shared, a refcount.
         Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+
+    /// The world it is in: for deriving sibling capabilities (clock, spawner, contexts) from an
+    /// already-open directory capability without creating a second native world outside a context.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn world(&self) -> &Io {
+        &self.io
     }
 
     /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).
@@ -2095,6 +2296,150 @@ impl Dir<ReadWrite> {
         // and nothing changed them since.
         let seen = self.io.generation(&name);
         Ok(Published { file: Flushed::of(&self.io, name, seen), how })
+    }
+
+    /// A staged sibling temporary file ready to be linked into its target path by
+    /// [`Dir::finish_publish_if_absent`].
+    pub fn stage_publish_if_absent(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<StagedPublish, FsError> {
+        self.stage_if_absent_inner(cx, path, content, durable)
+    }
+
+    /// Commits a [`StagedPublish`] created by [`Dir::stage_publish_if_absent`] via `Effect::Link`
+    /// only if the target path is still absent, removing the temporary file and syncing directory
+    /// names as requested by `durable`.
+    pub fn finish_publish_if_absent(
+        &self,
+        cx: &Cx,
+        staged: StagedPublish,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        self.finish_if_absent_inner(cx, staged, durable)
+    }
+
+    fn stage_if_absent_inner(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<StagedPublish, FsError> {
+        let name = self.beneath(path);
+        let (temp, how) = self.place(cx, &name, content)?;
+        if durable == Durable::Yes {
+            let _ = Written::of(&self.io, temp.share()).flush(cx)?;
+        }
+        Ok(StagedPublish { name, temp, how })
+    }
+
+    fn finish_if_absent_inner(
+        &self,
+        cx: &Cx,
+        staged: StagedPublish,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        let StagedPublish { name, temp, how } = staged;
+        let from = temp.share();
+        let to = name.share();
+        let linked = match call(&self.io, cx, FsOp::Publish, &name, |tag| Effect::Link { from, to, tag })? {
+            Done::Linked => true,
+            Done::Failed(error) => {
+                let exists = stat(&self.io, cx, FsOp::Publish, &name)?;
+                remove(&self.io, cx, FsOp::Publish, &temp)?;
+                return match exists {
+                    Some(_) => Ok(false),
+                    None => Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0))),
+                };
+            }
+            done => {
+                let _ = remove(&self.io, cx, FsOp::Publish, &temp);
+                return Err(unexpected(FsOp::Publish, &name, done));
+            }
+        };
+        remove(&self.io, cx, FsOp::Publish, &temp)?;
+        match durable.unsynced() {
+            Some(unsynced) => {
+                started(&self.io, &name, unsynced);
+                names_started(&self.io, &name, unsynced);
+            }
+            None => {
+                sync_names(&self.io, cx, FsOp::Publish, &name, None)?;
+            }
+        }
+        cx.event(how.says());
+        Ok(linked)
+    }
+
+    /// `path` made to hold `content` atomically ONLY if nothing exists at `path` yet (via
+    /// `Effect::Link` from a sibling temporary file): returns `Ok(true)` when this call created
+    /// `path`, or `Ok(false)` when another entry already occupied `path` (never overwriting it).
+    pub fn publish_if_absent(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        let staged = self.stage_if_absent_inner(cx, path, content, durable)?;
+        self.finish_if_absent_inner(cx, staged, durable)
+    }
+
+    /// Acquires an exclusive advisory file lock at `path` (creating the lock file if absent),
+    /// keeping native filesystem lock I/O off the driver's polling thread (cancellable/reapable
+    /// under `cx` deadline/cancellation) and using `Effect::Lock` in simulated worlds. Call
+    /// [`FileLock::unlock`] on the result-bearing path.
+    pub fn lock_exclusive(&self, cx: &Cx, path: &Path) -> Result<FileLock, FsError> {
+        let name = self.beneath(path);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.io.is_native_driver() {
+            let root_dir = self.io.native_root_dir().ok_or_else(|| {
+                driver_error(FsOp::Publish, &name, &"native world missing opened root directory descriptor")
+            })?;
+            let native = crate::rt::lock_exclusive_off_thread(cx, root_dir, name.as_str()).map_err(|err| match err {
+                crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+            })?;
+            return Ok(FileLock { kind: FileLockKind::Native(native), dir: self.share(), name, unlocked: false });
+        }
+        let backoff = core::time::Duration::from_millis(2);
+        loop {
+            cx.stopped_by(self.io.now())
+                .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+            let lock_file = name.share();
+            let mut acquired_tag = blaze_core::Tag(0);
+            let done = self
+                .io
+                .call(cx, |tag| {
+                    acquired_tag = tag;
+                    Effect::Lock { file: lock_file, mode: blaze_core::LockMode::Exclusive, tag }
+                })
+                .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+            match done {
+                Done::Locked => {
+                    return Ok(FileLock {
+                        kind: FileLockKind::Sim { io: self.io.share(), tag: acquired_tag },
+                        dir: self.share(),
+                        name,
+                        unlocked: false,
+                    });
+                }
+                Done::Contended => {
+                    let _ = self
+                        .io
+                        .call(cx, |tag| Effect::Timer { after: backoff, tag })
+                        .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
+                }
+                Done::Failed(error) => {
+                    return Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0)));
+                }
+                other => return Err(unexpected(FsOp::Publish, &name, other)),
+            }
+        }
     }
 
     /// The file at `path` gone, as durably as `durable` says; gone already is done.

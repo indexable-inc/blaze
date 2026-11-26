@@ -39,6 +39,12 @@ fn open_native_in(os: &blaze_core::Os, world: NativeWorld<'_>, workers: Option<c
     };
     // alloc: an error's message.
     let driver = blaze_core::native_in(os, world.root, world.threads).map_err(|error| refused(error.to_string()))?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let native_root_dir = Some(blaze_own::Arc::new_in(
+        // alloc: an error's message.
+        crate::rt::NativeRootDir::open(world.root).map_err(|errno| refused(errno.to_string()))?,
+        blaze_own::SharedAlloc::global(),
+    ));
     // alloc: an error's message.
     let host = crate::native::host_facts(world.host_name, driver.now()).map_err(|error| refused(error.to_string()))?;
     let workers = match workers {
@@ -67,6 +73,8 @@ fn open_native_in(os: &blaze_core::Os, world: NativeWorld<'_>, workers: Option<c
             hosted: None,
             disk: None,
             plant: Plant::None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir,
         },
         workers,
     ))

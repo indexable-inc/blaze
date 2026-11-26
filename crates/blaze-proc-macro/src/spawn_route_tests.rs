@@ -64,6 +64,7 @@ pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sy
         limits: LIMITS,
         table: Arc::new(Vec::new()),
         probes: None,
+        c_probes: None,
         spawner,
         step: ContentId([3; 32]),
         spawn_setting: Arc::new(spawn_setting),

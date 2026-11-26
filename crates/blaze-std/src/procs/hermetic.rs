@@ -56,11 +56,807 @@ mod native;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
+/// Source bytes of the hermetic runner, process-launch, and async file-read modules in
+/// `blaze-std` (AGENTS.md rule 69).
+pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
+    include_bytes!("../cx.rs"),
+    include_bytes!("../fs.rs"),
+    include_bytes!("../io.rs"),
+    include_bytes!("../io/fast.rs"),
+    include_bytes!("../io/native_in.rs"),
+    include_bytes!("../pending.rs"),
+    include_bytes!("../procs.rs"),
+    include_bytes!("../rt.rs"),
+    include_bytes!("linked.rs"),
+    include_bytes!("linked/run.rs"),
+    include_bytes!("hermetic.rs"),
+    include_bytes!("hermetic/execution.rs"),
+    include_bytes!("hermetic/machine.rs"),
+    include_bytes!("hermetic/native.rs"),
+    include_bytes!("hermetic/plan.rs"),
+    include_bytes!("hermetic/report.rs"),
+    include_bytes!("hermetic/landlock.rs"),
+    include_bytes!("hermetic/seatbelt.rs"),
+];
+
+/// Complete transitive runner/launcher/confinement implementation source bytes across `blaze-std`,
+/// `blaze-core`, and `blaze-sys` so content-addressed runner keys roll on any change to argument,
+/// environment, stream, spawn, or confinement code (AGENTS.md rule 69).
+pub const TRANSITIVE_CONFINEMENT_SOURCE: &[&[&[u8]]] = &[
+    CONFINEMENT_SOURCE,
+    blaze_core::SPAWN_SOURCE,
+    blaze_sys::CONFINEMENT_SOURCE,
+];
+
+/// File metadata stamp of a verified executable inode (device, inode, size, mtime, ctime).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VerifiedStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub modified_ns: i128,
+    pub changed_ns: i128,
+}
+
+/// A kernel-sealed immutable executable snapshot on Linux (`memfd_create` + `F_SEAL_WRITE |
+/// F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`), populated in a single bounded streaming pass
+/// through `bstd::fs` (`blaze-core`'s deadline-aware async driver) while computing the caller's
+/// SHA-256 digest and launched via `execveat(..., AT_EMPTY_PATH)` so neither path replacement
+/// nor in-place writes can ever alter the verified bytes before execution.
+#[cfg(target_os = "linux")]
+pub struct VerifiedExec {
+    fd: blaze_sys::linux::OwnedFd,
+    len: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn remaining_for_cx(cx: &Cx) -> Result<Duration, crate::Stopped> {
+    cx.check()?;
+    let deadline = cx.deadline();
+    if deadline.finite().is_some() {
+        let now = cx.io().now();
+        if deadline.passed(now) {
+            return Err(crate::Stopped::Deadline { span: cx.name(), at: deadline.get() });
+        }
+        let left = deadline.left(now);
+        if left.is_zero() {
+            return Err(crate::Stopped::Deadline { span: cx.name(), at: deadline.get() });
+        }
+        Ok(left)
+    } else {
+        Ok(Duration::from_secs(30))
+    }
+}
+
+/// Reusable, deadline-aware async file-descriptor reader built on `bstd::fs` (`blaze-core`'s
+/// kernel-probed `Uring`/`Threads` driver + `Cx::wait` / `blaze_core::wait`) rooted at `/`
+/// reading `/proc/self/fd/<fd>` so reads target the exact already-opened inode with zero TOCTOU
+/// and zero bespoke blocking syscalls.
+///
+/// Hold one instance across probes (e.g. on `HermeticClangProbe` or `FactFiles`): when a read is
+/// cancelled or expires on a stalled filesystem, `Pending::cancel` bounds the wait to 50 ms and
+/// retires the stale tag via `Io::forget`. If the kernel read is still stuck when `RootReader`
+/// drops (even on a stack-owned owner such as `FactFiles`), `RootReaderInner::drop` hands the
+/// secondary `Io` off to a single detached background reaper thread (`rt::retire_stalled_io`) so
+/// caller drop returns immediately AND the worker thread + driver are cleanly reclaimed once the
+/// stalled syscall returns (zero unbounded hang, zero `mem::forget` leak).
+#[cfg(target_os = "linux")]
+struct RootReaderInner {
+    io: Option<crate::io::Io>,
+    root: Option<crate::fs::Dir<crate::fs::ReadOnly>>,
+    stalled: core::sync::atomic::AtomicBool,
+    holds_reaper_slot: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RootReaderInner {
+    fn drop(&mut self) {
+        if self.stalled.load(core::sync::atomic::Ordering::Acquire) {
+            if let (Some(io), Some(root)) = (self.io.take(), self.root.take()) {
+                self.holds_reaper_slot = false;
+                crate::rt::retire_stalled_io(io, root);
+                return;
+            }
+        }
+        if self.holds_reaper_slot {
+            self.holds_reaper_slot = false;
+            crate::rt::release_reaper_slot();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ReaperSlotGuard(bool);
+
+#[cfg(target_os = "linux")]
+impl Drop for ReaperSlotGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            crate::rt::release_reaper_slot();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct RootReader {
+    inner: blaze_own::Arc<RootReaderInner, blaze_own::SharedAlloc<'static>>,
+}
+
+#[cfg(target_os = "linux")]
+impl blaze_own::Share for RootReader {}
+
+#[cfg(target_os = "linux")]
+impl RootReader {
+    pub fn new(cx: &Cx) -> Result<Self, Fault> {
+        match crate::rt::try_reserve_reaper_slot() {
+            Ok(()) => {}
+            Err(crate::rt::ReaperReserveError::BacklogFull) => {
+                return Err(Fault::Host {
+                    call: "bstd::fs root io (stalled-reader backlog full)",
+                    code: 11,
+                });
+            }
+            Err(crate::rt::ReaperReserveError::SpawnFailed) => {
+                return Err(Fault::Host {
+                    call: "bstd::fs root io (reaper worker spawn failed)",
+                    code: 11,
+                });
+            }
+        }
+        let mut slot_guard = ReaperSlotGuard(true);
+        let io = match cx.io().beside(crate::rt::RootPath::new("/")) {
+            Some(Ok(io)) => io,
+            Some(Err(_)) | None => {
+                return Err(Fault::Host { call: "bstd::fs root io (open /)", code: 5 });
+            }
+        };
+        let fs = io
+            .need_fs()
+            .map_err(|_| Fault::Host { call: "bstd::fs root io (missing fs)", code: 5 })?;
+        let root = fs.root().read_only();
+        slot_guard.0 = false;
+        let inner = blaze_own::Arc::new_in(
+            RootReaderInner {
+                io: Some(io),
+                root: Some(root),
+                stalled: core::sync::atomic::AtomicBool::new(false),
+                holds_reaper_slot: true,
+            },
+            blaze_own::SharedAlloc::global(),
+        );
+        Ok(Self { inner })
+    }
+
+    /// Whether a cancelled/expired read on this reader left a stalled syscall in flight (so
+    /// long-lived owners should rotate in a fresh reader and let this one retire to the reaper).
+    pub fn is_stalled(&self) -> bool {
+        self.inner.stalled.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    fn io_ref(&self) -> Result<&crate::io::Io, Fault> {
+        self.inner.io.as_ref().ok_or(Fault::Host { call: "bstd::fs root io (retired)", code: 5 })
+    }
+
+    fn root_ref(&self) -> Result<&crate::fs::Dir<crate::fs::ReadOnly>, Fault> {
+        self.inner.root.as_ref().ok_or(Fault::Host { call: "bstd::fs root io (retired)", code: 5 })
+    }
+
+    fn fd_rel(fd: blaze_sys::Fd) -> Result<crate::path::Path, Fault> {
+        let raw = u32::try_from(fd.raw()).map_err(|_| Fault::Host { call: "proc/self/fd path", code: 9 })?;
+        let mut buf = [0u8; 32];
+        const PREFIX: &[u8] = b"proc/self/fd/";
+        if let Some(dst) = buf.get_mut(..PREFIX.len()) {
+            dst.copy_from_slice(PREFIX);
+        }
+        let mut digits = [0u8; 12];
+        let mut d_at = digits.len();
+        let mut n = raw;
+        loop {
+            d_at -= 1;
+            if let Some(slot) = digits.get_mut(d_at) {
+                *slot = b'0' + u8::try_from(n % 10).unwrap_or(0);
+            }
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let d_len = digits.len() - d_at;
+        let total = PREFIX.len() + d_len;
+        if let (Some(dst), Some(src)) = (buf.get_mut(PREFIX.len()..total), digits.get(d_at..)) {
+            dst.copy_from_slice(src);
+        }
+        let s = core::str::from_utf8(buf.get(..total).unwrap_or(&[]))
+            .map_err(|_| Fault::Host { call: "proc/self/fd path", code: 22 })?;
+        crate::path::Path::new(s).map_err(|_| Fault::Host { call: "proc/self/fd path", code: 22 })
+    }
+
+    fn sub_cx(&self, cx: &Cx) -> Result<(Cx, Deadline), Fault> {
+        let io = self.io_ref()?;
+        let left = remaining_for_cx(cx)
+            .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
+        let deadline = Deadline::after(io.now(), left);
+        Ok((cx.on_beside(blaze_own::Share::share(io), deadline), deadline))
+    }
+
+    /// Waits for `pending` on `self.io` while polling in bounded 10 ms slices so parent
+    /// cancellation (`cx.cancelled()`) abandons a stalled read within a short 50 ms settle bound
+    /// instead of waiting out the full remaining probe deadline. If the read still has not
+    /// completed after `Pending::cancel`, marks this reader stalled so dropping it retires its
+    /// worker to the detached background reaper instead of blocking caller drop or leaking.
+    fn wait_read_cancellable<'buf>(
+        &self,
+        cx: &Cx,
+        read_cx: &Cx,
+        deadline: Deadline,
+        mut pending: crate::pending::Pending<'buf, crate::fs::ReadInto<'buf>>,
+        call: &'static str,
+    ) -> Result<usize, Fault> {
+        let io = self.io_ref()?;
+        loop {
+            match pending.try_wait() {
+                Ok(res) => return res.map_err(|e| fs_err_to_fault(call, &e)),
+                Err(still) => pending = still,
+            }
+            if cx.cancelled() {
+                let give_up = Deadline::after(io.now(), Duration::from_millis(50));
+                if matches!(
+                    pending.cancel(read_cx, give_up),
+                    Err(crate::fs::FsError { kind: crate::fs::FsKind::Stopped(_), .. })
+                ) {
+                    self.inner.stalled.store(true, core::sync::atomic::Ordering::Release);
+                }
+                return Err(Fault::Host { call: "nix runtime closure (cancelled)", code: 125 });
+            }
+            let now = io.now();
+            if deadline.passed(now) {
+                if matches!(
+                    pending.cancel(read_cx, Deadline::PASSED),
+                    Err(crate::fs::FsError { kind: crate::fs::FsKind::Stopped(_), .. })
+                ) {
+                    self.inner.stalled.store(true, core::sync::atomic::Ordering::Release);
+                }
+                return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
+            }
+            let slice = deadline.min(Deadline::after(now, Duration::from_millis(10)));
+            let _ = io.poll(slice);
+        }
+    }
+
+    /// Reads from already-opened `fd` at `offset` through `blaze-core`'s async driver until `out`
+    /// is completely filled or a zero-length read proves EOF (never truncating short FUSE/NFS
+    /// reads).
+    pub(super) fn read_exact_or_eof(
+        &self,
+        cx: &Cx,
+        fd: blaze_sys::Fd,
+        out: &mut [u8],
+        offset: u64,
+        call: &'static str,
+    ) -> Result<usize, Fault> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let rel = Self::fd_rel(fd)?;
+        let (open_cx, _) = self.sub_cx(cx)?;
+        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let mut filled = 0usize;
+        while filled < out.len() {
+            let step_off = u64::try_from(filled)
+                .ok()
+                .and_then(|d| offset.checked_add(d))
+                .ok_or(Fault::Host { call, code: 75 })?;
+            let (read_cx, deadline) = self.sub_cx(cx)?;
+            let Some(dst) = out.get_mut(filled..) else {
+                break;
+            };
+            let n = self.wait_read_cancellable(cx, &read_cx, deadline, file.read_into(dst, step_off), call)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        Ok(filled)
+    }
+
+    /// Streams the entire contents of already-opened `fd` in bounded 64 KiB async `Effect::Read`
+    /// chunks into `feed`, returning total bytes read.
+    pub(super) fn stream_fd(
+        &self,
+        cx: &Cx,
+        fd: blaze_sys::Fd,
+        call: &'static str,
+        mut feed: impl FnMut(&[u8]),
+    ) -> Result<u64, Fault> {
+        let rel = Self::fd_rel(fd)?;
+        let (open_cx, _) = self.sub_cx(cx)?;
+        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let mut buf = [0u8; 64 << 10];
+        let mut offset = 0u64;
+        loop {
+            let (read_cx, deadline) = self.sub_cx(cx)?;
+            let n = self.wait_read_cancellable(cx, &read_cx, deadline, file.read_into(&mut buf, offset), call)?;
+            if n == 0 {
+                break;
+            }
+            if let Some(chunk) = buf.get(..n) {
+                feed(chunk);
+            }
+            let step = u64::try_from(n).map_err(|_| Fault::Host { call, code: 75 })?;
+            offset = offset.checked_add(step).ok_or(Fault::Host { call, code: 75 })?;
+        }
+        Ok(offset)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fs_err_to_fault(call: &'static str, err: &crate::fs::FsError) -> Fault {
+    let code = match &err.kind {
+        crate::fs::FsKind::Stopped(_) => 110,
+        crate::fs::FsKind::NotFound => 2,
+        crate::fs::FsKind::IsADirectory => 21,
+        crate::fs::FsKind::NotADirectory => 20,
+        _ => 5,
+    };
+    Fault::Host { call, code }
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedExec {
+    /// Streams `rel` beneath `dir` through `bstd::fs` (`blaze-core`'s deadline-aware, cancellable
+    /// async driver — never raw blocking `pread`) into an executable `memfd` (selecting `MFD_EXEC`
+    /// via `probe_memfd_exec`, or refusing explicitly under `vm.memfd_noexec=2`) while feeding
+    /// those exact bytes into `on_chunk`, and permanently seals the `memfd`
+    /// (`SEAL | SHRINK | GROW | WRITE`) before returning.
+    pub fn open_and_seal<P: crate::fs::Rights>(
+        cx: &Cx,
+        dir: &crate::fs::Dir<P>,
+        rel: &crate::path::Path,
+        mut on_chunk: impl FnMut(&[u8]),
+    ) -> Result<VerifiedExec, VerifiedExecError> {
+        let _ = remaining_for_cx(cx).map_err(VerifiedExecError::Stopped)?;
+        let memfd_flags = match blaze_sys::posix::io::probe_memfd_exec()
+            .map_err(|errno| VerifiedExecError::Os { call: "memfd_create (probe MFD_EXEC)", errno })?
+        {
+            blaze_sys::posix::io::MemfdExec::Supported => blaze_sys::posix::io::MemfdFlags::CLOSE_ON_EXEC
+                .with(blaze_sys::posix::io::MemfdFlags::ALLOW_SEALING)
+                .with(blaze_sys::posix::io::MemfdFlags::EXEC),
+            blaze_sys::posix::io::MemfdExec::LegacyKernel => blaze_sys::posix::io::MemfdFlags::CLOSE_ON_EXEC
+                .with(blaze_sys::posix::io::MemfdFlags::ALLOW_SEALING),
+            blaze_sys::posix::io::MemfdExec::Denied(errno) => return Err(VerifiedExecError::ExecMemfdDenied(errno)),
+        };
+        let file = dir.open_read(cx, rel).map_err(VerifiedExecError::from_fs)?;
+        let memfd = match blaze_sys::posix::io::memfd_create(
+            blaze_sys::Path::new(c"blaze-verified-exec"),
+            memfd_flags,
+        ) {
+            Ok(fd) => fd,
+            Err(errno @ (blaze_sys::Errno::Perm | blaze_sys::Errno::Acces)) => {
+                return Err(VerifiedExecError::ExecMemfdDenied(errno));
+            }
+            Err(errno) => return Err(VerifiedExecError::Os { call: "memfd_create", errno }),
+        };
+        let mut chunk_buf = [0u8; 64 << 10];
+        let mut offset = 0u64;
+        loop {
+            let _ = remaining_for_cx(cx).map_err(VerifiedExecError::Stopped)?;
+            let n = file
+                .read_into(&mut chunk_buf, offset)
+                .wait(cx)
+                .map_err(VerifiedExecError::from_fs)?;
+            if n == 0 {
+                break;
+            }
+            let Some(chunk) = chunk_buf.get(..n) else {
+                break;
+            };
+            on_chunk(chunk);
+            let mut written = 0usize;
+            while written < chunk.len() {
+                let _ = remaining_for_cx(cx).map_err(VerifiedExecError::Stopped)?;
+                let Some(rem) = chunk.get(written..) else {
+                    break;
+                };
+                let w = blaze_sys::linux::write(memfd.fd(), rem)
+                    .map_err(|errno| VerifiedExecError::Os { call: "write (memfd)", errno })?;
+                if w == 0 {
+                    return Err(VerifiedExecError::Os { call: "write (memfd short)", errno: blaze_sys::Errno::Io });
+                }
+                written += w;
+            }
+            let step = u64::try_from(n).map_err(|_| VerifiedExecError::BadPath)?;
+            offset = offset.checked_add(step).ok_or(VerifiedExecError::BadPath)?;
+        }
+        let seals = blaze_sys::posix::io::Seals::WRITE
+            .with(blaze_sys::posix::io::Seals::SHRINK)
+            .with(blaze_sys::posix::io::Seals::GROW)
+            .with(blaze_sys::posix::io::Seals::SEAL);
+        blaze_sys::posix::io::add_seals(memfd.fd(), seals)
+            .map_err(|errno| VerifiedExecError::Os { call: "fcntl (F_ADD_SEALS)", errno })?;
+        Ok(VerifiedExec { fd: memfd, len: offset })
+    }
+
+    /// Length in bytes of the sealed executable snapshot.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Streams the sealed snapshot in bounded 64 KiB chunks through `bstd::fs` into `on_chunk`
+    /// (used by tests to verify immutability of the sealed `memfd`).
+    pub fn stream_chunks(&self, cx: &Cx, mut on_chunk: impl FnMut(&[u8])) -> Result<(), VerifiedExecError> {
+        let reader = RootReader::new(cx)
+            .map_err(|_| VerifiedExecError::Os { call: "bstd::fs root io", errno: blaze_sys::Errno::Io })?;
+        let _ = reader
+            .stream_fd(cx, self.fd.fd(), "read (sealed memfd)", |chunk| on_chunk(chunk))
+            .map_err(|_| VerifiedExecError::Os { call: "read (sealed memfd)", errno: blaze_sys::Errno::Io })?;
+        Ok(())
+    }
+
+    /// Attempts a write directly against the sealed `memfd` (always rejected by the kernel with
+    /// `EPERM` once `F_SEAL_WRITE` is installed; exposed for verification tests).
+    pub fn try_write_for_test(&self, bytes: &[u8]) -> Result<usize, VerifiedExecError> {
+        blaze_sys::linux::write(self.fd.fd(), bytes)
+            .map_err(|errno| VerifiedExecError::Os { call: "write (sealed memfd)", errno })
+    }
+
+    pub(super) fn fd(&self) -> blaze_sys::Fd {
+        self.fd.fd()
+    }
+}
+
+/// Why opening or streaming a [`VerifiedExec`] failed.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum VerifiedExecError {
+    BadPath,
+    NotRegular,
+    NotFound,
+    ExecMemfdDenied(blaze_sys::Errno),
+    Stopped(crate::Stopped),
+    Os { call: &'static str, errno: blaze_sys::Errno },
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedExecError {
+    fn from_fs(err: crate::fs::FsError) -> Self {
+        match err.kind {
+            crate::fs::FsKind::Stopped(s) => VerifiedExecError::Stopped(s),
+            crate::fs::FsKind::NotFound => VerifiedExecError::NotFound,
+            crate::fs::FsKind::IsADirectory => VerifiedExecError::NotRegular,
+            _ => VerifiedExecError::Os { call: "bstd::fs read", errno: blaze_sys::Errno::Io },
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl core::fmt::Display for VerifiedExecError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            VerifiedExecError::BadPath => f.write_str("invalid executable path"),
+            VerifiedExecError::NotRegular => f.write_str("executable path is not a regular file"),
+            VerifiedExecError::NotFound => f.write_str("executable file not found"),
+            VerifiedExecError::ExecMemfdDenied(errno) => write!(
+                f,
+                "kernel/namespace forbids executable memfd (vm.memfd_noexec=2 or seccomp, errno {})",
+                errno.raw()
+            ),
+            VerifiedExecError::Stopped(s) => write!(f, "stopped: {s}"),
+            VerifiedExecError::Os { call, errno } => write!(f, "{call} failed (errno {})", errno.raw()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod process_tests;
 
+/// Sans-IO coordinator for bounded independent reaper workers (`rt::retire_stalled_io` and
+/// `rt::retire_lock_fd`): guarantees that retiring an abandoned driver or file lock NEVER drops
+/// synchronously on the caller (even past the `max_workers` cap or on transient `thread::spawn`
+/// failure), reserves slots at admission time so `active + pending + reserved` can NEVER exceed
+/// `max_workers + max_pending`, and allows up to `max_workers` independent stalled mounts to
+/// drain without head-of-line blocking each other.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReaperPlant {
+    None,
+    /// Control 1: drops overflowed items synchronously on the caller when at cap.
+    SyncDropOnOverflow,
+    /// Control 2: collapses concurrency to a single FIFO worker.
+    SingleFifo,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(PartialEq, Eq, Debug)]
+pub enum RetireAction<T> {
+    Spawn(T),
+    Queued,
+    SyncDrop(T),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct ReaperCore<T> {
+    max_workers: usize,
+    max_pending: usize,
+    active: usize,
+    reserved: usize,
+    pending: blaze_own::VecDeque<T, blaze_own::SharedAlloc<'static>>,
+    plant: ReaperPlant,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<T> ReaperCore<T> {
+    pub fn new(max_workers: usize, max_pending: usize, plant: ReaperPlant) -> Self {
+        Self {
+            max_workers: max_workers.max(1),
+            max_pending: max_pending.max(1),
+            active: 0,
+            reserved: 0,
+            pending: blaze_own::VecDeque::new_in(blaze_own::SharedAlloc::global()),
+            plant,
+        }
+    }
+
+    fn total_cap(&self) -> usize {
+        self.max_workers.saturating_add(self.max_pending)
+    }
+
+    /// Whether the reaper backlog still has room to admit another live owner without allowing
+    /// `active + pending + reserved` to grow past `max_workers + max_pending`.
+    pub fn has_capacity(&self) -> bool {
+        self.active.saturating_add(self.pending.len()).saturating_add(self.reserved) < self.total_cap()
+    }
+
+    /// Atomically reserves one slot for a newly admitted live owner (`RootReader` or `NativeLock`).
+    /// Must be paired with either [`Self::release_reservation`] (normal close) or
+    /// [`Self::retire_reserved`] (stalled retirement).
+    pub fn try_reserve(&mut self) -> bool {
+        if self.has_capacity() {
+            self.reserved += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Releases a reservation when a live owner closes cleanly without stalling.
+    pub fn release_reservation(&mut self) {
+        self.reserved = self.reserved.saturating_sub(1);
+    }
+
+    /// Consumes a previously reserved slot and retires `item` into the bounded reaper pool.
+    pub fn retire_reserved(&mut self, item: T) -> RetireAction<T> {
+        self.reserved = self.reserved.saturating_sub(1);
+        self.retire(item)
+    }
+
+    fn effective_cap(&self) -> usize {
+        match self.plant {
+            ReaperPlant::SingleFifo => 1,
+            ReaperPlant::None | ReaperPlant::SyncDropOnOverflow => self.max_workers,
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    pub fn reserved(&self) -> usize {
+        self.reserved
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn retire(&mut self, item: T) -> RetireAction<T> {
+        let cap = self.effective_cap();
+        if self.active < cap {
+            self.active += 1;
+            if let Some(older) = self.pending.pop_front() {
+                self.pending.push_back(item);
+                return RetireAction::Spawn(older);
+            }
+            return RetireAction::Spawn(item);
+        }
+        if self.plant == ReaperPlant::SyncDropOnOverflow {
+            return RetireAction::SyncDrop(item);
+        }
+        self.pending.push_back(item);
+        RetireAction::Queued
+    }
+
+    pub fn on_spawn_failed(&mut self, item: T) {
+        self.active = self.active.saturating_sub(1);
+        self.pending.push_back(item);
+    }
+
+    /// Pops another queued item to spawn a reaper worker for whenever `active < cap` (used to
+    /// recover items queued during an earlier transient `thread::spawn` failure).
+    pub fn take_spawnable(&mut self) -> Option<T> {
+        let cap = self.effective_cap();
+        if self.active < cap
+            && let Some(item) = self.pending.pop_front()
+        {
+            self.active += 1;
+            return Some(item);
+        }
+        None
+    }
+
+    pub fn next_after_drop(&mut self) -> Option<T> {
+        if let Some(next) = self.pending.pop_front() {
+            return Some(next);
+        }
+        self.active = self.active.saturating_sub(1);
+        None
+    }
+}
+
+/// Planted bug for deterministic interleaving DSTs of [`StandbyReaperCore`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StandbyReaperPlant {
+    None,
+    /// Control: lets an idle worker exit without checking whether live `reserved` owners still
+    /// need standby coverage, stranding a subsequent retired driver with 0 workers.
+    ExitWhileNeeded,
+}
+
+/// Next action for a standby reaper worker thread inside its `Condvar` loop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub enum StandbyWorkerStep<T> {
+    Work(T),
+    Wait,
+    Exit,
+}
+
+/// Sans-IO state machine for the pre-spawned standby I/O reaper pool (`rt::try_reserve_reaper_slot`,
+/// `rt::release_reaper_slot`, `rt::retire_stalled_io`):
+/// - Spawns standby workers at admission time (`begin_reserve`) when a typed spawn error can still
+///   be returned to the caller, so `retire_reserved` NEVER calls `thread::spawn`, NEVER fails, and
+///   NEVER needs a background retry loop.
+/// - Tracks in-flight spawns (`spawning`) separately from live parked workers (`idle`) so no live
+///   worker ever exits prematurely counting on an unconfirmed spawn that might fail.
+/// - Surplus idle workers exit immediately on `release_reservation` when `pending` is empty.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct StandbyReaperCore<T> {
+    max_workers: usize,
+    max_pending: usize,
+    active: usize,
+    idle: usize,
+    spawning: usize,
+    reserved: usize,
+    pending: blaze_own::VecDeque<T, blaze_own::SharedAlloc<'static>>,
+    plant: StandbyReaperPlant,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<T> StandbyReaperCore<T> {
+    pub fn new(max_workers: usize, max_pending: usize, plant: StandbyReaperPlant) -> Self {
+        Self {
+            max_workers: max_workers.max(1),
+            max_pending: max_pending.max(1),
+            active: 0,
+            idle: 0,
+            spawning: 0,
+            reserved: 0,
+            pending: blaze_own::VecDeque::new_in(blaze_own::SharedAlloc::global()),
+            plant,
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    pub fn idle(&self) -> usize {
+        self.idle
+    }
+
+    pub fn spawning(&self) -> usize {
+        self.spawning
+    }
+
+    pub fn reserved(&self) -> usize {
+        self.reserved
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn total_cap(&self) -> usize {
+        self.max_workers.saturating_add(self.max_pending)
+    }
+
+    fn needed_standby(&self) -> usize {
+        let demand = self.pending.len().saturating_add(self.reserved);
+        demand.min(self.max_workers.saturating_sub(self.active))
+    }
+
+    /// Attempts to reserve a backlog slot for a new live owner. Returns `Ok(true)` if the caller
+    /// must spawn one standby worker thread (accounting for it in `spawning` until it starts or
+    /// fails via [`Self::abort_spawn_failed`]), `Ok(false)` if existing standby/active workers
+    /// already cover the reservation, or `Err(())` if the total backlog cap is full.
+    pub fn begin_reserve(&mut self) -> Result<bool, ()> {
+        if self.active.saturating_add(self.pending.len()).saturating_add(self.reserved) >= self.total_cap() {
+            return Err(());
+        }
+        self.reserved += 1;
+        let needed = self.needed_standby();
+        if self.idle.saturating_add(self.spawning) < needed {
+            self.spawning += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Rolls back a `begin_reserve()` call whose standby worker spawn failed.
+    pub fn abort_spawn_failed(&mut self) {
+        self.spawning = self.spawning.saturating_sub(1);
+        self.reserved = self.reserved.saturating_sub(1);
+    }
+
+    /// Called as the first step of a newly spawned standby worker thread before polling for work.
+    pub fn on_worker_started(&mut self) {
+        self.spawning = self.spawning.saturating_sub(1);
+        self.idle += 1;
+    }
+
+    /// Releases a reservation on clean close; returns `true` if a surplus idle worker should be
+    /// woken to exit.
+    pub fn release_reservation(&mut self) -> bool {
+        self.reserved = self.reserved.saturating_sub(1);
+        self.idle > self.needed_standby()
+    }
+
+    /// Consumes a reservation and enqueues a stalled item for an already-spawned standby worker
+    /// (or an active worker finishing its current drop). Never spawns and never fails.
+    pub fn retire_reserved(&mut self, item: T) {
+        self.reserved = self.reserved.saturating_sub(1);
+        self.pending.push_back(item);
+    }
+
+    /// Polls for the next action for a parked `idle` worker under the pool lock.
+    pub fn worker_poll(&mut self) -> StandbyWorkerStep<T> {
+        if self.active < self.max_workers
+            && let Some(item) = self.pending.pop_front()
+        {
+            self.idle = self.idle.saturating_sub(1);
+            self.active += 1;
+            return StandbyWorkerStep::Work(item);
+        }
+        let exit_now = match self.plant {
+            StandbyReaperPlant::None => self.pending.is_empty() && self.idle > self.needed_standby(),
+            StandbyReaperPlant::ExitWhileNeeded => self.pending.is_empty(),
+        };
+        if exit_now {
+            self.idle = self.idle.saturating_sub(1);
+            return StandbyWorkerStep::Exit;
+        }
+        StandbyWorkerStep::Wait
+    }
+
+    /// Transitions a worker from `active` back to `idle` after finishing a retired drop.
+    pub fn worker_finished_drop(&mut self) {
+        self.active = self.active.saturating_sub(1);
+        self.idle += 1;
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use landlock::{
+    HostLdCaps, PreloadScanner, dl_dst_lib_token, dl_dst_platform_token, expand_rpath_tokens,
+    feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match,
+    validate_rpath_entry, x86_64_fhs_hwcap_subdirs,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, LockedIoHandshake, LockedIoPlant, NativeLockErr};
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
 pub use machine::{Effect, Event, HermeticMachine, MachineOpts, State, Stream, Usage};
 pub use plan::{Access, Plan, PlanOpts, Rule as PlanRule, Why};
@@ -110,6 +906,25 @@ pub enum ClockSpec {
     /// nothing; the env must then hold no `SOURCE_DATE_EPOCH`. At [`Level::Execution`] a clock
     /// call is refused and ends the run.
     NeverAsks,
+    /// The caller explicitly supplied a malformed or out-of-range `SOURCE_DATE_EPOCH` at
+    /// [`Level::Inputs`] and wants the child process (e.g., Clang) to see that exact environment
+    /// value and produce its normal diagnostic rather than rejecting the spec pre-launch.
+    /// Accepted ONLY at [`Level::Inputs`] when `SOURCE_DATE_EPOCH` is present and fails `u64`
+    /// parsing.
+    InvalidEnv,
+}
+
+impl ClockSpec {
+    /// Derives the `ClockSpec` for a caller-supplied `SOURCE_DATE_EPOCH` value using the exact
+    /// same parser that [`HermeticSpec::new`] validates (`parse_u64`), so leading-zero (`01`),
+    /// non-numeric, or out-of-range values resolve to [`ClockSpec::InvalidEnv`] and never fail
+    /// pre-launch with [`Fault::ClockNotInEnv`].
+    pub fn from_source_date_epoch(value: &str) -> Self {
+        match parse_u64(value) {
+            Some(unix_secs) => ClockSpec::Fixed { unix_secs },
+            None => ClockSpec::InvalidEnv,
+        }
+    }
 }
 
 /// What the child may use. Every cap is required (there is no default budget).
@@ -183,6 +998,10 @@ pub struct HermeticSpec<'a> {
     streams: HermeticStreams,
     level: Level,
     report: ReportSpec<'a>,
+    #[cfg(target_os = "linux")]
+    arg0: Option<&'a str>,
+    #[cfg(target_os = "linux")]
+    verified_exec: Option<&'a VerifiedExec>,
 }
 
 /// The fields of a [`HermeticSpec`], every one required.
@@ -255,6 +1074,7 @@ impl<'a> HermeticSpec<'a> {
         match (opts.clock, epoch) {
             (ClockSpec::Fixed { unix_secs }, Some(value)) if parse_u64(value) == Some(unix_secs) => {}
             (ClockSpec::NeverAsks, None) => {}
+            (ClockSpec::InvalidEnv, Some(value)) if opts.level == Level::Inputs && parse_u64(value).is_none() => {}
             _ => return refuse(Fault::ClockNotInEnv),
         }
         if opts.level == Level::Inputs && opts.budget.steps.is_some() {
@@ -299,7 +1119,40 @@ impl<'a> HermeticSpec<'a> {
             streams: opts.streams,
             level: opts.level,
             report: opts.report,
+            #[cfg(target_os = "linux")]
+            arg0: None,
+            #[cfg(target_os = "linux")]
+            verified_exec: None,
         })
+    }
+
+    /// Overrides the child's `argv[0]` on Linux (where `Landlock` launches the target directly via
+    /// `execve` / `execveat` without a wrapper binary) while keeping the executed binary bound to
+    /// `program` (or `verified_exec`). Used so driver aliases (`cc`, `c++`, `gcc`) emit diagnostics
+    /// under the requested driver spelling without rewriting captured output streams.
+    #[cfg(target_os = "linux")]
+    pub fn with_arg0(mut self, arg0: &'a str) -> Self {
+        self.arg0 = Some(arg0);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn arg0(&self) -> Option<&'a str> {
+        self.arg0
+    }
+
+    /// Binds this spec to a pre-opened, pre-verified executable snapshot on Linux so Landlock and
+    /// `execveat(..., AT_EMPTY_PATH)` act on that exact descriptor without reopening `program`
+    /// by path. The borrow lifetime `'a` statically guarantees `exec` outlives this spec.
+    #[cfg(target_os = "linux")]
+    pub fn with_verified_exec(mut self, exec: &'a VerifiedExec) -> Self {
+        self.verified_exec = Some(exec);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn verified_exec_fd(&self) -> Option<blaze_sys::Fd> {
+        self.verified_exec.map(VerifiedExec::fd)
     }
 
     pub fn program(&self) -> Program<'a> {

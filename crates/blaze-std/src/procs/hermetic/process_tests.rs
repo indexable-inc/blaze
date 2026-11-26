@@ -400,7 +400,7 @@ blaze_sim::kind_test! {
                 // the fork; it allocates nothing and takes no lock.
                 unsafe {
                     command.pre_exec(move || {
-                        let confine = blaze_sys::linux::confine::ChildConfine { ruleset: blaze_sys::Fd::new(ruleset), filter: &filter, limits: &limits };
+                        let confine = blaze_sys::linux::confine::ChildConfine { ruleset: blaze_sys::Fd::new(ruleset), filter: &filter, limits: &limits, exec_fd: None };
                         blaze_sys::linux::confine::enter(&confine)
                             .map_err(|(_, errno)| std::io::Error::from_raw_os_error(i32::from(errno.raw())))
                     });

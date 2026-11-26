@@ -44,6 +44,8 @@ pub struct Setting<'s> {
     /// The probe checker and its records when the command's setting turns it on
     /// (script_probes.rs); `None`: the table answers the probes.
     pub probes: Option<crate::script_probes::ScriptProbes>,
+    /// The C compiler probe setting (`probe_clang.rs`: `Ready` or deferred `Unavailable`).
+    pub c_probes: Option<crate::probe_clang::CProbeSetting>,
     pub c_mode: CMode,
     /// What the command asked for: with each script's closure, where it runs (D69 (3),
     /// [`crate::native_unit::placed`]).
@@ -448,6 +450,7 @@ pub fn prepare_viewing_on<'a>(
         limits: RunLimits::STANDARD,
         table: Arc::clone(&setting.table),
         probes: setting.probes.as_ref().map(blaze_own::Share::share),
+        c_probes: setting.c_probes.as_ref().map(blaze_own::Share::share),
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::clone(&setting.spawn_setting),

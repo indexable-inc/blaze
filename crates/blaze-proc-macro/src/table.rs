@@ -735,7 +735,13 @@ fn write_whole(store: &DirStore, krate: &ContentId, file: &[u8]) -> Result<(), F
     match store.plant {
         RecordPlant::RenameFirst => store.files.write_in_place(&table_file(krate), file)?,
         RecordPlant::FramedPublish => store.files.publish_framed(&table_file(krate), file)?,
-        RecordPlant::None | RecordPlant::SealSkipped => store.files.publish(&table_file(krate), file)?,
+        RecordPlant::None
+        | RecordPlant::SealSkipped
+        | RecordPlant::BlindOverwrite
+        | RecordPlant::UnserializedRepair
+        | RecordPlant::SingleReadCProbe => {
+            store.files.publish(&table_file(krate), file)?
+        }
     }
     if let Some(boot) = store.files.boot {
         store.files.publish(&whole_file(krate), &voucher(&boot.0, &file[file.len() - SEAL_LEN..]))?;

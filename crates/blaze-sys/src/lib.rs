@@ -56,6 +56,32 @@
     reason = "the one home of system calls: each `unsafe` block states the kernel contract it relies on"
 )]
 
+/// Implementation source bytes of OS process-launch and confinement syscalls, hashed into
+/// content-addressed runner keys (AGENTS.md rule 69).
+pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
+    include_bytes!("lib.rs"),
+    include_bytes!("errno.rs"),
+    include_bytes!("flags.rs"),
+    include_bytes!("types.rs"),
+    include_bytes!("posix.rs"),
+    include_bytes!("linux/mod.rs"),
+    include_bytes!("linux/nr.rs"),
+    include_bytes!("linux/raw.rs"),
+    include_bytes!("linux/confine.rs"),
+    include_bytes!("linux/fdctl.rs"),
+    include_bytes!("linux/landlock.rs"),
+    include_bytes!("linux/mem.rs"),
+    include_bytes!("linux/process.rs"),
+    include_bytes!("linux/task.rs"),
+    include_bytes!("linux/fs.rs"),
+    include_bytes!("linux/uring.rs"),
+    include_bytes!("linux/vfork.rs"),
+    include_bytes!("seatbelt.rs"),
+    include_bytes!("macos.rs"),
+    include_bytes!("macos_kernel.rs"),
+    include_bytes!("macos_proc.rs"),
+];
+
 mod errno;
 #[macro_use]
 mod flags;

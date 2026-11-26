@@ -556,6 +556,7 @@ mod tests {
             limits: RunLimits::STANDARD,
             table: Arc::new(Vec::new()),
             probes: None,
+            c_probes: None,
             spawner: None,
             step: ContentId::default(),
             spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),

@@ -620,6 +620,37 @@ impl<'f> LazySdk<'f> {
     ) -> Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>> {
         self.resolve_raw(cx, blaze_home, wall_ns).0
     }
+
+    fn sdk_digest(&self, cx: &Cx, blaze_home: Option<&Dir<ReadWrite>>, wall_ns: u64) -> Result<[u8; 32], CliError> {
+        match self.resolve_on_demand(cx, blaze_home, wall_ns) {
+            Ok(sdk) => {
+                let mut hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
+                for (i, byte) in sdk.identity().key().iter().enumerate() {
+                    let hi = byte >> 4;
+                    let lo = byte & 15;
+                    if let Some(slot) = hex.get_mut(2 * i) {
+                        *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+                    }
+                    if let Some(slot) = hex.get_mut(2 * i + 1) {
+                        *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+                    }
+                }
+                Ok(blaze_build_script::facts::sdk_id_digest(core::str::from_utf8(&hex).unwrap_or("")))
+            }
+            Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos }) => {
+                Ok(blaze_build_script::facts::sdk_id_digest(""))
+            }
+            Err(refused) => {
+                use core::fmt::Write as _;
+                let mut msg = blaze_own::String::new_in(blaze_own::SharedAlloc::global());
+                let _ = write!(
+                    msg,
+                    "cannot resolve active SDK identity while following a saved c-probe read: {refused}"
+                );
+                Err(CliError::Sdk(msg))
+            }
+        }
+    }
 }
 
 /// The command's edge, read once (rule 75): what `check`, `why`, `run` and `test` each take of
@@ -3485,9 +3516,13 @@ fn checking<'f, 's: 'f>(
             crate::engine_ready_edit::StoredBase::OtherCheckout => None,
             crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved => journal.marked(&pointer.leaves, frame),
         };
+        let sdk_digest_fn = || match lazy_sdk {
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
+        };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), frame)?;
+        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
@@ -3615,9 +3650,13 @@ fn checking<'f, 's: 'f>(
             strategy.changed_since(cx, fs, root, opened.home.dir(), phases.clock(), whole_chosen.places(), frame)?
         };
         let whole_marked = whole_journal.marked(&whole_ptr.leaves, frame);
+        let sdk_digest_fn = || match lazy_sdk {
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
+        };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (whole_followed, whole_statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &whole_ptr.leaves, whole_marked.as_deref(), None, frame)?;
+        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         let whole_moved = whole_followed.layout_moved
             || whole_followed.now.rows.iter().zip(whole_followed.was.iter()).any(|(now, was)| now.state() != *was);
@@ -3717,9 +3756,13 @@ fn checking<'f, 's: 'f>(
                         unreadable = Some(why);
                     }
                     if let Some(new_ptr) = &pointer {
+                        let sdk_digest_fn = || match lazy_sdk {
+                            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+                            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
+                        };
                         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
                         let follow_began = phases.clock().now();
-                        let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &new_ptr.leaves, None, script_sweep.as_mut(), frame)?;
+                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
                         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
                         sweep_counts = journal.counts(statted, u32::try_from(new_ptr.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&new_ptr.leaves, frame)).with_looks(followed.looks, follow_ns);
                         followed_kept = Some(followed);
