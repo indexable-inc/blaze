@@ -84,6 +84,8 @@ pub enum Effect {
     /// A kitty graphics load waits on host IO: [`Terminal::kitty_pending`] says what,
     /// [`Terminal::kitty_answer`] gives it.
     KittyIo,
+    /// OSC 7770: Blaze Terminal API payload (custom symbols, font slices, entity bindings).
+    BlazeTermApi(Span),
 }
 
 /// The effects taken ([`Terminal::take_effects`]): the list and the bytes its spans name.

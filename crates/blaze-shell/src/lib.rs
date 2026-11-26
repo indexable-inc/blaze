@@ -22,6 +22,7 @@ pub mod rust_cell;
 pub mod svg_icons;
 pub mod sysmon_driver;
 pub mod sysmon_view;
+pub mod term_server;
 pub mod theme;
 pub mod tiling;
 pub mod ui_widgets;
