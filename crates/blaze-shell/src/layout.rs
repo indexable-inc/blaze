@@ -1652,11 +1652,12 @@ fn git_status_style(st: GitFileStatus, is_dir: bool) -> (f32, [f32; 4], Option<(
             Some(("+", theme::rgb(0x57, 0xc7, 0x85))),
             false,
         ),
-        // Untracked (not in git yet): visibly faded warm-rust (IntelliJ VCS untracked) + subtle `?`.
+        // Untracked (not in git yet): visibly faded warm-rust (IntelliJ VCS untracked),
+        // NO `?` glued right after `/` so folders like `.blaze/` stay crisp and clean.
         GitFileStatus::Untracked => (
-            0.68,
+            0.76,
             theme::rgb(0xc8, 0x89, 0x76),
-            Some(("?", theme::rgb(0xc8, 0x89, 0x76))),
+            None,
             false,
         ),
         GitFileStatus::Deleted => (
@@ -1745,6 +1746,11 @@ fn layout_file_grid(
         item.git = git_statuses.as_ref().and_then(|v| v.get(idx).copied());
         let label_chars = item.label.chars().count().min(32);
         item.w_px = icon_s + icon_gap + label_chars as f32 * m.cw + badge_pad;
+    }
+    // In default `ls` grids inside a git repo, place active non-ignored entries first and group
+    // `.gitignore`d build artifacts (`target/`, `node_modules/`, etc.) cleanly at the end.
+    if git_statuses.is_some() && !block.source.contains("sort-by") {
+        items.sort_by_key(|it| it.git == Some(GitFileStatus::Ignored));
     }
 
     // Pick the largest column count `ncols` (1..=6) whose column-major widths fit in `width`
@@ -2184,6 +2190,35 @@ fn layout_table(
         None
     };
 
+    // Pre-compute non-blocking progressive folder sizes via `#![no_std]` `blaze-dust` for any
+    // visible directory rows in `ll` / `ls -l` file tables!
+    let size_col_idx = col_displays.iter().position(|&d| d == ColDisplay::FileSize);
+    let mut row_dust: Vec<Option<blaze_dust::DustProgress>> = vec![None; visible_rows];
+    let mut dust_max_bytes: u64 = 0;
+    if size_col_idx.is_some()
+        && let Some(fc) = file_entry_col
+    {
+        for vis_i in 0..visible_rows {
+            let r = row_order[first_row + vis_i];
+            let fk = type_col_idx.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str);
+            let raw = table
+                .cell(r, fc)
+                .map(|c| format_value_cell_at(c, Some(now_ns)))
+                .unwrap_or_default();
+            let is_dir = fk.is_some_and(blaze_sniff::is_dir_label) || raw.ends_with('/');
+            if is_dir && !raw.is_empty() {
+                let full_p = full_path_for_entry(&block.prompt_snapshot.cwd, &block.source, &raw);
+                if let Some(prog) = crate::dust_driver::request_dir_size(std::path::Path::new(&full_p))
+                {
+                    if prog.bytes > dust_max_bytes {
+                        dust_max_bytes = prog.bytes;
+                    }
+                    row_dust[vis_i] = Some(prog);
+                }
+            }
+        }
+    }
+
     if visible_rows == 0 {
         scene.text(x0, cur_y + TABLE_ROW_PAD_Y, "0 rows", theme::INK_4, false, true, clip_id);
         cur_y += row_h;
@@ -2244,7 +2279,11 @@ fn layout_table(
                                     raw_name.clone()
                                 };
                                 let row_git = table_git_statuses.as_ref().and_then(|v| v.get(r).copied());
-                                let git_pad = if row_git.is_some() { m.cw * 1.45 } else { 0.0 };
+                                let (icon_alpha, name_col, badge, tracked_dot) = match row_git {
+                                    Some(st) => git_status_style(st, is_dir),
+                                    None => (1.0, theme::INK_1, None, false),
+                                };
+                                let git_pad = if badge.is_some() { m.cw * 1.8 } else { 0.0 };
                                 let max_ch = ((content_w - icon_pad - 8.0 - git_pad) / m.cw).floor().max(4.0) as usize;
                                 // Middle-truncate nested paths (`crates/…/layout.rs`) so filenames stay visible!
                                 let txt = if display_name.contains('/') {
@@ -2253,16 +2292,10 @@ fn layout_table(
                                     truncate_chars(&display_name, max_ch)
                                 };
                                 let txt_w = txt.chars().count() as f32 * m.cw;
-                                let chip_w = (icon_pad + txt_w + git_pad + 10.0)
-                                    .min(content_w + 2.0);
+                                let chip_w = (icon_pad + txt_w + 10.0).min(content_w + 2.0);
                                 let bx0 = rx - 5.0;
                                 let by0 = cur_y + 2.0;
                                 let by1 = cur_y + row_h - 2.0;
-
-                                let (icon_alpha, name_col, badge, tracked_dot) = match row_git {
-                                    Some(st) => git_status_style(st, is_dir),
-                                    None => (1.0, theme::INK_1, None, false),
-                                };
 
                                 // Sleek `ix.dev/blaze` inline chip for folders and `.rs` files.
                                 if (is_dir || icon_name == "rust_dark")
@@ -2273,7 +2306,7 @@ fn layout_table(
                                 scene.svg_icon_alpha(rx, iy, icon_s, icon_name, icon_alpha, clip_id);
                                 scene.text(rx + icon_pad, ty, txt, name_col, false, false, clip_id);
                                 if let Some((tag, tag_col)) = badge {
-                                    let gx = rx + icon_pad + txt_w + (m.cw * 0.45).max(3.5);
+                                    let gx = (bx0 + chip_w + 6.0).min(rx + content_w - m.cw);
                                     scene.ui_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
                                 } else if tracked_dot {
                                     let gx = rx + icon_pad + txt_w + (m.cw * 0.55).max(4.5);
@@ -2416,16 +2449,78 @@ fn layout_table(
                             }
                             ColDisplay::FileSize => {
                                 let row_is_dir = row_file_kind.is_some_and(blaze_sniff::is_dir_label);
-                                let bar_on = col_max_num[c] > 0.0;
+                                let effective_max = col_max_num[c].max(dust_max_bytes as f64);
+                                let bar_on = effective_max > 0.0;
                                 let text_area_w = if bar_on {
                                     (content_w - SIZE_BAR_W - 10.0).max(m.cw * 3.0)
                                 } else {
                                     content_w
                                 };
                                 if row_is_dir {
-                                    // Folders don't have meaningful byte sizes or bars (quiet `—`).
-                                    let tx = rx + text_area_w - m.cw;
-                                    scene.text(tx, ty, "—", theme::INK_4, false, false, clip_id);
+                                    if let Some(prog) = row_dust.get(vis_i).copied().flatten() {
+                                        if !prog.done && prog.bytes == 0 {
+                                            let tx = rx + text_area_w - m.cw;
+                                            scene.text(tx, ty, "…", theme::INK_4, false, false, clip_id);
+                                        } else {
+                                            let base = crate::dust_driver::format_bytes_compact(prog.bytes);
+                                            let raw = if !prog.done {
+                                                format!("~{base}")
+                                            } else if prog.capped {
+                                                format!("{base}+")
+                                            } else {
+                                                base
+                                            };
+                                            let max_ch = (text_area_w / m.cw).floor().max(2.0) as usize;
+                                            let txt = truncate_chars(&raw, max_ch);
+                                            let tx = rx + text_area_w - txt.chars().count() as f32 * m.cw;
+                                            let txt_col = if prog.done { theme::INK_2 } else { theme::INK_3 };
+                                            scene.text(tx, ty, txt, txt_col, false, false, clip_id);
+
+                                            if bar_on && prog.bytes > 0 {
+                                                let frac = blaze_dust::bar_fraction(
+                                                    prog.bytes,
+                                                    effective_max.round().max(1.0) as u64,
+                                                );
+                                                if frac >= 0.012 {
+                                                    let bx0 = rx + text_area_w + 10.0;
+                                                    let by0 = ty + m.ch * 0.5 - 2.0;
+                                                    let by1 = by0 + 4.0;
+                                                    scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
+                                                    let fill_w = (SIZE_BAR_W * frac).max(3.0);
+                                                    let fill_col = if !prog.done {
+                                                        theme::rgba(0xe5, 0xb5, 0x67, 0.55)
+                                                    } else if frac >= 0.85 {
+                                                        theme::rgb(0xe5, 0xb5, 0x67)
+                                                    } else {
+                                                        theme::rgb(0x58, 0x9d, 0xf6)
+                                                    };
+                                                    scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
+                                                }
+                                            }
+                                            scene.push_hover_clipped(
+                                                HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h),
+                                                clip_id,
+                                                HoverKind::Tooltip {
+                                                    title: format!(
+                                                        "{} {}",
+                                                        crate::dust_driver::format_bytes_compact(prog.bytes),
+                                                        if prog.done {
+                                                            if prog.capped { "(partial · limit reached)" } else { "on disk" }
+                                                        } else {
+                                                            "(scanning…)"
+                                                        }
+                                                    ),
+                                                    subtitle: Some(format!(
+                                                        "{} files · {} subdirs",
+                                                        prog.files, prog.dirs
+                                                    )),
+                                                },
+                                            );
+                                        }
+                                    } else {
+                                        let tx = rx + text_area_w - m.cw;
+                                        scene.text(tx, ty, "—", theme::INK_4, false, false, clip_id);
+                                    }
                                 } else {
                                     let raw = format_value_cell_at(cell, Some(now_ns));
                                     let max_ch = (text_area_w / m.cw).floor().max(2.0) as usize;
@@ -2434,7 +2529,7 @@ fn layout_table(
                                     scene.text(tx, ty, txt, theme::INK_2, false, false, clip_id);
 
                                     if bar_on && let Value::Size(Bytes(b)) = cell {
-                                        let frac = ((*b).max(0) as f64 / col_max_num[c]).clamp(0.0, 1.0) as f32;
+                                        let frac = ((*b).max(0) as f64 / effective_max).clamp(0.0, 1.0) as f32;
                                         if frac >= 0.015 {
                                             let bx0 = rx + text_area_w + 10.0;
                                             let by0 = ty + m.ch * 0.5 - 2.0;
