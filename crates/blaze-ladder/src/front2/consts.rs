@@ -570,7 +570,8 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
     /// returns `BuildError::OpaqueOwnerUnchecked` so `Consts::value_key` checks it and retries.
     fn opaque_hidden(&self, opaque: ItemKey, args: &[tc::PTy], ground: &mut PortableTys<'_>) -> Result<tc::PTy, blaze_build::BuildError> {
         let refused = |what| blaze_build::BuildError::UnsupportedSig { what };
-        let Some(&(owner, index)) = self.store.opaques.get(&opaque) else {
+        let filed = super::rpitit::filed_as(self.store, opaque);
+        let Some(&(owner, index)) = self.store.opaques.get(&filed) else {
             return Err(refused("an `impl Trait` type no head of the store made (`store.opaques`)"));
         };
         let definer = if super::tait::of_alias(index) {
@@ -581,7 +582,7 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
             let definer_lib = super::tait::defining_fn(self.definers, self.names, alias_lib).map_err(|miss| refused(miss.form()))?;
             super::keys::checker_of(definer_lib)
         } else {
-            if self.trait_fn(owner).is_some() {
+            if filed == opaque && self.trait_fn(owner).is_some() {
                 return Err(refused("a trait fn's `impl Trait` type in constant evaluation"));
             }
             owner
@@ -592,7 +593,7 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
         if self.store.maps.const_proofs.is_some() {
             self.store.maps.read_inputs(body.inputs.as_ref());
         }
-        let Some(&(_, hidden)) = body.checked.hidden.iter().find(|h| h.0 == opaque) else {
+        let Some(&(_, hidden)) = body.checked.hidden.iter().find(|h| h.0 == filed) else {
             return Err(refused("an `impl Trait` type its defining body gave no hidden type (a body that never returns)"));
         };
         let from = body.checked.types.view();

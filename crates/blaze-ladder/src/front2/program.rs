@@ -2043,9 +2043,15 @@ impl FrontEnd for Front2Program<'_> {
         super::coroutine_recipes::find(&self.recipes, owner, ordinal)
     }
 
-    /// From the head store's `opaques` ([`super::heads::Store::opaques`]).
+    /// From the head store's `opaques` ([`super::heads::Store::opaques`]), resolving RPITIT
+    /// default twins (`rpitit::filed_as`).
     fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> {
-        self.store.opaques.get(&opaque).copied()
+        let filed = super::rpitit::filed_as(&self.store, opaque);
+        self.store.opaques.get(&filed).copied()
+    }
+
+    fn opaque_filed(&self, opaque: ItemKey) -> ItemKey {
+        super::rpitit::filed_as(&self.store, opaque)
     }
 
     /// [`super::tait::defining_fn`] of the alias's library key.

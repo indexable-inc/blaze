@@ -27,7 +27,7 @@
 //! asks that was not laid is refused by name ("a coroutine state not laid before the build"),
 //! never built late.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_flags, may_partial_move_bindings, may_partial_move_temps};
 use blaze_build::layout::{LayoutCx, Layouts};
@@ -35,6 +35,7 @@ use blaze_build::{CoroutineOf, coroutines_in};
 use blaze_own::AVec;
 use blaze_typeck::BodyView;
 
+use super::make_one::{CachedFront, QueryCache};
 use super::*;
 use crate::code_records::reads::{ReadLog, ReadPlant, Recorded, laid_answer};
 use crate::front2::coroutine_needs::{HOLDS_ITSELF, OrderError, held_coroutines, layout_order, referenced_coroutines};
@@ -201,6 +202,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
+    query_cache: &RefCell<QueryCache>,
     ground: &mut PortableTys<'_>,
     layouts: &mut Layouts<L>,
     stash: &mut Vec<BuiltParts, Global>,
@@ -209,7 +211,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     pull_plain: bool,
     alloc: Alloc<'static>,
 ) -> Result<Lay, RunError> {
-    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, true, alloc)? {
+    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, query_cache, ground, layouts, asking, roots, true, alloc)? {
         Ordered::Laid { all, laid } => (all, laid),
         Ordered::Unchecked(owner) => return Ok(Lay::Unchecked(owner)),
     };
@@ -257,7 +259,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                 continue;
             }
             let view = body.view(program.body_types(ci));
-            let adts = FrontAdts(program, ci, consts, langs, bodies);
+            let adts = CachedFront { front: FrontAdts(program, ci, consts, langs, bodies), cache: query_cache };
             let args = match args_of(ground, c, alloc) {
                 Ok(a) => a,
                 Err(error) => {
@@ -284,7 +286,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     // forgets every state recorded above and not built into `stash`: one left recorded would be
     // skipped as made by the next lay, its functions never built.
     let before = stash.len();
-    let out = build_laid(program, consts, langs, bodies, ground, stash, &all, &laid_all, &owner_of, &unchecked, alloc);
+    let out = build_laid(program, consts, langs, bodies, query_cache, ground, stash, &all, &laid_all, &owner_of, &unchecked, alloc);
     if !matches!(out, Ok(Lay::Done)) {
         forget_laid(bodies, &all[stash.len() - before..], ground.view());
     }
@@ -301,6 +303,7 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
+    query_cache: &RefCell<QueryCache>,
     ground: &mut PortableTys<'_>,
     layouts: &mut Layouts<L>,
     stash: &mut Vec<BuiltParts, Global>,
@@ -309,7 +312,7 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     pull_plain: bool,
     alloc: Alloc<'static>,
 ) -> Result<Lay, RunError> {
-    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, &[of], false, alloc)? {
+    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, query_cache, ground, layouts, asking, &[of], false, alloc)? {
         Ordered::Laid { all, laid } => (all, laid),
         Ordered::Unchecked(owner) => return Ok(Lay::Unchecked(owner)),
     };
@@ -333,7 +336,7 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     // Lay `StateShape`s (types only) of any coroutines `of`'s own body creates or references
     // without holding them in `of`'s state (e.g. a future dropped before `.await` or boxed).
     let uses = {
-        let adts = FrontAdts(program, ci, consts, langs, bodies);
+        let adts = CachedFront { front: FrontAdts(program, ci, consts, langs, bodies), cache: query_cache };
         let args = match args_of(ground, of, alloc) {
             Ok(a) => a,
             Err(error) => {
@@ -350,7 +353,7 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         }
     };
     if !uses.is_empty() {
-        match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, &uses, false, alloc) {
+        match order_and_lay(program, consts, langs, bodies, query_cache, ground, layouts, asking, &uses, false, alloc) {
             Ok(Ordered::Laid { .. }) => {}
             Ok(Ordered::Unchecked(owner)) => {
                 forget_laid(bodies, &[of], ground.view());
@@ -376,7 +379,7 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                 || has_plain;
             if has_any {
                 let view = body.view(program.body_types(ci));
-                let adts = FrontAdts(program, ci, consts, langs, bodies);
+                let adts = CachedFront { front: FrontAdts(program, ci, consts, langs, bodies), cache: query_cache };
                 let args = match args_of(ground, of, alloc) {
                     Ok(a) => a,
                     Err(error) => {
@@ -400,7 +403,7 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
             }
         }
     }
-    let out = build_laid(program, consts, langs, bodies, ground, stash, &[of], of_laid, &owner_of, &unchecked, alloc);
+    let out = build_laid(program, consts, langs, bodies, query_cache, ground, stash, &[of], of_laid, &owner_of, &unchecked, alloc);
     if !matches!(out, Ok(Lay::Done)) {
         forget_laid(bodies, &[of], ground.view());
     }
@@ -428,13 +431,14 @@ pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
+    query_cache: &RefCell<QueryCache>,
     ground: &mut PortableTys<'_>,
     layouts: &mut Layouts<L>,
     asking: usize,
     roots: &[CoroutineOf],
     alloc: Alloc<'static>,
 ) -> Result<Relaid, RunError> {
-    let recorded = match order_and_lay(program, &[], langs, bodies, ground, layouts, asking, roots, false, alloc)? {
+    let recorded = match order_and_lay(program, &[], langs, bodies, query_cache, ground, layouts, asking, roots, false, alloc)? {
         Ordered::Laid { all, .. } => all,
         Ordered::Unchecked(owner) => return Ok(Relaid::Unchecked(owner)),
     };
@@ -442,7 +446,7 @@ pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     for &c in roots {
         let digest = match program.fn_index(c.owner) {
             Some(ci) if bodies.checked.get(ci).and_then(Option::as_ref).is_some() => {
-                let adts = FrontAdts(program, ci, &[], langs, bodies);
+                let adts = CachedFront { front: FrontAdts(program, ci, &[], langs, bodies), cache: query_cache };
                 lay_one(program, bodies, &adts, ci, c, &mut *ground, layouts, alloc).map(|(state, names)| laid_answer(&state, &names[..]))
             }
             _ => Err(not_answered()),
@@ -477,13 +481,14 @@ pub(super) fn lay_only<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
+    query_cache: &RefCell<QueryCache>,
     ground: &mut PortableTys<'_>,
     layouts: &mut Layouts<L>,
     asking: usize,
     roots: &[CoroutineOf],
     alloc: Alloc<'static>,
 ) -> Result<LaidOnly, RunError> {
-    match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, false, alloc)? {
+    match order_and_lay(program, consts, langs, bodies, query_cache, ground, layouts, asking, roots, false, alloc)? {
         Ordered::Laid { all, .. } => Ok(LaidOnly::Done(all)),
         Ordered::Unchecked(owner) => Ok(LaidOnly::Unchecked(owner)),
     }
@@ -518,6 +523,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
+    query_cache: &RefCell<QueryCache>,
     ground: &mut PortableTys<'_>,
     layouts: &mut Layouts<L>,
     asking: usize,
@@ -558,7 +564,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                     return Ok(None);
                 }
                 let Some(ci) = owner_of(c) else { return Err(not_answered()) };
-                let adts = FrontAdts(program, ci, consts, langs, bodies);
+                let adts = CachedFront { front: FrontAdts(program, ci, consts, langs, bodies), cache: query_cache };
                 let types = held_types(program, bodies, &adts, ci, c, &mut *ground, alloc)?;
                 held_coroutines(&mut *ground, &types, adts.facts(), alloc).map(Some)
             };
@@ -590,7 +596,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                 let Some(ci) = owner_of(c) else {
                     return Ok(Ordered::Unchecked(unchecked.get().unwrap_or(c.owner)));
                 };
-                let adts = FrontAdts(program, ci, consts, langs, bodies);
+                let adts = CachedFront { front: FrontAdts(program, ci, consts, langs, bodies), cache: query_cache };
                 let args = args_of(ground, c, alloc).map_err(|error| build_error(program, program.function(ci).named(), error, None))?;
                 let uses = roots_of_instance(program, bodies, &adts, ci, &args, None, true, &mut *ground, alloc)?;
                 for &u in uses.iter() {
@@ -614,7 +620,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         };
         let function = program.function(ci);
         let at_owner = |error| build_error(program, function.named(), error, None);
-        let adts = FrontAdts(program, ci, consts, langs, bodies);
+        let adts = CachedFront { front: FrontAdts(program, ci, consts, langs, bodies), cache: query_cache };
         let laid = match lay_one(program, bodies, &adts, ci, c, &mut *ground, layouts, alloc).and_then(|laid| Ok((args_of(ground, c, alloc)?, laid))) {
             Ok((args, laid)) => {
                 states.record(c.owner, c.ordinal, &args, laid.0.shape);
@@ -638,6 +644,7 @@ fn build_laid<P: FrontEnd>(
     consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
+    query_cache: &RefCell<QueryCache>,
     ground: &mut PortableTys<'_>,
     stash: &mut Vec<BuiltParts, Global>,
     all: &[CoroutineOf],
@@ -652,7 +659,7 @@ fn build_laid<P: FrontEnd>(
         };
         let function = program.function(ci);
         let at_owner = |error| build_error(program, function.named(), error, None);
-        let adts = FrontAdts(program, ci, consts, langs, bodies);
+        let adts = CachedFront { front: FrontAdts(program, ci, consts, langs, bodies), cache: query_cache };
         let args =args_of(ground, c, alloc).map_err(at_owner)?;
         let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(ci).and_then(Option::as_ref)) else {
             return Err(refuse(function.named(), "an async block whose owner fn has no checked body"));
@@ -690,7 +697,7 @@ fn build_laid<P: FrontEnd>(
 fn held_types<P: FrontEnd>(
     program: &P,
     bodies: &Bodies<'_>,
-    adts: &FrontAdts<'_, P>,
+    adts: &dyn Adts,
     ci: usize,
     c: CoroutineOf,
     ground: &mut PortableTys<'_>,
@@ -725,7 +732,7 @@ fn held_types<P: FrontEnd>(
 fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     bodies: &Bodies<'_>,
-    adts: &FrontAdts<'_, P>,
+    adts: &dyn Adts,
     ci: usize,
     c: CoroutineOf,
     ground: &mut PortableTys<'_>,

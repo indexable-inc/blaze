@@ -389,9 +389,15 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
     scratch: Alloc<'_>,
 ) -> Result<PTy, BuildError> {
     let refused = |what| BuildError::UnsupportedSig { what };
-    let Some((owner, index)) = program.opaque_of(opaque) else {
-        return Err(refused("an `impl Trait` type no fn head of the program made (the seam's `opaque_of`)"));
+    let filed = program.opaque_filed(opaque);
+    let Some((owner, index)) = program.opaque_of(filed) else {
+        return Err(BuildError::OpaqueOwnerUnchecked { opaque, owner: opaque });
     };
+    // An RPITIT default-body twin (`rpitit::default_key`) always resolves to the trait fn's own
+    // default body's hidden type for `filed` (never re-dispatched through `resolve`).
+    if filed != opaque {
+        return defined_hidden(program, checked, facts, filed, owner, args, ground, scratch);
+    }
     // A type alias's `impl Trait` (its owner row is the alias: tait.rs `of_alias`) has its
     // hidden type in the check record of the fn that defines it, `#[define_opaque(Alias)]`
     // (tait.rs `defining_fn`), never the alias's own (an alias has no body). Before (tempo

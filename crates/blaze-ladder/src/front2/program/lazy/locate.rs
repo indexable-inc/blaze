@@ -359,7 +359,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// container's head files them (heads.rs: a fn, const or type by its name), and each tuple
     /// or unit struct's constructor (`MemberKind::Ctor`, named ""). Uses `MemberWant::NameOnly`
     /// so zero source files are opened or outlined. Returns how many containers were read.
-    fn member_index(&mut self, krate: usize) -> Result<u32, LazyRefusal> {
+    pub(super) fn member_index(&mut self, krate: usize) -> Result<u32, LazyRefusal> {
         if let Some(ix) = self.member_rows.get(&krate) {
             return Ok(ix.containers);
         }
