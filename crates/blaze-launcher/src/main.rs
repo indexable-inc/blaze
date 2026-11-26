@@ -98,47 +98,111 @@ fn hex_path(hex: &str) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(dst)))
 }
 
-/// The sidecar beside `exe`, `<exe>.blaze-program`: one `name=value` a line.
+/// Capacity of the in-binary stub configuration slot patched by `blaze test` when creating
+/// self-describing `CARGO_BIN_EXE_*` launcher stubs (16 KiB, 4 KiB-aligned so macOS Mach-O
+/// ad-hoc page re-hashing touches at most 4 code pages).
+const STUB_SLOT_SIZE: usize = 16 * 1024;
+const STUB_SLOT_HEADER: usize = 36; // 16-byte magic + 16-byte state tag + 4-byte LE length
+const STUB_SLOT_MAGIC: &[u8; 16] = b"BLAZE_STUB_SLOT1";
+const STUB_SLOT_PATCHED: &[u8; 16] = b"PATCHED_STUB_001";
+
+#[repr(C)]
+struct StubSlotBytes {
+    header: [u8; 32],
+    rest: [u8; STUB_SLOT_SIZE - 32],
+}
+
+#[repr(C, align(4096))]
+pub struct EmbeddedStubSlot(core::cell::UnsafeCell<StubSlotBytes>);
+
+// SAFETY: `EMBEDDED_STUB_SLOT` is patched offline in the stub executable before process start
+// and is only ever read at startup (never mutated at runtime).
+unsafe impl Sync for EmbeddedStubSlot {}
+
+#[unsafe(no_mangle)]
+#[used]
+pub static EMBEDDED_STUB_SLOT: EmbeddedStubSlot = EmbeddedStubSlot(core::cell::UnsafeCell::new(StubSlotBytes {
+    // Magic (16 bytes) + unpatched tag (16 bytes). `blaze test` locates this exact 36-byte header
+    // (including the trailing 0u32 length) once in `blaze-launcher`, replaces the tag with
+    // `STUB_SLOT_PATCHED`, and writes the length + UTF-8 config payload so stubs stay runnable
+    // even if copied to another path without an adjacent `.blaze-program` file.
+    header: *b"BLAZE_STUB_SLOT1UNPATCHED_CFG_01",
+    rest: [0u8; STUB_SLOT_SIZE - 32],
+}));
+
+/// Reads the stub's embedded configuration slot when patched by `blaze test`, otherwise reads the
+/// adjacent `<exe>.blaze-program` sidecar (`name=value` per line).
 fn sidecar(exe: &Path) -> Result<Sidecar, String> {
-    let mut path = exe.as_os_str().to_owned();
-    path.push(".blaze-program");
-    let path = PathBuf::from(path);
-    let text = std::fs::read_to_string(&path).map_err(|why| {
-        format!(
-            "{} is a clone of blaze's launcher and its sidecar {} does not read: {why}. Run it with \
-             `blaze run`",
-            exe.display(),
-            path.display()
-        )
-    })?;
+    // Pass the slot pointer through `black_box` so LLVM cannot constant-fold the initial bytes
+    // even under LTO.
+    let ptr: *const StubSlotBytes = core::hint::black_box(EMBEDDED_STUB_SLOT.0.get().cast_const());
+    // SAFETY: `EMBEDDED_STUB_SLOT` is a `'static`, 4096-byte aligned `StubSlotBytes` of
+    // `STUB_SLOT_SIZE` bytes, never mutated at runtime.
+    let slot: &[u8] = unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), STUB_SLOT_SIZE) };
+    let (label, owned_text);
+    let text: &str = if slot.get(..16) == Some(STUB_SLOT_MAGIC.as_slice())
+        && slot.get(16..32) == Some(STUB_SLOT_PATCHED.as_slice())
+    {
+        let Some(&[b0, b1, b2, b3]) = slot.get(32..36) else {
+            return Err(format!("{} has a truncated embedded stub header", exe.display()));
+        };
+        let Ok(len) = usize::try_from(u32::from_le_bytes([b0, b1, b2, b3])) else {
+            return Err(format!("{} has an out-of-range embedded stub length", exe.display()));
+        };
+        let end = match STUB_SLOT_HEADER.checked_add(len) {
+            Some(end) if end <= STUB_SLOT_SIZE => end,
+            _ => return Err(format!("{} has an invalid embedded stub length ({len})", exe.display())),
+        };
+        let Some(payload) = slot.get(STUB_SLOT_HEADER..end) else {
+            return Err(format!("{} has an unreadable embedded stub payload", exe.display()));
+        };
+        label = exe.display().to_string();
+        core::str::from_utf8(payload)
+            .map_err(|why| format!("{} has non-UTF-8 embedded stub config: {why}", exe.display()))?
+    } else {
+        let mut path = exe.as_os_str().to_owned();
+        path.push(".blaze-program");
+        let path = PathBuf::from(path);
+        owned_text = std::fs::read_to_string(&path).map_err(|why| {
+            format!(
+                "{} is a clone of blaze's launcher and its sidecar {} does not read: {why}. Run it with \
+                 `blaze run`",
+                exe.display(),
+                path.display()
+            )
+        })?;
+        label = path.display().to_string();
+        &owned_text
+    };
+
     let line = |name: &str| text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix('='));
     let field = |name: &str| {
-        line(name).ok_or_else(|| format!("the sidecar {} has no `{name}`: run the program with `blaze run`", path.display()))
+        line(name).ok_or_else(|| format!("the sidecar {label} has no `{name}`: run the program with `blaze run`"))
     };
     let socket = PathBuf::from(field("socket")?);
     if line("mode") == Some("run") {
         let bin_raw = field("bin")?;
         let bin = bin_raw.parse::<u32>().map_err(|_| {
-            format!("the sidecar {} names bin `{bin_raw}`, which is no u32", path.display())
+            format!("the sidecar {label} names bin `{bin_raw}`, which is no u32")
         })?;
         let owner = match line("owner") {
             None => (u32::MAX, u32::MAX),
             Some(raw) => {
                 let (s, r) = raw.split_once(':').ok_or_else(|| {
-                    format!("the sidecar {} names owner `{raw}`, expected `<suite>:<row>`", path.display())
+                    format!("the sidecar {label} names owner `{raw}`, expected `<suite>:<row>`")
                 })?;
                 let suite = s.parse::<u32>().map_err(|_| {
-                    format!("the sidecar {} names owner suite `{s}`, which is no u32", path.display())
+                    format!("the sidecar {label} names owner suite `{s}`, which is no u32")
                 })?;
                 let row = r.parse::<u32>().map_err(|_| {
-                    format!("the sidecar {} names owner row `{r}`, which is no u32", path.display())
+                    format!("the sidecar {label} names owner row `{r}`, which is no u32")
                 })?;
                 (suite, row)
             }
         };
         let store = match line("store_hex") {
             Some(hex) => hex_path(hex).ok_or_else(|| {
-                format!("the sidecar {} has malformed `store_hex`", path.display())
+                format!("the sidecar {label} has malformed `store_hex`")
             })?,
             None => PathBuf::from(field("store")?),
         };
@@ -149,8 +213,7 @@ fn sidecar(exe: &Path) -> Result<Sidecar, String> {
     let hex = field("program")?;
     let Some(id) = hex32(hex) else {
         return Err(format!(
-            "the sidecar {} names program `{hex}`, which is no 64 hex digits: run the program with `blaze run`",
-            path.display()
+            "the sidecar {label} names program `{hex}`, which is no 64 hex digits: run the program with `blaze run`"
         ));
     };
     Ok(Sidecar::Daemon { socket, program: ProgramId(id) })

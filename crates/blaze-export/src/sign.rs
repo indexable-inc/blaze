@@ -30,6 +30,11 @@ pub const BLOB_HEADER: usize = 12 + 8;
 /// `CS_CodeDirectory`'s fields through `execSegFlags`.
 pub const DIRECTORY_HEADER: usize = 88;
 
+/// SHA-256 digest of a single code page for a `CS_CodeDirectory` slot.
+pub fn page_digest(page: &[u8]) -> [u8; HASH] {
+    blaze_sha256::digest(page)
+}
+
 /// How long the signature of a file of `code_limit` bytes before it is, 16-aligned.
 pub fn len(identifier: &str, code_limit: u64) -> u64 {
     let pages = (code_limit as usize).div_ceil(PAGE);

@@ -204,6 +204,7 @@ fn parse_entries(raw: &[u8], alloc: Alloc<'static>) -> Result<AVec<'static, Entr
 
 /// Lock-free RAII lease of one pre-allocated scratch slot (strictly POSIX async-signal-safe:
 /// uses only `AtomicBool::compare_exchange` / `store`, zero syscalls, zero allocator calls).
+/// Used exclusively by async-signal-safe `exec*` wrappers (`execv*`, `execl*`).
 struct SlotGuard<'a> {
     slot: Option<&'a ScratchSlot>,
 }
@@ -240,6 +241,56 @@ impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
         if let Some(slot) = self.slot {
             slot.in_use.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Heap-backed RAII scratch buffer (`libc::malloc`/`libc::free`) used by non-async-signal-safe
+/// wrappers (`system`, `popen`, `posix_spawn`, `posix_spawnp`) so arbitrary numbers of concurrent
+/// guest threads can block inside `system()`/`popen()` or invoke `posix_spawn*()` without any
+/// fixed process-wide concurrency cap and without starving `exec*` scratch slots.
+struct MallocBuf {
+    ptr: *mut u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemapErr {
+    TooBig,
+    NoMem,
+}
+
+impl RemapErr {
+    fn errno(self) -> c_int {
+        match self {
+            RemapErr::TooBig => libc::E2BIG,
+            RemapErr::NoMem => libc::ENOMEM,
+        }
+    }
+}
+
+impl MallocBuf {
+    const EMPTY: MallocBuf = MallocBuf { ptr: ptr::null_mut() };
+
+    fn alloc(bytes: usize) -> Result<MallocBuf, RemapErr> {
+        let size = bytes.max(1);
+        // SAFETY: `size > 0`; caller frees via `Drop`.
+        let ptr = unsafe { libc::malloc(size).cast::<u8>() };
+        if ptr.is_null() {
+            return Err(RemapErr::NoMem);
+        }
+        Ok(MallocBuf { ptr })
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for MallocBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: `self.ptr` came from `libc::malloc` and is freed once here.
+            unsafe { libc::free(self.ptr.cast()) };
         }
     }
 }
@@ -545,31 +596,105 @@ unsafe fn remap_cstr_list<'a>(
     unsafe { remap_cstr_list_with(list, table.entries.as_slice(), &table.slots, guard) }
 }
 
-/// Rewrites a single shell command C string (for `system` / `popen`) lazily into a pre-allocated
-/// scratch slot only when embedded rewriting is needed.
-unsafe fn remap_cmd_cstr<'a>(
-    cmd: *const c_char,
-    guard: &mut SlotGuard<'a>,
-) -> Result<*const c_char, ()> {
-    if cmd.is_null() {
-        return Ok(cmd);
+/// Rewrites a NUL-terminated `char* const*` list (`argv` or `envp`) using `MallocBuf` (for
+/// non-async-signal-safe `posix_spawn`/`posix_spawnp`) ONLY when at least one entry needs remapping.
+unsafe fn remap_cstr_list_malloc_with(
+    list: *const *const c_char,
+    entries: &[Entry],
+    buf_guard: &mut MallocBuf,
+) -> Result<*const *const c_char, RemapErr> {
+    if list.is_null() {
+        return Ok(list);
+    }
+    let mut count = 0usize;
+    let mut any_changed = false;
+    let mut need_bytes = 0usize;
+    loop {
+        // SAFETY: caller passes a valid NUL-terminated `argv`/`envp` pointer array.
+        let elem = unsafe { *list.add(count) };
+        if elem.is_null() {
+            break;
+        }
+        let bytes = unsafe { CStr::from_ptr(elem) }.to_bytes();
+        match measure_rewrite(bytes, entries).map_err(|()| RemapErr::TooBig)? {
+            MeasureResult::Unchanged => {}
+            MeasureResult::Exact(_) => any_changed = true,
+            MeasureResult::NeedsBytes(n) => {
+                any_changed = true;
+                need_bytes = need_bytes.checked_add(n).ok_or(RemapErr::TooBig)?;
+            }
+        }
+        count = count.checked_add(1).ok_or(RemapErr::TooBig)?;
+    }
+    if !any_changed {
+        return Ok(list);
+    }
+    let ptr_slots = count.checked_add(1).ok_or(RemapErr::TooBig)?;
+    let ptr_bytes = ptr_slots.checked_mul(size_of::<*const c_char>()).ok_or(RemapErr::TooBig)?;
+    let total = ptr_bytes.checked_add(need_bytes).ok_or(RemapErr::TooBig)?;
+    *buf_guard = MallocBuf::alloc(total)?;
+    // SAFETY: `libc::malloc` returns memory aligned for any fundamental type (including pointers),
+    // valid for `total` bytes, and exclusively owned by `buf_guard`.
+    let _ = align_of::<*const c_char>();
+    let ptrs_slice = unsafe { slice::from_raw_parts_mut(buf_guard.base().cast::<*const c_char>(), ptr_slots) };
+    let b_ptr = unsafe { buf_guard.base().add(ptr_bytes) };
+    let scratch_slice = unsafe { slice::from_raw_parts_mut(b_ptr, need_bytes) };
+
+    let mut cursor = 0usize;
+    for i in 0..count {
+        // SAFETY: `i < count`, valid elements of `list`.
+        let elem = unsafe { *list.add(i) };
+        let bytes = unsafe { CStr::from_ptr(elem) }.to_bytes();
+        let out_ptr = match rewrite_bytes(bytes, entries, scratch_slice, &mut cursor).map_err(|()| RemapErr::TooBig)? {
+            RewriteResult::Unchanged => elem,
+            RewriteResult::Exact(host) => host,
+            RewriteResult::Rewritten { start, .. } => {
+                // SAFETY: `start < scratch_slice.len()` and string is NUL-terminated.
+                unsafe { scratch_slice.as_ptr().add(start).cast::<c_char>() }
+            }
+        };
+        *ptrs_slice.get_mut(i).ok_or(RemapErr::TooBig)? = out_ptr;
+    }
+    *ptrs_slice.get_mut(count).ok_or(RemapErr::TooBig)? = ptr::null();
+    Ok(ptrs_slice.as_ptr())
+}
+
+unsafe fn remap_cstr_list_malloc(
+    list: *const *const c_char,
+    buf_guard: &mut MallocBuf,
+) -> Result<*const *const c_char, RemapErr> {
+    if list.is_null() {
+        return Ok(list);
     }
     let map_ptr = MAP.load(Ordering::Acquire);
     if map_ptr.is_null() {
-        return Ok(cmd);
+        return Ok(list);
     }
     // SAFETY: `map_ptr` was published once and never freed for the life of the process.
-    let table: &'a RemapTable = unsafe { &*map_ptr };
+    let table = unsafe { &*map_ptr };
+    unsafe { remap_cstr_list_malloc_with(list, table.entries.as_slice(), buf_guard) }
+}
+
+/// Rewrites a single shell command C string (for `system` / `popen`) lazily into a heap-backed
+/// `MallocBuf` only when embedded rewriting is needed, imposing no process-wide concurrency cap.
+unsafe fn remap_cmd_cstr_malloc_with(
+    cmd: *const c_char,
+    entries: &[Entry],
+    buf_guard: &mut MallocBuf,
+) -> Result<*const c_char, RemapErr> {
+    if cmd.is_null() {
+        return Ok(cmd);
+    }
     let bytes = unsafe { CStr::from_ptr(cmd) }.to_bytes();
-    match measure_rewrite(bytes, table.entries.as_slice())? {
+    match measure_rewrite(bytes, entries).map_err(|()| RemapErr::TooBig)? {
         MeasureResult::Unchanged => Ok(cmd),
         MeasureResult::Exact(host) => Ok(host),
         MeasureResult::NeedsBytes(need) => {
-            *guard = SlotGuard::acquire(&table.slots, need)?;
-            // SAFETY: `guard` exclusively leases `need` writable bytes.
-            let buf = unsafe { slice::from_raw_parts_mut(guard.base(), need) };
+            *buf_guard = MallocBuf::alloc(need)?;
+            // SAFETY: `buf_guard` owns `need` writable bytes.
+            let buf = unsafe { slice::from_raw_parts_mut(buf_guard.base(), need) };
             let mut cursor = 0usize;
-            match rewrite_bytes(bytes, table.entries.as_slice(), buf, &mut cursor)? {
+            match rewrite_bytes(bytes, entries, buf, &mut cursor).map_err(|()| RemapErr::TooBig)? {
                 RewriteResult::Unchanged => Ok(cmd),
                 RewriteResult::Exact(host) => Ok(host),
                 RewriteResult::Rewritten { start, .. } => {
@@ -578,6 +703,22 @@ unsafe fn remap_cmd_cstr<'a>(
             }
         }
     }
+}
+
+unsafe fn remap_cmd_cstr_malloc(
+    cmd: *const c_char,
+    buf_guard: &mut MallocBuf,
+) -> Result<*const c_char, RemapErr> {
+    if cmd.is_null() {
+        return Ok(cmd);
+    }
+    let map_ptr = MAP.load(Ordering::Acquire);
+    if map_ptr.is_null() {
+        return Ok(cmd);
+    }
+    // SAFETY: `map_ptr` was published once and never freed for the life of the process.
+    let table = unsafe { &*map_ptr };
+    unsafe { remap_cmd_cstr_malloc_with(cmd, table.entries.as_slice(), buf_guard) }
 }
 
 #[cfg(target_os = "macos")]
@@ -844,15 +985,17 @@ pub(crate) extern "C" fn remap_posix_spawn(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let mut argv_slot = SlotGuard::EMPTY;
-    let mut envp_slot = SlotGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_slot) }) else {
-        return libc::E2BIG;
+    let mut argv_buf = MallocBuf::EMPTY;
+    let mut envp_buf = MallocBuf::EMPTY;
+    let new_argv = match unsafe { remap_cstr_list_malloc(argv.cast(), &mut argv_buf) } {
+        Ok(v) => v,
+        Err(err) => return err.errno(),
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_slot) }) else {
-        return libc::E2BIG;
+    let new_envp = match unsafe { remap_cstr_list_malloc(envp.cast(), &mut envp_buf) } {
+        Ok(v) => v,
+        Err(err) => return err.errno(),
     };
-    // SAFETY: POSIX `posix_spawn` never mutates `argv`/`envp` strings; slots outlive the call.
+    // SAFETY: POSIX `posix_spawn` never mutates `argv`/`envp` strings; buffers outlive the call.
     unsafe {
         libc::posix_spawn(
             pid,
@@ -873,15 +1016,17 @@ pub(crate) extern "C" fn remap_posix_spawnp(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let mut argv_slot = SlotGuard::EMPTY;
-    let mut envp_slot = SlotGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_slot) }) else {
-        return libc::E2BIG;
+    let mut argv_buf = MallocBuf::EMPTY;
+    let mut envp_buf = MallocBuf::EMPTY;
+    let new_argv = match unsafe { remap_cstr_list_malloc(argv.cast(), &mut argv_buf) } {
+        Ok(v) => v,
+        Err(err) => return err.errno(),
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_slot) }) else {
-        return libc::E2BIG;
+    let new_envp = match unsafe { remap_cstr_list_malloc(envp.cast(), &mut envp_buf) } {
+        Ok(v) => v,
+        Err(err) => return err.errno(),
     };
-    // SAFETY: POSIX `posix_spawnp` never mutates `argv`/`envp` strings; slots outlive the call.
+    // SAFETY: POSIX `posix_spawnp` never mutates `argv`/`envp` strings; buffers outlive the call.
     unsafe {
         libc::posix_spawnp(
             pid,
@@ -895,10 +1040,13 @@ pub(crate) extern "C" fn remap_posix_spawnp(
 }
 
 pub(crate) extern "C" fn remap_system(command: *const c_char) -> c_int {
-    let mut slot = SlotGuard::EMPTY;
-    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut slot) }) else {
-        set_errno(libc::E2BIG);
-        return -1;
+    let mut buf = MallocBuf::EMPTY;
+    let cmd = match unsafe { remap_cmd_cstr_malloc(command, &mut buf) } {
+        Ok(c) => c,
+        Err(err) => {
+            set_errno(err.errno());
+            return -1;
+        }
     };
     // SAFETY: `cmd` is null or a valid NUL-terminated string live across `libc::system`.
     unsafe { libc::system(cmd) }
@@ -908,10 +1056,13 @@ pub(crate) extern "C" fn remap_popen(
     command: *const c_char,
     mode: *const c_char,
 ) -> *mut libc::FILE {
-    let mut slot = SlotGuard::EMPTY;
-    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut slot) }) else {
-        set_errno(libc::E2BIG);
-        return ptr::null_mut();
+    let mut buf = MallocBuf::EMPTY;
+    let cmd = match unsafe { remap_cmd_cstr_malloc(command, &mut buf) } {
+        Ok(c) => c,
+        Err(err) => {
+            set_errno(err.errno());
+            return ptr::null_mut();
+        }
     };
     // SAFETY: `cmd` and `mode` are valid NUL-terminated C strings live across `libc::popen`.
     unsafe { libc::popen(cmd, mode) }
@@ -1059,9 +1210,9 @@ mod tests {
     use blaze_own::Vec;
 
     use super::{
-        BinRemapError, RewriteResult, SCRATCH_SLOTS, SCRATCH_SLOT_BYTES, SlotGuard,
-        alloc_scratch_slots, derive_host_root, parse_entries, remap_cstr_list_with, rewrite_bytes,
-        rewrite_search_path,
+        BinRemapError, MallocBuf, RewriteResult, SCRATCH_SLOTS, SCRATCH_SLOT_BYTES, SlotGuard,
+        alloc_scratch_slots, derive_host_root, parse_entries, remap_cmd_cstr_malloc_with,
+        remap_cstr_list_with, rewrite_bytes, rewrite_search_path,
     };
 
     #[test]
@@ -1189,5 +1340,34 @@ mod tests {
         unsafe {
             let _ = libc::munmap(slots[0].base.cast(), SCRATCH_SLOTS * SCRATCH_SLOT_BYTES);
         }
+    }
+
+    #[test]
+    fn remap_cmd_cstr_malloc_has_no_concurrency_cap() {
+        let threads = SCRATCH_SLOTS + 8;
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let alloc = blaze_own::testing::heap().alloc();
+                    let entries = parse_entries(
+                        b"/target/debug/bin/app/cli\t/tmp/bzb-0123-r0-0/app/cli\n",
+                        alloc,
+                    )
+                    .expect("entries");
+                    let mut buf = MallocBuf::EMPTY;
+                    let cmd = c"\"/target/debug/bin/app/cli\" --concurrent";
+                    let out = unsafe { remap_cmd_cstr_malloc_with(cmd.as_ptr(), entries.as_slice(), &mut buf) }
+                        .expect("concurrent remapped system() command must never hit a process-wide slot cap");
+                    assert!(!buf.base().is_null());
+                    // Hold all `SCRATCH_SLOTS + 8` buffers alive simultaneously across the barrier.
+                    barrier.wait();
+                    assert_eq!(
+                        unsafe { CStr::from_ptr(out) }.to_bytes(),
+                        b"\"/tmp/bzb-0123-r0-0/app/cli\" --concurrent"
+                    );
+                });
+            }
+        });
     }
 }

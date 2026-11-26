@@ -7,9 +7,11 @@
 //!    `$HOME` length, always well within `sockaddr_un::sun_path`'s 104/108-byte limit), binds a
 //!    non-blocking `AF_UNIX` listener at `<sock_dir>/s`, and authenticates every accepted peer's
 //!    effective UID (`SO_PEERCRED` / `getpeereid`).
-//! 2. Places a launcher stub `<mine>/b/<package>/<bin_name>` (hardlink to `blaze-launcher`, with a
-//!    copy+`chmod 0o755` fallback across mount points) beside a `mode=run` sidecar
-//!    `<stub>.blaze-program` naming `socket`, `bin=<id>`, `store`, `entry`, and optional `native`.
+//! 2. Places a self-describing launcher stub `/tmp/bzb-<nonce>-r<suite>-<row>/<package>/<bin_name>`
+//!    by patching `blaze-launcher`'s in-binary `EMBEDDED_STUB_SLOT` with `mode=run`, `socket`,
+//!    `bin=<id>`, `owner=<suite>:<row>`, `store_hex`, `entry`, and optional `native` (and updating
+//!    its Mach-O `LC_CODE_SIGNATURE` on macOS), so stubs stay directly runnable even if a test
+//!    copies `CARGO_BIN_EXE_<name>` to another path without an adjacent sidecar file.
 //! 3. On Linux, bind-mounts `<mine>/b` read-only at `/target/debug/bin` inside the sandbox's
 //!    private mount namespace (`pivot_root`) so `/target/debug/bin/<package>/<bin_name>` is a real
 //!    kernel-visible executable file (`File::open`, `std::fs::read`, `/bin/sh -c`, `Command::new`
@@ -72,6 +74,20 @@ const OUTBOX_COMPACT_AT: usize = 64 * 1024;
 /// Fixed handshake sent by `blaze-launcher` `mode=run` (`[bin_id: u32, suite: u32, row: u32]` LE).
 const HANDSHAKE_LEN: usize = 12;
 
+/// In-binary self-describing stub slot layout (must match `blaze-launcher/src/main.rs`).
+const STUB_SLOT_SIZE: usize = 16 * 1024;
+const STUB_SLOT_HEADER: usize = 36;
+const STUB_SLOT_MAGIC: &[u8; 16] = b"BLAZE_STUB_SLOT1";
+const STUB_SLOT_UNPATCHED: &[u8; 16] = b"UNPATCHED_CFG_01";
+const STUB_SLOT_PATCHED: &[u8; 16] = b"PATCHED_STUB_001";
+
+/// Cached copy of `blaze-launcher` + the unique file offset of its `EMBEDDED_STUB_SLOT`.
+/// Reused and patched in-place across test rows so creating self-describing stubs allocates once.
+struct LauncherTemplate<'a> {
+    bytes: AVec<'a, u8>,
+    slot_offset: usize,
+}
+
 /// A workspace binary target ready to be served to tests via a `CARGO_BIN_EXE_<name>` stub.
 pub(crate) struct BinSuite<'s, 'h> {
     pub package: &'s str,
@@ -93,6 +109,8 @@ pub(crate) enum BinStubError {
     Home(bstd::fs::HomeError),
     Socket { path: AString<'static>, errno: Errno },
     Stub { path: AString<'static>, errno: Errno },
+    StubSlot { path: AString<'static>, why: &'static str },
+    MachoSignature { path: AString<'static>, why: &'static str },
     PathInvalid { path: AString<'static> },
 }
 
@@ -146,6 +164,12 @@ impl fmt::Display for BinStubError {
             }
             BinStubError::Stub { path, errno } => {
                 write!(f, "CARGO_BIN_EXE launcher stub `{path}`: {errno}")
+            }
+            BinStubError::StubSlot { path, why } => {
+                write!(f, "CARGO_BIN_EXE launcher stub `{path}` embedded slot: {why}")
+            }
+            BinStubError::MachoSignature { path, why } => {
+                write!(f, "CARGO_BIN_EXE launcher stub `{path}` Mach-O code signature: {why}")
             }
             BinStubError::PathInvalid { path } => {
                 write!(f, "CARGO_BIN_EXE path `{path}` is too long or contains a NUL byte")
@@ -864,7 +888,7 @@ pub(crate) struct BinServer<'a, 'h> {
     sock_nonce: u64,
     launcher_abs: AString<'a>,
     store_hex: AString<'a>,
-    cached_launcher: RefCell<Option<AVec<'a, u8>>>,
+    cached_launcher: RefCell<Option<LauncherTemplate<'a>>>,
     sock_dir_guard: PrivateSocketDir,
     listener: blaze_sys::posix::io::OwnedFd,
     bins: AVec<'a, BinRuntime<'a, 'h>>,
@@ -1060,42 +1084,35 @@ impl<'a, 'h> BinServer<'a, 'h> {
             let bin_rel = Path::new(bin.bin_name).map_err(BinStubError::Path)?;
             let host_path = bstd::mem::format_in!(frame, "{}/{}/{}", guard.dir.as_str(), bin.package, bin.bin_name);
             guard.files.push(owned_text(host_path.as_str(), self.tables));
-            place_launcher_stub(
+
+            let mut config = String::new_in(self.alloc);
+            let _ = writeln!(config, "mode=run");
+            let _ = writeln!(config, "socket={}", self.sock_dir_guard.socket.as_str());
+            let _ = writeln!(config, "bin={id}");
+            let _ = writeln!(config, "owner={suite}:{row}");
+            let _ = writeln!(config, "store_hex={}", self.store_hex.as_str());
+            let _ = writeln!(config, "entry={}", bin.entry_line.as_str());
+            if let Some(send) = bin.native {
+                match send.load_mode {
+                    crate::engine_native::NativeLoadMode::Eager => {
+                        let _ = writeln!(config, "native={}", send.hex);
+                    }
+                    crate::engine_native::NativeLoadMode::Lazy => {
+                        let _ = writeln!(config, "native=lazy:{}", send.hex);
+                    }
+                }
+            }
+            place_self_describing_stub(
                 cx,
                 &pkg_dir,
                 &bin_rel,
                 self.launcher_abs.as_str(),
                 host_path.as_str(),
+                config.as_bytes(),
                 &mut cached_launcher,
                 self.tables,
                 self.alloc,
             )?;
-
-            let sidecar_name = bstd::mem::format_in!(frame, "{}.blaze-program", bin.bin_name);
-            let sidecar_rel = Path::new(sidecar_name.as_str()).map_err(BinStubError::Path)?;
-            let mut sidecar = String::new_in(self.alloc);
-            let _ = writeln!(sidecar, "mode=run");
-            let _ = writeln!(sidecar, "socket={}", self.sock_dir_guard.socket.as_str());
-            let _ = writeln!(sidecar, "bin={id}");
-            let _ = writeln!(sidecar, "owner={suite}:{row}");
-            let _ = writeln!(sidecar, "store_hex={}", self.store_hex.as_str());
-            let _ = writeln!(sidecar, "entry={}", bin.entry_line.as_str());
-            if let Some(send) = bin.native {
-                match send.load_mode {
-                    crate::engine_native::NativeLoadMode::Eager => {
-                        let _ = writeln!(sidecar, "native={}", send.hex);
-                    }
-                    crate::engine_native::NativeLoadMode::Lazy => {
-                        let _ = writeln!(sidecar, "native=lazy:{}", send.hex);
-                    }
-                }
-            }
-            let mut sidecar_abs = String::new_in(self.tables);
-            let _ = write!(sidecar_abs, "{}.blaze-program", host_path.as_str());
-            guard.files.push(sidecar_abs);
-            pkg_dir
-                .publish(cx, &sidecar_rel, Content::bytes(sidecar.as_bytes()), Durable::No)
-                .map_err(BinStubError::Fs)?;
 
             let env_k = crate::work::held_str(bin.env_name.as_str(), frame);
             #[cfg(target_os = "linux")]
@@ -1415,41 +1432,304 @@ fn with_cstr<T>(
     f(cstr)
 }
 
-#[expect(clippy::too_many_arguments, reason = "places one launcher stub using the command's directory, cache, and allocators")]
-fn place_launcher_stub<'a>(
+/// Locates the unique unpatched `EMBEDDED_STUB_SLOT` inside `blaze-launcher`'s binary bytes.
+fn find_stub_slot(bytes: &[u8]) -> Result<usize, &'static str> {
+    let mut needle = [0u8; STUB_SLOT_HEADER];
+    if let Some(dst) = needle.get_mut(..16) {
+        dst.copy_from_slice(STUB_SLOT_MAGIC);
+    }
+    if let Some(dst) = needle.get_mut(16..32) {
+        dst.copy_from_slice(STUB_SLOT_UNPATCHED);
+    }
+    if bytes.len() < STUB_SLOT_SIZE {
+        return Err("launcher binary is smaller than EMBEDDED_STUB_SLOT");
+    }
+    let last = bytes.len() - STUB_SLOT_HEADER;
+    let mut found: Option<usize> = None;
+    let mut i = 0usize;
+    while i <= last {
+        if bytes.get(i).copied() == Some(STUB_SLOT_MAGIC[0])
+            && bytes.get(i..i + STUB_SLOT_HEADER) == Some(needle.as_slice())
+        {
+            if found.is_some() {
+                return Err("multiple EMBEDDED_STUB_SLOT markers found in launcher binary");
+            }
+            found = Some(i);
+            i = i.saturating_add(STUB_SLOT_HEADER);
+            continue;
+        }
+        i += 1;
+    }
+    let Some(off) = found else {
+        return Err("EMBEDDED_STUB_SLOT marker not found in launcher binary");
+    };
+    let end = off.checked_add(STUB_SLOT_SIZE).ok_or("EMBEDDED_STUB_SLOT offset overflow")?;
+    if end > bytes.len() {
+        return Err("EMBEDDED_STUB_SLOT extends past end of launcher binary");
+    }
+    Ok(off)
+}
+
+/// Patches `EMBEDDED_STUB_SLOT` at `slot_offset` with the active tag, LE length, and UTF-8
+/// `payload`, zeroing any remaining bytes in the 16 KiB slot.
+fn patch_stub_slot(bytes: &mut [u8], slot_offset: usize, payload: &[u8]) -> Result<(), &'static str> {
+    let cap = STUB_SLOT_SIZE - STUB_SLOT_HEADER;
+    if payload.len() > cap {
+        return Err("stub configuration exceeds 16 KiB embedded slot capacity");
+    }
+    let len_u32 = u32::try_from(payload.len()).map_err(|_| "stub configuration length exceeds u32")?;
+    let end = slot_offset.checked_add(STUB_SLOT_SIZE).ok_or("slot offset overflow")?;
+    let slot = bytes.get_mut(slot_offset..end).ok_or("slot slice out of bounds")?;
+    if let Some(dst) = slot.get_mut(..16) {
+        dst.copy_from_slice(STUB_SLOT_MAGIC);
+    }
+    if let Some(dst) = slot.get_mut(16..32) {
+        dst.copy_from_slice(STUB_SLOT_PATCHED);
+    }
+    if let Some(dst) = slot.get_mut(32..36) {
+        dst.copy_from_slice(&len_u32.to_le_bytes());
+    }
+    let payload_end = STUB_SLOT_HEADER + payload.len();
+    if let Some(dst) = slot.get_mut(STUB_SLOT_HEADER..payload_end) {
+        dst.copy_from_slice(payload);
+    }
+    if let Some(rest) = slot.get_mut(payload_end..) {
+        rest.fill(0);
+    }
+    Ok(())
+}
+
+fn read_le32(bytes: &[u8], off: usize) -> Option<u32> {
+    let b = bytes.get(off..off.checked_add(4)?)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_le64(bytes: &[u8], off: usize) -> Option<u64> {
+    let b = bytes.get(off..off.checked_add(8)?)?;
+    Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+}
+
+fn read_be32(bytes: &[u8], off: usize) -> Option<u32> {
+    let b = bytes.get(off..off.checked_add(4)?)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_be64(bytes: &[u8], off: usize) -> Option<u64> {
+    let b = bytes.get(off..off.checked_add(8)?)?;
+    Some(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+}
+
+/// Keeps a patched thin 64-bit Mach-O `blaze-launcher` validly ad-hoc code-signed on macOS:
+/// - Fast path (standard 1-blob ad-hoc `LC_CODE_SIGNATURE` from Apple `ld` / `blaze_export::sign`):
+///   recomputes SHA-256 only for the 4 KiB pages overlapping `[slot_offset .. slot_offset + slot_len]`
+///   and writes those hashes in place (~10 µs).
+/// - General path (multi-blob or CMS-signed `LC_CODE_SIGNATURE` at EOF): replaces the trailing
+///   signature with a fresh canonical ad-hoc `LC_CODE_SIGNATURE` via `blaze_export::sign::sign`
+///   and updates `LC_CODE_SIGNATURE.datasize`, `__LINKEDIT.filesize`, and `__LINKEDIT.vmsize`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn resign_macho_after_patch(
+    bytes: &mut AVec<'_, u8>,
+    slot_offset: usize,
+    slot_len: usize,
+) -> Result<(), &'static str> {
+    const MH_MAGIC_64: u32 = 0xFEED_FACF;
+    const LC_SEGMENT_64: u32 = 0x19;
+    const LC_CODE_SIGNATURE: u32 = 0x1D;
+    const CS_ADHOC: u32 = 0x2;
+    const CS_HASHTYPE_SHA256: u8 = 2;
+    const ARM64_PAGE: u64 = 16 * 1024;
+
+    if read_le32(bytes.as_slice(), 0) != Some(MH_MAGIC_64) {
+        return Err("launcher is not a thin 64-bit Mach-O executable");
+    }
+    let ncmds = read_le32(bytes.as_slice(), 16).ok_or("truncated Mach-O header")?;
+    let sizeofcmds = read_le32(bytes.as_slice(), 20).ok_or("truncated Mach-O header")?;
+    let cmds_end = 32usize
+        .checked_add(usize::try_from(sizeofcmds).map_err(|_| "sizeofcmds overflow")?)
+        .ok_or("Mach-O load commands overflow")?;
+    if cmds_end > bytes.len() {
+        return Err("Mach-O load commands extend past EOF");
+    }
+
+    let mut text_filesize: Option<u64> = None;
+    let mut linkedit: Option<(usize, u64)> = None;
+    let mut sig_cmd: Option<(usize, usize, usize)> = None;
+    let mut cursor = 32usize;
+    for _ in 0..ncmds {
+        let cmd = read_le32(bytes.as_slice(), cursor).ok_or("truncated load command")?;
+        let cmdsize = read_le32(bytes.as_slice(), cursor + 4).ok_or("truncated load command size")?;
+        let cmdsize_usize = usize::try_from(cmdsize).map_err(|_| "cmdsize overflow")?;
+        if cmdsize_usize < 8 {
+            return Err("Mach-O load command smaller than 8 bytes");
+        }
+        let next = cursor.checked_add(cmdsize_usize).ok_or("load command cursor overflow")?;
+        if next > cmds_end {
+            return Err("Mach-O load command extends past sizeofcmds");
+        }
+        if cmd == LC_SEGMENT_64 && cmdsize_usize >= 72 {
+            let segname = bytes.get(cursor + 8..cursor + 24).ok_or("truncated segname")?;
+            if segname.starts_with(b"__TEXT\0") {
+                text_filesize = read_le64(bytes.as_slice(), cursor + 48);
+            } else if segname.starts_with(b"__LINKEDIT\0") {
+                let fileoff = read_le64(bytes.as_slice(), cursor + 40).ok_or("truncated __LINKEDIT")?;
+                linkedit = Some((cursor, fileoff));
+            }
+        } else if cmd == LC_CODE_SIGNATURE && cmdsize_usize >= 16 {
+            let dataoff = read_le32(bytes.as_slice(), cursor + 8).ok_or("truncated LC_CODE_SIGNATURE")?;
+            let datasize = read_le32(bytes.as_slice(), cursor + 12).ok_or("truncated LC_CODE_SIGNATURE")?;
+            sig_cmd = Some((
+                cursor,
+                usize::try_from(dataoff).map_err(|_| "sig dataoff overflow")?,
+                usize::try_from(datasize).map_err(|_| "sig datasize overflow")?,
+            ));
+        }
+        cursor = next;
+    }
+
+    let (sig_cmd_off, sig_off, sig_size) = sig_cmd.ok_or("launcher Mach-O has no LC_CODE_SIGNATURE")?;
+    let sig_end = sig_off.checked_add(sig_size).ok_or("LC_CODE_SIGNATURE bounds overflow")?;
+    if sig_end > bytes.len() {
+        return Err("LC_CODE_SIGNATURE extends past EOF");
+    }
+    let patch_end = slot_offset.checked_add(slot_len).ok_or("slot end overflow")?;
+    if patch_end > sig_off {
+        return Err("EMBEDDED_STUB_SLOT is not inside signed code region");
+    }
+
+    // Fast path: 1-blob ad-hoc SHA-256 CS_CodeDirectory covering `0..sig_off`.
+    let can_rehash_in_place = (|| -> Option<(usize, usize, usize)> {
+        let super_magic = read_be32(bytes.as_slice(), sig_off)?;
+        let count = read_be32(bytes.as_slice(), sig_off + 8)?;
+        if super_magic != blaze_export::sign::SUPER_BLOB || count != 1 {
+            return None;
+        }
+        let blob_type = read_be32(bytes.as_slice(), sig_off + 12)?;
+        let blob_rel = usize::try_from(read_be32(bytes.as_slice(), sig_off + 16)?).ok()?;
+        if blob_type != 0 {
+            return None;
+        }
+        let cd_off = sig_off.checked_add(blob_rel)?;
+        if cd_off.checked_add(44)? > sig_end {
+            return None;
+        }
+        let cd_magic = read_be32(bytes.as_slice(), cd_off)?;
+        let flags = read_be32(bytes.as_slice(), cd_off + 12)?;
+        let hash_offset = usize::try_from(read_be32(bytes.as_slice(), cd_off + 16)?).ok()?;
+        let n_code_slots = usize::try_from(read_be32(bytes.as_slice(), cd_off + 28)?).ok()?;
+        let code_limit_32 = u64::from(read_be32(bytes.as_slice(), cd_off + 32)?);
+        let hash_size = *bytes.get(cd_off + 36)?;
+        let hash_type = *bytes.get(cd_off + 37)?;
+        let page_shift = *bytes.get(cd_off + 39)?;
+        if cd_magic != blaze_export::sign::CODE_DIRECTORY
+            || (flags & CS_ADHOC) == 0
+            || hash_type != CS_HASHTYPE_SHA256
+            || usize::from(hash_size) != blaze_export::sign::HASH
+            || !(10..=16).contains(&page_shift)
+        {
+            return None;
+        }
+        let code_limit = if code_limit_32 != 0 {
+            usize::try_from(code_limit_32).ok()?
+        } else {
+            let cd_len = usize::try_from(read_be32(bytes.as_slice(), cd_off + 4)?).ok()?;
+            if cd_len < 64 {
+                return None;
+            }
+            usize::try_from(read_be64(bytes.as_slice(), cd_off + 56)?).ok()?
+        };
+        if code_limit != sig_off {
+            return None;
+        }
+        let page = 1usize << usize::from(page_shift);
+        if code_limit.div_ceil(page) != n_code_slots {
+            return None;
+        }
+        let hashes_start = cd_off.checked_add(hash_offset)?;
+        let hashes_end = hashes_start.checked_add(n_code_slots.checked_mul(blaze_export::sign::HASH)?)?;
+        if hashes_end > sig_end {
+            return None;
+        }
+        Some((hashes_start, page, code_limit))
+    })();
+
+    if let Some((hashes_start, page, code_limit)) = can_rehash_in_place {
+        let first_page = slot_offset / page;
+        let last_page = patch_end.saturating_sub(1) / page;
+        for p in first_page..=last_page {
+            let from = p.checked_mul(page).ok_or("page offset overflow")?;
+            let to = from.saturating_add(page).min(code_limit);
+            let slice = bytes.get(from..to).ok_or("code page out of bounds")?;
+            let digest = blaze_export::sign::page_digest(slice);
+            let dst_off = hashes_start
+                .checked_add(p.checked_mul(blaze_export::sign::HASH).ok_or("hash slot overflow")?)
+                .ok_or("hash dst overflow")?;
+            let dst = bytes
+                .get_mut(dst_off..dst_off + blaze_export::sign::HASH)
+                .ok_or("hash slot out of bounds")?;
+            dst.copy_from_slice(&digest);
+        }
+        return Ok(());
+    }
+
+    // General path: replace trailing signature blob with a fresh ad-hoc CS_CodeDirectory.
+    if sig_end != bytes.len() {
+        return Err("non-ad-hoc LC_CODE_SIGNATURE is not at EOF");
+    }
+    let text_len = text_filesize.ok_or("launcher Mach-O has no __TEXT segment")?;
+    let (linkedit_off, linkedit_fileoff) = linkedit.ok_or("launcher Mach-O has no __LINKEDIT segment")?;
+    bytes.truncate(sig_off);
+    blaze_export::sign::sign(bytes, "blaze-launcher", text_len, true);
+    let new_sig_len = bytes.len().checked_sub(sig_off).ok_or("signature length underflow")?;
+    let new_sig_u32 = u32::try_from(new_sig_len).map_err(|_| "new signature size exceeds u32")?;
+    let new_linkedit_filesize = u64::try_from(bytes.len())
+        .map_err(|_| "file size exceeds u64")?
+        .checked_sub(linkedit_fileoff)
+        .ok_or("__LINKEDIT fileoff exceeds file size")?;
+    let new_linkedit_vmsize = new_linkedit_filesize.next_multiple_of(ARM64_PAGE);
+    if let Some(dst) = bytes.get_mut(sig_cmd_off + 12..sig_cmd_off + 16) {
+        dst.copy_from_slice(&new_sig_u32.to_le_bytes());
+    }
+    if let Some(dst) = bytes.get_mut(linkedit_off + 32..linkedit_off + 40) {
+        dst.copy_from_slice(&new_linkedit_vmsize.to_le_bytes());
+    }
+    if let Some(dst) = bytes.get_mut(linkedit_off + 48..linkedit_off + 56) {
+        dst.copy_from_slice(&new_linkedit_filesize.to_le_bytes());
+    }
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments, reason = "places one self-describing launcher stub using the command's directory, template cache, and allocators")]
+fn place_self_describing_stub<'a>(
     cx: &Cx,
     pkg_dir: &Dir<ReadWrite>,
     bin_rel: &Path,
     launcher_abs: &str,
     stub_abs: &str,
-    cached_bytes: &mut Option<AVec<'a, u8>>,
+    config: &[u8],
+    cached_template: &mut Option<LauncherTemplate<'a>>,
     tables: Alloc<'static>,
     alloc: Alloc<'a>,
 ) -> Result<(), BinStubError> {
-    #[cfg(target_os = "linux")]
-    {
-        use blaze_sys::Path as SysPath;
-        use blaze_sys::linux::{AtFlags, CWD, linkat};
-        let linked = with_cstr(launcher_abs, tables, |from_c| {
-            with_cstr(stub_abs, tables, |to_c| {
-                Ok(linkat(CWD, SysPath::new(from_c), CWD, SysPath::new(to_c), AtFlags::NONE))
-            })
-        })?;
-        match linked {
-            Ok(()) => return Ok(()),
-            Err(Errno::XDev | Errno::Perm | Errno::Acces) => {}
-            Err(errno) => return Err(BinStubError::Stub { path: owned_text(stub_abs, tables), errno }),
-        }
-    }
-    let bytes = match cached_bytes.as_ref() {
-        Some(bytes) => bytes.as_slice(),
+    let template = match cached_template.as_mut() {
+        Some(t) => t,
         None => {
-            let loaded = read_file_posix(launcher_abs, tables, alloc)?;
-            cached_bytes.insert(loaded).as_slice()
+            let bytes = read_file_posix(launcher_abs, tables, alloc)?;
+            let slot_offset = find_stub_slot(bytes.as_slice()).map_err(|why| BinStubError::StubSlot {
+                path: owned_text(launcher_abs, tables),
+                why,
+            })?;
+            cached_template.insert(LauncherTemplate { bytes, slot_offset })
         }
     };
+    patch_stub_slot(template.bytes.as_mut_slice(), template.slot_offset, config).map_err(|why| {
+        BinStubError::StubSlot { path: owned_text(stub_abs, tables), why }
+    })?;
+    #[cfg(target_os = "macos")]
+    resign_macho_after_patch(&mut template.bytes, template.slot_offset, STUB_SLOT_SIZE).map_err(|why| {
+        BinStubError::MachoSignature { path: owned_text(stub_abs, tables), why }
+    })?;
     pkg_dir
-        .publish(cx, bin_rel, Content::bytes(bytes), Durable::No)
+        .publish(cx, bin_rel, Content::bytes(template.bytes.as_slice()), Durable::No)
         .map_err(BinStubError::Fs)?;
     chmod_path(stub_abs, 0o755, tables)?;
     Ok(())
@@ -2322,5 +2602,119 @@ mod dst_tests {
             caught,
             "planted bug SwallowListenerPollError must be caught by the DST oracle"
         );
+    }
+
+    #[test]
+    fn stub_slot_find_and_patch_roundtrips_and_rejects_duplicates() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut fake = Vec::new_in(alloc);
+        fake.resize(STUB_SLOT_SIZE + 8192, 0u8);
+        let off = 4096usize;
+        fake[off..off + 16].copy_from_slice(STUB_SLOT_MAGIC);
+        fake[off + 16..off + 32].copy_from_slice(STUB_SLOT_UNPATCHED);
+        assert_eq!(find_stub_slot(fake.as_slice()), Ok(off));
+
+        // Duplicate marker must fail closed.
+        let mut dup = Vec::new_in(alloc);
+        dup.resize(STUB_SLOT_SIZE * 2 + 8192, 0u8);
+        dup[off..off + 16].copy_from_slice(STUB_SLOT_MAGIC);
+        dup[off + 16..off + 32].copy_from_slice(STUB_SLOT_UNPATCHED);
+        let off2 = off + STUB_SLOT_SIZE;
+        dup[off2..off2 + 16].copy_from_slice(STUB_SLOT_MAGIC);
+        dup[off2 + 16..off2 + 32].copy_from_slice(STUB_SLOT_UNPATCHED);
+        assert!(find_stub_slot(dup.as_slice()).is_err());
+
+        // Patching writes magic + patched tag + LE length + payload and zeroes the tail.
+        let payload = b"mode=run\nsocket=/tmp/s\nbin=0\nowner=1:2\n";
+        patch_stub_slot(fake.as_mut_slice(), off, payload).expect("patch 1");
+        assert_eq!(&fake[off..off + 16], STUB_SLOT_MAGIC);
+        assert_eq!(&fake[off + 16..off + 32], STUB_SLOT_PATCHED);
+        assert_eq!(read_le32(fake.as_slice(), off + 32), Some(payload.len() as u32));
+        assert_eq!(&fake[off + STUB_SLOT_HEADER..off + STUB_SLOT_HEADER + payload.len()], payload);
+
+        // Re-patching with a shorter payload zeroes trailing stale bytes from the first payload.
+        let shorter = b"mode=run\n";
+        patch_stub_slot(fake.as_mut_slice(), off, shorter).expect("patch 2");
+        assert_eq!(read_le32(fake.as_slice(), off + 32), Some(shorter.len() as u32));
+        assert!(fake[off + STUB_SLOT_HEADER + shorter.len()..off + STUB_SLOT_SIZE].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn resign_macho_after_patch_updates_adhoc_and_multi_blob_signatures() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // Build a synthetic thin 64-bit Mach-O with __TEXT, __LINKEDIT, and LC_CODE_SIGNATURE.
+        let text_len: usize = 32 * 1024;
+        let slot_off: usize = 8 * 1024;
+        let linkedit_off: usize = text_len;
+        let sig_off: usize = linkedit_off;
+        let mut macho = Vec::new_in(alloc);
+        macho.resize(sig_off, 0u8);
+
+        // Mach-O 64-bit header: magic, ncmds = 3, sizeofcmds = 72 + 72 + 16 = 160.
+        macho[0..4].copy_from_slice(&0xFEED_FACFu32.to_le_bytes());
+        macho[16..20].copy_from_slice(&3u32.to_le_bytes());
+        macho[20..24].copy_from_slice(&160u32.to_le_bytes());
+
+        // LC_SEGMENT_64 __TEXT at offset 32 (72 bytes).
+        let mut c = 32usize;
+        macho[c..c + 4].copy_from_slice(&0x19u32.to_le_bytes());
+        macho[c + 4..c + 8].copy_from_slice(&72u32.to_le_bytes());
+        macho[c + 8..c + 15].copy_from_slice(b"__TEXT\0");
+        macho[c + 48..c + 56].copy_from_slice(&(text_len as u64).to_le_bytes());
+        c += 72;
+
+        // LC_SEGMENT_64 __LINKEDIT at offset 104 (72 bytes).
+        let linkedit_cmd = c;
+        macho[c..c + 4].copy_from_slice(&0x19u32.to_le_bytes());
+        macho[c + 4..c + 8].copy_from_slice(&72u32.to_le_bytes());
+        macho[c + 8..c + 19].copy_from_slice(b"__LINKEDIT\0");
+        macho[c + 40..c + 48].copy_from_slice(&(linkedit_off as u64).to_le_bytes());
+        c += 72;
+
+        // LC_CODE_SIGNATURE at offset 176 (16 bytes).
+        let sig_cmd = c;
+        macho[c..c + 4].copy_from_slice(&0x1Du32.to_le_bytes());
+        macho[c + 4..c + 8].copy_from_slice(&16u32.to_le_bytes());
+        macho[c + 8..c + 12].copy_from_slice(&(sig_off as u32).to_le_bytes());
+
+        // Put an unpatched slot at `slot_off`, then sign with `blaze_export::sign::sign`.
+        macho[slot_off..slot_off + 16].copy_from_slice(STUB_SLOT_MAGIC);
+        macho[slot_off + 16..slot_off + 32].copy_from_slice(STUB_SLOT_UNPATCHED);
+        let init_sig_len = usize::try_from(blaze_export::sign::len("blaze-launcher", sig_off as u64)).expect("len");
+        macho[sig_cmd + 12..sig_cmd + 16].copy_from_slice(&(init_sig_len as u32).to_le_bytes());
+        macho[linkedit_cmd + 48..linkedit_cmd + 56].copy_from_slice(&(init_sig_len as u64).to_le_bytes());
+        macho[linkedit_cmd + 32..linkedit_cmd + 40]
+            .copy_from_slice(&(init_sig_len as u64).next_multiple_of(16 * 1024).to_le_bytes());
+        blaze_export::sign::sign(&mut macho, "blaze-launcher", text_len as u64, true);
+
+        let verify_all_pages = |buf: &[u8]| {
+            let sig_sz = usize::try_from(read_le32(buf, sig_cmd + 12).expect("sig_sz")).expect("usize");
+            assert_eq!(sig_off + sig_sz, buf.len());
+            assert_eq!(read_be32(buf, sig_off), Some(blaze_export::sign::SUPER_BLOB));
+            assert_eq!(read_be32(buf, sig_off + 8), Some(1));
+            let cd = sig_off + usize::try_from(read_be32(buf, sig_off + 16).expect("cd_rel")).expect("usize");
+            assert_eq!(read_be32(buf, cd), Some(blaze_export::sign::CODE_DIRECTORY));
+            let hash_off = usize::try_from(read_be32(buf, cd + 16).expect("hash_off")).expect("usize");
+            let n_slots = usize::try_from(read_be32(buf, cd + 28).expect("n_slots")).expect("usize");
+            let page = blaze_export::sign::PAGE;
+            assert_eq!(n_slots, sig_off.div_ceil(page));
+            for p in 0..n_slots {
+                let expected = blaze_export::sign::page_digest(&buf[p * page..((p + 1) * page).min(sig_off)]);
+                let stored = &buf[cd + hash_off + p * 32..cd + hash_off + (p + 1) * 32];
+                assert_eq!(stored, &expected, "page {p} hash mismatch");
+            }
+        };
+
+        // 1. Fast path: patch slot and re-hash overlapping pages in place.
+        patch_stub_slot(macho.as_mut_slice(), slot_off, b"mode=run\nowner=3:7\n").expect("patch fast");
+        resign_macho_after_patch(&mut macho, slot_off, STUB_SLOT_SIZE).expect("fast resign");
+        verify_all_pages(macho.as_slice());
+
+        // 2. General path: simulate a 2-blob (e.g. CMS-signed) signature, patch again, and verify
+        // it is cleanly replaced with a valid canonical ad-hoc signature.
+        macho[sig_off + 8..sig_off + 12].copy_from_slice(&2u32.to_be_bytes());
+        patch_stub_slot(macho.as_mut_slice(), slot_off, b"mode=run\nowner=9:11\n").expect("patch general");
+        resign_macho_after_patch(&mut macho, slot_off, STUB_SLOT_SIZE).expect("general resign");
+        verify_all_pages(macho.as_slice());
     }
 }

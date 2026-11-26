@@ -1170,6 +1170,19 @@ fn spawns_via_compile_time_and_runtime_env() {
     assert_eq!(String::from_utf8_lossy(&out_a.stdout).trim(), \"helper-ok:alpha,one\");
     assert_eq!(String::from_utf8_lossy(&out_b.stdout).trim(), \"helper-ok:beta,two\");
 
+    // Copying `CARGO_BIN_EXE_*` to an arbitrary temp path (with no adjacent sidecar file) must
+    // remain directly runnable, matching Cargo's self-contained executable behavior.
+    let copied = std::env::temp_dir().join(\"blaze_copied_helper_bin\");
+    let _ = std::fs::remove_file(&copied);
+    std::fs::copy(compile_path, &copied).expect(\"copy CARGO_BIN_EXE_helper to temp path\");
+    let copy_out = Command::new(&copied)
+        .args([\"copied\", \"ok\"])
+        .output()
+        .expect(\"spawn copied CARGO_BIN_EXE_helper\");
+    let _ = std::fs::remove_file(&copied);
+    assert!(copy_out.status.success(), \"copied helper failed: status={:?} stderr={}\", copy_out.status, String::from_utf8_lossy(&copy_out.stderr));
+    assert_eq!(String::from_utf8_lossy(&copy_out.stdout).trim(), \"helper-ok:copied,ok\");
+
     // On Linux, `/target/debug/bin` is bind-mounted in the kernel namespace so even an external
     // `/bin/sh` child sees and executes the exact compile-time path.
     #[cfg(target_os = \"linux\")]
