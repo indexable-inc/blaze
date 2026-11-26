@@ -695,7 +695,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 if allow_alias && (matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. })) {
                     continue;
                 }
-                if matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. }) {
+                if d > 0 && (matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. })) {
                     let (a2, da) = if matches!(na, PNode::Alias { .. }) && self.fits(a).is_ok() {
                         self.try_normalize_subject_flag(a, d)
                     } else {
