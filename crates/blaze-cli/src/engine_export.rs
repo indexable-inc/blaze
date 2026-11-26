@@ -68,7 +68,7 @@ const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 6 << 30;
 const EXPORT_WORKER_FRAME_KEEP: usize = 16 << 20;
 const EXPORT_WORKER_SCRATCH: usize = 1 << 20;
 const EXPORT_PER_WORKER_IN_FLIGHT: usize = 6;
-const EXPORT_MAX_QUEUED_PER_WORKER: usize = 64;
+const EXPORT_MAX_QUEUED_PER_WORKER: usize = 4096;
 const EXPORT_HAND_WAIT: core::time::Duration = core::time::Duration::from_secs(30);
 const EXPORT_PROCS_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 const EXPORT_RECV_SLICE: core::time::Duration = core::time::Duration::from_millis(10);
@@ -1179,6 +1179,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     }
 
     let active_workers = tasks.len();
+    let max_in_flight = (active_workers * EXPORT_PER_WORKER_IN_FLIGHT).max(1);
     let max_queued = (active_workers * EXPORT_MAX_QUEUED_PER_WORKER).max(1);
     let mut par_outcomes: AVec<'a, Option<RowOutcome<'a>>> = Vec::new_in(alloc);
     let mut pending_rows: AVec<'a, Option<blaze_ladder::body_ids::Pending>> = Vec::new_in(alloc);
@@ -1356,11 +1357,11 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                 }
             }
 
-            // Dispatch waiting rows until the frontier is drained or worker backlogs are full.
-            // Never spill a `tabled` body across workers: strict home affinity guarantees each
-            // body (`constructor_lower`, `constructor_simplify`, `checking`, etc.) is lowered and
-            // checked on at most one worker instead of up to 12x.
-            while *next_row < walk.len() && queued < max_queued {
+            // Dispatch waiting rows until all workers are saturated (`in_flight == max_in_flight`),
+            // the frontier is drained, or the safety backlog cap (`max_queued`) is reached.
+            // Never spill a `tabled` body across workers, and never let one slow worker's backlog
+            // starve idle peers while `in_flight < max_in_flight`.
+            while *next_row < walk.len() && in_flight < max_in_flight && queued < max_queued {
                 let row = *next_row;
                 *next_row += 1;
                 let need_len = walk.len() - start_row;
@@ -1439,7 +1440,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
 
             // If workers are busy and we cannot dispatch more right now, wait briefly on `done_ch`
             // (bounded slice so `procs_asked` is always serviced without deadlock).
-            if in_flight > 0 && (*next_row >= walk.len() || queued >= max_queued) {
+            if in_flight > 0 && (*next_row >= walk.len() || in_flight >= max_in_flight || queued >= max_queued) {
                 if cx.check().is_err() {
                     return Err(box_err(
                         ExportCliError::Walk { symbol: [0; 32], shown: owned_fmt(format_args!("export cancelled while waiting for code workers"), frame, heap.alloc()) },
