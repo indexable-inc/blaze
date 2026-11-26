@@ -1743,6 +1743,136 @@ impl<R, M, H> EthRpcConverter<R, M, H> {
 fn repro_build_eth_api_two_sources<'a>(conv: EthRpcConverter<EthReceiptImpl<'a>, EthMapA, EthMapB>) {
     conv.erased();
 }
+
+trait BeaNodeTypes {
+    type Primitives;
+    type ChainSpec;
+}
+trait BeaFullNodeComponents {
+    type Types: BeaNodeTypes;
+    type Evm: BeaConfigureEvm;
+}
+trait BeaRpcNodeCore {
+    type Primitives;
+    type Evm: BeaConfigureEvm;
+}
+trait BeaBlockExecutorFactory {
+    type EvmTypes: BeaEvmTypesHost;
+    type EvmEnv;
+}
+trait BeaEvmTypesHost {
+    type Tx;
+}
+trait BeaConfigureEvm {
+    type Primitives;
+    type BlockExecutorFactory: BeaBlockExecutorFactory;
+}
+struct BeaPrimitives;
+struct BeaEvmTypes;
+struct BeaTxEnv;
+struct BeaEvmEnv;
+impl BeaEvmTypesHost for BeaEvmTypes {
+    type Tx = BeaTxEnv;
+}
+struct BeaRecovered<T>(T);
+trait BeaTempoBounds:
+    BeaRpcNodeCore<
+        Primitives = BeaPrimitives,
+        Evm: BeaConfigureEvm<
+            Primitives = BeaPrimitives,
+            BlockExecutorFactory: BeaBlockExecutorFactory<
+                EvmTypes = BeaEvmTypes,
+                EvmEnv = BeaEvmEnv,
+            >,
+        > + 'static,
+    >
+{
+}
+trait BeaRpcTypes {
+    type TxReq;
+}
+struct BeaNetwork;
+struct BeaTxReq;
+impl BeaRpcTypes for BeaNetwork {
+    type TxReq = BeaTxReq;
+}
+trait BeaTryIntoTxEnv<T, E> {
+    type Err;
+}
+struct BeaEthApiErr<'a>(core::marker::PhantomData<&'a u8>);
+struct BeaTxConvErr;
+impl<'a> From<BeaTxConvErr> for BeaEthApiErr<'a> {
+    fn from(_: BeaTxConvErr) -> Self {
+        BeaEthApiErr(core::marker::PhantomData)
+    }
+}
+impl<'a> From<core::convert::Infallible> for BeaEthApiErr<'a> {
+    fn from(x: core::convert::Infallible) -> Self {
+        match x {}
+    }
+}
+impl BeaTryIntoTxEnv<BeaRecovered<BeaTxEnv>, BeaEvmEnv> for BeaTxReq {
+    type Err = BeaEthApiErr<'static>;
+}
+trait BeaTxEnvConverter<TxReq, Evm: BeaConfigureEvm> {
+    type Error;
+}
+impl<TxReq, Evm> BeaTxEnvConverter<TxReq, Evm> for ()
+where
+    TxReq: BeaTryIntoTxEnv<
+        BeaRecovered<<<Evm::BlockExecutorFactory as BeaBlockExecutorFactory>::EvmTypes as BeaEvmTypesHost>::Tx>,
+        <Evm::BlockExecutorFactory as BeaBlockExecutorFactory>::EvmEnv,
+    >,
+    Evm: BeaConfigureEvm,
+{
+    type Error = TxReq::Err;
+}
+trait BeaHeaderConv {
+    type Err;
+}
+impl BeaHeaderConv for () {
+    type Err = core::convert::Infallible;
+}
+trait BeaReceiptConv<N> {
+    type Error;
+}
+struct BeaTempoReceipt<'a, CS>(core::marker::PhantomData<(&'a u8, CS)>);
+impl<'a, CS> BeaReceiptConv<BeaPrimitives> for BeaTempoReceipt<'a, CS> {
+    type Error = BeaEthApiErr<'a>;
+}
+trait BeaRpcConvert {}
+struct BeaRpcConverter<Net, Evm, R, H = (), TxEnv = ()>(core::marker::PhantomData<(Net, Evm, R, H, TxEnv)>);
+impl<Net, Evm, R, H, TxEnv> BeaRpcConverter<Net, Evm, R, H, TxEnv> {
+    fn new(_: R) -> Self {
+        BeaRpcConverter(core::marker::PhantomData)
+    }
+    fn erased(self)
+    where
+        Self: BeaRpcConvert,
+    {
+    }
+}
+impl<N, Net, Evm, R, H, TxEnv> BeaRpcConvert for BeaRpcConverter<Net, Evm, R, H, TxEnv>
+where
+    Net: BeaRpcTypes,
+    Evm: BeaConfigureEvm<Primitives = N> + 'static,
+    R: BeaReceiptConv<N>,
+    R::Error: From<BeaTxConvErr> + From<TxEnv::Error> + From<H::Err>,
+    H: BeaHeaderConv,
+    TxEnv: BeaTxEnvConverter<Net::TxReq, Evm>,
+{
+}
+struct BeaCoreAdapter<N>(core::marker::PhantomData<N>);
+fn repro_build_eth_api_tx_env_two_sources<'a, N>(cs: <N::Types as BeaNodeTypes>::ChainSpec)
+where
+    N: BeaFullNodeComponents<Types: BeaNodeTypes<Primitives = BeaPrimitives>> + 'static,
+    BeaCoreAdapter<N>: BeaTempoBounds + BeaRpcNodeCore<Evm = N::Evm>,
+{
+    let conv: BeaRpcConverter<BeaNetwork, <BeaCoreAdapter<N> as BeaRpcNodeCore>::Evm, BeaTempoReceipt<'a, <N::Types as BeaNodeTypes>::ChainSpec>> =
+        BeaRpcConverter::new(BeaTempoReceipt(core::marker::PhantomData));
+    let _ = cs;
+    conv.erased();
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();
