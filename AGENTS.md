@@ -42,7 +42,7 @@ In scope:
 - Deps and cached records are fully optimized; workspace code tiers up via cross-fn LTO & PGO.
 - std's records (names, heads, code) are fetched per platform from R2, CI-written; yours stay local.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
-- blaze's own code is on bstd and our collections: no `std`, `alloc` or third-party crate.
+- EVERY crate is `#![no_std]` on `bstd`/`blaze-own` explicit `Alloc` & sans-IO: no `std`/`alloc`.
 - A plain Rust project adopts blaze's checks by steps: `rust`, `suggest`, `edition`, `strict`.
 
 Not now:
@@ -63,7 +63,7 @@ One line per rule; the full text is in its heading's skill (.agents/skills/): lo
 covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it with `--write`.
 
 ### Memory and data (skill `memory-and-data`)
-- **11. bump-allocate**: Name the allocator (`Frame`/`Bump`, `Global`); use `into_bump_slice`, never general `.leak()`.
+- **11. bump-allocate**: Always use `bstd`/`blaze-own` explicit `Alloc` (`Vec::new_in`); never `std`/`alloc` or `.leak()`.
 - **50. one-memory-measure**: Footprint is the measure, the kernel's limit the ceiling; nothing admits work by memory.
 - **51. outputs-are-records**: What outlives a task is a record written once, read in place; no cache but the page cache.
 - **52. cache-by-code-id**: A function's results are cached by its code identity and arguments; nothing invalidates by hand.

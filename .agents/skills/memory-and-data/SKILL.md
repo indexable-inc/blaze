@@ -9,26 +9,31 @@ description: "How blaze holds memory and keeps what it computes: no allocation w
 
 ## bump-allocate (rule 11)
 
-First, don't allocate where a borrow, a fixed buffer or the caller's buffer does: borrow instead of
-`to_owned`, `clone` or `to_vec`; write into the caller's buffer with `blaze_mem::format_into!` or
-`write!` instead of `format!` or `to_string`; use an array for a small `vec![..]`; pass an iterator
-on instead of `collect()`. Where an allocation is needed, allocate by lifetime and name the
-allocator: a collection that lives within one task (a query run, a codegen unit, a maintainer pass)
-uses `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, the request's
-lifetime uses the request's allocator, what outlives the request is a record and not heap
-(`outputs-are-records`), and the global heap is named `Global` where it is used
-(`Vec::new_in(Global)`, `Box::new_in(x, Global)`). Never expose or call general `.leak()`: to freeze
-bump-allocated storage into an arena-lifetime slice or reference, require `BumpAlloc` (`&Frame`,
-`ArenaLocal`, `&Inline`, `Bump<'a>`) and call `.into_bump_slice()`, `.into_bump_str()`,
-`Box::into_bump_ref()`, or `frame.alloc_str()` / `frame.alloc_slice_copy()`. Only intentional
-process-lifetime `'static` values may use `ProgramArena`, `Root::leak`, or `leak_static` (checked by
-`blaze::heap_leak`). An allocator is never implied (`Vec::new`, `vec![]`, `collect`, `Box::new`,
-`String::from`, `format!`, `to_string`, `to_owned`, `to_vec`, a `clone` of an owning value), and no
-comment stands in for one: `// alloc: <why>` keeps nothing, and an item that must keep an implied
-allocator says why with `#[expect(blaze::implicit_allocator, reason = "..")]`.
-`blaze::implicit_allocator` enforces this, with a fix to the explicit `Global` form, and
-`blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds each crate's `//
-alloc:` lines left to convert, its `expect`s and its lines naming `Global` to a list that only
+EVERY crate in blaze (compiler, runtime, tooling, shell, UI, config, parsers — not only compiler
+internals) MUST be `#![no_std]` on `bstd` and `blaze-own` (`AVec`, `AString`, `Vec::new_in(alloc)`,
+`String::new_in(alloc)`, `blaze_hash::{HashMap, HashSet}`), with `#![deny(blaze::std_use)]`,
+`#![deny(blaze::implicit_allocator)]`, and `#![blaze::sans_io]` on every library core; only the
+thinnest OS/GPU host driver boundary touches OS APIs, and even there collections still prefer
+`bstd`/`blaze-own`. First, don't allocate where a borrow, a fixed buffer or the caller's buffer
+does: borrow instead of `to_owned`, `clone` or `to_vec`; write into the caller's buffer with
+`blaze_mem::format_into!` or `write!` instead of `format!` or `to_string`; use an array for a small
+`vec![..]`; pass an iterator on instead of `collect()`. Where an allocation is needed, allocate by
+lifetime and name the allocator: a collection that lives within one task (a query run, a codegen
+unit, a maintainer pass) uses `Vec::new_in(frame)` / `Box::new_in(.., frame)` from
+`blaze_mem::frame::current`, the request's lifetime uses the request's allocator, what outlives the
+request is a record and not heap (`outputs-are-records`), and the global heap is named `Global`
+where it is used (`Vec::new_in(Global)`, `Box::new_in(x, Global)`). Never expose or call general
+`.leak()`: to freeze bump-allocated storage into an arena-lifetime slice or reference, require
+`BumpAlloc` (`&Frame`, `ArenaLocal`, `&Inline`, `Bump<'a>`) and call `.into_bump_slice()`,
+`.into_bump_str()`, `Box::into_bump_ref()`, or `frame.alloc_str()` / `frame.alloc_slice_copy()`.
+Only intentional process-lifetime `'static` values may use `ProgramArena`, `Root::leak`, or
+`leak_static` (checked by `blaze::heap_leak`). An allocator is never implied (`std::vec::Vec::new`,
+`vec![]`, `collect`, `Box::new`, `String::from`, `format!`, `to_string`, `to_owned`, `to_vec`, a
+`clone` of an owning value), and no comment stands in for one: `// alloc: <why>` keeps nothing, and
+an item that must keep an implied allocator says why with `#[expect(blaze::implicit_allocator,
+reason = "..")]`. `blaze::implicit_allocator` enforces this, with a fix to the explicit `Global`
+form, and `blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds each crate's
+`// alloc:` lines left to convert, its `expect`s and its lines naming `Global` to a list that only
 shrinks.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
