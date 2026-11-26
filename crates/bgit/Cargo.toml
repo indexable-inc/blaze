@@ -15,6 +15,7 @@ name = "bgit"
 path = "src/main.rs"
 
 [dependencies]
+blaze-core.workspace = true
 blaze-deflate.workspace = true
 blaze-git.workspace = true
 blaze-git-fetch.workspace = true

@@ -87,6 +87,9 @@ fn real_git_infect_merge_serve_clone_push_and_disinfect() {
     assert!(orig.join(".bgit/refs.bgref").is_file());
     assert!(orig.join(".bgit/graph.bggp").is_file());
 
+    let verify_out = run_bgit(&["verify", orig.to_str().unwrap()]);
+    assert!(verify_out.contains("Verified"), "unexpected verify output: {verify_out}");
+
     // 3. `bgit merge-base` matches `git merge-base` byte-for-byte!
     let bgit_mb = run_bgit(&["merge-base", orig.to_str().unwrap(), "main", "feature"]);
     assert_eq!(bgit_mb, git_mb);

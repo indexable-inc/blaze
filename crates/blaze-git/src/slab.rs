@@ -120,6 +120,86 @@ pub struct SlabIndexEntry {
     pub raw_len: u32,
 }
 
+/// Metrics returned by [`encode_slab_record_with_oid`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EncodedSlabRecord {
+    pub oid: Oid,
+    pub raw_len: u32,
+    pub stored_len: u32,
+}
+
+/// Writes the 16-byte `BGOB` v1 file header into `out`.
+pub fn write_slab_header<'a>(out: &mut AVec<'a, u8>) {
+    out.extend_from_slice(BGOB_MAGIC);
+    out.extend_from_slice(&1u32.to_le_bytes()); // version 1
+    out.extend_from_slice(&0u32.to_le_bytes()); // flags
+    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+}
+
+/// Encodes one standalone 8-byte-aligned `BGOB` v1 object record into `out` (appending).
+///
+/// Pure and self-contained so a multi-core driver can compress many objects in parallel and
+/// concatenate the resulting slices in deterministic OID order after [`write_slab_header`],
+/// producing byte-for-byte identical slabs to [`SlabWriter`].
+pub fn encode_slab_record_with_oid<'a>(
+    oid: Oid,
+    kind: ObjectKind,
+    body: &[u8],
+    compression: SlabCompression,
+    alloc: Alloc<'a>,
+    out: &mut AVec<'a, u8>,
+) -> Result<EncodedSlabRecord, GitError> {
+    let raw_len = u32::try_from(body.len()).map_err(|_| GitError {
+        file: GitFile::Slab,
+        at: out.len() as u64,
+        kind: ErrorKind::BudgetExceeded,
+    })?;
+
+    let mut zstd_buf: Option<AVec<'a, u8>> = None;
+    let codec = match compression {
+        SlabCompression::RawOnly => SlabCodec::Raw,
+        SlabCompression::AutoZstd if body.len() >= 128 => {
+            match compress_in(body, CompressOpts::FAST, alloc) {
+                Ok(c) if c.len() + 16 < body.len() => {
+                    zstd_buf = Some(c);
+                    SlabCodec::Zstd
+                }
+                _ => SlabCodec::Raw,
+            }
+        }
+        SlabCompression::AutoZstd => SlabCodec::Raw,
+    };
+    let payload: &[u8] = zstd_buf.as_deref().unwrap_or(body);
+    let stored_len = u32::try_from(payload.len()).map_err(|_| GitError {
+        file: GitFile::Slab,
+        at: out.len() as u64,
+        kind: ErrorKind::BudgetExceeded,
+    })?;
+
+    let mut hdr = [0u8; RECORD_HEADER_LEN];
+    hdr[0..20].copy_from_slice(&oid.0);
+    hdr[20] = kind_to_u8(kind);
+    hdr[21] = codec as u8;
+    hdr[22..24].copy_from_slice(&0u16.to_le_bytes());
+    hdr[24..28].copy_from_slice(&raw_len.to_le_bytes());
+    hdr[28..32].copy_from_slice(&stored_len.to_le_bytes());
+    let mut crc = blaze_deflate::Crc32::new();
+    crc.update(&hdr[0..32]);
+    crc.update(payload);
+    hdr[32..36].copy_from_slice(&crc.finish().to_le_bytes());
+
+    let start = out.len();
+    out.extend_from_slice(&hdr);
+    out.extend_from_slice(payload);
+    let rec_len = out.len() - start;
+    let padded_rec_len = align8(rec_len);
+    for _ in rec_len..padded_rec_len {
+        out.push(0);
+    }
+
+    Ok(EncodedSlabRecord { oid, raw_len, stored_len })
+}
+
 /// Append-only encoder for a `BGOB` v1 object slab.
 pub struct SlabWriter<'a> {
     slab_id: u16,
@@ -134,10 +214,7 @@ pub struct SlabWriter<'a> {
 impl<'a> SlabWriter<'a> {
     pub fn new(slab_id: u16, compression: SlabCompression, alloc: Alloc<'a>) -> SlabWriter<'a> {
         let mut buf = Vec::new_in(alloc);
-        buf.extend_from_slice(BGOB_MAGIC);
-        buf.extend_from_slice(&1u32.to_le_bytes()); // version 1
-        buf.extend_from_slice(&0u32.to_le_bytes()); // flags
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        write_slab_header(&mut buf);
         SlabWriter {
             slab_id,
             compression,
@@ -162,11 +239,6 @@ impl<'a> SlabWriter<'a> {
         kind: ObjectKind,
         body: &[u8],
     ) -> Result<SlabIndexEntry, GitError> {
-        let raw_len = u32::try_from(body.len()).map_err(|_| GitError {
-            file: GitFile::Slab,
-            at: self.buf.len() as u64,
-            kind: ErrorKind::BudgetExceeded,
-        })?;
         let offset = self.buf.len() as u64;
         if offset >= (1u64 << 48) {
             return Err(GitError {
@@ -175,51 +247,18 @@ impl<'a> SlabWriter<'a> {
                 kind: ErrorKind::BudgetExceeded,
             });
         }
+        let rec = encode_slab_record_with_oid(
+            oid,
+            kind,
+            body,
+            self.compression,
+            self.alloc,
+            &mut self.buf,
+        )?;
+        self.raw_bytes_total = self.raw_bytes_total.saturating_add(u64::from(rec.raw_len));
+        self.stored_bytes_total = self.stored_bytes_total.saturating_add(u64::from(rec.stored_len));
 
-        let mut zstd_buf: Option<AVec<'a, u8>> = None;
-        let codec = match self.compression {
-            SlabCompression::RawOnly => SlabCodec::Raw,
-            SlabCompression::AutoZstd if body.len() >= 128 => {
-                match compress_in(body, CompressOpts::FAST, self.alloc) {
-                    Ok(c) if c.len() + 16 < body.len() => {
-                        zstd_buf = Some(c);
-                        SlabCodec::Zstd
-                    }
-                    _ => SlabCodec::Raw,
-                }
-            }
-            SlabCompression::AutoZstd => SlabCodec::Raw,
-        };
-        let payload: &[u8] = zstd_buf.as_deref().unwrap_or(body);
-        let stored_len = u32::try_from(payload.len()).map_err(|_| GitError {
-            file: GitFile::Slab,
-            at: offset,
-            kind: ErrorKind::BudgetExceeded,
-        })?;
-
-        let mut hdr = [0u8; RECORD_HEADER_LEN];
-        hdr[0..20].copy_from_slice(&oid.0);
-        hdr[20] = kind_to_u8(kind);
-        hdr[21] = codec as u8;
-        hdr[22..24].copy_from_slice(&0u16.to_le_bytes());
-        hdr[24..28].copy_from_slice(&raw_len.to_le_bytes());
-        hdr[28..32].copy_from_slice(&stored_len.to_le_bytes());
-        let mut crc = blaze_deflate::Crc32::new();
-        crc.update(&hdr[0..32]);
-        crc.update(payload);
-        hdr[32..36].copy_from_slice(&crc.finish().to_le_bytes());
-
-        self.buf.extend_from_slice(&hdr);
-        self.buf.extend_from_slice(payload);
-        let padded = align8(self.buf.len());
-        while self.buf.len() < padded {
-            self.buf.push(0);
-        }
-
-        self.raw_bytes_total = self.raw_bytes_total.saturating_add(u64::from(raw_len));
-        self.stored_bytes_total = self.stored_bytes_total.saturating_add(u64::from(stored_len));
-
-        let entry = SlabIndexEntry { oid, slab_id: self.slab_id, offset, raw_len };
+        let entry = SlabIndexEntry { oid, slab_id: self.slab_id, offset, raw_len: rec.raw_len };
         self.entries.push(entry);
         Ok(entry)
     }
@@ -549,7 +588,13 @@ pub struct SlabIndex<'b> {
 }
 
 impl<'b> SlabIndex<'b> {
-    pub fn parse(bytes: &'b [u8], max_entries: u32) -> Result<SlabIndex<'b>, GitError> {
+    /// Parses a mapped `BGIX` v1 file in O(1) touching ONLY the 1,040-byte header and fanout
+    /// table (1 page even on a 1,000,000-object monorepo).
+    ///
+    /// Use this on the hot read-only mmap open path; use [`SlabIndex::parse`] for full-file
+    /// CRC-32 verification (`fsck` / tests). Every object read from the slab still verifies its
+    /// own per-record CRC-32 inside [`SlabReader::read_at`].
+    pub fn parse_header_fast(bytes: &'b [u8], max_entries: u32) -> Result<SlabIndex<'b>, GitError> {
         if bytes.len() < BGIX_OIDS_OFF + 4 || &bytes[0..4] != BGIX_MAGIC {
             return Err(GitError { file: GitFile::SlabIndex, at: 0, kind: ErrorKind::Malformed });
         }
@@ -573,14 +618,6 @@ impl<'b> SlabIndex<'b> {
         if bytes.len() != expected {
             return Err(GitError { file: GitFile::SlabIndex, at: 0, kind: ErrorKind::Malformed });
         }
-        let want_crc = u32_le(bytes, bytes.len() - 4);
-        if crc32(&bytes[..bytes.len() - 4]) != want_crc {
-            return Err(GitError {
-                file: GitFile::SlabIndex,
-                at: (bytes.len() - 4) as u64,
-                kind: ErrorKind::ChecksumMismatch,
-            });
-        }
         let mut prev = 0u32;
         for b in 0..256usize {
             let cur = u32_be(bytes, BGIX_HEADER_LEN + b * 4);
@@ -601,6 +638,19 @@ impl<'b> SlabIndex<'b> {
             });
         }
         Ok(SlabIndex { bytes, count })
+    }
+
+    pub fn parse(bytes: &'b [u8], max_entries: u32) -> Result<SlabIndex<'b>, GitError> {
+        let idx = SlabIndex::parse_header_fast(bytes, max_entries)?;
+        let want_crc = u32_le(bytes, bytes.len() - 4);
+        if crc32(&bytes[..bytes.len() - 4]) != want_crc {
+            return Err(GitError {
+                file: GitFile::SlabIndex,
+                at: (bytes.len() - 4) as u64,
+                kind: ErrorKind::ChecksumMismatch,
+            });
+        }
+        Ok(idx)
     }
 
     /// Mints a [`VerifiedIndex`] proof from this already-verified [`SlabIndex`].

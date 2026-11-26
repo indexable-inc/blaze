@@ -249,6 +249,135 @@ fn emit_copy<'a>(offset: u32, size: u32, out: &mut AVec<'a, u8>) {
     out.extend_from_slice(&extra[..elen]);
 }
 
+/// One chunk of encoded PACK v2 entries produced independently on a worker thread (offsets are
+/// chunk-relative and rebased by [`assemble_pack_from_chunks`]).
+pub struct EncodedPackChunk<'a> {
+    pub bytes: AVec<'a, u8>,
+    pub entries: AVec<'a, WrittenPackEntry>,
+}
+
+/// Encodes an ordered slice of unique `oids` into a self-contained PACK v2 chunk (with intra-
+/// chunk `OFS_DELTA` and `blaze-deflate` zlib compression) so a multi-core driver can encode
+/// disjoint OID slices concurrently across all cores over a read-only mmap store and stitch them
+/// deterministically via [`assemble_pack_from_chunks`].
+pub fn encode_pack_chunk<'a, S: ObjectStore<'a> + ?Sized>(
+    store: &S,
+    oids: &[Oid],
+    opts: PackWriteOpts,
+    alloc: Alloc<'a>,
+) -> Result<EncodedPackChunk<'a>, GitError> {
+    let mut out = Vec::new_in(alloc);
+    let mut entries: AVec<'a, WrittenPackEntry> = Vec::with_capacity_in(oids.len(), alloc);
+    let mut body = Vec::new_in(alloc);
+    let mut delta_buf = Vec::new_in(alloc);
+
+    struct LastBase<'a> {
+        offset: u64,
+        bytes: AVec<'a, u8>,
+    }
+    let mut last_blob: Option<LastBase<'a>> = None;
+    let mut last_tree: Option<LastBase<'a>> = None;
+
+    for &oid in oids {
+        let Some(kind) = store.read_object(&oid, &mut body)? else {
+            return Err(GitError {
+                file: GitFile::PackWrite,
+                at: out.len() as u64,
+                kind: ErrorKind::ObjectMissing(oid),
+            });
+        };
+        let entry_start = out.len();
+
+        let mut wrote_delta = false;
+        if opts.use_ofs_delta && body.len() >= 64 {
+            let cand = match kind {
+                ObjectKind::Blob => last_blob.as_ref(),
+                ObjectKind::Tree => last_tree.as_ref(),
+                _ => None,
+            };
+            if let Some(base) = cand
+                && encode_delta(&base.bytes, &body, alloc, &mut delta_buf)
+            {
+                // Chunk-relative backward distance equals final pack backward distance!
+                let back = (entry_start as u64) - base.offset;
+                write_pack_entry_header(6, delta_buf.len() as u64, &mut out);
+                write_ofs_back(back, &mut out);
+                zlib_append(&delta_buf, opts.deflate_level, alloc, &mut out)?;
+                wrote_delta = true;
+            }
+        }
+
+        if !wrote_delta {
+            write_pack_entry_header(kind_to_pack_num(kind), body.len() as u64, &mut out);
+            zlib_append(&body, opts.deflate_level, alloc, &mut out)?;
+            if opts.use_ofs_delta && body.len() <= (4 << 20) {
+                let slot = match kind {
+                    ObjectKind::Blob => Some(&mut last_blob),
+                    ObjectKind::Tree => Some(&mut last_tree),
+                    _ => None,
+                };
+                if let Some(slot) = slot {
+                    let mut saved = Vec::with_capacity_in(body.len(), alloc);
+                    saved.extend_from_slice(&body);
+                    *slot = Some(LastBase { offset: entry_start as u64, bytes: saved });
+                }
+            }
+        }
+
+        let mut crc = Crc32::new();
+        crc.update(&out[entry_start..]);
+        entries.push(WrittenPackEntry { oid, offset: entry_start as u64, crc32: crc.finish() });
+    }
+
+    Ok(EncodedPackChunk { bytes: out, entries })
+}
+
+/// Assembles pre-encoded [`EncodedPackChunk`]s (produced in parallel across worker threads) into
+/// one valid Git PACK v2 stream with trailing SHA-1 checksum and rebased `.idx` entry offsets.
+pub fn assemble_pack_from_chunks<'a>(
+    chunks: &[(&[u8], &[WrittenPackEntry])],
+    most_objects: u32,
+    alloc: Alloc<'a>,
+    out: &mut AVec<'a, u8>,
+) -> Result<AVec<'a, WrittenPackEntry>, GitError> {
+    out.clear();
+    let total_entries: usize = chunks.iter().map(|(_, e)| e.len()).sum();
+    let count = u32::try_from(total_entries).map_err(|_| GitError {
+        file: GitFile::PackWrite,
+        at: 0,
+        kind: ErrorKind::BudgetExceeded,
+    })?;
+    if count > most_objects {
+        return Err(GitError {
+            file: GitFile::PackWrite,
+            at: 0,
+            kind: ErrorKind::TooManyEntries { count, most: most_objects },
+        });
+    }
+    let total_bytes: usize = 12 + chunks.iter().map(|(b, _)| b.len()).sum::<usize>() + 20;
+    out.reserve(total_bytes);
+
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&count.to_be_bytes());
+
+    let mut entries = Vec::with_capacity_in(total_entries, alloc);
+    for &(chunk_bytes, chunk_entries) in chunks {
+        let base_off = out.len() as u64;
+        out.extend_from_slice(chunk_bytes);
+        for e in chunk_entries {
+            entries.push(WrittenPackEntry {
+                oid: e.oid,
+                offset: base_off + e.offset,
+                crc32: e.crc32,
+            });
+        }
+    }
+    let trailer = sha1(out);
+    out.extend_from_slice(&trailer);
+    Ok(entries)
+}
+
 /// Writes a valid Git PACK v2 stream containing `oids` read from `store` into `out` (cleared
 /// first), returning the per-entry `(oid, offset, crc32)` table for optional `.idx` v2 generation.
 pub fn write_pack_from_store<'a, S: ObjectStore<'a> + ?Sized>(
