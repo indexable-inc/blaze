@@ -408,6 +408,8 @@ fn sub32_smax(scalar: Scalar) -> i32 {
     }
 }
 
+const MAX_COMPOUND_DEPTH: usize = 64;
+
 fn push_ty_wasm_types(
     view: View<'_>,
     ty: Ty,
@@ -415,73 +417,96 @@ fn push_ty_wasm_types(
     inst: usize,
     dst: &mut AVec<'_, ValType>,
 ) -> Result<(), LirWasm64Error> {
-    if ty.is_none() {
-        return Ok(());
-    }
-    match ty.form() {
-        Form::Scalar => match ty.elem() {
-            Scalar::None => Ok(()),
-            Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
-                dst.push(ValType::I32);
-                Ok(())
-            }
-            Scalar::I64 | Scalar::Ptr => {
-                dst.push(ValType::I64);
-                Ok(())
-            }
-            Scalar::F32 => {
-                dst.push(ValType::F32);
-                Ok(())
-            }
-            Scalar::F64 => {
-                dst.push(ValType::F64);
-                Ok(())
-            }
-            Scalar::I128 => {
-                dst.push(ValType::I64);
-                dst.push(ValType::I64);
-                Ok(())
-            }
-            Scalar::F16 | Scalar::F128 => Err(LirWasm64Error::UnsupportedType { func, inst, ty }),
-        },
-        Form::Compound => {
-            for &member in view.members(ty) {
-                push_ty_wasm_types(view, Ty(member), func, inst, dst)?;
-            }
-            Ok(())
+    let mut stack = [Ty::NONE; MAX_COMPOUND_DEPTH];
+    let mut top = 0usize;
+    stack[top] = ty;
+    top += 1;
+    while top > 0 {
+        top -= 1;
+        let cur = stack[top];
+        if cur.is_none() {
+            continue;
         }
-        Form::Vector | Form::Scalable => Err(LirWasm64Error::UnsupportedType { func, inst, ty }),
+        match cur.form() {
+            Form::Scalar => match cur.elem() {
+                Scalar::None => {}
+                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => dst.push(ValType::I32),
+                Scalar::I64 | Scalar::Ptr => dst.push(ValType::I64),
+                Scalar::F32 => dst.push(ValType::F32),
+                Scalar::F64 => dst.push(ValType::F64),
+                Scalar::I128 => {
+                    dst.push(ValType::I64);
+                    dst.push(ValType::I64);
+                }
+                Scalar::F16 | Scalar::F128 => {
+                    return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
+                }
+            },
+            Form::Compound => {
+                let members = view.members(cur);
+                if top + members.len() > MAX_COMPOUND_DEPTH {
+                    return Err(LirWasm64Error::Overflow { what: "compound type nesting depth" });
+                }
+                for &member in members.iter().rev() {
+                    stack[top] = Ty(member);
+                    top += 1;
+                }
+            }
+            Form::Vector | Form::Scalable => {
+                return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
+            }
+        }
     }
+    Ok(())
 }
 
 fn wasm_slot_count(view: View<'_>, ty: Ty, func: u32, inst: usize) -> Result<u16, LirWasm64Error> {
-    if ty.is_none() {
-        return Ok(0);
-    }
-    match ty.form() {
-        Form::Scalar => match ty.elem() {
-            Scalar::None => Ok(0),
-            Scalar::I1
-            | Scalar::I8
-            | Scalar::I16
-            | Scalar::I32
-            | Scalar::I64
-            | Scalar::Ptr
-            | Scalar::F32
-            | Scalar::F64 => Ok(1),
-            Scalar::I128 => Ok(2),
-            Scalar::F16 | Scalar::F128 => Err(LirWasm64Error::UnsupportedType { func, inst, ty }),
-        },
-        Form::Compound => {
-            let mut sum = 0u16;
-            for &member in view.members(ty) {
-                let c = wasm_slot_count(view, Ty(member), func, inst)?;
+    let mut stack = [Ty::NONE; MAX_COMPOUND_DEPTH];
+    let mut top = 0usize;
+    stack[top] = ty;
+    top += 1;
+    let mut sum = 0u16;
+    while top > 0 {
+        top -= 1;
+        let cur = stack[top];
+        if cur.is_none() {
+            continue;
+        }
+        match cur.form() {
+            Form::Scalar => {
+                let c = match cur.elem() {
+                    Scalar::None => 0u16,
+                    Scalar::I1
+                    | Scalar::I8
+                    | Scalar::I16
+                    | Scalar::I32
+                    | Scalar::I64
+                    | Scalar::Ptr
+                    | Scalar::F32
+                    | Scalar::F64 => 1u16,
+                    Scalar::I128 => 2u16,
+                    Scalar::F16 | Scalar::F128 => {
+                        return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
+                    }
+                };
                 sum = sum.checked_add(c).ok_or(LirWasm64Error::Overflow { what: "compound slots" })?;
             }
-            Ok(sum)
+            Form::Compound => {
+                let members = view.members(cur);
+                if top + members.len() > MAX_COMPOUND_DEPTH {
+                    return Err(LirWasm64Error::Overflow { what: "compound type nesting depth" });
+                }
+                for &member in members.iter().rev() {
+                    stack[top] = Ty(member);
+                    top += 1;
+                }
+            }
+            Form::Vector | Form::Scalable => {
+                return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
+            }
         }
-        Form::Vector | Form::Scalable => Err(LirWasm64Error::UnsupportedType { func, inst, ty }),
     }
+    Ok(sum)
 }
 
 fn flatten_sig<'a>(
