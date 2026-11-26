@@ -207,7 +207,6 @@ fn list_owed_files<'n, 'a>(
     use blaze_scope::resolve::At;
     use blaze_surface::ItemKind;
 
-    let single_file = if owed_files.len() == 1 { owed_files.first().copied() } else { None };
     let mut files: blaze_own::AVec<'a, (u32, Option<&'n str>)> = blaze_own::AVec::with_capacity_in(owed_files.len(), alloc);
     let mut start_in = |file: u32, text: &str| -> Option<u32> {
         let base = match files.iter().find(|(f, _)| *f == file) {
@@ -231,51 +230,55 @@ fn list_owed_files<'n, 'a>(
 
     let mut out: blaze_own::AVec<'a, Listed<'n>> = blaze_own::AVec::new_in(alloc);
     let mut members: blaze_own::AVec<'a, ItemKey> = blaze_own::AVec::new_in(alloc);
-    for idx in 0..items.items() {
-        let Ok(Some(id)) = items.identity_at(idx) else { continue };
-        let Some(At::File(file)) = id.at else { continue };
-        let wanted = match single_file {
-            Some(only) => file == only,
-            None => owed_files.binary_search(&file).is_ok(),
-        };
-        if !wanted {
+    let mut prev_file: Option<u32> = None;
+    for &wanted_file in owed_files.iter() {
+        if prev_file == Some(wanted_file) {
             continue;
         }
-        let key = id.key;
-        match id.kind {
-            ItemKind::Function | ItemKind::Const | ItemKind::Static => {
-                let value = matches!(id.kind, ItemKind::Const | ItemKind::Static);
-                let Some(it) = NamesSource::text_of(records, key) else { continue };
-                if !value && it.text.trim_end().ends_with(';') {
-                    continue;
+        prev_file = Some(wanted_file);
+        let Ok(indices) = items.file_item_indices(wanted_file) else { continue };
+        for idx in indices {
+            let Ok(Some(id)) = items.identity_at(idx) else { continue };
+            let Some(At::File(file)) = id.at else { continue };
+            if file != wanted_file {
+                continue;
+            }
+            let key = id.key;
+            match id.kind {
+                ItemKind::Function | ItemKind::Const | ItemKind::Static => {
+                    let value = matches!(id.kind, ItemKind::Const | ItemKind::Static);
+                    let Some(it) = NamesSource::text_of(records, key) else { continue };
+                    if !value && it.text.trim_end().ends_with(';') {
+                        continue;
+                    }
+                    let Some(start) = start_in(file, it.text) else { continue };
+                    out.push(Listed { body: BodyRef::Free(key), at: Some(BodyAt { file, start }), entry: Some((file, it.item)) });
                 }
-                let Some(start) = start_in(file, it.text) else { continue };
-                out.push(Listed { body: BodyRef::Free(key), at: Some(BodyAt { file, start }), entry: Some((file, it.item)) });
-            }
-            ItemKind::Impl | ItemKind::Trait => {
-                let is_trait = id.kind == ItemKind::Trait;
-                NamesSource::each_member(records, key, &mut |m| {
-                    members.push(m.key);
-                    if m.written_by.is_some() {
-                        return;
-                    }
-                    let (kind, name) = match (m.kind, m.name) {
-                        (ItemKind::Function, Some(name)) => (MemberKind::Fn, name),
-                        (ItemKind::Const, Some(name)) => (MemberKind::Const, name),
-                        _ => return,
-                    };
-                    if is_trait && kind == MemberKind::Fn && m.text.trim_end().ends_with(';') {
-                        return;
-                    }
-                    let Some(start) = start_in(file, m.text) else { return };
-                    out.push(Listed {
-                        body: BodyRef::Member { container: key, is_trait, kind, name },
-                        at: Some(BodyAt { file, start }),
-                        entry: Some((file, m.item)),
+                ItemKind::Impl | ItemKind::Trait => {
+                    let is_trait = id.kind == ItemKind::Trait;
+                    NamesSource::each_member(records, key, &mut |m| {
+                        members.push(m.key);
+                        if m.written_by.is_some() {
+                            return;
+                        }
+                        let (kind, name) = match (m.kind, m.name) {
+                            (ItemKind::Function, Some(name)) => (MemberKind::Fn, name),
+                            (ItemKind::Const, Some(name)) => (MemberKind::Const, name),
+                            _ => return,
+                        };
+                        if is_trait && kind == MemberKind::Fn && m.text.trim_end().ends_with(';') {
+                            return;
+                        }
+                        let Some(start) = start_in(file, m.text) else { return };
+                        out.push(Listed {
+                            body: BodyRef::Member { container: key, is_trait, kind, name },
+                            at: Some(BodyAt { file, start }),
+                            entry: Some((file, m.item)),
+                        });
                     });
-                });
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     members.sort_unstable();
@@ -2030,7 +2033,7 @@ impl<'r> ScopeCache<'r> {
 /// Toolchain crate names that may declare `#[lang]` items or incoherent inherent impls
 /// (`#![rustc_coherence_is_core]` / `#[rustc_allow_incoherent_impl]`), matching
 /// `blaze-ladder/src/front2/source.rs` (`Records::name_lang_crates`) and `personality.rs`.
-fn is_lang_crate_name(name: &str) -> bool {
+pub(crate) fn is_lang_crate_name(name: &str) -> bool {
     matches!(name, "core" | "alloc" | "std" | "bstd" | "blaze_std" | "panic_unwind" | "panic_abort")
 }
 
@@ -2041,7 +2044,7 @@ fn is_lang_crate_name(name: &str) -> bool {
 /// `miniz_oxide`, `adler2`, `memchr`, `rustc_demangle`, `cfg_if`, `unwind`, `std_detect`,
 /// `rustc_std_workspace_*`, `compiler_builtins`, `test`) so `Records::name_lang_crates` and
 /// `StretchFront` never open ~15 unused toolchain `CrateScope` records on every edit.
-fn lang_places_of<A: core::alloc::Allocator>(
+pub(crate) fn lang_places_of<A: core::alloc::Allocator>(
     checked: &blaze_world::check_scope::CheckScope<'_>,
     list: &blaze_world::crate_list::CrateList<'static>,
     into: &mut Vec<usize, A>,
@@ -2560,6 +2563,96 @@ pub(crate) struct BodiesStage<'f> {
     /// [`BodiesStage::standing_view`], populated lazily on the coordinator thread and cleared
     /// whenever [`BodiesStage::plan_reach`] installs a new reach.
     standing_views: core::cell::RefCell<Option<StandingViewCache>>,
+    /// Request-local cache of the opened `BLZMEMB` members record so `plan_reach`, `ready_reads`,
+    /// and `groups` share one store read and one decode (rule 77).
+    members_cached: Option<CachedMembers>,
+}
+
+/// Request-local cached `BLZMEMB` view (or refusal) keyed by its CAS key.
+type CachedMembers = (
+    Key,
+    Result<blaze_own::Rc<crate::engine_members_record::View<'static>, blaze_own::Alloc<'static>>, crate::engine_members_record::MembersRefused>,
+);
+
+/// Lazy `BLZMEMB` writer that skips encoding, BLAKE3 hashing, and `store.put` when every member
+/// stands unchanged from an already content-stable stored members record (`CONTENT_STABLE_SERIAL`).
+struct MembersOut<'r> {
+    header: crate::engine_members_record::Header,
+    prior: Option<(Key, &'r crate::engine_members_record::View<'r>)>,
+    pending_stood: Vec<u32, blaze_own::Alloc<'static>>,
+    writer: Option<crate::engine_members_record::Writer<'static>>,
+    alloc: blaze_own::Alloc<'static>,
+}
+
+impl<'r> MembersOut<'r> {
+    fn new(
+        header: crate::engine_members_record::Header,
+        prior: Option<(Key, &'r crate::engine_members_record::View<'r>)>,
+        alloc: blaze_own::Alloc<'static>,
+    ) -> Self {
+        let prior = prior.filter(|(_, view)| view.header == header);
+        Self { header, prior, pending_stood: Vec::new_in(alloc), writer: None, alloc }
+    }
+
+    fn stood(&mut self, kept: &crate::engine_members_record::Member<'_>) {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.member(kept);
+        } else if self.prior.is_some() {
+            self.pending_stood.push(kept.at);
+        } else {
+            let mut writer = crate::engine_members_record::Writer::new(&self.header, self.alloc);
+            writer.member(kept);
+            self.writer = Some(writer);
+        }
+    }
+
+    fn member(&mut self, one: &crate::engine_members_record::Member<'_>) {
+        let writer = self.writer.get_or_insert_with(|| {
+            let mut w = crate::engine_members_record::Writer::new(&self.header, self.alloc);
+            if let Some((_, view)) = self.prior {
+                for &place in self.pending_stood.iter() {
+                    if let Some(kept) = view.member(place) {
+                        w.member(kept);
+                    }
+                }
+            }
+            self.pending_stood.clear();
+            w
+        });
+        writer.member(one);
+    }
+
+    /// Reuses the prior `BLZMEMB` key with zero encoding/hashing/puts when every member matched
+    /// the prior content-stable record; otherwise finishes and puts the new record.
+    fn finish_and_put(self, cx: &Cx, store: &mut dyn crate::store::Store<'_>) -> Result<(Key, bool), CliError> {
+        if self.writer.is_none()
+            && let Some((prior_key, view)) = self.prior
+            && view.len() == self.pending_stood.len()
+        {
+            return Ok((prior_key, false));
+        }
+        let writer = match self.writer {
+            Some(writer) => writer,
+            None => {
+                let mut w = crate::engine_members_record::Writer::new(&self.header, self.alloc);
+                if let Some((_, view)) = self.prior {
+                    for &place in self.pending_stood.iter() {
+                        if let Some(kept) = view.member(place) {
+                            w.member(kept);
+                        }
+                    }
+                }
+                w
+            }
+        };
+        let bytes = writer.finish();
+        let key = blaze_drive::key::content_key(&bytes);
+        if self.prior.is_some_and(|(prior_key, _)| prior_key == key) {
+            return Ok((key, false));
+        }
+        store.put(cx, key, &bytes)?;
+        Ok((key, true))
+    }
 }
 
 /// One multi-holder body row cached for [`BodiesStage::standing_view`].
@@ -3941,6 +4034,7 @@ impl<'f> BodiesStage<'f> {
             unreadable: None,
             by_need: crate::front_load::ByNeedCounts::default(),
             standing_views: core::cell::RefCell::new(None),
+            members_cached: None,
         }
     }
 
@@ -3970,7 +4064,50 @@ impl<'f> BodiesStage<'f> {
     /// from the record only where it was made over that answer (engine_members_record.rs
     /// `Header::made_at`). Both drivers set it; only [`StandingMembers`] reads it.
     pub(crate) fn members_from(&mut self, record: Option<Key>, last_serial: u64) {
+        if self.members_cached.as_ref().is_some_and(|(cached_key, _)| Some(*cached_key) != record) {
+            self.members_cached = None;
+        }
         self.members_last = Some((record, last_serial));
+    }
+
+    /// Opens the last request's `BLZMEMB` members record at most once per request, caching the
+    /// shared `Rc<View<'static>>` (or refusal) across `plan_reach`, `ready_reads`, and `groups`.
+    fn open_members<'r>(
+        &mut self,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        g: blaze_own::Alloc<'static>,
+    ) -> Result<
+        Option<Result<blaze_own::Rc<crate::engine_members_record::View<'static>, blaze_own::Alloc<'static>>, crate::engine_members_record::MembersRefused>>,
+        CliError,
+    > {
+        let Some(key) = self.members_last.and_then(|(record, _)| record) else {
+            return Ok(None);
+        };
+        if let Some((cached_key, cached)) = self.members_cached.as_ref()
+            && *cached_key == key
+        {
+            return Ok(Some(match cached {
+                Ok(view) => Ok(blaze_own::Share::share(view)),
+                Err(err) => Err(*err),
+            }));
+        }
+        let Some(held) = store.get(cx, key)? else {
+            return Ok(None);
+        };
+        let mut copy: Vec<u8, blaze_own::Alloc<'static>> = Vec::with_capacity_in(held.bytes.len(), g);
+        copy.extend_from_slice(held.bytes);
+        let bytes: &'static [u8] = copy.leak_static();
+        let opened = match crate::engine_members_record::View::open(bytes, g) {
+            Ok(view) => Ok(blaze_own::Rc::new_in(view, g)),
+            Err(err) => Err(err),
+        };
+        let out = match &opened {
+            Ok(view) => Ok(blaze_own::Share::share(view)),
+            Err(err) => Err(*err),
+        };
+        self.members_cached = Some((key, opened));
+        Ok(Some(out))
     }
 
     /// THE PLAN'S REACH (D191): which member units reach each file, made once a request from
@@ -4019,15 +4156,11 @@ impl<'f> BodiesStage<'f> {
             ReachFrom::MembersRecord => {
                 let refused = |unit: Option<Name>| EngineCheckError::ReadyRefused(ReadyRefused::Members { unit });
                 let Some(graph) = graph else { return Err(refused(None).into()) };
-                let stored = match self.members_last.and_then(|(record, _)| record) {
-                    Some(key) => store.get(cx, key)?.map(|held| held.bytes),
-                    None => None,
-                };
-                let view = match stored.map(|bytes| crate::engine_members_record::View::open(bytes, g)) {
+                let view = match self.open_members(cx, store, g)? {
                     Some(Ok(view)) if view.header.graph_out == graph.out => view,
                     _ => return Err(refused(None).into()),
                 };
-                Reach::of_members(list, scoped, &view, found, g).map_err(|unknown| refused(Some(unknown.unit)))?
+                Reach::of_members_shared(list, scoped, view, found, g).map_err(|unknown| refused(Some(unknown.unit)))?
             }
         };
         self.reach = Some(reach);
@@ -4097,13 +4230,12 @@ impl<'f> BodiesStage<'f> {
         let mut seeds: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
         let Some(list) = self.kept.list(cx, store, &graph, frame)? else { return Ok(seeds) };
         let today = rec::Header { graph_out: graph.out, tool, made_at: self.members_last.map_or(0, |(_, serial)| serial) };
-        let stored = match self.members_last.and_then(|(record, _)| record) {
-            Some(key) => store.get(cx, key)?.map(|held| held.bytes),
-            None => None,
-        };
         // A record that does not open stands no member (`groups` counts it and visits each):
         // every member's tree is then read, never one taken from a record it will not take.
-        let view = stored.and_then(|bytes| rec::View::open(bytes, g).ok());
+        let view = match self.open_members(cx, store, g)? {
+            Some(Ok(view)) => Some(view),
+            _ => None,
+        };
         let world = names.stage().names.as_ref();
         let is_test = |name: Name| world.is_some_and(|names| names.crate_at(name.subject).is_some_and(|at| names.list().test(at)));
         let root_of = |at: usize| Name::file(list.root(at).strip_prefix("/0/").unwrap_or(list.root(at)).as_bytes());
@@ -4133,19 +4265,19 @@ impl<'f> BodiesStage<'f> {
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
             let unit = crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) };
             let place = u32::try_from(member).unwrap_or(u32::MAX);
-            if view.as_ref().and_then(|view| stands(view, place, &today, moved, &unit, names)).is_some() {
+            if view.as_deref().and_then(|view| stands(view, place, &today, moved, &unit, names)).is_some() {
                 continue;
             }
             if !row_key_unit_only
                 && view
-                    .as_ref()
+                    .as_deref()
                     .and_then(|view| stands_below(view, place, &today, moved, &unit, names, &entries_now))
                     .is_some()
             {
                 continue;
             }
             seeds.push(root_of(member));
-            if let Some(kept) = view.as_ref().and_then(|view| view.member(place)) {
+            if let Some(kept) = view.as_deref().and_then(|view| view.member(place)) {
                 match &kept.state {
                     rec::MemberState::Held(held) => seeds.extend(held.held.iter().map(|held| held.slot)),
                     rec::MemberState::CutScope(cut) => seeds.extend(cut.held.iter().map(|held| held.slot)),
@@ -4414,14 +4546,14 @@ impl<'f> BodiesStage<'f> {
         let entered = Entered { tasks, rows: &rows, reach: reach.as_ref() };
         #[cfg(test)]
         let found = match (plants.open_whole, standing) {
-            (true, _) => self.groups::<Whole, EveryMember>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
-            (false, false) => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
-            (false, true) => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
+            (true, _) => self.groups::<Whole, EveryMember>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
+            (false, false) => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
+            (false, true) => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
         };
         #[cfg(not(test))]
         let found = match standing {
-            false => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
-            true => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
+            false => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
+            true => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, listings, frame, snapshot, &expansion_keys, &owed, entered)?,
         };
         let (mut found, stopped) = match found {
             Ok(found) => (Some(found), None),
@@ -5145,7 +5277,7 @@ impl<'f> BodiesStage<'f> {
     /// the files it reaches and does not hold, row key and uncovered bodies), unvisited: no names
     /// record asked, no environment made, no items record opened, no module tree walked. Every
     /// member visited ([`EveryMember`]) gives the same outputs; both write the record.
-    fn groups<'r, O: OpenWorld, S: SetupInputs>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, view: &(impl CellDigests + ?Sized), _plants: RowPlants, frame: &'f Frame, snapshot: &StoreSnapshot, expansion_keys: &SharedSet<Key, SharedAlloc<'static>>, owed: &[u32], asked: Entered<'_>) -> Result<Result<Found<'f, 'r>, Stop<'f>>, CliError> {
+    fn groups<'r, O: OpenWorld, S: SetupInputs>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'_, '_, '_, '_>, view: &(impl CellDigests + ?Sized), _plants: RowPlants, listings: &crate::engine_heads::Listings, frame: &'f Frame, snapshot: &StoreSnapshot, expansion_keys: &SharedSet<Key, SharedAlloc<'static>>, owed: &[u32], asked: Entered<'_>) -> Result<Result<Found<'f, 'r>, Stop<'f>>, CliError> {
         let Entered { tasks, rows, reach: plan_reach } = asked;
         let heap = handles.env.heap;
         let g = heap.alloc();
@@ -5222,20 +5354,20 @@ impl<'f> BodiesStage<'f> {
         // record is made again below (D160), never read in part.
         use crate::engine_members_record as rec;
         let today = rec::Header { graph_out: graph.out, tool: handles.tool, made_at: self.members_last.map_or(0, |(_, serial)| serial) };
-        let stored_members = match (S::STANDING, self.members_last.and_then(|(record, _)| record)) {
-            (true, Some(key)) => store.get(cx, key)?.map(|held| held.bytes),
-            _ => None,
-        };
-        let stood_view = match stored_members.map(|bytes| rec::View::open(bytes, g)) {
-            Some(Ok(view)) => {
-                tally.members_recorded = u32::try_from(view.len()).unwrap_or(u32::MAX);
-                Some(view)
+        let stood_view = if S::STANDING {
+            match self.open_members(cx, store, g)? {
+                Some(Ok(view)) => {
+                    tally.members_recorded = u32::try_from(view.len()).unwrap_or(u32::MAX);
+                    Some(view)
+                }
+                Some(Err(_refused)) => {
+                    tally.members_record_refused = tally.members_record_refused.saturating_add(1);
+                    None
+                }
+                None => None,
             }
-            Some(Err(_refused)) => {
-                tally.members_record_refused = tally.members_record_refused.saturating_add(1);
-                None
-            }
-            None => None,
+        } else {
+            None
         };
         tally.parts.members_record_ns = lap(handles.clock, &mut mark);
         let mut moved: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
@@ -5249,9 +5381,11 @@ impl<'f> BodiesStage<'f> {
         let drop_standing_heads = self.standing_drops_heads;
         // The planted control of the members' row key (`CommitPlant::RowKeyUnitOnly`).
         let row_key_unit_only = self.row_key_unit_only;
-        // This request's record, made at its answer's serial, one member at a time in the crate
-        // list's order.
-        let mut members_out = rec::Writer::new(&rec::Header { made_at: today.made_at.saturating_add(1), ..today }, g);
+        // This request's record, content-stable (`CONTENT_STABLE_SERIAL`): unchanged body edits
+        // reuse the prior `BLZMEMB` key with zero bytes encoded, hashed, or put (rule 77).
+        let out_header = rec::Header { made_at: rec::CONTENT_STABLE_SERIAL, ..today };
+        let prior_members = self.members_last.and_then(|(k, _)| k).zip(stood_view.as_deref());
+        let mut members_out = MembersOut::new(out_header, prior_members, g);
         let mut groups: Vec<Group<'f, 'r>, Global> = Vec::new_in(Global);
         let mut took: Vec<Took<'f>, blaze_own::Alloc<'static>> = Vec::new_in(g);
         // The first list that could not grow: the stage's typed stop (rule 3).
@@ -5349,7 +5483,7 @@ impl<'f> BodiesStage<'f> {
                 None => {
                     let Some(&(member, unit)) = below.get(below_at) else { break };
                     below_at += 1;
-                    let kept = stood_view.as_ref().and_then(|view| view.member(u32::try_from(member).unwrap_or(u32::MAX)));
+                    let kept = stood_view.as_deref().and_then(|view| view.member(u32::try_from(member).unwrap_or(u32::MAX)));
                     let rank = plan_reach.and_then(|reach| reach.rank_of(units[unit as usize].name));
                     let visit = deferral != Deferral::NeverVisited && kept.is_none_or(|kept| own_row_entered(kept, rows, rank));
                     if !visit {
@@ -5388,7 +5522,7 @@ impl<'f> BodiesStage<'f> {
             // not asked: no file of it is owed) and its uncovered bodies; written again whole.
             let place = u32::try_from(member).unwrap_or(u32::MAX);
             // Stood whole, or below its heads (piece A: kept in `below`, counted at its turn).
-            let standing = match (again, stood_view.as_ref()) {
+            let standing = match (again, stood_view.as_deref()) {
                 (None, Some(view)) => match stands(view, place, &today, &moved, &unit_val, names) {
                     Some(kept) => Some((kept, false)),
                     None => stands_below(view, place, &today, &moved, &unit_val, names, &entries_now).map(|kept| (kept, true)),
@@ -5405,7 +5539,7 @@ impl<'f> BodiesStage<'f> {
                         }
                         members.push(held.names);
                         if !drop_standing_heads {
-                            heads.extend(held.held.iter().map(|h| h.subject(kept.unit.prefix)));
+                            heads.extend(held.held.iter().map(|h| h.subject_lazy(kept.unit.prefix)));
                         }
                         member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
                         tally.files = tally.files.saturating_add(u32::try_from(held.held.len()).unwrap_or(u32::MAX));
@@ -5416,7 +5550,7 @@ impl<'f> BodiesStage<'f> {
                                 uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{label}")));
                             }
                         }
-                        members_out.member(kept);
+                        members_out.stood(kept);
                         tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
                         continue;
                     }
@@ -5424,11 +5558,11 @@ impl<'f> BodiesStage<'f> {
                         tally.members_stood = tally.members_stood.saturating_add(1);
                         members.push(cut.names);
                         if !drop_standing_heads {
-                            heads.extend(cut.held.iter().map(|h| h.subject(kept.unit.prefix)));
+                            heads.extend(cut.held.iter().map(|h| h.subject_lazy(kept.unit.prefix)));
                         }
                         member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
                         tally.files = tally.files.saturating_add(u32::try_from(cut.held.len()).unwrap_or(u32::MAX));
-                        members_out.member(kept);
+                        members_out.stood(kept);
                         tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
                         continue;
                     }
@@ -5436,7 +5570,7 @@ impl<'f> BodiesStage<'f> {
                         if let Some(words) = why.words() {
                             tally.members_stood = tally.members_stood.saturating_add(1);
                             member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(words), reads: own_cells }));
-                            members_out.member(kept);
+                            members_out.stood(kept);
                             tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
                             continue;
                         }
@@ -5454,7 +5588,7 @@ impl<'f> BodiesStage<'f> {
             // unchanged outlines from CAS on a 1-body edit while still refusing missing visited
             // trees on head/`mod` edits where `stands_below` is `None`) and reuse the record's
             // reach, held file map, and `row_key`.
-            let kept_below = match (again.is_some() && !row_key_unit_only, stood_view.as_ref().and_then(|view| view.member(place))) {
+            let kept_below = match (again.is_some() && !row_key_unit_only, stood_view.as_deref().and_then(|view| view.member(place))) {
                 (true, Some(kept)) => match &kept.state {
                     rec::MemberState::Held(held)
                         if found.iter().all(|edge| held.held.iter().any(|h| h.slot == edge.file) || kept.not_held.iter().any(|slot| *slot == edge.file)) =>
@@ -5528,6 +5662,7 @@ impl<'f> BodiesStage<'f> {
                 }
                 continue;
             };
+            listings.record_scope_key(list.key(member), own.at);
             // A member visited at need was pushed at its first turn (piece A).
             if again.is_none() {
                 members.push(own.name);
@@ -5666,7 +5801,7 @@ impl<'f> BodiesStage<'f> {
             // upfront `front_load::present` CAS lookups to `LazyScopeRecords::open` on first ask
             // while still checking `names.input_of` (in-memory on `phases`) so failed `CrateScope`
             // dependencies still cut the scope immediately.
-            let stood_in_record = again.is_some() || stood_view.as_ref().and_then(|view| view.member(place)).is_some_and(|m| matches!(m.state, rec::MemberState::Held(_)));
+            let stood_in_record = again.is_some() || stood_view.as_deref().and_then(|view| view.member(place)).is_some_and(|m| matches!(m.state, rec::MemberState::Held(_)));
             let defer_scope_inputs = stood_in_record
                 && names.stood_on().is_some()
                 && names.stage().results.is_empty()
@@ -5729,6 +5864,17 @@ impl<'f> BodiesStage<'f> {
                     scope.scope.dedup();
                     // Made by need, the member is its one opened crate (`scope_by_need`); a scope
                     // cut before the member has no group to check (the member is refused below).
+                    if let Some(ref rest) = unopened {
+                        for one in rest.iter() {
+                            listings.record_scope_key(one.key, one.input.at);
+                        }
+                    } else {
+                        for one in scope.crates.iter() {
+                            if let Some(inp) = input_at(one.world_at) {
+                                listings.record_scope_key(one.records.key, inp.at);
+                            }
+                        }
+                    }
                     let crates = match (unopened, scope.crates.first().copied()) {
                         (None, _) => Some(GroupCrates::Opened(scope.crates)),
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
@@ -5969,6 +6115,7 @@ impl<'f> BodiesStage<'f> {
                 owed_in.extend(owed_files.iter().map(|(file, _)| *file));
                 if owed_in.len() > 1 {
                     owed_in.sort_unstable();
+                    owed_in.dedup();
                 }
                 let mine = list_owed_files(records, &items, &owed_in, g);
                 // The unit's cfg, as the names library lowered the crate (body_types.rs
@@ -6436,9 +6583,7 @@ impl<'f> BodiesStage<'f> {
         // This request's members record, under the key of its bytes; the driver names it under
         // the checkout's members root at the commit (engine_check.rs).
         let mut put_mark = handles.clock.now();
-        let members_bytes = members_out.finish();
-        let members_key = blaze_drive::key::content_key(&members_bytes);
-        store.put(cx, members_key, &members_bytes)?;
+        let (members_key, _) = members_out.finish_and_put(cx, store)?;
         self.members_key = Some(members_key);
         setup_dep_files.persist(cx, store, &mut self.member_rows, heap)?;
         tally.parts.put_ns = lap(handles.clock, &mut put_mark);
@@ -9731,5 +9876,100 @@ mod worker_frame_caps_tests {
             .expect("non-toolchain dep file");
         warm_deps.persist(&cx, &mut store, &mut member_rows, heap).expect("persist warm dep files");
         assert_eq!(member_rows.as_ref().map_or(0, Vec::len), 1, "non-toolchain pack file pins into member_rows");
+    }
+
+    #[test]
+    fn members_out_reuses_content_stable_key_with_zero_puts_and_caches_open_once() {
+        use crate::engine_members_record as rec;
+        use crate::store::{CommandStore, Facts, Home};
+        use bstd::io::{Io, Limits, SimWorld};
+
+        let io = Io::simulated(SimWorld::new(89, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let err = io.need_err().expect("stderr");
+        let home = Home::of(&cx, &io.need_fs().expect("files"), Some("/h")).expect("test home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let lent = home.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 89 }, alloc).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store");
+
+        let header = rec::Header {
+            graph_out: ContentId([7; 32]),
+            tool: blaze_drive::Tool(ContentId([8; 32])),
+            made_at: rec::CONTENT_STABLE_SERIAL,
+        };
+        let make_member = |at: u32, test: bool, row_byte: u8| {
+            let mut held = Vec::new_in(alloc);
+            held.push(rec::Held {
+                file: 0,
+                slot: Name::file(b"src/lib.rs"),
+                path: b"src/lib.rs",
+                entries: ContentId([row_byte; 32]),
+            });
+            rec::Member {
+                at,
+                unit: crate::engine_body_plan::Unit {
+                    name: Name::new(Kind::CrateScope, ContentId([u8::try_from(at + 1).expect("small"); 32])),
+                    prefix: [u8::try_from(at + 1).expect("small"); 8],
+                    test,
+                },
+                state: rec::MemberState::Held(rec::HeldMember {
+                    names: Name::new(Kind::CrateScope, ContentId([u8::try_from(at + 1).expect("small"); 32])),
+                    names_out: ContentId([row_byte.wrapping_add(1); 32]),
+                    row: Key(ContentId([row_byte; 32])),
+                    uncovered: 0,
+                    named: Vec::new_in(alloc),
+                    held,
+                }),
+                not_held: Vec::new_in(alloc),
+            }
+        };
+
+        // Initial write puts content-stable BLZMEMB.
+        let m0 = make_member(0, false, 11);
+        let m1 = make_member(1, true, 22);
+        let mut out1 = MembersOut::new(header, None, alloc);
+        out1.member(&m0);
+        out1.member(&m1);
+        let (k1, did_put1) = out1.finish_and_put(&cx, &mut store).expect("initial put");
+        assert!(did_put1, "initial write must put BLZMEMB");
+
+        // BodiesStage::open_members caches the decoded View across plan_reach / ready_reads / groups.
+        let mut stage = BodiesStage::new(crate::engine_scope_reads::ScopeReadsAs::Cells);
+        stage.members_from(Some(k1), 42);
+        let v1 = stage.open_members(&cx, &mut store, alloc).expect("first open").expect("present").expect("valid");
+        let v2 = stage.open_members(&cx, &mut store, alloc).expect("second open").expect("present").expect("valid");
+        assert!(core::ptr::eq(&*v1, &*v2), "open_members must reuse the single cached Rc<View>");
+        assert_eq!(v1.len(), 2);
+        assert_eq!(v1.header.made_at, rec::CONTENT_STABLE_SERIAL);
+
+        // Unchanged body edit: both members stand -> 0 bytes encoded, 0 bytes hashed, 0 store.put.
+        let mut out2 = MembersOut::new(header, Some((k1, &v1)), alloc);
+        out2.stood(v1.member(0).expect("member 0"));
+        out2.stood(v1.member(1).expect("member 1"));
+        let (k2, did_put2) = out2.finish_and_put(&cx, &mut store).expect("reused finish");
+        assert_eq!(k2, k1, "unchanged members reuse exact prior key");
+        assert!(!did_put2, "unchanged members must perform 0 BLZMEMB puts");
+
+        // Control 1: member 0 stands, member 1 changes -> flushes member 0 and puts new key.
+        let m1_changed = make_member(1, true, 99);
+        let mut out3 = MembersOut::new(header, Some((k1, &v1)), alloc);
+        out3.stood(v1.member(0).expect("member 0"));
+        out3.member(&m1_changed);
+        let (k3, did_put3) = out3.finish_and_put(&cx, &mut store).expect("changed put");
+        assert!(did_put3 && k3 != k1, "changed member must put a fresh BLZMEMB");
+        stage.members_from(Some(k3), 43);
+        let v3 = stage.open_members(&cx, &mut store, alloc).expect("open k3").expect("present").expect("valid");
+        assert_eq!(v3.len(), 2);
+        assert!(v3.member(0).is_some() && v3.member(1).is_some());
+
+        // Control 2: narrowed scope (only 1 of 2 prior members stood) -> puts new 1-member record.
+        let mut out4 = MembersOut::new(header, Some((k1, &v1)), alloc);
+        out4.stood(v1.member(0).expect("member 0"));
+        let (k4, did_put4) = out4.finish_and_put(&cx, &mut store).expect("narrowed put");
+        assert!(did_put4 && k4 != k1, "narrowed member set must not reuse 2-member key");
+        stage.members_from(Some(k4), 44);
+        let v4 = stage.open_members(&cx, &mut store, alloc).expect("open k4").expect("present").expect("valid");
+        assert_eq!(v4.len(), 1);
     }
 }

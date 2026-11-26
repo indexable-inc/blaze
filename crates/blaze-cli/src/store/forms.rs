@@ -202,7 +202,7 @@ impl core::fmt::Display for Note<'_> {
 /// directory tag is written then too when it is missing (a home whose first store is of this
 /// form: the tag stays at `v2/store`, clean.rs checks it there). The stores found, said.
 pub(crate) fn note_once<D: Driver>(cx: &Cx, blaze: &Dir<ReadWrite>, lent: &Lent<D, StoreAlloc>, err: &Out) -> Result<u32, CliError> {
-    if lent.roots().iter().any(|(name, _)| name == OTHER_FORMS_LOOKED) {
+    if lent.has_root(OTHER_FORMS_LOOKED) {
         return Ok(0);
     }
     let tag = root()?.join(&Path::new(CACHEDIR_TAG)?);

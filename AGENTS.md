@@ -2,8 +2,8 @@
 # blaze
 
 blaze is a vertically integrated Rust stack for edit-to-result speed and hardware-floor execution.
-We own every layer: language, bstd, MIR/LIR, ABI, JIT/PGO/AOT, exporter, linter, runtime, and
-bare-metal/unikernel VMs (kernel too). Verticalize across all of them; fix anything below SOTA now.
+We own language, comptime reflection, pinned std/core/alloc, bstd, MIR/LIR, ABI, JIT/PGO/AOT,
+exporter, linter, runtime & kernels; delete jank/duplication and fix anything below SOTA now.
 
 ## The standard
 
@@ -37,7 +37,7 @@ time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical 
 In scope:
 - Cargo workspaces. The acceptance projects are reth, tempo and blaze itself.
 - Targets: macOS arm64, Linux (arm64 first; x86-64 CI), and bare-metal / unikernel VMs (kernel too).
-- Vertical ownership: co-design language, bstd, MIR/LIR, ABI, JIT/PGO, JIT linter, runtime & kernel.
+- Vertical ownership: co-design language, comptime reflection, pinned std, bstd, MIR/LIR & runtime.
 - `run`, `test`, `check`; `export` (native, PGO by default). No `build`. Runs compile what's called.
 - Deps and cached records are fully optimized; workspace code tiers up via cross-fn LTO & PGO.
 - std's records (names, heads, code) are fetched per platform from R2, CI-written; yours stay local.
@@ -81,8 +81,8 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **25. deterministic-output**: No key, record or output holds the machine or map order; two builders of one key write equal bytes.
 - **31. semantics-in-front-end**: Semantics go in the front end's crates; codegen, the store and the driver stay outside.
 - **32. library-over-language**: Build a feature as a library; failing that, add the smallest general primitive.
-- **55. own-the-language**: Never design around what Rust lacks: build the feature as an opt-in extension and use it.
-- **56. reflection-first**: Derive a property by compile-time reflection, not an auto trait, a proc macro or a special case.
+- **55. own-the-language**: Never work around Rust/std/bstd gaps: extend language, comptime, std or bstd and delete jank.
+- **56. reflection-first**: Use comptime reflection (`inline for`) aggressively to kill boilerplate, macros, codecs & jank.
 - **65. granular-caching**: Every cache is keyed per item by a key from text, computed before the work; never per crate.
 - **71. item-relative-positions**: Keys and records hold item-relative positions; `file:line:col` exists only when printed.
 - **74. verify-once**: A check happens once and returns a proof type that later code takes; nothing is verified twice.

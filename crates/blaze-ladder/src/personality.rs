@@ -30,7 +30,7 @@ use blaze_id::ItemKey as LibKey;
 
 use crate::code_records::PanicStrategy;
 use crate::front::FnLang;
-use crate::front2::index::{Index, LangTwice};
+use crate::front2::index::LangTwice;
 use crate::front2::source::NamesSource;
 
 /// Why the program has no personality routine to name.
@@ -70,13 +70,115 @@ impl core::error::Error for PersonalityError {}
 /// `panic = "abort"` (nothing lands, so nothing names one, and nothing is read); for one built
 /// `panic = "unwind"`, its `#[lang = "eh_personality"]` fn, or `None` when its lang crates
 /// declare none (the module's doc: refused at the first record that lands, not here).
+///
+/// Scans `names.each_lang(krate, ...)` directly for [`FnLang::EhPersonality`] with zero heap
+/// allocations instead of building a full ~160-entry `Index::from_source` map.
 pub fn personality_of<'n, S: NamesSource<'n>>(names: S, lang_crates: &[usize], panic: PanicStrategy) -> Result<Option<LibKey>, PersonalityError> {
     if panic == PanicStrategy::Abort {
         return Ok(None);
     }
-    let index = Index::from_source(names, lang_crates).map_err(PersonalityError::Lang)?;
-    if let Some((first, second)) = index.fn_lang_clash(FnLang::EhPersonality) {
-        return Err(PersonalityError::Twice { first, second });
+    let wanted = FnLang::EhPersonality.declared_as();
+    let mut found: Option<(LibKey, usize, &'n str)> = None;
+    let mut clash: Option<PersonalityError> = None;
+    let named = |krate: usize| (format!("{:?}", names.crate_key(krate)), format!("crate {krate} of the records"));
+    for &krate in lang_crates {
+        if names.proc_macro(krate) == Some(true) {
+            continue;
+        }
+        names.each_lang(krate, &mut |name, key| {
+            if clash.is_some() || !wanted.contains(&name) {
+                return;
+            }
+            match found {
+                None => found = Some((key, krate, name)),
+                Some((first, _, _)) if first == key => {}
+                Some((first, first_crate, first_name)) if first_name == name => {
+                    clash = Some(PersonalityError::Lang(LangTwice {
+                        name: name.into(),
+                        first,
+                        second: key,
+                        crates: [named(first_crate), named(krate)],
+                    }));
+                }
+                Some((first, _, _)) => {
+                    clash = Some(PersonalityError::Twice { first, second: key });
+                }
+            }
+        });
+        if let Some(err) = clash {
+            return Err(err);
+        }
     }
-    Ok(index.fn_lang(FnLang::EhPersonality))
+    Ok(found.map(|(key, _, _)| key))
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_id::CrateItemKey;
+    use blaze_ids::ContentId;
+    use blaze_mem::Frame;
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::task::Serial;
+    use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+    use blaze_surface::Edition;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    use super::{PersonalityError, personality_of};
+    use crate::code_records::PanicStrategy;
+
+    struct MapTexts<'a>(&'a [(&'a str, &'a str)]);
+
+    impl<'a> SourceTexts<'a> for MapTexts<'a> {
+        fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+            self.0.iter().find(|&&(p, _)| p == path).map(|&(_, text)| text)
+        }
+    }
+
+    #[test]
+    fn personality_of_fast_path_finds_skips_proc_macro_and_catches_duplicates() {
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+
+        let files: &[(&str, &str)] = &[
+            ("/a/lib.rs", "#![no_core]\n#[lang = \"eh_personality\"] pub fn pers_a() {}\n"),
+            ("/b/lib.rs", "#![no_core]\n#[lang = \"eh_personality\"] pub fn pers_b() {}\n"),
+            ("/c/lib.rs", "#![no_core]\npub fn plain() {}\n"),
+        ];
+        let texts = MapTexts(files);
+        let mk = |name: &'static str, root: &'static str, proc_macro: bool| CrateInput {
+            name,
+            key: CrateItemKey(ContentId::of("personality fast path test", name.as_bytes())),
+            root,
+            shown_from: "/",
+            edition: Edition::E2021,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let inputs = [
+            mk("a", "/a/lib.rs", false),
+            mk("b_pm", "/b/lib.rs", true),
+            mk("b", "/b/lib.rs", false),
+            mk("c", "/c/lib.rs", false),
+        ];
+        let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+        let solved = resolve_crates(&inputs, sysroot, &texts, &Serial, bump).expect("resolve");
+
+        // Abort returns None without touching lang crates.
+        assert_eq!(personality_of(&solved, &[0, 2], PanicStrategy::Abort), Ok(None));
+
+        // Single eh_personality found; proc-macro crate 1 is skipped.
+        let found = personality_of(&solved, &[3, 1, 0], PanicStrategy::Unwind).expect("single eh_personality");
+        assert!(found.is_some(), "eh_personality from crate 0 must be found");
+
+        // None declared returns Ok(None).
+        assert_eq!(personality_of(&solved, &[3, 1], PanicStrategy::Unwind), Ok(None));
+
+        // Duplicate eh_personality across two non-proc-macro crates returns PersonalityError::Lang.
+        let err = personality_of(&solved, &[0, 2], PanicStrategy::Unwind).expect_err("duplicate eh_personality must fail");
+        assert!(matches!(err, PersonalityError::Lang(ref t) if t.name == "eh_personality"), "unexpected error: {err:?}");
+    }
 }

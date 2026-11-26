@@ -182,7 +182,16 @@ impl<'a> Root<'a> {
         alloc: SharedAlloc<'a>,
     ) -> Encoded<'a> {
         let task_puts = u32::try_from(puts.len()).unwrap_or(u32::MAX);
-        let mut bytes = SVec::with_capacity_in(ROOT_HEAD + 4 + ID * self.pages.len(), alloc);
+        let file_bytes: usize = self.files.values().map(|d| NAME + 1 + usize::from(d.is_some()) * ID).sum();
+        let cap = ROOT_HEAD
+            .saturating_add(4 + ID * self.pages.len())
+            .saturating_add(4 + file_bytes)
+            .saturating_add(4 + FILE_PLACE * self.places.len())
+            .saturating_add(4 + NAME * self.units.len())
+            .saturating_add(4 + (NAME + 4) * self.findings.len())
+            .saturating_add(4 + OWED_TASK * self.owed_tasks.len())
+            .saturating_add(4 + OWED_CELL * self.owed_cells.len());
+        let mut bytes = SVec::with_capacity_in(cap, alloc);
         self.write_header(ROOT_FLAG_FLAT, &mut bytes);
         put_u32(&mut bytes, self.pages.len());
         for key in self.pages.iter() { put_id(&mut bytes, &key.0); }

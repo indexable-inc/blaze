@@ -820,10 +820,11 @@ pub(super) fn write_flat_file_member_from_v6(dicts: PageDicts<'_>, m: &[u8], out
 }
 
 /// Approximate `BEP6` logical/page weight for sizing `bits_kept` (`encode` / `try_repage`),
-/// keeping compacted `BEP6` pages fine-grained (~16-32 KiB) for fast incremental edits.
+/// accounting for per-page dictionary overhead so compacted `BEP6` pages stay fine-grained
+/// (~15–25 KiB) for fast incremental edits.
 pub(super) fn estimate_row_v6(defines: usize, reads: usize) -> u64 {
     let base = ROW_FIXED_V6 + NAME + 3 * ID;
-    u64::try_from(base.saturating_add(defines.saturating_mul(32)).saturating_add(reads.saturating_mul(32)))
+    u64::try_from(base.saturating_add(defines.saturating_mul(16)).saturating_add(reads.saturating_mul(12)))
         .unwrap_or(u64::MAX)
 }
 

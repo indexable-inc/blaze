@@ -68,6 +68,8 @@ crates/blaze-cli/src/roster.rs	VERSION	none
 crates/blaze-cli/src/run_ids.rs	TABLE_MAGIC	none
 crates/blaze-cli/src/run_ids.rs	TABLE_VERSION	none
 crates/blaze-cli/src/run_names.rs	MAGIC	none
+crates/blaze-cli/src/run_names.rs	TEST_INVENTORY_MAGIC	test previous_inventory_magic_is_refused
+crates/blaze-cli/src/run_names.rs	TEST_INVENTORY_VERSION	test previous_inventory_magic_is_refused
 crates/blaze-cli/src/sdk.rs	MAGIC	none
 crates/blaze-cli/src/seal.rs	SEAL_MAGIC	none
 crates/blaze-cli/src/start_list.rs	MAGIC	none

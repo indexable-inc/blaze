@@ -38,6 +38,9 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as EffectTag};
+/// Effect queue passed into `Plain` state transitions.
+type EffectList = Vec<Effect>;
+type EffectBuf<E> = Vec<Effect, E>;
 use blaze_hash::{BuildKeyHasher, Map, MapOpts, hash_map::Entry as HashEntry};
 use blaze_ids::{ContentId, crc32c};
 use blaze_mem::Kept;
@@ -1409,6 +1412,22 @@ enum Ctx {
 pub const COMMIT_PIECE_BYTES: usize = 4 << 20;
 /// Hard cap on streamed commit payload pieces in flight at once (`4 * 4 MiB = 16 MiB` ceiling).
 pub const COMMIT_PIECES_IN_FLIGHT: u32 = 4;
+/// Segments at or below this total length (and no larger than `commit_piece_bytes`) are assembled
+/// into a single contiguous `[HEADER | Payloads | Index | FOOTER]` buffer and written via one
+/// [`Effect::WriteUnsynced`] instead of `Truncate` + 4 separate `WriteAt` round-trips.
+pub const SMALL_SEGMENT_COALESCE_BYTES: u64 = 2 << 20;
+
+/// Outcome of one targeted root-commit mapping step ([`Plain::map_for_commit_roots`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommitRootMap {
+    /// Every segment needed by `Plain::reused` for pending root edits is mapped and verified.
+    Ready,
+    /// Targeted `Effect::Map` effects were pushed; drive them to completion and call again.
+    Mapped,
+    /// Pending root edits touch committed keys needing `other_roots` probes across unmapped
+    /// segments: caller should run `Plain::map_all` (rare dead-key resurrection / cross-checkout).
+    NeedAll,
+}
 
 /// What a write of a segment is for.
 enum Why<A: Allocator + Clone> {
@@ -1960,6 +1979,10 @@ struct Flip<A: Allocator + Clone> {
     /// The commit found a record its roots reuse swept since: not flipped; unlock, write
     /// what `carrying` lists into a segment of the commit's own, and flip again.
     carry: bool,
+    /// A concurrent budget eviction removed a segment this lazy commit had not yet mapped:
+    /// unlock, map all remaining segments of `self.manifest`, and retry the flip so
+    /// [`Plain::missing_from_eviction`] sees and carries every swept record.
+    map_all_retry: bool,
     /// [`Plant::UnlinkEarly`]: unlinks in flight before the log's write, which waits here.
     early: u32,
     deferred: Option<Effect>,
@@ -2040,6 +2063,9 @@ enum Then {
     Targeted,
     /// Every row ([`Plain::map_all`]): whole after it.
     All,
+    /// Whole map triggered after a lazy commit saw concurrent eviction under the flip lock:
+    /// sets `eager = true` and immediately retries [`Plain::retry_commit`].
+    RetryCommit,
 }
 
 /// The plain store's state machine: one per process (or per test actor). What it keeps is in
@@ -2223,6 +2249,8 @@ pub struct Plain<A: Allocator + Clone> {
     carry_rounds: u32,
     /// Records carried forward by this process's commits, ever ([`Plain::carried`]).
     carried: u64,
+    /// Parked commit change waiting for [`Then::RetryCommit`] after concurrent eviction.
+    retry_commit: Option<Change<A>>,
     /// The bytes of the segments this process's commits named, and how many: what its
     /// cleanup's budget is ([`Plain::cleanup_goes_on`]).
     written_here: u64,
@@ -2623,6 +2651,7 @@ impl<A: Allocator + Clone> Plain<A> {
             carried_in_commit: None,
             carry_rounds: 0,
             carried: 0,
+            retry_commit: None,
             written_here: 0,
             segments_here: 0,
             indexes_made: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: a(), capacity: None }),
@@ -3348,15 +3377,23 @@ impl<A: Allocator + Clone> Plain<A> {
     /// each, what this process holds uncommitted under it, then its committed segments.
     pub fn get_in(&self, spaces: &[Namespace], key: &Key) -> Option<Got<'_>> {
         assert!(self.eager, "Plain::get_in reads a whole store: Plain::map_all (or open_whole) first, or Plain::find, which maps at a first probe");
+        self.get_mapped_in(spaces, key)
+    }
+
+    /// Internal lookup across uncommitted batches and already-mapped segments only, for commit
+    /// paths that have already mapped every Bloom-matching segment for the keys being queried
+    /// ([`Plain::map_for_commit`], [`Plain::map_for_commit_roots`]).
+    fn get_mapped_in(&self, spaces: &[Namespace], key: &Key) -> Option<Got<'_>> {
         for space in spaces {
             if let Some(got) = self.held_get(*space, key) {
                 return Some(got);
             }
-            if let Some((at, entry)) = self.find_in(std::slice::from_ref(space), key) {
+            if let Some((at, entry)) = self.find_in(core::slice::from_ref(space), key)
+                && let Some(mapped) = self.maps.get(at)
+            {
                 let mut checks = self.checks.get();
                 checks.reads += 1;
                 self.checks.set(checks);
-                let mapped = &self.maps[at];
                 return Some(Got { tag: entry.tag, namespace: mapped.seg().namespace, bytes: mapped.payload(&entry) });
             }
         }
@@ -3691,28 +3728,38 @@ impl<A: Allocator + Clone> Plain<A> {
         })
     }
 
+    /// Background GC unsealed-segment batching thresholds: detached `blaze gc --background`
+    /// waits until at least this many unsealed local segments or this many unsealed bytes
+    /// accumulate before spawning a background process, avoiding a spawn on every tiny edit while
+    /// urgent triggers (over-budget, tier overflow, expired roots, retired files) fire at once.
+    pub const BG_GC_UNSEALED_SEGMENTS: usize = 8;
+    pub const BG_GC_UNSEALED_BYTES: u64 = 16 << 20;
+
+    /// `(count, total_bytes)` of local segments in the manifest not yet barrier-sealed.
+    fn unsealed_local_totals(&self) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for seg in &self.manifest.segments {
+            if seg.local && !seg.sealed {
+                count = count.saturating_add(1);
+                bytes = bytes.saturating_add(seg.file_len());
+            }
+        }
+        (count, bytes)
+    }
+
     /// Whether any local segment in the manifest is not yet barrier-sealed (`!seg.sealed`).
     /// Unsealed segments require full-segment BLAKE3 re-verification after a reboot, so
-    /// `needs_housekeeping` reports them for detached `blaze gc --background` to barrier-seal off
-    /// the foreground critical path.
+    /// `needs_housekeeping` reports them for sealing off the foreground critical path.
     pub(crate) fn has_unsealed_segments(&self) -> bool {
         self.manifest.segments.iter().any(|it| it.local && !it.sealed)
     }
 
-    /// O(segments + roots + retired) check of whether real compaction or GC housekeeping is due
-    /// at `now_ns`, using only the in-memory manifest (no `map_all`, no index probes):
-    /// - total committed bytes exceed the budget high watermark;
-    /// - any local segment is unsealed (`!seg.sealed`), so detached GC barrier-seals it for O(1)
-    ///   post-reboot verification;
-    /// - any tier of any namespace exceeds `K` open mergeable segments (including leased open
-    ///   segments, which tiered merges compact losslessly);
-    /// - any root has expired (`expires_ns <= now_ns`);
-    /// - any retired file is past `GRACE_NS`, not held by a live lease, and ready to unlink.
-    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+    /// Urgent housekeeping triggers that always require immediate attention regardless of
+    /// unsealed-segment batching: over budget, expired roots, unlinkable retired files, or any
+    /// tier exceeding `K` open mergeable segments.
+    fn needs_urgent_housekeeping(&self, now_ns: u64) -> bool {
         if self.over_budget() {
-            return true;
-        }
-        if self.has_unsealed_segments() {
             return true;
         }
         if self.manifest.roots.iter().any(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns) {
@@ -3741,6 +3788,32 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         false
+    }
+
+    /// O(segments + roots + retired) check of whether real compaction or GC housekeeping is due
+    /// at `now_ns`, using only the in-memory manifest (no `map_all`, no index probes):
+    /// - total committed bytes exceed the budget high watermark;
+    /// - any local segment is unsealed (`!seg.sealed`), so GC barrier-seals it for O(1)
+    ///   post-reboot verification;
+    /// - any tier of any namespace exceeds `K` open mergeable segments (including leased open
+    ///   segments, which tiered merges compact losslessly);
+    /// - any root has expired (`expires_ns <= now_ns`);
+    /// - any retired file is past `GRACE_NS`, not held by a live lease, and ready to unlink.
+    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+        self.has_unsealed_segments() || self.needs_urgent_housekeeping(now_ns)
+    }
+
+    /// Whether detached `blaze gc --background` should be spawned at `now_ns`: fires immediately
+    /// on any urgent housekeeping trigger (budget, tier overflow, expired root, unlinkable
+    /// retired file) and batches routine unsealed-segment sealing until at least
+    /// [`Plain::BG_GC_UNSEALED_SEGMENTS`] unsealed local segments or
+    /// [`Plain::BG_GC_UNSEALED_BYTES`] of unsealed bytes have accumulated.
+    pub fn needs_bg_gc(&self, now_ns: u64) -> bool {
+        if self.needs_urgent_housekeeping(now_ns) {
+            return true;
+        }
+        let (unsealed_segs, unsealed_bytes) = self.unsealed_local_totals();
+        unsealed_segs >= Self::BG_GC_UNSEALED_SEGMENTS || unsealed_bytes >= Self::BG_GC_UNSEALED_BYTES
     }
 
     /// Background housekeeping threshold (`K * open_tiers + K` = 24 for [`Tiers::STORE`]):
@@ -3852,67 +3925,29 @@ impl<A: Allocator + Clone> Plain<A> {
         Committed { generation: self.manifest.generation, segments: self.alloc_vec() }
     }
 
-    /// Whether a commit on this store requires the whole manifest mapped (because `Liveness::Reached`
-    /// non-renewal root edits walk existing roots in [`Plain::reused`] /
-    /// [`Plain::missing_from_eviction`]).
+    /// Whether a commit on this store must eagerly map every segment in the manifest before
+    /// committing (only for the planted [`Plant::CommitMapsAll`] control; normal commits map
+    /// only the Bloom-matching segments needed for committing keys and pending roots via
+    /// [`Plain::map_for_commit`] / [`Plain::map_for_commit_roots`]).
     pub fn needs_whole_for_commit(&self) -> bool {
         self.plant() == Plant::CommitMapsAll
-            || (self.cfg.liveness == Liveness::Reached
-                && self.roots_pending.iter().any(|edit| matches!(edit, RootEdit::Set { renew_only: false, .. })))
     }
 
     /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
-    /// least one key being committed in `self.held`, `batches`, or `records` (plus any local
-    /// segment lacking a valid Bloom filter), leaving non-matching prior-boot segments unmapped
-    /// and unhashed during foreground commits while keeping `TwoValues` detection 100% sound.
-    ///
-    /// Returns `Ok(true)` when map effects were pushed onto `effects` (caller drives them to
-    /// completion), `Ok(false)` when all matching segments are already mapped and verified.
-    pub fn map_for_commit<E: Allocator>(
+    /// least one key in the sorted, deduplicated `keys` slice (plus any local segment lacking a
+    /// valid Bloom filter). Returns `Ok(true)` when `Effect::Map` effects were pushed onto
+    /// `effects` (caller drives them to completion), `Ok(false)` when all matching segments are
+    /// already mapped and verified.
+    fn map_matching_keys<E: Allocator>(
         &mut self,
-        batches: &[&Batch],
-        records: &[LentRecord<'_>],
+        keys: &[(Namespace, [u8; 32])],
         now_ns: u64,
         effects: &mut Vec<Effect, E>,
     ) -> Result<bool, StoreError> {
         const LATE_COMMIT_MAP: &str = "named by the generation this process opened, and its first commit-targeted probe came more than the grace period after the open: another process's compaction may have unlinked it since; a command maps every segment (Driven::map_all) before its first pool task";
-        if let Some(why) = &self.broken {
-            return Err(why.clone());
-        }
-        if !self.ready() {
-            return Err(StoreError::Busy { phase: self.what() });
-        }
-        if self.eager {
+        if keys.is_empty() {
             return Ok(false);
         }
-        let est = self
-            .held
-            .iter()
-            .map(|h| h.batch.entries.len())
-            .sum::<usize>()
-            .saturating_add(batches.iter().map(|b| b.entries.len()).sum())
-            .saturating_add(records.len());
-        if est == 0 {
-            return Ok(false);
-        }
-        let mut keys: blaze_own::Vec<(Namespace, [u8; 32]), A> = self.own_vec_cap(est);
-        for held in &self.held {
-            let ns = held.batch.namespace;
-            for entry in &held.batch.entries {
-                keys.push((ns, entry.key.0));
-            }
-        }
-        for batch in batches {
-            let ns = batch.namespace;
-            for entry in &batch.entries {
-                keys.push((ns, entry.key.0));
-            }
-        }
-        for rec in records {
-            keys.push((rec.namespace, rec.key.0.0));
-        }
-        keys.sort_unstable();
-        keys.dedup();
         let all_ns = self.plant() == Plant::IgnoresNamespace;
         let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
         let late = now_ns.saturating_sub(self.opened_ns) > GRACE_NS;
@@ -3927,7 +3962,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 continue;
             }
             let slice: &[(Namespace, [u8; 32])] = if all_ns {
-                keys.as_slice()
+                keys
             } else {
                 let start = keys.partition_point(|(ns, _)| *ns < seg.namespace);
                 let end = keys.partition_point(|(ns, _)| *ns <= seg.namespace);
@@ -3979,6 +4014,347 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         self.phase = Phase::Mapping { left, then: Then::Targeted };
         Ok(true)
+    }
+
+    /// Checks that the store is neither broken nor busy before starting a targeted map operation.
+    fn check_ready_for_map(&self) -> Result<(), StoreError> {
+        if let Some(why) = &self.broken {
+            return Err(why.clone());
+        }
+        if !self.ready() {
+            return Err(StoreError::Busy { phase: self.what() });
+        }
+        Ok(())
+    }
+
+    /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
+    /// least one key being committed in `self.held`, `batches`, or `records` (plus any local
+    /// segment lacking a valid Bloom filter), leaving non-matching prior-boot segments unmapped
+    /// and unhashed during foreground commits while keeping `TwoValues` detection 100% sound.
+    ///
+    /// Returns `Ok(true)` when map effects were pushed onto `effects` (caller drives them to
+    /// completion), `Ok(false)` when all matching segments are already mapped and verified.
+    pub fn map_for_commit<E: Allocator>(
+        &mut self,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        now_ns: u64,
+        effects: &mut EffectBuf<E>,
+    ) -> Result<bool, StoreError> {
+        self.check_ready_for_map()?;
+        if self.eager {
+            return Ok(false);
+        }
+        let est = self
+            .held
+            .iter()
+            .map(|h| h.batch.entries.len())
+            .sum::<usize>()
+            .saturating_add(batches.iter().map(|b| b.entries.len()).sum())
+            .saturating_add(records.len());
+        if est == 0 {
+            return Ok(false);
+        }
+        let mut keys: blaze_own::Vec<(Namespace, [u8; 32]), A> = self.own_vec_cap(est);
+        for held in &self.held {
+            let ns = held.batch.namespace;
+            for entry in &held.batch.entries {
+                keys.push((ns, entry.key.0));
+            }
+        }
+        for batch in batches {
+            let ns = batch.namespace;
+            for entry in &batch.entries {
+                keys.push((ns, entry.key.0));
+            }
+        }
+        for rec in records {
+            keys.push((rec.namespace, rec.key.0.0));
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        self.map_matching_keys(keys.as_slice(), now_ns, effects)
+    }
+
+    /// Maximum number of replaced prior-root page indexes subtracted upfront in `reused` /
+    /// `map_for_commit_roots` to avoid scanning untouched segments on incremental edits.
+    const PRIOR_DIFF_MAX_INDEXES: usize = 64;
+
+    /// Targeted Bloom-filtered segment mapping for pending `Liveness::Reached` root edits so
+    /// normal incremental edits NEVER run `map_all()` over unrelated segments in the store:
+    /// - Round 1: edited root keys, unexpired prior roots of the same name, and index hints.
+    /// - Round 2: changed index keys not already followed by prior roots, plus replaced prior
+    ///   indexes (up to [`Plain::PRIOR_DIFF_MAX_INDEXES`]).
+    /// - Round 3: changed leaf keys not already live in replaced prior indexes / prior roots.
+    /// - Final check: if no candidate key hits a committed segment outside `prior_roots` (the
+    ///   common edit case), returns [`CommitRootMap::Ready`]; only if committed keys still need
+    ///   probing against unbloomed `other_roots` does it return [`CommitRootMap::NeedAll`].
+    pub fn map_for_commit_roots<E: Allocator>(
+        &mut self,
+        now_ns: u64,
+        effects: &mut EffectBuf<E>,
+    ) -> Result<CommitRootMap, StoreError> {
+        self.check_ready_for_map()?;
+        if self.eager || self.cfg.liveness != Liveness::Reached {
+            return Ok(CommitRootMap::Ready);
+        }
+        let has_non_renew_set = self
+            .roots_pending
+            .iter()
+            .any(|edit| matches!(edit, RootEdit::Set { renew_only: false, .. }));
+        if !has_non_renew_set {
+            return Ok(CommitRootMap::Ready);
+        }
+        let has_unmapped_local = self
+            .manifest
+            .segments
+            .iter()
+            .any(|s| s.local && s.count > 0 && !self.by_id.contains_key(&s.id) && !self.dropped.contains(&s.id));
+        if !has_unmapped_local {
+            return Ok(CommitRootMap::Ready);
+        }
+
+        let skip_first = self.plant() == Plant::ReachSkipsRoot;
+        let follow_indexes = self.plant() != Plant::IndexNotFollowed;
+        let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
+
+        let mut sets: blaze_own::Vec<Key, A> = self.own_vec();
+        let mut prior_roots: blaze_own::Vec<usize, A> = self.own_vec();
+        let mut other_roots: blaze_own::Vec<usize, A> = self.own_vec();
+        let mut r1: blaze_own::Vec<(Namespace, [u8; 32]), A> = self.own_vec();
+        {
+            let mut edited_names: blaze_own::Vec<&str, &A> = blaze_own::Vec::new_in(&self.alloc);
+            for edit in &self.roots_pending {
+                if let RootEdit::Set { name, key, renew_only: false, .. } = edit {
+                    sets.push(*key);
+                    edited_names.push(name.as_str());
+                    r1.push((Namespace::LOCAL, key.0.0));
+                }
+            }
+            edited_names.sort_unstable();
+            edited_names.dedup();
+            for (i, root) in self.manifest.roots.iter().enumerate() {
+                if root.expires_ns <= now_ns || (i == 0 && skip_first) {
+                    continue;
+                }
+                if edited_names.binary_search(&root.name.as_str()).is_ok() {
+                    prior_roots.push(i);
+                    r1.push((Namespace::LOCAL, root.key.0));
+                } else {
+                    other_roots.push(i);
+                }
+            }
+            for hint in &self.replaced_index_hints {
+                r1.push((Namespace::LOCAL, hint.0.0));
+            }
+        }
+        r1.sort_unstable();
+        r1.dedup();
+        if self.map_matching_keys(r1.as_slice(), now_ns, effects)? {
+            return Ok(CommitRootMap::Mapped);
+        }
+
+        let mut r2: blaze_own::Vec<(Namespace, [u8; 32]), A> = self.own_vec();
+        let mut changed_indexes: blaze_own::Vec<[u8; 32], A> = self.own_vec();
+        let mut prior_has_indexes = false;
+        let mut replaced_count = 0usize;
+        {
+            let mut prior_followed: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+            if follow_indexes {
+                for &i in &prior_roots {
+                    let Some(root) = self.manifest.roots.get(i) else { continue };
+                    let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else { continue };
+                    if reach_of(entry.tag) != TagReach::Indexes {
+                        continue;
+                    }
+                    let Some(map) = self.maps.get(at) else { continue };
+                    for chunk in map.payload(&entry).chunks_exact(32) {
+                        if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                            prior_followed.insert(raw, ());
+                        }
+                    }
+                }
+            }
+            prior_has_indexes = !prior_followed.is_empty();
+            let mut sets_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+            for root in &sets {
+                let Some(got) = self.get_mapped_in(&[Namespace::LOCAL], root) else { continue };
+                if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
+                    for chunk in got.bytes.chunks_exact(32) {
+                        if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                            sets_indexes.insert(raw, ());
+                            if !prior_followed.contains_key(&raw) {
+                                r2.push((Namespace::LOCAL, raw));
+                                changed_indexes.push(raw);
+                            }
+                        }
+                    }
+                }
+            }
+            if follow_indexes {
+                for raw in prior_followed.keys() {
+                    if !sets_indexes.contains_key(raw) {
+                        replaced_count = replaced_count.saturating_add(1);
+                    }
+                }
+                if replaced_count > 0 && replaced_count <= Self::PRIOR_DIFF_MAX_INDEXES {
+                    for raw in prior_followed.keys() {
+                        if !sets_indexes.contains_key(raw) {
+                            r2.push((Namespace::LOCAL, *raw));
+                        }
+                    }
+                }
+            }
+        }
+        changed_indexes.sort_unstable();
+        changed_indexes.dedup();
+        r2.sort_unstable();
+        r2.dedup();
+        if self.map_matching_keys(r2.as_slice(), now_ns, effects)? {
+            return Ok(CommitRootMap::Mapped);
+        }
+
+        let mut r3: blaze_own::Vec<(Namespace, [u8; 32]), A> = self.own_vec();
+        {
+            let mut prior_followed: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+            let mut prior_direct: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+            for &i in &prior_roots {
+                let Some(root) = self.manifest.roots.get(i) else { continue };
+                prior_direct.insert(root.key.0, ());
+                let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else { continue };
+                let Some(map) = self.maps.get(at) else { continue };
+                let payload = map.payload(&entry);
+                if reach_of(entry.tag) == TagReach::Indexes && follow_indexes {
+                    for chunk in payload.chunks_exact(32) {
+                        if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                            prior_followed.insert(raw, ());
+                            prior_direct.insert(raw, ());
+                        }
+                    }
+                } else {
+                    for chunk in payload.chunks_exact(32) {
+                        if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                            prior_direct.insert(raw, ());
+                        }
+                    }
+                }
+            }
+            let mut sets_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+            for root in &sets {
+                let Some(got) = self.get_mapped_in(&[Namespace::LOCAL], root) else { continue };
+                if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
+                    for chunk in got.bytes.chunks_exact(32) {
+                        if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                            sets_indexes.insert(raw, ());
+                        }
+                    }
+                }
+            }
+            let mut prior_diff_keys: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+            if follow_indexes && replaced_count > 0 && replaced_count <= Self::PRIOR_DIFF_MAX_INDEXES {
+                for raw in prior_followed.keys() {
+                    if sets_indexes.contains_key(raw) {
+                        continue;
+                    }
+                    if let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(*raw)))
+                        && reach_of(entry.tag) == TagReach::IndexKeys
+                        && let Some(map) = self.maps.get(at)
+                    {
+                        for key_chunk in map.payload(&entry).chunks_exact(32) {
+                            if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) {
+                                prior_diff_keys.insert(key_raw, ());
+                            }
+                        }
+                    }
+                }
+            }
+            let mut checked_idx: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+            for root in &sets {
+                let Some(got) = self.get_mapped_in(&[Namespace::LOCAL], root) else { continue };
+                if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
+                    for chunk in got.bytes.chunks_exact(32) {
+                        let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                        if prior_followed.contains_key(&raw) || checked_idx.insert(raw, ()).is_some() {
+                            continue;
+                        }
+                        let Some(held) = self.get_mapped_in(&[Namespace::LOCAL], &Key(ContentId(raw))) else { continue };
+                        if reach_of(held.tag) != TagReach::IndexKeys {
+                            continue;
+                        }
+                        for key_chunk in held.bytes.chunks_exact(32) {
+                            if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk)
+                                && !prior_diff_keys.contains_key(&key_raw)
+                                && !prior_direct.contains_key(&key_raw)
+                            {
+                                r3.push((Namespace::LOCAL, key_raw));
+                            }
+                        }
+                    }
+                } else {
+                    for key_chunk in got.bytes.chunks_exact(32) {
+                        if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk)
+                            && !prior_direct.contains_key(&key_raw)
+                            && !prior_diff_keys.contains_key(&key_raw)
+                        {
+                            r3.push((Namespace::LOCAL, key_raw));
+                        }
+                    }
+                }
+            }
+        }
+        r3.sort_unstable();
+        r3.dedup();
+        if self.map_matching_keys(r3.as_slice(), now_ns, effects)? {
+            return Ok(CommitRootMap::Mapped);
+        }
+
+        // Verify whether any candidate key actually exists in a committed LOCAL segment outside
+        // `prior_roots`: if none does (the common incremental edit case), `reused()` finishes with
+        // an empty `pending` set without ever probing `other_roots` or unmapped segments.
+        let mut still_pending: blaze_own::Vec<[u8; 32], &A> = blaze_own::Vec::new_in(&self.alloc);
+        let mut prior_keys: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        for &i in &prior_roots {
+            if let Some(root) = self.manifest.roots.get(i) {
+                prior_keys.insert(root.key.0, ());
+            }
+        }
+        for root in &sets {
+            if !prior_keys.contains_key(&root.0.0) && self.find_in(&[Namespace::LOCAL], root).is_some() {
+                still_pending.push(root.0.0);
+            }
+        }
+        let mut committed_changed_indexes = 0usize;
+        for &raw in &changed_indexes {
+            if self.find_in(&[Namespace::LOCAL], &Key(ContentId(raw))).is_some() {
+                committed_changed_indexes = committed_changed_indexes.saturating_add(1);
+                still_pending.push(raw);
+            }
+        }
+        for &(_, raw) in &r3 {
+            if self.find_in(&[Namespace::LOCAL], &Key(ContentId(raw))).is_some() {
+                still_pending.push(raw);
+            }
+        }
+        if still_pending.is_empty() {
+            return Ok(CommitRootMap::Ready);
+        }
+        if prior_has_indexes || replaced_count > Self::PRIOR_DIFF_MAX_INDEXES {
+            return Ok(CommitRootMap::NeedAll);
+        }
+        if other_roots.is_empty() {
+            return Ok(CommitRootMap::Ready);
+        }
+        if committed_changed_indexes > 32 || !self.replaced_index_hints.is_empty() {
+            return Ok(CommitRootMap::NeedAll);
+        }
+        for &idx in &other_roots {
+            let Some(root) = self.manifest.roots.get(idx) else { continue };
+            let bloom_id = root_bloom_digest(&root.key);
+            if self.bloom.may_contain_any_digest(&bloom_id, still_pending.iter(), trust_corrupt) != Some(false) {
+                return Ok(CommitRootMap::NeedAll);
+            }
+        }
+        Ok(CommitRootMap::Ready)
     }
 
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
@@ -4172,7 +4548,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 left.reserve(rest.len());
                 left.extend(rest);
                 let done = self.alloc_vec();
-                self.write_segment(first, Why::Commit { started_ns: now_ns, roots, rest: left, done }, effects);
+                self.write_segment(first, Why::Commit { started_ns: now_ns, roots, rest: left, done }, batches, records, effects);
             }
         }
         Ok(())
@@ -4545,7 +4921,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// the digest of all before it), names it by its digest, and starts its write: the file
     /// made at its length, then each piece written at its offset, in parallel. A segment of the
     /// same bytes already here is not written again (a published file is never rewritten).
-    fn write_segment(&mut self, next: NextCommit<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+    fn write_segment(&mut self, next: NextCommit<A>, why: Why<A>, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut EffectList) {
         match next {
             NextCommit::Laid(laid) => {
                 let Laid { pieces, index_at, run, namespace } = laid;
@@ -4557,7 +4933,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 let sealed = format::seal_parts(namespace, &run, index_at, pieces.iter().map(|(_, bytes)| bytes.as_slice()));
                 // The measure: every byte before the digest itself was read by it.
                 self.put_path.digested_bytes += sealed.len.saturating_sub(32);
-                self.start_write(sealed, pieces, WriteBody::Run(run), why, effects);
+                self.start_write(sealed, pieces, WriteBody::Run(run), why, batches, records, effects);
             }
             NextCommit::Planned(planned) => {
                 let PlannedSegment { sealed, bloom, kept, entries } = planned;
@@ -4582,7 +4958,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     index_flying: false,
                 };
                 let pieces = self.alloc_vec();
-                self.start_write(sealed, pieces, WriteBody::Stream { bloom, commit }, why, effects);
+                self.start_write(sealed, pieces, WriteBody::Stream { bloom, commit }, why, batches, records, effects);
             }
         }
     }
@@ -4742,7 +5118,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// A segment every byte of which is written under its name: ordered by [`Effect::Barrier`]
     /// (`F_BARRIERFSYNC` on macOS, `fdatasync` on Linux), then flipped; or, unsynced, flipped
     /// (the planted controls hand some to the flip before their barrier).
-    fn segment_done(&mut self, writing: Writing<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+    fn segment_done(&mut self, writing: Writing<A>, why: Why<A>, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut EffectList) {
         // The planted controls: a segment handed to the flip before its barrier (every
         // segment's, or a merge's alone), or never barriered.
         let merge_early = self.plant() == Plant::MergeFlipsBeforeSync && matches!(why, Why::Compact { .. });
@@ -4762,12 +5138,24 @@ impl<A: Allocator + Clone> Plain<A> {
                 return;
             }
         };
-        self.segment_written(writing, why, effects);
+        self.segment_written(writing, why, batches, records, effects);
     }
 
-    /// The write of a segment `sealed` describes (a commit's, or a carry's): `pieces` (its
-    /// payloads), then `run` and the footer — or a bounded-window `CommitStream`.
-    fn start_write(&mut self, sealed: format::Sealed, mut pieces: Vec<(u64, Vec<u8>), A>, body: WriteBody<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+    /// The write of a segment `sealed` describes (a commit's, or a carry's): small segments
+    /// (`<= SMALL_SEGMENT_COALESCE_BYTES`, bounded by `commit_piece_bytes`) are assembled into
+    /// one contiguous buffer and written in a single `Effect::WriteUnsynced` syscall; larger
+    /// segments pre-size via `Truncate` and stream `pieces` + `run`/index + footer.
+    #[expect(clippy::too_many_arguments, reason = "segment write entry point with external borrow slices for zero-copy streaming/coalescing")]
+    fn start_write(
+        &mut self,
+        sealed: format::Sealed,
+        mut pieces: Vec<(u64, Vec<u8>), A>,
+        body: WriteBody<A>,
+        why: Why<A>,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        effects: &mut EffectList,
+    ) {
         let index_at = sealed.described.index_at;
         let (count, len) = (sealed.described.count, sealed.len);
         let mut seg = Segment::of(&sealed.described, len);
@@ -4792,24 +5180,64 @@ impl<A: Allocator + Clone> Plain<A> {
             // are a named segment's, proved as its row is (synced before the flip that named
             // them, when durable): nothing of them is written here, so no sync is owed.
             let empty_pieces = self.alloc_vec();
-            self.segment_written(Synced::already_named(Writing { seg, file, pieces: empty_pieces, left: 0, stream: None, commit: None }), why, effects);
+            self.segment_written(
+                Synced::already_named(Writing { seg, file, pieces: empty_pieces, left: 0, stream: None, commit: None }),
+                why,
+                batches,
+                records,
+                effects,
+            );
             return;
         }
         self.put_path.segments_written += 1;
-        let mut header = effect_bytes!(HEADER);
-        header.extend_from_slice(&sealed.header);
-        if let Some(run) = run {
-            let mut footer = effect_bytes!(FOOTER);
-            footer.extend_from_slice(&sealed.footer);
-            pieces.insert(0, (0, header));
-            let footer_at = index_at + u64::from(count) * ENTRY as u64;
-            pieces.push((index_at, run));
-            pieces.push((footer_at, footer));
+        let coalesce_cap = SMALL_SEGMENT_COALESCE_BYTES.min(u64::try_from(self.commit_piece_bytes()).unwrap_or(0));
+        let (writing_pieces, left, writing_commit) = if len <= coalesce_cap
+            && self.plant() != Plant::CommitWholeWindow
+            && self.plant() != Plant::SealBeforeBarrier
+        {
+            let cap = usize::try_from(len).unwrap_or(0);
+            let mut whole = effect_bytes!(cap);
+            whole.extend_from_slice(&sealed.header);
+            if let Some(run) = run {
+                for (_, piece) in pieces {
+                    whole.extend_from_slice(&piece);
+                }
+                whole.extend_from_slice(&run);
+                whole.extend_from_slice(&sealed.footer);
+            } else if let Some(commit) = commit {
+                for &(src, pad_len) in &commit.kept {
+                    let payload = resolve_record(src, &self.sealed, batches, records);
+                    whole.extend_from_slice(payload);
+                    let pad = usize::from(pad_len);
+                    if pad > 0 {
+                        whole.resize(whole.len().saturating_add(pad), 0);
+                    }
+                }
+                for entry in &commit.entries {
+                    entry.encode_into(&mut whole);
+                }
+                whole.extend_from_slice(&commit.footer);
+            }
+            debug_assert_eq!(u64::try_from(whole.len()).unwrap_or(u64::MAX), len, "coalesced small segment length must match sealed.len");
+            effects.push(Effect::WriteUnsynced { file: file.share(), bytes: whole, tag: self.tag(SEG_PIECE, 0) });
+            (self.alloc_vec(), 1, None)
         } else {
-            pieces.push((0, header));
-        }
-        effects.extend(core::iter::once(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) }));
-        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: None, commit }), Box::new(why));
+            let mut header = effect_bytes!(HEADER);
+            header.extend_from_slice(&sealed.header);
+            if let Some(run) = run {
+                let mut footer = effect_bytes!(FOOTER);
+                footer.extend_from_slice(&sealed.footer);
+                pieces.insert(0, (0, header));
+                let footer_at = index_at + u64::from(count) * ENTRY as u64;
+                pieces.push((index_at, run));
+                pieces.push((footer_at, footer));
+            } else {
+                pieces.push((0, header));
+            }
+            effects.extend(core::iter::once(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) }));
+            (pieces, 0, commit)
+        };
+        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces: writing_pieces, left, stream: None, commit: writing_commit }), Box::new(why));
     }
 
     /// Names segments fetched from a source (their files already written here, unchanged,
@@ -5566,38 +5994,6 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(false)
     }
 
-    /// Builds a per-root reach Bloom filter for a `TagReach::Indexes` root covering `root_key`,
-    /// every index key it lists, and every leaf key inside each index.
-    fn build_root_bloom(&self, root_key: &ContentId, payload: &[u8]) -> Result<(ContentId, blaze_own::Vec<u8, Kept>), StoreError> {
-        let index_count = payload.len() / 32;
-        let mut index_payloads: blaze_own::Vec<([u8; 32], &[u8]), &A> = blaze_own::Vec::with_capacity_in(index_count, &self.alloc);
-        let mut total_keys: u64 = 1u64.saturating_add(u64::try_from(index_count).unwrap_or(u64::MAX));
-        for chunk in payload.chunks_exact(32) {
-            let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
-            let index = ContentId(raw);
-            let Some(got) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
-                return Err(StoreError::IndexGone { generation: self.manifest.generation, root: *root_key, index });
-            };
-            if reach_of(got.tag) != TagReach::IndexKeys {
-                return Err(StoreError::NotAnIndex { root: *root_key, key: index, tag: got.tag });
-            }
-            total_keys = total_keys.saturating_add(u64::try_from(got.bytes.len() / 32).unwrap_or(u64::MAX));
-            index_payloads.push((raw, got.bytes));
-        }
-        let bloom_id = root_bloom_digest(root_key);
-        let mut builder = BloomBuilder::with_bits_per_key(u32::try_from(total_keys).unwrap_or(u32::MAX), ROOT_BITS_PER_KEY);
-        builder.insert(&root_key.0);
-        for (idx_raw, idx_bytes) in index_payloads {
-            builder.insert(&idx_raw);
-            for key_chunk in idx_bytes.chunks_exact(32) {
-                if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) {
-                    builder.insert(&key_raw);
-                }
-            }
-        }
-        Ok((bloom_id, builder.finish(&bloom_id)))
-    }
-
     /// Semi-join probe of one unexpired root at manifest index `idx`, removing every key it
     /// reaches from `pending` and returning early as soon as `pending` empties. When
     /// `prioritize_diff` is true, index records absent from `sets_indexes` (the replaced page
@@ -5809,34 +6205,26 @@ impl<A: Allocator + Clone> Plain<A> {
         if sets.is_empty() {
             return Ok((out, new_blooms));
         }
-        // Cold store fast path: with zero committed segments, no record can be reused from a
-        // prior segment (`out` is empty). Still validate `RootGone` / `IndexGone` / `NotAnIndex`
-        // and build per-root reach Bloom filters for large indexed roots in a single pass.
+        // Cold / no-mapped-segments fast path: with zero mapped segments (either cold store or
+        // targeted commit mapping proved no committing/root key matched any existing segment), no
+        // record can be reused from a prior segment (`out` is empty). Still validate `RootGone` /
+        // `IndexGone` / `NotAnIndex`; per-root reach Bloom filters are built lazily in
+        // `probe_live_root()` when another checkout actually scans an unbloomed root.
         if self.maps.is_empty() {
             let follow_indexes = self.plant() != Plant::IndexNotFollowed;
             for root in &sets {
-                let Some(got) = self.get_in(&[Namespace::LOCAL], root) else {
+                let Some(got) = self.get_mapped_in(&[Namespace::LOCAL], root) else {
                     return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.0 });
                 };
                 if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
-                    if got.bytes.len() >= Self::ROOT_BLOOM_MIN_INDEXES * 32 {
-                        let bloom_id = root_bloom_digest(&root.0);
-                        if !self.bloom.has_digest(&bloom_id)
-                            && !self.pending_bloom.iter().any(|(d, _)| *d == bloom_id)
-                            && !new_blooms.iter().any(|(d, _)| *d == bloom_id)
-                        {
-                            new_blooms.push(self.build_root_bloom(&root.0, got.bytes)?);
-                        }
-                    } else {
-                        for index_chunk in got.bytes.chunks_exact(32) {
-                            let Ok(bytes) = <[u8; 32]>::try_from(index_chunk) else { continue };
-                            let index = ContentId(bytes);
-                            let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
-                                return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
-                            };
-                            if reach_of(held.tag) != TagReach::IndexKeys {
-                                return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
-                            }
+                    for index_chunk in got.bytes.chunks_exact(32) {
+                        let Ok(bytes) = <[u8; 32]>::try_from(index_chunk) else { continue };
+                        let index = ContentId(bytes);
+                        let Some(held) = self.get_mapped_in(&[Namespace::LOCAL], &Key(index)) else {
+                            return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
+                        };
+                        if reach_of(held.tag) != TagReach::IndexKeys {
+                            return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
                         }
                     }
                 }
@@ -5862,44 +6250,87 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         // Candidate-driven semi-join: collect ONLY the keys named by `edits` that already live in
-        // a committed `LOCAL` segment and are not inside an already-followed index record. This
-        // avoids materializing a global hash set of all keys across all roots in the store.
+        // a committed `LOCAL` segment and are not already reached by `prior_roots` (unchanged
+        // followed page indexes, replaced prior page indexes, or prior direct roots). This avoids
+        // both eager foreground Bloom builds and segment-wide `find_in` over unchanged keys.
         let mut pending: Map<[u8; 32], u64, BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         let mut followed: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         let mut sets_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         let mut checked_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
-        let mut prior_followed_loaded = false;
+        let mut visited_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        let mut prior_direct: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        let mut prior_diff_keys: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         let mut other_followed_loaded = false;
         let follow_indexes = self.plant() != Plant::IndexNotFollowed;
         let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
         let mut set_index_checks = 0usize;
 
+        if !prior_roots.is_empty() {
+            if follow_indexes {
+                self.collect_followed_indexes(&prior_roots, &mut followed)?;
+            }
+            for &i in &prior_roots {
+                let Some(root) = self.manifest.roots.get(i) else { continue };
+                prior_direct.insert(root.key.0, ());
+                if let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key))
+                    && let Some(map) = self.maps.get(at)
+                {
+                    for chunk in map.payload(&entry).chunks_exact(32) {
+                        if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                            prior_direct.insert(raw, ());
+                        }
+                    }
+                }
+            }
+            if follow_indexes && !followed.is_empty() {
+                for root in &sets {
+                    let Some(got) = self.get_mapped_in(&[Namespace::LOCAL], root) else { continue };
+                    if reach_of(got.tag) == TagReach::Indexes {
+                        for chunk in got.bytes.chunks_exact(32) {
+                            if let Ok(raw) = <[u8; 32]>::try_from(chunk) {
+                                sets_indexes.insert(raw, ());
+                            }
+                        }
+                    }
+                }
+                let mut replaced_count = 0usize;
+                for raw in followed.keys() {
+                    if !sets_indexes.contains_key(raw) {
+                        replaced_count = replaced_count.saturating_add(1);
+                    }
+                }
+                if replaced_count > 0 && replaced_count <= Self::PRIOR_DIFF_MAX_INDEXES {
+                    for raw in followed.keys() {
+                        if sets_indexes.contains_key(raw) {
+                            continue;
+                        }
+                        if let Some((idx_at, idx_entry)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(*raw)))
+                            && reach_of(idx_entry.tag) == TagReach::IndexKeys
+                            && let Some(idx_map) = self.maps.get(idx_at)
+                        {
+                            visited_indexes.insert(*raw, ());
+                            for key_chunk in idx_map.payload(&idx_entry).chunks_exact(32) {
+                                if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) {
+                                    prior_diff_keys.insert(key_raw, ());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for root in &sets {
-            if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], root)
+            if !prior_direct.contains_key(&root.0.0)
+                && let Some((at, _)) = self.find_in(&[Namespace::LOCAL], root)
                 && let Some(map) = self.maps.get(at)
             {
                 pending.insert(root.0.0, map.seg().id);
             }
-            let Some(got) = self.get_in(&[Namespace::LOCAL], root) else {
+            let Some(got) = self.get_mapped_in(&[Namespace::LOCAL], root) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.0 });
             };
             if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
-                // Pre-populate per-root reach Bloom filters for newly written large indexed roots
-                // (e.g., 512-page base reach shards) so subsequent incremental edits skip them in
-                // O(1) without ever scanning their 512 page indexes.
-                if got.bytes.len() >= Self::ROOT_BLOOM_MIN_INDEXES * 32 {
-                    let bloom_id = root_bloom_digest(&root.0);
-                    if !self.bloom.has_digest(&bloom_id)
-                        && !self.pending_bloom.iter().any(|(d, _)| *d == bloom_id)
-                        && !new_blooms.iter().any(|(d, _)| *d == bloom_id)
-                    {
-                        new_blooms.push(self.build_root_bloom(&root.0, got.bytes)?);
-                    }
-                }
-                if !prior_followed_loaded {
-                    self.collect_followed_indexes(&prior_roots, &mut followed)?;
-                    prior_followed_loaded = true;
-                }
                 for index_chunk in got.bytes.chunks_exact(32) {
                     let Ok(bytes) = <[u8; 32]>::try_from(index_chunk) else { continue };
                     sets_indexes.insert(bytes, ());
@@ -5937,7 +6368,7 @@ impl<A: Allocator + Clone> Plain<A> {
                         continue;
                     }
                     let index = ContentId(bytes);
-                    let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
+                    let Some(held) = self.get_mapped_in(&[Namespace::LOCAL], &Key(index)) else {
                         return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
                     };
                     if reach_of(held.tag) != TagReach::IndexKeys {
@@ -5945,6 +6376,9 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                     for key_chunk in held.bytes.chunks_exact(32) {
                         let Ok(key_bytes) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                        if prior_diff_keys.contains_key(&key_bytes) || prior_direct.contains_key(&key_bytes) {
+                            continue;
+                        }
                         if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(key_bytes)))
                             && let Some(map) = self.maps.get(at)
                         {
@@ -5955,6 +6389,9 @@ impl<A: Allocator + Clone> Plain<A> {
             } else {
                 for key_chunk in got.bytes.chunks_exact(32) {
                     let Ok(bytes) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                    if prior_direct.contains_key(&bytes) || prior_diff_keys.contains_key(&bytes) {
+                        continue;
+                    }
                     if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(bytes)))
                         && let Some(map) = self.maps.get(at)
                     {
@@ -5966,7 +6403,6 @@ impl<A: Allocator + Clone> Plain<A> {
         if pending.is_empty() {
             return Ok((out, new_blooms));
         }
-        let mut visited_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         for &idx in &prior_roots {
             self.probe_live_root(idx, true, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
             if pending.is_empty() {
@@ -6102,7 +6538,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             };
             check(root.0);
-            let Some(got) = self.get_in(&[Namespace::LOCAL], root) else { continue };
+            let Some(got) = self.get_mapped_in(&[Namespace::LOCAL], root) else { continue };
             for chunk in got.bytes.chunks_exact(32) {
                 let Ok(bytes) = <[u8; 32]>::try_from(chunk) else { continue };
                 check(ContentId(bytes));
@@ -6116,7 +6552,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     continue;
                 }
                 let index = ContentId(bytes);
-                let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else { continue };
+                let Some(held) = self.get_mapped_in(&[Namespace::LOCAL], &Key(index)) else { continue };
                 if reach_of(held.tag) != TagReach::IndexKeys {
                     continue;
                 }
@@ -6337,6 +6773,7 @@ impl<A: Allocator + Clone> Plain<A> {
             refused: None,
             aborted: false,
             carry: false,
+            map_all_retry: false,
             early: 0,
             deferred: None,
             bloom_staged,
@@ -6408,6 +6845,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut refused = None;
         let mut aborted = false;
         let mut carry = false;
+        let mut map_all_retry = false;
         // A slice's change, on the manifest being built: whether it aborted (a segment it
         // replaces is no longer named as this process planned it, or a root it planned to
         // LRU-evict was concurrently renewed/updated or is now covered by an active lease).
@@ -6514,7 +6952,18 @@ impl<A: Allocator + Clone> Plain<A> {
                     && !roots.is_empty()
                     && self.manifest.roots.iter().any(|r| r.expires_ns > now_ns && !m.roots.iter().any(|cur| cur.name == r.name))
                     && self.manifest.segments.iter().any(|s| s.local && !m.segments.iter().any(|cur| cur.id == s.id));
-                let extra_carry = if evicted_under {
+                let unmapped_evicted = evicted_under
+                    && !self.eager
+                    && self.manifest.segments.iter().any(|s| {
+                        s.local
+                            && !self.by_id.contains_key(&s.id)
+                            && !self.dropped.contains(&s.id)
+                            && !m.segments.iter().any(|cur| cur.id == s.id)
+                    });
+                let extra_carry = if unmapped_evicted {
+                    map_all_retry = true;
+                    self.alloc_vec()
+                } else if evicted_under {
                     match self.missing_from_eviction(roots, &m) {
                         Ok(list) => list,
                         Err(why) => {
@@ -6551,7 +7000,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                     true
                 };
-                if refused.is_some() {
+                if refused.is_some() || map_all_retry {
                 } else if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
                     // A compaction may have retired its segment as named by no generation:
                     // it is not flipped.
@@ -6702,14 +7151,15 @@ impl<A: Allocator + Clone> Plain<A> {
             let ignore_dead = self.plant() == Plant::IgnoreDeadPid;
             m.leases.retain(|it| it.expires_ns > now_ns && (ignore_dead || !reclaimed.contains(&it.holder)));
         }
-        if refused.is_some() || carry {
+        if refused.is_some() || carry || map_all_retry {
             // Not flipped: the slice waits for the next commit (or the carry's flip), unchanged.
             self.folding = folded.take();
         }
-        if refused.is_some() || aborted || carry {
+        if refused.is_some() || aborted || carry || map_all_retry {
             flip.refused = refused;
             flip.aborted = aborted;
             flip.carry = carry;
+            flip.map_all_retry = map_all_retry;
             if aborted {
                 flip.refreshed = compact_refresh;
             }
@@ -6911,6 +7361,41 @@ impl<A: Allocator + Clone> Plain<A> {
             }
             return;
         }
+        if flip.map_all_retry {
+            self.retry_commit = Some(flip.change);
+            let mut to_map = 0usize;
+            let mut sealed_to_map = 0usize;
+            for seg in &self.manifest.segments {
+                if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) || self.unchecked.contains_key(&seg.id) {
+                    continue;
+                }
+                to_map = to_map.saturating_add(1);
+                if seg.boot != self.cfg.boot && seg.sealed {
+                    sealed_to_map = sealed_to_map.saturating_add(1);
+                }
+            }
+            if to_map == 0 {
+                self.mapped(Then::RetryCommit, effects);
+                return;
+            }
+            self.reserve_maps(to_map, sealed_to_map, effects);
+            let mut left = 0u32;
+            let len = self.manifest.segments.len();
+            for row in 0..len {
+                let Some(seg) = self.manifest.segments.get(row).copied() else { continue };
+                if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) || self.unchecked.contains_key(&seg.id) {
+                    continue;
+                }
+                self.queue_map(row, seg.id, effects);
+                left = left.saturating_add(1);
+            }
+            if left == 0 {
+                self.mapped(Then::RetryCommit, effects);
+            } else {
+                self.phase = Phase::Mapping { left, then: Then::RetryCommit };
+            }
+            return;
+        }
         if flip.carry {
             let Change::Commit { segs, started_ns, roots } = flip.change else { unreachable!("only a commit carries") };
             self.carry(segs, started_ns, roots, effects);
@@ -7075,7 +7560,7 @@ impl<A: Allocator + Clone> Plain<A> {
         match laid_of(out, self.alloc.clone()) {
             Ok(laid) => {
                 let rest = self.alloc_vec();
-                self.write_segment(NextCommit::Laid(laid), Why::Commit { started_ns, roots, rest, done: segs }, effects);
+                self.write_segment(NextCommit::Laid(laid), Why::Commit { started_ns, roots, rest, done: segs }, &[], &[], effects);
             }
             Err(why) => self.commit_refused(why, roots),
         }
@@ -7497,6 +7982,13 @@ impl<A: Allocator + Clone> Plain<A> {
             }
             Then::Open | Then::Stamp | Then::Probe | Then::Targeted => {}
             Then::All => self.all_mapped(),
+            Then::RetryCommit => {
+                self.all_mapped();
+                if let Some(change) = self.retry_commit.take() {
+                    self.start_flip(change, effects);
+                    return;
+                }
+            }
         }
         if then == Then::Open && self.pending_stamps() {
             self.start_flip(Change::Stamp, effects);
@@ -7879,7 +8371,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     // A copy, under its temporary name: named by its digest now.
                     self.named_copy(*writing, *why, effects);
                 } else {
-                    self.segment_done(*writing, *why, effects);
+                    self.segment_done(*writing, *why, batches, records, effects);
                 }
                 Ok(())
             }
@@ -7888,7 +8380,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     return Err(why);
                 }
                 let Phase::Renaming(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
-                self.segment_done(*writing, *why, effects);
+                self.segment_done(*writing, *why, batches, records, effects);
                 Ok(())
             }
             (SEG_UNWRITE, Phase::Unwriting { temp, .. }) => {
@@ -7917,7 +8409,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 // They are a named segment's, proved as its row is (synced before the flip that
                 // named them, when durable): nothing of them was written under it, so no sync
                 // is owed.
-                self.segment_written(Synced::already_named(*writing), *why, effects);
+                self.segment_written(Synced::already_named(*writing), *why, batches, records, effects);
                 Ok(())
             }
             (SEG_SYNC, Phase::SyncingSegment(writing, _)) => {
@@ -7928,7 +8420,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     return Err(unexpected("ordering a segment"));
                 }
                 let Phase::SyncingSegment(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
-                self.segment_written(Synced::by_sync(*writing), *why, effects);
+                self.segment_written(Synced::by_sync(*writing), *why, batches, records, effects);
                 Ok(())
             }
             (BLOOM_STAGE, Phase::Flipping(flip)) if flip.bloom_staging => {
@@ -8185,7 +8677,7 @@ impl<A: Allocator + Clone> Plain<A> {
 
     /// A segment is written (and synced, when durable): a commit's next is written, or, with
     /// none left, the flip names them all.
-    fn segment_written(&mut self, synced: Synced<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+    fn segment_written(&mut self, synced: Synced<A>, why: Why<A>, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut EffectList) {
         let writing = synced.into_writing();
         let seg = (writing.seg, writing.file);
         match why {
@@ -8193,7 +8685,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 done.push(seg);
                 if !rest.is_empty() {
                     let next = rest.remove(0);
-                    self.write_segment(next, Why::Commit { started_ns, roots, rest, done }, effects);
+                    self.write_segment(next, Why::Commit { started_ns, roots, rest, done }, batches, records, effects);
                     return;
                 }
                 self.start_flip(Change::Commit { segs: done, started_ns, roots }, effects);

@@ -1168,37 +1168,158 @@ fn suite_closure<'a>(list: &blaze_world::crate_list::CrateList<'_>, test: usize,
     closure
 }
 
+/// Parses both `[profile.dev]` `panic` and `overflow-checks` from root `Cargo.toml` text in a
+/// single `blaze_toml::Document::parse_in` pass (matching `blaze_manifest::layout::panic::panic_strategy`
+/// and `blaze_manifest::layout::profile::overflow_checks` identically).
+fn parse_dev_profile_settings(
+    text: &str,
+    frame: &bstd::mem::Frame,
+) -> Result<(blaze_manifest::layout::panic::ProfilePanic, blaze_ladder::run::OverflowChecks), CliError> {
+    use blaze_manifest::layout::panic::{PanicError, ProfilePanic};
+    use blaze_manifest::layout::profile::BuiltinProfile;
+    use blaze_manifest::layout::{LayoutError, ManifestId, Span};
+    use blaze_toml::{Document, Kind, Limits};
+
+    const ROOT_MANIFEST: &str = "Cargo.toml";
+    let refused = |why: &dyn core::fmt::Display| CliError::Program(crate::ManifestRefused::of(why, frame));
+    let erased = blaze_own::Erased::new(frame);
+    let alloc = erased.handle();
+    let id = ManifestId(0);
+    let profile = BuiltinProfile::Dev;
+    let name = profile.name();
+    let span_of = |r: core::ops::Range<usize>| Span {
+        manifest: id,
+        start: u32::try_from(r.start).unwrap_or(u32::MAX),
+        end: u32::try_from(r.end).unwrap_or(u32::MAX),
+    };
+    let manifest = || blaze_own::String::from_str_in(ROOT_MANIFEST, alloc);
+    let doc = match Document::parse_in(text, Limits::CARGO, alloc) {
+        Ok(doc) => doc,
+        Err(error) => return Err(refused(&LayoutError::Toml { manifest: manifest(), error })),
+    };
+    let default_overflow = if profile.default_overflow_checks() {
+        blaze_ladder::run::OverflowChecks::On
+    } else {
+        blaze_ladder::run::OverflowChecks::Off
+    };
+    let Some(profiles) = doc.root().get("profile") else {
+        return Ok((ProfilePanic::Unwind, default_overflow));
+    };
+    if profiles.kind() != Kind::Table {
+        return Err(refused(&LayoutError::Expected { at: span_of(profiles.span()), key: "profile", kind: "a table" }));
+    }
+    let Some(table) = profiles.get(name) else {
+        return Ok((ProfilePanic::Unwind, default_overflow));
+    };
+    if table.kind() != Kind::Table {
+        return Err(refused(&LayoutError::Expected { at: span_of(table.span()), key: "profile.<name>", kind: "a table" }));
+    }
+    if let Some(inherits) = table.get("inherits") {
+        return Err(refused(&PanicError::InheritsInRoot { manifest: manifest(), profile: name, at: span_of(inherits.span()) }));
+    }
+    if let Some(packages) = table.get("package") {
+        if packages.kind() != Kind::Table {
+            return Err(refused(&LayoutError::Expected { at: span_of(packages.span()), key: "profile.<name>.package", kind: "a table" }));
+        }
+        for package in packages.children() {
+            if let Some(panic) = package.get("panic") {
+                return Err(refused(&PanicError::InPackageOverride {
+                    manifest: manifest(),
+                    profile: name,
+                    package: blaze_own::String::from_str_in(package.key(), alloc),
+                    at: span_of(panic.span()),
+                }));
+            }
+        }
+    }
+    let panic = match table.get("panic") {
+        None => ProfilePanic::Unwind,
+        Some(item) => match item.as_str() {
+            Some("unwind") => ProfilePanic::Unwind,
+            Some("abort") => ProfilePanic::Abort,
+            Some("immediate-abort") => {
+                return Err(refused(&PanicError::ImmediateAbort { manifest: manifest(), profile: name, at: span_of(item.span()) }));
+            }
+            Some(written) => {
+                return Err(refused(&PanicError::Unknown {
+                    manifest: manifest(),
+                    profile: name,
+                    written: blaze_own::String::from_str_in(written, alloc),
+                    at: span_of(item.span()),
+                }));
+            }
+            None => return Err(refused(&LayoutError::Expected { at: span_of(item.span()), key: "profile.<name>.panic", kind: "a string" })),
+        },
+    };
+    let overflow_on = match table.get("overflow-checks") {
+        None => profile.default_overflow_checks(),
+        Some(item) => match item.as_bool() {
+            Some(on) => on,
+            None => {
+                return Err(refused(&LayoutError::Expected {
+                    at: span_of(item.span()),
+                    key: "profile.<name>.overflow-checks",
+                    kind: "a bool",
+                }));
+            }
+        },
+    };
+    let overflow = if overflow_on { blaze_ladder::run::OverflowChecks::On } else { blaze_ladder::run::OverflowChecks::Off };
+    Ok((panic, overflow))
+}
+
 /// Reads both `[profile.dev]` `panic` and `overflow-checks` from the root `Cargo.toml` in a
-/// single read+parse instead of reading the manifest twice on `blaze test`.
+/// single read and single TOML parse on `blaze test`.
 fn dev_profile_settings(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     frame: &bstd::mem::Frame,
 ) -> Result<(blaze_manifest::layout::panic::ProfilePanic, blaze_ladder::run::OverflowChecks), CliError> {
     const ROOT_MANIFEST: &str = "Cargo.toml";
-    let refused = |why: &dyn core::fmt::Display| CliError::Program(crate::ManifestRefused::of(why, frame));
     let mut bytes = bstd::mem::Bytes::new_in(frame, "the root manifest");
     root.read_all(cx, &bstd::path::Path::new(ROOT_MANIFEST)?, &mut bytes)?;
     let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "the root manifest is not UTF-8" })?;
-    let erased = blaze_own::Erased::new(frame);
-    let panic = blaze_manifest::layout::panic::panic_strategy(
-        text,
-        blaze_manifest::layout::ManifestId(0),
-        ROOT_MANIFEST,
-        blaze_manifest::layout::profile::BuiltinProfile::Dev,
-        erased.handle(),
-    )
-    .map_err(|e| refused(&e))?;
-    let overflow_on = blaze_manifest::layout::profile::overflow_checks(
-        text,
-        blaze_manifest::layout::ManifestId(0),
-        ROOT_MANIFEST,
-        blaze_manifest::layout::profile::BuiltinProfile::Dev,
-        erased.handle(),
-    )
-    .map_err(|e| refused(&e))?;
-    let overflow = if overflow_on { blaze_ladder::run::OverflowChecks::On } else { blaze_ladder::run::OverflowChecks::Off };
-    Ok((panic, overflow))
+    parse_dev_profile_settings(text, frame)
+}
+
+const TEST_INVENTORY_PTR_DOMAIN: &str = "blaze-cli test inventory delta ptr 1";
+const TEST_INVENTORY_REC_DOMAIN: &str = "blaze-cli test inventory delta rec 1";
+
+fn test_inventory_ptr(graph_out: ContentId) -> blaze_cas::Key {
+    let mut h = blaze_ids::Hasher::new(TEST_INVENTORY_PTR_DOMAIN);
+    h.id(&graph_out);
+    blaze_cas::Key(h.finish())
+}
+
+fn load_test_inventory_cache<'a, D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    graph_out: ContentId,
+    bump: blaze_own::Bump<'a>,
+) -> Option<&'a [u8]> {
+    let tag = blaze_keyed::kind::ReservedTag::Drive.tag();
+    let ptr = test_inventory_ptr(graph_out);
+    let target = match lent.pointed(tag, &ptr) {
+        Ok(Some(key)) => key,
+        Ok(None) | Err(_) => return None,
+    };
+    let lend = lent.get(&target).ok()??;
+    Some(blaze_scope::resolve::aligned(lend.bytes, bump))
+}
+
+fn save_test_inventory_cache<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    graph_out: ContentId,
+    bytes: &[u8],
+) {
+    let tag = blaze_keyed::kind::ReservedTag::Drive.tag();
+    let ptr = test_inventory_ptr(graph_out);
+    let rec_key = blaze_cas::Key(ContentId::of(TEST_INVENTORY_REC_DOMAIN, bytes));
+    if matches!(lent.pointed(tag, &ptr), Ok(Some(current)) if current == rec_key) {
+        return;
+    }
+    if lent.put(&rec_key, blaze_cas::plain::Namespace::LOCAL, tag, bytes).is_ok() {
+        let _ = lent.point(tag, &ptr, &rec_key);
+    }
 }
 
 /// `blaze test` over the check's answer: the selected packages' suites from the answer's rows,
@@ -1250,7 +1371,24 @@ pub(crate) fn run_tests_status(
     // skip reading and parsing the root `Cargo.toml` just to build unused lint rules.
     let mut facts = start_facts(&standing, launch.fs, phases, crate::lints::Lints::NONE);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
-    let inventory = run_names::found_tests_answered(cx, root, &answered, &mut *standing.store, &mut facts, &mut read, packages, bin, heap, frame).map_err(CliError::RunNames)?;
+    let prev_inventory = load_test_inventory_cache(standing.lent, standing.graph.out, bump);
+    let (inventory, updated_inventory) = run_names::found_tests_answered_cached(
+        cx,
+        root,
+        &answered,
+        &mut *standing.store,
+        &mut facts,
+        &mut read,
+        packages,
+        bin,
+        prev_inventory,
+        heap,
+        frame,
+    )
+    .map_err(CliError::RunNames)?;
+    if let Some(updated) = updated_inventory {
+        save_test_inventory_cache(standing.lent, standing.graph.out, updated.as_slice());
+    }
     // A custom harness owns its arguments. Listing is a command operation, even for a selection
     // consisting entirely of custom harnesses.
     let harness_args: &[&str] = if inventory.suites.iter().any(|(_, unit)| unit.tests.harnessed()) || inventory.suites.is_empty() {
@@ -1747,5 +1885,60 @@ mod tests {
 
         let lent2 = open_lent(lent1.into_store().into_driver(), 302);
         assert_eq!(super::load_native_empty_memo(&lent2, &base, true), Some(img_key));
+    }
+
+    #[test]
+    fn parse_dev_profile_settings_matches_manifest_rules_in_one_parse() {
+        use blaze_ladder::run::OverflowChecks;
+        use blaze_manifest::layout::panic::ProfilePanic;
+
+        let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+        assert_eq!(
+            super::parse_dev_profile_settings("[package]\nname = \"a\"\n", &frame).expect("defaults"),
+            (ProfilePanic::Unwind, OverflowChecks::On)
+        );
+        assert_eq!(
+            super::parse_dev_profile_settings("[profile.dev]\npanic = \"abort\"\noverflow-checks = false\n", &frame).expect("custom dev"),
+            (ProfilePanic::Abort, OverflowChecks::Off)
+        );
+        assert!(super::parse_dev_profile_settings("[profile.dev]\ninherits = \"release\"\n", &frame).is_err());
+        assert!(super::parse_dev_profile_settings("[profile.dev]\npanic = \"immediate-abort\"\n", &frame).is_err());
+        assert!(super::parse_dev_profile_settings("[profile.dev.package.foo]\npanic = \"abort\"\n", &frame).is_err());
+        assert!(super::parse_dev_profile_settings("[profile.dev]\noverflow-checks = \"yes\"\n", &frame).is_err());
+        assert!(super::parse_dev_profile_settings("not valid toml = = =", &frame).is_err());
+    }
+
+    #[test]
+    fn test_inventory_delta_cache_persists_across_store_reopen() {
+        use blaze_cas::plain::Settings as StoreSettings;
+        use blaze_core::FileName;
+        use blaze_core::sim::{Faults, Sim};
+        use blaze_ids::ContentId;
+        use crate::store::plain_place::{Facts, after_answer, config, open, test_cx};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let cx = test_cx();
+        let open_lent = |sim: Sim, nonce: u64| {
+            let Some(store_name) = FileName::new("store") else { panic!("store name") };
+            let cfg = config(store_name, &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+            let Ok(lent) = open(sim, cfg, alloc) else { panic!("open sim lent {nonce}") };
+            lent
+        };
+
+        let graph_out = ContentId::of("test inventory graph", b"g1");
+        let payload = crate::run_names::TestsDeltaCache::encode(&[], alloc).expect("encode empty BZTI");
+        let lent1 = open_lent(Sim::new(83, Faults::default()), 401);
+        assert!(super::load_test_inventory_cache(&lent1, graph_out, bump).is_none());
+        super::save_test_inventory_cache(&lent1, graph_out, payload.as_slice());
+        assert_eq!(super::load_test_inventory_cache(&lent1, graph_out, bump), Some(payload.as_slice()));
+        assert!(after_answer(&cx, &lent1, 0).is_ok());
+
+        let lent2 = open_lent(lent1.into_store().into_driver(), 402);
+        let loaded = super::load_test_inventory_cache(&lent2, graph_out, bump).expect("reopened BZTI");
+        assert_eq!(loaded, payload.as_slice());
+        assert!(crate::run_names::TestsDeltaCache::open(loaded).is_some());
     }
 }

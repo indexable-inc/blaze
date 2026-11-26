@@ -88,7 +88,10 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 15: 24-byte crate-prefix-stripped keys in `T_ITEMS`/`T_MEMBERS`/`T_IMPLS`, 8-byte `owners`
 /// index rows (`(owner_row, member_row)`), and optional `grain` section (`F_GRAIN_AT == 0` when
 /// omitted for non-Surface dependency crates); a version-14 record is refused the same way.
-const VERSION: u32 = 15;
+/// 16: per-file CSR item index (`by_file`: `(files + 1)` u32 offsets + `u32` item indices) stored
+/// as column 12 of `T_ITEMS` for O(items_in_file) per-file item iteration (`file_item_indices`);
+/// a version-15 record is refused the same way.
+const VERSION: u32 = 16;
 const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
@@ -803,10 +806,12 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     let mut item_rows = RecordBytes::new_in(alloc);
     if !items.is_empty() {
         let dir_at = item_rows.len();
-        for _ in 0..12 {
+        for _ in 0..13 {
             put32(&mut item_rows, 0);
         }
         let mut buf = cols::ItemColsBuf::with_capacity_in(items.len(), alloc);
+        let mut file_counts: AVec<'b, u32> = AVec::with_capacity_in(names.files.len(), alloc);
+        file_counts.resize(names.files.len(), 0);
         for key in items.iter() {
             let (it, at) = &tables.texts[key];
             let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
@@ -816,6 +821,12 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             // (a file's, or an expansion's: the names task outlines each expansion once).
             let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
             let (code, start, len) = place(Some(*at), it.text);
+            if code < EXPANSION
+                && let Ok(file_idx) = usize::try_from(code)
+                && let Some(slot) = file_counts.get_mut(file_idx)
+            {
+                *slot = slot.checked_add(1).ok_or(ItemsRecordError::TooBig { what: "a file's items" })?;
+            }
             let (name, mut flags) = match it.name {
                 Some(n) => (strings.put(n)?, NAMED),
                 None => ((0, 0), 0),
@@ -873,7 +884,45 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         let l9 = cols::encode_opt_u64(buf.impl_rows(), u64::from(NONE), "item impl rows", alloc, &mut col_scratch, &mut item_rows)?;
         let l10 = cols::encode_opt_u64(buf.abi_ats(), 0, "item ABI offsets", alloc, &mut col_scratch, &mut item_rows)?;
         let l11 = cols::encode_opt_u64(buf.abi_lens(), 0, "item ABI lengths", alloc, &mut col_scratch, &mut item_rows)?;
-        cols::patch_dir(&mut item_rows, dir_at, [l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11]);
+        let l12 = if !names.files.is_empty() {
+            let mut offsets: AVec<'b, u32> = AVec::with_capacity_in(names.files.len().saturating_add(1), alloc);
+            let mut total = 0u32;
+            offsets.push(0);
+            for &count in file_counts.iter() {
+                total = total.checked_add(count).ok_or(ItemsRecordError::TooBig { what: "item file index" })?;
+                offsets.push(total);
+            }
+            let total_usize = usize::try_from(total).map_err(|_| ItemsRecordError::TooBig { what: "item file index" })?;
+            let mut cursors: AVec<'b, u32> = AVec::with_capacity_in(names.files.len(), alloc);
+            if let Some(prefix) = offsets.get(..names.files.len()) {
+                cursors.extend_from_slice(prefix);
+            }
+            let mut indices: AVec<'b, u32> = AVec::with_capacity_in(total_usize, alloc);
+            indices.resize(total_usize, 0);
+            for (idx, &code_u64) in buf.codes().iter().enumerate() {
+                if let Ok(code) = u32::try_from(code_u64)
+                    && code < EXPANSION
+                    && let Ok(file_idx) = usize::try_from(code)
+                    && let Some(cursor) = cursors.get_mut(file_idx)
+                    && let Ok(pos) = usize::try_from(*cursor)
+                    && let Some(dst) = indices.get_mut(pos)
+                {
+                    *dst = u32_of(idx, "item file index row")?;
+                    *cursor = cursor.saturating_add(1);
+                }
+            }
+            let start_len = item_rows.len();
+            for &off in offsets.iter() {
+                put32(&mut item_rows, off);
+            }
+            for &row_idx in indices.iter() {
+                put32(&mut item_rows, row_idx);
+            }
+            u32_of(item_rows.len().saturating_sub(start_len), "item file index")?
+        } else {
+            0
+        };
+        cols::patch_dir(&mut item_rows, dir_at, [l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12]);
     }
 
     // Each trait's and impl's members, in declaration order (columnar, single-allocation SoA buffer).
@@ -1523,6 +1572,50 @@ enum Seen<'a> {
 
 type FileSource<'a> = dyn Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a;
 
+/// Result of looking up item rows by their 16-byte checker prefix (`key.0.0[..16]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ItemPrefix {
+    /// No item row begins with these 16 bytes.
+    Absent,
+    /// Exactly one item row begins with these 16 bytes, at row index `usize`.
+    One(usize),
+    /// Two or more item rows share these 16 bytes.
+    Multiple,
+}
+
+/// Zero-copy iterator over the sorted `T_ITEMS` row indices belonging to one file
+/// (`ItemsRecord::file_item_indices`).
+#[derive(Clone, Copy, Debug)]
+pub struct FileItemIndices<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl Iterator for FileItemIndices<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let end = self.at.checked_add(4)?;
+        let chunk = self.bytes.get(self.at..end)?.first_chunk::<4>()?;
+        self.at = end;
+        usize::try_from(u32::from_le_bytes(*chunk)).ok()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.bytes.len().saturating_sub(self.at) / 4;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for FileItemIndices<'_> {}
+
+#[inline]
+fn le32_checked(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    let chunk = bytes.get(at..end)?.first_chunk::<4>()?;
+    Some(u32::from_le_bytes(*chunk))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ItemsCols<'a> {
     keys: &'a [u8],
@@ -1538,6 +1631,7 @@ struct ItemsCols<'a> {
     impl_row: cols::OptInt<'a>,
     abi_at: cols::OptInt<'a>,
     abi_len: cols::OptInt<'a>,
+    by_file: &'a [u8],
 }
 
 impl<'a> ItemsCols<'a> {
@@ -1556,17 +1650,26 @@ impl<'a> ItemsCols<'a> {
             impl_row: cols::OptInt::empty(0xffff_ffff),
             abi_at: cols::OptInt::empty(0),
             abi_len: cols::OptInt::empty(0),
+            by_file: &[],
         }
     }
 
-    fn open(bytes: &'a [u8], base: usize, count: usize) -> Result<Self, ItemsRecordError> {
+    fn open(bytes: &'a [u8], base: usize, count: usize, n_files: usize) -> Result<Self, ItemsRecordError> {
         if count == 0 {
             return Ok(Self::empty());
         }
         let Some(keys_bytes) = count.checked_mul(KEY_TAIL) else {
             return Err(ItemsRecordError::Short { what: "item rows", at: base });
         };
-        let (keys, [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11]) = cols::read_dir::<12>(bytes, base, keys_bytes, "item rows")?;
+        let (keys, [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12]) = cols::read_dir::<13>(bytes, base, keys_bytes, "item rows")?;
+        if !c12.is_empty() {
+            let Some(head_bytes) = n_files.checked_add(1).and_then(|n| n.checked_mul(4)) else {
+                return Err(ItemsRecordError::Short { what: "item file index", at: base });
+            };
+            if n_files == 0 || c12.len() < head_bytes || !(c12.len() - head_bytes).is_multiple_of(4) {
+                return Err(ItemsRecordError::Short { what: "item file index", at: base });
+            }
+        }
         Ok(ItemsCols {
             keys,
             module: cols::OptInt::open(c0, count, 0, "item modules", base)?,
@@ -1581,6 +1684,7 @@ impl<'a> ItemsCols<'a> {
             impl_row: cols::OptInt::open(c9, count, u64::from(NONE), "item impl rows", base)?,
             abi_at: cols::OptInt::open(c10, count, 0, "item ABI offsets", base)?,
             abi_len: cols::OptInt::open(c11, count, 0, "item ABI lengths", base)?,
+            by_file: c12,
         })
     }
 }
@@ -1754,7 +1858,7 @@ impl<'a> VerifiedItems<'a> {
                 within(WHAT[i], offsets[i], counts[i].checked_mul(WIDTHS[i]))?;
             }
         }
-        let item_cols = ItemsCols::open(bytes, offsets[T_ITEMS], counts[T_ITEMS])?;
+        let item_cols = ItemsCols::open(bytes, offsets[T_ITEMS], counts[T_ITEMS], counts[T_FILES])?;
         let member_cols = MembersCols::open(bytes, offsets[T_MEMBERS], counts[T_MEMBERS])?;
         let impl_cols = ImplsCols::open(bytes, offsets[T_IMPLS], counts[T_IMPLS])?;
         let buckets = buckets::BucketsCols::open(bytes, f(buckets::F_BUCKETS_AT), f(buckets::F_BUCKETS_COUNT))?;
@@ -2004,6 +2108,82 @@ impl<'a> ItemsRecord<'a> {
     #[inline]
     pub(super) fn item_outline(&self, i: usize) -> ItemIndex {
         ItemIndex(self.item_cols.outline.get_u32(i))
+    }
+
+    /// Binary-searches `T_ITEMS`'s sorted 24-byte key tails for rows whose 16-byte checker prefix
+    /// (`key.0.0[..16]`) equals `first`, without decoding any item columns or strings.
+    pub fn find_item_prefix(&self, first: &[u8; 16]) -> ItemPrefix {
+        if first.get(..8) != Some(self.key.prefix().as_slice()) {
+            return ItemPrefix::Absent;
+        }
+        let Some(sought) = first.get(8..16) else {
+            return ItemPrefix::Absent;
+        };
+        let count = self.counts.get(T_ITEMS).copied().unwrap_or(0);
+        let (mut lo, mut hi) = (0usize, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let head = Self::tail_at(self.item_cols.keys, mid).get(..8);
+            if head < Some(sought) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= count || Self::tail_at(self.item_cols.keys, lo).get(..8) != Some(sought) {
+            return ItemPrefix::Absent;
+        }
+        let next = lo.saturating_add(1);
+        if next < count && Self::tail_at(self.item_cols.keys, next).get(..8) == Some(sought) {
+            return ItemPrefix::Multiple;
+        }
+        ItemPrefix::One(lo)
+    }
+
+    /// Zero-copy O(items_in_file) iterator over `T_ITEMS` row indices whose text is
+    /// `At::File(file)` (version 16 CSR index in `T_ITEMS`).
+    pub fn file_item_indices(&self, file: u32) -> Result<FileItemIndices<'a>, ItemsRecordError> {
+        let count = self.counts.get(T_ITEMS).copied().unwrap_or(0);
+        let n_files = self.counts.get(T_FILES).copied().unwrap_or(0);
+        let Ok(file_idx) = usize::try_from(file) else {
+            return Ok(FileItemIndices { bytes: &[], at: 0 });
+        };
+        if count == 0 || file_idx >= n_files || self.item_cols.by_file.is_empty() {
+            return Ok(FileItemIndices { bytes: &[], at: 0 });
+        }
+        let by_file = self.item_cols.by_file;
+        let Some(head_bytes) = n_files.checked_add(1).and_then(|n| n.checked_mul(4)) else {
+            return Err(ItemsRecordError::Short { what: "item file index", at: file_idx });
+        };
+        let Some(start) = file_idx.checked_mul(4).and_then(|at| le32_checked(by_file, at)).and_then(|v| usize::try_from(v).ok()) else {
+            return Err(ItemsRecordError::Short { what: "item file index start", at: file_idx });
+        };
+        let Some(end) = file_idx.checked_add(1).and_then(|i| i.checked_mul(4)).and_then(|at| le32_checked(by_file, at)).and_then(|v| usize::try_from(v).ok()) else {
+            return Err(ItemsRecordError::Short { what: "item file index end", at: file_idx });
+        };
+        let Some(indices) = by_file.get(head_bytes..) else {
+            return Err(ItemsRecordError::Short { what: "item file index body", at: file_idx });
+        };
+        let total = indices.len() / 4;
+        if start > end || end > total {
+            return Err(ItemsRecordError::Short { what: "item file index range", at: file_idx });
+        }
+        let Some(byte_start) = start.checked_mul(4) else {
+            return Err(ItemsRecordError::Short { what: "item file index range", at: file_idx });
+        };
+        let Some(byte_end) = end.checked_mul(4) else {
+            return Err(ItemsRecordError::Short { what: "item file index range", at: file_idx });
+        };
+        let Some(slice) = indices.get(byte_start..byte_end) else {
+            return Err(ItemsRecordError::Short { what: "item file index range", at: file_idx });
+        };
+        Ok(FileItemIndices { bytes: slice, at: 0 })
+    }
+
+    /// Returns the verified current file snapshot (`FileItemsView` + text + surface) for `index`,
+    /// opening and checking it against the recorded surface at most once per `ItemsRecord`.
+    pub fn file_current(&self, index: u32) -> Result<CurrentFile<'a>, ItemsRecordError> {
+        self.current_file(index)
     }
 
     /// The current FileItems body hash of `outline` in `file` without touching the `grain` section.
@@ -2867,5 +3047,88 @@ mod twins {
             }
             Ok(())
         });
+    }
+
+    /// Per-file CSR index (`file_item_indices`) matches a full `0..items()` scan for every file
+    /// (including an empty file, multi-item files, macro-expanded items excluded from file lists,
+    /// and out-of-range file indices); `find_item_prefix` matches every item key and rejects
+    /// absent/foreign prefixes; version-15 bytes are rejected as `NotThisRecord`.
+    #[test]
+    fn file_item_indices_and_prefix_lookup_match_full_scan() {
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+        use crate::crate_scope::{Ready, resolve_by_records};
+        use crate::graph::Sysroot;
+        use crate::resolve::{At, CrateInput, SourceTexts, aligned};
+        use crate::task::Serial;
+
+        struct MapTexts(&'static [(&'static str, &'static str)]);
+        impl<'a> SourceTexts<'a> for MapTexts {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                (krate == 0).then(|| self.0.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)).flatten()
+            }
+        }
+
+        const LIB: &str = "#![no_core]\npub mod a;\npub mod b;\npub mod empty;\nmacro_rules! mk { () => { pub fn expanded() {} } }\nmk!();\npub struct Root;\npub fn root_fn() {}\n";
+        const A: &str = "pub struct A1;\npub fn a_fn() -> u8 { 1 }\nimpl A1 { pub fn m(&self) {} }\n";
+        const B: &str = "pub const B_CONST: u8 = 2;\npub static B_STAT: u8 = 3;\npub fn b_fn() {}\n";
+        const EMPTY: &str = "// no items here\n";
+        const FILES: &[(&str, &str)] = &[
+            ("/k0/lib.rs", LIB),
+            ("/k0/a.rs", A),
+            ("/k0/b.rs", B),
+            ("/k0/empty.rs", EMPTY),
+        ];
+        let texts: &'static MapTexts = std::boxed::Box::leak(std::boxed::Box::new(MapTexts(FILES)));
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "k0",
+            key: blaze_id::CrateItemKey(ContentId::of("blaze-scope file_index test", b"k0")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/k0/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let g = bump.alloc();
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), bump)
+            .expect("solve multi-file crate");
+        let bytes = super::encode(solved[0].names, g).expect("encode v16 items record");
+        let aligned_bytes = aligned(&bytes, bump);
+        let record = super::ItemsRecord::open(aligned_bytes, g).expect("open v16 items record");
+        assert_eq!(record.files(), 4, "4 files recorded");
+        assert!(record.items() >= 8, "items recorded across files and expansion");
+
+        // Compare `file_item_indices(file)` against a full scan for every file + OOB file.
+        for file in 0..=u32::try_from(record.files()).expect("fits") {
+            let expected: StdVec<usize> = (0..record.items())
+                .filter(|&idx| matches!(record.identity_at(idx).expect("id"), Some(id) if id.at == Some(At::File(file))))
+                .collect();
+            let got: StdVec<usize> = record.file_item_indices(file).expect("file_item_indices").collect();
+            assert_eq!(got, expected, "file_item_indices({file}) must match full scan");
+        }
+        // Verify `find_item_prefix` finds every item row and rejects absent/foreign prefixes.
+        for idx in 0..record.items() {
+            let id = record.identity_at(idx).expect("id").expect("present");
+            let mut first = [0u8; 16];
+            first.copy_from_slice(&id.key.0.0[..16]);
+            assert_eq!(record.find_item_prefix(&first), super::ItemPrefix::One(idx), "item {idx} found by prefix");
+        }
+        let mut absent = [0xffu8; 16];
+        absent[..8].copy_from_slice(&record.key().prefix());
+        assert_eq!(record.find_item_prefix(&absent), super::ItemPrefix::Absent);
+        let foreign = [0x00u8; 16];
+        assert_eq!(record.find_item_prefix(&foreign), super::ItemPrefix::Absent);
+
+        // Verify previous version 15 is rejected as `NotThisRecord`.
+        let mut v15 = bytes.to_vec();
+        v15[4..8].copy_from_slice(&15u32.to_le_bytes());
+        assert!(matches!(super::ItemsRecord::open(aligned(&v15, bump), g), Err(super::ItemsRecordError::NotThisRecord)));
     }
 }

@@ -1078,6 +1078,86 @@ impl<'n> FrozenImportCache<'n> {
     }
 }
 
+/// Transfers cell `cell` already lowered in `src` (with `src_keys`) directly into `dst` (with
+/// `dst_keys`) in the same process: encodes each head with [`head_record::encode_in_process_into`]
+/// into reusable `buf`, decodes into `&dst.tys` without `make_record_lives`, without `BZFZ`
+/// framing, and without any BLAKE3 digest computations, then files keys, opaque origins, heads,
+/// and soft-refused regions identically to [`file_frozen_cached`].
+#[expect(clippy::too_many_arguments, reason = "in-process direct store-to-store cell transfer handles")]
+pub(crate) fn transfer_cell_in_process<'n, N: NamesSource<'n>>(
+    names: N,
+    cell: Want,
+    src: &Store<'n>,
+    src_keys: &Keys,
+    dst: &Store<'n>,
+    dst_keys: &Keys,
+    enc_scratch: &mut head_record::EncodeScratch<'static>,
+    buf: &mut RecordBytes<'static>,
+    cache: &FrozenImportCache<'n>,
+    scratch: Alloc<'static>,
+) -> Result<(), FreezeError> {
+    use crate::front2::keys::Origin;
+    use crate::front2::project::head_digest::opaque_origin;
+
+    let head_ats = want_heads(src, cell, scratch);
+    let tys_before = dst.tys.view().len_now();
+    let mut heads: AVec<'static, (HeadAt, blaze_own::Box<Head<'n>, Alloc<'static>>)> = AVec::with_capacity_in(head_ats.len(), scratch);
+    let mut origins: AVec<'_, (ItemKey, head_record::OpaqueOrigin)> = AVec::new_in(scratch);
+    let mut refused_regions: AVec<'_, (HeadAt, head_record::Unlaid)> = AVec::new_in(scratch);
+    let origin = |key| opaque_origin(names, src_keys, src, key);
+    for at in head_ats.iter().copied() {
+        let rec = |error| FreezeError::Record { want: cell, at, error };
+        let head_ref = head_record::from_store(src, at).map_err(rec)?;
+        if let RecordedRegions::Refused(kind) = RecordedRegions::of(src, at, head_ref) {
+            refused_regions.push((at, kind));
+        }
+        let text = head_ref.text();
+        head_record::encode_in_process_into(head_ref, src.tys.view(), &origin, enc_scratch, buf).map_err(rec)?;
+        let decoded = head_record::decode_with_origins_boxed_inline_verified(
+            buf.as_slice(),
+            text,
+            &dst.tys,
+            dst.tys.alloc(),
+            &mut |s| dst.locals.keep_text(s),
+            &mut |_, _, _, _, _| true,
+            &mut |key, orig| {
+                origins.push((key, orig));
+                Ok(())
+            },
+        )
+        .map_err(rec)?;
+        if let (HeadAt::Opaque(k), Head::Opaque { key, fn_, index, .. }) = (at, &*decoded)
+            && k == *key
+        {
+            origins.push((*key, head_record::OpaqueOrigin { want: cell, owner: *fn_, index: *index }));
+        }
+        heads.push((at, decoded));
+    }
+    let clash = |error| FreezeError::Head { want: cell, error: HeadError::Key(error) };
+    for &(key, orig) in origins.iter() {
+        if !dst.opaques.contains_key(&key) {
+            dst_keys.item(orig.want.key()).map_err(clash)?;
+            if let Some(Origin::Member { container, kind, name }) = src_keys.origin(orig.owner) {
+                dst_keys.member(*container, *kind, name.as_ref()).map_err(clash)?;
+            }
+            dst.opaques.insert(key, (orig.owner, orig.index));
+        }
+    }
+    let needs_members = heads.iter().any(|(_, h)| matches!(&**h, Head::Trait { .. } | Head::Impl { .. }));
+    if needs_members {
+        cache.0.with_members(names, cell, |members| file_keys(cell, members, &heads, dst_keys))?;
+    } else {
+        file_keys(cell, &[], &heads, dst_keys)?;
+    }
+    file_named_items(names, cell, dst, dst_keys, &heads, tys_before)?;
+    dst.file_heads(cell, heads.into_iter().map(|(at, h)| (at, blaze_own::Box::into_inner(h))))
+        .map_err(|error| FreezeError::Head { want: cell, error })?;
+    for (at, kind) in refused_regions {
+        dst.regions.file_unlaid(head_record::regions_key(at), kind, kind.name());
+    }
+    Ok(())
+}
+
 /// Import an already-frozen cell. A Bodies task has the record its Heads task published and
 /// can only file it or report a typed error. The expected cell is checked before filing keys.
 pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenHead<'_>, store: &Store<'n>, keys: &Keys, scratch: Alloc<'static>) -> Result<(), FreezeError> {

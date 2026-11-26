@@ -795,11 +795,13 @@ pub(crate) fn report_live(board: &Board<'_>, now: u64, live: &(dyn blaze_screen:
     }));
 }
 
-/// `work` with the watcher beside it when a signal can ask, a line is due, or a live progress sink
-/// is attached; the watcher ends and is joined on every path, an unwind too. A stop the workers
-/// do not reach in [`STOP_BOUND`] is written from here and ends the process (`Exit::StopStalled`).
-/// A plant starts no watcher: its requests are the driver's at its scheduling points, so a planted
-/// run stays one deterministic thread on one worker.
+/// `work` with the watcher beside it when a periodic line is due (`every.is_some()`) or a live
+/// progress sink is attached (`live.is_some()`); the watcher ends and is joined on every path, an
+/// unwind too. When neither is active, `work` runs directly with zero OS thread spawn and zero
+/// `WATCH_SCRATCH` mapping (fast certificate and ready-edit paths check `board.stopping()` at
+/// scheduling points, while long multi-phase drives wrap themselves in [`watch_signals`] when
+/// process signals are held). A plant starts no watcher: its requests are the driver's at its
+/// scheduling points, so a planted run stays one deterministic thread on one worker.
 #[expect(clippy::too_many_arguments, reason = "the watcher's edge: each argument one specific capability or sink")]
 pub(crate) fn watched<R>(
     cx: &Cx,
@@ -812,9 +814,43 @@ pub(crate) fn watched<R>(
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     work: impl FnOnce() -> R,
 ) -> Result<R, StatusError> {
-    if board.asked.is_none() && every.is_none() && live.is_none() {
+    if every.is_none() && live.is_none() {
         return Ok(work());
     }
+    run_watched(cx, host, root, err, clock, board, every, live, work)
+}
+
+/// Watches held process signals (`SIGINFO`/`SIGUSR1` mid-phase and [`STOP_BOUND`] on stuck
+/// workers) during a long multi-phase drive when [`watched`] did not already spawn a watcher for
+/// `every` or `live`. No-op when `board.asked` is `None`.
+#[expect(clippy::too_many_arguments, reason = "the watcher's edge: each argument one specific capability")]
+pub(crate) fn watch_signals<R>(
+    cx: &Cx,
+    host: Option<&Host>,
+    root: &Dir<ReadWrite>,
+    err: &Out,
+    clock: &Clock,
+    board: &Board<'_>,
+    work: impl FnOnce() -> R,
+) -> Result<R, StatusError> {
+    if board.asked.is_none() {
+        return Ok(work());
+    }
+    run_watched(cx, host, root, err, clock, board, None, None, work)
+}
+
+#[expect(clippy::too_many_arguments, reason = "the watcher's edge: each argument one specific capability or sink")]
+fn run_watched<R>(
+    cx: &Cx,
+    host: Option<&Host>,
+    root: &Dir<ReadWrite>,
+    err: &Out,
+    clock: &Clock,
+    board: &Board<'_>,
+    every: Option<Duration>,
+    live: Option<&(dyn blaze_screen::Watch + Sync)>,
+    work: impl FnOnce() -> R,
+) -> Result<R, StatusError> {
     let spawner = cx.spawner();
     struct Over<'b, 'r>(&'b Board<'r>, &'b Signal);
     impl Drop for Over<'_, '_> {

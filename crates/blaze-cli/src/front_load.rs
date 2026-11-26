@@ -204,6 +204,40 @@ pub(crate) struct Unopened {
     pub(crate) package: &'static str,
 }
 
+/// Toolchain crate names that may declare `#[lang]` items or incoherent inherent impls
+/// (`#![rustc_coherence_is_core]` / `#[rustc_allow_incoherent_impl]`), matching
+/// `blaze-ladder/src/front2/source.rs` (`Records::name_lang_crates`), `personality.rs`, and
+/// `engine_bodies.rs` (`is_lang_crate_name`).
+pub(crate) fn is_lang_crate_name(name: &str) -> bool {
+    matches!(name, "core" | "alloc" | "std" | "bstd" | "blaze_std" | "panic_unwind" | "panic_abort")
+}
+
+/// Selects the actual lang-item crates from `checked.lang_places()` for `run`/`test` programs:
+/// always keeps the owner (place 0), every sysroot slot of `list`, and crates matching
+/// [`is_lang_crate_name`]. Excludes pure-dependency toolchain crates (`libc`, `gimli`, `object`,
+/// `addr2line`, `hashbrown`, `miniz_oxide`, `adler2`, `memchr`, `rustc_demangle`, `cfg_if`,
+/// `unwind`, `std_detect`, `rustc_std_workspace_*`, `compiler_builtins`, `test`) so
+/// `Records::name_lang_crates` and `Index::from_source` never eagerly open ~15 unused toolchain
+/// `CrateScope` records (~29 MB) on every edit.
+pub(crate) fn lang_places_of<A: core::alloc::Allocator>(
+    checked: &blaze_world::check_scope::CheckScope<'_>,
+    list: &blaze_world::crate_list::CrateList<'static>,
+    into: &mut Vec<usize, A>,
+) {
+    use blaze_world::crate_list::CrateGraph;
+    let sysroot = CrateGraph::sysroot(list);
+    let readers = checked.readers();
+    for place in checked.lang_places() {
+        let keep = place == 0
+            || readers.get(place).is_some_and(|&(world_at, _)| {
+                sysroot.contains(&Some(world_at)) || is_lang_crate_name(CrateGraph::name(list, world_at))
+            });
+        if keep {
+            into.push(place);
+        }
+    }
+}
+
 /// THE REQUEST'S SCOPE RECORDS OPENED BY NEED (piece C (a)): each crate's `CrateScope` record
 /// read in place from the committed snapshot and its sections checked once a request
 /// (front_load.rs `checked_records` through engine_records.rs `open_record`, rule 74), at the
@@ -1318,5 +1352,34 @@ mod tests {
         // Lazy `ScopeRecords::slots` stays unallocated until first crate ask.
         let scope_records = ScopeRecords::new(&snapshot, 16, heap);
         assert!(scope_records.slots.get().is_none(), "unused ScopeRecords must not allocate slots");
+    }
+
+    #[test]
+    fn lang_crate_filter_keeps_sysroot_and_skips_pure_toolchain_deps() {
+        for keep in ["core", "alloc", "std", "bstd", "blaze_std", "panic_unwind", "panic_abort"] {
+            assert!(is_lang_crate_name(keep), "`{keep}` must be kept as a lang/incoherent crate");
+        }
+        for skip in [
+            "libc",
+            "gimli",
+            "object",
+            "addr2line",
+            "hashbrown",
+            "miniz_oxide",
+            "adler2",
+            "memchr",
+            "rustc_demangle",
+            "cfg_if",
+            "unwind",
+            "std_detect",
+            "rustc_std_workspace_core",
+            "rustc_std_workspace_alloc",
+            "rustc_std_workspace_std",
+            "compiler_builtins",
+            "test",
+            "proc_macro",
+        ] {
+            assert!(!is_lang_crate_name(skip), "pure toolchain dep `{skip}` must be skipped");
+        }
     }
 }

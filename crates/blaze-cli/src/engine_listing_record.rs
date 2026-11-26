@@ -678,9 +678,21 @@ pub(crate) fn open_part<'r, 'a>(bytes: &'r [u8], alloc: Alloc<'a>) -> Result<Row
     Ok(rows)
 }
 
+/// How thoroughly [`open_join`] checks a join record (rule 74: local CAS bytes are
+/// integrity-checked once per boot, so re-hashing every head row with BLAKE3 on every
+/// read is redundant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Check header, bounds, tags, UTF-8, sort orders, index bounds, and `rows_digest`.
+    Full,
+    /// Local CAS bytes verified once by the store: check header, bounds, tags, UTF-8,
+    /// sort orders, and index bounds; trust the stored `digest` without re-hashing rows.
+    Store,
+}
+
 /// A crate's join in `bytes`, its texts read in place and its lists in `alloc`: its sort
-/// orders, its index and its digest checked here, once.
-pub(crate) fn open_join<'r, 'a>(bytes: &'r [u8], alloc: Alloc<'a>) -> Result<Joined<'r, 'a>, ListingRefused> {
+/// orders, its index and (under [`Check::Full`]) its digest checked here, once.
+pub(crate) fn open_join<'r, 'a>(bytes: &'r [u8], check: Check, alloc: Alloc<'a>) -> Result<Joined<'r, 'a>, ListingRefused> {
     let mut c = Cursor { bytes, at: 0 };
     c.header(&JOIN_MAGIC, "a crate's join")?;
     let rows = c.rows(alloc)?;
@@ -707,7 +719,7 @@ pub(crate) fn open_join<'r, 'a>(bytes: &'r [u8], alloc: Alloc<'a>) -> Result<Joi
     if let Some(row) = (1..rows.calls.len()).find(|at| rows.calls[at - 1] >= rows.calls[*at]) {
         return Err(ListingRefused::Order { what: "calls", row });
     }
-    if rows_digest(&rows) != digest {
+    if check == Check::Full && rows_digest(&rows) != digest {
         return Err(ListingRefused::Digest);
     }
     Ok(Joined { rows, by_sig, digest })
@@ -801,8 +813,9 @@ mod tests {
         assert_eq!(joined.rows.calls.len(), 2, "each call once");
         assert_eq!(joined.by_sig.len(), 6, "one index row a head name");
         let bytes = join_bytes(&joined, g);
-        let back = open_join(&bytes, g).expect("the join opens");
+        let back = open_join(&bytes, Check::Full, g).expect("the join opens");
         assert_eq!(back, joined, "the opened join is the join encoded");
+        assert_eq!(open_join(&bytes, Check::Store, g).expect("Check::Store opens"), joined, "Check::Store matches Check::Full");
         assert_eq!(back.digest, rows_digest(&back.rows), "restore equals fresh in digest");
         assert_eq!(&join_bytes(&back, g)[..], &bytes[..], "a join: restore equals fresh in bytes");
         // A join of the parts in another order is the same bytes (rule 25).
@@ -830,23 +843,24 @@ mod tests {
         let g = heap.alloc();
         let part = part_bytes(&rows(g), g);
         let joined = join_bytes(&join(rows(g), g), g);
-        assert!(open_part(&part, g).is_ok() && open_join(&joined, g).is_ok(), "CONTROL: the whole records open");
+        assert!(open_part(&part, g).is_ok() && open_join(&joined, Check::Full, g).is_ok(), "CONTROL: the whole records open");
         for cut in 0..part.len() {
             assert!(open_part(&part[..cut], g).is_err(), "a part cut at byte {cut} of {} is refused", part.len());
         }
         for cut in 0..joined.len() {
-            assert!(open_join(&joined[..cut], g).is_err(), "a join cut at byte {cut} of {} is refused", joined.len());
+            assert!(open_join(&joined[..cut], Check::Full, g).is_err(), "a join cut at byte {cut} of {} is refused", joined.len());
         }
         assert!(matches!(open_part(&joined, g), Err(ListingRefused::Magic { .. })), "a join is no part");
-        assert!(matches!(open_join(&part, g), Err(ListingRefused::Magic { .. })), "a part is no join");
+        assert!(matches!(open_join(&part, Check::Full, g), Err(ListingRefused::Magic { .. })), "a part is no join");
         let mut long = AVec::new_in(g);
         long.extend_from_slice(&joined);
         long.push(0);
-        assert!(matches!(open_join(&long, g), Err(ListingRefused::Trailing { left: 1, .. })), "a trailing byte is refused");
+        assert!(matches!(open_join(&long, Check::Full, g), Err(ListingRefused::Trailing { left: 1, .. })), "a trailing byte is refused");
+        assert!(matches!(open_join(&long, Check::Store, g), Err(ListingRefused::Trailing { left: 1, .. })), "Check::Store still refuses trailing bytes");
         let mut version = AVec::new_in(g);
         version.extend_from_slice(&joined);
         version[8] = 2;
-        assert_eq!(open_join(&version, g), Err(ListingRefused::Version { found: 2 }), "another form is refused, never read");
+        assert_eq!(open_join(&version, Check::Full, g), Err(ListingRefused::Version { found: 2 }), "another form is refused, never read");
         let mut counted = AVec::new_in(g);
         counted.extend_from_slice(&part);
         counted[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -856,17 +870,20 @@ mod tests {
         kind[16] = 0;
         assert!(matches!(open_part(&kind, g), Err(ListingRefused::Tag { at: 16, .. })), "a name's kind byte no kind has is refused");
         // A flipped byte of the first head's item name ("Point"): its text still reads, so the
-        // digest is what refuses it.
+        // digest is what refuses it under `Check::Full` (while `Check::Store` trusts local CAS).
         let name_at = 16 + 33 + 16 + 33 + 33 + WANT_BYTES + 16 + 1 + 4;
         let mut flipped = AVec::new_in(g);
         flipped.extend_from_slice(&joined);
         flipped[name_at] = b'Q';
-        assert_eq!(open_join(&flipped, g), Err(ListingRefused::Digest), "rows that are not the digest's are refused");
+        assert_eq!(open_join(&flipped, Check::Full, g), Err(ListingRefused::Digest), "rows that are not the digest's are refused");
+        assert!(open_join(&flipped, Check::Store, g).is_ok(), "Check::Store skips rows_digest re-hash on local CAS bytes");
         // Two heads swapped, the digest made again over the swapped rows: the order refuses it.
         let mut swapped = join(rows(g), g);
         swapped.rows.heads.swap(0, 1);
         swapped.digest = rows_digest(&swapped.rows);
-        assert!(matches!(open_join(&join_bytes(&swapped, g), g), Err(ListingRefused::Order { what: "heads", row: 1 })), "heads out of order are refused");
+        let swapped_bytes = join_bytes(&swapped, g);
+        assert!(matches!(open_join(&swapped_bytes, Check::Full, g), Err(ListingRefused::Order { what: "heads", row: 1 })), "heads out of order are refused");
+        assert!(matches!(open_join(&swapped_bytes, Check::Store, g), Err(ListingRefused::Order { what: "heads", row: 1 })), "Check::Store still enforces sort order");
     }
 
     fn facts(file: u32, entries: u8) -> FileFacts {

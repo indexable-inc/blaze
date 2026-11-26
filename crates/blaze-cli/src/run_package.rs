@@ -742,6 +742,80 @@ pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame
     })
 }
 
+/// Fast-path classification of default `blaze test` selection from reading ONLY the root
+/// `Cargo.toml` (1 read, 0 `getattrlistbulk`, 0 member manifest reads), avoiding `with_layout()`.
+pub(crate) enum FastTestSelection<'f> {
+    /// Standalone single-package checkout (no `[workspace]`, has `[package]` with literal name
+    /// and no `*.workspace = true` inheritance): `total_members == 1` -> `CheckScope::Whole`.
+    Standalone(&'f str),
+    /// Virtual workspace without `workspace.default-members` (`[workspace]`, no `[package]`):
+    /// default selection ALWAYS covers every member (`packages.len() == total_members`) ->
+    /// `CheckScope::Whole`, and member package names come from `Standing`'s `CrateList`.
+    AllWorkspaceMembers,
+    /// Root-package workspace without `workspace.default-members` (`[workspace]` + `[package]`):
+    /// default selection is always `[package]`; total member count (1 vs >1) can be resolved from
+    /// a standing stored `CrateList` when root `Cargo.toml` has not moved.
+    RootPackage(&'f str),
+    /// Explicit `-p`, `--bin`, subdir `member`, `workspace.default-members`, or a manifest needing
+    /// full layout / error diagnostics.
+    NeedsMembers,
+}
+
+/// Attempts to classify `select` for `blaze test` from ONLY the root `Cargo.toml` without
+/// running `with_layout()` (0 directory listings, 0 member manifest reads). Returns
+/// [`FastTestSelection::NeedsMembers`] whenever member manifests, `default-members`, `--bin`,
+/// `-p`, subdir `member`, or full layout error diagnostics are needed.
+pub(crate) fn fast_test_selection<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame: &'f Frame) -> Result<FastTestSelection<'f>, CliError> {
+    if !select.test_packages.is_empty() || select.bin.is_some() || !select.member.is_empty() {
+        return Ok(FastTestSelection::NeedsMembers);
+    }
+    let cx = cx.span("blaze test: root manifest fast selection");
+    let mut bytes = Bytes::new_in(frame, "the root manifest");
+    match root.read_all(&cx, &Path::new(MANIFEST)?, &mut bytes) {
+        Ok(_) => {}
+        Err(error) if matches!(error.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) => {
+            return Ok(FastTestSelection::NeedsMembers);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let Ok(text) = core::str::from_utf8(bytes.as_slice()) else {
+        return Ok(FastTestSelection::NeedsMembers);
+    };
+    let Ok(doc) = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, frame) else {
+        return Ok(FastTestSelection::NeedsMembers);
+    };
+    let root_table = doc.root();
+    match (root_table.get("workspace"), root_table.get("package")) {
+        (None, Some(pkg)) => {
+            if let Some(name) = pkg.get("name").and_then(|item| item.as_str())
+                && !name.is_empty()
+                && !uses_workspace_inheritance(&doc)
+            {
+                return Ok(FastTestSelection::Standalone(kept(name, frame)?));
+            }
+            Ok(FastTestSelection::NeedsMembers)
+        }
+        (Some(ws), None) => {
+            if ws.get("default-members").is_some() {
+                return Ok(FastTestSelection::NeedsMembers);
+            }
+            Ok(FastTestSelection::AllWorkspaceMembers)
+        }
+        (Some(ws), Some(pkg)) => {
+            if ws.get("default-members").is_some() {
+                return Ok(FastTestSelection::NeedsMembers);
+            }
+            if let Some(name) = pkg.get("name").and_then(|item| item.as_str())
+                && !name.is_empty()
+            {
+                return Ok(FastTestSelection::RootPackage(kept(name, frame)?));
+            }
+            Ok(FastTestSelection::NeedsMembers)
+        }
+        (None, None) => Ok(FastTestSelection::NeedsMembers),
+    }
+}
+
 /// What `blaze test` selected in the workspace: the sorted, deduplicated package names, any
 /// `--bin <name>` crate roots (checkout-relative, sorted, deduplicated), and how many members the
 /// workspace has in total (so a selection of every member with no `--bin` runs the whole-workspace
@@ -1300,6 +1374,39 @@ mod tests {
         started(&ws_files, std::vec::Vec::new(), |cx, fs| {
             let located = locate(cx, fs, &Checkout::Under(Path::new("a").expect("path")), cx.frame()).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!((located.at, located.member), ("", "a"));
+        });
+    }
+
+    #[test]
+    fn fast_test_selection_classifies_root_manifests_without_layout() {
+        // 1. Standalone package -> Standalone(name) for default select; NeedsMembers for -p/--bin/member.
+        let solo = package("solo");
+        checkout(&[("Cargo.toml", solo.as_str())], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast solo");
+            assert!(matches!(f, FastTestSelection::Standalone("solo")));
+            let with_p = fast_test_selection(cx, root, Select { test_packages: &["solo"], ..Select::NONE }, cx.frame()).expect("with -p");
+            assert!(matches!(with_p, FastTestSelection::NeedsMembers));
+            let with_bin = fast_test_selection(cx, root, Select { bin: Some("app"), ..Select::NONE }, cx.frame()).expect("with --bin");
+            assert!(matches!(with_bin, FastTestSelection::NeedsMembers));
+            let with_member = fast_test_selection(cx, root, Select { member: "sub", ..Select::NONE }, cx.frame()).expect("with member");
+            assert!(matches!(with_member, FastTestSelection::NeedsMembers));
+        });
+
+        // 2. Virtual workspace without default-members -> AllWorkspaceMembers; with default-members -> NeedsMembers.
+        checkout(&[("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n")], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast virtual");
+            assert!(matches!(f, FastTestSelection::AllWorkspaceMembers));
+        });
+        checkout(&[("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\ndefault-members = [\"crates/a\"]\n")], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast virtual defaults");
+            assert!(matches!(f, FastTestSelection::NeedsMembers));
+        });
+
+        // 3. Root-package workspace (ripgrep shape) -> RootPackage(name).
+        let rg_root = std::format!("{}\n[workspace]\nmembers = [\"crates/*\"]\n", package("ripgrep"));
+        checkout(&[("Cargo.toml", rg_root.as_str())], |cx, root| {
+            let f = fast_test_selection(cx, root, Select::NONE, cx.frame()).expect("fast ripgrep");
+            assert!(matches!(f, FastTestSelection::RootPackage("ripgrep")));
         });
     }
 }

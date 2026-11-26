@@ -363,7 +363,7 @@ fn scope_by_need_heads<'r, 'p>(
     let own = Crate { records: own_records, name: CrateGraph::name(list, at), package: list.shown_from(at), world_at: at };
     let mut rest: SVec<'p, crate::front_load::Unopened> = SVec::with_capacity_in(checked.readers().len().saturating_sub(1), at_phase);
     let mut lang: SVec<'p, usize> = SVec::new_in(at_phase);
-    lang.extend(checked.lang_places());
+    crate::engine_bodies::lang_places_of(&checked, list, &mut lang);
     let mut scope: SVec<'p, Name> = SVec::with_capacity_in(checked.readers().len(), at_phase);
     let mut whole = true;
     let mut cut = None;
@@ -535,7 +535,7 @@ impl<'p> SubjectEntries<'p> {
         subjects.reserve(pending.len());
         for &(prefix, file, idx) in pending.iter() {
             if let (Some(one), Some(Some((signature_file, entries)))) = (outlined.get(idx), self.cached.get(idx).copied()) {
-                subjects.push(Subject { prefix, file, slot: one.name, signature_file, entries });
+                subjects.push(Subject { prefix, file, slot: one.name, signature_file: SubjectFile::Resolved(signature_file), entries });
             }
         }
         Ok(())
@@ -890,6 +890,9 @@ impl HeadsStage {
         } else {
             &[]
         };
+        for (input, records) in cache.slots.iter().copied().flatten() {
+            listings.record_scope_key(records.key, input.at);
+        }
         let lazy = heads_lazy.get_or_insert_with(|| crate::front_load::ScopeRecords::new(lazy_snap.as_ref(), CrateGraph::len(&list), heap));
         let lazy_before = lazy.counts();
         let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), at_phase);
@@ -1426,6 +1429,65 @@ fn tables_of<'p>(
 // ---------------------------------------------------------------------------------------------
 // The head tasks: one an outline entry that has a head (module docs, "THE HEAD TASKS").
 
+/// Lazy or already-computed physical signature file of a [`Subject`].
+///
+/// Storing [`SubjectFile::Path`] lets standing `Held` files construct `Subject`s in O(1) with
+/// zero BLAKE3 digests; only the rare file actually queried computes `SignatureFile::new(path)`.
+#[derive(Clone, Copy)]
+pub(crate) enum SubjectFile {
+    Resolved(crate::signature::SignatureFile),
+    Path(&'static [u8]),
+}
+
+impl SubjectFile {
+    pub(crate) fn resolve(self) -> crate::signature::SignatureFile {
+        match self {
+            SubjectFile::Resolved(sig) => sig,
+            SubjectFile::Path(path) => crate::signature::SignatureFile::new(path),
+        }
+    }
+
+    pub(crate) fn subject(self) -> ContentId {
+        self.resolve().subject()
+    }
+
+    pub(crate) fn entry(self, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> Name {
+        self.resolve().entry(outline, item, text)
+    }
+
+    pub(crate) fn entry_from_chain(self, chain: ContentId) -> Name {
+        self.resolve().entry_from_chain(chain)
+    }
+}
+
+impl PartialEq for SubjectFile {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (SubjectFile::Resolved(a), SubjectFile::Resolved(b)) => a == b,
+            (SubjectFile::Path(a), SubjectFile::Path(b)) if a == b => true,
+            _ => self.resolve() == other.resolve(),
+        }
+    }
+}
+
+impl Eq for SubjectFile {}
+
+impl PartialOrd for SubjectFile {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SubjectFile {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        match (*self, *other) {
+            (SubjectFile::Resolved(a), SubjectFile::Resolved(b)) => a.cmp(&b),
+            (SubjectFile::Path(a), SubjectFile::Path(b)) if a == b => core::cmp::Ordering::Equal,
+            _ => self.resolve().cmp(&other.resolve()),
+        }
+    }
+}
+
 /// A member file as its items record lists it, matched to the planner's outline. The logical
 /// module slot names the item record cell, while `signature_file` names the physical file whose
 /// outline supplied the signature parts. Both come from one matched outline, and so do
@@ -1436,13 +1498,13 @@ pub(crate) struct Subject {
     pub(crate) prefix: [u8; 8],
     pub(crate) file: u32,
     pub(crate) slot: Name,
-    pub(crate) signature_file: crate::signature::SignatureFile,
+    pub(crate) signature_file: SubjectFile,
     pub(crate) entries: ContentId,
 }
 
 impl Subject {
     pub(crate) fn new(prefix: [u8; 8], file: u32, outline: &Outlined<'_>) -> Subject {
-        Subject { prefix, file, slot: outline.name, signature_file: crate::signature::SignatureFile::new(&outline.path), entries: crate::engine_listing_record::entries_of(outline) }
+        Subject { prefix, file, slot: outline.name, signature_file: SubjectFile::Resolved(crate::signature::SignatureFile::new(&outline.path)), entries: crate::engine_listing_record::entries_of(outline) }
     }
 }
 
@@ -2081,23 +2143,164 @@ impl<'s> Owners<'s> {
         // `g`: the listing's lists are the request heap's, `Listings`' own (kept for the call's
         // shape, which the head tasks and the stretches share: engine_heads_once.rs `one_head`).
         let _ = g;
-        let listing = match self.filled.binary_search_by_key(&prefix, |(p, _)| *p) {
-            Ok(at) => self.filled[at].1,
-            Err(at) => {
-                let listing = match self.over.records(k).filter(|one| one.key == key) {
-                    Some(one) => self.listings.listing(records, &one, k, key, self.subjects),
-                    None => Err(OVER_NOT_RECORDS),
-                };
-                // Linear in the crates this reader asked of (a scope's crates, once each).
-                self.filled.insert_shift(at, (prefix, listing));
-                listing
+        if let Ok(at) = self.filled.binary_search_by_key(&prefix, |(p, _)| *p)
+            && let Some(&(_, listing)) = self.filled.get(at)
+        {
+            return Some(match listing {
+                Ok(listing) => listing.place(id, scope),
+                Err(why) => HeadAt::Unlisted { scope, why },
+            });
+        }
+        let Some(one) = self.over.records(k).filter(|one| one.key == key) else {
+            if let Err(at) = self.filled.binary_search_by_key(&prefix, |(p, _)| *p) {
+                self.filled.insert_shift(at, (prefix, Err(OVER_NOT_RECORDS)));
             }
+            return Some(HeadAt::Unlisted { scope, why: OVER_NOT_RECORDS });
         };
+        // O(1) direct placement for normal file items (`At::File(file)`): skips building or
+        // reading the whole-crate `BLZLSTJ` listing on single-body edits.
+        if let Some(placed) = self.place_direct_file(records, k, prefix, id) {
+            return Some(placed);
+        }
+        if let crate::run_names::ScopeCrates::ByNeed(by_need) = self.over
+            && let Some(unopened) = k.checked_sub(1).and_then(|i| by_need.rest.get(i))
+        {
+            self.listings.record_scope_key(unopened.key, unopened.input.at);
+        }
+        let listing = self.listings.listing(records, &one, k, key, self.subjects);
+        // Linear in the crates this reader asked of (a scope's crates, once each).
+        if let Err(at) = self.filled.binary_search_by_key(&prefix, |(p, _)| *p) {
+            self.filled.insert_shift(at, (prefix, listing));
+        }
         Some(match listing {
             Ok(listing) => listing.place(id, scope),
             Err(why) => HeadAt::Unlisted { scope, why },
         })
     }
+
+    /// O(1) direct file-item head placement for non-macro items (`At::File(file)`): computes the
+    /// exact `(entry, cell, slot)` from that single file's `FileItemsView` and `ItemsRecord`
+    /// without building or reading the whole-crate `BLZLSTJ` listing. Returns `None` for
+    /// macro-expanded items (`At::Expansion`), impl methods (`Want::MemberFn`), plants,
+    /// uncovered/unlisted heads, or any ambiguity — all of which fall through to [`Listings::listing`].
+    fn place_direct_file<'n>(&self, records: &'n Records<'n>, k: usize, prefix: [u8; 8], id: &CellId) -> Option<HeadAt>
+    where
+        's: 'n,
+    {
+        if self.listings.plant != ListingsPlant::Rule {
+            return None;
+        }
+        if id.of.kind != Kind::Signature || id.of.subject.0.get(16..32) != Some([0u8; 16].as_slice()) {
+            return None;
+        }
+        let items = records.items_record(k)?;
+        let first: [u8; 16] = *id.of.subject.0.first_chunk::<16>()?;
+        let blaze_scope::items_record::ItemPrefix::One(idx) = items.find_item_prefix(&first) else {
+            return None;
+        };
+        let row = items.identity_at(idx).ok().flatten()?;
+        let At::File(file) = row.at? else {
+            return None;
+        };
+        let want = by_origin::kind_of_lib(records, row.key).and_then(|kind| by_origin::item_want(records, kind)).ok()?;
+        if head_cell_id(want).of != id.of {
+            return None;
+        }
+        let from = self.subjects.partition_point(|one| one.prefix < prefix);
+        let tail = self.subjects.get(from..)?;
+        let len = tail.iter().take_while(|one| one.prefix == prefix).count();
+        let mine = tail.get(..len)?;
+        let at = mine.binary_search_by_key(&file, |one| one.file).ok()?;
+        let subject = mine.get(at)?;
+        let _edition = NamesSource::edition_of(records, k)?;
+        let current = items.file_current(file).ok()?;
+        let view = current.view;
+        let top = row.outline;
+        let (cover, written) = if let Some(cover) = covering_entry_view(view, top) {
+            (cover, None)
+        } else if let Some(cover) = holding_entry_view(view, top) {
+            let from_entry = top.0.checked_sub(cover.0)?;
+            (cover, Some(Written { steps: ContentId::of(IN_A_BODY_DOMAIN, b""), from_entry }))
+        } else {
+            return None;
+        };
+        let chain = crate::signature::stored_chain(view, cover);
+        let entry = subject.signature_file.entry_from_chain(chain);
+        let name = NamesSource::name_of(records, row.key).unwrap_or("");
+        let cell = head_cell_written(want, name, None, written, WHOLE);
+        Some(HeadAt::Cell { cell: CellId { of: entry, cell }, file: subject.slot })
+    }
+}
+
+/// Mirrors `signature.rs` `own_head` for direct `FileItemsView` placement.
+const fn own_head_kind(kind: blaze_surface::ItemKind) -> bool {
+    matches!(
+        kind,
+        blaze_surface::ItemKind::Function
+            | blaze_surface::ItemKind::Const
+            | blaze_surface::ItemKind::Static
+            | blaze_surface::ItemKind::Struct
+            | blaze_surface::ItemKind::Enum
+            | blaze_surface::ItemKind::Union
+            | blaze_surface::ItemKind::Trait
+            | blaze_surface::ItemKind::TraitAlias
+            | blaze_surface::ItemKind::Impl
+            | blaze_surface::ItemKind::TypeAlias
+    )
+}
+
+/// Mirrors `signature.rs` `in_modules_only` directly over a serialized `FileItemsView`.
+fn in_modules_only_view(view: blaze_surface::FileItemsView<'_>, item: &blaze_surface::Item) -> bool {
+    let mut parent = item.parent;
+    while let Some(at) = parent {
+        let Some(up) = view.item(at) else { return false };
+        if up.kind() != blaze_surface::ItemKind::Module {
+            return false;
+        }
+        parent = up.parent;
+    }
+    true
+}
+
+/// Mirrors `signature.rs` `is_signature_entry` directly over a serialized `FileItemsView`.
+fn is_signature_entry_view(view: blaze_surface::FileItemsView<'_>, item: &blaze_surface::Item) -> bool {
+    if let Some(parent) = item.parent
+        && let Some(up) = view.item(parent)
+        && item.kind() == blaze_surface::ItemKind::Function
+        && up.kind() == blaze_surface::ItemKind::Impl
+    {
+        return in_modules_only_view(view, &up.item);
+    }
+    if own_head_kind(item.kind()) || matches!(item.kind(), blaze_surface::ItemKind::MacroCall | blaze_surface::ItemKind::ExternBlock) {
+        return in_modules_only_view(view, item);
+    }
+    false
+}
+
+/// Mirrors `signature.rs` `covering_entry` directly over a serialized `FileItemsView`.
+fn covering_entry_view(view: blaze_surface::FileItemsView<'_>, at: ItemIndex) -> Option<ItemIndex> {
+    let entry = view.item(at)?;
+    if is_signature_entry_view(view, &entry.item) {
+        return Some(at);
+    }
+    let parent = entry.parent?;
+    let up = view.item(parent)?;
+    (matches!(up.kind(), blaze_surface::ItemKind::Trait | blaze_surface::ItemKind::Impl | blaze_surface::ItemKind::ExternBlock)
+        && in_modules_only_view(view, &up.item))
+        .then_some(parent)
+}
+
+/// Mirrors [`holding_entry`] directly over a serialized `FileItemsView`.
+fn holding_entry_view(view: blaze_surface::FileItemsView<'_>, at: ItemIndex) -> Option<ItemIndex> {
+    let mut parent = view.item(at)?.parent;
+    for _ in 0..view.len() {
+        let up = parent?;
+        if let Some(cover) = covering_entry_view(view, up) {
+            return Some(cover);
+        }
+        parent = view.item(up)?.parent;
+    }
+    None
 }
 
 /// How many crate listings one request's table holds (rule 18): one a (crate, unit view) the
@@ -2363,6 +2566,10 @@ pub(crate) struct Listings {
     held: blaze_core::SharedMap<Key, Held, SharedAlloc<'static>>,
     /// The keys of `held` already put ([`HeadsStage::put_listings`]).
     put: blaze_core::SharedSet<Key, SharedAlloc<'static>>,
+    /// Each crate's `CrateScope` CAS record key (`Input::at`, which cryptographically covers
+    /// the whole `CrateScope` payload: `names`, `items`, and `expansions`), avoiding O(bytes)
+    /// BLAKE3 re-hashing of `over.items` and `over.names` in `join_key`.
+    scope_keys: blaze_core::SharedMap<blaze_id::CrateItemKey, Key, SharedAlloc<'static>>,
     made: AtomicU32,
     read: AtomicU32,
     parts_made: AtomicU32,
@@ -2408,6 +2615,7 @@ impl Listings {
             lists: blaze_core::SharedMap::new_in("engine.heads: each crate's listing once a request", heap.shared()),
             held: blaze_core::SharedMap::new_in("engine.heads: each listing record read or made, by key", heap.shared()),
             put: blaze_core::SharedSet::new_in("engine.heads: each listing record put", heap.shared()),
+            scope_keys: blaze_core::SharedMap::new_in("engine.heads: each crate scope's CAS key", heap.shared()),
             made: AtomicU32::new(0),
             read: AtomicU32::new(0),
             parts_made: AtomicU32::new(0),
@@ -2420,6 +2628,12 @@ impl Listings {
             asks: AtomicU32::new(0),
             full: AtomicU32::new(0),
         }
+    }
+
+    /// Records crate `key`'s `CrateScope` CAS key (`Input::at`) so [`Self::list_crate`] can
+    /// derive `join_key` in O(1) without re-hashing raw `items` and `names` section bytes.
+    pub(crate) fn record_scope_key(&self, key: blaze_id::CrateItemKey, at: Key) {
+        let _ = self.scope_keys.pin().try_insert(key, at);
     }
 
     /// The record at `key`: one this request holds, else the store's, copied to the heap.
@@ -2513,13 +2727,22 @@ impl Listings {
         // The plant that takes the table away takes the store too (its control counts makes).
         let stores = self.plant != ListingsPlant::PerAsk;
         let join_key = match listing_record::directory_digest(&over.expansions) {
-            Ok(directory) if stores => Some(listing_record::join_key(&listing_record::JoinKey {
-                krate,
-                items: listing_record::bytes_digest(over.items),
-                names: listing_record::bytes_digest(over.names),
-                directory,
-                files: &files,
-            })),
+            Ok(directory) if stores => {
+                // Prefer the already-hashed `CrateScope` CAS key (`Input::at`, covering every
+                // byte of `items`, `names`, and `expansions`) over re-hashing megabytes of raw
+                // `over.items` + `over.names` bytes on every command (rule 21 + rule 77).
+                let (items_id, names_id) = match self.scope_keys.pin().get(&key).copied() {
+                    Some(at) => (at.0, at.0),
+                    None => (listing_record::bytes_digest(over.items), listing_record::bytes_digest(over.names)),
+                };
+                Some(listing_record::join_key(&listing_record::JoinKey {
+                    krate,
+                    items: items_id,
+                    names: names_id,
+                    directory,
+                    files: &files,
+                }))
+            }
             Ok(_) => None,
             // No key without the directory's rows: made, and never stored.
             Err(_) => {
@@ -2531,7 +2754,7 @@ impl Listings {
         let mut put_join = join_key.is_some();
         if let Some(at) = join_key {
             match self.stored(at) {
-                Found::Bytes(bytes) => match listing_record::open_join(bytes, g) {
+                Found::Bytes(bytes) => match listing_record::open_join(bytes, listing_record::Check::Store, g) {
                     Ok(joined) => {
                         self.hold(at, bytes, false, true)?;
                         self.read.fetch_add(1, Ordering::Relaxed);
@@ -2598,7 +2821,8 @@ impl Listings {
         let mut bytes: Vec<u8, Alloc<'static>> = Vec::new_in(g);
         listing_record::encode_join(&joined, &mut bytes);
         let bytes: &'static [u8] = bytes.leak_static();
-        let joined = listing_record::open_join(bytes, g).map_err(|_| LISTING_NOT_OPENED)?;
+        let open_check = if cfg!(test) { listing_record::Check::Full } else { listing_record::Check::Store };
+        let joined = listing_record::open_join(bytes, open_check, g).map_err(|_| LISTING_NOT_OPENED)?;
         self.made.fetch_add(1, Ordering::Relaxed);
         if Self::filed(records) > before {
             self.faulted.fetch_add(1, Ordering::Relaxed);
@@ -3936,6 +4160,9 @@ impl HeadsStage {
         // The request's crate listings, lent to every worker as the frozen heads are.
         let head_jobs = self.jobs;
         let listings: &Listings = self.listings.get_or_insert_with(|| Listings::new(heap, head_jobs.listings, Some(snapshot_owner.clone()), handles.tool));
+        for (input, records) in cache.slots.iter().copied().flatten() {
+            listings.record_scope_key(records.key, input.at);
+        }
         let board = handles.board;
         // Each crate's setup, each split job, and any closed-dep `ImplBucket` jobs overlap inside
         // one worker scope so idle cores during `HeadsSetup` and `HeadsSplit` build dep tables.
@@ -5065,5 +5292,80 @@ mod heads_frame_caps_tests {
         assert!(r128 <= r64 && r128 >= HEADS_SCRATCH_RESET_MIN);
         assert!(k128 <= k64 && k128 >= HEADS_SCRATCH_KEEP_MIN);
         assert!(128usize.saturating_mul(k128) <= 160 << 20, "128-core heads scratch keep <= 160 MiB, got {}", 128usize.saturating_mul(k128));
+    }
+
+    #[test]
+    fn direct_file_placement_matches_outline_listing_byte_for_byte() {
+        let heap = blaze_own::testing::heap();
+        let text = r#"
+pub fn f_0(x: u64) -> u64 {
+    struct Local;
+    impl Local { fn hidden() {} }
+    fn inner() {}
+    x
+}
+pub struct Pair(u32);
+pub trait Measure { type Out; fn m(&self) -> u32; }
+impl Pair {
+    pub const K: u32 = 1;
+    pub fn a(&self) -> u32 { 1 }
+}
+impl Measure for Pair {
+    type Out = u32;
+    fn m(&self) -> u32 { 2 }
+}
+unsafe extern "C" { fn ext_f(x: i32) -> i32; }
+mod nested {
+    pub type Alias = u64;
+    pub static S: u32 = 0;
+    pub const C: u32 = 1;
+    pub enum E { A }
+}
+"#;
+        let outline = blaze_file_items::outline(text, blaze_surface::Edition::E2024, heap.alloc());
+        let bytes = outline.to_file_items(text, ContentId::of("direct place test", text.as_bytes()), heap.alloc()).expect("outline serializes");
+        let view = blaze_surface::FileItemsView::read(&bytes).expect("outline opens");
+        let lazy = SubjectFile::Path(b"src/rich.rs");
+        let resolved = SubjectFile::Resolved(crate::signature::SignatureFile::new(b"src/rich.rs"));
+        assert!(lazy == resolved);
+        assert_eq!(lazy.cmp(&resolved), core::cmp::Ordering::Equal);
+        assert_eq!(lazy.subject(), resolved.subject());
+
+        let mut covered_count = 0usize;
+        let mut held_count = 0usize;
+        for i in 0..outline.items().len() {
+            let idx = ItemIndex(u32::try_from(i).expect("small"));
+            let want_cover = crate::signature::covering_entry(&outline, idx);
+            let got_cover = covering_entry_view(view, idx);
+            assert_eq!(got_cover, want_cover, "covering_entry mismatch at item {i}");
+
+            let want_hold = holding_entry(&outline, idx);
+            let got_hold = holding_entry_view(view, idx);
+            assert_eq!(got_hold, want_hold, "holding_entry mismatch at item {i}");
+
+            let direct = if let Some(cover) = got_cover {
+                covered_count += 1;
+                Some((lazy.entry_from_chain(crate::signature::stored_chain(view, cover)), None))
+            } else if let Some(cover) = got_hold {
+                held_count += 1;
+                let from_entry = idx.0 - cover.0;
+                Some((lazy.entry_from_chain(crate::signature::stored_chain(view, cover)), Some(Written { steps: ContentId::of(IN_A_BODY_DOMAIN, b""), from_entry })))
+            } else {
+                None
+            };
+
+            let from_outline = if let Some(cover) = want_cover {
+                Some((resolved.entry(&outline, outline.item(cover), text), None))
+            } else if let Some(holder) = want_hold {
+                let cover = crate::signature::covering_entry(&outline, holder).expect("holder covered");
+                let from_entry = idx.0 - cover.0;
+                Some((resolved.entry(&outline, outline.item(cover), text), Some(Written { steps: ContentId::of(IN_A_BODY_DOMAIN, b""), from_entry })))
+            } else {
+                None
+            };
+            assert!(direct == from_outline, "direct vs outline placement mismatch at item {i}");
+        }
+        assert!(covered_count > 10, "expected covered top-level/nested items");
+        assert!(held_count >= 2, "expected body-held items inside f_0");
     }
 }

@@ -508,6 +508,14 @@ impl<'a> Lines<'a> {
             word(&mut out, len_of(bytes));
             out.extend_from_slice(bytes);
         }
+        // Selectively compress large (>= 4 KiB) `BEFB`/`BEFC` lines records into a `BZR1` fast-Zstd
+        // envelope when compressed output is strictly < 85% of raw size; small/incompressible
+        // records stay raw with zero framing overhead (rule 25: deterministic).
+        if let Ok(crate::store::record_codec::Encoded::Compressed(compressed)) =
+            crate::store::record_codec::encode_selective_in(out.as_slice(), self.alloc)
+        {
+            return (Key(ContentId::of(LINES_DOMAIN, &compressed)), compressed);
+        }
         (Key(ContentId::of(LINES_DOMAIN, &out)), out)
     }
 
@@ -769,8 +777,38 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
     }
 }
 
-/// The record `bytes`, every block and entry checked.
-pub(crate) fn decode<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<Last<'m, 'a>, LinesError> {
+/// The record `bytes` (raw `BEFB`/`BEFC` zero-copy, or `BZR1`-compressed decompressed into
+/// `frame`), every block and entry checked.
+pub(crate) fn decode_in_frame<'b, 'a>(bytes: &'b [u8], frame: &'b Frame, alloc: SharedAlloc<'a>) -> Result<Last<'b, 'a>, LinesError> {
+    let raw: &'b [u8] = match crate::store::record_codec::decode_if_envelope_in(
+        bytes,
+        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        frame,
+    ) {
+        Ok(crate::store::record_codec::Decoded::Borrowed(raw)) => raw,
+        Ok(crate::store::record_codec::Decoded::Owned(decompressed)) => decompressed.into_bump_slice(),
+        Err(_) => return Err(LinesError { at: 0, what: "the BZR1 compressed lines envelope is damaged or refused" }),
+    };
+    decode_raw(raw, alloc)
+}
+
+/// The record `bytes` (raw `BEFB`/`BEFC` zero-copy, or `BZR1`-compressed), every block and entry
+/// checked. Prefer [`decode_in_frame`] on hot command paths so decompressed buffers are reclaimed
+/// with the command's frame.
+pub(crate) fn decode<'m>(bytes: &'m [u8], alloc: SharedAlloc<'static>) -> Result<Last<'m, 'static>, LinesError> {
+    let raw: &'m [u8] = match crate::store::record_codec::decode_if_envelope_in(
+        bytes,
+        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        alloc,
+    ) {
+        Ok(crate::store::record_codec::Decoded::Borrowed(raw)) => raw,
+        Ok(crate::store::record_codec::Decoded::Owned(decompressed)) => decompressed.leak_static(),
+        Err(_) => return Err(LinesError { at: 0, what: "the BZR1 compressed lines envelope is damaged or refused" }),
+    };
+    decode_raw(raw, alloc)
+}
+
+fn decode_raw<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<Last<'m, 'a>, LinesError> {
     let mut reader = Reader { bytes, at: 0 };
     let placement = match reader.take(4, "the form")? {
         form if form == LINES_PLACED_MAGIC => Some(reader.digest("the placement facts")?),
@@ -2471,7 +2509,7 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
         if let Some(tally) = self.certified(cx, lines, shown, frame, out)? {
             return Ok(Ok(tally));
         }
-        match crate::engine_answer::load_lines(cx, store, lines, alloc)? {
+        match crate::engine_answer::load_lines_in(cx, store, lines, frame, alloc)? {
             Ok(last) => Ok(Ok(self.new_view(cx, root, store, lines, &last, shown, alloc, frame, out)?)),
             Err(why) => Ok(Err(why)),
         }
@@ -2554,14 +2592,22 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
         let Some(held) = crate::store::Store::get(store, cx, old.lines)? else {
             return Ok(None);
         };
-        if !held.bytes.starts_with(LINES_PLACED_MAGIC) || held.bytes.len() < 40 {
+        let Ok(decoded) = crate::store::record_codec::decode_if_envelope_in(
+            held.bytes,
+            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            frame,
+        ) else {
+            return Ok(None);
+        };
+        let raw = decoded.as_slice();
+        if !raw.starts_with(LINES_PLACED_MAGIC) || raw.len() < 40 {
             return Ok(None);
         }
-        if !lines.blocks_equal_encoded(&held.bytes[36..]) {
+        if !lines.blocks_equal_encoded(&raw[36..]) {
             return Ok(None);
         }
         let mut old_placement = [0u8; 32];
-        old_placement.copy_from_slice(&held.bytes[4..36]);
+        old_placement.copy_from_slice(&raw[4..36]);
         let fast_sources = Sources::new(frame);
         if !observe_standing_paths(lines, rows, texts, &fast_sources, frame)? {
             return Ok(None);
@@ -3001,5 +3047,69 @@ mod section_tests {
         assert!(!bytes5.is_empty(), "removed finding re-encodes lines");
         assert_eq!(tally5.listed, 1, "only a.rs finding remains");
         assert!(!text5.contains("b.rs"), "removed finding is no longer printed: {text5}");
+    }
+
+    /// Selective `BZR1` compression for `Lines` (`BEFB`/`BEFC`): small records (< 4 KiB) stay
+    /// raw zero-copy with `BEFB`/`BEFC` magic; large compressible records (>= 4 KiB) compress
+    /// deterministically into `BZR1`, round-trip block-for-block through both `decode_in_frame`
+    /// and `decode`, and refuse bit-flips and truncation with typed `LinesError`.
+    #[test]
+    fn lines_bzr1_selective_compression_round_trips_and_refuses_bit_flips() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("test frame");
+        let alloc = blaze_own::testing::heap().shared();
+
+        // 1. Small record (< 4 KiB): stays raw BEFB/BEFC with zero envelope overhead.
+        let mut small = Lines::new_in(alloc);
+        let one = Name::new(Kind::BodyCheck, ContentId::of("bzr1 small", b"one"));
+        small.note(one, Class::Told, b"small body note");
+        let (small_key, small_bytes) = small.record();
+        assert!(!crate::store::record_codec::is_envelope(&small_bytes), "small Lines record stays raw");
+        assert!(small_bytes.starts_with(LINES_MAGIC), "small Lines record starts with BEFB");
+        assert_eq!(small.record().0, small_key, "small Lines key is deterministic");
+        let small_last = decode_in_frame(&small_bytes, &frame, alloc).expect("decode small in frame");
+        assert!(small_last.blocks().eq(small.blocks()));
+
+        // 2. Large compressible record (>= 4 KiB): compresses into BZR1 for both BEFB and BEFC.
+        let mut big = Lines::new_in(alloc);
+        for i in 0u32..160 {
+            let name = Name::new(Kind::BodyCheck, ContentId::of("bzr1 big", &i.to_le_bytes()));
+            big.note(name, Class::Unchecked, b"body not checked: repeated diagnostic payload for zstd compression verification");
+        }
+        let (key_befb, bytes_befb) = big.record();
+        let (key_befb2, bytes_befb2) = big.record();
+        assert_eq!((key_befb, bytes_befb.as_slice()), (key_befb2, bytes_befb2.as_slice()), "BZR1 BEFB encoding is deterministic");
+        assert!(crate::store::record_codec::is_envelope(&bytes_befb), "large BEFB Lines record must compress into BZR1");
+        // 160 unique 32-byte BLAKE3 digests = 5,120 incompressible bytes; the ~13 KiB diagnostic
+        // text compresses to ~300 bytes (~3.3x overall).
+        assert!(bytes_befb.len() < 6500, "expected strong compression on repetitive Lines record, got {} bytes", bytes_befb.len());
+
+        let decoded_frame = decode_in_frame(&bytes_befb, &frame, alloc).expect("decode_in_frame BZR1 BEFB");
+        assert!(decoded_frame.blocks().eq(big.blocks()), "decode_in_frame round-trips every block");
+        let decoded_static = decode(&bytes_befb, alloc).expect("decode BZR1 BEFB");
+        assert!(decoded_static.blocks().eq(big.blocks()), "decode round-trips every block");
+
+        let placement = ContentId([0x42; 32]);
+        let (placed, bytes_befc) = big.record_for(placement);
+        assert!(crate::store::record_codec::is_envelope(&bytes_befc), "large BEFC Lines record must compress into BZR1");
+        let decoded_befc = decode_in_frame(&bytes_befc, &frame, alloc).expect("decode_in_frame BZR1 BEFC");
+        assert_eq!(decoded_befc.placement, Some(placement), "BEFC placement digest survives BZR1 round-trip");
+        assert!(decoded_befc.blocks().eq(big.blocks()), "BEFC blocks survive BZR1 round-trip");
+        assert_eq!(big.record_for(placement).0.key, placed.key, "BZR1 BEFC key is deterministic");
+
+        // 3. Bit-flip corruption and truncation are refused loudly with typed LinesError.
+        for &flip_at in &[5usize, 6, 12, bytes_befb.len() / 2, bytes_befb.len() - 1] {
+            let mut corrupted = bytes_befb.as_slice().to_vec();
+            corrupted[flip_at] ^= 0x5A;
+            assert!(
+                decode_in_frame(&corrupted, &frame, alloc).is_err(),
+                "bit-flip at byte {flip_at} must be refused by decode_in_frame"
+            );
+            assert!(
+                decode(&corrupted, alloc).is_err(),
+                "bit-flip at byte {flip_at} must be refused by decode"
+            );
+        }
+        let truncated = &bytes_befb[..bytes_befb.len() - 4];
+        assert!(decode_in_frame(truncated, &frame, alloc).is_err(), "truncated BZR1 Lines record must be refused");
     }
 }
