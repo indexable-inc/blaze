@@ -59,7 +59,7 @@ use crate::diag::At;
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{Edition, ExprId, ItemKey, LangItem, Mutbl, PatId};
 use crate::machine::{Lower, Machine, RECURSION_LIMIT};
-use crate::ty::{Cause, ClosureKind, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx};
+use crate::ty::{Cause, ClosureKind, FulfillErrorKind, Goal, Obligation, Ty, TyFlags, TyList, TyView, TypeCtx};
 use crate::world::{Adt, AdtKind, Def, TypeAttrs, World};
 
 /// How a place is captured, weakest first: a merge of two uses takes the stronger.
@@ -1144,9 +1144,23 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let answer = match cp.copy_trait {
             None => Copyness::NotCopy,
             Some(copy) => {
-                let args = self.mk_list(&[t])?;
+                let resolved = self.ty.resolve(t)?;
+                let args = self.mk_list(&[resolved])?;
                 let goal = Goal::Trait { trait_: copy, args };
-                if !self.ty.may_hold(goal, &mut self.reads)? { Copyness::NotCopy } else { self.probe_copy(goal)? }
+                if !self.ty.may_hold(goal, &mut self.reads)? {
+                    Copyness::NotCopy
+                } else {
+                    match self.probe_copy(goal)? {
+                        // A rigid type with no unresolved inference variables (e.g. an
+                        // unnormalized generic associated type `T::ExecutionData` or
+                        // `SealedHeader<N::BlockHeader>`) whose `Copy` bound is not proven by
+                        // the body's param-env is not `Copy` in Rust (`rustc`'s
+                        // `type_is_copy_modulo_regions`), even though the new trait solver
+                        // reports `Ambiguous` for unnormalized aliases.
+                        Copyness::Undecided if !self.ty.ty_flags(resolved).has(TyFlags::HAS_INFER) => Copyness::NotCopy,
+                        other => other,
+                    }
+                }
             }
         };
         cp.copy_cache.insert_shift(at, (t, answer));
@@ -1218,7 +1232,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     fn variant_field_ty(&mut self, adt: Adt<'w>, variant: u32, field: usize, args: TyList, sub: PatId) -> Result<Ty, Halt> {
         let fields = adt.fields.get(adt.variants[variant as usize].fields.range()).unwrap_or(&[]);
         let Some(f) = fields.get(field).copied() else { return Err(gap(At::Pat(sub), CaptureGapKind::PatternType)) };
-        let t = self.lower(adt.types, f.ty, Lower::Args(args), Cause::Pat(sub))?;
+        let t = self.lower(adt.types, f.ty, Lower::NormalizedArgs(args), Cause::Pat(sub))?;
         Ok(self.ty.resolve(t)?)
     }
 
@@ -1508,7 +1522,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 (place, mode) = self.truncate(cp, place, mode, i);
             }
             // `restrict_precision_for_drop_types`.
-            if mode == PlaceMode::ByValue {
+            if mode == PlaceMode::ByValue && place.len > 0 {
                 let t = cp.place_ty(place);
                 match self.copy_of(cp, t)? {
                     Copyness::Copy => {}

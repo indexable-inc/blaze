@@ -103,6 +103,71 @@ type BoxFut<'a> = Pin<Box<dyn Future<Output = u8> + Send + 'a>>;
 fn rpc_boxed(rpc: &Rpc) -> BoxFut<'_> { Box::pin(async move { header(&rpc.eth.api).await }) }
 fn rpc_boxed_rc(rpc: &RpcRc) -> BoxFut<'_> { Box::pin(async move { header_rc(&rpc.eth.api).await }) }
 
+// `reth_engine_tree::tree::payload_validator::BasicEngineValidator::spawn_convert_and_validate`:
+// a `move ||` closure spawned with `Send` that matches an enum holding an unnormalized rigid
+// associated type (`T::ExecutionData`) and captures a generic wrapper over an unnormalized
+// associated type (`SealedHeader<N::BlockHeader>`). Without `: Copy`, rigid aliases are `NotCopy`
+// (not `CopyUndecided`), so `capture_places` must decide the witness instead of leaving the
+// closure environment opaque (`ClosureCaptureWitness`).
+trait NodePrims {
+    type BlockHeader: Send + Sync + 'static;
+    type Block: Send + Sync + 'static;
+}
+trait PayloadTys: Send + Sync + 'static {
+    type ExecutionData: Send + Sync + 'static;
+}
+trait PayloadVal<T: PayloadTys>: Send + Sync + 'static {
+    type Block: Send + Sync + 'static;
+    fn convert(&self, payload: T::ExecutionData) -> Self::Block;
+}
+struct SealedHdr<H>(H);
+enum BlkOrPayload<N: NodePrims, T: PayloadTys> {
+    Block(N::Block),
+    Payload(T::ExecutionData),
+}
+fn spawn_blocking_send<F: FnOnce() -> R + Send + 'static, R: Send + 'static>(f: F) -> R { f() }
+
+fn spawn_convert_and_validate<N, T, V>(
+    input: BlkOrPayload<N, T>,
+    parent: SealedHdr<N::BlockHeader>,
+    validator: V,
+) -> N::Block
+where
+    N: NodePrims + Send + Sync + 'static,
+    T: PayloadTys,
+    V: PayloadVal<T, Block = N::Block>,
+{
+    spawn_blocking_send(move || {
+        let block = match input {
+            BlkOrPayload::Block(b) => b,
+            BlkOrPayload::Payload(p) => validator.convert(p),
+        };
+        let _ = &parent;
+        block
+    })
+}
+
+fn spawn_convert_and_validate_rc<N, T, V>(
+    input: BlkOrPayload<N, T>,
+    parent: SealedHdr<N::BlockHeader>,
+    validator: V,
+    local: Rc<u8>,
+) -> N::Block
+where
+    N: NodePrims + Send + Sync + 'static,
+    T: PayloadTys,
+    V: PayloadVal<T, Block = N::Block>,
+{
+    spawn_blocking_send(move || {
+        let block = match input {
+            BlkOrPayload::Block(b) => b,
+            BlkOrPayload::Payload(p) => validator.convert(p),
+        };
+        let _ = (&parent, &local);
+        block
+    })
+}
+
 fn main() {}
 "#;
 
@@ -184,4 +249,10 @@ fn role_shapes_have_their_closure_witness() {
 fn rpc_shapes_have_their_coroutine_witness() {
     let rows = verdicts(&["rpc_register", "rpc_register_rc", "rpc_boxed", "rpc_boxed_rc"]);
     judge(&rows, &["rpc_register", "rpc_boxed"], &[("rpc_register_rc", &["Send", "Send", "Sync"]), ("rpc_boxed_rc", &["Send"])]);
+}
+
+#[test]
+fn rigid_alias_move_closure_has_its_capture_witness() {
+    let rows = verdicts(&["spawn_convert_and_validate", "spawn_convert_and_validate_rc"]);
+    judge(&rows, &["spawn_convert_and_validate"], &[("spawn_convert_and_validate_rc", &["Send"])]);
 }
