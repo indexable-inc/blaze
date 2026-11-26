@@ -60,14 +60,18 @@ pub struct DirEntryMeta<'a> {
     /// Optional `(dev, ino)` for hardlink deduplication when `nlink > 1`.
     pub inode: Option<(u64, u64)>,
     pub nlink: u64,
+    /// Entry modification time in Unix nanoseconds (0 if unavailable).
+    pub mtime_ns: i64,
 }
 
-/// Snapshot of live or completed folder-size progress.
+/// Snapshot of live or completed folder-size & recursive-mtime progress.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DustProgress {
     pub bytes: u64,
     pub files: u64,
     pub dirs: u64,
+    /// Most recent `mtime` (Unix nanoseconds) across all visited descendants (0 if empty).
+    pub max_mtime_ns: i64,
     pub done: bool,
     pub capped: bool,
 }
@@ -159,6 +163,9 @@ impl<'a> DustMachine<'a> {
             return false;
         }
 
+        if entry.mtime_ns > self.progress.max_mtime_ns {
+            self.progress.max_mtime_ns = entry.mtime_ns;
+        }
         match entry.kind {
             EntryKind::File => {
                 if entry.nlink > 1
@@ -360,6 +367,7 @@ mod tests {
             bytes: 1000,
             inode: Some((1, 10)),
             nlink: 2,
+            mtime_ns: 1_000_000_000,
         }));
         // Hardlink to the same inode must only be counted once!
         assert!(m.feed_entry(DirEntryMeta {
@@ -368,6 +376,7 @@ mod tests {
             bytes: 1000,
             inode: Some((1, 10)),
             nlink: 2,
+            mtime_ns: 1_000_000_000,
         }));
         assert!(m.feed_entry(DirEntryMeta {
             name: "sub",
@@ -375,6 +384,7 @@ mod tests {
             bytes: 0,
             inode: None,
             nlink: 1,
+            mtime_ns: 500_000_000,
         }));
         m.finish_dir();
         assert!(!m.progress().done);
@@ -391,6 +401,7 @@ mod tests {
             bytes: 4096,
             inode: Some((1, 11)),
             nlink: 1,
+            mtime_ns: 9_000_000_000,
         }));
         m.finish_dir();
 
@@ -402,6 +413,7 @@ mod tests {
         assert_eq!(final_prog.bytes, 5096);
         assert_eq!(final_prog.files, 2);
         assert_eq!(final_prog.dirs, 1);
+        assert_eq!(final_prog.max_mtime_ns, 9_000_000_000);
     }
 
     #[test]
@@ -420,6 +432,7 @@ mod tests {
             bytes: 512,
             inode: None,
             nlink: 1,
+            mtime_ns: 100,
         }));
         assert!(m.feed_entry(DirEntryMeta {
             name: "f2",
@@ -427,6 +440,7 @@ mod tests {
             bytes: 512,
             inode: None,
             nlink: 1,
+            mtime_ns: 200,
         }));
         assert!(!m.feed_entry(DirEntryMeta {
             name: "f3",
@@ -434,6 +448,7 @@ mod tests {
             bytes: 512,
             inode: None,
             nlink: 1,
+            mtime_ns: 300,
         }));
         assert!(m.progress().capped);
         assert!(m.progress().done);
