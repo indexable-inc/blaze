@@ -3242,7 +3242,16 @@ struct ParHost<'r, 's, 'a, S> {
 impl<'a, S: SourceTexts<'a>> ExpandCx for ParHost<'_, '_, 'a, S> {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
         let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
-        self.crate_env.ok_or(refused)?.get(name).map_err(|_| refused)
+        let env = self.crate_env.ok_or(refused)?;
+        let value = env.get(name).map_err(|_| refused)?;
+        if value.is_none()
+            && name == "STD_ENV_ARCH"
+            && env.get("CARGO_CRATE_NAME").ok().flatten() == Some("std")
+            && let Some(arch) = self.cfg.atoms().iter().find_map(|&(k, v)| (k == "target_arch").then_some(v).flatten())
+        {
+            return Ok(Some(arch));
+        }
+        Ok(value)
     }
 
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
@@ -4127,7 +4136,16 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
     /// (rule 3), never answered unset.
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
         let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
-        self.sources.crate_env(self.krate).ok_or(refused)?.get(name).map_err(|_| refused)
+        let env = self.sources.crate_env(self.krate).ok_or(refused)?;
+        let value = env.get(name).map_err(|_| refused)?;
+        if value.is_none()
+            && name == "STD_ENV_ARCH"
+            && env.get("CARGO_CRATE_NAME").ok().flatten() == Some("std")
+            && let Some(arch) = self.cfg.atoms().iter().find_map(|&(k, v)| (k == "target_arch").then_some(v).flatten())
+        {
+            return Ok(Some(arch));
+        }
+        Ok(value)
     }
 
     /// A predicate the cfg does not read is false, as the lowering takes it.
