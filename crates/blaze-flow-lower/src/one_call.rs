@@ -937,6 +937,7 @@ struct BufferedSink<'s, A: Allocator + Copy> {
     static_: Origin,
     dyn_ph: &'s mut Vec<Origin, A>,
     subsets: &'s mut Vec<(Origin, Origin), A>,
+    created_existentials: Option<&'s mut Vec<Origin, A>>,
 }
 
 impl<A: Allocator + Copy> Constraints for BufferedSink<'_, A> {
@@ -950,6 +951,8 @@ impl<A: Allocator + Copy> Constraints for BufferedSink<'_, A> {
         let o = self.b.origin(kind == Kind::Placeholder);
         if kind == Kind::Placeholder {
             self.b.known(self.static_, o);
+        } else if let Some(created) = self.created_existentials.as_deref_mut() {
+            created.push(o);
         }
         o
     }
@@ -1840,6 +1843,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     static_,
                     dyn_ph: &mut self.dyn_bound_placeholders,
                     subsets: &mut buffered_subsets,
+                    created_existentials: None,
                 };
                 let mut cx = Cx { types: &unsize_types, sig_types: &heads, selected: &sel, owner: &who, origins: &sc.col, out: &mut sink };
                 let mut inst = blaze_borrow::Inst {
@@ -1869,6 +1873,264 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 self.b.subset(a, b);
             }
             Ok(UnsizeBorrow::Proven { closures_tied: all_closures_laid })
+        })();
+        self.call_scratch = Some(sc);
+        res
+    }
+
+    /// Computes exact field origins when [`Facts::field_regions`] has no static row (typically
+    /// because the field's declared type contains a `PNode::Alias` / GAT such as
+    /// `TxRequest<'a, 'host, T, Tx>::host: &'a mut T::Host<'host>` or
+    /// `BlockAssemblerInput<'a, 'b, F, H>::execution_ctx: F::ExecutionCtx<'a>`).
+    ///
+    /// Instantiates the field's declared region column from `Facts::regions().field(adt, variant,
+    /// field)` with the ADT's exact lifetime and type arguments from `of`, allocates `want` fresh
+    /// origins for `field_ty`, and relates `declared == actual` invariantly via
+    /// `blaze_borrow::relate_sides` (buffering all subset constraints so a failed normalization
+    /// leaves `self.b` and `self.origs` untouched and falls back to `Ok(None)`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn field_slot_via_borrow(
+        &mut self,
+        of: PInfo,
+        adt: ItemKey,
+        args_list: List,
+        variant: u32,
+        field: u32,
+        field_ty: TyD,
+        e: ExprId,
+    ) -> Result<Option<(u32, u32)>, Refusal> {
+        if field_ty.wrap.is_some() {
+            return Ok(None);
+        }
+        let facts: &'b F = self.facts;
+        let Ok(col) = facts.regions().field(adt, variant, field) else {
+            return Ok(None);
+        };
+        let lifetimes = self.adt_facts(adt, e)?.lifetimes;
+        let args = self.list(args_list, e)?;
+        let mut at: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
+        let mut total = lifetimes;
+        for &a in args {
+            let n = self.npos(a, e)?;
+            at.push((total, n));
+            total += n;
+        }
+        if total != of.len {
+            return Ok(None);
+        }
+        let want = self.npos_d(field_ty, e)?;
+        let mut sc = self.call_scratch.take().unwrap_or_else(|| CallOneScratch::new_in(self.alloc));
+        let res = (|| -> Result<Option<(u32, u32)>, Refusal> {
+            sc.clear();
+            let arity = FactsArity { facts };
+            for &a in args {
+                self.body_slots(a, &mut sc.bodies, e)?;
+            }
+            self.body_slots(field_ty.ty, &mut sc.bodies, e)?;
+            let caller = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &sc.bodies);
+            let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+            if caller.count(field_ty.ty) != Ok(SlotCount::new(want)) {
+                return Ok(None);
+            }
+            let Some(of_lo) = usize::try_from(of.start).ok() else { return Ok(None) };
+            let Some(of_hi) = of_lo.checked_add(of.len as usize) else { return Ok(None) };
+            let Some(of_origs) = self.origs.get(of_lo..of_hi) else { return Ok(None) };
+            sc.col.extend_from_slice(of_origs);
+            let mut type_args: Vec<Arg, A> = Vec::with_capacity_in(args.len(), self.alloc);
+            for (&a, &(off, n)) in args.iter().zip(at.iter()) {
+                if caller.count(a) != Ok(SlotCount::new(n)) {
+                    return Ok(None);
+                }
+                let Some(range) = SlotRange::new(Slot::new(off), SlotCount::new(n)) else {
+                    return Ok(None);
+                };
+                type_args.push(Arg { ty: a, at: range });
+                self.note_params(a, e, &mut sc.seen)?;
+            }
+            self.note_params(field_ty.ty, e, &mut sc.seen)?;
+            for &(t, _) in sc.bodies.iter() {
+                sc.one.clear();
+                self.captured_params(t, e, &mut sc.one)?;
+                let (Ok(bstart), Ok(blen)) = (u32::try_from(sc.held.len()), u32::try_from(sc.one.len())) else {
+                    return Ok(None);
+                };
+                for &p in sc.one.iter() {
+                    if sc.seen.scan_for(&p).is_none() {
+                        sc.seen.push(p);
+                    }
+                    sc.held.push(p);
+                }
+                sc.body_rows.push((t, bstart, blen));
+            }
+            let Ok(start) = u32::try_from(self.origs.len()) else { return Ok(None) };
+            let Ok(field_col_start) = u32::try_from(sc.col.len()) else { return Ok(None) };
+            let mut probe_origs: Vec<Origin, A> = Vec::with_capacity_in(want as usize, self.alloc);
+            let mut created_existentials: Vec<Origin, A> = Vec::with_capacity_in(want as usize, self.alloc);
+            for _ in 0..want {
+                let o = self.b.origin(false);
+                probe_origs.push(o);
+                created_existentials.push(o);
+                sc.col.push(o);
+            }
+            let Some(actual_range) = SlotRange::new(Slot::new(field_col_start), SlotCount::new(want)) else {
+                return Ok(None);
+            };
+            let Some(lt_range) = SlotRange::new(Slot::new(0), SlotCount::new(lifetimes)) else {
+                return Ok(None);
+            };
+            let actual_arg = Arg { ty: field_ty.ty, at: actual_range };
+            let static_ = self.universal(Region::Static);
+            let owner = self.body.owner;
+            let own_opt = facts.sig(owner).ok();
+            if let Some(own) = own_opt {
+                for i in 0..own.params().count() {
+                    self.universal(Region::Param(i));
+                }
+            }
+            for &p in sc.seen.iter() {
+                self.param_origin(p);
+            }
+            let bounds: &[ClauseView<'_>] = facts.regions().clauses(owner).unwrap_or(&[]);
+            let sel = CallSel { rows: self.ck.call_selections(e), body_rows: &self.ck.selected, facts, tys: self.tys };
+            let field_typed = Typed { ty: col.ty(), col: col.as_slice() };
+            let fields = [field_typed];
+            let callee = Callee::Ctor { adt, variant, lifetimes, fields: &fields, output: field_typed };
+            let generics = GenericArgs { lifetimes: lt_range, types: &type_args };
+            let mut buffered_subsets: Vec<(Origin, Origin), A> = Vec::new_in(self.alloc);
+            let ok = {
+                let who = CallOwner {
+                    item: owner,
+                    uni: &self.uni,
+                    params: &self.param_origs,
+                    bounds,
+                    sig: own_opt.filter(|_| !self.in_nested).map(|own| {
+                        let c = own.regions().col;
+                        Typed { ty: c.ty(), col: c.as_slice() }
+                    }),
+                    heads: &heads,
+                    bodies: BodyParams { rows: &sc.body_rows, held: &sc.held },
+                    closures: ClosureSigs { rows: &[], regs: &[] },
+                };
+                let mut sink = BufferedSink {
+                    b: &mut self.b,
+                    static_,
+                    dyn_ph: &mut self.dyn_bound_placeholders,
+                    subsets: &mut buffered_subsets,
+                    created_existentials: Some(&mut created_existentials),
+                };
+                let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &sc.col, out: &mut sink };
+                match blaze_borrow::instantiate(callee, generics, &mut |_| cx.out.fresh(Kind::Existential), self.alloc) {
+                    Ok(mut inst) => match inst.inputs.first().copied() {
+                        Some(declared) => blaze_borrow::relate_sides(
+                            &mut cx,
+                            &mut inst.envs,
+                            adt,
+                            declared,
+                            blaze_borrow::Side::caller(actual_arg),
+                            Variance::In,
+                        )
+                        .is_ok(),
+                        None => false,
+                    },
+                    Err(_) => false,
+                }
+            };
+            if !ok {
+                return Ok(None);
+            }
+            // Resolve every freshly allocated existential origin through bidirectional (`a <=> b`)
+            // equivalences in `buffered_subsets` back to its pre-existing origin (an origin of
+            // `of`, `'static`, or a universal/param origin). Field projection origins must alias
+            // the ADT's origins directly — leaving an unmentioned fresh origin with a point-scoped
+            // subset at projection time would let Polonius drop the flow across later statements.
+            let has_edge = |u: Origin, v: Origin| buffered_subsets.iter().any(|&(a, b)| a == u && b == v);
+            let mut resolved_map: Vec<(Origin, Origin), A> = Vec::with_capacity_in(created_existentials.len(), self.alloc);
+            let mut bfs: Vec<Origin, A> = Vec::new_in(self.alloc);
+            for &cr in created_existentials.iter() {
+                if resolved_map.iter().any(|&(k, _)| k == cr) {
+                    continue;
+                }
+                bfs.clear();
+                bfs.push(cr);
+                let mut head = 0usize;
+                let mut pre_existing: Option<Origin> = None;
+                let mut first_probe: Option<Origin> = None;
+                while head < bfs.len() {
+                    let cur = bfs[head];
+                    head += 1;
+                    if created_existentials.scan_for(&cur).is_none() {
+                        if pre_existing.is_none() {
+                            pre_existing = Some(cur);
+                        }
+                    } else if first_probe.is_none() && probe_origs.scan_for(&cur).is_some() {
+                        first_probe = Some(cur);
+                    }
+                    for &(a, b) in buffered_subsets.iter() {
+                        let next = if a == cur && has_edge(b, a) {
+                            b
+                        } else if b == cur && has_edge(a, b) {
+                            a
+                        } else {
+                            continue;
+                        };
+                        if bfs.scan_for(&next).is_none() {
+                            bfs.push(next);
+                        }
+                    }
+                }
+                if let Some(target) = pre_existing {
+                    for &member in bfs.iter() {
+                        if created_existentials.scan_for(&member).is_some()
+                            && !resolved_map.iter().any(|&(k, _)| k == member)
+                        {
+                            resolved_map.push((member, target));
+                        }
+                    }
+                } else if let Some(rep) = first_probe {
+                    // An unconstrained bound region (e.g. `for<'r> fn(&'r u8)`): valid only if no
+                    // one-way edge connects this equivalence class to an outside origin.
+                    for &(a, b) in buffered_subsets.iter() {
+                        let a_in = bfs.scan_for(&a).is_some();
+                        let b_in = bfs.scan_for(&b).is_some();
+                        if a_in != b_in {
+                            return Ok(None);
+                        }
+                    }
+                    for &member in bfs.iter() {
+                        if created_existentials.scan_for(&member).is_some()
+                            && !resolved_map.iter().any(|&(k, _)| k == member)
+                        {
+                            resolved_map.push((member, rep));
+                        }
+                    }
+                }
+            }
+            let map_orig = |o: Origin| -> Origin {
+                resolved_map.iter().find(|&&(k, _)| k == o).map_or(o, |&(_, v)| v)
+            };
+            let mut field_origs: Vec<Origin, A> = Vec::with_capacity_in(want as usize, self.alloc);
+            for &p in probe_origs.iter() {
+                field_origs.push(map_orig(p));
+            }
+            let mut final_subsets: Vec<(Origin, Origin), A> = Vec::new_in(self.alloc);
+            for &(a, b) in buffered_subsets.iter() {
+                let ma = map_orig(a);
+                let mb = map_orig(b);
+                if ma == mb {
+                    continue;
+                }
+                if created_existentials.scan_for(&ma).is_some() || created_existentials.scan_for(&mb).is_some() {
+                    return Ok(None);
+                }
+                if final_subsets.scan_for(&(ma, mb)).is_none() {
+                    final_subsets.push((ma, mb));
+                }
+            }
+            self.origs.extend_from_slice(&field_origs);
+            for &(a, b) in final_subsets.iter() {
+                self.b.subset(a, b);
+            }
+            Ok(Some((start, want)))
         })();
         self.call_scratch = Some(sc);
         res

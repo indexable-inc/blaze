@@ -3454,7 +3454,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
         let PNode::Adt(k, l) = self.node(adt_ty, e)? else { return Ok(None) };
         let facts: &'b F = self.facts;
-        let Some(regions) = facts.field_regions(k, variant, field) else { return Ok(None) };
+        let Some(regions) = facts.field_regions(k, variant, field) else {
+            return self.field_slot_via_borrow(of, k, l, variant, field, field_ty, e);
+        };
         let lifetimes = self.adt_facts(k, e)?.lifetimes;
         let args = self.list(l, e)?;
         // Where each argument's positions begin among the value's: its lifetimes, then each
