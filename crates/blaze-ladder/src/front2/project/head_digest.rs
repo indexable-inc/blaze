@@ -469,7 +469,8 @@ pub fn want_heads<'a>(store: &crate::front2::heads::Store<'_>, want: Want, alloc
             out.push(HeadAt::Impl(ck));
             if let Some(head) = store.impls.get(&ck) {
                 let mut consts: AVec<'a, ItemKey> = AVec::new_in(alloc);
-                consts.extend(head.consts.iter().map(|(_, k)| *k).filter(|k| store.fns.contains_key(k)));
+                let held = |k: &ItemKey| store.fns.contains_key(k) || store.fn_gaps.contains_key(k);
+                consts.extend(head.consts.iter().map(|(_, k)| *k).filter(held));
                 consts.sort_unstable();
                 out.extend(consts.iter().map(|k| HeadAt::Fn(*k)));
             }

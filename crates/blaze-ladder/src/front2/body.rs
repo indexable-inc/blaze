@@ -634,7 +634,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         let usize_node = blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize);
         // A `const` item declared in the body comes first (`const MOST: usize = ..; [x; MOST]`:
         // front2/const_open.rs `local_const`): a block's item shadows the module's name.
-        let made = match super::const_open::local_const(self.locals, self.owner, self.builder.heads, view, len, text, range) {
+        let made = match super::const_open::local_const(&self.builder.resolver, self.builder.marks, self.locals, self.owner, self.env.module, self.builder.heads, view, len, text, range) {
             Ok(Some(bits)) => match super::types::intern(tys, usize_node) {
                 Ok(ty) => super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty, bits }),
                 Err(why) => Err(why),
@@ -679,7 +679,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         let range = view.site(view.type_range(t)?)?;
         // Its refusal (a local constant not evaluated yet, a local value that is no constant)
         // stands only once the name is known to be no type.
-        let local = super::const_open::local_arg(self.locals, self.owner, self.builder.heads, view, t, name, range);
+        let local = super::const_open::local_arg(&self.builder.resolver, self.builder.marks, self.locals, self.owner, self.env.module, self.builder.heads, view, t, name, range);
         if matches!(local, Ok(Some(LocalArg::Type))) {
             return Types::ty(self, view, t, tys).map(ConstTerm::Is);
         }
