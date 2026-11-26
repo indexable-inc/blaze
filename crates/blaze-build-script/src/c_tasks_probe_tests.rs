@@ -382,10 +382,18 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         fn get<'a>(&self, _: &ProbeKey, _: Alloc<'a>) -> Result<Option<blaze_own::AVec<'a, u8>>, blaze_own::AString<'a>> { Ok(None) }
         fn put<'a>(&self, _: &ProbeKey, _: &[u8], _: Alloc<'a>) -> Result<(), blaze_own::AString<'a>> { Ok(()) }
     }
-    let inc_src = b"#include \"local.h\"\nint main(void) { return 0; }\n";
-    let mut inc_bytes = |name: &str| (name == "flag_check.c").then_some(inc_src.as_slice());
     let sp_ok = Spawn { program: "cc", args: &ok_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
-    assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut inc_bytes, alloc).is_err());
+    for bad_src in [
+        b"#include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
+        b"#/**/include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
+        b"#\\\ninclude \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
+        b"#inc\\\nlude \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
+        b"%:include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
+        b"??=include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
+    ] {
+        let mut inc_bytes = |name: &str| (name == "flag_check.c").then_some(bad_src);
+        assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut inc_bytes, alloc).is_err());
+    }
 
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");

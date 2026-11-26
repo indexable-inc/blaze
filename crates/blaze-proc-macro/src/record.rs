@@ -414,9 +414,20 @@ impl DirStore {
     }
 
     /// Keeps a C compiler probe's answer record, written once: other bytes under the key are
-    /// refused (rule 21), equal bytes are no write.
+    /// refused (rule 21), equal bytes are no write, and absent/torn/oversized records are replaced
+    /// atomically without calling the unbounded generic reader.
     pub(crate) fn put_c_probe(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
-        self.put_at(Self::named(b"c-probe/", key), bytes)
+        let name = Self::named(b"c-probe/", key);
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).map_err(|_| FilesError::Stopped { name })?;
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, alloc)? {
+            return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
+        }
+        let mut whole = blaze_own::Vec::with_capacity_in(bytes.len() + SEAL_LEN, alloc);
+        whole.extend_from_slice(bytes);
+        whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
+        self.files.publish(&name, whole.as_slice())
     }
 
     /// The record at `name`, its seal checked: `None` when absent or torn.

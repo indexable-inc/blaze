@@ -425,18 +425,101 @@ fn flag_takes_value(arg: &str) -> bool {
 }
 
 /// Whether `bytes` contains a preprocessor `#include`, `#include_next`, or `#import` directive
-/// that could pull headers outside the probe's keyed `OUT_DIR` inputs.
-fn has_include_directive(bytes: &[u8]) -> bool {
-    let Ok(text) = core::str::from_utf8(bytes) else {
+/// (after C translation phase 2 line-splicing and phase 3 comment stripping, plus conservative
+/// rejection of trigraphs/unclosed comments) that could pull headers outside the probe's keyed
+/// `OUT_DIR` inputs.
+fn has_include_directive(bytes: &[u8], alloc: Alloc<'_>) -> bool {
+    let Ok(raw_text) = core::str::from_utf8(bytes) else {
+        return true;
+    };
+    // Conservatively reject trigraphs that introduce `#` or `\` (`??=`, `??/`).
+    if raw_text.contains("??=") || raw_text.contains("??/") {
+        return true;
+    }
+    // Phase 2: remove `\\\n` and `\\\r\n` line splices.
+    let mut spliced: AVec<'_, u8> = Vec::with_capacity_in(bytes.len(), alloc);
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'\\' {
+            if bytes.get(i + 1) == Some(&b'\n') {
+                i += 2;
+                continue;
+            }
+            if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
+                i += 3;
+                continue;
+            }
+        }
+        spliced.push(b);
+        i += 1;
+    }
+    // Phase 3: strip `/* ... */` (replaced by a single space) and `// ...` comments while
+    // respecting quoted literals. An unclosed block comment is rejected conservatively.
+    let mut norm: AVec<'_, u8> = Vec::with_capacity_in(spliced.len(), alloc);
+    let mut j = 0usize;
+    let mut quote: Option<u8> = None;
+    let src = spliced.as_slice();
+    while let Some(&b) = src.get(j) {
+        if let Some(q) = quote {
+            norm.push(b);
+            j += 1;
+            if b == b'\\' {
+                if let Some(&esc) = src.get(j) {
+                    norm.push(esc);
+                    j += 1;
+                }
+            } else if b == q || b == b'\n' {
+                quote = None;
+            }
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            quote = Some(b);
+            norm.push(b);
+            j += 1;
+            continue;
+        }
+        if b == b'/' && src.get(j + 1) == Some(&b'*') {
+            j += 2;
+            let mut closed = false;
+            while let Some(&cb) = src.get(j) {
+                if cb == b'*' && src.get(j + 1) == Some(&b'/') {
+                    j += 2;
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !closed {
+                return true;
+            }
+            norm.push(b' ');
+            continue;
+        }
+        if b == b'/' && src.get(j + 1) == Some(&b'/') {
+            j += 2;
+            while let Some(&cb) = src.get(j) {
+                if cb == b'\n' {
+                    break;
+                }
+                j += 1;
+            }
+            continue;
+        }
+        norm.push(b);
+        j += 1;
+    }
+    let Ok(text) = core::str::from_utf8(norm.as_slice()) else {
         return true;
     };
     for line in text.lines() {
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        if let Some(after_hash) = trimmed.strip_prefix('#') {
-            let dir = after_hash.trim_start_matches([' ', '\t']);
+        let trimmed = line.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
+        let after_hash = trimmed.strip_prefix('#').or_else(|| trimmed.strip_prefix("%:"));
+        if let Some(after_hash) = after_hash {
+            let dir = after_hash.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
             for kw in ["include_next", "include", "import"] {
                 if let Some(rest) = dir.strip_prefix(kw) {
-                    let boundary = rest.bytes().next().is_none_or(|b| matches!(b, b' ' | b'\t' | b'"' | b'<' | b'/'));
+                    let boundary = rest.bytes().next().is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_');
                     if boundary {
                         return true;
                     }
@@ -571,7 +654,7 @@ pub fn resolve<'a, 'b>(
     })?;
     for (_, rel) in probe.input_rels.iter() {
         if let Some(bytes) = file_bytes(rel.as_str())
-            && has_include_directive(bytes)
+            && has_include_directive(bytes, alloc)
         {
             let refused = ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&probe.row, alloc) };
             let mut msg = String::new_in(alloc);

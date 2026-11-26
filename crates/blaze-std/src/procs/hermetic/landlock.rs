@@ -206,47 +206,39 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr) -> Result<(), Fault> {
         return Ok(());
     }
 
-    // Grant single-file READ_FILE | EXECUTE on the resolved loader (`nix-ld`) and glibc `ld.so`.
+    // Grant single-file READ_FILE | EXECUTE on the resolved loader (`PT_INTERP`) and, when the
+    // loader is NixOS's `nix-ld` shim, its delegated glibc `ld.so`.
+    let is_nix_ld = target.windows(6).any(|w| w == b"nix-ld");
     add_nix_file_rule(ruleset, interp_cstr)?;
-    add_nix_file_rule(ruleset, NIX_LD_SO)?;
+    if is_nix_ld {
+        add_nix_file_rule(ruleset, NIX_LD_SO)?;
+    }
 
-    // Resolve `ld.so`'s target (`/nix/store/<hash>-glibc-.../lib/ld-linux-*.so.*`) to find the
-    // exact glibc `lib/` prefix where `libc.so.6` and `libm.so.6` live.
+    // Resolve `ld.so`'s target (`/nix/store/<hash>-glibc-.../lib/ld-linux-*.so.*`) when using
+    // `nix-ld` so `DT_NEEDED` names from the ELF closure can resolve glibc libs without granting
+    // any library not actually referenced by the ELF graph.
     let mut glibc_buf = [0u8; PATH_CAP];
-    let glibc_dir: Option<&[u8]> = resolve_symlink_path(NIX_LD_SO.to_bytes(), &mut glibc_buf).and_then(|len| {
-        let resolved = glibc_buf.get(..len)?;
-        let slash = resolved.iter().rposition(|&b| b == b'/')?;
-        resolved.get(..=slash)
-    });
+    let glibc_dir: Option<&[u8]> = if is_nix_ld {
+        resolve_symlink_path(NIX_LD_SO.to_bytes(), &mut glibc_buf).and_then(|len| {
+            let resolved = glibc_buf.get(..len)?;
+            let slash = resolved.iter().rposition(|&b| b == b'/')?;
+            resolved.get(..=slash)
+        })
+    } else {
+        None
+    };
 
-    // Bounded BFS queue of canonical ELF paths to parse for transitive `DT_NEEDED` dependencies.
+    // Bounded BFS queue of canonical ELF paths to parse strictly for actual `DT_NEEDED`
+    // dependencies: seeded ONLY with the executable itself, its `PT_INTERP`, and (for `nix-ld`)
+    // `NIX_LD_SO` — never any unreferenced host libraries.
     let mut queue = [([0u8; PATH_CAP], 0usize); MAX_LIBS];
     let mut q_len = 0usize;
     let mut q_head = 0usize;
 
-    // Seed queue with the main executable itself (resolving symlinks so `$ORIGIN` works).
-    let mut prog_resolved = [0u8; PATH_CAP];
-    let prog_len = resolve_symlink_path(program.to_bytes(), &mut prog_resolved).unwrap_or_else(|| {
-        let raw = program.to_bytes();
-        let l = raw.len().min(PATH_CAP - 1);
-        if let (Some(d), Some(s)) = (prog_resolved.get_mut(..l), raw.get(..l)) {
-            d.copy_from_slice(s);
-            l
-        } else {
-            0
-        }
-    });
-    if prog_len > 0 && let Some(slot) = queue.get_mut(0) {
-        if let (Some(d), Some(s)) = (slot.0.get_mut(..prog_len), prog_resolved.get(..prog_len)) {
-            d.copy_from_slice(s);
-            slot.1 = prog_len;
-            q_len = 1;
-        }
-    }
-
-    // Also seed core glibc runtime libraries so their transitive deps (if any) are covered.
-    for base in [b"libc.so.6".as_slice(), b"libm.so.6", b"libgcc_s.so.1"] {
-        enqueue_nix_soname(ruleset, base, &[], NIX_LD_DIR, glibc_dir, &mut queue, &mut q_len)?;
+    enqueue_nix_resolved_path(program.to_bytes(), &mut queue, &mut q_len);
+    enqueue_nix_resolved_path(interp_cstr.to_bytes(), &mut queue, &mut q_len);
+    if is_nix_ld {
+        enqueue_nix_resolved_path(NIX_LD_SO.to_bytes(), &mut queue, &mut q_len);
     }
 
     while q_head < q_len {
@@ -506,6 +498,37 @@ fn resolve_symlink_path(path: &[u8], out: &mut [u8; 320]) -> Option<usize> {
         cur_len = next_len;
     }
     Some(cur_len)
+}
+
+fn enqueue_nix_resolved_path<const N: usize>(
+    raw: &[u8],
+    queue: &mut [([u8; 320], usize); N],
+    q_len: &mut usize,
+) {
+    let mut resolved = [0u8; 320];
+    let len = resolve_symlink_path(raw, &mut resolved).unwrap_or_else(|| {
+        let l = raw.len().min(319);
+        if let (Some(d), Some(s)) = (resolved.get_mut(..l), raw.get(..l)) {
+            d.copy_from_slice(s);
+            l
+        } else {
+            0
+        }
+    });
+    if len == 0 {
+        return;
+    }
+    let slice = resolved.get(..len).unwrap_or(&[]);
+    let seen = queue
+        .get(..*q_len)
+        .is_some_and(|used| used.iter().any(|(b, l)| *l == len && b.get(..*l) == Some(slice)));
+    if !seen && let Some(slot) = queue.get_mut(*q_len) {
+        if let (Some(d), Some(s)) = (slot.0.get_mut(..len), resolved.get(..len)) {
+            d.copy_from_slice(s);
+            slot.1 = len;
+            *q_len += 1;
+        }
+    }
 }
 
 fn enqueue_nix_soname<const N: usize>(

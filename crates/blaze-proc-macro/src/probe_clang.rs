@@ -21,9 +21,9 @@
 //!   and the cached canonical answer without hashing any table into every script's base key.
 
 use core::fmt::{self, Write as _};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::{fs, io::{self, Read as _}, path::{Path, PathBuf}, process, sync::Mutex};
+use std::{fs, path::{Path, PathBuf}, process, sync::{Condvar, Mutex}};
 
 use blaze_build_script::c_tasks_probe::{
     self, CanonicalProbe, MOUNT, OUT_DIR, ProbeAnswer, ProbeAnswerer, ProbeCache, ProbeKey, SDKROOT,
@@ -213,6 +213,13 @@ impl CProbeSetting {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerifyState {
+    Unverified,
+    InProgress,
+    Verified,
+}
+
 /// Hermetic pinned `clang-23` compiler probe runner (`bstd::procs::hermetic::Hermetic` at
 /// `Level::Inputs`).
 pub struct HermeticClangProbe {
@@ -224,8 +231,8 @@ pub struct HermeticClangProbe {
     sdk_digest: Option<[u8; 32]>,
     work_root: PathBuf,
     deadline: Duration,
-    verified: AtomicBool,
-    verify_lock: Mutex<()>,
+    verify_state: Mutex<VerifyState>,
+    verify_cv: Condvar,
 }
 
 impl HermeticClangProbe {
@@ -280,8 +287,8 @@ impl HermeticClangProbe {
             sdk_digest,
             work_root,
             deadline: PROBE_DEADLINE,
-            verified: AtomicBool::new(false),
-            verify_lock: Mutex::new(()),
+            verify_state: Mutex::new(VerifyState::Unverified),
+            verify_cv: Condvar::new(),
         };
         Ok((probe, pin.sha256))
     }
@@ -319,22 +326,65 @@ impl HermeticClangProbe {
             sdk_digest,
             work_root,
             deadline: PROBE_DEADLINE,
-            verified: AtomicBool::new(false),
-            verify_lock: Mutex::new(()),
+            verify_state: Mutex::new(VerifyState::Unverified),
+            verify_cv: Condvar::new(),
         })
     }
 
     /// Verifies `clang-23`'s SHA-256 against `pins/clang.json` lazily on the first cache miss,
-    /// using a sealed per-boot metadata stamp voucher so repeat commands in the same boot with
-    /// unchanged `(boot_id, dev, ino, len, mtime, ctime)` do not re-read 342 MB.
-    fn ensure_verified<'a>(&self, boot: Option<blaze_core::Boot>, alloc: Alloc<'a>) -> Result<(), AString<'a>> {
-        if self.verified.load(Ordering::Acquire) {
-            return Ok(());
+    /// strictly bounded by `clock`/`began`/`self.deadline`:
+    /// - Concurrent misses wait on `verify_cv` with `wait_timeout(remaining)` (never blocking past
+    ///   the probe deadline).
+    /// - Fast path checks a sealed per-boot metadata stamp voucher so repeat commands in the same
+    ///   boot with unchanged `(boot_id, dev, ino, len, mtime, ctime)` do not re-read 342 MB.
+    /// - Cold path streams `prog.shelf_path` through deadline-aware `bstd::fs` effects bound to
+    ///   the remaining probe budget (`shelf_world.cx(remaining, TASK_FRAME)`).
+    fn ensure_verified<'a>(
+        &self,
+        clock: &bstd::clock::Clock,
+        began: bstd::clock::Instant,
+        boot: Option<blaze_core::Boot>,
+        alloc: Alloc<'a>,
+    ) -> Result<(), AString<'a>> {
+        let remaining = || -> Option<Duration> {
+            let elapsed = clock.now().since(began).unwrap_or(Duration::ZERO);
+            self.deadline.checked_sub(elapsed).filter(|d| !d.is_zero())
+        };
+        let mut guard = crate::host::lock(&self.verify_state);
+        loop {
+            match *guard {
+                VerifyState::Verified => return Ok(()),
+                VerifyState::Unverified => {
+                    *guard = VerifyState::InProgress;
+                    break;
+                }
+                VerifyState::InProgress => {
+                    let Some(rem) = remaining() else {
+                        return Err(own_str("c-probe clang verification timed out waiting on another worker", alloc));
+                    };
+                    guard = match self.verify_cv.wait_timeout(guard, rem) {
+                        Ok((g, _)) => g,
+                        Err(poisoned) => poisoned.into_inner().0,
+                    };
+                }
+            }
         }
-        let _guard = crate::host::lock(&self.verify_lock);
-        if self.verified.load(Ordering::Acquire) {
-            return Ok(());
+        drop(guard);
+
+        struct ResetOnDrop<'s> {
+            state: &'s Mutex<VerifyState>,
+            cv: &'s Condvar,
+            done: bool,
         }
+        impl Drop for ResetOnDrop<'_> {
+            fn drop(&mut self) {
+                let mut g = crate::host::lock(self.state);
+                *g = if self.done { VerifyState::Verified } else { VerifyState::Unverified };
+                self.cv.notify_all();
+            }
+        }
+        let mut reset = ResetOnDrop { state: &self.verify_state, cv: &self.verify_cv, done: false };
+
         let prog = shelf_pins::shelf_program(CLANG_JSON, self.host.as_str(), "clang-23")
             .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
         let clang_path = Path::new(self.clang_path.as_str());
@@ -345,10 +395,13 @@ impl HermeticClangProbe {
             && let Ok(held) = fs::read(&voucher_path)
             && held.as_slice() == expected.0.as_slice()
         {
-            self.verified.store(true, Ordering::Release);
+            reset.done = true;
             return Ok(());
         }
-        let got_sha = file_sha256(clang_path).map_err(|e| own_fmt(format_args!("{}: {e}", clang_path.display()), alloc))?;
+        let Some(rem) = remaining() else {
+            return Err(own_str("c-probe clang verification timed out before hashing", alloc));
+        };
+        let got_sha = file_sha256_bounded(Path::new(self.shelf_dir.as_str()), prog.shelf_path, rem, alloc)?;
         shelf_pins::check_member(self.host.as_str(), prog, got_sha).map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
         if let Some(expected) = expected_voucher {
             let _ = fs::create_dir_all(&self.work_root);
@@ -357,7 +410,7 @@ impl HermeticClangProbe {
                 let _ = fs::rename(&tmp, &voucher_path);
             }
         }
-        self.verified.store(true, Ordering::Release);
+        reset.done = true;
         Ok(())
     }
 }
@@ -525,7 +578,9 @@ impl ProbeAnswerer for HermeticClangProbe {
         let _guard = TempDirGuard(task_path);
 
         let (world, _) = native_world(Path::new(task_real.as_str())).map_err(|e| own_fmt(format_args!("c-probe world: {e}"), alloc))?;
-        self.ensure_verified(world.boot().ok(), alloc)?;
+        let clock = world.need_clock().map_err(|m| own_fmt(format_args!("c-probe clock: {}", m.capability), alloc))?;
+        let probe_began = clock.now();
+        self.ensure_verified(&clock, probe_began, world.boot().ok(), alloc)?;
 
         // Materialize ONLY the probe's own OUT_DIR input files (`$IN<n><ext>` -> `<task>/in<n><ext>`).
         let mut placeholders: AVec<'a, (AString<'a>, AString<'a>)> = OwnVec::new_in(alloc);
@@ -606,10 +661,15 @@ impl ProbeAnswerer for HermeticClangProbe {
         let roots = Roots::new(roots_vec.as_slice()).map_err(|_| own_str("c-probe roots refused", alloc))?;
 
         let spawner = world.need_host().and_then(|h| h.spawner()).map_err(|m| own_fmt(format_args!("c-probe spawner: {}", m.capability), alloc))?;
-        let clock = world.need_clock().map_err(|m| own_fmt(format_args!("c-probe clock: {}", m.capability), alloc))?;
         let driver_clock = world.need_clock().map_err(|m| own_fmt(format_args!("c-probe clock: {}", m.capability), alloc))?;
         let hermetic = Hermetic::new(HermeticCapOpts { spawner, clock: driver_clock });
-        let cx = world.cx(self.deadline, bstd::mem::TASK_FRAME).map_err(|_| own_str("c-probe context stopped", alloc))?;
+        let elapsed = clock.now().since(probe_began).unwrap_or(Duration::ZERO);
+        let remaining = self
+            .deadline
+            .checked_sub(elapsed)
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| own_str("c-probe deadline exhausted during clang verification", alloc))?;
+        let cx = world.cx(remaining, bstd::mem::TASK_FRAME).map_err(|_| own_str("c-probe context stopped", alloc))?;
 
         let spec = HermeticSpec::new(HermeticOpts {
             program: Program::Stored { name: "clang-23", digest: Digest(self.shelf_digest), path: self.clang_path.as_str() },
@@ -623,8 +683,8 @@ impl ProbeAnswerer for HermeticClangProbe {
             channels: &[],
             clock: ClockSpec::Fixed { unix_secs: epoch_secs },
             seed: 0,
-            budget: Budget { cpu: self.deadline, memory: PROBE_MEMORY_BYTES, steps: None },
-            deadline: Deadline::after(clock.now().since_start(), self.deadline),
+            budget: Budget { cpu: remaining, memory: PROBE_MEMORY_BYTES, steps: None },
+            deadline: Deadline::after(clock.now().since_start(), remaining),
             streams: HermeticStreams { stdout: Capture::Keep { most: PROBE_MOST_STREAM }, stderr: Capture::Keep { most: PROBE_MOST_STREAM } },
             level: Level::Inputs,
             report: ReportSpec::WholeRoots,
@@ -720,18 +780,29 @@ fn canonical_utf8<'a>(path: &Path, alloc: Alloc<'a>) -> Result<SharedStr, AStrin
     }
 }
 
-fn file_sha256(path: &Path) -> Result<[u8; 32], io::Error> {
-    let mut file = fs::File::open(path)?;
+fn file_sha256_bounded<'a>(
+    shelf_dir: &Path,
+    rel_path: &str,
+    deadline: Duration,
+    alloc: Alloc<'a>,
+) -> Result<[u8; 32], AString<'a>> {
+    let (io, root) = native_world(shelf_dir).map_err(|e| own_fmt(format_args!("c-probe shelf world: {e}"), alloc))?;
+    let cx = io.cx(deadline, bstd::mem::TASK_FRAME).map_err(|_| own_str("c-probe verify context stopped", alloc))?;
+    let rel = bstd::path::Path::new(rel_path).map_err(|_| own_fmt(format_args!("invalid shelf path `{rel_path}`"), alloc))?;
+    let file = root.open_read(&cx, &rel).map_err(|e| own_fmt(format_args!("{rel_path}: {e}"), alloc))?;
     let mut hasher = blaze_sha256::Sha256::new();
     let mut buf = [0u8; 64 << 10];
+    let mut offset = 0u64;
     loop {
-        let n = file.read(&mut buf)?;
+        let n = file.read_into(&mut buf, offset).wait(&cx).map_err(|e| own_fmt(format_args!("{rel_path}: {e}"), alloc))?;
         if n == 0 {
             break;
         }
         if let Some(chunk) = buf.get(..n) {
             hasher.update(chunk);
         }
+        let step = u64::try_from(n).map_err(|_| own_str("c-probe verify offset overflow", alloc))?;
+        offset = offset.checked_add(step).ok_or_else(|| own_str("c-probe verify offset overflow", alloc))?;
     }
     Ok(hasher.finish())
 }
@@ -998,5 +1069,24 @@ mod tests {
         let mut env_bad = AVec::new_in(alloc);
         env_bad.push((OwnString::from_str_in("SOURCE_DATE_EPOCH", alloc), OwnString::from_str_in("not-a-num", alloc)));
         assert!(resolve_source_date_epoch(&mut env_bad, alloc).is_err());
+
+        // Lazy verification honors the probe deadline when another worker holds InProgress.
+        let dummy = HermeticClangProbe {
+            host: OwnString::from_str_in("aarch64-unknown-linux-gnu", super::SharedAlloc::global()),
+            clang_path: OwnString::from_str_in("/nonexistent/clang-23", super::SharedAlloc::global()),
+            shelf_dir: OwnString::from_str_in("/nonexistent", super::SharedAlloc::global()),
+            shelf_digest: [0u8; 32],
+            sdk_dir: None,
+            sdk_digest: None,
+            work_root: std::env::temp_dir(),
+            deadline: super::Duration::from_millis(25),
+            verify_state: super::Mutex::new(super::VerifyState::InProgress),
+            verify_cv: super::Condvar::new(),
+        };
+        let (io, _) = super::native_world(&std::env::temp_dir()).expect("native world");
+        let clock = io.need_clock().expect("clock");
+        let began = clock.now();
+        let err = dummy.ensure_verified(&clock, began, None, alloc).expect_err("must time out waiting on InProgress");
+        assert!(err.as_str().contains("timed out"), "unexpected error: {err}");
     }
 }

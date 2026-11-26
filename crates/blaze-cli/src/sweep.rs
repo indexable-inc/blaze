@@ -2052,6 +2052,15 @@ mod tests {
             blaze_proc_macro::probe_clang::CProbeStore::get(&dir_store, &key_a, alloc).unwrap().is_none(),
             "oversized c-probe record must return None in DirStore::get_c_probe"
         );
+        // Re-putting a valid answer over the oversized corrupted record succeeds cleanly without
+        // invoking the unbounded reader, and subsequent reads return the new answer.
+        blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_a, enc_a2.as_slice())
+            .expect("put_c_probe must replace oversized corrupted record");
+        assert_eq!(
+            blaze_proc_macro::probe_clang::CProbeStore::get(&dir_store, &key_a, alloc).unwrap().as_deref(),
+            Some(enc_a2.as_slice()),
+            "replaced oversized c-probe record is readable"
+        );
         assert_eq!(
             read_c_probe_reply_with(Some((&cx, &home)), parsed_b, key_b_hex, &active_answerer, &active_pin, &active_sdk, alloc).unwrap(),
             dig_b,
