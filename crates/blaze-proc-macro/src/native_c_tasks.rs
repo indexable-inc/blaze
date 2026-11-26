@@ -288,7 +288,7 @@ pub fn run_tasks<'a, 'b>(
         let (pre, free_slot) = match looked[at] {
             Looked::Hit(file) => {
                 report.found += 1;
-                objects.push(file);
+                objects.push(file.file());
                 continue;
             }
             Looked::Miss { pre, free_slot } => (pre, free_slot),

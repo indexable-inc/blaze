@@ -2601,9 +2601,7 @@ impl KeptMakers for SuiteMakers<'_> {
         let before_makers = self.makers.len();
         let maker = self.makers.of(job, || {
             let reader = typed.reader(cx, side.crates.snapshot(), tables);
-            let mut maker = Maker::of_start(names, job.entry, job.start, ByKind::new(reader), &side.builder, tables);
-            maker.watch(side.make_watch);
-            Ok(maker)
+            Ok(Maker::of_start(names, job.entry, job.start, ByKind::new(reader), &side.builder, Some(side.make_watch), tables))
         })?;
         maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
         let out = job.order.make(maker, &job.proof, job.name.as_slice(), entry);

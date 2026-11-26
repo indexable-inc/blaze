@@ -416,7 +416,7 @@ pub fn run_tree<'a, 'b>(
     let mut held: AVec<'_, u8> = Vec::new_in(alloc);
     if store.get(key, &mut held).map_err(|_| TreeError::Store { package })? {
         let files = decode_tree(&held, alloc).ok_or(TreeError::Damaged { package, key })?;
-        if files.iter().all(|f| area.has(FileRef { sha256: f.sha256, len: f.len })) {
+        if files.iter().all(|f| area.verify(FileRef { sha256: f.sha256, len: f.len }).is_some()) {
             return Ok(TreeDone { key, files, ran: false, left_out: 0 });
         }
     }

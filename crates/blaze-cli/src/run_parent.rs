@@ -847,9 +847,7 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     fn maker(&mut self, start: &Roots<'r>, ids: &RunIds<'h>) -> Result<RunMaker<'h>, ParentError> {
         let names = self.names()?;
         // `run_roots` start by the rule (`MakerStart::ByRule`): what `Maker::new` did.
-        let mut maker = Maker::of_roots(names, start.maker_entry(), start, ByKind::new(self.typed.over(*ids)), &self.builder, self.tables);
-        maker.watch(self.make_watch);
-        Ok(maker)
+        Ok(Maker::of_roots(names, start.maker_entry(), start, ByKind::new(self.typed.over(*ids)), &self.builder, Some(self.make_watch), self.tables))
     }
 
     /// From the names records: the checker key's library item (its first 16 bytes,

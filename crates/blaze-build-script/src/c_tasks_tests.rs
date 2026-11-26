@@ -763,3 +763,82 @@ fn evicted_area_blobs_trigger_clean_rebuild() {
     assert_eq!((re_all.objects_ran, re_all.archives_ran), (4, 1), "evicted objects and archive both rebuilt");
     assert!(AreaOf(&files).has(re_all.made[0].file));
 }
+
+#[test]
+fn decode_verified_file_record_distinguishes_present_evicted_and_damaged() {
+    use crate::c_tasks::{VerifiedRecord, decode_verified_file_record, encode_file_record};
+
+    let files = core::cell::RefCell::new(Files::default());
+    let mut area = AreaOf(&files);
+    let verified = area.put_verified(b"object bytes").expect("put_verified");
+    let raw = encode_file_record(verified.file());
+
+    assert_eq!(decode_verified_file_record(&raw, &area), VerifiedRecord::Present(verified));
+    assert_eq!(decode_verified_file_record(b"NOT_BCOB1", &area), VerifiedRecord::Damaged);
+
+    files.borrow_mut().held.clear();
+    assert_eq!(decode_verified_file_record(&raw, &area), VerifiedRecord::Evicted);
+}
+
+/// Even when all `PATH_SETS` slots for a unit's `pre_key` are occupied, evicting the matching
+/// slot's object blob from `Area` must return `Looked::Miss` (and recover via `admit` reusing
+/// the existing slot) rather than failing with `TaskError::PathSets`.
+#[test]
+fn full_path_sets_recovers_from_evicted_area_blob() {
+    use crate::c_tasks::{Looked, PATH_SETS, admit, look};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let bytes = script_record(alloc);
+    let outputs = OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
+    let demand = script_demand(&outputs, alloc);
+    let demand_strs: std::vec::Vec<&str> = demand.iter().map(|d| d.as_str()).collect();
+    let plan = plan(&outputs, &roots(), &demand_strs, alloc).unwrap_or_else(|e| panic!("{e:?}"));
+    let unit = &plan.units[0];
+    let tc = toolchain(7);
+    let files = core::cell::RefCell::new(Files::default());
+    let mut store = Store::default();
+    let mut world = World::new("/host/a");
+
+    // Populate all `PATH_SETS` slots by varying a synthetic read set per slot.
+    let mut last_file = None;
+    for slot in 0..PATH_SETS {
+        let header = std::format!("/package/include/slot_{slot}.h");
+        world.set(&header, &std::format!("/* slot {slot} */"));
+        let Looked::Miss { pre, free_slot } = look("foo", unit, &tc, world.of(unit.state), &AreaOf(&files), &mut store, alloc)
+            .unwrap_or_else(|e| panic!("slot {slot} look: {e:?}"))
+        else {
+            panic!("expected cold miss for slot {slot}");
+        };
+        assert_eq!(free_slot, slot);
+        let obj = AreaOf(&files).put(std::format!("obj-{slot}").as_bytes()).expect("put obj");
+        let mut reads = blaze_own::Vec::new_in(alloc);
+        reads.push(blaze_own::String::from_str_in(&header, alloc));
+        admit("foo", unit, pre, free_slot, obj, &reads, &roots(), world.of(unit.state), &mut store, alloc)
+            .unwrap_or_else(|e| panic!("slot {slot} admit: {e:?}"));
+        last_file = Some((obj, header));
+    }
+
+    // Evict every blob from `Area` while all `PATH_SETS` slots remain occupied in `store`.
+    let (evicted_obj, last_header) = last_file.expect("last slot");
+    files.borrow_mut().held.clear();
+    let Looked::Miss { pre, free_slot } = look("foo", unit, &tc, world.of(unit.state), &AreaOf(&files), &mut store, alloc)
+        .unwrap_or_else(|e| panic!("full-slots evicted look should miss, not PathSets: {e:?}"))
+    else {
+        panic!("evicted blob must not hit");
+    };
+    assert_eq!(free_slot, PATH_SETS);
+
+    // Recompile & re-admit the same read set: must reuse its existing slot and hit again.
+    let rebuilt = AreaOf(&files).put(std::format!("obj-{}", PATH_SETS - 1).as_bytes()).expect("reput");
+    assert_eq!(rebuilt, evicted_obj);
+    let mut reads = blaze_own::Vec::new_in(alloc);
+    reads.push(blaze_own::String::from_str_in(&last_header, alloc));
+    admit("foo", unit, pre, free_slot, rebuilt, &reads, &roots(), world.of(unit.state), &mut store, alloc)
+        .unwrap_or_else(|e| panic!("re-admit into full slots must reuse matching slot: {e:?}"));
+    let hit = look("foo", unit, &tc, world.of(unit.state), &AreaOf(&files), &mut store, alloc)
+        .unwrap_or_else(|e| panic!("rebuilt look: {e:?}"));
+    match hit {
+        Looked::Hit(verified) => assert_eq!(verified.file(), rebuilt),
+        Looked::Miss { .. } => panic!("expected hit after rebuilding evicted blob"),
+    }
+}

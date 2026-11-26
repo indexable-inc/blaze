@@ -44,3 +44,24 @@ Format for new entries:
 - **Kind**: `strictness/lint` + `tooling`
 - **Friction / Bug**: When the outer execution sandbox blocks shell commands or tool calls, agents can waste turns retrying alternate commands, probing ports/files, or falling back to partial static guesses instead of stopping loudly.
 - **Request**: Detect sandbox-denied tool/shell calls explicitly with a typed refusal and immediately stop to request full permissions from the user — zero retries, zero silent fallbacks (consistent with rule 3 `no-fallback`).
+
+### 2026-11-26 — Lint flagging $O(N)$ linear-search loops over slices (`SortedSlice::get` / `HashMap`)
+
+- **Area**: `crates/blaze-lint`, `crates/blaze-own` (`SortedSlice`)
+- **Kind**: `strictness/lint` + `bstd`
+- **Friction / Bug**: While self-hosting blaze (Waves 12–19), hot mid-end and codegen passes repeatedly suffered quadratic $O(N^2)$ blowups from linear scans over `Vec` / slice lookup tables (`for &(k, v) in slice { if k == needle { return Some(v); } }`) invoked inside per-instruction or per-block loops, stalling mega-function compilation behind 600s timeouts.
+- **Request**: Add a `blaze-lint` check flagging linear key-lookup loops (`for &(k, v) in slice { if k == needle { ... } }` or `.iter().find(|(k, _)| *k == needle)`) inside functions or nested loops and suggesting `blaze_own::SortedSlice::get` (binary search) or `blaze_hash::HashMap` with a structured fix hint.
+
+### 2026-11-26 — Enforce `MakeWatch` telemetry & scale-test coverage for mid-end / codegen passes
+
+- **Area**: `crates/blaze-ladder/src/run/make_one.rs`, `crates/blaze-cli`, `crates/blaze-lint`, `crates/blaze-lir`
+- **Kind**: `strictness/lint` + `diagnostic`
+- **Friction / Bug**: Production `Maker` sites (`engine_export.rs`, `wasm64_compile.rs`) silently dropped slow-function reporting when a post-hoc `.watch(...)` setter was omitted or when `build_lir` bypassed `MakeWatch` timing, hiding multi-second mega-functions until manual PID sampling; meanwhile quadratic mid-end passes shipped without large-N scale regression tests.
+- **Request**: Require watch/telemetry policies by construction (no optional post-hoc setters; lint against passing `None` for `MakeWatch` in non-test crates) and add a `blaze-lint` / test-harness policy flagging new mid-end/LIR/emit passes that lack a super-linear scale guard test (e.g. $N = 10^4$ blocks/values).
+
+### 2026-11-26 — Persist `Typed` body records for `Toolchain` and `Dependency` crates
+
+- **Area**: `crates/blaze-cli/src/engine_export.rs`, `crates/blaze-ladder/src/front2/program/lazy/typed.rs`, `crates/blaze-cli/src/body_types.rs`
+- **Kind**: `tooling` + `strictness/lint`
+- **Friction / Bug**: `ByKind` currently reads persisted `Typed` body records only for workspace member crates and falls back to `BodySource::Run` re-typechecking for `Toolchain` (`core`/`alloc`/`std`) and `Dependency` crates during `engine_export.rs` and `blaze run`/`test`, burning redundant CPU time on every export/codegen cold miss.
+- **Request**: Persist item-grained `Typed` body records for `Toolchain` and `Dependency` crates (shared via R2 for pinned `std`/crates.io) so `engine_export.rs` reads all reachable bodies via `BodySource::Read` and eliminates `BodySource::Run` re-typechecking entirely.

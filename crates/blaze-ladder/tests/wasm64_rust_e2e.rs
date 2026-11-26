@@ -303,6 +303,7 @@ fn real_rust_program_compiles_to_valid_wasm64() {
         MakerStart::ByRule,
         SecondCheck,
         &b,
+        None,
         alloc(),
     );
 
@@ -399,6 +400,7 @@ fn static_fn_pointer_relocation_and_determinism() {
             MakerStart::ByRule,
             SecondCheck,
             &b,
+            None,
             alloc(),
         );
         let mut wasm: AVec<'static, u8> = OwnVec::new_in(alloc());
