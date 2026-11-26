@@ -25,12 +25,12 @@ blaze-cad-field	318
 blaze-cad-mesh	1164
 blaze-cad-out	218
 blaze-cad-picture	293
-blaze-cas	234
+blaze-cas	233
 blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1261
+blaze-cli	1258
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -114,7 +114,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1663
+blaze-scope	1658
 blaze-screen	30
 blaze-script	91
 blaze-semver	9

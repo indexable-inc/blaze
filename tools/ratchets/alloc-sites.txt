@@ -15,7 +15,7 @@ blaze-build	0	0	14	1
 blaze-build-script	0	0	0	11
 blaze-bytes	0	0	0	3
 blaze-cad-out	0	0	0	1
-blaze-cas	10	0	43	68
+blaze-cas	10	0	43	65
 blaze-check	54	0	0	37
 blaze-cli	1	0	265	101
 blaze-columns	0	0	0	3

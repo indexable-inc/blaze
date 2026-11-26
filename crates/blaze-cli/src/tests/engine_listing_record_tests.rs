@@ -86,12 +86,11 @@ fn a_one_body_edit_reads_the_listing_and_makes_none() {
     write(&io, "one/src/a.rs", A_BODY);
     let edit = request(&io, HeadJobs::RULE);
     println!("body edit: made {}, read {}, parts {} made {} read, {} crates, {} asks", edit.made, edit.read, edit.parts_made, edit.parts_read, edit.crates, edit.asks);
-    assert!(edit.asks > 0 && edit.crates >= 1, "the edit's request asked a listing (a body's reads were placed): {edit:?}");
     assert!(edit.crates <= units, "the edit asks no unit the cold run did not list: {edit:?} of {units} units");
     assert_eq!(edit.made, 0, "THE FLOOR: a one-body edit makes no listing in any unit: {edit:?}");
-    assert_eq!(edit.read, edit.crates, "THE FLOOR: each unit's listing asked is one read of its join: {edit:?}");
-    assert_eq!(edit.parts_made + edit.parts_read, 0, "a read join opens no file's part: {edit:?}");
-    assert_eq!(edit.damaged, 0, "the stored joins opened: {edit:?}");
+    assert_eq!(edit.read, 0, "THE O(1) FLOOR (SOTA-v10): a plain file-item body edit places directly without opening any crate listing: {edit:?}");
+    assert_eq!(edit.parts_made + edit.parts_read, 0, "a body edit opens no file's part: {edit:?}");
+    assert_eq!(edit.damaged, 0, "nothing damaged: {edit:?}");
 
     // CONTROL: the plant that takes the table and the store away reads nothing on the same edit.
     let io = two_files(41, A);
@@ -127,13 +126,18 @@ fn an_item_added_to_one_file_makes_that_files_part_alone() {
 /// Expected line: `restore: R listings read, each equal to the fresh build's (of F)`.
 #[test]
 fn a_restored_listing_equals_a_fresh_one_in_rows_and_bytes() {
-    // Restored: made cold, then read after a body edit.
-    let io = two_files(47, A);
+    // Macro-expanded callee exercises the crate-listing (`BLZLSTJ`) restore path (since plain
+    // file-item callees are placed directly in O(1) without reading any crate listing).
+    const A_MAC: &str = "use crate::P;\n\nmacro_rules! mk { () => { pub fn mac_get(p: &P) -> u32 { p.x } }; }\nmk!();\n\npub fn twice(p: &P) -> u32 {\n    mac_get(p) + mac_get(p)\n}\n";
+    const A_MAC_BODY: &str = "use crate::P;\n\nmacro_rules! mk { () => { pub fn mac_get(p: &P) -> u32 { p.x } }; }\nmk!();\n\npub fn twice(p: &P) -> u32 {\n    mac_get(p) * 2\n}\n";
+    const A_MAC_ITEM: &str = "use crate::P;\n\nmacro_rules! mk { () => { pub fn mac_get(p: &P) -> u32 { p.x } }; }\nmk!();\n\npub fn twice(p: &P) -> u32 {\n    mac_get(p) + mac_get(p)\n}\n\npub fn thrice(p: &P) -> u32 {\n    mac_get(p) + twice(p)\n}\n";
+    // Restored: made cold, then read after a body edit calling the macro-expanded fn.
+    let io = two_files(47, A_MAC);
     let _ = request(&io, HeadJobs::RULE);
-    write(&io, "one/src/a.rs", A_BODY);
+    write(&io, "one/src/a.rs", A_MAC_BODY);
     let restored = request(&io, HeadJobs::RULE);
     // Fresh: the edited tree in a home of its own.
-    let fresh = request(&two_files(47, A_BODY), HeadJobs::RULE);
+    let fresh = request(&two_files(47, A_MAC_BODY), HeadJobs::RULE);
     // Both paths ran (rule 61): one read, one made.
     assert!(restored.read > 0 && restored.made == 0, "the restore read its listings: {restored:?}");
     assert!(fresh.made > 0 && fresh.read == 0, "the fresh build made its listings: {fresh:?}");
@@ -150,7 +154,7 @@ fn a_restored_listing_equals_a_fresh_one_in_rows_and_bytes() {
 
     // CONTROL: a tree whose listing differs (an item added) differs under the same key, so the
     // comparison above sees each listing's rows.
-    let other = request(&two_files(47, A_ITEM), HeadJobs::RULE);
+    let other = request(&two_files(47, A_MAC_ITEM), HeadJobs::RULE);
     let unequal = first_unequal(&other, &fresh);
     println!("control: {unequal:?}");
     assert!(unequal.is_some(), "CONTROL: another listing under the same key is found unequal: {other:?} {fresh:?}");

@@ -2704,6 +2704,14 @@ pub struct Store<'n> {
     /// inside one worker's stretch; moved into `RoundCx` during each round and restored afterward,
     /// so recursive `check_rounds_as` sees `None` and uses a fresh cache with zero TLS/statics).
     pub(crate) stretch_facts: Option<tc::infer::FactCache<'static>>,
+    /// Whether [`Store::ensure_noting`] delegates to `self.seeds` (`true` for body tasks backed
+    /// by frozen head records; `false` for `LazyProgram`, which lowers directly into `&mut self`
+    /// and uses `self.seeds` only for `&Store` on-the-spot queries from `BodyWorld`).
+    pub(crate) seed_on_ensure: bool,
+    /// Reusable per-store scratch `Frame` for signature lowering (`lower_alloc_here` /
+    /// `with_lowered_in`), rolled back via `Frame::scope` after every item so repeated head
+    /// lowerings never trigger `blaze_mem::frame::task` reserve/reset churn.
+    parse_scratch: core::cell::RefCell<Option<blaze_mem::Frame>>,
 }
 
 /// How [`Store::ensure`] meets the needs of a trait's members (front2_tables_cost.rs runs
@@ -3002,6 +3010,31 @@ pub(super) fn with_lowered<'n, S: super::source::NamesSource<'n>, R>(
     })
 }
 
+/// Lowers `text` using a reusable scratch `Frame` rolled back via `Frame::scope`, avoiding
+/// per-item `blaze_mem::frame::task` reserve/reset churn across member loops.
+fn with_lowered_in<'n, S: super::source::NamesSource<'n>, R>(
+    scratch: &mut Option<blaze_mem::Frame>,
+    names: S,
+    key: LibKey,
+    text: &'n str,
+    f: impl FnOnce(&View<'_>) -> R,
+) -> Result<R, HeadError> {
+    if scratch.is_none()
+        && let Ok(frame) = blaze_mem::Frame::new(blaze_mem::Tag::Parse)
+    {
+        *scratch = Some(frame);
+    }
+    if let Some(frame) = scratch.as_mut() {
+        frame.scope(|frame| {
+            let erased = blaze_own::Erased::new(frame);
+            let low = lower_in(names, key, text, erased.handle())?;
+            Ok(f(&low.view()))
+        })
+    } else {
+        with_lowered(names, key, text, f)
+    }
+}
+
 /// A member of a trait or an impl: its name, kind and text, as the names library lists it.
 struct Member<'n> {
     lib: LibKey,
@@ -3072,6 +3105,44 @@ impl<'n> Store<'n> {
     #[inline]
     pub fn work_alloc(&self) -> Alloc<'static> {
         self.work
+    }
+
+    /// Runs `f` with this store's reusable parse scratch `Frame` rolled back via `Frame::scope`
+    /// on return, avoiding per-item `blaze_mem::frame::task` reserve/reset churn.
+    fn with_parse_scratch<R>(&self, f: impl FnOnce(&blaze_mem::Frame) -> R) -> R {
+        if let Ok(mut slot) = self.parse_scratch.try_borrow_mut() {
+            if slot.is_none()
+                && let Ok(frame) = blaze_mem::Frame::new(blaze_mem::Tag::Parse)
+            {
+                *slot = Some(frame);
+            }
+            if let Some(frame) = slot.as_mut() {
+                return frame.scope(f);
+            }
+        }
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, f)
+    }
+
+    fn take_parse_scratch(&self) -> Option<blaze_mem::Frame> {
+        self.parse_scratch.try_borrow_mut().ok().and_then(|mut slot| slot.take())
+    }
+
+    fn put_parse_scratch(&self, frame: Option<blaze_mem::Frame>) {
+        if let Some(frame) = frame
+            && let Ok(mut slot) = self.parse_scratch.try_borrow_mut()
+            && slot.is_none()
+        {
+            *slot = Some(frame);
+        }
+    }
+
+    /// One item's signature lowered from `text` into `alloc` using this store's reusable scratch
+    /// frame (zero `blaze_mem::frame::task` churn).
+    fn lower_alloc_here<S: super::source::NamesSource<'n>>(&self, names: S, key: LibKey, text: &'n str, alloc: Alloc<'static>) -> Result<Lowered<'static, 'n>, HeadError> {
+        self.with_parse_scratch(|frame| {
+            let scratch = blaze_own::Erased::new(frame);
+            lower_in_with_scratch(names, key, text, alloc, scratch.handle())
+        })
     }
 
     /// An empty store; `sized` is the program's `#[lang = "sized"]` trait (none in a
@@ -3156,6 +3227,8 @@ impl<'n> Store<'n> {
             asked: core::cell::RefCell::new(blaze_ask::Counts::default()),
             gate: core::cell::RefCell::new(super::asks::Gate::Off),
             stretch_facts: None,
+            seed_on_ensure: true,
+            parse_scratch: core::cell::RefCell::new(None),
         }
     }
 
@@ -3231,8 +3304,14 @@ impl<'n> Store<'n> {
             asked,
             gate,
             stretch_facts,
+            seed_on_ensure,
+            parse_scratch,
         } = self;
         *stretch_facts = None;
+        *seed_on_ensure = true;
+        if let Some(frame) = parse_scratch.get_mut().as_mut() {
+            frame.reset();
+        }
         *work = heads_alloc;
         tys.clear();
         maps.clear();
@@ -3583,7 +3662,7 @@ impl<'n> Store<'n> {
                     own_consts.extend_from_slice(cs);
                 }
                 clauses.extend_from_slice(&p.clauses);
-                let low = lower_alloc(names, lib, it.text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering ADT for `where const`", Range::new(0, 0))))?;
+                let low = self.lower_alloc_here(names, lib, it.text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering ADT for `where const`", Range::new(0, 0))))?;
                 let v = low.view();
                 param_names(&v, 0, &mut own_params, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
                 let self_args = params(&mut self.tys, 0, adt.generics, &own_consts).map_err(|w| HeadError::Item(lib, w))?;
@@ -3600,14 +3679,14 @@ impl<'n> Store<'n> {
                     own_consts.extend_from_slice(cs);
                 }
                 clauses.extend_from_slice(&p.clauses);
-                let low = lower_alloc(names, lib, it.text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering trait for `where const`", Range::new(0, 0))))?;
+                let low = self.lower_alloc_here(names, lib, it.text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering trait for `where const`", Range::new(0, 0))))?;
                 let v = low.view();
                 param_names(&v, 1, &mut own_params, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
                 (ck, lib, module, it.text, tr.generics, SelfTy::Trait(lib))
             }
             Want::Head(_) => return Ok(false),
         };
-        let low = lower_alloc(names, lib, text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering owner for `where const`", Range::new(0, 0))))?;
+        let low = self.lower_alloc_here(names, lib, text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering owner for `where const`", Range::new(0, 0))))?;
         let v = low.view();
         let rows = v.rows(v.list(head::WHERE)).map_err(|b| HeadError::Item(lib, Why::from(b)))?;
         let bool_ty = intern(&mut self.tys, PNode::Bool).map_err(|w| HeadError::Item(lib, w))?;
@@ -3681,7 +3760,7 @@ impl<'n> Store<'n> {
                     return false;
                 }
                 let Some(text) = names.signature_text_of(lib) else { return false };
-                let Ok(low) = lower_alloc(names, lib, text.text, self.work_alloc()) else { return false };
+                let Ok(low) = self.lower_alloc_here(names, lib, text.text, self.work_alloc()) else { return false };
                 let view = low.view();
                 is_auto_copy_pub_view(names, lib, lib, tc::AdtKind::Struct, &view).is_ok_and(|x| x)
             });
@@ -3885,7 +3964,7 @@ impl<'n> Store<'n> {
     /// need, at the moment it is met, before it is made). Over a store that held nothing, that
     /// is every head `want`'s making read beside its own (front2/tables/head.rs `freeze`).
     pub fn ensure_noting<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want, noted: &mut dyn FnMut(Want)) -> Result<(), HeadError> {
-        let Some(seeds) = self.seeds else {
+        let Some(seeds) = self.seeds.filter(|_| self.seed_on_ensure) else {
             return self.ensure_seeded(names, keys, want, noted, &mut |_, _, _| Ok(Seeded::Lower));
         };
         // Seeded: the asked want first (`ensure_seeded` seeds only what a step needs), then
@@ -4020,7 +4099,7 @@ impl<'n> Store<'n> {
                 (detail, it.text, it.module)
             }
         };
-        let low = lower_alloc(names, key, text, self.work_alloc())?;
+        let low = self.lower_alloc_here(names, key, text, self.work_alloc())?;
         Ok(lowered.insert(FrameLowering { detail, text, module, low }))
     }
 
@@ -4600,7 +4679,10 @@ impl<'n> Store<'n> {
             None => names.signature_text_of(impl_).ok_or(HeadError::NoText(impl_))?.text,
         };
         let mut life_names: Vec<Name, Alloc<'static>> = Vec::new_in(self.tys.alloc());
-        with_lowered(names, impl_, text, |v| lifetime_names(v, &mut life_names))?.map_err(|why| HeadError::Item(impl_, why))?;
+        let mut scratch = self.take_parse_scratch();
+        let life_res = with_lowered_in(&mut scratch, names, impl_, text, |v| lifetime_names(v, &mut life_names));
+        self.put_parse_scratch(scratch);
+        life_res?.map_err(|why| HeadError::Item(impl_, why))?;
         let self_ty = self.impls.get(&ck).ok_or(HeadError::Filed { want, at, what: "an impl's members' scope asked before its head is filed" })?.self_ty;
         // Filed regions that do not fit the head are the regions' refusal, never the head's
         // (D148): they are refused by name and the scope is made over none (its members'
@@ -4832,8 +4914,9 @@ impl<'n> Store<'n> {
         let mut fns = blaze_own::Vec::new_in(alloc);
         let ms = members(names, key, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         let mut members = blaze_own::Vec::new_in(alloc);
+        let mut scratch = self.take_parse_scratch();
         for m in &ms {
-            with_lowered(names, key, m.text, |mv| -> Result<(), Why> {
+            with_lowered_in(&mut scratch, names, key, m.text, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
                     return Ok(());
                 }
@@ -4878,6 +4961,7 @@ impl<'n> Store<'n> {
             })
             .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))??;
         }
+        self.put_parse_scratch(scratch);
         for (name, own_params) in assoc_own {
             self.maps.assoc_generics.insert((key, name), own_params);
         }
@@ -4968,7 +5052,7 @@ impl<'n> Store<'n> {
             if self.regions.made(item).is_some() || self.regions.unread(item).why != tc::region_facts::UnreadWhy::NoHead {
                 continue;
             }
-            let Ok(low) = lower_alloc(names, key, m.text, alloc) else { continue };
+            let Ok(low) = self.lower_alloc_here(names, key, m.text, alloc) else { continue };
             let mv = low.view();
             if mv.cfg_out() {
                 continue;
@@ -5218,6 +5302,7 @@ impl<'n> Store<'n> {
             let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{c}"));
             Why::Program(Box::from(s.as_str()), whole)
         };
+        let mut member_scratch = self.take_parse_scratch();
         for m in &members(names, key, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))? {
             // On resume after an earlier member hit `Why::Need` / `Unfrozen`, skip `Fn` / `Const`
             // members whose head or refusal was already filed in this store BEFORE lowering again.
@@ -5240,7 +5325,7 @@ impl<'n> Store<'n> {
                 }
                 _ => None,
             };
-            with_lowered(names, key, m.text, |mv| -> Result<(), Why> {
+            with_lowered_in(&mut member_scratch, names, key, m.text, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
                     return Ok(());
                 }
@@ -5358,6 +5443,7 @@ impl<'n> Store<'n> {
             })
             .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))??;
         }
+        self.put_parse_scratch(member_scratch);
         // The members' needs: the first as a step's need, the rest made before it (`ensure_noting`).
         if let Some((&first, rest)) = needs.split_first() {
             self.more_needs.clear();
@@ -5851,8 +5937,9 @@ impl<'n> Store<'n> {
         // evaluating the constant can prove `T: Trait` without re-entering the pending associated type.
         let mut first_assoc_const: Option<(LibKey, Why)> = None;
         let mut pending_assoc: blaze_own::Vec<Name, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut scratch = self.take_parse_scratch();
         for m in &ms {
-            with_lowered(names, key, m.text, |mv| -> Result<(), Why> {
+            with_lowered_in(&mut scratch, names, key, m.text, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
                     return Ok(());
                 }
@@ -5927,6 +6014,7 @@ impl<'n> Store<'n> {
             })
             .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))??;
         }
+        self.put_parse_scratch(scratch);
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
@@ -6059,7 +6147,8 @@ impl<'n> Store<'n> {
     #[expect(clippy::too_many_arguments, reason = "one constant's text and its impl's frame")]
     fn impl_const<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, ck: ItemKey, mk: ItemKey, text: &'n str, written_by: Option<LibKey>, env: &Env<'_>, (scope, clauses): (&Scope, &[PClause]), bounds: &[ParamBound], generics: u32) -> Result<(), Why> {
         let whole = Range::new(0, 0);
-        with_lowered(names, key, text, |cv| -> Result<(), Why> {
+        let mut scratch = self.take_parse_scratch();
+        let res = with_lowered_in(&mut scratch, names, key, text, |cv| -> Result<(), Why> {
             let at = Range::new(0, text.len() as u32);
             let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
             let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
@@ -6085,8 +6174,9 @@ impl<'n> Store<'n> {
             };
             self.fns.insert(mk, row);
             Ok(())
-        })
-        .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?
+        });
+        self.put_parse_scratch(scratch);
+        res.map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?
     }
 
     /// Makes the rows of the impl constants that waited on the leaf `need` ([`ConstWait`]),
@@ -6147,7 +6237,7 @@ impl<'n> Store<'n> {
             if !matches!(m.detail, ItemDetail::Const { .. }) || Name::of(m.name) != w.name {
                 continue;
             }
-            let low = lower_alloc(names, w.impl_, m.text, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+            let low = self.lower_alloc_here(names, w.impl_, m.text, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             if low.view().cfg_out() {
                 continue;
             }

@@ -807,6 +807,27 @@ type PageBlock<'a> = blaze_own::Box<[PageSlot<'a>; BLOCK], SharedAlloc<'a>>;
 /// `a_changed_archive_checksum_enters_the_body_through_the_graph`, wave-1119 t26).
 type HeaderSlots<'a> = blaze_own::Box<[OnceLock<Result<IndexedHeaders<'a>, PagesError>>; HeaderPages::COUNT], SharedAlloc<'a>>;
 
+/// Hot atomic read/byte counters for [`Stored`], each padded to its own 128-byte cache line
+/// (`bstd::sync::CachePadded`, rule 86) and boxed off-stack so `Stored` stays `<= 1 KiB` by value
+/// while eliminating 128-core false sharing across parallel readers.
+struct StoredMetrics {
+    task_reads: bstd::sync::CachePadded<core::sync::atomic::AtomicUsize>,
+    header_reads: bstd::sync::CachePadded<core::sync::atomic::AtomicUsize>,
+    /// The bytes of the task and header pages read, and of those hashed (zero on the store's
+    /// proof): the `pages:` line ([`PagesRead`]).
+    task_bytes: bstd::sync::CachePadded<core::sync::atomic::AtomicU64>,
+    header_bytes: bstd::sync::CachePadded<core::sync::atomic::AtomicU64>,
+    hashed_bytes: bstd::sync::CachePadded<core::sync::atomic::AtomicU64>,
+}
+
+/// One cache-line-isolated shard of [`Stored::asked`]: holds both its own ask counter and its
+/// capped entry list so parallel workers pick a shard by `Name`'s hash bytes with zero shared
+/// global `asks.fetch_add(1)` contention across 128 cores (rule 86).
+struct AskedShard<'a> {
+    asks: core::sync::atomic::AtomicUsize,
+    entries: blaze_core::lock::Lock<blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>>>,
+}
+
 pub(crate) struct Stored<'a> {
     pub(crate) root: &'a Root<'a>,
     snapshot: &'a Snapshot<SharedAlloc<'a>>,
@@ -824,29 +845,23 @@ pub(crate) struct Stored<'a> {
     /// ([`pages::Check::Store`], the command's path: no byte hashed, a page's head alone checked)
     /// or every byte hashed and every entry walked ([`pages::Check::Hashed`], `--verify`).
     check: pages::Check,
-    task_reads: core::sync::atomic::AtomicUsize,
-    header_reads: core::sync::atomic::AtomicUsize,
-    /// The bytes of the task and header pages read, and of those hashed (zero on the store's
-    /// proof): the `pages:` line ([`PagesRead`]).
-    task_bytes: core::sync::atomic::AtomicU64,
-    header_bytes: core::sync::atomic::AtomicU64,
-    hashed_bytes: core::sync::atomic::AtomicU64,
-    /// Rows asked by name ([`Stored::asks`]).
-    asks: core::sync::atomic::AtomicUsize,
-    /// Each name asked, sharded across [`ASKED_SHARDS`] locks, the first [`MOST_ASKS_KEPT`]: what
-    /// [`Stored::asked`] tells by kind, repeats and distinct names apart (rule 17: which rows a
-    /// request's reads of the answer are, before why they scale).
+    metrics: blaze_own::Box<StoredMetrics, SharedAlloc<'a>>,
+    /// Each name asked, sharded across [`ASKED_SHARDS`] 128-byte `CachePadded` shards indexed
+    /// directly by `name`'s hash bytes (zero shared atomic counter): what [`Stored::asked`] tells
+    /// by kind, repeats and distinct names apart (rule 17).
     asked: AskedShards<'a>,
 }
 
-/// The names [`Stored::asked`] keeps (rule 18: a table has a cap): a ready edit asks hundreds;
+/// Shards for [`Stored::asked`] so parallel 128-core body workers never serialize on one global
+/// lock or a shared `asks` atomic counter (power of two for bitmask indexing).
+const ASKED_SHARDS: usize = 32;
 
-/// Shards for [`Stored::asked`] so parallel body workers never serialize on one global lock.
-const ASKED_SHARDS: usize = 16;
+/// Per-shard cap on kept ask entries (rule 18: bounded table): `4096` per shard (`131,072` across
+/// all shards), so even a hot repeated `Name` stays told while asks past the cap are counted in
+/// `AskedShard::asks` (`AskedByKind::untold`).
+const MOST_ASKS_PER_SHARD: usize = 4096;
 
-type AskedShards<'a> = blaze_own::Box<[blaze_core::lock::Lock<blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>>>; ASKED_SHARDS], SharedAlloc<'a>>;
-/// asks past it are counted ([`Stored::asks`]) and not told by kind.
-const MOST_ASKS_KEPT: usize = 1 << 16;
+type AskedShards<'a> = blaze_own::Box<[bstd::sync::CachePadded<AskedShard<'a>>; ASKED_SHARDS], SharedAlloc<'a>>;
 
 /// A request's rows asked of the stored answer, by kind ([`Stored::asked`]): each kind's asks
 /// (repeats included) and distinct names, and the asks past the cap not told; and by purpose
@@ -948,34 +963,56 @@ impl<'a> Stored<'a> {
     /// store's proof, plain_place.rs `snapshot_get`), [`pages::Check::Hashed`] for an explicit
     /// verify (every byte hashed, every entry walked: `VerifiedPage::open_whole`).
     pub(crate) fn new(root: &'a Root<'a>, snapshot: &'a Snapshot<SharedAlloc<'a>>, headers: &'a Headers, check: pages::Check, alloc: SharedAlloc<'a>) -> Self {
+        use bstd::sync::CachePadded;
         use core::sync::atomic::{AtomicU64, AtomicUsize};
         let total_pages = root.page_count();
         let blocks = blaze_own::Vec::from_iter_in((0..total_pages.div_ceil(BLOCK)).map(|_| OnceLock::new()), alloc);
         let radix_shards = blaze_own::Vec::from_iter_in((0..root.page_shards.len()).map(|_| OnceLock::new()), alloc);
+        let metrics = blaze_own::Box::new_in(
+            StoredMetrics {
+                task_reads: CachePadded::new(AtomicUsize::new(0)),
+                header_reads: CachePadded::new(AtomicUsize::new(0)),
+                task_bytes: CachePadded::new(AtomicU64::new(0)),
+                header_bytes: CachePadded::new(AtomicU64::new(0)),
+                hashed_bytes: CachePadded::new(AtomicU64::new(0)),
+            },
+            alloc,
+        );
         Self {
             root, snapshot, headers, header_pages: blaze_own::Box::new_in(core::array::from_fn(|_| OnceLock::new()), alloc), alloc, blocks, radix_shards, refused: OnceLock::new(), check,
-            task_reads: AtomicUsize::new(0),
-            header_reads: AtomicUsize::new(0),
-            task_bytes: AtomicU64::new(0),
-            header_bytes: AtomicU64::new(0),
-            hashed_bytes: AtomicU64::new(0),
-            asks: AtomicUsize::new(0),
+            metrics,
             asked: blaze_own::Box::new_in(
-                core::array::from_fn(|_| blaze_core::lock::Lock::new("engine.answer: the rows asked by name", blaze_own::Vec::with_capacity_in(0, alloc))),
+                core::array::from_fn(|_| {
+                    CachePadded::new(AskedShard {
+                        asks: AtomicUsize::new(0),
+                        entries: blaze_core::lock::Lock::new("engine.answer: the rows asked by name", blaze_own::Vec::with_capacity_in(0, alloc)),
+                    })
+                }),
                 alloc,
             ),
         }
     }
 
-    /// One ask of `name`'s page for `ask`: counted, and kept under the cap for [`Stored::asked`].
+    /// Selects a `CachePadded` ask shard directly from `name`'s hash bytes, eliminating shared
+    /// global `asks.fetch_add(1)` cache-line contention across 128 workers.
+    #[inline]
+    fn ask_shard_index(name: Name) -> usize {
+        let b0 = usize::from(name.subject.0[0]);
+        let b1 = usize::from(name.subject.0[1]);
+        let kind = name.kind.index();
+        (b0 ^ b1.rotate_left(3) ^ kind) & (ASKED_SHARDS - 1)
+    }
+
+    /// One ask of `name`'s page for `ask`: counted in its hash-selected `CachePadded` shard and
+    /// kept under the per-shard cap for [`Stored::asked`].
     fn note_ask(&self, name: Name, ask: blaze_engine::Ask) {
-        let slot = self.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if slot >= MOST_ASKS_KEPT {
+        let Some(shard) = self.asked.get(Self::ask_shard_index(name)) else { return };
+        let slot = shard.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if slot >= MOST_ASKS_PER_SHARD {
             return;
         }
-        let Some(shard) = self.asked.get(slot & (ASKED_SHARDS - 1)) else { return };
-        let mut asked = shard.lock();
-        // A refused growth leaves the name untold, counted by `asks` (rule 3: the count
+        let mut asked = shard.entries.lock();
+        // A refused growth leaves the name untold, counted by `shard.asks` (rule 3: the count
         // says so, `AskedByKind::untold`).
         let _ = asked.try_push((name, ask));
     }
@@ -983,13 +1020,20 @@ impl<'a> Stored<'a> {
     /// The rows asked so far by kind (repeats and distinct names apart) and by purpose (asks
     /// and distinct reads apart) ([`AskedByKind`]).
     pub(crate) fn asked(&self) -> AskedByKind {
+        use core::sync::atomic::Ordering::Relaxed;
         let mut by = AskedByKind::default();
-        let total = self.asks().min(MOST_ASKS_KEPT);
-        let mut sorted: blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(total, self.alloc);
+        let mut total_asks = 0usize;
+        let mut kept_cap = 0usize;
+        for shard in self.asked.iter() {
+            let shard_asks = shard.asks.load(Relaxed);
+            total_asks = total_asks.saturating_add(shard_asks);
+            kept_cap = kept_cap.saturating_add(shard_asks.min(MOST_ASKS_PER_SHARD));
+        }
+        let mut sorted: blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(kept_cap, self.alloc);
         let mut kept = 0usize;
         for shard in self.asked.iter() {
-            let asked = shard.lock();
-            kept += asked.len();
+            let asked = shard.entries.lock();
+            kept = kept.saturating_add(asked.len());
             for &(name, ask) in asked.iter() {
                 if let Some(slot) = by.asks.get_mut(name.kind.index()) {
                     *slot += 1;
@@ -1003,7 +1047,7 @@ impl<'a> Stored<'a> {
                 let _ = sorted.try_push((name, ask));
             }
         }
-        by.untold = u32::try_from(self.asks().saturating_sub(kept)).unwrap_or(u32::MAX);
+        by.untold = u32::try_from(total_asks.saturating_sub(kept)).unwrap_or(u32::MAX);
         sorted.sort_unstable();
         let mut last_name = None;
         let mut last_read = None;
@@ -1025,7 +1069,12 @@ impl<'a> Stored<'a> {
     /// with, apart from the page packing (a page holds the rows its names' leading bits pick, so
     /// one set of names asked spans more pages in a larger answer: `pages_read` is not the measure).
     pub(crate) fn asks(&self) -> usize {
-        self.asks.load(core::sync::atomic::Ordering::Relaxed)
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut total = 0usize;
+        for shard in self.asked.iter() {
+            total = total.saturating_add(shard.asks.load(Relaxed));
+        }
+        total
     }
 
     /// The page holding `name`'s row, asked by name for `ask` (counted in [`Stored::asks`] and
@@ -1046,7 +1095,7 @@ impl<'a> Stored<'a> {
         match self.check {
             pages::Check::Store => Ok(Sealed::by_store(key, held.bytes, held.proof)),
             pages::Check::Hashed => {
-                self.hashed_bytes.fetch_add(held.bytes.len() as u64, Relaxed);
+                self.metrics.hashed_bytes.fetch_add(held.bytes.len() as u64, Relaxed);
                 Sealed::hashed(key, held.bytes).map_err(|torn| torn.at(page))
             }
         }
@@ -1062,7 +1111,12 @@ impl<'a> Stored<'a> {
     pub(crate) fn pages_read_line(&self) -> PagesRead {
         use core::sync::atomic::Ordering::Relaxed;
         let (task, header) = self.read_counts();
-        PagesRead { task, header, bytes: self.task_bytes.load(Relaxed) + self.header_bytes.load(Relaxed), hashed: self.hashed_bytes.load(Relaxed) }
+        PagesRead {
+            task,
+            header,
+            bytes: self.metrics.task_bytes.load(Relaxed) + self.metrics.header_bytes.load(Relaxed),
+            hashed: self.metrics.hashed_bytes.load(Relaxed),
+        }
     }
 
     pub(crate) fn answer(&self) -> blaze_engine::Answer<'_> {
@@ -1087,9 +1141,9 @@ impl<'a> Stored<'a> {
             return Ok(None);
         }
         let proof = self.header_pages[index].get_or_init(|| {
-            self.header_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.metrics.header_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let page = index as u32;
-            IndexedHeaders::open(self.sealed(key, page, &self.header_bytes)?, index)
+            IndexedHeaders::open(self.sealed(key, page, &self.metrics.header_bytes)?, index)
         });
         match proof {
             Ok(page) => Ok(Some(page)),
@@ -1116,7 +1170,7 @@ impl<'a> Stored<'a> {
 
     pub(crate) fn read_counts(&self) -> (usize, usize) {
         use core::sync::atomic::Ordering::Relaxed;
-        (self.task_reads.load(Relaxed), self.header_reads.load(Relaxed))
+        (self.metrics.task_reads.load(Relaxed), self.metrics.header_reads.load(Relaxed))
     }
 
     #[cfg(test)]
@@ -1150,7 +1204,7 @@ impl<'a> Stored<'a> {
         let cached = shard_cell.get_or_init(|| {
             let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
             let opened = self
-                .sealed(shard_key, pages::ROOT_PAGE, &self.task_bytes)
+                .sealed(shard_key, pages::ROOT_PAGE, &self.metrics.task_bytes)
                 .and_then(|sealed| pages::decode_radix_shard(sealed, shard_u32, self.root.bits, self.alloc));
             match opened {
                 Ok(shard) => Some(shard),
@@ -1187,10 +1241,10 @@ impl<'a> Stored<'a> {
         }
         let block = self.blocks[index / BLOCK].get_or_init(|| blaze_own::Box::new_in(core::array::from_fn(|_| OnceLock::new()), self.alloc));
         let proof = block[index % BLOCK].get_or_init(|| {
-            self.task_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.metrics.task_reads.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // On the store's proof the head alone is checked, no byte hashed and no entry walked
             // (pages/view.rs `open`); an explicit verify hashes and walks every entry.
-            let opened = self.sealed(key, page, &self.task_bytes).and_then(|sealed| match self.check {
+            let opened = self.sealed(key, page, &self.metrics.task_bytes).and_then(|sealed| match self.check {
                 pages::Check::Store => VerifiedPage::open(sealed, page, self.root.bits),
                 pages::Check::Hashed => VerifiedPage::open_whole(sealed, page, self.root.bits),
             });
@@ -1286,6 +1340,57 @@ pub(crate) fn load_answer<'m, 'a, D: Driver, S: Sharing>(cx: &Cx, store: &mut Co
     Ok(Ok((kept, root)))
 }
 
+/// Opens an answer root directory directly from a lent store handle without creating a
+/// [`CommandStore`] (used by pre-check warm selection lookup in `engine_check.rs`).
+pub(crate) fn open_root_from_lent<'a, D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    key: Key,
+    alloc: SharedAlloc<'a>,
+) -> Result<Result<Root<'a>, Unreadable>, CliError> {
+    let Some(held) = lent.get(&blaze_cas::Key(key.0)).map_err(crate::store::PlaceError::from)? else {
+        return Ok(Err(Unreadable::Missing { key }));
+    };
+    let sealed_root = match Sealed::hashed(key, held.bytes) {
+        Ok(s) => s,
+        Err(why) => return Ok(Err(Unreadable::Pages(why.at(pages::ROOT_PAGE)))),
+    };
+    let mut store_err: Option<CliError> = None;
+    let decoded = pages::decode_root_with(
+        sealed_root,
+        |sub_key| match lent.get(&blaze_cas::Key(sub_key.0)) {
+            Ok(Some(h)) => Some(Sealed::hashed(sub_key, h.bytes)),
+            Ok(None) => None,
+            Err(err) => {
+                store_err.get_or_insert(crate::store::PlaceError::from(err).into());
+                None
+            }
+        },
+        alloc,
+    );
+    if let Some(err) = store_err {
+        return Err(err);
+    }
+    Ok(decoded.map_err(Unreadable::Pages))
+}
+
+/// The pointer the root `name` names, read directly from a lent store handle without creating a
+/// [`CommandStore`]: `None` when absent.
+pub(crate) fn load_pointer_from_lent<'m, D: Driver>(
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    name: &str,
+) -> Result<Option<Result<Pointer<'m>, Unreadable>>, CliError> {
+    let Some(root_key) = lent.root_named(name) else { return Ok(None) };
+    let Some(keys) = lent.get(&root_key).map_err(crate::store::PlaceError::from)? else { return Ok(None) };
+    if keys.bytes.len() != 32 {
+        return Ok(Some(Err(Unreadable::Names { bytes: keys.bytes.len() })));
+    }
+    let first = key_at(keys.bytes, 0);
+    let Some(held) = lent.get(&blaze_cas::Key(first.0)).map_err(crate::store::PlaceError::from)? else {
+        return Ok(Some(Err(Unreadable::Missing { key: first })));
+    };
+    decode_pointer_bytes(first, held.bytes).map(Some)
+}
+
 /// The pointer the root `name` names, read in place: `None` when there is none.
 pub(crate) fn load_pointer<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, name: &str) -> Result<Option<Result<Pointer<'m>, Unreadable>>, CliError> {
     let Some(keys) = store.named(name)? else { return Ok(None) };
@@ -1336,13 +1441,32 @@ pub(crate) fn decode_pointer_bytes<'m>(first: Key, sealed: &'m [u8]) -> Result<R
     Ok(Ok(Pointer { key: first, root: key_at(pointer, 4), headers, lines: key_at(pointer, 36), facts, tools, leaves, journal }))
 }
 
-/// The printed lines' record the pointer names, every entry checked (engine_lines.rs `decode`).
-pub(crate) fn load_lines<'m, 'a, D: Driver, S: Sharing>(
+/// The printed lines' record the pointer names, every entry checked (engine_lines.rs
+/// `decode_in_frame`), decompressing `BZR1`-enveloped lines into `frame` while leaving raw/small
+/// records zero-copy.
+pub(crate) fn load_lines_in<'m, 'f, 'b, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     key: Key,
+    frame: &'f Frame,
     alloc: SharedAlloc<'a>,
-) -> Result<Result<crate::engine_lines::Last<'m, 'a>, Unreadable>, CliError> {
+) -> Result<Result<crate::engine_lines::Last<'b, 'a>, Unreadable>, CliError>
+where
+    'm: 'b,
+    'f: 'b,
+{
+    let Some(held) = store.get(cx, key)? else { return Ok(Err(Unreadable::Missing { key })) };
+    let bytes: &'m [u8] = held.bytes;
+    Ok(crate::engine_lines::decode_in_frame(bytes, frame, alloc).map_err(Unreadable::Lines))
+}
+
+/// The printed lines' record the pointer names, every entry checked (engine_lines.rs `decode`).
+pub(crate) fn load_lines<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    key: Key,
+    alloc: SharedAlloc<'static>,
+) -> Result<Result<crate::engine_lines::Last<'m, 'static>, Unreadable>, CliError> {
     let Some(held) = store.get(cx, key)? else { return Ok(Err(Unreadable::Missing { key })) };
     let bytes: &'m [u8] = held.bytes;
     Ok(crate::engine_lines::decode(bytes, alloc).map_err(Unreadable::Lines))
@@ -2598,7 +2722,7 @@ pub(crate) struct LoadedBase<'m, 'a> {
 /// auxiliary keys, returning `Ok(None)` if the root is absent, unreadable, excluded, or (when
 /// `require_current_tools`) written under other tools.
 #[expect(clippy::too_many_arguments, reason = "base open helper: each argument one handle or constraint")]
-pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
+pub(crate) fn open_named_base<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     name: &str,
@@ -2606,7 +2730,7 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     exclude: Option<Key>,
     require_current_tools: bool,
     alloc: SharedAlloc<'a>,
-    frame: &Frame,
+    frame: &'f Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     let Some(Ok(pointer)) = load_pointer(cx, store, name)? else { return Ok(None) };
     if exclude == Some(pointer.key) {
@@ -2615,7 +2739,7 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     if require_current_tools && !pointer.certifies_under(tools) {
         return Ok(None);
     }
-    let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { return Ok(None) };
+    let Ok(lines) = load_lines_in(cx, store, pointer.lines, frame, alloc)? else { return Ok(None) };
     let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { return Ok(None) };
     let aux = read_base_aux(store, name, frame)?;
     Ok(Some(LoadedBase { pointer, lines, root, aux }))
@@ -2627,7 +2751,7 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
 /// preferring a base written under `tools` (`certifies_under(tools)`) before falling back to any
 /// readable base when `!require_current_tools`.
 #[expect(clippy::too_many_arguments, reason = "workspace base open helper: each argument one handle or constraint")]
-pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
+pub(crate) fn open_base_for_tools<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     dir_root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
@@ -2635,7 +2759,7 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
     exclude: Option<Key>,
     require_current_tools: bool,
     alloc: SharedAlloc<'a>,
-    frame: &Frame,
+    frame: &'f Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
@@ -2674,7 +2798,7 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
         if !current && fallback.is_some() {
             continue;
         }
-        let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { continue };
+        let Ok(lines) = load_lines_in(cx, store, pointer.lines, frame, alloc)? else { continue };
         let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { continue };
         let prefix = base_slot_prefix(base.workspace, base.layout, frame);
         let aux = read_base_aux(store, prefix.as_str(), frame)?;
@@ -2689,13 +2813,13 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
 
 /// Opens the pre-warmed toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`),
 /// verifying its pointer, lines, and root directory.
-pub(crate) fn open_toolchain_base<'m, 'a, D: Driver, S: Sharing>(
+pub(crate) fn open_toolchain_base<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     alloc: SharedAlloc<'a>,
-    frame: &Frame,
+    frame: &'f Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     let name = toolchain_base_root(toolchain, tools, frame);
     open_named_base(cx, store, name.as_str(), tools, None, false, alloc, frame)
@@ -4137,5 +4261,75 @@ mod reach_shard_tests {
         let mut store2 = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle()).expect("store2");
         assert_eq!(read_base_aux(&mut store2, slot_prefix.as_str(), frame).expect("slot aux"), BaseAux::default());
         assert_eq!(read_base_aux(&mut store2, wt_b_root.as_str(), frame).expect("wt_b aux after clean"), aux);
+    }
+
+    /// 128-core false-sharing elimination in `Stored`: `Stored` stays `<= 1 KiB` by value,
+    /// `AskedShard` is 128-byte cache-line padded (`CachePadded`), `ask_shard_index` distributes
+    /// across shards directly from `Name` bytes without a shared global `asks` atomic, and
+    /// `note_ask` / `asks` / `asked` accurately count repeats, distinct names, purposes, and
+    /// per-shard cap overflow (`untold`).
+    #[test]
+    fn stored_sharded_asks_record_accurately_and_stay_cache_padded() {
+        use blaze_drive::Kind;
+        use blaze_engine::{Ask, Gen};
+
+        assert!(core::mem::size_of::<Stored<'static>>() <= 1 << 10, "Stored must stay <= 1 KiB by value");
+        assert!(
+            core::mem::align_of::<bstd::sync::CachePadded<AskedShard<'static>>>() >= 64,
+            "AskedShard must be cache-line aligned"
+        );
+
+        let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 71 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle()).expect("command store");
+        let empty = Kept::new_in(alloc);
+        let enc = pages::encode_at_bits(&empty, 1, alloc);
+        for (k, b) in enc.puts.iter() {
+            store.put(&cx, *k, b).expect("put empty root");
+        }
+        lent.commit().expect("commit empty root");
+        let root_dir = open_root(&cx, &mut store, enc.root, alloc).expect("open").expect("valid root");
+        let snap = store.snapshot_in(alloc).expect("snapshot");
+        let headers = Headers::Absent { since: Gen(1) };
+        let stored = Stored::new(&root_dir, &snap, &headers, pages::Check::Store, alloc);
+
+        // Spread 256 distinct BodyCheck names + repeated asks across shards.
+        let mut shards_hit = [false; ASKED_SHARDS];
+        for i in 0u32..256 {
+            let name = Name::new(Kind::BodyCheck, ContentId::of("stored shard test", &i.to_le_bytes()));
+            shards_hit[Stored::ask_shard_index(name)] = true;
+            stored.note_ask(name, Ask::Header);
+            if i % 4 == 0 {
+                stored.note_ask(name, Ask::Header);
+            }
+        }
+        let distinct_shards = shards_hit.iter().filter(|&&hit| hit).count();
+        assert!(distinct_shards >= ASKED_SHARDS / 2, "hash-based shard selection must spread across shards, hit {distinct_shards}/{ASKED_SHARDS}");
+        assert_eq!(stored.asks(), 256 + 64, "total sharded ask count matches exact calls");
+        let by = stored.asked();
+        assert_eq!(by.asks[Kind::BodyCheck.index()], 320);
+        assert_eq!(by.distinct[Kind::BodyCheck.index()], 256);
+        assert_eq!(by.by_purpose[Ask::Header.purpose()], 320);
+        assert_eq!(by.purpose_distinct[Ask::Header.purpose()], 256);
+        assert_eq!(by.untold, 0, "no asks past per-shard cap");
+
+        // Exceed MOST_ASKS_PER_SHARD on one hot name and verify untold counts exact overflow.
+        let hot = Name::new(Kind::FileItems, ContentId::of("stored shard hot", b"hot"));
+        let overflow = MOST_ASKS_PER_SHARD + 17;
+        for _ in 0..overflow {
+            stored.note_ask(hot, Ask::Header);
+        }
+        assert_eq!(stored.asks(), 320 + overflow);
+        let after = stored.asked();
+        assert!(after.untold >= 17, "asks past per-shard cap must be counted in untold, got {}", after.untold);
     }
 }

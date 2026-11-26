@@ -1896,31 +1896,32 @@ const HAND_WAIT: Duration = Duration::from_secs(5);
 /// the command fails naming the workers ([`DriveError::CodeWorkers`]), never waits on.
 const END_WAIT: Duration = CODE_WAIT;
 
-/// The most makers one code worker keeps (rule 18: a table has a cap): one per `(suite,
-/// MakerKind)` its makes asked, least-recently-used dropped first. Every `MakerStart::Direct(_)`
-/// test in a suite shares ONE `(suite, MakerKind::Direct)` maker, so keeping 4 makers per worker
-/// prevents boundary thrashing when `OneEach` overlaps tail tests across adjacent suites while
-/// still evicting finished suites' multi-GB `LazyProgram` tables on large multi-crate workspaces.
-/// A maker dropped is made again cleanly (`Maker::of_start` reads nothing).
+/// Default cap for [`Makers::new`] (rule 18: a table has a cap; unit tests exercise 4-slot LRU
+/// eviction). Real code workers in [`SuiteMakers`] use the tighter [`WORKER_MOST_MAKERS`] cap so
+/// multi-suite cold test runs evict finished suites' `LazyProgram` tables aggressively.
 const MOST_MAKERS: usize = 4;
+
+/// Tighter per-worker resident maker cap for [`SuiteMakers`] (at most 2 `(suite, MakerKind)`
+/// makers kept per worker) so multi-suite cold `blaze test` runs stay well under 500 MB RSS.
+const WORKER_MOST_MAKERS: usize = 2;
 
 /// Soft frame budget per code worker: once a worker's `Frame` reaches this usage between makes,
 /// the worker drops its [`SuiteMakers`], resets and trims its `Frame` back to
 /// [`WORKER_FRAME_KEEP`], and rebuilds cleanly so multi-suite and heavy-suite test runs never
-/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS. Set to 2 GiB (half of
-/// `FRAME_RESERVE`) so large single-suite workspaces (e.g. `tempo-e2e` at ~550+ MiB of loaded
-/// crate trees and heads) stay warm across makes instead of resetting after every function.
-const WORKER_FRAME_RESET_AT: usize = 2 << 30;
+/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS. Set to 256 MiB so multi-suite
+/// cold test runs stay bounded while heavy single-suite cold makes still bump adaptively up to
+/// [`WORKER_FRAME_HARD_RESET_AT`].
+const WORKER_FRAME_RESET_AT: usize = 256 << 20;
 
 /// Hard frame ceiling per code worker (still 1 GiB below `FRAME_RESERVE`) for the adaptive
 /// cold-baseline bump: if a single cold make already fills past [`WORKER_FRAME_RESET_AT`], the
 /// worker keeps warm headroom up to this ceiling rather than thrashing on every make.
 const WORKER_FRAME_HARD_RESET_AT: usize = 3 << 30;
 
-/// Lower frame budget applied once [`Makers`] has evicted a suite at [`MOST_MAKERS`]: if the
+/// Lower frame budget applied once [`Makers`] has evicted a suite at its cap: if the
 /// worker's `Frame` holds at least this much memory from evicted suites, reclaim it between
 /// makes instead of retaining dead suites' `NamesRecords` and `Front2` arenas.
-const WORKER_FRAME_EVICT_RESET_AT: usize = 128 << 20;
+const WORKER_FRAME_EVICT_RESET_AT: usize = 64 << 20;
 
 /// Warm bytes kept in a code worker's `Frame` across resets; blocks past this are returned via
 /// `Frame::trim`.
@@ -2437,12 +2438,17 @@ pub(crate) enum MakersPlant {
 pub(crate) struct Makers<M> {
     kept: AVec<'static, (SuiteId, MakerKind, M)>,
     plant: MakersPlant,
+    cap: usize,
     evicted: bool,
 }
 
 impl<M: MadeFor> Makers<M> {
     pub(crate) fn new(alloc: Alloc<'static>, plant: MakersPlant) -> Makers<M> {
-        Makers { kept: Vec::new_in(alloc), plant, evicted: false }
+        Self::capped(alloc, plant, MOST_MAKERS)
+    }
+
+    pub(crate) fn capped(alloc: Alloc<'static>, plant: MakersPlant, cap: usize) -> Makers<M> {
+        Makers { kept: Vec::new_in(alloc), plant, cap: cap.max(1), evicted: false }
     }
 
     /// Whether any LRU eviction occurred since this `Makers` was constructed.
@@ -2469,8 +2475,8 @@ impl<M: MadeFor> Makers<M> {
             }
             None => {
                 let maker = make()?;
-                if self.kept.len() >= MOST_MAKERS {
-                    // Least-recently-used first: at most `MOST_MAKERS` moved, once a maker is made.
+                if self.kept.len() >= self.cap {
+                    // Least-recently-used first: at most `self.cap` moved, once a maker is made.
                     drop(self.kept.remove_shift(0));
                     self.evicted = true;
                 }
@@ -2557,7 +2563,7 @@ impl<'w> SuiteMakers<'w> {
             frame,
             tables: heap.alloc(),
             names,
-            makers: Makers::new(heap.alloc(), MakersPlant::None),
+            makers: Makers::capped(heap.alloc(), MakersPlant::None, WORKER_MOST_MAKERS),
             reset_needed: false,
             makes: 0,
             reset_at: WORKER_FRAME_RESET_AT,

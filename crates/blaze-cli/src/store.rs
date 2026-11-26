@@ -916,15 +916,17 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
     let answered = ns(clock);
     // Queue lease release (if this process held one) before testing whether a commit is owed.
     lent.release_lease();
-    let needs_hk = lent.needs_housekeeping(lent.wall_ns());
     let bg_detached = home.bg_gc.is_detached();
-    // Warm no-op fast path: when needs_housekeeping is false, 0 slices and 0 spawns.
-    // On a native host when housekeeping is needed (over budget, tiers over K, expired roots,
-    // or retired files ready), commit immediately with 0 foreground slices (1 flip, 0 seal
-    // barriers, full foreground QoS) and spawn detached `blaze gc --background`
-    // (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI exit is never delayed. In simulated
-    // worlds without a spawner, run inline slices (including exit-tail seal).
-    let slices = if needs_hk && !bg_detached && lent.needs_commit() { AFTER_ANSWER_SLICES } else { 0 };
+    // On a native host with detached background GC, commit immediately with 0 foreground slices
+    // (1 flip, 0 seal barriers, full foreground QoS) and spawn detached `blaze gc --background`
+    // only when `Driven::needs_bg_gc` fires (urgent triggers immediately, or unsealed segments
+    // batched past `BG_GC_UNSEALED_SEGMENTS` / `BG_GC_UNSEALED_BYTES`). In simulated worlds
+    // without a spawner, run inline slices when `needs_housekeeping` is true.
+    let slices = if !bg_detached && lent.needs_commit() && lent.needs_housekeeping(lent.wall_ns()) {
+        AFTER_ANSWER_SLICES
+    } else {
+        0
+    };
     let has_work = slices > 0 || lent.needs_commit();
     let (after, commit_ns, spawn_bg) = if !has_work {
         let named = lent.named();
@@ -941,17 +943,32 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         };
         let after = plain_place::AfterAnswer { cleanup, ..plain_place::AfterAnswer::default() };
         let commit_ns = ns(clock).saturating_sub(answered);
-        let spawn_bg = bg_detached && needs_hk;
-        drop(lent);
+        let spawn_bg = if bg_detached {
+            let now_ns = lent.wall_ns();
+            let driven = lent.into_store();
+            let due = driven.needs_bg_gc(now_ns);
+            drop(driven);
+            due
+        } else {
+            drop(lent);
+            false
+        };
         (after, commit_ns, spawn_bg)
     } else {
         // `plain_place::after_answer` keeps `lent.commit()` at caller QoS (P-cores) and scopes
         // QoS lowering strictly to inline maintenance (`fold_slice`, `clean_on`, `seal`).
         let after = plain_place::after_answer(cx, &lent, slices)?;
         let commit_ns = ns(clock).saturating_sub(answered);
-        let manifest_changed = after.segments_written > 0 || after.sealed || after.compaction_slices > 0;
-        let spawn_bg = bg_detached && (needs_hk || (manifest_changed && lent.needs_housekeeping(lent.wall_ns())));
-        drop(lent);
+        let spawn_bg = if bg_detached {
+            let now_ns = lent.wall_ns();
+            let driven = lent.into_store();
+            let due = driven.needs_bg_gc(now_ns);
+            drop(driven);
+            due
+        } else {
+            drop(lent);
+            false
+        };
         (after, commit_ns, spawn_bg)
     };
     if spawn_bg {
@@ -2039,5 +2056,31 @@ mod after_answer_commit_tests {
         let reopened = home.open_store(&durable, Facts { boot: Some(1), nonce: 86 }, heap.alloc()).expect("reopen");
         let held = reopened.get(&blaze_cas::Key(k.0)).expect("get").expect("record readable");
         assert_eq!(held.bytes, b"barrier-payload");
+    }
+
+    #[test]
+    fn forms_note_once_uses_has_root_and_single_small_commit_does_not_trigger_bg_gc() {
+        let io = Io::simulated(SimWorld::new(87, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let heap = blaze_own::testing::heap();
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+
+        let lent = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 87 }, heap.alloc()).expect("open");
+        assert!(!lent.has_root(plain_place::forms::OTHER_FORMS_LOOKED));
+        let noted = plain_place::forms::note_once(&cx, &home.dir, &lent, &err).expect("first note_once");
+        assert_eq!(noted, 0);
+        after_answer_printed(&cx, lent, &home, false, &clock, &err).expect("commit note_once");
+
+        let lent2 = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 88 }, heap.alloc()).expect("reopen");
+        assert!(lent2.has_root(plain_place::forms::OTHER_FORMS_LOOKED), "note_once must persist OTHER_FORMS_LOOKED root");
+        let noted2 = plain_place::forms::note_once(&cx, &home.dir, &lent2, &err).expect("second note_once");
+        assert_eq!(noted2, 0);
+        let now_ns = lent2.wall_ns();
+        let driven = lent2.into_store();
+        assert!(driven.needs_housekeeping(now_ns), "1 unsealed segment keeps needs_housekeeping true");
+        assert!(!driven.needs_bg_gc(now_ns), "1 small unsealed segment must not trigger detached bg GC spawn");
     }
 }

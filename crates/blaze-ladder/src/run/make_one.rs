@@ -477,9 +477,11 @@ struct Work {
     /// Whether a made instance touched a thread-local: the program then needs the getter's
     /// and ender's records (code_records.rs `RecordRun::getter`/`ender`).
     thread_locals: bool,
-    /// The program's compiler_builtins soft-float routines as instances, found once a run
-    /// (front2/builtins_shim.rs): every instance's emitter gets their places.
-    routines: crate::front2::builtins_shim::Bound,
+    /// The program's compiler_builtins soft-float routines as instances, found lazily on the
+    /// first function whose LIR actually mentions an `f16`/`f128` value (or on explicit
+    /// `Maker::bind_routines` for LTO export) so typical programs never open `compiler_builtins`
+    /// or walk `names.linked(roots)` during [`MakerState::new`].
+    routines: core::cell::OnceCell<crate::front2::builtins_shim::Bound>,
     /// The clock a make is timed on ([`MakeWatch::clock`]); `None`: no make is timed or
     /// reported.
     clock: Option<blaze_core::wait::Monotonic>,
@@ -607,6 +609,33 @@ fn tables_gone(key: ItemKey) -> RunError {
     RunError::OneBody { key, why: "the maker's tables were left taken by an earlier failed step (make_one.rs `MakerState::tables`)" }
 }
 
+/// Whether `view` mentions any `f16` or `f128` scalar, vector, compound member, or signature
+/// parameter whose legalization can call a `compiler_builtins` [`blaze_lir::legalize::SoftFloat`]
+/// routine.
+fn func_needs_soft_float(view: &blaze_lir::View<'_>) -> bool {
+    use blaze_lir::ty::{Scalar, Ty};
+    let is_soft = |bits: u16| matches!(Ty(bits).elem(), Scalar::F16 | Scalar::F128);
+    view.tys.iter().any(|&bits| is_soft(bits))
+        || view.compound_tys.iter().any(|&bits| is_soft(bits))
+        || view.sig_params.iter().any(|p| is_soft(p.ty))
+}
+
+/// Lazily binds `program.soft_float_routines` into `slot` on first demand, returning a borrow
+/// tied only to `slot` so callers may still mutably borrow sibling fields of [`Work`].
+fn get_or_init_routines<'r, P: FrontEnd>(
+    slot: &'r core::cell::OnceCell<crate::front2::builtins_shim::Bound>,
+    program: &P,
+    ground: &PortableTys<'_>,
+    alloc: Alloc<'static>,
+) -> Result<&'r crate::front2::builtins_shim::Bound, crate::symbols::SymbolError> {
+    if let Some(bound) = slot.get() {
+        return Ok(bound);
+    }
+    let bound = crate::front2::builtins_shim::Bound::new(program.soft_float_routines(alloc), ground, alloc)?;
+    let _ = slot.set(bound);
+    slot.get().ok_or(crate::symbols::SymbolError::NotGround { what: "soft-float routines slot not initialized" })
+}
+
 impl MakerState {
     /// Build a static datum or TLS template using the same ground names as code entries.
     pub fn static_entry<P: FrontEnd>(
@@ -674,10 +703,6 @@ impl MakerState {
             const_at: ConstTable::new_in(Global),
         };
         let ground = PortableTys::new_in(alloc);
-        let routines = crate::front2::builtins_shim::Bound::new(program.soft_float_routines(alloc), &ground, alloc).map_err(|_| RunError::OneBody {
-            key: first,
-            why: "a compiler_builtins soft-float routine's instance name did not encode (front2/builtins_shim.rs `Bound::new`)",
-        })?;
         let work = Work {
             alloc,
             isa,
@@ -690,7 +715,7 @@ impl MakerState {
             stash: Vec::new_in(Global),
             needs: Needs::new_in(Global),
             thread_locals: false,
-            routines,
+            routines: core::cell::OnceCell::new(),
             clock: None,
             times: MakeTimes::default(),
             reported: None,
@@ -2448,7 +2473,15 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
         }
         BuildSink::Entry(entry) => {
             use blaze_core::wait::Clock as _;
-            let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
+            let routines = if func_needs_soft_float(&built.func.view()) {
+                let bound = get_or_init_routines(&work.routines, program, &work.ground, work.alloc).map_err(|_| RunError::OneBody {
+                    key: instance.item,
+                    why: "a compiler_builtins soft-float routine's instance name did not encode (front2/builtins_shim.rs `Bound::new`)",
+                })?;
+                bound.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?
+            } else {
+                crate::front2::builtins_shim::Routines::NONE
+            };
             let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
             let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
             for n in 0..reach.rows.len() {
@@ -3142,7 +3175,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// function references) so host-machine emission can legalize `f128` operations if needed.
     pub fn bind_routines<'m>(&'m self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<crate::front2::builtins_shim::Routines<'m>, CodeRecordError> {
         match self.made.as_ref() {
-            Some((_, state)) => state.work.routines.bind(funcs),
+            Some((program, state)) => {
+                let bound = get_or_init_routines(&state.work.routines, program, &state.work.ground, state.work.alloc)
+                    .map_err(CodeRecordError::Symbol)?;
+                bound.bind(funcs)
+            }
             None => Ok(crate::front2::builtins_shim::Routines::NONE),
         }
     }
@@ -3592,5 +3629,39 @@ mod ask_progress_tests {
         };
         assert!(!asks_again(&non_retryable));
         assert_eq!(ask_key(&non_retryable), None);
+    }
+
+    #[test]
+    fn func_needs_soft_float_skips_ordinary_lir_and_detects_f16_f128() {
+        use super::func_needs_soft_float;
+        use crate::run::Global;
+        use blaze_lir::builder::{Param, Variadic};
+        use blaze_lir::func::Conv;
+        use blaze_lir::{BlockKind, Builder, Flags, Full, Op, Ty};
+
+        let make_binary = |ty: Ty, op: Op| {
+            let mut b = Builder::<Global, Full>::new_in(64, Global);
+            let p = Param::of(ty);
+            let sig = b.sig(Conv::C, Variadic::No, &[p, p], &[p]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let (x, y) = (b.param(ty), b.param(ty));
+            let res = b.binary(op, Flags::NONE, x, y);
+            b.ret(&[res]);
+            b.finish_checked().expect("valid LIR")
+        };
+
+        let plain_i64 = make_binary(Ty::I64, Op::Add);
+        assert!(!func_needs_soft_float(&plain_i64.view()), "i64 arithmetic must not trigger lazy compiler_builtins lookup");
+
+        let plain_f64 = make_binary(Ty::F64, Op::Fadd);
+        assert!(!func_needs_soft_float(&plain_f64.view()), "f64 arithmetic must not trigger lazy compiler_builtins lookup");
+
+        let quad = make_binary(Ty::F128, Op::Fadd);
+        assert!(func_needs_soft_float(&quad.view()), "f128 arithmetic must trigger lazy compiler_builtins lookup");
+
+        let half = make_binary(Ty::F16, Op::Fadd);
+        assert!(func_needs_soft_float(&half.view()), "f16 arithmetic must trigger lazy compiler_builtins lookup");
     }
 }

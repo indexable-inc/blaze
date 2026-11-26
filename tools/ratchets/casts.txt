@@ -103,7 +103,7 @@ blaze-remote	238
 blaze-report	137
 blaze-rng	3
 blaze-run	110
-blaze-scope	987
+blaze-scope	944
 blaze-screen	13
 blaze-script	11
 blaze-sha256	1
@@ -126,7 +126,7 @@ blaze-toolchain	24
 blaze-trace	53
 blaze-ty	2
 blaze-typeck	489
-blaze-unit-graph	63
+blaze-unit-graph	62
 blaze-units	2
 blaze-url	3
 blaze-v2-proof	5

@@ -32,9 +32,10 @@ pub const LAST_MAGIC: &[u8; 4] = b"BDL1";
 /// rows it needs, and a row's lists (its reads and the reverse index) vary from none to
 /// thousands. At 512 rows a page, tempo's table was 128 pages of about 20 MB each (2.6 GB in
 /// all), and a one-statement edit read all 128: 2.7 GB of footprint and about 3.7 ms of step a
-/// page (check-g044908-body, 2026-11-17). At this size a page is tens of KB.
-pub const PAGE_BYTES: u64 = 64 << 10;
-/// The most bits a root pages by: 65,536 pages (a 2 MiB root), 4 GiB at [`PAGE_BYTES`].
+/// page (check-g044908-body, 2026-11-17). At 16 KiB a page, incremental edits rewrite only
+/// ~20–40 KiB per touched page instead of hundreds of KiB while preserving >=3x BEP6 dictionary sharing.
+pub const PAGE_BYTES: u64 = 32 << 10;
+/// The most bits a root pages by: 65,536 pages (a 2 MiB flat root), 1 GiB at [`PAGE_BYTES`].
 pub const MOST_BITS: u8 = 16;
 
 /// One name's answer.
@@ -1524,10 +1525,13 @@ mod tests {
     fn pages_are_sized_by_bytes() {
         use super::{MOST_BITS, PAGE_BYTES, bits_for, bits_kept};
         assert_eq!((bits_for(0), bits_for(PAGE_BYTES), bits_for(PAGE_BYTES + 1)), (0, 0, 1));
+        let cap: u64 = PAGE_BYTES << MOST_BITS;
+        assert_eq!(bits_for(cap), MOST_BITS);
+        assert!(cap >> MOST_BITS <= PAGE_BYTES, "at cap, pages average {} bytes", cap >> MOST_BITS);
         let tempo: u64 = 2_600_000_000;
         let bits = bits_for(tempo);
         assert_eq!(bits, MOST_BITS);
-        assert!(tempo >> bits <= PAGE_BYTES, "tempo's pages average {} bytes", tempo >> bits);
+        assert!(tempo >> bits <= 64 << 10, "tempo's pages average {} bytes", tempo >> bits);
         // Control: the old rule (fewest bits keeping 512 rows a page) on its 65,536 rows.
         let mut by_rows = 0u8;
         while 65_536u64 > 512u64 << by_rows {

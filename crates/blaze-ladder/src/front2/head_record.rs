@@ -1025,6 +1025,9 @@ enum Parts {
 enum Text {
     Kept,
     Zeroed,
+    /// In-process store-to-store transfer: preserves `text_prefix` mode and length without
+    /// hashing fn text with BLAKE3 (never persisted).
+    InProcess,
 }
 
 /// A prefix ends immediately before the brace recorded by the parser. Checking the brace
@@ -1186,6 +1189,31 @@ pub fn encode_with_digests_into<'b>(
     Ok((meaning, regions))
 }
 
+/// Fast in-process head transfer encoding: writes a complete `BZHD` record into `out` reusing
+/// `scratch` with `Text::InProcess` and zero BLAKE3 digest computations (`TEXT_DOMAIN`,
+/// `REGIONS_DOMAIN`, `DIGEST_DOMAIN`). Never persisted to CAS; paired with
+/// [`decode_with_origins_boxed_inline_verified`] in the same process over the same `NamesSource`.
+pub(crate) fn encode_in_process_into<'b>(
+    head: HeadRef<'_, '_>,
+    tys: PTys<'_>,
+    origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, HeadRecordError>,
+    scratch: &mut EncodeScratch<'b>,
+    out: &mut RecordBytes<'_>,
+) -> Result<(), HeadRecordError> {
+    let meta = encode_into_scratch(head, tys, Text::InProcess, Parts::WithRegions, origin, scratch)?;
+    let [m0, m1, m2, m3] = MAGIC;
+    let [v0, v1, v2, v3] = VERSION.to_le_bytes();
+    let header_end = [m0, m1, m2, m3, v0, v1, v2, v3, meta.kind];
+    let count_le = meta.count.to_le_bytes();
+    out.clear();
+    out.reserve(header_end.len() + count_le.len() + scratch.terms.len() + scratch.body.len());
+    out.extend_from_slice(&header_end);
+    out.extend_from_slice(&count_le);
+    out.extend_from_slice(&scratch.terms);
+    out.extend_from_slice(&scratch.body);
+    Ok(())
+}
+
 struct EncodedMeta {
     kind: u8,
     count: u32,
@@ -1262,6 +1290,15 @@ fn encode_into_scratch<'b>(
                     Text::Zeroed => {
                         o.byte(0);
                         o.u32(0);
+                        o.body.extend_from_slice(&[0; 32]);
+                    }
+                    Text::InProcess => {
+                        o.byte(u8::from(head.text_prefix.is_some()));
+                        let len = match head.text_prefix {
+                            Some(end) => end,
+                            None => u32::try_from(head.text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?,
+                        };
+                        o.u32(len);
                         o.body.extend_from_slice(&[0; 32]);
                     }
                 }
@@ -2543,6 +2580,129 @@ pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableT
     decode_retaining_with(bytes, text, tys, alloc, None, None)
 }
 
+/// Stack-inline `PTy` buffer used by [`In`] so decoding typical head records (<= 64 terms,
+/// <= 16 list items) avoids both `blaze_mem::frame::task` setup and heap scratch allocations.
+enum SmallPTys<'s, const N: usize> {
+    Inline { len: usize, buf: [PTy; N] },
+    Heap(Vec<PTy, Alloc<'s>>),
+}
+
+impl<'s, const N: usize> SmallPTys<'s, N> {
+    fn new() -> Self {
+        Self::Inline { len: 0, buf: [PTy(0); N] }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    fn get(&self, at: usize) -> Option<&PTy> {
+        match self {
+            Self::Inline { len, buf } => buf.get(..*len).and_then(|s| s.get(at)),
+            Self::Heap(v) => v.get(at),
+        }
+    }
+
+    fn as_slice(&self) -> &[PTy] {
+        match self {
+            Self::Inline { len, buf } => buf.get(..*len).unwrap_or(&[]),
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Inline { len, .. } => *len = 0,
+            Self::Heap(v) => v.clear(),
+        }
+    }
+
+    fn reserve(&mut self, additional: usize, alloc: Alloc<'s>) {
+        match self {
+            Self::Inline { len, buf } => {
+                let needed = len.saturating_add(additional);
+                if needed > N {
+                    let mut v = Vec::with_capacity_in(needed, alloc);
+                    if let Some(s) = buf.get(..*len) {
+                        v.extend_from_slice(s);
+                    }
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => v.reserve(additional),
+        }
+    }
+
+    fn push(&mut self, value: PTy, alloc: Alloc<'s>) {
+        match self {
+            Self::Inline { len, buf } => {
+                if let Some(slot) = buf.get_mut(*len) {
+                    *slot = value;
+                    *len += 1;
+                    return;
+                }
+                let mut v = Vec::with_capacity_in(N.saturating_mul(2).max(8), alloc);
+                v.extend_from_slice(buf.as_slice());
+                v.push(value);
+                *self = Self::Heap(v);
+            }
+            Self::Heap(v) => v.push(value),
+        }
+    }
+}
+
+const INLINE_DECODE_TERMS: usize = 64;
+const INLINE_DECODE_SCRATCH: usize = 16;
+
+fn decode_retaining_body<'n, 's>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    scratch_alloc: Alloc<'s>,
+    keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
+) -> Result<DecodedHead<'n>, HeadRecordError> {
+    let mut r = In {
+        bytes,
+        at: 0,
+        tys,
+        locals: SmallPTys::new(),
+        scratch: SmallPTys::new(),
+        origins: Vec::new_in(alloc),
+        alloc,
+        scratch_alloc,
+    };
+    if r.take(4, "the magic")? != MAGIC.as_slice() {
+        return Err(E::NotThisRecord);
+    }
+    let found = r.u32("the version")?;
+    if found != VERSION {
+        return Err(E::Version { found });
+    }
+    let kind = r.u8("the head's kind")?;
+    let terms = r.count("the term table")?;
+    // Each term starts with at least a 1-byte tag, so `bytes.len()` safely bounds capacity.
+    r.locals.reserve(terms.min(bytes.len()), scratch_alloc);
+    for _ in 0..terms {
+        r.node()?;
+    }
+    let mut head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
+    // Form 22: the regions section, every column laid again over its type here, once.
+    if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
+        regions_fit_head((*head).as_ref(), filed.regions(), tys.view())?;
+        head.set_regions(filed)?;
+    }
+    if r.at != bytes.len() {
+        return Err(E::Trailing { at: r.at });
+    }
+    r.dedup_origins()?;
+    Ok(DecodedHead { head, origins: r.origins })
+}
+
 fn decode_retaining_with<'n>(
     bytes: &[u8],
     text: Option<&'n str>,
@@ -2551,45 +2711,22 @@ fn decode_retaining_with<'n>(
     keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
     verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
 ) -> Result<DecodedHead<'n>, HeadRecordError> {
-    blaze_mem::frame::task(blaze_mem::Tag::Parse, |decode_frame| {
-        let erased = blaze_own::Erased::new(decode_frame);
-        let scratch_alloc = erased.handle();
-        let mut r = In {
-            bytes,
-            at: 0,
-            tys,
-            locals: Vec::new_in(scratch_alloc),
-            scratch: Vec::new_in(scratch_alloc),
-            origins: Vec::new_in(alloc),
-            alloc,
-            scratch_alloc,
-        };
-        if r.take(4, "the magic")? != &MAGIC[..] {
-            return Err(E::NotThisRecord);
-        }
-        let found = r.u32("the version")?;
-        if found != VERSION {
-            return Err(E::Version { found });
-        }
-        let kind = r.u8("the head's kind")?;
-        let terms = r.count("the term table")?;
-        // Each term starts with at least a 1-byte tag, so `bytes.len()` safely bounds capacity.
-        r.locals.reserve(terms.min(bytes.len()));
-        for _ in 0..terms {
-            r.node()?;
-        }
-        let mut head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
-        // Form 22: the regions section, every column laid again over its type here, once.
-        if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
-            regions_fit_head((*head).as_ref(), filed.regions(), tys.view())?;
-            head.set_regions(filed)?;
-        }
-        if r.at != bytes.len() {
-            return Err(E::Trailing { at: r.at });
-        }
-        r.dedup_origins()?;
-        Ok(DecodedHead { head, origins: r.origins })
-    })
+    // Peek `terms` in the 13-byte header (`magic[4] + version[4] + kind[1] + terms[4]`) so
+    // heads with `<= INLINE_DECODE_TERMS` terms decode entirely on the stack without opening a
+    // `blaze_mem::frame::task` scratch frame.
+    let small_terms = bytes
+        .get(9..13)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(|b| usize::try_from(u32::from_le_bytes(b)).unwrap_or(usize::MAX))
+        .is_none_or(|terms| terms <= INLINE_DECODE_TERMS);
+    if small_terms {
+        decode_retaining_body(bytes, text, tys, alloc, alloc, keep_text, verify_text)
+    } else {
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, |decode_frame| {
+            let erased = blaze_own::Erased::new(decode_frame);
+            decode_retaining_body(bytes, text, tys, alloc, erased.handle(), keep_text, verify_text)
+        })
+    }
 }
 
 /// The reader: the bytes, where it is, and the record's terms as interned so far.
@@ -2597,9 +2734,10 @@ struct In<'r, 't, 'a, 's> {
     bytes: &'r [u8],
     at: usize,
     tys: &'t PortableTys<'a>,
-    /// The record's term `i` is `locals[i]` in `tys` (short-lived decode scratch frame).
-    locals: Vec<PTy, Alloc<'s>>,
-    scratch: Vec<PTy, Alloc<'s>>,
+    /// The record's term `i` is `locals[i]` in `tys` (stack-inline for <= 64 terms, spilling to
+    /// `scratch_alloc` for larger records).
+    locals: SmallPTys<'s, INLINE_DECODE_TERMS>,
+    scratch: SmallPTys<'s, INLINE_DECODE_SCRATCH>,
     origins: Vec<(ItemKey, OpaqueOrigin), Mem>,
     alloc: Mem,
     scratch_alloc: Alloc<'s>,
@@ -2831,18 +2969,18 @@ impl<'r> In<'r, '_, '_, '_> {
         self.scratch.clear();
         for _ in 0..n {
             let t = self.ty(what)?;
-            self.scratch.push(t);
+            self.scratch.push(t, self.scratch_alloc);
         }
         Ok(())
     }
     /// A list, interned into the table.
     fn list(&mut self, what: &'static str) -> Result<List, E> {
         self.tys_into_scratch(what)?;
-        self.tys.intern_list_shared(&self.scratch).map_err(E::Table)
+        self.tys.intern_list_shared(self.scratch.as_slice()).map_err(E::Table)
     }
     fn intern(&mut self, n: PNode) -> Result<(), E> {
         let t = self.tys.intern_shared(n).map_err(E::Table)?;
-        self.locals.push(t);
+        self.locals.push(t, self.scratch_alloc);
         Ok(())
     }
 
@@ -2866,8 +3004,8 @@ impl<'r> In<'r, '_, '_, '_> {
     fn node_dynamic(&mut self) -> Result<(), E> {
         // Through the table's own constructor, which keeps the one canonical form.
         self.tys_into_scratch("a trait object's predicates")?;
-        let t = self.tys.dynamic_shared(&self.scratch).map_err(E::Table)?;
-        self.locals.push(t);
+        let t = self.tys.dynamic_shared(self.scratch.as_slice()).map_err(E::Table)?;
+        self.locals.push(t, self.scratch_alloc);
         Ok(())
     }
 
@@ -3618,17 +3756,17 @@ impl<'r> In<'r, '_, '_, '_> {
         let trait_ = self.opt("an impl's trait", |r| r.key("an impl's trait"))?;
         let n = self.count("an impl's trait arguments")?;
         self.scratch.clear();
-        self.scratch.push(self_ty);
+        self.scratch.push(self_ty, self.scratch_alloc);
         for _ in 0..n {
             let t = self.ty("an impl's trait argument")?;
-            self.scratch.push(t);
+            self.scratch.push(t, self.scratch_alloc);
         }
         let trait_args = match trait_ {
             None if n == 0 => tc::ArgsAfterSelf::NONE,
             None => return Err(E::Shape { what: "an inherent impl with trait arguments" }),
             Some(_) => {
                 // The trait reference's whole list, `Self` first, split as the lowering does.
-                let with_self = self.tys.intern_list_shared(&self.scratch).map_err(E::Table)?;
+                let with_self = self.tys.intern_list_shared(self.scratch.as_slice()).map_err(E::Table)?;
                 tc::ArgsAfterSelf::split(self.tys.view(), with_self, self_ty)
                     .map_err(|_| E::Shape { what: "an impl's trait arguments do not follow its self type" })?
             }

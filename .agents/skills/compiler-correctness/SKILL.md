@@ -145,41 +145,38 @@ See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#whe
 
 ## own-the-language (rule 55)
 
-blaze has its own front end and its own pinned nightly, so the limits of stable Rust, and of rustc's
-unfinished features, are not blaze's limits. When a design is being bent around something the
-language cannot say (arithmetic on const generic arguments, a bound a parameter cannot state, a type
-the solver refuses), say so, and build the missing piece: finish the nightly feature in blaze's own
-front end where one exists (generic const expressions, specialization as blaze already has it), or
-add the smallest general primitive where none does (`library-over-language`), as an opt-in extension
-that changes no program that does not use it (`superset-of-rust`). Then use it in blaze's own code
-(`blaze-uses-its-extensions`). The same holds when nothing is blocked but the code pays for the gap:
-an abstraction that costs at run time (a `dyn` call, a clone, a heap box, a runtime check, a lock)
-only because the language cannot state it statically, boilerplate repeated because the language
-cannot abstract it, or an invariant kept by convention because no type can hold it. blaze's own
-crates are where the language is tried (dogfooding): whoever writes blaze code and finds such a
-place proposes the feature that would make it zero-cost or direct, unasked, as a short spec with its
-ledger row, and builds it. A workaround written because "stable const generics can't do that" is a
-subpar design to fix (`guard-the-cause`): the spec names the feature it needs and its ledger row.
+blaze owns its front end, its pinned nightly (`std`/`core`/`alloc`), and `bstd`, so the limits of
+stable Rust, upstream `std`, and rustc's unfinished features are NEVER blaze's limits. Whenever code
+gets ugly, janky, slow, or duplicated because Rust, `std`, or `bstd` lacks a primitive (compile-time
+reflection, `inline for`, const-generic arithmetic, zero-copy layout/codec generation, SIMD
+intrinsics, `#[blaze::pure]`/effects, allocator/SoA hooks, or `std`/`core` internals that can
+leverage blaze's comptime features), DO NOT write a clunky workaround: extend the language, modify
+pinned `std`/`core`/`alloc` or `bstd`, and delete the jank/boilerplate completely
+(`one-concept-one-home`, `whole-ports`). Use opt-in extensions that change no plain Rust program
+that does not use them (`superset-of-rust`), and dogfood them across blaze's own crates
+(`blaze-uses-its-extensions`). Any abstraction paying runtime cost (`dyn`, clone, heap box, lock,
+duplicate solver/IR) or manual boilerplate solely because the language or stdlib cannot express it
+statically is a bug to fix at the language/stdlib layer (`guard-the-cause`).
 
 See [docs/v2/plan/design/edition.md](../../../docs/v2/plan/design/edition.md).
 
 ## reflection-first (rule 56)
 
-A property that follows from the shape of a type or the body of a function (it holds no capability,
-it cannot own itself, every field is in its key, it is serializable or live-patchable) is written
-once using Blaze compile-time reflection (`inline for (name, field) in v`, `inline for (name, field)
-in dst`, `zip_fields` — `inline for` is the one implemented comptime-unroll loop syntax in blaze,
-not the unimplemented `for const` draft) and stated as a generic function or trait over what
-reflection finds: it can ask the real question (does a shared, mutable pointer lead back to this
-type), is decided per instance, and its refusal names the field path. Never reach for a Rust bridge
-macro (e.g. `reflect_struct!`) or `#[derive]` workaround in Blaze apps or demos just to compile with
-`rustc`: compile with `blaze` and use comptime reflection directly (`blaze-builds-blaze`). An auto
-trait can only say "every field has it" and fails with no reason; a proc macro is opaque to blaze
-(`blaze::proc_macro`); a check built into the compiler serves one property. Use those only where
-reflection is not the more powerful, and say why. When reflection cannot express what is needed (a
-bound that depends on a const expression, a body it cannot read, a type it cannot name), that is the
-work: extend reflection or the language with the smallest general primitive (`own-the-language`,
-`library-over-language`), never ship the weaker approximation in its place.
+Aggressively use Blaze compile-time reflection (`inline for (name, field) in v`, `inline for (name,
+field) in dst`, `zip_fields`, `core::mem::type_info`) — NOT hand-written boilerplate, auto traits,
+proc macros, bridge macros, or copy-pasted per-type match/encode/decode/hash/diff/visit/SOA logic —
+to eliminate jank and duplicate code across blaze, `bstd`, and pinned `std`/`core`/`alloc`. Any
+property or operation that follows from a type's shape (binary record encoding/decoding, content-key
+hashing, `SoA`/`CSR` column packing, layout/alignment/version checks, zero-copy validation,
+`Acyclic`/capability/purity proofs, diffing, tracing/debug formatting, live-patching) MUST be
+written ONCE as a generic function over compile-time reflection and reused everywhere, deleting the
+hand-rolled copies (`whole-ports`, `one-concept-one-home`). Never write a Rust bridge macro (e.g.
+`reflect_struct!`) or `#[derive]` workaround just to compile with `rustc`: compile with `blaze` and
+use comptime reflection directly (`blaze-builds-blaze`). Whenever reflection cannot yet express a
+pattern cleanly (a missing `type_info` query, enum/variant/tuple/field-attribute introspection,
+const-generic bound, or body inspection), extending reflection IS the primary work
+(`own-the-language`, `build-the-missing-piece`) — never leave hand-rolled jank standing in its
+place.
 
 See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 

@@ -332,25 +332,125 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
     }
 }
 
-/// On-the-spot head seeder for [`LazyProgram`]: freezes each requested head cell once into a
-/// per-program [`SeededHeads`] cache and files it into `&Store` in place during `check_body` and
-/// `in_world` queries (`BodyWorld::store_want`, `BodyWorld::impl_question`, and ADT layout
-/// lookups). Any head that belongs to a body-local item or cannot be frozen falls back cleanly to
-/// [`Seeded::Lower`] so the existing lowering + `eval_len` path handles it identically.
+/// Persistent in-process scratch store for [`LazySeed`], initialized lazily on the first `&Store`
+/// head miss from `BodyWorld::store_want` / `BodyWorld::impl_question`. Keeps lowered transitive
+/// dependencies warm across queries and transfers only the requested cell into `&Store` via
+/// [`crate::front2::tables::head::transfer_cell_in_process`] (zero `BZFZ` framing, zero
+/// `make_record_lives`, zero BLAKE3 digests).
+struct DirectSeedState<'n> {
+    store: blaze_own::Box<Store<'n>, Alloc<'static>>,
+    keys: crate::front2::keys::Keys,
+    enc_scratch: crate::front2::head_record::EncodeScratch<'static>,
+    buf: blaze_surface::RecordBytes<'static>,
+    import_cache: crate::front2::tables::head::FrozenImportCache<'n>,
+    failed: blaze_hash::HashSet<[u8; crate::front2::tables::head::WANT_BYTES], Alloc<'static>>,
+}
+
+/// On-the-spot head seeder for [`LazyProgram`]: lowers missing heads requested through `&Store`
+/// (`BodyWorld::store_want` and `BodyWorld::impl_question`) in a single persistent scratch store
+/// and transfers each cell directly into `&Store` in place. `Store::ensure_noting` bypasses this
+/// seeder (`store.seed_on_ensure = false`) and lowers directly into `&mut Store`. Any head that
+/// belongs to a body-local item or cannot be transferred falls back cleanly to [`Seeded::Lower`].
 struct LazySeed<'n, S> {
     names: S,
-    heads: RefCell<Option<crate::front2::tables::head::SeededHeads<'n, 'n, S>>>,
+    sized: Option<LibKey>,
+    pointers: crate::front2::receiver::Pointers,
+    frame: &'n blaze_mem::Frame,
+    alloc: Alloc<'static>,
+    state: RefCell<Option<DirectSeedState<'n>>>,
     consts: &'n RefCell<Option<LazyConsts<'n, S>>>,
 }
 
 impl<'n, S> LazySeed<'n, S> {
     fn clear(&self) {
-        if let Ok(mut guard) = self.heads.try_borrow_mut() {
+        if let Ok(mut guard) = self.state.try_borrow_mut() {
             let _ = guard.take();
         }
         if let Ok(mut guard) = self.consts.try_borrow_mut() {
             let _ = guard.take();
         }
+    }
+}
+
+impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
+    fn ensure_in_scratch(
+        &self,
+        state: &mut DirectSeedState<'n>,
+        cell: crate::front2::heads::Want,
+    ) -> Result<(), ()> {
+        use crate::front2::heads::{HeadError, Want};
+        use crate::front2::tables::head::{ConstValues as _, MOST_FREEZE_CONSTS};
+        use crate::front2::types::Why;
+
+        if state.store.made(cell) {
+            return Ok(());
+        }
+        let mut consts_eval = SharedLazyConsts(self.consts);
+        let mut asked: AVec<'_, LibKey> = AVec::new_in(self.alloc);
+        for _ in 0..=MOST_FREEZE_CONSTS {
+            let c = match state.store.ensure(self.names, &mut state.keys, cell) {
+                Ok(()) => return Ok(()),
+                Err(HeadError::Item(_, Why::NeedConst(c, _))) => c,
+                Err(_) => return Err(()),
+            };
+            if asked.contains(&c) || asked.len() == MOST_FREEZE_CONSTS {
+                return Err(());
+            }
+            asked.push(c);
+            if self.names.seeded_text_of(c).is_some() && !state.store.made(Want::Fn(c)) {
+                if state.keys.item(c).is_err() {
+                    return Err(());
+                }
+                if state.store.ensure(self.names, &mut state.keys, Want::Fn(c)).is_err() {
+                    return Err(());
+                }
+            }
+            if consts_eval.eval(&mut state.store, &mut state.keys, c).is_err() {
+                return Err(());
+            }
+        }
+        Err(())
+    }
+
+    fn transfer_one(
+        &self,
+        state: &mut DirectSeedState<'n>,
+        store: &Store<'n>,
+        keys: &crate::front2::keys::Keys,
+        need: crate::front2::heads::Want,
+        scratch: Alloc<'static>,
+    ) -> Result<(), ()> {
+        use crate::front2::tables::head::{cell_of, transfer_cell_in_process, want_bytes};
+        let cell = cell_of(self.names, need).map_err(|_| ())?;
+        if store.made(cell) {
+            return Ok(());
+        }
+        let key = want_bytes(cell);
+        if state.failed.contains(&key) {
+            return Err(());
+        }
+        if self.ensure_in_scratch(state, cell).is_err() {
+            state.failed.insert(key);
+            return Err(());
+        }
+        if transfer_cell_in_process(
+            self.names,
+            cell,
+            &state.store,
+            &state.keys,
+            store,
+            keys,
+            &mut state.enc_scratch,
+            &mut state.buf,
+            &state.import_cache,
+            scratch,
+        )
+        .is_err()
+        {
+            state.failed.insert(key);
+            return Err(());
+        }
+        Ok(())
     }
 }
 
@@ -366,12 +466,27 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
         if crate::front2::tables::seeds::of_the_body(store, need) {
             return Ok(Seeded::Lower);
         }
-        let Ok(mut guard) = self.heads.try_borrow_mut() else {
+        if store.made(need) {
+            return Ok(Seeded::Filed);
+        }
+        let Ok(mut guard) = self.state.try_borrow_mut() else {
             return Ok(Seeded::Lower);
         };
-        let Some(heads) = guard.as_mut() else {
-            return Ok(Seeded::Lower);
-        };
+        let state = guard.get_or_insert_with(|| {
+            let mut s = blaze_own::Box::new_in(Store::new(self.sized, self.frame, self.alloc), self.alloc);
+            s.pointers = self.pointers;
+            s.seed_on_ensure = false;
+            DirectSeedState {
+                store: s,
+                keys: crate::front2::keys::Keys::new_in(self.alloc),
+                enc_scratch: crate::front2::head_record::EncodeScratch::new_in(self.alloc),
+                buf: blaze_surface::RecordBytes::new_in(self.alloc),
+                import_cache: crate::front2::tables::head::FrozenImportCache::new(self.alloc),
+                failed: blaze_hash::HashSet::new_in(self.alloc),
+            }
+        });
+        state.store.prepared = store.prepared;
+        state.store.sources = store.sources;
         // A member fn's body lowering (`lower_member` -> `own_trait::of_member`) reads its
         // container's head (`store.impls` / `store.trait_defs`), and `track_caller` for a trait
         // impl method reads the trait's declared member (`keys.filed_member`) and trait head
@@ -381,7 +496,7 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                 let parent = Want::Head(container);
                 if !store.made(parent)
                     && !crate::front2::tables::seeds::of_the_body(store, parent)
-                    && crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch).is_err()
+                    && self.transfer_one(state, store, keys, parent, scratch).is_err()
                 {
                     return Ok(Seeded::Lower);
                 }
@@ -392,14 +507,14 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                     let trait_head = Want::Head(trait_lib);
                     if !store.made(trait_head)
                         && !crate::front2::tables::seeds::of_the_body(store, trait_head)
-                        && crate::front2::tables::head::seed(self.names, None, trait_head, heads, store, keys, scratch).is_err()
+                        && self.transfer_one(state, store, keys, trait_head, scratch).is_err()
                     {
                         return Ok(Seeded::Lower);
                     }
                     let members = Want::Members(trait_lib);
                     if !store.made(members)
                         && !crate::front2::tables::seeds::of_the_body(store, members)
-                        && crate::front2::tables::head::seed(self.names, None, members, heads, store, keys, scratch).is_err()
+                        && self.transfer_one(state, store, keys, members, scratch).is_err()
                     {
                         return Ok(Seeded::Lower);
                     }
@@ -409,16 +524,16 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                 let parent = Want::Head(container);
                 if !store.made(parent)
                     && !crate::front2::tables::seeds::of_the_body(store, parent)
-                    && crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch).is_err()
+                    && self.transfer_one(state, store, keys, parent, scratch).is_err()
                 {
                     return Ok(Seeded::Lower);
                 }
             }
             _ => {}
         }
-        match crate::front2::tables::head::seed(self.names, None, need, heads, store, keys, scratch) {
-            Ok(seeded) => Ok(seeded),
-            Err(_) => Ok(Seeded::Lower),
+        match self.transfer_one(state, store, keys, need, scratch) {
+            Ok(()) => Ok(Seeded::Filed),
+            Err(()) => Ok(Seeded::Lower),
         }
     }
 }
@@ -558,24 +673,17 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 bucket_index: RefCell::new(None),
                 cached_bits: RefCell::new(blaze_hash::HashMap::new_in(alloc)),
             })));
-            let consts_eval: &'n mut SharedLazyConsts<'n, S> = front.frame.alloc(SharedLazyConsts(consts_cell));
-            let seeded = crate::front2::tables::head::SeededHeads::new(crate::front2::tables::head::SeededHeadsOpts {
+            let seed: &'n LazySeed<'n, S> = front.frame.alloc(LazySeed {
                 names: front.names,
                 sized,
                 pointers,
                 frame: front.frame,
-                scratch: alloc,
                 alloc,
-                consts: Some(consts_eval),
-                known: None,
-                owners: None,
-            });
-            let seed: &'n LazySeed<'n, S> = front.frame.alloc(LazySeed {
-                names: front.names,
-                heads: RefCell::new(Some(seeded)),
+                state: RefCell::new(None),
                 consts: consts_cell,
             });
             store.seeds = Some(seed);
+            store.seed_on_ensure = false;
             (Some(seed), Some(Buckets::for_source(front.names, &front.index)))
         } else {
             (None, None)

@@ -23,7 +23,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, CommitDurability, Committed, Found, GcPlan, Got, LentRecord, Liveness, PidCheck, PidLiveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, CommitDurability, CommitRootMap, Committed, Found, GcPlan, Got, LentRecord, Liveness, PidCheck, PidLiveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::Settings,
 };
@@ -692,11 +692,44 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         Ok(())
     }
 
+    /// Maps ONLY the Bloom-matching segments needed to probe pending `Liveness::Reached` root
+    /// edits in [`Plain::reused`], falling back to [`Driven::map_all`] only when committed keys
+    /// still require probing unbloomed `other_roots` (dead-key resurrection / cross-checkout).
+    fn map_for_commit_roots(&mut self) -> Result<(), StoreError> {
+        if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
+            return Ok(());
+        }
+        // Bounded to 4 targeted rounds (edited+prior roots -> changed+replaced indexes -> leaf
+        // keys -> final check); falls back to `map_all` if still not settled.
+        for _ in 0..4 {
+            let lost = self.core.report().lost.len();
+            let now = self.driver.wall_ns();
+            match self.core.map_for_commit_roots(now, &mut self.effects)? {
+                CommitRootMap::Ready => {
+                    self.hand_losses(lost);
+                    return Ok(());
+                }
+                CommitRootMap::Mapped => {
+                    if !self.effects.is_empty() {
+                        self.run("mapping commit-root segments")?;
+                    }
+                    self.hand_losses(lost);
+                }
+                CommitRootMap::NeedAll => {
+                    self.hand_losses(lost);
+                    self.map_all()?;
+                    return Ok(());
+                }
+            }
+        }
+        self.map_all()
+    }
+
     /// [`Driven::commit_with`] with `records` lent where they lie (core.rs
     /// [`Plain::commit_records`]): a `Lent`'s shared arena, copied once, by the layout.
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
-        // After the answer: only map/verify segments that can conflict with the batch being
-        // committed (Bloom-filtered), unless a `Liveness::Reached` root-set or emergency
+        // After the answer: only map/verify segments that can conflict with the batch or pending
+        // roots being committed (Bloom-filtered), unless `Plant::CommitMapsAll` or emergency
         // auto-tier-merge requires a whole store.
         let writing = self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty();
         let mut auto_folded = false;
@@ -722,6 +755,9 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             } else {
                 self.map_for_commit(batches, records)?;
             }
+        }
+        if !self.core.whole() {
+            self.map_for_commit_roots()?;
         }
         let now = self.driver.wall_ns();
         self.core.commit_records(batches, records, now, &mut self.effects)?;
@@ -837,6 +873,13 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// `now_ns` ([`Plain::needs_housekeeping`]).
     pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
         self.core.needs_housekeeping(now_ns)
+    }
+
+    /// Whether detached `blaze gc --background` should be spawned at `now_ns`
+    /// ([`Plain::needs_bg_gc`]): fires immediately on urgent triggers and batches routine
+    /// unsealed-segment sealing past [`Plain::BG_GC_UNSEALED_SEGMENTS`] / [`Plain::BG_GC_UNSEALED_BYTES`].
+    pub fn needs_bg_gc(&self, now_ns: u64) -> bool {
+        self.core.needs_bg_gc(now_ns)
     }
 
     /// [`Plain::index_beside`].
@@ -1269,4 +1312,412 @@ fn nonce() -> u64 {
     let here = 0u8;
     let address = (&here as *const u8 as usize as u64).to_le_bytes();
     format::id_of("blaze plain store nonce 1", &[&std::process::id().to_le_bytes(), &blaze_core::system_wall_ns().to_le_bytes(), &address])
+}
+
+#[cfg(test)]
+mod sota10_commit_floor_tests {
+    use super::*;
+    use super::super::{
+        core::{LockStep, Plant, ROOT_LIFE_NS, TIER_SEGMENTS_MOST},
+        test_root,
+    };
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_mem::Frame;
+
+    const TAG: Tag = Tag(1);
+
+    fn make_cfg<'a>(n: u64, boot: u64, durable: bool, liveness: Liveness, cap_bytes: u64, root: &'a Frame) -> PlainConfig<&'a Frame> {
+        let mut writes = Vec::new_in(root);
+        writes.push(Namespace::LOCAL);
+        let mut reads = Vec::new_in(root);
+        reads.push(Namespace::LOCAL);
+        PlainConfig {
+            dir: FileName::new("plain").expect("dir"),
+            tags: n * TAGS,
+            cap_bytes,
+            boot,
+            nonce: 7_000 + n,
+            durable,
+            machine: PlainConfig::empty_machine(root),
+            writes,
+            reads,
+            liveness,
+            lock_step: LockStep::Backoff,
+        }
+    }
+
+    fn test_key(n: u32) -> Key {
+        Key(ContentId::of("sota10 commit floor test key", &n.to_le_bytes()))
+    }
+
+    fn fill_payload(n: u32, dst: &mut [u8]) {
+        for (i, slot) in dst.iter_mut().enumerate() {
+            *slot = u8::try_from((usize::try_from(n).unwrap_or(0).wrapping_mul(31).wrapping_add(i)) & 0xff).unwrap_or(0);
+        }
+    }
+
+    /// Coalesced small segments (`<= SMALL_SEGMENT_COALESCE_BYTES`) emit 1 single
+    /// `Effect::WriteUnsynced` (0 `Truncate`, 0 `WriteAt` on `seg-*`) matching `seal_segment`
+    /// byte-for-byte, and survive `sim.crash()` at every completion step across both durable and
+    /// unsynced commits without ever serving partial or corrupt bytes (Rules 26, 43).
+    #[test]
+    fn coalesced_small_segment_single_write_unsynced_and_crash_recovery_dst() {
+        let root = test_root();
+
+        // 1. Effect-shape proof: small commit emits 1 WriteUnsynced, 0 Truncate, 0 WriteAt on seg-*.
+        {
+            let mut sim = Sim::new(9101, Faults::default());
+            let mut plain = Plain::new(make_cfg(1, 1, true, Liveness::Everything, u64::MAX, &root), &root);
+            plain.set_stream_commits(true);
+            let mut effects = Default::default();
+            let mut done = Default::default();
+            plain.open_whole(&mut effects);
+            loop {
+                sim.submit(&mut effects);
+                if sim.in_flight() == 0 {
+                    break;
+                }
+                sim.poll(&mut done, Deadline::after(sim.now(), Duration::from_secs(60)));
+                let wall = sim.wall_ns();
+                for c in done.drain(..) {
+                    plain.complete(c, wall, &mut effects);
+                }
+            }
+            let mut buf0 = [0u8; 512];
+            let mut buf1 = [0u8; 768];
+            fill_payload(1, &mut buf0);
+            fill_payload(2, &mut buf1);
+            let k0 = test_key(1);
+            let k1 = test_key(2);
+            plain.put(k0, Namespace::LOCAL, TAG, &buf0).expect("put 0");
+            plain.put(k1, Namespace::LOCAL, TAG, &buf1).expect("put 1");
+
+            let wall = sim.wall_ns();
+            plain.commit_records(&[], &[], wall, &mut effects).expect("commit start");
+            let mut seg_write_unsynced = 0u32;
+            let mut seg_truncate = 0u32;
+            let mut seg_write_at = 0u32;
+            let mut written_seg_bytes: std::vec::Vec<u8> = std::vec::Vec::new();
+            loop {
+                for eff in &effects {
+                    match eff {
+                        Effect::WriteUnsynced { file, bytes, .. } if file.as_str().contains("/seg-") => {
+                            seg_write_unsynced += 1;
+                            written_seg_bytes.extend_from_slice(bytes);
+                        }
+                        Effect::Truncate { file, .. } if file.as_str().contains("/seg-") => seg_truncate += 1,
+                        Effect::WriteAt { file, .. } if file.as_str().contains("/seg-") => seg_write_at += 1,
+                        _ => {}
+                    }
+                }
+                sim.submit(&mut effects);
+                if sim.in_flight() == 0 {
+                    break;
+                }
+                sim.poll(&mut done, Deadline::after(sim.now(), Duration::from_secs(60)));
+                let w = sim.wall_ns();
+                for c in done.drain(..) {
+                    plain.complete(c, w, &mut effects);
+                }
+            }
+            assert_eq!(seg_write_unsynced, 1, "small segment must coalesce into 1 Effect::WriteUnsynced");
+            assert_eq!(seg_truncate, 0, "coalesced small segment must not emit Effect::Truncate");
+            assert_eq!(seg_write_at, 0, "coalesced small segment must not emit Effect::WriteAt");
+            let committed = plain.take_committed().expect("settled").expect("commit ok");
+            assert_eq!(committed.segments.len(), 1);
+
+            // Verify byte-for-byte equality against `format::seal_segment`.
+            let refs = [
+                (RecordRef { key: k0.0, tag: TAG }, &buf0[..]),
+                (RecordRef { key: k1.0, tag: TAG }, &buf1[..]),
+            ];
+            let mut expected = Default::default();
+            let described = format::seal_segment(Namespace::LOCAL, &refs, &mut expected).expect("seal_segment");
+            assert_eq!(described.count, 2);
+            assert_eq!(written_seg_bytes.as_slice(), expected.as_slice(), "coalesced small segment must match seal_segment byte-for-byte");
+            let mut check = Driven::with(sim, Path::new("/sim"), make_cfg(2, 2, true, Liveness::Everything, u64::MAX, &root), &root).expect("reopen");
+            assert!(check.scrub().expect("scrub").is_empty());
+            let g0 = check.get(&k0).expect("get 0").expect("present 0");
+            assert_eq!(check.got(g0).bytes, &buf0[..]);
+            let g1 = check.get(&k1).expect("get 1").expect("present 1");
+            assert_eq!(check.got(g1).bytes, &buf1[..]);
+        }
+
+        // 2. Crash-recovery DST: replay deterministically and crash (`sim.crash()`) at EVERY
+        //    completion step of a coalesced small-segment commit across seeds 0..4 and both
+        //    durable=true and durable=false.
+        for durable in [true, false] {
+            for seed in 0..4u64 {
+                let mut seed_buf = [0u8; 256];
+                fill_payload(100, &mut seed_buf);
+                let seed_k = test_key(100);
+                let seed_n = u32::try_from(seed).unwrap_or(0);
+                let mut payload_a = [0u8; 640];
+                let mut payload_b = [0u8; 1024];
+                fill_payload(200 + seed_n, &mut payload_a);
+                fill_payload(300 + seed_n, &mut payload_b);
+                let ka = test_key(200 + seed_n);
+                let kb = test_key(300 + seed_n);
+
+                let run_until = |stop_at: Option<u32>| -> (Sim, u32) {
+                    let mut w0 = Driven::with(
+                        Sim::new(9200 + seed, Faults::default()),
+                        Path::new("/sim"),
+                        make_cfg(1, 1, true, Liveness::Everything, u64::MAX, &root),
+                        &root,
+                    )
+                    .expect("seed open");
+                    w0.put(seed_k, Namespace::LOCAL, TAG, &seed_buf).expect("seed put");
+                    w0.commit_with(&[]).expect("seed commit");
+                    let mut sim = w0.into_driver();
+
+                    let mut plain = Plain::new(make_cfg(2, 1, durable, Liveness::Everything, u64::MAX, &root), &root);
+                    plain.set_stream_commits(true);
+                    let mut effects = Default::default();
+                    let mut done = Default::default();
+                    plain.open_whole(&mut effects);
+                    loop {
+                        sim.submit(&mut effects);
+                        if sim.in_flight() == 0 {
+                            break;
+                        }
+                        sim.poll(&mut done, Deadline::after(sim.now(), Duration::from_secs(60)));
+                        let wall = sim.wall_ns();
+                        for c in done.drain(..) {
+                            plain.complete(c, wall, &mut effects);
+                        }
+                    }
+                    plain.put(ka, Namespace::LOCAL, TAG, &payload_a).expect("put a");
+                    plain.put(kb, Namespace::LOCAL, TAG, &payload_b).expect("put b");
+                    plain.commit_records(&[], &[], sim.wall_ns(), &mut effects).expect("commit");
+                    let mut step = 0u32;
+                    'drive: loop {
+                        sim.submit(&mut effects);
+                        if sim.in_flight() == 0 {
+                            break;
+                        }
+                        sim.poll(&mut done, Deadline::after(sim.now(), Duration::from_secs(60)));
+                        let wall = sim.wall_ns();
+                        for c in done.drain(..) {
+                            plain.complete(c, wall, &mut effects);
+                            step += 1;
+                            if stop_at == Some(step) {
+                                break 'drive;
+                            }
+                        }
+                    }
+                    if stop_at.is_none() {
+                        assert!(plain.take_committed().expect("settled").is_ok());
+                    }
+                    (sim, step)
+                };
+
+                let (_, total_steps) = run_until(None);
+                assert!(total_steps >= 2, "commit must execute multiple completion steps");
+                for cut_step in 1..=total_steps {
+                    let (mut crashed, _) = run_until(Some(cut_step));
+                    crashed.crash();
+                    let mut reopened = Driven::with(
+                        crashed,
+                        Path::new("/sim"),
+                        make_cfg(10 + u64::from(cut_step), 2, durable, Liveness::Everything, u64::MAX, &root),
+                        &root,
+                    )
+                    .expect("reopen after crash");
+                    assert!(
+                        reopened.scrub().expect("scrub after crash").is_empty(),
+                        "seed {seed} step {cut_step}: corrupt record after crash"
+                    );
+                    let base_got = reopened.get(&seed_k).expect("get seed").expect("durable seed must survive crash");
+                    assert_eq!(reopened.got(base_got).bytes, &seed_buf[..]);
+                    let got_a = reopened.get(&ka).expect("get a").map(|f| reopened.got(f).bytes == &payload_a[..]);
+                    let got_b = reopened.get(&kb).expect("get b").map(|f| reopened.got(f).bytes == &payload_b[..]);
+                    assert_eq!(got_a, got_b, "seed {seed} step {cut_step}: coalesced segment commit must be atomic (all or none)");
+                    if let Some(eq) = got_a {
+                        assert!(eq, "seed {seed} step {cut_step}: recovered payload must match written bytes");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Liveness::Reached` root-edit commits map ONLY Bloom-matching segments (leaving unrelated
+    /// prior-boot segments unmapped and unhashed) while skipping unchanged page indexes and
+    /// subtracting replaced prior-index keys before segment probes. `Plant::CommitMapsAll` control
+    /// eagerly maps every segment, and resurrecting a dead key still marks its exact segment touched.
+    #[test]
+    fn reached_root_edit_commit_maps_targeted_without_map_all_and_tracks_resurrection() {
+        let root = test_root();
+        let mut payload = [0u8; 128];
+
+        let build_store = || -> (Sim, [Key; 20], Key, Key, u64) {
+            let mut buf = [0u8; 128];
+            let mut w = Driven::with(
+                Sim::new(9301, Faults::default()),
+                Path::new("/sim"),
+                make_cfg(1, 1, false, Liveness::Reached, u64::MAX, &root),
+                &root,
+            )
+            .expect("boot1 open");
+            w.disable_auto_merge();
+
+            // 18 unrelated committed segments (must stay unmapped on edit commit).
+            for s in 0..18u32 {
+                fill_payload(1_000 + s, &mut buf);
+                w.put(test_key(1_000 + s), Namespace::LOCAL, TAG, &buf).expect("put unrelated");
+                w.commit_with(&[]).expect("commit unrelated");
+            }
+
+            // 1 unrooted dead record in its own segment (for resurrection soundness check).
+            let dead_k = test_key(50_001);
+            fill_payload(50_001, &mut buf);
+            w.put(dead_k, Namespace::LOCAL, TAG, &buf).expect("put dead");
+            let dead_commit = w.commit_with(&[]).expect("commit dead");
+            let dead_seg_id = dead_commit.segments[0];
+
+            // 1 indexed reach root with 20 page indexes (>= ROOT_BLOOM_MIN_INDEXES) + answer root.
+            let mut indexes = [test_key(0); 20];
+            let mut kept_in_page0 = test_key(0);
+            for i in 0..20usize {
+                let n = u32::try_from(i).unwrap_or(0);
+                let ka = test_key(20_000 + n * 2);
+                let kb = test_key(20_000 + n * 2 + 1);
+                fill_payload(20_000 + n * 2, &mut buf);
+                w.put(ka, Namespace::LOCAL, TAG, &buf).expect("put ka");
+                fill_payload(20_000 + n * 2 + 1, &mut buf);
+                w.put(kb, Namespace::LOCAL, TAG, &buf).expect("put kb");
+                if i == 0 {
+                    kept_in_page0 = ka;
+                }
+                indexes[i] = w.index(&[ka, kb]).expect("index");
+            }
+            w.root_through("ws.reach", &indexes, ROOT_LIFE_NS).expect("root reach");
+            w.root_for("ws.answer", &[kept_in_page0], ROOT_LIFE_NS).expect("root answer");
+            w.commit_with(&[]).expect("commit roots");
+            let _ = w.seal().expect("seal boot1");
+            (w.into_driver(), indexes, kept_in_page0, dead_k, dead_seg_id)
+        };
+
+        // 1. Targeted edit commit in boot 2 (Plant::None): replaces 1 of 20 page indexes.
+        let (sim_boot1, mut indexes, kept_in_page0, dead_k, dead_seg_id) = build_store();
+        let mut w2 = Driven::planted(
+            sim_boot1,
+            Path::new("/sim"),
+            make_cfg(2, 2, false, Liveness::Reached, u64::MAX, &root),
+            &root,
+            Plant::None,
+        )
+        .expect("boot2 open");
+        w2.disable_auto_merge();
+        assert_eq!(w2.mapped_of_named().0, 0, "lazy open maps 0 segments");
+
+        let fresh_k = test_key(60_001);
+        fill_payload(60_001, &mut payload);
+        w2.put(fresh_k, Namespace::LOCAL, TAG, &payload).expect("put fresh");
+        indexes[0] = w2.index(&[kept_in_page0, fresh_k]).expect("new page 0 index");
+        w2.root_through("ws.reach", &indexes, ROOT_LIFE_NS).expect("update reach");
+        w2.root_for("ws.answer", &[kept_in_page0, fresh_k], ROOT_LIFE_NS).expect("update answer");
+        w2.commit_with(&[]).expect("edit commit");
+
+        let (mapped, named) = w2.mapped_of_named();
+        assert!(!w2.core().whole(), "normal Liveness::Reached edit commit must not call map_all()");
+        assert!(mapped <= 6 && mapped * 2 < named, "targeted root edit must leave unrelated segments unmapped (mapped={mapped}/{named})");
+        assert!(w2.core().checks().full <= 6, "targeted root edit must not hash unrelated prior-boot segments (checks={})", w2.core().checks().full);
+
+        // 2. Planted control (`Plant::CommitMapsAll`): forces eager `map_all()` over all segments.
+        let (sim_planted, mut indexes_planted, kept_planted, _, _) = build_store();
+        let mut w_planted = Driven::planted(
+            sim_planted,
+            Path::new("/sim"),
+            make_cfg(3, 2, false, Liveness::Reached, u64::MAX, &root),
+            &root,
+            Plant::CommitMapsAll,
+        )
+        .expect("planted open");
+        w_planted.disable_auto_merge();
+        w_planted.put(fresh_k, Namespace::LOCAL, TAG, &payload).expect("put fresh planted");
+        indexes_planted[0] = w_planted.index(&[kept_planted, fresh_k]).expect("new idx planted");
+        w_planted.root_through("ws.reach", &indexes_planted, ROOT_LIFE_NS).expect("update reach planted");
+        w_planted.commit_with(&[]).expect("planted commit");
+        assert!(w_planted.core().whole(), "Plant::CommitMapsAll control must call map_all()");
+        assert_eq!(w_planted.mapped_of_named().0, w_planted.mapped_of_named().1, "CommitMapsAll maps every segment");
+
+        // 3. Dead-key resurrection on a lazy reopen still marks the exact dead segment touched.
+        let sim_after_edit = w2.into_driver();
+        let mut w3 = Driven::with(
+            sim_after_edit,
+            Path::new("/sim"),
+            make_cfg(4, 2, false, Liveness::Reached, u64::MAX, &root),
+            &root,
+        )
+        .expect("reopen for resurrection");
+        w3.disable_auto_merge();
+        let res_idx = w3.index(&[kept_in_page0, dead_k]).expect("resurrect index");
+        indexes[0] = res_idx;
+        w3.root_through("ws.reach", &indexes, ROOT_LIFE_NS).expect("resurrect reach");
+        let res = w3.commit_with(&[]).expect("resurrect commit");
+        assert_eq!(
+            w3.core().segment_touched(dead_seg_id),
+            Some(res.generation),
+            "resurrecting a dead key from a lazy commit must still mark its exact segment touched"
+        );
+    }
+
+    /// `needs_bg_gc` gates unsealed-segment spawning behind `BG_GC_UNSEALED_SEGMENTS` /
+    /// `BG_GC_UNSEALED_BYTES` while preserving immediate triggers for over-budget, expired roots,
+    /// tier overflow (`> K`), and unlinkable retired files (and preserving `needs_housekeeping`
+    /// returning true after 1 unsealed segment).
+    #[test]
+    fn needs_bg_gc_batches_unsealed_segments_and_keeps_urgent_triggers_immediate() {
+        let root = test_root();
+        let mut payload = [0u8; 128];
+        let mut store = Driven::with(
+            Sim::new(9401, Faults::default()),
+            Path::new("/sim"),
+            make_cfg(1, 1, false, Liveness::Reached, 32 << 20, &root),
+            &root,
+        )
+        .expect("open");
+        store.disable_auto_merge();
+
+        // Commits 1..=TIER_SEGMENTS_MOST (4) small unsealed segments: `needs_housekeeping` is true,
+        // `needs_bg_gc` stays false (no background GC spawn on every edit).
+        let mut keys = [test_key(0); TIER_SEGMENTS_MOST + 1];
+        for i in 0..TIER_SEGMENTS_MOST {
+            let n = u32::try_from(i).unwrap_or(0);
+            let k = test_key(70_000 + n);
+            keys[i] = k;
+            fill_payload(70_000 + n, &mut payload);
+            store.put(k, Namespace::LOCAL, TAG, &payload).expect("put");
+            store.root_for("keep", &keys[..=i], ROOT_LIFE_NS).expect("root");
+            store.release_lease();
+            store.commit_with(&[]).expect("commit");
+            let now = store.driver().wall_ns();
+            assert!(store.needs_housekeeping(now), "needs_housekeeping keeps single-unsealed semantics");
+            assert!(!store.needs_bg_gc(now), "needs_bg_gc must not spawn bg GC for {} small unsealed segments", i + 1);
+        }
+
+        // Urgent trigger 1: over budget fires immediately even below unsealed count threshold.
+        let now = store.driver().wall_ns();
+        store.core_mut().set_cap(1);
+        assert!(store.needs_bg_gc(now), "over-budget must trigger bg GC immediately");
+        store.core_mut().set_cap(32 << 20);
+        assert!(!store.needs_bg_gc(now), "back under budget clears bg GC trigger");
+
+        // Urgent trigger 2: expired root fires immediately.
+        let expires = store.core().roots_expiring()[0].2;
+        assert!(!store.needs_bg_gc(expires - 1), "unexpired root does not trigger bg GC");
+        assert!(store.needs_bg_gc(expires), "expired root must trigger bg GC immediately");
+
+        // Urgent trigger 3: tier overflow (> K = 4 in tier 0) fires immediately.
+        let k_over = test_key(70_999);
+        keys[TIER_SEGMENTS_MOST] = k_over;
+        fill_payload(70_999, &mut payload);
+        store.put(k_over, Namespace::LOCAL, TAG, &payload).expect("put over K");
+        store.root_for("keep", &keys, ROOT_LIFE_NS).expect("root over K");
+        store.release_lease();
+        store.commit_with(&[]).expect("commit over K");
+        let now = store.driver().wall_ns();
+        assert!(store.needs_bg_gc(now), "tier overflow (> K) must trigger bg GC immediately");
+    }
 }
