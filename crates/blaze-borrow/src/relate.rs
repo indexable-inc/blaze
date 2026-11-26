@@ -233,6 +233,8 @@ struct Walk<'w, 'c, A: Allocator + Copy> {
     binder_v: BinderCtx,
     /// How many impls' where-clauses are being related around this point ([`Walk::impl_where`]).
     nested: u32,
+    /// Guard against re-entrant alias normalization inside [`Walk::erased_sides_norm`].
+    in_erased_norm: bool,
     walk_stack: [Option<WalkFrame<'c>>; WALK_STACK_CAP],
     walk_sp: usize,
     comp_stack: [Option<CompFrame<'c>>; COMP_STACK_CAP],
@@ -559,12 +561,25 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
 
     /// Structural erased equality between two resolved sides (including `Alias`, `Opaque`,
     /// `Param` heads): used to match caller/trait/opaque where-clauses against an asked subject
-    /// and trait arguments.
-    fn erased_sides(&self, a: Side<'c>, b: Side<'c>) -> bool {
+    /// and trait arguments. When the fast syntactic check returns `false` and either side holds
+    /// an alias (e.g. a forwarding inner alias like `<<TempoEthApi<N> as RpcNodeCore>::Evm as
+    /// ConfigureEvm>::BlockExecutorFactory` vs `<<N as RpcNodeCore>::Evm as ConfigureEvm>::BlockExecutorFactory`),
+    /// retries with inner-alias normalization.
+    fn erased_sides(&mut self, a: Side<'c>, b: Side<'c>) -> bool {
         self.erased_sides_with(a, b, false)
     }
 
-    fn erased_sides_with(&self, a: Side<'c>, b: Side<'c>, allow_alias: bool) -> bool {
+    fn erased_sides_with(&mut self, a: Side<'c>, b: Side<'c>, allow_alias: bool) -> bool {
+        if self.erased_sides_with_raw(a, b, allow_alias) {
+            return true;
+        }
+        if self.in_erased_norm {
+            return false;
+        }
+        self.erased_sides_norm(a, b, allow_alias)
+    }
+
+    fn erased_sides_with_raw(&self, a: Side<'c>, b: Side<'c>, allow_alias: bool) -> bool {
         const MAX_FRAMES: usize = 257;
         #[derive(Clone, Copy)]
         struct Frame<'c> {
@@ -632,6 +647,161 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 sp = top_idx;
             }
         }
+    }
+
+    /// Alias-normalizing erased structural equality: descends with split slots where available and
+    /// normalizes inner `PNode::Alias` nodes before failing `head_eq` or recursing on differing
+    /// alias arguments. Reclaims any temporary environments created during normalization.
+    fn erased_sides_norm(&mut self, a: Side<'c>, b: Side<'c>, allow_alias: bool) -> bool {
+        const MAX_FRAMES: usize = 64;
+        #[derive(Clone, Copy)]
+        struct NormFrame<'c> {
+            a: Side<'c>,
+            b: Side<'c>,
+            a_rest: Option<Slots<'c>>,
+            b_rest: Option<Slots<'c>>,
+            next_k: u32,
+            depth: u32,
+        }
+        let saved = (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v);
+        let env_mark = self.envs.len();
+        self.in_erased_norm = true;
+        let mut stack: [Option<NormFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
+        let mut sp = 0usize;
+        let mut budget = 1024u32;
+        let mut enter = Some((a, b, 0u32));
+        let res;
+        loop {
+            if let Some((a, b, d)) = enter.take() {
+                if d >= 32 || budget == 0 {
+                    res = false;
+                    break;
+                }
+                budget -= 1;
+                let (Ok(Resolved::Side(a)), Ok(Resolved::Side(b))) = (self.resolve(a), self.resolve(b)) else {
+                    res = false;
+                    break;
+                };
+                if self.erased_sides_with_raw(a, b, allow_alias) {
+                    continue;
+                }
+                let (Ok(na), Ok(nb)) = (self.node(a), self.node(b)) else {
+                    res = false;
+                    break;
+                };
+                if is_const(na) && is_const(nb) {
+                    continue;
+                }
+                if allow_alias && (matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. })) {
+                    continue;
+                }
+                if matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. }) {
+                    let (a2, da) = if matches!(na, PNode::Alias { .. }) && self.fits(a).is_ok() {
+                        self.try_normalize_subject_flag(a, d)
+                    } else {
+                        (a, false)
+                    };
+                    let (b2, db) = if matches!(nb, PNode::Alias { .. }) && self.fits(b).is_ok() {
+                        self.try_normalize_subject_flag(b, d)
+                    } else {
+                        (b, false)
+                    };
+                    if da || db {
+                        enter = Some((a2, b2, d + 1));
+                        continue;
+                    }
+                }
+                if !head_eq(na, nb) {
+                    res = false;
+                    break;
+                }
+                let (Ok(ka), Ok(kb)) = (self.kids_of(a), self.kids_of(b)) else {
+                    res = false;
+                    break;
+                };
+                if ka.len() != kb.len() {
+                    res = false;
+                    break;
+                }
+                if ka.len() > 0 {
+                    let a_rest = if self.fits(a).is_ok() {
+                        self.own(a).ok().and_then(|o| a.slots.split(o)).map(|(_, r)| r)
+                    } else {
+                        None
+                    };
+                    let b_rest = if self.fits(b).is_ok() {
+                        self.own(b).ok().and_then(|o| b.slots.split(o)).map(|(_, r)| r)
+                    } else {
+                        None
+                    };
+                    let Some(slot) = stack.get_mut(sp) else {
+                        res = false;
+                        break;
+                    };
+                    *slot = Some(NormFrame { a, b, a_rest, b_rest, next_k: 0, depth: d });
+                    sp += 1;
+                }
+                continue;
+            }
+            let Some(top_idx) = sp.checked_sub(1) else {
+                res = true;
+                break;
+            };
+            let Some(Some(mut frame)) = stack.get(top_idx).copied() else {
+                res = false;
+                break;
+            };
+            let (Ok(ka), Ok(kb)) = (self.kids_of(frame.a), self.kids_of(frame.b)) else {
+                res = false;
+                break;
+            };
+            if frame.next_k < ka.len() {
+                let k = frame.next_k;
+                frame.next_k = k + 1;
+                let a_kid = if let Some(ar) = frame.a_rest {
+                    match self.kid(frame.a, &ka, ar, k) {
+                        Ok((kid, next_r)) => {
+                            frame.a_rest = Some(next_r);
+                            kid
+                        }
+                        Err(_) => {
+                            frame.a_rest = None;
+                            let Some(x) = ka.get(k) else { res = false; break };
+                            Side { ty: x, slots: frame.a.slots }
+                        }
+                    }
+                } else {
+                    let Some(x) = ka.get(k) else { res = false; break };
+                    Side { ty: x, slots: frame.a.slots }
+                };
+                let b_kid = if let Some(br) = frame.b_rest {
+                    match self.kid(frame.b, &kb, br, k) {
+                        Ok((kid, next_r)) => {
+                            frame.b_rest = Some(next_r);
+                            kid
+                        }
+                        Err(_) => {
+                            frame.b_rest = None;
+                            let Some(y) = kb.get(k) else { res = false; break };
+                            Side { ty: y, slots: frame.b.slots }
+                        }
+                    }
+                } else {
+                    let Some(y) = kb.get(k) else { res = false; break };
+                    Side { ty: y, slots: frame.b.slots }
+                };
+                if let Some(slot) = stack.get_mut(top_idx) {
+                    *slot = Some(frame);
+                }
+                enter = Some((a_kid, b_kid, frame.depth + 1));
+            } else {
+                sp = top_idx;
+            }
+        }
+        self.in_erased_norm = false;
+        self.envs.truncate(env_mark);
+        (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
+        res
     }
 
     /// The `k`-th child of `s` FOR AN ERASED COMPARISON: its type, and `s`'s slots kept only
@@ -1358,7 +1528,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     }
 
     /// Every component of `s` outlives `region`.
-    fn alias_side_eq(&self, a: Side<'c>, b: Side<'c>) -> bool {
+    fn alias_side_eq(&mut self, a: Side<'c>, b: Side<'c>) -> bool {
         let Some(n) = a.slots.len() else { return false };
         b.slots.len() == Some(n)
             && self.erased_sides(a, b)
@@ -3029,9 +3199,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     }
 
     /// Collect up to 8 ancestor `Self` subjects of a nested `PNode::Alias` (e.g. for
-    /// `<<N as FullNodeTypes>::Provider as BlockReader>::Header`, returns `[N::Provider, N]`)
-    /// so caller clauses on `N: FullNodeComponents` can elaborate associated-type bounds.
-    fn alias_self_chain(&self, subject: Side<'c>) -> ([Option<Side<'c>>; 8], usize) {
+    /// `<<NodeAdapter<N, C> as FullNodeTypes>::Provider as DatabaseProviderFactory>::Provider`,
+    /// normalizes inner forwarding aliases so the chain reaches `<N as FullNodeTypes>::Provider`
+    /// and `N`, letting caller/assoc clauses elaborate bounds on the outer rigid alias).
+    fn alias_self_chain(&mut self, subject: Side<'c>) -> ([Option<Side<'c>>; 8], usize) {
         let mut out = [None; 8];
         let mut len = 0usize;
         let mut cur = subject;
@@ -3049,7 +3220,20 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 *slot = Some(inner);
                 len += 1;
             }
-            cur = inner;
+            let (norm, did) = if !self.in_erased_norm && matches!(self.node(inner), Ok(PNode::Alias { .. })) && self.fits(inner).is_ok() {
+                self.try_normalize_subject_flag(inner, 0)
+            } else {
+                (inner, false)
+            };
+            if did {
+                if let Some(slot) = out.get_mut(len) {
+                    *slot = Some(norm);
+                    len += 1;
+                }
+                cur = norm;
+            } else {
+                cur = inner;
+            }
         }
         (out, len)
     }
@@ -3816,6 +4000,7 @@ fn walker<'w, 'c, 'k: 'c, A: Allocator + Copy>(cx: &'w mut Cx<'k, '_>, envs: &'w
         hr_len: 0,
         binder_v: BinderCtx::None,
         nested: 0,
+        in_erased_norm: false,
         walk_stack: [None; WALK_STACK_CAP],
         walk_sp: 0,
         comp_stack: [None; COMP_STACK_CAP],
