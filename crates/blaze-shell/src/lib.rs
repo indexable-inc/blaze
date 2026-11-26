@@ -1373,4 +1373,55 @@ mod tests {
         eprintln!("live resize reflow (README.md x 80 widths): {per_frame_ms:.3} ms/frame (last_h={last_h:.0})");
         assert!(per_frame_ms < 5.0, "live resize reflow too slow: {per_frame_ms:.2} ms/frame");
     }
+
+    #[test]
+    fn git_subfolder_completion_and_ls_git_status_badges() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cwd = root.to_string_lossy().into_owned();
+        if crate::prompt::read_git_head(&cwd).is_none() {
+            return;
+        }
+
+        // 1. `ls` git status classification on the repo root:
+        //    `Cargo.toml` & `crates` are tracked (or modified), `target` is gitignored.
+        let entries = vec![
+            ("Cargo.toml".to_owned(), false),
+            ("crates".to_owned(), true),
+            ("target".to_owned(), true),
+            (".git".to_owned(), true),
+        ];
+        let statuses = crate::prompt::git_ls_entry_statuses(&root, &entries, None)
+            .expect("expected git statuses inside repo");
+        assert_eq!(statuses.len(), 4);
+        assert_ne!(statuses[0], crate::prompt::GitFileStatus::Ignored);
+        assert_ne!(statuses[0], crate::prompt::GitFileStatus::Untracked);
+        assert_ne!(statuses[1], crate::prompt::GitFileStatus::Ignored);
+        assert_eq!(statuses[2], crate::prompt::GitFileStatus::Ignored, "target/ must be Ignored");
+        assert_eq!(statuses[3], crate::prompt::GitFileStatus::Ignored, ".git must be Ignored");
+
+        // 2. Recursive git subfolder completion: `vim .r` inside `crates/blaze-shell` should surface
+        //    nested `.rs` files like `src/main.rs`, ranked strictly below any direct cwd match.
+        let shell_dir = root.join("crates/blaze-shell");
+        let shell_cwd = shell_dir.to_string_lossy().into_owned();
+        let alloc = Alloc::global();
+        let state = EngineState::new(&shell_cwd, &[], alloc);
+        let mut ed = Editor::new();
+        ed.set_text("vim .r".to_owned());
+        ed.refresh_assist(&state, &[], true);
+        let labels: Vec<&str> = ed.completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.starts_with("src/") && l.ends_with(".rs")),
+            "expected git subfolder `.rs` completion for `vim .r`, got {labels:?}"
+        );
+        // Any direct cwd match (without `/`) must appear before subfolder matches (with `/`).
+        if let (Some(last_direct), Some(first_sub)) = (
+            labels.iter().rposition(|l| !l.contains('/')),
+            labels.iter().position(|l| l.contains('/')),
+        ) {
+            assert!(
+                last_direct < first_sub,
+                "direct cwd matches should outrank subfolder matches: {labels:?}"
+            );
+        }
+    }
 }

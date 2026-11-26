@@ -878,3 +878,324 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
         _ => None,
     }
 }
+
+/// Per-entry Git tracking / dirty status for `ls` grids and tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitFileStatus {
+    Tracked,
+    Modified,
+    Staged,
+    Untracked,
+    Deleted,
+    Conflicted,
+    Ignored,
+}
+
+impl GitFileStatus {
+    /// Short single-char status tag (`None` for clean tracked/ignored entries).
+    pub const fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Conflicted => Some("!"),
+            Self::Modified => Some("M"),
+            Self::Staged => Some("+"),
+            Self::Deleted => Some("D"),
+            Self::Untracked => Some("?"),
+            Self::Tracked | Self::Ignored => None,
+        }
+    }
+
+    const fn severity(self) -> u8 {
+        match self {
+            Self::Conflicted => 5,
+            Self::Modified => 4,
+            Self::Staged => 3,
+            Self::Deleted => 2,
+            Self::Untracked => 1,
+            Self::Tracked | Self::Ignored => 0,
+        }
+    }
+
+    fn from_tag(tag: &str) -> Self {
+        match tag {
+            "!" => Self::Conflicted,
+            "M" => Self::Modified,
+            "+" => Self::Staged,
+            "D" => Self::Deleted,
+            "?" => Self::Untracked,
+            _ => Self::Tracked,
+        }
+    }
+}
+
+struct CachedIndexPaths {
+    mtime_ns: u128,
+    len: u64,
+    /// Lexicographically sorted worktree-relative tracked file paths from `.git/index`.
+    paths: Arc<Vec<String>>,
+}
+
+fn load_cached_index_paths(git_dir: &Path) -> Option<Arc<Vec<String>>> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    use std::time::UNIX_EPOCH;
+
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedIndexPaths>>> = OnceLock::new();
+
+    let index_path = git_dir.join("index");
+    let meta = fs::metadata(&index_path).ok()?;
+    let len = meta.len();
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = map.lock()
+        && let Some(hit) = guard.get(git_dir)
+        && hit.mtime_ns == mtime_ns
+        && hit.len == len
+    {
+        return Some(Arc::clone(&hit.paths));
+    }
+
+    let bytes = fs::read(&index_path).ok()?;
+    let parsed = blaze_git::index::parse_index(&bytes, blaze_git::Limits::SHIPPED, Alloc::global(), NoPlant).ok()?;
+    let mut paths = Vec::with_capacity(parsed.entries.len());
+    for entry in parsed.entries.iter() {
+        if let Some(p) = parsed.path_str(entry) {
+            paths.push(p.to_owned());
+        }
+    }
+    let arc = Arc::new(paths);
+    if let Ok(mut guard) = map.lock() {
+        if guard.len() > 16 {
+            guard.clear();
+        }
+        guard.insert(git_dir.to_path_buf(), CachedIndexPaths { mtime_ns, len, paths: Arc::clone(&arc) });
+    }
+    Some(arc)
+}
+
+fn repo_relative_dir(work_tree: &Path, dir: &Path) -> Option<String> {
+    let rel = dir.strip_prefix(work_tree).ok().or_else(|| {
+        let cw = fs::canonicalize(work_tree).ok()?;
+        let cd = fs::canonicalize(dir).ok()?;
+        cd.strip_prefix(&cw).ok().map(Path::to_path_buf).and_then(|_| None)
+    });
+    if let Some(r) = rel {
+        let s = r.to_string_lossy().replace('\\', "/");
+        return Some(s.trim_matches('/').to_owned());
+    }
+    let cw = fs::canonicalize(work_tree).ok()?;
+    let cd = fs::canonicalize(dir).ok()?;
+    let r = cd.strip_prefix(&cw).ok()?;
+    let s = r.to_string_lossy().replace('\\', "/");
+    Some(s.trim_matches('/').to_owned())
+}
+
+fn paths_dir_range(paths: &[String], dir: &str) -> std::ops::Range<usize> {
+    if dir.is_empty() {
+        return 0..paths.len();
+    }
+    let db = dir.as_bytes();
+    let start = paths.partition_point(|p| {
+        let pb = p.as_bytes();
+        let n = pb.len().min(db.len());
+        match pb[..n].cmp(&db[..n]) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal if pb.len() <= db.len() => true,
+            std::cmp::Ordering::Equal => pb[db.len()] < b'/',
+        }
+    });
+    let end = start
+        + paths[start..].partition_point(|p| {
+            let pb = p.as_bytes();
+            pb.len() > db.len() && pb.starts_with(db) && pb[db.len()] == b'/'
+        });
+    start..end
+}
+
+/// Return git-tracked subfolder paths strictly beneath `search_dir` (e.g. `src/main.rs`) for
+/// lower-priority recursive fuzzy file completion inside git repositories (zero subprocesses!).
+pub fn git_tracked_subpaths(search_dir: &Path, dirs_only: bool, max_results: usize) -> Option<Vec<String>> {
+    let dir_str = search_dir.to_str()?;
+    let head = read_git_head(dir_str)?;
+    let paths = load_cached_index_paths(&head.git_dir)?;
+    let rel_dir = repo_relative_dir(&head.work_tree, search_dir)?;
+    let range = paths_dir_range(&paths, &rel_dir);
+    let strip_len = if rel_dir.is_empty() { 0 } else { rel_dir.len() + 1 };
+
+    let mut out = Vec::new();
+    if dirs_only {
+        let mut seen = std::collections::HashSet::new();
+        for p in &paths[range] {
+            let rel = &p[strip_len..];
+            // Collect nested directories (`a/b/`, `a/b/c/`), skipping top-level dirs already from read_dir.
+            let mut search = 0usize;
+            while let Some(slash) = rel[search..].find('/') {
+                let end = search + slash;
+                let sub = &rel[..end];
+                if sub.contains('/') && seen.insert(sub.to_owned()) {
+                    out.push(format!("{sub}/"));
+                    if out.len() >= max_results {
+                        return Some(out);
+                    }
+                }
+                search = end + 1;
+            }
+        }
+    } else {
+        for p in &paths[range] {
+            let rel = &p[strip_len..];
+            if rel.contains('/') {
+                out.push(rel.to_owned());
+                if out.len() >= max_results {
+                    break;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Classify every `ls` entry `(name, is_dir)` inside `dir` against the enclosing git repository's
+/// `.git/index`, `.gitignore` stack, and working-tree status (zero subprocesses, cached).
+/// Returns `None` when `dir` is not inside a git repository.
+pub fn git_ls_entry_statuses(
+    dir: &Path,
+    entries: &[(String, bool)],
+    hint: Option<&GitStatusSummary>,
+) -> Option<Vec<GitFileStatus>> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    let dir_str = dir.to_str()?;
+    let head = read_git_head(dir_str)?;
+    let rel_dir = repo_relative_dir(&head.work_tree, dir)?;
+    let index_paths = load_cached_index_paths(&head.git_dir);
+
+    // Use the block's captured GitStatusSummary when available; otherwise cache a quick query
+    // for 750ms per worktree so 60-120fps layout frames never re-scan disk.
+    let owned_summary: Option<GitStatusSummary> = if hint.is_some() {
+        None
+    } else {
+        static STATUS_CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, Option<GitStatusSummary>)>>> =
+            OnceLock::new();
+        let cache = STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let cached = cache.lock().ok().and_then(|g| {
+            g.get(&head.work_tree)
+                .filter(|(t, _)| t.elapsed() < Duration::from_millis(750))
+                .map(|(_, s)| s.clone())
+        });
+        if let Some(hit) = cached {
+            hit
+        } else {
+            let fresh = query_blaze_git_status(dir_str);
+            if let Ok(mut g) = cache.lock() {
+                if g.len() > 16 {
+                    g.clear();
+                }
+                g.insert(head.work_tree.clone(), (Instant::now(), fresh.clone()));
+            }
+            fresh
+        }
+    };
+    let status_ref = hint.or(owned_summary.as_ref());
+
+    // Build IgnoreStack from global ignore, `.git/info/exclude`, and `.gitignore` chain down to `dir`.
+    let alloc = Alloc::global();
+    let mut ignore = blaze_git::ignore::IgnoreStack::new(blaze_git::Limits::SHIPPED, alloc);
+    if let Ok(home) = std::env::var("HOME")
+        && let Ok(bytes) = fs::read(Path::new(&home).join(".config/git/ignore"))
+    {
+        ignore.set_global_exclude(&bytes, NoPlant);
+    }
+    if let Ok(bytes) = fs::read(head.common_dir.join("info/exclude")) {
+        ignore.set_info_exclude(&bytes, NoPlant);
+    }
+    if let Ok(bytes) = fs::read(head.work_tree.join(".gitignore")) {
+        ignore.add_folder_gitignore("", &bytes, NoPlant);
+    }
+    if !rel_dir.is_empty() {
+        let mut accum = String::new();
+        for part in rel_dir.split('/') {
+            if !accum.is_empty() {
+                accum.push('/');
+            }
+            accum.push_str(part);
+            if let Ok(bytes) = fs::read(head.work_tree.join(&accum).join(".gitignore")) {
+                ignore.add_folder_gitignore(&accum, &bytes, NoPlant);
+            }
+        }
+    }
+
+    let changed = status_ref.map(|s| s.changed_files.as_slice()).unwrap_or(&[]);
+    let mut out = Vec::with_capacity(entries.len());
+
+    for (raw_name, is_dir) in entries {
+        let name = raw_name.trim_end_matches('/');
+        if name == ".git" {
+            out.push(GitFileStatus::Ignored);
+            continue;
+        }
+        let repo_rel = if rel_dir.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{rel_dir}/{name}")
+        };
+
+        // 1. Check dirty/staged/untracked working-tree changes (bubbling up onto parent dirs).
+        let mut best_dirty: Option<GitFileStatus> = None;
+        if *is_dir {
+            let prefix = format!("{repo_rel}/");
+            for (p, _, tag) in changed {
+                if p == &repo_rel || p.starts_with(&prefix) {
+                    let st = GitFileStatus::from_tag(tag);
+                    if best_dirty.is_none_or(|cur| st.severity() > cur.severity()) {
+                        best_dirty = Some(st);
+                    }
+                }
+            }
+        } else {
+            for (p, _, tag) in changed {
+                if p == &repo_rel {
+                    let st = GitFileStatus::from_tag(tag);
+                    if best_dirty.is_none_or(|cur| st.severity() > cur.severity()) {
+                        best_dirty = Some(st);
+                    }
+                }
+            }
+        }
+        if let Some(st) = best_dirty {
+            out.push(st);
+            continue;
+        }
+
+        // 2. Check `.git/index` tracked membership (`O(log N)` binary search).
+        let tracked = if let Some(ref paths) = index_paths {
+            if *is_dir {
+                !paths_dir_range(paths, &repo_rel).is_empty()
+            } else {
+                paths.binary_search(&repo_rel).is_ok()
+            }
+        } else {
+            false
+        };
+        if tracked {
+            out.push(GitFileStatus::Tracked);
+            continue;
+        }
+
+        // 3. Not tracked in `.git/index`: distinguish `.gitignore`d artifacts (`target/`) vs untracked.
+        if ignore.is_ignored(&repo_rel, *is_dir) {
+            out.push(GitFileStatus::Ignored);
+        } else {
+            out.push(GitFileStatus::Untracked);
+        }
+    }
+
+    Some(out)
+}
