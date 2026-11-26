@@ -4740,6 +4740,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
                         self.end_temp_val(v);
+                        self.name_temp_at(at, a);
                         V::Place(at.0, at.1)
                     }
                 };
