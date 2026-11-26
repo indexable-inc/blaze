@@ -523,6 +523,7 @@ blaze-arrow-ipc = { path = "crates/blaze-arrow-ipc" }
 # `TextSize` and `TextRange`, in place of text-size.
 blaze-text-size = { path = "crates/blaze-text-size" }
 blaze-cbor = { path = "crates/blaze-cbor" } # Deterministic CBOR (RFC 8949 4.2.1): the one home; blaze-pack and blaze-watch take it from here.
+blaze-ctx = { path = "crates/blaze-ctx" } # Hierarchical 3-level repo context engine and hybrid search emitting compact blaze-tab over BLAKE3/CBOR.
 # Compile-time code on blaze's own execution path (D175): grants, the protocol's two machines, the equality harness.
 blaze-comptime = { path = "crates/blaze-comptime" }
 # The C-name table a compile-time child's code is bound to, and its system layer (D175).
