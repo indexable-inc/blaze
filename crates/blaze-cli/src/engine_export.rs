@@ -63,11 +63,12 @@ const EXPORT_PAR_MIN_MISSES: usize = 4;
 /// Per-worker frame reset/trim budgets during parallel export codegen. After the first make sets
 /// the baseline (crate `Names` + `Maker` init), each worker gets at least `HEADROOM` bytes before
 /// resetting so large workspaces (200+ crates) never thrash `Maker::construct`.
-const EXPORT_WORKER_FRAME_HEADROOM: usize = 1 << 30;
-const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 4 << 30;
+const EXPORT_WORKER_FRAME_HEADROOM: usize = 3 << 30;
+const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 6 << 30;
 const EXPORT_WORKER_FRAME_KEEP: usize = 16 << 20;
 const EXPORT_WORKER_SCRATCH: usize = 1 << 20;
 const EXPORT_PER_WORKER_IN_FLIGHT: usize = 6;
+const EXPORT_MAX_QUEUED_PER_WORKER: usize = 64;
 const EXPORT_HAND_WAIT: core::time::Duration = core::time::Duration::from_secs(30);
 const EXPORT_PROCS_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 const EXPORT_RECV_SLICE: core::time::Duration = core::time::Duration::from_millis(10);
@@ -1172,12 +1173,20 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     }
 
     let active_workers = tasks.len();
-    let max_in_flight = (active_workers * EXPORT_PER_WORKER_IN_FLIGHT).max(1);
+    let max_queued = (active_workers * EXPORT_MAX_QUEUED_PER_WORKER).max(1);
     let mut par_outcomes: AVec<'a, Option<RowOutcome<'a>>> = Vec::new_in(alloc);
     let mut pending_rows: AVec<'a, Option<blaze_ladder::body_ids::Pending>> = Vec::new_in(alloc);
     let mut worker_in_flight: AVec<'a, usize> = Vec::with_capacity_in(active_workers, alloc);
     worker_in_flight.resize(active_workers, 0);
+    // Strict per-worker backlog stacks keyed by `tabled` home affinity: never spill a `tabled`
+    // body to a different worker, which would re-lower and re-typecheck giant functions
+    // (`constructor_simplify`, `BodiesStage::groups`, `checking`, etc.) up to 12x across workers.
+    let mut worker_queues: AVec<'a, AVec<'a, ExportJob>> = Vec::with_capacity_in(active_workers, alloc);
+    for _ in 0..active_workers {
+        worker_queues.push(Vec::new_in(alloc));
+    }
     let mut in_flight = 0usize;
+    let mut queued = 0usize;
 
     let serve_procs = |procs_asked: &bstd::sync::chan::OwnedChan<usize, SharedAlloc<'static>>,
                        procs_answers: &[bstd::sync::chan::OwnedChan<ExportProcsAnswer, SharedAlloc<'static>>]| {
@@ -1238,7 +1247,37 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
             return Ok(());
         }
 
-        while *next_row < walk.len() || in_flight > 0 {
+        let flush_worker_queue = |worker: usize,
+                                  worker_queues: &mut [AVec<'a, ExportJob>],
+                                  worker_in_flight: &mut [usize],
+                                  in_flight: &mut usize,
+                                  queued: &mut usize,
+                                  inboxes: &[bstd::sync::chan::OwnedChan<ExportJob, SharedAlloc<'static>>]|
+         -> Result<(), CliError> {
+            while worker_in_flight[worker] < EXPORT_PER_WORKER_IN_FLIGHT {
+                // Pop LIFO within the same home worker so sibling closures of the same `tabled`
+                // body execute back-to-back while hot in `MakerState`.
+                let Some(job) = worker_queues[worker].pop() else { break };
+                *queued -= 1;
+                let row = job.row;
+                let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
+                let sending = by.span("blaze build: dispatch queued export job");
+                if inboxes[worker].send(&sending, job).is_err() {
+                    return Err(box_err(
+                        ExportCliError::Walk {
+                            symbol: [0; 32],
+                            shown: owned_fmt(format_args!("export worker {worker} inbox closed while dispatching queued row {row}"), frame, heap.alloc()),
+                        },
+                        heap,
+                    ));
+                }
+                worker_in_flight[worker] += 1;
+                *in_flight += 1;
+            }
+            Ok(())
+        };
+
+        while *next_row < walk.len() || in_flight > 0 || queued > 0 {
             serve_procs(&procs_asked, procs_answers.as_slice());
 
             // Drain any completed worker jobs immediately so `walk.finish` records them in
@@ -1248,6 +1287,14 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                 if let Some(slot) = worker_in_flight.get_mut(done.worker) {
                     *slot = slot.saturating_sub(1);
                 }
+                flush_worker_queue(
+                    done.worker,
+                    &mut worker_queues,
+                    &mut worker_in_flight,
+                    &mut in_flight,
+                    &mut queued,
+                    &inboxes,
+                )?;
                 let row = done.row;
                 let rel = row - start_row;
                 let pend = pending_rows[rel].take().ok_or_else(|| {
@@ -1303,8 +1350,11 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                 }
             }
 
-            // Dispatch waiting rows until either the frontier is drained or workers are saturated.
-            while *next_row < walk.len() && in_flight < max_in_flight {
+            // Dispatch waiting rows until the frontier is drained or worker backlogs are full.
+            // Never spill a `tabled` body across workers: strict home affinity guarantees each
+            // body (`constructor_lower`, `constructor_simplify`, `checking`, etc.) is lowered and
+            // checked on at most one worker instead of up to 12x.
+            while *next_row < walk.len() && queued < max_queued {
                 let row = *next_row;
                 *next_row += 1;
                 let need_len = walk.len() - start_row;
@@ -1346,32 +1396,25 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                         let mut name = Vec::with_capacity_in(name_slice.len(), shared);
                         name.extend_from_slice(name_slice);
                         let job = ExportJob { row, order: pend.order(), proof, name, enclosers };
-                        // Route by `ItemKey` home affinity so repeated monomorphizations of the
-                        // same generic body (`Vec::push`, `Iterator::next`, etc.) reuse one
-                        // worker's warm `MakerState` instead of re-checking on all workers;
-                        // spill to the least-loaded worker only when the home worker is full.
-                        let home = (tabled.0 as usize) % active_workers;
-                        let target_worker = if worker_in_flight[home] < EXPORT_PER_WORKER_IN_FLIGHT {
-                            home
+                        let mixed = (tabled.0 as u64) ^ ((tabled.0 >> 64) as u64);
+                        let home = (mixed as usize) % active_workers;
+                        if worker_in_flight[home] < EXPORT_PER_WORKER_IN_FLIGHT {
+                            let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
+                            let sending = by.span("blaze build: dispatch export job");
+                            if inboxes[home].send(&sending, job).is_err() {
+                                let _ = walk.abandon::<RunError>(pend);
+                                return Err(box_err(
+                                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("export worker job channel closed or timed out"), frame, heap.alloc()) },
+                                    heap,
+                                ));
+                            }
+                            worker_in_flight[home] += 1;
+                            in_flight += 1;
                         } else {
-                            worker_in_flight
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|&(_, &load)| load)
-                                .map_or(home, |(idx, _)| idx)
-                        };
-                        let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
-                        let sending = by.span("blaze build: dispatch export job");
-                        if inboxes[target_worker].send(&sending, job).is_err() {
-                            let _ = walk.abandon::<RunError>(pend);
-                            return Err(box_err(
-                                ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("export worker job channel closed or timed out"), frame, heap.alloc()) },
-                                heap,
-                            ));
+                            worker_queues[home].push(job);
+                            queued += 1;
                         }
                         pending_rows[rel] = Some(pend);
-                        worker_in_flight[target_worker] += 1;
-                        in_flight += 1;
                     }
                     Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
                         let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {why}");
@@ -1390,7 +1433,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
 
             // If workers are busy and we cannot dispatch more right now, wait briefly on `done_ch`
             // (bounded slice so `procs_asked` is always serviced without deadlock).
-            if in_flight > 0 && (*next_row >= walk.len() || in_flight >= max_in_flight) {
+            if in_flight > 0 && (*next_row >= walk.len() || queued >= max_queued) {
                 if cx.check().is_err() {
                     return Err(box_err(
                         ExportCliError::Walk { symbol: [0; 32], shown: owned_fmt(format_args!("export cancelled while waiting for code workers"), frame, heap.alloc()) },
@@ -1404,6 +1447,14 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                         if let Some(slot) = worker_in_flight.get_mut(done.worker) {
                             *slot = slot.saturating_sub(1);
                         }
+                        flush_worker_queue(
+                            done.worker,
+                            &mut worker_queues,
+                            &mut worker_in_flight,
+                            &mut in_flight,
+                            &mut queued,
+                            &inboxes,
+                        )?;
                         let row = done.row;
                         let rel = row - start_row;
                         let pend = pending_rows[rel].take().ok_or_else(|| {
