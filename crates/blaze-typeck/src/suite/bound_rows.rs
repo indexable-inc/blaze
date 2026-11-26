@@ -215,3 +215,94 @@ fn a_callers_ground_clause_on_other_types_leaves_the_impl_selected() {
     assert_eq!(diags, 0);
     assert!(matches!(rows[0].2, Selected::Impl { imp, .. } if imp == w.marker_ref), "CONTROL: no clause: {rows:?}");
 }
+
+/// Projection normalization at writeback must elaborate associated-type item bounds and their
+/// supertraits (`Node: FullNodeTypes<Types = TempoNode>` -> `Node::Provider: FullProvider<Adapter<Node::Types>>`
+/// -> `<Node::Provider as ChainSpecProvider>::ChainSpec = <Adapter<TempoNode> as NodeTypes>::ChainSpec`
+/// -> `<TempoNode as NodeTypes>::ChainSpec` -> `TempoChainSpec`), filing the intermediate
+/// `NodeTypes::ChainSpec` impl rows and the normalized `TempoHardforks` impl row at the call.
+#[test]
+fn alias_bound_supertrait_projection_normalizes_and_selects_intermediate_impls() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let unit = fx.unit();
+
+    let node_types = fx.tr("NodeTypes", 1, Vec::new(), &["ChainSpec"]);
+    let cs_provider = fx.tr("ChainSpecProvider", 1, Vec::new(), &["ChainSpec"]);
+    let full_provider = fx.tr("FullProvider", 2, Vec::new(), &[]);
+    let p1_cs = fx.alias(node_types, "ChainSpec", &[p1]);
+    let fp_sup_tr = fx.bound(cs_provider, &[p0]);
+    let fp_sup_proj = fx.proj(cs_provider, &[p0], "ChainSpec", p1_cs);
+    fx.set_supers(full_provider, std::vec![fp_sup_tr, fp_sup_proj]);
+
+    let adapter = fx.strukt("Adapter", 1, &[]);
+    let adapter_p0 = fx.adt(adapter, &[p0]);
+    let p0_nt = fx.bound(node_types, &[p0]);
+    let p0_cs = fx.alias(node_types, "ChainSpec", &[p0]);
+    let impl_nt_adapter = fx.imp(
+        "impl<T: NodeTypes> NodeTypes for Adapter<T>",
+        1,
+        adapter_p0,
+        Some((node_types, &[])),
+        &[("ChainSpec", p0_cs)],
+        std::vec![p0_nt],
+    );
+
+    let full_node_types = fx.tr("FullNodeTypes", 1, Vec::new(), &["Types", "Provider"]);
+    let fnt_types = fx.alias(full_node_types, "Types", &[p0]);
+    let fnt_provider = fx.alias(full_node_types, "Provider", &[p0]);
+    let fnt_types_nt = fx.bound(node_types, &[fnt_types]);
+    let fnt_types_sized = fx.bound(sized, &[fnt_types]);
+    fx.set_assoc_bounds(full_node_types, "Types", std::vec![fnt_types_nt, fnt_types_sized]);
+    let adapter_types = fx.adt(adapter, &[fnt_types]);
+    let fnt_prov_fp = fx.bound(full_provider, &[fnt_provider, adapter_types]);
+    let fnt_prov_sized = fx.bound(sized, &[fnt_provider]);
+    fx.set_assoc_bounds(full_node_types, "Provider", std::vec![fnt_prov_fp, fnt_prov_sized]);
+
+    let tempo_node = fx.strukt("TempoNode", 0, &[]);
+    let tempo_node_t = fx.adt(tempo_node, &[]);
+    let tempo_cs = fx.strukt("TempoChainSpec", 0, &[]);
+    let tempo_cs_t = fx.adt(tempo_cs, &[]);
+    let impl_nt_tempo = fx.imp(
+        "impl NodeTypes for TempoNode",
+        0,
+        tempo_node_t,
+        Some((node_types, &[])),
+        &[("ChainSpec", tempo_cs_t)],
+        Vec::new(),
+    );
+
+    let hf = fx.tr("TempoHardforks", 1, Vec::new(), &[]);
+    let impl_hf_tempo = fx.imp("impl TempoHardforks for TempoChainSpec", 0, tempo_cs_t, Some((hf, &[])), &[], Vec::new());
+
+    let p0_csp = fx.bound(cs_provider, &[p0]);
+    let p0_csp_cs = fx.alias(cs_provider, "ChainSpec", &[p0]);
+    let p0_csp_cs_hf = fx.bound(hf, &[p0_csp_cs]);
+    fx.func("need_hf", 1, &[p0], unit, std::vec![p0_csp, p0_csp_cs_hf]);
+
+    let node_fnt = fx.bound(full_node_types, &[p0]);
+    let node_types_eq = fx.proj(full_node_types, &[p0], "Types", tempo_node_t);
+    let components = fx.func("components", 1, &[fnt_provider], unit, std::vec![node_fnt, node_types_eq]);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let p_param = b.param("p");
+    let f = b.path(&["need_hf"]);
+    let arg = b.local(p_param);
+    let call = b.call(f, &[arg]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, components, root, Plant::None, InferPlant::None);
+    assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+
+    let rows = c.call_selections(call);
+    let has_impl = |tr: ItemKey, is_proj: bool, want_imp: ItemKey| -> bool {
+        rows.iter().any(|r| {
+            r.trait_ == tr && r.name.is_some() == is_proj && matches!(r.selected, Selected::Impl { imp, .. } if imp == want_imp)
+        })
+    };
+    assert!(has_impl(node_types, true, impl_nt_adapter), "missing Adapter NodeTypes impl row: {rows:?}");
+    assert!(has_impl(node_types, true, impl_nt_tempo), "missing TempoNode NodeTypes impl row: {rows:?}");
+    assert!(has_impl(hf, false, impl_hf_tempo), "missing normalized TempoHardforks impl row: {rows:?}");
+}

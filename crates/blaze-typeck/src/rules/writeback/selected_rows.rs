@@ -202,41 +202,64 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // or `<Self::ReturnTuple<'_> as SolType>::abi_decode_sequence`) and file the normalized
         // selection row alongside the original.
         for i in 0..initial_len {
-            let Some(&Projected { expr: e, trait_, name: cname, args: rargs, .. }) = out.get(i) else { continue };
-            if !holds_alias(ex.out.view(), rargs, alloc)? {
+            let Some(&Projected { expr: e, trait_, name: cname, args: rargs, selected: rsel, .. }) = out.get(i) else { continue };
+            let has_alias = holds_alias(ex.out.view(), rargs, alloc)?;
+            let is_non_impl_proj = cname.is_some() && !matches!(rsel, Selected::Impl { .. });
+            if !has_alias && !is_non_impl_proj {
                 continue;
             }
             iargs.clear();
             iargs.extend_from_slice(ex.out.view().list(rargs)?);
             ps.clear();
             let mut changed = false;
-            for &t in &iargs {
-                let norm = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, 0, t, 0)?;
+            if has_alias {
+                for &t in &iargs {
+                    let norm = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, 0, t, 0)?;
+                    if self.reads.stopped() {
+                        return Ok(());
+                    }
+                    if norm != t {
+                        changed = true;
+                    }
+                    ps.push(norm);
+                }
+            } else {
+                ps.extend_from_slice(&iargs);
+            }
+            let mut final_sel = rsel;
+            if changed {
+                let list = ex.out.intern_list(&ps)?;
+                if seen.insert((e, trait_, cname, list), ()).is_none() {
+                    if out.len() >= MOST_PROJECTED {
+                        return Err(CheckError::Limit(Limit::Solver));
+                    }
+                    let selected = self.select_row(ex, rows, inert, &ps, (trait_, list, cname), e)?;
+                    if self.reads.stopped() {
+                        return Ok(());
+                    }
+                    out.push(Projected { expr: e, at: 0, trait_, name: cname, args: list, global_env: rows.env.global, selected });
+                    if matches!(selected, Selected::Impl { .. }) {
+                        nest.push((out.len() - 1, 0));
+                    }
+                    final_sel = selected;
+                }
+            }
+            // If a projection row was not selected via an impl (e.g. `<Node::Provider as
+            // ChainSpecProvider>::ChainSpec`), elaborate any projection equality from the caller's
+            // environment / assoc-type bounds / supertraits and normalize its RHS so downstream
+            // impl projection rows (e.g. `NodeTypes` for `NodeTypesWithDBAdapter` & `TempoNode`)
+            // are filed at `e` for `blaze-borrow`.
+            if let Some(an) = cname
+                && !matches!(final_sel, Selected::Impl { .. })
+                && let Some(rhs) = self.normalize_from_env_or_assoc(ex, inert, trait_, an, &ps)?
+            {
                 if self.reads.stopped() {
                     return Ok(());
                 }
-                if norm != t {
-                    changed = true;
+                let _ = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, 0, rhs, 0)?;
+                if self.reads.stopped() {
+                    return Ok(());
                 }
-                ps.push(norm);
-            }
-            if !changed {
-                continue;
-            }
-            let list = ex.out.intern_list(&ps)?;
-            if seen.insert((e, trait_, cname, list), ()).is_some() {
-                continue;
-            }
-            if out.len() >= MOST_PROJECTED {
-                return Err(CheckError::Limit(Limit::Solver));
-            }
-            let selected = self.select_row(ex, rows, inert, &ps, (trait_, list, cname), e)?;
-            if self.reads.stopped() {
-                return Ok(());
-            }
-            out.push(Projected { expr: e, at: 0, trait_, name: cname, args: list, global_env: rows.env.global, selected });
-            if matches!(selected, Selected::Impl { .. }) {
-                nest.push((out.len() - 1, 0));
             }
         }
         let mut next = 0usize;
@@ -409,7 +432,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut cur_depth = norm_depth;
         loop {
             // Descend into `cur_ty` at `cur_depth`.
-            let mut res = if cur_depth >= 8 {
+            let mut res = if cur_depth >= 16 {
                 cur_ty
             } else {
                 let node = ex.out.view().node(cur_ty)?;
@@ -502,36 +525,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         let Selected::Impl { imp, args: imp_args } = selected else {
-            // Also normalize through the caller's own `where`-clause projection equalities
-            // (e.g. `where N: FullNodeTypes<Types = TempoNode>` -> `N::Types` normalizes to
-            // `TempoNode`), so downstream impls on `N::Types` or `<N::Types as NodeTypes>::Primitives`
-            // are selected at writeback.
-            let own = match self.reads.predicates(self.body.owner) {
-                Ok(own) => own,
-                Err(Stop::Need(_)) => return Ok(None),
-                Err(Stop::Error(err)) => return Err(err),
-            };
-            for c in own.clauses {
-                if let PClause::Projection { trait_: pt, name: pn, args: pargs, term } = *c
-                    && pt == at
-                    && pn == an
-                    && let Ok(plist) = own.types.list(pargs)
-                    && plist.len() == aps.len()
-                {
-                    let mut all_eq = true;
-                    for (&pa, &aa) in plist.iter().zip(aps.iter()) {
-                        if !exact_equal(own.types, pa, ex.out.view(), aa, alloc)? {
-                            all_eq = false;
-                            break;
-                        }
-                    }
-                    if all_eq {
-                        let copied = copy_into(own.types, term, &mut ex.out, alloc)?;
-                        return Ok(Some(copied));
-                    }
-                }
-            }
-            return Ok(None);
+            // Also normalize through the caller's `where`-clauses, associated-type item bounds
+            // along the `Self` alias chain, and their transitive supertraits (e.g.
+            // `where Node: FullNodeTypes<Types = TempoNode>` -> `Node::Provider: FullProvider<
+            // NodeTypesWithDBAdapter<Node::Types, Node::DB>>` ->
+            // `<Node::Provider as ChainSpecProvider>::ChainSpec = <NodeTypesWithDBAdapter<..> as NodeTypes>::ChainSpec`),
+            // so downstream impls (`NodeTypes` for `NodeTypesWithDBAdapter`, `NodeTypes` for
+            // `TempoNode`, `TempoHardforks` for `TempoChainSpec`) are selected at writeback.
+            return self.normalize_from_env_or_assoc(ex, inert, at, an, &aps);
         };
         let hdr = match self.reads.impl_header(imp) {
             Ok(h) => h,
@@ -553,6 +554,153 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let sub = subst_into(h.types, val_ty, &ia, &mut ex.out, alloc)?;
         Ok(Some(sub))
+    }
+
+    /// Look up a projection equality `<aps[0] as at>::an = term` in the caller's `where`-clauses,
+    /// the associated-type item bounds of any `PNode::Alias` prefix of `aps[0]`, and their
+    /// transitive supertraits and trait predicates (bounded worklist, no recursion).
+    fn normalize_from_env_or_assoc(
+        &mut self,
+        ex: &mut Export<'a>,
+        inert: Inert,
+        at: ItemKey,
+        an: Name,
+        aps: &[PTy],
+    ) -> Result<Option<PTy>, CheckError> {
+        const MOST_PROJ_WORK: usize = 256;
+        let alloc = self.alloc;
+        let Some(&self_ty) = aps.first() else { return Ok(None) };
+
+        // Walk the `Self` alias chain of `aps[0]` (e.g. `[<Node as FullNodeTypes>::Provider, Node]`).
+        let mut chain: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+        let mut cur = self_ty;
+        for _ in 0..8usize {
+            if chain.scan_for(&cur).is_none() {
+                chain.push(cur);
+            }
+            match ex.out.view().node(cur)? {
+                PNode::Alias { args, .. } => {
+                    if let Some(&first) = ex.out.view().list(args)?.first() {
+                        cur = first;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let mut work: Vec<(ItemKey, List), Alloc<'a>> = Vec::new_in(alloc);
+        let mut visited: HashMap<(ItemKey, List), (), Alloc<'a>> = HashMap::new_in(alloc);
+        let mut scratch: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+
+        // Seed 1: caller's own `where`-clauses (no substitution).
+        let own = match self.reads.predicates(self.body.owner) {
+            Ok(own) => Some(own),
+            Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
+            Err(Stop::Need(_)) => None,
+            Err(Stop::Error(err)) => return Err(err),
+        };
+        if let Some(own) = own
+            && let Some(rhs) = scan_proj_clauses(
+                own.types, own.clauses, None, at, an, aps, &chain, inert,
+                &mut ex.out, &mut work, &mut visited, &mut scratch, MOST_PROJ_WORK, alloc,
+            )?
+        {
+            return Ok(Some(rhs));
+        }
+
+        // Seed 2: associated-type item bounds and trait predicates along `chain`.
+        let mut sub_args: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+        for &anc in &chain {
+            let PNode::Alias { trait_: sub_tr, name: sub_name, args: sub_list } = ex.out.view().node(anc)? else {
+                continue;
+            };
+            sub_args.clear();
+            sub_args.extend_from_slice(ex.out.view().list(sub_list)?);
+            let def = match self.reads.trait_def(sub_tr) {
+                Ok(def) => def,
+                Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
+                Err(Stop::Need(_)) => None,
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            if let Some(def) = def {
+                if let Some(rhs) = scan_proj_clauses(
+                    def.types, def.supertraits, Some(&sub_args), at, an, aps, &chain, inert,
+                    &mut ex.out, &mut work, &mut visited, &mut scratch, MOST_PROJ_WORK, alloc,
+                )? {
+                    return Ok(Some(rhs));
+                }
+                if let Some(assoc) = def.assoc_types.iter().find(|a| a.name == sub_name) {
+                    let assoc_wc = match self.reads.predicates(assoc.item) {
+                        Ok(wc) => Some(wc),
+                        Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
+                        Err(Stop::Need(_)) => None,
+                        Err(Stop::Error(err)) => return Err(err),
+                    };
+                    if let Some(wc) = assoc_wc
+                        && let Some(rhs) = scan_proj_clauses(
+                            wc.types, wc.clauses, Some(&sub_args), at, an, aps, &chain, inert,
+                            &mut ex.out, &mut work, &mut visited, &mut scratch, MOST_PROJ_WORK, alloc,
+                        )?
+                    {
+                        return Ok(Some(rhs));
+                    }
+                }
+            }
+            let tr_wc = match self.reads.predicates(sub_tr) {
+                Ok(wc) => Some(wc),
+                Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
+                Err(Stop::Need(_)) => None,
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            if let Some(wc) = tr_wc
+                && let Some(rhs) = scan_proj_clauses(
+                    wc.types, wc.clauses, Some(&sub_args), at, an, aps, &chain, inert,
+                    &mut ex.out, &mut work, &mut visited, &mut scratch, MOST_PROJ_WORK, alloc,
+                )?
+            {
+                return Ok(Some(rhs));
+            }
+        }
+
+        // Transitive supertrait & trait-predicate elaboration.
+        let mut next = 0usize;
+        let mut cur_args: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+        while let Some(&(cur_tr, cur_list)) = work.get(next) {
+            next += 1;
+            cur_args.clear();
+            cur_args.extend_from_slice(ex.out.view().list(cur_list)?);
+            let def = match self.reads.trait_def(cur_tr) {
+                Ok(def) => def,
+                Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
+                Err(Stop::Need(_)) => None,
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            if let Some(def) = def
+                && let Some(rhs) = scan_proj_clauses(
+                    def.types, def.supertraits, Some(&cur_args), at, an, aps, &chain, inert,
+                    &mut ex.out, &mut work, &mut visited, &mut scratch, MOST_PROJ_WORK, alloc,
+                )?
+            {
+                return Ok(Some(rhs));
+            }
+            let tr_wc = match self.reads.predicates(cur_tr) {
+                Ok(wc) => Some(wc),
+                Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
+                Err(Stop::Need(_)) => None,
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            if let Some(wc) = tr_wc
+                && let Some(rhs) = scan_proj_clauses(
+                    wc.types, wc.clauses, Some(&cur_args), at, an, aps, &chain, inert,
+                    &mut ex.out, &mut work, &mut visited, &mut scratch, MOST_PROJ_WORK, alloc,
+                )?
+            {
+                return Ok(Some(rhs));
+            }
+        }
+        Ok(None)
     }
 
     /// How the row `key` (`(trait, [Self, trait args..], name)`, its arguments `ps` in
@@ -1308,4 +1456,143 @@ fn copy_into(src: PTys<'_>, root: PTy, out: &mut PortableTys<'_>, alloc: Alloc<'
         mapped.insert(at, made);
     }
     mapped.get(&root).copied().ok_or(order(root, root))
+}
+
+/// Scan `clauses` (in `src`, optionally substituting `Param(i)` from `subst`) for either a
+/// projection equality matching `(at, an, aps)` (returning its instantiated RHS in `out`), or
+/// trait bounds whose `Self` argument belongs to `chain` (enqueueing them onto `work`).
+#[allow(clippy::too_many_arguments)]
+fn scan_proj_clauses<'a>(
+    src: PTys<'_>,
+    clauses: &[PClause],
+    subst: Option<&[PTy]>,
+    at: ItemKey,
+    an: Name,
+    aps: &[PTy],
+    chain: &[PTy],
+    inert: Inert,
+    out: &mut PortableTys<'a>,
+    work: &mut Vec<(ItemKey, List), Alloc<'a>>,
+    visited: &mut HashMap<(ItemKey, List), (), Alloc<'a>>,
+    scratch: &mut Vec<PTy, Alloc<'a>>,
+    limit: usize,
+    alloc: Alloc<'a>,
+) -> Result<Option<PTy>, CheckError> {
+    let sub_len = match subst {
+        Some(s) => match u32::try_from(s.len()) {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        },
+        None => 0,
+    };
+    for &clause in clauses {
+        match clause {
+            PClause::Projection { trait_: pt, name: pn, args: pargs, term } => {
+                let Ok(plist) = src.list(pargs) else { continue };
+                let Some(&p0) = plist.first() else { continue };
+                if let Some(sub_args) = subst {
+                    if !params_in_bounds(src, plist, sub_len, alloc)? {
+                        continue;
+                    }
+                    let c0 = subst_into(src, p0, sub_args, out, alloc)?;
+                    let want_proj = pt == at && pn == an && plist.len() == aps.len() && Some(&c0) == aps.first();
+                    let want_work = !inert.has(pt) && work.len() < limit && chain.contains(&c0);
+                    if !want_proj && !want_work {
+                        continue;
+                    }
+                    scratch.clear();
+                    scratch.push(c0);
+                    for &p in plist.iter().skip(1) {
+                        scratch.push(subst_into(src, p, sub_args, out, alloc)?);
+                    }
+                    if want_proj && scratch.as_slice() == aps && params_in_bounds(src, &[term], sub_len, alloc)? {
+                        return Ok(Some(subst_into(src, term, sub_args, out, alloc)?));
+                    }
+                    if want_work {
+                        let list = out.intern_list(scratch)?;
+                        if visited.insert((pt, list), ()).is_none() {
+                            work.push((pt, list));
+                        }
+                    }
+                } else {
+                    if pt == at && pn == an && plist.len() == aps.len() {
+                        let mut all_eq = true;
+                        for (&pa, &aa) in plist.iter().zip(aps.iter()) {
+                            if !exact_equal(src, pa, out.view(), aa, alloc)? {
+                                all_eq = false;
+                                break;
+                            }
+                        }
+                        if all_eq {
+                            return Ok(Some(copy_into(src, term, out, alloc)?));
+                        }
+                    }
+                    if !inert.has(pt) && work.len() < limit {
+                        let mut in_chain = false;
+                        for &ch in chain {
+                            if exact_equal(src, p0, out.view(), ch, alloc)? {
+                                in_chain = true;
+                                break;
+                            }
+                        }
+                        if in_chain {
+                            scratch.clear();
+                            for &p in plist {
+                                scratch.push(copy_into(src, p, out, alloc)?);
+                            }
+                            let list = out.intern_list(scratch)?;
+                            if visited.insert((pt, list), ()).is_none() {
+                                work.push((pt, list));
+                            }
+                        }
+                    }
+                }
+            }
+            PClause::Trait { trait_: ct, args: cargs } => {
+                if inert.has(ct) || work.len() >= limit {
+                    continue;
+                }
+                let Ok(clist) = src.list(cargs) else { continue };
+                let Some(&c0_raw) = clist.first() else { continue };
+                if let Some(sub_args) = subst {
+                    if !params_in_bounds(src, clist, sub_len, alloc)? {
+                        continue;
+                    }
+                    let c0 = subst_into(src, c0_raw, sub_args, out, alloc)?;
+                    if !chain.contains(&c0) {
+                        continue;
+                    }
+                    scratch.clear();
+                    scratch.push(c0);
+                    for &p in clist.iter().skip(1) {
+                        scratch.push(subst_into(src, p, sub_args, out, alloc)?);
+                    }
+                    let list = out.intern_list(scratch)?;
+                    if visited.insert((ct, list), ()).is_none() {
+                        work.push((ct, list));
+                    }
+                } else {
+                    let mut in_chain = false;
+                    for &ch in chain {
+                        if exact_equal(src, c0_raw, out.view(), ch, alloc)? {
+                            in_chain = true;
+                            break;
+                        }
+                    }
+                    if in_chain {
+                        scratch.clear();
+                        for &p in clist {
+                            scratch.push(copy_into(src, p, out, alloc)?);
+                        }
+                        let list = out.intern_list(scratch)?;
+                        if visited.insert((ct, list), ()).is_none() {
+                            work.push((ct, list));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
