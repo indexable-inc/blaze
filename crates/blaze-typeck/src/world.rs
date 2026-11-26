@@ -566,6 +566,11 @@ impl TypeAttrs {
     /// arguments and nothing else. Typing reads nothing of it; the body check's `args-inline`
     /// (rules/args_inline.rs) does. Bit 64.
     pub const ARGS: u32 = 64;
+    /// `#[rustc_deprecated_safe_2024]` on a fn (std's `env::set_var`/`remove_var`): the fn is
+    /// `unsafe`, but a call of it from a body whose edition is older than 2024 is allowed (the
+    /// `deprecated_safe_2024` lint is allow there), so the unsafety pass files nothing for it
+    /// (rules/unsafety.rs; library/std/src/env.rs `pub unsafe fn set_var`).
+    pub const DEPRECATED_SAFE_2024: u32 = 256;
     /// `#[repr(packed)]`, `#[repr(packed(N))]` or `#[repr(C, packed)]` on a struct or union: a
     /// field may be unaligned, so a closure or `async` block capturing a field BY REFERENCE
     /// captures the struct instead, whatever the field's alignment (capture_places.rs `borrow`;

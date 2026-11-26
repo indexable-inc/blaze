@@ -513,10 +513,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Some(t) => match self.view(t) {
                     TyView::Ref(_, inner) | TyView::Ptr(_, inner) => {
                         let inner = self.ty.shallow_resolve(inner);
-                        match self.view(inner) {
-                            TyView::Str | TyView::Slice(_) => Expectation::RvalueLikeUnsized(inner),
-                            _ => Expectation::HasType(inner),
-                        }
+                        // `rvalue_hint` (rules/mod.rs): an unsized expected pointee is only a
+                        // hint, never a hard type for the operand. So `&if c { p } else {
+                        // cwd.join(p) }` with expected `&Path` unifies the arms to `PathBuf` and
+                        // coerces the whole `&PathBuf` to `&Path`, instead of failing each arm
+                        // against `Path` (E0308); its `struct_tail` also catches an unsized-tail
+                        // ADT like `Path`, which the inline `Str | Slice` match missed. And a
+                        // closure borrowed as `&dyn Fn(..)` still reads its signature from the
+                        // hint (closure.rs `deduce_closure_signature`), which a flat `None`
+                        // would starve (omp-stats session.rs, pa-agent agent.rs).
+                        self.rvalue_hint(inner)?
                     }
                     _ => Expectation::None,
                 },
