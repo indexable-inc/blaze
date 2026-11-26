@@ -698,3 +698,59 @@ pub extern \"C\" fn main() -> i32 {
 ");
     assert_eq!(got, Ok(96));
 }
+
+/// Regression for `reth_rpc_eth_types::cache::EthStateCacheService::spawn_fetch`: a `Drop` local
+/// captured by value by `async move` blocks in multiple sibling `match` arms, where every use of
+/// the local inside each `async move` body only borrows it (`&self`), must receive a drop flag in
+/// `scan_env_moves` so sibling arms do not hit E0382 ("already moved") and drops run exactly once.
+#[test]
+fn match_arms_async_move_captures_borrowed_drop_local() {
+    let got = run("
+struct Provider {
+    val: u32,
+    drops: *mut u32,
+}
+impl Drop for Provider {
+    fn drop(&mut self) {
+        unsafe { *self.drops = *self.drops + 1; }
+    }
+}
+impl Provider {
+    fn get_block(&self, k: u32) -> u32 { self.val + k }
+    fn get_receipts(&self, k: u32) -> u32 { self.val + k * 2 }
+    fn get_bal(&self, k: u32) -> u32 { self.val + k * 3 }
+}
+
+enum Fetch {
+    Block(u32),
+    Receipts(u32),
+    Bal(u32),
+}
+
+fn spawn_fetch(fetch: Fetch, base: u32, drops: *mut u32) -> u32 {
+    let provider = Provider { val: base, drops };
+    match fetch {
+        Fetch::Block(k) => block_on(async move {
+            provider.get_block(k)
+        }),
+        Fetch::Receipts(k) => block_on(async move {
+            provider.get_receipts(k)
+        }),
+        Fetch::Bal(k) => block_on(async move {
+            provider.get_bal(k)
+        }),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut drops = 0u32;
+    let a = spawn_fetch(Fetch::Block(1), 10, &mut drops as *mut u32);
+    let b = spawn_fetch(Fetch::Receipts(2), 10, &mut drops as *mut u32);
+    let c = spawn_fetch(Fetch::Bal(3), 10, &mut drops as *mut u32);
+    if drops == 3 { (a + b + c) as i32 } else { -1 }
+}
+");
+    // 11 + 14 + 19 = 44, drops == 3 (each Provider dropped once inside its async block)
+    assert_eq!(got, Ok(44));
+}

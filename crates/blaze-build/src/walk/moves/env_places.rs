@@ -330,7 +330,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// a place below the binding, whose type needs drop) gets field flags (`partial`), the word
     /// `move_env_part` clears and its drops read, as `scan_part_moves` gives one to a binding a
     /// place expression moves a part of.
-    pub(in crate::walk) fn scan_env_moves(&mut self) -> Result<(), BuildError> {
+    /// Scans every closure and async block in the body for by-value captures:
+    /// - A whole-binding by-value capture (`move ||` / `async move`) moves `f.base` at `e` even
+    ///   when every use of `f.base` inside the inner body only borrows it (e.g. `provider.get()`).
+    ///   If `e` stands under a branch or loop relative to `f.base`'s declaration (`decl`), give
+    ///   `f.base` a drop flag so sibling match/`if` arms do not see `self.init[f.base] == false`.
+    /// - A by-value capture of a place below its binding whose type needs drop gives `f.base`
+    ///   partial-move field flags.
+    pub(in crate::walk) fn scan_env_moves(&mut self, parent: &[(u32, bool)], decl: &[u32]) -> Result<(), BuildError> {
         for i in 0..self.body.exprs.len() {
             let e = ExprId(u32::try_from(i).map_err(|_| malformed("an expression index past u32"))?);
             if !matches!(self.expr(e)?, Expr::Closure { .. } | Expr::AsyncBlock { .. }) {
@@ -338,7 +345,23 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
             let checked = self.checked;
             for f in checked.env_fields_by::<crate::layout::BuildEnv>(e) {
-                if f.is_whole() || f.how != CaptureKind::ByValue {
+                if f.how != CaptureKind::ByValue {
+                    continue;
+                }
+                if f.is_whole() {
+                    let home = *decl.get(f.base.ix()).ok_or(malformed("a captured binding past `pats`"))?;
+                    let mut c = e.0;
+                    while c != home {
+                        let (up, cond) = *parent.get(c as usize).ok_or(malformed("an expression past `exprs`"))?;
+                        if cond {
+                            *self.needs_flag.get_mut(f.base.ix()).ok_or(malformed("a captured binding past `pats`"))? = true;
+                            break;
+                        }
+                        if up == NO_EXPR {
+                            break;
+                        }
+                        c = up;
+                    }
                     continue;
                 }
                 let t = f.place_ty(checked).ok_or(malformed("a captured place's type past the record's types"))?;

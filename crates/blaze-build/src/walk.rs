@@ -3332,9 +3332,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // A part moved out by a place expression (a field, a box's contents) gives its local
         // field flags (walk/moves/boxes.rs).
         self.scan_part_moves(&parent)?;
-        // A part moved out by a closure's by-value capture of a place below its binding
-        // likewise (walk/moves/env_places.rs).
-        self.scan_env_moves()?;
+        // A binding or part moved out by a closure's / async block's by-value capture gives its
+        // local a drop flag (whole binding under a branch/loop) or field flags (partial place)
+        // (walk/moves/env_places.rs).
+        self.scan_env_moves(&parent, &decl)?;
         // A field taken out of a struct update's base likewise (walk/moves/struct_update.rs).
         self.scan_update_moves()?;
         self.expr_parent = parent;
