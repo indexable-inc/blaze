@@ -1298,7 +1298,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// fn's with its container's first), by what the item is
     /// ([`super::by_origin::const_params_of`]): a head not made is wanted, never answered "no
     /// const parameters"; a kind with none to give is refused by name.
-    fn const_params_once(&self, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
+    pub(super) fn const_params_once(&self, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
         match super::by_origin::const_params_of(self.names, self.keys, self.store, item) {
             Ok(params) => Ok(tc::ConstParams { params, types: self.types() }),
             Err(u) => self.unmade(u),
