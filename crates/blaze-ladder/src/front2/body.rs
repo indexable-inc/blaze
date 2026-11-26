@@ -1648,12 +1648,11 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
     // The body's blocks the names library made modules: a call in one, written by hand or by
-    // an expansion, reads its path there (scoped.rs `body_blocks`). Only for a text that is the
-    // library's item's or member's own (a local item's body, an anonymous constant's
-    // rendering: none).
-    // A member by its key, never by its text's slice (locals.rs `library_item_or_member`: a
-    // method's blocks had no modules before).
-    let blocks = match (super::locals::library_item_or_member(names, keys, item, owner, text), names.crate_key(krate)) {
+    // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.library_body`
+    // so both top-level items/members AND local fns/consts/statics whose blocks the names library
+    // wrote (`Locals::library_twin`, e.g. `std::sys::process::unix::<impl Command>::posix_spawn::get_posix_spawn_addchdir`)
+    // resolve block-local macro imports like `use crate::sys::weak::weak; weak!(...);`.
+    let blocks = match (store.locals.library_body(names, keys, item, owner, text), names.crate_key(krate)) {
         (Some(body), Some(crate_key)) => super::scoped::body_blocks(crate_key, body, text, alloc),
         _ => None,
     };

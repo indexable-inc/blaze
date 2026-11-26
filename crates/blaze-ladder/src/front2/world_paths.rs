@@ -274,15 +274,15 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 // rustc_resolve late.rs `resolve_qpath`: a path of two or more segments that
                 // fails, whose first segment is a builtin type's name, is that builtin type
                 // with the rest unresolved ("The same fallback is used when `a` resolves to
-                // nothing"). turso's `value.map(str::to_owned)` beside `use std::str;` is
-                // `<str>::to_owned`. Only for the path as written (no block `use` or glob
-                // standing for its first segment, no `::` root).
-                if shift == 0
-                    && !abs
-                    && rest.len() > 1
-                    && let Some(p) = builtin_first(rest)
+                // nothing"). Applies both when `use std::str;` is at module level (`shift == 0`,
+                // turso's `value.map(str::to_owned)`) and when `use std::u8;` is in a block
+                // (`shift > 0`, termcolor's `fn parse_number { use std::u8; u8::from_str_radix }`),
+                // as long as the written path itself did not start with `::` and had >= 2 segments.
+                if first != "{{root}}"
+                    && segments.len() > 1
+                    && let Some(p) = builtin_first(&[first])
                 {
-                    return Ok(Ok(PathRes { def: Def::Prim(p), consumed: lead + 1 }));
+                    return Ok(Ok(PathRes { def: Def::Prim(p), consumed: 1 }));
                 }
                 match local_type {
                     Some(row) if written.len() == 1 => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),

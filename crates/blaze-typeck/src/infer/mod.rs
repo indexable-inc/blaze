@@ -2240,13 +2240,15 @@ impl<'a> TypeCtx for InferCtx<'a> {
             // Selected, with a nested goal undecided: the answer's constraints are applied, so
             // the term is the answer when they decided it (`Normalized::Ambiguous`). An
             // overflow's constraints are not kept (rustc's `MaybeCause::Overflow { keep_constraints:
-            // false }` in the root), nor a term still a bare variable (two candidates left).
+            // false }` in the root), nor an unconstrained fresh variable (two candidates left).
+            // A fresh `var` unified with another variable (e.g. `<Arc<?T, ?A> as Deref>::Target
+            // = ?T` while `?A: Allocator` is still undecided) is NOT a singleton and must be kept.
             Ok(Answer::Maybe(blaze_solve::term::Certainty::Ambiguous)) => {
-                let r = Ty(self.terms.cx.resolve_ty(var).node().bits());
-                if matches!(self.view(r), TyView::Infer(_)) {
+                if self.terms.cx.is_singleton_ty_var(var) {
                     self.rollback_to(s);
                     return Ok(None);
                 }
+                let r = Ty(self.terms.cx.resolve_ty(var).node().bits());
                 self.commit(s);
                 Ok(Some(Normalized::Ambiguous(r)))
             }

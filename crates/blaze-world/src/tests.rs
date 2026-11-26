@@ -369,7 +369,7 @@ fn a_build_scripts_cfg_joins_its_library_at_task_time() {
 /// table gives std, and only std, the atom (toolchain.rs `STD_SCRIPT_CFG`).
 #[test]
 fn std_carries_its_build_script_cfg() {
-    let tc = toolchain(crate::Needs { std: true, bstd: false, proc_macro: false });
+    let tc = toolchain(crate::Needs { std: true, bstd: false, proc_macro: false, test: false });
     let std = &tc.crates()[tc.std().unwrap_or_else(|| panic!("no std"))];
     assert!(std.cfg.contains(&("backtrace_in_libstd", None)), "std's cfg: {:?}", std.cfg);
     let core = &tc.crates()[tc.core().unwrap_or_else(|| panic!("no core"))];
@@ -433,7 +433,7 @@ fn two_runs_under_one_crate_key_are_refused() {
 /// pack: a toolchain bump moves them all). Control: the same inputs give equal keys.
 #[test]
 fn a_toolchain_crates_key_covers_its_target_and_dependencies() {
-    let needs = crate::Needs { std: false, bstd: false, proc_macro: true };
+    let needs = crate::Needs { std: false, bstd: false, proc_macro: true, test: false };
     let std = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";
     let mac: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];
     let linux: &[(&str, Option<&str>)] = &[("target_os", Some("linux")), ("unix", None)];
