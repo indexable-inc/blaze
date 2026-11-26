@@ -233,6 +233,7 @@ pub enum HitAction {
     FindPrev,
     FindClose,
     SysMonToggleTree(BlockId),
+    SysMonToggleCumulative(BlockId),
     SysMonTogglePause(BlockId),
     SysMonSort { block: BlockId, col: u8 },
     SysMonSelectRow { block: BlockId, row: usize },

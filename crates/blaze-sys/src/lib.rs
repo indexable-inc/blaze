@@ -81,6 +81,10 @@ pub mod macos_block;
 /// macOS's facts, probed once (D185): the OS version and which private entries exist.
 #[cfg(target_os = "macos")]
 pub mod macos_facts;
+/// macOS host telemetry and process inspection: Mach CPU/VM counters, libproc process queries,
+/// `KERN_PROCARGS2` sysctl, and `kill(2)`.
+#[cfg(target_os = "macos")]
+pub mod macos_proc;
 
 #[cfg(unix)]
 pub mod posix;

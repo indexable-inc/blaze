@@ -741,128 +741,27 @@ fn read_hostname() -> String {
 fn read_os_mem_uptime() -> (i64, i64, i64) {
     #[cfg(target_os = "macos")]
     {
-        use std::ffi::{CStr, c_char, c_int, c_void};
-        #[repr(C)]
-        struct Timeval {
-            tv_sec: i64,
-            tv_usec: i32,
-            _pad: i32,
-        }
-        #[repr(C)]
-        struct VmStatistics64 {
-            free_count: u32,
-            active_count: u32,
-            inactive_count: u32,
-            wire_count: u32,
-            zero_fill_count: u64,
-            reactivations: u64,
-            pageins: u64,
-            pageouts: u64,
-            faults: u64,
-            cow_faults: u64,
-            lookups: u64,
-            hits: u64,
-            purges: u64,
-            purgeable_count: u32,
-            speculative_count: u32,
-            decompressions: u64,
-            compressions: u64,
-            swapins: u64,
-            swapouts: u64,
-            compressor_page_count: u32,
-            throttled_count: u32,
-            external_page_count: u32,
-            internal_page_count: u32,
-            total_uncompressed_pages_in_compressor: u64,
-        }
-        unsafe extern "C" {
-            fn sysctlbyname(
-                name: *const c_char,
-                oldp: *mut c_void,
-                oldlenp: *mut usize,
-                newp: *const c_void,
-                newlen: usize,
-            ) -> c_int;
-            fn mach_host_self() -> u32;
-            fn host_statistics64(
-                host: u32,
-                flavor: c_int,
-                host_info_out: *mut c_void,
-                host_info_out_cnt: *mut u32,
-            ) -> c_int;
-        }
-        let mut mem_total: u64 = 0;
-        let mut len = core::mem::size_of::<u64>();
-        let key_mem = CStr::from_bytes_with_nul(b"hw.memsize\0").expect("nul");
-        // SAFETY: `mem_total` and `len` point to valid stack locals sized for `u64`.
-        unsafe {
-            sysctlbyname(
-                key_mem.as_ptr(),
-                (&raw mut mem_total).cast(),
-                &mut len,
-                core::ptr::null(),
-                0,
-            );
-        }
-
-        let mut page_size: u64 = 16_384;
-        let mut plen = core::mem::size_of::<u64>();
-        let key_ps = CStr::from_bytes_with_nul(b"hw.pagesize\0").expect("nul");
-        // SAFETY: `page_size` and `plen` point to valid stack locals sized for `u64`.
-        unsafe {
-            sysctlbyname(
-                key_ps.as_ptr(),
-                (&raw mut page_size).cast(),
-                &mut plen,
-                core::ptr::null(),
-                0,
-            );
-        }
-        // SAFETY: `VmStatistics64` is a plain C integer struct (`vm_statistics64_data_t`).
-        let mut vm: VmStatistics64 = unsafe { core::mem::zeroed() };
-        let mut count = (core::mem::size_of::<VmStatistics64>() / core::mem::size_of::<u32>()) as u32;
-        const HOST_VM_INFO64: c_int = 4;
-        // SAFETY: `vm` matches `vm_statistics64_data_t` and `count` is its `natural_t` count.
-        let vm_rc = unsafe {
-            host_statistics64(
-                mach_host_self(),
-                HOST_VM_INFO64,
-                (&raw mut vm).cast(),
-                &mut count,
-            )
+        let (mem_total, mem_used) = match blaze_sys::macos_proc::vm_mem_info() {
+            Ok(vm) => {
+                let used = vm
+                    .active_bytes
+                    .saturating_add(vm.wired_bytes)
+                    .saturating_add(vm.compressed_bytes);
+                (
+                    vm.total_bytes.min(i64::MAX as u64) as i64,
+                    used.min(i64::MAX as u64) as i64,
+                )
+            }
+            Err(_) => (0, 0),
         };
-        let mem_used = if vm_rc == 0 {
-            let pages = u64::from(vm.active_count)
-                .saturating_add(u64::from(vm.wire_count))
-                .saturating_add(u64::from(vm.compressor_page_count));
-            pages.saturating_mul(page_size).min(i64::MAX as u64) as i64
-        } else {
-            0
-        };
-
-        let mut boot = Timeval { tv_sec: 0, tv_usec: 0, _pad: 0 };
-        let mut blen = core::mem::size_of::<Timeval>();
-        let key_boot = CStr::from_bytes_with_nul(b"kern.boottime\0").expect("nul");
-        // SAFETY: `boot` and `blen` point to valid stack locals sized for `Timeval`.
-        let rc = unsafe {
-            sysctlbyname(
-                key_boot.as_ptr(),
-                (&raw mut boot).cast(),
-                &mut blen,
-                core::ptr::null(),
-                0,
-            )
-        };
-        let uptime_ns = if rc == 0 && boot.tv_sec > 0 {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            now_secs.saturating_sub(boot.tv_sec).saturating_mul(1_000_000_000)
-        } else {
-            0
-        };
-        (mem_total.min(i64::MAX as u64) as i64, mem_used, uptime_ns)
+        let uptime_ns = blaze_sys::macos_proc::boot_time_secs()
+            .ok()
+            .and_then(|boot_secs| {
+                let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+                Some(now_secs.saturating_sub(boot_secs).saturating_mul(1_000_000_000))
+            })
+            .map_or(0, |ns| ns.min(i64::MAX as u64) as i64);
+        (mem_total, mem_used, uptime_ns)
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -273,7 +273,9 @@ pub struct ProcessRow<'a> {
     pub mem_bytes: u64,
     pub subtree_mem_bytes: u64,
     pub disk_bps: u64,
+    pub subtree_disk_bps: u64,
     pub threads: u32,
+    pub subtree_threads: u32,
     pub start_time_secs: u64,
 }
 
@@ -1041,7 +1043,9 @@ impl<'a> SysMonEngine<'a> {
                 mem_bytes: proc.mem_bytes,
                 subtree_mem_bytes: proc.mem_bytes,
                 disk_bps: proc.disk_bps,
+                subtree_disk_bps: proc.disk_bps,
                 threads: proc.threads,
+                subtree_threads: proc.threads,
                 start_time_secs: proc.start_time_secs,
             });
         }
@@ -1133,16 +1137,20 @@ impl<'a> SysMonEngine<'a> {
             }
         }
 
-        // 6. Bottom-up rollup of subtree CPU, GPU, memory, descendant counts, and filter visibility.
+        // 6. Bottom-up rollup of subtree CPU, GPU, memory, disk, threads, descendant counts, and filter visibility.
         let mut subtree_cpu: AVec<'a, f32> = Vec::with_capacity_in(n, alloc);
         let mut subtree_gpu: AVec<'a, f32> = Vec::with_capacity_in(n, alloc);
         let mut subtree_mem: AVec<'a, u64> = Vec::with_capacity_in(n, alloc);
+        let mut subtree_disk: AVec<'a, u64> = Vec::with_capacity_in(n, alloc);
+        let mut subtree_threads: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
         let mut child_count: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
         let mut visible: AVec<'a, bool> = Vec::with_capacity_in(n, alloc);
         for proc in self.computed_procs.iter() {
             subtree_cpu.push(proc.cpu_pct);
             subtree_gpu.push(proc.gpu_pct);
             subtree_mem.push(proc.mem_bytes);
+            subtree_disk.push(proc.disk_bps);
+            subtree_threads.push(proc.threads);
             child_count.push(0);
             visible.push(!filtering || matches_filter(proc, query));
         }
@@ -1152,6 +1160,8 @@ impl<'a> SysMonEngine<'a> {
                 subtree_cpu[p] += subtree_cpu[idx];
                 subtree_gpu[p] += subtree_gpu[idx];
                 subtree_mem[p] = subtree_mem[p].saturating_add(subtree_mem[idx]);
+                subtree_disk[p] = subtree_disk[p].saturating_add(subtree_disk[idx]);
+                subtree_threads[p] = subtree_threads[p].saturating_add(subtree_threads[idx]);
                 child_count[p] = child_count[p]
                     .saturating_add(1)
                     .saturating_add(child_count[idx]);
@@ -1275,7 +1285,9 @@ impl<'a> SysMonEngine<'a> {
                 mem_bytes: proc.mem_bytes,
                 subtree_mem_bytes: subtree_mem[frame.node],
                 disk_bps: proc.disk_bps,
+                subtree_disk_bps: subtree_disk[frame.node],
                 threads: proc.threads,
+                subtree_threads: subtree_threads[frame.node],
                 start_time_secs: proc.start_time_secs,
             });
 
@@ -2534,5 +2546,51 @@ mod tests {
         assert_eq!(summary2.entries.len(), 1);
         assert_eq!(summary2.entries[0].uptime_secs, 0);
         assert_eq!(summary2.entries[0].parent_name.as_str(), "");
+    }
+
+    #[test]
+    fn tree_subtree_rollups_sum_cpu_gpu_mem_disk_and_threads() {
+        let arena = Inline::<262_144>::new();
+        let erased = Erased::new(&arena);
+        let alloc = erased.handle();
+        let mut engine = SysMonEngine::new_in(alloc);
+
+        let snap = |ts_ns: u64, tick: u64| {
+            let mut procs = Vec::new_in(alloc);
+            let mut p1 = make_proc_with_cwd(alloc, 100, 1, "app", "/", "/Applications/App.app/Contents/MacOS/App", 100_000_000 * tick, 0, 1_000, 4);
+            p1.disk_read_bytes = 500 * tick;
+            let mut p2 = make_proc_with_cwd(alloc, 101, 100, "helper", "/", "/Applications/App.app/Contents/MacOS/Helper", 200_000_000 * tick, 50_000_000 * tick, 2_500, 6);
+            p2.disk_write_bytes = 1_500 * tick;
+            let mut p3 = make_proc_with_cwd(alloc, 102, 101, "worker", "/", "/Applications/App.app/Contents/MacOS/Worker", 50_000_000 * tick, 100_000_000 * tick, 500, 3);
+            p3.disk_read_bytes = 250 * tick;
+            procs.push(p1);
+            procs.push(p2);
+            procs.push(p3);
+            RawSnapshot {
+                timestamp_ns: ts_ns,
+                wall_time_secs: 1000 + tick,
+                cores: Vec::new_in(alloc),
+                mem: RawMemSample::default(),
+                gpu: RawGpuSample::empty_in(alloc),
+                processes: procs,
+                load_avg: [0.0; 3],
+                uptime_secs: 10 + tick,
+            }
+        };
+
+        engine.ingest(snap(1_000_000_000, 1));
+        engine.ingest(snap(2_000_000_000, 2));
+
+        let root = engine.rows().iter().find(|r| r.pid == 100).unwrap();
+        assert!((root.subtree_cpu_pct - 35.0).abs() < 0.1, "got {}", root.subtree_cpu_pct);
+        assert!((root.subtree_gpu_pct - 15.0).abs() < 0.1, "got {}", root.subtree_gpu_pct);
+        assert_eq!(root.subtree_mem_bytes, 4_000);
+        assert_eq!(root.subtree_disk_bps, 2_250);
+        assert_eq!(root.subtree_threads, 13);
+
+        let helper = engine.rows().iter().find(|r| r.pid == 101).unwrap();
+        assert_eq!(helper.subtree_mem_bytes, 3_000);
+        assert_eq!(helper.subtree_threads, 9);
+        assert_eq!(helper.subtree_disk_bps, 1_750);
     }
 }

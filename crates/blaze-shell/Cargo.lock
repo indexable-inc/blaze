@@ -200,6 +200,7 @@ dependencies = [
  "blaze-shell-config",
  "blaze-sniff",
  "blaze-ssh",
+ "blaze-sys",
  "blaze-sysmon",
  "blaze-ui",
  "blaze-vim",

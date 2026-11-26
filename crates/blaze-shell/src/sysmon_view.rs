@@ -73,6 +73,9 @@ pub struct SysMonState {
     pub confirm_kill: Option<(u32, String)>,
     pub status_msg: Option<String>,
     pub running: bool,
+    /// When true (default), parent rows in tree mode display cumulative subtree CPU %, GPU %,
+    /// and Memory across all descendants (press `c` or click `Σ Cumul` to toggle self-only).
+    pub cumulative: bool,
 }
 
 impl Default for SysMonState {
@@ -93,6 +96,7 @@ impl SysMonState {
             confirm_kill: None,
             status_msg: None,
             running: true,
+            cumulative: true,
         }
     }
 
@@ -561,7 +565,29 @@ fn draw_header_bar(
         m,
         clip_id,
         HitAction::SysMonToggleTree(block_id),
-    );
+    ) - pill_gap;
+
+    // [Σ Cumul] / [Self] toggle pill (shown in tree mode; cumulative by default!)
+    if tree {
+        let (cum_label, cum_fg, cum_bg, cum_border) = if state.cumulative {
+            ("Σ Cumul", theme::rgb(0x96, 0xc2, 0xff), theme::rgba(0x58, 0x9d, 0xf6, 0.14), theme::rgba(0x58, 0x9d, 0xf6, 0.36))
+        } else {
+            ("Self", theme::INK_3, theme::BG_CHIP, theme::LINE)
+        };
+        rx = draw_pill_right(
+            scene,
+            rx,
+            pill_y0,
+            pill_y1,
+            cum_label,
+            cum_fg,
+            cum_bg,
+            cum_border,
+            m,
+            clip_id,
+            HitAction::SysMonToggleCumulative(block_id),
+        );
+    }
 
     let left_max_x = (rx - 10.0).max(x0 + 80.0);
     let left_clip = intersect_clip(scene, clip_id, x0, y0, left_max_x, y0 + HEADER_H, 0.0);
@@ -1419,8 +1445,9 @@ fn draw_process_table(
             body_clip,
         );
 
-        // Show aggregated subtree metrics when a parent process is collapsed in tree mode
-        let use_subtree = tree_mode && row.has_children && row.collapsed;
+        // Show cumulative subtree CPU %, GPU %, and Memory on parent rows by default in tree mode
+        // (and always when collapsed), so app trees immediately reflect their true combined footprint!
+        let use_subtree = tree_mode && row.has_children && (state.cumulative || row.collapsed);
         let cpu_val = if use_subtree { row.subtree_cpu_pct } else { row.cpu_pct };
         let gpu_val = if use_subtree { row.subtree_gpu_pct } else { row.gpu_pct };
         let mem_val = if use_subtree { row.subtree_mem_bytes } else { row.mem_bytes };
@@ -1449,7 +1476,8 @@ fn draw_process_table(
 
         // THR
         if thr_w > 0.0 {
-            let thr_s = format!("{}", row.threads);
+            let thr_val = if use_subtree { row.subtree_threads } else { row.threads };
+            let thr_s = format!("{thr_val}");
             let tw = m.measure(&thr_s, TextFace::Mono);
             scene.text(thr_x1 - 6.0 - tw, mono_ty, thr_s, theme::INK_3, false, false, body_clip);
         }
@@ -1826,7 +1854,7 @@ fn draw_footer_bar(
         scene.ui_small(x0 + 10.0, ty, msg.as_str(), theme::INK_2, false, false, fclip);
     } else {
         let legend =
-            "↑↓ select · Space fold · t tree · / filter · 1-5 sort · x kill · p pause · ⌘⇧F expand · q close";
+            "↑↓ select · Space fold · t tree · c cumul · / filter · 1-5 sort · x kill · p pause · ⌘⇧F expand · q close";
         let max_chars = ((x1 - x0 - 8.0) / (m.cw * 0.78).max(4.0)).floor().max(8.0) as usize;
         let shown = truncate_chars(legend, max_chars);
         scene.ui_small(x0 + 4.0, ty, shown, theme::INK_4, false, false, fclip);

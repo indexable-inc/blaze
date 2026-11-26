@@ -1,16 +1,13 @@
 //! Thin native macOS telemetry & `.app` Retina icon driver over [`blaze_sysmon`].
 //!
 //! Zero external subprocesses (`ps`, `top`, `ioreg`, `sips` are never spawned):
-//! - Per-core CPU ticks via Mach `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`
-//! - Activity Monitor-exact memory (`internal - purgeable`, wired, compressed, cached), swap,
-//!   boottime uptime, and load average via Mach `host_statistics64(HOST_VM_INFO64)` + `sysctlbyname`
-//!   + `getloadavg`
+//! - Per-core CPU ticks, Activity Monitor-exact memory (`internal - purgeable`, wired,
+//!   compressed, cached), swap, boottime uptime, load average, Mach timebase, process inventory,
+//!   physical footprint, CPU nanoseconds, disk I/O, threads, CWD, command lines, and POSIX signals
+//!   routed through [`blaze_sys::macos_proc`]
 //! - Apple Silicon GPU model, core count, device/renderer/tiler utilization, VRAM, and per-process
 //!   GPU time + active command queues via `IOKit.framework` (`IOAccelerator` & child
 //!   `AGXDeviceUserClient` `AppUsage` entries) + `CoreFoundation.framework`
-//! - Process inventory, Activity Monitor physical footprint, CPU nanoseconds, disk I/O, threads,
-//!   and `.app` bundle path via `libproc` (`proc_listallpids`, `proc_pidinfo`, `proc_pid_rusage`,
-//!   `proc_pidpath`) + `mach_timebase_info`
 //! - Persistent 48×48 Retina `.app` icon PNG disk cache (`~/Library/Caches/blaze-shell/app_icons/`)
 //!   extracted lazily via `NSWorkspace::sharedWorkspace().iconForFile(...)` + `CoreGraphics` +
 //!   `ImageIO`, bumping [`app_icon_revision`] on completion so the UI repaints cleanly.
@@ -161,15 +158,6 @@ pub fn read_proc_cmdline(pid: u32) -> String {
         let _ = pid;
         String::new()
     }
-}
-
-/// Convert Mach absolute-time ticks into nanoseconds using `u128` intermediate math to avoid overflow.
-#[cfg(any(target_os = "macos", test))]
-#[inline]
-fn mach_ticks_to_ns(ticks: u64, numer: u64, denom: u64) -> u64 {
-    let d = u128::from(denom.max(1));
-    let ns = (u128::from(ticks) * u128::from(numer)) / d;
-    ns.min(u64::MAX as u128) as u64
 }
 
 /// Capture a complete system telemetry snapshot (CPU cores, memory, swap, GPU, per-process metrics,
@@ -354,31 +342,29 @@ pub fn send_process_signal(pid: u32, sigkill: bool) -> Result<(), String> {
     let raw_pid = i32::try_from(pid)
         .map_err(|_| format!("pid {pid} exceeds POSIX pid_t range (i32::MAX)"))?;
 
-    #[cfg(unix)]
+    const SIGKILL: i32 = 9;
+    const SIGTERM: i32 = 15;
+    let sig = if sigkill { SIGKILL } else { SIGTERM };
+    let sig_name = if sigkill { "SIGKILL" } else { "SIGTERM" };
+
+    #[cfg(target_os = "macos")]
     {
-        const SIGKILL: i32 = 9;
-        const SIGTERM: i32 = 15;
-
-        // Public POSIX `kill(2)` symbol from libSystem / libc.
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-
-        let sig = if sigkill { SIGKILL } else { SIGTERM };
-        let sig_name = if sigkill { "SIGKILL" } else { "SIGTERM" };
-        // SAFETY: `raw_pid > 0` and `sig` is a valid POSIX signal number.
-        let rc = unsafe { kill(raw_pid, sig) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            let err = std::io::Error::last_os_error();
-            Err(format!("failed to send {sig_name} to pid {pid}: {err}"))
-        }
+        blaze_sys::macos_proc::kill_pid(raw_pid, sig)
+            .map_err(|err| format!("failed to send {sig_name} to pid {pid}: {err}"))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = (raw_pid, sigkill);
+        blaze_sys::posix::signal::kill(raw_pid, sig)
+            .map_err(|err| format!("failed to send {sig_name} to pid {pid}: {err}"))
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64"))
+    )))]
+    {
+        let _ = (raw_pid, sig, sig_name);
         Err(format!("send_process_signal(pid={pid}) is unsupported on this platform"))
     }
 }
@@ -664,13 +650,14 @@ mod macos {
     use std::collections::HashMap;
     use std::ffi::{c_char, c_void};
     use std::fs;
-    use std::mem::{MaybeUninit, size_of};
+    use std::mem::size_of;
     use std::path::Path;
     use std::ptr::{null, null_mut};
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use blaze_own::{AString, AVec, Alloc};
+    use blaze_sys::macos_proc;
     use blaze_sysmon::{
         CoreTicks, RawGpuSample, RawMemSample, RawProcess, extract_app_bundle_path,
     };
@@ -679,38 +666,19 @@ mod macos {
     use objc2_core_graphics::CGImage;
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-    use super::{mach_ticks_to_ns, parse_creator_pid, parse_kern_procargs2};
+    use super::{parse_creator_pid, parse_kern_procargs2};
 
     // -------------------------------------------------------------------------
-    // Mach / XNU / BSD / libproc constants (verified against MacOSX.sdk headers)
+    // Buffer caps and Apple Framework UI/GPU constants
     // -------------------------------------------------------------------------
 
-    const CTL_KERN: i32 = 1;
-    const KERN_PROCARGS2: i32 = 49;
+    const MAX_CPU_CORES: usize = 512;
     const PROCARGS2_STACK_LEN: usize = 8192;
     const PROCARGS2_MAX_LEN: usize = 256 * 1024;
-
-    const KERN_SUCCESS: i32 = 0;
-    const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
-    const CPU_STATE_USER: usize = 0;
-    const CPU_STATE_SYSTEM: usize = 1;
-    const CPU_STATE_IDLE: usize = 2;
-    const CPU_STATE_NICE: usize = 3;
-    const CPU_STATE_MAX: usize = 4;
-
-    const HOST_VM_INFO64: i32 = 4;
-    /// `HOST_VM_INFO64_REV1_COUNT` (38 `natural_t` words = 152 bytes): supported on all macOS
-    /// versions 10.9 through 26+ and includes `internal_page_count`, `purgeable_count`,
-    /// `wire_count`, `compressor_page_count`, and `external_page_count`.
-    const HOST_VM_INFO64_REV1_COUNT: u32 = 38;
-
-    const PROC_PIDTBSDINFO: i32 = 3;
-    const PROC_PIDTASKINFO: i32 = 4;
-    const PROC_PIDVNODEPATHINFO: i32 = 9;
-    const RUSAGE_INFO_V4: i32 = 4;
     const MAXPATHLEN: usize = 1024;
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 
+    const KERN_SUCCESS: i32 = 0;
     const K_IO_MAIN_PORT_DEFAULT: u32 = 0;
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const K_CF_NUMBER_SINT64_TYPE: isize = 4;
@@ -723,181 +691,6 @@ mod macos {
     /// Target Retina @2x icon canvas (48×48 device pixels for 24×24 pt slots).
     const ICON_RETINA_PX: usize = 48;
 
-    // -------------------------------------------------------------------------
-    // Byte-exact XNU / BSD C structs (verified against MacOSX.sdk)
-    // -------------------------------------------------------------------------
-
-    /// `<mach/mach_time.h>` `struct mach_timebase_info` (8 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct MachTimebaseInfo {
-        pub numer: u32,
-        pub denom: u32,
-    }
-
-    /// `<mach/vm_statistics.h>` `struct vm_statistics64` rev1 prefix (152 bytes = 38 × `u32`).
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct VmStatistics64Rev1 {
-        pub free_count: u32,
-        pub active_count: u32,
-        pub inactive_count: u32,
-        pub wire_count: u32,
-        pub zero_fill_count: u64,
-        pub reactivations: u64,
-        pub pageins: u64,
-        pub pageouts: u64,
-        pub faults: u64,
-        pub cow_faults: u64,
-        pub lookups: u64,
-        pub hits: u64,
-        pub purges: u64,
-        pub purgeable_count: u32,
-        pub speculative_count: u32,
-        pub decompressions: u64,
-        pub compressions: u64,
-        pub swapins: u64,
-        pub swapouts: u64,
-        pub compressor_page_count: u32,
-        pub throttled_count: u32,
-        pub external_page_count: u32,
-        pub internal_page_count: u32,
-        pub total_uncompressed_pages_in_compressor: u64,
-    }
-
-    /// `<sys/sysctl.h>` `struct xsw_usage` (32 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct XswUsage {
-        pub xsu_total: u64,
-        pub xsu_avail: u64,
-        pub xsu_used: u64,
-        pub xsu_pagesize: u32,
-        pub xsu_encrypted: u32,
-    }
-
-    /// `<sys/_types/_timeval.h>` `struct timeval` on 64-bit macOS (16 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct Timeval {
-        pub tv_sec: i64,
-        pub tv_usec: i32,
-        pub _pad: i32,
-    }
-
-    /// `<sys/proc_info.h>` `struct proc_bsdinfo` (136 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub(super) struct ProcBsdInfo {
-        pub pbi_flags: u32,
-        pub pbi_status: u32,
-        pub pbi_xstatus: u32,
-        pub pbi_pid: u32,
-        pub pbi_ppid: u32,
-        pub pbi_uid: u32,
-        pub pbi_gid: u32,
-        pub pbi_ruid: u32,
-        pub pbi_rgid: u32,
-        pub pbi_svuid: u32,
-        pub pbi_svgid: u32,
-        pub rfu_1: u32,
-        pub pbi_comm: [u8; 16],
-        pub pbi_name: [u8; 32],
-        pub pbi_nfiles: u32,
-        pub pbi_pgid: u32,
-        pub pbi_pjobc: u32,
-        pub e_tdev: u32,
-        pub e_tpgid: u32,
-        pub pbi_nice: i32,
-        pub pbi_start_tvsec: u64,
-        pub pbi_start_tvusec: u64,
-    }
-
-    /// `<sys/proc_info.h>` `struct proc_taskinfo` (96 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct ProcTaskInfo {
-        pub pti_virtual_size: u64,
-        pub pti_resident_size: u64,
-        pub pti_total_user: u64,
-        pub pti_total_system: u64,
-        pub pti_threads_user: u64,
-        pub pti_threads_system: u64,
-        pub pti_policy: i32,
-        pub pti_faults: i32,
-        pub pti_pageins: i32,
-        pub pti_cow_faults: i32,
-        pub pti_messages_sent: i32,
-        pub pti_messages_received: i32,
-        pub pti_syscalls_mach: i32,
-        pub pti_syscalls_unix: i32,
-        pub pti_csw: i32,
-        pub pti_threadnum: i32,
-        pub pti_numrunning: i32,
-        pub pti_priority: i32,
-    }
-
-    /// `<sys/resource.h>` `struct rusage_info_v4` (296 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub(super) struct RusageInfoV4 {
-        pub ri_uuid: [u8; 16],
-        pub ri_user_time: u64,
-        pub ri_system_time: u64,
-        pub ri_pkg_idle_wkups: u64,
-        pub ri_interrupt_wkups: u64,
-        pub ri_pageins: u64,
-        pub ri_wired_size: u64,
-        pub ri_resident_size: u64,
-        pub ri_phys_footprint: u64,
-        pub ri_proc_start_abstime: u64,
-        pub ri_proc_exit_abstime: u64,
-        pub ri_child_user_time: u64,
-        pub ri_child_system_time: u64,
-        pub ri_child_pkg_idle_wkups: u64,
-        pub ri_child_interrupt_wkups: u64,
-        pub ri_child_pageins: u64,
-        pub ri_child_elapsed_abstime: u64,
-        pub ri_diskio_bytesread: u64,
-        pub ri_diskio_byteswritten: u64,
-        pub ri_cpu_time_qos_default: u64,
-        pub ri_cpu_time_qos_maintenance: u64,
-        pub ri_cpu_time_qos_background: u64,
-        pub ri_cpu_time_qos_utility: u64,
-        pub ri_cpu_time_qos_legacy: u64,
-        pub ri_cpu_time_qos_user_initiated: u64,
-        pub ri_cpu_time_qos_user_interactive: u64,
-        pub ri_billed_system_time: u64,
-        pub ri_serviced_system_time: u64,
-        pub ri_logical_writes: u64,
-        pub ri_lifetime_max_phys_footprint: u64,
-        pub ri_instructions: u64,
-        pub ri_cycles: u64,
-        pub ri_billed_energy: u64,
-        pub ri_serviced_energy: u64,
-        pub ri_interval_max_phys_footprint: u64,
-        pub ri_runnable_time: u64,
-    }
-
-    /// `<sys/proc_info.h>` `struct vnode_info_path` (1176 bytes, 8-byte aligned).
-    ///
-    /// `vip_vi` (`struct vnode_info`) is 152 bytes (`19 × u64`), followed immediately at offset
-    /// 152 by `vip_path[MAXPATHLEN]` (1024 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub(super) struct VnodeInfoPath {
-        pub vip_vi: [u64; 19],
-        pub vip_path: [u8; MAXPATHLEN],
-    }
-
-    /// `<sys/proc_info.h>` `struct proc_vnodepathinfo` (2352 bytes, 8-byte aligned).
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub(super) struct ProcVnodePathInfo {
-        pub pvi_cdir: VnodeInfoPath,
-        pub pvi_rdir: VnodeInfoPath,
-    }
-
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct CGRectRaw {
@@ -908,62 +701,8 @@ mod macos {
     }
 
     // -------------------------------------------------------------------------
-    // Direct C FFI declarations (documented per Rule 45)
+    // Apple Framework UI / GPU FFI declarations (IOKit / CF / CG / ImageIO)
     // -------------------------------------------------------------------------
-
-    // Public Mach, BSD sysctl, and libproc symbols in libSystem.B.dylib.
-    unsafe extern "C" {
-        /// Global `mach_port_t` for the current task (libSystem).
-        static mach_task_self_: u32;
-        /// Allocates a send right for the Mach host port; release with `mach_port_deallocate`.
-        fn mach_host_self() -> u32;
-        fn mach_port_deallocate(task: u32, name: u32) -> i32;
-        fn host_page_size(host: u32, out_page_size: *mut usize) -> i32;
-        fn host_processor_info(
-            host: u32,
-            flavor: i32,
-            out_processor_count: *mut u32,
-            out_processor_info: *mut *mut i32,
-            out_processor_info_cnt: *mut u32,
-        ) -> i32;
-        fn host_statistics64(
-            host: u32,
-            flavor: i32,
-            host_info_out: *mut i32,
-            host_info_out_cnt: *mut u32,
-        ) -> i32;
-        fn vm_deallocate(target_task: u32, address: usize, size: usize) -> i32;
-        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
-
-        fn sysctl(
-            name: *mut i32,
-            namelen: u32,
-            oldp: *mut c_void,
-            oldlenp: *mut usize,
-            newp: *const c_void,
-            newlen: usize,
-        ) -> i32;
-        fn sysctlbyname(
-            name: *const c_char,
-            oldp: *mut c_void,
-            oldlenp: *mut usize,
-            newp: *const c_void,
-            newlen: usize,
-        ) -> i32;
-        fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
-
-        // Public libproc (`<libproc.h>`) process inspection APIs.
-        fn proc_listallpids(buffer: *mut c_void, buffersize: i32) -> i32;
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut c_void,
-            buffersize: i32,
-        ) -> i32;
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut c_void) -> i32;
-        fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
-    }
 
     // Public IOKit.framework symbols for Apple Silicon `IOAccelerator` & `AGXDeviceUserClient`.
     #[link(name = "IOKit", kind = "framework")]
@@ -1068,20 +807,8 @@ mod macos {
     }
 
     // -------------------------------------------------------------------------
-    // RAII handle guards — guarantee zero Mach / IOKit / CF / CG leaks
+    // RAII handle guards — guarantee zero IOKit / CF / CG leaks
     // -------------------------------------------------------------------------
-
-    struct MachPortGuard(u32);
-    impl Drop for MachPortGuard {
-        fn drop(&mut self) {
-            if self.0 != 0 {
-                // SAFETY: `self.0` is an owned Mach port send right acquired via `mach_host_self`.
-                unsafe {
-                    let _ = mach_port_deallocate(mach_task_self_, self.0);
-                }
-            }
-        }
-    }
 
     struct IoObjectGuard(u32);
     impl Drop for IoObjectGuard {
@@ -1262,174 +989,82 @@ mod macos {
     // Mach timebase (cached once per process)
     // -------------------------------------------------------------------------
 
-    fn mach_timebase() -> (u64, u64) {
-        static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
-        *TIMEBASE.get_or_init(|| {
-            let mut info = MachTimebaseInfo::default();
-            // SAFETY: `info` is an initialized 8-byte `mach_timebase_info_data_t`.
-            let kr = unsafe { mach_timebase_info(&raw mut info) };
-            if kr == KERN_SUCCESS && info.numer > 0 && info.denom > 0 {
-                (u64::from(info.numer), u64::from(info.denom))
-            } else {
-                (1, 1)
-            }
+    fn cached_mach_timebase() -> (u32, u32) {
+        static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+        *TIMEBASE.get_or_init(|| match macos_proc::mach_timebase() {
+            Ok(tb) if tb.numer > 0 && tb.denom > 0 => (tb.numer, tb.denom),
+            _ => (1, 1),
         })
     }
 
     // -------------------------------------------------------------------------
-    // 1. Per-core CPU ticks
+    // 1. Per-core CPU ticks (via `blaze_sys::macos_proc`)
     // -------------------------------------------------------------------------
 
     pub(super) fn sample_cores(alloc: Alloc<'static>) -> AVec<'static, CoreTicks> {
-        // SAFETY: `mach_host_self()` returns a send right released by `MachPortGuard`.
-        let host = MachPortGuard(unsafe { mach_host_self() });
-        let mut num_cpus: u32 = 0;
-        let mut info_ptr: *mut i32 = null_mut();
-        let mut info_cnt: u32 = 0;
-
-        // SAFETY: out-pointers are valid stack locals; on success `info_ptr` is vm-allocated by
-        // the kernel and deallocated below via `vm_deallocate`.
-        let kr = unsafe {
-            host_processor_info(
-                host.0,
-                PROCESSOR_CPU_LOAD_INFO,
-                &raw mut num_cpus,
-                &raw mut info_ptr,
-                &raw mut info_cnt,
-            )
-        };
-
-        let out = if kr == KERN_SUCCESS && !info_ptr.is_null() {
-            let total_words = info_cnt as usize;
-            let cpu_count = (num_cpus as usize).min(total_words / CPU_STATE_MAX);
-            let mut vec = AVec::with_capacity_in(cpu_count, alloc);
-            // SAFETY: `info_ptr` points to `total_words` contiguous `i32`s allocated by Mach.
-            let slice = unsafe { std::slice::from_raw_parts(info_ptr, total_words) };
-            for i in 0..cpu_count {
-                let base = i * CPU_STATE_MAX;
-                vec.push(CoreTicks {
-                    user: u64::from(slice[base + CPU_STATE_USER] as u32),
-                    system: u64::from(slice[base + CPU_STATE_SYSTEM] as u32),
-                    idle: u64::from(slice[base + CPU_STATE_IDLE] as u32),
-                    nice: u64::from(slice[base + CPU_STATE_NICE] as u32),
-                });
+        let mut raw = [const {
+            macos_proc::CpuCoreTicks {
+                user: 0,
+                system: 0,
+                idle: 0,
+                nice: 0,
             }
-            // SAFETY: `info_ptr` was allocated by `host_processor_info` with `total_words * 4` bytes.
-            unsafe {
-                let _ = vm_deallocate(
-                    mach_task_self_,
-                    info_ptr as usize,
-                    total_words * size_of::<i32>(),
-                );
-            }
-            vec
-        } else {
-            AVec::new_in(alloc)
+        }; MAX_CPU_CORES];
+        let Ok(count) = macos_proc::cpu_core_ticks(&mut raw) else {
+            return AVec::new_in(alloc);
         };
-        out
-    }
-
-    // -------------------------------------------------------------------------
-    // 2. Memory, Swap, Uptime, Load Average
-    // -------------------------------------------------------------------------
-
-    fn sysctl_pod<T: Copy + Default>(name: &std::ffi::CStr) -> Option<T> {
-        let mut val = T::default();
-        let mut size = size_of::<T>();
-        // SAFETY: `name` is NUL-terminated; `val` has `size` writable bytes and `newp` is null.
-        let rc = unsafe {
-            sysctlbyname(
-                name.as_ptr(),
-                (&raw mut val).cast::<c_void>(),
-                &raw mut size,
-                null(),
-                0,
-            )
-        };
-        if rc == 0 && size == size_of::<T>() {
-            Some(val)
-        } else {
-            None
+        let n = count.min(raw.len());
+        let mut vec = AVec::with_capacity_in(n, alloc);
+        for core in &raw[..n] {
+            vec.push(CoreTicks {
+                user: u64::from(core.user),
+                system: u64::from(core.system),
+                idle: u64::from(core.idle),
+                nice: u64::from(core.nice),
+            });
         }
+        vec
     }
+
+    // -------------------------------------------------------------------------
+    // 2. Memory, Swap, Uptime, Load Average (via `blaze_sys::macos_proc`)
+    // -------------------------------------------------------------------------
 
     pub(super) fn sample_memory_and_host() -> (RawMemSample, [f32; 3], u64) {
-        let total_bytes = sysctl_pod::<u64>(c"hw.memsize").unwrap_or(0);
-
-        // SAFETY: `mach_host_self()` returns a send right released by `MachPortGuard`.
-        let host = MachPortGuard(unsafe { mach_host_self() });
-        let mut page_size_raw: usize = 0;
-        // SAFETY: `host.0` is a valid host port and `page_size_raw` is writable.
-        let page_size = if unsafe { host_page_size(host.0, &raw mut page_size_raw) } == KERN_SUCCESS
-            && page_size_raw > 0
-        {
-            page_size_raw as u64
-        } else {
-            16384
+        let mem = match macos_proc::vm_mem_info() {
+            Ok(vm) => RawMemSample {
+                total_bytes: vm.total_bytes,
+                app_bytes: vm.app_bytes,
+                wired_bytes: vm.wired_bytes,
+                compressed_bytes: vm.compressed_bytes,
+                cached_bytes: vm.cached_bytes,
+                swap_used_bytes: vm.swap_used_bytes,
+                swap_total_bytes: vm.swap_total_bytes,
+            },
+            Err(_) => RawMemSample {
+                total_bytes: 0,
+                app_bytes: 0,
+                wired_bytes: 0,
+                compressed_bytes: 0,
+                cached_bytes: 0,
+                swap_used_bytes: 0,
+                swap_total_bytes: 0,
+            },
         };
 
-        let mut vm = VmStatistics64Rev1::default();
-        let mut count = HOST_VM_INFO64_REV1_COUNT;
-        // SAFETY: `VmStatistics64Rev1` is 152 bytes = 38 `u32` words matching `HOST_VM_INFO64_REV1_COUNT`.
-        let vm_kr = unsafe {
-            host_statistics64(
-                host.0,
-                HOST_VM_INFO64,
-                (&raw mut vm).cast::<i32>(),
-                &raw mut count,
-            )
-        };
-
-        let (app_bytes, wired_bytes, compressed_bytes, cached_bytes) = if vm_kr == KERN_SUCCESS {
-            let internal = u64::from(vm.internal_page_count);
-            let purgeable = u64::from(vm.purgeable_count);
-            let wired = u64::from(vm.wire_count);
-            let compressed = u64::from(vm.compressor_page_count);
-            let external = u64::from(vm.external_page_count);
-            (
-                internal.saturating_sub(purgeable).saturating_mul(page_size),
-                wired.saturating_mul(page_size),
-                compressed.saturating_mul(page_size),
-                external.saturating_add(purgeable).saturating_mul(page_size),
-            )
-        } else {
-            (0, 0, 0, 0)
-        };
-
-        let swap = sysctl_pod::<XswUsage>(c"vm.swapusage").unwrap_or_default();
-
-        let uptime_secs = sysctl_pod::<Timeval>(c"kern.boottime")
-            .and_then(|boot| {
+        let uptime_secs = macos_proc::boot_time_secs()
+            .ok()
+            .and_then(|boot_secs| {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-                let boot_secs = u64::try_from(boot.tv_sec).ok()?;
                 Some(now.saturating_sub(boot_secs))
             })
             .unwrap_or(0);
 
-        let mut raw_load = [0.0f64; 3];
-        // SAFETY: `raw_load` holds 3 `f64` slots matching `nelem = 3`.
-        let n_load = unsafe { getloadavg(raw_load.as_mut_ptr(), 3) };
-        let load_avg = if n_load >= 3 {
-            [raw_load[0] as f32, raw_load[1] as f32, raw_load[2] as f32]
-        } else if n_load > 0 {
-            let mut out = [0.0f32; 3];
-            for i in 0..(n_load as usize).min(3) {
-                out[i] = raw_load[i] as f32;
-            }
-            out
-        } else {
-            [0.0; 3]
+        let load_avg = match macos_proc::load_average() {
+            Ok(raw) => [raw[0] as f32, raw[1] as f32, raw[2] as f32],
+            Err(_) => [0.0; 3],
         };
 
-        let mem = RawMemSample {
-            total_bytes,
-            app_bytes,
-            wired_bytes,
-            compressed_bytes,
-            cached_bytes,
-            swap_used_bytes: swap.xsu_used,
-            swap_total_bytes: swap.xsu_total,
-        };
         (mem, load_avg, uptime_secs)
     }
 
@@ -1595,7 +1230,7 @@ mod macos {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Processes via libproc + Mach timebase
+    // 4. Processes via `blaze_sys::macos_proc`
     // -------------------------------------------------------------------------
 
     fn c_bytes_to_str(bytes: &[u8]) -> &str {
@@ -1607,26 +1242,37 @@ mod macos {
         alloc: Alloc<'static>,
         gpu_by_pid: &HashMap<u32, (u64, u32)>,
     ) -> AVec<'static, RawProcess<'static>> {
-        let (tb_numer, tb_denom) = mach_timebase();
+        let (tb_numer, tb_denom) = cached_mach_timebase();
+        let to_ns = |ticks: u64| {
+            macos_proc::ticks_to_ns(
+                ticks,
+                macos_proc::MachTimebase {
+                    numer: tb_numer,
+                    denom: tb_denom,
+                },
+            )
+        };
 
-        // SAFETY: `proc_listallpids(NULL, 0)` queries the current process count without writing.
-        let estimated = unsafe { proc_listallpids(null_mut(), 0) };
-        if estimated <= 0 {
+        let Ok(estimated) = macos_proc::count_all_pids() else {
+            return AVec::new_in(alloc);
+        };
+        if estimated == 0 {
             return AVec::new_in(alloc);
         }
 
-        let cap = (estimated as usize).saturating_add(128).min(65_536);
+        let cap = estimated.saturating_add(128).min(65_536);
         let mut pids = vec![0i32; cap];
-        let buf_bytes = i32::try_from(cap * size_of::<i32>()).unwrap_or(i32::MAX);
-        // SAFETY: `pids` holds `cap` `i32` slots (`buf_bytes` bytes).
-        let actual_count = unsafe { proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), buf_bytes) };
-        if actual_count <= 0 {
+        let Ok(actual_count) = macos_proc::list_all_pids(&mut pids) else {
+            return AVec::new_in(alloc);
+        };
+        if actual_count == 0 {
             return AVec::new_in(alloc);
         }
-        let pid_slice = &pids[..(actual_count as usize).min(pids.len())];
+        let pid_slice = &pids[..actual_count.min(pids.len())];
 
         let mut out = AVec::with_capacity_in(pid_slice.len(), alloc);
         let mut path_buf = [0u8; PROC_PIDPATHINFO_MAXSIZE];
+        let mut cwd_buf = [0u8; MAXPATHLEN];
 
         for &raw_pid in pid_slice {
             if raw_pid < 0 {
@@ -1634,37 +1280,17 @@ mod macos {
             }
             let pid = raw_pid as u32;
 
-            let mut bsd = MaybeUninit::<ProcBsdInfo>::zeroed();
-            // SAFETY: `bsd` points to 136 writable bytes matching `PROC_PIDTBSDINFO`.
-            let bsd_len = unsafe {
-                proc_pidinfo(
-                    raw_pid,
-                    PROC_PIDTBSDINFO,
-                    0,
-                    bsd.as_mut_ptr().cast::<c_void>(),
-                    size_of::<ProcBsdInfo>() as i32,
-                )
-            };
-            if bsd_len != size_of::<ProcBsdInfo>() as i32 {
+            let Ok(bsd) = macos_proc::proc_bsd_info(raw_pid) else {
                 continue;
-            }
-            // SAFETY: `proc_pidinfo` wrote the full `ProcBsdInfo` struct.
-            let bsd = unsafe { bsd.assume_init() };
+            };
 
             // Executable path & `.app` bundle path.
-            // SAFETY: `path_buf` has `PROC_PIDPATHINFO_MAXSIZE` (4096) writable bytes.
-            let path_len = unsafe {
-                proc_pidpath(
-                    raw_pid,
-                    path_buf.as_mut_ptr().cast::<c_void>(),
-                    PROC_PIDPATHINFO_MAXSIZE as u32,
-                )
-            };
-            let exe_path_str = if path_len > 0 {
-                let len = (path_len as usize).min(path_buf.len());
-                String::from_utf8_lossy(&path_buf[..len]).into_owned()
-            } else {
-                String::new()
+            let exe_path_str = match macos_proc::proc_exe_path(raw_pid, &mut path_buf) {
+                Ok(len) if len > 0 => {
+                    let used = len.min(path_buf.len());
+                    String::from_utf8_lossy(&path_buf[..used]).into_owned()
+                }
+                _ => String::new(),
             };
             let app_bundle_path =
                 extract_app_bundle_path(&exe_path_str).map(|s| AString::from_str_in(s, alloc));
@@ -1672,8 +1298,8 @@ mod macos {
             // Prefer `pbi_name` (32 chars) over `pbi_comm` (16 chars); if `pbi_name` hit the
             // 31-byte kernel truncation cap and the executable basename extends it, use the full
             // basename.
-            let bsd_name = c_bytes_to_str(&bsd.pbi_name);
-            let bsd_comm = c_bytes_to_str(&bsd.pbi_comm);
+            let bsd_name = std::str::from_utf8(bsd.name_bytes()).unwrap_or("");
+            let bsd_comm = c_bytes_to_str(&bsd.comm);
             let exe_basename = Path::new(&exe_path_str)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -1691,83 +1317,44 @@ mod macos {
             };
 
             // Task info (thread count, plus fallback RSS & CPU ticks when `proc_pid_rusage` gets EPERM).
-            let mut task_info = ProcTaskInfo::default();
-            // SAFETY: `task_info` is 96 writable bytes matching `PROC_PIDTASKINFO`.
-            let task_len = unsafe {
-                proc_pidinfo(
-                    raw_pid,
-                    PROC_PIDTASKINFO,
-                    0,
-                    (&raw mut task_info).cast::<c_void>(),
-                    size_of::<ProcTaskInfo>() as i32,
-                )
-            };
-            let has_task = task_len == size_of::<ProcTaskInfo>() as i32;
-            let threads = if has_task && task_info.pti_threadnum > 0 {
-                task_info.pti_threadnum as u32
-            } else {
-                0
-            };
+            let task_info = macos_proc::proc_task_info(raw_pid).ok();
+            let threads = task_info.as_ref().map_or(0, |t| t.threads);
 
-            // Preferred Activity Monitor metrics via `proc_pid_rusage(RUSAGE_INFO_V4)`.
-            let mut rusage = MaybeUninit::<RusageInfoV4>::zeroed();
-            // SAFETY: `rusage` is 296 writable bytes matching `RUSAGE_INFO_V4`.
-            let ru_rc = unsafe {
-                proc_pid_rusage(raw_pid, RUSAGE_INFO_V4, rusage.as_mut_ptr().cast::<c_void>())
-            };
-            let (cpu_time_ns, mem_bytes, disk_read_bytes, disk_write_bytes) = if ru_rc == 0 {
-                // SAFETY: `proc_pid_rusage` returned 0 and populated `RusageInfoV4`.
-                let ru = unsafe { rusage.assume_init() };
-                let ticks = ru.ri_user_time.saturating_add(ru.ri_system_time);
-                (
-                    mach_ticks_to_ns(ticks, tb_numer, tb_denom),
-                    ru.ri_phys_footprint,
-                    ru.ri_diskio_bytesread,
-                    ru.ri_diskio_byteswritten,
-                )
-            } else if has_task {
-                // Unprivileged fallback for root/other-UID processes where `proc_pid_rusage`
-                // returns EPERM but `PROC_PIDTASKINFO` still succeeded.
-                let ticks = task_info
-                    .pti_total_user
-                    .saturating_add(task_info.pti_total_system);
-                (
-                    mach_ticks_to_ns(ticks, tb_numer, tb_denom),
-                    task_info.pti_resident_size,
-                    0,
-                    0,
-                )
-            } else {
-                (0, 0, 0, 0)
-            };
+            // Preferred Activity Monitor metrics via `proc_rusage_v4`.
+            let (cpu_time_ns, mem_bytes, disk_read_bytes, disk_write_bytes) =
+                if let Ok(ru) = macos_proc::proc_rusage_v4(raw_pid) {
+                    let ticks = ru.user_time.saturating_add(ru.system_time);
+                    (
+                        to_ns(ticks),
+                        ru.phys_footprint,
+                        ru.disk_read_bytes,
+                        ru.disk_write_bytes,
+                    )
+                } else if let Some(ref task) = task_info {
+                    // Unprivileged fallback for root/other-UID processes where `proc_pid_rusage`
+                    // returns EPERM but `PROC_PIDTASKINFO` still succeeded.
+                    let ticks = task.total_user.saturating_add(task.total_system);
+                    (to_ns(ticks), task.resident_size, 0, 0)
+                } else {
+                    (0, 0, 0, 0)
+                };
 
             let (gpu_time_ns, gpu_queues) = gpu_by_pid.get(&pid).copied().unwrap_or((0, 0));
 
-            // Process current working directory via `PROC_PIDVNODEPATHINFO`. Kernel / other-UID
-            // processes may return EPERM (`vnode_len <= 0`), leaving `cwd` empty.
-            let mut vnode = MaybeUninit::<ProcVnodePathInfo>::zeroed();
-            // SAFETY: `vnode` points to 2352 writable bytes matching `PROC_PIDVNODEPATHINFO`.
-            let vnode_len = unsafe {
-                proc_pidinfo(
-                    raw_pid,
-                    PROC_PIDVNODEPATHINFO,
-                    0,
-                    vnode.as_mut_ptr().cast::<c_void>(),
-                    size_of::<ProcVnodePathInfo>() as i32,
-                )
-            };
-            let cwd = if vnode_len == size_of::<ProcVnodePathInfo>() as i32 {
-                // SAFETY: `proc_pidinfo` wrote the full `ProcVnodePathInfo` struct.
-                let vnode = unsafe { vnode.assume_init() };
-                AString::from_str_in(c_bytes_to_str(&vnode.pvi_cdir.vip_path), alloc)
-            } else {
-                AString::new_in(alloc)
+            // Process current working directory. Kernel / other-UID processes may return EPERM,
+            // leaving `cwd` empty.
+            let cwd = match macos_proc::proc_cwd(raw_pid, &mut cwd_buf) {
+                Ok(len) if len > 0 => {
+                    let used = len.min(cwd_buf.len());
+                    AString::from_str_in(c_bytes_to_str(&cwd_buf[..used]), alloc)
+                }
+                _ => AString::new_in(alloc),
             };
 
             out.push(RawProcess {
-                pid: bsd.pbi_pid,
-                ppid: bsd.pbi_ppid,
-                uid: bsd.pbi_uid,
+                pid: bsd.pid,
+                ppid: bsd.ppid,
+                uid: bsd.uid,
                 name: AString::from_str_in(chosen_name, alloc),
                 exe_path: AString::from_str_in(&exe_path_str, alloc),
                 cwd,
@@ -1779,14 +1366,14 @@ mod macos {
                 disk_read_bytes,
                 disk_write_bytes,
                 threads,
-                start_time_secs: bsd.pbi_start_tvsec,
+                start_time_secs: bsd.start_time_secs,
             });
         }
 
         out
     }
 
-    /// Read a process's command line via `sysctl([CTL_KERN, KERN_PROCARGS2, pid])`.
+    /// Read a process's command line via `blaze_sys::macos_proc::proc_args2`.
     ///
     /// Uses an 8 KiB stack buffer for typical processes (0 heap allocations) and probes the exact
     /// kernel buffer size first so processes with large environments (> 8 KiB) still parse cleanly
@@ -1798,39 +1385,19 @@ mod macos {
         let Ok(raw_pid) = i32::try_from(pid) else {
             return String::new();
         };
-        let mut mib = [CTL_KERN, KERN_PROCARGS2, raw_pid];
-
-        let mut needed: usize = 0;
-        // SAFETY: `mib` has 3 `i32` entries; `oldp = NULL` queries the required byte length.
-        let probe_rc = unsafe {
-            sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as u32,
-                null_mut(),
-                &raw mut needed,
-                null(),
-                0,
-            )
+        let Ok(needed) = macos_proc::proc_args2_len(raw_pid) else {
+            return String::new();
         };
-        if probe_rc != 0 || needed < size_of::<i32>() {
+        if needed < size_of::<i32>() {
             return String::new();
         }
 
         if needed <= PROCARGS2_STACK_LEN {
             let mut stack_buf = [0u8; PROCARGS2_STACK_LEN];
-            let mut size = stack_buf.len();
-            // SAFETY: `stack_buf` holds `size` writable bytes for `KERN_PROCARGS2`.
-            let rc = unsafe {
-                sysctl(
-                    mib.as_mut_ptr(),
-                    mib.len() as u32,
-                    stack_buf.as_mut_ptr().cast::<c_void>(),
-                    &raw mut size,
-                    null(),
-                    0,
-                )
+            let Ok(size) = macos_proc::proc_args2(raw_pid, &mut stack_buf) else {
+                return String::new();
             };
-            if rc != 0 || size == 0 {
+            if size == 0 {
                 return String::new();
             }
             let used = size.min(stack_buf.len());
@@ -1838,19 +1405,10 @@ mod macos {
         } else {
             let cap = needed.min(PROCARGS2_MAX_LEN);
             let mut heap_buf = vec![0u8; cap];
-            let mut size = heap_buf.len();
-            // SAFETY: `heap_buf` holds `size` writable bytes for `KERN_PROCARGS2`.
-            let rc = unsafe {
-                sysctl(
-                    mib.as_mut_ptr(),
-                    mib.len() as u32,
-                    heap_buf.as_mut_ptr().cast::<c_void>(),
-                    &raw mut size,
-                    null(),
-                    0,
-                )
+            let Ok(size) = macos_proc::proc_args2(raw_pid, &mut heap_buf) else {
+                return String::new();
             };
-            if rc != 0 || size == 0 {
+            if size == 0 {
                 return String::new();
             }
             let used = size.min(heap_buf.len());
@@ -2016,15 +1574,24 @@ mod tests {
         assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn mach_ticks_to_ns_handles_large_values_without_overflow() {
+        use blaze_sys::macos_proc::{MachTimebase, ticks_to_ns};
+
         // Apple Silicon 24 MHz counter: numer=125, denom=3.
-        assert_eq!(mach_ticks_to_ns(3, 125, 3), 125);
-        assert_eq!(mach_ticks_to_ns(24_000_000, 125, 3), 1_000_000_000);
+        assert_eq!(ticks_to_ns(3, MachTimebase { numer: 125, denom: 3 }), 125);
+        assert_eq!(
+            ticks_to_ns(24_000_000, MachTimebase { numer: 125, denom: 3 }),
+            1_000_000_000
+        );
         // Large tick count that would overflow u64 * 125 without u128 intermediate math.
         let huge_ticks = u64::MAX / 10;
         let expected = ((u128::from(huge_ticks) * 125) / 3).min(u64::MAX as u128) as u64;
-        assert_eq!(mach_ticks_to_ns(huge_ticks, 125, 3), expected);
+        assert_eq!(
+            ticks_to_ns(huge_ticks, MachTimebase { numer: 125, denom: 3 }),
+            expected
+        );
     }
 
     #[test]
@@ -2123,74 +1690,6 @@ mod tests {
         );
         assert!(cmdline.chars().count() <= 120);
         assert!(read_proc_cmdline(0).is_empty());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn xnu_struct_layouts_match_macos_sdk_headers() {
-        use std::mem::{offset_of, size_of};
-
-        use macos::{
-            MachTimebaseInfo, ProcBsdInfo, ProcTaskInfo, ProcVnodePathInfo, RusageInfoV4, Timeval,
-            VmStatistics64Rev1, VnodeInfoPath, XswUsage,
-        };
-
-        assert_eq!(size_of::<ProcBsdInfo>(), 136);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_flags), 0);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_pid), 12);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_ppid), 16);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_uid), 20);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_comm), 48);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_name), 64);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_nfiles), 96);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_nice), 116);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_start_tvsec), 120);
-        assert_eq!(offset_of!(ProcBsdInfo, pbi_start_tvusec), 128);
-
-        assert_eq!(size_of::<ProcTaskInfo>(), 96);
-        assert_eq!(offset_of!(ProcTaskInfo, pti_virtual_size), 0);
-        assert_eq!(offset_of!(ProcTaskInfo, pti_resident_size), 8);
-        assert_eq!(offset_of!(ProcTaskInfo, pti_total_user), 16);
-        assert_eq!(offset_of!(ProcTaskInfo, pti_total_system), 24);
-        assert_eq!(offset_of!(ProcTaskInfo, pti_threadnum), 84);
-
-        assert_eq!(size_of::<RusageInfoV4>(), 296);
-        assert_eq!(offset_of!(RusageInfoV4, ri_user_time), 16);
-        assert_eq!(offset_of!(RusageInfoV4, ri_system_time), 24);
-        assert_eq!(offset_of!(RusageInfoV4, ri_phys_footprint), 72);
-        assert_eq!(offset_of!(RusageInfoV4, ri_diskio_bytesread), 144);
-        assert_eq!(offset_of!(RusageInfoV4, ri_diskio_byteswritten), 152);
-
-        assert_eq!(size_of::<VmStatistics64Rev1>(), 152);
-        assert_eq!(size_of::<VmStatistics64Rev1>() / size_of::<u32>(), 38);
-        assert_eq!(offset_of!(VmStatistics64Rev1, free_count), 0);
-        assert_eq!(offset_of!(VmStatistics64Rev1, wire_count), 12);
-        assert_eq!(offset_of!(VmStatistics64Rev1, purgeable_count), 88);
-        assert_eq!(offset_of!(VmStatistics64Rev1, compressor_page_count), 128);
-        assert_eq!(offset_of!(VmStatistics64Rev1, external_page_count), 136);
-        assert_eq!(offset_of!(VmStatistics64Rev1, internal_page_count), 140);
-
-        assert_eq!(size_of::<XswUsage>(), 32);
-        assert_eq!(offset_of!(XswUsage, xsu_total), 0);
-        assert_eq!(offset_of!(XswUsage, xsu_avail), 8);
-        assert_eq!(offset_of!(XswUsage, xsu_used), 16);
-        assert_eq!(offset_of!(XswUsage, xsu_pagesize), 24);
-        assert_eq!(offset_of!(XswUsage, xsu_encrypted), 28);
-
-        assert_eq!(size_of::<Timeval>(), 16);
-        assert_eq!(offset_of!(Timeval, tv_sec), 0);
-        assert_eq!(offset_of!(Timeval, tv_usec), 8);
-
-        assert_eq!(size_of::<MachTimebaseInfo>(), 8);
-
-        assert_eq!(size_of::<VnodeInfoPath>(), 1176);
-        assert_eq!(offset_of!(VnodeInfoPath, vip_vi), 0);
-        assert_eq!(offset_of!(VnodeInfoPath, vip_path), 152);
-
-        assert_eq!(size_of::<ProcVnodePathInfo>(), 2352);
-        assert_eq!(offset_of!(ProcVnodePathInfo, pvi_cdir), 0);
-        assert_eq!(offset_of!(ProcVnodePathInfo, pvi_cdir.vip_path), 152);
-        assert_eq!(offset_of!(ProcVnodePathInfo, pvi_rdir), 1176);
     }
 
     #[cfg(target_os = "macos")]

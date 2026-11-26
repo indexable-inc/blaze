@@ -3611,6 +3611,10 @@ mod macos_app {
                                                     sm.clamp_selection(vis_rows);
                                                     true
                                                 }
+                                                "c" => {
+                                                    sm.cumulative = !sm.cumulative;
+                                                    true
+                                                }
                                                 "p" => {
                                                     sm.engine.toggle_pause();
                                                     true
@@ -4794,6 +4798,14 @@ mod macos_app {
                                             {
                                                 sm.engine.toggle_tree_mode();
                                                 sm.clamp_selection(blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS);
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SysMonToggleCumulative(bid) => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                sm.cumulative = !sm.cumulative;
                                                 dirty = true;
                                             }
                                         }
