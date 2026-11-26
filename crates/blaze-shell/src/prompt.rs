@@ -41,6 +41,28 @@ pub struct GitHead {
     pub kind: WorktreeKind,
 }
 
+/// One file's diff stat inside a git stash entry (parsed from `git stash show --numstat`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitStashFileStat {
+    pub path: String,
+    pub icon: &'static str,
+    pub added: u32,
+    pub removed: u32,
+    pub is_binary: bool,
+}
+
+/// Rich git stash entry shown in the interactive stash popover (`branch`, `summary`, files, `+`/`-`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitStashEntry {
+    pub index: u32,
+    pub branch: String,
+    pub summary: String,
+    pub files: Vec<GitStashFileStat>,
+    pub total_files: u32,
+    pub total_added: u32,
+    pub total_removed: u32,
+}
+
 /// Full Starship-class Git prompt summary produced by `blaze-git`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitStatusSummary {
@@ -59,6 +81,8 @@ pub struct GitStatusSummary {
     pub changed_files: Vec<(String, &'static str, &'static str)>,
     /// Recent stash descriptions parsed directly from `logs/refs/stash` (newest first, max 8).
     pub stashes: Vec<String>,
+    /// Rich stash entries with per-file `+`/`-` diff stats (cached by stash reflog mtime).
+    pub stash_entries: Vec<GitStashEntry>,
     /// Local git branches read directly from `refs/heads` + `packed-refs` (current first, max 16).
     pub branches: Vec<String>,
     pub dirty: bool,
@@ -79,11 +103,19 @@ pub struct PromptInfo {
     pub host: String,
     /// True when this session is connected to a remote server rather than the local Mac.
     pub is_remote: bool,
+    /// Optional custom host symbol/emoji from `~/.config/blaze-shell/config.toml` (e.g. `"🦑"`).
+    pub host_symbol: Option<String>,
+    /// Optional custom host label (`Some("")` hides hostname for symbol-only display).
+    pub host_label_override: Option<String>,
     pub cwd: String,
     /// Full `~`-abbreviated path (used in tooltips / titlebar).
     pub cwd_display: String,
     /// Concise Starship directory label (repo-rooted inside git, e.g. `blaze-shell-1124`).
     pub dir_short: String,
+    /// Optional custom project symbol/emoji from `~/.config/blaze-shell/config.toml` (e.g. `"👋🌎"`).
+    pub project_symbol: Option<String>,
+    /// Optional custom project display label (`Some("")` hides dir name for symbol-only display).
+    pub project_label_override: Option<String>,
     pub git_branch: Option<String>,
     pub git_detached: bool,
     pub git_status: Option<GitStatusSummary>,
@@ -144,12 +176,17 @@ impl PromptInfo {
             Some(h) => (Some(h.label), h.detached),
             None => (None, false),
         };
-        Self {
-            host: crate::zoxide::detect_local_hostname(),
+        let host = crate::zoxide::detect_local_hostname();
+        let mut info = Self {
+            host,
             is_remote: false,
+            host_symbol: None,
+            host_label_override: None,
             cwd: cwd.to_owned(),
             cwd_display,
             dir_short,
+            project_symbol: None,
+            project_label_override: None,
             git_branch,
             git_detached,
             git_status: None,
@@ -158,6 +195,27 @@ impl PromptInfo {
             project_details,
             last_exit,
             last_duration_ms,
+        };
+        let cfg = crate::config::load_cached(home);
+        info.apply_user_config(&cfg, home);
+        info
+    }
+
+    /// Apply host & project symbol/label overrides from `~/.config/blaze-shell/config.toml`.
+    pub fn apply_user_config(&mut self, cfg: &crate::config::UserConfig<'_>, home: &str) {
+        if let Some(host_rule) = cfg.resolve_host(&self.host, self.is_remote) {
+            self.host_symbol = host_rule.symbol_str().map(str::to_owned);
+            self.host_label_override = host_rule.label_str().map(str::to_owned);
+        } else {
+            self.host_symbol = None;
+            self.host_label_override = None;
+        }
+        if let Some(proj) = cfg.resolve_project(&self.cwd, home) {
+            self.project_symbol = proj.symbol_str().map(str::to_owned);
+            self.project_label_override = proj.label_str().map(str::to_owned);
+        } else {
+            self.project_symbol = None;
+            self.project_label_override = None;
         }
     }
 
@@ -382,6 +440,11 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                 changed_icons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
                 let stashes = read_git_stashes(&head.common_dir, 8);
+                let stash_entries = if stashes.is_empty() {
+                    Vec::new()
+                } else {
+                    read_git_stash_entries(&head.common_dir, &head.work_tree, &stashes, 6)
+                };
                 let branches = read_local_branches(&head.common_dir, &branch, 16);
 
                 let dirty = c.conflicted > 0
@@ -400,6 +463,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     changed_icons,
                     changed_files,
                     stashes,
+                    stash_entries,
                     branches,
                     dirty,
                     conflicted: c.conflicted,
@@ -446,6 +510,136 @@ fn read_git_stashes(common_dir: &Path, limit: usize) -> Vec<String> {
                 .unwrap_or_else(|| line.trim().to_owned())
         })
         .collect()
+}
+
+/// Split `"WIP on main: c54fc93e6 Merge..."` or `"On main: pre-pull-backup"` into `(branch, summary)`.
+fn parse_stash_header(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("WIP on ")
+        .or_else(|| trimmed.strip_prefix("On "))
+        && let Some((br, msg)) = rest.split_once(':')
+    {
+        return (br.trim().to_owned(), msg.trim().to_owned());
+    }
+    (String::new(), trimmed.to_owned())
+}
+
+/// Read rich per-stash file diff stats (`+added` / `-removed`), cached by `(common_dir, reflog mtime, len)`.
+fn read_git_stash_entries(
+    common_dir: &Path,
+    work_tree: &Path,
+    stashes: &[String],
+    limit: usize,
+) -> Vec<GitStashEntry> {
+    use std::collections::HashMap;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::UNIX_EPOCH;
+
+    struct CachedStashes {
+        mtime_ns: u128,
+        len: u64,
+        entries: Vec<GitStashEntry>,
+    }
+    static STASH_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedStashes>>> = OnceLock::new();
+
+    let reflog = common_dir.join("logs/refs/stash");
+    let (mtime_ns, len) = fs::metadata(&reflog)
+        .ok()
+        .map(|m| {
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            (mt, m.len())
+        })
+        .unwrap_or((0, 0));
+
+    let map = STASH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = map.lock()
+        && let Some(hit) = guard.get(common_dir)
+        && hit.mtime_ns == mtime_ns
+        && hit.len == len
+    {
+        return hit.entries.clone();
+    }
+
+    let mut entries = Vec::new();
+    for (idx, raw_msg) in stashes.iter().take(limit).enumerate() {
+        let (branch, summary) = parse_stash_header(raw_msg);
+        let stash_ref = format!("stash@{{{idx}}}");
+        let mut files: Vec<GitStashFileStat> = Vec::new();
+        let mut total_files = 0u32;
+        let mut total_added = 0u32;
+        let mut total_removed = 0u32;
+
+        if let Ok(out) = Command::new("git")
+            .args(["stash", "show", "--numstat", "--include-untracked", &stash_ref])
+            .current_dir(work_tree)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let mut parts = line.splitn(3, '\t');
+                let (Some(a_s), Some(r_s), Some(path)) = (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                if path.trim().is_empty() {
+                    continue;
+                }
+                total_files += 1;
+                let is_binary = a_s == "-" || r_s == "-";
+                let added = a_s.parse::<u32>().unwrap_or(0);
+                let removed = r_s.parse::<u32>().unwrap_or(0);
+                total_added = total_added.saturating_add(added);
+                total_removed = total_removed.saturating_add(removed);
+                if files.len() < 8 {
+                    let leaf = path.rsplit('/').next().unwrap_or(path);
+                    let icon = crate::svg_icons::icon_name_for_file(leaf, Some("file"));
+                    files.push(GitStashFileStat {
+                        path: path.to_owned(),
+                        icon,
+                        added,
+                        removed,
+                        is_binary,
+                    });
+                }
+            }
+            // Sort by largest churn first so the most meaningful files show at the top.
+            files.sort_by(|a, b| (b.added + b.removed).cmp(&(a.added + a.removed)));
+        }
+
+        entries.push(GitStashEntry {
+            index: idx as u32,
+            branch,
+            summary,
+            files,
+            total_files,
+            total_added,
+            total_removed,
+        });
+    }
+
+    if let Ok(mut guard) = map.lock() {
+        if guard.len() > 16 {
+            guard.clear();
+        }
+        guard.insert(
+            common_dir.to_path_buf(),
+            CachedStashes {
+                mtime_ns,
+                len,
+                entries: entries.clone(),
+            },
+        );
+    }
+    entries
 }
 
 fn read_local_branches(common_dir: &Path, current: &str, limit: usize) -> Vec<String> {

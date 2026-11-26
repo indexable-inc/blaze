@@ -403,6 +403,7 @@ pub struct TabBarItem<'a> {
     pub id: TabId,
     /// 1-based workspace number (`Cmd+1..9`).
     pub slot: usize,
+    pub symbol: Option<&'a str>,
     pub title: &'a str,
     pub active: bool,
     pub pane_count: usize,
@@ -568,14 +569,23 @@ pub fn layout_window_top_bar(
             String::new()
         };
         let pad_x = 9.0;
+        let sym_h = 13.0f32;
+        let sym_w = tab
+            .symbol
+            .map(|s| crate::view::symbol_badge_width(s, sym_h) + if title_str.is_empty() { 0.0 } else { 5.0 })
+            .unwrap_or(0.0);
         let slot_w = m.measure(&slot_str, TextFace::Chrome) + 1.0;
-        let title_w = m.measure(&title_str, TextFace::Chrome) + 2.0;
+        let title_w = if title_str.is_empty() {
+            0.0
+        } else {
+            m.measure(&title_str, TextFace::Chrome) + 2.0
+        };
         let badge_w = if badge_str.is_empty() {
             0.0
         } else {
             m.measure(&badge_str, TextFace::Chrome) + 2.0
         };
-        let tab_w = pad_x * 2.0 + slot_w + title_w + badge_w;
+        let tab_w = pad_x * 2.0 + slot_w + sym_w + title_w + badge_w;
         if x + tab_w > tabs_end {
             break;
         }
@@ -610,8 +620,21 @@ pub fn layout_window_top_bar(
         let badge_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
         scene.chrome_text(tx, mid_y, &slot_str, slot_col, false, 0);
         tx += slot_w;
-        scene.chrome_text(tx, mid_y, &title_str, title_col, tab.active, 0);
-        tx += title_w;
+        if let Some(sym) = tab.symbol {
+            let sw = scene.emoji_symbol(
+                tx,
+                btn_y0 + ((btn_y1 - btn_y0) - sym_h) * 0.5,
+                sym_h,
+                sym,
+                if tab.active { 1.0 } else { 0.72 },
+                0,
+            );
+            tx += sw + if title_str.is_empty() { 0.0 } else { 5.0 };
+        }
+        if !title_str.is_empty() {
+            scene.chrome_text(tx, mid_y, &title_str, title_col, tab.active, 0);
+            tx += title_w;
+        }
         if !badge_str.is_empty() {
             scene.chrome_text(tx, mid_y, &badge_str, badge_col, false, 0);
         }
@@ -741,24 +764,43 @@ fn layout_starship_line(
         scene.line(x, y + 4.0, x, y + cap_h - 4.0, 1.0, sep_col, clip_id);
     };
 
-    // Segment 0: Modern Retina MacBook Pro / Server Rack icon + hostname (matching text & icon scale!).
-    if !prompt.host.is_empty() {
+    // Segment 0: Host icon/custom emoji (`~/.config/blaze-shell/config.toml`) + optional hostname.
+    let show_host = !prompt.host.is_empty() || prompt.host_symbol.is_some();
+    if show_host {
         let seg0_x0 = cx - 4.0;
         let host_s = m.icon_md();
-        let host_svg = if prompt.is_remote { "server_rack" } else { "macbook_pro" };
         let host_col = if prompt.is_remote { theme::INK_1 } else { theme::INK_2 };
-        scene.svg_icon_alpha(
-            cx,
-            ty + (m.ch - host_s) * 0.5,
-            host_s,
-            host_svg,
-            icon_alpha,
-            clip_id,
-        );
-        cx += host_s + 6.0;
-        let host_lbl = truncate_chars(&prompt.host, 16);
-        scene.text(cx, ty, &host_lbl, host_col, prompt.is_remote, false, clip_id);
-        cx += host_lbl.chars().count() as f32 * m.cw;
+        let host_label_raw = prompt
+            .host_label_override
+            .as_deref()
+            .unwrap_or(prompt.host.as_str());
+        if let Some(sym) = prompt.host_symbol.as_deref() {
+            let sym_h = (host_s + 1.5).min(m.ch);
+            let sw = scene.emoji_symbol(cx, ty + (m.ch - sym_h) * 0.5, sym_h, sym, icon_alpha, clip_id);
+            cx += sw;
+            if !host_label_raw.is_empty() {
+                cx += 5.0;
+            }
+        } else {
+            let host_svg = if prompt.is_remote { "server_rack" } else { "macbook_pro" };
+            scene.svg_icon_alpha(
+                cx,
+                ty + (m.ch - host_s) * 0.5,
+                host_s,
+                host_svg,
+                icon_alpha,
+                clip_id,
+            );
+            cx += host_s;
+            if !host_label_raw.is_empty() {
+                cx += 6.0;
+            }
+        }
+        if !host_label_raw.is_empty() {
+            let host_lbl = truncate_chars(host_label_raw, 16);
+            scene.text(cx, ty, &host_lbl, host_col, prompt.is_remote, false, clip_id);
+            cx += host_lbl.chars().count() as f32 * m.cw;
+        }
         scene.push_hover_clipped(
             HitRect::new(seg0_x0, y, cx + 4.0, y + cap_h),
             clip_id,
@@ -771,7 +813,7 @@ fn layout_starship_line(
                 subtitle: Some(if prompt.is_remote {
                     "connected via SSH / BSH1".to_owned()
                 } else {
-                    format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
+                    format!("{} {} · ~/.config/blaze-shell/config.toml", std::env::consts::OS, std::env::consts::ARCH)
                 }),
             },
         );
@@ -780,28 +822,46 @@ fn layout_starship_line(
         cx += sep_pad;
     }
 
-    // Segment 1: Location (macOS folder SVG + quiet parent path + crisp leaf dir).
+    // Segment 1: Location (custom project emoji or macOS folder SVG + quiet parent path + crisp leaf dir).
     let seg1_x0 = cx - 4.0;
-    scene.svg_icon_alpha(cx, ty + (m.ch - folder_s) * 0.5, folder_s, "folder_macos", icon_alpha, clip_id);
-    cx += folder_s + 6.0;
-
-    let max_dir = ((max_w * 0.42) / m.cw).floor().max(12.0) as usize;
-    let dir_lbl = truncate_chars(
-        if prompt.dir_short.is_empty() { &prompt.cwd_display } else { &prompt.dir_short },
-        max_dir,
-    );
-    if let Some(slash) = dir_lbl.rfind('/')
-        && slash + 1 < dir_lbl.len()
-    {
-        let parent = &dir_lbl[..=slash];
-        let leaf = &dir_lbl[slash + 1..];
-        scene.text(cx, ty, parent, meta_col, false, false, clip_id);
-        cx += parent.chars().count() as f32 * m.cw;
-        scene.text(cx, ty, leaf, dir_col, true, false, clip_id);
-        cx += leaf.chars().count() as f32 * m.cw;
+    let raw_dir_lbl = match prompt.project_label_override.as_deref() {
+        Some(custom) => custom,
+        None => {
+            if prompt.dir_short.is_empty() {
+                &prompt.cwd_display
+            } else {
+                &prompt.dir_short
+            }
+        }
+    };
+    if let Some(sym) = prompt.project_symbol.as_deref() {
+        let sym_h = (folder_s + 1.5).min(m.ch);
+        let sw = scene.emoji_symbol(cx, ty + (m.ch - sym_h) * 0.5, sym_h, sym, icon_alpha, clip_id);
+        cx += sw;
+        if !raw_dir_lbl.is_empty() {
+            cx += 6.0;
+        }
     } else {
-        scene.text(cx, ty, &dir_lbl, dir_col, true, false, clip_id);
-        cx += dir_lbl.chars().count() as f32 * m.cw;
+        scene.svg_icon_alpha(cx, ty + (m.ch - folder_s) * 0.5, folder_s, "folder_macos", icon_alpha, clip_id);
+        cx += folder_s + 6.0;
+    }
+
+    if !raw_dir_lbl.is_empty() {
+        let max_dir = ((max_w * 0.42) / m.cw).floor().max(12.0) as usize;
+        let dir_lbl = truncate_chars(raw_dir_lbl, max_dir);
+        if let Some(slash) = dir_lbl.rfind('/')
+            && slash + 1 < dir_lbl.len()
+        {
+            let parent = &dir_lbl[..=slash];
+            let leaf = &dir_lbl[slash + 1..];
+            scene.text(cx, ty, parent, meta_col, false, false, clip_id);
+            cx += parent.chars().count() as f32 * m.cw;
+            scene.text(cx, ty, leaf, dir_col, true, false, clip_id);
+            cx += leaf.chars().count() as f32 * m.cw;
+        } else {
+            scene.text(cx, ty, &dir_lbl, dir_col, true, false, clip_id);
+            cx += dir_lbl.chars().count() as f32 * m.cw;
+        }
     }
     if !prompt.cwd.is_empty() {
         scene.push_hover_clipped(
@@ -962,6 +1022,7 @@ fn layout_starship_line(
                         clip_id,
                         HoverKind::GitStashes {
                             stashes: st.stashes.clone(),
+                            entries: st.stash_entries.clone(),
                             total: st.stashed,
                         },
                     );
@@ -1128,6 +1189,8 @@ fn layout_block(
         scene,
         &block.source,
         &spans,
+        None,
+        None,
         cmd_x,
         cur_y,
         cmd_max_x,
@@ -1211,6 +1274,8 @@ fn layout_highlighted_source(
     scene: &mut Scene,
     source: &str,
     spans: &[HighlightSpan],
+    abbrevs: Option<&std::collections::BTreeMap<String, String>>,
+    live_cursor: Option<usize>,
     x0: f32,
     y0: f32,
     x1: f32,
@@ -1227,7 +1292,26 @@ fn layout_highlighted_source(
     for sp in spans {
         let s = (sp.span.start as usize).min(source.len());
         let e = (sp.span.end as usize).min(source.len());
-        let col = theme::highlight_color(sp.kind);
+        let col = if sp.kind == blaze_sh::lex::HighlightKind::Command && s < e {
+            let tok = &source[s..e];
+            match crate::editor::classify_command_token(tok, abbrevs) {
+                crate::editor::CommandHighlightKind::Builtin => theme::CMD_BUILTIN,
+                crate::editor::CommandHighlightKind::Abbrev => theme::CMD_ABBREV,
+                crate::editor::CommandHighlightKind::External => theme::CMD_EXTERNAL,
+                crate::editor::CommandHighlightKind::Unknown => {
+                    // While actively typing a valid command prefix at the cursor, stay neutral
+                    // instead of flashing red mid-word (e.g. `cla` -> `claude`).
+                    let editing_here = live_cursor.is_some_and(|c| c >= s && c <= e);
+                    if editing_here && crate::editor::is_known_command_prefix(tok, abbrevs) {
+                        theme::INK_1
+                    } else {
+                        theme::CMD_UNKNOWN
+                    }
+                }
+            }
+        } else {
+            theme::highlight_color(sp.kind)
+        };
         for c in &mut byte_colors[s..e] {
             *c = col;
         }
@@ -1545,40 +1629,45 @@ fn cached_ls_git_statuses(
 
 fn git_status_style(st: GitFileStatus, is_dir: bool) -> (f32, [f32; 4], Option<(&'static str, [f32; 4])>, bool) {
     match st {
-        GitFileStatus::Ignored => (0.42, theme::INK_4, None, false),
+        // Ignored / build artifacts: strongly faded, zero badge clutter.
+        GitFileStatus::Ignored => (0.40, theme::INK_4, None, false),
+        // Clean tracked: normal bright text, NO dot clutter (IntelliJ VCS style).
         GitFileStatus::Tracked => (
             1.0,
             if is_dir { theme::INK_1 } else { theme::INK_2 },
             None,
-            true,
+            false,
         ),
+        // Tracked with uncommitted edits: IntelliJ VCS modified sky-blue + `M`.
         GitFileStatus::Modified => (
             1.0,
-            theme::rgb(0xf0, 0xd8, 0xa8),
-            Some(("M", theme::rgb(0xe5, 0xb5, 0x67))),
+            theme::rgb(0x7c, 0xc0, 0xff),
+            Some(("M", theme::rgb(0x58, 0x9d, 0xf6))),
             false,
         ),
+        // Staged / added: IntelliJ VCS added emerald + `+`.
         GitFileStatus::Staged => (
             1.0,
-            theme::rgb(0xc6, 0xf6, 0xd5),
-            Some(("+", theme::rgb(0x4a, 0xde, 0x80))),
+            theme::rgb(0x88, 0xe0, 0x9e),
+            Some(("+", theme::rgb(0x57, 0xc7, 0x85))),
             false,
         ),
+        // Untracked (not in git yet): visibly faded warm-rust (IntelliJ VCS untracked) + subtle `?`.
         GitFileStatus::Untracked => (
-            1.0,
-            theme::rgb(0xb8, 0xd8, 0xf8),
-            Some(("?", theme::rgb(0x60, 0xa5, 0xfa))),
+            0.68,
+            theme::rgb(0xc8, 0x89, 0x76),
+            Some(("?", theme::rgb(0xc8, 0x89, 0x76))),
             false,
         ),
         GitFileStatus::Deleted => (
             0.75,
-            theme::rgb(0xf8, 0x71, 0x71),
-            Some(("D", theme::rgb(0xf8, 0x71, 0x71))),
+            theme::rgb(0xf0, 0x71, 0x78),
+            Some(("D", theme::rgb(0xf0, 0x71, 0x78))),
             false,
         ),
         GitFileStatus::Conflicted => (
             1.0,
-            theme::rgb(0xff, 0xa8, 0xa8),
+            theme::rgb(0xff, 0x88, 0x88),
             Some(("!", theme::rgb(0xf8, 0x51, 0x49))),
             false,
         ),
@@ -1648,7 +1737,10 @@ fn layout_file_grid(
         items.push(GridItem { raw: raw.to_owned(), label, icon, is_dir, git: None, w_px: 0.0 });
     }
     let git_statuses = cached_ls_git_statuses(block, &raw_entries);
-    let badge_pad = if git_statuses.is_some() { m.cw * 1.45 } else { 0.0 };
+    let has_any_badge = git_statuses
+        .as_ref()
+        .is_some_and(|v| v.iter().any(|st| git_status_style(*st, false).2.is_some()));
+    let badge_pad = if has_any_badge { m.cw * 1.45 } else { 0.0 };
     for (idx, item) in items.iter_mut().enumerate() {
         item.git = git_statuses.as_ref().and_then(|v| v.get(idx).copied());
         let label_chars = item.label.chars().count().min(32);
@@ -3461,7 +3553,18 @@ fn layout_inline_prompt(
         m.ch
     } else {
         let spans = editor.highlight_spans();
-        let h = layout_highlighted_source(scene, &editor.text, &spans, text_x, input_y, x1, m, clip_id);
+        let h = layout_highlighted_source(
+            scene,
+            &editor.text,
+            &spans,
+            Some(&editor.abbreviations),
+            Some(editor.cursor),
+            text_x,
+            input_y,
+            x1,
+            m,
+            clip_id,
+        );
 
         // Fish/Nushell inline ghost autosuggestion directly after the cursor on single-line input.
         if vim_mode == VimMode::Insert
@@ -3728,19 +3831,19 @@ fn layout_completion_popup(
                 px1 - 5.0 - sb_pad,
                 ry + row_h,
                 5.0,
-                theme::BG_SELECTED,
+                theme::COMPLETION_SEL_BG,
                 0.0,
                 [0.0; 4],
                 0,
             );
-            // Crisp monochrome left selection rail inside the selected row.
+            // Crisp IntelliJ blue left accent rail inside the selected row.
             scene.overlay_round_rect(
                 px0 + 5.0,
                 ry + 4.0,
                 px0 + 7.0,
                 ry + row_h - 4.0,
                 1.0,
-                theme::INK_1,
+                theme::MATCH_HIGHLIGHT,
                 0.0,
                 [0.0; 4],
                 0,
@@ -3754,42 +3857,114 @@ fn layout_completion_popup(
         if let Some(svg_name) = item.icon {
             scene.overlay_svg_icon(ix, iy, icon_s, svg_name, 0);
         } else {
-            let (glyph, bg_col, fg_col) = match item.kind {
-                CompletionKind::Abbrev => ("→", theme::BG_TRACK, theme::INK_1),
-                CompletionKind::Builtin => ("f", theme::BG_TRACK, theme::INK_2),
-                CompletionKind::Def => ("λ", theme::BG_TRACK, theme::INK_1),
-                CompletionKind::Keyword => ("k", theme::BG_TRACK, theme::INK_2),
-                CompletionKind::Flag => ("-", theme::BG_TRACK, theme::INK_3),
-                CompletionKind::Variable => ("$", theme::BG_TRACK, theme::INK_2),
-                CompletionKind::Column => ("▤", theme::BG_TRACK, theme::INK_2),
-                CompletionKind::Dir => ("d", theme::BG_TRACK, theme::INK_2),
-                CompletionKind::File => ("·", theme::BG_TRACK, theme::INK_3),
-                CompletionKind::External => ("›", theme::BG_TRACK, theme::INK_2),
+            // IntelliJ New UI Dark semantic icons: circular/rounded tinted badges with crisp colored borders & glyphs.
+            let (glyph, radius, fill_col, border_col, fg_col) = match item.kind {
+                CompletionKind::Variable => (
+                    "v",
+                    icon_s * 0.5,
+                    theme::rgba(0xd1, 0x9a, 0x66, 0.20),
+                    theme::rgba(0xd1, 0x9a, 0x66, 0.78),
+                    theme::rgb(0xe5, 0xa8, 0x70),
+                ),
+                CompletionKind::Builtin => (
+                    "f",
+                    icon_s * 0.5,
+                    theme::rgba(0x5c, 0xb8, 0xff, 0.18),
+                    theme::rgba(0x5c, 0xb8, 0xff, 0.75),
+                    theme::CMD_BUILTIN,
+                ),
+                CompletionKind::Subcommand => (
+                    "s",
+                    icon_s * 0.5,
+                    theme::rgba(0x56, 0xb6, 0xc2, 0.18),
+                    theme::rgba(0x56, 0xb6, 0xc2, 0.75),
+                    theme::rgb(0x56, 0xb6, 0xc2),
+                ),
+                CompletionKind::External => (
+                    "›",
+                    4.0,
+                    theme::rgba(0xe5, 0xc0, 0x7b, 0.16),
+                    theme::rgba(0xe5, 0xc0, 0x7b, 0.72),
+                    theme::CMD_EXTERNAL,
+                ),
+                CompletionKind::Abbrev => (
+                    "→",
+                    icon_s * 0.5,
+                    theme::rgba(0xc6, 0x78, 0xdd, 0.20),
+                    theme::rgba(0xc6, 0x78, 0xdd, 0.78),
+                    theme::CMD_ABBREV,
+                ),
+                CompletionKind::Def => (
+                    "λ",
+                    icon_s * 0.5,
+                    theme::rgba(0x6a, 0xab, 0x73, 0.20),
+                    theme::rgba(0x6a, 0xab, 0x73, 0.78),
+                    theme::rgb(0x6a, 0xab, 0x73),
+                ),
+                CompletionKind::Keyword => (
+                    "k",
+                    4.0,
+                    theme::rgba(0xcf, 0x8e, 0x6d, 0.18),
+                    theme::rgba(0xcf, 0x8e, 0x6d, 0.72),
+                    theme::rgb(0xcf, 0x8e, 0x6d),
+                ),
+                CompletionKind::Flag => (
+                    "-",
+                    4.0,
+                    theme::rgba(0x7a, 0xa2, 0xf7, 0.18),
+                    theme::rgba(0x7a, 0xa2, 0xf7, 0.70),
+                    theme::rgb(0x88, 0xa8, 0xcf),
+                ),
+                CompletionKind::Column => (
+                    "▤",
+                    3.5,
+                    theme::rgba(0x6a, 0xab, 0x73, 0.18),
+                    theme::rgba(0x6a, 0xab, 0x73, 0.70),
+                    theme::rgb(0x7c, 0xc9, 0x8b),
+                ),
+                CompletionKind::Dir => (
+                    "d",
+                    3.5,
+                    theme::rgba(0x39, 0x87, 0xe5, 0.18),
+                    theme::rgba(0x39, 0x87, 0xe5, 0.70),
+                    theme::SERIES_BLUE,
+                ),
+                CompletionKind::File => (
+                    "·",
+                    3.5,
+                    theme::BG_TRACK,
+                    theme::LINE_STRONG,
+                    theme::INK_3,
+                ),
             };
-            scene.overlay_round_rect(ix, iy, ix + icon_s, iy + icon_s, 3.5, bg_col, 0.0, [0.0; 4], 0);
+            scene.overlay_round_rect(ix, iy, ix + icon_s, iy + icon_s, radius, fill_col, 1.0, border_col, 0);
             let gx = ix + (icon_s - m.cw) * 0.5;
             scene.overlay_text_run(gx, ty, glyph, fg_col, true, false, 0);
         }
 
-        // Right-aligned type / file-size detail in crisp SF Pro (`UiSmall`).
-        let detail_txt = truncate_chars(&item.detail, 20);
+        // Right-aligned type / expansion / value-hint detail in crisp SF Pro (`UiSmall`).
+        let detail_txt = truncate_chars(&item.detail, 34);
         let detail_w = m.measure(&detail_txt, TextFace::UiSmall);
         let detail_x = px1 - 12.0 - sb_pad - detail_w;
         scene.overlay_ui_small(
             detail_x,
             ty,
             &detail_txt,
-            if is_sel { theme::INK_3 } else { theme::INK_4 },
+            if is_sel { theme::INK_2 } else { theme::INK_4 },
             false,
             false,
             0,
         );
 
-        // Label with IntelliJ-style matched-character highlighting.
+        // Label with IntelliJ-style vivid blue matched-character highlighting (`#589DF6`).
         let label_x = ix + icon_s + 9.0;
         let max_label_ch = ((detail_x - 14.0 - label_x) / m.cw).floor().max(6.0) as usize;
         let label_txt = truncate_chars(&item.label, max_label_ch);
-        let base_col = if is_sel { theme::INK_1 } else { theme::INK_2 };
+        let base_col = match item.kind {
+            CompletionKind::Keyword if !is_sel => theme::rgb(0xd8, 0xa8, 0x8c),
+            _ if is_sel => theme::INK_1,
+            _ => theme::INK_2,
+        };
 
         if item.match_indices.is_empty() {
             scene.overlay_text_run(label_x, ty, &label_txt, base_col, is_sel, false, 0);
@@ -3800,7 +3975,7 @@ fn layout_completion_popup(
             for (ci, ch) in label_txt.chars().enumerate() {
                 let matched = item.match_indices.contains(&ci);
                 if !run.is_empty() && matched != run_matched {
-                    let col = if run_matched { [1.0, 1.0, 1.0, 1.0] } else { base_col };
+                    let col = if run_matched { theme::MATCH_HIGHLIGHT } else { base_col };
                     scene.overlay_text_run(
                         label_x + run_start_col as f32 * m.cw,
                         ty,
@@ -3819,7 +3994,7 @@ fn layout_completion_popup(
                 run.push(ch);
             }
             if !run.is_empty() {
-                let col = if run_matched { [1.0, 1.0, 1.0, 1.0] } else { base_col };
+                let col = if run_matched { theme::MATCH_HIGHLIGHT } else { base_col };
                 scene.overlay_text_run(
                     label_x + run_start_col as f32 * m.cw,
                     ty,
@@ -4269,19 +4444,38 @@ fn layout_active_popover(
             let h = hdr_h + shown as f32 * row_h + pad_y;
             (w, h)
         }
-        HoverKind::GitStashes { stashes, .. } => {
-            let shown = stashes.len().clamp(1, 8);
-            let max_c = stashes
-                .iter()
-                .take(shown)
-                .map(|s| s.chars().count() + 11)
-                .max()
-                .unwrap_or(20)
-                .max(22)
-                .min(58);
-            let w = (max_c as f32 * m.cw + pad_x * 2.0).clamp(240.0, 520.0);
-            let h = hdr_h + shown as f32 * row_h + pad_y;
-            (w, h)
+        HoverKind::GitStashes { stashes, entries, .. } => {
+            if !entries.is_empty() {
+                let file_row_h = m.ch + 4.0;
+                let mut total_h = hdr_h + pad_y;
+                let shown_entries = entries.len().min(5);
+                for (idx, ent) in entries.iter().take(shown_entries).enumerate() {
+                    total_h += row_h; // stash summary header
+                    let shown_files = ent.files.len().min(4);
+                    total_h += shown_files as f32 * file_row_h;
+                    if ent.total_files as usize > shown_files {
+                        total_h += file_row_h;
+                    }
+                    if idx + 1 < shown_entries {
+                        total_h += 6.0; // subtle divider gap between stash cards
+                    }
+                }
+                let w = (vw - 32.0).min(540.0).max(360.0);
+                (w, total_h.min(vh - 48.0))
+            } else {
+                let shown = stashes.len().clamp(1, 8);
+                let max_c = stashes
+                    .iter()
+                    .take(shown)
+                    .map(|s| s.chars().count() + 11)
+                    .max()
+                    .unwrap_or(20)
+                    .max(22)
+                    .min(58);
+                let w = (max_c as f32 * m.cw + pad_x * 2.0).clamp(260.0, 520.0);
+                let h = hdr_h + shown as f32 * row_h + pad_y;
+                (w, h)
+            }
         }
         HoverKind::GitChanges { files, .. } => {
             let shown = files.len().clamp(1, 10);
@@ -4313,7 +4507,15 @@ fn layout_active_popover(
         }
         HoverKind::Toolchains { items } => {
             let shown = items.len().clamp(1, 6);
-            let w = 250.0;
+            let hdr_chars = "project toolchains".len() + "detected".len() + 5;
+            let row_chars = items
+                .iter()
+                .take(shown)
+                .map(|&(_, name, marker)| name.chars().count() + marker.chars().count() + 6)
+                .max()
+                .unwrap_or(20);
+            let w = ((hdr_chars.max(row_chars) as f32 * m.cw) + pad_x * 2.0 + icon_s + 12.0)
+                .clamp(280.0, 460.0);
             let h = hdr_h + shown as f32 * row_h + pad_y;
             (w, h)
         }
@@ -4551,9 +4753,163 @@ fn layout_active_popover(
                 ry += row_h;
             }
         }
-        HoverKind::GitStashes { stashes, total } => {
-            let mut ry = draw_header(scene, &format!("git stashes · {total}"), ".git/logs/refs/stash");
-            if stashes.is_empty() {
+        HoverKind::GitStashes { stashes, entries, total } => {
+            let mut ry = draw_header(scene, &format!("git stashes · {total}"), "click to inspect");
+            if !entries.is_empty() {
+                let file_row_h = m.ch + 4.0;
+                let file_icon_s = m.icon_sm();
+                let add_col = theme::rgb(0x57, 0xc7, 0x85);
+                let del_col = theme::rgb(0xf0, 0x71, 0x78);
+                let shown_entries = entries.len().min(5);
+                for (ei, ent) in entries.iter().take(shown_entries).enumerate() {
+                    if ry + row_h > y1 - 4.0 {
+                        break;
+                    }
+                    let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
+                    if is_hovered(row_rect) {
+                        scene.overlay_round_rect(
+                            row_rect.x0,
+                            row_rect.y0,
+                            row_rect.x1,
+                            row_rect.y1,
+                            5.0,
+                            theme::rgb(0x20, 0x22, 0x2a),
+                            0.0,
+                            [0.0; 4],
+                            0,
+                        );
+                    }
+                    let ty = ry + (row_h - m.ch) * 0.5;
+                    let idx_lbl = format!("@{{{}}}", ent.index);
+                    let idx_w = idx_lbl.len() as f32 * m.cw;
+                    scene.overlay_round_rect(
+                        x0 + pad_x - 2.0,
+                        ty,
+                        x0 + pad_x + idx_w + 4.0,
+                        ty + m.ch,
+                        3.5,
+                        theme::BG_TRACK,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                    scene.overlay_text_run(x0 + pad_x + 1.0, ty, &idx_lbl, theme::PROMPT_BRANCH, true, false, 0);
+
+                    // Right-aligned total diffstat (`+N -M`).
+                    let mut stat_x = x1 - pad_x;
+                    if ent.total_removed > 0 {
+                        let del_s = format!("-{}", ent.total_removed);
+                        let dw = del_s.len() as f32 * m.cw;
+                        stat_x -= dw;
+                        scene.overlay_text_run(stat_x, ty, del_s, del_col, true, false, 0);
+                        stat_x -= 6.0;
+                    }
+                    if ent.total_added > 0 {
+                        let add_s = format!("+{}", ent.total_added);
+                        let aw = add_s.len() as f32 * m.cw;
+                        stat_x -= aw;
+                        scene.overlay_text_run(stat_x, ty, add_s, add_col, true, false, 0);
+                        stat_x -= 8.0;
+                    }
+                    if ent.total_files > 0 {
+                        let fc = format!("{}f", ent.total_files);
+                        let fw = fc.len() as f32 * m.cw;
+                        stat_x -= fw;
+                        scene.overlay_text_run(stat_x, ty, fc, theme::INK_4, false, false, 0);
+                        stat_x -= 8.0;
+                    }
+
+                    let mut tx = x0 + pad_x + idx_w + 10.0;
+                    if !ent.branch.is_empty() {
+                        let br = truncate_chars(&ent.branch, 16);
+                        let bw = br.chars().count() as f32 * m.cw;
+                        if tx + bw + 24.0 < stat_x {
+                            scene.overlay_text_run(tx, ty, &br, theme::INK_3, false, false, 0);
+                            tx += bw + 7.0;
+                        }
+                    }
+                    let max_sum = ((stat_x - tx - 6.0) / m.cw).floor().max(6.0) as usize;
+                    scene.overlay_text_run(
+                        tx,
+                        ty,
+                        truncate_chars(&ent.summary, max_sum),
+                        theme::INK_1,
+                        true,
+                        false,
+                        0,
+                    );
+                    scene.push_hit(
+                        row_rect,
+                        HitAction::InsertToken(format!("git stash show -p stash@{{{}}}", ent.index)),
+                    );
+                    ry += row_h;
+
+                    // Indented changed files with SVG file icons and green `+N` / red `-N`.
+                    let shown_files = ent.files.len().min(4);
+                    for f in ent.files.iter().take(shown_files) {
+                        if ry + file_row_h > y1 - 4.0 {
+                            break;
+                        }
+                        let fty = ry + (file_row_h - m.ch) * 0.5;
+                        let fx = x0 + pad_x + 14.0;
+                        scene.overlay_svg_icon(fx, fty + (m.ch - file_icon_s) * 0.5, file_icon_s, f.icon, 0);
+
+                        let mut rx = x1 - pad_x;
+                        if f.is_binary {
+                            let b = "bin";
+                            let bw = b.len() as f32 * m.cw;
+                            rx -= bw;
+                            scene.overlay_text_run(rx, fty, b, theme::INK_4, false, false, 0);
+                            rx -= 8.0;
+                        } else {
+                            if f.removed > 0 {
+                                let rs = format!("-{}", f.removed);
+                                let rw = rs.len() as f32 * m.cw;
+                                rx -= rw;
+                                scene.overlay_text_run(rx, fty, rs, del_col, false, false, 0);
+                                rx -= 6.0;
+                            }
+                            if f.added > 0 {
+                                let as_ = format!("+{}", f.added);
+                                let aw = as_.len() as f32 * m.cw;
+                                rx -= aw;
+                                scene.overlay_text_run(rx, fty, as_, add_col, false, false, 0);
+                                rx -= 8.0;
+                            }
+                        }
+                        let name_x = fx + file_icon_s + 6.0;
+                        let max_fc = ((rx - name_x - 4.0) / m.cw).floor().max(8.0) as usize;
+                        scene.overlay_text_run(
+                            name_x,
+                            fty,
+                            truncate_middle(&f.path, max_fc),
+                            theme::INK_2,
+                            false,
+                            false,
+                            0,
+                        );
+                        ry += file_row_h;
+                    }
+                    if ent.total_files as usize > shown_files && ry + file_row_h <= y1 - 4.0 {
+                        let rem = ent.total_files as usize - shown_files;
+                        let fty = ry + (file_row_h - m.ch) * 0.5;
+                        scene.overlay_text_run(
+                            x0 + pad_x + 14.0 + file_icon_s + 6.0,
+                            fty,
+                            format!("+{rem} more file{}", if rem == 1 { "" } else { "s" }),
+                            theme::INK_4,
+                            false,
+                            true,
+                            0,
+                        );
+                        ry += file_row_h;
+                    }
+                    if ei + 1 < shown_entries && ry + 4.0 < y1 - 4.0 {
+                        scene.overlay_line(x0 + pad_x, ry + 2.5, x1 - pad_x, ry + 2.5, 1.0, theme::LINE_FAINT, 0);
+                        ry += 6.0;
+                    }
+                }
+            } else if stashes.is_empty() {
                 let ty = ry + (row_h - m.ch) * 0.5;
                 scene.overlay_text_run(x0 + pad_x, ty, "no stash descriptions", theme::INK_4, false, true, 0);
             } else {

@@ -43,6 +43,7 @@ const MAX_PATH_BINS: usize = 4096;
 pub enum CompletionKind {
     Abbrev,
     Builtin,
+    Subcommand,
     Def,
     Keyword,
     Flag,
@@ -51,6 +52,169 @@ pub enum CompletionKind {
     Dir,
     File,
     External,
+}
+
+/// Semantic class of a command-position token for live & block syntax highlighting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandHighlightKind {
+    Builtin,
+    Abbrev,
+    External,
+    Unknown,
+}
+
+/// Fast O(1) `$PATH` executable lookup cached per process for syntax highlighting.
+pub fn is_external_command_in_path(name: &str) -> bool {
+    use std::sync::OnceLock;
+    static PATH_SET: OnceLock<HashSet<String>> = OnceLock::new();
+    let set = PATH_SET.get_or_init(|| {
+        let mut out = HashSet::new();
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in path_var.split(':') {
+                if dir.is_empty() {
+                    continue;
+                }
+                let Ok(rd) = fs::read_dir(dir) else { continue };
+                for entry in rd.flatten() {
+                    if out.len() >= MAX_PATH_BINS {
+                        break;
+                    }
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.is_empty() || fname.starts_with('.') {
+                        continue;
+                    }
+                    let is_exec = entry
+                        .metadata()
+                        .map(|m| {
+                            #[cfg(unix)]
+                            {
+                                m.is_file() && (m.permissions().mode() & 0o111 != 0)
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                m.is_file()
+                            }
+                        })
+                        .unwrap_or(false);
+                    if is_exec {
+                        out.insert(fname);
+                    }
+                }
+            }
+        }
+        out
+    });
+    set.contains(name)
+}
+
+/// Classify a command-position token as Builtin, Abbrev, External `$PATH` binary, or Unknown.
+pub fn classify_command_token(
+    token: &str,
+    abbrevs: Option<&BTreeMap<String, String>>,
+) -> CommandHighlightKind {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return CommandHighlightKind::Unknown;
+    }
+    if let Some(ext) = trimmed.strip_prefix('^') {
+        return if ext.contains('/') || is_external_command_in_path(ext) {
+            CommandHighlightKind::External
+        } else {
+            CommandHighlightKind::Unknown
+        };
+    }
+    if abbrevs.is_some_and(|m| m.contains_key(trimmed)) {
+        return CommandHighlightKind::Abbrev;
+    }
+    if find_spec(trimmed).is_some()
+        || matches!(
+            trimmed,
+            "rust"
+                | "agent"
+                | "y"
+                | "yazi"
+                | "cd"
+                | "pwd"
+                | "alias"
+                | "export"
+                | "clear"
+                | "exit"
+                | "quit"
+                | "help"
+                | "history"
+                | "fork"
+                | "z"
+                | "zi"
+                | "source"
+                | "use"
+                | "hide"
+                | "env"
+        )
+    {
+        return CommandHighlightKind::Builtin;
+    }
+    if trimmed.contains('/') || is_external_command_in_path(trimmed) {
+        return CommandHighlightKind::External;
+    }
+    CommandHighlightKind::Unknown
+}
+
+/// True when `prefix` matches the start of any known builtin, abbreviation, or `$PATH` binary
+/// (used while typing so partial words like `cla` stay neutral instead of flashing red).
+pub fn is_known_command_prefix(
+    prefix: &str,
+    abbrevs: Option<&BTreeMap<String, String>>,
+) -> bool {
+    if prefix.is_empty() || prefix.starts_with('/') || prefix.starts_with('.') || prefix.starts_with('~') {
+        return true;
+    }
+    let clean = prefix.strip_prefix('^').unwrap_or(prefix);
+    if abbrevs.is_some_and(|m| m.keys().any(|k| k.starts_with(clean))) {
+        return true;
+    }
+    if BUILTIN_SPECS.iter().any(|s| s.name.starts_with(clean)) {
+        return true;
+    }
+    if KEYWORDS.iter().any(|(k, _)| k.starts_with(clean)) {
+        return true;
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        // Quick check against cached PATH set via `is_external_command_in_path` isn't prefix-indexed,
+        // so scan only if needed; cache the sorted vec once.
+        use std::sync::OnceLock;
+        static SORTED_BINS: OnceLock<Vec<String>> = OnceLock::new();
+        let bins = SORTED_BINS.get_or_init(|| {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for dir in path_var.split(':') {
+                if dir.is_empty() {
+                    continue;
+                }
+                let Ok(rd) = fs::read_dir(dir) else { continue };
+                for entry in rd.flatten() {
+                    if out.len() >= MAX_PATH_BINS {
+                        break;
+                    }
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.is_empty() || fname.starts_with('.') || seen.contains(&fname) {
+                        continue;
+                    }
+                    if seen.insert(fname.clone()) {
+                        out.push(fname);
+                    }
+                }
+            }
+            out.sort_unstable();
+            out
+        });
+        let idx = bins.partition_point(|b| b.as_str() < clean);
+        if let Some(cand) = bins.get(idx)
+            && cand.starts_with(clean)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// One candidate shown in the IntelliJ-style floating completion popup.
@@ -351,7 +515,8 @@ const DEFAULT_ABBREVIATIONS: &[(&str, &str)] = &[
     ("lt", "ls | sort-by modified -r"),
     ("p", "pwd"),
     ("c", "cd"),
-    ("cl", "clear"),
+    ("cl", "claude --dangerously-skip-permissions"),
+    ("cls", "clear"),
     ("o", "open"),
     ("op", "open"),
     // Structured pipeline shorthand (Nushell-style)
@@ -542,6 +707,12 @@ impl Editor {
             for (k, v) in parse_nuon_abbreviations(&raw) {
                 self.abbreviations.insert(k, v);
             }
+        }
+        // User `[abbreviations]` in `~/.config/blaze-shell/config.toml` take top priority.
+        let cfg = crate::config::load_cached(home);
+        for entry in cfg.abbreviations.iter() {
+            self.abbreviations
+                .insert(entry.name.as_str().to_owned(), entry.desc.as_str().to_owned());
         }
     }
 
@@ -1886,18 +2057,147 @@ impl Editor {
                 }
             });
         } else if prefix.starts_with('-') {
-            if let Some(cmd_name) = active_stage_command(before)
-                && let Some(spec) = find_spec(cmd_name)
-            {
+            let stage_start = before.rfind(['|', ';', '\n']).map_or(0, |p| p + 1);
+            let stage_prefix = before[stage_start..token_start].trim();
+            let stage_words: Vec<&str> = stage_prefix.split_whitespace().collect();
+            let cmd0 = stage_words.first().copied().unwrap_or("");
+            let cmd_base = cmd0.trim_start_matches('^').rsplit('/').next().unwrap_or(cmd0);
+            let subcmd = stage_words
+                .get(1)
+                .copied()
+                .filter(|w| !w.starts_with('-'));
+            let mut seen_flags: HashSet<String> = HashSet::new();
+
+            // 1. Native `blaze-sh` builtin flags.
+            if let Some(spec) = find_spec(cmd_base) {
                 for &flag in spec.flags {
-                    if let Some((score, idxs)) = fuzzy_match_score(flag, prefix) {
+                    if let Some((score, idxs)) = fuzzy_match_score(flag, prefix)
+                        && seen_flags.insert(flag.to_owned())
+                    {
                         scored.push((
-                            score + 30,
+                            score + 40,
                             CompletionItem {
                                 label: flag.to_owned(),
                                 insert: flag.to_owned(),
                                 detail: "flag".to_owned(),
                                 doc: format!("{} {flag} — {}", spec.name, spec.summary),
+                                kind: CompletionKind::Flag,
+                                icon: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // 2. User manual overrides from `~/.config/blaze-shell/config.toml` (`[completions.<cmd>.flags]`).
+            let home = state.get_env("HOME").unwrap_or("");
+            let user_cfg = crate::config::load_cached(home);
+            if let Some(ov) = user_cfg.completion_override(cmd_base) {
+                for entry in ov.flags.iter() {
+                    let flag = entry.name.as_str();
+                    if let Some((score, idxs)) = fuzzy_match_score(flag, prefix)
+                        && seen_flags.insert(flag.to_owned())
+                    {
+                        scored.push((
+                            score + 60,
+                            CompletionItem {
+                                label: flag.to_owned(),
+                                insert: flag.to_owned(),
+                                detail: "custom".to_owned(),
+                                doc: if entry.desc.as_str().is_empty() {
+                                    format!("{cmd_base} {flag}")
+                                } else {
+                                    entry.desc.as_str().to_owned()
+                                },
+                                kind: CompletionKind::Flag,
+                                icon: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // 3. Universal non-blocking CLI spec parser (`--help`, fish completions, `man`, curated manual specs).
+            let path_env = state
+                .get_env("PATH")
+                .map(str::to_owned)
+                .or_else(|| std::env::var("PATH").ok())
+                .unwrap_or_default();
+            let home_opt = (!home.is_empty()).then_some(home);
+            let mut spec_sources = Vec::new();
+            if let Some(sub) = subcmd
+                && let Some(sub_spec) =
+                    crate::cli_spec_driver::lookup_nonblocking(cmd_base, Some(sub), &path_env, home_opt)
+            {
+                spec_sources.push((55i32, sub_spec));
+            }
+            if let Some(top_spec) =
+                crate::cli_spec_driver::lookup_nonblocking(cmd_base, None, &path_env, home_opt)
+            {
+                spec_sources.push((35i32, top_spec));
+            }
+
+            for (boost, spec) in spec_sources {
+                for f in spec.flags.iter() {
+                    let hint = f.value_hint.as_ref().map(|h| h.as_str());
+                    let desc = f.description.as_str();
+                    let short_s = f.short.as_ref().map(|s| s.as_str());
+                    let long_s = f.long.as_ref().map(|s| s.as_str());
+
+                    if let Some(long) = long_s
+                        && let Some((score, idxs)) = fuzzy_match_score(long, prefix)
+                        && seen_flags.insert(long.to_owned())
+                    {
+                        let detail = match (short_s, hint) {
+                            (Some(s), Some(h)) => format!("{s}  {h}"),
+                            (Some(s), None) => s.to_owned(),
+                            (None, Some(h)) => h.to_owned(),
+                            (None, None) => "flag".to_owned(),
+                        };
+                        let doc = if !desc.is_empty() {
+                            desc.to_owned()
+                        } else {
+                            format!("{cmd_base} {long}")
+                        };
+                        scored.push((
+                            score + boost,
+                            CompletionItem {
+                                label: long.to_owned(),
+                                insert: long.to_owned(),
+                                detail,
+                                doc,
+                                kind: CompletionKind::Flag,
+                                icon: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+
+                    // Also match short flags when user typed `-` (not `--`).
+                    if !prefix.starts_with("--")
+                        && let Some(short) = short_s
+                        && let Some((score, idxs)) = fuzzy_match_score(short, prefix)
+                        && seen_flags.insert(short.to_owned())
+                    {
+                        let detail = match (long_s, hint) {
+                            (Some(l), _) => l.to_owned(),
+                            (None, Some(h)) => h.to_owned(),
+                            (None, None) => "flag".to_owned(),
+                        };
+                        let doc = if !desc.is_empty() {
+                            desc.to_owned()
+                        } else {
+                            format!("{cmd_base} {short}")
+                        };
+                        scored.push((
+                            score + boost - 5,
+                            CompletionItem {
+                                label: short.to_owned(),
+                                insert: short.to_owned(),
+                                detail,
+                                doc,
                                 kind: CompletionKind::Flag,
                                 icon: None,
                                 match_indices: idxs,
@@ -1989,7 +2289,7 @@ impl Editor {
                                     detail: "bin".to_owned(),
                                     doc: format!("external command `{bin}` on $PATH"),
                                     kind: CompletionKind::External,
-                                    icon: Some("shell_dark"),
+                                    icon: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2105,7 +2405,7 @@ impl Editor {
                                 insert: sub.to_owned(),
                                 detail: "blaze".to_owned(),
                                 doc: desc.to_owned(),
-                                kind: CompletionKind::Builtin,
+                                kind: CompletionKind::Subcommand,
                                 icon: Some("rust_dark"),
                                 match_indices: idxs,
                             },
@@ -2113,6 +2413,68 @@ impl Editor {
                     }
                 }
                 handled_specialized = true;
+            } else if subcmd.is_none()
+                && !cmd_base.is_empty()
+                && !matches!(cmd_base, "cd" | "z" | "zi" | "ls" | "open" | "cat" | "vim" | "nvim")
+            {
+                // Dynamic subcommand completion for ANY CLI (`claude`, `cargo`, `gh`, `docker`, `kubectl`, etc.)
+                // via our `#![no_std]` `blaze-cli-spec` parser + user `[completions.<cmd>.subcommands]`.
+                let home = state.get_env("HOME").unwrap_or("");
+                let path_env = state
+                    .get_env("PATH")
+                    .map(str::to_owned)
+                    .or_else(|| std::env::var("PATH").ok())
+                    .unwrap_or_default();
+                let mut seen_subs: HashSet<String> = HashSet::new();
+
+                let user_cfg = crate::config::load_cached(home);
+                if let Some(ov) = user_cfg.completion_override(cmd_base) {
+                    for entry in ov.subcommands.iter() {
+                        let sub = entry.name.as_str();
+                        if let Some((score, idxs)) = fuzzy_match_score(sub, prefix)
+                            && seen_subs.insert(sub.to_owned())
+                        {
+                            scored.push((
+                                score + 70,
+                                CompletionItem {
+                                    label: sub.to_owned(),
+                                    insert: sub.to_owned(),
+                                    detail: cmd_base.to_owned(),
+                                    doc: entry.desc.as_str().to_owned(),
+                                    kind: CompletionKind::Subcommand,
+                                    icon: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                }
+                if let Some(spec) = crate::cli_spec_driver::lookup_nonblocking(
+                    cmd_base,
+                    None,
+                    &path_env,
+                    (!home.is_empty()).then_some(home),
+                ) {
+                    for s in spec.subcommands.iter() {
+                        let sub = s.name.as_str();
+                        if let Some((score, idxs)) = fuzzy_match_score(sub, prefix)
+                            && seen_subs.insert(sub.to_owned())
+                        {
+                            scored.push((
+                                score + 62,
+                                CompletionItem {
+                                    label: sub.to_owned(),
+                                    insert: sub.to_owned(),
+                                    detail: cmd_base.to_owned(),
+                                    doc: s.description.as_str().to_owned(),
+                                    kind: CompletionKind::Subcommand,
+                                    icon: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                }
             }
 
             // Column-aware completion for table pipeline operators (`where`, `sort-by`, `select`, `get`, ...).
@@ -2214,6 +2576,7 @@ impl Editor {
             item.kind,
             CompletionKind::Abbrev
                 | CompletionKind::Builtin
+                | CompletionKind::Subcommand
                 | CompletionKind::Def
                 | CompletionKind::Keyword
                 | CompletionKind::External

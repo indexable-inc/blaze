@@ -98,25 +98,37 @@ pub const PROMPT_OK: [f32; 4] = rgb(0x7a, 0xd8, 0x96);
 pub const PROMPT_SPARK: [f32; 4] = rgb(0x74, 0xb0, 0xf7);
 /// Fish-style inline ghost autosuggestion text.
 pub const GHOST_INK: [f32; 4] = rgb(0x56, 0x56, 0x5c);
-/// Completion & history matched-character highlight (crisp pure white, monochrome-first).
-pub const MATCH_HIGHLIGHT: [f32; 4] = rgb(0xff, 0xff, 0xff);
+/// Completion & history matched-character highlight (IntelliJ New UI signature vivid blue).
+pub const MATCH_HIGHLIGHT: [f32; 4] = rgb(0x58, 0x9d, 0xf6);
+/// IntelliJ New UI dark-blue selected completion row fill.
+pub const COMPLETION_SEL_BG: [f32; 4] = rgb(0x27, 0x3b, 0x5c);
 
-/// Monochrome-first syntax highlighting matching `ix.dev/blaze`'s `$ curl -fsSL ... | sh`:
-/// commands in warm paper-white (`INK_1`), quoted strings in crisp editorial green, flags/pipes
-/// in quiet stone, and colour reserved for errors and semantic signals.
+// Semantic command-position syntax colors (distinct builtin vs external binary vs abbreviation).
+/// Builtin / `blaze-sh` native command (`ls`, `open`, `where`, `sort-by`): crisp sky-blue.
+pub const CMD_BUILTIN: [f32; 4] = rgb(0x5c, 0xb8, 0xff);
+/// External `$PATH` binary (`fd`, `rg`, `claude`, `git`, `vim`): warm IntelliJ method-gold.
+pub const CMD_EXTERNAL: [f32; 4] = rgb(0xe5, 0xc0, 0x7b);
+/// Command-position abbreviation (`cl`, `gs`, `ll`, `bc`): vivid IntelliJ lavender.
+pub const CMD_ABBREV: [f32; 4] = rgb(0xc6, 0x78, 0xdd);
+/// Unresolved/unknown command token: soft coral red.
+pub const CMD_UNKNOWN: [f32; 4] = rgb(0xe0, 0x6c, 0x75);
+
+/// IntelliJ New UI Dark inspired syntax highlighting:
+/// builtins in sky-blue, external `$PATH` commands in warm gold, abbreviations in lavender,
+/// keywords in warm IntelliJ orange, flags in cool slate-blue, strings in emerald green.
 pub fn highlight_color(kind: HighlightKind) -> [f32; 4] {
     match kind {
         HighlightKind::Command => INK_1,
-        HighlightKind::Keyword => INK_2,
-        HighlightKind::Flag => INK_3,
-        HighlightKind::String => rgb(0x7c, 0xc9, 0x8b),
-        HighlightKind::Number => INK_1,
-        HighlightKind::Unit => INK_3,
-        HighlightKind::Var => INK_2,
-        HighlightKind::Operator => INK_3,
-        HighlightKind::Pipe => INK_4,
+        HighlightKind::Keyword => rgb(0xcf, 0x8e, 0x6d),
+        HighlightKind::Flag => rgb(0x88, 0xa8, 0xcf),
+        HighlightKind::String => rgb(0x6a, 0xab, 0x73),
+        HighlightKind::Number => rgb(0x2a, 0xac, 0xb8),
+        HighlightKind::Unit => rgb(0x56, 0xb6, 0xc2),
+        HighlightKind::Var => rgb(0xc7, 0x92, 0xea),
+        HighlightKind::Operator => rgb(0x9a, 0xa5, 0xb8),
+        HighlightKind::Pipe => rgb(0x7c, 0x87, 0x99),
         HighlightKind::Punct => INK_4,
-        HighlightKind::Comment => INK_4,
+        HighlightKind::Comment => rgb(0x70, 0x76, 0x80),
         HighlightKind::RustCode => INK_1,
         HighlightKind::Error => DANGER,
     }
