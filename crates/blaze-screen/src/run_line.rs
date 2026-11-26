@@ -774,6 +774,105 @@ pub struct LineBuf<const N: usize> {
     len: usize,
 }
 
+/// Column width of right-aligned Cargo-style status verbs (`    Checking`, `    Finished`,
+/// `     Running`).
+pub const STATUS_VERB_WIDTH: usize = 12;
+
+/// Persistent Cargo-style status verb for `blaze run` progress lines on stderr.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusVerb {
+    Checking,
+    Compiling,
+    Linking,
+    Finished,
+    Running,
+}
+
+impl StatusVerb {
+    /// Display word for this status verb.
+    pub const fn word(self) -> &'static str {
+        match self {
+            StatusVerb::Checking => "Checking",
+            StatusVerb::Compiling => "Compiling",
+            StatusVerb::Linking => "Linking",
+            StatusVerb::Finished => "Finished",
+            StatusVerb::Running => "Running",
+        }
+    }
+
+    /// Semantic palette token for this verb (`Running` cyan for in-progress work, `Success`
+    /// green for completion and launch).
+    pub const fn token(self) -> blaze_report::palette::Token {
+        match self {
+            StatusVerb::Checking | StatusVerb::Compiling | StatusVerb::Linking => {
+                blaze_report::palette::Token::Running
+            }
+            StatusVerb::Finished | StatusVerb::Running => blaze_report::palette::Token::Success,
+        }
+    }
+}
+
+/// Formats one Cargo-style persistent status line onto `out`: right-aligned 12-column verb
+/// (bold palette color when `terminal` enables color, plain otherwise), one space, `detail`,
+/// and a trailing newline.
+pub fn write_status_line(
+    out: &mut dyn fmt::Write,
+    terminal: &blaze_report::terminal::Terminal,
+    verb: StatusVerb,
+    detail: fmt::Arguments<'_>,
+) -> fmt::Result {
+    let word = verb.word();
+    for _ in 0..STATUS_VERB_WIDTH.saturating_sub(word.len()) {
+        out.write_char(' ')?;
+    }
+    match terminal.sgr(verb.token()) {
+        "" => out.write_str(word)?,
+        code if code.starts_with("1;") => write!(out, "\x1b[{code}m{word}\x1b[0m")?,
+        code => write!(out, "\x1b[1;{code}m{word}\x1b[0m")?,
+    }
+    out.write_char(' ')?;
+    out.write_fmt(detail)?;
+    out.write_char('\n')
+}
+
+/// Formats `elapsed_ms` as a concise Cargo-style duration (`0.14s`, `12.34s`, `1m 05.20s`).
+pub fn write_elapsed_secs(out: &mut dyn fmt::Write, elapsed_ms: u64) -> fmt::Result {
+    if elapsed_ms < 60_000 {
+        let secs = elapsed_ms / 1000;
+        let hundredths = (elapsed_ms % 1000) / 10;
+        write!(out, "{secs}.{hundredths:02}s")
+    } else {
+        let mins = elapsed_ms / 60_000;
+        let rem = elapsed_ms % 60_000;
+        let secs = rem / 1000;
+        let hundredths = (rem % 1000) / 10;
+        write!(out, "{mins}m {secs:02}.{hundredths:02}s")
+    }
+}
+
+/// Formats a launched binary and its arguments inside backticks (`` `bin arg1 "arg 2"` ``).
+pub fn write_command_line(out: &mut dyn fmt::Write, bin: &str, args: &[&str]) -> fmt::Result {
+    out.write_char('`')?;
+    out.write_str(bin)?;
+    for arg in args {
+        out.write_char(' ')?;
+        let needs_quote = arg.is_empty() || arg.bytes().any(|b| b.is_ascii_whitespace() || b == b'`' || b == b'"');
+        if needs_quote {
+            out.write_char('"')?;
+            for ch in arg.chars() {
+                if ch == '"' || ch == '\\' {
+                    out.write_char('\\')?;
+                }
+                out.write_char(ch)?;
+            }
+            out.write_char('"')?;
+        } else {
+            out.write_str(arg)?;
+        }
+    }
+    out.write_char('`')
+}
+
 impl<const N: usize> LineBuf<N> {
     pub const fn new() -> LineBuf<N> {
         LineBuf { bytes: [0; N], len: 0 }
@@ -1223,5 +1322,60 @@ mod tests {
         assert_eq!(block.rows(), 2);
         let (rows, _) = shown_block(block, &Terminal::PIPE);
         assert!(rows[1].as_str().contains("build.rs"), "build.rs must stay prioritized on short terminals: {:?}", rows[1].as_str());
+    }
+
+    #[test]
+    fn cargo_style_status_lines_align_verbs_and_respect_color() {
+        let plain = Terminal::PIPE;
+        let ansi16 = Terminal {
+            caps: blaze_report::Caps { color: true, links: false, width: Some(80) },
+            colors: blaze_report::palette::Depth::Ansi16,
+            ..Terminal::PIPE
+        };
+
+        let mut buf = LineBuf::<256>::new();
+        write_status_line(&mut buf, &plain, StatusVerb::Checking, format_args!("hello")).expect("fits");
+        assert_eq!(buf.as_str(), "    Checking hello\n");
+        assert!(!buf.as_str().contains('\x1b'));
+
+        buf.clear();
+        write_status_line(&mut buf, &plain, StatusVerb::Compiling, format_args!("hello (src/main.rs)")).expect("fits");
+        assert_eq!(buf.as_str(), "   Compiling hello (src/main.rs)\n");
+
+        buf.clear();
+        write_status_line(&mut buf, &plain, StatusVerb::Linking, format_args!("hello")).expect("fits");
+        assert_eq!(buf.as_str(), "     Linking hello\n");
+
+        buf.clear();
+        let mut dur = LineBuf::<32>::new();
+        write_elapsed_secs(&mut dur, 145).expect("dur fits");
+        assert_eq!(dur.as_str(), "0.14s");
+        write_status_line(&mut buf, &plain, StatusVerb::Finished, format_args!("hello in {}", dur.as_str())).expect("fits");
+        assert_eq!(buf.as_str(), "    Finished hello in 0.14s\n");
+
+        buf.clear();
+        let mut cmd = LineBuf::<128>::new();
+        write_command_line(&mut cmd, "hello", &["--port", "8080", "two words", ""]).expect("cmd fits");
+        assert_eq!(cmd.as_str(), "`hello --port 8080 \"two words\" \"\"`");
+        write_status_line(&mut buf, &plain, StatusVerb::Running, format_args!("{}", cmd.as_str())).expect("fits");
+        assert_eq!(buf.as_str(), "     Running `hello --port 8080 \"two words\" \"\"`\n");
+
+        // Colored ANSI16 output uses bold cyan for Checking and bold green for Finished/Running.
+        buf.clear();
+        write_status_line(&mut buf, &ansi16, StatusVerb::Checking, format_args!("hello")).expect("fits");
+        assert_eq!(buf.as_str(), "    \x1b[1;36mChecking\x1b[0m hello\n");
+
+        buf.clear();
+        write_status_line(&mut buf, &ansi16, StatusVerb::Finished, format_args!("hello in 0.14s")).expect("fits");
+        assert_eq!(buf.as_str(), "    \x1b[1;32mFinished\x1b[0m hello in 0.14s\n");
+
+        buf.clear();
+        write_status_line(&mut buf, &ansi16, StatusVerb::Running, format_args!("`hello`")).expect("fits");
+        assert_eq!(buf.as_str(), "     \x1b[1;32mRunning\x1b[0m `hello`\n");
+
+        // Long durations format with minutes and hundredths.
+        dur.clear();
+        write_elapsed_secs(&mut dur, 65_230).expect("dur fits");
+        assert_eq!(dur.as_str(), "1m 05.23s");
     }
 }

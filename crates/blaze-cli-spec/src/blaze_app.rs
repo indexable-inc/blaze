@@ -105,6 +105,7 @@ const BUILD_FLAGS: &[ArgSpec] = &[
 const RUN_FLAGS: &[ArgSpec] = &[
     flag_multi("package", "package", Some('p'), "<name>", "Package to run", false),
     flag_value("bin", "bin", None, "<name>", "Binary target to run", false),
+    flag_bool("quiet", "quiet", Some('q'), "Do not print status lines", false),
     flag_multi("grant", "grant", None, "<k=v>", "Grant an environment/host capability", false),
     flag_bool("open", "open", None, "Open Explore viewer in browser", false),
     flag_value("workers", "workers", None, "<N>", "Maximum concurrent workers", false),

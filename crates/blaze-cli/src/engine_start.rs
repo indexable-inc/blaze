@@ -230,6 +230,9 @@ pub(crate) fn command(
     if command != Command::Run && flags.open == blaze_run::viewer::OpenExplore::Open {
         return Err(CliError::Usage("--open is `blaze run`'s"));
     }
+    if command != Command::Run && flags.quiet {
+        return Err(CliError::Usage("-q / --quiet is `blaze run`'s"));
+    }
     if flags.output.is_some() {
         return Err(CliError::Usage("-o / --output is `blaze build`'s"));
     }
@@ -247,13 +250,19 @@ pub(crate) fn command(
     };
     let view = flags.view.unwrap_or(blaze_report::frame::plain::View::Person);
     let line = crate::run_line::LineOpts::from_env(env, err, flags.color, screen_cmd, view, flags.status_every.is_some());
-    let line = crate::run_line::LineOpts { live: line.live && matches!(command, Command::Run | Command::Test), ..line };
+    let status_opts = crate::run_line::StatusOpts::for_run(screen_cmd, view, flags.quiet, line.terminal);
+    let line = crate::run_line::LineOpts {
+        live: line.live && matches!(command, Command::Run | Command::Test) && !flags.quiet,
+        ..line
+    };
     let start_scope = match command {
         Command::Run => crate::engine_check::StartScope::Bin(launch.select),
         Command::Test => crate::engine_check::StartScope::Test(launch.select),
         Command::Check => return Err(CliError::Usage("`check` is engine_check.rs's; engine_start.rs starts `run` and `test`")),
     };
-    let lined = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
+    let checking_label = checking_target(&flags, env, cx.frame());
+    let lined = crate::run_line::watched_run(cx, err, clock, line, status_opts, |watch, bg, status_out| {
+        status_out.checking(checking_label.as_str());
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
         let bg_live = if line.live { Some(bg) } else { None };
         check_for_start(cx, Some(args), fs, env, net, host, rng, words, err, phases, heap, &flags, command == Command::Run, start_scope, bg_live, |standing, phases, rng| {
@@ -262,8 +271,8 @@ pub(crate) fn command(
             let select = run_package::Select { member: standing.member, ..launch.select };
             let started = match command {
                 Command::Run => match standing.picked {
-                    Some(picked) => run_program(cx, standing, &picked, &launch, phases, watch),
-                    None => run_package::pick(cx, root, select, frame).and_then(|picked| run_program(cx, standing, &picked, &launch, phases, watch)),
+                    Some(picked) => run_program(cx, standing, &picked, &launch, phases, watch, status_out),
+                    None => run_package::pick(cx, root, select, frame).and_then(|picked| run_program(cx, standing, &picked, &launch, phases, watch, status_out)),
                 },
                 Command::Test => match standing.test_packages {
                     Some(packages) => run_tests(cx, standing, packages, select.bin, &launch, clock, rng, phases, watch),
@@ -276,6 +285,37 @@ pub(crate) fn command(
         })
     });
     lined.map_err(CliError::RunLine)?
+}
+
+/// Concise label shown on `blaze run`'s initial `    Checking <label>` status line using only
+/// parsed CLI flags and `PWD` (zero filesystem syscalls).
+fn checking_target<'f>(
+    flags: &crate::Flags<'_>,
+    env: Option<&bstd::env::Env>,
+    frame: &'f bstd::mem::Frame,
+) -> bstd::mem::String<&'f bstd::mem::Frame> {
+    match (flags.select.package, flags.select.bin) {
+        (Some(pkg), Some(bin)) if bin != pkg => return bstd::mem::format_in!(frame, "{pkg} ({bin})"),
+        (Some(pkg), _) => return bstd::mem::format_in!(frame, "{pkg}"),
+        (None, Some(bin)) => return bstd::mem::format_in!(frame, "{bin}"),
+        (None, None) => {}
+    }
+    if let Some(dir) = flags.dir {
+        let trimmed = dir.trim_end_matches('/');
+        if !trimmed.is_empty() && trimmed != "." {
+            return bstd::mem::format_in!(frame, "{trimmed}");
+        }
+    }
+    if let Some(env) = env
+        && let Ok(name) = bstd::env::VarName::new("PWD")
+        && let Ok(Some(pwd)) = env.get(&name)
+    {
+        let trimmed = pwd.trim_end_matches('/');
+        if let Some(base) = trimmed.rsplit('/').next().filter(|s| !s.is_empty()) {
+            return bstd::mem::format_in!(frame, "{base}");
+        }
+    }
+    bstd::mem::format_in!(frame, "workspace")
 }
 
 /// Domain for folding a non-whole `CheckScope` into the `RunIds` table's certificate so two
@@ -1068,7 +1108,13 @@ pub(crate) fn start_facts<'f>(
 /// image by key, its body ids, then the program under the lazy parent (program.rs `run`), which
 /// builds what it calls and refuses a called body whose check does not run (D151).
 pub(crate) fn run_program(
-    cx: &Cx, mut standing: Standing<'_, '_>, picked: &run_package::Program<'_>, launch: &program::Launch<'_>, phases: &mut Phases, watch: &dyn blaze_screen::Watch,
+    cx: &Cx,
+    mut standing: Standing<'_, '_>,
+    picked: &run_package::Program<'_>,
+    launch: &program::Launch<'_>,
+    phases: &mut Phases,
+    watch: &dyn blaze_screen::Watch,
+    status_out: &crate::run_line::RunStatusOut<'_, '_>,
 ) -> Result<Status, CliError> {
     let (frame, heap) = (standing.frame, standing.heap);
     let erased = blaze_own::Erased::new(frame);
@@ -1133,6 +1179,7 @@ pub(crate) fn run_program(
             .map_err(|error| crate::run_parent::ParentError::Names { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
     };
     let mut ids = || made.take().ok_or_else(|| crate::run_parent::ParentError::BodyIds { shown: std::boxed::Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
+    status_out.set_launch(picked.package, picked.bin, launch.args);
     let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
     drop(names);
     read.add_by_need(scope_records.counts());
@@ -1942,5 +1989,42 @@ mod tests {
         let loaded = super::load_test_inventory_cache(&lent2, graph_out, bump).expect("reopened BZTI");
         assert_eq!(loaded, payload.as_slice());
         assert!(crate::run_names::TestsDeltaCache::open(loaded).is_some());
+    }
+
+    #[test]
+    fn checking_target_and_quiet_flag_work_for_run() {
+        use bstd::io::{Io, Limits, SimWorld};
+
+        let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+        let args_of = |words: &[&str]| {
+            let mut world = SimWorld::new(51, Limits::USUAL);
+            world.args = words.iter().map(|&s| s.into()).collect();
+            Io::simulated(world).need_args().expect("args")
+        };
+
+        let a_short = args_of(&["blaze", "run", "-q", "-p", "scripts", "--bin", "rules"]);
+        let quiet_short = crate::flags_in(&a_short, &frame).expect("short -q");
+        assert!(quiet_short.quiet);
+        assert_eq!(super::checking_target(&quiet_short, None, &frame).as_str(), "scripts (rules)");
+
+        let a_long = args_of(&["blaze", "run", "--quiet", "-p", "hello"]);
+        let quiet_long = crate::flags_in(&a_long, &frame).expect("long --quiet");
+        assert!(quiet_long.quiet);
+        assert_eq!(super::checking_target(&quiet_long, None, &frame).as_str(), "hello");
+
+        let a_dir = args_of(&["blaze", "run", "crates/demo/"]);
+        let dir_only = crate::flags_in(&a_dir, &frame).expect("dir");
+        assert!(!dir_only.quiet);
+        assert_eq!(super::checking_target(&dir_only, None, &frame).as_str(), "crates/demo");
+
+        let a_bare = args_of(&["blaze", "run"]);
+        let bare = crate::flags_in(&a_bare, &frame).expect("bare");
+        assert_eq!(super::checking_target(&bare, None, &frame).as_str(), "workspace");
+
+        let mut pwd_world = SimWorld::new(52, Limits::USUAL);
+        pwd_world.env.push(("PWD".into(), "/Users/dev/projects/my-app/".into()));
+        let pwd_io = Io::simulated(pwd_world);
+        let pwd_env = pwd_io.env();
+        assert_eq!(super::checking_target(&bare, pwd_env.as_ref(), &frame).as_str(), "my-app");
     }
 }

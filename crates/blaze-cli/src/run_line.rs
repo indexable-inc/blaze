@@ -15,14 +15,18 @@
 //! Off a terminal (a pipe, a file, `CI`, `TERM=dumb`, `BLAZE_UI=plain`: blaze-screen `live`)
 //! the run is handed [`Unwatched`] and no thread is started.
 
-use core::fmt;
+use core::cell::RefCell;
+use core::fmt::{self, Write as _};
 use core::time::Duration;
 
 use blaze_core::lock::{Lock, Signal};
 use blaze_report::frame::Choice;
 use blaze_report::frame::plain::View;
 use blaze_report::terminal::{self, Color, Config, Terminal};
-use blaze_screen::{Caps, Command, LineBuf, RunStatus, RunStatusOpts, StatusFrame, Step, Unwatched, Watch, encode_status};
+use blaze_screen::{
+    Caps, Command, LineBuf, RunStatus, RunStatusOpts, StatusFrame, StatusVerb, Step, Unwatched, Watch, encode_status,
+    write_command_line, write_elapsed_secs, write_status_line,
+};
 use bstd::clock::{Clock, Instant};
 use bstd::cx::CxSpawn;
 use bstd::env::Env;
@@ -38,6 +42,12 @@ const MOST_COLS: u16 = 512;
 const FRAME_BYTES: usize = 16384;
 /// Bounded wait slice when `ProgressSink::see` waits for the ticker to flush an erase.
 const ERASE_WAIT: Duration = Duration::from_millis(50);
+/// Maximum UTF-8 bytes kept for the package name in a `Finished` line.
+const LAUNCH_PKG_BYTES: usize = 128;
+/// Maximum UTF-8 bytes kept for the formatted `` `<bin> <args...>` `` command line.
+const LAUNCH_CMD_BYTES: usize = 1024;
+/// Stack buffer for a persistent Cargo-style status line batch (`Checking`, or `Finished` + `Running`).
+const STATUS_BYTES: usize = 2048;
 
 /// Why the live line failed: said when the command ends (the run itself went on).
 #[derive(Debug)]
@@ -106,11 +116,141 @@ impl LineOpts {
     }
 }
 
+/// Persistent Cargo-style status line configuration for `blaze run` on stderr.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StatusOpts {
+    /// Emit persistent `Checking` / `Finished` / `Running` lines on stderr (`Command::Run`,
+    /// `View::Person`, `!quiet`), both on TTYs (colored) and non-TTYs (plain).
+    pub enabled: bool,
+    pub terminal: Terminal,
+}
+
+impl StatusOpts {
+    pub(crate) const OFF: StatusOpts = StatusOpts { enabled: false, terminal: Terminal::PIPE };
+
+    /// Enables Cargo-style persistent stderr status lines for human-facing non-quiet `blaze run`.
+    pub(crate) fn for_run(command: Command, view: View, quiet: bool, terminal: Terminal) -> StatusOpts {
+        StatusOpts { enabled: command == Command::Run && matches!(view, View::Person) && !quiet, terminal }
+    }
+}
+
+/// Truncates `text` to the longest UTF-8 prefix fitting in `max_bytes`.
+fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut take = max_bytes;
+    while take > 0 && !text.is_char_boundary(take) {
+        take -= 1;
+    }
+    &text[..take]
+}
+
+/// Bounded inline writer that caps output at `N - 4` bytes and flags truncation cleanly.
+struct CappedLine<const N: usize> {
+    buf: LineBuf<N>,
+    truncated: bool,
+}
+
+impl<const N: usize> CappedLine<N> {
+    const fn new() -> Self {
+        Self { buf: LineBuf::new(), truncated: false }
+    }
+}
+
+impl<const N: usize> fmt::Write for CappedLine<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.truncated {
+            return Ok(());
+        }
+        let limit = N.saturating_sub(4);
+        let room = limit.saturating_sub(self.buf.as_bytes().len());
+        if s.len() <= room {
+            let _ = self.buf.write_str(s);
+        } else {
+            let _ = self.buf.write_str(truncate_utf8(s, room));
+            self.truncated = true;
+        }
+        Ok(())
+    }
+}
+
+/// Resolved target metadata saved once `run_package::Program` is picked and emitted atomically
+/// on `Step::Started` right after erasing the inline TUI and right before spawning the child.
+struct LaunchInfo {
+    package: LineBuf<LAUNCH_PKG_BYTES>,
+    cmd: LineBuf<LAUNCH_CMD_BYTES>,
+}
+
+impl LaunchInfo {
+    fn new(package: &str, bin: &str, args: &[&str]) -> Self {
+        let mut pkg_buf = LineBuf::<LAUNCH_PKG_BYTES>::new();
+        let _ = pkg_buf.write_str(truncate_utf8(package, LAUNCH_PKG_BYTES));
+        let mut capped = CappedLine::<LAUNCH_CMD_BYTES>::new();
+        let _ = write_command_line(&mut capped, bin, args);
+        if capped.truncated {
+            let _ = capped.buf.write_str("...`");
+        }
+        Self { package: pkg_buf, cmd: capped.buf }
+    }
+}
+
+fn write_checking_line(cx: &Cx, err: &Out, terminal: &Terminal, failed: &mut Option<RunLineError>, target: &str) {
+    if failed.is_some() {
+        return;
+    }
+    let mut buf = LineBuf::<STATUS_BYTES>::new();
+    let trimmed = truncate_utf8(target, 512);
+    if write_status_line(&mut buf, terminal, StatusVerb::Checking, format_args!("{trimmed}")).is_err() {
+        *failed = Some(RunLineError::Encode);
+        return;
+    }
+    if let Err(why) = err.write_all(cx, buf.as_bytes()).and_then(|()| err.flush(cx)) {
+        *failed = Some(RunLineError::Out(why));
+    }
+}
+
+fn write_started_lines(
+    cx: &Cx,
+    err: &Out,
+    terminal: &Terminal,
+    failed: &mut Option<RunLineError>,
+    launch: &LaunchInfo,
+    elapsed_ms: u64,
+) {
+    if failed.is_some() {
+        return;
+    }
+    let mut dur = LineBuf::<32>::new();
+    if write_elapsed_secs(&mut dur, elapsed_ms).is_err() {
+        *failed = Some(RunLineError::Encode);
+        return;
+    }
+    let mut buf = LineBuf::<STATUS_BYTES>::new();
+    let pkg = launch.package.as_str();
+    let finished_ok = if pkg.is_empty() {
+        write_status_line(&mut buf, terminal, StatusVerb::Finished, format_args!("in {}", dur.as_str()))
+    } else {
+        write_status_line(&mut buf, terminal, StatusVerb::Finished, format_args!("{pkg} in {}", dur.as_str()))
+    };
+    if finished_ok.is_err()
+        || write_status_line(&mut buf, terminal, StatusVerb::Running, format_args!("{}", launch.cmd.as_str())).is_err()
+    {
+        *failed = Some(RunLineError::Encode);
+        return;
+    }
+    if let Err(why) = err.write_all(cx, buf.as_bytes()).and_then(|()| err.flush(cx)) {
+        *failed = Some(RunLineError::Out(why));
+    }
+}
+
 /// What both threads touch, behind [`Line::shared`].
 struct Shared<'a> {
     core: RunStatus,
     err: &'a Out,
     terminal: Terminal,
+    status: StatusOpts,
+    launch: Option<LaunchInfo>,
     /// The first failure; nothing more is written after it.
     failed: Option<RunLineError>,
 }
@@ -118,10 +258,22 @@ struct Shared<'a> {
 impl Shared<'_> {
     /// The frame due now, if any, written.
     fn due(&mut self, cx: &Cx) {
-        let Shared { core, err, terminal, failed } = self;
+        let Shared { core, err, terminal, failed, .. } = self;
         if let Some(frame) = core.frame() {
             put(cx, err, terminal, failed, &frame);
         }
+    }
+
+    /// Emits `Finished` and `Running` once when `Step::Started` fires (after `due` erased the TUI).
+    fn emit_started(&mut self, cx: &Cx, elapsed_ms: u64) {
+        if !self.status.enabled {
+            return;
+        }
+        let Some(launch) = self.launch.take() else {
+            return;
+        };
+        let Shared { err, status, failed, .. } = self;
+        write_started_lines(cx, err, &status.terminal, failed, &launch, elapsed_ms);
     }
 }
 
@@ -190,7 +342,7 @@ impl Line<'_> {
     /// failure returned. A second call writes nothing.
     fn finish(&self, cx: &Cx) -> Result<(), RunLineError> {
         let mut shared = self.shared.lock();
-        let Shared { core, err, terminal, failed } = &mut *shared;
+        let Shared { core, err, terminal, failed, .. } = &mut *shared;
         if let Some(frame) = core.finish() {
             put(cx, err, terminal, failed, &frame);
         }
@@ -213,6 +365,9 @@ impl Watch for Watching<'_, '_> {
         let before = shared.core.next_ms();
         shared.core.see(now, step);
         shared.due(self.cx);
+        if matches!(step, Step::Started) {
+            shared.emit_started(self.cx, now);
+        }
         // The ticker is woken only when the event moved its next time earlier.
         if shared.core.next_ms().is_some_and(|at| before.is_none_or(|was| at < was)) {
             self.line.woken.notify_one();
@@ -221,6 +376,116 @@ impl Watch for Watching<'_, '_> {
 
     fn paths(&self) -> bool {
         true
+    }
+}
+
+/// Non-TTY persistent status sink (no ticker thread, no inline TUI redraws).
+struct PlainState {
+    launch: Option<LaunchInfo>,
+    failed: Option<RunLineError>,
+}
+
+struct PlainStatus<'l, 'a> {
+    cx: &'l Cx,
+    err: &'a Out,
+    clock: &'a Clock,
+    began: Instant,
+    status: StatusOpts,
+    state: RefCell<PlainState>,
+}
+
+impl PlainStatus<'_, '_> {
+    fn now_ms(&self) -> u64 {
+        let since = self.clock.now().since(self.began).unwrap_or(Duration::ZERO);
+        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn checking(&self, target: &str) {
+        if !self.status.enabled {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        write_checking_line(self.cx, self.err, &self.status.terminal, &mut state.failed, target);
+    }
+
+    fn set_launch(&self, package: &str, bin: &str, args: &[&str]) {
+        if !self.status.enabled {
+            return;
+        }
+        self.state.borrow_mut().launch = Some(LaunchInfo::new(package, bin, args));
+    }
+
+    fn finish(&self) -> Result<(), RunLineError> {
+        self.state.borrow_mut().failed.take().map_or(Ok(()), Err)
+    }
+}
+
+impl Watch for PlainStatus<'_, '_> {
+    fn see(&self, step: Step<'_>) {
+        if !self.status.enabled || !matches!(step, Step::Started) {
+            return;
+        }
+        let now = self.now_ms();
+        let mut state = self.state.borrow_mut();
+        let Some(launch) = state.launch.take() else {
+            return;
+        };
+        write_started_lines(self.cx, self.err, &self.status.terminal, &mut state.failed, &launch, now);
+    }
+
+    fn paths(&self) -> bool {
+        false
+    }
+}
+
+enum StatusTarget<'l, 'a> {
+    Off,
+    Live { line: &'l Line<'a>, cx: &'l Cx },
+    Plain { plain: &'l PlainStatus<'l, 'a> },
+}
+
+/// Handle for emitting persistent Cargo-style `blaze run` stderr status lines without
+/// interleaving with the live inline TUI or the child process.
+pub(crate) struct RunStatusOut<'l, 'a> {
+    target: StatusTarget<'l, 'a>,
+}
+
+impl RunStatusOut<'_, '_> {
+    pub(crate) const NONE: RunStatusOut<'static, 'static> = RunStatusOut { target: StatusTarget::Off };
+
+    /// Writes `    Checking <target>` to stderr (erasing any active live TUI first).
+    pub(crate) fn checking(&self, target: &str) {
+        match self.target {
+            StatusTarget::Off => {}
+            StatusTarget::Live { line, cx } => {
+                let now = line.now_ms();
+                let mut shared = line.shared.lock();
+                if !shared.status.enabled {
+                    return;
+                }
+                shared.core.see(now, Step::Says);
+                shared.due(cx);
+                let Shared { err, status, failed, .. } = &mut *shared;
+                write_checking_line(cx, err, &status.terminal, failed, target);
+            }
+            StatusTarget::Plain { plain } => plain.checking(target),
+        }
+    }
+
+    /// Registers the resolved binary target and arguments so `Step::Started` emits
+    /// `    Finished <package> in <X.XXs>` and ``     Running `<bin> <args...>` ``
+    /// atomically right after erasing the inline TUI and right before spawning the child.
+    pub(crate) fn set_launch(&self, package: &str, bin: &str, args: &[&str]) {
+        match self.target {
+            StatusTarget::Off => {}
+            StatusTarget::Live { line, .. } => {
+                let mut shared = line.shared.lock();
+                if shared.status.enabled {
+                    shared.launch = Some(LaunchInfo::new(package, bin, args));
+                }
+            }
+            StatusTarget::Plain { plain } => plain.set_launch(package, bin, args),
+        }
     }
 }
 
@@ -283,13 +548,43 @@ pub(crate) fn watched<R>(
     opts: LineOpts,
     work: impl FnOnce(&dyn Watch, &(dyn Watch + Sync)) -> R,
 ) -> Result<R, RunLineError> {
+    watched_run(cx, err, clock, opts, StatusOpts::OFF, |watch, bg, _| work(watch, bg))
+}
+
+/// Like [`watched`], additionally coordinating persistent Cargo-style `blaze run` stderr status
+/// lines (`Checking`, `Finished`, `Running`) behind the same lock as the live inline TUI on TTYs
+/// and directly on `err` off TTYs (without spawning a ticker thread).
+pub(crate) fn watched_run<R>(
+    cx: &Cx,
+    err: &Out,
+    clock: &Clock,
+    opts: LineOpts,
+    status: StatusOpts,
+    work: impl FnOnce(&dyn Watch, &(dyn Watch + Sync), &RunStatusOut<'_, '_>) -> R,
+) -> Result<R, RunLineError> {
     if !opts.live {
-        return Ok(work(&Unwatched, &ProgressSink::NONE));
+        if !status.enabled {
+            return Ok(work(&Unwatched, &ProgressSink::NONE, &RunStatusOut::NONE));
+        }
+        let plain = PlainStatus {
+            cx,
+            err,
+            clock,
+            began: clock.now(),
+            status,
+            state: RefCell::new(PlainState { launch: None, failed: None }),
+        };
+        let status_out = RunStatusOut { target: StatusTarget::Plain { plain: &plain } };
+        let got = work(&plain, &ProgressSink::NONE, &status_out);
+        return plain.finish().map(|()| got);
     }
     let spawner = cx.spawner();
     let core = RunStatus::new(RunStatusOpts { caps: opts.caps, command: opts.command });
     let line = Line {
-        shared: Lock::new("run.line", Shared { core, err, terminal: opts.terminal, failed: None }),
+        shared: Lock::new(
+            "run.line",
+            Shared { core, err, terminal: opts.terminal, status, launch: None, failed: None },
+        ),
         woken: Signal::new("run.line.due"),
         erased: Signal::new("run.line.erased"),
         clock,
@@ -302,7 +597,12 @@ pub(crate) fn watched<R>(
             .map_err(|why| RunLineError::Ticker { kind: why.kind() })?;
         let over = Over { line: &line, cx };
         let bg = ProgressSink { line: Some(&line) };
-        let got = work(&Watching { line: &line, cx }, &bg);
+        let status_out = if status.enabled {
+            RunStatusOut { target: StatusTarget::Live { line: &line, cx } }
+        } else {
+            RunStatusOut { target: StatusTarget::Off }
+        };
+        let got = work(&Watching { line: &line, cx }, &bg, &status_out);
         let done = line.finish(cx);
         drop(over);
         done.map(|()| got)
@@ -360,5 +660,122 @@ mod tests {
         assert_eq!(result.expect("watched ok"), 42);
         let stderr_len = io.script(|host| host.err.len()).expect("sim host");
         assert_eq!(stderr_len, 0, "fast command under grace delay must write 0 bytes to stderr");
+    }
+
+    #[test]
+    fn run_status_lines_emit_on_tty_with_color_and_on_pipe_without_ansi() {
+        // Non-TTY (piped/CI/agent): plain right-aligned verbs, zero ANSI escape sequences.
+        let pipe = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        let cx = pipe.cx(Duration::from_secs(5), 1 << 20).expect("cx");
+        let err = pipe.need_err().expect("err");
+        let clock = pipe.need_clock().expect("clock");
+        let opts = LineOpts::new(&|_| None, &err, Choice::Auto, Command::Run, View::Person, false);
+        assert!(!opts.live);
+        let status = StatusOpts::for_run(Command::Run, View::Person, false, opts.terminal);
+        assert!(status.enabled);
+        let got = watched_run(&cx, &err, &clock, opts, status, |watch, _bg, out| {
+            out.checking("hello");
+            watch.see(Step::Began(blaze_screen::Stage::Checking));
+            out.set_launch("hello", "hello", &["--port", "8080"]);
+            watch.see(Step::Started);
+            7u32
+        })
+        .expect("watched_run ok");
+        assert_eq!(got, 7);
+        let pipe_err = pipe
+            .script(|host| std::string::String::from_utf8_lossy(&host.err).into_owned())
+            .expect("sim host");
+        assert!(!pipe_err.contains('\x1b'), "non-TTY stderr must contain zero ANSI escapes: {pipe_err:?}");
+        assert!(pipe_err.contains("    Checking hello\n"), "missing Checking line: {pipe_err:?}");
+        assert!(pipe_err.contains("    Finished hello in "), "missing Finished line: {pipe_err:?}");
+        assert!(pipe_err.contains("     Running `hello --port 8080`\n"), "missing Running line: {pipe_err:?}");
+
+        // TTY (color-capable): ANSI bold-cyan Checking, bold-green Finished + Running.
+        let tty = Io::simulated(SimWorld::new(12, Limits::USUAL));
+        tty.script(|host| {
+            host.ttys[1] = Tty::Terminal(Some(Size { cols: 100, rows: 24 }));
+        })
+        .expect("sim host");
+        let cx = tty.cx(Duration::from_secs(5), 1 << 20).expect("cx");
+        let err = tty.need_err().expect("err");
+        let clock = tty.need_clock().expect("clock");
+        let opts = LineOpts::new(&|_| None, &err, Choice::Auto, Command::Run, View::Person, false);
+        assert!(opts.live);
+        assert!(opts.terminal.caps.color);
+        let status = StatusOpts::for_run(Command::Run, View::Person, false, opts.terminal);
+        assert!(status.enabled);
+        watched_run(&cx, &err, &clock, opts, status, |watch, _bg, out| {
+            out.checking("scripts (rules)");
+            watch.see(Step::Began(blaze_screen::Stage::Checking));
+            out.set_launch("scripts", "rules", &["write"]);
+            watch.see(Step::Started);
+        })
+        .expect("watched_run tty ok");
+        let tty_err = tty
+            .script(|host| std::string::String::from_utf8_lossy(&host.err).into_owned())
+            .expect("sim host");
+        assert!(tty_err.contains("\x1b[1;"), "TTY stderr must style status verbs in bold color: {tty_err:?}");
+        assert!(tty_err.contains("Checking\x1b[0m scripts (rules)\n"), "missing colored Checking: {tty_err:?}");
+        assert!(tty_err.contains("Finished\x1b[0m scripts in "), "missing colored Finished: {tty_err:?}");
+        assert!(tty_err.contains("Running\x1b[0m `rules write`\n"), "missing colored Running: {tty_err:?}");
+    }
+
+    #[test]
+    fn run_status_lines_suppressed_by_quiet_and_machine_views() {
+        for (is_tty, view, quiet, cmd) in [
+            (false, View::Person, true, Command::Run),
+            (true, View::Person, true, Command::Run),
+            (false, View::Json, false, Command::Run),
+            (true, View::Json, false, Command::Run),
+            (false, View::Agent, false, Command::Run),
+            (true, View::Agent, false, Command::Run),
+            (false, View::Person, false, Command::Test),
+            (false, View::Person, false, Command::Check),
+        ] {
+            let io = Io::simulated(SimWorld::new(20, Limits::USUAL));
+            if is_tty {
+                io.script(|host| {
+                    host.ttys[1] = Tty::Terminal(Some(Size { cols: 100, rows: 24 }));
+                })
+                .expect("sim host");
+            }
+            let cx = io.cx(Duration::from_secs(5), 1 << 20).expect("cx");
+            let err = io.need_err().expect("err");
+            let clock = io.need_clock().expect("clock");
+            let base = LineOpts::new(&|_| None, &err, Choice::Auto, cmd, view, false);
+            let opts = LineOpts { live: base.live && !quiet, ..base };
+            let status = StatusOpts::for_run(cmd, view, quiet, opts.terminal);
+            assert!(!status.enabled, "status must be off for tty={is_tty} view={view:?} quiet={quiet} cmd={cmd:?}");
+            watched_run(&cx, &err, &clock, opts, status, |watch, _bg, out| {
+                out.checking("hello");
+                watch.see(Step::Began(blaze_screen::Stage::Checking));
+                out.set_launch("hello", "hello", &[]);
+                watch.see(Step::Started);
+            })
+            .expect("watched_run ok");
+            let stderr_len = io.script(|host| host.err.len()).expect("sim host");
+            assert_eq!(stderr_len, 0, "expected 0 stderr bytes for tty={is_tty} view={view:?} quiet={quiet} cmd={cmd:?}");
+        }
+    }
+
+    #[test]
+    fn run_status_lines_omit_finished_and_running_when_aborted_before_start() {
+        let io = Io::simulated(SimWorld::new(30, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(5), 1 << 20).expect("cx");
+        let err = io.need_err().expect("err");
+        let clock = io.need_clock().expect("clock");
+        let opts = LineOpts::new(&|_| None, &err, Choice::Auto, Command::Run, View::Person, false);
+        let status = StatusOpts::for_run(Command::Run, View::Person, false, opts.terminal);
+        watched_run(&cx, &err, &clock, opts, status, |watch, _bg, out| {
+            out.checking("broken");
+            watch.see(Step::Began(blaze_screen::Stage::Checking));
+            out.set_launch("broken", "broken", &[]);
+            // Early error return before `Step::Started` is ever reached.
+        })
+        .expect("watched_run ok");
+        let stderr = io
+            .script(|host| std::string::String::from_utf8_lossy(&host.err).into_owned())
+            .expect("sim host");
+        assert_eq!(stderr, "    Checking broken\n");
     }
 }
