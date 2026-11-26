@@ -1095,13 +1095,16 @@ pub trait Beyond {
 /// list's cost). Only an answer equal to a stored row's is kept: a run's facts do not move
 /// under it, so it is today's for every entry.
 pub struct Answers<'a> {
-    rows: AVec<'a, (AVec<'a, u8>, ContentId)>,
+    rows: blaze_hash::Map<AVec<'a, u8>, ContentId, blaze_hash::FixedState, Alloc<'a>>,
     alloc: Alloc<'a>,
 }
 
 impl<'a> Answers<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Answers<'a> {
-        Answers { rows: blaze_own::Vec::new_in(alloc), alloc }
+        Answers {
+            rows: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+            alloc,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1113,14 +1116,14 @@ impl<'a> Answers<'a> {
     }
 
     fn get(&self, question: &[u8]) -> Option<ContentId> {
-        self.rows.binary_search_by(|row| row.0[..].cmp(question)).ok().map(|at| self.rows[at].1)
+        self.rows.get(question).copied()
     }
 
     fn keep(&mut self, question: &[u8], answer: ContentId) {
-        if let Err(at) = self.rows.binary_search_by(|row| row.0[..].cmp(question)) {
+        if !self.rows.contains_key(question) {
             let mut q = blaze_own::Vec::with_capacity_in(question.len(), self.alloc);
             q.extend_from_slice(question);
-            self.rows.insert_shift(at, (q, answer));
+            self.rows.insert(q, answer);
         }
     }
 }

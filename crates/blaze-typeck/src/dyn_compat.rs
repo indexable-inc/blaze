@@ -362,17 +362,21 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
         return Err(CheckError::Malformed(Malformed::NoRecord(Question::FnSig(item))).into());
     };
     // `len_now`: a live view's later types are walked too (portable.rs `PTys`).
-    let mut seen_nodes: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(types.len_now(), alloc);
-    seen_nodes.resize(types.len_now(), false);
+    // Sparse set rather than a `types.len_now()` dense bool table: `types` is often the
+    // whole program's shared `PortableTys` (hundreds of thousands of nodes) while one item
+    // reaches only a handful of nodes.
+    let len_now = types.len_now();
+    let mut seen_nodes: blaze_hash::Set<PTy, blaze_hash::FixedState, Alloc<'_>> =
+        blaze_hash::Set::new(blaze_hash::SetOpts { hasher: blaze_hash::FixedState, alloc, capacity: None });
     let mut traits: Vec<ItemKey, Alloc<'_>> = Vec::new_in(alloc);
     let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     // Children are pushed reversed so the walk meets types in written order.
     roots.reverse();
     while let Some(p) = roots.pop() {
-        let Some(s) = seen_nodes.get_mut(p.0 as usize) else {
+        if (p.0 as usize) >= len_now {
             return Err(CheckError::Malformed(Malformed::TypeOrder { node: p.0, child: p.0 }).into());
-        };
-        if core::mem::replace(s, true) {
+        }
+        if !seen_nodes.insert(p) {
             continue;
         }
         let n = types.node(p)?;
@@ -399,14 +403,17 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
 /// Whether `Param(0)` is in any of the types `l` of `t`: a bounded walk over the node table,
 /// whose children come before their parents (each node is visited once).
 pub(crate) fn names_self(t: PTys<'_>, l: &[PTy], alloc: Alloc<'_>) -> Result<bool, Stop> {
-    let mut seen: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(t.len(), alloc);
-    seen.resize(t.len(), false);
+    let t_len = t.len();
+    let mut seen: blaze_hash::Set<PTy, blaze_hash::FixedState, Alloc<'_>> =
+        blaze_hash::Set::new(blaze_hash::SetOpts { hasher: blaze_hash::FixedState, alloc, capacity: None });
     let mut todo: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(l.len(), alloc);
     todo.extend_from_slice(l);
     let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     while let Some(p) = todo.pop() {
-        let Some(s) = seen.get_mut(p.0 as usize) else { return Err(CheckError::Malformed(Malformed::TypeOrder { node: p.0, child: p.0 }).into()) };
-        if core::mem::replace(s, true) {
+        if (p.0 as usize) >= t_len {
+            return Err(CheckError::Malformed(Malformed::TypeOrder { node: p.0, child: p.0 }).into());
+        }
+        if !seen.insert(p) {
             continue;
         }
         let n = t.node(p)?;
