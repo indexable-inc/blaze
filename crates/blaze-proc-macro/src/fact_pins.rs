@@ -175,11 +175,25 @@ pub enum FactNow {
 }
 
 /// `subject` ([`facts::subject`]'s form: the program's word, then one argument per line, or a
-/// missing program's `absent-program\n<host>\n<name>`) answered now with `pins`.
-pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
+/// missing program's `absent-program\n<host>\n<name>`, or a compiler probe's
+/// `cc-probe\n<64 hex of ProbeKey>`) answered now with `pins` and optional C probe cache
+/// `c_probes`.
+pub fn fact_now_with_probes(
+    subject: &str,
+    pins: Option<&FactPins>,
+    c_probes: Option<&dyn crate::probe_clang::CProbeStore>,
+    alloc: Alloc<'_>,
+) -> FactNow {
     // A program found missing (spawn_route.rs `ABSENT_HEAD`, D192): a fact of the pinned base
     // tool set's names and blaze's answered list, not of these pins, so answered with none.
     if let Some(now) = crate::spawn_route::absent_now(subject, alloc) {
+        return FactNow::Answer(now);
+    }
+    if facts::parse_cc_probe_subject(subject).is_some() {
+        let Some(store) = c_probes else {
+            return FactNow::NoPins;
+        };
+        let now = crate::probe_clang::c_probe_reply_now(subject, Some(store), alloc).flatten();
         return FactNow::Answer(now);
     }
     let mut lines = subject.split('\n');
@@ -206,6 +220,12 @@ pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> Fac
         Ok(answer) => FactNow::Answer(Some(reply_digest(answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()))),
         Err(_) => FactNow::Answer(None),
     }
+}
+
+/// `subject` answered now with `pins` (no C probe store: `cc-probe` subjects return
+/// [`FactNow::NoPins`]).
+pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
+    fact_now_with_probes(subject, pins, None, alloc)
 }
 
 /// What the read `subject` is now for a record's lookup: a fact answered with `pins`

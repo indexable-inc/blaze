@@ -13,7 +13,10 @@
 
 use blaze_own::Alloc;
 
-use crate::c_tasks_probe::{Answered, ProbeWhy, Spawn, Table, TableWhy, is_probe};
+use crate::c_tasks_probe::{
+    Answered, CanonicalProbe, MOUNT, ProbeAnswer, ProbeAnswerer, ProbeCache, ProbeKey, ProbeWhy, Spawn, Table, TableAnswerer, TableWhy,
+    canonical_reply_digest, canonicalize, decode_answer, encode_answer, is_probe, resolve,
+};
 
 /// A clang archive's sha256, and the same as the table spells it.
 const CLANG_PIN: [u8; 32] = [0x5d; 32];
@@ -69,7 +72,7 @@ fn files(name: &str) -> Option<[u8; 32]> {
 const ENV: &[(&str, &str)] = &[("CARGO_PKG_NAME", "zstd-sys"), ("MACOSX_DEPLOYMENT_TARGET", "11.0")];
 
 fn spawn<'s>(program: &'s str, args: &'s [&'s str], env: &'s [(&'s str, &'s str)]) -> Spawn<'s> {
-    Spawn { program, args, env, out_dir: OUT, sdk: SDK, stdin: &[] }
+    Spawn { program, args, env, out_dir: OUT, sdk: SDK, mount: "", sdk_id: "", stdin: &[] }
 }
 
 fn parse<'a>(text: &str, alloc: Alloc<'a>) -> Table<'a> {
@@ -236,11 +239,101 @@ fn the_pinned_table_answers_a_linux_arm64_family_probe() {
     let path = format!("{OUT}/123456789detect_compiler_family.c");
     let args = ["-E", path.as_str()];
     let held = |rel: &str| (rel == "123456789detect_compiler_family.c").then_some(detect);
-    let probe = Spawn { program: "cc", args: &args, env: &[], out_dir: OUT, sdk: "", stdin: &[] };
+    let probe = Spawn { program: "cc", args: &args, env: &[], out_dir: OUT, sdk: "", mount: "/package", sdk_id: "", stdin: &[] };
     let answered = match table.answer(&pin.sha256, &probe, held, alloc) {
         Ok(answered) => answered,
         Err(refused) => panic!("{refused}"),
     };
     assert_eq!(answered.code, 0);
     assert!(answered.stdout.as_str().contains("\"clang\""), "{answered:?}");
+}
+
+#[test]
+fn mount_normalization_shares_probe_key_across_package_and_vendored_workspace() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let id = TableAnswerer::strategy_id();
+    let pkg_args = flag_args("-ffile-prefix-map=/package=");
+    let ws_args = flag_args("-ffile-prefix-map=/workspace/vendored/aws-lc-sys=");
+    let pkg_spawn = Spawn { program: "cc", args: &pkg_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let ws_spawn = Spawn { program: "cc", args: &ws_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/workspace/vendored/aws-lc-sys", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let a = canonicalize(id, &CLANG_PIN, &pkg_spawn, files, alloc).expect("pkg canonical");
+    let b = canonicalize(id, &CLANG_PIN, &ws_spawn, files, alloc).expect("ws canonical");
+    assert_eq!(a.key, b.key, "workspace vendored mount must share probe key with /package");
+    assert!(a.row.args.iter().any(|arg| arg.as_str() == format!("-ffile-prefix-map={MOUNT}=")));
+    // Control: different sdk_id produces a different ProbeKey.
+    let other_sdk = Spawn { sdk_id: "macos-sdk 15.1", ..pkg_spawn };
+    let c = canonicalize(id, &CLANG_PIN, &other_sdk, files, alloc).expect("other sdk");
+    assert_ne!(a.key, c.key);
+}
+
+#[test]
+fn header_including_preprocess_is_not_classified_as_probe() {
+    assert!(is_probe("cc", &["-E", "/out/123detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-E", "-I/package/include", "/package/src/foo.c"]));
+    assert!(!is_probe("cc", &["-E", "-isystem", "/sdk/usr/include", "/package/src/foo.c"]));
+    assert!(!is_probe("cc", &["-E", "-include", "config.h", "/package/src/foo.c"]));
+}
+
+#[test]
+fn binary_probe_answer_round_trips_and_resolves_once_via_cache() {
+    use core::cell::RefCell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    let alloc = blaze_own::testing::heap().alloc();
+    let ans = ProbeAnswer {
+        code: 1,
+        stdout: blaze_own::String::from_str_in("", alloc),
+        stderr: blaze_own::String::from_str_in("clang: warning in $IN0.c\n", alloc),
+    };
+    let mut bytes = blaze_own::Vec::new_in(alloc);
+    encode_answer(&ans, &mut bytes);
+    let decoded = decode_answer(bytes.as_slice(), alloc).expect("decode");
+    assert_eq!(decoded, ans);
+    assert_eq!(canonical_reply_digest(&decoded), canonical_reply_digest(&ans));
+
+    struct CountingAnswerer(AtomicUsize);
+    impl ProbeAnswerer for CountingAnswerer {
+        fn id(&self) -> blaze_ids::ContentId {
+            blaze_ids::ContentId::of("test c-probe answerer", b"v1")
+        }
+        fn answer<'a, 'b>(
+            &self,
+            _probe: &CanonicalProbe<'_, '_>,
+            _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+            alloc: Alloc<'a>,
+        ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ProbeAnswer {
+                code: 0,
+                stdout: blaze_own::String::from_str_in("ok $IN0.c\n", alloc),
+                stderr: blaze_own::String::new_in(alloc),
+            })
+        }
+    }
+    struct MemCache(RefCell<std::vec::Vec<(ProbeKey, std::vec::Vec<u8>)>>);
+    impl ProbeCache for MemCache {
+        fn get<'a>(&self, key: &ProbeKey, alloc: Alloc<'a>) -> Result<Option<blaze_own::AVec<'a, u8>>, blaze_own::AString<'a>> {
+            let guard = self.0.borrow();
+            Ok(guard.iter().find(|(k, _)| k == key).map(|(_, b)| {
+                let mut v = blaze_own::Vec::with_capacity_in(b.len(), alloc);
+                v.extend_from_slice(b);
+                v
+            }))
+        }
+        fn put<'a>(&self, key: &ProbeKey, bytes: &[u8], _alloc: Alloc<'a>) -> Result<(), blaze_own::AString<'a>> {
+            self.0.borrow_mut().push((*key, bytes.to_vec()));
+            Ok(())
+        }
+    }
+
+    let answerer = CountingAnswerer(AtomicUsize::new(0));
+    let cache = MemCache(RefCell::new(std::vec::Vec::new()));
+    let args = flag_args("-Wshadow");
+    let sp = Spawn { program: "cc", args: &args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    let mut no_bytes = |_: &str| -> Option<&[u8]> { None };
+    let first = resolve(&answerer, &cache, &CLANG_PIN, &sp, files, &mut no_bytes, alloc).expect("first");
+    let second = resolve(&answerer, &cache, &CLANG_PIN, &sp, files, &mut no_bytes, alloc).expect("second");
+    assert_eq!(answerer.0.load(Ordering::SeqCst), 1, "second probe must hit cache");
+    assert_eq!(first.key, second.key);
+    assert_eq!(first.canonical_digest, second.canonical_digest);
+    assert_eq!(first.answered.stdout.as_str(), "ok /target/debug/build/zstd-sys-1/out/flag_check.c\n");
 }

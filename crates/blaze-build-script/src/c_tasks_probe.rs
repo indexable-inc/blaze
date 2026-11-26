@@ -40,11 +40,22 @@ pub const PATH: &str = "pins/answers/clang.json";
 /// The one form of the table read here (its `form`).
 pub const FORM: u64 = 1;
 const ID_DOMAIN: &str = "blaze-build-script clang answers table 1";
+/// Domain for canonical [`ProbeKey`] hashing (answerer id, clang sha256, sdk/sysroot id, program,
+/// canonical args, canonical `CLANG_ENV`, sorted input file sha256s).
+pub const PROBE_KEY_DOMAIN: &str = "blaze-build-script c probe 1";
+/// Domain for [`canonical_reply_digest`] (matches `spawn_route::reply_digest` so `fact_now` and
+/// `spawn_probe` agree).
+const REPLY_DOMAIN: &str = "blaze build-script spawn reply 1";
+/// Magic bytes of an encoded binary probe cache record (`bzcp` v1).
+const ANSWER_MAGIC: [u8; 4] = *b"bzcp";
+const ANSWER_VERSION: u32 = 1;
 
 /// The guest `OUT_DIR`'s spelling in a row.
 pub const OUT_DIR: &str = "$OUT_DIR";
 /// The guest SDK folder's spelling in a row.
 pub const SDKROOT: &str = "$SDKROOT";
+/// The script's root mount / package directory spelling in a row (`/package`, `/workspace/...`).
+pub const MOUNT: &str = "$MOUNT";
 /// The head of a file a probe reads under `OUT_DIR`, as a row spells it (`$IN0.c`).
 pub const INPUT: &str = "$IN";
 /// The head of a path under `OUT_DIR` a probe names where no file is (`-o $OUT0`).
@@ -73,12 +84,28 @@ fn name_of(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
+/// Include/header search flags that indicate a real preprocessing job rather than a compiler
+/// family detection probe (`cc -E <OUT_DIR>/...detect_compiler_family.c`).
+fn is_header_search_flag(arg: &str) -> bool {
+    matches!(arg, "-I" | "-isystem" | "-iquote" | "-idirafter" | "-include" | "-imacros")
+        || arg.starts_with("-I")
+        || arg.starts_with("-isystem")
+        || arg.starts_with("-iquote")
+        || arg.starts_with("-idirafter")
+}
+
 /// Whether the spawn of `program` with `args` is a compiler probe, from its text alone: a C
-/// compiler asked to preprocess (`-E`), asked `-?`, or writing `-o …/flag_check` (cc's
-/// `is_flag_supported`). Any other compile is a C request (`c_tasks`).
+/// compiler asked `-?`, writing `-o …/flag_check` (cc's `is_flag_supported`), or preprocessing
+/// (`-E`) with no header-search flags (`-I`, `-isystem`, `-include`, ...). Any other compile or
+/// header-including preprocess job is a C request (`c_tasks`).
 pub fn is_probe(program: &str, args: &[&str]) -> bool {
-    COMPILERS.contains(&name_of(program))
-        && (args.iter().any(|arg| matches!(*arg, "-E" | "-?")) || args.windows(2).any(|pair| pair[0] == "-o" && name_of(pair[1]) == "flag_check"))
+    if !COMPILERS.contains(&name_of(program)) {
+        return false;
+    }
+    if args.contains(&"-?") || args.windows(2).any(|pair| pair[0] == "-o" && name_of(pair[1]) == "flag_check") {
+        return true;
+    }
+    args.contains(&"-E") && !args.iter().any(|arg| is_header_search_flag(arg))
 }
 
 /// The table's identity for the base key: its bytes, under this form.
@@ -191,8 +218,334 @@ pub struct Spawn<'s> {
     pub out_dir: &'s str,
     /// The guest SDK folder; empty where the target has none.
     pub sdk: &'s str,
+    /// The script's root mount / package directory (e.g. `/package` or `/workspace/vendored/foo`);
+    /// normalized to [`MOUNT`] so workspace-path-dependent flags like `-ffile-prefix-map=...`
+    /// share one canonical key. Empty disables mount normalization.
+    pub mount: &'s str,
+    /// Identity of the SDK (e.g. `"macos-sdk 15.2"`) or pinned Linux sysroot (`""` when none),
+    /// hashed into [`ProbeKey`].
+    pub sdk_id: &'s str,
     /// What the spawn was given on standard input: a probe answers only when it is empty.
     pub stdin: &'s [u8],
+}
+
+/// Content-addressed key of a canonicalized compiler probe.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ProbeKey(pub ContentId);
+
+/// Canonical placeholder-spelled output of a compiler probe, BEFORE [`CanonicalProbe::unspell`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProbeAnswer<'a> {
+    pub code: i32,
+    pub stdout: AString<'a>,
+    pub stderr: AString<'a>,
+}
+
+/// Why an encoded probe cache record could not be decoded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeDecodeError {
+    Truncated,
+    BadMagic,
+    BadVersion(u32),
+    BadUtf8,
+    Trailing,
+}
+
+impl fmt::Display for ProbeDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProbeDecodeError::Truncated => f.write_str("truncated c-probe record"),
+            ProbeDecodeError::BadMagic => f.write_str("c-probe record magic mismatch"),
+            ProbeDecodeError::BadVersion(v) => write!(f, "unsupported c-probe record version {v}"),
+            ProbeDecodeError::BadUtf8 => f.write_str("c-probe record stream is not UTF-8"),
+            ProbeDecodeError::Trailing => f.write_str("trailing bytes in c-probe record"),
+        }
+    }
+}
+
+/// Encodes a canonical [`ProbeAnswer`] into binary `bzcp` v1 format for CAS storage.
+pub fn encode_answer(ans: &ProbeAnswer<'_>, out: &mut AVec<'_, u8>) {
+    out.extend_from_slice(&ANSWER_MAGIC);
+    out.extend_from_slice(&ANSWER_VERSION.to_le_bytes());
+    out.extend_from_slice(&ans.code.to_le_bytes());
+    let stdout = ans.stdout.as_bytes();
+    let stderr = ans.stderr.as_bytes();
+    out.extend_from_slice(&u32::try_from(stdout.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(stdout);
+    out.extend_from_slice(&u32::try_from(stderr.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(stderr);
+}
+
+/// Decodes a binary `bzcp` v1 probe record into a canonical [`ProbeAnswer`].
+pub fn decode_answer<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<ProbeAnswer<'a>, ProbeDecodeError> {
+    let take = |at: &mut usize, n: usize| -> Result<&[u8], ProbeDecodeError> {
+        let end = at.checked_add(n).ok_or(ProbeDecodeError::Truncated)?;
+        let slice = bytes.get(*at..end).ok_or(ProbeDecodeError::Truncated)?;
+        *at = end;
+        Ok(slice)
+    };
+    let take_u32 = |at: &mut usize| -> Result<u32, ProbeDecodeError> {
+        let b = take(at, 4)?;
+        let arr: [u8; 4] = b.try_into().map_err(|_| ProbeDecodeError::Truncated)?;
+        Ok(u32::from_le_bytes(arr))
+    };
+    let mut at = 0usize;
+    let magic = take(&mut at, 4)?;
+    if magic != ANSWER_MAGIC {
+        return Err(ProbeDecodeError::BadMagic);
+    }
+    let version = take_u32(&mut at)?;
+    if version != ANSWER_VERSION {
+        return Err(ProbeDecodeError::BadVersion(version));
+    }
+    let code_bytes: [u8; 4] = take(&mut at, 4)?.try_into().map_err(|_| ProbeDecodeError::Truncated)?;
+    let code = i32::from_le_bytes(code_bytes);
+    let out_len = usize::try_from(take_u32(&mut at)?).map_err(|_| ProbeDecodeError::Truncated)?;
+    let out_raw = take(&mut at, out_len)?;
+    let out_str = core::str::from_utf8(out_raw).map_err(|_| ProbeDecodeError::BadUtf8)?;
+    let err_len = usize::try_from(take_u32(&mut at)?).map_err(|_| ProbeDecodeError::Truncated)?;
+    let err_raw = take(&mut at, err_len)?;
+    let err_str = core::str::from_utf8(err_raw).map_err(|_| ProbeDecodeError::BadUtf8)?;
+    if at != bytes.len() {
+        return Err(ProbeDecodeError::Trailing);
+    }
+    Ok(ProbeAnswer {
+        code,
+        stdout: String::from_str_in(out_str, alloc),
+        stderr: String::from_str_in(err_str, alloc),
+    })
+}
+
+/// Digest of a canonical [`ProbeAnswer`] (computed BEFORE [`CanonicalProbe::unspell`]), recorded
+/// in the script's read list under `cc-probe\n<key hex>` so `fact_now` can re-verify without `OUT_DIR`.
+pub fn canonical_reply_digest(ans: &ProbeAnswer<'_>) -> ContentId {
+    let mut hash = Hasher::new(REPLY_DOMAIN);
+    hash.update(&ans.code.to_le_bytes());
+    for part in [ans.stdout.as_bytes(), ans.stderr.as_bytes()] {
+        hash.update(&u32::try_from(part.len()).unwrap_or(u32::MAX).to_le_bytes()).update(part);
+    }
+    hash.finish()
+}
+
+/// A canonicalized compiler probe ready for cache lookup or execution by a [`ProbeAnswerer`].
+pub struct CanonicalProbe<'b, 's> {
+    pub key: ProbeKey,
+    pub clang: [u8; 32],
+    pub sdk_id: AString<'b>,
+    pub row: Row<'b>,
+    /// `($IN<n><ext> or $OUT<n><ext>, original spawned arg)`.
+    pub paths: AVec<'b, (AString<'b>, &'s str)>,
+    /// `($IN<n><ext>, OUT_DIR-relative path)` for every input file present in `OUT_DIR`.
+    pub input_rels: AVec<'b, (AString<'b>, AString<'b>)>,
+}
+
+impl<'b> CanonicalProbe<'b, '_> {
+    /// Restores placeholder paths (`$IN<n>`, `$OUT<n>`, `$OUT_DIR`, `$SDKROOT`, `$MOUNT`) back
+    /// into the script's guest paths.
+    pub fn unspell(&self, text: &str, spawn: &Spawn<'_>, alloc: Alloc<'b>) -> AString<'b> {
+        let mut pairs: AVec<'b, (&str, &str)> = Vec::new_in(alloc);
+        for (spelled, actual) in self.paths.iter() {
+            pairs.push((spelled.as_str(), *actual));
+        }
+        pairs.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+        pairs.push((OUT_DIR, spawn.out_dir));
+        if !spawn.sdk.is_empty() {
+            pairs.push((SDKROOT, spawn.sdk));
+        }
+        if !spawn.mount.is_empty() {
+            pairs.push((MOUNT, spawn.mount));
+        }
+        replaced(text, &pairs, alloc)
+    }
+}
+
+/// Builds a [`CanonicalProbe`] and its [`ProbeKey`] from a script spawn.
+pub fn canonicalize<'b, 's>(
+    answerer_id: ContentId,
+    clang: &[u8; 32],
+    spawn: &Spawn<'s>,
+    mut file: impl FnMut(&str) -> Option<[u8; 32]>,
+    alloc: Alloc<'b>,
+) -> Result<CanonicalProbe<'b, 's>, ProbeRefused<'b>> {
+    let clang_hex = hex(clang, alloc);
+    let asked = asked(clang_hex.as_str(), spawn, &mut file, alloc);
+    if !spawn.stdin.is_empty() {
+        return Err(ProbeRefused { why: ProbeWhy::Stdin, row: row_json(&asked.row, alloc) });
+    }
+    let key = probe_key(answerer_id, clang, spawn.sdk_id, &asked.row);
+    Ok(CanonicalProbe {
+        key,
+        clang: *clang,
+        sdk_id: String::from_str_in(spawn.sdk_id, alloc),
+        row: asked.row,
+        paths: asked.paths,
+        input_rels: asked.input_rels,
+    })
+}
+
+fn probe_key(answerer_id: ContentId, clang: &[u8; 32], sdk_id: &str, row: &Row<'_>) -> ProbeKey {
+    let mut h = Hasher::new(PROBE_KEY_DOMAIN);
+    h.id(&answerer_id).part(clang).part(sdk_id.as_bytes()).part(row.program.as_bytes());
+    h.update(&u32::try_from(row.args.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for arg in row.args.iter() {
+        h.part(arg.as_bytes());
+    }
+    h.update(&u32::try_from(row.env.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for (k, v) in row.env.iter() {
+        h.part(k.as_bytes()).part(v.as_bytes());
+    }
+    h.update(&u32::try_from(row.files.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for (k, v) in row.files.iter() {
+        h.part(k.as_bytes()).part(v.as_bytes());
+    }
+    ProbeKey(h.finish())
+}
+
+/// Strategy seam (rule 78) for answering a canonical compiler probe: first instantiation is
+/// hermetic pinned `clang-23` (`HermeticClangProbe`), future instantiation is `blaze-cfront`,
+/// and offline zero-download mode uses [`TableAnswerer`].
+pub trait ProbeAnswerer {
+    /// Stable identity of this answerer strategy and its confinement/format version (hashed into
+    /// [`ProbeKey`]).
+    fn id(&self) -> ContentId;
+    /// Produces the canonical placeholder-spelled [`ProbeAnswer`] for `probe`.
+    fn answer<'a, 'b>(
+        &self,
+        probe: &CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>>;
+}
+
+/// Content-addressed cache of encoded [`ProbeAnswer`] records keyed by [`ProbeKey`].
+pub trait ProbeCache {
+    fn get<'a>(&self, key: &ProbeKey, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, AString<'a>>;
+    fn put<'a>(&self, key: &ProbeKey, bytes: &[u8], alloc: Alloc<'a>) -> Result<(), AString<'a>>;
+}
+
+/// A resolved probe: its canonical key and reply digest (for the script's per-probe read list)
+/// plus the guest-spelled [`Answered`] output delivered to the script.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolvedProbe<'a> {
+    pub key: ProbeKey,
+    pub canonical_digest: ContentId,
+    pub answered: Answered<'a>,
+}
+
+/// Resolves a compiler probe through one [`ProbeAnswerer`] and one [`ProbeCache`]: checks the
+/// cache first, invokes `answerer` on miss and persists the canonical answer, then computes
+/// `canonical_digest` before `unspell`.
+pub fn resolve<'a, 'b>(
+    answerer: &dyn ProbeAnswerer,
+    cache: &dyn ProbeCache,
+    clang: &[u8; 32],
+    spawn: &Spawn<'_>,
+    file_digest: impl FnMut(&str) -> Option<[u8; 32]>,
+    file_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+    alloc: Alloc<'a>,
+) -> Result<ResolvedProbe<'a>, AString<'a>> {
+    let probe = canonicalize(answerer.id(), clang, spawn, file_digest, alloc).map_err(|r| {
+        let mut msg = String::new_in(alloc);
+        let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{r}"));
+        msg
+    })?;
+    let canonical = match cache.get(&probe.key, alloc)? {
+        Some(bytes) => decode_answer(bytes.as_slice(), alloc).map_err(|e| {
+            let mut msg = String::new_in(alloc);
+            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("cached c-probe record: {e}"));
+            msg
+        })?,
+        None => {
+            let ans = answerer.answer(&probe, file_bytes, alloc)?;
+            let mut encoded: AVec<'a, u8> = Vec::new_in(alloc);
+            encode_answer(&ans, &mut encoded);
+            cache.put(&probe.key, encoded.as_slice(), alloc)?;
+            ans
+        }
+    };
+    let canonical_digest = canonical_reply_digest(&canonical);
+    let answered = Answered {
+        code: canonical.code,
+        stdout: probe.unspell(canonical.stdout.as_str(), spawn, alloc),
+        stderr: probe.unspell(canonical.stderr.as_str(), spawn, alloc),
+    };
+    Ok(ResolvedProbe { key: probe.key, canonical_digest, answered })
+}
+
+/// Strategy implementation backed by the checked-in `pins/answers/clang.json` corpus (used only
+/// when no local clang shelf is installed).
+pub struct TableAnswerer<'t> {
+    table: &'t Table<'t>,
+}
+
+impl<'t> TableAnswerer<'t> {
+    pub fn new(table: &'t Table<'t>) -> TableAnswerer<'t> {
+        TableAnswerer { table }
+    }
+
+    pub fn strategy_id() -> ContentId {
+        ContentId::of("blaze-build-script c-probe table answerer 1", b"v1")
+    }
+}
+
+impl ProbeAnswerer for TableAnswerer<'_> {
+    fn id(&self) -> ContentId {
+        Self::strategy_id()
+    }
+
+    fn answer<'a, 'b>(
+        &self,
+        probe: &CanonicalProbe<'_, '_>,
+        _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+        // Match against the table, treating `$MOUNT` as equivalent to `/package` for legacy rows
+        // written before mount normalization.
+        let found = self.table.rows.iter().find(|row| same_key_mount_compat(row, &probe.row));
+        let Some(row) = found else {
+            let refused = ProbeRefused { why: ProbeWhy::NoRow, row: row_json(&probe.row, alloc) };
+            let mut msg = String::new_in(alloc);
+            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{refused}"));
+            return Err(msg);
+        };
+        let Answer::Known { code, stdout, stderr } = &row.answer else {
+            let refused = ProbeRefused { why: ProbeWhy::Pending, row: row_json(&probe.row, alloc) };
+            let mut msg = String::new_in(alloc);
+            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{refused}"));
+            return Err(msg);
+        };
+        Ok(ProbeAnswer {
+            code: *code,
+            stdout: String::from_str_in(stdout.as_str(), alloc),
+            stderr: String::from_str_in(stderr.as_str(), alloc),
+        })
+    }
+}
+
+/// Like [`same_key`], also matching legacy `/package` rows against `$MOUNT`-normalized args.
+fn same_key_mount_compat(table_row: &Row<'_>, asked_row: &Row<'_>) -> bool {
+    if same_key(table_row, asked_row) {
+        return true;
+    }
+    let same_set = |x: &[(AString<'_>, AString<'_>)], y: &[(AString<'_>, AString<'_>)]| {
+        x.len() == y.len() && x.iter().all(|(k, v)| y.iter().any(|(k2, v2)| k.as_str() == k2.as_str() && v.as_str() == v2.as_str()))
+    };
+    let arg_eq = |t: &str, a: &str| {
+        if t == a {
+            return true;
+        }
+        if let Some((prefix, suffix)) = a.split_once(MOUNT) {
+            t.strip_prefix(prefix).and_then(|rest| rest.strip_suffix(suffix)) == Some("/package")
+        } else {
+            false
+        }
+    };
+    table_row.clang.as_str() == asked_row.clang.as_str()
+        && table_row.program.as_str() == asked_row.program.as_str()
+        && table_row.args.len() == asked_row.args.len()
+        && table_row.args.iter().zip(asked_row.args.iter()).all(|(x, y)| arg_eq(x.as_str(), y.as_str()))
+        && same_set(&table_row.env, &asked_row.env)
+        && same_set(&table_row.files, &asked_row.files)
 }
 
 /// The table's answer to a probe.
@@ -281,7 +634,7 @@ impl<'a> Table<'a> {
         if !spawn.stdin.is_empty() {
             return Err(ProbeRefused { why: ProbeWhy::Stdin, row: row_json(&asked.row, alloc) });
         }
-        let Some(row) = self.rows.iter().find(|row| same_key(row, &asked.row)) else {
+        let Some(row) = self.rows.iter().find(|row| same_key_mount_compat(row, &asked.row)) else {
             return Err(ProbeRefused { why: ProbeWhy::NoRow, row: row_json(&asked.row, alloc) });
         };
         let Answer::Known { code, stdout, stderr } = &row.answer else {
@@ -292,11 +645,13 @@ impl<'a> Table<'a> {
     }
 }
 
-/// A probe's key as a row, and its path placeholders.
+/// A probe's key as a row, its path placeholders, and its `OUT_DIR`-relative input file paths.
 struct Asked<'b, 's> {
     row: Row<'b>,
     /// `($IN<n><ext> or $OUT<n><ext>, the argument as spawned)`.
     paths: AVec<'b, (AString<'b>, &'s str)>,
+    /// `($IN<n><ext>, OUT_DIR-relative path)` for every input file present in `OUT_DIR`.
+    input_rels: AVec<'b, (AString<'b>, AString<'b>)>,
 }
 
 impl<'b> Asked<'b, '_> {
@@ -312,6 +667,9 @@ impl<'b> Asked<'b, '_> {
         if !spawn.sdk.is_empty() {
             pairs.push((SDKROOT, spawn.sdk));
         }
+        if !spawn.mount.is_empty() {
+            pairs.push((MOUNT, spawn.mount));
+        }
         replaced(text, &pairs, alloc)
     }
 }
@@ -323,9 +681,14 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
     if !spawn.sdk.is_empty() {
         roots.push((spawn.sdk, SDKROOT));
     }
+    if !spawn.mount.is_empty() {
+        roots.push((spawn.mount, MOUNT));
+    }
+    roots.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()));
     let mut args: AVec<'b, AString<'b>> = Vec::new_in(alloc);
     let mut files: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
     let mut paths: AVec<'b, (AString<'b>, &'s str)> = Vec::new_in(alloc);
+    let mut input_rels: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
     let (mut inputs, mut outputs) = (0u32, 0u32);
     for arg in spawn.args.iter().copied() {
         let rel = arg.strip_prefix(spawn.out_dir).and_then(|rest| rest.strip_prefix('/')).filter(|rel| !rel.is_empty() && !rel.ends_with('/'));
@@ -349,6 +712,7 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
         spelled.push_str(extension(rel));
         if let Some(digest) = digest {
             files.push((spelled.clone(), hex(&digest, alloc)));
+            input_rels.push((own(spelled.as_str()), own(rel)));
         }
         paths.push((spelled.clone(), arg));
         args.push(spelled);
@@ -362,7 +726,7 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
         }
     }
     let row = Row { clang: own(clang), program: own(name_of(spawn.program)), args, env, files, answer: Answer::Pending };
-    Asked { row, paths }
+    Asked { row, paths, input_rels }
 }
 
 /// The extension of the last name of `path` with its dot (`.c`, `.cpp`), or "" where it has

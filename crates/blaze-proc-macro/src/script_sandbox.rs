@@ -479,6 +479,10 @@ pub struct Script {
     /// is not read. `None` (the default until the checker answers the real probes' ladder):
     /// the table answers.
     pub probes: Option<crate::script_probes::ScriptProbes>,
+    /// The C compiler probe answerer and content-addressed cache (`probe_clang.rs`): when `Some`,
+    /// `cc-probe` spawns are answered through its strategy seam and cached under `c-probe/<key>`,
+    /// recording per-probe reads (`cc-probe\n<key hex>`).
+    pub c_probes: Option<crate::probe_clang::CScriptProbes>,
     /// The deterministic sandbox's executor, chosen once per command by its setting; `None`:
     /// the sandbox is off (D92, D94), and a spawn that needs it is refused by name.
     pub spawner: Option<Arc<dyn blaze_spawn::Executor + Send + Sync>>,

@@ -48,12 +48,27 @@ use crate::{
 };
 
 /// The loader and the system libraries: read whole (and the loader run: see `prepare`).
-/// `/lib64` holds x86-64's loader (`/lib64/ld-linux-x86-64.so.2`); a path of the set the host
-/// lacks is refused by name (`openat`), so each is one every supported host has.
+/// `/lib64` holds x86-64's loader (`/lib64/ld-linux-x86-64.so.2`); `/nix/store` and
+/// `/run/current-system/sw/share/nix-ld/lib` hold NixOS's dynamic loader and libraries.
+/// Missing optional system paths are skipped in [`prepare`] (`Errno::NoEnt` on `Why::System`
+/// rules only); every user root and program path is still strictly required.
 #[cfg(target_arch = "x86_64")]
-pub const SYSTEM: [&str; 4] = ["/usr/lib", "/lib", "/lib64", "/etc/ld.so.cache"];
+pub const SYSTEM: [&str; 6] = [
+    "/usr/lib",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+    "/nix/store",
+    "/run/current-system/sw/share/nix-ld/lib",
+];
 #[cfg(not(target_arch = "x86_64"))]
-pub const SYSTEM: [&str; 3] = ["/usr/lib", "/lib", "/etc/ld.so.cache"];
+pub const SYSTEM: [&str; 5] = [
+    "/usr/lib",
+    "/lib",
+    "/etc/ld.so.cache",
+    "/nix/store",
+    "/run/current-system/sw/share/nix-ld/lib",
+];
 
 /// The oldest Landlock ABI that confines a child here.
 pub const LEAST_ABI: u32 = 3;
@@ -125,11 +140,12 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         let flags = OpenFlags::PATH.with(OpenFlags::CLOSE_ON_EXEC);
         let (fd, folder) = match openat(CWD, blaze_sys::Path::new(path), flags.with(OpenFlags::DIRECTORY), 0) {
             Ok(fd) => (fd, true),
-            Err(blaze_sys::Errno::NotDir) => {
-                let fd = openat(CWD, blaze_sys::Path::new(path), flags, 0)
-                    .map_err(|errno| Fault::Host { call: "openat (a plan file, O_PATH)", code: errno.raw() })?;
-                (fd, false)
-            }
+            Err(blaze_sys::Errno::NotDir) => match openat(CWD, blaze_sys::Path::new(path), flags, 0) {
+                Ok(fd) => (fd, false),
+                Err(blaze_sys::Errno::NoEnt) if rule.why == Why::System => continue,
+                Err(errno) => return Err(Fault::Host { call: "openat (a plan file, O_PATH)", code: errno.raw() }),
+            },
+            Err(blaze_sys::Errno::NoEnt) if rule.why == Why::System => continue,
             Err(errno) => return Err(Fault::Host { call: "openat (a plan path, O_PATH)", code: errno.raw() }),
         };
         // The system set also gets EXECUTE: `execve` opens the ELF interpreter (the dynamic

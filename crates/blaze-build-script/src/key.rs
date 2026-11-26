@@ -109,7 +109,9 @@ impl<'k> HostToolKey<'k> {
 /// its spawn's folder when recorded (c_tasks.rs `rooted`): a `bzbsout6` record of run 2 holds
 /// them as spawned, which the C tasks refuse as host paths, so none is found again. 4: a
 /// `--param` value is no longer taken for a path (`rooted` made it `/package/ssp-buffer-size=4`).
-pub const DOMAIN: &str = "blaze v2 build-script run 4";
+/// 5: compiler probes (`cc-probe`) are recorded per probe in the script's read list instead of
+/// hashing the whole `pins/answers/clang.json` table into every script's base key.
+pub const DOMAIN: &str = "blaze v2 build-script run 5";
 
 /// The base key.
 pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> ContentId {
@@ -129,12 +131,6 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         .update(&l.out_dir_files.to_le_bytes())
         .update(&l.output.to_le_bytes())
         .update(&l.line.to_le_bytes());
-    if let RunnerKey::Wasm = inputs.runner {
-        // A wasm script's compiler probes are answered from this table (c_tasks_probe): a
-        // changed answer re-runs the scripts, and no probe is in a read list. A native script
-        // runs its compiler, so the table is not in its key.
-        hasher.part(b"clang answers").id(&crate::c_tasks_probe::table_id(blaze_pins::CLANG_ANSWERS_JSON.as_bytes()));
-    }
     if let RunnerKey::Native { compiler, target, sysroot, host_tools } = inputs.runner {
         hasher.part(b"native").part(&compiler).part(target.as_bytes()).part(sysroot.as_bytes());
         if !host_tools.is_empty() {

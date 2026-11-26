@@ -272,6 +272,9 @@ pub(crate) struct Shared<'f> {
     table: Arc<std::vec::Vec<Row>>,
     macro_table: Arc<std::vec::Vec<Row>>,
     spawn: Arc<SpawnSetting>,
+    /// Hermetic pinned `clang-23` probe runner (or offline table when shelf is absent) and its
+    /// content-addressed `c-probe/<64-hex>` record store.
+    c_probes: blaze_proc_macro::probe_clang::CScriptProbes,
     /// The native setting, or why the command has none (its words, naming the path).
     native: Result<NativeSetting<'f>, &'f str>,
     /// The command resolved no macOS SDK (sdk.rs). A native run's key then holds "no SDK"
@@ -610,7 +613,25 @@ impl<'f> Scripts<'f> {
         // resolved again here.
         let checkout = env.served.within(frame);
         let no_sdk = env.sdk.is_err();
-        let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, native, no_sdk, graph_record }, frame));
+        let mut sdk_hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
+        let sdk_pair = env.sdk.as_ref().ok().map(|sdk| {
+            let key = sdk.identity().key();
+            for (i, byte) in key.iter().enumerate() {
+                let hi = byte >> 4;
+                let lo = byte & 15;
+                if let Some(slot) = sdk_hex.get_mut(2 * i) {
+                    *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+                }
+                if let Some(slot) = sdk_hex.get_mut(2 * i + 1) {
+                    *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+                }
+            }
+            let id_str = core::str::from_utf8(&sdk_hex).unwrap_or("");
+            (sdk.folder(), id_str)
+        });
+        let c_probes = blaze_proc_macro::probe_clang::open_command_c_probes(home, host, sdk_pair, &store, alloc)
+            .map_err(|error| SetupError::Setting(said(frame, format_args!("c-probes: {error}"))))?;
+        let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, c_probes, native, no_sdk, graph_record }, frame));
         Ok(shared)
     }
 
@@ -1086,6 +1107,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         // answers until the engine's checker has answered the real probes' ladder
         // (handoff p1-probe-checker.txt).
         probes: None,
+        c_probes: Some(blaze_own::Share::share(&shared.c_probes)),
         c_mode: C_MODE,
         mode: MODE,
         native,
@@ -1127,7 +1149,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // dependent. Under [`CheckoutReads::Hole`] every read of the checkout is a hole: its outputs
     // serve nothing and it runs again next command.
     match job.checkout {
-        CheckoutReads::Kept { plant, status } => match admit_reads(&ran.reads, ran_as, &shared.spawn, checkout_prefix, plant, status, checkout, alloc) {
+        CheckoutReads::Kept { plant, status } => match admit_reads_with_probes(&ran.reads, ran_as, &shared.spawn, Some(&*shared.c_probes.records), checkout_prefix, plant, status, checkout, alloc) {
             Ok(()) => {
                 for read in checkout.iter() {
                     reads.push((read.name(), read.answer));
@@ -1204,6 +1226,21 @@ pub(crate) fn admit_reads(
     cells: &mut crate::engine_script_reads::ReadList,
     alloc: Alloc<'_>,
 ) -> Result<(), crate::engine_script_reads::NoCell> {
+    admit_reads_with_probes(observed, ran_as, setting, None, checkout_prefix, plant, status, cells, alloc)
+}
+
+#[expect(clippy::too_many_arguments, reason = "build-script read admission: each input one capability or mode")]
+pub(crate) fn admit_reads_with_probes(
+    observed: &[blaze_proc_macro::script_sandbox::Read],
+    ran_as: RanAs,
+    setting: &SpawnSetting,
+    c_probes: Option<&dyn blaze_proc_macro::probe_clang::CProbeStore>,
+    checkout_prefix: Option<&str>,
+    plant: crate::engine_script_reads::ReadsPlant,
+    status: Option<crate::engine_script_reads::StatusView>,
+    cells: &mut crate::engine_script_reads::ReadList,
+    alloc: Alloc<'_>,
+) -> Result<(), crate::engine_script_reads::NoCell> {
     use crate::engine_script_reads::{self as reads, NoCell, READS_CAP, Subject};
 
     let result_alloc = *cells.allocator();
@@ -1236,10 +1273,11 @@ pub(crate) fn admit_reads(
             file(Subject::from_str_in(crate::sweep::SHIM_FILE, result_alloc), digest);
             file(Subject::from_str_in(crate::sweep::PINS_FILE, result_alloc), blaze_proc_macro::native_facts::pins_digest(setting.pins.as_ref(), alloc));
         } else if blaze_proc_macro::spawn_route::is_fact_reply(subject, alloc) {
-            // A derived fact (pkg-config, sw_vers, cc-version): its reply is a function of the
-            // pins, so it is a keyed read of a reply file the next command answers again.
+            // A derived fact (pkg-config, sw_vers, cc-version, cc-probe): its reply is a function
+            // of the pins or cached c-probe record, so it is a keyed read of a reply file the next
+            // command answers again.
             let digest = read.digest.ok_or_else(rejected)?;
-            if !blaze_proc_macro::spawn_route::fact_reply_matches(subject, Some(digest), setting.pins.as_ref(), alloc) {
+            if !blaze_proc_macro::spawn_route::fact_reply_matches_with_probes(subject, Some(digest), setting.pins.as_ref(), c_probes, alloc) {
                 return Err(rejected());
             }
             let mut path = Subject::from_str_in(crate::sweep::REPLY_FILES, result_alloc);

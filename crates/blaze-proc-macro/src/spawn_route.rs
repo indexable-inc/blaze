@@ -387,15 +387,27 @@ pub fn is_fact_reply(subject: &str, alloc: Alloc<'_>) -> bool {
     crate::fact_pins::fact_now(subject, None, alloc) != crate::fact_pins::FactNow::NotAFact
 }
 
+/// Checks the observed digest of a derived fact's reply against what the pins (and optional C
+/// probe cache) answer now.
+pub fn fact_reply_matches_with_probes(
+    subject: &str,
+    observed: Option<ContentId>,
+    pins: Option<&FactPins>,
+    c_probes: Option<&dyn crate::probe_clang::CProbeStore>,
+    alloc: Alloc<'_>,
+) -> bool {
+    if observed.is_none() || !is_fact_reply(subject, alloc) {
+        return false;
+    }
+    crate::fact_pins::fact_now_with_probes(subject, pins, c_probes, alloc) == crate::fact_pins::FactNow::Answer(observed)
+}
+
 /// Checks the observed digest of a derived fact's reply against what the pins answer now
 /// (the deterministic pkg-config database with its nonzero "not found" reply, the pinned
 /// `sw_vers`, the pinned clang's version text). A native caller also has to identify the image
 /// that ran.
 pub fn fact_reply_matches(subject: &str, observed: Option<ContentId>, pins: Option<&FactPins>, alloc: Alloc<'_>) -> bool {
-    if observed.is_none() || !is_fact_reply(subject, alloc) {
-        return false;
-    }
-    crate::fact_pins::fact_now(subject, pins, alloc) == crate::fact_pins::FactNow::Answer(observed)
+    fact_reply_matches_with_probes(subject, observed, pins, None, alloc)
 }
 
 /// A file's digest in a spawn request (`present`).
@@ -510,10 +522,10 @@ impl ScriptSandbox {
         self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes())
     }
 
-    /// A compiler probe, answered from pins/answers/clang.json (`c_tasks_probe`) by the host's
-    /// clang pin, in every `CMode` (a check and a run see one answer): nothing runs and nothing
-    /// is recorded (the table's digest is in the base key), and a probe the table does not
-    /// answer stops the script with the row to add (rule 3).
+    /// A compiler probe, answered through the command's [`crate::probe_clang::CScriptProbes`]
+    /// strategy seam and content-addressed cache (`c_tasks_probe::resolve`), recording a per-probe
+    /// read (`cc-probe\n<key hex>` -> canonical reply digest before `unspell`). When `c_probes` is
+    /// absent (isolated unit tests without a command store), falls back to the checked-in table.
     fn spawn_probe(&mut self, program: &str, args: &[String], spawned: &Decoded) -> Result<(), Stop> {
         let script = Arc::clone(&self.script);
         let refused = |why: String| SpawnRefusal::Fact { program: program.to_owned(), args: args.to_vec(), why };
@@ -527,18 +539,55 @@ impl ScriptSandbox {
             Ok(pin) => pin.sha256,
             Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
         };
+        let owned_env = child_env(&script.env, spawned);
+        let env: Vec<(&str, &str)> = owned_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
+        let mount = script.cwd();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = &self.out;
+        let held_digest = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
+        let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
+
+        if let Some(c_probes) = &script.c_probes {
+            let probe = c_tasks_probe::Spawn {
+                program,
+                args: &arg_refs,
+                env: &env,
+                out_dir: script.out_dir(),
+                sdk,
+                mount: mount.as_str(),
+                sdk_id: &c_probes.sdk_id,
+                stdin: &spawned.stdin,
+            };
+            let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
+            let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
+                Ok(resolved) => resolved,
+                Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
+            };
+            let subject = facts::cc_probe_subject(&resolved.key, alloc);
+            let code = resolved.answered.code;
+            let stdout = resolved.answered.stdout.as_bytes().to_vec();
+            let stderr = resolved.answered.stderr.as_bytes().to_vec();
+            let subject_owned = subject.as_str().to_owned();
+            self.record(subject_owned, Some(resolved.canonical_digest));
+            return self.deliver(program, spawned.modes, code, &stdout, &stderr);
+        }
+
+        let probe = c_tasks_probe::Spawn {
+            program,
+            args: &arg_refs,
+            env: &env,
+            out_dir: script.out_dir(),
+            sdk,
+            mount: mount.as_str(),
+            sdk_id: "",
+            stdin: &spawned.stdin,
+        };
         let table = match c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc) {
             Ok(table) => table,
             Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
         };
-        let owned_env = child_env(&script.env, spawned);
-        let env: Vec<(&str, &str)> = owned_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let probe = c_tasks_probe::Spawn { program, args: &arg_refs, env: &env, out_dir: script.out_dir(), sdk, stdin: &spawned.stdin };
-        let out = &self.out;
-        let held = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
-        match table.answer(&clang, &probe, held, alloc) {
+        match table.answer(&clang, &probe, held_digest, alloc) {
             Ok(answer) => self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()),
             Err(why) => Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
         }

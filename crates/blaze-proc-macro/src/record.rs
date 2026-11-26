@@ -47,6 +47,14 @@ use crate::{
 const SEAL: &str = "blaze expansion record seal 1";
 const SEAL_LEN: usize = 32;
 
+/// Verifies a sealed record file's trailing [`SEAL`] and returns its unsealed body bytes, or
+/// `None` if the file is truncated or its seal does not match.
+pub fn unseal_record(bytes: &[u8]) -> Option<&[u8]> {
+    let body_len = bytes.len().checked_sub(SEAL_LEN)?;
+    let (body, seal) = bytes.split_at_checked(body_len)?;
+    (ContentId::of(SEAL, body).0 == seal).then_some(body)
+}
+
 /// How long one record read or publish may take (rule 18): a record is a small file, so a
 /// minute is a hang, failed by the effect layer naming the record.
 const RECORD_BUDGET: Duration = Duration::from_secs(60);
@@ -179,8 +187,8 @@ pub enum FilesError {
     Stopped { name: RecordName },
 }
 
-impl std::fmt::Display for FilesError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for FilesError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             FilesError::World(error) => write!(f, "the records' folder: {error}"),
             FilesError::NoTree => f.write_str("the records' world has no file tree"),
@@ -281,9 +289,9 @@ impl DirStore {
         Self::named(kind, key)
     }
 
-    /// `<folder><64 hex of key>`: `folder` is one of the store's (at most seven bytes).
+    /// `<folder><64 hex of key>`: `folder` is one of the store's (at most eight bytes).
     fn named(kind: &[u8], key: &ContentId) -> RecordName {
-        let mut name = RecordName { bytes: [0; 71], len: 0 };
+        let mut name = RecordName { bytes: [0; 72], len: 0 };
         name.bytes[..kind.len()].copy_from_slice(kind);
         let mut at = kind.len();
         for byte in key.0 {
@@ -296,10 +304,10 @@ impl DirStore {
     }
 }
 
-/// A record's file name, `list/<64 hex>` or `answer/<64 hex>`, inline: no allocation a lookup.
+/// A record's file name, `list/<64 hex>`, `answer/<64 hex>`, or `c-probe/<64 hex>`, inline: no allocation a lookup.
 #[derive(Clone, Copy, Debug)]
 pub struct RecordName {
-    bytes: [u8; 71],
+    bytes: [u8; 72],
     len: u8,
 }
 
@@ -309,8 +317,8 @@ impl RecordName {
     }
 }
 
-impl std::fmt::Display for RecordName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RecordName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -357,6 +365,23 @@ impl DirStore {
     /// (rule 21), equal bytes are no write.
     pub(crate) fn put_probe(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
         self.put_at(Self::named(b"probe/", key), bytes)
+    }
+
+    /// A build script's C compiler probe's answer record (`c_tasks_probe::encode_answer`):
+    /// `c-probe/<64 hex of the canonical ProbeKey>`.
+    pub(crate) fn get_c_probe<'a>(&self, key: &ContentId, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, FilesError> {
+        let Some(bytes) = self.get_at(Self::named(b"c-probe/", key))? else {
+            return Ok(None);
+        };
+        let mut out = AVec::with_capacity_in(bytes.len(), alloc);
+        out.extend_from_slice(&bytes);
+        Ok(Some(out))
+    }
+
+    /// Keeps a C compiler probe's answer record, written once: other bytes under the key are
+    /// refused (rule 21), equal bytes are no write.
+    pub(crate) fn put_c_probe(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
+        self.put_at(Self::named(b"c-probe/", key), bytes)
     }
 
     /// The record at `name`, its seal checked: `None` when absent or torn.

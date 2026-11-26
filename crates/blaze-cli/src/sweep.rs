@@ -45,10 +45,66 @@ pub(crate) const EXECUTOR_FILE: &str = "/blaze/facts/executor";
 struct FactFiles<'a> {
     setting: Option<blaze_proc_macro::spawn_route::SpawnSetting>,
     exe_dir: Option<&'a str>,
+    home: Option<(&'a Cx, &'a Dir<ReadWrite>)>,
+}
+
+/// Reads a sealed `c-probe/<64-hex>` record from the command's `.blaze` home capability and
+/// returns its canonical answer digest (or [`crate::engine_script_reads::NONE`] on miss/torn).
+fn read_c_probe_reply(
+    home: Option<(&Cx, &Dir<ReadWrite>)>,
+    hex: &str,
+    alloc: blaze_own::Alloc<'_>,
+) -> Result<ContentId, CliError> {
+    let Some((cx, dir)) = home else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    const PREFIX: &[u8] = b"v2/build-script/records/c-probe/";
+    if hex.len() != 64 || !hex.is_ascii() {
+        return Ok(crate::engine_script_reads::NONE);
+    }
+    let mut path_buf = [0u8; PREFIX.len() + 64];
+    path_buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    path_buf[PREFIX.len()..].copy_from_slice(hex.as_bytes());
+    let Ok(path_str) = core::str::from_utf8(&path_buf) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let Ok(rel) = Path::new(path_str) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let file = match dir.open_read(cx, &rel) {
+        Ok(file) => file,
+        Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
+        Err(_) => return Ok(crate::engine_script_reads::NONE),
+    };
+    let Ok(len_u64) = file.len(cx) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let Ok(len) = usize::try_from(len_u64) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let mut raw = blaze_own::AVec::new_in(alloc);
+    raw.resize(len, 0u8);
+    let Ok(read) = file.read_into(raw.as_mut_slice(), 0).wait(cx) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    raw.truncate(read);
+    let Some(body) = blaze_proc_macro::record::unseal_record(raw.as_slice()) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    let Ok(answer) = blaze_build_script::c_tasks_probe::decode_answer(body, alloc) else {
+        return Ok(crate::engine_script_reads::NONE);
+    };
+    Ok(blaze_build_script::c_tasks_probe::canonical_reply_digest(&answer))
 }
 
 impl<'a> FactFiles<'a> {
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
+        if let Some(subject) = path.strip_prefix(REPLY_FILES)
+            && blaze_build_script::facts::parse_cc_probe_subject(subject).is_some()
+            && let Some(hex) = subject.strip_prefix("cc-probe\n")
+        {
+            return read_c_probe_reply(self.home, hex, alloc);
+        }
         if path == SHIM_FILE {
             let installed = || {
                 if let Some(dir) = self.exe_dir {
@@ -100,7 +156,7 @@ impl<'a> FactFiles<'a> {
 /// iff every `FACT_MOUNT` row matches its stored digest.
 pub(crate) fn verify_fact_leaves(leaves: &Leaves<'_>, exe_dir: Option<&str>, frame: &Frame) -> bool {
     let erased = blaze_own::Erased::new(frame);
-    let mut fact_files = FactFiles { setting: None, exe_dir };
+    let mut fact_files = FactFiles { setting: None, exe_dir, home: None };
     for i in 0..leaves.len() {
         let row = leaves.row(i);
         let path = leaves.path(i);
@@ -1087,7 +1143,7 @@ impl<S: Stamps> Follow<S> {
         let mut bytes = Bytes::new_in(frame, "a file the last answer read");
         let mut layout_moved = false;
         let erased = blaze_own::Erased::new(frame);
-        let mut fact_files = FactFiles::default();
+        let mut fact_files = FactFiles { setting: None, exe_dir: None, home: home.map(|dir| (&cx, dir)) };
         // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
         // after them in the table's (kind, path) order.
         let mut crates: Vec<usize, &Frame> = Vec::new_in(frame);
@@ -1803,6 +1859,73 @@ mod tests {
         assert!(super::wanted("", "target", true, false) && !super::wanted("", "target", true, true), "a `target` is listed exactly when untagged");
         assert!(!super::wanted("", ".blaze", true, false) && !super::wanted("", ".git", true, false));
         assert!(super::wanted("crates", "target", true, true), "control: only the root's `target` can be cargo's");
+    }
+
+    /// Rule 23 selective invalidation in `sweep.rs`: each `cc-probe\n<64-hex>` reply row is
+    /// validated through the `.blaze` home capability against `v2/build-script/records/c-probe/<hex>`.
+    /// Changing one cached probe record moves ONLY that probe's row, leaving unrelated probes' rows
+    /// unchanged.
+    #[test]
+    fn sweep_c_probe_reply_validates_selectively_through_home_dir() {
+        use blaze_build_script::c_tasks_probe::{ProbeAnswer, ProbeKey, canonical_reply_digest, encode_answer};
+        use blaze_build_script::facts::cc_probe_subject;
+        use blaze_own::{AVec, String as OwnString};
+
+        let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let alloc = erased.handle();
+        let fs = io.need_fs().expect("files");
+        let root = fs.open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+        let home = fs.open_dir(&cx, &Path::new("home/.blaze").expect("a path")).expect("open");
+        let store_dir = home.subdir(&Path::new("v2").expect("v2"));
+        let dir_store = blaze_proc_macro::record::DirStore::build_scripts(io.spawner(), None, &store_dir);
+
+        let key_a = ProbeKey(ContentId([0x11; 32]));
+        let key_b = ProbeKey(ContentId([0x22; 32]));
+        let ans_a = ProbeAnswer { code: 0, stdout: OwnString::new_in(alloc), stderr: OwnString::new_in(alloc) };
+        let ans_b = ProbeAnswer { code: 0, stdout: OwnString::from_str_in("ok", alloc), stderr: OwnString::new_in(alloc) };
+        let mut enc_a = AVec::new_in(alloc);
+        encode_answer(&ans_a, &mut enc_a);
+        let mut enc_b = AVec::new_in(alloc);
+        encode_answer(&ans_b, &mut enc_b);
+        blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_a, enc_a.as_slice()).expect("put A");
+        blaze_proc_macro::probe_clang::CProbeStore::put(&dir_store, &key_b, enc_b.as_slice()).expect("put B");
+
+        let subj_a = cc_probe_subject(&key_a, alloc);
+        let subj_b = cc_probe_subject(&key_b, alloc);
+        let path_a = std::format!("{REPLY_FILES}{}", subj_a.as_str());
+        let path_b = std::format!("{REPLY_FILES}{}", subj_b.as_str());
+        let dig_a = canonical_reply_digest(&ans_a);
+        let dig_b = canonical_reply_digest(&ans_b);
+
+        let mut rows = Rows::new_in(frame);
+        rows.push(LeafKind::ScriptFile, 0, &path_a, None, dig_a);
+        rows.push(LeafKind::ScriptFile, 0, &path_b, None, dig_b);
+        let table = Leaves::bytes_in(&rows, frame).expect("table");
+        let (last, _) = Leaves::of(&table).expect("leaves");
+        let model = Model { now: Cell::new(10 * TICK), mtimes: RefCell::new(StdMap::new()) };
+
+        // Both rows stand unchanged when records match.
+        let followed = Follow { stamps: &model, plant: Plant::None }.follow(&cx, &root, Some(&home), &last, frame).expect("follow 1");
+        assert_eq!(followed.now.rows[0].id, dig_a, "probe A stands");
+        assert_eq!(followed.now.rows[1].id, dig_b, "probe B stands");
+
+        // Replace ONLY probe A's sealed file with a different answer; probe B stays valid.
+        let ans_a2 = ProbeAnswer { code: 1, stdout: OwnString::new_in(alloc), stderr: OwnString::from_str_in("bad flag", alloc) };
+        let mut enc_a2 = AVec::new_in(alloc);
+        encode_answer(&ans_a2, &mut enc_a2);
+        let mut sealed = std::vec::Vec::with_capacity(enc_a2.len() + 32);
+        sealed.extend_from_slice(enc_a2.as_slice());
+        sealed.extend_from_slice(&ContentId::of("blaze expansion record seal 1", enc_a2.as_slice()).0);
+        let rel_a = std::format!("v2/build-script/records/c-probe/{}", subj_a.as_str().strip_prefix("cc-probe\n").unwrap());
+        home.publish(&cx, &Path::new(&rel_a).expect("rel_a"), Content::bytes(&sealed), Durable::No).expect("overwrite A");
+
+        let followed2 = Follow { stamps: &model, plant: Plant::None }.follow(&cx, &root, Some(&home), &last, frame).expect("follow 2");
+        assert_eq!(followed2.now.rows[0].id, canonical_reply_digest(&ans_a2), "probe A reflects new answer");
+        assert_ne!(followed2.now.rows[0].id, dig_a, "probe A invalidated");
+        assert_eq!(followed2.now.rows[1].id, dig_b, "probe B untouched");
     }
 }
 

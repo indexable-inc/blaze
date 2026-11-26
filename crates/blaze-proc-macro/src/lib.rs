@@ -57,6 +57,8 @@ pub mod native_setting;
 #[cfg(feature = "runtime")]
 pub mod native_unit;
 #[cfg(feature = "runtime")]
+pub mod probe_clang;
+#[cfg(feature = "runtime")]
 pub mod protocol;
 #[cfg(feature = "runtime")]
 pub mod script;

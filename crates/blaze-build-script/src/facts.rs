@@ -339,6 +339,40 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
     }
 }
 
+/// The head of a per-probe compiler read subject: `cc-probe\n<64 lowercase hex of ProbeKey>`.
+pub const CC_PROBE_HEAD: &str = "cc-probe";
+
+fn hex_nibble(n: u8) -> char {
+    match n & 15 {
+        d @ 0..=9 => char::from(b'0' + d),
+        d => char::from(b'a' + (d - 10)),
+    }
+}
+
+/// The read subject for a resolved compiler probe, keyed by its canonical [`crate::c_tasks_probe::ProbeKey`].
+pub fn cc_probe_subject<'a>(key: &crate::c_tasks_probe::ProbeKey, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::from_str_in(CC_PROBE_HEAD, alloc);
+    out.push('\n');
+    for byte in key.0.0 {
+        out.push(hex_nibble(byte >> 4));
+        out.push(hex_nibble(byte & 15));
+    }
+    out
+}
+
+/// Parses a `cc-probe\n<64 lowercase hex>` read subject back into its [`crate::c_tasks_probe::ProbeKey`].
+pub fn parse_cc_probe_subject(subject: &str) -> Option<crate::c_tasks_probe::ProbeKey> {
+    let hex = subject.strip_prefix(CC_PROBE_HEAD)?.strip_prefix('\n')?;
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(crate::c_tasks_probe::ProbeKey(blaze_ids::ContentId(bytes)))
+}
+
 /// The fact's record subject for the script's read list (as D54's `git:` subjects): the whole
 /// question, one field per line. `pkgconf` is recorded as `pkg-config`: both are answered alike.
 pub fn subject<'a>(fact: &Fact<'_>, alloc: Alloc<'a>) -> AString<'a> {

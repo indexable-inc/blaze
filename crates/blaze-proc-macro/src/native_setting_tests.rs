@@ -145,6 +145,7 @@ fn setting<'s>(store: &'s Path, native: Option<NativeSetting<'s>>) -> Setting<'s
         host: HOST,
         table: Arc::new(Vec::new()),
         probes: None,
+        c_probes: None,
         c_mode: CMode::Built,
         mode: Mode::Build,
         native,

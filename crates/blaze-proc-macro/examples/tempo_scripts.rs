@@ -321,6 +321,7 @@ fn main() {
         host: TARGET,
         table: Arc::clone(&setup.table),
         probes: None,
+        c_probes: None,
         c_mode: CMode::Deferred,
         mode: blaze_build_script::toolchain::Mode::Check,
         native: setup.native.as_ref().ok().map(|run| run.setting()),
