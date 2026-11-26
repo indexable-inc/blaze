@@ -180,6 +180,20 @@ fn call_build_send() {
     require_send(build_with_async_closure(1));
 }
 
+type BoxFut<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+type Relaunch = std::sync::Arc<dyn Fn() -> BoxFut<u8> + Send + Sync>;
+
+fn launch_node_arc_closure_unsize(flag: bool, val: u8) -> BoxFut<u8> {
+    Box::pin(async move {
+        let saved = flag.then(|| val);
+        async {}.await;
+        if let Some(v) = saved {
+            let _relaunch: Relaunch = std::sync::Arc::new(move || Box::pin(async move { v }));
+        }
+        val
+    })
+}
+
 fn main() {}
 "#;
 
@@ -273,7 +287,7 @@ fn an_async_closure_is_a_stored_closure_value() {
             "TWIN `{name}`: rustc refuses it (E0277: `Rc<u8>` held across the body's `.await`): {got:?}"
         );
     }
-    for name in ["returned_dropped", "spawn_move_capture_send", "call_build_send"] {
+    for name in ["returned_dropped", "spawn_move_capture_send", "call_build_send", "launch_node_arc_closure_unsize"] {
         let got = world.check(BodyRef::Free(key_of(name)), alloc);
         std::println!("{name}: {got:?}");
         assert!(got.is_clean() && got.gaps.is_empty() && got.undecided.is_empty(), "{name}: clean with zero gaps: {got:?}");
