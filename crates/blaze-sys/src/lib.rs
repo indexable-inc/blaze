@@ -60,7 +60,13 @@
 /// content-addressed runner keys (AGENTS.md rule 69).
 pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("lib.rs"),
+    include_bytes!("errno.rs"),
+    include_bytes!("flags.rs"),
+    include_bytes!("types.rs"),
+    include_bytes!("posix.rs"),
     include_bytes!("linux/mod.rs"),
+    include_bytes!("linux/nr.rs"),
+    include_bytes!("linux/raw.rs"),
     include_bytes!("linux/confine.rs"),
     include_bytes!("linux/landlock.rs"),
     include_bytes!("linux/process.rs"),
@@ -69,6 +75,7 @@ pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("linux/vfork.rs"),
     include_bytes!("seatbelt.rs"),
     include_bytes!("macos.rs"),
+    include_bytes!("macos_kernel.rs"),
     include_bytes!("macos_proc.rs"),
 ];
 

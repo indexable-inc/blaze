@@ -435,6 +435,8 @@ struct Child<'a> {
     /// The confinement it enters last before `execve` (D177): data the parent made, which the
     /// child only reads.
     confine: Option<&'a blaze_sys::linux::confine::ChildConfine<'a>>,
+    /// Typed `argv`/`envp` for `blaze_sys::linux::execveat` when `confine.exec_fd` is `Some`.
+    exec_args: Option<(blaze_sys::linux::Args<'a>, blaze_sys::linux::Args<'a>)>,
     /// The error slot, the one memory of the parent's the child writes, read by the parent only
     /// after the child has exec'd or exited: the step that failed (0: none) and its errno, and
     /// for a refused confinement ([`CONFINE_STEP`]) which of its steps.
@@ -467,6 +469,41 @@ fn clone(plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned>
 /// until this returns; the child's frames go there while the calling thread waits.
 #[cfg(target_os = "linux")]
 unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned> {
+    const EXEC_ARGS_CAP: usize = 1024;
+    let mut argv_buf = [blaze_sys::linux::Arg::END; EXEC_ARGS_CAP];
+    let mut envp_buf = [blaze_sys::linux::Arg::END; EXEC_ARGS_CAP];
+    let exec_args = if ask.confine.and_then(|c| c.exec_fd).is_some() {
+        if plan.argv.len() > EXEC_ARGS_CAP || plan.envp.len() > EXEC_ARGS_CAP {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "execveat argv/envp exceeds cap"));
+        }
+        for (i, &p) in plan.argv.iter().enumerate() {
+            if let Some(slot) = argv_buf.get_mut(i) {
+                *slot = if p.is_null() {
+                    blaze_sys::linux::Arg::END
+                } else {
+                    // SAFETY: `Plan` keeps every NUL-terminated argument string live until `clone_on` returns.
+                    blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
+                };
+            }
+        }
+        for (i, &p) in plan.envp.iter().enumerate() {
+            if let Some(slot) = envp_buf.get_mut(i) {
+                *slot = if p.is_null() {
+                    blaze_sys::linux::Arg::END
+                } else {
+                    // SAFETY: `Plan` keeps every NUL-terminated env string live until `clone_on` returns.
+                    blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
+                };
+            }
+        }
+        let argv = blaze_sys::linux::Args::new(argv_buf.get(..plan.argv.len()).unwrap_or(&[]))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid execveat argv"))?;
+        let envp = blaze_sys::linux::Args::new(envp_buf.get(..plan.envp.len()).unwrap_or(&[]))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid execveat envp"))?;
+        Some((argv, envp))
+    } else {
+        None
+    };
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
     let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
     let mut child = Child {
@@ -478,6 +515,7 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
         session: ask.session,
         parent: ask.parent,
         confine: ask.confine,
+        exec_args,
         step: 0,
         failed: 0,
         refused: None,
@@ -700,22 +738,18 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
             unsafe { libc::_exit(crate::exit::Exit::ExecFailed.code()) }
         }
     }
-    if let Some(exec_fd) = child.confine.and_then(|c| c.exec_fd) {
-        // SAFETY: `exec_fd` is an open `O_RDONLY | O_CLOEXEC` descriptor kept alive by the parent
-        // across `CLONE_VFORK`, and `argv`/`envp` are NULL-terminated arrays of NUL-terminated
-        // strings kept by the parent. `SYS_execveat` with `AT_EMPTY_PATH` is a single raw syscall
-        // (async-signal-safe) that launches the exact verified inode without reopening `program`
-        // by path; on success the child leaves shared memory and the kernel closes `exec_fd`.
-        let _ = unsafe {
-            libc::syscall(
-                libc::SYS_execveat,
-                exec_fd.raw(),
-                c"".as_ptr(),
-                child.plan.argv.as_ptr(),
-                child.plan.envp.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        };
+    if let (Some(exec_fd), Some((argv, envp))) = (child.confine.and_then(|c| c.exec_fd), child.exec_args) {
+        let errno = blaze_sys::linux::execveat(
+            exec_fd,
+            blaze_sys::Path::EMPTY,
+            argv,
+            envp,
+            blaze_sys::linux::AtFlags::EMPTY_PATH,
+        );
+        child.failed = libc::c_int::from(errno.raw());
+        child.step = 4;
+        // SAFETY: the end of the child, running nothing of the parent's; one syscall.
+        unsafe { libc::_exit(crate::exit::Exit::ExecFailed.code()) }
     } else {
         // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
         // all kept by the parent until the program runs. Async-signal-safe; on success the child

@@ -521,6 +521,20 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         assert!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_prof, files, alloc).is_err(), "{bad_prof} must be refused");
     }
 
+    // Command-line token pasting (`-DCAT(a,b)=a##b`, `-D P=a%:%:b`) and nested response files in
+    // option values (`-Xassembler @args.rsp`) are refused before caching.
+    for bad_argv in [
+        ["-c", "-DCAT(a,b)=a##b", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+        ["-c", "-D", "CAT(a,b)=a%:%:b", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+        ["-c", "-Xassembler", "@args.rsp", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+    ] {
+        let sp = Spawn { program: "cc", args: bad_argv, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        assert_eq!(
+            canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp, files, alloc).err().expect("bad argv").why,
+            ProbeWhy::PackageInput
+        );
+    }
+
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
     let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");

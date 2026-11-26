@@ -141,9 +141,30 @@ impl VerifiedExec {
         })
     }
 
-    /// The kernel metadata stamp of the opened inode.
+    /// The kernel metadata stamp captured when the inode was opened.
     pub fn stamp(&self) -> VerifiedStamp {
         self.stamp
+    }
+
+    /// Re-queries `statx(fd, "", AT_EMPTY_PATH, BASIC)` on the pinned descriptor to detect any
+    /// in-place mutation (`write`/`truncate`/`chmod`, which unconditionally advances `ctime` for
+    /// non-root writers) between verification and execution.
+    pub fn stamp_now(&self, cx: &Cx) -> Result<VerifiedStamp, VerifiedExecError> {
+        cx.check().map_err(VerifiedExecError::Stopped)?;
+        let st = blaze_sys::linux::statx(
+            self.fd.fd(),
+            blaze_sys::Path::EMPTY,
+            blaze_sys::linux::AtFlags::EMPTY_PATH,
+            blaze_sys::linux::StatxMask::BASIC,
+        )
+        .map_err(|errno| VerifiedExecError::Os { call: "statx", errno })?;
+        if st.mode & blaze_sys::linux::Statx::TYPE_MASK != blaze_sys::linux::Statx::REGULAR {
+            return Err(VerifiedExecError::NotRegular);
+        }
+        let dev = (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor);
+        let modified_ns = i128::from(st.mtime.sec) * 1_000_000_000 + i128::from(st.mtime.nsec);
+        let changed_ns = i128::from(st.ctime.sec) * 1_000_000_000 + i128::from(st.ctime.nsec);
+        Ok(VerifiedStamp { dev, ino: st.ino, len: st.size, modified_ns, changed_ns })
     }
 
     /// Streams the entire opened inode in bounded 64 KiB chunks into `on_chunk`, checking `cx`
@@ -199,6 +220,8 @@ mod tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod process_tests;
 
+#[cfg(target_os = "linux")]
+pub use landlock::feed_nix_runtime_closure;
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
 pub use machine::{Effect, Event, HermeticMachine, MachineOpts, State, Stream, Usage};
 pub use plan::{Access, Plan, PlanOpts, Rule as PlanRule, Why};

@@ -816,8 +816,20 @@ pub fn canonicalize<'b, 's>(
             break;
         }
         if let Some(prev) = prev_flag.take() {
-            // Only `-o` may carry an `OUT_DIR` path; any other flag taking a separate value with
-            // a path separator (e.g. `-L /host/lib`) is refused as an unkeyed external input.
+            // Reject nested response files (e.g. `-Xassembler @args.rsp`) and preprocessor token
+            // pasting in `-D` macro values (`-D CAT(a,b)=a##b`). Only `-o` may carry an `OUT_DIR`
+            // path; any other flag taking a separate value with a path separator (e.g. `-L /host/lib`)
+            // is refused as an unkeyed external input.
+            if arg.starts_with('@')
+                || masked.contains("##")
+                || masked.contains("%:%:")
+                || contains_ident(masked, "__has_include")
+                || contains_ident(masked, "__has_include_next")
+                || contains_ident(masked, "__has_embed")
+            {
+                has_arg_package_input = true;
+                break;
+            }
             if prev == "-o" {
                 if arg != "/dev/null" && under_out_dir(arg, spawn.out_dir).is_none() {
                     has_arg_package_input = true;
@@ -831,6 +843,8 @@ pub fn canonicalize<'b, 's>(
         }
         if is_header_search_flag(arg)
             || arg.starts_with('@')
+            || masked.contains("##")
+            || masked.contains("%:%:")
             || contains_ident(masked, "__has_include")
             || contains_ident(masked, "__has_include_next")
             || contains_ident(masked, "__has_embed")

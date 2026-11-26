@@ -46,27 +46,32 @@ struct FactFiles<'a> {
     setting: Option<blaze_proc_macro::spawn_route::SpawnSetting>,
     exe_dir: Option<&'a str>,
     home: Option<(&'a Cx, &'a Dir<ReadWrite>)>,
+    /// Host `$HOME` path string (for computing the Nix runtime closure identity on NixOS when a
+    /// `cc-probe` leaf row is followed).
+    home_path: Option<&'a str>,
     /// Lazy active SDK identity digest (`facts::sdk_id_digest`): resolved at most once when a
     /// `cc-probe` leaf row is actually followed (zero overhead on pure-Rust workspaces).
     sdk_digest: Option<&'a dyn Fn() -> [u8; 32]>,
     cached_sdk: Option<[u8; 32]>,
+    cached_answerer: Option<ContentId>,
 }
 
 /// Reads a sealed `c-probe/<64-hex>` record from the command's `.blaze` home capability after
-/// verifying the subject's `(answerer, clang, sdk)` against the active command's hermetic answerer,
-/// `pins/clang.json` host pin, and active SDK identity, capping on-disk size before allocating.
+/// verifying the subject's `(answerer, clang, sdk)` against the active command's hermetic answerer
+/// (including the Nix runtime closure on NixOS), `pins/clang.json` host pin, and active SDK
+/// identity, capping on-disk size before allocating.
 fn read_c_probe_reply(
     home: Option<(&Cx, &Dir<ReadWrite>)>,
     parsed: blaze_build_script::facts::CcProbeSubject,
     key_hex: &str,
+    active_answerer: &ContentId,
     active_sdk: &[u8; 32],
     alloc: blaze_own::Alloc<'_>,
 ) -> Result<ContentId, CliError> {
-    let active_answerer = blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id();
     let Some(active_pin) = blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE) else {
         return Ok(crate::engine_script_reads::NONE);
     };
-    read_c_probe_reply_with(home, parsed, key_hex, &active_answerer, &active_pin, active_sdk, alloc)
+    read_c_probe_reply_with(home, parsed, key_hex, active_answerer, &active_pin, active_sdk, alloc)
 }
 
 fn read_c_probe_reply_with(
@@ -143,13 +148,26 @@ impl<'a> FactFiles<'a> {
         digest
     }
 
+    fn active_answerer_id(&mut self, alloc: blaze_own::Alloc<'_>) -> ContentId {
+        if let Some(cached) = self.cached_answerer {
+            return cached;
+        }
+        let id = self
+            .home_path
+            .and_then(|home| blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(home, crate::graph::TRIPLE, alloc))
+            .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id);
+        self.cached_answerer = Some(id);
+        id
+    }
+
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
         if let Some(subject) = path.strip_prefix(REPLY_FILES)
             && let Some(parsed) = blaze_build_script::facts::parse_cc_probe_subject(subject)
             && let Some(key_hex) = subject.rsplit('\n').next()
         {
             let active_sdk = self.active_sdk_digest();
-            return read_c_probe_reply(self.home, parsed, key_hex, &active_sdk, alloc);
+            let active_answerer = self.active_answerer_id(alloc);
+            return read_c_probe_reply(self.home, parsed, key_hex, &active_answerer, &active_sdk, alloc);
         }
         if path == SHIM_FILE {
             let installed = || {
@@ -202,7 +220,7 @@ impl<'a> FactFiles<'a> {
 /// iff every `FACT_MOUNT` row matches its stored digest.
 pub(crate) fn verify_fact_leaves(leaves: &Leaves<'_>, exe_dir: Option<&str>, frame: &Frame) -> bool {
     let erased = blaze_own::Erased::new(frame);
-    let mut fact_files = FactFiles { setting: None, exe_dir, home: None, sdk_digest: None, cached_sdk: None };
+    let mut fact_files = FactFiles { setting: None, exe_dir, home: None, home_path: None, sdk_digest: None, cached_sdk: None, cached_answerer: None };
     for i in 0..leaves.len() {
         let row = leaves.row(i);
         let path = leaves.path(i);
@@ -1163,7 +1181,7 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_with_sdk(cx, root, home, last, marked, served, None, frame)
+        self.follow_served_with_sdk(cx, root, home, None, last, marked, served, None, frame)
     }
 
     /// [`Follow::follow_served`] carrying a lazy active SDK identity resolver for `cc-probe`
@@ -1174,13 +1192,14 @@ impl<S: Stamps> Follow<S> {
         cx: &Cx,
         root: &Dir<ReadWrite>,
         home: Option<&Dir<ReadWrite>>,
+        home_path: Option<&str>,
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         sdk_digest: Option<&dyn Fn() -> [u8; 32]>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by_with_sdk::<Batched>(cx, root, home, last, marked, served, sdk_digest, frame)
+        self.follow_served_by_with_sdk::<Batched>(cx, root, home, home_path, last, marked, served, sdk_digest, frame)
     }
 
     /// A served script observation can depend on paths beyond its recorded name, including
@@ -1199,7 +1218,7 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by_with_sdk::<W>(cx, root, home, last, marked, served, None, frame)
+        self.follow_served_by_with_sdk::<W>(cx, root, home, None, last, marked, served, None, frame)
     }
 
     #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
@@ -1208,6 +1227,7 @@ impl<S: Stamps> Follow<S> {
         cx: &Cx,
         root: &Dir<ReadWrite>,
         home: Option<&Dir<ReadWrite>>,
+        home_path: Option<&str>,
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
         mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
@@ -1221,7 +1241,15 @@ impl<S: Stamps> Follow<S> {
         let mut bytes = Bytes::new_in(frame, "a file the last answer read");
         let mut layout_moved = false;
         let erased = blaze_own::Erased::new(frame);
-        let mut fact_files = FactFiles { setting: None, exe_dir: None, home: home.map(|dir| (&cx, dir)), sdk_digest, cached_sdk: None };
+        let mut fact_files = FactFiles {
+            setting: None,
+            exe_dir: None,
+            home: home.map(|dir| (&cx, dir)),
+            home_path,
+            sdk_digest,
+            cached_sdk: None,
+            cached_answerer: None,
+        };
         // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
         // after them in the table's (kind, path) order.
         let mut crates: Vec<usize, &Frame> = Vec::new_in(frame);

@@ -244,16 +244,15 @@ pub struct HermeticClangProbe {
     work_rel: SharedStr,
     work_root: SharedStr,
     deadline: Duration,
+    resolved_id: bstd::sync::Flight<(), ContentId, (), SharedAlloc<'static>>,
     verify_flight: bstd::sync::Flight<(), VerifiedClang, OwnArc<str, SharedAlloc<'static>>, SharedAlloc<'static>>,
 }
 
 impl HermeticClangProbe {
-    /// Strategy id of this answerer, derived directly from the complete transitive implementation
-    /// source bytes of `probe_clang.rs`, `spawn_route.rs`, `record.rs`, `c_tasks_probe.rs`, and
-    /// every runner/launcher/confinement source file across `blaze-std`, `blaze-core`, and
-    /// `blaze-sys` (AGENTS.md rule 69) so any runner, cache, routing, process-launch, or
-    /// canonicalization change automatically rolls [`ProbeKey`] and invalidates prior `cc-probe`
-    /// read subjects.
+    /// Base strategy id of this answerer, derived directly from the complete transitive
+    /// implementation source bytes of `probe_clang.rs`, `spawn_route.rs`, `record.rs`,
+    /// `c_tasks_probe.rs`, and every runner/launcher/confinement source file across `blaze-std`,
+    /// `blaze-core`, and `blaze-sys` (AGENTS.md rule 69).
     pub fn strategy_id() -> ContentId {
         let mut h = blaze_ids::Hasher::new(HERMETIC_STRATEGY_DOMAIN);
         h.part(include_bytes!("probe_clang.rs"))
@@ -266,6 +265,56 @@ impl HermeticClangProbe {
             }
         }
         h.finish()
+    }
+
+    /// Strategy id bound to the host runtime closure of `clang_path`: hashes [`Self::strategy_id`]
+    /// plus, on NixOS hosts, the exact resolved loader (`PT_INTERP`), `nix-ld` / glibc `ld.so`,
+    /// and transitive `/nix/store` shared library paths and contents so any NixOS system
+    /// generation or runtime library change automatically rolls [`ProbeKey`] and invalidates
+    /// `cc-probe` read subjects (AGENTS.md rule 21).
+    pub fn strategy_id_for_clang(clang_path: &str) -> ContentId {
+        let base = Self::strategy_id();
+        #[cfg(target_os = "linux")]
+        {
+            let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe runtime closure 1");
+            h.id(&base);
+            match bstd::procs::hermetic::feed_nix_runtime_closure(clang_path, &mut |chunk| {
+                h.update(chunk);
+            }) {
+                Ok(true) => {
+                    h.part(b"nix-closure-ok");
+                }
+                Ok(false) => {
+                    h.part(b"no-nix-closure");
+                }
+                Err(Fault::Host { call, code }) => {
+                    h.part(b"nix-closure-err").part(call.as_bytes()).update(&code.to_le_bytes());
+                }
+                Err(_) => {
+                    h.part(b"nix-closure-err-other");
+                }
+            }
+            h.finish()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = clang_path;
+            base
+        }
+    }
+
+    /// Strategy id for the pinned `clang-23` shelf beneath `home` on `host`, used by `sweep.rs`
+    /// when revalidating recorded `cc-probe` read subjects.
+    pub fn strategy_id_for_home(home: &str, host: &str, alloc: Alloc<'_>) -> Option<ContentId> {
+        let pin = toolchain::clang_pin(CLANG_JSON, host).ok()?;
+        let prog = shelf_pins::shelf_program(CLANG_JSON, host, "clang-23").ok()?;
+        let shelf_hex = hex_bytes(&pin.sha256, alloc);
+        let clang_path = Path::new(home)
+            .join(crate::native_setting::SHELF_DIR)
+            .join(shelf_hex.as_str())
+            .join(prog.shelf_path);
+        let path_str = clang_path.to_str()?;
+        Some(Self::strategy_id_for_clang(path_str))
     }
 
     /// Opens [`HermeticClangProbe`] for `host` using already-open deadline-aware directory
@@ -312,6 +361,11 @@ impl HermeticClangProbe {
             work_rel: OwnString::from_str_in(work_rel, SharedAlloc::global()),
             work_root: work_str,
             deadline: PROBE_DEADLINE,
+            resolved_id: bstd::sync::Flight::with_capacity_in(
+                "c-probe.clang.strategy_id",
+                NonZeroUsize::MIN,
+                SharedAlloc::global(),
+            ),
             verify_flight: bstd::sync::Flight::with_capacity_in(
                 "c-probe.clang.verify",
                 NonZeroUsize::MIN,
@@ -362,6 +416,11 @@ impl HermeticClangProbe {
             work_rel: OwnString::from_str_in(work_rel, SharedAlloc::global()),
             work_root: work_str,
             deadline: PROBE_DEADLINE,
+            resolved_id: bstd::sync::Flight::with_capacity_in(
+                "c-probe.clang.strategy_id",
+                NonZeroUsize::MIN,
+                SharedAlloc::global(),
+            ),
             verify_flight: bstd::sync::Flight::with_capacity_in(
                 "c-probe.clang.verify",
                 NonZeroUsize::MIN,
@@ -454,6 +513,15 @@ impl HermeticClangProbe {
                     let got_sha = hasher.finish();
                     shelf_pins::check_member(self.host.as_str(), prog, got_sha)
                         .map_err(|e| fail(own_fmt(format_args!("{e}"), alloc)))?;
+                    let after_hash = exec
+                        .stamp_now(vcx)
+                        .map_err(|e| fail(own_fmt(format_args!("post-hash stat clang-23: {e}"), alloc)))?;
+                    if after_hash != stamp {
+                        return Err(OwnArc::from_str_in(
+                            "pinned clang-23 inode was modified during SHA-256 verification (rule 21)",
+                            shared,
+                        ));
+                    }
                     if let Some(expected) = expected_voucher
                         && let Ok(voucher_rel) = bstd::path::Path::new(voucher_name.as_str())
                     {
@@ -787,7 +855,12 @@ fn resolve_source_date_epoch<'a>(
 
 impl ProbeAnswerer for HermeticClangProbe {
     fn id(&self) -> ContentId {
-        Self::strategy_id()
+        if let Ok(cx) = self.io.cx(self.deadline, bstd::mem::TASK_FRAME)
+            && let Ok(id) = self.resolved_id.ask(&cx, (), |_vcx| Ok(Self::strategy_id_for_clang(self.clang_path.as_str())))
+        {
+            return id;
+        }
+        Self::strategy_id_for_clang(self.clang_path.as_str())
     }
 
     fn answer<'a, 'b>(
@@ -952,7 +1025,19 @@ impl ProbeAnswerer for HermeticClangProbe {
         })
         .map_err(|e| own_fmt(format_args!("c-probe spec refused: {:?} ({:?})", e.fault, e.rule), alloc))?;
         #[cfg(target_os = "linux")]
-        let spec = spec.with_verified_exec(&verified.exec);
+        let spec = {
+            // Revalidate the pinned inode's kernel metadata (`ctime`/`mtime`/`size`) immediately
+            // before `execveat` to catch any in-place write since verification; during `execveat`
+            // the kernel enforces `ETXTBSY` write exclusion on the running binary.
+            let pre_stamp = verified
+                .exec
+                .stamp_now(&cx)
+                .map_err(|e| own_fmt(format_args!("pre-exec stat clang-23: {e}"), alloc))?;
+            if pre_stamp != verified.exec.stamp() {
+                return Err(own_str("pinned clang-23 inode was modified before probe execution (rule 21)", alloc));
+            }
+            spec.with_verified_exec(&verified.exec)
+        };
 
         #[cfg(not(target_os = "linux"))]
         {
@@ -974,6 +1059,24 @@ impl ProbeAnswerer for HermeticClangProbe {
         let ran = hermetic
             .run(&cx, &spec, &ProbeFiles, alloc)
             .map_err(|e| own_fmt(format_args!("c-probe hermetic run failed: {:?} ({:?})", e.fault, e.rule), alloc))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let Some(post_rem) = remaining() else {
+                return Err(own_str("c-probe deadline exhausted before post-exec inode revalidation", alloc));
+            };
+            let post_cx = self
+                .io
+                .cx(post_rem, bstd::mem::TASK_FRAME)
+                .map_err(|_| own_str("c-probe post-exec context stopped", alloc))?;
+            let post_stamp = verified
+                .exec
+                .stamp_now(&post_cx)
+                .map_err(|e| own_fmt(format_args!("post-exec stat clang-23: {e}"), alloc))?;
+            if post_stamp != verified.exec.stamp() {
+                return Err(own_str("pinned clang-23 inode was modified during probe execution (rule 21)", alloc));
+            }
+        }
 
         #[cfg(not(target_os = "linux"))]
         {
@@ -1471,13 +1574,14 @@ mod tests {
         assert!(err.as_str().contains("missing"), "unexpected missing-shelf error: {err}");
         let _ = std::fs::remove_dir_all(&empty_home);
 
-        // On Linux, `VerifiedExec` pins the opened inode so replacing the file on disk after
-        // opening never swaps the verified bytes.
+        // On Linux, `VerifiedExec` pins the opened inode against atomic path replacement AND
+        // `stamp_now` immediately detects any in-place write (`ctime`/`size` mutation).
         #[cfg(target_os = "linux")]
         {
             let pin_file = std::env::temp_dir().join(format!("blaze-cprobe-inode-{}.bin", std::process::id()));
             std::fs::write(&pin_file, b"original-verified-bytes").expect("write original");
             let vex = bstd::procs::hermetic::VerifiedExec::open(&tmp_cx, &pin_file.to_string_lossy()).expect("open VerifiedExec");
+            assert_eq!(vex.stamp_now(&tmp_cx).expect("stamp_now"), vex.stamp());
             // Atomically replace path on disk with a new inode.
             let replacement = std::env::temp_dir().join(format!("blaze-cprobe-inode-{}.new", std::process::id()));
             std::fs::write(&replacement, b"tampered-replacement-bytes").expect("write replacement");
@@ -1486,6 +1590,23 @@ mod tests {
             vex.stream_chunks(&tmp_cx, |chunk| seen.extend_from_slice(chunk)).expect("stream verified inode");
             assert_eq!(seen.as_slice(), b"original-verified-bytes");
             let _ = std::fs::remove_file(&pin_file);
+
+            // In-place write to the same inode advances kernel metadata (`ctime`/`size`), caught
+            // by `stamp_now` before/after execution.
+            let mut_file = std::env::temp_dir().join(format!("blaze-cprobe-inplace-{}.bin", std::process::id()));
+            std::fs::write(&mut_file, b"before-write").expect("write initial");
+            let vex_mut = bstd::procs::hermetic::VerifiedExec::open(&tmp_cx, &mut_file.to_string_lossy()).expect("open mut");
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new().write(true).open(&mut_file).expect("open in-place");
+                f.write_all(b"tampered-in-place!").expect("write in-place");
+            }
+            assert_ne!(
+                vex_mut.stamp_now(&tmp_cx).expect("stamp after in-place write"),
+                vex_mut.stamp(),
+                "in-place mutation must invalidate VerifiedExec stamp"
+            );
+            let _ = std::fs::remove_file(&mut_file);
         }
 
         // SOURCE_DATE_EPOCH parsing honors nonzero epoch and rejects invalid text.
@@ -1514,6 +1635,11 @@ mod tests {
             work_rel: OwnString::new_in(super::SharedAlloc::global()),
             work_root: OwnString::from_str_in(&std::env::temp_dir().to_string_lossy(), super::SharedAlloc::global()),
             deadline: super::Duration::from_millis(25),
+            resolved_id: bstd::sync::Flight::with_capacity_in(
+                "c-probe.clang.strategy_id.test",
+                super::NonZeroUsize::MIN,
+                super::SharedAlloc::global(),
+            ),
             verify_flight: bstd::sync::Flight::with_capacity_in(
                 "c-probe.clang.verify.test",
                 super::NonZeroUsize::MIN,

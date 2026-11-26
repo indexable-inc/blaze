@@ -3503,7 +3503,7 @@ fn checking<'f, 's: 'f>(
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
+        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
@@ -3637,7 +3637,7 @@ fn checking<'f, 's: 'f>(
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), frame)?;
+        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         let whole_moved = whole_followed.layout_moved
             || whole_followed.now.rows.iter().zip(whole_followed.was.iter()).any(|(now, was)| now.state() != *was);
@@ -3743,7 +3743,7 @@ fn checking<'f, 's: 'f>(
                         };
                         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
                         let follow_began = phases.clock().now();
-                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
+                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
                         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
                         sweep_counts = journal.counts(statted, u32::try_from(new_ptr.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&new_ptr.leaves, frame)).with_looks(followed.looks, follow_ns);
                         followed_kept = Some(followed);
