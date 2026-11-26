@@ -644,6 +644,9 @@ impl<'b> VerifiedPage<'b> {
         if r.take(4)? != PAGE_MAGIC || r.u8()? != bits || r.u32()? != page {
             return Err(PagesError::Magic { page });
         }
+        if bits == 0 || bits > blaze_drive::answers::MOST_BITS || page >= (1u32 << bits) {
+            return Err(PagesError::Count { page, count: u32::from(bits) });
+        }
         let names_count = usize::try_from(r.u32()?).unwrap_or(usize::MAX);
         let cells_count = usize::try_from(r.u32()?).unwrap_or(usize::MAX);
         let ids_count = usize::try_from(r.u32()?).unwrap_or(usize::MAX);
@@ -768,16 +771,21 @@ impl<'b> VerifiedPage<'b> {
                     });
                 }
                 let key_idx = r.u32()?;
-                let placed = if is_cell_key {
+                let (expected_page, reported) = if is_cell_key {
                     check_idx(key_idx, n_cells, page, start)?;
                     let cid = dicts.cell_id(key_idx);
-                    if section == READERS { readers_slot(&cid) } else { cid.of }
+                    let expected = if section == READERS {
+                        readers_page_of(&cid, bits)
+                    } else {
+                        content_page_of(cid.of, bits)
+                    };
+                    (expected, cid.of)
                 } else {
                     check_idx(key_idx, n_names, page, start)?;
-                    dicts.name(key_idx)
+                    let n = dicts.name(key_idx);
+                    (content_page_of(n, bits), n)
                 };
-                if page_of(placed, bits) != page {
-                    let reported = if is_cell_key { dicts.cell_id(key_idx).of } else { placed };
+                if expected_page != page {
                     return Err(PagesError::Misplaced {
                         page,
                         section: SECTION_NAMES[section],

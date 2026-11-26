@@ -227,7 +227,8 @@ fn write_envelope<A: Allocator + Copy>(
 /// [`Encoded::Raw`] with zero framing overhead.
 ///
 /// Use for record types whose raw bytes already carry a distinct magic that cannot collide with
-/// [`MAGIC`] (`b"BZR1"`), such as `TypedBody` (`BZCHKD07`).
+/// [`MAGIC`] (`b"BZR1"`), such as `TypedBody` (`BZCHKD07`), frozen dependency heads (`BZFZ`),
+/// crate head listings (`BLZLSTJ\x01` / `BLZLSTP\x01`), `Lines` (`BEFB`/`BEFC`), and native images.
 pub(crate) fn encode_selective_in<'a, A: Allocator + Copy>(
     raw: &'a [u8],
     alloc: A,
@@ -570,5 +571,35 @@ mod tests {
                 assert!(decode_envelope_impl(spoofed.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc, DecodePlant::IgnoreLengthMismatch).is_ok());
             }
         });
+    }
+
+    #[test]
+    fn bzfz_and_blzl_magics_round_trip_selectively_and_never_collide_with_bzr1() {
+        let alloc = blaze_own::testing::heap().alloc();
+        for magic in [&b"BZFZ"[..], &b"BLZLSTJ\x01"[..], &b"BLZLSTP\x01"[..]] {
+            assert_ne!(&magic[..4], MAGIC.as_slice(), "inner magic must be disjoint from BZR1");
+            // Small payload stays raw and borrows zero-copy on decode.
+            let mut small = blaze_own::Vec::with_capacity_in(128, alloc);
+            small.extend_from_slice(magic);
+            small.resize(128, 0x2a);
+            let enc_small = encode_selective_in(small.as_slice(), alloc).expect("encode small");
+            assert!(!enc_small.is_compressed(), "small payload stays raw");
+            let dec_small = decode_if_envelope_in(enc_small.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("decode small");
+            assert!(!dec_small.was_compressed(), "small decode is zero-copy");
+            assert_eq!(dec_small.as_slice(), small.as_slice());
+
+            // Large structured payload compresses into BZR1 and round-trips byte-identical.
+            let mut large = blaze_own::Vec::with_capacity_in(16 << 10, alloc);
+            large.extend_from_slice(magic);
+            while large.len() < (16 << 10) {
+                large.extend_from_slice(b"struct_item_row_payload_entry\0\0\0");
+            }
+            let enc_large = encode_selective_in(large.as_slice(), alloc).expect("encode large");
+            assert!(enc_large.is_compressed(), "large structured payload compresses into BZR1");
+            assert!(enc_large.as_slice().len() < large.len() / 2, "must shrink substantially");
+            let dec_large = decode_if_envelope_in(enc_large.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("decode large");
+            assert!(dec_large.was_compressed(), "large decode decompresses BZR1");
+            assert_eq!(dec_large.as_slice(), large.as_slice());
+        }
     }
 }

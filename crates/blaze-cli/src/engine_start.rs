@@ -569,7 +569,7 @@ impl PageReuseOracle<'_> {
                 Self::mark_changed(changed_pages.as_mut_slice(), idx);
             }
         }
-        let ug_page = usize::try_from(blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), bits)).unwrap_or(usize::MAX);
+        let ug_page = usize::try_from(blaze_engine::pages::content_page_of(blaze_drive::Name::unit_graph(), bits)).unwrap_or(usize::MAX);
         if Self::is_page_changed(changed_pages.as_slice(), ug_page) && !ug_row_unchanged {
             return None;
         }
@@ -604,7 +604,7 @@ impl PageReuseOracle<'_> {
 
 impl crate::run_ids::ReuseOracle for PageReuseOracle<'_> {
     fn unchanged(&self, name: blaze_drive::Name) -> bool {
-        let page = usize::try_from(blaze_drive::answers::page_of(name, self.bits)).unwrap_or(usize::MAX);
+        let page = usize::try_from(blaze_engine::pages::content_page_of(name, self.bits)).unwrap_or(usize::MAX);
         if Self::is_page_changed(self.changed_pages.as_slice(), page) {
             return false;
         }
@@ -713,7 +713,7 @@ fn build_page_reuse_oracle<'a, 'm>(
     if prev.bits != curr.bits {
         return Ok((None, Some(curr)));
     }
-    let ug_page_u32 = blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), curr.bits);
+    let ug_page_u32 = blaze_engine::pages::content_page_of(blaze_drive::Name::unit_graph(), curr.bits);
     let ug_page = usize::try_from(ug_page_u32).unwrap_or(usize::MAX);
     if !curr.is_radix() {
         let prev_ug = prev.pages.get(ug_page).copied().unwrap_or_default();
@@ -736,7 +736,9 @@ fn build_page_reuse_oracle<'a, 'm>(
     let ug_slot = ug_page % blaze_engine::pages::RADIX_LEAF_PAGES;
     let mut prev_ug_key = Key::default();
     let mut curr_ug_key = Key::default();
-    for (shard_idx, (&prev_sk, &curr_sk)) in prev.page_shards.iter().zip(curr.page_shards.iter()).enumerate() {
+    // In `BER6`, content entries live exclusively in the lower half of radix shards.
+    let content_shards = prev.page_shards.len() / 2;
+    for (shard_idx, (&prev_sk, &curr_sk)) in prev.page_shards.iter().zip(curr.page_shards.iter()).take(content_shards).enumerate() {
         if prev_sk == curr_sk {
             continue;
         }
@@ -1689,9 +1691,9 @@ mod tests {
         let edited_file = blaze_drive::Name::file(b"crates/a/src/lib.rs");
         let skipped_file = blaze_drive::Name::file(b"crates/b/src/bin/extra.rs");
         let untouched_file = blaze_drive::Name::file(b"crates/c/src/lib.rs");
-        let edited_page = usize::try_from(blaze_drive::answers::page_of(edited_file, bits)).unwrap_or(0);
-        let ug_page = usize::try_from(blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), bits)).unwrap_or(0);
-        let target_page = if edited_page == ug_page { (edited_page + 1) % 16 } else { edited_page };
+        let edited_page = usize::try_from(blaze_engine::pages::content_page_of(edited_file, bits)).unwrap_or(0);
+        let ug_page = usize::try_from(blaze_engine::pages::content_page_of(blaze_drive::Name::unit_graph(), bits)).unwrap_or(0);
+        let target_page = if edited_page == ug_page { (edited_page + 1) % 8 } else { edited_page };
         if let Some(slot) = curr.get_mut(target_page) {
             *slot = blaze_drive::Key(blaze_ids::ContentId([0x20; 32]));
         }
@@ -1705,7 +1707,7 @@ mod tests {
                 assert!(!oracle.unchanged(edited_file), "changed page must report unchanged=false");
             }
             assert!(!oracle.unchanged(skipped_file), "PLACE_SKIPPED toggle must report unchanged=false");
-            let untouched_page = usize::try_from(blaze_drive::answers::page_of(untouched_file, bits)).unwrap_or(0);
+            let untouched_page = usize::try_from(blaze_engine::pages::content_page_of(untouched_file, bits)).unwrap_or(0);
             if untouched_page != target_page {
                 assert!(oracle.unchanged(untouched_file), "untouched page must report unchanged=true");
             }
@@ -1726,7 +1728,7 @@ mod tests {
         assert!(colliding.is_some(), "ug_page hash-bucket collision with unchanged UnitGraph row must allow delta reuse");
         if let Some(oracle) = colliding {
             assert!(!oracle.unchanged(blaze_drive::Name::unit_graph()), "ug_page itself remains marked changed for colliding tasks");
-            let untouched_page = usize::try_from(blaze_drive::answers::page_of(untouched_file, bits)).unwrap_or(0);
+            let untouched_page = usize::try_from(blaze_engine::pages::content_page_of(untouched_file, bits)).unwrap_or(0);
             if untouched_page != target_page && untouched_page != ug_page {
                 assert!(oracle.unchanged(untouched_file), "untouched pages stay reusable across ug_page collision");
             }

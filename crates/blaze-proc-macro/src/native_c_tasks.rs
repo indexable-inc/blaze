@@ -958,23 +958,10 @@ impl TreeRunner for ShelfTree<'_> {
             if !set(&vars, "RANLIB") {
                 vars.push((String::from_str_in("RANLIB", alloc), joined(&[shelf, "/bin/llvm-ar s"], alloc)));
             }
-            let mut maps: AString<'a> = String::new_in(alloc);
-            for (guest, host) in shown.iter() {
-                maps.push_str(" -ffile-prefix-map=");
-                maps.push_str(host);
-                maps.push('=');
-                maps.push_str(guest);
-            }
-            maps.push_str(" -Wno-unused-command-line-argument");
-            // The maps on the flags the tree's compiles take (`CFLAGS` always, `CXXFLAGS` when
-            // the script set it): no host folder reaches an object's debug information.
-            for flags in ["CFLAGS", "CXXFLAGS"] {
-                match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
-                    Some(at) => vars[at].1.push_str(maps.as_str()),
-                    None if flags == "CFLAGS" => vars.push((String::from_str_in(flags, alloc), String::from_str_in(maps.as_str().trim_start(), alloc))),
-                    None => {}
-                }
-            }
+            // The maps on every compiler flag var the tree's compiles may take (`CFLAGS`,
+            // `CXXFLAGS`, `CPPFLAGS`, `ASFLAGS`), whether set or unset: no host folder reaches
+            // any C, C++, preprocessed, or assembly object's debug information (rule 25, rule 54).
+            inject_prefix_map_flags(&mut vars, &shown, alloc);
             for (name, value) in tool_env.iter() {
                 vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
@@ -1085,9 +1072,46 @@ impl TreeRunner for ShelfTree<'_> {
     }
 }
 
+/// Compiler flag environment variables that a process tree (`configure`, `make`, `cmake`) may
+/// pass to `clang`/`clang++` when compiling C, C++, preprocessed, or assembly translation units.
+/// Every variable receives `-ffile-prefix-map=<host>=<guest>` whether or not the script already
+/// set it so no host work directory leaks into debug information (rule 25, rule 54).
+const PREFIX_MAP_FLAG_VARS: [&str; 4] = ["CFLAGS", "CXXFLAGS", "CPPFLAGS", "ASFLAGS"];
+
+/// Injects `-ffile-prefix-map=<host>=<guest>` (for every `(guest, host)` pair in `shown`) and
+/// `-Wno-unused-command-line-argument` into every variable in [`PREFIX_MAP_FLAG_VARS`], appending
+/// to an existing entry or inserting a new one when unset.
+fn inject_prefix_map_flags<'a>(
+    vars: &mut AVec<'a, (AString<'a>, AString<'a>)>,
+    shown: &[(&str, &str)],
+    alloc: Alloc<'a>,
+) {
+    let mut maps: AString<'a> = String::new_in(alloc);
+    for (guest, host) in shown.iter() {
+        maps.push_str(" -ffile-prefix-map=");
+        maps.push_str(host);
+        maps.push('=');
+        maps.push_str(guest);
+    }
+    maps.push_str(" -Wno-unused-command-line-argument");
+    let trimmed = maps.as_str().trim_start();
+    for flags in PREFIX_MAP_FLAG_VARS {
+        match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
+            Some(at) => {
+                if vars[at].1.is_empty() {
+                    vars[at].1.push_str(trimmed);
+                } else {
+                    vars[at].1.push_str(maps.as_str());
+                }
+            }
+            None => vars.push((String::from_str_in(flags, alloc), String::from_str_in(trimmed, alloc))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tree_spelling_tests {
-    use super::{shelf_program, to_guest, to_host};
+    use super::{AString, AVec, PREFIX_MAP_FLAG_VARS, String, Vec, inject_prefix_map_flags, shelf_program, to_guest, to_host};
 
     /// A guest folder is made its host folder where a word or a flag's letters begin with it,
     /// never inside a word or a longer name; shown again, the host folders are their guests.
@@ -1109,5 +1133,36 @@ mod tree_spelling_tests {
         assert_eq!(shelf_program("g++"), Some("bin/clang++"));
         assert_eq!(shelf_program("ar"), Some("bin/llvm-ar"));
         assert_eq!(shelf_program("ccache"), None);
+    }
+
+    #[test]
+    fn prefix_map_flags_are_injected_into_cxxflags_and_siblings_when_unset_and_set() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let shown = [("/out", "/h/work/abc-123-0/out"), ("/package", "/h/pkg")];
+        let expected_maps = "-ffile-prefix-map=/h/work/abc-123-0/out=/out -ffile-prefix-map=/h/pkg=/package -Wno-unused-command-line-argument";
+
+        // 1. All flag vars initially unset: CFLAGS, CXXFLAGS, CPPFLAGS, ASFLAGS all get the prefix maps.
+        let mut unset: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        inject_prefix_map_flags(&mut unset, &shown, alloc);
+        for var in PREFIX_MAP_FLAG_VARS {
+            let found = unset.iter().find(|(k, _)| k.as_str() == var).map(|(_, v)| v.as_str());
+            assert_eq!(found, Some(expected_maps), "{var} must receive prefix-map flags when initially unset");
+        }
+
+        // 2. CXXFLAGS already set (plus empty CPPFLAGS): preserves existing flags, appends maps,
+        //    and still inserts unset siblings cleanly.
+        let mut preset: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        preset.push((String::from_str_in("CXXFLAGS", alloc), String::from_str_in("-O2 -std=c++17", alloc)));
+        preset.push((String::from_str_in("CPPFLAGS", alloc), String::from_str_in("", alloc)));
+        inject_prefix_map_flags(&mut preset, &shown, alloc);
+        let lookup = |name: &str| preset.iter().rev().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+        assert_eq!(
+            lookup("CXXFLAGS"),
+            Some("-O2 -std=c++17 -ffile-prefix-map=/h/work/abc-123-0/out=/out -ffile-prefix-map=/h/pkg=/package -Wno-unused-command-line-argument"),
+            "existing CXXFLAGS must be preserved with prefix-map appended"
+        );
+        assert_eq!(lookup("CPPFLAGS"), Some(expected_maps), "empty CPPFLAGS gets prefix-map without leading space");
+        assert_eq!(lookup("CFLAGS"), Some(expected_maps), "unset CFLAGS receives prefix-map");
+        assert_eq!(lookup("ASFLAGS"), Some(expected_maps), "unset ASFLAGS receives prefix-map");
     }
 }

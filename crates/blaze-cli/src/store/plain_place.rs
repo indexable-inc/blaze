@@ -102,9 +102,14 @@ impl Joined {
 const STORE_TAGS: u64 = 1 << 50;
 
 /// Past this many uncommitted bytes in the arena, a put commits first.
-/// 64 MiB bounds the transient `Arena + lay_out` commit spike to ~128 MiB on large cold builds
+/// 32 MiB bounds the transient `Arena + lay_out` commit spike to ~64 MiB on large cold builds
 /// while incremental edits (a few KB to a few MB) still commit once after the answer.
-pub(crate) const COMMIT_BYTES: u64 = 64 << 20;
+pub(crate) const COMMIT_BYTES: u64 = 32 << 20;
+
+/// Minimum uncommitted arena size before a stage boundary (`flush_puts_if_large`) flushes eagerly
+/// so large cold-stage arenas (`Names`/`Heads`) free before the next stage allocates while tiny
+/// incremental edits stay in the shared `InArena` and commit once in `after_answer`.
+pub(crate) const STAGE_FLUSH_BYTES: u64 = 16 << 20;
 
 /// THE PUT PATH'S SEAM (blaze-cas plain/arena.rs, rule 78): where a reader finds a record this
 /// command put and has not committed. `AfterCommit` (today's): each phase commits its puts
@@ -126,6 +131,12 @@ pub(crate) const CHECKPOINT_AGE_NS: u64 = 30_000_000_000;
 /// and not committed, the oldest seen `waited_ns` ago at a phase boundary.
 pub(crate) fn checkpoint_due(uncommitted: u64, waited_ns: u64) -> bool {
     uncommitted > COMMIT_BYTES || (uncommitted > 0 && waited_ns >= CHECKPOINT_AGE_NS)
+}
+
+/// The stage-boundary flush rule (`checkpoint_tests` below): flush early at a stage boundary
+/// only when uncommitted puts have grown to at least [`STAGE_FLUSH_BYTES`].
+pub(crate) fn stage_flush_due(uncommitted: u64) -> bool {
+    uncommitted >= STAGE_FLUSH_BYTES
 }
 
 /// Why the store refused, by name (rule 19).
@@ -390,12 +401,33 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         Ok(self.lent.with_bytes(&CasKey(key.0), |_tag, _ns, bytes| f(bytes))?)
     }
 
-    /// Commits any uncommitted puts immediately (even below `COMMIT_BYTES`) so the current shared
-    /// arena is freed and later stages read from file-backed segment mappings with zero pinning.
-    pub fn flush_puts(&mut self) -> Result<(), PlaceError> {
-        if self.lent.uncommitted_bytes() > 0 {
-            self.commit()?;
+    /// Commits uncommitted puts at a stage boundary only when they reach [`STAGE_FLUSH_BYTES`]
+    /// (16 MiB) — or past [`CHECKPOINT_AGE_NS`] via [`PlainPlace::checkpoint`], or always under
+    /// `Visibility::AfterCommit`. Frees large cold-stage arenas before the next stage allocates
+    /// while avoiding tiny intermediate segments and manifest flips on incremental edits (where
+    /// `Visibility::InArena` serves uncommitted puts in place across stages and [`after_answer`]
+    /// commits everything durably once). Returns `true` when a commit ran.
+    pub fn flush_puts_if_large(&mut self) -> Result<bool, PlaceError> {
+        let uncommitted = self.lent.uncommitted_bytes();
+        if self.lent.visibility() == Visibility::AfterCommit {
+            if uncommitted > 0 {
+                self.commit()?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
+        if stage_flush_due(uncommitted) {
+            self.commit()?;
+            return Ok(true);
+        }
+        self.checkpoint()
+    }
+
+    /// Stage-boundary flush: delegates to [`PlainPlace::flush_puts_if_large`] so intermediate
+    /// stages flush large (`>= STAGE_FLUSH_BYTES`) arenas while small edits stay in the shared
+    /// `InArena` until [`after_answer`].
+    pub fn flush_puts(&mut self) -> Result<(), PlaceError> {
+        let _ = self.flush_puts_if_large()?;
         Ok(())
     }
 
@@ -778,7 +810,16 @@ mod tests;
 /// falls where its tape says.
 #[cfg(test)]
 mod checkpoint_tests {
-    use super::{CHECKPOINT_AGE_NS, COMMIT_BYTES, checkpoint_due};
+    use blaze_cas::plain::Settings;
+    use blaze_core::FileName;
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_drive::Key;
+    use blaze_ids::ContentId;
+
+    use super::{
+        CHECKPOINT_AGE_NS, COMMIT_BYTES, Facts, PlainPlace, STAGE_FLUSH_BYTES, after_answer, checkpoint_due, config, open,
+        stage_flush_due, test_cx,
+    };
 
     #[test]
     fn a_checkpoint_is_due_past_the_bytes_or_the_age_and_never_with_nothing_put() {
@@ -786,6 +827,32 @@ mod checkpoint_tests {
         assert!(checkpoint_due(COMMIT_BYTES + 1, 0), "past the bytes, at once");
         assert!(!checkpoint_due(COMMIT_BYTES, CHECKPOINT_AGE_NS - 1), "at the bytes and under the age: not yet");
         assert!(checkpoint_due(1, CHECKPOINT_AGE_NS), "one byte, waited the age");
+        assert!(!stage_flush_due(0), "zero bytes never triggers stage flush");
+        assert!(!stage_flush_due(STAGE_FLUSH_BYTES - 1), "below 16 MiB stays in shared arena");
+        assert!(stage_flush_due(STAGE_FLUSH_BYTES), "at 16 MiB flushes stage arena");
+    }
+
+    #[test]
+    fn small_stage_flush_stays_in_arena_visible_to_snapshots_and_commits_once_after_answer() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(1), nonce: 5151 }, alloc);
+        let lent = open(Sim::new(11, Faults::default()), cfg, alloc).expect("the store opens");
+        let mut place = PlainPlace::new(&lent, false);
+        let k = Key(ContentId::of("small stage flush key", b"v1"));
+        place.put(k, false, b"small edit record").expect("put");
+        assert!(!place.flush_puts_if_large().expect("flush_puts_if_large"), "small stage must not commit mid-command");
+        assert_eq!(place.commits(), 0, "zero intermediate commits on small edit");
+        // In-process readers and snapshots see the uncommitted InArena put immediately.
+        let snap = place.snapshot_in(alloc).expect("snapshot");
+        assert_eq!(
+            snap.get(&blaze_cas::Key(k.0)).expect("snapshot get"),
+            Some(&b"small edit record"[..]),
+            "InArena snapshot sees uncommitted record across stages"
+        );
+        drop(snap);
+        drop(place);
+        let done = after_answer(&test_cx(), &lent, 0).expect("after_answer");
+        assert_eq!(done.segments_written, 1, "after_answer commits everything once");
     }
 }
 

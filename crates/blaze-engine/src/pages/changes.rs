@@ -578,10 +578,17 @@ struct Changed<'a> {
 impl<'a> Changed<'a> {
     fn set(&mut self, section: usize, key: CellId, value: Option<SVec<'a, u8>>) {
         let alloc = self.alloc;
-        // A readers entry is on its cell's own page, every other on its task's (the form).
-        let placed = if section == READERS { readers_slot(&key) } else { key.of };
-        let page = self.pages.entry(page_of(placed, self.bits)).or_insert_with(|| ChangedPage {
-            witness: placed, sections: core::array::from_fn(|_| BTreeMap::new_in(alloc)),
+        // A readers entry lives in the upper half (`readers_page_of`), every content section in the
+        // lower half (`content_page_of`). The witness uses `page_witness(index, bits)` so
+        // `Ask::Witness` resolves any slot in `0..(1 << bits)`.
+        let index = if section == READERS {
+            readers_page_of(&key, self.bits)
+        } else {
+            content_page_of(key.of, self.bits)
+        };
+        let page = self.pages.entry(index).or_insert_with(|| ChangedPage {
+            witness: page_witness(usize::try_from(index).unwrap_or(0), self.bits),
+            sections: core::array::from_fn(|_| BTreeMap::new_in(alloc)),
         });
         page.sections[section].insert(key, value);
     }
@@ -653,15 +660,15 @@ fn collect_old_entries<'a, 'p>(
     out
 }
 
-fn write_flat_at<'p, 'a>(bufs: &mut [PageBuf<'p, 'a>], bits: u8, name: Name, section: usize, write: impl FnOnce(&mut SVec<'a, u8>)) {
-    let idx = usize::try_from(page_of(name, bits)).unwrap_or(0);
+fn write_flat_at<'p, 'a>(bufs: &mut [PageBuf<'p, 'a>], page_idx: u32, section: usize, write: impl FnOnce(&mut SVec<'a, u8>)) {
+    let idx = usize::try_from(page_idx).unwrap_or(0);
     if let Some(buf) = bufs.get_mut(idx) {
         buf.push_flat(section, write);
     }
 }
 
-fn write_dict_at<'p, 'a>(bufs: &mut [PageBuf<'p, 'a>], bits: u8, name: Name, section: usize, page: &'p VerifiedPage<'p>, bytes: &'p [u8]) {
-    let idx = usize::try_from(page_of(name, bits)).unwrap_or(0);
+fn write_dict_at<'p, 'a>(bufs: &mut [PageBuf<'p, 'a>], page_idx: u32, section: usize, page: &'p VerifiedPage<'p>, bytes: &'p [u8]) {
+    let idx = usize::try_from(page_idx).unwrap_or(0);
     if let Some(buf) = bufs.get_mut(idx) {
         buf.push_dict(section, page, bytes);
     }
@@ -742,10 +749,10 @@ where
             if let Some(plan) = plan { files.insert(plan.file); }
         }
         if old.is_some_and(|r| r.phase.stage == Stage::Outlines) {
-            root.outlines = root.outlines.checked_sub(1).ok_or(PagesError::Total { page: page_of(name, last.bits), field: "outline count" })?;
+            root.outlines = root.outlines.checked_sub(1).ok_or(PagesError::Total { page: content_page_of(name, last.bits), field: "outline count" })?;
         }
         root.outlines = root.outlines.checked_add(u32::from(next.is_some_and(|r| r.phase.stage == Stage::Outlines)))
-            .ok_or(PagesError::Total { page: page_of(name, last.bits), field: "outline count" })?;
+            .ok_or(PagesError::Total { page: content_page_of(name, last.bits), field: "outline count" })?;
         if next.is_some_and(|r| r.phase.stage == Stage::Units) { units.insert(name); } else { units.remove(&name); }
         match next.filter(|r| r.failed || r.findings > 0) {
             Some(r) => { root.findings.insert(name, r.findings); }
@@ -903,7 +910,7 @@ where
         total = total.saturating_add(u64::try_from(ob.len()).unwrap_or(u64::MAX));
     }
 
-    let new_bits = bits_kept(total, Some(last.bits));
+    let new_bits = bits_kept_partitioned(total, Some(last.bits));
     if new_bits == last.bits {
         return Ok(None);
     }
@@ -921,21 +928,21 @@ where
             while let Some(&(&name, val)) = updates.peek() && named(name) < k {
                 updates.next();
                 if let Some(row) = val {
-                    write_flat_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
+                    write_flat_at(&mut bufs, content_page_of(name, new_bits), ROWS, |out| put_row(out, name, row));
                 }
             }
             if let Some(&(&name, val)) = updates.peek() && named(name) == k {
                 updates.next();
                 if let Some(row) = val {
-                    write_flat_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
+                    write_flat_at(&mut bufs, content_page_of(name, new_bits), ROWS, |out| put_row(out, name, row));
                 }
             } else {
-                write_dict_at(&mut bufs, new_bits, k.of, ROWS, page, old_bytes);
+                write_dict_at(&mut bufs, content_page_of(k.of, new_bits), ROWS, page, old_bytes);
             }
         }
         for (&name, val) in updates {
             if let Some(row) = val {
-                write_flat_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
+                write_flat_at(&mut bufs, content_page_of(name, new_bits), ROWS, |out| put_row(out, name, row));
             }
         }
     }
@@ -947,7 +954,7 @@ where
             while let Some(&(&id, val)) = updates.peek() && id < k {
                 updates.next();
                 if let Some((digest, moved)) = val {
-                    write_flat_at(&mut bufs, new_bits, id.of, CELLS, |out| {
+                    write_flat_at(&mut bufs, content_page_of(id.of, new_bits), CELLS, |out| {
                         put_cell_id(out, &id);
                         put_id(out, digest);
                         out.extend_from_slice(&moved.0.to_le_bytes());
@@ -957,19 +964,19 @@ where
             if let Some(&(&id, val)) = updates.peek() && id == k {
                 updates.next();
                 if let Some((digest, moved)) = val {
-                    write_flat_at(&mut bufs, new_bits, id.of, CELLS, |out| {
+                    write_flat_at(&mut bufs, content_page_of(id.of, new_bits), CELLS, |out| {
                         put_cell_id(out, &id);
                         put_id(out, digest);
                         out.extend_from_slice(&moved.0.to_le_bytes());
                     });
                 }
             } else {
-                write_dict_at(&mut bufs, new_bits, k.of, CELLS, page, old_bytes);
+                write_dict_at(&mut bufs, content_page_of(k.of, new_bits), CELLS, page, old_bytes);
             }
         }
         for (&id, val) in updates {
             if let Some((digest, moved)) = val {
-                write_flat_at(&mut bufs, new_bits, id.of, CELLS, |out| {
+                write_flat_at(&mut bufs, content_page_of(id.of, new_bits), CELLS, |out| {
                     put_cell_id(out, &id);
                     put_id(out, digest);
                     out.extend_from_slice(&moved.0.to_le_bytes());
@@ -980,13 +987,13 @@ where
 
     // 3. OWED_CELLS & 4. OWED_TASKS (complete sets live in `root`)
     for (id, moved) in root.owed_cells.iter() {
-        write_flat_at(&mut bufs, new_bits, id.of, OWED_CELLS, |out| {
+        write_flat_at(&mut bufs, content_page_of(id.of, new_bits), OWED_CELLS, |out| {
             put_cell_id(out, id);
             out.extend_from_slice(&moved.0.to_le_bytes());
         });
     }
     for (&name, plan) in root.owed_tasks.iter() {
-        write_flat_at(&mut bufs, new_bits, name, OWED_TASKS, |out| put_plan(out, plan));
+        write_flat_at(&mut bufs, content_page_of(name, new_bits), OWED_TASKS, |out| put_plan(out, plan));
     }
 
     // 5. FILES
@@ -996,21 +1003,21 @@ where
             while let Some(&(&uk, val)) = updates.peek() && uk < k {
                 updates.next();
                 if let Some(rec) = val {
-                    write_flat_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
+                    write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), FILES, |out| out.extend_from_slice(rec));
                 }
             }
             if let Some(&(&uk, val)) = updates.peek() && uk == k {
                 updates.next();
                 if let Some(rec) = val {
-                    write_flat_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
+                    write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), FILES, |out| out.extend_from_slice(rec));
                 }
             } else {
-                write_dict_at(&mut bufs, new_bits, k.of, FILES, page, old_bytes);
+                write_dict_at(&mut bufs, content_page_of(k.of, new_bits), FILES, page, old_bytes);
             }
         }
         for (&uk, val) in updates {
             if let Some(rec) = val {
-                write_flat_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
+                write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), FILES, |out| out.extend_from_slice(rec));
             }
         }
     }
@@ -1022,21 +1029,21 @@ where
             while let Some(&(&uk, val)) = updates.peek() && uk < k {
                 updates.next();
                 if let Some((serial, cause)) = val {
-                    write_flat_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
+                    write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
                 }
             }
             if let Some(&(&uk, val)) = updates.peek() && uk == k {
                 updates.next();
                 if let Some((serial, cause)) = val {
-                    write_flat_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
+                    write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
                 }
             } else {
-                write_dict_at(&mut bufs, new_bits, k.of, CAUSES, page, old_bytes);
+                write_dict_at(&mut bufs, content_page_of(k.of, new_bits), CAUSES, page, old_bytes);
             }
         }
         for (&uk, val) in updates {
             if let Some((serial, cause)) = val {
-                write_flat_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
+                write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
             }
         }
     }
@@ -1048,7 +1055,7 @@ where
             while let Some(&(&uk, val)) = updates.peek() && uk < k {
                 updates.next();
                 if let Some(key) = val {
-                    write_flat_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
+                    write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), RECORDS, |out| {
                         put_name(out, uk.of);
                         put_id(out, &key.0);
                     });
@@ -1057,18 +1064,18 @@ where
             if let Some(&(&uk, val)) = updates.peek() && uk == k {
                 updates.next();
                 if let Some(key) = val {
-                    write_flat_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
+                    write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), RECORDS, |out| {
                         put_name(out, uk.of);
                         put_id(out, &key.0);
                     });
                 }
             } else {
-                write_dict_at(&mut bufs, new_bits, k.of, RECORDS, page, old_bytes);
+                write_dict_at(&mut bufs, content_page_of(k.of, new_bits), RECORDS, page, old_bytes);
             }
         }
         for (&uk, val) in updates {
             if let Some(key) = val {
-                write_flat_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
+                write_flat_at(&mut bufs, content_page_of(uk.of, new_bits), RECORDS, |out| {
                     put_name(out, uk.of);
                     put_id(out, &key.0);
                 });
@@ -1109,7 +1116,7 @@ where
                 if let Some(slot) = scratch.get_mut(CELL_ID..CELL_ID + 4) {
                     slot.copy_from_slice(&count_u32.to_le_bytes());
                 }
-                write_flat_at(bufs, new_bits, readers_slot(&id), READERS, |out| out.extend_from_slice(scratch));
+                write_flat_at(bufs, readers_page_of(&id, new_bits), READERS, |out| out.extend_from_slice(scratch));
             }
         };
         let mut updates = work.readers.iter().peekable();
@@ -1122,7 +1129,7 @@ where
                 updates.next();
                 write_merged(&mut bufs, &mut scratch, id, Some((page, old_bytes)), changes);
             } else {
-                write_dict_at(&mut bufs, new_bits, readers_slot(&k), READERS, page, old_bytes);
+                write_dict_at(&mut bufs, readers_page_of(&k, new_bits), READERS, page, old_bytes);
             }
         }
         for (&id, changes) in updates {
@@ -1465,9 +1472,10 @@ where
     let work = answer.work().ok_or(PagesError::Base { serial: answer.serial })?;
     let mut run_pages = Some(run_pages);
     let added = estimate_added_bytes(kept, work);
-    let page_budget = blaze_drive::answers::PAGE_BYTES << last.bits.min(blaze_drive::answers::MOST_BITS);
+    let half_bits = last.bits.saturating_sub(1).min(blaze_drive::answers::MOST_BITS - 1);
+    let page_budget = blaze_drive::answers::PAGE_BYTES << half_bits;
     if added > page_budget / 2
-        && blaze_drive::answers::bits_for(last.bytes.saturating_add(added)) > last.bits
+        && bits_kept_partitioned(last.bytes.saturating_add(added), Some(last.bits)) > last.bits
         && let Some(encoded) = try_repage(kept, last, source, work, &mut get_record, &mut run_pages, alloc)?
     {
         return Ok(encoded);
@@ -1504,10 +1512,10 @@ where
             if let Some(plan) = plan { files.insert(plan.file); }
         }
         if old.is_some_and(|r| r.phase.stage == Stage::Outlines) {
-            root.outlines = root.outlines.checked_sub(1).ok_or(PagesError::Total { page: page_of(name, last.bits), field: "outline count" })?;
+            root.outlines = root.outlines.checked_sub(1).ok_or(PagesError::Total { page: content_page_of(name, last.bits), field: "outline count" })?;
         }
         root.outlines = root.outlines.checked_add(u32::from(next.is_some_and(|r| r.phase.stage == Stage::Outlines)))
-            .ok_or(PagesError::Total { page: page_of(name, last.bits), field: "outline count" })?;
+            .ok_or(PagesError::Total { page: content_page_of(name, last.bits), field: "outline count" })?;
         if next.is_some_and(|r| r.phase.stage == Stage::Units) {
             if units.insert(name) { summary_changed = true; }
         } else if units.remove(&name) {

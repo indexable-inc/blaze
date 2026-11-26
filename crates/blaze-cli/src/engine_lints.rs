@@ -602,6 +602,32 @@ impl LintsStage {
                         refused.push((task.planned.name, why));
                     }
                 }
+            } else if workers.get() <= 1 {
+                // Single-worker phase: run inline on the caller thread reusing one `LINTS_FRAME`
+                // reset between files without waking a pool worker thread.
+                let mut scratch = Frame::with_reserve(LINTS_FRAME, Tag::Other)
+                    .map_err(|_| CliError::Text { what: "a lint file's frame could not be reserved (engine_lints.rs)" })?;
+                for task in tasks.iter() {
+                    let began = clock.now();
+                    let mut counts = LintCounts::default();
+                    let ran = stage
+                        .job_of(outlined, task)
+                        .and_then(|job| stage.run_job_in(&cx, &scratch, root, &job, &mut counts).map(|linted| (job.file, linted)));
+                    let ns = clock.now().since(began).map_or(0, crate::engine_times::ns);
+                    add_counts(&mut phase_counts, &counts);
+                    times.push(task.planned.name, ns);
+                    match ran.and_then(|(file, linted)| file_done(task, file, linted, alloc)) {
+                        Ok((done, one)) => {
+                            buffer.done.push(done);
+                            made.push(one);
+                        }
+                        Err(why) => {
+                            buffer.done.push(crate::engine_tasks::failed(task, alloc));
+                            refused.push((task.planned.name, why));
+                        }
+                    }
+                    let _ = scratch.reset();
+                }
             } else {
                 // Multi-file phase: dynamic work-stealing across `min(tasks.len(), workers)` workers,
                 // each building `job_of` and reusing one `LINTS_FRAME` reset between files (eliminates

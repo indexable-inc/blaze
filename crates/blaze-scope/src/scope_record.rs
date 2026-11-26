@@ -45,6 +45,9 @@
 
 #![blaze::sans_io]
 
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{Binding, BuildError, CallShape, Edition, Globs, Namespace, ProcKind, RecordBytes, ScopeBuilder, ScopeView, TextualDef};
@@ -578,8 +581,60 @@ fn check(bytes: &[u8], holds: Holds) -> Result<Head, RecordRead> {
     Ok(head)
 }
 
-/// A crate's exports record checked whole, once in this process: the proof every reader takes
-/// (rule 74). Made only by [`Verified::check`]; a `Copy` of a pointer and the header.
+/// Checks only the header, alignment, section bounds, and crate name UTF-8 in O(1) without
+/// faulting body pages (rule 74: CAS segments are already BLAKE3-verified on open/fetch).
+fn check_header_only(bytes: &[u8]) -> Result<Head, RecordRead> {
+    let head = Head::read(bytes)?;
+    let (strings_len, strings_at) = head.sections[STRINGS];
+    let name_end = head.name.0.checked_add(head.name.1).filter(|e| *e <= strings_len).ok_or(RecordRead::Past { table: "crate name", at: NAME_AT })?;
+    let name_slice = bytes.get(strings_at + head.name.0..strings_at + name_end).ok_or(RecordRead::Past { table: "crate name", at: NAME_AT })?;
+    core::str::from_utf8(name_slice).map_err(|_| RecordRead::Utf8 { table: "crate name", at: NAME_AT })?;
+    Ok(head)
+}
+
+/// Whether a [`Verified`] exports record proof checked every byte up front (`Full`, from
+/// [`Verified::check`]) or checked header + section bounds + crate name in O(1) and verifies each
+/// accessed module scope, variant run, and macro row lazily on demand (`Lazy`, from
+/// [`Verified::check_header`] / [`Verified::check_header_with_bitmap`]).
+#[derive(Clone, Copy, Debug)]
+enum CheckMode<'a> {
+    Full,
+    Lazy(&'a [AtomicU64]),
+}
+
+/// Zero-initialized lock-free per-module verification bitmap branded to one immutable exports
+/// record slice (`'a`), covering up to `WORDS * 64` (default 2,048) modules in 256 bytes with
+/// zero heap allocation and no destructor required when placed in a `Frame`.
+pub struct ModuleBitmap<'a, const WORDS: usize = 32> {
+    addr: usize,
+    len: usize,
+    words: [AtomicU64; WORDS],
+    _bytes: PhantomData<&'a [u8]>,
+}
+
+impl<'a, const WORDS: usize> ModuleBitmap<'a, WORDS> {
+    /// Creates a fresh zeroed verification bitmap bound to `bytes` (touches 0 bytes of `bytes`).
+    pub fn for_bytes(bytes: &'a [u8]) -> Self {
+        Self {
+            addr: bytes.as_ptr().addr(),
+            len: bytes.len(),
+            words: [const { AtomicU64::new(0) }; WORDS],
+            _bytes: PhantomData,
+        }
+    }
+
+    fn slice_for(&self, bytes: &[u8]) -> &[AtomicU64] {
+        if bytes.as_ptr().addr() == self.addr && bytes.len() == self.len {
+            &self.words
+        } else {
+            &[]
+        }
+    }
+}
+
+/// A crate's exports record checked once in this process: the proof every reader takes (rule 74).
+/// Made only by [`Verified::check`], [`Verified::check_header`], or
+/// [`Verified::check_header_with_bitmap`]; a `Copy` of a pointer, header, and verification mode.
 ///
 /// The command makes it where the bytes enter the process (a wave's mapped record, a store
 /// fetch whose digest was checked) and hands it to every dependent of the request, which
@@ -588,6 +643,7 @@ fn check(bytes: &[u8], holds: Holds) -> Result<Head, RecordRead> {
 pub struct Verified<'a> {
     bytes: &'a [u8],
     head: Head,
+    mode: CheckMode<'a>,
 }
 
 impl<'a> Verified<'a> {
@@ -595,7 +651,23 @@ impl<'a> Verified<'a> {
     /// allocation. A refusal names the table and the byte offset that broke it.
     pub fn check(bytes: &'a [u8]) -> Result<Verified<'a>, RecordRead> {
         let head = check(bytes, Holds::Exports)?;
-        Ok(Verified { bytes, head })
+        Ok(Verified { bytes, head, mode: CheckMode::Full })
+    }
+
+    /// Checks only the header, alignment, section bounds, and crate name UTF-8 in O(1) without
+    /// touching body pages (rule 74: CAS segments are already BLAKE3-verified on open/fetch).
+    /// Accessed module scopes, enum variants, and macro rows are validated lazily on demand.
+    pub fn check_header(bytes: &'a [u8]) -> Result<Verified<'a>, RecordRead> {
+        let head = check_header_only(bytes)?;
+        Ok(Verified { bytes, head, mode: CheckMode::Lazy(&[]) })
+    }
+
+    /// As [`Verified::check_header`], attaching a branded zero-initialized per-module
+    /// verification bitmap so each accessed module's `ScopeView::read` runs at most once across
+    /// concurrent readers.
+    pub fn check_header_with_bitmap<const WORDS: usize>(bytes: &'a [u8], bitmap: &'a ModuleBitmap<'a, WORDS>) -> Result<Verified<'a>, RecordRead> {
+        let head = check_header_only(bytes)?;
+        Ok(Verified { bytes, head, mode: CheckMode::Lazy(bitmap.slice_for(bytes)) })
     }
 
     /// The crate the record is of.
@@ -616,14 +688,15 @@ impl<'a> Verified<'a> {
 }
 
 /// A checked exports record header tied to the immutable address and length of the bytes that
-/// passed [`CheckedHead::check`] (such as a record inside a shared `AppendVec` store arena).
-/// Re-lends [`Verified`] in O(1) without re-checking while the owning snapshot stays alive, and
-/// refuses any mismatched slice by returning `None`.
+/// passed [`CheckedHead::check`] or [`CheckedHead::check_header`] (such as a record inside a
+/// shared `AppendVec` store arena). Re-lends [`Verified`] in O(1) without re-checking while the
+/// owning snapshot stays alive, and refuses any mismatched slice by returning `None`.
 #[derive(Clone, Copy, Debug)]
 pub struct CheckedHead {
     head: Head,
     addr: usize,
     len: usize,
+    full: bool,
 }
 
 impl CheckedHead {
@@ -631,13 +704,32 @@ impl CheckedHead {
     /// slice identity `(addr, len)`.
     pub fn check(bytes: &[u8]) -> Result<CheckedHead, RecordRead> {
         let head = check(bytes, Holds::Exports)?;
-        Ok(CheckedHead { head, addr: bytes.as_ptr().addr(), len: bytes.len() })
+        Ok(CheckedHead { head, addr: bytes.as_ptr().addr(), len: bytes.len(), full: true })
+    }
+
+    /// Checks only the header, section bounds, and crate name UTF-8 in O(1) (rule 74), deferring
+    /// per-module `ScopeView::read` checks until accessed.
+    pub fn check_header(bytes: &[u8]) -> Result<CheckedHead, RecordRead> {
+        let head = check_header_only(bytes)?;
+        Ok(CheckedHead { head, addr: bytes.as_ptr().addr(), len: bytes.len(), full: false })
     }
 
     /// Re-lends [`Verified<'a>`] in O(1) if `bytes` is the exact slice previously checked.
     pub fn rebind<'a>(self, bytes: &'a [u8]) -> Option<Verified<'a>> {
         if bytes.as_ptr().addr() == self.addr && bytes.len() == self.len {
-            Some(Verified { bytes, head: self.head })
+            let mode = if self.full { CheckMode::Full } else { CheckMode::Lazy(&[]) };
+            Some(Verified { bytes, head: self.head, mode })
+        } else {
+            None
+        }
+    }
+
+    /// Re-lends [`Verified<'a>`] in O(1) with a branded per-module verification bitmap when
+    /// checked header-only, so each accessed module verifies at most once across readers.
+    pub fn rebind_with_bitmap<'a, const WORDS: usize>(self, bytes: &'a [u8], bitmap: &'a ModuleBitmap<'a, WORDS>) -> Option<Verified<'a>> {
+        if bytes.as_ptr().addr() == self.addr && bytes.len() == self.len {
+            let mode = if self.full { CheckMode::Full } else { CheckMode::Lazy(bitmap.slice_for(bytes)) };
+            Some(Verified { bytes, head: self.head, mode })
         } else {
             None
         }
@@ -649,25 +741,27 @@ impl CheckedHead {
 /// then one module row found and its scope searched in place. No allocation.
 pub(crate) fn inner_binds(inner: &[u8], module: ItemKey, name: &str) -> Result<bool, RecordRead> {
     let head = check(inner, Holds::Inner)?;
-    let record = DepRecord { bytes: inner, head };
-    Ok(record.view(module).is_some_and(|v| v.bindings().any(|e| e.name == name)))
+    let record = DepRecord { bytes: inner, head, mode: CheckMode::Full };
+    Ok(record.view(module, false).is_some_and(|v| v.bindings().any(|e| e.name == name)))
 }
 
 // ---------------------------------------------------------------------------------------------
 // Reading in place.
 
-/// A crate's exports record, read in place: a `Copy` of the proof's pointer and header. Every
-/// answer is a binary search of the bytes; nothing is decoded, kept or allocated.
+/// A crate's exports record, read in place: a `Copy` of the proof's pointer, header, and
+/// verification mode. Every answer is a binary search of the bytes; nothing is decoded, kept or
+/// allocated.
 #[derive(Clone, Copy, Debug)]
 pub struct DepRecord<'a> {
     bytes: &'a [u8],
     head: Head,
+    mode: CheckMode<'a>,
 }
 
 impl<'a> DepRecord<'a> {
     /// The record the proof is of: O(1), no allocation, nothing read.
     pub fn open(proof: Verified<'a>) -> DepRecord<'a> {
-        DepRecord { bytes: proof.bytes, head: proof.head }
+        DepRecord { bytes: proof.bytes, head: proof.head, mode: proof.mode }
     }
 
     pub fn key(&self) -> CrateItemKey {
@@ -691,19 +785,31 @@ impl<'a> DepRecord<'a> {
         self.head.errored
     }
 
-    /// A range of the strings, as text.
-    fn text(&self, at: usize, len: usize) -> &'a str {
-        let bytes: &'a [u8] = self.bytes;
-        let start = self.head.sections[STRINGS].1 + at;
-        // SAFETY: every caller passes a range the header or a row of this record names, and
-        // `check`, the one maker of the proof this record was opened from, ran `str::from_utf8`
-        // on exactly that range of the same immutable `'a` bytes and it returned `Ok`.
-        unsafe { core::str::from_utf8_unchecked(&bytes[start..start + len]) }
+    /// A range of the strings, bounds- and UTF-8-checked when opened lazily.
+    fn checked_text(&self, at: usize, len: usize) -> Option<&'a str> {
+        let (strings_len, strings_at) = self.head.sections[STRINGS];
+        if at.checked_add(len).is_none_or(|end| end > strings_len) {
+            return None;
+        }
+        let start = strings_at.checked_add(at)?;
+        let slice = self.bytes.get(start..start.checked_add(len)?)?;
+        match self.mode {
+            CheckMode::Full => {
+                // SAFETY: `check` ran `str::from_utf8` on every string range in these same
+                // immutable `'a` bytes and it returned `Ok`.
+                Some(unsafe { core::str::from_utf8_unchecked(slice) })
+            }
+            CheckMode::Lazy(_) => core::str::from_utf8(slice).ok(),
+        }
     }
 
     /// The crate's own name.
     pub fn name(&self) -> &'a str {
-        self.text(self.head.name.0, self.head.name.1)
+        let bytes: &'a [u8] = self.bytes;
+        let start = self.head.sections[STRINGS].1 + self.head.name.0;
+        // SAFETY: both `check` and `check_header_only`, the only makers of a proof, bounds-checked
+        // `head.name` and ran `str::from_utf8` on exactly this range of the immutable `'a` bytes.
+        unsafe { core::str::from_utf8_unchecked(&bytes[start..start + self.head.name.1]) }
     }
 
     /// Every other crate its scopes name an item of, sorted: a slice of the bytes.
@@ -721,23 +827,49 @@ impl<'a> DepRecord<'a> {
     }
 
     /// The module's scope in place, whatever record the check was of.
-    fn view(&self, module: ItemKey) -> Option<ScopeView<'a>> {
+    fn view(&self, module: ItemKey, exports_only: bool) -> Option<ScopeView<'a>> {
         let bytes: &'a [u8] = self.bytes;
-        let row = self.row(MODULES, module)?;
-        let start = self.head.sections[BLOB].1 + le32(bytes, row + 32) as usize;
-        let part = &bytes[start..start + le32(bytes, row + 36) as usize];
-        // SAFETY: `check`, the one maker of the proof this record was opened from, ran
-        // `ScopeView::read` on exactly these bytes (the same row of the same immutable `'a`
-        // bytes gives the same range at the same address), and it returned `Ok`.
+        let (count, at) = self.head.sections[MODULES];
+        let idx = find_row(bytes, at, MODULE_ROW, count, module)?;
+        let row = at + idx * MODULE_ROW;
+        let rel = le32(bytes, row + 32) as usize;
+        let len = le32(bytes, row + 36) as usize;
+        if rel.checked_add(len).is_none_or(|end| end > self.head.sections[BLOB].0) {
+            return None;
+        }
+        let start = self.head.sections[BLOB].1.checked_add(rel)?;
+        let part = bytes.get(start..start.checked_add(len)?)?;
+        if let CheckMode::Lazy(verified_modules) = self.mode {
+            let word_idx = idx >> 6;
+            let bit = 1u64 << (idx & 63);
+            let already = verified_modules.get(word_idx).is_some_and(|w| (w.load(Ordering::Acquire) & bit) != 0);
+            if !already {
+                let view = ScopeView::read(part).ok()?;
+                if view.module() != module {
+                    return None;
+                }
+                if exports_only && (view.textual().next().is_some() || view.marks().next().is_some()) {
+                    return None;
+                }
+                if let Some(w) = verified_modules.get(word_idx) {
+                    w.fetch_or(bit, Ordering::Release);
+                }
+                return Some(view);
+            }
+        }
+        // SAFETY: Either `Verified::check` ran `ScopeView::read` (and checked module identity +
+        // exports-only) on these exact immutable `'a` bytes, or `CheckMode::Lazy` ran those same
+        // checks on `part` before setting `verified_modules[idx]` with Release ordering, paired
+        // with the Acquire load above.
         Some(unsafe { ScopeView::trusted(part) })
     }
 
     /// The module's finished scope, viewed in place; `None` for a module the record does not
     /// hold (no other crate can walk into it).
     pub fn scope(&self, module: ItemKey) -> Option<ExportsScope<'a>> {
-        // An exports record's: `Verified::check` refused any scope with a textual scope or a
-        // mark, so the view answers those empty, as the scope does.
-        self.view(module).map(ExportsScope)
+        // An exports record's: `Verified::check` (or lazy `view` check) refused any scope with a
+        // textual scope or a mark, so the view answers those empty, as the scope does.
+        self.view(module, true).map(ExportsScope)
     }
 
     /// The module's chain up to the crate's root, itself first: a slice of the bytes.
@@ -748,9 +880,14 @@ impl<'a> DepRecord<'a> {
         if first == NONE {
             return None;
         }
-        let start = self.head.sections[CHAINS].1 + first as usize * KEY;
-        let len = le32(bytes, row + 44) as usize;
-        Some(ItemKey::slice_of(bytes[start..start + len * KEY].as_chunks::<KEY>().0))
+        let first = usize::try_from(first).ok()?;
+        let len = usize::try_from(le32(bytes, row + 44)).ok()?;
+        if first.checked_add(len).is_none_or(|end| end > self.head.sections[CHAINS].0) {
+            return None;
+        }
+        let start = self.head.sections[CHAINS].1.checked_add(first.checked_mul(KEY)?)?;
+        let slice = bytes.get(start..start.checked_add(len.checked_mul(KEY)?)?)?;
+        Some(ItemKey::slice_of(slice.as_chunks::<KEY>().0))
     }
 
     /// An enum's variants as rows of the record, or `None` when `owner` is no enum it holds.
@@ -758,39 +895,51 @@ impl<'a> DepRecord<'a> {
         let bytes: &'a [u8] = self.bytes;
         let row = self.row(ENUMS, owner)?;
         let (first, count) = (le32(bytes, row + 32) as usize, le32(bytes, row + 36) as usize);
-        let rows_at = self.head.sections[VARIANTS].1 + first * VARIANT_ROW;
-        // SAFETY: `check`, the one maker of this record's proof, checked this enum's run of
-        // variant rows inside the variant rows section, and each row's name range inside the
-        // strings and UTF-8, in the same immutable `'a` bytes.
-        Some(unsafe { Variants::trusted(bytes, self.head.sections[STRINGS].1, rows_at, count) })
+        let end_variants = first.checked_add(count)?;
+        if end_variants > self.head.sections[VARIANTS].0 {
+            return None;
+        }
+        let rows_at = self.head.sections[VARIANTS].1.checked_add(first.checked_mul(VARIANT_ROW)?)?;
+        let (strings_len, strings_at) = self.head.sections[STRINGS];
+        if matches!(self.mode, CheckMode::Lazy(_)) {
+            for k in 0..count {
+                let v = rows_at.checked_add(k.checked_mul(VARIANT_ROW)?)?;
+                let at = le32(bytes, v + 32) as usize;
+                let len = le32(bytes, v + 36) as usize;
+                if at.checked_add(len).is_none_or(|end| end > strings_len) {
+                    return None;
+                }
+                let start = strings_at.checked_add(at)?;
+                let name_slice = bytes.get(start..start.checked_add(len)?)?;
+                core::str::from_utf8(name_slice).ok()?;
+            }
+        }
+        // SAFETY: Either `Verified::check` checked this enum's run of variant rows and each name
+        // range's bounds and UTF-8 validity, or `CheckMode::Lazy` ran those exact checks above
+        // on the same immutable `'a` bytes.
+        Some(unsafe { Variants::trusted(bytes, strings_at, rows_at, count) })
     }
 
     /// A macro's source, made from its row: its texts slices of the bytes.
     pub fn macro_of(&self, def: ItemKey) -> Option<MacroSrc<'a>> {
         let row = self.row(MACROS, def)?;
-        Some(self.macro_at(row))
+        self.macro_at(row)
     }
 
-    fn macro_at(&self, row: usize) -> MacroSrc<'a> {
+    fn macro_at(&self, row: usize) -> Option<MacroSrc<'a>> {
         let bytes: &'a [u8] = self.bytes;
-        let range = |field: usize| self.text(le32(bytes, field) as usize, le32(bytes, field + 4) as usize);
+        let range = |field: usize| self.checked_text(le32(bytes, field) as usize, le32(bytes, field + 4) as usize);
         let extra = bytes[row + 91];
         let body = match bytes[row + 90] {
-            0 => MacroBody::Rules(range(row + 72)),
-            1 => MacroBody::Macro2 { params: (extra != 0).then(|| range(row + 72)), body: range(row + 80) },
-            2 => MacroBody::BuiltinFn(range(row + 72)),
-            3 => match CallShape::from_byte(extra) {
-                Some(shape) => MacroBody::BuiltinOther(shape),
-                None => unreachable!("a macro row's call shape at {} was checked by `check`", row + 91),
-            },
-            4 => match ProcKind::from_byte(extra) {
-                Some(kind) => MacroBody::Proc { kind, helpers: range(row + 72) },
-                None => unreachable!("a macro row's proc-macro kind at {} was checked by `check`", row + 91),
-            },
-            5 => MacroBody::BuiltinDerive { helpers: range(row + 72) },
-            tag => unreachable!("a macro row's body tag {tag} at {} was checked by `check`", row + 90),
+            0 => MacroBody::Rules(range(row + 72)?),
+            1 => MacroBody::Macro2 { params: if extra != 0 { Some(range(row + 72)?) } else { None }, body: range(row + 80)? },
+            2 => MacroBody::BuiltinFn(range(row + 72)?),
+            3 => MacroBody::BuiltinOther(CallShape::from_byte(extra)?),
+            4 => MacroBody::Proc { kind: ProcKind::from_byte(extra)?, helpers: range(row + 72)? },
+            5 => MacroBody::BuiltinDerive { helpers: range(row + 72)? },
+            _ => return None,
         };
-        MacroSrc { name: range(row + 64), body, module: key_at(bytes, row + 32), export: bytes[row + 88] != 0, local_inner: bytes[row + 89] != 0 }
+        Some(MacroSrc { name: range(row + 64)?, body, module: key_at(bytes, row + 32), export: bytes[row + 88] != 0, local_inner: bytes[row + 89] != 0 })
     }
 
     /// Every module the record holds, by key, in the stored (key) order.

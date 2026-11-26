@@ -174,8 +174,44 @@ pub const TOUCH_NS: u64 = DAY_NS;
 
 const DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
-/// Default maximum byte budget for a developer's global store (32 GiB).
-pub const DEFAULT_MAX_STORE_BYTES: u64 = 32 << 30;
+/// Default maximum byte budget for a developer's global store (12 GiB).
+pub const DEFAULT_MAX_STORE_BYTES: u64 = 12 << 30;
+
+/// Minimum segment file length (64 MiB) above which under-budget compaction sweeps once >25%
+/// dead (`live * 4 < file_len * 3`), so multi-GiB segments with hundreds of MiB of dead records
+/// compact instead of waiting for >50% dead.
+const LARGE_SEGMENT_SWEEP_MIN_BYTES: u64 = 64 << 20;
+
+/// Under-budget dead-segment sweep threshold: large segments (`>= 64 MiB`) sweep once >25% dead
+/// (`live * 4 < file_len * 3`), while smaller segments sweep once >50% dead (`live * 2 < file_len`).
+#[inline]
+fn should_sweep_under_budget(live_bytes: u64, file_len: u64) -> bool {
+    if file_len >= LARGE_SEGMENT_SWEEP_MIN_BYTES {
+        live_bytes.saturating_mul(4) < file_len.saturating_mul(3)
+    } else {
+        live_bytes.saturating_mul(2) < file_len
+    }
+}
+
+/// Maximum number of newest `tool-base.<pinned>.<triple>.*` roots retained per
+/// `(pinned, triple)` prefix; older unprotected roots under the same prefix are pruned
+/// proactively during compaction.
+pub const TOOL_BASE_KEEP_MOST: usize = 2;
+
+/// Extracts the `tool-base.<pinned>.<triple>` group prefix from a toolchain-only base root name
+/// (`tool-base.<16-hex-pinned>.<triple>.<16-hex-tools>`). Returns `None` for any other root name.
+fn tool_base_prefix(name: &str) -> Option<&str> {
+    let (prefix, tools) = name.rsplit_once('.')?;
+    if tools.is_empty() {
+        return None;
+    }
+    let after = prefix.strip_prefix("tool-base.")?;
+    let (pinned, triple) = after.split_once('.')?;
+    if pinned.is_empty() || triple.is_empty() || triple.contains('.') {
+        return None;
+    }
+    Some(prefix)
+}
 
 /// Minimum sensible non-zero store byte budget enforced at the CLI/env edge (1 GiB).
 pub const MIN_MAX_STORE_BYTES: u64 = 1 << 30;
@@ -1619,6 +1655,10 @@ const KEEP_TIER_PROTECTED: u8 = 0;
 const KEEP_TIER_ACTIVE_TOOLCHAIN: u8 = 1;
 const KEEP_TIER_OLD_TOOLCHAIN: u8 = 2;
 const KEEP_TIER_REGULAR: u8 = 3;
+/// Superseded `tool-base.<pinned>.<triple>.*` roots past [`TOOL_BASE_KEEP_MOST`] per prefix:
+/// sorted last so surviving roots claim shared records first, then pruned proactively even
+/// when under the store byte budget.
+const KEEP_TIER_SUPERSEDED_TOOL_BASE: u8 = 4;
 
 /// High bit on a `ReachCache::owner` slot value marking that the key's byte length has already
 /// been added to its owning root's marginal bytes and `total_live`.
@@ -5778,8 +5818,40 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         let active_toolchain_idx = active_toolchain.map(|(idx, _, _)| idx);
-        let mut order: blaze_own::Vec<(usize, u8, u64), A> = self.own_vec();
         let skip_first = self.plant() == Plant::ReachSkipsRoot;
+        let mut tool_bases: blaze_own::Vec<(&str, u64, u64, &str, usize), &A> = blaze_own::Vec::new_in(&self.alloc);
+        for (idx, root) in self.manifest.roots.iter().enumerate() {
+            if root.expires_ns <= now_ns || (idx == 0 && skip_first) {
+                continue;
+            }
+            if let Some(prefix) = tool_base_prefix(&root.name) {
+                tool_bases.push((prefix, root.expires_ns, root.generation, root.name.as_str(), idx));
+            }
+        }
+        let mut superseded_tool_bases: blaze_own::Vec<usize, &A> = blaze_own::Vec::new_in(&self.alloc);
+        if tool_bases.len() > TOOL_BASE_KEEP_MOST {
+            tool_bases.sort_unstable_by(|a, b| {
+                a.0.cmp(b.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.3.cmp(b.3))
+            });
+            let mut cur_prefix = "";
+            let mut rank = 0usize;
+            for &(prefix, _, _, _, idx) in tool_bases.iter() {
+                if prefix == cur_prefix {
+                    rank = rank.saturating_add(1);
+                } else {
+                    cur_prefix = prefix;
+                    rank = 0;
+                }
+                if rank >= TOOL_BASE_KEEP_MOST {
+                    superseded_tool_bases.push(idx);
+                }
+            }
+            superseded_tool_bases.sort_unstable();
+        }
+        let mut order: blaze_own::Vec<(usize, u8, u64), A> = self.own_vec();
         for (idx, root) in self.manifest.roots.iter().enumerate() {
             if root.expires_ns <= now_ns || (idx == 0 && skip_first) {
                 continue;
@@ -5788,6 +5860,8 @@ impl<A: Allocator + Clone> Plain<A> {
             let leased = min_other_lease_since.is_some_and(|since| root.generation >= since);
             let tier = if root.expires_ns == NEVER || touched || leased {
                 KEEP_TIER_PROTECTED
+            } else if superseded_tool_bases.binary_search(&idx).is_ok() {
+                KEEP_TIER_SUPERSEDED_TOOL_BASE
             } else if active_toolchain_idx == Some(idx) {
                 if self.plant() == Plant::LruEvictsToolchainFirst {
                     KEEP_TIER_REGULAR
@@ -5985,21 +6059,58 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(())
     }
 
-    /// Derives `(total_live, Option<EvictPlan>, kept_count)` from a sized [`ReachCache`] in
-    /// O(roots). Surviving roots are `cache.order[..kept_count]`.
-    fn evict_from_reach(&self, cache: &ReachCache<A>) -> (u64, Option<EvictPlan<A>>, u32) {
+    /// Fast check for whether the manifest holds more than [`TOOL_BASE_KEEP_MOST`] unexpired
+    /// `tool-base.<pinned>.<triple>.*` roots sharing one prefix.
+    fn has_prunable_tool_base(&self, now_ns: u64) -> bool {
+        let mut prefixes: blaze_own::Vec<&str, &A> = blaze_own::Vec::new_in(&self.alloc);
+        for root in &self.manifest.roots {
+            if root.expires_ns <= now_ns {
+                continue;
+            }
+            if let Some(prefix) = tool_base_prefix(&root.name) {
+                prefixes.push(prefix);
+            }
+        }
+        if prefixes.len() <= TOOL_BASE_KEEP_MOST {
+            return false;
+        }
+        prefixes.sort_unstable();
+        let mut cur = "";
+        let mut count = 0usize;
+        for &p in prefixes.iter() {
+            if p == cur {
+                count = count.saturating_add(1);
+                if count > TOOL_BASE_KEEP_MOST {
+                    return true;
+                }
+            } else {
+                cur = p;
+                count = 1;
+            }
+        }
+        false
+    }
+
+    /// Derives `(total_live, surviving_live, Option<EvictPlan>, kept_count)` from a [`ReachCache`]
+    /// in O(roots). Surviving roots are `cache.order[..kept_count]`.
+    ///
+    /// Always prunes trailing [`KEEP_TIER_SUPERSEDED_TOOL_BASE`] roots first, then when over the
+    /// high watermark continues LRU-evicting oldest non-protected roots down toward the 75% low
+    /// watermark.
+    fn evict_from_reach(&self, cache: &ReachCache<A>) -> (u64, u64, Option<EvictPlan<A>>, u32) {
         let total_live = cache.total_live;
         let kept_all = u32::try_from(cache.order.len()).unwrap_or(u32::MAX);
         let framing = u64::try_from(HEADER + FOOTER).unwrap_or(0);
-        if !self.over_budget() || total_live.saturating_add(framing) <= self.high_watermark_bytes() {
-            return (total_live, None, kept_all);
-        }
+        let over_high = self.over_budget() && total_live.saturating_add(framing) > self.high_watermark_bytes();
         let target = self.low_watermark_bytes().saturating_sub(framing);
         let mut remaining = total_live;
         let mut plan = EvictPlan::new(self.own_vec(), self.own_vec());
         let mut evicted = 0u32;
         for &(idx, tier, marginal) in cache.order.iter().rev() {
-            if tier == KEEP_TIER_PROTECTED || remaining <= target {
+            if tier == KEEP_TIER_PROTECTED {
+                break;
+            }
+            if tier != KEEP_TIER_SUPERSEDED_TOOL_BASE && (!over_high || remaining <= target) {
                 break;
             }
             let Some(root) = self.manifest.roots.get(idx) else { continue };
@@ -6009,7 +6120,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         let kept_count = kept_all.saturating_sub(evicted);
         let out = (!plan.is_empty()).then_some(plan);
-        (total_live, out, kept_count)
+        (total_live, remaining, out, kept_count)
     }
 
     /// Read-only GC plan at `now_ns` (requires `map_all` first, writes nothing; reuses
@@ -6019,16 +6130,16 @@ impl<A: Allocator + Clone> Plain<A> {
         let cap_bytes = self.cfg.cap_bytes;
         let high_watermark_bytes = self.high_watermark_bytes();
         let low_watermark_bytes = self.low_watermark_bytes();
-        let (live_bytes, evict) = if self.manifest.roots.is_empty() {
-            (0, None)
+        let (live_bytes, surviving_live, evict) = if self.manifest.roots.is_empty() {
+            (0, 0, None)
         } else {
             self.ensure_reach(now_ns, true)?;
             match self.reach_cache.as_ref() {
                 Some(reach) => {
-                    let (live, plan, _) = self.evict_from_reach(reach);
-                    (live, plan)
+                    let (live, surviving, plan, _) = self.evict_from_reach(reach);
+                    (live, surviving, plan)
                 }
-                None => (0, None),
+                None => (0, 0, None),
             }
         };
         let expired_roots = u32::try_from(self.manifest.roots.iter().filter(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns).count()).unwrap_or(u32::MAX);
@@ -6048,11 +6159,6 @@ impl<A: Allocator + Clone> Plain<A> {
                 .count(),
         )
         .unwrap_or(u32::MAX);
-        let surviving_live = if evict.is_some() {
-            live_bytes.min(low_watermark_bytes)
-        } else {
-            live_bytes
-        };
         let reclaimable_bytes = total_bytes.saturating_sub(surviving_live);
         Ok(GcPlan {
             total_bytes,
@@ -6205,7 +6311,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     scanned = scanned.saturating_add(1);
                     looked_index = looked_index.saturating_add(u64::from(seg.count).saturating_mul(entry_u64));
                     let (live, _) = self.live_of(seg, &owner, kept);
-                    if live.saturating_mul(2) < seg.file_len() {
+                    if should_sweep_under_budget(live, seg.file_len()) {
                         sparse = Some((i, live == 0));
                         break;
                     }
@@ -6973,13 +7079,14 @@ impl<A: Allocator + Clone> Plain<A> {
             return;
         }
         let over = self.over_budget();
-        let (evict, kept_count) = if over && !self.manifest.roots.is_empty() {
-            if let Err(why) = self.ensure_reach(now_ns, true) {
+        let has_tool_base_prunable = self.has_prunable_tool_base(now_ns);
+        let (evict, kept_count) = if (over || has_tool_base_prunable) && !self.manifest.roots.is_empty() {
+            if let Err(why) = self.ensure_reach(now_ns, over) {
                 return self.stop(why);
             }
             match self.reach_cache.as_ref() {
                 Some(cache) => {
-                    let (_, plan, kept) = self.evict_from_reach(cache);
+                    let (_, _, plan, kept) = self.evict_from_reach(cache);
                     (plan, Some(kept))
                 }
                 None => (None, None),
@@ -8337,13 +8444,14 @@ impl<A: Allocator + Clone> Plain<A> {
                     stats.more = true;
                 } else {
                     let over = self.over_budget();
-                    let (next_evict, kept_count) = if over && !self.manifest.roots.is_empty() {
-                        if let Err(why) = self.ensure_reach(self.now_ns, true) {
+                    let has_tool_base_prunable = self.has_prunable_tool_base(self.now_ns);
+                    let (next_evict, kept_count) = if (over || has_tool_base_prunable) && !self.manifest.roots.is_empty() {
+                        if let Err(why) = self.ensure_reach(self.now_ns, over) {
                             return self.stop(why);
                         }
                         match self.reach_cache.as_ref() {
                             Some(cache) => {
-                                let (_, plan, kept) = self.evict_from_reach(cache);
+                                let (_, _, plan, kept) = self.evict_from_reach(cache);
                                 (plan, Some(kept))
                             }
                             None => (None, None),
@@ -9222,4 +9330,203 @@ fn hash_leases(leases: &[Lease]) -> ContentId {
         h.update(&lease.pid.to_le_bytes());
     }
     h.finish()
+}
+
+#[cfg(test)]
+mod d3_gc_tests {
+    use core::time::Duration;
+
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_core::wait::Deadline;
+    use blaze_core::{Driver, FileName};
+    use blaze_ids::ContentId;
+    use blaze_keyed::kind::{Namespace, Tag};
+    use blaze_mem::Frame;
+
+    use super::{
+        DEFAULT_MAX_STORE_BYTES, LARGE_SEGMENT_SWEEP_MIN_BYTES, Liveness, LockStep, Plain, PlainConfig,
+        Plant, ROOT_LIFE_NS, TAGS, TOOL_BASE_KEEP_MOST, should_sweep_under_budget, tool_base_prefix,
+    };
+    use crate::Key;
+    use crate::plain::settings::Settings;
+    use crate::plain::test_root;
+
+    const TEST_TAG: Tag = Tag(1);
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn default_budget_and_large_segment_sweep_threshold() {
+        assert_eq!(DEFAULT_MAX_STORE_BYTES, 12 << 30);
+        assert_eq!(LARGE_SEGMENT_SWEEP_MIN_BYTES, 64 << 20);
+        assert_eq!(TOOL_BASE_KEEP_MOST, 2);
+
+        // 2.75 GiB segment with 935 MiB dead (~33.2% dead, ~66.8% live) MUST compact under budget.
+        let seg_2_75g = (2u64 << 30) + (768u64 << 20);
+        let dead_935m = 935u64 << 20;
+        assert!(should_sweep_under_budget(seg_2_75g - dead_935m, seg_2_75g));
+
+        // Exact 64 MiB boundary: 25% dead (75% live) does not sweep; >25% dead sweeps.
+        let exact_64m = 64u64 << 20;
+        let live_75pct = 48u64 << 20;
+        assert!(!should_sweep_under_budget(live_75pct, exact_64m));
+        assert!(should_sweep_under_budget(live_75pct - 1, exact_64m));
+
+        // Below 64 MiB: keeps >50% dead threshold (40% dead does not sweep; >50% dead sweeps).
+        let seg_32m = 32u64 << 20;
+        assert!(!should_sweep_under_budget(seg_32m * 3 / 5, seg_32m));
+        assert!(should_sweep_under_budget(seg_32m / 2 - 1, seg_32m));
+    }
+
+    #[test]
+    fn tool_base_prefix_parses_only_four_segment_tool_base_roots() {
+        assert_eq!(
+            tool_base_prefix("tool-base.0123456789abcdef.aarch64-apple-darwin.fedcba9876543210"),
+            Some("tool-base.0123456789abcdef.aarch64-apple-darwin")
+        );
+        assert_eq!(
+            tool_base_prefix("tool-base.aaaaaaaaaaaaaaaa.aarch64-unknown-linux-gnu.0000000000000001"),
+            Some("tool-base.aaaaaaaaaaaaaaaa.aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(tool_base_prefix("tool.active"), None);
+        assert_eq!(tool_base_prefix("ans.0"), None);
+        assert_eq!(tool_base_prefix("tool-base.only"), None);
+        assert_eq!(tool_base_prefix("tool-base.a.b"), None);
+        assert_eq!(tool_base_prefix("tool-base.a.b."), None);
+        assert_eq!(tool_base_prefix("tool-base..triple.tools"), None);
+        assert_eq!(tool_base_prefix("tool-base.a.b.c.d"), None);
+    }
+
+    fn key(n: u32) -> Key {
+        Key(ContentId::of("plain d3 tool-base test key", &n.to_le_bytes()))
+    }
+
+    fn settle(sim: &mut Sim, store: &mut Plain<&Frame>, effects: &mut super::EffectList) {
+        let mut done = core::default::Default::default();
+        let mut settled = false;
+        for _ in 0..100_000u32 {
+            if !effects.is_empty() {
+                sim.submit(effects);
+            }
+            if store.ready() && effects.is_empty() && sim.in_flight() == 0 {
+                settled = true;
+                break;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(3600)));
+            let wall = sim.wall_ns();
+            for c in done.drain(..) {
+                if store.owns(c.tag) {
+                    store.complete(c, wall, effects);
+                }
+            }
+            if store.broken().is_some() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "store did not settle (phase: {})", store.what());
+    }
+
+    fn open_store<'f>(sim: &mut Sim, n: u64, cap_bytes: u64, root: &'f Frame) -> Plain<&'f Frame> {
+        let settings = Settings::default();
+        let cfg = PlainConfig {
+            dir: FileName::new("plain").expect("dir"),
+            tags: (n + 1) * TAGS,
+            cap_bytes,
+            boot: 1,
+            nonce: 9000 + n,
+            durable: false,
+            machine: PlainConfig::empty_machine(root),
+            writes: settings.writes(root),
+            reads: settings.reads(root),
+            liveness: Liveness::Reached,
+            lock_step: LockStep::Backoff,
+        };
+        let mut store = Plain::planted(cfg, root, Plant::None);
+        let mut effects = core::default::Default::default();
+        store.open_whole(&mut effects);
+        settle(sim, &mut store, &mut effects);
+        assert!(store.broken().is_none(), "open failed: {:?}", store.broken());
+        store.handed();
+        store
+    }
+
+    #[test]
+    fn superseded_tool_base_roots_prune_past_two_per_prefix_under_budget() {
+        let root = test_root();
+        let mut sim = Sim::new(404, Faults::default());
+        const CAP: u64 = 1 << 20; // 1 MiB: store stays far under budget.
+        let mut proc_id = 1u64;
+
+        let shared_key = key(99);
+        let shared_payload = [0x5au8; 512];
+
+        let mut write_root = |sim: &mut Sim, name: &str, id: u32| {
+            sim.advance(HOUR);
+            let mut s = open_store(sim, proc_id, CAP, &root);
+            proc_id += 1;
+            let k = key(id);
+            let mut body = [0u8; 512];
+            body[0] = u8::try_from(id & 0xff).unwrap_or(0);
+            if s.get(&shared_key).is_none() {
+                s.put(shared_key, Namespace::LOCAL, TEST_TAG, &shared_payload).expect("put shared");
+            }
+            s.put(k, Namespace::LOCAL, TEST_TAG, &body).expect("put");
+            s.root_for(name, &[shared_key, k], ROOT_LIFE_NS).expect("root");
+            s.release_lease();
+            let mut effects = core::default::Default::default();
+            let wall = sim.wall_ns();
+            s.commit(&[], wall, &mut effects).expect("commit starts");
+            settle(sim, &mut s, &mut effects);
+            assert!(matches!(s.take_committed(), Some(Ok(_))), "commit ok");
+        };
+
+        let tb0 = "tool-base.aaaa1111bbbb2222.aarch64-apple-darwin.0000000000000000";
+        let tb1 = "tool-base.aaaa1111bbbb2222.aarch64-apple-darwin.0000000000000001";
+        let tb2 = "tool-base.aaaa1111bbbb2222.aarch64-apple-darwin.0000000000000002";
+        let tb3 = "tool-base.aaaa1111bbbb2222.aarch64-apple-darwin.0000000000000003";
+        let other = "tool-base.cccc3333dddd4444.aarch64-apple-darwin.0000000000000001";
+        write_root(&mut sim, tb0, 1);
+        write_root(&mut sim, tb1, 2);
+        write_root(&mut sim, tb2, 3);
+        write_root(&mut sim, tb3, 4);
+        write_root(&mut sim, other, 5);
+        write_root(&mut sim, "ans.0", 6);
+
+        let mut gc = open_store(&mut sim, 99, CAP, &root);
+        assert!(!gc.over_budget(), "test store must be under budget");
+        let plan = gc.plan_gc(sim.wall_ns()).expect("plan_gc");
+        assert_eq!(plan.lru_evict_roots, 2, "dry-run must plan pruning 2 superseded tool-base roots: {plan:?}");
+
+        let mut effects = core::default::Default::default();
+        let mut evicted_total = 0u32;
+        for _ in 0..8u32 {
+            assert!(gc.compact(&mut effects), "compact starts");
+            settle(&mut sim, &mut gc, &mut effects);
+            assert!(gc.broken().is_none(), "compact broke: {:?}", gc.broken());
+            let sliced = gc.take_sliced().expect("sliced");
+            evicted_total += sliced.evicted_roots;
+            if !sliced.more || sliced.aborted || (sliced.segments == 0 && sliced.evicted_roots == 0 && sliced.removed == 0) {
+                break;
+            }
+        }
+        assert_eq!(evicted_total, 2, "must prune exactly the 2 oldest superseded tool-base roots");
+        assert!(gc.root_named(tb0).is_none(), "oldest superseded tb0 pruned");
+        assert!(gc.root_named(tb1).is_none(), "second oldest superseded tb1 pruned");
+        assert!(gc.root_named(tb2).is_some(), "second newest tb2 kept");
+        assert!(gc.root_named(tb3).is_some(), "newest tb3 kept");
+        assert!(gc.root_named(other).is_some(), "other prefix root kept");
+        assert!(gc.root_named("ans.0").is_some(), "regular answer root kept");
+        assert_eq!(gc.get(&shared_key).expect("shared record intact").bytes, shared_payload.as_slice());
+        assert!(gc.get(&key(3)).is_some() && gc.get(&key(4)).is_some() && gc.get(&key(5)).is_some() && gc.get(&key(6)).is_some());
+
+        // Control: add a 3rd root under `aaaa...` (`tb4`), renew/touch `tb2` (now the oldest of the 3),
+        // and verify the touched root is protected and NOT pruned!
+        let tb4 = "tool-base.aaaa1111bbbb2222.aarch64-apple-darwin.0000000000000004";
+        write_root(&mut sim, tb4, 7);
+        let mut gc2 = open_store(&mut sim, 100, CAP, &root);
+        assert!(gc2.renew_root(tb2, ROOT_LIFE_NS, sim.wall_ns()).is_live());
+        let plan2 = gc2.plan_gc(sim.wall_ns()).expect("plan_gc 2");
+        assert_eq!(plan2.lru_evict_roots, 0, "touched oldest tool-base root must remain protected");
+    }
 }

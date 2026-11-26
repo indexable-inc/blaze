@@ -3976,10 +3976,12 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     }
 
     /// Runs `work` on the current thread while pre-opening the distinct lang crates (`core`,
-    /// `alloc`, `std`, `bstd`) of active groups in parallel on `workers`.
+    /// `alloc`, `std`, `bstd`) of active groups in parallel on `workers`. Skips spawning worker
+    /// threads for tiny edits (`<= INLINE_RUNS_MAX` bodies) so lang crates open lazily on demand
+    /// without waking 3 parallel opener workers.
     pub(crate) fn pre_open_lang_with<T>(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32, work: impl FnOnce(&Cx) -> T) -> Result<T, CliError> {
         let Some(found) = self.found.as_ref() else { return Ok(work(cx)) };
-        if self.ones.is_empty() || workers.get() <= 1 {
+        if self.ones.len() <= INLINE_RUNS_MAX || workers.get() <= 1 {
             return Ok(work(cx));
         }
         let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];

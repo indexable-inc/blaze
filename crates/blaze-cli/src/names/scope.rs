@@ -714,6 +714,10 @@ fn resolve_metered(
         };
         (done, par.seen.into_inner())
     };
+    // Return every committed page of `CALL_SCRATCH` back to the OS immediately after solving
+    // finishes (while `solve_scratch` already trimmed to 0 inside `Par::solve_scratch`), so
+    // macro-expansion scratch frames do not sit dirty alongside `SCOPE_FRAME` and `scope_record`.
+    metered.trim_scratch();
     if let crate::job_texts::Packs::SyncLazy(lazy, _) = job.packs
         && let Some(why) = lazy.refused()
     {
@@ -734,6 +738,7 @@ fn resolve_metered(
     let oracle = match (job.oracle.blocks(), oracle) {
         (true, Some(mut o)) => {
             let (tally, line) = blocks_differential(&cx, root, job, env, callers, metered, &now);
+            metered.trim_scratch();
             o.blocks = Some(tally);
             o.blocks_line = line;
             Some(o)

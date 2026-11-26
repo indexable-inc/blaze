@@ -52,6 +52,7 @@
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::alloc::Global;
+use std::sync::OnceLock;
 
 use blaze_cas::plain::Snapshot;
 use blaze_core::Driver;
@@ -244,6 +245,32 @@ pub(crate) fn dependency_head(bytes: &[u8], names_at: Key, cell: Want) -> Result
     }
 }
 
+/// Like [`dependency_head`], transparently decoding a `BZR1` envelope after `KEY_BYTES` when the
+/// stored `BZFZ` payload was compressed at `Level::Fast`. Raw (`< 4 KiB`, incompressible, or
+/// legacy uncompressed) records return [`Decoded::Borrowed`] zero-copy; compressed records return
+/// [`Decoded::Owned`] in `alloc`.
+pub(crate) fn dependency_head_decoded<'b, A: core::alloc::Allocator + Copy>(
+    bytes: &'b [u8],
+    names_at: Key,
+    cell: Want,
+    alloc: A,
+) -> Result<crate::store::record_codec::Decoded<'b, A>, &'static str> {
+    if bytes.len() < KEY_BYTES || bytes[..KEY_BYTES] != names_at.0.0 {
+        return Err("a dependency head's record does not begin with the names key its key holds (engine_seeds.rs `dependency_key`)");
+    }
+    let decoded = crate::store::record_codec::decode_if_envelope_in(
+        &bytes[KEY_BYTES..],
+        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        alloc,
+    )
+    .map_err(|_| "a dependency head's compressed BZR1 record could not be decoded (engine_seeds.rs `dependency_head_decoded`)")?;
+    match FrozenHead::read(decoded.as_slice()) {
+        Ok(head) if head.want() == cell => Ok(decoded),
+        Ok(_) => Err("a dependency head's record holds another cell than its key names (engine_seeds.rs `dependency_key`)"),
+        Err(_) => Err("a dependency head's record does not read as a frozen head (engine_seeds.rs `dependency_head`)"),
+    }
+}
+
 /// Why the records a finder reads could not be read (the store's snapshot refused).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Unreadable;
@@ -258,6 +285,21 @@ pub(crate) trait HeadRecords: Sync {
     /// ([`dependency_head`], the command's).
     fn head<'b>(&self, bytes: &'b [u8], names_at: Key, cell: Want) -> Result<&'b [u8], &'static str> {
         dependency_head(bytes, names_at, cell)
+    }
+    /// Like [`HeadRecords::head`], also transparently decoding a `BZR1` envelope after `KEY_BYTES`
+    /// when the stored `BZFZ` payload is compressed while delegating raw records to [`Self::head`].
+    fn head_decoded<'b, A: core::alloc::Allocator + Copy>(
+        &self,
+        bytes: &'b [u8],
+        names_at: Key,
+        cell: Want,
+        alloc: A,
+    ) -> Result<crate::store::record_codec::Decoded<'b, A>, &'static str> {
+        if bytes.len() >= KEY_BYTES && crate::store::record_codec::is_envelope(&bytes[KEY_BYTES..]) {
+            dependency_head_decoded(bytes, names_at, cell, alloc)
+        } else {
+            self.head(bytes, names_at, cell).map(crate::store::record_codec::Decoded::Borrowed)
+        }
     }
 }
 
@@ -470,8 +512,10 @@ enum MemberRead {
 /// A dependency head's record looked up through the snapshot, once (rule 74).
 #[derive(Clone, Copy, Debug)]
 enum DependencyRead {
-    /// Under its key, checked: its frozen bytes follow its names key.
+    /// Under its key, checked: raw uncompressed frozen bytes follow its names key in `snapshot`.
     Found,
+    /// Under its key, checked: `BZR1`-compressed frozen bytes decompressed once into `decoded_deps`.
+    FoundDecoded(crate::engine_heads_once::SliceRef),
     /// No record under its key: frozen on this ask, put at the merge.
     Absent,
     /// A record that does not read as the head its key names (the request fails at the merge).
@@ -683,6 +727,9 @@ pub(crate) struct RequestTable<'p> {
     taken: blaze_core::SharedSetBy<CellId, blaze_hash::DigestState, SharedAlloc<'static>>,
     /// What was read of the dependency heads' records, by key.
     dependencies: blaze_core::SharedMapBy<Key, DependencyRead, blaze_hash::DigestState, SharedAlloc<'static>>,
+    /// Lock-free slab owning decompressed `BZR1` dependency-head `BZFZ` payloads for this Bodies
+    /// phase only (lazily initialized on first compressed read, freed on drop: zero `leak_static`).
+    decoded_deps: OnceLock<crate::engine_heads_once::SliceSlab<u8>>,
     fresh: blaze_core::SharedMap<ContentId, Fresh, SharedAlloc<'static>>,
     /// Every cell asked that no head task's record answered.
     read: blaze_core::SharedSet<ContentId, SharedAlloc<'static>>,
@@ -809,6 +856,7 @@ impl<'p> RequestTable<'p> {
             members: blaze_core::SharedMapBy::new_in("engine.member heads read from their head tasks' records", shared),
             taken: blaze_core::SharedSetBy::new_in("engine.member heads taken", shared),
             dependencies: blaze_core::SharedMapBy::new_in("engine.dependency head records read", shared),
+            decoded_deps: OnceLock::new(),
             fresh: blaze_core::SharedMap::new_in("engine.frozen heads, made this request", shared),
             read: blaze_core::SharedSet::new_in("engine.heads not in the head tasks' records, read", shared),
             first_failed: blaze_core::SharedMap::new_in("engine.heads whose first freeze failed, with their reasons", shared),
@@ -909,20 +957,30 @@ impl<'p> RequestTable<'p> {
         };
         match read {
             DependencyRead::Found => self.snapshot.get(&blaze_cas::Key(key.0)).ok().flatten().and_then(|bytes| bytes.get(KEY_BYTES..)),
+            DependencyRead::FoundDecoded(slice) => self.decoded_deps.get().map(|slab| slab.get(slice)),
             DependencyRead::Absent | DependencyRead::Bad(_) => None,
         }
     }
 
     /// The record under dependency key `key`, checked once: its names key is `names_at` and its
-    /// bytes are the frozen head of `cell` (rule 21).
+    /// bytes are the frozen head of `cell` (rule 21), transparently decoding a `BZR1` envelope
+    /// after `KEY_BYTES` when compressed.
     fn read_dependency(&self, key: Key, names_at: Key, cell: Want) -> DependencyRead {
         let bytes = match self.snapshot.get(&blaze_cas::Key(key.0)) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return DependencyRead::Absent,
             Err(_) => return DependencyRead::Bad("the store's snapshot could not read a dependency head's record (engine_seeds.rs `RequestTable::read_dependency`)"),
         };
-        match dependency_head(bytes, names_at, cell) {
-            Ok(_) => DependencyRead::Found,
+        match dependency_head_decoded(bytes, names_at, cell, self.heap.shared()) {
+            Ok(crate::store::record_codec::Decoded::Borrowed(_)) => DependencyRead::Found,
+            Ok(crate::store::record_codec::Decoded::Owned(decoded)) => {
+                let slab = self.decoded_deps.get_or_init(|| crate::engine_heads_once::SliceSlab::new(self.heap.shared()));
+                let hint = u64::from_le_bytes(key.0.0[..8].try_into().unwrap_or([0; 8]));
+                match slab.push_vec(hint, decoded) {
+                    Some(slice) => DependencyRead::FoundDecoded(slice),
+                    None => DependencyRead::Bad("the request's dependency-head decode slab is full (engine_seeds.rs `RequestTable::read_dependency`)"),
+                }
+            }
             Err(why) => DependencyRead::Bad(why),
         }
     }
@@ -1008,7 +1066,7 @@ impl<'p> RequestTable<'p> {
         for (_, read) in self.dependencies.pin().iter() {
             looked = looked.saturating_add(1);
             match read {
-                DependencyRead::Found => found = found.saturating_add(1),
+                DependencyRead::Found | DependencyRead::FoundDecoded(_) => found = found.saturating_add(1),
                 DependencyRead::Absent => {}
                 DependencyRead::Bad(why) => return Err(CliError::Text { what: *why }),
             }
@@ -1035,9 +1093,12 @@ impl<'p> RequestTable<'p> {
                 not_put.no_names = not_put.no_names.saturating_add(1);
                 continue;
             };
-            let mut payload = blaze_own::Vec::with_capacity_in(KEY_BYTES + one.bytes.len(), g);
+            let encoded = crate::store::record_codec::encode_selective_in(one.bytes, g)
+                .map_err(|_| CliError::Text { what: "a dependency head could not be compressed into BZR1 (engine_seeds.rs `RequestTable::merge`)" })?;
+            let body = encoded.as_slice();
+            let mut payload = blaze_own::Vec::with_capacity_in(KEY_BYTES + body.len(), g);
             payload.extend_from_slice(&names_at.0.0);
-            payload.extend_from_slice(one.bytes);
+            payload.extend_from_slice(body);
             puts.push((dependency_key(names_at, one.cell, tool), krate.toolchain, payload));
         }
         puts.sort_unstable_by_key(|(key, _, _)| *key);
