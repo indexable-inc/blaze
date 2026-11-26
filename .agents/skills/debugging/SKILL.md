@@ -42,7 +42,9 @@ file, filter only with patterns anchored to the lines they drop, and say that so
 (a row, a step, a line) only after reading the raw file; an unanchored `grep -v` once deleted the
 rows it was then reported a tool had not printed. A date is a claim too: say when something will
 work only with the measured run that date rests on, and otherwise name the run that will give the
-number.
+number. The same holds for proposed optimizations and roadmap estimates: never eyeball a projected
+speedup, memory drop, or size win without stating the measured total and the target component's
+measured share (Amdahl bound).
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
