@@ -24,3 +24,20 @@ pub enum GitStatusPlant {
 }
 
 impl blaze_own::planted::Plants for GitStatusPlant {}
+
+/// A deliberate bug planted into the storage, merge, pack, or wire engine to verify DST oracles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitEnginePlant {
+    /// Skip CRC-32 verification when reading an object record from a `BGOB` slab.
+    SkipSlabCrcCheck,
+    /// Skip SHA-1 OID verification when unpacking an object from a wire PACK stream.
+    SkipPackOidVerify,
+    /// Always pick `ours` on overlapping 3-way line edits instead of marking a conflict.
+    SkipThreeWayConflict,
+    /// Skip comparing old-OID precondition on compare-and-swap ref updates (`git push`).
+    SkipCasOldOidCheck,
+    /// Corrupt the trailing SHA-1 checksum of generated PACK v2 streams.
+    CorruptPackTrailer,
+}
+
+impl blaze_own::planted::Plants for GitEnginePlant {}

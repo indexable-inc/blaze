@@ -38,11 +38,12 @@ then hand the batch over. A half-ported tree blocks every lane's run.
 ## best-long-term-design (rule 28)
 
 Build only what you are proud of, on the first iteration too: the first version of a design is
-already the one you would defend, never a placeholder to improve later; then iterate. Pick the best
-long-term design, not the least work: own the layer or port rustc's rule properly, and spend the
-effort on proving it right: real crates' own test suites passing under blaze, property tests and
-deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of
-hostile bytes.
+already the one you would defend, never a placeholder to improve later; then iterate. Always pursue
+and present the longest-term best solution by default (assume infinite time, even if
+out-of-distribution), not the least work: own the layer or port rustc's rule properly, show unitless
+proportional effort bars (`[████████░░]`) when comparing options, and spend the effort on proving it
+right: real crates' own test suites passing under blaze, property tests and deterministic simulation
+of blaze's own invariants (`testing` skill), and fuzzing of parsers of hostile bytes.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
@@ -64,11 +65,14 @@ See [docs/contributing.md#documents](../../../docs/contributing.md#documents).
 
 Each concept has one type, one rule and one place it is computed: two types for the same thing (a
 `BuiltFor` in two crates), two copies of a rule (where code runs, what a key covers), two paths that
-do the same job (two schedulers, two evaluators, two tiers for one level) are a bug. Merge them into
-the better one, delete the other, and ban its name with a `replacement` (`fix-through-blaze-lints`);
-a change that finds a duplicate removes it or files an issue naming both. For the CLI,
-`blaze-cli-spec` (`BLAZE_APP`) is the single source of truth for commands, flags, help text, usage,
-and shell completions — never hand-duplicate help strings or reach for proc macros.
+do the same job (two schedulers, two evaluators, two tiers for one level) are a bug. Whenever you
+spot duplicated logic or patterns across the repo that can be generalized into a shared crate,
+ALWAYS immediately spawn a subagent to extract and generalize it into one shared crate, sweep all
+callers, ban the removed duplicates with a `replacement` (`fix-through-blaze-lints`), and
+land/admin-merge it cleanly (`agents-are-a-cost`) — never leave duplicates behind or merely file an
+issue. For the CLI, `blaze-cli-spec` (`BLAZE_APP`) is the single source of truth for commands,
+flags, help text, usage, and shell completions — never hand-duplicate help strings or reach for proc
+macros.
 
 ## guard-the-cause (rule 54)
 

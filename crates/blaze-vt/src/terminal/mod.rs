@@ -32,6 +32,7 @@ use crate::screen::{Screen, ScreenStats};
 
 pub use kitty::{KittyCells, KittyScreen};
 pub use modes::{Mode, ModeState, MouseEvents, MouseFormat};
+pub(crate) use print::cp_width;
 
 /// Bytes of an [`Effects`] list's buffer ([`Effects::bytes`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -83,6 +84,8 @@ pub enum Effect {
     /// A kitty graphics load waits on host IO: [`Terminal::kitty_pending`] says what,
     /// [`Terminal::kitty_answer`] gives it.
     KittyIo,
+    /// OSC 7770: Blaze Terminal API payload (custom symbols, font slices, entity bindings).
+    BlazeTermApi(Span),
 }
 
 /// The effects taken ([`Terminal::take_effects`]): the list and the bytes its spans name.
@@ -509,6 +512,72 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
 
     pub fn alternate(&self) -> Option<&Screen<'a, P>> {
         self.alternate.as_ref()
+    }
+
+    pub(crate) fn primary_mut(&mut self) -> &mut Screen<'a, P> {
+        &mut self.primary
+    }
+
+    pub(crate) fn alternate_mut(&mut self) -> Option<&mut Screen<'a, P>> {
+        self.alternate.as_mut()
+    }
+
+    pub(crate) fn modes_mut(&mut self) -> &mut ModeState {
+        &mut self.modes
+    }
+
+    pub(crate) fn plant(&self) -> P {
+        self.plant
+    }
+
+    /// Switches active screen during snapshot restore without clobbering `primary.saved`,
+    /// copying cursors, or mutating mode bits.
+    pub(crate) fn switch_screen_for_restore(&mut self, to: Which) -> Result<(), AllocFailure> {
+        if to == Which::Alternate && self.alternate.is_none() {
+            let alt = Screen::new(
+                self.cols,
+                self.rows,
+                self.opts.page_rows.max(1),
+                0,
+                true,
+                self.alloc,
+                self.plant,
+            )?;
+            self.alternate = Some(alt);
+        }
+        self.active = to;
+        let s = self.scr();
+        s.all_dirty = true;
+        s.pages.mark_all_dirty();
+        Ok(())
+    }
+
+    /// Resets terminal state (including palette/dynamic colour overrides) prior to restoring
+    /// a snapshot.
+    pub(crate) fn reset_for_restore(&mut self) {
+        self.full_reset();
+        self.colors.palette.reset_modified();
+        self.colors.foreground.override_ = None;
+        self.colors.background.override_ = None;
+        self.colors.cursor.override_ = None;
+        self.title_stack.clear();
+        self.mouse_shape = MouseShape::Text;
+    }
+
+    /// Captures a canonical, portable VT snapshot of the terminal into `alloc`.
+    pub fn snapshot_vt<A: core::alloc::Allocator + Clone>(
+        &self,
+        alloc: A,
+    ) -> Result<crate::snapshot::VtSnapshot<A>, AllocFailure> {
+        crate::snapshot::capture(self, alloc)
+    }
+
+    /// Restores a previously captured [`crate::snapshot::VtSnapshot`] into this terminal.
+    pub fn restore_vt_snapshot<A: core::alloc::Allocator>(
+        &mut self,
+        snap: &crate::snapshot::VtSnapshot<A>,
+    ) -> Result<(), crate::snapshot::RestoreError> {
+        crate::snapshot::restore(self, snap)
     }
 
     pub fn active(&self) -> Which {

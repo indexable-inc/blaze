@@ -419,6 +419,13 @@ struct CallSel<'s, F: Facts> {
     tys: PTys<'s>,
 }
 
+/// Whether two recorded row selections name the same source: two `Selected::Impl` rows for the
+/// same `imp` (e.g. filed before and after alias normalization with different `List` IDs) select
+/// the exact same impl and are not conflicting sources.
+fn same_selected(a: blaze_typeck::Selected, b: blaze_typeck::Selected) -> bool {
+    a == b || matches!((a, b), (blaze_typeck::Selected::Impl { imp: i1, .. }, blaze_typeck::Selected::Impl { imp: i2, .. }) if i1 == i2)
+}
+
 impl<F: Facts> CallSel<'_, F> {
     /// How row `r`'s arguments compare against the ask's: `Differ` if any differs, `Same` if
     /// every argument matches structurally, `Unknown` otherwise.
@@ -581,12 +588,12 @@ impl<F: Facts> Selected for CallSel<'_, F> {
                 Keyed::Differ => continue,
                 Keyed::Same => match exact {
                     None => exact = Some(r),
-                    Some(f) if f.selected == r.selected => {}
+                    Some(f) if same_selected(f.selected, r.selected) => {}
                     Some(_) => return None,
                 },
                 Keyed::Unknown => match loose {
                     None => loose = Some(r),
-                    Some(f) if f.selected == r.selected => {}
+                    Some(f) if same_selected(f.selected, r.selected) => {}
                     Some(_) => return None,
                 },
             }
@@ -622,6 +629,10 @@ impl<F: Facts> Selected for CallSel<'_, F> {
         })
     }
 
+    fn is_rpitit_alias(&self, opaque: ItemKey, trait_: ItemKey, name: Name) -> bool {
+        self.facts.rpitit_opaque(opaque).is_some_and(|info| info.trait_ == trait_ && info.name == name)
+    }
+
     fn select_keyed(&self, ask: Ask, args: &dyn AskArgs) -> Selection<'_> {
         let answers = |r: &&Projected| {
             r.trait_ == ask.trait_
@@ -638,12 +649,12 @@ impl<F: Facts> Selected for CallSel<'_, F> {
                 Keyed::Differ => continue,
                 Keyed::Same => match exact {
                     None => exact = Some(r),
-                    Some(f) if f.selected == r.selected => {}
+                    Some(f) if same_selected(f.selected, r.selected) => {}
                     Some(_) => exact_conflict = true,
                 },
                 Keyed::Unknown => match loose {
                     None => loose = Some(r),
-                    Some(f) if f.selected == r.selected => {}
+                    Some(f) if same_selected(f.selected, r.selected) => {}
                     Some(_) => loose_conflict = true,
                 },
             }
@@ -668,7 +679,7 @@ impl<F: Facts> Selected for CallSel<'_, F> {
                 if self.match_row(r, args) == Keyed::Same {
                     match body_exact {
                         None => body_exact = Some(r),
-                        Some(f) if f.selected == r.selected => {}
+                        Some(f) if same_selected(f.selected, r.selected) => {}
                         Some(_) => body_conflict = true,
                     }
                 }

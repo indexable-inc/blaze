@@ -285,6 +285,11 @@ fn wasm64_export_is_deterministic_and_valid_memory64() {
         name: "hello-wasm64",
         funcs: &funcs,
         data: &data,
+        indirect_table: &[],
+        extra_types: &[],
+        omit_blaze_host_v1: false,
+        extra_imports: &[],
+        extra_globals: &[],
         profile_digest: Some([0xAB; 32]),
         opts: Wasm64Opts::DEFAULT,
     };
@@ -300,7 +305,10 @@ fn wasm64_export_is_deterministic_and_valid_memory64() {
     assert_eq!(checked.min_pages, Wasm64Opts::DEFAULT.min_pages);
     assert_eq!(checked.max_pages, Wasm64Opts::DEFAULT.max_pages);
     assert_eq!(checked.host_imports, 3);
+    assert_eq!(checked.import_count, 3);
+    assert!(checked.has_blaze_host_v1);
     assert_eq!(checked.func_count, 1);
+    assert_eq!(checked.global_count, 3);
     assert_eq!(checked.data_segments, 1);
     assert!(checked.has_memory_export);
     assert!(checked.has_start_export);
@@ -315,6 +323,168 @@ fn wasm64_export_is_deterministic_and_valid_memory64() {
         bad[p] = 0x01; // clear memory64 bit 0x04
         assert!(matches!(check_wasm64(&bad), Err(Wasm64Error::NotMemory64 { .. })));
     }
+}
+
+#[test]
+fn wasm64_indirect_table_and_extra_types_validate() {
+    use crate::wasm64::{
+        HOST_IMPORT_COUNT, ValType, Wasm64Error, Wasm64Func, Wasm64Opts, Wasm64Program,
+        check_wasm64, export_wasm64,
+    };
+
+    let funcs = [
+        Wasm64Func {
+            export_name: Some("_start"),
+            params: &[],
+            results: &[ValType::I32],
+            locals: &[],
+            body: &[0x41, 0x00],
+        },
+        Wasm64Func {
+            export_name: None,
+            params: &[ValType::I64],
+            results: &[ValType::I64],
+            locals: &[],
+            body: &[0x20, 0x00],
+        },
+    ];
+    let extra_types: [(&[ValType], &[ValType]); 1] = [(&[ValType::I32, ValType::I32], &[ValType::I32])];
+    let indirect = [HOST_IMPORT_COUNT + 1];
+    let prog = Wasm64Program {
+        name: "indirect-wasm64",
+        funcs: &funcs,
+        data: &[],
+        indirect_table: &indirect,
+        extra_types: &extra_types,
+        omit_blaze_host_v1: false,
+        extra_imports: &[],
+        extra_globals: &[],
+        profile_digest: None,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    assert_eq!(prog.import_count(), HOST_IMPORT_COUNT);
+    assert_eq!(prog.type_index_for(&[ValType::I64], &[ValType::I64]), Some(HOST_IMPORT_COUNT + 1));
+    assert_eq!(
+        prog.type_index_for(&[ValType::I32, ValType::I32], &[ValType::I32]),
+        Some(prog.extra_type_index(0))
+    );
+
+    let mut out = Vec::new_in(Alloc::global());
+    export_wasm64(&prog, &mut out, Alloc::global()).expect("exports with table + elem");
+    let checked = check_wasm64(&out).expect("check_wasm64 accepts table + elem sections");
+    assert!(checked.has_blaze_host_v1);
+    assert_eq!(checked.table_size, 2);
+    assert_eq!(checked.elem_count, 1);
+
+    // Out-of-bounds indirect_table func index is refused cleanly.
+    let bad_table = [HOST_IMPORT_COUNT + 99];
+    let bad_prog = Wasm64Program { indirect_table: &bad_table, ..prog };
+    assert!(matches!(
+        export_wasm64(&bad_prog, &mut out, Alloc::global()),
+        Err(Wasm64Error::InvalidTableFunc { .. })
+    ));
+}
+
+#[test]
+fn wasm64_reactor_extra_imports_and_extra_globals_validate() {
+    use crate::wasm64::{
+        ValType, Wasm64Error, Wasm64ExportGlobal, Wasm64Func, Wasm64Import, Wasm64Opts,
+        Wasm64Program, check_wasm64, export_wasm64,
+    };
+
+    let imports = [
+        Wasm64Import {
+            module: "wasi_snapshot_preview1_64",
+            field: "fd_write",
+            params: &[ValType::I32, ValType::I64, ValType::I64, ValType::I64],
+            results: &[ValType::I32],
+        },
+        Wasm64Import {
+            module: "blaze_proc_macro_64",
+            field: "dispatch",
+            params: &[ValType::I64, ValType::I64],
+            results: &[ValType::I64],
+        },
+    ];
+    let funcs = [Wasm64Func {
+        export_name: Some("blaze_proc_macro_expand"),
+        params: &[ValType::I64],
+        results: &[ValType::I64],
+        locals: &[],
+        body: &[0x20, 0x00], // local.get 0
+    }];
+    let globals = [
+        Wasm64ExportGlobal {
+            name: "__blaze_proc_macro_decls",
+            val_type: ValType::I64,
+            mutable: false,
+            init_i64: 0x40000,
+        },
+        Wasm64ExportGlobal {
+            name: "__blaze_proc_macro_abi",
+            val_type: ValType::I32,
+            mutable: true,
+            init_i64: 2,
+        },
+    ];
+    let extra_types: [(&[ValType], &[ValType]); 1] = [(&[ValType::F64], &[ValType::F64])];
+    let indirect = [2u32]; // defined func 0 is at index `import_count() == 2`
+    let prog = Wasm64Program {
+        name: "reactor-wasm64",
+        funcs: &funcs,
+        data: &[],
+        indirect_table: &indirect,
+        extra_types: &extra_types,
+        omit_blaze_host_v1: true,
+        extra_imports: &imports,
+        extra_globals: &globals,
+        profile_digest: None,
+        opts: Wasm64Opts::DEFAULT,
+    };
+
+    assert_eq!(prog.import_count(), 2);
+    assert_eq!(
+        prog.type_index_for(
+            &[ValType::I32, ValType::I64, ValType::I64, ValType::I64],
+            &[ValType::I32]
+        ),
+        Some(0)
+    );
+    assert_eq!(prog.type_index_for(&[ValType::I64, ValType::I64], &[ValType::I64]), Some(1));
+    assert_eq!(prog.type_index_for(&[ValType::I64], &[ValType::I64]), Some(2));
+    assert_eq!(
+        prog.type_index_for(&[ValType::F64], &[ValType::F64]),
+        Some(prog.extra_type_index(0))
+    );
+    assert_eq!(prog.extra_type_index(0), 3);
+
+    let mut out = Vec::new_in(Alloc::global());
+    export_wasm64(&prog, &mut out, Alloc::global()).expect("reactor wasm64 exports");
+    let checked = check_wasm64(&out).expect("check_wasm64 accepts reactor module");
+    assert!(checked.memory64);
+    assert!(!checked.has_blaze_host_v1);
+    assert_eq!(checked.host_imports, 0);
+    assert_eq!(checked.import_count, 2);
+    assert_eq!(checked.func_count, 1);
+    assert_eq!(checked.global_count, 5);
+    assert_eq!(checked.export_count, 5);
+    assert!(checked.has_memory_export);
+    assert!(!checked.has_start_export);
+    assert_eq!(checked.table_size, 2);
+    assert_eq!(checked.elem_count, 1);
+
+    // Duplicate global export name is refused cleanly.
+    let dup_globals = [Wasm64ExportGlobal {
+        name: "blaze_proc_macro_expand",
+        val_type: ValType::I64,
+        mutable: false,
+        init_i64: 0,
+    }];
+    let dup_prog = Wasm64Program { extra_globals: &dup_globals, ..prog };
+    assert_eq!(
+        export_wasm64(&dup_prog, &mut out, Alloc::global()),
+        Err(Wasm64Error::DuplicateExport)
+    );
 }
 
 /// Rust `Space::Tls` layout and format checks on both Mach-O arm64 and ELF arm64:

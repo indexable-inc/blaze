@@ -196,12 +196,13 @@ See [docs/v2/plan/design/tasks.md](../../../docs/v2/plan/design/tasks.md).
 
 ## agents-are-a-cost (rule 48)
 
-An agent costs its whole context, and its report loses detail both ways, so the coordinator does
-small pieces, reads and deletions itself and never starts a fleet to read or summarise. But work
-that splits into independent, large pieces is done in parallel (`sota-first`): one lane per piece,
-with a brief that states its outcome, its check and its paths (`worktree-per-lane` says how lanes
-share one directory). At most four lanes write in shared files of one tree at once (existing crates,
-a registry every lane appends to): that is what the main agent can compile within minutes of each
+Spawn tasks as subagents by default so the coordinator stays free for incoming tasks. An agent costs
+its whole context, and its report loses detail both ways, so the coordinator does tiny
+reads/deletions itself and never starts a fleet just to summarise. But work that splits into
+independent, large pieces is done in parallel (`sota-first`): one lane per piece, with a brief that
+states its outcome, its check and its paths (`worktree-per-lane` says how lanes share one
+directory). At most four lanes write in shared files of one tree at once (existing crates, a
+registry every lane appends to): that is what the main agent can compile within minutes of each
 report and admit onto the green head (`fan-out-write-only`); more such pieces wait for a slot. A
 lane whose whole piece is a new crate or a new directory of its own does not take a slot, nor does
 one that needs no compile of this tree (a tool in Python, a doc); the main agent still compiles each
@@ -277,6 +278,16 @@ local Mach-O/ELF `N_SECT` function symbols so `sample`, `nm`, `objdump`, and `ll
 box, write clean textual IR dumpers and side-by-side instruction/stall diff scripts, and wire fast
 single-function harnesses before grinding through blind iterations. Sharpening the tool pays for
 itself on iteration two and compounds across every agent that touches the tree.
+
+## alarm-on-any-compile-failure (rule 90)
+
+Whenever ANY target repository, workspace, or crate fails to compile, exits non-zero, or leaves even
+a single item unchecked (including partial checks, missing `MacroModule`/`CrateScope` records,
+failing build scripts or proc macros, or incomplete typeck/borrowck), PLASTER 🚨🚨🚨 PROMINENTLY ACROSS
+THE TOP AND BODY OF YOUR RESPONSE. Never bury partial compilation failures in footnotes, never treat
+a subset passing as the whole repo working, and never report benchmark timings from an incomplete
+check without 🚨🚨🚨 explicitly naming the repo, exit status, unchecked item count, and exact root
+cause.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

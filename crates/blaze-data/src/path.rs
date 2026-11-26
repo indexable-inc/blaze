@@ -54,7 +54,7 @@ impl<'p> At<'p> {
         write_step(out, self.step, before)
     }
 
-    fn render_in<A: Allocator>(&self, alloc: A) -> String<A> {
+    pub(crate) fn render_in<A: Allocator>(&self, alloc: A) -> String<A> {
         let mut out = String::new_in(alloc);
         if self.write_into(&mut out).is_err() {
             unreachable!("writing into a `String` does not fail");
@@ -499,7 +499,7 @@ fn write_unknown<'k, A: Allocator>(
 
 /// The known name nearest `name` when it is near: at most two edits away, and fewer edits than
 /// `name` has bytes; the first of the nearest on a tie.
-fn closest<'k>(name: &str, known: impl Iterator<Item = &'k str>) -> Option<&'k str> {
+pub(crate) fn closest<'k>(name: &str, known: impl Iterator<Item = &'k str>) -> Option<&'k str> {
     let mut best: Option<(usize, &'k str)> = None;
     for candidate in known {
         let Some(d) = distance(name.as_bytes(), candidate.as_bytes()) else { continue };

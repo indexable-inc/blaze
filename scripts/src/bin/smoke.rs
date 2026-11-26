@@ -127,13 +127,11 @@ enum Step {
 }
 
 /// Every step, in the order each project runs them and its quote lists them.
-/// `blaze check`'s exit status while a stage it is defined to run is not built: 3, "incomplete"
-/// (blaze-cli main.rs `INCOMPLETE`, `blaze explain 3`). The stages are blaze-cli work.rs
-/// `CHECK_STAGES`, which this script cannot reach; the day every one is `true`, `check` exits 0
-/// and this turns 0 with it, so the smoke run never passes a check that said less than it did.
-const CHECK_STATUS: i32 = 3;
-/// The word of `check`'s closing line while stages are missing ("incomplete · NOT checked: ..").
-const CHECK_SAYS: &str = "incomplete";
+/// `blaze check`'s exit status once every stage in `CHECK_STAGES` (`crates/blaze-cli/src/work.rs`)
+/// is built (`BORROWS_ARE_ERRORS = true` in `crates/blaze-cli/src/body_types.rs`): 0.
+const CHECK_STATUS: i32 = 0;
+/// The closing line `blaze check` prints when every stage ran cleanly.
+const CHECK_SAYS: &str = "0 errors: blaze check";
 
 const STEPS: [Step; 6] = [Step::Cold, Step::NoOp, Step::BodyEdit, Step::Comment, Step::Check, Step::Test];
 
@@ -617,7 +615,7 @@ impl Smoke {
         let wall = Duration::from_nanos(measured.wall_ns);
         let outcome = match (step, measured.status) {
             (Step::Check, CHECK_STATUS) => Outcome::Ok,
-            (Step::Check, status) => Outcome::Failed(format!("exited {status}, where `check` exits {CHECK_STATUS} while stages are missing")),
+            (Step::Check, status) => Outcome::Failed(format!("exited {status}, expected {CHECK_STATUS}")),
             (_, 0) => Outcome::Ok,
             (_, -1) => Outcome::Failed("was ended by a signal".to_owned()),
             (_, status) => Outcome::Failed(format!("exited {status}")),

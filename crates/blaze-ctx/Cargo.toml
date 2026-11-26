@@ -1,0 +1,33 @@
+[package]
+name = "blaze-ctx"
+description = "Hierarchical 3-level repository context engine and hybrid search core (BM25 + char 3-grams + pluggable dense embeddings + 1-hop concept graph) emitting token-budgeted blaze-tab tables over an incremental BLAKE3/CBOR index; no_std sans-IO core, zero third-party deps"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "blaze-ctx"
+path = "src/bin/blaze-ctx.rs"
+
+[dependencies]
+blaze-blake3.workspace = true
+blaze-cbor.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-own = { workspace = true, features = ["std"] }
+blaze-tab.workspace = true
+blaze-toml.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

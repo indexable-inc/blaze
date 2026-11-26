@@ -132,10 +132,17 @@ pub struct PromptInfo {
     pub cwd_display: String,
     /// Concise Starship directory label (repo-rooted inside git, e.g. `blaze-shell-1124`).
     pub dir_short: String,
-    /// Optional custom project symbol/emoji from `~/.config/blaze-shell/config.toml` (e.g. `"👋🌎"`).
+    /// Optional custom project symbol/emoji from `~/.config/blaze-shell/config.toml` or live
+    /// `TermServer` inode binding (e.g. `"👋🌎"` or a registered custom symbol name like `"rocket"`).
     pub project_symbol: Option<String>,
     /// Optional custom project display label (`Some("")` hides dir name for symbol-only display).
     pub project_label_override: Option<String>,
+    /// Optional custom accent color from live `TermServer` inode binding.
+    pub project_color: Option<[f32; 4]>,
+    /// Optional short badge pill from live `TermServer` inode binding (e.g. `"prod"`).
+    pub project_badge: Option<String>,
+    /// Canonical entity id when matched from `TermServer` (e.g. `"file:16777234:9812345"`).
+    pub project_entity_id: Option<String>,
     pub git_branch: Option<String>,
     pub git_detached: bool,
     pub git_status: Option<GitStatusSummary>,
@@ -209,6 +216,9 @@ impl PromptInfo {
             dir_short,
             project_symbol: None,
             project_label_override: None,
+            project_color: None,
+            project_badge: None,
+            project_entity_id: None,
             git_branch,
             git_detached,
             git_status: None,
@@ -239,6 +249,40 @@ impl PromptInfo {
         } else {
             self.project_symbol = None;
             self.project_label_override = None;
+        }
+        self.project_color = None;
+        self.project_badge = None;
+        self.project_entity_id = None;
+
+        // Live `TermServer` entity bindings (inode-keyed for folders so renames/moves preserve
+        // metadata, and hostname-keyed for hosts) override static config.toml entries!
+        if let Some(host_ent) = crate::term_server::lookup_global_host_entity(&self.host) {
+            if let Some(sym) = host_ent.symbol {
+                self.host_symbol = Some(sym);
+            }
+            if let Some(lbl) = host_ent.display_name {
+                self.host_label_override = Some(lbl);
+            }
+        }
+        if let Some(dir_ent) =
+            crate::term_server::lookup_global_dir_entity_with_ancestors(Path::new(&self.cwd))
+        {
+            if let Some(sym) = dir_ent.symbol {
+                self.project_symbol = Some(sym);
+            }
+            if let Some(lbl) = dir_ent.display_name {
+                self.project_label_override = Some(lbl);
+            }
+            if let Some([r, g, b, a]) = dir_ent.color {
+                self.project_color = Some([
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    f32::from(a) / 255.0,
+                ]);
+            }
+            self.project_badge = dir_ent.badge;
+            self.project_entity_id = Some(format!("{}:{}", dir_ent.kind.as_str(), dir_ent.id));
         }
     }
 

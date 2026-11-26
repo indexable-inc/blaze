@@ -21,6 +21,12 @@ pub enum VtPlant {
     StyleFreedWhileNamed,
     /// A row moved across a page boundary is taken for a row of the page before it.
     PageBoundaryOffByOne,
+    /// Snapshot omits SGR style transitions when encoding rows.
+    SnapshotDropsStyle,
+    /// Snapshot omits the final cursor position (CUP).
+    SnapshotDropsCursor,
+    /// Snapshot omits primary soft-wrap flags.
+    SnapshotDropsSoftWrap,
 }
 
 impl Plants for VtPlant {}

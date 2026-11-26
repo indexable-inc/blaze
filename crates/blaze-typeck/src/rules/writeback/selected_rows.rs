@@ -868,6 +868,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let sized = inert.0[0];
         let global = own.clauses.iter().all(|c| matches!(c, PClause::Trait { trait_, .. } if Some(*trait_) == sized));
         env.global = global;
+        let proj_eqs = self.owner_proj_eqs(own.clauses, inert)?;
         for c in own.clauses {
             let (trait_, args) = match *c {
                 PClause::Trait { trait_, args } | PClause::Projection { trait_, args, .. } => (trait_, args),
@@ -877,6 +878,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 continue;
             }
             if holds_alias(own.types, args, alloc)? {
+                if let Some(ref eqs) = proj_eqs
+                    && has_rigid_param_alias(own.types, args, eqs, alloc)?
+                {
+                    continue;
+                }
                 env.traits.push(trait_);
             } else if !env.exact.contains(&trait_) {
                 env.exact.push(trait_);
@@ -1043,11 +1049,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let Some(&ps0) = ps.first() else { return Ok(true) };
         let ps0_node = tys.node(ps0)?;
-        // Whether `own.clauses` carries any projection equality `<.. as at>::an = term` (which
-        // could normalize a rigid alias to another type in this body's param-env).
-        let has_proj_eq = |at: ItemKey, an: Name| -> bool {
-            own.clauses.iter().any(|cl| matches!(*cl, PClause::Projection { trait_: pt, name: pn, .. } if pt == at && pn == an))
-        };
+        // Collect projection equalities `(trait_, name)` from `own.clauses` and their transitive
+        // supertraits so rigid parameter aliases (`<P as T1>::A1`, `<<P as T1>::A1 as T2>::A2`, ...)
+        // with no equating projection clause do not shadow concrete impls.
+        let proj_eqs = self.owner_proj_eqs(own.clauses, inert)?;
         let ps0_is_concrete = !matches!(
             ps0_node,
             PNode::Param(_) | PNode::ConstParam(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) | PNode::Infer | PNode::Error
@@ -1069,22 +1074,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let a0_node = own.types.node(a0)?;
             let self_matches = match (a0_node, ps0_node) {
                 (PNode::Param(q), PNode::Param(p)) => q == p,
-                (PNode::Param(_), PNode::Alias { trait_: at, name: an, args: p_args }) => {
+                (PNode::Param(_), PNode::Alias { .. }) => {
                     // A clause `P: Tr` cannot match a rigid alias `<Q as Foo>::Assoc` (e.g.
                     // `I: IntoIterator` vs `I::IntoIter: IntoIterator` in `for x in iter.into_iter()`)
-                    // unless a projection equality in `own.clauses` can equate that alias.
-                    let rigid_param = tys.list(p_args).ok().and_then(|al| al.first()).and_then(|&s| tys.node(s).ok()).is_some_and(|n| matches!(n, PNode::Param(_)));
-                    !rigid_param || has_proj_eq(at, an)
+                    // unless a projection equality in `own.clauses` (or their supertraits) can equate it.
+                    match proj_eqs {
+                        Some(ref eqs) => !is_rigid_param_alias(tys, ps0, eqs)?,
+                        None => true,
+                    }
                 }
                 (PNode::Param(_), PNode::Opaque(..) | PNode::Infer | PNode::Error) => true,
                 (PNode::Param(_), _) => false,
-                (PNode::Alias { trait_: at, name: an, args: a_args }, _) if ps0_is_concrete => {
-                    // A rigid alias `<P as Tr>::Assoc` on a type parameter cannot shadow a concrete
-                    // type constructor's impl (e.g. `O::Len: PartialEq` vs `&O: PartialEq` or
-                    // `P::Searcher<'a>: Clone` vs `MatchIndicesInternal<'a, P>: Clone`) unless a
-                    // projection equality in `own.clauses` can equate that alias.
-                    let rigid_param = own.types.list(a_args).ok().and_then(|al| al.first()).and_then(|&s| own.types.node(s).ok()).is_some_and(|n| matches!(n, PNode::Param(_)));
-                    !rigid_param || has_proj_eq(at, an)
+                (PNode::Alias { .. }, _) if ps0_is_concrete => {
+                    // A rigid alias `<P as Tr>::Assoc` (or nested `<<P as T1>::A1 as T2>::A2`) on a
+                    // type parameter cannot shadow a concrete type constructor's impl unless a
+                    // projection equality in `own.clauses` (or their supertraits) can equate it.
+                    match proj_eqs {
+                        Some(ref eqs) => !is_rigid_param_alias(own.types, a0, eqs)?,
+                        None => true,
+                    }
                 }
                 (PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error, _) => true,
                 _ => may_equal(own.types, a0, tys, ps0, alloc)?,
@@ -1108,6 +1116,65 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         Ok(false)
+    }
+
+    /// Collects every `(trait_, name)` that has a projection equality clause in `own_clauses` or
+    /// any transitive supertrait of traits named in `own_clauses`. Returns `None` if a supertrait
+    /// definition is unanswered or the worklist cap is hit, so callers stay conservative.
+    fn owner_proj_eqs(&mut self, own_clauses: &[PClause], inert: Inert) -> Result<Option<Vec<(ItemKey, Name), Alloc<'a>>>, CheckError> {
+        let alloc = self.alloc;
+        let mut eqs: Vec<(ItemKey, Name), Alloc<'a>> = Vec::new_in(alloc);
+        let mut work: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
+        for c in own_clauses {
+            match *c {
+                PClause::Projection { trait_, name, .. } => {
+                    if eqs.scan_for(&(trait_, name)).is_none() {
+                        eqs.push((trait_, name));
+                    }
+                    if !inert.has(trait_) && work.scan_for(&trait_).is_none() {
+                        work.push(trait_);
+                    }
+                }
+                PClause::Trait { trait_, .. } => {
+                    if !inert.has(trait_) && work.scan_for(&trait_).is_none() {
+                        work.push(trait_);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut next = 0usize;
+        while let Some(&t) = work.get(next) {
+            if work.len() > MOST_ENV_TRAITS * 2 {
+                return Ok(None);
+            }
+            next += 1;
+            let def = match self.reads.trait_def(t) {
+                Ok(Some(def)) => def,
+                Ok(None) => continue,
+                Err(Stop::Need(_)) => return Ok(None),
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            for s in def.supertraits {
+                match *s {
+                    PClause::Projection { trait_: st, name, .. } => {
+                        if eqs.scan_for(&(st, name)).is_none() {
+                            eqs.push((st, name));
+                        }
+                        if !inert.has(st) && work.scan_for(&st).is_none() {
+                            work.push(st);
+                        }
+                    }
+                    PClause::Trait { trait_: st, .. } => {
+                        if !inert.has(st) && work.scan_for(&st).is_none() {
+                            work.push(st);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Some(eqs))
     }
 
     /// Whether `target` is a transitive supertrait of `start` (bounded BFS).
@@ -1252,6 +1319,53 @@ fn names_param(tys: PTys<'_>, l: List, alloc: Alloc<'_>) -> Result<bool, CheckEr
         match node {
             PNode::Param(_) | PNode::ConstParam(_) => return Ok(true),
             PNode::Alias { .. } => {}
+            _ => children(node, tys, &mut stack)?,
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `t` is a rigid associated-type projection rooted at a type parameter
+/// (`<P as T1>::A1`, `<<P as T1>::A1 as T2>::A2`, ...) where no projection equality in `proj_eqs`
+/// equates any step along the chain. Such a projection cannot normalize to a concrete/ground type
+/// in the caller's param-env.
+fn is_rigid_param_alias(tys: PTys<'_>, mut t: PTy, proj_eqs: &[(ItemKey, Name)]) -> Result<bool, CheckError> {
+    for _ in 0..16 {
+        match tys.node(t)? {
+            PNode::Alias { trait_, name, args } => {
+                if proj_eqs.contains(&(trait_, name)) {
+                    return Ok(false);
+                }
+                let Some(&self_ty) = tys.list(args)?.first() else {
+                    return Ok(false);
+                };
+                t = self_ty;
+            }
+            PNode::Param(_) => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `l` contains any rigid parameter alias outside projections that have a matching
+/// projection equality in `proj_eqs` (bounded work list, no recursion).
+fn has_rigid_param_alias(tys: PTys<'_>, l: List, proj_eqs: &[(ItemKey, Name)], alloc: Alloc<'_>) -> Result<bool, CheckError> {
+    let mut stack: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
+    stack.extend_from_slice(tys.list(l)?);
+    let mut steps = 0u32;
+    while let Some(t) = stack.pop() {
+        steps += 1;
+        if steps > MOST_NODES {
+            return Err(CheckError::Limit(Limit::Solver));
+        }
+        let node = tys.node(t)?;
+        match node {
+            PNode::Alias { .. } => {
+                if is_rigid_param_alias(tys, t, proj_eqs)? {
+                    return Ok(true);
+                }
+            }
             _ => children(node, tys, &mut stack)?,
         }
     }

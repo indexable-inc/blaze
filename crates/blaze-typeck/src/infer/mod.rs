@@ -775,6 +775,57 @@ impl<'a> InferCtx<'a> {
         self.solver.take_trace()
     }
 
+    /// Interns a canonical finite const value-set pattern type (`base is in CONST_SLICE`) in this
+    /// inference context, mirroring [`crate::portable::PortableTys::pattern_const_set`].
+    pub fn mk_pattern_const_set(&mut self, base: Ty, member_digests: &[u128]) -> Result<Ty, CheckError> {
+        let (digests, n) = crate::portable::canonical_const_set(member_digests)?;
+        let tag = self.mk(TyView::Never)?;
+        let u128_ty = self.mk(TyView::Uint(crate::ids::UintTy::U128))?;
+        let mut terms = [Ty(0); 1 + crate::portable::MAX_PATTERN_SET_MEMBERS];
+        terms[0] = tag;
+        for (i, digest) in digests[..n].iter().copied().enumerate() {
+            terms[1 + i] = self.mk(TyView::ConstValue { ty: u128_ty, bits: digest })?;
+        }
+        let list = self.mk_list(&terms[..1 + n])?;
+        self.mk(TyView::Pat(base, list))
+    }
+
+    fn const_set_parts(
+        &mut self,
+        pat: Ty,
+    ) -> Option<(Ty, [u128; crate::portable::MAX_PATTERN_SET_MEMBERS], usize)> {
+        let pat = self.shallow_resolve(pat);
+        let TyView::Pat(base, list) = self.view(pat) else { return None };
+        let len = self.list_len(list) as usize;
+        if len < 2 || len - 1 > crate::portable::MAX_PATTERN_SET_MEMBERS {
+            return None;
+        }
+        if !matches!(self.view(self.list_get(list, 0)), TyView::Never) {
+            return None;
+        }
+        let mut out = [0u128; crate::portable::MAX_PATTERN_SET_MEMBERS];
+        let n = len - 1;
+        for i in 0..n {
+            let elem = self.list_get(list, (1 + i) as u32);
+            let TyView::ConstValue { ty, bits } = self.view(elem) else { return None };
+            if !matches!(self.view(ty), TyView::Uint(crate::ids::UintTy::U128)) {
+                return None;
+            }
+            out[i] = bits;
+        }
+        Some((base, out, n))
+    }
+
+    /// Whether `sub` and `sup` are canonical finite const value-set pattern types over the same
+    /// base type with `members(sub) ⊆ members(sup)` (`(SemVer is in OLD) <: (SemVer is in ALL)`).
+    pub fn const_set_is_subset(&mut self, sub: Ty, sup: Ty) -> bool {
+        let Some((sub_base, sub_digests, sub_n)) = self.const_set_parts(sub) else { return false };
+        let Some((sup_base, sup_digests, sup_n)) = self.const_set_parts(sup) else { return false };
+        let (sb, pb) = (self.shallow_resolve(sub_base), self.shallow_resolve(sup_base));
+        let same_base = sb == pb || matches!((self.resolve(sb), self.resolve(pb)), (Ok(x), Ok(y)) if x == y);
+        same_base && crate::portable::sorted_digests_is_subset(&sub_digests[..sub_n], &sup_digests[..sup_n])
+    }
+
     pub(crate) fn imported_closure(
         &mut self, owner: ItemKey, ordinal: u32, args: TyList, sig: Ty, kind: crate::ty::ClosureKind, upvars: Option<Ty>,
     ) -> Result<Ty, CheckError> {

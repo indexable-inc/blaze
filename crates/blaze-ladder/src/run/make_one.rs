@@ -61,6 +61,10 @@ use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable
 #[path = "export_lto.rs"]
 pub mod export_lto;
 
+/// Whole-program LIR-to-Wasm64 (`memory64`) linker over a record walk.
+#[path = "wasm64.rs"]
+pub mod wasm64;
+
 /// One function reference in a [`BuiltLir`] body: either a Rust instance symbol or an offset span
 /// into [`BuiltLir::c_text`] naming a C extern function.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

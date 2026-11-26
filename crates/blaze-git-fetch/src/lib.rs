@@ -28,9 +28,9 @@ extern crate std;
 
 mod oid;
 mod pack;
-mod pkt;
+pub mod pkt;
 mod plant;
-mod protocol;
+pub mod protocol;
 pub mod sha1;
 pub mod store;
 mod tree;

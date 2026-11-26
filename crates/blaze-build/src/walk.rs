@@ -2566,6 +2566,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let rest = if self.partial[p.ix()] {
             let slot = self.b.slot(8, 3, SlotKind::Named);
             self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
+            self.record_mask_decl_loop(slot);
             Some(slot)
         } else {
             None
@@ -2617,6 +2618,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             LocalOwn::None | LocalOwn::Kept | LocalOwn::Drop(_) => {
                 let slot = self.b.slot(8, 3, SlotKind::Named);
                 *entry = LocalOwn::KeptFlags(slot);
+                self.record_mask_decl_loop(slot);
                 slot
             }
         };
@@ -4740,6 +4742,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
                         self.end_temp_val(v);
+                        self.name_temp_at(at, a);
                         V::Place(at.0, at.1)
                     }
                 };

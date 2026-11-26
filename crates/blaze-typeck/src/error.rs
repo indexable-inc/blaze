@@ -36,6 +36,8 @@ pub enum Limit {
     Interner,
     /// A pattern type with more than `MAX_PATTERN_RANGES` ranges, or a base wider than 128 bits.
     PatternRanges,
+    /// A finite const value-set pattern type with more than `MAX_PATTERN_SET_MEMBERS` members.
+    PatternSetMembers,
     /// A trait object with more than `MAX_OBJECT_PREDS` predicates.
     ObjectPreds,
     /// A trait object's principal with more than `dyn_compat::MAX_SUPERTRAITS` traits above it.
@@ -116,6 +118,8 @@ pub enum Malformed {
     /// `char` or `bool`, the only types a const generic may have (the Reference, "Const
     /// generics"); `node` is the value's node or handle.
     ConstValueType { node: u32 },
+    /// A finite const value-set pattern type with no allowed members (`T is in []`).
+    EmptyPatternSet,
     /// A const term where a type is needed, or a type where a const is needed: `node` is it.
     Sort { node: u32 },
     /// A trait object's list holds a node that is no `ExTrait`, `ExProj` or `ExAuto`, or two
