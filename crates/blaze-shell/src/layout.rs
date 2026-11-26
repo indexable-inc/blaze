@@ -4214,8 +4214,8 @@ fn layout_command_output(
     let out_b = crate::dust_driver::format_bytes_compact(stdout_len as u64);
     let err_b = crate::dust_driver::format_bytes_compact(stderr_len as u64);
 
-    // Always surface explicit `exit N`, `out`, and `err` metadata for every external command!
-    let exit_lbl = format!("exit {}", out.exit_code);
+    // Surface compact stream metadata (`err 552 B`, `out 1.2 KiB · err 552 B`) without repeating
+    // the `exit N` badge that already appears in the block header above.
     let streams_lbl = if stderr_len > 0 && stdout_len > 0 {
         format!("out {out_b} · err {err_b}")
     } else if stderr_len > 0 {
@@ -4223,15 +4223,15 @@ fn layout_command_output(
     } else if stdout_len > 0 {
         format!("out {out_b}")
     } else {
-        "empty".to_owned()
+        format!("exit {}", out.exit_code)
     };
-    let pill_lbl = format!("{exit_lbl} · {streams_lbl}");
-    let pill_w = m.measure(&pill_lbl, TextFace::UiSmall) + 18.0;
+    let pill_lbl = streams_lbl;
+    let pill_w = m.measure(&pill_lbl, TextFace::UiSmall) + 16.0;
     let bx0 = (x0 + width - pill_w).max(x0 + 80.0);
     let (pill_bg, pill_border, pill_fg) = if out.exit_code != 0 {
         (
             theme::rgba(0xe0, 0x6c, 0x75, 0.14),
-            theme::rgba(0xe0, 0x6c, 0x75, 0.65),
+            theme::rgba(0xe0, 0x6c, 0x75, 0.55),
             theme::DANGER,
         )
     } else if stderr_len > 0 {
@@ -4247,26 +4247,30 @@ fn layout_command_output(
             theme::rgb(0x7c, 0xd4, 0xa8),
         )
     };
-    scene.round_rect(
-        bx0,
-        y0 - 1.0,
-        x0 + width,
-        y0 + m.ch + 1.0,
-        (m.ch + 2.0) * 0.5,
-        pill_bg,
-        1.0,
-        pill_border,
-        clip_id,
-    );
-    scene.ui_small(bx0 + 9.0, y0, &pill_lbl, pill_fg, out.exit_code != 0, false, clip_id);
-    scene.push_hover_clipped(
-        HitRect::new(bx0, y0 - 2.0, x0 + width, y0 + m.ch + 2.0),
-        clip_id,
-        HoverKind::Tooltip {
-            title: format!("exit {} · {dur_s} · {out_b} stdout · {err_b} stderr", out.exit_code),
-            subtitle: Some("fields: .stdout · .stderr · .exit_code · .duration · .events".to_owned()),
-        },
-    );
+    let draw_meta_pill = |scene: &mut Scene, pill_y: f32, inset_right: f32| {
+        let px1 = x0 + width - inset_right;
+        let px0 = (px1 - pill_w).max(x0 + 80.0);
+        scene.round_rect(
+            px0,
+            pill_y,
+            px1,
+            pill_y + m.ch - 1.0,
+            (m.ch - 1.0) * 0.5,
+            pill_bg,
+            1.0,
+            pill_border,
+            clip_id,
+        );
+        scene.ui_small(px0 + 8.0, pill_y, &pill_lbl, pill_fg, out.exit_code != 0, false, clip_id);
+        scene.push_hover_clipped(
+            HitRect::new(px0, pill_y - 2.0, px1, pill_y + m.ch + 1.0),
+            clip_id,
+            HoverKind::Tooltip {
+                title: format!("exit {} · {dur_s} · {out_b} stdout · {err_b} stderr", out.exit_code),
+                subtitle: Some("fields: .stdout · .stderr · .exit_code · .duration · .events".to_owned()),
+            },
+        );
+    };
 
     // Flatten time-ordered chunks into display lines tagged with `(arrival_ns, stream)`,
     // preserving ANSI SGR codes so external CLIs (`rg`, `cargo`, `git`, `gh`, `bun`, `pytest`)
@@ -4301,6 +4305,7 @@ fn layout_command_output(
     }
 
     if lines.is_empty() {
+        draw_meta_pill(scene, y0, 0.0);
         let empty_msg = if out.exit_code != 0 {
             format!("(exited with code {}, no stdout/stderr)", out.exit_code)
         } else {
@@ -4309,6 +4314,10 @@ fn layout_command_output(
         scene.text(x0, y0, &empty_msg, theme::INK_4, false, true, clip_id);
         return m.ch;
     }
+
+    let first_is_diag_card = lines
+        .first()
+        .is_some_and(|(_, s, l)| *s == blaze_sh::OutputStream::Stderr && !l.contains('\x1b'));
 
     let text_w_first = (bx0 - x0 - 12.0).max(m.cw * 16.0);
     let full_cols = ((width - 10.0) / m.cw).floor().max(16.0) as usize;
@@ -4320,8 +4329,45 @@ fn layout_command_output(
     let mut stdout_style = AnsiStyle::default();
     let mut stderr_style = AnsiStyle::default();
 
-    for (at_ns, stream, raw_line) in lines.iter().take(max_display_lines) {
+    let display_lines = &lines[..lines.len().min(max_display_lines)];
+    let mut li = 0usize;
+    while li < display_lines.len() {
+        let (at_ns, stream, raw_line) = &display_lines[li];
         let is_err = *stream == blaze_sh::OutputStream::Stderr;
+
+        // Contiguous uncolored `stderr` lines render as crisp structured diagnostic cards
+        // (`error`, `warning`, `note`, `help`, `<tool>`, `--> loc`, code frames) with inline
+        // Markdown `` `code` `` chips and clean word-boundary wrapping!
+        if is_err && !raw_line.contains('\x1b') {
+            let group_start = li;
+            let mut group: Vec<(i64, &str)> = Vec::new();
+            while li < display_lines.len()
+                && display_lines[li].1 == blaze_sh::OutputStream::Stderr
+                && !display_lines[li].2.contains('\x1b')
+            {
+                group.push((display_lines[li].0, display_lines[li].2.as_str()));
+                li += 1;
+            }
+            let right_reserve = if row_idx == 0 { pill_w + 14.0 } else { 0.0 };
+            let card_y0 = cur_y;
+            let h = crate::diag_view::layout_stderr_diagnostic_group(
+                scene,
+                &group,
+                out.exit_code,
+                x0,
+                cur_y,
+                width,
+                right_reserve,
+                m,
+                clip_id,
+            );
+            cur_y += h + 4.0;
+            row_idx += li - group_start;
+            let at_lbl = format_duration_ns((*at_ns).max(0) as u64);
+            let _ = (card_y0, at_lbl);
+            continue;
+        }
+
         let default_fg = if is_err {
             theme::rgb(0xec, 0x9b, 0x82)
         } else {
@@ -4344,26 +4390,45 @@ fn layout_command_output(
                     fg[3] *= 0.65;
                 }
                 let bg = sp.style.bg;
-                let mut chars = sp.text.chars().peekable();
-                while chars.peek().is_some() {
+                let mut rest = sp.text.as_str();
+                while !rest.is_empty() {
                     if col >= max_cols {
                         cur_y += step_y;
                         row_idx += 1;
                         col = 0;
                         max_cols = full_cols;
-                    }
-                    let take = max_cols - col;
-                    let mut seg = String::new();
-                    let mut taken = 0usize;
-                    while taken < take {
-                        if let Some(ch) = chars.next() {
-                            seg.push(ch);
-                            taken += 1;
-                        } else {
+                        rest = rest.trim_start_matches(' ');
+                        if rest.is_empty() {
                             break;
                         }
                     }
-                    if !seg.is_empty() {
+                    let take = max_cols - col;
+                    let total_chars = rest.chars().count();
+                    let (chunk, next_rest) = if total_chars <= take {
+                        (rest, "")
+                    } else {
+                        // Prefer breaking at the last space within `take` so words never split mid-word!
+                        let mut cut_b = rest.len();
+                        let mut last_space_b = None;
+                        for (ci, (bi, ch)) in rest.char_indices().enumerate() {
+                            if ci >= take {
+                                cut_b = bi;
+                                break;
+                            }
+                            if ch == ' ' {
+                                last_space_b = Some(bi);
+                            }
+                        }
+                        if let Some(sb) = last_space_b
+                            && sb > 0
+                        {
+                            (&rest[..sb], rest[sb + 1..].trim_start_matches(' '))
+                        } else {
+                            (&rest[..cut_b], &rest[cut_b..])
+                        }
+                    };
+                    let taken = chunk.chars().count();
+                    if taken > 0 {
                         let rx = line_x + col as f32 * m.cw;
                         let rw = taken as f32 * m.cw;
                         if let Some(bg_col) = bg {
@@ -4379,8 +4444,15 @@ fn layout_command_output(
                                 clip_id,
                             );
                         }
-                        scene.text(rx, cur_y, &seg, fg, sp.style.bold, sp.style.italic, clip_id);
+                        scene.text(rx, cur_y, chunk, fg, sp.style.bold, sp.style.italic, clip_id);
                         col += taken;
+                    }
+                    rest = next_rest;
+                    if !rest.is_empty() {
+                        cur_y += step_y;
+                        row_idx += 1;
+                        col = 0;
+                        max_cols = full_cols;
                     }
                 }
             }
@@ -4409,6 +4481,7 @@ fn layout_command_output(
                 subtitle: None,
             },
         );
+        li += 1;
     }
     if lines.len() > max_display_lines {
         scene.text(
@@ -4421,6 +4494,13 @@ fn layout_command_output(
             clip_id,
         );
         cur_y += step_y;
+    }
+
+    // Paint stream metadata pill AFTER cards so it sits crisply on top of the first card's header!
+    if first_is_diag_card {
+        draw_meta_pill(scene, y0 + 7.5, 10.0);
+    } else {
+        draw_meta_pill(scene, y0, 0.0);
     }
 
     (cur_y - y0).max(m.ch)
@@ -5108,16 +5188,36 @@ fn layout_error_panel(
     draw_icon(scene, Icon::Error, px, cur_y + (m.ch - icon_s) * 0.5, icon_s, theme::DANGER, clip_id);
     let kind_x = px + icon_s + 7.0;
     let kind_lbl = err.kind.as_str();
-    scene.text(kind_x, cur_y, kind_lbl, theme::DANGER, true, false, clip_id);
+    let kind_bw = m.measure(kind_lbl, TextFace::UiSmall) + 12.0;
+    let kind_bh = m.ch - 1.0;
+    scene.round_rect(
+        kind_x,
+        cur_y + 0.5,
+        kind_x + kind_bw,
+        cur_y + 0.5 + kind_bh,
+        kind_bh * 0.5,
+        theme::rgba(0xe0, 0x6c, 0x75, 0.18),
+        1.0,
+        theme::rgba(0xe0, 0x6c, 0x75, 0.45),
+        clip_id,
+    );
+    scene.ui_small(kind_x + 6.0, cur_y + 0.5, kind_lbl, theme::DANGER, true, false, clip_id);
 
-    let msg_x = kind_x + (kind_lbl.len() as f32 + 2.0) * m.cw;
-    let msg_cols = ((x1 - 12.0 - msg_x) / m.cw).floor().max(14.0) as usize;
-    let msg_lines = wrap_lines(err.message.as_str(), msg_cols);
-    for (i, line) in msg_lines.iter().enumerate() {
-        let tx = if i == 0 { msg_x } else { px };
-        scene.text(tx, cur_y, line, theme::INK_1, false, false, clip_id);
-        cur_y += m.ch + 3.0;
-    }
+    let inner_w = (x1 - 12.0 - px).max(100.0);
+    let msg_indent = (kind_x - px) + kind_bw + 8.0;
+    let msg_h = crate::diag_view::layout_inline_markdown(
+        scene,
+        err.message.as_str(),
+        px,
+        cur_y,
+        inner_w,
+        msg_indent,
+        0.0,
+        theme::INK_1,
+        m,
+        clip_id,
+    );
+    cur_y += msg_h + 4.0;
 
     if !source.is_empty() {
         cur_y += 3.0;
@@ -5142,14 +5242,33 @@ fn layout_error_panel(
     }
 
     if let Some(help) = &err.help {
-        let help_lbl = "help  ";
-        scene.text(px, cur_y, help_lbl, theme::INK_3, false, false, clip_id);
-        let hx = px + help_lbl.len() as f32 * m.cw;
-        let h_cols = ((x1 - 12.0 - hx) / m.cw).floor().max(16.0) as usize;
-        for (i, line) in wrap_lines(help.as_str(), h_cols).iter().enumerate() {
-            scene.text(if i == 0 { hx } else { px }, cur_y, line, theme::INK_2, false, false, clip_id);
-            cur_y += m.ch + 2.0;
-        }
+        let help_bw = m.measure("help", TextFace::UiSmall) + 10.0;
+        let help_bh = m.ch - 2.0;
+        scene.round_rect(
+            px,
+            cur_y + 1.0,
+            px + help_bw,
+            cur_y + 1.0 + help_bh,
+            help_bh * 0.5,
+            theme::rgba(0x4c, 0xc3, 0x8a, 0.16),
+            1.0,
+            theme::rgba(0x4c, 0xc3, 0x8a, 0.36),
+            clip_id,
+        );
+        scene.ui_small(px + 5.0, cur_y + 1.0, "help", theme::OK, true, false, clip_id);
+        let help_h = crate::diag_view::layout_inline_markdown(
+            scene,
+            help.as_str(),
+            px,
+            cur_y,
+            inner_w,
+            help_bw + 8.0,
+            0.0,
+            theme::INK_2,
+            m,
+            clip_id,
+        );
+        cur_y += help_h + 3.0;
     }
 
     cur_y += 6.0;
