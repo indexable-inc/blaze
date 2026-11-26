@@ -1108,6 +1108,11 @@ impl<D: Driver, S: Sharing> StoreSink<'_, '_, '_, '_, D, S> {
         use blaze_cas::plain::{INDEX_KEYS_MOST, beside_key};
         use blaze_keyed::kind::ReservedTag;
 
+        // Fast path for a single-key page with no CrateScope expansions (e.g. a readers-only page):
+        // skip buffer copy/sort/dedup and file the 32-byte beside index directly.
+        if scopes.is_empty() && let [only] = records {
+            return self.lent.index_beside(blaze_cas::Key(owner.0), &[blaze_cas::Key(only.0)]).map_err(PublishError::Cas);
+        }
         // CAS reach follows one index level. Include each expansion's key and its owner's
         // side index so a later carried names row can be indexed again after compaction.
         cas_buf.clear();

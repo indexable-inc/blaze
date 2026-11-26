@@ -45,7 +45,7 @@
 use core::fmt;
 
 use blaze_drive::record::Stored;
-use blaze_drive::{Input, Key, Name};
+use blaze_drive::{Input, Key, Kind, Name};
 use blaze_id::CrateItemKey;
 use blaze_ids::ContentId;
 use blaze_ids::producer::{ProducerId, Whole};
@@ -65,10 +65,35 @@ use crate::store::Store;
 /// The rule a refusal here names.
 const RULE: &str = "engine_native.rs";
 
-/// The domain of [`image_key`]. 3: the fields its doc lists, in that order, the SDK's identity
-/// (its version and build, blaze-apple-sdk `SdkId::key`) last (2 held the version alone; 1 had
-/// none, and named frameworks from a table).
-const KEY_FORM: &str = "blaze-cli engine native image key 3";
+/// The domain of [`image_key`]. 4: content-addressed by native link inputs only (excludes
+/// `program` and pure-Rust crates with an empty link table and no build script, so binaries/tests
+/// sharing a native closure share one store record and one dylib file). 3 hashed `program` and
+/// every closure crate; 2 held the SDK version alone; 1 had no SDK identity.
+const KEY_FORM: &str = "blaze-cli engine native image key 4";
+
+/// Canonical 20-byte encoding of an empty valid state-0 link table (`native_links::write_table`
+/// with 0 decls, 0 foreign names, 0 exports). A crate with no build script and this exact table
+/// contributes nothing to the native link closure.
+const EMPTY_LINK_TABLE: [u8; 20] = [
+    native_links::TABLE_MAGIC[0],
+    native_links::TABLE_MAGIC[1],
+    native_links::TABLE_MAGIC[2],
+    native_links::TABLE_MAGIC[3],
+    native_links::TABLE_FORM.to_le_bytes()[0],
+    native_links::TABLE_FORM.to_le_bytes()[1],
+    0, 0, // state = 0 (table), reserved = 0
+    0, 0, 0, 0, // decls = 0
+    0, 0, 0, 0, // foreign = 0
+    0, 0, 0, 0, // exports = 0
+];
+
+/// Whether `c` contributes to the native image: a build script, or a link table other than the
+/// canonical empty state-0 table (decls, foreign roots, Rust exports, a refusal, or malformed
+/// bytes that `open_table` must still refuse).
+#[inline]
+fn contributes_native(c: &CrateIn<'_>) -> bool {
+    c.script.is_some() || c.table != EMPTY_LINK_TABLE
+}
 
 /// The reserve of the image's scratch frame: the tables opened, the link line, the plan, the
 /// layout and the image's bytes (a native script's archive is mapped, never copied here).
@@ -685,15 +710,22 @@ fn platform_code(platform: Platform) -> u8 {
     }
 }
 
-/// The store key of the image of `program` linking `crates` (the module's THE KEY): from the
-/// inputs alone, before the work. `sdk`: the macOS SDK's identity (`None` on Linux), whose
-/// stubs state the libraries' install names.
-pub(crate) fn image_key(program: Name, platform: Platform, producer: &ProducerId<Whole>, crates: &[CrateIn<'_>], sdk: Option<blaze_apple_sdk::SdkId>) -> Key {
+/// The store key of the native image linking `crates` (content-addressed by native link inputs
+/// alone, before the work): excludes the program's identity and pure-Rust crates with empty link
+/// tables and no build script so binaries/tests sharing a native closure share one store record
+/// and one dylib file (`v2/run/records/<key>`). `sdk`: the macOS SDK's identity (`None` on Linux),
+/// whose stubs state the libraries' install names.
+pub(crate) fn image_key(platform: Platform, producer: &ProducerId<Whole>, crates: &[CrateIn<'_>], sdk: Option<blaze_apple_sdk::SdkId>) -> Key {
     let mut h = blaze_ids::Hasher::new(KEY_FORM);
-    h.update(&[program.kind as u8]).update(&program.subject.0);
     h.update(&[platform_code(platform)]).update(&producer.id().0);
-    h.update(&(crates.len() as u64).to_le_bytes());
-    for c in crates.iter() {
+    let contributing = crates.iter().filter(|c| contributes_native(c)).count();
+    h.update(&u64::try_from(contributing).unwrap_or(u64::MAX).to_le_bytes());
+    for (idx, c) in crates.iter().enumerate() {
+        if !contributes_native(c) {
+            continue;
+        }
+        // Only the root crate's own build script has `rustc-link-arg` validated (natives.rs `link_line`).
+        h.update(&[u8::from(idx == 0 && c.script.is_some())]);
         h.update(&(c.package.len() as u64).to_le_bytes()).update(c.package.as_bytes());
         h.update(&[c.links.kind as u8]).update(&c.links.subject.0).update(&native_links::table_digest(c.table).0);
         match c.script {
@@ -746,7 +778,6 @@ fn held<'w>(text: &str, ask: &NativeAsk<'w>) -> &'w str {
 struct PreparedCrates<'r, 's> {
     platform: Platform,
     sdk: Option<blaze_apple_sdk::Sdk<'r>>,
-    program: Name,
     crates: Vec<CrateIn<'s>, &'s Frame>,
 }
 
@@ -795,7 +826,7 @@ fn prepare_crates<'r, 'm: 's, 's>(
     let Some(root) = (0..list.len()).find(|r| list.key(*r) == first.key) else {
         return Err(NativeError::NotListed { krate: first.key });
     };
-    let program = match list.root(root).strip_prefix("/0/") {
+    let _program = match list.root(root).strip_prefix("/0/") {
         Some(path) if native_image::linked(&list, root) => native_image::program_name(path),
         _ => return Err(NativeError::NotAProgram { package: held(list.name(root), ask) }),
     };
@@ -922,7 +953,7 @@ fn prepare_crates<'r, 'm: 's, 's>(
             groups: &groups,
         }));
     }
-    Ok(PreparedCrates { platform, sdk, program, crates })
+    Ok(PreparedCrates { platform, sdk, crates })
 }
 
 /// THE CONTRACT OF E3: the native image of the program whose crates are `closure`, found by its
@@ -945,7 +976,7 @@ pub(crate) fn image_for<'r>(
     let prepared = prepare_crates(&cx, standing, closure, watch, &scratch)?;
     let ask = &standing.native;
     let store: &mut dyn Store<'_> = &mut *standing.store;
-    let image = image_in(&cx, &mut OnStore(store), prepared.program, &prepared.crates, prepared.platform, prepared.sdk, ask, &scratch)?;
+    let image = image_in(&cx, &mut OnStore(store), &prepared.crates, prepared.platform, prepared.sdk, ask, &scratch)?;
     // Read back in place (found or just put: the store lends its own puts), for its start.
     let gone = || NativeError::Send { words: "the image's record does not read back from the store just after `image_in`" };
     let bytes = OnStore(store).get(&cx, image.key).map_err(NativeError::Store)?.ok_or_else(gone)?;
@@ -1058,15 +1089,15 @@ fn table_of<'m, 'w>(cx: &Cx, store: &mut dyn Store<'m>, scope: &Input, package: 
     }
 }
 
-/// The image of `program` linking `crates` (link order, the program's crate first): found at
-/// [`image_key`] in `store`, else made in `scratch` and put there. The record found is checked
-/// once to be this program's and these inputs' (its name and source), never made again over.
-/// `sdk`: the macOS SDK whose stubs name the libraries (`None` on Linux).
+/// The native image linking `crates` (link order, the program's crate first): found at
+/// [`image_key`] in `store`, else made in `scratch` and put there. Content-addressed by native
+/// link inputs only (never the program name), so binaries and tests sharing a native closure
+/// share one record and one dylib file. `sdk`: the macOS SDK whose stubs name the libraries
+/// (`None` on Linux).
 #[expect(clippy::too_many_arguments, reason = "each is one input of the image or of its key, named at the call")]
 pub(crate) fn image_in<'w>(
     cx: &Cx,
     store: &mut dyn ImageStore<'_>,
-    program: Name,
     crates: &[CrateIn<'_>],
     platform: Platform,
     sdk: Option<blaze_apple_sdk::Sdk<'_>>,
@@ -1082,15 +1113,16 @@ pub(crate) fn image_in<'w>(
         (Platform::MacosArm64, None) => return Err(NativeError::Sdk { words: "none was handed to the image (engine_native.rs `image_in`)" }),
         (Platform::LinuxArm64, _) => None,
     };
-    let key = image_key(program, platform, &ask.producer, crates, sdk.map(|sdk| sdk.identity()));
+    let key = image_key(platform, &ask.producer, crates, sdk.map(|sdk| sdk.identity()));
+    let record_name = Name::new(Kind::Native, key.0);
     if let Some(bytes) = store.get(&cx, key).map_err(NativeError::Store)? {
         let view = match blaze_drive::record::open(bytes) {
             Ok(Stored::Whole(view)) => view,
             Ok(Stored::Shape(_)) => return Err(NativeError::Damaged { key, why: "a shape record, which holds no image" }),
             Err(_) => return Err(NativeError::Damaged { key, why: "bytes that are no drive record" }),
         };
-        if view.name != program || view.source != key.0 {
-            return Err(NativeError::Damaged { key, why: "the record of another program or of other inputs" });
+        if view.name != record_name || view.source != key.0 {
+            return Err(NativeError::Damaged { key, why: "the record of another native image or of other inputs" });
         }
         if view.payload.is_empty() {
             return Err(NativeError::Damaged { key, why: "an empty image (a program with no C input still has one)" });
@@ -1141,9 +1173,12 @@ pub(crate) fn image_in<'w>(
     if let Err(error) = native_links::program_image(&linked, &installs, platform, &ask.producer, blaze_hash::FixedState, &mut image, erased.bump()) {
         return Err(NativeError::Link { what: "the program's native image", words: held(bstd::mem::format_in!(scratch, "{error:?}").as_str(), ask) });
     }
-    // What it read, in link order: each crate's table (by its digest) and its script's run.
+    // What it read, in link order: each native-contributing crate's table (by its digest) and
+    // its script's run. Pure-Rust crates with empty link tables and no build script are omitted
+    // so two programs sharing a native closure write identical record bytes under one key
+    // (rule 21, rule 25).
     let mut reads = Vec::with_capacity_in(crates.len() * 2, scratch);
-    for c in crates.iter() {
+    for c in crates.iter().filter(|c| contributes_native(c)) {
         reads.push((c.links, native_links::table_digest(c.table)));
         if let Some(script) = c.script {
             reads.push((script.name, script.out));
@@ -1152,7 +1187,7 @@ pub(crate) fn image_in<'w>(
     let encoded = crate::store::record_codec::encode_selective_in(image.as_slice(), scratch)
         .map_err(|why| NativeError::Link { what: "compressing the program's native image", words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) })?;
     let stored_payload = encoded.as_slice();
-    let head = blaze_drive::record::write_plain_head(program, key.0, out, &reads, stored_payload.len(), alloc);
+    let head = blaze_drive::record::write_plain_head(record_name, key.0, out, &reads, stored_payload.len(), alloc);
     store.put_parts(&cx, key, &[head.as_slice(), stored_payload]).map_err(NativeError::Store)?;
     Ok(Image { key, made: true, bytes: image.len() })
 }
@@ -1202,7 +1237,6 @@ mod tests {
 
     use blaze_build_script::instr::OutputLimits;
     use blaze_build_script::outputs::Outputs;
-    use blaze_drive::Kind;
     use blaze_ids::producer::Producers;
     use bstd::io::{Io, Limits, SimWorld};
 
@@ -1381,7 +1415,7 @@ mod tests {
     fn try_image<'f>(f: &'f Fixture, store: &mut Model, crates: &[CrateIn<'_>]) -> Result<Image, NativeError<'f>> {
         let cx = f.io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
         let ask = NativeAsk { producer: f.producer, home: None, words: &f.words, fs: f.io.need_fs().expect("files") };
-        image_in(&cx, store, native_image::program_name("src/main.rs"), crates, f.platform, Some(f.sdk), &ask, &f.scratch)
+        image_in(&cx, store, crates, f.platform, Some(f.sdk), &ask, &f.scratch)
     }
 
     fn image(f: &Fixture, store: &mut Model, crates: &[CrateIn<'_>]) -> Image {
@@ -1487,7 +1521,7 @@ mod tests {
         let hit = image(&f, &mut two, &crates);
         assert!(!hit.made && hit.key == a.key && two.image(hit.key) == one.image(a.key), "the hit's image is not the fresh one");
         let other = fixture(b"engine_native restore: another producer");
-        assert_ne!(image_key(native_image::program_name("src/main.rs"), other.platform, &other.producer, &crates, sdk_key(&other)), a.key, "control: the producer is not in the key");
+        assert_ne!(image_key(other.platform, &other.producer, &crates, sdk_key(&other)), a.key, "control: the producer is not in the key");
         std::println!("engine_native: two homes, one key, equal bytes ({})", a.bytes);
     }
 
@@ -1497,7 +1531,7 @@ mod tests {
     fn a_damaged_record_is_refused_by_its_key() {
         let f = fixture(b"engine_native damaged");
         let crates = [CrateIn { package: "app", links: links(1), table: leak(table(&[])), script: None }];
-        let key = image_key(native_image::program_name("src/main.rs"), f.platform, &f.producer, &crates, sdk_key(&f));
+        let key = image_key(f.platform, &f.producer, &crates, sdk_key(&f));
         let mut store = Model::default();
         store.held.push((key, &b"not a record"[..]));
         match try_image(&f, &mut store, &crates) {
@@ -1571,8 +1605,7 @@ mod tests {
             Err(NativeError::Stub { package: "app", library: "`-lz`", why: StubWhy::Form(_), .. }) => {}
             other => panic!("a stub of no form was not refused: {:?}", other.map(|image| image.key)),
         }
-        let program = native_image::program_name("src/main.rs");
-        let key = |sdk: blaze_apple_sdk::Sdk<'static>| image_key(program, f.platform, &f.producer, &crates, Some(sdk.identity()));
+        let key = |sdk: blaze_apple_sdk::Sdk<'static>| image_key(f.platform, &f.producer, &crates, Some(sdk.identity()));
         let tools = sdk_at("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#, BUILD_26B118);
         let older = sdk_at("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk", r#"{"Version":"26.5"}"#, "<key>ProductBuildVersion</key><string>25F70</string>");
         let beta = sdk_at("/Library/Developer/CommandLineTools/SDKs/MacOSX27.2.sdk", r#"{"Version":"27.2"}"#, "<key>ProductBuildVersion</key><string>26B5044k</string>");
@@ -1595,7 +1628,6 @@ mod tests {
         let bare = image_in(
             &cx,
             &mut store,
-            native_image::program_name("src/main.rs"),
             &[CrateIn { package: "app", links: links(1), table: empty, script: None }],
             Platform::LinuxArm64,
             None,
@@ -1607,7 +1639,6 @@ mod tests {
         let linked_m = image_in(
             &cx,
             &mut store,
-            native_image::program_name("src/main.rs"),
             &[CrateIn { package: "app", links: links(1), table: with_m, script: None }],
             Platform::LinuxArm64,
             None,
@@ -1721,5 +1752,56 @@ mod tests {
             other => panic!("corrupted BZR1 BNL2 record must be refused as Damaged, got {:?}", other.map(|img| img.key)),
         }
         assert_eq!(corrupted_store.puts, 0, "must not overwrite corrupted record");
+    }
+
+    /// Two distinct binaries/tests with different program crates and pure-Rust intermediate deps
+    /// but identical native link inputs produce the exact same `image_key`, share one store record
+    /// (zero duplicate links or dylibs), and write byte-identical records across fresh stores.
+    /// CONTROL: a program crate that itself contributes native `#[link]` or a build script moves
+    /// `image_key`.
+    #[test]
+    fn different_programs_with_identical_native_closure_share_one_key_and_image() {
+        let f = fixture(b"engine_native dedup by native inputs");
+        let empty = leak(table(&[]));
+        let with_z = leak(table(&["z"]));
+        let run = script(3, leak(script_payload(b"cargo::rustc-link-lib=z\n")));
+        let crates_a = [
+            CrateIn { package: "bin_alpha@0.1.0", links: links(10), table: empty, script: None },
+            CrateIn { package: "pure_helper_a@0.1.0", links: links(11), table: empty, script: None },
+            CrateIn { package: "zsys@1.0.0", links: links(2), table: with_z, script: Some(run) },
+        ];
+        let crates_b = [
+            CrateIn { package: "test_beta@0.1.0", links: links(20), table: empty, script: None },
+            CrateIn { package: "zsys@1.0.0", links: links(2), table: with_z, script: Some(run) },
+        ];
+
+        let key_a = image_key(f.platform, &f.producer, &crates_a, sdk_key(&f));
+        let key_b = image_key(f.platform, &f.producer, &crates_b, sdk_key(&f));
+        assert_eq!(key_a, key_b, "two programs with identical native link closure must share one image_key");
+
+        // Shared store: second program hits the first program's record with 0 new puts.
+        let mut shared = Model::default();
+        let first = image(&f, &mut shared, &crates_a);
+        assert!(first.made && shared.puts == 1);
+        let second = image(&f, &mut shared, &crates_b);
+        assert_eq!((second.key, second.made, second.bytes, shared.puts), (first.key, false, first.bytes, 1));
+
+        // Fresh store rule 21/25: both programs emit byte-identical records (header + LC_ID_DYLIB + payload).
+        let mut fresh_b = Model::default();
+        let made_b = image(&f, &mut fresh_b, &crates_b);
+        assert_eq!(made_b.key, first.key);
+        assert_eq!(shared.held[0].1, fresh_b.held[0].1, "records under one native key must be byte-equal");
+        assert_eq!(shared.image(first.key), fresh_b.image(made_b.key), "dylib bytes including LC_ID_DYLIB must be identical");
+
+        // CONTROL: a program crate that itself contributes a native link decl or build script moves the key.
+        let crates_native_prog = [
+            CrateIn { package: "bin_gamma@0.1.0", links: links(30), table: with_z, script: None },
+            CrateIn { package: "zsys@1.0.0", links: links(2), table: with_z, script: Some(run) },
+        ];
+        assert_ne!(
+            image_key(f.platform, &f.producer, &crates_native_prog, sdk_key(&f)),
+            key_a,
+            "control: a program crate with its own native link table must produce a distinct image_key"
+        );
     }
 }

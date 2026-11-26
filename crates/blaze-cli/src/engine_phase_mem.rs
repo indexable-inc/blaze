@@ -193,14 +193,13 @@ impl Drop for RequestMem {
 
 /// Phases that committed at least this many bytes trigger an inter-phase `blaze-mem` trim
 /// (`MADV_FREE_REUSABLE`/`MADV_DONTNEED`) so idle worker shelves, span pools, and warm chunk
-/// caches return to the OS before the next heavy cold phase peaks; warm/edit phases stay below
-/// this threshold and pay zero trim overhead.
-const PHASE_TRIM_THRESHOLD: u64 = 16 << 20;
+/// caches return to the OS before the next heavy cold phase peaks; tiny warm/edit phases stay
+/// below this threshold and pay zero trim overhead.
+const PHASE_TRIM_THRESHOLD: u64 = 4 << 20;
 
 /// Warm-chunk threshold for triggering inter-phase cooling when the phase arena itself is small:
-/// 64 MiB avoids cooling/re-committing spans across hundreds of small `Scripts`/`Names` phases
-/// while still shedding memory before heavy `Heads`/`Bodies` peaks.
-const CHUNK_TRIM_THRESHOLD: u64 = 64 << 20;
+/// 16 MiB sheds dirty warm chunks after small/medium phases before heavy `Heads`/`Bodies` peaks.
+const CHUNK_TRIM_THRESHOLD: u64 = 16 << 20;
 
 /// One phase's arena (the module's doc).
 pub(crate) struct PhaseMem<'r> {

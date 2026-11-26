@@ -2638,18 +2638,27 @@ impl Listings {
         let _ = self.scope_keys.pin().try_insert(key, at);
     }
 
-    /// The record at `key`: one this request holds, else the store's, copied to the heap.
+    /// The record at `key`: one this request holds, else the store's (transparently decoding a
+    /// `BZR1` envelope when compressed), copied/decoded onto the request heap.
     fn stored(&self, key: Key) -> Found {
         if let Some(held) = self.held.pin().get(&key).copied() {
             return Found::Bytes(held.bytes);
         }
         let Some(snapshot) = self.snapshot.as_ref() else { return Found::NoStore };
         match snapshot.get(key) {
-            Ok(Some(bytes)) => {
-                let mut copy: Vec<u8, Alloc<'static>> = Vec::with_capacity_in(bytes.len(), self.heap.alloc());
-                copy.extend_from_slice(bytes);
-                Found::Bytes(copy.leak_static())
-            }
+            Ok(Some(bytes)) => match crate::store::record_codec::decode_if_envelope_in(
+                bytes,
+                crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+                self.heap.alloc(),
+            ) {
+                Ok(crate::store::record_codec::Decoded::Borrowed(raw)) => {
+                    let mut copy: Vec<u8, Alloc<'static>> = Vec::with_capacity_in(raw.len(), self.heap.alloc());
+                    copy.extend_from_slice(raw);
+                    Found::Bytes(copy.leak_static())
+                }
+                Ok(crate::store::record_codec::Decoded::Owned(decompressed)) => Found::Bytes(decompressed.leak_static()),
+                Err(_) => Found::Fault,
+            },
             Ok(None) => Found::Absent,
             Err(_) => Found::Fault,
         }
@@ -2894,8 +2903,11 @@ impl Listings {
         puts.extend(self.held.pin().iter().filter(|(key, held)| held.made && !put.contains(*key)).map(|(key, held)| (*key, held.bytes)));
         puts.sort_unstable_by_key(|(key, _)| *key);
         for (key, bytes) in puts.iter() {
-            ledger.put(stage, *key, &[*bytes], 0);
-            store.put(cx, *key, bytes)?;
+            let encoded = crate::store::record_codec::encode_selective_in(bytes, g)
+                .map_err(|_| CliError::Text { what: "a crate head listing record could not be compressed into BZR1 (engine_heads.rs `Listings::put_made`)" })?;
+            let stored = encoded.as_slice();
+            ledger.put(stage, *key, &[stored], 0);
+            store.put(cx, *key, stored)?;
             put.insert(*key);
         }
         Ok(u32::try_from(puts.len()).unwrap_or(u32::MAX))

@@ -1077,11 +1077,12 @@ impl<'a> Stored<'a> {
         total
     }
 
-    /// The page holding `name`'s row, asked by name for `ask` (counted in [`Stored::asks`] and
-    /// told by purpose in [`Stored::asked`]).
+    /// The page holding `name`'s row (or `READERS` entry for `Ask::Readers`, or arbitrary page for
+    /// `Ask::Witness`), asked by name for `ask` (counted in [`Stored::asks`] and told by purpose in
+    /// [`Stored::asked`]).
     pub(crate) fn named_page(&self, name: Name, ask: blaze_engine::Ask) -> Result<Option<&VerifiedPage<'a>>, PagesError> {
         self.note_ask(name, ask);
-        self.page_at(blaze_drive::answers::page_of(name, self.root.bits) as usize)
+        self.page_at(pages::page_for_ask(name, ask, self.root.bits) as usize)
     }
 
     /// Page `page`'s record under `key` from the snapshot, sealed by this request's `check`:
@@ -1266,7 +1267,7 @@ impl<'a> Stored<'a> {
 impl StoredPages for Stored<'_> {
     fn header(&self, name: Name) -> Result<Option<Header>, PagesError> {
         self.note_ask(name, blaze_engine::Ask::Header);
-        self.headers.header(name, |index| self.headers_at(index), || self.page_at(blaze_drive::answers::page_of(name, self.root.bits) as usize))
+        self.headers.header(name, |index| self.headers_at(index), || self.page_at(pages::content_page_of(name, self.root.bits) as usize))
     }
     fn page(&self, name: Name) -> Result<Option<&VerifiedPage<'_>>, PagesError> {
         self.named_page(name, blaze_engine::Ask::Unsaid)
@@ -1284,8 +1285,12 @@ impl StoredPages for Stored<'_> {
     }
 
     fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), blaze_engine::LastError>) -> Result<(), blaze_engine::LastError> {
+        // In `BER6`, `ROWS` live exclusively in the lower content half (`0 .. half_pages(bits)`).
         if !self.root.is_radix() {
-            for index in 0..self.root.pages.len() {
+            let content_pages = usize::try_from(pages::half_pages(self.root.bits))
+                .unwrap_or(self.root.pages.len())
+                .min(self.root.pages.len());
+            for index in 0..content_pages {
                 if let Some(page) = self.page_at(index).map_err(blaze_engine::LastError::Pages)? {
                     for name in page.row_names() {
                         visit(name)?;
@@ -1293,7 +1298,8 @@ impl StoredPages for Stored<'_> {
                 }
             }
         } else {
-            for (shard_idx, &shard_key) in self.root.page_shards.iter().enumerate() {
+            let content_shards = self.root.page_shards.len() / 2;
+            for (shard_idx, &shard_key) in self.root.page_shards.iter().take(content_shards).enumerate() {
                 if shard_key == Key::default() {
                     continue;
                 }
@@ -2121,9 +2127,21 @@ fn save<'m, D: Driver, S: Sharing>(
         keys: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'a>>,
         scopes: blaze_own::Vec<(Name, Key), SharedAlloc<'a>>,
     }
-    let page_recs: blaze_own::Vec<(Key, &[(Name, Key)]), SharedAlloc<'_>> =
-        blaze_own::Vec::from_iter_in(encoded.page_records(), alloc);
-    let prepared = run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer reach", &page_recs, alloc, |&(page, rows)| {
+    // Fast-path pages with 0 `RECORDS` (including all upper-half `READERS`-only pages) directly to
+    // a minimal 32-byte `index_beside(page, &[page])` with zero alloc/sort/dedup and zero worker
+    // fan-out, preserving 100% `blaze-cas` `IndexedRoot` GC reachability while cutting `Index`
+    // beside-record writes on reader-edge edits from megabytes to ~32 B/page.
+    let mut nonempty_recs: blaze_own::Vec<(Key, &[(Name, Key)]), SharedAlloc<'_>> =
+        blaze_own::Vec::new_in(alloc);
+    let mut empty_pages: blaze_own::Vec<Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+    for (page, rows) in encoded.page_records() {
+        if rows.is_empty() {
+            empty_pages.push(page);
+        } else {
+            nonempty_recs.push((page, rows));
+        }
+    }
+    let prepared = run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer reach", &nonempty_recs, alloc, |&(page, rows)| {
         let mut keys: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> =
             blaze_own::Vec::with_capacity_in(rows.len().saturating_add(1), alloc);
         let mut scopes: blaze_own::Vec<(Name, Key), SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
@@ -2149,7 +2167,16 @@ fn save<'m, D: Driver, S: Sharing>(
         alloc,
         capacity: Some(task_puts),
     });
-    for (item, &(_, rows)) in prepared.into_iter().zip(page_recs.iter()) {
+    for page in empty_pages {
+        let cas_page = blaze_cas::Key(page.0);
+        let beside = sink
+            .lent
+            .index_beside(cas_page, &[cas_page])
+            .map_err(|error| reach_error(PublishError::Cas(error)))?;
+        indexed_beside.insert(page.0.0, beside);
+        saved.puts += 1;
+    }
+    for (item, &(_, rows)) in prepared.into_iter().zip(nonempty_recs.iter()) {
         for &(name, record) in rows {
             if sink.store.is_toolchain(name) {
                 toolchain_records.push(record);
@@ -3091,16 +3118,23 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         capacity: Some(usize::try_from(encoded.task_puts).unwrap_or(0)),
     });
     for (page, page_rows) in encoded.page_records() {
-        records.clear();
-        scopes.clear();
-        records.push(page);
-        for &(name, record) in page_rows {
-            records.push(record);
-            if name.kind == blaze_drive::Kind::CrateScope {
-                scopes.push((name, record));
+        let beside = if page_rows.is_empty() {
+            let cas_page = blaze_cas::Key(page.0);
+            sink.lent
+                .index_beside(cas_page, &[cas_page])
+                .map_err(|error| reach_error(crate::engine_answer_rows::PublishError::Cas(error)))?
+        } else {
+            records.clear();
+            scopes.clear();
+            records.push(page);
+            for &(name, record) in page_rows {
+                records.push(record);
+                if name.kind == blaze_drive::Kind::CrateScope {
+                    scopes.push((name, record));
+                }
             }
-        }
-        let beside = sink.index_rows_into(page, &records, &scopes, &mut cas_buf).map_err(reach_error)?;
+            sink.index_rows_into(page, &records, &scopes, &mut cas_buf).map_err(reach_error)?
+        };
         indexed_beside.insert(page.0.0, beside);
     }
     let index_of = |p: Key| {
@@ -4004,12 +4038,12 @@ mod reach_shard_tests {
         // so editing those 3 tasks touches EXACTLY 4 task pages (3 task pages + 1 file page) across
         // 4 distinct leaf shards!
         let edited_file = Name::new(Kind::FileItems, ContentId::of("radix e2e file", &0u32.to_le_bytes()));
-        let file_page = blaze_drive::answers::page_of(edited_file, 16) as usize;
+        let file_page = pages::content_page_of(edited_file, 16) as usize;
         let mut picked: std::vec::Vec<Name> = std::vec::Vec::new();
         let mut used_shards = std::collections::BTreeSet::new();
         used_shards.insert(Root::shard_of(file_page).0);
         for &n in cold.answer.by_file[&edited_file].iter() {
-            let p = blaze_drive::answers::page_of(n, 16) as usize;
+            let p = pages::content_page_of(n, 16) as usize;
             let (s, _) = Root::shard_of(p);
             if used_shards.insert(s) {
                 picked.push(n);

@@ -35,10 +35,10 @@ use crate::store::StoreFailure;
 /// store just made, so the look runs once in its life.
 pub(crate) const OTHER_FORMS_LOOKED: &str = "blaze.other-forms-looked";
 
-/// How long a store of another form is kept after its last use: the roster's window
-/// (roster.rs `WINDOW_DAYS`, 30), the time a binary that ran is taken as live. A blaze of that
-/// form that still runs uses it, and so keeps it.
-pub(crate) const EXPIRY_DAYS: u64 = crate::roster::WINDOW_DAYS as u64;
+/// How long a store of another form is kept after its last use: 3 days, so superseded store
+/// formats (like `f5s2`/`f5s3`) do not linger for a month consuming tens of gigabytes. A blaze
+/// of that form that still runs updates its head on every commit, and so keeps it alive.
+pub(crate) const EXPIRY_DAYS: u64 = 3;
 
 const DAY_NS: u64 = 86_400 * 1_000_000_000;
 
@@ -155,11 +155,11 @@ pub(crate) fn list(cx: &Cx, blaze: &Dir<ReadWrite>, root: &Path) -> Result<Other
 /// only (fs.rs, `Stamp`). That rule guards a PROOF: an equal stamp is taken to say "these
 /// bytes did not change", which a racy write within the file system's clock step could make
 /// false, so nothing may read one field of it, or order by it, to skip work. This is no proof
-/// and skips nothing: it is a coarse age, read against a 30-day period, of data that is
+/// and skips nothing: it is a coarse age, read against a 3-day period, of data that is
 /// derived. Nothing better is known of an other form's use: this blaze cannot read that
 /// store's head or roots (they are of a form it does not read, which is why it is there), and
 /// the roster (roster.rs) records binaries, not the forms they write. Each way it can be wrong
-/// is safe: a clock step of seconds is nothing against 30 days; a time in the future (a clock
+/// is safe: a clock step of seconds is nothing against 3 days; a time in the future (a clock
 /// set back) keeps the store ([`expired`]); a store an old blaze still uses is rewritten (its
 /// head) on each of that blaze's commits, so it stays younger than the period while that blaze
 /// runs; and one removed too early costs that blaze a rebuild of its own records, never a

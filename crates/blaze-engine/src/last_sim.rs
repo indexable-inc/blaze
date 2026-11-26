@@ -537,22 +537,31 @@ fn twin_engines_answer_alike() {
     check(SimConfig::cases(300), |tape| twin(tape, Plant::None));
 }
 
-/// A small DAG fits on one real answer page. Reopen the page after each publication,
-/// including edits which rewrite observations while retaining the same reader edges.
+/// A small DAG fits on `bits == 1`: page 0 holds content (`ROWS`/`CELLS`/etc.), page 1 holds
+/// `READERS`. Reopen both pages after each publication, including edits which rewrite
+/// observations while retaining the same reader edges.
 struct DagPage<'b> {
-    page: crate::pages::VerifiedPage<'b>,
+    content: Option<crate::pages::VerifiedPage<'b>>,
+    readers: Option<crate::pages::VerifiedPage<'b>>,
     headers: BTreeMap<usize, crate::pages::IndexedHeaders<'b>>,
 }
 
 impl crate::StoredPages for DagPage<'_> {
     fn page(&self, _: Name) -> Result<Option<&crate::pages::VerifiedPage<'_>>, crate::pages::PagesError> {
-        Ok(Some(&self.page))
+        Ok(self.content.as_ref())
+    }
+
+    fn page_for(&self, name: Name, ask: crate::Ask) -> Result<Option<&crate::pages::VerifiedPage<'_>>, crate::pages::PagesError> {
+        Ok(match crate::pages::page_for_ask(name, ask, 1) {
+            0 => self.content.as_ref(),
+            _ => self.readers.as_ref(),
+        })
     }
 
     fn header(&self, name: Name) -> Result<Option<crate::pages::Header>, crate::pages::PagesError> {
         Ok(match crate::pages::HeaderPages::slot(name) {
             Some(slot) => self.headers.get(&slot).and_then(|headers| headers.get(name)),
-            None => crate::pages::Header::from_page(&self.page, name),
+            None => self.content.as_ref().and_then(|page| crate::pages::Header::from_page(page, name)),
         })
     }
 
@@ -561,7 +570,10 @@ impl crate::StoredPages for DagPage<'_> {
     fn refusal(&self) -> Option<crate::pages::PagesError> { None }
 
     fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), LastError>) -> Result<(), LastError> {
-        self.page.row_names().try_for_each(visit)
+        if let Some(page) = self.content.as_ref() {
+            page.row_names().try_for_each(visit)?;
+        }
+        Ok(())
     }
 }
 
@@ -655,6 +667,11 @@ fn paged_dag(tape: &Tape) -> Result<(), Broke> {
         .map_err(|e| Broke::Harness(format!("cold DAG: {e}")))?;
     let mut memory = Kept::after(crate::SMap::new_in(alloc()), cold.answer, &cold.causes, crate::SMap::new_in(alloc()));
     let mut encoded = encode(&memory, None, alloc());
+    let mut page_bytes: BTreeMap<Key, StdVec<u8>> = encoded
+        .puts
+        .iter()
+        .map(|(k, v)| (*k, v.iter().copied().collect()))
+        .collect();
     let (mut header_keys, writes) = HeaderPages::encode(&memory, None, |_| Ok(None), alloc())
         .map_err(|e| Broke::Harness(format!("cold DAG headers: {e}")))?;
     let mut header_bytes: BTreeMap<_, _> = writes.into_iter().collect();
@@ -701,24 +718,34 @@ fn paged_dag(tape: &Tape) -> Result<(), Broke> {
             format!("DAG mask {mask:#b}: scope output {:?} -> {:?}, entry {scope_entry:?}", old[0], values[0])
         })?;
         let (next, (next_headers, writes)) = {
-            let bytes = |key| encoded.puts.iter().find(|(k, _)| *k == key).expect("this edit rewrites the single page and root").1.as_slice();
+            let bytes = |key: Key| page_bytes.get(&key).expect("every live page and root is in store").as_slice();
             // Each record hashed against its key (no store proves them here), then each page and
             // shard walked whole: the simulation reads in verify mode.
             fn sealed(key: Key, bytes: &[u8]) -> Result<Sealed<'_>, Broke> {
                 Sealed::hashed(key, bytes).map_err(|torn| Broke::Oracle(format!("DAG record {key:?}: {torn:?}")))
             }
             let root = decode_root(sealed(encoded.root, bytes(encoded.root))?, alloc()).map_err(|e| Broke::Oracle(format!("DAG root: {e}")))?;
-            assert_eq!(root.bits, 0, "the small DAG fits on one page");
-            let key = root.pages[0];
-            let page = VerifiedPage::open_whole(sealed(key, bytes(key))?, 0, root.bits).map_err(|e| Broke::Oracle(format!("DAG page: {e}")))?;
+            assert_eq!(root.bits, 1, "the small DAG fits on bits=1 (page 0 content, page 1 readers)");
+            let content_key = root.pages[0];
+            let content = if content_key != Key::default() {
+                Some(VerifiedPage::open_whole(sealed(content_key, bytes(content_key))?, 0, root.bits).map_err(|e| Broke::Oracle(format!("DAG content page: {e}")))?)
+            } else {
+                None
+            };
+            let readers_key = root.pages[1];
+            let readers_page = if readers_key != Key::default() {
+                Some(VerifiedPage::open_whole(sealed(readers_key, bytes(readers_key))?, 1, root.bits).map_err(|e| Broke::Oracle(format!("DAG readers page: {e}")))?)
+            } else {
+                None
+            };
             let mut headers = BTreeMap::new();
             for (slot, &key) in header_keys.keys.iter().enumerate().filter(|(_, key)| **key != Key::default()) {
                 let shard = IndexedHeaders::open_whole(sealed(key, &header_bytes[&key])?, slot).map_err(|e| Broke::Oracle(format!("DAG header {slot}: {e}")))?;
                 headers.insert(slot, shard);
             }
-            let stored = DagPage { page, headers };
+            let stored = DagPage { content, readers: readers_page, headers };
             for (&name, &cause) in memory.causes.iter() {
-                let saved = stored.page.cause(name);
+                let saved = stored.content.as_ref().and_then(|page| page.cause(name));
                 oracle(saved == Some(cause), || format!("before DAG step {step}: {name:?} expected {cause:?}, page {saved:?}"))?;
             }
             let view = dag_request(Answer::from_pages(&stored, root.serial, alloc()), &files, outline, scope, &values, &readers)
@@ -728,7 +755,7 @@ fn paged_dag(tape: &Tape) -> Result<(), Broke> {
             })?;
             let changed = Kept::after(crate::SMap::new_in(alloc()), view.answer, &view.causes, crate::SMap::new_in(alloc()));
             let next = encode_changes(&changed, &root, alloc(), |k| {
-                encoded.puts.iter().find(|(pk, _)| *pk == k).map(|(_, b)| Sealed::hashed(k, b))
+                page_bytes.get(&k).map(|b| Sealed::hashed(k, b))
             })
             .map_err(|e| Broke::Oracle(format!("publish DAG step {step}: {e}")))?;
             let headers = HeaderPages::encode(&changed, Some(&header_keys), |slot| Ok(stored.headers.get(&slot)), alloc())
@@ -740,6 +767,9 @@ fn paged_dag(tape: &Tape) -> Result<(), Broke> {
         oracle(next.root == expected_root, || {
             format!("after DAG step {step}, mask {mask:#b}: in-memory root {expected_root:?}, published {:?}", next.root)
         })?;
+        for (k, v) in next.puts.iter() {
+            page_bytes.insert(*k, v.iter().copied().collect());
+        }
         encoded = next;
         header_keys = next_headers;
         header_bytes.extend(writes);
@@ -801,7 +831,7 @@ fn rows_touched_by_one_edit() {
     assert!(touched * 20 < total as u64, "rows touched {touched} of {total}: one edit asked for a twentieth of the answer or more");
 }
 
-/// Growing from a tiny `bits = 0` base (like `tool-base`) to a large workspace must re-page
+/// Growing from a tiny `bits = 1` base (like `tool-base`) to a large workspace must re-page
 /// inside `encode_changes` and produce the exact same root as a full `encode`.
 #[test]
 fn encode_changes_repages_when_growing_from_small_base() {
@@ -809,16 +839,26 @@ fn encode_changes_repages_when_growing_from_small_base() {
     use crate::pages::{Kept, Sealed, VerifiedPage, decode_root, encode, encode_changes};
 
     struct SmallBase<'b> {
-        page: VerifiedPage<'b>,
+        content: Option<VerifiedPage<'b>>,
+        readers: Option<VerifiedPage<'b>>,
     }
     impl crate::StoredPages for SmallBase<'_> {
         fn page(&self, _: Name) -> Result<Option<&VerifiedPage<'_>>, crate::pages::PagesError> {
-            Ok(Some(&self.page))
+            Ok(self.content.as_ref())
+        }
+        fn page_for(&self, name: Name, ask: crate::Ask) -> Result<Option<&VerifiedPage<'_>>, crate::pages::PagesError> {
+            Ok(match crate::pages::page_for_ask(name, ask, 1) {
+                0 => self.content.as_ref(),
+                _ => self.readers.as_ref(),
+            })
         }
         fn finding(&self, _: Name) -> Option<u32> { None }
         fn refusal(&self) -> Option<crate::pages::PagesError> { None }
         fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), LastError>) -> Result<(), LastError> {
-            self.page.row_names().try_for_each(visit)
+            if let Some(page) = self.content.as_ref() {
+                page.row_names().try_for_each(visit)?;
+            }
+            Ok(())
         }
     }
 
@@ -833,15 +873,16 @@ fn encode_changes_repages_when_growing_from_small_base() {
     let base_res = dag_request(Answer::new_in(alloc()), &[(outline, &small_plans)], outline, scope, &values, &small_readers).expect("small base");
     let base_kept = Kept::after(crate::SMap::new_in(alloc()), base_res.answer, &base_res.causes, crate::SMap::new_in(alloc()));
     let base_encoded = encode(&base_kept, None, alloc());
-    assert_eq!(base_encoded.bits, 0, "small base fits on one page");
+    assert_eq!(base_encoded.bits, 1, "small base fits on bits=1 (page 0 content, page 1 readers)");
     let mut base_bytes: crate::SMap<'_, Key, crate::SVec<'_, u8>> = crate::SMap::new_in(alloc());
     for (k, v) in base_encoded.puts.iter() {
         base_bytes.insert(*k, crate::SVec::from_slice_in(v, alloc()));
     }
     let base_root = decode_root(Sealed::hashed(base_encoded.root, &base_bytes[&base_encoded.root]).expect("base root"), alloc()).expect("decode base root");
-    let base_page_key = base_root.pages[0];
+    let base_content_key = base_root.pages[0];
+    let base_readers_key = base_root.pages[1];
 
-    // Grow to 220 bodies (each reading all 5 selectors -> > 64 KiB -> bits >= 1).
+    // Grow to 220 bodies (each reading all 5 selectors -> > 64 KiB -> bits >= 2).
     let mut big_readers: StdVec<StdVec<usize>> = StdVec::from([StdVec::from([0])]);
     let mut big_plans = small_plans;
     for i in 1..220 {
@@ -852,8 +893,13 @@ fn encode_changes_repages_when_growing_from_small_base() {
     let big_files = [(outline, big_plans.as_slice())];
     let eager = dag_request(base_kept.answer, &big_files, outline, scope, &values, &big_readers).expect("eager big");
     let repaged = {
-        let base_page = VerifiedPage::open(Sealed::hashed(base_page_key, &base_bytes[&base_page_key]).expect("base page"), 0, 0).expect("open base page");
-        let stored = SmallBase { page: base_page };
+        let content = (base_content_key != Key::default()).then(|| {
+            VerifiedPage::open(Sealed::hashed(base_content_key, &base_bytes[&base_content_key]).expect("content page"), 0, 1).expect("open content page")
+        });
+        let readers = (base_readers_key != Key::default()).then(|| {
+            VerifiedPage::open(Sealed::hashed(base_readers_key, &base_bytes[&base_readers_key]).expect("readers page"), 1, 1).expect("open readers page")
+        });
+        let stored = SmallBase { content, readers };
         let paged = dag_request(Answer::from_pages(&stored, base_root.serial, alloc()), &big_files, outline, scope, &values, &big_readers).expect("paged big");
         assert_eq!(&eager.entered[..], &paged.entered[..], "same tasks entered on paged vs in-memory base");
         let paged_kept = Kept::after(crate::SMap::new_in(alloc()), paged.answer, &paged.causes, crate::SMap::new_in(alloc()));

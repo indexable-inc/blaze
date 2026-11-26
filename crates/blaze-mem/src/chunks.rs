@@ -49,14 +49,13 @@ pub const MAX_NODES: u32 = 16;
 
 const COUNT: u32 = (SPACE_BYTES / CHUNK) as u32;
 
-/// The warm chunks a space keeps after its cache passed [`WARM_MOST`]: 256 MiB a place (a worker's
-/// frames shelve their own warm chunks, `frame::SHELF`, before giving back to the space). Sized so
-/// 64–128 cores per NUMA socket absorb concurrent task bursts without thrashing `madvise` purges,
-/// while still bounding idle dirty RSS across cold build phases.
-pub const WARM_KEEP: u32 = 128;
+/// The warm chunks a space keeps after its cache passed [`WARM_MOST`]: 48 MiB a place (a worker's
+/// frames shelve their own warm chunks, `frame::SHELF`, before giving back to the space). Balances
+/// bounded idle dirty RAM against avoiding intra-wave madvise/re-fault thrashing on 18+ cores.
+pub const WARM_KEEP: u32 = 24;
 
 /// The warm chunks past which a give trims the space's cache down to [`WARM_KEEP`]: twice it
-/// (256 chunks = 512 MiB a place), so a trim purges at least [`WARM_KEEP`] chunks at once, and a
+/// (48 chunks = 96 MiB a place), so a trim purges at least [`WARM_KEEP`] chunks at once, and a
 /// working set that swings under this purges none.
 pub const WARM_MOST: u32 = 2 * WARM_KEEP;
 

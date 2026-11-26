@@ -1341,7 +1341,7 @@ fn filter_whole_lines_for_scope<'a, 'm, D: blaze_core::Driver, S: crate::store::
                     // A body that stopped before recording reads (e.g. `FrameUsedUp`): classify by
                     // the `CrateScope` readers of its file when all agree on scope membership.
                     let surface = CellId { of: row.facts.file, cell: crate::engine_tasks::SURFACE };
-                    let Some(file_page) = stored.page(blaze_engine::pages::readers_slot(&surface)).map_err(crate::engine_answer::page_error)? else {
+                    let Some(file_page) = stored.page_for(blaze_engine::pages::readers_slot(&surface), blaze_engine::Ask::Readers).map_err(crate::engine_answer::page_error)? else {
                         return Ok(Skipped("whole-lines cert skipped: BodyCheck(0-reads) missing file readers page"));
                     };
                     let mut file_allowed = false;
@@ -1376,7 +1376,7 @@ fn filter_whole_lines_for_scope<'a, 'm, D: blaze_core::Driver, S: crate::store::
                         let mut allowed_file_count = 0usize;
                         let mut disallowed_file_count = 0usize;
                         let surface = CellId { of: row.facts.file, cell: crate::engine_tasks::SURFACE };
-                        if let Some(file_page) = stored.page(blaze_engine::pages::readers_slot(&surface)).map_err(crate::engine_answer::page_error)? {
+                        if let Some(file_page) = stored.page_for(blaze_engine::pages::readers_slot(&surface), blaze_engine::Ask::Readers).map_err(crate::engine_answer::page_error)? {
                             for reader in file_page.readers(&surface) {
                                 if reader.kind == Kind::CrateScope
                                     && let Some(&u) = crate_index.get(&reader)
@@ -1489,7 +1489,7 @@ fn filter_whole_lines_for_scope<'a, 'm, D: blaze_core::Driver, S: crate::store::
                     return Ok(Skipped("whole-lines cert skipped: Lint missing header"));
                 };
                 let surface = CellId { of: header.facts.file, cell: crate::engine_tasks::SURFACE };
-                let Some(file_page) = stored.page(blaze_engine::pages::readers_slot(&surface)).map_err(crate::engine_answer::page_error)? else {
+                let Some(file_page) = stored.page_for(blaze_engine::pages::readers_slot(&surface), blaze_engine::Ask::Readers).map_err(crate::engine_answer::page_error)? else {
                     return Ok(Skipped("whole-lines cert skipped: Lint missing file readers page"));
                 };
                 let mut any_allowed = false;
@@ -1513,7 +1513,7 @@ fn filter_whole_lines_for_scope<'a, 'm, D: blaze_core::Driver, S: crate::store::
             }
             Kind::FileItems => {
                 let surface = CellId { of: name, cell: crate::engine_tasks::SURFACE };
-                let file_page = stored.page(blaze_engine::pages::readers_slot(&surface)).map_err(crate::engine_answer::page_error)?;
+                let file_page = stored.page_for(blaze_engine::pages::readers_slot(&surface), blaze_engine::Ask::Readers).map_err(crate::engine_answer::page_error)?;
                 let mut any_allowed = false;
                 let mut any_disallowed = false;
                 if let Some(file_page) = file_page {
@@ -5727,9 +5727,9 @@ where
         && ![Stage::Units, Stage::Outlines, Stage::Scripts, Stage::Names].into_iter().any(|stage| engine.has_pending_stage(stage))
     {
         serve_found(rq, engine, store, read, records)?;
-        // Flush any remaining uncommitted Names/Outlines arena (< 64 MiB) before Heads/Bodies
-        // begin, so the final Names arena frees immediately and all downstream `CrateScope`
-        // reads hit committed file-backed segment mappings with zero `kept_arenas` pinning.
+        // Flush only large uncommitted Names/Outlines arenas (>= `STAGE_FLUSH_BYTES`, 16 MiB)
+        // before Heads/Bodies begin; small edits remain in the shared `InArena` (visible to all
+        // downstream readers and snapshots) and commit once durably in `after_answer`.
         store.flush_puts()?;
     }
     let mut phase = match prior.or_else(|| mixed.map(|task| task.planned.phase)) {
@@ -6464,6 +6464,69 @@ fn outlines_phase<'r>(rq: &mut Drive<'_, '_, 'r, '_, '_>, engine: &Engine<'r, Ev
     rq.pool.failed().map_err(CliError::Pool)
 }
 
+/// Overlays moved/failed `ImplBucket` rows from this request onto [`crate::engine_shelf_pages::StoredShelf`]:
+/// - Every crate whose `ImplBucket` task succeeded this request is already placed in
+///   `rq.bodies.shelf` (`ImplShelf`), which `TableSet::paged` checks BEFORE calling
+///   `ShelfSource::framed`.
+/// - Any crate whose `ImplBucket` task entered this request (recorded in `superseded`) and did not
+///   land in `rq.bodies.shelf` (e.g. failed or disappeared) must return `None` instead of falling
+///   through to stale pre-edit bytes in `stored`.
+/// - All standing crates (`core`, `alloc`, `std`, and unchanged workspace/dependency crates) fall
+///   through lazily to `StoredShelf` in place from CAS mmap, eliminating the full-graph
+///   `engine_heads::complete()` read-back on incremental edits.
+struct StoredShelfOverlay<'p, 'a, 's> {
+    stored: crate::engine_shelf_pages::StoredShelf<'p, 'a>,
+    superseded: &'s [Name],
+}
+
+impl<'p, 'a: 'p, 's> StoredShelfOverlay<'p, 'a, 's> {
+    fn new(stored: &'p crate::engine_answer::Stored<'a>, superseded: &'s [Name], heap: &'static blaze_own::Heap) -> StoredShelfOverlay<'p, 'a, 's> {
+        StoredShelfOverlay {
+            stored: crate::engine_shelf_pages::StoredShelf::new(stored, heap),
+            superseded,
+        }
+    }
+
+    fn fault(&self) -> Option<&'static str> {
+        self.stored.fault()
+    }
+
+    fn read(&self) -> u32 {
+        self.stored.read()
+    }
+}
+
+impl<'p, 'a: 'p, 's> blaze_ladder::front2::buckets::ShelfSource for StoredShelfOverlay<'p, 'a, 's> {
+    fn framed(&self, krate: blaze_id::CrateItemKey) -> Option<&[u8]> {
+        if !self.superseded.is_empty()
+            && self.superseded.binary_search(&blaze_ladder::front2::buckets::impl_tables_name(krate)).is_ok()
+        {
+            return None;
+        }
+        self.stored.framed(krate)
+    }
+}
+
+/// Builds a sorted slice of `Kind::ImplBucket` task names updated in `changes` during this
+/// request's `Stage::Heads` so [`StoredShelfOverlay`] never serves stale pre-edit impl tables for
+/// a crate whose `ImplBucket` task ran and failed.
+fn build_shelf_superseded<'f>(
+    changes: &SMap<'_, Name, Option<blaze_drive::Key>>,
+    entered_impl_bucket: bool,
+    frame: &'f Frame,
+) -> blaze_own::Vec<Name, &'f Frame> {
+    let mut superseded = blaze_own::Vec::new_in(frame);
+    if !entered_impl_bucket {
+        return superseded;
+    }
+    for &name in changes.keys() {
+        if name.kind == Kind::ImplBucket {
+            superseded.push(name);
+        }
+    }
+    superseded
+}
+
 /// Builds a sorted in-memory overlay of the `Signature` rows updated in `changes` during this
 /// request's `Stage::Heads` so `PagedHeads` stays active even when heads moved.
 #[inline(never)]
@@ -6525,16 +6588,18 @@ fn bodies_phase<'r, 'm, 'p>(
     let body_tool = tools.of(Name { kind: blaze_drive::Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
     let handles = crate::engine_bodies::Handles { root: rq.root, env: rq.env, graph: rq.graph, names: rq.names.as_ref().map(crate::engine_names::NamesInputs::ran), outlined: rq.outlined, workers: rq.workers, clock: rq.phases.clock(), board: rq.board, tool: body_tool, scoped: rq.scoped };
     // Read standing impl tables and frozen heads lazily from `stored` whenever `Units` did not
-    // move: if no `ImplBucket` task ran (even when `Names` or `Signature` ran), every crate's
-    // impl table still stands in `stored`, avoiding eagerly scanning all 1,206 `ImplBucket`
-    // records; for `Signature` heads, keep `PagedHeads` active even when `Stage::Heads` ran by
-    // overlaying only the `Signature` rows updated in `records.changes` this request, avoiding
-    // eagerly scanning all ~19,000 standing `Signature` headers.
+    // move: even when `ImplBucket` tasks ran this request, their freshly built tables already live
+    // in `rq.bodies.shelf` (checked first by `TableSet::paged`) while `StoredShelfOverlay` blocks
+    // any failed/superseded `ImplBucket` name from falling through to stale `stored` rows and
+    // lazily pages all standing crates (`core`, `alloc`, `std`, and unchanged workspace/dep crates)
+    // in place from CAS mmap — eliminating `engine_heads::complete()` on incremental edits; for
+    // `Signature` heads, keep `PagedHeads` active via `build_heads_overlay`.
     let units_moved = rq.ran.iter().any(|(phase, _, count)| phase.stage == Stage::Units && *count > 0);
     let can_page_stored = !rq.fresh && !units_moved && rq.serve.served.get().is_none();
-    let lazy_shelf_stored = stored.filter(|_| can_page_stored && !rq.bodies.entered_impl_bucket());
+    let lazy_shelf_stored = stored.filter(|_| can_page_stored);
     let lazy_heads_stored = stored.filter(|_| can_page_stored);
-    let stored_shelf = lazy_shelf_stored.map(|stored| crate::engine_shelf_pages::StoredShelf::new(stored, heap));
+    let superseded_shelf = build_shelf_superseded(&records.changes, can_page_stored && rq.bodies.entered_impl_bucket(), frame);
+    let stored_shelf = lazy_shelf_stored.map(|stored| StoredShelfOverlay::new(stored, &superseded_shelf[..], heap));
     // The tables of crates whose Heads task stands, from the store: one shelf of all when not paged.
     if stored_shelf.is_none()
         && let Some(stage) = rq.names.as_ref()
@@ -7958,10 +8023,11 @@ fn put_phase<'m>(
         put_now += once.put_dependencies(cx, &mut *store, &mut *rq.ledger)?;
     }
     rq.puts += put_now;
-    // Written now, so the store's arena frees them: the next phase reads them in place from the
-    // segment's mapping (rule 51; store.rs `commit_puts`). Flush at the end of `Stage::Names` and
-    // `Stage::Heads` so each stage's final arena frees before the next stage allocates and later
-    // stages read committed file-backed segment mappings with zero `kept_arenas` pinning.
+    // Checkpoint/flush at stage boundaries: `store.flush_puts()` delegates to
+    // `PlainPlace::flush_puts_if_large()` (16 MiB threshold), freeing large cold-stage `Names` /
+    // `Heads` arenas before the next stage allocates while letting small incremental edits stay in
+    // the shared `InArena` (visible to snapshots and in-process readers across stages) until one
+    // durable commit in `after_answer`.
     let flush_stage_end = matches!(phase.stage, Stage::Names | Stage::Heads) && !engine.has_pending_stage(phase.stage);
     if put_now > 0 || flush_stage_end {
         {

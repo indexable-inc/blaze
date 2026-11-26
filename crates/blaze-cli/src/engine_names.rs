@@ -22,7 +22,7 @@ use blaze_own::{BTreeMap, Csr, Heap4, Share, SharedAlloc, Vec};
 use blaze_scope::crate_env::EnvLent;
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, SourceTexts};
-use blaze_scope::scope_record::{CheckedHead, Verified};
+use blaze_scope::scope_record::{CheckedHead, ModuleBitmap, Verified};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Frame, Tag};
@@ -781,8 +781,10 @@ impl<'f> NamesStage<'f> {
                             };
                             match got {
                                 Ok(bytes) => {
-                                    let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
-                                    Mapped::Lazy(own.alloc(LazyExports::new(bytes, krate_g, None)), has_exports)
+                                    let cell_digest = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS });
+                                    let has_exports = cell_digest != blaze_drive::key::ABSENT;
+                                    let known_digest = has_exports.then_some(cell_digest);
+                                    Mapped::Lazy(own.alloc(LazyExports::new(bytes, krate_g, known_digest)), has_exports)
                                 }
                                 Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
                                 Err(error) => Mapped::Unreadable(blaze_own::format_in!(&own, "{error}").into_bump_str()),
@@ -1281,11 +1283,13 @@ fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, exports: &[u
 
 /// Worker-side once-verified exports slot for committed (or copying-route) bytes: allocated once
 /// per crate in the coordinator's frame, verified lazily on the first dependent worker thread
-/// via `OnceLock` (rule 74), removing serial `Verified::check` from the coordinator thread.
+/// via `OnceLock` (rule 74), checking only header + section bounds + crate name in O(1) so
+/// untouched pages of `core`/`alloc`/`std` CAS records are never faulted on edits.
 struct LazyExports<'j> {
     bytes: &'j [u8],
     krate: &'j str,
     verified: OnceLock<Result<Verified<'j>, blaze_scope::crate_scope::RecordRead>>,
+    bitmap: ModuleBitmap<'j>,
     digest: OnceLock<ContentId>,
 }
 
@@ -1295,14 +1299,14 @@ impl<'j> LazyExports<'j> {
         if let Some(id) = early_digest {
             let _ = digest.set(id);
         }
-        Self { bytes, krate, verified: OnceLock::new(), digest }
+        Self { bytes, krate, verified: OnceLock::new(), bitmap: ModuleBitmap::for_bytes(bytes), digest }
     }
 
-    fn verify(&self) -> Result<Verified<'j>, &blaze_scope::crate_scope::RecordRead> {
+    fn verify(&'j self) -> Result<Verified<'j>, &'j blaze_scope::crate_scope::RecordRead> {
         self.verified
             .get_or_init(|| {
                 record_checked_test(self.krate);
-                Verified::check(self.bytes)
+                Verified::check_header_with_bitmap(self.bytes, &self.bitmap)
             })
             .as_ref()
             .map(|proof| *proof)
@@ -1314,8 +1318,8 @@ impl<'j> LazyExports<'j> {
 }
 
 /// Worker-side once-verified exports slot for an uncommitted shared-arena record in a
-/// `StoreSnapshot`: `CheckedHead::check` runs lazily once on the first dependent worker thread
-/// and subsequent readers rebind in O(1) without pinning `Lent::kept_arenas`.
+/// `StoreSnapshot`: `CheckedHead::check_header` runs lazily once on the first dependent worker
+/// thread and subsequent readers rebind in O(1) without pinning `Lent::kept_arenas`.
 struct LazyUncommitted<'j> {
     offset: usize,
     len: usize,
@@ -1333,7 +1337,7 @@ impl<'j> LazyUncommitted<'j> {
         self.checked
             .get_or_init(|| {
                 record_checked_test(self.krate);
-                let head = CheckedHead::check(slice)?;
+                let head = CheckedHead::check_header(slice)?;
                 let digest = self.early_digest.unwrap_or_else(|| exports_digest(slice));
                 Ok((head, digest))
             })
@@ -1780,8 +1784,10 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                 } else {
                     match exports.exports_committed(cx, store, &input, krate_g, self.local) {
                         Ok(Some(bytes)) => {
-                            let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
-                            let lazy = self.frame.alloc(LazyExports::new(bytes, krate_g, early_digest));
+                            let cell_digest = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS });
+                            let has_exports = cell_digest != blaze_drive::key::ABSENT;
+                            let known_digest = early_digest.or_else(|| has_exports.then_some(cell_digest));
+                            let lazy = self.frame.alloc(LazyExports::new(bytes, krate_g, known_digest));
                             if let Some(slot) = self.mapped.get_mut(g) {
                                 *slot = Some((input, Mapped::Lazy(lazy, has_exports)));
                             }
@@ -1804,8 +1810,10 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                             if use_snapshot && let Some((_, snap)) = self.uncommitted_snap.as_ref() {
                                 match exports.exports_from_snapshot(snap.as_ref(), &input, krate_g, self.local) {
                                     Ok((_bytes, offset, len)) => {
-                                        let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
-                                        let lazy = self.frame.alloc(LazyUncommitted::new(offset, len, krate_g, early_digest));
+                                        let cell_digest = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS });
+                                        let has_exports = cell_digest != blaze_drive::key::ABSENT;
+                                        let known_digest = early_digest.or_else(|| has_exports.then_some(cell_digest));
+                                        let lazy = self.frame.alloc(LazyUncommitted::new(offset, len, krate_g, known_digest));
                                         if let Some(slot) = self.uncommitted_mapped.get_mut(g) {
                                             *slot = Some((input, UncommittedMapped::Lazy(lazy, has_exports)));
                                         }
@@ -1828,8 +1836,10 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                                 // `Copying` test control (or non-snapshot test store).
                                 match exports.exports(cx, store, &input, krate_g, self.frame, self.local) {
                                     Ok(bytes) => {
-                                        let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
-                                        let lazy = self.frame.alloc(LazyExports::new(bytes, krate_g, early_digest));
+                                        let cell_digest = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS });
+                                        let has_exports = cell_digest != blaze_drive::key::ABSENT;
+                                        let known_digest = early_digest.or_else(|| has_exports.then_some(cell_digest));
+                                        let lazy = self.frame.alloc(LazyExports::new(bytes, krate_g, known_digest));
                                         if let Some(slot) = self.mapped.get_mut(g) {
                                             *slot = Some((input, Mapped::Lazy(lazy, has_exports)));
                                         }
@@ -2117,11 +2127,31 @@ impl Job<'_, '_> {
         let name = task.planned.name;
         let script_input = self.script.map(|(input, _)| input);
         let snap_ref = self.uncommitted_snap.as_deref();
+        // Pre-build branded per-module verification bitmaps for any uncommitted snapshot
+        // dependencies so their immutable borrow outlives `resolve_with_prepares` (0 alloc when
+        // all deps are committed, e.g. on every edit).
+        let uncommitted_count = if snap_ref.is_some() {
+            self.deps.iter().filter(|d| matches!(d.exports, Some(ExportRef::LazyInSnapshot(_)))).count()
+        } else {
+            0
+        };
+        let mut uncommitted_bitmaps: Vec<(usize, ModuleBitmap<'_>), _> =
+            Vec::with_capacity_in(uncommitted_count, alloc);
+        if let Some(snap) = snap_ref {
+            for (idx, dep) in self.deps.iter().enumerate() {
+                if let Some(ExportRef::LazyInSnapshot(lazy)) = dep.exports
+                    && let Ok(Some(record)) = snap.get(dep.input.at)
+                    && let Some(slice) = lazy.offset.checked_add(lazy.len).and_then(|end| record.get(lazy.offset..end))
+                {
+                    uncommitted_bitmaps.push((idx, ModuleBitmap::for_bytes(slice)));
+                }
+            }
+        }
         // Verify dependency exports lazily on worker threads (once per crate via `OnceLock`,
         // rule 74), in sorted `dep.index` order so any unreadable dependency stops deterministically.
         let mut verified_deps: Vec<Option<Verified<'_>>, _> = Vec::with_capacity_in(self.deps.len(), local);
         let mut first_bad: Option<blaze_own::String<SharedAlloc<'a>>> = None;
-        for dep in self.deps {
+        for (idx, dep) in self.deps.iter().enumerate() {
             match dep.exports {
                 Some(ExportRef::Lazy(lazy)) => match lazy.verify() {
                     Ok(proof) => verified_deps.push(Some(proof)),
@@ -2139,6 +2169,7 @@ impl Job<'_, '_> {
                 },
                 Some(ExportRef::LazyInSnapshot(lazy)) => {
                     let dep_krate = self.crates.get(dep.index).map_or("", |c| c.input.name);
+                    let bitmap = uncommitted_bitmaps.iter().find(|(i, _)| *i == idx).map(|(_, b)| b);
                     let res: Result<Verified<'_>, blaze_own::String<SharedAlloc<'a>>> = (|| {
                         let Some(snap) = snap_ref else {
                             return Err(blaze_own::format_in!(alloc, "crate {}: missing snapshot for uncommitted dependency {dep_krate}", krate.input.name));
@@ -2152,9 +2183,15 @@ impl Job<'_, '_> {
                             return Err(blaze_own::format_in!(alloc, "crate {}: uncommitted dependency {dep_krate} exports slice out of bounds", krate.input.name));
                         };
                         match lazy.verify(slice) {
-                            Ok((head, _digest)) => head.rebind(slice).ok_or_else(|| {
-                                blaze_own::format_in!(alloc, "crate {}: uncommitted dependency {dep_krate} exports identity mismatch", krate.input.name)
-                            }),
+                            Ok((head, _digest)) => {
+                                let rebound = match bitmap {
+                                    Some(bitmap) => head.rebind_with_bitmap(slice, bitmap),
+                                    None => head.rebind(slice),
+                                };
+                                rebound.ok_or_else(|| {
+                                    blaze_own::format_in!(alloc, "crate {}: uncommitted dependency {dep_krate} exports identity mismatch", krate.input.name)
+                                })
+                            }
                             Err(error) => Err(blaze_own::format_in!(
                                 alloc,
                                 "crate `{}`: the record of its dependency `{dep_krate}`: its exports record did not check: {error:?}",

@@ -8,7 +8,7 @@
 //! Every field little-endian and fixed-width; a name is its kind byte and its 32-byte subject.
 //!
 //! ```text
-//! root = "BER4" | serial u64 | bits u8 | bytes u64 | flags u8 | live_pages u32 | outlines u32
+//! root = "BER6" | serial u64 | bits u8 (>= 1) | bytes u64 | flags u8 | live_pages u32 | outlines u32
 //!        if flags == 0 (flat, bits <= RADIX_FLAT_MAX_BITS):
 //!          | pages u32 (= 1 << bits) | pages x key [32]
 //!          | files | places | units | findings | owed tasks | owed cells
@@ -16,16 +16,18 @@
 //!          | shards u32 (= 1 << (bits - RADIX_LEAF_BITS)) | shards x key [32]
 //!          | 16 x file_shard_key [32] | places_key [32] | summary_key [32]
 //!          | owed tasks | owed cells
+//!        page index space (`0 .. (1 << bits)`):
+//!          - lower half `0 .. (1 << (bits - 1))`: content (`ROWS`, `CELLS`, `OWED_CELLS`,
+//!            `OWED_TASKS`, `FILES`, `CAUSES`, `RECORDS`) via [`content_page_of`]
+//!          - upper half `(1 << (bits - 1)) .. (1 << bits)`: `READERS` only via [`readers_page_of`]
 //! radix shard  = "BEX1" | bits u8 | shard u32 | 256 x key [32]  (all-zero shard = zero key)
 //! file shard   = "BEF1" | shard u8 | count u32 | count x (file | has u8 | [digest [32]])
 //! places rec   = "BEPL" | count u32 | count x (file | unit | edition u8 | flags u8)
 //! summary rec  = "BES1" | units u32 | units x Name | findings u32 | findings x (Name | u32)
 //! file places = count u32 | count x (file | unit | edition u8 | flags u8), by file, strictly
 //!        ([`FilePlace`]: one a source file the driver planned, each file of the plan digests)
-//! page = "BEP5" | bits u8 | index u32 | 8 x count u32 | (n + 1) x start u32 | the eight
-//!        sections, where n is the counts' sum, start j is entry j's first byte in the page
-//!        (entries numbered across the sections in order) and start n is the page's length;
-//!        the sections, in this order:
+//! page = "BEP6" | bits u8 | index u32 | names u32 | cells u32 | ids u32 | 8 x count u32 | (n + 1) x start u32
+//!        | sorted unique dictionaries (names, cells, ids) | the eight sections:
 //!   rows        name | key | stage u8 | wave u16 | file | source | out | serial u64 |
 //!               findings u32 | flags u8 (1 inline, 2 failed, 4 indexed) | defines u32 | reads u32 |
 //!               defines x (cell [16], digest) | reads x (cell id, digest) | if indexed: reads x u32
@@ -104,12 +106,13 @@ pub use view::{StoredDefines, StoredNames, StoredReads, StoredRow, VerifiedPage}
 /// `BEP5` is refused cleanly by magic (Rule 3, Rule 26).
 pub const PAGE_MAGIC: &[u8; 4] = b"BEP6";
 
-/// The name whose page ([`page_of`]) holds `id`'s readers entry: a placement key, never a task's
-/// name. Its subject is the task's with its first eight bytes replaced by a mix of the task's
-/// first word, its kind and the cell's two words (splitmix64's finalizer over a fold, part of the
-/// form: two builders place one cell on one page, rule 25), so the cells of one task are spread
-/// over the pages like the tasks are, and a change to one cell's readers rewrites the page of
-/// that one list and not of every list its task defines.
+/// The name whose page holds `id`'s readers entry: a placement key, never a task's name. Its
+/// subject is the task's with its first eight bytes replaced by a mix of the task's first word,
+/// its kind and the cell's two words (splitmix64's finalizer over a fold, part of the form: two
+/// builders place one cell on one page, rule 25), so the cells of one task are spread over the
+/// upper-half readers pages ([`readers_page_of`]) like the tasks are over the lower-half content
+/// pages ([`content_page_of`]), and a change to one cell's readers rewrites only that readers
+/// page and never any content page.
 pub fn readers_slot(id: &CellId) -> Name {
     let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
     let mut subject = id.of.subject.0;
@@ -124,12 +127,74 @@ pub fn readers_slot(id: &CellId) -> Name {
     subject[..8].copy_from_slice(&h.to_be_bytes());
     Name::new(id.of.kind, ContentId(subject))
 }
+
+/// Number of pages in each half of a `BER6` root (`1 << (bits - 1)` for `bits >= 1`).
+#[inline]
+pub const fn half_pages(bits: u8) -> u32 {
+    if bits == 0 {
+        1
+    } else {
+        1u32 << (bits - 1)
+    }
+}
+
+/// Which page of a `BER6` root of `bits` (`>= 1`) holds a content entry (`ROWS`, `CELLS`,
+/// `OWED_CELLS`, `OWED_TASKS`, `FILES`, `CAUSES`, `RECORDS`) for `name`: always in the lower
+/// half `0 .. (1 << (bits - 1))`.
+#[inline]
+pub fn content_page_of(name: Name, bits: u8) -> u32 {
+    page_of(name, bits.saturating_sub(1))
+}
+
+/// Which page of a `BER6` root of `bits` (`>= 1`) holds a `READERS` entry for `slot` (computed
+/// via [`readers_slot`]): always in the upper half `(1 << (bits - 1)) .. (1 << bits)`.
+#[inline]
+pub fn readers_slot_page_of(slot: Name, bits: u8) -> u32 {
+    let half_bits = bits.saturating_sub(1).min(blaze_drive::answers::MOST_BITS - 1);
+    (1u32 << half_bits) + page_of(slot, half_bits)
+}
+
+/// Which page of a `BER6` root of `bits` (`>= 1`) holds `id`'s `READERS` entry: always in the
+/// upper half `(1 << (bits - 1)) .. (1 << bits)`.
+#[inline]
+pub fn readers_page_of(id: &CellId, bits: u8) -> u32 {
+    readers_slot_page_of(readers_slot(id), bits)
+}
+
+/// Which page of a `BER6` root of `bits` (`>= 1`) answers `ask` for `name`:
+/// - [`Ask::Readers`](crate::Ask::Readers): upper half via [`readers_slot_page_of`] (`name` is
+///   `readers_slot(&id)`);
+/// - [`Ask::Witness`](crate::Ask::Witness): full `0 .. (1 << bits)` space via [`page_of`]
+///   (`name` is a synthetic page witness);
+/// - every other ask: lower half via [`content_page_of`].
+#[inline]
+pub fn page_for_ask(name: Name, ask: crate::Ask, bits: u8) -> u32 {
+    match ask {
+        crate::Ask::Readers => readers_slot_page_of(name, bits),
+        crate::Ask::Witness => page_of(name, bits),
+        _ => content_page_of(name, bits),
+    }
+}
+
+/// Partitioned `BER6` bit count for `total` estimated `BEP6` bytes (always in `1..=MOST_BITS`):
+/// keeps `old` while its per-half bit count stays in `bits_kept`'s hysteresis band, giving
+/// content `1 << (bits - 1)` pages and `READERS` `1 << (bits - 1)` pages.
+#[inline]
+pub fn bits_kept_partitioned(total: u64, old: Option<u8>) -> u8 {
+    let old_half = old.map(|b| b.saturating_sub(1));
+    let half = bits_kept(total, old_half).min(blaze_drive::answers::MOST_BITS - 1);
+    half + 1
+}
+
 /// The root's form. `BER3` stored a flat array of up to 65,536 page keys (2 MiB) plus all
 /// directory sections inline; `BER4` kept small answers inline and stored large answers as a
-/// 2-level 256-way radix tree over `BEP5` pages; `BER5` stores the same directory over `BEP6`
-/// dictionary-encoded pages. A `BER4` root is a [`PagesError::Magic`], reported at `open_root`
-/// and rebuilt cleanly (D160), never failing mid-engine on a `BEP5` page.
-pub const ROOT_MAGIC: &[u8; 4] = b"BER5";
+/// 2-level 256-way radix tree over `BEP5` pages; `BER5` stored the same directory over `BEP6`
+/// dictionary-encoded pages with content and `READERS` mixed on every page; `BER6` partitions the
+/// `1 << bits` (`bits >= 1`) page address space into lower-half content pages (`0..half`) and
+/// upper-half `READERS`-only pages (`half..2*half`) so adding reader edges never rewrites content
+/// pages. A `BER5` (or older) root is a [`PagesError::Magic`], reported at `open_root` and
+/// rebuilt cleanly (Rule 3, Rule 26).
+pub const ROOT_MAGIC: &[u8; 4] = b"BER6";
 /// Leaf-shard form of a 2-level radix answer root: 256 page keys (8,192 bytes + 9-byte header).
 pub const RADIX_SHARD_MAGIC: &[u8; 4] = b"BEX1";
 /// File-directory shard form of a radix answer root (16 shards by subject's leading nibble).
@@ -1032,10 +1097,10 @@ where
     encode_inner(kept, last, None, PagesPlant::None, alloc, run_pages)
 }
 
-/// `kept` encoded at an explicit `bits` count (clamped to `MOST_BITS`), primarily for testing
+/// `kept` encoded at an explicit `bits` count (clamped to `1..=MOST_BITS`), primarily for testing
 /// large-paging radix trees (`bits = 10..=16`) without allocating gigabytes of synthetic rows.
 pub fn encode_at_bits<'a>(kept: &Kept<'_>, bits: u8, alloc: SharedAlloc<'a>) -> Encoded<'a> {
-    encode_inner(kept, None, Some(bits.min(blaze_drive::answers::MOST_BITS)), PagesPlant::None, alloc, |jobs| run_whole_serial(jobs, alloc))
+    encode_inner(kept, None, Some(bits.clamp(1, blaze_drive::answers::MOST_BITS)), PagesPlant::None, alloc, |jobs| run_whole_serial(jobs, alloc))
 }
 
 /// [`encode`] with a planted bug ([`PagesPlant`]).
@@ -1058,7 +1123,7 @@ where
     let files_kept = plant != PagesPlant::FilesDropped;
     let has_row = |name: &Name| answer.rows.contains_key(name);
     let bits = match forced_bits {
-        Some(bits) => bits,
+        Some(bits) => bits.clamp(1, blaze_drive::answers::MOST_BITS),
         None => {
             // The estimated BEP6 bytes in all, which size the paging.
             let mut total = 0u64;
@@ -1085,32 +1150,32 @@ where
                 .sum();
             let rec_bytes = (bep6::RECORD_V6 + ID) * kept.records.keys().filter(|name| has_row(*name)).count();
             total = total.saturating_add(u64::try_from(cause_bytes.saturating_add(rec_bytes)).unwrap_or(u64::MAX));
-            bits_kept(total, last.map(|root| root.bits))
+            bits_kept_partitioned(total, last.map(|root| root.bits))
         }
     };
     let count = 1usize << bits;
-    let rows_part = partition_by_page(count, answer.rows.iter().map(|(name, row)| (page_of(*name, bits), (name, row))), alloc);
-    let cells_part = partition_by_page(count, answer.cells.iter().map(|(id, val)| (page_of(id.of, bits), (id, val))), alloc);
-    let owed_cells_part = partition_by_page(count, answer.owed_cells.iter().map(|(id, moved)| (page_of(id.of, bits), (id, moved))), alloc);
-    let owed_tasks_part = partition_by_page(count, answer.owed_tasks.iter().map(|(name, planned)| (page_of(*name, bits), (name, planned))), alloc);
+    let rows_part = partition_by_page(count, answer.rows.iter().map(|(name, row)| (content_page_of(*name, bits), (name, row))), alloc);
+    let cells_part = partition_by_page(count, answer.cells.iter().map(|(id, val)| (content_page_of(id.of, bits), (id, val))), alloc);
+    let owed_cells_part = partition_by_page(count, answer.owed_cells.iter().map(|(id, moved)| (content_page_of(id.of, bits), (id, moved))), alloc);
+    let owed_tasks_part = partition_by_page(count, answer.owed_tasks.iter().map(|(name, planned)| (content_page_of(*name, bits), (name, planned))), alloc);
     let files_part = if files_kept {
-        partition_by_page(count, answer.by_file.iter().map(|(file, names)| (page_of(*file, bits), (file, names))), alloc)
+        partition_by_page(count, answer.by_file.iter().map(|(file, names)| (content_page_of(*file, bits), (file, names))), alloc)
     } else {
         Partitioned::empty(alloc)
     };
     let causes_part = partition_by_page(
         count,
-        kept.causes.iter().filter(|(name, _)| has_row(name)).map(|(name, cause)| (page_of(*name, bits), (name, cause))),
+        kept.causes.iter().filter(|(name, _)| has_row(name)).map(|(name, cause)| (content_page_of(*name, bits), (name, cause))),
         alloc,
     );
     let records_part = partition_by_page(
         count,
-        kept.records.iter().filter(|(name, _)| has_row(name)).map(|(name, key)| (page_of(*name, bits), (name, key))),
+        kept.records.iter().filter(|(name, _)| has_row(name)).map(|(name, key)| (content_page_of(*name, bits), (name, key))),
         alloc,
     );
     let readers_part = partition_by_page(
         count,
-        answer.readers.iter().map(|(id, names)| (page_of(readers_slot(id), bits), (id, names))),
+        answer.readers.iter().map(|(id, names)| (readers_page_of(id, bits), (id, names))),
         alloc,
     );
 
@@ -1361,7 +1426,7 @@ pub fn decode_root_with<'a, 'g>(root: Sealed<'_>, get: impl FnMut(Key) -> Got<'g
     let flags = r.u8()?;
     let live_pages = r.u32()?;
     let outlines = r.u32()?;
-    if bits > blaze_drive::answers::MOST_BITS {
+    if bits == 0 || bits > blaze_drive::answers::MOST_BITS {
         return Err(PagesError::Count { page: ROOT_PAGE, count: u32::from(bits) });
     }
     let max_pages = 1u32 << bits;
@@ -1600,5 +1665,387 @@ mod codex_regression_tests {
         };
         let reencoded = encode(&decoded, None, alloc);
         assert_eq!(reencoded.root, par_rev.root, "round-trip after encode_par must preserve root");
+    }
+
+    #[test]
+    fn previous_root_magic_ber5_is_rejected() {
+        let alloc = blaze_own::testing::heap().shared();
+        let mut ber5 = Vec::new_in(alloc);
+        ber5.extend_from_slice(b"BER5");
+        ber5.extend_from_slice(&[0u8; 64]);
+        let key = content_key(&ber5);
+        assert_eq!(
+            decode_root_hashed(key, &ber5, alloc).err(),
+            Some(PagesError::Magic { page: ROOT_PAGE }),
+            "old BER5 mixed root magic must be rejected with PagesError::Magic"
+        );
+
+        // `BER6` with `bits == 0` is invalid (partitioned roots require `bits >= 1`).
+        let mut zero_bits = Vec::new_in(alloc);
+        zero_bits.extend_from_slice(ROOT_MAGIC);
+        zero_bits.extend_from_slice(&0u64.to_le_bytes()); // serial
+        zero_bits.push(0); // bits == 0
+        zero_bits.extend_from_slice(&0u64.to_le_bytes()); // total
+        zero_bits.push(ROOT_FLAG_FLAT);
+        zero_bits.extend_from_slice(&0u32.to_le_bytes()); // live_pages
+        zero_bits.extend_from_slice(&0u32.to_le_bytes()); // outlines
+        zero_bits.extend_from_slice(&1u32.to_le_bytes()); // count
+        zero_bits.extend_from_slice(&[0u8; 32]);
+        let key0 = content_key(&zero_bits);
+        assert_eq!(
+            decode_root_hashed(key0, &zero_bits, alloc).err(),
+            Some(PagesError::Count { page: ROOT_PAGE, count: 0 }),
+            "BER6 root with bits == 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn partitioned_content_and_readers_round_trip_flat_and_radix() {
+        let alloc = blaze_own::testing::heap().shared();
+        let mut kept = Kept::new_in(alloc);
+        kept.answer.serial = Gen(3);
+        let phase = Phase::new(Stage::Bodies, 0);
+        let mut reader_pairs = Vec::new_in(alloc);
+        for i in 0..64u32 {
+            let file = Name::new(Kind::FileItems, ContentId::of("part file", &(i % 6).to_le_bytes()));
+            let name = Name::new(Kind::BodyCheck, ContentId::of("part task", &i.to_le_bytes()));
+            let src = ContentId::of("part src", &i.to_le_bytes());
+            let out = ContentId::of("part out", &i.to_le_bytes());
+            let rec = Key(ContentId::of("part rec", &i.to_le_bytes()));
+            let cell = Cell(*ContentId::of("part cell", &i.to_le_bytes()).0.first_chunk::<16>().unwrap_or(&[0; 16]));
+            let cid = CellId { of: name, cell };
+            let mut defines = Vec::new_in(alloc);
+            defines.push((cell, out));
+            let mut reads = Vec::new_in(alloc);
+            let mut by_cell = Vec::new_in(alloc);
+            if i > 0 {
+                let prev = Name::new(Kind::BodyCheck, ContentId::of("part task", &(i - 1).to_le_bytes()));
+                let prev_cell = Cell(*ContentId::of("part cell", &(i - 1).to_le_bytes()).0.first_chunk::<16>().unwrap_or(&[0; 16]));
+                let prev_id = CellId { of: prev, cell: prev_cell };
+                reads.push((prev_id, ContentId::of("part out", &(i - 1).to_le_bytes())));
+                by_cell.push(0u32);
+                reader_pairs.push((prev_id, name));
+            }
+            kept.answer.cells.insert(cid, (out, Gen(3)));
+            kept.answer.by_file.entry(file).or_insert_with(|| Vec::new_in(alloc)).push(name);
+            kept.places.insert(file, FilePlace { unit: file, edition: 3, flags: 1 });
+            kept.answer.rows.insert(name, Row {
+                key: Key(src), phase, file, source: src, out, serial: Gen(3),
+                defines, reads, by_cell, findings: 0, inline: false, failed: false,
+            });
+            kept.causes.insert(name, (Gen(3), Cause::New));
+            kept.records.insert(name, rec);
+        }
+        kept.answer.readers = Readers::from_pairs(reader_pairs, alloc);
+        for names in kept.answer.by_file.values_mut() {
+            names.sort_unstable();
+        }
+
+        for bits in [4u8, 10u8, 16u8] {
+            let encoded = encode_at_bits(&kept, bits, alloc);
+            assert_eq!(encoded.bits, bits);
+            assert_eq!(encoded.is_radix(), bits > RADIX_FLAT_MAX_BITS);
+            let half = half_pages(bits);
+
+            let mut store: BTreeMap<Key, &[u8], _> = BTreeMap::new_in(alloc);
+            for (k, bytes) in encoded.puts.iter() {
+                store.insert(*k, bytes.as_slice());
+            }
+
+            // Build lookup of page_key -> page_records len.
+            let mut recs_len: BTreeMap<Key, usize, _> = BTreeMap::new_in(alloc);
+            for (k, recs) in encoded.page_records() {
+                recs_len.insert(k, recs.len());
+            }
+
+            let root = decode_root_with(
+                Sealed::hashed(encoded.root, store[&encoded.root]).expect("sealed root"),
+                |k| store.get(&k).map(|b| Sealed::hashed(k, b)),
+                alloc,
+            )
+            .expect("decode root");
+
+            let mut seen_content_pages = 0usize;
+            let mut seen_readers_pages = 0usize;
+            let mut check_page = |idx: u32, key: Key| {
+                let sealed = Sealed::hashed(key, store[&key]).expect("sealed page");
+                let vp = VerifiedPage::open_whole(sealed, idx, bits).expect("open_whole");
+                if idx < half {
+                    seen_content_pages += 1;
+                    assert!(vp.entries(READERS).next().is_none(), "lower-half content page {idx} must hold 0 READERS");
+                } else {
+                    seen_readers_pages += 1;
+                    assert!(vp.row_names().next().is_none(), "upper-half readers page {idx} must hold 0 ROWS");
+                    assert!(vp.entries(CELLS).next().is_none(), "upper-half readers page {idx} must hold 0 CELLS");
+                    assert!(vp.records().next().is_none(), "upper-half readers page {idx} must hold 0 RECORDS");
+                    assert_eq!(recs_len.get(&key).copied().unwrap_or(0), 0, "upper-half readers page {idx} must publish 0 page_records");
+                    assert!(vp.entries(READERS).next().is_some(), "live upper-half page {idx} must hold READERS");
+                }
+            };
+
+            if !root.is_radix() {
+                for (idx, &key) in root.pages.iter().enumerate() {
+                    if key != Key::default() {
+                        check_page(u32::try_from(idx).unwrap_or(u32::MAX), key);
+                    }
+                }
+            } else {
+                for (shard_idx, &shard_key) in root.page_shards.iter().enumerate() {
+                    if shard_key == Key::default() {
+                        continue;
+                    }
+                    let shard = decode_radix_shard(
+                        Sealed::hashed(shard_key, store[&shard_key]).expect("sealed shard"),
+                        u32::try_from(shard_idx).unwrap_or(u32::MAX),
+                        bits,
+                        alloc,
+                    )
+                    .expect("decode shard");
+                    let base = shard_idx << RADIX_LEAF_BITS;
+                    for (slot, &key) in shard.keys.iter().enumerate() {
+                        if key != Key::default() {
+                            check_page(u32::try_from(base + slot).unwrap_or(u32::MAX), key);
+                        }
+                    }
+                }
+            }
+            assert!(seen_content_pages > 0 && seen_readers_pages > 0);
+
+            let back = decode(encoded.root, |k| store.get(&k).map(|b| Sealed::hashed(k, b)), alloc)
+                .expect("round-trip decode");
+            assert_eq!(encode_at_bits(&back, bits, alloc).root, encoded.root, "round-trip at bits={bits} must preserve root");
+        }
+    }
+
+    #[test]
+    fn adding_reader_mutates_only_upper_half_leaving_content_pages_byte_identical() {
+        let alloc = blaze_own::testing::heap().shared();
+        let tools = crate::Tools([blaze_drive::key::Tool(ContentId([5; 32])); blaze_drive::key::KINDS]);
+        let phase_names = Phase::new(Stage::Names, 0);
+        let phase_bodies = Phase::new(Stage::Bodies, 0);
+
+        for bits in [4u8, 10u8] {
+            let half = half_pages(bits);
+            let producer_file = Name::new(Kind::FileItems, ContentId::of("core file", b"core/lib.rs"));
+            let producer = Name::new(Kind::CrateScope, ContentId::of("core scope", b"core"));
+            let producer_page = content_page_of(producer, bits);
+            assert!(producer_page < half);
+
+            // Pick a workspace file and two body tasks on content pages distinct from `producer_page`.
+            let ws_file = (0..1000u32)
+                .map(|i| Name::new(Kind::FileItems, ContentId::of("ws file", &i.to_le_bytes())))
+                .find(|f| content_page_of(*f, bits) != producer_page)
+                .expect("distinct ws file page");
+            let existing_body = (0..1000u32)
+                .map(|i| Name::new(Kind::BodyCheck, ContentId::of("ws body 0", &i.to_le_bytes())))
+                .find(|n| content_page_of(*n, bits) != producer_page)
+                .expect("distinct existing body page");
+            let added_body = (0..1000u32)
+                .map(|i| Name::new(Kind::BodyCheck, ContentId::of("ws body 1", &i.to_le_bytes())))
+                .find(|n| content_page_of(*n, bits) != producer_page && *n != existing_body)
+                .expect("distinct added body page");
+
+            let producer_src = ContentId::of("core src", b"v1");
+            let producer_rec = Key(ContentId::of("core rec", b"v1"));
+            let body_src = ContentId::of("body src", b"v1");
+            let body_rec = Key(ContentId::of("body rec", b"v1"));
+
+            // Producer defines 12 cells on `producer_page`.
+            let mut producer_cells: Vec<(CellId, ContentId), _> = Vec::new_in(alloc);
+            let mut defines: Vec<(Cell, ContentId), _> = Vec::new_in(alloc);
+            for c in 0..12u8 {
+                let cell = Cell([c + 1; 16]);
+                let dig = ContentId::of("core cell dig", &[c]);
+                defines.push((cell, dig));
+                producer_cells.push((CellId { of: producer, cell }, dig));
+            }
+
+            let mut cold = Kept::new_in(alloc);
+            cold.answer.serial = Gen(1);
+            for &(cid, dig) in producer_cells.iter() {
+                cold.answer.cells.insert(cid, (dig, Gen(1)));
+            }
+            cold.answer.rows.insert(producer, Row {
+                key: tools.key(producer, &producer_src), phase: phase_names, file: producer_file,
+                source: producer_src, out: producer_rec.0, serial: Gen(1),
+                defines, reads: Vec::new_in(alloc), by_cell: Vec::new_in(alloc),
+                findings: 0, inline: false, failed: false,
+            });
+            cold.causes.insert(producer, (Gen(1), Cause::New));
+            cold.records.insert(producer, producer_rec);
+            let mut prod_members = Vec::new_in(alloc);
+            prod_members.push(producer);
+            cold.answer.by_file.insert(producer_file, prod_members);
+            cold.places.insert(producer_file, FilePlace { unit: producer_file, edition: 3, flags: 0 });
+
+            // Existing body already reads cell 0.
+            let mut b0_reads = Vec::new_in(alloc);
+            b0_reads.push(producer_cells[0]);
+            let mut b0_idx = Vec::new_in(alloc);
+            b0_idx.push(0u32);
+            cold.answer.rows.insert(existing_body, Row {
+                key: tools.key(existing_body, &body_src), phase: phase_bodies, file: ws_file,
+                source: body_src, out: body_rec.0, serial: Gen(1),
+                defines: Vec::new_in(alloc), reads: b0_reads, by_cell: b0_idx,
+                findings: 0, inline: false, failed: false,
+            });
+            cold.causes.insert(existing_body, (Gen(1), Cause::New));
+            cold.records.insert(existing_body, body_rec);
+            let mut ws_members = Vec::new_in(alloc);
+            ws_members.push(existing_body);
+            cold.answer.by_file.insert(ws_file, ws_members);
+            cold.places.insert(ws_file, FilePlace { unit: ws_file, edition: 3, flags: 0 });
+            let mut rpairs = Vec::new_in(alloc);
+            rpairs.push((producer_cells[0].0, existing_body));
+            cold.answer.readers = Readers::from_pairs(rpairs, alloc);
+
+            let enc_v1 = encode_at_bits(&cold, bits, alloc);
+            let mut store: BTreeMap<Key, SVec<'_, u8>, _> = BTreeMap::new_in(alloc);
+            for (k, b) in enc_v1.puts.iter() {
+                store.insert(*k, SVec::from_slice_in(b, alloc));
+            }
+            let root_v1 = decode_root_with(
+                Sealed::hashed(enc_v1.root, &store[&enc_v1.root]).expect("root v1"),
+                |k| store.get(&k).map(|b| Sealed::hashed(k, b)),
+                alloc,
+            )
+            .expect("decode root v1");
+
+            // Capture producer's exact lower-half page key before the edit.
+            let page_key_in = |root: &Root<'_>, idx: u32, st: &BTreeMap<Key, SVec<'static, u8>, SharedAlloc<'static>>| -> Key {
+                let i = usize::try_from(idx).unwrap_or(usize::MAX);
+                if !root.is_radix() {
+                    root.pages[i]
+                } else {
+                    let (s, slot) = Root::shard_of(i);
+                    let sk = root.page_shards[s];
+                    if sk == Key::default() {
+                        return Key::default();
+                    }
+                    let shard = decode_radix_shard(
+                        Sealed::hashed(sk, &st[&sk]).expect("shard"),
+                        u32::try_from(s).unwrap_or(u32::MAX),
+                        root.bits,
+                        alloc,
+                    )
+                    .expect("decode shard");
+                    shard.keys[slot]
+                }
+            };
+            let producer_page_key_v1 = page_key_in(&root_v1, producer_page, &store);
+            assert_ne!(producer_page_key_v1, Key::default());
+
+            // Pre-open all live pages into a `StoredPages` map.
+            let mut opened: BTreeMap<u32, VerifiedPage<'_>, SharedAlloc<'static>> = BTreeMap::new_in(alloc);
+            for idx in 0..(1u32 << bits) {
+                let k = page_key_in(&root_v1, idx, &store);
+                if k != Key::default() {
+                    let vp = VerifiedPage::open_whole(Sealed::hashed(k, &store[&k]).expect("page"), idx, bits).expect("open page");
+                    opened.insert(idx, vp);
+                }
+            }
+            struct TestStored<'p, 'm> {
+                bits: u8,
+                pages: &'m BTreeMap<u32, VerifiedPage<'p>, SharedAlloc<'static>>,
+            }
+            impl crate::StoredPages for TestStored<'_, '_> {
+                fn page(&self, name: Name) -> Result<Option<&VerifiedPage<'_>>, PagesError> {
+                    Ok(self.pages.get(&content_page_of(name, self.bits)))
+                }
+                fn page_for(&self, name: Name, ask: crate::Ask) -> Result<Option<&VerifiedPage<'_>>, PagesError> {
+                    Ok(self.pages.get(&page_for_ask(name, ask, self.bits)))
+                }
+                fn finding(&self, _: Name) -> Option<u32> { None }
+                fn refusal(&self) -> Option<PagesError> { None }
+                fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), crate::LastError>) -> Result<(), crate::LastError> {
+                    for (&idx, page) in self.pages.iter() {
+                        if idx < half_pages(self.bits) {
+                            for n in page.row_names() {
+                                visit(n)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            let stored = TestStored { bits, pages: &opened };
+
+            // Edit: add `added_body` to `ws_file`, reading ALL 12 cells of `producer`!
+            let mut next_members = Vec::new_in(alloc);
+            next_members.push(Planned { name: existing_body, phase: phase_bodies, file: ws_file, source: body_src });
+            next_members.push(Planned { name: added_body, phase: phase_bodies, file: ws_file, source: body_src });
+            next_members.sort_unstable_by_key(|p| p.name);
+            let edit = crate::Edit { files: &[(ws_file, next_members.as_slice())] };
+            let mut eng = crate::Engine::new_in(tools, Answer::from_pages(&stored, Gen(1), alloc), &edit, crate::Everything, crate::Plant::None, alloc).expect("engine");
+            assert_eq!(eng.next_phase().expect("phase"), Some(phase_bodies));
+            assert_eq!(eng.tasks().len(), 1);
+            let task = eng.tasks()[0];
+            assert_eq!(task.planned.name, added_body);
+            let mut reads = Vec::new_in(alloc);
+            for &(cid, dig) in producer_cells.iter() {
+                reads.push((cid, dig));
+            }
+            let mut batch = crate::Buffer::new_in(alloc);
+            batch.done.push(crate::Done {
+                name: added_body, key: task.key, out: body_rec.0,
+                defines: Vec::new_in(alloc), reads, findings: 0, failed: false,
+            });
+            eng.merge(core::slice::from_mut(&mut batch)).expect("merge");
+            assert_eq!(eng.next_phase().expect("settled"), None);
+            let crate::Finished { answer: edit_answer, causes: edit_causes, .. } = eng.finish().expect("finish");
+            let mut payloads = BTreeMap::new_in(alloc);
+            payloads.insert(added_body, body_rec);
+            let edit_kept = Kept::after(BTreeMap::new_in(alloc), edit_answer, &edit_causes, payloads);
+
+            let enc_v2 = encode_changes(&edit_kept, &root_v1, alloc, |k| store.get(&k).map(|b| Sealed::hashed(k, b)))
+                .expect("encode_changes");
+            let deltas = enc_v2.page_deltas.as_ref().expect("incremental deltas");
+            // Producer's lower-half content page MUST be completely untouched!
+            assert!(
+                deltas.iter().all(|d| d.index != producer_page),
+                "adding 12 reader edges to producer's cells must NOT mutate producer's content page {producer_page} (deltas: {deltas:?})"
+            );
+            // Every touched readers page must lie in the upper half and have 0 page_records!
+            let mut rec_map: BTreeMap<Key, usize, _> = BTreeMap::new_in(alloc);
+            for (k, recs) in enc_v2.page_records() {
+                rec_map.insert(k, recs.len());
+            }
+            for &(cid, _) in producer_cells.iter() {
+                let rp = readers_page_of(&cid, bits);
+                assert!(rp >= half, "readers page {rp} must be in upper half >= {half}");
+                let delta = deltas.iter().find(|d| d.index == rp).expect("readers page must be updated");
+                assert_eq!(rec_map.get(&delta.new).copied().unwrap_or(0), 0, "readers page {rp} must have 0 RECORDS");
+            }
+
+            // Release borrows of `store`, store v2 puts, and verify producer's page key is byte-identical
+            // and the full answer decodes and re-encodes identically.
+            drop(edit_kept);
+            drop(edit_causes);
+            drop(stored);
+            drop(opened);
+            for (k, b) in enc_v2.puts.iter() {
+                store.insert(*k, SVec::from_slice_in(b, alloc));
+            }
+            let root_v2 = decode_root_with(
+                Sealed::hashed(enc_v2.root, &store[&enc_v2.root]).expect("root v2"),
+                |k| store.get(&k).map(|b| Sealed::hashed(k, b)),
+                alloc,
+            )
+            .expect("decode root v2");
+            assert_eq!(
+                page_key_in(&root_v2, producer_page, &store),
+                producer_page_key_v1,
+                "producer's content page key must stay byte-identical at bits={bits}"
+            );
+            // Verify every cell's readers list includes `added_body`.
+            for &(cid, _) in producer_cells.iter() {
+                let rp = readers_page_of(&cid, bits);
+                let rk = page_key_in(&root_v2, rp, &store);
+                let vp = VerifiedPage::open_whole(Sealed::hashed(rk, &store[&rk]).expect("rp"), rp, bits).expect("open_whole rp");
+                assert!(vp.readers(&cid).any(|r| r == added_body), "added_body must be in readers of {cid:?}");
+            }
+            let decoded = decode(enc_v2.root, |k| store.get(&k).map(|b| Sealed::hashed(k, b)), alloc).expect("decode v2");
+            assert_eq!(encode_at_bits(&decoded, bits, alloc).root, enc_v2.root, "round-trip v2 at bits={bits}");
+        }
     }
 }

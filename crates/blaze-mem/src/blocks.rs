@@ -93,8 +93,8 @@ pub const MAX_ALIGN: usize = 4096;
 pub const AT_ONCE: usize = 256 << 10;
 
 /// The warm bytes a class of smaller blocks keeps, pages and all, before a giver trims it
-/// down to half of this: about 2 MiB a class, under 0.2 GiB for every class blaze uses.
-pub const KEEP: usize = 2 << 20;
+/// down to half of this: 1 MiB a class, halving idle dirty blocks without mid-wave slab thrash.
+pub const KEEP: usize = 1 << 20;
 
 /// The net bytes a thread gives or takes of one class before it adds them to the class's
 /// counts: a class's count is short of the truth by at most this per thread.

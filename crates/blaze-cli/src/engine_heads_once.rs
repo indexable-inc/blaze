@@ -153,7 +153,7 @@ fn shard_of_want(want: Want) -> u64 {
 /// the 1-based local index within that shard (`1..=SLAB_SHARD_CAP`), so non-empty refs are always
 /// non-zero even in shard `0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-struct SliceRef(u32);
+pub(crate) struct SliceRef(u32);
 
 type SlabBucket<T> = Vec<OnceLock<blaze_own::Box<[T], SharedAlloc<'static>>>, SharedAlloc<'static>>;
 type SlabOuter<T> = Vec<OnceLock<SlabBucket<T>>, SharedAlloc<'static>>;
@@ -164,16 +164,16 @@ struct SlabShard<T> {
 }
 
 /// Safe, lock-free-on-read, 128-way sharded append-only store of boxed slices owned by
-/// [`HeadsOnce`]. Each shard is 128 B [`CachePadded`] (rule 86) with lazily initialized buckets,
-/// eliminating global atomic contention across 128 workers while freeing everything when
-/// [`HeadsOnce`] drops at the end of `Stage::Heads` (zero `leak_static()`, zero `unsafe`).
-struct SliceSlab<T> {
+/// [`HeadsOnce`] (and `RequestTable::decoded_deps`). Each shard is 128 B [`CachePadded`] (rule 86)
+/// with lazily initialized buckets, eliminating global atomic contention across 128 workers while
+/// freeing everything when its owner drops (zero `leak_static()`, zero `unsafe`).
+pub(crate) struct SliceSlab<T> {
     shards: Vec<CachePadded<SlabShard<T>>, SharedAlloc<'static>>,
     alloc: SharedAlloc<'static>,
 }
 
 impl<T: Copy> SliceSlab<T> {
-    fn new(alloc: SharedAlloc<'static>) -> SliceSlab<T> {
+    pub(crate) fn new(alloc: SharedAlloc<'static>) -> SliceSlab<T> {
         let mut shards = Vec::with_capacity_in(SLAB_SHARDS, alloc);
         for _ in 0..SLAB_SHARDS {
             shards.push(CachePadded::new(SlabShard { next: AtomicU32::new(0), outer: OnceLock::new() }));
@@ -181,7 +181,16 @@ impl<T: Copy> SliceSlab<T> {
         SliceSlab { shards, alloc }
     }
 
-    fn push(&self, shard_hint: u64, items: &[T]) -> Option<SliceRef> {
+    pub(crate) fn push(&self, shard_hint: u64, items: &[T]) -> Option<SliceRef> {
+        if items.is_empty() {
+            return Some(SliceRef(0));
+        }
+        let mut copy = Vec::with_capacity_in(items.len(), self.alloc);
+        copy.extend_from_slice(items);
+        self.push_vec(shard_hint, copy)
+    }
+
+    pub(crate) fn push_vec(&self, shard_hint: u64, items: Vec<T, SharedAlloc<'static>>) -> Option<SliceRef> {
         if items.is_empty() {
             return Some(SliceRef(0));
         }
@@ -216,13 +225,11 @@ impl<T: Copy> SliceSlab<T> {
             slots
         });
         let cell = inner.get(lo)?;
-        let mut copy = Vec::with_capacity_in(items.len(), self.alloc);
-        copy.extend_from_slice(items);
-        let _ = cell.set(copy.into_boxed_slice());
+        let _ = cell.set(items.into_boxed_slice());
         Some(SliceRef((shard_u32 << SLAB_LOCAL_BITS) | local_one))
     }
 
-    fn get(&self, r: SliceRef) -> &[T] {
+    pub(crate) fn get(&self, r: SliceRef) -> &[T] {
         if r.0 == 0 {
             return &[];
         }
@@ -325,8 +332,10 @@ pub(crate) struct FailedEntry<'a> {
 /// command (or since the last commit, [`HeadsOnce::committed`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Looked {
-    /// A record, checked (engine_seeds.rs `dependency_head`): read in place on every ask.
+    /// A raw uncompressed record, checked (engine_seeds.rs `dependency_head`): read in place.
     Found,
+    /// A `BZR1`-compressed record, decompressed and checked once into `self.bytes_slab`.
+    FoundDecoded(SliceRef),
     /// None: a worker freezes it, and the phase's commit puts it ([`HeadsOnce::put_dependencies`]).
     Absent,
     /// A record that is not the head its key names, or a store that could not read: the phase's
@@ -574,7 +583,9 @@ impl HeadsOnce {
         let keys: Vec<Key, Alloc<'static>> = {
             let puts = self.pending_puts(g);
             for (key, names_at, bytes) in puts.iter() {
-                let parts: [&[u8]; 2] = [&names_at.0.0, *bytes];
+                let encoded = crate::store::record_codec::encode_selective_in(bytes, g)
+                    .map_err(|_| CliError::Text { what: "a closed dependency head could not be compressed into BZR1 (engine_heads_once.rs `put_dependencies`)" })?;
+                let parts: [&[u8]; 2] = [&names_at.0.0, encoded.as_slice()];
                 ledger.put(Stage::Heads, *key, &parts, 0);
                 store.put_parts(cx, *key, &parts)?;
             }
@@ -928,7 +939,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
             match pin.get(&at) {
                 Some(looked) => *looked,
                 None => {
-                    let looked = look_up(&finder.records, key, names_at, cell);
+                    let looked = look_up(&finder.records, key, names_at, cell, &self.bytes_slab, shard_of_want(cell), self.heap.shared());
                     // Past the cap a look is made again on each ask, never kept (rule 18): the
                     // answer is the same, its cost a probe of the store's index.
                     if self.looked_count.load(Ordering::Relaxed) >= MOST_CELLS {
@@ -937,7 +948,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
                         match pin.try_insert(at, looked) {
                             Ok(_) => {
                                 self.looked_count.fetch_add(1, Ordering::Relaxed);
-                                if looked == Looked::Found {
+                                if matches!(looked, Looked::Found | Looked::FoundDecoded(_)) {
                                     self.deps_found.fetch_add(1, Ordering::Relaxed);
                                 }
                                 looked
@@ -950,6 +961,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
         };
         match looked {
             Looked::Found => finder.records.record(key).ok().flatten().and_then(|bytes| bytes.get(KEY_BYTES..)),
+            Looked::FoundDecoded(slice) => Some(self.bytes_slab.get(slice)),
             Looked::Absent | Looked::Bad(_) => None,
         }
     }
@@ -958,7 +970,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
     fn bad(&self) -> Option<&'static str> {
         self.looked.pin().iter().find_map(|(_, looked)| match looked {
             Looked::Bad(why) => Some(*why),
-            Looked::Found | Looked::Absent => None,
+            Looked::Found | Looked::FoundDecoded(_) | Looked::Absent => None,
         })
     }
 
@@ -970,7 +982,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
         let looked = self.looked.pin();
         for (at, entry) in self.cells.pin().iter() {
             let Some((key, names_at)) = entry.record else { continue };
-            if looked.get(at) == Some(&Looked::Found) {
+            if matches!(looked.get(at), Some(Looked::Found | Looked::FoundDecoded(_))) {
                 continue;
             }
             if self.put_keys.binary_search(&key).is_ok() {
@@ -1023,11 +1035,24 @@ impl<R: HeadRecords> HeadsOnce<R> {
     }
 }
 
-/// The record under `key` in `records`, checked as `cell`'s head over `names_at`.
-fn look_up<R: HeadRecords>(records: &R, key: Key, names_at: Key, cell: Want) -> Looked {
+/// The record under `key` in `records`, checked as `cell`'s head over `names_at` (transparently
+/// decoding a `BZR1` envelope after `KEY_BYTES` into `slab` when compressed).
+fn look_up<R: HeadRecords>(
+    records: &R,
+    key: Key,
+    names_at: Key,
+    cell: Want,
+    slab: &SliceSlab<u8>,
+    shard_hint: u64,
+    alloc: SharedAlloc<'static>,
+) -> Looked {
     match records.record(key) {
-        Ok(Some(bytes)) => match records.head(bytes, names_at, cell) {
-            Ok(_) => Looked::Found,
+        Ok(Some(bytes)) => match records.head_decoded(bytes, names_at, cell, alloc) {
+            Ok(crate::store::record_codec::Decoded::Borrowed(_)) => Looked::Found,
+            Ok(crate::store::record_codec::Decoded::Owned(decoded)) => match slab.push_vec(shard_hint, decoded) {
+                Some(slice) => Looked::FoundDecoded(slice),
+                None => Looked::Bad("the request's head byte slab is full (engine_heads_once.rs `look_up`)"),
+            },
             Err(why) => Looked::Bad(why),
         },
         Ok(None) => Looked::Absent,

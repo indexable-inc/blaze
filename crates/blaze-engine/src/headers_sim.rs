@@ -43,7 +43,6 @@ use std::string::String;
 use std::sync::Mutex;
 use std::vec::Vec as StdVec;
 
-use blaze_drive::answers::page_of;
 use blaze_drive::cells::Cell;
 use blaze_drive::key::{Key, Kind, Name};
 use blaze_id::ContentId;
@@ -53,8 +52,8 @@ use crate::StoredPages;
 use crate::engine::{Answer, CellId, Gen, Phase, Plant, Planned, Row};
 use crate::last::LastError;
 use crate::pages::{
-    Header, Headers, HeadersPlant, IndexedHeaders, Kept, PagesError, ROOT_PAGE, Root, Sealed, VerifiedPage, Writer, decode, decode_root,
-    encode, encode_changes,
+    Header, Headers, HeadersPlant, IndexedHeaders, Kept, PagesError, ROOT_PAGE, Root, Sealed, VerifiedPage, Writer,
+    content_page_of, decode, decode_root, encode, encode_changes, page_for_ask, readers_page_of,
 };
 use crate::sim::{Crates, Item, Pools, World, alloc, edit, first_world, oracle, request};
 
@@ -151,7 +150,11 @@ impl<'b> Reader<'b> {
 
 impl StoredPages for Reader<'_> {
     fn page(&self, name: Name) -> Result<Option<&VerifiedPage<'_>>, PagesError> {
-        self.page_at(page_of(name, self.root.bits) as usize)
+        self.page_at(content_page_of(name, self.root.bits) as usize)
+    }
+
+    fn page_for(&self, name: Name, ask: crate::Ask) -> Result<Option<&VerifiedPage<'_>>, PagesError> {
+        self.page_at(page_for_ask(name, ask, self.root.bits) as usize)
     }
 
     fn header(&self, name: Name) -> Result<Option<Header>, PagesError> {
@@ -428,17 +431,18 @@ fn a_ready_edit_reads_no_shard_and_pages_its_names_alone() {
     }
     names.extend(step.entered.iter().copied());
     let mut bound: BTreeSet<Name> = names.clone();
+    let mut reader_cells: BTreeSet<CellId> = BTreeSet::new();
     for answer in [&last.answer, &fresh.answer] {
         for name in names.iter() {
             if let Some(row) = answer.rows.get(name) {
-                // A read's definer, and the page of that cell's readers (pages.rs
-                // `readers_slot`): a reader joining or leaving a list rewrites that page.
+                // A read's definer (content half), and the upper-half page of that cell's readers
+                // (`readers_page_of`): a reader joining or leaving a list rewrites that page.
                 bound.extend(row.reads.iter().map(|(id, _)| id.of));
-                bound.extend(row.reads.iter().map(|(id, _)| crate::pages::readers_slot(id)));
+                reader_cells.extend(row.reads.iter().map(|(id, _)| *id));
                 bound.insert(row.file);
                 for (cell, _) in row.defines.iter() {
                     let id = CellId { of: *name, cell: *cell };
-                    bound.insert(crate::pages::readers_slot(&id));
+                    reader_cells.insert(id);
                     if let Some(readers) = answer.readers.get(&id) {
                         bound.extend(readers.iter().copied());
                     }
@@ -446,8 +450,9 @@ fn a_ready_edit_reads_no_shard_and_pages_its_names_alone() {
             }
         }
     }
-    // Paged as the root the request read was.
-    let pages: BTreeSet<u32> = bound.iter().map(|name| page_of(*name, step.bits)).collect();
+    // Paged as the root the request read was (lower half for content, upper half for readers).
+    let mut pages: BTreeSet<u32> = bound.iter().map(|name| content_page_of(*name, step.bits)).collect();
+    pages.extend(reader_cells.iter().map(|id| readers_page_of(id, step.bits)));
     let beyond: StdVec<u32> = step.touched.difference(&pages).copied().collect();
     println!(
         "pages touched {} of {}, all within the {} pages of the request's names ({} names); {} shard asks",

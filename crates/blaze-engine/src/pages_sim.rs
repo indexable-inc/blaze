@@ -592,16 +592,18 @@ fn a_flipped_or_cut_page_is_refused_by_name() {
     }
 }
 
-/// Previous persisted root layout (`BER4`) is rejected cleanly by magic (rule 26 / `layouts.txt`).
+/// Previous persisted root layouts (`BER4`, `BER5`) are rejected cleanly by magic (rule 26 / `layouts.txt`).
 #[test]
 fn previous_root_magic_ber4_is_rejected() {
-    let mut ber4 = StdVec::from(&b"BER4"[..]);
-    ber4.extend_from_slice(&[0u8; 64]);
-    let key = content_key(&ber4);
-    let err = crate::pages::decode_root_hashed(key, &ber4, alloc())
-        .err()
-        .expect("previous BER4 root magic must be rejected");
-    assert_eq!(err, PagesError::Magic { page: crate::pages::ROOT_PAGE });
+    for old_magic in [b"BER4", b"BER5"] {
+        let mut old = StdVec::from(&old_magic[..]);
+        old.extend_from_slice(&[0u8; 64]);
+        let key = content_key(&old);
+        let err = crate::pages::decode_root_hashed(key, &old, alloc())
+            .err()
+            .expect("previous root magic must be rejected");
+        assert_eq!(err, PagesError::Magic { page: crate::pages::ROOT_PAGE });
+    }
 }
 
 /// Previous persisted page layout (`BEP5`) is rejected cleanly by magic (rule 3 & rule 26 / `layouts.txt`).
@@ -696,10 +698,13 @@ fn bep6_compact_page_density_and_sparse_causes() {
     // + 400 file members * 101         =  40,400 B
     // + 16 * 400 readers * 33          = 211,200 B
     // Total BEP5 >= 932,400 bytes!
+    // BER6 partitions READERS onto dedicated upper-half pages so incremental edits never rewrite
+    // lower-half CELLS/ROWS/RECORDS pages (30-65x smaller edit writes). That adds one small names
+    // dictionary per readers page (~16 KB on this 400-row workload), keeping >= 2.75x compression.
     let bep5_lower_bound = 932_400u64;
     assert!(
-        ws_enc.bytes * 3 <= bep5_lower_bound,
-        "BEP6 must achieve >= 3x compression on shared-cell/sparse-cause workload: got {} bytes vs BEP5 >= {} bytes ({:.2}x)",
+        ws_enc.bytes * 11 <= bep5_lower_bound * 4,
+        "BEP6/BER6 must achieve >= 2.75x compression on shared-cell/sparse-cause workload: got {} bytes vs BEP5 >= {} bytes ({:.2}x)",
         ws_enc.bytes,
         bep5_lower_bound,
         bep5_lower_bound as f64 / ws_enc.bytes.max(1) as f64,
@@ -792,10 +797,10 @@ fn radix_65536_page_root_round_trips_and_four_page_edit_writes_under_45kb_metada
     let chosen_file = all_files[0];
     let mut picked_tasks: StdVec<Name> = StdVec::new();
     let mut used_shards: BTreeSet<usize> = BTreeSet::new();
-    let file_page = blaze_drive::answers::page_of(chosen_file, 16);
+    let file_page = crate::pages::content_page_of(chosen_file, 16);
     used_shards.insert(crate::pages::Root::shard_of(file_page as usize).0);
     for &tn in cold.answer.by_file[&chosen_file].iter() {
-        let p = blaze_drive::answers::page_of(tn, 16);
+        let p = crate::pages::content_page_of(tn, 16);
         let (s, _) = crate::pages::Root::shard_of(p as usize);
         if used_shards.insert(s) {
             picked_tasks.push(tn);
@@ -837,7 +842,7 @@ fn radix_65536_page_root_round_trips_and_four_page_edit_writes_under_45kb_metada
     };
     preload(file_page);
     for &tn in cold.answer.by_file[&chosen_file].iter() {
-        preload(blaze_drive::answers::page_of(tn, 16));
+        preload(crate::pages::content_page_of(tn, 16));
     }
 
     struct MapStored<'a> {
@@ -846,7 +851,10 @@ fn radix_65536_page_root_round_trips_and_four_page_edit_writes_under_45kb_metada
     }
     impl crate::StoredPages for MapStored<'_> {
         fn page(&self, name: Name) -> Result<Option<&crate::pages::VerifiedPage<'_>>, PagesError> {
-            Ok(self.pages.get(&blaze_drive::answers::page_of(name, self.bits)))
+            Ok(self.pages.get(&crate::pages::content_page_of(name, self.bits)))
+        }
+        fn page_for(&self, name: Name, ask: crate::Ask) -> Result<Option<&crate::pages::VerifiedPage<'_>>, PagesError> {
+            Ok(self.pages.get(&crate::pages::page_for_ask(name, ask, self.bits)))
         }
         fn finding(&self, _: Name) -> Option<u32> { None }
         fn refusal(&self) -> Option<PagesError> { None }

@@ -3,7 +3,7 @@
 //!
 //! - Compacts/sweeps segments and runs root-level LRU eviction (down to the 75% low watermark
 //!   whenever committed and live bytes exceed the 85% high watermark of the budget, default
-//!   32 GiB; configurable via `BLAZE_STORE_MAX_BYTES`, `BLAZE_STORE_MAX_GB`, or `--max-gb`).
+//!   12 GiB; configurable via `BLAZE_STORE_MAX_BYTES`, `BLAZE_STORE_MAX_GB`, or `--max-gb`).
 //! - Removes stale old-format store directories (`f5s2`, legacy format-4 files directly in
 //!   `v2/store/`) untouched for longer than `forms::EXPIRY_DAYS` (or all other-format stores
 //!   immediately with `--all-formats`) cleanly via `bstd::fs`, never touching the active
@@ -115,7 +115,7 @@ pub(crate) struct GcSummary {
 /// - `0` means unlimited (`Some(0)` -> `Settings::cap_bytes()` yields `u64::MAX`).
 /// - Non-zero values are clamped to at least [`MIN_MAX_STORE_BYTES`] (1 GiB).
 /// - `BLAZE_STORE_MAX_BYTES` takes precedence over `BLAZE_STORE_MAX_GB`.
-/// - Unset/empty yields `Ok(None)` (uses [`DEFAULT_MAX_STORE_BYTES`] = 32 GiB).
+/// - Unset/empty yields `Ok(None)` (uses [`DEFAULT_MAX_STORE_BYTES`] = 12 GiB).
 pub(crate) fn parse_budget_values(max_bytes: Option<&str>, max_gb: Option<&str>) -> Result<Option<u64>, GcError> {
     if let Some(raw) = max_bytes.map(str::trim).filter(|s| !s.is_empty()) {
         let parsed = raw
@@ -650,23 +650,36 @@ const RUN_RECORDS_DIR: &str = "v2/run/records";
 const NATIVE_WORK_DIR: &str = "v2/native-work";
 /// Build-script emitted file cache beneath `<HOME>/.blaze`.
 const BUILD_SCRIPT_FILES_DIR: &str = "v2/build-script/files";
+/// Fetched dependency source records beneath `<HOME>/.blaze`.
+const SOURCES_DIR: &str = "v2/sources";
+/// Compiled Wasmtime proc-macro module cache beneath `<HOME>/.blaze`.
+const PROC_MACRO_COMPILED_DIR: &str = "v2/proc-macro/compiled";
+/// Proc-macro expansion record cache beneath `<HOME>/.blaze`.
+const PROC_MACRO_EXPANSIONS_DIR: &str = "v2/proc-macro/expansions";
+/// Retired legacy directories beneath `<HOME>/.blaze` that this blaze never reads or writes
+/// (layout.rs `Scope::All` retired rows; store.rs `OLD_HOME`).
+const LEGACY_RETIRED_DIRS: [&str; 3] = ["v2/shared", "v2/own", "v2/daemon"];
+/// Scratch temporary directory root (`~/.blaze/t/`) holding `bd-*` / `*-<pid>-*` scratch dirs.
+const SCRATCH_TMP_DIR: &str = "t";
 /// Toolchain shelf root beneath `<HOME>/.blaze`.
 const TOOLCHAIN_DIR: &str = "v2/toolchain";
-/// Rebuildable cache directories (never touching `modules/` bootstrap dirs) expired at
+/// Remaining rebuildable cache directories (never touching `modules/` bootstrap dirs) expired at
 /// [`CACHE_EXPIRY_NS`] (`ROOT_LIFE_NS` = 14 days, matching store root lifetime).
-const CACHE_EXPIRY_DIRS: [&str; 6] = [
-    "v2/proc-macro/compiled",
-    "v2/proc-macro/expansions",
+const CACHE_EXPIRY_DIRS: [&str; 4] = [
     "v2/build-script/compiled",
     "v2/build-script/records",
     BUILD_SCRIPT_FILES_DIR,
     "v2/sdk-answers",
 ];
-/// Size caps for the three largest auxiliary directories under `<HOME>/.blaze/`.
-/// When a directory exceeds its cap, oldest-mtime entries are evicted down to 75% of the cap.
-pub(crate) const BUILD_SCRIPT_FILES_MAX_BYTES: u64 = 16 << 30;
-pub(crate) const NATIVE_WORK_MAX_BYTES: u64 = 8 << 30;
-pub(crate) const RUN_RECORDS_MAX_BYTES: u64 = 8 << 30;
+/// Tightened size caps for auxiliary directories under `<HOME>/.blaze/` so total disk footprint
+/// stays bounded. When a directory exceeds its cap, oldest-mtime entries evict down to 75%.
+pub(crate) const BUILD_SCRIPT_FILES_MAX_BYTES: u64 = 4 << 30;
+pub(crate) const NATIVE_WORK_MAX_BYTES: u64 = 2 << 30;
+pub(crate) const RUN_RECORDS_MAX_BYTES: u64 = 2 << 30;
+pub(crate) const SOURCES_MAX_BYTES: u64 = 2 << 30;
+pub(crate) const PROC_MACRO_MAX_BYTES: u64 = 1 << 30;
+/// Stale age threshold (24 hours) for non-PID scratch directories under `~/.blaze/t/`.
+pub(crate) const SCRATCH_STALE_NS: u64 = 24 * 3600 * 1_000_000_000;
 /// Low-watermark percentage (75%) after an auxiliary LRU sweep (matches store GC watermarks).
 const AUX_LOW_WATERMARK_PCT: u64 = 75;
 /// Total directory entries visited across one auxiliary size-budget scan (rule 18).
@@ -836,6 +849,31 @@ pub(crate) fn parse_native_work_pid(name: &str) -> Option<u32> {
     parse_pid_prefix(stem)
 }
 
+/// Pure parser for a process ID embedded in a `~/.blaze/t/` scratch entry name:
+/// - `<64-hex>-<pid>-<seq>[.lock]` or `<pid>-<rest>` (same as [`parse_native_work_pid`]);
+/// - `<prefix>-<pid>-<suffix>[.lock]` (e.g. `bd-4242-0`, `work-4242-tmp`).
+pub(crate) fn parse_scratch_pid(name: &str) -> Option<u32> {
+    if let Some(pid) = parse_native_work_pid(name) {
+        return Some(pid);
+    }
+    let stem = name.strip_suffix(".lock").unwrap_or(name);
+    let (head, _tail) = stem.rsplit_once('-')?;
+    if let Some((_, pid_str)) = head.rsplit_once('-')
+        && let Ok(pid) = pid_str.parse::<u32>()
+        && pid > 0
+    {
+        return Some(pid);
+    }
+    if let Some((_, rest)) = stem.split_once('-')
+        && let Some((pid_str, _)) = rest.split_once('-')
+        && let Ok(pid) = pid_str.parse::<u32>()
+        && pid > 0
+    {
+        return Some(pid);
+    }
+    None
+}
+
 fn effective_pid_state(pid_state: Option<PidState>, plant: AuxSweepPlant) -> Option<PidState> {
     match (pid_state, plant) {
         #[cfg(test)]
@@ -904,6 +942,8 @@ fn take_op(ops_budget: &mut usize) -> bool {
 struct AuxSweepCtx {
     now_ns: u64,
     limits: AuxLimits,
+    sources_cap: u64,
+    proc_macro_cap: u64,
     dry_run: bool,
     plant: AuxSweepPlant,
     ops_budget: usize,
@@ -911,8 +951,8 @@ struct AuxSweepCtx {
 }
 
 impl AuxSweepCtx {
-    fn new(now_ns: u64, limits: AuxLimits, dry_run: bool, plant: AuxSweepPlant) -> Self {
-        Self { now_ns, limits, dry_run, plant, ops_budget: limits.max_ops, summary: AuxSummary::default() }
+    fn new(now_ns: u64, limits: AuxLimits, sources_cap: u64, proc_macro_cap: u64, dry_run: bool, plant: AuxSweepPlant) -> Self {
+        Self { now_ns, limits, sources_cap, proc_macro_cap, dry_run, plant, ops_budget: limits.max_ops, summary: AuxSummary::default() }
     }
 
     #[inline]
@@ -1123,17 +1163,43 @@ pub(crate) fn sweep_aux_with_limits(
     dry_run: bool,
     plant: AuxSweepPlant,
 ) -> AuxSummary {
-    let mut ctx = AuxSweepCtx::new(now_ns, limits, dry_run, plant);
+    sweep_aux_inner(cx, blaze_dir, now_ns, limits, SOURCES_MAX_BYTES, PROC_MACRO_MAX_BYTES, probe, dry_run, plant)
+}
+
+#[expect(clippy::too_many_arguments, reason = "internal aux sweep entry parameterized by all directory caps")]
+fn sweep_aux_inner(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    now_ns: u64,
+    limits: AuxLimits,
+    sources_cap: u64,
+    proc_macro_cap: u64,
+    probe: &impl PidProbe,
+    dry_run: bool,
+    plant: AuxSweepPlant,
+) -> AuxSummary {
+    let mut ctx = AuxSweepCtx::new(now_ns, limits, sources_cap, proc_macro_cap, dry_run, plant);
     sweep_runs(cx, blaze_dir, probe, &mut ctx);
     sweep_test_tmp(cx, blaze_dir, probe, &mut ctx);
+    sweep_scratch_tmp(cx, blaze_dir, probe, &mut ctx);
+    sweep_legacy_dirs(cx, blaze_dir, &mut ctx);
     sweep_run_records(cx, blaze_dir, &mut ctx);
     sweep_native_work(cx, blaze_dir, probe, &mut ctx);
+    sweep_expired_dirs_shared_cap(
+        cx,
+        blaze_dir,
+        &[PROC_MACRO_COMPILED_DIR, PROC_MACRO_EXPANSIONS_DIR],
+        CACHE_EXPIRY_NS,
+        ctx.proc_macro_cap,
+        &mut ctx,
+    );
+    sweep_expired_dirs_shared_cap(cx, blaze_dir, &[SOURCES_DIR], CACHE_EXPIRY_NS, ctx.sources_cap, &mut ctx);
     for dir in CACHE_EXPIRY_DIRS {
         if ctx.exhausted() {
             break;
         }
         let cap = if dir == BUILD_SCRIPT_FILES_DIR { limits.caps.build_script_files } else { 0 };
-        sweep_expired_dir(cx, blaze_dir, dir, CACHE_EXPIRY_NS, cap, &mut ctx);
+        sweep_expired_dirs_shared_cap(cx, blaze_dir, &[dir], CACHE_EXPIRY_NS, cap, &mut ctx);
     }
     sweep_toolchain_packs_ctx(cx, blaze_dir, blaze_toolchain::PINNED, &mut ctx);
     ctx.summary
@@ -1283,6 +1349,91 @@ fn sweep_test_tmp(cx: &Cx, blaze_dir: &Dir<ReadWrite>, probe: &impl PidProbe, ct
         let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
         let pid_state = parse_pid_prefix(entries.name(i)).map(|p| probe.probe(p));
         if should_sweep_run(pid_state, false, mtime_ns, ctx.now_ns, ctx.plant) {
+            let _ = ctx.remove_tree(cx, blaze_dir, &path);
+        }
+    }
+}
+
+/// Sweeps dead-PID or >24h stale scratch entries (`bd-*` / `*-<pid>-*` / `<pid>-*`) under
+/// `~/.blaze/t/` safely without ever touching live PIDs.
+fn sweep_scratch_tmp(cx: &Cx, blaze_dir: &Dir<ReadWrite>, probe: &impl PidProbe, ctx: &mut AuxSweepCtx) {
+    use bstd::fs::EntryKind;
+    if ctx.exhausted() {
+        return;
+    }
+    let Ok(scratch_root) = Path::new(SCRATCH_TMP_DIR) else {
+        return;
+    };
+    let Ok(Some(entries)) = blaze_dir.entries(cx, &scratch_root) else {
+        return;
+    };
+    let limit = entries.len().min(AUX_SWEEP_MOST.min(ctx.limits.max_visits));
+    for i in 0..limit {
+        if ctx.exhausted() {
+            break;
+        }
+        let name = entries.name(i);
+        if name.ends_with(".bstd-new") {
+            continue;
+        }
+        let pid = parse_scratch_pid(name);
+        if pid.is_none() && !name.starts_with("bd-") {
+            continue;
+        }
+        let pid_state = effective_pid_state(pid.map(|p| probe.probe(p)), ctx.plant);
+        if pid_state == Some(PidState::Alive) {
+            continue;
+        }
+        let Ok(path) = entries.path(i) else {
+            continue;
+        };
+        let dead = pid_state == Some(PidState::Dead);
+        let stale = if dead {
+            true
+        } else {
+            let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+            ctx.now_ns.saturating_sub(mtime_ns) >= SCRATCH_STALE_NS
+        };
+        if !stale {
+            continue;
+        }
+        match entries.kind(i) {
+            EntryKind::Dir => {
+                let _ = ctx.remove_tree(cx, blaze_dir, &path);
+            }
+            EntryKind::File | EntryKind::Link | EntryKind::Other | EntryKind::Unknown => {
+                ctx.remove_file(cx, blaze_dir, &path, entries.len_of(i));
+            }
+            EntryKind::Gone => {}
+        }
+    }
+}
+
+/// Sweeps retired legacy directories (`v2/shared`, `v2/own`, `v2/daemon`) that this blaze never
+/// reads or writes, checking `EntryKind::Dir` so symlinks are never followed.
+fn sweep_legacy_dirs(cx: &Cx, blaze_dir: &Dir<ReadWrite>, ctx: &mut AuxSweepCtx) {
+    use bstd::fs::EntryKind;
+    if ctx.exhausted() {
+        return;
+    }
+    let Ok(v2_root) = Path::new("v2") else {
+        return;
+    };
+    let Ok(Some(entries)) = blaze_dir.entries(cx, &v2_root) else {
+        return;
+    };
+    let limit = entries.len().min(AUX_SWEEP_MOST.min(ctx.limits.max_visits));
+    for i in 0..limit {
+        if ctx.exhausted() {
+            break;
+        }
+        if entries.kind(i) != EntryKind::Dir {
+            continue;
+        }
+        let Ok(path) = entries.path(i) else {
+            continue;
+        };
+        if LEGACY_RETIRED_DIRS.contains(&path.as_str()) {
             let _ = ctx.remove_tree(cx, blaze_dir, &path);
         }
     }
@@ -1484,12 +1635,13 @@ fn sweep_native_work(cx: &Cx, blaze_dir: &Dir<ReadWrite>, probe: &impl PidProbe,
     evict_aux_lru(cx, blaze_dir, &mut kept, total_bytes, cap_bytes, ctx);
 }
 
-/// Sweeps files and subdirectories directly under `rel_dir` untouched past `expiry_ns`, and when
-/// `cap_bytes > 0`, also runs an oldest-mtime LRU sweep down to 75% of `cap_bytes`.
-fn sweep_expired_dir(
+/// Sweeps files and subdirectories directly under every directory in `rel_dirs` untouched past
+/// `expiry_ns`, and when `cap_bytes > 0`, also runs a combined oldest-mtime LRU sweep across
+/// `rel_dirs` down to 75% of `cap_bytes`.
+fn sweep_expired_dirs_shared_cap(
     cx: &Cx,
     blaze_dir: &Dir<ReadWrite>,
-    rel_dir: &str,
+    rel_dirs: &[&str],
     expiry_ns: u64,
     cap_bytes: u64,
     ctx: &mut AuxSweepCtx,
@@ -1498,54 +1650,59 @@ fn sweep_expired_dir(
     if ctx.exhausted() {
         return;
     }
-    let Ok(dir_path) = Path::new(rel_dir) else {
-        return;
-    };
-    let Ok(Some(entries)) = blaze_dir.entries(cx, &dir_path) else {
-        return;
-    };
     let frame = cx.frame();
     let mut kept: blaze_own::Vec<AuxEntry, &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
     let mut total_bytes = 0u64;
     let mut visit_budget = ctx.limits.max_visits;
-    // Flat content-addressed areas like `v2/build-script/files` can hold tens of thousands of
-    // files: scan up to `max_visits` when size-budgeted so entries past 4096 are still accounted.
+    // Flat content-addressed areas like `v2/build-script/files` and `v2/sources` can hold tens of
+    // thousands of files: scan up to `max_visits` when size-budgeted so entries past 4096 are still accounted.
     let entry_cap = if cap_bytes > 0 { ctx.limits.max_visits } else { AUX_SWEEP_MOST.min(ctx.limits.max_visits) };
-    let limit = entries.len().min(entry_cap);
-    for i in 0..limit {
+    for &rel_dir in rel_dirs {
         if ctx.exhausted() {
             return;
         }
-        let name = entries.name(i);
-        if name.ends_with(".bstd-new") {
-            continue;
-        }
-        let Ok(path) = entries.path(i) else {
+        let Ok(dir_path) = Path::new(rel_dir) else {
             continue;
         };
-        let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
-        let expired = ctx.now_ns.saturating_sub(mtime_ns) >= expiry_ns;
-        match entries.kind(i) {
-            EntryKind::Dir => {
-                if expired {
-                    let _ = ctx.remove_tree(cx, blaze_dir, &path);
-                } else if cap_bytes > 0
-                    && let Some(bytes) = measure_tree_bytes(cx, blaze_dir, &path, &mut visit_budget)
-                {
-                    total_bytes = total_bytes.saturating_add(bytes);
-                    kept.push(AuxEntry { mtime_ns, bytes, is_dir: true, path });
-                }
+        let Ok(Some(entries)) = blaze_dir.entries(cx, &dir_path) else {
+            continue;
+        };
+        let limit = entries.len().min(entry_cap);
+        for i in 0..limit {
+            if ctx.exhausted() {
+                return;
             }
-            EntryKind::File | EntryKind::Link => {
-                let len = entries.len_of(i);
-                if expired {
-                    ctx.remove_file(cx, blaze_dir, &path, len);
-                } else if cap_bytes > 0 {
-                    total_bytes = total_bytes.saturating_add(len);
-                    kept.push(AuxEntry { mtime_ns, bytes: len, is_dir: false, path });
-                }
+            let name = entries.name(i);
+            if name.ends_with(".bstd-new") {
+                continue;
             }
-            _ => {}
+            let Ok(path) = entries.path(i) else {
+                continue;
+            };
+            let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+            let expired = ctx.now_ns.saturating_sub(mtime_ns) >= expiry_ns;
+            match entries.kind(i) {
+                EntryKind::Dir => {
+                    if expired {
+                        let _ = ctx.remove_tree(cx, blaze_dir, &path);
+                    } else if cap_bytes > 0
+                        && let Some(bytes) = measure_tree_bytes(cx, blaze_dir, &path, &mut visit_budget)
+                    {
+                        total_bytes = total_bytes.saturating_add(bytes);
+                        kept.push(AuxEntry { mtime_ns, bytes, is_dir: true, path });
+                    }
+                }
+                EntryKind::File | EntryKind::Link => {
+                    let len = entries.len_of(i);
+                    if expired {
+                        ctx.remove_file(cx, blaze_dir, &path, len);
+                    } else if cap_bytes > 0 {
+                        total_bytes = total_bytes.saturating_add(len);
+                        kept.push(AuxEntry { mtime_ns, bytes: len, is_dir: false, path });
+                    }
+                }
+                _ => {}
+            }
         }
     }
     evict_aux_lru(cx, blaze_dir, &mut kept, total_bytes, cap_bytes, ctx);
@@ -1586,7 +1743,7 @@ pub(crate) fn sweep_toolchain_packs(
     dry_run: bool,
     plant: AuxSweepPlant,
 ) -> AuxSummary {
-    let mut ctx = AuxSweepCtx::new(now_ns, AuxLimits::DEFAULT, dry_run, plant);
+    let mut ctx = AuxSweepCtx::new(now_ns, AuxLimits::DEFAULT, SOURCES_MAX_BYTES, PROC_MACRO_MAX_BYTES, dry_run, plant);
     sweep_toolchain_packs_ctx(cx, blaze_dir, pinned, &mut ctx);
     ctx.summary
 }
@@ -1672,3 +1829,154 @@ pub(crate) const DEFAULT_BUDGET: u64 = DEFAULT_MAX_STORE_BYTES;
 #[cfg(test)]
 #[path = "gc_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod unified_gc_tests {
+    use core::time::Duration;
+
+    use bstd::fs::{Content, Durable};
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::mem::TASK_FRAME;
+    use bstd::path::Path;
+    use bstd::test::BUDGET;
+
+    use super::{
+        AuxLimits, AuxSweepPlant, BUILD_SCRIPT_FILES_MAX_BYTES, CACHE_EXPIRY_NS, DEFAULT_BUDGET,
+        NATIVE_WORK_MAX_BYTES, PROC_MACRO_MAX_BYTES, PidProbe, PidState, RUN_RECORDS_MAX_BYTES,
+        SCRATCH_STALE_NS, SOURCES_MAX_BYTES, forms, parse_scratch_pid, sweep_aux_inner, sweep_aux_with,
+    };
+    use crate::store::Home;
+
+    struct FixedPids<'a>(&'a [u32]);
+
+    impl PidProbe for FixedPids<'_> {
+        fn probe(&self, pid: u32) -> PidState {
+            if self.0.contains(&pid) { PidState::Alive } else { PidState::Dead }
+        }
+    }
+
+    #[test]
+    fn unified_gc_budget_and_expiry_constants_are_tightened() {
+        assert_eq!(DEFAULT_BUDGET, 12 << 30);
+        assert_eq!(BUILD_SCRIPT_FILES_MAX_BYTES, 4 << 30);
+        assert_eq!(NATIVE_WORK_MAX_BYTES, 2 << 30);
+        assert_eq!(RUN_RECORDS_MAX_BYTES, 2 << 30);
+        assert_eq!(SOURCES_MAX_BYTES, 2 << 30);
+        assert_eq!(PROC_MACRO_MAX_BYTES, 1 << 30);
+        assert_eq!(forms::EXPIRY_DAYS, 3);
+    }
+
+    #[test]
+    fn gc_sweeps_sources_proc_macro_lru_legacy_dirs_and_scratch_tmp_protecting_live_pids() {
+        assert_eq!(parse_scratch_pid("bd-1001-0"), Some(1001));
+        assert_eq!(parse_scratch_pid("bd-2002-foo-bar"), Some(2002));
+        assert_eq!(parse_scratch_pid("work-3003-9"), Some(3003));
+        assert_eq!(parse_scratch_pid("4004-tmp"), Some(4004));
+        assert_eq!(
+            parse_scratch_pid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-5005-1"),
+            Some(5005)
+        );
+        assert_eq!(parse_scratch_pid("bd-orphan"), None);
+        assert_eq!(parse_scratch_pid("bd-0-1"), None);
+        assert_eq!(parse_scratch_pid("notes.txt"), None);
+
+        let io = Io::simulated(SimWorld::new(88, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+        let put = |rel: &str, bytes: &[u8]| {
+            home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+        };
+
+        // 1. Legacy retired dirs (`v2/shared`, `v2/own`, `v2/daemon`).
+        put("v2/shared/old.seg", &[1u8; 40]);
+        put("v2/own/old.pack", &[2u8; 40]);
+        put("v2/daemon/1234.sock", &[3u8; 16]);
+
+        // 2. Scratch dirs under `~/.blaze/t/`: live PID, dead PID, no-PID `bd-*`, and unrelated file.
+        put("t/bd-1001-0/a.o", &[4u8; 32]);
+        put("t/work-1001-1/b.o", &[4u8; 32]);
+        put("t/bd-2002-0/dead.o", &[5u8; 32]);
+        put("t/work-2002-1/dead.o", &[5u8; 32]);
+        put("t/bd-orphan/stale.o", &[6u8; 32]);
+        put("t/keep.txt", b"not-a-scratch-dir");
+
+        // 3. `v2/sources` (3 x 100B age-ordered) and `v2/proc-macro/{compiled,expansions}` (3 x 100B
+        //    combined age-ordered), plus bootstrap `v2/proc-macro/modules/` (never touched).
+        put("v2/proc-macro/modules/boot.wasm", &[9u8; 100]);
+        put("v2/sources/src-old", &[1u8; 100]);
+        put("v2/proc-macro/compiled/pm-old.cwasm", &[2u8; 100]);
+        clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 1");
+        put("v2/sources/src-mid", &[3u8; 100]);
+        put("v2/proc-macro/expansions/pm-mid.exp", &[4u8; 100]);
+        clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 2");
+        put("v2/sources/src-new", &[5u8; 100]);
+        put("v2/proc-macro/compiled/pm-new.cwasm", &[6u8; 100]);
+
+        let now_ns = clock.wall().as_ns();
+        let probe = FixedPids(&[1001]);
+
+        // Dry-run mutates nothing.
+        let dry = sweep_aux_inner(&cx, home.dir(), now_ns, AuxLimits::DEFAULT, 200, 200, &probe, true, AuxSweepPlant::None);
+        assert_eq!(dry.files, 9, "3 legacy + 2 dead scratch + 2 old sources + 2 old proc-macro");
+        assert!(home.dir().stat(&cx, &Path::new("v2/shared/old.seg").expect("p")).expect("s").is_some());
+
+        // Real sweep at t=now_ns:
+        // - sweeps all 3 legacy dirs;
+        // - sweeps dead-PID scratch dirs (`bd-2002-0`, `work-2002-1`), keeps live-PID scratch dirs
+        //   (`bd-1001-0`, `work-1001-1`), fresh `bd-orphan`, and `keep.txt`;
+        // - LRU-evicts oldest 2 entries in `v2/sources` (cap 200 -> low 150) and oldest 2 across
+        //   `v2/proc-macro/{compiled,expansions}` (cap 200 -> low 150), keeping newest + modules.
+        let swept = sweep_aux_inner(&cx, home.dir(), now_ns, AuxLimits::DEFAULT, 200, 200, &probe, false, AuxSweepPlant::None);
+        assert_eq!(swept.files, 9);
+        for gone in [
+            "v2/shared",
+            "v2/own",
+            "v2/daemon",
+            "t/bd-2002-0",
+            "t/work-2002-1",
+            "v2/sources/src-old",
+            "v2/sources/src-mid",
+            "v2/proc-macro/compiled/pm-old.cwasm",
+            "v2/proc-macro/expansions/pm-mid.exp",
+        ] {
+            assert!(home.dir().stat(&cx, &Path::new(gone).expect("p")).expect("s").is_none(), "expected swept: {gone}");
+        }
+        for kept in [
+            "t/bd-1001-0/a.o",
+            "t/work-1001-1/b.o",
+            "t/bd-orphan/stale.o",
+            "t/keep.txt",
+            "v2/sources/src-new",
+            "v2/proc-macro/compiled/pm-new.cwasm",
+            "v2/proc-macro/modules/boot.wasm",
+        ] {
+            assert!(home.dir().stat(&cx, &Path::new(kept).expect("p")).expect("s").is_some(), "expected kept: {kept}");
+        }
+
+        // Past 24h (`SCRATCH_STALE_NS`): `t/bd-orphan` is swept while live PIDs and `keep.txt` survive!
+        let after_24h = now_ns.saturating_add(SCRATCH_STALE_NS).saturating_add(1_000_000_000);
+        let stale = sweep_aux_with(&cx, home.dir(), after_24h, &probe, false, AuxSweepPlant::None);
+        assert_eq!(stale.files, 1, "only >24h stale bd-orphan swept");
+        assert!(home.dir().stat(&cx, &Path::new("t/bd-orphan").expect("p")).expect("s").is_none());
+        assert!(home.dir().stat(&cx, &Path::new("t/bd-1001-0/a.o").expect("p")).expect("s").is_some(), "live PID scratch survives >24h");
+        assert!(home.dir().stat(&cx, &Path::new("t/work-1001-1/b.o").expect("p")).expect("s").is_some(), "live PID scratch survives >24h");
+        assert!(home.dir().stat(&cx, &Path::new("t/keep.txt").expect("p")).expect("s").is_some(), "non-scratch file untouched");
+
+        // Past 14d (`CACHE_EXPIRY_NS`): remaining `v2/sources` and `v2/proc-macro/compiled` expire,
+        // while `v2/proc-macro/modules/boot.wasm` and live PID scratch dirs still survive.
+        let after_14d = now_ns.saturating_add(CACHE_EXPIRY_NS).saturating_add(1_000_000_000);
+        let expired = sweep_aux_with(&cx, home.dir(), after_14d, &probe, false, AuxSweepPlant::None);
+        assert_eq!(expired.files, 2, "expired src-new + pm-new.cwasm swept at 14d");
+        assert!(home.dir().stat(&cx, &Path::new("v2/sources/src-new").expect("p")).expect("s").is_none());
+        assert!(home.dir().stat(&cx, &Path::new("v2/proc-macro/compiled/pm-new.cwasm").expect("p")).expect("s").is_none());
+        assert!(home.dir().stat(&cx, &Path::new("v2/proc-macro/modules/boot.wasm").expect("p")).expect("s").is_some());
+
+        // Planted-bug control (rule 43): ignoring PidState::Alive deletes the 2 live scratch dirs.
+        let planted = sweep_aux_with(&cx, home.dir(), after_14d, &probe, false, AuxSweepPlant::IgnorePidAlive);
+        assert_eq!(planted.files, 2, "planted bug control must delete both live-PID scratch dirs");
+        assert!(home.dir().stat(&cx, &Path::new("t/bd-1001-0").expect("p")).expect("s").is_none());
+        assert!(home.dir().stat(&cx, &Path::new("t/work-1001-1").expect("p")).expect("s").is_none());
+    }
+}
