@@ -2805,6 +2805,47 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
+    /// Emits `slot_dead` on any binding slots allocated for `p` (e.g. on a match guard's
+    /// false edge before jumping to the next arm, where `own_pat` never ran and `ScopeEnd`
+    /// will not execute).
+    fn end_pat_slots(&mut self, p: PatId) -> Result<(), BuildError> {
+        let mut todo = Vec::new_in(self.alloc);
+        todo.push(p);
+        while let Some(p) = todo.pop() {
+            let subs = match self.pat(p)? {
+                Pat::Bind { sub, .. } => {
+                    if let Some((home, _)) = self.slots.get(p.ix()).copied().flatten() {
+                        let slot = match home {
+                            Home::Slot(s) => Some(s),
+                            Home::At(val, off) => self.whole_slot((val, off)),
+                            Home::Indirect(..) => None,
+                        };
+                        if let Some(s) = slot && !self.vals_use_slot(s) {
+                            self.b.slot_dead(s);
+                        }
+                    }
+                    todo.extend(sub);
+                    continue;
+                }
+                Pat::Ref { inner, .. } => {
+                    todo.push(inner);
+                    continue;
+                }
+                Pat::Struct { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().rev().map(|fp| fp.pat));
+                    continue;
+                }
+                Pat::Or { alts } => alts,
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => elems,
+                _ => continue,
+            };
+            let subs = self.body.pat_lists.get(subs.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+            todo.extend(subs.iter().rev().copied());
+        }
+        Ok(())
+    }
+
     /// Stores `on` into binding `p`'s flag, if it has one.
     fn set_flag(&mut self, p: PatId, on: bool) {
         if on && let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
@@ -2921,6 +2962,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             (V::Place(..), Repr::Agg(_)) => {
                 let at = self.temp(repr);
                 self.store(v, repr, at)?;
+                self.end_temp_val(v);
                 Ok(V::Place(at.0, at.1))
             }
             _ => Ok(v),
@@ -2935,6 +2977,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             (V::Place(..), Repr::Agg(_)) => {
                 let at = self.temp(repr);
                 self.store(v, repr, at)?;
+                self.end_temp_val(v);
                 Ok(V::Place(at.0, at.1))
             }
             _ => Ok(v),
@@ -4425,15 +4468,26 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let st = self.matches[m as usize];
                 let next = self.arm_blocks[(st.first + i + 1) as usize];
                 let body = self.create();
-                self.br(c, (body, &[]), (next, &[]));
-                self.begin(body);
-                if let Ok(Expr::Match { arms, .. }) = self.expr(st.expr)
-                    && let Some(arm) = self
+                let arm = match self.expr(st.expr) {
+                    Ok(Expr::Match { arms, .. }) => self
                         .body
                         .arms
                         .get(arms.range())
                         .and_then(|l| usize::try_from(i).ok().and_then(|ix| l.get(ix)))
-                        .copied()
+                        .copied(),
+                    _ => None,
+                };
+                if self.co.is_some() && let Some(arm) = arm {
+                    let miss = self.create();
+                    self.br(c, (body, &[]), (miss, &[]));
+                    self.begin(miss);
+                    self.end_pat_slots(arm.pat)?;
+                    self.jump(next, &[]);
+                } else {
+                    self.br(c, (body, &[]), (next, &[]));
+                }
+                self.begin(body);
+                if let Some(arm) = arm
                     && !self.pat_has_ref(arm.pat)?
                 {
                     let scrut_slot = if let Some(at) = st.tested {

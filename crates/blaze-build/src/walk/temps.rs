@@ -528,7 +528,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// Whether any value currently on the walk's value stack addresses `slot`.
-    fn vals_use_slot(&self, slot: SlotId) -> bool {
+    pub(super) fn vals_use_slot(&self, slot: SlotId) -> bool {
         self.vals_slot_count(slot) > 0
     }
 
