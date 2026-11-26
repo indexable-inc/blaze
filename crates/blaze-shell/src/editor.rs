@@ -2797,6 +2797,78 @@ fn collect_path_completions(
             },
         ));
     }
+
+    // Lower-priority recursive git-tracked subfolder completion when inside a git repo:
+    // surfaces nested files like `src/main.rs` (e.g. `vim .r` or `vim main`) cleanly beneath
+    // direct `cwd` matches without scanning ignored build artifacts (`target/`, `node_modules/`).
+    if !file_prefix.is_empty()
+        && !dir_part.starts_with('/')
+        && let Some(subpaths) = crate::prompt::git_tracked_subpaths(&search_dir, dirs_only, 8192)
+    {
+        let mut sub_hits: Vec<(i32, CompletionItem)> = Vec::new();
+        for rel in subpaths {
+            let trimmed = rel.trim_end_matches('/');
+            let is_dir = rel.ends_with('/');
+            if !show_hidden && trimmed.split('/').any(|seg| seg.starts_with('.')) {
+                continue;
+            }
+            let (leaf_byte_off, leaf) = match trimmed.rfind('/') {
+                Some(i) => (i + 1, &trimmed[i + 1..]),
+                None => (0, trimmed),
+            };
+            let matched = if let Some((sc, mut leaf_idxs)) = fuzzy_match_score(leaf, file_prefix) {
+                let char_off = rel[..leaf_byte_off].chars().count();
+                for ix in &mut leaf_idxs {
+                    *ix += char_off;
+                }
+                Some((sc + 18, leaf_idxs))
+            } else {
+                fuzzy_match_score(&rel, file_prefix)
+            };
+            let Some((raw_score, idxs)) = matched else {
+                continue;
+            };
+            let depth = trimmed.bytes().filter(|&b| b == b'/').count() as i32;
+            // Rank strictly below direct `cwd` matches; shallower subfolders outrank deeper ones.
+            let adj_score = raw_score - 95 - depth * 15;
+            let kind_str = if is_dir { Some("dir") } else { Some("file") };
+            let icon = Some(icon_name_for_file(leaf, kind_str));
+            let raw_insert = format!("{dir_part}{rel}");
+            let insert = shell_quote_if_needed(&raw_insert);
+            let parent_hint = if leaf_byte_off > 0 {
+                &trimmed[..leaf_byte_off - 1]
+            } else {
+                ""
+            };
+            let detail = if is_dir {
+                "git dir".to_owned()
+            } else if parent_hint.is_empty() {
+                "git".to_owned()
+            } else {
+                format!("git · {parent_hint}")
+            };
+            let doc = if dir_part.is_empty() {
+                format!("{cwd}/{rel}")
+            } else {
+                raw_insert
+            };
+            sub_hits.push((
+                adj_score,
+                CompletionItem {
+                    label: rel,
+                    insert,
+                    detail,
+                    doc,
+                    kind: if is_dir { CompletionKind::Dir } else { CompletionKind::File },
+                    icon,
+                    match_indices: idxs,
+                },
+            ));
+        }
+        sub_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
+        sub_hits.truncate(20);
+        out.extend(sub_hits);
+    }
 }
 
 fn word_left_boundary(s: &str, cursor: usize) -> usize {

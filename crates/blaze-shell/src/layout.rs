@@ -22,7 +22,7 @@ use crate::editor::{
     PALETTE_VISIBLE_ROWS,
 };
 use crate::icons::{Icon, draw_icon, icon_for_record_key};
-use crate::prompt::PromptInfo;
+use crate::prompt::{GitFileStatus, PromptInfo};
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::tiling::{PaneId, SplitAxis, SplitHandle, SplitId, TabId};
@@ -1493,6 +1493,98 @@ fn full_path_for_entry(block_cwd: &str, block_source: &str, entry_name: &str) ->
     }
 }
 
+fn resolve_ls_target_dir(block_cwd: &str, block_source: &str) -> std::path::PathBuf {
+    if let Some(prefix) = resolve_block_dir_prefix(block_source) {
+        if prefix.starts_with('/') {
+            return std::path::PathBuf::from(prefix);
+        }
+        if let Some(rest) = prefix.strip_prefix("~/")
+            && let Ok(home) = std::env::var("HOME")
+        {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+        return std::path::PathBuf::from(block_cwd).join(prefix);
+    }
+    std::path::PathBuf::from(block_cwd)
+}
+
+fn cached_ls_git_statuses(
+    block: &Block,
+    entries: &[(String, bool)],
+) -> Option<Vec<GitFileStatus>> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<(u64, usize), (Instant, Option<Vec<GitFileStatus>>)>> =
+            RefCell::new(HashMap::new());
+    }
+    let key = (block.id.0, entries.len());
+    let cached = CACHE.with(|c| {
+        c.borrow()
+            .get(&key)
+            .filter(|(t, _)| t.elapsed() < Duration::from_millis(750))
+            .map(|(_, v)| v.clone())
+    });
+    if let Some(hit) = cached {
+        return hit;
+    }
+    let dir = resolve_ls_target_dir(&block.prompt_snapshot.cwd, &block.source);
+    let computed =
+        crate::prompt::git_ls_entry_statuses(&dir, entries, block.prompt_snapshot.git_status.as_ref());
+    CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() > 128 {
+            m.clear();
+        }
+        m.insert(key, (Instant::now(), computed.clone()));
+    });
+    computed
+}
+
+fn git_status_style(st: GitFileStatus, is_dir: bool) -> (f32, [f32; 4], Option<(&'static str, [f32; 4])>, bool) {
+    match st {
+        GitFileStatus::Ignored => (0.42, theme::INK_4, None, false),
+        GitFileStatus::Tracked => (
+            1.0,
+            if is_dir { theme::INK_1 } else { theme::INK_2 },
+            None,
+            true,
+        ),
+        GitFileStatus::Modified => (
+            1.0,
+            theme::rgb(0xf0, 0xd8, 0xa8),
+            Some(("M", theme::rgb(0xe5, 0xb5, 0x67))),
+            false,
+        ),
+        GitFileStatus::Staged => (
+            1.0,
+            theme::rgb(0xc6, 0xf6, 0xd5),
+            Some(("+", theme::rgb(0x4a, 0xde, 0x80))),
+            false,
+        ),
+        GitFileStatus::Untracked => (
+            1.0,
+            theme::rgb(0xb8, 0xd8, 0xf8),
+            Some(("?", theme::rgb(0x60, 0xa5, 0xfa))),
+            false,
+        ),
+        GitFileStatus::Deleted => (
+            0.75,
+            theme::rgb(0xf8, 0x71, 0x71),
+            Some(("D", theme::rgb(0xf8, 0x71, 0x71))),
+            false,
+        ),
+        GitFileStatus::Conflicted => (
+            1.0,
+            theme::rgb(0xff, 0xa8, 0xa8),
+            Some(("!", theme::rgb(0xf8, 0x51, 0x49))),
+            false,
+        ),
+    }
+}
+
 /// Compact `eza --grid`-style multi-column file & directory view using authentic macOS blue
 /// folders and IntelliJ New UI dark SVG icons — dense, instant scan, zero wasted height.
 #[allow(clippy::too_many_arguments)]
@@ -1528,14 +1620,16 @@ fn layout_file_grid(
     let icon_gap = (m.cw * 0.7).round().max(5.0);
     let col_gap = (m.cw * 1.8).round().max(14.0);
 
-    // Pre-collect display labels + SVG icon names.
+    // Pre-collect display labels + SVG icon names + optional git tracked/status badges.
     struct GridItem {
         raw: String,
         label: String,
         icon: &'static str,
         is_dir: bool,
+        git: Option<GitFileStatus>,
         w_px: f32,
     }
+    let mut raw_entries: Vec<(String, bool)> = Vec::with_capacity(visible);
     let mut items: Vec<GridItem> = Vec::with_capacity(visible);
     for r in 0..visible {
         let raw = table
@@ -1550,9 +1644,15 @@ fn layout_file_grid(
             raw.to_owned()
         };
         let icon = icon_name_for_file(raw, kind);
-        let label_chars = label.chars().count().min(32);
-        let w_px = icon_s + icon_gap + label_chars as f32 * m.cw;
-        items.push(GridItem { raw: raw.to_owned(), label, icon, is_dir, w_px });
+        raw_entries.push((raw.to_owned(), is_dir));
+        items.push(GridItem { raw: raw.to_owned(), label, icon, is_dir, git: None, w_px: 0.0 });
+    }
+    let git_statuses = cached_ls_git_statuses(block, &raw_entries);
+    let badge_pad = if git_statuses.is_some() { m.cw * 1.45 } else { 0.0 };
+    for (idx, item) in items.iter_mut().enumerate() {
+        item.git = git_statuses.as_ref().and_then(|v| v.get(idx).copied());
+        let label_chars = item.label.chars().count().min(32);
+        item.w_px = icon_s + icon_gap + label_chars as f32 * m.cw + badge_pad;
     }
 
     // Pick the largest column count `ncols` (1..=6) whose column-major widths fit in `width`
@@ -1589,13 +1689,32 @@ fn layout_file_grid(
             let idx = c * nrows + r;
             let cw = best_col_widths[c];
             if let Some(item) = items.get(idx) {
-                let max_ch = ((cw - icon_s - icon_gap).max(m.cw * 3.0) / m.cw).floor() as usize;
+                let max_ch = ((cw - icon_s - icon_gap - badge_pad).max(m.cw * 3.0) / m.cw).floor() as usize;
                 let txt = truncate_chars(&item.label, max_ch.max(3));
-                let item_w = icon_s + icon_gap + txt.chars().count() as f32 * m.cw;
-                scene.svg_icon(cx, iy, icon_s, item.icon, clip_id);
-                let col = if item.is_dir { theme::INK_1 } else { theme::INK_2 };
+                let txt_w = txt.chars().count() as f32 * m.cw;
+                let (icon_alpha, col, badge, tracked_dot) = match item.git {
+                    Some(st) => git_status_style(st, item.is_dir),
+                    None => (1.0, if item.is_dir { theme::INK_1 } else { theme::INK_2 }, None, false),
+                };
+                scene.svg_icon_alpha(cx, iy, icon_s, item.icon, icon_alpha, clip_id);
                 scene.text(cx + icon_s + icon_gap, ty, txt, col, false, false, clip_id);
-                let item_rect = HitRect::new(cx - 3.0, cur_y, cx + item_w + 4.0, cur_y + row_h);
+                let mut end_x = cx + icon_s + icon_gap + txt_w;
+                if let Some((tag, tag_col)) = badge {
+                    let bx = end_x + (m.cw * 0.45).max(3.5);
+                    scene.ui_small(bx, ty + 1.0, tag, tag_col, true, false, clip_id);
+                    end_x = bx + m.cw;
+                } else if tracked_dot {
+                    let dx = end_x + (m.cw * 0.55).max(4.5);
+                    scene.over_circle(
+                        dx,
+                        ty + m.ch * 0.52,
+                        1.9,
+                        theme::rgba(0x3f, 0xb9, 0x50, 0.52),
+                        clip_id,
+                    );
+                    end_x = dx + 4.0;
+                }
+                let item_rect = HitRect::new(cx - 3.0, cur_y, end_x + 4.0, cur_y + row_h);
                 scene.push_drag_source_clipped(
                     item_rect,
                     clip_id,
@@ -1951,6 +2070,28 @@ fn layout_table(
         0
     };
 
+    // Pre-compute cached per-row git statuses for `ls -l` / file tables (skipping `git status` tables
+    // that already display an explicit `status` column).
+    let file_entry_col = col_displays.iter().position(|&d| d == ColDisplay::FileEntry);
+    let has_status_col = table.col_index("status").is_some();
+    let table_git_statuses: Option<Vec<GitFileStatus>> = if !has_status_col
+        && let Some(fc) = file_entry_col
+    {
+        let mut raw_entries = Vec::with_capacity(total_rows);
+        for r in 0..total_rows {
+            let raw = table
+                .cell(r, fc)
+                .map(|c| format_value_cell_at(c, Some(now_ns)))
+                .unwrap_or_default();
+            let fk = type_col_idx.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str);
+            let is_dir = fk.is_some_and(blaze_sniff::is_dir_label) || raw.ends_with('/');
+            raw_entries.push((raw, is_dir));
+        }
+        cached_ls_git_statuses(block, &raw_entries)
+    } else {
+        None
+    };
+
     if visible_rows == 0 {
         scene.text(x0, cur_y + TABLE_ROW_PAD_Y, "0 rows", theme::INK_4, false, true, clip_id);
         cur_y += row_h;
@@ -2010,25 +2151,48 @@ fn layout_table(
                                 } else {
                                     raw_name.clone()
                                 };
-                                let max_ch = ((content_w - icon_pad - 8.0) / m.cw).floor().max(4.0) as usize;
+                                let row_git = table_git_statuses.as_ref().and_then(|v| v.get(r).copied());
+                                let git_pad = if row_git.is_some() { m.cw * 1.45 } else { 0.0 };
+                                let max_ch = ((content_w - icon_pad - 8.0 - git_pad) / m.cw).floor().max(4.0) as usize;
                                 // Middle-truncate nested paths (`crates/…/layout.rs`) so filenames stay visible!
                                 let txt = if display_name.contains('/') {
                                     truncate_middle(&display_name, max_ch)
                                 } else {
                                     truncate_chars(&display_name, max_ch)
                                 };
-                                let chip_w = (icon_pad + txt.chars().count() as f32 * m.cw + 10.0)
+                                let txt_w = txt.chars().count() as f32 * m.cw;
+                                let chip_w = (icon_pad + txt_w + git_pad + 10.0)
                                     .min(content_w + 2.0);
                                 let bx0 = rx - 5.0;
                                 let by0 = cur_y + 2.0;
                                 let by1 = cur_y + row_h - 2.0;
 
+                                let (icon_alpha, name_col, badge, tracked_dot) = match row_git {
+                                    Some(st) => git_status_style(st, is_dir),
+                                    None => (1.0, theme::INK_1, None, false),
+                                };
+
                                 // Sleek `ix.dev/blaze` inline chip for folders and `.rs` files.
-                                if is_dir || icon_name == "rust_dark" {
+                                if (is_dir || icon_name == "rust_dark")
+                                    && row_git != Some(GitFileStatus::Ignored)
+                                {
                                     scene.round_rect(bx0, by0, bx0 + chip_w, by1, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip_id);
                                 }
-                                scene.svg_icon(rx, iy, icon_s, icon_name, clip_id);
-                                scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                                scene.svg_icon_alpha(rx, iy, icon_s, icon_name, icon_alpha, clip_id);
+                                scene.text(rx + icon_pad, ty, txt, name_col, false, false, clip_id);
+                                if let Some((tag, tag_col)) = badge {
+                                    let gx = rx + icon_pad + txt_w + (m.cw * 0.45).max(3.5);
+                                    scene.ui_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
+                                } else if tracked_dot {
+                                    let gx = rx + icon_pad + txt_w + (m.cw * 0.55).max(4.5);
+                                    scene.over_circle(
+                                        gx,
+                                        ty + m.ch * 0.52,
+                                        1.9,
+                                        theme::rgba(0x3f, 0xb9, 0x50, 0.52),
+                                        clip_id,
+                                    );
+                                }
                                 let cell_rect = HitRect::new(bx0, cur_y, bx0 + chip_w, cur_y + row_h);
                                 scene.push_drag_source_clipped(
                                     cell_rect,
