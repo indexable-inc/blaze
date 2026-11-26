@@ -27,7 +27,7 @@ use blaze_sniff::{FileCategory, SniffResult, sniff_file};
 pub use blaze_html::{ColorScheme, TextAlign};
 pub use crate::highlight::{CodeLine, CodeSpan, TokenKind, highlight_code};
 pub use crate::markdown::{
-    MdBlock, MdSpan, MdStyle, MdTable, parse_html_document, parse_markdown,
+    MdAlertKind, MdBlock, MdSpan, MdStyle, MdTable, parse_html_document, parse_markdown,
     parse_markdown_with_scheme,
 };
 

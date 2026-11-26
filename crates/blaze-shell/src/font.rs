@@ -62,8 +62,9 @@ pub struct Fonts {
     ui_small_m: FaceMetrics,
     heading_m: FaceMetrics,
     chrome_m: FaceMetrics,
-    /// Exact device-pixel CoreText advances for ASCII `32..=126` in `ui[0]`.
+    /// Exact device-pixel CoreText advances for ASCII `32..=126` in `ui[0]` (Regular) and `ui[1]` (Bold).
     ui_adv_px: [f32; 95],
+    ui_bold_adv_px: [f32; 95],
     /// Ratio `chrome_px / (points * scale * 0.94)`.
     chrome_ratio: f32,
     slots: HashMap<Key, Option<Slot>>,
@@ -201,11 +202,16 @@ impl Fonts {
         };
 
         let mut ui_adv_px = [0.0f32; 95];
+        let mut ui_bold_adv_px = [0.0f32; 95];
         for code in 32u8..=126u8 {
             let ch = code as char;
-            ui_adv_px[(code - 32) as usize] = glyph_of(&ui[0], ch)
+            let idx = (code - 32) as usize;
+            ui_adv_px[idx] = glyph_of(&ui[0], ch)
                 .map(|g| advance_of(&ui[0], g) as f32)
                 .unwrap_or(ui_m.space_adv);
+            ui_bold_adv_px[idx] = glyph_of(&ui[1], ch)
+                .map(|g| advance_of(&ui[1], g) as f32)
+                .unwrap_or(ui_adv_px[idx] * 1.06);
         }
         let chrome_ratio = (chrome_px / (px * 0.94).max(1.0)) as f32;
 
@@ -221,6 +227,7 @@ impl Fonts {
             heading_m,
             chrome_m,
             ui_adv_px,
+            ui_bold_adv_px,
             chrome_ratio,
             slots: HashMap::new(),
             next_x: 0,
@@ -234,13 +241,16 @@ impl Fonts {
     pub fn cell_metrics(&self, scale: f64) -> CellMetrics {
         let inv_scale = 1.0 / (scale as f32).max(1.0);
         let mut ui_adv = [0.0f32; 95];
-        for (dst, &src) in ui_adv.iter_mut().zip(self.ui_adv_px.iter()) {
-            *dst = src * inv_scale;
+        let mut ui_bold_adv = [0.0f32; 95];
+        for i in 0..95 {
+            ui_adv[i] = self.ui_adv_px[i] * inv_scale;
+            ui_bold_adv[i] = self.ui_bold_adv_px[i] * inv_scale;
         }
         CellMetrics {
             cw: self.metrics.cell_w as f32 * inv_scale,
             ch: self.metrics.cell_h as f32 * inv_scale,
             ui_adv,
+            ui_bold_adv,
             chrome_ratio: self.chrome_ratio,
         }
     }
@@ -255,15 +265,19 @@ impl Fonts {
         s
     }
 
-    /// Convert laid-out [`TextRun`]s into GPU [`GlyphInst`] quads, rasterizing missing glyphs
-    /// into `self.pending` on demand.
-    pub fn rasterize_runs(&mut self, runs: &[TextRun], scale: f64) -> Vec<GlyphInst> {
-        let mut glyphs = Vec::with_capacity(runs.len() * 12);
+    /// Convert visible [`TextRun`]s into GPU [`GlyphInst`] quads, culling offscreen runs outside
+    /// `[0, viewport_h]` so tall rendered documents scroll at locked 120fps.
+    pub fn rasterize_runs(&mut self, runs: &[TextRun], scale: f64, viewport_h: f32) -> Vec<GlyphInst> {
+        let mut glyphs = Vec::with_capacity(runs.len().min(256) * 12);
         let inv_atlas = 1.0 / ATLAS as f32;
         let inv_scale = 1.0 / (scale as f32).max(1.0);
         let cw = self.metrics.cell_w as f32 * inv_scale;
+        let ch = self.metrics.cell_h as f32 * inv_scale;
 
         for run in runs {
+            if run.y + ch * 1.6 < 0.0 || run.y > viewport_h + ch {
+                continue;
+            }
             let mut x = run.x;
             let (space_adv, y_nudge) = match run.face {
                 TextFace::Mono => (cw, 0.0),

@@ -119,6 +119,7 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
         prev_cwd = Some(cur_cwd);
         prev_branch = Some(cur_branch);
         let draw_y = feed_top + content_y - input.scroll_y;
+        scene.block_tops.push((blk.id, content_y));
         let h = layout_block(
             &mut scene,
             blk,
@@ -1441,6 +1442,75 @@ fn layout_value(
         }
         Value::String(s) if depth == 0 && open_target_filename(&block.source).is_some() => {
             let fname = open_target_filename(&block.source).unwrap_or("file");
+            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
+            let base_dir = target_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
+            let max_h = if block.folded { 520.0 } else { 16000.0 };
+            with_cached_open_preview(block.id.0, fname, s.as_ref().as_bytes(), |doc| {
+                crate::yazi::render_rich_preview(
+                    scene,
+                    doc,
+                    Some(base_dir),
+                    Some(&target_path),
+                    x0,
+                    y0,
+                    width,
+                    y0 + max_h,
+                    m,
+                    clip_id,
+                )
+                .max(m.ch)
+            })
+        }
+        Value::Binary(b) if depth == 0 && open_target_filename(&block.source).is_some() => {
+            let fname = open_target_filename(&block.source).unwrap_or("file");
+            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
+            let base_dir = target_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
+            with_cached_open_preview(block.id.0, fname, b.as_ref(), |doc| {
+                crate::yazi::render_rich_preview(
+                    scene,
+                    doc,
+                    Some(base_dir),
+                    Some(&target_path),
+                    x0,
+                    y0,
+                    width,
+                    y0 + 540.0,
+                    m,
+                    clip_id,
+                )
+                .max(m.ch)
+            })
+        }
+        scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
+    }
+}
+
+/// Cache parsed `blaze_preview::PreviewDoc` per `(block_id, filename, byte_len)` on the UI thread
+/// so scrolling and live animations never re-parse Markdown, HTML, or syntax highlighting per frame!
+fn with_cached_open_preview<R>(
+    block_id: u64,
+    fname: &str,
+    bytes: &[u8],
+    f: impl FnOnce(&blaze_preview::PreviewDoc<'static>) -> R,
+) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<(u64, String, usize), blaze_preview::PreviewDoc<'static>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cell| {
+        let key = (block_id, fname.to_owned(), bytes.len());
+        let mut map = cell.borrow_mut();
+        if !map.contains_key(&key) {
+            if map.len() >= 32 {
+                map.clear();
+            }
             let open_limits = blaze_preview::PreviewLimits {
                 max_rows: 64,
                 max_cols: 8,
@@ -1449,57 +1519,16 @@ fn layout_value(
             };
             let doc = blaze_preview::build_preview(
                 fname,
-                s.as_ref().as_bytes(),
-                s.as_ref().len() as u64,
+                bytes,
+                bytes.len() as u64,
                 open_limits,
                 Alloc::global(),
             );
-            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
-            let base_dir = target_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
-            let max_h = if block.folded { 520.0 } else { 16000.0 };
-            crate::yazi::render_rich_preview(
-                scene,
-                &doc,
-                Some(base_dir),
-                x0,
-                y0,
-                width,
-                y0 + max_h,
-                m,
-                clip_id,
-            )
-            .max(m.ch)
+            map.insert(key.clone(), doc);
         }
-        Value::Binary(b) if depth == 0 && open_target_filename(&block.source).is_some() => {
-            let fname = open_target_filename(&block.source).unwrap_or("file");
-            let doc = blaze_preview::build_preview(
-                fname,
-                b.as_ref(),
-                b.as_ref().len() as u64,
-                blaze_preview::PreviewLimits::SHIPPED,
-                Alloc::global(),
-            );
-            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
-            let base_dir = target_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
-            crate::yazi::render_rich_preview(
-                scene,
-                &doc,
-                Some(base_dir),
-                x0,
-                y0,
-                width,
-                y0 + 260.0,
-                m,
-                clip_id,
-            )
-            .max(m.ch)
-        }
-        scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
-    }
+        let doc = map.get(&key).expect("just inserted");
+        f(doc)
+    })
 }
 
 /// Extract `<file>` when a command line is a direct `open <file>` (without pipes), so `open`

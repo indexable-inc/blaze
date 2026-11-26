@@ -35,9 +35,31 @@ pub struct ImageSlot {
 }
 
 /// Probe the natural pixel dimensions `(width, height)` of a local image file (`webp`, `avif`,
-/// `png`, `jpg`, `gif`, `svg`, etc.).
+/// `png`, `jpg`, `gif`, `svg`, etc.), cached in memory so layout never re-reads disk per frame.
 #[cfg(target_os = "macos")]
 pub fn probe_image_size(path: &Path) -> Option<(u32, u32)> {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    static DIM_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<(u32, u32)>>>> = OnceLock::new();
+    let cache = DIM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(&cached) = guard.get(path)
+    {
+        return cached;
+    }
+    let probed = probe_image_size_uncached(path);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 512 {
+            guard.clear();
+        }
+        guard.insert(path.to_path_buf(), probed);
+    }
+    probed
+}
+
+#[cfg(target_os = "macos")]
+fn probe_image_size_uncached(path: &Path) -> Option<(u32, u32)> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.is_empty() || bytes.len() > 32 * 1024 * 1024 {
         return None;
@@ -999,23 +1021,56 @@ unsafe fn trace_svg_path(
 }
 
 #[cfg(target_os = "macos")]
-struct AnimatedSource {
-    src: *mut mac_imageio::OpaqueCGImageSource,
-    frame_ends_ms: Vec<u64>,
-    total_ms: u64,
-    last_frame: usize,
-    /// Optional decoded RGBA frame cache for compact animations (e.g. 32-frame Blaze fire WebP).
-    cached_frames: Vec<Option<Vec<u8>>>,
-    cache_enabled: bool,
+enum AnimBackend {
+    /// Compact animations (e.g. 32-frame Blaze fire WebP): lazily decoded once into RAM cache.
+    Cached {
+        src: *mut mac_imageio::OpaqueCGImageSource,
+        frames: Vec<Option<Vec<u8>>>,
+    },
+    /// Large multi-hundred-frame animations (e.g. 2.7 MB Game of Life `docs/demo.avif`):
+    /// decoded asynchronously on a dedicated worker thread so scrolling stays locked 60/120fps.
+    Streamed {
+        req_tx: std::sync::mpsc::SyncSender<usize>,
+        frame_rx: std::sync::mpsc::Receiver<(usize, Vec<u8>)>,
+        in_flight: Option<usize>,
+    },
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for AnimatedSource {
+impl Drop for AnimBackend {
     fn drop(&mut self) {
-        if !self.src.is_null() {
+        if let AnimBackend::Cached { src, .. } = self
+            && !src.is_null()
+        {
             // SAFETY: owned `CGImageSource` handle created by `CGImageSourceCreateWithData`.
-            unsafe { mac_imageio::CFRelease(self.src.cast()) };
-            self.src = std::ptr::null_mut();
+            unsafe { mac_imageio::CFRelease(src.cast()) };
+            *src = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct AnimatedSource {
+    frame_ends_ms: Vec<u64>,
+    total_ms: u64,
+    last_frame: usize,
+    backend: AnimBackend,
+}
+
+#[cfg(target_os = "macos")]
+struct SendImageSource(*mut mac_imageio::OpaqueCGImageSource);
+
+// SAFETY: `CGImageSourceRef` is exclusively owned and accessed by the single background decoder
+// thread until it exits and calls `CFRelease`.
+#[cfg(target_os = "macos")]
+unsafe impl Send for SendImageSource {}
+
+#[cfg(target_os = "macos")]
+impl Drop for SendImageSource {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { mac_imageio::CFRelease(self.0.cast()) };
+            self.0 = std::ptr::null_mut();
         }
     }
 }
@@ -1103,23 +1158,42 @@ impl ImageAtlas {
                     .frame_ends_ms
                     .partition_point(|&end| end <= t)
                     .min(anim.frame_ends_ms.len() - 1);
-                if frame_idx != anim.last_frame {
-                    let rgba = if anim.cache_enabled {
-                        if let Some(cached) = anim.cached_frames[frame_idx].as_ref() {
-                            Some(cached.clone())
-                        } else {
-                            let decoded = unsafe { decode_frame_rgba(anim.src, frame_idx, slot.w, slot.h) };
-                            if let Some(ref bytes) = decoded {
-                                anim.cached_frames[frame_idx] = Some(bytes.clone());
+                match &mut anim.backend {
+                    AnimBackend::Cached { src, frames } => {
+                        if frame_idx != anim.last_frame {
+                            let rgba = if let Some(cached) = frames[frame_idx].as_ref() {
+                                Some(cached.clone())
+                            } else {
+                                let decoded = unsafe { decode_frame_rgba(*src, frame_idx, slot.w, slot.h) };
+                                if let Some(ref bytes) = decoded {
+                                    frames[frame_idx] = Some(bytes.clone());
+                                }
+                                decoded
+                            };
+                            if let Some(bytes) = rgba {
+                                self.pending.push((slot, bytes));
+                                anim.last_frame = frame_idx;
                             }
-                            decoded
                         }
-                    } else {
-                        unsafe { decode_frame_rgba(anim.src, frame_idx, slot.w, slot.h) }
-                    };
-                    if let Some(bytes) = rgba {
-                        self.pending.push((slot, bytes));
-                        anim.last_frame = frame_idx;
+                    }
+                    AnimBackend::Streamed { req_tx, frame_rx, in_flight } => {
+                        // Drain any completed decoded frames non-blockingly and upload the newest.
+                        let mut newest: Option<(usize, Vec<u8>)> = None;
+                        while let Ok(done) = frame_rx.try_recv() {
+                            if *in_flight == Some(done.0) {
+                                *in_flight = None;
+                            }
+                            newest = Some(done);
+                        }
+                        if let Some((got_idx, bytes)) = newest {
+                            self.pending.push((slot, bytes));
+                            anim.last_frame = got_idx;
+                        }
+                        if frame_idx != anim.last_frame && *in_flight != Some(frame_idx) {
+                            if req_tx.try_send(frame_idx).is_ok() {
+                                *in_flight = Some(frame_idx);
+                            }
+                        }
                     }
                 }
             }
@@ -1184,33 +1258,66 @@ impl ImageAtlas {
                 frame_ends_ms.push(total_ms);
             }
             let cache_enabled = capped <= 48 && w_px * h_px <= 800 * 500;
-            let mut cached_frames = if cache_enabled { vec![None; capped] } else { Vec::new() };
-            if cache_enabled && !cached_frames.is_empty() {
-                cached_frames[0] = Some(first_rgba);
-            }
+            let backend = if cache_enabled {
+                let mut frames = vec![None; capped];
+                if !frames.is_empty() {
+                    frames[0] = Some(first_rgba);
+                }
+                AnimBackend::Cached { src, frames }
+            } else {
+                let (req_tx, req_rx) = std::sync::mpsc::sync_channel::<usize>(2);
+                let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(2);
+                let owned_src = SendImageSource(src);
+                let dw = slot.w;
+                let dh = slot.h;
+                let _ = std::thread::Builder::new()
+                    .name("blaze-shell-anim".to_owned())
+                    .spawn(move || {
+                        let guard = owned_src;
+                        while let Ok(mut target_idx) = req_rx.recv() {
+                            // Coalesce queued requests to always decode the latest target frame.
+                            while let Ok(newer) = req_rx.try_recv() {
+                                target_idx = newer;
+                            }
+                            if let Some(rgba) = decode_frame_rgba(guard.0, target_idx, dw, dh) {
+                                if frame_tx.send((target_idx, rgba)).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                AnimBackend::Streamed { req_tx, frame_rx, in_flight: None }
+            };
             Some(AtlasEntry {
                 slot,
                 anim: Some(AnimatedSource {
-                    src,
                     frame_ends_ms,
                     total_ms,
                     last_frame: 0,
-                    cached_frames,
-                    cache_enabled,
+                    backend,
                 }),
             })
         }
     }
 
-    /// Convert laid-out [`ImageQuad`]s into GPU [`GlyphInst`] quads, advancing any live animated
-    /// WebP/AVIF/GIF frames to `now_ms`. Returns `(instances, has_live_animations)`.
-    pub fn rasterize_quads(&mut self, quads: &[ImageQuad], now_ms: u64) -> (Vec<GlyphInst>, bool) {
+    /// Convert visible [`ImageQuad`]s into GPU [`GlyphInst`] quads, culling offscreen images so
+    /// scrolled-away animations (`docs/demo.avif`, etc.) do zero decoding & zero GPU upload!
+    pub fn rasterize_quads(
+        &mut self,
+        quads: &[ImageQuad],
+        now_ms: u64,
+        viewport_h: f32,
+    ) -> (Vec<GlyphInst>, bool) {
         let mut out = Vec::with_capacity(quads.len());
         let mut any_anim = false;
         let inv = 1.0 / IMAGE_ATLAS_SIZE as f32;
         for q in quads {
-            let w_px = ((q.w as f64) * self.scale).round().clamp(1.0, 1400.0) as usize;
-            let h_px = ((q.h as f64) * self.scale).round().clamp(1.0, 1000.0) as usize;
+            // Viewport cull: never decode or upload offscreen images/animations!
+            if q.y + q.h < -32.0 || q.y > viewport_h + 32.0 {
+                continue;
+            }
+            let w_px = ((q.w as f64) * self.scale).round().clamp(1.0, 1200.0) as usize;
+            let h_px = ((q.h as f64) * self.scale).round().clamp(1.0, 840.0) as usize;
             let Some((slot, is_anim)) = self.ensure_entry(&q.path, w_px, h_px, now_ms) else {
                 continue;
             };
@@ -1254,11 +1361,11 @@ mod tests {
                 alpha: 1.0,
                 clip_id: 0,
             };
-            let (insts, anim) = atlas.rasterize_quads(std::slice::from_ref(&q), 0);
+            let (insts, anim) = atlas.rasterize_quads(std::slice::from_ref(&q), 0, 1000.0);
             assert_eq!(insts.len(), 1);
             assert!(anim, "header-dark.webp must be recognized as animated");
             atlas.pending.clear();
-            let (_, _) = atlas.rasterize_quads(std::slice::from_ref(&q), 400);
+            let (_, _) = atlas.rasterize_quads(std::slice::from_ref(&q), 400, 1000.0);
             assert!(!atlas.pending.is_empty(), "advancing timestamp must upload next animation frame");
         }
         if life.is_file() {
@@ -1273,7 +1380,7 @@ mod tests {
                 alpha: 1.0,
                 clip_id: 0,
             };
-            let (insts, anim) = atlas.rasterize_quads(std::slice::from_ref(&q), 0);
+            let (insts, anim) = atlas.rasterize_quads(std::slice::from_ref(&q), 0, 1000.0);
             assert_eq!(insts.len(), 1);
             assert!(anim, "docs/demo.avif must be recognized as animated");
         }
@@ -1289,7 +1396,7 @@ mod tests {
                 alpha: 1.0,
                 clip_id: 0,
             };
-            let (insts, _) = atlas.rasterize_quads(&[q], 0);
+            let (insts, _) = atlas.rasterize_quads(&[q], 0, 1000.0);
             assert_eq!(insts.len(), 1, "SVG chart must rasterize into ImageAtlas");
         }
     }

@@ -117,7 +117,7 @@ mod macos_app {
     };
     use blaze_shell::view::{
         ActiveDrag, ActivePopover, CursorTrail, DragPayload, HitAction, HitRect, HoverKind,
-        OutputNav, OutputVisualMode, Scene, TextSelection, compute_text_selection,
+        OutputNav, OutputVisualMode, Scene, TextFace, TextSelection, compute_text_selection,
         extract_visual_lines, output_nav_geometry, select_at_point,
     };
     use blaze_shell::yazi::{YaziAction, YaziState, layout_yazi_pane, load_hover_preview};
@@ -589,6 +589,7 @@ mod macos_app {
         git_worker: GitStatusWorker,
         scroll_y: f32,
         auto_scroll_bottom: bool,
+        scroll_to_block: Option<BlockId>,
         active_pty: Option<ActivePty>,
         yazi: Option<YaziState>,
         agent_hub: Option<AgentHub>,
@@ -636,6 +637,7 @@ mod macos_app {
                 git_worker,
                 scroll_y: 0.0,
                 auto_scroll_bottom: false,
+                scroll_to_block: None,
                 active_pty: None,
                 yazi: None,
                 agent_hub: None,
@@ -1051,7 +1053,13 @@ mod macos_app {
                 let _ = self.store.fork_from_block(block_id, Some(&label));
             }
             self.refresh_prompt(exit_code, duration_ms);
-            self.auto_scroll_bottom = true;
+            if trimmed.starts_with("open ") && !trimmed.contains('|') && exit_code == 0 {
+                self.scroll_to_block = Some(block_id);
+                self.auto_scroll_bottom = false;
+            } else {
+                self.scroll_to_block = None;
+                self.auto_scroll_bottom = true;
+            }
         }
 
         fn poll_async_jobs(&mut self, cols: u16, rows: u16, cell_px: (u32, u32)) -> bool {
@@ -1573,7 +1581,13 @@ mod macos_app {
                     output_nav: if pl.focused { output_nav } else { None },
                 });
                 let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
-                let target_scroll = if pane.auto_scroll_bottom {
+                let target_scroll = if let Some(bid) = pane.scroll_to_block.take() {
+                    if let Some(&(_, by)) = first.block_tops.iter().find(|(id, _)| *id == bid) {
+                        (by - 8.0).clamp(0.0, max_s)
+                    } else {
+                        max_s
+                    }
+                } else if pane.auto_scroll_bottom {
                     pane.auto_scroll_bottom = false;
                     max_s
                 } else {
@@ -1671,6 +1685,43 @@ mod macos_app {
         // 4. Optional `Cmd+Shift+P` Command Palette rendered above everything.
         if let Some(pal) = command_palette {
             layout_command_palette(&mut master, pal, vw, vh, metrics);
+        }
+
+        // 5. Safari/Chrome-style subtle bottom-left URL preview pill when hovering a clickable link.
+        if command_palette.is_none()
+            && let Some([mx, my]) = mouse_pos
+            && let Some(HitAction::OpenLink { href, .. }) = master.hit_test(mx, my)
+        {
+            let max_chars = (((vw * 0.55) / metrics.measure("n", TextFace::UiSmall).max(5.0))
+                .floor() as usize)
+                .clamp(24, 96);
+            let shown = blaze_shell::view::truncate_chars(&href, max_chars);
+            let tw = metrics.measure(&shown, TextFace::UiSmall);
+            let pw = (tw + 18.0).min(vw - 24.0);
+            let ph = metrics.line_h(TextFace::UiSmall) + 8.0;
+            let px0 = 10.0;
+            let py0 = (vh - ph - 8.0).max(TOP_BAR_H + 8.0);
+            master.overlay_round_rect(
+                px0,
+                py0,
+                px0 + pw,
+                py0 + ph,
+                5.0,
+                theme::rgba(0x14, 0x15, 0x1a, 0.94),
+                1.0,
+                theme::LINE,
+                0,
+            );
+            master.overlay_text.push(blaze_shell::view::TextRun {
+                x: px0 + 9.0,
+                y: py0 + 4.0,
+                text: shown,
+                color: theme::INK_2,
+                bold: false,
+                italic: false,
+                face: TextFace::UiSmall,
+                clip_id: 0,
+            });
         }
 
         (master, tile_layout)
@@ -1984,9 +2035,11 @@ mod macos_app {
             if let Some(sy) = cli.scroll_y {
                 first_pane.scroll_y = sy.max(0.0);
                 first_pane.auto_scroll_bottom = false;
+                first_pane.scroll_to_block = None;
             } else if !cli.scroll_bottom {
                 first_pane.scroll_y = 0.0;
                 first_pane.auto_scroll_bottom = false;
+                first_pane.scroll_to_block = None;
             }
         }
         let demo_cwd = first_pane.cwd().to_owned();
@@ -2045,8 +2098,9 @@ mod macos_app {
                 None,
                 None,
             );
-            let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
-            let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale);
+            let vh = size.height as f32;
+            let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
+            let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale, vh);
             for (slot, bytes) in fonts.pending.drain(..) {
                 renderer.upload(slot, &bytes);
             }
@@ -2055,7 +2109,7 @@ mod macos_app {
             for (slot, rgba) in icon_atlas.pending.drain(..) {
                 renderer.upload_icon(slot, &rgba);
             }
-            let (images, _) = image_atlas.rasterize_quads(&scene.image_quads, 0);
+            let (images, _) = image_atlas.rasterize_quads(&scene.image_quads, 0, vh);
             for (slot, rgba) in image_atlas.pending.drain(..) {
                 renderer.upload_image(slot, &rgba);
             }
@@ -2111,6 +2165,7 @@ mod macos_app {
         let mut zoom_changed = false;
         let mut cur_cursor = CursorKind::Arrow;
         let mut last_mouse: Option<(f32, f32)> = None;
+        let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
 
         loop {
@@ -3643,6 +3698,74 @@ mod macos_app {
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
                                         }
+                                        HitAction::CopyText(txt) => {
+                                            copy_to_pasteboard(&txt);
+                                        }
+                                        HitAction::OpenLink { href, base_dir } => {
+                                            active_popover = None;
+                                            let trimmed = href.trim();
+                                            if let Some(frag) = trimmed.strip_prefix('#') {
+                                                let needle = frag.to_ascii_lowercase();
+                                                if let Some(&(_, ay)) = composite_scene
+                                                    .anchors
+                                                    .iter()
+                                                    .rev()
+                                                    .find(|(slug, _)| slug == &needle)
+                                                {
+                                                    let pane_top = tile_layout
+                                                        .panes
+                                                        .iter()
+                                                        .find(|p| p.focused)
+                                                        .map_or(TOP_BAR_H, |p| p.rect.y0);
+                                                    shell.scroll_y = (shell.scroll_y
+                                                        + (ay - (pane_top + 16.0)))
+                                                        .max(0.0);
+                                                    shell.auto_scroll_bottom = false;
+                                                    shell.scroll_to_block = None;
+                                                    dirty = true;
+                                                }
+                                            } else if trimmed.starts_with("http://")
+                                                || trimmed.starts_with("https://")
+                                                || trimmed.starts_with("mailto:")
+                                            {
+                                                let _ = std::process::Command::new("/usr/bin/open")
+                                                    .arg(trimmed)
+                                                    .spawn();
+                                            } else if !trimmed.is_empty() {
+                                                let path_part =
+                                                    trimmed.split('#').next().unwrap_or(trimmed);
+                                                let rel = std::path::Path::new(path_part);
+                                                let resolved = if rel.is_absolute() {
+                                                    rel.to_path_buf()
+                                                } else if !base_dir.is_empty() {
+                                                    std::path::Path::new(&base_dir).join(rel)
+                                                } else {
+                                                    std::path::Path::new(shell.cwd()).join(rel)
+                                                };
+                                                let disp = resolved
+                                                    .strip_prefix(shell.cwd())
+                                                    .unwrap_or(&resolved)
+                                                    .to_string_lossy()
+                                                    .into_owned();
+                                                let quoted = if disp.contains(' ') {
+                                                    format!("\"{disp}\"")
+                                                } else {
+                                                    disp
+                                                };
+                                                let cmd = if resolved.is_dir() {
+                                                    format!("ls -l {quoted}")
+                                                } else {
+                                                    format!("open {quoted}")
+                                                };
+                                                let (cols, rows) = grid_for(size, &fonts, scale);
+                                                let cpx = (
+                                                    fonts.metrics.cell_w as u32,
+                                                    fonts.metrics.cell_h as u32,
+                                                );
+                                                shell.submit_command(&cmd, cols, rows, cpx, false);
+                                                dirty = true;
+                                            }
+                                        }
                                         HitAction::SwitchTab(_)
                                         | HitAction::NewTab
                                         | HitAction::CloseTab(_)
@@ -3816,6 +3939,15 @@ mod macos_app {
                                     }
                                 } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
                                     active_popover = None;
+                                    dirty = true;
+                                }
+
+                                let hovered_link = match composite_scene.hit_test(x, y) {
+                                    Some(HitAction::OpenLink { href, .. }) => Some(href),
+                                    _ => None,
+                                };
+                                if hovered_link != last_hovered_link {
+                                    last_hovered_link = hovered_link;
                                     dirty = true;
                                 }
 
@@ -4275,8 +4407,9 @@ mod macos_app {
                 }
                 last_cursor_rect = scene.cursor_rect;
 
-                let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
-                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale);
+                let vh = size.height as f32;
+                let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
+                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale, vh);
                 for (slot, bytes) in fonts.pending.drain(..) {
                     renderer.upload(slot, &bytes);
                 }
@@ -4286,7 +4419,7 @@ mod macos_app {
                     renderer.upload_icon(slot, &rgba);
                 }
                 let anim_ms = anim_epoch.elapsed().as_millis() as u64;
-                let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms);
+                let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms, vh);
                 has_animated_images = any_anim;
                 for (slot, rgba) in image_atlas.pending.drain(..) {
                     renderer.upload_image(slot, &rgba);
