@@ -21,6 +21,8 @@ use blaze_keyed::{
     store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, RowRefused, SEGMENT_MOST, SegmentId, StoreError, TwoValues},
 };
 
+use super::par::Par;
+
 /// The format of a plain store's own files: its head slots and its manifests. Formats 1 and 2
 /// shared their number with the segments'; format 3 gives each retired row a mark, "lost, not
 /// yet reported" ([`LostMark`]), in the u32 that format 2 kept zero; format 4 adds a segment
@@ -575,6 +577,246 @@ pub(crate) fn seal_entries<'p>(
     Sealed { header, footer, described: Described { namespace, count, index_at, digest }, len }
 }
 
+/// Minimum hashed segment byte length (`128 KiB`) before parallel BLAKE3 Merkle striping engages.
+const PAR_HASH_THRESHOLD: u64 = 128 << 10;
+
+/// Minimum BLAKE3 stripe width in chunks (`64 KiB`) so each worker saturates wide SIMD trees.
+const MIN_STRIPE_CHUNKS: u64 = 64;
+
+/// Maximum BLAKE3 stripe width in chunks (`4 MiB`) to keep load balanced across 128 cores.
+const MAX_STRIPE_CHUNKS: u64 = 4096;
+
+/// Chooses a power-of-two stripe width in BLAKE3 chunks (`>= 64 KiB`, `<= 4 MiB`) guaranteed to
+/// split `digest_len` (`>= PAR_HASH_THRESHOLD`) into at least two subtrees for `finalize_subtrees`.
+fn choose_stripe_chunks(digest_len: u64, workers: usize) -> u64 {
+    let chunk_u64 = u64::try_from(blaze_ids::b3::CHUNK_LEN).unwrap_or(1024);
+    let total_chunks = digest_len.div_ceil(chunk_u64);
+    let target_stripes = u64::try_from(workers.saturating_mul(4).max(2)).unwrap_or(8);
+    let raw = total_chunks / target_stripes;
+    let mut stripe = if raw <= MIN_STRIPE_CHUNKS {
+        MIN_STRIPE_CHUNKS
+    } else {
+        raw.next_power_of_two().min(MAX_STRIPE_CHUNKS)
+    };
+    while stripe > MIN_STRIPE_CHUNKS && stripe.saturating_mul(chunk_u64) >= digest_len {
+        stripe /= 2;
+    }
+    stripe
+}
+
+/// Batches small slices into 8 KiB (`8 * CHUNK_LEN`) aligned flushes for [`blaze_ids::b3::SubtreeHasher`]
+/// so small records, zero padding, and 48-byte index entries run through the 8-lane SIMD wide-tree
+/// compressor while large slices pass straight through without copying.
+struct BufferedSubtreeHasher {
+    hasher: blaze_ids::b3::SubtreeHasher,
+    buf: [u8; 8192],
+    fill: usize,
+}
+
+impl BufferedSubtreeHasher {
+    fn new_from_context_key(key: &blaze_ids::b3::ContextKey, start_chunk: u64) -> BufferedSubtreeHasher {
+        BufferedSubtreeHasher {
+            hasher: blaze_ids::b3::SubtreeHasher::new_from_context_key(key, start_chunk),
+            buf: [0u8; 8192],
+            fill: 0,
+        }
+    }
+
+    #[inline]
+    fn update(&mut self, mut bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.fill > 0 {
+            let space = self.buf.len().saturating_sub(self.fill);
+            if bytes.len() < space {
+                if let Some(dst) = self.buf.get_mut(self.fill..self.fill.saturating_add(bytes.len())) {
+                    dst.copy_from_slice(bytes);
+                }
+                self.fill = self.fill.saturating_add(bytes.len());
+                return;
+            }
+            if let (Some(dst), Some(src)) = (self.buf.get_mut(self.fill..), bytes.get(..space)) {
+                dst.copy_from_slice(src);
+            }
+            self.hasher.update(&self.buf);
+            self.fill = 0;
+            bytes = bytes.get(space..).unwrap_or(&[]);
+        }
+        let bulk = bytes.len() & !8191usize;
+        if bulk > 0
+            && let Some(head) = bytes.get(..bulk)
+        {
+            self.hasher.update(head);
+            bytes = bytes.get(bulk..).unwrap_or(&[]);
+        }
+        if !bytes.is_empty() {
+            if let Some(dst) = self.buf.get_mut(..bytes.len()) {
+                dst.copy_from_slice(bytes);
+            }
+            self.fill = bytes.len();
+        }
+    }
+
+    fn finish_non_root(mut self) -> [u32; 8] {
+        if self.fill > 0
+            && let Some(tail) = self.buf.get(..self.fill)
+        {
+            self.hasher.update(tail);
+        }
+        self.hasher.finalize_non_root()
+    }
+}
+
+/// Parallel twin of [`seal_entries`] using [`Par`] and aligned BLAKE3 Merkle subtrees.
+///
+/// Below `128 KiB` or when `par.workers() <= 1`, delegates directly to serial [`seal_entries`]
+/// with zero overhead. Above `128 KiB`, seeks each power-of-two stripe `[lo..hi)` into
+/// `[header | sorted (payload, pad) | entries | footer_head]` in `O(log N)` via
+/// `entries.partition_point`, hashes all stripes in parallel through `par.map_range`, and folds
+/// the subtree chaining values into the exact bit-for-bit same [`Sealed`] digest (Rule 25).
+#[allow(dead_code, reason = "wired into plain/core.rs right after SOTA-v10 merges")]
+pub(crate) fn seal_entries_par<'p, P: Par, A: core::alloc::Allocator + Copy>(
+    namespace: Namespace,
+    entries: &[Entry],
+    index_at: u64,
+    payload_at: impl Fn(usize) -> (&'p [u8], u8) + Sync,
+    par: &P,
+    alloc: A,
+) -> Sealed {
+    let header_u64 = u64::try_from(HEADER).unwrap_or(128);
+    let entry_u64 = u64::try_from(ENTRY).unwrap_or(48);
+    let footer_u64 = u64::try_from(FOOTER).unwrap_or(48);
+    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    let entry_bytes = u64::from(count).saturating_mul(entry_u64);
+    let foot_at = index_at.saturating_add(entry_bytes);
+    let digest_len = foot_at.saturating_add(16);
+
+    if par.workers() <= 1
+        || digest_len < PAR_HASH_THRESHOLD
+        || entries.first().is_some_and(|e| e.at != header_u64)
+    {
+        return seal_entries(namespace, entries, index_at, (0..entries.len()).map(&payload_at));
+    }
+
+    let lowest = entries.first().map_or(ContentId([0; 32]), |it| it.key);
+    let highest = entries.last().map_or(ContentId([0; 32]), |it| it.key);
+    let header = header_of(namespace, count, lowest, highest, index_at);
+    let foot = footer_head(count, index_at);
+    let chunk_u64 = u64::try_from(blaze_ids::b3::CHUNK_LEN).unwrap_or(1024);
+    let stripe_chunks = choose_stripe_chunks(digest_len, par.workers());
+    let stripe_bytes_u64 = stripe_chunks.saturating_mul(chunk_u64);
+    let stripe_count = usize::try_from(digest_len.div_ceil(stripe_bytes_u64)).unwrap_or(0);
+    let ctx_key = blaze_ids::b3::context_key(SEGMENT_DIGEST);
+
+    let cvs = par.map_range(stripe_count, 1, alloc, |stripe_idx, _hi| {
+        let idx_u64 = u64::try_from(stripe_idx).unwrap_or(0);
+        let lo = idx_u64.saturating_mul(stripe_bytes_u64);
+        let hi = lo.saturating_add(stripe_bytes_u64).min(digest_len);
+        let mut hasher = BufferedSubtreeHasher::new_from_context_key(&ctx_key, idx_u64.saturating_mul(stripe_chunks));
+        let mut pos = lo;
+
+        // 1. Header [0 .. HEADER)
+        if pos < header_u64 {
+            let seg_lo = usize::try_from(pos).unwrap_or(0);
+            let seg_hi = usize::try_from(hi.min(header_u64)).unwrap_or(HEADER);
+            if let Some(slice) = header.get(seg_lo..seg_hi) {
+                hasher.update(slice);
+                pos = pos.saturating_add(u64::try_from(slice.len()).unwrap_or(0));
+            }
+        }
+
+        // 2. Payloads + alignment padding [HEADER .. index_at)
+        if pos < hi && pos < index_at {
+            let pay_hi = hi.min(index_at);
+            let mut idx = entries.partition_point(|e| e.at <= pos).saturating_sub(1);
+            while pos < pay_hi {
+                let Some(entry) = entries.get(idx) else {
+                    break;
+                };
+                let (bytes, pad_len) = payload_at(idx);
+                let entry_start = entry.at;
+                let data_end = entry_start.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
+                let pad_end = data_end.saturating_add(u64::from(pad_len));
+                if pos < data_end {
+                    let slice_lo = usize::try_from(pos.saturating_sub(entry_start)).unwrap_or(0);
+                    let slice_hi = usize::try_from(pay_hi.min(data_end).saturating_sub(entry_start)).unwrap_or(bytes.len());
+                    if let Some(slice) = bytes.get(slice_lo..slice_hi) {
+                        hasher.update(slice);
+                        pos = pos.saturating_add(u64::try_from(slice.len()).unwrap_or(0));
+                    }
+                }
+                if pos < pay_hi && pos < pad_end {
+                    let pad_take = usize::try_from(pay_hi.min(pad_end).saturating_sub(pos)).unwrap_or(0);
+                    if let Some(z) = ZEROS.get(..pad_take) {
+                        hasher.update(z);
+                        pos = pos.saturating_add(u64::try_from(z.len()).unwrap_or(0));
+                    }
+                }
+                idx = idx.saturating_add(1);
+            }
+        }
+
+        // 3. Sorted index entries [index_at .. foot_at)
+        if pos < hi && pos < foot_at {
+            let idx_hi = hi.min(foot_at);
+            let rel = pos.saturating_sub(index_at);
+            let mut entry_idx = usize::try_from(rel / entry_u64).unwrap_or(0);
+            let mut in_entry = usize::try_from(rel % entry_u64).unwrap_or(0);
+            while pos < idx_hi {
+                let Some(entry) = entries.get(entry_idx) else {
+                    break;
+                };
+                let encoded = entry.encode_array();
+                let take = usize::try_from(idx_hi.saturating_sub(pos))
+                    .unwrap_or(0)
+                    .min(ENTRY.saturating_sub(in_entry));
+                if let Some(slice) = encoded.get(in_entry..in_entry.saturating_add(take)) {
+                    hasher.update(slice);
+                    pos = pos.saturating_add(u64::try_from(slice.len()).unwrap_or(0));
+                }
+                in_entry = 0;
+                entry_idx = entry_idx.saturating_add(1);
+            }
+        }
+
+        // 4. Footer head [foot_at .. digest_len)
+        if pos < hi && pos < digest_len {
+            let foot_lo = usize::try_from(pos.saturating_sub(foot_at)).unwrap_or(0);
+            let foot_hi = usize::try_from(hi.min(digest_len).saturating_sub(foot_at)).unwrap_or(16);
+            if let Some(slice) = foot.get(foot_lo..foot_hi) {
+                hasher.update(slice);
+            }
+        }
+
+        hasher.finish_non_root()
+    });
+
+    let (full_cvs, tail_cv) = if digest_len.is_multiple_of(stripe_bytes_u64) {
+        (cvs.as_slice(), None)
+    } else {
+        match cvs.as_slice().split_last() {
+            Some((&tail, full)) => (full, Some(tail)),
+            None => (&[][..], None),
+        }
+    };
+    let digest = ContentId(blaze_ids::b3::finalize_subtrees_from_context_key(
+        &ctx_key,
+        stripe_chunks,
+        full_cvs,
+        tail_cv,
+    ));
+    let mut footer = [0u8; FOOTER];
+    if let Some(dst) = footer.get_mut(..16) {
+        dst.copy_from_slice(&foot);
+    }
+    if let Some(dst) = footer.get_mut(16..) {
+        dst.copy_from_slice(&digest.0);
+    }
+    let len = foot_at.saturating_add(footer_u64);
+    Sealed { header, footer, described: Described { namespace, count, index_at, digest }, len }
+}
+
 /// A whole segment of `namespace` holding `records` (each its key and tag, and its payload):
 /// the payloads and the index in key order, the first given of a duplicate key kept (the rest
 /// dropped unread: one key names one value, rule 21, which the store's put and a push's
@@ -718,6 +960,149 @@ pub fn check_segment(bytes: &[u8]) -> Result<Described, StoreError> {
         return Err(layout("its header's lowest or highest key is not its index's", 32));
     }
     Ok(Described { namespace: Namespace(u64_at(bytes, 8)), count, index_at, digest: claimed.0 })
+}
+
+/// Parallel twin of [`check_segment`] using [`Par`] for BLAKE3 Merkle digest verification and
+/// index-entry validation.
+///
+/// Below `128 KiB` or when `par.workers() <= 1`, delegates directly to serial [`check_segment`].
+/// Produces the exact same `Ok(Described)` or first `Err(StoreError)` as [`check_segment`]
+/// regardless of worker chunk execution order (Rule 25).
+pub fn check_segment_par<P: Par, A: core::alloc::Allocator + Copy>(
+    bytes: &[u8],
+    par: &P,
+    alloc: A,
+) -> Result<Described, StoreError> {
+    let len = bytes.len();
+    let len_u64 = u64::try_from(len).unwrap_or(u64::MAX);
+    let digest_len = len_u64.saturating_sub(32);
+    if par.workers() <= 1 || digest_len < PAR_HASH_THRESHOLD {
+        return check_segment(bytes);
+    }
+    let claimed_id = bytes
+        .get(len.saturating_sub(32)..)
+        .and_then(|s| <[u8; 32]>::try_from(s).ok())
+        .map_or(ContentId([0; 32]), ContentId);
+    let claimed = SegmentId(claimed_id);
+    let layout = |what: &'static str, at: u64| StoreError::Layout { segment: claimed, what, at };
+    if len < HEADER.saturating_add(FOOTER) || len_u64 > SEGMENT_MOST {
+        return Err(layout("a segment's length is outside HEADER + FOOTER ..= 4 GiB", len_u64));
+    }
+    if bytes.get(0..4) != Some(&SEGMENT_MAGIC[..]) {
+        return Err(layout("its header does not start with `BLPS`: not a plain segment", 0));
+    }
+    let found_format = bytes
+        .get(4..8)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map_or(0, u32::from_le_bytes);
+    if found_format != SEGMENT_FORMAT {
+        return Err(StoreError::Format { what: "a plain store's segment", found: found_format, wanted: SEGMENT_FORMAT });
+    }
+    let foot_start = len.saturating_sub(FOOTER);
+    let Some(foot) = bytes.get(foot_start..) else {
+        return Err(layout("its footer does not say what its header says: it is cut short or torn", u64::try_from(foot_start).unwrap_or(0)));
+    };
+    let count = bytes.get(16..20).and_then(|s| <[u8; 4]>::try_from(s).ok()).map_or(0, u32::from_le_bytes);
+    let index_at = bytes.get(24..32).and_then(|s| <[u8; 8]>::try_from(s).ok()).map_or(0, u64::from_le_bytes);
+    let foot_count = foot.get(4..8).and_then(|s| <[u8; 4]>::try_from(s).ok()).map_or(0, u32::from_le_bytes);
+    let foot_index_at = foot.get(8..16).and_then(|s| <[u8; 8]>::try_from(s).ok()).map_or(0, u64::from_le_bytes);
+    if foot.get(0..4) != Some(&FOOTER_MAGIC[..]) || foot_count != count || foot_index_at != index_at {
+        return Err(layout("its footer does not say what its header says: it is cut short or torn", u64::try_from(foot_start).unwrap_or(0)));
+    }
+    let header_u64 = u64::try_from(HEADER).unwrap_or(128);
+    let entry_u64 = u64::try_from(ENTRY).unwrap_or(48);
+    let footer_u64 = u64::try_from(FOOTER).unwrap_or(48);
+    let end = index_at
+        .checked_add(u64::from(count).saturating_mul(entry_u64))
+        .and_then(|it| it.checked_add(footer_u64));
+    if index_at < header_u64 || !index_at.is_multiple_of(ALIGN) || end != Some(len_u64) {
+        return Err(layout("its index does not start aligned after the header and end at the footer", index_at));
+    }
+
+    // Parallel BLAKE3 Merkle digest over `bytes[..len - 32]`.
+    let hashed_bytes = bytes.get(..len.saturating_sub(32)).unwrap_or(&[]);
+    let chunk_u64 = u64::try_from(blaze_ids::b3::CHUNK_LEN).unwrap_or(1024);
+    let stripe_chunks = choose_stripe_chunks(digest_len, par.workers());
+    let stripe_bytes = usize::try_from(stripe_chunks.saturating_mul(chunk_u64)).unwrap_or(65_536);
+    let stripe_count = hashed_bytes.len().div_ceil(stripe_bytes);
+    let ctx_key = blaze_ids::b3::context_key(SEGMENT_DIGEST);
+    let cvs = par.map_range(stripe_count, 1, alloc, |stripe_idx, _hi| {
+        let byte_lo = stripe_idx.saturating_mul(stripe_bytes);
+        let byte_hi = byte_lo.saturating_add(stripe_bytes).min(hashed_bytes.len());
+        let slice = hashed_bytes.get(byte_lo..byte_hi).unwrap_or(&[]);
+        let start_chunk = u64::try_from(stripe_idx).unwrap_or(0).saturating_mul(stripe_chunks);
+        let mut hasher = blaze_ids::b3::SubtreeHasher::new_from_context_key(&ctx_key, start_chunk);
+        hasher.update(slice);
+        hasher.finalize_non_root()
+    });
+    let (full_cvs, tail_cv) = if hashed_bytes.len().is_multiple_of(stripe_bytes) {
+        (cvs.as_slice(), None)
+    } else {
+        match cvs.as_slice().split_last() {
+            Some((&tail, full)) => (full, Some(tail)),
+            None => (&[][..], None),
+        }
+    };
+    let digest = ContentId(blaze_ids::b3::finalize_subtrees_from_context_key(
+        &ctx_key,
+        stripe_chunks,
+        full_cvs,
+        tail_cv,
+    ));
+    if digest != claimed.0 {
+        return Err(layout("its bytes are not the ones its digest names: torn, cut short or forged", 0));
+    }
+
+    let count_usize = usize::try_from(count).unwrap_or(0);
+    let index_usize = usize::try_from(index_at).unwrap_or(0);
+    let run_len = count_usize.saturating_mul(ENTRY);
+    let Some(run) = bytes.get(index_usize..index_usize.saturating_add(run_len)) else {
+        return Err(layout("its index does not start aligned after the header and end at the footer", index_at));
+    };
+
+    let check_entry_range = |lo: usize, hi: usize| -> Option<StoreError> {
+        for i in lo..hi {
+            let at = index_at.saturating_add(u64::try_from(i.saturating_mul(ENTRY)).unwrap_or(0));
+            let Some(row_bytes) = run.get(i.saturating_mul(ENTRY)..i.saturating_add(1).saturating_mul(ENTRY)) else {
+                return Some(layout("an entry places its payload outside the payloads", at));
+            };
+            let entry = match Entry::decode(row_bytes) {
+                Ok(entry) => entry,
+                Err(what) => return Some(layout(what, at)),
+            };
+            if entry.at < header_u64 || !entry.at.is_multiple_of(ALIGN) || entry.at.saturating_add(u64::from(entry.len)) > index_at {
+                return Some(layout("an entry places its payload outside the payloads", at));
+            }
+            if i > 0 {
+                let prev_key = run.get(i.saturating_sub(1).saturating_mul(ENTRY)..i.saturating_sub(1).saturating_mul(ENTRY).saturating_add(32));
+                let curr_key = row_bytes.get(0..32);
+                if prev_key >= curr_key {
+                    return Some(layout("an entry is not after the one before it: the index is not sorted, each key once", at));
+                }
+            }
+        }
+        None
+    };
+
+    if count_usize >= 1024 {
+        let errs = par.map_range(count_usize, 1024, alloc, check_entry_range);
+        for err in errs.into_iter().flatten() {
+            return Err(err);
+        }
+    } else if let Some(err) = check_entry_range(0, count_usize) {
+        return Err(err);
+    }
+
+    if count_usize > 0 {
+        let last_off = count_usize.saturating_sub(1).saturating_mul(ENTRY);
+        let first_ok = bytes.get(32..64) == run.get(0..32);
+        let last_ok = bytes.get(64..96) == run.get(last_off..last_off.saturating_add(32));
+        if !first_ok || !last_ok {
+            return Err(layout("its header's lowest or highest key is not its index's", 32));
+        }
+    }
+    let ns_raw = bytes.get(8..16).and_then(|s| <[u8; 8]>::try_from(s).ok()).map_or(0, u64::from_le_bytes);
+    Ok(Described { namespace: Namespace(ns_raw), count, index_at, digest: claimed.0 })
 }
 
 /// What a segment's header and footer say, read by range without its middle (a remote
@@ -1408,4 +1793,168 @@ pub(crate) fn sorted_run<B: core::alloc::Allocator>(mut entries: Vec<Entry, B>) 
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod par_tests {
+    use blaze_own::Vec as OwnedVec;
+
+    use super::*;
+    use crate::plain::{par::{Serial, ShuffledPar}, test_root};
+
+    fn build_test_segment<'a, A: core::alloc::Allocator + Copy>(
+        record_lens: &[usize],
+        seed: u64,
+        alloc: A,
+    ) -> (OwnedVec<Entry, A>, OwnedVec<OwnedVec<u8, A>, A>, OwnedVec<u8, A>, u64) {
+        let mut items: OwnedVec<(ContentId, Tag, OwnedVec<u8, A>), A> = OwnedVec::with_capacity_in(record_lens.len(), alloc);
+        for (i, &len) in record_lens.iter().enumerate() {
+            let mut key_in = [0u8; 16];
+            key_in[..8].copy_from_slice(&seed.to_le_bytes());
+            key_in[8..].copy_from_slice(&(i as u64).to_le_bytes());
+            let key = ContentId::of("format par test key", &key_in);
+            let mut payload: OwnedVec<u8, A> = OwnedVec::with_capacity_in(len, alloc);
+            let mut state = seed.wrapping_add((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            for j in 0..len {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                payload.push(((state >> 56) as u8) ^ ((j & 0xff) as u8));
+            }
+            items.push((key, Tag(((i % 7) + 1) as u16), payload));
+        }
+        items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut entries: OwnedVec<Entry, A> = OwnedVec::with_capacity_in(items.len(), alloc);
+        let mut payloads: OwnedVec<OwnedVec<u8, A>, A> = OwnedVec::with_capacity_in(items.len(), alloc);
+        let mut pads: OwnedVec<u8, A> = OwnedVec::with_capacity_in(items.len(), alloc);
+        let mut at = HEADER as u64;
+        for (key, tag, payload) in items.into_iter() {
+            let len_u32 = u32::try_from(payload.len()).expect("len fits");
+            let end = at + u64::from(len_u32);
+            let padded = aligned(end);
+            let pad_len = u8::try_from(padded - end).expect("pad fits");
+            let crc = record_crc(&key, tag, payload.as_slice());
+            entries.push(Entry { key, tag, at, len: len_u32, crc });
+            payloads.push(payload);
+            pads.push(pad_len);
+            at = padded;
+        }
+        (entries, payloads, pads, at)
+    }
+
+    fn materialize_segment<A: core::alloc::Allocator + Copy>(
+        sealed: &Sealed,
+        entries: &[Entry],
+        payloads: &[OwnedVec<u8, A>],
+        pads: &[u8],
+        alloc: A,
+    ) -> OwnedVec<u8, A> {
+        let total = usize::try_from(sealed.len).expect("segment len fits");
+        let mut bytes: OwnedVec<u8, A> = OwnedVec::with_capacity_in(total, alloc);
+        bytes.extend_from_slice(&sealed.header);
+        for (payload, &pad) in payloads.iter().zip(pads.iter()) {
+            bytes.extend_from_slice(payload.as_slice());
+            let pad_usize = usize::from(pad);
+            if pad_usize > 0 {
+                bytes.extend_from_slice(&ZEROS[..pad_usize]);
+            }
+        }
+        for entry in entries {
+            bytes.extend_from_slice(&entry.encode_array());
+        }
+        bytes.extend_from_slice(&sealed.footer);
+        assert_eq!(bytes.len(), total);
+        bytes
+    }
+
+    #[test]
+    fn seal_entries_par_and_check_segment_par_match_serial_bit_for_bit() {
+        let root = test_root();
+        let ns = Namespace::LOCAL;
+
+        // 1. Small segment (< 128 KiB): delegates to serial path.
+        let small_lens = [0usize, 1, 15, 16, 17, 100, 4096];
+        // 2. Medium segment (~210 KiB with odd lengths, padding, zero-len records, and multi-stripe crossing).
+        let mut med_lens: OwnedVec<usize, _> = OwnedVec::with_capacity_in(200, &root);
+        for i in 0..200usize {
+            let len = match i % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 15,
+                3 => 16,
+                4 => 17,
+                5 => 333,
+                _ => 4_099,
+            };
+            med_lens.push(len);
+        }
+        // 3. Multi-MB segment (~2.6 MiB with > 1500 entries so both parallel digest AND parallel entry check run).
+        let mut big_lens: OwnedVec<usize, _> = OwnedVec::with_capacity_in(1600, &root);
+        for i in 0..1600usize {
+            let len = if i == 300 {
+                600_000
+            } else if i % 11 == 0 {
+                0
+            } else {
+                (i * 97) % 2_503
+            };
+            big_lens.push(len);
+        }
+
+        for (case_idx, lens) in [small_lens.as_slice(), med_lens.as_slice(), big_lens.as_slice()].iter().enumerate() {
+            let (entries, payloads, pads, index_at) = build_test_segment(lens, 100 + case_idx as u64, &root);
+            let mut slices = Vec::with_capacity_in(payloads.len(), &root);
+            for p in payloads.iter() {
+                slices.push(p.as_slice());
+            }
+            let slice_refs = slices.as_slice();
+            let pad_refs = pads.as_slice();
+
+            let want = seal_entries(
+                ns,
+                entries.as_slice(),
+                index_at,
+                (0..entries.len()).map(|i| (slice_refs[i], pad_refs[i])),
+            );
+            let got_serial = seal_entries_par(
+                ns,
+                entries.as_slice(),
+                index_at,
+                |i| (slice_refs[i], pad_refs[i]),
+                &Serial,
+                &root,
+            );
+            let par = ShuffledPar::from_seed(32, 0xdead_beef + case_idx as u64);
+            let got_par = seal_entries_par(
+                ns,
+                entries.as_slice(),
+                index_at,
+                |i| (slice_refs[i], pad_refs[i]),
+                &par,
+                &root,
+            );
+
+            assert_eq!(got_serial.header, want.header, "case {case_idx} serial header");
+            assert_eq!(got_serial.footer, want.footer, "case {case_idx} serial footer");
+            assert_eq!(got_serial.described, want.described, "case {case_idx} serial described");
+            assert_eq!(got_serial.len, want.len, "case {case_idx} serial len");
+
+            assert_eq!(got_par.header, want.header, "case {case_idx} par header");
+            assert_eq!(got_par.footer, want.footer, "case {case_idx} par footer");
+            assert_eq!(got_par.described, want.described, "case {case_idx} par described");
+            assert_eq!(got_par.len, want.len, "case {case_idx} par len");
+
+            let mut seg_bytes = materialize_segment(&got_par, entries.as_slice(), payloads.as_slice(), pads.as_slice(), &root);
+            let checked_serial = check_segment(seg_bytes.as_slice()).expect("serial check passes");
+            let checked_par = check_segment_par(seg_bytes.as_slice(), &par, &root).expect("par check passes");
+            assert_eq!(checked_par, checked_serial, "case {case_idx} check_segment_par matches serial");
+            assert_eq!(checked_par, want.described, "case {case_idx} described matches sealed");
+
+            // Negative control: flip one bit in the middle and verify both serial and parallel reject identically.
+            let mid = seg_bytes.len() / 2;
+            seg_bytes[mid] ^= 0x80;
+            let err_serial = check_segment(seg_bytes.as_slice()).expect_err("serial rejects corrupted byte");
+            let err_par = check_segment_par(seg_bytes.as_slice(), &par, &root).expect_err("par rejects corrupted byte");
+            assert_eq!(err_par, err_serial, "case {case_idx} error matches serial");
+        }
+    }
 }

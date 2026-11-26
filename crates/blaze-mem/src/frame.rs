@@ -96,19 +96,19 @@ const SPAN_WARM: usize = CHUNK;
 /// more.
 pub const WARM: usize = SHELF * CHUNK + SPANS * SPAN_WARM;
 
-/// The frame memory all of a machine's threads keep warm between tasks, at most: eight shelves
-/// at their most, 256 MiB, what a typical Mac's eight workers keep. A machine of more threads
-/// shares it ([`ShelfSize::for_threads`]): before, every thread kept [`WARM`], 32 MiB, so 128
-/// workers kept 4 GiB idle and charged to no task (the outside review, thoughts2.md 4.2).
-pub const WARM_ALL: usize = 8 * WARM;
+/// The frame memory all of a machine's threads keep warm between tasks, at most: 32 shelves
+/// at their most, 1 GiB total across large-core hosts ([`ShelfSize::for_threads`]), so 128-core
+/// servers keep at least 2 warm chunks (4 MiB) + 2 warm spans (4 MiB) per worker without
+/// thrashing the process chunk/span pools under concurrent builds.
+pub const WARM_ALL: usize = 32 * WARM;
 
 /// Warm spans the process keeps behind its threads' shelves, for a thread whose shelf has none
-/// (or non-task [`Frame::with_reserve`] spans): 80 of [`SPAN_WARM`], 160 MiB total across
-/// [`SPAN_POOL_SHARDS`] cache-padded shards (up to 64 warm spans = 128 MiB + 512 cold spans =
-/// 32 MiB max at 64 KiB granules) so 128 workers never serialize on one global mutex or trigger
-/// `munmap`/`mmap_lock` storms. Chunks have the process's cache behind them already
-/// ([`chunks::WARM_KEEP`]); a span past this goes to the kernel.
-pub const SPAN_POOL: usize = 80;
+/// (or non-task [`Frame::with_reserve`] spans): 160 of [`SPAN_WARM`], 320 MiB total across
+/// [`SPAN_POOL_SHARDS`] (128) cache-padded shards (128 warm spans = 256 MiB + 1024 cold spans =
+/// 64 MiB max at 64 KiB granules) so 128 workers get 1 shard per core and never serialize on one
+/// mutex or trigger `munmap`/`mmap_lock` storms. Chunks have the process's cache behind them
+/// already ([`chunks::WARM_KEEP`]); a span past this goes to the kernel.
+pub const SPAN_POOL: usize = 160;
 
 /// How many blocks one thread's shelf keeps warm, from the machine it is on (rule 75: the pool
 /// that starts the thread hands it in, [`size_shelf`]; one code path, sized by the machine).
@@ -125,14 +125,14 @@ impl ShelfSize {
     pub const MOST: ShelfSize = ShelfSize { chunks: SHELF, spans: SPANS };
 
     /// A thread's part of [`WARM_ALL`] on a machine of `threads` workers, as chunks and spans
-    /// half each: [`ShelfSize::MOST`] up to eight threads, one of each (4 MiB) from 64 threads
-    /// on, so 128 threads keep at most 512 MiB (and the process's pools behind them).
+    /// half each: [`ShelfSize::MOST`] up to 32 threads, and at least 2 chunks + 2 spans (8 MiB)
+    /// per worker on 128+ core hosts.
     pub const fn for_threads(threads: usize) -> ShelfSize {
         let threads = if threads == 0 { 1 } else { threads };
         let blocks = WARM_ALL / threads / CHUNK;
         let half = blocks / 2;
-        let half = if half == 0 {
-            1
+        let half = if half < 2 {
+            2
         } else if half > SHELF {
             SHELF
         } else {
@@ -1094,27 +1094,31 @@ struct Shelf {
     most_spans: Cell<usize>,
 }
 
-/// Number of cache-line-padded shards backing [`SPANS_POOLED`] (power of two): 32 shards give at
-/// most 4 threads per shard on 128-core Linux servers, eliminating global mutex and `mmap_lock`
+/// Number of cache-line-padded shards backing [`SPANS_POOLED`] (power of two): 128 shards give
+/// 1 shard per core on 128-core Graviton 5 / EPYC hosts, eliminating mutex and `mmap_lock`
 /// contention on concurrent non-task `Frame::with_reserve` releases.
-const SPAN_POOL_SHARDS: usize = 32;
-/// Warm slots per shard: 2 x 32 = 64 warm spans (128 MiB max at [`SPAN_WARM`] = 2 MiB each).
-const SPAN_POOL_WARM_PER_SHARD: usize = 2;
-/// Cold slots per shard: 16 x 32 = 512 cold spans (decommitted down to one granule, 32 MiB max
+const SPAN_POOL_SHARDS: usize = 128;
+/// Warm slots per shard: 1 x 128 = 128 warm spans (256 MiB max at [`SPAN_WARM`] = 2 MiB each).
+const SPAN_POOL_WARM_PER_SHARD: usize = 1;
+/// Cold slots per shard: 8 x 128 = 1024 cold spans (decommitted down to one granule, 64 MiB max
 /// even on 64 KiB granules), reusing virtual reservations without `mmap`/`munmap` churn.
-const SPAN_POOL_COLD_PER_SHARD: usize = 16;
+const SPAN_POOL_COLD_PER_SHARD: usize = 8;
 /// Total warm slots across all shards.
 const SPAN_POOL_WARM: usize = SPAN_POOL_SHARDS * SPAN_POOL_WARM_PER_SHARD;
 /// Total cold slots across all shards.
 const SPAN_POOL_COLD: usize = SPAN_POOL_SHARDS * SPAN_POOL_COLD_PER_SHARD;
-/// Total committed-byte budget across all shards (`SPAN_POOL * SPAN_WARM` = 160 MiB).
+/// Total committed-byte budget across all shards (`SPAN_POOL * SPAN_WARM` = 320 MiB).
 const SPAN_POOL_BUDGET: usize = SPAN_POOL * SPAN_WARM;
-/// Committed-byte budget per shard (5 MiB = 4 MiB warm + 1 MiB cold headroom).
+/// Committed-byte budget per shard (2.5 MiB = 2 MiB warm + 512 KiB cold headroom).
 const SPAN_POOL_SHARD_BUDGET: usize = SPAN_POOL_BUDGET / SPAN_POOL_SHARDS;
+/// 64-bit bitmap words covering [`SPAN_POOL_SHARDS`].
+const SPAN_POOL_MASK_WORDS: usize = SPAN_POOL_SHARDS / 64;
 
-const _: () = assert!(SPAN_POOL_SHARDS.is_power_of_two());
-const _: () = assert!(SPAN_POOL_WARM == 64 && SPAN_POOL_COLD == 512);
+const _: () = assert!(SPAN_POOL_SHARDS == 128 && SPAN_POOL_SHARDS.is_power_of_two());
+const _: () = assert!(SPAN_POOL_WARM == 128 && SPAN_POOL_COLD == 1024);
+const _: () = assert!(SPAN_POOL_SHARD_BUDGET >= SPAN_WARM);
 const _: () = assert!(SPAN_POOL_SHARD_BUDGET * SPAN_POOL_SHARDS <= SPAN_POOL_BUDGET);
+const _: () = assert!(SPAN_POOL_MASK_WORDS * 64 == SPAN_POOL_SHARDS);
 
 /// Pooled spans in one shard of [`SPANS_POOLED`]: up to [`SPAN_POOL_WARM_PER_SHARD`] warm spans
 /// (each down to [`SPAN_WARM`]) plus up to [`SPAN_POOL_COLD_PER_SHARD`] cold spans (each down to
@@ -1220,8 +1224,38 @@ impl SpanPoolShard {
 static SPANS_POOLED: [SpanPoolShard; SPAN_POOL_SHARDS] =
     [const { SpanPoolShard::new() }; SPAN_POOL_SHARDS];
 
+/// 128-byte cache-padded word of the non-empty shard bitmap for [`SPANS_POOLED`].
+#[repr(align(128))]
+struct SpanPoolMaskWord(AtomicU64);
+
+/// Bit `i` is set while shard `i` holds at least one warm or cold span (updated only under shard
+/// `i`'s mutex, so no set/clear race is possible). Lets [`take_pooled_span`] skip empty shards in
+/// two atomic loads instead of issuing 128 `try_lock` RMWs on cold span allocation.
+static SPAN_POOL_NONEMPTY: [SpanPoolMaskWord; SPAN_POOL_MASK_WORDS] =
+    [const { SpanPoolMaskWord(AtomicU64::new(0)) }; SPAN_POOL_MASK_WORDS];
+
+#[inline]
+fn set_span_shard_nonempty(idx: usize, nonempty: bool) {
+    let idx = idx & (SPAN_POOL_SHARDS - 1);
+    let bit = 1u64 << (idx % 64);
+    if let Some(word) = SPAN_POOL_NONEMPTY.get(idx / 64) {
+        if nonempty {
+            word.0.fetch_or(bit, Ordering::Release);
+        } else {
+            word.0.fetch_and(!bit, Ordering::Release);
+        }
+    }
+}
+
+#[inline]
+fn span_shard_has_any(idx: usize) -> bool {
+    let idx = idx & (SPAN_POOL_SHARDS - 1);
+    let bit = 1u64 << (idx % 64);
+    SPAN_POOL_NONEMPTY.get(idx / 64).is_some_and(|word| (word.0.load(Ordering::Acquire) & bit) != 0)
+}
+
 /// Monotonic counter assigning threads round-robin to [`SPANS_POOLED`] shards so 128 workers
-/// distribute evenly (4 workers/shard) without hash collisions.
+/// distribute evenly (1 worker/shard) without hash collisions.
 static SPAN_SHARD_NEXT: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
@@ -1230,7 +1264,7 @@ thread_local! {
 }
 
 #[inline]
-fn thread_span_shard() -> usize {
+pub(crate) fn thread_span_shard() -> usize {
     SPAN_SHARD
         .try_with(|cell| {
             let cur = cell.get();
@@ -1283,6 +1317,7 @@ fn pool_or_drop_span(span: *mut Block) {
             if let Some(slot) = pool.warm.get_mut(len) {
                 *slot = span;
                 pool.warm_len = len + 1;
+                set_span_shard_nonempty(home, true);
                 return;
             }
         }
@@ -1310,6 +1345,7 @@ fn pool_cold_or_drop_span_in(shard: usize, span: *mut Block) {
         if let Some(slot) = pool.cold.get_mut(len) {
             *slot = span;
             pool.cold_len = len + 1;
+            set_span_shard_nonempty(shard, true);
             return;
         }
     }
@@ -1319,19 +1355,42 @@ fn pool_cold_or_drop_span_in(shard: usize, span: *mut Block) {
 
 /// A pooled span whose reservation holds `need` bytes, out of the calling thread's shard first
 /// (preferring warm, then cold, best-fit by reservation capacity), then non-blocking steal across
-/// sibling shards via `try_lock` so asymmetric producer/consumer threads still reuse reservations
-/// without cross-core lock contention.
+/// non-empty sibling shards via [`SPAN_POOL_NONEMPTY`] + `try_lock` so asymmetric producer/consumer
+/// threads reuse reservations without scanning empty shards or serializing on locks.
 fn take_pooled_span(need: usize) -> Option<*mut Block> {
     let home = thread_span_shard();
-    if let Some(span) = span_pool_shard(home).take_matching(need) {
-        return Some(span);
+    if span_shard_has_any(home) {
+        let mut pool = span_pool_shard(home);
+        let taken = pool.take_matching(need);
+        if pool.warm_len == 0 && pool.cold_len == 0 {
+            set_span_shard_nonempty(home, false);
+        }
+        if taken.is_some() {
+            return taken;
+        }
     }
-    for step in 1..SPAN_POOL_SHARDS {
-        let idx = (home + step) & (SPAN_POOL_SHARDS - 1);
-        let Some(shard) = SPANS_POOLED.get(idx) else { continue };
-        let Ok(mut pool) = shard.0.try_lock() else { continue };
-        if let Some(span) = pool.take_matching(need) {
-            return Some(span);
+    let start_word = home / 64;
+    for wstep in 0..SPAN_POOL_MASK_WORDS {
+        let word_idx = (start_word + wstep) % SPAN_POOL_MASK_WORDS;
+        let mut bits = SPAN_POOL_NONEMPTY
+            .get(word_idx)
+            .map_or(0, |word| word.0.load(Ordering::Acquire));
+        while bits != 0 {
+            let bit = usize::try_from(bits.trailing_zeros()).unwrap_or(0);
+            bits &= bits - 1;
+            let idx = word_idx * 64 + bit;
+            if idx == home {
+                continue;
+            }
+            let Some(shard) = SPANS_POOLED.get(idx) else { continue };
+            let Ok(mut pool) = shard.0.try_lock() else { continue };
+            let taken = pool.take_matching(need);
+            if pool.warm_len == 0 && pool.cold_len == 0 {
+                set_span_shard_nonempty(idx, false);
+            }
+            if taken.is_some() {
+                return taken;
+            }
         }
     }
     None
@@ -1359,6 +1418,9 @@ pub fn cool_span_pool() {
             for slot in pool.warm.iter_mut().take(len) {
                 *slot = ptr::null_mut();
             }
+            if pool.cold_len == 0 {
+                set_span_shard_nonempty(i, false);
+            }
             (spans, len)
         };
         for &span in warm.iter().take(warm_len) {
@@ -1384,6 +1446,7 @@ pub fn trim_span_pool() {
             for slot in pool.cold.iter_mut().take(clen) {
                 *slot = ptr::null_mut();
             }
+            set_span_shard_nonempty(i, false);
             (warm, wlen, cold, clen)
         };
         for &span in warm.iter().take(warm_len) {
@@ -2304,5 +2367,19 @@ mod tests {
         assert!(cooled > 0 && cooled < pooled, "cool_span_pool reduced {pooled} -> {cooled}");
         trim_span_pool();
         assert_eq!(pooled_span_bytes(), 0, "trim_span_pool emptied all shards");
+        assert!(
+            SPAN_POOL_NONEMPTY.iter().all(|w| w.0.load(Ordering::Acquire) == 0),
+            "trim_span_pool cleared all non-empty bitmap bits"
+        );
+    }
+
+    #[test]
+    fn shelf_size_128_cores_keeps_at_least_two_warm_chunks_and_spans() {
+        assert_eq!(SPAN_POOL_SHARDS, 128);
+        let wide = ShelfSize::for_threads(128);
+        assert!(wide.chunks >= 2 && wide.spans >= 2, "128 cores got {wide:?}");
+        assert_eq!(wide, ShelfSize { chunks: 2, spans: 2 });
+        let huge = ShelfSize::for_threads(256);
+        assert!(huge.chunks >= 2 && huge.spans >= 2, "256 cores got {huge:?}");
     }
 }

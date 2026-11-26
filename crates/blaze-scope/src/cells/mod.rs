@@ -817,6 +817,10 @@ pub(crate) struct Cells<'a, N> {
     guess_epoch: u32,
     cell_queue: ABTreeSet<'a, CellId>,
     item_queue: ABTreeSet<'a, ItemId>,
+    /// Ready macro calls (`items[i].call.is_some()`), kept separate from `item_queue` (imports)
+    /// so `turn` can batch all simultaneously-ready macro calls into one parallel wave without
+    /// evaluating `use` imports ahead of pending macro expansions.
+    call_queue: ABTreeSet<'a, ItemId>,
     /// Calls resolved and not expanded yet.
     expand_queue: ABTreeSet<'a, ItemId>,
     /// Inputs a group's fixed point met outside the group (a node reads the second): edges the
@@ -1341,6 +1345,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             guess_epoch: 0,
             cell_queue: ABTreeSet::new_in(alloc),
             item_queue: ABTreeSet::new_in(alloc),
+            call_queue: ABTreeSet::new_in(alloc),
             expand_queue: ABTreeSet::new_in(alloc),
             extra: ABTreeMap::new_in(alloc),
             outer: Outer {
@@ -1937,7 +1942,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let module = &mut self.modules[m as usize];
             module.calls.push(id);
             module.growth += 1;
-            self.item_queue.insert(id);
+            self.call_queue.insert(id);
             self.stats.calls += 1;
         }
         // Positions are unique in a fragment: no sort order is left open.
@@ -2084,53 +2089,77 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         Ok(())
     }
 
-    /// Expands call `i`, resolved: the driver expands it, the facts hand back what it writes,
-    /// which is added to its module as a fragment at the call's place; then its growth ends.
-    fn expand_call<F: ScopeFacts<Name = N>>(&mut self, facts: &F, expand: &dyn Fn(ItemKey, Def), i: ItemId) -> Result<(), CellError> {
-        let (m, at, def) = match (self.items[i as usize].call, self.items[i as usize].outcome) {
-            (Some(at), Some(Outcome::Called(def))) => (self.items[i as usize].module, at, def),
-            _ => return Ok(()),
-        };
-        // Read now, before `grown` wakes its waiters (such an attribute among them,
-        // [`Cells::derive_helper`]); only where an attribute follows, so a derive no attribute
-        // follows never asks (a built-in derive's helpers are refused by the facts).
-        if at.shape == CallShape::Derive
-            && !self.helpers.contains_key(&def.key)
-            && let Some(&on) = self.call_on.get(&i)
-            && self.attr_after.get(&(at.frag, on)).is_some_and(|&last| last > at.pos)
-        {
-            let mut names: AVec<'a, N> = AVec::new_in(self.alloc);
-            facts.derive_helpers(def.key, &mut names).map_err(|error| CellError::Helpers { call: at.key, derive: def.key, error })?;
-            names.sort_unstable();
-            names.dedup();
-            self.helpers.insert(def.key, names);
-        }
-        expand(at.key, def);
-        let mut tops: AVec<'a, ItemKey> = AVec::new_in(self.alloc);
-        match facts.with_expansion(at.key, |opt| {
-            let Some(d) = opt else { return false };
-            tops.reserve(d.mods.len());
-            for c in d.mods.iter() {
-                tops.push(c.module);
+    /// Expands a deterministic wave of resolved calls `batch` (in ascending `ItemId` order):
+    /// first reads any needed derive helpers, then asks `expand_batch` to expand every call in
+    /// the wave (in parallel when the driver provides workers), then reads each expansion's
+    /// modules and fragment into `Cells` sequentially in exact `batch` order.
+    fn expand_calls<F: ScopeFacts<Name = N>>(
+        &mut self,
+        facts: &F,
+        expand_batch: &dyn Fn(&[(ItemKey, Def)]),
+        batch: &[ItemId],
+    ) -> Result<(), CellError> {
+        let mut ready: AVec<'a, (ItemId, ModId, CallAt, Def)> = AVec::with_capacity_in(batch.len(), self.alloc);
+        for &i in batch {
+            let Some(item) = usize::try_from(i).ok().and_then(|ix| self.items.get(ix)) else {
+                continue;
+            };
+            if let (Some(at), Some(Outcome::Called(def))) = (item.call, item.outcome) {
+                ready.push((i, item.module, at, def));
             }
-            true
-        }) {
-            Ok(true) => {}
-            Ok(false) => return Err(CellError::NotExpanded { call: at.key }),
-            Err(error) => return Err(CellError::Expansion { call: at.key, error }),
         }
-        let made = self.make_modules(facts, &tops)?;
-        let f = match facts.with_expansion(at.key, |opt| opt.map(|d| self.read_fragment(m, d, Some((at.frag, at.pos))))) {
-            Ok(Some(res)) => res?,
-            Ok(None) => return Err(CellError::NotExpanded { call: at.key }),
-            Err(error) => return Err(CellError::Expansion { call: at.key, error }),
-        };
-        for &n in made.iter() {
-            self.read_text(facts, n)?;
+        if ready.is_empty() {
+            return Ok(());
         }
-        self.items[i as usize].expansion = Some(f);
-        self.stats.expansions += 1;
-        self.grown(i);
+        // Read derive helpers before `grown` wakes waiting attributes ([`Cells::derive_helper`]).
+        for &(i, _, at, def) in ready.iter() {
+            if at.shape == CallShape::Derive
+                && !self.helpers.contains_key(&def.key)
+                && let Some(&on) = self.call_on.get(&i)
+                && self.attr_after.get(&(at.frag, on)).is_some_and(|&last| last > at.pos)
+            {
+                let mut names: AVec<'a, N> = AVec::new_in(self.alloc);
+                facts.derive_helpers(def.key, &mut names).map_err(|error| CellError::Helpers { call: at.key, derive: def.key, error })?;
+                names.sort_unstable();
+                names.dedup();
+                self.helpers.insert(def.key, names);
+            }
+        }
+        let mut requests: AVec<'a, (ItemKey, Def)> = AVec::with_capacity_in(ready.len(), self.alloc);
+        for &(_, _, at, def) in ready.iter() {
+            requests.push((at.key, def));
+        }
+        expand_batch(&requests);
+        let mut tops: AVec<'a, ItemKey> = AVec::new_in(self.alloc);
+        for &(i, m, at, _) in ready.iter() {
+            tops.clear();
+            match facts.with_expansion(at.key, |opt| {
+                let Some(d) = opt else { return false };
+                tops.reserve(d.mods.len());
+                for c in d.mods.iter() {
+                    tops.push(c.module);
+                }
+                true
+            }) {
+                Ok(true) => {}
+                Ok(false) => return Err(CellError::NotExpanded { call: at.key }),
+                Err(error) => return Err(CellError::Expansion { call: at.key, error }),
+            }
+            let made = self.make_modules(facts, &tops)?;
+            let f = match facts.with_expansion(at.key, |opt| opt.map(|d| self.read_fragment(m, d, Some((at.frag, at.pos))))) {
+                Ok(Some(res)) => res?,
+                Ok(None) => return Err(CellError::NotExpanded { call: at.key }),
+                Err(error) => return Err(CellError::Expansion { call: at.key, error }),
+            };
+            for &n in made.iter() {
+                self.read_text(facts, n)?;
+            }
+            if let Some(item) = usize::try_from(i).ok().and_then(|ix| self.items.get_mut(ix)) {
+                item.expansion = Some(f);
+            }
+            self.stats.expansions += 1;
+            self.grown(i);
+        }
         Ok(())
     }
 
@@ -2428,7 +2457,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 self.cell_queue.insert(c);
             }
             Node::Item(i) => {
-                self.item_queue.insert(i);
+                self.enqueue_item(i);
             }
         }
     }
@@ -4353,27 +4382,82 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// Runs every import and call of the crate to its decision; `expand` is the driver's hook that
     /// expands a resolved call, whose expansion `facts` then hands back.
     pub(crate) fn run<F: ScopeFacts<Name = N>>(&mut self, facts: &F, expand: &dyn Fn(ItemKey, Def), order: &[u32]) -> Result<(), CellError> {
-        for &i in order {
-            self.item_queue.insert(i);
-        }
-        for i in 0..self.items.len() as ItemId {
-            self.item_queue.insert(i);
-        }
-        self.turn(&mut |c: &mut Cells<'a, N>, i| c.expand_call(facts, expand, i))
+        let expand_batch = |batch: &[(ItemKey, Def)]| {
+            for &(call, def) in batch {
+                expand(call, def);
+            }
+        };
+        self.run_batched(facts, &expand_batch, order)
     }
 
-    /// The loop: cells first, then expansions, then items; at a quiet point the sinks.
-    fn turn(&mut self, expand: &mut dyn FnMut(&mut Cells<'a, N>, ItemId) -> Result<(), CellError>) -> Result<(), CellError> {
+    fn enqueue_item(&mut self, i: ItemId) {
+        if usize::try_from(i).ok().and_then(|ix| self.items.get(ix)).is_some_and(|it| it.call.is_some()) {
+            self.call_queue.insert(i);
+        } else {
+            self.item_queue.insert(i);
+        }
+    }
+
+    fn pop_next_item(&mut self) -> Option<ItemId> {
+        if self.backward {
+            match (self.item_queue.last().copied(), self.call_queue.last().copied()) {
+                (Some(a), Some(b)) if b >= a => self.call_queue.pop_last(),
+                (Some(_), _) => self.item_queue.pop_last(),
+                (None, Some(_)) => self.call_queue.pop_last(),
+                (None, None) => None,
+            }
+        } else {
+            match (self.item_queue.first().copied(), self.call_queue.first().copied()) {
+                (Some(a), Some(b)) if b <= a => self.call_queue.pop_first(),
+                (Some(_), _) => self.item_queue.pop_first(),
+                (None, Some(_)) => self.call_queue.pop_first(),
+                (None, None) => None,
+            }
+        }
+    }
+
+    /// Runs every import and call of the crate to its decision, handing each wave of
+    /// simultaneously-ready resolved macro calls to `expand_batch`.
+    pub(crate) fn run_batched<F: ScopeFacts<Name = N>>(
+        &mut self,
+        facts: &F,
+        expand_batch: &dyn Fn(&[(ItemKey, Def)]),
+        order: &[u32],
+    ) -> Result<(), CellError> {
+        for &i in order {
+            self.enqueue_item(i);
+        }
+        for i in 0..u32::try_from(self.items.len()).unwrap_or(u32::MAX) {
+            self.enqueue_item(i);
+        }
+        self.turn(&mut |c: &mut Cells<'a, N>, batch: &[ItemId]| c.expand_calls(facts, expand_batch, batch))
+    }
+
+    /// The loop: as soon as any macro call is ready to expand, drain all other ready macro calls
+    /// (`call_queue`, never `use` imports in `item_queue`) so simultaneously-ready calls form one
+    /// deterministic parallel wave and expand before later `use` imports run; otherwise step the
+    /// next item across `call_queue`/`item_queue` in `ItemId` order; at a quiet point decide sinks.
+    fn turn(&mut self, expand: &mut dyn FnMut(&mut Cells<'a, N>, &[ItemId]) -> Result<(), CellError>) -> Result<(), CellError> {
+        let mut batch: AVec<'a, ItemId> = AVec::new_in(self.alloc);
         loop {
             self.drain_cells();
-            if let Some(i) = self.expand_queue.pop_first() {
-                expand(self, i)?;
+            if !self.expand_queue.is_empty() {
+                while let Some(i) = if self.backward { self.call_queue.pop_last() } else { self.call_queue.pop_first() } {
+                    if usize::try_from(i).ok().and_then(|ix| self.items.get(ix)).is_some_and(|it| !it.deep) {
+                        self.eval(i);
+                    }
+                    self.drain_cells();
+                }
+                batch.clear();
+                while let Some(i) = if self.backward { self.expand_queue.pop_last() } else { self.expand_queue.pop_first() } {
+                    batch.push(i);
+                }
+                expand(self, &batch)?;
                 continue;
             }
-            let next = if self.backward { self.item_queue.pop_last() } else { self.item_queue.pop_first() };
-            if let Some(i) = next {
+            if let Some(i) = self.pop_next_item() {
                 // A call past the recursion limit is never evaluated (its error is written).
-                if !self.items[i as usize].deep {
+                if usize::try_from(i).ok().and_then(|ix| self.items.get(ix)).is_some_and(|it| !it.deep) {
                     self.eval(i);
                 }
                 continue;
@@ -4391,10 +4475,20 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     pub(crate) fn ask(&mut self, module: ItemKey, ns: Namespace, name: N) -> Result<Option<Value>, CellError> {
         let Some(&m) = self.by_key.get(&module) else { return Ok(None) };
         let c = self.cell(m, ns, name, Layer::Full);
-        self.turn(&mut |c: &mut Cells<'a, N>, i| {
-            Err(CellError::NotExpanded { call: c.items[i as usize].call.map_or(c.modules[c.root as usize].key, |at| at.key) })
+        self.turn(&mut |c: &mut Cells<'a, N>, batch: &[ItemId]| {
+            let call = batch
+                .first()
+                .copied()
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|ix| c.items.get(ix))
+                .and_then(|it| it.call)
+                .map_or_else(
+                    || usize::try_from(c.root).ok().and_then(|r| c.modules.get(r)).map_or(module, |md| md.key),
+                    |at| at.key,
+                );
+            Err(CellError::NotExpanded { call })
         })?;
-        Ok(self.cells[c as usize].value)
+        Ok(usize::try_from(c).ok().and_then(|ix| self.cells.get(ix)).and_then(|cell| cell.value))
     }
 
     /// Import `index` of fragment `frag`: a module's own text (by the module's key) or a call's

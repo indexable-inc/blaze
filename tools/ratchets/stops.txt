@@ -30,7 +30,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1258
+blaze-cli	1253
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -86,7 +86,7 @@ blaze-macro-run	4
 blaze-malloc	65
 blaze-manifest	150
 blaze-math	42
-blaze-mem	104
+blaze-mem	102
 blaze-memchr	17
 blaze-memo	95
 blaze-memo-macros	3
@@ -114,7 +114,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1658
+blaze-scope	1647
 blaze-screen	30
 blaze-script	91
 blaze-semver	9

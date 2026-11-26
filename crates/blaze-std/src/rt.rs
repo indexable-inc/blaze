@@ -53,9 +53,12 @@ pub use launch::{SPEC_MARK, SPEC_MARK_VALUE, launch, launch_with};
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod testing_native;
 
-/// The threads the native driver runs file calls on where it has a pool (kqueue, IOCP): a
-/// bound bstd picks for a program's entry, named (std.md, "The second rule").
+/// The baseline threads the native driver runs file calls on where it has a pool (kqueue, IOCP):
+/// scaled up to [`MAX_FILE_THREADS`] on wide-core hosts ([`machine::file_threads`], std.md).
 pub(crate) const FILE_THREADS: usize = 4;
+
+/// Upper bound on native driver file threads on large-core servers (e.g. 16 at 128 cores).
+const MAX_FILE_THREADS: usize = 16;
 
 /// What a program of the blaze edition hands Rust std's `lang_start`: its [`Status`], as the
 /// one type of bstd that implements Rust std's `Termination`. Gone with `lang_start`, when
@@ -467,10 +470,13 @@ pub(crate) mod pool {
             .name(format!("bstd-worker-{at}"))
             .stack_size(WORKER_STACK)
             .spawn(move || {
-                if let Some((cpu, class)) = mine.placement(at)
-                    && let Err(why) = machine::place(cpu, class)
-                {
-                    super::fatal(&StartError { worker: at, why }.to_string());
+                if let Some((cpu, class)) = mine.placement(at) {
+                    if let Err(why) = machine::place(cpu, class) {
+                        let mut buf = [0u8; 256];
+                        let msg = machine::fmt_into(&mut buf, format_args!("{}", StartError { worker: at, why }));
+                        super::fatal(msg);
+                    }
+                    let _ = blaze_mem::chunks::set_thread_node(machine::numa_node(cpu));
                 }
                 blaze_mem::frame::size_shelf(blaze_mem::frame::ShelfSize::for_threads(mine.workers() as usize));
                 mine.work(at);
@@ -510,14 +516,39 @@ mod machine {
     //! The machine's cores, and placing a worker on one (rule 45 for macOS's).
 
     // `std` is this module's (bstd is `no_std`: rt.rs is where Rust std is named).
-    use super::std::{self, format, string::String, vec::Vec as StdVec};
+    #[cfg(target_os = "linux")]
+    use super::std::fs;
+    use super::std::{self, format, string::String, thread, vec::Vec as StdVec};
 
     use alloc::{alloc::Global, string::ToString as _};
 
     use blaze_own::Vec;
 
-    use super::TopologyError;
+    use super::{FILE_THREADS, MAX_FILE_THREADS, TopologyError};
     use crate::task::threads::{Class, Group, Topology};
+
+    /// Maximum workers placed in one `GroupState`: unified-LLC CPUs (e.g. 128-core Graviton 4/5)
+    /// are split into virtual groups of at most 16 workers so all cores do not serialize on a
+    /// single `bstd.task.inject` mutex.
+    pub(super) const MAX_GROUP_WORKERS: usize = 16;
+
+    /// Native file-IO thread count for a host of `cores` logical CPUs, bounded to `4..=16`.
+    pub(super) const fn file_threads_for(cores: usize) -> usize {
+        let scaled = cores / 8;
+        if scaled < FILE_THREADS {
+            FILE_THREADS
+        } else if scaled > MAX_FILE_THREADS {
+            MAX_FILE_THREADS
+        } else {
+            scaled
+        }
+    }
+
+    /// Native file-IO thread count for this host (`4..=16`, spawning no threads here).
+    pub(super) fn file_threads() -> usize {
+        let cores = read().map_or(FILE_THREADS, |topology| topology.workers() as usize);
+        file_threads_for(cores)
+    }
 
     fn failed(what: &'static str, why: impl core::fmt::Display) -> TopologyError {
         TopologyError { what, why: why.to_string() }
@@ -572,13 +603,62 @@ mod machine {
                 continue;
             }
             let shared = last_level(cpu)?;
-            let group: StdVec<u32> = shared.into_iter().filter(|&it| allowed(it) && !seen.contains(&it)).collect();
+            let node = numa_node(cpu);
+            let group: StdVec<u32> = shared
+                .into_iter()
+                .filter(|&it| allowed(it) && !seen.contains(&it) && numa_node(it) == node)
+                .collect();
             seen.extend(group.iter().copied());
             if !group.is_empty() {
                 groups.push(group);
             }
         }
         Ok(made(groups.into_iter().map(|cpus| (Class::Foreground, cpus)), true))
+    }
+
+    /// Formats `args` into a caller-supplied stack buffer without allocating.
+    pub(super) fn fmt_into<'b>(buf: &'b mut [u8], args: core::fmt::Arguments<'_>) -> &'b str {
+        struct Writer<'b> {
+            buf: &'b mut [u8],
+            len: usize,
+        }
+        impl core::fmt::Write for Writer<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let room = self.buf.len().saturating_sub(self.len);
+                let take = bytes.len().min(room);
+                if let Some(dst) = self.buf.get_mut(self.len..self.len + take)
+                    && let Some(src) = bytes.get(..take)
+                {
+                    dst.copy_from_slice(src);
+                    self.len += take;
+                }
+                Ok(())
+            }
+        }
+        let mut writer = Writer { buf, len: 0 };
+        let _ = core::fmt::Write::write_fmt(&mut writer, args);
+        let len = writer.len;
+        core::str::from_utf8(buf.get(..len).unwrap_or(&[])).unwrap_or("")
+    }
+
+    /// The NUMA node of Linux CPU `cpu` from `/sys/devices/system/cpu/cpuN/nodeM`, or `None` when
+    /// sysfs exposes no node or the node is past `blaze_mem::chunks::MAX_NODES`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn numa_node(cpu: u32) -> Option<u32> {
+        let mut buf = [0u8; 64];
+        let dir = fmt_into(&mut buf, format_args!("/sys/devices/system/cpu/cpu{cpu}"));
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(num) = name.to_str().and_then(|it| it.strip_prefix("node"))
+                && let Ok(node) = num.parse::<u32>()
+                && node < blaze_mem::chunks::MAX_NODES
+            {
+                return Some(node);
+            }
+        }
+        None
     }
 
     /// The cores sharing `cpu`'s highest-level cache: itself alone when sysfs names no cache.
@@ -702,26 +782,63 @@ mod machine {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn numa_node(_cpu: u32) -> Option<u32> {
+        None
+    }
+
     fn made(groups: impl Iterator<Item = (Class, StdVec<u32>)>, pin: bool) -> Topology {
-        let mut out = Vec::new_in(Global);
+        let alloc = Global;
+        let mut out = Vec::new_in(alloc);
         for (class, cpus) in groups {
-            let mut own = Vec::with_capacity_in(cpus.len(), Global);
-            for cpu in cpus {
-                own.push(cpu);
+            for chunk in cpus.chunks(MAX_GROUP_WORKERS) {
+                let mut own = Vec::with_capacity_in(chunk.len(), alloc);
+                for &cpu in chunk {
+                    own.push(cpu);
+                }
+                out.push(Group { class, cpus: own });
             }
-            out.push(Group { class, cpus: own });
         }
         Topology { groups: out, pin }
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{cpu_list, std};
+        use super::{Class, MAX_GROUP_WORKERS, StdVec, cpu_list, file_threads_for, made, std};
 
         #[test]
         fn a_cpu_list_reads_ranges_and_singles() {
             assert_eq!(cpu_list("0-3,8,10-11\n"), Ok(std::vec![0, 1, 2, 3, 8, 10, 11]));
             assert!(cpu_list("3-1").is_err());
+        }
+
+        #[test]
+        fn unified_llc_group_splits_into_virtual_groups_of_at_most_16_and_file_threads_scale() {
+            let unified_128: StdVec<u32> = (0..128).collect();
+            let topo = made(core::iter::once((Class::Foreground, unified_128)), true);
+            assert_eq!(topo.workers(), 128);
+            assert_eq!(topo.groups.len(), 8);
+            assert!(topo.groups.iter().all(|g| g.cpus.len() == MAX_GROUP_WORKERS));
+
+            let mixed = made(
+                [
+                    (Class::Foreground, (0..20).collect()),
+                    (Class::Background, (20..28).collect()),
+                ]
+                .into_iter(),
+                false,
+            );
+            assert_eq!(mixed.workers(), 28);
+            assert_eq!(mixed.groups.len(), 3);
+            assert_eq!(mixed.groups[0].cpus.len(), 16);
+            assert_eq!(mixed.groups[1].cpus.len(), 4);
+            assert_eq!(mixed.groups[2].cpus.len(), 8);
+
+            assert_eq!(file_threads_for(1), 4);
+            assert_eq!(file_threads_for(16), 4);
+            assert_eq!(file_threads_for(64), 8);
+            assert_eq!(file_threads_for(128), 16);
+            assert_eq!(file_threads_for(256), 16);
         }
 
         /// Rule 45: the Darwin calls the pool makes exist, and the QoS call works on this
@@ -786,7 +903,7 @@ pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &
     let world = NativeWorld {
         root,
         above,
-        threads: FILE_THREADS,
+        threads: machine::file_threads(),
         env,
         args,
         // alloc: once per process, the host's name (empty: see `run`).

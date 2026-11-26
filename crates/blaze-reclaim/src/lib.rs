@@ -41,15 +41,23 @@ use crate::sync::{
 
 mod sync;
 
+/// 128-byte cache-line padded global epoch so `Grace::start` increments never false-share
+/// with adjacent statics or [`FIRST`]'s slot array on 128-core ARM64/x86-64 hosts (rule 86).
+#[repr(align(128))]
+struct PaddedEpoch(AtomicU64);
+
+const _: () = assert!(align_of::<PaddedEpoch>() == 128);
+
 /// Advanced by every [`Grace::start`]. A task that began at an epoch after a grace's started
 /// after the values of that grace were unlinked, so it cannot reach them.
-static EPOCH: AtomicU64 = AtomicU64::new(1);
+static EPOCH: PaddedEpoch = PaddedEpoch(AtomicU64::new(1));
 
 /// The first slots; more blocks are linked on as threads come, and none is ever freed (a slot
 /// is given back when its thread ends).
 static FIRST: Block = Block::new();
 
-const SLOTS: usize = 64;
+/// Slots in each block: 128 so 128-core hosts fit in [`FIRST`] with zero linked-list traversal.
+const SLOTS: usize = 128;
 
 /// What [`Slot::since`] holds for a thread out of any task.
 const OUT: u64 = 0;
@@ -249,7 +257,7 @@ fn begin(local: &Local) {
     // Acquire: an epoch after a grace's start comes with everything unlinked before it.
     // Release: this store replaces the `OUT` the thread's last task ended with, so a writer that
     // reads it must still be ordered after that task's reads.
-    slot.since.store(EPOCH.load(Ordering::Acquire), Ordering::Release);
+    slot.since.store(EPOCH.0.load(Ordering::Acquire), Ordering::Release);
     // Against `Grace::start`'s fence: either the writer's scan sees this slot, or the loads this
     // task does next see what the writer unlinked.
     fence(Ordering::SeqCst);
@@ -347,7 +355,7 @@ impl Grace {
     /// Starts one. Call it after the release stores that unlinked what it covers.
     pub fn start() -> Grace {
         fence(Ordering::SeqCst);
-        Grace(EPOCH.fetch_add(1, Ordering::SeqCst))
+        Grace(EPOCH.0.fetch_add(1, Ordering::SeqCst))
     }
 
     /// Whether it has passed: one scan of every thread's slot. To ask of many graces, take one
@@ -372,7 +380,7 @@ impl Horizon {
         // one, at least this, so it is never counted passed below. A grace numbered below it
         // started before the scan, which `oldest` orders after the load (its fence), so the
         // scan judges it as `Grace::passed` called then would.
-        let next = EPOCH.load(Ordering::SeqCst);
+        let next = EPOCH.0.load(Ordering::SeqCst);
         Horizon(next.min(oldest()))
     }
 
@@ -480,3 +488,37 @@ impl Passed {
 mod model;
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
+
+#[cfg(all(test, not(blaze_check)))]
+mod scale_128_tests {
+    use super::*;
+
+    /// Verifies `SLOTS == 128`, 128-byte cache-line padding of `EPOCH` and `Slot`, and that 128
+    /// simultaneously active threads fit in `FIRST` without allocating a linked overflow block.
+    #[test]
+    fn first_block_holds_128_concurrent_slots_and_epoch_is_128b_aligned() {
+        assert_eq!(SLOTS, 128);
+        assert_eq!(align_of::<PaddedEpoch>(), 128);
+        assert_eq!(align_of::<Slot>(), 128);
+        assert_eq!(ptr::from_ref(&EPOCH).addr() % 128, 0);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(96));
+        let mut handles = Vec::with_capacity(96);
+        for _ in 0..96 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let guard = enter();
+                assert!(in_task());
+                let nested = enter();
+                barrier.wait();
+                drop(nested);
+                drop(guard);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("reclaim 128-slot worker");
+        }
+        // `FIRST` holds 128 slots, so 96 simultaneous threads (+ test harness threads) stay in 1 block.
+        assert!(FIRST.slots.len() == 128);
+    }
+}
