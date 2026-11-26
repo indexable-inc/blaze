@@ -559,8 +559,8 @@ impl QueryCache {
 
 /// One maker's state over program `P` (made with the program, on the first miss).
 pub struct MakerState {
-    /// Each fn key asked of `check_one`, sorted: the fn's index, `None` when it had no body.
-    asked: AVec<'static, (ItemKey, Option<usize>)>,
+    /// Each fn key asked of `check_one`: the fn's index, `None` when it had no body.
+    asked: blaze_hash::Map<ItemKey, Option<usize>, blaze_hash::FixedState, Alloc<'static>>,
     /// Fn `i`'s checked body, `None` until asked (or with none): what [`Bodies`] reads.
     checked: AVec<'static, Option<Checked<'static>>>,
     tables: Option<Tables>,
@@ -729,7 +729,12 @@ impl MakerState {
             answers: Answers::new_in(alloc),
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
         };
-        Ok(MakerState { asked: blaze_own::Vec::new_in(alloc), checked: blaze_own::Vec::new_in(alloc), tables: Some(tables), work })
+        Ok(MakerState {
+            asked: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+            checked: blaze_own::Vec::new_in(alloc),
+            tables: Some(tables),
+            work,
+        })
     }
 
     /// The read-list tests' planted bug (code_reads.rs `ReadPlant`, rule 23): every build after
@@ -762,7 +767,7 @@ impl MakerState {
         self.owners_named(&*program, key, &mut todo);
         let mut steps = 0;
         while let Some(owner) = todo.pop() {
-            if self.asked.binary_search_by_key(&owner, |r| r.0).is_ok() {
+            if self.asked.contains_key(&owner) {
                 continue;
             }
             steps += 1;
@@ -781,7 +786,7 @@ impl MakerState {
     /// in that fn's check, front2/coroutines.rs `opaque_hidden`), an `async fn`'s future among
     /// them.
     fn owners_named<P: FrontEnd>(&self, program: &P, key: ItemKey, todo: &mut AVec<'_, ItemKey>) {
-        let Some(Some(i)) = self.asked.binary_search_by_key(&key, |r| r.0).ok().map(|n| self.asked[n].1) else { return };
+        let Some(&Some(i)) = self.asked.get(&key) else { return };
         let Some(Some(done)) = self.checked.get(i) else { return };
         let view = done.types.view();
         for n in view.nodes() {
@@ -804,10 +809,9 @@ impl MakerState {
 
     /// [`MakerState::ensure`] of one key, owners not followed.
     fn ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
-        let slot = match self.asked.binary_search_by_key(&key, |r| r.0) {
-            Ok(n) => return Ok(self.asked[n].1),
-            Err(n) => n,
-        };
+        if let Some(&at) = self.asked.get(&key) {
+            return Ok(at);
+        }
         // A ctor has no body to check: its row is made, and its instance built as a fn
         // ([`build_one`]'s ctor arm).
         // The trait's `Clone::clone` has no body either: the one instance tabled at it is a
@@ -818,7 +822,7 @@ impl MakerState {
             || crate::clone_shim::is_language_fn_ptr_item(program, key)
         {
             let at = program.head_row(key)?;
-            self.asked.insert_shift(slot, (key, at));
+            self.asked.insert(key, at);
             return Ok(at);
         }
         // Populate head facts first so a tuple/unit struct ctor whose ADT has not yet been
@@ -826,7 +830,7 @@ impl MakerState {
         // `ctor_of` instead of being sent to `check_one` as a body-bearing fn.
         let head_at = program.head_row(key)?;
         if program.ctor_of(key).is_some() {
-            self.asked.insert_shift(slot, (key, head_at));
+            self.asked.insert(key, head_at);
             return Ok(head_at);
         }
         // The body's checked columns by the typing seam: checked again, or read (`Typing`).
@@ -838,7 +842,7 @@ impl MakerState {
                 Some(i)
             }
         };
-        self.asked.insert_shift(slot, (key, at));
+        self.asked.insert(key, at);
         Ok(at)
     }
 
@@ -895,15 +899,15 @@ impl MakerState {
     ) -> Result<(), RunError> {
         /// The most closure owners one ensure follows (rule 18).
         const MOST_OWNERS: usize = 4096;
-        if let Err(slot) = self.asked.binary_search_by_key(&spec_key, |r| r.0) {
-            self.asked.insert_shift(slot, (spec_key, Some(spec_i)));
+        if !self.asked.contains_key(&spec_key) {
+            self.asked.insert(spec_key, Some(spec_i));
         }
         self.register_checked_row(&*program, spec_key, spec_i, done, checks)?;
         let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(self.work.alloc);
         self.owners_named(&*program, spec_key, &mut todo);
         let mut steps = 0;
         while let Some(owner) = todo.pop() {
-            if self.asked.binary_search_by_key(&owner, |r| r.0).is_ok() {
+            if self.asked.contains_key(&owner) {
                 continue;
             }
             steps += 1;
@@ -1108,9 +1112,9 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
                 if pull_owners < MOST_HELD_COROUTINES
                     && (opaque == owner
-                        || match state.asked.binary_search_by_key(&owner, |r| r.0) {
-                            Err(_) => true,
-                            Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
+                        || match state.asked.get(&owner) {
+                            None => true,
+                            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
                         }) =>
             {
                 pull_owners += 1;
@@ -1174,9 +1178,9 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner: op_owner }, .. })
                                 if pull_owners < MOST_HELD_COROUTINES
                                     && (opaque == op_owner
-                                        || match state.asked.binary_search_by_key(&op_owner, |r| r.0) {
-                                            Err(_) => true,
-                                            Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(op_owner).is_none(),
+                                        || match state.asked.get(&op_owner) {
+                                            None => true,
+                                            Some(entry) => entry.is_none() && program.fn_index(op_owner).is_none(),
                                         }) =>
                             {
                                 pull_owners += 1;
@@ -1201,9 +1205,9 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
                 if owners < MOST_HELD_COROUTINES
                     && (opaque == owner
-                        || match state.asked.binary_search_by_key(&owner, |r| r.0) {
-                            Err(_) => true,
-                            Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
+                        || match state.asked.get(&owner) {
+                            None => true,
+                            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
                         }) =>
             {
                 owners += 1;
@@ -1272,7 +1276,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                         }
                         if program.head_row(key)?.is_some() {
                             made_any = true;
-                        } else if state.asked.binary_search_by_key(&key, |r| r.0).is_ok() {
+                        } else if state.asked.contains_key(&key) {
                             return Err(refusal);
                         } else {
                             state.ensure(program, typing, key, checks)?;
@@ -1487,10 +1491,8 @@ fn ensure_opaque_owner<P: FrontEnd, T: Typing<P>>(
         let Some(row) = program.head_row(owner)? else {
             return Err(unchecked_owner(&*program, build_i, owner));
         };
-        if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
-            && let Some(entry) = state.asked.get_mut(slot)
-        {
-            entry.1 = Some(row);
+        if let Some(entry) = state.asked.get_mut(&owner) {
+            *entry = Some(row);
         }
     }
     Ok(())
@@ -1991,10 +1993,8 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 let Ok(Some(row)) = program.head_row(owner) else {
                     return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner });
                 };
-                if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
-                    && let Some(entry) = state.asked.get_mut(slot)
-                {
-                    entry.1 = Some(row);
+                if let Some(entry) = state.asked.get_mut(&owner) {
+                    *entry = Some(row);
                 }
             }
             Err(_) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
@@ -3419,7 +3419,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                     Ok(()) if !untabled.is_empty() => {
                         for (key, refusal) in untabled {
                             owners += 1;
-                            if owners > MOST_HELD_COROUTINES || state.asked.binary_search_by_key(&key, |r| r.0).is_ok() {
+                            if owners > MOST_HELD_COROUTINES || state.asked.contains_key(&key) {
                                 return Err(refusal);
                             }
                             state.ensure(program, &mut self.typing, key, &mut self.checks)?;
