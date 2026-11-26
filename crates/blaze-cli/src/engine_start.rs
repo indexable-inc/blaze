@@ -982,10 +982,9 @@ fn native_image_for_cached<'r>(
 
     let memo_info = (|| -> Option<(blaze_cas::Key, blaze_own::Vec<Key, &bstd::mem::Frame>)> {
         let platform = crate::native_image::platform()?;
-        let sdk = match (platform, standing.place.sdk) {
-            (blaze_ladder::native_links::Platform::MacosArm64, Ok(sdk)) => Some(sdk.identity()),
-            (blaze_ladder::native_links::Platform::MacosArm64, Err(_)) => return None,
-            (blaze_ladder::native_links::Platform::LinuxArm64, _) => None,
+        let sdk = match platform {
+            blaze_ladder::native_links::Platform::MacosArm64 => Some(standing.resolve_sdk(cx).ok()?.identity()),
+            blaze_ladder::native_links::Platform::LinuxArm64 => None,
         };
         let first = closure.first()?;
         let root = (0..list.len()).find(|&r| list.key(r) == first.key)?;
@@ -1078,10 +1077,9 @@ pub(crate) fn run_program(
     let seen = TreesSeen::default();
     let pack_dirs = SyncPackDirs::default();
     let root = standing.checkout;
-    let lints = crate::lints::of_root(cx, root, frame)?;
-    // The names world's facts, made only on the unit map's miss (run_names.rs `unit_map`):
-    // the program's crate is its `Bin` unit's, found through that map (`program_row`).
-    let mut facts = start_facts(&standing, launch.fs, phases, lints);
+    // The start path does not run lints (`Standing::tools` already uses `Lints::NONE`);
+    // skip reading and parsing the root `Cargo.toml` just to build unused lint rules.
+    let mut facts = start_facts(&standing, launch.fs, phases, crate::lints::Lints::NONE);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
     let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, picked.root, heap, frame).map_err(CliError::RunNames)?;
     let owner = run_names::Owner::At(at);
@@ -1093,6 +1091,7 @@ pub(crate) fn run_program(
     let closure = program_found.closure_in(alloc);
     let native = native_image_for_cached(cx, &mut standing, list, &closure, true, watch, frame)
         .map_err(|error| CliError::Start(StartError::Native { shown: bstd::mem::format_in!(frame, "{error}").as_str().into() }))?;
+    phases.mark_cx(cx, "run_inventory", frame);
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
     let asked = crate::run_ids::Asked::default();
     let began = phases.now();
@@ -1169,6 +1168,39 @@ fn suite_closure<'a>(list: &blaze_world::crate_list::CrateList<'_>, test: usize,
     closure
 }
 
+/// Reads both `[profile.dev]` `panic` and `overflow-checks` from the root `Cargo.toml` in a
+/// single read+parse instead of reading the manifest twice on `blaze test`.
+fn dev_profile_settings(
+    cx: &Cx,
+    root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    frame: &bstd::mem::Frame,
+) -> Result<(blaze_manifest::layout::panic::ProfilePanic, blaze_ladder::run::OverflowChecks), CliError> {
+    const ROOT_MANIFEST: &str = "Cargo.toml";
+    let refused = |why: &dyn core::fmt::Display| CliError::Program(crate::ManifestRefused::of(why, frame));
+    let mut bytes = bstd::mem::Bytes::new_in(frame, "the root manifest");
+    root.read_all(cx, &bstd::path::Path::new(ROOT_MANIFEST)?, &mut bytes)?;
+    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "the root manifest is not UTF-8" })?;
+    let erased = blaze_own::Erased::new(frame);
+    let panic = blaze_manifest::layout::panic::panic_strategy(
+        text,
+        blaze_manifest::layout::ManifestId(0),
+        ROOT_MANIFEST,
+        blaze_manifest::layout::profile::BuiltinProfile::Dev,
+        erased.handle(),
+    )
+    .map_err(|e| refused(&e))?;
+    let overflow_on = blaze_manifest::layout::profile::overflow_checks(
+        text,
+        blaze_manifest::layout::ManifestId(0),
+        ROOT_MANIFEST,
+        blaze_manifest::layout::profile::BuiltinProfile::Dev,
+        erased.handle(),
+    )
+    .map_err(|e| refused(&e))?;
+    let overflow = if overflow_on { blaze_ladder::run::OverflowChecks::On } else { blaze_ladder::run::OverflowChecks::Off };
+    Ok((panic, overflow))
+}
+
 /// `blaze test` over the check's answer: the selected packages' suites from the answer's rows,
 /// the body ids, then each suite under the lazy parent (test_drive.rs `run_suites`). A test
 /// that calls a body whose check does not run (D151) is NOT RUN naming that body; the others run.
@@ -1213,10 +1245,10 @@ pub(crate) fn run_tests_status(
     let seen = TreesSeen::default();
     let pack_dirs = SyncPackDirs::default();
     let root = standing.checkout;
-    let lints = crate::lints::of_root(cx, root, frame)?;
     let workers = standing.workers.get();
-    // The names world's facts, made only on a test map's miss (run_names.rs `tests_of`).
-    let mut facts = start_facts(&standing, launch.fs, phases, lints);
+    // The start path does not run lints (`Standing::tools` already uses `Lints::NONE`);
+    // skip reading and parsing the root `Cargo.toml` just to build unused lint rules.
+    let mut facts = start_facts(&standing, launch.fs, phases, crate::lints::Lints::NONE);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
     let inventory = run_names::found_tests_answered(cx, root, &answered, &mut *standing.store, &mut facts, &mut read, packages, bin, heap, frame).map_err(CliError::RunNames)?;
     // A custom harness owns its arguments. Listing is a command operation, even for a selection
@@ -1253,17 +1285,17 @@ pub(crate) fn run_tests_status(
         let list = inventory.list().ok_or(CliError::Start(StartError::NoProgram))?;
         // Up front, before a body id is walked: a test program over dependencies built to abort
         // is refused by name (rule 3), never linked into an unwinding image.
-        let profile = program::dev_profile_panic(cx, root, frame)?;
+        let (profile, overflow) = dev_profile_settings(cx, root, frame)?;
         if let Some((test, dependency)) = abort_dependency(profile, list, inventory.suites.iter().map(|(_, unit)| unit.at)) {
             use blaze_world::crate_list::CrateGraph as _;
             let shown = |at: usize| -> std::boxed::Box<str> { std::boxed::Box::from(bstd::mem::format_in!(frame, "{} {}", list.name(at), list.version(at)).as_str()) };
             return Err(CliError::Start(StartError::AbortTests { test: shown(test), dependency: shown(dependency) }));
         }
+        phases.mark_cx(cx, "test_inventory", frame);
         let began = phases.now();
         let (ids, decoded_curr_root) = body_ids_with_root(cx, &mut standing, list, &asked, bump)?;
         let ids_ns = phases.since(began);
         phases.mark_cx(cx, "body_ids", frame);
-        let overflow = program::dev_overflow(cx, root, frame)?;
         let panic = blaze_ladder::panic_strategy::of_profile(blaze_world::panic::TEST_PROFILE);
         // Boxed in the process heap: the error outlives this frame to `main`'s print.
         let parent = move |why| CliError::OwnProcess(blaze_own::Box::new_in(crate::own_process::OwnError::Parent(why), heap.alloc()));

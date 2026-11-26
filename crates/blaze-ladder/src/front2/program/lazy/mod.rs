@@ -469,8 +469,13 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// placement (seam_rules.rs `SiteCache`).
     site_cache: RefCell<seam_rules::SiteCache<'n>>,
     /// Each crate's members keyed as their containers' heads key them, made the first time a
-    /// key of the crate is asked that the key map does not know (lazy/locate.rs).
-    member_rows: HashMap<usize, locate::MemberIndex<'n>, Global>,
+    /// key of the crate is asked that the key map and targeted container probes do not know
+    /// (lazy/locate.rs).
+    member_rows: Map<usize, locate::MemberIndex<'n>, Alloc<'n>>,
+    /// Per-crate targeted member index over `#[lang]` containers alone, built lazily before
+    /// falling back to a full crate-wide `member_rows` scan so `core`/`std` lang trait methods
+    /// (e.g. `PartialEq::eq` in `assert_eq!`) resolve in O(lang items) with zero `each_item` scan.
+    lang_member_rows: Map<usize, locate::MemberIndex<'n>, Alloc<'n>>,
     /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`,
     /// `FrontEnd::specialize_inline_for`), created on demand per `(orig, concrete_args)`.
     inline_for_specs: AVec<'n, crate::front2::inline_for::SpecRow>,
@@ -603,7 +608,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             definers: crate::front2::tait::Definers::new_in(alloc),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             site_cache: RefCell::new(seam_rules::SiteCache::new_in(alloc)),
-            member_rows: HashMap::new_in(Global),
+            member_rows: Map::new_in(alloc),
+            lang_member_rows: Map::new_in(alloc),
             inline_for_specs: AVec::new_in(alloc),
             fixed_spell: Spelling::fixed(),
             adt_scanned_tys: 0,

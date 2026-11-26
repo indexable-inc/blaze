@@ -692,16 +692,143 @@ fn unit_map<'f, 'm>(
     Ok(frame.alloc_slice_copy(&made))
 }
 
+/// Structural identity of a target-side workspace-member crate row shared between `UnitGraph`'s
+/// `Unit` and `CrateList`'s row encoding (`blaze-world/src/list.rs`). When a target unit and a
+/// target-side member crate row match uniquely on this signature, [`program_row`] and [`tests_of`]
+/// resolve the row directly in O(units + crates) with zero `unit_map` store reads and zero
+/// `names_world` / `units::lay` filesystem walks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MemberUnitSig<'a> {
+    pub(crate) package: &'a str,
+    pub(crate) version: &'a str,
+    pub(crate) crate_name: &'a str,
+    pub(crate) root: &'a str,
+    pub(crate) test: bool,
+    pub(crate) bin: Option<&'a str>,
+    pub(crate) test_or_bench: bool,
+    pub(crate) proc_macro: bool,
+    pub(crate) build_script: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberRowSlot {
+    One(usize),
+    Ambiguous,
+}
+
+/// Direct O(units + crates) bijection between target-side workspace-member units and `CrateList`
+/// rows. Any unit or crate-list row that is not uniquely identified returns `None` from
+/// [`MemberUnitIndex::resolve`], falling back cleanly to [`unit_map`].
+pub(crate) struct MemberUnitIndex<'k, 'a> {
+    unit_counts: blaze_hash::Map<MemberUnitSig<'k>, u32, blaze_hash::FixedState, Alloc<'a>>,
+    by_sig: blaze_hash::Map<MemberUnitSig<'k>, MemberRowSlot, blaze_hash::FixedState, Alloc<'a>>,
+}
+
+pub(crate) fn unit_member_sig<'a>(unit: &'a blaze_unit_graph::Unit<'_>) -> Option<MemberUnitSig<'a>> {
+    if unit.for_host || matches!(unit.kind, blaze_unit_graph::UnitKind::BuildScript) {
+        return None;
+    }
+    Some(MemberUnitSig {
+        package: unit.name.as_str(),
+        version: unit.version.as_str(),
+        crate_name: unit.crate_name.as_str(),
+        root: unit.root.as_str(),
+        test: unit.cfg.iter().any(|c| c.name == "test" && c.value.is_none()),
+        bin: match &unit.kind {
+            blaze_unit_graph::UnitKind::Bin(name) => Some(name.as_str()),
+            _ => None,
+        },
+        test_or_bench: matches!(
+            unit.kind,
+            blaze_unit_graph::UnitKind::IntegrationTest(_) | blaze_unit_graph::UnitKind::Bench(_)
+        ),
+        proc_macro: matches!(unit.kind, blaze_unit_graph::UnitKind::ProcMacro),
+        build_script: unit.build_script.is_some(),
+    })
+}
+
+fn list_member_sig<'a>(list: &'a CrateList<'_>, r: usize) -> Option<MemberUnitSig<'a>> {
+    if !list.member(r) || CrateGraph::toolchain(list, r) || CrateGraph::side(list, r) != blaze_world::Side::Target {
+        return None;
+    }
+    let env = list.env_facts(r);
+    let (package, version) = env.package?;
+    let root = list.root(r).strip_prefix(list.shown_from(r))?;
+    Some(MemberUnitSig {
+        package,
+        version,
+        crate_name: CrateGraph::name(list, r),
+        root,
+        test: list.test(r),
+        bin: env.bin,
+        test_or_bench: env.test_or_bench,
+        proc_macro: CrateGraph::proc_macro(list, r),
+        build_script: env.build_script,
+    })
+}
+
+impl<'k, 'a> MemberUnitIndex<'k, 'a> {
+    pub(crate) fn build(units: &'k [blaze_unit_graph::Unit<'_>], list: &'k CrateList<'_>, alloc: Alloc<'a>) -> Self {
+        let rows = (0..CrateGraph::len(list)).filter_map(|r| list_member_sig(list, r).map(|sig| (r, sig)));
+        Self::build_from_rows(units, rows, CrateGraph::len(list), alloc)
+    }
+
+    pub(crate) fn build_from_rows(
+        units: &'k [blaze_unit_graph::Unit<'_>],
+        rows: impl IntoIterator<Item = (usize, MemberUnitSig<'k>)>,
+        rows_cap: usize,
+        alloc: Alloc<'a>,
+    ) -> Self {
+        let mut unit_counts: blaze_hash::Map<MemberUnitSig<'k>, u32, blaze_hash::FixedState, Alloc<'a>> = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc,
+            capacity: Some(units.len()),
+        });
+        for unit in units {
+            if let Some(sig) = unit_member_sig(unit) {
+                match unit_counts.get_mut(&sig) {
+                    Some(count) => *count = count.saturating_add(1),
+                    None => {
+                        unit_counts.insert(sig, 1u32);
+                    }
+                }
+            }
+        }
+        let mut by_sig = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc,
+            capacity: Some(rows_cap),
+        });
+        for (r, sig) in rows {
+            match by_sig.get_mut(&sig) {
+                Some(slot) => *slot = MemberRowSlot::Ambiguous,
+                None => {
+                    by_sig.insert(sig, MemberRowSlot::One(r));
+                }
+            }
+        }
+        Self { unit_counts, by_sig }
+    }
+
+    pub(crate) fn resolve(&self, unit: &'k blaze_unit_graph::Unit<'_>) -> Option<usize> {
+        let sig = unit_member_sig(unit)?;
+        if self.unit_counts.get(&sig).copied() != Some(1) {
+            return None;
+        }
+        match self.by_sig.get(&sig).copied() {
+            Some(MemberRowSlot::One(row)) => Some(row),
+            Some(MemberRowSlot::Ambiguous) | None => None,
+        }
+    }
+}
+
 /// `run`'s program crate: the crate list's row of the unit of kind `Bin` (never `for_host`)
 /// whose crate root is `program_root` (checkout-relative: run_package.rs `Program::root`).
 ///
-/// Chosen by the UNIT's kind, through the unit map: the engine's unit graph is made with test
-/// units (engine_check.rs `checking`, `Graph::new(.., true, ..)`), so a binary's file is the
-/// root of two crates, its `Bin` unit's and its `Test { bin }` unit's. Their two rows of the
-/// crate list hold the same name, root, package, binary name and member; only their keys
-/// differ (the test unit's cfg holds `test`: blaze-world list.rs `unit_crate_key`), and the
-/// list holds no cfg, so the row alone cannot say which is the program.
-/// COST: [`unit_map`], the unit graph's decode on a map hit, O(units).
+/// Resolved directly via [`MemberUnitIndex`] (matching `list.test(r)`, `env_facts(r).bin`,
+/// package, version, crate name, and relative root) with zero `unit_map` reads or `units::lay`
+/// filesystem walks; falls back to [`unit_map`] only if a unit signature is ambiguous.
+/// COST: one unit-graph payload decode, O(units + crates).
 #[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
 pub(crate) fn program_row<'f, 'm>(
     cx: &Cx,
@@ -716,25 +843,34 @@ pub(crate) fn program_row<'f, 'm>(
     let _cx = cx.span("run names: the program's unit");
     let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
     let list = facts.bodies.list(cx, store, &graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
-    let mapping = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
-    let decoded;
-    let units = match facts.names.as_ref().and_then(|names| names.made()) {
-        Some(made) => &made.graph().units,
-        None => {
-            let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
-            decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
-            &decoded.graph.units
-        }
-    };
-    if mapping.len() != units.len() * 4 {
-        return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
-    }
+    let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
+    let decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
+    let units = &decoded.graph.units;
+    let erased = blaze_own::Erased::new(frame);
+    let direct = MemberUnitIndex::build(units, &list, erased.handle());
+    let mut mapping: Option<&'f [u8]> = None;
     let mut owner: Option<usize> = None;
     for (index, unit) in units.iter().enumerate() {
         if unit.for_host || !matches!(unit.kind, blaze_unit_graph::UnitKind::Bin(_)) {
             continue;
         }
-        let at = u32_at(mapping, index * 4) as usize;
+        let at = match direct.resolve(unit) {
+            Some(at) => at,
+            None => {
+                let map_bytes = match mapping {
+                    Some(map_bytes) => map_bytes,
+                    None => {
+                        let map_bytes = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
+                        if map_bytes.len() != units.len() * 4 {
+                            return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+                        }
+                        mapping = Some(map_bytes);
+                        map_bytes
+                    }
+                };
+                usize::try_from(u32_at(map_bytes, index * 4)).unwrap_or(usize::MAX)
+            }
+        };
         // `u32::MAX`: a unit that is no crate of the list.
         if at >= CrateGraph::len(&list) || !list.member(at) || list.root(at).strip_prefix("/0/") != Some(program_root) {
             continue;
@@ -884,19 +1020,12 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
     frame: &'f Frame,
 ) -> Result<TestInventory<'s>, RunNamesError> {
     let graph = answer.graph;
-    let mapping = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
-    let decoded;
-    let units = match facts.names.as_ref().and_then(|names| names.made()) {
-        Some(made) => &made.graph().units,
-        None => {
-            let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
-            decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
-            &decoded.graph.units
-        }
-    };
-    if mapping.len() != units.len() * 4 {
-        return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
-    }
+    let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
+    let decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
+    let units = &decoded.graph.units;
+    let erased = blaze_own::Erased::new(frame);
+    let direct = MemberUnitIndex::build(units, &list, erased.handle());
+    let mut mapping: Option<&'f [u8]> = None;
     let snapshot = run_snapshot(store)?;
     let mut suites = AVec::new_in(heap.alloc());
     let mut bins = AVec::new_in(heap.alloc());
@@ -910,21 +1039,39 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
         if selected.binary_search(&unit.name.as_str()).is_err() {
             continue;
         }
-        let at = u32_at(mapping, index * 4) as usize;
+        let at = match direct.resolve(unit) {
+            Some(at) => at,
+            None => {
+                let map_bytes = match mapping {
+                    Some(map_bytes) => map_bytes,
+                    None => {
+                        let map_bytes = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
+                        if map_bytes.len() != units.len() * 4 {
+                            return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+                        }
+                        mapping = Some(map_bytes);
+                        map_bytes
+                    }
+                };
+                usize::try_from(u32_at(map_bytes, index * 4)).unwrap_or(usize::MAX)
+            }
+        };
         if at >= CrateGraph::len(&list) || !list.member(at) {
             return Err(RunNamesError::TestMap { unit: index, why: "the selected target has no member crate at its mapped index" });
         }
         let name = CrateGraph::name(&list, at);
         let key = list.key(at);
         let input = answer.crate_input(at, blaze_drive::key::crate_scope_name(&key)).ok_or(RunNamesError::NotAnswered { crate_name: name })?;
-        let records = read.records(cx, store, &input, key, heap.alloc()).map_err(|why| unread(name, why))?;
         let Some((package, version)) = list.env_facts(at).package else {
             return Err(RunNamesError::TestMap { unit: index, why: "the selected target's crate has no package" });
         };
         if package != unit.name.as_str() || version != unit.version.as_str() || name != unit.crate_name.as_str() {
             return Err(RunNamesError::TestMap { unit: index, why: "the mapped crate does not belong to this unit" });
         }
-        let tests = if harness {
+        // Harnessed suites read ONLY their `tests` section (`1` store get per suite, zero
+        // `CrateScope` names/items/expansions verification) and take their edition directly from
+        // `unit.edition.syntax`. Only harnessless targets open `records` to locate `fn main`.
+        let (tests, edition) = if harness {
             let bytes = read.tests(cx, store, &input).map_err(|why| unread(name, why))?;
             if bytes.is_empty() {
                 return Err(RunNamesError::TestTarget { package, crate_name: name, why: "the harnessed target's scope has no tests record" });
@@ -933,9 +1080,10 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
             if rows.key() != key {
                 return Err(RunNamesError::TestTarget { package, crate_name: name, why: "the tests record belongs to a different unit" });
             }
-            TestRows::Harness(rows)
+            (TestRows::Harness(rows), crate::units::syntax_of(unit.edition.syntax))
         } else {
-            TestRows::Main(main_test(records, package, name, heap.alloc())?)
+            let records = read.records(cx, store, &input, key, heap.alloc()).map_err(|why| unread(name, why))?;
+            (TestRows::Main(main_test(records, package, name, heap.alloc())?), records.edition)
         };
         let target = if target_name.is_empty() {
             kind
@@ -950,8 +1098,8 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
             bin_packages.push(package);
         }
         suites.push((
-            Found::Stood(answer, snapshot.clone()),
-            TestUnit { at, key, package, target, tests, edition: records.edition, expose_bins },
+            Found::Stood(answer, blaze_own::Share::share(&snapshot)),
+            TestUnit { at, key, package, target, tests, edition, expose_bins },
         ));
     }
     // Collect advertised workspace `[[bin]]` targets for packages with selected integration/bench
@@ -965,7 +1113,23 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
             if !bin_packages.iter().any(|&p| p == unit.name.as_str()) {
                 continue;
             }
-            let at = usize::try_from(u32_at(mapping, index * 4)).unwrap_or(usize::MAX);
+            let at = match direct.resolve(unit) {
+                Some(at) => at,
+                None => {
+                    let map_bytes = match mapping {
+                        Some(map_bytes) => map_bytes,
+                        None => {
+                            let map_bytes = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
+                            if map_bytes.len() != units.len() * 4 {
+                                return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+                            }
+                            mapping = Some(map_bytes);
+                            map_bytes
+                        }
+                    };
+                    usize::try_from(u32_at(map_bytes, index * 4)).unwrap_or(usize::MAX)
+                }
+            };
             if at >= CrateGraph::len(&list) || !list.member(at) {
                 return Err(RunNamesError::TestMap { unit: index, why: "the advertised binary target has no member crate at its mapped index" });
             }

@@ -75,6 +75,21 @@ const KEY_FORM: &str = "blaze-cli engine native image key 3";
 /// Virtual until touched; dropped when [`image_for`] returns.
 const NATIVE_FRAME: usize = 4 << 30;
 
+/// Maximum uncompressed `BNL2` native image size accepted when decoding a `BZR1` envelope
+/// (256 MiB, bounded well inside [`NATIVE_FRAME`] and `u32::MAX`, rule 18).
+const NATIVE_IMAGE_MAX_BYTES: usize = 256 << 20;
+
+/// Decodes a stored `BNL2` native image payload: zero-copy borrow when raw/small, or `BZR1`
+/// Level::Fast zstd decompressed into `scratch` when compressed.
+fn decode_image_payload<'a, 's, 'w>(
+    key: Key,
+    payload: &'a [u8],
+    scratch: &'s Frame,
+) -> Result<crate::store::record_codec::Decoded<'a, &'s Frame>, NativeError<'w>> {
+    crate::store::record_codec::decode_if_envelope_in(payload, NATIVE_IMAGE_MAX_BYTES, scratch)
+        .map_err(|_| NativeError::Damaged { key, why: "its BZR1 native image envelope did not decode" })
+}
+
 /// What the image needs beyond the check's records, handed down from the command's edge (R1 puts
 /// it in `Standing::native`).
 pub(crate) struct NativeAsk<'r> {
@@ -749,14 +764,21 @@ fn prepare_crates<'r, 'm: 's, 's>(
         return Err(NativeError::Platform { triple: crate::graph::TRIPLE });
     };
     let Some(first) = closure.first() else { return Err(NativeError::NoProgram) };
+    // macOS: each library's install name is the SDK's stub's, so resolve the SDK lazily on demand
+    // here (at most once per command via `Standing::resolve_sdk`, reusing the open `~/.blaze` dir)
+    // instead of eagerly during `Standing` construction.
+    let sdk = match platform {
+        Platform::MacosArm64 => match standing.resolve_sdk(cx) {
+            Ok(sdk) => Some(sdk),
+            Err(why) => {
+                let ask = &standing.native;
+                return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });
+            }
+        },
+        Platform::LinuxArm64 => None,
+    };
     // Disjoint fields: the ask and the readers are shared, the store is the one mutable borrow.
     let (ask, names, graph) = (&standing.native, standing.names, standing.graph);
-    // macOS: each library's install name is the SDK's stub's, so the image needs the SDK.
-    let sdk = match (platform, standing.place.sdk) {
-        (Platform::MacosArm64, Ok(sdk)) => Some(sdk),
-        (Platform::MacosArm64, Err(why)) => return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) }),
-        (Platform::LinuxArm64, _) => None,
-    };
     let store: &mut dyn Store<'m> = &mut *standing.store;
     let err = standing.err;
     // A crate whose script deferred C requests: run here, before the link (native_runner_c.rs;
@@ -928,7 +950,8 @@ pub(crate) fn image_for<'r>(
     let gone = || NativeError::Send { words: "the image's record does not read back from the store just after `image_in`" };
     let bytes = OnStore(store).get(&cx, image.key).map_err(NativeError::Store)?.ok_or_else(gone)?;
     let Ok(Stored::Whole(view)) = blaze_drive::record::open(bytes) else { return Err(NativeError::Damaged { key: image.key, why: "it does not open as the whole record `image_in` checked" }) };
-    let send = send_of(&cx, image.key, view.payload, &prepared.crates, prepared.platform, ask, &scratch)?;
+    let decoded = decode_image_payload(image.key, view.payload, &scratch)?;
+    let send = send_of(&cx, image.key, decoded.as_slice(), &prepared.crates, prepared.platform, ask, &scratch)?;
     Ok(ProgramImage { key: image.key, send })
 }
 
@@ -1072,7 +1095,11 @@ pub(crate) fn image_in<'w>(
         if view.payload.is_empty() {
             return Err(NativeError::Damaged { key, why: "an empty image (a program with no C input still has one)" });
         }
-        return Ok(Image { key, made: false, bytes: view.payload.len() });
+        let decoded = decode_image_payload(key, view.payload, scratch)?;
+        if decoded.as_slice().is_empty() {
+            return Err(NativeError::Damaged { key, why: "an empty image (a program with no C input still has one)" });
+        }
+        return Ok(Image { key, made: false, bytes: decoded.as_slice().len() });
     }
 
     // Made now: each crate's table and its script's outputs opened, in the scratch frame.
@@ -1122,8 +1149,11 @@ pub(crate) fn image_in<'w>(
             reads.push((script.name, script.out));
         }
     }
-    let head = blaze_drive::record::write_plain_head(program, key.0, out, &reads, image.len(), alloc);
-    store.put_parts(&cx, key, &[head.as_slice(), image.as_slice()]).map_err(NativeError::Store)?;
+    let encoded = crate::store::record_codec::encode_selective_in(image.as_slice(), scratch)
+        .map_err(|why| NativeError::Link { what: "compressing the program's native image", words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) })?;
+    let stored_payload = encoded.as_slice();
+    let head = blaze_drive::record::write_plain_head(program, key.0, out, &reads, stored_payload.len(), alloc);
+    store.put_parts(&cx, key, &[head.as_slice(), stored_payload]).map_err(NativeError::Store)?;
     Ok(Image { key, made: true, bytes: image.len() })
 }
 
@@ -1205,12 +1235,24 @@ mod tests {
     }
 
     impl Model {
-        /// The image's bytes (the payload of the record at `key`).
-        fn image(&self, key: Key) -> &'static [u8] {
+        /// The raw stored payload bytes inside the `Whole` record at `key` (may be `BZR1`-compressed).
+        fn raw_payload(&self, key: Key) -> &'static [u8] {
             let (_, bytes) = self.held.iter().find(|(at, _)| *at == key).unwrap_or_else(|| panic!("no record at {key:?}"));
             match blaze_drive::record::open(bytes) {
                 Ok(Stored::Whole(view)) => view.payload,
                 _ => panic!("the record at {key:?} is no whole record"),
+            }
+        }
+
+        /// The decoded image bytes (transparently unwrapping `BZR1` when compressed).
+        fn image(&self, key: Key) -> &'static [u8] {
+            let raw = self.raw_payload(key);
+            let alloc = blaze_own::testing::heap().alloc();
+            match crate::store::record_codec::decode_if_envelope_in(raw, NATIVE_IMAGE_MAX_BYTES, alloc)
+                .unwrap_or_else(|why| panic!("the record at {key:?} failed BZR1 decode: {why}"))
+            {
+                crate::store::record_codec::Decoded::Borrowed(bytes) => bytes,
+                crate::store::record_codec::Decoded::Owned(bytes) => leak(bytes.as_slice().to_vec()),
             }
         }
     }
@@ -1627,5 +1669,57 @@ mod tests {
 
         let no_symtab = build_macho(&[], false);
         assert!(macho_exports_pure_symbol(&no_symtab), "missing LC_SYMTAB fails closed to eager");
+    }
+
+    #[test]
+    fn bnl2_record_compresses_large_images_with_bzr1_round_trips_and_rejects_corruption() {
+        let f = fixture(b"engine_native bzr1 roundtrip");
+        let crates = [CrateIn { package: "app", links: links(1), table: leak(table(&["z"])), script: None }];
+        let mut store = Model::default();
+
+        // 1. Real Mach-O BNL2 image (>= 4 KiB) compresses into BZR1 envelope and round-trips byte-exact.
+        let made = image(&f, &mut store, &crates);
+        assert!(made.made && made.bytes >= crate::store::record_codec::COMPRESS_MIN_BYTES);
+        let stored_payload = store.raw_payload(made.key);
+        assert!(
+            crate::store::record_codec::is_envelope(stored_payload),
+            "large BNL2 native image must be wrapped in BZR1 envelope"
+        );
+        assert!(
+            stored_payload.len() * 4 < made.bytes,
+            "expected >4x BZR1 compression on page-aligned BNL2 image: {} -> {} bytes",
+            made.bytes,
+            stored_payload.len()
+        );
+        let decoded_bytes = store.image(made.key);
+        assert_eq!(decoded_bytes.len(), made.bytes);
+        assert_eq!(&decoded_bytes[..4], &0xfeed_facfu32.to_le_bytes());
+        assert!(contains(decoded_bytes, b"libz"));
+
+        // Cache hit validates BZR1 envelope and returns exact uncompressed byte length.
+        let hit = image(&f, &mut store, &crates);
+        assert_eq!((hit.key, hit.made, hit.bytes, store.puts), (made.key, false, made.bytes, 1));
+
+        // 2. Small (< 4 KiB) raw payload stays zero-copy (Decoded::Borrowed, not compressed).
+        let mut small_raw = std::vec![0xcf, 0xfa, 0xed, 0xfe];
+        small_raw.resize(1024, 0xab);
+        let enc_small = crate::store::record_codec::encode_selective_in(&small_raw, &f.scratch).expect("encode small");
+        assert!(!enc_small.is_compressed(), "small payloads stay raw");
+        let dec_small = decode_image_payload(made.key, enc_small.as_slice(), &f.scratch).expect("decode small");
+        assert!(!dec_small.was_compressed(), "raw payloads borrow zero-copy");
+        assert_eq!(dec_small.as_slice(), small_raw.as_slice());
+
+        // 3. Corrupted BZR1 envelope is refused loudly as NativeError::Damaged with 0 re-puts.
+        let mut corrupted_store = Model::default();
+        let (_, whole_bytes) = store.held.iter().find(|(at, _)| *at == made.key).expect("stored record");
+        let mut flipped = whole_bytes.to_vec();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x01;
+        corrupted_store.held.push((made.key, leak(flipped)));
+        match try_image(&f, &mut corrupted_store, &crates) {
+            Err(NativeError::Damaged { key, .. }) => assert_eq!(key, made.key),
+            other => panic!("corrupted BZR1 BNL2 record must be refused as Damaged, got {:?}", other.map(|img| img.key)),
+        }
+        assert_eq!(corrupted_store.puts, 0, "must not overwrite corrupted record");
     }
 }

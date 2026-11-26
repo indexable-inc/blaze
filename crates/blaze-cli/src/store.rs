@@ -621,8 +621,10 @@ impl Home {
     /// (one driver a process, drive.md ruling 5): nothing is mapped until a get probes.
     pub fn open_store(&self, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
         let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
-        let dir = driver.dir().clone();
-        Ok(plain_place::open(driver, plain_place::config(dir, settings, facts, alloc), alloc)?)
+        let dir = driver.dir().share();
+        let lent = plain_place::open(driver, plain_place::config(dir, settings, facts, alloc), alloc)?;
+        lent.set_commit_durability(default_local_durability(settings));
+        Ok(lent)
     }
 
     /// Opens the store with an explicit [`Liveness`] policy (used by `blaze gc` to sweep
@@ -632,7 +634,26 @@ impl Home {
         let dir = driver.dir().share();
         let mut cfg = plain_place::config(dir, settings, facts, alloc);
         cfg.liveness = liveness;
-        Ok(plain_place::open(driver, cfg, alloc)?)
+        let lent = plain_place::open(driver, cfg, alloc)?;
+        lent.set_commit_durability(default_local_durability(settings));
+        Ok(lent)
+    }
+}
+
+/// Default commit durability for a local rebuildable CLI store:
+/// - `settings.durable == false` keeps [`blaze_cas::plain::CommitDurability::Unsynced`] (zero
+///   foreground barriers/syncs; background GC seals segments asynchronously and post-crash opens
+///   verify unsealed segments whole on first read).
+/// - `settings.durable == true` defaults to [`blaze_cas::plain::CommitDurability::Barrier`]
+///   (`F_BARRIERFSYNC` on macOS, `fdatasync` on Linux: ordered crash-consistent commits with zero
+///   `F_FULLFSYNC`, proven across power cuts in `blaze-cas` DST
+///   `barrier_ordered_commits_cut_full_syncs_and_survive_power_cuts_at_every_step`). Callers
+///   requiring `F_FULLFSYNC` can explicitly opt in via `lent.set_commit_durability(Full)`.
+const fn default_local_durability(settings: &Settings) -> blaze_cas::plain::CommitDurability {
+    if settings.durable {
+        blaze_cas::plain::CommitDurability::Barrier
+    } else {
+        blaze_cas::plain::CommitDurability::Unsynced
     }
 }
 
@@ -1983,5 +2004,40 @@ mod after_answer_commit_tests {
         assert!(!crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe contended gc.lock"), "gc_lock_is_free returns false while GC holds gc.lock");
         drop(held_lock);
         assert!(crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe released gc.lock"), "gc.lock free again after drop");
+    }
+
+    #[test]
+    fn default_local_durability_uses_unsynced_when_off_and_barrier_when_durable() {
+        use blaze_cas::plain::CommitDurability;
+
+        let unsynced = Settings::default();
+        let durable = Settings { durable: true, ..Settings::default() };
+        assert_eq!(default_local_durability(&unsynced), CommitDurability::Unsynced);
+        assert_eq!(default_local_durability(&durable), CommitDurability::Barrier);
+
+        let io = Io::simulated(SimWorld::new(85, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let heap = blaze_own::testing::heap();
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+
+        let lent = home.open_store(&durable, Facts { boot: Some(1), nonce: 85 }, heap.alloc()).expect("open durable");
+        let k = Key(ContentId::of("barrier default durability key", b"v1"));
+        lent.put(&blaze_cas::Key(k.0), blaze_keyed::kind::Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), b"barrier-payload")
+            .expect("put");
+        let cleanup = after_answer_printed(&cx, lent, &home, false, &clock, &err).expect("commit");
+        assert_eq!(cleanup.put.after_answer.commits, 1);
+        assert!(
+            cleanup.put.after_answer.disk.barriers >= 2,
+            "durable local store commits with ordered barriers (segment + manifest log), got {}",
+            cleanup.put.after_answer.disk.barriers
+        );
+        assert_eq!(cleanup.put.after_answer.disk.syncs, 0, "Barrier mode avoids F_FULLFSYNC");
+
+        let reopened = home.open_store(&durable, Facts { boot: Some(1), nonce: 86 }, heap.alloc()).expect("reopen");
+        let held = reopened.get(&blaze_cas::Key(k.0)).expect("get").expect("record readable");
+        assert_eq!(held.bytes, b"barrier-payload");
     }
 }

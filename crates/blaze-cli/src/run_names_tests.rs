@@ -262,3 +262,94 @@ fn by_need_scope_defers_dependency_opens_and_matches_opened_answers() {
     assert_eq!(dep_a_root_by_need, opened_eager.records.root_module(1));
     assert_eq!(counter.opened_dep_b.load(Ordering::Relaxed), 0, "dep_b still never opened");
 }
+
+/// `MemberUnitIndex` uniquely maps target-side workspace-member units (`Lib`, `Test { bin: None }`,
+/// `Bin`, `Test { bin: Some }`, `IntegrationTest`) to their `CrateList` rows without touching
+/// `unit_map` or the filesystem, while refusing host units, build scripts, and any duplicated
+/// signature (triggering the `unit_map` fallback).
+#[test]
+fn member_unit_index_resolves_unique_targets_and_refuses_ambiguous_or_host() {
+    use blaze_manifest::lock::LockId;
+    use blaze_own::String as AString;
+    use blaze_unit_graph::{CfgAtom, ExtraUnit, Unit, UnitKind};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let txt = |s: &str| AString::from_str_in(s, alloc);
+    let mk_unit = |kind: UnitKind<'static>, for_host: bool, crate_name: &str, root: &str, has_test: bool| -> Unit<'static> {
+        let mut cfg = AVec::new_in(alloc);
+        if has_test {
+            cfg.push(CfgAtom::flag("test", alloc));
+        }
+        Unit {
+            package: LockId(0),
+            name: txt("pkg"),
+            version: txt("0.1.0"),
+            kind,
+            for_host,
+            edition: edition::PackageEdition::of_manifest("2024").expect("2024 edition"),
+            crate_name: txt(crate_name),
+            root: txt(root),
+            features: AVec::new_in(alloc),
+            cfg,
+            deps: AVec::new_in(alloc),
+            build_script: None,
+            links: None,
+        }
+    };
+
+    let units = [
+        // 0: Lib (src/lib.rs, test=false)
+        mk_unit(UnitKind::Lib, false, "pkg", "src/lib.rs", false),
+        // 1: Lib test harness (same file, test=true)
+        mk_unit(UnitKind::Test { bin: None }, false, "pkg", "src/lib.rs", true),
+        // 2: Bin("app") (src/main.rs, test=false)
+        mk_unit(UnitKind::Bin(txt("app")), false, "app", "src/main.rs", false),
+        // 3: Bin("app") test harness (same file, test=true, env.bin=None)
+        mk_unit(UnitKind::Test { bin: Some(txt("app")) }, false, "app", "src/main.rs", true),
+        // 4: IntegrationTest (tests/it.rs, test=true, test_or_bench=true)
+        mk_unit(
+            UnitKind::IntegrationTest(ExtraUnit { name: txt("it"), harness: true, test: true, required_features: AVec::new_in(alloc) }),
+            false,
+            "it",
+            "tests/it.rs",
+            true,
+        ),
+        // 5: Host copy of Lib (must never resolve as target-side)
+        mk_unit(UnitKind::Lib, true, "pkg", "src/lib.rs", false),
+        // 6: BuildScript (must never resolve as target-side)
+        mk_unit(UnitKind::BuildScript, false, "build_script_build", "build.rs", false),
+    ];
+
+    let rows: [(usize, super::MemberUnitSig<'_>); 5] = [
+        (10, super::unit_member_sig(&units[0]).expect("lib sig")),
+        (11, super::unit_member_sig(&units[1]).expect("lib test sig")),
+        (12, super::unit_member_sig(&units[2]).expect("bin sig")),
+        (13, super::unit_member_sig(&units[3]).expect("bin test sig")),
+        (14, super::unit_member_sig(&units[4]).expect("it sig")),
+    ];
+    let index = super::MemberUnitIndex::build_from_rows(&units, rows, rows.len(), alloc);
+    assert_eq!(index.resolve(&units[0]), Some(10), "Lib resolves cleanly");
+    assert_eq!(index.resolve(&units[1]), Some(11), "Lib test resolves distinctly from Lib");
+    assert_eq!(index.resolve(&units[2]), Some(12), "Bin resolves distinctly from Bin test");
+    assert_eq!(index.resolve(&units[3]), Some(13), "Bin test resolves distinctly from Bin");
+    assert_eq!(index.resolve(&units[4]), Some(14), "IntegrationTest resolves cleanly");
+    assert_eq!(index.resolve(&units[5]), None, "for_host unit must not match target row");
+    assert_eq!(index.resolve(&units[6]), None, "BuildScript must not match target row");
+
+    // Ambiguous crate-list rows (two rows sharing the same signature) must return None.
+    let dup_rows = [
+        (10, super::unit_member_sig(&units[0]).expect("lib sig")),
+        (99, super::unit_member_sig(&units[0]).expect("dup lib sig")),
+    ];
+    let dup_index = super::MemberUnitIndex::build_from_rows(&units, dup_rows, dup_rows.len(), alloc);
+    assert_eq!(dup_index.resolve(&units[0]), None, "duplicate crate-list signature must fall back");
+
+    // Ambiguous units (two target units sharing the same signature) must return None.
+    let dup_units = [
+        mk_unit(UnitKind::Lib, false, "pkg", "src/lib.rs", false),
+        mk_unit(UnitKind::Lib, false, "pkg", "src/lib.rs", false),
+    ];
+    let one_row = [(10, super::unit_member_sig(&dup_units[0]).expect("lib sig"))];
+    let dup_unit_index = super::MemberUnitIndex::build_from_rows(&dup_units, one_row, one_row.len(), alloc);
+    assert_eq!(dup_unit_index.resolve(&dup_units[0]), None, "duplicate target unit signature must fall back");
+}
