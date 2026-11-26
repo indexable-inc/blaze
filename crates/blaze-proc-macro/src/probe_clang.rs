@@ -187,6 +187,9 @@ impl ProbeCache for CacheAdapter<'_> {
 pub struct CScriptProbes {
     pub answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>>,
     pub records: OwnArc<dyn CProbeStore, SharedAlloc<'static>>,
+    /// Configured host SDK directory (`""` when no SDK is active), verified against child
+    /// `SDKROOT` overrides before canonicalizing a probe (rule 21).
+    pub sdk_dir: OwnArc<str, SharedAlloc<'static>>,
     /// SDK / sysroot identity hashed into every [`ProbeKey`] (`""` on Linux with no sysroot).
     pub sdk_id: OwnArc<str, SharedAlloc<'static>>,
     /// Digest of `sdk_id` (`facts::sdk_id_digest`) verified in `cc-probe` read revalidation.
@@ -269,37 +272,43 @@ impl HermeticClangProbe {
         h.finish()
     }
 
-    /// Strategy id bound to the host runtime closure of `clang_path` under deadline `cx`: hashes
-    /// [`Self::strategy_id`] plus, on NixOS hosts, the exact resolved loader (`PT_INTERP`),
-    /// `nix-ld` / glibc `ld.so`, and transitive `/nix/store` shared library paths and contents.
+    /// Strategy id bound to the selected `clang-23` shelf member (`shelf_path` + member SHA-256
+    /// from `pins/clang.json`) AND the host ELF runtime closure of `clang_path` under deadline
+    /// `cx` (on both NixOS and standard FHS Linux hosts: resolved loader `PT_INTERP`, `nix-ld` /
+    /// glibc `ld.so` or `/etc/ld.so.cache`, and transitive shared library paths and contents).
     /// Fallible: any I/O, permission, or deadline failure while reading the runtime closure is
     /// propagated loudly instead of forging a cache key (AGENTS.md rules 18, 21).
     pub fn strategy_id_for_clang<'a>(
         cx: &bstd::cx::Cx,
+        host: &str,
         clang_path: &str,
         alloc: Alloc<'a>,
     ) -> Result<ContentId, AString<'a>> {
         let base = Self::strategy_id();
+        let prog = shelf_pins::shelf_program(CLANG_JSON, host, "clang-23")
+            .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
+        let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe runtime closure 2");
+        h.id(&base)
+            .part(host.as_bytes())
+            .part(prog.shelf_path.as_bytes())
+            .part(&prog.sha256);
         #[cfg(target_os = "linux")]
         {
-            let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe runtime closure 1");
-            h.id(&base);
             let engaged = bstd::procs::hermetic::feed_nix_runtime_closure(cx, clang_path, &mut |chunk| {
                 h.update(chunk);
             })
-            .map_err(|fault| own_fmt(format_args!("c-probe nix runtime closure for `{clang_path}`: {fault:?}"), alloc))?;
+            .map_err(|fault| own_fmt(format_args!("c-probe runtime closure for `{clang_path}`: {fault:?}"), alloc))?;
             if engaged {
-                h.part(b"nix-closure-ok");
+                h.part(b"linux-elf-closure-ok");
             } else {
-                h.part(b"no-nix-closure");
+                h.part(b"no-elf-closure");
             }
-            Ok(h.finish())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (cx, clang_path, alloc);
-            Ok(base)
+            let _ = (cx, clang_path);
         }
+        Ok(h.finish())
     }
 
     /// Strategy id for the pinned `clang-23` shelf beneath `home` on `host`, bounded by `cx`,
@@ -324,7 +333,7 @@ impl HermeticClangProbe {
         let Some(path_str) = clang_path.to_str() else {
             return Err(own_str("c-probe clang shelf path is not UTF-8", alloc));
         };
-        Self::strategy_id_for_clang(cx, path_str, alloc).map(Some)
+        Self::strategy_id_for_clang(cx, host, path_str, alloc).map(Some)
     }
 
     /// Opens [`HermeticClangProbe`] for `host` using already-open deadline-aware directory
@@ -703,11 +712,12 @@ pub fn open_command_c_probes<'a>(
         Ok(pair) => pair,
         Err(why) => return CProbeSetting::Unavailable(OwnArc::from_str_in(why.as_str(), shared)),
     };
-    let sdk_str = sdk.map_or("", |(_, id)| id);
+    let (sdk_dir_str, sdk_str) = sdk.map_or(("", ""), |(dir, id)| (dir, id));
+    let sdk_dir: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_dir_str, shared);
     let sdk_id: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_str, shared);
     let sdk_digest = facts::sdk_id_digest(sdk_str);
     let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = OwnArc::new_in(hermetic, shared);
-    CProbeSetting::Ready(CScriptProbes { answerer, records, sdk_id, sdk_digest, clang_sha256 })
+    CProbeSetting::Ready(CScriptProbes { answerer, records, sdk_dir, sdk_id, sdk_digest, clang_sha256 })
 }
 
 /// Host's pinned clang archive SHA-256 from `pins/clang.json`, or `None` when `host` has no pin.
@@ -845,7 +855,7 @@ impl ProbeAnswerer for HermeticClangProbe {
             .io
             .cx(self.deadline, bstd::mem::TASK_FRAME)
             .map_err(|_| own_str("c-probe strategy id context stopped", alloc))?;
-        Self::strategy_id_for_clang(&cx, self.clang_path.as_str(), alloc)
+        Self::strategy_id_for_clang(&cx, self.host.as_str(), self.clang_path.as_str(), alloc)
     }
 
     fn answer<'a, 'b>(
@@ -1014,7 +1024,7 @@ impl ProbeAnswerer for HermeticClangProbe {
             // Re-hash the Nix runtime closure under `cx` immediately before launching to ensure
             // `/run/current-system` did not switch since `probe.answerer_id` was computed.
             // `verified.exec` itself is already a kernel-sealed immutable `memfd`.
-            let pre_id = Self::strategy_id_for_clang(&cx, self.clang_path.as_str(), alloc)?;
+            let pre_id = Self::strategy_id_for_clang(&cx, self.host.as_str(), self.clang_path.as_str(), alloc)?;
             if pre_id != probe.answerer_id {
                 return Err(own_str("host Nix runtime closure changed before probe execution (rule 21)", alloc));
             }
@@ -1051,7 +1061,7 @@ impl ProbeAnswerer for HermeticClangProbe {
                 .io
                 .cx(post_rem, bstd::mem::TASK_FRAME)
                 .map_err(|_| own_str("c-probe post-exec context stopped", alloc))?;
-            let post_id = Self::strategy_id_for_clang(&post_cx, self.clang_path.as_str(), alloc)?;
+            let post_id = Self::strategy_id_for_clang(&post_cx, self.host.as_str(), self.clang_path.as_str(), alloc)?;
             if post_id != probe.answerer_id {
                 return Err(own_str("host Nix runtime closure changed during probe execution (rule 21)", alloc));
             }
@@ -1740,6 +1750,7 @@ mod tests {
         let probes = super::CScriptProbes {
             answerer: super::OwnArc::new_in(FailingAnswerer, shared),
             records: super::OwnArc::new_in(EmptyStore, shared),
+            sdk_dir: super::OwnArc::from_str_in("", shared),
             sdk_id: super::OwnArc::from_str_in("", shared),
             sdk_digest: [0u8; 32],
             clang_sha256: [1u8; 32],

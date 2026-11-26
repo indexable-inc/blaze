@@ -120,12 +120,27 @@ fn read_c_probe_reply_with(
     };
     let mut raw = blaze_own::AVec::new_in(alloc);
     raw.resize(len, 0u8);
-    let read = match file.read_into(raw.as_mut_slice(), 0).wait(cx) {
-        Ok(read) => read,
-        Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
-        Err(error) => return Err(CliError::Fs(error)),
-    };
-    raw.truncate(read);
+    // Accumulate until `len` bytes or a zero-length read proves EOF so short positional reads on
+    // FUSE/network filesystems never truncate a valid record and spuriously invalidate the fact.
+    let mut filled = 0usize;
+    while filled < len {
+        let Ok(step_off) = u64::try_from(filled) else {
+            return Ok(crate::engine_script_reads::NONE);
+        };
+        let Some(dst) = raw.as_mut_slice().get_mut(filled..) else {
+            break;
+        };
+        let n = match file.read_into(dst, step_off).wait(cx) {
+            Ok(n) => n,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(crate::engine_script_reads::NONE),
+            Err(error) => return Err(CliError::Fs(error)),
+        };
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    raw.truncate(filled);
     let Some(body) = blaze_proc_macro::record::unseal_record(raw.as_slice()) else {
         return Ok(crate::engine_script_reads::NONE);
     };

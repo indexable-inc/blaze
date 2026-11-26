@@ -185,25 +185,49 @@ fn is_header_search_flag(arg: &str) -> bool {
     false
 }
 
-/// Matches the exact `cc-rs` `is_flag_supported` probe shape: compile-only (`-c`), writing
-/// `-o <dir>/flag_check` with ONLY the companion `<dir>/flag_check.<c-ext>` source input in the
-/// same directory so custom build scripts that happen to name a real object/binary `flag_check`
-/// stay on the normal compiler route and preserve their output file.
+/// Matches the exact `cc-rs` `is_flag_supported` probe shape: compile-only (`-c`), with
+/// **exactly one** `-o <dir>/flag_check` output option (no duplicate `-o` or attached `-o...`)
+/// and ONLY the companion `<dir>/flag_check.<c-ext>` source input in the same directory so custom
+/// build scripts that happen to name a real object/binary `flag_check` stay on the normal
+/// compiler route and preserve their output file.
 fn is_flag_check_probe(args: &[&str]) -> bool {
     if !args.contains(&"-c") {
         return false;
     }
     let mut out_path: Option<&str> = None;
-    for pair in args.windows(2) {
-        if pair[0] == "-o" && name_of(pair[1]) == "flag_check" {
-            out_path = Some(pair[1]);
-            break;
+    let mut saw_flag_src = false;
+    let mut prev_flag: Option<&str> = None;
+    for &arg in args {
+        if let Some(prev) = prev_flag.take() {
+            if prev == "-o" {
+                if out_path.is_some() || name_of(arg) != "flag_check" {
+                    return false;
+                }
+                out_path = Some(arg);
+            }
+            continue;
         }
+        if arg.starts_with("-o") && arg.len() > 2 {
+            // Attached `-o<path>` (either duplicate or non-cc-rs shape): not a flag_check probe.
+            return false;
+        }
+        if flag_takes_value(arg) {
+            prev_flag = Some(arg);
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        let Some(out) = out_path else {
+            // Check after loop if source preceded `-o`: only record once we know `out_path`.
+            // Actually collect in a second pass below so `-c <src> -o <out>` ordering still works.
+            continue;
+        };
+        let _ = out;
     }
     let Some(out_path) = out_path else {
         return false;
     };
-    let mut saw_flag_src = false;
     let mut skip_next = false;
     for &arg in args {
         if skip_next {
@@ -228,21 +252,52 @@ fn is_flag_check_probe(args: &[&str]) -> bool {
     saw_flag_src
 }
 
+/// Matches the exact `cc-rs` compiler-family detection probe shape: `-E`, no `-o` output flag,
+/// no header-search flags, and ONLY ONE positional source input whose basename is
+/// `<0+ ascii digits>detect_compiler_family.c`.
+fn is_family_probe(args: &[&str]) -> bool {
+    if !args.contains(&"-E") {
+        return false;
+    }
+    let mut family_inputs = 0usize;
+    let mut skip_next = false;
+    for &arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "-o" || (arg.starts_with("-o") && arg.len() > 2) || is_header_search_flag(arg) {
+            return false;
+        }
+        if flag_takes_value(arg) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        let base = name_of(arg);
+        let Some(prefix) = base.strip_suffix("detect_compiler_family.c") else {
+            return false;
+        };
+        if !prefix.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        family_inputs += 1;
+    }
+    family_inputs == 1
+}
+
 /// Whether the spawn of `program` with `args` is a compiler probe, from its text alone: a C
 /// compiler asked `-?`, running `cc-rs`'s `is_flag_supported` (`-c -o <dir>/flag_check
 /// <dir>/flag_check.<c-ext>`), or running `cc-rs`'s zero-header compiler-family detection
-/// (`cc -E …detect_compiler_family.c` with no header-search flags). Real preprocessing or
-/// compile jobs stay on the deferred/build C route.
+/// (`cc -E <dir>/<digits>detect_compiler_family.c` with no `-o` or header-search flags). Real
+/// preprocessing or compile jobs stay on the deferred/build C route.
 pub fn is_probe(program: &str, args: &[&str]) -> bool {
     if !COMPILERS.contains(&name_of(program)) {
         return false;
     }
-    if args.contains(&"-?") || is_flag_check_probe(args) {
-        return true;
-    }
-    args.contains(&"-E")
-        && !args.iter().any(|arg| is_header_search_flag(arg))
-        && args.iter().any(|arg| name_of(arg).ends_with("detect_compiler_family.c"))
+    args.contains(&"-?") || is_flag_check_probe(args) || is_family_probe(args)
 }
 
 /// The table's identity for the base key: its bytes, under this form.
@@ -652,6 +707,7 @@ fn contains_disallowed_probe_token(text: &str) -> bool {
         || contains_ident(text, "__FILE_NAME__")
         || contains_ident(text, "__builtin_FILE")
         || contains_ident(text, "__builtin_FILE_NAME")
+        || contains_ident(text, "__builtin_source_location")
         || contains_ident(text, "asm")
         || contains_ident(text, "__asm")
         || contains_ident(text, "__asm__")

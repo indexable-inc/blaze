@@ -556,6 +556,12 @@ impl ScriptSandbox {
 
         match &script.c_probes {
             Some(crate::probe_clang::CProbeSetting::Ready(c_probes)) => {
+                let configured_sdk = c_probes.sdk_dir.as_ref();
+                if !sdk.is_empty() && sdk != configured_sdk {
+                    return Err(self.refuse(Refusal::Spawn(refused(format!(
+                        "compiler probe SDKROOT `{sdk}` does not match configured command SDK `{configured_sdk}` (rule 21)"
+                    )))));
+                }
                 let probe = c_tasks_probe::Spawn {
                     program,
                     args: &arg_refs,

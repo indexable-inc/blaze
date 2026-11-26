@@ -353,24 +353,32 @@ fn walk_nix_elf_closure(
     let Ok(interp_cstr) = CStr::from_bytes_until_nul(&interp_c) else {
         return Ok(false);
     };
-    // Only engage on NixOS where the ELF interpreter symlinks into `/nix/store/`.
+    // Check whether the ELF interpreter symlinks into `/nix/store/` (NixOS).
     // Propagate filesystem/permission errors on `readlinkat` rather than treating them as
     // non-NixOS (only `EINVAL`, a regular non-symlink interpreter file, means non-symlink).
     let mut link_buf = [0u8; 512];
-    let target = match readlinkat(CWD, blaze_sys::Path::new(interp_cstr), &mut link_buf) {
-        Ok(target) => target,
-        Err(blaze_sys::Errno::Inval) => return Ok(false),
+    let (is_nix, is_nix_ld) = match readlinkat(CWD, blaze_sys::Path::new(interp_cstr), &mut link_buf) {
+        Ok(target) => {
+            let nix = target.starts_with(b"/nix/store/");
+            let nix_ld = nix && target.windows(6).any(|w| w == b"nix-ld");
+            (nix, nix_ld)
+        }
+        Err(blaze_sys::Errno::Inval) => (false, false),
         Err(errno) => {
             return Err(Fault::Host { call: "readlinkat (nix ELF PT_INTERP)", code: errno.raw() });
         }
     };
-    if !target.starts_with(b"/nix/store/") {
+    if !is_nix && feed.is_none() {
+        // Landlock confinement only needs extra single-file grants on NixOS (standard FHS hosts
+        // already receive `/lib`, `/lib64`, `/usr/lib`, `/etc/ld.so.cache` from `Why::System`).
+        // When `feed.is_some()` (runtime closure hashing), continue walking the full FHS ELF64
+        // closure + `/etc/ld.so.cache` so non-Nix Linux hosts also key their actual runtime libs.
         return Ok(false);
     }
     // Generated helpers inside `Why::HelperFolder` do not exist pre-exec so their transitive
     // Nix-store `DT_NEEDED` closure cannot be computed upfront; refuse explicitly rather than
     // granting `/nix/store` or letting generated helpers fail mid-run (rule 3).
-    if has_helper_folder {
+    if is_nix && has_helper_folder {
         return Err(Fault::Host {
             call: "landlock (NixOS minimal ELF closure does not support HelperFolder)",
             code: 38,
@@ -378,10 +386,9 @@ fn walk_nix_elf_closure(
     }
 
     // Grant single-file READ_FILE | EXECUTE ONLY on the resolved loader (`PT_INTERP`) and, when
-    // the loader is NixOS's `nix-ld` shim, its delegated glibc `ld.so` (and feed both into any
-    // caller hashing the runtime closure).
-    let is_nix_ld = target.windows(6).any(|w| w == b"nix-ld");
-    if let Some(rs) = ruleset {
+    // the loader is NixOS's `nix-ld` shim, its delegated glibc `ld.so` (and feed both — plus
+    // `/etc/ld.so.cache` on non-Nix FHS Linux — into any caller hashing the runtime closure).
+    if is_nix && let Some(rs) = ruleset {
         add_nix_loader_rule(rs, interp_cstr)?;
         if is_nix_ld {
             add_nix_loader_rule(rs, NIX_LD_SO)?;
@@ -391,6 +398,17 @@ fn walk_nix_elf_closure(
         feed_nix_file_by_path(&reader, cx, interp_cstr, f)?;
         if is_nix_ld {
             feed_nix_file_by_path(&reader, cx, NIX_LD_SO, f)?;
+        }
+        if !is_nix {
+            match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.cache"), OpenFlags::CLOSE_ON_EXEC, 0) {
+                Ok(cache_fd) => {
+                    feed_nix_fd(&reader, cx, b"/etc/ld.so.cache", cache_fd.fd(), f)?;
+                }
+                Err(blaze_sys::Errno::NoEnt) => {}
+                Err(errno) => {
+                    return Err(Fault::Host { call: "openat (/etc/ld.so.cache)", code: errno.raw() });
+                }
+            }
         }
     }
 
@@ -930,7 +948,27 @@ fn enqueue_nix_soname<const N: usize>(
         return Ok(());
     }
     if let Some(dir) = glibc_dir {
-        let _ = try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)?;
+        if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+            return Ok(());
+        }
+    }
+    // On non-Nix FHS Linux (runtime closure hashing mode, where `ruleset` is `None`), also search
+    // the standard dynamic-linker library directories so glibc/libstdc++/libgcc are hashed.
+    if ruleset.is_none() {
+        for fhs_dir in [
+            &b"/lib/aarch64-linux-gnu/"[..],
+            &b"/usr/lib/aarch64-linux-gnu/"[..],
+            &b"/lib/x86_64-linux-gnu/"[..],
+            &b"/usr/lib/x86_64-linux-gnu/"[..],
+            &b"/lib64/"[..],
+            &b"/usr/lib64/"[..],
+            &b"/lib/"[..],
+            &b"/usr/lib/"[..],
+        ] {
+            if try_grant_and_enqueue_lib(reader, cx, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+                return Ok(());
+            }
+        }
     }
     Ok(())
 }

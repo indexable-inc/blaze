@@ -89,7 +89,13 @@ impl OnDir {
 
     /// Reads `name` directly into `alloc`, returning `Ok(None)` without allocating if the file is
     /// absent, exceeds `max_bytes`, or has a missing/mismatched trailing [`SEAL`].
-    fn read_sealed_bounded<'a>(&self, name: &RecordName, max_bytes: u64, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, FilesError> {
+    fn read_sealed_bounded<'a>(
+        &self,
+        name: &RecordName,
+        max_bytes: u64,
+        single_read_plant: bool,
+        alloc: Alloc<'a>,
+    ) -> Result<Option<AVec<'a, u8>>, FilesError> {
         let cx = self.cx(name)?;
         let file = match self.dir.open_read(&cx, &Self::path(name)?) {
             Ok(file) => file,
@@ -122,6 +128,9 @@ impl OnDir {
                 break;
             }
             filled += n;
+            if single_read_plant {
+                break;
+            }
         }
         if filled > len {
             return Err(FilesError::OtherBytes { name: *name });
@@ -288,6 +297,10 @@ pub enum RecordPlant {
     /// lock (`Effect::Lock`), allowing two concurrent repairers to silently overwrite each other.
     /// Never taken except by the concurrent-repair DST planted-bug control (rule 23).
     UnserializedRepair,
+    /// `read_sealed_bounded` stops after a single `read_into` call instead of accumulating short
+    /// positional reads until `cap` or EOF, causing a valid record under `Sim::short_reads` to be
+    /// misclassified as corrupt and overwritten. Never taken except by the short-read DST control.
+    SingleReadCProbe,
 }
 
 /// The folder store of records: each file the record's bytes then their [`SEAL`], published
@@ -455,7 +468,8 @@ impl DirStore {
     /// `c-probe/<64 hex of the canonical ProbeKey>`, bounded at [`crate::probe_clang::MAX_RECORD_BYTES`]
     /// before allocating.
     pub(crate) fn get_c_probe<'a>(&self, key: &ContentId, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, FilesError> {
-        self.files.read_sealed_bounded(&Self::named(b"c-probe/", key), crate::probe_clang::MAX_RECORD_BYTES, alloc)
+        let single_read = self.plant == RecordPlant::SingleReadCProbe;
+        self.files.read_sealed_bounded(&Self::named(b"c-probe/", key), crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc)
     }
 
     /// Keeps a C compiler probe's answer record using atomic compare-and-publish
@@ -479,7 +493,8 @@ impl DirStore {
         if self.files.publish_if_absent(&name, whole.as_slice())? {
             return Ok(());
         }
-        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, alloc)? {
+        let single_read = self.plant == RecordPlant::SingleReadCProbe;
+        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc)? {
             return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
         }
         self.repair_c_probe_after_invalid(&name, bytes, alloc)
@@ -498,8 +513,9 @@ impl DirStore {
         } else {
             Some(self.files.lock_exclusive(&lock_name)?)
         };
+        let single_read = self.plant == RecordPlant::SingleReadCProbe;
         let result = if repair_guard.is_some()
-            && let Some(held) = self.files.read_sealed_bounded(name, crate::probe_clang::MAX_RECORD_BYTES, alloc)?
+            && let Some(held) = self.files.read_sealed_bounded(name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc)?
         {
             if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) }
         } else {

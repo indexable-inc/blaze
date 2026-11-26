@@ -356,3 +356,51 @@ fn c_probe_repair_lock_sim_catches_unserialized_repair() {
         }
     }
 }
+
+/// Deterministic short-read simulation for `DirStore::{get_c_probe, put_c_probe}` using
+/// `Sim::short_reads`: forces repeated short positional reads (`one_in = 1`) on `c-probe/` and
+/// verifies that a valid sealed record is read whole without triggering false corruption repair,
+/// while a conflicting `put_c_probe` is rejected with `OtherBytes`.
+fn run_c_probe_short_reads_dst(plant: RecordPlant) -> Result<(), &'static str> {
+    let alloc = blaze_own::testing::heap().alloc();
+    for seed in 0..32u32 {
+        let io = Io::sim(u64::from(seed));
+        let dir = io.need_fs().map_err(|_| "no fs")?.root();
+        let store = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir }, plant);
+        let k = key(seed + 100);
+        let want_a = b"canonical-c-probe-answer-payload-long-enough-to-split-under-short-reads-1234567890";
+        let want_b = b"conflicting-c-probe-answer-that-must-never-overwrite-a-valid-sealed-record-0987654";
+        store.put_c_probe(&k, want_a).map_err(|_| "initial put")?;
+        let c_probe_dir = blaze_core::FileName::new("c-probe").ok_or("c-probe dir")?;
+        let installed = io.with_sim(|sim| sim.short_reads(c_probe_dir, 1));
+        if installed.is_none() {
+            return Err("expected simulated world");
+        }
+        let got = store.get_c_probe(&k, alloc).map_err(|_| "get under short_reads")?;
+        if got.as_deref() != Some(want_a.as_slice()) {
+            return Err("c-probe short-read oracle: truncated valid sealed record");
+        }
+        match store.put_c_probe(&k, want_b) {
+            Err(FilesError::OtherBytes { .. }) => {}
+            Ok(()) => return Err("c-probe short-read oracle: falsely repaired and overwrote valid record"),
+            Err(_) => return Err("unexpected error"),
+        }
+        let verify = store.get_c_probe(&k, alloc).map_err(|_| "verify")?;
+        if verify.as_deref() != Some(want_a.as_slice()) {
+            return Err("c-probe short-read oracle: lost original record");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn c_probe_short_reads_dst_preserves_valid_records_without_repair() {
+    run_c_probe_short_reads_dst(RecordPlant::None).expect("short-read loop must preserve valid records");
+}
+
+#[test]
+fn c_probe_short_reads_dst_catches_planted_single_read() {
+    let err = run_c_probe_short_reads_dst(RecordPlant::SingleReadCProbe)
+        .expect_err("planted SingleReadCProbe must be caught under Sim::short_reads");
+    assert!(err.contains("c-probe short-read oracle"), "unexpected failure: {err}");
+}
