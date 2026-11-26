@@ -29,10 +29,11 @@ impl Terminator {
     }
 }
 
-/// Whether ghostty captures this OSC without a size limit (52, 66, 72, 5522 after their `;`).
-/// `head` is the payload so far; the answer is settled once it holds the number and its `;`.
+/// Whether this OSC captures without the [`MAX_BUF`] size limit (52, 66, 72, 5522, 7770 after
+/// their `;`). `head` is the payload so far; the answer is settled once it holds the number and
+/// its `;`.
 pub fn unbounded(head: &[u8]) -> bool {
-    [&b"52;"[..], b"66;", b"72;", b"5522;"].iter().any(|p| head.starts_with(p))
+    [&b"52;"[..], b"66;", b"72;", b"5522;", b"7770;"].iter().any(|p| head.starts_with(p))
 }
 
 /// A parsed OSC (osc.zig:23 `Command`). Strings are the payload's bytes, unvalidated: a title
@@ -90,6 +91,8 @@ pub enum Command<'a> {
     KittyDndProtocol(KittyDnd<'a>),
     /// OSC 3008.
     ContextSignal(ContextSignal<'a>),
+    /// OSC 7770: Blaze Terminal Protocol payload.
+    BlazeTermApi(&'a [u8]),
 }
 
 /// Which parser a number selects (osc.zig:612 `end`).
@@ -111,6 +114,7 @@ enum Kind {
     Rxvt,
     Iterm2,
     KittyClipboard,
+    BlazeTermApi,
 }
 
 fn kind(number: &[u8]) -> Option<Kind> {
@@ -135,6 +139,7 @@ fn kind(number: &[u8]) -> Option<Kind> {
         b"1337" => K::Iterm2,
         b"3008" => K::Context,
         b"5522" => K::KittyClipboard,
+        b"7770" => K::BlazeTermApi,
         [b'1', d @ b'0'..=b'9'] => {
             K::Color(Operation::Dynamic(Dynamic::from_code(10 + (d - b'0'))?))
         }
@@ -161,8 +166,10 @@ pub fn parse(payload: &[u8], terminator: Terminator) -> Option<Command<'_>> {
         };
     };
     let data = &payload[semi + 1..];
-    let bounded =
-        !matches!(kind, Kind::Clipboard | Kind::TextSizing | Kind::Dnd | Kind::KittyClipboard);
+    let bounded = !matches!(
+        kind,
+        Kind::Clipboard | Kind::TextSizing | Kind::Dnd | Kind::KittyClipboard | Kind::BlazeTermApi
+    );
     if bounded && data.len() > MAX_BUF {
         return None;
     }
@@ -201,6 +208,7 @@ pub fn parse(payload: &[u8], terminator: Terminator) -> Option<Command<'_>> {
             let (metadata, payload) = split_payload(data);
             Some(Command::KittyClipboardProtocol(KittyClipboard { metadata, payload, terminator }))
         }
+        Kind::BlazeTermApi => (!data.is_empty()).then_some(Command::BlazeTermApi(data)),
     }
 }
 

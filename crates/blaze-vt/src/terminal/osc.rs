@@ -43,6 +43,9 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
             Command::HyperlinkStart { id, uri } => self.scr().start_hyperlink(uri, id),
             Command::HyperlinkEnd => self.scr().end_hyperlink(),
             Command::ConemuProgressReport(p) => self.effect(Effect::Progress(p)),
+            Command::BlazeTermApi(payload) => {
+                self.effect_with([payload], |[payload]| Effect::BlazeTermApi(payload));
+            }
             // OSC 1 and the rest: parsed, and ignored as ghostty ignores them.
             Command::ChangeWindowIcon(_)
             | Command::ConemuSleep { .. }

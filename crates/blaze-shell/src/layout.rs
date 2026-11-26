@@ -74,6 +74,65 @@ pub struct LayoutInput<'a> {
     pub output_nav: Option<OutputNav>,
 }
 
+/// Convert `[r, g, b, a]` bytes from `TermServer` entity metadata into normalized RGBA floats.
+#[inline]
+fn rgba_u8_to_f32(c: [u8; 4]) -> [f32; 4] {
+    [
+        f32::from(c[0]) / 255.0,
+        f32::from(c[1]) / 255.0,
+        f32::from(c[2]) / 255.0,
+        f32::from(c[3]) / 255.0,
+    ]
+}
+
+/// Logical display width of a symbol spec: checks the live `TermServer` custom symbol registry
+/// first (stripping optional `"sym:"` prefix), otherwise falls back to emoji cluster width.
+fn symbol_display_width(sym: &str, h: f32) -> f32 {
+    let key = sym.strip_prefix("sym:").unwrap_or(sym);
+    if let Some(reg) = crate::term_server::lookup_global_symbol(key) {
+        return (reg.width_cells.max(1) as f32 * h).max(h);
+    }
+    if sym.chars().count() == 1
+        && let Some(ch) = sym.chars().next()
+        && let Some(reg) = crate::term_server::lookup_global_codepoint(ch as u32)
+    {
+        return (reg.width_cells.max(1) as f32 * h).max(h);
+    }
+    crate::view::symbol_badge_width(sym, h)
+}
+
+/// Draw either a registered Blaze Terminal API custom symbol (SVG, in-memory font glyph, PNG, or
+/// composite text) OR a Unicode/emoji badge, returning its logical horizontal width.
+#[allow(clippy::too_many_arguments)]
+fn draw_symbol_or_emoji(
+    scene: &mut Scene,
+    x: f32,
+    y: f32,
+    h: f32,
+    sym: &str,
+    tint: Option<[f32; 4]>,
+    alpha: f32,
+    clip_id: u32,
+) -> f32 {
+    let key = sym.strip_prefix("sym:").unwrap_or(sym);
+    if let Some(reg) = crate::term_server::lookup_global_symbol(key) {
+        let w = (reg.width_cells.max(1) as f32 * h).max(h);
+        let eff_tint = if reg.monochrome { tint } else { None };
+        scene.custom_symbol(x, y, w, h, reg.name, eff_tint, alpha, clip_id);
+        return w;
+    }
+    if sym.chars().count() == 1
+        && let Some(ch) = sym.chars().next()
+        && let Some(reg) = crate::term_server::lookup_global_codepoint(ch as u32)
+    {
+        let w = (reg.width_cells.max(1) as f32 * h).max(h);
+        let eff_tint = if reg.monochrome { tint } else { None };
+        scene.custom_symbol(x, y, w, h, reg.name, eff_tint, alpha, clip_id);
+        return w;
+    }
+    scene.emoji_symbol(x, y, h, sym, alpha, clip_id)
+}
+
 /// Lay out the full `ix.dev/blaze` + Starship inline-stream shell interface.
 ///
 /// The live prompt flows directly underneath the last command output (like a native
@@ -656,7 +715,7 @@ pub fn layout_window_top_bar(
         let sym_h = 13.0f32;
         let sym_w = tab
             .symbol
-            .map(|s| crate::view::symbol_badge_width(s, sym_h) + if title_str.is_empty() { 0.0 } else { 5.0 })
+            .map(|s| symbol_display_width(s, sym_h) + if title_str.is_empty() { 0.0 } else { 5.0 })
             .unwrap_or(0.0);
         let slot_w = m.measure(&slot_str, TextFace::Chrome) + 1.0;
         let title_w = if title_str.is_empty() {
@@ -705,11 +764,13 @@ pub fn layout_window_top_bar(
         scene.chrome_text(tx, mid_y, &slot_str, slot_col, false, 0);
         tx += slot_w;
         if let Some(sym) = tab.symbol {
-            let sw = scene.emoji_symbol(
+            let sw = draw_symbol_or_emoji(
+                scene,
                 tx,
                 btn_y0 + ((btn_y1 - btn_y0) - sym_h) * 0.5,
                 sym_h,
                 sym,
+                Some(title_col),
                 if tab.active { 1.0 } else { 0.72 },
                 0,
             );
@@ -860,7 +921,16 @@ fn layout_starship_line(
             .unwrap_or(prompt.host.as_str());
         if let Some(sym) = prompt.host_symbol.as_deref() {
             let sym_h = (host_s + 1.5).min(m.ch);
-            let sw = scene.emoji_symbol(cx, ty + (m.ch - sym_h) * 0.5, sym_h, sym, icon_alpha, clip_id);
+            let sw = draw_symbol_or_emoji(
+                scene,
+                cx,
+                ty + (m.ch - sym_h) * 0.5,
+                sym_h,
+                sym,
+                Some(host_col),
+                icon_alpha,
+                clip_id,
+            );
             cx += sw;
             if !host_label_raw.is_empty() {
                 cx += 5.0;
@@ -918,9 +988,19 @@ fn layout_starship_line(
             }
         }
     };
+    let eff_dir_col = prompt.project_color.unwrap_or(dir_col);
     if let Some(sym) = prompt.project_symbol.as_deref() {
         let sym_h = (folder_s + 1.5).min(m.ch);
-        let sw = scene.emoji_symbol(cx, ty + (m.ch - sym_h) * 0.5, sym_h, sym, icon_alpha, clip_id);
+        let sw = draw_symbol_or_emoji(
+            scene,
+            cx,
+            ty + (m.ch - sym_h) * 0.5,
+            sym_h,
+            sym,
+            Some(eff_dir_col),
+            icon_alpha,
+            clip_id,
+        );
         cx += sw;
         if !raw_dir_lbl.is_empty() {
             cx += 6.0;
@@ -940,12 +1020,34 @@ fn layout_starship_line(
             let leaf = &dir_lbl[slash + 1..];
             scene.text(cx, ty, parent, meta_col, false, false, clip_id);
             cx += parent.chars().count() as f32 * m.cw;
-            scene.text(cx, ty, leaf, dir_col, true, false, clip_id);
+            scene.text(cx, ty, leaf, eff_dir_col, true, false, clip_id);
             cx += leaf.chars().count() as f32 * m.cw;
         } else {
-            scene.text(cx, ty, &dir_lbl, dir_col, true, false, clip_id);
+            scene.text(cx, ty, &dir_lbl, eff_dir_col, true, false, clip_id);
             cx += dir_lbl.chars().count() as f32 * m.cw;
         }
+    }
+    if let Some(badge) = prompt.project_badge.as_deref()
+        && !badge.is_empty()
+    {
+        cx += 6.0;
+        let bw = m.measure(badge, TextFace::UiSmall) + 10.0;
+        let bh = m.ch - 2.0;
+        let by = ty + 1.0;
+        let bc = prompt.project_color.unwrap_or(theme::SERIES_BLUE);
+        scene.round_rect(
+            cx,
+            by,
+            cx + bw,
+            by + bh,
+            bh * 0.5,
+            [bc[0], bc[1], bc[2], 0.16],
+            1.0,
+            [bc[0], bc[1], bc[2], 0.42],
+            clip_id,
+        );
+        scene.ui_small(cx + 5.0, ty + 1.0, badge, bc, true, false, clip_id);
+        cx += bw;
     }
     if !prompt.cwd.is_empty() {
         scene.push_hover_clipped(
@@ -2132,16 +2234,31 @@ fn layout_file_grid(
             let cw = best_col_widths[c];
             if let Some(item) = items.get(idx) {
                 let max_ch = ((cw - icon_s - icon_gap - badge_pad).max(m.cw * 3.0) / m.cw).floor() as usize;
-                let txt = truncate_chars(&item.label, max_ch.max(3));
+                let full_p = full_path_for_entry(block.state_after.cwd.as_ref(), &block.source, &item.raw);
+                let entity = crate::term_server::lookup_global_path_entity(std::path::Path::new(&full_p));
+                let eff_label = entity
+                    .as_ref()
+                    .and_then(|e| e.display_name.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&item.label);
+                let txt = truncate_chars(eff_label, max_ch.max(3));
                 let txt_w = txt.chars().count() as f32 * m.cw;
-                let (icon_alpha, col, badge, tracked_dot) = match item.git {
+                let (icon_alpha, mut col, badge, tracked_dot) = match item.git {
                     Some(st) => git_status_style(st, item.is_dir),
                     None => (1.0, if item.is_dir { theme::INK_1 } else { theme::INK_2 }, None, false),
                 };
-                scene.svg_icon_alpha(cx, iy, icon_s, item.icon, icon_alpha, clip_id);
+                if let Some(c) = entity.as_ref().and_then(|e| e.color) {
+                    col = rgba_u8_to_f32(c);
+                }
+                let drawn_icon_w = if let Some(sym) = entity.as_ref().and_then(|e| e.symbol.as_deref()) {
+                    draw_symbol_or_emoji(scene, cx, iy, icon_s, sym, Some(col), icon_alpha, clip_id)
+                } else {
+                    scene.svg_icon_alpha(cx, iy, icon_s, item.icon, icon_alpha, clip_id);
+                    icon_s
+                };
                 draw_shaded_filename(
                     scene,
-                    cx + icon_s + icon_gap,
+                    cx + drawn_icon_w + icon_gap,
                     ty,
                     &txt,
                     item.is_dir,
@@ -2149,7 +2266,7 @@ fn layout_file_grid(
                     m,
                     clip_id,
                 );
-                let mut end_x = cx + icon_s + icon_gap + txt_w;
+                let mut end_x = cx + drawn_icon_w + icon_gap + txt_w;
                 if let Some((tag, tag_col)) = badge {
                     let bx = end_x + (m.cw * 0.45).max(3.5);
                     scene.ui_small(bx, ty + 1.0, tag, tag_col, true, false, clip_id);
@@ -2179,7 +2296,7 @@ fn layout_file_grid(
                     item_rect,
                     clip_id,
                     HoverKind::FileEntry {
-                        full_path: full_path_for_entry(block.state_after.cwd.as_ref(), &block.source, &item.raw),
+                        full_path: full_p,
                         name: item.label.clone(),
                         icon: Some(item.icon),
                         is_dir: item.is_dir,
@@ -3042,12 +3159,44 @@ fn layout_table(
                                         ];
                                     }
                                 }
-                                scene.svg_icon(item_x, iy, icon_s, icon_name, clip_id);
+                                let tree_full_path = full_path_for_entry(
+                                    block.state_after.cwd.as_ref(),
+                                    &block.source,
+                                    rel_path,
+                                );
+                                let tree_entity = crate::term_server::lookup_global_path_entity(
+                                    std::path::Path::new(&tree_full_path),
+                                );
+                                if let Some(c) = tree_entity.as_ref().and_then(|e| e.color) {
+                                    name_col = rgba_u8_to_f32(c);
+                                }
+                                let eff_tree_txt = tree_entity
+                                    .as_ref()
+                                    .and_then(|e| e.display_name.as_deref())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(&txt);
+                                let drawn_icon_pad = if let Some(sym) =
+                                    tree_entity.as_ref().and_then(|e| e.symbol.as_deref())
+                                {
+                                    draw_symbol_or_emoji(
+                                        scene,
+                                        item_x,
+                                        iy,
+                                        icon_s,
+                                        sym,
+                                        Some(name_col),
+                                        1.0,
+                                        clip_id,
+                                    ) + 6.0
+                                } else {
+                                    scene.svg_icon(item_x, iy, icon_s, icon_name, clip_id);
+                                    icon_pad
+                                };
                                 draw_shaded_filename(
                                     scene,
-                                    item_x + icon_pad,
+                                    item_x + drawn_icon_pad,
                                     ty,
-                                    &txt,
+                                    eff_tree_txt,
                                     is_dir,
                                     name_col,
                                     m,
@@ -3056,7 +3205,7 @@ fn layout_table(
                                 let cell_rect = HitRect::new(
                                     item_x - 3.0,
                                     cur_y,
-                                    item_x + icon_pad + txt_w + 6.0,
+                                    item_x + drawn_icon_pad + txt_w + 6.0,
                                     cur_y + row_h,
                                 );
                                 scene.push_drag_source_clipped(
@@ -3072,11 +3221,7 @@ fn layout_table(
                                     cell_rect,
                                     clip_id,
                                     HoverKind::FileEntry {
-                                        full_path: full_path_for_entry(
-                                            block.state_after.cwd.as_ref(),
-                                            &block.source,
-                                            rel_path,
-                                        ),
+                                        full_path: tree_full_path,
                                         name: display_name,
                                         icon: Some(icon_name),
                                         is_dir,
@@ -3131,30 +3276,66 @@ fn layout_table(
                                         ];
                                     }
                                 }
+                                let entry_full_path = full_path_for_entry(
+                                    &block.prompt_snapshot.cwd,
+                                    &block.source,
+                                    &raw_name,
+                                );
+                                let entry_entity = crate::term_server::lookup_global_path_entity(
+                                    std::path::Path::new(&entry_full_path),
+                                );
+                                if let Some(c) = entry_entity.as_ref().and_then(|e| e.color) {
+                                    name_col = rgba_u8_to_f32(c);
+                                }
+                                let shown_name = entry_entity
+                                    .as_ref()
+                                    .and_then(|e| e.display_name.as_deref())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(&display_name);
                                 let git_pad = if badge.is_some() { m.cw * 1.8 } else { 0.0 };
                                 let max_ch = ((content_w - icon_pad - 8.0 - git_pad) / m.cw).floor().max(4.0) as usize;
                                 // Middle-truncate nested paths (`crates/…/layout.rs`) so filenames stay visible!
-                                let txt = if display_name.contains('/') {
-                                    truncate_middle(&display_name, max_ch)
+                                let txt = if shown_name.contains('/') {
+                                    truncate_middle(shown_name, max_ch)
                                 } else {
-                                    truncate_chars(&display_name, max_ch)
+                                    truncate_chars(shown_name, max_ch)
                                 };
                                 let txt_w = txt.chars().count() as f32 * m.cw;
-                                let chip_w = (icon_pad + txt_w + 10.0).min(content_w + 2.0);
+                                let drawn_icon_pad = if let Some(sym) =
+                                    entry_entity.as_ref().and_then(|e| e.symbol.as_deref())
+                                {
+                                    symbol_display_width(sym, icon_s) + 6.0
+                                } else {
+                                    icon_pad
+                                };
+                                let chip_w = (drawn_icon_pad + txt_w + 10.0).min(content_w + 2.0);
                                 let bx0 = rx - 5.0;
                                 let by0 = cur_y + 2.0;
                                 let by1 = cur_y + row_h - 2.0;
 
                                 // Sleek `ix.dev/blaze` inline chip for folders and `.rs` files.
-                                if (is_dir || icon_name == "rust_dark")
+                                if (is_dir || icon_name == "rust_dark" || entry_entity.is_some())
                                     && row_git != Some(GitFileStatus::Ignored)
                                 {
                                     scene.round_rect(bx0, by0, bx0 + chip_w, by1, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip_id);
                                 }
-                                scene.svg_icon_alpha(rx, iy, icon_s, icon_name, icon_alpha, clip_id);
+                                if let Some(sym) = entry_entity.as_ref().and_then(|e| e.symbol.as_deref()) {
+                                    draw_symbol_or_emoji(
+                                        scene,
+                                        rx,
+                                        iy,
+                                        icon_s,
+                                        sym,
+                                        Some(name_col),
+                                        icon_alpha,
+                                        clip_id,
+                                    );
+                                } else {
+                                    scene.svg_icon_alpha(rx, iy, icon_s, icon_name, icon_alpha, clip_id);
+                                }
                                 draw_shaded_filename(
                                     scene,
-                                    rx + icon_pad,
+                                    rx + drawn_icon_pad,
                                     ty,
                                     &txt,
                                     is_dir,
@@ -3166,7 +3347,7 @@ fn layout_table(
                                     let gx = (bx0 + chip_w + 6.0).min(rx + content_w - m.cw);
                                     scene.ui_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
                                 } else if tracked_dot {
-                                    let gx = rx + icon_pad + txt_w + (m.cw * 0.55).max(4.5);
+                                    let gx = rx + drawn_icon_pad + txt_w + (m.cw * 0.55).max(4.5);
                                     scene.over_circle(
                                         gx,
                                         ty + m.ch * 0.52,
@@ -3189,7 +3370,7 @@ fn layout_table(
                                     cell_rect,
                                     clip_id,
                                     HoverKind::FileEntry {
-                                        full_path: full_path_for_entry(&block.prompt_snapshot.cwd, &block.source, &raw_name),
+                                        full_path: entry_full_path,
                                         name: display_name,
                                         icon: Some(icon_name),
                                         is_dir,
@@ -3531,12 +3712,34 @@ fn layout_table(
                                 } else {
                                     theme::value_color(cell)
                                 };
-                                let tx = if col_right_align[c] {
-                                    rx + content_w - txt.chars().count() as f32 * m.cw
+                                // Render registered PUA custom symbols (`U+E100..=U+EFFF`) live inside
+                                // table cells (e.g. `term symbol list`'s `preview` column!).
+                                if raw.chars().count() == 1
+                                    && let Some(ch) = raw.chars().next()
+                                    && let Some(sym) =
+                                        crate::term_server::lookup_global_codepoint(ch as u32)
+                                {
+                                    let sh = m.icon_md();
+                                    let sw = (sym.width_cells.max(1) as f32 * sh).max(sh);
+                                    let tint = if sym.monochrome { Some(color) } else { None };
+                                    scene.custom_symbol(
+                                        rx,
+                                        ty + (m.ch - sh) * 0.5,
+                                        sw,
+                                        sh,
+                                        sym.name,
+                                        tint,
+                                        1.0,
+                                        clip_id,
+                                    );
                                 } else {
-                                    rx
-                                };
-                                scene.text(tx, ty, &txt, color, false, false, clip_id);
+                                    let tx = if col_right_align[c] {
+                                        rx + content_w - txt.chars().count() as f32 * m.cw
+                                    } else {
+                                        rx
+                                    };
+                                    scene.text(tx, ty, &txt, color, false, false, clip_id);
+                                }
                                 let cell_rect = HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h);
                                 if !push_exact_value_hover(scene, cell_rect, cell, now_ns, clip_id) && txt != raw {
                                     scene.push_hover_clipped(
@@ -5354,6 +5557,15 @@ fn draw_terminal_rows(
             }
             let cp = cell.codepoint();
             if cp <= 0x20 || f.invisible {
+                continue;
+            }
+            // Registered Blaze Terminal API custom symbol (`U+E100..=U+EFFF`): renders crisp
+            // Retina SVG, in-memory font glyph slice, PNG, or composite text directly in the grid!
+            if let Some(sym) = crate::term_server::lookup_global_codepoint(cp) {
+                let sym_w = (m.cw * sym.width_cells.max(1) as f32).max(m.cw);
+                let sym_h = m.ch;
+                let tint = if sym.monochrome { Some(color) } else { None };
+                scene.custom_symbol(x0, y0, sym_w, sym_h, sym.name, tint, color[3], clip_id);
                 continue;
             }
             // Custom pixel-exact GPU SDF renderer for Unicode block elements (`U+2580..=U+259F`)
