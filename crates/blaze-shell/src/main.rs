@@ -598,6 +598,138 @@ mod macos_app {
         pb.setString_forType(&NSString::from_str(text), t);
     }
 
+    /// Collect all live child PTY and background-job PIDs across every pane & tab so the
+    /// folder-process monitor knows which processes belong to which `blaze-shell` pane/TUI.
+    fn collect_shell_pane_pids(
+        wm: &TileManager,
+        panes: &std::collections::HashMap<PaneId, ShellApp>,
+    ) -> Vec<blaze_sysmon::ShellPanePid> {
+        let mut out = Vec::new();
+        let mut pane_num = 0u32;
+        for tab in wm.tabs() {
+            let mut leaves = Vec::new();
+            tab.root.collect_leaves(&mut leaves);
+            for pid in leaves {
+                pane_num += 1;
+                let Some(pane) = panes.get(&pid) else {
+                    continue;
+                };
+                if let Some(ap) = &pane.active_pty {
+                    let is_alt = pane
+                        .store
+                        .block(ap.block_id)
+                        .is_some_and(|b| {
+                            matches!(
+                                &b.body,
+                                BlockBody::Terminal { term, running: true, .. }
+                                    if matches!(term.active(), blaze_vt::terminal::Which::Alternate)
+                            )
+                        });
+                    out.push(blaze_sysmon::ShellPanePid {
+                        pid: ap.pty.pid(),
+                        pane_id: u64::from(pid.0),
+                        block_id: ap.block_id.0,
+                        pane_number: pane_num,
+                        is_alt_screen: is_alt,
+                    });
+                }
+                for blk in pane.store.active_blocks() {
+                    if let BlockBody::Running { pid: os_pid, .. } = &blk.body {
+                        let p = os_pid.load(std::sync::atomic::Ordering::Relaxed);
+                        if p > 0 {
+                            out.push(blaze_sysmon::ShellPanePid {
+                                pid: p,
+                                pane_id: u64::from(pid.0),
+                                block_id: blk.id.0,
+                                pane_number: pane_num,
+                                is_alt_screen: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Hydrate a hovered `CommandToken` into a rich `HoverKind::CommandExplain` popover using
+    /// `blaze-cli-spec` (`man` page + `--help` + fish + curated specs) and `blaze-sh` builtins.
+    fn hydrate_command_explain(
+        source: &str,
+        token_start: usize,
+        token_end: usize,
+        path_env: &str,
+        home: Option<&str>,
+    ) -> Option<HoverKind> {
+        let alloc = Alloc::global();
+        let tokens = blaze_cli_spec::explain::tokenize_command_spans(source, alloc);
+        let tok = tokens
+            .iter()
+            .find(|t| t.start == token_start && t.end == token_end)?;
+        let cmd = tok.cmd_base.as_str();
+        let sub = tok.subcmd.as_ref().map(|s| s.as_str());
+        let spec = if !cmd.is_empty() {
+            let sub_for_spec = match tok.role {
+                blaze_cli_spec::explain::TokenRole::Command
+                | blaze_cli_spec::explain::TokenRole::Subcommand => None,
+                _ => sub,
+            };
+            blaze_shell::cli_spec_driver::lookup_nonblocking(cmd, sub_for_spec, path_env, home)
+                .or_else(|| {
+                    if sub_for_spec.is_some() {
+                        blaze_shell::cli_spec_driver::lookup_nonblocking(cmd, None, path_env, home)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+        let man_summary = match tok.role {
+            blaze_cli_spec::explain::TokenRole::Command if !cmd.is_empty() => {
+                blaze_shell::cli_spec_driver::lookup_man_summary_nonblocking(cmd, None)
+            }
+            blaze_cli_spec::explain::TokenRole::Subcommand if !cmd.is_empty() => {
+                blaze_shell::cli_spec_driver::lookup_man_summary_nonblocking(cmd, Some(tok.text.as_str()))
+            }
+            _ => None,
+        };
+        let builtin_summary = match tok.role {
+            blaze_cli_spec::explain::TokenRole::Command => {
+                if matches!(cmd, "top" | "btop" | "htop" | "sysmon") {
+                    Some("Native Metal Activity & Apple Silicon GPU Monitor (process tree + app icons)")
+                } else {
+                    blaze_sh::BUILTIN_SPECS
+                        .iter()
+                        .find(|b| b.name == cmd)
+                        .map(|b| b.summary)
+                }
+            }
+            _ => None,
+        };
+        let exp = blaze_cli_spec::explain::explain_token_in(
+            tok,
+            spec.as_deref(),
+            man_summary.as_deref(),
+            builtin_summary,
+            alloc,
+        )?;
+        Some(HoverKind::CommandExplain {
+            source: source.to_owned(),
+            token_start,
+            token_end,
+            badge: exp.badge,
+            title: exp.title.as_str().to_owned(),
+            summary: exp.summary.as_str().to_owned(),
+            details: exp
+                .details
+                .iter()
+                .map(|d| (d.tag.as_str().to_owned(), d.text.as_str().to_owned()))
+                .collect(),
+            source_note: exp.source_note.as_str().to_owned(),
+        })
+    }
+
     fn to_vim_key(key: Key, text: &str, ctrl: bool, alt: bool, shift: bool) -> Option<VimKeyEvent> {
         let mods = VimMods { ctrl, alt, shift };
         let code = match key {
@@ -2604,6 +2736,8 @@ mod macos_app {
         let mut last_git_meta_rev = blaze_shell::git_meta_driver::git_meta_revision();
         let mut last_remote_rev = blaze_shell::remote_driver::remote_complete_revision();
         let mut last_app_icon_rev = blaze_shell::sysmon_driver::app_icon_revision();
+        let mut last_folder_proc_rev = blaze_shell::sysmon_driver::folder_proc_revision();
+        let mut last_folder_poll = Instant::now() - std::time::Duration::from_secs(5);
         let mut command_palette: Option<CommandPalette> = None;
         let mut find_bar: Option<blaze_shell::find::FindBar> = None;
         let mut find_needs_scroll = false;
@@ -4696,6 +4830,44 @@ mod macos_app {
                                             }
                                             dirty = true;
                                         }
+                                        HitAction::FocusPaneBlock { pane: target_pane, block: target_block } => {
+                                            active_popover = None;
+                                            wm.focus_pane_anywhere(target_pane);
+                                            if let Some(tp) = panes.get_mut(&target_pane) {
+                                                tp.scroll_to_block = Some(target_block);
+                                                tp.auto_scroll_bottom = false;
+                                            }
+                                            dirty = true;
+                                        }
+                                        HitAction::InspectProcessPid(target_pid) => {
+                                            active_popover = None;
+                                            let mut sm = blaze_shell::sysmon_view::SysMonState::new();
+                                            let snap = blaze_shell::sysmon_driver::sample_snapshot(Alloc::global());
+                                            sm.engine.ingest(snap);
+                                            sm.set_filter(target_pid.to_string());
+                                            if let Some(prev_id) = shell.active_sysmon.take()
+                                                && let Some(prev_blk) = shell.store.block_mut(prev_id)
+                                                && let BlockBody::SysMon(prev_sm) = &mut prev_blk.body
+                                            {
+                                                prev_sm.running = false;
+                                            }
+                                            let st_b = shell.store.active_state().fork();
+                                            let bid = shell.store.record_block(
+                                                format!("top --pid {target_pid}"),
+                                                shell.prompt.clone(),
+                                                st_b.fork(),
+                                                st_b,
+                                                now_ms(),
+                                                0,
+                                                0,
+                                                BlockBody::SysMon(Box::new(sm)),
+                                            );
+                                            shell.active_sysmon = Some(bid);
+                                            shell.sysmon_fullscreen = false;
+                                            shell.last_sysmon_tick = Instant::now() - std::time::Duration::from_millis(680);
+                                            shell.auto_scroll_bottom = true;
+                                            dirty = true;
+                                        }
                                         HitAction::FindToggleCase => {
                                             if let Some(fb) = &mut find_bar {
                                                 fb.toggle_case();
@@ -5017,6 +5189,8 @@ mod macos_app {
                                         HoverKind::FilePreview { .. }
                                             | HoverKind::DirPreview { .. }
                                             | HoverKind::FileEntry { .. }
+                                            | HoverKind::CommandToken { .. }
+                                            | HoverKind::CommandExplain { .. }
                                             | HoverKind::Tooltip { .. }
                                     ) {
                                         return false;
@@ -5058,20 +5232,38 @@ mod macos_app {
                                     if active_popover.as_ref().is_none_or(|cur| cur.anchor != reg.rect) {
                                         let hydrated_kind = match &reg.kind {
                                             HoverKind::FileEntry { full_path, name, icon, .. } => {
-                                                load_hover_preview(
+                                                Some(load_hover_preview(
                                                     std::path::Path::new(full_path),
                                                     name,
                                                     *icon,
                                                     16,
+                                                ))
+                                            }
+                                            HoverKind::CommandToken { source, token_start, token_end } => {
+                                                let path_env = shell
+                                                    .store
+                                                    .active_state()
+                                                    .get_env("PATH")
+                                                    .unwrap_or("");
+                                                hydrate_command_explain(
+                                                    source,
+                                                    *token_start,
+                                                    *token_end,
+                                                    path_env,
+                                                    Some(&shell.home),
                                                 )
                                             }
-                                            other => other.clone(),
+                                            other => Some(other.clone()),
                                         };
-                                        active_popover = Some(ActivePopover {
-                                            anchor: reg.rect,
-                                            kind: hydrated_kind,
-                                            pinned: false,
-                                        });
+                                        if let Some(kind) = hydrated_kind {
+                                            active_popover = Some(ActivePopover {
+                                                anchor: reg.rect,
+                                                kind,
+                                                pinned: false,
+                                            });
+                                        } else {
+                                            active_popover = None;
+                                        }
                                         dirty = true;
                                     }
                                 } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
@@ -5430,11 +5622,28 @@ mod macos_app {
             let cur_cli_rev = blaze_shell::cli_spec_driver::spec_revision();
             if cur_cli_rev != last_cli_spec_rev {
                 last_cli_spec_rev = cur_cli_rev;
-                if let Some(shell) = panes.get_mut(&wm.focused_pane())
-                    && !shell.editor.text.is_empty()
-                {
-                    let was_open = !shell.editor.completions.is_empty() || popup_engaged;
-                    shell.refresh_editor_assist(was_open);
+                if let Some(shell) = panes.get_mut(&wm.focused_pane()) {
+                    if !shell.editor.text.is_empty() {
+                        let was_open = !shell.editor.completions.is_empty() || popup_engaged;
+                        shell.refresh_editor_assist(was_open);
+                    }
+                    // If the user is currently hovering a command token whose `man` / `--help`
+                    // probe just completed, re-hydrate the explanation card live!
+                    if let Some(pop) = &mut active_popover
+                        && let HoverKind::CommandExplain { source, token_start, token_end, .. } =
+                            &pop.kind
+                    {
+                        let path_env = shell.store.active_state().get_env("PATH").unwrap_or("");
+                        if let Some(updated) = hydrate_command_explain(
+                            source,
+                            *token_start,
+                            *token_end,
+                            path_env,
+                            Some(&shell.home),
+                        ) {
+                            pop.kind = updated;
+                        }
+                    }
                     dirty = true;
                 }
             }
@@ -5463,6 +5672,33 @@ mod macos_app {
             if cur_app_icon_rev != last_app_icon_rev {
                 last_app_icon_rev = cur_app_icon_rev;
                 dirty = true;
+            }
+            let cur_fp_rev = blaze_shell::sysmon_driver::folder_proc_revision();
+            if cur_fp_rev != last_folder_proc_rev
+                || last_folder_poll.elapsed() >= std::time::Duration::from_millis(1200)
+            {
+                last_folder_proc_rev = cur_fp_rev;
+                last_folder_poll = Instant::now();
+                let pane_roots = collect_shell_pane_pids(&wm, &panes);
+                for pane in panes.values_mut() {
+                    let next_fp = blaze_shell::sysmon_driver::poll_folder_procs(
+                        &pane.prompt.cwd,
+                        &pane_roots,
+                    );
+                    if pane.prompt.folder_procs != next_fp {
+                        pane.prompt.folder_procs = next_fp;
+                        dirty = true;
+                    }
+                }
+                if let Some(pop) = &mut active_popover
+                    && let HoverKind::FolderProcs { summary } = &mut pop.kind
+                    && let Some(focused) = panes.get(&wm.focused_pane())
+                    && focused.prompt.cwd == summary.folder
+                    && *summary != focused.prompt.folder_procs
+                {
+                    *summary = focused.prompt.folder_procs.clone();
+                    dirty = true;
+                }
             }
             // Live ~900ms native telemetry sampling for any running Activity & GPU Monitor (`top`/`btop`).
             for pane in panes.values_mut() {

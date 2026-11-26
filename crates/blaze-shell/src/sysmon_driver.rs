@@ -23,11 +23,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use blaze_own::Alloc;
-use blaze_sysmon::RawSnapshot;
+use blaze_sysmon::{RawSnapshot, ShellPanePid, SysMonEngine};
 
 static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
 static APP_ICON_REVISION: AtomicU64 = AtomicU64::new(0);
@@ -299,6 +299,274 @@ pub fn send_process_signal(pid: u32, sigkill: bool) -> Result<(), String> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Background non-blocking folder process watcher (zero-block UI polling)
+// -----------------------------------------------------------------------------
+
+/// Owned UI-ready description of one process associated with a watched folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FolderProcItem {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+    pub cwd: String,
+    pub rel_dir: String,
+    pub exe_path: String,
+    pub app_icon_path: Option<String>,
+    pub cpu_pct: f32,
+    pub gpu_pct: f32,
+    pub mem_bytes: u64,
+    pub threads: u32,
+    pub is_hot: bool,
+    pub via_descendant: bool,
+    pub shell_pane: Option<ShellPanePid>,
+}
+
+/// Owned UI snapshot of all active processes rooted under one watched folder.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FolderProcSnapshot {
+    pub folder: String,
+    pub items: Vec<FolderProcItem>,
+    pub total_cpu_pct: f32,
+    pub total_gpu_pct: f32,
+    pub total_mem_bytes: u64,
+    pub is_hot: bool,
+    pub primary_name: String,
+}
+
+const MAX_WATCHED_FOLDERS: usize = 8;
+const FOLDER_POLL_ACTIVE_TTL: Duration = Duration::from_secs(10);
+const FOLDER_SAMPLE_INTERVAL: Duration = Duration::from_millis(1400);
+const FOLDER_IDLE_WAIT: Duration = Duration::from_secs(5);
+
+struct WatchedFolder {
+    pane_roots: Vec<ShellPanePid>,
+    last_polled: Instant,
+}
+
+struct WatchState {
+    folders: HashMap<String, WatchedFolder>,
+    /// Incremented whenever a brand-new folder is registered or polling resumes after idle.
+    wake_seq: u64,
+}
+
+struct FolderProcWatcher {
+    cache: Mutex<HashMap<String, FolderProcSnapshot>>,
+    watch: Mutex<WatchState>,
+    wake: Condvar,
+}
+
+impl FolderProcWatcher {
+    fn new() -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            watch: Mutex::new(WatchState {
+                folders: HashMap::new(),
+                wake_seq: 0,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+}
+
+static FOLDER_PROC_REVISION: AtomicU64 = AtomicU64::new(0);
+static FOLDER_PROC_WATCHER: OnceLock<FolderProcWatcher> = OnceLock::new();
+static FOLDER_PROC_WORKER_STARTED: OnceLock<()> = OnceLock::new();
+
+/// Monotonic revision bumped whenever the background folder process sampler refreshes its cache.
+pub fn folder_proc_revision() -> u64 {
+    FOLDER_PROC_REVISION.load(Ordering::Acquire)
+}
+
+/// Zero-block O(1) lookup of active processes running inside `folder`.
+///
+/// Registers `(folder, pane_roots)` into a bounded watch table (at most 8 active folders) and
+/// lazily starts a single background sampler thread (`blaze-folder-procs`) that refreshes every
+/// 1.4s while polled and parks cleanly when idle for more than 10s. Registering a brand-new folder
+/// wakes the sampler immediately so directory switches update promptly.
+pub fn poll_folder_procs(folder: &str, pane_roots: &[ShellPanePid]) -> FolderProcSnapshot {
+    if folder.is_empty() {
+        return FolderProcSnapshot::default();
+    }
+
+    let watcher = FOLDER_PROC_WATCHER.get_or_init(FolderProcWatcher::new);
+    let now = Instant::now();
+    let mut should_wake = false;
+
+    if let Ok(mut state) = watcher.watch.lock() {
+        if let Some(entry) = state.folders.get_mut(folder) {
+            if now.duration_since(entry.last_polled) > FOLDER_POLL_ACTIVE_TTL {
+                should_wake = true;
+            }
+            entry.last_polled = now;
+            if entry.pane_roots.as_slice() != pane_roots {
+                entry.pane_roots.clear();
+                entry.pane_roots.extend_from_slice(pane_roots);
+            }
+            if should_wake {
+                state.wake_seq = state.wake_seq.wrapping_add(1);
+            }
+        } else {
+            // Evict the least-recently-polled folder when the watch table reaches its cap.
+            if state.folders.len() >= MAX_WATCHED_FOLDERS
+                && let Some(oldest_key) = state
+                    .folders
+                    .iter()
+                    .min_by_key(|(_, v)| v.last_polled)
+                    .map(|(k, _)| k.clone())
+            {
+                state.folders.remove(&oldest_key);
+            }
+            state.folders.insert(
+                folder.to_owned(),
+                WatchedFolder {
+                    pane_roots: pane_roots.to_vec(),
+                    last_polled: now,
+                },
+            );
+            state.wake_seq = state.wake_seq.wrapping_add(1);
+            should_wake = true;
+        }
+    }
+
+    FOLDER_PROC_WORKER_STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("blaze-folder-procs".to_owned())
+            .spawn(folder_proc_worker_loop);
+    });
+
+    if should_wake {
+        watcher.wake.notify_one();
+    }
+
+    if let Ok(cache) = watcher.cache.lock()
+        && let Some(snap) = cache.get(folder)
+    {
+        return snap.clone();
+    }
+
+    FolderProcSnapshot {
+        folder: folder.to_owned(),
+        ..FolderProcSnapshot::default()
+    }
+}
+
+fn folder_proc_worker_loop() {
+    let alloc = Alloc::global();
+    let mut engine = SysMonEngine::new_in(alloc);
+    let own_pid = std::process::id();
+
+    loop {
+        let Some(watcher) = FOLDER_PROC_WATCHER.get() else {
+            return;
+        };
+
+        // Snapshot recently-polled folders and park cleanly when nothing has been polled for 10s.
+        let (active, observed_wake_seq): (Vec<(String, Vec<ShellPanePid>)>, u64) = {
+            let Ok(mut state) = watcher.watch.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            state
+                .folders
+                .retain(|_, w| now.duration_since(w.last_polled) <= FOLDER_POLL_ACTIVE_TTL);
+
+            if state.folders.is_empty() {
+                let seq = state.wake_seq;
+                let Ok((mut state, _)) = watcher.wake.wait_timeout_while(
+                    state,
+                    FOLDER_IDLE_WAIT,
+                    |s| s.wake_seq == seq && s.folders.is_empty(),
+                ) else {
+                    return;
+                };
+                let now = Instant::now();
+                state
+                    .folders
+                    .retain(|_, w| now.duration_since(w.last_polled) <= FOLDER_POLL_ACTIVE_TTL);
+                if state.folders.is_empty() {
+                    continue;
+                }
+                let list = state
+                    .folders
+                    .iter()
+                    .take(MAX_WATCHED_FOLDERS)
+                    .map(|(k, v)| (k.clone(), v.pane_roots.clone()))
+                    .collect();
+                (list, state.wake_seq)
+            } else {
+                let list = state
+                    .folders
+                    .iter()
+                    .take(MAX_WATCHED_FOLDERS)
+                    .map(|(k, v)| (k.clone(), v.pane_roots.clone()))
+                    .collect();
+                (list, state.wake_seq)
+            }
+        };
+
+        let raw = sample_snapshot(alloc);
+        engine.ingest(raw);
+
+        let mut updated: Vec<(String, FolderProcSnapshot)> = Vec::with_capacity(active.len());
+        for (folder, roots) in &active {
+            let summary = engine.folder_processes_in(folder, own_pid, roots, alloc);
+            let mut items = Vec::with_capacity(summary.entries.len());
+            for entry in summary.entries.iter() {
+                let app_icon_path = entry
+                    .app_bundle_path
+                    .as_ref()
+                    .and_then(|p| lookup_or_cache_app_icon(p.as_str()));
+                items.push(FolderProcItem {
+                    pid: entry.pid,
+                    ppid: entry.ppid,
+                    name: entry.name.as_str().to_owned(),
+                    cwd: entry.cwd.as_str().to_owned(),
+                    rel_dir: entry.rel_dir.as_str().to_owned(),
+                    exe_path: entry.exe_path.as_str().to_owned(),
+                    app_icon_path,
+                    cpu_pct: entry.cpu_pct,
+                    gpu_pct: entry.gpu_pct,
+                    mem_bytes: entry.mem_bytes,
+                    threads: entry.threads,
+                    is_hot: entry.is_hot,
+                    via_descendant: entry.via_descendant,
+                    shell_pane: entry.shell_pane.clone(),
+                });
+            }
+            updated.push((
+                folder.clone(),
+                FolderProcSnapshot {
+                    folder: summary.folder.as_str().to_owned(),
+                    items,
+                    total_cpu_pct: summary.total_cpu_pct,
+                    total_gpu_pct: summary.total_gpu_pct,
+                    total_mem_bytes: summary.total_mem_bytes,
+                    is_hot: summary.is_hot,
+                    primary_name: summary.primary_name.as_str().to_owned(),
+                },
+            ));
+        }
+
+        if let Ok(mut cache) = watcher.cache.lock() {
+            cache.retain(|k, _| active.iter().any(|(af, _)| af == k));
+            for (k, v) in updated {
+                cache.insert(k, v);
+            }
+        }
+        FOLDER_PROC_REVISION.fetch_add(1, Ordering::Release);
+
+        // Sleep 1.4s between ticks, waking immediately if a brand-new folder is registered.
+        if let Ok(state) = watcher.watch.lock() {
+            let _ = watcher.wake.wait_timeout_while(
+                state,
+                FOLDER_SAMPLE_INTERVAL,
+                |s| s.wake_seq == observed_wake_seq,
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clashing_extern_declarations)]
 mod macos {
@@ -342,7 +610,9 @@ mod macos {
 
     const PROC_PIDTBSDINFO: i32 = 3;
     const PROC_PIDTASKINFO: i32 = 4;
+    const PROC_PIDVNODEPATHINFO: i32 = 9;
     const RUSAGE_INFO_V4: i32 = 4;
+    const MAXPATHLEN: usize = 1024;
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 
     const K_IO_MAIN_PORT_DEFAULT: u32 = 0;
@@ -511,6 +781,25 @@ mod macos {
         pub ri_serviced_energy: u64,
         pub ri_interval_max_phys_footprint: u64,
         pub ri_runnable_time: u64,
+    }
+
+    /// `<sys/proc_info.h>` `struct vnode_info_path` (1176 bytes, 8-byte aligned).
+    ///
+    /// `vip_vi` (`struct vnode_info`) is 152 bytes (`19 × u64`), followed immediately at offset
+    /// 152 by `vip_path[MAXPATHLEN]` (1024 bytes).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct VnodeInfoPath {
+        pub vip_vi: [u64; 19],
+        pub vip_path: [u8; MAXPATHLEN],
+    }
+
+    /// `<sys/proc_info.h>` `struct proc_vnodepathinfo` (2352 bytes, 8-byte aligned).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct ProcVnodePathInfo {
+        pub pvi_cdir: VnodeInfoPath,
+        pub pvi_rdir: VnodeInfoPath,
     }
 
     #[repr(C)]
@@ -1350,12 +1639,34 @@ mod macos {
 
             let (gpu_time_ns, gpu_queues) = gpu_by_pid.get(&pid).copied().unwrap_or((0, 0));
 
+            // Process current working directory via `PROC_PIDVNODEPATHINFO`. Kernel / other-UID
+            // processes may return EPERM (`vnode_len <= 0`), leaving `cwd` empty.
+            let mut vnode = MaybeUninit::<ProcVnodePathInfo>::zeroed();
+            // SAFETY: `vnode` points to 2352 writable bytes matching `PROC_PIDVNODEPATHINFO`.
+            let vnode_len = unsafe {
+                proc_pidinfo(
+                    raw_pid,
+                    PROC_PIDVNODEPATHINFO,
+                    0,
+                    vnode.as_mut_ptr().cast::<c_void>(),
+                    size_of::<ProcVnodePathInfo>() as i32,
+                )
+            };
+            let cwd = if vnode_len == size_of::<ProcVnodePathInfo>() as i32 {
+                // SAFETY: `proc_pidinfo` wrote the full `ProcVnodePathInfo` struct.
+                let vnode = unsafe { vnode.assume_init() };
+                AString::from_str_in(c_bytes_to_str(&vnode.pvi_cdir.vip_path), alloc)
+            } else {
+                AString::new_in(alloc)
+            };
+
             out.push(RawProcess {
                 pid: bsd.pbi_pid,
                 ppid: bsd.pbi_ppid,
                 uid: bsd.pbi_uid,
                 name: AString::from_str_in(chosen_name, alloc),
                 exe_path: AString::from_str_in(&exe_path_str, alloc),
+                cwd,
                 app_bundle_path,
                 cpu_time_ns,
                 gpu_time_ns,
@@ -1551,8 +1862,8 @@ mod tests {
         use std::mem::{offset_of, size_of};
 
         use macos::{
-            MachTimebaseInfo, ProcBsdInfo, ProcTaskInfo, RusageInfoV4, Timeval,
-            VmStatistics64Rev1, XswUsage,
+            MachTimebaseInfo, ProcBsdInfo, ProcTaskInfo, ProcVnodePathInfo, RusageInfoV4, Timeval,
+            VmStatistics64Rev1, VnodeInfoPath, XswUsage,
         };
 
         assert_eq!(size_of::<ProcBsdInfo>(), 136);
@@ -1602,6 +1913,15 @@ mod tests {
         assert_eq!(offset_of!(Timeval, tv_usec), 8);
 
         assert_eq!(size_of::<MachTimebaseInfo>(), 8);
+
+        assert_eq!(size_of::<VnodeInfoPath>(), 1176);
+        assert_eq!(offset_of!(VnodeInfoPath, vip_vi), 0);
+        assert_eq!(offset_of!(VnodeInfoPath, vip_path), 152);
+
+        assert_eq!(size_of::<ProcVnodePathInfo>(), 2352);
+        assert_eq!(offset_of!(ProcVnodePathInfo, pvi_cdir), 0);
+        assert_eq!(offset_of!(ProcVnodePathInfo, pvi_cdir.vip_path), 152);
+        assert_eq!(offset_of!(ProcVnodePathInfo, pvi_rdir), 1176);
     }
 
     #[cfg(target_os = "macos")]
@@ -1617,9 +1937,22 @@ mod tests {
         assert!(s1.uptime_secs > 0, "expected non-zero host uptime");
 
         let my_pid = std::process::id();
+        let me = s1
+            .processes
+            .iter()
+            .find(|p| p.pid == my_pid)
+            .expect("expected current test process in process list");
         assert!(
-            s1.processes.iter().any(|p| p.pid == my_pid),
-            "expected current test process (pid {my_pid}) in process list"
+            !me.cwd.as_str().is_empty(),
+            "expected PROC_PIDVNODEPATHINFO to populate current process cwd"
         );
+        if let Ok(expected) = std::env::current_dir().and_then(fs::canonicalize)
+            && let Ok(actual) = fs::canonicalize(me.cwd.as_str())
+        {
+            assert_eq!(
+                actual, expected,
+                "current process cwd from PROC_PIDVNODEPATHINFO should match current_dir"
+            );
+        }
     }
 }

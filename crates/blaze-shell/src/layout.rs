@@ -1136,6 +1136,71 @@ fn layout_starship_line(
         }
     }
 
+    // Segment 6: Live Folder Processes & Hot Indicator (cwd + subfolders + grandchildren/descendants).
+    // Hover lists every process with CPU/GPU/MEM & subfolder; click jumps to its pane/TUI or inspects in `top`!
+    if is_live && !prompt.folder_procs.items.is_empty() {
+        let fp = &prompt.folder_procs;
+        let count = fp.items.len();
+        cx += sep_pad;
+        draw_divider(scene, cx);
+        cx += sep_pad;
+        let seg6_x0 = cx - 4.0;
+        let primary = truncate_chars(
+            if fp.primary_name.is_empty() { "proc" } else { fp.primary_name.as_str() },
+            14,
+        );
+        let label = if fp.is_hot {
+            let hot_pct = fp.total_cpu_pct.max(fp.total_gpu_pct).round() as u32;
+            if count > 1 {
+                format!("{hot_pct}% · {primary} +{}", count - 1)
+            } else {
+                format!("{hot_pct}% · {primary}")
+            }
+        } else if count > 1 {
+            format!("{primary} +{}", count - 1)
+        } else {
+            primary
+        };
+        let pill_fg = if fp.is_hot {
+            theme::rgb(0xff, 0xa8, 0x5c)
+        } else {
+            theme::rgb(0x7c, 0xd4, 0xa8)
+        };
+        let dot_col = if fp.is_hot {
+            theme::rgb(0xff, 0x6b, 0x4a)
+        } else {
+            theme::OK
+        };
+        if fp.is_hot {
+            let approx_w = 12.0 + m.measure(&label, TextFace::UiSmall) + 8.0;
+            scene.round_rect(
+                seg6_x0 + 1.0,
+                y + 2.5,
+                (cx + approx_w).min(x0 + max_w - pad_x),
+                y + cap_h - 2.5,
+                (cap_h - 5.0) * 0.5,
+                theme::rgba(0xe8, 0x6a, 0x35, 0.16),
+                0.75,
+                theme::rgba(0xff, 0x8a, 0x4c, 0.48),
+                clip_id,
+            );
+        }
+        if fp.is_hot {
+            scene.text(cx, ty, "🔥", pill_fg, true, false, clip_id);
+            cx += m.cw + 5.0;
+        } else {
+            scene.over_circle(cx + 3.0, ty + m.ch * 0.5, 2.7, dot_col, clip_id);
+            cx += 9.5;
+        }
+        scene.ui_small(cx, ty, &label, pill_fg, fp.is_hot, false, clip_id);
+        cx += m.measure(&label, TextFace::UiSmall) + 2.0;
+        scene.push_hover_clipped(
+            HitRect::new(seg6_x0, y, cx + 4.0, y + cap_h),
+            clip_id,
+            HoverKind::FolderProcs { summary: fp.clone() },
+        );
+    }
+
     let cap_x1 = (cx + pad_x).min(x0 + max_w);
     scene.rects[cap_idx].rect[2] = cap_x1;
 
@@ -1516,6 +1581,62 @@ fn layout_highlighted_source(
             );
         }
         cur_y += line_step;
+    }
+
+    // Record hoverable command-token spans for live man-page / `--help` explain-on-hover!
+    let cmd_tokens = blaze_cli_spec::explain::tokenize_command_spans(
+        source,
+        blaze_own::Alloc::global(),
+    );
+    if !cmd_tokens.is_empty() {
+        // Compute (line_y, col) for every byte index in `source` matching the wrap layout above.
+        let mut byte_pos_xy: Vec<Option<(f32, f32)>> = vec![None; source.len()];
+        let mut ly = y0;
+        let mut b_off = 0usize;
+        for raw_line in source.split('\n') {
+            let mut col = 0usize;
+            for (rel_idx, _ch) in raw_line.char_indices() {
+                if col >= max_cols {
+                    ly += line_step;
+                    col = 0;
+                }
+                if let Some(slot) = byte_pos_xy.get_mut(b_off + rel_idx) {
+                    *slot = Some((x0 + col as f32 * m.cw, ly));
+                }
+                col += 1;
+            }
+            b_off = (b_off + raw_line.len() + 1).min(source.len());
+            ly += line_step;
+        }
+        for tok in cmd_tokens.iter() {
+            if tok.start >= tok.end || tok.end > source.len() {
+                continue;
+            }
+            if matches!(tok.role, blaze_cli_spec::explain::TokenRole::Arg)
+                && tok.for_flag.is_none()
+            {
+                continue;
+            }
+            let Some((tx0, ty0)) = byte_pos_xy.get(tok.start).copied().flatten() else {
+                continue;
+            };
+            // Find last char inside [tok.start, tok.end) on the same wrapped line.
+            let mut tx1 = tx0 + m.cw;
+            for pos in byte_pos_xy[tok.start..tok.end].iter().flatten() {
+                if (pos.1 - ty0).abs() < 0.5 {
+                    tx1 = tx1.max(pos.0 + m.cw);
+                }
+            }
+            scene.push_hover_clipped(
+                HitRect::new(tx0, ty0, tx1, ty0 + m.ch),
+                clip_id,
+                HoverKind::CommandToken {
+                    source: source.to_owned(),
+                    token_start: tok.start,
+                    token_end: tok.end,
+                },
+            );
+        }
     }
 
     (cur_y - y0 - 4.0).max(m.ch)
@@ -6271,6 +6392,35 @@ fn layout_active_popover(
             let h = hdr_h + 6.0 + shown as f32 * dir_row_h + extra + pad_y;
             (w, h)
         }
+        HoverKind::FolderProcs { summary } => {
+            let shown = summary.items.len().clamp(1, 12);
+            let w = 520.0f32.min((vw - 24.0).max(300.0));
+            let proc_row_h = m.ch + 10.0;
+            let foot_h = if summary.items.len() > shown { m.ch + 6.0 } else { 0.0 };
+            let h = hdr_h + 4.0 + shown as f32 * proc_row_h + foot_h + pad_y;
+            (w, h)
+        }
+        HoverKind::CommandToken { .. } => (200.0, hdr_h + row_h),
+        HoverKind::CommandExplain { title, summary, details, .. } => {
+            let base_w = 440.0f32.min((vw - 24.0).max(260.0));
+            let title_w = m.measure(title, TextFace::Mono) + 160.0;
+            let w = base_w.max(title_w.min(520.0)).min((vw - 24.0).max(260.0));
+            let wrap_cols = ((w - pad_x * 2.0) / m.cw).floor().max(24.0) as usize;
+            let sum_lines = if summary.is_empty() { 0 } else { wrap_lines(summary, wrap_cols).len().min(4) };
+            let mut det_lines = 0usize;
+            for (tag, txt) in details.iter().take(6) {
+                let rem_cols = wrap_cols.saturating_sub(tag.chars().count() + 4).max(16);
+                det_lines += wrap_lines(txt, rem_cols).len().min(2);
+            }
+            let det_pad = if det_lines > 0 { 6.0 } else { 0.0 };
+            let h = hdr_h
+                + 8.0
+                + sum_lines as f32 * (m.ch + 3.0)
+                + det_pad
+                + det_lines as f32 * (m.ch + 4.0)
+                + pad_y;
+            (w, h.max(hdr_h + row_h + pad_y))
+        }
     };
 
     // Place file & directory previews on the RIGHT-HAND SIDE (never above/below, so hovering up/down
@@ -6310,17 +6460,26 @@ fn layout_active_popover(
     let ax1 = pop.anchor.x1 + 2.0;
     let ay1 = pop.anchor.y1 + 1.0;
     if ax1 > ax0 && ay1 > ay0 {
-        scene.overlay_round_rect(
-            ax0,
-            ay0,
-            ax1,
-            ay1,
-            5.0,
-            theme::rgba(0xff, 0xff, 0xff, 0.08),
-            1.0,
-            theme::rgba(0xff, 0xff, 0xff, 0.24),
-            0,
-        );
+        let is_cmd_explain = matches!(pop.kind, HoverKind::CommandExplain { .. });
+        let (a_fill, a_border) = if is_cmd_explain {
+            (theme::rgba(0x58, 0x9d, 0xf6, 0.22), theme::rgba(0x7c, 0xb7, 0xff, 0.78))
+        } else {
+            (theme::rgba(0xff, 0xff, 0xff, 0.08), theme::rgba(0xff, 0xff, 0xff, 0.24))
+        };
+        scene.overlay_round_rect(ax0, ay0, ax1, ay1, 4.5, a_fill, 1.0, a_border, 0);
+        if is_cmd_explain {
+            scene.overlay_round_rect(
+                ax0 + 2.0,
+                ay1 - 1.5,
+                ax1 - 2.0,
+                ay1,
+                0.75,
+                theme::rgba(0x7c, 0xb7, 0xff, 0.92),
+                0.0,
+                [0.0; 4],
+                0,
+            );
+        }
         if is_side_preview {
             scene.overlay_round_rect(
                 ax0,
@@ -6984,6 +7143,229 @@ fn layout_active_popover(
                     (m_n, h_n) => format!("… {m_n} more · {h_n} hidden"),
                 };
                 scene.overlay_ui_small(x0 + pad_x + icon_s + 8.0, ry + 2.0, foot, theme::INK_4, false, true, 0);
+            }
+        }
+        HoverKind::FolderProcs { summary } => {
+            let folder_name = std::path::Path::new(&summary.folder)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&summary.folder);
+            let left_hdr = if summary.is_hot {
+                format!("🔥 running in {folder_name}/ · {}", summary.items.len())
+            } else {
+                format!("running in {folder_name}/ · {}", summary.items.len())
+            };
+            let right_hdr = format!(
+                "{:.0}% CPU · {}",
+                summary.total_cpu_pct,
+                crate::sysmon_view::format_iec_bytes(summary.total_mem_bytes),
+            );
+            let mut ry = draw_header(scene, &left_hdr, &right_hdr) + 2.0;
+            let proc_row_h = m.ch + 10.0;
+            for item in summary.items.iter().take(12) {
+                let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + proc_row_h);
+                if is_hovered(row_rect) {
+                    scene.overlay_round_rect(
+                        row_rect.x0,
+                        row_rect.y0,
+                        row_rect.x1,
+                        row_rect.y1,
+                        5.0,
+                        theme::rgb(0x20, 0x22, 0x2a),
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
+                let ty = ry + (proc_row_h - m.ch) * 0.5;
+                let ix = x0 + pad_x;
+                let iy = ry + (proc_row_h - icon_s) * 0.5;
+                if let Some(app_ic) = item.app_icon_path.as_deref() {
+                    scene.overlay_avatar_image(ix, iy, icon_s, app_ic.to_owned(), 0);
+                } else {
+                    let lc = item.name.to_ascii_lowercase();
+                    let svg = if lc.contains("rust") || lc.contains("cargo") || lc.contains("blaze") {
+                        "rust_dark"
+                    } else if lc.contains("node") || lc.contains("bun") || lc.contains("deno") {
+                        "javascript_dark"
+                    } else if lc.contains("python") {
+                        "python_dark"
+                    } else {
+                        "shell_dark"
+                    };
+                    scene.overlay_svg_icon(ix, iy, icon_s, svg, 0);
+                }
+
+                // Right side: clickable action pill (`Pane 2 · alt ↗` or `inspect ↗`), then MEM, GPU%, CPU%.
+                let (act_lbl, act_fg, act_bg, action) = if let Some(sp) = item.shell_pane {
+                    let lbl = if sp.is_alt_screen {
+                        format!("Pane {} · TUI ↗", sp.pane_number)
+                    } else {
+                        format!("Pane {} ↗", sp.pane_number)
+                    };
+                    (
+                        lbl,
+                        theme::rgb(0x8c, 0xc2, 0xff),
+                        theme::rgba(0x58, 0x9d, 0xf6, 0.18),
+                        HitAction::FocusPaneBlock {
+                            pane: crate::tiling::PaneId(sp.pane_id as u32),
+                            block: crate::blocks::BlockId(sp.block_id),
+                        },
+                    )
+                } else {
+                    (
+                        format!("pid {} ↗", item.pid),
+                        theme::INK_3,
+                        theme::rgba(0xff, 0xff, 0xff, 0.06),
+                        HitAction::InspectProcessPid(item.pid),
+                    )
+                };
+                let act_w = m.measure(&act_lbl, TextFace::UiSmall) + 12.0;
+                let act_x0 = x1 - pad_x - act_w;
+                scene.overlay_round_rect(
+                    act_x0,
+                    ry + 3.0,
+                    x1 - pad_x,
+                    ry + proc_row_h - 3.0,
+                    4.5,
+                    act_bg,
+                    0.0,
+                    [0.0; 4],
+                    0,
+                );
+                scene.overlay_ui_small(act_x0 + 6.0, ty, &act_lbl, act_fg, item.shell_pane.is_some(), false, 0);
+
+                let mut rx = act_x0 - 8.0;
+                let mem_s = crate::sysmon_view::format_iec_bytes(item.mem_bytes);
+                let mem_w = m.measure(&mem_s, TextFace::UiSmall);
+                rx -= mem_w;
+                scene.overlay_ui_small(rx, ty, &mem_s, theme::INK_3, false, false, 0);
+                rx -= 10.0;
+
+                if item.gpu_pct >= 0.5 {
+                    let gpu_s = format!("G:{:.0}%", item.gpu_pct);
+                    let gw = m.measure(&gpu_s, TextFace::UiSmall);
+                    rx -= gw;
+                    scene.overlay_ui_small(rx, ty, &gpu_s, theme::rgb(0x56, 0xd8, 0xc8), true, false, 0);
+                    rx -= 8.0;
+                }
+
+                let cpu_s = if item.is_hot {
+                    format!("🔥{:.0}%", item.cpu_pct)
+                } else {
+                    format!("{:.1}%", item.cpu_pct)
+                };
+                let cpu_col = if item.is_hot {
+                    theme::rgb(0xff, 0x8a, 0x4c)
+                } else if item.cpu_pct >= 5.0 {
+                    theme::rgb(0xe5, 0xc0, 0x7b)
+                } else {
+                    theme::INK_4
+                };
+                let cpu_w = m.measure(&cpu_s, TextFace::UiSmall);
+                rx -= cpu_w;
+                scene.overlay_ui_small(rx, ty, &cpu_s, cpu_col, item.is_hot, false, 0);
+                rx -= 10.0;
+
+                let name_x = ix + icon_s + 7.0;
+                let avail_ch = ((rx - name_x) / m.cw).floor().max(8.0) as usize;
+                let display_name = if item.rel_dir != "." && !item.rel_dir.is_empty() {
+                    format!("{}  {}", item.name, item.rel_dir)
+                } else {
+                    item.name.clone()
+                };
+                let shown_txt = truncate_chars(&display_name, avail_ch);
+                let name_len = item.name.chars().count().min(shown_txt.chars().count());
+                let (n_part, sub_part): (String, String) = {
+                    let mut chars = shown_txt.chars();
+                    let a: String = chars.by_ref().take(name_len).collect();
+                    let b: String = chars.collect();
+                    (a, b)
+                };
+                scene.overlay_text_run(name_x, ty, &n_part, theme::INK_1, item.is_hot, false, 0);
+                if !sub_part.is_empty() {
+                    scene.overlay_text_run(
+                        name_x + name_len as f32 * m.cw,
+                        ty,
+                        &sub_part,
+                        theme::INK_4,
+                        false,
+                        false,
+                        0,
+                    );
+                }
+
+                scene.push_hit(row_rect, action);
+                ry += proc_row_h;
+            }
+            if summary.items.len() > 12 {
+                scene.overlay_ui_small(
+                    x0 + pad_x,
+                    ry + 2.0,
+                    format!("… {} more processes (run `top` for full tree)", summary.items.len() - 12),
+                    theme::INK_4,
+                    false,
+                    true,
+                    0,
+                );
+            }
+        }
+        HoverKind::CommandToken { .. } => {}
+        HoverKind::CommandExplain { badge, title, summary, details, source_note, .. } => {
+            let (b_fg, b_bg) = match *badge {
+                "BUILTIN" => (theme::CMD_BUILTIN, theme::rgba(0x5c, 0xb8, 0xff, 0.16)),
+                "COMMAND" => (theme::CMD_EXTERNAL, theme::rgba(0xe5, 0xc0, 0x7b, 0.16)),
+                "SUBCOMMAND" => (theme::rgb(0x56, 0xb6, 0xc2), theme::rgba(0x56, 0xb6, 0xc2, 0.16)),
+                "FLAG" => (theme::rgb(0x88, 0xb4, 0xff), theme::rgba(0x58, 0x9d, 0xf6, 0.18)),
+                "PIPE" | "REDIR" => (theme::rgb(0xc6, 0x78, 0xdd), theme::rgba(0xc6, 0x78, 0xdd, 0.16)),
+                "VAR" => (theme::rgb(0xd1, 0x9a, 0x66), theme::rgba(0xd1, 0x9a, 0x66, 0.16)),
+                _ => (theme::INK_2, theme::rgba(0xff, 0xff, 0xff, 0.08)),
+            };
+            // Header with colored role pill + monospace token title.
+            let hy = y0 + (hdr_h - m.ch) * 0.5;
+            let bw = m.measure(badge, TextFace::UiSmall) + 10.0;
+            scene.overlay_round_rect(
+                x0 + pad_x,
+                y0 + 5.0,
+                x0 + pad_x + bw,
+                y0 + hdr_h - 5.0,
+                4.0,
+                b_bg,
+                0.0,
+                [0.0; 4],
+                0,
+            );
+            scene.overlay_ui_small(x0 + pad_x + 5.0, hy, *badge, b_fg, true, false, 0);
+            scene.overlay_text_run(x0 + pad_x + bw + 8.0, hy, title, theme::INK_1, true, false, 0);
+            if !source_note.is_empty() {
+                let sw = m.measure(source_note, TextFace::UiSmall);
+                scene.overlay_ui_small(x1 - pad_x - sw, hy, source_note, theme::INK_4, false, false, 0);
+            }
+            scene.overlay_line(x0 + 1.0, y0 + hdr_h, x1 - 1.0, y0 + hdr_h, 1.0, theme::LINE_FAINT, 0);
+
+            let mut ry = y0 + hdr_h + 6.0;
+            let wrap_cols = ((x1 - x0 - pad_x * 2.0) / m.cw).floor().max(24.0) as usize;
+            if !summary.is_empty() {
+                for line in wrap_lines(summary, wrap_cols).into_iter().take(4) {
+                    scene.overlay_ui_small(x0 + pad_x, ry, line, theme::INK_2, false, false, 0);
+                    ry += m.ch + 3.0;
+                }
+            }
+            if !details.is_empty() {
+                ry += 4.0;
+                for (tag, txt) in details.iter().take(6) {
+                    let tag_w = (tag.chars().count() as f32 * m.cw + 10.0).max(34.0);
+                    scene.overlay_text_run(x0 + pad_x, ry, tag, b_fg, true, false, 0);
+                    let rem_cols = ((x1 - x0 - pad_x * 2.0 - tag_w) / m.cw).floor().max(16.0) as usize;
+                    for (li, line) in wrap_lines(txt, rem_cols).into_iter().take(2).enumerate() {
+                        scene.overlay_ui_small(x0 + pad_x + tag_w, ry, line, theme::INK_3, false, false, 0);
+                        if li == 0 {
+                            ry += m.ch + 4.0;
+                        } else {
+                            ry += m.ch + 2.0;
+                        }
+                    }
+                }
             }
         }
     }
