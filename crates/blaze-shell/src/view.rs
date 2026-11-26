@@ -1092,6 +1092,28 @@ impl Scene {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn overlay_image(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        path: String,
+        clip_id: u32,
+    ) {
+        self.overlay_images.push(ImageQuad {
+            x,
+            y,
+            w,
+            h,
+            path,
+            alpha: 1.0,
+            circle: false,
+            clip_id,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn overlay_avatar_image(
         &mut self,
         x: f32,

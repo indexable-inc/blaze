@@ -385,6 +385,9 @@ pub struct FolderProcItem {
     pub cmdline: String,
     pub parent_name: String,
     pub app_icon_path: Option<String>,
+    pub origin_app_name: String,
+    pub origin_app_icon_path: Option<String>,
+    pub origin_chain: String,
     pub cpu_pct: f32,
     pub gpu_pct: f32,
     pub mem_bytes: u64,
@@ -590,6 +593,10 @@ fn folder_proc_worker_loop() {
                     .app_bundle_path
                     .as_ref()
                     .and_then(|p| lookup_or_cache_app_icon(p.as_str()));
+                let origin_app_icon_path = entry
+                    .origin_app_bundle_path
+                    .as_ref()
+                    .and_then(|p| lookup_or_cache_app_icon(p.as_str()));
                 let cmdline = read_proc_cmdline(entry.pid);
                 items.push(FolderProcItem {
                     pid: entry.pid,
@@ -601,6 +608,9 @@ fn folder_proc_worker_loop() {
                     cmdline,
                     parent_name: entry.parent_name.as_str().to_owned(),
                     app_icon_path,
+                    origin_app_name: entry.origin_app_name.as_str().to_owned(),
+                    origin_app_icon_path,
+                    origin_chain: entry.origin_chain.as_str().to_owned(),
                     cpu_pct: entry.cpu_pct,
                     gpu_pct: entry.gpu_pct,
                     mem_bytes: entry.mem_bytes,
@@ -1275,14 +1285,43 @@ mod macos {
         let mut cwd_buf = [0u8; MAXPATHLEN];
 
         for &raw_pid in pid_slice {
-            if raw_pid < 0 {
+            // Skip PID 0 (`kernel_task`) and PID 1 (`launchd`) so top-level apps sit cleanly at
+            // depth 0 in `top` while root bridge processes like `/usr/bin/login` stay in the tree.
+            if raw_pid <= 1 {
                 continue;
             }
             let pid = raw_pid as u32;
 
-            let Ok(bsd) = macos_proc::proc_bsd_info(raw_pid) else {
-                continue;
+            let (bsd_info, kinfo_basic) = match macos_proc::proc_bsd_info(raw_pid) {
+                Ok(bsd) => (Some(bsd), None),
+                Err(_) => match macos_proc::proc_kinfo_basic(raw_pid) {
+                    Ok(ki) => (None, Some(ki)),
+                    Err(_) => continue,
+                },
             };
+
+            let (proc_pid, ppid, uid, start_time_secs, bsd_name, bsd_comm, trunc_cap) =
+                match (&bsd_info, &kinfo_basic) {
+                    (Some(bsd), _) => (
+                        bsd.pid,
+                        bsd.ppid,
+                        bsd.uid,
+                        bsd.start_time_secs,
+                        std::str::from_utf8(bsd.name_bytes()).unwrap_or(""),
+                        c_bytes_to_str(&bsd.comm),
+                        31usize,
+                    ),
+                    (_, Some(ki)) => (
+                        ki.pid,
+                        ki.ppid,
+                        0,
+                        ki.start_time_secs,
+                        std::str::from_utf8(ki.name_bytes()).unwrap_or(""),
+                        "",
+                        16usize,
+                    ),
+                    (None, None) => unreachable!(),
+                };
 
             // Executable path & `.app` bundle path.
             let exe_path_str = match macos_proc::proc_exe_path(raw_pid, &mut path_buf) {
@@ -1295,17 +1334,14 @@ mod macos {
             let app_bundle_path =
                 extract_app_bundle_path(&exe_path_str).map(|s| AString::from_str_in(s, alloc));
 
-            // Prefer `pbi_name` (32 chars) over `pbi_comm` (16 chars); if `pbi_name` hit the
-            // 31-byte kernel truncation cap and the executable basename extends it, use the full
-            // basename.
-            let bsd_name = std::str::from_utf8(bsd.name_bytes()).unwrap_or("");
-            let bsd_comm = c_bytes_to_str(&bsd.comm);
+            // Prefer `pbi_name` (32 chars) over `pbi_comm` (16 chars); if the kernel name hit its
+            // truncation cap and the executable basename extends it, use the full basename.
             let exe_basename = Path::new(&exe_path_str)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             let chosen_name = if !bsd_name.is_empty() {
-                if bsd_name.len() >= 31 && exe_basename.starts_with(bsd_name) {
+                if bsd_name.len() >= trunc_cap && exe_basename.starts_with(bsd_name) {
                     exe_basename
                 } else {
                     bsd_name
@@ -1352,9 +1388,9 @@ mod macos {
             };
 
             out.push(RawProcess {
-                pid: bsd.pid,
-                ppid: bsd.ppid,
-                uid: bsd.uid,
+                pid: proc_pid,
+                ppid,
+                uid,
                 name: AString::from_str_in(chosen_name, alloc),
                 exe_path: AString::from_str_in(&exe_path_str, alloc),
                 cwd,
@@ -1366,7 +1402,7 @@ mod macos {
                 disk_read_bytes,
                 disk_write_bytes,
                 threads,
-                start_time_secs: bsd.start_time_secs,
+                start_time_secs,
             });
         }
 

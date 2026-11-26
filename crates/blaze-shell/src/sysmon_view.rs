@@ -28,6 +28,9 @@ const FILTER_H: f32 = 26.0;
 const FILTER_GAP: f32 = 6.0;
 const TABLE_HEADER_H: f32 = 24.0;
 const ROW_H: f32 = 22.0;
+const TREE_BASE_X: f32 = 13.0;
+const TREE_INDENT: f32 = 18.0;
+const TREE_MAX_VISUAL_DEPTH: usize = 10;
 const FOOTER_GAP: f32 = 6.0;
 const FOOTER_H: f32 = 24.0;
 const PAD_Y: f32 = 10.0;
@@ -1592,40 +1595,128 @@ fn draw_process_cell(
     clip_id: u32,
 ) {
     let pclip = intersect_clip(scene, clip_id, x0, ry0, x1, ry1, 0.0);
-    let mut cx = x0 + 6.0;
-    let mono_ty = center_text_y(ry0, ROW_H, m.line_h(TextFace::Mono));
     let ui_ty = center_text_y(ry0, ROW_H, m.line_h(TextFace::Ui));
+    let mut cx;
 
-    // Tree connectors + clickable fold chevron
+    // Pixel-snapped GPU vector tree guides + crisp disclosure chevron
     if tree_mode {
-        let prefix = row.tree_prefix.as_str();
-        if !prefix.is_empty() {
-            scene.text(cx, mono_ty, prefix, theme::INK_4, false, false, pclip);
-            cx += m.measure(prefix, TextFace::Mono);
+        let guide_col = theme::rgba(0xff, 0xff, 0xff, 0.13);
+        let active_guide_col = if selected {
+            theme::rgba(0x7c, 0xb7, 0xff, 0.42)
+        } else {
+            theme::rgba(0xff, 0xff, 0xff, 0.17)
+        };
+        let chev_col = if selected { theme::INK_1 } else { theme::INK_2 };
+
+        let depth = (row.depth as usize).min(TREE_MAX_VISUAL_DEPTH);
+        let stem_x = |lvl: usize| (x0 + TREE_BASE_X + lvl as f32 * TREE_INDENT).round();
+        let cy = (ry0 + ROW_H * 0.5).round();
+        let my_x = stem_x(depth);
+
+        // Pass-through vertical ancestor guides
+        for lvl in 0..depth.saturating_sub(1) {
+            if (row.ancestor_mask >> lvl) & 1 != 0 {
+                let sx = stem_x(lvl);
+                scene.round_rect(sx - 0.5, ry0, sx + 0.5, ry1, 0.0, guide_col, 0.0, [0.0; 4], pclip);
+            }
         }
-        let chev_w = 14.0;
-        if row.has_children {
-            let chev = if row.collapsed { "▸" } else { "▾" };
-            scene.ui_small(
-                cx + 1.0,
-                center_text_y(ry0, ROW_H, m.line_h(TextFace::UiSmall)),
-                chev,
-                theme::INK_2,
-                true,
-                false,
+
+        // Incoming L/T connector
+        if depth >= 1 {
+            let sx = stem_x(depth - 1);
+            if row.is_last_sibling {
+                scene.round_rect(
+                    sx - 0.5,
+                    ry0,
+                    sx + 0.5,
+                    cy + 0.5,
+                    0.0,
+                    active_guide_col,
+                    0.0,
+                    [0.0; 4],
+                    pclip,
+                );
+            } else if selected {
+                scene.round_rect(
+                    sx - 0.5,
+                    ry0,
+                    sx + 0.5,
+                    cy + 0.5,
+                    0.0,
+                    active_guide_col,
+                    0.0,
+                    [0.0; 4],
+                    pclip,
+                );
+                scene.round_rect(
+                    sx - 0.5,
+                    cy + 0.5,
+                    sx + 0.5,
+                    ry1,
+                    0.0,
+                    guide_col,
+                    0.0,
+                    [0.0; 4],
+                    pclip,
+                );
+            } else {
+                scene.round_rect(sx - 0.5, ry0, sx + 0.5, ry1, 0.0, guide_col, 0.0, [0.0; 4], pclip);
+            }
+
+            let branch_x1 = if row.has_children { my_x - 6.5 } else { my_x + 5.0 };
+            if branch_x1 > sx - 0.5 {
+                scene.round_rect(
+                    sx - 0.5,
+                    cy - 0.5,
+                    branch_x1,
+                    cy + 0.5,
+                    0.0,
+                    active_guide_col,
+                    0.0,
+                    [0.0; 4],
+                    pclip,
+                );
+            }
+        }
+
+        // Parent-to-child drop connector (meets first child's ry0 with zero vertical gap)
+        if row.has_children && !row.collapsed {
+            scene.round_rect(
+                my_x - 0.5,
+                cy + 6.0,
+                my_x + 0.5,
+                ry1,
+                0.0,
+                guide_col,
+                0.0,
+                [0.0; 4],
                 pclip,
             );
+        }
+
+        // Crisp GPU vector disclosure chevron + hit target
+        if row.has_children {
+            if row.collapsed {
+                scene.line(my_x - 2.0, cy - 3.5, my_x + 2.0, cy, 1.35, chev_col, pclip);
+                scene.line(my_x + 2.0, cy, my_x - 2.0, cy + 3.5, 1.35, chev_col, pclip);
+            } else {
+                scene.line(my_x - 3.5, cy - 1.5, my_x, cy + 2.2, 1.35, chev_col, pclip);
+                scene.line(my_x, cy + 2.2, my_x + 3.5, cy - 1.5, 1.35, chev_col, pclip);
+            }
             scene.push_hit_clipped(
-                HitRect::new((cx - 2.0).max(x0), ry0, (cx + chev_w).min(x1), ry1),
+                HitRect::new((my_x - 8.0).max(x0), ry0, (my_x + 8.0).min(x1), ry1),
                 pclip,
                 HitAction::SysMonToggleCollapse { block: block_id, pid: row.pid },
             );
         }
-        cx += chev_w;
+
+        cx = my_x + 9.5;
+    } else {
+        cx = x0 + 8.0;
     }
 
     // Icon: real macOS `.app` Retina icon, else IntelliJ SVG icon, else subtle rounded glyph badge
-    let icon_size = 15.0;
+    let icon_size = 16.0;
     let icon_y = ry0 + (ROW_H - icon_size) * 0.5;
     if cx + icon_size < x1 {
         let app_icon = row
@@ -1639,7 +1730,7 @@ fn draw_process_cell(
         } else {
             draw_process_glyph_badge(scene, row.name.as_str(), cx, icon_y, icon_size, m, pclip);
         }
-        cx += icon_size + 5.5;
+        cx += icon_size + 6.0;
     }
 
     // Reserve space for `+N` collapsed child count pill if present
