@@ -202,7 +202,7 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     let base = fresh_home("build_scripts_cfg", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home, &at);
+    put_module(&home, &at.join("app"));
     let (_, said) = check(&at, &home);
     assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
     // The status is not read: while the borrow check's findings stay notes, every check ends
@@ -270,7 +270,7 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     let base = fresh_home("build_scripts_engine", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home, &at);
+    put_module(&home, &at.join("app"));
     let (_, said) = check(&at, &home);
     // Not the status: every check ends "incomplete: NOT checked: borrows" for now.
     assert!(said.contains("0 errors: blaze check") && !said.contains("not checked because"), "check of the fixture failed:\n{said}");
