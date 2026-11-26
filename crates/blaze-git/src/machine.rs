@@ -18,8 +18,9 @@ use blaze_own::{AString, AVec, Alloc, String, Vec, planted::Planted};
 
 use crate::{
     AheadBehindMode, ChangeKind, ChangedSample, Detail, Divergence, ErrorKind, FileKind, FileStat,
-    GitError, GitFile, GitStatusPlant, Head, PromptStatus, RepoState, ShortOid, StatusCounts,
-    StatusOpts, TagMode, Truncated, UntrackedMode, Upstream, WorktreeKind,
+    FileStatus, GitError, GitFile, GitStatusPlant, Head, PromptStatus, RepoState, ShortOid,
+    StatusCounts, StatusEntry, StatusOpts, TagMode, Truncated, UntrackedMode, Upstream,
+    WorktreeKind,
     commit_graph::{CommitGraph, parse_graph_chain},
     ignore::IgnoreStack,
     index::{IndexEntry, IndexView, OwnedIndex},
@@ -308,6 +309,8 @@ pub struct StatusMachine<'a, P: Planted<GitStatusPlant>> {
     // Working-tree status tracking.
     counts: StatusCounts,
     changed_samples: AVec<'a, ChangedSample<'a>>,
+    entries: AVec<'a, StatusEntry<'a>>,
+    staged_entries_drained: bool,
     truncated: Truncated,
     ignores: IgnoreStack<'a>,
 
@@ -322,6 +325,8 @@ pub struct StatusMachine<'a, P: Planted<GitStatusPlant>> {
     pending_ignore_dirs: AVec<'a, AString<'a>>,
     /// Next collapse group id and whether each collapse group has already found an untracked file.
     collapse_found: AVec<'a, bool>,
+    /// Root directory path (with trailing `/`) for each collapse group (populated in `Detail::Full`).
+    collapse_roots: AVec<'a, AString<'a>>,
     worktree_entries_seen: u32,
     /// Reusable scratch path buffer for ignore checks (zero per-entry allocations).
     child_scratch: AString<'a>,
@@ -407,6 +412,8 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             graph_layer_oids: Vec::new_in(alloc),
             counts: StatusCounts::default(),
             changed_samples: Vec::new_in(alloc),
+            entries: Vec::new_in(alloc),
+            staged_entries_drained: false,
             truncated: Truncated::default(),
             ignores: IgnoreStack::new(opts.limits, alloc),
             verified_entries: Vec::new_in(alloc),
@@ -414,6 +421,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             buffered_dirs: Vec::new_in(alloc),
             pending_ignore_dirs: Vec::new_in(alloc),
             collapse_found: Vec::new_in(alloc),
+            collapse_roots: Vec::new_in(alloc),
             worktree_entries_seen: 0,
             child_scratch: String::with_capacity_in(256, alloc),
             stat_pending_indices: Vec::new_in(alloc),
@@ -971,12 +979,14 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                     let Some(bytes) = maybe_bytes.as_deref() else {
                         self.counts.deleted = self.counts.deleted.saturating_add(1);
                         self.record_sample_bytes(path_bytes, ChangeKind::Deleted);
+                        self.record_worktree_entry(path_bytes, FileStatus::Deleted);
                         continue;
                     };
                     let blob_oid = hash_worktree_blob(bytes, autocrlf, self.alloc);
                     if blob_oid != entry.oid {
                         self.counts.modified = self.counts.modified.saturating_add(1);
                         self.record_sample_bytes(path_bytes, ChangeKind::Modified);
+                        self.record_worktree_entry(path_bytes, FileStatus::Modified);
                     }
                 }
                 self.index = Some(owned_idx);
@@ -1004,11 +1014,13 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                     let Some(target) = maybe_target.as_deref() else {
                         self.counts.typechanged = self.counts.typechanged.saturating_add(1);
                         self.record_sample_bytes(path_bytes, ChangeKind::Modified);
+                        self.record_worktree_entry(path_bytes, FileStatus::TypeChanged);
                         continue;
                     };
                     if Oid::of(ObjectKind::Blob, target) != entry.oid {
                         self.counts.modified = self.counts.modified.saturating_add(1);
                         self.record_sample_bytes(path_bytes, ChangeKind::Modified);
+                        self.record_worktree_entry(path_bytes, FileStatus::Modified);
                     }
                 }
                 self.index = Some(owned_idx);
@@ -1310,6 +1322,15 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                             None => {
                                 let g = self.collapse_found.len() as u32;
                                 self.collapse_found.push(false);
+                                if self.opts.detail == Detail::Full {
+                                    let mut root = String::with_capacity_in(
+                                        self.child_scratch.len() + 1,
+                                        self.alloc,
+                                    );
+                                    root.push_str(self.child_scratch.as_str());
+                                    root.push('/');
+                                    self.collapse_roots.push(root);
+                                }
                                 g
                             }
                         };
@@ -1330,6 +1351,12 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                         });
                     }
                 } else {
+                    // Skip unmerged conflicted paths (present at index stage 1..=3): never untracked.
+                    if let Some(idx) = parsed
+                        && idx.has_conflict(self.child_scratch.as_bytes())
+                    {
+                        continue;
+                    }
                     if presence_untracked_done {
                         continue;
                     }
@@ -1341,11 +1368,29 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                             self.collapse_found[group_id as usize] = true;
                             self.counts.untracked = self.counts.untracked.saturating_add(1);
                             self.record_child_scratch(ChangeKind::Untracked);
+                            if self.opts.detail == Detail::Full
+                                && let Some(root) = self.collapse_roots.get(group_id as usize)
+                            {
+                                self.entries.push(StatusEntry {
+                                    path: String::from_str_in(root.as_str(), self.alloc),
+                                    index: FileStatus::Untracked,
+                                    worktree: FileStatus::Untracked,
+                                    unmerged: false,
+                                });
+                            }
                         }
                         break;
                     } else {
                         self.counts.untracked = self.counts.untracked.saturating_add(1);
                         self.record_child_scratch(ChangeKind::Untracked);
+                        if self.opts.detail == Detail::Full && !self.child_scratch.is_empty() {
+                            self.entries.push(StatusEntry {
+                                path: String::from_str_in(self.child_scratch.as_str(), self.alloc),
+                                index: FileStatus::Untracked,
+                                worktree: FileStatus::Untracked,
+                                unmerged: false,
+                            });
+                        }
                     }
                 }
             }
@@ -1368,7 +1413,8 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                         if !listing.has_name(sub) {
                             while i < wd.index_end {
                                 let e2 = &idx.entries[i];
-                                let r2 = &idx.path_bytes(e2)[prefix_len..];
+                                let p2 = idx.path_bytes(e2);
+                                let r2 = &p2[prefix_len..];
                                 if r2.len() > slash && r2[..slash] == *sub && r2[slash] == b'/' {
                                     if !self.verified_entries[i]
                                         && !e2.assume_valid
@@ -1378,6 +1424,8 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                                     {
                                         self.counts.deleted = self.counts.deleted.saturating_add(1);
                                         self.verified_entries[i] = true;
+                                        self.record_sample_bytes(p2, ChangeKind::Deleted);
+                                        self.record_worktree_entry(p2, FileStatus::Deleted);
                                     }
                                     i += 1;
                                 } else {
@@ -1403,8 +1451,11 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                             && !entry.is_sparse_dir()
                             && !entry.is_gitlink()
                         {
+                            let p = idx.path_bytes(entry);
                             self.counts.deleted = self.counts.deleted.saturating_add(1);
                             self.verified_entries[i] = true;
+                            self.record_sample_bytes(p, ChangeKind::Deleted);
+                            self.record_worktree_entry(p, FileStatus::Deleted);
                         }
                         i += 1;
                     }
@@ -1413,6 +1464,20 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
         }
         self.index = owned_opt;
         Ok(())
+    }
+
+    fn record_worktree_entry(&mut self, path: &[u8], status: FileStatus) {
+        if self.opts.detail != Detail::Full || path.is_empty() {
+            return;
+        }
+        if let Ok(s) = core::str::from_utf8(path) {
+            self.entries.push(StatusEntry {
+                path: String::from_str_in(s, self.alloc),
+                index: FileStatus::Unmodified,
+                worktree: status,
+                unmerged: false,
+            });
+        }
     }
 
     fn record_child_scratch(&mut self, kind: ChangeKind) {
@@ -1447,11 +1512,13 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
         if stat.kind == FileKind::Gone {
             self.counts.deleted = self.counts.deleted.saturating_add(1);
             self.record_sample_bytes(path_bytes, ChangeKind::Deleted);
+            self.record_worktree_entry(path_bytes, FileStatus::Deleted);
             return;
         }
         if entry.intent_to_add {
             self.counts.modified = self.counts.modified.saturating_add(1);
             self.record_sample_bytes(path_bytes, ChangeKind::Modified);
+            self.record_worktree_entry(path_bytes, FileStatus::Added);
             return;
         }
         let want_kind = if entry.is_symlink() {
@@ -1464,6 +1531,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
         if stat.kind != want_kind {
             self.counts.typechanged = self.counts.typechanged.saturating_add(1);
             self.record_sample_bytes(path_bytes, ChangeKind::Modified);
+            self.record_worktree_entry(path_bytes, FileStatus::TypeChanged);
             return;
         }
 
@@ -1473,6 +1541,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
         if mode_differs {
             self.counts.modified = self.counts.modified.saturating_add(1);
             self.record_sample_bytes(path_bytes, ChangeKind::Modified);
+            self.record_worktree_entry(path_bytes, FileStatus::Modified);
             return;
         }
 
@@ -1485,6 +1554,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
         if size_differs_definitively {
             self.counts.modified = self.counts.modified.saturating_add(1);
             self.record_sample_bytes(path_bytes, ChangeKind::Modified);
+            self.record_worktree_entry(path_bytes, FileStatus::Modified);
             return;
         }
 
@@ -1601,6 +1671,22 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                     self.counts.staged_modified = sc.modified;
                     self.counts.staged_deleted = sc.deleted;
                     self.counts.staged_typechanged = sc.typechanged;
+                    if self.opts.detail == Detail::Full && !self.staged_entries_drained {
+                        self.staged_entries_drained = true;
+                        let diff = self.staged_diff.as_mut().unwrap();
+                        let staged = core::mem::replace(
+                            &mut diff.staged_entries,
+                            Vec::new_in(self.alloc),
+                        );
+                        for (path, st) in staged {
+                            self.entries.push(StatusEntry {
+                                path,
+                                index: st,
+                                worktree: FileStatus::Unmodified,
+                                unmerged: false,
+                            });
+                        }
+                    }
                     break;
                 }
                 self.staged_diff.as_ref().unwrap().needed_trees(&mut tree_oids);
@@ -1937,6 +2023,55 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             divergence: self.divergence,
         });
 
+        let mut entries = core::mem::replace(&mut self.entries, Vec::new_in(self.alloc));
+        if self.opts.detail == Detail::Full {
+            if let Some(owned) = &self.index {
+                let view = owned.view();
+                for c in view.conflicts.iter() {
+                    if let Ok(s) = core::str::from_utf8(view.conflict_path_bytes(c)) {
+                        let (x, y) = conflict_xy(c.stage_mask);
+                        entries.push(StatusEntry {
+                            path: String::from_str_in(s, self.alloc),
+                            index: x,
+                            worktree: y,
+                            unmerged: true,
+                        });
+                    }
+                }
+            }
+            if entries.len() > 1 {
+                entries.sort_unstable_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+                // Coalesce entries sharing the exact same path (e.g. staged + unstaged edit -> MM).
+                let mut merged: AVec<'a, StatusEntry<'a>> =
+                    Vec::with_capacity_in(entries.len(), self.alloc);
+                for e in entries {
+                    if let Some(prev) = merged.last_mut()
+                        && prev.path.as_str() == e.path.as_str()
+                    {
+                        if e.unmerged {
+                            prev.index = e.index;
+                            prev.worktree = e.worktree;
+                            prev.unmerged = true;
+                        } else if !prev.unmerged {
+                            if e.index != FileStatus::Unmodified
+                                && e.index != FileStatus::Untracked
+                            {
+                                prev.index = e.index;
+                            }
+                            if e.worktree != FileStatus::Unmodified
+                                && e.worktree != FileStatus::Untracked
+                            {
+                                prev.worktree = e.worktree;
+                            }
+                        }
+                    } else {
+                        merged.push(e);
+                    }
+                }
+                entries = merged;
+            }
+        }
+
         PromptStatus {
             head,
             tag: self.tag.take(),
@@ -1946,7 +2081,22 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             worktree: self.worktree_kind,
             truncated: self.truncated,
             changed_samples: core::mem::replace(&mut self.changed_samples, Vec::new_in(self.alloc)),
+            entries,
         }
+    }
+}
+
+/// Map Git index conflict stage bitmask (bit 1 = base, bit 2 = ours, bit 3 = theirs)
+/// to exact Git porcelain v1 `(X, Y)` codes.
+fn conflict_xy(stage_mask: u8) -> (FileStatus, FileStatus) {
+    match stage_mask & 0b1110 {
+        0b0010 => (FileStatus::Deleted, FileStatus::Deleted),     // DD: both deleted
+        0b0100 => (FileStatus::Added, FileStatus::Unmerged),      // AU: added by us
+        0b0110 => (FileStatus::Unmerged, FileStatus::Deleted),    // UD: deleted by them
+        0b1000 => (FileStatus::Unmerged, FileStatus::Added),      // UA: added by them
+        0b1010 => (FileStatus::Deleted, FileStatus::Unmerged),    // DU: deleted by us
+        0b1100 => (FileStatus::Added, FileStatus::Added),         // AA: both added
+        _ => (FileStatus::Unmerged, FileStatus::Unmerged),        // UU: both modified
     }
 }
 

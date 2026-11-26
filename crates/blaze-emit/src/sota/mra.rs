@@ -757,6 +757,7 @@ fn visit_op_uses(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(MReg))
         | MOp::Mul { rn: a, rm: b, .. }
         | MOp::Umulh { rn: a, rm: b, .. }
         | MOp::Smulh { rn: a, rm: b, .. }
+        | MOp::CarryAddSub { rn: a, rm: b, .. }
         | MOp::Udiv { rn: a, rm: b, .. }
         | MOp::Sdiv { rn: a, rm: b, .. }
         | MOp::Umin { rn: a, rm: b, .. }
@@ -876,6 +877,7 @@ fn visit_op_defs(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(MReg))
         | MOp::Msub { dst, .. }
         | MOp::Umulh { dst, .. }
         | MOp::Smulh { dst, .. }
+        | MOp::CarryAddSub { dst, .. }
         | MOp::Udiv { dst, .. }
         | MOp::Sdiv { dst, .. }
         | MOp::Umin { dst, .. }
@@ -1131,6 +1133,13 @@ fn remap_op_regs(
         }
         MOp::Umulh { dst, rn, rm } => MOp::Umulh { dst: map_write(dst, false), rn: map_use(rn), rm: map_use(rm) },
         MOp::Smulh { dst, rn, rm } => MOp::Smulh { dst: map_write(dst, false), rn: map_use(rn), rm: map_use(rm) },
+        MOp::CarryAddSub { dst, rn, rm, is_sub, sets_flags } => MOp::CarryAddSub {
+            dst: map_write(dst, false),
+            rn: map_use(rn),
+            rm: map_use(rm),
+            is_sub,
+            sets_flags,
+        },
         MOp::Udiv { dst, rn, rm, wide } => {
             MOp::Udiv { dst: map_write(dst, false), rn: map_use(rn), rm: map_use(rm), wide }
         }
