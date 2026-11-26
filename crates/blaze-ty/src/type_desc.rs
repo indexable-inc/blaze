@@ -14,7 +14,7 @@ use blaze_own::{Alloc, Vec};
 
 use crate::cx::TyCx;
 use crate::ids::{Arg, Mutability, Region, Ty};
-use crate::pat_ty::{IntInterval, IntPatTy, PatTyError};
+use crate::pat_ty::{ConstPatMember, ConstSetPatTy, IntInterval, IntPatTy, PatTyError};
 use crate::record_ty::{RecordError, RecordTy};
 use crate::union_ty::{UnionError, UnionTy};
 
@@ -52,6 +52,8 @@ pub enum TypeDescNode<'s> {
     Union { start: u32, len: u32 },
     /// Integer pattern type `base is LO..=HI`.
     IntPat { base: DescId, bit_width: u8, signed: bool, lo: i128, hi: i128 },
+    /// Finite const value-set pattern type `base is in CONST_SLICE`.
+    ConstSetPat { base: DescId, structural_eq: bool, start: u32, len: u32 },
 }
 
 /// Resolved output of evaluating a [`TypeDescArena`] root node.
@@ -65,6 +67,8 @@ pub enum EvaluatedDesc<'a, 's> {
     Union(UnionTy<'a>),
     /// Canonical integer pattern type (also interned into `cx.tys` as `ty::PAT`).
     IntPat { ty: Ty, pat: IntPatTy<'a> },
+    /// Canonical finite const value-set pattern type (also interned into `cx.tys` as `ty::PAT`).
+    ConstSetPat { ty: Ty, pat: ConstSetPatTy<'a, 's> },
 }
 
 /// Typed diagnostic returned when a [`TypeDescArena`] description is invalid.
@@ -110,6 +114,7 @@ pub struct TypeDescArena<'a, 's> {
     nodes: Vec<TypeDescNode<'s>, Alloc<'a>>,
     children: Vec<DescId, Alloc<'a>>,
     fields: Vec<FieldDesc<'s>, Alloc<'a>>,
+    const_members: Vec<ConstPatMember<'s>, Alloc<'a>>,
 }
 
 impl<'a, 's> TypeDescArena<'a, 's> {
@@ -119,6 +124,7 @@ impl<'a, 's> TypeDescArena<'a, 's> {
             nodes: Vec::new_in(alloc),
             children: Vec::new_in(alloc),
             fields: Vec::new_in(alloc),
+            const_members: Vec::new_in(alloc),
         }
     }
 
@@ -177,6 +183,19 @@ impl<'a, 's> TypeDescArena<'a, 's> {
         self.push_node(TypeDescNode::IntPat { base, bit_width, signed, lo, hi })
     }
 
+    /// Finite const value-set pattern type `base is in CONST_SLICE`.
+    pub fn const_set_pat(
+        &mut self,
+        base: DescId,
+        structural_eq: bool,
+        members: &[ConstPatMember<'s>],
+    ) -> DescId {
+        let start = u32::try_from(self.const_members.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(members.len()).unwrap_or(u32::MAX);
+        self.const_members.extend_from_slice(members);
+        self.push_node(TypeDescNode::ConstSetPat { base, structural_eq, start, len })
+    }
+
     fn node(&self, id: DescId) -> Result<TypeDescNode<'s>, TypeDescError<'s>> {
         let idx = usize::try_from(id.0).map_err(|_| TypeDescError::InvalidNode(id))?;
         self.nodes.get(idx).copied().ok_or(TypeDescError::InvalidNode(id))
@@ -194,6 +213,18 @@ impl<'a, 's> TypeDescArena<'a, 's> {
         let l = usize::try_from(len).map_err(|_| TypeDescError::InvalidNode(owner))?;
         let e = s.checked_add(l).ok_or(TypeDescError::InvalidNode(owner))?;
         self.fields.get(s..e).ok_or(TypeDescError::InvalidNode(owner))
+    }
+
+    fn const_member_slice(
+        &self,
+        start: u32,
+        len: u32,
+        owner: DescId,
+    ) -> Result<&[ConstPatMember<'s>], TypeDescError<'s>> {
+        let s = usize::try_from(start).map_err(|_| TypeDescError::InvalidNode(owner))?;
+        let l = usize::try_from(len).map_err(|_| TypeDescError::InvalidNode(owner))?;
+        let e = s.checked_add(l).ok_or(TypeDescError::InvalidNode(owner))?;
+        self.const_members.get(s..e).ok_or(TypeDescError::InvalidNode(owner))
     }
 
     /// Evaluates a single [`DescId`] to a plain interned [`Ty`] iteratively (no recursion),
@@ -230,7 +261,8 @@ impl<'a, 's> TypeDescArena<'a, 's> {
                     TypeDescNode::FieldByName { base, .. }
                     | TypeDescNode::Ref { inner: base, .. }
                     | TypeDescNode::Slice(base)
-                    | TypeDescNode::IntPat { base, .. } => {
+                    | TypeDescNode::IntPat { base, .. }
+                    | TypeDescNode::ConstSetPat { base, .. } => {
                         stack.push((base, false));
                     }
                     TypeDescNode::Tuple { start, len } | TypeDescNode::Union { start, len } => {
@@ -331,6 +363,14 @@ impl<'a, 's> TypeDescArena<'a, 's> {
                         .map_err(TypeDescError::Pat)?;
                     pat.intern_into(cx, scratch)
                 }
+                TypeDescNode::ConstSetPat { base, structural_eq, start, len } => {
+                    let bidx = usize::try_from(base.0).map_err(|_| TypeDescError::InvalidNode(base))?;
+                    let base_ty = results.get(bidx).copied().flatten().ok_or(TypeDescError::InvalidNode(base))?;
+                    let members = self.const_member_slice(start, len, id)?;
+                    let pat = ConstSetPatTy::from_values(base_ty, structural_eq, members, scratch)
+                        .map_err(TypeDescError::Pat)?;
+                    pat.intern_into(cx, scratch)
+                }
             };
 
             if let Some(slot) = results.get_mut(idx) {
@@ -383,6 +423,14 @@ impl<'a, 's> TypeDescArena<'a, 's> {
                     .map_err(TypeDescError::Pat)?;
                 let ty = pat.intern_into(cx, alloc);
                 Ok(EvaluatedDesc::IntPat { ty, pat })
+            }
+            TypeDescNode::ConstSetPat { base, structural_eq, start, len } => {
+                let base_ty = self.eval_ty(cx, base, ref_region, &lookup_struct_field, alloc)?;
+                let members = self.const_member_slice(start, len, root)?;
+                let pat = ConstSetPatTy::from_values(base_ty, structural_eq, members, alloc)
+                    .map_err(TypeDescError::Pat)?;
+                let ty = pat.intern_into(cx, alloc);
+                Ok(EvaluatedDesc::ConstSetPat { ty, pat })
             }
             _ => {
                 let ty = self.eval_ty(cx, root, ref_region, &lookup_struct_field, alloc)?;
@@ -489,5 +537,63 @@ mod tests {
             panic!("expected IntPat");
         };
         assert_eq!(pat.niche_count(), 156);
+    }
+
+    #[test]
+    fn type_desc_builds_canonical_const_set_pattern_type_for_semver() {
+        let h = heap();
+        let a = h.alloc();
+        let mut cx = TyCx::new_in(a);
+
+        let semver = cx.tys.adt(Def(99), List::EMPTY);
+        let encode = |major: u16, minor: u16, patch: u16| -> [u8; 6] {
+            let mut out = [0u8; 6];
+            out[0..2].copy_from_slice(&major.to_le_bytes());
+            out[2..4].copy_from_slice(&minor.to_le_bytes());
+            out[4..6].copy_from_slice(&patch.to_le_bytes());
+            out
+        };
+        let b_111 = encode(1, 1, 1);
+        let b_122 = encode(1, 2, 2);
+        let b_345 = encode(3, 4, 5);
+        let v111 = ConstPatMember::from_bytes(&b_111, "1.1.1");
+        let v122 = ConstPatMember::from_bytes(&b_122, "1.2.2");
+        let v345 = ConstPatMember::from_bytes(&b_345, "3.4.5");
+
+        let mut arena = TypeDescArena::new(a);
+        let d_semver = arena.of_ty(semver);
+        let d_versions_a = arena.const_set_pat(d_semver, true, &[v345, v111, v122, v111]);
+        let d_versions_b = arena.const_set_pat(d_semver, true, &[v111, v122, v345]);
+
+        let EvaluatedDesc::ConstSetPat { ty: ty_a, pat } =
+            arena.eval(&mut cx, d_versions_a, Region::STATIC, |_, _| None, a).unwrap()
+        else {
+            panic!("expected ConstSetPat");
+        };
+        let EvaluatedDesc::ConstSetPat { ty: ty_b, .. } =
+            arena.eval(&mut cx, d_versions_b, Region::STATIC, |_, _| None, a).unwrap()
+        else {
+            panic!("expected ConstSetPat");
+        };
+        assert_eq!(ty_a, ty_b);
+        assert_eq!(pat.base(), semver);
+        assert_eq!(pat.values(), &[v111, v122, v345]);
+        assert!(matches!(cx.tys.ty_kind(ty_a), crate::tys::TyKind::Pat(b, _) if b == semver));
+
+        // Also works nested inside a structural record (`eval_ty` path).
+        let d_rec = arena.record(&[FieldDesc { name: "version", ty: d_versions_a }]);
+        let EvaluatedDesc::Record(rec) =
+            arena.eval(&mut cx, d_rec, Region::STATIC, |_, _| None, a).unwrap()
+        else {
+            panic!("expected Record");
+        };
+        assert_eq!(rec.field("version").unwrap().ty, ty_a);
+
+        // Non-`StructuralPartialEq` base is refused through `TypeDescError::Pat`.
+        let d_bad = arena.const_set_pat(d_semver, false, &[v111]);
+        assert_eq!(
+            arena.eval(&mut cx, d_bad, Region::STATIC, |_, _| None, a).unwrap_err(),
+            TypeDescError::Pat(PatTyError::NotStructuralEq)
+        );
     }
 }

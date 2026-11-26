@@ -26,19 +26,33 @@ pub const WASM_VERSION: [u8; 4] = [1, 0, 0, 0];
 
 /// Canonical Wasm64 host import module name for Blaze's sans-IO ring provider.
 pub const HOST_MODULE: &str = "blaze_host_v1";
+/// Number of built-in host imports (`submit_wait`, `host_caps`, `host_log`).
+pub const HOST_IMPORT_COUNT: u32 = 3;
 /// Current sans-IO ring ABI version exported as immutable global `blaze_ring_abi_version`.
 pub const RING_ABI_VERSION: i32 = 1;
+
+/// Built-in host import signatures (type indices `0`, `1`, `2`).
+pub const HOST_IMPORT_SIGS: [(&[ValType], &[ValType]); HOST_IMPORT_COUNT as usize] = [
+    (&[ValType::I64, ValType::I32, ValType::I32, ValType::I64], &[ValType::I32]),
+    (&[ValType::I64, ValType::I32], &[ValType::I32]),
+    (&[ValType::I32, ValType::I64, ValType::I32], &[]),
+];
 
 /// WebAssembly section IDs.
 const SEC_CUSTOM: u8 = 0;
 const SEC_TYPE: u8 = 1;
 const SEC_IMPORT: u8 = 2;
 const SEC_FUNCTION: u8 = 3;
+const SEC_TABLE: u8 = 4;
 const SEC_MEMORY: u8 = 5;
 const SEC_GLOBAL: u8 = 6;
 const SEC_EXPORT: u8 = 7;
+const SEC_ELEMENT: u8 = 9;
 const SEC_CODE: u8 = 10;
 const SEC_DATA: u8 = 11;
+
+/// `funcref` reference type byte for the indirect-call table.
+const FUNCREF: u8 = 0x70;
 
 /// WebAssembly value types.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,15 +112,106 @@ impl Wasm64Opts {
     };
 }
 
+/// One imported host function declared in the Wasm64 Import section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wasm64Import<'a> {
+    pub module: &'a str,
+    pub field: &'a str,
+    pub params: &'a [ValType],
+    pub results: &'a [ValType],
+}
+
+/// One exported global appended after the built-in globals (`$__stack_pointer`, `$__heap_base`,
+/// `blaze_ring_abi_version`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wasm64ExportGlobal<'a> {
+    pub name: &'a str,
+    pub val_type: ValType,
+    pub mutable: bool,
+    pub init_i64: i64,
+}
+
 /// Complete Wasm64 module input to [`export_wasm64`].
 #[derive(Clone, Copy, Debug)]
 pub struct Wasm64Program<'a> {
     pub name: &'a str,
     pub funcs: &'a [Wasm64Func<'a>],
     pub data: &'a [Wasm64Data<'a>],
+    /// Function indices (in Wasm index space: `0..import_count()` for imports,
+    /// `import_count()..` for `funcs`) placed into indirect-call table 0 starting at slot 1
+    /// (slot 0 is reserved as a null-trap entry). When empty, no Table or Element section is
+    /// emitted.
+    pub indirect_table: &'a [u32],
+    /// Additional `(params, results)` function types appended to the Type section after the
+    /// import types and `funcs.len()` module function types, so `call_indirect` can reference
+    /// any signature by deterministic type index.
+    pub extra_types: &'a [(&'a [ValType], &'a [ValType])],
+    /// When `false`, the 3 `blaze_host_v1` imports (`submit_wait`, `host_caps`, `host_log`) are
+    /// emitted at function indices `0..3` before `extra_imports`. When `true`, only
+    /// `extra_imports` are emitted starting at function index `0`.
+    pub omit_blaze_host_v1: bool,
+    /// Additional imported host functions appended after the 3 `blaze_host_v1` imports when
+    /// `!omit_blaze_host_v1`, or starting at function index `0` when `omit_blaze_host_v1`.
+    pub extra_imports: &'a [Wasm64Import<'a>],
+    /// Additional exported globals appended after the 3 built-in globals (`$__stack_pointer`,
+    /// `$__heap_base`, `blaze_ring_abi_version`) and exported by `name`.
+    pub extra_globals: &'a [Wasm64ExportGlobal<'a>],
     /// Optional persisted `BPG1` PGO profile digest embedded into custom section `"blaze.profile"`.
     pub profile_digest: Option<[u8; 32]>,
     pub opts: Wasm64Opts,
+}
+
+impl<'a> Wasm64Program<'a> {
+    /// Number of built-in `blaze_host_v1` imports included in this module (`0` or `3`).
+    #[inline]
+    pub const fn blaze_host_import_count(&self) -> u32 {
+        if self.omit_blaze_host_v1 { 0 } else { HOST_IMPORT_COUNT }
+    }
+
+    /// Total number of imported functions (`blaze_host_v1` when not omitted + `extra_imports`).
+    #[inline]
+    pub const fn import_count(&self) -> u32 {
+        self.blaze_host_import_count() + self.extra_imports.len() as u32
+    }
+
+    /// Deterministic Type section index of `self.extra_types[extra_idx]`.
+    #[inline]
+    pub const fn extra_type_index(&self, extra_idx: usize) -> u32 {
+        self.import_count() + self.funcs.len() as u32 + extra_idx as u32
+    }
+
+    /// Returns the first Type section index matching `(params, results)` across:
+    /// 1. Built-in `blaze_host_v1` import types (`0..HOST_IMPORT_COUNT`, when `!omit_blaze_host_v1`),
+    /// 2. `extra_imports` types (`blaze_host_import_count()..import_count()`),
+    /// 3. Module function types (`import_count()..import_count() + funcs.len()`),
+    /// 4. `extra_types` (`import_count() + funcs.len()..`).
+    pub fn type_index_for(&self, params: &[ValType], results: &[ValType]) -> Option<u32> {
+        let base_imports = self.blaze_host_import_count();
+        if !self.omit_blaze_host_v1 {
+            for (i, &(p, r)) in HOST_IMPORT_SIGS.iter().enumerate() {
+                if p == params && r == results {
+                    return Some(i as u32);
+                }
+            }
+        }
+        for (i, imp) in self.extra_imports.iter().enumerate() {
+            if imp.params == params && imp.results == results {
+                return Some(base_imports + i as u32);
+            }
+        }
+        let import_count = self.import_count();
+        for (i, f) in self.funcs.iter().enumerate() {
+            if f.params == params && f.results == results {
+                return Some(import_count + i as u32);
+            }
+        }
+        for (i, &(p, r)) in self.extra_types.iter().enumerate() {
+            if p == params && r == results {
+                return Some(self.extra_type_index(i));
+            }
+        }
+        None
+    }
 }
 
 /// Summary returned by [`export_wasm64`].
@@ -127,12 +232,15 @@ pub struct Wasm64Exported {
 pub enum Wasm64Error {
     NoStartExport,
     InvalidMemoryRange { min_pages: u64, max_pages: u64 },
+    InvalidTableFunc { func_idx: u32, func_count: u32 },
     DuplicateExport,
     BadMagic,
     BadVersion,
     Truncated,
     SectionOutOfOrder { prev: u8, got: u8 },
     NotMemory64 { flags: u8 },
+    InvalidTable,
+    InvalidElement,
     MissingHostImport,
     MissingMemoryExport,
     DataOffsetNotI64,
@@ -145,6 +253,12 @@ impl fmt::Display for Wasm64Error {
             Wasm64Error::InvalidMemoryRange { min_pages, max_pages } => {
                 write!(f, "wasm64 export: min_pages ({min_pages}) exceeds max_pages ({max_pages})")
             }
+            Wasm64Error::InvalidTableFunc { func_idx, func_count } => {
+                write!(
+                    f,
+                    "wasm64 export: indirect_table function index {func_idx} out of range (total funcs {func_count})"
+                )
+            }
             Wasm64Error::DuplicateExport => write!(f, "wasm64 export: duplicate export name"),
             Wasm64Error::BadMagic => write!(f, "wasm64 check: missing \\0asm magic"),
             Wasm64Error::BadVersion => write!(f, "wasm64 check: unsupported wasm binary version"),
@@ -154,6 +268,12 @@ impl fmt::Display for Wasm64Error {
             }
             Wasm64Error::NotMemory64 { flags } => {
                 write!(f, "wasm64 check: memory limits flags {flags:#x} lack memory64 bit (0x04)")
+            }
+            Wasm64Error::InvalidTable => {
+                write!(f, "wasm64 check: invalid indirect-call table section")
+            }
+            Wasm64Error::InvalidElement => {
+                write!(f, "wasm64 check: invalid element section (expected active i32.const offset)")
             }
             Wasm64Error::MissingHostImport => {
                 write!(f, "wasm64 check: missing required `{HOST_MODULE}` sans-IO ring import")
@@ -175,7 +295,12 @@ pub struct Wasm64Check {
     pub min_pages: u64,
     pub max_pages: Option<u64>,
     pub host_imports: u32,
+    pub import_count: u32,
+    pub has_blaze_host_v1: bool,
     pub func_count: u32,
+    pub global_count: u32,
+    pub table_size: u32,
+    pub elem_count: u32,
     pub export_count: u32,
     pub data_segments: u32,
     pub has_memory_export: bool,
@@ -186,7 +311,7 @@ pub struct Wasm64Check {
 // ---- LEB128 helpers -------------------------------------------------------------------------
 
 #[inline]
-fn push_u32_leb(out: &mut AVec<'_, u8>, mut v: u32) {
+pub(crate) fn push_u32_leb(out: &mut AVec<'_, u8>, mut v: u32) {
     loop {
         let mut byte = (v & 0x7F) as u8;
         v >>= 7;
@@ -201,7 +326,7 @@ fn push_u32_leb(out: &mut AVec<'_, u8>, mut v: u32) {
 }
 
 #[inline]
-fn push_u64_leb(out: &mut AVec<'_, u8>, mut v: u64) {
+pub(crate) fn push_u64_leb(out: &mut AVec<'_, u8>, mut v: u64) {
     loop {
         let mut byte = (v & 0x7F) as u8;
         v >>= 7;
@@ -216,7 +341,7 @@ fn push_u64_leb(out: &mut AVec<'_, u8>, mut v: u64) {
 }
 
 #[inline]
-fn push_i32_leb(out: &mut AVec<'_, u8>, mut v: i32) {
+pub(crate) fn push_i32_leb(out: &mut AVec<'_, u8>, mut v: i32) {
     loop {
         let byte = (v & 0x7F) as u8;
         v >>= 7;
@@ -229,7 +354,7 @@ fn push_i32_leb(out: &mut AVec<'_, u8>, mut v: i32) {
 }
 
 #[inline]
-fn push_i64_leb(out: &mut AVec<'_, u8>, mut v: i64) {
+pub(crate) fn push_i64_leb(out: &mut AVec<'_, u8>, mut v: i64) {
     loop {
         let byte = (v & 0x7F) as u8;
         v >>= 7;
@@ -281,8 +406,10 @@ pub fn export_wasm64<'a>(
     }
 
     let mut has_start = false;
+    let mut exported_funcs = 0u32;
     for (idx, f) in program.funcs.iter().enumerate() {
         if let Some(name) = f.export_name {
+            exported_funcs += 1;
             if name == "_start" {
                 has_start = true;
             }
@@ -296,8 +423,36 @@ pub fn export_wasm64<'a>(
             }
         }
     }
-    if !has_start {
+    for (idx, g) in program.extra_globals.iter().enumerate() {
+        if g.name == "memory" || g.name == "blaze_ring_abi_version" {
+            return Err(Wasm64Error::DuplicateExport);
+        }
+        for f in program.funcs {
+            if f.export_name == Some(g.name) {
+                return Err(Wasm64Error::DuplicateExport);
+            }
+        }
+        for prev in &program.extra_globals[..idx] {
+            if prev.name == g.name {
+                return Err(Wasm64Error::DuplicateExport);
+            }
+        }
+    }
+    if program.omit_blaze_host_v1 {
+        if exported_funcs == 0 {
+            return Err(Wasm64Error::NoStartExport);
+        }
+    } else if !has_start {
         return Err(Wasm64Error::NoStartExport);
+    }
+
+    let base_imports = program.blaze_host_import_count();
+    let import_count = program.import_count();
+    let total_funcs = import_count + program.funcs.len() as u32;
+    for &func_idx in program.indirect_table {
+        if func_idx >= total_funcs {
+            return Err(Wasm64Error::InvalidTableFunc { func_idx, func_count: total_funcs });
+        }
     }
 
     out.clear();
@@ -307,38 +462,69 @@ pub fn export_wasm64<'a>(
     let mut sec = Vec::new_in(alloc);
 
     // ---- 1. Type Section -------------------------------------------------------------------
-    // Type 0: submit_wait(i64, i32, i32, i64) -> i32
-    // Type 1: host_caps(i64, i32) -> i32
-    // Type 2: host_log(i32, i64, i32) -> ()
-    // Types 3..3+N: one per guest function.
+    // Deterministic order matching `Wasm64Program::type_index_for` & `extra_type_index`:
+    // - When `!omit_blaze_host_v1`: types 0..3 for `submit_wait`, `host_caps`, `host_log`.
+    // - Next `extra_imports.len()`: one per `extra_imports` entry.
+    // - Next `funcs.len()`: one per guest function.
+    // - Final `extra_types.len()`: one per `extra_types` entry (for `call_indirect`).
     sec.clear();
-    push_u32_leb(&mut sec, 3 + program.funcs.len() as u32);
-    push_functype(&mut sec, &[ValType::I64, ValType::I32, ValType::I32, ValType::I64], &[ValType::I32]);
-    push_functype(&mut sec, &[ValType::I64, ValType::I32], &[ValType::I32]);
-    push_functype(&mut sec, &[ValType::I32, ValType::I64, ValType::I32], &[]);
+    let type_count =
+        import_count + program.funcs.len() as u32 + program.extra_types.len() as u32;
+    push_u32_leb(&mut sec, type_count);
+    if !program.omit_blaze_host_v1 {
+        for &(params, results) in &HOST_IMPORT_SIGS {
+            push_functype(&mut sec, params, results);
+        }
+    }
+    for imp in program.extra_imports {
+        push_functype(&mut sec, imp.params, imp.results);
+    }
     for f in program.funcs {
         push_functype(&mut sec, f.params, f.results);
     }
+    for &(params, results) in program.extra_types {
+        push_functype(&mut sec, params, results);
+    }
     push_section(out, SEC_TYPE, &sec);
 
-    // ---- 2. Import Section (3 imports from "blaze_host_v1") --------------------------------
-    sec.clear();
-    push_u32_leb(&mut sec, 3);
-    for (name, ty_idx) in [("submit_wait", 0u32), ("host_caps", 1u32), ("host_log", 2u32)] {
-        push_name(&mut sec, HOST_MODULE);
-        push_name(&mut sec, name);
-        sec.push(0x00); // func import
-        push_u32_leb(&mut sec, ty_idx);
+    // ---- 2. Import Section -----------------------------------------------------------------
+    if import_count > 0 {
+        sec.clear();
+        push_u32_leb(&mut sec, import_count);
+        if !program.omit_blaze_host_v1 {
+            for (name, ty_idx) in [("submit_wait", 0u32), ("host_caps", 1u32), ("host_log", 2u32)] {
+                push_name(&mut sec, HOST_MODULE);
+                push_name(&mut sec, name);
+                sec.push(0x00); // func import
+                push_u32_leb(&mut sec, ty_idx);
+            }
+        }
+        for (i, imp) in program.extra_imports.iter().enumerate() {
+            push_name(&mut sec, imp.module);
+            push_name(&mut sec, imp.field);
+            sec.push(0x00); // func import
+            push_u32_leb(&mut sec, base_imports + i as u32);
+        }
+        push_section(out, SEC_IMPORT, &sec);
     }
-    push_section(out, SEC_IMPORT, &sec);
 
     // ---- 3. Function Section ---------------------------------------------------------------
     sec.clear();
     push_u32_leb(&mut sec, program.funcs.len() as u32);
     for i in 0..program.funcs.len() {
-        push_u32_leb(&mut sec, 3 + i as u32);
+        push_u32_leb(&mut sec, import_count + i as u32);
     }
     push_section(out, SEC_FUNCTION, &sec);
+
+    // ---- 4. Table Section (funcref, 32-bit limits; slot 0 reserved as null trap) -----------
+    if !program.indirect_table.is_empty() {
+        sec.clear();
+        push_u32_leb(&mut sec, 1);
+        sec.push(FUNCREF);
+        sec.push(0x00); // table32 limits: min only (table indices remain i32 in memory64)
+        push_u32_leb(&mut sec, 1 + program.indirect_table.len() as u32);
+        push_section(out, SEC_TABLE, &sec);
+    }
 
     // ---- 5. Memory Section (`memory64`: flags 0x04 or 0x05, u64 LEB128 pages) --------------
     sec.clear();
@@ -360,8 +546,9 @@ pub fn export_wasm64<'a>(
     // Global 0: $__stack_pointer (mut i64)
     // Global 1: $__heap_base (const i64)
     // Global 2: $blaze_ring_abi_version (const i32)
+    // Globals 3..3+G: extra exported globals (`program.extra_globals`)
     sec.clear();
-    push_u32_leb(&mut sec, 3);
+    push_u32_leb(&mut sec, 3 + program.extra_globals.len() as u32);
     // Global 0: mut i64
     sec.push(ValType::I64 as u8);
     sec.push(0x01); // mut
@@ -380,15 +567,34 @@ pub fn export_wasm64<'a>(
     sec.push(0x41); // i32.const
     push_i32_leb(&mut sec, RING_ABI_VERSION);
     sec.push(0x0B); // end
+    // Extra globals
+    for g in program.extra_globals {
+        sec.push(g.val_type as u8);
+        sec.push(if g.mutable { 0x01 } else { 0x00 });
+        match g.val_type {
+            ValType::I32 => {
+                sec.push(0x41); // i32.const
+                push_i32_leb(&mut sec, g.init_i64 as i32);
+            }
+            ValType::I64 => {
+                sec.push(0x42); // i64.const
+                push_i64_leb(&mut sec, g.init_i64);
+            }
+            ValType::F32 => {
+                sec.push(0x43); // f32.const
+                sec.extend_from_slice(&(g.init_i64 as u32).to_le_bytes());
+            }
+            ValType::F64 => {
+                sec.push(0x44); // f64.const
+                sec.extend_from_slice(&(g.init_i64 as u64).to_le_bytes());
+            }
+        }
+        sec.push(0x0B); // end
+    }
     push_section(out, SEC_GLOBAL, &sec);
 
     // ---- 7. Export Section -----------------------------------------------------------------
-    let mut export_count = 2u32; // "memory" + "blaze_ring_abi_version"
-    for f in program.funcs {
-        if f.export_name.is_some() {
-            export_count += 1;
-        }
-    }
+    let export_count = 2u32 + exported_funcs + program.extra_globals.len() as u32;
     sec.clear();
     push_u32_leb(&mut sec, export_count);
     // Export memory 0
@@ -399,15 +605,36 @@ pub fn export_wasm64<'a>(
     push_name(&mut sec, "blaze_ring_abi_version");
     sec.push(0x03); // global
     push_u32_leb(&mut sec, 2);
-    // Export guest functions (function indices start at 3 after the 3 host imports)
+    // Export guest functions (function indices start at `import_count`)
     for (i, f) in program.funcs.iter().enumerate() {
         if let Some(name) = f.export_name {
             push_name(&mut sec, name);
             sec.push(0x00); // func
-            push_u32_leb(&mut sec, 3 + i as u32);
+            push_u32_leb(&mut sec, import_count + i as u32);
         }
     }
+    // Export extra globals (global indices start at 3)
+    for (i, g) in program.extra_globals.iter().enumerate() {
+        push_name(&mut sec, g.name);
+        sec.push(0x03); // global
+        push_u32_leb(&mut sec, 3 + i as u32);
+    }
     push_section(out, SEC_EXPORT, &sec);
+
+    // ---- 9. Element Section (active segment at i32.const 1 populating table 0) -------------
+    if !program.indirect_table.is_empty() {
+        sec.clear();
+        push_u32_leb(&mut sec, 1); // 1 element segment
+        sec.push(0x00); // active segment, table 0, vec(funcidx)
+        sec.push(0x41); // i32.const (table indices are 32-bit in memory64)
+        push_i32_leb(&mut sec, 1); // slot 0 reserved as null trap
+        sec.push(0x0B); // end
+        push_u32_leb(&mut sec, program.indirect_table.len() as u32);
+        for &func_idx in program.indirect_table {
+            push_u32_leb(&mut sec, func_idx);
+        }
+        push_section(out, SEC_ELEMENT, &sec);
+    }
 
     // ---- 10. Code Section ------------------------------------------------------------------
     sec.clear();
@@ -557,7 +784,7 @@ impl<'a> Reader<'a> {
 }
 
 /// Validates a written Wasmtime 64 (`.wasm`) binary against the WebAssembly `memory64` spec
-/// and Blaze's `blaze_host_v1` sans-IO ABI requirements.
+/// for both `blaze_host_v1` modules and `omit_blaze_host_v1` (WASI-64 / reactor) modules.
 pub fn check_wasm64(bytes: &[u8]) -> Result<Wasm64Check, Wasm64Error> {
     let mut r = Reader::new(bytes);
     if r.take(4)? != WASM_MAGIC {
@@ -572,8 +799,17 @@ pub fn check_wasm64(bytes: &[u8]) -> Result<Wasm64Check, Wasm64Error> {
     let mut min_pages = 0u64;
     let mut max_pages = None;
     let mut host_imports = 0u32;
+    let mut import_count = 0u32;
+    let mut has_submit_wait = false;
+    let mut has_host_caps = false;
+    let mut has_host_log = false;
     let mut func_count = 0u32;
+    let mut code_count = 0u32;
+    let mut global_count = 0u32;
+    let mut table_size = 0u32;
+    let mut elem_count = 0u32;
     let mut export_count = 0u32;
+    let mut exported_funcs = 0u32;
     let mut data_segments = 0u32;
     let mut has_memory_export = false;
     let mut has_start_export = false;
@@ -596,22 +832,93 @@ pub fn check_wasm64(bytes: &[u8]) -> Result<Wasm64Check, Wasm64Error> {
                     has_profile_section = true;
                 }
             }
+            SEC_TYPE => {
+                let count = sr.u32_leb()?;
+                for _ in 0..count {
+                    if sr.byte()? != 0x60 {
+                        return Err(Wasm64Error::Truncated);
+                    }
+                    let n_params = sr.u32_leb()? as usize;
+                    let _ = sr.take(n_params)?;
+                    let n_results = sr.u32_leb()? as usize;
+                    let _ = sr.take(n_results)?;
+                }
+            }
             SEC_IMPORT => {
                 let count = sr.u32_leb()?;
                 for _ in 0..count {
                     let module = sr.name()?;
-                    let _field = sr.name()?;
+                    let field = sr.name()?;
                     let kind = sr.byte()?;
-                    if kind == 0x00 {
-                        let _ty = sr.u32_leb()?;
+                    match kind {
+                        0x00 => {
+                            let _ty = sr.u32_leb()?;
+                        }
+                        0x01 => {
+                            let _reftype = sr.byte()?;
+                            let flags = sr.byte()?;
+                            let _min = sr.u32_leb()?;
+                            if (flags & 0x01) != 0 {
+                                let _max = sr.u32_leb()?;
+                            }
+                        }
+                        0x02 => {
+                            let flags = sr.byte()?;
+                            if (flags & MEM64_MIN_ONLY) != 0 {
+                                let _min = sr.u64_leb()?;
+                                if (flags & 0x01) != 0 {
+                                    let _max = sr.u64_leb()?;
+                                }
+                            } else {
+                                let _min = sr.u32_leb()?;
+                                if (flags & 0x01) != 0 {
+                                    let _max = sr.u32_leb()?;
+                                }
+                            }
+                        }
+                        0x03 => {
+                            let _val_type = sr.byte()?;
+                            let _mutability = sr.byte()?;
+                        }
+                        _ => return Err(Wasm64Error::Truncated),
                     }
-                    if module == HOST_MODULE {
-                        host_imports += 1;
+                    import_count = import_count.saturating_add(1);
+                    if module == HOST_MODULE && kind == 0x00 {
+                        host_imports = host_imports.saturating_add(1);
+                        match field {
+                            "submit_wait" => has_submit_wait = true,
+                            "host_caps" => has_host_caps = true,
+                            "host_log" => has_host_log = true,
+                            _ => {}
+                        }
                     }
                 }
             }
             SEC_FUNCTION => {
                 func_count = sr.u32_leb()?;
+                for _ in 0..func_count {
+                    let _ty_idx = sr.u32_leb()?;
+                }
+            }
+            SEC_TABLE => {
+                let count = sr.u32_leb()?;
+                for i in 0..count {
+                    let reftype = sr.byte()?;
+                    if reftype != FUNCREF && reftype != 0x6F {
+                        return Err(Wasm64Error::InvalidTable);
+                    }
+                    let flags = sr.byte()?;
+                    if (flags & 0x04) != 0 {
+                        return Err(Wasm64Error::InvalidTable);
+                    }
+                    let min = sr.u32_leb()?;
+                    if (flags & 0x01) != 0 {
+                        let _max = sr.u32_leb()?;
+                    }
+                    if i == 0 {
+                        table_size = min;
+                    }
+                }
             }
             SEC_MEMORY => {
                 let count = sr.u32_leb()?;
@@ -627,6 +934,29 @@ pub fn check_wasm64(bytes: &[u8]) -> Result<Wasm64Check, Wasm64Error> {
                     }
                 }
             }
+            SEC_GLOBAL => {
+                global_count = sr.u32_leb()?;
+                for _ in 0..global_count {
+                    let _val_type = sr.byte()?;
+                    let _mutability = sr.byte()?;
+                    match sr.byte()? {
+                        0x41 | 0x42 => sr.skip_sleb64()?,
+                        0x43 => {
+                            let _ = sr.take(4)?;
+                        }
+                        0x44 => {
+                            let _ = sr.take(8)?;
+                        }
+                        0x23 => {
+                            let _ = sr.u32_leb()?;
+                        }
+                        _ => return Err(Wasm64Error::Truncated),
+                    }
+                    if sr.byte()? != 0x0B {
+                        return Err(Wasm64Error::Truncated);
+                    }
+                }
+            }
             SEC_EXPORT => {
                 export_count = sr.u32_leb()?;
                 for _ in 0..export_count {
@@ -636,9 +966,41 @@ pub fn check_wasm64(bytes: &[u8]) -> Result<Wasm64Check, Wasm64Error> {
                     if name == "memory" && kind == 0x02 {
                         has_memory_export = true;
                     }
-                    if name == "_start" && kind == 0x00 {
-                        has_start_export = true;
+                    if kind == 0x00 {
+                        exported_funcs = exported_funcs.saturating_add(1);
+                        if name == "_start" {
+                            has_start_export = true;
+                        }
                     }
+                }
+            }
+            SEC_ELEMENT => {
+                let segs = sr.u32_leb()?;
+                for _ in 0..segs {
+                    let mode = sr.u32_leb()?;
+                    if mode == 0 {
+                        if sr.byte()? != 0x41 {
+                            return Err(Wasm64Error::InvalidElement);
+                        }
+                        sr.skip_sleb64()?;
+                        if sr.byte()? != 0x0B {
+                            return Err(Wasm64Error::InvalidElement);
+                        }
+                        let n = sr.u32_leb()?;
+                        for _ in 0..n {
+                            let _func_idx = sr.u32_leb()?;
+                        }
+                        elem_count = elem_count.saturating_add(n);
+                    } else {
+                        return Err(Wasm64Error::InvalidElement);
+                    }
+                }
+            }
+            SEC_CODE => {
+                code_count = sr.u32_leb()?;
+                for _ in 0..code_count {
+                    let body_len = sr.u32_leb()? as usize;
+                    let _ = sr.take(body_len)?;
                 }
             }
             SEC_DATA => {
@@ -666,22 +1028,29 @@ pub fn check_wasm64(bytes: &[u8]) -> Result<Wasm64Check, Wasm64Error> {
     if !memory64 {
         return Err(Wasm64Error::NotMemory64 { flags: 0 });
     }
-    if host_imports < 2 {
-        return Err(Wasm64Error::MissingHostImport);
-    }
     if !has_memory_export {
         return Err(Wasm64Error::MissingMemoryExport);
     }
-    if !has_start_export {
+    if exported_funcs == 0 {
         return Err(Wasm64Error::NoStartExport);
     }
+    if code_count != func_count {
+        return Err(Wasm64Error::Truncated);
+    }
+
+    let has_blaze_host_v1 = has_submit_wait && has_host_caps && has_host_log;
 
     Ok(Wasm64Check {
         memory64,
         min_pages,
         max_pages,
         host_imports,
+        import_count,
+        has_blaze_host_v1,
         func_count,
+        global_count,
+        table_size,
+        elem_count,
         export_count,
         data_segments,
         has_memory_export,

@@ -2858,25 +2858,41 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         g.trait_counts.dedup_by_key(|&mut (k, _)| k);
         g.alias_counts.sort_unstable_by_key(|&(k, n, _)| (k, n));
         g.alias_counts.dedup_by_key(|&mut (k, n, _)| (k, n));
-        let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
-        let count = |got: tc::regions::Count| match got {
-            tc::regions::Count::Known(n) => Some(n),
-            tc::regions::Count::NotKnown => None,
-        };
-        for t in g.trait_counts.iter_mut() {
-            t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
-            if r.keys
-                .library_in(r.names, tc::ItemKey(t.0))
-                .and_then(|lib| r.store.maps.traits.get(&lib))
-                .is_some_and(|td| td.flags.has(tc::TraitFlags::AUTO))
-            {
-                g.auto_traits.push(t.0);
+        {
+            let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
+            let count = |got: tc::regions::Count| match got {
+                tc::regions::Count::Known(n) => Some(n),
+                tc::regions::Count::NotKnown => None,
+            };
+            for t in g.trait_counts.iter_mut() {
+                t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
+                if r.keys
+                    .library_in(r.names, tc::ItemKey(t.0))
+                    .and_then(|lib| r.store.maps.traits.get(&lib))
+                    .is_some_and(|td| td.flags.has(tc::TraitFlags::AUTO))
+                {
+                    g.auto_traits.push(t.0);
+                }
+            }
+            g.auto_traits.sort_unstable();
+            g.auto_traits.dedup();
+            for a in g.alias_counts.iter_mut() {
+                a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
             }
         }
-        g.auto_traits.sort_unstable();
-        g.auto_traits.dedup();
+        // Synthetic RPITIT associated types (`async fn` / `-> impl Trait` in traits) are not
+        // written as `type ...;` members in the trait text, so `NamesSource::assoc_lifetimes`
+        // answers `None`; their lifetime count is the corresponding RPITIT opaque's captures.
+        drop(regions);
         for a in g.alias_counts.iter_mut() {
-            a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
+            if a.2.is_some() {
+                continue;
+            }
+            let tk = tc::ItemKey(a.0);
+            ensure_rpitit_trait_rows(r, tk);
+            if let Some(opaque) = r.store.rpitit_traits.get(&tk).and_then(|tr| tr.rows.iter().find(|s| s.name == a.1)).map(|s| s.opaque) {
+                a.2 = r.store.regions.made(opaque).and_then(|f| f.regions().opaque_captures).or_else(|| r.store.maps.opaque_lifetimes.get(&opaque).copied());
+            }
         }
     }
     g.items = items;

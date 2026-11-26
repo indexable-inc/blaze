@@ -40,11 +40,19 @@ pub mod commit_graph;
 pub mod format;
 pub mod ignore;
 pub mod index;
+pub mod infect;
 pub mod machine;
+pub mod merge;
 pub mod objects;
+pub mod pack_write;
 pub mod plant;
 pub mod refs;
+pub mod slab;
+pub mod storage;
+pub mod wire;
 
+#[cfg(test)]
+mod engine_tests;
 #[cfg(test)]
 mod tests;
 
@@ -491,7 +499,15 @@ pub enum GitFile {
     PackData(Oid),
     TreeObject(Oid),
     CommitObject(Oid),
+    TagObject(Oid),
     Worktree,
+    Slab,
+    SlabIndex,
+    RefTable,
+    PackWrite,
+    Wire,
+    Merge,
+    Infect,
 }
 
 /// Specific cause of a [`GitError`].
@@ -509,6 +525,12 @@ pub enum ErrorKind {
     WrongObjectKind { want: ObjectKind, got: ObjectKind },
     RefCycle,
     UnexpectedReply,
+    ChecksumMismatch,
+    Compression,
+    BudgetExceeded,
+    CasMismatch,
+    NonFastForward,
+    WireProtocol,
 }
 
 impl fmt::Display for GitError {

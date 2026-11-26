@@ -61,6 +61,10 @@ use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable
 #[path = "export_lto.rs"]
 pub mod export_lto;
 
+/// Whole-program LIR-to-Wasm64 (`memory64`) linker over a record walk.
+#[path = "wasm64.rs"]
+pub mod wasm64;
+
 /// One function reference in a [`BuiltLir`] body: either a Rust instance symbol or an offset span
 /// into [`BuiltLir::c_text`] naming a C extern function.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,7 +125,7 @@ impl<A: core::alloc::Allocator> BuiltLir<A> {
 /// entry, or hand back the verified LIR and resolved reference tables for whole-program LTO.
 enum BuildSink<'e, 'a, A: core::alloc::Allocator = Alloc<'a>> {
     Entry(&'e mut AVec<'a, u8>),
-    Lir { alloc: A, out: &'e mut Option<BuiltLir<A>> },
+    Lir { alloc: A, out: &'e mut Option<BuiltLir<A>>, declared: Option<&'e mut crate::body_ids::DeclaredList<'a>> },
 }
 
 /// How many bodies were checked for a walk's makes: the claim "a run that finds every record
@@ -1721,11 +1725,15 @@ impl<P: FrontEnd> blaze_build::Adts for CachedFront<'_, P> {
     fn nounwind(&self, owner: ItemKey) -> Option<bool> { self.front.nounwind(owner) }
     fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs { self.front.fn_attrs(owner) }
     fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
-        if let Some(&hit) = self.cache.borrow().track_caller.get(&instance.item) {
+        let item = match self.front.0.resolve(self.front.1, instance.item, instance.args, ground) {
+            Ok((resolved, _)) => resolved,
+            Err(_) => instance.item,
+        };
+        if let Some(&hit) = self.cache.borrow().track_caller.get(&item) {
             return Some(hit);
         }
-        let ans = self.front.track_caller(instance, ground)?;
-        self.cache.borrow_mut().track_caller.insert(instance.item, ans);
+        let ans = self.front.0.track_caller(item)?;
+        self.cache.borrow_mut().track_caller.insert(item, ans);
         Some(ans)
     }
     fn location_adt(&self) -> Option<ItemKey> { self.front.location_adt() }
@@ -2452,8 +2460,14 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
     // Absorb Phase 2's clean read log into `work.reads` (which applies `work.reads.plant`).
     work.reads.absorb(ref_reads);
     match sink {
-        BuildSink::Lir { alloc, out } => {
+        BuildSink::Lir { alloc, out, declared } => {
             let out_alloc = *alloc;
+            if let Some(dst) = declared.as_deref_mut() {
+                for n in 0..reach.rows.len() {
+                    let (tabled, name_bytes) = reach.row(n);
+                    dst.push(tabled, name_bytes);
+                }
+            }
             let mut c_text: blaze_own::Vec<u8, A> = blaze_own::Vec::new_in(out_alloc);
             let mut push_c = |s: &str| -> Result<(u32, u32), RunError> {
                 let start = u32::try_from(c_text.len()).map_err(|_| RunError::CodeRecord {
@@ -3194,24 +3208,44 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
     /// Allocator-generic variant of [`Self::build_lir`] so parallel export LTO can store
     /// [`BuiltLir`] in a `Send + Sync` [`blaze_own::SharedAlloc`].
-    pub fn build_lir_in<A: core::alloc::Allocator + Copy>(&mut self, _grant: &G, tabled: ItemKey, name: &[u8], alloc: A) -> Result<BuiltLir<A>, RunError> {
+    pub fn build_lir_in<A: core::alloc::Allocator + Copy>(&mut self, grant: &G, tabled: ItemKey, name: &[u8], alloc: A) -> Result<BuiltLir<A>, RunError> {
+        self.build_lir_with_reach_in(grant, tabled, name, None, alloc)
+    }
+
+    /// Lowers one instance to verified [`BuiltLir`] and optionally appends every reached callee
+    /// instance `(tabled, name_bytes)` to `declared` (enabling single-pass whole-program LIR
+    /// walks such as Wasm64 without native machine-code emission).
+    pub fn build_lir_with_reach_in<'r, A: core::alloc::Allocator + Copy>(
+        &mut self,
+        _grant: &G,
+        tabled: ItemKey,
+        name: &[u8],
+        declared: Option<&mut crate::body_ids::DeclaredList<'r>>,
+        alloc: A,
+    ) -> Result<BuiltLir<A>, RunError> {
         if let Some(void) = self.void(tabled) {
             return Err(void);
         }
-        let made = self.build_lir_over(tabled, name, alloc);
+        let made = self.build_lir_over(tabled, name, declared, alloc);
         if let Some(void) = self.void(tabled) {
             return Err(void);
         }
         made
     }
 
-    fn build_lir_over<A: core::alloc::Allocator + Copy>(&mut self, tabled: ItemKey, name: &[u8], alloc: A) -> Result<BuiltLir<A>, RunError> {
+    fn build_lir_over<'r, A: core::alloc::Allocator + Copy>(
+        &mut self,
+        tabled: ItemKey,
+        name: &[u8],
+        declared: Option<&mut crate::body_ids::DeclaredList<'r>>,
+        alloc: A,
+    ) -> Result<BuiltLir<A>, RunError> {
         self.construct(tabled)?;
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::build_lir`)" });
         };
         let mut out: Option<BuiltLir<A>> = None;
-        let mut sink = BuildSink::Lir { alloc, out: &mut out };
+        let mut sink = BuildSink::Lir { alloc, out: &mut out, declared };
         run_instance_loop(program, &mut self.typing, state, &mut self.checks, tabled, name, &mut sink)?;
         out.ok_or(RunError::OneBody { key: tabled, why: "the LIR build completed without producing a body (make_one.rs `Maker::build_lir`)" })
     }

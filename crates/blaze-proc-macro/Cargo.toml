@@ -106,6 +106,9 @@ blaze-lower.workspace = true
 blaze-surface.workspace = true
 # `tempo_pipeline`: each body checked as blaze-real's stage h does (`to_typeck`'s table).
 blaze-typeck.workspace = true
+# `wasm64_runtime`: live end-to-end `blaze-lir -> wasm64 -> Wasmtime` oracle tests against `blaze_lir::eval`.
+blaze-export.workspace = true
+blaze-lir = { workspace = true, features = ["eval"] }
 
 # N7 (D112): a native script's `sw_vers` answered by the fact shim; the test binary is both the
 # script and the shim (argv[0]), so it has its own main.

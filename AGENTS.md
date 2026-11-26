@@ -15,24 +15,34 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
   VMs; `check`, `build`, `run`, `test`; EVERY internal crate `#![no_std]` on `bstd`/`blaze-own`
   explicit `Alloc` & sans-IO. **Not now:** `blaze watch`/build-on-save, Windows, Buck/Bazel, remote
   runs.
-- **Autonomy & craft:** Act autonomously on non-controversial improvements — when you see something
-  clearly suboptimal, duplicated, or a pattern that generalizes, make it ideal and sweep all
-  siblings directly without asking. Pause to ask only on genuinely controversial tradeoffs or
-  irreversible direction changes. Build to SOTA within 10% of the floor on the first iteration, then
-  iterate; delete jank and duplication.
+- **Autonomy & craft:** Act autonomously on non-controversial improvements — when you spot
+  duplicated logic/patterns that generalize, immediately spawn a subagent to extract a shared crate,
+  sweep all callers, and land it. Pause only on genuinely controversial tradeoffs or irreversible
+  direction changes. Pursue the longest-term best solution by default (assume infinite time, even if
+  OOD), within 10% of the floor on iteration one, then iterate; delete jank. Show unitless
+  proportional effort bars (`[████████░░]`) when comparing options.
+- **Workflow & orientation:** Before doing anything wrt Rust/Cargo, read
+  `.agents/skills/must_read_blaze/SKILL.md` (`must_read_blaze`) and log missing features or
+  stricter-is-better catches in `agents/feature-requests.md`. Spawn tasks as subagents by default so
+  the coordinator stays free for incoming tasks. Sandbox blocking shell/tools? Stop immediately, ask
+  the user for full permissions, and wait. After finishing a change, immediately land/merge it (PR +
+  smoke) and fast-forward/update the base branch head you branched off of (never leave finished work
+  sitting unmerged on a stale branch).
 - **Docs & skills:** [docs/contributing.md](docs/contributing.md), [docs/README.md](docs/README.md),
   and `.agents/skills/` (load the relevant skill before domain work, including `authoring-prompts`
   before editing rules/skills/briefs).
 - ✨ **Core gap (build scripts & proc macros):** `MacroModule` (`macros.rs`/`script_modules.rs`) is
-  lookup-only — blaze does not compile `build.rs` or proc-macro crates itself yet (it has native
-  arm64 codegen + OS sandboxes, no wasm32 backend yet), so any crate missing from
+  lookup-only — blaze does not compile `build.rs` or proc-macro crates itself yet (no `blaze-lir →
+  wasm64` emitter wired yet), so any crate missing from
   `~/.blaze/v2/{proc-macro,build-script}/modules` fails `CrateScope` and blocks downstream crates. ✨
 - 🚀 **Endgame (self-compiled usercode):** Turn `MacroModule` into a real blaze compile task (zero
   `toolrun.sh`/`rustc`): (1) Tier 0 `#[comptime]` reflection for blaze/bstd code (zero proc-macros);
-  (2) Tier 1 `wasm32-wasip1` emitter off blaze's V3 SSA/LIR backend for all proc-macros & pure-Rust
-  `build.rs` (~10-50 µs in-process Wasmtime, exact WASI read-tracing, cross-OS R2-shared `.wasm`);
-  (3) Tier 2 blaze's native arm64 backend + OS sandbox + pinned `clang` for C-linking `build.rs`
-  (built first to unblock `build.rs` immediately with zero throwaway work). 🚀
+  (2) Tier 1 `wasm64` (`memory64`) emitter off `blaze-lir` + `blaze-export/src/wasm64.rs` for all
+  proc-macros & pure-Rust `build.rs` (64-bit pointers match host layout, no
+  `wasi-libc`/`wasm-lld`/regalloc, ~10-50 µs in-process Wasmtime, exact `blaze-comptime`
+  read-tracing, cross-OS R2-shared `.wasm`); (3) Tier 2 host spawns & C-linking native tools
+  (`clang`/`cc`/`cmake`) routed through blaze's own hypervisor micro-VM sandbox (hardware isolation,
+  hermetic FS, deterministic prefix-maps). 🚀
 
 ## Core Rules
 
@@ -76,7 +86,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 
 ### Design and changing code (skill `changing-code`)
 - **24. whole-ports**: Delete replaced APIs completely, never deprecate; port all callers in one batch so it builds.
-- **30. one-concept-one-home**: One type, one rule, one place per concept; merge duplicates and ban the removed name.
+- **30. one-concept-one-home**: One home per concept; on duplicated logic, spawn a subagent to extract a shared crate & sweep.
 - **54. guard-the-cause**: Generalize every problem (>=3 similar cases), name the class, fix from first principles & merge.
 - **62. sota-first**: Build the SOTA end state within 10% of the floor directly; build missing pieces; stop on 2nd fix.
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
@@ -92,7 +102,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **69. every-command-has-a-timeout**: Put a timeout on every command; verify on real projects first; a hang is a bug to report.
 
 ### Landing (skill `landing`)
-- **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.
+- **37. land-through-pr**: Land finished work immediately via PR (`land.py` + smoke) & fast-forward base branch; never push.
 - **68. proof-before-merge**: The PR quotes a release blaze running, checking and testing hello-world on the exact tree.
 
 ### Docs and scripts (skill `docs-and-scripts`)

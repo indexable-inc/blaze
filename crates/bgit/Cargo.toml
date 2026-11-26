@@ -1,0 +1,27 @@
+[package]
+name = "bgit"
+description = "Fast, Git-wire-compatible CLI and native macOS driver over blaze-git: infect/disinfect, native .bgit slabs (BGOB/BGIX/BGRF/CGPH), ORT 3-way merge, Smart HTTP & stdio server + client"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bgit"
+path = "src/main.rs"
+
+[dependencies]
+blaze-core.workspace = true
+blaze-deflate.workspace = true
+blaze-git.workspace = true
+blaze-git-fetch.workspace = true
+blaze-hash.workspace = true
+blaze-own.workspace = true
+blaze-zstd.workspace = true
+
+[lints]
+workspace = true

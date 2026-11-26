@@ -78,8 +78,9 @@ pub enum TyView {
     /// `ConstInfer`).
     Array(Ty, Ty),
     Slice(Ty),
-    /// A pattern type `base is PAT`: `PNode::Pat`'s view, its ranges `ConstValue` terms in
-    /// pairs. Opaque to the checker: no coercion, deref, field or method reaches the base.
+    /// A pattern type `base is PAT`: `PNode::Pat`'s view, holding either canonical range
+    /// `ConstValue` pairs or a finite const value-set (`Never` tag + sorted `u128` member
+    /// digests). Opaque to the checker: no coercion, deref, field or method reaches the base.
     Pat(Ty, TyList),
     Adt(ItemKey, TyList),
     FnDef(ItemKey, TyList),

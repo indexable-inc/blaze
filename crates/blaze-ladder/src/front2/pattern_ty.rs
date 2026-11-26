@@ -77,6 +77,7 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         let written = match pat {
             lf::TyPat::NotNull => String::from("_ is !null"),
             lf::TyPat::Of(p) => format!("_ is {}", v.text_at(v.pat_range(p)?)?),
+            lf::TyPat::In(c) => format!("_ is in {}", v.text_at(v.const_range(c)?)?),
         };
         let text = parse_pattern_type(&written, r).map_err(|e| refused(format!("{e:?}"), r))?;
         let names = self.resolver.names;

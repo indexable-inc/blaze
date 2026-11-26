@@ -89,6 +89,7 @@ const CHECK_FLAGS: &[ArgSpec] = &[
 const BUILD_FLAGS: &[ArgSpec] = &[
     flag_multi("package", "package", Some('p'), "<name>", "Package to build", false),
     flag_value("bin", "bin", None, "<name>", "Binary target to build", false),
+    flag_value("target", "target", None, "<triple>", "Build target (native or wasm64)", false),
     flag_value("output", "output", Some('o'), "<path>", "Destination executable path", false),
     flag_value("workers", "workers", None, "<N>", "Maximum concurrent workers", false),
     flag_bool("stats", "stats", None, "Print telemetry summary at exit", false),

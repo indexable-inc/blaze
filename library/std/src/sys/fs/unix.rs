@@ -519,6 +519,11 @@ impl FileAttr {
         self.stat.st_size as u64
     }
     pub fn perm(&self) -> FilePermissions {
+        // blaze: WASI preview 1 carries no POSIX permission bits in `st_mode`, so `autocfg::new()`
+        // would falsely reject `OUT_DIR` as read-only; the sandbox enforces writes per syscall.
+        #[cfg(all(target_os = "wasi", target_arch = "wasm64"))]
+        return FilePermissions { mode: (self.stat.st_mode as mode_t) | 0o200 };
+        #[cfg(not(all(target_os = "wasi", target_arch = "wasm64")))]
         FilePermissions { mode: (self.stat.st_mode as mode_t) }
     }
 

@@ -581,4 +581,119 @@ fn manually_drop_field_scrutinee_and_ref_move_control() {
     assert!(error.contains("a move out") || error.starts_with("diagnostics"), "{error}");
 }
 
+/// A local declared *inside* a `loop`, overwritten by an assignment, and then partially moved
+/// out of by a `match` later in the same iteration (`reth_transaction_pool::maintain`'s
+/// `loop { let mut reloaded = None; ... reloaded = Some(res); match reloaded { Some(v) => ... } }`).
+/// Because the local is re-declared and its field-flags word reset on every turn of that loop,
+/// the assignment cannot run after the partial move on a later turn, so `in_one_loop` must not
+/// refuse it and every value drops exactly once.
+///
+/// Control twin: the same assignment + partial move on a local declared *outside* the loop (so
+/// it survives across the loop back-edge) must still be refused by name.
+#[test]
+fn loop_local_assign_then_partial_move_drops_once_while_outer_local_is_refused() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], UNIT);
+    let g = g_world(&mut w);
+
+    // Local declared inside the loop: two iterations drop (1,2), (3,4), then (11,12), (13,14).
+    let mut b = BodyBuf::new();
+    let zero = b.int(0, None);
+    let i = b.bind("i");
+    let lp = b.e(Expr::Tuple { elems: List::EMPTY });
+    let i_cmp = b.local(i);
+    let two = b.int(2, None);
+    let done = b.bin(BinOp::Ge, i_cmp, two);
+    let brk = b.e(Expr::Break { value: None, target: lp });
+    let brk_blk = b.block(&[Stmt::Expr { expr: brk, semi: true }], None);
+    let guard = b.e(Expr::If { cond: done, then: brk_blk, else_: None });
+
+    let mk_g = |b: &mut BodyBuf, i: PatId, k: u128| {
+        let ie = b.local(i);
+        let ten = b.int(10, None);
+        let i10 = b.bin(BinOp::Mul, ie, ten);
+        let kv = b.int(k, None);
+        let id = b.bin(BinOp::Add, i10, kv);
+        let gp = b.path("G");
+        let start = b.field_inits.len() as u32;
+        b.field_inits.push(FieldInit { name: Name::of("x"), expr: id });
+        b.e(Expr::Struct { path: gp, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None })
+    };
+    let z0 = b.int(0, None);
+    let g1 = mk_g(&mut b, i, 1);
+    let g2 = mk_g(&mut b, i, 2);
+    let init_pair = b.tuple(&[z0, g1, g2]);
+    let x = b.bind("x");
+    let z1 = b.int(0, None);
+    let g3 = mk_g(&mut b, i, 3);
+    let g4 = mk_g(&mut b, i, 4);
+    let next_pair = b.tuple(&[z1, g3, g4]);
+    let x_lhs = b.local(x);
+    let asg = b.e(Expr::Assign { lhs: x_lhs, rhs: next_pair });
+    let x_scrut = b.local(x);
+    let wild0 = b.pat(Pat::Wild);
+    let a = plain_bind(&mut b, "a");
+    let wild = b.pat(Pat::Wild);
+    let pat = tuple_pat(&mut b, &[wild0, a, wild]);
+    let a_e = b.local(a);
+    let mv = match_on(&mut b, x_scrut, &[(pat, a_e)]);
+    let moved = b.bind("moved");
+    let i_lhs = b.local(i);
+    let i_rhs = b.local(i);
+    let one = b.int(1, None);
+    let inc_val = b.bin(BinOp::Add, i_rhs, one);
+    let inc = b.e(Expr::Assign { lhs: i_lhs, rhs: inc_val });
+    let loop_body = b.block(
+        &[
+            Stmt::Expr { expr: guard, semi: false },
+            Stmt::Let { pat: x, ty: None, init: Some(init_pair), else_: None },
+            Stmt::Expr { expr: asg, semi: true },
+            Stmt::Let { pat: moved, ty: None, init: Some(mv), else_: None },
+            Stmt::Expr { expr: inc, semi: true },
+        ],
+        None,
+    );
+    b.set(lp, Expr::Loop { body: loop_body });
+    let root = b.block(&[Stmt::Let { pat: i, ty: None, init: Some(zero), else_: None }, Stmt::Expr { expr: lp, semi: false }], None);
+    let seen = drops_of(&w, &b, root, g, None).unwrap_or_else(|e| panic!("loop-local assign + partial move failed: {e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(seen.as_slice(), &[1, 2, 3, 4, 11, 12, 13, 14]);
+    let _ = seen;
+
+    // Control twin: `x` declared *outside* the loop lives across the back-edge -> still refused.
+    let mut b = BodyBuf::new();
+    let g1 = g_lit(&mut b, 1);
+    let g2 = g_lit(&mut b, 2);
+    let init_pair = b.tuple(&[g1, g2]);
+    let x = b.bind("x");
+    let lp = b.e(Expr::Tuple { elems: List::EMPTY });
+    let g3 = g_lit(&mut b, 3);
+    let g4 = g_lit(&mut b, 4);
+    let next_pair = b.tuple(&[g3, g4]);
+    let x_lhs = b.local(x);
+    let asg = b.e(Expr::Assign { lhs: x_lhs, rhs: next_pair });
+    let x_scrut = b.local(x);
+    let a = plain_bind(&mut b, "a");
+    let wild = b.pat(Pat::Wild);
+    let pat = tuple_pat(&mut b, &[a, wild]);
+    let a_e = b.local(a);
+    let mv = match_on(&mut b, x_scrut, &[(pat, a_e)]);
+    let moved = b.bind("moved");
+    let brk = b.e(Expr::Break { value: None, target: lp });
+    let loop_body = b.block(
+        &[
+            Stmt::Expr { expr: asg, semi: true },
+            Stmt::Let { pat: moved, ty: None, init: Some(mv), else_: None },
+            Stmt::Expr { expr: brk, semi: true },
+        ],
+        None,
+    );
+    b.set(lp, Expr::Loop { body: loop_body });
+    let root = b.block(&[Stmt::Let { pat: x, ty: None, init: Some(init_pair), else_: None }, Stmt::Expr { expr: lp, semi: false }], None);
+    let Err(error) = drops_of(&w, &b, root, g, None) else {
+        panic!("outer-local assign + partial move in a loop must still be refused");
+    };
+    assert!(error.contains("would not test the part's bit"), "{error}");
+}
+
 mod field_scrutinee;

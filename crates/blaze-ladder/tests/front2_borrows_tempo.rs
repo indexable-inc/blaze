@@ -1461,6 +1461,288 @@ where
 {
     repop_on_new_blocks(client)
 }
+
+// Delegating trait `async fn` whose synthetic RPITIT associated type appears in the borrow-check's
+// `alias_counts` (`tempo_node::executed_state::TempoTreeValidatorBuilder::build_tree_validator`).
+trait TreeValidatorBuilder<N> {
+    type Validator;
+    async fn build_tree_validator(self, ctx: &N) -> Self::Validator;
+}
+struct InnerTreeBuilder;
+impl<N> TreeValidatorBuilder<N> for InnerTreeBuilder {
+    type Validator = u64;
+    async fn build_tree_validator(self, _ctx: &N) -> Self::Validator {
+        42
+    }
+}
+struct WrappingTreeBuilder {
+    inner: InnerTreeBuilder,
+}
+impl<N> TreeValidatorBuilder<N> for WrappingTreeBuilder {
+    type Validator = <InnerTreeBuilder as TreeValidatorBuilder<N>>::Validator;
+    async fn build_tree_validator(self, ctx: &N) -> Self::Validator {
+        self.inner.build_tree_validator(ctx).await
+    }
+}
+
+// Repro 1: `build_tree_validator` — delegating via caller where-clause
+// `InnerTreeBuilder2: TreeValidatorBuilder<N>` where the concrete impl has extra bounds on `N`.
+trait ExtraNodeBound {}
+struct InnerTreeBuilder2;
+impl<N: ExtraNodeBound> TreeValidatorBuilder<N> for InnerTreeBuilder2 {
+    type Validator = u64;
+    async fn build_tree_validator(self, _ctx: &N) -> Self::Validator {
+        42
+    }
+}
+struct WrappingTreeBuilder2 {
+    inner: InnerTreeBuilder2,
+}
+impl<N> TreeValidatorBuilder<N> for WrappingTreeBuilder2
+where
+    InnerTreeBuilder2: TreeValidatorBuilder<N>,
+{
+    type Validator = <InnerTreeBuilder2 as TreeValidatorBuilder<N>>::Validator;
+    async fn build_tree_validator(self, ctx: &N) -> Self::Validator {
+        self.inner.build_tree_validator(ctx).await
+    }
+}
+
+// Repro 2: `build_network` — `ctx.start_network(network, pool)` where
+// `Node::Provider: BlockReaderFor<BasicNet<Node::Types, Pool::Tx>>` is proven by a blanket impl.
+trait NetNodeTypes {
+    type Block;
+}
+trait NetFullNodeTypes {
+    type Types: NetNodeTypes;
+    type Provider: NetBlockReader<Block = <Self::Types as NetNodeTypes>::Block>;
+}
+trait NetBlockReader {
+    type Block;
+}
+trait NetPrimitives {
+    type Block;
+}
+struct BasicNet<P>(core::marker::PhantomData<P>);
+impl<P: NetNodeTypes> NetPrimitives for BasicNet<P> {
+    type Block = P::Block;
+}
+trait NetBlockReaderFor<N: NetPrimitives>: NetBlockReader<Block = N::Block> {}
+impl<N: NetPrimitives, T: NetBlockReader<Block = N::Block>> NetBlockReaderFor<N> for T {}
+struct NetBuilderCtx<Node>(core::marker::PhantomData<Node>);
+impl<Node: NetFullNodeTypes> NetBuilderCtx<Node> {
+    fn start_network<N>(&self)
+    where
+        N: NetPrimitives,
+        Node::Provider: NetBlockReaderFor<N>,
+    {
+    }
+}
+fn repro_build_network<Node: NetFullNodeTypes>(ctx: &NetBuilderCtx<Node>) {
+    ctx.start_network::<BasicNet<Node::Types>>();
+}
+
+// Repro 2b: `build_network` with `NodeTypesWithDBAdapter`, `FullProvider` supertrait, and
+// `PoolTransaction` where `Pooled: TryFrom<Self::Consensus>` meets `TryFrom<TxTy<Node::Types>>`.
+trait Net2Primitives {
+    type Block;
+    type SignedTx;
+}
+trait Net2NodeTypes {
+    type Primitives: Net2Primitives;
+}
+struct Net2WithDb<N, DB>(core::marker::PhantomData<(N, DB)>);
+impl<N: Net2NodeTypes, DB> Net2NodeTypes for Net2WithDb<N, DB> {
+    type Primitives = N::Primitives;
+}
+trait Net2BlockReader {
+    type Block;
+    type Transaction;
+}
+trait Net2FullProvider<N: Net2NodeTypes>:
+    Net2BlockReader<
+        Block = <<N as Net2NodeTypes>::Primitives as Net2Primitives>::Block,
+        Transaction = <<N as Net2NodeTypes>::Primitives as Net2Primitives>::SignedTx,
+    >
+{
+}
+trait Net2FullNodeTypes {
+    type Types: Net2NodeTypes;
+    type DB;
+    type Provider: Net2FullProvider<Net2WithDb<Self::Types, Self::DB>>;
+}
+trait Net2PoolTx {
+    type Consensus;
+    type Pooled: TryFrom<Self::Consensus>;
+}
+trait Net2TxPool {
+    type Transaction: Net2PoolTx;
+}
+trait Net2NetPrims {
+    type Block;
+    type BroadcastedTx;
+    type PooledTx;
+}
+struct Net2Basic<P, Pooled>(core::marker::PhantomData<(P, Pooled)>);
+impl<P, Pooled> Net2NetPrims for Net2Basic<P, Pooled>
+where
+    P: Net2Primitives,
+    Pooled: TryFrom<P::SignedTx>,
+{
+    type Block = P::Block;
+    type BroadcastedTx = P::SignedTx;
+    type PooledTx = Pooled;
+}
+trait Net2BlockReaderFor<N: Net2NetPrims>:
+    Net2BlockReader<Block = N::Block, Transaction = N::BroadcastedTx>
+{
+}
+impl<N: Net2NetPrims, T: Net2BlockReader<Block = N::Block, Transaction = N::BroadcastedTx>>
+    Net2BlockReaderFor<N> for T
+{
+}
+struct Net2BuilderCtx<Node>(core::marker::PhantomData<Node>);
+impl<Node: Net2FullNodeTypes> Net2BuilderCtx<Node> {
+    fn start_network<N, Pool>(&self, _pool: Pool)
+    where
+        N: Net2NetPrims,
+        Pool: Net2TxPool<
+            Transaction: Net2PoolTx<Consensus = N::BroadcastedTx, Pooled = N::PooledTx>,
+        >,
+        Node::Provider: Net2BlockReaderFor<N>,
+    {
+    }
+    fn start_network_no_reader<N, Pool>(&self, _pool: Pool)
+    where
+        N: Net2NetPrims,
+        Pool: Net2TxPool<
+            Transaction: Net2PoolTx<Consensus = N::BroadcastedTx, Pooled = N::PooledTx>,
+        >,
+    {
+    }
+}
+fn repro_build_network_no_reader<Node, Pool>(ctx: &Net2BuilderCtx<Node>, pool: Pool)
+where
+    Node: Net2FullNodeTypes,
+    Pool: Net2TxPool<
+        Transaction: Net2PoolTx<
+            Consensus = <<Node::Types as Net2NodeTypes>::Primitives as Net2Primitives>::SignedTx,
+        >,
+    >,
+{
+    ctx.start_network_no_reader::<
+        Net2Basic<
+            <Node::Types as Net2NodeTypes>::Primitives,
+            <Pool::Transaction as Net2PoolTx>::Pooled,
+        >,
+        Pool,
+    >(pool);
+}
+trait Net2FullNodeTypesNoDb {
+    type Types: Net2NodeTypes;
+    type Provider: Net2FullProvider<Self::Types>;
+}
+struct Net2BuilderCtxNoDb<Node>(core::marker::PhantomData<Node>);
+impl<Node: Net2FullNodeTypesNoDb> Net2BuilderCtxNoDb<Node> {
+    fn start_network<N, Pool>(&self, _pool: Pool)
+    where
+        N: Net2NetPrims,
+        Pool: Net2TxPool<
+            Transaction: Net2PoolTx<Consensus = N::BroadcastedTx, Pooled = N::PooledTx>,
+        >,
+        Node::Provider: Net2BlockReaderFor<N>,
+    {
+    }
+}
+fn repro_build_network_no_db<Node, Pool>(ctx: &Net2BuilderCtxNoDb<Node>, pool: Pool)
+where
+    Node: Net2FullNodeTypesNoDb,
+    Pool: Net2TxPool<
+        Transaction: Net2PoolTx<
+            Consensus = <<Node::Types as Net2NodeTypes>::Primitives as Net2Primitives>::SignedTx,
+        >,
+    >,
+{
+    ctx.start_network::<
+        Net2Basic<
+            <Node::Types as Net2NodeTypes>::Primitives,
+            <Pool::Transaction as Net2PoolTx>::Pooled,
+        >,
+        Pool,
+    >(pool);
+}
+fn repro_build_network_full<Node, Pool>(ctx: &Net2BuilderCtx<Node>, pool: Pool)
+where
+    Node: Net2FullNodeTypes,
+    Pool: Net2TxPool<
+        Transaction: Net2PoolTx<
+            Consensus = <<Node::Types as Net2NodeTypes>::Primitives as Net2Primitives>::SignedTx,
+        >,
+    >,
+{
+    ctx.start_network::<
+        Net2Basic<
+            <Node::Types as Net2NodeTypes>::Primitives,
+            <Pool::Transaction as Net2PoolTx>::Pooled,
+        >,
+        Pool,
+    >(pool);
+}
+
+// Repro 3: `build_eth_api` (`RpcConverter::erased`) — impl with multiple `From<Assoc::Err>`
+// where-clauses on the same error type (`E: From<ErrA> + From<M::Err> + From<H::Err>`) where
+// `M::Err` and `H::Err` normalize to distinct concrete error types with distinct `From` impls.
+struct EthErr<'a>(&'a u8);
+struct EthErrA;
+struct EthErrB;
+impl<'a> From<EthErrA> for EthErr<'a> {
+    fn from(_: EthErrA) -> Self {
+        EthErr(&0)
+    }
+}
+impl<'a> From<EthErrB> for EthErr<'a> {
+    fn from(_: EthErrB) -> Self {
+        EthErr(&0)
+    }
+}
+trait EthMapper {
+    type Err;
+}
+struct EthMapA;
+impl EthMapper for EthMapA {
+    type Err = EthErrA;
+}
+struct EthMapB;
+impl EthMapper for EthMapB {
+    type Err = EthErrB;
+}
+trait EthReceiptConv {
+    type Error;
+}
+struct EthReceiptImpl<'a>(core::marker::PhantomData<&'a u8>);
+impl<'a> EthReceiptConv for EthReceiptImpl<'a> {
+    type Error = EthErr<'a>;
+}
+trait EthRpcConvert {}
+struct EthRpcConverter<R, M, H>(core::marker::PhantomData<(R, M, H)>);
+impl<R, M, H> EthRpcConvert for EthRpcConverter<R, M, H>
+where
+    M: EthMapper,
+    H: EthMapper,
+    R: EthReceiptConv,
+    R::Error: From<M::Err> + From<H::Err>,
+{
+}
+impl<R, M, H> EthRpcConverter<R, M, H> {
+    fn erased(self)
+    where
+        Self: EthRpcConvert,
+    {
+    }
+}
+fn repro_build_eth_api_two_sources<'a>(conv: EthRpcConverter<EthReceiptImpl<'a>, EthMapA, EthMapB>) {
+    conv.erased();
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

@@ -287,6 +287,12 @@ mod mac_imageio {
             a: f64,
         ) -> *mut c_void;
         pub(super) fn CGColorRelease(color: *mut c_void);
+        pub(super) fn CGDataProviderCreateWithCFData(
+            data: *const OpaqueCFData,
+        ) -> *mut c_void;
+        pub(super) fn CGDataProviderRelease(provider: *mut c_void);
+        pub(super) fn CGFontCreateWithDataProvider(provider: *mut c_void) -> *mut c_void;
+        pub(super) fn CGFontRelease(font: *mut c_void);
         pub(super) fn CGContextRelease(ctx: *mut OpaqueCGContext);
     }
 
@@ -296,6 +302,17 @@ mod mac_imageio {
             ui_type: u32,
             size: f64,
             language: *const c_void,
+        ) -> *mut OpaqueCTFont;
+        pub(super) fn CTFontCreateWithGraphicsFont(
+            graphics_font: *mut c_void,
+            size: f64,
+            matrix: *const c_void,
+            attributes: *const c_void,
+        ) -> *mut OpaqueCTFont;
+        pub(super) fn CTFontCreateWithName(
+            name: *const OpaqueCFString,
+            size: f64,
+            matrix: *const c_void,
         ) -> *mut OpaqueCTFont;
         pub(super) fn CTLineCreateWithAttributedString(
             attr_str: *const OpaqueCFAttributedString,
@@ -1731,6 +1748,259 @@ pub(crate) fn rasterize_coretext_rgba(text: &str, w_px: usize, h_px: usize) -> O
             px[2] = ((f32::from(px[2]) / af).round().clamp(0.0, 255.0)) as u8;
         }
     }
+    Some(buf)
+}
+
+/// Rasterize a single Unicode `codepoint` from an in-memory TTF/OTF font buffer (`font_bytes`),
+/// an installed macOS font name (`font_name`), or the system UI font into a centered straight-RGBA8
+/// Retina bitmap (`w_px x h_px`). When `tint` is `None`, renders pure white so Metal's
+/// `GlyphInst.color` can tint the glyph on the GPU.
+#[cfg(target_os = "macos")]
+pub(crate) fn rasterize_custom_font_glyph_rgba(
+    font_name: Option<&str>,
+    font_bytes: Option<&[u8]>,
+    codepoint: u32,
+    w_px: usize,
+    h_px: usize,
+    tint: Option<[u8; 4]>,
+) -> Option<Vec<u8>> {
+    use mac_imageio::*;
+    if w_px == 0 || h_px == 0 {
+        return None;
+    }
+    let ch = char::from_u32(codepoint)?;
+    let mut ch_buf = [0u8; 4];
+    let text = ch.encode_utf8(&mut ch_buf);
+    let (fg_r, fg_g, fg_b, fg_a) = match tint {
+        Some([r, g, b, a]) => (
+            f64::from(r) / 255.0,
+            f64::from(g) / 255.0,
+            f64::from(b) / 255.0,
+            f64::from(a) / 255.0,
+        ),
+        None => (1.0, 1.0, 1.0, 1.0),
+    };
+
+    let mut buf = vec![0u8; w_px * h_px * 4];
+    // SAFETY: Every CF/CG/CT handle created below is null-checked and explicitly released before
+    // returning; `buf` holds `w_px * h_px * 4` bytes and outlives `ctx`.
+    let drew = unsafe {
+        let space = CGColorSpaceCreateDeviceRGB();
+        if space.is_null() {
+            return None;
+        }
+        let ctx = CGBitmapContextCreate(
+            buf.as_mut_ptr().cast(),
+            w_px,
+            h_px,
+            8,
+            w_px * 4,
+            space,
+            RGBA8_PREMUL_LAST,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
+            return None;
+        }
+        CGContextSetShouldAntialias(ctx, true);
+
+        let cf_text = cf_str(text);
+        if cf_text.is_null() {
+            CGContextRelease(ctx);
+            return None;
+        }
+
+        let make_font = |pt: f64| -> *mut OpaqueCTFont {
+            if let Some(bytes) = font_bytes.filter(|b| !b.is_empty()) {
+                let cf_data = CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize);
+                if cf_data.is_null() {
+                    return std::ptr::null_mut();
+                }
+                let provider = CGDataProviderCreateWithCFData(cf_data);
+                CFRelease(cf_data.cast());
+                if provider.is_null() {
+                    return std::ptr::null_mut();
+                }
+                let cg_font = CGFontCreateWithDataProvider(provider);
+                CGDataProviderRelease(provider);
+                if cg_font.is_null() {
+                    return std::ptr::null_mut();
+                }
+                let ct_font =
+                    CTFontCreateWithGraphicsFont(cg_font, pt, std::ptr::null(), std::ptr::null());
+                CGFontRelease(cg_font);
+                ct_font
+            } else if let Some(name) = font_name.filter(|s| !s.is_empty()) {
+                let cf_name = cf_str(name);
+                if cf_name.is_null() {
+                    return std::ptr::null_mut();
+                }
+                let ct_font = CTFontCreateWithName(cf_name, pt, std::ptr::null());
+                CFRelease(cf_name.cast());
+                ct_font
+            } else {
+                CTFontCreateUIFontForLanguage(CT_UI_SYSTEM, pt, std::ptr::null())
+            }
+        };
+
+        let build_line = |pt: f64| -> (*mut OpaqueCTFont, *mut OpaqueCTLine, f64, f64, f64) {
+            let font = make_font(pt);
+            if font.is_null() {
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let fg = CGColorCreateGenericRGB(fg_r, fg_g, fg_b, fg_a);
+            let keys = [kCTFontAttributeName, kCTForegroundColorAttributeName];
+            let vals = [font as *const c_void, fg as *const c_void];
+            let attrs = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                vals.as_ptr(),
+                if fg.is_null() { 1 } else { 2 },
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
+            if !fg.is_null() {
+                CGColorRelease(fg);
+            }
+            if attrs.is_null() {
+                CFRelease(font.cast());
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let attr_s = CFAttributedStringCreate(std::ptr::null(), cf_text, attrs);
+            CFRelease(attrs.cast());
+            if attr_s.is_null() {
+                CFRelease(font.cast());
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let line = CTLineCreateWithAttributedString(attr_s);
+            CFRelease(attr_s.cast());
+            if line.is_null() {
+                CFRelease(font.cast());
+                return (std::ptr::null_mut(), std::ptr::null_mut(), 0.0, 0.0, 0.0);
+            }
+            let (mut asc, mut desc, mut lead) = (0.0f64, 0.0f64, 0.0f64);
+            let lw = CTLineGetTypographicBounds(line, &mut asc, &mut desc, &mut lead);
+            (font, line, lw, asc, desc)
+        };
+
+        let mut pt = (h_px as f64) * 0.84;
+        let (mut font, mut line, mut lw, mut asc, mut desc) = build_line(pt);
+        if !line.is_null() {
+            let max_w = (w_px as f64 - 2.0).max(1.0);
+            let max_h = (h_px as f64 - 2.0).max(1.0);
+            let total_h = asc + desc;
+            let scale_w = if lw > max_w && lw > 1.0 { max_w / lw } else { 1.0 };
+            let scale_h = if total_h > max_h && total_h > 1.0 { max_h / total_h } else { 1.0 };
+            let fit_scale = scale_w.min(scale_h);
+            if fit_scale < 1.0 {
+                CFRelease(line.cast());
+                CFRelease(font.cast());
+                pt *= fit_scale.clamp(0.25, 1.0);
+                let (f2, l2, w2, a2, d2) = build_line(pt);
+                font = f2;
+                line = l2;
+                lw = w2;
+                asc = a2;
+                desc = d2;
+            }
+        }
+
+        let ok = if !line.is_null() {
+            let draw_x = ((w_px as f64 - lw) * 0.5).max(0.5);
+            let total_h = (asc + desc).max(1.0);
+            let draw_y = ((h_px as f64 - total_h) * 0.5 + desc).max(0.5);
+            CGContextSetTextPosition(ctx, draw_x, draw_y);
+            CTLineDraw(line, ctx);
+            CFRelease(line.cast());
+            true
+        } else {
+            false
+        };
+        if !font.is_null() {
+            CFRelease(font.cast());
+        }
+        CFRelease(cf_text.cast());
+        CGContextRelease(ctx);
+        ok
+    };
+
+    if !drew {
+        return None;
+    }
+    unpremultiply_rgba(&mut buf);
+    Some(buf)
+}
+
+/// Decode in-memory PNG bytes via ImageIO and rasterize centered with preserved aspect ratio
+/// into a straight-RGBA8 Retina bitmap (`w_px x h_px`).
+#[cfg(target_os = "macos")]
+pub(crate) fn rasterize_png_bytes_rgba(
+    png_bytes: &[u8],
+    w_px: usize,
+    h_px: usize,
+) -> Option<Vec<u8>> {
+    use mac_imageio::*;
+    if png_bytes.is_empty() || w_px == 0 || h_px == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; w_px * h_px * 4];
+    // SAFETY: `png_bytes` is valid for `CFDataCreate`; every CF/CG handle is null-checked and
+    // released before returning; `buf` holds `w_px * h_px * 4` bytes and outlives `ctx`.
+    let ok = unsafe {
+        let cf_data = CFDataCreate(std::ptr::null(), png_bytes.as_ptr(), png_bytes.len() as isize);
+        if cf_data.is_null() {
+            return None;
+        }
+        let src = CGImageSourceCreateWithData(cf_data, std::ptr::null());
+        CFRelease(cf_data.cast());
+        if src.is_null() {
+            return None;
+        }
+        let img = CGImageSourceCreateImageAtIndex(src, 0, std::ptr::null());
+        CFRelease(src.cast());
+        if img.is_null() {
+            return None;
+        }
+        let src_w = CGImageGetWidth(img);
+        let src_h = CGImageGetHeight(img);
+        if src_w == 0 || src_h == 0 {
+            CGImageRelease(img);
+            return None;
+        }
+        let space = CGColorSpaceCreateDeviceRGB();
+        if space.is_null() {
+            CGImageRelease(img);
+            return None;
+        }
+        let ctx = CGBitmapContextCreate(
+            buf.as_mut_ptr().cast(),
+            w_px,
+            h_px,
+            8,
+            w_px * 4,
+            space,
+            RGBA8_PREMUL_LAST,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
+            CGImageRelease(img);
+            return None;
+        }
+        let scale = (w_px as f64 / src_w as f64).min(h_px as f64 / src_h as f64);
+        let draw_w = src_w as f64 * scale;
+        let draw_h = src_h as f64 * scale;
+        let draw_x = (w_px as f64 - draw_w) * 0.5;
+        let draw_y = (h_px as f64 - draw_h) * 0.5;
+        CGContextSetInterpolationQuality(ctx, INTERP_HIGH);
+        CGContextDrawImage(ctx, CGRectRaw { x: draw_x, y: draw_y, w: draw_w, h: draw_h }, img);
+        CGContextRelease(ctx);
+        CGImageRelease(img);
+        true
+    };
+    if !ok {
+        return None;
+    }
+    unpremultiply_rgba(&mut buf);
     Some(buf)
 }
 

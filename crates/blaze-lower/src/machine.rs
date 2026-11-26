@@ -1732,11 +1732,20 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                 // expanded, its expansion's, lowered in place (statements stay in their
                 // block's values, each one of its statements).
             }
-            // `builtin # pattern_type(base is pat)`: core's `pattern_type!` expanded.
+            // `builtin # pattern_type(base is pat)`, `base is pat`, or `base is in CONST_EXPR`.
             PATTERN_TYPE => {
                 let base = self.first(f, V::Type).map(|v| TypeId(v.id));
-                let pat = if self.has_tok(f, NOT_NULL) { Some(TyPat::NotNull) } else { self.first(f, V::Pat).map(|v| TyPat::Of(PatId(v.id))) };
+                let not_null = self.has_tok(f, NOT_NULL);
+                let const_set = self.first(f, V::Skipped(CONST_ARG)).map(|v| v.range);
+                let pat_id = self.first(f, V::Pat).map(|v| PatId(v.id));
                 self.done(f);
+                let pat = if not_null {
+                    Some(TyPat::NotNull)
+                } else if let Some(range) = const_set {
+                    Some(TyPat::In(self.put_const(range)))
+                } else {
+                    pat_id.map(TyPat::Of)
+                };
                 let t = match (base, pat) {
                     (Some(base), Some(pat)) => TypeRef::Pat { base, pat },
                     _ => {

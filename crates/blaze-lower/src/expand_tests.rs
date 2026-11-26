@@ -1296,6 +1296,53 @@ fn a_pattern_type_expands_to_its_one_form() {
     }
 }
 
+/// Finite const value-set pattern types (`SemVer is in VERSIONS`, `SemVer is in [V1, V2, V3]`)
+/// parse and lower to `TypeRef::Pat { base, pat: TyPat::In(const_idx) }` in both bare type
+/// positions (including a function return type before `{ ... }`) and `pattern_type!(...)`.
+#[test]
+fn const_set_pattern_types_parse_and_lower_to_ty_pat_in() {
+    let src = "fn f(x: SemVer is in [V1, V2, V3]) -> SemVer is in VERSIONS { let a: SemVer is in VERSIONS = x; let b: pattern_type!(SemVer is in [V1, V2, V3]) = a; b }";
+
+    // Signature lowering: parameter and return type (`-> SemVer is in VERSIONS { ... }` must not consume the body).
+    let sig = crate::lower_signature(src, Edition::E2024, &mut Unix, Alloc::global()).expect("lower signature");
+    let sv = sig.view();
+    let sig_unhandled: StdVec<_> = sv.unhandled().collect();
+    assert!(sig_unhandled.is_empty(), "unhandled {sig_unhandled:?}\n{}", dump_of(&sig));
+    let sig_tys: StdVec<TypeRef> = (0..sv.types.len()).map(|i| sv.ty(TypeId(i as u32)).expect("a type row")).collect();
+    let sig_pats: StdVec<TypeRef> = sig_tys.iter().copied().filter(|t| matches!(t, TypeRef::Pat { .. })).collect();
+    assert_eq!(sig_pats.len(), 2, "{sig_tys:?}");
+    for (pat, want) in sig_pats.iter().zip(["[V1, V2, V3]", "VERSIONS"].iter()) {
+        match *pat {
+            TypeRef::Pat { base, pat: TyPat::In(c) } => {
+                assert!(matches!(sv.ty(base), Ok(TypeRef::Path(_))), "{:?}", sv.ty(base));
+                let text = sv.text_at(sv.const_range(c).expect("const range")).expect("const text");
+                assert_eq!(text, *want);
+            }
+            other => panic!("expected TyPat::In, got {other:?}"),
+        }
+    }
+
+    // Body lowering (expanding): bare `SemVer is in VERSIONS` and `pattern_type!(SemVer is in [V1, V2, V3])`.
+    let l = expanding(&[], src);
+    let v = l.view();
+    let unhandled: StdVec<_> = v.unhandled().collect();
+    assert!(unhandled.is_empty(), "unhandled {unhandled:?}\n{}", dump_of(&l));
+    let tys: StdVec<TypeRef> = (0..v.types.len()).map(|i| v.ty(TypeId(i as u32)).expect("a type row")).collect();
+    assert!(!tys.iter().any(|t| matches!(t, TypeRef::Macro(_) | TypeRef::Error)), "{tys:?}");
+    let pats: StdVec<TypeRef> = tys.iter().copied().filter(|t| matches!(t, TypeRef::Pat { .. })).collect();
+    assert_eq!(pats.len(), 2, "{tys:?}");
+    for (pat, want) in pats.iter().zip(["VERSIONS", "[ V1 , V2 , V3 ]"].iter()) {
+        match *pat {
+            TypeRef::Pat { base, pat: TyPat::In(c) } => {
+                assert!(matches!(v.ty(base), Ok(TypeRef::Path(_))), "{:?}", v.ty(base));
+                let text = v.text_at(v.const_range(c).expect("const range")).expect("const text");
+                assert_eq!(text, *want);
+            }
+            other => panic!("expected TyPat::In, got {other:?}"),
+        }
+    }
+}
+
 fn label_diags(defs: &[(&'static str, &str)], text: &str) -> StdVec<DiagKind> {
     let l = expanding(defs, text);
     let v = l.view();

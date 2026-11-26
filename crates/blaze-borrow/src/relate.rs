@@ -247,16 +247,21 @@ struct Walk<'w, 'c, A: Allocator + Copy> {
     comp_sp: usize,
 }
 
+/// Maximum number of trait/projection arguments cached in normalized form for [`AskAt`].
+const MAX_NORM_ARGS: usize = 8;
+
 /// The ask's arguments `[Self, trait args..]`, where a side holds them.
 #[derive(Clone, Copy)]
 enum AskAt<'c> {
     /// An alias, or a bound laid subject-first (`ExTrait(Tr, [T, A..])`): its children.
     Kids(Side<'c>),
-    /// A bound with its subject apart (`ExTrait(Tr, [A..])`): the subject, then the children.
-    Subject { subject: Side<'c>, of: Side<'c> },
+    /// A bound with its subject apart (`ExTrait(Tr, [A..])`): the subject, then the children
+    /// (with any alias argument `1..MAX_NORM_ARGS` normalized into `norm[k]` when `Some`).
+    Subject { subject: Side<'c>, of: Side<'c>, norm: [Option<Side<'c>>; MAX_NORM_ARGS] },
     /// Subject-first node (`ExTrait`, `Alias`, or `ExProj` of `len` args) whose child 0 has
-    /// already been normalized to `subject`, with remaining arguments `1..len` from `of`.
-    SubjectKids { subject: Side<'c>, of: Side<'c>, len: u32 },
+    /// already been normalized to `subject`, with remaining arguments `1..len` from `of`
+    /// (with any alias argument `1..MAX_NORM_ARGS` normalized into `norm[k]` when `Some`).
+    SubjectKids { subject: Side<'c>, of: Side<'c>, len: u32, norm: [Option<Side<'c>>; MAX_NORM_ARGS] },
 }
 
 /// [`AskArgs`] over a walk: each argument followed through its environment and compared with a
@@ -273,9 +278,21 @@ impl<'c, A: Allocator + Copy> Keyer<'_, '_, 'c, A> {
         match self.at {
             AskAt::Kids(s) => self.walk.erased_kid(s, k),
             AskAt::Subject { subject, .. } if k == 0 => Some(subject),
-            AskAt::Subject { of, .. } => self.walk.erased_kid(of, k - 1),
+            AskAt::Subject { of, norm, .. } => {
+                if let Some(Some(s)) = norm.get(k as usize).copied() {
+                    Some(s)
+                } else {
+                    self.walk.erased_kid(of, k - 1)
+                }
+            }
             AskAt::SubjectKids { subject, .. } if k == 0 => Some(subject),
-            AskAt::SubjectKids { of, len, .. } if k < len => self.walk.erased_kid(of, k),
+            AskAt::SubjectKids { of, len, norm, .. } if k < len => {
+                if let Some(Some(s)) = norm.get(k as usize).copied() {
+                    Some(s)
+                } else {
+                    self.walk.erased_kid(of, k)
+                }
+            }
             AskAt::SubjectKids { .. } => None,
         }
     }
@@ -833,14 +850,17 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             b: PTy,
             next_k: u32,
             depth: u32,
+            /// Inside a matched `Alias` pair, a child mismatch means `Unknown` (the two aliases
+            /// may still normalize to the same type), never `Differ`.
+            in_alias: bool,
         }
         let open = |n: PNode| matches!(n, PNode::Infer | PNode::Error | PNode::Alias { .. });
         let mut stack: [Option<ErasedFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
         let mut sp: usize = 0;
         let mut out = Keyed::Same;
-        let mut enter = Some((a, b, depth));
+        let mut enter = Some((a, b, depth, false));
         loop {
-            if let Some((a, b, d)) = enter.take() {
+            if let Some((a, b, d, in_alias)) = enter.take() {
                 if d > MOST_WALK_DEPTH || budget.get() == 0 {
                     out = Keyed::Unknown;
                     continue;
@@ -863,19 +883,32 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     out = Keyed::Unknown;
                     continue;
                 };
+                // Two syntactically identical aliases (`<T as Tr>::A` vs `<T as Tr>::A`, e.g.
+                // inside `NodeTypesWithDBAdapter<Node::Types, Node::DB>`) match `Keyed::Same` when
+                // all their arguments match `Keyed::Same`; any mismatch inside an alias downgrades
+                // to `Keyed::Unknown` (never `Differ`, since distinct aliases can normalize equal).
+                let same_alias_head = matches!(
+                    (na, nb),
+                    (PNode::Alias { trait_: t1, name: n1, .. }, PNode::Alias { trait_: t2, name: n2, .. })
+                        if t1 == t2 && n1 == n2
+                );
                 // What structure does not decide: a hole, an error, or an alias not normalized here.
                 // Distinct `Opaque(x)` / `Opaque(y)` and `Opaque` vs concrete types are distinct
                 // nominal types in callers (`head_eq` returns `Keyed::Differ`).
-                if open(na) || open(nb) {
+                if !same_alias_head && (open(na) || open(nb)) {
                     out = Keyed::Unknown;
                     continue;
                 }
                 // A const's type is a node of its own table: compare its bits, then its type.
                 if let (PNode::ConstValue { ty: ta, bits: x }, PNode::ConstValue { ty: tb, bits: y }) = (na, nb) {
                     if x != y {
+                        if in_alias {
+                            out = Keyed::Unknown;
+                            continue;
+                        }
                         return Keyed::Differ;
                     }
-                    enter = Some((Side { ty: ta, slots: a.slots }, tb, d + 1));
+                    enter = Some((Side { ty: ta, slots: a.slots }, tb, d + 1, in_alias));
                     continue;
                 }
                 // An impl's or callee's const parameter (never bound by `blaze-borrow`, since
@@ -885,7 +918,11 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     out = Keyed::Unknown;
                     continue;
                 }
-                if !head_eq(na, nb) {
+                if !same_alias_head && !head_eq(na, nb) {
+                    if in_alias {
+                        out = Keyed::Unknown;
+                        continue;
+                    }
                     return Keyed::Differ;
                 }
                 let (Ok(ka), Ok(kb)) = (self.kids_of(a), self.types.kids(b)) else {
@@ -893,6 +930,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     continue;
                 };
                 if ka.len() != kb.len() {
+                    if in_alias || same_alias_head {
+                        out = Keyed::Unknown;
+                        continue;
+                    }
                     return Keyed::Differ;
                 }
                 if ka.len() > 0 {
@@ -900,7 +941,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         out = Keyed::Unknown;
                         continue;
                     };
-                    *slot = Some(ErasedFrame { a, b, next_k: 0, depth: d });
+                    *slot = Some(ErasedFrame { a, b, next_k: 0, depth: d, in_alias: in_alias || same_alias_head });
                     sp += 1;
                 }
                 continue;
@@ -927,7 +968,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     sp = top_idx;
                     continue;
                 };
-                enter = Some((Side { ty: x, slots: frame.a.slots }, y, frame.depth + 1));
+                enter = Some((Side { ty: x, slots: frame.a.slots }, y, frame.depth + 1, frame.in_alias));
             } else {
                 sp = top_idx;
             }
@@ -1018,7 +1059,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 let both_alias = matches!((na, nb), (PNode::Alias { .. }, PNode::Alias { .. }));
                 let same_alias = matches!((na, nb), (PNode::Alias { trait_: t, name: n, .. }, PNode::Alias { trait_: u, name: m, .. }) if t == u && n == m)
                     && self.erased_sides(a, b);
-                if !same_alias {
+                // A trait fn's RPITIT return type appears as `Opaque(op, args)` in the trait
+                // signature and as its synthetic `Alias { trait_, name, args }` in the caller's
+                // typed body. When delegating through a caller where-clause (no concrete impl
+                // selected), both sides denote the same abstract future and equate directly.
+                let same_rpitit = match (na, nb) {
+                    (PNode::Opaque(op, _), PNode::Alias { trait_, name, .. })
+                    | (PNode::Alias { trait_, name, .. }, PNode::Opaque(op, _)) => self.selected.is_rpitit_alias(op, trait_, name),
+                    _ => false,
+                };
+                if !same_alias && !same_rpitit {
                     if matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. }) {
                         let mut ba = MOST_WALK_STEPS;
                         let mut bb = MOST_WALK_STEPS;
@@ -1097,7 +1147,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         continue;
                     }
                 }
-                let mut heads_match = head_eq(na, nb);
+                let mut heads_match = head_eq(na, nb) || same_rpitit;
                 if !heads_match {
                     if let PNode::Opaque(op_key, _) = na {
                         match self.normalize_rpitit(a, op_key, nb, d)? {
@@ -1230,8 +1280,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let kids = self.kids_of(s)?;
         let (_, args_rest) = s.slots.split(own).ok_or(self.malformed(s.ty, Bad::StepBound))?;
         let mut norm_subject = None;
+        let mut norm_args = [None; MAX_NORM_ARGS];
         if kids.len() > 0 {
-            let (subject, _) = self.kid(s, &kids, args_rest, 0)?;
+            let (subject, mut rem) = self.kid(s, &kids, args_rest, 0)?;
             if let Resolved::Side(subject) = self.resolve(subject)? {
                 let subject = self.try_normalize_subject(subject, depth);
                 norm_subject = Some(subject);
@@ -1239,10 +1290,22 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     return Ok(val);
                 }
             }
+            for k in 1..kids.len() {
+                let (arg, r) = self.kid(s, &kids, rem, k)?;
+                rem = r;
+                if let Some(slot) = norm_args.get_mut(k as usize)
+                    && let Resolved::Side(arg_s) = self.resolve(arg)?
+                {
+                    let (n, changed) = self.try_normalize_subject_flag(arg_s, depth);
+                    if changed {
+                        *slot = Some(n);
+                    }
+                }
+            }
         }
         let selected: &'c dyn Selected = self.selected;
         let at = match norm_subject {
-            Some(subject) => AskAt::SubjectKids { subject, of: s, len: kids.len() },
+            Some(subject) => AskAt::SubjectKids { subject, of: s, len: kids.len(), norm: norm_args },
             None => AskAt::Kids(s),
         };
         let key = Keyer { walk: &*self, at, budget: Cell::new(MOST_WALK_STEPS) };
@@ -2294,8 +2357,30 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(());
         }
         let param_miss = matches!(self.node(subject)?, PNode::Param(_));
+        let mut norm_args = [None; MAX_NORM_ARGS];
+        if self.fits(trait_ref).is_ok()
+            && let Ok(own) = self.own(trait_ref)
+            && let Ok(kids) = self.kids_of(trait_ref)
+            && let Some((_, mut rem)) = trait_ref.slots.split(own)
+        {
+            for k in 0..kids.len() {
+                if let Ok((arg, r)) = self.kid(trait_ref, &kids, rem, k) {
+                    rem = r;
+                    if let Some(slot) = norm_args.get_mut((k + 1) as usize)
+                        && let Ok(Resolved::Side(arg_s)) = self.resolve(arg)
+                    {
+                        let (n, changed) = self.try_normalize_subject_flag(arg_s, 0);
+                        if changed {
+                            *slot = Some(n);
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
         let selected: &'c dyn Selected = self.selected;
-        let key = Keyer { walk: &*self, at: AskAt::Subject { subject, of: trait_ref }, budget: Cell::new(MOST_WALK_STEPS) };
+        let key = Keyer { walk: &*self, at: AskAt::Subject { subject, of: trait_ref, norm: norm_args }, budget: Cell::new(MOST_WALK_STEPS) };
         match selected.select_keyed(Ask { trait_, name: None, written: trait_ref.ty }, &key) {
             Selection::Impl { head, .. } => {
                 let env = self.envs.impl_env(head.lifetimes, head.types).ok_or(self.malformed(trait_ref.ty, Bad::StepBound))?;
@@ -2844,8 +2929,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return self.walk(norm, term, Variance::In, 1);
         }
         // Reflexive projection equality (`<T as Tr<A..>>::N == <T as Tr<A..>>::N`, e.g.
-        // `P: WriterIn<Buffer = B>` instantiated with `B = P::Buffer`): relate own lifetime slots
-        // and `[Self, A..]` invariantly, just as `walk_loop`'s `same_alias` does.
+        // `P: WriterIn<Buffer = B>` instantiated with `B = P::Buffer`, or
+        // `Pool::Transaction::Pooled == <BasicNetworkPrimitives<_, Pool::Transaction::Pooled> as NetworkPrimitives>::PooledTransaction`):
+        // normalize `term` first so projections that reduce to the same alias match reflexively,
+        // then relate own lifetime slots and `[Self, A..]` invariantly, just as `walk_loop`'s
+        // `same_alias` does.
+        let term = if let Resolved::Side(term_res) = self.resolve(term)? {
+            self.try_normalize_subject(term_res, 0)
+        } else {
+            term
+        };
         if let Resolved::Side(term_res) = self.resolve(term)?
             && let PNode::Alias { trait_: t2, name: n2, .. } = self.node(term_res)?
             && t2 == trait_
@@ -2883,8 +2976,24 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        let mut norm_args = [None; MAX_NORM_ARGS];
+        if last > 1 {
+            let (_, mut rem) = self.kid(proj, &kids, args_rest, 0)?;
+            for k in 1..last {
+                let (arg, r) = self.kid(proj, &kids, rem, k)?;
+                rem = r;
+                if let Some(slot) = norm_args.get_mut(k as usize)
+                    && let Resolved::Side(arg_s) = self.resolve(arg)?
+                {
+                    let (n, changed) = self.try_normalize_subject_flag(arg_s, 0);
+                    if changed {
+                        *slot = Some(n);
+                    }
+                }
+            }
+        }
         let selected: &'c dyn Selected = self.selected;
-        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: proj, len: last }, budget: Cell::new(MOST_WALK_STEPS) };
+        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: proj, len: last, norm: norm_args }, budget: Cell::new(MOST_WALK_STEPS) };
         let (head, value) = match selected.select_keyed(Ask { trait_, name: Some(name), written: proj.ty }, &key) {
             Selection::Impl { head, value: Some(value) } => (head, value),
             Selection::Impl { value: None, .. } => return Err(self.malformed(proj.ty, Bad::NoValue)),
@@ -2963,24 +3072,49 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(());
         }
         let (subject, normalized) = self.try_normalize_subject_flag(raw_subject, 0);
+        // Normalize any alias trait arguments (`k in 1..kids.len()`) so both the all-inert check
+        // and `select_keyed` see concrete normalized types (e.g. `EthApiError: From<M::Err> +
+        // From<H::Err>` distinguishes `From<ErrA>` from `From<ErrB>` instead of colliding as
+        // `TwoSources`).
+        let mut norm_args = [None; MAX_NORM_ARGS];
+        let mut norm_ok = true;
+        {
+            let mut nrest = rest;
+            for k in 1..kids.len() {
+                let (arg, r) = self.kid(trait_ref, &kids, nrest, k)?;
+                nrest = r;
+                match self.resolve(arg)? {
+                    Resolved::Side(s) => {
+                        let (n, changed) = self.try_normalize_subject_flag(s, 0);
+                        if changed && let Some(slot) = norm_args.get_mut(k as usize) {
+                            *slot = Some(n);
+                        }
+                    }
+                    Resolved::Unbound { .. } => norm_ok = false,
+                }
+            }
+        }
         // If normalizing the subject or any alias trait argument yields an all-inert goal
         // (e.g. `usize: Sum<<Map<Iter<'a, _>, C> as Iterator>::Item>` -> `usize: Sum<usize>`),
         // the normalized impls' own where-clauses have already been checked and the goal itself
         // relates no region (so `selected_rows` rightly skipped filing a row for it).
-        if own == SlotCount::ZERO {
+        if own == SlotCount::ZERO && norm_ok {
             let mut b = MOST_WALK_STEPS;
             if self.inert(subject, 0, &mut b)? {
                 let mut all_inert = true;
                 let mut irest = rest;
                 for k in 1..kids.len() {
-                    let (arg, r) = self.kid(trait_ref, &kids, irest, k)?;
+                    let (raw_arg, r) = self.kid(trait_ref, &kids, irest, k)?;
                     irest = r;
-                    let arg = match self.resolve(arg)? {
-                        Resolved::Side(s) => self.try_normalize_subject(s, 0),
-                        Resolved::Unbound { .. } => {
-                            all_inert = false;
-                            break;
-                        }
+                    let arg = match norm_args.get(k as usize).copied().flatten() {
+                        Some(n) => n,
+                        None => match self.resolve(raw_arg)? {
+                            Resolved::Side(s) => self.try_normalize_subject(s, 0),
+                            Resolved::Unbound { .. } => {
+                                all_inert = false;
+                                break;
+                            }
+                        },
                     };
                     let mut kb = MOST_WALK_STEPS;
                     if !self.inert(arg, 0, &mut kb)? {
@@ -2997,7 +3131,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(());
         }
         let param_miss = matches!(self.node(subject)?, PNode::Param(_));
-        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: trait_ref, len: kids.len() }, budget: Cell::new(MOST_WALK_STEPS) };
+        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: trait_ref, len: kids.len(), norm: norm_args }, budget: Cell::new(MOST_WALK_STEPS) };
         let head = match selected.select_keyed(Ask { trait_, name: None, written: trait_ref.ty }, &key) {
             Selection::Impl { head, .. } => head,
             Selection::Not(NotSelected::Builtin) if self.nothing_to_tie(trait_ref, 1)? => return Ok(()),

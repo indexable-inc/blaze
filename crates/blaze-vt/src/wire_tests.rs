@@ -325,6 +325,32 @@ fn osc_bounded_capture_is_invalid_past_max_buf() {
     assert_eq!(t.stats().0.strings_truncated, 1);
 }
 
+#[test]
+fn osc_7770_blaze_term_api_effects() {
+    let mut t = fed(10, 3, b"\x1b]7770;{\"op\":\"ping\"}\x1b\\\x1b]7770;op=ping\x07");
+    let (list, fx) = effects(&mut t);
+    let [Effect::BlazeTermApi(s1), Effect::BlazeTermApi(s2)] = list[..] else {
+        panic!("{list:?}");
+    };
+    assert_eq!(fx.bytes(s1), b"{\"op\":\"ping\"}");
+    assert_eq!(fx.bytes(s2), b"op=ping");
+
+    // Empty / missing `;` are ignored as unsupported.
+    t.feed(b"\x1b]7770;\x07\x1b]7770\x1b\\");
+    assert_eq!(effects(&mut t).0, []);
+    assert_eq!(t.stats().0.unsupported, 2);
+
+    // Unbounded capture: payloads larger than MAX_BUF (2048) pass through intact.
+    let payload: StdVec<u8> = core::iter::repeat_n(b'z', crate::osc::MAX_BUF + 1024).collect();
+    let mut seq = StdVec::from(&b"\x1b]7770;"[..]);
+    seq.extend_from_slice(&payload);
+    seq.extend_from_slice(b"\x1b\\");
+    t.feed(&seq);
+    let (list, fx) = effects(&mut t);
+    let [Effect::BlazeTermApi(big)] = list[..] else { panic!("{list:?}") };
+    assert_eq!(fx.bytes(big), payload.as_slice());
+}
+
 // ---- OSC 52 -------------------------------------------------------------------------------
 
 #[test]

@@ -830,3 +830,41 @@ fn may_partial_move_bindings_marks_expr_let_scrutinee() {
     let flags = crate::coroutine_state::may_partial_move_bindings(&view, &checked, a);
     assert!(flags[pending.ix()], "`Expr::Let` scrutinee local must be marked as partial-move");
 }
+
+/// Regression: an `.await` result held as a temporary across a subsequent `.await`
+/// (e.g. `let r = &twice().await; let w = twice().await; *r + w` or `lock().await.next().await`)
+/// is saved by the flow under `Identity::Temp(first_await, Role::Result)`, not `Role::Value`.
+/// `hold_temp` / `hold_copy_temp` must fall back to `Role::Result` so the spilled slot is placed
+/// in the laid coroutine state rather than rejected as unnamed across suspension.
+#[test]
+fn await_result_temp_borrowed_across_second_await_uses_result_role() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "await_temp_across", "await_temp_across_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let r = &twice().await;
+    let first = call_await(&mut b, "twice");
+    let ref_first = ref_expr(&mut b, blaze_typeck::Mutbl::Not, first);
+    let r = b.bind("r");
+    let s0 = b.let_(r, None, ref_first);
+    // let w = twice().await;
+    let second = call_await(&mut b, "twice");
+    let (s1, wv) = let_u64(&mut b, "w", second);
+    // *r + w
+    let rl = b.local(r);
+    let deref_r = deref_expr(&mut b, rl);
+    let wl = b.local(wv);
+    let total = bin(&mut b, BinOp::Add, deref_r, wl);
+    let body = b.block(&[s0, s1], Some(total));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    let saved = [
+        (Identity::Temp(first, Role::Awaitee), (16, 3), false),
+        (Identity::Temp(first, Role::Result), (8, 3), false),
+        (Identity::Binding(r), (8, 3), false),
+        (Identity::Temp(second, Role::Awaitee), (16, 3), false),
+    ];
+    let laid = Laid::new((0, 0), &saved, 2, StatePlant::None);
+    assert_ran(run_laid(&w, &progs, Script::Complete, Some(&laid)), Ran { value: 4, polls: 5, drops: 0, made: 2 });
+}

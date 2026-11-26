@@ -459,9 +459,12 @@ fn parse_color(v: &str) -> Result<Option<[f32; 4]>, String> {
     };
     Ok(Some(match v {
         "none" | "transparent" => return Ok(None),
-        "white" => [1.0, 1.0, 1.0, 1.0],
+        "white" | "currentColor" | "currentcolor" => [1.0, 1.0, 1.0, 1.0],
         "black" => [0.0, 0.0, 0.0, 1.0],
         _ => match v.strip_prefix('#') {
+            Some(h) if h.len() == 8 && h.is_ascii() => {
+                [hex(&h[0..2])?, hex(&h[2..4])?, hex(&h[4..6])?, hex(&h[6..8])?]
+            }
             Some(h) if h.len() == 6 && h.is_ascii() => [hex(&h[0..2])?, hex(&h[2..4])?, hex(&h[4..6])?, 1.0],
             Some(h) if h.len() == 3 && h.is_ascii() => {
                 let d = |i: usize| hex(&h[i..=i].repeat(2));
@@ -752,6 +755,7 @@ pub struct IconAtlas {
     cell_px: usize,
     slots: HashMap<&'static str, Option<IconSlot>>,
     emoji_slots: HashMap<(String, usize), Option<IconSlot>>,
+    custom_slots: HashMap<(String, u64, usize, usize), Option<IconSlot>>,
     next_x: usize,
     next_y: usize,
     row_h: usize,
@@ -767,6 +771,7 @@ impl IconAtlas {
             cell_px,
             slots: HashMap::new(),
             emoji_slots: HashMap::new(),
+            custom_slots: HashMap::new(),
             next_x: 0,
             next_y: 0,
             row_h: 0,
@@ -830,6 +835,89 @@ impl IconAtlas {
         }
     }
 
+    /// Rasterize custom symbols registered via the Blaze Terminal API (SVG, in-memory font glyph,
+    /// PNG bitmap, or composite text) into the RGBA8 Metal icon atlas and append their quads into `out`.
+    pub fn rasterize_custom_symbol_quads_into(
+        &mut self,
+        quads: &[crate::view::CustomSymbolQuad],
+        out: &mut Vec<blaze_ui::shaders::GlyphInst>,
+    ) {
+        let inv = 1.0 / ICON_ATLAS_SIZE as f32;
+        for q in quads {
+            if q.name.is_empty() || q.w <= 0.0 || q.h <= 0.0 {
+                continue;
+            }
+            let Some(sym) = crate::term_server::lookup_global_symbol(&q.name) else {
+                continue;
+            };
+            let h_px = self.cell_px;
+            let aspect = (q.w / q.h).clamp(0.5, 4.0);
+            let w_px = ((h_px as f32) * aspect).round().clamp(16.0, 256.0) as usize;
+            let Some(slot) = self.custom_symbol_slot(&sym, w_px, h_px) else {
+                continue;
+            };
+            let color = if let Some(t) = q.tint {
+                [t[0], t[1], t[2], t[3] * q.alpha]
+            } else {
+                [1.0, 1.0, 1.0, q.alpha]
+            };
+            out.push(blaze_ui::shaders::GlyphInst {
+                rect: [q.x, q.y, q.x + q.w, q.y + q.h],
+                uv: [
+                    slot.x as f32 * inv,
+                    slot.y as f32 * inv,
+                    (slot.x + slot.w) as f32 * inv,
+                    (slot.y + slot.h) as f32 * inv,
+                ],
+                color,
+                clip_info: [q.clip_id, 0, 0, 0],
+            });
+        }
+    }
+
+    fn custom_symbol_slot(
+        &mut self,
+        sym: &crate::term_server::SymbolSnapshot,
+        w_px: usize,
+        h_px: usize,
+    ) -> Option<IconSlot> {
+        let key = (sym.name.clone(), sym.revision, w_px, h_px);
+        if let Some(&cached) = self.custom_slots.get(&key) {
+            return cached;
+        }
+        let rgba = match &sym.source {
+            crate::term_server::SymbolSourceSnapshot::Svg { markup, monochrome } => parse_svg(markup)
+                .ok()
+                .and_then(|art| rasterize_svg_art_rgba(&art, w_px, h_px, *monochrome)),
+            crate::term_server::SymbolSourceSnapshot::FontGlyph {
+                font_name,
+                font_data,
+                codepoint,
+                tint,
+            } => crate::image_atlas::rasterize_custom_font_glyph_rgba(
+                font_name.as_deref(),
+                font_data.as_deref(),
+                *codepoint,
+                w_px,
+                h_px,
+                *tint,
+            ),
+            crate::term_server::SymbolSourceSnapshot::Png { data } => {
+                crate::image_atlas::rasterize_png_bytes_rgba(data, w_px, h_px)
+            }
+            crate::term_server::SymbolSourceSnapshot::Text { text } => {
+                rasterize_coretext_rgba(text, w_px, h_px)
+            }
+        };
+        let slot = rgba.and_then(|bytes| {
+            let s = self.alloc_rect(w_px, h_px)?;
+            self.pending.push((s, bytes));
+            Some(s)
+        });
+        self.custom_slots.insert(key, slot);
+        slot
+    }
+
     fn alloc_rect(&mut self, w_px: usize, h_px: usize) -> Option<IconSlot> {
         let step_w = w_px + 2;
         let step_h = h_px + 2;
@@ -880,105 +968,124 @@ impl IconAtlas {
     fn rasterize(&mut self, name: &'static str) -> Option<IconSlot> {
         let art = get_svg(name)?;
         let sz = self.cell_px;
+        let buf = rasterize_svg_art_rgba(art, sz, sz, false)?;
         let slot = self.alloc_rect(sz, sz)?;
-
-        let mut buf = vec![0u8; sz * sz * 4];
-        {
-            use objc2_core_graphics::{
-                CGBitmapContextCreate, CGColorSpace, CGContext, CGLineCap, CGLineJoin,
-            };
-
-            let space = CGColorSpace::new_device_rgb()?;
-            // kCGImageAlphaPremultipliedLast (1) | kCGBitmapByteOrder32Big (0).
-            // SAFETY: `buf` holds `sz * sz * 4` bytes and lives past context drop.
-            let ctx = unsafe {
-                CGBitmapContextCreate(buf.as_mut_ptr().cast(), sz, sz, 8, sz * 4, Some(&space), 1)
-            }?;
-            CGContext::set_should_antialias(Some(&ctx), true);
-            CGContext::set_allows_antialiasing(Some(&ctx), true);
-            CGContext::set_line_cap(Some(&ctx), CGLineCap::Round);
-            CGContext::set_line_join(Some(&ctx), CGLineJoin::Round);
-
-            let [vx, vy, vw, vh] = art.view;
-            let s = (sz as f64 / vw).min(sz as f64 / vh);
-            let ox = (sz as f64 - vw * s) * 0.5 - vx * s;
-            let oy = (sz as f64 - vh * s) * 0.5 - vy * s;
-            // CoreGraphics origin is bottom-left; SVG y goes down, so flip y into [0, sz].
-            let map = |p: [f64; 2]| -> (f64, f64) { (ox + p[0] * s, sz as f64 - (oy + p[1] * s)) };
-
-            for layer in &art.layers {
-                let emit_path = |ctx: &CGContext| {
-                    CGContext::begin_path(Some(ctx));
-                    for seg in &layer.segs {
-                        match *seg {
-                            Seg::Move(p) => {
-                                let (x, y) = map(p);
-                                CGContext::move_to_point(Some(ctx), x, y);
-                            }
-                            Seg::Line(p) => {
-                                let (x, y) = map(p);
-                                CGContext::add_line_to_point(Some(ctx), x, y);
-                            }
-                            Seg::Quad(c, p) => {
-                                let (cx, cy) = map(c);
-                                let (x, y) = map(p);
-                                CGContext::add_quad_curve_to_point(Some(ctx), cx, cy, x, y);
-                            }
-                            Seg::Cubic(c1, c2, p) => {
-                                let (x1, y1) = map(c1);
-                                let (x2, y2) = map(c2);
-                                let (x, y) = map(p);
-                                CGContext::add_curve_to_point(Some(ctx), x1, y1, x2, y2, x, y);
-                            }
-                            Seg::Close => CGContext::close_path(Some(ctx)),
-                        }
-                    }
-                };
-
-                if let Some(ink) = layer.fill {
-                    emit_path(&ctx);
-                    CGContext::set_rgb_fill_color(
-                        Some(&ctx),
-                        f64::from(ink[0]),
-                        f64::from(ink[1]),
-                        f64::from(ink[2]),
-                        f64::from(ink[3]),
-                    );
-                    if layer.even_odd {
-                        CGContext::eo_fill_path(Some(&ctx));
-                    } else {
-                        CGContext::fill_path(Some(&ctx));
-                    }
-                }
-                if let Some((ink, w)) = layer.stroke {
-                    emit_path(&ctx);
-                    CGContext::set_rgb_stroke_color(
-                        Some(&ctx),
-                        f64::from(ink[0]),
-                        f64::from(ink[1]),
-                        f64::from(ink[2]),
-                        f64::from(ink[3]),
-                    );
-                    CGContext::set_line_width(Some(&ctx), (w * s).max(0.75));
-                    CGContext::stroke_path(Some(&ctx));
-                }
-            }
-        }
-
-        // Convert premultiplied RGBA from CoreGraphics into straight RGBA for `ui_sprite_fs`.
-        for px in buf.chunks_exact_mut(4) {
-            let a = px[3];
-            if a > 0 && a < 255 {
-                let af = f32::from(a) / 255.0;
-                px[0] = ((f32::from(px[0]) / af).round().clamp(0.0, 255.0)) as u8;
-                px[1] = ((f32::from(px[1]) / af).round().clamp(0.0, 255.0)) as u8;
-                px[2] = ((f32::from(px[2]) / af).round().clamp(0.0, 255.0)) as u8;
-            }
-        }
-
         self.pending.push((slot, buf));
         Some(slot)
     }
+}
+
+/// Rasterize a parsed [`SvgArt`] at Retina resolution (`w_px x h_px`) into straight-RGBA8 bytes
+/// using CoreGraphics. When `monochrome` is true, every fill/stroke renders white RGB while
+/// preserving layer alpha so Metal's `GlyphInst.color` tints it on the GPU.
+#[cfg(target_os = "macos")]
+fn rasterize_svg_art_rgba(
+    art: &SvgArt,
+    w_px: usize,
+    h_px: usize,
+    monochrome: bool,
+) -> Option<Vec<u8>> {
+    let [vx, vy, vw, vh] = art.view;
+    if w_px == 0 || h_px == 0 || vw <= 0.0 || vh <= 0.0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; w_px * h_px * 4];
+    {
+        use objc2_core_graphics::{
+            CGBitmapContextCreate, CGColorSpace, CGContext, CGLineCap, CGLineJoin,
+        };
+
+        let space = CGColorSpace::new_device_rgb()?;
+        // kCGImageAlphaPremultipliedLast (1) | kCGBitmapByteOrder32Big (0).
+        // SAFETY: `buf` holds `w_px * h_px * 4` bytes and lives past context drop.
+        let ctx = unsafe {
+            CGBitmapContextCreate(buf.as_mut_ptr().cast(), w_px, h_px, 8, w_px * 4, Some(&space), 1)
+        }?;
+        CGContext::set_should_antialias(Some(&ctx), true);
+        CGContext::set_allows_antialiasing(Some(&ctx), true);
+        CGContext::set_line_cap(Some(&ctx), CGLineCap::Round);
+        CGContext::set_line_join(Some(&ctx), CGLineJoin::Round);
+
+        let s = (w_px as f64 / vw).min(h_px as f64 / vh);
+        let ox = (w_px as f64 - vw * s) * 0.5 - vx * s;
+        let oy = (h_px as f64 - vh * s) * 0.5 - vy * s;
+        // CoreGraphics origin is bottom-left; SVG y goes down, so flip y into [0, h_px].
+        let map = |p: [f64; 2]| -> (f64, f64) { (ox + p[0] * s, h_px as f64 - (oy + p[1] * s)) };
+
+        for layer in &art.layers {
+            let emit_path = |ctx: &CGContext| {
+                CGContext::begin_path(Some(ctx));
+                for seg in &layer.segs {
+                    match *seg {
+                        Seg::Move(p) => {
+                            let (x, y) = map(p);
+                            CGContext::move_to_point(Some(ctx), x, y);
+                        }
+                        Seg::Line(p) => {
+                            let (x, y) = map(p);
+                            CGContext::add_line_to_point(Some(ctx), x, y);
+                        }
+                        Seg::Quad(c, p) => {
+                            let (cx, cy) = map(c);
+                            let (x, y) = map(p);
+                            CGContext::add_quad_curve_to_point(Some(ctx), cx, cy, x, y);
+                        }
+                        Seg::Cubic(c1, c2, p) => {
+                            let (x1, y1) = map(c1);
+                            let (x2, y2) = map(c2);
+                            let (x, y) = map(p);
+                            CGContext::add_curve_to_point(Some(ctx), x1, y1, x2, y2, x, y);
+                        }
+                        Seg::Close => CGContext::close_path(Some(ctx)),
+                    }
+                }
+            };
+
+            if let Some(ink) = layer.fill {
+                emit_path(&ctx);
+                let (r, g, b, a) = if monochrome {
+                    (1.0, 1.0, 1.0, f64::from(ink[3]))
+                } else {
+                    (f64::from(ink[0]), f64::from(ink[1]), f64::from(ink[2]), f64::from(ink[3]))
+                };
+                CGContext::set_rgb_fill_color(Some(&ctx), r, g, b, a);
+                if layer.even_odd {
+                    CGContext::eo_fill_path(Some(&ctx));
+                } else {
+                    CGContext::fill_path(Some(&ctx));
+                }
+            }
+            if let Some((ink, w)) = layer.stroke {
+                emit_path(&ctx);
+                let (r, g, b, a) = if monochrome {
+                    (1.0, 1.0, 1.0, f64::from(ink[3]))
+                } else {
+                    (f64::from(ink[0]), f64::from(ink[1]), f64::from(ink[2]), f64::from(ink[3]))
+                };
+                CGContext::set_rgb_stroke_color(Some(&ctx), r, g, b, a);
+                CGContext::set_line_width(Some(&ctx), (w * s).max(0.75));
+                CGContext::stroke_path(Some(&ctx));
+            }
+        }
+    }
+
+    // Convert premultiplied RGBA from CoreGraphics into straight RGBA for `ui_sprite_fs`.
+    for px in buf.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        } else if a < 255 {
+            let af = f32::from(a) / 255.0;
+            px[0] = ((f32::from(px[0]) / af).round().clamp(0.0, 255.0)) as u8;
+            px[1] = ((f32::from(px[1]) / af).round().clamp(0.0, 255.0)) as u8;
+            px[2] = ((f32::from(px[2]) / af).round().clamp(0.0, 255.0)) as u8;
+        }
+    }
+
+    Some(buf)
 }
 
 /// Rasterize a UTF-8 emoji or custom symbol string (`"🦑"`, `"👋🌎"`, `"🔥"`, `"λ"`) into a

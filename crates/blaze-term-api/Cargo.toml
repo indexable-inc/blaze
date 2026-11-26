@@ -1,0 +1,19 @@
+[package]
+name = "blaze-term-api"
+description = "Pure no_std, zero-unsafe, sans-IO terminal entity and symbol registry protocol (JSON-RPC, OSC 7770, canonical snapshots)"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+authors = ["blaze contributors"]
+
+[lib]
+name = "blaze_term_api"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+blaze-own = { path = "../blaze-own" }
+blaze-data = { path = "../blaze-data" }
+blaze-json = { path = "../blaze-json" }
+blaze-base64 = { path = "../blaze-base64" }

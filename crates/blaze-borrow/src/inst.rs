@@ -1297,4 +1297,11 @@ pub trait Selected {
         let _ = (opaque, args);
         None
     }
+    /// Whether `opaque` is the trait-fn RPITIT opaque corresponding to the synthetic RPITIT
+    /// associated type `(trait_, name)` (written as `Opaque` in the trait signature and as
+    /// `Alias { trait_, name, .. }` in typeck).
+    fn is_rpitit_alias(&self, opaque: ItemKey, trait_: ItemKey, name: Name) -> bool {
+        let _ = (opaque, trait_, name);
+        false
+    }
 }

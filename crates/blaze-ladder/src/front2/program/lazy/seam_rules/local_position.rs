@@ -338,10 +338,28 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
         }
     }
     let range = current.ok_or(PositionGap::NoItem)?;
-    for copy in copies {
+    for (idx, copy) in copies.iter().copied().enumerate() {
         let end = copy.to.checked_add(copy.len).ok_or(PositionGap::PastText)?;
         if !(copy.to <= range.start && range.start < end) {
             continue;
+        }
+        // An expression call whose statement carries outer attributes (e.g. reth's
+        // `#[expect(clippy::needless_continue)] let events = stream_select!(..);`) is rendered
+        // by `expanded_blocks::render` (`Event::Call`) as two copies separated by a synthetic
+        // `\n`: the statement's attributes, then the call itself (plus optional synthetic `;`).
+        // Rust places a function-like call at the call's own path (past outer attributes), so
+        // return the call copy's written range in `body`.
+        if let Some(next) = copies.get(idx + 1).copied()
+            && rendered.get(end as usize..next.to as usize) == Some("\n")
+        {
+            let next_end = next.to.checked_add(next.len).ok_or(PositionGap::PastText)?;
+            let tail_ok = range.end <= next_end || rendered.get(next_end as usize..range.end as usize) == Some(";");
+            if range.end > next.to && tail_ok {
+                let last = next_end.min(range.end);
+                let start = next.from;
+                let end = start.checked_add(last - next.to).ok_or(PositionGap::PastText)?;
+                return Ok(Range::new(start, end));
+            }
         }
         // A `(..)` or `[..]` call is copied and then given the `;` an item-position call ends
         // with (blaze-scope expanded_blocks.rs `render`, `Event::Call`): rand's tail call
@@ -363,7 +381,33 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
 
 #[cfg(test)]
 mod tests {
-    use super::first_token;
+    use super::{first_token, written_range};
+    use blaze_surface::{Edition, ItemKind};
+
+    /// An expression-position macro call whose enclosing `let` carries an outer attribute
+    /// (`reth_node_builder`'s `#[expect(clippy::needless_continue)] let events = stream_select!(..);`):
+    /// `expanded_blocks::render` copies the attribute and the call as two disjoint slices joined by
+    /// a synthetic `\n`, plus a synthetic `;`. `written_range` must locate the call's exact written
+    /// span in the body (past the attribute and `let events = `), matching both paren and brace calls.
+    #[test]
+    fn attributed_expr_macro_call_in_body_resolves_to_call_span() {
+        let alloc = blaze_own::Alloc::global();
+        for call in ["stream_select!(a, b)", "stream_select! { a, b }"] {
+            let body = format!("fn f() {{\n    #[expect(clippy::needless_continue)]\n    let events = {call};\n}}\n");
+            let nested = blaze_file_items::nested::scan(&body, alloc);
+            let rendered = blaze_scope::blocks::module_text(&body, &nested, &mut |_| {}, alloc);
+            let outline = blaze_file_items::outline(&rendered, Edition::E2024, alloc);
+            let macro_item = outline
+                .items()
+                .iter()
+                .find(|it| it.kind() == ItemKind::MacroCall)
+                .expect("macro call in rendered block module");
+            let chain = blaze_file_items::item_chain(&outline, macro_item, &rendered);
+            let range = written_range(&body, chain, Edition::E2024, alloc)
+                .unwrap_or_else(|e| panic!("attributed `{call}` must resolve: {e:?}"));
+            assert_eq!(&body[range.start as usize..range.end as usize], call);
+        }
+    }
 
     /// curve25519-dalek's shape (two `///` lines, then `#[inline(always)]`): the declaration
     /// starts at the `#`, where the text scan starts it; a nested block comment and a plain

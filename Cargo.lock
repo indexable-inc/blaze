@@ -201,6 +201,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 name = "bgit"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-deflate",
  "blaze-git",
  "blaze-git-fetch",
@@ -814,6 +815,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ctx"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-cbor",
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+ "blaze-tab",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-cunit"
 version = "0.0.0"
 dependencies = [
@@ -959,6 +973,7 @@ dependencies = [
  "blaze-code",
  "blaze-hash",
  "blaze-ids",
+ "blaze-lir",
  "blaze-mem",
  "blaze-native",
  "blaze-own",
@@ -1732,6 +1747,7 @@ dependencies = [
  "blaze-build-script",
  "blaze-core",
  "blaze-expand",
+ "blaze-export",
  "blaze-fetch",
  "blaze-file-items",
  "blaze-format",
@@ -1739,6 +1755,7 @@ dependencies = [
  "blaze-id",
  "blaze-ids",
  "blaze-lex",
+ "blaze-lir",
  "blaze-lower",
  "blaze-manifest",
  "blaze-mem",
@@ -2352,6 +2369,16 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
  "tar",
+]
+
+[[package]]
+name = "blaze-term-api"
+version = "0.0.0"
+dependencies = [
+ "blaze-base64",
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
 ]
 
 [[package]]
