@@ -14,10 +14,12 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-deflate.workspace = true
 blaze-git-fetch.workspace = true
 blaze-hash.workspace = true
 blaze-memchr.workspace = true
 blaze-own.workspace = true
+blaze-zstd.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["testing"] }
