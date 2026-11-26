@@ -549,18 +549,30 @@ impl<'a, S, T> BinProtocol<'a, S, T> {
     /// Joins entered functions and purity recorded by workspace binaries spawned under
     /// `(suite, row)` into the spawning test's `entered_fns` and `keep` verdict.
     ///
-    /// If any owned helper connection is STILL live (`!conn.dead`) when the test finishes, the
-    /// row is marked unkeepable (`Err(NotKept::Untraced)` unless already impure) because work the
-    /// helper performs after the test exits cannot be captured in this cache decision.
+    /// Conservatively marks the row unkeepable (`Err(NotKept::Untraced)` unless already impure)
+    /// whenever ANY helper connection might still produce post-exit work for this row:
+    /// - a live connection owned by `(suite, row)` (`!conn.dead && conn.owner == Some((suite, row))`),
+    /// - a live connection whose 12-byte handshake has not completed yet (`!conn.dead && conn.bin_id.is_none()`), or
+    /// - an unaccepted peer queued on the listening socket (`has_queued_accept == true`).
+    /// (Any test process that actually calls `posix_spawn`/`fork`/`clone` is also already marked
+    /// `Err(NotKept::Foreign)` at the syscall boundary before this join runs.)
     fn drain_owner_evidence(
         &mut self,
         suite: u32,
         row: u32,
+        has_queued_accept: bool,
         entered_fns: &mut AVec<'a, EnteredFn<'a>>,
         keep: &mut Result<(), NotKept>,
     ) {
+        if has_queued_accept && keep.is_ok() {
+            *keep = Err(NotKept::Untraced);
+        }
         for conn in self.conns.iter_mut() {
-            if conn.owner == Some((suite, row)) {
+            if !conn.dead && conn.bin_id.is_none() {
+                if keep.is_ok() {
+                    *keep = Err(NotKept::Untraced);
+                }
+            } else if conn.owner == Some((suite, row)) {
                 if !conn.dead {
                     if keep.is_ok() {
                         *keep = Err(conn.keep.err().unwrap_or(NotKept::Untraced));
@@ -985,7 +997,17 @@ impl<'a, 'h> BinServer<'a, 'h> {
         entered_fns: &mut AVec<'a, EnteredFn<'a>>,
         keep: &mut Result<(), NotKept>,
     ) {
-        self.proto.drain_owner_evidence(suite, row, entered_fns, keep);
+        use blaze_sys::posix::io::{PollEvents, PollFd, poll};
+
+        // Check non-blockingly whether any peer is already queued on the listening socket waiting
+        // to be accepted (fail-closed on `poll` error).
+        let mut pfd = [PollFd::new(self.listener.fd(), PollEvents::IN)];
+        let zero = Some(Timespec { sec: 0, nsec: 0 });
+        let has_queued_accept = match poll(&mut pfd, zero) {
+            Ok(ready) => ready > 0 && pfd[0].found().contains(PollEvents::IN),
+            Err(_) => true,
+        };
+        self.proto.drain_owner_evidence(suite, row, has_queued_accept, entered_fns, keep);
     }
 
     /// Non-blocking poll/accept/read/serve/write pump across the listener and every connected
@@ -1318,6 +1340,8 @@ mod dst_tests {
         None,
         /// Re-introduces the bug where a still-live owned connection leaves a pure test keepable.
         LiveConnStillKeepable,
+        /// Re-introduces the bug where queued or partially-handshaken peers leave a row keepable.
+        UnattributedPeerStillKeepable,
         /// Re-introduces the bug where a binary serving error reports the wrong owner.
         WrongErrorOwner,
         /// Re-introduces the bug where an outbox overflow is silently ignored.
@@ -1763,6 +1787,7 @@ mod dst_tests {
                 // Finish an owner `(suite, row)` and check the evidence + live-conn oracle!
                 let suite = u32::try_from(rng.range(2)).unwrap_or(0);
                 let row = u32::try_from(rng.range(4)).unwrap_or(0);
+                let has_queued_accept = rng.range(8) == 0;
                 let mut drained_entered = Vec::new_in(alloc);
                 let mut drained_keep: Result<(), NotKept> = Ok(());
 
@@ -1796,15 +1821,53 @@ mod dst_tests {
                             i += 1;
                         }
                     }
+                } else if bug == PlantedBug::UnattributedPeerStillKeepable {
+                    // Simulate the pre-fix bug: mark live owned connections unkeepable, but ignore
+                    // queued accepts and partially-handshaken (`bin_id.is_none()`) peers.
+                    for conn in proto.conns.iter_mut() {
+                        if conn.owner == Some((suite, row)) {
+                            if !conn.dead {
+                                if drained_keep.is_ok() {
+                                    drained_keep = Err(conn.keep.err().unwrap_or(NotKept::Untraced));
+                                }
+                            } else if let Err(why) = conn.keep
+                                && drained_keep.is_ok()
+                            {
+                                drained_keep = Err(why);
+                            }
+                            while let Some(e) = conn.entered_fns.pop() {
+                                drained_entered.push(e);
+                            }
+                        }
+                    }
+                    let mut i = 0;
+                    while i < proto.evidence.len() {
+                        if proto.evidence.get(i).is_some_and(|ev| ev.suite == suite && ev.row == row) {
+                            let mut ev = proto.evidence.remove_swap(i);
+                            if let Err(why) = ev.keep
+                                && drained_keep.is_ok()
+                            {
+                                drained_keep = Err(why);
+                            }
+                            while let Some(e) = ev.entered_fns.pop() {
+                                drained_entered.push(e);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
                 } else {
-                    proto.drain_owner_evidence(suite, row, &mut drained_entered, &mut drained_keep);
+                    proto.drain_owner_evidence(suite, row, has_queued_accept, &mut drained_entered, &mut drained_keep);
                 }
 
-                // Oracle: check whether ANY live peer currently has `owner == Some((suite, row))`.
+                // Oracle: check whether ANY live peer currently has `owner == Some((suite, row))`,
+                // OR any live peer is still pre-handshake (`bin_id.is_none()`), OR a peer is queued.
                 let has_live_owned = proto
                     .conns()
                     .iter()
                     .any(|c| !c.dead && c.owner == Some((suite, row)));
+                let has_unattributed = has_queued_accept
+                    || proto.conns().iter().any(|c| !c.dead && c.bin_id.is_none());
                 let mut expected_keep: Result<(), NotKept> = Ok(());
                 let mut expected_entered: AVec<'static, [u8; 32]> = Vec::new_in(alloc);
                 let mut idx = 0;
@@ -1836,7 +1899,10 @@ mod dst_tests {
                 if has_live_owned && drained_keep.is_ok() {
                     return Err("row with live helper connection was marked keepable");
                 }
-                if !has_live_owned {
+                if has_unattributed && drained_keep.is_ok() {
+                    return Err("row with queued or pre-handshake helper peer was marked keepable");
+                }
+                if !has_live_owned && !has_unattributed {
                     if drained_keep.is_ok() != expected_keep.is_ok() {
                         return Err("purity verdict diverged from oracle");
                     }
@@ -1947,5 +2013,22 @@ mod dst_tests {
             }
         }
         assert!(caught, "planted bug IgnoreOutboxCap must be caught by the DST oracle");
+    }
+
+    #[test]
+    fn dst_planted_bug_unattributed_peer_keep_is_caught() {
+        let mut caught = false;
+        for seed in 1u64..=32 {
+            if run_dst(seed, PlantedBug::UnattributedPeerStillKeepable)
+                == Err("row with queued or pre-handshake helper peer was marked keepable")
+            {
+                caught = true;
+                break;
+            }
+        }
+        assert!(
+            caught,
+            "planted bug UnattributedPeerStillKeepable must be caught by the DST oracle"
+        );
     }
 }
