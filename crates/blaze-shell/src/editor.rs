@@ -2746,6 +2746,17 @@ impl Editor {
                     } else {
                         None
                     };
+                    let (prefix_dir_part, prefix_leaf) = match prefix.rfind('/') {
+                        Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
+                        None => ("", prefix),
+                    };
+                    let resolved_dir_prefix: Option<String> = if prefix_dir_part.starts_with('/') {
+                        Some(prefix_dir_part.to_owned())
+                    } else if let Some(rest) = prefix_dir_part.strip_prefix("~/") {
+                        Some(format!("{}/{rest}", home.trim_end_matches('/')))
+                    } else {
+                        None
+                    };
                     for zm in self.zoxide.query(prefix, &self.local_host, now_ns, 20) {
                         if let Some(anchor) = anchored_prefix.as_deref()
                             && (!zm.is_local
@@ -2757,11 +2768,28 @@ impl Editor {
                             continue;
                         }
                         let short = crate::prompt::abbreviate_home(&zm.path, home);
-                        let (label, insert, detail, doc, fs_meta) = if zm.is_local {
+                        let (label, match_query, insert, detail, doc, fs_meta) = if zm.is_local {
                             let dir_insert = if zm.path == "/" {
                                 "/".to_owned()
                             } else {
                                 format!("{}/", zm.path.trim_end_matches('/'))
+                            };
+                            let (disp_label, mq) = if let Some(dp) = resolved_dir_prefix.as_deref()
+                                && dir_insert.len() > dp.len()
+                                && dir_insert
+                                    .get(..dp.len())
+                                    .is_some_and(|p| p.eq_ignore_ascii_case(dp))
+                            {
+                                (dir_insert[dp.len()..].to_owned(), prefix_leaf)
+                            } else {
+                                (
+                                    if short == "/" {
+                                        "/".to_owned()
+                                    } else {
+                                        format!("{}/", short.trim_end_matches('/'))
+                                    },
+                                    prefix,
+                                )
                             };
                             let mtime_ns = fs::metadata(&zm.path)
                                 .ok()
@@ -2769,10 +2797,11 @@ impl Editor {
                                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|d| d.as_nanos().min(i64::MAX as u128) as i64);
                             (
-                                short.clone(),
+                                disp_label,
+                                mq,
                                 shell_quote_if_needed(&dir_insert),
-                                format!("z · {:.0}", zm.score),
-                                format!("zoxide ({}) · {}", zm.host, zm.path),
+                                "recent".to_owned(),
+                                format!("recent dir · {}", zm.path),
                                 Some(CompletionFsMeta {
                                     path: zm.path.clone(),
                                     mtime_ns,
@@ -2782,13 +2811,14 @@ impl Editor {
                         } else {
                             (
                                 format!("{}:{}", zm.host, short),
+                                prefix,
                                 shell_quote_if_needed(&format!("{}:{}", zm.host, zm.path)),
                                 format!("host · {}", zm.host),
-                                format!("remote zoxide on {} · {}", zm.host, zm.path),
+                                format!("remote dir on {} · {}", zm.host, zm.path),
                                 None,
                             )
                         };
-                        let match_indices = fuzzy_match_score(&label, prefix)
+                        let match_indices = fuzzy_match_score(&label, match_query)
                             .map(|(_, idxs)| idxs)
                             .unwrap_or_default();
                         scored.push((

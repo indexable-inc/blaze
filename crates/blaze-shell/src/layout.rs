@@ -6310,18 +6310,36 @@ fn layout_completion_popup(
     let doc_h = m.ch + 12.0;
     let popup_h = show as f32 * row_h + doc_h + 10.0;
 
-    // Precompute live filesystem recency (`mtime_ns` + recursive `blaze-dust` `max_mtime_ns`)
-    // and progressive byte sizes for visible rows so autocomplete shares `ls`'s exact heatmap
-    // coloring and tier-colored proportional size bars!
+    // Precompute live filesystem recency (`mtime_ns` + recursive `blaze-dust` `max_mtime_ns`),
+    // progressive byte sizes, and unified right-hand column widths so every row's recency age,
+    // size bar, and size label snap to crisp vertical columns!
     struct RowFsVisual {
         bytes: Option<u64>,
         bytes_done: bool,
-        bytes_capped: bool,
-        mtime_ns: Option<i64>,
+        detail_txt: String,
+        age_txt: Option<String>,
+        heat: Option<([f32; 4], f32)>,
     }
+    let format_compact_age = |age_secs: u64| -> String {
+        if age_secs < 60 {
+            format!("{}s", age_secs.max(1))
+        } else if age_secs < 3_600 {
+            format!("{}m", age_secs / 60)
+        } else if age_secs < 86_400 {
+            format!("{}h", age_secs / 3_600)
+        } else if age_secs < 86_400 * 30 {
+            format!("{}d", age_secs / 86_400)
+        } else if age_secs < 86_400 * 365 {
+            format!("{}mo", age_secs / (86_400 * 30))
+        } else {
+            format!("{}y", age_secs / (86_400 * 365))
+        }
+    };
     let mut row_vis: Vec<RowFsVisual> = Vec::with_capacity(show);
     let mut max_bytes: u64 = 0;
     let mut any_size_bar = false;
+    let mut any_age = false;
+    let mut max_detail_w = 0.0f32;
     for offset in 0..show {
         let item = &editor.completions[win_start + offset];
         let mut bytes = item.fs_meta.as_ref().and_then(|f| f.size_bytes);
@@ -6347,9 +6365,60 @@ fn layout_completion_popup(
             max_bytes = max_bytes.max(b);
             any_size_bar = true;
         }
-        row_vis.push(RowFsVisual { bytes, bytes_done, bytes_capped, mtime_ns });
+        let detail_raw = if item.kind == CompletionKind::Dir
+            && let Some(b) = bytes
+            && b > 0
+        {
+            let compact = crate::dust_driver::format_bytes_compact(b);
+            let sz_s = if !bytes_done {
+                format!("~{compact}")
+            } else if bytes_capped {
+                format!("{compact}+")
+            } else {
+                compact
+            };
+            if matches!(item.detail.as_str(), "dir" | "git dir" | "recent") {
+                sz_s
+            } else {
+                format!("{sz_s} · {}", item.detail)
+            }
+        } else {
+            item.detail.clone()
+        };
+        let detail_txt = truncate_chars(&detail_raw, 28);
+        max_detail_w = max_detail_w.max(m.measure(&detail_txt, TextFace::UiSmall));
+
+        let (age_txt, heat) = if let Some(mt) = mtime_ns
+            && mt > 0
+            && now_ns > 0
+        {
+            let age_secs = now_ns.saturating_sub(mt).max(0) as u64 / 1_000_000_000;
+            let hcol = theme::recency_heat_color(age_secs);
+            let blend = if age_secs < 600 {
+                0.42
+            } else if age_secs < 7_200 {
+                0.28
+            } else if age_secs < 86_400 {
+                0.15
+            } else {
+                0.0
+            };
+            any_age = true;
+            (Some(format_compact_age(age_secs)), Some((hcol, blend)))
+        } else {
+            (None, None)
+        };
+
+        row_vis.push(RowFsVisual { bytes, bytes_done, detail_txt, age_txt, heat });
     }
-    let popup_w = (x1 - x0).min(if any_size_bar { 620.0 } else { 560.0 });
+    const COMP_SIZE_BAR_W: f32 = 44.0;
+    const COMP_AGE_COL_W: f32 = 28.0;
+    let detail_col_w = if any_size_bar {
+        max_detail_w.clamp(58.0, 96.0)
+    } else {
+        max_detail_w.min(180.0)
+    };
+    let popup_w = (x1 - x0).min(if any_size_bar { 640.0 } else { 560.0 });
 
     // Anchor horizontally near the active cursor token (clamped inside `[x0, x1 - popup_w]`).
     let (_, ccol) = editor.cursor_line_col();
@@ -6527,54 +6596,33 @@ fn layout_completion_popup(
             scene.overlay_text_run(gx, ty, glyph, fg_col, true, false, 0);
         }
 
-        // Right-aligned type / expansion / live folder-size detail + proportional tier-colored size bar.
+        // Fixed right-hand tabular columns (all vertically centered on the exact row centerline):
+        //   [label ...]   [age (heat-colored)]   [==== size bar]   [right-aligned size/detail]
         let vis = &row_vis[offset];
-        let dynamic_detail: Option<String> = if item.kind == CompletionKind::Dir
-            && let Some(b) = vis.bytes
-            && b > 0
-        {
-            let compact = crate::dust_driver::format_bytes_compact(b);
-            let sz_s = if !vis.bytes_done {
-                format!("~{compact}")
-            } else if vis.bytes_capped {
-                format!("{compact}+")
-            } else {
-                compact
-            };
-            if item.detail == "dir" || item.detail == "git dir" {
-                Some(sz_s)
-            } else {
-                Some(format!("{sz_s} · {}", item.detail))
-            }
-        } else {
-            None
-        };
-        let detail_src = dynamic_detail.as_deref().unwrap_or(&item.detail);
-        let detail_txt = truncate_chars(detail_src, 34);
-        let detail_w = m.measure(&detail_txt, TextFace::UiSmall);
-        let detail_x = px1 - 12.0 - sb_pad - detail_w;
+        let ty_small = ry + (row_h - m.line_h(TextFace::UiSmall)) * 0.5;
+        let right_edge = px1 - 14.0 - sb_pad;
+        let detail_w = m.measure(&vis.detail_txt, TextFace::UiSmall);
+        let detail_x = right_edge - detail_w;
         scene.overlay_ui_small(
             detail_x,
-            ty,
-            &detail_txt,
+            ty_small,
+            &vis.detail_txt,
             if is_sel { theme::INK_2 } else { theme::INK_4 },
             false,
             false,
             0,
         );
 
-        // Proportional tier-colored size bar (matches `ls`: Bytes slate, KiB blue, MiB amber, GiB orange).
-        const COMP_SIZE_BAR_W: f32 = 44.0;
-        let mut right_edge_for_label = detail_x - 12.0;
+        let mut col_left = right_edge - detail_col_w - 10.0;
         if any_size_bar {
-            let bar_x0 = detail_x - 10.0 - COMP_SIZE_BAR_W;
-            right_edge_for_label = bar_x0 - 10.0;
+            let bar_x0 = col_left - COMP_SIZE_BAR_W;
+            col_left = bar_x0 - 12.0;
             if let Some(b) = vis.bytes
                 && b > 0
                 && max_bytes > 0
             {
                 let frac = blaze_dust::bar_fraction(b, max_bytes);
-                let by0 = ty + m.ch * 0.5 - 2.0;
+                let by0 = ry + row_h * 0.5 - 2.0;
                 let by1 = by0 + 4.0;
                 scene.overlay_round_rect(
                     bar_x0,
@@ -6612,50 +6660,29 @@ fn layout_completion_popup(
             }
         }
 
-        // Recency heatmap tint (matches `ls` `theme::recency_heat_color(age_secs)`).
-        let heat_info: Option<([f32; 4], f32)> = vis.mtime_ns.and_then(|mt| {
-            if mt <= 0 || now_ns <= 0 {
-                return None;
+        if any_age {
+            if let Some(age_s) = vis.age_txt.as_deref()
+                && let Some((heat_col, _)) = vis.heat
+            {
+                let aw = m.measure(age_s, TextFace::UiSmall);
+                scene.overlay_ui_small(col_left - aw, ty_small, age_s, heat_col, false, false, 0);
             }
-            let age_secs = now_ns.saturating_sub(mt).max(0) as u64 / 1_000_000_000;
-            if age_secs < 600 {
-                Some((theme::recency_heat_color(age_secs), 0.45))
-            } else if age_secs < 7_200 {
-                Some((theme::recency_heat_color(age_secs), 0.30))
-            } else if age_secs < 86_400 {
-                Some((theme::recency_heat_color(age_secs), 0.16))
-            } else {
-                None
-            }
-        });
-        if let Some((heat_col, _)) = heat_info {
-            let dot_x = right_edge_for_label + 2.0;
-            let dot_y = ty + m.ch * 0.5;
-            scene.overlay_round_rect(
-                dot_x - 2.2,
-                dot_y - 2.2,
-                dot_x + 2.2,
-                dot_y + 2.2,
-                2.2,
-                heat_col,
-                0.0,
-                [0.0; 4],
-                0,
-            );
-            right_edge_for_label -= 8.0;
+            col_left -= COMP_AGE_COL_W + 10.0;
         }
 
         // Label with IntelliJ-style vivid blue matched-character highlighting (`#589DF6`)
         // blended with `ls`-matching recency heat warmth when recently modified.
         let label_x = ix + icon_s + 9.0;
-        let max_label_ch = ((right_edge_for_label - label_x) / m.cw).floor().max(6.0) as usize;
+        let max_label_ch = ((col_left - label_x) / m.cw).floor().max(6.0) as usize;
         let label_txt = truncate_chars(&item.label, max_label_ch);
         let mut base_col = match item.kind {
             CompletionKind::Keyword if !is_sel => theme::rgb(0xd8, 0xa8, 0x8c),
             _ if is_sel => theme::INK_1,
             _ => theme::INK_2,
         };
-        if let Some((heat, blend)) = heat_info {
+        if let Some((heat, blend)) = vis.heat
+            && blend > 0.0
+        {
             base_col = [
                 base_col[0] + (heat[0] - base_col[0]) * blend,
                 base_col[1] + (heat[1] - base_col[1]) * blend,
