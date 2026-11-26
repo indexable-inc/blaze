@@ -71,6 +71,7 @@ blaze-format	0	0	8
 blaze-format-core	0	0	8
 blaze-format-tiers	1	0	40
 blaze-fuzz	0	0	8
+blaze-git	0	0	1
 blaze-git-fetch	0	0	1
 blaze-glob	0	0	1
 blaze-graph	5	0	64
@@ -78,6 +79,7 @@ blaze-h1	0	0	1
 blaze-h2	0	0	1
 blaze-hash	0	1	1
 blaze-hashcons	0	0	8
+blaze-html	0	0	1
 blaze-http	3	1	62
 blaze-id	0	0	8
 blaze-ids	1	3	8
@@ -107,7 +109,9 @@ blaze-new	1	0	87
 blaze-own	0	0	1
 blaze-pack	0	0	62
 blaze-parquet	1	0	36
+blaze-pbr	0	0	1
 blaze-pg	1	0	1
+blaze-preview	0	0	1
 blaze-proc-macro	3	0	228
 blaze-producers	0	0	8
 blaze-profile	4	0	151
@@ -126,6 +130,7 @@ blaze-scope	0	0	86
 blaze-screen	1	1	62
 blaze-script	1	0	16
 blaze-semver	0	0	1
+blaze-sh	0	0	1
 blaze-sim	0	0	1
 blaze-site	0	0	1
 blaze-site-wasm	0	0	1
@@ -136,6 +141,7 @@ blaze-spawn	0	0	8
 blaze-spin	0	0	1
 blaze-sqlite	1	0	34
 blaze-squeeze	1	0	40
+blaze-ssh	0	0	1
 blaze-stage	0	0	86
 blaze-std	4	0	109
 blaze-store-check	0	0	8
@@ -158,6 +164,8 @@ blaze-ui-wasm	0	0	1
 blaze-unit-graph	0	0	86
 blaze-units	0	0	1
 blaze-v2-proof	0	0	64
+blaze-vim	0	0	1
+blaze-vt	0	0	1
 blaze-wasi	1	0	124
 blaze-watch	0	0	1
 blaze-world	0	0	228

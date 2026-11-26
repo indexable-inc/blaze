@@ -118,12 +118,424 @@ pub struct BodyFrame<'n> {
     pub front: Option<&'n StretchFront>,
 }
 
+/// Magic header for persisted `BSF1` [`StretchFront`] CAS records (format v1).
+pub const STRETCH_FRONT_MAGIC: &[u8; 4] = b"BSF1";
+
+/// The known `receiver::Pointer::Unknown` static reason strings (receiver.rs), mapped to stable
+/// 1-byte tags `2..=5` in `BSF1` so `Pointer::Unknown` round-trips with zero allocation or leaks.
+const UNKNOWN_POINTER_REASONS: [&str; 4] = [
+    "the head store was made without the program's receiver pointer types (`receiver::Pointers::find`)",
+    "alloc's `Box` is in no module the names library knows",
+    "alloc's `rc::Rc` or `sync::Arc` names no struct",
+    "alloc's `rc::Rc` or `sync::Arc` does not resolve",
+];
+
+/// Why `BSF1` [`StretchFront`] bytes could not be encoded or decoded (rule 3, rule 19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StretchFrontError {
+    /// Input ended before the expected bytes could be read.
+    Short { need: usize, left: usize },
+    /// Leading 4-byte magic does not match [`STRETCH_FRONT_MAGIC`] (`b"BSF1"`).
+    Magic { found: [u8; 4] },
+    /// A list or string length does not fit in a `u32` (or exceeds remaining bytes).
+    CountOverflow { what: &'static str, count: usize },
+    /// A lang-crate index does not fit in a `u32` (or `usize`).
+    IndexOverflow { value: usize },
+    /// Encoded lang items are non-empty while `scope` is empty.
+    ScopeEmptyWithLangs { langs: u32 },
+    /// `scope` indices are not strictly ascending.
+    UnsortedScope { at: usize },
+    /// `langs` names are not strictly ascending.
+    UnsortedLangs { at: usize },
+    /// `reads` entries are not strictly ascending.
+    UnsortedReads { at: usize },
+    /// A lang item name is not valid UTF-8.
+    InvalidUtf8 { at: usize },
+    /// Unrecognized `receiver::Pointer` discriminant tag.
+    PointerTag { tag: u8 },
+    /// `receiver::Pointer::Unknown` carried a reason string not in [`UNKNOWN_POINTER_REASONS`].
+    UnknownPointerReason,
+    /// Unrecognized `TableRead` discriminant tag.
+    ReadTag { tag: u8 },
+    /// Unrecognized `NameCell` discriminant tag.
+    NameCellTag { tag: u8 },
+    /// Unrecognized `Section` discriminant tag.
+    SectionTag { tag: u8 },
+    /// `reads` count exceeds [`super::recorder::MOST_READS`].
+    TooManyReads { count: u32 },
+    /// Unexpected bytes remained after the end of the `BSF1` payload.
+    Trailing { extra: usize },
+    /// Conflicting lang item entries could not be loaded into [`super::super::index::IndexIn`].
+    LangConflict,
+}
+
+impl core::fmt::Display for StretchFrontError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Short { need, left } => write!(f, "BSF1 stretch front truncated: needed {need} bytes, only {left} left (front2 tables/task.rs)"),
+            Self::Magic { found } => write!(f, "BSF1 stretch front has magic {found:?}, expected {STRETCH_FRONT_MAGIC:?} (front2 tables/task.rs)"),
+            Self::CountOverflow { what, count } => write!(f, "BSF1 stretch front {what} count {count} overflows limit (front2 tables/task.rs)"),
+            Self::IndexOverflow { value } => write!(f, "BSF1 stretch front crate index {value} overflows u32 (front2 tables/task.rs)"),
+            Self::ScopeEmptyWithLangs { langs } => write!(f, "BSF1 stretch front has {langs} lang items with empty scope (front2 tables/task.rs)"),
+            Self::UnsortedScope { at } => write!(f, "BSF1 stretch front scope is not strictly ascending at entry {at} (front2 tables/task.rs)"),
+            Self::UnsortedLangs { at } => write!(f, "BSF1 stretch front langs are not strictly ascending at entry {at} (front2 tables/task.rs)"),
+            Self::UnsortedReads { at } => write!(f, "BSF1 stretch front reads are not strictly ascending at entry {at} (front2 tables/task.rs)"),
+            Self::InvalidUtf8 { at } => write!(f, "BSF1 stretch front lang name at entry {at} is not valid UTF-8 (front2 tables/task.rs)"),
+            Self::PointerTag { tag } => write!(f, "BSF1 stretch front has unknown pointer tag {tag} (front2 tables/task.rs)"),
+            Self::UnknownPointerReason => f.write_str("BSF1 stretch front encountered an unrecognized Pointer::Unknown reason (front2 tables/task.rs)"),
+            Self::ReadTag { tag } => write!(f, "BSF1 stretch front has unknown TableRead tag {tag} (front2 tables/task.rs)"),
+            Self::NameCellTag { tag } => write!(f, "BSF1 stretch front has unknown NameCell tag {tag} (front2 tables/task.rs)"),
+            Self::SectionTag { tag } => write!(f, "BSF1 stretch front has unknown Section tag {tag} (front2 tables/task.rs)"),
+            Self::TooManyReads { count } => write!(f, "BSF1 stretch front read count {count} exceeds MOST_READS (front2 tables/task.rs)"),
+            Self::Trailing { extra } => write!(f, "BSF1 stretch front has {extra} trailing bytes (front2 tables/task.rs)"),
+            Self::LangConflict => f.write_str("BSF1 stretch front lang entries conflicted while building IndexIn (front2 tables/task.rs)"),
+        }
+    }
+}
+
+struct BsfReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> BsfReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], StretchFrontError> {
+        match self.bytes.split_at_checked(n) {
+            Some((head, rest)) => {
+                self.bytes = rest;
+                Ok(head)
+            }
+            None => Err(StretchFrontError::Short { need: n, left: self.bytes.len() }),
+        }
+    }
+
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], StretchFrontError> {
+        let slice = self.take(N)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(slice);
+        Ok(out)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, StretchFrontError> {
+        let [byte] = self.take_array::<1>()?;
+        Ok(byte)
+    }
+
+    fn take_u32(&mut self) -> Result<u32, StretchFrontError> {
+        Ok(u32::from_le_bytes(self.take_array::<4>()?))
+    }
+
+    fn take_item_key(&mut self) -> Result<ItemKey, StretchFrontError> {
+        Ok(ItemKey(ContentId(self.take_array::<32>()?)))
+    }
+}
+
+fn encode_pointer<A: core::alloc::Allocator>(pointer: super::super::receiver::Pointer, out: &mut blaze_own::Vec<u8, A>) -> Result<(), StretchFrontError> {
+    use super::super::receiver::Pointer;
+    match pointer {
+        Pointer::Absent => out.push(0),
+        Pointer::At(key) => {
+            out.push(1);
+            out.extend_from_slice(&key.0.0);
+        }
+        Pointer::Unknown(why) => {
+            let Some(pos) = UNKNOWN_POINTER_REASONS.iter().position(|&known| known == why) else {
+                return Err(StretchFrontError::UnknownPointerReason);
+            };
+            let tag = u8::try_from(pos).ok().and_then(|v| v.checked_add(2)).ok_or(StretchFrontError::UnknownPointerReason)?;
+            out.push(tag);
+        }
+    }
+    Ok(())
+}
+
+fn decode_pointer(r: &mut BsfReader<'_>) -> Result<super::super::receiver::Pointer, StretchFrontError> {
+    use super::super::receiver::Pointer;
+    match r.take_u8()? {
+        0 => Ok(Pointer::Absent),
+        1 => Ok(Pointer::At(r.take_item_key()?)),
+        tag @ 2..=5 => {
+            let idx = usize::from(tag - 2);
+            let reason = UNKNOWN_POINTER_REASONS.get(idx).copied().ok_or(StretchFrontError::PointerTag { tag })?;
+            Ok(Pointer::Unknown(reason))
+        }
+        tag => Err(StretchFrontError::PointerTag { tag }),
+    }
+}
+
+fn encode_name_cell<A: core::alloc::Allocator>(cell: NameCell, out: &mut blaze_own::Vec<u8, A>) {
+    use blaze_scope::names_cells::Section;
+    match cell {
+        NameCell::Binding { module, name } => {
+            out.push(1);
+            out.extend_from_slice(&module.0.0);
+            out.extend_from_slice(&name.0);
+        }
+        NameCell::Module { module } => {
+            out.push(2);
+            out.extend_from_slice(&module.0.0);
+        }
+        NameCell::Root { krate } => {
+            out.push(3);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::Variants { owner } => {
+            out.push(4);
+            out.extend_from_slice(&owner.0.0);
+        }
+        NameCell::Item { key } => {
+            out.push(5);
+            out.extend_from_slice(&key.0.0);
+        }
+        NameCell::Members { owner } => {
+            out.push(6);
+            out.extend_from_slice(&owner.0.0);
+        }
+        NameCell::Expansion { call } => {
+            out.push(7);
+            out.extend_from_slice(&call.0.0);
+        }
+        NameCell::Whole { krate, section } => {
+            let sec = match section {
+                Section::Names => 1u8,
+                Section::Items => 2u8,
+                Section::Expansions => 3u8,
+            };
+            out.push(8);
+            out.extend_from_slice(&krate);
+            out.push(sec);
+        }
+        NameCell::MemberOf { member } => {
+            out.push(9);
+            out.extend_from_slice(&member.0.0);
+        }
+        NameCell::VariantOf { variant } => {
+            out.push(10);
+            out.extend_from_slice(&variant.0.0);
+        }
+        NameCell::Beginning { first } => {
+            out.push(11);
+            out.extend_from_slice(&first);
+        }
+        NameCell::Lang { krate } => {
+            out.push(12);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::Incoherent { krate } => {
+            out.push(13);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::Textual { module } => {
+            out.push(14);
+            out.extend_from_slice(&module.0.0);
+        }
+        NameCell::InternalSymbols { krate } => {
+            out.push(15);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::Links { krate } => {
+            out.push(16);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::ImplRows { krate } => {
+            out.push(17);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::Files { krate } => {
+            out.push(18);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::Extensions { krate } => {
+            out.push(19);
+            out.extend_from_slice(&krate);
+        }
+        NameCell::CfgAtoms { krate } => {
+            out.push(20);
+            out.extend_from_slice(&krate);
+        }
+    }
+}
+
+fn decode_name_cell(r: &mut BsfReader<'_>) -> Result<NameCell, StretchFrontError> {
+    use blaze_scope::cell_key::CellKey;
+    use blaze_scope::names_cells::Section;
+    match r.take_u8()? {
+        1 => Ok(NameCell::Binding { module: r.take_item_key()?, name: CellKey(r.take_array::<16>()?) }),
+        2 => Ok(NameCell::Module { module: r.take_item_key()? }),
+        3 => Ok(NameCell::Root { krate: r.take_array::<8>()? }),
+        4 => Ok(NameCell::Variants { owner: r.take_item_key()? }),
+        5 => Ok(NameCell::Item { key: r.take_item_key()? }),
+        6 => Ok(NameCell::Members { owner: r.take_item_key()? }),
+        7 => Ok(NameCell::Expansion { call: r.take_item_key()? }),
+        8 => {
+            let krate = r.take_array::<8>()?;
+            let section = match r.take_u8()? {
+                1 => Section::Names,
+                2 => Section::Items,
+                3 => Section::Expansions,
+                tag => return Err(StretchFrontError::SectionTag { tag }),
+            };
+            Ok(NameCell::Whole { krate, section })
+        }
+        9 => Ok(NameCell::MemberOf { member: r.take_item_key()? }),
+        10 => Ok(NameCell::VariantOf { variant: r.take_item_key()? }),
+        11 => Ok(NameCell::Beginning { first: r.take_array::<16>()? }),
+        12 => Ok(NameCell::Lang { krate: r.take_array::<8>()? }),
+        13 => Ok(NameCell::Incoherent { krate: r.take_array::<8>()? }),
+        14 => Ok(NameCell::Textual { module: r.take_item_key()? }),
+        15 => Ok(NameCell::InternalSymbols { krate: r.take_array::<8>()? }),
+        16 => Ok(NameCell::Links { krate: r.take_array::<8>()? }),
+        17 => Ok(NameCell::ImplRows { krate: r.take_array::<8>()? }),
+        18 => Ok(NameCell::Files { krate: r.take_array::<8>()? }),
+        19 => Ok(NameCell::Extensions { krate: r.take_array::<8>()? }),
+        20 => Ok(NameCell::CfgAtoms { krate: r.take_array::<8>()? }),
+        tag => Err(StretchFrontError::NameCellTag { tag }),
+    }
+}
+
+fn encode_table_read<A: core::alloc::Allocator>(read: TableRead, out: &mut blaze_own::Vec<u8, A>) {
+    match read {
+        TableRead::Names(cell) => {
+            out.push(0);
+            encode_name_cell(cell, out);
+        }
+        TableRead::Signature { key } => {
+            out.push(1);
+            out.extend_from_slice(&key.0.0);
+        }
+        TableRead::Text { key } => {
+            out.push(2);
+            out.extend_from_slice(&key.0.0);
+        }
+        TableRead::Head { item, part } => {
+            out.push(3);
+            out.extend_from_slice(&item);
+            out.push(part);
+        }
+        TableRead::Impls { krate, bucket } => {
+            out.push(4);
+            out.extend_from_slice(&krate);
+            out.extend_from_slice(&bucket);
+        }
+    }
+}
+
+fn decode_table_read(r: &mut BsfReader<'_>) -> Result<TableRead, StretchFrontError> {
+    match r.take_u8()? {
+        0 => Ok(TableRead::Names(decode_name_cell(r)?)),
+        1 => Ok(TableRead::Signature { key: r.take_item_key()? }),
+        2 => Ok(TableRead::Text { key: r.take_item_key()? }),
+        3 => Ok(TableRead::Head { item: r.take_array::<16>()?, part: r.take_u8()? }),
+        4 => Ok(TableRead::Impls { krate: r.take_array::<16>()?, bucket: r.take_array::<16>()? }),
+        tag => Err(StretchFrontError::ReadTag { tag }),
+    }
+}
+
+/// Minimal `NamesSource` adapter used solely to hydrate [`super::super::index::IndexIn`] from
+/// validated `BSF1` `(name, key)` entries without modifying `front2/index.rs`.
+#[derive(Clone, Copy)]
+struct DecodeLangSource<'n> {
+    first_crate: Option<usize>,
+    langs: &'n [(&'n str, ItemKey)],
+}
+
+impl<'n> NamesSource<'n> for DecodeLangSource<'n> {
+    fn solved(self) -> Option<&'n blaze_scope::resolve::Names<'n>> { None }
+    fn head_lowerings(self) -> Option<&'n super::super::heads::HeadLowerings> { None }
+    fn gap(self, _question: &'static str, _key: Option<ItemKey>) {}
+    fn crate_count(self) -> usize { 0 }
+    fn crate_of(self, _key: ItemKey) -> Option<usize> { None }
+    fn crate_key(self, _krate: usize) -> Option<blaze_id::CrateItemKey> { None }
+    fn root_module(self, _krate: usize) -> Option<ItemKey> { None }
+    fn edition_of(self, _krate: usize) -> Option<blaze_surface::Edition> { None }
+    fn cfg_atoms(self, _krate: usize) -> Option<&'n [(&'n str, Option<&'n str>)]> { None }
+    fn proc_macro(self, _krate: usize) -> Option<bool> { Some(false) }
+    fn std_is(self, _krate: usize) -> Option<blaze_unit_graph::StdIs> { None }
+    fn root_attrs(self, _krate: usize) -> Option<blaze_scope::graph::RootAttrs> { None }
+    fn has_feature(self, _krate: usize, _name: &str) -> Option<bool> { None }
+    fn linked<'a>(self, _roots: &[usize], _alloc: Alloc<'a>) -> Option<Result<super::super::linked::Linked<'a>, super::super::linked::RootsError>> { None }
+    fn sysroot_std(self) -> Option<Option<usize>> { None }
+    fn may_write_incoherent(self, _krate: usize) -> Option<bool> { None }
+    fn walk(self, module: ItemKey, _ns: blaze_surface::Namespace, _written: blaze_scope::names::Written<'_, &str>) -> Result<blaze_scope::names::Resolved, blaze_scope::names::PathError> {
+        Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+    }
+    fn written_module(self, module: ItemKey, _n: u8) -> Result<ItemKey, blaze_scope::names::PathError> {
+        Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+    }
+    fn traits_in_scope<'b>(self, module: ItemKey, _alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, blaze_scope::names::PathError> {
+        Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+    }
+    fn variants(self, _owner: ItemKey) -> Option<super::super::source::VariantRows<'n>> { None }
+    fn variant_of(self, _variant: ItemKey) -> Option<(ItemKey, u32)> { None }
+    fn has_text(self, _key: ItemKey) -> bool { false }
+    fn text_of(self, _key: ItemKey) -> Option<blaze_scope::task::ItemText<'n>> { None }
+    fn name_of(self, _key: ItemKey) -> Option<&'n str> { None }
+    fn home_of(self, _key: ItemKey) -> Option<ItemKey> { None }
+    fn place_of(self, _key: ItemKey) -> Option<blaze_scope::resolve::Place> { None }
+    fn item_start(self, _key: ItemKey) -> Option<(blaze_scope::resolve::At, u32)> { None }
+    fn file_paths(self, _krate: usize, _file: u32) -> Option<super::super::source::FilePaths<'n>> { None }
+    fn file_text(self, _krate: usize, _file: u32) -> Option<&'n str> { None }
+    fn call_origin(self, _krate: usize, call: ItemKey) -> Result<super::super::expansion_origin::CallOrigin<'n>, super::super::expansion_origin::Unmapped> {
+        Err(super::super::expansion_origin::Unmapped::NotServed { call })
+    }
+    fn member_beginning(self, _krate: usize, _item: blaze_typeck::ItemKey) -> Result<Option<ItemKey>, crate::seam::PositionGap> { Ok(None) }
+    fn enclosing_keys(self, _krate: usize, _visit: impl FnMut(ItemKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap> { Ok(()) }
+    fn expansion_text(self, _krate: usize, _call: ItemKey) -> Option<&'n str> { None }
+    fn text_marks(self, _krate: usize, _call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::super::item_site::MarksLost> { Ok(None) }
+    fn extern_abi(self, _key: ItemKey) -> Option<Option<&'n str>> { None }
+    fn attr_value(self, _key: ItemKey, _attr: &'static str) -> Option<Option<blaze_scope::attr_values::RowValue<'n>>> { None }
+    fn kind_of_item(self, _key: ItemKey) -> Option<ItemKind> { None }
+    fn detail_of(self, _key: ItemKey) -> Option<blaze_surface::ItemDetail> { None }
+    fn is_ctor(self, _key: ItemKey) -> bool { false }
+    fn each_member(self, _owner: ItemKey, _each: &mut dyn FnMut(super::super::source::MemberOf<'n>)) -> bool { false }
+    fn member_owner(self, _member: ItemKey) -> Option<(ItemKey, &'n str)> { None }
+    fn each_impl(self, _krate: usize, _each: &mut dyn FnMut(super::super::index::ImplAt<'n>)) {}
+    fn each_impl_row(self, _krate: usize, _each: &mut dyn FnMut(blaze_scope::items_record::ImplRow<'n>)) -> bool { false }
+    fn impl_with_header(self, _krate: usize, _key: ItemKey, _module: ItemKey) -> Option<super::super::index::ImplAt<'n>> { None }
+    fn each_lang(self, krate: usize, each: &mut dyn FnMut(&'n str, ItemKey)) {
+        if self.first_crate == Some(krate) {
+            for &(name, key) in self.langs {
+                each(name, key);
+            }
+        }
+    }
+    fn macro_body_of(self, module: ItemKey, _written: blaze_scope::names::Written<'_, &str>) -> Result<Option<blaze_scope::task::MacroBody<'n>>, blaze_scope::names::PathError> {
+        Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+    }
+    fn macro_at(self, module: ItemKey, _written: blaze_scope::names::Written<'_, &str>) -> Result<super::super::source::MacroAt<'n>, blaze_scope::names::PathError> {
+        Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+    }
+    fn module_path(self, _module: ItemKey) -> Option<&'n str> { None }
+    fn failed_call<'b>(self, _call: ItemKey, _bump: blaze_own::Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    where
+        'n: 'b,
+    {
+        None
+    }
+    fn each_item(self, _krate: usize, _each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool { false }
+    fn block_binding(self, _module: ItemKey, _ns: blaze_surface::Namespace, _name: &str) -> Option<Option<blaze_surface::Binding>> { None }
+    fn binds(self, _module: ItemKey, _ns: blaze_surface::Namespace, _name: &'n str) -> bool { false }
+    fn key_beginning(self, _first: [u8; 16]) -> Option<ItemKey> { None }
+    fn declared_lifetimes(self, _key: ItemKey) -> Option<u32> { None }
+    fn assoc_lifetimes(self, _trait_: ItemKey, _name: blaze_typeck::Name) -> Option<u32> { None }
+}
+
 /// Thread-safe, group-scoped lang-item [`Index`] and receiver
 /// [`super::super::receiver::Pointers`] built once per member group alongside the exact
 /// `TableRead`s their construction performed, replayed into each body's recorder so read lists
 /// remain identical (rule 21).
 pub struct StretchFront {
     index: super::super::index::IndexIn,
+    /// Canonical sorted `(name, key)` lang entries matching `index`, kept so `encode` writes
+    /// deterministic `BSF1` bytes independent of hash-map iteration order (rule 25).
+    langs: blaze_own::Vec<(blaze_own::String<blaze_own::SharedAlloc<'static>>, ItemKey), blaze_own::SharedAlloc<'static>>,
     pointers: super::super::receiver::Pointers,
     reads: blaze_own::Vec<TableRead, blaze_own::SharedAlloc<'static>>,
 }
@@ -140,7 +552,144 @@ impl StretchFront {
         let (recorded, _) = recorder.take_item().map_err(TaskError::Full)?;
         let mut reads = blaze_own::Vec::with_capacity_in(recorded.len(), alloc);
         reads.extend_from_slice(&recorded);
-        Ok(Self { index, pointers, reads })
+        reads.sort_unstable();
+        let mut langs = blaze_own::Vec::with_capacity_in(borrowed.lang_count(), alloc);
+        for &krate in lang_crates {
+            if tables.records().proc_macro(krate) == Some(true) {
+                continue;
+            }
+            tables.records().each_lang(krate, &mut |name, key| {
+                langs.push((blaze_own::String::from_str_in(name, alloc), key));
+            });
+        }
+        langs.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then_with(|| a.1.cmp(&b.1)));
+        langs.dedup_by(|a, b| a.0.as_str() == b.0.as_str());
+        Ok(Self { index, langs, pointers, reads })
+    }
+
+    /// Encodes `self` into the deterministic `BSF1` binary layout (rule 25):
+    /// `BSF1 | scope_len u32 | scope [u32] | langs_len u32 | langs [(len u32, utf8, key 32)] |
+    ///  pointers (boxed, rc, arc, pin) | reads_len u32 | reads [TableRead]`.
+    pub fn encode<A: core::alloc::Allocator>(&self, out: &mut blaze_own::Vec<u8, A>) -> Result<(), StretchFrontError> {
+        let index = self.index.borrow();
+        let scope = index.scope();
+        let scope_len = u32::try_from(scope.len()).map_err(|_| StretchFrontError::CountOverflow { what: "scope", count: scope.len() })?;
+        let langs_len = u32::try_from(self.langs.len()).map_err(|_| StretchFrontError::CountOverflow { what: "langs", count: self.langs.len() })?;
+        let reads_len = u32::try_from(self.reads.len()).map_err(|_| StretchFrontError::CountOverflow { what: "reads", count: self.reads.len() })?;
+        if scope.is_empty() && !self.langs.is_empty() {
+            return Err(StretchFrontError::ScopeEmptyWithLangs { langs: langs_len });
+        }
+        out.extend_from_slice(STRETCH_FRONT_MAGIC);
+        out.extend_from_slice(&scope_len.to_le_bytes());
+        for &krate in scope {
+            let idx = u32::try_from(krate).map_err(|_| StretchFrontError::IndexOverflow { value: krate })?;
+            out.extend_from_slice(&idx.to_le_bytes());
+        }
+        out.extend_from_slice(&langs_len.to_le_bytes());
+        for (name, key) in self.langs.iter() {
+            let name_bytes = name.as_bytes();
+            let name_len = u32::try_from(name_bytes.len()).map_err(|_| StretchFrontError::CountOverflow { what: "lang name", count: name_bytes.len() })?;
+            out.extend_from_slice(&name_len.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&key.0.0);
+        }
+        encode_pointer(self.pointers.boxed, out)?;
+        encode_pointer(self.pointers.rc, out)?;
+        encode_pointer(self.pointers.arc, out)?;
+        encode_pointer(self.pointers.pin, out)?;
+        out.extend_from_slice(&reads_len.to_le_bytes());
+        for &read in self.reads.iter() {
+            encode_table_read(read, out);
+        }
+        Ok(())
+    }
+
+    /// Decodes a `BSF1` record into [`StretchFront`] allocated in `alloc`, validating magic,
+    /// bounds, UTF-8, strict canonical ordering, and zero trailing bytes once (rule 3, rule 74).
+    pub fn decode(bytes: &[u8], alloc: blaze_own::SharedAlloc<'static>) -> Result<Self, StretchFrontError> {
+        let mut r = BsfReader::new(bytes);
+        let magic = r.take_array::<4>()?;
+        if &magic != STRETCH_FRONT_MAGIC {
+            return Err(StretchFrontError::Magic { found: magic });
+        }
+        let scope_len_u32 = r.take_u32()?;
+        let scope_len = usize::try_from(scope_len_u32).map_err(|_| StretchFrontError::CountOverflow { what: "scope", count: usize::MAX })?;
+        if scope_len > r.remaining() / 4 {
+            return Err(StretchFrontError::Short { need: scope_len.saturating_mul(4), left: r.remaining() });
+        }
+        let mut scope = blaze_own::Vec::with_capacity_in(scope_len, alloc);
+        let mut prev_scope: Option<usize> = None;
+        for at in 0..scope_len {
+            let raw = r.take_u32()?;
+            let krate = usize::try_from(raw).map_err(|_| StretchFrontError::CountOverflow { what: "scope index", count: usize::MAX })?;
+            if let Some(prev) = prev_scope
+                && krate <= prev
+            {
+                return Err(StretchFrontError::UnsortedScope { at });
+            }
+            prev_scope = Some(krate);
+            scope.push(krate);
+        }
+        let langs_len_u32 = r.take_u32()?;
+        if scope.is_empty() && langs_len_u32 > 0 {
+            return Err(StretchFrontError::ScopeEmptyWithLangs { langs: langs_len_u32 });
+        }
+        let langs_len = usize::try_from(langs_len_u32).map_err(|_| StretchFrontError::CountOverflow { what: "langs", count: usize::MAX })?;
+        if langs_len > r.remaining() / 36 {
+            return Err(StretchFrontError::Short { need: langs_len.saturating_mul(36), left: r.remaining() });
+        }
+        let mut borrowed_langs: blaze_own::Vec<(&str, ItemKey), blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(langs_len, alloc);
+        let mut prev_lang: Option<&str> = None;
+        for at in 0..langs_len {
+            let name_len_u32 = r.take_u32()?;
+            let name_len = usize::try_from(name_len_u32).map_err(|_| StretchFrontError::CountOverflow { what: "lang name", count: usize::MAX })?;
+            let raw_name = r.take(name_len)?;
+            let name = core::str::from_utf8(raw_name).map_err(|_| StretchFrontError::InvalidUtf8 { at })?;
+            if let Some(prev) = prev_lang
+                && name <= prev
+            {
+                return Err(StretchFrontError::UnsortedLangs { at });
+            }
+            prev_lang = Some(name);
+            let key = r.take_item_key()?;
+            borrowed_langs.push((name, key));
+        }
+        let pointers = super::super::receiver::Pointers {
+            boxed: decode_pointer(&mut r)?,
+            rc: decode_pointer(&mut r)?,
+            arc: decode_pointer(&mut r)?,
+            pin: decode_pointer(&mut r)?,
+        };
+        let reads_len_u32 = r.take_u32()?;
+        let reads_len = usize::try_from(reads_len_u32).map_err(|_| StretchFrontError::TooManyReads { count: reads_len_u32 })?;
+        if reads_len > super::recorder::MOST_READS {
+            return Err(StretchFrontError::TooManyReads { count: reads_len_u32 });
+        }
+        if reads_len > r.remaining() / 10 {
+            return Err(StretchFrontError::Short { need: reads_len.saturating_mul(10), left: r.remaining() });
+        }
+        let mut reads = blaze_own::Vec::with_capacity_in(reads_len, alloc);
+        let mut prev_read: Option<TableRead> = None;
+        for at in 0..reads_len {
+            let read = decode_table_read(&mut r)?;
+            if let Some(prev) = prev_read
+                && read <= prev
+            {
+                return Err(StretchFrontError::UnsortedReads { at });
+            }
+            prev_read = Some(read);
+            reads.push(read);
+        }
+        if r.remaining() != 0 {
+            return Err(StretchFrontError::Trailing { extra: r.remaining() });
+        }
+        let source = DecodeLangSource { first_crate: scope.first().copied(), langs: borrowed_langs.as_slice() };
+        let index = super::super::index::IndexIn::from_source_in(source, scope.as_slice(), alloc).map_err(|_| StretchFrontError::LangConflict)?;
+        let mut langs = blaze_own::Vec::with_capacity_in(borrowed_langs.len(), alloc);
+        for &(name, key) in borrowed_langs.iter() {
+            langs.push((blaze_own::String::from_str_in(name, alloc), key));
+        }
+        Ok(Self { index, langs, pointers, reads })
     }
 
     /// Borrows the shared lang-item index with zero heap allocation.
@@ -156,6 +705,11 @@ impl StretchFront {
     /// The exact table reads performed while building [`Self`], to replay into a recorder.
     pub fn reads(&self) -> &[TableRead] {
         &self.reads
+    }
+
+    /// The canonical sorted `(name, key)` lang entries held by [`Self`].
+    pub fn langs(&self) -> &[(blaze_own::String<blaze_own::SharedAlloc<'static>>, ItemKey)] {
+        &self.langs
     }
 }
 
@@ -4935,6 +5489,210 @@ pub fn body_diag() -> u16 {
             }
             assert_eq!(rev_store.rollovers(), 0, "{mode} reversed reuse must not rollover");
         }
+    }
+
+    /// Rule 25 & Rule 26: `BSF1` round-trip of a real [`StretchFront`] equals fresh in `IndexIn`,
+    /// `Pointers`, `TableRead`s, re-encoded bytes, and live body check verdict + read list.
+    #[test]
+    fn stretch_front_bsf1_round_trip_matches_fresh() {
+        use blaze_drive::key::Key;
+        use blaze_engine::{Phase, Planned, Stage};
+        use super::super::head_tests::cells;
+
+        let src = "\
+#![no_std]
+pub trait Show {
+    fn val(&self) -> u8;
+}
+impl Show for u8 {
+    fn val(&self) -> u8 { *self }
+}
+pub fn entry(x: u8) -> u8 {
+    x.val()
+}";
+        let (records, _, body_frame) = world_of(src);
+        let unused = Recorder::new(RecorderOpts { alloc: a() });
+        let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[0, CORE_AT], reads: &unused });
+        let shared = blaze_own::testing::heap().shared();
+
+        let fresh = StretchFront::new(tables, a(), shared).expect("fresh StretchFront");
+        let mut encoded = blaze_own::Vec::new_in(a());
+        fresh.encode(&mut encoded).expect("encode BSF1");
+        assert!(encoded.starts_with(STRETCH_FRONT_MAGIC));
+
+        let decoded = StretchFront::decode(&encoded, shared).expect("decode BSF1");
+        assert_eq!(decoded.borrow_index().scope(), fresh.borrow_index().scope());
+        assert_eq!(decoded.borrow_index().lang_count(), fresh.borrow_index().lang_count());
+        assert_eq!(decoded.langs().len(), fresh.langs().len());
+        for (name, key) in fresh.langs().iter() {
+            assert_eq!(decoded.borrow_index().lang(name.as_str()), Some(*key), "lang mismatch for {}", name.as_str());
+            assert_eq!(decoded.borrow_index().lang_name_of(*key), fresh.borrow_index().lang_name_of(*key), "reverse lang mismatch for {}", name.as_str());
+        }
+        assert_eq!(decoded.pointers(), fresh.pointers());
+        assert_eq!(decoded.reads(), fresh.reads());
+
+        let mut reencoded = blaze_own::Vec::new_in(a());
+        decoded.encode(&mut reencoded).expect("re-encode BSF1");
+        assert_eq!(reencoded.as_slice(), encoded.as_slice(), "BSF1 encoding must be deterministic");
+
+        // Verify live body checking produces identical verdict and reads across None / fresh / decoded.
+        let heads = cells(records);
+        let key = heads.iter().map(|want| want.key()).find(|&k| records.name_of(k) == Some("entry")).expect("entry fn");
+        let task = Task {
+            planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) },
+            key: Key(ABSENT),
+        };
+        let fresh_ref: &'static StretchFront = body_frame.alloc(fresh);
+        let decoded_ref: &'static StretchFront = body_frame.alloc(decoded);
+        let mut results = blaze_own::Vec::with_capacity_in(3, a());
+        for front in [None, Some(fresh_ref), Some(decoded_ref)] {
+            let bf = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None, front };
+            let mut rec = Recorder::new(RecorderOpts { alloc: a() });
+            let mut enc = AString::new_in(a());
+            let got = check_body_item(tables, &task, &bf, a(), &mut rec, None, &mut enc, None).expect("check entry");
+            let mut reads = blaze_own::Vec::with_capacity_in(got.reads.len(), a());
+            reads.extend_from_slice(got.reads.as_slice());
+            reads.sort_unstable();
+            results.push((got.out, got.failed, got.findings, reads));
+        }
+        assert_eq!(results[2], results[1], "decoded StretchFront must match fresh StretchFront");
+        assert_eq!(results[2], results[0], "decoded StretchFront must match uncached check");
+    }
+
+    /// Rule 3 & Rule 26: previous layout magic `BSF0` is refused with a typed `Magic` error.
+    #[test]
+    fn previous_stretch_front_magic_bsf0_is_rejected() {
+        let shared = blaze_own::testing::heap().shared();
+        let mut bytes = blaze_own::Vec::new_in(a());
+        bytes.extend_from_slice(b"BSF0");
+        // Minimal valid payload tail (empty scope, empty langs, 4 absent pointers, empty reads).
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let err = StretchFront::decode(&bytes, shared).err().expect("BSF0 must be rejected");
+        assert_eq!(err, StretchFrontError::Magic { found: *b"BSF0" });
+    }
+
+    /// Rule 3 & Rule 25: exhaustive coverage of all `Pointer` and `TableRead`/`NameCell` variants,
+    /// plus rejection of truncated, trailing, unsorted, invalid UTF-8, and bad-tag payloads.
+    #[test]
+    fn stretch_front_bsf1_all_variants_and_malformed_rejection() {
+        use blaze_scope::cell_key::CellKey;
+        use blaze_scope::names_cells::Section;
+        use super::super::super::receiver::{Pointer, Pointers};
+
+        let shared = blaze_own::testing::heap().shared();
+        let k = |b: u8| ItemKey(ContentId([b; 32]));
+        let c8 = |b: u8| [b; 8];
+        let c16 = |b: u8| [b; 16];
+
+        let mut all_reads = blaze_own::Vec::new_in(a());
+        all_reads.extend_from_slice(&[
+            TableRead::Names(NameCell::Binding { module: k(1), name: CellKey(c16(2)) }),
+            TableRead::Names(NameCell::Module { module: k(3) }),
+            TableRead::Names(NameCell::Root { krate: c8(4) }),
+            TableRead::Names(NameCell::Variants { owner: k(5) }),
+            TableRead::Names(NameCell::Item { key: k(6) }),
+            TableRead::Names(NameCell::Members { owner: k(7) }),
+            TableRead::Names(NameCell::Expansion { call: k(8) }),
+            TableRead::Names(NameCell::MemberOf { member: k(9) }),
+            TableRead::Names(NameCell::VariantOf { variant: k(10) }),
+            TableRead::Names(NameCell::Beginning { first: c16(11) }),
+            TableRead::Names(NameCell::Lang { krate: c8(12) }),
+            TableRead::Names(NameCell::Incoherent { krate: c8(13) }),
+            TableRead::Names(NameCell::InternalSymbols { krate: c8(14) }),
+            TableRead::Names(NameCell::Links { krate: c8(15) }),
+            TableRead::Names(NameCell::ImplRows { krate: c8(16) }),
+            TableRead::Names(NameCell::Files { krate: c8(17) }),
+            TableRead::Names(NameCell::Extensions { krate: c8(18) }),
+            TableRead::Names(NameCell::CfgAtoms { krate: c8(19) }),
+            TableRead::Names(NameCell::Textual { module: k(20) }),
+            TableRead::Names(NameCell::Whole { krate: c8(21), section: Section::Names }),
+            TableRead::Names(NameCell::Whole { krate: c8(22), section: Section::Items }),
+            TableRead::Names(NameCell::Whole { krate: c8(23), section: Section::Expansions }),
+            TableRead::Signature { key: k(24) },
+            TableRead::Text { key: k(25) },
+            TableRead::Head { item: c16(26), part: 7 },
+            TableRead::Impls { krate: c16(27), bucket: c16(28) },
+        ]);
+        all_reads.sort_unstable();
+        all_reads.dedup();
+
+        // Build a synthetic BSF1 payload covering all Pointer::Unknown reasons & all TableRead tags.
+        let mut raw = blaze_own::Vec::new_in(a());
+        raw.extend_from_slice(STRETCH_FRONT_MAGIC);
+        raw.extend_from_slice(&2u32.to_le_bytes()); // scope = [0, 3]
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&3u32.to_le_bytes());
+        raw.extend_from_slice(&2u32.to_le_bytes()); // langs = [("owned_box", k(30)), ("sized", k(31))]
+        for (name, key) in [("owned_box", k(30)), ("sized", k(31))] {
+            let name_len = u32::try_from(name.len()).expect("lang name len fits u32");
+            raw.extend_from_slice(&name_len.to_le_bytes());
+            raw.extend_from_slice(name.as_bytes());
+            raw.extend_from_slice(&key.0.0);
+        }
+        // Pointers: At, Absent, Unknown(0), Unknown(3)
+        let pointers = Pointers {
+            boxed: Pointer::At(k(30)),
+            rc: Pointer::Absent,
+            arc: Pointer::Unknown(UNKNOWN_POINTER_REASONS[1]),
+            pin: Pointer::Unknown(UNKNOWN_POINTER_REASONS[3]),
+        };
+        encode_pointer(pointers.boxed, &mut raw).expect("encode boxed");
+        encode_pointer(pointers.rc, &mut raw).expect("encode rc");
+        encode_pointer(pointers.arc, &mut raw).expect("encode arc");
+        encode_pointer(pointers.pin, &mut raw).expect("encode pin");
+        let reads_len = u32::try_from(all_reads.len()).expect("reads len fits u32");
+        raw.extend_from_slice(&reads_len.to_le_bytes());
+        for &read in all_reads.iter() {
+            encode_table_read(read, &mut raw);
+        }
+
+        let decoded = StretchFront::decode(&raw, shared).expect("decode synthetic BSF1");
+        assert_eq!(decoded.borrow_index().scope(), &[0, 3]);
+        assert_eq!(decoded.borrow_index().lang("owned_box"), Some(k(30)));
+        assert_eq!(decoded.borrow_index().lang("sized"), Some(k(31)));
+        assert_eq!(decoded.pointers(), pointers);
+        assert_eq!(decoded.reads(), all_reads.as_slice());
+
+        let mut reencoded = blaze_own::Vec::new_in(a());
+        decoded.encode(&mut reencoded).expect("re-encode synthetic BSF1");
+        assert_eq!(reencoded.as_slice(), raw.as_slice());
+
+        // Truncated input rejected.
+        assert!(matches!(StretchFront::decode(&raw[..raw.len() - 1], shared), Err(StretchFrontError::Short { .. })));
+        assert!(matches!(StretchFront::decode(&raw[..3], shared), Err(StretchFrontError::Short { .. })));
+
+        // Trailing bytes rejected.
+        let mut trailing = blaze_own::Vec::new_in(a());
+        trailing.extend_from_slice(&raw);
+        trailing.push(0);
+        assert_eq!(StretchFront::decode(&trailing, shared).err(), Some(StretchFrontError::Trailing { extra: 1 }));
+
+        // Unsorted scope rejected.
+        let mut bad_scope = blaze_own::Vec::new_in(a());
+        bad_scope.extend_from_slice(STRETCH_FRONT_MAGIC);
+        bad_scope.extend_from_slice(&2u32.to_le_bytes());
+        bad_scope.extend_from_slice(&3u32.to_le_bytes());
+        bad_scope.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(StretchFront::decode(&bad_scope, shared).err(), Some(StretchFrontError::UnsortedScope { at: 1 }));
+
+        // Non-empty langs with empty scope rejected.
+        let mut empty_scope = blaze_own::Vec::new_in(a());
+        empty_scope.extend_from_slice(STRETCH_FRONT_MAGIC);
+        empty_scope.extend_from_slice(&0u32.to_le_bytes());
+        empty_scope.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(StretchFront::decode(&empty_scope, shared).err(), Some(StretchFrontError::ScopeEmptyWithLangs { langs: 1 }));
+
+        // Unknown pointer tag rejected.
+        let mut bad_ptr = blaze_own::Vec::new_in(a());
+        bad_ptr.extend_from_slice(STRETCH_FRONT_MAGIC);
+        bad_ptr.extend_from_slice(&0u32.to_le_bytes());
+        bad_ptr.extend_from_slice(&0u32.to_le_bytes());
+        bad_ptr.extend_from_slice(&[99u8, 0, 0, 0]);
+        bad_ptr.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(StretchFront::decode(&bad_ptr, shared).err(), Some(StretchFrontError::PointerTag { tag: 99 }));
     }
 }
 

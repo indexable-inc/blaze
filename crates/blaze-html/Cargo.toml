@@ -1,0 +1,24 @@
+[package]
+name = "blaze-html"
+description = "Pure no_std, zero-unsafe, sans-IO HTML5 tokenizer, arena DOM, and visual block renderer with dark/light <picture> resolution and Markdown interoperability"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

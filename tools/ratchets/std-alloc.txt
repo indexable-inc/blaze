@@ -27,7 +27,7 @@ blaze-cas	87	1	4	395
 blaze-cbor	0	0	1	0
 blaze-cc	0	0	4	3
 blaze-check	72	1	0	107
-blaze-cli	486	1	0	407
+blaze-cli	482	1	0	405
 blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11
@@ -75,7 +75,7 @@ blaze-lower	17	0	0	15
 blaze-malloc	4	0	3	20
 blaze-manifest	151	1	0	775
 blaze-math	0	0	0	1
-blaze-mem	48	1	5	39
+blaze-mem	46	1	5	39
 blaze-memchr	2	0	1	4
 blaze-memo	100	1	8	114
 blaze-memo-macros	2	1	0	36

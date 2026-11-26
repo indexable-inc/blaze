@@ -1,0 +1,29 @@
+[package]
+name = "blaze-sh"
+description = "bstd::sh: blaze's own structured shell language core (docs/v2/plan/design/sh.md): pipelines of typed values, O(1) copy-on-write forkable engine state, Rust REPL cell protocol, sans-IO, no_std, every allocation in the caller's Alloc"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-toml.workspace = true
+blaze-glob.workspace = true
+blaze-sniff.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

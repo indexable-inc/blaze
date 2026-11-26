@@ -242,12 +242,22 @@ pub(crate) fn unroot_checkout<D: Driver>(
     Ok(unrooted)
 }
 
+/// Auxiliary per-answer record keys (`<root>.members` and `<root>.grains`) carried beside a
+/// saved workspace base so cross-worktree adoption (`adopt_certified`) and `OtherCheckout` starts
+/// inherit standing member reach and `ReadGrains` without rebuilding them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct BaseAux {
+    pub(crate) members: Option<Key>,
+    pub(crate) grains: Option<Key>,
+}
+
 /// Whether a saved answer should update the home's shared workspace bases (`BASES_ROOT`): whole-
-/// workspace checks keep their base; scoped checks skip it so a partial answer never replaces a
-/// workspace base.
+/// workspace checks keep their base (with optional auxiliary `.members`/`.grains` keys); scoped
+/// checks skip it so a partial answer never replaces a workspace base.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SaveBase {
     Keep,
+    KeepWith(BaseAux),
     Skip,
 }
 
@@ -1670,9 +1680,18 @@ where
     Ok(out)
 }
 
+/// Maximum changed causes in an incremental `save()` that reuse `request_alloc` directly instead
+/// of creating and dropping a fresh 64 GiB `PHASE_RESERVE` `blaze_mem::Root`.
+const SAVE_SCOPED_ARENA_CAUSES: usize = 64;
+
 /// [`run_jobs_par`] giving each worker its own reusable bump [`Frame`] (reset between jobs and
 /// trimmed above [`PAGE_SCRATCH_TRIM`]) so `BEP6` page dictionary & merge scratch never contends
 /// on `save_mem` or allocates on `Global`.
+///
+/// When `reuse_frame` is `Some` and the jobs run inline (`jobs.len() < min_par || active_workers
+/// <= 1`), uses the caller's frame directly so small 1-line incremental edits skip reserving and
+/// unmapping a 1 GiB `PAGE_SCRATCH_FRAME`.
+#[expect(clippy::too_many_arguments, reason = "parallel framed job runner: each argument one scheduling/memory handle")]
 fn run_jobs_par_framed<'a, J, R, F>(
     cx: &Cx,
     workers: core::num::NonZeroU32,
@@ -1680,6 +1699,7 @@ fn run_jobs_par_framed<'a, J, R, F>(
     span: &'static str,
     jobs: &[J],
     alloc: SharedAlloc<'a>,
+    reuse_frame: Option<&Frame>,
     run: F,
 ) -> Result<blaze_own::Vec<R, SharedAlloc<'a>>, CliError>
 where
@@ -1688,8 +1708,17 @@ where
     F: Fn(&J, &Frame) -> R + Sync,
 {
     let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+    if jobs.is_empty() {
+        return Ok(out);
+    }
     let active_workers = workers.get().min(cx.workers());
     if jobs.len() < min_par || active_workers <= 1 {
+        if let Some(scratch) = reuse_frame {
+            for job in jobs {
+                out.push(run(job, scratch));
+            }
+            return Ok(out);
+        }
         let mut scratch = Frame::with_reserve(PAGE_SCRATCH_FRAME, blaze_mem::Tag::Query)
             .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?;
         for job in jobs {
@@ -1789,23 +1818,36 @@ fn save<'m, D: Driver, S: Sharing>(
     writer: Writer,
     rows: &Rows<'_>,
     journal: &crate::journal_sweep::Taken<'_>,
-    _request_alloc: SharedAlloc<'_>,
+    request_alloc: SharedAlloc<'_>,
     frame: &Frame,
     row_keys: &[Key],
     (last_root, rekey): (Option<Key>, Rekey),
     workers: core::num::NonZeroU32,
     save_base: SaveBase,
 ) -> Result<Saved, CliError> {
-    // Scoped arena for all serialization buffers (encoded pages, header shards, reach/direct
-    // indexes, toolchain base merge): none outlives `save()`, so keeping them out of `RequestMem`
-    // (`Tag::Api`) returns 100% of their pages to the OS before `after_answer` commit.
-    let save_mem = blaze_mem::Root::new(blaze_mem::RootOpts {
-        reserve: crate::engine_phase_mem::PHASE_RESERVE,
-        tag: blaze_mem::Tag::Query,
-        live_at_drop: blaze_mem::LiveAtDrop::Refused,
-    })
-    .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?;
-    let alloc = save_mem.shared();
+    // Incremental edits (`last.is_some()` with few changed causes) reuse `request_alloc` and the
+    // caller's scratch frame directly, avoiding the cost of reserving and unmapping a brand-new
+    // 64 GiB `PHASE_RESERVE` `blaze_mem::Root` + 1 GiB `PAGE_SCRATCH_FRAME` on every edit.
+    // Cold or large rebuilds keep a scoped `blaze_mem::Root` so 100% of their serialization
+    // buffers return to the OS before `after_answer` commit.
+    let small_edit = last.is_some() && kept.causes.len() <= SAVE_SCOPED_ARENA_CAUSES;
+    let save_mem = if small_edit {
+        None
+    } else {
+        Some(
+            blaze_mem::Root::new(blaze_mem::RootOpts {
+                reserve: crate::engine_phase_mem::PHASE_RESERVE,
+                tag: blaze_mem::Tag::Query,
+                live_at_drop: blaze_mem::LiveAtDrop::Refused,
+            })
+            .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?,
+        )
+    };
+    let alloc = match save_mem.as_ref() {
+        Some(mem) => mem.shared(),
+        None => request_alloc,
+    };
+    let inline_scratch = small_edit.then_some(frame);
     let result = (|| -> Result<Saved, CliError> {
     let mut encoded = match last {
         Some(stored) => {
@@ -1822,7 +1864,7 @@ fn save<'m, D: Driver, S: Sharing>(
                         None
                     }
                 },
-                |jobs| match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job, scratch| job.run_in(alloc, scratch)) {
+                |jobs| match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, inline_scratch, |job, scratch| job.run_in(alloc, scratch)) {
                     Ok(built) => built,
                     Err(error) => {
                         pool_err = Some(error);
@@ -1841,7 +1883,7 @@ fn save<'m, D: Driver, S: Sharing>(
         None => {
             let mut pool_err: Option<CliError> = None;
             let encoded = pages::encode_par(kept, None, alloc, |jobs| {
-                match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job, scratch| job.run_in(alloc, scratch)) {
+                match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, inline_scratch, |job, scratch| job.run_in(alloc, scratch)) {
                     Ok(built) => built,
                     Err(error) => {
                         pool_err = Some(error);
@@ -2087,10 +2129,14 @@ fn save<'m, D: Driver, S: Sharing>(
     // This answer as its workspace's newest base: a checkout of it with none of its own starts
     // from it ([`BASES_ROOT`]). Scoped checks skip this so a partial answer never replaces a
     // workspace base. The control keeps the one home-wide pointer instead.
-    if save_base == SaveBase::Skip {
-        saved.base = BaseKept::NotAsked;
-        return Ok(saved);
-    }
+    let base_aux = match save_base {
+        SaveBase::Skip => {
+            saved.base = BaseKept::NotAsked;
+            return Ok(saved);
+        }
+        SaveBase::Keep => BaseAux::default(),
+        SaveBase::KeepWith(aux) => aux,
+    };
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
         store.pin(LATEST_ROOT, &[key])?;
@@ -2103,6 +2149,7 @@ fn save<'m, D: Driver, S: Sharing>(
         rows,
         key,
         base_direct_index,
+        base_aux,
         &encoded,
         &indexed_beside,
         unsharded_indexes.as_deref(),
@@ -2145,17 +2192,26 @@ fn unroot_base_slot<D: Driver>(
     let prefix = base_slot_prefix(workspace, layout, frame);
     let answer_name = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
     let reach_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
+    let members_name = bstd::mem::format_in!(frame, "{}.members", prefix.as_str());
+    let grains_name = bstd::mem::format_in!(frame, "{}.grains", prefix.as_str());
     if lent.has_root(answer_name.as_str()) {
         lent.unroot(answer_name.as_str());
     }
     if lent.has_root(reach_name.as_str()) {
         lent.unroot(reach_name.as_str());
     }
+    if lent.has_root(members_name.as_str()) {
+        lent.unroot(members_name.as_str());
+    }
+    if lent.has_root(grains_name.as_str()) {
+        lent.unroot(grains_name.as_str());
+    }
     unroot_reach_shards(lent, prefix.as_str(), 0, true, frame);
 }
 
-/// Renews an already-kept workspace base slot's answer and reach roots in O(1) so surviving
-/// entries in [`BASES_ROOT`] do not expire while another checkout keeps updating the list.
+/// Renews an already-kept workspace base slot's answer, auxiliary (`.members`/`.grains`), and
+/// reach roots in O(1) so surviving entries in [`BASES_ROOT`] do not expire while another checkout
+/// keeps updating the list.
 fn renew_base_slot<D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     workspace: ContentId,
@@ -2165,6 +2221,10 @@ fn renew_base_slot<D: Driver>(
     let prefix = base_slot_prefix(workspace, layout, frame);
     let answer_name = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
     let _ = lent.renew_root(answer_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+    let members_name = bstd::mem::format_in!(frame, "{}.members", prefix.as_str());
+    let _ = lent.renew_root(members_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+    let grains_name = bstd::mem::format_in!(frame, "{}.grains", prefix.as_str());
+    let _ = lent.renew_root(grains_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
     let reach_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
     if lent.renew_root(reach_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
         return;
@@ -2214,6 +2274,7 @@ fn keep_base<'m, D: Driver, S: Sharing>(
     rows: &Rows<'_>,
     pointer: Key,
     base_direct_index: blaze_cas::Key,
+    base_aux: BaseAux,
     encoded: &pages::Encoded<'_>,
     indexed_beside: &BesideCache<'_>,
     unsharded_indexes: Option<&[blaze_cas::Key]>,
@@ -2263,6 +2324,39 @@ fn keep_base<'m, D: Driver, S: Sharing>(
     }
     lent.root_through(base_answer.as_str(), &[base_direct_index], blaze_cas::plain::ROOT_LIFE_NS)
         .map_err(crate::store::PlaceError::from)?;
+    // Propagate standing `.members` and `.grains` keys under this `(workspace, layout)` base slot
+    // (without changing `BEB2` layout) so cross-worktree `adopt_certified` and `OtherCheckout`
+    // starts inherit member reach and `ReadGrains` directly.
+    let base_members = bstd::mem::format_in!(frame, "{}.members", prefix.as_str());
+    match base_aux.members {
+        Some(key) => {
+            if read_single_key(store, base_members.as_str())? != Some(key)
+                || !lent.renew_root(base_members.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live()
+            {
+                store.pin(base_members.as_str(), &[key])?;
+            }
+        }
+        None => {
+            if lent.has_root(base_members.as_str()) {
+                lent.unroot(base_members.as_str());
+            }
+        }
+    }
+    let base_grains = bstd::mem::format_in!(frame, "{}.grains", prefix.as_str());
+    match base_aux.grains {
+        Some(key) => {
+            if read_single_key(store, base_grains.as_str())? != Some(key)
+                || !lent.renew_root(base_grains.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live()
+            {
+                store.pin(base_grains.as_str(), &[key])?;
+            }
+        }
+        None => {
+            if lent.has_root(base_grains.as_str()) {
+                lent.unroot(base_grains.as_str());
+            }
+        }
+    }
 
     // Unroot evicted base slots and renew surviving base slots in O(1).
     for old in old_bases.iter() {
@@ -2287,14 +2381,38 @@ fn keep_base<'m, D: Driver, S: Sharing>(
     })
 }
 
+/// Reads a single 32-byte key from a named store root, or `None` if absent or another length.
+fn read_single_key<'m, D: Driver, S: Sharing>(
+    store: &mut CommandStore<'m, '_, D, S>,
+    root_name: &str,
+) -> Result<Option<Key>, CliError> {
+    Ok(store.named(root_name)?.filter(|keys| keys.len() == 32).map(|keys| key_at(keys, 0)))
+}
+
+/// Reads the optional `<prefix>.members` and `<prefix>.grains` auxiliary keys for a base or root.
+fn read_base_aux<'m, D: Driver, S: Sharing>(
+    store: &mut CommandStore<'m, '_, D, S>,
+    prefix: &str,
+    frame: &Frame,
+) -> Result<BaseAux, CliError> {
+    let members_root = bstd::mem::format_in!(frame, "{prefix}.members");
+    let grains_root = bstd::mem::format_in!(frame, "{prefix}.grains");
+    Ok(BaseAux {
+        members: read_single_key(store, members_root.as_str())?,
+        grains: read_single_key(store, grains_root.as_str())?,
+    })
+}
+
 /// Adopts an identical stored answer from another checkout (`StoredBase::OtherCheckout`, zero
 /// moved leaves, matching tools, replayable, 0 owed) under this checkout's own root `name`
 /// without re-running the `Phases` driver.
 ///
 /// Writes a fresh sealed pointer carrying this checkout's leaf stamps (`rows`) and journal cursor
-/// (`journal`), and pins `{name}`, `{name}.journal`, `{name}.answer`, and `{name}.reach` (or
-/// sharded reach roots) so this checkout's answer is completely independent of the source
-/// checkout under GC and `blaze clean`.
+/// (`journal`), and pins `{name}`, `{name}.journal`, `{name}.answer`, `{name}.reach` (or
+/// sharded reach roots), and any standing `{name}.members` / `{name}.grains` auxiliary keys from
+/// `aux` so this checkout's answer is completely independent of the source checkout under GC and
+/// `blaze clean` and takes `Ready` on its very first edit with zero `ReadyRefused::Members` and
+/// zero `ReadGrains` rebuild.
 ///
 /// Returns `Ok(Some(new_pointer_key))` when adopted, or `Ok(None)` if a legacy radix base lacks
 /// its `beside_key(pointer)` root-tree index (caller falls through to `Phases`).
@@ -2306,6 +2424,7 @@ pub(crate) fn adopt_certified<'m, D: Driver, S: Sharing>(
     name: &str,
     pointer: &Pointer<'_>,
     root_dir: &Root<'_>,
+    aux: BaseAux,
     rows: &Rows<'_>,
     journal: &crate::journal_sweep::Taken<'_>,
     alloc: SharedAlloc<'_>,
@@ -2425,6 +2544,18 @@ pub(crate) fn adopt_certified<'m, D: Driver, S: Sharing>(
     let _ = lent.index_beside(blaze_cas::Key(new_key.0), &base_direct).map_err(crate::store::PlaceError::from)?;
     store.pin(name, &[new_key])?;
     store.pin(crate::journal_checkpoint::name(name, frame).as_str(), &[new_key])?;
+    let members_name = bstd::mem::format_in!(frame, "{name}.members");
+    match aux.members {
+        Some(key) => store.pin(members_name.as_str(), &[key])?,
+        None if lent.has_root(members_name.as_str()) => lent.unroot(members_name.as_str()),
+        None => {}
+    }
+    let grains_name = bstd::mem::format_in!(frame, "{name}.grains");
+    match aux.grains {
+        Some(key) => store.pin(grains_name.as_str(), &[key])?,
+        None if lent.has_root(grains_name.as_str()) => lent.unroot(grains_name.as_str()),
+        None => {}
+    }
     Ok(Some(new_key))
 }
 
@@ -2441,17 +2572,19 @@ fn read_bases<'m, 'f, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'
     Ok(Some(decode_bases(held.bytes, frame)))
 }
 
-/// A fully validated fallback base answer: its sealed pointer, printed lines record, and decoded
-/// root directory all opened cleanly against `store`.
+/// A fully validated fallback base answer: its sealed pointer, printed lines record, decoded
+/// root directory, and optional standing auxiliary keys (`.members`/`.grains`) all opened cleanly
+/// against `store`.
 pub(crate) struct LoadedBase<'m, 'a> {
     pub(crate) pointer: Pointer<'m>,
     pub(crate) lines: crate::engine_lines::Last<'m, 'a>,
     pub(crate) root: Root<'a>,
+    pub(crate) aux: BaseAux,
 }
 
-/// Opens a named root's pointer, lines record, and root directory, returning `Ok(None)` if the
-/// root is absent, unreadable, excluded, or (when `require_current_tools`) written under other
-/// tools.
+/// Opens a named root's pointer, lines record, root directory, and optional `.members`/`.grains`
+/// auxiliary keys, returning `Ok(None)` if the root is absent, unreadable, excluded, or (when
+/// `require_current_tools`) written under other tools.
 #[expect(clippy::too_many_arguments, reason = "base open helper: each argument one handle or constraint")]
 pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
@@ -2461,6 +2594,7 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     exclude: Option<Key>,
     require_current_tools: bool,
     alloc: SharedAlloc<'a>,
+    frame: &Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     let Some(Ok(pointer)) = load_pointer(cx, store, name)? else { return Ok(None) };
     if exclude == Some(pointer.key) {
@@ -2471,7 +2605,8 @@ pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     }
     let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { return Ok(None) };
     let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { return Ok(None) };
-    Ok(Some(LoadedBase { pointer, lines, root }))
+    let aux = read_base_aux(store, name, frame)?;
+    Ok(Some(LoadedBase { pointer, lines, root, aux }))
 }
 
 /// Opens the best readable workspace base from [`BASES_ROOT`] for the checkout at `dir_root`:
@@ -2492,7 +2627,7 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
-        return open_named_base(cx, store, LATEST_ROOT, tools, exclude, require_current_tools, alloc);
+        return open_named_base(cx, store, LATEST_ROOT, tools, exclude, require_current_tools, alloc, frame);
     }
     let Some(Some(bases)) = read_bases(cx, store, frame)? else { return Ok(None) };
     let read = |name: &str, text: &mut bstd::mem::Bytes<'_>| -> Result<bool, CliError> {
@@ -2529,7 +2664,9 @@ pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
         }
         let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { continue };
         let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { continue };
-        let loaded = LoadedBase { pointer, lines, root };
+        let prefix = base_slot_prefix(base.workspace, base.layout, frame);
+        let aux = read_base_aux(store, prefix.as_str(), frame)?;
+        let loaded = LoadedBase { pointer, lines, root, aux };
         if current {
             return Ok(Some(loaded));
         }
@@ -2549,7 +2686,7 @@ pub(crate) fn open_toolchain_base<'m, 'a, D: Driver, S: Sharing>(
     frame: &Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     let name = toolchain_base_root(toolchain, tools, frame);
-    open_named_base(cx, store, name.as_str(), tools, None, false, alloc)
+    open_named_base(cx, store, name.as_str(), tools, None, false, alloc, frame)
 }
 
 /// The home-wide toolchain-only answer root: `tool-base.<PINNED>.<TRIPLE>.<tools>`.
@@ -2747,7 +2884,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     }
     let mut tc_page_err: Option<CliError> = None;
     let encoded = pages::encode_par(&tc_kept, None, alloc, |jobs| {
-        match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "toolchain base pages", jobs, alloc, |job, scratch| job.run_in(alloc, scratch)) {
+        match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "toolchain base pages", jobs, alloc, None, |job, scratch| job.run_in(alloc, scratch)) {
             Ok(built) => built,
             Err(error) => {
                 tc_page_err = Some(error);
@@ -3860,5 +3997,131 @@ mod reach_shard_tests {
             );
         }
         let _ = garbage_key;
+    }
+
+    /// Rule 26 round-trip: saving a workspace base with `SaveBase::KeepWith(BaseAux { members,
+    /// grains })` persists `.members`/`.grains` under the `(workspace, layout)` base slot without
+    /// changing `BEB2`; another worktree opening that base via `open_base_for_tools` reads back
+    /// the exact keys and `adopt_certified` pins them under Worktree B's own `<name>.members` and
+    /// `<name>.grains` roots; evicting Worktree A cleans up the base slot's auxiliary roots while
+    /// Worktree B's adopted roots remain live.
+    #[test]
+    fn base_aux_propagates_across_keep_base_and_adopt_certified() {
+        use blaze_drive::{Kind, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage};
+
+        let io = Io::simulated(SimWorld::new(53, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let wt_a_dir = fs.open_dir(&cx, &bstd::path::Path::new("wt_a").expect("wt_a")).expect("open wt_a");
+        let wt_b_dir = fs.open_dir(&cx, &bstd::path::Path::new("wt_b").expect("wt_b")).expect("open wt_b");
+        let manifest_bytes = b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+        let lock_bytes = b"version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+        for dir in [&wt_a_dir, &wt_b_dir] {
+            dir.publish(&cx, &bstd::path::Path::new("Cargo.toml").expect("manifest"), bstd::fs::Content::bytes(manifest_bytes), bstd::fs::Durable::No).expect("write Cargo.toml");
+            dir.publish(&cx, &bstd::path::Path::new("Cargo.lock").expect("lock"), bstd::fs::Content::bytes(lock_bytes), bstd::fs::Durable::No).expect("write Cargo.lock");
+        }
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 53 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+        let tools = Tools([Tool(ContentId([7; 32])); blaze_drive::key::KINDS]);
+        let toolchain = blaze_toolchain::ToolchainId([2; 32]);
+        let journal = crate::journal_sweep::take(&cx, &fs, &wt_a_dir, home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
+        let lines = crate::engine_lines::Lines::new_in(alloc).record();
+
+        let mut rows = Rows::new_in(frame);
+        rows.workspace = Workspace::of_lock(lock_bytes, frame);
+        let manifest_path = u32::try_from(rows.names.push("Cargo.toml")).expect("path idx");
+        let lock_path = u32::try_from(rows.names.push("Cargo.lock")).expect("path idx");
+        rows.rows.push(crate::sweep::Leaf {
+            kind: crate::sweep::LeafKind::Manifest,
+            flags: 0,
+            path: manifest_path,
+            stamp: None,
+            id: ContentId::of(crate::sweep::FILE_DOMAIN, manifest_bytes),
+        });
+        rows.rows.push(crate::sweep::Leaf {
+            kind: crate::sweep::LeafKind::Manifest,
+            flags: 0,
+            path: lock_path,
+            stamp: None,
+            id: ContentId::of(crate::sweep::FILE_DOMAIN, lock_bytes),
+        });
+
+        let payload = blaze_drive::key::content_key(b"row-payload");
+        store.put(&cx, payload, b"row-payload").expect("put payload");
+        let members_key = blaze_drive::key::content_key(b"members-record-bytes");
+        store.put(&cx, members_key, b"members-record-bytes").expect("put members");
+        let grains_key = blaze_drive::key::content_key(b"grains-record-bytes");
+        store.put(&cx, grains_key, b"grains-record-bytes").expect("put grains");
+        let aux = BaseAux { members: Some(members_key), grains: Some(grains_key) };
+
+        let mut cold = Kept::new_in(alloc);
+        cold.answer.serial = Gen(1);
+        let file = Name::new(Kind::FileItems, ContentId::of("base aux test file", b"lib.rs"));
+        let task = Name::new(Kind::BodyCheck, ContentId::of("base aux test body", b"f"));
+        let src = ContentId::of("base aux test src", b"v1");
+        cold.answer.by_file.entry(file).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(task);
+        cold.answer.rows.insert(task, Row {
+            key: tools.key(task, &src),
+            phase: Phase::new(Stage::Bodies, 0),
+            file,
+            source: src,
+            out: payload.0,
+            serial: Gen(1),
+            defines: blaze_own::Vec::new_in(alloc),
+            reads: blaze_own::Vec::new_in(alloc),
+            by_cell: blaze_own::Vec::new_in(alloc),
+            findings: 0,
+            inline: false,
+            failed: false,
+        });
+        cold.causes.insert(task, (Gen(1), Cause::New));
+        cold.records.insert(task, payload);
+
+        let wt_a_root = root_name("/wt_a", frame);
+        let wt_b_root = root_name("/wt_b", frame);
+        let saved = save_edit(
+            &cx, &mut store, &lent, wt_a_root.as_str(), toolchain, &tools, &cold,
+            Printed { names: true, bodies_whole: true, replayable: true },
+            (lines.0, &lines.1), None, &rows, &journal, alloc, frame, &[],
+            (None, core::num::NonZeroU32::MIN), SaveBase::KeepWith(aux),
+        ).expect("save wt_a");
+        assert!(matches!(saved.base, BaseKept::Kept { entries: 1 }), "saved base: {:?}", saved.base);
+        lent.commit().expect("commit wt_a");
+
+        // Worktree B opens the workspace base from `BASES_ROOT` and recovers `BaseAux`.
+        let loaded = open_base_for_tools(&cx, &mut store, &wt_b_dir, &tools, None, true, alloc, frame)
+            .expect("open base")
+            .expect("found base for wt_b");
+        assert_eq!(loaded.aux, aux, "open_base_for_tools must return standing members/grains keys");
+
+        // Worktree B adopts the certified answer: its own `<wt_b>.members` and `<wt_b>.grains` are pinned.
+        let adopted = adopt_certified(
+            &cx, &mut store, &lent, wt_b_root.as_str(), &loaded.pointer, &loaded.root,
+            loaded.aux, &rows, &journal, alloc, frame,
+        ).expect("adopt_certified");
+        assert!(adopted.is_some(), "adopt_certified succeeded");
+        lent.commit().expect("commit wt_b");
+
+        let wt_b_aux = read_base_aux(&mut store, wt_b_root.as_str(), frame).expect("read wt_b aux");
+        assert_eq!(wt_b_aux, aux, "adopted checkout owns its own .members and .grains roots");
+
+        // Unrooting Worktree A removes the base slot's `.members`/`.grains` while Worktree B's stay live.
+        let ws = rows.workspace.expect("workspace");
+        let layout = layout_of(&rows, frame).expect("layout");
+        let slot_prefix = base_slot_prefix(ws.id, layout, frame);
+        drop(loaded);
+        drop(store);
+        unroot_checkout(&lent, "/wt_a", frame).expect("unroot wt_a");
+        let mut store2 = CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle()).expect("store2");
+        assert_eq!(read_base_aux(&mut store2, slot_prefix.as_str(), frame).expect("slot aux"), BaseAux::default());
+        assert_eq!(read_base_aux(&mut store2, wt_b_root.as_str(), frame).expect("wt_b aux after clean"), aux);
     }
 }

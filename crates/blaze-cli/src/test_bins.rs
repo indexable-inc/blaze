@@ -954,7 +954,8 @@ impl<'a, 'h> BinServer<'a, 'h> {
             let head = roots.head();
             let cache_id = crate::test_cache::bin_cache_id(bin.package, bin.bin_name, bin.key, &bin.builder);
             let mut sc = SuiteCache::new(bin.names, bin.builder, typed, tables, make_watch);
-            crate::test_cache::load_verified_by_id(lent, cache_id, certificate, sc.verified_mut())
+            let (closed_set, ws_set) = sc.verified_sets_mut();
+            crate::test_cache::load_verified_by_id(lent, cache_id, certificate, closed_set, ws_set)
                 .map_err(|why| BinStubError::Cache(blaze_own::Box::new_in(why, tables)))?;
             let entry_sym = sc.root_test(&roots).map_err(|why| BinStubError::Parent {
                 package: owned_text(bin.package, tables),
@@ -1028,7 +1029,14 @@ impl<'a, 'h> BinServer<'a, 'h> {
         for bin in self.bins.iter() {
             let sc = bin.suite_cache.borrow();
             if sc.verified_dirty() {
-                crate::test_cache::save_verified_by_id(lent, bin.cache_id, certificate, sc.verified_pairs(), self.alloc)?;
+                crate::test_cache::save_verified_by_id(
+                    lent,
+                    bin.cache_id,
+                    certificate,
+                    sc.verified_closed_pairs(),
+                    sc.verified_workspace_pairs(),
+                    self.alloc,
+                )?;
             }
         }
         Ok(())
@@ -2489,22 +2497,28 @@ mod dst_tests {
                     pairs.sort_unstable();
                     pairs.dedup();
                     let mut bytes: AVec<'static, u8> = Vec::new_in(alloc);
-                    encode_verified(&cert_today, pairs.as_slice(), &mut bytes);
-                    let mut reloaded: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
+                    let today = *cert_today.bytes();
+                    let stale = *cert_stale.bytes();
+                    encode_verified(today, today, pairs.as_slice(), &[], &mut bytes);
+                    let mut reloaded_closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
                         Set::new(SetOpts { hasher: FixedState::default(), alloc, capacity: None });
-                    match decode_verified_status(bytes.as_slice(), &cert_today, &mut reloaded) {
-                        VerifiedDecode::Loaded(n) if n == oset.len() => {
+                    let mut reloaded_ws: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
+                        Set::new(SetOpts { hasher: FixedState::default(), alloc, capacity: None });
+                    match decode_verified_status(bytes.as_slice(), today, today, &mut reloaded_closed, &mut reloaded_ws) {
+                        VerifiedDecode::Loaded(n, 0) if n == oset.len() => {
                             for pair in oset.iter() {
-                                if !reloaded.contains(pair) {
+                                if !reloaded_closed.contains(pair) {
                                     return Err("reloaded BZTV missed an oracle verified pair");
                                 }
                             }
                         }
                         _ => return Err("BZTV round-trip failed under matching certificate"),
                     }
-                    let mut stale_out: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
+                    let mut stale_closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
                         Set::new(SetOpts { hasher: FixedState::default(), alloc, capacity: None });
-                    if decode_verified_status(bytes.as_slice(), &cert_stale, &mut stale_out)
+                    let mut stale_ws: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
+                        Set::new(SetOpts { hasher: FixedState::default(), alloc, capacity: None });
+                    if decode_verified_status(bytes.as_slice(), stale, stale, &mut stale_closed, &mut stale_ws)
                         != VerifiedDecode::StaleCertificate
                     {
                         return Err("BZTV did not reject stale certificate");
@@ -2513,9 +2527,11 @@ mod dst_tests {
                         *last ^= 0xFF;
                     }
                     bytes.truncate(bytes.len().saturating_sub(1));
-                    let mut corrupt_out: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
+                    let mut corrupt_closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
                         Set::new(SetOpts { hasher: FixedState::default(), alloc, capacity: None });
-                    if decode_verified_status(bytes.as_slice(), &cert_today, &mut corrupt_out)
+                    let mut corrupt_ws: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> =
+                        Set::new(SetOpts { hasher: FixedState::default(), alloc, capacity: None });
+                    if decode_verified_status(bytes.as_slice(), today, today, &mut corrupt_closed, &mut corrupt_ws)
                         != VerifiedDecode::Corrupt
                     {
                         return Err("truncated BZTV was not flagged corrupt");

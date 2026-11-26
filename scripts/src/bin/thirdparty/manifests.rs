@@ -31,8 +31,9 @@ pub(super) const MANIFESTS_DOC: &str = r#"
 "#;
 
 /// Directories with a Cargo.toml that are not members, and must stay out, each with why.
-const NOT_MEMBERS: [(&str, &str); 2] = [
+const NOT_MEMBERS: [(&str, &str); 3] = [
     ("crates/blaze-hvbox", "a Hypervisor.framework sandbox kept out of git and out of the workspace until its owner says (it panicked the Mac's kernel, 2026-11-16)"),
+    ("crates/blaze-shell", "its own workspace with its own lock: a macOS Metal/AppKit GUI app blaze does not build on Linux"),
     ("crates/harness", "its own workspace with its own lock: a macOS app and daemon blaze does not build (crates/harness/README.md)"),
 ];
 

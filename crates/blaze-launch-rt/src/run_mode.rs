@@ -1533,6 +1533,12 @@ pub enum End {
     /// entry's thread with the control thread alive, so the program's `atexit` functions (its
     /// code) can still reach code not yet placed.
     Exit,
+    /// A test entry with an unwind marker (`BLAZE_LAUNCH_UNWOUND_FILE`): on normal return, ends
+    /// through `libc::exit(status)` with the control thread alive so TLS destructors and `atexit`
+    /// handlers (e.g. tokio runtime TLS) can still JIT-resolve unplaced destructors; on an
+    /// uncaught guest panic unwind, stops the control thread and returns [`RunModeError::Unwound`]
+    /// so the launcher records the unwind marker and ends with `_exit(101)`.
+    ExitOrReturnUnwound,
     /// A compile-time program: the control thread is stopped and joined and [`run`] returns the
     /// status to its caller, which owns the process (blaze-launcher's `comptime:` branch, which
     /// ends it through the compile-time transport's `end`). The program's `atexit` functions
@@ -2407,9 +2413,10 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
         }
         let exit = call_entry_with(thunk, handed, argc, argv);
         match (exit, end) {
-            (EntryExit::Returned(status), End::Exit) => {
+            (EntryExit::Returned(status), End::Exit | End::ExitOrReturnUnwound) => {
                 // The main thread stays a mutator to the end: `exit` runs the program's
-                // `atexit` functions, which are its code.
+                // `atexit` functions and TLS destructors, which are its code and may trigger
+                // demand-compilation through the live control thread.
                 core::mem::forget(me);
                 // SAFETY: ends the process as a C program's return from `main` does; `fd` and
                 // every mapping end with it.
@@ -2438,7 +2445,7 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
                 }
                 Ok(status)
             }
-            (EntryExit::Unwound, End::Return) => {
+            (EntryExit::Unwound, End::Return | End::ExitOrReturnUnwound) => {
                 drop(me);
                 shared.stop();
                 if control.join().is_err() {

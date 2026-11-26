@@ -1177,6 +1177,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-html"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-http"
 version = "0.0.0"
 dependencies = [
@@ -1666,6 +1674,19 @@ name = "blaze-pins"
 version = "0.0.0"
 
 [[package]]
+name = "blaze-preview"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-html",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-sniff",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-proc-macro"
 version = "0.0.0"
 dependencies = [
@@ -2000,6 +2021,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-sh"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-glob",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-sniff",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-sha256"
 version = "0.0.0"
 dependencies = [
@@ -2034,6 +2068,14 @@ version = "0.0.0"
 dependencies = [
  "blaze-own",
  "blaze-site",
+]
+
+[[package]]
+name = "blaze-sniff"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -2116,6 +2158,14 @@ dependencies = [
  "blaze-sim",
  "blaze-surface",
  "zstd",
+]
+
+[[package]]
+name = "blaze-ssh"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -2416,6 +2466,14 @@ dependencies = [
  "blaze-graph",
  "blaze-ids",
  "blaze-store-check",
+]
+
+[[package]]
+name = "blaze-vim"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]

@@ -1049,6 +1049,10 @@ pub enum BuildError {
     /// the operation and its rule (unwinding in the body, a compound value live across a
     /// suspend, a cancel path that suspends...).
     Coroutine(blaze_lir::coroutine::CoroutineError),
+    /// The flow lowering refused an `async` block's body when building its state recipe
+    /// (`blaze-flow-lower::lower_async_witness` / `state_recipe`), naming the exact `Refusal`
+    /// form and item-relative byte range (rule 19).
+    CoroutineRecipe { owner: ItemKey, ordinal: u32, refusal: blaze_flow_lower::Refusal },
     /// An unsizing coercion at `expr` the build refuses by the rule `rule` (walk/unsize_nested.rs):
     /// through ADT `adt` (none: at the pointer itself), `why`: a struct where no field or more
     /// than one field holding bytes differs, a union, an enum, a nesting past `UNSIZE_DEPTH`.
@@ -1208,6 +1212,11 @@ impl fmt::Display for BuildError {
             BuildError::Lir(error) => write!(f, "blaze-lir's builder refused the function: {error}"),
             BuildError::Verify(error) => write!(f, "the LIR built does not verify: {error}"),
             BuildError::Coroutine(error) => write!(f, "an async block's body was not split: {error}"),
+            BuildError::CoroutineRecipe { owner, ordinal, refusal } => write!(
+                f,
+                "async block {ordinal} of {:#x}: its state recipe was refused by flow lowering ({:?} at {}..{})",
+                owner.0, refusal.form, refusal.range.start, refusal.range.end
+            ),
             BuildError::Unsize { expr, adt: Some(adt), why, rule } => {
                 write!(f, "expression {}: an unsizing coercion through ADT {:#x}: {why} ({rule})", expr.0, adt.0)
             }

@@ -983,6 +983,24 @@ pub(crate) fn checked_body(outline: &blaze_file_items::Outline<'_>, item: &blaze
     Some(body)
 }
 
+/// [`checked_body`] over an already-serialized [`blaze_surface::FileItemsView`].
+pub(crate) fn checked_body_view(view: blaze_surface::FileItemsView<'_>, item: &blaze_surface::Item) -> Option<blaze_surface::Range> {
+    let holds = |kind: ItemKind| matches!(kind, ItemKind::Function | ItemKind::Const | ItemKind::Static);
+    if !holds(item.kind()) {
+        return None;
+    }
+    let body = item.body?;
+    let mut parent = item.parent;
+    while let Some(at) = parent {
+        let up = view.item(at)?;
+        if holds(up.item.kind()) {
+            return None;
+        }
+        parent = up.item.parent;
+    }
+    Some(body)
+}
+
 /// Whether a macro can take `item`, so that its expansions write bodies its entry's check
 /// covers (body_types.rs `check`, covered.rs `written_by`): a macro call; an item with an
 /// outer attribute that is not one of the language's inert ones (a derive, an attribute
@@ -990,6 +1008,15 @@ pub(crate) fn checked_body(outline: &blaze_file_items::Outline<'_>, item: &blaze
 /// (D104; covered.rs `Root::Replaced`). A filter, never the answer: an entry it lets through
 /// whose expansions wrote nothing covers nothing more.
 pub(crate) fn may_expand(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> bool {
+    may_expand_attrs(outline.attrs(item).iter().copied(), item, text)
+}
+
+/// [`may_expand`] over an already-serialized [`blaze_surface::FileItemsView`].
+pub(crate) fn may_expand_view(view: blaze_surface::FileItemsView<'_>, item: &blaze_surface::Item, text: &str) -> bool {
+    may_expand_attrs(view.attrs(item), item, text)
+}
+
+fn may_expand_attrs(mut attrs: impl Iterator<Item = blaze_surface::Attr>, item: &blaze_surface::Item, text: &str) -> bool {
     if item.kind() == ItemKind::MacroCall {
         // An `include!`'s items are a file's, which is a part with its own bodies' parts
         // (`outline_file`'s `MacroCall` arm): its expansion writes no body this entry covers.
@@ -1003,7 +1030,7 @@ pub(crate) fn may_expand(outline: &blaze_file_items::Outline<'_>, item: &blaze_s
     }
     // A `cfg_attr` may give a derive (`#[cfg_attr(feature = "serde", derive(Serialize))]`):
     // it is never evaluated here, so it lets the entry through.
-    outline.attrs(item).iter().any(|attr| {
+    attrs.any(|attr| {
         !attr.inner
             && match attr.kind {
                 blaze_surface::AttrKind::CfgAttr => true,
@@ -1036,6 +1063,44 @@ pub(crate) fn expansion_entry(outline: &blaze_file_items::Outline<'_>, item: &bl
     checked_body(outline, item).is_none() && crate::signature::is_signature_entry(outline, item) && may_expand(outline, item, text)
 }
 
+/// [`expansion_entry`] over an already-serialized [`blaze_surface::FileItemsView`].
+pub(crate) fn expansion_entry_view(view: blaze_surface::FileItemsView<'_>, item: &blaze_surface::Item, text: &str) -> bool {
+    let in_modules_only = |mut parent: Option<blaze_surface::ItemIndex>| {
+        while let Some(at) = parent {
+            let Some(up) = view.item(at) else { return false };
+            if up.item.kind() != ItemKind::Module {
+                return false;
+            }
+            parent = up.item.parent;
+        }
+        true
+    };
+    let is_sig = if let Some(parent) = item.parent
+        && let Some(up) = view.item(parent)
+        && item.kind() == ItemKind::Function
+        && up.item.kind() == ItemKind::Impl
+    {
+        in_modules_only(up.item.parent)
+    } else {
+        matches!(
+            item.kind(),
+            ItemKind::Function
+                | ItemKind::Const
+                | ItemKind::Static
+                | ItemKind::Struct
+                | ItemKind::Enum
+                | ItemKind::Union
+                | ItemKind::Trait
+                | ItemKind::TraitAlias
+                | ItemKind::Impl
+                | ItemKind::TypeAlias
+                | ItemKind::MacroCall
+                | ItemKind::ExternBlock
+        ) && in_modules_only(item.parent)
+    };
+    checked_body_view(view, item).is_none() && is_sig && may_expand_view(view, item, text)
+}
+
 /// A body's name: its file's subject and its entry's chain up to the file (each kind, name as
 /// written and disambiguator), so it stands while other items move and its own text changes.
 ///
@@ -1045,8 +1110,13 @@ pub(crate) fn expansion_entry(outline: &blaze_file_items::Outline<'_>, item: &bl
 /// each with disambiguator 0) had ONE name, and the bodies stage kept one of the two calls'
 /// tasks and dropped the other without a word (`two_macro_calls_side_by_side_are_two_bodies`).
 pub(crate) fn body_name(file: Name, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> Name {
+    body_name_from_chain(file, blaze_file_items::item_chain(outline, item, text))
+}
+
+/// [`body_name`] from an already-computed item chain digest (e.g. `signature::stored_chain`).
+pub(crate) fn body_name_from_chain(file: Name, chain: blaze_ids::ContentId) -> Name {
     let mut h = blaze_ids::Hasher::new(BODY_DOMAIN);
-    h.update(&file.subject.0).update(&blaze_file_items::item_chain(outline, item, text).0);
+    h.update(&file.subject.0).update(&chain.0);
     Name::new(Kind::BodyCheck, h.finish())
 }
 
@@ -1068,6 +1138,11 @@ pub(crate) fn item_chain(outline: &blaze_file_items::Outline<'_>, item: &blaze_s
 /// never outlining the file again (engine_lints.rs `lint_text`).
 pub(crate) fn stored_item_chain(view: blaze_surface::FileItemsView<'_>, at: blaze_surface::ItemIndex) -> u64 {
     chain_word(crate::signature::stored_chain(view, at))
+}
+
+/// [`item_chain`] from an already-computed item chain digest.
+pub(crate) fn item_chain_word(chain: blaze_ids::ContentId) -> u64 {
+    chain_word(chain)
 }
 
 /// A chain under this record's domain, cut to the 64 bits a placed finding holds.

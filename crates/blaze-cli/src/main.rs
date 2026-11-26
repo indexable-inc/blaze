@@ -633,6 +633,87 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
 /// What `blaze build` is told: the two commands that do what it would.
 const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` writes the program as a standalone executable";
 
+/// Help text for `blaze --help`, `blaze -h`, `blaze help [cmd]`, and bare `blaze`.
+const HELP_TEXT: &str = "\
+blaze — incremental Rust compiler, runner, tester, and exporter
+
+USAGE
+  blaze <command> [options] [dir]
+
+COMMANDS
+  check           Check and lint a workspace incrementally
+  run             Compile what is reached and run a binary
+  test            Run workspace tests incrementally
+  export          Export a standalone PGO-optimized native binary
+  ci              Run CI checks with structured reporting
+  inspect         Inspect lowered MIR/types for a file or function
+  why             Explain why a file or item was rechecked
+  explain         Explain a diagnostic or lint code
+  clean           Remove checkout state (and --store for home store)
+  gc              Compact store and evict stale records
+  peer            Serve crate records to LAN peers
+  toolchain       Print the pinned Rust toolchain
+  warm-toolchain  Pre-warm toolchain records into the store
+  version         Print blaze and toolchain versions
+  help            Show this help message
+
+COMMON OPTIONS
+  -p, --package <name>   Select package in workspace
+      --bin <name>       Select binary target
+  -o, --output <path>    Output path for `blaze export`
+      --view <mode>      Output view: person, agent, or json
+      --color <when>     Color output: auto, always, or never
+      --fix [sel...]     Apply automatic fixes (`blaze check`)
+      --workers <N>      Limit concurrent worker threads
+      --stats            Print telemetry summary at exit
+  -h, --help             Show help for blaze or a command
+  -V, --version          Print version information
+
+EXAMPLES
+  blaze check
+  blaze run -- --arg
+  blaze test
+  blaze export -p app -o ./app";
+
+fn command_help(sub: &str) -> Option<&'static str> {
+    match sub {
+        "check" | "engine-check" => Some(
+            "blaze check [dir] [options]\n\nCheck and lint a workspace incrementally.\n\nOPTIONS\n  --color auto|always|never   Colorize diagnostics\n  --view person|agent|json    Diagnostic output format\n  --fix [selector...]         Apply fixes (id, code, path, or all)\n  --each                      Report each body individually\n  --workers <N>               Maximum concurrent workers\n  --status-every <secs>       Emit periodic progress lines\n  --stats                     Print telemetry report at exit",
+        ),
+        "run" => Some(
+            "blaze run [dir] [options] [-- <program args>...]\n\nCompile only what is reached and execute a binary.\n\nOPTIONS\n  -p, --package <name>        Package to run\n      --bin <name>            Binary target to run\n      --grant <k=v>           Grant an environment/host capability\n      --open                  Open Explore viewer in browser\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
+        ),
+        "test" => Some(
+            "blaze test [dir] [options] [-- <test args>...]\n\nRun workspace tests incrementally.\n\nOPTIONS\n  -p, --package <name>        Package to test\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
+        ),
+        "export" => Some(
+            "blaze export [dir] [options]\n\nExport a standalone native executable (PGO-optimized by default).\n\nOPTIONS\n  -p, --package <name>        Package to export\n      --bin <name>            Binary target to export\n  -o, --output <path>         Destination executable path\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
+        ),
+        "ci" => Some(
+            "blaze ci [dir] [options]\n\nRun workspace CI checks.\n\nOPTIONS\n  --format <fmt>              Output format\n  --todo <mode>               TODO handling policy\n  --workers <N>               Maximum concurrent workers",
+        ),
+        "inspect" => Some(
+            "blaze inspect <file.rs[::fn]> [options]\n\nInspect lowered types and expressions for a file or function.\n\nOPTIONS\n  --json                      Emit JSON output\n  --all-exprs                 Include all sub-expressions\n  --edition <ed>              Override Rust edition (2015..2024, blaze-2026.11)",
+        ),
+        "clean" => Some(
+            "blaze clean [dir] [--store]\n\nRemove checkout build state (and home store with --store).",
+        ),
+        "gc" => Some(
+            "blaze gc [dir] [--background]\n\nCompact store segments and evict stale entries.",
+        ),
+        "explain" => Some(
+            "blaze explain <code>\n\nExplain a blaze diagnostic or lint code.",
+        ),
+        _ => None,
+    }
+}
+
+fn print_help(cx: &Cx, sub: Option<&str>, out: &Out) -> Result<Status, CliError> {
+    let text = sub.and_then(command_help).unwrap_or(HELP_TEXT);
+    out.line(cx, format_args!("{text}"))?;
+    Ok(Status::OK)
+}
+
 #[expect(clippy::too_many_arguments, reason = "top-level command dispatcher: each argument one specific capability extracted at main")]
 fn command(
     cx: &Cx,
@@ -648,7 +729,15 @@ fn command(
     phases: &mut Phases,
     heap: &'static blaze_own::Heap,
 ) -> Result<Status, CliError> {
+    if let Some(sub) = args.get(1)
+        && !matches!(sub, "help" | "-h" | "--help" | "warm-toolchain")
+        && args.each().skip(2).take_while(|a| *a != "--").any(|a| matches!(a, "-h" | "--help"))
+    {
+        return print_help(cx, Some(sub), out);
+    }
     match args.get(1) {
+        Some("--help" | "-h") | None => print_help(cx, None, out),
+        Some("help") => print_help(cx, args.get(2), out),
         // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
         // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
         // are moved.
@@ -689,7 +778,7 @@ fn command(
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, &clock, host, rng, out, err, heap),
         Some("peer") => peer::run(cx, args, fs, env, net, &clock, rng, out),
-        Some(_) | None => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
+        Some(_) => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
     }
 }
 

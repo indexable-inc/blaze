@@ -1,0 +1,42 @@
+[workspace]
+
+[package]
+name = "blaze-shell"
+description = "Native macOS GUI shell rendered by blaze's Metal + blaze-ui SDF/glyph shaders + CoreText, powered by blaze-sh structured values, O(1) CoW session forks, blaze-vt PTY blocks, and live Rust cells via blaze run"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+authors = ["blaze contributors"]
+
+[lib]
+name = "blaze_shell"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "blaze-shell"
+path = "src/main.rs"
+
+[dependencies]
+blaze-own = { path = "../blaze-own", features = ["std"] }
+blaze-git = { path = "../blaze-git" }
+blaze-preview = { path = "../blaze-preview" }
+blaze-sniff = { path = "../blaze-sniff" }
+blaze-ssh = { path = "../blaze-ssh" }
+blaze-vim = { path = "../blaze-vim" }
+blaze-vt = { path = "../blaze-vt" }
+blaze-sh = { path = "../blaze-sh" }
+blaze-ui = { path = "../blaze-ui" }
+blaze-json = { path = "../blaze-json" }
+blaze-data = { path = "../blaze-data" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-text = "0.3"

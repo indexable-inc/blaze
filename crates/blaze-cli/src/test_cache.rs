@@ -58,19 +58,248 @@ const RESULT_SLOT_DOMAIN: &str = "blaze test result slot 1";
 const TEST_ID_DOMAIN: &str = "blaze test: package target and test 2";
 const ADDRESS_DOMAIN: &str = "blaze test address of traced run 1";
 const TOOLS_DIGEST_DOMAIN: &str = "blaze test tools digest 1";
+const SUITE_CERT_DOMAIN: &str = "blaze test suite cert 1";
+const CLOSED_CRATES_DIGEST_DOMAIN: &str = "blaze test closed crates digest 1";
 
 const STATE_MAGIC: [u8; 4] = *b"BZTS";
-/// Version 2: header includes `Standing::root` certificate, check `tools_digest`, and a closed
-/// non-workspace crate fact table (`prefix`, `fact`, `digest`) with per-fn `closed` flags so
-/// `TestCache::open` skips re-hashing unchanged suites and unchanged toolchain/dependency fns.
-const STATE_VERSION: u32 = 2;
+/// Version 3: header adds per-suite `suite_cert` beside `Standing::root` (`cert`), `tools_digest`,
+/// and the closed non-workspace crate fact table (`prefix`, `fact`, `digest`) with per-fn `closed`
+/// flags so `TestCache::open` skips re-hashing unchanged suites in O(1) without opening `BodyCheck`
+/// rows when another suite is edited.
+const STATE_VERSION: u32 = 3;
 const VERIFIED_MAGIC: [u8; 4] = *b"BZTV";
-const VERIFIED_VERSION: u32 = 1;
-/// Cap on verified `(instance_key, content_key)` pairs persisted per suite under today's certificate.
+/// Version 2: splits verified `(instance_key, content_key)` pairs into closed/toolchain entries
+/// keyed by `closed_crates_digest` (preserved across workspace edits) and workspace entries keyed
+/// by per-suite `suite_cert`.
+const VERIFIED_VERSION: u32 = 2;
+/// Cap on verified `(instance_key, content_key)` pairs persisted per section (`closed` and `workspace`) per suite.
 const MOST_VERIFIED_PERSISTED: usize = 65_536;
 /// Cap on historical `BZTR` result keys kept per suite beyond those referenced by the current
 /// `Head` (bounded MRU undo-history ring so `SuiteState` and CAS roots never grow unboundedly).
 const MOST_EXTRA_RESULT_KEYS: usize = 64;
+
+/// Per-suite invalidation digests computed from the suite's crate dependency closure (Rule 21):
+/// - `suite_cert` covers every crate, file plan, workspace body row, and settled answer input in
+///   the suite's closure so untouched suites hit O(1) `same_cert` without opening `BodyCheck` rows.
+/// - `closed_crates_digest` covers only settled non-workspace (`Toolchain` + `Dependency`) crates
+///   in the suite's closure plus toolchain/tools/builder so closed `BZTV` verifications survive
+///   workspace edits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SuiteDigests {
+    pub(crate) suite_cert: [u8; 32],
+    pub(crate) closed_crates_digest: [u8; 32],
+}
+
+/// Computes deterministic per-suite [`SuiteDigests`] over `unit`'s transitive crate dependency
+/// closure in `list` (rules 21, 25).
+#[expect(clippy::too_many_arguments, reason = "computes closed and full suite closure digests from engine standing state")]
+pub(crate) fn compute_suite_digests(
+    unit: TestUnit<'_>,
+    builder: &Builder,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    ids: &RunIds<'_>,
+    tools_digest: [u8; 32],
+    standing_root: ContentId,
+    standing_errors: u32,
+    engine_root: Option<&blaze_engine::pages::Root<'_>>,
+    alloc: Alloc<'_>,
+) -> SuiteDigests {
+    use blaze_world::crate_list::CrateGraph as _;
+
+    let n = list.len();
+    let mut visited: AVec<'_, bool> = Vec::with_capacity_in(n, alloc);
+    visited.resize(n, false);
+    let mut stack: AVec<'_, usize> = Vec::new_in(alloc);
+    let mut closure: AVec<'_, usize> = Vec::new_in(alloc);
+    if let Some(slot) = visited.get_mut(unit.at) {
+        *slot = true;
+        stack.push(unit.at);
+    }
+    while let Some(at) = stack.pop() {
+        closure.push(at);
+        for dep in list.deps(at) {
+            if let Some(slot) = visited.get_mut(dep)
+                && !*slot
+            {
+                *slot = true;
+                stack.push(dep);
+            }
+        }
+    }
+    closure.sort_unstable_by_key(|&at| list.key(at).0);
+
+    // 1. `closed_crates_digest`: covers toolchain, producers, tools, builder, and every non-member
+    // crate in `closure` (Toolchain, Fetched, CheckoutDep). Independent of workspace edits.
+    let mut closed_h = Hasher::new(CLOSED_CRATES_DIGEST_DOMAIN);
+    closed_h.update(&tools_digest);
+    closed_h.update(&ids.toolchain().0);
+    closed_h.id(&ids.producers());
+    hash_builder(&mut closed_h, builder);
+    let mut closed_count = 0u64;
+    for &at in closure.iter() {
+        if list.member(at) {
+            continue;
+        }
+        closed_count = closed_count.saturating_add(1);
+        let key = list.key(at);
+        closed_h.id(&key.0);
+        match ids.crate_row_bytes(key.prefix()) {
+            Some(row) => {
+                closed_h.update(&[1]);
+                closed_h.update(row);
+            }
+            None => {
+                closed_h.update(&[0]);
+            }
+        }
+    }
+    closed_h.update(&closed_count.to_le_bytes());
+    let closed_crates_digest = closed_h.finish().0;
+
+    // 2. `suite_cert`: covers `closed_crates_digest`, `unit.key`, all Stage::Units rows (UnitGraph,
+    // manifests, Given env!/include_str! data files), and every workspace crate in `closure`
+    // (its CrateRow, all RunIds BodyRows, and every source file's plan digest + FilePlace).
+    // When check had errors or unsettled owed tasks/cells (or no root), fold `standing_root`.
+    let mut suite_h = Hasher::new(SUITE_CERT_DOMAIN);
+    suite_h.update(&closed_crates_digest);
+    suite_h.id(&unit.key.0);
+    match engine_root {
+        Some(root) if standing_errors == 0 && root.owed_tasks.is_empty() && root.owed_cells.is_empty() => {
+            suite_h.update(&[1]);
+            let mut unit_names: AVec<'_, blaze_drive::Name> = Vec::with_capacity_in(root.units.len(), alloc);
+            unit_names.extend_from_slice(root.units.as_slice());
+            unit_names.sort_unstable();
+            unit_names.dedup();
+            suite_h.update(&u64::try_from(unit_names.len()).unwrap_or(u64::MAX).to_le_bytes());
+            for &u in unit_names.iter() {
+                suite_h.part(u.kind.name().as_bytes()).id(&u.subject);
+                match root.files.get(&u).copied().flatten() {
+                    Some(digest) => {
+                        suite_h.update(&[1]);
+                        suite_h.id(&digest);
+                    }
+                    None => {
+                        suite_h.update(&[0]);
+                    }
+                }
+            }
+
+            let mut root_files: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
+                Set::new(blaze_hash::SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None });
+            let mut fstack: AVec<'_, blaze_drive::Name> = Vec::new_in(alloc);
+            let mut seen_files: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
+                Set::new(blaze_hash::SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None });
+            let mut member_count = 0u64;
+            for &at in closure.iter() {
+                if !list.member(at) {
+                    continue;
+                }
+                member_count = member_count.saturating_add(1);
+                let key = list.key(at);
+                let prefix = key.prefix();
+                suite_h.id(&key.0);
+                match ids.crate_row_bytes(prefix) {
+                    Some(row) => {
+                        suite_h.update(&[1]);
+                        suite_h.update(row);
+                    }
+                    None => {
+                        suite_h.update(&[0]);
+                    }
+                }
+                let bodies = ids.crate_bodies_bytes(prefix);
+                suite_h.update(&u64::try_from(bodies.len()).unwrap_or(u64::MAX).to_le_bytes());
+                suite_h.update(bodies);
+                if let Some(rel) = list.root(at).strip_prefix("/0/") {
+                    let root_file = blaze_drive::Name::file(rel.as_bytes());
+                    root_files.insert(root_file.subject.0);
+                    if seen_files.insert(root_file.subject.0) {
+                        fstack.push(root_file);
+                    }
+                }
+            }
+            suite_h.update(&member_count.to_le_bytes());
+
+            // Also include any file whose `FilePlace::unit` belongs to a workspace crate in `closure`
+            // (covers macro-generated `mod` files in addition to `ids.edges`).
+            for (&file_name, place) in root.places.iter() {
+                if root_files.contains(&place.unit.subject.0) && seen_files.insert(file_name.subject.0) {
+                    fstack.push(file_name);
+                }
+            }
+            let mut files: AVec<'_, blaze_drive::Name> = Vec::new_in(alloc);
+            while let Some(file) = fstack.pop() {
+                files.push(file);
+                if let Some(children) = ids.children(file) {
+                    for child in children {
+                        if child.kind == blaze_drive::Kind::FileItems && seen_files.insert(child.subject.0) {
+                            fstack.push(child);
+                        }
+                    }
+                }
+            }
+            files.sort_unstable();
+            files.dedup();
+            suite_h.update(&u64::try_from(files.len()).unwrap_or(u64::MAX).to_le_bytes());
+            for &file in files.iter() {
+                suite_h.id(&file.subject);
+                match root.files.get(&file).copied().flatten() {
+                    Some(digest) => {
+                        suite_h.update(&[1]);
+                        suite_h.id(&digest);
+                    }
+                    None => {
+                        suite_h.update(&[0]);
+                    }
+                }
+                match root.places.get(&file) {
+                    Some(place) => {
+                        suite_h.update(&[1, place.edition, place.flags]);
+                    }
+                    None => {
+                        suite_h.update(&[0]);
+                    }
+                }
+            }
+        }
+        _ => {
+            suite_h.update(&[0]);
+            suite_h.id(&standing_root);
+        }
+    }
+    SuiteDigests { suite_cert: suite_h.finish().0, closed_crates_digest }
+}
+
+/// Sans-IO test helper computing per-suite [`SuiteDigests`] over `ids` when no full `CrateList`
+/// or engine `Root` is present (used by `test_drive.rs` zero-spawn unit tests).
+#[cfg(test)]
+pub(crate) fn test_suite_digests(
+    unit_key: blaze_id::CrateItemKey,
+    builder: &Builder,
+    ids: &RunIds<'_>,
+    tools_digest: [u8; 32],
+) -> SuiteDigests {
+    let mut closed_h = Hasher::new(CLOSED_CRATES_DIGEST_DOMAIN);
+    closed_h.update(&tools_digest);
+    closed_h.update(&ids.toolchain().0);
+    closed_h.id(&ids.producers());
+    hash_builder(&mut closed_h, builder);
+    let closed_crates_digest = closed_h.finish().0;
+
+    let mut suite_h = Hasher::new(SUITE_CERT_DOMAIN);
+    suite_h.update(&closed_crates_digest);
+    suite_h.id(&unit_key.0);
+    if let Some(row) = ids.crate_row_bytes(unit_key.prefix()) {
+        suite_h.update(&[1]);
+        suite_h.update(row);
+    } else {
+        suite_h.update(&[0]);
+    }
+    let bodies = ids.crate_bodies_bytes(unit_key.prefix());
+    suite_h.update(&u64::try_from(bodies.len()).unwrap_or(u64::MAX).to_le_bytes());
+    suite_h.update(bodies);
+    SuiteDigests { suite_cert: suite_h.finish().0, closed_crates_digest }
+}
 
 /// Computes a deterministic 32-byte digest over all engine tool identities so `SuiteState` can
 /// prove that `RunIds::producers` (check-kind tools) is unchanged without re-hashing every fn.
@@ -134,19 +363,21 @@ pub(crate) fn bin_cache_id(package: &str, bin_name: &str, key: blaze_id::CrateIt
 
 /// Loads previously verified `(instance_key, content_key)` pairs for an arbitrary suite/binary
 /// identity `id` if and only if they were recorded under today's exact `certificate`.
-/// Returns `Ok(0)` only on a genuine cold miss (no pointer or certificate mismatch); store I/O
-/// errors, dangling pointers, wrong tags, and corrupt `BZTV` payloads are returned as typed errors.
+/// Returns `Ok((0, 0))` only on a genuine cold miss (no pointer or certificate mismatch); store
+/// I/O errors, dangling pointers, wrong tags, and corrupt `BZTV` payloads are returned as typed
+/// errors.
 pub(crate) fn load_verified_by_id<D: Driver>(
     lent: &Lent<D, StoreAlloc>,
     id: ContentId,
     certificate: &crate::start_list::Certificate,
-    into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
-) -> Result<usize, DriveError> {
+    into_closed: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    into_workspace: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+) -> Result<(usize, usize), DriveError> {
     let store_err = |e: LentError| DriveError::CacheStore { what: "reading binary stub verified cache", why: CacheError::Store(e) };
     let corrupt = |what: &'static str| DriveError::CacheStore { what: "reading binary stub verified cache", why: CacheError::Corrupt(what) };
     let ptr_key = verified_ptr_key(id);
     let Some(state_key) = lent.pointed(TestIndex::TAG, &ptr_key).map_err(store_err)? else {
-        return Ok(0);
+        return Ok((0, 0));
     };
     let Some(lend) = lent.get(&state_key).map_err(store_err)? else {
         return Err(corrupt("verified cache pointer names a missing record"));
@@ -154,9 +385,10 @@ pub(crate) fn load_verified_by_id<D: Driver>(
     if lend.tag != TestIndex::TAG {
         return Err(corrupt("verified cache record has unexpected store tag"));
     }
-    match decode_verified_status(lend.bytes, certificate, into) {
-        VerifiedDecode::Loaded(n) => Ok(n),
-        VerifiedDecode::StaleCertificate => Ok(0),
+    let cert = *certificate.bytes();
+    match decode_verified_status(lend.bytes, cert, cert, into_closed, into_workspace) {
+        VerifiedDecode::Loaded(closed, ws) => Ok((closed, ws)),
+        VerifiedDecode::StaleCertificate => Ok((0, 0)),
         VerifiedDecode::Corrupt => Err(corrupt("malformed BZTV verified cache payload")),
     }
 }
@@ -167,25 +399,36 @@ pub(crate) fn save_verified_by_id<D: Driver>(
     lent: &Lent<D, StoreAlloc>,
     id: ContentId,
     certificate: &crate::start_list::Certificate,
-    pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+    closed_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+    workspace_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
     alloc: Alloc<'_>,
 ) -> Result<(), DriveError> {
     let store_err = |e: LentError| DriveError::CacheStore { what: "writing binary stub verified cache", why: CacheError::Store(e) };
     let root_err = |e: RootError| DriveError::CacheStore { what: "pinning binary stub verified cache", why: CacheError::Root(e) };
-    let mut list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
-    for pair in pairs {
-        if list.len() >= MOST_VERIFIED_PERSISTED {
+    let mut closed_list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+    for pair in closed_pairs {
+        if closed_list.len() >= MOST_VERIFIED_PERSISTED {
             break;
         }
-        list.push(pair);
+        closed_list.push(pair);
     }
-    if list.is_empty() {
+    let mut ws_list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+    for pair in workspace_pairs {
+        if ws_list.len() >= MOST_VERIFIED_PERSISTED {
+            break;
+        }
+        ws_list.push(pair);
+    }
+    if closed_list.is_empty() && ws_list.is_empty() {
         return Ok(());
     }
-    list.sort_unstable();
-    list.dedup();
+    closed_list.sort_unstable();
+    closed_list.dedup();
+    ws_list.sort_unstable();
+    ws_list.dedup();
+    let cert = *certificate.bytes();
     let mut vbytes: AVec<'_, u8> = Vec::new_in(alloc);
-    encode_verified(certificate, list.as_slice(), &mut vbytes);
+    encode_verified(cert, cert, closed_list.as_slice(), ws_list.as_slice(), &mut vbytes);
     let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
     let vptr_key = verified_ptr_key(id);
     lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
@@ -705,6 +948,8 @@ struct FnEntry<'a> {
 
 struct SuiteSlot<'a, 'm> {
     id: ContentId,
+    suite_cert: [u8; 32],
+    closed_crates_digest: [u8; 32],
     head_bytes: Option<&'m [u8]>,
     postings_bytes: Option<&'m [u8]>,
     /// Existing pinned keys loaded for this suite (ptr, state, head, postings, results) so a
@@ -719,10 +964,12 @@ struct SuiteSlot<'a, 'm> {
     new_head: Option<(CasKey, AVec<'a, u8>)>,
     new_postings: Option<CasKey>,
     dirty: bool,
-    /// Existing persisted `(verified_ptr, verified_state)` keys if already in CAS for today's certificate.
+    /// Existing persisted `(verified_ptr, verified_state)` keys if already in CAS for today's
+    /// closed or full suite digest.
     loaded_verified_keys: Option<(CasKey, CasKey)>,
-    /// Newly verified `(instance_key, content_key)` pairs to persist under today's certificate.
-    verified_to_save: Option<(crate::start_list::Certificate, AVec<'a, ([u8; 32], [u8; 32])>)>,
+    /// Newly verified `(closed_pairs, workspace_pairs)` to persist under today's
+    /// `(suite_cert, closed_crates_digest)` on [`TestCache::commit`].
+    verified_to_save: Option<(AVec<'a, ([u8; 32], [u8; 32])>, AVec<'a, ([u8; 32], [u8; 32])>)>,
 }
 
 /// CAS-backed incremental cache for all suites in one `blaze test` invocation.
@@ -743,7 +990,7 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
     /// with the per-suite opened [`Head`]s, [`Postings`]s, and combined `moved` ask list.
     pub(crate) fn open(
         lent: &'m Lent<D, StoreAlloc>,
-        suite_specs: &[(TestUnit<'_>, Builder)],
+        suite_specs: &[crate::test_drive::SuiteSpec<'_>],
         ids: &RunIds<'_>,
         certificate: &crate::start_list::Certificate,
         tools_digest: [u8; 32],
@@ -755,10 +1002,14 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
         let mut postings_list = Vec::with_capacity_in(suite_specs.len(), alloc);
         let mut moved = Vec::new_in(alloc);
 
-        for (unit, builder) in suite_specs {
+        for spec in suite_specs {
+            let unit = &spec.unit;
+            let builder = &spec.builder;
             let sid = suite_id(*unit, builder);
             let mut slot = SuiteSlot {
                 id: sid,
+                suite_cert: spec.digests.suite_cert,
+                closed_crates_digest: spec.digests.closed_crates_digest,
                 head_bytes: None,
                 postings_bytes: None,
                 loaded_root_keys: Vec::new_in(alloc),
@@ -787,11 +1038,14 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
                 slot.loaded_root_keys.push(loaded.postings_key);
                 slot.loaded_root_keys.extend_from_slice(loaded.result_keys.as_slice());
                 slot.result_keys = loaded.result_keys;
-                // Fast path 1: exact Standing::root certificate and check tools digest match ->
-                // every body key and crate fact in RunIds is identical (zero instance_key hashing).
-                let same_cert = loaded.cert == cert && loaded.tools_digest == tools_digest;
-                // Fast path 2: on workspace edits, skip re-hashing pure toolchain/dependency fns
-                // whose generic arguments touch no workspace crate whenever their crate facts stand.
+                // Fast path 1: exact Standing::root certificate OR per-suite closure `suite_cert`
+                // and check tools digest match -> every crate, file, and body in this suite's
+                // closure is identical (zero `instance_key` hashing and zero `BodyCheck` opens).
+                let same_cert = loaded.tools_digest == tools_digest
+                    && (loaded.cert == cert || loaded.suite_cert == spec.digests.suite_cert);
+                // Fast path 2: on edits inside this suite's closure, skip re-hashing pure
+                // toolchain/dependency fns whose generic arguments touch no workspace crate
+                // whenever their crate facts stand.
                 let closed_ok = !same_cert
                     && loaded.tools_digest == tools_digest
                     && closed_crates_unchanged(loaded.closed_crates.as_slice(), ids);
@@ -850,47 +1104,65 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
         suite
     }
 
-    /// Loads previously verified `(instance_key, content_key)` pairs for `suite` if and only if
-    /// they were recorded under today's exact `certificate` (the unforgeable `Standing::root`).
-    /// Returns how many pairs were loaded.
+    /// Loads previously verified `(instance_key, content_key)` pairs for `suite`:
+    /// - Closed/toolchain entries load whenever `closed_crates_digest` stands (surviving workspace
+    ///   edits so `std`/`core`/`alloc`/dep callees skip `verify_instance` in O(1)).
+    /// - Workspace entries load only when the suite's full `suite_cert` also stands.
+    /// Returns `(closed_loaded, workspace_loaded)`.
     pub(crate) fn load_verified(
         &mut self,
         suite: SuiteId,
-        certificate: &crate::start_list::Certificate,
-        into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
-    ) -> usize {
-        let Ok(idx) = usize::try_from(suite.0) else { return 0 };
-        let Some(slot) = self.suites.get_mut(idx) else { return 0 };
+        into_closed: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+        into_workspace: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    ) -> (usize, usize) {
+        let Ok(idx) = usize::try_from(suite.0) else { return (0, 0) };
+        let Some(slot) = self.suites.get_mut(idx) else { return (0, 0) };
         let ptr_key = verified_ptr_key(slot.id);
-        let Ok(Some(state_key)) = self.lent.pointed(TestIndex::TAG, &ptr_key) else { return 0 };
-        let Ok(Some(lend)) = self.lent.get(&state_key) else { return 0 };
+        let Ok(Some(state_key)) = self.lent.pointed(TestIndex::TAG, &ptr_key) else { return (0, 0) };
+        let Ok(Some(lend)) = self.lent.get(&state_key) else { return (0, 0) };
         if lend.tag != TestIndex::TAG {
-            return 0;
+            return (0, 0);
         }
-        let Some(loaded) = decode_verified(lend.bytes, certificate, into) else { return 0 };
+        let Some(loaded) = decode_verified(
+            lend.bytes,
+            slot.suite_cert,
+            slot.closed_crates_digest,
+            into_closed,
+            into_workspace,
+        ) else {
+            return (0, 0);
+        };
         slot.loaded_verified_keys = Some((ptr_key, state_key));
         loaded
     }
 
-    /// Schedules the full set of verified `(instance_key, content_key)` pairs for `suite` to be
-    /// persisted under today's `certificate` on [`Self::commit`].
+    /// Schedules the full sets of closed and workspace verified `(instance_key, content_key)`
+    /// pairs for `suite` to be persisted under today's `(suite_cert, closed_crates_digest)` on
+    /// [`Self::commit`].
     pub(crate) fn record_verified(
         &mut self,
         suite: SuiteId,
-        certificate: crate::start_list::Certificate,
-        pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+        closed_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+        workspace_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
     ) {
         let Ok(idx) = usize::try_from(suite.0) else { return };
         let Some(slot) = self.suites.get_mut(idx) else { return };
-        let mut list = Vec::new_in(self.alloc);
-        for pair in pairs {
-            if list.len() >= MOST_VERIFIED_PERSISTED {
+        let mut closed = Vec::new_in(self.alloc);
+        for pair in closed_pairs {
+            if closed.len() >= MOST_VERIFIED_PERSISTED {
                 break;
             }
-            list.push(pair);
+            closed.push(pair);
         }
-        if !list.is_empty() {
-            slot.verified_to_save = Some((certificate, list));
+        let mut workspace = Vec::new_in(self.alloc);
+        for pair in workspace_pairs {
+            if workspace.len() >= MOST_VERIFIED_PERSISTED {
+                break;
+            }
+            workspace.push(pair);
+        }
+        if !closed.is_empty() || !workspace.is_empty() {
+            slot.verified_to_save = Some((closed, workspace));
         }
     }
 
@@ -971,13 +1243,21 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
         for slot in self.suites.iter_mut() {
             let mut verified_keys = slot.loaded_verified_keys;
             let mut verified_changed = false;
-            if let Some((cert, mut pairs)) = slot.verified_to_save.take()
-                && !pairs.is_empty()
+            if let Some((mut closed_pairs, mut ws_pairs)) = slot.verified_to_save.take()
+                && (!closed_pairs.is_empty() || !ws_pairs.is_empty())
             {
-                pairs.sort_unstable();
-                pairs.dedup();
+                closed_pairs.sort_unstable();
+                closed_pairs.dedup();
+                ws_pairs.sort_unstable();
+                ws_pairs.dedup();
                 let mut vbytes: AVec<'_, u8> = Vec::new_in(self.alloc);
-                encode_verified(&cert, pairs.as_slice(), &mut vbytes);
+                encode_verified(
+                    slot.suite_cert,
+                    slot.closed_crates_digest,
+                    closed_pairs.as_slice(),
+                    ws_pairs.as_slice(),
+                    &mut vbytes,
+                );
                 let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
                 let vptr_key = verified_ptr_key(slot.id);
                 self.lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
@@ -1052,6 +1332,7 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
             let mut state_bytes: AVec<'_, u8> = Vec::new_in(self.alloc);
             encode_suite_state(
                 self.cert,
+                slot.suite_cert,
                 self.tools_digest,
                 head_key,
                 postings_key,
@@ -1172,6 +1453,7 @@ struct LoadedState<'a, 'm> {
     ptr_key: CasKey,
     state_key: CasKey,
     cert: [u8; 32],
+    suite_cert: [u8; 32],
     tools_digest: [u8; 32],
     head_key: CasKey,
     postings_key: CasKey,
@@ -1182,9 +1464,10 @@ struct LoadedState<'a, 'm> {
     result_keys: AVec<'a, CasKey>,
 }
 
-/// Decoded payload of a `SuiteState` v2 record (before resolving `head_key`/`postings_key` in CAS).
+/// Decoded payload of a `SuiteState` v3 record (before resolving `head_key`/`postings_key` in CAS).
 struct DecodedSuiteState<'a> {
     cert: [u8; 32],
+    suite_cert: [u8; 32],
     tools_digest: [u8; 32],
     head_key: CasKey,
     postings_key: CasKey,
@@ -1310,9 +1593,10 @@ fn prune_result_keys<'a>(
     out
 }
 
-#[expect(clippy::too_many_arguments, reason = "deterministic SuiteState v2 encoder")]
+#[expect(clippy::too_many_arguments, reason = "deterministic SuiteState v3 encoder")]
 fn encode_suite_state(
     cert: [u8; 32],
+    suite_cert: [u8; 32],
     tools_digest: [u8; 32],
     head_key: CasKey,
     postings_key: CasKey,
@@ -1325,6 +1609,7 @@ fn encode_suite_state(
     out.extend_from_slice(&STATE_MAGIC);
     out.extend_from_slice(&STATE_VERSION.to_le_bytes());
     out.extend_from_slice(&cert);
+    out.extend_from_slice(&suite_cert);
     out.extend_from_slice(&tools_digest);
     out.extend_from_slice(&head_key.0.0);
     out.extend_from_slice(&postings_key.0.0);
@@ -1373,7 +1658,7 @@ fn decode_suite_state<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Option<DecodedSuite
         buf.get(off..off.checked_add(32)?)?.try_into().ok()
     };
 
-    let header_len = 4 + 4 + 32 + 32 + 32 + 32 + 4 + 4 + 4 + 4;
+    let header_len = 4 + 4 + 32 + 32 + 32 + 32 + 32 + 4 + 4 + 4 + 4;
     if bytes.len() < header_len || bytes.get(0..4) != Some(&STATE_MAGIC) {
         return None;
     }
@@ -1382,13 +1667,14 @@ fn decode_suite_state<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Option<DecodedSuite
         return None;
     }
     let cert = read_32(bytes, 8)?;
-    let tools_digest = read_32(bytes, 40)?;
-    let head_key = CasKey(ContentId(read_32(bytes, 72)?));
-    let postings_key = CasKey(ContentId(read_32(bytes, 104)?));
-    let fn_count = usize::try_from(read_u32(bytes, 136)?).ok()?;
-    let res_count = usize::try_from(read_u32(bytes, 140)?).ok()?;
-    let crate_count = usize::try_from(read_u32(bytes, 144)?).ok()?;
-    if read_u32(bytes, 148)? != 0 {
+    let suite_cert = read_32(bytes, 40)?;
+    let tools_digest = read_32(bytes, 72)?;
+    let head_key = CasKey(ContentId(read_32(bytes, 104)?));
+    let postings_key = CasKey(ContentId(read_32(bytes, 136)?));
+    let fn_count = usize::try_from(read_u32(bytes, 168)?).ok()?;
+    let res_count = usize::try_from(read_u32(bytes, 172)?).ok()?;
+    let crate_count = usize::try_from(read_u32(bytes, 176)?).ok()?;
+    if read_u32(bytes, 180)? != 0 {
         return None;
     }
 
@@ -1440,21 +1726,31 @@ fn decode_suite_state<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Option<DecodedSuite
         result_keys.push(k);
     }
 
-    Some(DecodedSuiteState { cert, tools_digest, head_key, postings_key, fns, closed_crates, result_keys })
+    Some(DecodedSuiteState { cert, suite_cert, tools_digest, head_key, postings_key, fns, closed_crates, result_keys })
 }
 
 pub(crate) fn encode_verified(
-    certificate: &crate::start_list::Certificate,
-    pairs: &[([u8; 32], [u8; 32])],
+    suite_cert: [u8; 32],
+    closed_crates_digest: [u8; 32],
+    closed_pairs: &[([u8; 32], [u8; 32])],
+    workspace_pairs: &[([u8; 32], [u8; 32])],
     out: &mut AVec<'_, u8>,
 ) {
-    let count = pairs.len().min(MOST_VERIFIED_PERSISTED);
-    out.reserve(4 + 4 + 32 + 4 + count * 64);
+    let closed_count = closed_pairs.len().min(MOST_VERIFIED_PERSISTED);
+    let workspace_count = workspace_pairs.len().min(MOST_VERIFIED_PERSISTED);
+    let header_len = 4 + 4 + 32 + 32 + 4 + 4;
+    out.reserve(header_len + (closed_count + workspace_count) * 64);
     out.extend_from_slice(&VERIFIED_MAGIC);
     out.extend_from_slice(&VERIFIED_VERSION.to_le_bytes());
-    out.extend_from_slice(certificate.bytes());
-    out.extend_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
-    for &(key, under) in pairs.iter().take(count) {
+    out.extend_from_slice(&suite_cert);
+    out.extend_from_slice(&closed_crates_digest);
+    out.extend_from_slice(&u32::try_from(closed_count).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(workspace_count).unwrap_or(u32::MAX).to_le_bytes());
+    for &(key, under) in closed_pairs.iter().take(closed_count) {
+        out.extend_from_slice(&key);
+        out.extend_from_slice(&under);
+    }
+    for &(key, under) in workspace_pairs.iter().take(workspace_count) {
         out.extend_from_slice(&key);
         out.extend_from_slice(&under);
     }
@@ -1462,17 +1758,19 @@ pub(crate) fn encode_verified(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum VerifiedDecode {
-    Loaded(usize),
+    Loaded(usize, usize),
     StaleCertificate,
     Corrupt,
 }
 
 pub(crate) fn decode_verified_status(
     bytes: &[u8],
-    certificate: &crate::start_list::Certificate,
-    into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    suite_cert: [u8; 32],
+    closed_crates_digest: [u8; 32],
+    into_closed: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    into_workspace: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
 ) -> VerifiedDecode {
-    let header_len = 4 + 4 + 32 + 4;
+    let header_len = 4 + 4 + 32 + 32 + 4 + 4;
     if bytes.len() < header_len || bytes.get(0..4) != Some(&VERIFIED_MAGIC) {
         return VerifiedDecode::Corrupt;
     }
@@ -1482,24 +1780,39 @@ pub(crate) fn decode_verified_status(
     if u32::from_le_bytes(version_bytes) != VERIFIED_VERSION {
         return VerifiedDecode::Corrupt;
     }
-    let Some(count_bytes) = bytes.get(40..44).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+    let Some(stored_suite_cert) = bytes.get(8..40) else {
         return VerifiedDecode::Corrupt;
     };
-    let Ok(count) = usize::try_from(u32::from_le_bytes(count_bytes)) else {
+    let Some(stored_closed_digest) = bytes.get(40..72) else {
         return VerifiedDecode::Corrupt;
     };
-    let Some(payload) = count.checked_mul(64) else {
+    let Some(closed_count_bytes) = bytes.get(72..76).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(ws_count_bytes) = bytes.get(76..80).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Ok(closed_count) = usize::try_from(u32::from_le_bytes(closed_count_bytes)) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Ok(workspace_count) = usize::try_from(u32::from_le_bytes(ws_count_bytes)) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(total_pairs) = closed_count.checked_add(workspace_count) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(payload) = total_pairs.checked_mul(64) else {
         return VerifiedDecode::Corrupt;
     };
     if bytes.len().checked_sub(header_len) != Some(payload) {
         return VerifiedDecode::Corrupt;
     }
-    if bytes.get(8..40) != Some(certificate.bytes().as_slice()) {
+    if stored_closed_digest != closed_crates_digest.as_slice() {
         return VerifiedDecode::StaleCertificate;
     }
     let mut at = header_len;
-    let mut loaded = 0usize;
-    for _ in 0..count {
+    let mut loaded_closed = 0usize;
+    for _ in 0..closed_count {
         let Some(key) = bytes.get(at..at + 32).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
             return VerifiedDecode::Corrupt;
         };
@@ -1507,20 +1820,37 @@ pub(crate) fn decode_verified_status(
             return VerifiedDecode::Corrupt;
         };
         at += 64;
-        if into.insert((key, under)) {
-            loaded += 1;
+        if into_closed.insert((key, under)) {
+            loaded_closed += 1;
         }
     }
-    VerifiedDecode::Loaded(loaded)
+    let mut loaded_workspace = 0usize;
+    if stored_suite_cert == suite_cert.as_slice() {
+        for _ in 0..workspace_count {
+            let Some(key) = bytes.get(at..at + 32).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+                return VerifiedDecode::Corrupt;
+            };
+            let Some(under) = bytes.get(at + 32..at + 64).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+                return VerifiedDecode::Corrupt;
+            };
+            at += 64;
+            if into_workspace.insert((key, under)) {
+                loaded_workspace += 1;
+            }
+        }
+    }
+    VerifiedDecode::Loaded(loaded_closed, loaded_workspace)
 }
 
 fn decode_verified(
     bytes: &[u8],
-    certificate: &crate::start_list::Certificate,
-    into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
-) -> Option<usize> {
-    match decode_verified_status(bytes, certificate, into) {
-        VerifiedDecode::Loaded(n) => Some(n),
+    suite_cert: [u8; 32],
+    closed_crates_digest: [u8; 32],
+    into_closed: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    into_workspace: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+) -> Option<(usize, usize)> {
+    match decode_verified_status(bytes, suite_cert, closed_crates_digest, into_closed, into_workspace) {
+        VerifiedDecode::Loaded(closed, ws) => Some((closed, ws)),
         VerifiedDecode::StaleCertificate | VerifiedDecode::Corrupt => None,
     }
 }
@@ -1545,6 +1875,7 @@ fn load_suite_state<'a, 'm, D: Driver>(lent: &'m Lent<D, StoreAlloc>, suite: Con
         ptr_key,
         state_key,
         cert: decoded.cert,
+        suite_cert: decoded.suite_cert,
         tools_digest: decoded.tools_digest,
         head_key: decoded.head_key,
         postings_key: decoded.postings_key,
@@ -1665,9 +1996,10 @@ mod tests {
     }
 
     #[test]
-    fn suite_state_v2_round_trips_cert_tools_closed_flags_and_closed_crates() {
+    fn suite_state_v3_round_trips_cert_suite_cert_tools_closed_flags_and_closed_crates() {
         let alloc = blaze_own::testing::heap().alloc();
         let cert = [0x11u8; 32];
+        let suite_cert = [0x12u8; 32];
         let tools = [0x22u8; 32];
         let head_key = CasKey(ContentId([0x33u8; 32]));
         let postings_key = CasKey(ContentId([0x44u8; 32]));
@@ -1699,6 +2031,7 @@ mod tests {
         let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
         encode_suite_state(
             cert,
+            suite_cert,
             tools,
             head_key,
             postings_key,
@@ -1710,9 +2043,10 @@ mod tests {
         );
 
         let decoded = decode_suite_state(bytes.as_slice(), alloc);
-        assert!(decoded.is_some(), "valid SuiteState v2 must decode");
+        assert!(decoded.is_some(), "valid SuiteState v3 must decode");
         if let Some(d) = decoded {
             assert_eq!(d.cert, cert);
+            assert_eq!(d.suite_cert, suite_cert);
             assert_eq!(d.tools_digest, tools);
             assert_eq!(d.head_key, head_key);
             assert_eq!(d.postings_key, postings_key);
@@ -1723,13 +2057,13 @@ mod tests {
             assert_eq!(d.result_keys.as_slice(), &results);
         }
 
-        // Planted control: v1 version byte must be rejected cleanly so old homes rebuild.
-        let mut v1 = Vec::new_in(alloc);
-        v1.extend_from_slice(bytes.as_slice());
-        if let Some(ver) = v1.get_mut(4..8) {
-            ver.copy_from_slice(&1u32.to_le_bytes());
+        // Planted control: v2 version byte must be rejected cleanly so old homes rebuild.
+        let mut v2 = Vec::new_in(alloc);
+        v2.extend_from_slice(bytes.as_slice());
+        if let Some(ver) = v2.get_mut(4..8) {
+            ver.copy_from_slice(&2u32.to_le_bytes());
         }
-        assert!(decode_suite_state(v1.as_slice(), alloc).is_none());
+        assert!(decode_suite_state(v2.as_slice(), alloc).is_none());
     }
 
     #[test]
@@ -1774,23 +2108,62 @@ mod tests {
     }
 
     #[test]
-    fn verified_cache_round_trips_under_matching_certificate_and_rejects_stale_certificate() {
+    fn verified_cache_v2_preserves_closed_across_workspace_edit_and_invalidates_on_closed_change() {
         let alloc = blaze_own::testing::heap().alloc();
-        let today = crate::start_list::Certificate::for_tests([0xaa; 32]);
-        let moved = crate::start_list::Certificate::for_tests([0xbb; 32]);
-        let pairs = [([1u8; 32], [2u8; 32]), ([3u8; 32], [4u8; 32])];
+        let suite_a = [0xaa; 32];
+        let suite_edited = [0xbb; 32];
+        let closed_a = [0xcc; 32];
+        let closed_moved = [0xdd; 32];
+        let closed_pairs = [([1u8; 32], [2u8; 32]), ([3u8; 32], [4u8; 32])];
+        let ws_pairs = [([5u8; 32], [6u8; 32])];
         let mut bytes = Vec::new_in(alloc);
-        encode_verified(&today, &pairs, &mut bytes);
+        encode_verified(suite_a, closed_a, &closed_pairs, &ws_pairs, &mut bytes);
 
-        let mut loaded = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
-        assert_eq!(decode_verified(bytes.as_slice(), &today, &mut loaded), Some(2));
-        assert!(loaded.contains(&([1u8; 32], [2u8; 32])));
-        assert!(loaded.contains(&([3u8; 32], [4u8; 32])));
+        // 1. Exact match: both closed and workspace verified pairs load.
+        let mut loaded_closed = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        let mut loaded_ws = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        assert_eq!(decode_verified(bytes.as_slice(), suite_a, closed_a, &mut loaded_closed, &mut loaded_ws), Some((2, 1)));
+        assert!(loaded_closed.contains(&([1u8; 32], [2u8; 32])));
+        assert!(loaded_closed.contains(&([3u8; 32], [4u8; 32])));
+        assert!(loaded_ws.contains(&([5u8; 32], [6u8; 32])));
 
-        // Planted control: a changed workspace certificate must reject all cached verdicts.
-        let mut stale = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
-        assert_eq!(decode_verified(bytes.as_slice(), &moved, &mut stale), None);
-        assert!(stale.is_empty());
+        // 2. Workspace edit (`suite_cert` moved, `closed_crates_digest` unchanged):
+        // all closed/toolchain pairs are preserved in O(1); workspace pairs are invalidated.
+        let mut after_ws_closed = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        let mut after_ws_ws = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        assert_eq!(
+            decode_verified(bytes.as_slice(), suite_edited, closed_a, &mut after_ws_closed, &mut after_ws_ws),
+            Some((2, 0)),
+        );
+        assert!(after_ws_closed.contains(&([1u8; 32], [2u8; 32])));
+        assert!(after_ws_closed.contains(&([3u8; 32], [4u8; 32])));
+        assert!(after_ws_ws.is_empty(), "workspace edit must invalidate workspace verified entries");
+
+        // 3. Planted control: changing `closed_crates_digest` invalidates BOTH closed and workspace entries.
+        let mut stale_closed = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        let mut stale_ws = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        assert_eq!(
+            decode_verified(bytes.as_slice(), suite_a, closed_moved, &mut stale_closed, &mut stale_ws),
+            None,
+        );
+        assert!(stale_closed.is_empty());
+        assert!(stale_ws.is_empty());
+    }
+
+    #[test]
+    fn decode_verified_refuses_previous_v1_layout() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut raw = Vec::new_in(alloc);
+        raw.extend_from_slice(&VERIFIED_MAGIC);
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&[0xaa; 32]);
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        let mut closed = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        let mut ws = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        assert!(
+            decode_verified(raw.as_slice(), [0xaa; 32], [0xcc; 32], &mut closed, &mut ws).is_none(),
+            "v1 BZTV must be rejected so v2 rebuilds cleanly",
+        );
     }
 
     #[test]
@@ -1824,6 +2197,17 @@ mod tests {
         raw.extend_from_slice(&STATE_MAGIC);
         raw.extend_from_slice(&1u32.to_le_bytes());
         raw.extend_from_slice(&0u32.to_le_bytes());
-        assert!(decode_suite_state(&raw, alloc).is_none(), "v1 SuiteState must be rejected so v2 rebuilds cleanly");
+        assert!(decode_suite_state(&raw, alloc).is_none(), "v1 SuiteState must be rejected so v3 rebuilds cleanly");
+    }
+
+    #[test]
+    fn decode_state_refuses_previous_v2_layout() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut raw = Vec::new_in(alloc);
+        raw.extend_from_slice(&STATE_MAGIC);
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        // Full 152-byte v2 header with 0 fns, 0 results, 0 closed crates.
+        raw.extend_from_slice(&[0u8; 32 * 4 + 4 * 4]);
+        assert!(decode_suite_state(&raw, alloc).is_none(), "v2 SuiteState must be rejected so v3 rebuilds cleanly");
     }
 }

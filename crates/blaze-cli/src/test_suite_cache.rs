@@ -30,8 +30,8 @@ use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ladder::body_ids::{
     Begun, DeclaredList, EntryForm, Form as _, How, Make, Order, Pending, RowKind, Scratch, Stepped, Unkeyed, Walk, instance_key,
 };
-use blaze_ladder::code_records::statics::{each_static_named, each_vtable_datum, entry_record};
-use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, content_key};
+use blaze_ladder::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView, each_static_named, each_vtable_datum, entry_record};
+use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, EntryView, content_key};
 use blaze_ladder::code_records::reads::Verdict;
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, MakeWatch, Maker, NamesRecords};
 use blaze_ladder::run::special::{MakerKind, MakerStart, Roots, StartHead};
@@ -109,9 +109,62 @@ pub(crate) struct StepCounts {
     pub unkeyed: usize,
 }
 
-/// Lazily-initialized [`Make`] adapter that consults `SuiteCache::verified` in O(1) before ever
-/// constructing the command-thread [`RunMaker`]. On warm `BZTV` hits and on cold `Codes::Pooled`
-/// misses (dispatched to off-thread `CodePool` workers), no command-thread `Maker` is constructed.
+/// Returns `true` iff `item` belongs to a settled non-workspace (`Toolchain` or `Dependency`) crate.
+fn is_closed_item(item: ItemKey, ids: &RunIds<'_>) -> bool {
+    matches!(ids.grain(item), Some(crate::run_ids::Grain::Toolchain | crate::run_ids::Grain::Dependency))
+}
+
+/// Returns `true` iff `(tabled, name, entry)` touches ONLY settled `Toolchain` / `Dependency`
+/// crates (zero `Workspace` items in `tabled`, generic args `name`, or any read-list question in
+/// `entry`), proving its `Verdict::Holds` remains valid across workspace edits whenever
+/// `closed_crates_digest` stands (rule 21).
+fn is_closed_verified_entry(tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) -> bool {
+    if !is_closed_item(tabled, ids) {
+        return false;
+    }
+    let mut ok = true;
+    if blaze_ladder::body_ids::each_item(name, |item| {
+        if ok && !is_closed_item(item, ids) {
+            ok = false;
+        }
+    })
+    .is_err()
+        || !ok
+    {
+        return false;
+    }
+    if entry.get(..8).is_some_and(|magic| magic == STATIC_ENTRY_MAGIC) {
+        return StaticEntryView::read(entry).is_ok();
+    }
+    let Ok(view) = EntryView::read(entry) else {
+        return false;
+    };
+    for row in view.reads() {
+        let Ok((question, _)) = row else {
+            return false;
+        };
+        // Read-list question layout (`code_reads.rs::question_head`): 1-byte kind + 8-byte extra + instance name.
+        let Some(q_name) = question.get(9..) else {
+            return false;
+        };
+        if blaze_ladder::body_ids::each_item(q_name, |item| {
+            if ok && !is_closed_item(item, ids) {
+                ok = false;
+            }
+        })
+        .is_err()
+            || !ok
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Lazily-initialized [`Make`] adapter that consults `SuiteCache`'s verified sets in O(1) before
+/// ever constructing the command-thread [`RunMaker`]. On warm `BZTV` hits (including closed
+/// `std`/`core`/`alloc`/dep hits across workspace edits) and on cold `Codes::Pooled` misses
+/// (dispatched to off-thread `CodePool` workers), no command-thread `Maker` is constructed.
 struct LazyVerifyingMaker<'a, 'h> {
     names: NamesRecords<'h>,
     builder: &'a Builder,
@@ -123,7 +176,8 @@ struct LazyVerifyingMaker<'a, 'h> {
     ids: RunIds<'h>,
     enclosers: LocalEnclosers,
     maker: &'a mut Option<RunMaker<'h>>,
-    verified: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_closed: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_workspace: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: &'a mut bool,
 }
 
@@ -188,15 +242,22 @@ impl Make for LazyVerifyingMaker<'_, '_> {
         entry: &[u8],
     ) -> Result<Option<Verdict>, Self::Error> {
         let pair = (key.0.0, under.0.0);
-        if self.verified.contains(&pair) {
+        if self.verified_closed.contains(&pair) || self.verified_workspace.contains(&pair) {
             return Ok(Some(Verdict::Holds));
         }
         let enclosers = self.enclosers;
         let maker = self.ensure_maker()?;
         maker.prepare_local(enclosers.locals(), enclosers.enclosers());
         let verdict = maker.verify(tabled, name, entry)?;
-        if matches!(verdict, Some(Verdict::Holds)) && self.verified.insert(pair) {
-            *self.verified_dirty = true;
+        if matches!(verdict, Some(Verdict::Holds)) {
+            let inserted = if is_closed_verified_entry(tabled, name, entry, &self.ids) {
+                self.verified_closed.insert(pair)
+            } else {
+                self.verified_workspace.insert(pair)
+            };
+            if inserted {
+                *self.verified_dirty = true;
+            }
         }
         Ok(verdict)
     }
@@ -321,7 +382,8 @@ pub(crate) struct SuiteCache<'h> {
     scratch: Scratch<'static>,
     list: DeclaredList<'static>,
     maker: Option<RunMaker<'h>>,
-    verified: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    verified_workspace: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: bool,
     pubs: Map<[u8; 32], CachedPub, BuildKeyHasher, Alloc<'static>>,
     datums: Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>>,
@@ -353,7 +415,8 @@ impl<'h> SuiteCache<'h> {
             scratch: Scratch::new_in(tables),
             list: DeclaredList::new_in(tables),
             maker: None,
-            verified: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            verified_closed: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            verified_workspace: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
             verified_dirty: false,
             pubs: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             datums: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
@@ -365,16 +428,36 @@ impl<'h> SuiteCache<'h> {
         }
     }
 
-    pub(crate) fn verified_mut(&mut self) -> &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>> {
-        &mut self.verified
+    pub(crate) fn verified_sets_mut(
+        &mut self,
+    ) -> (
+        &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+        &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    ) {
+        (&mut self.verified_closed, &mut self.verified_workspace)
     }
 
     pub(crate) fn verified_dirty(&self) -> bool {
         self.verified_dirty
     }
 
-    pub(crate) fn verified_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
-        self.verified.iter().copied()
+    pub(crate) fn verified_closed_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
+        self.verified_closed.iter().copied()
+    }
+
+    pub(crate) fn verified_workspace_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
+        self.verified_workspace.iter().copied()
+    }
+
+    fn record_verified_entry(&mut self, pair: ([u8; 32], [u8; 32]), tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) {
+        let inserted = if is_closed_verified_entry(tabled, name, entry, ids) {
+            self.verified_closed.insert(pair)
+        } else {
+            self.verified_workspace.insert(pair)
+        };
+        if inserted {
+            self.verified_dirty = true;
+        }
     }
 
     pub(crate) fn warm_len(&self) -> usize {
@@ -587,16 +670,16 @@ impl<'h> SuiteCache<'h> {
             } else {
                 let s_name = self.walk.name(at);
                 let ik = instance_key(CodeSymbol(static_sym), s_tabled, s_name, ids, &self.builder, &self.builder.producer, self.tables);
-                if let (Stepped::Made(under), Some(ik)) = (s_stepped, ik)
-                    && self.verified.insert((ik.0.0, under.0.0))
-                {
-                    self.verified_dirty = true;
-                }
-                ik.map(|ik| {
+                let entered = ik.map(|ik| {
                     let mut name_copy = Vec::with_capacity_in(s_name.len(), self.tables);
                     name_copy.extend_from_slice(s_name);
                     CachedEntered { symbol: FnName(static_sym), code_key: ik.0.0, tabled: s_tabled, name: name_copy }
-                })
+                });
+                if let (Stepped::Made(under), Some(ik)) = (s_stepped, ik) {
+                    let name_slice = entered.as_ref().map_or(&[][..], |e| e.name.as_slice());
+                    self.record_verified_entry((ik.0.0, under.0.0), s_tabled, name_slice, s_entry, ids);
+                }
+                entered
             };
             let s_unkeyed = s_unkeyed_step || s_entered.is_none();
             let s_purity = if s_unkeyed { Err(NotKept::Untraced) } else { check_datum_purity(s_datum) };
@@ -625,16 +708,16 @@ impl<'h> SuiteCache<'h> {
         } else {
             let name_slice = self.walk.name(row);
             let inst_key = instance_key(code_sym, tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables);
-            if let (Stepped::Made(under), Some(ik)) = (stepped, inst_key)
-                && self.verified.insert((ik.0.0, under.0.0))
-            {
-                self.verified_dirty = true;
-            }
-            inst_key.map(|ik| {
+            let entered = inst_key.map(|ik| {
                 let mut name_copy = Vec::with_capacity_in(name_slice.len(), self.tables);
                 name_copy.extend_from_slice(name_slice);
                 CachedEntered { symbol: FnName(symbol.0), code_key: ik.0.0, tabled, name: name_copy }
-            })
+            });
+            if let (Stepped::Made(under), Some(ik)) = (stepped, inst_key) {
+                let name_bytes = entered.as_ref().map_or(&[][..], |e| e.name.as_slice());
+                self.record_verified_entry((ik.0.0, under.0.0), tabled, name_bytes, entry, ids);
+            }
+            entered
         };
         let unkeyed = unkeyed_step || entered.is_none();
         let purity = if unkeyed { Err(NotKept::Untraced) } else { check_record_purity(record) };
@@ -781,7 +864,8 @@ impl<'h> SuiteCache<'h> {
                     ids: *ids,
                     enclosers,
                     maker: &mut self.maker,
-                    verified: &mut self.verified,
+                    verified_closed: &mut self.verified_closed,
+                    verified_workspace: &mut self.verified_workspace,
                     verified_dirty: &mut self.verified_dirty,
                 };
                 let stepped = match codes {
@@ -940,10 +1024,16 @@ impl<'h> SuiteCache<'h> {
                 watch.see(Step::Answered(Answered::Made));
                 let tabled = self.walk.tabled(row);
                 let name_slice = self.walk.name(row);
-                if let Some(ik) = instance_key(CodeSymbol(flight.symbol), tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables)
-                    && self.verified.insert((ik.0.0, under.0.0))
-                {
-                    self.verified_dirty = true;
+                if let Some(ik) = instance_key(CodeSymbol(flight.symbol), tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables) {
+                    let is_closed = is_closed_verified_entry(tabled, name_slice, entry, ids);
+                    let inserted = if is_closed {
+                        self.verified_closed.insert((ik.0.0, under.0.0))
+                    } else {
+                        self.verified_workspace.insert((ik.0.0, under.0.0))
+                    };
+                    if inserted {
+                        self.verified_dirty = true;
+                    }
                 }
             }
             Stepped::Unkeyed(Unkeyed::NoRecord) => {

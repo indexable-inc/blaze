@@ -101,7 +101,7 @@ pub const TAGS: u64 = 1 << 40;
 /// reading the head to mapping what it names, and on a commit from starting its segment to
 /// its flip (half of it: [`Plain::commit`]). Mappings outlive an unlink, so a process that
 /// mapped a file keeps reading it whatever happens after.
-pub const GRACE_NS: u64 = 10 * 60 * 1_000_000_000;
+pub const GRACE_NS: u64 = 60 * 1_000_000_000;
 
 /// Records no root names are kept for this many generations after the one that put them
 /// ([`Liveness::Everything`]; a [`Liveness::Reached`] store keeps what a lease keeps instead).
@@ -143,7 +143,7 @@ pub const fn watermark_bytes(cap_bytes: u64, pct: u64) -> u64 {
 
 /// How long a running command's lease ([`format::Lease`]) lasts past its last commit: a
 /// process that dies holding one is let go of this long after, by the clock the flips pass in.
-pub const LEASE_NS: u64 = 60 * 60 * 1_000_000_000;
+pub const LEASE_NS: u64 = 30 * 60 * 1_000_000_000;
 
 /// The bytes of segments one [`Liveness::Reached`] slice looks at for their live share, from
 /// a place that moves with each generation: what bounds a slice's reading of indexes.
@@ -1073,6 +1073,14 @@ pub(crate) enum Plant {
     /// unlinking them in a zero-conflict slice first (so a concurrent foreground conflict aborts
     /// unlinking ready retired files).
     MixRetiredWithCopy,
+    /// Planted bug: triggers synchronous foreground `fold_tiered_slice` at the soft background
+    /// housekeeping threshold ([`Plain::AUTO_TIER_MERGE_BG`] = 24) instead of deferring until
+    /// the emergency safety ceiling ([`Plain::AUTO_TIER_MERGE_FG`] = 128).
+    ForegroundFoldsAtBgThreshold,
+    /// Planted bug: foreground commits map and full-check every segment (`map_all`) instead of
+    /// only segments whose Bloom filter matches a key in the committing batch (phase_commit_tests
+    /// DST control, rule 43).
+    CommitMapsAll,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -1905,6 +1913,10 @@ struct Flip<A: Allocator + Clone> {
     /// `(replaced, written_bytes)` for `bloom_effect`, cleared if `BLOOM_WRITE` fails and applied
     /// to `BloomIndex::mapped_bytes` when the flip commits.
     bloom_written: Option<(bool, u64)>,
+    /// Latest committed `(slot, manifest)` read under the flip lock when a compaction slice aborts
+    /// due to a concurrent commit, so [`Plain::flipped`] refreshes in-place while preserving all
+    /// existing `mmap`s and `ReachCache`.
+    refreshed: Option<(Option<Slot>, Manifest)>,
 }
 
 /// Parked `Ctx::Open` resolution waiting for the parallel `BLOOM_MAP` effect to settle.
@@ -1957,8 +1969,14 @@ enum Then {
     Commit,
     Stamp,
     Compact(Sliced),
+    /// An aborted compaction slice refreshed to the newest manifest in place: maps only delta
+    /// segments added by the concurrent commit while keeping `stats.aborted == true`.
+    CompactAborted(Sliced),
     /// One row a probe asked ([`Plain::find`]).
     Probe,
+    /// Bloom-matched rows for a foreground commit ([`Plain::map_for_commit`]): verified without
+    /// setting `eager = true`.
+    Targeted,
     /// Every row ([`Plain::map_all`]): whole after it.
     All,
 }
@@ -2899,9 +2917,6 @@ impl<A: Allocator + Clone> Plain<A> {
     /// lock. Returns `Some((temp_file, bytes))` when a staged write should run in
     /// `Phase::StagingBloom` before acquiring `self.flip`.
     fn prepare_staged_bloom(&mut self, change: &Change<A>) -> Option<(StagedBloom, Effect)> {
-        if !self.eager {
-            return None;
-        }
         let compact_bloom = matches!(change, Change::Compact { .. });
         let mut proj_segs: blaze_own::Vec<Segment, Kept> =
             blaze_own::Vec::with_capacity_in(self.manifest.segments.len().saturating_add(4), BLOOM_ALLOC);
@@ -3600,6 +3615,9 @@ impl<A: Allocator + Clone> Plain<A> {
     /// hundreds of consecutive multi-phase commits without background GC stay well below
     /// [`Plain::named_most`].
     pub(crate) fn auto_merge_open_threshold(&self) -> usize {
+        if self.plant() == Plant::ForegroundFoldsAtBgThreshold {
+            return self.auto_merge_bg_threshold().max(Self::AUTO_TIER_MERGE_BG);
+        }
         self.auto_merge_bg_threshold().max(Self::AUTO_TIER_MERGE_FG)
     }
 
@@ -3681,7 +3699,136 @@ impl<A: Allocator + Clone> Plain<A> {
     /// into the segment's piece, its CRC the one made at its put. The same segments as the
     /// same records put into a batch (arena_tests.rs, the seam's equality).
     fn empty_committed(&self) -> Committed<A> {
-        Committed { generation: self.manifest.generation, segments: Vec::new_in(self.alloc.clone()) }
+        Committed { generation: self.manifest.generation, segments: self.alloc_vec() }
+    }
+
+    /// Whether a commit on this store requires the whole manifest mapped (because `Liveness::Reached`
+    /// non-renewal root edits walk existing roots in [`Plain::reused`] /
+    /// [`Plain::missing_from_eviction`]).
+    pub fn needs_whole_for_commit(&self) -> bool {
+        self.plant() == Plant::CommitMapsAll
+            || (self.cfg.liveness == Liveness::Reached
+                && self.roots_pending.iter().any(|edit| matches!(edit, RootEdit::Set { renew_only: false, .. })))
+    }
+
+    /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
+    /// least one key being committed in `self.held`, `batches`, or `records` (plus any local
+    /// segment lacking a valid Bloom filter), leaving non-matching prior-boot segments unmapped
+    /// and unhashed during foreground commits while keeping `TwoValues` detection 100% sound.
+    ///
+    /// Returns `Ok(true)` when map effects were pushed onto `effects` (caller drives them to
+    /// completion), `Ok(false)` when all matching segments are already mapped and verified.
+    pub fn map_for_commit<E: Allocator>(
+        &mut self,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        now_ns: u64,
+        effects: &mut Vec<Effect, E>,
+    ) -> Result<bool, StoreError> {
+        const LATE_COMMIT_MAP: &str = "named by the generation this process opened, and its first commit-targeted probe came more than the grace period after the open: another process's compaction may have unlinked it since; a command maps every segment (Driven::map_all) before its first pool task";
+        if let Some(why) = &self.broken {
+            return Err(why.clone());
+        }
+        if !self.ready() {
+            return Err(StoreError::Busy { phase: self.what() });
+        }
+        if self.eager {
+            return Ok(false);
+        }
+        let est = self
+            .held
+            .iter()
+            .map(|h| h.batch.entries.len())
+            .sum::<usize>()
+            .saturating_add(batches.iter().map(|b| b.entries.len()).sum())
+            .saturating_add(records.len());
+        if est == 0 {
+            return Ok(false);
+        }
+        let mut keys: blaze_own::Vec<(Namespace, [u8; 32]), A> = self.own_vec_cap(est);
+        for held in &self.held {
+            let ns = held.batch.namespace;
+            for entry in &held.batch.entries {
+                keys.push((ns, entry.key.0));
+            }
+        }
+        for batch in batches {
+            let ns = batch.namespace;
+            for entry in &batch.entries {
+                keys.push((ns, entry.key.0));
+            }
+        }
+        for rec in records {
+            keys.push((rec.namespace, rec.key.0.0));
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let all_ns = self.plant() == Plant::IgnoresNamespace;
+        let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
+        let late = now_ns.saturating_sub(self.opened_ns) > GRACE_NS;
+        let mut to_check_parked: blaze_own::Vec<u64, A> = self.own_vec();
+        let mut to_map_rows: blaze_own::Vec<(usize, u64, bool), A> = self.own_vec();
+        for (row, seg) in self.manifest.segments.iter().enumerate() {
+            if !seg.local
+                || seg.count == 0
+                || self.by_id.contains_key(&seg.id)
+                || self.dropped.contains(&seg.id)
+            {
+                continue;
+            }
+            let slice: &[(Namespace, [u8; 32])] = if all_ns {
+                keys.as_slice()
+            } else {
+                let start = keys.partition_point(|(ns, _)| *ns < seg.namespace);
+                let end = keys.partition_point(|(ns, _)| *ns <= seg.namespace);
+                keys.get(start..end).unwrap_or(&[])
+            };
+            if slice.is_empty() {
+                continue;
+            }
+            let may_hit = self
+                .bloom
+                .may_contain_any_digest(&seg.digest, slice.iter().map(|(_, k)| k), trust_corrupt)
+                .unwrap_or(true);
+            if !may_hit {
+                continue;
+            }
+            if self.unchecked.contains_key(&seg.id) {
+                to_check_parked.push(seg.id);
+                continue;
+            }
+            if late {
+                return Err(StoreError::Lost {
+                    segment: seg.id,
+                    generation: self.manifest.generation,
+                    what: LATE_COMMIT_MAP,
+                });
+            }
+            to_map_rows.push((row, seg.id, seg.boot != self.cfg.boot && seg.sealed));
+        }
+        let checked_any = !to_check_parked.is_empty();
+        for id in to_check_parked {
+            self.check_parked(id);
+        }
+        if to_map_rows.is_empty() {
+            if checked_any {
+                self.order_view();
+            }
+            return Ok(false);
+        }
+        let sealed_to_map = to_map_rows.iter().filter(|(_, _, sealed)| *sealed).count();
+        self.reserve_maps(to_map_rows.len(), sealed_to_map, effects);
+        let mut left = 0u32;
+        for (row, id, _) in to_map_rows {
+            self.queue_map(row, id, effects);
+            left = left.saturating_add(1);
+        }
+        if left == 0 {
+            self.order_view();
+            return Ok(false);
+        }
+        self.phase = Phase::Mapping { left, then: Then::Targeted };
+        Ok(true)
     }
 
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
@@ -3689,12 +3836,53 @@ impl<A: Allocator + Clone> Plain<A> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
-        // The layout refuses two values under one key against every committed row: a whole
-        // store (rule 21). A commit with nothing to lay out (stamps alone) needs none.
+        // `Liveness::Reached` root-set commits walk existing roots (`reused`) and need a whole
+        // store; plain record/phase/pointer commits only require Bloom-matching segments to be
+        // mapped and verified (`Plain::map_for_commit` or `Plain::map_all`).
         assert!(
-            self.eager || (!self.holds_uncommitted() && batches.iter().all(|it| it.is_empty()) && records.is_empty()),
-            "Plain::commit lays out against a whole store: Plain::map_all first"
+            self.eager || !self.needs_whole_for_commit(),
+            "Plain::commit with Liveness::Reached root-set edits needs a whole store: Plain::map_all first"
         );
+        if !self.eager && (self.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty()) {
+            let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
+            let all_ns = self.plant() == Plant::IgnoresNamespace;
+            for seg in &self.manifest.segments {
+                if !seg.local
+                    || seg.count == 0
+                    || self.by_id.contains_key(&seg.id)
+                    || self.dropped.contains(&seg.id)
+                {
+                    continue;
+                }
+                let ns_keys = self
+                    .held
+                    .iter()
+                    .filter(|h| all_ns || h.batch.namespace == seg.namespace)
+                    .flat_map(|h| h.batch.entries.iter().map(|e| &e.key.0))
+                    .chain(
+                        batches
+                            .iter()
+                            .filter(|b| all_ns || b.namespace == seg.namespace)
+                            .flat_map(|b| b.entries.iter().map(|e| &e.key.0)),
+                    )
+                    .chain(
+                        records
+                            .iter()
+                            .filter(|r| all_ns || r.namespace == seg.namespace)
+                            .map(|r| &r.key.0.0),
+                    );
+                let mut peekable = ns_keys.peekable();
+                if peekable.peek().is_none() {
+                    continue;
+                }
+                assert_eq!(
+                    self.bloom.may_contain_any_digest(&seg.digest, peekable, trust_corrupt),
+                    Some(false),
+                    "Plain::commit_records: unmapped segment {:016x} may contain a committing key: call Plain::map_for_commit or Plain::map_all first",
+                    seg.id,
+                );
+            }
+        }
         if let Some(batch) = batches.iter().find(|it| !self.cfg.writes.contains(&it.namespace)) {
             return Err(StoreError::NotWritable { namespace: batch.namespace });
         }
@@ -4906,8 +5094,9 @@ impl<A: Allocator + Clone> Plain<A> {
         (total_live, out, kept_count)
     }
 
-    /// Read-only GC plan at `now_ns` (requires `map_all` first, writes nothing).
-    pub fn plan_gc(&self, now_ns: u64) -> Result<GcPlan, StoreError> {
+    /// Read-only GC plan at `now_ns` (requires `map_all` first, writes nothing; reuses
+    /// `self.reach_cache` across calls and subsequent compaction slices).
+    pub fn plan_gc(&mut self, now_ns: u64) -> Result<GcPlan, StoreError> {
         let total_bytes = self.manifest.bytes();
         let cap_bytes = self.cfg.cap_bytes;
         let high_watermark_bytes = self.high_watermark_bytes();
@@ -4915,9 +5104,14 @@ impl<A: Allocator + Clone> Plain<A> {
         let (live_bytes, evict) = if self.manifest.roots.is_empty() {
             (0, None)
         } else {
-            let reach = self.compute_reach(now_ns, true)?;
-            let (live, plan, _) = self.evict_from_reach(&reach);
-            (live, plan)
+            self.ensure_reach(now_ns, true)?;
+            match self.reach_cache.as_ref() {
+                Some(reach) => {
+                    let (live, plan, _) = self.evict_from_reach(reach);
+                    (live, plan)
+                }
+                None => (0, None),
+            }
         };
         let expired_roots = u32::try_from(self.manifest.roots.iter().filter(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns).count()).unwrap_or(u32::MAX);
         let lru_evict_roots = evict.as_ref().map_or(0, |it| u32::try_from(it.len()).unwrap_or(u32::MAX));
@@ -5997,6 +6191,7 @@ impl<A: Allocator + Clone> Plain<A> {
             bloom_staging,
             bloom_effect: None,
             bloom_written: None,
+            refreshed: None,
         }));
         if let Some(effect) = stage_effect {
             effects.push(effect);
@@ -6020,6 +6215,11 @@ impl<A: Allocator + Clone> Plain<A> {
     fn build(&mut self, base: Base, fresh: bool, now_ns: u64, effects: &mut Vec<Effect>) {
         let Phase::Flipping(mut flip) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("a build is a flip's") };
         let base_gen = base.manifest.generation;
+        // Preserve the unmodified on-disk `(slot, manifest)` for in-place refresh if a compaction
+        // slice aborts due to a concurrent commit (avoids dropping/reopening the store and keeps
+        // all existing `mmap`s & `ReachCache` alive).
+        let compact_refresh = (matches!(flip.change, Change::Compact { .. }) && base_gen != self.manifest.generation)
+            .then(|| (base.slot, base.manifest.clone()));
         let generation = base.slot.map_or(1, |it| it.generation + 1);
         let mut m = base.manifest;
         m.generation = generation;
@@ -6042,7 +6242,8 @@ impl<A: Allocator + Clone> Plain<A> {
             retire(&mut m, *id, false);
         }
         let current_log = base.slot.map(|it| it.log);
-        let orphans: Vec<(u64, bool), A> = std::mem::replace(&mut self.orphans, Vec::new_in(self.alloc.clone()));
+        let empty_orphans = self.alloc_vec();
+        let orphans: Vec<(u64, bool), A> = std::mem::replace(&mut self.orphans, empty_orphans);
         let adopt_orphans = |m: &mut Manifest, list: &[(u64, bool)]| {
             for &(id, log) in list {
                 let named = if log { Some(id) == current_log } else { m.segments.iter().any(|it| it.id == id) };
@@ -6338,6 +6539,9 @@ impl<A: Allocator + Clone> Plain<A> {
             flip.refused = refused;
             flip.aborted = aborted;
             flip.carry = carry;
+            if aborted {
+                flip.refreshed = compact_refresh;
+            }
             self.phase = Phase::Flipping(flip);
             self.unlock(effects);
             return;
@@ -6545,15 +6749,31 @@ impl<A: Allocator + Clone> Plain<A> {
             self.pending_bloom.clear();
             let Change::Compact { seg, mut stats, .. } = flip.change else { unreachable!("only a compaction aborts") };
             stats.aborted = true;
+            let mut refreshed = false;
+            if let Some((slot, manifest)) = flip.refreshed {
+                let same_reach = hash_roots(&manifest.roots) == hash_roots(&self.manifest.roots)
+                    && hash_leases(&manifest.leases) == hash_leases(&self.manifest.leases)
+                    && self.dropped.is_empty();
+                self.slot = slot;
+                self.manifest = manifest;
+                if !same_reach {
+                    self.invalidate_reach();
+                }
+                self.bloom.prune(&self.manifest.segments, &self.manifest.roots);
+                self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
+                refreshed = true;
+            }
             self.sliced = Some(stats);
+            let then = if refreshed { Then::CompactAborted(stats) } else { Then::Compact(stats) };
             match seg {
                 Some((_, file)) => {
                     // Never named: this process's own, removed now.
                     self.removing.clear();
                     self.removing.push(file.share());
                     effects.push(Effect::Remove { file, tag: self.tag(REMOVE, 0) });
-                    self.phase = Phase::Removing { left: 1, then: Then::Compact(stats) };
+                    self.phase = Phase::Removing { left: 1, then };
                 }
+                None if refreshed => self.map_new(then, effects),
                 None => self.phase = Phase::Ready,
             }
             return;
@@ -6714,9 +6934,31 @@ impl<A: Allocator + Clone> Plain<A> {
 
     /// Maps each segment of this process's manifest it has not mapped; then what `then` says.
     fn map_new(&mut self, then: Then, effects: &mut Vec<Effect>) {
-        // Lazy until whole: no row is mapped before a probe reaches it (probe.rs). The plant
-        // maps every row at the open, as the open did before piece 3.
+        // Lazy until whole: no unrelated prior-boot row is mapped before a probe or Bloom match
+        // reaches it (probe.rs). On `Then::Commit` we still map ONLY the segment(s) this commit
+        // just wrote (`self.committing`, same boot = O(1), 0 BLAKE3) so `At::Held` lookups and
+        // `open_files` stay valid without touching unrelated prior-boot segments.
         if !self.eager && !(then == Then::Open && self.plant() == Plant::MapsAllAtOpen) {
+            if then == Then::Commit && !self.committing.is_empty() {
+                let mut left = 0u32;
+                let len = self.manifest.segments.len();
+                for i in 0..len {
+                    let Some(seg) = self.manifest.segments.get(i).copied() else { continue };
+                    if !seg.local
+                        || self.by_id.contains_key(&seg.id)
+                        || self.dropped.contains(&seg.id)
+                        || !self.committing.contains(&seg.id)
+                    {
+                        continue;
+                    }
+                    left = left.saturating_add(1);
+                    self.queue_map(i, seg.id, effects);
+                }
+                if left > 0 {
+                    self.phase = Phase::Mapping { left, then };
+                    return;
+                }
+            }
             self.mapped(then, effects);
             return;
         }
@@ -7077,7 +7319,10 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 self.sliced = Some(stats);
             }
-            Then::Open | Then::Stamp | Then::Probe => {}
+            Then::CompactAborted(stats) => {
+                self.sliced = Some(stats);
+            }
+            Then::Open | Then::Stamp | Then::Probe | Then::Targeted => {}
             Then::All => self.all_mapped(),
         }
         if then == Then::Open && self.pending_stamps() {

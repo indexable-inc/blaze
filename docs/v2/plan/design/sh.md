@@ -1,6 +1,6 @@
 ---
-status: plan
-summary: "blaze-shell: blaze's own shell. A nushell-like language (`crates/blaze-sh`, `bstd::sh`: structured values through pipelines, sans-IO, `no_std`, on bstd's owning types) and a native macOS app (`crates/blaze-shell`) that draws values with blaze's own renderer (Metal, blaze-ui's Rust-authored shaders), not a TUI. External programs run on a PTY inside an output block through blaze-vt; full-screen programs take the window. The prompt is Rust in-process."
+status: current
+summary: "blaze-shell: blaze's own shell. A nushell-like language (`crates/blaze-sh`, `bstd::sh`: structured values through pipelines, O(1) CoW forkable state, sans-IO, `no_std`, on bstd's owning types) and a native macOS app (`crates/blaze-shell`) that draws values with blaze's own renderer (Metal, blaze-ui's Rust-authored shaders), not a TUI. External programs run on a PTY inside an output block through blaze-vt; full-screen programs take the window. The prompt is Rust in-process and `rust { ... }` / `:rs` cells execute live via `blaze run`."
 date: 2026-11-24
 ---
 # sh: blaze's own shell

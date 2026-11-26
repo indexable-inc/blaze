@@ -17,9 +17,9 @@ use blaze_memchr::memchr;
 use blaze_own::{AString, AVec, Alloc, String, Vec, planted::Planted};
 
 use crate::{
-    AheadBehindMode, Detail, Divergence, ErrorKind, FileKind, FileStat, GitError, GitFile,
-    GitStatusPlant, Head, PromptStatus, RepoState, ShortOid, StatusCounts, StatusOpts, TagMode,
-    Truncated, UntrackedMode, Upstream, WorktreeKind,
+    AheadBehindMode, ChangeKind, ChangedSample, Detail, Divergence, ErrorKind, FileKind, FileStat,
+    GitError, GitFile, GitStatusPlant, Head, PromptStatus, RepoState, ShortOid, StatusCounts,
+    StatusOpts, TagMode, Truncated, UntrackedMode, Upstream, WorktreeKind,
     commit_graph::{CommitGraph, parse_graph_chain},
     ignore::IgnoreStack,
     index::{IndexEntry, IndexView, OwnedIndex},
@@ -29,6 +29,8 @@ use crate::{
         find_packed_tag_for_oid, lookup_packed_ref, parse_config, parse_head, parse_loose_ref,
     },
 };
+
+const MAX_CHANGED_SAMPLES: usize = 24;
 
 /// Which capability directory a requested relative path belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -305,6 +307,7 @@ pub struct StatusMachine<'a, P: Planted<GitStatusPlant>> {
 
     // Working-tree status tracking.
     counts: StatusCounts,
+    changed_samples: AVec<'a, ChangedSample<'a>>,
     truncated: Truncated,
     ignores: IgnoreStack<'a>,
 
@@ -403,6 +406,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             graph_layers_raw: Vec::new_in(alloc),
             graph_layer_oids: Vec::new_in(alloc),
             counts: StatusCounts::default(),
+            changed_samples: Vec::new_in(alloc),
             truncated: Truncated::default(),
             ignores: IgnoreStack::new(opts.limits, alloc),
             verified_entries: Vec::new_in(alloc),
@@ -938,7 +942,8 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                 let pending =
                     core::mem::replace(&mut self.stat_pending_indices, Vec::new_in(self.alloc));
                 for (idx, st) in pending.into_iter().zip(stats.iter()) {
-                    self.check_tracked_stat(idx, &owned_idx.entries[idx], st.stat);
+                    let path_bytes = owned_idx.view().path_bytes(&owned_idx.entries[idx]);
+                    self.check_tracked_stat(idx, &owned_idx.entries[idx], path_bytes, st.stat);
                 }
                 self.index = Some(owned_idx);
                 self.phase = Phase::HashFiles;
@@ -961,14 +966,17 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                     if self.opts.detail == Detail::Presence && self.counts.modified > 0 {
                         break;
                     }
+                    let entry = &owned_idx.entries[idx];
+                    let path_bytes = owned_idx.view().path_bytes(entry);
                     let Some(bytes) = maybe_bytes.as_deref() else {
                         self.counts.deleted = self.counts.deleted.saturating_add(1);
+                        self.record_sample_bytes(path_bytes, ChangeKind::Deleted);
                         continue;
                     };
-                    let entry = &owned_idx.entries[idx];
                     let blob_oid = hash_worktree_blob(bytes, autocrlf, self.alloc);
                     if blob_oid != entry.oid {
                         self.counts.modified = self.counts.modified.saturating_add(1);
+                        self.record_sample_bytes(path_bytes, ChangeKind::Modified);
                     }
                 }
                 self.index = Some(owned_idx);
@@ -991,13 +999,16 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                     if self.opts.detail == Detail::Presence && self.counts.modified > 0 {
                         break;
                     }
+                    let entry = &owned_idx.entries[idx];
+                    let path_bytes = owned_idx.view().path_bytes(entry);
                     let Some(target) = maybe_target.as_deref() else {
                         self.counts.typechanged = self.counts.typechanged.saturating_add(1);
+                        self.record_sample_bytes(path_bytes, ChangeKind::Modified);
                         continue;
                     };
-                    let entry = &owned_idx.entries[idx];
                     if Oid::of(ObjectKind::Blob, target) != entry.oid {
                         self.counts.modified = self.counts.modified.saturating_add(1);
+                        self.record_sample_bytes(path_bytes, ChangeKind::Modified);
                     }
                 }
                 self.index = Some(owned_idx);
@@ -1225,7 +1236,8 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                         && !idx_entry.is_sparse_dir()
                         && !idx_entry.is_gitlink()
                     {
-                        self.check_tracked_stat(idx_pos, idx_entry, entry.stat);
+                        let path_bytes = idx.path_bytes(idx_entry);
+                        self.check_tracked_stat(idx_pos, idx_entry, path_bytes, entry.stat);
                     }
                     continue;
                 }
@@ -1328,10 +1340,12 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                         if !self.collapse_found[group_id as usize] {
                             self.collapse_found[group_id as usize] = true;
                             self.counts.untracked = self.counts.untracked.saturating_add(1);
+                            self.record_child_scratch(ChangeKind::Untracked);
                         }
                         break;
                     } else {
                         self.counts.untracked = self.counts.untracked.saturating_add(1);
+                        self.record_child_scratch(ChangeKind::Untracked);
                     }
                 }
             }
@@ -1401,13 +1415,43 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
         Ok(())
     }
 
-    fn check_tracked_stat(&mut self, idx_pos: usize, entry: &IndexEntry, stat: FileStat) {
+    fn record_child_scratch(&mut self, kind: ChangeKind) {
+        if self.changed_samples.len() >= MAX_CHANGED_SAMPLES || self.child_scratch.is_empty() {
+            return;
+        }
+        self.changed_samples.push(ChangedSample {
+            path: String::from_str_in(self.child_scratch.as_str(), self.alloc),
+            kind,
+        });
+    }
+
+    fn record_sample_bytes(&mut self, path: &[u8], kind: ChangeKind) {
+        if self.changed_samples.len() >= MAX_CHANGED_SAMPLES || path.is_empty() {
+            return;
+        }
+        if let Ok(s) = core::str::from_utf8(path) {
+            self.changed_samples.push(ChangedSample {
+                path: String::from_str_in(s, self.alloc),
+                kind,
+            });
+        }
+    }
+
+    fn check_tracked_stat(
+        &mut self,
+        idx_pos: usize,
+        entry: &IndexEntry,
+        path_bytes: &[u8],
+        stat: FileStat,
+    ) {
         if stat.kind == FileKind::Gone {
             self.counts.deleted = self.counts.deleted.saturating_add(1);
+            self.record_sample_bytes(path_bytes, ChangeKind::Deleted);
             return;
         }
         if entry.intent_to_add {
             self.counts.modified = self.counts.modified.saturating_add(1);
+            self.record_sample_bytes(path_bytes, ChangeKind::Modified);
             return;
         }
         let want_kind = if entry.is_symlink() {
@@ -1419,6 +1463,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
         };
         if stat.kind != want_kind {
             self.counts.typechanged = self.counts.typechanged.saturating_add(1);
+            self.record_sample_bytes(path_bytes, ChangeKind::Modified);
             return;
         }
 
@@ -1427,6 +1472,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             && stat.executable() != entry.is_executable();
         if mode_differs {
             self.counts.modified = self.counts.modified.saturating_add(1);
+            self.record_sample_bytes(path_bytes, ChangeKind::Modified);
             return;
         }
 
@@ -1438,6 +1484,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             && (want_kind == FileKind::Symlink || self.config.autocrlf == AutoCrlf::False);
         if size_differs_definitively {
             self.counts.modified = self.counts.modified.saturating_add(1);
+            self.record_sample_bytes(path_bytes, ChangeKind::Modified);
             return;
         }
 
@@ -1898,6 +1945,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             counts: self.counts,
             worktree: self.worktree_kind,
             truncated: self.truncated,
+            changed_samples: core::mem::replace(&mut self.changed_samples, Vec::new_in(self.alloc)),
         }
     }
 }

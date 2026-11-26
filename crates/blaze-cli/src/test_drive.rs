@@ -1872,8 +1872,15 @@ const MOST_MAKERS: usize = 4;
 /// Soft frame budget per code worker: once a worker's `Frame` reaches this usage between makes,
 /// the worker drops its [`SuiteMakers`], resets and trims its `Frame` back to
 /// [`WORKER_FRAME_KEEP`], and rebuilds cleanly so multi-suite and heavy-suite test runs never
-/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS.
-const WORKER_FRAME_RESET_AT: usize = 512 << 20;
+/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS. Set to 2 GiB (half of
+/// `FRAME_RESERVE`) so large single-suite workspaces (e.g. `tempo-e2e` at ~550+ MiB of loaded
+/// crate trees and heads) stay warm across makes instead of resetting after every function.
+const WORKER_FRAME_RESET_AT: usize = 2 << 30;
+
+/// Hard frame ceiling per code worker (still 1 GiB below `FRAME_RESERVE`) for the adaptive
+/// cold-baseline bump: if a single cold make already fills past [`WORKER_FRAME_RESET_AT`], the
+/// worker keeps warm headroom up to this ceiling rather than thrashing on every make.
+const WORKER_FRAME_HARD_RESET_AT: usize = 3 << 30;
 
 /// Lower frame budget applied once [`Makers`] has evicted a suite at [`MOST_MAKERS`]: if the
 /// worker's `Frame` holds at least this much memory from evicted suites, reclaim it between
@@ -2481,7 +2488,7 @@ const NO_SUITE: &str = "the make names a suite this command does not have (test_
 pub(crate) struct SuiteMakers<'w> {
     cx: &'w Cx,
     root: &'w Dir<ReadWrite>,
-    sides: &'w [SuiteSide<'w>],
+    sides: &'w [Option<SuiteSide<'w>>],
     typed: crate::engine_body_record::SyncTypedFrom<'w>,
     procs: crate::job_texts::Procs<'w>,
     frame: &'w Frame,
@@ -2489,6 +2496,7 @@ pub(crate) struct SuiteMakers<'w> {
     names: AVec<'static, Option<NamesRecords<'w>>>,
     makers: Makers<TestMaker<'w>>,
     reset_needed: bool,
+    makes: usize,
     reset_at: usize,
     evict_reset_at: usize,
 }
@@ -2497,7 +2505,7 @@ impl<'w> SuiteMakers<'w> {
     pub(crate) fn new(
         cx: &'w Cx,
         root: &'w Dir<ReadWrite>,
-        sides: &'w [SuiteSide<'w>],
+        sides: &'w [Option<SuiteSide<'w>>],
         typed: crate::engine_body_record::SyncTypedFrom<'w>,
         procs: crate::job_texts::Procs<'w>,
         frame: &'w Frame,
@@ -2516,6 +2524,7 @@ impl<'w> SuiteMakers<'w> {
             names,
             makers: Makers::new(heap.alloc(), MakersPlant::None),
             reset_needed: false,
+            makes: 0,
             reset_at: WORKER_FRAME_RESET_AT,
             evict_reset_at: WORKER_FRAME_EVICT_RESET_AT,
         }
@@ -2524,8 +2533,8 @@ impl<'w> SuiteMakers<'w> {
 
 impl KeptMakers for SuiteMakers<'_> {
     fn make(&mut self, job: &Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), Unmade> {
-        let at = job.suite.0 as usize;
-        let side = *self.sides.get(at).ok_or_else(|| refused(job, NO_SUITE))?;
+        let at = usize::try_from(job.suite.0).map_err(|_| refused(job, NO_SUITE))?;
+        let side = self.sides.get(at).and_then(|side| *side).ok_or_else(|| refused(job, NO_SUITE))?;
         let names = match self.names.get(at).copied().flatten() {
             Some(names) => names,
             None => {
@@ -2550,12 +2559,22 @@ impl KeptMakers for SuiteMakers<'_> {
             Ok(maker)
         })?;
         maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
-        job.order.make(maker, &job.proof, job.name.as_slice(), entry)
+        let out = job.order.make(maker, &job.proof, job.name.as_slice(), entry);
+        self.makes = self.makes.saturating_add(1);
+        if self.makes == 1 {
+            let used = self.frame.used();
+            if used >= self.reset_at && used < WORKER_FRAME_HARD_RESET_AT {
+                self.reset_at = used.saturating_add(256 << 20).min(WORKER_FRAME_HARD_RESET_AT);
+            }
+        }
+        out
     }
 
     fn forget(&mut self, suite: SuiteId) {
         self.makers.forget(suite);
-        if let Some(slot) = self.names.get_mut(suite.0 as usize) {
+        if let Ok(at) = usize::try_from(suite.0)
+            && let Some(slot) = self.names.get_mut(at)
+        {
             *slot = None;
         }
         self.reset_needed = true;
@@ -2580,7 +2599,7 @@ impl KeptMakers for SuiteMakers<'_> {
 struct SuiteMakersFactory<'w, 'p> {
     cx: &'w Cx,
     root: &'w Dir<ReadWrite>,
-    sides: &'w [SuiteSide<'w>],
+    sides: &'w [Option<SuiteSide<'w>>],
     typed: crate::engine_body_record::SyncTypedFrom<'w>,
     procs: ProcsSide<'p>,
     by_need: WorkerProcs<'w, 'p>,
@@ -2609,7 +2628,7 @@ pub(crate) fn work<'p>(
     cx: &Cx,
     lane: WorkerLane<'_, 'p>,
     clock: &bstd::clock::Clock,
-    sides: &[SuiteSide<'_>],
+    sides: &[Option<SuiteSide<'_>>],
     typed: crate::engine_body_record::SyncTypedFrom<'_>,
     root: &Dir<ReadWrite>,
     procs: ProcsSide<'p>,
@@ -3087,6 +3106,14 @@ impl<'c> Launched<'c, '_, '_> {
         let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
         // If this test is already impure at launch (eager native C image or custom harness), batch
         // pre-publish the suite's warm functions into `ahead` before spawning.
+        //
+        // Pure tests (`keep.is_ok()`) intentionally NEVER receive pre-published warm functions
+        // (not even pure `CodeClass::Toolchain` / closed functions): pure tests derive their
+        // `entered_fns` set — and therefore their `BZTR` `Address` and `Postings` asks — from the
+        // child's demand-driven `Up::Need` stream. Pre-publishing any function would suppress its
+        // `Up::Need` and make `entered_fns` depend on sibling test execution order (`warm_order`),
+        // violating Rule 25 determinism and breaking `Effect::Look` undo-cache and flakiness
+        // address matching (and for impure functions, bypassing per-test `NotKept` tracking).
         if keep.is_err() {
             let prep = self.suite_cache.borrow().prepublish_warm(
                 test_entry,
@@ -4229,21 +4256,27 @@ struct Selected<'r, T> {
     rows: &'r [Location],
 }
 
-impl Refuse for Selected<'_, EntryCheck<'_, '_>> {
+impl Refuse for Selected<'_, Option<EntryCheck<'_, '_>>> {
     fn refusal(&mut self, flat: u32) -> Result<Option<&str>, OneError> {
-        let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
-        self.suites[loc.suite.0 as usize].refusal(loc.row)
+        let flat_idx = usize::try_from(flat).map_err(|_| OneError::NoRow { row: flat })?;
+        let loc = self.rows.get(flat_idx).ok_or(OneError::NoRow { row: flat })?;
+        let suite_idx = usize::try_from(loc.suite.0).map_err(|_| OneError::NoRow { row: flat })?;
+        let check = self.suites.get_mut(suite_idx).and_then(|suite| suite.as_mut()).ok_or(OneError::NoRow { row: flat })?;
+        check.refusal(loc.row)
     }
 }
 
-impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
+impl RunOne for Selected<'_, Option<Launched<'_, '_, '_>>> {
     async fn run(&self, flat: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
-        let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
-        self.suites[loc.suite.0 as usize].run(loc.row, budget, output, signals).await
+        let flat_idx = usize::try_from(flat).map_err(|_| OneError::NoRow { row: flat })?;
+        let loc = self.rows.get(flat_idx).ok_or(OneError::NoRow { row: flat })?;
+        let suite_idx = usize::try_from(loc.suite.0).map_err(|_| OneError::NoRow { row: flat })?;
+        let launched = self.suites.get(suite_idx).and_then(|suite| suite.as_ref()).ok_or(OneError::NoRow { row: flat })?;
+        launched.run(loc.row, budget, output, signals).await
     }
 
     fn pump_bins(&self) -> Result<bool, OneError> {
-        let Some(first) = self.suites.first() else { return Ok(false) };
+        let Some(first) = self.suites.iter().find_map(|s| s.as_ref()) else { return Ok(false) };
         let Some(bins) = first.bins else { return Ok(false) };
         bins.borrow_mut()
             .pump(first.cx, first.ids, first.lent, first.watch)
@@ -4258,91 +4291,73 @@ impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
     }
 }
 
-/// The selected suites run, their code made where [`CODES`] says (D194, THE seam): `Serial`, in
-/// each test's own turn; `Pooled`, by the command's code workers ([`pooled`]), the relay handed
-/// to every test's run. `root` is the checkout's (each worker's names records read its trees
-/// through it); `procs` is the command's proc-macro runner (by need: a worker asks for it,
-/// [`CodePool`]); `heap` is the command's, the relay's and the workers' tables in it.
-///
-/// Opens `TestCache` and resolves pure `Effect::Look` cache checks BEFORE spawning code workers
-/// or creating `$TMPDIR` folders: an all-cached run spawns zero worker threads and creates zero
-/// temporary directories; a partial run sizes its worker pool to the actual dirty test count and
-/// lazily creates `$TMPDIR` / loads `BZTV` only for suites that actually execute a test.
-#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and specific runtime capabilities")]
-pub(crate) fn run_suites<'h>(
-    cx: &Cx,
-    fs: &bstd::fs::Fs,
-    env: Option<&bstd::env::Env>,
-    host: &bstd::host::Host,
-    clock: &bstd::clock::Clock,
-    rng: &mut bstd::rng::Rng,
-    out: &bstd::out::Out,
-    err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], bins: &[crate::test_bins::BinSuite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, tools_digest: [u8; 32], config: LoopConfig<'_>,
-    args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
-) -> Result<Status, DriveError> {
-    let sel_cx = cx.span("blaze test: selected suites");
-    let tables = heap.alloc();
-    let erased = blaze_own::Erased::new(frame);
-    let alloc = erased.handle();
-    let mut suite_specs = Vec::with_capacity_in(suites.len(), alloc);
-    for suite in suites {
-        suite_specs.push((suite.unit, suite.builder));
-    }
-    let (mut cache, heads, postings_list, moved) =
-        crate::test_cache::TestCache::open(lent, suite_specs.as_slice(), ids, &certificate, tools_digest, alloc);
-    let merged_postings_bytes: AVec<'_, u8>;
-    let postings = if postings_list.len() == 1 {
-        postings_list.first().copied().unwrap_or(Postings::EMPTY)
-    } else if postings_list.is_empty() {
-        Postings::EMPTY
-    } else {
-        let mut pairs: AVec<'_, (Ask, TestId)> = Vec::new_in(alloc);
-        for head in heads.iter() {
-            for row in head.rows() {
-                for ask in head.asks(row) {
-                    pairs.push((ask, row.kept.test));
-                }
-            }
-        }
-        if pairs.is_empty() {
-            Postings::EMPTY
-        } else {
-            merged_postings_bytes = blaze_run::postings::encode(pairs.as_slice(), alloc)
-                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?;
-            Postings::open(merged_postings_bytes.as_slice())
-                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
-        }
-    };
-    let select = blaze_run::plan::Plan::new(config.plan, alloc).map_err(LoopError::from)?;
-    let mut locations = Vec::new_in(alloc);
-    let mut owners = Vec::new_in(alloc);
-    let mut rows = Vec::new_in(alloc);
-    let mut filtered = 0u32;
-    for (index, suite) in suites.iter().enumerate() {
-        let unit = suite.unit;
-        let tests = unit.tests;
-        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-        for at in 0..tests.len() {
-            let mut row = asked(unit, record_row(tests, at)?, &suite.builder, args);
-            // Custom harnesses receive the raw arguments themselves.
-            if tests.harnessed() && !select.lets_through(&row) {
-                filtered = filtered
-                    .checked_add(1)
-                    .ok_or(DriveError::TooManyRows { count: usize::try_from(u32::MAX).unwrap_or(usize::MAX).saturating_add(1) })?;
-                continue;
-            }
-            if suites.len() > 1 {
-                let path = bstd::mem::format_in!(frame, "{}/{}/{}", unit.package, unit.target, row.path);
-                row.path = crate::work::held_str(path.as_str(), frame);
-            }
-            rows.push(row);
-            owners.push(suite_id);
-            locations.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
-        }
-    }
-    cache.set_owners(rows.as_slice(), owners.as_slice());
+/// Cheap suite descriptor sufficient for `TestCache::open` and `TestLoop` planning without
+/// linking native images or opening crate names records.
+#[derive(Clone, Copy)]
+pub(crate) struct SuiteSpec<'s> {
+    pub unit: TestUnit<'s>,
+    pub builder: Builder,
+    pub digests: crate::test_cache::SuiteDigests,
+}
 
+/// Outcome of the pure `TestCache` + `TestLoop` planning pass ([`prepare_suites`]).
+pub(crate) enum PreparedSuites<'a, 'm, D: blaze_core::Driver> {
+    /// Every targeted test hit `TestCache` (or was ignored/filtered/empty): `TestCache` has
+    /// already committed and printed the closing line with zero code workers, zero launcher
+    /// spawns, zero `$TMPDIR` syscalls, and zero native-image / names-record setup.
+    Done(Status),
+    /// At least one test requires execution; only suites where [`DirtySuites::is_suite_dirty`] is
+    /// `true` need `Suite` materialization (`image_for`, `crates_of`, `names_in`, `package_run`).
+    Dirty(DirtySuites<'a, 'm, D>),
+}
+
+/// State carried from the pure `TestCache` pass into dirty-test execution ([`DirtySuites::run`]).
+pub(crate) struct DirtySuites<'a, 'm, D: blaze_core::Driver> {
+    cache: crate::test_cache::TestCache<'a, 'm, D>,
+    machine: TestLoop<'a, 'a>,
+    pending_runs: AVec<'a, Effect<'a>>,
+    locations: &'a [Location],
+    dirty_suites: &'a [bool],
+    steps_left: usize,
+    most: usize,
+    alloc: Alloc<'a>,
+}
+
+impl<'a, 'm, D: blaze_core::Driver> DirtySuites<'a, 'm, D> {
+    /// Whether suite `index` has at least one runnable test that missed `TestCache`.
+    pub(crate) fn is_suite_dirty(&self, index: usize) -> bool {
+        self.dirty_suites.get(index).copied().unwrap_or(false)
+    }
+
+    /// Number of initial `Effect::Run` dispatches queued in `pending_runs`.
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending_runs.len()
+    }
+}
+
+/// Opens `TestCache` and resolves all pure `Effect::Look` cache checks BEFORE materializing
+/// per-suite native images/names records, spawning code workers, or creating `$TMPDIR` folders:
+/// - When every targeted test hits `TestCache` (0 tests left to run), commits `TestCache` and
+///   returns [`PreparedSuites::Done`] with ZERO worker/process spawns and ZERO setup overhead.
+/// - When some tests are dirty, returns [`PreparedSuites::Dirty`] naming the exact subset of
+///   suites that need execution so clean suites pay zero setup.
+#[expect(clippy::too_many_arguments, reason = "pure cache-resolution edge takes the suite specs, run ids, and cache handles")]
+pub(crate) fn prepare_suites<'a, 'm: 'a, D: blaze_core::Driver>(
+    cx: &Cx,
+    clock: &bstd::clock::Clock,
+    out: &bstd::out::Out,
+    specs: &[SuiteSpec<'a>],
+    ids: &RunIds<'_>,
+    certificate: &crate::start_list::Certificate,
+    tools_digest: [u8; 32],
+    config: LoopConfig<'a>,
+    args: &[&str],
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    watch: &dyn Watch,
+    bump: blaze_own::Bump<'a>,
+) -> Result<PreparedSuites<'a, 'm, D>, DriveError> {
+    let sel_cx = cx.span("blaze test: check test cache");
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
     let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
         watch.see(blaze_screen::Step::Says);
@@ -4355,13 +4370,109 @@ pub(crate) fn run_suites<'h>(
         Ok(())
     };
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
+    let prepared = prepare_suites_with(specs, ids, certificate, tools_digest, config, args, lent, &now, &mut print, bump)?;
+    if matches!(prepared, PreparedSuites::Done(_)) {
+        watch.see(blaze_screen::Step::Says);
+    }
+    Ok(prepared)
+}
+
+/// Sans-IO core of [`prepare_suites`]: resolves `TestCache` and pure `TestLoop` effects over an
+/// injected clock and print sink so tests can verify the zero-spawn fast path deterministically.
+#[expect(clippy::too_many_arguments, reason = "sans-IO test-cache preparation core")]
+pub(crate) fn prepare_suites_with<'a, 'm: 'a, D: blaze_core::Driver>(
+    specs: &[SuiteSpec<'a>],
+    ids: &RunIds<'_>,
+    certificate: &crate::start_list::Certificate,
+    tools_digest: [u8; 32],
+    config: LoopConfig<'a>,
+    args: &[&str],
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    now: &dyn Fn() -> Nanos,
+    print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
+    bump: blaze_own::Bump<'a>,
+) -> Result<PreparedSuites<'a, 'm, D>, DriveError> {
+    let alloc = bump.alloc();
+    let (mut cache, heads_vec, postings_list, moved) =
+        crate::test_cache::TestCache::open(lent, specs, ids, certificate, tools_digest, alloc);
+    let mut heads_bump: Vec<Head<'a>, blaze_own::Bump<'a>> = Vec::with_capacity_in(heads_vec.len(), bump);
+    for head in heads_vec {
+        heads_bump.push(head);
+    }
+    let heads: &'a [Head<'a>] = heads_bump.into_bump_slice();
+    // `TestLoop::begin_inventory` / `Plan::decide` only ever queries `postings.tests_of(ask)` for
+    // `ask` in `moved`: skip O(all suites * all asks) full postings re-encoding completely when
+    // `moved` is empty, and for multi-suite edits probe ONLY the moved asks directly against each
+    // suite's already-opened `BZPS` postings record (O(|moved| * suites * log P)).
+    let postings: Postings<'a> = if moved.is_empty() || postings_list.is_empty() {
+        Postings::EMPTY
+    } else if postings_list.len() == 1 {
+        postings_list.first().copied().unwrap_or(Postings::EMPTY)
+    } else {
+        let mut pairs: AVec<'a, (Ask, TestId)> = Vec::new_in(alloc);
+        let mut named: AVec<'a, TestId> = Vec::new_in(alloc);
+        for &ask in moved.iter() {
+            for suite_postings in postings_list.iter() {
+                named.clear();
+                suite_postings.tests_of(ask, &mut named);
+                for &test in named.iter() {
+                    pairs.push((ask, test));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            Postings::EMPTY
+        } else {
+            let encoded = blaze_run::postings::encode(pairs.as_slice(), alloc)
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?;
+            let mut held: Vec<u8, blaze_own::Bump<'a>> = Vec::with_capacity_in(encoded.len(), bump);
+            held.extend_from_slice(encoded.as_slice());
+            let slice: &'a [u8] = held.into_bump_slice();
+            Postings::open(slice)
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
+        }
+    };
+    let select = blaze_run::plan::Plan::new(config.plan, alloc).map_err(LoopError::from)?;
+    let mut locations_bump: Vec<Location, blaze_own::Bump<'a>> = Vec::new_in(bump);
+    let mut owners_bump: Vec<SuiteId, blaze_own::Bump<'a>> = Vec::new_in(bump);
+    let mut rows = Vec::new_in(alloc);
+    let mut row_meta: AVec<'a, (TestId, SuiteId, bool, bool)> = Vec::new_in(alloc);
+    let mut filtered = 0u32;
+    for (index, spec) in specs.iter().enumerate() {
+        let unit = spec.unit;
+        let tests = unit.tests;
+        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: specs.len() })?);
+        for at in 0..tests.len() {
+            let mut row = asked(unit, record_row(tests, at)?, &spec.builder, args);
+            // Custom harnesses receive the raw arguments themselves.
+            if tests.harnessed() && !select.lets_through(&row) {
+                filtered = filtered
+                    .checked_add(1)
+                    .ok_or(DriveError::TooManyRows { count: usize::try_from(u32::MAX).unwrap_or(usize::MAX).saturating_add(1) })?;
+                continue;
+            }
+            if specs.len() > 1 {
+                let mut path: String<blaze_own::Bump<'a>> = String::new_in(bump);
+                let _ = write!(path, "{}/{}/{}", unit.package, unit.target, row.path);
+                row.path = path.into_bump_str();
+            }
+            row_meta.push((row.test, suite_id, row.ignore.is_some(), row.bench));
+            rows.push(row);
+            owners_bump.push(suite_id);
+            locations_bump.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
+        }
+    }
+    let owners: &'a [SuiteId] = owners_bump.into_bump_slice();
+    let locations: &'a [Location] = locations_bump.into_bump_slice();
+    cache.set_owners(rows.as_slice(), owners);
 
     let most = STEPS_FIXED.saturating_add(STEPS_PER_TEST.saturating_mul(rows.len()));
     let mut machine = TestLoop::new(config, alloc)?;
-    let mut out_effects: AVec<'_, Effect<'_>> = Vec::new_in(alloc);
-    let mut effects: AVec<'_, Effect<'_>> = Vec::new_in(alloc);
-    let mut pending_runs: AVec<'_, Effect<'_>> = Vec::new_in(alloc);
-    machine.begin_inventory(rows, &owners, heads.as_slice(), postings, moved.as_slice(), filtered, now(), &mut out_effects)?;
+    let mut out_effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
+    let mut effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
+    let mut pending_runs: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
+    let mut looked_misses: AVec<'a, TestId> = Vec::new_in(alloc);
+    machine.begin_inventory(rows, owners, heads, postings, moved.as_slice(), filtered, now(), &mut out_effects)?;
     machine.step(Event::Checked { errors: 0 }, now(), &mut out_effects)?;
     let mut steps_used = 0usize;
     let mut done = None;
@@ -4377,6 +4488,9 @@ pub(crate) fn run_suites<'h>(
                 Effect::Moved { .. } => return Err(DriveError::NoHead { effect: "the moved asks" }),
                 Effect::Look { suite, test, .. } => {
                     let found = cache.look(suite, test)?;
+                    if !found {
+                        looked_misses.push(test);
+                    }
                     machine.step(Event::Looked { test, found }, now(), &mut out_effects)?;
                 }
                 Effect::Run { .. } | Effect::Kill { .. } => pending_runs.push(effect),
@@ -4392,50 +4506,146 @@ pub(crate) fn run_suites<'h>(
         }
     }
     if let Some(status) = done {
-        watch.see(blaze_screen::Step::Says);
         cache.commit(ids)?;
-        return Ok(status);
+        return Ok(PreparedSuites::Done(status));
     }
     if pending_runs.is_empty() {
         return Err(DriveError::Stalled);
     }
 
-    // The command's one make watch (rule 75: its clock started here, at the edge), handed to
-    // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
-    let make_watch = crate::run_parent::command_make_watch();
-    let want_workers = if TestHost::THIS.has_sandbox() {
-        usize::try_from(config.plan.width)
-            .unwrap_or(MAX_CODE_WORKERS)
-            .min(pending_runs.len())
-            .min(MAX_CODE_WORKERS)
-    } else {
-        0
-    };
-    let steps_left = most.saturating_sub(steps_used);
-    let status = match CODES {
-        Codes::Pooled if want_workers > 1 && cx.workers() > 1 => {
-            let sync_typed = typed.sync_over(*ids);
-            pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
-                run_dirty(
-                    &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
-                    tables, watch, make_watch, frame, alloc, Some(relay), &mut machine, pending_runs,
-                    steps_left, most, locations.as_slice(), &mut cache, &mut print,
-                )
-            })
+    // Identify the exact subset of suites with at least one runnable test that missed `TestCache`
+    // (including tests still queued behind `config.plan.width` inside `TestLoop`).
+    looked_misses.sort_unstable();
+    let mut dirty_bump: Vec<bool, blaze_own::Bump<'a>> = Vec::with_capacity_in(specs.len(), bump);
+    dirty_bump.resize(specs.len(), false);
+    for effect in pending_runs.iter() {
+        if let Effect::Run { row, .. } = effect
+            && let Ok(row_idx) = usize::try_from(*row)
+            && let Some(loc) = locations.get(row_idx)
+            && let Ok(suite_idx) = usize::try_from(loc.suite.0)
+            && let Some(flag) = dirty_bump.get_mut(suite_idx)
+        {
+            *flag = true;
         }
-        Codes::Serial | Codes::Pooled => {
-            run_dirty(
-                &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
-                tables, watch, make_watch, frame, alloc, None, &mut machine, pending_runs,
-                steps_left, most, locations.as_slice(), &mut cache, &mut print,
-            )
+    }
+    for &(test_id, owner, is_ignored, is_bench) in row_meta.iter() {
+        let Ok(suite_idx) = usize::try_from(owner.0) else { continue };
+        if dirty_bump.get(suite_idx).copied().unwrap_or(false) {
+            continue;
         }
-    }?;
-    cache.commit(ids)?;
-    Ok(status)
+        if is_bench && !config.plan.benches {
+            continue;
+        }
+        if is_ignored && config.plan.ignored == blaze_run::plan::Ignored::Skip {
+            continue;
+        }
+        let dirty = if config.plan.run_all {
+            true
+        } else {
+            match heads.get(suite_idx).and_then(|head| head.row(test_id)) {
+                None => true,
+                Some(row) => match row.kept.last {
+                    blaze_run::plan::Last::Failed | blaze_run::plan::Last::NotKept(_) => true,
+                    blaze_run::plan::Last::Passed { .. } | blaze_run::plan::Last::Unsettled { .. } => {
+                        looked_misses.binary_search(&test_id).is_ok()
+                    }
+                },
+            }
+        };
+        if dirty && let Some(flag) = dirty_bump.get_mut(suite_idx) {
+            *flag = true;
+        }
+    }
+    Ok(PreparedSuites::Dirty(DirtySuites {
+        cache,
+        machine,
+        pending_runs,
+        locations,
+        dirty_suites: dirty_bump.into_bump_slice(),
+        steps_left: most.saturating_sub(steps_used),
+        most,
+        alloc,
+    }))
 }
 
-/// [`run_suites`] under `Codes::Pooled` (D194 piece 2): spawns up to `want_workers` code workers
+impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
+    /// Executes the remaining dirty tests across the materialized dirty suites (`Some(Suite)` for
+    /// every suite where [`Self::is_suite_dirty`] is `true`, `None` for clean cached suites),
+    /// spawning code workers only when `CODES == Pooled` and more than one dirty test runs in
+    /// parallel, then commits `TestCache`.
+    #[expect(clippy::too_many_arguments, reason = "the command supplies the dirty suites and specific runtime capabilities")]
+    pub(crate) fn run<'h>(
+        mut self,
+        cx: &Cx,
+        fs: &'a bstd::fs::Fs,
+        env: Option<&bstd::env::Env>,
+        host: &bstd::host::Host,
+        clock: &bstd::clock::Clock,
+        rng: &mut bstd::rng::Rng,
+        out: &bstd::out::Out,
+        err: &bstd::out::Out,
+        suites: &[Option<Suite<'_, 'h>>],
+        bins: &[crate::test_bins::BinSuite<'a, 'h>],
+        ids: &RunIds<'h>,
+        typed: crate::engine_body_record::TypedFrom<'h>,
+        certificate: crate::start_list::Certificate,
+        config: LoopConfig<'a>,
+        args: &[&str],
+        lent: &CommandLent,
+        root: &Dir<ReadWrite>,
+        procs: crate::job_texts::Procs<'_>,
+        heap: &'static blaze_own::Heap,
+        watch: &dyn Watch,
+        frame: &Frame,
+    ) -> Result<Status, DriveError> {
+        let sel_cx = cx.span("blaze test: selected suites");
+        let tables = heap.alloc();
+        let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
+            watch.see(blaze_screen::Step::Says);
+            for chunk in bytes.utf8_chunks() {
+                out.write(&sel_cx, chunk.valid()).map_err(|_| DriveError::Print)?;
+                if !chunk.invalid().is_empty() {
+                    out.write(&sel_cx, "\u{FFFD}").map_err(|_| DriveError::Print)?;
+                }
+            }
+            Ok(())
+        };
+        // The command's one make watch (rule 75: its clock started here, at the edge), handed to
+        // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
+        let make_watch = crate::run_parent::command_make_watch();
+        let want_workers = if TestHost::THIS.has_sandbox() {
+            usize::try_from(config.plan.width)
+                .unwrap_or(MAX_CODE_WORKERS)
+                .min(self.pending_runs.len())
+                .min(MAX_CODE_WORKERS)
+        } else {
+            0
+        };
+        let status = match CODES {
+            Codes::Pooled if want_workers > 1 && cx.workers() > 1 => {
+                let sync_typed = typed.sync_over(*ids);
+                pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
+                    run_dirty(
+                        &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
+                        tables, watch, make_watch, frame, self.alloc, Some(relay), &mut self.machine, self.pending_runs,
+                        self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
+                    )
+                })
+            }
+            Codes::Serial | Codes::Pooled => {
+                run_dirty(
+                    &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
+                    tables, watch, make_watch, frame, self.alloc, None, &mut self.machine, self.pending_runs,
+                    self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
+                )
+            }
+        }?;
+        self.cache.commit(ids)?;
+        Ok(status)
+    }
+}
+
+/// [`DirtySuites::run`] under `Codes::Pooled` (D194 piece 2): spawns up to `want_workers` code workers
 /// (bounded by available pool threads beside the command thread and [`MAX_CODE_WORKERS`]), runs
 /// `run` over the shared [`CodeRelay`], then closes every lane and joins all workers within
 /// [`END_WAIT`].
@@ -4450,7 +4660,7 @@ fn pooled<'h>(
     cx: &Cx,
     clock: &bstd::clock::Clock,
     rng: &mut bstd::rng::Rng,
-    suites: &[Suite<'_, 'h>],
+    suites: &[Option<Suite<'_, 'h>>],
     typed: crate::engine_body_record::SyncTypedFrom<'h>,
     want_workers: usize,
     root: &Dir<ReadWrite>,
@@ -4467,11 +4677,13 @@ fn pooled<'h>(
         return Err(DriveError::NoCodeWorkers { have });
     };
     let lanes = Lanes::new(most, heap);
-    let mut sides: AVec<'static, SuiteSide<'_>> = Vec::with_capacity_in(suites.len(), heap.alloc());
-    sides.extend(suites.iter().map(|suite| SuiteSide { crates: suite.crates, builder: suite.builder, make_watch }));
+    let mut sides: AVec<'static, Option<SuiteSide<'_>>> = Vec::with_capacity_in(suites.len(), heap.alloc());
+    sides.extend(suites.iter().map(|suite| {
+        suite.as_ref().map(|suite| SuiteSide { crates: suite.crates, builder: suite.builder, make_watch })
+    }));
     let sides = sides.as_slice();
     let side = ProcsSide::of(procs);
-    let children = suites.iter().map(|suite| suite.unit.tests.len()).sum::<usize>();
+    let children = suites.iter().map(|suite| suite.as_ref().map_or(0, |suite| suite.unit.tests.len())).sum::<usize>();
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
     // The scope is linear: nothing returns between it and its join.
     let scope = cx.scope();
@@ -4523,7 +4735,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], bins: &[crate::test_bins::BinSuite<'a, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
+    suites: &[Option<Suite<'_, 'h>>], bins: &[crate::test_bins::BinSuite<'a, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     alloc: Alloc<'a>, relay: Option<&CodeRelay<'_>>, machine: &mut TestLoop<'a, 'r>, pending_runs: AVec<'a, Effect<'a>>,
     steps_left: usize, most: usize, locations: &[Location], cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
@@ -4590,29 +4802,47 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         None
     };
     let mut dirs = Vec::with_capacity_in(suites.len(), frame);
-    for index in 0..suites.len() {
-        let dir = LazySuiteDir::new(&mine, index);
-        let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
-        dirs.push((dir, temp));
+    for (index, suite) in suites.iter().enumerate() {
+        if suite.is_some() {
+            let dir = LazySuiteDir::new(&mine, index);
+            let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
+            dirs.push(Some((dir, temp)));
+        } else {
+            dirs.push(None);
+        }
     }
-    // 3. Lazy per-suite `SuiteCache` shells (`load_verified` deferred until a suite runs a test).
+    // 3. Lazy per-suite `SuiteCache` shells (`load_verified` deferred until a suite runs a test),
+    // allocated ONLY for dirty suites.
     let mut child_base = 0usize;
     let entered_sink: RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>> = RefCell::new(Vec::new_in(alloc));
     let mut suite_caches = Vec::with_capacity_in(suites.len(), alloc);
     for suite in suites {
-        let sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
-        suite_caches.push(RefCell::new(sc));
+        match suite {
+            Some(suite) => {
+                let sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
+                suite_caches.push(Some(RefCell::new(sc)));
+            }
+            None => suite_caches.push(None),
+        }
     }
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
     for (index, (suite, suite_cache)) in suites.iter().zip(suite_caches.iter()).enumerate() {
+        let Some(suite) = suite else {
+            launches.push(None);
+            checks.push(None);
+            continue;
+        };
         let unit = suite.unit;
         let tests = unit.tests;
         let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-        let Some((dir, temp)) = dirs.get(index) else {
+        let Some((dir, temp)) = dirs.get(index).and_then(|entry| entry.as_ref()) else {
             return Err(DriveError::NoSuite { suite: suite_id });
         };
-        launches.push(Launched {
+        let Some(suite_cache) = suite_cache.as_ref() else {
+            return Err(DriveError::NoSuite { suite: suite_id });
+        };
+        launches.push(Some(Launched {
             err, package: unit.package, target: unit.target,
             cx, spawner: &spawner, launcher: launcher.as_str(), store: store.as_str(),
             temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
@@ -4627,9 +4857,9 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             suite_cache,
             bins: bin_server.as_ref(),
             expose_bins: unit.expose_bins,
-        });
+        }));
         child_base += tests.len();
-        checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
+        checks.push(Some(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) }));
     }
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
     let launched = Selected { suites: launches.as_mut_slice(), rows: locations };
@@ -4650,8 +4880,10 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             && !*loaded
         {
             *loaded = true;
-            if let Some(sc) = suite_caches.get(suite_idx) {
-                let _ = active_cache.load_verified(loc.suite, &certificate, sc.borrow_mut().verified_mut());
+            if let Some(Some(sc)) = suite_caches.get(suite_idx) {
+                let mut sc = sc.borrow_mut();
+                let (closed_set, ws_set) = sc.verified_sets_mut();
+                let _ = active_cache.load_verified(loc.suite, closed_set, ws_set);
             }
         }
     };
@@ -4674,7 +4906,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         let row_idx = usize::try_from(*row).map_err(|_| one(OneError::NoRow { row: *row }))?;
         let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: *row }))?;
         let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
-        let unit = suites.get(suite_idx).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
+        let unit = suites.get(suite_idx).and_then(|suite| suite.as_ref()).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
         let tests = unit.tests;
         let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
         let path = record_row(tests, loc_row)?.path;
@@ -4687,7 +4919,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         let row_idx = usize::try_from(turn.row).map_err(|_| one(OneError::NoRow { row: turn.row }))?;
         let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: turn.row }))?;
         let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
-        let unit = suites.get(suite_idx).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
+        let unit = suites.get(suite_idx).and_then(|suite| suite.as_ref()).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
         let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
         let path = record_row(unit.tests, loc_row)?.path;
         err.line(cx, format_args!(
@@ -4713,10 +4945,11 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     }
     let status = status?;
     for (index, sc) in suite_caches.iter().enumerate() {
+        let Some(sc) = sc.as_ref() else { continue };
         let sc = sc.borrow();
         if sc.verified_dirty() {
             let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-            cache.record_verified(suite_id, certificate, sc.verified_pairs());
+            cache.record_verified(suite_id, sc.verified_closed_pairs(), sc.verified_workspace_pairs());
         }
     }
     Ok(status)
@@ -5095,6 +5328,377 @@ mod should_panic_tests {
         let plain2 = blaze_run::child::seatbelt("/h/.blaze/v2/test/tmp/1/0/3", None, alloc);
         if let Ok(base) = plain2 {
             assert!(matches!(with_unwound(base, Some("/h/\"bad/unwound-3")), Err(OneError::Profile { .. })));
+        }
+    }
+}
+
+#[cfg(test)]
+mod zero_spawn_tests {
+    use super::*;
+    use blaze_cas::plain::{Lent, Settings as StoreSettings};
+    use blaze_core::FileName;
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_drive::{Cell as DriveCell, Kind, Name, Tool};
+    use blaze_emit::{Isa, Os};
+    use blaze_id::CrateItemKey;
+    use blaze_ladder::run::OverflowChecks;
+    use blaze_toolchain::ToolchainId;
+
+    use crate::run_ids::{
+        Answer, Asked as IdsAsked, BodyFacts, BodyReads, BodyScratch, ByNeed, Checked, CrateTable, Most, Place, Proof, ProofFold,
+        ReadsFrom, RunIds, RunIdsError, Seen, Today, Unread, WorkspaceBody,
+    };
+    use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx};
+
+    const S0: u8 = 0x41;
+    const S1: u8 = 0x42;
+
+    struct TwoCrates;
+
+    impl CrateTable<'static> for TwoCrates {
+        fn len(&self) -> usize {
+            2
+        }
+        fn key(&self, at: usize) -> CrateItemKey {
+            let b = if at == 0 { S0 } else { S1 };
+            CrateItemKey(ContentId([b; 32]))
+        }
+        fn name(&self, at: usize) -> &'static str {
+            if at == 0 { "suite_a" } else { "suite_b" }
+        }
+        fn place(&self, _at: usize) -> Place {
+            Place::Checkout
+        }
+        fn each_dep(&self, _at: usize, _each: &mut dyn FnMut(usize)) {}
+    }
+
+    struct CleanBody {
+        chk0: Name,
+        key0: ContentId,
+        chk1: Name,
+        key1: ContentId,
+    }
+
+    impl Today for CleanBody {
+        fn out(&self, _name: Name) -> Option<ContentId> {
+            Some(ContentId([0x77; 32]))
+        }
+        fn cell(&self, _name: Name, _cell: DriveCell) -> Option<ContentId> {
+            None
+        }
+    }
+
+    impl Answer for CleanBody {
+        fn open(&mut self, _cx: &Cx, _name: Name, _seen: &mut dyn FnMut(Seen<'_>) -> Result<(), RunIdsError<'static>>) -> Result<bool, RunIdsError<'static>> {
+            Ok(false)
+        }
+        fn skipped(&self, _file: Name) -> bool {
+            false
+        }
+        fn body(&mut self, _cx: &Cx, check: Name, _tool: Tool, known: Option<(ContentId, Name)>, out: &mut BodyScratch<'_>) -> Result<Option<BodyFacts>, RunIdsError<'static>> {
+            out.clear();
+            let Some((text, file)) = known else { return Ok(None) };
+            let key = if check == self.chk0 {
+                self.key0
+            } else if check == self.chk1 {
+                self.key1
+            } else {
+                return Ok(None);
+            };
+            Ok(Some(BodyFacts { key, checked: Checked::Clean, text, file }))
+        }
+    }
+
+    struct StandingProofs;
+
+    impl BodyReads for StandingProofs {
+        fn proof(&self, check: Name, _most: u32) -> Result<Proof, Unread> {
+            let mut fold = ProofFold::new(check);
+            let digest = ContentId([0x33; 32]);
+            fold.read(&[0x12; 32], &digest, &digest);
+            Ok(fold.finish())
+        }
+    }
+
+    fn item_of(byte: u8, low: u64) -> ItemKey {
+        let mut b = [byte; 16];
+        if let Some(tail) = b.get_mut(8..16) {
+            tail.copy_from_slice(&low.to_be_bytes());
+        }
+        ItemKey(u128::from_be_bytes(b))
+    }
+
+    fn test_builder() -> Result<Builder, crate::run_parent::ParentError> {
+        let producer = blaze_ids::producer::Producers::for_tests(b"test_drive zero spawn").get::<blaze_ids::producer::CodeBuilder>();
+        let isa = Isa { os: Os::MacOs, lse: true };
+        crate::run_parent::builder_for("2024", OverflowChecks::On, blaze_ladder::run::Panic::Unwind, producer, isa)
+    }
+
+    fn open_sim_lent(sim: Sim, nonce: u64, alloc: Alloc<'static>) -> Option<Lent<Sim, StoreAlloc>> {
+        let name = FileName::new("store")?;
+        let cfg = config(name, &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+        open(sim, cfg, alloc).ok()
+    }
+
+    fn build_ids<'a>(
+        cx: &Cx,
+        tools: &[Tool; blaze_drive::key::KINDS],
+        chk0: Name,
+        key0: ContentId,
+        chk1: Name,
+        key1: ContentId,
+        proofs: &'a StandingProofs,
+        asked: &'a IdsAsked,
+        bump: blaze_own::Bump<'a>,
+    ) -> Option<RunIds<'a>> {
+        let file0 = Name::file(b"a/src/lib.rs");
+        let file1 = Name::file(b"b/src/lib.rs");
+        let bodies = [
+            WorkspaceBody { item: item_of(S0, 1), check: chk0, text: key0, file: file0 },
+            WorkspaceBody { item: item_of(S1, 1), check: chk1, text: key1, file: file1 },
+        ];
+        let mut ans = CleanBody { chk0, key0, chk1, key1 };
+        let ids = RunIds::new(cx, ToolchainId(blaze_toolchain::PINNED.0), &TwoCrates, tools, &bodies, &[], &mut ans, None, Most::USUAL, bump).ok()?;
+        ids.reading::<ByNeed>(ReadsFrom::new(proofs, asked, Most::USUAL)).ok()
+    }
+
+    struct NoRefusal;
+
+    impl Refuse for NoRefusal {
+        fn refusal(&mut self, _row: u32) -> Result<Option<&str>, OneError> {
+            Ok(None)
+        }
+    }
+
+    fn instance_name_bytes(item: ItemKey) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        if let Some(head) = out.get_mut(..16) {
+            head.copy_from_slice(&item.0.to_le_bytes());
+        }
+        out
+    }
+
+    struct CountingPureRun<'s, 'a> {
+        spawns: Cell<u32>,
+        syms: [FnName; 2],
+        items: [ItemKey; 2],
+        keys: [[u8; 32]; 2],
+        entered_sink: &'s RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
+        alloc: Alloc<'a>,
+    }
+
+    impl RunOne for CountingPureRun<'_, '_> {
+        async fn run(&self, row: u32, _budget: Nanos, _output: &mut Output<'_>, _signals: &Signals) -> Result<RunOutcome, OneError> {
+            self.spawns.set(self.spawns.get().saturating_add(1));
+            let idx = usize::try_from(row).unwrap_or(0);
+            let sym = self.syms.get(idx).copied().unwrap_or(FnName([0; 32]));
+            let tabled = self.items.get(idx).copied().unwrap_or(ItemKey(0));
+            let code_key = self.keys.get(idx).copied().unwrap_or([0; 32]);
+            let suite = SuiteId(row);
+            let mut name = Vec::with_capacity_in(20, self.alloc);
+            name.extend_from_slice(&instance_name_bytes(tabled));
+            self.entered_sink.borrow_mut().push((
+                suite,
+                crate::test_cache::EnteredFn {
+                    symbol: sym,
+                    code_key,
+                    tabled,
+                    name,
+                },
+            ));
+            let heap = blaze_own::testing::heap().alloc();
+            let mut entered = Vec::new_in(heap);
+            entered.push(sym);
+            Ok(RunOutcome {
+                how: How::Reported(Said::Returned),
+                keep: Ok(()),
+                panic_text: String::new_in(heap),
+                entered,
+            })
+        }
+    }
+
+    /// Verifies the zero-spawn `TestCache` fast path end-to-end:
+    /// 1. Cold run returns `PreparedSuites::Dirty` with both suites dirty; driving it runs both
+    ///    tests and persists `SuiteState` + `BZTH` + `BZPS` + `BZTR` into simulated CAS.
+    /// 2. Repeat run where all targeted tests hit `TestCache` returns `PreparedSuites::Done`
+    ///    directly with ZERO worker/process spawns and ZERO suite materializations, printing the
+    ///    exact `test result: ok. ran 0:` / `2 reused from kept results` summary.
+    /// 3. Partial edit moving only suite 0's body key returns `PreparedSuites::Dirty` with
+    ///    `is_suite_dirty(0) == true` and `is_suite_dirty(1) == false` (`pending_count() == 1`),
+    ///    so unchanged suite 1 skips all native-image / names-record setup.
+    #[test]
+    fn all_cached_tests_hit_zero_spawn_fast_path_and_partial_edit_dirties_only_changed_suite() {
+        let heap = blaze_own::testing::heap().alloc();
+        let cx = test_cx();
+        let Ok(builder) = test_builder() else { panic!("builder_for must succeed") };
+        let tools: [Tool; blaze_drive::key::KINDS] = core::array::from_fn(|at| Tool(ContentId([u8::try_from(at).unwrap_or(u8::MAX); 32])));
+        let tools_digest = crate::test_cache::tools_digest(&tools);
+        let chk0 = Name::new(Kind::BodyCheck, ContentId([0x61; 32]));
+        let chk1 = Name::new(Kind::BodyCheck, ContentId([0x62; 32]));
+        let item0 = item_of(S0, 1);
+        let item1 = item_of(S1, 1);
+        let sym0 = FnName([0x91; 32]);
+        let sym1 = FnName([0x92; 32]);
+
+        let unit0 = TestUnit {
+            at: 0,
+            key: CrateItemKey(ContentId([S0; 32])),
+            package: "pkg_a",
+            target: "a",
+            tests: TestRows::Main(LibKey(ContentId([0x81; 32]))),
+            edition: blaze_surface::Edition::E2024,
+            expose_bins: false,
+        };
+        let unit1 = TestUnit {
+            at: 1,
+            key: CrateItemKey(ContentId([S1; 32])),
+            package: "pkg_b",
+            target: "b",
+            tests: TestRows::Main(LibKey(ContentId([0x82; 32]))),
+            edition: blaze_surface::Edition::E2024,
+            expose_bins: false,
+        };
+        let make_specs = |ids: &RunIds<'_>| {
+            [
+                SuiteSpec { unit: unit0, builder, digests: crate::test_cache::test_suite_digests(unit0.key, &builder, ids, tools_digest) },
+                SuiteSpec { unit: unit1, builder, digests: crate::test_cache::test_suite_digests(unit1.key, &builder, ids, tools_digest) },
+            ]
+        };
+        let make_config = |root_byte: u8| LoopConfig {
+            plan: blaze_run::plan::Config {
+                width: 2,
+                deadline: Nanos(10_000_000_000),
+                run_all: false,
+                ignored: blaze_run::plan::Ignored::Skip,
+                benches: false,
+                filter: blaze_run::plan::Filter::All,
+                skip: &[],
+            },
+            style: blaze_run::report::Style::text(80, false),
+            list: false,
+            run: blaze_run::CheckoutKey([root_byte; 32]),
+            suites: 2,
+        };
+
+        let proofs = StandingProofs;
+        let asked1 = IdsAsked::default();
+        let Some(ids1) = build_ids(&cx, &tools, chk0, ContentId([0x11; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked1, blaze_own::testing::bump()) else { panic!("ids1") };
+        let specs1 = make_specs(&ids1);
+        let name0 = instance_name_bytes(item0);
+        let name1 = instance_name_bytes(item1);
+        let Some(code_key0) = blaze_ladder::body_ids::instance_key(blaze_code::record::Symbol(sym0.0), item0, &name0, &ids1, &builder, &builder.producer, heap).map(|k| k.0.0) else { panic!("instance_key 0") };
+        let Some(code_key1) = blaze_ladder::body_ids::instance_key(blaze_code::record::Symbol(sym1.0), item1, &name1, &ids1, &builder, &builder.producer, heap).map(|k| k.0.0) else { panic!("instance_key 1") };
+
+        let cert1 = crate::start_list::Certificate::for_tests([0xaa; 32]);
+        let Some(lent1) = open_sim_lent(Sim::new(11, Faults::default()), 1, heap) else { panic!("open sim lent 1") };
+
+        // 1. Cold run: both suites are dirty, execute both via mock `RunOne` (no OS spawns), commit cache.
+        let tick = Cell::new(0u64);
+        let clock = || {
+            let next = tick.get().saturating_add(1_000);
+            tick.set(next);
+            Nanos(next)
+        };
+        {
+            let mut cold_out = String::new_in(heap);
+            let mut cold_print = |bytes: &[u8]| -> Result<(), DriveError> {
+                if let Ok(text) = core::str::from_utf8(bytes) {
+                    cold_out.push_str(text);
+                }
+                Ok(())
+            };
+            let cfg1 = make_config(0xaa);
+            let prepared1 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, cfg1, &[], &lent1, &clock, &mut cold_print, blaze_own::testing::bump());
+            let Ok(PreparedSuites::Dirty(mut dirty1)) = prepared1 else { panic!("cold run must be Dirty") };
+            assert!(dirty1.is_suite_dirty(0) && dirty1.is_suite_dirty(1), "both suites dirty on cold run");
+            assert_eq!(dirty1.pending_count(), 2);
+
+            let entered_sink: RefCell<AVec<'_, (SuiteId, crate::test_cache::EnteredFn<'_>)>> = RefCell::new(Vec::new_in(dirty1.alloc));
+            {
+                let mock_runs = CountingPureRun {
+                    spawns: Cell::new(0),
+                    syms: [sym0, sym1],
+                    items: [item0, item1],
+                    keys: [code_key0, code_key1],
+                    entered_sink: &entered_sink,
+                    alloc: dirty1.alloc,
+                };
+                let signals = Signals::default();
+                let Ok(pool) = OneEach::new(&mock_runs, &signals, &clock, dirty1.alloc, heap) else { panic!("OneEach") };
+                let mut runner = Runner::new(pool, &cfg1.plan, TestHost::Macos, dirty1.alloc);
+                let mut refuse = NoRefusal;
+                let mut on_run = |_row: u32, _cache: &mut crate::test_cache::TestCache<'_, '_, Sim>| {};
+                let cold_status = drive_pending(
+                    &mut dirty1.machine,
+                    dirty1.pending_runs,
+                    dirty1.steps_left,
+                    dirty1.most,
+                    &mut runner,
+                    &mut refuse,
+                    &mut dirty1.cache,
+                    &entered_sink,
+                    &mut on_run,
+                    &mut cold_print,
+                    dirty1.alloc,
+                );
+                assert!(cold_status.is_ok(), "cold drive failed: {cold_status:?}");
+                if let Ok(status) = cold_status {
+                    assert_eq!((status.passed, status.failed), (2, 0), "{cold_out}");
+                }
+                assert_eq!(mock_runs.spawns.get(), 2, "cold run executes both tests");
+            }
+            assert!(dirty1.cache.commit(&ids1).is_ok(), "cache commit");
+        }
+        assert!(after_answer(&cx, &lent1, 0).is_ok(), "commit lent1");
+
+        // 2. Repeat run after restart: all tests hit `TestCache` -> `PreparedSuites::Done` with
+        // ZERO spawns, ZERO suite materialization, exact output line & exit status.
+        let Some(lent2) = open_sim_lent(lent1.into_store().into_driver(), 2, heap) else { panic!("reopen sim lent 2") };
+        let mut warm_out = String::new_in(heap);
+        let mut warm_print = |bytes: &[u8]| -> Result<(), DriveError> {
+            if let Ok(text) = core::str::from_utf8(bytes) {
+                warm_out.push_str(text);
+            }
+            Ok(())
+        };
+        let prepared2 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, make_config(0xaa), &[], &lent2, &clock, &mut warm_print, blaze_own::testing::bump());
+        match prepared2 {
+            Ok(PreparedSuites::Done(status)) => {
+                assert_eq!(status, Status { passed: 2, failed: 0, ignored: 0, not_run: 0, check_errors: 0 });
+                assert!(warm_out.contains("test result: ok. ran 0:"), "missing ran 0 summary: {warm_out}");
+                assert!(warm_out.contains("2 reused from kept results"), "missing reused count: {warm_out}");
+            }
+            Ok(PreparedSuites::Dirty(_)) => panic!("all-cached run must return PreparedSuites::Done without spawning workers"),
+            Err(err) => panic!("warm prepare failed: {err}"),
+        }
+
+        // 3. Partial edit: only suite 0's body key moves (`0x11` -> `0x99`); suite 1 stays identical.
+        let asked2 = IdsAsked::default();
+        let Some(ids2) = build_ids(&cx, &tools, chk0, ContentId([0x99; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked2, blaze_own::testing::bump()) else { panic!("ids2") };
+        let specs2 = make_specs(&ids2);
+        let cert2 = crate::start_list::Certificate::for_tests([0xbb; 32]);
+        let mut partial_out = String::new_in(heap);
+        let mut partial_print = |bytes: &[u8]| -> Result<(), DriveError> {
+            if let Ok(text) = core::str::from_utf8(bytes) {
+                partial_out.push_str(text);
+            }
+            Ok(())
+        };
+        let prepared3 = prepare_suites_with(&specs2, &ids2, &cert2, tools_digest, make_config(0xbb), &[], &lent2, &clock, &mut partial_print, blaze_own::testing::bump());
+        match prepared3 {
+            Ok(PreparedSuites::Dirty(dirty3)) => {
+                assert!(dirty3.is_suite_dirty(0), "changed suite 0 must be dirty");
+                assert!(!dirty3.is_suite_dirty(1), "unchanged suite 1 must NOT be dirty (zero setup)");
+                assert_eq!(dirty3.pending_count(), 1, "only 1 dirty test queued");
+                assert_eq!(
+                    asked2.bodies(),
+                    1,
+                    "untouched suite 1 must hit per-suite SuiteCert in O(1) without opening its BodyCheck proof",
+                );
+            }
+            Ok(PreparedSuites::Done(status)) => panic!("edited suite 0 must not be Done: {status:?}"),
+            Err(err) => panic!("partial prepare failed: {err}"),
         }
     }
 }

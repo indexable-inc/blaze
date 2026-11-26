@@ -563,13 +563,25 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 return Err(Refused::Form { what: "the callee of a call with a legacy const generic argument", range });
             }
         };
-        let Some(positions) = self.legacy.legacy_positions(checker_of(callee)) else {
+        let callee_key = checker_of(callee);
+        if callee_key != self.owner {
+            // `#[rustc_legacy_const_generics(..)]` lives in `FnHead::legacy_const_generics`
+            // (head_record v6): record the callee's `Head` cell so adding, removing, or editing
+            // the attribute invalidates this caller while body-only edits to `callee` never do
+            // (rule 21, rule 77).
+            self.builder.resolver.names.impls_read(super::tables::recorder::TableRead::Head {
+                item: callee_key.0.to_be_bytes(),
+                part: 0,
+            });
+        }
+        let Some(positions) = self.legacy.legacy_positions(callee_key) else {
             // The head is not made. Making it costs this body a whole conversion round (and
-            // the seeded path cannot add one), so it is asked for only when the callee's text
-            // writes the attribute at all: a fn whose text does not has no listed position,
-            // and its argument is an ordinary value. The text only filters; the positions are
-            // read from the head once it is made.
-            let written = self.builder.resolver.names.text_of(callee).is_some_and(|t| t.text.contains("rustc_legacy_const_generics"));
+            // the seeded path cannot add one), so it is asked for only when the callee's outer
+            // attributes write the attribute at all: a fn whose outer attributes do not has no
+            // listed position, and its argument is an ordinary value. Reading through
+            // `seeded_text_of` avoids recording a coarse `TableRead::Text` on `callee`; the
+            // `Head` cell recorded above covers any attribute/signature edit on `callee`.
+            let written = self.builder.resolver.names.seeded_text_of(callee).is_some_and(|t| has_legacy_const_attr_in_prefix(t.text));
             if !written {
                 return Ok(None);
             }
@@ -1857,6 +1869,299 @@ fn note_body_record_field_names(view: &View<'_>, maps: &super::heads::Maps) {
             if !text.is_empty() {
                 maps.note_record_field_name(Name(hash), text);
             }
+        }
+    }
+}
+
+/// Whether `text` (a free fn item's source) may carry `#[rustc_legacy_const_generics(..)]` in
+/// its outer attribute prefix. Scans only leading whitespace, comments, and `#[...]` outer
+/// attributes before the `fn` signature (never scanning the function body), returning `true`
+/// conservatively on any malformed or unclosed comment, literal, or attribute so `FnHead`
+/// remains the single source of truth.
+fn has_legacy_const_attr_in_prefix(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        let Some(&b) = bytes.get(i) else { break };
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Line comment `//...\n` (including `///` doc comments).
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while let Some(&c) = bytes.get(i) {
+                i += 1;
+                if c == b'\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Nested block comment `/* ... */`.
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            let mut nest = 1u32;
+            while i < len && nest > 0 {
+                if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+                    nest = nest.saturating_add(1);
+                    i += 2;
+                } else if bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/') {
+                    nest -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if nest != 0 {
+                return true;
+            }
+            continue;
+        }
+        // Outer attribute `#[...]`: scan balanced brackets, respecting comments and literals.
+        if b == b'#' && bytes.get(i + 1) == Some(&b'[') {
+            let attr_start = i;
+            i += 2;
+            let mut depth = 1u32;
+            while i < len && depth > 0 {
+                let Some(&c) = bytes.get(i) else { break };
+                match c {
+                    b'[' => {
+                        depth = depth.saturating_add(1);
+                        i += 1;
+                    }
+                    b']' => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                        i += 2;
+                        while let Some(&ch) = bytes.get(i) {
+                            i += 1;
+                            if ch == b'\n' {
+                                break;
+                            }
+                        }
+                    }
+                    b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                        i += 2;
+                        let mut nest = 1u32;
+                        while i < len && nest > 0 {
+                            if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+                                nest = nest.saturating_add(1);
+                                i += 2;
+                            } else if bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/') {
+                                nest -= 1;
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if nest != 0 {
+                            return true;
+                        }
+                    }
+                    b'"' => {
+                        i += 1;
+                        let mut closed = false;
+                        while let Some(&ch) = bytes.get(i) {
+                            i += 1;
+                            if ch == b'\\' {
+                                if i < len {
+                                    i += 1;
+                                }
+                            } else if ch == b'"' {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        if !closed {
+                            return true;
+                        }
+                    }
+                    b'r' if is_raw_string_prefix(bytes, i) => {
+                        let mut j = i + 1;
+                        let mut hashes = 0usize;
+                        while bytes.get(j) == Some(&b'#') {
+                            hashes += 1;
+                            j += 1;
+                        }
+                        if bytes.get(j) == Some(&b'"') {
+                            j += 1;
+                            let mut closed = false;
+                            while j < len {
+                                if bytes.get(j) == Some(&b'"') {
+                                    let mut k = j + 1;
+                                    let mut matched = 0usize;
+                                    while matched < hashes && bytes.get(k) == Some(&b'#') {
+                                        matched += 1;
+                                        k += 1;
+                                    }
+                                    if matched == hashes {
+                                        j = k;
+                                        closed = true;
+                                        break;
+                                    }
+                                }
+                                j += 1;
+                            }
+                            if !closed {
+                                return true;
+                            }
+                            i = j;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    b'\'' => {
+                        if bytes.get(i + 1) == Some(&b'\\') {
+                            // Escaped char literal like `'\''` or `'\u{10ffff}'`.
+                            i += 2;
+                            if i < len {
+                                i += 1;
+                            }
+                            let mut steps = 0usize;
+                            while let Some(&ch) = bytes.get(i) {
+                                i += 1;
+                                steps += 1;
+                                if ch == b'\'' || steps >= 16 {
+                                    break;
+                                }
+                            }
+                        } else if bytes.get(i + 2) == Some(&b'\'') {
+                            // Single ASCII byte char literal like `']'` or `'"'`.
+                            i += 3;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            if depth != 0 {
+                return true;
+            }
+            if text.get(attr_start..i).is_none_or(|attr| attr.contains("rustc_legacy_const_generics")) {
+                return true;
+            }
+            continue;
+        }
+        // First non-whitespace, non-comment, non-outer-attribute token (`pub`, `fn`, `async`, ...).
+        return false;
+    }
+    false
+}
+
+/// Whether `bytes[at]` (`b'r'`) may start a Rust raw string (`r"..."`, `br#"..."#`, `cr#"..."#`),
+/// as opposed to an identifier ending in `r`.
+fn is_raw_string_prefix(bytes: &[u8], at: usize) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let Some(prev_idx) = at.checked_sub(1) else { return true };
+    let Some(&prev) = bytes.get(prev_idx) else { return true };
+    if !is_ident(prev) {
+        return true;
+    }
+    if matches!(prev, b'b' | b'c') {
+        return prev_idx.checked_sub(1).and_then(|p| bytes.get(p)).is_none_or(|&b| !is_ident(b));
+    }
+    false
+}
+
+#[cfg(test)]
+mod legacy_const_read_tests {
+    use blaze_lower::scoped::Prepares;
+
+    use super::{has_legacy_const_attr_in_prefix, lower_fn};
+    use crate::front2::heads::Store;
+    use crate::front2::keys::{Keys, checker_of};
+    use crate::front2::source::NamesSource;
+    use crate::front2::tables::head_tests::{a, world_of};
+    use crate::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
+    use crate::front2::tables::view::{Tables, TablesOpts};
+
+    #[test]
+    fn prefix_scan_skips_body_and_finds_outer_attributes() {
+        assert!(!has_legacy_const_attr_in_prefix("pub fn plain(x: u32) -> u32 { /* rustc_legacy_const_generics */ x }"));
+        assert!(!has_legacy_const_attr_in_prefix("/// mentions rustc_legacy_const_generics\n#[inline]\npub fn plain(x: u32) -> u32 { let _ = \"rustc_legacy_const_generics\"; x }"));
+        assert!(!has_legacy_const_attr_in_prefix("/* /* nested rustc_legacy_const_generics */ */\n#[allow(clippy::all)]\nfn f() {}"));
+        assert!(!has_legacy_const_attr_in_prefix("#[foo(r#type)]\nfn f() { \"rustc_legacy_const_generics\"; }"));
+
+        assert!(has_legacy_const_attr_in_prefix("#[rustc_legacy_const_generics(1)]\npub fn f<const N: u32>(v: u32) -> u32 { v }"));
+        assert!(has_legacy_const_attr_in_prefix("/// doc\n#[inline]\n#[cfg_attr(all(), rustc_legacy_const_generics(1))]\npub unsafe fn f<const N: u32>(v: u32) -> u32 { v }"));
+        assert!(has_legacy_const_attr_in_prefix("#[doc = \"]\"]\n#[doc = r#\"]\"#]\n#[doc = \"a\\\"b]\"]\n#[foo(']')]\n#[rustc_legacy_const_generics(0)]\nfn f() {}"));
+    }
+
+    #[test]
+    fn legacy_const_probe_records_head_not_coarse_text() {
+        let src = "\
+#![no_std]
+#![feature(rustc_attrs)]
+pub fn plain_callee(x: u32) -> u32 { x + 1 }
+#[rustc_legacy_const_generics(1)]
+pub fn legacy_callee<const N: u32>(v: u32) -> u32 { v >> N }
+pub fn caller_plain(a: u32) -> u32 { plain_callee(a + 1) }
+pub fn caller_legacy(a: u32) -> u32 { legacy_callee(a, { 8 }) }
+";
+        let (records, sized, frame) = world_of(src);
+        let find_fn = |want: &str| {
+            let mut found = None;
+            NamesSource::each_item(records, 0, &mut |key, _| {
+                if NamesSource::name_of(records, key) == Some(want) {
+                    found = Some(key);
+                }
+            });
+            found.unwrap_or_else(|| panic!("missing fixture fn `{want}`"))
+        };
+        let plain_callee = find_fn("plain_callee");
+        let legacy_callee = find_fn("legacy_callee");
+        let caller_plain = find_fn("caller_plain");
+        let caller_legacy = find_fn("caller_legacy");
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        let prepared = Prepares::new_in(bump);
+
+        // Normal call with expression argument: must record `Head`, never coarse `Text`, on callee.
+        {
+            let rec = Recorder::new(RecorderOpts { alloc: a() });
+            let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[1], reads: &rec });
+            let mut keys = Keys::new_in(a());
+            let mut store = Store::new(sized, frame, a());
+            let body = lower_fn(tables, &prepared, &mut keys, &mut store, caller_plain).expect("lower caller_plain");
+            assert!(body.typeck.legacy_args.is_empty());
+            let reads = rec.keys().expect("recorded reads");
+            assert!(
+                !reads.contains(&TableRead::Text { key: plain_callee }),
+                "normal call must not record coarse TableRead::Text on callee: {:?}",
+                &*reads
+            );
+            assert!(
+                reads.contains(&TableRead::Head { item: checker_of(plain_callee).0.to_be_bytes(), part: 0 }),
+                "legacy const probe must record TableRead::Head on callee: {:?}",
+                &*reads
+            );
+        }
+
+        // Legacy const generic call: lowers the legacy arg and still records no `TableRead::Text` on callee.
+        {
+            let rec = Recorder::new(RecorderOpts { alloc: a() });
+            let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[1], reads: &rec });
+            let mut keys = Keys::new_in(a());
+            let mut store = Store::new(sized, frame, a());
+            let body = lower_fn(tables, &prepared, &mut keys, &mut store, caller_legacy).expect("lower caller_legacy");
+            assert_eq!(body.typeck.legacy_args.len(), 1, "expected 1 lowered legacy const arg");
+            let reads = rec.keys().expect("recorded reads");
+            assert!(
+                !reads.contains(&TableRead::Text { key: legacy_callee }),
+                "legacy const call must not record coarse TableRead::Text on callee: {:?}",
+                &*reads
+            );
+            assert!(
+                reads.contains(&TableRead::Head { item: checker_of(legacy_callee).0.to_be_bytes(), part: 0 }),
+                "legacy const call must record TableRead::Head on callee: {:?}",
+                &*reads
+            );
         }
     }
 }

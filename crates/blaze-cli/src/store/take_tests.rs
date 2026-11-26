@@ -151,9 +151,10 @@ fn a_fresh_home_takes_the_set_whole_once_and_its_next_command_asks_nothing() {
         assert!(!rooted(&lent), "a fresh home holds the toolchain's root");
         let taken = world.take(&cx, &lent, TakePlant::NONE).expect("B takes the set");
         std::eprintln!("blaze: {taken}");
-        assert_eq!((taken.how, taken.records, taken.already, taken.bytes, taken.generation, taken.head_reads), (How::Took, N, 0, total, 1, 1));
-        // The head, the prefix, then each segment whole in one read (each under 8 MiB).
-        assert_eq!(taken.reads as usize, 2 + segments, "reads of the origin");
+        assert_eq!((taken.how, taken.records, taken.already, taken.bytes, taken.generation, taken.head_reads), (How::Took, N, 0, total, 1, 0));
+        // Fresh home fetches the prefix directly in 1 RTT (its leading HEAD_LEN bytes hold the
+        // head), then each segment whole in one read (each under 8 MiB).
+        assert_eq!(taken.reads as usize, 1 + segments, "reads of the origin");
         let line = taken.to_string();
         assert!(line.starts_with("published: set "), "{line}");
         assert!(line.contains(&format!(" generation 1: {N} records, {total} bytes taken in ")), "{line}");
