@@ -881,6 +881,10 @@ pub struct AdtRow {
     pub field_regions: super::borrows::AdtFieldRegions,
     pub variants: blaze_own::Vec<tc::Variant, Alloc<'static>>,
     pub fields: blaze_own::Vec<tc::Field, Alloc<'static>>,
+    /// Per-field visibility (`MemberVis`), parallel to `fields` (enums: `MemberVis::Public`),
+    /// read by `World::member_visible` during field-access autoderef so private fields of a
+    /// wrapper type (e.g. `ManuallyDrop::value`) do not shadow the deref target's fields.
+    pub field_vis: blaze_own::Vec<MemberVis, Alloc<'static>>,
     /// Its `#[repr(..)]`: what layout reads.
     pub repr: blaze_build::layout::ReprAttrs,
     /// Its `#[rustc_layout_scalar_valid_range_start(s)]` and `..._end(e)`, as written (each
@@ -5522,6 +5526,7 @@ impl<'n> Store<'n> {
         }
         let mut variants = blaze_own::Vec::new_in(alloc);
         let mut fields = blaze_own::Vec::new_in(alloc);
+        let mut field_vis = blaze_own::Vec::new_in(alloc);
         // Each field's default (RFC 3681), one per field, and the text of each written one:
         // filed as an anonymous constant's head below, once the ADT's clauses are made.
         let mut defaults: blaze_own::Vec<Option<ItemKey>, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
@@ -5539,6 +5544,7 @@ impl<'n> Store<'n> {
                     None => Name::of_index(j as u32),
                 };
                 fields.push(tc::Field { name: fname, ty });
+                field_vis.push(if kind == tc::AdtKind::Enum { MemberVis::Public } else { MemberVis::of_in(v, f.vis)? });
                 let Some(c) = f.default else {
                     defaults.push(None);
                     continue;
@@ -5715,7 +5721,7 @@ impl<'n> Store<'n> {
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
         self.auto_copy_pub.insert(ck, auto_copy);
-        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, valid, discrs, args, marks: coherence, lifetimes, field_regions });
+        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, marks: coherence, lifetimes, field_regions });
         self.adt_life_from_view(names, keys, key, module, v);
         Ok(())
     }
