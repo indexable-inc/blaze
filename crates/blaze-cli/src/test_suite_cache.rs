@@ -38,7 +38,7 @@ use blaze_ladder::run::special::{MakerKind, MakerStart, Roots, StartHead};
 use blaze_ladder::run::RunError as LadderRunError;
 use blaze_launch::wire::RecordId;
 use blaze_launch::wire::data::Datum;
-use blaze_launch::wire::run::Symbol;
+use blaze_launch::wire::run::{BYTES_PART_MOST, Symbol};
 use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
 use blaze_run::plan::NotKept;
 use blaze_run::postings::FnName;
@@ -1093,7 +1093,8 @@ impl<'h> SuiteCache<'h> {
     }
 
     /// Bounded variant of [`Self::prepublish_warm`] that stops before `out.len()` exceeds
-    /// `max_out_len`, advancing `child.warm_cursor` only through entries actually processed so any
+    /// `max_out_len`, preflighting every byte of the complete unsent publication (function bytes,
+    /// all unsent transitive static datums, and wire framing) without mutating `child` so any
     /// remaining warm functions are published in later turns or served on demand (rule 18).
     #[expect(clippy::too_many_arguments, reason = "pre-publishes cached suite entries into one impure child's wire buffer under a byte cap")]
     pub(crate) fn prepublish_warm_bounded<A: Allocator>(
@@ -1131,11 +1132,15 @@ impl<'h> SuiteCache<'h> {
             if entry.lands && head.personality.is_none() {
                 continue;
             }
-            // Preflight byte budget BEFORE calling `gather_for_child` so we never mutate
-            // `child.sent_records` or `child.told` for a deferred entry.
-            if published > 0 && out.len().saturating_add(entry.bytes.len()) >= max_out_len {
-                next_cursor -= 1;
-                break;
+            // Preflight EVERY byte the complete unsent publication (function inline bytes, all
+            // unsent transitive static datums, and wire framing) would append BEFORE mutating
+            // `child.sent_records` or `child.told`, including on the very first warm entry.
+            if max_out_len < usize::MAX {
+                let needed = preflight_entry_wire_bytes(entry, &self.datums, child, scratch_alloc);
+                if out.len().saturating_add(needed) > max_out_len {
+                    next_cursor -= 1;
+                    break;
+                }
             }
             let mut any_unkeyed = false;
             let mut datums_purity = Ok(());
@@ -1425,5 +1430,195 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
 
     fn watch(&self) -> &dyn Watch {
         self.watch
+    }
+}
+
+/// Computes a strict upper bound on the wire bytes `Needs::publish_precomputed` will append for
+/// `entry` — covering the function's inline bytes, every unsent transitive static/vtable datum's
+/// inline bytes (including `BYTES_PART_MOST` chunk headers), `Down::Declare`, `Down::Data`,
+/// `Down::ThreadLocals`, and `Down::Publish`/`Down::Positioned` — WITHOUT mutating `child`.
+fn preflight_entry_wire_bytes(
+    entry: &CachedPub,
+    datums: &Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>>,
+    child: &ChildSent<'_>,
+    scratch_alloc: Alloc<'_>,
+) -> usize {
+    const FRAME_OVERHEAD: usize = 96;
+    const BYTES_PART_OVERHEAD: usize = 192;
+    const DECLARE_PAIR_BYTES: usize = 64;
+    const DATA_ITEM_BYTES: usize = 96;
+    const TLS_FRAME_BYTES: usize = 256;
+    const PUBLISH_BASE_BYTES: usize = 224;
+
+    let part_limit = usize::try_from(BYTES_PART_MOST).unwrap_or(4 << 20);
+    let inline_bytes_cost = |len: usize| -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let parts = len.div_ceil(part_limit);
+        len.saturating_add(parts.saturating_mul(BYTES_PART_OVERHEAD))
+    };
+
+    let mut seen_told: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
+        Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: scratch_alloc, capacity: None });
+    let mut seen_records: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
+        Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: scratch_alloc, capacity: None });
+    let mut work_named: AVec<'_, Symbol> = Vec::with_capacity_in(entry.named.len(), scratch_alloc);
+    work_named.extend_from_slice(entry.named.as_slice());
+
+    let mut total = 0usize;
+    if !child.sent_records.contains(&entry.record.0) && seen_records.insert(entry.record.0) {
+        total = total.saturating_add(inline_bytes_cost(entry.bytes.len()));
+    }
+
+    let mut declares_count = 1usize.saturating_add(entry.declares.len());
+    let mut data_count = 0usize;
+    let mut touches_tls = false;
+    let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
+    let mut idx = 0usize;
+    while let Some(&static_sym) = work_named.get(idx) {
+        idx += 1;
+        if static_sym.0 == descriptor {
+            touches_tls = true;
+            continue;
+        }
+        if child.told.contains(&static_sym.0) || !seen_told.insert(static_sym.0) {
+            continue;
+        }
+        let Some(datum) = datums.get(&static_sym.0) else {
+            continue;
+        };
+        data_count = data_count.saturating_add(1);
+        declares_count = declares_count.saturating_add(datum.declares.len());
+        if !child.sent_records.contains(&datum.record.0) && seen_records.insert(datum.record.0) {
+            total = total.saturating_add(inline_bytes_cost(datum.bytes.len()));
+        }
+        work_named.extend_from_slice(datum.named.as_slice());
+    }
+
+    total = total.saturating_add(FRAME_OVERHEAD.saturating_add(declares_count.saturating_mul(DECLARE_PAIR_BYTES)));
+    if data_count > 0 {
+        total = total.saturating_add(FRAME_OVERHEAD.saturating_add(data_count.saturating_mul(DATA_ITEM_BYTES)));
+    }
+    if touches_tls {
+        total = total.saturating_add(TLS_FRAME_BYTES);
+    }
+    total = total.saturating_add(PUBLISH_BASE_BYTES.saturating_add(entry.values.len()));
+    total
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use crate::run_parent::wire_out;
+
+    #[test]
+    fn preflight_accounts_for_transitive_datums_and_framing_without_mutating_child() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let fn_sym = Symbol([0x10; 32]);
+        let fn_rec = RecordId([0x11; 32]);
+        let d1_sym = Symbol([0x20; 32]);
+        let d1_rec = RecordId([0x21; 32]);
+        let d2_sym = Symbol([0x30; 32]);
+        let d2_rec = RecordId([0x31; 32]);
+
+        let mut fn_bytes = Vec::with_capacity_in(512, alloc);
+        fn_bytes.resize(512, 0xAA);
+        let mut d1_bytes = Vec::with_capacity_in(256 * 1024, alloc);
+        d1_bytes.resize(256 * 1024, 0xBB);
+        // Second transitive datum spans two `BYTES_PART_MOST` (4 MiB) wire chunks.
+        let mut d2_bytes = Vec::with_capacity_in((4 << 20) + 128 * 1024, alloc);
+        d2_bytes.resize((4 << 20) + 128 * 1024, 0xCC);
+
+        let mut d1_named = Vec::new_in(alloc);
+        d1_named.push(d2_sym);
+        let mut datums: Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>> =
+            Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None });
+        datums.insert(
+            d1_sym.0,
+            CachedDatum {
+                record: d1_rec,
+                bytes: d1_bytes,
+                declares: Vec::new_in(alloc),
+                named: d1_named,
+                entered: None,
+                unkeyed: false,
+                purity: Ok(()),
+            },
+        );
+        datums.insert(
+            d2_sym.0,
+            CachedDatum {
+                record: d2_rec,
+                bytes: d2_bytes,
+                declares: Vec::new_in(alloc),
+                named: Vec::new_in(alloc),
+                entered: None,
+                unkeyed: false,
+                purity: Ok(()),
+            },
+        );
+
+        let mut fn_named = Vec::new_in(alloc);
+        fn_named.push(d1_sym);
+        let mut fn_declares = Vec::new_in(alloc);
+        fn_declares.push(Symbol([0x40; 32]));
+        let entry = CachedPub {
+            key: CodeKey(blaze_ids::ContentId([0x01; 32])),
+            record: fn_rec,
+            bytes: fn_bytes,
+            declares: fn_declares,
+            named: fn_named,
+            values: Vec::new_in(alloc),
+            lands: false,
+            purity: Ok(()),
+            entered: None,
+            unkeyed: false,
+            tabled: None,
+        };
+
+        let child = ChildSent::new(alloc);
+        let estimated = preflight_entry_wire_bytes(&entry, &datums, &child, alloc);
+        // Must NOT mutate `child` and MUST account for both transitive datums (> 4.3 MiB),
+        // not just the 512-byte function record.
+        assert!(child.told.is_empty());
+        assert!(child.sent_records.is_empty());
+        assert!(estimated > (4 << 20) + 384 * 1024, "preflight missed transitive datums: {estimated}");
+
+        // Publish the exact same records via `Needs::publish_precomputed` and verify the
+        // preflight estimate is a true upper bound (`actual <= estimated`).
+        let d1 = datums.get(&d1_sym.0).expect("d1");
+        let d2 = datums.get(&d2_sym.0).expect("d2");
+        let data = [
+            Datum { symbol: d1_sym, record: d1_rec },
+            Datum { symbol: d2_sym, record: d2_rec },
+        ];
+        let named = [d1_sym, d2_sym];
+        let inline = [
+            (fn_rec, entry.bytes.as_slice()),
+            (d1_rec, d1.bytes.as_slice()),
+            (d2_rec, d2.bytes.as_slice()),
+        ];
+        let mut needs = Needs::new(alloc);
+        let mut out = wire_out(alloc);
+        assert!(
+            needs
+                .publish_precomputed(
+                    fn_sym,
+                    fn_rec,
+                    entry.declares.as_slice(),
+                    &data,
+                    &named,
+                    entry.values.as_slice(),
+                    &inline,
+                    &mut out,
+                )
+                .expect("publish_precomputed")
+        );
+        assert!(
+            out.len() <= estimated,
+            "actual encoded wire bytes ({}) exceeded preflight upper bound ({estimated})",
+            out.len(),
+        );
     }
 }

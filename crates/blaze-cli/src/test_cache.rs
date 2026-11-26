@@ -1443,7 +1443,7 @@ fn decode_suite_state<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Option<DecodedSuite
     Some(DecodedSuiteState { cert, tools_digest, head_key, postings_key, fns, closed_crates, result_keys })
 }
 
-fn encode_verified(
+pub(crate) fn encode_verified(
     certificate: &crate::start_list::Certificate,
     pairs: &[([u8; 32], [u8; 32])],
     out: &mut AVec<'_, u8>,
@@ -1460,13 +1460,14 @@ fn encode_verified(
     }
 }
 
-enum VerifiedDecode {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VerifiedDecode {
     Loaded(usize),
     StaleCertificate,
     Corrupt,
 }
 
-fn decode_verified_status(
+pub(crate) fn decode_verified_status(
     bytes: &[u8],
     certificate: &crate::start_list::Certificate,
     into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,

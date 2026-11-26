@@ -822,6 +822,12 @@ pub(crate) trait RunOne {
     fn pump_bins(&self) -> Result<bool, OneError> {
         Ok(false)
     }
+
+    /// Resolves a `(suite, row)` pair carried by a workspace binary connection back to the
+    /// runner's flat row index so binary-serving failures are attributed to the spawning test.
+    fn flat_of(&self, _suite: u32, _row: u32) -> Option<u32> {
+        None
+    }
 }
 
 /// Process-wide dispositions belong to the pool. A SIGTERM is observed by every child,
@@ -995,6 +1001,9 @@ pub(crate) struct OneEach<'b, R: RunOne, C: Fn() -> Nanos> {
     /// The error that stopped a run in blaze, and the tests record row it was of: printed by
     /// [`run_suites`] as one line naming the test, before the command's own error line.
     pub failed: Option<(u32, OneError)>,
+    /// An unattached host-side failure (e.g. a pre-handshake workspace binary server error)
+    /// that does not belong to any single test row.
+    pub failed_unowned: Option<OneError>,
     /// The longest turn any child's poll took ([`Turn`]): printed by [`run_suites`] when the
     /// runner stops, so a zygote "silent" past an allowance says what held the thread.
     pub longest: Option<Turn>,
@@ -1008,7 +1017,7 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
         let running = std::vec::Vec::new_in(*proof.allocator());
         Ok(OneEach {
             runs, signals, now, heap, suite: SuiteId(0), width: 0,
-            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, longest: None,
+            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, failed_unowned: None, longest: None,
         })
     }
 
@@ -1158,8 +1167,15 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let bin_progress = match self.runs.pump_bins() {
                 Ok(prog) => prog,
                 Err(error) => {
-                    let row = self.running.first().map_or(0, |r| r.row);
-                    self.failed = Some((row, error));
+                    let owner_row = match &error {
+                        OneError::BinServe(err) => err.owner.and_then(|(suite, row)| self.runs.flat_of(suite, row)),
+                        _ => None,
+                    };
+                    if let Some(row) = owner_row {
+                        self.failed = Some((row, error));
+                    } else {
+                        self.failed_unowned = Some(error);
+                    }
                     return Err(RunError::Seam {
                         call: "serving workspace binary stub",
                         errno: 0,
@@ -1296,6 +1312,71 @@ mod pool_tests {
             assert_eq!(end.output.tail, &end.row.to_le_bytes());
             assert_eq!(end.test, TestId([end.row as u8; 32]));
         }
+    }
+
+    #[test]
+    fn bin_serve_failure_attributed_to_owner_or_unowned() {
+        struct BinFail {
+            owner: Option<(u32, u32)>,
+            pumped: Cell<bool>,
+        }
+
+        impl RunOne for BinFail {
+            async fn run(&self, _: u32, _: Nanos, _: &mut Output<'_>, _: &Signals) -> Result<RunOutcome, OneError> {
+                next_turn().await;
+                let heap = blaze_own::testing::heap().alloc();
+                Ok(RunOutcome {
+                    how: How::Reported(Said::Returned),
+                    keep: Err(NotKept::Untraced),
+                    panic_text: String::new_in(heap),
+                    entered: Vec::new_in(heap),
+                })
+            }
+
+            fn pump_bins(&self) -> Result<bool, OneError> {
+                if self.pumped.replace(true) {
+                    return Ok(false);
+                }
+                let heap = blaze_own::testing::heap().alloc();
+                Err(OneError::BinServe(crate::test_bins::BinServeError {
+                    owner: self.owner,
+                    package: String::from_str_in("binapp", heap),
+                    bin: String::from_str_in("helper", heap),
+                    why: crate::test_bins::BinServeWhy::Protocol("injected failure"),
+                }))
+            }
+
+            fn flat_of(&self, suite: u32, row: u32) -> Option<u32> {
+                (suite == 2 && row == 5).then_some(7)
+            }
+        }
+
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let clock = || Nanos(1);
+
+        // Owned failure while rows 3 and 7 are running: must blame row 7, NOT `running.first()` (row 3).
+        let owned = BinFail { owner: Some((2, 5)), pumped: Cell::new(false) };
+        let mut pool = OneEach::new(&owned, &signals, clock, heap, heap).expect("heap");
+        pool.start(SuiteId(0), 2).expect("start");
+        pool.ask(3, TestId([3; 32]), Nanos(100)).expect("row 3");
+        pool.ask(7, TestId([7; 32]), Nanos(100)).expect("row 7");
+        pool.wait(Nanos(100)).expect("ready");
+        pool.clear();
+        assert!(pool.wait(Nanos(100)).is_err());
+        assert!(matches!(pool.failed, Some((7, OneError::BinServe(_)))));
+        assert!(pool.failed_unowned.is_none());
+
+        // Pre-handshake / unowned failure (`owner: None`): must go to `failed_unowned`, NOT blame row 3.
+        let unowned = BinFail { owner: None, pumped: Cell::new(false) };
+        let mut pool = OneEach::new(&unowned, &signals, clock, heap, heap).expect("heap");
+        pool.start(SuiteId(0), 2).expect("start");
+        pool.ask(3, TestId([3; 32]), Nanos(100)).expect("row 3");
+        pool.wait(Nanos(100)).expect("ready");
+        pool.clear();
+        assert!(pool.wait(Nanos(100)).is_err());
+        assert!(pool.failed.is_none());
+        assert!(matches!(pool.failed_unowned, Some(OneError::BinServe(_))));
     }
 
     /// A child whose first turn makes its roots' code for a long time (the clock moved 5000 in
@@ -4170,6 +4251,13 @@ impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
             .pump(first.cx, first.ids, first.lent, first.watch)
             .map_err(OneError::BinServe)
     }
+
+    fn flat_of(&self, suite: u32, row: u32) -> Option<u32> {
+        self.rows
+            .iter()
+            .position(|loc| loc.suite.0 == suite && loc.row == row)
+            .and_then(|idx| u32::try_from(idx).ok())
+    }
 }
 
 /// The selected suites run, their code made where [`CODES`] says (D194, THE seam): `Serial`, in
@@ -4595,6 +4683,9 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
         let path = record_row(tests, loc_row)?.path;
         err.line(cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
+        one_stopped = true;
+    } else if let (Err(DriveError::Run(_)), Some(failed)) = (&status, runner.zygotes().failed_unowned.as_ref()) {
+        err.line(cx, format_args!("blaze test: workspace binary server failed: {failed}")).map_err(|_| DriveError::Print)?;
         one_stopped = true;
     } else if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
         let row_idx = usize::try_from(turn.row).map_err(|_| one(OneError::NoRow { row: turn.row }))?;
