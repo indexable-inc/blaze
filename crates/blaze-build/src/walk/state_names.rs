@@ -311,6 +311,29 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
+    /// Names `slot` as the saved temporary of expression `e`: tries `Role::Value` first, then
+    /// `Role::Result` when the flow stores `e`'s value under `Role::Result` (e.g. an `.await`
+    /// result temporary held across a subsequent `.await`, as in `lock().await.next().await`).
+    pub(super) fn name_temp_slot(&mut self, slot: SlotId, e: ExprId) {
+        self.name_slot(slot, Identity::Temp(e, Role::Value));
+        if !self.slot_is_named(slot) {
+            self.name_slot(slot, Identity::Temp(e, Role::Result));
+        }
+    }
+
+    /// Names the slot whose whole storage `at` is, if it is one, as `e`'s saved temporary.
+    pub(super) fn name_temp_at(&mut self, at: (Value, i32), e: ExprId) {
+        if self.names.is_none() || at.1 != 0 {
+            return;
+        }
+        let view = self.b.func().view();
+        let ix = at.0.index();
+        if ix < view.len() && view.op(ix) == Op::SlotAddr {
+            let slot = SlotId(view.data[ix]);
+            self.name_temp_slot(slot, e);
+        }
+    }
+
     /// A fresh slot of `temp`, named as the running task's expression's value.
     pub(super) fn name_temp(&mut self, slot: SlotId) {
         if let Some(x) = self.names.as_ref().map(|n| n.at) {

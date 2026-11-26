@@ -158,7 +158,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             let Repr::Agg(l) = repr else {
                 return Err(malformed("a value that needs drop not held as an aggregate"));
             };
-            self.name_at(at, blaze_flow_lower::identity::Identity::Temp(init, blaze_flow_lower::identity::Role::Value));
+            self.name_temp_at(at, init);
             let scope = self.temp_scope_index(init.0).ok_or(malformed("an extended temporary whose `let` is not open"))?;
             let pos = usize::try_from(*self.temp_marks.get(scope).ok_or(malformed("a temporary scope past `temp_marks`"))?)
                 .map_err(|_| malformed("a temporary mark past `usize`"))?;
