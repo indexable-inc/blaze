@@ -19,12 +19,12 @@ use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blaze_own::Alloc;
 use blaze_sysmon::{RawSnapshot, ShellPanePid, SysMonEngine};
@@ -84,6 +84,85 @@ pub fn parse_creator_pid(creator: &str) -> Option<u32> {
     rest[..digits_len].parse::<u32>().ok()
 }
 
+/// Parse a macOS `sysctl([CTL_KERN, KERN_PROCARGS2, pid])` byte buffer into a concise
+/// displayable command line (at most 120 chars, using the basename of `argv[0]`).
+pub fn parse_kern_procargs2(buf: &[u8]) -> String {
+    const MAX_ARGS: usize = 64;
+    const MAX_CMDLINE_CHARS: usize = 120;
+
+    if buf.len() < 4 {
+        return String::new();
+    }
+    let raw_argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if raw_argc <= 0 {
+        return String::new();
+    }
+    let argc = (raw_argc as usize).clamp(1, MAX_ARGS);
+
+    // Skip the NUL-terminated `exec_path` immediately following `argc`.
+    let mut pos = 4usize;
+    let Some(exec_nul) = buf[pos..].iter().position(|&b| b == 0) else {
+        return String::new();
+    };
+    pos += exec_nul;
+    // Skip the `exec_path` NUL terminator plus any trailing NUL alignment padding bytes.
+    while pos < buf.len() && buf[pos] == 0 {
+        pos += 1;
+    }
+
+    let mut args: Vec<String> = Vec::with_capacity(argc.min(16));
+    for arg_idx in 0..argc {
+        if pos >= buf.len() {
+            break;
+        }
+        let end = match buf[pos..].iter().position(|&b| b == 0) {
+            Some(rel) => pos + rel,
+            None => buf.len(),
+        };
+        let raw = String::from_utf8_lossy(&buf[pos..end]);
+        if !raw.is_empty() {
+            if arg_idx == 0 {
+                let display = Path::new(raw.as_ref())
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(raw.as_ref());
+                args.push(display.to_owned());
+            } else {
+                args.push(raw.into_owned());
+            }
+        }
+        pos = end.saturating_add(1);
+    }
+
+    let joined = args.join(" ");
+    if joined.chars().count() <= MAX_CMDLINE_CHARS {
+        return joined;
+    }
+    let mut truncated: String = joined.chars().take(MAX_CMDLINE_CHARS - 1).collect();
+    while truncated.ends_with(' ') {
+        truncated.pop();
+    }
+    truncated.push('…');
+    truncated
+}
+
+/// Read the displayable command line (`argv[0]` basename + arguments, <= 120 chars) for `pid`.
+///
+/// On macOS this queries `sysctl([CTL_KERN, KERN_PROCARGS2, pid])` directly with zero subprocesses.
+/// Intended for small result sets (such as the top 16 folder processes).
+pub fn read_proc_cmdline(pid: u32) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        macos::read_proc_cmdline(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        String::new()
+    }
+}
+
 /// Convert Mach absolute-time ticks into nanoseconds using `u128` intermediate math to avoid overflow.
 #[cfg(any(target_os = "macos", test))]
 #[inline]
@@ -97,6 +176,9 @@ fn mach_ticks_to_ns(ticks: u64, numer: u64, denom: u64) -> u64 {
 /// load average, and uptime) in one native FFI pass with zero subprocesses.
 pub fn sample_snapshot(alloc: Alloc<'static>) -> RawSnapshot<'static> {
     let timestamp_ns = monotonic_now_ns();
+    let wall_time_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
 
     #[cfg(target_os = "macos")]
     {
@@ -106,6 +188,7 @@ pub fn sample_snapshot(alloc: Alloc<'static>) -> RawSnapshot<'static> {
         let processes = macos::sample_processes(alloc, &gpu_by_pid);
         RawSnapshot {
             timestamp_ns,
+            wall_time_secs,
             cores,
             mem,
             gpu,
@@ -122,6 +205,7 @@ pub fn sample_snapshot(alloc: Alloc<'static>) -> RawSnapshot<'static> {
 
         RawSnapshot {
             timestamp_ns,
+            wall_time_secs,
             cores: AVec::new_in(alloc),
             mem: RawMemSample {
                 total_bytes: 0,
@@ -312,11 +396,14 @@ pub struct FolderProcItem {
     pub cwd: String,
     pub rel_dir: String,
     pub exe_path: String,
+    pub cmdline: String,
+    pub parent_name: String,
     pub app_icon_path: Option<String>,
     pub cpu_pct: f32,
     pub gpu_pct: f32,
     pub mem_bytes: u64,
     pub threads: u32,
+    pub uptime_secs: u64,
     pub is_hot: bool,
     pub via_descendant: bool,
     pub shell_pane: Option<ShellPanePid>,
@@ -517,6 +604,7 @@ fn folder_proc_worker_loop() {
                     .app_bundle_path
                     .as_ref()
                     .and_then(|p| lookup_or_cache_app_icon(p.as_str()));
+                let cmdline = read_proc_cmdline(entry.pid);
                 items.push(FolderProcItem {
                     pid: entry.pid,
                     ppid: entry.ppid,
@@ -524,11 +612,14 @@ fn folder_proc_worker_loop() {
                     cwd: entry.cwd.as_str().to_owned(),
                     rel_dir: entry.rel_dir.as_str().to_owned(),
                     exe_path: entry.exe_path.as_str().to_owned(),
+                    cmdline,
+                    parent_name: entry.parent_name.as_str().to_owned(),
                     app_icon_path,
                     cpu_pct: entry.cpu_pct,
                     gpu_pct: entry.gpu_pct,
                     mem_bytes: entry.mem_bytes,
                     threads: entry.threads,
+                    uptime_secs: entry.uptime_secs,
                     is_hot: entry.is_hot,
                     via_descendant: entry.via_descendant,
                     shell_pane: entry.shell_pane.clone(),
@@ -588,11 +679,16 @@ mod macos {
     use objc2_core_graphics::CGImage;
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-    use super::{mach_ticks_to_ns, parse_creator_pid};
+    use super::{mach_ticks_to_ns, parse_creator_pid, parse_kern_procargs2};
 
     // -------------------------------------------------------------------------
     // Mach / XNU / BSD / libproc constants (verified against MacOSX.sdk headers)
     // -------------------------------------------------------------------------
+
+    const CTL_KERN: i32 = 1;
+    const KERN_PROCARGS2: i32 = 49;
+    const PROCARGS2_STACK_LEN: usize = 8192;
+    const PROCARGS2_MAX_LEN: usize = 256 * 1024;
 
     const KERN_SUCCESS: i32 = 0;
     const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
@@ -839,6 +935,14 @@ mod macos {
         fn vm_deallocate(target_task: u32, address: usize, size: usize) -> i32;
         fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 
+        fn sysctl(
+            name: *mut i32,
+            namelen: u32,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *const c_void,
+            newlen: usize,
+        ) -> i32;
         fn sysctlbyname(
             name: *const c_char,
             oldp: *mut c_void,
@@ -1675,10 +1779,83 @@ mod macos {
                 disk_read_bytes,
                 disk_write_bytes,
                 threads,
+                start_time_secs: bsd.pbi_start_tvsec,
             });
         }
 
         out
+    }
+
+    /// Read a process's command line via `sysctl([CTL_KERN, KERN_PROCARGS2, pid])`.
+    ///
+    /// Uses an 8 KiB stack buffer for typical processes (0 heap allocations) and probes the exact
+    /// kernel buffer size first so processes with large environments (> 8 KiB) still parse cleanly
+    /// (XNU returns zeroed tail bytes if `oldlen < p_argslen`).
+    pub(super) fn read_proc_cmdline(pid: u32) -> String {
+        if pid == 0 {
+            return String::new();
+        }
+        let Ok(raw_pid) = i32::try_from(pid) else {
+            return String::new();
+        };
+        let mut mib = [CTL_KERN, KERN_PROCARGS2, raw_pid];
+
+        let mut needed: usize = 0;
+        // SAFETY: `mib` has 3 `i32` entries; `oldp = NULL` queries the required byte length.
+        let probe_rc = unsafe {
+            sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                null_mut(),
+                &raw mut needed,
+                null(),
+                0,
+            )
+        };
+        if probe_rc != 0 || needed < size_of::<i32>() {
+            return String::new();
+        }
+
+        if needed <= PROCARGS2_STACK_LEN {
+            let mut stack_buf = [0u8; PROCARGS2_STACK_LEN];
+            let mut size = stack_buf.len();
+            // SAFETY: `stack_buf` holds `size` writable bytes for `KERN_PROCARGS2`.
+            let rc = unsafe {
+                sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as u32,
+                    stack_buf.as_mut_ptr().cast::<c_void>(),
+                    &raw mut size,
+                    null(),
+                    0,
+                )
+            };
+            if rc != 0 || size == 0 {
+                return String::new();
+            }
+            let used = size.min(stack_buf.len());
+            parse_kern_procargs2(&stack_buf[..used])
+        } else {
+            let cap = needed.min(PROCARGS2_MAX_LEN);
+            let mut heap_buf = vec![0u8; cap];
+            let mut size = heap_buf.len();
+            // SAFETY: `heap_buf` holds `size` writable bytes for `KERN_PROCARGS2`.
+            let rc = unsafe {
+                sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as u32,
+                    heap_buf.as_mut_ptr().cast::<c_void>(),
+                    &raw mut size,
+                    null(),
+                    0,
+                )
+            };
+            if rc != 0 || size == 0 {
+                return String::new();
+            }
+            let used = size.min(heap_buf.len());
+            parse_kern_procargs2(&heap_buf[..used])
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1856,6 +2033,98 @@ mod tests {
         assert!(send_process_signal(0, true).is_err());
     }
 
+    #[test]
+    fn parse_kern_procargs2_extracts_argv_basenames_and_truncates() {
+        fn build_procargs2(
+            argc: i32,
+            exec_path: &str,
+            pad_nuls: usize,
+            argv: &[&str],
+            envp: &[&str],
+        ) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&argc.to_ne_bytes());
+            out.extend_from_slice(exec_path.as_bytes());
+            out.extend(std::iter::repeat_n(0u8, pad_nuls.max(1)));
+            for arg in argv {
+                out.extend_from_slice(arg.as_bytes());
+                out.push(0);
+            }
+            for env in envp {
+                out.extend_from_slice(env.as_bytes());
+                out.push(0);
+            }
+            out
+        }
+
+        // Standard macOS layout: argv[0] path compacted to basename, NUL padding skipped, envp ignored.
+        let buf = build_procargs2(
+            2,
+            "/opt/homebrew/bin/nu",
+            5,
+            &["/opt/homebrew/bin/nu", "--login"],
+            &["SECRET_TOKEN=must-not-leak"],
+        );
+        assert_eq!(parse_kern_procargs2(&buf), "nu --login");
+
+        // Empty args are skipped while still counting toward `argc` so `envp` is never read.
+        let buf_empty_arg = build_procargs2(
+            3,
+            "/usr/bin/cargo",
+            3,
+            &["/usr/bin/cargo", "", "test"],
+            &["HOME=/Users/dev"],
+        );
+        assert_eq!(parse_kern_procargs2(&buf_empty_arg), "cargo test");
+
+        // Plain argv[0] without slashes stays intact.
+        let buf_plain = build_procargs2(2, "/bin/zsh", 1, &["-zsh", "-i"], &[]);
+        assert_eq!(parse_kern_procargs2(&buf_plain), "-zsh -i");
+
+        // Long command line (including multi-byte UTF-8) truncates cleanly to <= 120 chars.
+        let long_arg = "α".repeat(150);
+        let buf_long = build_procargs2(2, "/usr/bin/python3", 2, &["/usr/bin/python3", &long_arg], &[]);
+        let parsed_long = parse_kern_procargs2(&buf_long);
+        assert!(parsed_long.chars().count() <= 120);
+        assert!(parsed_long.starts_with("python3 "));
+        assert!(parsed_long.ends_with('…'));
+
+        // `argc` above 64 is clamped cleanly without panicking.
+        let many_args: Vec<&str> = std::iter::once("/usr/bin/tool")
+            .chain(std::iter::repeat_n("x", 80))
+            .collect();
+        let buf_many = build_procargs2(100, "/usr/bin/tool", 2, &many_args, &["ENV=1"]);
+        let parsed_many = parse_kern_procargs2(&buf_many);
+        assert!(parsed_many.chars().count() <= 120);
+        assert!(parsed_many.starts_with("tool x x"));
+
+        // Malformed / short / non-positive-argc inputs return empty string.
+        assert_eq!(parse_kern_procargs2(&[]), "");
+        assert_eq!(parse_kern_procargs2(&[1, 0, 0]), "");
+        assert_eq!(
+            parse_kern_procargs2(&build_procargs2(0, "/bin/sh", 2, &["/bin/sh"], &["A=1"])),
+            ""
+        );
+        assert_eq!(
+            parse_kern_procargs2(&build_procargs2(-3, "/bin/sh", 2, &["/bin/sh"], &[])),
+            ""
+        );
+        assert_eq!(parse_kern_procargs2(&[1, 0, 0, 0, b'/', b'a']), "");
+        assert_eq!(parse_kern_procargs2(&[1, 0, 0, 0, 0, 0, 0, 0]), "");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_proc_cmdline_returns_current_process_cmdline() {
+        let cmdline = read_proc_cmdline(std::process::id());
+        assert!(
+            !cmdline.is_empty(),
+            "expected KERN_PROCARGS2 to return non-empty cmdline for current process"
+        );
+        assert!(cmdline.chars().count() <= 120);
+        assert!(read_proc_cmdline(0).is_empty());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn xnu_struct_layouts_match_macos_sdk_headers() {
@@ -1932,6 +2201,7 @@ mod tests {
         let s2 = sample_snapshot(alloc);
 
         assert!(s2.timestamp_ns >= s1.timestamp_ns, "timestamp must be monotonic");
+        assert!(s1.wall_time_secs > 0, "expected non-zero Unix wall time");
         assert!(!s1.cores.is_empty(), "expected at least one CPU core");
         assert!(s1.mem.total_bytes > 0, "expected non-zero total RAM");
         assert!(s1.uptime_secs > 0, "expected non-zero host uptime");
@@ -1942,6 +2212,10 @@ mod tests {
             .iter()
             .find(|p| p.pid == my_pid)
             .expect("expected current test process in process list");
+        assert!(
+            me.start_time_secs > 0 && me.start_time_secs <= s1.wall_time_secs.saturating_add(1),
+            "expected valid pbi_start_tvsec for current process"
+        );
         assert!(
             !me.cwd.as_str().is_empty(),
             "expected PROC_PIDVNODEPATHINFO to populate current process cwd"

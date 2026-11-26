@@ -2069,6 +2069,7 @@ mod tests {
                 disk_read_bytes: 0,
                 disk_write_bytes: 0,
                 threads: 42,
+                start_time_secs: 0,
             });
             for idx in 1u32..=15 {
                 procs.push(RawProcess {
@@ -2086,10 +2087,12 @@ mod tests {
                     disk_read_bytes: 0,
                     disk_write_bytes: 0,
                     threads: 4,
+                    start_time_secs: 0,
                 });
             }
             RawSnapshot {
                 timestamp_ns: ts_ns,
+                wall_time_secs: 0,
                 cores,
                 mem: RawMemSample {
                     total_bytes: 64 * 1024u64.pow(3),

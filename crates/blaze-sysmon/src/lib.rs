@@ -119,12 +119,14 @@ pub struct RawProcess<'a> {
     pub disk_read_bytes: u64,
     pub disk_write_bytes: u64,
     pub threads: u32,
+    pub start_time_secs: u64,
 }
 
 /// One complete raw system snapshot passed into [`SysMonEngine::ingest`].
 #[derive(Debug)]
 pub struct RawSnapshot<'a> {
     pub timestamp_ns: u64,
+    pub wall_time_secs: u64,
     pub cores: AVec<'a, CoreTicks>,
     pub mem: RawMemSample,
     pub gpu: RawGpuSample<'a>,
@@ -272,6 +274,7 @@ pub struct ProcessRow<'a> {
     pub subtree_mem_bytes: u64,
     pub disk_bps: u64,
     pub threads: u32,
+    pub start_time_secs: u64,
 }
 
 /// Finds the outermost `.app` bundle directory containing `exe_path`, so nested helper apps
@@ -372,6 +375,7 @@ pub struct FolderProcEntry<'a> {
     pub pid: u32,
     pub ppid: u32,
     pub name: AString<'a>,
+    pub parent_name: AString<'a>,
     pub cwd: AString<'a>,
     pub rel_dir: AString<'a>,
     pub exe_path: AString<'a>,
@@ -380,6 +384,7 @@ pub struct FolderProcEntry<'a> {
     pub gpu_pct: f32,
     pub mem_bytes: u64,
     pub threads: u32,
+    pub uptime_secs: u64,
     pub is_hot: bool,
     pub via_descendant: bool,
     pub shell_pane: Option<ShellPanePid>,
@@ -418,6 +423,7 @@ struct ComputedProc<'a> {
     mem_bytes: u64,
     disk_bps: u64,
     threads: u32,
+    start_time_secs: u64,
 }
 
 /// Pure sans-IO system & process monitor state machine.
@@ -431,6 +437,7 @@ pub struct SysMonEngine<'a> {
     collapsed: ABTreeSet<'a, u32>,
     sample_count: u64,
     prev_timestamp_ns: Option<u64>,
+    wall_time_secs: u64,
     prev_cores: AVec<'a, CoreTicks>,
     prev_procs: ABTreeMap<'a, u32, PrevProcCounters>,
     core_utils: AVec<'a, f32>,
@@ -465,6 +472,7 @@ impl<'a> SysMonEngine<'a> {
             collapsed: BTreeSet::new_in(alloc),
             sample_count: 0,
             prev_timestamp_ns: None,
+            wall_time_secs: 0,
             prev_cores: Vec::new_in(alloc),
             prev_procs: BTreeMap::new_in(alloc),
             core_utils: Vec::new_in(alloc),
@@ -579,11 +587,13 @@ impl<'a> SysMonEngine<'a> {
                 mem_bytes: proc.mem_bytes,
                 disk_bps,
                 threads: proc.threads,
+                start_time_secs: proc.start_time_secs,
             });
         }
 
         self.prev_procs = next_prev_procs;
         self.prev_timestamp_ns = Some(snap.timestamp_ns);
+        self.wall_time_secs = snap.wall_time_secs;
         self.process_count = self.computed_procs.len();
         self.thread_count = total_threads;
         self.mem = snap.mem;
@@ -738,6 +748,11 @@ impl<'a> SysMonEngine<'a> {
     }
 
     #[inline]
+    pub fn wall_time_secs(&self) -> u64 {
+        self.wall_time_secs
+    }
+
+    #[inline]
     pub fn sample_count(&self) -> u64 {
         self.sample_count
     }
@@ -882,10 +897,22 @@ impl<'a> SysMonEngine<'a> {
             };
 
             let is_hot = proc.cpu_pct >= HOT_CPU_PCT || proc.gpu_pct >= HOT_GPU_PCT;
+            let uptime_secs = if self.wall_time_secs > 0 && proc.start_time_secs > 0 {
+                self.wall_time_secs.saturating_sub(proc.start_time_secs)
+            } else {
+                0
+            };
+            let parent_name = match pid_to_idx.get(&proc.ppid) {
+                Some(&parent_idx) => {
+                    String::from_str_in(self.computed_procs[parent_idx].name.as_str(), alloc)
+                }
+                None => String::new_in(alloc),
+            };
             entries.push(FolderProcEntry {
                 pid: proc.pid,
                 ppid: proc.ppid,
                 name: String::from_str_in(proc.name.as_str(), alloc),
+                parent_name,
                 cwd: String::from_str_in(proc.cwd.as_str(), alloc),
                 rel_dir: String::from_str_in(relative_subpath(proc.cwd.as_str(), folder), alloc),
                 exe_path: String::from_str_in(proc.exe_path.as_str(), alloc),
@@ -897,6 +924,7 @@ impl<'a> SysMonEngine<'a> {
                 gpu_pct: proc.gpu_pct,
                 mem_bytes: proc.mem_bytes,
                 threads: proc.threads,
+                uptime_secs,
                 is_hot,
                 via_descendant,
                 shell_pane,
@@ -1014,6 +1042,7 @@ impl<'a> SysMonEngine<'a> {
                 subtree_mem_bytes: proc.mem_bytes,
                 disk_bps: proc.disk_bps,
                 threads: proc.threads,
+                start_time_secs: proc.start_time_secs,
             });
         }
     }
@@ -1247,6 +1276,7 @@ impl<'a> SysMonEngine<'a> {
                 subtree_mem_bytes: subtree_mem[frame.node],
                 disk_bps: proc.disk_bps,
                 threads: proc.threads,
+                start_time_secs: proc.start_time_secs,
             });
 
             if has_children && !collapsed {
@@ -1381,6 +1411,7 @@ mod tests {
             disk_read_bytes,
             disk_write_bytes,
             threads,
+            start_time_secs: 0,
         }
     }
 
@@ -1450,6 +1481,7 @@ mod tests {
         ));
         engine.ingest(RawSnapshot {
             timestamp_ns: 1_000_000_000,
+            wall_time_secs: 1_700_000_000,
             cores: cores1,
             mem: make_mem(1000, 300, 150, 50),
             gpu: make_gpu(alloc, "Apple M4 Max", 25.0, 20.0, 15.0),
@@ -1458,6 +1490,7 @@ mod tests {
             uptime_secs: 3600,
         });
         assert_eq!(engine.sample_count(), 1);
+        assert_eq!(engine.wall_time_secs(), 1_700_000_000);
         assert_eq!(engine.core_utils(), &[0.0, 0.0]);
         assert_eq!(engine.total_cpu_pct(), 0.0);
         assert_eq!(engine.mem().used_bytes(), 500);
@@ -1472,6 +1505,7 @@ mod tests {
         // While paused and sample_count > 0, subsequent snapshots are ignored.
         engine.ingest(RawSnapshot {
             timestamp_ns: 2_000_000_000,
+            wall_time_secs: 1_700_009_999,
             cores: Vec::new_in(alloc),
             mem: make_mem(1000, 900, 0, 0),
             gpu: RawGpuSample::empty_in(alloc),
@@ -1481,6 +1515,7 @@ mod tests {
         });
         assert_eq!(engine.sample_count(), 1);
         assert_eq!(engine.uptime_secs(), 3600);
+        assert_eq!(engine.wall_time_secs(), 1_700_000_000);
 
         // Unpause and feed sample #2 after dt = 500ms (0.5s).
         engine.toggle_pause();
@@ -1496,7 +1531,7 @@ mod tests {
         // d_cpu = 750_000_000 ns => 150.0% (multi-core process!)
         // d_gpu = 125_000_000 ns => 25.0%
         // d_disk = (15_000 + 10_000) - (10_000 + 5_000) = 10_000 bytes over 0.5s => 20_000 B/s
-        procs2.push(make_proc(
+        let mut worker2 = make_proc(
             alloc,
             10,
             0,
@@ -1508,9 +1543,12 @@ mod tests {
             15_000,
             10_000,
             6,
-        ));
+        );
+        worker2.start_time_secs = 1_699_999_900;
+        procs2.push(worker2);
         engine.ingest(RawSnapshot {
             timestamp_ns: 1_500_000_000,
+            wall_time_secs: 1_700_000_001,
             cores: cores2,
             mem: make_mem(1000, 400, 200, 100),
             gpu: make_gpu(alloc, "Apple M4 Max", 42.0, 35.0, 18.0),
@@ -1520,6 +1558,7 @@ mod tests {
         });
 
         assert_eq!(engine.sample_count(), 2);
+        assert_eq!(engine.wall_time_secs(), 1_700_000_001);
         assert!((engine.core_utils()[0] - 80.0).abs() < 1e-4);
         assert!((engine.core_utils()[1] - 20.0).abs() < 1e-4);
         assert!((engine.total_cpu_pct() - 50.0).abs() < 1e-4);
@@ -1530,6 +1569,7 @@ mod tests {
         assert_eq!(r.disk_bps, 20_000);
         assert_eq!(r.threads, 6);
         assert_eq!(r.gpu_queues, 2);
+        assert_eq!(r.start_time_secs, 1_699_999_900);
 
         // History rings should hold 2 points.
         assert_eq!(engine.cpu_history().len(), 2);
@@ -1659,6 +1699,7 @@ mod tests {
             procs.push(make_proc(alloc, 21, 20, "zsh", "/bin/zsh", 10_000_000 * mult, 0, 20, 0, 0, 1));
             RawSnapshot {
                 timestamp_ns: ts,
+                wall_time_secs: 0,
                 cores: Vec::new_in(alloc),
                 mem: make_mem(10_000, 500, 100, 0),
                 gpu: RawGpuSample::empty_in(alloc),
@@ -1779,6 +1820,7 @@ mod tests {
             procs.push(make_proc(alloc, 20, 0, "Beta", "/b", 300_000_000 * mult, 0, 300, 0, 0, 1));
             RawSnapshot {
                 timestamp_ns: ts,
+                wall_time_secs: 0,
                 cores: Vec::new_in(alloc),
                 mem: RawMemSample::default(),
                 gpu: RawGpuSample::empty_in(alloc),
@@ -1865,6 +1907,7 @@ mod tests {
 
         engine.ingest(RawSnapshot {
             timestamp_ns: 1_000_000_000,
+            wall_time_secs: 0,
             cores: Vec::new_in(alloc),
             mem: RawMemSample::default(),
             gpu: RawGpuSample::empty_in(alloc),
@@ -1994,8 +2037,10 @@ mod tests {
         //  │   └─ 201 (other-child, cwd="/tmp") -> MUST NOT match!
         let make_snap = |ts: u64, mult: u64| {
             let mut procs = Vec::new_in(alloc);
-            procs.push(make_proc_with_cwd(alloc, 1, 0, "launchd", "/", "/sbin/launchd", 0, 0, 100, 1));
-            procs.push(make_proc_with_cwd(
+            let mut p_launchd = make_proc_with_cwd(alloc, 1, 0, "launchd", "/", "/sbin/launchd", 0, 0, 100, 1);
+            p_launchd.start_time_secs = 1_700_000_000;
+            procs.push(p_launchd);
+            let mut p_zsh = make_proc_with_cwd(
                 alloc,
                 100,
                 1,
@@ -2006,8 +2051,10 @@ mod tests {
                 0,
                 200,
                 1,
-            ));
-            procs.push(make_proc_with_cwd(
+            );
+            p_zsh.start_time_secs = 1_700_000_100;
+            procs.push(p_zsh);
+            let mut p_cargo = make_proc_with_cwd(
                 alloc,
                 101,
                 100,
@@ -2018,8 +2065,10 @@ mod tests {
                 0,
                 400,
                 4,
-            ));
-            procs.push(make_proc_with_cwd(
+            );
+            p_cargo.start_time_secs = 1_700_000_350;
+            procs.push(p_cargo);
+            let mut p_wrapper = make_proc_with_cwd(
                 alloc,
                 102,
                 101,
@@ -2030,8 +2079,10 @@ mod tests {
                 0,
                 300,
                 2,
-            ));
-            procs.push(make_proc_with_cwd(
+            );
+            p_wrapper.start_time_secs = 1_700_000_400;
+            procs.push(p_wrapper);
+            let mut p_rustc = make_proc_with_cwd(
                 alloc,
                 103,
                 102,
@@ -2042,7 +2093,9 @@ mod tests {
                 0,
                 1000,
                 8,
-            ));
+            );
+            p_rustc.start_time_secs = 1_700_000_480;
+            procs.push(p_rustc);
             procs.push(make_proc_with_cwd(
                 alloc,
                 200,
@@ -2069,6 +2122,7 @@ mod tests {
             ));
             RawSnapshot {
                 timestamp_ns: ts,
+                wall_time_secs: 1_700_000_500,
                 cores: Vec::new_in(alloc),
                 mem: RawMemSample::default(),
                 gpu: RawGpuSample::empty_in(alloc),
@@ -2081,12 +2135,14 @@ mod tests {
         engine.ingest(make_snap(1_000_000_000, 1));
         engine.ingest(make_snap(2_000_000_000, 2));
 
-        // ProcessRow carries cwd in both tree and flat modes.
+        // ProcessRow carries cwd and start_time_secs in both tree and flat modes.
         let zsh_row = engine.rows().iter().find(|r| r.pid == 100).unwrap();
         assert_eq!(zsh_row.cwd.as_str(), "/Volumes/Projects/blaze");
+        assert_eq!(zsh_row.start_time_secs, 1_700_000_100);
         engine.toggle_tree_mode();
         let cargo_row = engine.rows().iter().find(|r| r.pid == 101).unwrap();
         assert_eq!(cargo_row.cwd.as_str(), "/Volumes/Projects/blaze/crates/blaze-shell");
+        assert_eq!(cargo_row.start_time_secs, 1_700_000_350);
 
         let summary = engine.folder_processes_in(folder, 9999, &[], alloc);
         assert_eq!(summary.folder.as_str(), folder);
@@ -2097,18 +2153,26 @@ mod tests {
         assert!(summary.entries[0].via_descendant);
         assert_eq!(summary.entries[0].rel_dir.as_str(), "/tmp");
         assert_eq!(summary.entries[0].cwd.as_str(), "/tmp");
+        assert_eq!(summary.entries[0].uptime_secs, 20);
+        assert_eq!(summary.entries[0].parent_name.as_str(), "rustc-wrapper");
 
         assert_eq!(summary.entries[1].pid, 101);
         assert!(!summary.entries[1].via_descendant);
         assert_eq!(summary.entries[1].rel_dir.as_str(), "crates/blaze-shell");
+        assert_eq!(summary.entries[1].uptime_secs, 150);
+        assert_eq!(summary.entries[1].parent_name.as_str(), "zsh");
 
         assert_eq!(summary.entries[2].pid, 102);
         assert!(summary.entries[2].via_descendant);
         assert_eq!(summary.entries[2].rel_dir.as_str(), "/var/folders/tmp");
+        assert_eq!(summary.entries[2].uptime_secs, 100);
+        assert_eq!(summary.entries[2].parent_name.as_str(), "cargo");
 
         assert_eq!(summary.entries[3].pid, 100);
         assert!(!summary.entries[3].via_descendant);
         assert_eq!(summary.entries[3].rel_dir.as_str(), ".");
+        assert_eq!(summary.entries[3].uptime_secs, 400);
+        assert_eq!(summary.entries[3].parent_name.as_str(), "launchd");
 
         assert_eq!(summary.primary_name.as_str(), "rustc");
         assert_eq!(summary.total_mem_bytes, 200 + 400 + 300 + 1000);
@@ -2277,6 +2341,7 @@ mod tests {
             ));
             RawSnapshot {
                 timestamp_ns: ts,
+                wall_time_secs: 0,
                 cores: Vec::new_in(alloc),
                 mem: RawMemSample::default(),
                 gpu: RawGpuSample::empty_in(alloc),
@@ -2333,6 +2398,7 @@ mod tests {
             procs.push(make_proc_with_cwd(alloc, 12, 1, "w3", folder, "/bin/w3", 100_000_000 * mult, 0, 500, 1));
             RawSnapshot {
                 timestamp_ns: ts,
+                wall_time_secs: 0,
                 cores: Vec::new_in(alloc),
                 mem: RawMemSample::default(),
                 gpu: RawGpuSample::empty_in(alloc),
@@ -2367,6 +2433,7 @@ mod tests {
             procs.push(make_proc_with_cwd(alloc, 22, 1, "hot-cpu", folder, "/bin/c", 250_000_000 * mult, 0, 100, 1));
             RawSnapshot {
                 timestamp_ns: ts,
+                wall_time_secs: 0,
                 cores: Vec::new_in(alloc),
                 mem: RawMemSample::default(),
                 gpu: RawGpuSample::empty_in(alloc),
@@ -2395,5 +2462,77 @@ mod tests {
         assert!(empty.entries.is_empty());
         assert!(!empty.is_hot);
         assert_eq!(empty.primary_name.as_str(), "");
+    }
+
+    #[test]
+    fn folder_processes_uptime_and_parent_name_edge_cases() {
+        let arena = Inline::<262_144>::new();
+        let erased = Erased::new(&arena);
+        let alloc = erased.handle();
+
+        let folder = "/Volumes/Projects/blaze";
+        let mut engine = SysMonEngine::new_in(alloc);
+
+        // Case 1: wall_time_secs > 0 with normal, zero, future start times, and missing parent.
+        let mut procs = Vec::new_in(alloc);
+        let mut normal = make_proc_with_cwd(alloc, 10, 9999, "orphan", folder, "/bin/orphan", 0, 0, 100, 1);
+        normal.start_time_secs = 1_000;
+        procs.push(normal);
+
+        let mut zero_start = make_proc_with_cwd(alloc, 11, 10, "zero-start", folder, "/bin/z", 0, 0, 100, 1);
+        zero_start.start_time_secs = 0;
+        procs.push(zero_start);
+
+        let mut future_start = make_proc_with_cwd(alloc, 12, 10, "future-start", folder, "/bin/f", 0, 0, 100, 1);
+        future_start.start_time_secs = 5_000;
+        procs.push(future_start);
+
+        engine.ingest(RawSnapshot {
+            timestamp_ns: 1_000_000_000,
+            wall_time_secs: 1_250,
+            cores: Vec::new_in(alloc),
+            mem: RawMemSample::default(),
+            gpu: RawGpuSample::empty_in(alloc),
+            processes: procs,
+            load_avg: [0.0; 3],
+            uptime_secs: 1,
+        });
+
+        let summary = engine.folder_processes_in(folder, 999, &[], alloc);
+        assert_eq!(summary.entries.len(), 3);
+
+        let e10 = summary.entries.iter().find(|e| e.pid == 10).unwrap();
+        assert_eq!(e10.uptime_secs, 250);
+        assert_eq!(e10.parent_name.as_str(), "");
+
+        let e11 = summary.entries.iter().find(|e| e.pid == 11).unwrap();
+        assert_eq!(e11.uptime_secs, 0);
+        assert_eq!(e11.parent_name.as_str(), "orphan");
+
+        let e12 = summary.entries.iter().find(|e| e.pid == 12).unwrap();
+        assert_eq!(e12.uptime_secs, 0);
+        assert_eq!(e12.parent_name.as_str(), "orphan");
+
+        // Case 2: wall_time_secs == 0 yields uptime_secs == 0 even when start_time_secs > 0.
+        let mut procs2 = Vec::new_in(alloc);
+        let mut p = make_proc_with_cwd(alloc, 20, 0, "solo", folder, "/bin/solo", 0, 0, 100, 1);
+        p.start_time_secs = 1_000;
+        procs2.push(p);
+
+        engine.ingest(RawSnapshot {
+            timestamp_ns: 2_000_000_000,
+            wall_time_secs: 0,
+            cores: Vec::new_in(alloc),
+            mem: RawMemSample::default(),
+            gpu: RawGpuSample::empty_in(alloc),
+            processes: procs2,
+            load_avg: [0.0; 3],
+            uptime_secs: 2,
+        });
+
+        let summary2 = engine.folder_processes_in(folder, 999, &[], alloc);
+        assert_eq!(summary2.entries.len(), 1);
+        assert_eq!(summary2.entries[0].uptime_secs, 0);
+        assert_eq!(summary2.entries[0].parent_name.as_str(), "");
     }
 }
