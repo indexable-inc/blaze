@@ -61,7 +61,7 @@ pub(super) fn streams_of(spec: &HermeticSpec<'_>) -> Streams {
 pub(super) fn run_spec<'r>(program: &'r str, args: &'r [&'r str], start: &'r StartView<'r>, streams: Streams) -> RunSpec<'r> {
     RunSpec {
         program,
-        arg0: None,
+        arg0: start.spec.arg0(),
         args,
         env: start.env,
         dir: start.spec.cwd(),

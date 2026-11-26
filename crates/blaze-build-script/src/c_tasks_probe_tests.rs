@@ -722,4 +722,50 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert_eq!(can_tmp_a.key, can_tmp_b.key, "ambient TMPDIR must not split probe keys");
     assert_eq!(can_tmp_a.key, can_no_tmp.key, "ambient TMPDIR must match absent TMPDIR key");
     assert!(can_tmp_a.exec_env.iter().all(|(k, _)| k.as_str() != "TMPDIR"), "host TMPDIR must not persist into exec_env");
+
+    // Revalidating answerer.id() after a cache hit must reject a mid-lookup runtime-closure switch.
+    struct SwitchingAnswerer {
+        calls: core::cell::Cell<u32>,
+    }
+    impl ProbeAnswerer for SwitchingAnswerer {
+        fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<blaze_ids::ContentId, blaze_own::AString<'a>> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            let tag = if n == 0 { b"v1" } else { b"v2" };
+            Ok(blaze_ids::ContentId::of("switching-answerer-test", tag))
+        }
+        fn answer<'a, 'b>(
+            &self,
+            _probe: &CanonicalProbe<'_, '_>,
+            _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+            alloc: blaze_own::Alloc<'a>,
+        ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+            Ok(ProbeAnswer { code: 0, stdout: blaze_own::String::new_in(alloc), stderr: blaze_own::String::new_in(alloc) })
+        }
+    }
+    struct HitCache(std::vec::Vec<u8>);
+    impl ProbeCache for HitCache {
+        fn get<'a>(&self, _key: &ProbeKey, alloc: blaze_own::Alloc<'a>) -> Result<Option<blaze_own::AVec<'a, u8>>, blaze_own::AString<'a>> {
+            let mut out = blaze_own::AVec::with_capacity_in(self.0.len(), alloc);
+            out.extend_from_slice(&self.0);
+            Ok(Some(out))
+        }
+        fn put<'a>(&self, _key: &ProbeKey, _bytes: &[u8], _alloc: blaze_own::Alloc<'a>) -> Result<(), blaze_own::AString<'a>> {
+            Ok(())
+        }
+    }
+    let mut encoded_hit = blaze_own::AVec::new_in(alloc);
+    crate::c_tasks_probe::encode_answer(
+        &ProbeAnswer { code: 0, stdout: blaze_own::String::new_in(alloc), stderr: blaze_own::String::new_in(alloc) },
+        &mut encoded_hit,
+    );
+    let switching = SwitchingAnswerer { calls: core::cell::Cell::new(0) };
+    let hit_cache = HitCache(encoded_hit.as_slice().to_vec());
+    let mut no_bytes = |_: &str| None;
+    let err = crate::c_tasks_probe::resolve(&switching, &hit_cache, &CLANG_PIN, &sp_no_tmp, files, &mut no_bytes, alloc)
+        .expect_err("mid-lookup runtime-closure switch must reject cache hit");
+    assert!(
+        err.as_str().contains("runtime closure changed during cache lookup"),
+        "expected closure-change error, got: {err}"
+    );
 }

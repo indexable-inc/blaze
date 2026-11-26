@@ -1390,11 +1390,24 @@ pub fn resolve<'a, 'b>(
         }
     }
     let canonical = match cache.get(&probe.key, alloc)? {
-        Some(bytes) => decode_answer(bytes.as_slice(), alloc).map_err(|e| {
-            let mut msg = String::new_in(alloc);
-            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("cached c-probe record: {e}"));
-            msg
-        })?,
+        Some(bytes) => {
+            // Revalidate the live answerer identity after the cache read so a runtime-closure
+            // switch during cache lookup never serves a stale record under an obsolete identity.
+            let post_id = answerer.id(alloc)?;
+            if post_id != answerer_id {
+                let mut msg = String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(
+                    &mut msg,
+                    format_args!("c-probe answerer runtime closure changed during cache lookup (rule 21)"),
+                );
+                return Err(msg);
+            }
+            decode_answer(bytes.as_slice(), alloc).map_err(|e| {
+                let mut msg = String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("cached c-probe record: {e}"));
+                msg
+            })?
+        }
         None => {
             let ans = answerer.answer(&probe, file_bytes, alloc)?;
             let mut encoded: AVec<'a, u8> = Vec::new_in(alloc);

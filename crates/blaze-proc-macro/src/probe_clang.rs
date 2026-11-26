@@ -278,39 +278,6 @@ impl CProbeSetting {
     }
 }
 
-/// Rewrites Clang's driver diagnostic prefix (`clang-23:`) at the start of any line to the
-/// requested compiler spelling (e.g. `cc:`, `c++:`, `gcc:`, `clang:`) so stderr/stdout match the
-/// spawned driver `argv[0]` rather than exposing the internal shelf binary name `clang-23`.
-#[cfg(any(target_os = "linux", test))]
-fn rewrite_driver_prefix<'a>(text: &str, requested_program: &str, alloc: Alloc<'a>) -> AString<'a> {
-    if requested_program.is_empty() || requested_program == "clang-23" || !text.contains("clang-23:") {
-        return OwnString::from_str_in(text, alloc);
-    }
-    let mut out = OwnString::with_capacity_in(text.len(), alloc);
-    let mut at_line_start = true;
-    let mut pos = 0usize;
-    while let Some(rest) = text.get(pos..) {
-        if rest.is_empty() {
-            break;
-        }
-        if at_line_start && rest.starts_with("clang-23:") {
-            out.push_str(requested_program);
-            out.push(':');
-            pos += "clang-23:".len();
-            at_line_start = false;
-            continue;
-        }
-        if let Some(ch) = rest.chars().next() {
-            out.push(ch);
-            pos += ch.len_utf8();
-            at_line_start = ch == '\n';
-        } else {
-            break;
-        }
-    }
-    out
-}
-
 /// Default strategy id for this host OS (used when no home/runtime-closure context is available
 /// and by cross-platform `sweep` tests).
 pub fn default_answerer_strategy_id() -> ContentId {
@@ -1085,6 +1052,10 @@ impl HermeticClangProbe {
         }
         owned_args.push(own_str("-fintegrated-cc1", alloc));
         owned_args.push(own_str("--no-default-config", alloc));
+        // Pin Clang's builtin resource directory explicitly to the shelf since `argv[0]` carries
+        // the requested compiler spelling (`cc`, `c++`, `gcc`, etc.) rather than `<shelf>/bin/clang-23`.
+        owned_args.push(own_str("-resource-dir", alloc));
+        owned_args.push(own_fmt(format_args!("{}/lib/clang/23", self.shelf_dir.as_str()), alloc));
 
         let mut has_sysroot = false;
         let sdk_str = self.sdk_dir.as_ref().map(OwnString::as_str);
@@ -1181,7 +1152,9 @@ impl HermeticClangProbe {
         if pre_id != probe.answerer_id {
             return Err(own_str("host runtime closure changed before probe execution (rule 21)", alloc));
         }
-        let spec = spec.with_verified_exec(&verified.exec);
+        let spec = spec
+            .with_arg0(probe.row.program.as_str())
+            .with_verified_exec(&verified.exec);
 
         let ran = hermetic.run(&cx, &spec, &ProbeFiles, alloc).map_err(|e| match e.fault {
             Fault::Stopped(HermeticStop::Stream { stream, most }) => own_fmt(
@@ -1213,8 +1186,9 @@ impl HermeticClangProbe {
 
         // Normalize host paths back to canonical placeholders (longest match first) while escaping
         // literal `$` -> `$$` so literal `$OUT_DIR`/`$IN0.c` in Clang output round-trip verbatim
-        // through `CanonicalProbe::unspell`, `<shelf>/bin` (`InstalledDir:`) never leaks `$HOME`,
-        // and driver diagnostics preserve the requested compiler spelling (`cc:`, `c++:`, etc.).
+        // through `CanonicalProbe::unspell` and `<shelf>/bin` (`InstalledDir:`) never leaks `$HOME`.
+        // Driver diagnostics already carry the requested compiler spelling natively via `with_arg0`,
+        // so user-produced preprocessor output (e.g. `clang-23: marker`) is never rewritten.
         let requested = probe.row.program.as_str();
         let stdout = normalize_reply(raw_out, requested, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
         let stderr = normalize_reply(raw_err, requested, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real, sdk_str, placeholders.as_slice(), alloc);
@@ -1250,8 +1224,7 @@ fn normalize_reply<'a>(
         rev_pairs.push((sdk, SDKROOT));
     }
     rev_pairs.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()));
-    let replaced = replace_pairs_escape_dollar(raw, rev_pairs.as_slice(), alloc);
-    rewrite_driver_prefix(replaced.as_str(), driver_name, alloc)
+    replace_pairs_escape_dollar(raw, rev_pairs.as_slice(), alloc)
 }
 
 #[cfg(target_os = "linux")]
@@ -1507,15 +1480,24 @@ mod tests {
             let raw_cached = store.get(&resolved.key, alloc).expect("read cache").expect("cached");
             let canonical = c_tasks_probe::decode_answer(raw_cached.as_slice(), alloc).expect("decode");
             assert_eq!(canonical.code, *code, "code mismatch for {:?}", row.args);
-            let expected_stdout = super::rewrite_driver_prefix(stdout.as_str(), row.program.as_str(), alloc);
-            let expected_stderr = super::rewrite_driver_prefix(stderr.as_str(), row.program.as_str(), alloc);
-            assert_eq!(canonical.stdout.as_str(), expected_stdout.as_str(), "stdout mismatch for {:?}", row.args);
-            assert_eq!(canonical.stderr.as_str(), expected_stderr.as_str(), "stderr mismatch for {:?}", row.args);
+            // Legacy `pins/answers/clang.json` rows were captured with `argv[0] = clang-23`;
+            // live hermetic probes pass the requested compiler spelling (`cc`, `c++`, etc.) as
+            // `argv[0]` natively, so compare stderr after translating the legacy corpus prefix.
+            let legacy_stderr: std::string::String = stderr
+                .as_str()
+                .split_inclusive('\n')
+                .map(|line| match line.strip_prefix("clang-23:") {
+                    Some(rest) => format!("{}:{rest}", row.program.as_str()),
+                    None => line.to_owned(),
+                })
+                .collect();
+            assert_eq!(canonical.stdout.as_str(), stdout.as_str(), "stdout mismatch for {:?}", row.args);
+            assert_eq!(canonical.stderr.as_str(), legacy_stderr.as_str(), "stderr mismatch for {:?}", row.args);
             if row.args.len() == 1 && row.args[0].as_str() == "-?" {
                 let want_prefix = format!("{}: error:", row.program.as_str());
                 assert!(
                     canonical.stderr.as_str().starts_with(want_prefix.as_str()),
-                    "diagnostic must preserve requested driver spelling `{want_prefix}`, got: {}",
+                    "diagnostic must preserve requested driver spelling `{want_prefix}` natively via argv[0], got: {}",
                     canonical.stderr.as_str()
                 );
             }
@@ -1534,6 +1516,36 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 27, "expected >= 27 Linux ARM64 rows checked, got {checked}");
+
+        // User-produced preprocessor stdout beginning with `clang-23:` must NEVER be rewritten
+        // because driver diagnostics get the requested `argv[0]` natively at launch.
+        {
+            let marker_src: &[u8] = b"clang-23: marker\n#pragma message \"clang\"\n";
+            let marker_sha = blaze_sha256::digest(marker_src);
+            let marker_out = "/target/debug/build/marker-1/out";
+            let marker_path = format!("{marker_out}/1detect_compiler_family.c");
+            let marker_args = ["-E", marker_path.as_str()];
+            let sp_marker = Spawn {
+                program: "cc",
+                args: &marker_args,
+                env: &[],
+                out_dir: marker_out,
+                sdk: "",
+                mount: "/package",
+                sdk_id: "",
+                stdin: &[],
+            };
+            let dig = |rel: &str| (rel == "1detect_compiler_family.c").then_some(marker_sha);
+            let mut bytes = |rel: &str| (rel == "1detect_compiler_family.c").then_some(marker_src);
+            let res = resolve(&answerer, &cache, &pin.sha256, &sp_marker, dig, &mut bytes, alloc)
+                .expect("marker family probe");
+            assert_eq!(res.answered.code, 0);
+            assert!(
+                res.answered.stdout.as_str().lines().any(|line| line == "clang-23: marker"),
+                "user-produced stdout line `clang-23: marker` must stay untouched, got:\n{}",
+                res.answered.stdout.as_str()
+            );
+        }
 
         // Novel flags + nonzero SOURCE_DATE_EPOCH (proves ClockSpec::Fixed agrees with env!).
         for (extra_flag, env) in [
@@ -1945,7 +1957,7 @@ mod tests {
             OwnString::from_str_in("/tmp/task-1/in0.c", alloc),
         )];
         let norm = super::normalize_reply(
-            "clang: /home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23\nclang-23: error: unknown argument\nliteral clang-23: stays\nInstalledDir: /home/user/.blaze/v2/toolchain/clang/abc/bin\nreal=/tmp/task-1/in0.c dir=/tmp/task-1 lit=$OUT_DIR lit2=$IN0.c\n",
+            "clang: /home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23\nclang-23: user-produced-stdout\nInstalledDir: /home/user/.blaze/v2/toolchain/clang/abc/bin\nreal=/tmp/task-1/in0.c dir=/tmp/task-1 lit=$OUT_DIR lit2=$IN0.c\n",
             "cc",
             "/home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23",
             "/home/user/.blaze/v2/toolchain/clang/abc",
@@ -1990,13 +2002,13 @@ mod tests {
         assert!(!super::is_stream_overflow_error("c-probe hermetic run failed"));
         assert_eq!(
             norm.as_str(),
-            "clang: cc\ncc: error: unknown argument\nliteral clang-23: stays\nInstalledDir: $CLANG_SHELF/bin\nreal=$IN0.c dir=$OUT_DIR lit=$$OUT_DIR lit2=$$IN0.c\n"
+            "clang: cc\nclang-23: user-produced-stdout\nInstalledDir: $CLANG_SHELF/bin\nreal=$IN0.c dir=$OUT_DIR lit=$$OUT_DIR lit2=$$IN0.c\n"
         );
         let canon = c_tasks_probe::canonicalize(stub_id, &pin, &sp_a, dig, alloc).expect("canon");
         let restored = canon.unspell(norm.as_str(), &sp_a, alloc);
         assert_eq!(
             restored.as_str(),
-            "clang: cc\ncc: error: unknown argument\nliteral clang-23: stays\nInstalledDir: $CLANG_SHELF/bin\nreal=/out/flag_check.c dir=/out lit=$OUT_DIR lit2=$IN0.c\n"
+            "clang: cc\nclang-23: user-produced-stdout\nInstalledDir: $CLANG_SHELF/bin\nreal=/out/flag_check.c dir=/out lit=$OUT_DIR lit2=$IN0.c\n"
         );
 
         // Stale task directory collisions recover cleanly across crash / PID reuse, and explicit

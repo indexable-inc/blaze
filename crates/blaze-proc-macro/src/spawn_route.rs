@@ -605,10 +605,17 @@ impl ScriptSandbox {
         {
             let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
 
-            // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) stay on the ordinary compiler
-            // route so large generated `-E` or flag-check sources never trip the probe capture cap.
+            // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) execute via the real
+            // compiler executor in build mode; in `CMode::Deferred` they fail explicitly rather
+            // than deferring to a fabricated exit-0 reply (rule 3).
             if crate::probe_clang::has_oversized_probe_input(&arg_refs, script.out_dir(), &mut held_bytes) {
-                return self.spawn_ordinary_compiler(program, spawned);
+                if self.script.c_mode != CMode::Deferred && self.script.spawner.is_some() {
+                    return self.spawn_executor(program, args, spawned);
+                }
+                return Err(self.refuse(Refusal::Spawn(refused(format!(
+                    "compiler probe input exceeds {} bytes (cannot defer a result-affecting probe, rule 3)",
+                    crate::probe_clang::MAX_PROBE_INPUT_BYTES
+                )))));
             }
 
             match &script.c_probes {
@@ -632,8 +639,12 @@ impl ScriptSandbox {
                     let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
                     let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
                         Ok(resolved) => resolved,
-                        Err(why) if crate::probe_clang::is_stream_overflow_error(why.as_str()) => {
-                            return self.spawn_ordinary_compiler(program, spawned);
+                        Err(why)
+                            if crate::probe_clang::is_stream_overflow_error(why.as_str())
+                                && self.script.c_mode != CMode::Deferred
+                                && self.script.spawner.is_some() =>
+                        {
+                            return self.spawn_executor(program, args, spawned);
                         }
                         Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
                     };
@@ -653,22 +664,6 @@ impl ScriptSandbox {
                 )))),
             }
         }
-    }
-
-    /// Routes a compiler invocation that outgrew probe bounds (input > 64 KiB or stream > 1 MiB)
-    /// onto the ordinary compiler route (`Deferred` in check mode, `Executor` in build mode, or
-    /// `NoSandbox` when no executor is configured).
-    #[cfg(target_os = "linux")]
-    fn spawn_ordinary_compiler(&mut self, program: &str, spawned: &Decoded) -> Result<(), Stop> {
-        if self.script.c_mode == CMode::Deferred {
-            return self.spawn_deferred(program, spawned);
-        }
-        let args = spawned.argv.get(1..).unwrap_or(&[]);
-        if self.script.spawner.is_some() {
-            return self.spawn_executor(program, args, spawned);
-        }
-        let why = self.script.spawn_setting.no_sandbox();
-        Err(self.refuse(Refusal::Spawn(SpawnRefusal::NoSandbox { program: program.to_owned(), args: args.to_vec(), why })))
     }
 
     /// The spawn sent to the executor as a request record; its written files applied to
