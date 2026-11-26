@@ -196,12 +196,13 @@ See [docs/v2/plan/design/tasks.md](../../../docs/v2/plan/design/tasks.md).
 
 ## agents-are-a-cost (rule 48)
 
-An agent costs its whole context, and its report loses detail both ways, so the coordinator does
-small pieces, reads and deletions itself and never starts a fleet to read or summarise. But work
-that splits into independent, large pieces is done in parallel (`sota-first`): one lane per piece,
-with a brief that states its outcome, its check and its paths (`worktree-per-lane` says how lanes
-share one directory). At most four lanes write in shared files of one tree at once (existing crates,
-a registry every lane appends to): that is what the main agent can compile within minutes of each
+Spawn tasks as subagents by default so the coordinator stays free for incoming tasks. An agent costs
+its whole context, and its report loses detail both ways, so the coordinator does tiny
+reads/deletions itself and never starts a fleet just to summarise. But work that splits into
+independent, large pieces is done in parallel (`sota-first`): one lane per piece, with a brief that
+states its outcome, its check and its paths (`worktree-per-lane` says how lanes share one
+directory). At most four lanes write in shared files of one tree at once (existing crates, a
+registry every lane appends to): that is what the main agent can compile within minutes of each
 report and admit onto the green head (`fan-out-write-only`); more such pieces wait for a slot. A
 lane whose whole piece is a new crate or a new directory of its own does not take a slot, nor does
 one that needs no compile of this tree (a tool in Python, a doc); the main agent still compiles each
