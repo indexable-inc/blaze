@@ -10,7 +10,7 @@
 //! division by zero traps"; a run whose input outcome is undefined or out of fuel says nothing
 //! of its output and is passed over.
 
-use std::alloc::Global;
+use blaze_own::testing::TestHeap;
 
 use blaze_sim::{Broke, Config, Tape, check, control};
 
@@ -27,6 +27,7 @@ use crate::{
     op::Op,
     print,
     ty::Ty,
+    verify,
 };
 
 /// Far past what a generated run takes (each loop runs at most four times).
@@ -46,8 +47,8 @@ const WIDTHS: [Ty; 4] = [Ty::I8, Ty::I32, Ty::I64, Ty::I128];
 
 /// A generated caller, its callee `g(x, y) = (x - y) + 3`, and how many calls it makes.
 struct Made {
-    func: Func<Global>,
-    callee: Func<Global>,
+    func: Func<TestHeap>,
+    callee: Func<TestHeap>,
     width: u32,
     calls: usize,
 }
@@ -58,7 +59,7 @@ struct Made {
 /// invariant parameter, a slot stored and loaded, and calls to `g`.
 struct Gen<'t> {
     t: &'t Tape,
-    b: Builder<Global, Full>,
+    b: Builder<TestHeap, Full>,
     ty: Ty,
     width: u32,
     /// The values every later point of the main path may use.
@@ -220,8 +221,8 @@ impl Gen<'_> {
 }
 
 /// `g(x, y) = (x - y) + 3` of `ty`.
-fn callee(ty: Ty) -> Result<Func<Global>, BuildError> {
-    let mut b = Builder::<Global, Full>::new_in(64, Global);
+fn callee(ty: Ty) -> Result<Func<TestHeap>, BuildError> {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(ty), Param::of(ty)], &[Param::of(ty)]);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
@@ -238,7 +239,7 @@ fn callee(ty: Ty) -> Result<Func<Global>, BuildError> {
 /// returned, so a wrong value anywhere shows.
 fn random(t: &Tape, calls: bool) -> Result<Made, BuildError> {
     let ty = WIDTHS[t.below(WIDTHS.len() as u64, "the width") as usize];
-    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(ty), Param::of(ty)], &[Param::of(ty)]);
     b.set_signature(sig);
     let callee_ref = calls.then(|| (b.reference(RefKind::Func, 0), sig));
@@ -288,7 +289,7 @@ fn arguments(t: &Tape, width: u32) -> [Val; 2] {
 }
 
 /// The input's outcome, or `None` when it says nothing of the output (undefined, out of fuel).
-fn defined(outcome: Result<Outcome<Global>, EvalError>, view: View<'_>) -> Result<Option<Outcome<Global>>, Broke> {
+fn defined(outcome: Result<Outcome<TestHeap>, EvalError>, view: View<'_>) -> Result<Option<Outcome<TestHeap>>, Broke> {
     match outcome {
         Ok(Outcome::Undefined { .. } | Outcome::OutOfFuel) => Ok(None),
         Ok(it) => Ok(Some(it)),
@@ -299,8 +300,8 @@ fn defined(outcome: Result<Outcome<Global>, EvalError>, view: View<'_>) -> Resul
 /// The output of `pass` ran to `after`: the same outcome as the input's `before`.
 fn same(
     pass: &str,
-    before: &Outcome<Global>,
-    after: Result<Outcome<Global>, EvalError>,
+    before: &Outcome<TestHeap>,
+    after: Result<Outcome<TestHeap>, EvalError>,
     input: View<'_>,
     output: View<'_>,
 ) -> Result<(), Broke> {
@@ -328,13 +329,13 @@ fn passes_agree(t: &Tape, plant: Plant) -> Result<(), Broke> {
     let made = random(t, false).map_err(|e| Broke::Harness(format!("the generator: {e}")))?;
     let view = made.func.view();
     let args = arguments(t, made.width);
-    let Some(before) = defined(run_in(view, &args, FUEL, Global), view)? else { return Ok(()) };
-    let propagated = propagate_planted(view, plant, Global).map_err(|e| refused("propagation", e, view))?;
-    same("propagation", &before, run_in(propagated.view(), &args, FUEL, Global), view, propagated.view())?;
-    let cleaned = dead(view, Global).map_err(|e| refused("dead code removal", e, view))?;
-    same("dead code removal", &before, run_in(cleaned.view(), &args, FUEL, Global), view, cleaned.view())?;
-    let both = dead(propagated.view(), Global).map_err(|e| refused("dead code removal", e, propagated.view()))?;
-    same("propagation then dead code removal", &before, run_in(both.view(), &args, FUEL, Global), view, both.view())
+    let Some(before) = defined(run_in(view, &args, FUEL, TestHeap), view)? else { return Ok(()) };
+    let propagated = propagate_planted(view, plant, TestHeap).map_err(|e| refused("propagation", e, view))?;
+    same("propagation", &before, run_in(propagated.view(), &args, FUEL, TestHeap), view, propagated.view())?;
+    let cleaned = dead(view, TestHeap).map_err(|e| refused("dead code removal", e, view))?;
+    same("dead code removal", &before, run_in(cleaned.view(), &args, FUEL, TestHeap), view, cleaned.view())?;
+    let both = dead(propagated.view(), TestHeap).map_err(|e| refused("dead code removal", e, propagated.view()))?;
+    same("propagation then dead code removal", &before, run_in(both.view(), &args, FUEL, TestHeap), view, both.view())
 }
 
 /// The stage on a caller of `g`: the caller run with `g` followed equals the output run (with
@@ -344,10 +345,10 @@ fn stage_agrees(t: &Tape) -> Result<(), Broke> {
     let view = made.func.view();
     let bodies = One { g: made.callee.view() };
     let args = arguments(t, made.width);
-    let before = run_calls_in(view, ROOT, &args, FUEL, &bodies, Global);
+    let before = run_calls_in(view, ROOT, &args, FUEL, &bodies, TestHeap);
     let Some(before) = defined(before, view)? else { return Ok(()) };
-    let (out, read) = simplify(view, ROOT, &bodies, TRIVIAL, Global).map_err(|e| refused("the simplify stage", e, view))?;
-    let after = run_calls_in(out.view(), ROOT, &args, FUEL, &bodies, Global);
+    let (out, read) = simplify(view, ROOT, &bodies, TRIVIAL, TestHeap).map_err(|e| refused("the simplify stage", e, view))?;
+    let after = run_calls_in(out.view(), ROOT, &args, FUEL, &bodies, TestHeap);
     same("the simplify stage", &before, after, view, out.view())?;
     let calls = |v: View<'_>| (0..v.len()).filter(|&i| v.op(i) == Op::Call).count();
     let spliced = calls(out.view()) < made.calls;
@@ -388,8 +389,8 @@ fn the_stage_keeps_what_the_caller_computes() {
 }
 
 /// A one-block function of `ty` with no parameters returning what `body` makes.
-fn one_block(ty: Ty, body: impl FnOnce(&mut Builder<Global, Full>) -> Value) -> Func<Global> {
-    let mut b = Builder::<Global, Full>::new_in(64, Global);
+fn one_block(ty: Ty, body: impl FnOnce(&mut Builder<TestHeap, Full>) -> Value) -> Func<TestHeap> {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
     let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(ty)]);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
@@ -403,6 +404,16 @@ fn ops(view: View<'_>) -> Vec<Op> {
     (0..view.len()).map(|i| view.op(i)).collect()
 }
 
+fn returned_int(out: &Outcome<TestHeap>) -> u128 {
+    match out {
+        Outcome::Returned(vals) => match vals.as_slice() {
+            [Val::Int(v)] => *v,
+            other => panic!("expected single int return, got {other:?}"),
+        },
+        other => panic!("expected Returned, got {other:?}"),
+    }
+}
+
 /// `5 - 7` of `i8` is `254` by the evaluator's wrapping `sub` (2^8 - 2): the stage's last two
 /// passes leave one `iconst` and the `return`.
 /// Expected: `test simplify::prop_tests::a_sub_of_constants_folds_to_the_evaluators_value ... ok`.
@@ -412,10 +423,10 @@ fn a_sub_of_constants_folds_to_the_evaluators_value() {
         let (five, seven) = (b.iconst(Ty::I8, 5), b.iconst(Ty::I8, 7));
         b.binary(Op::Sub, Flags::NONE, five, seven)
     });
-    let out = dead(propagate(func.view(), Global).expect("propagates").view(), Global).expect("cleans");
+    let out = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
     assert_eq!(ops(out.view()), [Op::Iconst, Op::Return], "{}", print(out.view()));
-    let ran = run_in(out.view(), &[], FUEL, Global).expect("runs");
-    assert_eq!(ran, Outcome::<Global>::Returned(vec![Val::Int(254)]));
+    let ran = run_in(out.view(), &[], FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&ran), 254);
 }
 
 /// "Division by zero traps" (lib.rs, Semantics): `7 / 0` is not folded, and still traps.
@@ -426,10 +437,10 @@ fn a_division_by_zero_stays_and_traps() {
         let (seven, zero) = (b.iconst(Ty::I32, 7), b.iconst(Ty::I32, 0));
         b.binary(Op::Udiv, Flags::NONE, seven, zero)
     });
-    let out = dead(propagate(func.view(), Global).expect("propagates").view(), Global).expect("cleans");
+    let out = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
     assert!(ops(out.view()).contains(&Op::Udiv), "{}", print(out.view()));
-    let ran = run_in(out.view(), &[], FUEL, Global).expect("runs");
-    assert_eq!(ran, Outcome::<Global>::Trapped(Trap::DivByZero));
+    let ran = run_in(out.view(), &[], FUEL, TestHeap).expect("runs");
+    assert_eq!(ran, Outcome::<TestHeap>::Trapped(Trap::DivByZero));
 }
 
 /// `add nsw` of `100 + 100` in `i8` overflows: a promise broken, undefined; the flag keeps the
@@ -441,7 +452,7 @@ fn a_flagged_add_is_not_folded() {
         let hundred = b.iconst(Ty::I8, 100);
         b.binary(Op::Add, Flags::NSW, hundred, hundred)
     });
-    let out = propagate(func.view(), Global).expect("propagates");
+    let out = propagate(func.view(), TestHeap).expect("propagates");
     assert!(ops(out.view()).contains(&Op::Add), "{}", print(out.view()));
 }
 
@@ -449,7 +460,7 @@ fn a_flagged_add_is_not_folded() {
 /// Expected: `test simplify::prop_tests::a_br_on_a_constant_becomes_a_jump ... ok`.
 #[test]
 fn a_br_on_a_constant_becomes_a_jump() {
-    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
     let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I32)]);
     b.set_signature(sig);
     let [entry, yes, no] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
@@ -463,11 +474,11 @@ fn a_br_on_a_constant_becomes_a_jump() {
     let two = b.iconst(Ty::I32, 2);
     b.ret(&[two]);
     let func = b.finish_checked().expect("builds");
-    let out = dead(func.view(), Global).expect("cleans");
+    let out = dead(func.view(), TestHeap).expect("cleans");
     assert_eq!(out.view().blocks(), 2, "{}", print(out.view()));
     assert!(!ops(out.view()).contains(&Op::Br), "{}", print(out.view()));
-    let ran = run_in(out.view(), &[], FUEL, Global).expect("runs");
-    assert_eq!(ran, Outcome::<Global>::Returned(vec![Val::Int(1)]));
+    let ran = run_in(out.view(), &[], FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&ran), 1);
 }
 
 /// A loop header's parameter given `x` on entry and itself on the back edge is `x`: after the
@@ -475,7 +486,7 @@ fn a_br_on_a_constant_becomes_a_jump() {
 /// Expected: `test simplify::prop_tests::an_invariant_loop_parameter_is_a_copy ... ok`.
 #[test]
 fn an_invariant_loop_parameter_is_a_copy() {
-    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
     b.set_signature(sig);
     let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
@@ -496,21 +507,21 @@ fn an_invariant_loop_parameter_is_a_copy() {
     let sum = b.binary(Op::Add, Flags::NONE, i, inv);
     b.ret(&[sum]);
     let func = b.finish_checked().expect("builds");
-    let out = dead(propagate(func.view(), Global).expect("propagates").view(), Global).expect("cleans");
+    let out = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
     let params = ops(out.view()).iter().filter(|&&op| op == Op::Param).count();
     assert_eq!(params, 2, "{}", print(out.view()));
     let args = [Val::Int(40)];
-    let before = run_in(func.view(), &args, FUEL, Global).expect("runs");
-    let after = run_in(out.view(), &args, FUEL, Global).expect("runs");
+    let before = run_in(func.view(), &args, FUEL, TestHeap).expect("runs");
+    let after = run_in(out.view(), &args, FUEL, TestHeap).expect("runs");
     assert_eq!(before, after);
-    assert_eq!(after, Outcome::<Global>::Returned(vec![Val::Int(43)]));
+    assert_eq!(returned_int(&after), 43);
 }
 
 /// A value that stands for a block parameter whose arguments fold to a constant propagates that
 /// constant to its own users (tests the CSR worklist's `stands` relay).
 #[test]
 fn a_stands_relay_chain_folds_dependent_instructions() {
-    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I1)], &[Param::of(Ty::I32)]);
     b.set_signature(sig);
     let [entry, then, other, join] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
@@ -536,7 +547,7 @@ fn a_stands_relay_chain_folds_dependent_instructions() {
     let plus_one = b.binary(Op::Add, Flags::NONE, sel, k);
     b.ret(&[plus_one]);
     let func = b.finish_checked().expect("builds");
-    let out = dead(propagate(func.view(), Global).expect("propagates").view(), Global).expect("cleans");
+    let out = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
     assert_eq!(
         ops(out.view()),
         [Op::Param, Op::Br, Op::Jump, Op::Jump, Op::Iconst, Op::Return],
@@ -544,15 +555,15 @@ fn a_stands_relay_chain_folds_dependent_instructions() {
         print(out.view())
     );
     for c in [0u128, 1] {
-        let ran = run_in(out.view(), &[Val::Int(c)], FUEL, Global).expect("runs");
-        assert_eq!(ran, Outcome::<Global>::Returned(vec![Val::Int(5)]));
+        let ran = run_in(out.view(), &[Val::Int(c)], FUEL, TestHeap).expect("runs");
+        assert_eq!(returned_int(&ran), 5);
     }
 }
 
 /// No-op fast paths for `propagate` and `dead` on a function with nothing to fold or remove.
 #[test]
 fn noop_function_preserves_ir_and_semantics() {
-    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32), Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
@@ -561,14 +572,12 @@ fn noop_function_preserves_ir_and_semantics() {
     let sum = b.binary(Op::Add, Flags::NONE, x, y);
     b.ret(&[sum]);
     let func = b.finish_checked().expect("builds");
-    let prop = propagate(func.view(), Global).expect("propagates");
-    let cleaned = dead(prop.view(), Global).expect("cleans");
+    let prop = propagate(func.view(), TestHeap).expect("propagates");
+    let cleaned = dead(prop.view(), TestHeap).expect("cleans");
     assert_eq!(ops(cleaned.view()), ops(func.view()));
     let args = [Val::Int(17), Val::Int(25)];
-    assert_eq!(
-        run_in(cleaned.view(), &args, FUEL, Global).expect("runs"),
-        Outcome::<Global>::Returned(vec![Val::Int(42)])
-    );
+    let ran = run_in(cleaned.view(), &args, FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&ran), 42);
 }
 
 /// A long chain of constant additions folds completely in linear time.
@@ -582,8 +591,324 @@ fn a_long_constant_chain_folds_completely() {
         }
         acc
     });
-    let out = dead(propagate(func.view(), Global).expect("propagates").view(), Global).expect("cleans");
+    let out = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
     assert_eq!(ops(out.view()), [Op::Iconst, Op::Return], "{}", print(out.view()));
-    let ran = run_in(out.view(), &[], FUEL, Global).expect("runs");
-    assert_eq!(ran, Outcome::<Global>::Returned(vec![Val::Int(512)]));
+    let ran = run_in(out.view(), &[], FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&ran), 512);
+}
+
+/// XOR-range proof: `(a ^ ((pos & 0x3fffff) | 0x400000 | (tag << 23))) <u 0x400000` guarantees
+/// bit 22 of `a` is `1`, so `a == 0` folds to `false` (and `a != 0` to `true`) on the true edge.
+#[test]
+fn xor_range_folds_eq_zero_and_ne_zero_on_true_branch() {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+    let sig = b.sig(
+        Conv::C,
+        Variadic::No,
+        &[Param::of(Ty::I32), Param::of(Ty::I32), Param::of(Ty::I32)],
+        &[Param::of(Ty::I32)],
+    );
+    b.set_signature(sig);
+    let [entry, hit, zero_blk, ok_blk, miss] = [(); 5].map(|_| b.create_block(BlockKind::Normal));
+    b.begin(entry);
+    let (a, pos, tag) = (b.param(Ty::I32), b.param(Ty::I32), b.param(Ty::I32));
+    let low_mask = b.iconst(Ty::I32, 0x3f_ffff);
+    let bit22 = b.iconst(Ty::I32, 0x40_0000);
+    let sh23 = b.iconst(Ty::I32, 23);
+    let pos_lo = b.binary(Op::And, Flags::NONE, pos, low_mask);
+    let with_bit = b.binary(Op::Or, Flags::NONE, pos_lo, bit22);
+    let tag_hi = b.binary(Op::Shl, Flags::NONE, tag, sh23);
+    let entry_val = b.binary(Op::Or, Flags::NONE, with_bit, tag_hi);
+    let diff = b.binary(Op::Xor, Flags::NONE, a, entry_val);
+    let cond = b.icmp(IntCond::Ult, diff, bit22);
+    b.br(Flags::NONE, cond, (hit, &[]), (miss, &[]));
+
+    b.begin(hit);
+    let zero = b.iconst(Ty::I32, 0);
+    let is_zero = b.icmp(IntCond::Eq, a, zero);
+    b.br(Flags::NONE, is_zero, (zero_blk, &[]), (ok_blk, &[]));
+
+    b.begin(zero_blk);
+    let bad = b.iconst(Ty::I32, 999);
+    b.ret(&[bad]);
+
+    b.begin(ok_blk);
+    let is_nz = b.icmp(IntCond::Ne, a, zero);
+    let one_v = b.iconst(Ty::I32, 11);
+    let zero_v = b.iconst(Ty::I32, 22);
+    let res = b.select(Flags::NONE, is_nz, one_v, zero_v);
+    b.ret(&[res]);
+
+    b.begin(miss);
+    let miss_v = b.iconst(Ty::I32, 7);
+    b.ret(&[miss_v]);
+
+    let func = b.finish_checked().expect("builds");
+    let prop = propagate(func.view(), TestHeap).expect("propagates");
+    verify(prop.view()).expect("verified after propagate");
+    let cleaned = dead(prop.view(), TestHeap).expect("cleans");
+    verify(cleaned.view()).expect("verified after dead");
+
+    // Only the initial XOR-range `icmp` and `br` remain: both `a == 0` and `a != 0` folded.
+    let icmps = ops(cleaned.view()).iter().filter(|&&op| op == Op::Icmp).count();
+    let brs = ops(cleaned.view()).iter().filter(|&&op| op == Op::Br).count();
+    assert_eq!(icmps, 1, "expected dead `a == 0` and `a != 0` to fold:\n{}", print(cleaned.view()));
+    assert_eq!(brs, 1, "expected dead `cbz` branch to vanish:\n{}", print(cleaned.view()));
+
+    let cases: &[[u128; 3]] = &[
+        [0, 12, 3],
+        [0x40_0005 | (3 << 23), 12, 3],
+        [0x40_0005 | (4 << 23), 12, 3],
+        [0x3f_ffff, 0, 0],
+        [0x40_0000, 0, 0],
+    ];
+    for &[av, pv, tv] in cases {
+        let args = [Val::Int(av), Val::Int(pv), Val::Int(tv)];
+        let before = run_in(func.view(), &args, FUEL, TestHeap).expect("before runs");
+        let after = run_in(cleaned.view(), &args, FUEL, TestHeap).expect("after runs");
+        assert_eq!(before, after, "mismatch on args ({av:#x}, {pv:#x}, {tv:#x})");
+    }
+}
+
+/// Inverted `Uge` on the false edge (`!((a ^ b) >=u 0x400000)`) and `Ule` (`<=u 0x3fffff`),
+/// plus `Zext` widening of `a` before comparing against `0`, all fold `== 0` to `false`.
+#[test]
+fn xor_range_ule_and_inverted_uge_false_branch_with_zext_fold_eq_zero() {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+    let sig = b.sig(
+        Conv::C,
+        Variadic::No,
+        &[Param::of(Ty::I32), Param::of(Ty::I32)],
+        &[Param::of(Ty::I32)],
+    );
+    b.set_signature(sig);
+    let [entry, hit, miss] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+    b.begin(entry);
+    let (a, y) = (b.param(Ty::I32), b.param(Ty::I32));
+    let a64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, a);
+    let bit22 = b.iconst(Ty::I32, 0x40_0000);
+    let tagged = b.binary(Op::Or, Flags::NONE, y, bit22);
+    let diff = b.binary(Op::Xor, Flags::NONE, tagged, a);
+    // Inverted condition: `miss` when `>= 0x400000`, `hit` on the false edge (`< 0x400000`).
+    let ge = b.icmp(IntCond::Uge, diff, bit22);
+    b.br(Flags::NONE, ge, (miss, &[]), (hit, &[]));
+
+    b.begin(hit);
+    let zero64 = b.iconst(Ty::I64, 0);
+    let is_zero64 = b.icmp(IntCond::Eq, a64, zero64);
+    let bad = b.iconst(Ty::I32, 100);
+    let ok = b.iconst(Ty::I32, 42);
+    let res = b.select(Flags::NONE, is_zero64, bad, ok);
+    b.ret(&[res]);
+
+    b.begin(miss);
+    let miss_v = b.iconst(Ty::I32, 5);
+    b.ret(&[miss_v]);
+
+    let func = b.finish_checked().expect("builds");
+    let cleaned = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
+    verify(cleaned.view()).expect("verified");
+    assert!(!ops(cleaned.view()).contains(&Op::Select), "{}", print(cleaned.view()));
+    assert_eq!(
+        ops(cleaned.view()).iter().filter(|&&op| op == Op::Icmp).count(),
+        1,
+        "{}",
+        print(cleaned.view())
+    );
+
+    for (av, yv) in [(0u128, 0u128), (0x40_0001, 0), (0x40_0001, 0x80_0000), (0xc0_0007, 0x80_0000)] {
+        let args = [Val::Int(av), Val::Int(yv)];
+        let before = run_in(func.view(), &args, FUEL, TestHeap).expect("before runs");
+        let after = run_in(cleaned.view(), &args, FUEL, TestHeap).expect("after runs");
+        assert_eq!(before, after, "mismatch on ({av:#x}, {yv:#x})");
+    }
+}
+
+/// 2-predecessor merge where BOTH incoming edges satisfy the XOR-range condition (matching
+/// `lz77_scan_fast_leaf`'s pos0/pos1 hit merge): the merged block parameter `prev_entry` is
+/// proven nonzero, folding `prev_entry == 0` -> `false`.
+#[test]
+fn xor_range_two_pred_merge_both_proven_nonzero_folds_param_eq_zero() {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+    let sig = b.sig(
+        Conv::C,
+        Variadic::No,
+        &[Param::of(Ty::I32), Param::of(Ty::I32), Param::of(Ty::I32), Param::of(Ty::I32)],
+        &[Param::of(Ty::I32)],
+    );
+    b.set_signature(sig);
+    let [entry, check1, hit, zero_blk, ok_blk, miss] = [(); 6].map(|_| b.create_block(BlockKind::Normal));
+    b.begin(entry);
+    let (pl0, y0, pl1, y1) = (b.param(Ty::I32), b.param(Ty::I32), b.param(Ty::I32), b.param(Ty::I32));
+    let bit22 = b.iconst(Ty::I32, 0x40_0000);
+    let max_lo = b.iconst(Ty::I32, 0x3f_ffff);
+    let el0 = b.binary(Op::Or, Flags::NONE, y0, bit22);
+    let d0 = b.binary(Op::Xor, Flags::NONE, pl0, el0);
+    let hit0 = b.icmp(IntCond::Ult, d0, bit22);
+    b.br(Flags::NONE, hit0, (hit, &[pl0]), (check1, &[]));
+
+    b.begin(check1);
+    let el1 = b.binary(Op::Or, Flags::NONE, y1, bit22);
+    let d1 = b.binary(Op::Xor, Flags::NONE, pl1, el1);
+    let hit1 = b.icmp(IntCond::Ule, d1, max_lo);
+    b.br(Flags::NONE, hit1, (hit, &[pl1]), (miss, &[]));
+
+    b.begin(hit);
+    let prev_entry = b.param(Ty::I32);
+    let zero = b.iconst(Ty::I32, 0);
+    let is_zero = b.icmp(IntCond::Eq, prev_entry, zero);
+    b.br(Flags::NONE, is_zero, (zero_blk, &[]), (ok_blk, &[]));
+
+    b.begin(zero_blk);
+    let zret = b.iconst(Ty::I32, 999);
+    b.ret(&[zret]);
+
+    b.begin(ok_blk);
+    b.ret(&[prev_entry]);
+
+    b.begin(miss);
+    let mret = b.iconst(Ty::I32, 0);
+    b.ret(&[mret]);
+
+    let func = b.finish_checked().expect("builds");
+    let prop = propagate(func.view(), TestHeap).expect("propagates");
+    verify(prop.view()).expect("verified after propagate");
+    let cleaned = dead(prop.view(), TestHeap).expect("cleans");
+    verify(cleaned.view()).expect("verified after dead");
+
+    // Only the 2 tag-match `icmp`/`br`s remain; `prev_entry == 0` folded and `zero_blk` vanished.
+    let icmps = ops(cleaned.view()).iter().filter(|&&op| op == Op::Icmp).count();
+    let brs = ops(cleaned.view()).iter().filter(|&&op| op == Op::Br).count();
+    assert_eq!(icmps, 2, "expected merged `prev_entry == 0` to fold:\n{}", print(cleaned.view()));
+    assert_eq!(brs, 2, "expected dead `cbz` in merge block to vanish:\n{}", print(cleaned.view()));
+
+    let cases: &[[u128; 4]] = &[
+        [0x40_0010, 0, 0, 0],
+        [0, 0, 0x40_0020, 0],
+        [0, 0, 0, 0],
+        [0x80_0000, 0, 0xc0_0077, 0x80_0000],
+    ];
+    for &[a0, b0, a1, b1] in cases {
+        let args = [Val::Int(a0), Val::Int(b0), Val::Int(a1), Val::Int(b1)];
+        let before = run_in(func.view(), &args, FUEL, TestHeap).expect("before runs");
+        let after = run_in(cleaned.view(), &args, FUEL, TestHeap).expect("after runs");
+        assert_eq!(before, after, "mismatch on {args:?}");
+    }
+}
+
+/// Negative control: bit 21 (`0x200000`) is strictly below `0x400000`, so `(a ^ (y | 0x200000))
+/// <u 0x400000` can hold when `a == 0` (`y = 0`); `a == 0` MUST NOT fold.
+#[test]
+fn xor_range_bit_below_bound_does_not_fold_eq_zero() {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+    let sig = b.sig(
+        Conv::C,
+        Variadic::No,
+        &[Param::of(Ty::I32), Param::of(Ty::I32)],
+        &[Param::of(Ty::I32)],
+    );
+    b.set_signature(sig);
+    let [entry, hit, miss] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+    b.begin(entry);
+    let (a, y) = (b.param(Ty::I32), b.param(Ty::I32));
+    let bit21 = b.iconst(Ty::I32, 0x20_0000);
+    let bound = b.iconst(Ty::I32, 0x40_0000);
+    let tagged = b.binary(Op::Or, Flags::NONE, y, bit21);
+    let diff = b.binary(Op::Xor, Flags::NONE, a, tagged);
+    let cond = b.icmp(IntCond::Ult, diff, bound);
+    b.br(Flags::NONE, cond, (hit, &[]), (miss, &[]));
+
+    b.begin(hit);
+    let zero = b.iconst(Ty::I32, 0);
+    let is_zero = b.icmp(IntCond::Eq, a, zero);
+    let was_zero = b.iconst(Ty::I32, 111);
+    let was_nz = b.iconst(Ty::I32, 222);
+    let res = b.select(Flags::NONE, is_zero, was_zero, was_nz);
+    b.ret(&[res]);
+
+    b.begin(miss);
+    let mret = b.iconst(Ty::I32, 333);
+    b.ret(&[mret]);
+
+    let func = b.finish_checked().expect("builds");
+    let cleaned = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
+    verify(cleaned.view()).expect("verified");
+
+    // `a == 0` must NOT fold: both `icmp`s and the `select` stay intact.
+    assert_eq!(
+        ops(cleaned.view()).iter().filter(|&&op| op == Op::Icmp).count(),
+        2,
+        "bit 21 < 22 must not fold `a == 0`:\n{}",
+        print(cleaned.view())
+    );
+    assert!(ops(cleaned.view()).contains(&Op::Select), "{}", print(cleaned.view()));
+
+    // On `(a = 0, y = 0)`: `(0 ^ 0x200000) < 0x400000` is true AND `a == 0` is true -> returns 111.
+    let ran_zero = run_in(cleaned.view(), &[Val::Int(0), Val::Int(0)], FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&ran_zero), 111);
+    let ran_nz = run_in(cleaned.view(), &[Val::Int(1), Val::Int(0)], FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&ran_nz), 222);
+}
+
+/// Negative control: 2-predecessor merge where one edge satisfies XOR-range but the other passes
+/// `0` into the merge parameter; `p == 0` in the merge block MUST NOT fold.
+#[test]
+fn xor_range_two_pred_merge_with_zero_edge_does_not_fold_param_eq_zero() {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+    let sig = b.sig(
+        Conv::C,
+        Variadic::No,
+        &[Param::of(Ty::I32), Param::of(Ty::I32)],
+        &[Param::of(Ty::I32)],
+    );
+    b.set_signature(sig);
+    let [entry, fallback, hit, zero_blk, ok_blk] = [(); 5].map(|_| b.create_block(BlockKind::Normal));
+    b.begin(entry);
+    let (pl0, y0) = (b.param(Ty::I32), b.param(Ty::I32));
+    let bit22 = b.iconst(Ty::I32, 0x40_0000);
+    let el0 = b.binary(Op::Or, Flags::NONE, y0, bit22);
+    let d0 = b.binary(Op::Xor, Flags::NONE, pl0, el0);
+    let hit0 = b.icmp(IntCond::Ult, d0, bit22);
+    b.br(Flags::NONE, hit0, (hit, &[pl0]), (fallback, &[]));
+
+    b.begin(fallback);
+    let zero_arg = b.iconst(Ty::I32, 0);
+    b.jump((hit, &[zero_arg]));
+
+    b.begin(hit);
+    let p = b.param(Ty::I32);
+    let zero = b.iconst(Ty::I32, 0);
+    let is_zero = b.icmp(IntCond::Eq, p, zero);
+    b.br(Flags::NONE, is_zero, (zero_blk, &[]), (ok_blk, &[]));
+
+    b.begin(zero_blk);
+    let zret = b.iconst(Ty::I32, 55);
+    b.ret(&[zret]);
+
+    b.begin(ok_blk);
+    b.ret(&[p]);
+
+    let func = b.finish_checked().expect("builds");
+    let cleaned = dead(propagate(func.view(), TestHeap).expect("propagates").view(), TestHeap).expect("cleans");
+    verify(cleaned.view()).expect("verified");
+
+    // Both `icmp`s and both `br`s must remain since `fallback` passes `0`.
+    assert_eq!(
+        ops(cleaned.view()).iter().filter(|&&op| op == Op::Icmp).count(),
+        2,
+        "merge with 0-arg edge must not fold `p == 0`:\n{}",
+        print(cleaned.view())
+    );
+    assert_eq!(
+        ops(cleaned.view()).iter().filter(|&&op| op == Op::Br).count(),
+        2,
+        "merge with 0-arg edge must keep `p == 0` branch:\n{}",
+        print(cleaned.view())
+    );
+
+    // Fallback edge passes 0 -> returns 55; XOR-range hit passes 0x40_0010 -> returns 0x40_0010.
+    let via_zero = run_in(cleaned.view(), &[Val::Int(0), Val::Int(0)], FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&via_zero), 55);
+    let via_hit = run_in(cleaned.view(), &[Val::Int(0x40_0010), Val::Int(0)], FUEL, TestHeap).expect("runs");
+    assert_eq!(returned_int(&via_hit), 0x40_0010);
 }

@@ -10,10 +10,11 @@
 //! - **Memory LICM**: hoists non-volatile loop-invariant loads out of natural loops into the
 //!   dominating `Jump` preheader when no aliasing store/call/atomic occurs in the loop AND the
 //!   load is guaranteed dereferenceable (in `header` or from a `SlotAddr`).
-//! - **Intra-Block Sub-Word Load Forwarding & Byte-Gather Folding**: on little-endian targets,
-//!   forwards narrow scalar integer loads from enclosing wider scalar integer stores
-//!   (`to_le_bytes()` elimination) and folds contiguous `I8` stores into `I16`/`I32`/`I64` loads
-//!   (`from_le_bytes()` elimination) on non-escaping stack slots.
+//! - **Intra-Block Sub-Word Load Forwarding & Mixed-Width Piece Folding**: on little-endian
+//!   targets, forwards narrow scalar integer loads from enclosing wider scalar integer stores
+//!   (`to_le_bytes()` elimination) and folds disjoint covering `I8`/`I16`/`I32` stores into
+//!   wider `I16`/`I32`/`I64` loads (`from_le_bytes()` / packed struct construction) on
+//!   non-escaping stack slots.
 //! - **Dead Store Elimination (DSE)**: removes overwritten non-volatile stores to the exact same
 //!   `(base, offset, size)` with no intervening aliasing load/call/atomic/fence, as well as
 //!   non-volatile stores to unread or post-return dead non-escaping stack slots.
@@ -42,6 +43,8 @@ pub struct MemOptStats {
     pub loads_hoisted: u32,
     /// Overwritten dead stores eliminated within basic blocks.
     pub dead_stores_eliminated: u32,
+    /// Dead temporary bulk-copy slots elided (`Memset -> Memcpy` / `Memcpy -> Memcpy`).
+    pub temp_copies_elided: u32,
 }
 
 /// Output of [`optimize_memory`].
@@ -431,7 +434,669 @@ fn intern_align_attr<A: Allocator>(func: &mut Func<A>, align: u8) -> u32 {
     row.saturating_add(1)
 }
 
-/// Scalarizes non-volatile `Op::Memcpy` and `Op::Memmove` instructions into overlap-safe
+fn intern_bulk_attr<A: Allocator>(func: &mut Func<A>, align: u8, src_align: u8) -> u32 {
+    if align == 0 && src_align == 0 {
+        return 0;
+    }
+    let rec = MemAttrsRec { range: 0, align, src_align, pointee_align: 0, bits: 0 };
+    if let Some(pos) = func.mem_attrs.iter().position(|it| *it == rec) {
+        return to_u32(pos).saturating_add(1);
+    }
+    let row = to_u32(func.mem_attrs.len());
+    func.mem_attrs.push(rec);
+    row.saturating_add(1)
+}
+
+const MAX_TEMP_COPY_ELISION_PASSES: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TempWriterKind {
+    None,
+    Memset {
+        inst: u32,
+        byte_val: u32,
+        len: u64,
+    },
+    Copy {
+        inst: u32,
+        src: u32,
+        len: u64,
+        src_align: u8,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TempReader {
+    slot: u32,
+    inst: u32,
+    dst: u32,
+    len_val: u32,
+    len: u64,
+    dst_align: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TempCopyRewrite {
+    Keep,
+    Delete,
+    ToMemset {
+        dst: u32,
+        byte_val: u32,
+        len_val: u32,
+        dst_align: u8,
+    },
+    ToCopy {
+        op: Op,
+        dst: u32,
+        src: u32,
+        len_val: u32,
+        dst_align: u8,
+        src_align: u8,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PtrOrigin {
+    Slot { slot: u32, off: Option<i64> },
+    EntryParam,
+    Data,
+    Unknown,
+}
+
+fn resolve_ptr_origin(view: &View<'_>, block_of: &[u32], mut ptr: u32) -> PtrOrigin {
+    let mut off: Option<i64> = Some(0);
+    let mut all_inbounds = true;
+    let mut hopped = false;
+    for _ in 0..8 {
+        let pi = to_idx(ptr);
+        if view.op(pi) == Op::PtrAdd {
+            if !Flags(at_u8(view.flags, pi)).contains(Flags::INBOUNDS) {
+                all_inbounds = false;
+            }
+            let at = to_idx(at_u32(view.data, pi));
+            let base = at_u32(view.extra, at);
+            let by = at_u32(view.extra, at.saturating_add(1));
+            off = off
+                .and_then(|cur| const_i64(view, to_idx(by)).and_then(|d| cur.checked_add(d)));
+            ptr = base;
+            hopped = true;
+            continue;
+        }
+        break;
+    }
+    let pi = to_idx(ptr);
+    match view.op(pi) {
+        Op::SlotAddr if off.is_some() || all_inbounds => {
+            PtrOrigin::Slot { slot: at_u32(view.data, pi), off }
+        }
+        Op::Param if at_u32(block_of, pi) == 0 && (!hopped || all_inbounds) => {
+            PtrOrigin::EntryParam
+        }
+        Op::DataAddr if !hopped || all_inbounds => PtrOrigin::Data,
+        _ => PtrOrigin::Unknown,
+    }
+}
+
+fn slot_range_in_bounds(view: &View<'_>, slot: u32, off: i64, len: u64) -> bool {
+    let Some(rec) = view.slots.get(to_idx(slot)) else {
+        return false;
+    };
+    let Ok(off_u64) = u64::try_from(off) else {
+        return false;
+    };
+    off_u64.checked_add(len).is_some_and(|end| end <= u64::from(rec.size))
+}
+
+fn ptrs_provably_disjoint(
+    view: &View<'_>,
+    block_of: &[u32],
+    a: u32,
+    b: u32,
+    len: u64,
+) -> bool {
+    let oa = resolve_ptr_origin(view, block_of, a);
+    let ob = resolve_ptr_origin(view, block_of, b);
+    match (oa, ob) {
+        (PtrOrigin::Slot { slot: sa, off: oa_off }, PtrOrigin::Slot { slot: sb, off: ob_off }) => {
+            if sa != sb {
+                let a_ok = oa_off.is_none_or(|o| slot_range_in_bounds(view, sa, o, len));
+                let b_ok = ob_off.is_none_or(|o| slot_range_in_bounds(view, sb, o, len));
+                a_ok && b_ok
+            } else if let (Some(off_a), Some(off_b)) = (oa_off, ob_off)
+                && slot_range_in_bounds(view, sa, off_a, len)
+                && slot_range_in_bounds(view, sb, off_b, len)
+                && let Ok(len_i64) = i64::try_from(len)
+                && let (Some(end_a), Some(end_b)) =
+                    (off_a.checked_add(len_i64), off_b.checked_add(len_i64))
+            {
+                end_a <= off_b || end_b <= off_a
+            } else {
+                false
+            }
+        }
+        (PtrOrigin::Slot { slot, off }, PtrOrigin::EntryParam | PtrOrigin::Data)
+        | (PtrOrigin::EntryParam | PtrOrigin::Data, PtrOrigin::Slot { slot, off }) => {
+            off.is_none_or(|o| slot_range_in_bounds(view, slot, o, len))
+        }
+        _ => false,
+    }
+}
+
+fn blocks_temp_copy_elision(
+    view: &View<'_>,
+    inst: usize,
+    temp_slot: u32,
+    src_origin: PtrOrigin,
+) -> bool {
+    match view.op(inst) {
+        Op::Store
+        | Op::Memcpy
+        | Op::Memmove
+        | Op::Memset
+        | Op::MaskedStore
+        | Op::Scatter
+        | Op::Call
+        | Op::CallIndirect
+        | Op::Invoke
+        | Op::InvokeIndirect
+        | Op::TailCall
+        | Op::TailCallIndirect
+        | Op::AtomicLoad
+        | Op::AtomicStore
+        | Op::AtomicRmw
+        | Op::Cmpxchg
+        | Op::Fence
+        | Op::Asm
+        | Op::AsmBr
+        | Op::TargetIntrinsic
+        | Op::Suspend => true,
+        Op::Load => Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE),
+        Op::SlotLive | Op::SlotDead => {
+            let k_slot = at_u32(view.data, inst);
+            if k_slot == temp_slot {
+                true
+            } else {
+                match src_origin {
+                    PtrOrigin::Slot { slot: s_slot, .. } => k_slot == s_slot,
+                    PtrOrigin::EntryParam | PtrOrigin::Data => false,
+                    PtrOrigin::Unknown => true,
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
+fn eliminate_temp_bulk_copies_round<A: Allocator + Copy>(
+    view: View<'_>,
+    alloc: A,
+) -> Result<Option<(Func<A>, u32)>, SimplifyError> {
+    let nslots = view.slots.len();
+    let len = view.len();
+    if nslots == 0 || len == 0 {
+        return Ok(None);
+    }
+
+    // Fast path: every rewrite eliminates a non-volatile `Memcpy`/`Memmove` reader.
+    let mut has_bulk_copy = false;
+    for inst in 0..len {
+        if matches!(view.op(inst), Op::Memcpy | Op::Memmove)
+            && Flags(at_u8(view.flags, inst)).0 == 0
+        {
+            has_bulk_copy = true;
+            break;
+        }
+    }
+    if !has_bulk_copy {
+        return Ok(None);
+    }
+
+    let mut slot_addr_of = filled(len, NONE, &alloc);
+    for inst in 0..len {
+        if view.op(inst) == Op::SlotAddr {
+            set_at(&mut slot_addr_of, inst, at_u32(view.data, inst));
+        }
+    }
+
+    let blocks = view.blocks();
+    let mut block_of = filled(len, 0u32, &alloc);
+    for b in 0..blocks {
+        let b32 = to_u32(b);
+        for inst in view.block(Block(b32)) {
+            set_at(&mut block_of, inst, b32);
+        }
+    }
+
+    // Classify every use of every `Op::SlotAddr(slot_id)` across the entire function.
+    let mut ineligible = filled(nslots, false, &alloc);
+    let mut writers = filled(nslots, TempWriterKind::None, &alloc);
+    let mut readers: Vec<TempReader, A> = Vec::new_in(alloc);
+
+    for inst in 0..len {
+        let op = view.op(inst);
+        match op {
+            Op::Memset => {
+                let at = to_idx(at_u32(view.data, inst));
+                let dst = at_u32(view.extra, at);
+                let byte_val = at_u32(view.extra, at.saturating_add(1));
+                let len_val = at_u32(view.extra, at.saturating_add(2));
+
+                let b_slot = at_u32(&slot_addr_of, to_idx(byte_val));
+                if b_slot != NONE {
+                    set_at(&mut ineligible, to_idx(b_slot), true);
+                }
+                let l_slot = at_u32(&slot_addr_of, to_idx(len_val));
+                if l_slot != NONE {
+                    set_at(&mut ineligible, to_idx(l_slot), true);
+                }
+
+                let dst_slot = at_u32(&slot_addr_of, to_idx(dst));
+                if dst_slot != NONE {
+                    let s_idx = to_idx(dst_slot);
+                    let const_len = if Flags(at_u8(view.flags, inst)).0 == 0 {
+                        const_u64(&view, to_idx(len_val))
+                            .filter(|&n| n > 0 && slot_range_in_bounds(&view, dst_slot, 0, n))
+                    } else {
+                        None
+                    };
+                    if let Some(n) = const_len
+                        && writers.get(s_idx).copied() == Some(TempWriterKind::None)
+                    {
+                        set_at(
+                            &mut writers,
+                            s_idx,
+                            TempWriterKind::Memset { inst: to_u32(inst), byte_val, len: n },
+                        );
+                    } else {
+                        set_at(&mut ineligible, s_idx, true);
+                    }
+                }
+            }
+            Op::Memcpy | Op::Memmove => {
+                let at = to_idx(at_u32(view.data, inst));
+                let dst = at_u32(view.extra, at);
+                let src = at_u32(view.extra, at.saturating_add(1));
+                let len_val = at_u32(view.extra, at.saturating_add(2));
+
+                let l_slot = at_u32(&slot_addr_of, to_idx(len_val));
+                if l_slot != NONE {
+                    set_at(&mut ineligible, to_idx(l_slot), true);
+                }
+
+                let dst_slot = at_u32(&slot_addr_of, to_idx(dst));
+                let src_slot = at_u32(&slot_addr_of, to_idx(src));
+                if dst_slot != NONE && dst_slot == src_slot {
+                    set_at(&mut ineligible, to_idx(dst_slot), true);
+                    continue;
+                }
+
+                let const_len = if Flags(at_u8(view.flags, inst)).0 == 0 {
+                    const_u64(&view, to_idx(len_val)).filter(|&n| n > 0)
+                } else {
+                    None
+                };
+                let (dst_align, src_align) = match view.mem_attrs(inst) {
+                    Some(m) => (m.align, m.src_align),
+                    None => (0, 0),
+                };
+
+                if dst_slot != NONE {
+                    let s_idx = to_idx(dst_slot);
+                    if let Some(n) = const_len
+                        && slot_range_in_bounds(&view, dst_slot, 0, n)
+                        && writers.get(s_idx).copied() == Some(TempWriterKind::None)
+                    {
+                        set_at(
+                            &mut writers,
+                            s_idx,
+                            TempWriterKind::Copy { inst: to_u32(inst), src, len: n, src_align },
+                        );
+                    } else {
+                        set_at(&mut ineligible, s_idx, true);
+                    }
+                }
+
+                if src_slot != NONE {
+                    let s_idx = to_idx(src_slot);
+                    if let Some(n) = const_len
+                        && slot_range_in_bounds(&view, src_slot, 0, n)
+                    {
+                        readers.push(TempReader {
+                            slot: src_slot,
+                            inst: to_u32(inst),
+                            dst,
+                            len_val,
+                            len: n,
+                            dst_align,
+                        });
+                    } else {
+                        set_at(&mut ineligible, s_idx, true);
+                    }
+                }
+            }
+            Op::SlotAddr | Op::SlotLive | Op::SlotDead => {}
+            _ => {
+                each(&view, inst, |item| match item {
+                    Item::Value(v) => {
+                        let s = at_u32(&slot_addr_of, to_idx(v));
+                        if s != NONE {
+                            set_at(&mut ineligible, to_idx(s), true);
+                        }
+                    }
+                    Item::Edge(edge) => {
+                        if let Some((arg_start, arg_len)) = edge.args {
+                            for k in 0..arg_len {
+                                let v = at_u32(view.extra, arg_start.saturating_add(k));
+                                let s = at_u32(&slot_addr_of, to_idx(v));
+                                if s != NONE {
+                                    set_at(&mut ineligible, to_idx(s), true);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    if readers.is_empty() {
+        return Ok(None);
+    }
+    readers.sort_unstable_by_key(|r| (r.slot, r.inst));
+
+    let mut rewrites = filled(len, TempCopyRewrite::Keep, &alloc);
+    let mut inst_touched = filled(len, false, &alloc);
+    let mut slot_eliminated = filled(nslots, false, &alloc);
+    let mut eliminated_count = 0u32;
+
+    for s in 0..nslots {
+        if at_bool(&ineligible, s) {
+            continue;
+        }
+        let writer = writers.get(s).copied().unwrap_or(TempWriterKind::None);
+        if writer == TempWriterKind::None {
+            continue;
+        }
+
+        let s32 = to_u32(s);
+        let r_start = readers.partition_point(|r| r.slot < s32);
+        let r_rest = readers.get(r_start..).unwrap_or(&[]);
+        let r_len = r_rest.partition_point(|r| r.slot == s32);
+        let slot_readers = r_rest.get(..r_len).unwrap_or(&[]);
+        if slot_readers.is_empty() {
+            continue;
+        }
+
+        match writer {
+            TempWriterKind::None => {}
+            TempWriterKind::Memset { inst: w_u32, byte_val, len: w_len } => {
+                let w_inst = to_idx(w_u32);
+                if at_bool(&inst_touched, w_inst) {
+                    continue;
+                }
+                let w_block = at_u32(&block_of, w_inst);
+                let mut ok = true;
+                for &r in slot_readers {
+                    let r_inst = to_idx(r.inst);
+                    if r.len != w_len
+                        || at_u32(&block_of, r_inst) != w_block
+                        || w_inst >= r_inst
+                        || at_bool(&inst_touched, r_inst)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let max_r_inst = slot_readers.last().map_or(0, |r| to_idx(r.inst));
+                for k in w_inst.saturating_add(1)..max_r_inst {
+                    if matches!(view.op(k), Op::SlotLive | Op::SlotDead)
+                        && at_u32(view.data, k) == s32
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+
+                set_at(&mut inst_touched, w_inst, true);
+                set_at(&mut rewrites, w_inst, TempCopyRewrite::Delete);
+                for &r in slot_readers {
+                    let r_inst = to_idx(r.inst);
+                    set_at(&mut inst_touched, r_inst, true);
+                    set_at(
+                        &mut rewrites,
+                        r_inst,
+                        TempCopyRewrite::ToMemset {
+                            dst: r.dst,
+                            byte_val,
+                            len_val: r.len_val,
+                            dst_align: r.dst_align,
+                        },
+                    );
+                }
+                set_at(&mut slot_eliminated, s, true);
+                eliminated_count = eliminated_count.saturating_add(1);
+            }
+            TempWriterKind::Copy {
+                inst: w_u32,
+                src: w_src,
+                len: w_len,
+                src_align: w_src_align,
+            } => {
+                if slot_readers.len() != 1 {
+                    continue;
+                }
+                let Some(&r) = slot_readers.first() else {
+                    continue;
+                };
+                let w_inst = to_idx(w_u32);
+                let r_inst = to_idx(r.inst);
+                if r.len != w_len
+                    || at_u32(&block_of, r_inst) != at_u32(&block_of, w_inst)
+                    || w_inst >= r_inst
+                    || at_bool(&inst_touched, w_inst)
+                    || at_bool(&inst_touched, r_inst)
+                {
+                    continue;
+                }
+
+                let src_origin = resolve_ptr_origin(&view, &block_of, w_src);
+                let mut blocked = false;
+                for k in w_inst.saturating_add(1)..r_inst {
+                    if blocks_temp_copy_elision(&view, k, s32, src_origin) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if blocked {
+                    continue;
+                }
+
+                let copy_op = if ptrs_provably_disjoint(&view, &block_of, r.dst, w_src, w_len) {
+                    Op::Memcpy
+                } else {
+                    Op::Memmove
+                };
+                set_at(&mut inst_touched, w_inst, true);
+                set_at(&mut inst_touched, r_inst, true);
+                set_at(&mut rewrites, w_inst, TempCopyRewrite::Delete);
+                set_at(
+                    &mut rewrites,
+                    r_inst,
+                    TempCopyRewrite::ToCopy {
+                        op: copy_op,
+                        dst: r.dst,
+                        src: w_src,
+                        len_val: r.len_val,
+                        dst_align: r.dst_align,
+                        src_align: w_src_align,
+                    },
+                );
+                set_at(&mut slot_eliminated, s, true);
+                eliminated_count = eliminated_count.saturating_add(1);
+            }
+        }
+    }
+
+    if eliminated_count == 0 {
+        return Ok(None);
+    }
+
+    // Delete dead `SlotAddr`, `SlotLive`, and `SlotDead` instructions of eliminated slots.
+    for inst in 0..len {
+        if matches!(view.op(inst), Op::SlotAddr | Op::SlotLive | Op::SlotDead)
+            && at_bool(&slot_eliminated, to_idx(at_u32(view.data, inst)))
+        {
+            set_at(&mut rewrites, inst, TempCopyRewrite::Delete);
+        }
+    }
+
+    // Pass 1: precompute old->new instruction index map.
+    let mut val_map = filled(len, NONE, &alloc);
+    let mut next_idx: usize = 0;
+    for inst in 0..len {
+        if rewrites.get(inst).copied().unwrap_or(TempCopyRewrite::Keep) != TempCopyRewrite::Delete {
+            set_at(&mut val_map, inst, to_u32(next_idx));
+            next_idx = next_idx.saturating_add(1);
+        }
+    }
+
+    // Pass 2: rebuild instructions and compact `slots` / `variables` in one pass.
+    let mut func = view.to_func_in(alloc);
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+    func.slots.clear();
+    func.variables.clear();
+
+    let mut slot_row = filled(nslots, NONE, &alloc);
+    for (s, rec) in view.slots.iter().enumerate() {
+        if !at_bool(&slot_eliminated, s) {
+            set_at(&mut slot_row, s, to_u32(func.slots.len()));
+            func.slots.push(*rec);
+        }
+    }
+    for var in view.variables {
+        let row = at_u32(&slot_row, to_idx(var.slot));
+        if row != NONE {
+            let mut mapped = *var;
+            mapped.slot = row;
+            func.variables.push(mapped);
+        }
+    }
+
+    let memset_op = op_byte(Op::Memset);
+    let memcpy_op = op_byte(Op::Memcpy);
+    let memmove_op = op_byte(Op::Memmove);
+
+    for b in 0..blocks {
+        let b32 = to_u32(b);
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(at_u8(view.block_kinds, b));
+        for inst in view.block(Block(b32)) {
+            let loc = at_u32(view.locs, inst);
+            let rw = rewrites.get(inst).copied().unwrap_or(TempCopyRewrite::Keep);
+            match rw {
+                TempCopyRewrite::Delete => {}
+                TempCopyRewrite::Keep => {
+                    if matches!(view.op(inst), Op::SlotAddr | Op::SlotLive | Op::SlotDead) {
+                        let mapped_slot = at_u32(&slot_row, to_idx(at_u32(view.data, inst)));
+                        func.ops.push(at_u8(view.ops, inst));
+                        func.flags.push(at_u8(view.flags, inst));
+                        func.tys.push(at_u16(view.tys, inst));
+                        func.data.push(mapped_slot);
+                        func.attrs.push(at_u32(view.attrs, inst));
+                        func.locs.push(loc);
+                    } else {
+                        let _ = copy_inst_same_blocks(&view, inst, &val_map, &mut func);
+                    }
+                }
+                TempCopyRewrite::ToMemset { dst, byte_val, len_val, dst_align } => {
+                    let new_dst = at_u32(&val_map, to_idx(dst));
+                    let new_byte = at_u32(&val_map, to_idx(byte_val));
+                    let new_len = at_u32(&val_map, to_idx(len_val));
+                    let attr = intern_align_attr(&mut func, dst_align);
+                    let extra_at = to_u32(func.extra.len());
+                    func.extra.push(new_dst);
+                    func.extra.push(new_byte);
+                    func.extra.push(new_len);
+                    func.ops.push(memset_op);
+                    func.flags.push(Flags::NONE.0);
+                    func.tys.push(Ty::NONE.0);
+                    func.data.push(extra_at);
+                    func.attrs.push(attr);
+                    func.locs.push(loc);
+                }
+                TempCopyRewrite::ToCopy { op, dst, src, len_val, dst_align, src_align } => {
+                    let new_dst = at_u32(&val_map, to_idx(dst));
+                    let new_src = at_u32(&val_map, to_idx(src));
+                    let new_len = at_u32(&val_map, to_idx(len_val));
+                    let attr = intern_bulk_attr(&mut func, dst_align, src_align);
+                    let extra_at = to_u32(func.extra.len());
+                    func.extra.push(new_dst);
+                    func.extra.push(new_src);
+                    func.extra.push(new_len);
+                    let raw_op = if op == Op::Memcpy { memcpy_op } else { memmove_op };
+                    func.ops.push(raw_op);
+                    func.flags.push(Flags::NONE.0);
+                    func.tys.push(Ty::NONE.0);
+                    func.data.push(extra_at);
+                    func.attrs.push(attr);
+                    func.locs.push(loc);
+                }
+            }
+        }
+    }
+
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok(Some((func, eliminated_count)))
+}
+
+fn eliminate_temp_bulk_copies_view<A: Allocator + Copy>(
+    view: View<'_>,
+    alloc: A,
+) -> Result<Option<(Func<A>, u32)>, SimplifyError> {
+    let Some((mut cur, first_elided)) = eliminate_temp_bulk_copies_round(view, alloc)? else {
+        return Ok(None);
+    };
+    let mut total = first_elided;
+    for _ in 1..MAX_TEMP_COPY_ELISION_PASSES {
+        let Some((next, elided)) = eliminate_temp_bulk_copies_round(cur.view(), alloc)? else {
+            break;
+        };
+        cur = next;
+        total = total.saturating_add(elided);
+    }
+    let cleaned = dead(cur.view(), alloc)?;
+    Ok(Some((cleaned, total)))
+}
+
+/// Eliminates dead temporary local stack slots used solely as single-writer bulk-copy staging
+/// buffers (`Op::Memset -> Op::Memcpy/Memmove` and `Op::Memcpy/Memmove -> Op::Memcpy/Memmove`),
+/// compacting eliminated stack slots and running up to 4 fixed-point passes followed by `dead`.
+pub fn eliminate_temp_bulk_copies<A: Allocator + Copy>(
+    func: Func<A>,
+    alloc: A,
+) -> Result<(Func<A>, u32), SimplifyError> {
+    match eliminate_temp_bulk_copies_view(func.view(), alloc)? {
+        Some((cleaned, total)) => Ok((cleaned, total)),
+        None => Ok((func, 0)),
+    }
+}
+
+/// Elides dead temporary bulk-copy chains (`Memset -> Memcpy`, `Memcpy -> Memcpy`) and then
+/// scalarizes non-volatile `Op::Memcpy` and `Op::Memmove` instructions into overlap-safe
 /// `Op::Load` + `Op::Store` sequences (all loads before all stores):
 /// - Constant lengths `1`, `2`, `4`, or `8` bytes on any pointer (`Ty::I8`/`I16`/`I32`/`I64`).
 /// - Constant lengths `1..=32` bytes when `src` or `dst` resolves to a local `Op::SlotAddr`,
@@ -443,28 +1108,30 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
     view: View<'_>,
     alloc: A,
 ) -> Result<Option<Func<A>>, SimplifyError> {
-    let len = view.len();
+    let elided = eliminate_temp_bulk_copies_view(view, alloc)?;
+    let work_view = elided.as_ref().map_or(view, |(f, _)| f.view());
+    let len = work_view.len();
     let mut has_plain_small = false;
     let mut has_slot_candidate = false;
     for inst in 0..len {
-        let Some(op) = bulk_small_memop(&view, inst) else {
+        let Some(op) = bulk_small_memop(&work_view, inst) else {
             continue;
         };
         if matches!(op.len, 1 | 2 | 4 | 8) {
             has_plain_small = true;
-        } else if resolve_slot_copy_range(&view, op.src, op.len).is_some()
-            || resolve_slot_copy_range(&view, op.dst, op.len).is_some()
+        } else if resolve_slot_copy_range(&work_view, op.src, op.len).is_some()
+            || resolve_slot_copy_range(&work_view, op.dst, op.len).is_some()
         {
             has_slot_candidate = true;
             break;
         }
     }
     if !has_plain_small && !has_slot_candidate {
-        return Ok(None);
+        return Ok(elided.map(|(f, _)| f));
     }
 
     let slot_fields = if has_slot_candidate {
-        collect_slot_fields(&view, alloc)
+        collect_slot_fields(&work_view, alloc)
     } else {
         SlotFields::empty(alloc)
     };
@@ -475,7 +1142,7 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
     let mut next_idx: usize = 0;
     let mut any_rewritten = false;
     for inst in 0..len {
-        if let Some(plan) = small_memop_plan(&view, inst, &slot_fields) {
+        if let Some(plan) = small_memop_plan(&work_view, inst, &slot_fields) {
             // `Memcpy`/`Memmove` produces no value (`Ty::NONE`) and expands to `n` `Load`s
             // followed by `n` `Store`s.
             let expanded = usize::from(plan.len).saturating_mul(2);
@@ -487,7 +1154,7 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
         }
     }
     if !any_rewritten {
-        return Ok(None);
+        return Ok(elided.map(|(f, _)| f));
     }
     if next_idx >= to_idx(NONE) {
         return Err(SimplifyError::Refused { inst: 0, what: "more values than LIR numbers" });
@@ -496,7 +1163,7 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
     // Pass 2: rebuild instructions, replacing each matching bulk op with all `n` `Load`s into SSA
     // values followed by all `n` `Store`s. Because every source byte is loaded before any
     // destination byte is written, this is overlap-safe even for `Op::Memmove`.
-    let mut func = view.to_func_in(alloc);
+    let mut func = work_view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -509,20 +1176,20 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
 
     let load_op = op_byte(Op::Load);
     let store_op = op_byte(Op::Store);
-    let blocks = view.blocks();
+    let blocks = work_view.blocks();
     for b in 0..blocks {
         let b32 = to_u32(b);
         func.block_starts.push(to_u32(func.ops.len()));
-        func.block_kinds.push(at_u8(view.block_kinds, b));
-        for inst in view.block(Block(b32)) {
-            if let Some(plan) = small_memop_plan(&view, inst, &slot_fields) {
-                let at = to_idx(at_u32(view.data, inst));
-                let old_dst = at_u32(view.extra, at);
-                let old_src = at_u32(view.extra, at.saturating_add(1));
+        func.block_kinds.push(at_u8(work_view.block_kinds, b));
+        for inst in work_view.block(Block(b32)) {
+            if let Some(plan) = small_memop_plan(&work_view, inst, &slot_fields) {
+                let at = to_idx(at_u32(work_view.data, inst));
+                let old_dst = at_u32(work_view.extra, at);
+                let old_src = at_u32(work_view.extra, at.saturating_add(1));
                 let new_dst = at_u32(&val_map, to_idx(old_dst));
                 let new_src = at_u32(&val_map, to_idx(old_src));
-                let loc = at_u32(view.locs, inst);
-                let (dst_align, src_align) = match view.mem_attrs(inst) {
+                let loc = at_u32(work_view.locs, inst);
+                let (dst_align, src_align) = match work_view.mem_attrs(inst) {
                     Some(m) => (m.align, m.src_align),
                     None => (0, 0),
                 };
@@ -559,7 +1226,7 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
                     func.locs.push(loc);
                 }
             } else {
-                let _ = copy_inst_same_blocks(&view, inst, &val_map, &mut func);
+                let _ = copy_inst_same_blocks(&work_view, inst, &val_map, &mut func);
             }
         }
     }
@@ -724,14 +1391,20 @@ fn no_alias(a: MemLoc, b: MemLoc, non_escaping: &[bool]) -> bool {
     false
 }
 
-/// Runs alias-aware Memory LICM, intra-block sub-word load forwarding & byte-gather folding,
-/// and Dead Store Elimination on `view`.
+/// Runs dead-temp bulk-copy elision, alias-aware Memory LICM, intra-block sub-word &
+/// mixed-width load forwarding, and Dead Store Elimination on `view`.
 pub fn optimize_memory<A: Allocator + Copy>(
     view: View<'_>,
     alloc: A,
 ) -> Result<MemOptOutput<A>, SimplifyError> {
     let mut stats = MemOptStats::default();
-    let (after_licm, hoisted) = hoist_invariant_loads(view, alloc)?;
+    let (after_elide, elided) = match eliminate_temp_bulk_copies_view(view, alloc)? {
+        Some((f, count)) => (Some(f), count),
+        None => (None, 0),
+    };
+    stats.temp_copies_elided = elided;
+    let licm_in = after_elide.as_ref().map_or(view, |f| f.view());
+    let (after_licm, hoisted) = hoist_invariant_loads(licm_in, alloc)?;
     stats.loads_hoisted = hoisted;
     let (after_fwd, forwarded) = match forward_subword_loads(after_licm.view(), alloc)? {
         Some((f, count)) => (f, count),
@@ -997,7 +1670,7 @@ fn hoist_invariant_loads<A: Allocator + Copy>(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct WideStore {
+struct ActiveStore {
     slot: u32,
     off: i64,
     bytes: i64,
@@ -1006,11 +1679,12 @@ struct WideStore {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ByteStore {
-    slot: u32,
-    off: i64,
+struct Piece {
     val: u32,
+    byte_off: u8,
 }
+
+const EMPTY_PIECE: Piece = Piece { val: NONE, byte_off: 0 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LoadRewrite {
@@ -1021,15 +1695,14 @@ enum LoadRewrite {
         load_ty: Ty,
         shift_bits: u32,
     },
-    WideFromBytes {
+    WideFromPieces {
         load_ty: Ty,
-        byte_vals: [u32; 8],
+        pieces: [Piece; 8],
         count: u8,
     },
 }
 
-const MAX_WIDE_STORES: usize = 64;
-const MAX_BYTE_STORES: usize = 128;
+const MAX_ACTIVE_STORES: usize = 192;
 
 #[inline]
 fn scalar_int_bytes(ty: Ty) -> Option<i64> {
@@ -1041,6 +1714,31 @@ fn scalar_int_bytes(ty: Ty) -> Option<i64> {
         Some(4)
     } else if ty == Ty::I64 {
         Some(8)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn load_full_byte_mask(load_bytes: i64) -> Option<u8> {
+    match load_bytes {
+        2 => Some(0x03),
+        4 => Some(0x0f),
+        8 => Some(0xff),
+        _ => None,
+    }
+}
+
+#[inline]
+fn piece_byte_mask(byte_off: u8, byte_width: u8) -> Option<u8> {
+    let base: u8 = match byte_width {
+        1 => 0x01,
+        2 => 0x03,
+        4 => 0x0f,
+        _ => return None,
+    };
+    if byte_off.checked_add(byte_width).is_some_and(|end| end <= 8) {
+        Some(base << byte_off)
     } else {
         None
     }
@@ -1060,7 +1758,7 @@ fn rewrite_inst_count(rw: LoadRewrite) -> usize {
         LoadRewrite::NarrowFromWide { shift_bits, .. } => {
             if shift_bits == 0 { 1 } else { 3 }
         }
-        LoadRewrite::WideFromBytes { count, .. } => {
+        LoadRewrite::WideFromPieces { count, .. } => {
             let k = usize::from(count);
             if k <= 1 { 1 } else { 1usize.saturating_add(4usize.saturating_mul(k.saturating_sub(1))) }
         }
@@ -1101,55 +1799,41 @@ fn push_vv_inst<A: Allocator>(
 }
 
 fn invalidate_slot_all<A: Allocator>(
-    wide_stores: &mut Vec<WideStore, A>,
-    byte_stores: &mut Vec<ByteStore, A>,
+    active_stores: &mut Vec<ActiveStore, A>,
     slot: u32,
 ) {
     let mut i = 0;
-    while i < wide_stores.len() {
-        if wide_stores.get(i).is_some_and(|st| st.slot == slot) {
-            wide_stores.remove_swap(i);
+    while i < active_stores.len() {
+        if active_stores.get(i).is_some_and(|st| st.slot == slot) {
+            active_stores.remove_swap(i);
         } else {
             i = i.saturating_add(1);
-        }
-    }
-    let mut j = 0;
-    while j < byte_stores.len() {
-        if byte_stores.get(j).is_some_and(|bs| bs.slot == slot) {
-            byte_stores.remove_swap(j);
-        } else {
-            j = j.saturating_add(1);
         }
     }
 }
 
 fn invalidate_slot_range<A: Allocator>(
-    wide_stores: &mut Vec<WideStore, A>,
-    byte_stores: &mut Vec<ByteStore, A>,
+    active_stores: &mut Vec<ActiveStore, A>,
     slot: u32,
     off: i64,
     size: i64,
 ) {
     let mut i = 0;
-    while i < wide_stores.len() {
-        if wide_stores.get(i).is_some_and(|st| st.slot == slot && ranges_overlap(st.off, st.bytes, off, size)) {
-            wide_stores.remove_swap(i);
+    while i < active_stores.len() {
+        if active_stores
+            .get(i)
+            .is_some_and(|st| st.slot == slot && ranges_overlap(st.off, st.bytes, off, size))
+        {
+            active_stores.remove_swap(i);
         } else {
             i = i.saturating_add(1);
         }
     }
-    let mut j = 0;
-    while j < byte_stores.len() {
-        if byte_stores.get(j).is_some_and(|bs| bs.slot == slot && ranges_overlap(bs.off, 1, off, size)) {
-            byte_stores.remove_swap(j);
-        } else {
-            j = j.saturating_add(1);
-        }
-    }
 }
 
-/// Intra-block sub-word load forwarding (`to_le_bytes()` elimination) and contiguous byte-gather
-/// store-to-load folding (`from_le_bytes()` elimination) on non-escaping stack slots (little-endian).
+/// Intra-block sub-word load forwarding (`to_le_bytes()` elimination) and mixed-width piece-gather
+/// store-to-load folding (`from_le_bytes()` / packed struct assembly) on non-escaping stack slots
+/// (little-endian).
 ///
 /// Returns `Ok(None)` without rewriting when no load is forwarded.
 fn forward_subword_loads<A: Allocator + Copy>(
@@ -1168,13 +1852,11 @@ fn forward_subword_loads<A: Allocator + Copy>(
     }
 
     let mut rewrites = filled(len, LoadRewrite::Keep, &alloc);
-    let mut wide_stores: Vec<WideStore, A> = Vec::new_in(alloc);
-    let mut byte_stores: Vec<ByteStore, A> = Vec::new_in(alloc);
+    let mut active_stores: Vec<ActiveStore, A> = Vec::new_in(alloc);
     let mut forwarded = 0u32;
 
     for b in 0..blocks {
-        wide_stores.clear();
-        byte_stores.clear();
+        active_stores.clear();
         for inst in view.block(Block(to_u32(b))) {
             let op = view.op(inst);
             match op {
@@ -1189,48 +1871,32 @@ fn forward_subword_loads<A: Allocator + Copy>(
                     if let Some(loc) = decompose_loc(&view, &slot_of, ptr, off, val_ty) {
                         if loc.slot != u32::MAX && at_bool(&non_escaping, to_idx(loc.slot)) {
                             if !loc.off_known || volatile || loc.off.checked_add(loc.size).is_none() {
-                                invalidate_slot_all(&mut wide_stores, &mut byte_stores, loc.slot);
+                                invalidate_slot_all(&mut active_stores, loc.slot);
                             } else {
                                 invalidate_slot_range(
-                                    &mut wide_stores,
-                                    &mut byte_stores,
+                                    &mut active_stores,
                                     loc.slot,
                                     loc.off,
                                     loc.size,
                                 );
-                                if loc.off >= 0 {
-                                    match scalar_int_bytes(val_ty) {
-                                        Some(1) => {
-                                            if byte_stores.len() >= MAX_BYTE_STORES {
-                                                byte_stores.remove_swap(0);
-                                            }
-                                            byte_stores.push(ByteStore {
-                                                slot: loc.slot,
-                                                off: loc.off,
-                                                val,
-                                            });
-                                        }
-                                        Some(bytes) => {
-                                            if wide_stores.len() >= MAX_WIDE_STORES {
-                                                wide_stores.remove_swap(0);
-                                            }
-                                            wide_stores.push(WideStore {
-                                                slot: loc.slot,
-                                                off: loc.off,
-                                                bytes,
-                                                ty: val_ty,
-                                                val,
-                                            });
-                                        }
-                                        None => {}
+                                if loc.off >= 0 && let Some(bytes) = scalar_int_bytes(val_ty) {
+                                    if active_stores.len() >= MAX_ACTIVE_STORES {
+                                        active_stores.remove_swap(0);
                                     }
+                                    active_stores.push(ActiveStore {
+                                        slot: loc.slot,
+                                        off: loc.off,
+                                        bytes,
+                                        ty: val_ty,
+                                        val,
+                                    });
                                 }
                             }
                         }
                     } else {
                         let ptr_slot = at_u32(&slot_of, to_idx(ptr));
                         if ptr_slot != u32::MAX && at_bool(&non_escaping, to_idx(ptr_slot)) {
-                            invalidate_slot_all(&mut wide_stores, &mut byte_stores, ptr_slot);
+                            invalidate_slot_all(&mut active_stores, ptr_slot);
                         }
                     }
                 }
@@ -1261,7 +1927,7 @@ fn forward_subword_loads<A: Allocator + Copy>(
 
                     // Case A: narrow scalar-int load completely inside an active wider store.
                     let mut matched_wide = false;
-                    for &st in &wide_stores {
+                    for &st in &active_stores {
                         if st.slot == loc.slot
                             && load_bytes < st.bytes
                             && loc.off >= st.off
@@ -1291,48 +1957,77 @@ fn forward_subword_loads<A: Allocator + Copy>(
                         continue;
                     }
 
-                    // Case B: `I16`/`I32`/`I64` load reconstructed from contiguous active `I8` stores.
-                    if load_bytes > 1
-                        && let Ok(k) = usize::try_from(load_bytes)
-                        && k <= 8
-                    {
-                        let mut byte_vals = [NONE; 8];
-                        let mut all_present = true;
-                        for j in 0..k {
-                            let Ok(j_i64) = i64::try_from(j) else {
-                                all_present = false;
-                                break;
-                            };
-                            let Some(byte_off) = loc.off.checked_add(j_i64) else {
-                                all_present = false;
-                                break;
-                            };
-                            if let Some(bs) =
-                                byte_stores.iter().find(|bs| bs.slot == loc.slot && bs.off == byte_off)
+                    // Case B: `I16`/`I32`/`I64` load reconstructed from strictly disjoint active
+                    // narrower scalar-int stores (`I8`/`I16`/`I32`) completely covering
+                    // `[loc.off .. load_end)`.
+                    if let Some(full_mask) = load_full_byte_mask(load_bytes) {
+                        let mut pieces = [EMPTY_PIECE; 8];
+                        let mut count: usize = 0;
+                        let mut covered_mask: u8 = 0;
+                        let mut partial_conflict = false;
+                        for &st in &active_stores {
+                            if st.slot != loc.slot
+                                || !ranges_overlap(st.off, st.bytes, loc.off, load_bytes)
                             {
-                                set_at(&mut byte_vals, j, bs.val);
-                            } else {
-                                all_present = false;
+                                continue;
+                            }
+                            let Some(st_end) = st.off.checked_add(st.bytes) else {
+                                partial_conflict = true;
+                                break;
+                            };
+                            if st.bytes >= load_bytes || st.off < loc.off || st_end > load_end {
+                                partial_conflict = true;
                                 break;
                             }
+                            let Some(rel_i64) = st.off.checked_sub(loc.off) else {
+                                partial_conflict = true;
+                                break;
+                            };
+                            let (Ok(byte_off), Ok(byte_width)) =
+                                (u8::try_from(rel_i64), u8::try_from(st.bytes))
+                            else {
+                                partial_conflict = true;
+                                break;
+                            };
+                            let Some(mask) = piece_byte_mask(byte_off, byte_width) else {
+                                partial_conflict = true;
+                                break;
+                            };
+                            if (covered_mask & mask) != 0 || count >= 8 {
+                                partial_conflict = true;
+                                break;
+                            }
+                            set_at(&mut pieces, count, Piece { val: st.val, byte_off });
+                            count = count.saturating_add(1);
+                            covered_mask |= mask;
                         }
-                        if all_present && let Ok(count) = u8::try_from(k) {
-                            set_at(
-                                &mut rewrites,
-                                inst,
-                                LoadRewrite::WideFromBytes { load_ty, byte_vals, count },
-                            );
-                            forwarded = forwarded.saturating_add(1);
+                        if !partial_conflict && count >= 2 && covered_mask == full_mask {
+                            if let Some(slice) = pieces.get_mut(..count) {
+                                slice.sort_unstable_by_key(|p| p.byte_off);
+                            }
+                            if pieces.first().is_some_and(|p| p.byte_off == 0)
+                                && let Ok(piece_count) = u8::try_from(count)
+                            {
+                                set_at(
+                                    &mut rewrites,
+                                    inst,
+                                    LoadRewrite::WideFromPieces {
+                                        load_ty,
+                                        pieces,
+                                        count: piece_count,
+                                    },
+                                );
+                                forwarded = forwarded.saturating_add(1);
+                            }
                         }
                     }
                 }
                 Op::SlotLive | Op::SlotDead => {
                     let s = at_u32(view.data, inst);
-                    invalidate_slot_all(&mut wide_stores, &mut byte_stores, s);
+                    invalidate_slot_all(&mut active_stores, s);
                 }
                 Op::MaskedStore | Op::Scatter => {
-                    wide_stores.clear();
-                    byte_stores.clear();
+                    active_stores.clear();
                 }
                 _ => {}
             }
@@ -1399,16 +2094,16 @@ fn forward_subword_loads<A: Allocator + Copy>(
                         let _ = push_data_inst(&mut func, trunc_op, load_ty, shifted, loc);
                     }
                 }
-                LoadRewrite::WideFromBytes { load_ty, byte_vals, count } => {
+                LoadRewrite::WideFromPieces { load_ty, pieces, count } => {
                     let k = usize::from(count);
-                    let first_old = at_u32(&byte_vals, 0);
+                    let first_old = pieces.first().map_or(NONE, |p| p.val);
                     let first_new = at_u32(&val_map, to_idx(first_old));
                     let mut acc = push_data_inst(&mut func, zext_op, load_ty, first_new, loc);
                     for j in 1..k {
-                        let b_old = at_u32(&byte_vals, j);
-                        let b_new = at_u32(&val_map, to_idx(b_old));
-                        let ext = push_data_inst(&mut func, zext_op, load_ty, b_new, loc);
-                        let shift_bits = to_u32(j).saturating_mul(8);
+                        let piece = pieces.get(j).copied().unwrap_or(EMPTY_PIECE);
+                        let p_new = at_u32(&val_map, to_idx(piece.val));
+                        let ext = push_data_inst(&mut func, zext_op, load_ty, p_new, loc);
+                        let shift_bits = u32::from(piece.byte_off).saturating_mul(8);
                         let sh = push_data_inst(&mut func, iconst_op, load_ty, shift_bits, loc);
                         let part = push_vv_inst(&mut func, shl_op, load_ty, ext, sh, loc);
                         acc = push_vv_inst(&mut func, or_op, load_ty, acc, part, loc);
@@ -2434,5 +3129,495 @@ mod tests {
             after_sroa.slots.is_empty(),
             "both padded tuple slots must be eliminated by SROA"
         );
+    }
+
+    #[test]
+    fn forward_mixed_width_u16_u8_u8_stores_to_u32_load_and_dse() {
+        use crate::eval::{Outcome, Val, run_in};
+
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Exact `FseDecEntry` pattern: out-of-order stores `u8 @ +2`, `u8 @ +3`, `u16 @ +0` ->
+        // `u32 @ +0`, plus 64-bit mixed-width `u16 @ +4`, `u8 @ +7`, `u32 @ +0`, `u8 @ +6` ->
+        // `u64 @ +0`.
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I16),
+                Param::of(Ty::I8),
+                Param::of(Ty::I8),
+                Param::of(Ty::I32),
+            ],
+            &[Param::of(Ty::I32), Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let lo = b.param(Ty::I16);
+        let b2 = b.param(Ty::I8);
+        let b3 = b.param(Ty::I8);
+        let lo32 = b.param(Ty::I32);
+
+        let s1 = b.slot(4, 2, SlotKind::Temp);
+        let sp1 = b.slot_addr(s1);
+        b.store(Flags::NONE, b2, sp1, 2, MemAttrs::default());
+        b.store(Flags::NONE, b3, sp1, 3, MemAttrs::default());
+        b.store(Flags::NONE, lo, sp1, 0, MemAttrs::aligned(1));
+        let w32 = b.load(Ty::I32, Flags::NONE, sp1, 0, MemAttrs::aligned(2));
+
+        let s2 = b.slot(8, 3, SlotKind::Temp);
+        let sp2 = b.slot_addr(s2);
+        b.store(Flags::NONE, lo, sp2, 4, MemAttrs::aligned(1));
+        b.store(Flags::NONE, b3, sp2, 7, MemAttrs::default());
+        b.store(Flags::NONE, lo32, sp2, 0, MemAttrs::aligned(2));
+        b.store(Flags::NONE, b2, sp2, 6, MemAttrs::default());
+        let w64 = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+
+        b.ret(&[w32, w64]);
+        let func = b.finish_checked().expect("valid mixed-width input");
+
+        let out = optimize_memory(func.view(), alloc).expect("memopt succeeds");
+        assert!(verify(out.func.view()).is_ok(), "optimized mixed-width function must verify");
+
+        let opt_view = out.func.view();
+        for inst in 0..opt_view.len() {
+            assert_ne!(
+                opt_view.op(inst),
+                Op::Load,
+                "mixed-width stack loads must be forwarded and eliminated"
+            );
+            assert_ne!(
+                opt_view.op(inst),
+                Op::Store,
+                "dead mixed-width stack stores must be eliminated by DSE"
+            );
+        }
+
+        let fuel = 10_000;
+        let cases = [
+            (0u16, 0u8, 0u8, 0u32),
+            (u16::MAX, u8::MAX, u8::MAX, u32::MAX),
+            (0x1234u16, 0x56u8, 0x78u8, 0x9abc_def0u32),
+            (0x8001u16, 0x80u8, 0x01u8, 0x8000_0001u32),
+        ];
+        for (lo_v, b2_v, b3_v, lo32_v) in cases {
+            let args = [
+                Val::Int(u128::from(lo_v)),
+                Val::Int(u128::from(b2_v)),
+                Val::Int(u128::from(b3_v)),
+                Val::Int(u128::from(lo32_v)),
+            ];
+            let before = run_in(func.view(), &args, fuel, alloc).expect("eval before memopt");
+            let after = run_in(opt_view, &args, fuel, alloc).expect("eval after memopt");
+            assert_eq!(before, after, "eval mismatch for ({lo_v:#x}, {b2_v:#x}, {b3_v:#x}, {lo32_v:#x})");
+
+            let want32 =
+                u128::from(u32::from(lo_v) | (u32::from(b2_v) << 16) | (u32::from(b3_v) << 24));
+            let want64 = u128::from(
+                u64::from(lo32_v)
+                    | (u64::from(lo_v) << 32)
+                    | (u64::from(b2_v) << 48)
+                    | (u64::from(b3_v) << 56),
+            );
+            assert!(
+                matches!(
+                    after,
+                    Outcome::Returned(ref vals)
+                        if vals.as_slice() == [Val::Int(want32), Val::Int(want64)]
+                ),
+                "unexpected result for ({lo_v:#x}, {b2_v:#x}, {b3_v:#x}, {lo32_v:#x}): {after:?}"
+            );
+        }
+
+        // Negative / soundness case: a newer overlapping `u8 @ +1` partially overwrites `u16 @ +0`
+        // (leaving byte 0 uncovered in active_stores). Must NOT mis-forward stale byte 1!
+        let mut nb = Builder::<_, Full>::new_in(64, alloc);
+        let nsig = nb.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I16),
+                Param::of(Ty::I8),
+                Param::of(Ty::I8),
+                Param::of(Ty::I8),
+            ],
+            &[Param::of(Ty::I32)],
+        );
+        nb.set_signature(nsig);
+        let nentry = nb.create_block(BlockKind::Normal);
+        nb.begin(nentry);
+        let n_lo = nb.param(Ty::I16);
+        let n_b2 = nb.param(Ty::I8);
+        let n_b3 = nb.param(Ty::I8);
+        let patch_b1 = nb.param(Ty::I8);
+
+        let ns = nb.slot(4, 2, SlotKind::Temp);
+        let nsp = nb.slot_addr(ns);
+        nb.store(Flags::NONE, n_b2, nsp, 2, MemAttrs::default());
+        nb.store(Flags::NONE, n_b3, nsp, 3, MemAttrs::default());
+        nb.store(Flags::NONE, n_lo, nsp, 0, MemAttrs::aligned(1));
+        nb.store(Flags::NONE, patch_b1, nsp, 1, MemAttrs::default());
+        let nw32 = nb.load(Ty::I32, Flags::NONE, nsp, 0, MemAttrs::aligned(2));
+        nb.ret(&[nw32]);
+        let nfunc = nb.finish_checked().expect("valid partial-overwrite mixed-width input");
+
+        let nout = optimize_memory(nfunc.view(), alloc).expect("memopt succeeds on partial overwrite");
+        assert!(verify(nout.func.view()).is_ok(), "partial-overwrite optimized function must verify");
+        let nopt_view = nout.func.view();
+        let has_load = (0..nopt_view.len()).any(|i| nopt_view.op(i) == Op::Load);
+        assert!(has_load, "partially overwritten u16 @ +0 by u8 @ +1 must NOT be forwarded");
+
+        for (lo_v, b2_v, b3_v, patch_v) in [
+            (0x1234u16, 0x56u8, 0x78u8, 0xaau8),
+            (0xffffu16, 0x00u8, 0xffu8, 0x00u8),
+            (0x00ffu16, 0x80u8, 0x01u8, 0x7fu8),
+        ] {
+            let args = [
+                Val::Int(u128::from(lo_v)),
+                Val::Int(u128::from(b2_v)),
+                Val::Int(u128::from(b3_v)),
+                Val::Int(u128::from(patch_v)),
+            ];
+            let before = run_in(nfunc.view(), &args, fuel, alloc).expect("eval partial before");
+            let after = run_in(nopt_view, &args, fuel, alloc).expect("eval partial after");
+            assert_eq!(before, after, "partial-overwrite mismatch");
+
+            let want = u128::from(
+                (u32::from(lo_v) & 0xff)
+                    | (u32::from(patch_v) << 8)
+                    | (u32::from(b2_v) << 16)
+                    | (u32::from(b3_v) << 24),
+            );
+            assert!(
+                matches!(after, Outcome::Returned(ref vals) if vals.as_slice() == [Val::Int(want)]),
+                "unexpected partial-overwrite result: {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn elides_chained_temp_memset_and_memcpy() {
+        use crate::eval::{Outcome, Val, run_in};
+
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Exact `[0u32; 256]` lowering chain:
+        // `memset(t1, fill, 1024) -> memcpy(t2, t1, 1024) -> memcpy(out, t2, 1024)`
+        // with `slot_live` / `slot_dead` markers and pre-poisoned `out`.
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I8)],
+            &[Param::of(Ty::I32), Param::of(Ty::I32)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let fill = b.param(Ty::I8);
+
+        let out_slot = b.slot(1024, 2, SlotKind::Named);
+        let t1 = b.slot(1024, 2, SlotKind::Temp);
+        let t2 = b.slot(1024, 2, SlotKind::Temp);
+        let p_out = b.slot_addr(out_slot);
+        let poison = b.iconst(Ty::I32, 0xdead_beef);
+        b.store(Flags::NONE, poison, p_out, 0, MemAttrs::aligned(2));
+        b.store(Flags::NONE, poison, p_out, 1020, MemAttrs::aligned(2));
+
+        let n1024 = b.iconst(Ty::I64, 1024);
+        let copy_al = MemAttrs { align: 2, src_align: 2, pointee_align: 0, bits: 0, range: None };
+
+        b.slot_live(t1);
+        let p_t1 = b.slot_addr(t1);
+        b.bulk(Op::Memset, Flags::NONE, p_t1, fill, n1024, MemAttrs::aligned(2));
+
+        b.slot_live(t2);
+        let p_t2 = b.slot_addr(t2);
+        b.bulk(Op::Memcpy, Flags::NONE, p_t2, p_t1, n1024, copy_al);
+        b.slot_dead(t1);
+
+        b.bulk(Op::Memcpy, Flags::NONE, p_out, p_t2, n1024, copy_al);
+        b.slot_dead(t2);
+
+        let first = b.load(Ty::I32, Flags::NONE, p_out, 0, MemAttrs::aligned(2));
+        let last = b.load(Ty::I32, Flags::NONE, p_out, 1020, MemAttrs::aligned(2));
+        b.ret(&[first, last]);
+        let func = b.finish_checked().expect("valid chained memset/memcpy input");
+
+        let (elided_fn, elided_count) =
+            eliminate_temp_bulk_copies(func.view().to_func_in(alloc), alloc)
+                .expect("eliminate_temp_bulk_copies succeeds");
+        assert_eq!(elided_count, 2, "must elide both temp slots t1 and t2");
+        verify(elided_fn.view()).expect("elided function verifies");
+        assert_eq!(elided_fn.slots.len(), 1, "both 1024B temp slots must be removed");
+
+        let ev = elided_fn.view();
+        let mut memsets = 0u32;
+        let mut memcpys = 0u32;
+        let mut memmoves = 0u32;
+        let mut memset_inst = None;
+        for inst in 0..ev.len() {
+            match ev.op(inst) {
+                Op::Memset => {
+                    memsets += 1;
+                    memset_inst = Some(inst);
+                }
+                Op::Memcpy => memcpys += 1,
+                Op::Memmove => memmoves += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(memsets, 1, "must collapse to exactly 1 Op::Memset(out, fill, 1024)");
+        assert_eq!(memcpys, 0, "no Op::Memcpy may remain");
+        assert_eq!(memmoves, 0, "no Op::Memmove may remain");
+        let ms_idx = memset_inst.expect("memset present");
+        let ms_attrs = ev.mem_attrs(ms_idx).expect("memset must keep dst align");
+        assert_eq!(ms_attrs.align, 2, "dst align must be preserved");
+        assert_eq!(ms_attrs.src_align, 0, "memset src_align must be 0");
+
+        // Also verify both pipeline entry points (`scalarize_small_memops` and `optimize_memory`) hit it.
+        let via_scalarize = scalarize_small_memops(func.view(), alloc)
+            .expect("scalarize_small_memops succeeds")
+            .expect("scalarize_small_memops must elide chained temp memset");
+        verify(via_scalarize.view()).expect("scalarize output verifies");
+        assert_eq!(via_scalarize.slots.len(), 1);
+        assert!(
+            !(0..via_scalarize.view().len()).any(|i| via_scalarize.view().op(i) == Op::Memcpy),
+            "scalarize_small_memops must eliminate all chained Op::Memcpy"
+        );
+
+        let via_memopt = optimize_memory(func.view(), alloc).expect("optimize_memory succeeds");
+        verify(via_memopt.func.view()).expect("optimize_memory output verifies");
+        assert_eq!(via_memopt.stats.temp_copies_elided, 2);
+        assert_eq!(via_memopt.func.slots.len(), 1);
+        assert!(
+            !(0..via_memopt.func.view().len()).any(|i| via_memopt.func.view().op(i) == Op::Memcpy),
+            "optimize_memory must eliminate all chained Op::Memcpy"
+        );
+
+        let fuel = 50_000;
+        for (byte_val, want_word) in [(0x00u8, 0x0000_0000u32), (0x5au8, 0x5a5a_5a5au32)] {
+            let args = [Val::Int(u128::from(byte_val))];
+            let before = run_in(func.view(), &args, fuel, alloc).expect("eval before elision");
+            let after = run_in(ev, &args, fuel, alloc).expect("eval after elision");
+            assert_eq!(before, after, "eval mismatch for fill={byte_val:#x}");
+            let want = u128::from(want_word);
+            assert!(
+                matches!(
+                    after,
+                    Outcome::Returned(ref vals) if vals.as_slice() == [Val::Int(want), Val::Int(want)]
+                ),
+                "unexpected eval result for fill={byte_val:#x}: {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn elides_temp_memcpy_to_memcpy_and_respects_aliasing() {
+        use crate::eval::{Outcome, Val, run_in};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let fuel = 50_000;
+
+        // 1. Positive (provably disjoint local slots): `memcpy(t1, src, 512) -> memcpy(dst, t1, 512)`
+        //    collapses to 1 `Op::Memcpy(dst, src, 512)` and drops `t1`.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let v0 = b.param(Ty::I64);
+            let v1 = b.param(Ty::I64);
+
+            let src_slot = b.slot(512, 3, SlotKind::Named);
+            let dst_slot = b.slot(512, 3, SlotKind::Named);
+            let t1 = b.slot(512, 3, SlotKind::Temp);
+            let p_src = b.slot_addr(src_slot);
+            let p_dst = b.slot_addr(dst_slot);
+            let p_t1 = b.slot_addr(t1);
+            b.store(Flags::NONE, v0, p_src, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, v1, p_src, 504, MemAttrs::aligned(3));
+
+            let n512 = b.iconst(Ty::I64, 512);
+            let al8 = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+            b.bulk(Op::Memcpy, Flags::NONE, p_t1, p_src, n512, al8);
+            b.bulk(Op::Memcpy, Flags::NONE, p_dst, p_t1, n512, al8);
+            b.slot_dead(t1);
+
+            let r0 = b.load(Ty::I64, Flags::NONE, p_dst, 0, MemAttrs::aligned(3));
+            let r1 = b.load(Ty::I64, Flags::NONE, p_dst, 504, MemAttrs::aligned(3));
+            b.ret(&[r0, r1]);
+            let func = b.finish_checked().expect("valid disjoint memcpy chain");
+
+            let out = optimize_memory(func.view(), alloc).expect("optimize_memory succeeds");
+            assert_eq!(out.stats.temp_copies_elided, 1);
+            verify(out.func.view()).expect("optimized disjoint copy verifies");
+            assert_eq!(out.func.slots.len(), 2, "temp slot t1 must be dropped");
+
+            let ov = out.func.view();
+            let memcpys = (0..ov.len()).filter(|&i| ov.op(i) == Op::Memcpy).count();
+            let memmoves = (0..ov.len()).filter(|&i| ov.op(i) == Op::Memmove).count();
+            assert_eq!(memcpys, 1, "disjoint slots must collapse to 1 Op::Memcpy");
+            assert_eq!(memmoves, 0, "disjoint slots need not downgrade to Op::Memmove");
+
+            let args = [Val::Int(0x1122_3344_5566_7788), Val::Int(0x99aa_bbcc_ddee_ff00)];
+            let before = run_in(func.view(), &args, fuel, alloc).expect("eval disjoint before");
+            let after = run_in(ov, &args, fuel, alloc).expect("eval disjoint after");
+            assert_eq!(before, after);
+            assert!(matches!(
+                after,
+                Outcome::Returned(ref vals)
+                    if vals.as_slice()
+                        == [Val::Int(0x1122_3344_5566_7788), Val::Int(0x99aa_bbcc_ddee_ff00)]
+            ));
+        }
+
+        // 2. Positive (potentially aliasing external params): `memcpy(t1, src, 512) -> memcpy(dst, t1, 512)`
+        //    must downgrade to overlap-safe `Op::Memmove(dst, src, 512)` with `dst_align` and `src_align`.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let t1 = b.slot(512, 3, SlotKind::Temp);
+            let p_t1 = b.slot_addr(t1);
+            let n512 = b.iconst(Ty::I64, 512);
+            let w_attrs = MemAttrs { align: 3, src_align: 2, pointee_align: 0, bits: 0, range: None };
+            let r_attrs = MemAttrs { align: 1, src_align: 3, pointee_align: 0, bits: 0, range: None };
+            b.bulk(Op::Memcpy, Flags::NONE, p_t1, src, n512, w_attrs);
+            b.bulk(Op::Memcpy, Flags::NONE, dst, p_t1, n512, r_attrs);
+            b.ret(&[]);
+            let func = b.finish_checked().expect("valid external param copy");
+
+            let (opt, elided) =
+                eliminate_temp_bulk_copies(func, alloc).expect("elide external param copy");
+            assert_eq!(elided, 1);
+            verify(opt.view()).expect("external param memmove verifies");
+            assert!(opt.slots.is_empty(), "temp slot t1 must be dropped");
+
+            let ov = opt.view();
+            let memcpys = (0..ov.len()).filter(|&i| ov.op(i) == Op::Memcpy).count();
+            let mm_idx = (0..ov.len()).find(|&i| ov.op(i) == Op::Memmove).expect("must emit Memmove");
+            assert_eq!(memcpys, 0, "potentially aliasing external params must use Op::Memmove");
+            let attrs = ov.mem_attrs(mm_idx).expect("must preserve alignments");
+            assert_eq!(attrs.align, 1, "must keep dst align from reader");
+            assert_eq!(attrs.src_align, 2, "must keep src align from writer");
+        }
+
+        // 3. Negative control: intervening store to `src` between `memcpy`s must block elision.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let old_v = b.param(Ty::I64);
+            let new_v = b.param(Ty::I64);
+            let src_slot = b.slot(512, 3, SlotKind::Named);
+            let dst_slot = b.slot(512, 3, SlotKind::Named);
+            let t1 = b.slot(512, 3, SlotKind::Temp);
+            let p_src = b.slot_addr(src_slot);
+            let p_dst = b.slot_addr(dst_slot);
+            let p_t1 = b.slot_addr(t1);
+            let n512 = b.iconst(Ty::I64, 512);
+            let al8 = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+            b.store(Flags::NONE, old_v, p_src, 0, MemAttrs::aligned(3));
+            b.bulk(Op::Memcpy, Flags::NONE, p_t1, p_src, n512, al8);
+            b.store(Flags::NONE, new_v, p_src, 0, MemAttrs::aligned(3));
+            b.bulk(Op::Memcpy, Flags::NONE, p_dst, p_t1, n512, al8);
+            let out_v = b.load(Ty::I64, Flags::NONE, p_dst, 0, MemAttrs::aligned(3));
+            b.ret(&[out_v]);
+            let func = b.finish_checked().expect("valid intervening-store input");
+
+            let (opt, elided) =
+                eliminate_temp_bulk_copies(func.view().to_func_in(alloc), alloc)
+                    .expect("pass succeeds on intervening store");
+            assert_eq!(elided, 0, "intervening store between memcpys must block elision");
+            let memcpys = (0..opt.view().len()).filter(|&i| opt.view().op(i) == Op::Memcpy).count();
+            assert_eq!(memcpys, 2, "both Op::Memcpys must remain");
+
+            let args = [Val::Int(0xaaaa), Val::Int(0xbbbb)];
+            let after = run_in(opt.view(), &args, fuel, alloc).expect("eval intervening store");
+            assert!(
+                matches!(after, Outcome::Returned(ref vals) if vals.as_slice() == [Val::Int(0xaaaa)]),
+                "must observe pre-store snapshot 0xaaaa, got {after:?}"
+            );
+        }
+
+        // 4. Negative control: escaping `t1` passed to a call must block elision.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let sink_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+            let sink = b.reference(crate::func::RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let t1 = b.slot(512, 3, SlotKind::Temp);
+            let p_t1 = b.slot_addr(t1);
+            let n512 = b.iconst(Ty::I64, 512);
+            let al8 = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+            b.bulk(Op::Memcpy, Flags::NONE, p_t1, src, n512, al8);
+            b.bulk(Op::Memcpy, Flags::NONE, dst, p_t1, n512, al8);
+            let _ = b.call(Flags::NONE, sink, sink_sig, &[p_t1]);
+            b.ret(&[]);
+            let func = b.finish_checked().expect("valid escaping-slot input");
+
+            let (opt, elided) =
+                eliminate_temp_bulk_copies(func, alloc).expect("pass succeeds on escaping slot");
+            assert_eq!(elided, 0, "escaping temp slot must not be elided");
+            let memcpys = (0..opt.view().len()).filter(|&i| opt.view().op(i) == Op::Memcpy).count();
+            assert_eq!(memcpys, 2, "both Op::Memcpys must remain when slot escapes");
+        }
+
+        // 5. Negative control: volatile bulk writer or reader must block elision.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let t1 = b.slot(512, 3, SlotKind::Temp);
+            let t2 = b.slot(512, 3, SlotKind::Temp);
+            let p_t1 = b.slot_addr(t1);
+            let p_t2 = b.slot_addr(t2);
+            let zero = b.iconst(Ty::I8, 0);
+            let n512 = b.iconst(Ty::I64, 512);
+            let al8 = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+            b.bulk(Op::Memset, Flags::VOLATILE, p_t1, zero, n512, MemAttrs::aligned(3));
+            b.bulk(Op::Memcpy, Flags::NONE, dst, p_t1, n512, al8);
+            b.bulk(Op::Memcpy, Flags::NONE, p_t2, src, n512, al8);
+            b.bulk(Op::Memcpy, Flags::VOLATILE, dst, p_t2, n512, al8);
+            b.ret(&[]);
+            let func = b.finish_checked().expect("valid volatile bulk input");
+
+            let (opt, elided) =
+                eliminate_temp_bulk_copies(func, alloc).expect("pass succeeds on volatile bulk");
+            assert_eq!(elided, 0, "volatile bulk ops must not be elided");
+            let memsets = (0..opt.view().len()).filter(|&i| opt.view().op(i) == Op::Memset).count();
+            let memcpys = (0..opt.view().len()).filter(|&i| opt.view().op(i) == Op::Memcpy).count();
+            assert_eq!(memsets, 1, "volatile memset must remain");
+            assert_eq!(memcpys, 3, "all three memcpys must remain");
+        }
     }
 }

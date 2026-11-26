@@ -29,6 +29,8 @@ pub mod abi;
 pub mod bolt;
 mod enc_x64;
 mod isel;
+mod layout;
+pub mod mach_a64;
 pub mod module;
 mod regalloc;
 mod release_opts;
@@ -555,9 +557,17 @@ fn run_sota_loop_and_late_passes<'a>(
         None => post_mach,
     };
 
-    // Stage 1f: Intra-block critical-path latency-aware DAG list scheduler (skipped after
-    // vectorization, unrolling, GEMM, AMAC, SIMD idioms, modulo pipelining, or dispatch tail-dup).
-    let sched_func = if !did_vectorize && !did_unroll && !did_taildup && !did_gemm && !did_amac && !did_simd_idiom && !did_modulo {
+    // Stage 1f: Pre-RA intra-block critical-path latency-aware DAG list scheduler.
+    // Provides register-pressure-bounded SSA ILP overlap before RA (while `mach_a64::mach_sched_m5`
+    // performs post-RA Apple-M5 microarchitectural scheduling on AArch64). Runs even when a cold
+    // inner loop was unrolled; skipped only after GEMM, AMAC, SIMD idioms, modulo pipelining, or
+    // dispatch tail-dup.
+    let sched_func = if !did_taildup
+        && !did_gemm
+        && !did_amac
+        && !did_simd_idiom
+        && !did_modulo
+    {
         schedule_dag(post_super, alloc).ok().filter(|o| o.stats.insts_reordered > 0).map(|o| o.func)
     } else {
         None

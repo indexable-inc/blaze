@@ -47,6 +47,7 @@ pub mod unroll;
 pub mod unswitch;
 #[cfg(any(test, feature = "eval"))]
 pub mod validate;
+pub mod value_info;
 pub mod vectorize;
 
 pub use amac::{AmacOpts, AmacOutput, AmacStats, interleave_amac_loops};

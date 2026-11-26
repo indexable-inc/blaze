@@ -24,7 +24,7 @@ use core::fmt;
 
 use blaze_code::datum::{DatumView, OWN_DATUM, Place as DatumPlace};
 use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, SiteKind, Space, Symbol as CodeSymbol, Target};
-use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime};
+use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{CodeKey, entry_of, statics};
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker};
@@ -268,6 +268,7 @@ struct ExportSummary<'f> {
     stubs: usize,
     lto_bodies: usize,
     lto_inlined: usize,
+    lto_hot: usize,
 }
 
 /// How one walked row's entry bytes are held until assembly.
@@ -750,6 +751,9 @@ fn export_program<'f>(
     })?;
     let lto_bodies = lto_out.bodies.len();
     let lto_inlined = lto_out.total_inlined;
+    let lto_hot_symbols = lto_out.hot_symbols;
+    let lto_profile_digest = lto_out.profile_digest;
+    let lto_hot = lto_hot_symbols.len();
     let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
     for body in lto_out.bodies {
         if let Some(slot) = outcomes.get_mut(body.row) {
@@ -1055,6 +1059,10 @@ fn export_program<'f>(
         None => None,
     };
 
+    let export_profile = (!lto_hot_symbols.is_empty()).then_some(Profile {
+        digest: lto_profile_digest,
+        hot: lto_hot_symbols.as_slice(),
+    });
     let data_count = data.len();
     let program_in = ProgramIn {
         name: picked.bin,
@@ -1064,7 +1072,7 @@ fn export_program<'f>(
         panic: export_panic,
         personality,
         tls: tls_runtime,
-        profile: None,
+        profile: export_profile,
         natives: native_export.as_ref().map(|n| &n.image),
         exports: native_export.as_ref().map_or(&[], |n| n.exports.as_slice()),
     };
@@ -1094,6 +1102,7 @@ fn export_program<'f>(
         stubs,
         lto_bodies,
         lto_inlined,
+        lto_hot,
     })
 }
 
@@ -1292,7 +1301,7 @@ fn print_summary(
         err.line(
             cx,
             format_args!(
-                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} bytes={} wall={}ms",
+                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} hot={} bytes={} wall={}ms",
                 summary.exported.functions,
                 summary.exported.folded,
                 summary.stubs,
@@ -1303,6 +1312,7 @@ fn print_summary(
                 summary.unkeyed,
                 summary.lto_bodies,
                 summary.lto_inlined,
+                summary.lto_hot,
                 summary.exported.len,
                 wall_ms
             ),

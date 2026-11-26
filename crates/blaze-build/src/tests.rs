@@ -3886,6 +3886,143 @@ fn guarded_arms_move_only_after_the_guard_passes() {
     assert!(failed.is_empty(), "{failed}");
 }
 
+/// Builds `fn main() { let a = [elem; len]; }` and `fn main(i: usize) -> T { let a = [elem; len]; a[i] }`,
+/// passes the bare body's LIR view to `check_bare`, and returns `(a[0], a[len - 1])`.
+fn run_repeat_bodies(
+    elem_node: PNode,
+    make_elem: impl Fn(&mut BodyBuf) -> ExprId,
+    len: u64,
+    check_bare: impl FnOnce(blaze_lir::View<'_>),
+) -> (u128, u128) {
+    let mut w_bare = TestWorld::new();
+    w_bare.func(1, "main", &[], UNIT);
+    let mut b_bare = BodyBuf::new();
+    let a = b_bare.bind("a");
+    let elem = make_elem(&mut b_bare);
+    let len_ty = b_bare.types.usize_value(len).expect("a length interns");
+    let arr = b_bare.e(Expr::Repeat { elem, len: len_ty, count: None });
+    let root = b_bare.block(&[Stmt::Let { pat: a, ty: None, init: Some(arr), else_: None }], None);
+    let bare = build(&w_bare, &b_bare, root).unwrap_or_else(|e| panic!("{e}"));
+    check_bare(bare.func.view());
+
+    let mut w_idx = TestWorld::new();
+    w_idx.func(1, "main", &[USIZE], elem_node);
+    w_idx.bounds_fn();
+    let mut b_idx = BodyBuf::new();
+    let i = b_idx.bind("i");
+    b_idx.params.push(i);
+    let a = b_idx.bind("a");
+    let elem = make_elem(&mut b_idx);
+    let len_ty = b_idx.types.usize_value(len).expect("a length interns");
+    let arr = b_idx.e(Expr::Repeat { elem, len: len_ty, count: None });
+    let a_e = b_idx.local(a);
+    let i_e = b_idx.local(i);
+    let at = b_idx.index(a_e, i_e);
+    let root = b_idx.block(&[Stmt::Let { pat: a, ty: None, init: Some(arr), else_: None }], Some(at));
+    let indexed = build(&w_idx, &b_idx, root).unwrap_or_else(|e| panic!("{e}"));
+
+    let first = one(&indexed, &[Val::Int(0)]);
+    let last = one(&indexed, &[Val::Int(u128::from(len - 1))]);
+    (first, last)
+}
+
+/// Uniform-byte scalar constant repeats `[c; N]` past `UNROLL_LEAVES` lower directly to one
+/// `Op::Memset` in a single block (no `array_loop`) and preserve the exact element bits.
+#[test]
+fn uniform_byte_const_repeats_lower_to_memset() {
+    let f32_node = PNode::Float(blaze_typeck::FloatTy::F32);
+    let cases: &[(&str, PNode, u64, u8, u32, u128, fn(&mut BodyBuf) -> ExprId)] = &[
+        ("[0u32; 256]", U32, 256, 0x00, 256 * 4, 0, |b| b.int(0, SU32)),
+        (
+            "[0u16; 256]",
+            PNode::Uint(UintTy::U16),
+            256,
+            0x00,
+            256 * 2,
+            0,
+            |b| b.int(0, Some(IntSuffix::Uint(UintTy::U16))),
+        ),
+        (
+            "[0x5Au8; 64]",
+            U8,
+            64,
+            0x5A,
+            64,
+            0x5A,
+            |b| b.int(0x5A, Some(IntSuffix::Uint(UintTy::U8))),
+        ),
+        (
+            "[u32::MAX; 64]",
+            U32,
+            64,
+            0xFF,
+            64 * 4,
+            u128::from(u32::MAX),
+            |b| b.int(u128::from(u32::MAX), SU32),
+        ),
+        ("[0.0f32; 64]", f32_node, 64, 0x00, 64 * 4, 0, |b| {
+            let e = b.e(Expr::Lit(Lit::Float(Some(blaze_typeck::FloatTy::F32))));
+            b.lits.push((e, u128::from(0.0f32.to_bits())));
+            e
+        }),
+    ];
+
+    for &(name, elem_node, len, want_byte, want_bytes, want_bits, make_elem) in cases {
+        let (first, last) = run_repeat_bodies(elem_node, make_elem, len, |view| {
+            let text = blaze_lir::print(view);
+            assert_eq!(view.blocks(), 1, "{name}: expected single block (no array_loop):\n{text}");
+            let mut memset_count = 0usize;
+            let mut memset_inst = 0usize;
+            for inst in 0..view.len() {
+                if view.op(inst) == blaze_lir::Op::Memset {
+                    memset_count += 1;
+                    memset_inst = inst;
+                }
+            }
+            assert_eq!(memset_count, 1, "{name}: expected exactly one Op::Memset:\n{text}");
+            let mut o = view.operands(memset_inst);
+            let (_dst, fill, bytes) = (o.value(), o.value(), o.value());
+            assert_eq!(view.op(fill.index()), blaze_lir::Op::Iconst, "{name}: fill op:\n{text}");
+            assert_eq!(view.ty(fill), Ty::I8, "{name}: fill ty:\n{text}");
+            assert_eq!(view.data[fill.index()], u32::from(want_byte), "{name}: fill byte:\n{text}");
+            assert_eq!(view.op(bytes.index()), blaze_lir::Op::Iconst, "{name}: length op:\n{text}");
+            assert_eq!(view.ty(bytes), Ty::I64, "{name}: length ty:\n{text}");
+            assert_eq!(view.data[bytes.index()], want_bytes, "{name}: total bytes:\n{text}");
+        });
+
+        assert_eq!(first, want_bits, "{name}: a[0]");
+        assert_eq!(last, want_bits, "{name}: a[len - 1]");
+    }
+}
+
+/// Non-uniform-byte scalar constant repeats (`[1u32; 64]`, `[-0.0f32; 64]`) must not lower to
+/// `Op::Memset`; they keep `array_loop` and preserve exact element bit patterns.
+#[test]
+fn non_uniform_const_repeats_keep_array_loop() {
+    let f32_node = PNode::Float(blaze_typeck::FloatTy::F32);
+    let neg_zero_bits = u128::from((-0.0f32).to_bits());
+    let cases: &[(&str, PNode, u64, u128, fn(&mut BodyBuf) -> ExprId)] = &[
+        ("[1u32; 64]", U32, 64, 1, |b| b.int(1, SU32)),
+        ("[-0.0f32; 64]", f32_node, 64, neg_zero_bits, |b| {
+            let e = b.e(Expr::Lit(Lit::Float(Some(blaze_typeck::FloatTy::F32))));
+            b.lits.push((e, u128::from((-0.0f32).to_bits())));
+            e
+        }),
+    ];
+
+    for &(name, elem_node, len, want_bits, make_elem) in cases {
+        let (first, last) = run_repeat_bodies(elem_node, make_elem, len, |view| {
+            let text = blaze_lir::print(view);
+            let has_memset = (0..view.len()).any(|inst| view.op(inst) == blaze_lir::Op::Memset);
+            assert!(!has_memset, "{name}: must not lower to Op::Memset:\n{text}");
+            assert_eq!(view.blocks(), 4, "{name}: expected 4-block array_loop:\n{text}");
+        });
+
+        assert_eq!(first, want_bits, "{name}: a[0]");
+        assert_eq!(last, want_bits, "{name}: a[len - 1]");
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 mod objects;
 

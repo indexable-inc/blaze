@@ -29,8 +29,9 @@ use super::CallMode;
 use super::enc_x64::{
     self as x64, Cc, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, XReg,
 };
+use super::layout::compute_block_layout;
 use super::regalloc::{self, is_fp_ty, is_vec128_ty, is_vec256_ty, is_vec512_ty, is_vec_mask_ty};
-use super::release_opts::{MagicUdiv64, compute_block_order, compute_magic_udiv64, detect_tail_calls};
+use super::release_opts::{MagicUdiv64, compute_magic_udiv64, detect_tail_calls};
 
 const TIER: TierName = TierName::Sota;
 
@@ -853,7 +854,7 @@ pub(crate) fn emit_sota_x64<'a>(
         || uses_sdot_ymm;
     let blocks = view.blocks();
     let tail_calls = detect_tail_calls(&view, call_mode == CallMode::DirectBl, crate::Os::Linux, alloc);
-    let block_order = compute_block_order(&view, alloc);
+    let block_order = compute_block_layout(&view, alloc).order;
 
     // 0. Layout local stack slots at `[rsp + 0..spill_base]`.
     let mut slot_cursor = 0u64;

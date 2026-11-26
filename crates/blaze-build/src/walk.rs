@@ -5860,8 +5860,62 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// If `v` is a scalar constant whose exact `stride`-byte representation consists of a single
+    /// repeated byte, returns that byte so `[v; N]` lowers to one `Op::Memset`.
+    fn repeat_byte_fill(&self, v: V, elem: Repr, stride: u32) -> Option<u8> {
+        let elem_ty = elem.scalar()?;
+        let width = elem_ty.bits(self.b.ptr_bits());
+        if stride == 0 || width != stride.checked_mul(8)? {
+            return None;
+        }
+        let bytes_len = usize::try_from(stride).ok()?;
+        let V::Scalar(val) = v else {
+            return None;
+        };
+        let view = self.b.func().view();
+        let ix = val.index();
+        if ix >= view.len() || view.ty(val) != elem_ty {
+            return None;
+        }
+        let uniform_byte = |bytes: &[u8]| -> Option<u8> {
+            let (&first, rest) = bytes.split_first()?;
+            rest.iter().all(|&b| b == first).then_some(first)
+        };
+        match view.op(ix) {
+            Op::Null => Some(0),
+            Op::Iconst => {
+                let word = *view.data.get(ix)?;
+                let bytes = if width <= 32 {
+                    u128::from(word).to_le_bytes()
+                } else {
+                    i128::from(i32::from_le_bytes(word.to_le_bytes())).to_le_bytes()
+                };
+                uniform_byte(bytes.get(..bytes_len)?)
+            }
+            Op::Fconst => {
+                let word = *view.data.get(ix)?;
+                let bytes = word.to_le_bytes();
+                uniform_byte(bytes.get(..bytes_len)?)
+            }
+            Op::IconstWide | Op::FconstWide => {
+                let words_len = usize::try_from(elem_ty.const_words()).ok()?;
+                if words_len == 0 || words_len.checked_mul(4) != Some(bytes_len) {
+                    return None;
+                }
+                let start = usize::try_from(*view.data.get(ix)?).ok()?;
+                let end = start.checked_add(words_len)?;
+                let words = view.extra.get(start..end)?;
+                let first = words.first()?.to_le_bytes()[0];
+                let uniform = u32::from_le_bytes([first; 4]);
+                words.iter().all(|&w| w == uniform).then_some(first)
+            }
+            _ => None,
+        }
+    }
+
     /// `[x; N]`: the value on top stored `N` times into the array's temporary under it,
-    /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
+    /// unrolled up to `UNROLL_LEAVES` leaves, as a single `Op::Memset` for uniform-byte scalar
+    /// constants beyond that, and in a loop otherwise.
     fn repeat(&mut self, e: ExprId) -> Result<(), BuildError> {
         let v = self.pop()?;
         let repr = self.expr_repr(e)?;
@@ -5870,14 +5924,26 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             self.push_val(V::None, None);
             return Ok(());
         };
-        let Shape::Array { elem, len, stride } = self.layouts[l as usize].shape else {
-            return Err(malformed("an array literal of a type that is not an array"));
+        let (elem, len, stride, leaves, align) = match &self.layouts[l as usize] {
+            Layout { shape: Shape::Array { elem, len, stride }, leaves, align, .. } => {
+                (*elem, *len, *stride, *leaves, *align)
+            }
+            _ => return Err(malformed("an array literal of a type that is not an array")),
         };
         let to = self.temp(repr);
-        if self.layouts[l as usize].leaves <= UNROLL_LEAVES {
+        if leaves <= UNROLL_LEAVES {
             for i in 0..len {
                 self.store(v, elem, (to.0, to.1 + (i * stride) as i32))?;
             }
+        } else if let Some(byte) = self.repeat_byte_fill(v, elem, stride)
+            && let Some(total) = u64::from(len).checked_mul(u64::from(stride))
+            && total > 0
+        {
+            let dst = self.address(to);
+            let fill = self.b.iconst(Ty::I8, u128::from(byte));
+            let bytes = self.b.iconst(Ty::I64, u128::from(total));
+            let attrs = MemAttrs::aligned(align);
+            self.b.bulk(Op::Memset, Flags::NONE, dst, fill, bytes, attrs);
         } else {
             // The loop's source is the element itself: the same place at every index.
             let (i, _, tp, header, exit) = self.array_loop(len, stride, to, to);

@@ -13,7 +13,7 @@ use blaze_lir::{
     builder::{Param, Variadic},
     func::{BlockKind, Conv, Func, RefKind},
 };
-use blaze_own::{Alloc, Vec};
+use blaze_own::{Alloc, Vec, alloc_ref::Erased, testing::TestHeap};
 
 use crate::{Named, Names, Outside, record::emit_record, tests::{ISA, emitted}};
 
@@ -64,10 +64,12 @@ fn inst(code: &[u8], at: u32) -> u32 {
 /// Prints `unwind rows: 3 rows (continue, cleanup, continue) for 4 calls; the landing stores x0 first`.
 #[test]
 fn an_invoke_gets_a_cleanup_row_and_a_call_in_the_cleanup_none() {
+    static TEST_HEAP: Erased<TestHeap> = Erased::new(TestHeap);
+    let alloc = Alloc::of(&TEST_HEAP);
     let func = with_cleanup();
-    let (record, _) = emit_record(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &ByPlace, &crate::RoutinePlaces::NONE, ISA, Alloc::global()).expect("emits");
+    let (record, _) = emit_record(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &ByPlace, &crate::RoutinePlaces::NONE, ISA, alloc).expect("emits");
     let sealed = record.seal().expect("seals");
-    let mut bytes = Vec::new_in(Alloc::global());
+    let mut bytes = Vec::new_in(alloc);
     sealed.encode(&mut bytes);
     let view = CodeView::read(&bytes).unwrap();
     let resume = blaze_code::record::Symbol::of_name("_Unwind_Resume");

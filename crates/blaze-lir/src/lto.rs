@@ -537,7 +537,7 @@ impl Default for SotaLtoOpts {
 }
 
 /// Runs the full cross-function post-inline SOTA pipeline on one body:
-/// `SROA -> prop -> thread_jumps -> prop -> DCE -> aegraph fixpoint -> BCE -> Loop Unswitching -> Memory LICM/DSE -> 4x SIMD Auto-Vectorization -> 4x Scalar Unrolling -> Bounded E-Graph Superopt`.
+/// `SROA -> prop -> if_convert(4) -> thread_jumps -> prop -> DCE -> aegraph fixpoint -> BCE -> Loop Unswitching -> if_convert(32) -> Memory LICM/DSE -> 4x SIMD Auto-Vectorization -> 4x Scalar Unrolling -> Bounded E-Graph Superopt`.
 fn sota_optimize_body<A: Allocator + Copy>(
     view: View<'_>,
     opts: SotaLtoOpts,
@@ -545,6 +545,7 @@ fn sota_optimize_body<A: Allocator + Copy>(
 ) -> Result<Func<A>, SimplifyError> {
     let mut cur = scalar_replace(view, alloc)?;
     cur = propagate(cur.view(), alloc)?;
+    cur = if_convert(cur.view(), 4, alloc)?.func;
     cur = thread_jumps(cur.view(), alloc)?;
     cur = propagate(cur.view(), alloc)?;
     cur = dead(cur.view(), alloc)?;
@@ -561,9 +562,20 @@ fn sota_optimize_body<A: Allocator + Copy>(
     cur = optimize_memory(cur.view(), alloc)?.func;
     let mut vectorized = false;
     if opts.auto_vectorize {
-        let vout = auto_vectorize_loops(cur.view(), alloc)?;
-        vectorized = vout.stats.loops_vectorized > 0;
-        cur = vout.func;
+        // Vectorize every eligible loop in the function (bounded at 16 rounds; vectorized
+        // loops' scalar tails gain a third predecessor so they are never re-matched).
+        for _ in 0..16 {
+            let vout = auto_vectorize_loops(cur.view(), alloc)?;
+            if vout.stats.loops_vectorized == 0 {
+                break;
+            }
+            vectorized = true;
+            cur = vout.func;
+        }
+        if vectorized {
+            cur = propagate(cur.view(), alloc)?;
+            cur = dead(cur.view(), alloc)?;
+        }
         if !vectorized {
             let mout = vectorize_memchr_loops(cur.view(), alloc)?;
             vectorized = mout.stats.loops_vectorized > 0;
@@ -584,9 +596,7 @@ fn sota_optimize_body<A: Allocator + Copy>(
             cur = sout.func;
         }
     }
-    if !vectorized {
-        cur = schedule_dag(cur.view(), alloc)?.func;
-    }
+    cur = schedule_dag(cur.view(), alloc)?.func;
     Ok(cur)
 }
 
