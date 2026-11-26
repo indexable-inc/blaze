@@ -360,22 +360,55 @@ impl<A: Allocator> Flow<A> {
         }
     }
 
-    /// Returns the `idx`-th successor statement of `s`, or `None`.
+    /// Calls `f` on each successor block of block `b`.
     #[inline]
-    pub(crate) fn nth_succ(&self, s: Stmt, idx: u32) -> Option<Stmt> {
-        match self.stmt(s).kind {
-            StmtKind::Goto(b) => (idx == 0).then(|| Stmt(self.blocks[b.index()].start)),
+    pub(crate) fn for_each_block_succ(&self, b: Block, mut f: impl FnMut(Block)) {
+        let range = self.blocks[b.index()];
+        if range.end <= range.start {
+            return;
+        }
+        match self.stmt(Stmt(range.end - 1)).kind {
+            StmtKind::Goto(t) => f(t),
+            StmtKind::Switch { targets, .. } => {
+                for &t in &self.succ[targets.start as usize..targets.end as usize] {
+                    f(t);
+                }
+            }
+            StmtKind::Suspend { resume, cancel } => {
+                f(resume);
+                f(cancel);
+            }
+            StmtKind::Return | StmtKind::Unreachable => {}
+            _ => {
+                if let Some(&t) = self.stmt_block.get(range.end as usize) {
+                    f(t);
+                }
+            }
+        }
+    }
+
+    /// Returns the `idx`-th successor block of block `b`, or `None`.
+    #[inline]
+    pub(crate) fn nth_block_succ(&self, b: Block, idx: u32) -> Option<Block> {
+        let range = self.blocks[b.index()];
+        if range.end <= range.start {
+            return None;
+        }
+        match self.stmt(Stmt(range.end - 1)).kind {
+            StmtKind::Goto(t) => (idx == 0).then_some(t),
             StmtKind::Switch { targets, .. } => {
                 let i = targets.start + idx;
-                (i < targets.end).then(|| Stmt(self.blocks[self.succ[i as usize].index()].start))
+                (i < targets.end).then(|| self.succ[i as usize])
             }
             StmtKind::Suspend { resume, cancel } => match idx {
-                0 => Some(Stmt(self.blocks[resume.index()].start)),
-                1 => Some(Stmt(self.blocks[cancel.index()].start)),
+                0 => Some(resume),
+                1 => Some(cancel),
                 _ => None,
             },
             StmtKind::Return | StmtKind::Unreachable => None,
-            _ => (idx == 0).then(|| Stmt(s.0 + 1)),
+            _ => (idx == 0)
+                .then(|| self.stmt_block.get(range.end as usize).copied())
+                .flatten(),
         }
     }
 

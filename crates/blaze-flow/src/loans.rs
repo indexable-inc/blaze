@@ -18,7 +18,7 @@ use core::alloc::Allocator;
 
 use crate::bits::{self, BitWorklist, Bits};
 use crate::flow::{
-    BorrowKind, Bound, Flow, Loan, Local, Operand, Origin, Place, Point, Proj, Span, Stmt,
+    Block, BorrowKind, Bound, Flow, Loan, Local, Operand, Origin, Place, Point, Proj, Span, Stmt,
     StmtKind, Value,
 };
 use crate::moves::{Inits, for_each_operand};
@@ -186,16 +186,20 @@ pub fn kills<A: Allocator>(flow: &Flow<A>, s: Stmt, l: Loan) -> bool {
     }
 }
 
-fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, include_drops: bool, mut used: impl FnMut(Local)) -> Option<Local> {
-    let local = |p: Place| flow.place(p).local;
-    let dest_def =|dest: Place, used: &mut dyn FnMut(Local)| {
-        if flow.place(dest).depth == 0 {
-            Some(local(dest))
-        } else {
-            used(local(dest));
-            None
+#[inline]
+fn stmt_def<A: Allocator>(flow: &Flow<A>, s: Stmt) -> Option<Local> {
+    match flow.stmt(s).kind {
+        StmtKind::Assign { dest, .. } | StmtKind::Call { dest, .. } => {
+            (flow.place(dest).depth == 0).then(|| flow.place(dest).local)
         }
-    };
+        StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => Some(l),
+        _ => None,
+    }
+}
+
+#[inline]
+fn for_each_stmt_use_no_drop<A: Allocator>(flow: &Flow<A>, s: Stmt, mut used: impl FnMut(Local)) {
+    let local = |p: Place| flow.place(p).local;
     match flow.stmt(s).kind {
         StmtKind::Assign { dest, value } => {
             for_each_operand(flow, value, |o| {
@@ -206,7 +210,9 @@ fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, include_
             if let Value::Borrow { place, .. } = value {
                 used(local(place));
             }
-            dest_def(dest, &mut used)
+            if flow.place(dest).depth > 0 {
+                used(local(dest));
+            }
         }
         StmtKind::Call { args, dest } => {
             for o in flow.ops(args) {
@@ -214,41 +220,37 @@ fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, include_
                     used(local(*p));
                 }
             }
-            dest_def(dest, &mut used)
-        }
-        StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => Some(l),
-        // Drop-liveness: origins in dropping positions of a dropped local are drop-live where
-        // the drop may run (`Inits::drop_may_run`, as suspend.rs's liveness has it). Non-dropping
-        // positions (`flow.local_no_drop_origins`, e.g. `&mut U` in `Result<&mut U, E>`) are
-        // excluded when `include_drops` is false.
-        StmtKind::Drop(p) => {
-            if include_drops && init.drop_may_run(flow, s, p) {
-                used(local(p));
+            if flow.place(dest).depth > 0 {
+                used(local(dest));
             }
-            None
         }
-        StmtKind::Activate(l) => {
-            used(local(flow.loan(l).place));
-            None
-        }
-        StmtKind::Switch { on, .. } => {
-            used(local(on));
-            None
-        }
+        StmtKind::Activate(l) => used(local(flow.loan(l).place)),
+        StmtKind::Switch { on, .. } => used(local(on)),
         // A mention defines nothing and is an access of nothing (`for_each_access` gives it
         // none); it uses its local only through a `Deref` (`Flow::mention_use`).
         StmtKind::Mention(p) => {
             if let Some(l) = flow.mention_use(p) {
                 used(l);
             }
-            None
         }
-        StmtKind::Return => {
-            used(Local(0));
-            None
-        }
-        _ => None,
+        StmtKind::Return => used(Local(0)),
+        _ => {}
     }
+}
+
+fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, include_drops: bool, mut used: impl FnMut(Local)) -> Option<Local> {
+    // Drop-liveness: origins in dropping positions of a dropped local are drop-live where
+    // the drop may run (`Inits::drop_may_run`, as suspend.rs's liveness has it). Non-dropping
+    // positions (`flow.local_no_drop_origins`, e.g. `&mut U` in `Result<&mut U, E>`) are
+    // excluded when `include_drops` is false.
+    if let StmtKind::Drop(p) = flow.stmt(s).kind {
+        if include_drops && init.drop_may_run(flow, s, p) {
+            used(flow.place(p).local);
+        }
+        return None;
+    }
+    for_each_stmt_use_no_drop(flow, s, used);
+    stmt_def(flow, s)
 }
 
 /// What both tiers read: origins live at each point, and two-phase loans activated on entry.
@@ -302,80 +304,207 @@ impl<T, A: Allocator> Csr<T, A> {
     }
 }
 
-/// Local liveness (backward, postorder worklist; bound `2 * stmts * locals + 1`),
-/// origin liveness from it (RFC 2094: "a lifetime L is live at a point P if there is some
-/// variable `p` which is live at P, and L appears in the type of `p`"), and activation
-/// (forward, RPO worklist; bound `stmts * loans + stmts + 1`).
+#[inline]
+fn fill_all_bits(row: &mut [u64], count: usize) {
+    if count == 0 {
+        return;
+    }
+    row.fill(u64::MAX);
+    let rem = count % 64;
+    if rem != 0
+        && let Some(last) = row.last_mut()
+    {
+        *last = (1u64 << rem) - 1;
+    }
+}
+
+/// `dst |= src & mask`; says whether `dst` grew.
+#[inline]
+fn union_masked_into(dst: &mut [u64], src: &[u64], mask: &[u64]) -> bool {
+    let mut grew = false;
+    for ((d, &s), &m) in dst.iter_mut().zip(src.iter()).zip(mask.iter()) {
+        let next = *d | (s & m);
+        if next != *d {
+            *d = next;
+            grew = true;
+        }
+    }
+    grew
+}
+
+/// Initializes `(cur_init, init_count, mi_row)` from block `b`'s entry `init` row for the
+/// tracked drop-origin locals (`local_to_dl`).
+fn init_tracked_block<A: Allocator>(
+    flow: &Flow<A>,
+    init: &Inits<A>,
+    b: usize,
+    local_to_dl: &[u32],
+    cur_init: &mut [u64],
+    init_count: &mut [u32],
+    mi_row: &mut [u64],
+) {
+    cur_init.copy_from_slice(init.init.row(b));
+    init_count.fill(0);
+    mi_row.fill(0);
+    for (w, &word) in cur_init.iter().enumerate() {
+        let mut bits_w = word;
+        let base = w * 64;
+        while bits_w != 0 {
+            let bit = usize::try_from(bits_w.trailing_zeros()).unwrap_or(0);
+            bits_w &= bits_w - 1;
+            if let Some(pr) = flow.places.get(base + bit) {
+                let dli = local_to_dl[pr.local.index()];
+                if dli != u32::MAX {
+                    let dli = dli as usize;
+                    init_count[dli] += 1;
+                    if init_count[dli] == 1 {
+                        bits::put(mi_row, dli, true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Advances `(cur_init, init_count, mi_row)` across statement `s` for tracked drop-origin locals.
+fn step_tracked_init<A: Allocator>(
+    flow: &Flow<A>,
+    init: &Inits<A>,
+    s: Stmt,
+    local_to_dl: &[u32],
+    cur_init: &mut [u64],
+    init_count: &mut [u32],
+    mi_row: &mut [u64],
+) {
+    let mut set_sub = |p: Place, on: bool| {
+        let dli = local_to_dl[flow.place(p).local.index()];
+        if dli == u32::MAX {
+            return;
+        }
+        let dli = dli as usize;
+        for &q in init.subtrees.subtree(p) {
+            let qi = q as usize;
+            let was = bits::test(cur_init, qi);
+            if was != on {
+                bits::put(cur_init, qi, on);
+                if on {
+                    init_count[dli] += 1;
+                    if init_count[dli] == 1 {
+                        bits::put(mi_row, dli, true);
+                    }
+                } else {
+                    init_count[dli] -= 1;
+                    if init_count[dli] == 0 {
+                        bits::put(mi_row, dli, false);
+                    }
+                }
+            }
+        }
+    };
+    match flow.stmt(s).kind {
+        StmtKind::Assign { dest, value } => {
+            for_each_operand(flow, value, |o| {
+                if let Operand::Move(p) = o {
+                    set_sub(p, false);
+                }
+            });
+            set_sub(dest, true);
+        }
+        StmtKind::Call { args, dest } => {
+            for &o in flow.ops(args) {
+                if let Operand::Move(p) = o {
+                    set_sub(p, false);
+                }
+            }
+            set_sub(dest, true);
+        }
+        StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => {
+            set_sub(flow.local_place(l), false);
+        }
+        StmtKind::Drop(p) => set_sub(p, false),
+        _ => {}
+    }
+}
+
+fn mark_origins<A: Allocator>(
+    in_row: &[u64],
+    out_row: &[u64],
+    idx_to_local: &[Local],
+    origins_by_local: &Csr<Origin, A>,
+    live: &mut Bits<A>,
+    start_p: usize,
+    mid_p: usize,
+) {
+    for w in 0..in_row.len() {
+        let in_w = in_row[w];
+        let base = w * 64;
+        // Locals in `in_row`: origins live at both Start and Mid.
+        let mut b = in_w;
+        while b != 0 {
+            let idx = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
+            b &= b - 1;
+            let local = idx_to_local[idx].index();
+            for &origin in origins_by_local.row(local) {
+                let oi = origin.index();
+                live.set(start_p, oi);
+                live.set(mid_p, oi);
+            }
+        }
+        // Locals only in `out_row`: origins live at Mid only.
+        let mut b = out_row[w] & !in_w;
+        while b != 0 {
+            let idx = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
+            b &= b - 1;
+            let local = idx_to_local[idx].index();
+            for &origin in origins_by_local.row(local) {
+                live.set(mid_p, origin.index());
+            }
+        }
+    }
+}
+
+/// Local liveness (backward, block-grain postorder worklist over origin-bearing locals; bound
+/// `2 * blocks * origin_locals + 1`), origin liveness from it (RFC 2094: "a lifetime L is live at
+/// a point P if there is some variable `p` which is live at P, and L appears in the type of `p`"),
+/// and activation (forward, block-grain RPO worklist; bound `blocks * loans + blocks + 1`).
 pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, Bound> {
-    let (n, nl, o) = (flow.stmts.len(), flow.loans.len(), flow.origins as usize);
-    let locals = flow.locals as usize;
     // Where each drop may run: the move check's dataflow, unplanted (a planted move bug is
     // the move check's control, not liveness's).
     let init = crate::moves::inits(flow, Plant::None, alloc)?;
-    let mut live_in = Bits::new_in(n, locals, alloc);
-    let mut live_out = Bits::new_in(n, locals, alloc);
+    facts_with_inits(flow, init, alloc)
+}
 
-    if n == 0 {
+pub(crate) fn facts_with_inits<A: Allocator + Copy>(
+    flow: &Flow<A>,
+    init: Inits<A>,
+    alloc: A,
+) -> Result<Facts<A>, Bound> {
+    let (nb, n, nl, o) = (flow.blocks.len(), flow.stmts.len(), flow.loans.len(), flow.origins as usize);
+    let locals = flow.locals as usize;
+
+    if n == 0 || nb == 0 {
         let live = Bits::new_in(0, o, alloc);
         let active = Bits::new_in(0, nl, alloc);
         return Ok(Facts { live, active, init });
     }
 
-    // Precompute per-statement `(def, uses)` and whether any `Activate` exists once.
-    let split_drop = !flow.local_no_drop_origins.is_empty();
-    let mut defs = Vec::with_capacity_in(n, alloc);
-    let mut uses_off = Vec::with_capacity_in(n + 1, alloc);
-    let mut uses_data = Vec::with_capacity_in(n, alloc);
-    let mut drop_uses: Vec<(usize, Local), A> = Vec::new_in(alloc);
-    let mut has_activate = false;
-    uses_off.push(0u32);
-    for s in 0..n {
-        let stmt = Stmt(s as u32);
-        if matches!(flow.stmt(stmt).kind, StmtKind::Activate(_)) {
-            has_activate = true;
-        }
-        if let StmtKind::Drop(p) = flow.stmt(stmt).kind
-            && init.drop_may_run(flow, stmt, p)
-        {
-            drop_uses.push((s, flow.place(p).local));
-        }
-        let def = uses_and_def(flow, &init, stmt, false, |l| uses_data.push(l));
-        defs.push(def);
-        uses_off.push(uses_data.len() as u32);
+    let has_activate = nl > 0
+        && flow.stmts.iter().any(|row| matches!(row.kind, StmtKind::Activate(_)));
+
+    // Fast exit when there are neither origins nor two-phase activations to solve.
+    if o == 0 && !has_activate {
+        let live = Bits::new_in(2 * n, 0, alloc);
+        let active = Bits::new_in(n, nl, alloc);
+        return Ok(Facts { live, active, init });
     }
 
-    // Build statement predecessor CSR in two linear passes.
-    let mut pred_off = Vec::with_capacity_in(n + 1, alloc);
-    pred_off.resize(n + 1, 0u32);
-    for s in 0..n {
-        flow.for_each_succ(Stmt(s as u32), |t| {
-            pred_off[t.index()] += 1;
-        });
-    }
-    let mut total_edges = 0u32;
-    for c in pred_off[..n].iter_mut() {
-        total_edges += *c;
-        *c = total_edges;
-    }
-    pred_off[n] = total_edges;
-    let mut pred_entries = Vec::with_capacity_in(total_edges as usize, alloc);
-    pred_entries.resize(total_edges as usize, 0u32);
-    for s in 0..n {
-        flow.for_each_succ(Stmt(s as u32), |t| {
-            let ti = t.index();
-            pred_off[ti] -= 1;
-            pred_entries[pred_off[ti] as usize] = s as u32;
-        });
-    }
-    let preds = Csr { offsets: pred_off, entries: pred_entries };
-
-    // Full-CFG DFS forest postorder (entry first, then any disconnected blocks).
-    // Smallest `post_rank` is backward topological order; `(n - 1) - post_rank` is forward RPO.
-    let mut visited = Vec::with_capacity_in(n, alloc);
-    visited.resize(n, false);
-    let mut postorder = Vec::with_capacity_in(n, alloc);
-    let mut dfs = Vec::with_capacity_in(n, alloc);
-    let entry = flow.entry().index();
+    // Full-CFG block DFS forest postorder (entry block first, then any disconnected blocks).
+    // Smallest `post_rank` is backward topological order; `(nb - 1) - post_rank` is forward RPO.
+    let eb = flow.stmt_block[flow.entry().index()].index();
+    let mut visited = Vec::with_capacity_in(nb, alloc);
+    visited.resize(nb, false);
+    let mut postorder = Vec::with_capacity_in(nb, alloc);
+    let mut dfs = Vec::with_capacity_in(nb, alloc);
     let visit_root = |root: usize,
                       visited: &mut Vec<bool, A>,
                       postorder: &mut Vec<u32, A>,
@@ -386,8 +515,8 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
         visited[root] = true;
         dfs.push((root as u32, 0u32));
         while let Some((node, next)) = dfs.last_mut() {
-            let s = Stmt(*node);
-            if let Some(t) = flow.nth_succ(s, *next) {
+            let b = Block(*node);
+            if let Some(t) = flow.nth_block_succ(b, *next) {
                 *next += 1;
                 let ti = t.index();
                 if !visited[ti] {
@@ -400,128 +529,21 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
             }
         }
     };
-    visit_root(entry, &mut visited, &mut postorder, &mut dfs);
-    for s in 0..n {
-        visit_root(s, &mut visited, &mut postorder, &mut dfs);
+    visit_root(eb, &mut visited, &mut postorder, &mut dfs);
+    for b in 0..nb {
+        visit_root(b, &mut visited, &mut postorder, &mut dfs);
     }
     drop(dfs);
     drop(visited);
-    let mut post_rank = Vec::with_capacity_in(n, alloc);
-    post_rank.resize(n, 0u32);
-    for (r, &s) in postorder.iter().enumerate() {
-        post_rank[s as usize] = r as u32;
+    let mut post_rank = Vec::with_capacity_in(nb, alloc);
+    post_rank.resize(nb, 0u32);
+    for (r, &b) in postorder.iter().enumerate() {
+        post_rank[b as usize] = r as u32;
     }
 
-    // Backward liveness worklist:
-    // `live_in(s) = use(s) | (live_out(s) - def(s))`, `live_out(s) = union_{t in succ(s)} live_in(t)`.
-    let mut worklist = BitWorklist::new_in(n, alloc);
-    for s in 0..n {
-        let lo = uses_off[s] as usize;
-        let hi = uses_off[s + 1] as usize;
-        if lo < hi {
-            for &l in &uses_data[lo..hi] {
-                live_in.set(s, l.index());
-            }
-            for &pred in preds.row(s) {
-                let p = pred as usize;
-                if bits::union_into(live_out.row_mut(p), live_in.row(s)) {
-                    worklist.push(post_rank[p] as usize);
-                }
-            }
-        }
-    }
-    drop(uses_data);
-    drop(uses_off);
-
-    let mut scratch_l = Vec::with_capacity_in(live_in.words(), alloc);
-    scratch_l.resize(live_in.words(), 0u64);
-    let limit = (2 * n * locals + 1) as u64;
-    let mut pops = 0u64;
-    while let Some(rank) = worklist.pop_min() {
-        pops += 1;
-        if pops > limit {
-            return Err(Bound::Passes { what: "liveness passes", limit });
-        }
-        let s = postorder[rank] as usize;
-        scratch_l.copy_from_slice(live_out.row(s));
-        if let Some(d) = defs[s] {
-            bits::put(&mut scratch_l, d.index(), false);
-        }
-        if bits::union_into(live_in.row_mut(s), &scratch_l) {
-            for &pred in preds.row(s) {
-                let p = pred as usize;
-                if bits::union_into(live_out.row_mut(p), live_in.row(s)) {
-                    worklist.push(post_rank[p] as usize);
-                }
-            }
-        }
-    }
-    // Second backward liveness pass for drop-only uses: a local is drop-live along paths reaching
-    // `StmtKind::Drop(p)` ONLY where the local may be initialized (RFC 2094, "liveness"), so a
-    // conditional move in one branch of an `if`/`else` does not leak drop-liveness back from the
-    // join block's `Drop(p)`. When `split_drop` is set, only drop-live origins of `local(p)` are
-    // marked live from `drop_in`/`drop_out`.
-    let mut drop_in = if !drop_uses.is_empty() && o > 0 { Some(Bits::new_in(n, locals, alloc)) } else { None };
-    let mut drop_out = if drop_in.is_some() { Some(Bits::new_in(n, locals, alloc)) } else { None };
-    if let (Some(d_in), Some(d_out)) = (&mut drop_in, &mut drop_out) {
-        let (maybe_init_in, maybe_init_out) = init.local_maybe_init(flow, alloc);
-        for &(s, l) in &drop_uses {
-            d_in.set(s, l.index());
-            for &pred in preds.row(s) {
-                let p = usize::try_from(pred).unwrap_or(0);
-                if maybe_init_out.get(p, l.index()) && d_out.set(p, l.index()) {
-                    if let Some(&pr) = post_rank.get(p) {
-                        worklist.push(usize::try_from(pr).unwrap_or(0));
-                    }
-                }
-            }
-        }
-        let mut dpops = 0u64;
-        while let Some(rank) = worklist.pop_min() {
-            dpops += 1;
-            if dpops > limit {
-                return Err(Bound::Passes { what: "drop liveness passes", limit });
-            }
-            let s = postorder.get(rank).copied().and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
-            scratch_l.copy_from_slice(d_out.row(s));
-            if let Some(d) = defs.get(s).copied().flatten() {
-                bits::put(&mut scratch_l, d.index(), false);
-            }
-            for (dst, &mask) in scratch_l.iter_mut().zip(maybe_init_in.row(s).iter()) {
-                *dst &= mask;
-            }
-            if bits::union_into(d_in.row_mut(s), &scratch_l) {
-                for &pred in preds.row(s) {
-                    let p = usize::try_from(pred).unwrap_or(0);
-                    let mut grew = false;
-                    for ((dst, &src), &mask) in d_out
-                        .row_mut(p)
-                        .iter_mut()
-                        .zip(d_in.row(s).iter())
-                        .zip(maybe_init_out.row(p).iter())
-                    {
-                        let next = *dst | (src & mask);
-                        if next != *dst {
-                            *dst = next;
-                            grew = true;
-                        }
-                    }
-                    if grew {
-                        if let Some(&pr) = post_rank.get(p) {
-                            worklist.push(usize::try_from(pr).unwrap_or(0));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    drop(drop_uses);
-    drop(scratch_l);
-    drop(preds);
-    drop(defs);
-
-    // Build `facts.live` via CSR `origins_by_local`, `trailing_zeros()`, and precomputed `ph_mask`.
+    let mut worklist = BitWorklist::new_in(nb, alloc);
     let mut live = Bits::new_in(2 * n, o, alloc);
+
     if o > 0 {
         let ow = live.words();
         let mut ph_mask = Vec::with_capacity_in(ow, alloc);
@@ -533,154 +555,477 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
                 has_ph = true;
             }
         }
+        if has_ph {
+            for p in 0..(2 * n) {
+                live.row_mut(p).copy_from_slice(&ph_mask);
+            }
+        }
+        drop(ph_mask);
+
         let origins_by_local = Csr::from_iter(
             locals,
             flow.local_origins.iter().map(|&(l, origin)| (l.index(), origin)),
             alloc,
         );
-        let lw = live_in.words();
-        let mut local_has_origin = Vec::with_capacity_in(lw, alloc);
-        local_has_origin.resize(lw, 0u64);
+        // Project liveness to only locals whose types mention at least one origin.
+        let mut local_to_ol = Vec::with_capacity_in(locals, alloc);
+        local_to_ol.resize(locals, u32::MAX);
+        let mut ol_to_local = Vec::new_in(alloc);
         for l in 0..locals {
             if !origins_by_local.row(l).is_empty() {
-                bits::put(&mut local_has_origin, l, true);
+                local_to_ol[l] = ol_to_local.len() as u32;
+                ol_to_local.push(Local(l as u32));
             }
         }
-        for s in 0..n {
-            let start_p = 2 * s;
-            let mid_p = 2 * s + 1;
-            if has_ph {
-                live.row_mut(start_p).copy_from_slice(&ph_mask);
-                live.row_mut(mid_p).copy_from_slice(&ph_mask);
+        let ol = ol_to_local.len();
+
+        if ol > 0 {
+            // Build block predecessor CSR in two linear passes.
+            let mut pred_off = Vec::with_capacity_in(nb + 1, alloc);
+            pred_off.resize(nb + 1, 0u32);
+            for b in 0..nb {
+                flow.for_each_block_succ(Block(b as u32), |tb| {
+                    pred_off[tb.index()] += 1;
+                });
             }
-            let in_row = live_in.row(s);
-            let out_row = live_out.row(s);
-            for w in 0..lw {
-                let mask = local_has_origin[w];
-                if mask == 0 {
+            let mut total_edges = 0u32;
+            for c in pred_off[..nb].iter_mut() {
+                total_edges += *c;
+                *c = total_edges;
+            }
+            pred_off[nb] = total_edges;
+            let mut pred_entries = Vec::with_capacity_in(total_edges as usize, alloc);
+            pred_entries.resize(total_edges as usize, 0u32);
+            for b in 0..nb {
+                flow.for_each_block_succ(Block(b as u32), |tb| {
+                    let ti = tb.index();
+                    pred_off[ti] -= 1;
+                    pred_entries[pred_off[ti] as usize] = b as u32;
+                });
+            }
+            let block_preds = Csr { offsets: pred_off, entries: pred_entries };
+
+            // Block-grain backward liveness over origin-bearing locals:
+            // `live_in(b) = block_use(b) | (live_out(b) & block_trans(b))`.
+            let mut block_live_in = Bits::new_in(nb, ol, alloc);
+            let mut block_live_out = Bits::new_in(nb, ol, alloc);
+            let mut block_trans = Bits::new_in(nb, ol, alloc);
+            for b in 0..nb {
+                let range = flow.blocks[b];
+                fill_all_bits(block_trans.row_mut(b), ol);
+                let mut any_use = false;
+                for s in range.start..range.end {
+                    let stmt = Stmt(s);
+                    for_each_stmt_use_no_drop(flow, stmt, |l| {
+                        let oi = local_to_ol[l.index()];
+                        if oi != u32::MAX && block_trans.get(b, oi as usize) {
+                            block_live_in.set(b, oi as usize);
+                            any_use = true;
+                        }
+                    });
+                    if let Some(d) = stmt_def(flow, stmt) {
+                        let oi = local_to_ol[d.index()];
+                        if oi != u32::MAX {
+                            block_trans.clear(b, oi as usize);
+                        }
+                    }
+                }
+                if any_use {
+                    for &pred in block_preds.row(b) {
+                        let p = pred as usize;
+                        if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
+                            worklist.push(post_rank[p] as usize);
+                        }
+                    }
+                }
+            }
+
+            let olw = block_live_in.words();
+            let mut scratch_l = Vec::with_capacity_in(olw, alloc);
+            scratch_l.resize(olw, 0u64);
+            let limit = (nb as u64)
+                .saturating_mul(ol as u64)
+                .saturating_mul(2)
+                .saturating_add(1);
+            let mut pops = 0u64;
+            while let Some(rank) = worklist.pop_min() {
+                pops += 1;
+                if pops > limit {
+                    return Err(Bound::Passes { what: "liveness passes", limit });
+                }
+                let b = postorder[rank] as usize;
+                for ((dst, &out_w), &tr_w) in scratch_l
+                    .iter_mut()
+                    .zip(block_live_out.row(b).iter())
+                    .zip(block_trans.row(b).iter())
+                {
+                    *dst = out_w & tr_w;
+                }
+                if bits::union_into(block_live_in.row_mut(b), &scratch_l) {
+                    for &pred in block_preds.row(b) {
+                        let p = pred as usize;
+                        if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
+                            worklist.push(post_rank[p] as usize);
+                        }
+                    }
+                }
+            }
+            drop(block_trans);
+            drop(block_live_in);
+
+            // Expand block-exit liveness backward through each block to populate `facts.live`.
+            let mut cur_out = Vec::with_capacity_in(olw, alloc);
+            cur_out.resize(olw, 0u64);
+            let mut cur_in = scratch_l;
+            for b in 0..nb {
+                let range = flow.blocks[b];
+                if range.end <= range.start {
                     continue;
                 }
-                let in_w = in_row[w];
-                let base = w * 64;
-                // Locals in `live_in`: origins live at both Start and Mid.
-                let mut b = in_w & mask;
-                while b != 0 {
-                    let local = base + b.trailing_zeros() as usize;
-                    b &= b - 1;
-                    for &origin in origins_by_local.row(local) {
-                        let oi = origin.index();
-                        live.set(start_p, oi);
-                        live.set(mid_p, oi);
+                cur_out.copy_from_slice(block_live_out.row(b));
+                for s in (range.start..range.end).rev() {
+                    let stmt = Stmt(s);
+                    cur_in.copy_from_slice(&cur_out);
+                    if let Some(d) = stmt_def(flow, stmt) {
+                        let oi = local_to_ol[d.index()];
+                        if oi != u32::MAX {
+                            bits::put(&mut cur_in, oi as usize, false);
+                        }
                     }
-                }
-                // Locals only in `live_out`: origins live at Mid only.
-                let mut b = (out_row[w] & !in_w) & mask;
-                while b != 0 {
-                    let local = base + b.trailing_zeros() as usize;
-                    b &= b - 1;
-                    for &origin in origins_by_local.row(local) {
-                        live.set(mid_p, origin.index());
-                    }
+                    for_each_stmt_use_no_drop(flow, stmt, |l| {
+                        let oi = local_to_ol[l.index()];
+                        if oi != u32::MAX {
+                            bits::put(&mut cur_in, oi as usize, true);
+                        }
+                    });
+                    let su = s as usize;
+                    mark_origins(
+                        &cur_in,
+                        &cur_out,
+                        &ol_to_local,
+                        &origins_by_local,
+                        &mut live,
+                        2 * su,
+                        2 * su + 1,
+                    );
+                    cur_out.copy_from_slice(&cur_in);
                 }
             }
-        }
-        if let (Some(d_in), Some(d_out)) = (&drop_in, &drop_out) {
-            let mut drop_origins_owned = None;
-            let mut local_has_drop_owned = None;
-            if split_drop {
+            drop(cur_out);
+            drop(cur_in);
+            drop(block_live_out);
+
+            // Second backward liveness pass for drop-only uses: a local is drop-live along paths
+            // reaching `StmtKind::Drop(p)` ONLY where the local may be initialized (RFC 2094,
+            // "liveness"), so a conditional move in one branch of an `if`/`else` does not leak
+            // drop-liveness back from the join block's `Drop(p)`. Solved at block grain over only
+            // the locals that both appear in a reachable `Drop` and carry a drop-live origin.
+            let split_drop = !flow.local_no_drop_origins.is_empty();
+            let drop_origins_owned = split_drop.then(|| {
                 let mut drop_pairs: Vec<(usize, Origin), A> = Vec::new_in(alloc);
                 for &(l, origin) in &flow.local_origins {
                     if flow.local_no_drop_origins.binary_search(&(l, origin)).is_err() {
                         drop_pairs.push((l.index(), origin));
                     }
                 }
-                let csr = Csr::from_iter(locals, drop_pairs.iter().copied(), alloc);
-                let mut has = Vec::with_capacity_in(lw, alloc);
-                has.resize(lw, 0u64);
-                for l in 0..locals {
-                    if !csr.row(l).is_empty() {
-                        bits::put(&mut has, l, true);
+                Csr::from_iter(locals, drop_pairs.iter().copied(), alloc)
+            });
+            let drop_origins_by_local = drop_origins_owned.as_ref().unwrap_or(&origins_by_local);
+
+            let mut local_to_dl = Vec::with_capacity_in(locals, alloc);
+            local_to_dl.resize(locals, u32::MAX);
+            let mut dl_to_local = Vec::new_in(alloc);
+            let mut drop_uses: Vec<(Stmt, u32), A> = Vec::new_in(alloc);
+            let mut block_has_drop = Vec::with_capacity_in(nb, alloc);
+            block_has_drop.resize(nb, false);
+            for s in 0..n {
+                let stmt = Stmt(s as u32);
+                if let StmtKind::Drop(p) = flow.stmt(stmt).kind {
+                    let l = flow.place(p).local;
+                    if !drop_origins_by_local.row(l.index()).is_empty()
+                        && init.drop_may_run(flow, stmt, p)
+                    {
+                        let dli = if local_to_dl[l.index()] == u32::MAX {
+                            let idx = dl_to_local.len() as u32;
+                            local_to_dl[l.index()] = idx;
+                            dl_to_local.push(l);
+                            idx
+                        } else {
+                            local_to_dl[l.index()]
+                        };
+                        drop_uses.push((stmt, dli));
+                        block_has_drop[flow.stmt_block[s].index()] = true;
                     }
                 }
-                drop_origins_owned = Some(csr);
-                local_has_drop_owned = Some(has);
             }
-            let drop_origins_by_local = drop_origins_owned.as_ref().unwrap_or(&origins_by_local);
-            let local_has_drop_origin = local_has_drop_owned.as_deref().unwrap_or(&local_has_origin);
-            for s in 0..n {
-                let start_p = 2 * s;
-                let mid_p = 2 * s + 1;
-                let in_row = d_in.row(s);
-                let out_row = d_out.row(s);
-                for (w, &mask) in local_has_drop_origin.iter().enumerate() {
-                    if mask == 0 {
+            let dl = dl_to_local.len();
+            if dl > 0 {
+                let mut block_d_in = Bits::new_in(nb, dl, alloc);
+                let mut block_d_out = Bits::new_in(nb, dl, alloc);
+                let mut block_drop_trans = Bits::new_in(nb, dl, alloc);
+                let mut block_mi_out = Bits::new_in(nb, dl, alloc);
+
+                let pw = init.init.words();
+                let mut cur_init = Vec::with_capacity_in(pw, alloc);
+                cur_init.resize(pw, 0u64);
+                let mut init_count = Vec::with_capacity_in(dl, alloc);
+                init_count.resize(dl, 0u32);
+                let dlw = block_d_in.words();
+                let mut mi_row = Vec::with_capacity_in(dlw, alloc);
+                mi_row.resize(dlw, 0u64);
+
+                // Summarize each reached block's drop-liveness transfer in one forward walk:
+                // `d_in(b) = block_drop_gen(b) | (d_out(b) & block_drop_trans(b))`.
+                for b in 0..nb {
+                    if !init.reached[b] {
                         continue;
                     }
-                    let in_w = in_row[w];
-                    let base = w * 64;
-                    let mut b = in_w & mask;
-                    while b != 0 {
-                        let local = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
-                        b &= b - 1;
-                        for &origin in drop_origins_by_local.row(local) {
-                            let oi = origin.index();
-                            live.set(start_p, oi);
-                            live.set(mid_p, oi);
+                    let range = flow.blocks[b];
+                    if range.end <= range.start {
+                        continue;
+                    }
+                    init_tracked_block(
+                        flow,
+                        &init,
+                        b,
+                        &local_to_dl,
+                        &mut cur_init,
+                        &mut init_count,
+                        &mut mi_row,
+                    );
+                    fill_all_bits(block_drop_trans.row_mut(b), dl);
+                    let mut du = drop_uses.partition_point(|&(ds, _)| ds.0 < range.start);
+                    for s in range.start..range.end {
+                        let stmt = Stmt(s);
+                        while du < drop_uses.len() && drop_uses[du].0 == stmt {
+                            let dli = drop_uses[du].1 as usize;
+                            du += 1;
+                            if block_drop_trans.get(b, dli) {
+                                block_d_in.set(b, dli);
+                            }
+                        }
+                        if let Some(d) = stmt_def(flow, stmt) {
+                            let dli = local_to_dl[d.index()];
+                            if dli != u32::MAX {
+                                block_drop_trans.clear(b, dli as usize);
+                            }
+                        }
+                        bits::intersect_into(block_drop_trans.row_mut(b), &mi_row);
+                        step_tracked_init(
+                            flow,
+                            &init,
+                            stmt,
+                            &local_to_dl,
+                            &mut cur_init,
+                            &mut init_count,
+                            &mut mi_row,
+                        );
+                        if s + 1 < range.end {
+                            bits::intersect_into(block_drop_trans.row_mut(b), &mi_row);
                         }
                     }
-                    let mut b = (out_row[w] & !in_w) & mask;
-                    while b != 0 {
-                        let local = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
-                        b &= b - 1;
-                        for &origin in drop_origins_by_local.row(local) {
-                            live.set(mid_p, origin.index());
+                    block_mi_out.row_mut(b).copy_from_slice(&mi_row);
+                }
+                // Seed backward worklist from blocks whose `block_d_in` has any upward-exposed drop.
+                for b in 0..nb {
+                    if !init.reached[b] || !block_d_in.row(b).iter().any(|&w| w != 0) {
+                        continue;
+                    }
+                    for &pred in block_preds.row(b) {
+                        let p = pred as usize;
+                        if union_masked_into(
+                            block_d_out.row_mut(p),
+                            block_d_in.row(b),
+                            block_mi_out.row(p),
+                        ) {
+                            worklist.push(post_rank[p] as usize);
+                        }
+                    }
+                }
+                let dlimit = (nb as u64)
+                    .saturating_mul(dl as u64)
+                    .saturating_mul(2)
+                    .saturating_add(1);
+                let mut scratch_d = Vec::with_capacity_in(dlw, alloc);
+                scratch_d.resize(dlw, 0u64);
+                let mut dpops = 0u64;
+                while let Some(rank) = worklist.pop_min() {
+                    dpops += 1;
+                    if dpops > dlimit {
+                        return Err(Bound::Passes { what: "drop liveness passes", limit: dlimit });
+                    }
+                    let b = postorder[rank] as usize;
+                    for ((dst, &out_w), &tr_w) in scratch_d
+                        .iter_mut()
+                        .zip(block_d_out.row(b).iter())
+                        .zip(block_drop_trans.row(b).iter())
+                    {
+                        *dst = out_w & tr_w;
+                    }
+                    if bits::union_into(block_d_in.row_mut(b), &scratch_d) {
+                        for &pred in block_preds.row(b) {
+                            let p = pred as usize;
+                            if union_masked_into(
+                                block_d_out.row_mut(p),
+                                block_d_in.row(b),
+                                block_mi_out.row(p),
+                            ) {
+                                worklist.push(post_rank[p] as usize);
+                            }
+                        }
+                    }
+                }
+                drop(block_drop_trans);
+                drop(block_mi_out);
+                drop(block_d_in);
+
+                // Expand block-exit drop-liveness backward through each active block to `facts.live`.
+                let mut block_mi: Vec<u64, A> = Vec::new_in(alloc);
+                let mut cur_out = Vec::with_capacity_in(dlw, alloc);
+                cur_out.resize(dlw, 0u64);
+                let mut cur_in = scratch_d;
+                for b in 0..nb {
+                    if !init.reached[b] {
+                        continue;
+                    }
+                    let range = flow.blocks[b];
+                    if range.end <= range.start {
+                        continue;
+                    }
+                    if !block_has_drop[b] && !block_d_out.row(b).iter().any(|&w| w != 0) {
+                        continue;
+                    }
+                    let len = (range.end - range.start) as usize;
+                    let needed = (len + 1) * dlw;
+                    if block_mi.len() < needed {
+                        block_mi.resize(needed, 0u64);
+                    }
+                    init_tracked_block(
+                        flow,
+                        &init,
+                        b,
+                        &local_to_dl,
+                        &mut cur_init,
+                        &mut init_count,
+                        &mut mi_row,
+                    );
+                    block_mi[0..dlw].copy_from_slice(&mi_row);
+                    for i in 0..len {
+                        let stmt = Stmt(range.start + i as u32);
+                        step_tracked_init(
+                            flow,
+                            &init,
+                            stmt,
+                            &local_to_dl,
+                            &mut cur_init,
+                            &mut init_count,
+                            &mut mi_row,
+                        );
+                        let off = (i + 1) * dlw;
+                        block_mi[off..off + dlw].copy_from_slice(&mi_row);
+                    }
+                    let mut du_end = drop_uses.partition_point(|&(ds, _)| ds.0 < range.end);
+                    cur_out.copy_from_slice(block_d_out.row(b));
+                    for i in (0..len).rev() {
+                        let s = range.start + i as u32;
+                        let stmt = Stmt(s);
+                        cur_in.copy_from_slice(&cur_out);
+                        if let Some(d) = stmt_def(flow, stmt) {
+                            let dli = local_to_dl[d.index()];
+                            if dli != u32::MAX {
+                                bits::put(&mut cur_in, dli as usize, false);
+                            }
+                        }
+                        let mi_in_slice = &block_mi[i * dlw..(i + 1) * dlw];
+                        bits::intersect_into(&mut cur_in, mi_in_slice);
+                        while du_end > 0 && drop_uses[du_end - 1].0 == stmt {
+                            du_end -= 1;
+                            bits::put(&mut cur_in, drop_uses[du_end].1 as usize, true);
+                        }
+                        let su = s as usize;
+                        mark_origins(
+                            &cur_in,
+                            &cur_out,
+                            &dl_to_local,
+                            drop_origins_by_local,
+                            &mut live,
+                            2 * su,
+                            2 * su + 1,
+                        );
+                        // For the previous statement `i - 1`, `d_out[i - 1] = d_in[i] & maybe_init_out[i - 1]`,
+                        // and `maybe_init_out[i - 1] == maybe_init_in[i] == mi_in_slice`.
+                        for ((dst, &in_w), &m) in
+                            cur_out.iter_mut().zip(cur_in.iter()).zip(mi_in_slice.iter())
+                        {
+                            *dst = in_w & m;
                         }
                     }
                 }
             }
         }
     }
-    drop(drop_in);
-    drop(drop_out);
-    drop(live_in);
-    drop(live_out);
 
     let mut active = Bits::new_in(n, nl, alloc);
     if has_activate && nl > 0 {
-        let mut reached = Vec::with_capacity_in(n, alloc);
-        reached.resize(n, false);
-        reached[entry] = true;
+        let mut block_active = Bits::new_in(nb, nl, alloc);
+        let mut reached = Vec::with_capacity_in(nb, alloc);
+        reached.resize(nb, false);
+        reached[eb] = true;
         let mut scratch = Vec::with_capacity_in(active.words(), alloc);
         scratch.resize(active.words(), 0u64);
-        // Reuse the now-empty `worklist` in forward RPO (`(n - 1) - post_rank`).
-        worklist.push(n - 1 - post_rank[entry] as usize);
-        let limit = (n * nl + n + 1) as u64;
+        // Reuse the now-empty `worklist` in forward block RPO (`(nb - 1) - post_rank`).
+        worklist.push(nb - 1 - post_rank[eb] as usize);
+        let limit = (nb as u64)
+            .saturating_mul(nl as u64)
+            .saturating_add(nb as u64)
+            .saturating_add(1);
         let mut pops = 0u64;
         while let Some(rpo_r) = worklist.pop_min() {
             pops += 1;
             if pops > limit {
                 return Err(Bound::Passes { what: "activation passes", limit });
             }
-            let s = postorder[n - 1 - rpo_r] as usize;
-            scratch.copy_from_slice(active.row(s));
-            match flow.stmt(Stmt(s as u32)).kind {
-                StmtKind::Activate(l) => bits::put(&mut scratch, l.index(), true),
-                StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } => {
-                    bits::put(&mut scratch, loan.index(), false)
+            let b = postorder[nb - 1 - rpo_r] as usize;
+            let range = flow.blocks[b];
+            scratch.copy_from_slice(block_active.row(b));
+            for s in range.start..range.end {
+                match flow.stmt(Stmt(s)).kind {
+                    StmtKind::Activate(l) => bits::put(&mut scratch, l.index(), true),
+                    StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } => {
+                        bits::put(&mut scratch, loan.index(), false)
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-            flow.for_each_succ(Stmt(s as u32), |t| {
-                let t = t.index();
+            flow.for_each_block_succ(Block(b as u32), |tb| {
+                let t = tb.index();
                 let first = !reached[t];
                 if first {
                     reached[t] = true;
                 }
-                let grew = bits::union_into(active.row_mut(t), &scratch);
+                let grew = bits::union_into(block_active.row_mut(t), &scratch);
                 if first || grew {
-                    worklist.push(n - 1 - post_rank[t] as usize);
+                    worklist.push(nb - 1 - post_rank[t] as usize);
                 }
             });
+        }
+        // Expand block-entry activation forward into per-statement `active`.
+        for b in 0..nb {
+            if !reached[b] {
+                continue;
+            }
+            let range = flow.blocks[b];
+            scratch.copy_from_slice(block_active.row(b));
+            for s in range.start..range.end {
+                active.row_mut(s as usize).copy_from_slice(&scratch);
+                match flow.stmt(Stmt(s)).kind {
+                    StmtKind::Activate(l) => bits::put(&mut scratch, l.index(), true),
+                    StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } => {
+                        bits::put(&mut scratch, loan.index(), false)
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     Ok(Facts { live, active, init })

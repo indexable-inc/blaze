@@ -104,11 +104,8 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 SelfTy::None => Err(PathMiss::FIRST),
             });
         }
-        if let Some(&(_, i)) = self.params.iter().find(|(n, _)| *n == segments[0]) {
-            return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
-        }
-        // The items of the body's blocks, innermost first, before the module's
-        // ([`super::locals`]); a local `use` names its path, resolved at the module.
+        // The items of the body's blocks, innermost first, shadow generic parameters and the
+        // module's items ([`super::locals`]); a local `use` names its path, resolved at the module.
         let mut via_use = None;
         // The module the path is resolved at: the body's, or the block's module of the local
         // struct, enum, union or alias its first segment names.
@@ -175,6 +172,13 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             if let Some(def) = def {
                 return Ok(Ok(PathRes { def, consumed: 1 }));
             }
+        }
+        if via_use.is_none()
+            && via_glob.is_none()
+            && local_type.is_none()
+            && let Some(&(_, i)) = self.params.iter().find(|(n, _)| *n == segments[0])
+        {
+            return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
         }
         // A local `use`'s binding stands for its path: `max` of `use core::cmp::max` is
         // `core::cmp::max`, the rest of the written path after it.

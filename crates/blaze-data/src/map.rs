@@ -9,7 +9,8 @@
 
 #![blaze::sans_io]
 
-use core::{alloc::Allocator, fmt, mem};
+use core::alloc::Allocator;
+use core::{fmt, mem};
 
 use blaze_own::{
     String, Vec,

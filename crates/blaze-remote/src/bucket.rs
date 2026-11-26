@@ -228,7 +228,7 @@ pub fn drive<M: Machine>(machine: &mut M, bucket: &mut dyn Bucket, sink: &mut dy
                 // What a failed machine still has in flight is answered (by its deadline at
                 // the latest) and dropped, so the next machine on this bucket never sees it.
                 while bucket.in_flight() > 0 {
-                    drop(bucket.wait());
+                    drop(Bucket::wait(bucket));
                 }
                 return out;
             }
@@ -237,7 +237,7 @@ pub fn drive<M: Machine>(machine: &mut M, bucket: &mut dyn Bucket, sink: &mut dy
         if bucket.in_flight() == 0 {
             return Err(Failure::Misused("a machine waits with nothing asked".to_owned()));
         }
-        replies = bucket.wait();
+        replies = Bucket::wait(bucket);
     }
     Err(Failure::Misused(format!("a machine took {STEPS_MOST} steps without ending")))
 }

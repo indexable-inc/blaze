@@ -74,6 +74,14 @@ pub trait ObjectStore<'a> {
     /// Reads object `oid` into `out` (cleared first). Returns `Ok(None)` if absent.
     fn read_object(&self, oid: &Oid, out: &mut AVec<'a, u8>) -> Result<Option<ObjectKind>, GitError>;
 
+    /// Returns the raw (uncompressed) byte length of `oid` without necessarily reading or
+    /// decompressing its payload. Stores like `.bgit` `BGIX` answer in O(log N) with zero
+    /// decompression; the default falls back to [`Self::read_object`].
+    fn object_size(&self, oid: &Oid, alloc: Alloc<'a>) -> Result<Option<u64>, GitError> {
+        let mut scratch = Vec::new_in(alloc);
+        Ok(self.read_object(oid, &mut scratch)?.map(|_| scratch.len() as u64))
+    }
+
     /// Stores `(kind, body)` and returns its exact SHA-1 [`Oid`]. Idempotent if already present.
     fn write_object(&mut self, kind: ObjectKind, body: &[u8]) -> Result<Oid, GitError>;
 

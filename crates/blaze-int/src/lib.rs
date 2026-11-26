@@ -280,22 +280,26 @@ macro_rules! narrow {
         // `x as u128` of a `u128` source is the value itself: the table's one body for all.
         #[allow(clippy::unnecessary_cast)]
         impl Cast<$s, $t> {
+            /// Range-checked conversion returning `Err(wide)` without constructing [`Narrowed`].
+            #[inline(always)]
+            const fn try_cast(x: $s) -> Result<$t, u128> {
+                let wide = x as u128;
+                if wide <= <$t>::MAX as u128 { Ok(x as $t) } else { Err(wide) }
+            }
+
             /// The same value, or a [`Narrowed`] naming it.
             #[inline(always)]
             pub const fn narrow(x: $s) -> Result<$t, Narrowed> {
-                // An unsigned value is never under the target's minimum; the target's maximum
-                // is positive, so its `u128` is exact.
-                if x as u128 <= <$t>::MAX as u128 {
-                    Ok(x as $t)
-                } else {
-                    Err(Narrowed { value: Value::Unsigned(x as u128), from: stringify!($s), to: stringify!($t) })
+                match Self::try_cast(x) {
+                    Ok(it) => Ok(it),
+                    Err(wide) => Err(Narrowed { value: Value::Unsigned(wide), from: stringify!($s), to: stringify!($t) }),
                 }
             }
 
             /// The value clamped to the target's range.
             #[inline(always)]
             pub const fn saturate(x: $s) -> $t {
-                match Self::narrow(x) {
+                match Self::try_cast(x) {
                     Ok(it) => it,
                     Err(_) => <$t>::MAX,
                 }
@@ -307,24 +311,27 @@ macro_rules! narrow {
         // `x as i128` of an `i128` source is the value itself: the table's one body for all.
         #[allow(clippy::unnecessary_cast)]
         impl Cast<$s, $t> {
+            /// Range-checked conversion returning `Err(wide)` without constructing [`Narrowed`].
+            #[inline(always)]
+            const fn try_cast(x: $s) -> Result<$t, i128> {
+                let wide = x as i128;
+                let fits = if wide < 0 { wide >= <$t>::MIN as i128 } else { wide as u128 <= <$t>::MAX as u128 };
+                if fits { Ok(x as $t) } else { Err(wide) }
+            }
+
             /// The same value, or a [`Narrowed`] naming it.
             #[inline(always)]
             pub const fn narrow(x: $s) -> Result<$t, Narrowed> {
-                let wide = x as i128;
-                // The target's minimum is 0 or negative and its maximum positive, so both are
-                // exact in `i128` and `u128`.
-                let fits = if wide < 0 { wide >= <$t>::MIN as i128 } else { wide as u128 <= <$t>::MAX as u128 };
-                if fits {
-                    Ok(x as $t)
-                } else {
-                    Err(Narrowed { value: Value::Signed(wide), from: stringify!($s), to: stringify!($t) })
+                match Self::try_cast(x) {
+                    Ok(it) => Ok(it),
+                    Err(wide) => Err(Narrowed { value: Value::Signed(wide), from: stringify!($s), to: stringify!($t) }),
                 }
             }
 
             /// The value clamped to the target's range.
             #[inline(always)]
             pub const fn saturate(x: $s) -> $t {
-                match Self::narrow(x) {
+                match Self::try_cast(x) {
                     Ok(it) => it,
                     Err(_) if x < 0 => <$t>::MIN,
                     Err(_) => <$t>::MAX,
@@ -340,7 +347,7 @@ macro_rules! narrow {
             #[inline(always)]
             #[track_caller]
             pub const fn narrow_or_stop(x: $s) -> $t {
-                match Self::narrow(x) {
+                match Self::try_cast(x) {
                     Ok(it) => it,
                     Err(_) => panic!(concat!(
                         "blaze_int: narrow_or_stop: a ",

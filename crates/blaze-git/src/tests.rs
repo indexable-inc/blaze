@@ -669,6 +669,35 @@ fn index_v4_conflicts_staged_modified_deleted_untracked_stashed_and_format() {
     let mut prompt = StdString::new();
     format_status(&status, &PromptStyle::STARSHIP, &mut prompt).unwrap();
     assert_eq!(prompt, "feat/starship (MERGING) [=$2✘!+3?3]");
+
+    // Verify `Detail::Full` collects every exact per-path porcelain XY entry (including UU,
+    // staged add/mod/del, unstaged mod/del, collapsed untracked dir, and simultaneous MM!).
+    repo.put_work("dir/staged_mod.txt", b"staged_then_edited_again", 70, 4, false);
+    repo.put_work("conflict.rs", b"<<<<<<< ours\n=======\n>>>>>>> theirs\n", 50, 1, false);
+    let full = repo.drive(StatusOpts::FULL, alloc, NoPlant).expect("full status ok");
+    let mut porcelain = StdString::new();
+    crate::format_porcelain_v1(&full, true, &mut porcelain).unwrap();
+    assert_eq!(
+        porcelain,
+        "## feat/starship\n\
+         UU conflict.rs\n\
+         A  dir/staged_add.txt\n\
+         D  dir/staged_del.txt\n\
+         MM dir/staged_mod.txt\n\
+         \x20D wt_del.txt\n\
+         \x20M wt_mod.txt\n\
+         ?? .gitignore\n\
+         ?? keep.log\n\
+         ?? new_dir/\n"
+    );
+    let mut long_out = StdString::new();
+    crate::format_long_status(&full, false, &mut long_out).unwrap();
+    assert!(long_out.contains("On branch feat/starship"));
+    assert!(long_out.contains("Changes to be committed:"));
+    assert!(long_out.contains("Unmerged paths:"));
+    assert!(long_out.contains("both modified:   conflict.rs"));
+    assert!(long_out.contains("Changes not staged for commit:"));
+    assert!(long_out.contains("Untracked files:"));
 }
 
 #[test]

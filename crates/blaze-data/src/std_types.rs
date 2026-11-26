@@ -8,8 +8,10 @@
 
 #![blaze::sans_io]
 
+extern crate std;
+
 use core::alloc::Allocator;
-use std::{borrow::ToOwned, string::String as StdString, vec::Vec as StdVec};
+use self::std::{borrow::ToOwned, string::String as StdString, vec::Vec as StdVec};
 
 use crate::{Cursor, FromValue, ShapeError, ToValue, Value};
 
@@ -45,7 +47,7 @@ impl<A: Allocator + Clone, T: FromValue<A>> FromValue<A> for StdVec<T> {
 #[cfg(unix)]
 mod path {
     use core::alloc::Allocator;
-    use std::{
+    use super::std::{
         ffi::OsStr,
         os::unix::ffi::OsStrExt,
         path::{Path, PathBuf},

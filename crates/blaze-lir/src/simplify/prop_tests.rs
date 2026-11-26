@@ -912,3 +912,162 @@ fn xor_range_two_pred_merge_with_zero_edge_does_not_fold_param_eq_zero() {
     let via_hit = run_in(cleaned.view(), &[Val::Int(0x40_0010), Val::Int(0)], FUEL, TestHeap).expect("runs");
     assert_eq!(returned_int(&via_hit), 0x40_0010);
 }
+
+/// Packed `Option<u8>` / `Result<u8, ()>` discriminant extraction:
+/// - `Trunc(Shl(Zext(x_i8 -> i16), 8) -> i8)` folds to `0` and collapses `Switch` to arm 0;
+/// - `Trunc(Or(Shl(Zext(x_i8 -> i16), 8), 1) -> i8)` folds to `1` and collapses `Switch` to arm 1.
+#[test]
+fn prop_folds_packed_enum_tag_trunc_and_collapses_switch() {
+    // Case 1: tag == 0 via `Shl(Zext(x_i8 -> i16), 8)` -> `Trunc(-> i8)` -> `Switch`.
+    let func0 = {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I8)], &[Param::of(Ty::I32)]);
+        b.set_signature(sig);
+        let [entry, arm0, arm1, default_blk] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let x = b.param(Ty::I8);
+        let x16 = b.convert(Op::Zext, Flags::NONE, Ty::I16, x);
+        let c8 = b.iconst(Ty::I16, 8);
+        let packed = b.binary(Op::Shl, Flags::NONE, x16, c8);
+        let tag = b.convert(Op::Trunc, Flags::NONE, Ty::I8, packed);
+        b.switch(tag, (default_blk, &[]), &[(0, (arm0, &[])), (1, (arm1, &[]))]);
+
+        b.begin(arm0);
+        let x32 = b.convert(Op::Zext, Flags::NONE, Ty::I32, x);
+        b.ret(&[x32]);
+
+        b.begin(arm1);
+        let v1 = b.iconst(Ty::I32, 111);
+        b.ret(&[v1]);
+
+        b.begin(default_blk);
+        let vd = b.iconst(Ty::I32, 222);
+        b.ret(&[vd]);
+
+        b.finish_checked().expect("builds tag-0 switch")
+    };
+
+    let prop0 = propagate(func0.view(), TestHeap).expect("propagates tag-0");
+    verify(prop0.view()).expect("verified tag-0 after propagate");
+    assert!(!ops(prop0.view()).contains(&Op::Trunc), "{}", print(prop0.view()));
+    assert!(!ops(prop0.view()).contains(&Op::Switch), "{}", print(prop0.view()));
+
+    let cleaned0 = dead(prop0.view(), TestHeap).expect("cleans tag-0");
+    verify(cleaned0.view()).expect("verified tag-0 after dead");
+    assert!(!ops(cleaned0.view()).contains(&Op::Trunc), "{}", print(cleaned0.view()));
+    assert!(!ops(cleaned0.view()).contains(&Op::Switch), "{}", print(cleaned0.view()));
+    assert_eq!(cleaned0.view().blocks(), 1, "{}", print(cleaned0.view()));
+
+    for xv in [0u128, 1, 42, 255] {
+        let args = [Val::Int(xv)];
+        let before = run_in(func0.view(), &args, FUEL, TestHeap).expect("before runs");
+        let after = run_in(cleaned0.view(), &args, FUEL, TestHeap).expect("after runs");
+        assert_eq!(before, after, "tag-0 mismatch on x={xv}");
+        assert_eq!(returned_int(&after), xv);
+    }
+
+    // Case 2: tag == 1 via `Or(Shl(Zext(x_i8 -> i16), 8), 1)` -> `Trunc(-> i8)` -> `Switch`.
+    let func1 = {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I8)], &[Param::of(Ty::I32)]);
+        b.set_signature(sig);
+        let [entry, arm0, arm1, default_blk] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let x = b.param(Ty::I8);
+        let x16 = b.convert(Op::Zext, Flags::NONE, Ty::I16, x);
+        let c8 = b.iconst(Ty::I16, 8);
+        let sh = b.binary(Op::Shl, Flags::NONE, x16, c8);
+        let c1 = b.iconst(Ty::I16, 1);
+        let packed = b.binary(Op::Or, Flags::NONE, sh, c1);
+        let tag = b.convert(Op::Trunc, Flags::NONE, Ty::I8, packed);
+        b.switch(tag, (default_blk, &[]), &[(0, (arm0, &[])), (1, (arm1, &[]))]);
+
+        b.begin(arm0);
+        let v0 = b.iconst(Ty::I32, 10);
+        b.ret(&[v0]);
+
+        b.begin(arm1);
+        let x32 = b.convert(Op::Zext, Flags::NONE, Ty::I32, x);
+        let k = b.iconst(Ty::I32, 100);
+        let sum = b.binary(Op::Add, Flags::NONE, x32, k);
+        b.ret(&[sum]);
+
+        b.begin(default_blk);
+        let vd = b.iconst(Ty::I32, 222);
+        b.ret(&[vd]);
+
+        b.finish_checked().expect("builds tag-1 switch")
+    };
+
+    let prop1 = propagate(func1.view(), TestHeap).expect("propagates tag-1");
+    verify(prop1.view()).expect("verified tag-1 after propagate");
+    assert!(!ops(prop1.view()).contains(&Op::Trunc), "{}", print(prop1.view()));
+    assert!(!ops(prop1.view()).contains(&Op::Switch), "{}", print(prop1.view()));
+
+    let cleaned1 = dead(prop1.view(), TestHeap).expect("cleans tag-1");
+    verify(cleaned1.view()).expect("verified tag-1 after dead");
+    assert!(!ops(cleaned1.view()).contains(&Op::Trunc), "{}", print(cleaned1.view()));
+    assert!(!ops(cleaned1.view()).contains(&Op::Switch), "{}", print(cleaned1.view()));
+    assert_eq!(cleaned1.view().blocks(), 1, "{}", print(cleaned1.view()));
+
+    for xv in [0u128, 1, 42, 255] {
+        let args = [Val::Int(xv)];
+        let before = run_in(func1.view(), &args, FUEL, TestHeap).expect("before runs");
+        let after = run_in(cleaned1.view(), &args, FUEL, TestHeap).expect("after runs");
+        assert_eq!(before, after, "tag-1 mismatch on x={xv}");
+        assert_eq!(returned_int(&after), xv + 100);
+    }
+}
+
+/// Negative guard: `Or(Shl(Zext(x_i8 -> i16), 8), Zext(tag_i1 -> i16))` has an unknown bit 0,
+/// so `Trunc(-> i8)` and the downstream `Switch` MUST remain live.
+#[test]
+fn prop_does_not_fold_unknown_packed_enum_tag() {
+    let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+    let sig = b.sig(
+        Conv::C,
+        Variadic::No,
+        &[Param::of(Ty::I8), Param::of(Ty::I1)],
+        &[Param::of(Ty::I32)],
+    );
+    b.set_signature(sig);
+    let [entry, arm0, arm1, default_blk] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+    b.begin(entry);
+    let (x, tag_i1) = (b.param(Ty::I8), b.param(Ty::I1));
+    let x16 = b.convert(Op::Zext, Flags::NONE, Ty::I16, x);
+    let c8 = b.iconst(Ty::I16, 8);
+    let sh = b.binary(Op::Shl, Flags::NONE, x16, c8);
+    let tag16 = b.convert(Op::Zext, Flags::NONE, Ty::I16, tag_i1);
+    let packed = b.binary(Op::Or, Flags::NONE, sh, tag16);
+    let tag = b.convert(Op::Trunc, Flags::NONE, Ty::I8, packed);
+    b.switch(tag, (default_blk, &[]), &[(0, (arm0, &[])), (1, (arm1, &[]))]);
+
+    b.begin(arm0);
+    let x32 = b.convert(Op::Zext, Flags::NONE, Ty::I32, x);
+    b.ret(&[x32]);
+
+    b.begin(arm1);
+    let v1 = b.iconst(Ty::I32, 99);
+    b.ret(&[v1]);
+
+    b.begin(default_blk);
+    let vd = b.iconst(Ty::I32, 222);
+    b.ret(&[vd]);
+
+    let func = b.finish_checked().expect("builds unknown-tag switch");
+    let prop = propagate(func.view(), TestHeap).expect("propagates");
+    verify(prop.view()).expect("verified after propagate");
+    let cleaned = dead(prop.view(), TestHeap).expect("cleans");
+    verify(cleaned.view()).expect("verified after dead");
+
+    assert!(ops(cleaned.view()).contains(&Op::Trunc), "unknown tag trunc must stay:\n{}", print(cleaned.view()));
+    assert!(ops(cleaned.view()).contains(&Op::Switch), "unknown tag switch must stay:\n{}", print(cleaned.view()));
+
+    for (xv, tv, want) in [(0u128, 0u128, 0u128), (42, 0, 42), (42, 1, 99), (255, 1, 99)] {
+        let args = [Val::Int(xv), Val::Int(tv)];
+        let before = run_in(func.view(), &args, FUEL, TestHeap).expect("before runs");
+        let after = run_in(cleaned.view(), &args, FUEL, TestHeap).expect("after runs");
+        assert_eq!(before, after, "mismatch on (x={xv}, tag={tv})");
+        assert_eq!(returned_int(&after), want);
+    }
+}

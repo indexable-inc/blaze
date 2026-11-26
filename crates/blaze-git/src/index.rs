@@ -122,6 +122,15 @@ impl<'a> CacheTree<'a> {
     }
 }
 
+/// One unmerged (conflicted) path in `.git/index` (stages 1..=3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConflictEntry {
+    pub path_start: u32,
+    pub path_len: u32,
+    /// Bitmask of present conflict stages: bit 1 = base, bit 2 = ours, bit 3 = theirs.
+    pub stage_mask: u8,
+}
+
 /// Parsed `.git/index` borrowing v2/v3 paths from the input buffer.
 pub struct ParsedIndex<'i, 'a> {
     /// Original index bytes (used to slice v2/v3 paths and cache-tree names).
@@ -131,6 +140,8 @@ pub struct ParsedIndex<'i, 'a> {
     is_v4: bool,
     /// Normal (stage 0) entries in sorted byte order.
     pub entries: AVec<'a, IndexEntry>,
+    /// Distinct conflicted paths (stages 1..=3) in sorted byte order.
+    pub conflicts: AVec<'a, ConflictEntry>,
     /// Number of distinct paths that have at least one unmerged (stage 1..=3) entry.
     pub conflicted_count: u32,
     /// Optional recursive `TREE` cache-tree extension.
@@ -200,18 +211,20 @@ impl<'i, 'a> ParsedIndex<'i, 'a> {
             v4_paths: &self.v4_paths,
             is_v4: self.is_v4,
             entries: &self.entries,
+            conflicts: &self.conflicts,
             cache_tree: self.cache_tree.as_ref().map(|ct| ct.nodes.as_slice()),
         }
     }
 }
 
-/// Zero-cost borrowed view over an already-parsed index (4 slices + 1 bool, zero allocations).
+/// Zero-cost borrowed view over an already-parsed index (5 slices + 1 bool, zero allocations).
 #[derive(Clone, Copy)]
 pub struct IndexView<'a> {
     pub raw: &'a [u8],
     pub v4_paths: &'a [u8],
     pub is_v4: bool,
     pub entries: &'a [IndexEntry],
+    pub conflicts: &'a [ConflictEntry],
     pub cache_tree: Option<&'a [CacheTreeNode]>,
 }
 
@@ -221,6 +234,21 @@ impl<'a> IndexView<'a> {
         let start = entry.path_start as usize;
         let end = start + entry.path_len as usize;
         if self.is_v4 { &self.v4_paths[start..end] } else { &self.raw[start..end] }
+    }
+
+    #[inline]
+    pub fn conflict_path_bytes(&self, entry: &ConflictEntry) -> &'a [u8] {
+        let start = entry.path_start as usize;
+        let end = start + entry.path_len as usize;
+        if self.is_v4 { &self.v4_paths[start..end] } else { &self.raw[start..end] }
+    }
+
+    #[inline]
+    pub fn has_conflict(&self, path: &[u8]) -> bool {
+        if self.conflicts.is_empty() {
+            return false;
+        }
+        self.conflicts.binary_search_by(|c| self.conflict_path_bytes(c).cmp(path)).is_ok()
     }
 
     #[inline]
@@ -279,6 +307,7 @@ pub struct OwnedIndex<'a> {
     pub v4_paths: AVec<'a, u8>,
     pub is_v4: bool,
     pub entries: AVec<'a, IndexEntry>,
+    pub conflicts: AVec<'a, ConflictEntry>,
     pub conflicted_count: u32,
     pub cache_tree: Option<CacheTree<'a>>,
     pub version: u32,
@@ -292,9 +321,26 @@ impl<'a> OwnedIndex<'a> {
         plant: impl Planted<GitStatusPlant>,
     ) -> Result<OwnedIndex<'a>, GitError> {
         let parsed = parse_index(&raw, limits, alloc, plant)?;
-        let ParsedIndex { v4_paths, is_v4, entries, conflicted_count, cache_tree, version, .. } =
-            parsed;
-        Ok(OwnedIndex { raw, v4_paths, is_v4, entries, conflicted_count, cache_tree, version })
+        let ParsedIndex {
+            v4_paths,
+            is_v4,
+            entries,
+            conflicts,
+            conflicted_count,
+            cache_tree,
+            version,
+            ..
+        } = parsed;
+        Ok(OwnedIndex {
+            raw,
+            v4_paths,
+            is_v4,
+            entries,
+            conflicts,
+            conflicted_count,
+            cache_tree,
+            version,
+        })
     }
 
     #[inline]
@@ -304,6 +350,7 @@ impl<'a> OwnedIndex<'a> {
             v4_paths: &self.v4_paths,
             is_v4: self.is_v4,
             entries: &self.entries,
+            conflicts: &self.conflicts,
             cache_tree: self.cache_tree.as_ref().map(|ct| ct.nodes.as_slice()),
         }
     }
@@ -365,6 +412,7 @@ pub fn parse_index<'i, 'a>(
 
     let end = bytes.len() - 20;
     let mut entries = Vec::with_capacity_in(count as usize, alloc);
+    let mut conflicts: AVec<'a, ConflictEntry> = Vec::new_in(alloc);
     let is_v4 = version == 4;
     let mut v4_paths: AVec<'a, u8> = Vec::new_in(alloc);
     let mut prev_v4: AVec<'a, u8> = Vec::new_in(alloc);
@@ -465,6 +513,7 @@ pub fn parse_index<'i, 'a>(
 
         if stage > 0 {
             if !plant.has(GitStatusPlant::SkipConflictCount) {
+                let stage_bit = 1u8 << stage;
                 let same_as_last = has_last_conflict && {
                     let prev: &[u8] = if is_v4 {
                         &v4_paths[last_conflict_start..last_conflict_start + last_conflict_len]
@@ -473,8 +522,17 @@ pub fn parse_index<'i, 'a>(
                     };
                     prev == path_slice
                 };
-                if !same_as_last {
+                if same_as_last {
+                    if let Some(last) = conflicts.last_mut() {
+                        last.stage_mask |= stage_bit;
+                    }
+                } else {
                     conflicted_count = conflicted_count.saturating_add(1);
+                    conflicts.push(ConflictEntry {
+                        path_start: path_start as u32,
+                        path_len: path_len as u32,
+                        stage_mask: stage_bit,
+                    });
                     last_conflict_start = path_start;
                     last_conflict_len = path_len;
                     has_last_conflict = true;
@@ -534,6 +592,7 @@ pub fn parse_index<'i, 'a>(
         v4_paths,
         is_v4,
         entries,
+        conflicts,
         conflicted_count,
         cache_tree,
         version,

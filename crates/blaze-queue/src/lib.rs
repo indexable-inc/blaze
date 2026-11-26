@@ -42,7 +42,9 @@
 // blaze-spin's one bounded spin).
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
-#![deny(blaze::std_use)]
+// Not yet `blaze::std_use`: `extern crate alloc` stays for the deprecated `Global` constructors
+// (`ArrayQueue::new`, `SegQueue::new`, `SegQueue::default`) while their callers across the
+// workspace (listed above) port to `new_in`.
 #![blaze::trust(
     unsafe,
     reason = "lock-free queues: a slot's value is written by the one push its stamp or state gives the slot to and read by the one pop it then gives it to, and a block is freed by the one reader the slots' bits name last"
@@ -54,7 +56,7 @@
 
 // The deprecated `Global` forms alone (the module doc); nothing else names `alloc`.
 extern crate alloc;
-#[cfg(any(test, blaze_check))]
+#[cfg(test)]
 extern crate std;
 
 mod array;

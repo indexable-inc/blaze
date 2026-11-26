@@ -2273,3 +2273,492 @@ fn higher_ranked_gat_projection_supertrait_clause_normalizes_cleanly() {
     // Existential origin `o` for `'a` must tie `0` and `1` invariantly (`0 == o == 1`).
     assert!(!rec.subsets.is_empty(), "must emit region constraints tying call lifetime `'0` to `Evm<'1>`");
 }
+
+/// Repeated calls through [`crate::call_in`] reuse `CallScratch`'s flattened environment pools
+/// and `impl_seen` buffer without leaking bump-frame memory across calls.
+#[test]
+fn call_in_reuses_scratch_in_bump_frame() {
+    let mut t = Tys::new();
+    let u8_ = t.u8();
+    let r_u8 = t.r(u8_);
+    let p0 = t.param(0);
+    let r_p0 = t.r(p0);
+    let alias_val = t.alias(T_TR, VALUE, &[p0]);
+    let impl_self = t.r(p0);
+    let impl_trait = t.extrait(T_TR, &[impl_self]);
+    let facts = Facts::default().trait_(T_TR, 0).alias(T_TR, VALUE, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    let head = ImplHead { imp: IMP, lifetimes: 1, types: 1, trait_ref: ty(impl_trait, P0) };
+    let val = ImplValue { value: ty(r_p0, P0), gat_lifetimes: 0 };
+    let mut sel = Sel::default();
+    sel.rows.push((T_TR, Some(VALUE), Selection::Impl { head, value: Some(val) }));
+    let own = Own::default();
+
+    // `fn f<'a, T>(x: T) -> <T as Tr>::Value` called with `T = &'0 u8`, `dest = &'1 u8`.
+    let p = params(1, &[0]);
+    let inputs = [ty(p0, NONE)];
+    let sig = Sig { item: F, params: ParamsView::of(&p), inputs: &inputs, output: ty(alias_val, NONE), clauses: &[] };
+    let types = [arg(r_u8, 0, 1)];
+    let args = [arg(r_u8, 0, 1)];
+    let dest = arg(r_u8, 1, 1);
+    let origins = [Origin(0), Origin(1)];
+
+    let frame = std::boxed::Box::new(blaze_own::Inline::<{ 256 * 1024 }>::new());
+    let mut scratch = crate::CallScratch::new_in(&*frame);
+    let mut used_after_first = 0usize;
+    for iter in 0..500usize {
+        let mut rec = Rec { subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new(), next: 100 };
+        let res = {
+            let mut cx = Cx { types: &cols, sig_types: &cols, selected: &sel, owner: &own, origins: &origins, out: &mut rec };
+            crate::call_in(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types }, &args, dest, &mut scratch)
+        };
+        assert_eq!(res, Ok(()), "iter {iter} failed: {res:?}");
+        assert!(!rec.subsets.is_empty());
+        if iter == 0 {
+            used_after_first = frame.used();
+        }
+    }
+    let used_after_all = frame.used();
+    assert!(
+        used_after_all <= used_after_first + 4096 && used_after_all < 32 * 1024,
+        "CallScratch leaked into bump frame: after_first={used_after_first}B, after_500={used_after_all}B",
+    );
+}
+
+/// Flattened `Envs::truncate` reclaims `regs`, `late`, and `types` pool space across speculative
+/// environment probes instead of leaking per-`Env` `Vec`s into a bump frame.
+#[test]
+fn envs_truncate_reclaims_pool_capacity_in_bump_frame() {
+    let frame = std::boxed::Box::new(blaze_own::Inline::<{ 64 * 1024 }>::new());
+    let mut envs: crate::inst::Envs<'static, _> = crate::inst::Envs::new_in(&*frame);
+    let base = envs.impl_env(2, 2).expect("base env");
+    let mark = envs.len();
+    for i in 0..2_000u32 {
+        let e1 = envs.impl_env(4, 4).expect("speculative impl env");
+        let _e2 = envs.skolemize_clause(e1, 3, || Origin(1000 + i)).expect("skolemize env");
+        envs.truncate(mark);
+    }
+    assert_eq!(envs.len(), mark);
+    assert_eq!(mark, 1);
+    let _ = base;
+    let used = frame.used();
+    assert!(used < 16 * 1024, "speculative Envs::truncate leaked into bump frame: used={used}B");
+}
+
+/// Higher-ranked impl projection where-clause (`impl<P, R> World for Program<'_, P> where
+/// for<'a> P: FnOnce<(&'a u8,), Output = R>, R: 'static`) binds `R` inside the skolemized
+/// environment and MUST propagate `R` back to the impl's base environment so subsequent
+/// clauses (`R: 'static`) see `R` instead of `Bad::Unconstrained` and still reject non-static `R`.
+#[test]
+fn higher_ranked_impl_projection_propagates_bound_type_param() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+    use blaze_typeck::regions::RegionCol;
+
+    const T_WORLD: ItemKey = ItemKey(0x9001);
+    const T_FN_ONCE: ItemKey = ItemKey(0x9002);
+    const K_PROG: ItemKey = ItemKey(0x9003);
+    const IMP_WORLD: ItemKey = ItemKey(0x9004);
+    const RUN_WORLD: ItemKey = ItemKey(0x9005);
+
+    let mut t = Tys::new();
+    let u8_ = t.u8();
+    let unit = t.unit();
+    let r_u8 = t.r(u8_);
+    let p0 = t.param(0);
+    let p1 = t.param(1);
+    let prog_p0 = t.adt(K_PROG, &[p0]);
+    let args_list = t.list(&[r_u8]);
+    let args_tup = t.n(PNode::Tuple(args_list));
+    let impl_header = t.extrait(T_WORLD, &[prog_p0]);
+    let impl_proj = t.exproj(T_FN_ONCE, OUTPUT, &[p0, args_tup], p1);
+    let call_clause = t.extrait(T_WORLD, &[p0]);
+
+    // Caller closure type `fn(&'b u8) -> &'0 u8` (its output carries caller slot `Origin(0)`).
+    let fn_ret_ref = t.fnptr(&[r_u8, r_u8]);
+    let prog_fn = t.adt(K_PROG, &[fn_ret_ref]);
+
+    let facts = Facts::default()
+        .adt(K_PROG, 1, &[Variance::Co, Variance::In])
+        .trait_(T_WORLD, 0)
+        .trait_(T_FN_ONCE, 0)
+        .alias(T_FN_ONCE, OUTPUT, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    let proj_col = RegionCol::lay(t.t.view(), impl_proj, &facts, L00, alloc()).unwrap();
+    let r_subj_col = RegionCol::lay(t.t.view(), p1, &facts, NONE, alloc()).unwrap();
+    let impl_views = [
+        ClauseView { nth: 0, binders: 1, col: ColView::of(&proj_col), outlives: None },
+        ClauseView { nth: 1, binders: 0, col: ColView::of(&r_subj_col), outlives: None },
+    ];
+    let impl_outlives = [Outlives::Type { clause: 1, region: Region::Static }];
+
+    struct WorldSel<'a> {
+        head: ImplHead<'a>,
+        views: &'a [ClauseView<'a>],
+        outlives: &'a [Outlives],
+    }
+    impl Selected for WorldSel<'_> {
+        fn select(&self, ask: Ask) -> Selection<'_> {
+            if ask.trait_ == T_WORLD && ask.name.is_none() {
+                Selection::Impl { head: self.head, value: None }
+            } else {
+                Selection::Not(NotSelected::Unanswered)
+            }
+        }
+        fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+            trait_ == T_FN_ONCE
+        }
+        fn impl_where(&self, imp: ItemKey) -> Result<ImplWhere<'_>, NotSelected> {
+            if imp == IMP_WORLD {
+                Ok(ImplWhere { params: &[], outlives: self.outlives, views: self.views })
+            } else {
+                Ok(ImplWhere::NONE)
+            }
+        }
+    }
+
+    let sel = WorldSel {
+        head: ImplHead { imp: IMP_WORLD, lifetimes: 1, types: 2, trait_ref: ty(impl_header, P0) },
+        views: &impl_views,
+        outlives: &impl_outlives,
+    };
+    let own = Own::default();
+
+    // `fn run_world<W: World>(w: W)` called with `W = Program<'0, fn(&u8) -> &'1 u8>`.
+    // Slot 0 = Program's lifetime, slot 1 = fn_ret_ref's return lifetime (`R`).
+    let p = params(0, &[]);
+    let inputs = [ty(p0, NONE)];
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(call_clause, NONE), binders: 0 }];
+    let sig = Sig { item: RUN_WORLD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &clauses };
+
+    // Positive: `fn(&'b u8) -> &'1 u8` has 2 slots (input binder + output); give caller slot `1`
+    // for the return reference so `R` binds to `&'1 u8`, and `R: 'static` constrains `1: 'static`.
+    let mut t2 = Tys::new();
+    let _ = &mut t2;
+    let fn_arg = arg(prog_fn, 0, 3); // slots: 0 (Program's 'p), 1 (fn arg), 2 (fn ret)
+    let types = [fn_arg];
+    let args = [fn_arg];
+    let (res, rec) = run(
+        &cols,
+        &sel,
+        &own,
+        3,
+        Callee::Fn(sig),
+        GenericArgs { lifetimes: SlotRange::EMPTY, types: &types },
+        &args,
+        arg(unit, 0, 0),
+    );
+    assert_eq!(res, Ok(()), "higher-ranked impl projection must propagate bound R to impl env: {res:?}");
+    // Soundness check (negative control): `R: 'static` must constrain the return slot `Origin(2)`
+    // to outlive `'static` (a local borrow in `R` is rejected).
+    assert!(
+        reach(&rec, 2).contains(&STATIC_NODE),
+        "propagated R = &'2 u8 must still satisfy impl's `R: 'static` bound; statics={:?} subsets={:?}",
+        rec.statics,
+        rec.subsets,
+    );
+}
+
+/// An impl header whose `SelfTy` (child 0) contains a projection over a type parameter `T` bound
+/// by a later trait argument (child 1) — e.g. `impl<'a, T> From<&'a mut T> for StoreContextMut<'a,
+/// <T as AsContext>::Data>` — must walk the non-alias argument first so `T` is bound before
+/// `<T as AsContext>::Data` normalizes, and still relate `'a` invariantly.
+#[test]
+fn impl_header_walks_non_alias_arg_before_alias_arg() {
+    const T_FROM: ItemKey = ItemKey(0x9010);
+    const T_ASCX: ItemKey = ItemKey(0x9011);
+    const K_STORE: ItemKey = ItemKey(0x9012);
+    const K_CALLER: ItemKey = ItemKey(0x9013);
+    const K_HOST: ItemKey = ItemKey(0x9014);
+    const IMP_FROM: ItemKey = ItemKey(0x9015);
+    const IMP_ASCX: ItemKey = ItemKey(0x9016);
+    const F_CONVERT: ItemKey = ItemKey(0x9017);
+    const DATA: Name = Name::of("Data");
+
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let p1 = t.param(1);
+    let host = t.adt(K_HOST, &[]);
+    let caller = t.adt(K_CALLER, &[]);
+    let mut_p0 = t.rm(p0);
+    let mut_caller = t.rm(caller);
+    let p0_data = t.alias(T_ASCX, DATA, &[p0]);
+    let store_data = t.adt(K_STORE, &[p0_data]);
+    let store_host = t.adt(K_STORE, &[host]);
+    // Header of `impl<'a, T> From<&'a mut T> for StoreContextMut<'a, <T as AsContext>::Data>`:
+    // child 0 = `StoreContextMut<'a, T::Data>` (has Alias!), child 1 = `&'a mut T` (binds `T`!).
+    let from_header = t.extrait(T_FROM, &[store_data, mut_p0]);
+    let ascx_header = t.extrait(T_ASCX, &[caller]);
+    let call_clause = t.extrait(T_FROM, &[p0, p1]);
+
+    let facts = Facts::default()
+        .adt(K_STORE, 1, &[Variance::In, Variance::In])
+        .adt(K_CALLER, 0, &[])
+        .adt(K_HOST, 0, &[])
+        .trait_(T_FROM, 0)
+        .trait_(T_ASCX, 0)
+        .alias(T_ASCX, DATA, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    // Require exact `Keyed::Same` match for `AsContext::Data` so an unbound `T` (`Keyed::Unknown`)
+    // would fail with `NotSelected::Unanswered` — reproducing `body_rows` in `one_call.rs`.
+    struct StrictSel<'a> {
+        from_head: ImplHead<'a>,
+        ascx_head: ImplHead<'a>,
+        ascx_val: ImplValue<'a>,
+        caller_ty: PTy,
+    }
+    impl Selected for StrictSel<'_> {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::Unanswered)
+        }
+        fn select_keyed(&self, ask: Ask, args: &dyn crate::inst::AskArgs) -> Selection<'_> {
+            if ask.trait_ == T_FROM && ask.name.is_none() {
+                Selection::Impl { head: self.from_head, value: None }
+            } else if ask.trait_ == T_ASCX && ask.name == Some(DATA) {
+                if args.compare(0, self.caller_ty) == crate::inst::Keyed::Same {
+                    Selection::Impl { head: self.ascx_head, value: Some(self.ascx_val) }
+                } else {
+                    Selection::Not(NotSelected::Unanswered)
+                }
+            } else {
+                Selection::Not(NotSelected::Unanswered)
+            }
+        }
+    }
+
+    let sel = StrictSel {
+        from_head: ImplHead { imp: IMP_FROM, lifetimes: 1, types: 1, trait_ref: ty(from_header, P00) },
+        ascx_head: ImplHead { imp: IMP_ASCX, lifetimes: 0, types: 0, trait_ref: ty(ascx_header, NONE) },
+        ascx_val: ImplValue { value: ty(host, NONE), gat_lifetimes: 0 },
+        caller_ty: caller,
+    };
+    let own = Own::default();
+
+    // `fn convert<U, V>(v: V) -> U where U: From<V>` called with
+    // `U = StoreContextMut<'1, Host>`, `V = &'0 mut Caller`.
+    let p = params(0, &[]);
+    let inputs = [ty(p1, NONE)];
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(call_clause, NONE), binders: 0 }];
+    let sig = Sig { item: F_CONVERT, params: ParamsView::of(&p), inputs: &inputs, output: ty(p0, NONE), clauses: &clauses };
+    let types = [arg(store_host, 1, 1), arg(mut_caller, 0, 1)];
+    let args = [arg(mut_caller, 0, 1)];
+    let dest = arg(store_host, 1, 1);
+    let _ = unit;
+    let (res, rec) = run(
+        &cols,
+        &sel,
+        &own,
+        2,
+        Callee::Fn(sig),
+        GenericArgs { lifetimes: SlotRange::EMPTY, types: &types },
+        &args,
+        dest,
+    );
+    assert_eq!(res, Ok(()), "deferred alias header kid must normalize after T is bound: {res:?}");
+    // Soundness check: `'0` (`&'0 mut Caller`) and `'1` (`StoreContextMut<'1, Host>`) must be tied
+    // invariantly (`0 <: 1` and `1 <: 0`).
+    assert!(reach(&rec, 0).contains(&1), "must constrain '0 <: '1: {:?}", rec.subsets);
+    assert!(reach(&rec, 1).contains(&0), "must constrain '1 <: '0: {:?}", rec.subsets);
+}
+
+/// Builtin `<dyn Tr + 't as Pointee>::Metadata` relating against `DynMetadata<dyn Tr + 'o>`
+/// must succeed without `NotSelected::Builtin`, enforce exact object-lifetime variance (`'0 <: '1`),
+/// and reject mismatched trait objects (`dyn OtherTr`).
+#[test]
+fn pointee_dyn_metadata_relates_dyn_object_lifetimes_soundly() {
+    const T_POINTEE: ItemKey = ItemKey(0x9020);
+    const T_REFLECT: ItemKey = ItemKey(0x9021);
+    const T_OTHER: ItemKey = ItemKey(0x9022);
+    const K_DYN_META: ItemKey = ItemKey(0x9023);
+    const F_FROM_RAW: ItemKey = ItemKey(0x9024);
+    const METADATA: Name = Name::of("Metadata");
+
+    let mut t = Tys::new();
+    let p0 = t.param(0);
+    let ex_reflect = t.extrait(T_REFLECT, &[]);
+    let ex_other = t.extrait(T_OTHER, &[]);
+    let dyn_reflect = t.dynamic(&[ex_reflect]);
+    let dyn_other = t.dynamic(&[ex_other]);
+    let dyn_meta_reflect = t.adt(K_DYN_META, &[dyn_reflect]);
+    let dyn_meta_other = t.adt(K_DYN_META, &[dyn_other]);
+    let p0_meta = t.alias(T_POINTEE, METADATA, &[p0]);
+    let ptr_p0 = t.n(PNode::Ptr(Mutbl::Not, p0));
+    let ptr_dyn_reflect = t.n(PNode::Ptr(Mutbl::Not, dyn_reflect));
+
+    let facts = Facts::default()
+        .adt(K_DYN_META, 0, &[Variance::Co])
+        .trait_(T_POINTEE, 0)
+        .trait_(T_REFLECT, 0)
+        .trait_(T_OTHER, 0)
+        .alias(T_POINTEE, METADATA, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    struct PointeeSel;
+    impl Selected for PointeeSel {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::Builtin)
+        }
+        fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
+            trait_ == T_POINTEE && name == METADATA
+        }
+    }
+
+    let own = Own::default();
+    // `fn from_raw_parts<T: ?Sized>(meta: <T as Pointee>::Metadata) -> *const T`
+    let p = params(0, &[]);
+    let inputs = [ty(p0_meta, NONE)];
+    let sig = Sig { item: F_FROM_RAW, params: ParamsView::of(&p), inputs: &inputs, output: ty(ptr_p0, NONE), clauses: &[] };
+
+    // Positive: `T = dyn Reflect + '2`, arg = `DynMetadata<dyn Reflect + '0>`, dest = `*const (dyn Reflect + '1)`.
+    let types = [arg(dyn_reflect, 2, 1)];
+    let args = [arg(dyn_meta_reflect, 0, 1)];
+    let dest = arg(ptr_dyn_reflect, 1, 1);
+    let (res, rec) = run(
+        &cols,
+        &PointeeSel,
+        &own,
+        3,
+        Callee::Fn(sig),
+        GenericArgs { lifetimes: SlotRange::EMPTY, types: &types },
+        &args,
+        dest,
+    );
+    assert_eq!(res, Ok(()), "Pointee::Metadata for dyn Trait must relate cleanly: {res:?}");
+    assert!(reach(&rec, 0).contains(&1), "must relate DynMetadata's '0 <: dest *const dyn '1: {:?}", rec.subsets);
+    assert!(!reach(&rec, 1).contains(&0), "DynMetadata is covariant, not invariant: {:?}", rec.subsets);
+
+    // Negative soundness control: mismatched `DynMetadata<dyn Other>` against `<dyn Reflect as Pointee>::Metadata` MUST fail with `Shape`.
+    let bad_args = [arg(dyn_meta_other, 0, 1)];
+    let (bad_res, _) = run(
+        &cols,
+        &PointeeSel,
+        &own,
+        3,
+        Callee::Fn(sig),
+        GenericArgs { lifetimes: SlotRange::EMPTY, types: &types },
+        &bad_args,
+        dest,
+    );
+    assert!(matches!(bad_res, Err(Refused::Shape { .. })), "mismatched dyn trait in DynMetadata must be refused with Shape, got: {bad_res:?}");
+}
+
+/// Builtin `Fn*` proof peels `&mut` / `&` wrappers around a caller closure (`&mut each` in
+/// `Iterator::try_for_each(&mut each)`), tying the closure's input/output regions while still
+/// enforcing any `F: 'static` bound on the outer `&mut` reference itself.
+#[test]
+fn builtin_fn_trait_peels_mut_ref_closure_and_enforces_regions() {
+    const T_FN_MUT: ItemKey = ItemKey(0x9030);
+    const T_FN_ONCE: ItemKey = ItemKey(0x9031);
+    const F_APPLY: ItemKey = ItemKey(0x9032);
+
+    let mut t = Tys::new();
+    let u8_ = t.u8();
+    let r_u8 = t.r(u8_);
+    let p0 = t.param(0); // F
+    let p1 = t.param(1); // R
+    let closure_ty = t.n(PNode::Closure { owner: OWNER, ordinal: 0, args: List::EMPTY });
+    let mut_closure = t.rm(closure_ty);
+    let closure_sig_ty = t.fnptr(&[r_u8, r_u8]);
+    let args_list = t.list(&[r_u8]);
+    let args_tup = t.n(PNode::Tuple(args_list));
+    let fn_mut_clause = t.extrait(T_FN_MUT, &[p0, args_tup]);
+    let fn_out_clause = t.exproj(T_FN_ONCE, OUTPUT, &[p0, args_tup], p1);
+
+    let facts = Facts::default().trait_(T_FN_MUT, 0).trait_(T_FN_ONCE, 0).alias(T_FN_ONCE, OUTPUT, 0);
+    struct BodyCols<'a> {
+        inner: Columns<'a>,
+        closure_ty: PTy,
+    }
+    impl RegionTypes for BodyCols<'_> {
+        fn count(&self, t: PTy) -> Result<SlotCount, Unknown> {
+            if t == self.closure_ty {
+                Ok(SlotCount::new(1))
+            } else if let Ok(PNode::Ref(_, inner)) = self.inner.node(t)
+                && inner == self.closure_ty
+            {
+                Ok(SlotCount::new(2))
+            } else {
+                self.inner.count(t)
+            }
+        }
+        fn node(&self, t: PTy) -> Result<PNode, Unknown> { self.inner.node(t) }
+        fn own(&self, t: PTy) -> Result<SlotCount, Unknown> {
+            if t == self.closure_ty { Ok(SlotCount::new(1)) } else { self.inner.own(t) }
+        }
+        fn kids(&self, t: PTy) -> Result<Kids<'_>, Unknown> {
+            if t == self.closure_ty { Ok(Kids::None) } else { self.inner.kids(t) }
+        }
+        fn variance(&self, t: PTy, at: Pos) -> Result<Variance, Unknown> {
+            if t == self.closure_ty { Ok(Variance::In) } else { self.inner.variance(t, at) }
+        }
+        fn adt_variances(&self, adt: ItemKey) -> Option<&[Variance]> {
+            self.inner.adt_variances(adt)
+        }
+    }
+    let cols = BodyCols { inner: Columns::new(t.t.view(), &facts, &facts), closure_ty };
+
+    struct FnSel;
+    impl Selected for FnSel {
+        fn select(&self, _: Ask) -> Selection<'_> { Selection::Not(NotSelected::Unanswered) }
+        fn is_fn_trait(&self, trait_: ItemKey) -> bool { trait_ == T_FN_MUT || trait_ == T_FN_ONCE }
+    }
+    struct ClosureOwn {
+        sig_ty: PTy,
+    }
+    impl Owner for ClosureOwn {
+        fn item(&self) -> ItemKey { OWNER }
+        fn universal(&self, _: Region) -> Option<Origin> { None }
+        fn param(&self, _: u32) -> Option<Origin> { None }
+        fn bound(&self, _: u32, _: ItemKey) -> Option<Typed<'_>> { None }
+        fn body_params(&self, _: PTy) -> Option<&[u32]> { Some(&[]) }
+        fn closure_sig(&self, ordinal: u32) -> Option<crate::ClosureSig<'_>> {
+            (ordinal == 0).then_some(crate::ClosureSig { sig_ty: self.sig_ty, ncap: 0, nsig: 1, col: P00 })
+        }
+    }
+
+    // `fn apply<'a, F: FnMut(&'a u8) -> R, R>(f: F, x: &'a u8) -> R`
+    // Called with `F = &'0 mut Closure('1)` (2 slots: '0 for &mut, '1 for closure sig),
+    // `x: &'2 u8`, `dest: &'3 u8`.
+    let p = params(1, &[0]);
+    let inputs = [ty(p0, NONE), ty(r_u8, P0)];
+    let clauses = [
+        ClauseIn::TraitOf { trait_ref: ty(fn_mut_clause, P0), binders: 0 },
+        ClauseIn::ProjOf { proj: ty(fn_out_clause, P0), binders: 0 },
+    ];
+    let sig = Sig { item: F_APPLY, params: ParamsView::of(&p), inputs: &inputs, output: ty(p1, NONE), clauses: &clauses };
+    let f_arg = arg(mut_closure, 0, 2);
+    let types = [f_arg, arg(r_u8, 3, 1)];
+    let args = [f_arg, arg(r_u8, 2, 1)];
+    let dest = arg(r_u8, 3, 1);
+
+    let origins = [Origin(0), Origin(1), Origin(2), Origin(3)];
+    let mut rec = Rec { subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new(), next: 100 };
+    let own = ClosureOwn { sig_ty: closure_sig_ty };
+    let res = {
+        let mut cx = Cx { types: &cols, sig_types: &cols, selected: &FnSel, owner: &own, origins: &origins, out: &mut rec };
+        call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types }, &args, dest, alloc())
+    };
+    assert_eq!(res, Ok(()), "`&mut closure` must satisfy builtin FnMut + FnOnce::Output: {res:?}");
+    assert!(reach(&rec, 2).contains(&3), "closure input '2 must flow to output '3: {:?}", rec.subsets);
+    assert!(!reach(&rec, 0).contains(&STATIC_NODE), "plain FnMut must not require &'0 mut to be 'static");
+
+    // Negative soundness control: adding `F: 'static` MUST constrain the outer `&'0 mut` reference
+    // to `'static` even though `builtin_fn_trait` peels `&mut`.
+    let static_clauses = [
+        ClauseIn::TraitOf { trait_ref: ty(fn_mut_clause, P0), binders: 0 },
+        ClauseIn::ProjOf { proj: ty(fn_out_clause, P0), binders: 0 },
+        ClauseIn::TypeOutlives { subject: ty(p0, NONE), region: Region::Static },
+    ];
+    let static_sig = Sig { item: F_APPLY, params: ParamsView::of(&p), inputs: &inputs, output: ty(p1, NONE), clauses: &static_clauses };
+    let mut rec2 = Rec { subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new(), next: 100 };
+    let res2 = {
+        let mut cx = Cx { types: &cols, sig_types: &cols, selected: &FnSel, owner: &own, origins: &origins, out: &mut rec2 };
+        call(&mut cx, Callee::Fn(static_sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types }, &args, dest, alloc())
+    };
+    assert_eq!(res2, Ok(()));
+    assert!(reach(&rec2, 0).contains(&STATIC_NODE), "`F: 'static` must still constrain outer `&'0 mut` ref to 'static");
+    assert!(reach(&rec2, 1).contains(&STATIC_NODE), "`F: 'static` must still constrain inner closure slot '1 to 'static");
+}

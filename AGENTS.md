@@ -92,6 +92,8 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent mistakes by newtype/proof types first, then lints with fixes; a prompt rule comes last.
 - **89. flag-jank-or-monumentous-in-all-caps**: IF FORCED INTO A JANK WORKAROUND OR A MONUMENTAL TASK, SHOUT IT IN ALL CAPS TO THE USER.
+- **91. narrow-collection-views**: Wrap `&mut Vec<T>` in narrow drain-only/push-only views at API boundaries; never leak raw storage.
+- **92. rename-surprising-methods**: If you mispredict a method's behavior before reading its body, rename it unambiguously immediately.
 
 ### Building, lanes and machines (skill `build-and-test`)
 - **2. blaze-builds-blaze**: Dogfood blaze (check/test/build) for inner loops, never cold cargo; fix any self-hosting gap.

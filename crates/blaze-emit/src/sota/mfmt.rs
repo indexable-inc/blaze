@@ -144,6 +144,7 @@ pub fn summarize_mfunc(func: &MFunc<'_>) -> MFuncSummary {
                 | MOp::Msub { .. }
                 | MOp::Umulh { .. }
                 | MOp::Smulh { .. }
+                | MOp::CarryAddSub { .. }
                 | MOp::Udiv { .. }
                 | MOp::Sdiv { .. }
                 | MOp::Umin { .. }
@@ -837,6 +838,15 @@ fn format_op<W: fmt::Write>(func: &MFunc<'_>, op: &MOp, out: &mut W) -> fmt::Res
         }
         MOp::Umulh { dst, rn, rm } => format_binary_gpr(func, "umulh", dst, rn, rm, true, out),
         MOp::Smulh { dst, rn, rm } => format_binary_gpr(func, "smulh", dst, rn, rm, true, out),
+        MOp::CarryAddSub { dst, rn, rm, is_sub, sets_flags } => {
+            let mnem = match (is_sub, sets_flags) {
+                (false, false) => "adc",
+                (false, true) => "adcs",
+                (true, false) => "sbc",
+                (true, true) => "sbcs",
+            };
+            format_binary_gpr(func, mnem, dst, rn, rm, true, out)
+        }
         MOp::Udiv { dst, rn, rm, wide } => format_binary_gpr(func, "udiv", dst, rn, rm, wide, out),
         MOp::Sdiv { dst, rn, rm, wide } => format_binary_gpr(func, "sdiv", dst, rn, rm, wide, out),
         MOp::Umin { dst, rn, rm, wide } => format_binary_gpr(func, "umin", dst, rn, rm, wide, out),

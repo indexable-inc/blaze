@@ -429,7 +429,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     pub(crate) fn expr_unary(&mut self, f: Frame, e: ExprId, op: UnOp, operand: ExprId) -> Result<Flow, Stop> {
         if f.state == 0 {
-            let expect = if op == UnOp::Deref { Expectation::None } else { f.expect };
+            let expect = match op {
+                UnOp::Deref => Expectation::None,
+                UnOp::Neg | UnOp::Not => match f.expect {
+                    Expectation::Castable(_) => Expectation::None,
+                    other => other,
+                },
+            };
             self.resume(f, 1)?;
             self.push_expr(operand, expect, Then::Nothing)?;
             return Ok(Flow::Wait);
@@ -513,10 +519,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Some(t) => match self.view(t) {
                     TyView::Ref(_, inner) | TyView::Ptr(_, inner) => {
                         let inner = self.ty.shallow_resolve(inner);
-                        match self.view(inner) {
-                            TyView::Str | TyView::Slice(_) => Expectation::RvalueLikeUnsized(inner),
-                            _ => Expectation::HasType(inner),
-                        }
+                        self.rvalue_hint(inner)?
                     }
                     _ => Expectation::None,
                 },

@@ -49,15 +49,14 @@
 //! (the pinned library/alloc/src/macros.rs), whose input `Box<MaybeUninit<[P; ?N]>>` under an
 //! expected `Vec<P>` still holds its own `?N`, and only through it does `P` reach the array's
 //! elements as their coercion target (rung s6-async-04; suite/expect_fudge.rs). Said plainly:
-//! this takes fewer hints than rustc does (an input holding a variable the probe made; an ADT
-//! whose LAST FIELD is unsized is also not looked through: `struct_tail` is not asked).
+//! this takes fewer hints than rustc does (an input holding a variable the probe made).
 
 use blaze_own::{Alloc, Vec};
 
 use crate::error::Stop;
 use crate::ids::ExprId;
 use crate::machine::{Expectation, Machine};
-use crate::ty::{Ty, TyList, TyView, TypeCtx};
+use crate::ty::{Ty, TyFlags, TyList, TyView, TypeCtx};
 use crate::world::World;
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
@@ -77,11 +76,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expectation::HasType(t) => t,
             // A coroutine body carries a sized destination output as a non-reporting rvalue
             // hint. Use that hint to infer generic inputs while leaving the output equality to
-            // the enclosing coercion's projection obligation. Ordinary unsized rvalue hints are
-            // for the argument only and do not determine a callee's output.
+            // the enclosing coercion's projection obligation. Ordinary unsized rvalue hints
+            // (including structs with unsized tails like `Path` / `OsStr` / `CStr`) are for
+            // the argument only and do not determine a callee's output.
             Expectation::RvalueLikeUnsized(t) => {
                 let t = self.ty.shallow_resolve(t);
-                if matches!(self.view(t), TyView::Str | TyView::Slice(_) | TyView::Dynamic(_)) {
+                if self.is_unsized_tail(t)? {
                     return Ok(());
                 }
                 t
@@ -92,10 +92,23 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if n == 0 || self.is_ty_var(expected) || self.is_err(expected) || self.is_err(output) {
             return Ok(());
         }
+        // Resolve the callee's output with the pending obligations first (rustc's
+        // `resolve_vars_with_obligations` before probing against the expected output): for a
+        // trait method like `strings.get(at)` on `Sharded<Box<str>>: Interner<?T>` with
+        // expected `&str`, the unique `impl<T: Send + Sync> Interner<T> for Sharded<T>` fixes
+        // `?T = Box<str>` before the probe runs, so `output` is `&Box<str>` (which does not
+        // unify with `&str`, and instead deref-coerces after the call) rather than binding
+        // `?T = str`.
+        let output = self.resolve_with_obligations(output)?;
+        if self.is_err(output) {
+            return Ok(());
+        }
+        let output_has_infer = self.ty.ty_flags(output).has(TyFlags::HAS_INFER);
         // Per input: `HasType(t)` binds the formal to `t`; `RvalueLikeUnsized(t)` is the
-        // argument's hint only (`rvalue_hint`: `str`, a slice, a trait object).
+        // argument's hint only (`rvalue_hint`: `str`, a slice, a trait object, or an unsized tail).
         let mut hints: Vec<Option<Expectation>, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
         let outer_ev = self.active_inferred_err_var();
+        let mut probe_has_error = false;
         let fits = self.probe(|m| -> Result<bool, Stop> {
             // The variables that outlive the probe: those that exist before it.
             let mark = m.ty.var_mark();
@@ -115,6 +128,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let says_nothing = m.ty.list_has_infer_since(one, mark) || matches!(m.ty.view(resolved), TyView::Error);
                 hints.push(if says_nothing { None } else { Some(m.rvalue_hint(resolved)?) });
             }
+            // When `output` still held an inference variable (so `resolve_with_obligations`
+            // already settled all pre-existing obligations above) and we are about to commit
+            // `HasType` bindings, verify that unifying `output` with `expected` does not
+            // violate any pending obligation (e.g. a multi-impl `Multi: Interner<str>` or
+            // `str: Sized` when `&Box<str>` should instead deref-coerce to `&str`).
+            // `RvalueLikeUnsized` hints (e.g. `Box::new(|x| ..)` expected as `Box<dyn Fn(..)>`)
+            // never bind the formal, so they are always kept.
+            if output_has_infer && hints.iter().any(|h| matches!(h, Some(Expectation::HasType(_)))) {
+                let errors_before = m.errors;
+                m.select()?;
+                probe_has_error = m.errors > errors_before;
+            }
             Ok(true)
         })?;
         if !fits {
@@ -122,7 +147,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         for (i, hint) in hints.iter().enumerate() {
             match *hint {
-                Some(Expectation::HasType(t)) => {
+                Some(Expectation::HasType(t)) if !probe_has_error => {
                     let formal = self.ty.list_get(inputs, i as u32);
                     // `t` is `formal` under the probe's bindings, so the two unify; `false`
                     // binds nothing (`TypeCtx::unify`), and the argument is then checked
@@ -137,7 +162,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         None => self.unsized_arg_hints.push((arg, t)),
                     }
                 }
-                Some(Expectation::None | Expectation::Castable(_)) | None => {}
+                Some(Expectation::HasType(_) | Expectation::None | Expectation::Castable(_)) | None => {}
             }
         }
         Ok(())

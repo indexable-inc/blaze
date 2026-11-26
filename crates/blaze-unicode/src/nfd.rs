@@ -188,11 +188,6 @@ impl Iterator for Nfd<'_> {
 
 /// Appends `s` in NFD to `out`. What `out` held before is left as it is, and a non-starter of `s`
 /// is never moved in front of it.
-///
-/// Deprecated: it grows a global-heap `String`. Use [`nfd_chars`] and append its characters to
-/// the caller's own text (`out.extend(nfd_chars(s))`). Its caller today: blaze-fetch's
-/// `tree::fold`.
-#[expect(blaze::implicit_allocator, reason = "deprecated; goes with its last caller, blaze-fetch's tree::fold")]
-pub fn nfd(s: &str, out: &mut alloc::string::String) {
+pub fn nfd<E: core::iter::Extend<char>>(s: &str, out: &mut E) {
     out.extend(nfd_chars(s));
 }

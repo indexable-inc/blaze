@@ -30,7 +30,8 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::{alloc::Global, collections::BTreeMap, net::SocketAddr, time::Duration};
+use core::net::SocketAddr;
+use std::{alloc::Global, collections::BTreeMap, time::Duration};
 
 use blaze_http::h3::{
     self, ClientConfig, ConnId, Early, Endpoint, Event, Length, Range, RequestEnd, RequestId,
@@ -349,7 +350,7 @@ impl<W: Wire> H3Bucket<W> {
             // Copied out, so the clock is advanced before the core is handed them (the driver
             // contract's first step).
             let mut came = Vec::new_in(Global);
-            self.wire.wait(until, &mut |from, bytes| {
+            Wire::wait(&mut self.wire, until, &mut |from, bytes| {
                 let mut copy = Vec::with_capacity_in(bytes.len(), Global);
                 copy.extend_from_slice(bytes);
                 came.push((from, copy));
@@ -461,10 +462,10 @@ impl<W: Wire, S: Ready> Bucket for Routed<W, S> {
         // on either side is answered by its deadline.
         for _ in 0..TURNS_MOST_PER_WAIT {
             if self.h3.in_flight() == 0 {
-                return self.h1.wait();
+                return Bucket::wait(&mut self.h1);
             }
             if self.h1.in_flight() == 0 {
-                return self.h3.wait();
+                return Bucket::wait(&mut self.h3);
             }
             let mut out = self.h1.ready();
             let cap = self.h3.wire.now() + MIXED_SLICE;
@@ -473,8 +474,8 @@ impl<W: Wire, S: Ready> Bucket for Routed<W, S> {
                 return out;
             }
         }
-        let mut out = self.h3.wait();
-        out.extend(self.h1.wait());
+        let mut out = Bucket::wait(&mut self.h3);
+        out.extend(Bucket::wait(&mut self.h1));
         out
     }
 

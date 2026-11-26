@@ -43,12 +43,14 @@ pub mod index;
 pub mod infect;
 pub mod machine;
 pub mod merge;
+pub mod nfs3;
 pub mod objects;
 pub mod pack_write;
 pub mod plant;
 pub mod refs;
 pub mod slab;
 pub mod storage;
+pub mod vfs;
 pub mod wire;
 
 #[cfg(test)]
@@ -62,7 +64,9 @@ pub use blaze_git_fetch::{Kind as ObjectKind, Oid};
 use blaze_own::AString;
 
 pub use crate::{
-    format::{PromptStyle, format_status},
+    format::{
+        PromptStyle, format_long_status, format_porcelain_v1, format_short_status, format_status,
+    },
     machine::{
         DirEntry, DirListing, FileData, Got, IncrementalPlan, RangeData, RangeRead, Snapshot,
         StatEntry, StatusMachine, Step, Want,
@@ -129,6 +133,9 @@ pub enum Detail {
     Counts,
     /// Stop hashing/walking a category as soon as its count reaches 1 (presence-only prompt).
     Presence,
+    /// Compute exact counts AND collect every changed, staged, conflicted, and untracked path
+    /// into [`PromptStatus::entries`] (for `bgit status`, `--short`, `--porcelain`).
+    Full,
 }
 
 /// Whether ahead/behind divergence against upstream is computed.
@@ -180,6 +187,16 @@ impl StatusOpts {
         detail: Detail::Presence,
         ahead_behind: AheadBehindMode::Enabled,
         tag: TagMode::Skipped,
+        short_oid_len: 7,
+        limits: Limits::SHIPPED,
+    };
+
+    /// Full per-path `git status` configuration (populates [`PromptStatus::entries`]).
+    pub const FULL: StatusOpts = StatusOpts {
+        untracked: UntrackedMode::Normal,
+        detail: Detail::Full,
+        ahead_behind: AheadBehindMode::Enabled,
+        tag: TagMode::DetachedOnly,
         short_oid_len: 7,
         limits: Limits::SHIPPED,
     };
@@ -461,6 +478,63 @@ pub struct ChangedSample<'a> {
     pub kind: ChangeKind,
 }
 
+/// One-side status code matching Git porcelain v1 (`X` = index vs HEAD, `Y` = worktree vs index).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileStatus {
+    Unmodified,
+    Added,
+    Modified,
+    Deleted,
+    TypeChanged,
+    Untracked,
+    Unmerged,
+}
+
+impl FileStatus {
+    /// Single-character Git porcelain v1 code (` `, `A`, `M`, `D`, `T`, `?`, `U`).
+    #[inline]
+    pub const fn code(self) -> char {
+        match self {
+            FileStatus::Unmodified => ' ',
+            FileStatus::Added => 'A',
+            FileStatus::Modified => 'M',
+            FileStatus::Deleted => 'D',
+            FileStatus::TypeChanged => 'T',
+            FileStatus::Untracked => '?',
+            FileStatus::Unmerged => 'U',
+        }
+    }
+}
+
+/// One per-path working-tree / index status record (Git porcelain v1 `XY path`).
+#[derive(PartialEq, Eq, Debug)]
+pub struct StatusEntry<'a> {
+    pub path: AString<'a>,
+    /// Index vs `HEAD` status (`X`), or `Untracked` (`?`) / unmerged conflict code.
+    pub index: FileStatus,
+    /// Working-tree vs index status (`Y`), or `Untracked` (`?`) / unmerged conflict code.
+    pub worktree: FileStatus,
+    /// True when this path has unmerged index conflict stages (1..=3).
+    pub unmerged: bool,
+}
+
+impl StatusEntry<'_> {
+    #[inline]
+    pub const fn is_untracked(&self) -> bool {
+        matches!(self.index, FileStatus::Untracked) && matches!(self.worktree, FileStatus::Untracked)
+    }
+
+    #[inline]
+    pub const fn is_staged(&self) -> bool {
+        !self.unmerged && !self.is_untracked() && !matches!(self.index, FileStatus::Unmodified)
+    }
+
+    #[inline]
+    pub const fn is_unstaged(&self) -> bool {
+        !self.unmerged && !self.is_untracked() && !matches!(self.worktree, FileStatus::Unmodified)
+    }
+}
+
 /// Complete Starship-class summary of a Git repository snapshot.
 #[derive(PartialEq, Eq, Debug)]
 pub struct PromptStatus<'a> {
@@ -473,6 +547,8 @@ pub struct PromptStatus<'a> {
     pub truncated: Truncated,
     /// Up to 24 representative uncommitted file paths (modified, untracked, deleted, conflicted).
     pub changed_samples: blaze_own::AVec<'a, ChangedSample<'a>>,
+    /// Complete sorted per-path status list (populated when [`StatusOpts::detail`] is [`Detail::Full`]).
+    pub entries: blaze_own::AVec<'a, StatusEntry<'a>>,
 }
 
 /// A typed refusal naming the git file, byte offset (when applicable), and rule violated.

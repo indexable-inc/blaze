@@ -812,10 +812,11 @@ fn prepare_crates<'r, 'm: 's, 's>(
     let (ask, names, graph) = (&standing.native, standing.names, standing.graph);
     let store: &mut dyn Store<'m> = &mut *standing.store;
     let err = standing.err;
+    let checkout_root = standing.place.served.root_text();
     // A crate whose script deferred C requests: run here, before the link (native_runner_c.rs;
     // macOS only, where the pinned clang and the SDK are; elsewhere the link refuses the record
     // by name, natives.rs `DeferredC`).
-    let mut c_tasks = sdk.map(|sdk| crate::native_runner_c::CTasks::new(ask.home, sdk, &ask.fs, standing.workers.get(), standing.heap));
+    let mut c_tasks = sdk.map(|sdk| crate::native_runner_c::CTasks::new(ask.home, checkout_root, sdk, &ask.fs, standing.workers.get(), standing.heap));
 
     // The crate list, in place from the unit graph's record.
     let payload = native_image::payload_in_place(cx, store, &graph).map_err(NativeError::Store)?;

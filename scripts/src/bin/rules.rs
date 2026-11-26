@@ -98,6 +98,8 @@ const CORE_RULES: &[&str] = &[
     "edit-rust-by-syntax",
     "type-then-lint-then-rule",
     "flag-jank-or-monumentous-in-all-caps",
+    "narrow-collection-views",
+    "rename-surprising-methods",
     // Building, lanes and machines
     "blaze-builds-blaze",
     "work-in-ix-vms",
@@ -1060,6 +1062,24 @@ const RULES: &[Rule<'static>] = &[
         reason: Some(r#"Andrew, 2026-11-26: "if any repo doesnt compile please give 🚨🚨🚨 all over response (even if it doesnt compile a little bit) change AGENTS.md"."#),
         link: None,
         also_in: &["debugging", "build-and-test"],
+    },
+    Rule {
+        id: "narrow-collection-views",
+        skill: "changing-code",
+        line: "Wrap `&mut Vec<T>` in narrow drain-only/push-only views at API boundaries; never leak raw storage.",
+        info: r#"Do not pass bare `&mut Vec<T>` across trait or API boundaries when the callee only needs one narrow role — consuming a batch (`Driver::submit`), appending outputs (`Driver::poll`, event/decision/diagnostic sinks), or iterating. Bare `&mut Vec<T>` grants over-broad authority (pushing into a consume-only queue, clearing/mutating an append-only output, or returning a mismatched count) and hard-wires `Vec` and its allocator into the signature. Wrap the caller's reusable buffer in a minimal-capability newtype view (drain-only / `IntoIterator` for consumers, push-only `Sink` tracking count for producers) so callers keep zero-alloc buffer reuse while backing storage can move freely to `blaze_own::Vec`, `Soa`, or archetypal per-variant storage without touching callers."#,
+        reason: Some(r#"Andrew, 2026-11-26, on `Driver::submit(&mut Vec<Effect>)` and `Driver::poll(&mut Vec<Completion>)`: "i feel Vec is not good here! could be a better tpye or new type that could wrap Vec as store but have simlper API like only drain??? ... maybe mentoin to do this pattern by defualt in AGENTS.md as well"."#),
+        link: None,
+        also_in: &["runtime-code"],
+    },
+    Rule {
+        id: "rename-surprising-methods",
+        skill: "changing-code",
+        line: "If you mispredict a method's behavior before reading its body, rename it unambiguously immediately.",
+        info: r#"Whenever you encounter a method, function, type, or flag and mispredict what it does — its side effects, ordering, durability, allocation/time complexity, or error behavior — before reading its implementation, treat the misprediction as a defect in the name itself. Immediately rename it to an unambiguous name that makes the real behavior obvious at the call site (e.g. `unordered_iter`, `drain_by_variant`, `insert_shift`, `remove_swap`, `write_unsynced`) and port all callers in one batch (`whole-ports`). Never leave a misleading name behind with a doc comment hoping the next reader checks the body."#,
+        reason: Some(r#"Andrew, 2026-11-26: "alos make sure in AGNETS.md be clear if you see a method and mispredicted the behavior before looking ath teh impleemtnation immediately rename it to an unambiguous name!!!!"."#),
+        link: None,
+        also_in: &["runtime-code"],
     },
 ];
 

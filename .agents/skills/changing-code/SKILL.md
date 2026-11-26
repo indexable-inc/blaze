@@ -341,4 +341,26 @@ proper fix is a monumental task whose scope the user may not yet realize, STOP A
 CAPS clearly explaining: (1) WHAT IS JANK OR MONUMENTAL, (2) WHY THE PROPER WAY IS HUGE OR BLOCKED,
 and (3) THE EXACT OPTIONS BEFORE PROCEEDING OR MERGING.
 
+## narrow-collection-views (rule 91)
+
+Do not pass bare `&mut Vec<T>` across trait or API boundaries when the callee only needs one narrow
+role — consuming a batch (`Driver::submit`), appending outputs (`Driver::poll`,
+event/decision/diagnostic sinks), or iterating. Bare `&mut Vec<T>` grants over-broad authority
+(pushing into a consume-only queue, clearing/mutating an append-only output, or returning a
+mismatched count) and hard-wires `Vec` and its allocator into the signature. Wrap the caller's
+reusable buffer in a minimal-capability newtype view (drain-only / `IntoIterator` for consumers,
+push-only `Sink` tracking count for producers) so callers keep zero-alloc buffer reuse while backing
+storage can move freely to `blaze_own::Vec`, `Soa`, or archetypal per-variant storage without
+touching callers.
+
+## rename-surprising-methods (rule 92)
+
+Whenever you encounter a method, function, type, or flag and mispredict what it does — its side
+effects, ordering, durability, allocation/time complexity, or error behavior — before reading its
+implementation, treat the misprediction as a defect in the name itself. Immediately rename it to an
+unambiguous name that makes the real behavior obvious at the call site (e.g. `unordered_iter`,
+`drain_by_variant`, `insert_shift`, `remove_swap`, `write_unsynced`) and port all callers in one
+batch (`whole-ports`). Never leave a misleading name behind with a doc comment hoping the next
+reader checks the body.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

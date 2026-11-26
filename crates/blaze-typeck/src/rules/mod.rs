@@ -104,6 +104,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
+    /// Whether `t`'s struct tail is an unsized built-in (`str`, `[T]`, `dyn ..`, or `extern type`).
+    pub(crate) fn is_unsized_tail(&mut self, t: Ty) -> Result<bool, Stop> {
+        let tail = self.struct_tail(t)?;
+        Ok(matches!(self.view(tail), TyView::Str | TyView::Slice(_) | TyView::Dynamic(_) | TyView::Foreign(_)))
+    }
+
     /// `Expectation::rvalue_hint`: an unsized expected type is only a hint. rustc
     /// (expectation.rs `rvalue_hint`) matches the type's STRUCT TAIL (`struct_tail_raw`):
     /// `ty::Slice | ty::Str | ty::Dynamic` give `ExpectRvalueLikeUnsized`. So a struct whose last
@@ -114,11 +120,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// at `RwLock::new(cursor)` and E0277 "`dyn ..: Sized`". As the hint, `T` is
     /// `RwLock<RawRwLock, BtreeDumpCursor>`, and the `Arc` coerces after (`CoerceUnsized`).
     pub(crate) fn rvalue_hint(&mut self, t: Ty) -> Result<Expectation, Stop> {
-        let tail = self.struct_tail(t)?;
-        Ok(match self.view(tail) {
-            TyView::Str | TyView::Slice(_) | TyView::Dynamic(_) => Expectation::RvalueLikeUnsized(t),
-            _ => Expectation::HasType(t),
-        })
+        Ok(if self.is_unsized_tail(t)? { Expectation::RvalueLikeUnsized(t) } else { Expectation::HasType(t) })
     }
 
     /// The type's struct tail (rustc's `struct_tail_raw`): a struct's last field at its
@@ -152,15 +154,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// How many structs [`Self::struct_tail`] goes through.
     const TAIL_DEPTH: u32 = 64;
 
-    /// `Expectation::adjust_for_branches`: an expected type that is still a variable is no
-    /// expectation for the branches.
+    /// `Expectation::adjust_for_branches`: an expected type that is still a variable, or a
+    /// castable target (`if c { 8 } else { x } as u64`), is no expectation for the branches.
     pub(crate) fn adjust_for_branches(&mut self, ex: Expectation) -> Expectation {
         match ex {
             Expectation::HasType(t) => {
                 let t = self.ty.shallow_resolve(t);
                 if self.is_ty_var(t) { Expectation::None } else { Expectation::HasType(t) }
             }
-            other => other,
+            Expectation::RvalueLikeUnsized(t) => Expectation::RvalueLikeUnsized(t),
+            Expectation::Castable(_) | Expectation::None => Expectation::None,
         }
     }
 

@@ -520,3 +520,576 @@ fn closure_fn_ptr_param_call_lowers_cleanly() {
         }
     }
 }
+
+/// Registers `Sized`, `FnOnce`, `FnMut`, and `Fn` lang traits (with `rust-call` methods) into `fx`.
+fn add_fn_traits(fx: &mut Fx) -> (ItemKey, ItemKey, ItemKey) {
+    let sized = fx.tr("Sized", 1, no_clauses(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let rust_call = FnPtrHeader { abi: blaze_typeck::Abi::RustCall, safety: blaze_typeck::Safety::Safe, c_variadic: false };
+
+    let fn_once = fx.tr("FnOnce", 2, no_clauses(), &["Output"]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    let out = fx.alias(fn_once, "Output", &[p0, p1]);
+    let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
+    fx.set_header(call_once, rust_call);
+
+    let sup = fx.bound(fn_once, &[p0, p1]);
+    let fn_mut = fx.tr("FnMut", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::FnMut, fn_mut);
+    let m_self = fx.r(Mutbl::Mut, p0);
+    let call_mut = fx.trait_fn(fn_mut, "call_mut", true, &[m_self, p1], out);
+    fx.set_header(call_mut, rust_call);
+
+    let sup = fx.bound(fn_mut, &[p0, p1]);
+    let fn_ = fx.tr("Fn", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::Fn, fn_);
+    let r_self = fx.r(Mutbl::Not, p0);
+    let call = fx.trait_fn(fn_, "call", true, &[r_self, p1], out);
+    fx.set_header(call, rust_call);
+    (fn_, fn_mut, fn_once)
+}
+
+/// `dyn Fn(inputs..) -> output` in `fx`.
+fn dyn_fn_ty(fx: &mut Fx, fn_tr: ItemKey, fn_once: ItemKey, inputs: &[PTy], output: PTy) -> PTy {
+    let tup = fx.tuple(inputs);
+    let args_l = fx.list(&[tup]);
+    let ex_fn = fx.ty(PNode::ExTrait(fn_tr, args_l));
+    let ex_out = fx.ty(PNode::ExProj { trait_: fn_once, name: Name::of("Output"), args: args_l, term: output });
+    let preds = fx.list(&[ex_fn, ex_out]);
+    fx.ty(PNode::Dynamic(preds))
+}
+
+/// `base.name` built in `b` using a local slot for `p`.
+fn field_access(b: &mut Bb, p: PatId, base: ExprId, name: &str) -> ExprId {
+    let at = b.local(p);
+    b.exprs[at.ix()] = blaze_typeck::Expr::Field { base, name: Name::of(name) };
+    at
+}
+
+/// `lhs = rhs` built in `b` using a local slot for `p`.
+fn assign_expr(b: &mut Bb, p: PatId, lhs: ExprId, rhs: ExprId) -> ExprId {
+    let at = b.local(p);
+    b.exprs[at.ix()] = blaze_typeck::Expr::Assign { lhs, rhs };
+    at
+}
+
+/// Extended fixture facts with custom ADT metadata (lifetimes, variances, field names, field
+/// counts, and `FieldRegion` rows) for testing struct-field and container `dyn Fn*` calls.
+struct DynFacts {
+    lane: Lane,
+    adts: std::vec::Vec<(ItemKey, AdtFacts, &'static [crate::Variance])>,
+    fields: std::vec::Vec<(ItemKey, u32, &'static str, u32, &'static [crate::FieldRegion])>,
+    field_counts: std::vec::Vec<(ItemKey, u32, u32)>,
+}
+
+impl DynFacts {
+    fn of(w: &World, fn_traits: (ItemKey, ItemKey, ItemKey)) -> DynFacts {
+        let mut lane = Lane::of(w);
+        lane.fn_traits = [Some(fn_traits.0), Some(fn_traits.1), Some(fn_traits.2)];
+        lane.wide.sigs.decls.trait_(fn_traits.0, 0);
+        lane.wide.sigs.decls.trait_(fn_traits.1, 0);
+        lane.wide.sigs.decls.trait_(fn_traits.2, 0);
+        lane.wide.sigs.decls.alias(fn_traits.2, "Output", 0);
+        DynFacts { lane, adts: std::vec::Vec::new(), fields: std::vec::Vec::new(), field_counts: std::vec::Vec::new() }
+    }
+}
+
+impl Declared for DynFacts {
+    fn decls(&self) -> &Decls {
+        self.lane.decls()
+    }
+}
+
+impl Facts for DynFacts {
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+        if let Some(&(_, _, v)) = self.adts.iter().find(|&&(a, ..)| a == k) {
+            return Some(v);
+        }
+        self.lane.adt_variances(k)
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> {
+        None
+    }
+    fn is_fn_trait(&self, k: ItemKey) -> bool {
+        self.lane.is_fn_trait(k)
+    }
+    fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, adt: ItemKey, variant: u32, field: u32) -> Option<&[crate::FieldRegion]> {
+        self.fields.iter().find(|&&(a, v, _, f, _)| a == adt && v == variant && f == field).map(|&(_, _, _, _, r)| r)
+    }
+    fn copy_args(&self, _: ItemKey) -> Option<&[bool]> {
+        None
+    }
+    fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+        if let Some(&(_, f, _)) = self.adts.iter().find(|&&(a, ..)| a == k) {
+            return Some(f);
+        }
+        self.lane.adt(k)
+    }
+    fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
+        self.lane.callee(k)
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        true
+    }
+    fn closure_requirements(&self, closure: ExprId) -> &[Requirement] {
+        self.lane.closure_requirements(closure)
+    }
+    fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
+        self.fields.iter().find(|&&(a, v, n, _, _)| a == adt && v == variant && Name::of(n) == name).map(|&(_, _, _, f, _)| f)
+    }
+    fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
+        self.field_counts.iter().find(|&&(a, v, _)| a == adt && v == variant).map(|&(_, _, c)| c)
+    }
+    fn param_copy(&self, index: u32) -> bool {
+        self.lane.param_copy(index)
+    }
+}
+
+/// Struct field `&'a dyn Fn*` on a lifetime-bearing struct (`Mapped<'s>::map`,
+/// `Standing<'r>::sdk_resolver`, `CommandFront<'h, 'c>::names`, `Declared<'f, 't>::make` shapes):
+/// - Positive 1 (object lifetime `'a` in `slots[0]`, HRTB input `for<'x> Fn(&'x S)`):
+///   `fn use_hrtb<'a>(h: Holder<'a>, s: S) { (h.hrtb)(&s); m(&mut s); }` -> clean.
+/// - Positive 2 (free lifetime `'a` in `slots[1..]` output `&'a dyn Fn() -> &'a S`):
+///   `fn use_make<'a>(h: Holder<'a>) -> &'a S { (h.make)() }` -> clean.
+/// - Negative 1 (soundness: seeded input lifetime `'a` rejects local borrow):
+///   `fn bad_sink<'a>(h: Holder<'a>, s: S) { (h.sink)(&s); }` -> borrow error.
+/// - Negative 2 (soundness: seeded output lifetime `'a` cannot be returned as unrelated `'b`):
+///   `fn bad_make<'a, 'b>(h: Holder<'a>) -> &'b S { (h.make)() }` -> `UnprovenOutlives`.
+#[test]
+fn dyn_fn_field_with_struct_lifetime_and_seeded_param() {
+    use crate::region_fixture::P1;
+    use crate::{FieldRegion, Variance};
+
+    let mut decls_out = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let fns = add_fn_traits(fx);
+        let d_in = dyn_fn_ty(fx, fns.0, fns.2, &[rs], unit);
+        let r_in = fx.r(Mutbl::Not, d_in);
+        let d_out = dyn_fn_ty(fx, fns.0, fns.2, &[], rs);
+        let r_out = fx.r(Mutbl::Not, d_out);
+        let holder = fx.strukt("Holder", 0, &[("hrtb", r_in), ("sink", r_in), ("make", r_out)]);
+        let ht = fx.adt(holder, &[]);
+        let use_hrtb = fx.func("use_hrtb", 0, &[ht, st], unit, no_clauses());
+        let use_make = fx.func("use_make", 0, &[ht], rs, no_clauses());
+        let bad_sink = fx.func("bad_sink", 0, &[ht, st], unit, no_clauses());
+        let bad_make = fx.func("bad_make", 0, &[ht], rs, no_clauses());
+        decls_out = Some((fns, holder, ht, r_in, r_out, use_hrtb, use_make, bad_sink, bad_make));
+    });
+    let (fns, holder, ht, r_in, r_out, use_hrtb, use_make, bad_sink, bad_make) = decls_out.expect("declared");
+
+    const HRTB_FR: [FieldRegion; 4] = [FieldRegion::Lifetime(0), FieldRegion::Lifetime(0), FieldRegion::Bound(0), FieldRegion::Bound(0)];
+    const SINK_FR: [FieldRegion; 4] = [FieldRegion::Lifetime(0), FieldRegion::Lifetime(0), FieldRegion::Lifetime(0), FieldRegion::Lifetime(0)];
+    const MAKE_FR: [FieldRegion; 3] = [FieldRegion::Lifetime(0), FieldRegion::Lifetime(0), FieldRegion::Lifetime(0)];
+    const INV: [Variance; 1] = [Variance::In];
+
+    let mut facts = DynFacts::of(&w, fns);
+    facts.adts.push((
+        holder,
+        AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 1, union: false, is_enum: false, is_box: false },
+        &INV,
+    ));
+    facts.fields.push((holder, 0, "hrtb", 0, &HRTB_FR));
+    facts.fields.push((holder, 0, "sink", 1, &SINK_FR));
+    facts.fields.push((holder, 0, "make", 2, &MAKE_FR));
+    facts.lane.wide.sigs.decls.adt(holder, 1);
+    facts.lane.wide.sigs.decls.field(holder, 0, 0, r_in, &[P0, P0, BOUND1, BOUND1]);
+    facts.lane.wide.sigs.decls.field(holder, 0, 1, r_in, &[P0, P0, P0, P0]);
+    facts.lane.wide.sigs.decls.field(holder, 0, 2, r_out, &[P0, P0, P0]);
+
+    facts.lane.wide.add(use_hrtb, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ht, w.st], output: w.unit, slots: &[P0] });
+    facts.lane.wide.add(use_make, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ht], output: w.rs, slots: &[P0, P0] });
+    facts.lane.wide.add(bad_sink, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ht, w.st], output: w.unit, slots: &[P0] });
+    facts.lane.wide.add(bad_make, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[ht], output: w.rs, slots: &[P0, P1] });
+
+    // Positive 1: `(h.hrtb)(&s); m(&mut s);`
+    {
+        let mut b = Bb::new();
+        let (ph, ps) = (b.param("h"), b.param("s"));
+        let lh = b.local(ph);
+        let fh = field_access(&mut b, ph, lh, "hrtb");
+        let ls = b.local(ps);
+        let rs_e = b.borrow(Mutbl::Not, ls);
+        let call = b.call(fh, &[rs_e]);
+        let st1 = b.semi(call);
+        let mut_s = call_ref(&mut b, "m", Mutbl::Mut, ps);
+        let st2 = b.semi(mut_s);
+        let root = b.block(&[st1, st2], None);
+        let got = findings_laid(&w.fx, &b, use_hrtb, root, &facts, Plant::None);
+        assert_eq!(got, Ok(std::vec::Vec::new()), "HRTB dyn Fn field on lifetime struct must pass: {got:?}");
+    }
+
+    // Positive 2: `(h.make)()` returned as `&'a S`
+    {
+        let mut b = Bb::new();
+        let ph = b.param("h");
+        let lh = b.local(ph);
+        let fm = field_access(&mut b, ph, lh, "make");
+        let call = b.call(fm, &[]);
+        let root = b.block(&[], Some(call));
+        let got = findings_laid(&w.fx, &b, use_make, root, &facts, Plant::None);
+        assert_eq!(got, Ok(std::vec::Vec::new()), "seeded output lifetime on dyn Fn field must pass: {got:?}");
+    }
+
+    // Negative 1: `(h.sink)(&s)` passes local `&s` into `&'a S`
+    {
+        let mut b = Bb::new();
+        let (ph, ps) = (b.param("h"), b.param("s"));
+        let lh = b.local(ph);
+        let fs = field_access(&mut b, ph, lh, "sink");
+        let ls = b.local(ps);
+        let rs_e = b.borrow(Mutbl::Not, ls);
+        let call = b.call(fs, &[rs_e]);
+        let st1 = b.semi(call);
+        let root = b.block(&[st1], None);
+        let got = findings_laid(&w.fx, &b, bad_sink, root, &facts, Plant::None).expect("lowered");
+        assert!(got.iter().any(|l| l.starts_with("borrow ")), "NEGATIVE: local borrow into &'a S field sink must error: {got:?}");
+    }
+
+    // Negative 2: `(h.make)()` returns `&'a S` where `&'b S` is expected
+    {
+        let mut b = Bb::new();
+        let ph = b.param("h");
+        let lh = b.local(ph);
+        let fm = field_access(&mut b, ph, lh, "make");
+        let call = b.call(fm, &[]);
+        let root = b.block(&[], Some(call));
+        let got = findings_laid(&w.fx, &b, bad_make, root, &facts, Plant::None).expect("lowered");
+        assert!(got.iter().any(|l| l.contains("UnprovenOutlives")), "NEGATIVE: &'a S returned as &'b S must fail outlives: {got:?}");
+    }
+}
+
+/// Container lookup bound via `let Some(program) = self.programs.take() else { return; }; program(..)`
+/// (`crates/blaze-core/src/sim.rs::run` shape):
+/// - Positive: HRTB `dyn Fn(&mut S)` extracted via `let ... else` checks clean (`program(&mut s); m(&mut s);`).
+/// - Negative 1: conflicting shared borrow `let r = &s; program(&mut s); g(r);` catches `borrow Invalidated`.
+/// - Negative 2: container holding `dyn Fn(&'static S)` rejects local `&s` (`borrow ` error).
+/// - Negative 3: reassigned local `program = other; program(&mut s);` is refused (`CalleeValueUnknown`),
+///   never unsoundly inheriting the initializer's signature.
+#[test]
+fn container_let_else_dyn_fn_call_checks_borrows() {
+    use blaze_typeck::regions::Region;
+    use crate::{FieldRegion, Variance};
+
+    let mut decls_out = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let fns = add_fn_traits(fx);
+        let rms = fx.r(Mutbl::Mut, st);
+        let p0 = fx.param(0);
+        let (option, _) = fx.enum_("Option", 1, &[("None", &[]), ("Some", &[p0])]);
+        let map = fx.strukt("Map", 1, &[]);
+        let map_v = fx.adt(map, &[p0]);
+        let rm_map_v = fx.r(Mutbl::Mut, map_v);
+        let opt_v = fx.adt(option, &[p0]);
+        let imp_map = fx.imp("impl<V> Map<V> {}", 1, map_v, None, &[], no_clauses());
+        let take = fx.impl_fn(imp_map, "take", true, &[rm_map_v], opt_v);
+
+        let d_hrtb = dyn_fn_ty(fx, fns.0, fns.2, &[rms], unit);
+        let r_hrtb = fx.r(Mutbl::Not, d_hrtb);
+        let map_hrtb = fx.adt(map, &[r_hrtb]);
+
+        let d_stat = dyn_fn_ty(fx, fns.0, fns.2, &[rs], unit);
+        let r_stat = fx.r(Mutbl::Not, d_stat);
+        let map_stat = fx.adt(map, &[r_stat]);
+
+        let sim = fx.strukt("Sim", 0, &[("programs", map_hrtb), ("static_programs", map_stat)]);
+        let sim_t = fx.adt(sim, &[]);
+        let rm_sim = fx.r(Mutbl::Mut, sim_t);
+
+        let run_hrtb = fx.func("run_hrtb", 0, &[rm_sim, st], unit, no_clauses());
+        let run_stat = fx.func("run_stat", 0, &[rm_sim, st], unit, no_clauses());
+        let run_reassigned = fx.func("run_reassigned", 0, &[rm_sim, r_hrtb, st], unit, no_clauses());
+        decls_out = Some((fns, option, map, sim, rm_map_v, opt_v, take, map_hrtb, map_stat, rm_sim, r_hrtb, run_hrtb, run_stat, run_reassigned));
+    });
+    let (fns, option, map, sim, rm_map_v, opt_v, take, map_hrtb, map_stat, rm_sim, r_hrtb, run_hrtb, run_stat, run_reassigned) =
+        decls_out.expect("declared");
+
+    const HRTB_FR: [FieldRegion; 4] = [FieldRegion::Static, FieldRegion::Static, FieldRegion::Bound(0), FieldRegion::Bound(0)];
+    const STAT_FR: [FieldRegion; 4] = [FieldRegion::Static, FieldRegion::Static, FieldRegion::Static, FieldRegion::Static];
+    const ARG0_FR: [FieldRegion; 1] = [FieldRegion::Arg(0)];
+    const CO1: [Variance; 1] = [Variance::Co];
+
+    let mut facts = DynFacts::of(&w, fns);
+    facts.adts.push((
+        option,
+        AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: true, is_box: false },
+        &CO1,
+    ));
+    facts.adts.push((
+        map,
+        AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false },
+        &CO1,
+    ));
+    facts.adts.push((
+        sim,
+        AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false },
+        &[],
+    ));
+    facts.field_counts.push((option, 0, 0));
+    facts.field_counts.push((option, 1, 1));
+    facts.fields.push((option, 1, "0", 0, &ARG0_FR));
+    facts.fields.push((sim, 0, "programs", 0, &HRTB_FR));
+    facts.fields.push((sim, 0, "static_programs", 1, &STAT_FR));
+    facts.lane.wide.sigs.decls.field(sim, 0, 0, map_hrtb, &[Region::Static, Region::Static, BOUND1, BOUND1]);
+    facts.lane.wide.sigs.decls.field(sim, 0, 1, map_stat, &[Region::Static, Region::Static, Region::Static, Region::Static]);
+    facts.lane.wide.add(take, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rm_map_v], output: opt_v, slots: &[P0] });
+    facts.lane.wide.add(run_hrtb, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rm_sim, w.st], output: w.unit, slots: &[P0] });
+    facts.lane.wide.add(run_stat, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rm_sim, w.st], output: w.unit, slots: &[P0] });
+    facts.lane.wide.add(
+        run_reassigned,
+        FnHead {
+            lifetimes: 1,
+            late: &[0],
+            outlives: &[],
+            inputs: &[rm_sim, r_hrtb, w.st],
+            output: w.unit,
+            slots: &[P0, Region::Static, Region::Static, BOUND1, BOUND1],
+        },
+    );
+
+    // Positive + Negative 1 (conflicting borrow across `program(&mut s)`) via `let Some(program) = sim.programs.take() else { return; };`
+    for conflict in [false, true] {
+        let mut b = Bb::new();
+        let (psim, ps) = (b.param("sim"), b.param("s"));
+        let lsim = b.local(psim);
+        let fprogs = field_access(&mut b, psim, lsim, "programs");
+        let call_take = b.method(fprogs, "take", &[]);
+        let pprog = b.bind("program");
+        let some_prog = b.variant_pat(&["Option", "Some"], &[pprog]);
+        let ret_e = b.ret(None);
+        let st_let = b.let_(some_prog, None, call_take);
+        let lprog = b.local(pprog);
+        let ls = b.local(ps);
+        let mut_s = b.borrow(Mutbl::Mut, ls);
+        let call_prog = b.call(lprog, &[mut_s]);
+        let st_call = b.semi(call_prog);
+        let root = if conflict {
+            let ls2 = b.local(ps);
+            let r_s = b.borrow(Mutbl::Not, ls2);
+            let pr = b.bind("r");
+            let st_r = b.let_(pr, None, r_s);
+            let use_r = call1(&mut b, "g", pr);
+            let st_use = b.semi(use_r);
+            b.block(&[st_let, st_r, st_call, st_use], None)
+        } else {
+            let mut_after = call_ref(&mut b, "m", Mutbl::Mut, ps);
+            let st_after = b.semi(mut_after);
+            b.block(&[st_let, st_call, st_after], None)
+        };
+        let mut view = b.view(run_hrtb, root);
+        let mut stmts_owned = view.stmts.to_vec();
+        if let blaze_typeck::Stmt::Let { else_, .. } = &mut stmts_owned[st_let.ix()] {
+            *else_ = Some(ret_e);
+        }
+        view.stmts = &stmts_owned;
+        let got = crate::region_fixture::run(&w.fx, &view, &facts, facts.decls(), Plant::None).map(|r| r.lines);
+        if conflict {
+            let lines = got.expect("lowered");
+            assert!(lines.iter().any(|l| l.starts_with("borrow Invalidated")), "NEGATIVE: shared borrow across `program(&mut s)` must error: {lines:?}");
+        } else {
+            assert_eq!(got, Ok(std::vec::Vec::new()), "POSITIVE: `let Some(program) = sim.programs.take() else {{ return; }}; program(&mut s);` must pass: {got:?}");
+        }
+    }
+
+    // Negative 2: container holds `&'static dyn Fn(&'static S)` -> passing `&s` must report a borrow error.
+    {
+        let mut b = Bb::new();
+        let (psim, ps) = (b.param("sim"), b.param("s"));
+        let lsim = b.local(psim);
+        let fprogs = field_access(&mut b, psim, lsim, "static_programs");
+        let call_take = b.method(fprogs, "take", &[]);
+        let pprog = b.bind("program");
+        let some_prog = b.variant_pat(&["Option", "Some"], &[pprog]);
+        let ret_e = b.ret(None);
+        let st_let = b.let_(some_prog, None, call_take);
+        let lprog = b.local(pprog);
+        let ls = b.local(ps);
+        let ref_s = b.borrow(Mutbl::Not, ls);
+        let call_prog = b.call(lprog, &[ref_s]);
+        let st_call = b.semi(call_prog);
+        let root = b.block(&[st_let, st_call], None);
+        let mut view = b.view(run_stat, root);
+        let mut stmts_owned = view.stmts.to_vec();
+        if let blaze_typeck::Stmt::Let { else_, .. } = &mut stmts_owned[st_let.ix()] {
+            *else_ = Some(ret_e);
+        }
+        view.stmts = &stmts_owned;
+        let got = crate::region_fixture::run(&w.fx, &view, &facts, facts.decls(), Plant::None).map(|r| r.lines).expect("lowered");
+        assert!(got.iter().any(|l| l.starts_with("borrow ")), "NEGATIVE: local `&s` into `&'static S` container dyn Fn must error: {got:?}");
+    }
+
+    // Negative 3: reassigned local is refused (`CalleeValueUnknown`), never unsoundly assuming initializer's signature.
+    {
+        let mut b = Bb::new();
+        let (psim, pother, ps) = (b.param("sim"), b.param("other"), b.param("s"));
+        let lsim = b.local(psim);
+        let fprogs = field_access(&mut b, psim, lsim, "programs");
+        let call_take = b.method(fprogs, "take", &[]);
+        let pprog = b.bind_mut("program");
+        let some_prog = b.variant_pat(&["Option", "Some"], &[pprog]);
+        let ret_e = b.ret(None);
+        let st_let = b.let_(some_prog, None, call_take);
+        let lhs = b.local(pprog);
+        let rhs = b.local(pother);
+        let asgn = assign_expr(&mut b, pprog, lhs, rhs);
+        let st_asgn = b.semi(asgn);
+        let lprog = b.local(pprog);
+        let ls = b.local(ps);
+        let mut_s = b.borrow(Mutbl::Mut, ls);
+        let call_prog = b.call(lprog, &[mut_s]);
+        let st_call = b.semi(call_prog);
+        let root = b.block(&[st_let, st_asgn, st_call], None);
+        let mut view = b.view(run_reassigned, root);
+        let mut stmts_owned = view.stmts.to_vec();
+        if let blaze_typeck::Stmt::Let { else_, .. } = &mut stmts_owned[st_let.ix()] {
+            *else_ = Some(ret_e);
+        }
+        view.stmts = &stmts_owned;
+        let got = crate::region_fixture::run(&w.fx, &view, &facts, facts.decls(), Plant::None);
+        assert!(
+            matches!(got, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+            "NEGATIVE: reassigned local callable must refuse rather than trusting initializer: {got:?}"
+        );
+    }
+}
+
+/// Generic `F: Fn*(..)` referencing an enclosing fn's lifetime parameter `'a`, called inside a
+/// nested closure (`MadeOnce<'n, F>::procs` in `job_texts.rs:290` shape):
+/// - Positive: `fn ok<'a, F: Fn() -> &'a S>(f: F) { let _c = || { let r = f(); g(r); }; }` lowers
+///   cleanly (previously refused with `CalleeValueUnknown` because `self.in_nested` rejected
+///   `Region::Param(0)`) with zero findings.
+/// - Negative (soundness): `fn bad<'a, F: Fn(&'a S)>(f: F) { let _c = || { let s = mk(); f(&s); }; }`
+///   lowers cleanly AND catches the local borrow `&s` escaping into `'a` (`!report.borrows.is_empty()`).
+#[test]
+fn generic_fn_param_called_inside_closure_checks_owner_lifetime() {
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let fns = add_fn_traits(fx);
+        let p0 = fx.param(0);
+        let unit_tup = fx.tuple(&[]);
+        let rs_tup = fx.tuple(&[rs]);
+        let c_ok_fn = fx.bound(fns.0, &[p0, unit_tup]);
+        let c_ok_out = fx.proj(fns.2, &[p0, unit_tup], "Output", rs);
+        let f_ok = fx.func("ok", 1, &[p0], unit, std::vec![c_ok_fn, c_ok_out]);
+        let c_bad_fn = fx.bound(fns.0, &[p0, rs_tup]);
+        let c_bad_out = fx.proj(fns.2, &[p0, rs_tup], "Output", unit);
+        let f_bad = fx.func("bad", 1, &[p0], unit, std::vec![c_bad_fn, c_bad_out]);
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+
+        let ok_args = fx.list(&[p0, unit_tup]);
+        let ex_ok_fn = fx.ty(PNode::ExTrait(fns.0, ok_args));
+        let ex_ok_out = fx.ty(PNode::ExProj { trait_: fns.2, name: Name::of("Output"), args: ok_args, term: rs });
+        let bad_args = fx.list(&[p0, rs_tup]);
+        let ex_bad_fn = fx.ty(PNode::ExTrait(fns.0, bad_args));
+        let ex_bad_out = fx.ty(PNode::ExProj { trait_: fns.2, name: Name::of("Output"), args: bad_args, term: unit });
+        items = Some((fns, p0, mk, f_ok, f_bad, ex_ok_fn, ex_ok_out, ex_bad_fn, ex_bad_out));
+    });
+    let (fns, p0, mk, f_ok, f_bad, ex_ok_fn, ex_ok_out, ex_bad_fn, ex_bad_out) = items.expect("declared");
+
+    let mut facts = DynFacts::of(&w, fns);
+    facts.lane.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.lane.wide.add(f_ok, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[p0], output: w.unit, slots: &[] });
+    facts.lane.wide.sigs.decls.clause(f_ok, 0, 0, ex_ok_fn, &[]);
+    facts.lane.wide.sigs.decls.clause(f_ok, 1, 0, ex_ok_out, &[P0]);
+    facts.lane.wide.add(f_bad, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[p0], output: w.unit, slots: &[] });
+    facts.lane.wide.sigs.decls.clause(f_bad, 0, 0, ex_bad_fn, &[P0]);
+    facts.lane.wide.sigs.decls.clause(f_bad, 1, 0, ex_bad_out, &[P0]);
+
+    // Positive: `|| { let r = f(); g(r); }`
+    {
+        let mut b = Bb::new();
+        let pf = b.param("f");
+        let lf = b.local(pf);
+        let call_f = b.call(lf, &[]);
+        let pr = b.bind("r");
+        let st1 = b.let_(pr, None, call_f);
+        let use_r = call1(&mut b, "g", pr);
+        let st2 = b.semi(use_r);
+        let inner = b.block(&[st1, st2], None);
+        let cl = b.closure(&[], inner);
+        let pc = b.bind("c");
+        let st_let = b.let_(pc, None, cl);
+        let root = b.block(&[st_let], None);
+        let body = b.view(f_ok, root);
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc()).expect("lower closure");
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        assert!(
+            report.moves.is_empty() && report.borrows.is_empty(),
+            "POSITIVE: `|| {{ let r = f(); g(r); }}` must check clean: moves={} borrows={}",
+            report.moves.len(),
+            report.borrows.len()
+        );
+    }
+
+    // Negative: `|| { let s = mk(); f(&s); }` passes local `&s` into owner lifetime `'a`
+    {
+        let mut b = Bb::new();
+        let pf = b.param("f");
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let ps = b.bind("s");
+        let st1 = b.let_(ps, None, call_mk);
+        let lf = b.local(pf);
+        let ls = b.local(ps);
+        let rs_e = b.borrow(Mutbl::Not, ls);
+        let call_f = b.call(lf, &[rs_e]);
+        let st2 = b.semi(call_f);
+        let inner = b.block(&[st1, st2], None);
+        let cl = b.closure(&[], inner);
+        let pc = b.bind("c");
+        let st_let = b.let_(pc, None, cl);
+        let root = b.block(&[st_let], None);
+        let body = b.view(f_bad, root);
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc()).expect("lower closure");
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        assert!(!report.borrows.is_empty(), "NEGATIVE: local `&s` passed to `F: Fn(&'a S)` inside closure must fail borrow check");
+    }
+}
