@@ -56,8 +56,14 @@ mod native;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
-/// Source bytes of the hermetic runner and process-launch modules in `blaze-std` (AGENTS.md rule 69).
+/// Source bytes of the hermetic runner, process-launch, and async file-read modules in
+/// `blaze-std` (AGENTS.md rule 69).
 pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
+    include_bytes!("../cx.rs"),
+    include_bytes!("../fs.rs"),
+    include_bytes!("../io.rs"),
+    include_bytes!("../io/fast.rs"),
+    include_bytes!("../pending.rs"),
     include_bytes!("../procs.rs"),
     include_bytes!("linked/run.rs"),
     include_bytes!("hermetic.rs"),
@@ -178,9 +184,8 @@ impl RootFdReader {
     fn sub_cx(&self, cx: &Cx) -> Result<Cx, Fault> {
         let left = remaining_for_cx(cx)
             .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
-        self.io
-            .cx(left, crate::mem::TASK_FRAME)
-            .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })
+        let deadline = Deadline::after(self.io.now(), left);
+        Ok(cx.on_beside(blaze_own::Share::share(&self.io), deadline))
     }
 
     /// Reads from already-opened `fd` at `offset` through `blaze-core`'s async driver until `out`

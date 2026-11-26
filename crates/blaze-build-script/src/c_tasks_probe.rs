@@ -558,24 +558,72 @@ fn flag_takes_value(arg: &str) -> bool {
     )
 }
 
-/// Whether `arg` (and optional `next`) requests host CPU auto-detection or profile feedback input
-/// not determined at `Level::Inputs` (`-march=native`, `-mcpu=native`, `-mtune=native`,
-/// `--target=native`, `-Xarch_host`, `-fprofile-use*`, `-fprofile-instr-use*`,
-/// `-fprofile-sample-use*`, `-fprofile-remapping-file*`, `-fauto-profile*`). Deterministic
-/// instrumentation-generation flags such as `-fprofile-instr-generate` and `-fprofile-arcs` are
-/// allowed in flag-support probes.
+/// Whether `arg` (and optional `next`) requests host CPU auto-detection, profile feedback input,
+/// or nondeterministic compiler timing/stat reports not determined at `Level::Inputs`
+/// (`-march=native`, `-mcpu=native`, `-mtune=native`, `--target=native`, `-Xarch_host`,
+/// `-fprofile-use*`, `-fprofile-instr-use*`, `-fprofile-sample-use*`,
+/// `-fprofile-remapping-file*`, `-fauto-profile*`, `-ftime-report*`, `-ftime-trace*`,
+/// `-fproc-stat-report*`, `-print-stats`, `--print-stats`, `-time-passes`, `-stats`).
+/// Deterministic instrumentation-generation flags such as `-fprofile-instr-generate` and
+/// `-fprofile-arcs` are allowed in flag-support probes.
 fn is_host_dependent_flag(arg: &str, next: Option<&str>) -> bool {
-    if matches!(arg, "-march=native" | "-mcpu=native" | "-mtune=native" | "--target=native")
-        || arg.starts_with("-Xarch_host")
+    if matches!(
+        arg,
+        "-march=native"
+            | "-mcpu=native"
+            | "-mtune=native"
+            | "--target=native"
+            | "-print-stats"
+            | "--print-stats"
+            | "-time-passes"
+            | "-stats"
+    ) || arg.starts_with("-Xarch_host")
         || arg.starts_with("-fprofile-use")
         || arg.starts_with("-fprofile-instr-use")
         || arg.starts_with("-fprofile-sample-use")
         || arg.starts_with("-fprofile-remapping-file")
         || arg.starts_with("-fauto-profile")
+        || arg.starts_with("-ftime-report")
+        || arg.starts_with("-ftime-trace")
+        || arg.starts_with("-fproc-stat-report")
     {
         return true;
     }
     if matches!(arg, "-march" | "-mcpu" | "-mtune" | "-target" | "--target") && next == Some("native") {
+        return true;
+    }
+    false
+}
+
+/// Whether `text` contains a disallowed preprocessor/macro/filename/assembly token in either
+/// probe source text or command-line `-D` macro arguments.
+fn contains_disallowed_probe_token(text: &str) -> bool {
+    text.contains("##")
+        || text.contains("%:%:")
+        || contains_ident(text, "__has_include")
+        || contains_ident(text, "__has_include_next")
+        || contains_ident(text, "__has_embed")
+        || contains_ident(text, "_Pragma")
+        || contains_ident(text, "__FILE__")
+        || contains_ident(text, "__BASE_FILE__")
+        || contains_ident(text, "__FILE_NAME__")
+        || contains_ident(text, "asm")
+        || contains_ident(text, "__asm")
+        || contains_ident(text, "__asm__")
+}
+
+/// Whether `arg` names an assembler source file (`.s`, `.S`, `.asm`) or explicit assembler
+/// language selection (`-x assembler*` / `-xassembler*`).
+fn is_assembler_input_or_lang(arg: &str, prev: Option<&str>) -> bool {
+    if prev == Some("-x") && arg.starts_with("assembler") {
+        return true;
+    }
+    if arg.starts_with("-xassembler") {
+        return true;
+    }
+    if !arg.starts_with('-')
+        && (arg.ends_with(".s") || arg.ends_with(".S") || arg.ends_with(".asm") || arg.ends_with(".ASM"))
+    {
         return true;
     }
     false
@@ -743,6 +791,21 @@ fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
     };
     for line in text.lines() {
         let trimmed = line.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
+        // Reject assembler file-inclusion directives (`.include` / `.incbin`) anywhere in a
+        // probe input (including after `;` statement separators).
+        for stmt in trimmed.split(';') {
+            let s = stmt.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
+            if let Some(after_dot) = s.strip_prefix('.') {
+                for kw in ["include", "incbin"] {
+                    if let Some(rest) = after_dot.strip_prefix(kw) {
+                        let boundary = rest.bytes().next().is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_');
+                        if boundary {
+                            return Some(ProbeWhy::PackageInput);
+                        }
+                    }
+                }
+            }
+        }
         let after_hash = trimmed.strip_prefix('#').or_else(|| trimmed.strip_prefix("%:"));
         if let Some(after_hash) = after_hash {
             let dir = after_hash.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
@@ -769,16 +832,7 @@ fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
             }
         }
     }
-    if text.contains("##")
-        || text.contains("%:%:")
-        || contains_ident(text, "__has_include")
-        || contains_ident(text, "__has_include_next")
-        || contains_ident(text, "__has_embed")
-        || contains_ident(text, "_Pragma")
-        || contains_ident(text, "asm")
-        || contains_ident(text, "__asm")
-        || contains_ident(text, "__asm__")
-    {
+    if contains_disallowed_probe_token(text) {
         return Some(ProbeWhy::PackageInput);
     }
     if contains_ident(text, "__TIMESTAMP__") {
@@ -817,16 +871,14 @@ pub fn canonicalize<'b, 's>(
             break;
         }
         if let Some(prev) = prev_flag.take() {
-            // Reject nested response files (e.g. `-Xassembler @args.rsp`) and preprocessor token
-            // pasting in `-D` macro values (`-D CAT(a,b)=a##b`). Only `-o` may carry an `OUT_DIR`
-            // path; any other flag taking a separate value with a path separator (e.g. `-L /host/lib`)
-            // is refused as an unkeyed external input.
+            // Reject nested response files (e.g. `-Xassembler @args.rsp`), assembler language
+            // selection (`-x assembler`), and preprocessor/pragma/filename/asm macro tokens in
+            // `-D` values (`-D CAT(a,b)=a##b`, `-D READ=_Pragma(...)`). Only `-o` may carry an
+            // `OUT_DIR` path; any other flag taking a separate value with a path separator
+            // (e.g. `-L /host/lib`) is refused as an unkeyed external input.
             if arg.starts_with('@')
-                || masked.contains("##")
-                || masked.contains("%:%:")
-                || contains_ident(masked, "__has_include")
-                || contains_ident(masked, "__has_include_next")
-                || contains_ident(masked, "__has_embed")
+                || is_assembler_input_or_lang(arg, Some(prev))
+                || contains_disallowed_probe_token(masked)
             {
                 has_arg_package_input = true;
                 break;
@@ -844,11 +896,8 @@ pub fn canonicalize<'b, 's>(
         }
         if is_header_search_flag(arg)
             || arg.starts_with('@')
-            || masked.contains("##")
-            || masked.contains("%:%:")
-            || contains_ident(masked, "__has_include")
-            || contains_ident(masked, "__has_include_next")
-            || contains_ident(masked, "__has_embed")
+            || is_assembler_input_or_lang(arg, None)
+            || contains_disallowed_probe_token(masked)
             || (!spawn.mount.is_empty() && arg.contains(spawn.mount) && !is_prefix_map_flag(arg))
         {
             has_arg_package_input = true;
