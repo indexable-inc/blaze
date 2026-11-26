@@ -45,6 +45,7 @@ use std::format;
 
 use blaze_flow_lower::InteriorPart;
 use blaze_hash::HashMap;
+use blaze_id::ItemKey as LibKey;
 use blaze_own::{Alloc, Vec};
 use blaze_typeck as tc;
 use blaze_typeck::{Checked, CoroutineFacts, Hidden, ItemKey, List, PNode, PTy, PTys, PortableTys};
@@ -452,6 +453,10 @@ pub enum HiddenFail {
     Copy { owner: ItemKey, why: &'static str },
     /// A local coroutine's expression or closure signature did not yield its checked facts.
     Coroutine(tc::CheckError),
+    /// Checking the defining body met a constant that must be evaluated first while another
+    /// constant evaluation holds `&mut Consts` (`ConstFail::Nested`): bubbled back to
+    /// `Consts::value_listed`'s work list (`const_open::needed_first`) instead of stringified.
+    NeedConst { key: LibKey },
     /// The work list passed [`MOST_DEFINES`] checks.
     TooMany { opaque: ItemKey, most: u32 },
 }
@@ -480,6 +485,7 @@ impl core::fmt::Display for HiddenFail {
             ),
             HiddenFail::Copy { owner, why } => write!(f, "the hidden types of fn {owner:?}'s clean check could not be filed: {why}"),
             HiddenFail::Coroutine(e) => core::fmt::Display::fmt(e, f),
+            HiddenFail::NeedConst { key } => write!(f, "a defining body needs constant {key:?} evaluated first"),
             HiddenFail::TooMany { opaque, most } => {
                 write!(f, "the hidden type of the `impl Trait` type {opaque:?}: its defining bodies need more than {most} checks (rule 18)")
             }
@@ -491,6 +497,16 @@ pub(super) fn gap(owner: ItemKey, fail: HiddenFail) -> CheckFail {
     let mut gaps = std::vec::Vec::new();
     gaps.push(Gap::Hidden(fail));
     CheckFail::Gap { owner, gaps }
+}
+
+/// Converts a [`HiddenFail`] into a [`CheckFail`]: preserves [`HiddenFail::NeedConst`] as
+/// `CheckFail::Const { ConstFail::Nested }` so `Consts::value_listed`'s work list evaluates the
+/// needed constant first instead of failing the outer constant evaluation with a stringified gap.
+pub(super) fn into_check_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, fail: HiddenFail) -> CheckFail {
+    match fail {
+        HiddenFail::NeedConst { key } => super::check::const_nested_fail(r, owner, key),
+        other => gap(owner, other),
+    }
 }
 
 fn shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Box<str> {
@@ -557,7 +573,7 @@ pub(crate) fn after_auto_gap<'n, S: NamesSource<'n>>(
             r.store.hidden.wanted = Some(opaque);
             return Ok(false);
         }
-        define(r, opaque).map_err(|f| gap(owner, f))?;
+        define(r, opaque).map_err(|f| into_check_fail(r, owner, f))?;
     }
     if let Err(at) = leaks.binary_search(&opaque) {
         leaks.insert(at, opaque);
@@ -669,6 +685,14 @@ fn check_defining<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: It
         // bounds: front2 rpitit.rs; one at a place reveals its projection and never comes
         // here): no body defines it, so no check of one can reveal it.
         Err(BodyError::NoBody(_)) => return Err(HiddenFail::TraitFnInBounds { opaque, owner, shown: shown(r, owner) }),
+        Err(BodyError::Const { item, error }) if matches!(&*error, super::consts::ConstFail::Nested { .. }) => {
+            return Err(HiddenFail::NeedConst { key: item });
+        }
+        Err(
+            BodyError::Convert { why: Some(super::types::Why::NeedConst(key, _)), .. }
+            | BodyError::Head { error: super::heads::HeadError::Item(_, super::types::Why::NeedConst(key, _)), .. }
+            | BodyError::Generics { why: super::types::Why::NeedConst(key, _), .. },
+        ) => return Err(HiddenFail::NeedConst { key }),
         Err(e) => return Ok(Err(format!("its body was not lowered: {e}").into_boxed_str())),
     };
     let view = lowered.lowered.view();
@@ -696,10 +720,13 @@ fn check_defining<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: It
             let scratch = r.store.work_alloc();
             r.store.reads.file(lowered.typeck.owner, &filed.reads, scratch)
         });
-    Ok(match checked {
-        Ok(()) => Ok(()),
-        Err(e) => Err(format!("{e}").into_boxed_str()),
-    })
+    match checked {
+        Ok(()) => Ok(Ok(())),
+        Err(CheckFail::Const { key, error, .. }) if matches!(&*error, super::consts::ConstFail::Nested { .. }) => {
+            Err(HiddenFail::NeedConst { key })
+        }
+        Err(e) => Ok(Err(format!("{e}").into_boxed_str())),
+    }
 }
 
 /// `roots` of `from` interned into `out`, each reached node after its children (a table holds
@@ -1143,5 +1170,72 @@ fn main() {}
             };
             super::define_for_reveal(&mut r, opaque).expect("define_for_reveal must succeed with store.prepared");
         }
+    }
+
+    /// When `define_for_reveal` checks an `async fn` defining body that contains an unevaluated
+    /// anonymous array-length constant (`[u8; 0 + 1 + 1]`, as `tokio::select!` expands to) while
+    /// an outer constant evaluation holds `&mut Consts` (`r.consts: None`, `evaluating > 0`), it
+    /// must return `HiddenFail::NeedConst` (not a stringified `HiddenFail::Defining`) so
+    /// `Consts::value_listed`'s work list evaluates the constant first and retries.
+    #[test]
+    fn define_for_reveal_propagates_const_nested() {
+        use crate::front2::check::{BuildOrder, Records};
+
+        const SOURCE: &str = r#"
+async fn make_val() -> u8 {
+    let arr: [u8; 0 + 1 + 1] = [1, 2];
+    arr[0]
+}
+fn caller() { let _ = make_val(); }
+fn main() {}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let files = [("/nested_const_opaque/src/main.rs".into(), SOURCE.into())];
+        let user = UserCrate {
+            name: "nested_const_opaque", dir: "/nested_const_opaque/", root: "/nested_const_opaque/src/main.rs", files: &files,
+            edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("fixture world");
+        let make_val_lib = world
+            .bodies(alloc)
+            .into_iter()
+            .find_map(|(body, _)| match body {
+                BodyRef::Free(k) if names.item_text(k)?.name == Some("make_val") => Some(k),
+                _ => None,
+            })
+            .expect("make_val body");
+        let want = super::super::heads::Want::Fn(make_val_lib);
+        world.store.ensure(world.front.names, &mut world.front.keys, want).expect("make_val head");
+        let opaque = world
+            .store
+            .opaques
+            .keys()
+            .copied()
+            .next()
+            .expect("make_val async opaque");
+        let mut buckets = None;
+        // Simulate an active outer constant evaluation (`r.consts: None`, `evaluating: 1`).
+        world.store.maps.evaluating.set(1);
+        let err = {
+            let mut r = Records {
+                names: world.front.names,
+                keys: &mut world.front.keys,
+                index: &world.front.index,
+                store: &mut world.store,
+                buckets: &mut buckets,
+                order: BuildOrder::AsAsked,
+                consts: None,
+            };
+            super::define_for_reveal(&mut r, opaque).expect_err("must surface NeedConst when evaluating > 0")
+        };
+        world.store.maps.evaluating.set(0);
+        assert!(matches!(err, super::HiddenFail::NeedConst { .. }), "expected HiddenFail::NeedConst, got {err:?}");
     }
 }

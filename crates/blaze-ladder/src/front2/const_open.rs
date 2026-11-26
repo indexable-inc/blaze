@@ -79,6 +79,7 @@ pub(super) fn needed_first(e: &ConstFail) -> Option<LibKey> {
         ConstFail::Check { error: CheckFail::Const { key, error, .. }, .. } if matches!(**error, ConstFail::Nested { .. }) => Some(*key),
         ConstFail::Body { error: BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }, .. } => Some(*c),
         ConstFail::Body { error: BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }, .. } => Some(*c),
+        ConstFail::Body { error: BodyError::Const { item, error }, .. } if matches!(**error, ConstFail::Nested { .. }) => Some(*item),
         _ => None,
     }
 }
