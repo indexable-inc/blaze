@@ -9,6 +9,7 @@ pub mod cli_spec_driver;
 pub mod config;
 pub mod dust_driver;
 pub mod editor;
+pub mod git_meta_driver;
 pub mod host;
 pub mod icons;
 pub mod image_atlas;

@@ -463,6 +463,30 @@ unsafe fn decode_frame_rgba(
     Some(rgba)
 }
 
+/// Apply an antialiased SDF circular alpha mask to a straight-RGBA8 square bitmap so GitHub
+/// user avatars render as crisp Retina circles in Metal without extra shader permutations.
+#[cfg(target_os = "macos")]
+fn apply_circle_mask_rgba(rgba: &mut [u8], w: usize, h: usize) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    let r = cx.min(cy) - 0.5;
+    for y in 0..h {
+        let dy = (y as f32 + 0.5) - cy;
+        for x in 0..w {
+            let dx = (x as f32 + 0.5) - cx;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let cov = (r + 0.75 - dist).clamp(0.0, 1.0);
+            let i = (y * w + x) * 4;
+            if i + 3 < rgba.len() {
+                rgba[i + 3] = ((rgba[i + 3] as f32) * cov).round() as u8;
+            }
+        }
+    }
+}
+
 /// Render an SVG file (`<style>` CSS classes, `<rect>`, `<line>`, `<circle>`, `<path>`, `<text>`)
 /// natively via CoreGraphics + CoreText at Retina resolution (`dst_w x dst_h`).
 #[cfg(target_os = "macos")]
@@ -1222,12 +1246,24 @@ impl ImageAtlas {
         (req_w.clamp(1, max_w), req_h.clamp(1, max_h))
     }
 
-    fn ensure_entry(&mut self, path: &str, w_px: usize, h_px: usize, now_ms: u64) -> Option<(ImageSlot, bool)> {
-        if !self.entries.contains_key(path) {
-            let loaded = self.load_new_entry(Path::new(path), w_px, h_px);
-            self.entries.insert(path.to_owned(), loaded);
+    fn ensure_entry(
+        &mut self,
+        path: &str,
+        w_px: usize,
+        h_px: usize,
+        circle: bool,
+        now_ms: u64,
+    ) -> Option<(ImageSlot, bool)> {
+        let cache_key = if circle {
+            format!("circle:{path}")
+        } else {
+            path.to_owned()
+        };
+        if !self.entries.contains_key(&cache_key) {
+            let loaded = self.load_new_entry(Path::new(path), w_px, h_px, circle);
+            self.entries.insert(cache_key.clone(), loaded);
         }
-        let entry = self.entries.get_mut(path)?.as_mut()?;
+        let entry = self.entries.get_mut(&cache_key)?.as_mut()?;
         let slot = entry.slot;
         let mut is_animated = false;
 
@@ -1236,7 +1272,7 @@ impl ImageAtlas {
             match &mut anim.backend {
                 AnimBackend::AvifDav1d(streamer) => {
                     if let Some((got_idx, bytes)) = streamer.poll_visible() {
-                        self.pending_recycle.push((path.to_owned(), slot, bytes));
+                        self.pending_recycle.push((cache_key.clone(), slot, bytes));
                         anim.last_frame = got_idx;
                     }
                 }
@@ -1294,7 +1330,13 @@ impl ImageAtlas {
         Some((slot, is_animated))
     }
 
-    fn load_new_entry(&mut self, path: &Path, req_w: usize, req_h: usize) -> Option<AtlasEntry> {
+    fn load_new_entry(
+        &mut self,
+        path: &Path,
+        req_w: usize,
+        req_h: usize,
+        circle: bool,
+    ) -> Option<AtlasEntry> {
         if is_svg_path(path) {
             let (dw, dh) = self.choose_decode_dims(path, req_w, req_h, 1600, 1100);
             let rgba = decode_svg_rgba(path, dw, dh)?;
@@ -1341,7 +1383,12 @@ impl ImageAtlas {
             }
         }
 
-        let (w_px, h_px) = self.choose_decode_dims(path, req_w, req_h, 1440, 960);
+        let (w_px, h_px) = if circle {
+            let side = req_w.max(req_h).clamp(16, 128);
+            (side, side)
+        } else {
+            self.choose_decode_dims(path, req_w, req_h, 1440, 960)
+        };
 
         use mac_imageio::*;
         // SAFETY: `bytes` lives through `CFDataCreate`; ownership of `src` is either moved into
@@ -1361,20 +1408,23 @@ impl ImageAtlas {
                 CFRelease(src.cast());
                 return None;
             }
-            let first_rgba = match decode_frame_rgba(src, 0, w_px, h_px) {
+            let mut first_rgba = match decode_frame_rgba(src, 0, w_px, h_px) {
                 Some(b) => b,
                 None => {
                     CFRelease(src.cast());
                     return None;
                 }
             };
+            if circle {
+                apply_circle_mask_rgba(&mut first_rgba, w_px, h_px);
+            }
             let Some(slot) = self.alloc_slot(w_px, h_px) else {
                 CFRelease(src.cast());
                 return None;
             };
             self.pending.push((slot, first_rgba.clone()));
 
-            if count == 1 {
+            if count == 1 || circle {
                 CFRelease(src.cast());
                 return Some(AtlasEntry { slot, anim: None });
             }
@@ -1447,7 +1497,7 @@ impl ImageAtlas {
             }
             let w_px = ((q.w as f64) * self.scale).round().clamp(1.0, 1200.0) as usize;
             let h_px = ((q.h as f64) * self.scale).round().clamp(1.0, 840.0) as usize;
-            let Some((slot, is_anim)) = self.ensure_entry(&q.path, w_px, h_px, now_ms) else {
+            let Some((slot, is_anim)) = self.ensure_entry(&q.path, w_px, h_px, q.circle, now_ms) else {
                 continue;
             };
             if is_anim {
@@ -1488,6 +1538,7 @@ mod tests {
                 h: 184.0,
                 path: fire.to_string_lossy().into_owned(),
                 alpha: 1.0,
+                circle: false,
                 clip_id: 0,
             };
             let (insts, anim) = atlas.rasterize_quads(std::slice::from_ref(&q), 0, 1000.0);
@@ -1507,6 +1558,7 @@ mod tests {
                 h: 300.0,
                 path: life.to_string_lossy().into_owned(),
                 alpha: 1.0,
+                circle: false,
                 clip_id: 0,
             };
             let (insts, anim) = atlas.rasterize_quads(std::slice::from_ref(&q), 0, 1000.0);
@@ -1523,6 +1575,7 @@ mod tests {
                 h: 350.0,
                 path: chart.to_string_lossy().into_owned(),
                 alpha: 1.0,
+                circle: false,
                 clip_id: 0,
             };
             let (insts, _) = atlas.rasterize_quads(&[q], 0, 1000.0);

@@ -216,6 +216,10 @@ pub enum ColDisplay {
     Percent,
     /// Rust crate / package name.
     Crate,
+    /// Git commit author (renders with circular GitHub avatar / monogram badge + exact hover).
+    GitAuthor,
+    /// Git commit SHA / summary (renders monospace SHA + subject + full commit hover).
+    GitCommit,
 }
 
 /// Columnar persistent table: a list of records sharing column headers, stored column-wise

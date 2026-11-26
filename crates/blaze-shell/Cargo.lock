@@ -83,6 +83,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-git-meta"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-glob"
 version = "0.0.0"
 dependencies = [
@@ -184,6 +191,7 @@ dependencies = [
  "blaze-data",
  "blaze-dust",
  "blaze-git",
+ "blaze-git-meta",
  "blaze-html",
  "blaze-json",
  "blaze-own",

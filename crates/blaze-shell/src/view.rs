@@ -214,6 +214,7 @@ pub struct ImageQuad {
     pub h: f32,
     pub path: String,
     pub alpha: f32,
+    pub circle: bool,
     pub clip_id: u32,
 }
 
@@ -1017,7 +1018,21 @@ impl Scene {
 
     #[allow(clippy::too_many_arguments)]
     pub fn image(&mut self, x: f32, y: f32, w: f32, h: f32, path: String, clip_id: u32) {
-        self.image_quads.push(ImageQuad { x, y, w, h, path, alpha: 1.0, clip_id });
+        self.image_quads.push(ImageQuad { x, y, w, h, path, alpha: 1.0, circle: false, clip_id });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn avatar_image(&mut self, x: f32, y: f32, size: f32, path: String, clip_id: u32) {
+        self.image_quads.push(ImageQuad {
+            x,
+            y,
+            w: size,
+            h: size,
+            path,
+            alpha: 1.0,
+            circle: true,
+            clip_id,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
