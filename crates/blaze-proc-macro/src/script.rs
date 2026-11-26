@@ -319,7 +319,8 @@ impl ScriptRuntime {
             .operator_cost(fuel_cost())
             .max_wasm_stack(MAX_WASM_STACK)
             .async_stack_size(MAX_WASM_STACK)
-            .wasm_backtrace_details(WasmBacktraceDetails::Disable);
+            .wasm_backtrace_details(WasmBacktraceDetails::Disable)
+            .wasm_memory64(true);
         let engine = Engine::new(&config).map_err(RuntimeError::Engine)?;
         let mut bytes = Bytes::default();
         bytes.write(b"blaze build-script host 1\n");

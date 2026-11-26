@@ -35,6 +35,8 @@ pub mod error;
 pub mod export;
 pub mod input;
 pub mod layout;
+/// Direct `blaze-lir` -> Wasmtime 64 (`memory64`) compiler backend.
+pub mod lir_wasm64;
 pub mod macho;
 pub mod native_dylib;
 pub mod native_so;
@@ -49,10 +51,14 @@ pub mod wasm64;
 pub use error::ExportError;
 pub use export::{Exported, Panics, export};
 pub use input::{CExport, Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
+pub use lir_wasm64::{
+    LirWasm64Error, LirWasm64Func, LirWasm64Import, LirWasm64Module, LirWasm64Static,
+    compile_lir_wasm64,
+};
 pub use optimized::{Function02, ProgramIn02, export_optimized, v1_to_v2};
 pub use wasm64::{
-    Wasm64Check, Wasm64Data, Wasm64Error, Wasm64Exported, Wasm64Func, Wasm64Opts, Wasm64Program,
-    check_wasm64, export_wasm64,
+    HOST_IMPORT_COUNT, HOST_MODULE, ValType, Wasm64Check, Wasm64Data, Wasm64Error, Wasm64Exported,
+    Wasm64Func, Wasm64Opts, Wasm64Program, check_wasm64, export_wasm64,
 };
 
 #[cfg(test)]

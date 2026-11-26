@@ -223,7 +223,8 @@ impl Settings {
             .operator_cost(self.fuel_cost.clone())
             .max_wasm_stack(self.max_wasm_stack)
             .async_stack_size(self.async_stack_size)
-            .wasm_backtrace_details(if self.wasm_backtrace_details { WasmBacktraceDetails::Enable } else { WasmBacktraceDetails::Disable });
+            .wasm_backtrace_details(if self.wasm_backtrace_details { WasmBacktraceDetails::Enable } else { WasmBacktraceDetails::Disable })
+            .wasm_memory64(true);
         config
     }
 }

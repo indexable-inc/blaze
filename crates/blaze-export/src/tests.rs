@@ -285,6 +285,8 @@ fn wasm64_export_is_deterministic_and_valid_memory64() {
         name: "hello-wasm64",
         funcs: &funcs,
         data: &data,
+        indirect_table: &[],
+        extra_types: &[],
         profile_digest: Some([0xAB; 32]),
         opts: Wasm64Opts::DEFAULT,
     };
@@ -315,6 +317,61 @@ fn wasm64_export_is_deterministic_and_valid_memory64() {
         bad[p] = 0x01; // clear memory64 bit 0x04
         assert!(matches!(check_wasm64(&bad), Err(Wasm64Error::NotMemory64 { .. })));
     }
+}
+
+#[test]
+fn wasm64_indirect_table_and_extra_types_validate() {
+    use crate::wasm64::{
+        HOST_IMPORT_COUNT, ValType, Wasm64Error, Wasm64Func, Wasm64Opts, Wasm64Program,
+        check_wasm64, export_wasm64,
+    };
+
+    let funcs = [
+        Wasm64Func {
+            export_name: Some("_start"),
+            params: &[],
+            results: &[ValType::I32],
+            locals: &[],
+            body: &[0x41, 0x00],
+        },
+        Wasm64Func {
+            export_name: None,
+            params: &[ValType::I64],
+            results: &[ValType::I64],
+            locals: &[],
+            body: &[0x20, 0x00],
+        },
+    ];
+    let extra_types: [(&[ValType], &[ValType]); 1] = [(&[ValType::I32, ValType::I32], &[ValType::I32])];
+    let indirect = [HOST_IMPORT_COUNT + 1];
+    let prog = Wasm64Program {
+        name: "indirect-wasm64",
+        funcs: &funcs,
+        data: &[],
+        indirect_table: &indirect,
+        extra_types: &extra_types,
+        profile_digest: None,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    assert_eq!(prog.type_index_for(&[ValType::I64], &[ValType::I64]), Some(HOST_IMPORT_COUNT + 1));
+    assert_eq!(
+        prog.type_index_for(&[ValType::I32, ValType::I32], &[ValType::I32]),
+        Some(prog.extra_type_index(0))
+    );
+
+    let mut out = Vec::new_in(Alloc::global());
+    export_wasm64(&prog, &mut out, Alloc::global()).expect("exports with table + elem");
+    let checked = check_wasm64(&out).expect("check_wasm64 accepts table + elem sections");
+    assert_eq!(checked.table_size, 2);
+    assert_eq!(checked.elem_count, 1);
+
+    // Out-of-bounds indirect_table func index is refused cleanly.
+    let bad_table = [HOST_IMPORT_COUNT + 99];
+    let bad_prog = Wasm64Program { indirect_table: &bad_table, ..prog };
+    assert!(matches!(
+        export_wasm64(&bad_prog, &mut out, Alloc::global()),
+        Err(Wasm64Error::InvalidTableFunc { .. })
+    ));
 }
 
 /// Rust `Space::Tls` layout and format checks on both Mach-O arm64 and ELF arm64:

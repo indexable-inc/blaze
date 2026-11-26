@@ -73,6 +73,8 @@ pub mod spawn_records;
 #[cfg(feature = "runtime")]
 pub mod spawn_route;
 #[cfg(feature = "runtime")]
+pub mod wasm64_runtime;
+#[cfg(feature = "runtime")]
 pub mod wire;
 
 #[cfg(all(test, feature = "runtime"))]
