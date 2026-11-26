@@ -30,15 +30,23 @@ pub enum TextFace {
 pub struct CellMetrics {
     pub cw: f32,
     pub ch: f32,
-    /// Exact logical-pixel CoreText advances for ASCII `32..=126` in `TextFace::Ui` (`0.0` = heuristic fallback).
+    /// Exact logical-pixel CoreText advances for ASCII `32..=126` in `TextFace::Ui` Regular (`0.0` = heuristic fallback).
     pub ui_adv: [f32; 95],
+    /// Exact logical-pixel CoreText advances for ASCII `32..=126` in `TextFace::Ui` Bold/Semibold (`0.0` = heuristic fallback).
+    pub ui_bold_adv: [f32; 95],
     /// Exact logical-pixel advance ratio `Chrome / Ui`.
     pub chrome_ratio: f32,
 }
 
 impl Default for CellMetrics {
     fn default() -> Self {
-        Self { cw: 8.0, ch: 18.0, ui_adv: [0.0; 95], chrome_ratio: 0.92 }
+        Self {
+            cw: 8.0,
+            ch: 18.0,
+            ui_adv: [0.0; 95],
+            ui_bold_adv: [0.0; 95],
+            chrome_ratio: 0.92,
+        }
     }
 }
 
@@ -60,39 +68,41 @@ impl CellMetrics {
         self.measure_styled(text, face, false)
     }
 
-    /// Exact logical width of `text` in `face` with optional bold weight adjustment.
+    /// Exact logical width of `text` in `face` with exact CoreText regular vs bold glyph advances.
     pub fn measure_styled(&self, text: &str, face: TextFace, bold: bool) -> f32 {
         if face == TextFace::Mono {
             return text.chars().count() as f32 * self.cw;
         }
-        let bold_mul = if bold && face != TextFace::Heading { 1.075 } else { 1.0 };
         // Use exact measured CoreText glyph advances when populated (`Fonts::cell_metrics`).
-        if self.ui_adv[b'n' as usize - 32] > 0.0 {
+        let use_bold_table = (bold || face == TextFace::Heading) && self.ui_bold_adv[b'n' as usize - 32] > 0.0;
+        let table = if use_bold_table { &self.ui_bold_adv } else { &self.ui_adv };
+        if table[b'n' as usize - 32] > 0.0 {
             let ratio = match face {
                 TextFace::Mono => 1.0,
                 TextFace::Ui => 1.0,
                 TextFace::UiSmall => 0.84 / 0.94,
-                TextFace::Heading => (1.18 / 0.94) * 1.04,
+                TextFace::Heading => 1.18 / 0.94,
                 TextFace::Chrome => self.chrome_ratio,
             };
-            let fallback_non_ascii = self.ui_adv[b'm' as usize - 32].max(self.cw * 0.85);
+            let fallback_non_ascii = table[b'm' as usize - 32].max(self.cw * 0.85);
             let mut sum = 0.0f32;
             for ch in text.chars() {
                 let code = ch as u32;
                 if (32..=126).contains(&code) {
-                    sum += self.ui_adv[(code - 32) as usize];
+                    sum += table[(code - 32) as usize];
                 } else if ch == '·' {
-                    sum += self.ui_adv[b'.' as usize - 32] * 1.05;
+                    sum += table[b'.' as usize - 32] * 1.05;
                 } else if ch == '—' || ch == '…' {
-                    sum += self.ui_adv[b'M' as usize - 32] * 1.1;
+                    sum += table[b'M' as usize - 32] * 1.1;
                 } else {
                     sum += fallback_non_ascii;
                 }
             }
-            return sum * ratio * bold_mul;
+            return sum * ratio;
         }
 
         // Heuristic fallback for headless unit tests without CoreText.
+        let bold_mul = if bold && face != TextFace::Heading { 1.075 } else { 1.0 };
         let base_cw = if face == TextFace::Chrome { 7.8 } else { self.cw };
         let scale = match face {
             TextFace::Mono => 1.0,
@@ -217,6 +227,9 @@ pub enum HitAction {
     FocusPane(PaneId),
     ClosePane(PaneId),
     ToggleZoomPane(PaneId),
+    /// Rendered Markdown/HTML interactive actions.
+    OpenLink { href: String, base_dir: String },
+    CopyText(String),
 }
 
 /// Clickable UI target recorded during layout.
@@ -674,6 +687,10 @@ pub struct Scene {
     pub hit_regions: Vec<HitRegion>,
     /// Hoverable regions for interactive floating popovers (branch picker, stashes, dirty files, tooltips).
     pub hover_regions: Vec<HoverRegion>,
+    /// Heading anchor targets `(github_slug, screen_y)` recorded during Markdown/HTML layout.
+    pub anchors: Vec<(String, f32)>,
+    /// Content-space top Y offset `(block_id, content_y)` for each block in the active pane.
+    pub block_tops: Vec<(BlockId, f32)>,
     /// Bounding rect of the currently open floating popover (keeps popover open while pointer moves into it).
     pub popover_rect: Option<HitRect>,
     /// Embedded scrollable table viewports for nested vertical/horizontal trackpad scrolling.
@@ -716,6 +733,8 @@ impl Scene {
             hover_regions: Vec::new(),
             popover_rect: None,
             scroll_regions: Vec::new(),
+            anchors: Vec::new(),
+            block_tops: Vec::new(),
             drag_sources: Vec::new(),
             composer_rect: HitRect::new(0.0, 0.0, 0.0, 0.0),
             composer_text_origin: [0.0, 0.0],
@@ -1369,6 +1388,9 @@ impl Scene {
         }
 
         if is_focused {
+            for (slug, ay) in sub.anchors {
+                self.anchors.push((slug, ay + dy));
+            }
             for r in sub.overlay_rects {
                 let cid = map_ov_clip(r.clip_info[0]);
                 self.overlay_rects.push(xlat_rect(r, cid));

@@ -167,7 +167,10 @@ fn tokenize_line<'a>(
         // Line comments
         let is_comment = match style {
             LangStyle::CStyle => b == b'/' && i + 1 < len && bytes[i + 1] == b'/',
-            LangStyle::HashComment => b == b'#',
+            LangStyle::HashComment => {
+                b == b'#'
+                    && (i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b';')
+            }
             LangStyle::Sql | LangStyle::Lean => b == b'-' && i + 1 < len && bytes[i + 1] == b'-',
         };
         if is_comment {

@@ -34,7 +34,6 @@ use crate::view::{
 };
 
 pub const TOP_BAR_H: f32 = 34.0;
-pub const PANE_HEADER_H: f32 = 24.0;
 pub const TILE_GAP: f32 = 2.0;
 const TRAFFIC_LIGHTS_PAD: f32 = 80.0;
 const OUTER_PAD_X: f32 = 16.0;
@@ -119,6 +118,7 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
         prev_cwd = Some(cur_cwd);
         prev_branch = Some(cur_branch);
         let draw_y = feed_top + content_y - input.scroll_y;
+        scene.block_tops.push((blk.id, content_y));
         let h = layout_block(
             &mut scene,
             blk,
@@ -481,8 +481,8 @@ pub fn layout_window_top_bar(
         &mut rx,
         Icon::NewWindow,
         HitAction::NewWindow,
-        "New window",
-        "Cmd+N · inherit cwd",
+        "New OS window",
+        "Cmd+Shift+N · separate window",
     );
     push_icon_btn(
         scene,
@@ -675,119 +675,6 @@ pub fn layout_window_top_bar(
             x += bw + 5.0;
         }
     }
-}
-
-/// Draw crisp monochrome tiling pane header + subtle active/inactive border when `pane_count > 1`.
-/// Returns the inner content `HitRect` below the 24px pane header.
-#[allow(clippy::too_many_arguments)]
-pub fn draw_tiled_pane_chrome(
-    scene: &mut Scene,
-    pane_id: PaneId,
-    outer: HitRect,
-    focused: bool,
-    title: &str,
-    branch: Option<&str>,
-    process_tag: Option<&str>,
-    m: CellMetrics,
-) -> HitRect {
-    let hdr_y1 = (outer.y0 + PANE_HEADER_H).min(outer.y1);
-    let hdr_bg = if focused {
-        theme::rgb(0x16, 0x16, 0x19)
-    } else {
-        theme::rgb(0x12, 0x12, 0x14)
-    };
-    let border_col = if focused {
-        theme::rgb(0x3a, 0x3a, 0x42)
-    } else {
-        theme::LINE_FAINT
-    };
-
-    // Header bar background + hairline bottom divider + active accent rail on top edge.
-    scene.round_rect(outer.x0, outer.y0, outer.x1, hdr_y1, 0.0, hdr_bg, 0.0, [0.0; 4], 0);
-    if focused {
-        scene.line(outer.x0, outer.y0 + 1.0, outer.x1, outer.y0 + 1.0, 2.0, theme::rgb(0x6e, 0x6e, 0x78), 0);
-    }
-    scene.line(outer.x0, hdr_y1 - 0.5, outer.x1, hdr_y1 - 0.5, 1.0, border_col, 0);
-
-    // Clicking anywhere on the header focuses the pane.
-    scene.push_hit(HitRect::new(outer.x0, outer.y0, outer.x1, hdr_y1), HitAction::FocusPane(pane_id));
-
-    let chrome_ch = m.line_h(TextFace::Chrome);
-    let mid_y = outer.y0 + (PANE_HEADER_H - chrome_ch) * 0.5;
-    let mut lx = outer.x0 + 10.0;
-    let dot_col = if focused { theme::INK_1 } else { theme::INK_4 };
-    scene.over_circle(lx + 2.5, outer.y0 + PANE_HEADER_H * 0.5, 2.5, dot_col, 0);
-    lx += 11.0;
-
-    // Right-aligned Zoom + Close icon buttons on the pane header.
-    let btn_s = 10.0;
-    let btn_w = 20.0;
-    let mut rx = outer.x1 - 4.0;
-    if rx - btn_w > lx + 40.0 {
-        let close_r = HitRect::new(rx - btn_w, outer.y0 + 2.0, rx, hdr_y1 - 2.0);
-        draw_icon(
-            scene,
-            Icon::Close,
-            close_r.x0 + (btn_w - btn_s) * 0.5,
-            outer.y0 + (PANE_HEADER_H - btn_s) * 0.5,
-            btn_s,
-            theme::INK_4,
-            0,
-        );
-        scene.push_hit(close_r, HitAction::ClosePane(pane_id));
-        rx -= btn_w + 2.0;
-    }
-    if rx - btn_w > lx + 40.0 {
-        let zoom_r = HitRect::new(rx - btn_w, outer.y0 + 2.0, rx, hdr_y1 - 2.0);
-        draw_icon(
-            scene,
-            Icon::Maximize,
-            zoom_r.x0 + (btn_w - btn_s) * 0.5,
-            outer.y0 + (PANE_HEADER_H - btn_s) * 0.5,
-            btn_s,
-            theme::INK_4,
-            0,
-        );
-        scene.push_hit(zoom_r, HitAction::ToggleZoomPane(pane_id));
-        rx -= btn_w + 6.0;
-    }
-
-    // Folder icon + title + optional git branch / active process badge.
-    let icon_s = 11.5;
-    scene.svg_icon_alpha(
-        lx,
-        outer.y0 + (PANE_HEADER_H - icon_s) * 0.5,
-        icon_s,
-        "folder_macos",
-        if focused { 1.0 } else { 0.65 },
-        0,
-    );
-    lx += icon_s + 6.0;
-
-    let mut label = title.to_owned();
-    if let Some(br) = branch
-        && !br.is_empty()
-    {
-        label.push_str("  ·  ");
-        label.push_str(br);
-    }
-    if let Some(tag) = process_tag {
-        label.push_str("  [");
-        label.push_str(tag);
-        label.push(']');
-    }
-    let avg_cw = m.measure("n", TextFace::Chrome).max(4.5);
-    let max_c = ((rx - lx) / avg_cw).floor().max(6.0) as usize;
-    scene.chrome_text(
-        lx,
-        mid_y,
-        truncate_chars(&label, max_c),
-        if focused { theme::INK_1 } else { theme::INK_4 },
-        focused,
-        0,
-    );
-
-    HitRect::new(outer.x0, hdr_y1, outer.x1, outer.y1.max(hdr_y1 + 20.0))
 }
 
 /// Draw crisp 1px hairline split dividers between tiled panes (highlighted while actively dragged).
@@ -1441,6 +1328,75 @@ fn layout_value(
         }
         Value::String(s) if depth == 0 && open_target_filename(&block.source).is_some() => {
             let fname = open_target_filename(&block.source).unwrap_or("file");
+            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
+            let base_dir = target_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
+            let max_h = if block.folded { 520.0 } else { 16000.0 };
+            with_cached_open_preview(block.id.0, fname, s.as_ref().as_bytes(), |doc| {
+                crate::yazi::render_rich_preview(
+                    scene,
+                    doc,
+                    Some(base_dir),
+                    Some(&target_path),
+                    x0,
+                    y0,
+                    width,
+                    y0 + max_h,
+                    m,
+                    clip_id,
+                )
+                .max(m.ch)
+            })
+        }
+        Value::Binary(b) if depth == 0 && open_target_filename(&block.source).is_some() => {
+            let fname = open_target_filename(&block.source).unwrap_or("file");
+            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
+            let base_dir = target_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
+            with_cached_open_preview(block.id.0, fname, b.as_ref(), |doc| {
+                crate::yazi::render_rich_preview(
+                    scene,
+                    doc,
+                    Some(base_dir),
+                    Some(&target_path),
+                    x0,
+                    y0,
+                    width,
+                    y0 + 540.0,
+                    m,
+                    clip_id,
+                )
+                .max(m.ch)
+            })
+        }
+        scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
+    }
+}
+
+/// Cache parsed `blaze_preview::PreviewDoc` per `(block_id, filename, byte_len)` on the UI thread
+/// so scrolling and live animations never re-parse Markdown, HTML, or syntax highlighting per frame!
+fn with_cached_open_preview<R>(
+    block_id: u64,
+    fname: &str,
+    bytes: &[u8],
+    f: impl FnOnce(&blaze_preview::PreviewDoc<'static>) -> R,
+) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<(u64, String, usize), blaze_preview::PreviewDoc<'static>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cell| {
+        let key = (block_id, fname.to_owned(), bytes.len());
+        let mut map = cell.borrow_mut();
+        if !map.contains_key(&key) {
+            if map.len() >= 32 {
+                map.clear();
+            }
             let open_limits = blaze_preview::PreviewLimits {
                 max_rows: 64,
                 max_cols: 8,
@@ -1449,57 +1405,16 @@ fn layout_value(
             };
             let doc = blaze_preview::build_preview(
                 fname,
-                s.as_ref().as_bytes(),
-                s.as_ref().len() as u64,
+                bytes,
+                bytes.len() as u64,
                 open_limits,
                 Alloc::global(),
             );
-            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
-            let base_dir = target_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
-            let max_h = if block.folded { 520.0 } else { 6400.0 };
-            crate::yazi::render_rich_preview(
-                scene,
-                &doc,
-                Some(base_dir),
-                x0,
-                y0,
-                width,
-                y0 + max_h,
-                m,
-                clip_id,
-            )
-            .max(m.ch)
+            map.insert(key.clone(), doc);
         }
-        Value::Binary(b) if depth == 0 && open_target_filename(&block.source).is_some() => {
-            let fname = open_target_filename(&block.source).unwrap_or("file");
-            let doc = blaze_preview::build_preview(
-                fname,
-                b.as_ref(),
-                b.as_ref().len() as u64,
-                blaze_preview::PreviewLimits::SHIPPED,
-                Alloc::global(),
-            );
-            let target_path = std::path::Path::new(&block.prompt_snapshot.cwd).join(fname);
-            let base_dir = target_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
-            crate::yazi::render_rich_preview(
-                scene,
-                &doc,
-                Some(base_dir),
-                x0,
-                y0,
-                width,
-                y0 + 260.0,
-                m,
-                clip_id,
-            )
-            .max(m.ch)
-        }
-        scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
-    }
+        let doc = map.get(&key).expect("just inserted");
+        f(doc)
+    })
 }
 
 /// Extract `<file>` when a command line is a direct `open <file>` (without pipes), so `open`

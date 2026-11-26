@@ -42,6 +42,30 @@ pub struct MdTable<'a> {
     pub rows: AVec<'a, AVec<'a, AVec<'a, MdSpan<'a>>>>,
 }
 
+/// GitHub-style callout alert kind (`> [!NOTE]`, `> [!TIP]`, `> [!IMPORTANT]`, `> [!WARNING]`, `> [!CAUTION]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MdAlertKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl MdAlertKind {
+    /// Human-readable title label shown above the alert body.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Tip => "Tip",
+            Self::Important => "Important",
+            Self::Warning => "Warning",
+            Self::Caution => "Caution",
+        }
+    }
+}
+
 /// One visual block in a rendered Markdown / HTML document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MdBlock<'a> {
@@ -67,6 +91,10 @@ pub enum MdBlock<'a> {
         spans: AVec<'a, MdSpan<'a>>,
     },
     Quote {
+        spans: AVec<'a, MdSpan<'a>>,
+    },
+    Alert {
+        kind: MdAlertKind,
         spans: AVec<'a, MdSpan<'a>>,
     },
     CodeFence {
@@ -275,9 +303,14 @@ pub fn parse_markdown_with_scheme<'a>(
             continue;
         }
 
-        // 7. Blockquote (`> ...`) — join consecutive `>` lines into a clean wrapped quote!
+        // 7. Blockquote (`> ...`) & GitHub callout alerts (`> [!NOTE]`, `> [!WARNING]`, ...)
         if let Some(first_rest) = trimmed.strip_prefix('>') {
-            let mut joined = AString::from_str_in(first_rest.trim_start(), alloc);
+            let first_trimmed = first_rest.trim_start();
+            let (alert_kind, first_body) = match parse_github_alert_tag(first_trimmed) {
+                Some((kind, rem)) => (Some(kind), rem),
+                None => (None, first_trimmed),
+            };
+            let mut joined = AString::from_str_in(first_body, alloc);
             idx = idx.saturating_add(1);
             while idx < total {
                 let nxt = raw_lines.get(idx).copied().unwrap_or("").trim();
@@ -295,18 +328,33 @@ pub fn parse_markdown_with_scheme<'a>(
                     break;
                 }
             }
-            blocks.push(MdBlock::Quote { spans: parse_inline(joined.as_str(), alloc) });
+            let spans = parse_inline(joined.as_str(), alloc);
+            if let Some(kind) = alert_kind {
+                blocks.push(MdBlock::Alert { kind, spans });
+            } else {
+                blocks.push(MdBlock::Quote { spans });
+            }
             continue;
         }
 
-        // 8. Unordered bullet (`- `, `* `, `+ `) with wrapped continuation lines
+        // 8. Unordered bullet (`- `, `* `, `+ `) and GFM task list checkboxes (`- [x] `, `- [ ] `)
         let leading_spaces = raw.bytes().take_while(|&b| b == b' ').count();
         if let Some(rest) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
             .or_else(|| trimmed.strip_prefix("+ "))
         {
-            let mut body = AString::from_str_in(rest.trim(), alloc);
+            let rest_t = rest.trim_start();
+            let (marker_str, initial_text) = if let Some(after) =
+                rest_t.strip_prefix("[x] ").or_else(|| rest_t.strip_prefix("[X] "))
+            {
+                ("☑", after.trim())
+            } else if let Some(after) = rest_t.strip_prefix("[ ] ") {
+                ("☐", after.trim())
+            } else {
+                ("•", rest_t.trim())
+            };
+            let mut body = AString::from_str_in(initial_text, alloc);
             idx = idx.saturating_add(1);
             while idx < total {
                 let nxt_raw = raw_lines.get(idx).copied().unwrap_or("");
@@ -324,7 +372,7 @@ pub fn parse_markdown_with_scheme<'a>(
             let indent = u8::try_from((leading_spaces / 2).min(4)).unwrap_or(0);
             blocks.push(MdBlock::Bullet {
                 indent,
-                marker: AString::from_str_in("•", alloc),
+                marker: AString::from_str_in(marker_str, alloc),
                 spans: parse_inline(body.as_str(), alloc),
             });
             continue;
@@ -1013,6 +1061,27 @@ fn extract_href<'a>(open_inner: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
         after.split_whitespace().next()?
     };
     Some(decode_entities(val, alloc))
+}
+
+fn parse_github_alert_tag(s: &str) -> Option<(MdAlertKind, &str)> {
+    let rest = s.strip_prefix("[!")?;
+    let end = rest.find(']')?;
+    let tag = rest.get(..end)?.trim();
+    let kind = if tag.eq_ignore_ascii_case("NOTE") {
+        MdAlertKind::Note
+    } else if tag.eq_ignore_ascii_case("TIP") {
+        MdAlertKind::Tip
+    } else if tag.eq_ignore_ascii_case("IMPORTANT") {
+        MdAlertKind::Important
+    } else if tag.eq_ignore_ascii_case("WARNING") {
+        MdAlertKind::Warning
+    } else if tag.eq_ignore_ascii_case("CAUTION") {
+        MdAlertKind::Caution
+    } else {
+        return None;
+    };
+    let tail = rest.get(end.saturating_add(1)..)?.trim_start();
+    Some((kind, tail))
 }
 
 fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {

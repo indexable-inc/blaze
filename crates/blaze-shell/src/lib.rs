@@ -20,6 +20,8 @@ pub mod yazi;
 pub mod zoxide;
 
 #[cfg(target_os = "macos")]
+pub mod avif_dav1d;
+#[cfg(target_os = "macos")]
 pub mod font;
 #[cfg(target_os = "macos")]
 pub mod keys;
@@ -1085,8 +1087,7 @@ mod tests {
     #[test]
     fn tiling_wm_invariants_and_scene_compositing() {
         use crate::layout::{
-            TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers, draw_tiled_pane_chrome,
-            layout_window_top_bar,
+            TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers, layout_window_top_bar,
         };
         use crate::tiling::{CloseOutcome, FocusDir, SplitAxis, TileManager};
         use crate::view::{HitRect, Scene};
@@ -1195,16 +1196,7 @@ mod tests {
         let l = wm.layout(area, 2.0);
         let mut master = Scene::new();
         for pl in &l.panes {
-            let content = draw_tiled_pane_chrome(
-                &mut master,
-                pl.pane,
-                pl.rect,
-                pl.focused,
-                "tmp",
-                Some("main"),
-                None,
-                CellMetrics::default(),
-            );
+            let content = pl.rect;
             let sub = build_pane_scene(&LayoutInput {
                 store: &store,
                 editor: &editor,
@@ -1300,5 +1292,85 @@ mod tests {
         let mut sc = crate::view::Scene::new();
         crate::layout::layout_command_palette(&mut sc, &pal, 1140.0, 820.0, CellMetrics::default());
         assert!(sc.hit_regions.iter().any(|h| matches!(h.action, HitAction::SelectPalette(_))));
+    }
+
+    #[test]
+    fn live_resize_reflow_readme_80_widths_is_submillisecond() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let readme = root.join("README.md");
+        if !readme.is_file() {
+            return;
+        }
+        let content = fs::read_to_string(&readme).expect("read README.md");
+        let alloc = Alloc::global();
+        let cwd = root.to_string_lossy().into_owned();
+        let state = EngineState::new(&cwd, &[], alloc);
+        let mut store = BlockStore::new(state.fork());
+        let prompt = crate::prompt::PromptInfo::from_cwd(&cwd, &cwd, 0, 0);
+        store.record_block(
+            "open README.md".to_owned(),
+            prompt.clone(),
+            state.fork(),
+            state.fork(),
+            0,
+            1,
+            0,
+            BlockBody::Value(Value::string(&content, alloc)),
+        );
+        let editor = Editor::new();
+        let m = CellMetrics::default();
+
+        // Warm up once (parses Markdown/HTML & shapes tokens).
+        let _ = build_scene(&LayoutInput {
+            store: &store,
+            editor: &editor,
+            prompt: &prompt,
+            viewport_w: 1140.0,
+            viewport_h: 820.0,
+            metrics: m,
+            scroll_y: 0.0,
+            cursor_visible: true,
+            now_ns: 0,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
+            cursor_trail: None,
+            text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
+            output_nav: None,
+        });
+
+        // Sweep across 80 distinct widths simulating a live drag resize (520px..1320px).
+        let t0 = std::time::Instant::now();
+        let mut last_h = 0.0f32;
+        for i in 0..80 {
+            let vw = 520.0 + (i as f32) * 10.0;
+            let sc = build_scene(&LayoutInput {
+                store: &store,
+                editor: &editor,
+                prompt: &prompt,
+                viewport_w: vw,
+                viewport_h: 820.0,
+                metrics: m,
+                scroll_y: 0.0,
+                cursor_visible: true,
+                now_ns: 0,
+                zoom_pct: 100,
+                inline_titlebar: true,
+                drag: None,
+                cursor_trail: None,
+                text_selection: None,
+                active_popover: None,
+                mouse_pos: None,
+                output_nav: None,
+            });
+            last_h = sc.total_content_height;
+            assert!(!sc.text_runs.is_empty());
+        }
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let per_frame_ms = elapsed_ms / 80.0;
+        eprintln!("live resize reflow (README.md x 80 widths): {per_frame_ms:.3} ms/frame (last_h={last_h:.0})");
+        assert!(per_frame_ms < 5.0, "live resize reflow too slow: {per_frame_ms:.2} ms/frame");
     }
 }

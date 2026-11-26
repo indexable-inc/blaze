@@ -121,6 +121,39 @@ fn previews_rust_code_with_syntax_tokens() {
 }
 
 #[test]
+fn previews_github_alerts_and_task_checkboxes() {
+    let md = "> [!WARNING]\n> Watch out for **sharp** edges.\n\n- [x] Shipped Metal GPU\n- [ ] Next milestone\n";
+    let alloc = blaze_own::testing::heap().alloc();
+    let doc = build_preview("NOTES.md", md.as_bytes(), md.len() as u64, PreviewLimits::SHIPPED, alloc);
+    let PreviewBody::Markdown { blocks, .. } = doc.body else {
+        panic!("expected markdown preview");
+    };
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        MdBlock::Alert { kind: crate::MdAlertKind::Warning, spans }
+            if spans.iter().any(|s| s.style == MdStyle::Bold && s.text.as_str() == "sharp")
+    )));
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        MdBlock::Bullet { marker, .. } if marker.as_str() == "☑"
+    )));
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        MdBlock::Bullet { marker, .. } if marker.as_str() == "☐"
+    )));
+}
+
+#[test]
+fn shell_hash_mid_word_is_not_comment() {
+    let sh = "nix run github:indexable-inc/blaze#life # actual comment\n";
+    let alloc = blaze_own::testing::heap().alloc();
+    let lines = crate::highlight_code(sh, "Shell", 8, alloc);
+    assert_eq!(lines.len(), 1);
+    assert!(!lines[0].spans.iter().any(|s| s.kind == TokenKind::Comment && s.text.as_str().contains("#life")));
+    assert!(lines[0].spans.iter().any(|s| s.kind == TokenKind::Comment && s.text.as_str().contains("# actual comment")));
+}
+
+#[test]
 fn sim_preview_never_panics_on_arbitrary_inputs() {
     use blaze_sim::{Config, check};
 

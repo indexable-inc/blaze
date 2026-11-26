@@ -61,6 +61,7 @@ fn headless_repl() {
 
 #[cfg(target_os = "macos")]
 mod macos_app {
+    use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
@@ -79,16 +80,21 @@ mod macos_app {
     };
     use blaze_vt::input::key::{Key, OptionAsAlt, Platform};
     use blaze_vt::terminal::{Effect, Opts as VtOpts, Terminal};
-    use objc2::rc::autoreleasepool;
-    use objc2::{MainThreadMarker, MainThreadOnly, sel};
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEventMask,
-        NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
-        NSPasteboardTypeString, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
+        NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
+        NSPasteboardTypeString, NSResponder, NSView, NSWindow, NSWindowStyleMask,
+        NSWindowTitleVisibility,
     };
-    use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
+    use objc2_core_graphics::CGColor;
+    use objc2_foundation::{
+        NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+        NSString,
+    };
     use objc2_metal::MTLCreateSystemDefaultDevice;
-    use objc2_quartz_core::CAMetalLayer;
+    use objc2_quartz_core::{CAMetalLayer, CATransaction, kCAGravityTopLeft};
 
     use blaze_shell::agent_hub::{
         AgentHub, AgentHubAction, AgentRecord, AgentStatus, layout_agent_hub_pane,
@@ -102,9 +108,8 @@ mod macos_app {
     use blaze_shell::image_atlas::ImageAtlas;
     use blaze_shell::keys;
     use blaze_shell::layout::{
-        LayoutInput, PANE_HEADER_H, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
-        draw_split_dividers, draw_tiled_pane_chrome, layout_command_palette,
-        layout_fullscreen_terminal_pane, layout_window_top_bar,
+        LayoutInput, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers,
+        layout_command_palette, layout_fullscreen_terminal_pane, layout_window_top_bar,
     };
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
@@ -117,7 +122,7 @@ mod macos_app {
     };
     use blaze_shell::view::{
         ActiveDrag, ActivePopover, CursorTrail, DragPayload, HitAction, HitRect, HoverKind,
-        OutputNav, OutputVisualMode, Scene, TextSelection, compute_text_selection,
+        OutputNav, OutputVisualMode, Scene, TextFace, TextSelection, compute_text_selection,
         extract_visual_lines, output_nav_geometry, select_at_point,
     };
     use blaze_shell::yazi::{YaziAction, YaziState, layout_yazi_pane, load_hover_preview};
@@ -141,6 +146,7 @@ mod macos_app {
         demo_history: bool,
         demo_tiled: bool,
         scroll_bottom: bool,
+        scroll_y: Option<f32>,
         cwd: Option<String>,
         cmd: Option<String>,
         screenshot: Option<PathBuf>,
@@ -152,6 +158,7 @@ mod macos_app {
         let mut demo_history = false;
         let mut demo_tiled = false;
         let mut scroll_bottom = false;
+        let mut scroll_y = None;
         let mut cwd = None;
         let mut cmd = None;
         let mut screenshot = None;
@@ -172,6 +179,11 @@ mod macos_app {
                     demo_tiled = true;
                 }
                 "--scroll-bottom" => scroll_bottom = true,
+                "--scroll" => {
+                    if let Some(v) = args.next() {
+                        scroll_y = v.parse::<f32>().ok();
+                    }
+                }
                 "--cwd" => {
                     if let Some(d) = args.next() {
                         cwd = Some(d);
@@ -190,7 +202,17 @@ mod macos_app {
                 _ => {}
             }
         }
-        CliOpts { demo, demo_popup, demo_history, demo_tiled, scroll_bottom, cwd, cmd, screenshot }
+        CliOpts {
+            demo,
+            demo_popup,
+            demo_history,
+            demo_tiled,
+            scroll_bottom,
+            scroll_y,
+            cwd,
+            cmd,
+            screenshot,
+        }
     }
 
     /// Spawn a fresh native macOS `blaze-shell` window inheriting `cwd` (`Cmd+N`).
@@ -572,6 +594,7 @@ mod macos_app {
         git_worker: GitStatusWorker,
         scroll_y: f32,
         auto_scroll_bottom: bool,
+        scroll_to_block: Option<BlockId>,
         active_pty: Option<ActivePty>,
         yazi: Option<YaziState>,
         agent_hub: Option<AgentHub>,
@@ -619,6 +642,7 @@ mod macos_app {
                 git_worker,
                 scroll_y: 0.0,
                 auto_scroll_bottom: false,
+                scroll_to_block: None,
                 active_pty: None,
                 yazi: None,
                 agent_hub: None,
@@ -1034,7 +1058,13 @@ mod macos_app {
                 let _ = self.store.fork_from_block(block_id, Some(&label));
             }
             self.refresh_prompt(exit_code, duration_ms);
-            self.auto_scroll_bottom = true;
+            if trimmed.starts_with("open ") && !trimmed.contains('|') && exit_code == 0 {
+                self.scroll_to_block = Some(block_id);
+                self.auto_scroll_bottom = false;
+            } else {
+                self.scroll_to_block = None;
+                self.auto_scroll_bottom = true;
+            }
         }
 
         fn poll_async_jobs(&mut self, cols: u16, rows: u16, cell_px: (u32, u32)) -> bool {
@@ -1390,13 +1420,8 @@ mod macos_app {
         fonts: &Fonts,
         scale: f64,
     ) {
-        let show_hdr = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
         for pl in &tile_layout.panes {
-            let content_rect = if show_hdr {
-                HitRect::new(pl.rect.x0, (pl.rect.y0 + PANE_HEADER_H).min(pl.rect.y1), pl.rect.x1, pl.rect.y1)
-            } else {
-                pl.rect
-            };
+            let content_rect = pl.rect;
             if let Some(pane) = panes.get_mut(&pl.pane)
                 && let Some(ap) = &pane.active_pty
             {
@@ -1438,28 +1463,14 @@ mod macos_app {
         let work_area = HitRect::new(0.0, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
         let tile_layout = wm.layout(work_area, TILE_GAP);
         let mut master = Scene::new();
-        let show_pane_hdr = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
+        let is_split = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
 
         // 1. Lay out and composite every visible pane in the active workspace tab!
         for pl in &tile_layout.panes {
             let Some(pane) = panes.get_mut(&pl.pane) else {
                 continue;
             };
-            let content_rect = if show_pane_hdr {
-                let proc_tag = pane.process_tag();
-                draw_tiled_pane_chrome(
-                    &mut master,
-                    pl.pane,
-                    pl.rect,
-                    pl.focused,
-                    &pane.prompt.dir_short,
-                    pane.prompt.git_branch.as_deref(),
-                    proc_tag,
-                    metrics,
-                )
-            } else {
-                pl.rect
-            };
+            let content_rect = pl.rect;
             let pw = (content_rect.x1 - content_rect.x0).max(120.0);
             let ph = (content_rect.y1 - content_rect.y0).max(80.0);
             let sub_vh = ph + TOP_BAR_H;
@@ -1556,7 +1567,13 @@ mod macos_app {
                     output_nav: if pl.focused { output_nav } else { None },
                 });
                 let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
-                let target_scroll = if pane.auto_scroll_bottom {
+                let target_scroll = if let Some(bid) = pane.scroll_to_block.take() {
+                    if let Some(&(_, by)) = first.block_tops.iter().find(|(id, _)| *id == bid) {
+                        (by - 8.0).clamp(0.0, max_s)
+                    } else {
+                        max_s
+                    }
+                } else if pane.auto_scroll_bottom {
                     pane.auto_scroll_bottom = false;
                     max_s
                 } else {
@@ -1595,7 +1612,7 @@ mod macos_app {
             master.composite_pane(sub, content_rect, TOP_BAR_H, pl.focused, vw, vh);
 
             // Subtle Ghostty-style dim veil on unfocused tiled panes so focus is unmistakable.
-            if show_pane_hdr && !pl.focused {
+            if is_split && !pl.focused {
                 master.over_round_rect(
                     pl.rect.x0,
                     pl.rect.y0,
@@ -1656,13 +1673,65 @@ mod macos_app {
             layout_command_palette(&mut master, pal, vw, vh, metrics);
         }
 
+        // 5. Safari/Chrome-style subtle bottom-left URL preview pill when hovering a clickable link.
+        if command_palette.is_none()
+            && let Some([mx, my]) = mouse_pos
+            && let Some(HitAction::OpenLink { href, .. }) = master.hit_test(mx, my)
+        {
+            let max_chars = (((vw * 0.55) / metrics.measure("n", TextFace::UiSmall).max(5.0))
+                .floor() as usize)
+                .clamp(24, 96);
+            let shown = blaze_shell::view::truncate_chars(&href, max_chars);
+            let tw = metrics.measure(&shown, TextFace::UiSmall);
+            let pw = (tw + 18.0).min(vw - 24.0);
+            let ph = metrics.line_h(TextFace::UiSmall) + 8.0;
+            let px0 = 10.0;
+            let py0 = (vh - ph - 8.0).max(TOP_BAR_H + 8.0);
+            master.overlay_round_rect(
+                px0,
+                py0,
+                px0 + pw,
+                py0 + ph,
+                5.0,
+                theme::rgba(0x14, 0x15, 0x1a, 0.94),
+                1.0,
+                theme::LINE,
+                0,
+            );
+            master.overlay_text.push(blaze_shell::view::TextRun {
+                x: px0 + 9.0,
+                y: py0 + 4.0,
+                text: shown,
+                color: theme::INK_2,
+                bold: false,
+                italic: false,
+                face: TextFace::UiSmall,
+                clip_id: 0,
+            });
+        }
+
         (master, tile_layout)
+    }
+
+    fn auto_split_axis(tile_layout: &TileLayout) -> SplitAxis {
+        tile_layout
+            .panes
+            .iter()
+            .find(|p| p.focused)
+            .map_or(SplitAxis::Vertical, |p| {
+                if (p.rect.x1 - p.rect.x0) >= (p.rect.y1 - p.rect.y0) {
+                    SplitAxis::Vertical
+                } else {
+                    SplitAxis::Horizontal
+                }
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_palette_action(
         action: PaletteAction,
         wm: &mut TileManager,
+        tile_layout: &TileLayout,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         font_points: &mut f64,
         zoom_changed: &mut bool,
@@ -1676,6 +1745,11 @@ mod macos_app {
         match action {
             PaletteAction::NewTab => {
                 let (_, new_pid) = wm.new_tab();
+                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::NewTiledPane => {
+                let new_pid = wm.split_focused(auto_split_axis(tile_layout));
                 panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
                 *pty_sizes_dirty = true;
             }
@@ -1859,6 +1933,227 @@ mod macos_app {
         app.setWindowsMenu(Some(&win_menu));
     }
 
+    enum ResizeEvent {
+        WillStartLiveResize,
+        FrameSize { size: NSSize, live: bool },
+        DidEndLiveResize,
+    }
+
+    thread_local! {
+        static RESIZE_HOOK: RefCell<Option<*mut dyn FnMut(ResizeEvent)>> = const { RefCell::new(None) };
+    }
+
+    fn dispatch_resize_event(ev: ResizeEvent) {
+        let ptr = RESIZE_HOOK.with(|c| c.borrow_mut().take());
+        if let Some(p) = ptr {
+            // SAFETY: `p` is installed on the main thread for the dynamic extent of an AppKit
+            // modal call via `with_resize_hook` and restored before returning; taking prevents
+            // re-entrant double-borrows if AppKit nests another layout call.
+            unsafe { (*p)(ev) };
+            RESIZE_HOOK.with(|c| *c.borrow_mut() = Some(p));
+        }
+    }
+
+    fn with_resize_hook<R>(f: &mut dyn FnMut(ResizeEvent), body: impl FnOnce() -> R) -> R {
+        struct Reset(Option<*mut dyn FnMut(ResizeEvent)>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RESIZE_HOOK.with(|c| *c.borrow_mut() = self.0);
+            }
+        }
+        // SAFETY: `f` outlives `body()` and `Reset::drop` unconditionally clears the thread-local
+        // hook before `f` can be invalidated (even across panics).
+        let raw: *mut dyn FnMut(ResizeEvent) = unsafe { std::mem::transmute(f) };
+        let prev = RESIZE_HOOK.with(|c| c.borrow_mut().replace(raw));
+        let _guard = Reset(prev);
+        body()
+    }
+
+    define_class!(
+        // SAFETY: `NSView` subclass with empty ivars on the main thread only; forwards to super.
+        #[unsafe(super(NSView, NSResponder, NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "BlazeMetalView"]
+        struct BlazeMetalView;
+
+        unsafe impl NSObjectProtocol for BlazeMetalView {}
+
+        impl BlazeMetalView {
+            #[unsafe(method(setFrameSize:))]
+            fn set_frame_size(&self, size: NSSize) {
+                // SAFETY: forwarding the same selector to `NSView`'s superclass implementation.
+                let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+                dispatch_resize_event(ResizeEvent::FrameSize { size, live: self.inLiveResize() });
+            }
+
+            #[unsafe(method(viewWillStartLiveResize))]
+            fn will_start_live_resize(&self) {
+                // SAFETY: forwarding to superclass.
+                let _: () = unsafe { msg_send![super(self), viewWillStartLiveResize] };
+                dispatch_resize_event(ResizeEvent::WillStartLiveResize);
+            }
+
+            #[unsafe(method(viewDidEndLiveResize))]
+            fn did_end_live_resize(&self) {
+                // SAFETY: forwarding to superclass.
+                let _: () = unsafe { msg_send![super(self), viewDidEndLiveResize] };
+                dispatch_resize_event(ResizeEvent::DidEndLiveResize);
+            }
+        }
+    );
+
+    impl BlazeMetalView {
+        fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(());
+            // SAFETY: calling `NSView`'s designated initializer `initWithFrame:` on main thread.
+            unsafe { msg_send![super(this), initWithFrame: frame] }
+        }
+    }
+
+    /// Synchronized Metal live-resize & external-resize handler (exact `den-native` protocol):
+    /// updates `CAMetalLayer`'s drawable size with implicit animations disabled, reflows the full
+    /// scene in place using pre-shaped text runs and path-keyed GPU images, and presents inside
+    /// the active CoreAnimation transaction (`presentsWithTransaction`) so window borders and text
+    /// move atomically with zero stretching, black gaps, or lag.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_resize_event(
+        ev: ResizeEvent,
+        window: &NSWindow,
+        layer: &CAMetalLayer,
+        renderer: &Renderer,
+        wm: &TileManager,
+        panes: &mut std::collections::HashMap<PaneId, ShellApp>,
+        fonts: &mut Fonts,
+        icon_atlas: &mut IconAtlas,
+        image_atlas: &mut ImageAtlas,
+        size: &mut NSSize,
+        scale: &mut f64,
+        font_points: f64,
+        anim_epoch: Instant,
+        has_animated_images: &mut bool,
+        tile_layout: &mut TileLayout,
+        composite_scene: &mut Scene,
+        pty_sizes_dirty: &mut bool,
+        dirty: &mut bool,
+        last_pty_sync: &mut Instant,
+    ) {
+        match ev {
+            ResizeEvent::WillStartLiveResize => {
+                layer.setPresentsWithTransaction(true);
+            }
+            ResizeEvent::DidEndLiveResize => {
+                layer.setPresentsWithTransaction(false);
+                *pty_sizes_dirty = true;
+                *dirty = true;
+            }
+            ResizeEvent::FrameSize { size: new_size, live } => {
+                if new_size.width < 40.0 || new_size.height < 40.0 || !window.isVisible() {
+                    return;
+                }
+                let new_scale = window.backingScaleFactor().max(1.0);
+                if (new_scale - *scale).abs() > f64::EPSILON {
+                    *scale = new_scale;
+                    *fonts = Fonts::new(font_points, *scale);
+                    *icon_atlas = IconAtlas::new(*scale * (font_points / FONT_POINTS));
+                    image_atlas.set_scale(*scale);
+                }
+                *size = new_size;
+                let px_w = (size.width * *scale).round().max(1.0);
+                let px_h = (size.height * *scale).round().max(1.0);
+                CATransaction::begin();
+                CATransaction::setDisableActions(true);
+                layer.setContentsScale(*scale);
+                layer.setDrawableSize(NSSize::new(px_w, px_h));
+                CATransaction::commit();
+
+                if !live {
+                    layer.setPresentsWithTransaction(true);
+                }
+
+                let metrics = fonts.cell_metrics(*scale);
+                let cursor_vis = window.isKeyWindow();
+                let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
+                let (mut scene, next_tl) = build_window_scene(
+                    wm,
+                    panes,
+                    size.width as f32,
+                    size.height as f32,
+                    metrics,
+                    cursor_vis,
+                    now_ns(),
+                    zoom_pct,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                *tile_layout = next_tl;
+
+                if !live || last_pty_sync.elapsed().as_millis() >= 50 {
+                    sync_pty_sizes(panes, tile_layout, fonts, *scale);
+                    *last_pty_sync = Instant::now();
+                    *pty_sizes_dirty = false;
+                } else {
+                    *pty_sizes_dirty = true;
+                }
+
+                let vh = size.height as f32;
+                let glyphs = fonts.rasterize_runs(&scene.text_runs, *scale, vh);
+                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, *scale, vh);
+                for (slot, bytes) in fonts.pending.drain(..) {
+                    renderer.upload(slot, &bytes);
+                }
+                let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
+                for (slot, rgba) in icon_atlas.pending.drain(..) {
+                    renderer.upload_icon(slot, &rgba);
+                }
+                let anim_ms = anim_epoch.elapsed().as_millis() as u64;
+                let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms, vh);
+                *has_animated_images = any_anim;
+                image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
+
+                let vp = ViewportUniform {
+                    size: [size.width as f32, size.height as f32],
+                    dpr: *scale as f32,
+                    time: 0.0,
+                };
+                let frame = FrameDraw {
+                    vp,
+                    clear: scene.clear_color,
+                    clips: &scene.clips,
+                    rects: &scene.rects,
+                    glyphs: &glyphs,
+                    icons: &icons,
+                    images: &images,
+                    over_rects: &scene.over_rects,
+                    overlay_rects: &scene.overlay_rects,
+                    overlay_icons: &overlay_icons,
+                    overlay_glyphs: &overlay_glyphs,
+                };
+                renderer.draw(layer, &frame);
+                if !live {
+                    CATransaction::flush();
+                    layer.setPresentsWithTransaction(false);
+                }
+                scene.rects.clear();
+                scene.icon_quads.clear();
+                scene.image_quads.clear();
+                scene.over_rects.clear();
+                scene.overlay_rects.clear();
+                scene.overlay_icons.clear();
+                scene.overlay_text.clear();
+                *composite_scene = scene;
+                *dirty = false;
+            }
+        }
+    }
+
     pub fn run() {
         let cli = parse_cli();
 
@@ -1920,13 +2215,28 @@ mod macos_app {
             use objc2_app_kit::NSAppearanceCustomization as _;
             window.setAppearance(Some(&app_dark));
         }
-        let view = window.contentView().expect("window contentView");
+        let view = BlazeMetalView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(init_w, init_h)));
+        window.setContentView(Some(&view));
 
         let renderer = Renderer::new(MTLCreateSystemDefaultDevice().expect("no Metal GPU device"));
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(renderer.device()));
         layer.setPixelFormat(PIXEL_FORMAT);
         layer.setFramebufferOnly(true);
+        // Disable implicit CoreAnimation stretch/fade actions and anchor contents top-left
+        // (matching `den-native`) so window resizes never stretch old frames or flash white.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        // SAFETY: `kCAGravityTopLeft` is a valid QuartzCore static NSString constant.
+        layer.setContentsGravity(unsafe { kCAGravityTopLeft });
+        let ground = CGColor::new_srgb(
+            0x10 as f64 / 255.0,
+            0x10 as f64 / 255.0,
+            0x11 as f64 / 255.0,
+            1.0,
+        );
+        layer.setBackgroundColor(Some(&ground));
+        CATransaction::commit();
         view.setLayer(Some(&layer));
         view.setWantsLayer(true);
 
@@ -1964,9 +2274,14 @@ mod macos_app {
         }
         if let Some(ref startup_cmd) = cli.cmd {
             first_pane.submit_command(startup_cmd, init_cols, init_rows, cell_px, false);
-            if !cli.scroll_bottom {
+            if let Some(sy) = cli.scroll_y {
+                first_pane.scroll_y = sy.max(0.0);
+                first_pane.auto_scroll_bottom = false;
+                first_pane.scroll_to_block = None;
+            } else if !cli.scroll_bottom {
                 first_pane.scroll_y = 0.0;
                 first_pane.auto_scroll_bottom = false;
+                first_pane.scroll_to_block = None;
             }
         }
         let demo_cwd = first_pane.cwd().to_owned();
@@ -2025,8 +2340,9 @@ mod macos_app {
                 None,
                 None,
             );
-            let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
-            let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale);
+            let vh = size.height as f32;
+            let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
+            let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale, vh);
             for (slot, bytes) in fonts.pending.drain(..) {
                 renderer.upload(slot, &bytes);
             }
@@ -2035,10 +2351,8 @@ mod macos_app {
             for (slot, rgba) in icon_atlas.pending.drain(..) {
                 renderer.upload_icon(slot, &rgba);
             }
-            let images = image_atlas.rasterize_quads(&scene.image_quads);
-            for (slot, rgba) in image_atlas.pending.drain(..) {
-                renderer.upload_image(slot, &rgba);
-            }
+            let (images, _) = image_atlas.rasterize_quads(&scene.image_quads, 0, vh);
+            image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
             let vp = ViewportUniform {
                 size: [size.width as f32, size.height as f32],
                 dpr: scale as f32,
@@ -2078,6 +2392,9 @@ mod macos_app {
         let mut trail_prev: Option<[f32; 4]> = None;
         let mut trail_start: Option<Instant> = None;
         let mut last_running_tick = Instant::now();
+        let mut last_anim_tick = Instant::now();
+        let mut has_animated_images = false;
+        let anim_epoch = Instant::now();
         let mut pending_drag: Option<PendingDrag> = None;
         let mut selecting_composer = false;
         let mut selecting_output = false;
@@ -2088,7 +2405,9 @@ mod macos_app {
         let mut zoom_changed = false;
         let mut cur_cursor = CursorKind::Arrow;
         let mut last_mouse: Option<(f32, f32)> = None;
+        let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
+        let mut last_pty_sync = Instant::now();
 
         loop {
             let mut quit = false;
@@ -2096,12 +2415,51 @@ mod macos_app {
                 // SAFETY: `NSDefaultRunLoopMode` is a valid Foundation static string.
                 let mode = unsafe { NSDefaultRunLoopMode };
                 let until = NSDate::dateWithTimeIntervalSinceNow(if dirty { 0.0 } else { 0.008 });
-                while let Some(ev) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                    NSEventMask::Any,
-                    Some(&until),
-                    mode,
-                    true,
-                ) {
+                let mut events: Vec<Retained<NSEvent>> = Vec::with_capacity(8);
+                {
+                    let mut on_resize = |rev: ResizeEvent| {
+                        handle_resize_event(
+                            rev,
+                            &window,
+                            &layer,
+                            &renderer,
+                            &wm,
+                            &mut panes,
+                            &mut fonts,
+                            &mut icon_atlas,
+                            &mut image_atlas,
+                            &mut size,
+                            &mut scale,
+                            font_points,
+                            anim_epoch,
+                            &mut has_animated_images,
+                            &mut tile_layout,
+                            &mut composite_scene,
+                            &mut pty_sizes_dirty,
+                            &mut dirty,
+                            &mut last_pty_sync,
+                        );
+                    };
+                    with_resize_hook(&mut on_resize, || {
+                        if let Some(first) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                            NSEventMask::Any,
+                            Some(&until),
+                            mode,
+                            true,
+                        ) {
+                            events.push(first);
+                            while let Some(more) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                                NSEventMask::Any,
+                                None,
+                                mode,
+                                true,
+                            ) {
+                                events.push(more);
+                            }
+                        }
+                    });
+                }
+                for ev in events {
                     match ev.r#type() {
                         NSEventType::KeyDown if window.isKeyWindow() => {
                             let flags = ev.modifierFlags();
@@ -2156,6 +2514,7 @@ mod macos_app {
                                         run_palette_action(
                                             act,
                                             &mut wm,
+                                            &tile_layout,
                                             &mut panes,
                                             &mut font_points,
                                             &mut zoom_changed,
@@ -2199,13 +2558,24 @@ mod macos_app {
                             }
 
                             if flags.contains(NSEventModifierFlags::Command) {
-                                // 1. `Cmd+N`: new native macOS window inheriting focused pane's cwd.
+                                // 1. `Cmd+N`: auto-tile a new pane internally along the focused pane's
+                                //    longer axis (BSP spiral); `Cmd+Shift+N` spawns a separate OS window.
                                 if key == Key::KeyN && !ctrl && !alt {
                                     let cwd = panes
                                         .get(&wm.focused_pane())
                                         .map(|p| p.cwd().to_owned())
                                         .unwrap_or_else(|| "/".to_owned());
-                                    spawn_new_window(&cwd);
+                                    if shift {
+                                        spawn_new_window(&cwd);
+                                    } else {
+                                        let new_pid = wm.split_focused(auto_split_axis(&tile_layout));
+                                        panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                        active_popover = None;
+                                        output_selection = None;
+                                        output_nav = None;
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                    }
                                     continue;
                                 }
                                 // 2. `Cmd+T`: new workspace tab inheriting focused pane's cwd.
@@ -3289,6 +3659,7 @@ mod macos_app {
                                     run_palette_action(
                                         act,
                                         &mut wm,
+                                        &tile_layout,
                                         &mut panes,
                                         &mut font_points,
                                         &mut zoom_changed,
@@ -3620,6 +3991,74 @@ mod macos_app {
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
                                         }
+                                        HitAction::CopyText(txt) => {
+                                            copy_to_pasteboard(&txt);
+                                        }
+                                        HitAction::OpenLink { href, base_dir } => {
+                                            active_popover = None;
+                                            let trimmed = href.trim();
+                                            if let Some(frag) = trimmed.strip_prefix('#') {
+                                                let needle = frag.to_ascii_lowercase();
+                                                if let Some(&(_, ay)) = composite_scene
+                                                    .anchors
+                                                    .iter()
+                                                    .rev()
+                                                    .find(|(slug, _)| slug == &needle)
+                                                {
+                                                    let pane_top = tile_layout
+                                                        .panes
+                                                        .iter()
+                                                        .find(|p| p.focused)
+                                                        .map_or(TOP_BAR_H, |p| p.rect.y0);
+                                                    shell.scroll_y = (shell.scroll_y
+                                                        + (ay - (pane_top + 16.0)))
+                                                        .max(0.0);
+                                                    shell.auto_scroll_bottom = false;
+                                                    shell.scroll_to_block = None;
+                                                    dirty = true;
+                                                }
+                                            } else if trimmed.starts_with("http://")
+                                                || trimmed.starts_with("https://")
+                                                || trimmed.starts_with("mailto:")
+                                            {
+                                                let _ = std::process::Command::new("/usr/bin/open")
+                                                    .arg(trimmed)
+                                                    .spawn();
+                                            } else if !trimmed.is_empty() {
+                                                let path_part =
+                                                    trimmed.split('#').next().unwrap_or(trimmed);
+                                                let rel = std::path::Path::new(path_part);
+                                                let resolved = if rel.is_absolute() {
+                                                    rel.to_path_buf()
+                                                } else if !base_dir.is_empty() {
+                                                    std::path::Path::new(&base_dir).join(rel)
+                                                } else {
+                                                    std::path::Path::new(shell.cwd()).join(rel)
+                                                };
+                                                let disp = resolved
+                                                    .strip_prefix(shell.cwd())
+                                                    .unwrap_or(&resolved)
+                                                    .to_string_lossy()
+                                                    .into_owned();
+                                                let quoted = if disp.contains(' ') {
+                                                    format!("\"{disp}\"")
+                                                } else {
+                                                    disp
+                                                };
+                                                let cmd = if resolved.is_dir() {
+                                                    format!("ls -l {quoted}")
+                                                } else {
+                                                    format!("open {quoted}")
+                                                };
+                                                let (cols, rows) = grid_for(size, &fonts, scale);
+                                                let cpx = (
+                                                    fonts.metrics.cell_w as u32,
+                                                    fonts.metrics.cell_h as u32,
+                                                );
+                                                shell.submit_command(&cmd, cols, rows, cpx, false);
+                                                dirty = true;
+                                            }
+                                        }
                                         HitAction::SwitchTab(_)
                                         | HitAction::NewTab
                                         | HitAction::CloseTab(_)
@@ -3793,6 +4232,15 @@ mod macos_app {
                                     }
                                 } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
                                     active_popover = None;
+                                    dirty = true;
+                                }
+
+                                let hovered_link = match composite_scene.hit_test(x, y) {
+                                    Some(HitAction::OpenLink { href, .. }) => Some(href),
+                                    _ => None,
+                                };
+                                if hovered_link != last_hovered_link {
+                                    last_hovered_link = hovered_link;
                                     dirty = true;
                                 }
 
@@ -4018,9 +4466,59 @@ mod macos_app {
                         }
                         _ => {}
                     }
-                    app.sendEvent(&ev);
+                    let mut on_resize = |rev: ResizeEvent| {
+                        handle_resize_event(
+                            rev,
+                            &window,
+                            &layer,
+                            &renderer,
+                            &wm,
+                            &mut panes,
+                            &mut fonts,
+                            &mut icon_atlas,
+                            &mut image_atlas,
+                            &mut size,
+                            &mut scale,
+                            font_points,
+                            anim_epoch,
+                            &mut has_animated_images,
+                            &mut tile_layout,
+                            &mut composite_scene,
+                            &mut pty_sizes_dirty,
+                            &mut dirty,
+                            &mut last_pty_sync,
+                        );
+                    };
+                    with_resize_hook(&mut on_resize, || {
+                        app.sendEvent(&ev);
+                    });
                 }
-                app.updateWindows();
+                let mut on_resize = |rev: ResizeEvent| {
+                    handle_resize_event(
+                        rev,
+                        &window,
+                        &layer,
+                        &renderer,
+                        &wm,
+                        &mut panes,
+                        &mut fonts,
+                        &mut icon_atlas,
+                        &mut image_atlas,
+                        &mut size,
+                        &mut scale,
+                        font_points,
+                        anim_epoch,
+                        &mut has_animated_images,
+                        &mut tile_layout,
+                        &mut composite_scene,
+                        &mut pty_sizes_dirty,
+                        &mut dirty,
+                        &mut last_pty_sync,
+                    );
+                };
+                with_resize_hook(&mut on_resize, || {
+                    app.updateWindows();
+                });
             });
 
             // Distinguish user-closed window from `Cmd+H` (app hidden) or `Cmd+M` (minimized to Dock)
@@ -4158,6 +4656,14 @@ mod macos_app {
                 last_running_tick = Instant::now();
                 dirty = true;
             }
+            if has_animated_images
+                && !is_hidden_or_min
+                && last_anim_tick.elapsed().as_millis() >= 15
+                && image_atlas.has_ready_animation_frame(anim_epoch.elapsed().as_millis() as u64)
+            {
+                last_anim_tick = Instant::now();
+                dirty = true;
+            }
 
             // Handle window resize, backing scale changes, and `Cmd+`/`Cmd-`/`Cmd+0` zoom.
             let new_size = view.bounds().size;
@@ -4248,8 +4754,9 @@ mod macos_app {
                 }
                 last_cursor_rect = scene.cursor_rect;
 
-                let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
-                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale);
+                let vh = size.height as f32;
+                let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
+                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale, vh);
                 for (slot, bytes) in fonts.pending.drain(..) {
                     renderer.upload(slot, &bytes);
                 }
@@ -4258,10 +4765,10 @@ mod macos_app {
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
                 }
-                let images = image_atlas.rasterize_quads(&scene.image_quads);
-                for (slot, rgba) in image_atlas.pending.drain(..) {
-                    renderer.upload_image(slot, &rgba);
-                }
+                let anim_ms = anim_epoch.elapsed().as_millis() as u64;
+                let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms, vh);
+                has_animated_images = any_anim;
+                image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
                 let vp = ViewportUniform {
                     size: [size.width as f32, size.height as f32],
                     dpr: scale as f32,
