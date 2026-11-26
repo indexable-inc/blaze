@@ -444,8 +444,8 @@ pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: 
         let to_text = joined(&area_rel, &hex64(&sha256));
         let to = bstd::path::Path::new(&to_text).map_err(|_| named(format!("{to_text}: not a relative path")))?;
         match root.stat(&cx, &to).map_err(|e| named(e.to_string()))? {
-            Some(_) => stored.present += 1,
-            None => root.rename_replacing_unsynced(&cx, &from, &to, bstd::fs::Unsynced::No).map_err(|e| named(format!("renamed into the file area {area}: {e}")))?,
+            Some(meta) if !meta.dir && meta.len == file.len => stored.present += 1,
+            _ => root.rename_replacing_unsynced(&cx, &from, &to, bstd::fs::Unsynced::No).map_err(|e| named(format!("renamed into the file area {area}: {e}")))?,
         }
         let mode = if file.executable { FileMode::Executable } else { FileMode::Plain };
         outputs.add_stored(&file.name, at, mode, sha256, limits, alloc).map_err(|e| named(format!("{e:?}")))?;

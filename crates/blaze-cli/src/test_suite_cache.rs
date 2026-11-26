@@ -185,9 +185,7 @@ impl<'h> LazyVerifyingMaker<'_, 'h> {
     fn ensure_maker(&mut self) -> Result<&mut RunMaker<'h>, LadderRunError> {
         let want = MakerKind::of(self.entry, self.start);
         let maker = self.maker.get_or_insert_with(|| {
-            let mut maker = Maker::of_start(self.names, self.entry, self.start, ByKind::new(self.typed.over(self.ids)), self.builder, self.tables);
-            maker.watch(self.make_watch);
-            maker
+            Maker::of_start(self.names, self.entry, self.start, ByKind::new(self.typed.over(self.ids)), self.builder, Some(self.make_watch), self.tables)
         });
         if maker.made_for() != want
             || (matches!(self.start, MakerStart::Direct(_)) && !maker.set_direct_entry(self.entry, self.start))

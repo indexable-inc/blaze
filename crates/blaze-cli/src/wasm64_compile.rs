@@ -1718,6 +1718,7 @@ fn emit_wasm64_from_records<'n>(
                 &roots,
                 SecondCheck,
                 &builder,
+                Some(crate::run_parent::command_make_watch()),
                 heap_alloc,
             );
             let opts = Wasm64BuildOpts {
@@ -1775,6 +1776,7 @@ fn emit_wasm64_from_records<'n>(
                 MakerStart::Direct(expand_lib),
                 SecondCheck,
                 &builder,
+                Some(crate::run_parent::command_make_watch()),
                 heap_alloc,
             );
             let exports = [

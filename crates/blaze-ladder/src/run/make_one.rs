@@ -153,9 +153,9 @@ pub const MAKE_REPORT_BYTES: u64 = 1 << 20;
 pub const MAKE_REPORT_TIME: core::time::Duration = core::time::Duration::from_secs(1);
 
 /// What a maker reports its large or slow makes with: the clock the make's times are read on,
-/// and where each [`MakeSizes`] goes (the parent prints it, one line to stderr). Handed in
-/// ([`Maker::watch`]; rule 75: no clock and no output of its own); without it, no make is
-/// timed and none reported.
+/// and where each [`MakeSizes`] goes (the parent prints it, one line to stderr). Handed in at
+/// construction ([`Maker::of_roots`] / [`Maker::of_start`]; rule 75: no clock and no output of
+/// its own); with `None`, no make is timed and none reported.
 #[derive(Clone, Copy)]
 pub struct MakeWatch<'n> {
     pub clock: blaze_core::wait::Monotonic,
@@ -962,8 +962,14 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     state.work.times = MakeTimes::default();
     state.work.reported = None;
     make_instance_timed(program, typing, state, checks, tabled, name, entry)?;
-    // The make's report, when it was large or slow (rule 16): its times split, the checks and
-    // pulls (`lower`) being what the builds and emits leave of the whole.
+    finish_make_timing(state, made_from);
+    Ok(())
+}
+
+/// Records the make's [`MakeSizes`] report when it was large or slow (rule 16): its times split,
+/// with checks and constant pulls (`lower`) being what builds and emits leave of the whole.
+fn finish_make_timing(state: &mut MakerState, made_from: Option<core::time::Duration>) {
+    use blaze_core::wait::Clock as _;
     if let (Some(c), Some(from)) = (state.work.clock, made_from) {
         let took = c.now().saturating_sub(from);
         let times = core::mem::take(&mut state.work.times);
@@ -975,7 +981,6 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
             state.work.reported = Some(MakeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code, lower, build: times.build, emit: times.emit });
         }
     }
-    Ok(())
 }
 
 /// [`make_instance`]'s work, timed by it.
@@ -2520,6 +2525,9 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
             lir_tls.extend_from_slice(&built.thread_locals);
             let mut lir_traps: blaze_own::Vec<blaze_code::record::TrapSource, A> = blaze_own::Vec::with_capacity_in(built.traps.len(), out_alloc);
             lir_traps.extend_from_slice(&built.traps);
+            if work.clock.is_some() {
+                work.times.last = Some(MadeSizes::of(name(), built, &[]));
+            }
             **out = Some(BuiltLir {
                 func: built.func.view().to_func_in(out_alloc),
                 funcs: lir_funcs,
@@ -2997,7 +3005,7 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     panic: blaze_build::Panic,
     alloc: Alloc<'static>,
     checks: CheckCount,
-    /// Where a large or slow make is reported ([`Maker::watch`]); `None`: nowhere, untimed.
+    /// Where a large or slow make is reported (passed at construction); `None`: nowhere, untimed.
     watch: Option<MakeWatch<'n>>,
     /// How its builds record their read lists ([`Maker::plant_reads`]): `ReadPlant::None` but
     /// in the planted control.
@@ -3012,18 +3020,18 @@ impl<'n> Maker<'n, Fixture, SecondCheck> {
     /// tables live in (`Store::new`, `MakerState`). Cheap: reads, resolves and checks nothing.
     ///
     /// Its program starts by THE start rule (`MakerStart::ByRule`): a program's run, for this
-    /// crate's walks (`Fixture`), each body checked in the make. A parent whose roots name
-    /// another start takes [`Maker::of_roots`]; a walk reading another typing,
+    /// crate's walks (`Fixture`), each body checked in the make, untimed. A parent whose roots
+    /// name another start takes [`Maker::of_roots`]; a walk reading another typing,
     /// [`Maker::typed`].
     pub fn new(names: NamesRecords<'n>, entry: Option<ItemKey>, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
-        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, SecondCheck, builder, alloc)
+        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, SecondCheck, builder, None, alloc)
     }
 }
 
 impl<'n, T: Typing<RecordsProgram<'n>>> Maker<'n, Fixture, T> {
     /// [`Maker::new`] with the body's checked columns from `typing`: the oracle's two sides.
     pub fn typed(names: NamesRecords<'n>, entry: Option<ItemKey>, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, Fixture, T> {
-        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, typing, builder, alloc)
+        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, typing, builder, None, alloc)
     }
 }
 
@@ -3031,10 +3039,19 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// The maker for the roots a front handed (run/special.rs `Roots`): `entry` as [`Maker::new`]
     /// takes it, and the program's start the roots' own (`Roots::maker_start`): `blaze run`'s
     /// roots start by the rule, a test's at its fn. The one way the lazy parent makes a maker.
-    /// `typing`: where each body's checked columns come from (production: [`SecondCheck`]
-    /// until the check keeps its typed record; then [`FromRecord`]).
-    pub fn of_roots(names: NamesRecords<'n>, entry: Option<ItemKey>, roots: &crate::run::special::Roots<'_>, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
-        Self::starting(names, entry, roots.maker_start, typing, builder, alloc)
+    /// `typing`: where each body's checked columns come from (production: [`ByKind`]).
+    /// `watch`: where large or slow makes are reported (`Some(MakeWatch)` in production so
+    /// slow codegen is never silent, rule 16; `None` in untimed test fixtures).
+    pub fn of_roots(
+        names: NamesRecords<'n>,
+        entry: Option<ItemKey>,
+        roots: &crate::run::special::Roots<'_>,
+        typing: T,
+        builder: &Builder,
+        watch: Option<MakeWatch<'n>>,
+        alloc: Alloc<'static>,
+    ) -> Maker<'n, G, T> {
+        Self::starting(names, entry, roots.maker_start, typing, builder, watch, alloc)
     }
 
     /// [`Maker::of_roots`] for the `entry` and `start` read off those roots beforehand
@@ -3042,8 +3059,16 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// test_drive.rs `CodePool`, D194: a code worker's maker over its own names records, for the
     /// start the asking test's roots said), so its roots are not made again. Equal to `of_roots`
     /// over roots whose `maker_start` is `start`: that one reads nothing else of them.
-    pub fn of_start(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
-        Self::starting(names, entry, start, typing, builder, alloc)
+    pub fn of_start(
+        names: NamesRecords<'n>,
+        entry: Option<ItemKey>,
+        start: crate::run::special::MakerStart,
+        typing: T,
+        builder: &Builder,
+        watch: Option<MakeWatch<'n>>,
+        alloc: Alloc<'static>,
+    ) -> Maker<'n, G, T> {
+        Self::starting(names, entry, start, typing, builder, watch, alloc)
     }
 
     /// Which start class this maker was made for (`MakerKind::ByRule(entry)` or
@@ -3091,7 +3116,15 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         }
     }
 
-    fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
+    fn starting(
+        names: NamesRecords<'n>,
+        entry: Option<ItemKey>,
+        start: crate::run::special::MakerStart,
+        typing: T,
+        builder: &Builder,
+        watch: Option<MakeWatch<'n>>,
+        alloc: Alloc<'static>,
+    ) -> Maker<'n, G, T> {
         Maker {
             typing,
             grant: core::marker::PhantomData,
@@ -3107,7 +3140,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             panic: crate::panic_strategy::of_strategy(builder.settings.panic),
             alloc,
             checks: CheckCount::default(),
-            watch: None,
+            watch,
             plant: ReadPlant::None,
         }
     }
@@ -3119,16 +3152,6 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             state.plant_reads(plant);
         }
         self.plant = plant;
-    }
-
-    /// Every later make timed on `watch.clock`, and each that is large or slow (its code or
-    /// estimated frame at least [`MAKE_REPORT_BYTES`], or its make at least
-    /// [`MAKE_REPORT_TIME`]) handed to `watch.report` as its [`MakeSizes`] (rule 16).
-    pub fn watch(&mut self, watch: MakeWatch<'n>) {
-        if let Some((_, state)) = self.made.as_mut() {
-            state.time_on(watch.clock);
-        }
-        self.watch = Some(watch);
     }
 
     /// Whether an instance made in this session touched a thread-local. A FOUND record's use of
@@ -3261,9 +3284,17 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::build_lir`)" });
         };
+        use blaze_core::wait::Clock as _;
+        let made_from = state.work.clock.map(|c| c.now());
+        state.work.times = MakeTimes::default();
+        state.work.reported = None;
         let mut out: Option<BuiltLir<A>> = None;
         let mut sink = BuildSink::Lir { alloc, out: &mut out, declared };
         run_instance_loop(program, &mut self.typing, state, &mut self.checks, tabled, name, &mut sink)?;
+        finish_make_timing(state, made_from);
+        if let (Some(watch), Some(sizes)) = (self.watch, state.take_report()) {
+            (watch.report)(&sizes);
+        }
         out.ok_or(RunError::OneBody { key: tabled, why: "the LIR build completed without producing a body (make_one.rs `Maker::build_lir`)" })
     }
 

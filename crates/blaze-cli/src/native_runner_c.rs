@@ -497,26 +497,17 @@ fn built_stored_files_present(home: Option<&str>, payload: &[u8], alloc: Alloc<'
     let Some(home) = home else {
         return false;
     };
-    let mut path = String::new_in(alloc);
-    path.push_str(home);
-    path.push('/');
-    path.push_str(crate::scripts::STORE_UNDER_HOME);
-    path.push('/');
-    path.push_str(blaze_build_script::outputs::FILE_AREA);
-    path.push('/');
-    let prefix_len = path.len();
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for file in core::iter::once(first).chain(stored) {
-        path.truncate(prefix_len);
-        for &b in file.sha256 {
-            path.push(HEX[usize::from(b >> 4)] as char);
-            path.push(HEX[usize::from(b & 15)] as char);
-        }
-        if !std::fs::metadata(path.as_str()).is_ok_and(|m| m.is_file() && m.len() == file.len) {
-            return false;
-        }
-    }
-    true
+    let mut area_folder = String::new_in(alloc);
+    area_folder.push_str(home);
+    area_folder.push('/');
+    area_folder.push_str(crate::scripts::STORE_UNDER_HOME);
+    area_folder.push('/');
+    area_folder.push_str(blaze_build_script::outputs::FILE_AREA);
+    let area = blaze_proc_macro::native_c::FileArea { folder: area_folder.as_str() };
+    use blaze_build_script::c_tasks::{Area as _, FileRef};
+    core::iter::once(first)
+        .chain(stored)
+        .all(|file| area.verify(FileRef { sha256: *file.sha256, len: file.len }).is_some())
 }
 
 /// What the image holds for its readers' `links` trees (engine_native.rs `image_for`): every

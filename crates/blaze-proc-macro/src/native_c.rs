@@ -259,7 +259,7 @@ impl Area for FileArea<'_> {
         let file = FileRef { sha256: sha.finish(), len: bytes.len() as u64 };
         let mut at = [0u8; PATH_MOST];
         let at = self.path(&file.sha256, "", &mut at)?;
-        if std::fs::metadata(at).is_ok() {
+        if std::fs::metadata(at).is_ok_and(|meta| meta.is_file() && meta.len() == file.len) {
             return Ok(file);
         }
         // Written beside its name, then renamed: a reader never sees part of it.
