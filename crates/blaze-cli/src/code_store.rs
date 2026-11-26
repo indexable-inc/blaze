@@ -28,10 +28,14 @@
 use core::cell::RefCell;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace};
+use blaze_cas::plain::{CommittedLend, INDEX_KEYS_MOST, Lent, LentError, Namespace};
 use blaze_core::Driver;
+use blaze_hash::{BuildKeyHasher, Map, MapOpts};
+use blaze_ids::ContentId;
 use blaze_keyed::kind::ReservedTag;
+use blaze_keyed::store::Put;
 use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, StoreError};
+use blaze_own::Vec as OwnVec;
 
 use crate::store::plain_place::{COMMIT_BYTES, StoreAlloc};
 
@@ -56,6 +60,23 @@ pub(crate) struct HomeCodeStore<'m, D: Driver> {
     reached: RefCell<std::vec::Vec<CasKey, StoreAlloc>>,
     /// The toolchain-class keys this run wrote: entries and pointers with their targets.
     toolchain: std::vec::Vec<CasKey, StoreAlloc>,
+    /// Generation of `lent` when this handle was opened: if no mid-walk commit or external flip
+    /// moved past it, `ensure_persisted` takes an O(1) fast path.
+    opened_gen: u64,
+    /// Code entries already read from `lent` (or confirmed present via committed `Put::Same`)
+    /// during this command, borrowing `lent`'s immutable segment mmaps / kept arenas directly
+    /// with zero payload copies. Prevents a mid-command `lent.commit()` that adopts a newer
+    /// manifest (after concurrent `blaze gc` swept an unrooted pre-existing segment) from making
+    /// an already-stepped entry disappear (`MissingEntry`) before the command finishes reading it,
+    /// and enables [`HomeCodeStore::ensure_persisted`] to rewrite any swept entry before rooting.
+    lent_entries: RefCell<Map<[u8; 32], &'m [u8], BuildKeyHasher, StoreAlloc>>,
+    /// Pointer associations (`code_key -> content_key`) observed or written during this command so
+    /// [`HomeCodeStore::ensure_persisted`] can rewrite any swept pointer before `keep_program`
+    /// roots it.
+    lent_pointers: RefCell<Map<[u8; 32], CasKey, BuildKeyHasher, StoreAlloc>>,
+    /// Test-only switch for the DST planted-bug control (`SkipLentEntries`).
+    #[cfg(test)]
+    use_lent_entries: bool,
 }
 
 /// The most keys one run's code may reach: one index's (blaze-cas `INDEX_KEYS_MOST`); one more
@@ -65,7 +86,99 @@ const REACHED_MOST: usize = INDEX_KEYS_MOST;
 impl<'m, D: Driver> HomeCodeStore<'m, D> {
     pub(crate) fn new(lent: &'m Lent<D, StoreAlloc>) -> HomeCodeStore<'m, D> {
         let alloc = *lent.alloc();
-        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(alloc)), toolchain: std::vec::Vec::new_in(alloc) }
+        let opened_gen = lent.generation();
+        let lent_entries = RefCell::new(Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }));
+        let lent_pointers = RefCell::new(Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }));
+        HomeCodeStore {
+            lent,
+            commits: 0,
+            opened_gen,
+            reached: RefCell::new(std::vec::Vec::new_in(alloc)), toolchain: std::vec::Vec::new_in(alloc),
+            lent_entries,
+            lent_pointers,
+            #[cfg(test)]
+            use_lent_entries: true,
+        }
+    }
+
+    /// Test-only control (rule 23): disables `lent_entries` lookup so the DST oracle proves
+    /// mid-walk manifest adoption after concurrent GC causes `MissingEntry` without it.
+    #[cfg(test)]
+    pub(crate) fn disable_lent_entries_for_test(&mut self) {
+        self.use_lent_entries = false;
+    }
+
+    /// Ensures every cached content entry and pointer observed by this handle is still present in
+    /// `lent`'s current manifest (or uncommitted arena under the active lease) before the caller
+    /// persists closing roots (`keep_program` / `keep_toolchain`).
+    ///
+    /// Fast path: when neither this process nor any concurrent writer flipped since `HomeCodeStore::new`,
+    /// returns `Ok(0)` after a single 64-byte `head` generation check. When a concurrent GC swept
+    /// a pre-existing unrooted segment and a mid-walk or sync commit adopted that manifest, rewrites
+    /// every swept content record (from `lent`'s immutable mmaps in `lent_entries`) and its pointer
+    /// association (`lent_pointers`) in deterministic key order under the active lease so the
+    /// closing root never has holes.
+    pub(crate) fn ensure_persisted(&mut self) -> Result<usize, StoreError> {
+        let sentinel = CodeKey(ContentId([0; 32]));
+        if self.lent.generation() == self.opened_gen {
+            let disk_gen = self.lent.head_generation_on_disk().map_err(|error| refused(sentinel, &error))?;
+            if disk_gen == self.opened_gen {
+                return Ok(0);
+            }
+            if self.lent.needs_commit() {
+                self.lent.commit().map_err(|error| refused(sentinel, &error))?;
+                self.commits += 1;
+            }
+        }
+        if self.lent.generation() == self.opened_gen {
+            return Ok(0);
+        }
+        let alloc = *self.lent.alloc();
+        let mut entries: OwnVec<([u8; 32], &'m [u8]), StoreAlloc> = OwnVec::with_capacity_in(self.lent_entries.borrow().len(), alloc);
+        for (&raw, &bytes) in self.lent_entries.borrow().iter() {
+            entries.push((raw, bytes));
+        }
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut restored = 0usize;
+        for (raw, bytes) in entries {
+            let cas = CasKey(ContentId(raw));
+            let code = CodeKey(ContentId(raw));
+            match self.lent.tag_of(&cas).map_err(|error| refused(code, &error))? {
+                Some(tag) if ReservedTag::Code.is(tag) => {}
+                Some(_) => return Err(StoreError::Failed { key: code, what: "a record under a code key is filed under another tag than ReservedTag::Code: not a code entry" }),
+                None => {
+                    if self.lent.uncommitted_bytes() > COMMIT_BYTES {
+                        self.lent.commit().map_err(|error| refused(code, &error))?;
+                        self.commits += 1;
+                    }
+                    self.lent.put(&cas, Namespace::LOCAL, ReservedTag::Code.tag(), bytes).map_err(|error| refused(code, &error))?;
+                    restored += 1;
+                }
+            }
+        }
+        let mut pointers: OwnVec<([u8; 32], CasKey), StoreAlloc> = OwnVec::with_capacity_in(self.lent_pointers.borrow().len(), alloc);
+        for (&raw, &target) in self.lent_pointers.borrow().iter() {
+            pointers.push((raw, target));
+        }
+        pointers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (raw, target) in pointers {
+            let cas = CasKey(ContentId(raw));
+            let code = CodeKey(ContentId(raw));
+            let needs_point = match self.lent.pointed(ReservedTag::Code.tag(), &cas) {
+                Ok(Some(cur)) if cur == target => false,
+                Ok(Some(_)) | Ok(None) | Err(LentError::TargetGone { .. }) => true,
+                Err(error) => return Err(refused(code, &error)),
+            };
+            if needs_point {
+                if self.lent.uncommitted_bytes() > COMMIT_BYTES {
+                    self.lent.commit().map_err(|error| refused(code, &error))?;
+                    self.commits += 1;
+                }
+                self.lent.point(ReservedTag::Code.tag(), &cas, &target).map_err(|error| refused(code, &error))?;
+                restored += 1;
+            }
+        }
+        Ok(restored)
     }
 
     /// The toolchain-class keys this run wrote, sorted, each once (the toolchain root's new
@@ -134,10 +247,18 @@ fn refused(key: CodeKey, error: &LentError) -> StoreError {
 
 impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
+        #[cfg(test)]
+        let use_cache = self.use_lent_entries;
+        #[cfg(not(test))]
+        let use_cache = true;
+        if use_cache && let Some(&bytes) = self.lent_entries.borrow().get(&key.0.0) {
+            return Ok(Some(bytes));
+        }
         match self.lent.get(&CasKey(key.0)) {
             Ok(None) => Ok(None),
             Ok(Some(lend)) if ReservedTag::Code.is(lend.tag) => {
                 self.reach(key, &[CasKey(key.0)])?;
+                self.lent_entries.borrow_mut().insert(key.0.0, lend.bytes);
                 Ok(Some(lend.bytes))
             }
             Ok(Some(_)) => Err(StoreError::Failed { key, what: "a record under a code key is filed under another tag than ReservedTag::Code: not a code entry" }),
@@ -153,7 +274,13 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
             self.lent.commit().map_err(|error| refused(key, &error))?;
             self.commits += 1;
         }
-        self.lent.put(&CasKey(key.0), Namespace::LOCAL, ReservedTag::Code.tag(), bytes).map_err(|error| refused(key, &error))?;
+        let wrote = self.lent.put(&CasKey(key.0), Namespace::LOCAL, ReservedTag::Code.tag(), bytes).map_err(|error| refused(key, &error))?;
+        if wrote == Put::Same
+            && let Ok(CommittedLend::Found(lend)) = self.lent.get_committed(&CasKey(key.0))
+            && ReservedTag::Code.is(lend.tag)
+        {
+            self.lent_entries.borrow_mut().insert(key.0.0, lend.bytes);
+        }
         self.wrote(class, key, &[CasKey(key.0)])
     }
 
@@ -162,11 +289,19 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
     /// program root that expired, store/roots.rs) is the cache's miss: the instance is built again, put, and `key` pointed anew; that is the
     /// path every miss takes, not another route.
     fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
+        #[cfg(test)]
+        let use_cache = self.use_lent_entries;
+        #[cfg(not(test))]
+        let use_cache = true;
+        if use_cache && self.lent_entries.borrow().contains_key(&key.0.0) {
+            return Ok(None);
+        }
         match self.lent.pointed(ReservedTag::Code.tag(),&CasKey(key.0)) {
             // A pointer is kept by naming its name AND its target (blaze-keyed `ReservedTag::Pointer`: reach
             // does not follow a pointer), so both are this run's.
             Ok(Some(target)) => {
                 self.reach(key, &[CasKey(key.0), target])?;
+                self.lent_pointers.borrow_mut().insert(key.0.0, target);
                 Ok(Some(CodeKey(target.0)))
             }
             Ok(None) => Ok(None),
@@ -187,6 +322,7 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
             self.commits += 1;
         }
         self.lent.point(ReservedTag::Code.tag(),&CasKey(key.0), &CasKey(content.0)).map_err(|error| refused(key, &error))?;
+        self.lent_pointers.borrow_mut().insert(key.0.0, CasKey(content.0));
         self.wrote(class, key, &[CasKey(key.0), CasKey(content.0)])
     }
 }

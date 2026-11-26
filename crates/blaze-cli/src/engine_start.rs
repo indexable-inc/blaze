@@ -284,7 +284,7 @@ const SCOPED_IDS_CERT_DOMAIN: &str = "blaze-cli run ids scoped cert 1";
 
 /// The certificate key for `RunIds` of `standing`: equal to `Key(root)` for whole-workspace runs,
 /// and folded with `scope` for scoped runs so each scope owns a disjoint `RunIds` record.
-fn body_ids_cert(root: ContentId, scope: crate::engine_check::CheckScope<'_>) -> Key {
+pub(crate) fn body_ids_cert(root: ContentId, scope: crate::engine_check::CheckScope<'_>) -> Key {
     let put_len = |h: &mut blaze_ids::Hasher, n: usize| {
         h.update(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
     };
@@ -398,7 +398,7 @@ fn body_ids_last_ptr(
 
 /// Deterministic, checkout-path-free workspace identity derived from member `(name, /0/... root)`
 /// entries in `list`, shared across worktrees of the same repository (rules 25, 36).
-fn workspace_anchor_id(list: &blaze_world::crate_list::CrateList<'_>, alloc: Alloc<'_>) -> Option<ContentId> {
+pub(crate) fn workspace_anchor_id(list: &blaze_world::crate_list::CrateList<'_>, alloc: Alloc<'_>) -> Option<ContentId> {
     use blaze_world::crate_list::CrateGraph as _;
 
     let mut members: blaze_own::AVec<'_, (&str, &str)> = blaze_own::Vec::new_in(alloc);
