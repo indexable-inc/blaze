@@ -247,16 +247,21 @@ struct Walk<'w, 'c, A: Allocator + Copy> {
     comp_sp: usize,
 }
 
+/// Maximum number of trait/projection arguments cached in normalized form for [`AskAt`].
+const MAX_NORM_ARGS: usize = 8;
+
 /// The ask's arguments `[Self, trait args..]`, where a side holds them.
 #[derive(Clone, Copy)]
 enum AskAt<'c> {
     /// An alias, or a bound laid subject-first (`ExTrait(Tr, [T, A..])`): its children.
     Kids(Side<'c>),
-    /// A bound with its subject apart (`ExTrait(Tr, [A..])`): the subject, then the children.
-    Subject { subject: Side<'c>, of: Side<'c> },
+    /// A bound with its subject apart (`ExTrait(Tr, [A..])`): the subject, then the children
+    /// (with any alias argument `1..MAX_NORM_ARGS` normalized into `norm[k]` when `Some`).
+    Subject { subject: Side<'c>, of: Side<'c>, norm: [Option<Side<'c>>; MAX_NORM_ARGS] },
     /// Subject-first node (`ExTrait`, `Alias`, or `ExProj` of `len` args) whose child 0 has
-    /// already been normalized to `subject`, with remaining arguments `1..len` from `of`.
-    SubjectKids { subject: Side<'c>, of: Side<'c>, len: u32 },
+    /// already been normalized to `subject`, with remaining arguments `1..len` from `of`
+    /// (with any alias argument `1..MAX_NORM_ARGS` normalized into `norm[k]` when `Some`).
+    SubjectKids { subject: Side<'c>, of: Side<'c>, len: u32, norm: [Option<Side<'c>>; MAX_NORM_ARGS] },
 }
 
 /// [`AskArgs`] over a walk: each argument followed through its environment and compared with a
@@ -273,9 +278,21 @@ impl<'c, A: Allocator + Copy> Keyer<'_, '_, 'c, A> {
         match self.at {
             AskAt::Kids(s) => self.walk.erased_kid(s, k),
             AskAt::Subject { subject, .. } if k == 0 => Some(subject),
-            AskAt::Subject { of, .. } => self.walk.erased_kid(of, k - 1),
+            AskAt::Subject { of, norm, .. } => {
+                if let Some(Some(s)) = norm.get(k as usize).copied() {
+                    Some(s)
+                } else {
+                    self.walk.erased_kid(of, k - 1)
+                }
+            }
             AskAt::SubjectKids { subject, .. } if k == 0 => Some(subject),
-            AskAt::SubjectKids { of, len, .. } if k < len => self.walk.erased_kid(of, k),
+            AskAt::SubjectKids { of, len, norm, .. } if k < len => {
+                if let Some(Some(s)) = norm.get(k as usize).copied() {
+                    Some(s)
+                } else {
+                    self.walk.erased_kid(of, k)
+                }
+            }
             AskAt::SubjectKids { .. } => None,
         }
     }
@@ -1257,8 +1274,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let kids = self.kids_of(s)?;
         let (_, args_rest) = s.slots.split(own).ok_or(self.malformed(s.ty, Bad::StepBound))?;
         let mut norm_subject = None;
+        let mut norm_args = [None; MAX_NORM_ARGS];
         if kids.len() > 0 {
-            let (subject, _) = self.kid(s, &kids, args_rest, 0)?;
+            let (subject, mut rem) = self.kid(s, &kids, args_rest, 0)?;
             if let Resolved::Side(subject) = self.resolve(subject)? {
                 let subject = self.try_normalize_subject(subject, depth);
                 norm_subject = Some(subject);
@@ -1266,10 +1284,22 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     return Ok(val);
                 }
             }
+            for k in 1..kids.len() {
+                let (arg, r) = self.kid(s, &kids, rem, k)?;
+                rem = r;
+                if let Some(slot) = norm_args.get_mut(k as usize)
+                    && let Resolved::Side(arg_s) = self.resolve(arg)?
+                {
+                    let (n, changed) = self.try_normalize_subject_flag(arg_s, depth);
+                    if changed {
+                        *slot = Some(n);
+                    }
+                }
+            }
         }
         let selected: &'c dyn Selected = self.selected;
         let at = match norm_subject {
-            Some(subject) => AskAt::SubjectKids { subject, of: s, len: kids.len() },
+            Some(subject) => AskAt::SubjectKids { subject, of: s, len: kids.len(), norm: norm_args },
             None => AskAt::Kids(s),
         };
         let key = Keyer { walk: &*self, at, budget: Cell::new(MOST_WALK_STEPS) };
@@ -2168,8 +2198,30 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(());
         }
         let param_miss = matches!(self.node(subject)?, PNode::Param(_));
+        let mut norm_args = [None; MAX_NORM_ARGS];
+        if self.fits(trait_ref).is_ok()
+            && let Ok(own) = self.own(trait_ref)
+            && let Ok(kids) = self.kids_of(trait_ref)
+            && let Some((_, mut rem)) = trait_ref.slots.split(own)
+        {
+            for k in 0..kids.len() {
+                if let Ok((arg, r)) = self.kid(trait_ref, &kids, rem, k) {
+                    rem = r;
+                    if let Some(slot) = norm_args.get_mut((k + 1) as usize)
+                        && let Ok(Resolved::Side(arg_s)) = self.resolve(arg)
+                    {
+                        let (n, changed) = self.try_normalize_subject_flag(arg_s, 0);
+                        if changed {
+                            *slot = Some(n);
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
         let selected: &'c dyn Selected = self.selected;
-        let key = Keyer { walk: &*self, at: AskAt::Subject { subject, of: trait_ref }, budget: Cell::new(MOST_WALK_STEPS) };
+        let key = Keyer { walk: &*self, at: AskAt::Subject { subject, of: trait_ref, norm: norm_args }, budget: Cell::new(MOST_WALK_STEPS) };
         match selected.select_keyed(Ask { trait_, name: None, written: trait_ref.ty }, &key) {
             Selection::Impl { head, .. } => {
                 let env = self.envs.impl_env(head.lifetimes, head.types).ok_or(self.malformed(trait_ref.ty, Bad::StepBound))?;
@@ -2745,8 +2797,24 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        let mut norm_args = [None; MAX_NORM_ARGS];
+        if last > 1 {
+            let (_, mut rem) = self.kid(proj, &kids, args_rest, 0)?;
+            for k in 1..last {
+                let (arg, r) = self.kid(proj, &kids, rem, k)?;
+                rem = r;
+                if let Some(slot) = norm_args.get_mut(k as usize)
+                    && let Resolved::Side(arg_s) = self.resolve(arg)?
+                {
+                    let (n, changed) = self.try_normalize_subject_flag(arg_s, 0);
+                    if changed {
+                        *slot = Some(n);
+                    }
+                }
+            }
+        }
         let selected: &'c dyn Selected = self.selected;
-        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: proj, len: last }, budget: Cell::new(MOST_WALK_STEPS) };
+        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: proj, len: last, norm: norm_args }, budget: Cell::new(MOST_WALK_STEPS) };
         let (head, value) = match selected.select_keyed(Ask { trait_, name: Some(name), written: proj.ty }, &key) {
             Selection::Impl { head, value: Some(value) } => (head, value),
             Selection::Impl { value: None, .. } => return Err(self.malformed(proj.ty, Bad::NoValue)),
@@ -2820,24 +2888,49 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(());
         }
         let (subject, normalized) = self.try_normalize_subject_flag(raw_subject, 0);
+        // Normalize any alias trait arguments (`k in 1..kids.len()`) so both the all-inert check
+        // and `select_keyed` see concrete normalized types (e.g. `EthApiError: From<M::Err> +
+        // From<H::Err>` distinguishes `From<ErrA>` from `From<ErrB>` instead of colliding as
+        // `TwoSources`).
+        let mut norm_args = [None; MAX_NORM_ARGS];
+        let mut norm_ok = true;
+        {
+            let mut nrest = rest;
+            for k in 1..kids.len() {
+                let (arg, r) = self.kid(trait_ref, &kids, nrest, k)?;
+                nrest = r;
+                match self.resolve(arg)? {
+                    Resolved::Side(s) => {
+                        let (n, changed) = self.try_normalize_subject_flag(s, 0);
+                        if changed && let Some(slot) = norm_args.get_mut(k as usize) {
+                            *slot = Some(n);
+                        }
+                    }
+                    Resolved::Unbound { .. } => norm_ok = false,
+                }
+            }
+        }
         // If normalizing the subject or any alias trait argument yields an all-inert goal
         // (e.g. `usize: Sum<<Map<Iter<'a, _>, C> as Iterator>::Item>` -> `usize: Sum<usize>`),
         // the normalized impls' own where-clauses have already been checked and the goal itself
         // relates no region (so `selected_rows` rightly skipped filing a row for it).
-        if own == SlotCount::ZERO {
+        if own == SlotCount::ZERO && norm_ok {
             let mut b = MOST_WALK_STEPS;
             if self.inert(subject, 0, &mut b)? {
                 let mut all_inert = true;
                 let mut irest = rest;
                 for k in 1..kids.len() {
-                    let (arg, r) = self.kid(trait_ref, &kids, irest, k)?;
+                    let (raw_arg, r) = self.kid(trait_ref, &kids, irest, k)?;
                     irest = r;
-                    let arg = match self.resolve(arg)? {
-                        Resolved::Side(s) => self.try_normalize_subject(s, 0),
-                        Resolved::Unbound { .. } => {
-                            all_inert = false;
-                            break;
-                        }
+                    let arg = match norm_args.get(k as usize).copied().flatten() {
+                        Some(n) => n,
+                        None => match self.resolve(raw_arg)? {
+                            Resolved::Side(s) => self.try_normalize_subject(s, 0),
+                            Resolved::Unbound { .. } => {
+                                all_inert = false;
+                                break;
+                            }
+                        },
                     };
                     let mut kb = MOST_WALK_STEPS;
                     if !self.inert(arg, 0, &mut kb)? {
@@ -2854,7 +2947,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(());
         }
         let param_miss = matches!(self.node(subject)?, PNode::Param(_));
-        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: trait_ref, len: kids.len() }, budget: Cell::new(MOST_WALK_STEPS) };
+        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: trait_ref, len: kids.len(), norm: norm_args }, budget: Cell::new(MOST_WALK_STEPS) };
         let head = match selected.select_keyed(Ask { trait_, name: None, written: trait_ref.ty }, &key) {
             Selection::Impl { head, .. } => head,
             Selection::Not(NotSelected::Builtin) if self.nothing_to_tie(trait_ref, 1)? => return Ok(()),

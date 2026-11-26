@@ -1688,6 +1688,61 @@ where
         Pool,
     >(pool);
 }
+
+// Repro 3: `build_eth_api` (`RpcConverter::erased`) — impl with multiple `From<Assoc::Err>`
+// where-clauses on the same error type (`E: From<ErrA> + From<M::Err> + From<H::Err>`) where
+// `M::Err` and `H::Err` normalize to distinct concrete error types with distinct `From` impls.
+struct EthErr<'a>(&'a u8);
+struct EthErrA;
+struct EthErrB;
+impl<'a> From<EthErrA> for EthErr<'a> {
+    fn from(_: EthErrA) -> Self {
+        EthErr(&0)
+    }
+}
+impl<'a> From<EthErrB> for EthErr<'a> {
+    fn from(_: EthErrB) -> Self {
+        EthErr(&0)
+    }
+}
+trait EthMapper {
+    type Err;
+}
+struct EthMapA;
+impl EthMapper for EthMapA {
+    type Err = EthErrA;
+}
+struct EthMapB;
+impl EthMapper for EthMapB {
+    type Err = EthErrB;
+}
+trait EthReceiptConv {
+    type Error;
+}
+struct EthReceiptImpl<'a>(core::marker::PhantomData<&'a u8>);
+impl<'a> EthReceiptConv for EthReceiptImpl<'a> {
+    type Error = EthErr<'a>;
+}
+trait EthRpcConvert {}
+struct EthRpcConverter<R, M, H>(core::marker::PhantomData<(R, M, H)>);
+impl<R, M, H> EthRpcConvert for EthRpcConverter<R, M, H>
+where
+    M: EthMapper,
+    H: EthMapper,
+    R: EthReceiptConv,
+    R::Error: From<M::Err> + From<H::Err>,
+{
+}
+impl<R, M, H> EthRpcConverter<R, M, H> {
+    fn erased(self)
+    where
+        Self: EthRpcConvert,
+    {
+    }
+}
+fn repro_build_eth_api_two_sources<'a>(conv: EthRpcConverter<EthReceiptImpl<'a>, EthMapA, EthMapB>) {
+    conv.erased();
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();
