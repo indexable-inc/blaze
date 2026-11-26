@@ -1725,7 +1725,7 @@ fn emit_wasm64_from_records<'n>(
                 exports: &[],
                 export_globals: &[],
                 include_blaze_host_v1: false,
-                opts: Wasm64Opts::DEFAULT,
+                opts: Wasm64Opts::USER_PROGRAM,
             };
             compile_roots_to_wasm64(
                 &roots,
@@ -1788,7 +1788,7 @@ fn emit_wasm64_from_records<'n>(
                 exports: &exports,
                 export_globals: &export_globals,
                 include_blaze_host_v1: false,
-                opts: Wasm64Opts::DEFAULT,
+                opts: Wasm64Opts::USER_PROGRAM,
             };
             compile_items_to_wasm64(
                 &[init_item, alloc_item, expand_item],

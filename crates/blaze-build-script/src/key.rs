@@ -51,7 +51,7 @@ impl RunLimits {
     /// The design's limits (build-scripts.md): fuel tens of times the largest generator's,
     /// 1 GiB of memory, `OUT_DIR` 64 MiB in 4096 files, 16 MiB of output, 256 KiB a line.
     pub const STANDARD: RunLimits =
-        RunLimits { fuel: 1 << 36, memory: 1 << 30, out_dir_bytes: 64 << 20, out_dir_files: 4096, output: 16 << 20, line: 256 << 10 };
+        RunLimits { fuel: 1 << 39, memory: 1 << 30, out_dir_bytes: 64 << 20, out_dir_files: 4096, output: 16 << 20, line: 256 << 10 };
 }
 
 /// What the base key is made of.

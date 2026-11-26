@@ -1052,7 +1052,7 @@ fn export_program<'f>(
             exports: &[],
             export_globals: &[],
             include_blaze_host_v1: false,
-            opts: blaze_export::wasm64::Wasm64Opts::DEFAULT,
+            opts: blaze_export::wasm64::Wasm64Opts::USER_PROGRAM,
         };
         let built = blaze_ladder::run::make_one::wasm64::compile_walk_to_wasm64(
             &walk,
