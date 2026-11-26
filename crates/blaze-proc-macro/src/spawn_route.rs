@@ -612,11 +612,16 @@ impl ScriptSandbox {
         let env: Vec<(&str, &str)> = owned_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
         let mount = script.cwd();
+        let out_dir = script.out_dir();
+        // `cc-rs` spawns compiler flag probes (`flag_check.c`) with `.current_dir(OUT_DIR)`.
+        // `c_tasks_probe` refuses any relative or non-`OUT_DIR` file argument, so both `mount`
+        // and `out_dir` are hermetic probe working directories (rule 21).
         if let Some(ref cwd_override) = spawned.cwd
             && !same_guest_dir(cwd_override.as_str(), mount.as_str())
+            && !same_guest_dir(cwd_override.as_str(), out_dir)
         {
             return Err(self.refuse(Refusal::Spawn(refused(format!(
-                "compiler probe current_dir `{cwd_override}` differs from script cwd `{mount}` (rule 21)"
+                "compiler probe current_dir `{cwd_override}` differs from script cwd `{mount}` and OUT_DIR `{out_dir}` (rule 21)"
             )))));
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
