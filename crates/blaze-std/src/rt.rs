@@ -1281,6 +1281,7 @@ fn fd_dev_ino(fd: blaze_sys::Fd) -> Result<(u64, u64), blaze_sys::Errno> {
         Ok((st.st_dev, st.st_ino))
     }
     #[cfg(target_os = "macos")]
+    #[expect(unsafe_code, reason = "POSIX `fstat` FFI on an open descriptor with its SAFETY comment")]
     {
         let mut st = blaze_sys::posix::proc::stat::zeroed();
         // SAFETY: `fstat` writes to valid mutable `stat` buffer for open descriptor `fd`.
@@ -2222,6 +2223,7 @@ fn fd_len_u64(fd: blaze_sys::Fd) -> Result<u64, blaze_sys::Errno> {
         u64::try_from(st.st_size).map_err(|_| blaze_sys::Errno::Overflow)
     }
     #[cfg(target_os = "macos")]
+    #[expect(unsafe_code, reason = "POSIX `fstat` FFI on an open descriptor with its SAFETY comment")]
     {
         let mut st = blaze_sys::posix::proc::stat::zeroed();
         // SAFETY: `fstat` writes to valid mutable `stat` buffer for open descriptor `fd`.
