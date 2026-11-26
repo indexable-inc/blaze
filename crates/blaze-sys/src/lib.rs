@@ -68,6 +68,7 @@ pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("linux/nr.rs"),
     include_bytes!("linux/raw.rs"),
     include_bytes!("linux/confine.rs"),
+    include_bytes!("linux/fdctl.rs"),
     include_bytes!("linux/landlock.rs"),
     include_bytes!("linux/process.rs"),
     include_bytes!("linux/task.rs"),

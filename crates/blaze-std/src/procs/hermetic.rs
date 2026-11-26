@@ -89,9 +89,10 @@ pub struct VerifiedStamp {
     pub changed_ns: i128,
 }
 
-/// A pre-opened executable descriptor on Linux (`O_RDONLY | O_CLOEXEC`) bound to a single kernel
-/// inode so verification (SHA-256) and execution (`execveat(..., AT_EMPTY_PATH)` + Landlock) act
-/// on the exact same inode with zero path-reopen TOCTOU.
+/// A kernel-sealed immutable executable snapshot on Linux (`memfd_create` + `F_SEAL_WRITE |
+/// F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`), populated in a single bounded streaming pass
+/// while computing the caller's SHA-256 digest and launched via `execveat(..., AT_EMPTY_PATH)` so
+/// neither path replacement nor in-place writes can ever alter the verified bytes before execution.
 #[cfg(target_os = "linux")]
 pub struct VerifiedExec {
     fd: blaze_sys::linux::OwnedFd,
@@ -100,9 +101,14 @@ pub struct VerifiedExec {
 
 #[cfg(target_os = "linux")]
 impl VerifiedExec {
-    /// Opens `path` read-only (`O_CLOEXEC`), checks `cx` before starting, verifies it is a regular
-    /// file via `statx(fd, "", AT_EMPTY_PATH, BASIC)`, and returns the bound handle and stamp.
-    pub fn open(cx: &Cx, path: &str) -> Result<VerifiedExec, VerifiedExecError> {
+    /// Opens `path` read-only (`O_CLOEXEC`), checks `cx` before every 64 KiB chunk, copies the
+    /// exact bytes into an anonymous `memfd` while streaming those same bytes into `on_chunk`,
+    /// and permanently seals the `memfd` (`SEAL | SHRINK | GROW | WRITE`) before returning.
+    pub fn open_and_seal(
+        cx: &Cx,
+        path: &str,
+        mut on_chunk: impl FnMut(&[u8]),
+    ) -> Result<VerifiedExec, VerifiedExecError> {
         cx.check().map_err(VerifiedExecError::Stopped)?;
         let bytes = path.as_bytes();
         if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= 4096 {
@@ -115,7 +121,7 @@ impl VerifiedExec {
         let Ok(cstr) = core::ffi::CStr::from_bytes_until_nul(buf.get(..=bytes.len()).unwrap_or(&[0])) else {
             return Err(VerifiedExecError::BadPath);
         };
-        let fd = blaze_sys::linux::openat(
+        let src_fd = blaze_sys::linux::openat(
             blaze_sys::linux::CWD,
             blaze_sys::Path::new(cstr),
             blaze_sys::linux::OpenFlags::CLOSE_ON_EXEC,
@@ -123,7 +129,7 @@ impl VerifiedExec {
         )
         .map_err(|errno| VerifiedExecError::Os { call: "openat", errno })?;
         let st = blaze_sys::linux::statx(
-            fd.fd(),
+            src_fd.fd(),
             blaze_sys::Path::EMPTY,
             blaze_sys::linux::AtFlags::EMPTY_PATH,
             blaze_sys::linux::StatxMask::BASIC,
@@ -132,43 +138,63 @@ impl VerifiedExec {
         if st.mode & blaze_sys::linux::Statx::TYPE_MASK != blaze_sys::linux::Statx::REGULAR {
             return Err(VerifiedExecError::NotRegular);
         }
+        let memfd = blaze_sys::posix::io::memfd_create(
+            blaze_sys::Path::new(c"blaze-verified-exec"),
+            blaze_sys::posix::io::MemfdFlags::CLOSE_ON_EXEC
+                .with(blaze_sys::posix::io::MemfdFlags::ALLOW_SEALING),
+        )
+        .map_err(|errno| VerifiedExecError::Os { call: "memfd_create", errno })?;
+        let mut chunk_buf = [0u8; 64 << 10];
+        let mut offset = 0u64;
+        loop {
+            cx.check().map_err(VerifiedExecError::Stopped)?;
+            let n = blaze_sys::linux::pread(src_fd.fd(), &mut chunk_buf, offset)
+                .map_err(|errno| VerifiedExecError::Os { call: "pread", errno })?;
+            if n == 0 {
+                break;
+            }
+            let Some(chunk) = chunk_buf.get(..n) else {
+                break;
+            };
+            on_chunk(chunk);
+            let mut written = 0usize;
+            while written < chunk.len() {
+                cx.check().map_err(VerifiedExecError::Stopped)?;
+                let Some(rem) = chunk.get(written..) else {
+                    break;
+                };
+                let w = blaze_sys::linux::write(memfd.fd(), rem)
+                    .map_err(|errno| VerifiedExecError::Os { call: "write (memfd)", errno })?;
+                if w == 0 {
+                    return Err(VerifiedExecError::Os { call: "write (memfd short)", errno: blaze_sys::Errno::Io });
+                }
+                written += w;
+            }
+            let step = u64::try_from(n).map_err(|_| VerifiedExecError::BadPath)?;
+            offset = offset.checked_add(step).ok_or(VerifiedExecError::BadPath)?;
+        }
+        let seals = blaze_sys::posix::io::Seals::WRITE
+            .with(blaze_sys::posix::io::Seals::SHRINK)
+            .with(blaze_sys::posix::io::Seals::GROW)
+            .with(blaze_sys::posix::io::Seals::SEAL);
+        blaze_sys::posix::io::add_seals(memfd.fd(), seals)
+            .map_err(|errno| VerifiedExecError::Os { call: "fcntl (F_ADD_SEALS)", errno })?;
         let dev = (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor);
         let modified_ns = i128::from(st.mtime.sec) * 1_000_000_000 + i128::from(st.mtime.nsec);
         let changed_ns = i128::from(st.ctime.sec) * 1_000_000_000 + i128::from(st.ctime.nsec);
         Ok(VerifiedExec {
-            fd,
-            stamp: VerifiedStamp { dev, ino: st.ino, len: st.size, modified_ns, changed_ns },
+            fd: memfd,
+            stamp: VerifiedStamp { dev, ino: st.ino, len: offset, modified_ns, changed_ns },
         })
     }
 
-    /// The kernel metadata stamp captured when the inode was opened.
+    /// The kernel metadata stamp captured when the source file was snapshotted.
     pub fn stamp(&self) -> VerifiedStamp {
         self.stamp
     }
 
-    /// Re-queries `statx(fd, "", AT_EMPTY_PATH, BASIC)` on the pinned descriptor to detect any
-    /// in-place mutation (`write`/`truncate`/`chmod`, which unconditionally advances `ctime` for
-    /// non-root writers) between verification and execution.
-    pub fn stamp_now(&self, cx: &Cx) -> Result<VerifiedStamp, VerifiedExecError> {
-        cx.check().map_err(VerifiedExecError::Stopped)?;
-        let st = blaze_sys::linux::statx(
-            self.fd.fd(),
-            blaze_sys::Path::EMPTY,
-            blaze_sys::linux::AtFlags::EMPTY_PATH,
-            blaze_sys::linux::StatxMask::BASIC,
-        )
-        .map_err(|errno| VerifiedExecError::Os { call: "statx", errno })?;
-        if st.mode & blaze_sys::linux::Statx::TYPE_MASK != blaze_sys::linux::Statx::REGULAR {
-            return Err(VerifiedExecError::NotRegular);
-        }
-        let dev = (u64::from(st.dev_major) << 32) | u64::from(st.dev_minor);
-        let modified_ns = i128::from(st.mtime.sec) * 1_000_000_000 + i128::from(st.mtime.nsec);
-        let changed_ns = i128::from(st.ctime.sec) * 1_000_000_000 + i128::from(st.ctime.nsec);
-        Ok(VerifiedStamp { dev, ino: st.ino, len: st.size, modified_ns, changed_ns })
-    }
-
-    /// Streams the entire opened inode in bounded 64 KiB chunks into `on_chunk`, checking `cx`
-    /// before every chunk so cancellation or deadline expiry aborts promptly.
+    /// Streams the sealed snapshot in bounded 64 KiB chunks into `on_chunk`, checking `cx` before
+    /// every chunk (used by tests to verify immutability of the sealed `memfd`).
     pub fn stream_chunks(&self, cx: &Cx, mut on_chunk: impl FnMut(&[u8])) -> Result<(), VerifiedExecError> {
         let mut buf = [0u8; 64 << 10];
         let mut offset = 0u64;
@@ -186,6 +212,13 @@ impl VerifiedExec {
             offset = offset.checked_add(step).ok_or(VerifiedExecError::BadPath)?;
         }
         Ok(())
+    }
+
+    /// Attempts a write directly against the sealed `memfd` (always rejected by the kernel with
+    /// `EPERM` once `F_SEAL_WRITE` is installed; exposed for verification tests).
+    pub fn try_write_for_test(&self, bytes: &[u8]) -> Result<usize, VerifiedExecError> {
+        blaze_sys::linux::write(self.fd.fd(), bytes)
+            .map_err(|errno| VerifiedExecError::Os { call: "write (sealed memfd)", errno })
     }
 
     pub(super) fn fd(&self) -> blaze_sys::Fd {

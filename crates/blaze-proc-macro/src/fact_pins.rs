@@ -193,7 +193,9 @@ pub fn fact_now_with_probes(
         let Some(probes) = c_probes else {
             return FactNow::NoPins;
         };
-        let active_answerer = probes.answerer.id();
+        let Ok(active_answerer) = probes.answerer.id(alloc) else {
+            return FactNow::Answer(None);
+        };
         let now = crate::probe_clang::c_probe_reply_now(subject, &active_answerer, &probes.clang_sha256, &probes.sdk_digest, Some(&*probes.records), alloc).flatten();
         return FactNow::Answer(now);
     }

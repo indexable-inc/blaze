@@ -148,16 +148,23 @@ impl<'a> FactFiles<'a> {
         digest
     }
 
-    fn active_answerer_id(&mut self, alloc: blaze_own::Alloc<'_>) -> ContentId {
+    fn active_answerer_id(&mut self, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
         if let Some(cached) = self.cached_answerer {
-            return cached;
+            return Ok(cached);
         }
-        let id = self
-            .home_path
-            .and_then(|home| blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(home, crate::graph::TRIPLE, alloc))
-            .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id);
+        let id = match (self.home, self.home_path) {
+            (Some((cx, _)), Some(home)) => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home(
+                cx,
+                home,
+                crate::graph::TRIPLE,
+                alloc,
+            )
+            .map_err(|_| CliError::Text { what: "cannot compute active c-probe runtime closure identity" })?
+            .unwrap_or_else(blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id),
+            _ => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id(),
+        };
         self.cached_answerer = Some(id);
-        id
+        Ok(id)
     }
 
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
@@ -166,7 +173,7 @@ impl<'a> FactFiles<'a> {
             && let Some(key_hex) = subject.rsplit('\n').next()
         {
             let active_sdk = self.active_sdk_digest();
-            let active_answerer = self.active_answerer_id(alloc);
+            let active_answerer = self.active_answerer_id(alloc)?;
             return read_c_probe_reply(self.home, parsed, key_hex, &active_answerer, &active_sdk, alloc);
         }
         if path == SHIM_FILE {

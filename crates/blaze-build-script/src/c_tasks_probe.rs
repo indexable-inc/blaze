@@ -446,6 +446,7 @@ pub enum Segment<'b> {
 /// A canonicalized compiler probe ready for cache lookup or execution by a [`ProbeAnswerer`].
 pub struct CanonicalProbe<'b, 's> {
     pub key: ProbeKey,
+    pub answerer_id: ContentId,
     pub clang: [u8; 32],
     pub sdk_id: AString<'b>,
     pub row: Row<'b>,
@@ -875,6 +876,7 @@ pub fn canonicalize<'b, 's>(
     let key = probe_key(answerer_id, clang, spawn.sdk_id, &asked.row, &asked.exec_args, &asked.exec_env);
     Ok(CanonicalProbe {
         key,
+        answerer_id,
         clang: *clang,
         sdk_id: String::from_str_in(spawn.sdk_id, alloc),
         row: asked.row,
@@ -939,8 +941,9 @@ fn probe_key(
 /// and offline zero-download mode uses [`TableAnswerer`].
 pub trait ProbeAnswerer {
     /// Stable identity of this answerer strategy and its confinement/format version (hashed into
-    /// [`ProbeKey`]).
-    fn id(&self) -> ContentId;
+    /// [`ProbeKey`]). Fallible because deriving a host runtime-closure digest can fail if a
+    /// required library or link cannot be read within the probe deadline.
+    fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>>;
     /// Produces the canonical placeholder-spelled [`ProbeAnswer`] for `probe`.
     fn answer<'a, 'b>(
         &self,
@@ -956,11 +959,13 @@ pub trait ProbeCache {
     fn put<'a>(&self, key: &ProbeKey, bytes: &[u8], alloc: Alloc<'a>) -> Result<(), AString<'a>>;
 }
 
-/// A resolved probe: its canonical key and reply digest (for the script's per-probe read list)
-/// plus the guest-spelled [`Answered`] output delivered to the script.
+/// A resolved probe: its canonical key, answerer strategy identity, and reply digest (for the
+/// script's per-probe read list) plus the guest-spelled [`Answered`] output delivered to the
+/// script.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ResolvedProbe<'a> {
     pub key: ProbeKey,
+    pub answerer_id: ContentId,
     pub canonical_digest: ContentId,
     pub answered: Answered<'a>,
 }
@@ -977,7 +982,8 @@ pub fn resolve<'a, 'b>(
     file_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
     alloc: Alloc<'a>,
 ) -> Result<ResolvedProbe<'a>, AString<'a>> {
-    let probe = canonicalize(answerer.id(), clang, spawn, file_digest, alloc).map_err(|r| {
+    let answerer_id = answerer.id(alloc)?;
+    let probe = canonicalize(answerer_id, clang, spawn, file_digest, alloc).map_err(|r| {
         let mut msg = String::new_in(alloc);
         let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{r}"));
         msg
@@ -1012,7 +1018,7 @@ pub fn resolve<'a, 'b>(
         stdout: probe.unspell(canonical.stdout.as_str(), spawn, alloc),
         stderr: probe.unspell(canonical.stderr.as_str(), spawn, alloc),
     };
-    Ok(ResolvedProbe { key: probe.key, canonical_digest, answered })
+    Ok(ResolvedProbe { key: probe.key, answerer_id, canonical_digest, answered })
 }
 
 /// Strategy implementation backed by the checked-in `pins/answers/clang.json` corpus (used only
@@ -1032,8 +1038,8 @@ impl<'t> TableAnswerer<'t> {
 }
 
 impl ProbeAnswerer for TableAnswerer<'_> {
-    fn id(&self) -> ContentId {
-        Self::strategy_id(self.table.id())
+    fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+        Ok(Self::strategy_id(self.table.id()))
     }
 
     fn answer<'a, 'b>(

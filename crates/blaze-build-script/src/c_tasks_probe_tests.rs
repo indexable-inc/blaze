@@ -292,8 +292,8 @@ fn binary_probe_answer_round_trips_and_resolves_once_via_cache() {
 
     struct CountingAnswerer(AtomicUsize);
     impl ProbeAnswerer for CountingAnswerer {
-        fn id(&self) -> blaze_ids::ContentId {
-            blaze_ids::ContentId::of("test c-probe answerer", b"v1")
+        fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<blaze_ids::ContentId, blaze_own::AString<'a>> {
+            Ok(blaze_ids::ContentId::of("test c-probe answerer", b"v1"))
         }
         fn answer<'a, 'b>(
             &self,
@@ -379,7 +379,9 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     // OUT_DIR source containing `#include` is refused in `resolve` before caching or running.
     struct PanicAnswerer;
     impl ProbeAnswerer for PanicAnswerer {
-        fn id(&self) -> blaze_ids::ContentId { blaze_ids::ContentId([9; 32]) }
+        fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<blaze_ids::ContentId, blaze_own::AString<'a>> {
+            Ok(blaze_ids::ContentId([9; 32]))
+        }
         fn answer<'a, 'b>(&self, _: &CanonicalProbe<'_, '_>, _: &mut dyn FnMut(&str) -> Option<&'b [u8]>, _: Alloc<'a>) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
             panic!("must not invoke answerer for #include probe");
         }
@@ -413,7 +415,9 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     // Inert tokens inside quoted string literals must NOT be rejected.
     struct OkAnswerer;
     impl ProbeAnswerer for OkAnswerer {
-        fn id(&self) -> blaze_ids::ContentId { blaze_ids::ContentId([10; 32]) }
+        fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<blaze_ids::ContentId, blaze_own::AString<'a>> {
+            Ok(blaze_ids::ContentId([10; 32]))
+        }
         fn answer<'a, 'b>(&self, _: &CanonicalProbe<'_, '_>, _: &mut dyn FnMut(&str) -> Option<&'b [u8]>, alloc: Alloc<'a>) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
             Ok(ProbeAnswer { code: 0, stdout: blaze_own::String::new_in(alloc), stderr: blaze_own::String::new_in(alloc) })
         }
@@ -538,5 +542,5 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
     let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");
-    assert_ne!(TableAnswerer::new(&t1).id(), TableAnswerer::new(&t2).id());
+    assert_ne!(TableAnswerer::new(&t1).id(alloc).expect("id1"), TableAnswerer::new(&t2).id(alloc).expect("id2"));
 }

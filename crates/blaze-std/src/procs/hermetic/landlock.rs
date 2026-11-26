@@ -137,10 +137,11 @@ pub(super) fn prepare_with_exec(plan: &Plan<'_>, budget: Budget, processes: bool
         if rule.why == Why::Program
             && let Some(efd) = exec_fd
         {
-            let granted = rights(rule.access, false).bits();
-            let pb = PathBeneath { allowed_access: granted, parent_fd: efd.raw() };
-            landlock_add_rule_path(ruleset.fd(), &pb)
-                .map_err(|errno| Fault::Host { call: "landlock_add_rule (verified exec)", code: errno.raw() })?;
+            // `efd` is a kernel-sealed anonymous `memfd` executed via `execveat(..., AT_EMPTY_PATH)`:
+            // it lives outside any mounted filesystem (so Landlock does not gate `AT_EMPTY_PATH`
+            // exec on it and rejects `memfd` in `PathBeneath` with EBADFD). We therefore omit
+            // granting `EXECUTE` on the on-disk program path and walk the Nix ELF closure directly
+            // from the sealed `efd`.
             grant_nix_elf_closure(ruleset.fd(), path, Some(efd), plan, has_helper_folder)?;
             continue;
         }
@@ -182,12 +183,14 @@ pub(super) fn prepare_with_exec(plan: &Plan<'_>, budget: Budget, processes: bool
 }
 
 /// On NixOS hosts where `program_path`'s `PT_INTERP` symlinks into `/nix/store/`, walks the exact
-/// same transitive ELF64 runtime closure as [`grant_nix_elf_closure`] and feeds the canonical
-/// resolved path and file contents of the ELF interpreter, delegated glibc `ld.so`, and every
-/// transitive shared library into `feed` so callers can bind the host Nix runtime closure into
-/// content-addressed keys (AGENTS.md rule 21). Returns `Ok(true)` when a NixOS closure was
-/// hashed, or `Ok(false)` on non-NixOS hosts or non-ELF files.
-pub fn feed_nix_runtime_closure(program_path: &str, feed: &mut dyn FnMut(&[u8])) -> Result<bool, Fault> {
+/// same transitive ELF64 runtime closure as [`grant_nix_elf_closure`] (bounded by `cx` before
+/// every open and 64 KiB read chunk) and feeds the canonical resolved path and file contents of
+/// the ELF interpreter, delegated glibc `ld.so`, and every transitive shared library into `feed` so
+/// callers can bind the host Nix runtime closure into content-addressed keys (AGENTS.md rule 21).
+/// Returns `Ok(true)` when a NixOS closure was hashed, or `Ok(false)` on non-NixOS hosts or
+/// non-ELF files.
+pub fn feed_nix_runtime_closure(cx: &Cx, program_path: &str, feed: &mut dyn FnMut(&[u8])) -> Result<bool, Fault> {
+    check_nix_cx(Some(cx))?;
     let bytes = program_path.as_bytes();
     if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= 4096 {
         return Err(Fault::Host { call: "nix runtime closure (invalid program path)", code: 22 });
@@ -200,7 +203,14 @@ pub fn feed_nix_runtime_closure(program_path: &str, feed: &mut dyn FnMut(&[u8]))
         return Err(Fault::Host { call: "nix runtime closure (invalid program path)", code: 22 });
     };
     let mut opt_feed = Some(feed);
-    walk_nix_elf_closure(None, cstr, None, None, false, &mut opt_feed)
+    walk_nix_elf_closure(Some(cx), None, cstr, None, None, false, &mut opt_feed)
+}
+
+fn check_nix_cx(cx: Option<&Cx>) -> Result<(), Fault> {
+    if let Some(cx) = cx {
+        cx.check().map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
+    }
+    Ok(())
 }
 
 /// Ordered inherited `DT_RPATH` pool-index chain (current/newest ancestor first, oldest last),
@@ -248,11 +258,12 @@ fn grant_nix_elf_closure(
     has_helper_folder: bool,
 ) -> Result<(), Fault> {
     let mut no_feed: Option<&mut dyn FnMut(&[u8])> = None;
-    let _ = walk_nix_elf_closure(Some(ruleset), program, verified_exec_fd, Some(plan), has_helper_folder, &mut no_feed)?;
+    let _ = walk_nix_elf_closure(None, Some(ruleset), program, verified_exec_fd, Some(plan), has_helper_folder, &mut no_feed)?;
     Ok(())
 }
 
 fn walk_nix_elf_closure(
+    cx: Option<&Cx>,
     ruleset: Option<Fd>,
     program: &CStr,
     verified_exec_fd: Option<Fd>,
@@ -264,6 +275,8 @@ fn walk_nix_elf_closure(
     const PATH_CAP: usize = 320;
     const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
     const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
+
+    check_nix_cx(cx)?;
 
     let opened_prog = match verified_exec_fd {
         Some(_) => None,
@@ -335,9 +348,9 @@ fn walk_nix_elf_closure(
         }
     }
     if let Some(f) = feed.as_deref_mut() {
-        feed_nix_file_by_path(interp_cstr, f)?;
+        feed_nix_file_by_path(cx, interp_cstr, f)?;
         if is_nix_ld {
-            feed_nix_file_by_path(NIX_LD_SO, f)?;
+            feed_nix_file_by_path(cx, NIX_LD_SO, f)?;
         }
     }
 
@@ -357,25 +370,22 @@ fn walk_nix_elf_closure(
 
     // Bounded BFS queue of `(canonical ELF path, len, ordered inherited DT_RPATH chain)` seeded
     // ONLY with the executable itself, its `PT_INTERP`, and (for `nix-ld`) `NIX_LD_SO`.
+    // For the primary program we always keep `program` (its shelf path) for `$ORIGIN` expansion
+    // even when `verified_exec_fd` is an anonymous sealed `memfd`.
     let mut queue = [([0u8; PATH_CAP], 0usize, RpathChain::EMPTY); MAX_LIBS];
     let mut q_len = 0usize;
     let mut q_head = 0usize;
     let mut rpath_pool = [([0u8; PATH_CAP], 0usize); 32];
     let mut rpath_pool_len = 0usize;
 
-    if let Some(efd) = verified_exec_fd {
-        let mut prog_real = [0u8; PATH_CAP];
-        let prog_len = readlink_fd_path(efd, &mut prog_real)?;
-        enqueue_nix_resolved_path(prog_real.get(..prog_len).unwrap_or(&[]), RpathChain::EMPTY, &mut queue, &mut q_len)?;
-    } else {
-        enqueue_nix_resolved_path(program.to_bytes(), RpathChain::EMPTY, &mut queue, &mut q_len)?;
-    }
+    enqueue_nix_resolved_path(program.to_bytes(), RpathChain::EMPTY, &mut queue, &mut q_len)?;
     enqueue_nix_resolved_path(interp_cstr.to_bytes(), RpathChain::EMPTY, &mut queue, &mut q_len)?;
     if is_nix_ld {
         enqueue_nix_resolved_path(NIX_LD_SO.to_bytes(), RpathChain::EMPTY, &mut queue, &mut q_len)?;
     }
 
     while q_head < q_len {
+        check_nix_cx(cx)?;
         let cur_idx = q_head;
         let mut cur_path = [0u8; PATH_CAP];
         let (cur_len, inherited_chain) = match queue.get(cur_idx) {
@@ -557,6 +567,7 @@ fn walk_nix_elf_closure(
                     });
                 }
                 if !try_grant_and_enqueue_lib(
+                    cx,
                     ruleset,
                     b"",
                     exp_slice,
@@ -574,6 +585,7 @@ fn walk_nix_elf_closure(
                 }
             } else {
                 enqueue_nix_soname(
+                    cx,
                     ruleset,
                     soname,
                     search_dirs.get(..search_count).unwrap_or(&[]),
@@ -855,6 +867,7 @@ fn enqueue_nix_canonical_slice<const N: usize>(
 }
 
 fn enqueue_nix_soname<const N: usize>(
+    cx: Option<&Cx>,
     ruleset: Option<Fd>,
     soname: &[u8],
     search_dirs: &[([u8; 320], usize)],
@@ -868,20 +881,21 @@ fn enqueue_nix_soname<const N: usize>(
 ) -> Result<(), Fault> {
     for (dir_buf, dir_len) in search_dirs {
         let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
-        if try_grant_and_enqueue_lib(ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+        if try_grant_and_enqueue_lib(cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
             return Ok(());
         }
     }
-    if try_grant_and_enqueue_lib(ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+    if try_grant_and_enqueue_lib(cx, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
         return Ok(());
     }
     if let Some(dir) = glibc_dir {
-        let _ = try_grant_and_enqueue_lib(ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)?;
+        let _ = try_grant_and_enqueue_lib(cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)?;
     }
     Ok(())
 }
 
 fn try_grant_and_enqueue_lib<const N: usize>(
+    cx: Option<&Cx>,
     ruleset: Option<Fd>,
     dir_prefix: &[u8],
     soname: &[u8],
@@ -892,6 +906,7 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     q_len: &mut usize,
     feed: &mut Option<&mut dyn FnMut(&[u8])>,
 ) -> Result<bool, Fault> {
+    check_nix_cx(cx)?;
     let mut candidate = [0u8; 320];
     let total = dir_prefix.len().saturating_add(soname.len());
     if total + 1 > candidate.len() {
@@ -940,27 +955,29 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         .get(..*q_len)
         .is_some_and(|used| used.iter().any(|(b, l, _)| *l == res_slice.len() && b.get(..*l) == Some(res_slice)));
     if first_seen_path && let Some(f) = feed.as_deref_mut() {
-        feed_nix_fd(res_slice, fd.fd(), f)?;
+        feed_nix_fd(cx, res_slice, fd.fd(), f)?;
     }
     enqueue_nix_canonical_slice(res_slice, child_chain, queue, q_len)?;
     Ok(true)
 }
 
-fn feed_nix_file_by_path(path: &CStr, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
+fn feed_nix_file_by_path(cx: Option<&Cx>, path: &CStr, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
+    check_nix_cx(cx)?;
     let fd = openat(CWD, blaze_sys::Path::new(path), OpenFlags::CLOSE_ON_EXEC, 0)
         .map_err(|errno| Fault::Host { call: "openat (nix runtime loader)", code: errno.raw() })?;
     let mut resolved = [0u8; 320];
     let res_len = readlink_fd_path(fd.fd(), &mut resolved)?;
-    feed_nix_fd(resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
+    feed_nix_fd(cx, resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
 }
 
-fn feed_nix_fd(canonical_path: &[u8], fd: Fd, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
+fn feed_nix_fd(cx: Option<&Cx>, canonical_path: &[u8], fd: Fd, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
     let path_len = u32::try_from(canonical_path.len()).unwrap_or(u32::MAX);
     feed(&path_len.to_le_bytes());
     feed(canonical_path);
     let mut buf = [0u8; 64 << 10];
     let mut offset = 0u64;
     loop {
+        check_nix_cx(cx)?;
         let n = pread(fd, &mut buf, offset)
             .map_err(|errno| Fault::Host { call: "pread (nix runtime closure hash)", code: errno.raw() })?;
         if n == 0 {
