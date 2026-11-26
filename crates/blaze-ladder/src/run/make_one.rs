@@ -54,7 +54,7 @@ use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared,
 use crate::front2::const_at::{ConstNeed, ConstTable, Needs};
 use crate::front2::coroutines::Coroutines;
 use crate::front2::program::lazy::LazyRefusal;
-use super::lay_states::{LaidOnly, Lay, forget_laid_in, lay_and_build, lay_only, roots_of_instance, unchecked_owner};
+use super::lay_states::{LaidOnly, Lay, forget_laid_in, lay_and_build_one, lay_only, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
 
 /// Whole-program demand-driven cross-function LIR inlining and LTO for `blaze export`.
@@ -2205,7 +2205,12 @@ fn build_lir_phase<P: FrontEnd>(
                 work.stash.swap_remove(at);
             }
             if find(&work.stash[..]).is_none() {
-                match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &[of], true, work.alloc)? {
+                // `of` may already have a types-only `StateShape` in `bodies.coroutines.states`
+                // from an earlier non-coroutine caller (`lay_only`). Forget `of`'s own shape
+                // (preserving already-laid child shapes) so `lay_and_build_one` lays and builds
+                // only `of` itself into `work.stash`.
+                bodies.coroutines.states.forget(of.owner, of.ordinal, &args);
+                match lay_and_build_one(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, of, true, work.alloc)? {
                     Lay::Done => {}
                     Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
                     Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
@@ -2228,10 +2233,13 @@ fn build_lir_phase<P: FrontEnd>(
         let extra_args = (instance.args != owner_args).then_some(instance.args);
         let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, work.alloc)?;
         if !roots.is_empty() {
-            match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, true, work.alloc)? {
-                Lay::Done => {}
-                Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
-                Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
+            // Non-coroutine callers (e.g. `Pin::as_mut`, `DerefMut::deref_mut`, `Box::into_pin`,
+            // `drop_glue`, async callers) only need each referenced coroutine's `StateShape`
+            // (types only), never its LIR — each coroutine builds its own LIR lazily when its
+            // `poll`/`resume`/`drop` entry is actually demanded.
+            match lay_only(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, i, &roots, work.alloc)? {
+                LaidOnly::Done(_) => {}
+                LaidOnly::Unchecked(owner) => return Ok(Phase1::Check(owner)),
             }
         }
     }
