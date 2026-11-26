@@ -1819,10 +1819,8 @@ const fn float_cond_to_mcond(c: FloatCond) -> Option<MCond> {
 }
 
 fn lookup_lir_call_clobbers(table: &[(u32, CallClobbers)], lir_inst: u32) -> CallClobbers {
-    for &(idx, clob) in table {
-        if idx == lir_inst {
-            return clob;
-        }
+    if let Ok(pos) = table.binary_search_by_key(&lir_inst, |&(idx, _)| idx) {
+        return table[pos].1;
     }
     CallClobbers::C_ABI_ARM64
 }
@@ -9782,6 +9780,7 @@ fn bind_call_clobbers<'a>(
             }
         }
     }
+    bound.sort_unstable_by_key(|&(idx, _)| idx);
     Ok(bound)
 }
 
