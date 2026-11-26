@@ -2332,6 +2332,11 @@ mod macos_app {
                 let _: () = unsafe { msg_send![super(self), viewDidEndLiveResize] };
                 dispatch_resize_event(ResizeEvent::DidEndLiveResize);
             }
+
+            #[unsafe(method(acceptsFirstMouse:))]
+            fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+                true
+            }
         }
     );
 
@@ -2725,6 +2730,7 @@ mod macos_app {
         let mut pty_buf = vec![0u8; 1 << 16];
         let mut keybuf = [0u8; 128];
         let mut dirty = true;
+        let mut was_key_window = window.isKeyWindow();
         let mut pty_sizes_dirty = false;
         let mut composite_scene = Scene::new();
         let mut tile_layout = TileLayout::default();
@@ -4471,10 +4477,26 @@ mod macos_app {
                                 }
                             }
                         }
-                        NSEventType::LeftMouseDown if window.isKeyWindow() => {
+                        NSEventType::LeftMouseDown
+                            if ev.windowNumber() == window.windowNumber() =>
+                        {
                             let pt = ev.locationInWindow();
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
+                            // Clicking an unfocused window activates it AND immediately focuses the
+                            // clicked pane, tab, button, or text cursor in a single click (never
+                            // requiring two clicks!). Traffic lights still go straight to AppKit.
+                            if !window.isKeyWindow() {
+                                let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
+                                if in_traffic_lights {
+                                    app.sendEvent(&ev);
+                                    continue;
+                                }
+                                #[allow(deprecated)]
+                                app.activateIgnoringOtherApps(true);
+                                window.makeKeyAndOrderFront(None);
+                                dirty = true;
+                            }
                             // 0. If the Command Palette is open, handle row clicks or backdrop dismiss!
                             if let Some(pal) = &command_palette {
                                 if let Some(HitAction::SelectPalette(idx)) = composite_scene.hit_test(x, y)
@@ -5891,6 +5913,11 @@ mod macos_app {
                 }
             }
 
+            let now_key_window = window.isKeyWindow();
+            if now_key_window != was_key_window {
+                was_key_window = now_key_window;
+                dirty = true;
+            }
             if dirty && !is_hidden_or_min {
                 let metrics = fonts.cell_metrics(scale);
                 // Steady non-blinking cursor (matches Ghostty `cursor-style-blink = false`).
