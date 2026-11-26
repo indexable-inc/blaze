@@ -2297,6 +2297,35 @@ impl<'a> TypeCtx for InferCtx<'a> {
         }
         Ok(Some(((inputs, cause), None)))
     }
+
+    fn closure_used_only_once(
+        &mut self,
+        closure: ExprId,
+        once_traits: [Option<ItemKey>; 2],
+        ref_traits: [Option<ItemKey>; 4],
+    ) -> bool {
+        let mut saw_once = false;
+        let mut saw_ref = false;
+        for i in 0..self.obs.len() {
+            let (trait_, args) = match self.obs[i].goal {
+                Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } => (trait_, args),
+                _ => continue,
+            };
+            if self.list_len(args) == 0 {
+                continue;
+            }
+            let self_ty = self.shallow_resolve(self.list_get(args, 0));
+            if !matches!(self.view(self_ty), TyView::Closure(e, _) if e == closure) {
+                continue;
+            }
+            if ref_traits.contains(&Some(trait_)) {
+                saw_ref = true;
+            } else if once_traits.contains(&Some(trait_)) {
+                saw_once = true;
+            }
+        }
+        saw_once && !saw_ref
+    }
 }
 
 fn mutability(m: crate::ids::Mutbl) -> blaze_ty::Mutability {

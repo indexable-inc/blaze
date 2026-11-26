@@ -179,8 +179,8 @@ fn storage_tuple<'a>(
     let saved = w.saved(alloc).map_err(|_| tc::CheckError::FutureWitness {
         reason: "saved-local analysis exceeded its bound", at: w.range(),
     })?;
-    // The witness lays one argument per whole-binding row of the block (its layout's count).
-    let rows = done.captures.column::<0>().iter().filter(|b| **b == block).count();
+    // The witness lays one argument per captured place field (`coroutine.rs::run_async`).
+    let rows = done.env_fields_by::<tc::Places>(block).count();
     if rows != w.args() as usize {
         return Err(invalid);
     }
