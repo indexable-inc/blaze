@@ -141,6 +141,7 @@ mod macos_app {
         demo_history: bool,
         demo_tiled: bool,
         scroll_bottom: bool,
+        scroll_y: Option<f32>,
         cwd: Option<String>,
         cmd: Option<String>,
         screenshot: Option<PathBuf>,
@@ -152,6 +153,7 @@ mod macos_app {
         let mut demo_history = false;
         let mut demo_tiled = false;
         let mut scroll_bottom = false;
+        let mut scroll_y = None;
         let mut cwd = None;
         let mut cmd = None;
         let mut screenshot = None;
@@ -172,6 +174,11 @@ mod macos_app {
                     demo_tiled = true;
                 }
                 "--scroll-bottom" => scroll_bottom = true,
+                "--scroll" => {
+                    if let Some(v) = args.next() {
+                        scroll_y = v.parse::<f32>().ok();
+                    }
+                }
                 "--cwd" => {
                     if let Some(d) = args.next() {
                         cwd = Some(d);
@@ -190,7 +197,17 @@ mod macos_app {
                 _ => {}
             }
         }
-        CliOpts { demo, demo_popup, demo_history, demo_tiled, scroll_bottom, cwd, cmd, screenshot }
+        CliOpts {
+            demo,
+            demo_popup,
+            demo_history,
+            demo_tiled,
+            scroll_bottom,
+            scroll_y,
+            cwd,
+            cmd,
+            screenshot,
+        }
     }
 
     /// Spawn a fresh native macOS `blaze-shell` window inheriting `cwd` (`Cmd+N`).
@@ -1964,7 +1981,10 @@ mod macos_app {
         }
         if let Some(ref startup_cmd) = cli.cmd {
             first_pane.submit_command(startup_cmd, init_cols, init_rows, cell_px, false);
-            if !cli.scroll_bottom {
+            if let Some(sy) = cli.scroll_y {
+                first_pane.scroll_y = sy.max(0.0);
+                first_pane.auto_scroll_bottom = false;
+            } else if !cli.scroll_bottom {
                 first_pane.scroll_y = 0.0;
                 first_pane.auto_scroll_bottom = false;
             }
@@ -2035,7 +2055,7 @@ mod macos_app {
             for (slot, rgba) in icon_atlas.pending.drain(..) {
                 renderer.upload_icon(slot, &rgba);
             }
-            let images = image_atlas.rasterize_quads(&scene.image_quads);
+            let (images, _) = image_atlas.rasterize_quads(&scene.image_quads, 0);
             for (slot, rgba) in image_atlas.pending.drain(..) {
                 renderer.upload_image(slot, &rgba);
             }
@@ -2078,6 +2098,9 @@ mod macos_app {
         let mut trail_prev: Option<[f32; 4]> = None;
         let mut trail_start: Option<Instant> = None;
         let mut last_running_tick = Instant::now();
+        let mut last_anim_tick = Instant::now();
+        let mut has_animated_images = false;
+        let anim_epoch = Instant::now();
         let mut pending_drag: Option<PendingDrag> = None;
         let mut selecting_composer = false;
         let mut selecting_output = false;
@@ -4158,6 +4181,10 @@ mod macos_app {
                 last_running_tick = Instant::now();
                 dirty = true;
             }
+            if has_animated_images && !is_hidden_or_min && last_anim_tick.elapsed().as_millis() >= 33 {
+                last_anim_tick = Instant::now();
+                dirty = true;
+            }
 
             // Handle window resize, backing scale changes, and `Cmd+`/`Cmd-`/`Cmd+0` zoom.
             let new_size = view.bounds().size;
@@ -4258,7 +4285,9 @@ mod macos_app {
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
                 }
-                let images = image_atlas.rasterize_quads(&scene.image_quads);
+                let anim_ms = anim_epoch.elapsed().as_millis() as u64;
+                let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms);
+                has_animated_images = any_anim;
                 for (slot, rgba) in image_atlas.pending.drain(..) {
                     renderer.upload_image(slot, &rgba);
                 }

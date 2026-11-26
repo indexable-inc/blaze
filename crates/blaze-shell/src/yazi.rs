@@ -1511,18 +1511,19 @@ fn render_md_image(
         None
     };
 
-    let is_raster = resolved.as_ref().is_some_and(|p| {
+    let is_supported_img = resolved.as_ref().is_some_and(|p| {
         p.extension()
             .and_then(|e| e.to_str())
             .is_some_and(|ext| {
                 matches!(
                     ext.to_ascii_lowercase().as_str(),
-                    "webp" | "png" | "jpg" | "jpeg" | "gif" | "heic" | "bmp" | "tif" | "tiff"
+                    "webp" | "avif" | "png" | "jpg" | "jpeg" | "gif" | "heic" | "bmp" | "tif"
+                        | "tiff" | "svg"
                 )
             })
     });
 
-    if let Some(full) = resolved.as_ref().filter(|_| is_raster) {
+    if let Some(full) = resolved.as_ref().filter(|_| is_supported_img) {
         let probed = crate::image_atlas::probe_image_size(full);
         let (nat_w, nat_h) = match (attr_w, attr_h, probed) {
             (Some(w), Some(h), _) => (w as f32, h as f32),
@@ -1534,7 +1535,7 @@ fn render_md_image(
         };
         let mut dw = nat_w.min(max_w);
         let mut dh = if nat_w > 0.0 { nat_h * (dw / nat_w) } else { 160.0 };
-        let max_h = (max_y - y - 8.0).clamp(48.0, 360.0);
+        let max_h = (max_y - y - 8.0).clamp(48.0, 480.0);
         if dh > max_h && dh > 0.0 {
             dw *= max_h / dh;
             dh = max_h;
@@ -1613,10 +1614,10 @@ fn render_md_table(
             let (face, bold) = span_face_bold(sp.style, bold_hdr, TextFace::Ui);
             total += m.measure_styled(sp.text.as_str(), face, bold);
             if matches!(sp.style, MdStyle::Code | MdStyle::Kbd) {
-                total += 8.0;
+                total += 10.0;
             }
         }
-        total + 22.0
+        total + 30.0
     };
     for (ci, h) in tbl.headers.iter().enumerate() {
         if ci < ncols {
@@ -1892,10 +1893,17 @@ fn render_md_spans_single_line(
         }
         let (face, bold) = span_face_bold(sp.style, force_bold, prose_face);
         let pad = if matches!(sp.style, MdStyle::Code | MdStyle::Kbd) { 4.0 } else { 0.0 };
-        let avg_cw = m.measure("n", face).max(4.0);
-        let max_c = ((rem_w - pad * 2.0) / avg_cw).floor().max(2.0) as usize;
-        let txt = truncate_chars(sp.text.as_str(), max_c);
-        let sw = m.measure_styled(&txt, face, bold);
+        let avail = (rem_w - pad * 2.0).max(0.0);
+        let full_w = m.measure_styled(sp.text.as_str(), face, bold);
+        let (txt, sw) = if full_w <= avail + 2.0 {
+            (sp.text.as_str().to_owned(), full_w)
+        } else {
+            let avg_cw = m.measure("e", face).max(4.0);
+            let max_c = (avail / avg_cw).floor().max(2.0) as usize;
+            let t = truncate_chars(sp.text.as_str(), max_c);
+            let w = m.measure_styled(&t, face, bold);
+            (t, w)
+        };
         cx += pad;
         draw_styled_md_run(scene, &txt, sp.style, sw, cx, y, base_col, force_bold, prose_face, m, clip);
         cx += sw + pad;

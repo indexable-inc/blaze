@@ -168,6 +168,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-data",
  "blaze-git",
+ "blaze-html",
  "blaze-json",
  "blaze-own",
  "blaze-preview",

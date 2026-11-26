@@ -1458,7 +1458,7 @@ fn layout_value(
             let base_dir = target_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(&block.prompt_snapshot.cwd));
-            let max_h = if block.folded { 520.0 } else { 6400.0 };
+            let max_h = if block.folded { 520.0 } else { 16000.0 };
             crate::yazi::render_rich_preview(
                 scene,
                 &doc,
