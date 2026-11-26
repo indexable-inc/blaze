@@ -30,7 +30,7 @@ use blaze_ladder::code_records::{CodeKey, entry_of, statics};
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker};
 use blaze_ladder::run::special::{EntryForm, Roots, Special, make_special, run_roots};
 use blaze_ladder::run::RunError;
-use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, String, Vec};
+use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, SharedAlloc, String, Vec};
 use blaze_typeck::ItemKey;
 use bstd::Cx;
 use bstd::entry::Status;
@@ -386,8 +386,8 @@ enum RowOutcome<'a> {
     /// (`Machine::SME2 | Machine::CSSC | Machine::SHA3`), kept ephemeral in `export_bump` so
     /// host-specific code never enters portable `HomeCodeStore` (Rule 25).
     Lto {
-        record: AVec<'a, u8>,
-        vtable_data: AVec<'a, (CodeSymbol, AVec<'a, u8>)>,
+        record: Vec<u8, SharedAlloc<'static>>,
+        vtable_data: Vec<(CodeSymbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     },
     /// A non-root library/cold function that `blaze-build` cannot lower to LIR yet: replaced by a
     /// deterministic trap stub (`write(2, msg, len); _exit(125); brk #0`) that reports the exact
@@ -660,6 +660,181 @@ fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSym
     false
 }
 
+/// Virtual reservation for each parallel export LTO worker's reusable scratch frame (reset after
+/// every body, trimmed when committed exceeds [`EXPORT_LTO_WORKER_TRIM`]). Untouched virtual pages
+/// cost zero RSS; 2 GiB avoids exhausting bump space on large post-inline functions.
+const EXPORT_LTO_WORKER_FRAME: usize = 2 << 30;
+const EXPORT_LTO_WORKER_KEEP: usize = 4 << 20;
+const EXPORT_LTO_WORKER_TRIM: usize = 32 << 20;
+/// Minimum batch count to fan out export LTO work across worker threads.
+const EXPORT_LTO_PAR_MIN: usize = 4;
+
+/// Chooses the dynamic work-stealing batch size for `count` items across `worker_count` workers.
+#[inline]
+const fn lto_batch_size(count: usize, worker_count: usize) -> usize {
+    if count >= worker_count.saturating_mul(16) { 4 } else { 1 }
+}
+
+/// Atomically claims the next `[start, end)` batch of indices from `next`, returning `None` once
+/// all `count` items have been claimed.
+#[inline]
+fn steal_next_batch(
+    next: &bstd::sync::CachePadded<core::sync::atomic::AtomicUsize>,
+    batch: usize,
+    count: usize,
+) -> Option<(usize, usize)> {
+    let start = next.fetch_add(batch, core::sync::atomic::Ordering::Relaxed);
+    if start >= count {
+        return None;
+    }
+    Some((start, start.saturating_add(batch).min(count)))
+}
+
+/// Validates and merges out-of-order `(index, T)` worker outputs into exact ascending `0..count`
+/// order (Rule 25), refusing any worker/scope failure, out-of-bounds index, duplicate index, or
+/// missing index (Rule 3).
+fn collect_lto_worker_parts<T>(
+    count: usize,
+    parts: Vec<Result<Vec<(usize, T), SharedAlloc<'static>>, &'static str>, SharedAlloc<'static>>,
+    scope_failed: bool,
+    out_alloc: SharedAlloc<'static>,
+) -> Result<Vec<T, SharedAlloc<'static>>, blaze_ladder::run::make_one::export_lto::ExportLtoSimplifyError> {
+    use blaze_ladder::run::make_one::export_lto::ExportLtoSimplifyError;
+
+    let mut slots: Vec<Option<T>, SharedAlloc<'static>> = Vec::with_capacity_in(count, out_alloc);
+    for _ in 0..count {
+        slots.push(None);
+    }
+    let mut err_what: Option<&'static str> = None;
+    for part_res in parts {
+        match part_res {
+            Ok(part) => {
+                for (idx, item) in part {
+                    let Some(slot) = slots.get_mut(idx) else {
+                        err_what.get_or_insert("export LTO worker index out of range");
+                        continue;
+                    };
+                    if slot.is_some() {
+                        err_what.get_or_insert("export LTO worker duplicated index");
+                        continue;
+                    }
+                    *slot = Some(item);
+                }
+            }
+            Err(what) => {
+                err_what.get_or_insert(what);
+            }
+        }
+    }
+    if scope_failed {
+        err_what.get_or_insert("export LTO worker scope join failed");
+    }
+    if let Some(what) = err_what {
+        return Err(ExportLtoSimplifyError::Refused { inst: 0, what });
+    }
+    let mut out = Vec::with_capacity_in(count, out_alloc);
+    for slot in slots {
+        let Some(item) = slot else {
+            return Err(ExportLtoSimplifyError::Refused { inst: 0, what: "export LTO worker missed index" });
+        };
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// `Cx::scope`-backed parallel executor for `optimize_export_workspace_par`: dynamically steals
+/// work across `workers` with one reusable bump [`Frame`] per worker and returns results in exact
+/// ascending index order (Rule 25).
+struct CliLtoRunner<'c> {
+    cx: &'c Cx,
+    workers: core::num::NonZeroU32,
+}
+
+impl blaze_ladder::run::make_one::export_lto::ExportLtoRunner for CliLtoRunner<'_> {
+    fn par_map<T: Send, F>(
+        &self,
+        count: usize,
+        out_alloc: SharedAlloc<'static>,
+        f: F,
+    ) -> Result<Vec<T, SharedAlloc<'static>>, blaze_ladder::run::make_one::export_lto::ExportLtoSimplifyError>
+    where
+        F: Fn(usize, Alloc<'_>) -> T + Sync,
+    {
+        use blaze_ladder::run::make_one::export_lto::ExportLtoSimplifyError;
+
+        let mut out = Vec::with_capacity_in(count, out_alloc);
+        if count == 0 {
+            return Ok(out);
+        }
+        let active_workers = self.workers.get().min(self.cx.workers());
+        if count < EXPORT_LTO_PAR_MIN || active_workers <= 1 {
+            let mut scratch = Frame::with_reserve(EXPORT_LTO_WORKER_FRAME, bstd::mem::Tag::Other)
+                .map_err(|_| ExportLtoSimplifyError::Refused { inst: 0, what: "export LTO scratch frame reserve failed" })?;
+            for idx in 0..count {
+                if self.cx.check().is_err() {
+                    return Err(ExportLtoSimplifyError::Refused { inst: 0, what: "export LTO worker stopped" });
+                }
+                scratch.reset();
+                if scratch.committed() > EXPORT_LTO_WORKER_TRIM {
+                    scratch.trim(EXPORT_LTO_WORKER_KEEP);
+                }
+                let erased = Erased::new(&scratch);
+                out.push(f(idx, erased.handle()));
+            }
+            return Ok(out);
+        }
+
+        let worker_count = usize::try_from(active_workers).unwrap_or(1).min(count);
+        let batch = lto_batch_size(count, worker_count);
+        let next = bstd::sync::CachePadded::new(core::sync::atomic::AtomicUsize::new(0));
+        let next_ref = &next;
+        let f_ref = &f;
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let mut handles = Vec::with_capacity_in(worker_count, out_alloc);
+        let est_per_worker = (count / worker_count).saturating_add(batch);
+        for _ in 0..worker_count {
+            handles.push(scope.may_overlap(
+                "export: LTO worker",
+                4 << 20,
+                move |worker_cx: &Cx| -> Result<_, core::convert::Infallible> {
+                    let mut scratch = match Frame::with_reserve(EXPORT_LTO_WORKER_FRAME, bstd::mem::Tag::Other) {
+                        Ok(frame) => frame,
+                        Err(_) => return Ok(Err("export LTO worker scratch frame reserve failed")),
+                    };
+                    let mut local: Vec<(usize, T), SharedAlloc<'static>> = Vec::with_capacity_in(est_per_worker, out_alloc);
+                    while let Some((start, end)) = steal_next_batch(next_ref, batch, count) {
+                        if worker_cx.check().is_err() {
+                            return Ok(Err("export LTO worker stopped"));
+                        }
+                        for idx in start..end {
+                            scratch.reset();
+                            if scratch.committed() > EXPORT_LTO_WORKER_TRIM {
+                                scratch.trim(EXPORT_LTO_WORKER_KEEP);
+                            }
+                            let erased = Erased::new(&scratch);
+                            local.push((idx, f_ref(idx, erased.handle())));
+                        }
+                    }
+                    Ok(Ok(local))
+                },
+            ));
+        }
+
+        let mut parts: Vec<Result<Vec<(usize, T), SharedAlloc<'static>>, &'static str>, SharedAlloc<'static>> =
+            Vec::with_capacity_in(handles.len(), out_alloc);
+        for handle in handles {
+            match handle.join(self.cx) {
+                Ok(Ok(part)) => parts.push(Ok(part)),
+                Ok(Err(what)) => parts.push(Err(what)),
+                Err(_) => parts.push(Err("export LTO worker task panicked or stopped")),
+            }
+        }
+        let scope_failed = scope.join(self.cx).is_err();
+        collect_lto_worker_parts(count, parts, scope_failed, out_alloc)
+    }
+}
+
 /// Core whole-program reachability closure + `blaze_export::export` + atomic write + chmod.
 fn export_program<'f>(
     cx: &Cx,
@@ -855,17 +1030,19 @@ fn export_program<'f>(
         }
     }
     let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
+    let lto_runner = CliLtoRunner { cx, workers: standing.workers };
     let lto_out = {
         let _lto_span = cx.span("export: workspace LTO");
-        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+        blaze_ladder::run::make_one::export_lto::optimize_export_workspace_par(
             &walk,
             lto_seeds.as_slice(),
             |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
             |tabled| ids.runnable(tabled).ok(),
             &mut maker,
             lto_opts,
+            heap.shared(),
             alloc,
-            heap.alloc(),
+            &lto_runner,
         )
         .map_err(|why| {
             box_err(
@@ -879,7 +1056,7 @@ fn export_program<'f>(
     let lto_hot_symbols = lto_out.hot_symbols;
     let lto_profile_digest = lto_out.profile_digest;
     let lto_hot = lto_hot_symbols.len();
-    let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
+    let mut extra_roots: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(heap.shared());
     for body in lto_out.bodies {
         if let Some(slot) = outcomes.get_mut(body.row) {
             *slot = RowOutcome::Lto {
@@ -1749,5 +1926,391 @@ mod tests {
         let msg = std::format!("{err}");
         assert!(msg.contains("keeping program code root failed"), "{msg}");
         assert!(msg.contains("disk full"), "{msg}");
+    }
+
+    #[test]
+    fn cli_lto_scheduler_dst_interleavings_failures_and_oracle() {
+        use core::sync::atomic::AtomicUsize;
+
+        let shared = blaze_own::testing::heap().shared();
+        blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
+            let worker_count = usize::try_from(tape.int_in(1..=8u64, "workers")).expect("workers");
+            let count = usize::try_from(tape.int_in(0..=64u64, "count")).expect("count");
+            let inject_worker_err = tape.coin("inject worker error");
+            let inject_scope_err = tape.coin("inject scope error");
+            let fail_worker = if inject_worker_err {
+                Some(usize::try_from(tape.int_in(0..=u64::try_from(worker_count - 1).expect("w"), "fail worker")).expect("fw"))
+            } else {
+                None
+            };
+            let fail_after_steps = usize::try_from(tape.int_in(0..=4u64, "fail after steps")).expect("steps");
+
+            let batch = lto_batch_size(count, worker_count.min(count.max(1)));
+            let next = bstd::sync::CachePadded::new(AtomicUsize::new(0));
+            let eval_item = |idx: usize| -> u64 {
+                let x = u64::try_from(idx).expect("idx");
+                x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(13) ^ x.wrapping_add(17)
+            };
+
+            // Sequential oracle.
+            let mut oracle: Vec<u64, SharedAlloc<'static>> = Vec::with_capacity_in(count, shared);
+            for idx in 0..count {
+                oracle.push(eval_item(idx));
+            }
+
+            // Simulate concurrent step-by-step interleavings across `worker_count` workers sharing
+            // the production atomic `steal_next_batch` cursor.
+            struct SimWorker {
+                pending: Option<(usize, usize)>,
+                done: bool,
+                steps: usize,
+                failed: Option<&'static str>,
+                out: Vec<(usize, u64), SharedAlloc<'static>>,
+            }
+            let mut workers: Vec<SimWorker, SharedAlloc<'static>> = Vec::with_capacity_in(worker_count, shared);
+            for _ in 0..worker_count {
+                workers.push(SimWorker {
+                    pending: None,
+                    done: false,
+                    steps: 0,
+                    failed: None,
+                    out: Vec::new_in(shared),
+                });
+            }
+            let mut hits: Vec<usize, SharedAlloc<'static>> = Vec::with_capacity_in(count, shared);
+            for _ in 0..count {
+                hits.push(0);
+            }
+
+            loop {
+                let mut active: Vec<usize, SharedAlloc<'static>> = Vec::with_capacity_in(worker_count, shared);
+                for (w_idx, w) in workers.iter().enumerate() {
+                    if !w.done {
+                        active.push(w_idx);
+                    }
+                }
+                if active.is_empty() {
+                    break;
+                }
+                let pick_pos = usize::try_from(
+                    tape.int_in(0..=u64::try_from(active.len() - 1).expect("active"), "pick worker"),
+                )
+                .expect("pick");
+                let w_idx = active[pick_pos];
+                let w = &mut workers[w_idx];
+
+                if fail_worker == Some(w_idx) && w.steps >= fail_after_steps {
+                    w.failed = Some("injected worker cancellation");
+                    w.done = true;
+                    continue;
+                }
+
+                if let Some((cur, end)) = w.pending {
+                    hits[cur] += 1;
+                    w.out.push((cur, eval_item(cur)));
+                    w.steps += 1;
+                    if cur + 1 < end {
+                        w.pending = Some((cur + 1, end));
+                    } else {
+                        w.pending = None;
+                    }
+                } else if let Some((start, end)) = steal_next_batch(&next, batch, count) {
+                    w.pending = Some((start, end));
+                } else {
+                    w.done = true;
+                }
+            }
+
+            // Shuffle worker completion order before merging through `collect_lto_worker_parts`.
+            let mut order: Vec<usize, SharedAlloc<'static>> = Vec::with_capacity_in(worker_count, shared);
+            for i in 0..worker_count {
+                order.push(i);
+            }
+            for i in (1..order.len()).rev() {
+                let j = usize::try_from(tape.int_in(0..=u64::try_from(i).expect("i"), "shuffle")).expect("j");
+                order.swap(i, j);
+            }
+
+            let mut any_failed = inject_scope_err;
+            let mut raw_parts: Vec<Option<Result<Vec<(usize, u64), SharedAlloc<'static>>, &'static str>>, SharedAlloc<'static>> =
+                Vec::with_capacity_in(worker_count, shared);
+            for w in workers {
+                if let Some(err) = w.failed {
+                    any_failed = true;
+                    raw_parts.push(Some(Err(err)));
+                } else {
+                    raw_parts.push(Some(Ok(w.out)));
+                }
+            }
+            let mut shuffled_parts: Vec<Result<Vec<(usize, u64), SharedAlloc<'static>>, &'static str>, SharedAlloc<'static>> =
+                Vec::with_capacity_in(worker_count, shared);
+            for idx in order {
+                if let Some(part) = raw_parts[idx].take() {
+                    shuffled_parts.push(part);
+                }
+            }
+
+            let got = collect_lto_worker_parts(count, shuffled_parts, inject_scope_err, shared);
+            if any_failed {
+                assert!(
+                    got.is_err(),
+                    "expected worker/scope failure to propagate (worker_err={inject_worker_err}, scope_err={inject_scope_err})"
+                );
+            } else {
+                let got = got.expect("clean concurrent schedule must succeed");
+                assert_eq!(got.as_slice(), oracle.as_slice(), "merged output must match sequential oracle");
+                for (idx, &h) in hits.iter().enumerate() {
+                    assert_eq!(h, 1, "index {idx} must be executed exactly once, got {h}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cli_lto_scheduler_dst_catches_planted_bugs() {
+        let shared = blaze_own::testing::heap().shared();
+        let oracle: [u64; 4] = [10, 20, 30, 40];
+
+        // Planted bug 1: skipping index-order restoration (concatenating shuffled worker outputs).
+        let mut p0 = Vec::new_in(shared);
+        p0.push((2usize, 30u64));
+        p0.push((3usize, 40u64));
+        let mut p1 = Vec::new_in(shared);
+        p1.push((0usize, 10u64));
+        p1.push((1usize, 20u64));
+        let mut buggy_concat: Vec<u64, SharedAlloc<'static>> = Vec::new_in(shared);
+        for &(_, v) in p0.iter().chain(p1.iter()) {
+            buggy_concat.push(v);
+        }
+        assert_ne!(
+            buggy_concat.as_slice(),
+            &oracle,
+            "Rule 23 control: oracle must catch unordered worker concatenation"
+        );
+        let mut good_parts = Vec::new_in(shared);
+        good_parts.push(Ok(p0));
+        good_parts.push(Ok(p1));
+        assert_eq!(
+            collect_lto_worker_parts(4, good_parts, false, shared).expect("valid").as_slice(),
+            &oracle
+        );
+
+        // Planted bug 2: duplicate index emitted by two workers must be refused.
+        let mut d0 = Vec::new_in(shared);
+        d0.push((0usize, 10u64));
+        d0.push((1usize, 20u64));
+        let mut d1 = Vec::new_in(shared);
+        d1.push((1usize, 20u64));
+        d1.push((2usize, 30u64));
+        d1.push((3usize, 40u64));
+        let mut dup_parts = Vec::new_in(shared);
+        dup_parts.push(Ok(d0));
+        dup_parts.push(Ok(d1));
+        assert!(
+            collect_lto_worker_parts(4, dup_parts, false, shared).is_err(),
+            "Rule 23 control: duplicate index must be caught"
+        );
+
+        // Planted bug 3: dropped index must be refused.
+        let mut m0 = Vec::new_in(shared);
+        m0.push((0usize, 10u64));
+        m0.push((1usize, 20u64));
+        let mut m1 = Vec::new_in(shared);
+        m1.push((3usize, 40u64));
+        let mut missing_parts = Vec::new_in(shared);
+        missing_parts.push(Ok(m0));
+        missing_parts.push(Ok(m1));
+        assert!(
+            collect_lto_worker_parts(4, missing_parts, false, shared).is_err(),
+            "Rule 23 control: missing index must be caught"
+        );
+
+        // Planted bug 4: worker cancellation/failure must never be swallowed.
+        let mut f0 = Vec::new_in(shared);
+        f0.push((0usize, 10u64));
+        let mut err_parts = Vec::new_in(shared);
+        err_parts.push(Ok(f0));
+        err_parts.push(Err("export LTO worker stopped"));
+        assert!(
+            collect_lto_worker_parts(4, err_parts, false, shared).is_err(),
+            "Rule 23 control: worker failure must propagate"
+        );
+    }
+
+    #[test]
+    fn cli_lto_runner_parallel_workers_match_sequential_lto() {
+        use blaze_ladder::run::make_one::export_lto::ExportLtoRunner;
+        use blaze_lir::{
+            BlockKind, Flags, Op, Ty, View,
+            body::{Bodies, BodyId, Target},
+            builder::{Builder, Full, Param, Variadic},
+            func::{Conv, RefId, RefKind},
+            inline::{InlinePolicy, NoWeights},
+            lto::{ModuleBody, lto_optimize_module, lto_optimize_module_par},
+            verify,
+        };
+        use bstd::io::{Io, Limits, SimWorld};
+        use core::num::NonZeroU32;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let shared = blaze_own::testing::heap().shared();
+        let alloc = Alloc::from(shared);
+        let io = Io::simulated(SimWorld::new(101, Limits::USUAL));
+        let workers = NonZeroU32::new(4).expect("4 workers");
+
+        io.with_test_workers(workers, |cx| {
+            assert_eq!(cx.workers(), 4, "test pool must run with 4 real workers");
+            let runner = CliLtoRunner { cx, workers };
+
+            // 1. Direct `CliLtoRunner::par_map` across serial threshold (<4) and parallel (>=4)
+            //    batches, exercising scratch bump allocations and verifying exact-once execution.
+            for &count in &[0usize, 1, 3, 4, 15, 64, 137] {
+                let mut hit_vec: Vec<AtomicUsize, SharedAlloc<'static>> = Vec::with_capacity_in(count, shared);
+                for _ in 0..count {
+                    hit_vec.push(AtomicUsize::new(0));
+                }
+                let hits = hit_vec.as_slice();
+                let got = runner
+                    .par_map(count, shared, |idx, scratch| {
+                        hits[idx].fetch_add(1, Ordering::Relaxed);
+                        // Exercise per-worker scratch frame reset/allocation.
+                        let mut tmp: Vec<u64, Alloc<'_>> = Vec::with_capacity_in(16, scratch);
+                        for k in 0..16u64 {
+                            tmp.push(u64::try_from(idx).expect("idx").wrapping_mul(31).wrapping_add(k));
+                        }
+                        tmp.iter().copied().fold(0u64, u64::wrapping_add)
+                    })
+                    .expect("par_map succeeds");
+                assert_eq!(got.len(), count);
+                for idx in 0..count {
+                    assert_eq!(hits[idx].load(Ordering::Relaxed), 1, "count={count} idx={idx}");
+                    let mut want = 0u64;
+                    for k in 0..16u64 {
+                        want = want.wrapping_add(u64::try_from(idx).expect("idx").wrapping_mul(31).wrapping_add(k));
+                    }
+                    assert_eq!(got[idx], want, "count={count} idx={idx}");
+                }
+            }
+
+            // 2. End-to-end `lto_optimize_module_par` running on real multi-threaded `CliLtoRunner`
+            //    across an 8-body multi-level DAG (forcing parallel pre-simplify AND parallel
+            //    wavefront SCC inlining with >=4 SCCs in a level) vs `lto_optimize_module`.
+            let leaf_ids: [BodyId; 4] = [
+                BodyId([31u8; 32]),
+                BodyId([32u8; 32]),
+                BodyId([33u8; 32]),
+                BodyId([34u8; 32]),
+            ];
+            let root_ids: [BodyId; 4] = [
+                BodyId([41u8; 32]),
+                BodyId([42u8; 32]),
+                BodyId([43u8; 32]),
+                BodyId([44u8; 32]),
+            ];
+
+            let mut leaf_funcs = Vec::with_capacity_in(4, shared);
+            for i in 0..4u64 {
+                let mut b = Builder::<_, Full>::new_in(64, alloc);
+                let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+                b.set_signature(sig);
+                let entry = b.create_block(BlockKind::Normal);
+                b.begin(entry);
+                let x = b.param(Ty::I64);
+                let c = b.iconst(Ty::I64, u128::from(i + 3));
+                let y = b.binary(Op::Add, Flags::NONE, x, c);
+                b.ret(&[y]);
+                leaf_funcs.push(b.finish_checked().expect("leaf").view().to_func_in(shared));
+            }
+
+            let mut root_funcs = Vec::with_capacity_in(4, shared);
+            let mut root_refs: [(RefId, RefId); 4] = [(RefId(0), RefId(0)); 4];
+            for i in 0..4usize {
+                let mut b = Builder::<_, Full>::new_in(64, alloc);
+                let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+                b.set_signature(sig);
+                let r0 = b.reference(RefKind::Func, 0);
+                let r1 = b.reference(RefKind::Func, 1);
+                let entry = b.create_block(BlockKind::Normal);
+                b.begin(entry);
+                let x = b.param(Ty::I64);
+                let a = b.call(Flags::NONE, r0, sig, &[x]);
+                let bb = b.call(Flags::NONE, r1, sig, &[a]);
+                b.ret(&[bb]);
+                root_refs[i] = (r0, r1);
+                root_funcs.push(b.finish_checked().expect("root").view().to_func_in(shared));
+            }
+
+            struct EightBodyBank<'a> {
+                leaf_ids: [BodyId; 4],
+                root_ids: [BodyId; 4],
+                root_refs: [(RefId, RefId); 4],
+                leaf_views: [View<'a>; 4],
+            }
+
+            impl Bodies for EightBodyBank<'_> {
+                fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+                    for i in 0..4 {
+                        if from == self.root_ids[i] {
+                            let (r0, r1) = self.root_refs[i];
+                            if reference == r0 {
+                                return Some((self.leaf_ids[i], self.leaf_views[i]));
+                            }
+                            if reference == r1 {
+                                let next = (i + 1) % 4;
+                                return Some((self.leaf_ids[next], self.leaf_views[next]));
+                            }
+                        }
+                    }
+                    None
+                }
+
+                fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+                    self.callee(from, reference).map(|(id, _)| Target::Func(id))
+                }
+            }
+
+            let bank = EightBodyBank {
+                leaf_ids,
+                root_ids,
+                root_refs,
+                leaf_views: [
+                    leaf_funcs[0].view(),
+                    leaf_funcs[1].view(),
+                    leaf_funcs[2].view(),
+                    leaf_funcs[3].view(),
+                ],
+            };
+
+            let mut seq_mod = Vec::with_capacity_in(8, alloc);
+            let mut par_mod = Vec::with_capacity_in(8, shared);
+            for i in 0..4 {
+                seq_mod.push(ModuleBody { id: root_ids[i], func: root_funcs[i].view().to_func_in(alloc) });
+                par_mod.push(ModuleBody { id: root_ids[i], func: root_funcs[i].view().to_func_in(shared) });
+            }
+            for i in 0..4 {
+                seq_mod.push(ModuleBody { id: leaf_ids[i], func: leaf_funcs[i].view().to_func_in(alloc) });
+                par_mod.push(ModuleBody { id: leaf_ids[i], func: leaf_funcs[i].view().to_func_in(shared) });
+            }
+
+            let policy = InlinePolicy::default();
+            let seq = lto_optimize_module(seq_mod, &bank, &NoWeights, policy, alloc).expect("seq lto");
+            let par = lto_optimize_module_par(par_mod, &bank, &NoWeights, policy, shared, &runner).expect("par lto");
+
+            assert_eq!(par.scc_count, seq.scc_count);
+            assert_eq!(par.total_inlined_bodies, seq.total_inlined_bodies);
+            assert!(par.total_inlined_bodies >= 8, "expected all 8 root->leaf calls inlined");
+            assert_eq!(par.bodies.len(), seq.bodies.len());
+            for (p, s) in par.bodies.iter().zip(seq.bodies.iter()) {
+                assert_eq!(p.id, s.id);
+                assert_eq!(p.summary.summary_hash, s.summary.summary_hash);
+                assert_eq!(p.prev_summary.summary_hash, s.prev_summary.summary_hash);
+                assert_eq!(p.read.as_slice(), s.read.as_slice());
+                assert_eq!(p.imported_refs.as_slice(), s.imported_refs.as_slice());
+                assert_eq!(p.func.view().ops, s.func.view().ops);
+                assert_eq!(p.func.view().data, s.func.view().data);
+                assert_eq!(p.func.view().extra, s.func.view().extra);
+                verify(p.func.view()).expect("verified post-LTO IR");
+            }
+        });
     }
 }

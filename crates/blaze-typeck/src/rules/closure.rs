@@ -559,10 +559,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.closure_kinds.push((owner, kind, upvars));
             }
             self.capture_uses.truncate(first_use);
-            if let Some(f) = self.futures.iter_mut().find(|f| f.expr == owner) {
-                // An AsyncFnOnce-only closure consumes its environment. There
-                // is no borrowing call variant with a different stored type.
-                let owns_environment = params.is_none() || rows.is_empty() || kind == crate::ty::ClosureKind::FnOnce;
+            if let Some(fi) = self.futures.iter().position(|f| f.expr == owner) {
+                // An AsyncFnOnce-only closure — or one whose obligations in this body are
+                // exclusively by-value `FnOnce` / `AsyncFnOnce` (e.g. `spawn(async move |s| ..)`)
+                // — consumes its environment; there is no borrowing `CallRefFuture` variant with
+                // a different stored type.
+                let once_only = if params.is_some() {
+                    let once_traits = [self.lang(LangItem::FnOnce)?, self.lang(LangItem::AsyncFnOnce)?];
+                    let ref_traits = [
+                        self.lang(LangItem::Fn)?,
+                        self.lang(LangItem::FnMut)?,
+                        self.lang(LangItem::AsyncFn)?,
+                        self.lang(LangItem::AsyncFnMut)?,
+                    ];
+                    self.ty.closure_used_only_once(owner, once_traits, ref_traits)
+                } else {
+                    false
+                };
+                let owns_environment = params.is_none() || rows.is_empty() || kind == crate::ty::ClosureKind::FnOnce || once_only;
                 // RFC 3668 ("Async closures"), rustc `CoroutineClosureSignature::
                 // tupled_upvars_by_closure_kind`: an `Fn`/`FnMut` async closure has two call
                 // futures. `async_call_once(self)`'s (the by-move body) stores the closure's own
@@ -589,7 +603,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     // are the same under either layout. A decided owner's places are known, an
                     // undecided one's are its whole-binding rows: the flow's saved locals are
                     // all that is missing either way.
-                    f.witness = if !suspends {
+                    self.futures[fi].witness = if !suspends {
                         crate::CoroutineWitness::Complete
                     } else {
                         crate::CoroutineWitness::NeedsSavedLocals
@@ -597,7 +611,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     // The places' environment: async_fn.rs `analyze_coroutine_captures` holds it
                     // in the unpolled state in place of the whole-binding rows.
                     if decided {
-                        f.initial = upvars;
+                        self.futures[fi].initial = upvars;
                     }
                 }
             }

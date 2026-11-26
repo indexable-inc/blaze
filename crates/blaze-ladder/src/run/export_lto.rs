@@ -31,24 +31,28 @@ use blaze_emit::{
 use blaze_lir::{
     Block, BlockKind, Field, Flags, Layout, Op, Ty, VerifyError,
     body::{Bodies, BodyId, DatumId, Target},
-    func::{Conv, FnAttrs, Inline, ParamKind, RefId, RefKind, RefRec, SigId, SigRec},
+    func::{Conv, DataId, FnAttrs, Inline, ParamKind, RefId, RefKind, RefRec, SigId, SigRec},
     inline::InlinePolicy,
-    lto::{ModuleBody, OptimizedBody, lto_optimize_module, tarjan_sccs},
+    lto::{LtoRunner, ModuleBody, OptimizedBody, SequentialLtoRunner, lto_optimize_module_par, tarjan_sccs},
     op::{Word, walk},
     pgo::{PgoRecordError, PgoSiteTable},
     simplify::SimplifyError,
     verify,
 };
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
 use blaze_tier::{Arch, CallClobbers, Machine, Reg, RegSet};
 use blaze_typeck::ItemKey;
 
-use super::{BuiltCallee, BuiltLir, Maker, RecordsProgram, Typing};
+use super::{BuiltCallee, BuiltLir, Maker, RecordsProgram, Typing, func_needs_soft_float};
 use crate::body_ids::{Grant, RowKind, Walk};
 pub use crate::code_records::export_machine;
 use crate::code_records::{Callee, CodeRecordError, InstanceNames, emit_code_record_for_machine_with_abi};
+use crate::front2::builtins_shim::Routines;
 use crate::run::RunError;
 use crate::symbols::{static_symbol, tls_symbol};
+
+pub use blaze_lir::lto::LtoRunner as ExportLtoRunner;
+pub use blaze_lir::simplify::SimplifyError as ExportLtoSimplifyError;
 
 /// Upper bound on transitive `ImportedRef` resolution hops (Rule 18).
 const MAX_IMPORT_HOPS: usize = 32;
@@ -80,7 +84,7 @@ const EXPORT_PGO_PROFILE_DOMAIN: &str = "blaze v2 export pgo profile 1";
 pub struct ExportLtoOpts<'b> {
     /// Target host machine features (typically from [`export_machine`]).
     pub machine: Machine,
-    /// Maximum BFS hop depth from workspace seed functions into inlineable callees.
+    /// Maximum BFS hop depth from workspace seed functions into reachable non-cold callees.
     pub max_depth: u8,
     /// Maximum total function bodies gathered into the LTO module.
     pub max_bodies: usize,
@@ -89,10 +93,11 @@ pub struct ExportLtoOpts<'b> {
     /// Maximum LIR instruction count for keeping a `#[inline(always)]` non-workspace callee.
     pub max_always_inline_insts: usize,
     /// Maximum LIR instruction count for keeping a reachable non-cold library caller (e.g.
+    /// `serde_json::Deserializer::parse_value`, derived `Visitor::visit_map`,
     /// `core::slice::sort::drift::sort`, `hashbrown::RawTable::find`) in the LTO module so its
     /// own small callees inline bottom-up into it and it emits with host-ISA SOTA codegen.
     pub max_caller_insts: usize,
-    /// Cross-function inlining policy handed to `blaze_lir::lto::lto_optimize_module`.
+    /// Cross-function inlining policy handed to `blaze_lir::lto::lto_optimize_module_par`.
     pub policy: InlinePolicy,
     /// Optional persisted `BPG1` PGO binary record merged with static cold-start estimates
     /// via exponential decay before LTO inlining and hot-function layout ranking.
@@ -100,25 +105,25 @@ pub struct ExportLtoOpts<'b> {
 }
 
 impl ExportLtoOpts<'static> {
-    /// Release export defaults: bounded demand-driven BFS (`depth <= 16`, `<= 4096` bodies,
-    /// non-cold library callers `<= 2048` LIR insts) and aggressive cross-function inlining
-    /// (`lto_optimize_module` enforces `Inline::Never` and `policy.max_callee_insts` when
-    /// deciding whether a body may be inlined into its own callers).
+    /// Release export defaults: bounded demand-driven BFS (`depth <= 24`, `<= 12288` bodies,
+    /// non-cold library callers `<= 8192` pre-SROA LIR insts) and aggressive cross-function
+    /// inlining (`lto_optimize_module_par` enforces `Inline::Never` and `policy.max_callee_insts`
+    /// when deciding whether a body may be inlined into its own callers).
     pub fn for_export(isa: Isa) -> Self {
         Self {
             machine: export_machine(isa),
-            max_depth: 16,
-            max_bodies: 4096,
-            max_callee_insts: 384,
-            max_always_inline_insts: 640,
-            max_caller_insts: 2048,
+            max_depth: 24,
+            max_bodies: 12288,
+            max_callee_insts: 512,
+            max_always_inline_insts: 1024,
+            max_caller_insts: 8192,
             policy: InlinePolicy {
                 cost_threshold: 120,
                 max_callee_insts: 256,
                 hot_multiplier: 4,
                 hot_weight_threshold: 10,
                 max_depth: 16,
-                max_growth: 4096,
+                max_growth: 6144,
                 allow_external_refs: true,
                 allow_loops: true,
             },
@@ -215,26 +220,26 @@ impl fmt::Display for ExportLtoError {
 impl core::error::Error for ExportLtoError {}
 
 /// One LTO-optimized and re-emitted function record for `blaze export`.
-pub struct LtoBodyOut<'a> {
+pub struct LtoBodyOut {
     /// Row index in `Walk`.
     pub row: usize,
     /// Instance symbol.
     pub symbol: Symbol,
     /// Encoded sealed canonical `CodeRecord` bytes (ready for `CodeView::read` and
     /// `materialize_positionless`).
-    pub record: AVec<'a, u8>,
+    pub record: Vec<u8, SharedAlloc<'static>>,
     /// Encoded vtable datums referenced by this body or any of its inlined callees.
-    pub vtable_data: AVec<'a, (Symbol, AVec<'a, u8>)>,
+    pub vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     /// Any `SoftFloat` routines that legalization called during emission, as `(tabled, name_bytes)`.
-    pub extra_declared: AVec<'a, (ItemKey, AVec<'a, u8>)>,
+    pub extra_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     /// Count of callee bodies spliced into this function.
     pub inlined_bodies: usize,
 }
 
-/// Output of [`optimize_export_workspace`].
+/// Output of [`optimize_export_workspace`] / [`optimize_export_workspace_par`].
 pub struct ExportLtoOut<'a> {
     /// Optimized functions replacing their walk rows in the exported binary.
-    pub bodies: AVec<'a, LtoBodyOut<'a>>,
+    pub bodies: Vec<LtoBodyOut, SharedAlloc<'static>>,
     /// Hot module symbols ranked hottest-first for `blaze_export::Profile::hot`
     /// (16 KB iTLB-page-aware Ext-TSP code packing).
     pub hot_symbols: AVec<'a, Symbol>,
@@ -247,17 +252,16 @@ pub struct ExportLtoOut<'a> {
     pub total_inlined: usize,
 }
 
-struct LtoOrigin<'a> {
+struct LtoOrigin {
     row: usize,
     symbol: Symbol,
     is_seed: bool,
-    lowered_libm: bool,
     orig_unreachables: usize,
-    built: BuiltLir<'a>,
+    built: BuiltLir<SharedAlloc<'static>>,
 }
 
-struct LtoBodies<'a, 'b> {
-    origins: &'b [LtoOrigin<'a>],
+struct LtoBodies<'b> {
+    origins: &'b [LtoOrigin],
     by_sym: &'b [([u8; 32], usize)],
 }
 
@@ -266,7 +270,7 @@ fn find_body_idx(by_sym: &[([u8; 32], usize)], sym: [u8; 32]) -> Option<usize> {
     by_sym.get(pos).map(|row| row.1)
 }
 
-impl Bodies for LtoBodies<'_, '_> {
+impl Bodies for LtoBodies<'_> {
     fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, blaze_lir::View<'_>)> {
         let caller_idx = find_body_idx(self.by_sym, from.0)?;
         let caller = self.origins.get(caller_idx)?;
@@ -322,11 +326,11 @@ impl Bodies for LtoBodies<'_, '_> {
 
 /// Transitively resolves an `ImportedRef` (`start_idx`, `start_ref`) back through bottom-up SCC
 /// inlining layers to its originating body index and pre-LTO `RefRec`.
-fn resolve_ref_origin<'a>(
+fn resolve_ref_origin(
     start_idx: usize,
     start_ref: RefId,
-    lto_bodies: &[OptimizedBody<Alloc<'a>>],
-    origins: &[LtoOrigin<'a>],
+    lto_bodies: &[OptimizedBody<SharedAlloc<'static>>],
+    origins: &[LtoOrigin],
     by_sym: &[([u8; 32], usize)],
 ) -> Result<(usize, RefRec), ExportLtoError> {
     let start_sym = origins.get(start_idx).map_or([0u8; 32], |o| o.symbol.0);
@@ -378,11 +382,16 @@ fn put_at<'a, T>(
 }
 
 /// Appends `(symbol, bytes)` to `out` if `symbol` is not already present.
-fn push_vtable_datum<'a>(out: &mut AVec<'a, (Symbol, AVec<'a, u8>)>, symbol: Symbol, bytes: &[u8], alloc: Alloc<'a>) {
+fn push_vtable_datum(
+    out: &mut Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
+    symbol: Symbol,
+    bytes: &[u8],
+    alloc: SharedAlloc<'static>,
+) {
     if out.iter().any(|(s, _)| *s == symbol) {
         return;
     }
-    let mut copied: AVec<'a, u8> = Vec::with_capacity_in(bytes.len(), alloc);
+    let mut copied: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(bytes.len(), alloc);
     copied.extend_from_slice(bytes);
     out.push((symbol, copied));
 }
@@ -445,7 +454,7 @@ fn match_ieee_libm(raw_name: &str, machine: Machine) -> Option<LibmOp> {
 
 /// Checks whether instruction `inst` is a non-variadic `Conv::C` `Op::Call` or `Op::Invoke` to an
 /// exact IEEE-754 libm function supported by `sota` on `machine` with matching signature and types.
-fn detect_libm_call(built: &BuiltLir<'_>, inst: usize, machine: Machine) -> Option<LoweredLibmCall> {
+fn detect_libm_call<A: core::alloc::Allocator>(built: &BuiltLir<A>, inst: usize, machine: Machine) -> Option<LoweredLibmCall> {
     let view = built.func.view();
     let op = Op::from_byte(*view.ops.get(inst)?)?;
     let is_invoke = match op {
@@ -657,7 +666,7 @@ fn copy_remapped_extra<'a>(
 /// / `sqrt` wrappers into tiny unwind-free pure leaves that `lto_optimize_module` inlines directly
 /// into caller loops (exposing `Op::Fma` to `gemm.rs` SME2 `FMOPA.S`/`FMOPA.D`).
 /// Returns `true` iff at least one call/invoke was lowered.
-fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: Alloc<'a>) -> bool {
+fn lower_ieee_libm_calls<A: core::alloc::Allocator>(built: &mut BuiltLir<A>, machine: Machine, alloc: Alloc<'_>) -> bool {
     let n = built.func.ops.len();
     if n == 0 || built.funcs.is_empty() || built.c_text.is_empty() {
         return false;
@@ -675,7 +684,7 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         return false;
     };
 
-    let mut rewrites: AVec<'a, Option<LoweredLibmCall>> = Vec::with_capacity_in(n, alloc);
+    let mut rewrites: AVec<'_, Option<LoweredLibmCall>> = Vec::with_capacity_in(n, alloc);
     rewrites.resize(n, None);
     if let Some(slot) = rewrites.get_mut(first_idx) {
         *slot = Some(first_hit);
@@ -692,7 +701,7 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         }
     }
 
-    let mut val_map: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
+    let mut val_map: AVec<'_, u32> = Vec::with_capacity_in(n, alloc);
     let mut next_inst = 0u32;
     for i in 0..n {
         val_map.push(next_inst);
@@ -712,13 +721,13 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         return false;
     };
     let new_cap = n.saturating_add(extra_insts);
-    let mut new_ops: AVec<'a, u8> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_flags: AVec<'a, u8> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_tys: AVec<'a, u16> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_data: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_extra: AVec<'a, u32> = Vec::with_capacity_in(built.func.extra.len(), alloc);
-    let mut new_attrs: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_locs: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_ops: AVec<'_, u8> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_flags: AVec<'_, u8> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_tys: AVec<'_, u16> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_data: AVec<'_, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_extra: AVec<'_, u32> = Vec::with_capacity_in(built.func.extra.len(), alloc);
+    let mut new_attrs: AVec<'_, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_locs: AVec<'_, u32> = Vec::with_capacity_in(new_cap, alloc);
 
     {
         let view = built.func.view();
@@ -835,7 +844,7 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         }
     }
 
-    let mut new_block_starts: AVec<'a, u32> = Vec::with_capacity_in(built.func.block_starts.len(), alloc);
+    let mut new_block_starts: AVec<'_, u32> = Vec::with_capacity_in(built.func.block_starts.len(), alloc);
     for &old_start in built.func.block_starts.iter() {
         let Some(mapped) = remap_val(val_map.as_slice(), old_start) else {
             return false;
@@ -899,16 +908,16 @@ struct HotCandidate {
 
 /// Builds the module's PGO weight table from static cold-start estimates, exponentially
 /// decay-merged with an explicit persisted `BPG1` record when provided (Rule 86).
-fn build_pgo_table<'s>(
-    mod_bodies: &[ModuleBody<Alloc<'s>>],
+fn build_pgo_table<A: core::alloc::Allocator + Copy>(
+    mod_bodies: &[ModuleBody<A>],
     pgo_bytes: Option<&[u8]>,
-    scratch: Alloc<'s>,
-) -> Result<PgoSiteTable<Alloc<'s>>, ExportLtoError> {
-    let static_pgo = PgoSiteTable::estimate_static(mod_bodies, scratch);
+    alloc: A,
+) -> Result<PgoSiteTable<A>, ExportLtoError> {
+    let static_pgo = PgoSiteTable::estimate_static(mod_bodies, alloc);
     match pgo_bytes {
         Some(bytes) => {
-            let persisted = PgoSiteTable::decode(bytes, scratch).map_err(ExportLtoError::PgoRecord)?;
-            Ok(persisted.merge_decayed(&static_pgo, PGO_DECAY_NUM, PGO_DECAY_DEN, scratch))
+            let persisted = PgoSiteTable::decode(bytes, alloc).map_err(ExportLtoError::PgoRecord)?;
+            Ok(persisted.merge_decayed(&static_pgo, PGO_DECAY_NUM, PGO_DECAY_DEN, alloc))
         }
         None => Ok(static_pgo),
     }
@@ -1243,8 +1252,8 @@ fn is_zero_call_leaf(view: blaze_lir::View<'_>) -> bool {
 /// Collects direct non-cold post-LTO call edges `(caller_sym, callee_sym)` within the LTO module,
 /// resolving both original and inliner-imported `RefId`s back to their originating `BuiltCallee`.
 fn collect_post_lto_call_edges<'s>(
-    origins: &[LtoOrigin<'s>],
-    lto_bodies: &[OptimizedBody<Alloc<'s>>],
+    origins: &[LtoOrigin],
+    lto_bodies: &[OptimizedBody<SharedAlloc<'static>>],
     by_sym: &[([u8; 32], usize)],
     scratch: Alloc<'s>,
 ) -> AVec<'s, (Symbol, Symbol)> {
@@ -1333,10 +1342,10 @@ fn collect_post_lto_call_edges<'s>(
 /// below its hottest called leaf). Ordering packs `HotLeaf` kernels first (pages 0..2), direct
 /// `HotLeafCaller`s immediately after (pages 1..4), then remaining hot bodies, breaking ties by
 /// `score` descending, `is_seed` descending, then `Symbol` bytes ascending.
-fn rank_hot_symbols<'a, 's>(
+fn rank_hot_symbols<'a, 's, A: core::alloc::Allocator + Copy>(
     bodies: &[(Symbol, bool, blaze_lir::View<'_>)],
     call_edges: &[(Symbol, Symbol)],
-    pgo: &PgoSiteTable<Alloc<'s>>,
+    pgo: &PgoSiteTable<A>,
     alloc: Alloc<'a>,
     scratch: Alloc<'s>,
 ) -> AVec<'a, Symbol> {
@@ -1475,12 +1484,12 @@ fn rank_hot_symbols<'a, 's>(
 
 /// Computes a deterministic BLAKE3 digest over the active `PgoSiteTable` and ranked `hot_symbols`
 /// for `blaze_export::Profile::digest` (Rule 21, Rule 25).
-fn compute_profile_digest<'s>(
-    pgo: &PgoSiteTable<Alloc<'s>>,
+fn compute_profile_digest<A: core::alloc::Allocator + Copy>(
+    pgo: &PgoSiteTable<A>,
     hot_symbols: &[Symbol],
-    scratch: Alloc<'s>,
+    alloc: A,
 ) -> [u8; 32] {
-    let encoded = pgo.encode(scratch);
+    let encoded = pgo.encode(alloc);
     let mut hasher = blaze_ids::Hasher::new(EXPORT_PGO_PROFILE_DOMAIN);
     hasher.update(encoded.as_slice());
     let count = u64::try_from(hot_symbols.len()).unwrap_or(u64::MAX);
@@ -1493,7 +1502,7 @@ fn compute_profile_digest<'s>(
 
 /// Prepared post-LTO surviving body ready for whole-module Zero-ABI planning and bottom-up
 /// Tarjan SCC IPRA emission.
-struct PreparedBody<'a, 's, 'o, 'm> {
+struct PreparedBody<'s, 'o, 'm> {
     row: usize,
     symbol: Symbol,
     inlined_bodies: usize,
@@ -1503,10 +1512,16 @@ struct PreparedBody<'a, 's, 'o, 'm> {
     statics: AVec<'s, ItemKey>,
     c_statics: AVec<'s, (ItemKey, &'o str)>,
     vtables: AVec<'s, Symbol>,
-    vtable_data: AVec<'a, (Symbol, AVec<'a, u8>)>,
+    vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     tls: AVec<'s, ItemKey>,
     traps: &'o [TrapSource],
-    routines: crate::front2::builtins_shim::Routines<'m>,
+    routines: Routines<'m>,
+}
+
+/// Emitted sealed `CodeRecord` bytes and called soft-float routine declarations for one body.
+struct EmittedBodyRec {
+    record: Vec<u8, SharedAlloc<'static>>,
+    extra_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
 }
 
 /// Returns `true` iff `view` can soundly use `CallConvKind::ColdPreserveAll` without breaking
@@ -1641,10 +1656,10 @@ fn estimate_caller_live_pressure(view: blaze_lir::View<'_>) -> (RegSet, RegSet) 
 /// 2-tier hot/cold classification for post-LTO emission: non-cold, non-noreturn bodies containing
 /// at least one loop or PGO/static heat strictly above [`STATIC_STRAIGHT_LINE_WEIGHT`] run the
 /// full hot superopt tier; cold 0-loop straight-line bodies skip multi-round `superopt_a64`.
-fn body_is_hot_tier<'s>(
+fn body_is_hot_tier<'s, A: core::alloc::Allocator + Copy>(
     view: blaze_lir::View<'_>,
     symbol: Symbol,
-    pgo: &PgoSiteTable<Alloc<'s>>,
+    pgo: &PgoSiteTable<A>,
     scratch: Alloc<'s>,
 ) -> bool {
     if (view.head.attrs & (FnAttrs::COLD | FnAttrs::NORETURN)) != 0 {
@@ -1687,27 +1702,36 @@ fn direct_internal_callee_idx(
     find_body_idx(surv_by_sym, sym.0)
 }
 
-/// Runs demand-driven whole-program cross-function LIR inlining and host-ISA SOTA emission over
+/// Decides whether a non-workspace callee reached during demand-driven export LTO BFS should have
+/// its normal-block callees expanded. Cold (unless `#[inline(always)]`) and `#[noreturn]` bodies
+/// are never expanded so panic/format/backtrace subgraphs stay out of LTO, while large non-cold
+/// callers (even past `opts.max_caller_insts`) ARE still expanded so their downstream hot call
+/// subgraph (`SliceRead::*`, `Vec::push`, etc.) is never severed!
+fn should_expand_non_seed(attrs: u32) -> bool {
+    let is_cold = (attrs & FnAttrs::COLD) != 0;
+    let is_noreturn = (attrs & FnAttrs::NORETURN) != 0;
+    let inline_attr = FnAttrs(attrs).inline();
+    !is_noreturn && (!is_cold || inline_attr == Inline::Always)
+}
+
 /// Decides whether a non-workspace callee reached during demand-driven export LTO BFS enters
 /// the LTO module. Non-cold, non-noreturn library callers up to `opts.max_caller_insts` (including
-/// `#[inline(never)]` hot algorithms such as `core::slice::sort::drift::sort`) are kept so their
-/// own small callees inline bottom-up into them and they emit with host-ISA SOTA codegen, while
-/// `lto_optimize_module` continues enforcing `Inline::Never` and `opts.policy.max_callee_insts`
-/// when deciding whether to inline them into their own callers. Cold and noreturn bodies stay out
-/// of the module unless explicitly marked `#[inline(always)]`.
+/// `#[inline(never)]` hot algorithms such as `core::slice::sort::drift::sort` and derived
+/// `serde::de::Visitor::visit_map`) are kept so their own small callees inline bottom-up into them
+/// and they emit with host-ISA SOTA codegen, while `lto_optimize_module_par` continues enforcing
+/// `Inline::Never` and `opts.policy.max_callee_insts` when deciding whether to inline them into
+/// their own callers. Cold and noreturn bodies stay out unless explicitly `#[inline(always)]`.
 fn should_keep_non_seed(
     attrs: u32,
     insts: usize,
     in_tiny_reserve: bool,
     tiny_leaf_insts: usize,
-    opts: &ExportLtoOpts,
+    opts: &ExportLtoOpts<'_>,
 ) -> bool {
-    let is_cold = (attrs & FnAttrs::COLD) != 0;
-    let is_noreturn = (attrs & FnAttrs::NORETURN) != 0;
-    let inline_attr = FnAttrs(attrs).inline();
-    if is_noreturn || (is_cold && inline_attr != Inline::Always) {
+    if !should_expand_non_seed(attrs) {
         return false;
     }
+    let inline_attr = FnAttrs(attrs).inline();
     if in_tiny_reserve {
         return matches!(inline_attr, Inline::Always | Inline::Hint) && insts <= tiny_leaf_insts;
     }
@@ -1721,130 +1745,225 @@ fn should_keep_non_seed(
     insts <= keep_limit
 }
 
-/// Whole-program demand-driven cross-function LIR inlining and host-ISA SOTA emission over
-/// workspace seed rows and their small inlineable callees.
-#[expect(clippy::too_many_arguments, reason = "whole-program export LTO over walk, seeds, gate, maker, options, output allocator, and scratch allocator")]
-pub fn optimize_export_workspace<'a, 's, 'n, 'b, G, T>(
+/// Enqueues a candidate target symbol into either `call_queue` (direct `Call`/`Invoke` edges) or
+/// `indirect_queue` (`FuncAddr` and vtable/relocated-data targets) while preserving the shallowest
+/// observed BFS depth (`min_depth`). If a row was already scanned at `depth >= max_depth` without
+/// expanding its callees (`PROCESSED_UNEXPANDED`) and is later reached at a strictly shallower
+/// depth `< max_depth`, it is re-queued in `QUEUED_EXPAND_ONLY` mode so its downstream callees are
+/// expanded without duplicating the row in `origins`.
+const UNSEEN: u8 = 0;
+const QUEUED_INDIRECT: u8 = 1;
+const QUEUED_CALL: u8 = 2;
+const PROCESSED_UNEXPANDED: u8 = 3;
+const QUEUED_EXPAND_ONLY: u8 = 4;
+const PROCESSED: u8 = 5;
+
+#[expect(clippy::too_many_arguments, reason = "BFS enqueue helper threading explicit queues and state slices without extra allocations")]
+fn enqueue_sym(
     walk: &Walk<'_>,
-    seeds: &[usize],
-    is_eligible_callee: impl Fn(usize) -> bool,
-    mut grant_for: impl FnMut(ItemKey) -> Option<G>,
-    maker: &mut Maker<'n, G, T>,
-    opts: ExportLtoOpts<'b>,
-    alloc: Alloc<'a>,
-    scratch: Alloc<'s>,
-) -> Result<ExportLtoOut<'a>, ExportLtoError>
-where
-    G: Grant,
-    T: Typing<RecordsProgram<'n>>,
-{
-    if seeds.is_empty() || opts.max_bodies == 0 {
-        return Ok(ExportLtoOut {
-            bodies: Vec::new_in(alloc),
-            hot_symbols: Vec::new_in(alloc),
-            profile_digest: [0u8; 32],
-            module_bodies: 0,
-            total_inlined: 0,
-        });
+    sym: Symbol,
+    direct: bool,
+    next_depth: u8,
+    max_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    min_depth: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+) {
+    let Some(callee_row) = walk.row_of(&sym) else {
+        return;
+    };
+    if !is_eligible_callee(callee_row) {
+        return;
     }
-
-    // Visited states: prioritize direct `Op::Call` callees (which `inline_guided` can splice)
-    // ahead of `Op::Invoke` callees so unwind/formatting subtrees never evict small leaf helpers
-    // (`PartialOrd::lt`, `slice::iter`, `IntoIterator::into_iter`) from the LTO module budget.
-    const UNSEEN: u8 = 0;
-    const QUEUED_INVOKE: u8 = 1;
-    const QUEUED_CALL: u8 = 2;
-    const PROCESSED: u8 = 3;
-
-    let mut visited: AVec<'s, u8> = Vec::with_capacity_in(walk.len(), scratch);
-    visited.resize(walk.len(), UNSEEN);
-    let mut call_queue: AVec<'s, (usize, u8, bool)> = Vec::with_capacity_in(seeds.len().min(opts.max_bodies), scratch);
-    let mut invoke_queue: AVec<'s, (usize, u8, bool)> = Vec::new_in(scratch);
-    for &row in seeds {
-        if let Some(state) = visited.get_mut(row)
-            && *state == UNSEEN
-            && is_eligible_callee(row)
-        {
+    let eff_depth = if let Some(best) = min_depth.get_mut(callee_row) {
+        let updated = (*best).min(next_depth);
+        *best = updated;
+        updated
+    } else {
+        next_depth
+    };
+    if let Some(state) = visited.get_mut(callee_row) {
+        if direct && *state < QUEUED_CALL {
             *state = QUEUED_CALL;
-            call_queue.push((row, 0, true));
+            call_queue.push((callee_row, eff_depth, false));
+        } else if !direct && *state == UNSEEN {
+            *state = QUEUED_INDIRECT;
+            indirect_queue.push((callee_row, eff_depth, false));
+        } else if *state == PROCESSED_UNEXPANDED && eff_depth < max_depth {
+            *state = QUEUED_EXPAND_ONLY;
+            if direct {
+                call_queue.push((callee_row, eff_depth, false));
+            } else {
+                indirect_queue.push((callee_row, eff_depth, false));
+            }
         }
     }
+}
 
-    // 1. Bounded demand-driven BFS: gather workspace seeds + small inlineable callees.
-    // Reserve the final eighth of large LTO budgets for tiny `<= 24`-inst `#[inline]` /
-    // `#[inline(always)]` leaf helpers (e.g. `slice::get -> ptr::add -> ptr::read -> ub_checks`)
-    // so medium callees in huge workspaces never crowd out deep leaf chains.
-    const TINY_INLINE_LEAF_INSTS: usize = 24;
-    const MAX_RESERVE_SCANS: usize = 2048;
-    let tiny_reserve = if opts.max_bodies >= 512 { opts.max_bodies / 8 } else { 0 };
-    let soft_limit = opts.max_bodies.saturating_sub(tiny_reserve);
-    let mut reserve_scans = 0usize;
-    let mut origins: AVec<'s, LtoOrigin<'s>> = Vec::with_capacity_in(call_queue.len(), scratch);
-    let mut call_head = 0usize;
-    let mut invoke_head = 0usize;
-    while origins.len() < opts.max_bodies {
-        let in_tiny_reserve = tiny_reserve > 0 && origins.len() >= soft_limit;
-        if in_tiny_reserve && reserve_scans >= MAX_RESERVE_SCANS {
-            break;
-        }
-        let next = if let Some(&item) = call_queue.get(call_head) {
-            call_head += 1;
-            item
-        } else if !in_tiny_reserve
-            && let Some(&item) = invoke_queue.get(invoke_head)
-        {
-            invoke_head += 1;
-            item
-        } else {
-            break;
-        };
-        let (row, depth, is_seed) = next;
-        let Some(state) = visited.get_mut(row) else {
-            continue;
-        };
-        if *state == PROCESSED {
+/// Enqueues every concrete `Space::Func` method symbol referenced by vtable `vsym` in
+/// `built.vtable_data` into `indirect_queue` so `&dyn Trait` hot implementations (e.g.
+/// `serde_json::read::SliceRead`, `std::io::Read`) are discovered by export LTO BFS.
+#[expect(clippy::too_many_arguments, reason = "vtable BFS enqueue helper threading explicit queues and state slices")]
+fn enqueue_vtable_methods<A: core::alloc::Allocator>(
+    built: &BuiltLir<A>,
+    vsym: Symbol,
+    walk: &Walk<'_>,
+    next_depth: u8,
+    max_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    min_depth: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+) {
+    for (sym, datum_bytes) in built.vtable_data.iter() {
+        if *sym != vsym {
             continue;
         }
-        *state = PROCESSED;
-        if in_tiny_reserve && !is_seed {
-            reserve_scans += 1;
-        }
-        let tabled = walk.tabled(row);
-        let symbol = walk.symbol(row);
-        let name = walk.name(row);
-        let Some(grant) = grant_for(tabled) else {
-            return Err(ExportLtoError::NotRunnable { symbol: symbol.0, tabled });
-        };
-        let mut built = maker
-            .build_lir(&grant, tabled, name, scratch)
-            .map_err(|error| ExportLtoError::BuildLir { symbol: symbol.0, error })?;
-        let lowered_libm = lower_ieee_libm_calls(&mut built, opts.machine, scratch);
-        if lowered_libm {
-            verify(built.func.view())
-                .map_err(|error| ExportLtoError::Verify { symbol: symbol.0, error })?;
-        }
-
-        let view = built.func.view();
-        if !is_seed && !should_keep_non_seed(view.head.attrs, view.len(), in_tiny_reserve, TINY_INLINE_LEAF_INSTS, &opts) {
+        let Ok(dv) = DatumView::read(datum_bytes.as_slice()) else {
             continue;
+        };
+        for i in 0..dv.targets() {
+            let target = dv.target(i);
+            if target.space == Space::Func {
+                enqueue_sym(
+                    walk,
+                    target.symbol,
+                    false,
+                    next_depth,
+                    max_depth,
+                    is_eligible_callee,
+                    visited,
+                    min_depth,
+                    call_queue,
+                    indirect_queue,
+                );
+            }
         }
+    }
+}
 
-        if depth < opts.max_depth {
-            let next_depth = depth.saturating_add(1);
-            for b in 0..view.blocks() {
-                let Ok(b_u32) = u32::try_from(b) else { break };
-                let block = Block(b_u32);
-                if view.block_kind(block) != BlockKind::Normal {
-                    continue;
+/// Iteratively traverses local `RefKind::Data` relocations starting from `root_data` (following
+/// nested `Data -> Data -> Func/Vtable` chains while guarding against cycles via `visited_data`)
+/// and enqueues every discovered function or vtable method target into `indirect_queue`.
+#[expect(clippy::too_many_arguments, reason = "iterative data-reloc traversal helper threading explicit queues and per-body visited state")]
+fn enqueue_data_relocs<A: core::alloc::Allocator>(
+    built: &BuiltLir<A>,
+    root_data: u32,
+    walk: &Walk<'_>,
+    next_depth: u8,
+    max_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    min_depth: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+    visited_data: &mut [bool],
+    data_stack: &mut AVec<'_, u32>,
+) {
+    let Ok(root_idx) = usize::try_from(root_data) else {
+        return;
+    };
+    let Some(seen_root) = visited_data.get_mut(root_idx) else {
+        return;
+    };
+    if *seen_root {
+        return;
+    }
+    *seen_root = true;
+    data_stack.clear();
+    data_stack.push(root_data);
+
+    let view = built.func.view();
+    while let Some(data_place) = data_stack.pop() {
+        for reloc in view.data_relocs_of(DataId(data_place)) {
+            let Some(trec) = view.refs.get(RefId(reloc.target).index()) else {
+                continue;
+            };
+            match RefKind::from_word(trec.kind) {
+                Some(RefKind::Func) => {
+                    let Ok(place_idx) = usize::try_from(trec.place) else { continue };
+                    let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
+                    enqueue_sym(
+                        walk,
+                        callee_sym,
+                        false,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
                 }
-                for at in view.block(block) {
-                    let op = view.op(at);
-                    if !matches!(op, Op::Call | Op::Invoke) {
-                        continue;
+                Some(RefKind::Vtable) => {
+                    let Ok(place_idx) = usize::try_from(trec.place) else { continue };
+                    let Some(&vsym) = built.vtables.get(place_idx) else { continue };
+                    enqueue_vtable_methods(
+                        built,
+                        vsym,
+                        walk,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
+                }
+                Some(RefKind::Data) => {
+                    let Ok(next_idx) = usize::try_from(trec.place) else { continue };
+                    if let Some(seen) = visited_data.get_mut(next_idx)
+                        && !*seen
+                    {
+                        *seen = true;
+                        data_stack.push(trec.place);
                     }
-                    if view.flags(at).contains(Flags::COLD) {
-                        continue;
-                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Enqueues every non-cold callee reachable from `BlockKind::Normal` blocks of `built`:
+/// - direct `Op::Call` and `Op::Invoke` targets into `call_queue` (now that unwinding `Op::Invoke`
+///   inlines cleanly, normal-block `Op::Invoke` is a first-class hot edge);
+/// - `Op::FuncAddr` function-pointer targets and `Op::DataAddr` vtable / nested relocated-data
+///   targets into `indirect_queue`.
+#[expect(clippy::too_many_arguments, reason = "BFS callee discovery helper threading explicit queues, depth bounds, and scratch allocator")]
+fn enqueue_normal_callees<A: core::alloc::Allocator>(
+    built: &BuiltLir<A>,
+    walk: &Walk<'_>,
+    next_depth: u8,
+    max_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    min_depth: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+    scratch: Alloc<'_>,
+) {
+    let view = built.func.view();
+    let mut visited_data: AVec<'_, bool> = Vec::new_in(scratch);
+    let mut data_stack: AVec<'_, u32> = Vec::new_in(scratch);
+    for b in 0..view.blocks() {
+        let Ok(b_u32) = u32::try_from(b) else { break };
+        let block = Block(b_u32);
+        if view.block_kind(block) != BlockKind::Normal {
+            continue;
+        }
+        for at in view.block(block) {
+            if view.flags(at).contains(Flags::COLD) {
+                continue;
+            }
+            let op = view.op(at);
+            match op {
+                Op::Call | Op::Invoke => {
                     let Some(&data_at) = view.data.get(at) else { continue };
                     let Ok(extra_idx) = usize::try_from(data_at) else { continue };
                     let Some(&ref_word) = view.extra.get(extra_idx) else { continue };
@@ -1854,37 +1973,151 @@ where
                     }
                     let Ok(place_idx) = usize::try_from(rec.place) else { continue };
                     let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
-                    let Some(callee_row) = walk.row_of(&callee_sym) else { continue };
-                    if !is_eligible_callee(callee_row) {
+                    enqueue_sym(
+                        walk,
+                        callee_sym,
+                        true,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
+                }
+                Op::FuncAddr => {
+                    let Some(&ref_word) = view.data.get(at) else { continue };
+                    let Some(rec) = view.refs.get(RefId(ref_word).index()) else { continue };
+                    if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
                         continue;
                     }
-                    if let Some(state) = visited.get_mut(callee_row) {
-                        if op == Op::Call && *state < QUEUED_CALL {
-                            *state = QUEUED_CALL;
-                            call_queue.push((callee_row, next_depth, false));
-                        } else if op == Op::Invoke && *state == UNSEEN {
-                            *state = QUEUED_INVOKE;
-                            invoke_queue.push((callee_row, next_depth, false));
+                    let Ok(place_idx) = usize::try_from(rec.place) else { continue };
+                    let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
+                    enqueue_sym(
+                        walk,
+                        callee_sym,
+                        false,
+                        next_depth,
+                        max_depth,
+                        is_eligible_callee,
+                        visited,
+                        min_depth,
+                        call_queue,
+                        indirect_queue,
+                    );
+                }
+                Op::DataAddr => {
+                    let Some(&ref_word) = view.data.get(at) else { continue };
+                    let Some(rec) = view.refs.get(RefId(ref_word).index()) else { continue };
+                    match RefKind::from_word(rec.kind) {
+                        Some(RefKind::Vtable) => {
+                            let Ok(place_idx) = usize::try_from(rec.place) else { continue };
+                            let Some(&vsym) = built.vtables.get(place_idx) else { continue };
+                            enqueue_vtable_methods(
+                                built,
+                                vsym,
+                                walk,
+                                next_depth,
+                                max_depth,
+                                is_eligible_callee,
+                                visited,
+                                min_depth,
+                                call_queue,
+                                indirect_queue,
+                            );
                         }
+                        Some(RefKind::Data) => {
+                            if visited_data.is_empty() && !view.datas.is_empty() {
+                                visited_data.resize(view.datas.len(), false);
+                            }
+                            enqueue_data_relocs(
+                                built,
+                                rec.place,
+                                walk,
+                                next_depth,
+                                max_depth,
+                                is_eligible_callee,
+                                visited,
+                                min_depth,
+                                call_queue,
+                                indirect_queue,
+                                visited_data.as_mut_slice(),
+                                &mut data_stack,
+                            );
+                        }
+                        _ => {}
                     }
                 }
+                _ => {}
             }
         }
-
-        let orig_unreachables = view.ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count();
-        origins.push(LtoOrigin {
-            row,
-            symbol,
-            is_seed,
-            lowered_libm,
-            orig_unreachables,
-            built,
-        });
     }
+}
 
-    if origins.is_empty() {
+/// Whole-program demand-driven cross-function LIR inlining and host-ISA SOTA emission over
+/// workspace seed rows and their reachable non-cold callees (sequential convenience wrapper).
+#[expect(clippy::too_many_arguments, reason = "whole-program export LTO over walk, seeds, gate, maker, options, shared output allocator, and scratch allocator")]
+pub fn optimize_export_workspace<'a, 'n, 'b, G, T>(
+    walk: &Walk<'_>,
+    seeds: &[usize],
+    is_eligible_callee: impl Fn(usize) -> bool,
+    grant_for: impl FnMut(ItemKey) -> Option<G>,
+    maker: &mut Maker<'n, G, T>,
+    opts: ExportLtoOpts<'b>,
+    shared: SharedAlloc<'static>,
+    alloc: Alloc<'a>,
+) -> Result<ExportLtoOut<'a>, ExportLtoError>
+where
+    G: Grant,
+    T: Typing<RecordsProgram<'n>>,
+{
+    optimize_export_workspace_par(
+        walk,
+        seeds,
+        is_eligible_callee,
+        grant_for,
+        maker,
+        opts,
+        shared,
+        alloc,
+        &SequentialLtoRunner,
+    )
+}
+
+/// Whole-program demand-driven cross-function LIR inlining and host-ISA SOTA emission
+/// over workspace seed rows and their reachable non-cold callees.
+///
+/// 1. Demand-driven BFS from `seeds` follows normal-block `Op::Call`, `Op::Invoke`,
+///    `Op::FuncAddr`, and vtable/relocated-data `Space::Func` edges without severing callees of
+///    oversized non-cold callers.
+/// 2. Bottom-up Tarjan SCC ThinLTO (`lto_optimize_module_par`) runs pre-inline simplify and
+///    wavefront SCC inlining in parallel across `runner`, guided by static PGO merged with any
+///    persisted `BPG1` record.
+/// 3. Whole-module Zero-ABI planning (`ScratchOrder`, guarded `ColdPreserveAll`, `InternalFast`)
+///    and bottom-up Tarjan SCC IPRA emission (`emit_code_record_for_machine_with_abi`) emit every
+///    gathered non-cold body into sealed host-ISA `CodeRecord`s in deterministic index order
+///    (Rule 25).
+#[expect(clippy::too_many_arguments, reason = "whole-program parallel export LTO over walk, seeds, gate, maker, options, shared output allocator, scratch allocator, and parallel runner")]
+pub fn optimize_export_workspace_par<'a, 'n, 'b, G, T, R>(
+    walk: &Walk<'_>,
+    seeds: &[usize],
+    is_eligible_callee: impl Fn(usize) -> bool,
+    mut grant_for: impl FnMut(ItemKey) -> Option<G>,
+    maker: &mut Maker<'n, G, T>,
+    opts: ExportLtoOpts<'b>,
+    shared: SharedAlloc<'static>,
+    alloc: Alloc<'a>,
+    runner: &R,
+) -> Result<ExportLtoOut<'a>, ExportLtoError>
+where
+    G: Grant,
+    T: Typing<RecordsProgram<'n>>,
+    R: LtoRunner,
+{
+    if seeds.is_empty() || opts.max_bodies == 0 {
         return Ok(ExportLtoOut {
-            bodies: Vec::new_in(alloc),
+            bodies: Vec::new_in(shared),
             hot_symbols: Vec::new_in(alloc),
             profile_digest: [0u8; 32],
             module_bodies: 0,
@@ -1892,26 +2125,162 @@ where
         });
     }
 
-    // 2. Bottom-up Tarjan SCC cross-function LIR inlining + SROA/propagate/DCE/CFG-coalesce,
+    let mut visited: AVec<'a, u8> = Vec::with_capacity_in(walk.len(), alloc);
+    visited.resize(walk.len(), UNSEEN);
+    let mut min_depth: AVec<'a, u8> = Vec::with_capacity_in(walk.len(), alloc);
+    min_depth.resize(walk.len(), u8::MAX);
+    let mut call_queue: AVec<'a, (usize, u8, bool)> = Vec::with_capacity_in(seeds.len().min(opts.max_bodies), alloc);
+    let mut indirect_queue: AVec<'a, (usize, u8, bool)> = Vec::new_in(alloc);
+    for &row in seeds {
+        if let Some(state) = visited.get_mut(row)
+            && *state == UNSEEN
+            && is_eligible_callee(row)
+        {
+            *state = QUEUED_CALL;
+            if let Some(best) = min_depth.get_mut(row) {
+                *best = 0;
+            }
+            call_queue.push((row, 0, true));
+        }
+    }
+
+    // 1. Bounded demand-driven BFS: gather workspace seeds + reachable non-cold dependency bodies.
+    // Reserve the final eighth of large LTO budgets for tiny `<= 24`-inst `#[inline]` /
+    // `#[inline(always)]` leaf helpers so medium callees never crowd out deep leaf chains.
+    const TINY_INLINE_LEAF_INSTS: usize = 24;
+    const MAX_RESERVE_SCANS: usize = 2048;
+    let tiny_reserve = if opts.max_bodies >= 512 { opts.max_bodies / 8 } else { 0 };
+    let soft_limit = opts.max_bodies.saturating_sub(tiny_reserve);
+    let max_scanned = opts.max_bodies.saturating_mul(2);
+    let mut total_scanned = 0usize;
+    let mut reserve_scans = 0usize;
+    let mut origins: Vec<LtoOrigin, SharedAlloc<'static>> = Vec::with_capacity_in(call_queue.len(), shared);
+    let mut call_head = 0usize;
+    let mut indirect_head = 0usize;
+    while origins.len() < opts.max_bodies && total_scanned < max_scanned {
+        let in_tiny_reserve = tiny_reserve > 0 && origins.len() >= soft_limit;
+        if in_tiny_reserve && reserve_scans >= MAX_RESERVE_SCANS {
+            break;
+        }
+        let next = if let Some(&item) = call_queue.get(call_head) {
+            call_head += 1;
+            item
+        } else if !in_tiny_reserve
+            && let Some(&item) = indirect_queue.get(indirect_head)
+        {
+            indirect_head += 1;
+            item
+        } else {
+            break;
+        };
+        let (row, queued_depth, is_seed) = next;
+        let Some(state) = visited.get_mut(row) else {
+            continue;
+        };
+        if *state == PROCESSED || *state == PROCESSED_UNEXPANDED {
+            continue;
+        }
+        let expand_only = *state == QUEUED_EXPAND_ONLY;
+        let depth = min_depth.get(row).copied().unwrap_or(queued_depth).min(queued_depth);
+        *state = if depth < opts.max_depth { PROCESSED } else { PROCESSED_UNEXPANDED };
+        total_scanned += 1;
+        if in_tiny_reserve && !is_seed && !expand_only {
+            reserve_scans += 1;
+        }
+        let tabled = walk.tabled(row);
+        let symbol = walk.symbol(row);
+        let name = walk.name(row);
+        let Some(grant) = grant_for(tabled) else {
+            return Err(ExportLtoError::NotRunnable { symbol: symbol.0, tabled });
+        };
+        let mut built = maker
+            .build_lir_in(&grant, tabled, name, shared)
+            .map_err(|error| ExportLtoError::BuildLir { symbol: symbol.0, error })?;
+        let lowered_libm = lower_ieee_libm_calls(&mut built, opts.machine, alloc);
+        if lowered_libm {
+            verify(built.func.view())
+                .map_err(|error| ExportLtoError::Verify { symbol: symbol.0, error })?;
+        }
+
+        let view = built.func.view();
+        if !is_seed && !should_expand_non_seed(view.head.attrs) {
+            if let Some(st) = visited.get_mut(row) {
+                *st = PROCESSED;
+            }
+            continue;
+        }
+
+        // Always expand normal-block callees of every seed and every non-cold, non-noreturn body
+        // BEFORE checking `max_caller_insts` / `in_tiny_reserve` so large callers never sever
+        // their downstream call subgraph (`SliceRead::*`, `Vec::push`, etc.).
+        if depth < opts.max_depth {
+            let next_depth = depth.saturating_add(1);
+            enqueue_normal_callees(
+                &built,
+                walk,
+                next_depth,
+                opts.max_depth,
+                &is_eligible_callee,
+                visited.as_mut_slice(),
+                min_depth.as_mut_slice(),
+                &mut call_queue,
+                &mut indirect_queue,
+                alloc,
+            );
+        }
+
+        if expand_only {
+            continue;
+        }
+
+        if !is_seed && !should_keep_non_seed(view.head.attrs, view.len(), in_tiny_reserve, TINY_INLINE_LEAF_INSTS, &opts) {
+            continue;
+        }
+
+        let orig_unreachables = view
+            .ops
+            .iter()
+            .filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable))
+            .count();
+        origins.push(LtoOrigin {
+            row,
+            symbol,
+            is_seed,
+            orig_unreachables,
+            built,
+        });
+    }
+
+    if origins.is_empty() {
+        return Ok(ExportLtoOut {
+            bodies: Vec::new_in(shared),
+            hot_symbols: Vec::new_in(alloc),
+            profile_digest: [0u8; 32],
+            module_bodies: 0,
+            total_inlined: 0,
+        });
+    }
+
+    // 2. Parallel bottom-up Tarjan SCC cross-function LIR inlining + SROA/propagate/DCE/CFG-coalesce,
     //    guided by static PGO estimates merged with any persisted cross-worktree `BPG1` record.
     let n = origins.len();
-    let mut by_sym: AVec<'s, ([u8; 32], usize)> = Vec::with_capacity_in(n, scratch);
-    let mut mod_bodies: AVec<'s, ModuleBody<Alloc<'s>>> = Vec::with_capacity_in(n, scratch);
+    let mut by_sym: Vec<([u8; 32], usize), SharedAlloc<'static>> = Vec::with_capacity_in(n, shared);
+    let mut mod_bodies: Vec<ModuleBody<SharedAlloc<'static>>, SharedAlloc<'static>> = Vec::with_capacity_in(n, shared);
     for (idx, orig) in origins.iter().enumerate() {
         by_sym.push((orig.symbol.0, idx));
         mod_bodies.push(ModuleBody {
             id: BodyId(orig.symbol.0),
-            func: orig.built.func.view().to_func_in(scratch),
+            func: orig.built.func.view().to_func_in(shared),
         });
     }
     by_sym.sort_unstable();
 
-    let pgo = build_pgo_table(mod_bodies.as_slice(), opts.pgo_bytes, scratch)?;
+    let pgo = build_pgo_table(mod_bodies.as_slice(), opts.pgo_bytes, shared)?;
     let bodies_view = LtoBodies { origins: origins.as_slice(), by_sym: by_sym.as_slice() };
-    let lto = lto_optimize_module(mod_bodies, &bodies_view, &pgo, opts.policy, scratch)
+    let lto = lto_optimize_module_par(mod_bodies, &bodies_view, &pgo, opts.policy, shared, runner)
         .map_err(ExportLtoError::Optimize)?;
 
-    let mut hot_inputs: AVec<'s, (Symbol, bool, blaze_lir::View<'_>)> = Vec::with_capacity_in(n, scratch);
+    let mut hot_inputs: AVec<'a, (Symbol, bool, blaze_lir::View<'_>)> = Vec::with_capacity_in(n, alloc);
     for (orig, opt) in origins.iter().zip(lto.bodies.iter()) {
         hot_inputs.push((orig.symbol, orig.is_seed, opt.func.view()));
     }
@@ -1919,21 +2288,23 @@ where
         origins.as_slice(),
         lto.bodies.as_slice(),
         by_sym.as_slice(),
-        scratch,
+        alloc,
     );
-    let hot_symbols = rank_hot_symbols(hot_inputs.as_slice(), call_edges.as_slice(), &pgo, alloc, scratch);
-    let profile_digest = compute_profile_digest(&pgo, hot_symbols.as_slice(), scratch);
+    let hot_symbols = rank_hot_symbols(hot_inputs.as_slice(), call_edges.as_slice(), &pgo, alloc, alloc);
+    let profile_digest = compute_profile_digest(&pgo, hot_symbols.as_slice(), shared);
 
-    // 3. Expand reference tables transitively for every surviving post-LTO body, plan whole-module
-    //    Zero-ABI (`ScratchOrder` + guarded `ColdPreserveAll`) & bottom-up Tarjan SCC emission order,
-    //    and emit ephemeral host-ISA records with IPRA + 2-tier cold-fast classification (never
-    //    written to portable `CodeStore`, preserving exact deterministic output order — Rule 25).
-    let mut prepared: AVec<'s, PreparedBody<'a, 's, '_, '_>> = Vec::with_capacity_in(n, scratch);
+    // 3. Prepare soft-float routines once, expand reference tables transitively for EVERY gathered
+    //    non-cold post-LTO body so hot dependency functions also receive host-ISA SOTA + superopt
+    //    codegen, plan whole-module Zero-ABI (`ScratchOrder` + guarded `ColdPreserveAll`) &
+    //    bottom-up Tarjan SCC emission order, and emit ephemeral host-ISA records with IPRA +
+    //    2-tier cold-fast classification (never written to portable `CodeStore`, preserving exact
+    //    deterministic output order — Rule 25).
+    let bound_routines = maker
+        .prepare_routines()
+        .map_err(|error| ExportLtoError::Record { symbol: [0u8; 32], error })?;
+    let mut prepared: AVec<'a, PreparedBody<'a, '_, '_>> = Vec::with_capacity_in(n, alloc);
     for (idx, (orig, opt)) in origins.iter().zip(lto.bodies.iter()).enumerate() {
-        if !orig.is_seed && !orig.lowered_libm && opt.read.is_empty() {
-            continue;
-        }
-        let mut funcs: AVec<'s, Callee<'_>> = Vec::with_capacity_in(orig.built.funcs.len() + opt.imported_refs.len(), scratch);
+        let mut funcs: AVec<'a, Callee<'_>> = Vec::with_capacity_in(orig.built.funcs.len() + opt.imported_refs.len(), alloc);
         for p in 0..orig.built.funcs.len() {
             let p_u32 = u32::try_from(p).map_err(|_| ExportLtoError::BadRef {
                 symbol: orig.symbol.0,
@@ -1949,9 +2320,9 @@ where
             };
             funcs.push(callee);
         }
-        let mut statics: AVec<'s, ItemKey> = Vec::with_capacity_in(orig.built.statics.len(), scratch);
+        let mut statics: AVec<'a, ItemKey> = Vec::with_capacity_in(orig.built.statics.len(), alloc);
         statics.extend_from_slice(orig.built.statics.as_slice());
-        let mut c_statics: AVec<'s, (ItemKey, &str)> = Vec::with_capacity_in(orig.built.c_statics.len(), scratch);
+        let mut c_statics: AVec<'a, (ItemKey, &str)> = Vec::with_capacity_in(orig.built.c_statics.len(), alloc);
         for &(item, start, len) in orig.built.c_statics.iter() {
             let Some(cname) = orig.built.c_str(start, len) else {
                 return Err(ExportLtoError::BadRef {
@@ -1962,13 +2333,14 @@ where
             };
             c_statics.push((item, cname));
         }
-        let mut vtables: AVec<'s, Symbol> = Vec::with_capacity_in(orig.built.vtables.len(), scratch);
+        let mut vtables: AVec<'a, Symbol> = Vec::with_capacity_in(orig.built.vtables.len(), alloc);
         vtables.extend_from_slice(orig.built.vtables.as_slice());
-        let mut vtable_data: AVec<'a, (Symbol, AVec<'a, u8>)> = Vec::with_capacity_in(orig.built.vtable_data.len(), alloc);
+        let mut vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+            Vec::with_capacity_in(orig.built.vtable_data.len(), shared);
         for (vsym, bytes) in orig.built.vtable_data.iter() {
-            push_vtable_datum(&mut vtable_data, *vsym, bytes.as_slice(), alloc);
+            push_vtable_datum(&mut vtable_data, *vsym, bytes.as_slice(), shared);
         }
-        let mut tls: AVec<'s, ItemKey> = Vec::with_capacity_in(orig.built.tls.len(), scratch);
+        let mut tls: AVec<'a, ItemKey> = Vec::with_capacity_in(orig.built.tls.len(), alloc);
         tls.extend_from_slice(orig.built.tls.as_slice());
 
         for imp in opt.imported_refs.iter() {
@@ -2045,7 +2417,7 @@ where
                     };
                     put_at(&mut vtables, place, vsym, orig.symbol.0, "imported vtable place", imp.caller_ref.0)?;
                     for (sym, bytes) in src_origin.built.vtable_data.iter() {
-                        push_vtable_datum(&mut vtable_data, *sym, bytes.as_slice(), alloc);
+                        push_vtable_datum(&mut vtable_data, *sym, bytes.as_slice(), shared);
                     }
                 }
                 RefKind::Tls => {
@@ -2068,19 +2440,33 @@ where
             }
         }
 
-        // Bind compiler_builtins soft-float routines AFTER all original + imported function refs.
-        let routines = maker
-            .bind_routines(&mut funcs)
-            .map_err(|error| ExportLtoError::Record { symbol: orig.symbol.0, error })?;
+        // Bind compiler_builtins soft-float routines AFTER all original + imported function refs,
+        // only when the body touches f16/f128.
+        let routines = if func_needs_soft_float(&opt.func.view()) {
+            match bound_routines {
+                Some(bound) => bound
+                    .bind(&mut funcs)
+                    .map_err(|error| ExportLtoError::Record { symbol: orig.symbol.0, error })?,
+                None => Routines::NONE,
+            }
+        } else {
+            Routines::NONE
+        };
         let verified = verify(opt.func.view())
             .map_err(|error| ExportLtoError::Verify { symbol: orig.symbol.0, error })?;
-        let post_unreachables = opt.func.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count();
+        let post_unreachables = opt
+            .func
+            .view()
+            .ops
+            .iter()
+            .filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable))
+            .count();
         let traps: &[TrapSource] = if opt.read.is_empty() && orig.orig_unreachables == post_unreachables {
             orig.built.traps.as_slice()
         } else {
             &[]
         };
-        let is_hot = body_is_hot_tier(verified.view(), orig.symbol, &pgo, scratch);
+        let is_hot = body_is_hot_tier(verified.view(), orig.symbol, &pgo, alloc);
         prepared.push(PreparedBody {
             row: orig.row,
             symbol: orig.symbol,
@@ -2101,7 +2487,7 @@ where
     let m = prepared.len();
     if m == 0 {
         return Ok(ExportLtoOut {
-            bodies: Vec::new_in(alloc),
+            bodies: Vec::new_in(shared),
             hot_symbols,
             profile_digest,
             module_bodies: n,
@@ -2111,8 +2497,8 @@ where
 
     // 3b. Index surviving bodies, construct post-LTO direct call graph CSR, and compute
     //     reverse-topological (callees-first) Tarjan SCCs.
-    let mut surv_by_sym: AVec<'s, ([u8; 32], usize)> = Vec::with_capacity_in(m, scratch);
-    let mut walk_row_to_surv: AVec<'s, u32> = Vec::with_capacity_in(walk.len(), scratch);
+    let mut surv_by_sym: AVec<'a, ([u8; 32], usize)> = Vec::with_capacity_in(m, alloc);
+    let mut walk_row_to_surv: AVec<'a, u32> = Vec::with_capacity_in(walk.len(), alloc);
     walk_row_to_surv.resize(walk.len(), u32::MAX);
     for (i, prep) in prepared.iter().enumerate() {
         surv_by_sym.push((prep.symbol.0, i));
@@ -2124,11 +2510,11 @@ where
     }
     surv_by_sym.sort_unstable();
 
-    let mut adj_offsets: AVec<'s, u32> = Vec::with_capacity_in(m.saturating_add(1), scratch);
-    let mut adj: AVec<'s, u32> = Vec::with_capacity_in(m.saturating_mul(2), scratch);
-    let mut in_degree: AVec<'s, usize> = Vec::with_capacity_in(m, scratch);
+    let mut adj_offsets: AVec<'a, u32> = Vec::with_capacity_in(m.saturating_add(1), alloc);
+    let mut adj: AVec<'a, u32> = Vec::with_capacity_in(m.saturating_mul(2), alloc);
+    let mut in_degree: AVec<'a, usize> = Vec::with_capacity_in(m, alloc);
     in_degree.resize(m, 0);
-    let mut callees_per_fn: AVec<'s, AVec<'s, usize>> = Vec::with_capacity_in(m, scratch);
+    let mut callees_per_fn: AVec<'a, AVec<'a, usize>> = Vec::with_capacity_in(m, alloc);
     adj_offsets.push(0);
 
     for prep in prepared.iter() {
@@ -2161,7 +2547,7 @@ where
         }
         adj.truncate(w);
 
-        let mut row_callees: AVec<'s, usize> = Vec::with_capacity_in(w.saturating_sub(edge_start), scratch);
+        let mut row_callees: AVec<'a, usize> = Vec::with_capacity_in(w.saturating_sub(edge_start), alloc);
         for &callee_u32 in adj.get(edge_start..w).unwrap_or(&[]) {
             if let Ok(cidx) = usize::try_from(callee_u32)
                 && cidx < m
@@ -2182,14 +2568,14 @@ where
         adj_offsets.push(next_off);
     }
 
-    let emit_sccs = tarjan_sccs(m, adj_offsets.as_slice(), adj.as_slice(), scratch);
+    let emit_sccs = tarjan_sccs(m, adj_offsets.as_slice(), adj.as_slice(), alloc);
 
     // 3c. Identify ABI-pinned roots (walk roots such as `main`/`lang_start`/personality, bodies
     //     declared by any non-surviving walk row or static, bodies with zero internal callers,
     //     and any symbol address-taken via `Op::FuncAddr`, `data_relocs`, or vtable datums) and
     //     run whole-module Zero-ABI planning (`ScratchOrder` + guarded `ColdPreserveAll`).
-    let mut is_exported: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
-    let mut address_taken: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    let mut is_exported: AVec<'a, bool> = Vec::with_capacity_in(m, alloc);
+    let mut address_taken: AVec<'a, bool> = Vec::with_capacity_in(m, alloc);
     for i in 0..m {
         let root_or_uncalled = prepared
             .get(i)
@@ -2264,7 +2650,7 @@ where
 
     let abi_plan = {
         const EMPTY_CALLEES: &[usize] = &[];
-        let mut abi_inputs: AVec<'s, AbiFnInput<'_>> = Vec::with_capacity_in(m, scratch);
+        let mut abi_inputs: AVec<'a, AbiFnInput<'_>> = Vec::with_capacity_in(m, alloc);
         for (i, prep) in prepared.iter().enumerate() {
             let view = prep.verified.view();
             let (caller_live_pressure_gprs, caller_live_pressure_fps) = estimate_caller_live_pressure(view);
@@ -2280,7 +2666,7 @@ where
         }
         let mut zero_abi_opts = ZeroAbiOpts::arm64_export();
         zero_abi_opts.enable_scc_pinning = false;
-        plan_module_abi(abi_inputs.as_slice(), zero_abi_opts, scratch)
+        plan_module_abi(abi_inputs.as_slice(), zero_abi_opts, alloc)
     };
 
     // 3d. Emit surviving bodies in callees-first Tarjan SCC order with bottom-up IPRA,
@@ -2288,7 +2674,7 @@ where
     //     interprocedural `ScratchOrder`, guarded `ColdPreserveAll`, and 2-tier cold-fast mode.
     let is_arm64 = opts.machine.arch == Arch::Arm64;
 
-    let mut scc_size: AVec<'s, usize> = Vec::with_capacity_in(m, scratch);
+    let mut scc_size: AVec<'a, usize> = Vec::with_capacity_in(m, alloc);
     scc_size.resize(m, 0);
     for scc_idx in 0..emit_sccs.len() {
         let comp = emit_sccs.component(scc_idx);
@@ -2302,8 +2688,8 @@ where
         }
     }
 
-    let mut misel_caller_ok: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
-    let mut misel_callee_ok: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    let mut misel_caller_ok: AVec<'a, bool> = Vec::with_capacity_in(m, alloc);
+    let mut misel_callee_ok: AVec<'a, bool> = Vec::with_capacity_in(m, alloc);
     for prep in prepared.iter() {
         let (caller_ok, callee_ok) = if is_arm64 {
             let names = InstanceNames {
@@ -2334,9 +2720,9 @@ where
         misel_callee_ok.push(callee_ok);
     }
 
-    let mut callers_per_fn: AVec<'s, AVec<'s, usize>> = Vec::with_capacity_in(m, scratch);
+    let mut callers_per_fn: AVec<'a, AVec<'a, usize>> = Vec::with_capacity_in(m, alloc);
     for _ in 0..m {
-        callers_per_fn.push(Vec::new_in(scratch));
+        callers_per_fn.push(Vec::new_in(alloc));
     }
     for (caller_idx, callees) in callees_per_fn.iter().enumerate() {
         for &callee_idx in callees.iter() {
@@ -2346,7 +2732,7 @@ where
         }
     }
 
-    let mut use_internal_fast: AVec<'s, bool> = Vec::with_capacity_in(m, scratch);
+    let mut use_internal_fast: AVec<'a, bool> = Vec::with_capacity_in(m, alloc);
     for (f, prep) in prepared.iter().enumerate() {
         let ok = is_arm64
             && abi_plan.plans.get(f).is_some_and(|p| p.conv == CallConvKind::InternalFast)
@@ -2362,16 +2748,15 @@ where
         use_internal_fast.push(ok);
     }
 
-    let mut known_clobbers: AVec<'s, Option<CallClobbers>> = Vec::with_capacity_in(m, scratch);
-    let mut emitted_records: AVec<'s, Option<(AVec<'a, u8>, AVec<'a, (ItemKey, AVec<'a, u8>)>)>> =
-        Vec::with_capacity_in(m, scratch);
+    let mut known_clobbers: AVec<'a, Option<CallClobbers>> = Vec::with_capacity_in(m, alloc);
+    let mut emitted_records: AVec<'a, Option<EmittedBodyRec>> = Vec::with_capacity_in(m, alloc);
     for _ in 0..m {
         known_clobbers.push(None);
         emitted_records.push(None);
     }
-    let mut callee_clobbers_buf: AVec<'s, (u32, CallClobbers)> = Vec::new_in(scratch);
-    let mut internal_fast_callees_buf: AVec<'s, u32> = Vec::new_in(scratch);
-    let mut scc_clobbers: AVec<'s, (usize, CallClobbers)> = Vec::new_in(scratch);
+    let mut callee_clobbers_buf: AVec<'a, (u32, CallClobbers)> = Vec::new_in(alloc);
+    let mut internal_fast_callees_buf: AVec<'a, u32> = Vec::new_in(alloc);
+    let mut scc_clobbers: AVec<'a, (usize, CallClobbers)> = Vec::new_in(alloc);
 
     for scc_idx in 0..emit_sccs.len() {
         let comp = emit_sccs.component(scc_idx);
@@ -2444,21 +2829,21 @@ where
                 prep.routines,
                 prep.traps,
                 abi_opts,
-                scratch,
+                alloc,
             )
             .map_err(|error| ExportLtoError::Record { symbol: prep.symbol.0, error })?;
 
-            let mut record: AVec<'a, u8> = Vec::with_capacity_in(record_tmp.len(), alloc);
+            let mut record: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(record_tmp.len(), shared);
             record.extend_from_slice(record_tmp.as_slice());
-            let mut extra_declared: AVec<'a, (ItemKey, AVec<'a, u8>)> =
-                Vec::with_capacity_in(called_declared.len(), alloc);
+            let mut extra_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+                Vec::with_capacity_in(called_declared.len(), shared);
             for d in called_declared.iter() {
-                let mut name_buf: AVec<'a, u8> = Vec::with_capacity_in(d.name.len(), alloc);
+                let mut name_buf: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(d.name.len(), shared);
                 name_buf.extend_from_slice(d.name);
                 extra_declared.push((d.tabled, name_buf));
             }
             if let Some(slot) = emitted_records.get_mut(idx) {
-                *slot = Some((record, extra_declared));
+                *slot = Some(EmittedBodyRec { record, extra_declared });
             }
             scc_clobbers.push((idx, clobbers));
         }
@@ -2485,15 +2870,15 @@ where
     }
 
     // 3e. Reassemble `out_bodies` in exact original body order (Rule 25).
-    let mut out_bodies: AVec<'a, LtoBodyOut<'a>> = Vec::with_capacity_in(m, alloc);
+    let mut out_bodies: Vec<LtoBodyOut, SharedAlloc<'static>> = Vec::with_capacity_in(m, shared);
     for (prep, rec_opt) in prepared.into_iter().zip(emitted_records.into_iter()) {
-        if let Some((record, extra_declared)) = rec_opt {
+        if let Some(emitted) = rec_opt {
             out_bodies.push(LtoBodyOut {
                 row: prep.row,
                 symbol: prep.symbol,
-                record,
+                record: emitted.record,
                 vtable_data: prep.vtable_data,
-                extra_declared,
+                extra_declared: emitted.extra_declared,
                 inlined_bodies: prep.inlined_bodies,
             });
         }
@@ -2537,7 +2922,7 @@ mod tests {
         func: blaze_lir::Func<Alloc<'static>>,
         c_names: &[&str],
         alloc: Alloc<'static>,
-    ) -> BuiltLir<'static> {
+    ) -> BuiltLir<Alloc<'static>> {
         let mut funcs: AVec<'static, BuiltCallee> = Vec::with_capacity_in(c_names.len(), alloc);
         let mut c_text: AVec<'static, u8> = Vec::new_in(alloc);
         for &name in c_names {
@@ -2565,7 +2950,7 @@ mod tests {
         ret_ty: Ty,
         variadic: Variadic,
         alloc: Alloc<'static>,
-    ) -> BuiltLir<'static> {
+    ) -> BuiltLir<Alloc<'static>> {
         let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
         let sig_params: std::vec::Vec<Param> = param_tys.iter().copied().map(Param::of).collect();
         let ret_params = [Param::of(ret_ty)];
@@ -3334,5 +3719,290 @@ mod tests {
         assert!(should_keep_non_seed(always_inline, 12, true, 24, &opts));
         assert!(!should_keep_non_seed(0, 12, true, 24, &opts));
         assert!(!should_keep_non_seed(hint_inline, 25, true, 24, &opts));
+
+        // Oversized non-cold callers are still expanded so their downstream call subgraph is never
+        // severed, while cold/noreturn bodies stay unexpanded.
+        assert!(should_expand_non_seed(0));
+        assert!(should_expand_non_seed(no_inline));
+        assert!(should_expand_non_seed(FnAttrs::COLD | always_inline));
+        assert!(!should_expand_non_seed(FnAttrs::COLD));
+        assert!(!should_expand_non_seed(FnAttrs::NORETURN));
+        assert!(!should_expand_non_seed(FnAttrs::NORETURN | always_inline));
+    }
+
+    #[test]
+    fn enqueue_normal_callees_discovers_call_invoke_func_addr_and_vtable_methods() {
+        use blaze_code::datum::{Datum, Place as DatumPlace};
+        use blaze_code::record::{Target as CodeTarget, Word as CodeWord};
+
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Register 4 reachable functions in a Walk: direct_call, direct_invoke, fn_ptr, vtable_method.
+        let mut walk = Walk::new_in(alloc);
+        let row_call = walk.root::<RunError>((ItemKey(1), b"direct_call"), 64).expect("row_call");
+        let row_invoke = walk.root::<RunError>((ItemKey(2), b"direct_invoke"), 64).expect("row_invoke");
+        let row_fnptr = walk.root::<RunError>((ItemKey(3), b"fn_ptr"), 64).expect("row_fnptr");
+        let row_vmethod = walk.root::<RunError>((ItemKey(4), b"vtable_method"), 64).expect("row_vmethod");
+        let sym_call = walk.symbol(row_call);
+        let sym_invoke = walk.symbol(row_invoke);
+        let sym_fnptr = walk.symbol(row_fnptr);
+        let sym_vmethod = walk.symbol(row_vmethod);
+        let vsym = Symbol::of_name("test_vtable");
+
+        // Build a vtable datum referencing `sym_vmethod`.
+        let mut vt_datum = Datum::new_in(DatumPlace::ReadOnly, 3, alloc);
+        vt_datum.bytes.extend_from_slice(&[0u8; 8]);
+        let t_idx = vt_datum.target(CodeTarget { space: Space::Func, symbol: sym_vmethod });
+        vt_datum.words.push(CodeWord { at: 0, target: t_idx, addend: 0 });
+        let mut vt_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        vt_datum.seal().expect("seal").encode(&mut vt_bytes);
+
+        let func = {
+            let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+            b.set_signature(sig);
+            let r_call = b.reference(RefKind::Func, 0);
+            let r_invoke = b.reference(RefKind::Func, 1);
+            let r_fnptr = b.reference(RefKind::Func, 2);
+            let r_vtable = b.reference(RefKind::Vtable, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            b.call(Flags::NONE, r_call, sig, &[]);
+            let _fp = b.func_addr(r_fnptr);
+            let _vt = b.data_addr(r_vtable);
+            b.invoke(Flags::NONE, r_invoke, sig, &[], norm, pad);
+            b.begin(norm);
+            b.ret(&[]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("valid caller")
+        };
+
+        let mut funcs_tbl: AVec<'static, BuiltCallee> = Vec::new_in(alloc);
+        funcs_tbl.push(BuiltCallee::Symbol(sym_call));
+        funcs_tbl.push(BuiltCallee::Symbol(sym_invoke));
+        funcs_tbl.push(BuiltCallee::Symbol(sym_fnptr));
+        let mut vtables_tbl: AVec<'static, Symbol> = Vec::new_in(alloc);
+        vtables_tbl.push(vsym);
+        let mut vtable_data: AVec<'static, (Symbol, AVec<'static, u8>)> = Vec::new_in(alloc);
+        vtable_data.push((vsym, vt_bytes));
+
+        let built = BuiltLir {
+            func,
+            funcs: funcs_tbl,
+            statics: Vec::new_in(alloc),
+            c_statics: Vec::new_in(alloc),
+            vtables: vtables_tbl,
+            vtable_data,
+            tls: Vec::new_in(alloc),
+            traps: Vec::new_in(alloc),
+            c_text: Vec::new_in(alloc),
+        };
+
+        let mut visited: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        visited.resize(walk.len(), UNSEEN);
+        let mut min_depth: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        min_depth.resize(walk.len(), u8::MAX);
+        let mut call_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        let mut indirect_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        enqueue_normal_callees(
+            &built,
+            &walk,
+            1,
+            24,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+            alloc,
+        );
+
+        assert!(call_queue.iter().any(|&(r, d, _)| r == row_call && d == 1));
+        assert!(call_queue.iter().any(|&(r, d, _)| r == row_invoke && d == 1));
+        assert!(indirect_queue.iter().any(|&(r, d, _)| r == row_fnptr && d == 1));
+        assert!(indirect_queue.iter().any(|&(r, d, _)| r == row_vmethod && d == 1));
+    }
+
+    #[test]
+    fn enqueue_sym_preserves_shallowest_depth_on_promotion_and_reexpands_unexpanded() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut walk = Walk::new_in(alloc);
+        let row_promoted = walk.root::<RunError>((ItemKey(11), b"promoted_target"), 64).expect("row_promoted");
+        let row_unexpanded = walk.root::<RunError>((ItemKey(12), b"unexpanded_target"), 64).expect("row_unexpanded");
+        let sym_promoted = walk.symbol(row_promoted);
+        let sym_unexpanded = walk.symbol(row_unexpanded);
+
+        let max_depth = 4u8;
+        let mut visited: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        visited.resize(walk.len(), UNSEEN);
+        let mut min_depth: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        min_depth.resize(walk.len(), u8::MAX);
+        let mut call_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        let mut indirect_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+
+        // 1. Shallow indirect edge (depth 1) followed by deep direct-call promotion (depth == max_depth):
+        //    promotion into `call_queue` MUST retain the shallowest depth (`1`), never overwrite with `4`.
+        enqueue_sym(
+            &walk,
+            sym_promoted,
+            false,
+            1,
+            max_depth,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+        );
+        enqueue_sym(
+            &walk,
+            sym_promoted,
+            true,
+            max_depth,
+            max_depth,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+        );
+        assert_eq!(visited[row_promoted], QUEUED_CALL);
+        assert_eq!(min_depth[row_promoted], 1);
+        assert!(
+            call_queue.iter().any(|&(r, d, _)| r == row_promoted && d == 1),
+            "promoted direct-queue entry must preserve shallowest depth 1, got {call_queue:?}"
+        );
+
+        // 2. A row previously processed at `max_depth` (`PROCESSED_UNEXPANDED`) that is later
+        //    reached at depth `2 < max_depth` MUST be re-queued as `QUEUED_EXPAND_ONLY`.
+        visited[row_unexpanded] = PROCESSED_UNEXPANDED;
+        min_depth[row_unexpanded] = max_depth;
+        enqueue_sym(
+            &walk,
+            sym_unexpanded,
+            false,
+            2,
+            max_depth,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+        );
+        assert_eq!(visited[row_unexpanded], QUEUED_EXPAND_ONLY);
+        assert_eq!(min_depth[row_unexpanded], 2);
+        assert!(
+            indirect_queue.iter().any(|&(r, d, _)| r == row_unexpanded && d == 2),
+            "unexpanded row reached at shallower depth must re-queue for expansion, got {indirect_queue:?}"
+        );
+    }
+
+    #[test]
+    fn enqueue_normal_callees_follows_nested_data_relocs_and_breaks_cycles() {
+        use blaze_code::datum::{Datum, Place as DatumPlace};
+        use blaze_code::record::{Target as CodeTarget, Word as CodeWord};
+        use blaze_lir::builder::DataReloc;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut walk = Walk::new_in(alloc);
+        let row_nested_fn = walk.root::<RunError>((ItemKey(21), b"nested_data_fn"), 64).expect("row_nested_fn");
+        let row_nested_vt = walk.root::<RunError>((ItemKey(22), b"nested_data_vt_method"), 64).expect("row_nested_vt");
+        let sym_nested_fn = walk.symbol(row_nested_fn);
+        let sym_nested_vt = walk.symbol(row_nested_vt);
+        let vsym = Symbol::of_name("nested_test_vtable");
+
+        let mut vt_datum = Datum::new_in(DatumPlace::ReadOnly, 3, alloc);
+        vt_datum.bytes.extend_from_slice(&[0u8; 8]);
+        let t_idx = vt_datum.target(CodeTarget { space: Space::Func, symbol: sym_nested_vt });
+        vt_datum.words.push(CodeWord { at: 0, target: t_idx, addend: 0 });
+        let mut vt_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        vt_datum.seal().expect("seal").encode(&mut vt_bytes);
+
+        // Build `outer_data -> mid_data -> (nested_fn, vtable, self-reference cycle)`.
+        let func = {
+            let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+            b.set_signature(sig);
+            let r_fn = b.reference(RefKind::Func, 0);
+            let r_vt = b.reference(RefKind::Vtable, 0);
+            let inner_data = b.data(
+                &[0u8; 16],
+                3,
+                &[
+                    DataReloc { offset: 0, target: r_fn, addend: 0 },
+                    DataReloc { offset: 8, target: r_vt, addend: 0 },
+                ],
+            );
+            let mid_data = b.data(
+                &[0u8; 8],
+                3,
+                &[DataReloc { offset: 0, target: inner_data, addend: 0 }],
+            );
+            // Include a duplicate/back-edge reference alongside `mid_data` to exercise cycle/dedup.
+            let outer_data = b.data(
+                &[0u8; 16],
+                3,
+                &[
+                    DataReloc { offset: 0, target: mid_data, addend: 0 },
+                    DataReloc { offset: 8, target: inner_data, addend: 0 },
+                ],
+            );
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let _p = b.data_addr(outer_data);
+            b.ret(&[]);
+            b.finish_checked().expect("valid nested data caller")
+        };
+
+        let mut funcs_tbl: AVec<'static, BuiltCallee> = Vec::new_in(alloc);
+        funcs_tbl.push(BuiltCallee::Symbol(sym_nested_fn));
+        let mut vtables_tbl: AVec<'static, Symbol> = Vec::new_in(alloc);
+        vtables_tbl.push(vsym);
+        let mut vtable_data: AVec<'static, (Symbol, AVec<'static, u8>)> = Vec::new_in(alloc);
+        vtable_data.push((vsym, vt_bytes));
+
+        let built = BuiltLir {
+            func,
+            funcs: funcs_tbl,
+            statics: Vec::new_in(alloc),
+            c_statics: Vec::new_in(alloc),
+            vtables: vtables_tbl,
+            vtable_data,
+            tls: Vec::new_in(alloc),
+            traps: Vec::new_in(alloc),
+            c_text: Vec::new_in(alloc),
+        };
+
+        let mut visited: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        visited.resize(walk.len(), UNSEEN);
+        let mut min_depth: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        min_depth.resize(walk.len(), u8::MAX);
+        let mut call_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        let mut indirect_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        enqueue_normal_callees(
+            &built,
+            &walk,
+            2,
+            24,
+            &|_| true,
+            visited.as_mut_slice(),
+            min_depth.as_mut_slice(),
+            &mut call_queue,
+            &mut indirect_queue,
+            alloc,
+        );
+
+        assert!(
+            indirect_queue.iter().any(|&(r, d, _)| r == row_nested_fn && d == 2),
+            "expected nested Data -> Data -> Func target in indirect_queue, got {indirect_queue:?}"
+        );
+        assert!(
+            indirect_queue.iter().any(|&(r, d, _)| r == row_nested_vt && d == 2),
+            "expected nested Data -> Data -> Vtable method in indirect_queue, got {indirect_queue:?}"
+        );
     }
 }

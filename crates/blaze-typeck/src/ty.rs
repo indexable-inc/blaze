@@ -371,6 +371,18 @@ pub trait TypeCtx {
     /// Supply the inferred call kind and the stored capture types. A missing tuple
     /// means the binding rows did not establish the precise captured places.
     fn settle_closure(&mut self, closure: ExprId, kind: ClosureKind, upvars: Option<Ty>) -> Result<(), CheckError>;
+
+    /// Whether every callable trait obligation on `closure` in this body is a by-value
+    /// `FnOnce` / `AsyncFnOnce` obligation (at least one such obligation, and zero `Fn`, `FnMut`,
+    /// `AsyncFn`, or `AsyncFnMut` obligations). When true, an `async` closure's future is
+    /// strictly the owning `CallOnceFuture` storing its captures by value, never a borrowing
+    /// `CallRefFuture`.
+    fn closure_used_only_once(
+        &mut self,
+        closure: ExprId,
+        once_traits: [Option<ItemKey>; 2],
+        ref_traits: [Option<ItemKey>; 4],
+    ) -> bool;
 }
 
 /// A closure's kind (`rustc_type_ir::ClosureKind`), weakest trait first.
