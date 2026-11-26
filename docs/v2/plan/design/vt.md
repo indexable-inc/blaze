@@ -51,12 +51,35 @@ KeyEvent / MouseEvent / Paste / Focus ──► input::encode(&Modes) ──► 
 | `kitty` | APC graphics (transmit, put, delete, query; zlib through bstd's inflate, PNG through bstd::image; placements, virtual placements, U+10EEEE), the glyph protocol | 9 |
 | `input` | key encoding (legacy, modifyOtherKeys, kitty flags 1–16), mouse (X10, 1005, 1006, 1015, 1016; 1000/1002/1003), focus, paste (bracketed, unsafe bytes) | 10 |
 | `reply` | every reply's exact bytes and terminator | 12 |
+| `snapshot` | canonical, portable VT snapshot & restore (`VtSnapshot`, `capture`, `restore`) | — |
 
 Known ghostty quirks are kept and each has a test with ghostty's line in its name (inventory
 "Things a port could get wrong"): 0x10–0x1F and DEL print in ground; ANSI DECRQM is silent; CAN,
 SUB and ESC inside an OSC still dispatch it; bare `CSI g` is ignored. Two are ghostty bugs, not
 behaviour, and are fixed here, each with a test saying so: HPA/VPA/HPR/VPR adding the origin
 offset twice (libghostty handler), and OSC 105 being unreachable.
+
+## Snapshot & restore (`snapshot`)
+
+A terminal can be shut down, restarted, and resumed from a VT-equivalent state across internal
+layout or schema updates without persisting `PageList`, `StyleSet`, or `ExtTable` internals:
+
+- **`Terminal::snapshot_vt(alloc)` / `snapshot::capture(&term, alloc)`** emits a
+  `VtSnapshot<A: Allocator>` holding `(cols, rows)`, `active_alt`, a minimal canonical VT byte
+  stream for the primary screen (`primary_vt`), an optional canonical VT stream for the alternate
+  screen when active or non-empty (`alt_vt`), bit-packed per-row soft-wrap flags
+  (`primary_soft_wraps` / `alt_soft_wraps`, 2 bits/row for `wrap` and `wrap_continuation`) so
+  resize reflow stays faithful, deferred-wrap (`pending_wrap`) cursor flags, and non-replayable
+  mode bits (`?47`/`?1047`/`?1049`/`?1048`/`?3`).
+- **`Terminal::restore_vt_snapshot(&snap)` / `snapshot::restore(&mut term, &snap)`** validates
+  `(cols, rows)` (refusing mismatches with `RestoreError::DimensionMismatch`), resets the
+  terminal, replays the canonical VT streams through `Terminal::feed`, applies the soft-wrap /
+  deferred-wrap / non-replay mode metadata, and drains spurious replay replies and effects.
+- **Proof.** `snapshot_tests.rs` verifies unit round-trips (truecolor/256-color/underline SGR,
+  wide CJK + `SpacerHead` + combining/ZWJ graphemes, multi-page scrollback + reflow, cursor
+  position/shape/visibility, modes/margins, OSC 2/4/7/8/10/11/12/22/133, active and dormant alt
+  screens) plus a `blaze-sim` property test with planted-bug controls (`SnapshotDropsStyle`,
+  `SnapshotDropsCursor`, `SnapshotDropsSoftWrap`).
 
 ## Tests (rules 53, 64, 23)
 

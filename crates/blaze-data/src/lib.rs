@@ -56,6 +56,7 @@
 // First, and textually scoped, so the crate's own modules call its macros by name.
 #[macro_use]
 mod macros;
+mod lossy;
 mod map;
 mod path;
 mod plant;
@@ -71,8 +72,15 @@ mod walk;
 extern crate std;
 
 #[cfg(test)]
+mod lossy_tests;
+#[cfg(test)]
 mod tests;
 
+pub use lossy::{
+    Decoded, FromValueLossy, IsolatedList, ItemOutcome, LossyFields, LossyPlant,
+    decode_list_isolated, decode_lossy, decode_strict, decode_versioned_str, merge_unknown_into,
+    merge_unknown_into_planted,
+};
 pub use map::{Map, Taken};
 pub use plant::DataPlant;
 pub use path::{At, Cursor, Extra, Fields, Shape, ShapeError, Step, write_step};
