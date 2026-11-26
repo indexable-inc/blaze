@@ -1467,6 +1467,11 @@ impl Buckets {
         }
     }
 
+    /// The backing allocator used for this table's admitted rows and sight caches.
+    pub(super) fn alloc(&self) -> blaze_own::Alloc<'static> {
+        self.alloc
+    }
+
     /// Files every impl of `index` by its header as written.
     pub fn new(names: &Names<'_>, index: &Index<'_>) -> Buckets {
         Self::new_in(names, index, default_alloc())

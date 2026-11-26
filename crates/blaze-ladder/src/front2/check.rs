@@ -336,11 +336,12 @@ fn merge_replayed_reads<'n, S: NamesSource<'n>>(
                 };
                 let home = trait_home(r.names, r.keys, r.store, trait_, shape).map_err(|error| CheckFail::Head { owner, error })?;
                 let b = r.buckets.get_or_insert_with(|| Buckets::for_source_in(r.names, r.index, alloc));
-                b.admit_shared(r.names, r.keys, home, Ask::Trait(trait_, shape), alloc).map_err(|e| match e {
+                let ba = b.alloc();
+                b.admit_shared(r.names, r.keys, home, Ask::Trait(trait_, shape), ba).map_err(|e| match e {
                     AdmitError::Tables(error) => CheckFail::Tables { owner, error },
                     AdmitError::Question(error) => CheckFail::ImplQuestion { owner, error },
                 })?;
-                b.sight(r.names, seen, alloc).map_err(|why| CheckFail::Buckets { owner, error: Unfilled::Sight(why) })?;
+                b.sight(r.names, seen, ba).map_err(|why| CheckFail::Buckets { owner, error: Unfilled::Sight(why) })?;
             }
             Question::Lang(item) => {
                 if let Ok(Some(lib)) = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, item) {
@@ -2812,10 +2813,11 @@ pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S,
     // Only impls written where the orphan rules allow (`trait_home`) are candidates.
     let home = trait_home(names, heads.keys(), heads.store(), trait_, shape).map_err(MakeFail::Head)?;
     // Over a bucket index: this question's buckets of the crates `home` admits.
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().work_alloc()).map_err(MakeFail::from)?;
+    let ba = b.alloc();
+    b.admit_shared(names, heads.keys(), home, ask, ba).map_err(MakeFail::from)?;
     // And only impls of the crates the asking body sees (`Seen`): none of a crate downstream
     // of a checked body's, whose headers are then never made for it either.
-    let sight = b.sight(names, seen, heads.store().work_alloc()).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
+    let sight = b.sight(names, seen, ba).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
     let mut candidates = b.trait_candidates(trait_, shape, home);
     // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
     // decides an auto trait's structural rule, and the solver matches it to no positive
@@ -2840,7 +2842,7 @@ pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names:
     let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
     // Only impls written in the type's own crate (`inherent_home`) are candidates.
     let home = inherent_home(names, heads.keys(), heads.store(), shape).map_err(MakeFail::Head)?;
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().work_alloc()).map_err(MakeFail::from)?;
+    b.admit_shared(names, heads.keys(), home, ask, b.alloc()).map_err(MakeFail::from)?;
     // The name filters first, from the impls' member rows (no header made): an impl
     // that declares no member of the name is never the answer, so its header is not
     // lowered for it. rustc finds an inherent item by name before it unifies self
