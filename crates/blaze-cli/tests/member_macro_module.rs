@@ -45,9 +45,6 @@ const REAP: Duration = Duration::from_secs(10);
 /// The words of the failure this piece removes (blaze-world procs.rs `PathWithoutFolder`).
 const NOT_GIVEN: &str = "a path macro crate whose folder was not given";
 
-/// The start of the line a looked-up member module the store lacks prints (macros.rs).
-const LACKS: &str = "mac 0.1.0: no compiled proc-macro module in";
-
 const LIB: &str = "use proc_macro::TokenStream;\n\n#[proc_macro]\npub fn same(input: TokenStream) -> TokenStream {\n    input\n}\n";
 
 /// pm-small at `dir`, its macro crate's root `lib`.
@@ -110,16 +107,23 @@ fn check(dir: &Path, home: &Path) -> String {
     std::fs::read_to_string(&said).unwrap_or_else(|error| panic!("reading {}: {error}", said.display()))
 }
 
-/// The module key the member's lookup printed: the 64 hex digits after "(key " on the
-/// [`LACKS`] line.
-fn key(said: &str, at: &Path) -> String {
+/// The published module key(s) under `<home>/.blaze/v2/proc-macro/modules` (64 hex chars each).
+fn published_keys(home: &Path, said: &str, at: &Path) -> Vec<String> {
     assert!(!said.contains(NOT_GIVEN), "the folder of a member macro crate was not given ({}):\n{said}", at.display());
-    let line = said.lines().find(|line| line.contains(LACKS)).unwrap_or_else(|| panic!("no line says the member's module was looked up ({}):\n{said}", at.display()));
-    let (_, after) = line.split_once("(key ").unwrap_or_else(|| panic!("the lookup's line names no key: {line}"));
-    let key: String = after.chars().take_while(char::is_ascii_hexdigit).collect();
-    assert_eq!(key.len(), 64, "a module key is a SHA-256 in hex: {line}");
-    assert!(line.contains("\"checkout\""), "the bootstrap's input names the checkout the path crate is in: {line}");
-    key
+    assert!(!said.contains("error[macro-call-failed]"), "the self-compiled wasm64 proc-macro failed ({}):\n{said}", at.display());
+    let dir = home.join(".blaze/v2/proc-macro/modules");
+    let mut keys: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("reading {} after check ({}): {error}\n{said}", dir.display(), at.display()))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("module.wasm").is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    keys.sort();
+    for k in &keys {
+        assert_eq!(k.len(), 64, "a module key is a SHA-256 in hex: {k}");
+        assert!(k.chars().all(|c| c.is_ascii_hexdigit()), "a module key is hex: {k}");
+    }
+    keys
 }
 
 #[test]
@@ -131,42 +135,36 @@ fn a_member_macro_crate_is_looked_up_by_its_files() {
     workspace(&at_a, LIB);
     workspace(&at_b, LIB);
     workspace(&at_c, &format!("{LIB}\n"));
-    let key_a = key(&check(&at_a, &a.join("home")), &at_a);
-    let key_b = key(&check(&at_b, &b.join("home")), &at_b);
-    let key_c = key(&check(&at_c, &c.join("home")), &at_c);
-    assert_eq!(key_a, key_b, "one workspace at two paths: one module key (rule 25)");
-    assert_ne!(key_a, key_c, "a byte more in mac/src/lib.rs: another module key (rule 21)");
-    println!("keyed: {key_a} then {key_c}");
+    let (home_a, home_b, home_c) = (a.join("home"), b.join("home"), c.join("home"));
+    let keys_a = published_keys(&home_a, &check(&at_a, &home_a), &at_a);
+    let keys_b = published_keys(&home_b, &check(&at_b, &home_b), &at_b);
+    let keys_c = published_keys(&home_c, &check(&at_c, &home_c), &at_c);
+    assert_eq!(keys_a.len(), 1);
+    assert_eq!(keys_b.len(), 1);
+    assert_eq!(keys_c.len(), 1);
+    assert_eq!(keys_a[0], keys_b[0], "one workspace at two paths: one module key (rule 25)");
+    assert_ne!(keys_a[0], keys_c[0], "a byte more in mac/src/lib.rs: another module key (rule 21)");
+    println!("keyed: {} then {}", keys_a[0], keys_c[0]);
 }
 
 /// The lookup's own key holds the member's files (member-macro-module-2, rule 21): a module
-/// found for `mac`'s files is not used once one byte of `mac/src/lib.rs` changes.
-///
-/// One checkout, one home. (1) `blaze check`: the store is empty, the lookup names key `k1`.
-/// (2) A module record for `k1` is put in the store (`wasm-sha256`, all `find_module` reads):
-/// the store's listing moved, the lookup runs again, finds it, and no line names `mac`'s
-/// module. (3) One byte more in `mac/src/lib.rs`: the lookup must run again and name a new key
-/// `k2`, which the store lacks. Before -2 (the lookup's key was the graph's source and the
-/// subject, which hold `mac`'s manifest and not its files) step (3) printed nothing: the found
-/// record of step (2) stood, naming the module of the old files.
-///
-/// Prints `edited: <k1> then <k2>`. Control: with -1's macros.rs/units.rs (no `MacroFiles`
-/// row), it fails with "an edit of mac/src/lib.rs left the found module of the old files standing".
+/// self-compiled for `mac`'s files is not reused once one byte of `mac/src/lib.rs` changes.
 #[test]
 fn an_edit_of_a_member_macro_crate_moves_its_module_lookup() {
     let base = fresh_home("member_macro_module_edit", true);
     let (home, at) = (base.join("home"), base.join("pm"));
     workspace(&at, LIB);
-    let k1 = key(&check(&at, &home), &at);
-    let module = home.join(".blaze/v2/proc-macro/modules").join(&k1);
-    std::fs::create_dir_all(&module).unwrap_or_else(|error| panic!("making {}: {error}", module.display()));
-    std::fs::write(module.join("wasm-sha256"), format!("{}\n", "0".repeat(64))).expect("the planted module's digest");
-    let found = check(&at, &home);
-    assert!(!found.contains(LACKS) && !found.contains(NOT_GIVEN), "the module put in the store was not found:\n{found}");
+    let keys1 = published_keys(&home, &check(&at, &home), &at);
+    assert_eq!(keys1.len(), 1, "first check self-compiles one module");
+    let k1 = keys1[0].clone();
+    // Second check with unchanged files reuses the published module without compiling a new key.
+    let keys1_again = published_keys(&home, &check(&at, &home), &at);
+    assert_eq!(keys1_again, vec![k1.clone()], "unchanged files reuse the cached module");
+    // Editing one byte of `mac/src/lib.rs` moves the module key and self-compiles a second module.
     std::fs::write(at.join("mac/src/lib.rs"), format!("{LIB}\n")).expect("the edit of mac/src/lib.rs");
-    let edited = check(&at, &home);
-    assert!(edited.contains(LACKS), "an edit of mac/src/lib.rs left the found module of the old files standing:\n{edited}");
-    let k2 = key(&edited, &at);
+    let keys2 = published_keys(&home, &check(&at, &home), &at);
+    assert_eq!(keys2.len(), 2, "an edit of mac/src/lib.rs must publish a new module key alongside {k1}: {keys2:?}");
+    let k2 = keys2.into_iter().find(|k| k != &k1).expect("a distinct second key");
     assert_ne!(k1, k2, "the edited files' module key is another");
     println!("edited: {k1} then {k2}");
 }

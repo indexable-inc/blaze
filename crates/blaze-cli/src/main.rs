@@ -107,6 +107,7 @@ mod test_run;
 mod toolchain;
 mod units;
 mod unused_deps;
+mod wasm64_compile;
 mod work;
 mod check_command;
 mod ci_command;

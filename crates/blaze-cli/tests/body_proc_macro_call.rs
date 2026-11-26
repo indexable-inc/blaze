@@ -45,10 +45,6 @@ const DEADLINE: Duration = Duration::from_secs(300);
 const REAP: Duration = Duration::from_secs(10);
 /// The words of the finding this piece removes (blaze-scope resolve.rs `ExpandNote::NoDefinition`).
 const NO_DEFINITION: &str = "NoDefinition";
-/// The `MacroModule` task's line for a crate whose module the store lacks (macros.rs).
-const NAMED: &str = "mac 0.1.0: no compiled proc-macro module in";
-/// The body's call, named by its path in the body's finding (blaze-lower by_name.rs).
-const CALL: &str = "mac::same";
 
 /// pm-small at `dir`.
 fn workspace(dir: &Path) {
@@ -113,10 +109,17 @@ fn check(dir: &Path, home: &Path) -> String {
 fn a_body_call_of_a_fn_like_proc_macro_goes_to_the_runner() {
     let home = fresh_home("body_proc_macro_call", true);
     let at = home.join("pm");
+    let user_home = home.join("home");
     workspace(&at);
-    let said = check(&at, &home.join("home"));
+    let said = check(&at, &user_home);
     assert!(!said.contains(NO_DEFINITION), "the body call was looked up as a source definition (NoDefinition):\n{said}");
-    assert!(said.contains(NAMED), "the crate with no module is named with its bootstrap command:\n{said}");
-    assert!(said.contains(CALL), "the body's unexpanded call is named by its path:\n{said}");
-    println!("named: {NAMED}");
+    assert!(!said.contains("error[macro-call-failed]"), "the self-compiled wasm64 proc-macro failed to expand in body position:\n{said}");
+    assert!(!said.contains("error[types]"), "type checking failed after expanding `mac::same!(1 + 2)`:\n{said}");
+    let modules_dir = user_home.join(".blaze/v2/proc-macro/modules");
+    let published: Vec<_> = std::fs::read_dir(&modules_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", modules_dir.display()))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("module.wasm").is_file())
+        .collect();
+    assert_eq!(published.len(), 1, "expected 1 self-compiled wasm64 proc-macro module in {}:\n{said}", modules_dir.display());
 }

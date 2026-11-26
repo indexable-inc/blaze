@@ -137,6 +137,12 @@ struct MacroCrate {
     /// `name version`.
     label: String,
     module: Result<ModuleRecord, ModuleError>,
+    /// Module store root (`<home>/.blaze/v2`) for late-published modules compiled on demand by a
+    /// `MacroModule` task after `ProcRunner` was initialized.
+    module_store: Option<std::path::PathBuf>,
+    /// Populated once when an initially-`Missing` module is published to `module_store` later in
+    /// the same command.
+    published: PublishOnce<ModuleRecord>,
     /// Whether its missing or unloadable module was reported.
     reported: AtomicBool,
     /// Its module as the runtime loaded it, for the command: asked of the runtime once (its
@@ -147,6 +153,29 @@ struct MacroCrate {
 }
 
 impl MacroCrate {
+    /// Returns the module record, checking `module_store` once if the module was initially missing
+    /// (e.g. self-compiled on demand by a `MacroModule` task that completed after `ProcRunner`
+    /// started).
+    fn resolve_module(&self) -> Result<&ModuleRecord, &ModuleError> {
+        match &self.module {
+            Ok(module) => Ok(module),
+            Err(error) => {
+                if let Some(module) = self.published.get() {
+                    return Ok(module);
+                }
+                if let (Some(store), ModuleError::Missing { name, version, key }) = (&self.module_store, error)
+                    && let Ok(record) = crate::module::read_module_by_key(store, key.clone(), name, version)
+                {
+                    drop(self.published.set(record));
+                    if let Some(module) = self.published.get() {
+                        return Ok(module);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// See [`MacroCrate::loaded`].
     fn loaded(&self, runtime: &Runtime, module: &ModuleRecord) -> Result<Arc<Loaded>, RuntimeError> {
         if let Some(loaded) = self.loaded.get() {
@@ -324,10 +353,23 @@ impl<'r> ProcMacros<'r> {
     /// gave it) under `key`, the crate key its definitions carry. A crate with no module is
     /// registered all the same: its calls are refused, and it is reported once.
     pub fn add_crate(&mut self, key: CrateItemKey, name: &str, version: &str, module: Result<ModuleRecord, ModuleError>) {
+        self.add_crate_in(None, key, name, version, module);
+    }
+
+    /// Registers a macro crate backed by `store` so that if its module is initially `Missing`
+    /// (because a `MacroModule` task is still self-compiling it on demand in the same command),
+    /// the first consumer call after `MacroModule` finishes picks up the published module cleanly.
+    pub fn add_crate_from_store(&mut self, store: &Path, key: CrateItemKey, name: &str, version: &str, module: Result<ModuleRecord, ModuleError>) {
+        self.add_crate_in(Some(store.to_path_buf()), key, name, version, module);
+    }
+
+    fn add_crate_in(&mut self, module_store: Option<std::path::PathBuf>, key: CrateItemKey, name: &str, version: &str, module: Result<ModuleRecord, ModuleError>) {
         self.crates.push(MacroCrate {
             key,
             label: format!("{name} {version}"),
             module,
+            module_store,
+            published: PublishOnce::new(),
             reported: AtomicBool::new(false),
             loaded: PublishOnce::new(),
         });
@@ -347,7 +389,7 @@ impl<'r> ProcMacros<'r> {
         match crate::module::read_module(store, &id) {
             Err(e) if !matches!(e, ModuleError::Missing { .. }) => Err(named(AddWhy::Module(e))),
             module => {
-                self.add_crate(key, reached.name, reached.version, module);
+                self.add_crate_from_store(store, key, reached.name, reached.version, module);
                 Ok(key)
             }
         }
@@ -355,7 +397,7 @@ impl<'r> ProcMacros<'r> {
 
     /// The macros `key`'s module exports; none when it has no module.
     pub fn exports(&self, key: CrateItemKey) -> &[Exported] {
-        match self.crates.iter().find(|it| it.key == key).map(|it| &it.module) {
+        match self.crates.iter().find(|it| it.key == key).map(MacroCrate::resolve_module) {
             Some(Ok(module)) => &module.macros,
             _ => &[],
         }
@@ -363,7 +405,7 @@ impl<'r> ProcMacros<'r> {
 
     /// Each registered crate: its key, `name version`, and whether it has a module.
     pub fn crates(&self) -> impl Iterator<Item = (CrateItemKey, &str, bool)> {
-        self.crates.iter().map(|it| (it.key, it.label.as_str(), it.module.is_ok()))
+        self.crates.iter().map(|it| (it.key, it.label.as_str(), it.resolve_module().is_ok()))
     }
 
     /// The findings so far, taken, with the compiled records the runtime refused.
@@ -425,7 +467,7 @@ impl<'r> ProcMacros<'r> {
         let MacroKind::ProcMacro { krate, kind } = def.kind() else { return None };
         let Some(macro_crate) = self.crates.iter().find(|it| it.key == krate) else { return Some(Finding::UnknownCrate { krate }) };
         let name = def.proc_name().unwrap_or("");
-        let module = match &macro_crate.module {
+        let module = match macro_crate.resolve_module() {
             Ok(module) => module,
             Err(error) => {
                 if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, name) {
@@ -468,7 +510,7 @@ impl<'r> ProcMacros<'r> {
             return Err(refused);
         };
         let name = def.proc_name().unwrap_or("");
-        let module = match &macro_crate.module {
+        let module = match macro_crate.resolve_module() {
             Ok(module) => module,
             Err(error) => {
                 // Default built-in comptime patch fast path: expand patched crates (`serde_derive`,

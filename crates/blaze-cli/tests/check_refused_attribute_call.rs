@@ -40,7 +40,7 @@ fn workspace(dir: &Path, lib: &str) {
         ("Cargo.toml", "[workspace]\nmembers = [\"mac\", \"app\"]\nresolver = \"2\"\n"),
         ("Cargo.lock", "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"mac\",\n]\n\n[[package]]\nname = \"mac\"\nversion = \"0.1.0\"\n"),
         ("mac/Cargo.toml", "[package]\nname = \"mac\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n"),
-        ("mac/src/lib.rs", "use proc_macro::TokenStream;\n\n#[proc_macro_attribute]\npub fn rpc(_args: TokenStream, item: TokenStream) -> TokenStream {\n    item\n}\n"),
+        ("mac/src/lib.rs", "use proc_macro::TokenStream;\n\n#[proc_macro_attribute]\npub fn rpc(_args: TokenStream, item: TokenStream) -> TokenStream {\n    let _: u32 = \"broken_proc_macro\";\n    item\n}\n"),
         ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nmac = { path = \"../mac\" }\n"),
         ("app/src/lib.rs", lib),
     ];

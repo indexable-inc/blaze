@@ -116,10 +116,18 @@ enum ScriptWork<'f> {
 /// The worker gets only immutable bytes. Neither the coordinator's store nor its
 /// single-threaded frame crosses the pool boundary.
 enum ModuleJob<'a> {
-    Build { wanted: crate::script_modules::Wanted<'a>, home: Option<&'a str> },
+    Build {
+        wanted: crate::script_modules::Wanted<'a>,
+        home: Option<&'a str>,
+        compile: Option<crate::wasm64_compile::CompileInputs<'a>>,
+    },
     Proc {
-        crates: Option<crate::macros::MacroCrates>, home: Option<&'a str>, checkout: &'a str,
-        graph: Option<Input>, initial: Option<MacroInputs<'a>>,
+        crates: Option<crate::macros::MacroCrates>,
+        home: Option<&'a str>,
+        checkout: &'a str,
+        graph: Option<Input>,
+        initial: Option<MacroInputs<'a>>,
+        compile: Option<crate::wasm64_compile::CompileInputs<'a>>,
     },
     #[cfg(test)]
     Fixture,
@@ -186,10 +194,13 @@ impl ModuleJob<'_> {
         let name = task.planned.name;
         let drive = |inputs| drive_task(name, task.key, task.planned.source, inputs, Vec::new_in(alloc), alloc);
         let (did, crates) = match self {
-            Self::Build { wanted, home } => (crate::script_modules::run(cx, home, wanted, &drive(Vec::new_in(alloc)), frame)?, None),
+            Self::Build { wanted, home, compile } => (
+                crate::script_modules::run(cx, home, wanted, compile, &drive(Vec::new_in(alloc)), frame)?,
+                None,
+            ),
             #[cfg(test)]
             Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found(name.subject), None)),
-            Self::Proc { mut crates, home, checkout, graph, initial } => {
+            Self::Proc { mut crates, home, checkout, graph, initial, compile } => {
                 let mut handed = LookupStore { name, graph: initial.zip(graph).map(|(input, graph)| (graph.at, input.graph)) };
                 let mut inputs = Vec::new_in(alloc);
                 inputs.extend(graph);
@@ -213,7 +224,7 @@ impl ModuleJob<'_> {
                     None => None,
                 };
                 let place = crate::macros::Place { home, checkout, members: Some(&members), rows: &rows };
-                let did = crate::macros::run(cx, &mut handed, lock.as_ref(), &mut crates, place, &drive(inputs), frame, frame)?;
+                let did = crate::macros::run(cx, &mut handed, lock.as_ref(), &mut crates, place, compile, &drive(inputs), frame, frame)?;
                 (did, crates)
             }
         };
@@ -325,6 +336,7 @@ pub(crate) struct ScriptQueue<'s> {
     native_running: usize,
     proc_running: bool,
     macro_inputs: Option<MacroInputs<'s>>,
+    compile_inputs: Option<crate::wasm64_compile::CompileInputs<'s>>,
     order: BTreeMap<(bool, Name), EngineTask, &'s Frame>,
     waiting: BTreeMap<(ScriptLane, bool, Name), EngineTask, &'s Frame>,
     running: BTreeMap<Name, Running<'s>, &'s Frame>,
@@ -345,7 +357,7 @@ impl<'s> ScriptQueue<'s> {
             scope, jobs, waiter: jobs.alloc(blaze_core::wait::Parker::new()),
             slots: jobs.alloc(PoolSlots { width, used: core::cell::Cell::new(0) }),
             width, native_running: 0,
-            proc_running: false, macro_inputs: None,
+            proc_running: false, macro_inputs: None, compile_inputs: None,
             order: BTreeMap::new_in(jobs), waiting: BTreeMap::new_in(jobs), running: BTreeMap::new_in(jobs),
             answered: BTreeMap::new_in(jobs),
             joined_later: Vec::new_in(jobs), clock: &handles.env.clock,
@@ -354,8 +366,63 @@ impl<'s> ScriptQueue<'s> {
         }
     }
 
+    /// Lazily prepares immutable inputs for on-demand `wasm64` self-compilation of missing
+    /// build-script or proc-macro modules (only when running against an on-disk checkout).
+    fn ensure_compile_inputs<'f>(
+        &mut self,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'_>,
+        graph_key: Option<Key>,
+        handles: &Handles<'s, 'f>,
+    ) -> Result<Option<crate::wasm64_compile::CompileInputs<'s>>, CliError>
+    where
+        'f: 's,
+    {
+        if self.compile_inputs.is_some() {
+            return Ok(self.compile_inputs);
+        }
+        let (Some(graph_key), Some(side), crate::engine_script_reads::Served::Root(root)) =
+            (graph_key, handles.side, handles.env.served)
+        else {
+            return Ok(None);
+        };
+        let mut bytes = bstd::mem::Bytes::new_in(self.jobs, "unit graph for wasm64 self-compile");
+        if !store.get_into(cx, graph_key, &mut bytes)? {
+            return Ok(None);
+        }
+        let held = self.jobs.alloc(bytes).as_slice();
+        let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held) else {
+            return Ok(None);
+        };
+        let Ok(sections) = crate::graph_payload::sections(view.payload) else {
+            return Ok(None);
+        };
+        let mut members = Vec::new_in(self.jobs);
+        if let Some(list) = handles.members {
+            for entry in list {
+                members.push((entry.id, work::held_str(entry.dir.as_str(), self.jobs), entry.kind));
+            }
+        }
+        let built = crate::wasm64_compile::CompileInputs {
+            graph: sections.graph,
+            lock: side.lock.text,
+            checkout: Some(root),
+            members: members.into_bump_slice(),
+            heap: handles.env.heap,
+        };
+        self.compile_inputs = Some(built);
+        Ok(self.compile_inputs)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+
+    /// True when any proc-macro `MacroModule` lookup/self-compile is still waiting or running.
+    /// `Stage::Names` must wait for these so no `CrateScope` task invokes `ProcRunner` before a
+    /// self-compiled proc-macro module is published to disk.
+    pub(crate) fn has_pending_proc_macro_module(&self) -> bool {
+        self.proc_running || self.waiting.keys().any(|(lane, _, _)| *lane == ScriptLane::ProcLookup)
     }
 
     /// True when every queued script task is an instantaneously-answered `Given` cell (zero
@@ -1387,6 +1454,7 @@ impl<'f> ScriptsStage<'f> {
         let drive = self.drive(&task, handles.env.heap.alloc())?;
         let name = drive.name;
         let world = names.names.as_ref().ok_or(CliError::Text { what: "the names world, made by the planner, is gone (engine_scripts.rs `prepare_lookup`)" })?;
+        let graph_key = self.output(Name::unit_graph()).flatten().map(|(key, _)| key);
         if world.script_module(name.subject).is_some() {
             #[cfg(test)]
             if self.runner.is_some() { return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Fixture), drive)); }
@@ -1401,7 +1469,12 @@ impl<'f> ScriptsStage<'f> {
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
             };
-            return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Build { wanted, home: handles.env.home }), drive));
+            let compile = if wanted.ran_as == crate::scripts::RanAs::Wasm {
+                queue.ensure_compile_inputs(cx, store, graph_key, handles)?
+            } else {
+                None
+            };
+            return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Build { wanted, home: handles.env.home, compile }), drive));
         }
         let Some(side) = handles.side else {
             let failure = TaskFailure { name, why: Why::Refused { what: "a proc-macro module's lookup with no lock read this command", rule: RULE } };
@@ -1428,7 +1501,8 @@ impl<'f> ScriptsStage<'f> {
         } else {
             None
         };
-        let lookup = ModuleJob::Proc { crates: self.macros.take(), home: side.place.home, checkout: side.place.checkout, graph, initial };
+        let compile = queue.ensure_compile_inputs(cx, store, graph_key, handles)?;
+        let lookup = ModuleJob::Proc { crates: self.macros.take(), home: side.place.home, checkout: side.place.checkout, graph, initial, compile };
         Ok(Dispatch::Run(ScriptWork::Module(lookup), drive))
     }
 
@@ -1771,7 +1845,7 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         // (which opens dependency crate records via `EngineRecords`). That is worker-count
         // invariant, keeps `Scripts` at 0 crate records read when no script runs, and lets
         // `Names` run at full unthrottled width once it is known whether any `Script` woke up.
-        if self.scripts.only_given() {
+        if self.scripts.only_given() || self.scripts.has_pending_proc_macro_module() {
             return Ok(());
         }
         #[cfg(test)]

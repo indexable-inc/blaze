@@ -353,7 +353,7 @@ mod with_sandbox {
             {
                 return Err(MakeError::Module { krate: std::format!("{} {}", identity.package, identity.version), why: error.to_string() });
             }
-            procs.add_crate(key, &identity.package, &identity.version, module);
+            procs.add_crate_from_store(&modules, key, &identity.package, &identity.version, module);
             keys.push((at, key));
             crate_names.push((key, blaze_own::String::from_str_in(identity.package.as_str(), side.heap.shared())));
         }

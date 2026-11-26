@@ -308,8 +308,9 @@ fn unquote_attr_string(raw: &str) -> Option<&str> {
 fn collect_rust_c_exports<'a, 'n>(
     records: &'n Records<'n>,
     alloc: Alloc<'a>,
-) -> AVec<'a, RustCExport<'a>> {
+) -> (AVec<'a, RustCExport<'a>>, AVec<'a, (ItemKey, blaze_own::String<Alloc<'a>>)>) {
     let mut exports: AVec<'a, RustCExport<'a>> = Vec::new_in(alloc);
+    let mut foreign_statics: AVec<'a, (ItemKey, blaze_own::String<Alloc<'a>>)> = Vec::new_in(alloc);
     let crate_count = records.crate_count();
     let mut items_buf: AVec<'a, blaze_id::ItemKey> = Vec::new_in(alloc);
 
@@ -324,7 +325,16 @@ fn collect_rust_c_exports<'a, 'n>(
         });
         for &lib_key in items_buf.iter() {
             // Skip foreign declarations inside `extern { ... }` blocks; we want definitions only.
+            // Record foreign statics (`extern "C" { static FOO: ...; }`) so static-to-static
+            // relocations can alias them to their Rust `#[no_mangle]` definition.
             if records.extern_abi(lib_key).flatten().is_some() {
+                if matches!(records.kind_of_item(lib_key), Some(ItemKind::Static))
+                    && let Some(sym_name) = records.name_of(lib_key)
+                {
+                    let mut owned = blaze_own::String::with_capacity_in(sym_name.len(), alloc);
+                    owned.push_str(sym_name);
+                    foreign_statics.push((checker_of(lib_key), owned));
+                }
                 continue;
             }
             let Some(item_text) = records.signature_text_of(lib_key) else { continue };
@@ -376,7 +386,7 @@ fn collect_rust_c_exports<'a, 'n>(
             .then_with(|| a.item.0.cmp(&b.item.0))
     });
     exports.dedup_by(|a, b| a.name.as_str() == b.name.as_str() && a.is_static == b.is_static);
-    exports
+    (exports, foreign_statics)
 }
 
 fn find_rust_c_export<'a>(
@@ -881,6 +891,48 @@ where
     compile_worklist_to_wasm64(queue, seen_syms, None, grant_of, maker, opts, resolve_import, out, alloc)
 }
 
+/// Computes the canonical no-generic-argument function symbol for `item`, matching the symbol
+/// used in `Wasm64BuildOpts::exports` when compiling via [`compile_items_to_wasm64`].
+pub fn fn_symbol_of_item<'a>(item: ItemKey, alloc: Alloc<'a>) -> Result<Symbol, Wasm64BuildError> {
+    let (sym, _) = encode_no_args_name(item, alloc)?;
+    Ok(sym)
+}
+
+/// Single-pass whole-program Wasm64 compiler starting from explicit root functions and root
+/// statics (e.g., proc-macro reactors exporting `_initialize`, `blaze_proc_macro_alloc`,
+/// `blaze_proc_macro_expand`, and `#[rustc_proc_macro_decls] static _DECLS`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single-pass wasm64 compiler over explicit root items, grant closure, maker, options, import resolver, output buffer, and allocator"
+)]
+pub fn compile_items_to_wasm64<'a, 'n, G, T>(
+    root_fns: &[ItemKey],
+    root_statics: &[ItemKey],
+    grant_of: impl FnMut(ItemKey) -> Option<G>,
+    maker: &mut Maker<'n, G, T>,
+    opts: &Wasm64BuildOpts<'_>,
+    resolve_import: impl FnMut(&str) -> Option<(&'static str, &'static str)>,
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+) -> Result<Wasm64BuildOut, Wasm64BuildError>
+where
+    G: Grant,
+    T: Typing<RecordsProgram<'n>>,
+{
+    let cap = root_fns.len().saturating_add(root_statics.len()).saturating_add(4);
+    let mut queue: AVec<'a, WorkItem<'a>> = Vec::with_capacity_in(cap, alloc);
+    let mut seen_syms: AVec<'a, [u8; 32]> = Vec::with_capacity_in(cap, alloc);
+    for &item in root_fns {
+        let (sym, name_bytes) = encode_no_args_name(item, alloc)?;
+        enqueue_unique(&mut queue, &mut seen_syms, RowKind::Instance, item, sym, name_bytes.as_slice(), alloc);
+    }
+    for &item in root_statics {
+        let sym = static_symbol(item);
+        enqueue_unique(&mut queue, &mut seen_syms, RowKind::Static, item, sym, &[], alloc);
+    }
+    compile_worklist_to_wasm64(queue, seen_syms, None, grant_of, maker, opts, resolve_import, out, alloc)
+}
+
 /// Single-pass whole-program Wasm64 compiler starting directly from `roots` without running a
 /// native machine-code `Walk::one` pass first.
 #[expect(
@@ -932,7 +984,7 @@ where
 {
     // 0. Discover Rust-defined `#[no_mangle]` / `#[export_name]` fns and statics across all
     //    crates (e.g., `wasi_rt`, `compiler_builtins`, `panic_abort`, user crates).
-    let rust_exports = collect_rust_c_exports(maker.names.records, alloc);
+    let (rust_exports, foreign_statics) = collect_rust_c_exports(maker.names.records, alloc);
 
     // If the program has a Rust-defined `_start` (e.g. `wasi_rt::_start`) and the caller asked
     // for a `start_symbol` without explicitly exporting `_start`, root `wasi_rt::_start` so WASI
@@ -962,6 +1014,7 @@ where
     let mut funcs: AVec<'a, OwnedFunc<'a>> = Vec::new_in(alloc);
     let mut func_by_sym: AVec<'a, ([u8; 32], u32)> = Vec::new_in(alloc);
     let mut static_datums: AVec<'a, OwnedDatum<'a>> = Vec::new_in(alloc);
+    let mut foreign_static_alias: AVec<'a, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
     let mut entry_buf: AVec<'a, u8> = Vec::new_in(alloc);
     let mut reached_buf = DeclaredList::new_in(alloc);
 
@@ -1008,11 +1061,21 @@ where
 
                 // Enqueue non-foreign statics and resolve foreign statics defined by Rust crates.
                 for &st_item in built.statics.iter() {
-                    if let Some(c_name) = built.foreign_static_name(st_item) {
+                    let foreign_name = built.foreign_static_name(st_item).or_else(|| {
+                        foreign_statics
+                            .iter()
+                            .find(|(item, _)| *item == st_item)
+                            .map(|(_, n)| n.as_str())
+                    });
+                    if let Some(c_name) = foreign_name {
                         if let Some(def_item) =
                             find_rust_c_export(rust_exports.as_slice(), c_name, true)
                         {
+                            let from_sym = static_symbol(st_item);
                             let def_sym = static_symbol(def_item);
+                            if !foreign_static_alias.iter().any(|&(k, _)| k == from_sym.0) {
+                                foreign_static_alias.push((from_sym.0, def_sym.0));
+                            }
                             enqueue_unique(
                                 &mut queue,
                                 &mut seen_syms,
@@ -1124,6 +1187,29 @@ where
                     },
                 )?;
                 entry_view.each_static(|st_item| {
+                    if let Some((_, c_name)) =
+                        foreign_statics.iter().find(|(item, _)| *item == st_item)
+                    {
+                        if let Some(def_item) =
+                            find_rust_c_export(rust_exports.as_slice(), c_name.as_str(), true)
+                        {
+                            let from_sym = static_symbol(st_item);
+                            let def_sym = static_symbol(def_item);
+                            if !foreign_static_alias.iter().any(|&(k, _)| k == from_sym.0) {
+                                foreign_static_alias.push((from_sym.0, def_sym.0));
+                            }
+                            enqueue_unique(
+                                &mut queue,
+                                &mut seen_syms,
+                                RowKind::Static,
+                                def_item,
+                                def_sym,
+                                &[],
+                                alloc,
+                            );
+                        }
+                        return;
+                    }
                     let st_sym = static_symbol(st_item);
                     enqueue_unique(
                         &mut queue,
@@ -1314,6 +1400,23 @@ where
         synth_funcs.push(("__wasm_call_ctors", None, place, noop_func));
     }
 
+    // Precompute Wasm signatures for Rust `#[no_mangle]`/`#[export_name]` C functions so a host
+    // import sharing a POSIX name (e.g. `blaze_seed::unlink(ptr, len) -> i32` vs `wasi_rt`'s
+    // `#[no_mangle] extern "C" fn unlink(cstr) -> i32`) is not misbound across mismatched ABIs.
+    let mut rust_c_fn_sigs: AVec<'a, (u32, bool, AVec<'a, ValType>, AVec<'a, ValType>)> =
+        Vec::with_capacity_in(rust_c_fn_to_place.len(), alloc);
+    for &(_, place) in rust_c_fn_to_place.iter() {
+        if let Some(target_fn) = funcs.get(place as usize) {
+            let tv = target_fn.built.func.view();
+            let tsig = SigId(tv.head.sig);
+            let variadic = tsig.index() < tv.sigs.len()
+                && (tv.sig(tsig).bits & blaze_lir::func::SigRec::VARIADIC) != 0;
+            if let Ok((tp, tr)) = flatten_sig_wasm(tv, tsig, alloc) {
+                rust_c_fn_sigs.push((place, variadic, tp, tr));
+            }
+        }
+    }
+
     for f in funcs.iter_mut() {
         new_places.clear();
         let ref_len = f.built.func.refs.len();
@@ -1338,7 +1441,13 @@ where
                                 symbol: [0u8; 32],
                             });
                         };
-                        if let Some(c_name) = f.built.foreign_static_name(item) {
+                        let foreign_name = f.built.foreign_static_name(item).or_else(|| {
+                            foreign_statics
+                                .iter()
+                                .find(|(it, _)| *it == item)
+                                .map(|(_, n)| n.as_str())
+                        });
+                        if let Some(c_name) = foreign_name {
                             if let Some(st_place) =
                                 find_export_place(rust_c_static_to_place.as_slice(), c_name)
                             {
@@ -1406,13 +1515,37 @@ where
                             fn_place
                         }
                         Some(Callee::C(c_name)) => {
+                            let ref_id = RefId(u32::try_from(ref_idx).map_err(|_| {
+                                Wasm64BuildError::Export(LirWasm64Error::Overflow {
+                                    what: "ref index",
+                                })
+                            })?);
+                            let rust_c_match = find_export_place(rust_c_fn_to_place.as_slice(), c_name)
+                                .filter(|&internal_place| {
+                                    if resolve_import(c_name).is_none() {
+                                        return true;
+                                    }
+                                    let Some((_, variadic, exp_p, exp_r)) =
+                                        rust_c_fn_sigs.iter().find(|(p, ..)| *p == internal_place)
+                                    else {
+                                        return true;
+                                    };
+                                    if *variadic {
+                                        return true;
+                                    }
+                                    match find_call_site_sig(view, ref_id, alloc) {
+                                        Ok(Some((cp, cr))) => {
+                                            cp.as_slice() == exp_p.as_slice()
+                                                && cr.as_slice() == exp_r.as_slice()
+                                        }
+                                        _ => true,
+                                    }
+                                });
                             if let Some(internal_place) =
                                 find_export_place(export_name_to_place.as_slice(), c_name)
                             {
                                 internal_place
-                            } else if let Some(internal_place) =
-                                find_export_place(rust_c_fn_to_place.as_slice(), c_name)
-                            {
+                            } else if let Some(internal_place) = rust_c_match {
                                 internal_place
                             } else if c_name == "__main_void"
                                 && let Some(place) = main_void_place
@@ -1429,11 +1562,6 @@ where
                                         "unresolved C extern import",
                                     ));
                                 };
-                                let ref_id = RefId(u32::try_from(ref_idx).map_err(|_| {
-                                    Wasm64BuildError::Export(LirWasm64Error::Overflow {
-                                        what: "ref index",
-                                    })
-                                })?);
                                 let (params, results) =
                                     if let Some(sig) = find_call_site_sig(view, ref_id, alloc)? {
                                         sig
@@ -1532,12 +1660,16 @@ where
                             Space::Vtable => "vtable",
                             _ => "tls",
                         };
+                        let target_sym = foreign_static_alias
+                            .iter()
+                            .find(|&&(from, _)| from == t.symbol.0)
+                            .map_or(t.symbol.0, |&(_, to)| to);
                         let Some(st_place) =
-                            find_static_place(static_datums.as_slice(), t.symbol.0)
+                            find_static_place(static_datums.as_slice(), target_sym)
                         else {
                             return Err(Wasm64BuildError::UnresolvedSymbol {
                                 space,
-                                symbol: t.symbol.0,
+                                symbol: target_sym,
                             });
                         };
                         LirWasm64RelocTarget::Static(st_place)

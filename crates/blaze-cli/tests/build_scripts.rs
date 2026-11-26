@@ -212,18 +212,20 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     println!("cfg reached");
 }
 
-/// With no module of `app`'s script in the store, the run fails: one finding naming the script
-/// and its package, and the unit that reads it named as not checked (rule 20: the rest goes on).
-/// Prints "failed by name".
+/// When `app`'s build script fails to compile to `wasm64`, the check fails: one finding naming
+/// the script and its package, and the unit that reads it named as not checked (rule 20: the rest
+/// goes on). Prints "failed by name".
 #[test]
 fn a_failed_script_is_a_finding_naming_it_and_its_unit() {
     let base = fresh_home("build_scripts_failed", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
+    // Make build.rs fail to compile so MacroModule fails cleanly with a typed diagnostic.
+    std::fs::write(at.join("app/build.rs"), "fn main() { let _: u32 = \"not_a_u32\"; }\n").expect("writing broken build.rs");
     let (ok, said) = check(&at, &home);
     assert!(!ok, "a check whose build script failed exited 0:\n{said}");
     assert!(said.contains("the build script of app 0.1.0"), "the failed script is not named:\n{said}");
-    assert!(said.contains("no build-script module of app 0.1.0"), "the script's own failure is not said:\n{said}");
+    assert!(said.contains("wasm64 self-compilation failed"), "the script's own failure is not said:\n{said}");
     // Ruling D115 (6), one shape for every cause (blaze-cli not_checked.rs).
     assert!(
         // Since d115-6 (piece 2c) the cause is the module's lookup, named by its script.
@@ -289,23 +291,46 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     println!("engine scripts: {phases:?}");
 }
 
-/// With no module of the script in the store, `engine-check` fails as `check` does: the lookup's
-/// own words name the script's package, and its crate is not resolved. Prints "engine failed by
-/// name".
+/// With no prebuilt module in the store, `engine-check` self-compiles `build.rs` to `wasm64`,
+/// runs it in Wasmtime `memory64`, and checks `#[cfg(from_script)]` with zero errors.
+/// And when `build.rs` fails to compile, the lookup's failure names the script's package and its
+/// crate waits on it.
 #[test]
 fn engine_check_names_a_missing_script_module() {
+    // 1. Positive self-compilation path from an empty module store.
+    let base_ok = fresh_home("build_scripts_engine_self_compile", true);
+    let (home_ok, at_ok) = (base_ok.join("home"), base_ok.join("ws"));
+    workspace(&at_ok);
+    let (_, said_ok) = run(&at_ok, &home_ok, "engine-check");
+    assert!(
+        said_ok.contains("0 errors: blaze check") && !said_ok.lines().any(|line| line.contains("`made`")),
+        "self-compiled build.rs did not reach #[cfg(from_script)]:\n{said_ok}"
+    );
+    let published = home_ok.join(".blaze/v2/build-script/modules");
+    assert!(
+        std::fs::read_dir(&published)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|e| e.path().join("module.wasm").is_file()),
+        "expected self-compiled wasm64 build-script module in {}",
+        published.display()
+    );
+
+    // 2. Failure path: a broken build.rs fails MacroModule by name and holds `app` not checked.
     let base = fresh_home("build_scripts_engine_failed", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
+    std::fs::write(at.join("app/build.rs"), "fn main() { let _: u32 = \"not_a_u32\"; }\n").expect("writing broken build.rs");
     let (ok, said) = run(&at, &home, "engine-check");
     assert!(!ok, "an engine-check whose build script failed exited 0:\n{said}");
-    assert!(said.contains("no build-script module of app 0.1.0"), "the lookup's own failure is not said:\n{said}");
+    assert!(said.contains("the build script of app 0.1.0"), "the lookup's own failure is not said:\n{said}");
     assert!(said.contains("not run: each waits on a task that failed"), "the run and its crate did not wait on the lookup:\n{said}");
     let phases = engine_phases(&at);
     for (stage, wave, planned, entered) in phases.iter() {
         assert_eq!(planned, entered, "{stage} {wave}: tasks planned and entered:\n{phases:?}");
     }
-    println!("engine failed by name");
+    println!("engine self-compile and failed by name");
 }
 
 /// `check` (the engine, the one command path since the old checker went, 2026-11-19) must give
