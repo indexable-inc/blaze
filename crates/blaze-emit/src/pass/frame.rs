@@ -915,8 +915,14 @@ pub(crate) fn pack_slots<A: Allocator + Copy>(
 
     // 6. Greedy deterministic placement (`tracked` is already sorted by descending size,
     //    descending align, ascending slot index).
-    let mut placed_start = filled(tracked_count, 0u64, alloc);
-    let mut placed_end = filled(tracked_count, 0u64, alloc);
+    //    For each slot `t`, collect the already-placed conflicting intervals `[u_s, u_e)` (`u < t`)
+    //    into a reusable scratch buffer, sort by start offset (skipped when already non-decreasing),
+    //    and scan once to find the lowest aligned offset `>= base_offset` disjoint from all of them.
+    //    Produces the exact same first-fit layout as repeated rescanning while eliminating the O(S^3)
+    //    blowup on large mutually-interfering frames (O(S^2) / O(S log S) when sorted / sparse).
+    let mut placed_start = filled(tracked_count, 0u32, alloc);
+    let mut placed_end = filled(tracked_count, 0u32, alloc);
+    let mut blocked: Vec<(u32, u32), A> = Vec::with_capacity_in(tracked_count, alloc);
     let mut max_end = base_offset;
 
     for (t, &s_u32) in tracked.iter().enumerate() {
@@ -926,33 +932,40 @@ pub(crate) fn pack_slots<A: Allocator + Copy>(
         let size = u64::from(rec.size);
         let row = conflict.get(t * words..(t + 1) * words).unwrap_or(&[]);
 
-        let mut off = base_offset.next_multiple_of(align);
-        loop {
-            let end = off + size;
-            let mut next_off = None;
-            // Check against all earlier-placed conflicting slots (`u < t`).
-            for (wi, &word) in row.iter().enumerate() {
-                let mut mask = word;
-                while mask != 0 {
-                    let u = wi * 64 + idx(mask.trailing_zeros());
-                    mask &= mask - 1;
-                    if u >= t {
-                        break;
-                    }
-                    let u_s = placed_start.get(u).copied().unwrap_or(0);
-                    let u_e = placed_end.get(u).copied().unwrap_or(0);
-                    if off < u_e && u_s < end {
-                        let cand = u_e.next_multiple_of(align);
-                        next_off = Some(match next_off {
-                            Some(prev) if prev >= cand => prev,
-                            _ => cand,
-                        });
-                    }
+        blocked.clear();
+        let mut sorted = true;
+        let mut prev_start = 0u32;
+        let full_words = t / 64;
+        let rem_bits = t % 64;
+        let word_limit = full_words + usize::from(rem_bits != 0);
+        for (wi, &raw_word) in row.iter().take(word_limit).enumerate() {
+            let mut mask = if wi == full_words { raw_word & ((1u64 << rem_bits) - 1) } else { raw_word };
+            let base_u = wi * 64;
+            while mask != 0 {
+                let u = base_u + idx(mask.trailing_zeros());
+                mask &= mask - 1;
+                let u_s = placed_start.get(u).copied().unwrap_or(0);
+                let u_e = placed_end.get(u).copied().unwrap_or(0);
+                if u_s < prev_start {
+                    sorted = false;
                 }
+                prev_start = u_s;
+                blocked.push((u_s, u_e));
             }
-            match next_off {
-                Some(n_off) => off = n_off,
-                None => break,
+        }
+        if !sorted {
+            blocked.sort_unstable_by_key(|&(u_s, _)| u_s);
+        }
+
+        let mut off = base_offset.next_multiple_of(align);
+        for &(u_s_u32, u_e_u32) in blocked.iter() {
+            let u_s = u64::from(u_s_u32);
+            let u_e = u64::from(u_e_u32);
+            if u_s >= off + size {
+                break;
+            }
+            if off < u_e {
+                off = u_e.next_multiple_of(align);
             }
         }
 
@@ -960,12 +973,14 @@ pub(crate) fn pack_slots<A: Allocator + Copy>(
         if end >= FRAME_LIMIT {
             return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
         }
-        set_u32(&mut slot_at, s, u32_of_u64(off));
+        let off_u32 = u32_of_u64(off);
+        let end_u32 = u32_of_u64(end);
+        set_u32(&mut slot_at, s, off_u32);
         if let Some(ps) = placed_start.get_mut(t) {
-            *ps = off;
+            *ps = off_u32;
         }
         if let Some(pe) = placed_end.get_mut(t) {
-            *pe = end;
+            *pe = end_u32;
         }
         if end > max_end {
             max_end = end;

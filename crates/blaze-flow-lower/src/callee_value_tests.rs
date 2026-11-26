@@ -1567,3 +1567,198 @@ fn closure_dyn_fn_param_higher_ranked_positive_and_static_negative() {
         bad.err()
     );
 }
+
+/// Regression & soundness test for `crates/blaze-report/src/frame/mod.rs::closing`:
+/// `|pen: &mut Pen<'_, '_>, draw: &dyn Fn(&mut Pen<'_, '_>)| { draw(pen); }`
+/// `front2::body::closure_param_regions` records a shared `WrittenRegion::Elided(0)` pair at
+/// `ROOT` (outer `&`) and `step(ROOT, 0)` (`dyn`'s default `+ '_` object bound) on every
+/// `&dyn Fn(...)` parameter.
+/// - POSITIVE: that wrapper-only `Elided(0)` pair lowers cleanly and passes `blaze_flow::check`.
+/// - NEGATIVE 1 (borrow soundness): an active shared borrow of `pen` across `draw(pen)` is still
+///   caught as a borrow error.
+/// - NEGATIVE 2: `WrittenRegion::Named` on the wrapper is refused (`CalleeValueUnknown`).
+/// - NEGATIVE 3: `WrittenRegion::Elided(0)` deeper than the peeled wrapper chain (inside `dyn Fn`
+///   inputs) is refused (`CalleeValueUnknown`).
+/// - NEGATIVE 4: `WrittenRegion::Elided(0)` at `own > 0` on `dyn` is refused (`CalleeValueUnknown`).
+/// - NEGATIVE 5: `WrittenRegion::Elided(0)` on a `fn(...)` pointer param (not `dyn`) is refused
+///   (`CalleeValueUnknown`).
+#[test]
+fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
+    use crate::Variance;
+    use blaze_typeck::{ClosureParamRegion, WrittenRegion};
+
+    let mut items = None;
+    let w = world_with(|fx, st, _rs, unit| {
+        let fns = add_fn_traits(fx);
+        let pen_adt = fx.strukt("Pen", 0, &[]);
+        let pen = fx.adt(pen_adt, &[]);
+        let rm_pen = fx.r(Mutbl::Mut, pen);
+        let r_rm_pen = fx.r(Mutbl::Not, rm_pen);
+        let dyn_fn = dyn_fn_ty(fx, fns.0, fns.2, &[rm_pen], unit);
+        let ref_dyn = fx.r(Mutbl::Not, dyn_fn);
+        let fn_list = fx.list(&[rm_pen, unit]);
+        let fn_ptr = fx.ty(PNode::FnPtr(fn_list, FnPtrHeader::RUST));
+        let use_pen = fx.func("use_pen", 0, &[r_rm_pen], unit, no_clauses());
+        let f = fx.func("f", 0, &[], unit, no_clauses());
+        let _ = st;
+        items = Some((fns, pen_adt, r_rm_pen, rm_pen, ref_dyn, fn_ptr, use_pen, f));
+    });
+    let (fns, pen_adt, r_rm_pen, rm_pen, ref_dyn, fn_ptr, use_pen, f) = items.expect("declared");
+    const PEN_VAR: [Variance; 2] = [Variance::In, Variance::In];
+    let mut facts = DynFacts::of(&w, fns);
+    facts.adts.push((
+        pen_adt,
+        AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 2, union: false, is_enum: false, is_box: false },
+        &PEN_VAR,
+    ));
+    facts.lane.wide.sigs.decls.adt(pen_adt, 2);
+    facts.lane.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.unit, slots: &[] });
+    facts.lane.wide.add(
+        use_pen,
+        FnHead {
+            lifetimes: 4,
+            late: &[0, 1, 2, 3],
+            outlives: &[],
+            inputs: &[r_rm_pen],
+            output: w.unit,
+            slots: &[P0, crate::region_fixture::P1, crate::region_fixture::P2, crate::Region::Param(3)],
+        },
+    );
+
+    let root_path = ClosureParamRegion::ROOT;
+    let step1 = ClosureParamRegion::push_step(root_path, 0).expect("step1");
+    let step2 = ClosureParamRegion::push_step(step1, 0).expect("step2");
+
+    let run_dyn = |conflict_borrow: bool, regions_fn: &dyn Fn(ExprId) -> std::vec::Vec<ClosureParamRegion>| {
+        let mut b = Bb::new();
+        let ppen = b.bind("pen");
+        let pdraw = b.bind("draw");
+        let inner = if conflict_borrow {
+            let pr = b.bind("r");
+            let lpen1 = b.local(ppen);
+            let bor_pen = b.borrow(Mutbl::Not, lpen1);
+            let st1 = b.let_(pr, None, bor_pen);
+            let ldraw = b.local(pdraw);
+            let lpen2 = b.local(ppen);
+            let call_draw = b.call(ldraw, &[lpen2]);
+            let st2 = b.semi(call_draw);
+            let puse = b.path(&["use_pen"]);
+            let lr = b.local(pr);
+            let call_use = b.call(puse, &[lr]);
+            let st3 = b.semi(call_use);
+            b.block(&[st1, st2, st3], None)
+        } else {
+            let ldraw = b.local(pdraw);
+            let lpen = b.local(ppen);
+            let call_draw = b.call(ldraw, &[lpen]);
+            let st = b.semi(call_draw);
+            b.block(&[st], None)
+        };
+        let cl = b.closure(&[ppen, pdraw], inner);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_c], None);
+        let mut body = b.view(f, root);
+        let opt_tys = [Some(rm_pen), Some(ref_dyn)];
+        body.types = w.fx.t.view();
+        body.opt_types = &opt_tys;
+        let mut written = regions_fn(cl);
+        written.sort_unstable();
+        body.closure_param_regions = &written;
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc())
+    };
+
+    // POSITIVE: exact front2 `&dyn Fn(&mut Pen<'_, '_>)` wrapper-only `Elided(0)` pair checks cleanly.
+    let ok = run_dyn(false, &|cl| {
+        std::vec![
+            ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) },
+            ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) },
+        ]
+    })
+    .expect("POSITIVE: `&dyn Fn(&mut Pen<'_, '_>)` with wrapper-only `Elided(0)` must lower cleanly");
+    let report = blaze_flow::check(&ok.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(report.moves.is_empty() && report.borrows.is_empty(), "POSITIVE: expected clean check: {:?}", report.borrows);
+
+    // NEGATIVE 1: active shared borrow across `draw(pen)` is still caught.
+    let conflict = run_dyn(true, &|cl| {
+        std::vec![
+            ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) },
+            ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) },
+        ]
+    })
+    .expect("NEGATIVE 1: conflicting borrow body lowers cleanly");
+    let conflict_report = blaze_flow::check(&conflict.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(
+        !conflict_report.borrows.is_empty(),
+        "NEGATIVE 1: active `&*pen` across `draw(pen)` must report a borrow conflict"
+    );
+
+    // NEGATIVE 2: `WrittenRegion::Named` on wrapper is refused.
+    let bad_named = run_dyn(false, &|cl| {
+        std::vec![ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Named }]
+    });
+    assert!(
+        matches!(bad_named, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+        "NEGATIVE 2: `WrittenRegion::Named` on `&dyn Fn` param must be refused, got {:?}",
+        bad_named.err()
+    );
+
+    // NEGATIVE 3: `WrittenRegion::Elided(0)` reaching inside `dyn Fn` inputs (depth 2 > wrapper depth 1) is refused.
+    let bad_deep = run_dyn(false, &|cl| {
+        std::vec![
+            ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) },
+            ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) },
+            ClosureParamRegion { closure: cl, param: 1, path: step2, own: 0, kind: WrittenRegion::Elided(0) },
+        ]
+    });
+    assert!(
+        matches!(bad_deep, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+        "NEGATIVE 3: `WrittenRegion::Elided` inside `dyn Fn` inputs must be refused, got {:?}",
+        bad_deep.err()
+    );
+
+    // NEGATIVE 4: `WrittenRegion::Elided(0)` at `own > 0` on `dyn` is refused.
+    let bad_own = run_dyn(false, &|cl| {
+        std::vec![ClosureParamRegion { closure: cl, param: 1, path: step1, own: 1, kind: WrittenRegion::Elided(0) }]
+    });
+    assert!(
+        matches!(bad_own, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+        "NEGATIVE 4: `WrittenRegion::Elided` at `own > 0` on `dyn` must be refused, got {:?}",
+        bad_own.err()
+    );
+
+    // NEGATIVE 5: `WrittenRegion::Elided(0)` on a `fn(...)` pointer param (not `dyn`) is refused.
+    let mut b = Bb::new();
+    let ppen = b.bind("pen");
+    let pcb = b.bind("cb");
+    let lcb = b.local(pcb);
+    let lpen = b.local(ppen);
+    let call_cb = b.call(lcb, &[lpen]);
+    let st = b.semi(call_cb);
+    let inner = b.block(&[st], None);
+    let cl = b.closure(&[ppen, pcb], inner);
+    let pc = b.bind("c");
+    let st_c = b.let_(pc, None, cl);
+    let root = b.block(&[st_c], None);
+    let mut body = b.view(f, root);
+    let opt_tys = [Some(rm_pen), Some(fn_ptr)];
+    body.types = w.fx.t.view();
+    body.opt_types = &opt_tys;
+    let written_fp = [
+        ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) },
+        ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) },
+    ];
+    body.closure_param_regions = &written_fp;
+    let mut ck = crate::region_fixture::checked(&w.fx, &body);
+    let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+    let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+    let bad_fnptr = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc());
+    assert!(
+        matches!(bad_fnptr, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+        "NEGATIVE 5: `WrittenRegion::Elided` on a `fn(...)` pointer param must be refused, got {:?}",
+        bad_fnptr.err()
+    );
+}

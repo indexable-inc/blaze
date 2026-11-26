@@ -9306,10 +9306,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     /// Peels `&`/`&mut` and zero-lifetime smart-pointer wrappers (`Box`, `Arc`, `Rc`) off a
-    /// body-table type `t` to find an underlying `PNode::Dynamic`.
-    fn peel_body_dyn(&self, mut t: PTy, e: ExprId) -> Result<Option<PTy>, Refusal> {
+    /// body-table type `t` to find an underlying `PNode::Dynamic`, returning `(dyn_ty, depth)`
+    /// where `depth` is the number of wrapper steps peeled along child index `0`.
+    fn peel_body_dyn_depth(&self, mut t: PTy, e: ExprId) -> Result<Option<(PTy, u32)>, Refusal> {
         let facts: &'b F = self.facts;
-        for _ in 0..16 {
+        for depth in 0..16u32 {
             match self.node(t, e)? {
                 PNode::Ref(_, inner) => t = inner,
                 PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
@@ -9320,11 +9321,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     }
                     t = inner;
                 }
-                PNode::Dynamic(_) => return Ok(Some(t)),
+                PNode::Dynamic(_) => return Ok(Some((t, depth))),
                 _ => return Ok(None),
             }
         }
         Ok(None)
+    }
+
+    /// Peels `&`/`&mut` and zero-lifetime smart-pointer wrappers (`Box`, `Arc`, `Rc`) off a
+    /// body-table type `t` to find an underlying `PNode::Dynamic`.
+    fn peel_body_dyn(&self, t: PTy, e: ExprId) -> Result<Option<PTy>, Refusal> {
+        Ok(self.peel_body_dyn_depth(t, e)?.map(|(d, _)| d))
     }
 
     /// Peels `wrap`, `&`/`&mut`, and zero-lifetime smart-pointer wrappers off `ty` to find an
@@ -9614,11 +9621,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
         let Ok(c_ty) = self.expr_ty(c) else { return Ok(false) };
         let facts: &'b F = self.facts;
+        let mut dyn_wrapper_depth: Option<u32> = None;
         let callable_arity_ok = if let Some((fp_ty, _)) = self.peel_body_fn_ptr(TyD::of(c_ty), e)?
             && let Ok(PNode::FnPtr(fn_list, _)) = self.node(fp_ty, c)
         {
             self.list(fn_list, e)?.len() == args.len() + 1
-        } else if let Some(dyn_ty) = self.peel_body_dyn(c_ty, e)?
+        } else if let Some((dyn_ty, depth)) = self.peel_body_dyn_depth(c_ty, e)?
             && let Ok(PNode::Dynamic(preds)) = self.node(dyn_ty, c)
         {
             let mut matched = false;
@@ -9632,6 +9640,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     matched = true;
                     break;
                 }
+            }
+            if matched {
+                dyn_wrapper_depth = Some(depth);
             }
             matched
         } else {
@@ -9655,9 +9666,34 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             break;
         }
         let Some((ce, pi)) = found else { return Ok(false) };
-        // If any explicit `'static` or named lifetime was written inside this fn-pointer param,
-        // do not assume all input lifetimes are independent higher-ranked binders.
-        if self.body.closure_param_regions.iter().any(|r| r.closure == ce && r.param == pi) {
+        // If any explicit `'static`, named lifetime, or non-wrapper shared elided lifetime was
+        // written on this callable param, do not assume all input lifetimes are independent
+        // higher-ranked binders.
+        // Exception: `&dyn Fn(...)` (and nested `&`/`&mut`/smart-ptr wrappers around `dyn Fn(...)`)
+        // ties the outer reference's elided lifetime to the `dyn` object's default `+ '_` bound
+        // via `WrittenRegion::Elided(id)` at `own == 0` along the wrapper chain (`ROOT`..=`depth`).
+        // Those entries constrain only the trait object's borrow/capture lifetime (checked by
+        // evaluating `c`), never the `Fn` trait's higher-ranked input lifetimes.
+        let is_dyn_wrapper_elided = |r: &blaze_typeck::ClosureParamRegion| -> bool {
+            let Some(max_depth) = dyn_wrapper_depth else { return false };
+            if !matches!(r.kind, blaze_typeck::WrittenRegion::Elided(_)) || r.own != 0 {
+                return false;
+            }
+            let mut cur = blaze_typeck::ClosureParamRegion::ROOT;
+            for d in 0..=max_depth {
+                if r.path == cur {
+                    return true;
+                }
+                if d < max_depth {
+                    let Some(next) = blaze_typeck::ClosureParamRegion::push_step(cur, 0) else {
+                        return false;
+                    };
+                    cur = next;
+                }
+            }
+            false
+        };
+        if self.body.closure_param_regions.iter().any(|r| r.closure == ce && r.param == pi && !is_dyn_wrapper_elided(r)) {
             return Ok(false);
         }
         let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
