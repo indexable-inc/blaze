@@ -395,6 +395,37 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut inc_bytes, alloc).is_err());
     }
 
+    // Joined and delegated header/preprocessor flags are refused before caching.
+    for bad_flag in [
+        "-include/target/debug/build/zstd-sys-1/out/foo.h",
+        "-imacros/target/debug/build/zstd-sys-1/out/foo.h",
+        "-Wp,-include,/target/debug/build/zstd-sys-1/out/foo.h",
+        "-Xpreprocessor",
+        "-Xclang",
+        "--include=/target/debug/build/zstd-sys-1/out/foo.h",
+        "-ivfsoverlay/target/debug/build/zstd-sys-1/out/vfs.yaml",
+    ] {
+        let joined_args = ["-c", bad_flag, "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
+        let sp = Spawn { program: "cc", args: &joined_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+        assert_eq!(
+            canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp, files, alloc).err().expect(bad_flag).why,
+            ProbeWhy::PackageInput
+        );
+    }
+
+    // Literal `-DROOT="$OUT_DIR"` and actual `-DROOT="<OUT_DIR>"` have disjoint structural ProbeKeys
+    // and keep the literal string distinct from the real `Segment::OutDir`.
+    let lit_args = flag_args("-DROOT=\"$OUT_DIR\"");
+    let real_define = std::format!("-DROOT=\"{OUT}\"");
+    let real_args = flag_args(&real_define);
+    let sp_lit = Spawn { program: "cc", args: &lit_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    let sp_real = Spawn { program: "cc", args: &real_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+    let can_lit = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_lit, files, alloc).expect("lit");
+    let can_real = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_real, files, alloc).expect("real");
+    assert_ne!(can_lit.key, can_real.key, "literal $OUT_DIR must not collide with real OUT_DIR");
+    assert!(can_lit.exec_args.iter().flatten().all(|s| !matches!(s, crate::c_tasks_probe::Segment::OutDir)));
+    assert!(can_real.exec_args.iter().flatten().any(|s| matches!(s, crate::c_tasks_probe::Segment::OutDir)));
+
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
     let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");

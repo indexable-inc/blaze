@@ -26,7 +26,7 @@ use core::time::Duration;
 use std::{fs, path::{Path, PathBuf}, process, sync::{Condvar, Mutex}};
 
 use blaze_build_script::c_tasks_probe::{
-    self, CanonicalProbe, MOUNT, OUT_DIR, ProbeAnswer, ProbeAnswerer, ProbeCache, ProbeKey, SDKROOT,
+    self, CanonicalProbe, MOUNT, OUT_DIR, ProbeAnswer, ProbeAnswerer, ProbeCache, ProbeKey, SDKROOT, Segment,
     canonical_reply_digest, decode_answer,
 };
 use blaze_build_script::facts;
@@ -236,9 +236,17 @@ pub struct HermeticClangProbe {
 }
 
 impl HermeticClangProbe {
-    /// Strategy id of this answerer (hashed into [`ProbeKey`] and `cc-probe` read subjects).
+    /// Strategy id of this answerer, derived directly from the implementation source bytes of
+    /// `probe_clang.rs`, `c_tasks_probe.rs`, and the OS confinement backends (AGENTS.md rule 69)
+    /// so any runner or canonicalization change automatically rolls [`ProbeKey`] and invalidates
+    /// prior `cc-probe` read subjects.
     pub fn strategy_id() -> ContentId {
-        ContentId::of(HERMETIC_STRATEGY_DOMAIN, b"v1")
+        let mut h = blaze_ids::Hasher::new(HERMETIC_STRATEGY_DOMAIN);
+        h.part(include_bytes!("probe_clang.rs")).id(&c_tasks_probe::implementation_id());
+        for part in bstd::procs::hermetic::CONFINEMENT_SOURCE {
+            h.part(part);
+        }
+        h.finish()
     }
 
     /// Opens [`HermeticClangProbe`] for `host` from `<home>/.blaze/v2/toolchain/clang/<sha256>`.
@@ -387,13 +395,28 @@ impl HermeticClangProbe {
 
         let prog = shelf_pins::shelf_program(CLANG_JSON, self.host.as_str(), "clang-23")
             .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
-        let clang_path = Path::new(self.clang_path.as_str());
-        let expected_voucher = boot.and_then(|b| verify_voucher_digest(b, clang_path, &prog.sha256));
+        let Some(rem) = remaining() else {
+            return Err(own_str("c-probe clang verification timed out before starting", alloc));
+        };
+        let (shelf_io, shelf_root) = native_world(Path::new(self.shelf_dir.as_str()))
+            .map_err(|e| own_fmt(format_args!("c-probe shelf world: {e}"), alloc))?;
+        let shelf_cx = shelf_io
+            .cx(rem, bstd::mem::TASK_FRAME)
+            .map_err(|_| own_str("c-probe verify context stopped", alloc))?;
+        let clang_rel = bstd::path::Path::new(prog.shelf_path)
+            .map_err(|_| own_fmt(format_args!("invalid shelf path `{}`", prog.shelf_path), alloc))?;
+        let expected_voucher = match (boot, shelf_root.stat(&shelf_cx, &clang_rel)) {
+            (Some(b), Ok(Some(meta))) => Some(verify_voucher_digest(b, &meta, &prog.sha256)),
+            _ => None,
+        };
         let voucher_name = own_fmt(format_args!("verified-{}.stamp", hex_bytes(&prog.sha256, alloc)), alloc);
-        let voucher_path = self.work_root.join(voucher_name.as_str());
+        let work_world = remaining()
+            .and_then(|r| native_world(&self.work_root).ok().map(|w| (w, r)))
+            .and_then(|((io, root), r)| io.cx(r, bstd::mem::TASK_FRAME).ok().map(|cx| (io, root, cx)));
         if let Some(expected) = expected_voucher
-            && let Ok(held) = fs::read(&voucher_path)
-            && held.as_slice() == expected.0.as_slice()
+            && let Some((_, ref work_root, ref work_cx)) = work_world
+            && let Ok(voucher_rel) = bstd::path::Path::new(voucher_name.as_str())
+            && read_voucher_bounded(work_root, work_cx, &voucher_rel) == Some(expected.0)
         {
             reset.done = true;
             return Ok(());
@@ -401,14 +424,23 @@ impl HermeticClangProbe {
         let Some(rem) = remaining() else {
             return Err(own_str("c-probe clang verification timed out before hashing", alloc));
         };
-        let got_sha = file_sha256_bounded(Path::new(self.shelf_dir.as_str()), prog.shelf_path, rem, alloc)?;
+        let hash_cx = shelf_io
+            .cx(rem, bstd::mem::TASK_FRAME)
+            .map_err(|_| own_str("c-probe verify hash context stopped", alloc))?;
+        let got_sha = file_sha256_bounded_on(&shelf_root, &hash_cx, &clang_rel, prog.shelf_path, alloc)?;
         shelf_pins::check_member(self.host.as_str(), prog, got_sha).map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
-        if let Some(expected) = expected_voucher {
-            let _ = fs::create_dir_all(&self.work_root);
-            let tmp = self.work_root.join(own_fmt(format_args!("{voucher_name}.{}.tmp", process::id()), alloc).as_str());
-            if fs::write(&tmp, expected.0).is_ok() {
-                let _ = fs::rename(&tmp, &voucher_path);
-            }
+        if let Some(expected) = expected_voucher
+            && let Some(rem_w) = remaining()
+            && let Some((ref work_io, ref work_root, _)) = work_world
+            && let Ok(pub_cx) = work_io.cx(rem_w, bstd::mem::TASK_FRAME)
+            && let Ok(voucher_rel) = bstd::path::Path::new(voucher_name.as_str())
+        {
+            let _ = work_root.publish(
+                &pub_cx,
+                &voucher_rel,
+                bstd::fs::Content::bytes(&expected.0),
+                bstd::fs::Durable::No,
+            );
         }
         reset.done = true;
         Ok(())
@@ -416,27 +448,40 @@ impl HermeticClangProbe {
 }
 
 /// Computes a per-boot file-metadata stamp digest binding `(boot_id, expected_sha256, dev, ino,
-/// size, mtime, ctime)` so the binary is re-hashed on reboot or any metadata change.
-fn verify_voucher_digest(boot: blaze_core::Boot, path: &Path, expected_sha256: &[u8; 32]) -> Option<ContentId> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let meta = fs::metadata(path).ok()?;
-        let mut h = blaze_ids::Hasher::new(VERIFY_VOUCHER_DOMAIN);
-        h.part(&boot.0)
-            .part(expected_sha256)
-            .update(&meta.dev().to_le_bytes())
-            .update(&meta.ino().to_le_bytes())
-            .update(&meta.len().to_le_bytes())
-            .update(&meta.mtime().to_le_bytes())
-            .update(&meta.mtime_nsec().to_le_bytes())
-            .update(&meta.ctime().to_le_bytes())
-            .update(&meta.ctime_nsec().to_le_bytes());
-        Some(h.finish())
+/// size, modified_ns, changed_ns)` from a deadline-bounded `bstd::fs::Meta` stat.
+fn verify_voucher_digest(boot: blaze_core::Boot, meta: &bstd::fs::Meta, expected_sha256: &[u8; 32]) -> ContentId {
+    let mut h = blaze_ids::Hasher::new(VERIFY_VOUCHER_DOMAIN);
+    h.part(&boot.0)
+        .part(expected_sha256)
+        .update(&meta.stamp.dev.to_le_bytes())
+        .update(&meta.stamp.ino.to_le_bytes())
+        .update(&meta.stamp.len.to_le_bytes())
+        .update(&meta.stamp.modified_ns.to_le_bytes())
+        .update(&meta.stamp.changed_ns.to_le_bytes());
+    h.finish()
+}
+
+/// Reads an exact 32-byte verification voucher through deadline-aware `bstd::fs` into a stack
+/// buffer (rejecting any missing, truncated, or oversized file without allocating).
+fn read_voucher_bounded(
+    dir: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    cx: &bstd::cx::Cx,
+    rel: &bstd::path::Path,
+) -> Option<[u8; 32]> {
+    let file = dir.open_read(cx, rel).ok()?;
+    if file.len(cx).ok()? != 32 {
+        return None;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (boot, path, expected_sha256);
+    let mut buf = [0u8; 33];
+    let n = file.read_into(&mut buf, 0).wait(cx).ok()?;
+    if n != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    if let Some(src) = buf.get(..32) {
+        out.copy_from_slice(src);
+        Some(out)
+    } else {
         None
     }
 }
@@ -594,17 +639,23 @@ impl ProbeAnswerer for HermeticClangProbe {
             placeholders.push((own_str(spelled.as_str(), alloc), host_file));
         }
 
-        // Collect output placeholders (`$OUT<n><ext>` -> `<task>/out<n><ext>`).
-        for arg in probe.row.args.iter() {
-            let text = arg.as_str();
-            if text.starts_with(c_tasks_probe::OUTPUT) && !placeholders.iter().any(|(k, _)| k.as_str() == text) {
-                let local_name = placeholder_filename(text, alloc);
-                let host_file = own_fmt(format_args!("{}/{local_name}", task_real.as_str()), alloc);
-                placeholders.push((own_str(text, alloc), host_file));
+        // Collect output placeholders strictly from structural `Segment::Placeholder` nodes so
+        // literal arguments containing `$OUT` are never mistaken for output files.
+        for segs in probe.exec_args.iter() {
+            for seg in segs.iter() {
+                if let Segment::Placeholder(spelled) = seg
+                    && spelled.as_str().starts_with(c_tasks_probe::OUTPUT)
+                    && !placeholders.iter().any(|(k, _)| k.as_str() == spelled.as_str())
+                {
+                    let local_name = placeholder_filename(spelled.as_str(), alloc);
+                    let host_file = own_fmt(format_args!("{}/{local_name}", task_real.as_str()), alloc);
+                    placeholders.push((own_str(spelled.as_str(), alloc), host_file));
+                }
             }
         }
 
-        // Build canonical argv executed by pinned `clang-23`.
+        // Build canonical argv executed by pinned `clang-23` from structural segments so literal
+        // sentinel text like `-DROOT="$OUT_DIR"` is preserved verbatim.
         let mut owned_args: AVec<'a, AString<'a>> = OwnVec::new_in(alloc);
         if matches!(probe.row.program.as_str(), "c++" | "clang++" | "g++") {
             owned_args.push(own_str("--driver-mode=g++", alloc));
@@ -614,14 +665,10 @@ impl ProbeAnswerer for HermeticClangProbe {
 
         let mut has_sysroot = false;
         let sdk_str = self.sdk_dir.as_ref().map(OwnString::as_str);
-        for arg in probe.row.args.iter() {
-            let s = arg.as_str();
-            has_sysroot |= s.starts_with("-isysroot") || s.starts_with("--sysroot");
-            if let Some((_, host_file)) = placeholders.iter().find(|(k, _)| k.as_str() == s) {
-                owned_args.push(own_str(host_file.as_str(), alloc));
-            } else {
-                owned_args.push(expand_roots(s, task_real.as_str(), sdk_str, alloc));
-            }
+        for segs in probe.exec_args.iter() {
+            let rendered = render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc);
+            has_sysroot |= rendered.as_str().starts_with("-isysroot") || rendered.as_str().starts_with("--sysroot");
+            owned_args.push(rendered);
         }
         if !has_sysroot && let Some(sdk) = sdk_str {
             owned_args.push(own_str("-isysroot", alloc));
@@ -634,8 +681,11 @@ impl ProbeAnswerer for HermeticClangProbe {
 
         // Build strictly ascending environment (`CLANG_ENV` + synchronized `SOURCE_DATE_EPOCH`).
         let mut owned_env: AVec<'a, (AString<'a>, AString<'a>)> = OwnVec::new_in(alloc);
-        for (k, v) in probe.row.env.iter() {
-            owned_env.push((own_str(k.as_str(), alloc), expand_roots(v.as_str(), task_real.as_str(), sdk_str, alloc)));
+        for (k, segs) in probe.exec_env.iter() {
+            owned_env.push((
+                own_str(k.as_str(), alloc),
+                render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc),
+            ));
         }
         let epoch_secs = resolve_source_date_epoch(&mut owned_env, alloc)?;
         owned_env.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
@@ -703,22 +753,71 @@ impl ProbeAnswerer for HermeticClangProbe {
         let raw_out = core::str::from_utf8(ran.stdout.as_slice()).map_err(|_| own_str("c-probe stdout is not UTF-8", alloc))?;
         let raw_err = core::str::from_utf8(ran.stderr.as_slice()).map_err(|_| own_str("c-probe stderr is not UTF-8", alloc))?;
 
-        // Normalize host paths back to canonical placeholders (longest match first).
-        let mut rev_pairs: AVec<'a, (&str, &str)> = OwnVec::new_in(alloc);
-        for (spelled, host_file) in placeholders.iter() {
-            rev_pairs.push((host_file.as_str(), spelled.as_str()));
-        }
-        rev_pairs.push((self.clang_path.as_str(), "clang-23"));
-        rev_pairs.push((task_real.as_str(), OUT_DIR));
-        if let Some(sdk_dir) = sdk_str {
-            rev_pairs.push((sdk_dir, SDKROOT));
-        }
-        rev_pairs.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-        let stdout = replace_pairs(raw_out, rev_pairs.as_slice(), alloc);
-        let stderr = replace_pairs(raw_err, rev_pairs.as_slice(), alloc);
+        // Normalize host paths back to canonical placeholders (longest match first), including the
+        // entire clang shelf root (`<shelf>/bin` -> `$CLANG_SHELF/bin`) so `-v` output like
+        // `InstalledDir: <shelf>/bin` never leaks the machine's home directory into cached replies.
+        let stdout = normalize_reply(raw_out, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc);
+        let stderr = normalize_reply(raw_err, self.clang_path.as_str(), self.shelf_dir.as_str(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc);
         Ok(ProbeAnswer { code, stdout, stderr })
     }
+}
+
+/// Stable placeholder replacing host clang shelf root paths (e.g. `InstalledDir: $CLANG_SHELF/bin`).
+const CLANG_SHELF: &str = "$CLANG_SHELF";
+
+fn normalize_reply<'a>(
+    raw: &str,
+    clang_path: &str,
+    shelf_dir: &str,
+    task_dir: &str,
+    sdk_dir: Option<&str>,
+    placeholders: &[(AString<'a>, AString<'a>)],
+    alloc: Alloc<'a>,
+) -> AString<'a> {
+    let mut rev_pairs: AVec<'a, (&str, &str)> = OwnVec::new_in(alloc);
+    for (spelled, host_file) in placeholders.iter() {
+        rev_pairs.push((host_file.as_str(), spelled.as_str()));
+    }
+    rev_pairs.push((clang_path, "clang-23"));
+    rev_pairs.push((shelf_dir, CLANG_SHELF));
+    rev_pairs.push((task_dir, OUT_DIR));
+    if let Some(sdk) = sdk_dir {
+        rev_pairs.push((sdk, SDKROOT));
+    }
+    rev_pairs.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()));
+    replace_pairs(raw, rev_pairs.as_slice(), alloc)
+}
+
+fn render_segments<'a>(
+    segs: &[Segment<'_>],
+    task_dir: &str,
+    sdk_dir: Option<&str>,
+    placeholders: &[(AString<'a>, AString<'a>)],
+    alloc: Alloc<'a>,
+) -> AString<'a> {
+    let mut out = OwnString::new_in(alloc);
+    for seg in segs {
+        match seg {
+            Segment::Literal(lit) => out.push_str(lit.as_str()),
+            Segment::OutDir => out.push_str(task_dir),
+            Segment::SdkRoot => {
+                if let Some(sdk) = sdk_dir {
+                    out.push_str(sdk);
+                } else {
+                    out.push_str(SDKROOT);
+                }
+            }
+            Segment::Mount => out.push_str("/package"),
+            Segment::Placeholder(spelled) => {
+                if let Some((_, host_file)) = placeholders.iter().find(|(k, _)| k.as_str() == spelled.as_str()) {
+                    out.push_str(host_file.as_str());
+                } else {
+                    out.push_str(spelled.as_str());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn placeholder_filename<'a>(spelled: &str, alloc: Alloc<'a>) -> AString<'a> {
@@ -728,13 +827,6 @@ fn placeholder_filename<'a>(spelled: &str, alloc: Alloc<'a>) -> AString<'a> {
         own_fmt(format_args!("out{rest}"), alloc)
     } else {
         own_str("file", alloc)
-    }
-}
-
-fn expand_roots<'a>(text: &str, task_dir: &str, sdk_dir: Option<&str>, alloc: Alloc<'a>) -> AString<'a> {
-    match sdk_dir {
-        Some(sdk) => replace_pairs(text, &[(OUT_DIR, task_dir), (MOUNT, "/package"), (SDKROOT, sdk)], alloc),
-        None => replace_pairs(text, &[(OUT_DIR, task_dir), (MOUNT, "/package")], alloc),
     }
 }
 
@@ -780,21 +872,19 @@ fn canonical_utf8<'a>(path: &Path, alloc: Alloc<'a>) -> Result<SharedStr, AStrin
     }
 }
 
-fn file_sha256_bounded<'a>(
-    shelf_dir: &Path,
-    rel_path: &str,
-    deadline: Duration,
+fn file_sha256_bounded_on<'a>(
+    root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    cx: &bstd::cx::Cx,
+    rel: &bstd::path::Path,
+    label: &str,
     alloc: Alloc<'a>,
 ) -> Result<[u8; 32], AString<'a>> {
-    let (io, root) = native_world(shelf_dir).map_err(|e| own_fmt(format_args!("c-probe shelf world: {e}"), alloc))?;
-    let cx = io.cx(deadline, bstd::mem::TASK_FRAME).map_err(|_| own_str("c-probe verify context stopped", alloc))?;
-    let rel = bstd::path::Path::new(rel_path).map_err(|_| own_fmt(format_args!("invalid shelf path `{rel_path}`"), alloc))?;
-    let file = root.open_read(&cx, &rel).map_err(|e| own_fmt(format_args!("{rel_path}: {e}"), alloc))?;
+    let file = root.open_read(cx, rel).map_err(|e| own_fmt(format_args!("{label}: {e}"), alloc))?;
     let mut hasher = blaze_sha256::Sha256::new();
     let mut buf = [0u8; 64 << 10];
     let mut offset = 0u64;
     loop {
-        let n = file.read_into(&mut buf, offset).wait(&cx).map_err(|e| own_fmt(format_args!("{rel_path}: {e}"), alloc))?;
+        let n = file.read_into(&mut buf, offset).wait(cx).map_err(|e| own_fmt(format_args!("{label}: {e}"), alloc))?;
         if n == 0 {
             break;
         }
@@ -1088,5 +1178,29 @@ mod tests {
         let began = clock.now();
         let err = dummy.ensure_verified(&clock, began, None, alloc).expect_err("must time out waiting on InProgress");
         assert!(err.as_str().contains("timed out"), "unexpected error: {err}");
+
+        // Structural segment rendering preserves literal `$OUT_DIR` while expanding real `Segment::OutDir`.
+        let lit_segs = [super::Segment::Literal(OwnString::from_str_in("-DROOT=\"$OUT_DIR\"", alloc))];
+        let rendered_lit = super::render_segments(&lit_segs, "/tmp/task-1", None, &[], alloc);
+        assert_eq!(rendered_lit.as_str(), "-DROOT=\"$OUT_DIR\"");
+        let real_segs = [
+            super::Segment::Literal(OwnString::from_str_in("-DROOT=\"", alloc)),
+            super::Segment::OutDir,
+            super::Segment::Literal(OwnString::from_str_in("\"", alloc)),
+        ];
+        let rendered_real = super::render_segments(&real_segs, "/tmp/task-1", None, &[], alloc);
+        assert_eq!(rendered_real.as_str(), "-DROOT=\"/tmp/task-1\"");
+
+        // Reply normalization scrubs BOTH `<shelf>/bin/clang-23` AND `<shelf>/bin` (`InstalledDir:`).
+        let norm = super::normalize_reply(
+            "clang: /home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23\nInstalledDir: /home/user/.blaze/v2/toolchain/clang/abc/bin\n",
+            "/home/user/.blaze/v2/toolchain/clang/abc/bin/clang-23",
+            "/home/user/.blaze/v2/toolchain/clang/abc",
+            "/tmp/task-1",
+            None,
+            &[],
+            alloc,
+        );
+        assert_eq!(norm.as_str(), "clang: clang-23\nInstalledDir: $CLANG_SHELF/bin\n");
     }
 }

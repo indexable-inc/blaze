@@ -2097,6 +2097,51 @@ impl Dir<ReadWrite> {
         Ok(Published { file: Flushed::of(&self.io, name, seen), how })
     }
 
+    /// `path` made to hold `content` atomically ONLY if nothing exists at `path` yet (via
+    /// `Effect::Link` from a sibling temporary file): returns `Ok(true)` when this call created
+    /// `path`, or `Ok(false)` when another entry already occupied `path` (never overwriting it).
+    pub fn publish_if_absent(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        let name = self.beneath(path);
+        let (temp, how) = self.place(cx, &name, content)?;
+        if durable == Durable::Yes {
+            let _ = Written::of(&self.io, temp.share()).flush(cx)?;
+        }
+        let from = temp.share();
+        let to = name.share();
+        let linked = match call(&self.io, cx, FsOp::Publish, &name, |tag| Effect::Link { from, to, tag })? {
+            Done::Linked => true,
+            Done::Failed(error) => {
+                let _ = remove(&self.io, cx, FsOp::Publish, &temp);
+                return match stat(&self.io, cx, FsOp::Publish, &name)? {
+                    Some(_) => Ok(false),
+                    None => Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0))),
+                };
+            }
+            done => {
+                let _ = remove(&self.io, cx, FsOp::Publish, &temp);
+                return Err(unexpected(FsOp::Publish, &name, done));
+            }
+        };
+        let _ = remove(&self.io, cx, FsOp::Publish, &temp);
+        match durable.unsynced() {
+            Some(unsynced) => {
+                started(&self.io, &name, unsynced);
+                names_started(&self.io, &name, unsynced);
+            }
+            None => {
+                sync_names(&self.io, cx, FsOp::Publish, &name, None)?;
+            }
+        }
+        cx.event(how.says());
+        Ok(linked)
+    }
+
     /// The file at `path` gone, as durably as `durable` says; gone already is done.
     /// [`Dir::remove_unsynced`] or [`Dir::remove_synced`], chosen at run time.
     pub fn remove(&self, cx: &Cx, path: &Path, durable: Durable) -> Result<(), FsError> {

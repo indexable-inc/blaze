@@ -84,3 +84,81 @@ fn the_oracle_catches_a_read_that_skips_the_seal() {
         }
     }
 }
+
+/// Durable-state DST for `DirStore::{get_c_probe, put_c_probe}`: verifies crash/failure
+/// whole-or-absent invariant, atomic compare-and-publish conflict detection (`OtherBytes`),
+/// and oversized-record replacement across seeded fault schedules.
+fn c_probe_program(io: &Io, plant: RecordPlant) -> Result<(), FilesError> {
+    let dir = io.need_fs().map_err(|_| FilesError::NoTree)?.root();
+    let store = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir }, plant);
+    let alloc = blaze_own::testing::heap().alloc();
+    let check_oracle = |store: &DirStore| -> Result<(), FilesError> {
+        let mut want = [0u8; LONGEST];
+        for k in 0..8u32 {
+            let want = payload(k, &mut want);
+            if let Some(bytes) = store.get_c_probe(&key(k), alloc)? {
+                assert!(
+                    bytes.as_slice() == want,
+                    "c-probe oracle: key {k} read back as other bytes ({} for {})",
+                    bytes.len(),
+                    want.len()
+                );
+            }
+        }
+        Ok(())
+    };
+    check_oracle(&store)?;
+    let mut value = [0u8; LONGEST];
+    for k in 0..8u32 {
+        let want = payload(k, &mut value);
+        store.put_c_probe(&key(k), want)?;
+        // Equal re-put must succeed idempotently.
+        store.put_c_probe(&key(k), want)?;
+        // Conflicting second writer under the same key MUST fail with OtherBytes and NEVER
+        // silently replace the committed record.
+        let mut conflict = std::vec::Vec::from(want);
+        conflict.push(0xA5);
+        match store.put_c_probe(&key(k), &conflict) {
+            Err(FilesError::OtherBytes { .. }) => {}
+            Ok(()) => assert!(false, "c-probe oracle: conflicting put_c_probe on key {k} silently succeeded"),
+            Err(other) => return Err(other),
+        }
+    }
+    check_oracle(&store)
+}
+
+#[test]
+fn c_probe_compare_and_publish_survives_crashes_and_rejects_conflicts() {
+    match seeded(
+        "blaze-proc-macro",
+        module_path!(),
+        "c_probe_cas_crash",
+        Seeds::DEFAULT.from(0, 300),
+        Given::NOTHING,
+        |_: &Cx, io: Io| c_probe_program(&io, RecordPlant::None),
+    ) {
+        Ok(passed) => {
+            assert!(passed.counts.cuts > 100, "too few power cuts: {:?}", passed.counts);
+            assert!(passed.counts.failures > 100, "too few failures: {:?}", passed.counts);
+        }
+        Err(failed) => panic!("{failed}"),
+    }
+}
+
+#[test]
+fn c_probe_dst_catches_planted_blind_overwrite() {
+    match seeded(
+        "blaze-proc-macro",
+        module_path!(),
+        "c_probe_cas_planted_bug",
+        Seeds::DEFAULT.from(0, 32),
+        Given::NOTHING,
+        |_: &Cx, io: Io| c_probe_program(&io, RecordPlant::BlindOverwrite),
+    ) {
+        Ok(passed) => panic!("planted BlindOverwrite was not caught in {} starts", passed.starts),
+        Err(failed) => {
+            let said = std::format!("{failed}");
+            assert!(said.contains("c-probe oracle"), "planted BlindOverwrite failed otherwise: {said}");
+        }
+    }
+}

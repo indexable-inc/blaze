@@ -112,6 +112,7 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         scoped: if abi >= 6 { SCOPES } else { 0 },
     };
     let ruleset = landlock_create_ruleset(&attr).map_err(|errno| Fault::Host { call: "landlock_create_ruleset", code: errno.raw() })?;
+    let has_helper_folder = plan.rules().any(|rule| rule.why == Why::HelperFolder);
     let mut name = [0u8; 4096];
     for (at, rule) in plan.rules().enumerate() {
         let bytes = rule.path.as_bytes();
@@ -144,7 +145,7 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
         landlock_add_rule_path(ruleset.fd(), &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule", code: errno.raw() })?;
         if matches!(rule.why, Why::Program | Why::Helper) {
-            grant_nix_elf_closure(ruleset.fd(), path)?;
+            grant_nix_elf_closure(ruleset.fd(), path, has_helper_folder)?;
         }
     }
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
@@ -164,7 +165,7 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
 /// and `ld.so`'s resolved glibc `lib/` directory) and grants Landlock single-file
 /// `READ_FILE | EXECUTE` ONLY on the exact loader and resolved shared library files — never on
 /// `/nix/store` as a directory. Does nothing on non-NixOS hosts or non-ELF scripts.
-fn grant_nix_elf_closure(ruleset: Fd, program: &CStr) -> Result<(), Fault> {
+fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -> Result<(), Fault> {
     const MAX_LIBS: usize = 64;
     const PATH_CAP: usize = 320;
     const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
@@ -204,6 +205,15 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr) -> Result<(), Fault> {
     };
     if !target.starts_with(b"/nix/store/") {
         return Ok(());
+    }
+    // Generated helpers inside `Why::HelperFolder` do not exist pre-exec so their transitive
+    // Nix-store `DT_NEEDED` closure cannot be computed upfront; refuse explicitly rather than
+    // granting `/nix/store` or letting generated helpers fail mid-run (rule 3).
+    if has_helper_folder {
+        return Err(Fault::Host {
+            call: "landlock (NixOS minimal ELF closure does not support HelperFolder)",
+            code: 38,
+        });
     }
 
     // Grant single-file READ_FILE | EXECUTE on the resolved loader (`PT_INTERP`) and, when the

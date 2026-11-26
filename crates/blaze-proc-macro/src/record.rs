@@ -165,6 +165,13 @@ impl OnDir {
         self.dir.publish(&cx, &Self::path(name)?, Content::bytes(whole), Durable::No).map(|_| ()).map_err(FilesError::Effect)
     }
 
+    /// `name` published atomically ONLY if absent (compare-and-publish via `Effect::Link`),
+    /// returning `Ok(true)` if created or `Ok(false)` if another file already occupies `name`.
+    fn publish_if_absent(&self, name: &RecordName, whole: &[u8]) -> Result<bool, FilesError> {
+        let cx = self.cx(name)?;
+        self.dir.publish_if_absent(&cx, &Self::path(name)?, Content::bytes(whole), Durable::No).map_err(FilesError::Effect)
+    }
+
     /// [`RecordPlant::FramedPublish`]'s write: `whole` copied into the task's frame, then
     /// published from there, so a record longer than the frame is refused. Never taken but by
     /// the planted bug's test.
@@ -252,6 +259,10 @@ pub enum RecordPlant {
     /// A crate's results table is copied into the task's frame before it is published: a
     /// table longer than the frame is refused ([`table`]'s hundred-megabyte test).
     FramedPublish,
+    /// `put_c_probe` blindly overwrites an existing valid record via `publish` instead of using
+    /// atomic compare-and-publish (`publish_if_absent` + `OtherBytes` on conflict). Never taken
+    /// except by the durable-state DST planted-bug control (rule 23).
+    BlindOverwrite,
 }
 
 /// The folder store of records: each file the record's bytes then their [`SEAL`], published
@@ -413,21 +424,37 @@ impl DirStore {
         self.files.read_sealed_bounded(&Self::named(b"c-probe/", key), crate::probe_clang::MAX_RECORD_BYTES, alloc)
     }
 
-    /// Keeps a C compiler probe's answer record, written once: other bytes under the key are
-    /// refused (rule 21), equal bytes are no write, and absent/torn/oversized records are replaced
-    /// atomically without calling the unbounded generic reader.
+    /// Keeps a C compiler probe's answer record using atomic compare-and-publish
+    /// (`publish_if_absent` via `Effect::Link`):
+    /// - Absent: atomically created once without racing any concurrent writer.
+    /// - Present and valid: equal bytes succeed; different bytes fail with [`FilesError::OtherBytes`]
+    ///   (rule 21) so nondeterministic answers are never silently overwritten.
+    /// - Present and torn/corrupted/oversized (`> MAX_RECORD_BYTES`): rejected before allocating
+    ///   and replaced atomically via `publish`, followed by bounded re-verification.
     pub(crate) fn put_c_probe(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
         let name = Self::named(b"c-probe/", key);
         let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).map_err(|_| FilesError::Stopped { name })?;
         let erased = blaze_own::Erased::new(&frame);
         let alloc = erased.handle();
-        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, alloc)? {
-            return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
-        }
         let mut whole = blaze_own::Vec::with_capacity_in(bytes.len() + SEAL_LEN, alloc);
         whole.extend_from_slice(bytes);
         whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
-        self.files.publish(&name, whole.as_slice())
+        if self.plant == RecordPlant::BlindOverwrite {
+            return self.files.publish(&name, whole.as_slice());
+        }
+        if self.files.publish_if_absent(&name, whole.as_slice())? {
+            return Ok(());
+        }
+        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, alloc)? {
+            return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
+        }
+        self.files.publish(&name, whole.as_slice())?;
+        if let Some(held) = self.files.read_sealed_bounded(&name, crate::probe_clang::MAX_RECORD_BYTES, alloc)?
+            && held.as_slice() != bytes
+        {
+            return Err(FilesError::OtherBytes { name });
+        }
+        Ok(())
     }
 
     /// The record at `name`, its seal checked: `None` when absent or torn.

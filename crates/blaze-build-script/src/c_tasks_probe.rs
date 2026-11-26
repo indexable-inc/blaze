@@ -94,12 +94,36 @@ fn under_out_dir<'a>(path: &'a str, out_dir: &str) -> Option<&'a str> {
     Some(rel)
 }
 
+/// Implementation identity of compiler-probe classification, canonicalization, and input
+/// filtering (AGENTS.md rule 69: derived from source bytes, never a hand-bumped version).
+pub fn implementation_id() -> ContentId {
+    ContentId::of("blaze-build-script c_tasks_probe implementation", include_bytes!("c_tasks_probe.rs"))
+}
+
 fn is_header_search_flag(arg: &str) -> bool {
-    matches!(arg, "-I" | "-isystem" | "-iquote" | "-idirafter" | "-include" | "-imacros")
-        || arg.starts_with("-I")
-        || arg.starts_with("-isystem")
-        || arg.starts_with("-iquote")
-        || arg.starts_with("-idirafter")
+    const PREFIXES: &[&str] = &[
+        "-I",
+        "-isystem",
+        "-iquote",
+        "-idirafter",
+        "-iprefix",
+        "-iwithprefix",
+        "-iwithprefixbefore",
+        "-include",
+        "-imacros",
+        "-iframework",
+        "-F",
+        "--include",
+        "--include-directory",
+        "-Wp,",
+        "-Xpreprocessor",
+        "-Xclang",
+        "-fmodule-map-file",
+        "-fprebuilt-module-path",
+        "-fmodules-cache-path",
+        "-ivfsoverlay",
+    ];
+    PREFIXES.iter().any(|p| arg.starts_with(p))
 }
 
 /// Whether the spawn of `program` with `args` is a compiler probe, from its text alone: a C
@@ -340,12 +364,28 @@ pub fn canonical_reply_digest(ans: &ProbeAnswer<'_>) -> ContentId {
     hash.finish()
 }
 
+/// A structural piece of a canonicalized probe argument or environment value: separates real
+/// guest-path substitutions from literal text (e.g. `-DROOT="$OUT_DIR"`) so they never collide in
+/// [`ProbeKey`] or get mistakenly expanded at execution time.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Segment<'b> {
+    Literal(AString<'b>),
+    OutDir,
+    SdkRoot,
+    Mount,
+    Placeholder(AString<'b>),
+}
+
 /// A canonicalized compiler probe ready for cache lookup or execution by a [`ProbeAnswerer`].
 pub struct CanonicalProbe<'b, 's> {
     pub key: ProbeKey,
     pub clang: [u8; 32],
     pub sdk_id: AString<'b>,
     pub row: Row<'b>,
+    /// Structural argument segments (`Segment::Literal` vs path placeholders).
+    pub exec_args: AVec<'b, AVec<'b, Segment<'b>>>,
+    /// Structural environment `(name, segments)`.
+    pub exec_env: AVec<'b, (AString<'b>, AVec<'b, Segment<'b>>)>,
     /// `($IN<n><ext> or $OUT<n><ext>, original spawned arg)`.
     pub paths: AVec<'b, (AString<'b>, &'s str)>,
     /// `($IN<n><ext>, OUT_DIR-relative path)` for every input file present in `OUT_DIR`.
@@ -575,27 +615,60 @@ pub fn canonicalize<'b, 's>(
     if has_env_package_input || has_arg_package_input {
         return Err(ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&asked.row, alloc) });
     }
-    let key = probe_key(answerer_id, clang, spawn.sdk_id, &asked.row);
+    let key = probe_key(answerer_id, clang, spawn.sdk_id, &asked.row, &asked.exec_args, &asked.exec_env);
     Ok(CanonicalProbe {
         key,
         clang: *clang,
         sdk_id: String::from_str_in(spawn.sdk_id, alloc),
         row: asked.row,
+        exec_args: asked.exec_args,
+        exec_env: asked.exec_env,
         paths: asked.paths,
         input_rels: asked.input_rels,
     })
 }
 
-fn probe_key(answerer_id: ContentId, clang: &[u8; 32], sdk_id: &str, row: &Row<'_>) -> ProbeKey {
+fn hash_segments(h: &mut Hasher, segs: &[Segment<'_>]) {
+    h.update(&u32::try_from(segs.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for seg in segs {
+        match seg {
+            Segment::Literal(s) => {
+                h.update(&[0u8]).part(s.as_bytes());
+            }
+            Segment::OutDir => {
+                h.update(&[1u8]);
+            }
+            Segment::SdkRoot => {
+                h.update(&[2u8]);
+            }
+            Segment::Mount => {
+                h.update(&[3u8]);
+            }
+            Segment::Placeholder(p) => {
+                h.update(&[4u8]).part(p.as_bytes());
+            }
+        }
+    }
+}
+
+fn probe_key(
+    answerer_id: ContentId,
+    clang: &[u8; 32],
+    sdk_id: &str,
+    row: &Row<'_>,
+    exec_args: &[AVec<'_, Segment<'_>>],
+    exec_env: &[(AString<'_>, AVec<'_, Segment<'_>>)],
+) -> ProbeKey {
     let mut h = Hasher::new(PROBE_KEY_DOMAIN);
     h.id(&answerer_id).part(clang).part(sdk_id.as_bytes()).part(row.program.as_bytes());
-    h.update(&u32::try_from(row.args.len()).unwrap_or(u32::MAX).to_le_bytes());
-    for arg in row.args.iter() {
-        h.part(arg.as_bytes());
+    h.update(&u32::try_from(exec_args.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for segs in exec_args {
+        hash_segments(&mut h, segs.as_slice());
     }
-    h.update(&u32::try_from(row.env.len()).unwrap_or(u32::MAX).to_le_bytes());
-    for (k, v) in row.env.iter() {
-        h.part(k.as_bytes()).part(v.as_bytes());
+    h.update(&u32::try_from(exec_env.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for (k, segs) in exec_env {
+        h.part(k.as_bytes());
+        hash_segments(&mut h, segs.as_slice());
     }
     h.update(&u32::try_from(row.files.len()).unwrap_or(u32::MAX).to_le_bytes());
     for (k, v) in row.files.iter() {
@@ -861,6 +934,8 @@ impl<'a> Table<'a> {
 /// A probe's key as a row, its path placeholders, and its `OUT_DIR`-relative input file paths.
 struct Asked<'b, 's> {
     row: Row<'b>,
+    exec_args: AVec<'b, AVec<'b, Segment<'b>>>,
+    exec_env: AVec<'b, (AString<'b>, AVec<'b, Segment<'b>>)>,
     /// `($IN<n><ext> or $OUT<n><ext>, the argument as spawned)`.
     paths: AVec<'b, (AString<'b>, &'s str)>,
     /// `($IN<n><ext>, OUT_DIR-relative path)` for every input file present in `OUT_DIR`.
@@ -899,6 +974,7 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
     }
     roots.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()));
     let mut args: AVec<'b, AString<'b>> = Vec::new_in(alloc);
+    let mut exec_args: AVec<'b, AVec<'b, Segment<'b>>> = Vec::new_in(alloc);
     let mut files: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
     let mut paths: AVec<'b, (AString<'b>, &'s str)> = Vec::new_in(alloc);
     let mut input_rels: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
@@ -906,11 +982,15 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
     for arg in spawn.args.iter().copied() {
         let Some(rel) = under_out_dir(arg, spawn.out_dir) else {
             args.push(spelled_roots(arg, &roots, alloc));
+            exec_args.push(spelled_segments(arg, &roots, alloc));
             continue;
         };
         // One path, one placeholder, however often it is named.
         if let Some((spelled, _)) = paths.iter().find(|(_, actual)| *actual == arg) {
-            args.push(spelled.clone());
+            args.push(own(spelled.as_str()));
+            let mut segs: AVec<'b, Segment<'b>> = Vec::new_in(alloc);
+            segs.push(Segment::Placeholder(own(spelled.as_str())));
+            exec_args.push(segs);
             continue;
         }
         let digest = file(rel);
@@ -923,22 +1003,27 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
         *count += 1;
         spelled.push_str(extension(rel));
         if let Some(digest) = digest {
-            files.push((spelled.clone(), hex(&digest, alloc)));
+            files.push((own(spelled.as_str()), hex(&digest, alloc)));
             input_rels.push((own(spelled.as_str()), own(rel)));
         }
-        paths.push((spelled.clone(), arg));
+        let mut segs: AVec<'b, Segment<'b>> = Vec::new_in(alloc);
+        segs.push(Segment::Placeholder(own(spelled.as_str())));
+        exec_args.push(segs);
+        paths.push((own(spelled.as_str()), arg));
         args.push(spelled);
     }
     // Each placeholder once (above), so the unstable sort is the one order.
     files.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     let mut env: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
+    let mut exec_env: AVec<'b, (AString<'b>, AVec<'b, Segment<'b>>)> = Vec::new_in(alloc);
     for name in CLANG_ENV {
         if let Some((_, value)) = spawn.env.iter().rev().find(|(have, _)| *have == name) {
             env.push((own(name), spelled_roots(value, &roots, alloc)));
+            exec_env.push((own(name), spelled_segments(value, &roots, alloc)));
         }
     }
     let row = Row { clang: own(clang), program: own(name_of(spawn.program)), args, env, files, answer: Answer::Pending };
-    Asked { row, paths, input_rels }
+    Asked { row, exec_args, exec_env, paths, input_rels }
 }
 
 /// The extension of the last name of `path` with its dot (`.c`, `.cpp`), or "" where it has
@@ -985,6 +1070,49 @@ fn same_key(a: &Row<'_>, b: &Row<'_>) -> bool {
 /// Whether `byte` may continue a path component (so a root followed by it is another name).
 fn continues_name(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+/// `text` split structurally into literal spans and real guest-folder placeholders.
+fn spelled_segments<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) -> AVec<'b, Segment<'b>> {
+    let mut out: AVec<'b, Segment<'b>> = Vec::new_in(alloc);
+    let mut lit = String::new_in(alloc);
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    'scan: while let Some(rest) = text.get(at..) {
+        if rest.is_empty() {
+            break;
+        }
+        for (root, spelling) in roots.iter().copied() {
+            if !root.is_empty()
+                && rest.starts_with(root)
+                && !bytes.get(at + root.len()).is_some_and(|b| continues_name(*b))
+            {
+                if !lit.is_empty() {
+                    out.push(Segment::Literal(lit));
+                    lit = String::new_in(alloc);
+                }
+                let seg = match spelling {
+                    OUT_DIR => Segment::OutDir,
+                    SDKROOT => Segment::SdkRoot,
+                    MOUNT => Segment::Mount,
+                    other => Segment::Placeholder(String::from_str_in(other, alloc)),
+                };
+                out.push(seg);
+                at += root.len();
+                continue 'scan;
+            }
+        }
+        if let Some(ch) = rest.chars().next() {
+            lit.push(ch);
+            at += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if !lit.is_empty() {
+        out.push(Segment::Literal(lit));
+    }
+    out
 }
 
 /// `text` with each root (a guest folder) spelled as its placeholder where it stands whole.
