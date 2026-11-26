@@ -226,6 +226,8 @@ pub enum ProbeWhy {
     Stdin,
     /// The probe references headers, response files, or package paths outside `OUT_DIR`.
     PackageInput,
+    /// The probe uses host-CPU or timestamp-observing options/macros not determined at `Level::Inputs`.
+    HostDependent,
 }
 
 impl fmt::Display for ProbeRefused<'_> {
@@ -238,6 +240,9 @@ impl fmt::Display for ProbeRefused<'_> {
             }
             ProbeWhy::PackageInput => {
                 return write!(f, "a compiler probe references headers or package paths outside OUT_DIR, which a zero-header probe does not key or mount (rule 21): {}", self.row.as_str());
+            }
+            ProbeWhy::HostDependent => {
+                return write!(f, "a compiler probe uses host-CPU or host-timestamp observations not determined at Level::Inputs (rule 21): {}", self.row.as_str());
             }
         }
         write!(f, "; add or keep the row and run scripts/src/bin/clang_answers.rs: {}", self.row.as_str())
@@ -464,17 +469,53 @@ fn flag_takes_value(arg: &str) -> bool {
     )
 }
 
-/// Whether `bytes` contains a preprocessor `#include`, `#include_next`, or `#import` directive
-/// (after C translation phase 2 line-splicing and phase 3 comment stripping, plus conservative
-/// rejection of trigraphs/unclosed comments) that could pull headers outside the probe's keyed
-/// `OUT_DIR` inputs.
-fn has_include_directive(bytes: &[u8], alloc: Alloc<'_>) -> bool {
-    let Ok(raw_text) = core::str::from_utf8(bytes) else {
+/// Whether `arg` (and optional `next`) requests host CPU auto-detection or profile feedback not
+/// determined at `Level::Inputs` (`-march=native`, `-mcpu=native`, `-mtune=native`,
+/// `--target=native`, `-Xarch_host`, `-fprofile-*`).
+fn is_host_dependent_flag(arg: &str, next: Option<&str>) -> bool {
+    if matches!(arg, "-march=native" | "-mcpu=native" | "-mtune=native" | "--target=native")
+        || arg.starts_with("-Xarch_host")
+        || arg.starts_with("-fprofile-")
+    {
         return true;
+    }
+    if matches!(arg, "-march" | "-mcpu" | "-mtune" | "-target" | "--target") && next == Some("native") {
+        return true;
+    }
+    false
+}
+
+/// Whether `text` contains identifier token `ident` delimited by non-identifier characters.
+fn contains_ident(text: &str, ident: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = 0usize;
+    while let Some(rest) = text.get(start..) {
+        let Some(pos) = rest.find(ident) else {
+            return false;
+        };
+        let abs = start + pos;
+        let left_ok = abs == 0 || !bytes.get(abs - 1).is_some_and(|&b| is_id(b));
+        let right_ok = !bytes.get(abs + ident.len()).is_some_and(|&b| is_id(b));
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + ident.len();
+    }
+    false
+}
+
+/// Checks materialized `OUT_DIR` probe source bytes (after C translation phase 2 line-splicing
+/// and phase 3 comment stripping) for unkeyed file/header inclusions (`#include`, `#include_next`,
+/// `#import`, `__has_include`, `__has_include_next`, `__has_embed`) or host-timestamp macros
+/// (`__TIMESTAMP__`), returning the refusal reason if disallowed.
+fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
+    let Ok(raw_text) = core::str::from_utf8(bytes) else {
+        return Some(ProbeWhy::PackageInput);
     };
     // Conservatively reject trigraphs that introduce `#` or `\` (`??=`, `??/`).
     if raw_text.contains("??=") || raw_text.contains("??/") {
-        return true;
+        return Some(ProbeWhy::PackageInput);
     }
     // Phase 2: remove `\\\n` and `\\\r\n` line splices.
     let mut spliced: AVec<'_, u8> = Vec::with_capacity_in(bytes.len(), alloc);
@@ -531,7 +572,7 @@ fn has_include_directive(bytes: &[u8], alloc: Alloc<'_>) -> bool {
                 j += 1;
             }
             if !closed {
-                return true;
+                return Some(ProbeWhy::PackageInput);
             }
             norm.push(b' ');
             continue;
@@ -550,7 +591,7 @@ fn has_include_directive(bytes: &[u8], alloc: Alloc<'_>) -> bool {
         j += 1;
     }
     let Ok(text) = core::str::from_utf8(norm.as_slice()) else {
-        return true;
+        return Some(ProbeWhy::PackageInput);
     };
     for line in text.lines() {
         let trimmed = line.trim_start_matches([' ', '\t', '\r', '\x0b', '\x0c']);
@@ -561,13 +602,22 @@ fn has_include_directive(bytes: &[u8], alloc: Alloc<'_>) -> bool {
                 if let Some(rest) = dir.strip_prefix(kw) {
                     let boundary = rest.bytes().next().is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_');
                     if boundary {
-                        return true;
+                        return Some(ProbeWhy::PackageInput);
                     }
                 }
             }
         }
     }
-    false
+    if contains_ident(text, "__has_include")
+        || contains_ident(text, "__has_include_next")
+        || contains_ident(text, "__has_embed")
+    {
+        return Some(ProbeWhy::PackageInput);
+    }
+    if contains_ident(text, "__TIMESTAMP__") {
+        return Some(ProbeWhy::HostDependent);
+    }
+    None
 }
 
 /// Builds a [`CanonicalProbe`] and its [`ProbeKey`] from a script spawn.
@@ -589,8 +639,14 @@ pub fn canonicalize<'b, 's>(
         .iter()
         .any(|(k, v)| is_path_steering_env(k.as_str()) && !v.as_str().is_empty());
     let mut has_arg_package_input = false;
+    let mut has_host_dep_arg = false;
     let mut skip_next = false;
-    for &arg in spawn.args {
+    for (idx, &arg) in spawn.args.iter().enumerate() {
+        let next = spawn.args.get(idx + 1).copied();
+        if is_host_dependent_flag(arg, next) {
+            has_host_dep_arg = true;
+            break;
+        }
         if is_header_search_flag(arg)
             || arg.starts_with('@')
             || (!spawn.mount.is_empty() && arg.contains(spawn.mount) && !is_prefix_map_flag(arg))
@@ -611,6 +667,9 @@ pub fn canonicalize<'b, 's>(
             has_arg_package_input = true;
             break;
         }
+    }
+    if has_host_dep_arg {
+        return Err(ProbeRefused { why: ProbeWhy::HostDependent, row: row_json(&asked.row, alloc) });
     }
     if has_env_package_input || has_arg_package_input {
         return Err(ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&asked.row, alloc) });
@@ -727,9 +786,9 @@ pub fn resolve<'a, 'b>(
     })?;
     for (_, rel) in probe.input_rels.iter() {
         if let Some(bytes) = file_bytes(rel.as_str())
-            && has_include_directive(bytes, alloc)
+            && let Some(why) = disallowed_probe_source(bytes, alloc)
         {
-            let refused = ProbeRefused { why: ProbeWhy::PackageInput, row: row_json(&probe.row, alloc) };
+            let refused = ProbeRefused { why, row: row_json(&probe.row, alloc) };
             let mut msg = String::new_in(alloc);
             let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{refused}"));
             return Err(msg);

@@ -522,10 +522,11 @@ impl ScriptSandbox {
         self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes())
     }
 
-    /// A compiler probe, answered through the command's [`crate::probe_clang::CScriptProbes`]
-    /// strategy seam and content-addressed cache (`c_tasks_probe::resolve`), recording a per-probe
-    /// read (`cc-probe\n<key hex>` -> canonical reply digest before `unspell`). When `c_probes` is
-    /// absent (isolated unit tests without a command store), falls back to the checked-in table.
+    /// A compiler probe, answered strictly through the command's
+    /// [`crate::probe_clang::CScriptProbes`] strategy seam and content-addressed cache
+    /// (`c_tasks_probe::resolve`), recording a per-probe read
+    /// (`cc-probe\n<answerer>\n<clang>\n<sdk>\n<key>` -> canonical reply digest before `unspell`).
+    /// Never silently switches to an offline table when `c_probes` is absent (rule 3).
     fn spawn_probe(&mut self, program: &str, args: &[String], spawned: &Decoded) -> Result<(), Stop> {
         let script = Arc::clone(&self.script);
         let refused = |why: String| SpawnRefusal::Fact { program: program.to_owned(), args: args.to_vec(), why };
@@ -572,31 +573,14 @@ impl ScriptSandbox {
                 let stderr = resolved.answered.stderr.as_bytes().to_vec();
                 let subject_owned = subject.as_str().to_owned();
                 self.record(subject_owned, Some(resolved.canonical_digest));
-                return self.deliver(program, spawned.modes, code, &stdout, &stderr);
+                self.deliver(program, spawned.modes, code, &stdout, &stderr)
             }
             Some(crate::probe_clang::CProbeSetting::Unavailable(why)) => {
-                return Err(self.refuse(Refusal::Spawn(refused(why.as_ref().to_owned()))));
+                Err(self.refuse(Refusal::Spawn(refused(why.as_ref().to_owned()))))
             }
-            None => {}
-        }
-
-        let probe = c_tasks_probe::Spawn {
-            program,
-            args: &arg_refs,
-            env: &env,
-            out_dir: script.out_dir(),
-            sdk,
-            mount: mount.as_str(),
-            sdk_id: "",
-            stdin: &spawned.stdin,
-        };
-        let table = match c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc) {
-            Ok(table) => table,
-            Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
-        };
-        match table.answer(&clang, &probe, held_digest, alloc) {
-            Ok(answer) => self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()),
-            Err(why) => Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+            None => Err(self.refuse(Refusal::Spawn(refused(
+                "no C compiler probe setting configured on this Script (rule 3)".to_owned(),
+            )))),
         }
     }
 

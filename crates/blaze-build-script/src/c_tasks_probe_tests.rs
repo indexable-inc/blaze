@@ -390,9 +390,27 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         b"#inc\\\nlude \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
         b"%:include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
         b"??=include \"local.h\"\nint main(void) { return 0; }\n".as_slice(),
+        b"#if __has_include(\"sibling.h\")\nint x;\n#endif\n".as_slice(),
+        b"#if __has_include_next(<foo.h>)\nint x;\n#endif\n".as_slice(),
+        b"#if __has_embed(\"data.bin\")\nint x;\n#endif\n".as_slice(),
+        b"const char *t = __TIMESTAMP__;\n".as_slice(),
     ] {
         let mut inc_bytes = |name: &str| (name == "flag_check.c").then_some(bad_src);
         assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut inc_bytes, alloc).is_err());
+    }
+
+    // Host-CPU-probing flags (`-march=native`, `-mcpu=native`, `-mtune=native`, split forms)
+    // are refused before caching at `Level::Inputs`.
+    for native_args in [
+        ["-E", "-dM", "-march=native", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+        ["-c", "-mcpu=native", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+        ["-c", "-mtune", "native", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+    ] {
+        let sp = Spawn { program: "cc", args: native_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "", stdin: &[] };
+        assert_eq!(
+            canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp, files, alloc).err().expect("native flag").why,
+            ProbeWhy::HostDependent
+        );
     }
 
     // Joined and delegated header/preprocessor flags are refused before caching.
