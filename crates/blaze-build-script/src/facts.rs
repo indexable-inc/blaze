@@ -67,6 +67,8 @@ pub enum FactRefused<'a> {
     /// `sw_vers` with arguments other than exactly one of `-productVersion`, `-buildVersion`,
     /// `-productName`: the arguments joined by spaces.
     SwVersArgs { args: AString<'a> },
+    /// `sw_vers` asked on a host that declares no Apple userland (empty macOS version pins).
+    NoAppleUserland,
     /// A compiler probe whose argument is not `--version`, `-dumpversion` or `-dumpfullversion`.
     CompilerArgs { program: AString<'a>, arg: AString<'a> },
     /// A compiler probe asked of [`answer`]: its answer is the table's (`c_tasks_probe`).
@@ -84,6 +86,9 @@ impl core::fmt::Display for FactRefused<'_> {
             }
             FactRefused::SwVersArgs { args } => {
                 write!(f, "sw_vers `{}`: only one of -productVersion, -buildVersion, -productName is answered (READINESS 1f)", args.as_str())
+            }
+            FactRefused::NoAppleUserland => {
+                f.write_str("sw_vers: the host declares no Apple userland, so sw_vers is not answered (READINESS 1f)")
             }
             FactRefused::CompilerArgs { program, arg } => {
                 write!(f, "`{} {}`: only --version, -dumpversion, -dumpfullversion are answered for a compiler (READINESS 1f)", program.as_str(), arg.as_str())
@@ -209,6 +214,9 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
     match *fact {
         Fact::PkgConfig { args } => pkg_config(args, alloc),
         Fact::SwVers { args } => {
+            if pins.macos_product_version.is_empty() || pins.macos_build_version.is_empty() {
+                return Err(FactRefused::NoAppleUserland);
+            }
             let value = match args {
                 ["-productVersion"] => pins.macos_product_version,
                 ["-buildVersion"] => pins.macos_build_version,

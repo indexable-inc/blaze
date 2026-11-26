@@ -12,8 +12,8 @@
 //! `test blaze-build-script: exit 0; 4 passed, 0 failed`.
 
 use crate::{
-    fact_pins::{AppleUserland, CLANG_GUEST_DIR, FactPinsError, UserlandError, apple_userland, fact_pins},
-    facts::{answer, question},
+    fact_pins::{AppleUserland, CLANG_GUEST_DIR, FactPinsError, UserlandError, apple_userland, fact_pins, linux_fact_pins},
+    facts::{FactRefused, answer, question},
 };
 use blaze_pins::CLANG_JSON as PIN;
 
@@ -79,4 +79,26 @@ fn fact_pins_answer_libusb1_sys() {
     assert_eq!(got.code, 1);
     assert!(got.stdout.as_str().is_empty());
     assert!(got.stderr.as_str().starts_with("Package libusb-1.0 was not found in the pkg-config search path.\n"), "{}", got.stderr.as_str());
+}
+
+#[test]
+fn linux_fact_pins_answers_clang_and_pkg_config_and_refuses_sw_vers() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let owned = linux_fact_pins(PIN, "aarch64-unknown-linux-gnu", CLANG_GUEST_DIR, alloc).expect("linux pins");
+    assert_eq!(
+        owned.clang_version_text.as_str(),
+        "clang version 23.1.4 (https://github.com/llvm/llvm-project 7a941dfb2877a0b8cf30323fefa85ad019e0b0f5)\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\n"
+    );
+    assert_eq!((owned.macos_product_version.as_str(), owned.macos_build_version.as_str()), ("", ""));
+    let pins = owned.pins();
+    let cc = question("cc", &["--version"]).expect("a fact");
+    assert_eq!(answer(&cc, &pins, alloc).expect("answered").stdout.as_str(), owned.clang_version_text.as_str());
+    let pkg = question("pkg-config", &["--libs", "--cflags", "zlib"]).expect("a fact");
+    assert_eq!(answer(&pkg, &pins, alloc).expect("answered").code, 1);
+    let sw = question("sw_vers", &["-productVersion"]).expect("a fact");
+    assert_eq!(answer(&sw, &pins, alloc), Err(FactRefused::NoAppleUserland));
+    assert_eq!(
+        linux_fact_pins(PIN, "x86_64-unknown-linux-gnu", CLANG_GUEST_DIR, alloc).err(),
+        Some(FactPinsError::NoTriple { target: "x86_64-unknown-linux-gnu" })
+    );
 }

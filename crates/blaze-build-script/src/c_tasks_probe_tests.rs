@@ -219,3 +219,28 @@ fn the_pinned_table_answers_a_family_probe_in_a_build_folder() {
     assert_eq!(answered.code, 0);
     assert!(answered.stdout.as_str().contains("\"clang\"") && answered.stderr.as_str().contains(path.as_str()), "{answered:?}");
 }
+
+#[test]
+fn the_pinned_table_answers_a_linux_arm64_family_probe() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let table = parse(include_str!("../../../pins/answers/clang.json"), alloc);
+    let pin = crate::toolchain::clang_pin(blaze_pins::CLANG_JSON, "aarch64-unknown-linux-gnu").unwrap_or_else(|e| panic!("{e}"));
+    let unhex = |text: &str| -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (at, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).expect("hex");
+        }
+        out
+    };
+    let detect = unhex("97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f");
+    let path = format!("{OUT}/123456789detect_compiler_family.c");
+    let args = ["-E", path.as_str()];
+    let held = |rel: &str| (rel == "123456789detect_compiler_family.c").then_some(detect);
+    let probe = Spawn { program: "cc", args: &args, env: &[], out_dir: OUT, sdk: "", stdin: &[] };
+    let answered = match table.answer(&pin.sha256, &probe, held, alloc) {
+        Ok(answered) => answered,
+        Err(refused) => panic!("{refused}"),
+    };
+    assert_eq!(answered.code, 0);
+    assert!(answered.stdout.as_str().contains("\"clang\""), "{answered:?}");
+}

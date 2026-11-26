@@ -15,7 +15,7 @@ use blaze_own::AString;
 use blaze_record::Digest;
 
 use crate::{
-    fact_pins::{FactNow, UserlandText, fact_now, pinned_setting, read_now},
+    fact_pins::{FactNow, UserlandText, command_spawn_setting, fact_now, linux_pinned_setting, pinned_setting, read_now},
     script_sandbox::{Refusal, ScriptSandbox, SpawnRefusal, Tree},
     spawn_route::SpawnSetting,
     spawn_route_tests::{script, shim},
@@ -99,4 +99,27 @@ fn fact_pins_reads_are_answered_again_under_todays_pins() {
     assert_eq!(fact_now(subject, None, alloc), FactNow::NoPins);
     assert_eq!(read_now(&tree, subject, None, alloc), None);
     assert_eq!(fact_now("file:build.rs", today.pins.as_ref(), alloc), FactNow::NotAFact);
+}
+
+#[test]
+fn linux_arm64_command_spawn_setting_answers_cc_and_pkg_config_and_refuses_sw_vers() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let setting = command_spawn_setting("aarch64-unknown-linux-gnu", alloc).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(setting, linux_pinned_setting("aarch64-unknown-linux-gnu", alloc).unwrap_or_else(|e| panic!("{e}")));
+    let script = script(CMode::Deferred, None, setting);
+    let mut sandbox = ScriptSandbox::new(std::sync::Arc::clone(&script));
+
+    sandbox.spawn(&shim(&["cc", "--version"], false, &[], None, b"", [2, 2])).unwrap_or_else(|stop| panic!("refused: {}", stop.0));
+    let (code, stdout, _) = reply(&sandbox.reply);
+    let stdout = String::from_utf8(stdout).expect("utf-8");
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Target: aarch64-unknown-linux-gnu\n"), "{stdout}");
+
+    sandbox.spawn(&shim(&LIBUSB, false, &[], None, b"", [2, 2])).unwrap_or_else(|stop| panic!("refused: {}", stop.0));
+    assert_eq!(reply(&sandbox.reply).0, 1);
+
+    let Err(stop) = sandbox.spawn(&shim(&["sw_vers", "-productVersion"], false, &[], None, b"", [2, 2])) else {
+        panic!("sw_vers answered on Linux");
+    };
+    assert!(stop.0.contains("no Apple userland"), "{}", stop.0);
 }
