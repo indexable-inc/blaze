@@ -1733,10 +1733,25 @@ mod macos_app {
         (master, tile_layout)
     }
 
+    fn auto_split_axis(tile_layout: &TileLayout) -> SplitAxis {
+        tile_layout
+            .panes
+            .iter()
+            .find(|p| p.focused)
+            .map_or(SplitAxis::Vertical, |p| {
+                if (p.rect.x1 - p.rect.x0) >= (p.rect.y1 - p.rect.y0) {
+                    SplitAxis::Vertical
+                } else {
+                    SplitAxis::Horizontal
+                }
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_palette_action(
         action: PaletteAction,
         wm: &mut TileManager,
+        tile_layout: &TileLayout,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         font_points: &mut f64,
         zoom_changed: &mut bool,
@@ -1750,6 +1765,11 @@ mod macos_app {
         match action {
             PaletteAction::NewTab => {
                 let (_, new_pid) = wm.new_tab();
+                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::NewTiledPane => {
+                let new_pid = wm.split_focused(auto_split_axis(tile_layout));
                 panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
                 *pty_sizes_dirty = true;
             }
@@ -2514,6 +2534,7 @@ mod macos_app {
                                         run_palette_action(
                                             act,
                                             &mut wm,
+                                            &tile_layout,
                                             &mut panes,
                                             &mut font_points,
                                             &mut zoom_changed,
@@ -2557,13 +2578,24 @@ mod macos_app {
                             }
 
                             if flags.contains(NSEventModifierFlags::Command) {
-                                // 1. `Cmd+N`: new native macOS window inheriting focused pane's cwd.
+                                // 1. `Cmd+N`: auto-tile a new pane internally along the focused pane's
+                                //    longer axis (BSP spiral); `Cmd+Shift+N` spawns a separate OS window.
                                 if key == Key::KeyN && !ctrl && !alt {
                                     let cwd = panes
                                         .get(&wm.focused_pane())
                                         .map(|p| p.cwd().to_owned())
                                         .unwrap_or_else(|| "/".to_owned());
-                                    spawn_new_window(&cwd);
+                                    if shift {
+                                        spawn_new_window(&cwd);
+                                    } else {
+                                        let new_pid = wm.split_focused(auto_split_axis(&tile_layout));
+                                        panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                        active_popover = None;
+                                        output_selection = None;
+                                        output_nav = None;
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                    }
                                     continue;
                                 }
                                 // 2. `Cmd+T`: new workspace tab inheriting focused pane's cwd.
@@ -3647,6 +3679,7 @@ mod macos_app {
                                     run_palette_action(
                                         act,
                                         &mut wm,
+                                        &tile_layout,
                                         &mut panes,
                                         &mut font_points,
                                         &mut zoom_changed,

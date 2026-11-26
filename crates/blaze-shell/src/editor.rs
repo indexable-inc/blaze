@@ -138,6 +138,7 @@ pub struct ReverseSearch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     NewTab,
+    NewTiledPane,
     NewWindow,
     SplitVertical,
     SplitHorizontal,
@@ -173,13 +174,14 @@ pub struct CommandPalette {
 }
 
 const PALETTE_CATALOG: &[PaletteCommand] = &[
+    PaletteCommand { title: "New Tiled Pane (Auto Split)", category: "Tiling", shortcut: "⌘N", action: PaletteAction::NewTiledPane },
     PaletteCommand { title: "Split Pane Vertically (Right)", category: "Tiling", shortcut: "⌘D", action: PaletteAction::SplitVertical },
     PaletteCommand { title: "Split Pane Horizontally (Down)", category: "Tiling", shortcut: "⌘⇧D", action: PaletteAction::SplitHorizontal },
     PaletteCommand { title: "Toggle Zoom Focused Pane", category: "Tiling", shortcut: "⌘⇧↵", action: PaletteAction::ToggleZoom },
     PaletteCommand { title: "Equalize Split Ratios", category: "Tiling", shortcut: "⌘⌃=", action: PaletteAction::EqualizeSplits },
     PaletteCommand { title: "Close Focused Pane / Tab", category: "Tiling", shortcut: "⌘W", action: PaletteAction::ClosePane },
     PaletteCommand { title: "New Workspace Tab", category: "Workspace", shortcut: "⌘T", action: PaletteAction::NewTab },
-    PaletteCommand { title: "New Window (Inherit Directory)", category: "Window", shortcut: "⌘N", action: PaletteAction::NewWindow },
+    PaletteCommand { title: "New OS Window (Separate)", category: "Window", shortcut: "⌘⇧N", action: PaletteAction::NewWindow },
     PaletteCommand { title: "Fork Session Branch (O(1) CoW)", category: "Session", shortcut: "⌘B", action: PaletteAction::ForkBranch },
     PaletteCommand { title: "Open File Browser (y)", category: "Tools", shortcut: "y", action: PaletteAction::OpenYazi },
     PaletteCommand { title: "Open Agent Fleet Hub", category: "Tools", shortcut: "agent", action: PaletteAction::OpenAgentHub },

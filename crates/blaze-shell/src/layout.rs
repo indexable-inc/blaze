@@ -482,8 +482,8 @@ pub fn layout_window_top_bar(
         &mut rx,
         Icon::NewWindow,
         HitAction::NewWindow,
-        "New window",
-        "Cmd+N · inherit cwd",
+        "New OS window",
+        "Cmd+Shift+N · separate window",
     );
     push_icon_btn(
         scene,
