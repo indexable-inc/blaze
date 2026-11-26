@@ -173,12 +173,25 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 return Ok(Ok(PathRes { def, consumed: 1 }));
             }
         }
+        let mut shadowed_ty_param = None;
         if via_use.is_none()
             && via_glob.is_none()
             && local_type.is_none()
             && let Some(&(_, i)) = self.params.iter().find(|(n, _)| *n == segments[0])
         {
-            return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
+            // Type parameters live only in the type namespace, while const parameters live in the
+            // value namespace (the Reference, "Namespaces"). For a single-segment value path
+            // (`Err(x)` inside `fn f<Err>()`), a type parameter must not shadow value-namespace
+            // items like prelude `Result::Err`; only fall back to `Def::TyParam(i)` if module
+            // lookup finds nothing, so `let _ = T;` still reports E0423 (`NotAValue`).
+            let is_type_only_in_value = written.len() == 1
+                && ns == Ns::Value
+                && self.const_params_once(self.owner)?.type_of(i).is_none();
+            if is_type_only_in_value {
+                shadowed_ty_param = Some(i);
+            } else {
+                return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
+            }
         }
         // A local `use`'s binding stands for its path: `max` of `use core::cmp::max` is
         // `core::cmp::max`, the rest of the written path after it.
@@ -255,6 +268,9 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // under its block's module (a later segment it cannot read): never "the program
             // names nothing" for a name that is declared.
             Err(ResolveError::Path(e)) => {
+                if let Some(i) = shadowed_ty_param {
+                    return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
+                }
                 // rustc_resolve late.rs `resolve_qpath`: a path of two or more segments that
                 // fails, whose first segment is a builtin type's name, is that builtin type
                 // with the rest unresolved ("The same fallback is used when `a` resolves to
