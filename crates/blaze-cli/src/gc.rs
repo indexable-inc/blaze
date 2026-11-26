@@ -15,7 +15,7 @@
 
 use core::fmt;
 
-use blaze_cas::plain::{DEFAULT_MAX_STORE_BYTES, ExclusiveLock, Liveness, MIN_MAX_STORE_BYTES, Settings, Sliced};
+use blaze_cas::plain::{DEFAULT_MAX_STORE_BYTES, ExclusiveLock, Liveness, MIN_MAX_STORE_BYTES, NoPidCheck, OsPidCheck, PidCheck, Settings, Sliced};
 use blaze_core::FileName;
 use blaze_keyed::store::StoreError;
 use bstd::args::Args;
@@ -382,6 +382,11 @@ pub(crate) fn run_with(
         // manifest in-place and maps only delta segments from the concurrent writer so all
         // existing segment `mmap`s and `ReachCache` survive across conflict retries.
         let lent = home.open_store_with_liveness(&settings, facts, Liveness::Reached, heap.alloc())?;
+        if !cx.is_simulated() {
+            lent.set_pid(host.pid());
+        }
+        let pid_check: &dyn PidCheck = if cx.is_simulated() { &NoPidCheck } else { &OsPidCheck };
+        let _reclaimed = lent.reclaim_dead_leases(pid_check);
         summary.bytes_before = lent.total_bytes();
         for attempt in 0..=GC_CONFLICT_RETRIES_MOST {
             let ran = if opts.background {
@@ -404,7 +409,8 @@ pub(crate) fn run_with(
             }
             if aborted && remaining_slices > 0 && attempt < GC_CONFLICT_RETRIES_MOST {
                 // `Plain` already adopted the newer manifest and mapped delta segments in-place;
-                // retry compaction directly on `lent` without dropping or reopening the store.
+                // re-probe any newly discovered same-boot leases and retry compaction directly.
+                let _ = lent.reclaim_dead_leases(pid_check);
                 continue;
             }
             break;
@@ -542,6 +548,8 @@ fn run_dry(
 
     if store_exists {
         let lent = home.open_store_with_liveness(settings, facts, Liveness::Reached, heap.alloc())?;
+        let pid_check: &dyn PidCheck = if cx.is_simulated() { &NoPidCheck } else { &OsPidCheck };
+        let _reclaimed = lent.reclaim_dead_leases(pid_check);
         let plan = lent.plan_gc().map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
         summary.bytes_before = plan.total_bytes;
         summary.bytes_after = plan.total_bytes.saturating_sub(plan.reclaimable_bytes);

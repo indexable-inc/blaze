@@ -54,6 +54,9 @@ use crate::CliError;
 pub(crate) mod plain_place;
 pub use plain_place::{Facts, Held, PlaceError, PlainPlace, StoreAlloc};
 
+/// Selective fast `zstd` (`BZR1`) envelope for large decoded-on-read CAS records.
+pub(crate) mod record_codec;
+
 /// What keeps a record after its command: one typed root per lifetime class.
 pub(crate) mod roots;
 
@@ -858,6 +861,9 @@ pub fn open_for_command(
     // developer's only its own. Budget defaults to 32 GiB unless overridden via env.
     let settings = Settings { max_store_bytes, trusted_writer: TRUSTED_BUILDER, ..Settings::default() };
     let lent = home.open_store(&settings, Facts { boot, nonce }, heap.alloc())?;
+    if !cx.is_simulated() {
+        lent.set_pid(host.pid());
+    }
     let open_ns = ns(clock).saturating_sub(began);
     old_home(cx, &home, checkout_root, checkout, &lent, err)?;
     // Stores of other forms beside this blaze's (D160): said once, never read.

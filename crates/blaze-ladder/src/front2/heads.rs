@@ -1031,12 +1031,12 @@ fn discriminants<'a, 'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut
     Ok(out)
 }
 
-/// Copies `src` into an exact-sized `Global` vector (zero allocation when empty).
-fn exact_global<T: Clone>(src: &[T]) -> Vec<T, Global> {
+/// Copies `src` into an exact-sized vector in `alloc` (zero allocation when empty).
+fn exact_in<T: Copy>(src: &[T], alloc: Alloc<'static>) -> blaze_own::Vec<T, Alloc<'static>> {
     if src.is_empty() {
-        return Vec::new_in(Global);
+        return blaze_own::Vec::new_in(alloc);
     }
-    let mut out = Vec::with_capacity_in(src.len(), Global);
+    let mut out = blaze_own::Vec::with_capacity_in(src.len(), alloc);
     out.extend_from_slice(src);
     out
 }
@@ -1159,21 +1159,21 @@ pub struct FnHead<'n> {
     /// `#[rustc_legacy_const_generics(i, ..)]`'s positions, as written: the call argument at
     /// each is the next own const generic argument (blaze-typeck rules/legacy_const.rs). Empty
     /// for every other fn.
-    pub legacy_const_generics: Vec<u32, Global>,
-    pub inputs: Vec<PTy, Global>,
+    pub legacy_const_generics: blaze_own::Vec<u32, Alloc<'static>>,
+    pub inputs: blaze_own::Vec<PTy, Alloc<'static>>,
     pub output: PTy,
     pub has_body: bool,
     /// The names its body's types are read with, as its signature was: the module, every
     /// generic parameter in scope (the container's first, then its own), `Self` and the
     /// container's associated types. One home: a body is lowered in the env its head was.
     pub module: LibKey,
-    pub params: Vec<(Name, u32), Global>,
+    pub params: blaze_own::Vec<(Name, u32), Alloc<'static>>,
     /// Which of those are const parameters, with their types ([`Env::consts`]).
-    pub consts: Vec<(u32, PTy), Global>,
+    pub consts: blaze_own::Vec<(u32, PTy), Alloc<'static>>,
     /// The trait bounds on those parameters (the container's, then its own).
-    pub bounds: Vec<ParamBound, Global>,
+    pub bounds: blaze_own::Vec<ParamBound, Alloc<'static>>,
     pub self_: SelfTy,
-    pub self_assoc: Vec<(Name, PTy), Global>,
+    pub self_assoc: blaze_own::Vec<(Name, PTy), Alloc<'static>>,
 }
 
 /// The environment in which a free item body is lowered. A local item's body belongs to
@@ -3493,7 +3493,7 @@ impl<'n> Store<'n> {
                 }
             }
             preds_table.insert(cond_key, cp);
-            let mut row = FnHead {
+            let row = FnHead {
                 lib,
                 text,
                 text_prefix: None,
@@ -3506,21 +3506,17 @@ impl<'n> Store<'n> {
                 header: tc::FnPtrHeader::RUST,
                 c_variadic: false,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(text),
-                legacy_const_generics: Default::default(),
-                inputs: Default::default(),
+                legacy_const_generics: blaze_own::Vec::new_in(alloc),
+                inputs: blaze_own::Vec::new_in(alloc),
                 output: bool_ty,
                 has_body: true,
                 module,
-                params: Default::default(),
-                consts: Default::default(),
-                bounds: Default::default(),
+                params: exact_in(env.params, alloc),
+                consts: exact_in(env.consts, alloc),
+                bounds: exact_in(bounds, alloc),
                 self_: env.self_,
-                self_assoc: Default::default(),
+                self_assoc: exact_in(env.self_assoc, alloc),
             };
-            row.params.extend_from_slice(env.params);
-            row.consts.extend_from_slice(env.consts);
-            row.bounds.extend_from_slice(bounds);
-            row.self_assoc.extend_from_slice(env.self_assoc);
             fns.insert(cond_key, row);
         }
         Ok(())
@@ -3641,7 +3637,7 @@ impl<'n> Store<'n> {
                 }
             }
             self.preds.insert(cond_key, cp);
-            let mut row = FnHead {
+            let row = FnHead {
                 lib,
                 text: decl,
                 text_prefix: None,
@@ -3654,21 +3650,17 @@ impl<'n> Store<'n> {
                 header: tc::FnPtrHeader::RUST,
                 c_variadic: false,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(decl),
-                legacy_const_generics: Default::default(),
-                inputs: Default::default(),
+                legacy_const_generics: blaze_own::Vec::new_in(alloc),
+                inputs: blaze_own::Vec::new_in(alloc),
                 output: bool_ty,
                 has_body: true,
                 module,
-                params: Default::default(),
-                consts: Default::default(),
-                bounds: Default::default(),
+                params: exact_in(&own_params, alloc),
+                consts: exact_in(&own_consts, alloc),
+                bounds: exact_in(&own_bounds, alloc),
                 self_,
-                self_assoc: Default::default(),
+                self_assoc: exact_in(&own_assoc, alloc),
             };
-            row.params.extend_from_slice(&own_params);
-            row.consts.extend_from_slice(&own_consts);
-            row.bounds.extend_from_slice(&own_bounds);
-            row.self_assoc.extend_from_slice(&own_assoc);
             self.fns.insert(cond_key, row);
         }
         Ok(self.fns.contains_key(&cond))
@@ -5348,21 +5340,15 @@ impl<'n> Store<'n> {
                             }
                         };
                         self.fn_gaps.remove(&mk);
-                        let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
-                        own_bounds.extend_from_slice(&bounds);
+                        let head_alloc = self.tys.alloc();
                         self.preds.insert(mk, cp);
                         let header = tc::FnPtrHeader::RUST;
                         let has_body = mv.head.get(head::FLAGS).copied().unwrap_or(0) & sig::HAS_BODY != 0;
-                        let head_alloc = *own_bounds.allocator();
-                        let mut head_params = Vec::with_capacity_in(ps.len(), head_alloc);
-                        head_params.extend_from_slice(&ps);
-                        let mut head_consts = Vec::with_capacity_in(cs.len(), head_alloc);
-                        head_consts.extend_from_slice(&cs);
                         let row = FnHead {
                             qualifiers: FnQualifiers::of(mv)?,
                             lib: key, text: m.text, text_prefix: None, text_inline: false, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false,
-                            header, c_variadic: false, legacy_const_generics: Vec::new_in(head_alloc), inputs: Vec::new_in(head_alloc), output, has_body,
-                            module, params: head_params, consts: head_consts, bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(head_alloc),
+                            header, c_variadic: false, legacy_const_generics: blaze_own::Vec::new_in(head_alloc), inputs: blaze_own::Vec::new_in(head_alloc), output, has_body,
+                            module, params: exact_in(&ps, head_alloc), consts: exact_in(&cs, head_alloc), bounds: exact_in(&bounds, head_alloc), self_: env.self_, self_assoc: blaze_own::Vec::new_in(head_alloc),
                         };
                         self.fns.insert(mk, row);
                     }
@@ -5579,13 +5565,7 @@ impl<'n> Store<'n> {
             let mut dp = Preds::new_in(scope.clone_in(alloc));
             dp.inherit(&preds.clauses);
             self.preds.insert(dk, dp);
-            let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
-            own_bounds.extend_from_slice(&bounds);
-            let head_alloc = *own_bounds.allocator();
-            let mut head_params = Vec::with_capacity_in(ps.len(), head_alloc);
-            head_params.extend_from_slice(&ps);
-            let mut head_consts = Vec::with_capacity_in(cs.len(), head_alloc);
-            head_consts.extend_from_slice(&cs);
+            let head_alloc = self.tys.alloc();
             let row = FnHead {
                 lib: key,
                 text,
@@ -5599,16 +5579,16 @@ impl<'n> Store<'n> {
                 self_param: false,
                 header: tc::FnPtrHeader::RUST,
                 c_variadic: false,
-                legacy_const_generics: Vec::new_in(head_alloc),
-                inputs: Vec::new_in(head_alloc),
+                legacy_const_generics: blaze_own::Vec::new_in(head_alloc),
+                inputs: blaze_own::Vec::new_in(head_alloc),
                 output,
                 has_body: true,
                 module,
-                params: head_params,
-                consts: head_consts,
-                bounds: own_bounds,
+                params: exact_in(&ps, head_alloc),
+                consts: exact_in(&cs, head_alloc),
+                bounds: exact_in(&bounds, head_alloc),
                 self_: SelfTy::Ty(self_ty, None),
-                self_assoc: Vec::new_in(head_alloc),
+                self_assoc: blaze_own::Vec::new_in(head_alloc),
             };
             self.fns.insert(dk, row);
         }
@@ -6093,22 +6073,15 @@ impl<'n> Store<'n> {
             let ra = self.tys.alloc();
             let (output, filed) = const_regions(&cb, &mut self.tys, env, cv, lf::TypeId(t), (self.container_regions.get(&ck).ok_or(ck), member_scope, self.regions.made(ck).map(super::head_record::FiledRegions::arity)), (&cp, self.regions.made(ck).map(super::head_record::FiledRegions::regions)), ra)?;
             file_regions(self, mk, filed);
-            let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
-            own_bounds.extend_from_slice(bounds);
-            let mut self_assoc = Vec::with_capacity_in(env.self_assoc.len(), Global);
-            self_assoc.extend_from_slice(env.self_assoc);
-            let mut params = Vec::with_capacity_in(env.params.len(), Global);
-            params.extend_from_slice(env.params);
-            let mut consts = Vec::with_capacity_in(env.consts.len(), Global);
-            consts.extend_from_slice(env.consts);
+            let head_alloc = self.tys.alloc();
             let header = tc::FnPtrHeader::RUST;
             self.preds.insert(mk, cp);
             let has_body = cv.head.get(head::FLAGS).copied().unwrap_or(0) & sig::HAS_BODY != 0;
             let row = FnHead {
                 qualifiers: FnQualifiers::of(cv)?,
                 lib: key, text, text_prefix: None, text_inline: false, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false,
-                header, c_variadic: false, legacy_const_generics: Vec::new_in(Global), inputs: Vec::new_in(Global), output, has_body,
-                module: env.module, params, consts, bounds: own_bounds, self_: env.self_, self_assoc,
+                header, c_variadic: false, legacy_const_generics: blaze_own::Vec::new_in(head_alloc), inputs: blaze_own::Vec::new_in(head_alloc), output, has_body,
+                module: env.module, params: exact_in(env.params, head_alloc), consts: exact_in(env.consts, head_alloc), bounds: exact_in(bounds, head_alloc), self_: env.self_, self_assoc: exact_in(env.self_assoc, head_alloc),
             };
             self.fns.insert(mk, row);
             Ok(())
@@ -6372,6 +6345,7 @@ impl<'n> Store<'n> {
                 let text: &'n str = self.locals.keep_text(&src);
                 let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
                 self.preds.insert(dk, Preds::new_in(scope));
+                let head_alloc = self.tys.alloc();
                 let row = FnHead {
                     lib,
                     text,
@@ -6385,16 +6359,16 @@ impl<'n> Store<'n> {
                     self_param: false,
                     header: tc::FnPtrHeader::RUST,
                     c_variadic: false,
-                    legacy_const_generics: Default::default(),
-                    inputs: Default::default(),
+                    legacy_const_generics: blaze_own::Vec::new_in(head_alloc),
+                    inputs: blaze_own::Vec::new_in(head_alloc),
                     output: ty,
                     has_body: true,
                     module: env.module,
-                    params: Default::default(),
-                    consts: Default::default(),
-                    bounds: Default::default(),
+                    params: blaze_own::Vec::new_in(head_alloc),
+                    consts: blaze_own::Vec::new_in(head_alloc),
+                    bounds: blaze_own::Vec::new_in(head_alloc),
                     self_: SelfTy::None,
-                    self_assoc: Default::default(),
+                    self_assoc: blaze_own::Vec::new_in(head_alloc),
                 };
                 self.fns.insert(dk, row);
                 defaults.push(Some(dk));
@@ -6485,7 +6459,7 @@ impl<'n> Store<'n> {
         let Bounds::Done(outer_bounds) = outer.bounds else {
             return Err(Why::Program("a fn's container's bounds were not lowered before the fn".into(), Range::new(0, 0)));
         };
-        let mut bounds = exact_global(outer_bounds);
+        let mut bounds = exact_in(outer_bounds, alloc);
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         // The return type's builder: an expanded return type is a text of its own, read at the
         // fn's module; the item's marks are not its tokens'.
@@ -6508,7 +6482,19 @@ impl<'n> Store<'n> {
         // bodiless fn's such bound stays its head's error.
         let says_misses = flags & sig::HAS_BODY != 0;
         let mut bound_misses = blaze_own::Vec::new_in(self.tys.alloc());
-        b.param_bounds_kept(&mut self.tys, &env, v, parent, &mut bounds, if says_misses { Some(&mut bound_misses) } else { None })?;
+        let has_own_bounds = !v.rows(v.list(head::GENERICS))?.is_empty() || !v.rows(v.list(head::WHERE))?.is_empty();
+        if has_own_bounds {
+            if says_misses {
+                let mut tmp_bounds = Vec::with_capacity_in(outer_bounds.len(), Global);
+                tmp_bounds.extend_from_slice(outer_bounds);
+                b.param_bounds_kept(&mut self.tys, &env, v, parent, &mut tmp_bounds, Some(&mut bound_misses))?;
+                if let Some(added) = tmp_bounds.get(outer_bounds.len()..) {
+                    bounds.extend_from_slice(added);
+                }
+            } else {
+                b.param_bounds_in(&mut self.tys, &env, v, parent, &mut bounds)?;
+            }
+        }
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
         // The return type's env: its opaques by their ids in `rv`; the parameters' `impl`s are
         // not in it (none is written in a return type).
@@ -7002,16 +6988,16 @@ impl<'n> Store<'n> {
                 header,
                 c_variadic,
                 qualifiers,
-                legacy_const_generics: exact_global(&legacy_const_generics),
-                inputs: exact_global(&inputs),
+                legacy_const_generics,
+                inputs,
                 output,
                 has_body,
                 module,
-                params: exact_global(&ps),
-                consts: exact_global(&cs),
+                params: ps,
+                consts: cs,
                 bounds,
                 self_,
-                self_assoc: exact_global(self_assoc_slice),
+                self_assoc: exact_in(self_assoc_slice, alloc),
             },
         );
         Ok(())

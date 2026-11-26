@@ -22,6 +22,7 @@
 //! | [`CloneIn`], [`Share`], [`DefaultIn`], [`FromIn`], [`IntoIn`], [`FromStrIn`] | std's `Clone`, `Default`, `From`, `Into` and `FromStr` with the allocator named; `Share` the copy that is another handle ([`make`]) |
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
+//! | [`Csr`] | a zero-unsafe Compressed Sparse Row container: flat `offsets: Vec<u32, A>` (`[0, ..]`) + `values: Vec<T, A>` |
 //! | [`String`], [`format_in!`], [`format_into!`] | UTF-8 text over [`Vec<u8, A>`](Vec); `blaze_mem` re-exports it, keeping only `OsString` and `PathBuf` |
 //! | [`FixedVec`] | up to `N` values inline, no allocator; a push past `N` is refused with [`Full`], the value handed back |
 //! | [`Packed`], [`Pack`] | values of different sizes end to end in one byte buffer, each its own size; iterated, not indexed, with an optional checkpoint every `K` values for seeking |
@@ -113,6 +114,7 @@ pub mod boxed;
 pub mod btree;
 pub mod byte_cursor;
 pub mod cow;
+pub mod csr;
 pub mod deque;
 mod error;
 pub mod fixed;
@@ -175,6 +177,7 @@ pub use lz77::{
     lz77_preload_default, lz77_preload_fast, lz77_scan_default, lz77_scan_fast,
 };
 pub use cow::{Cow, ToOwnedIn};
+pub use csr::Csr;
 pub use deque::VecDeque;
 pub use error::AllocFailure;
 pub use fixed::{FixedString, FixedVec, Full, Inline, Overflow};

@@ -10,9 +10,10 @@ use bstd::clock::{Clock, Instant};
 
 pub(crate) mod byte_rows;
 
-/// The most phases one command marks: tempo's edit marked 16 when the open checkout was one
-/// phase (2026-11-20, score-c1725wave42), and its parts are four more (engine_check.rs `edge`).
-const MOST: usize = 24;
+/// The most phases one command marks: `blaze test` and `blaze run` mark ~20 check phases plus
+/// SDK resolution and start phases (`body_ids`, `test_prepare`, `test_open_suites`, `test_run`,
+/// `program_run`); 64 leaves ample headroom so no phase is ever merged into the last row.
+const MOST: usize = 64;
 
 pub struct Phases {
     clock: Clock,
@@ -658,5 +659,27 @@ mod tests {
         p.worked_used("bodies", &spread);
         assert_eq!(p.beside_len, 1);
         assert_eq!(p.beside[0].1.n, 1);
+    }
+
+    #[test]
+    fn start_phases_past_twenty_four_are_recorded_individually() {
+        let io = Io::simulated(SimWorld::new(9, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("the simulated context");
+        let frame = cx.frame();
+        let mut phases = Phases::new(io.need_clock().expect("clock"));
+        for _ in 0..23 {
+            phases.mark_cx(&cx, "check_phase", frame);
+        }
+        phases.mark_cx(&cx, "test_open_suites", frame);
+        phases.mark_cx(&cx, "test_run", frame);
+        phases.mark_cx(&cx, "program_run", frame);
+        assert_eq!(phases.len, 26);
+        assert_eq!(phases.rows[23].0, "test_open_suites");
+        assert_eq!(phases.rows[24].0, "test_run");
+        assert_eq!(phases.rows[25].0, "program_run");
+        let profile = std::format!("{phases}");
+        assert!(profile.contains("phase used   test_open_suites:"), "{profile}");
+        assert!(profile.contains("phase used   test_run:"), "{profile}");
+        assert!(profile.contains("phase used   program_run:"), "{profile}");
     }
 }

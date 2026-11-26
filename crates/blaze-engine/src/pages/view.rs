@@ -583,7 +583,7 @@ impl<'b> VerifiedPage<'b> {
         }
     }
 
-    pub(super) fn restore<'r>(&self, kept: &mut Kept<'r>, alloc: SharedAlloc<'r>) {
+    pub(super) fn restore<'r>(&self, kept: &mut Kept<'r>, reader_pairs: &mut SVec<'r, (CellId, Name)>, alloc: SharedAlloc<'r>) {
         for n in self.row_names() {
             if let Some(row) = self.row(n) {
                 let owned = row.to_owned(alloc);
@@ -631,9 +631,7 @@ impl<'b> VerifiedPage<'b> {
         for b in self.entries(READERS) {
             let id = self.dicts.cell_id(word(b));
             let tail = b.get(8..).unwrap_or(&[]);
-            let mut readers = BTreeSet::new_in(alloc);
-            readers.extend(StoredNames { chunks: tail.chunks_exact(IDX), dicts: self.dicts });
-            kept.answer.readers.insert(id, readers);
+            reader_pairs.extend(StoredNames { chunks: tail.chunks_exact(IDX), dicts: self.dicts }.map(|reader| (id, reader)));
         }
     }
 

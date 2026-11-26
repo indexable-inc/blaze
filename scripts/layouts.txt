@@ -33,7 +33,7 @@ crates/blaze-cas/src/plain/bloom.rs	MAGIC	test previous_bloom_version_is_ignored
 crates/blaze-cas/src/plain/bloom.rs	VERSION	test previous_bloom_version_is_ignored
 crates/blaze-cas/src/plain/bottom.rs	MAGIC	none
 crates/blaze-cas/src/plain/format.rs	FOOTER_MAGIC	none
-crates/blaze-cas/src/plain/format.rs	FORMAT	none
+crates/blaze-cas/src/plain/format.rs	FORMAT	test a_previous_layout_is_refused_by_name
 crates/blaze-cas/src/plain/format.rs	HEAD_MAGIC	none
 crates/blaze-cas/src/plain/format.rs	MANIFEST_MAGIC	none
 crates/blaze-cas/src/plain/format.rs	SEGMENT_FORMAT	none
@@ -73,6 +73,8 @@ crates/blaze-cli/src/seal.rs	SEAL_MAGIC	none
 crates/blaze-cli/src/start_list.rs	MAGIC	none
 crates/blaze-cli/src/start_list.rs	VERSION	none
 crates/blaze-cli/src/store/published.rs	FLOOR_MAGIC	none
+crates/blaze-cli/src/store/record_codec.rs	MAGIC	test previous_bzr1_layout_is_refused_by_name
+crates/blaze-cli/src/store/record_codec.rs	VERSION	test previous_bzr1_layout_is_refused_by_name
 crates/blaze-cli/src/sweep.rs	LEAVES_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	STATE_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	STATE_VERSION	test decode_state_refuses_previous_v2_layout

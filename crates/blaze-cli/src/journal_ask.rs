@@ -262,11 +262,13 @@ fn paired_place(stored: Stored<'_>) -> Option<Place> {
     checkout.then(|| stored.helper_place()).flatten().and_then(|bytes| Place::decode(&bytes))
 }
 
-/// Maximum stored leaf-table rows for which a direct batched `getattrlistbulk` sweep (`0.2–3 ms`)
-/// is strictly faster than opening a cold `FSEventStream` (`26–160 ms` waiting on `fseventsd`
-/// `HistoryDone`) when no journal helper vouched. Above this count, a fallback journal replay
-/// beats statting every leaf.
-pub(crate) const SMALL_CHECKOUT_LEAVES: usize = 1024;
+/// Maximum stored leaf-table rows for which a direct batched `getattrlistbulk` sweep
+/// (~0.25–0.5 µs/leaf -> ~1–2 ms at 4096 leaves) is strictly faster than waiting on an
+/// `fseventsd` sync cookie (11–12 ms per warm ask, or 26–160 ms on a cold `FSEventStream`
+/// `HistoryDone`). Covers small and medium/large workspaces (`ripgrep`, `tempo`, `blaze`) with
+/// 100% soundness across renames, creates, deletes, in-place edits, and restarts; above this
+/// count, the journal helper / FSEvents replay beats statting every leaf.
+pub(crate) const SMALL_CHECKOUT_LEAVES: usize = 4096;
 
 /// Whether a fallback OS journal replay (`FSEventStream`) should be skipped in favor of a direct
 /// batched stat sweep when the journal helper did not vouch.
@@ -838,6 +840,8 @@ mod replay_policy_tests {
         assert_eq!(ReplayPolicy::Always.use_direct_sweep(), None);
         assert_eq!(ReplayPolicy::Auto { stored_leaves: None }.use_direct_sweep(), None);
         assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(0) }.use_direct_sweep(), Some(0));
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(1249) }.use_direct_sweep(), Some(1249));
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(3000) }.use_direct_sweep(), Some(3000));
         assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES) }.use_direct_sweep(), Some(SMALL_CHECKOUT_LEAVES));
         assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES + 1) }.use_direct_sweep(), None);
 

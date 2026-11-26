@@ -40,7 +40,7 @@ use super::keys::{Keys, checker_of};
 use super::linked::{Linked, RootsError};
 use super::rows::Rows;
 use super::source::NamesSource;
-use super::types::{PRIMS, children, path_texts};
+use super::types::{PRIMS, children_into, path_texts};
 use crate::resolve::{Kind, Ns, ResolveError};
 
 mod asked;
@@ -372,12 +372,12 @@ impl Unread {
 /// filed by the aliased type's constructor.
 /// `Err` where it is a builtin the checker has no type for (blaze's `i80`): no question the
 /// checker asks is at that type.
-fn written_shape<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name, u32)], v: &View<'_>, t: lf::TypeId) -> Result<Option<Shape>, NoCheckerType> {
+fn written_shape<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name, u32)], v: &View<'_>, t: lf::TypeId, alloc: blaze_own::Alloc<'_>) -> Result<Option<Shape>, NoCheckerType> {
     match shape_step(names, module, params, v, t) {
         None => Ok(None),
         Some(Written::Shape(s)) => Ok(Some(s)),
         Some(Written::NoCheckerType) => Err(NoCheckerType),
-        Some(Written::Alias(k)) => alias_shape(names, k),
+        Some(Written::Alias(k)) => alias_shape(names, k, alloc),
     }
 }
 
@@ -395,9 +395,9 @@ const MOST_ALIAS_HOPS: u32 = 64;
 
 /// The constructor of the type alias `alias` stands for, following aliases of aliases as a
 /// loop; `None` where the aliased type is no constructor read here (a parameter, `dyn`).
-fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey) -> Result<Option<Shape>, NoCheckerType> {
+fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey, alloc: blaze_own::Alloc<'_>) -> Result<Option<Shape>, NoCheckerType> {
     for _ in 0..MOST_ALIAS_HOPS {
-        let Some(step) = alias_step(names, alias) else { return Ok(None) };
+        let Some(step) = alias_step(names, alias, alloc) else { return Ok(None) };
         match step {
             Written::Shape(s) => return Ok(Some(s)),
             Written::NoCheckerType => return Err(NoCheckerType),
@@ -408,21 +408,21 @@ fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey) -> Result<Op
 }
 
 /// [`alias_shape`] backed by a reusable cache across rows and crates.
-fn alias_shape_cached<'n, S: NamesSource<'n>>(names: S, alias: LibKey, cache: &mut AliasShapes) -> Result<Option<Shape>, NoCheckerType> {
+fn alias_shape_cached<'n, S: NamesSource<'n>>(names: S, alias: LibKey, cache: &mut AliasShapes, alloc: blaze_own::Alloc<'_>) -> Result<Option<Shape>, NoCheckerType> {
     if let Some(&hit) = cache.get(&alias) {
         return hit;
     }
-    let got = alias_shape(names, alias);
+    let got = alias_shape(names, alias, alloc);
     cache.insert(alias, got);
     got
 }
 
 /// What the type alias `alias` stands for, one step.
-fn alias_step<'n, S: NamesSource<'n>>(names: S, alias: LibKey) -> Option<Written> {
+fn alias_step<'n, S: NamesSource<'n>>(names: S, alias: LibKey, alloc: blaze_own::Alloc<'_>) -> Option<Written> {
     let text = names.signature_text_of(alias)?.text;
     let module = names.home_of(alias)?;
     with_lowered(names, alias, text, |v| {
-        let mut params = Vec::new_in(Global);
+        let mut params = blaze_own::Vec::new_in(alloc);
         super::heads::param_names(v, 0, &mut params, super::heads::Consts::Skip).ok()?;
         let t = v.head_opt(head::TY)?;
         shape_step(names, module, &params, v, lf::TypeId(t))
@@ -440,7 +440,6 @@ enum Written {
 }
 
 fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name, u32)], v: &View<'_>, t: lf::TypeId) -> Option<Written> {
-    let mut kids = Vec::new_in(Global);
     let shape = match v.ty(t).ok()? {
         lf::TypeRef::Ref { mutbl, .. } => Some(Shape::Ref(mutbl)),
         lf::TypeRef::Ptr { mutbl, .. } => Some(Shape::Ptr(mutbl)),
@@ -448,8 +447,9 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
         lf::TypeRef::Array { .. } => Some(Shape::Array),
         lf::TypeRef::Never => Some(Shape::Never),
         lf::TypeRef::Tuple(_) => {
-            children(v, t, &mut kids).ok()?;
-            Some(Shape::Tuple(u32::try_from(kids.len()).ok()?))
+            let mut count = 0u32;
+            children_into(v, t, &mut |_| count = count.saturating_add(1)).ok()?;
+            Some(Shape::Tuple(count))
         }
         lf::TypeRef::Path(p) => {
             let (abs, texts, segs, _) = path_texts(v, p).ok()?;
@@ -460,8 +460,8 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
                 return None;
             }
             match (crate::resolve::Paths { names }).path(module, abs, &texts, Ns::Type) {
-                Ok(f) if f.consumed as usize == texts.len() && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union) => Some(Shape::Adt(checker_of(f.key))),
-                Ok(f) if f.consumed as usize == texts.len() => match f.kind {
+                Ok(f) if usize::try_from(f.consumed).ok() == Some(texts.len()) && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union) => Some(Shape::Adt(checker_of(f.key))),
+                Ok(f) if usize::try_from(f.consumed).ok() == Some(texts.len()) => match f.kind {
                     Kind::Builtin(name) => prim_shape(name),
                     Kind::TypeAlias => return Some(Written::Alias(f.key)),
                     Kind::WideInt { .. } => return Some(Written::NoCheckerType),
@@ -478,15 +478,15 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
 
 /// Files an impl by its header's text, with what bounds it when its self type is a path that
 /// was read to no constructor ([`PathSelf`]; `None` for any other impl).
-fn file<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey) -> (Filed, Option<PathSelf>) {
+fn file<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey, alloc: blaze_own::Alloc<'_>) -> (Filed, Option<PathSelf>) {
     let Some(it) = names.signature_text_of(key) else { return (Filed::Unread(Unread::NoText, None), None) };
     match with_lowered(names, key, it.text, |v| {
-        let mut params = Vec::new_in(Global);
+        let mut params = blaze_own::Vec::new_in(alloc);
         if super::heads::param_names(v, 0, &mut params, super::heads::Consts::Skip).is_err() {
             return (Filed::Unread(Unread::Generics, None), None);
         }
         let self_ty = lf::TypeId(v.head[head::SELF_TY]);
-        let Ok(self_shape) = written_shape(names, module, &params, v, self_ty) else { return (Filed::NoCheckerType, None) };
+        let Ok(self_shape) = written_shape(names, module, &params, v, self_ty, alloc) else { return (Filed::NoCheckerType, None) };
         let path_self = self_shape.is_none() && is_named_path(&params, v, self_ty);
         let Some(t) = v.head_opt(head::TRAIT) else { return (Filed::Inherent(self_shape), path_self.then_some(PathSelf::Inherent)) };
         let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(t)) else { return (Filed::Unread(Unread::TraitNotAPath, self_shape), None) };
@@ -587,11 +587,11 @@ fn default_alloc() -> blaze_own::Alloc<'static> {
     blaze_own::Alloc::global()
 }
 
-fn written_trait<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) -> (Option<&'n str>, bool) {
+fn written_trait<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>, alloc: blaze_own::Alloc<'_>) -> (Option<&'n str>, bool) {
     // A crate with no edition (over records: no items record, filed by the source) reads as a
     // header that does not read.
     let Some(edition) = names.edition_of(at.krate) else { return (None, false) };
-    let Ok(h) = blaze_file_items::impl_header(at.header, edition, default_alloc()) else { return (None, false) };
+    let Ok(h) = blaze_file_items::impl_header(at.header, edition, alloc) else { return (None, false) };
     let blanket = h.trait_.is_some() && h.params.iter().any(|p| *p == h.self_ty);
     (h.trait_, blanket)
 }
@@ -618,7 +618,7 @@ fn bare_text(trait_text: &str) -> bool {
 /// of: under that trait's "any" list when the names library resolves the path to a trait in the
 /// impl's module, else unread with why (a trait impl, so a candidate of trait questions only).
 /// Its self type's shape is not read here (`None`: a candidate at every shape of its trait).
-fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &str) -> Filed {
+fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &str, alloc: blaze_own::Alloc<'_>) -> Filed {
     let whole = trait_text.trim();
     // The path before its generic arguments (`Tr<..>`) or its parenthesized ones (`Fn(..)`).
     let head = whole.split(['<', '(']).next().unwrap_or("").trim();
@@ -626,7 +626,7 @@ fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &s
         Some(rest) => (true, rest),
         None => (false, head),
     };
-    let mut texts: Vec<&str, Global> = Vec::new_in(Global);
+    let mut texts: blaze_own::Vec<&str, blaze_own::Alloc<'_>> = blaze_own::Vec::new_in(alloc);
     for s in rest.split("::") {
         let s = s.trim();
         let ident = s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_');
@@ -638,22 +638,22 @@ fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &s
     let bare = head.len() == whole.len();
     let path: Box<str> = Box::from(head);
     match (crate::resolve::Paths { names }).path(module, abs, &texts, Ns::Type) {
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Filed::Trait(checker_of(f.key), None, bare),
-        Ok(f) => Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, None),
+        Ok(f) if f.kind == Kind::Trait && usize::try_from(f.consumed).ok() == Some(texts.len()) => Filed::Trait(checker_of(f.key), None, bare),
+        Ok(f) => Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: u32::try_from(texts.len()).unwrap_or(u32::MAX) }, None),
         Err(why) => Filed::Unread(Unread::Resolve { path, why }, None),
     }
 }
 
-/// A path as an impl row holds it (`a::b`, `::a::b`: written, without arguments): whether it
-/// is global, and its segments. `None` for a segment that is no plain identifier (`r#a`, a
-/// macro's `$crate`): such an impl is filed from its header's text, where the lowering spells
-/// the segment.
-fn row_path(path: &str) -> Option<(bool, Vec<&str, Global>)> {
+/// A path as an impl row holds it (`a::b`, `::a::b`: written, without arguments): fills `out`
+/// with its segments and returns whether it is global. `None` for a segment that is no plain
+/// identifier (`r#a`, a macro's `$crate`): such an impl is filed from its header's text, where
+/// the lowering spells the segment.
+fn row_path_into<'p, A: core::alloc::Allocator>(path: &'p str, out: &mut blaze_own::Vec<&'p str, A>) -> Option<bool> {
+    out.clear();
     let (abs, rest) = match path.strip_prefix("::") {
         Some(rest) => (true, rest),
         None => (false, path),
     };
-    let mut texts: Vec<&str, Global> = Vec::new_in(Global);
     for s in rest.split("::") {
         // An expansion's text writes a path's tokens apart (`:: core :: clone :: Clone`, a
         // derive's impl): the row keeps the path as written.
@@ -662,9 +662,9 @@ fn row_path(path: &str) -> Option<(bool, Vec<&str, Global>)> {
         if !ident {
             return None;
         }
-        texts.push(s);
+        out.push(s);
     }
-    Some((abs, texts))
+    Some(abs)
 }
 
 /// What a self type's head path names, as [`file_row`] keeps it per (module, path).
@@ -683,15 +683,17 @@ enum SelfAt {
 /// (the rows are sorted by trait path, then module, so each run of equal (trait path, module)
 /// is resolved once) and each self path met, by the module it is written in. One per crate
 /// filed; dropped when its rows are.
-struct RowNames<'n, 'a> {
+struct RowNames<'n, 'm, 'a> {
     /// The run's trait path, its module, the crate the path's root names (token-mark-2 R2: two
     /// rows of one text and module may name two crates' `crate`), and the trait it names
     /// (`None`: not a trait as written: each impl of the run is filed from its header's text,
     /// which says why). `selves` is keyed by the self path's root the same way.
     /// The trait is kept with the crate it is defined in ([`PathSelf::Trait`]).
     run: Option<(&'n str, LibKey, Option<blaze_id::CrateItemKey>, Result<(ItemKey, Option<usize>), RowMiss>)>,
-    selves: HashMap<(LibKey, &'n str, Option<blaze_id::CrateItemKey>), SelfAt, Global>,
-    aliases: Option<&'a mut AliasShapes>,
+    selves: HashMap<(LibKey, &'n str, Option<blaze_id::CrateItemKey>), SelfAt, blaze_own::Alloc<'a>>,
+    path_buf: blaze_own::Vec<&'n str, blaze_own::Alloc<'a>>,
+    aliases: Option<&'m mut AliasShapes>,
+    alloc: blaze_own::Alloc<'a>,
 }
 
 /// Files an impl by its ROW of the items record ([`ImplRow`]: its trait's path and its self
@@ -715,7 +717,7 @@ struct RowNames<'n, 'a> {
 ///
 /// The third answer is what bounds an impl whose self path was read to no constructor
 /// ([`PathSelf`], as `file` gives it).
-fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_>) -> Result<(Filed, bool, Option<PathSelf>), RowMiss> {
+fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_, '_>) -> Result<(Filed, bool, Option<PathSelf>), RowMiss> {
     if row.header_unread {
         return Err(RowMiss::HeaderUnread);
     }
@@ -732,10 +734,13 @@ fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowN
     let trait_ = match kept.run {
         Some((path, module, root, trait_)) if path == trait_path && module == row.module && root == row.trait_root => trait_,
         _ => {
-            let trait_ = row_path(trait_path).ok_or(RowMiss::TraitPath).and_then(|(abs, texts)| match paths.path_with(row.module, row.trait_root, abs, &texts, Ns::Type) {
-                Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Ok((checker_of(f.key), names.crate_of(f.key))),
-                Ok(_) | Err(_) => Err(RowMiss::NoTrait),
-            });
+            let trait_ = match row_path_into(trait_path, &mut kept.path_buf) {
+                None => Err(RowMiss::TraitPath),
+                Some(abs) => match paths.path_with(row.module, row.trait_root, abs, &kept.path_buf, Ns::Type) {
+                    Ok(f) if f.kind == Kind::Trait && usize::try_from(f.consumed).ok() == Some(kept.path_buf.len()) => Ok((checker_of(f.key), names.crate_of(f.key))),
+                    Ok(_) | Err(_) => Err(RowMiss::NoTrait),
+                },
+            };
             kept.run = Some((trait_path, row.module, row.trait_root, trait_));
             trait_
         }
@@ -762,7 +767,7 @@ enum RowSelf {
 /// `Err` where the row does not name it ([`SelfHead::Other`], a path segment that is no plain
 /// identifier). [`file_row`]'s first step, and what files an impl whose text did not read by
 /// the head its row read ([`textless`]).
-fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_>) -> Result<RowSelf, RowMiss> {
+fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_, '_>) -> Result<RowSelf, RowMiss> {
     let paths = crate::resolve::Paths { names };
     let mut path_self = false;
     let shape = match row.head {
@@ -783,16 +788,16 @@ fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowN
                 Some(at) => at,
                 None => {
                     // The arms of `shape_step`'s path case, over the row's path.
-                    let at = match row_path(written) {
+                    let at = match row_path_into(written, &mut kept.path_buf) {
                         None => SelfAt::Text,
-                        Some((abs, texts)) => match paths.path_with(row.module, row.self_root, abs, &texts, Ns::Type) {
-                            Ok(f) if f.consumed as usize == texts.len() => match f.kind {
+                        Some(abs) => match paths.path_with(row.module, row.self_root, abs, &kept.path_buf, Ns::Type) {
+                            Ok(f) if usize::try_from(f.consumed).ok() == Some(kept.path_buf.len()) => match f.kind {
                                 Kind::Struct | Kind::Enum | Kind::Union => SelfAt::Shape(Some(Shape::Adt(checker_of(f.key)))),
                                 Kind::Builtin(name) => SelfAt::Shape(prim_shape(name)),
                                 Kind::TypeAlias => {
                                     let resolved = match kept.aliases.as_deref_mut() {
-                                        Some(cache) => alias_shape_cached(names, f.key, cache),
-                                        None => alias_shape(names, f.key),
+                                        Some(cache) => alias_shape_cached(names, f.key, cache, kept.alloc),
+                                        None => alias_shape(names, f.key, kept.alloc),
                                     };
                                     match resolved {
                                         Ok(Some(shape)) => SelfAt::Shape(Some(shape)),
@@ -844,6 +849,19 @@ pub enum RowMiss {
     NoTrait = 5,
 }
 
+impl RowMiss {
+    const fn index(self) -> usize {
+        match self {
+            RowMiss::HeaderUnread => 0,
+            RowMiss::TraitUnread => 1,
+            RowMiss::SelfOther => 2,
+            RowMiss::SelfPath => 3,
+            RowMiss::TraitPath => 4,
+            RowMiss::NoTrait => 5,
+        }
+    }
+}
+
 /// The classes of [`RowMiss`], in the order of [`Buckets::row_misses`].
 pub const ROW_MISSES: [&str; 6] = ["header unread", "trait unread", "self type other", "self path not plain", "trait path not plain", "trait not resolved"];
 
@@ -881,7 +899,7 @@ pub struct FileCounts {
 /// `file_row` resolves each run of equal (trait path, module) once, and the impls read from
 /// text are filed by key. Every impl of `rows` is handed over exactly once.
 pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], each: &mut dyn FnMut(Filing)) -> FileCounts {
-    file_rows_with_aliases(names, krate, rows, None, each)
+    file_rows_in(names, krate, rows, None, default_alloc(), each)
 }
 
 fn file_rows_with_aliases<'n, S: NamesSource<'n>>(
@@ -891,9 +909,27 @@ fn file_rows_with_aliases<'n, S: NamesSource<'n>>(
     aliases: Option<&mut AliasShapes>,
     each: &mut dyn FnMut(Filing),
 ) -> FileCounts {
+    let alloc = aliases.as_ref().map_or_else(default_alloc, |cache| *cache.allocator());
+    file_rows_in(names, krate, rows, aliases, alloc, each)
+}
+
+fn file_rows_in<'n, S: NamesSource<'n>>(
+    names: S,
+    krate: usize,
+    rows: &[ImplRow<'n>],
+    aliases: Option<&mut AliasShapes>,
+    alloc: blaze_own::Alloc<'_>,
+    each: &mut dyn FnMut(Filing),
+) -> FileCounts {
     let mut counts = FileCounts::default();
-    let mut kept = RowNames { run: None, selves: HashMap::new_in(Global), aliases };
-    let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
+    let mut kept = RowNames {
+        run: None,
+        selves: HashMap::new_in(alloc),
+        path_buf: blaze_own::Vec::new_in(alloc),
+        aliases,
+        alloc,
+    };
+    let mut impls: blaze_own::Vec<super::index::ImplAt<'n>, blaze_own::Alloc<'_>> = blaze_own::Vec::new_in(alloc);
     for row in rows.iter() {
         // A refused derive's gap (D193 point 5, blaze-scope `ImplRow::refused_call`): no impl
         // item, so no text to read; filed by what its row reads (`textless`: a trait impl of an
@@ -909,7 +945,9 @@ fn file_rows_with_aliases<'n, S: NamesSource<'n>>(
                 each(Filing { key: row.key, filed, blanket, by_text: false, unread_bare: false, path_self });
             }
             Err(miss) => {
-                counts.row_misses[miss as usize] += 1;
+                if let Some(slot) = counts.row_misses.get_mut(miss.index()) {
+                    *slot += 1;
+                }
                 match names.impl_with_header(krate, row.key, row.module) {
                     Some(at) => impls.push(at),
                     // Its text did not read (the source filed why): unread, filed by what its
@@ -921,9 +959,9 @@ fn file_rows_with_aliases<'n, S: NamesSource<'n>>(
     }
     // By key: the order impls are filed in is a function of the records.
     impls.sort_by_key(|at| at.key);
-    counts.from_text = impls.len() as u32;
+    counts.from_text = u32::try_from(impls.len()).unwrap_or(u32::MAX);
     for at in impls.iter() {
-        each(file_text(names, at));
+        each(file_text(names, at, alloc));
     }
     counts
 }
@@ -933,12 +971,12 @@ fn file_rows_with_aliases<'n, S: NamesSource<'n>>(
 /// trait (`Filed::Inherent`) or did not lower (`NoText`, `Unlowered`, `Generics`): it is then
 /// never a candidate of an inherent question. Only an impl whose header text does not read
 /// stays blind.
-fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) -> Filing {
-    let (written, blanket) = written_trait(names, at);
-    let (filed, path_self, by_text) = match (file(names, at.key, at.module), written) {
+fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>, alloc: blaze_own::Alloc<'_>) -> Filing {
+    let (written, blanket) = written_trait(names, at, alloc);
+    let (filed, path_self, by_text) = match (file(names, at.key, at.module, alloc), written) {
         // Filed by its text's trait, its self type not read: not bounded.
-        ((Filed::Inherent(_), _), Some(t)) => (file_by_text(names, at.module, t), None, true),
-        ((Filed::Unread(why, _), _), Some(t)) if !why.is_trait_impl() => (file_by_text(names, at.module, t), None, true),
+        ((Filed::Inherent(_), _), Some(t)) => (file_by_text(names, at.module, t, alloc), None, true),
+        ((Filed::Unread(why, _), _), Some(t)) if !why.is_trait_impl() => (file_by_text(names, at.module, t, alloc), None, true),
         ((f, path_self), _) => (f, path_self, false),
     };
     Filing { key: at.key, filed, blanket, by_text, unread_bare: written.is_some_and(bare_text), path_self }
@@ -954,7 +992,7 @@ fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) ->
 /// constructor: a header whose tokens did not read, an inherent impl, and a self head the row
 /// does not name (`SelfHead::Other`, a path of no plain identifiers) stay candidates of every
 /// question, as `file` files an impl with no text.
-fn textless<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_>) -> Filing {
+fn textless<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_, '_>) -> Filing {
     let filing = |filed: Filed, unread_bare: bool| Filing { key: row.key, filed, blanket: false, by_text: false, unread_bare, path_self: None };
     if row.header_unread || !row.has_trait {
         return filing(Filed::Unread(Unread::NoText, None), false);
@@ -1498,7 +1536,7 @@ impl Buckets {
             }
             // By key: the order impls are filed in is a function of the names.
             gaps.sort_unstable_by_key(|row| row.key);
-            let counts = file_rows(names, krate, &gaps, &mut |f| b.take(names, krate, f));
+            let counts = file_rows_in(names, krate, &gaps, None, alloc, &mut |f| b.take(names, krate, f));
             b.count(counts);
         }
         Buckets::of(b)
@@ -1811,7 +1849,8 @@ impl BucketIndex {
             let mut rows: blaze_own::Vec<ImplRow<'n>, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(self.alloc);
             if !self.no_rows && names.each_impl_row(krate, &mut |row| rows.push(row)) {
                 let mut aliases = self.alias_shapes.take();
-                let counts = file_rows_with_aliases(names, krate, &rows, aliases.as_mut(), &mut |f| self.take(names, krate, f));
+                let alloc = self.alloc;
+                let counts = file_rows_in(names, krate, &rows, aliases.as_mut(), alloc, &mut |f| self.take(names, krate, f));
                 self.alias_shapes = aliases;
                 self.count(counts);
             } else {
@@ -1829,8 +1868,9 @@ impl BucketIndex {
 
     /// Files each impl of `impls` by its header as written.
     fn file_all<'n, S: NamesSource<'n>>(&mut self, names: S, impls: &[super::index::ImplAt<'n>]) {
+        let alloc = self.alloc;
         for at in impls.iter() {
-            let f = file_text(names, at);
+            let f = file_text(names, at, alloc);
             self.take(names, at.krate, f);
         }
     }
