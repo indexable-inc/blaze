@@ -283,6 +283,7 @@ fn handle_request(
                     cwd.as_str(),
                     &env,
                     stdin.as_ref().map(|b| b.as_slice()),
+                    mode == ExternalMode::Interactive,
                     pid_out,
                     alloc,
                 ) {
@@ -933,6 +934,7 @@ fn run_external_captured(
     cwd: &str,
     env: &AVec<'_, (blaze_own::ARc<'_, str>, blaze_own::ARc<'_, str>)>,
     stdin_bytes: Option<&[u8]>,
+    rich_color: bool,
     pid_out: Option<&Arc<AtomicU32>>,
     alloc: Alloc<'static>,
 ) -> Result<ExternalResult<'static>, String> {
@@ -941,33 +943,79 @@ fn run_external_captured(
         cmd.arg(a.as_str());
     }
     cmd.current_dir(cwd);
+    let mut has_no_color = false;
+    let mut has_term = false;
+    let mut has_colorterm = false;
+    let mut has_clicolor = false;
+    let mut has_clicolor_force = false;
+    let mut has_force_color = false;
+    let mut has_cargo_color = false;
+    let mut has_gh_tty = false;
+    let mut has_columns = false;
+    let mut has_git_pager = false;
+    let mut has_git_cfg = false;
     if !env.is_empty() {
         cmd.env_clear();
-        let mut has_term = false;
-        let mut has_colorterm = false;
-        let mut has_clicolor = false;
         for (k, v) in env.iter() {
             match k.as_ref() {
+                "NO_COLOR" if !v.as_ref().is_empty() => has_no_color = true,
                 "TERM" => has_term = true,
                 "COLORTERM" => has_colorterm = true,
                 "CLICOLOR" => has_clicolor = true,
+                "CLICOLOR_FORCE" => has_clicolor_force = true,
+                "FORCE_COLOR" => has_force_color = true,
+                "CARGO_TERM_COLOR" => has_cargo_color = true,
+                "GH_FORCE_TTY" => has_gh_tty = true,
+                "COLUMNS" => has_columns = true,
+                "GIT_PAGER" => has_git_pager = true,
+                "GIT_CONFIG_COUNT" => has_git_cfg = true,
                 _ => {}
             }
             cmd.env(k.as_ref(), v.as_ref());
         }
-        if !has_term {
-            cmd.env("TERM", "xterm-256color");
-        }
-        if !has_colorterm {
-            cmd.env("COLORTERM", "truecolor");
-        }
-        if !has_clicolor {
-            cmd.env("CLICOLOR", "1");
-        }
-    } else {
+    }
+    if !has_term {
         cmd.env("TERM", "xterm-256color");
+    }
+    if !has_colorterm {
         cmd.env("COLORTERM", "truecolor");
+    }
+    if !has_clicolor {
         cmd.env("CLICOLOR", "1");
+    }
+    cmd.env("TERM_PROGRAM", "blaze-shell");
+    // When this command's output is rendered directly to the user (not piped into another
+    // blaze-sh stage), tell modern CLIs (`rg`, `cargo`, `git`, `gh`, `bun`, `pytest`, `bat`,
+    // `eza`, `npm`) to emit full ANSI 24-bit color & pretty tables while we still capture
+    // clean, separate, time-interleaved `stdout`, `stderr`, and `exit_code`!
+    if rich_color && !has_no_color {
+        if !has_clicolor_force {
+            cmd.env("CLICOLOR_FORCE", "1");
+        }
+        if !has_force_color {
+            cmd.env("FORCE_COLOR", "1");
+        }
+        if !has_cargo_color {
+            cmd.env("CARGO_TERM_COLOR", "always");
+        }
+        if !has_gh_tty {
+            cmd.env("GH_FORCE_TTY", "120");
+        }
+        if !has_columns {
+            cmd.env("COLUMNS", "120");
+        }
+        cmd.env("PY_COLORS", "1");
+        let prog_base = program.rsplit('/').next().unwrap_or(program);
+        if prog_base == "git" {
+            if !has_git_pager {
+                cmd.env("GIT_PAGER", "cat");
+            }
+            if !has_git_cfg {
+                cmd.env("GIT_CONFIG_COUNT", "1");
+                cmd.env("GIT_CONFIG_KEY_0", "color.ui");
+                cmd.env("GIT_CONFIG_VALUE_0", "always");
+            }
+        }
     }
     cmd.stdin(if stdin_bytes.is_some() { Stdio::piped() } else { Stdio::null() });
     cmd.stdout(Stdio::piped());

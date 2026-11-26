@@ -1388,6 +1388,18 @@ fn layout_block(
                 scene.text(x0 + 15.0, cur_y, txt, theme::INK_3, false, false, clip_id);
                 m.ch + 2.0
             }
+            BlockBody::SysMon(state) => crate::sysmon_view::layout_sysmon_block(
+                scene,
+                block.id,
+                state,
+                x0,
+                cur_y,
+                x1,
+                None,
+                m,
+                clip_id,
+                false,
+            ),
         };
         cur_y += body_h;
     }
@@ -3515,8 +3527,9 @@ fn draw_shaded_filename(
 }
 
 /// Render a structured external-command [`blaze_sh::CommandOutput`] with true time-interleaved
-/// `stdout` and `stderr` streams, subtle coral gutter rail on `stderr` lines, exact per-line
-/// arrival timestamp hover tooltips, and a right-aligned `output` / `exit N` pill.
+/// `stdout` and `stderr` streams, full ANSI SGR color rendering (16 / 256 / 24-bit TrueColor,
+/// bold/dim/italic, backgrounds), subtle coral gutter rail on `stderr` lines, exact per-line
+/// arrival timestamp hover tooltips, and explicit `exit N · out · err` metadata pills.
 #[allow(clippy::too_many_arguments)]
 fn layout_command_output(
     scene: &mut Scene,
@@ -3527,34 +3540,57 @@ fn layout_command_output(
     m: CellMetrics,
     clip_id: u32,
 ) -> f32 {
-    let has_stderr = out.stderr_len() > 0;
-    let has_stdout = out.stdout_len() > 0;
-    let pill_lbl = if out.exit_code != 0 {
-        format!("output · exit {}", out.exit_code)
-    } else if has_stdout && has_stderr {
-        "output · 2 streams".to_owned()
+    let stdout_len = out.stdout_len();
+    let stderr_len = out.stderr_len();
+    let dur_s = format_duration_ns(out.duration.0.max(0) as u64);
+    let out_b = crate::dust_driver::format_bytes_compact(stdout_len as u64);
+    let err_b = crate::dust_driver::format_bytes_compact(stderr_len as u64);
+
+    // Always surface explicit `exit N`, `out`, and `err` metadata for every external command!
+    let exit_lbl = format!("exit {}", out.exit_code);
+    let streams_lbl = if stderr_len > 0 && stdout_len > 0 {
+        format!("out {out_b} · err {err_b}")
+    } else if stderr_len > 0 {
+        format!("err {err_b}")
+    } else if stdout_len > 0 {
+        format!("out {out_b}")
     } else {
-        "output".to_owned()
+        "empty".to_owned()
     };
-    let pill_w = pill_lbl.chars().count() as f32 * m.cw + 14.0;
-    let bx0 = x0 + width - pill_w;
-    let pill_border = if out.exit_code != 0 { theme::DANGER } else { theme::LINE };
-    let pill_fg = if out.exit_code != 0 { theme::DANGER } else { theme::INK_3 };
+    let pill_lbl = format!("{exit_lbl} · {streams_lbl}");
+    let pill_w = m.measure(&pill_lbl, TextFace::UiSmall) + 18.0;
+    let bx0 = (x0 + width - pill_w).max(x0 + 80.0);
+    let (pill_bg, pill_border, pill_fg) = if out.exit_code != 0 {
+        (
+            theme::rgba(0xe0, 0x6c, 0x75, 0.14),
+            theme::rgba(0xe0, 0x6c, 0x75, 0.65),
+            theme::DANGER,
+        )
+    } else if stderr_len > 0 {
+        (
+            theme::rgba(0xe5, 0xb5, 0x67, 0.10),
+            theme::rgba(0xe5, 0xb5, 0x67, 0.45),
+            theme::rgb(0xe5, 0xb5, 0x67),
+        )
+    } else {
+        (
+            theme::rgba(0x4c, 0xc3, 0x8a, 0.08),
+            theme::rgba(0x4c, 0xc3, 0x8a, 0.36),
+            theme::rgb(0x7c, 0xd4, 0xa8),
+        )
+    };
     scene.round_rect(
         bx0,
         y0 - 1.0,
         x0 + width,
         y0 + m.ch + 1.0,
         (m.ch + 2.0) * 0.5,
-        [0.0; 4],
+        pill_bg,
         1.0,
         pill_border,
         clip_id,
     );
-    scene.text(bx0 + 7.0, y0, &pill_lbl, pill_fg, false, false, clip_id);
-    let dur_s = format_duration_ns(out.duration.0.max(0) as u64);
-    let out_b = crate::dust_driver::format_bytes_compact(out.stdout_len() as u64);
-    let err_b = crate::dust_driver::format_bytes_compact(out.stderr_len() as u64);
+    scene.ui_small(bx0 + 9.0, y0, &pill_lbl, pill_fg, out.exit_code != 0, false, clip_id);
     scene.push_hover_clipped(
         HitRect::new(bx0, y0 - 2.0, x0 + width, y0 + m.ch + 2.0),
         clip_id,
@@ -3564,25 +3600,45 @@ fn layout_command_output(
         },
     );
 
-    // Flatten time-ordered chunks into display lines tagged with `(arrival_ns, stream)`.
+    // Flatten time-ordered chunks into display lines tagged with `(arrival_ns, stream)`,
+    // preserving ANSI SGR codes so external CLIs (`rg`, `cargo`, `git`, `gh`, `bun`, `pytest`)
+    // render with full terminal colors!
     let mut lines: Vec<(i64, blaze_sh::OutputStream, String)> = Vec::new();
+    let mut prev_ended_nl = true;
     for ch in out.chunks.iter() {
         let text = String::from_utf8_lossy(ch.bytes.as_ref());
-        let cleaned = strip_ansi_simple(&text);
-        for seg in cleaned.split('\n') {
+        let ends_nl = text.ends_with('\n');
+        let mut first_seg = true;
+        for seg in text.split('\n') {
             let s = seg.trim_end_matches('\r');
-            if s.is_empty() && lines.last().is_some_and(|l| l.2.is_empty()) {
-                continue;
+            if first_seg && !prev_ended_nl {
+                if let Some(last) = lines.last_mut()
+                    && last.1 == ch.stream
+                {
+                    last.2.push_str(s);
+                    first_seg = false;
+                    continue;
+                }
             }
             lines.push((ch.at.0, ch.stream, s.to_owned()));
+            first_seg = false;
         }
+        if ends_nl && lines.last().is_some_and(|l| l.2.is_empty()) {
+            lines.pop();
+        }
+        prev_ended_nl = ends_nl;
     }
     while lines.last().is_some_and(|l| l.2.is_empty()) {
         lines.pop();
     }
 
     if lines.is_empty() {
-        scene.text(x0, y0, "(no output)", theme::INK_4, false, true, clip_id);
+        let empty_msg = if out.exit_code != 0 {
+            format!("(exited with code {}, no stdout/stderr)", out.exit_code)
+        } else {
+            "(no stdout/stderr)".to_owned()
+        };
+        scene.text(x0, y0, &empty_msg, theme::INK_4, false, true, clip_id);
         return m.ch;
     }
 
@@ -3593,23 +3649,77 @@ fn layout_command_output(
     let mut cur_y = y0;
     let mut row_idx = 0usize;
     let max_display_lines = 400usize;
+    let mut stdout_style = AnsiStyle::default();
+    let mut stderr_style = AnsiStyle::default();
 
     for (at_ns, stream, raw_line) in lines.iter().take(max_display_lines) {
         let is_err = *stream == blaze_sh::OutputStream::Stderr;
-        let cols = if row_idx == 0 { first_cols } else { full_cols };
-        let wrapped = wrap_lines(raw_line, cols);
-        let line_x = if is_err { x0 + 8.0 } else { x0 };
-        let line_col = if is_err {
+        let default_fg = if is_err {
             theme::rgb(0xec, 0x9b, 0x82)
         } else {
             theme::INK_1
         };
+        let style_state = if is_err { &mut stderr_style } else { &mut stdout_style };
+        let spans = parse_ansi_sgr_spans(raw_line, style_state);
+        let line_x = if is_err { x0 + 8.0 } else { x0 };
         let block_y0 = cur_y;
-        for wline in &wrapped {
-            scene.text(line_x, cur_y, wline, line_col, false, false, clip_id);
+
+        if spans.is_empty() {
+            cur_y += step_y;
+            row_idx += 1;
+        } else {
+            let mut col = 0usize;
+            let mut max_cols = if row_idx == 0 { first_cols } else { full_cols };
+            for sp in &spans {
+                let mut fg = sp.style.fg.unwrap_or(default_fg);
+                if sp.style.dim {
+                    fg[3] *= 0.65;
+                }
+                let bg = sp.style.bg;
+                let mut chars = sp.text.chars().peekable();
+                while chars.peek().is_some() {
+                    if col >= max_cols {
+                        cur_y += step_y;
+                        row_idx += 1;
+                        col = 0;
+                        max_cols = full_cols;
+                    }
+                    let take = max_cols - col;
+                    let mut seg = String::new();
+                    let mut taken = 0usize;
+                    while taken < take {
+                        if let Some(ch) = chars.next() {
+                            seg.push(ch);
+                            taken += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if !seg.is_empty() {
+                        let rx = line_x + col as f32 * m.cw;
+                        let rw = taken as f32 * m.cw;
+                        if let Some(bg_col) = bg {
+                            scene.round_rect(
+                                rx,
+                                cur_y,
+                                rx + rw,
+                                cur_y + m.ch,
+                                2.0,
+                                bg_col,
+                                0.0,
+                                [0.0; 4],
+                                clip_id,
+                            );
+                        }
+                        scene.text(rx, cur_y, &seg, fg, sp.style.bold, sp.style.italic, clip_id);
+                        col += taken;
+                    }
+                }
+            }
             cur_y += step_y;
             row_idx += 1;
         }
+
         if is_err {
             scene.over_round_rect(
                 x0,
@@ -3622,7 +3732,7 @@ fn layout_command_output(
             );
         }
         let at_lbl = format_duration_ns((*at_ns).max(0) as u64);
-        let max_line_x1 = if row_idx <= wrapped.len() { bx0 - 8.0 } else { x0 + width };
+        let max_line_x1 = if block_y0 == y0 { bx0 - 8.0 } else { x0 + width };
         scene.push_hover_clipped(
             HitRect::new(x0, block_y0, max_line_x1.max(x0 + 40.0), cur_y),
             clip_id,
@@ -3648,28 +3758,184 @@ fn layout_command_output(
     (cur_y - y0).max(m.ch)
 }
 
-/// Strip ANSI CSI escape sequences cleanly for structured `Value::Output` line display.
-fn strip_ansi_simple(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+#[derive(Clone, Copy, Default)]
+struct AnsiStyle {
+    fg: Option<[f32; 4]>,
+    bg: Option<[f32; 4]>,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+}
+
+struct StyledSpan {
+    text: String,
+    style: AnsiStyle,
+}
+
+fn ansi_16_color(idx: u8) -> [f32; 4] {
+    match idx {
+        0 => theme::rgb(0x48, 0x4f, 0x58),
+        1 => theme::rgb(0xe0, 0x6c, 0x75),
+        2 => theme::rgb(0x73, 0xd0, 0x89),
+        3 => theme::rgb(0xe5, 0xc0, 0x7b),
+        4 => theme::rgb(0x61, 0xaf, 0xef),
+        5 => theme::rgb(0xc6, 0x78, 0xdd),
+        6 => theme::rgb(0x56, 0xb6, 0xc2),
+        7 => theme::rgb(0xd4, 0xd9, 0xe1),
+        8 => theme::rgb(0x76, 0x83, 0x90),
+        9 => theme::rgb(0xff, 0x85, 0x8e),
+        10 => theme::rgb(0x8e, 0xe8, 0xa2),
+        11 => theme::rgb(0xf6, 0xd4, 0x8c),
+        12 => theme::rgb(0x7f, 0xc2, 0xff),
+        13 => theme::rgb(0xdc, 0x96, 0xf2),
+        14 => theme::rgb(0x73, 0xd6, 0xe0),
+        _ => theme::rgb(0xf4, 0xf6, 0xfa),
+    }
+}
+
+fn ansi_256_color(n: u8) -> [f32; 4] {
+    if n < 16 {
+        return ansi_16_color(n);
+    }
+    if n >= 232 {
+        let g = 8u8.saturating_add((n - 232).saturating_mul(10));
+        return theme::rgb(g, g, g);
+    }
+    let c = n - 16;
+    let r = c / 36;
+    let g = (c / 6) % 6;
+    let b = c % 6;
+    let ch = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+    theme::rgb(ch(r), ch(g), ch(b))
+}
+
+fn apply_sgr_params(params: &str, style: &mut AnsiStyle) {
+    if params.is_empty() {
+        *style = AnsiStyle::default();
+        return;
+    }
+    let nums: Vec<u16> = params
+        .split(';')
+        .map(|p| p.parse::<u16>().unwrap_or(0))
+        .collect();
+    let mut i = 0usize;
+    while i < nums.len() {
+        match nums[i] {
+            0 => *style = AnsiStyle::default(),
+            1 => style.bold = true,
+            2 => style.dim = true,
+            3 => style.italic = true,
+            22 => {
+                style.bold = false;
+                style.dim = false;
+            }
+            23 => style.italic = false,
+            30..=37 => style.fg = Some(ansi_16_color((nums[i] - 30) as u8)),
+            39 => style.fg = None,
+            40..=47 => style.bg = Some(ansi_16_color((nums[i] - 40) as u8)),
+            49 => style.bg = None,
+            90..=97 => style.fg = Some(ansi_16_color((nums[i] - 90 + 8) as u8)),
+            100..=107 => style.bg = Some(ansi_16_color((nums[i] - 100 + 8) as u8)),
+            38 | 48 => {
+                let is_fg = nums[i] == 38;
+                if i + 2 < nums.len() && nums[i + 1] == 5 {
+                    let col = ansi_256_color(nums[i + 2].min(255) as u8);
+                    if is_fg {
+                        style.fg = Some(col);
+                    } else {
+                        style.bg = Some(col);
+                    }
+                    i += 2;
+                } else if i + 4 < nums.len() && nums[i + 1] == 2 {
+                    let col = theme::rgb(
+                        nums[i + 2].min(255) as u8,
+                        nums[i + 3].min(255) as u8,
+                        nums[i + 4].min(255) as u8,
+                    );
+                    if is_fg {
+                        style.fg = Some(col);
+                    } else {
+                        style.bg = Some(col);
+                    }
+                    i += 4;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Parse one line of external command output into styled ANSI SGR spans, cleanly discarding
+/// OSC hyperlinks/titles and non-SGR CSI cursor controls.
+fn parse_ansi_sgr_spans(s: &str, style: &mut AnsiStyle) -> Vec<StyledSpan> {
+    let mut out: Vec<StyledSpan> = Vec::new();
+    let mut cur = String::new();
     let bytes = s.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            i += 2;
-            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                i += 1;
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    let start = i + 2;
+                    let mut j = start;
+                    while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        if bytes[j] == b'm' {
+                            if !cur.is_empty() {
+                                out.push(StyledSpan {
+                                    text: core::mem::take(&mut cur),
+                                    style: *style,
+                                });
+                            }
+                            if let Ok(params) = core::str::from_utf8(&bytes[start..j]) {
+                                apply_sgr_params(params, style);
+                            }
+                        }
+                        i = j + 1;
+                    } else {
+                        i = bytes.len();
+                    }
+                    continue;
+                }
+                b']' => {
+                    // Skip OSC sequences (`\x1b]...\x07` or `\x1b]...\x1b\\`).
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        if bytes[j] == 0x07 {
+                            j += 1;
+                            break;
+                        }
+                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                _ => {
+                    i += 2;
+                    continue;
+                }
             }
-            if i < bytes.len() {
-                i += 1;
-            }
-            continue;
         }
         if let Some(ch) = s[i..].chars().next() {
-            out.push(ch);
+            if ch == '\t' {
+                cur.push_str("    ");
+            } else if !ch.is_control() {
+                cur.push(ch);
+            }
             i += ch.len_utf8();
         } else {
             break;
         }
+    }
+    if !cur.is_empty() {
+        out.push(StyledSpan { text: cur, style: *style });
     }
     out
 }

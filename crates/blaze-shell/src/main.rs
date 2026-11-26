@@ -645,6 +645,9 @@ mod macos_app {
         /// Alternate-screen TUIs (`claude`, `vim`, `htop`) render inline by default so scrollback
         /// remains visible; toggle true fullscreen anytime with `Cmd+Shift+F` (or block `⤢` pill).
         pty_fullscreen: bool,
+        active_sysmon: Option<BlockId>,
+        sysmon_fullscreen: bool,
+        last_sysmon_tick: Instant,
         yazi: Option<YaziState>,
         agent_hub: Option<AgentHub>,
         managed_agents: Vec<AgentRecord>,
@@ -695,6 +698,9 @@ mod macos_app {
                 scroll_to_block: None,
                 active_pty: None,
                 pty_fullscreen: false,
+                active_sysmon: None,
+                sysmon_fullscreen: false,
+                last_sysmon_tick: Instant::now(),
                 yazi: None,
                 agent_hub: None,
                 managed_agents: Vec::new(),
@@ -836,6 +842,68 @@ mod macos_app {
                     term_rows,
                     cell_px,
                 );
+                return;
+            }
+
+            // 2b. Native Metal Activity & GPU Monitor (`top` / `btop` / `htop` / `sysmon`).
+            // Use `^top` to bypass and run external `/usr/bin/top` on a PTY if ever needed.
+            let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+            if matches!(first_tok, "top" | "btop" | "htop" | "sysmon")
+                && !trimmed.contains('|')
+                && !trimmed.contains(';')
+                && !trimmed.contains("&&")
+            {
+                let mut sm = blaze_shell::sysmon_view::SysMonState::new();
+                for arg in trimmed.split_whitespace().skip(1) {
+                    match arg {
+                        "--gpu" | "-g" => sm.engine.set_sort(blaze_sysmon::SortColumn::Gpu),
+                        "--mem" | "-m" => sm.engine.set_sort(blaze_sysmon::SortColumn::Mem),
+                        "--pid" | "-p" => sm.engine.set_sort(blaze_sysmon::SortColumn::Pid),
+                        "--name" | "-n" => sm.engine.set_sort(blaze_sysmon::SortColumn::Name),
+                        "--list" | "--flat" | "-l" => {
+                            if sm.engine.tree_mode() {
+                                sm.engine.toggle_tree_mode();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let snap = blaze_shell::sysmon_driver::sample_snapshot(Alloc::global());
+                sm.engine.ingest(snap);
+                // If an earlier sysmon block was still live in this pane, freeze it cleanly.
+                if let Some(prev_id) = self.active_sysmon.take()
+                    && let Some(prev_blk) = self.store.block_mut(prev_id)
+                    && let BlockBody::SysMon(prev_sm) = &mut prev_blk.body
+                {
+                    prev_sm.running = false;
+                }
+                let state_before = self.store.active_state().fork();
+                let prompt_snap = self.prompt.clone();
+                let bid = self.store.record_block(
+                    trimmed.to_owned(),
+                    prompt_snap.clone(),
+                    state_before.fork(),
+                    state_before,
+                    now_ms(),
+                    0,
+                    0,
+                    BlockBody::SysMon(Box::new(sm)),
+                );
+                self.active_sysmon = Some(bid);
+                self.sysmon_fullscreen = false;
+                // Schedule first delta tick quickly (~220ms) so live CPU % & GPU % appear right away!
+                self.last_sysmon_tick = Instant::now() - std::time::Duration::from_millis(680);
+                self.editor.record_history_entry(HistoryEntry {
+                    command: trimmed.to_owned(),
+                    host: prompt_snap.host,
+                    cwd: prompt_snap.cwd,
+                    git_branch: prompt_snap.git_branch,
+                    duration_ms: 0,
+                    exit_code: 0,
+                    timestamp_ns: now_ns(),
+                    in_session: true,
+                });
+                self.auto_scroll_bottom = true;
                 return;
             }
 
@@ -1067,7 +1135,7 @@ mod macos_app {
             }
 
             let t0 = Instant::now();
-            let res = run_command_line(trimmed, state_before.fork(), true);
+            let res = run_command_line(trimmed, state_before.fork(), is_interactive_tty_cmd(trimmed));
             let elapsed = t0.elapsed();
             let duration_ms = elapsed.as_millis() as u64;
             let duration_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
@@ -1627,6 +1695,26 @@ mod macos_app {
                 layout_yazi_pane(yazi, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
             } else if let Some(hub) = &pane.agent_hub {
                 layout_agent_hub_pane(hub, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
+            } else if pane.sysmon_fullscreen
+                && let Some(sid) = pane.active_sysmon
+                && let Some(blk) = pane.store.block(sid)
+                && let BlockBody::SysMon(state) = &blk.body
+            {
+                let mut sc = Scene::new();
+                let avail_h = (sub_vh - TOP_BAR_H - 12.0).max(200.0);
+                let _ = blaze_shell::sysmon_view::layout_sysmon_block(
+                    &mut sc,
+                    sid,
+                    state,
+                    8.0,
+                    TOP_BAR_H + 6.0,
+                    (pw - 8.0).max(260.0),
+                    Some(avail_h),
+                    metrics,
+                    0,
+                    true,
+                );
+                sc
             } else if pane.pty_fullscreen
                 && pane.store.is_alternate_screen()
                 && let Some(tid) = pane.store.active_running_terminal()
@@ -2515,6 +2603,7 @@ mod macos_app {
         let mut last_dust_rev = blaze_shell::dust_driver::dust_revision();
         let mut last_git_meta_rev = blaze_shell::git_meta_driver::git_meta_revision();
         let mut last_remote_rev = blaze_shell::remote_driver::remote_complete_revision();
+        let mut last_app_icon_rev = blaze_shell::sysmon_driver::app_icon_revision();
         let mut command_palette: Option<CommandPalette> = None;
         let mut find_bar: Option<blaze_shell::find::FindBar> = None;
         let mut find_needs_scroll = false;
@@ -2615,12 +2704,15 @@ mod macos_app {
                                     continue;
                                 }
                                 if !ctrl && !alt && shift && (key == Key::KeyF || lower == "f") {
-                                    if let Some(pane) = panes.get_mut(&wm.focused_pane())
-                                        && pane.active_pty.is_some()
-                                    {
-                                        pane.pty_fullscreen = !pane.pty_fullscreen;
-                                        pty_sizes_dirty = true;
-                                        dirty = true;
+                                    if let Some(pane) = panes.get_mut(&wm.focused_pane()) {
+                                        if pane.active_sysmon.is_some() {
+                                            pane.sysmon_fullscreen = !pane.sysmon_fullscreen;
+                                            dirty = true;
+                                        } else if pane.active_pty.is_some() {
+                                            pane.pty_fullscreen = !pane.pty_fullscreen;
+                                            pty_sizes_dirty = true;
+                                            dirty = true;
+                                        }
                                     }
                                     continue;
                                 }
@@ -3237,6 +3329,198 @@ mod macos_app {
                                         // instead of swallowing them or leaking stray characters
                                         // into the composer, Yazi, or PTY.
                                         app.sendEvent(&ev);
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // 0a-sysmon. Native Activity & GPU Monitor (`top` / `btop` / `sysmon`) keyboard handling.
+                            if let Some(sid) = shell.active_sysmon {
+                                let vis_rows = if shell.sysmon_fullscreen {
+                                    blaze_shell::sysmon_view::visible_rows_for_height(
+                                        Some((size.height as f32 - TOP_BAR_H - 12.0).max(200.0)),
+                                        true,
+                                        false,
+                                    )
+                                } else {
+                                    blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS
+                                };
+                                let mut close_sysmon = false;
+                                if let Some(blk) = shell.store.block_mut(sid)
+                                    && let BlockBody::SysMon(sm) = &mut blk.body
+                                    && sm.running
+                                {
+                                    let handled = if sm.confirm_kill.is_some() {
+                                        match key {
+                                            Key::Escape => {
+                                                sm.cancel_kill();
+                                                true
+                                            }
+                                            Key::Enter | Key::NumpadEnter => {
+                                                sm.confirm_kill_selected(false);
+                                                true
+                                            }
+                                            _ => {
+                                                let txt = keys::text_of(&ev);
+                                                if txt == "y" || txt == "Y" {
+                                                    sm.confirm_kill_selected(false);
+                                                } else if txt == "K" {
+                                                    sm.confirm_kill_selected(true);
+                                                } else {
+                                                    sm.cancel_kill();
+                                                }
+                                                true
+                                            }
+                                        }
+                                    } else if sm.filter_focused {
+                                        match key {
+                                            Key::Escape => {
+                                                sm.filter_focused = false;
+                                                sm.clear_filter();
+                                                true
+                                            }
+                                            Key::Enter | Key::NumpadEnter => {
+                                                sm.filter_focused = false;
+                                                true
+                                            }
+                                            Key::Backspace => {
+                                                if flags.contains(NSEventModifierFlags::Command) {
+                                                    sm.clear_filter();
+                                                } else {
+                                                    sm.pop_filter_char();
+                                                }
+                                                true
+                                            }
+                                            Key::ArrowUp => {
+                                                sm.move_selection(-1, vis_rows);
+                                                true
+                                            }
+                                            Key::ArrowDown => {
+                                                sm.move_selection(1, vis_rows);
+                                                true
+                                            }
+                                            _ if !flags.contains(NSEventModifierFlags::Command)
+                                                && !ctrl
+                                                && !alt =>
+                                            {
+                                                let txt = keys::text_of(&ev);
+                                                let mut any = false;
+                                                for ch in txt.chars() {
+                                                    if !ch.is_control() {
+                                                        sm.push_filter_char(ch);
+                                                        any = true;
+                                                    }
+                                                }
+                                                any
+                                            }
+                                            _ => false,
+                                        }
+                                    } else if !flags.contains(NSEventModifierFlags::Command) && !alt {
+                                        let txt = keys::text_of(&ev);
+                                        match key {
+                                            Key::Escape => {
+                                                if !sm.filter_input.is_empty() {
+                                                    sm.clear_filter();
+                                                } else {
+                                                    sm.running = false;
+                                                    close_sysmon = true;
+                                                }
+                                                true
+                                            }
+                                            Key::ArrowUp => {
+                                                sm.move_selection(-1, vis_rows);
+                                                true
+                                            }
+                                            Key::ArrowDown => {
+                                                sm.move_selection(1, vis_rows);
+                                                true
+                                            }
+                                            Key::PageUp => {
+                                                sm.move_selection(-(vis_rows as isize), vis_rows);
+                                                true
+                                            }
+                                            Key::PageDown => {
+                                                sm.move_selection(vis_rows as isize, vis_rows);
+                                                true
+                                            }
+                                            Key::Space | Key::Enter | Key::NumpadEnter => {
+                                                sm.toggle_selected_collapse();
+                                                true
+                                            }
+                                            _ if ctrl && key == Key::KeyC => {
+                                                sm.running = false;
+                                                close_sysmon = true;
+                                                true
+                                            }
+                                            _ if !ctrl => match txt.as_str() {
+                                                "q" => {
+                                                    sm.running = false;
+                                                    close_sysmon = true;
+                                                    true
+                                                }
+                                                "j" => {
+                                                    sm.move_selection(1, vis_rows);
+                                                    true
+                                                }
+                                                "k" => {
+                                                    sm.move_selection(-1, vis_rows);
+                                                    true
+                                                }
+                                                "t" => {
+                                                    sm.engine.toggle_tree_mode();
+                                                    sm.clamp_selection(vis_rows);
+                                                    true
+                                                }
+                                                "p" => {
+                                                    sm.engine.toggle_pause();
+                                                    true
+                                                }
+                                                "/" => {
+                                                    sm.filter_focused = true;
+                                                    true
+                                                }
+                                                "1" => {
+                                                    sm.engine.set_sort(blaze_sysmon::SortColumn::Cpu);
+                                                    sm.clamp_selection(vis_rows);
+                                                    true
+                                                }
+                                                "2" => {
+                                                    sm.engine.set_sort(blaze_sysmon::SortColumn::Gpu);
+                                                    sm.clamp_selection(vis_rows);
+                                                    true
+                                                }
+                                                "3" => {
+                                                    sm.engine.set_sort(blaze_sysmon::SortColumn::Mem);
+                                                    sm.clamp_selection(vis_rows);
+                                                    true
+                                                }
+                                                "4" => {
+                                                    sm.engine.set_sort(blaze_sysmon::SortColumn::Pid);
+                                                    sm.clamp_selection(vis_rows);
+                                                    true
+                                                }
+                                                "5" => {
+                                                    sm.engine.set_sort(blaze_sysmon::SortColumn::Name);
+                                                    sm.clamp_selection(vis_rows);
+                                                    true
+                                                }
+                                                "x" | "K" => {
+                                                    sm.begin_kill_selected();
+                                                    true
+                                                }
+                                                _ => false,
+                                            },
+                                            _ => false,
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if close_sysmon {
+                                        shell.active_sysmon = None;
+                                        shell.sysmon_fullscreen = false;
+                                    }
+                                    if handled {
+                                        dirty = true;
                                         continue;
                                     }
                                 }
@@ -3916,6 +4200,32 @@ mod macos_app {
                                 if yazi.scroll_at(mx - pane_x0, rows_delta) {
                                     dirty = true;
                                 }
+                            } else if let Some(sid) = shell.active_sysmon
+                                && (shell.sysmon_fullscreen
+                                    || matches!(
+                                        composite_scene.hit_test(mx, my),
+                                        Some(
+                                            HitAction::SysMonSelectRow { .. }
+                                                | HitAction::SysMonToggleCollapse { .. }
+                                                | HitAction::SysMonSort { .. }
+                                                | HitAction::SysMonToggleTree(_)
+                                                | HitAction::SysMonTogglePause(_)
+                                        )
+                                    ))
+                                && let Some(blk) = shell.store.block_mut(sid)
+                                && let BlockBody::SysMon(sm) = &mut blk.body
+                            {
+                                let vis_rows = if shell.sysmon_fullscreen {
+                                    blaze_shell::sysmon_view::visible_rows_for_height(
+                                        Some((size.height as f32 - TOP_BAR_H - 12.0).max(200.0)),
+                                        true,
+                                        sm.filter_focused || !sm.filter_input.is_empty(),
+                                    )
+                                } else {
+                                    blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS
+                                };
+                                sm.scroll_by(rows_delta as isize, vis_rows);
+                                dirty = true;
                             } else if let Some(hub) = &mut shell.agent_hub {
                                 if dy.abs() > 0.5 && !hub.agents.is_empty() {
                                     if dy < 0.0 && hub.selected + 1 < hub.agents.len() {
@@ -4313,11 +4623,78 @@ mod macos_app {
                                             dirty = true;
                                         }
                                         HitAction::TogglePtyFullscreen => {
-                                            if shell.active_pty.is_some() {
+                                            if shell.active_sysmon.is_some() {
+                                                shell.sysmon_fullscreen = !shell.sysmon_fullscreen;
+                                                dirty = true;
+                                            } else if shell.active_pty.is_some() {
                                                 shell.pty_fullscreen = !shell.pty_fullscreen;
                                                 pty_sizes_dirty = true;
                                                 dirty = true;
                                             }
+                                        }
+                                        HitAction::SysMonToggleTree(bid) => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                sm.engine.toggle_tree_mode();
+                                                sm.clamp_selection(blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS);
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SysMonTogglePause(bid) => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                sm.engine.toggle_pause();
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SysMonSort { block: bid, col } => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                sm.engine.set_sort(blaze_sysmon::SortColumn::from_u8(col));
+                                                sm.clamp_selection(blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS);
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SysMonSelectRow { block: bid, row } => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                let vis = if shell.sysmon_fullscreen {
+                                                    blaze_shell::sysmon_view::visible_rows_for_height(
+                                                        Some((size.height as f32 - TOP_BAR_H - 12.0).max(200.0)),
+                                                        true,
+                                                        sm.filter_focused || !sm.filter_input.is_empty(),
+                                                    )
+                                                } else {
+                                                    blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS
+                                                };
+                                                sm.select_row(row, vis);
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SysMonToggleCollapse { block: bid, pid } => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                sm.engine.toggle_collapse(pid);
+                                                sm.clamp_selection(blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS);
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SysMonClose(bid) => {
+                                            if let Some(blk) = shell.store.block_mut(bid)
+                                                && let BlockBody::SysMon(sm) = &mut blk.body
+                                            {
+                                                sm.running = false;
+                                            }
+                                            if shell.active_sysmon == Some(bid) {
+                                                shell.active_sysmon = None;
+                                                shell.sysmon_fullscreen = false;
+                                            }
+                                            dirty = true;
                                         }
                                         HitAction::FindToggleCase => {
                                             if let Some(fb) = &mut find_bar {
@@ -5080,6 +5457,39 @@ mod macos_app {
                     let was_open = !shell.editor.completions.is_empty() || popup_engaged;
                     shell.refresh_editor_assist(was_open);
                     dirty = true;
+                }
+            }
+            let cur_app_icon_rev = blaze_shell::sysmon_driver::app_icon_revision();
+            if cur_app_icon_rev != last_app_icon_rev {
+                last_app_icon_rev = cur_app_icon_rev;
+                dirty = true;
+            }
+            // Live ~900ms native telemetry sampling for any running Activity & GPU Monitor (`top`/`btop`).
+            for pane in panes.values_mut() {
+                if let Some(sid) = pane.active_sysmon
+                    && pane.last_sysmon_tick.elapsed() >= std::time::Duration::from_millis(900)
+                {
+                    pane.last_sysmon_tick = Instant::now();
+                    if let Some(blk) = pane.store.block_mut(sid)
+                        && let BlockBody::SysMon(sm) = &mut blk.body
+                        && sm.running
+                    {
+                        if !sm.engine.paused() {
+                            let snap = blaze_shell::sysmon_driver::sample_snapshot(Alloc::global());
+                            sm.engine.ingest(snap);
+                            let vis = if pane.sysmon_fullscreen {
+                                blaze_shell::sysmon_view::visible_rows_for_height(
+                                    Some((size.height as f32 - TOP_BAR_H - 12.0).max(200.0)),
+                                    true,
+                                    sm.filter_focused || !sm.filter_input.is_empty(),
+                                )
+                            } else {
+                                blaze_shell::sysmon_view::INLINE_VISIBLE_ROWS
+                            };
+                            sm.clamp_selection(vis);
+                            dirty = true;
+                        }
+                    }
                 }
             }
             let focused_pid = wm.focused_pane();

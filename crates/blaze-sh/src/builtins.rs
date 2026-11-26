@@ -2572,6 +2572,31 @@ fn builtin_select<'a>(
             }
             Ok(Value::Record(out))
         }
+        Value::Output(o) => {
+            let mut out = Record::new(alloc);
+            for &n in name_refs.iter() {
+                let val = match n {
+                    "stdout" => o.stdout_value(alloc),
+                    "stderr" => o.stderr_value(alloc),
+                    "exit_code" | "status" => Value::Int(i64::from(o.exit_code)),
+                    "duration" => Value::Duration(o.duration),
+                    "events" | "chunks" | "streams" => Value::Table(o.events_table(alloc)),
+                    other => {
+                        let mut msg = AString::from_str_in("output has no field `", alloc);
+                        msg.push_str(other);
+                        msg.push_str("` (expected stdout, stderr, exit_code, duration, or events)");
+                        return Err(Control::Error(ShellError::new(
+                            ErrorKind::MissingColumn,
+                            span,
+                            msg.as_str(),
+                            alloc,
+                        )));
+                    }
+                };
+                out.insert_str(n, val);
+            }
+            Ok(Value::Record(out))
+        }
         Value::List(items) => {
             let mut table = Table::from_col_names(name_refs.as_slice(), alloc);
             for i in 0..items.len() {
@@ -3680,6 +3705,13 @@ fn builtin_columns<'a>(
             let mut out = PVec::new(alloc);
             for i in 0..r.len() {
                 out.push(Value::String(r.keys.get(i).unwrap().share()));
+            }
+            Ok(Value::List(out))
+        }
+        Value::Output(_) => {
+            let mut out = PVec::new(alloc);
+            for name in ["stdout", "stderr", "exit_code", "duration", "events"] {
+                out.push(Value::string(name, alloc));
             }
             Ok(Value::List(out))
         }
