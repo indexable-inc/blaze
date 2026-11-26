@@ -18,16 +18,20 @@
 
 mod disk;
 mod net_driver;
+mod status_driver;
 
 use std::{
     alloc::Global,
-    env, io,
+    env,
+    io::{self, IsTerminal as _},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use blaze_git::{
+    Detail, PromptStyle, StatusOpts, UntrackedMode, format_long_status, format_porcelain_v1,
+    format_short_status, format_status,
     merge::{MergeLimits, MergeOpts, MergeStatus, find_merge_bases, merge_commits},
     slab::SlabCompression,
     storage::{ObjectStore, RefStore, RefTarget, RefUpdate, Signature, encode_commit},
@@ -38,6 +42,7 @@ use blaze_own::{Alloc, Erased, String as OwnString, Vec as OwnVec};
 use crate::{
     disk::{BgitDiskStore, disinfect_repo_on_disk, infect_repo_on_disk, open_or_infect},
     net_driver::{http_clone, http_ls_remote, http_push, serve_http, serve_stdio},
+    status_driver::run_status,
 };
 
 fn main() -> ExitCode {
@@ -61,6 +66,7 @@ fn print_usage() {
     println!(
         "bgit — sans-IO, Git-wire-compatible VCS engine (macOS / APFS native .bgit store)\n\n\
          USAGE:\n\
+         \tbgit status [dir] [-s|--short] [--porcelain] [-b|--branch] [-uno|-unormal|-uall] [--prompt] [--timing]\n\
          \tbgit init [dir]\n\
          \tbgit infect [dir] [--raw]\n\
          \tbgit disinfect <dir> <out-git-dir>\n\
@@ -79,6 +85,7 @@ fn print_usage() {
 
 fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     match args[0].as_str() {
+        "status" | "st" => cmd_status(&args[1..], alloc),
         "init" => {
             let dir = args.get(1).map_or_else(|| PathBuf::from("."), PathBuf::from);
             let store = BgitDiskStore::init(&dir, alloc)?;
@@ -366,6 +373,109 @@ fn cmd_merge<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     } else if result.status == MergeStatus::MergedClean || result.status == MergeStatus::Conflicted {
         store.flush()?;
     }
+    Ok(())
+}
+
+fn cmd_status<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Long,
+        Short,
+        Porcelain,
+        Prompt,
+    }
+
+    let mut dir = PathBuf::from(".");
+    let mut mode = Mode::Long;
+    let mut show_branch = false;
+    let mut untracked = UntrackedMode::Normal;
+    let mut color_override: Option<bool> = None;
+    let mut show_timing = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "-s" | "--short" => mode = Mode::Short,
+            "--porcelain" | "--porcelain=v1" | "--porcelain=1" => mode = Mode::Porcelain,
+            "--prompt" => mode = Mode::Prompt,
+            "-b" | "--branch" => show_branch = true,
+            "-sb" | "-bs" => {
+                mode = Mode::Short;
+                show_branch = true;
+            }
+            "-uno" | "-u=no" | "--untracked-files=no" => untracked = UntrackedMode::Off,
+            "-unormal" | "-u=normal" | "--untracked-files=normal" => {
+                untracked = UntrackedMode::Normal;
+            }
+            "-u" | "-uall" | "-u=all" | "--untracked-files=all" => {
+                untracked = UntrackedMode::All;
+            }
+            "--color" | "--color=always" => color_override = Some(true),
+            "--no-color" | "--color=never" => color_override = Some(false),
+            "--color=auto" => color_override = None,
+            "--timing" => show_timing = true,
+            "-h" | "--help" => {
+                println!(
+                    "USAGE:\n\
+                     \tbgit status [dir] [-s|--short] [--porcelain] [-b|--branch] \
+                     [-uno|-unormal|-uall] [--prompt] [--color|--no-color] [--timing]"
+                );
+                return Ok(());
+            }
+            other if other.starts_with('-') => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown status flag: {other}"),
+                ));
+            }
+            other => dir = PathBuf::from(other),
+        }
+    }
+
+    let detail = if mode == Mode::Prompt { Detail::Counts } else { Detail::Full };
+    let opts = StatusOpts { untracked, detail, ..StatusOpts::FULL };
+    let (status, timing) = run_status(&dir, opts, alloc)?;
+
+    let use_color = match mode {
+        Mode::Porcelain | Mode::Prompt => false,
+        Mode::Long | Mode::Short => color_override.unwrap_or_else(|| io::stdout().is_terminal()),
+    };
+
+    let mut out = String::new();
+    match mode {
+        Mode::Long => {
+            let _ = format_long_status(&status, use_color, &mut out);
+        }
+        Mode::Short => {
+            let _ = format_short_status(&status, show_branch, use_color, &mut out);
+        }
+        Mode::Porcelain => {
+            let _ = format_porcelain_v1(&status, show_branch, &mut out);
+        }
+        Mode::Prompt => {
+            let _ = format_status(&status, &PromptStyle::STARSHIP, &mut out);
+            out.push('\n');
+        }
+    }
+    print!("{out}");
+
+    if show_timing {
+        eprintln!(
+            "timing: total={:.2}ms machine={:.2}ms list_dirs={:.2}ms(n={}) stat_paths={:.2}ms(n={}) read_files={:.2}ms(n={}) read_with_stat={:.2}ms links={:.2}ms ranges={:.2}ms rounds={}",
+            timing.total_us as f64 / 1000.0,
+            timing.machine_us as f64 / 1000.0,
+            timing.list_dirs_us as f64 / 1000.0,
+            timing.list_dirs_count,
+            timing.stat_paths_us as f64 / 1000.0,
+            timing.stat_paths_count,
+            timing.read_files_us as f64 / 1000.0,
+            timing.read_files_count,
+            timing.read_with_stat_us as f64 / 1000.0,
+            timing.read_links_us as f64 / 1000.0,
+            timing.read_ranges_us as f64 / 1000.0,
+            timing.rounds,
+        );
+    }
+
     Ok(())
 }
 

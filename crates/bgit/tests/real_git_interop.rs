@@ -176,3 +176,96 @@ fn real_git_infect_merge_serve_clone_push_and_disinfect() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn bgit_status_matches_real_git_porcelain_and_works_on_pure_bgit_repos() {
+    let base = std::env::temp_dir().join(format!("bgit-status-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    let run_git_raw = |dir: &Path, args: &[&str]| -> String {
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let run_bgit_raw = |args: &[&str]| -> String {
+        let out = Command::new(bgit_bin()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "bgit {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // 1. Create a real Git repo with staged add/mod/del, MM, unstaged mod/del, ignored, and collapsed untracked dir.
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "Test"]);
+    run_git(&repo, &["config", "user.email", "test@example.com"]);
+    fs::write(repo.join(".gitignore"), "*.log\nignored_dir/\n").unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/keep.rs"), "fn keep() {}\n").unwrap();
+    fs::write(repo.join("src/staged_mod.rs"), "fn v1() {}\n").unwrap();
+    fs::write(repo.join("src/staged_del.rs"), "fn old() {}\n").unwrap();
+    fs::write(repo.join("src/wt_mod.rs"), "fn a() {}\n").unwrap();
+    fs::write(repo.join("src/wt_del.rs"), "fn b() {}\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "initial"]);
+
+    // Staged add + staged mod (then also modified in worktree -> MM) + staged delete.
+    fs::write(repo.join("src/staged_add.rs"), "fn added() {}\n").unwrap();
+    fs::write(repo.join("src/staged_mod.rs"), "fn v2_staged() {}\n").unwrap();
+    run_git(&repo, &["add", "src/staged_add.rs", "src/staged_mod.rs"]);
+    run_git(&repo, &["rm", "src/staged_del.rs"]);
+    // Now edit staged_mod.rs again in worktree so it becomes `MM`.
+    fs::write(repo.join("src/staged_mod.rs"), "fn v3_worktree() {}\n").unwrap();
+    // Unstaged modification and deletion.
+    fs::write(repo.join("src/wt_mod.rs"), "fn a_modified() {}\n").unwrap();
+    fs::remove_file(repo.join("src/wt_del.rs")).unwrap();
+    // Untracked file, collapsed untracked dir, and ignored files.
+    fs::write(repo.join("untracked.txt"), "hello\n").unwrap();
+    fs::create_dir_all(repo.join("new_dir/sub")).unwrap();
+    fs::write(repo.join("new_dir/sub/x.txt"), "nested\n").unwrap();
+    fs::write(repo.join("skip.log"), "ignored\n").unwrap();
+    fs::create_dir_all(repo.join("ignored_dir")).unwrap();
+    fs::write(repo.join("ignored_dir/y.txt"), "ignored\n").unwrap();
+
+    let git_porcelain = run_git_raw(&repo, &["status", "--porcelain=v1", "-b"]);
+    let bgit_porcelain = run_bgit_raw(&["status", repo.to_str().unwrap(), "--porcelain", "-b"]);
+    assert_eq!(
+        bgit_porcelain, git_porcelain,
+        "bgit status --porcelain -b must match git status --porcelain=v1 -b exactly"
+    );
+
+    // Also verify `-uno` matches `git status -uno --porcelain=v1 -b`.
+    let git_uno = run_git_raw(&repo, &["status", "-uno", "--porcelain=v1", "-b"]);
+    let bgit_uno = run_bgit_raw(&["status", repo.to_str().unwrap(), "-uno", "--porcelain", "-b"]);
+    assert_eq!(bgit_uno, git_uno, "bgit status -uno must match git status -uno");
+
+    // Also verify running from a subdirectory discovers the repo root!
+    let bgit_from_sub =
+        run_bgit_raw(&["status", repo.join("src").to_str().unwrap(), "--porcelain", "-b"]);
+    assert_eq!(bgit_from_sub, git_porcelain, "bgit status from subdir must discover root");
+
+    // 2. Infect the repo, then create a pure `.bgit`-only checkout (removing `.git`) and verify `bgit status` works!
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-m", "clean snapshot"]);
+    run_bgit(&["infect", repo.to_str().unwrap()]);
+    // Remove `.git` completely -> pure `.bgit`-only repository!
+    fs::remove_dir_all(repo.join(".git")).unwrap();
+    let clean_bgit = run_bgit_raw(&["status", repo.to_str().unwrap(), "--porcelain", "-b"]);
+    assert_eq!(clean_bgit, "## main\n", "pure .bgit clean status");
+
+    fs::write(repo.join("src/keep.rs"), "fn keep_edited() {}\n").unwrap();
+    fs::remove_file(repo.join("src/wt_mod.rs")).unwrap();
+    fs::write(repo.join("brand_new.txt"), "hi\n").unwrap();
+    let dirty_bgit = run_bgit_raw(&["status", repo.to_str().unwrap(), "--porcelain", "-b"]);
+    assert_eq!(
+        dirty_bgit,
+        "## main\n M src/keep.rs\n D src/wt_mod.rs\n?? brand_new.txt\n",
+        "pure .bgit dirty status"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
