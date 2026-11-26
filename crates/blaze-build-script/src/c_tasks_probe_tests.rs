@@ -341,10 +341,14 @@ fn binary_probe_answer_round_trips_and_resolves_once_via_cache() {
 #[test]
 fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     let alloc = blaze_own::testing::heap().alloc();
-    // `-E` with header search flags is neither a zero-header probe nor a deferred C tool.
+    // `-E` with header search flags is NOT a zero-header probe, and stays on the deferred C-tool
+    // route during `CMode::Deferred` (while a zero-header `-E` probe goes to `Fact::CcProbe`).
     let pp_args = ["-E", "-I", "/package/include", "/package/src/check.c"];
     assert!(!is_probe("cc", &pp_args));
-    assert!(!crate::probe::is_deferred_tool("cc", &pp_args));
+    assert!(crate::probe::is_deferred_tool("cc", &pp_args));
+    let fam_args = ["-E", "/target/debug/build/zstd-sys-1/out/1detect_compiler_family.c"];
+    assert!(is_probe("cc", &fam_args));
+    assert!(!crate::probe::is_deferred_tool("cc", &fam_args));
 
     // `flag_check` referencing package headers or non-prefix-map `$MOUNT` paths is refused cleanly.
     let files = |name: &str| (name == "flag_check.c").then_some(FLAG_SRC);
@@ -458,6 +462,8 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         "--include=/target/debug/build/zstd-sys-1/out/foo.h",
         "-fmodule-file=m=/target/debug/build/zstd-sys-1/out/m.pcm",
         "-fembed-dir=/target/debug/build/zstd-sys-1/out",
+        "-fxray-attr-list=/target/debug/build/zstd-sys-1/out/xray.txt",
+        "-isysroot/host/sysroot",
         "-ivfsoverlay/target/debug/build/zstd-sys-1/out/vfs.yaml",
     ] {
         let joined_args = ["-c", bad_flag, "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
@@ -467,6 +473,12 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
             ProbeWhy::PackageInput
         );
     }
+    let split_isysroot = ["-c", "-isysroot", "/host/sysroot", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
+    let sp_isys = Spawn { program: "cc", args: &split_isysroot, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    assert_eq!(
+        canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_isys, files, alloc).err().expect("split -isysroot").why,
+        ProbeWhy::PackageInput
+    );
 
     // Literal `-DROOT="$OUT_DIR"` and actual `-DROOT="<OUT_DIR>"` have disjoint structural ProbeKeys
     // and keep the literal string distinct from the real `Segment::OutDir`.

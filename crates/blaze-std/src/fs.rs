@@ -431,16 +431,34 @@ impl Meta {
 }
 
 
-/// An exclusive file lock acquired through [`Dir::lock_exclusive`]: dropping it submits
-/// `Effect::Unlock` with a bounded teardown wait so locks are never leaked within a live process
-/// and release automatically on process crash.
+/// An exclusive file lock acquired through [`Dir::lock_exclusive`]: call [`FileLock::unlock`] on
+/// the result-bearing path so unlock failures surface as typed [`FsError`]s; `Drop` performs a
+/// bounded fallback unlock only if the lock was dropped early (e.g. on error/unwind).
 pub struct FileLock {
     io: Io,
+    name: FileName,
     tag: blaze_core::Tag,
+    unlocked: bool,
+}
+
+impl FileLock {
+    /// Explicitly releases the file lock under `cx`, surfacing any `Done::Failed` or stop error.
+    pub fn unlock(mut self, cx: &Cx) -> Result<(), FsError> {
+        self.unlocked = true;
+        let lock = self.tag;
+        match call(&self.io, cx, FsOp::Publish, &self.name, |tag| Effect::Unlock { lock, tag })? {
+            Done::Unlocked => Ok(()),
+            Done::Failed(error) => Err(FsError::new(FsOp::Publish, &self.name, FsKind::Driver(error.0))),
+            other => Err(unexpected(FsOp::Publish, &self.name, other)),
+        }
+    }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
+        if self.unlocked {
+            return;
+        }
         let lock = self.tag;
         let tag = self.io.submit(|tag| Effect::Unlock { lock, tag });
         let until = blaze_core::wait::Deadline::after(self.io.now(), core::time::Duration::from_secs(5));
@@ -2134,8 +2152,9 @@ impl Dir<ReadWrite> {
         let linked = match call(&self.io, cx, FsOp::Publish, &name, |tag| Effect::Link { from, to, tag })? {
             Done::Linked => true,
             Done::Failed(error) => {
-                let _ = remove(&self.io, cx, FsOp::Publish, &temp);
-                return match stat(&self.io, cx, FsOp::Publish, &name)? {
+                let exists = stat(&self.io, cx, FsOp::Publish, &name)?;
+                remove(&self.io, cx, FsOp::Publish, &temp)?;
+                return match exists {
                     Some(_) => Ok(false),
                     None => Err(FsError::new(FsOp::Publish, &name, FsKind::Driver(error.0))),
                 };
@@ -2145,7 +2164,7 @@ impl Dir<ReadWrite> {
                 return Err(unexpected(FsOp::Publish, &name, done));
             }
         };
-        let _ = remove(&self.io, cx, FsOp::Publish, &temp);
+        remove(&self.io, cx, FsOp::Publish, &temp)?;
         match durable.unsynced() {
             Some(unsynced) => {
                 started(&self.io, &name, unsynced);
@@ -2161,7 +2180,7 @@ impl Dir<ReadWrite> {
 
     /// Acquires an exclusive advisory file lock at `path` (creating the lock file if absent) via
     /// `Effect::Lock`, retrying on `Done::Contended` with scheduler-aware timers until `cx`'s
-    /// deadline or cancellation. Releasing the returned [`FileLock`] submits `Effect::Unlock`.
+    /// deadline or cancellation. Call [`FileLock::unlock`] on the result-bearing path.
     pub fn lock_exclusive(&self, cx: &Cx, path: &Path) -> Result<FileLock, FsError> {
         let name = self.beneath(path);
         let backoff = core::time::Duration::from_millis(2);
@@ -2179,7 +2198,7 @@ impl Dir<ReadWrite> {
                 .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
             match done {
                 Done::Locked => {
-                    return Ok(FileLock { io: self.io.share(), tag: acquired_tag });
+                    return Ok(FileLock { io: self.io.share(), name, tag: acquired_tag, unlocked: false });
                 }
                 Done::Contended => {
                     let _ = self

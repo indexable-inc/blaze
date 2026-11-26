@@ -145,7 +145,7 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
         let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
         landlock_add_rule_path(ruleset.fd(), &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule", code: errno.raw() })?;
         if matches!(rule.why, Why::Program | Why::Helper) {
-            grant_nix_elf_closure(ruleset.fd(), path, has_helper_folder)?;
+            grant_nix_elf_closure(ruleset.fd(), path, plan, has_helper_folder)?;
         }
     }
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
@@ -165,7 +165,7 @@ pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepa
 /// and `ld.so`'s resolved glibc `lib/` directory) and grants Landlock single-file
 /// `READ_FILE | EXECUTE` ONLY on the exact loader and resolved shared library files — never on
 /// `/nix/store` as a directory. Does nothing on non-NixOS hosts or non-ELF scripts.
-fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -> Result<(), Fault> {
+fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, plan: &Plan<'_>, has_helper_folder: bool) -> Result<(), Fault> {
     const MAX_LIBS: usize = 128;
     const PATH_CAP: usize = 320;
     const NIX_LD_DIR: &[u8] = b"/run/current-system/sw/share/nix-ld/lib/";
@@ -317,26 +317,30 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
             .get(..cur_len)
             .and_then(|p| p.iter().rposition(|&b| b == b'/').and_then(|s| p.get(..s)))
             .unwrap_or(&[]);
-        let mut search_dirs = [([0u8; PATH_CAP], 0usize); 8];
+        let mut search_dirs = [([0u8; PATH_CAP], 0usize); 16];
         let mut search_count = 0usize;
         if let Some(rp_off) = runpath_off.or(rpath_off)
             && let Some(at) = strtab_file_off.checked_add(rp_off)
         {
-            let mut rp_buf = [0u8; 1024];
+            let mut rp_buf = [0u8; 2048];
             let n = pread(elf_fd.fd(), &mut rp_buf, at).unwrap_or(0);
             let raw = rp_buf.get(..n).unwrap_or(&[]);
-            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            let Some(end) = raw.iter().position(|&b| b == 0) else {
+                return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
+            };
             for entry in raw.get(..end).unwrap_or(&[]).split(|&b| b == b':') {
                 if entry.is_empty() {
                     continue;
                 }
-                if let Some(slot) = search_dirs.get_mut(search_count) {
-                    let expanded_len = expand_origin(entry, origin_dir, &mut slot.0);
-                    if expanded_len > 0 {
-                        slot.1 = expanded_len;
-                        search_count += 1;
-                    }
+                let Some(slot) = search_dirs.get_mut(search_count) else {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
+                };
+                let expanded_len = expand_origin(entry, origin_dir, &mut slot.0);
+                if expanded_len == 0 {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entry exceeds path cap)", code: 36 });
                 }
+                slot.1 = expanded_len;
+                search_count += 1;
             }
         }
 
@@ -353,11 +357,12 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
                 continue;
             }
             if soname.contains(&b'/') {
-                // Path-bearing `DT_NEEDED` (e.g. direct `/nix/store/.../libfoo.so` or `$ORIGIN/...`):
-                // expand `$ORIGIN` and grant/enqueue directly, refusing if relative or unresolvable.
+                // Path-bearing `DT_NEEDED`: expand `$ORIGIN`, require it to resolve beneath an
+                // authorized root (`/nix/store/`, `nix-ld/lib/`, or a declared `plan` root) before
+                // granting, refusing everything else by name (never widening the sandbox to
+                // arbitrary host paths named by untrusted ELF metadata).
                 let mut expanded = [0u8; PATH_CAP];
                 let exp_len = expand_origin(soname, origin_dir, &mut expanded);
-                // `expand_origin` appends a trailing `/`; trim it for a library file path.
                 let file_len = if exp_len > 1 && expanded.get(exp_len - 1) == Some(&b'/') {
                     exp_len - 1
                 } else {
@@ -370,7 +375,18 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
                         code: 2,
                     });
                 }
-                if !try_grant_and_enqueue_lib(ruleset, b"", exp_slice, &mut queue, &mut q_len)? {
+                let mut resolved = [0u8; PATH_CAP];
+                let res_slice = match resolve_symlink_path(exp_slice, &mut resolved) {
+                    Some(res_len) => resolved.get(..res_len).unwrap_or(exp_slice),
+                    None => exp_slice,
+                };
+                if !is_authorized_nix_dep_path(res_slice, NIX_LD_DIR, plan) {
+                    return Err(Fault::Host {
+                        call: "landlock (NixOS ELF path-bearing DT_NEEDED outside authorized roots)",
+                        code: 13,
+                    });
+                }
+                if !try_grant_and_enqueue_lib(ruleset, b"", res_slice, NIX_LD_DIR, plan, &mut queue, &mut q_len)? {
                     return Err(Fault::Host {
                         call: "landlock (NixOS ELF path-bearing DT_NEEDED not found)",
                         code: 2,
@@ -383,6 +399,7 @@ fn grant_nix_elf_closure(ruleset: Fd, program: &CStr, has_helper_folder: bool) -
                     search_dirs.get(..search_count).unwrap_or(&[]),
                     NIX_LD_DIR,
                     glibc_dir,
+                    plan,
                     &mut queue,
                     &mut q_len,
                 )?;
@@ -553,6 +570,29 @@ fn resolve_symlink_path(path: &[u8], out: &mut [u8; 320]) -> Option<usize> {
     Some(cur_len)
 }
 
+/// Whether resolved path `path` is within an explicitly authorized root (`/nix/store/`,
+/// `nix_ld_dir`, or a declared `plan` rule) and contains no `..` traversal components.
+fn is_authorized_nix_dep_path(path: &[u8], nix_ld_dir: &[u8], plan: &Plan<'_>) -> bool {
+    if path.first() != Some(&b'/') || path.split(|&b| b == b'/').any(|seg| seg == b"..") {
+        return false;
+    }
+    if path.starts_with(b"/nix/store/") || path.starts_with(nix_ld_dir) {
+        return true;
+    }
+    for rule in plan.rules() {
+        let root = rule.path.as_bytes();
+        if path == root {
+            return true;
+        }
+        if rule.subtree && path.starts_with(root) {
+            if root.ends_with(b"/") || path.get(root.len()) == Some(&b'/') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn enqueue_nix_resolved_path<const N: usize>(
     raw: &[u8],
     queue: &mut [([u8; 320], usize); N],
@@ -595,20 +635,21 @@ fn enqueue_nix_soname<const N: usize>(
     runpath_dirs: &[([u8; 320], usize)],
     nix_ld_dir: &[u8],
     glibc_dir: Option<&[u8]>,
+    plan: &Plan<'_>,
     queue: &mut [([u8; 320], usize); N],
     q_len: &mut usize,
 ) -> Result<(), Fault> {
     for (dir_buf, dir_len) in runpath_dirs {
         let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
-        if try_grant_and_enqueue_lib(ruleset, dir, soname, queue, q_len)? {
+        if try_grant_and_enqueue_lib(ruleset, dir, soname, nix_ld_dir, plan, queue, q_len)? {
             return Ok(());
         }
     }
-    if try_grant_and_enqueue_lib(ruleset, nix_ld_dir, soname, queue, q_len)? {
+    if try_grant_and_enqueue_lib(ruleset, nix_ld_dir, soname, nix_ld_dir, plan, queue, q_len)? {
         return Ok(());
     }
     if let Some(dir) = glibc_dir {
-        let _ = try_grant_and_enqueue_lib(ruleset, dir, soname, queue, q_len)?;
+        let _ = try_grant_and_enqueue_lib(ruleset, dir, soname, nix_ld_dir, plan, queue, q_len)?;
     }
     Ok(())
 }
@@ -617,6 +658,8 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     ruleset: Fd,
     dir_prefix: &[u8],
     soname: &[u8],
+    nix_ld_dir: &[u8],
+    plan: &Plan<'_>,
     queue: &mut [([u8; 320], usize); N],
     q_len: &mut usize,
 ) -> Result<bool, Fault> {
@@ -641,9 +684,6 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         Err(errno) => return Err(Fault::Host { call: "openat (nix runtime file, O_PATH)", code: errno.raw() }),
     };
     let granted = AccessFs::READ_FILE.with(AccessFs::EXECUTE).bits();
-    let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
-    landlock_add_rule_path(ruleset, &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule (nix runtime file)", code: errno.raw() })?;
-
     let mut resolved = [0u8; 320];
     let res_len = resolve_symlink_path(candidate.get(..total).unwrap_or(&[]), &mut resolved).unwrap_or(total);
     let res_slice = if res_len == total && resolved.first() == Some(&0) {
@@ -651,6 +691,14 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     } else {
         resolved.get(..res_len).unwrap_or(&[])
     };
+    if !is_authorized_nix_dep_path(res_slice, nix_ld_dir, plan) {
+        return Err(Fault::Host {
+            call: "landlock (NixOS ELF dependency resolved outside authorized roots)",
+            code: 13,
+        });
+    }
+    let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
+    landlock_add_rule_path(ruleset, &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule (nix runtime file)", code: errno.raw() })?;
     let already = queue
         .get(..*q_len)
         .unwrap_or(&[])

@@ -104,6 +104,7 @@ fn is_header_search_flag(arg: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "-I",
         "-isystem",
+        "-isysroot",
         "-iquote",
         "-idirafter",
         "-iprefix",
@@ -125,7 +126,14 @@ fn is_header_search_flag(arg: &str) -> bool {
         "-fembed-dir",
         "-fsanitize-ignorelist",
         "-fsanitize-blacklist",
+        "-fsanitize-coverage-allowlist",
+        "-fsanitize-coverage-ignorelist",
         "-fprofile-list",
+        "-fxray-attr-list",
+        "-fxray-always-instrument",
+        "-fxray-never-instrument",
+        "-foptimization-record-file",
+        "-fdepfile-entry",
         "-fpass-plugin",
         "-fplugin",
         "--config",
@@ -135,7 +143,23 @@ fn is_header_search_flag(arg: &str) -> bool {
         "--sysroot",
         "-ivfsoverlay",
     ];
-    PREFIXES.iter().any(|p| arg.starts_with(p))
+    if PREFIXES.iter().any(|p| arg.starts_with(p)) {
+        return true;
+    }
+    // Closed-world guard: refuse any `flag=value` option whose value contains a path separator
+    // (other than safe string-rewriting prefix-map flags) or whose name explicitly references an
+    // external file/list/dir/path/sysroot/plugin/overlay.
+    if !is_prefix_map_flag(arg) && !arg.starts_with("-D") && let Some((name, val)) = arg.split_once('=') {
+        if val.contains('/') || val.contains('\\') {
+            return true;
+        }
+        for suffix in ["-file", "-list", "-dir", "-path", "sysroot", "include", "embed", "plugin", "config", "allowlist", "ignorelist", "blacklist", "overlay"] {
+            if name.ends_with(suffix) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether the spawn of `program` with `args` is a compiler probe, from its text alone: a C
@@ -704,7 +728,7 @@ pub fn canonicalize<'b, 's>(
         .any(|(k, v)| is_path_steering_env(k.as_str()) && !v.as_str().is_empty());
     let mut has_arg_package_input = false;
     let mut has_host_dep_arg = false;
-    let mut skip_next = false;
+    let mut prev_flag: Option<&str> = None;
     for (idx, &arg) in spawn.args.iter().enumerate() {
         let next = spawn.args.get(idx + 1).copied();
         let masked_arg = mask_quoted_literals(arg, alloc);
@@ -712,6 +736,20 @@ pub fn canonicalize<'b, 's>(
         if is_host_dependent_flag(arg, next) || contains_ident(masked, "__TIMESTAMP__") {
             has_host_dep_arg = true;
             break;
+        }
+        if let Some(prev) = prev_flag.take() {
+            // Only `-o` may carry an `OUT_DIR` path; any other flag taking a separate value with
+            // a path separator (e.g. `-L /host/lib`) is refused as an unkeyed external input.
+            if prev == "-o" {
+                if arg != "/dev/null" && under_out_dir(arg, spawn.out_dir).is_none() {
+                    has_arg_package_input = true;
+                    break;
+                }
+            } else if arg.contains('/') || arg.contains('\\') {
+                has_arg_package_input = true;
+                break;
+            }
+            continue;
         }
         if is_header_search_flag(arg)
             || arg.starts_with('@')
@@ -723,12 +761,8 @@ pub fn canonicalize<'b, 's>(
             has_arg_package_input = true;
             break;
         }
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
         if flag_takes_value(arg) {
-            skip_next = true;
+            prev_flag = Some(arg);
             continue;
         }
         if !arg.starts_with('-') && arg != "/dev/null" && under_out_dir(arg, spawn.out_dir).is_none() {

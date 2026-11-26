@@ -478,18 +478,27 @@ impl DirStore {
         let mut whole = blaze_own::Vec::with_capacity_in(bytes.len() + SEAL_LEN, alloc);
         whole.extend_from_slice(bytes);
         whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
-        let _repair_guard = if self.plant == RecordPlant::UnserializedRepair {
+        let lock_name = RecordName::from_ascii(b"c-probe/.repair.lock");
+        let repair_guard = if self.plant == RecordPlant::UnserializedRepair {
             None
         } else {
-            let lock_name = RecordName::from_ascii(b"c-probe/.repair.lock");
             Some(self.files.lock_exclusive(&lock_name)?)
         };
-        if _repair_guard.is_some()
+        let result = if repair_guard.is_some()
             && let Some(held) = self.files.read_sealed_bounded(name, crate::probe_clang::MAX_RECORD_BYTES, alloc)?
         {
-            return if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) };
+            if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) }
+        } else {
+            self.files.publish(name, whole.as_slice())
+        };
+        if let Some(guard) = repair_guard {
+            let unlock_cx = self.files.cx(&lock_name)?;
+            let unlocked = guard.unlock(&unlock_cx).map_err(FilesError::Effect);
+            result?;
+            unlocked?;
+            return Ok(());
         }
-        self.files.publish(name, whole.as_slice())
+        result
     }
 
     /// The record at `name`, its seal checked: `None` when absent or torn.
