@@ -1999,7 +1999,7 @@ impl Job<'_> {
         found.outlined.sort_unstable_by_key(|one| one.name);
         found.probes.sort_unstable_by_key(|(slot, ..)| Name::file(slot));
         let implicit_entry_root = input.implicit.entry.then(|| input.root.strip_prefix("/0/")).flatten();
-        let mut answer = finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, script_input, outlined, found, alloc, local, self.kept)?;
+        let mut answer = finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, &exports, script_input, outlined, found, alloc, local, bump, self.kept)?;
         answer.scope_bytes = scope_bytes;
         Ok(answer)
     }
@@ -2071,7 +2071,7 @@ fn unseen_file(task: Name, read: Name, krate: &str, path: &str, heap: SharedAllo
 }
 
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
-fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
+fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], dep_exports: &[Verified<'_>], script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, bump: blaze_own::Bump<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
     // A file this crate found and its worker outlined (which may upgrade a walk `DATA_FILE` to a
     // Rust outline), else one the request's outlines hold.
@@ -2132,6 +2132,42 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
             }
         }
     }
+    let payload = resolved.payload();
+    let parts = crate::names::sections::sections(payload).map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload whose sections do not read" })?;
+    // Rule 21: `blaze-file-items` omits bare `#[test]` / `#[bench]` plain-fn bodies and bare
+    // `STD_EXPR_MACROS` body text from `Outline::surface()`. When a non-stdlib crate shadows
+    // `test`/`bench` with a user attribute macro, or shadows/imports/defines any name in
+    // `STD_EXPR_MACROS` (or enables `#[no_implicit_prelude]` or emitted a failed macro call),
+    // record `definition_cell(entry_name)` reads so body edits still wake `CrateScope`.
+    let non_stdlib = !matches!(krate, "core" | "std" | "alloc");
+    let (shadowed_test, mut shadowed_expr) = if non_stdlib {
+        shadowed_in_names(parts.names, dep_exports, bump)
+    } else {
+        (false, false)
+    };
+    if record.findings.iter().any(|(rule, ..)| *rule == crate::names::failed_call::FAILED_CALL) {
+        shadowed_expr = true;
+    }
+    if shadowed_test || shadowed_expr {
+        for path in files {
+            let file = Name::file(path.as_bytes());
+            if let Some((file_outlined, file_record)) =
+                surface_outlined(&found.outlined, file, path).or_else(|| surface_outlined(outlined, file, path))
+                && let Ok(file_payload) = file_record.payload_bytes()
+                && let Ok(view) = blaze_surface::FileItemsView::read(file_payload)
+            {
+                record_shadowed_definition_reads(
+                    file_outlined.name,
+                    &file_outlined.path,
+                    view,
+                    shadowed_test,
+                    shadowed_expr,
+                    &mut record.reads,
+                    &mut reads,
+                );
+            }
+        }
+    }
     for path in absent {
         let file = Name::file(path.as_bytes());
         record.reads.push((Name::new(Kind::Surface, file.subject), blaze_drive::key::ABSENT));
@@ -2162,8 +2198,6 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
     }
     reads.sort_unstable_by_key(|row| row.0);
     reads.dedup_by_key(|row| row.0);
-    let payload = resolved.payload();
-    let parts = crate::names::sections::sections(payload).map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload whose sections do not read" })?;
     record.parts.push(Part { name: Name::links_of(name), locate: Locate::Source(blaze_ladder::native_links::table_digest(parts.links)), place: 0 });
     let defines = cells_of(name, &record, parts.exports, parts.cells, alloc)?;
     let key = crate::engine_store::record_key(task.key, record.out, &record.reads, payload);
@@ -2171,6 +2205,221 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
     let header = blaze_drive::record::write_plain_head(name, task.planned.source, record.out, &record.reads, payload.len(), scratch);
     let head = SVec::from_slice_in(&header, heap);
     Ok(WorkerAnswer { done, result: Ok(Finished { record, resolved, ok, unresolved, key, head, oracle, found }), scope_bytes: crate::names::metered::ScopeBytes::default() })
+}
+
+/// Single-pass shadow check over `names_bytes` (a `CrateScope` payload's `names` section) and
+/// `dep_exports` for both `#[test]`/`#[bench]` attribute macros and [`blaze_file_items::nested::STD_EXPR_MACROS`]
+/// function-like macros.
+///
+/// Returns `(shadowed_test_attr, shadowed_expr_macro)`.
+///
+/// Rule 21: `blaze-file-items` omits bare `#[test]` / `#[bench]` plain-fn bodies and bare
+/// `STD_EXPR_MACROS` call arguments from `Outline::surface()`. Whenever a non-stdlib crate
+/// defines, imports, or `#[macro_use]`s any shadowed name (or uses `#[no_implicit_prelude]`),
+/// [`finish`] calls [`record_shadowed_definition_reads`] so body edits still wake `CrateScope`.
+fn shadowed_in_names(names_bytes: &[u8], dep_exports: &[Verified<'_>], bump: blaze_own::Bump<'_>) -> (bool, bool) {
+    if names_bytes.is_empty() {
+        return (false, false);
+    }
+    let aligned = if names_bytes.as_ptr().align_offset(16) == 0 {
+        names_bytes
+    } else {
+        blaze_scope::resolve::aligned(names_bytes, bump)
+    };
+    let Ok(verified) = blaze_scope::names_record::Verified::check_header(aligned) else {
+        return (false, false);
+    };
+    let names = blaze_scope::names_record::NamesRecord::open(verified);
+    let is_attr_macro = |def: blaze_surface::Def| {
+        matches!(def.kind, blaze_surface::DefKind::Macro(shapes) if shapes.accepts(blaze_surface::CallShape::Attr))
+    };
+    let is_fn_macro = |def: blaze_surface::Def| {
+        matches!(def.kind, blaze_surface::DefKind::Macro(shapes) if shapes.accepts(blaze_surface::CallShape::FnLike))
+    };
+
+    let mut shadowed_test = false;
+    let mut shadowed_expr = false;
+
+    let root = names.crate_root();
+    for (name, _, shapes) in root.macro_exports() {
+        if !shadowed_test && shapes.accepts(blaze_surface::CallShape::Attr) && matches!(name, "test" | "bench") {
+            shadowed_test = true;
+        }
+        if !shadowed_expr && shapes.accepts(blaze_surface::CallShape::FnLike) && blaze_file_items::nested::is_std_expr_macro(name) {
+            shadowed_expr = true;
+        }
+        if shadowed_test && shadowed_expr {
+            break;
+        }
+    }
+    let is_stdlib_expr_macro = |mac: &str, key: blaze_id::ItemKey| -> bool {
+        dep_exports.iter().any(|proof| {
+            let dep = blaze_scope::scope_record::DepRecord::open(*proof);
+            if !matches!(dep.name(), "core" | "alloc" | "std") {
+                return false;
+            }
+            let Some(scope) = dep.scope(dep.root()) else {
+                return false;
+            };
+            let view = scope.view();
+            view.get(blaze_surface::Namespace::Macros, mac).is_some_and(|b| b.def.key == key && is_fn_macro(b.def))
+                || view.macro_exports().any(|def| def.name == mac && def.def == key && def.shapes.accepts(blaze_surface::CallShape::FnLike))
+        })
+    };
+
+    // Check `#[macro_use] extern crate ...` roots from non-stdlib dependencies.
+    let self_root = names.root_module();
+    for root_key in root.macro_use() {
+        if shadowed_test && shadowed_expr {
+            break;
+        }
+        if root_key == self_root {
+            continue;
+        }
+        let dep = dep_exports
+            .iter()
+            .map(|proof| blaze_scope::scope_record::DepRecord::open(*proof))
+            .find(|dep| dep.root() == root_key);
+        let Some(dep) = dep else {
+            // Unknown `#[macro_use]` root: conservatively treat expr macros as shadowed.
+            shadowed_expr = true;
+            continue;
+        };
+        if matches!(dep.name(), "core" | "alloc" | "std") {
+            continue;
+        }
+        if let Some(scope) = dep.scope(root_key) {
+            let view = scope.view();
+            if !shadowed_test {
+                for attr in ["test", "bench"] {
+                    if view.get(blaze_surface::Namespace::Macros, attr).is_some_and(|b| is_attr_macro(b.def)) {
+                        shadowed_test = true;
+                        break;
+                    }
+                }
+            }
+            if !shadowed_expr {
+                for &mac in blaze_file_items::nested::STD_EXPR_MACROS.iter() {
+                    if view.get(blaze_surface::Namespace::Macros, mac).is_some_and(|b| is_fn_macro(b.def)) {
+                        shadowed_expr = true;
+                        break;
+                    }
+                }
+            }
+            if !shadowed_test || !shadowed_expr {
+                for def in view.macro_exports() {
+                    if !shadowed_test && def.shapes.accepts(blaze_surface::CallShape::Attr) && matches!(def.name, "test" | "bench") {
+                        shadowed_test = true;
+                    }
+                    if !shadowed_expr && def.shapes.accepts(blaze_surface::CallShape::FnLike) && blaze_file_items::nested::is_std_expr_macro(def.name) {
+                        shadowed_expr = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for module in names.modules() {
+        if shadowed_test && shadowed_expr {
+            break;
+        }
+        if !shadowed_expr && names.no_implicit_prelude(module) {
+            shadowed_expr = true;
+        }
+        let Some(scope) = names.scope(module) else { continue };
+        if !shadowed_test || !shadowed_expr {
+            for def in scope.textual().chain(scope.macro_exports()) {
+                if !shadowed_test && def.shapes.accepts(blaze_surface::CallShape::Attr) && matches!(def.name, "test" | "bench") {
+                    shadowed_test = true;
+                }
+                if !shadowed_expr && def.shapes.accepts(blaze_surface::CallShape::FnLike) && blaze_file_items::nested::is_std_expr_macro(def.name) {
+                    shadowed_expr = true;
+                }
+                if shadowed_test && shadowed_expr {
+                    break;
+                }
+            }
+        }
+        if !shadowed_test {
+            for attr in ["test", "bench"] {
+                if let Some(binding) = scope.get(blaze_surface::Namespace::Macros, attr)
+                    && is_attr_macro(binding.def)
+                {
+                    shadowed_test = true;
+                    break;
+                }
+            }
+        }
+        if !shadowed_expr {
+            for &mac in blaze_file_items::nested::STD_EXPR_MACROS.iter() {
+                if let Some(binding) = scope.get(blaze_surface::Namespace::Macros, mac)
+                    && is_fn_macro(binding.def)
+                    && !is_stdlib_expr_macro(mac, binding.def.key)
+                {
+                    shadowed_expr = true;
+                    break;
+                }
+            }
+        }
+    }
+    (shadowed_test, shadowed_expr)
+}
+
+#[cfg(test)]
+fn has_shadowed_test_attr(names_bytes: &[u8], bump: blaze_own::Bump<'_>) -> bool {
+    shadowed_in_names(names_bytes, &[], bump).0
+}
+
+#[cfg(test)]
+fn has_shadowed_expr_macro(names_bytes: &[u8], dep_exports: &[Verified<'_>], bump: blaze_own::Bump<'_>) -> bool {
+    shadowed_in_names(names_bytes, dep_exports, bump).1
+}
+
+/// Records `definition_cell(entry_name)` reads for entries whose bodies `Outline::surface()`
+/// omits when shadowed: attributed functions (`shadowed_test`) and `Fn`/`Const`/`Static`
+/// items with `body_holds_items == true` (`shadowed_expr`). Each matching entry is recorded once.
+fn record_shadowed_definition_reads<A: core::alloc::Allocator>(
+    file_name: Name,
+    file_path: &[u8],
+    view: blaze_surface::FileItemsView<'_>,
+    shadowed_test: bool,
+    shadowed_expr: bool,
+    record_reads: &mut Vec<(Name, ContentId), A>,
+    reads: &mut SVec<'_, (CellId, ContentId)>,
+) {
+    let sig_file = crate::signature::SignatureFile::new(file_path);
+    for (index, entry) in view.items().enumerate() {
+        let want_test = shadowed_test
+            && entry.item.kind() == blaze_surface::ItemKind::Function
+            && view.attrs(&entry.item).any(|attr| attr.kind == blaze_surface::AttrKind::Other);
+        let want_expr = shadowed_expr
+            && matches!(
+                entry.item.detail,
+                blaze_surface::ItemDetail::Fn { body_holds_items: true }
+                    | blaze_surface::ItemDetail::Const { body_holds_items: true }
+                    | blaze_surface::ItemDetail::Static { body_holds_items: true }
+            );
+        if (want_test || want_expr)
+            && let Ok(index) = u32::try_from(index)
+        {
+            let entry_name = sig_file.entry_from_chain(crate::signature::stored_chain(view, blaze_surface::ItemIndex(index)));
+            record_reads.push((entry_name, entry.item.hash));
+            reads.push((CellId { of: file_name, cell: crate::engine_tasks::definition_cell(entry_name) }, entry.item.hash));
+        }
+    }
+}
+
+/// Records `definition_cell(entry_name)` reads for every function in `view` carrying an
+/// `AttrKind::Other` attribute (which includes bare `#[test]` and `#[bench]`).
+#[cfg(test)]
+fn record_attr_fn_definition_reads<A: core::alloc::Allocator>(
+    file_name: Name,
+    file_path: &[u8],
+    view: blaze_surface::FileItemsView<'_>,
+    record_reads: &mut Vec<(Name, ContentId), A>,
+    reads: &mut SVec<'_, (CellId, ContentId)>,
+) {
+    record_shadowed_definition_reads(file_name, file_path, view, true, false, record_reads, reads);
 }
 
 /// Results may arrive in any order. The engine's task index orders every observable merge.
@@ -2196,6 +2445,184 @@ pub(crate) mod schedule_test {
         admissions.finish(task).expect("the first entry can still file its result");
         assert!(matches!(admissions.admit(task), Err(EngineCheckError::Twice { task: refused }) if refused == task));
         println!("duplicate Names admission refused before and after filing");
+    }
+
+    #[test]
+    fn shadowed_test_proc_macro_records_definition_cell_while_builtin_test_does_not() {
+        use blaze_id::CrateItemKey;
+        use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+        struct MemSources<'a>(&'a [(usize, &'a str, &'a str)]);
+        impl<'a> SourceTexts<'a> for MemSources<'a> {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                self.0.iter().find(|&&(k, p, _)| k == krate && p == path).map(|&(_, _, text)| text)
+            }
+        }
+
+        let proc_src = "#![no_core]\n#[proc_macro_attribute]\npub fn test(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
+        let user_src = "#![no_core]\nuse my_macros::test;\n#[test]\nfn shadowed_test() { let x = 1; }\nfn plain_fn() { let y = 2; }\n";
+        let normal_src = "#![no_core]\n#[test]\nfn builtin_test() { let x = 1; }\nfn plain_fn() { let y = 2; }\n";
+
+        let frame = Frame::with_reserve(8 << 20, Tag::Nameres).expect("test frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
+        let rust = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let proc_implicit = Implicit { proc_macro: true, ..rust };
+        let sources = MemSources(&[
+            (0, "/macros/lib.rs", proc_src),
+            (1, "/user/lib.rs", user_src),
+            (2, "/normal/lib.rs", normal_src),
+        ]);
+        let deps_user = [("my_macros", 0usize)];
+        let test_cfg = [("test", None)];
+        let crates = [
+            CrateInput {
+                name: "my_macros",
+                key: CrateItemKey(ContentId::of("test shadowed_test proc_macro", b"my_macros")),
+                edition: Edition::E2021,
+                implicit: proc_implicit,
+                root: "/macros/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            },
+            CrateInput {
+                name: "user",
+                key: CrateItemKey(ContentId::of("test shadowed_test user", b"user")),
+                edition: Edition::E2021,
+                implicit: rust,
+                root: "/user/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &deps_user,
+                cfg: &test_cfg,
+                script: None,
+            },
+            CrateInput {
+                name: "normal",
+                key: CrateItemKey(ContentId::of("test shadowed_test normal", b"normal")),
+                edition: Edition::E2021,
+                implicit: rust,
+                root: "/normal/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &[],
+                cfg: &test_cfg,
+                script: None,
+            },
+        ];
+        let solved = resolve_crates(&crates, Sysroot::default(), &sources, &blaze_scope::task::Serial, bump).expect("resolve_crates");
+        let user_names = blaze_scope::names_record::encode(solved.krate(1), alloc).expect("encode user names");
+        let normal_names = blaze_scope::names_record::encode(solved.krate(2), alloc).expect("encode normal names");
+
+        assert!(has_shadowed_test_attr(&user_names, bump), "crate importing user #[proc_macro_attribute] pub fn test must trigger definition_cell reads");
+        assert!(!has_shadowed_test_attr(&normal_names, bump), "normal crate using built-in #[test] must not trigger definition_cell reads");
+
+        let outline = blaze_file_items::outline(user_src, Edition::E2021, alloc);
+        let file_items_bytes = outline.to_file_items(user_src, ContentId::of(crate::sweep::FILE_DOMAIN, user_src.as_bytes()), alloc).expect("to_file_items");
+        let file_items_aligned = blaze_scope::resolve::aligned(&file_items_bytes, bump);
+        let view = blaze_surface::FileItemsView::read(file_items_aligned).expect("FileItemsView::read");
+        let file_name = Name::file(b"user/lib.rs");
+        let heap = blaze_own::testing::heap();
+        let mut record_reads: Vec<(Name, ContentId), SharedAlloc<'_>> = Vec::new_in(heap.shared());
+        let mut reads: SVec<'_, (CellId, ContentId)> = SVec::new_in(heap.shared());
+        record_attr_fn_definition_reads(file_name, b"user/lib.rs", view, &mut record_reads, &mut reads);
+
+        assert_eq!(reads.len(), 1, "only attributed #[test] fn must record definition_cell, not plain_fn");
+        let sig_file = crate::signature::SignatureFile::new(b"user/lib.rs");
+        let shadowed_item = view.items().enumerate().find(|(_, e)| e.name == "shadowed_test").expect("shadowed_test entry");
+        let expected_entry = sig_file.entry_from_chain(crate::signature::stored_chain(view, blaze_surface::ItemIndex(u32::try_from(shadowed_item.0).expect("small"))));
+        let expected_cell = CellId { of: file_name, cell: crate::engine_tasks::definition_cell(expected_entry) };
+        assert_eq!(reads[0], (expected_cell, shadowed_item.1.item.hash));
+        assert_eq!(record_reads[0], (expected_entry, shadowed_item.1.item.hash));
+    }
+
+    #[test]
+    fn shadowed_std_expr_macro_records_definition_cell_while_normal_crate_does_not() {
+        use blaze_id::CrateItemKey;
+        use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+        struct MemSources<'a>(&'a [(usize, &'a str, &'a str)]);
+        impl<'a> SourceTexts<'a> for MemSources<'a> {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                self.0.iter().find(|&&(k, p, _)| k == krate && p == path).map(|&(_, _, text)| text)
+            }
+        }
+
+        let macro_dep_src = "#![no_core]\n#[macro_export]\nmacro_rules! println { ($($t:tt)*) => {}; }\n";
+        let local_shadow_src = "#![no_core]\nmacro_rules! assert_eq { ($a:expr, $b:expr) => {}; }\nfn calls_assert() { assert_eq!(1, 1); }\nfn plain_fn() { let y = 2; }\n";
+        let import_shadow_src = "#![no_core]\nuse dep_macros::println;\nfn calls_println() { println!(\"hi\"); }\n";
+        let no_prelude_src = "#![no_core]\n#![no_implicit_prelude]\nfn plain() { let x = 1; }\n";
+        let normal_src = "#![no_core]\nfn plain() { let x = 1; }\n";
+
+        let frame = Frame::with_reserve(8 << 20, Tag::Nameres).expect("test frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
+        let rust = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let sources = MemSources(&[
+            (0, "/dep/lib.rs", macro_dep_src),
+            (1, "/local/lib.rs", local_shadow_src),
+            (2, "/imported/lib.rs", import_shadow_src),
+            (3, "/noprelude/lib.rs", no_prelude_src),
+            (4, "/normal/lib.rs", normal_src),
+        ]);
+        const DEPS_IMPORTED: &[(&str, usize)] = &[("dep_macros", 0usize)];
+        let mk = |name: &'static str, root: &'static str, deps: &'static [(&'static str, usize)]| CrateInput {
+            name,
+            key: CrateItemKey(ContentId::of("test shadowed_expr_macro", name.as_bytes())),
+            edition: Edition::E2021,
+            implicit: rust,
+            root,
+            shown_from: "/",
+            features: &[],
+            deps,
+            cfg: &[],
+            script: None,
+        };
+        let crates = [
+            mk("dep_macros", "/dep/lib.rs", &[]),
+            mk("local_shadow", "/local/lib.rs", &[]),
+            mk("import_shadow", "/imported/lib.rs", DEPS_IMPORTED),
+            mk("no_prelude", "/noprelude/lib.rs", &[]),
+            mk("normal", "/normal/lib.rs", &[]),
+        ];
+        let solved = resolve_crates(&crates, Sysroot::default(), &sources, &blaze_scope::task::Serial, bump).expect("resolve_crates");
+        let local_names = blaze_scope::names_record::encode(solved.krate(1), alloc).expect("encode local");
+        let import_names = blaze_scope::names_record::encode(solved.krate(2), alloc).expect("encode import");
+        let noprelude_names = blaze_scope::names_record::encode(solved.krate(3), alloc).expect("encode noprelude");
+        let normal_names = blaze_scope::names_record::encode(solved.krate(4), alloc).expect("encode normal");
+
+        assert!(has_shadowed_expr_macro(&local_names, &[], bump), "local macro_rules! assert_eq must trigger expr-macro shadow guard");
+        assert!(has_shadowed_expr_macro(&import_names, &[], bump), "imported use dep_macros::println must trigger expr-macro shadow guard");
+        assert!(has_shadowed_expr_macro(&noprelude_names, &[], bump), "#![no_implicit_prelude] must trigger expr-macro shadow guard");
+        assert!(!has_shadowed_expr_macro(&normal_names, &[], bump), "normal crate must not trigger expr-macro shadow guard");
+
+        // `record_shadowed_definition_reads` records `definition_cell` ONLY for items with `body_holds_items == true`.
+        let outline = blaze_file_items::outline(local_shadow_src, Edition::E2021, alloc);
+        let file_items_bytes = outline.to_file_items(local_shadow_src, ContentId::of(crate::sweep::FILE_DOMAIN, local_shadow_src.as_bytes()), alloc).expect("to_file_items");
+        let file_items_aligned = blaze_scope::resolve::aligned(&file_items_bytes, bump);
+        let view = blaze_surface::FileItemsView::read(file_items_aligned).expect("FileItemsView::read");
+        let file_name = Name::file(b"local/lib.rs");
+        let heap = blaze_own::testing::heap();
+        let mut record_reads: Vec<(Name, ContentId), SharedAlloc<'_>> = Vec::new_in(heap.shared());
+        let mut reads: SVec<'_, (CellId, ContentId)> = SVec::new_in(heap.shared());
+        record_shadowed_definition_reads(file_name, b"local/lib.rs", view, false, true, &mut record_reads, &mut reads);
+
+        assert_eq!(reads.len(), 1, "only fn with body_holds_items=true must record definition_cell, not plain_fn");
+        let sig_file = crate::signature::SignatureFile::new(b"local/lib.rs");
+        let calls_item = view.items().enumerate().find(|(_, e)| e.name == "calls_assert").expect("calls_assert entry");
+        let expected_entry = sig_file.entry_from_chain(crate::signature::stored_chain(view, blaze_surface::ItemIndex(u32::try_from(calls_item.0).expect("small"))));
+        let expected_cell = CellId { of: file_name, cell: crate::engine_tasks::definition_cell(expected_entry) };
+        assert_eq!(reads[0], (expected_cell, calls_item.1.item.hash));
+        assert_eq!(record_reads[0], (expected_entry, calls_item.1.item.hash));
     }
 
     #[derive(Debug, PartialEq, Eq)]

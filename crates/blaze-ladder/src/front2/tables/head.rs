@@ -300,9 +300,16 @@ pub struct StoreConsts<'r, 'n, S> {
 impl<'n, S: NamesSource<'n>> ConstValues<'n> for StoreConsts<'_, 'n, S> {
     fn eval(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: LibKey) -> Result<(), ConstFail> {
         let mut consts = Consts::default();
-        let mut buckets = None;
-        let mut r = Records { names: self.names, keys, index: self.index, store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, self.prepared)) };
-        eval_len(&mut r, c)
+        // Back transient `Buckets` in a per-eval `FreezeScratch` so repeated `StoreConsts::eval`
+        // calls inside a single head task release their `ImplRow` tables immediately instead of
+        // accumulating in the outer bump-only `FreezeScratch` (`heads_of`).
+        let mut bucket_scratch = FreezeScratch::new(512 << 20, 0, blaze_mem::Tag::Infer)
+            .map_err(|_| ConstFail::Eval("could not reserve constant-evaluation buckets scratch frame".into()))?;
+        bucket_scratch.with_batch_alloc(|bucket_alloc, _| {
+            let mut buckets = Some(crate::front2::buckets::Buckets::for_source_in(self.names, self.index, bucket_alloc));
+            let mut r = Records { names: self.names, keys, index: self.index, store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, self.prepared)) };
+            eval_len(&mut r, c)
+        })
     }
 }
 

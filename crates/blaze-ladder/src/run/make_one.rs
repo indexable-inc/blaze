@@ -54,7 +54,7 @@ use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared,
 use crate::front2::const_at::{ConstNeed, ConstTable, Needs};
 use crate::front2::coroutines::Coroutines;
 use crate::front2::program::lazy::LazyRefusal;
-use super::lay_states::{LaidOnly, Lay, forget_laid_in, lay_and_build, lay_only, roots_of_instance, unchecked_owner};
+use super::lay_states::{LaidOnly, Lay, forget_laid_in, lay_and_build_one, lay_only, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
 
 /// Whole-program demand-driven cross-function LIR inlining and LTO for `blaze export`.
@@ -1500,7 +1500,8 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     // Any coroutine held by value in a constant need's arguments (e.g. `Box::new(async move { .. })`
     // reading `<{coroutine} as SizedTypeProperties>::LAYOUT`): lay out its state from types first
     // (`lay_only`) so constant evaluation observes the exact same `StateShape` as the build.
-    let mut laid_for_const: AVec<'static, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(work.alloc);
+    // Shapes remain recorded in `bodies.coroutines.states` (the coroutine's own `poll`/`resume`/`drop`
+    // entry always forgets its own shape before `lay_and_build_one`), avoiding redundant re-laying.
     let mut unchecked_coro = None;
     let lay_result = if found.is_ok() && !work.needs.is_empty() {
         let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
@@ -1515,10 +1516,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
             match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
                 Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
                 Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
-                    Ok(LaidOnly::Done(recorded)) => {
-                        laid_for_const = recorded;
-                        Ok(())
-                    }
+                    Ok(LaidOnly::Done(_)) => Ok(()),
                     Ok(LaidOnly::Unchecked(owner)) => {
                         unchecked_coro = Some(owner);
                         Ok(())
@@ -1549,10 +1547,6 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         &mut table.const_at,
         crate::front2::const_at::BuildFacts::new(&table.closures, &table.coroutines),
     );
-    // Forget states laid solely for constant evaluation so `build_one`'s `lay_and_build` still
-    // builds their functions into `stash` (states already laid & built earlier were not in
-    // `laid_for_const` and remain recorded).
-    forget_laid_in(&table.coroutines, &laid_for_const, work.ground.view());
     if let Err(refusal) = pull_res {
         let item = refusal.need.item();
         let path = program.item_named(item);
@@ -2205,7 +2199,12 @@ fn build_lir_phase<P: FrontEnd>(
                 work.stash.swap_remove(at);
             }
             if find(&work.stash[..]).is_none() {
-                match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &[of], true, work.alloc)? {
+                // `of` may already have a types-only `StateShape` in `bodies.coroutines.states`
+                // from an earlier non-coroutine caller (`lay_only`). Forget `of`'s own shape
+                // (preserving already-laid child shapes) so `lay_and_build_one` lays and builds
+                // only `of` itself into `work.stash`.
+                bodies.coroutines.states.forget(of.owner, of.ordinal, &args);
+                match lay_and_build_one(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, of, true, work.alloc)? {
                     Lay::Done => {}
                     Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
                     Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
@@ -2228,10 +2227,13 @@ fn build_lir_phase<P: FrontEnd>(
         let extra_args = (instance.args != owner_args).then_some(instance.args);
         let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, work.alloc)?;
         if !roots.is_empty() {
-            match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, true, work.alloc)? {
-                Lay::Done => {}
-                Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
-                Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
+            // Non-coroutine callers (e.g. `Pin::as_mut`, `DerefMut::deref_mut`, `Box::into_pin`,
+            // `drop_glue`, async callers) only need each referenced coroutine's `StateShape`
+            // (types only), never its LIR — each coroutine builds its own LIR lazily when its
+            // `poll`/`resume`/`drop` entry is actually demanded.
+            match lay_only(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, i, &roots, work.alloc)? {
+                LaidOnly::Done(_) => {}
+                LaidOnly::Unchecked(owner) => return Ok(Phase1::Check(owner)),
             }
         }
     }

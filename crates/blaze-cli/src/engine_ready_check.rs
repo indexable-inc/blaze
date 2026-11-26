@@ -4,15 +4,15 @@
 //! host's unrecorded `Recorded::peek`/`row` and its `placed` (kinds.rs), `BodyRunner::run_body`
 //! (engine_bodies.rs: the `Sync` part of a setup a run reads, the phase path's `Shared` but for
 //! today's digests) and `Prepared::join_ready` (THE ONE JOIN both drivers call),
-//! `LintsStage::lint_units`/`keep` (engine_lints.rs) and `engine_answer::save_changes` (the ready
+//! `LintsStage::lint_one`/`keep` (engine_lints.rs) and `engine_answer::save_changes` (the ready
 //! commit: pages alone, the header index left `Headers::Absent`, no shard read or written).
 //!
-//! Here: the three kinds a one-function edit enters (`FileItems`, `Lint`, `BodyCheck`; the
-//! precondition engine_ready_edit.rs `admit` refuses any other), the request-wide [`Sink`] (each
-//! file's one lint walk parked before the drive, the body rows the bodies' setup decided at the
-//! plan, each body's lines and findings, each kind's typed error), the pool ([`Workers`]), the
-//! drive itself ([`drive_edit`]) and the drive's stop as the command's error ([`stopped`]). The
-//! commit's planted bug is engine_ready_edit.rs `CommitPlant`.
+//! Here: the four kinds a one-function edit enters (`FileItems`, `Given`, `Lint`, `BodyCheck`; the
+//! precondition engine_ready_edit.rs `admit` refuses any other), the request-wide [`Sink`] (the
+//! lint units kept by `Lint` runs on workers, the body rows the bodies' setup decided at the plan,
+//! each body's lines and findings, each kind's typed error), the pool ([`Workers`]), the drive
+//! itself ([`drive_edit`]) and the drive's stop as the command's error ([`stopped`]). The commit's
+//! planted bug is engine_ready_edit.rs `CommitPlant`.
 //!
 //! What a kind holds is `Sync` by construction: the sink behind its one lock holds only `Send`
 //! parts (a kind's failure as [`KindError`], owned and `Copy`, never the command's `CliError`),
@@ -29,7 +29,7 @@
 
 use core::convert::Infallible;
 
-use blaze_drive::key::{Key, Name};
+use blaze_drive::key::Name;
 use blaze_drive::{Kind, Locate};
 // `Ran` here is the engine's (kinds.rs); engine_bodies.rs `Ran` is a body's row.
 use blaze_engine::kinds::{Ask, Defines, Failure, KindFacts, Out, Outcome, Owed, ROW_CELL, Ran, Recorded, Refusal, TaskKind};
@@ -92,7 +92,7 @@ fn ran_of<'a>(src: &Recorded<'_, 'a>, done: Done<'a>, standing: Standing, out: &
 
 /// The task's file's place in the planner's outlines and its outline.
 fn outline_of<'o, 'h>(outlined: &'o [Outlined<'h>], file: Name) -> Option<(usize, &'o Outlined<'h>)> {
-    outlined.binary_search_by(|one| one.name.cmp(&file)).ok().map(|at| (at, &outlined[at]))
+    outlined.binary_search_by(|one| one.name.cmp(&file)).ok().and_then(|at| outlined.get(at).map(|one| (at, one)))
 }
 
 /// The source of the unit `name` as its file's outline lists it.
@@ -103,17 +103,6 @@ fn unit_of(one: &Outlined<'_>, name: Name) -> Option<ContentId> {
             _ => None,
         })
     })
-}
-
-/// One lint unit's row from its file's walk, parked in the [`Sink`] until its task runs.
-pub(crate) struct Parked<'a> {
-    name: Name,
-    /// The key the walk made its row under: the task the engine runs must carry it (rule 21).
-    key: Key,
-    done: Option<Done<'a>>,
-    kept: UnitKept,
-    /// Its task ran and took `done`: only these are the stage's after the drive.
-    ran: bool,
 }
 
 /// What the kinds' runs hand the coordinator beside their rows, behind one named lock (rule
@@ -131,8 +120,9 @@ pub(crate) struct Sink<'a, 'f> {
 
 /// The sink's contents, taken whole after the drive.
 pub(crate) struct Sunk<'a, 'f> {
-    /// Each entered lint unit's row from its file's one walk ([`walk_lints`]), sorted by name.
-    lints: SVec<'a, Parked<'a>>,
+    /// Each entered lint task's kept result, pushed when its `Lint` task finishes on a worker and
+    /// sorted by name in [`Sunk::keep_lints`] (rule 25).
+    lints: SVec<'a, (Name, UnitKept)>,
     /// Each body run's lines, findings and frozen-head counts, its row given to the engine.
     pub(crate) bodies: SVec<'a, BodyRun<'a, 'f>>,
     /// Each run's typed error, by its task (rule 19): the engine is told [`Refusal::Host`].
@@ -160,9 +150,15 @@ impl From<KindError> for EngineCheckError {
 }
 
 impl<'a, 'f> Sink<'a, 'f> {
-    /// A request's sink over the lint rows `walk_lints` parked and the body rows `prepare` decided.
-    pub(crate) fn new(lints: SVec<'a, Parked<'a>>, decided: blaze_engine::Buffer<'a>, alloc: SharedAlloc<'a>) -> Sink<'a, 'f> {
-        Sink { sunk: blaze_core::lock::Lock::new("engine.ready.sink", Sunk { lints, bodies: SVec::new_in(alloc), failed: SVec::new_in(alloc) }), decided }
+    /// A request's sink over the body rows `prepare` decided.
+    pub(crate) fn new(decided: blaze_engine::Buffer<'a>, alloc: SharedAlloc<'a>) -> Sink<'a, 'f> {
+        Sink {
+            sunk: blaze_core::lock::Lock::new(
+                "engine.ready.sink",
+                Sunk { lints: SVec::new_in(alloc), bodies: SVec::new_in(alloc), failed: SVec::new_in(alloc) },
+            ),
+            decided,
+        }
     }
 
     /// `task`'s row as the bodies' setup decided it, copied into `out`'s allocator with each read
@@ -192,24 +188,6 @@ impl<'a, 'f> Sink<'a, 'f> {
         Ran::Failed(Refusal::Host { name })
     }
 
-    /// The row the task's file's walk parked for it, taken. A lint run reads nothing (it stands
-    /// by its key), so it never ends in `Need` and is taken once.
-    fn take_lint(&self, task: &Task) -> Result<Done<'a>, KindError> {
-        let name = task.planned.name;
-        let mut sunk = self.sunk.lock();
-        let at = sunk.lints.binary_search_by_key(&name, |one| one.name).map_err(|_| KindError::Host {
-            task: name,
-            what: "a `Lint` task its file's walk did not park: the forward wake entered a unit the precondition did not name (engine_ready_check.rs `walk_lints`)",
-        })?;
-        let parked = &mut sunk.lints[at];
-        if parked.key != task.key {
-            return Err(KindError::Host { task: name, what: "its lint row was walked under another key than the task the engine runs" });
-        }
-        let done = parked.done.take().ok_or(KindError::Host { task: name, what: "its lint row was taken twice in one request" })?;
-        parked.ran = true;
-        Ok(done)
-    }
-
     pub(crate) fn into_sunk(self) -> Sunk<'a, 'f> {
         self.sunk.into_inner()
     }
@@ -222,13 +200,11 @@ impl<'a, 'f> Sunk<'a, 'f> {
         Some(self.failed.swap_remove(at).1)
     }
 
-    /// The lint units whose tasks ran, into the stage (`LintsStage::keep`), in name order; a
-    /// unit parked but never entered is dropped with the sink.
+    /// The lint units whose tasks ran, into the stage (`LintsStage::keep`), in name order (rule 25).
     pub(crate) fn keep_lints(&mut self, lints: &mut LintsStage) {
-        for parked in self.lints.drain(..) {
-            if parked.ran {
-                lints.keep(parked.kept);
-            }
+        self.lints.sort_unstable_by_key(|(name, _)| *name);
+        for (_, kept) in self.lints.drain(..) {
+            lints.keep(kept);
         }
     }
 }
@@ -242,66 +218,6 @@ pub(crate) fn stopped(error: blaze_engine::ready::Error<'_>, sunk: &mut Sunk<'_,
         return EngineCheckError::from(kept).into();
     }
     EngineCheckError::Ready(error.detach_in(heap)).into()
-}
-
-/// Each edited file's entered lint units in ONE walk a file, before the drive (D187: lint woken
-/// by file). A unit's scope comes from the units around it, so a walk a unit would read its file
-/// once a unit; here each file's units are walked once, the files in parallel, and each row
-/// parked by task name in the request's [`Sink`]. `tasks` are the entering `Lint` tasks, from
-/// the request's one plan (engine_ready_edit.rs `file_tasks`, never planned again here), each
-/// with the key the engine gives it (`Tools::key`), checked again when it runs. The files'
-/// outlines are `outlined`, sorted by name.
-pub(crate) fn walk_lints<'a>(cx: &Cx, lints: &LintsStage, root: &Dir<ReadWrite>, outlined: &[Outlined<'_>], tasks: &[Task], alloc: SharedAlloc<'a>) -> Result<SVec<'a, Parked<'a>>, CliError> {
-    let mut asked: SVec<'a, (usize, Task, ContentId)> = SVec::with_capacity_in(tasks.len(), alloc);
-    for task in tasks.iter() {
-        let one = &task.planned;
-        let (file, outline) = outline_of(outlined, one.file).ok_or(EngineCheckError::ReadyHost { task: one.name, what: "a `Lint` task whose file is none of the request's outlines" })?;
-        let unit = unit_of(outline, one.name).ok_or(EngineCheckError::ReadyHost { task: one.name, what: "a `Lint` task its file's outline lists no unit of" })?;
-        asked.push((file, *task, unit));
-    }
-    asked.sort_unstable_by_key(|(file, task, _)| (*file, task.planned.name));
-    let mut jobs: SVec<'a, (usize, SVec<'a, (Task, ContentId)>)> = SVec::new_in(alloc);
-    for group in asked.chunk_by(|a, b| a.0 == b.0) {
-        let mut units: SVec<'a, (Task, ContentId)> = SVec::with_capacity_in(group.len(), alloc);
-        units.extend(group.iter().map(|(_, task, unit)| (*task, *unit)));
-        jobs.push((group[0].0, units));
-    }
-    if jobs.is_empty() {
-        return Ok(SVec::new_in(alloc));
-    }
-    if let [(file, units)] = jobs.as_slice()
-        && let Some(one) = outlined.get(*file)
-    {
-        let rows = lints.lint_units(cx, root, *file, one, units, alloc);
-        let mut parked: SVec<'a, Parked<'a>> = SVec::with_capacity_in(rows.len(), alloc);
-        parked.extend(rows.into_iter().map(|(done, kept)| Parked { name: done.name, key: done.key, done: Some(done), kept, ran: false }));
-        parked.sort_unstable_by_key(|one| one.name);
-        return Ok(parked);
-    }
-    let span = cx.span("engine: the ready lint walks");
-    let scope = span.scope();
-    // The handles live in the walks' span frame (rule 11).
-    let mut running = blaze_own::Vec::with_capacity_in(jobs.len(), span.frame());
-    for (file, units) in jobs.iter() {
-        let (file, one, units) = (*file, &outlined[*file], &units[..]);
-        running.push(scope.may_overlap("engine ready lint walk", READY_FRAME, move |cx: &Cx| Ok::<_, Infallible>(lints.lint_units(cx, root, file, one, units, alloc))));
-    }
-    let mut parked: SVec<'a, Parked<'a>> = SVec::with_capacity_in(asked.len(), alloc);
-    let mut failed = None;
-    for handle in running.into_iter() {
-        match handle.join(&span) {
-            Ok(rows) => parked.extend(rows.into_iter().map(|(done, kept)| Parked { name: done.name, key: done.key, done: Some(done), kept, ran: false })),
-            Err(error) => {
-                failed.get_or_insert(error);
-            }
-        }
-    }
-    scope.join(&span).map_err(CliError::Pool)?;
-    if let Some(error) = failed {
-        return Err(CliError::Pool(error));
-    }
-    parked.sort_unstable_by_key(|one| one.name);
-    Ok(parked)
 }
 
 /// `FileItems`: an edited file's outline, made by the planner and published here as the phase
@@ -358,16 +274,19 @@ impl<'a> TaskKind<'a, Cx> for GivenKind<'_, 'a, '_> {
     }
 }
 
-/// `Lint`: one lint unit of an edited file (planned by `file_tasks`, engine_lints.rs `plan`).
-/// Its row was made by its file's one walk before the drive ([`walk_lints`]) and parked in the
-/// [`Sink`]; the run takes it (a kind answers one name a run, shell.rs `TaskKind::run`, so the
-/// file's siblings are answered from the one walk this way, not by a run each). Reads nothing:
-/// it stands by its key.
-pub(crate) struct LintKind<'p, 'a, 'f> {
+/// `Lint`: one file's lint task (planned by `file_tasks`, engine_lints.rs `plan`).
+/// Runs [`LintsStage::lint_one`] directly on the ready pool concurrently with `BodyCheck` once
+/// its file's `FileItems` row is final (`Stage::Lints` depends only on `Stage::Units` and
+/// `Stage::Outlines` in `blaze-engine` kinds.rs / ready.rs). Reads nothing in its recorded read
+/// list: it stands by its key.
+pub(crate) struct LintKind<'p, 'h, 'a, 'f> {
+    pub(crate) lints: &'p LintsStage,
+    pub(crate) root: &'p Dir<ReadWrite>,
+    pub(crate) outlined: &'p [Outlined<'h>],
     pub(crate) sink: &'p Sink<'a, 'f>,
 }
 
-impl<'a> TaskKind<'a, Cx> for LintKind<'_, 'a, '_> {
+impl<'a> TaskKind<'a, Cx> for LintKind<'_, '_, 'a, '_> {
     fn facts(&self) -> KindFacts {
         KindFacts { kind: Kind::Lint, stage: Stage::Lints, grows_into: None }
     }
@@ -376,11 +295,27 @@ impl<'a> TaskKind<'a, Cx> for LintKind<'_, 'a, '_> {
         Err(Refusal::CannotPlan { kind: Kind::Lint, ask })
     }
 
-    fn run(&self, _cx: &Cx, src: &Recorded<'_, 'a>, task: &Task, out: &mut Out<'a>) -> Ran<'a> {
-        match self.sink.take_lint(task) {
-            Ok(done) => ran_of(src, done, Standing::As(Stands::ByKey), out),
-            Err(error) => self.sink.fail(task.planned.name, error),
+    fn run(&self, cx: &Cx, src: &Recorded<'_, 'a>, task: &Task, out: &mut Out<'a>) -> Ran<'a> {
+        let name = task.planned.name;
+        // Wait until this file's `FileItems` row is final (unrecorded peek): in Tick 1 `FileItems`
+        // runs and merges in sub-millisecond time while `Lint` and `BodyCheck` park in O(1); in
+        // Tick 2 `Lint` and `BodyCheck` wake together and execute concurrently across all workers.
+        let _ = src.row(task.planned.file);
+        if let Some(needs) = src.need() {
+            return Ran::Need(needs);
         }
+        let Some((file, outline)) = outline_of(self.outlined, task.planned.file) else {
+            return self.sink.fail(name, KindError::Host { task: name, what: "a `Lint` task whose file is none of the request's outlines" });
+        };
+        if unit_of(outline, name).is_none() {
+            return self.sink.fail(name, KindError::Host { task: name, what: "a `Lint` task its file's outline lists no unit of" });
+        }
+        let (done, kept) = self.lints.lint_one(cx, self.root, file, outline, task, out.alloc());
+        let ran = ran_of(src, done, Standing::As(Stands::ByKey), out);
+        if let Ran::Done(_) = &ran {
+            self.sink.sunk.lock().lints.push((name, kept));
+        }
+        ran
     }
 }
 
@@ -490,13 +425,14 @@ pub(crate) struct Driven<'a, 'f> {
     pub(crate) panicked: SVec<'a, Name>,
 }
 
-/// The stages a ready edit reads, made by the coordinator before the drive: each entered file's
-/// parked lint rows ([`walk_lints`]), and the bodies' one setup (`BodiesStage::prepare` over the
-/// ready engine's view before the drive, which takes any `CellDigests`) as its runs read it
-/// (`Prepared::runner` over `BodiesStage::reads_view`) with the rows that setup decided with no
-/// check to run (its buffer).
+/// The stages a ready edit reads, made by the coordinator before the drive: the read-only lint
+/// stage (with priors loaded, run concurrently with `BodyCheck` inside the drive) and checkout
+/// root, and the bodies' one setup (`BodiesStage::prepare` over the ready engine's view before
+/// the drive, which takes any `CellDigests`) as its runs read it (`Prepared::runner` over
+/// `BodiesStage::reads_view`) with the rows that setup decided with no check to run (its buffer).
 pub(crate) struct Stages<'p, 'f, 'r, 'a> {
-    pub(crate) parked: SVec<'a, Parked<'a>>,
+    pub(crate) lints: &'p LintsStage,
+    pub(crate) root: &'p Dir<ReadWrite>,
     pub(crate) runner: Option<BodyRunner<'p, 'f, 'r>>,
     pub(crate) decided: blaze_engine::Buffer<'a>,
 }
@@ -519,12 +455,12 @@ pub(crate) fn drive_edit<'a, 'f>(
     alloc: SharedAlloc<'a>,
     heap: SharedAlloc<'static>,
 ) -> Result<Driven<'a, 'f>, CliError> {
-    let sink: Sink<'a, 'f> = Sink::new(stages.parked, stages.decided, alloc);
+    let sink: Sink<'a, 'f> = Sink::new(stages.decided, alloc);
     // The kinds borrow the sink for the drive alone: it is taken whole after it.
     let drove = {
         let outlines = FileItemsKind { outlined };
         let given = GivenKind { given: given_answers, sink: &sink };
-        let lint = LintKind { sink: &sink };
+        let lint = LintKind { lints: stages.lints, root: stages.root, outlined, sink: &sink };
         let body = BodyKind { runner: stages.runner, sink: &sink, given_entering };
         let list: [&dyn TaskKind<'a, Cx>; 4] = [&outlines, &given, &lint, &body];
         let kinds = blaze_engine::kinds::Kinds::new(&list).map_err(EngineCheckError::ReadyKinds)?;
@@ -550,11 +486,10 @@ pub(crate) fn drive_edit<'a, 'f>(
     Ok(Driven { finished, sunk, panicked })
 }
 
-/// A lint walk's frame, as the phase path's: one file a job.
-const READY_FRAME: usize = 1 << 28;
-/// A ready engine task's frame: `FileItems`, `Given`, and `Lint` use almost none, and `BodyCheck`
-/// reserves its own stretch/scratch frames (`BODIES_FRAME`/`BODY_SCRATCH`), so a 4 MiB reserve
-/// avoids 256 MiB mmap/munmap churn on every tick's jobs.
+/// A ready engine task's frame: `FileItems` and `Given` use almost none, `Lint` runs in-frame for
+/// small edits and reserves `LINTS_FRAME` only when needed, and `BodyCheck` reserves its own
+/// stretch/scratch frames (`BODIES_FRAME`/`BODY_SCRATCH`), so a 4 MiB reserve avoids 256 MiB
+/// mmap/munmap churn on every tick's jobs.
 const READY_TASK_FRAME: usize = 4 << 20;
 
 /// The command's workers as the shell's pool (blaze-engine shell.rs `Pool`): each job of a
@@ -602,7 +537,7 @@ impl<'a> blaze_engine::shell::Pool<'a> for Workers<'_> {
         // The handles live in the batch's span frame (rule 11), not a global heap.
         let mut running = blaze_own::Vec::with_capacity_in(jobs.len(), cx.frame());
         for job in jobs.iter_mut() {
-            let clock = self.clock.clone();
+            let clock = self.clock;
             running.push(scope.may_overlap("engine ready task", READY_TASK_FRAME, move |cx: &Cx| {
                 let began = at(start, clock.now());
                 // A job not started by the deadline is left unrun (shell.rs `Pool::run`).

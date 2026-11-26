@@ -249,7 +249,11 @@ pub struct LazyCounts {
 /// The program filled one body at a time (module docs).
 struct LazyConsts<'n, S> {
     names: S,
-    index: crate::front2::index::Index<'n>,
+    /// Lang-crate scope copied from `front.index.scope()` so `index` is built lazily on first
+    /// uncached constant evaluation instead of duplicating `Index::from_source` on every
+    /// `LazyProgram::from_records` construction.
+    scope: AVec<'static, usize>,
+    index: RefCell<Option<crate::front2::index::Index<'n>>>,
     prepared: &'n Prepares<'n>,
     /// Persistent impl-filing index reused across constant evaluations of frozen heads so
     /// every crate's unfiled impl rows are filed at most once per lazy program instead of
@@ -282,16 +286,28 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
             store.maps.file_bits(c, bits);
             return Ok(());
         }
+        if consts.index.borrow().is_none() {
+            let built = crate::front2::index::Index::from_source(consts.names, consts.scope.as_slice()).map_err(|_| {
+                let item = checker_of(c);
+                crate::front2::consts::ConstFail::Body { item, error: BodyError::NoBody(item) }
+            })?;
+            *consts.index.borrow_mut() = Some(built);
+        }
+        let index_guard = consts.index.borrow();
+        let Some(consts_index) = index_guard.as_ref() else {
+            let item = checker_of(c);
+            return Err(crate::front2::consts::ConstFail::Body { item, error: BodyError::NoBody(item) });
+        };
         let reused = consts.bucket_index.borrow_mut().take();
         let mut buckets = Some(match reused {
             Some(ix) => Buckets::from_index(ix),
-            None => Buckets::for_source(consts.names, &consts.index),
+            None => Buckets::for_source(consts.names, consts_index),
         });
         let mut evaluator = Consts::default();
         let mut r = crate::front2::check::Records {
             names: consts.names,
             keys,
-            index: &consts.index,
+            index: consts_index,
             store,
             buckets: &mut buckets,
             order: crate::front2::check::BuildOrder::AsAsked,
@@ -453,8 +469,13 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// placement (seam_rules.rs `SiteCache`).
     site_cache: RefCell<seam_rules::SiteCache<'n>>,
     /// Each crate's members keyed as their containers' heads key them, made the first time a
-    /// key of the crate is asked that the key map does not know (lazy/locate.rs).
-    member_rows: HashMap<usize, locate::MemberIndex<'n>, Global>,
+    /// key of the crate is asked that the key map and targeted container probes do not know
+    /// (lazy/locate.rs).
+    member_rows: Map<usize, locate::MemberIndex<'n>, Alloc<'n>>,
+    /// Per-crate targeted member index over `#[lang]` containers alone, built lazily before
+    /// falling back to a full crate-wide `member_rows` scan so `core`/`std` lang trait methods
+    /// (e.g. `PartialEq::eq` in `assert_eq!`) resolve in O(lang items) with zero `each_item` scan.
+    lang_member_rows: Map<usize, locate::MemberIndex<'n>, Alloc<'n>>,
     /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`,
     /// `FrontEnd::specialize_inline_for`), created on demand per `(orig, concrete_args)`.
     inline_for_specs: AVec<'n, crate::front2::inline_for::SpecRow>,
@@ -527,11 +548,12 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let prepared = Prepares::new_in(bump);
         store.prepared = Some(prepared);
         let (seed, buckets) = if seeded_heads {
-            let consts_index = crate::front2::index::Index::from_source(front.names, front.index.scope())
-                .map_err(|e| Front2Refusal::Front(crate::front2::FrontError::Lang(e)))?;
+            let mut scope = AVec::with_capacity_in(front.index.scope().len(), alloc);
+            scope.extend_from_slice(front.index.scope());
             let consts_cell: &'n RefCell<Option<LazyConsts<'n, S>>> = front.frame.alloc(RefCell::new(Some(LazyConsts {
                 names: front.names,
-                index: consts_index,
+                scope,
+                index: RefCell::new(None),
                 prepared,
                 bucket_index: RefCell::new(None),
                 cached_bits: RefCell::new(blaze_hash::HashMap::new_in(alloc)),
@@ -586,7 +608,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             definers: crate::front2::tait::Definers::new_in(alloc),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             site_cache: RefCell::new(seam_rules::SiteCache::new_in(alloc)),
-            member_rows: HashMap::new_in(Global),
+            member_rows: Map::new_in(alloc),
+            lang_member_rows: Map::new_in(alloc),
             inline_for_specs: AVec::new_in(alloc),
             fixed_spell: Spelling::fixed(),
             adt_scanned_tys: 0,

@@ -62,34 +62,62 @@ pub(crate) fn member_entry(owner: Name, kind: blaze_surface::ItemKind, name: &st
     Name::new(blaze_drive::Kind::Signature, digest)
 }
 
-fn item_cells<'a>(file: crate::signature::SignatureFile, view: blaze_surface::FileItemsView<'_>, defines: &mut SVec<'a, (Cell, ContentId)>, alloc: SharedAlloc<'a>) {
+#[cfg(test)]
+fn item_cells<'a, A: core::alloc::Allocator + Copy>(
+    file: crate::signature::SignatureFile,
+    view: blaze_surface::FileItemsView<'_>,
+    defines: &mut SVec<'a, (Cell, ContentId)>,
+    scratch: A,
+) {
+    item_cells_in(file, view, defines, 0, scratch);
+}
+
+fn item_cells_in<'a, A: core::alloc::Allocator + Copy>(
+    file: crate::signature::SignatureFile,
+    view: blaze_surface::FileItemsView<'_>,
+    defines: &mut SVec<'a, (Cell, ContentId)>,
+    member_hint: usize,
+    scratch: A,
+) {
     use blaze_surface::{ItemIndex, ItemKind};
-    let mut groups = SVec::new_in(alloc);
+    let mut groups = blaze_own::Vec::with_capacity_in(member_hint, scratch);
+    let mut last_owner: Option<(ItemIndex, Name)> = None;
     for (index, entry) in view.items().enumerate() {
-        let at = ItemIndex(index as u32);
+        let at = ItemIndex(u32::try_from(index).unwrap_or(u32::MAX));
         let item = &entry.item;
         let name = file.entry_from_chain(crate::signature::stored_chain(view, at));
         let signature = crate::signature::stored_signature(view, at, item);
         defines.push((definition_cell(name), item.hash));
         defines.push((signature_cell(name), signature));
-        if !entry.name.is_empty() && let Some(up) = item.parent
+        if !entry.name.is_empty()
+            && let Some(up) = item.parent
             && view.item(up).is_some_and(|owner| matches!(owner.kind(), ItemKind::Trait | ItemKind::Impl))
         {
-            let owner = file.entry_from_chain(crate::signature::stored_chain(view, up));
+            let owner = match last_owner {
+                Some((cached_up, cached_name)) if cached_up == up => cached_name,
+                _ => {
+                    let computed = file.entry_from_chain(crate::signature::stored_chain(view, up));
+                    last_owner = Some((up, computed));
+                    computed
+                }
+            };
             let group = member_entry(owner, item.kind(), blaze_scope::task::unraw(entry.name));
             groups.push((group, at.0, item.hash, signature));
         }
     }
-    groups.sort_unstable_by_key(|row| (row.0, row.1));
-    for rows in groups.chunk_by(|a, b| a.0 == b.0) {
-        let mut full = blaze_ids::Hasher::new("blaze-cli member definition alternatives 1");
-        let mut head = blaze_ids::Hasher::new("blaze-cli member signature alternatives 1");
-        for (_, _, text, sig) in rows {
-            full.id(text);
-            head.id(sig);
+    if !groups.is_empty() {
+        groups.sort_unstable_by_key(|row| (row.0, row.1));
+        for rows in groups.chunk_by(|a, b| a.0 == b.0) {
+            let Some(first) = rows.first() else { continue };
+            let mut full = blaze_ids::Hasher::new("blaze-cli member definition alternatives 1");
+            let mut head = blaze_ids::Hasher::new("blaze-cli member signature alternatives 1");
+            for (_, _, text, sig) in rows {
+                full.id(text);
+                head.id(sig);
+            }
+            defines.push((definition_cell(first.0), full.finish()));
+            defines.push((signature_cell(first.0), head.finish()));
         }
-        defines.push((definition_cell(rows[0].0), full.finish()));
-        defines.push((signature_cell(rows[0].0), head.finish()));
     }
 }
 
@@ -194,9 +222,9 @@ pub(crate) struct Tasks<'p, 'h> {
 
 impl Tasks<'_, '_> {
     /// Runs `task` into `buffer`, its result's lists in `alloc`; a panic is the task's failure.
-    pub(crate) fn work<'a>(&self, _cx: &Cx, _view: View<'_, 'a>, task: &Task, buffer: &mut Buffer<'a>, alloc: SharedAlloc<'a>) {
+    pub(crate) fn work<'a>(&self, cx: &Cx, _view: View<'_, 'a>, task: &Task, buffer: &mut Buffer<'a>, alloc: SharedAlloc<'a>) {
         let ran = work::unwinding(|| match task.planned.phase.stage {
-            Stage::Outlines => self.outline(task, alloc),
+            Stage::Outlines => self.outline_in(task, alloc, cx.frame()),
             // Not planned yet (engine_check.rs `plan`): a task entered in a stage with no runner
             // here is a failure row, named, never skipped.
             // The units, scripts and names stages run on the coordinator (engine_units.rs,
@@ -212,33 +240,72 @@ impl Tasks<'_, '_> {
     /// The `Outlines` task: the planner's outline of the task's file, published. One code for
     /// both drivers: the phase path's [`Tasks::work`] and the `Ready` kind (engine_ready_check.rs).
     pub(crate) fn outline<'a>(&self, task: &Task, alloc: SharedAlloc<'a>) -> Done<'a> {
+        self.outline_in(task, alloc, alloc)
+    }
+
+    fn outline_in<'a, S: core::alloc::Allocator + Copy>(&self, task: &Task, alloc: SharedAlloc<'a>, scratch: S) -> Done<'a> {
         let Ok(at) = self.outlined.binary_search_by(|one| one.name.cmp(&task.planned.name)) else {
             return failed(task, alloc);
         };
-        let Ok(record) = &self.outlined[at].made else {
+        let Some(outlined) = self.outlined.get(at) else {
             return failed(task, alloc);
         };
-        let mut defines = SVec::new_in(alloc);
-        defines.push((WHOLE, record.out));
-        if let Some(surface) = surface_of(record) {
-            defines.push((SURFACE, surface));
+        let Ok(record) = &outlined.made else {
+            return failed(task, alloc);
+        };
+        let part_cells = record
+            .parts
+            .iter()
+            .filter(|part| matches!(part.name.kind, blaze_drive::Kind::Signature | blaze_drive::Kind::BodyCheck))
+            .count();
+        let mut defines = if let Some(surface) = surface_of(record) {
             let payload = record.payload_bytes().unwrap_or_else(|error| panic!("outline {:?} has no item payload: {error:?}", record.name));
             let view = blaze_surface::FileItemsView::read(payload).unwrap_or_else(|error| panic!("outline {:?} has an invalid item payload: {error:?}", record.name));
+            let member_count = view
+                .items()
+                .filter(|entry| {
+                    !entry.name.is_empty()
+                        && entry
+                            .item
+                            .parent
+                            .is_some_and(|up| view.item(up).is_some_and(|owner| matches!(owner.kind(), blaze_surface::ItemKind::Trait | blaze_surface::ItemKind::Impl)))
+                })
+                .count();
+            let cap = 4usize
+                .saturating_add(view.len().saturating_mul(2))
+                .saturating_add(member_count.saturating_mul(2))
+                .saturating_add(part_cells);
+            let mut defines = SVec::with_capacity_in(cap, alloc);
+            defines.push((WHOLE, record.out));
+            defines.push((SURFACE, surface));
             defines.push((DATA, view.file()));
-            item_cells(crate::signature::SignatureFile::new(&self.outlined[at].path), view, &mut defines, alloc);
-        }
-        defines.push((HEADS, heads_of(record)));
+            item_cells_in(crate::signature::SignatureFile::new(&outlined.path), view, &mut defines, member_count, scratch);
+            defines
+        } else {
+            let mut defines = SVec::with_capacity_in(2usize.saturating_add(part_cells), alloc);
+            defines.push((WHOLE, record.out));
+            defines
+        };
+        let mut heads_hasher = blaze_ids::Hasher::new(HEADS_DOMAIN);
         for part in &record.parts {
             if matches!(part.name.kind, blaze_drive::Kind::Signature | blaze_drive::Kind::BodyCheck) {
                 let blaze_drive::Locate::Source(digest) = part.locate else {
                     panic!("outline {:?} has no source digest for item part {:?}", record.name, part.name);
                 };
+                if part.name.kind == blaze_drive::Kind::Signature {
+                    heads_hasher.update(&part.name.subject.0).update(&digest.0);
+                }
                 defines.push((part_cell(part.name), digest));
             }
         }
-        defines.sort_unstable_by_key(|(cell, _)| *cell);
-        if let Some(pair) = defines.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-            panic!("outline {:?} defines item cell {:?} twice", record.name, pair[0].0);
+        defines.push((HEADS, heads_hasher.finish()));
+        if defines.len() > 1 {
+            defines.sort_unstable_by_key(|(cell, _)| *cell);
+        }
+        if let Some(pair) = defines.windows(2).find(|pair| matches!(pair, [a, b] if a.0 == b.0))
+            && let Some((dup, _)) = pair.first()
+        {
+            panic!("outline {:?} defines item cell {:?} twice", record.name, dup);
         }
         Done {
             name: task.planned.name,
@@ -267,8 +334,10 @@ pub(crate) fn failed<'a>(task: &Task, alloc: SharedAlloc<'a>) -> Done<'a> {
 /// finding (the failure itself), the failure's out.
 pub(crate) fn failed_with<'a>(task: &Task, reads: SVec<'a, (CellId, ContentId)>, alloc: SharedAlloc<'a>) -> Done<'a> {
     let mut reads = reads;
-    reads.sort_unstable_by_key(|(id, _)| *id);
-    reads.dedup_by_key(|(id, _)| *id);
+    if reads.len() > 1 {
+        reads.sort_unstable_by_key(|(id, _)| *id);
+        reads.dedup_by_key(|(id, _)| *id);
+    }
     Done {
         name: task.planned.name,
         key: task.key,

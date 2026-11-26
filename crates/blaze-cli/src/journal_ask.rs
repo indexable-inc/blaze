@@ -262,11 +262,13 @@ fn paired_place(stored: Stored<'_>) -> Option<Place> {
     checkout.then(|| stored.helper_place()).flatten().and_then(|bytes| Place::decode(&bytes))
 }
 
-/// Maximum stored leaf-table rows for which a direct batched `getattrlistbulk` sweep (`0.2–3 ms`)
-/// is strictly faster than opening a cold `FSEventStream` (`26–160 ms` waiting on `fseventsd`
-/// `HistoryDone`) when no journal helper vouched. Above this count, a fallback journal replay
-/// beats statting every leaf.
-pub(crate) const SMALL_CHECKOUT_LEAVES: usize = 1024;
+/// Maximum stored leaf-table rows for which a direct batched `getattrlistbulk` sweep
+/// (~0.25–0.5 µs/leaf -> ~1–2 ms at 4096 leaves) is strictly faster than waiting on an
+/// `fseventsd` sync cookie (11–12 ms per warm ask, or 26–160 ms on a cold `FSEventStream`
+/// `HistoryDone`). Covers small and medium/large workspaces (`ripgrep`, `tempo`, `blaze`) with
+/// 100% soundness across renames, creates, deletes, in-place edits, and restarts; above this
+/// count, the journal helper / FSEvents replay beats statting every leaf.
+pub(crate) const SMALL_CHECKOUT_LEAVES: usize = 4096;
 
 /// Whether a fallback OS journal replay (`FSEventStream`) should be skipped in favor of a direct
 /// batched stat sweep when the journal helper did not vouch.
@@ -280,6 +282,19 @@ pub(crate) enum ReplayPolicy {
 }
 
 impl ReplayPolicy {
+    /// Pure sans-IO decision: whether this checkout is small enough (`<= SMALL_CHECKOUT_LEAVES`)
+    /// that a direct batched stat sweep (`getattrlistbulk` / `fstatat`) beats BOTH connecting to /
+    /// spawning `journal-helper` (11–12 ms `fseventsd` sync-cookie wait) and replaying an OS
+    /// journal stream. Returns `Some(leaves)` on the direct-sweep fast path; `None` for large
+    /// checkouts, cold checkouts without a stored leaf count, and [`ReplayPolicy::Always`].
+    pub(crate) fn use_direct_sweep(self) -> Option<usize> {
+        match self {
+            ReplayPolicy::Always => None,
+            ReplayPolicy::Auto { stored_leaves: Some(leaves) } if leaves <= SMALL_CHECKOUT_LEAVES => Some(leaves),
+            ReplayPolicy::Auto { .. } => None,
+        }
+    }
+
     /// Pure sans-IO decision: whether to skip `Taken::replay_checkout` when the helper did not
     /// vouch.
     pub(crate) fn skip_fallback_replay(self, has_stored_cursor: bool, started_helper: bool) -> bool {
@@ -318,6 +333,22 @@ impl ChangedSince for Asked<'_> {
         let cx = cx.span("sweep: the changes since the stored answer's place, asked of the journal helper");
         let cx = cx.until(clock.after(JOURNAL_WAIT));
         let mut taken = Taken::begin_for(&cx, fs, root, clock, stored, frame)?;
+        if let Some(leaves) = self.replay.use_direct_sweep() {
+            // Small checkout fast path: skip connecting to or spawning `journal-helper` (which
+            // waits ~11–12 ms on an `fseventsd` sync cookie) and go straight to the direct batched
+            // stat sweep (`getattrlistbulk` / `fstatat`).
+            taken.refused_without_replay();
+            taken.said(HelperRow {
+                by: Self::NAME,
+                ask_ns: 0,
+                names: None,
+                differ: None,
+                said: Said::of(format_args!(
+                    "skipped helper and replay (direct sweep; {leaves} <= {SMALL_CHECKOUT_LEAVES} leaves)"
+                )),
+            });
+            return Ok(taken);
+        }
         let asked = ask(&cx, home, clock, self.me, paired_place(stored), frame)?;
         // Spawn a detached helper before any fallback replay so helper startup overlaps with the
         // replay instead of running serially after it.
@@ -802,5 +833,35 @@ mod replay_policy_tests {
         taken.encode(&mut out);
         let stored = Stored::of(&out).expect("encoded");
         assert!(!stored.has_checkout_cursor());
+    }
+
+    #[test]
+    fn small_checkout_takes_direct_sweep_before_helper_ask() {
+        assert_eq!(ReplayPolicy::Always.use_direct_sweep(), None);
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: None }.use_direct_sweep(), None);
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(0) }.use_direct_sweep(), Some(0));
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(1249) }.use_direct_sweep(), Some(1249));
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(3000) }.use_direct_sweep(), Some(3000));
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES) }.use_direct_sweep(), Some(SMALL_CHECKOUT_LEAVES));
+        assert_eq!(ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES + 1) }.use_direct_sweep(), None);
+
+        let frame = Frame::with_reserve(crate::engine_check::REQUEST_FRAME, bstd::mem::Tag::Other).expect("frame");
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(23, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let root = fs.root();
+        let clock = io.need_clock().expect("clock");
+        let build = bstd::host::BuildId::of(b"test-build").expect("build id");
+        let me = Me::of(&build, Some("/checkout/small"), Some("/home/u"), &frame);
+        let small = Asked {
+            me,
+            start: HelperStart::None,
+            replay: ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES) },
+        };
+        let taken = small.changed_since(&cx, &fs, &root, &root, &clock, Stored::NONE, &frame).expect("direct sweep");
+        assert!(matches!(taken.journal, crate::journal_sweep::JournalUse::Refused(crate::journal_sweep::Refused::NoCursor)));
+        let helper = taken.helper.as_ref().expect("helper row recorded");
+        assert_eq!(helper.ask_ns, 0, "direct sweep must skip helper connect/ask");
+        assert!(helper.said.as_str().contains("skipped helper and replay (direct sweep"));
     }
 }

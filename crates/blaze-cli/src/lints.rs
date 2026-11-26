@@ -403,13 +403,45 @@ pub(crate) fn parts_in<A: core::alloc::Allocator + Copy>(
     Ok(())
 }
 
+/// Fast zero-lex pre-screen for `Rule::VariantCount` over a whole file: returns `false` ONLY
+/// when `text` provably produces an empty `Variants` match set for every unit (no `enum`
+/// keyword, no integer literal >= 3, or none of the three counting-site byte patterns: `..`,
+/// `;` + `]`, or `const`/`static` + `=`).
+fn file_may_have_variant_count(text: &str) -> bool {
+    if !text.contains("enum") {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut has_ge3 = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(b, b'3'..=b'9') {
+            has_ge3 = true;
+            break;
+        }
+        if matches!(b, b'0'..=b'2')
+            && bytes.get(i + 1).is_some_and(|&next| {
+                next.is_ascii_digit() || matches!(next, b'_' | b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+            })
+        {
+            has_ge3 = true;
+            break;
+        }
+    }
+    if !has_ge3 {
+        return false;
+    }
+    text.contains("..")
+        || (bytes.contains(&b';') && bytes.contains(&b']'))
+        || (bytes.contains(&b'=') && (text.contains("const") || text.contains("static")))
+}
+
 /// Each unit of `text` as a `Lint` part keyed by `K`, pushed on `parts` in unit order: each
 /// unit's own text walked in pre-order by a pass of no rule for the scope it gives each child
-/// (what a scope is does not depend on the rules; the units' own texts together are the file
-/// once), from the file's scope as `marks` make it (in a core or not); each unit's place its
-/// start in the file. `variant-count`'s whole-file fact (a lex of the file) gathered only when
-/// `rules` with what `marks` add run it, as the Lints stage gathers it (rule 77). Scratch in
-/// `alloc`.
+/// (what a scope is does not depend on the rules; leaf units have no children and skip the lex
+/// pass completely), from the file's scope as `marks` make it (in a core or not); each unit's
+/// place its start in the file. `variant-count`'s whole-file fact (a lex of the file) gathered
+/// only when `rules` with what `marks` add run it and [`file_may_have_variant_count`] holds
+/// (rule 77). Scratch in `alloc`.
 #[expect(clippy::too_many_arguments, reason = "one file's facts, each named")]
 pub(crate) fn parts_with<K: UnitKey, A: core::alloc::Allocator + Copy>(
     outline: &blaze_file_items::Outline<'_>,
@@ -428,19 +460,30 @@ pub(crate) fn parts_with<K: UnitKey, A: core::alloc::Allocator + Copy>(
     let count = units.list.len();
     let mut scopes: AVec<'_, Scope> = AVec::with_capacity_in(count, alloc);
     scopes.resize(count, file_scope_in(marks, path, text));
-    let variants = match marked.runs(Rule::VariantCount) {
-        true => Some(Variants::gather(text, alloc).map_err(|_| UNGATHERED)?),
-        false => None,
+    let variants = if marked.runs(Rule::VariantCount) && file_may_have_variant_count(text) {
+        Some(Variants::gather(text, alloc).map_err(|_| UNGATHERED)?)
+    } else {
+        None
     };
     let mut findings = Findings::new_in(alloc);
     let mut scratch = blaze_lint::Scratch::new_in(alloc);
     for at in 0..count {
         let own = units.own(at, text, alloc).map_err(|_| UNLINTED)?;
-        let scope = scopes[at];
-        findings.clear();
-        let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, at), None, &mut scratch, &mut findings).map_err(|_| UNLINTED)?;
-        for (child, given) in units.children_of(at).iter().zip(linted.children.iter()) {
-            scopes[*child as usize] = *given;
+        let scope = scopes.get(at).copied().ok_or(UNLINTED)?;
+        let children = units.children_of(at);
+        // Only non-leaf units propagate `Scope` to child units; leaf units (95%+ of items and
+        // bytes in large files) have zero children so skipping `lint_own_with` preserves 100%
+        // byte-identical scopes and keys while avoiding a full-file re-lex at outline time.
+        if !children.is_empty() {
+            findings.clear();
+            let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, at), None, &mut scratch, &mut findings).map_err(|_| UNLINTED)?;
+            for (child, given) in children.iter().zip(linted.children.iter()) {
+                if let Ok(idx) = usize::try_from(*child)
+                    && let Some(slot) = scopes.get_mut(idx)
+                {
+                    *slot = *given;
+                }
+            }
         }
         let mut source = K::source(&units, at, text, &own, scope, marks, variants.as_ref());
         // Top-level `use` items under `Rule::UnusedImport` read identifier uses from sibling
@@ -1675,5 +1718,109 @@ mod tests {
             got_use.4.as_ref().is_some_and(|f| f.0.iter().any(|row| row.0 == number_of(Rule::UnusedImport))),
             "unused top-level use must emit UnusedImport finding"
         );
+    }
+
+    /// Outline-time `parts_with` skipping `Variants::gather` when `file_may_have_variant_count` is
+    /// false and skipping `lint_own_with` on leaf units must produce 100% byte-identical `Part`
+    /// lists (names, source keys, places) compared to unconditionally running full `Variants::gather`
+    /// and `lint_own_with` on every unit.
+    #[test]
+    fn parts_with_fast_path_matches_full_lex_byte_for_byte() {
+        fn full_reference<'a>(
+            outline: &blaze_file_items::Outline<'_>,
+            text: &str,
+            path: &str,
+            file: ContentId,
+            marks: RootMarks,
+            rules: &RuleSet,
+            alloc: Alloc<'a>,
+        ) -> AVec<'a, Part> {
+            let units = Units::plan(outline.items(), text.len(), alloc).expect("plan");
+            let marked = marks.rules(*rules);
+            let runs_unused_import = marked.runs(Rule::UnusedImport);
+            let none = RuleSet::only(&[]);
+            let count = units.list.len();
+            let mut scopes: AVec<'_, Scope> = AVec::with_capacity_in(count, alloc);
+            scopes.resize(count, file_scope_in(marks, path, text));
+            let variants = marked.runs(Rule::VariantCount).then(|| Variants::gather(text, alloc).expect("gather"));
+            let mut findings = Findings::new_in(alloc);
+            let mut scratch = blaze_lint::Scratch::new_in(alloc);
+            let mut out = AVec::with_capacity_in(count + 1, alloc);
+            for at in 0..count {
+                let own = units.own(at, text, alloc).expect("own");
+                let scope = scopes[at];
+                findings.clear();
+                let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, at), None, &mut scratch, &mut findings).expect("lint");
+                for (child, given) in units.children_of(at).iter().zip(linted.children.iter()) {
+                    let idx = usize::try_from(*child).expect("u32 index");
+                    scopes[idx] = *given;
+                }
+                let mut source = Structural::source(&units, at, text, &own, scope, marks, variants.as_ref());
+                if runs_unused_import && is_top_level_use_unit(outline.items(), at) {
+                    let mut h = Hasher::new(UNIT_SOURCE_DOMAIN);
+                    h.update(&source.0).update(&file.0);
+                    source = h.finish();
+                }
+                out.push(Part { name: unit_name(file, outline, at, text), locate: Locate::Source(source), place: units.list[at].base });
+            }
+            let whole = file_part(file, &out);
+            out.push(whole);
+            out
+        }
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let rules = Step::Strict.rules().with(Rule::UnusedImport).with(Rule::VariantCount);
+        let cases: [(&str, &str, bool); 4] = [
+            (
+                "app/src/no_enums.rs",
+                "use core::fmt::Debug;\n\
+                 pub struct S;\n\
+                 impl S {\n\
+                     // SAFETY: trivial\n\
+                     #[allow(dead_code)]\n\
+                     pub unsafe fn a(&self) -> u32 { 10 }\n\
+                     // clone: small handle\n\
+                     pub fn b(&self) -> u32 { 20 }\n\
+                 }\n\
+                 #[cfg(test)]\n\
+                 mod tests {\n\
+                     #[test]\n\
+                     fn t() { let _ = [0u8; 5]; }\n\
+                 }\n",
+                false,
+            ),
+            (
+                "app/src/enum_no_sites.rs",
+                "pub enum Small { A, B, C, D }\n\
+                 pub fn f(x: u8) -> u8 { x + 1 + 2 }\n",
+                false,
+            ),
+            (
+                "app/src/enum_with_sites.rs",
+                "pub enum Kind { A, B, C, D }\n\
+                 pub const COUNT: usize = 4;\n\
+                 pub fn make() -> [u8; 4] { [0; 4] }\n\
+                 pub fn range() { for _ in 0..4 {} }\n",
+                true,
+            ),
+            (
+                "app/src/cfg_test_inner.rs",
+                "#![cfg(test)]\n\
+                 use core::mem;\n\
+                 pub trait T { fn m(&self) -> usize { 1 } }\n\
+                 pub fn helper() -> usize { 42 }\n",
+                false,
+            ),
+        ];
+        for (path, text, expect_variants_prescreen) in cases {
+            assert_eq!(file_may_have_variant_count(text), expect_variants_prescreen, "pre-screen mismatch for {path}");
+            let file = ContentId::of("parts_with fast path test", path.as_bytes());
+            let outline = blaze_file_items::outline(text, blaze_surface::Edition::E2024, alloc);
+            let marks = marks_of(text, text);
+            let mut got = Vec::new_in(alloc);
+            parts_in(&outline, text, path, file, marks, &rules, alloc, &mut got).expect("parts_in");
+            let want = full_reference(&outline, text, path, file, marks, &rules, alloc);
+            assert_eq!(got.as_slice(), want.as_slice(), "parts_with mismatch for {path}");
+        }
     }
 }

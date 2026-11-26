@@ -72,6 +72,9 @@ fn build_error<P: FrontEnd>(program: &P, function: Named, error: BuildError, ran
     {
         return RunError::Projection { function, why };
     }
+    if let BuildError::CoroutineRecipe { owner, .. } = error {
+        return RunError::ItemRefused { function, error, item: owner, path: program.item_named(owner) };
+    }
     RunError::Build { function, error, range }
 }
 
@@ -206,7 +209,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     pull_plain: bool,
     alloc: Alloc<'static>,
 ) -> Result<Lay, RunError> {
-    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, alloc)? {
+    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, true, alloc)? {
         Ordered::Laid { all, laid } => (all, laid),
         Ordered::Unchecked(owner) => return Ok(Lay::Unchecked(owner)),
     };
@@ -288,6 +291,122 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     out
 }
 
+/// On-demand single-coroutine lay & build for `make_one`: lays the `StateShape` of `of`, any
+/// unlaid coroutines held by value inside `of`, and any unlaid coroutines used by `of`'s own
+/// body (types only, never building child coroutines' LIR), then pulls constants and builds LIR
+/// for **only `of`** into `stash`. Child coroutines are built lazily on their own first call.
+#[expect(clippy::too_many_arguments, reason = "run/make_one's per-instance tables, borrowed apart")]
+pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+    program: &P,
+    consts: Consts<'_>,
+    langs: &BackLangs,
+    bodies: &Bodies<'_>,
+    ground: &mut PortableTys<'_>,
+    layouts: &mut Layouts<L>,
+    stash: &mut Vec<BuiltParts, Global>,
+    asking: usize,
+    of: CoroutineOf,
+    pull_plain: bool,
+    alloc: Alloc<'static>,
+) -> Result<Lay, RunError> {
+    let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, &[of], false, alloc)? {
+        Ordered::Laid { all, laid } => (all, laid),
+        Ordered::Unchecked(owner) => return Ok(Lay::Unchecked(owner)),
+    };
+    let Some(of_pos) = all.iter().position(|&c| c == of) else {
+        return Err(refuse(program.function(asking).named(), "a coroutine whose own lay produced no state entry"));
+    };
+    let of_laid = &laid_all[of_pos..of_pos + 1];
+    let unchecked: Cell<Option<ItemKey>> = Cell::new(None);
+    let owner_of = |c: CoroutineOf| -> Option<usize> {
+        let ci = program.fn_index(c.owner)?;
+        if bodies.checked.get(ci).and_then(Option::as_ref).is_none() {
+            unchecked.set(Some(c.owner));
+            return None;
+        }
+        Some(ci)
+    };
+    let Some(ci) = owner_of(of) else {
+        forget_laid(bodies, &[of], ground.view());
+        return Ok(Lay::Unchecked(unchecked.get().unwrap_or(of.owner)));
+    };
+    // Lay `StateShape`s (types only) of any coroutines `of`'s own body creates or references
+    // without holding them in `of`'s state (e.g. a future dropped before `.await` or boxed).
+    let uses = {
+        let adts = FrontAdts(program, ci, consts, langs, bodies);
+        let args = match args_of(ground, of, alloc) {
+            Ok(a) => a,
+            Err(error) => {
+                forget_laid(bodies, &[of], ground.view());
+                return Err(build_error(program, program.function(ci).named(), error, None));
+            }
+        };
+        match roots_of_instance(program, bodies, &adts, ci, &args, None, true, &mut *ground, alloc) {
+            Ok(u) => u,
+            Err(err) => {
+                forget_laid(bodies, &[of], ground.view());
+                return Err(err);
+            }
+        }
+    };
+    if !uses.is_empty() {
+        match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, &uses, false, alloc) {
+            Ok(Ordered::Laid { .. }) => {}
+            Ok(Ordered::Unchecked(owner)) => {
+                forget_laid(bodies, &[of], ground.view());
+                return Ok(Lay::Unchecked(owner));
+            }
+            Err(err) => {
+                forget_laid(bodies, &[of], ground.view());
+                return Err(err);
+            }
+        }
+    }
+    if program.evaluates_at_args() {
+        let function = program.function(ci);
+        if let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(ci).and_then(Option::as_ref)) {
+            let has_plain = pull_plain
+                && (done.expr_defs.column::<1>().iter().any(|d| matches!(d, blaze_typeck::Def::Const(_)))
+                    || done.pat_defs.column::<1>().iter().any(|d| matches!(d, blaze_typeck::Def::Const(_))));
+            let has_any = !done.const_args.is_empty()
+                || !done.pat_const_args.is_empty()
+                || !done.default_fields.is_empty()
+                || !done.promoted.is_empty()
+                || body.exprs.iter().any(|x| matches!(x, blaze_typeck::Expr::ConstBlock { .. }))
+                || has_plain;
+            if has_any {
+                let view = body.view(program.body_types(ci));
+                let adts = FrontAdts(program, ci, consts, langs, bodies);
+                let args = match args_of(ground, of, alloc) {
+                    Ok(a) => a,
+                    Err(error) => {
+                        forget_laid(bodies, &[of], ground.view());
+                        return Err(build_error(program, function.named(), error, None));
+                    }
+                };
+                let mut needs = crate::front2::const_at::Needs::new_in(alloc);
+                let res = crate::front2::const_at::needs_of(&view, done, &args, ground, adts.facts(), alloc, &mut needs)
+                    .and_then(|()| if pull_plain { crate::front2::const_at::plain_needs_of(done, &mut needs) } else { Ok(()) });
+                if let Err(error) = res {
+                    forget_laid(bodies, &[of], ground.view());
+                    return Err(build_error(program, function.named(), error, None));
+                }
+                if needs.iter().any(|(need, a)| bodies.const_at.get(need, a).is_none()) {
+                    forget_laid(bodies, &[of], ground.view());
+                    let mut missing: AVec<'static, (ItemKey, List)> = AVec::with_capacity_in(1, alloc);
+                    missing.push((of.owner, of.owner_args));
+                    return Ok(Lay::PullConstants(missing));
+                }
+            }
+        }
+    }
+    let out = build_laid(program, consts, langs, bodies, ground, stash, &[of], of_laid, &owner_of, &unchecked, alloc);
+    if !matches!(out, Ok(Lay::Done)) {
+        forget_laid(bodies, &[of], ground.view());
+    }
+    out
+}
+
 /// What a verification's lay did ([`relay`]).
 pub(super) enum Relaid {
     /// `recorded`: the states this lay recorded, none built, which the caller forgets once it
@@ -315,7 +434,7 @@ pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     roots: &[CoroutineOf],
     alloc: Alloc<'static>,
 ) -> Result<Relaid, RunError> {
-    let recorded = match order_and_lay(program, &[], langs, bodies, ground, layouts, asking, roots, alloc)? {
+    let recorded = match order_and_lay(program, &[], langs, bodies, ground, layouts, asking, roots, false, alloc)? {
         Ordered::Laid { all, .. } => all,
         Ordered::Unchecked(owner) => return Ok(Relaid::Unchecked(owner)),
     };
@@ -364,7 +483,7 @@ pub(super) fn lay_only<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     roots: &[CoroutineOf],
     alloc: Alloc<'static>,
 ) -> Result<LaidOnly, RunError> {
-    match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, alloc)? {
+    match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, false, alloc)? {
         Ordered::Laid { all, .. } => Ok(LaidOnly::Done(all)),
         Ordered::Unchecked(owner) => Ok(LaidOnly::Unchecked(owner)),
     }
@@ -403,6 +522,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     layouts: &mut Layouts<L>,
     asking: usize,
     roots: &[CoroutineOf],
+    include_uses: bool,
     alloc: Alloc<'static>,
 ) -> Result<Ordered, RunError> {
     use crate::front2::coroutine_needs::MOST_HELD;
@@ -465,16 +585,18 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
             Err(OrderError::Build(error)) => return Err(build_error(program, asking_name(), error, None)),
         };
         pending.clear();
-        for &c in order.iter() {
-            let Some(ci) = owner_of(c) else {
-                return Ok(Ordered::Unchecked(unchecked.get().unwrap_or(c.owner)));
-            };
-            let adts = FrontAdts(program, ci, consts, langs, bodies);
-            let args = args_of(ground, c, alloc).map_err(|error| build_error(program, program.function(ci).named(), error, None))?;
-            let uses = roots_of_instance(program, bodies, &adts, ci, &args, None, true, &mut *ground, alloc)?;
-            for &u in uses.iter() {
-                if !all.contains(&u) && !order.contains(&u) && !pending.contains(&u) {
-                    pending.push(u);
+        if include_uses {
+            for &c in order.iter() {
+                let Some(ci) = owner_of(c) else {
+                    return Ok(Ordered::Unchecked(unchecked.get().unwrap_or(c.owner)));
+                };
+                let adts = FrontAdts(program, ci, consts, langs, bodies);
+                let args = args_of(ground, c, alloc).map_err(|error| build_error(program, program.function(ci).named(), error, None))?;
+                let uses = roots_of_instance(program, bodies, &adts, ci, &args, None, true, &mut *ground, alloc)?;
+                for &u in uses.iter() {
+                    if !all.contains(&u) && !order.contains(&u) && !pending.contains(&u) {
+                        pending.push(u);
+                    }
                 }
             }
         }
@@ -582,7 +704,7 @@ fn held_types<P: FrontEnd>(
     let facts = bodies.coroutines.table.get(c.owner, c.ordinal).ok_or_else(not_answered)?;
     let recipe = match program.coroutine_recipe(c.owner, c.ordinal) {
         Some(Ok(r)) => r,
-        Some(Err(_)) => return Err(BuildError::UnsupportedSig { what: "an async block whose flow was refused: its state recipe was not made" }),
+        Some(Err(refusal)) => return Err(BuildError::CoroutineRecipe { owner: c.owner, ordinal: c.ordinal, refusal }),
         None => return Err(not_answered()),
     };
     let mut args: AVec<'_, PTy> = AVec::new_in(alloc);
@@ -613,7 +735,8 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     let types = held_types(program, bodies, adts, ci, c, &mut *ground, alloc)?;
     let recipe = match program.coroutine_recipe(c.owner, c.ordinal) {
         Some(Ok(r)) => r,
-        _ => return Err(BuildError::UnsupportedSig { what: "an async block whose flow was refused: its state recipe was not made" }),
+        Some(Err(refusal)) => return Err(BuildError::CoroutineRecipe { owner: c.owner, ordinal: c.ordinal, refusal }),
+        None => return Err(not_answered()),
     };
     let points = recipe.points;
     // Needs the lazy program fills (`NoAdt`, `Select(Missing(_))`, `OpaqueOwnerUnchecked`) and

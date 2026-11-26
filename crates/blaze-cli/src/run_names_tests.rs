@@ -75,3 +75,281 @@ fn harnessless_targets_each_have_one_main() {
         assert_eq!(tests.row(1), Ok(None));
     }
 }
+
+/// `ScopeCrates::ByNeed` opens ZERO dependency crates during setup or when querying only the
+/// owner crate, opens a dependency crate at most once when a question actually reaches it, and
+/// produces identical `NamesSource` answers to `ScopeCrates::Opened` (rules 74, 77).
+#[test]
+fn by_need_scope_defers_dependency_opens_and_matches_opened_answers() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use blaze_id::CrateItemKey;
+    use blaze_ladder::front2::source::NamesSource as _;
+    use blaze_own::Alloc;
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::resolve::{CrateInput, SourceTexts};
+    use blaze_surface::Edition;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+    use bstd::io::{Io, Limits, SimWorld};
+
+    const APP_SRC: &str = "#![no_core]\npub fn entry() -> u32 { 1 }\n";
+    const DEP_A_SRC: &str = "#![no_core]\npub struct Alpha;\npub fn alpha() -> Alpha { Alpha }\n";
+    const DEP_B_SRC: &str = "#![no_core]\npub struct Beta;\npub fn beta() -> Beta { Beta }\n";
+
+    struct MemTexts;
+    impl<'a> SourceTexts<'a> for MemTexts {
+        fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+            match path {
+                "/0/app/lib.rs" => Some(APP_SRC),
+                "/1/dep_a/lib.rs" => Some(DEP_A_SRC),
+                "/2/dep_b/lib.rs" => Some(DEP_B_SRC),
+                _ => None,
+            }
+        }
+    }
+
+    const IMPLICIT: Implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+    let mk_input = |name: &'static str, root: &'static str, deps: &'static [(&'static str, usize)]| CrateInput {
+        name,
+        key: CrateItemKey(ContentId::of("blaze-cli run_names by_need test crate", name.as_bytes())),
+        edition: Edition::E2021,
+        implicit: IMPLICIT,
+        root,
+        shown_from: "/",
+        features: &[],
+        deps,
+        cfg: &[],
+        script: None,
+    };
+
+    let inputs = [
+        mk_input("app", "/0/app/lib.rs", &[("dep_a", 1), ("dep_b", 2)]),
+        mk_input("dep_a", "/1/dep_a/lib.rs", &[]),
+        mk_input("dep_b", "/2/dep_b/lib.rs", &[]),
+    ];
+    let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+    let solved = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &MemTexts, &blaze_scope::task::Serial, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("resolve test crates: {e:?}"));
+
+    let g = Alloc::global();
+    let mut crate_recs = std::vec::Vec::new();
+    for (idx, c) in solved.crates().iter().enumerate() {
+        let n = blaze_scope::names_record::encode(c, g).expect("names record");
+        let i = blaze_scope::items_record::encode(c, g).expect("items record");
+        let split = blaze_scope::expansion_records::write(c, g).expect("expansions");
+        let payload = crate::names::sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]);
+        let rec = crate::front_load::crate_records(
+            blaze_drive::key::crate_scope_name(&inputs[idx].key),
+            &payload,
+            inputs[idx].key,
+            blaze_own::testing::bump(),
+        )
+        .expect("crate records");
+        crate_recs.push(rec);
+    }
+
+    struct CountingByNeed<'a> {
+        recs: &'a [crate::front_load::CrateRecords<'a>],
+        opened_dep_a: AtomicUsize,
+        opened_dep_b: AtomicUsize,
+    }
+    impl crate::front_load::OpenByNeed for CountingByNeed<'_> {
+        fn open<'s>(&'s self, one: &crate::front_load::Unopened) -> Result<crate::front_load::CrateRecords<'s>, &'static str> {
+            match one.world_at {
+                1 => {
+                    self.opened_dep_a.fetch_add(1, Ordering::Relaxed);
+                }
+                2 => {
+                    self.opened_dep_b.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            self.recs.get(one.world_at).copied().ok_or("missing test crate")
+        }
+    }
+
+    let io = Io::simulated(SimWorld::new(73, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let root = fs.root();
+    let frame = cx.frame();
+    let heap = blaze_own::testing::heap();
+
+    let own = super::Crate { records: crate_recs[0], name: "app", package: "/", world_at: 0 };
+    let dep_a_crate = super::Crate { records: crate_recs[1], name: "dep_a", package: "/", world_at: 1 };
+    let dep_b_crate = super::Crate { records: crate_recs[2], name: "dep_b", package: "/", world_at: 2 };
+    let opened_slice = [own, dep_a_crate, dep_b_crate];
+
+    let unopened = [
+        crate::front_load::Unopened {
+            input: input(1),
+            key: inputs[1].key,
+            world_at: 1,
+            name: "dep_a",
+            package: "/",
+        },
+        crate::front_load::Unopened {
+            input: input(2),
+            key: inputs[2].key,
+            world_at: 2,
+            name: "dep_b",
+            package: "/",
+        },
+    ];
+    let counter = CountingByNeed {
+        recs: &crate_recs,
+        opened_dep_a: AtomicUsize::new(0),
+        opened_dep_b: AtomicUsize::new(0),
+    };
+
+    let empty_packs = crate::job_texts::Packs::Open(&[]);
+    let by_need_scope = super::ScopeCrates::ByNeed(super::ByNeedScope {
+        own,
+        rest: &unopened,
+        records: &counter,
+    });
+    let opened_by_need = super::names_records_envs(
+        &cx,
+        &root,
+        by_need_scope,
+        (empty_packs, None),
+        &[],
+        crate::job_texts::Procs::None,
+        std::vec::Vec::new(),
+        super::Envs { owner: None, rest: None },
+        None,
+        None,
+        frame,
+        heap.alloc(),
+    )
+    .expect("by_need names records");
+
+    // Setup must open ZERO dependencies.
+    assert_eq!(counter.opened_dep_a.load(Ordering::Relaxed), 0, "dep_a must not open at setup");
+    assert_eq!(counter.opened_dep_b.load(Ordering::Relaxed), 0, "dep_b must not open at setup");
+
+    // Querying the owner crate must still open ZERO dependencies.
+    let app_root_by_need = opened_by_need.records.root_module(0);
+    assert!(app_root_by_need.is_some(), "owner root module must answer");
+    assert_eq!(counter.opened_dep_a.load(Ordering::Relaxed), 0, "owner query must not open dep_a");
+    assert_eq!(counter.opened_dep_b.load(Ordering::Relaxed), 0, "owner query must not open dep_b");
+
+    // Querying dep_a opens dep_a once and leaves dep_b completely untouched.
+    let dep_a_root_by_need = opened_by_need.records.root_module(1);
+    assert!(dep_a_root_by_need.is_some(), "dep_a root module must answer");
+    assert_eq!(counter.opened_dep_a.load(Ordering::Relaxed), 1, "dep_a opens once on first query");
+    assert_eq!(counter.opened_dep_b.load(Ordering::Relaxed), 0, "untouched dep_b must stay closed");
+
+    // Compare against ScopeCrates::Opened oracle: answers must match identically.
+    let opened_eager = super::names_records_envs(
+        &cx,
+        &root,
+        super::ScopeCrates::Opened(&opened_slice),
+        (empty_packs, None),
+        &[],
+        crate::job_texts::Procs::None,
+        std::vec::Vec::new(),
+        super::Envs { owner: None, rest: None },
+        None,
+        None,
+        frame,
+        heap.alloc(),
+    )
+    .expect("eager names records");
+
+    assert_eq!(opened_by_need.records.crate_count(), opened_eager.records.crate_count());
+    assert_eq!(app_root_by_need, opened_eager.records.root_module(0));
+    assert_eq!(dep_a_root_by_need, opened_eager.records.root_module(1));
+    assert_eq!(counter.opened_dep_b.load(Ordering::Relaxed), 0, "dep_b still never opened");
+}
+
+/// `MemberUnitIndex` uniquely maps target-side workspace-member units (`Lib`, `Test { bin: None }`,
+/// `Bin`, `Test { bin: Some }`, `IntegrationTest`) to their `CrateList` rows without touching
+/// `unit_map` or the filesystem, while refusing host units, build scripts, and any duplicated
+/// signature (triggering the `unit_map` fallback).
+#[test]
+fn member_unit_index_resolves_unique_targets_and_refuses_ambiguous_or_host() {
+    use blaze_manifest::lock::LockId;
+    use blaze_own::String as AString;
+    use blaze_unit_graph::{CfgAtom, ExtraUnit, Unit, UnitKind};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let txt = |s: &str| AString::from_str_in(s, alloc);
+    let mk_unit = |kind: UnitKind<'static>, for_host: bool, crate_name: &str, root: &str, has_test: bool| -> Unit<'static> {
+        let mut cfg = AVec::new_in(alloc);
+        if has_test {
+            cfg.push(CfgAtom::flag("test", alloc));
+        }
+        Unit {
+            package: LockId(0),
+            name: txt("pkg"),
+            version: txt("0.1.0"),
+            kind,
+            for_host,
+            edition: edition::PackageEdition::of_manifest("2024").expect("2024 edition"),
+            crate_name: txt(crate_name),
+            root: txt(root),
+            features: AVec::new_in(alloc),
+            cfg,
+            deps: AVec::new_in(alloc),
+            build_script: None,
+            links: None,
+        }
+    };
+
+    let units = [
+        // 0: Lib (src/lib.rs, test=false)
+        mk_unit(UnitKind::Lib, false, "pkg", "src/lib.rs", false),
+        // 1: Lib test harness (same file, test=true)
+        mk_unit(UnitKind::Test { bin: None }, false, "pkg", "src/lib.rs", true),
+        // 2: Bin("app") (src/main.rs, test=false)
+        mk_unit(UnitKind::Bin(txt("app")), false, "app", "src/main.rs", false),
+        // 3: Bin("app") test harness (same file, test=true, env.bin=None)
+        mk_unit(UnitKind::Test { bin: Some(txt("app")) }, false, "app", "src/main.rs", true),
+        // 4: IntegrationTest (tests/it.rs, test=true, test_or_bench=true)
+        mk_unit(
+            UnitKind::IntegrationTest(ExtraUnit { name: txt("it"), harness: true, test: true, required_features: AVec::new_in(alloc) }),
+            false,
+            "it",
+            "tests/it.rs",
+            true,
+        ),
+        // 5: Host copy of Lib (must never resolve as target-side)
+        mk_unit(UnitKind::Lib, true, "pkg", "src/lib.rs", false),
+        // 6: BuildScript (must never resolve as target-side)
+        mk_unit(UnitKind::BuildScript, false, "build_script_build", "build.rs", false),
+    ];
+
+    let rows: [(usize, super::MemberUnitSig<'_>); 5] = [
+        (10, super::unit_member_sig(&units[0]).expect("lib sig")),
+        (11, super::unit_member_sig(&units[1]).expect("lib test sig")),
+        (12, super::unit_member_sig(&units[2]).expect("bin sig")),
+        (13, super::unit_member_sig(&units[3]).expect("bin test sig")),
+        (14, super::unit_member_sig(&units[4]).expect("it sig")),
+    ];
+    let index = super::MemberUnitIndex::build_from_rows(&units, rows, rows.len(), alloc);
+    assert_eq!(index.resolve(&units[0]), Some(10), "Lib resolves cleanly");
+    assert_eq!(index.resolve(&units[1]), Some(11), "Lib test resolves distinctly from Lib");
+    assert_eq!(index.resolve(&units[2]), Some(12), "Bin resolves distinctly from Bin test");
+    assert_eq!(index.resolve(&units[3]), Some(13), "Bin test resolves distinctly from Bin");
+    assert_eq!(index.resolve(&units[4]), Some(14), "IntegrationTest resolves cleanly");
+    assert_eq!(index.resolve(&units[5]), None, "for_host unit must not match target row");
+    assert_eq!(index.resolve(&units[6]), None, "BuildScript must not match target row");
+
+    // Ambiguous crate-list rows (two rows sharing the same signature) must return None.
+    let dup_rows = [
+        (10, super::unit_member_sig(&units[0]).expect("lib sig")),
+        (99, super::unit_member_sig(&units[0]).expect("dup lib sig")),
+    ];
+    let dup_index = super::MemberUnitIndex::build_from_rows(&units, dup_rows, dup_rows.len(), alloc);
+    assert_eq!(dup_index.resolve(&units[0]), None, "duplicate crate-list signature must fall back");
+
+    // Ambiguous units (two target units sharing the same signature) must return None.
+    let dup_units = [
+        mk_unit(UnitKind::Lib, false, "pkg", "src/lib.rs", false),
+        mk_unit(UnitKind::Lib, false, "pkg", "src/lib.rs", false),
+    ];
+    let one_row = [(10, super::unit_member_sig(&dup_units[0]).expect("lib sig"))];
+    let dup_unit_index = super::MemberUnitIndex::build_from_rows(&dup_units, one_row, one_row.len(), alloc);
+    assert_eq!(dup_unit_index.resolve(&dup_units[0]), None, "duplicate target unit signature must fall back");
+}

@@ -27,7 +27,7 @@ blaze-cas	87	1	4	395
 blaze-cbor	0	0	1	0
 blaze-cc	0	0	4	3
 blaze-check	72	1	0	107
-blaze-cli	483	1	0	406
+blaze-cli	446	1	0	369
 blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11
@@ -38,7 +38,7 @@ blaze-dbsp	14	1	0	36
 blaze-deflate	11	0	1	6
 blaze-ed25519	3	0	0	1
 blaze-emit	0	0	23	46
-blaze-engine	0	0	0	10
+blaze-engine	0	0	0	9
 blaze-expand	32	0	0	38
 blaze-export	12	0	0	0
 blaze-fetch	52	0	7	40
@@ -63,10 +63,10 @@ blaze-inproc-rt	0	1	0	0
 blaze-json	0	0	2	0
 blaze-keyed	0	0	13	291
 blaze-kit	12	0	13	30
-blaze-ladder	297	1	2	1481
+blaze-ladder	296	1	2	1439
 blaze-launch	0	0	15	58
 blaze-launch-rt	91	1	1	159
-blaze-launcher	60	1	0	13
+blaze-launcher	57	1	0	13
 blaze-lex	14	0	0	16
 blaze-lint	17	0	0	31
 blaze-lint-defs	0	0	3	16
@@ -75,7 +75,7 @@ blaze-lower	17	0	0	15
 blaze-malloc	4	0	3	20
 blaze-manifest	151	1	0	775
 blaze-math	0	0	0	1
-blaze-mem	48	1	5	39
+blaze-mem	46	1	5	39
 blaze-memchr	2	0	1	4
 blaze-memo	100	1	8	114
 blaze-memo-macros	2	1	0	36

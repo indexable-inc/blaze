@@ -63,6 +63,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             Target::Neon(call) => self.neon_intrinsic(e, list, t, call),
             Target::Sha3(call) => self.sha3_intrinsic(e, list, t, call),
             Target::Sha2(f) => self.sha2_intrinsic(e, list, t, f),
+            Target::Crc32(f) => self.crc32_intrinsic(e, list, t, f),
             // A barrier or hint (THREADS.md D1, intrinsics/target.rs): `fn(i32 imm)`, the
             // immediate a constant (the library passes `arg::SY` and the like), no result.
             _ => {
@@ -264,6 +265,34 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.vector_intrinsic(e, list, t, spec, |b, v, _| {
             intrinsics::target::sha2::build(b, f, v).ok_or(malformed("a SHA-2 call built with other than its operand count (a build bug)"))
         })
+    }
+
+    /// AArch64 CRC32 / CRC32C call `e` (`t` is `Target::Crc32(f)`): `(crc: u32, data: u32|u64) -> u32`.
+    fn crc32_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target, f: intrinsics::target::crc32::Crc32Fn) -> Result<(), BuildError> {
+        let &[crc_arg, data_arg] = list else {
+            return Err(BuildError::Target { target: t, expr: Some(e), why: "a CRC32 call with other than two operands" });
+        };
+        let base = self.vals.len().checked_sub(2).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+        let crc_v = self.vals[base];
+        let data_v = self.vals[base + 1];
+        self.truncate_vals(base);
+        if !self.live {
+            self.push_val(V::None, None);
+            return Ok(());
+        }
+        let crc_ty = self.adjusted_ty(crc_arg)?;
+        let data_ty = self.adjusted_ty(data_arg)?;
+        let crc_repr = self.repr_at(crc_arg, crc_ty)?;
+        let data_repr = self.repr_at(data_arg, data_ty)?;
+        let want_data = f.data_ty();
+        if crc_repr.scalar() != Some(Ty::I32) || data_repr.scalar() != Some(want_data) {
+            return Err(BuildError::Target { target: t, expr: Some(e), why: "CRC32 operand types do not match" });
+        }
+        let crc = self.scalar(crc_v, Ty::I32)?;
+        let data = self.scalar(data_v, want_data)?;
+        let res = intrinsics::target::crc32::build(&mut self.b, f, crc, data);
+        self.push_val(V::Scalar(res), None);
+        Ok(())
     }
 
     /// One lane of `op` over `ops` (one, two or three, by the function's arity): each

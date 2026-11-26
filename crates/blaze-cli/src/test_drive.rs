@@ -226,6 +226,10 @@ pub(crate) enum OneError {
     /// A make, or a worker's ask for the proc-macro runner, could not be handed over the code
     /// workers' channel `chan` (D194): the worker `worker` is gone, or the hand-over stopped so.
     CodeHandOff { chan: &'static str, worker: usize, why: &'static str },
+    /// Preparing `CARGO_BIN_EXE_*` launcher stubs or their Unix code-server socket failed.
+    Bins(crate::test_bins::BinStubError),
+    /// Host-side code serving for a spawned `CARGO_BIN_EXE_*` workspace binary failed.
+    BinServe(crate::test_bins::BinServeError),
 }
 
 impl fmt::Display for OneError {
@@ -268,6 +272,8 @@ impl fmt::Display for OneError {
                 waited / 1_000_000_000,
                 waited % 1_000_000_000 / 100_000_000,
             ),
+            OneError::Bins(error) => write!(f, "{error}"),
+            OneError::BinServe(error) => write!(f, "{error}"),
         }
     }
 }
@@ -809,6 +815,19 @@ pub(crate) trait RunOne {
     /// Runs row `row` in a process of its own, killed `budget` after its start: how it ended,
     /// its purity verdict, its entered functions, and its output into `output`.
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError>;
+
+    /// Non-blocking pump for workspace binary launcher stubs (`CARGO_BIN_EXE_*`). Returns `Ok(true)`
+    /// when any binary connection was accepted or made progress, or `Err(OneError)` on host-side
+    /// binary serving failure.
+    fn pump_bins(&self) -> Result<bool, OneError> {
+        Ok(false)
+    }
+
+    /// Resolves a `(suite, row)` pair carried by a workspace binary connection back to the
+    /// runner's flat row index so binary-serving failures are attributed to the spawning test.
+    fn flat_of(&self, _suite: u32, _row: u32) -> Option<u32> {
+        None
+    }
 }
 
 /// Process-wide dispositions belong to the pool. A SIGTERM is observed by every child,
@@ -982,6 +1001,9 @@ pub(crate) struct OneEach<'b, R: RunOne, C: Fn() -> Nanos> {
     /// The error that stopped a run in blaze, and the tests record row it was of: printed by
     /// [`run_suites`] as one line naming the test, before the command's own error line.
     pub failed: Option<(u32, OneError)>,
+    /// An unattached host-side failure (e.g. a pre-handshake workspace binary server error)
+    /// that does not belong to any single test row.
+    pub failed_unowned: Option<OneError>,
     /// The longest turn any child's poll took ([`Turn`]): printed by [`run_suites`] when the
     /// runner stops, so a zygote "silent" past an allowance says what held the thread.
     pub longest: Option<Turn>,
@@ -995,7 +1017,7 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
         let running = std::vec::Vec::new_in(*proof.allocator());
         Ok(OneEach {
             runs, signals, now, heap, suite: SuiteId(0), width: 0,
-            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, longest: None,
+            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, failed_unowned: None, longest: None,
         })
     }
 
@@ -1141,6 +1163,42 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let left = Duration::from_nanos(until.0.saturating_sub(before_sweep.0));
             self.signals.wait.set(interval.min(left));
             self.signals.progress.set(false);
+            let bin_before = (self.now)();
+            let bin_progress = match self.runs.pump_bins() {
+                Ok(prog) => prog,
+                Err(error) => {
+                    let owner_row = match &error {
+                        OneError::BinServe(err) => err.owner.and_then(|(suite, row)| self.runs.flat_of(suite, row)),
+                        _ => None,
+                    };
+                    if let Some(row) = owner_row {
+                        self.failed = Some((row, error));
+                    } else {
+                        self.failed_unowned = Some(error);
+                    }
+                    return Err(RunError::Seam {
+                        call: "serving workspace binary stub",
+                        errno: 0,
+                        suite: Some(self.suite),
+                    });
+                }
+            };
+            let bin_nanos = (self.now)().0.saturating_sub(bin_before.0);
+            if bin_progress {
+                self.signals.progress.set(true);
+                self.signals.wait.set(Duration::ZERO);
+            }
+            if bin_nanos > 0 {
+                for running in self.running.iter_mut() {
+                    if !running.started {
+                        running.pre_start = Nanos(running.pre_start.0.saturating_add(bin_nanos));
+                    } else if running.parked_now {
+                        running.parked = Nanos(running.parked.0.saturating_add(bin_nanos));
+                    } else {
+                        running.stalled = Nanos(running.stalled.0.saturating_add(bin_nanos));
+                    }
+                }
+            }
             self.sweep(&mut context)?;
             swept = true;
             crossed_until = before_sweep < until && (self.now)() >= until;
@@ -1254,6 +1312,71 @@ mod pool_tests {
             assert_eq!(end.output.tail, &end.row.to_le_bytes());
             assert_eq!(end.test, TestId([end.row as u8; 32]));
         }
+    }
+
+    #[test]
+    fn bin_serve_failure_attributed_to_owner_or_unowned() {
+        struct BinFail {
+            owner: Option<(u32, u32)>,
+            pumped: Cell<bool>,
+        }
+
+        impl RunOne for BinFail {
+            async fn run(&self, _: u32, _: Nanos, _: &mut Output<'_>, _: &Signals) -> Result<RunOutcome, OneError> {
+                next_turn().await;
+                let heap = blaze_own::testing::heap().alloc();
+                Ok(RunOutcome {
+                    how: How::Reported(Said::Returned),
+                    keep: Err(NotKept::Untraced),
+                    panic_text: String::new_in(heap),
+                    entered: Vec::new_in(heap),
+                })
+            }
+
+            fn pump_bins(&self) -> Result<bool, OneError> {
+                if self.pumped.replace(true) {
+                    return Ok(false);
+                }
+                let heap = blaze_own::testing::heap().alloc();
+                Err(OneError::BinServe(crate::test_bins::BinServeError {
+                    owner: self.owner,
+                    package: String::from_str_in("binapp", heap),
+                    bin: String::from_str_in("helper", heap),
+                    why: crate::test_bins::BinServeWhy::Protocol("injected failure"),
+                }))
+            }
+
+            fn flat_of(&self, suite: u32, row: u32) -> Option<u32> {
+                (suite == 2 && row == 5).then_some(7)
+            }
+        }
+
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let clock = || Nanos(1);
+
+        // Owned failure while rows 3 and 7 are running: must blame row 7, NOT `running.first()` (row 3).
+        let owned = BinFail { owner: Some((2, 5)), pumped: Cell::new(false) };
+        let mut pool = OneEach::new(&owned, &signals, clock, heap, heap).expect("heap");
+        pool.start(SuiteId(0), 2).expect("start");
+        pool.ask(3, TestId([3; 32]), Nanos(100)).expect("row 3");
+        pool.ask(7, TestId([7; 32]), Nanos(100)).expect("row 7");
+        pool.wait(Nanos(100)).expect("ready");
+        pool.clear();
+        assert!(pool.wait(Nanos(100)).is_err());
+        assert!(matches!(pool.failed, Some((7, OneError::BinServe(_)))));
+        assert!(pool.failed_unowned.is_none());
+
+        // Pre-handshake / unowned failure (`owner: None`): must go to `failed_unowned`, NOT blame row 3.
+        let unowned = BinFail { owner: None, pumped: Cell::new(false) };
+        let mut pool = OneEach::new(&unowned, &signals, clock, heap, heap).expect("heap");
+        pool.start(SuiteId(0), 2).expect("start");
+        pool.ask(3, TestId([3; 32]), Nanos(100)).expect("row 3");
+        pool.wait(Nanos(100)).expect("ready");
+        pool.clear();
+        assert!(pool.wait(Nanos(100)).is_err());
+        assert!(pool.failed.is_none());
+        assert!(matches!(pool.failed_unowned, Some(OneError::BinServe(_))));
     }
 
     /// A child whose first turn makes its roots' code for a long time (the clock moved 5000 in
@@ -1540,10 +1663,36 @@ fn entry_roots<'a>(harness: bool, names: NamesRecords<'_>, test: LibKey, exports
     }
 }
 
-/// [`Refuse`] over the test roots: each row's roots made in a scratch frame, the words of a
-/// refusal kept for the caller. The run makes them again in its own frame: one head lowered
-/// twice, until the zygote's protocol carries a refusal (NOT DONE, piece 9).
-pub(crate) struct EntryCheck<'c, 'h> {
+/// Per-suite validated roots handed from [`EntryCheck::refusal`] to [`Launched::run_captured`],
+/// avoiding running `entry_roots` (`Store::new`, head lowering, and `personality_of`) twice per
+/// test and avoiding a per-test `Frame::new` allocation in `EntryCheck`. Borrowed strictly
+/// synchronously, never across `.await` (rule 27).
+pub(crate) struct RootsCache<'a, T = Roots<'a>> {
+    rows: blaze_hash::Map<u32, T, blaze_hash::FixedState, Alloc<'a>>,
+}
+
+impl<'a, T> RootsCache<'a, T> {
+    pub(crate) fn new(alloc: Alloc<'a>) -> Self {
+        Self { rows: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }) }
+    }
+
+    pub(crate) fn contains(&self, row: u32) -> bool {
+        self.rows.contains_key(&row)
+    }
+
+    pub(crate) fn insert(&mut self, row: u32, roots: T) {
+        self.rows.insert(row, roots);
+    }
+
+    pub(crate) fn take(&mut self, row: u32) -> Option<T> {
+        self.rows.remove(&row)
+    }
+}
+
+/// [`Refuse`] over the test roots: each row's roots are computed once into `roots_alloc`,
+/// cached in `roots_cache` for [`Launched::run_captured`] to consume without recomputing, and any
+/// refusal's words are kept for the caller.
+pub(crate) struct EntryCheck<'c, 'h, 'a> {
     pub tests: TestRows<'c>,
     pub names: NamesRecords<'h>,
     pub builder: Builder,
@@ -1551,10 +1700,12 @@ pub(crate) struct EntryCheck<'c, 'h> {
     /// Its suite's native image's exports (`NativeSend::items`, roots of every row), else why the
     /// image could not be had ([`Suite::native`]): every row's refusal.
     pub image: Result<&'c [LibKey], &'c str>,
+    pub roots_cache: &'c RefCell<RootsCache<'a>>,
+    pub roots_alloc: Alloc<'a>,
     said: AString<'c>,
 }
 
-impl Refuse for EntryCheck<'_, '_> {
+impl Refuse for EntryCheck<'_, '_, '_> {
     fn refusal(&mut self, row: u32) -> Result<Option<&str>, OneError> {
         let exports = match self.image {
             Ok(exports) => exports,
@@ -1564,14 +1715,21 @@ impl Refuse for EntryCheck<'_, '_> {
                 return Ok(Some(self.said.as_str()));
             }
         };
+        if self.roots_cache.borrow().contains(row) {
+            return Ok(None);
+        }
         let test = key_of(&self.tests, row)?;
-        let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
-        let erased = blaze_own::Erased::new(&frame);
-        let made = entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, erased.handle());
-        let Err(why) = made else { return Ok(None) };
-        self.said.clear();
-        write!(self.said, "{why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
-        Ok(Some(self.said.as_str()))
+        match entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, self.roots_alloc) {
+            Ok(roots) => {
+                self.roots_cache.borrow_mut().insert(row, roots);
+                Ok(None)
+            }
+            Err(why) => {
+                self.said.clear();
+                write!(self.said, "{why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
+                Ok(Some(self.said.as_str()))
+            }
+        }
     }
 }
 
@@ -1749,8 +1907,15 @@ const MOST_MAKERS: usize = 4;
 /// Soft frame budget per code worker: once a worker's `Frame` reaches this usage between makes,
 /// the worker drops its [`SuiteMakers`], resets and trims its `Frame` back to
 /// [`WORKER_FRAME_KEEP`], and rebuilds cleanly so multi-suite and heavy-suite test runs never
-/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS.
-const WORKER_FRAME_RESET_AT: usize = 512 << 20;
+/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS. Set to 2 GiB (half of
+/// `FRAME_RESERVE`) so large single-suite workspaces (e.g. `tempo-e2e` at ~550+ MiB of loaded
+/// crate trees and heads) stay warm across makes instead of resetting after every function.
+const WORKER_FRAME_RESET_AT: usize = 2 << 30;
+
+/// Hard frame ceiling per code worker (still 1 GiB below `FRAME_RESERVE`) for the adaptive
+/// cold-baseline bump: if a single cold make already fills past [`WORKER_FRAME_RESET_AT`], the
+/// worker keeps warm headroom up to this ceiling rather than thrashing on every make.
+const WORKER_FRAME_HARD_RESET_AT: usize = 3 << 30;
 
 /// Lower frame budget applied once [`Makers`] has evicted a suite at [`MOST_MAKERS`]: if the
 /// worker's `Frame` holds at least this much memory from evicted suites, reclaim it between
@@ -2366,6 +2531,7 @@ pub(crate) struct SuiteMakers<'w> {
     names: AVec<'static, Option<NamesRecords<'w>>>,
     makers: Makers<TestMaker<'w>>,
     reset_needed: bool,
+    makes: usize,
     reset_at: usize,
     evict_reset_at: usize,
 }
@@ -2393,6 +2559,7 @@ impl<'w> SuiteMakers<'w> {
             names,
             makers: Makers::new(heap.alloc(), MakersPlant::None),
             reset_needed: false,
+            makes: 0,
             reset_at: WORKER_FRAME_RESET_AT,
             evict_reset_at: WORKER_FRAME_EVICT_RESET_AT,
         }
@@ -2427,7 +2594,15 @@ impl KeptMakers for SuiteMakers<'_> {
             Ok(maker)
         })?;
         maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
-        job.order.make(maker, &job.proof, job.name.as_slice(), entry)
+        let out = job.order.make(maker, &job.proof, job.name.as_slice(), entry);
+        self.makes = self.makes.saturating_add(1);
+        if self.makes == 1 {
+            let used = self.frame.used();
+            if used >= self.reset_at && used < WORKER_FRAME_HARD_RESET_AT {
+                self.reset_at = used.saturating_add(256 << 20).min(WORKER_FRAME_HARD_RESET_AT);
+            }
+        }
+        out
     }
 
     fn forget(&mut self, suite: SuiteId) {
@@ -2685,6 +2860,14 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     /// Suite-wide shared walk, maker, verified set, and publication cache (borrowed strictly
     /// within synchronous calls, never across `.await`, rule 27).
     pub suite_cache: &'c RefCell<suite_cache::SuiteCache<'h>>,
+    /// Command-wide binary launcher stub server (`CARGO_BIN_EXE_*`, `test.md` piece 17), borrowed
+    /// strictly within synchronous calls (never across `.await`, rule 27).
+    pub bins: Option<&'c RefCell<crate::test_bins::BinServer<'a, 'h>>>,
+    /// Whether this suite exposes `CARGO_BIN_EXE_*` (integration tests and benchmarks only).
+    pub expose_bins: bool,
+    /// Per-suite validated `Roots<'a>` populated by [`EntryCheck::refusal`] and consumed here
+    /// synchronously before spawning (never held across `.await`, rule 27).
+    pub roots_cache: &'c RefCell<RootsCache<'a>>,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
@@ -2911,11 +3094,16 @@ impl<'c> Launched<'c, '_, '_> {
         let named = Path::new(name.as_str()).map_err(OneError::Path)?;
         suite_dir.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
         let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
-        // 2. Per-test roots rooted into the suite's single shared walk.
+        // 2. Per-test roots rooted into the suite's single shared walk (reusing validated roots
+        // from `EntryCheck::refusal` so `entry_roots` runs once per test, never twice).
         let exports = self.native.map_or(&[][..], |send| send.items);
         signals.begin(Doing::Roots);
-        let roots = entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, alloc)
-            .map_err(|why| OneError::Parent(ParentError::Roots(why)))?;
+        let cached_roots = self.roots_cache.borrow_mut().take(row);
+        let roots = match cached_roots {
+            Some(roots) => roots,
+            None => entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, self.cache_alloc)
+                .map_err(|why| OneError::Parent(ParentError::Roots(why)))?,
+        };
         let head = roots.head();
         let test_entry = {
             let mut sc = self.suite_cache.borrow_mut();
@@ -2961,6 +3149,14 @@ impl<'c> Launched<'c, '_, '_> {
         let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
         // If this test is already impure at launch (eager native C image or custom harness), batch
         // pre-publish the suite's warm functions into `ahead` before spawning.
+        //
+        // Pure tests (`keep.is_ok()`) intentionally NEVER receive pre-published warm functions
+        // (not even pure `CodeClass::Toolchain` / closed functions): pure tests derive their
+        // `entered_fns` set — and therefore their `BZTR` `Address` and `Postings` asks — from the
+        // child's demand-driven `Up::Need` stream. Pre-publishing any function would suppress its
+        // `Up::Need` and make `entered_fns` depend on sibling test execution order (`warm_order`),
+        // violating Rule 25 determinism and breaking `Effect::Look` undo-cache and flakiness
+        // address matching (and for impure functions, bypassing per-test `NotKept` tracking).
         if keep.is_err() {
             let prep = self.suite_cache.borrow().prepublish_warm(
                 test_entry,
@@ -2978,16 +3174,60 @@ impl<'c> Launched<'c, '_, '_> {
         let line = head.line;
         let entry = bstd::mem::format_in!(frame, "{line}");
         // 3. Environment.
-        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 9, frame);
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 16, frame);
         vars.push(("TMPDIR", temp.as_str()));
         vars.extend_from_slice(self.place.vars);
         let package = self.place.vars;
-        let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
+        // Borrow `self.bins` strictly synchronously here to materialize per-row read-only stubs
+        // (`owner=<suite>:<row>` inside the read-only sidecar — zero extra guest env vars!) and
+        // snapshot `CARGO_BIN_EXE_*` into `frame` (never across `.await`, rule 27).
+        let mut bin_env_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
+        let mut bin_map_text: Option<String<&Frame>> = None;
+        let mut bin_dir_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "linux")]
+        let mut bin_sock_dir_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "macos")]
+        let mut bin_socket_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "macos")]
+        let mut bin_natives: Vec<crate::engine_native::NativeSend<'_>, &Frame> = Vec::new_in(frame);
+        let mut _row_stubs = None;
+        if self.expose_bins
+            && let Some(bins_cell) = self.bins
+        {
+            let bins_ref = bins_cell.borrow();
+            if let Some(prepared) = bins_ref
+                .prepare_row_stubs(cx, self.package, self.suite.0, row, frame)
+                .map_err(OneError::Bins)?
+            {
+                bin_env_pairs = prepared.env_pairs;
+                bin_map_text = prepared.bin_map;
+                bin_dir_text = Some(String::from_str_in(prepared.guard.dir_str(), frame));
+                #[cfg(target_os = "linux")]
+                {
+                    bin_sock_dir_text = Some(String::from_str_in(bins_ref.sock_dir(), frame));
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    bin_socket_text = Some(String::from_str_in(bins_ref.socket_path(), frame));
+                    bin_natives.extend_from_slice(bins_ref.bin_natives());
+                }
+                _row_stubs = Some(prepared.guard);
+            }
+        }
+        vars.extend_from_slice(bin_env_pairs.as_slice());
+        let command = self.env.iter().copied().filter(|(name, _)| {
+            *name != "TMPDIR"
+                && package.binary_search_by(|(set, _)| set.cmp(name)).is_err()
+                && !bin_env_pairs.iter().any(|(set, _)| set == name)
+        });
         run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
         let lazy_native = self.native.filter(|_| !eager_native).map(|send| bstd::mem::format_in!(frame, "lazy:{}", send.hex));
         if let Some(send) = self.native {
             let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
             vars.push(("BLAZE_LAUNCH_NATIVE", value));
+        }
+        if let Some(map) = bin_map_text.as_ref() {
+            vars.push(("BLAZE_LAUNCH_BIN_MAP", map.as_str()));
         }
         #[cfg(target_os = "macos")]
         let unwound_full = self.tests.harnessed().then(|| bstd::mem::format_in!(frame, "{}/unwound-{row}", self.temp));
@@ -2998,14 +3238,31 @@ impl<'c> Launched<'c, '_, '_> {
         #[cfg(target_os = "linux")]
         {
             vars.push(("BLAZE_LAUNCH_SANDBOX_TEMP", temp.as_str()));
+            if let Some(dir) = bin_dir_text.as_ref() {
+                vars.push(("BLAZE_LAUNCH_BINS_DIR", dir.as_str()));
+            }
+            if let Some(sock_dir) = bin_sock_dir_text.as_ref() {
+                vars.push(("BLAZE_LAUNCH_BINS_SOCK_DIR", sock_dir.as_str()));
+            }
             if self.tests.harnessed() {
                 vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", "fd:4"));
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = &bin_dir_text;
         // 4. Sandbox + spawn.
         #[cfg(target_os = "macos")]
         let Started { child: mut run, pipes: given } = {
-            let profile = seatbelt_profile(temp.as_str(), self.store, self.native, unwound_full.as_ref().map(|s| s.as_str()), frame, alloc)?;
+            let profile = seatbelt_profile(
+                temp.as_str(),
+                self.store,
+                self.native,
+                unwound_full.as_ref().map(|s| s.as_str()),
+                bin_socket_text.as_ref().map(|s| s.as_str()),
+                bin_natives.as_slice(),
+                frame,
+                alloc,
+            )?;
             let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
             args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
             args.extend_from_slice(self.args);
@@ -3460,6 +3717,14 @@ impl<'c> Launched<'c, '_, '_> {
         } else if let Some(error) = torn {
             return Err(child_error(error));
         }
+        if self.expose_bins
+            && let Some(bins_cell) = self.bins
+        {
+            bins_cell
+                .borrow_mut()
+                .drain_owner_evidence(self.suite.0, row, &mut entered_fns, &mut keep)
+                .map_err(OneError::BinServe)?;
+        }
         if entered_fns.is_empty() && keep.is_ok() {
             keep = Err(NotKept::Untraced);
         }
@@ -3638,11 +3903,19 @@ fn seatbelt_profile<'a>(
     store: &str,
     native: Option<crate::engine_native::NativeSend<'_>>,
     unwound: Option<&str>,
+    control: Option<&str>,
+    bin_natives: &[crate::engine_native::NativeSend<'_>],
     frame: &Frame,
     alloc: Alloc<'a>,
 ) -> Result<AString<'a>, OneError> {
-    let profile = blaze_run::child::seatbelt(temp, None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
-    let profile = with_native(profile, store, native)?;
+    let profile = blaze_run::child::seatbelt(temp, control, alloc).map_err(|why| {
+        let text = bstd::mem::format_in!(frame, "{why}");
+        OneError::Profile { why: text.as_str().into() }
+    })?;
+    let mut profile = with_native(profile, store, native)?;
+    for &bin_native in bin_natives {
+        profile = with_native(profile, store, Some(bin_native))?;
+    }
     with_unwound(profile, unwound)
 }
 
@@ -4026,7 +4299,7 @@ struct Selected<'r, T> {
     rows: &'r [Location],
 }
 
-impl Refuse for Selected<'_, Option<EntryCheck<'_, '_>>> {
+impl Refuse for Selected<'_, Option<EntryCheck<'_, '_, '_>>> {
     fn refusal(&mut self, flat: u32) -> Result<Option<&str>, OneError> {
         let flat_idx = usize::try_from(flat).map_err(|_| OneError::NoRow { row: flat })?;
         let loc = self.rows.get(flat_idx).ok_or(OneError::NoRow { row: flat })?;
@@ -4044,6 +4317,21 @@ impl RunOne for Selected<'_, Option<Launched<'_, '_, '_>>> {
         let launched = self.suites.get(suite_idx).and_then(|suite| suite.as_ref()).ok_or(OneError::NoRow { row: flat })?;
         launched.run(loc.row, budget, output, signals).await
     }
+
+    fn pump_bins(&self) -> Result<bool, OneError> {
+        let Some(first) = self.suites.iter().find_map(|s| s.as_ref()) else { return Ok(false) };
+        let Some(bins) = first.bins else { return Ok(false) };
+        bins.borrow_mut()
+            .pump(first.cx, first.ids, first.lent, first.watch)
+            .map_err(OneError::BinServe)
+    }
+
+    fn flat_of(&self, suite: u32, row: u32) -> Option<u32> {
+        self.rows
+            .iter()
+            .position(|loc| loc.suite.0 == suite && loc.row == row)
+            .and_then(|idx| u32::try_from(idx).ok())
+    }
 }
 
 /// Cheap suite descriptor sufficient for `TestCache::open` and `TestLoop` planning without
@@ -4052,6 +4340,7 @@ impl RunOne for Selected<'_, Option<Launched<'_, '_, '_>>> {
 pub(crate) struct SuiteSpec<'s> {
     pub unit: TestUnit<'s>,
     pub builder: Builder,
+    pub digests: crate::test_cache::SuiteDigests,
 }
 
 /// Outcome of the pure `TestCache` + `TestLoop` planning pass ([`prepare_suites`]).
@@ -4147,27 +4436,30 @@ pub(crate) fn prepare_suites_with<'a, 'm: 'a, D: blaze_core::Driver>(
     bump: blaze_own::Bump<'a>,
 ) -> Result<PreparedSuites<'a, 'm, D>, DriveError> {
     let alloc = bump.alloc();
-    let mut suite_specs = Vec::with_capacity_in(specs.len(), alloc);
-    for spec in specs {
-        suite_specs.push((spec.unit, spec.builder));
-    }
     let (mut cache, heads_vec, postings_list, moved) =
-        crate::test_cache::TestCache::open(lent, suite_specs.as_slice(), ids, certificate, tools_digest, alloc);
+        crate::test_cache::TestCache::open(lent, specs, ids, certificate, tools_digest, alloc);
     let mut heads_bump: Vec<Head<'a>, blaze_own::Bump<'a>> = Vec::with_capacity_in(heads_vec.len(), bump);
     for head in heads_vec {
         heads_bump.push(head);
     }
     let heads: &'a [Head<'a>] = heads_bump.into_bump_slice();
-    let postings: Postings<'a> = if postings_list.len() == 1 {
-        postings_list.first().copied().unwrap_or(Postings::EMPTY)
-    } else if postings_list.is_empty() {
+    // `TestLoop::begin_inventory` / `Plan::decide` only ever queries `postings.tests_of(ask)` for
+    // `ask` in `moved`: skip O(all suites * all asks) full postings re-encoding completely when
+    // `moved` is empty, and for multi-suite edits probe ONLY the moved asks directly against each
+    // suite's already-opened `BZPS` postings record (O(|moved| * suites * log P)).
+    let postings: Postings<'a> = if moved.is_empty() || postings_list.is_empty() {
         Postings::EMPTY
+    } else if postings_list.len() == 1 {
+        postings_list.first().copied().unwrap_or(Postings::EMPTY)
     } else {
         let mut pairs: AVec<'a, (Ask, TestId)> = Vec::new_in(alloc);
-        for head in heads.iter() {
-            for row in head.rows() {
-                for ask in head.asks(row) {
-                    pairs.push((ask, row.kept.test));
+        let mut named: AVec<'a, TestId> = Vec::new_in(alloc);
+        for &ask in moved.iter() {
+            for suite_postings in postings_list.iter() {
+                named.clear();
+                suite_postings.tests_of(ask, &mut named);
+                for &test in named.iter() {
+                    pairs.push((ask, test));
                 }
             }
         }
@@ -4328,7 +4620,7 @@ impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
     pub(crate) fn run<'h>(
         mut self,
         cx: &Cx,
-        fs: &bstd::fs::Fs,
+        fs: &'a bstd::fs::Fs,
         env: Option<&bstd::env::Env>,
         host: &bstd::host::Host,
         clock: &bstd::clock::Clock,
@@ -4336,6 +4628,7 @@ impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
         out: &bstd::out::Out,
         err: &bstd::out::Out,
         suites: &[Option<Suite<'_, 'h>>],
+        bins: &[crate::test_bins::BinSuite<'a, 'h>],
         ids: &RunIds<'h>,
         typed: crate::engine_body_record::TypedFrom<'h>,
         certificate: crate::start_list::Certificate,
@@ -4376,7 +4669,7 @@ impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
                 let sync_typed = typed.sync_over(*ids);
                 pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
                     run_dirty(
-                        &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                        &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
                         tables, watch, make_watch, frame, self.alloc, Some(relay), &mut self.machine, self.pending_runs,
                         self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
                     )
@@ -4384,7 +4677,7 @@ impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
             }
             Codes::Serial | Codes::Pooled => {
                 run_dirty(
-                    &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                    &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
                     tables, watch, make_watch, frame, self.alloc, None, &mut self.machine, self.pending_runs,
                     self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
                 )
@@ -4480,12 +4773,12 @@ fn pooled<'h>(
 #[expect(clippy::too_many_arguments, reason = "the command supplies the dirty test loop, records, and specific runtime capabilities")]
 fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     cx: &Cx,
-    fs: &bstd::fs::Fs,
+    fs: &'a bstd::fs::Fs,
     env: Option<&bstd::env::Env>,
     host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
     err: &bstd::out::Out,
-    suites: &[Option<Suite<'_, 'h>>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
+    suites: &[Option<Suite<'_, 'h>>], bins: &[crate::test_bins::BinSuite<'a, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     alloc: Alloc<'a>, relay: Option<&CodeRelay<'_>>, machine: &mut TestLoop<'a, 'r>, pending_runs: AVec<'a, Effect<'a>>,
     steps_left: usize, most: usize, locations: &[Location], cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
@@ -4504,6 +4797,19 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let command = bstd::mem::format_in!(frame, "{}-{}", host.pid(), clock.now().since_start().as_nanos());
     let command_path = Path::new(command.as_str()).map_err(|why| one(OneError::Path(why)))?;
     let mine = temps.make_dir(cx, &command_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
+    // RAII guard ensures `<mine>` (`v2/test/tmp/<pid>-<ns>`) is removed even if any setup step
+    // below (launcher check, `BinServer::start`, etc.) returns an error before tests run.
+    struct MineCleanup<'c, 't> {
+        cx: &'c Cx,
+        temps: &'t Dir<ReadWrite>,
+        path: &'t Path,
+    }
+    impl Drop for MineCleanup<'_, '_> {
+        fn drop(&mut self) {
+            let _ = crate::gc::remove_tree_best_effort(self.cx, self.temps, self.path);
+        }
+    }
+    let _mine_cleanup = MineCleanup { cx, temps: &temps, path: &command_path };
     let store = bstd::mem::format_in!(frame, "{home}/{RECORDS}");
     // 2. The launcher beside this binary, the spawner, the command's environment.
     let exe = host.exe().map_err(DriveError::Missing)?;
@@ -4514,6 +4820,30 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let spawner = host.spawner().map_err(DriveError::Missing)?;
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
+    let sock_nonce = u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(0)
+        ^ (u64::from(host.pid()).rotate_left(32));
+    let bin_server = if !bins.is_empty() && TestHost::THIS.has_sandbox() {
+        Some(RefCell::new(
+            crate::test_bins::BinServer::start(
+                cx,
+                fs,
+                sock_nonce,
+                launcher.as_str(),
+                store.as_str(),
+                bins,
+                lent,
+                &certificate,
+                typed,
+                tables,
+                make_watch,
+                frame,
+                alloc,
+            )
+            .map_err(|err| one(OneError::Bins(err)))?,
+        ))
+    } else {
+        None
+    };
     let mut dirs = Vec::with_capacity_in(suites.len(), frame);
     for (index, suite) in suites.iter().enumerate() {
         if suite.is_some() {
@@ -4529,18 +4859,23 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let mut child_base = 0usize;
     let entered_sink: RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>> = RefCell::new(Vec::new_in(alloc));
     let mut suite_caches = Vec::with_capacity_in(suites.len(), alloc);
+    let mut roots_caches = Vec::with_capacity_in(suites.len(), alloc);
     for suite in suites {
         match suite {
             Some(suite) => {
                 let sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
                 suite_caches.push(Some(RefCell::new(sc)));
+                roots_caches.push(Some(RefCell::new(RootsCache::new(alloc))));
             }
-            None => suite_caches.push(None),
+            None => {
+                suite_caches.push(None);
+                roots_caches.push(None);
+            }
         }
     }
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
-    for (index, (suite, suite_cache)) in suites.iter().zip(suite_caches.iter()).enumerate() {
+    for (index, ((suite, suite_cache), roots_cache)) in suites.iter().zip(suite_caches.iter()).zip(roots_caches.iter()).enumerate() {
         let Some(suite) = suite else {
             launches.push(None);
             checks.push(None);
@@ -4553,6 +4888,9 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             return Err(DriveError::NoSuite { suite: suite_id });
         };
         let Some(suite_cache) = suite_cache.as_ref() else {
+            return Err(DriveError::NoSuite { suite: suite_id });
+        };
+        let Some(roots_cache) = roots_cache.as_ref() else {
             return Err(DriveError::NoSuite { suite: suite_id });
         };
         launches.push(Some(Launched {
@@ -4568,9 +4906,21 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             entered_sink: &entered_sink,
             cache_alloc: alloc,
             suite_cache,
+            bins: bin_server.as_ref(),
+            expose_bins: unit.expose_bins,
+            roots_cache,
         }));
         child_base += tests.len();
-        checks.push(Some(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) }));
+        checks.push(Some(EntryCheck {
+            tests,
+            names: suite.names,
+            builder: suite.builder,
+            tables,
+            image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)),
+            roots_cache,
+            roots_alloc: alloc,
+            said: String::new_in(alloc),
+        }));
     }
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
     let launched = Selected { suites: launches.as_mut_slice(), rows: locations };
@@ -4592,7 +4942,9 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         {
             *loaded = true;
             if let Some(Some(sc)) = suite_caches.get(suite_idx) {
-                let _ = active_cache.load_verified(loc.suite, &certificate, sc.borrow_mut().verified_mut());
+                let mut sc = sc.borrow_mut();
+                let (closed_set, ws_set) = sc.verified_sets_mut();
+                let _ = active_cache.load_verified(loc.suite, closed_set, ws_set);
             }
         }
     };
@@ -4610,9 +4962,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         alloc,
     );
     watch.see(blaze_screen::Step::Says);
-    // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
-    // paths now that all child test processes have exited.
-    let _ = crate::gc::remove_tree_best_effort(cx, &temps, &command_path);
+    let mut one_stopped = false;
     if let (Err(DriveError::Run(_)), Some((row, failed))) = (&status, runner.zygotes().failed.as_ref()) {
         let row_idx = usize::try_from(*row).map_err(|_| one(OneError::NoRow { row: *row }))?;
         let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: *row }))?;
@@ -4622,9 +4972,11 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
         let path = record_row(tests, loc_row)?.path;
         err.line(cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
-        return Err(DriveError::OneStopped);
-    }
-    if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
+        one_stopped = true;
+    } else if let (Err(DriveError::Run(_)), Some(failed)) = (&status, runner.zygotes().failed_unowned.as_ref()) {
+        err.line(cx, format_args!("blaze test: workspace binary server failed: {failed}")).map_err(|_| DriveError::Print)?;
+        one_stopped = true;
+    } else if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
         let row_idx = usize::try_from(turn.row).map_err(|_| one(OneError::NoRow { row: turn.row }))?;
         let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: turn.row }))?;
         let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
@@ -4636,13 +4988,29 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             turn.nanos / 1_000_000_000, turn.nanos % 1_000_000_000 / 100_000_000, unit.package, unit.target, turn.row, turn.doing,
         )).map_err(|_| DriveError::Print)?;
     }
+    // Persist verified binary stub pairs (`BZTV`) before dropping `bin_server` so even a failed
+    // first run warms subsequent spawns of the same workspace binary under today's certificate.
+    let bin_saved = bin_server.as_ref().map(|server| server.borrow().save_verified(lent, &certificate));
+    // Close the binary stub listener and drop any remaining connections before `_mine_cleanup`
+    // removes `<mine>` (`v2/test/tmp/<pid>-<ns>`).
+    drop(runner);
+    drop(launched);
+    drop(launches);
+    drop(bin_server);
+    drop(_mine_cleanup);
+    if let Some(Err(err)) = bin_saved {
+        return Err(err);
+    }
+    if one_stopped {
+        return Err(DriveError::OneStopped);
+    }
     let status = status?;
     for (index, sc) in suite_caches.iter().enumerate() {
         let Some(sc) = sc.as_ref() else { continue };
         let sc = sc.borrow();
         if sc.verified_dirty() {
             let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-            cache.record_verified(suite_id, certificate, sc.verified_pairs());
+            cache.record_verified(suite_id, sc.verified_closed_pairs(), sc.verified_workspace_pairs());
         }
     }
     Ok(status)
@@ -5241,6 +5609,7 @@ mod zero_spawn_tests {
             target: "a",
             tests: TestRows::Main(LibKey(ContentId([0x81; 32]))),
             edition: blaze_surface::Edition::E2024,
+            expose_bins: false,
         };
         let unit1 = TestUnit {
             at: 1,
@@ -5249,8 +5618,14 @@ mod zero_spawn_tests {
             target: "b",
             tests: TestRows::Main(LibKey(ContentId([0x82; 32]))),
             edition: blaze_surface::Edition::E2024,
+            expose_bins: false,
         };
-        let specs = [SuiteSpec { unit: unit0, builder }, SuiteSpec { unit: unit1, builder }];
+        let make_specs = |ids: &RunIds<'_>| {
+            [
+                SuiteSpec { unit: unit0, builder, digests: crate::test_cache::test_suite_digests(unit0.key, &builder, ids, tools_digest) },
+                SuiteSpec { unit: unit1, builder, digests: crate::test_cache::test_suite_digests(unit1.key, &builder, ids, tools_digest) },
+            ]
+        };
         let make_config = |root_byte: u8| LoopConfig {
             plan: blaze_run::plan::Config {
                 width: 2,
@@ -5270,6 +5645,7 @@ mod zero_spawn_tests {
         let proofs = StandingProofs;
         let asked1 = IdsAsked::default();
         let Some(ids1) = build_ids(&cx, &tools, chk0, ContentId([0x11; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked1, blaze_own::testing::bump()) else { panic!("ids1") };
+        let specs1 = make_specs(&ids1);
         let name0 = instance_name_bytes(item0);
         let name1 = instance_name_bytes(item1);
         let Some(code_key0) = blaze_ladder::body_ids::instance_key(blaze_code::record::Symbol(sym0.0), item0, &name0, &ids1, &builder, &builder.producer, heap).map(|k| k.0.0) else { panic!("instance_key 0") };
@@ -5294,7 +5670,7 @@ mod zero_spawn_tests {
                 Ok(())
             };
             let cfg1 = make_config(0xaa);
-            let prepared1 = prepare_suites_with(&specs, &ids1, &cert1, tools_digest, cfg1, &[], &lent1, &clock, &mut cold_print, blaze_own::testing::bump());
+            let prepared1 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, cfg1, &[], &lent1, &clock, &mut cold_print, blaze_own::testing::bump());
             let Ok(PreparedSuites::Dirty(mut dirty1)) = prepared1 else { panic!("cold run must be Dirty") };
             assert!(dirty1.is_suite_dirty(0) && dirty1.is_suite_dirty(1), "both suites dirty on cold run");
             assert_eq!(dirty1.pending_count(), 2);
@@ -5347,7 +5723,7 @@ mod zero_spawn_tests {
             }
             Ok(())
         };
-        let prepared2 = prepare_suites_with(&specs, &ids1, &cert1, tools_digest, make_config(0xaa), &[], &lent2, &clock, &mut warm_print, blaze_own::testing::bump());
+        let prepared2 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, make_config(0xaa), &[], &lent2, &clock, &mut warm_print, blaze_own::testing::bump());
         match prepared2 {
             Ok(PreparedSuites::Done(status)) => {
                 assert_eq!(status, Status { passed: 2, failed: 0, ignored: 0, not_run: 0, check_errors: 0 });
@@ -5361,6 +5737,7 @@ mod zero_spawn_tests {
         // 3. Partial edit: only suite 0's body key moves (`0x11` -> `0x99`); suite 1 stays identical.
         let asked2 = IdsAsked::default();
         let Some(ids2) = build_ids(&cx, &tools, chk0, ContentId([0x99; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked2, blaze_own::testing::bump()) else { panic!("ids2") };
+        let specs2 = make_specs(&ids2);
         let cert2 = crate::start_list::Certificate::for_tests([0xbb; 32]);
         let mut partial_out = String::new_in(heap);
         let mut partial_print = |bytes: &[u8]| -> Result<(), DriveError> {
@@ -5369,15 +5746,34 @@ mod zero_spawn_tests {
             }
             Ok(())
         };
-        let prepared3 = prepare_suites_with(&specs, &ids2, &cert2, tools_digest, make_config(0xbb), &[], &lent2, &clock, &mut partial_print, blaze_own::testing::bump());
+        let prepared3 = prepare_suites_with(&specs2, &ids2, &cert2, tools_digest, make_config(0xbb), &[], &lent2, &clock, &mut partial_print, blaze_own::testing::bump());
         match prepared3 {
             Ok(PreparedSuites::Dirty(dirty3)) => {
                 assert!(dirty3.is_suite_dirty(0), "changed suite 0 must be dirty");
                 assert!(!dirty3.is_suite_dirty(1), "unchanged suite 1 must NOT be dirty (zero setup)");
                 assert_eq!(dirty3.pending_count(), 1, "only 1 dirty test queued");
+                assert_eq!(
+                    asked2.bodies(),
+                    1,
+                    "untouched suite 1 must hit per-suite SuiteCert in O(1) without opening its BodyCheck proof",
+                );
             }
             Ok(PreparedSuites::Done(status)) => panic!("edited suite 0 must not be Done: {status:?}"),
             Err(err) => panic!("partial prepare failed: {err}"),
         }
+    }
+
+    #[test]
+    fn roots_cache_hands_validated_roots_from_check_to_launch_without_recomputing() {
+        let heap = blaze_own::testing::heap();
+        let cache = RefCell::new(RootsCache::<u32>::new(heap.alloc()));
+        assert!(!cache.borrow().contains(9));
+        // EntryCheck inserts validated roots once; a repeated check hits without recomputing.
+        cache.borrow_mut().insert(9, 42);
+        assert!(cache.borrow().contains(9));
+        // Launch takes the cached entry once, leaving the slot empty for any later retry.
+        assert_eq!(cache.borrow_mut().take(9), Some(42));
+        assert!(!cache.borrow().contains(9));
+        assert_eq!(cache.borrow_mut().take(9), None);
     }
 }

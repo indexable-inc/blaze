@@ -386,6 +386,12 @@ pub trait Facts {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is an `auto trait` (`Send`, `Sync`, `Unpin`, `Freeze`, etc.), forwarded to
+    /// `blaze_borrow::Selected::is_auto_trait`.
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
     /// Whether `trait_` is one of the callable traits (`Fn`, `FnMut`, `FnOnce`: lang items `fn`,
     /// `fn_mut`, `fn_once`). Used by `call_through_value` to locate a generic parameter's or
     /// trait object's callable signature in the owner's clause or signature columns.
@@ -9055,7 +9061,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.b.stmt(StmtKind::StorageLive(l), self.pat_span(p));
                     match by_ref {
                         None => {
-                            if !is_residual && (ty.wrap.is_some() || ty.ty != lt.ty) {
+                            if !is_residual && (ty.wrap.is_some() || !self.same_up_to_alias(ty.ty, lt.ty, root)?) {
                                 return self.refuse_pat(Form::BindingMode, p);
                             }
                             let op = self.operand(Val { at: At::Place(place), ty }, root)?;
@@ -9069,7 +9075,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         Some(m) => {
                             if !is_residual {
                                 match self.node(lt.ty, root)? {
-                                    PNode::Ref(rm, inner) if rm == m && ty.wrap.is_none() && inner == ty.ty => {}
+                                    PNode::Ref(rm, inner) if rm == m && ty.wrap.is_none() && self.same_up_to_alias(inner, ty.ty, root)? => {}
                                     _ => return self.refuse_pat(Form::BindingMode, p),
                                 }
                             }
@@ -9264,17 +9270,155 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             },
         };
         let mut t = field;
+        let mut peels = 0u32;
+        let mut first_mutbl = None;
         for _ in 0..MOST_POSITIONS {
             t = match (t.wrap, self.node(t.ty, root)?) {
-                (Some(_), _) => TyD::of(t.ty),
-                (None, PNode::Ref(_, i)) => TyD::of(i),
+                (Some(m), _) => {
+                    if peels == 0 {
+                        first_mutbl = Some(m);
+                    }
+                    peels += 1;
+                    TyD::of(t.ty)
+                }
+                (None, PNode::Ref(m, i)) => {
+                    if peels == 0 {
+                        first_mutbl = Some(m);
+                    }
+                    peels += 1;
+                    TyD::of(i)
+                }
                 _ => break,
             };
         }
-        if t.wrap.is_some() || t.ty != own {
+        if t.wrap.is_some() {
             return self.refuse_pat(Form::BindingMode, sp);
         }
-        Ok(field)
+        if t.ty == own {
+            return Ok(field);
+        }
+        // `field` and `own` may differ only because the type checker normalized an associated
+        // projection inside a compound type (e.g. `(<Pin<&mut Fut> as Future>::Output, ..)` vs
+        // `(<Fut as Future>::Output, ..)` in `Either::Right((output, mut panicked))`). Require
+        // matching concrete non-ref outer heads so a hidden peel inside a top-level alias cannot
+        // slip past.
+        if self.same_concrete_head_up_to_alias(t.ty, own, root)? {
+            return Ok(match (peels, first_mutbl) {
+                (0, _) => TyD::of(own),
+                (1, Some(m)) => TyD { wrap: Some(m), ty: own },
+                _ => field,
+            });
+        }
+        self.refuse_pat(Form::BindingMode, sp)
+    }
+
+    /// Returns `true` when `a` and `b` share the same concrete non-ref, non-alias outer head and
+    /// all of their child subtrees match up to associated-type / opaque normalization.
+    fn same_concrete_head_up_to_alias(&self, a: PTy, b: PTy, e: ExprId) -> Result<bool, Refusal> {
+        if a == b {
+            return Ok(true);
+        }
+        let (na, nb) = (self.node(a, e)?, self.node(b, e)?);
+        if matches!(na, PNode::Alias { .. } | PNode::Opaque(..) | PNode::Ref(..))
+            || matches!(nb, PNode::Alias { .. } | PNode::Opaque(..) | PNode::Ref(..))
+        {
+            return Ok(false);
+        }
+        self.same_up_to_alias(a, b, e)
+    }
+
+    /// Structural type equality on `self.tys` modulo associated-type / opaque normalization, while
+    /// strictly preserving reference heads (`&` / `&mut` never matches a non-reference so a
+    /// binding-mode mismatch is never masked).
+    pub(crate) fn same_up_to_alias(&self, a: PTy, b: PTy, e: ExprId) -> Result<bool, Refusal> {
+        const MAX_STACK: usize = 32;
+        const MAX_STEPS: u32 = 64;
+        if a == b {
+            return Ok(true);
+        }
+        let mut stack = [(a, b); MAX_STACK];
+        let mut len = 1usize;
+        let mut steps = 0u32;
+        while len > 0 {
+            len -= 1;
+            steps += 1;
+            if steps > MAX_STEPS {
+                return Ok(false);
+            }
+            let (xa, xb) = stack[len];
+            if xa == xb {
+                continue;
+            }
+            let (na, nb) = (self.node(xa, e)?, self.node(xb, e)?);
+            if matches!(na, PNode::ConstValue { .. } | PNode::ConstParam(_))
+                && matches!(nb, PNode::ConstValue { .. } | PNode::ConstParam(_))
+            {
+                continue;
+            }
+            if matches!(na, PNode::Ref(..)) != matches!(nb, PNode::Ref(..)) {
+                return Ok(false);
+            }
+            if matches!(na, PNode::Alias { .. } | PNode::Opaque(..))
+                || matches!(nb, PNode::Alias { .. } | PNode::Opaque(..))
+            {
+                continue;
+            }
+            if !blaze_borrow::head_eq(na, nb) {
+                return Ok(false);
+            }
+            let mut push_pair = |x: PTy, y: PTy| -> bool {
+                if len >= MAX_STACK {
+                    return false;
+                }
+                stack[len] = (x, y);
+                len += 1;
+                true
+            };
+            match (na, nb) {
+                (PNode::Ref(_, pa), PNode::Ref(_, pb))
+                | (PNode::Ptr(_, pa), PNode::Ptr(_, pb))
+                | (PNode::Slice(pa), PNode::Slice(pb)) => {
+                    if !push_pair(pa, pb) {
+                        return Ok(false);
+                    }
+                }
+                (PNode::Array(ea, na), PNode::Array(eb, nb)) => {
+                    if !push_pair(ea, eb) || !push_pair(na, nb) {
+                        return Ok(false);
+                    }
+                }
+                (PNode::Tuple(la), PNode::Tuple(lb))
+                | (PNode::Union(la), PNode::Union(lb))
+                | (PNode::Adt(_, la), PNode::Adt(_, lb))
+                | (PNode::Record(_, la), PNode::Record(_, lb))
+                | (PNode::FnDef(_, la), PNode::FnDef(_, lb))
+                | (PNode::FnPtr(la, _), PNode::FnPtr(lb, _))
+                | (PNode::Dynamic(la), PNode::Dynamic(lb)) => {
+                    let (sa, sb) = (self.list(la, e)?, self.list(lb, e)?);
+                    if sa.len() != sb.len() {
+                        return Ok(false);
+                    }
+                    for (&x, &y) in sa.iter().zip(sb.iter()) {
+                        if !push_pair(x, y) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                (PNode::Pat(ba, la), PNode::Pat(bb, lb)) => {
+                    let (sa, sb) = (self.list(la, e)?, self.list(lb, e)?);
+                    if sa.len() != sb.len() || !push_pair(ba, bb) {
+                        return Ok(false);
+                    }
+                    for (&x, &y) in sa.iter().zip(sb.iter()) {
+                        if !push_pair(x, y) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(true)
     }
 
     /// When entering a peeling subpattern `sp` in `Move` mode (`mode == 0`), any direct immutable

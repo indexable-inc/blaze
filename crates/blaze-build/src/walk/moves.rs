@@ -374,6 +374,25 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             (Owner::Temp, None) => cx.root.mask.ok_or(malformed("a temporary scrutinee without its word"))?,
             (Owner::None, None) => return Err(malformed("a part moved out of a scrutinee no one owns")),
         };
+        // A direct variant field `(v, j)` of a local enum already has its bit in `0..base`
+        // (`field_bit`), which both `drop_owned` (on earlier whole-local assignments in a loop)
+        // and `drop_tree` (`root_switch`) already test. Clearing that bit directly avoids
+        // allocating a new `part_bit` past `base` and lets loops like `output = Some(v); if let
+        // Some(v) = output { break v; }` build cleanly without double-drop.
+        if matches!(cx.root.owner, Owner::Local(_))
+            && prefix.is_none()
+            && len == 1
+            && let Some(Step::Variant { v, row }) = self.moves.steps.get(start as usize).copied()
+            && let Ok(l) = self.layout(cx.root.g)
+            && let Shape::Enum { first, .. } = self.layouts[l as usize].shape
+            && let (ff, fl) = self.layout_variants[(first + v) as usize]
+            && row >= ff
+            && row < ff + fl
+            && let Some(bit) = self.field_bit(l, v, row - ff)?
+        {
+            self.moves.steps.truncate(start as usize);
+            return self.arm_effect(Pending::Clear { mask, bits: 1u64 << bit }, cx.guarded);
+        }
         // A local enum's switch owns its first `field_bit`s (a whole local's only: a local with
         // a field scrutinee is a struct or tuple, `field_path`'s `Shape::Fields`).
         let base = match (cx.root.owner, prefix, self.layout(cx.root.g).map(|l| self.layouts[l as usize].shape)) {

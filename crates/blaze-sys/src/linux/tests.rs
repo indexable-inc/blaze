@@ -199,6 +199,7 @@ fn the_number_table_is_libcs() {
         ("OPEN_TREE", libc::SYS_open_tree),
         ("MOVE_MOUNT", libc::SYS_move_mount),
         ("MOUNT_SETATTR", libc::SYS_mount_setattr),
+        ("PIVOT_ROOT", libc::SYS_pivot_root),
     ];
     // Every row of the table is checked, and in the table's order: a call added to one and
     // not the other fails here.

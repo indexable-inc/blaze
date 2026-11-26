@@ -578,22 +578,7 @@ impl<'a> Work<'a> {
             }
         }
         drop(self.cells);
-        for (id, delta) in self.readers.iter() {
-            let readers = answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc));
-            for (reader, added) in delta.iter() {
-                match *added {
-                    true => {
-                        readers.insert(*reader);
-                    }
-                    false => {
-                        readers.remove(reader);
-                    }
-                }
-            }
-            if readers.is_empty() {
-                answer.readers.remove(id);
-            }
-        }
+        answer.readers.apply_edits(&self.readers);
         for (file, names) in self.by_file.into_iter() {
             match names {
                 Some(names) => {

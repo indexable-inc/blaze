@@ -543,6 +543,9 @@ pub struct BorrowFacts<'a> {
     /// `Facts::trait_lifetimes` (the one call rule). The read: the names source files the
     /// trait's `Item` cell as it answers (tables/view.rs `declared_lifetimes`, D155).
     trait_counts: AVec<'a, (u128, Option<u32>)>,
+    /// Sorted checker keys of gathered traits marked `auto trait` (`TraitFlags::AUTO`), for
+    /// `blaze_flow_lower::Facts::is_auto_trait`.
+    auto_traits: AVec<'a, u128>,
     /// Each `<_ as trait_>::name` of those types, sorted, and its lifetime count (the trait's
     /// plus the associated type's own, `Arity::alias_lifetimes`), for `Facts::alias_lifetimes`;
     /// its reads the trait's `Item` and `Members` cells, filed by the names source likewise.
@@ -658,6 +661,7 @@ impl<'a> BorrowFacts<'a> {
             shape_refused: AVec::new_in(alloc),
             object_traits: AVec::new_in(alloc),
             trait_counts: AVec::new_in(alloc),
+            auto_traits: AVec::new_in(alloc),
             alias_counts: AVec::new_in(alloc),
             fn_binders: true,
             variance_at: AVec::new_in(alloc),
@@ -829,6 +833,9 @@ impl Facts for ReadBy<'_, '_> {
         self.facts.relates_nothing.contains(&Some(trait_))
             || Some(trait_) == self.facts.discriminant_kind
             || Some(trait_) == self.facts.pointee
+    }
+    fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.auto_traits.binary_search(&trait_.0).is_ok()
     }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.fn_traits.contains(&Some(trait_))
@@ -1774,13 +1781,96 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             }
         }
     }
-    // Ensure trait heads transitively through supertraits so `regions.clauses(trait_)` is loaded
-    // for supertrait elaboration in `blaze-borrow`.
+    // Ensure trait heads transitively through supertraits, trait where-clauses, associated-type
+    // item bounds, and nested alias traits so `regions.clauses` and `assoc_items` are loaded for
+    // supertrait elaboration in `blaze-borrow`.
     {
+        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>) {
+            let (args, extra_ty) = match *cl {
+                tc::PClause::Trait { trait_: sup, args } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), None)
+                }
+                tc::PClause::Projection { trait_: sup, args, term, .. } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), Some(term))
+                }
+                _ => (None, None),
+            };
+            let mut st = [tc::PTy(0); 32];
+            let mut len = 0usize;
+            if let Some(args) = args
+                && let Ok(list) = stys.list(args)
+            {
+                for &t in list {
+                    if len < st.len() {
+                        st[len] = t;
+                        len += 1;
+                    }
+                }
+            }
+            if let Some(t) = extra_ty
+                && len < st.len()
+            {
+                st[len] = t;
+                len += 1;
+            }
+            let mut steps = 0u32;
+            while len > 0 && steps < 64 {
+                len -= 1;
+                steps += 1;
+                let Ok(node) = stys.node(st[len]) else { continue };
+                match node {
+                    tc::PNode::Alias { trait_: at, args: al, .. }
+                    | tc::PNode::ExProj { trait_: at, args: al, .. }
+                    | tc::PNode::ExTrait(at, al) => {
+                        if traits.scan_for(&at.0).is_none() {
+                            traits.push(at.0);
+                        }
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Adt(_, al)
+                    | tc::PNode::Tuple(al)
+                    | tc::PNode::Dynamic(al)
+                    | tc::PNode::Opaque(_, al) => {
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Ref(_, x)
+                    | tc::PNode::Ptr(_, x)
+                    | tc::PNode::Slice(x)
+                    | tc::PNode::Array(x, _) => {
+                        if len < st.len() {
+                            st[len] = x;
+                            len += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let mut ti = 0usize;
         traits.sort_unstable();
         traits.dedup();
-        while ti < traits.len() && traits.len() < 256 {
+        while ti < traits.len() && traits.len() < 1024 {
             let tk = tc::ItemKey(traits[ti]);
             ti += 1;
             if let Some(lib) = r.keys.library_in(r.names, tk)
@@ -1789,23 +1879,21 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 container_head(r, lib, true);
                 r.store.ensure_assoc_regions(r.names, r.keys, lib);
             }
+            let stys = r.store.tys.view();
+            if let Some(p) = r.store.preds.get(&tk) {
+                for cl in p.clauses.iter() {
+                    push_clause_traits(stys, cl, &mut traits);
+                }
+            }
             if let Some(def) = r.store.trait_defs.get(&tk) {
                 for sc in def.supertraits.iter() {
-                    if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *sc
-                        && traits.scan_for(&sup.0).is_none()
-                    {
-                        traits.push(sup.0);
-                    }
+                    push_clause_traits(stys, sc, &mut traits);
                 }
                 for a in def.assoc.iter() {
                     g.assoc_items.push((tk.0, a.name, a.item));
                     if let Some(ap) = r.store.preds.get(&a.item) {
                         for ac in ap.clauses.iter() {
-                            if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *ac
-                                && traits.scan_for(&sup.0).is_none()
-                            {
-                                traits.push(sup.0);
-                            }
+                            push_clause_traits(stys, ac, &mut traits);
                         }
                     }
                 }
@@ -2774,7 +2862,16 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         };
         for t in g.trait_counts.iter_mut() {
             t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
+            if r.keys
+                .library_in(r.names, tc::ItemKey(t.0))
+                .and_then(|lib| r.store.maps.traits.get(&lib))
+                .is_some_and(|td| td.flags.has(tc::TraitFlags::AUTO))
+            {
+                g.auto_traits.push(t.0);
+            }
         }
+        g.auto_traits.sort_unstable();
+        g.auto_traits.dedup();
         for a in g.alias_counts.iter_mut() {
             a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
         }

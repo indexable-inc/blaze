@@ -65,8 +65,8 @@ fn usual() -> Io {
 
 /// This blaze's store files in the fixtures: under plain_place.rs `STORE_DIR` (a test below
 /// holds them there).
-const OWN_SEG: &str = "h/.blaze/v2/store/f5s3/seg-0000000000000001";
-const OWN_HEAD: &str = "h/.blaze/v2/store/f5s3/head";
+const OWN_SEG: &str = "h/.blaze/v2/store/f6s3/seg-0000000000000001";
+const OWN_HEAD: &str = "h/.blaze/v2/store/f6s3/head";
 
 #[test]
 fn the_fixtures_name_this_blazes_store() {

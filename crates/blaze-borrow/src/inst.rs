@@ -279,16 +279,28 @@ pub(crate) enum TypeAt<'c> {
 /// read (most a handful).
 pub struct Envs<'c, A: Allocator> {
     envs: Vec<Env<'c, A>, A>,
+    owner: Option<EnvId>,
     alloc: A,
 }
 
-/// The most environments one call makes (rule 18; deeply chained iterator adaptors like
-/// `a.flatten().chain(b.flatten()).chain(c.flatten())` open several hundred environments).
-pub const MOST_ENVS: usize = 4096;
+/// The most environments one call makes (rule 18; deeply chained iterator adaptors and
+/// Reth node-builder trait stacks open many nested impl/supertrait environments).
+pub const MOST_ENVS: usize = 32768;
 
 impl<'c, A: Allocator + Copy> Envs<'c, A> {
     pub fn new_in(alloc: A) -> Envs<'c, A> {
-        Envs { envs: Vec::new_in(alloc), alloc }
+        Envs { envs: Vec::new_in(alloc), owner: None, alloc }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.envs.len()
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if self.owner.is_some_and(|id| (id.0 as usize) >= len) {
+            self.owner = None;
+        }
+        self.envs.truncate(len);
     }
 
     fn push(&mut self, mode: Mode, regs: Vec<Option<Reg>, A>, types: Vec<Option<Side<'c>>, A>) -> Option<EnvId> {
@@ -318,10 +330,16 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
     }
 
     /// An environment in the caller's numbering (a bound of the caller's read for a tie).
+    /// Cached per call since `Mode::Owner { binder: None }` is immutable and empty.
     pub(crate) fn owner_env(&mut self) -> Option<EnvId> {
+        if let Some(id) = self.owner {
+            return Some(id);
+        }
         let regs = Vec::new_in(self.alloc);
         let tys = Vec::new_in(self.alloc);
-        self.push(Mode::Owner { binder: None }, regs, tys)
+        let id = self.push(Mode::Owner { binder: None }, regs, tys)?;
+        self.owner = Some(id);
+        Some(id)
     }
 
     /// Clones `base` with its clause-level `for<..>` binder (`binder: 0`, variables `0..binders`)
@@ -797,6 +815,14 @@ pub trait Selected {
     /// by name (stricter, never looser). The type checker's table answers from the lowering's
     /// facts (blaze-flow-lower `Facts::trait_relates_nothing`).
     fn relates_nothing(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is an `auto trait` (`Send`, `Sync`, `Unpin`, `Freeze`, etc.). When
+    /// `blaze-typeck` proved `T: AutoTrait` structurally or from an opaque/generic bound (never a
+    /// manual `impl` with extra `where` clauses, which returns `Selection::Impl`), the proof
+    /// relates no region.
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
         let _ = trait_;
         false
     }

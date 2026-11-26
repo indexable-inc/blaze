@@ -522,22 +522,140 @@ impl fmt::Display for IdsLine {
 }
 
 /// One check's proof, read at most once (a memo of the command's one thread; an error is kept
-/// too: a refused read is said again, never retried, rule 3). Sorted by `fact`, one each.
+/// too: a refused read is said again, never retried, rule 3).
 pub(crate) struct Slot {
     fact: [u8; 32],
     check: Name,
     proof: core::cell::OnceCell<Result<Proof, Unread>>,
 }
 
-/// The slots of BODY_ROW-wide `bodies`: one a distinct check, sorted by its fact, in `bump`.
-/// O(bodies log bodies) hashes and compares; nothing of a body is read.
-fn slots_of<'a>(bodies: &[u8], bump: Bump<'a>) -> &'a [Slot] {
-    let mut slots: Vec<Slot, Bump<'a>> = Vec::with_capacity_in(bodies.len() / BODY_ROW, bump);
-    for b in bodies.chunks_exact(BODY_ROW) {
-        let check = row_check(b);
-        slots.push(Slot { fact: body_fact(check), check, proof: core::cell::OnceCell::new() });
+/// On-demand proof cache allocated in `bump`: avoids eagerly BLAKE3-hashing `body_fact(check)`
+/// and sorting every workspace body row during `RunIds::read` and `RunIds::build_scoped`.
+///
+/// - Normal run/test execution (`proof_of` -> `today`): allocates one `Slot` per stepped body
+///   (O(1) per stepped body, 0 work on cache hits and on `prev_ids` delta reads).
+/// - Cold `today(fact)` lookup for a check never settled via `proof_of`: lazily materializes
+///   `all` once via [`slots_of_reusing`], sharing already-settled slots so `Asked` never
+///   double-counts a check.
+struct ProofSlots<'a> {
+    bump: Bump<'a>,
+    by_check: core::cell::RefCell<AVec<'a, &'a Slot>>,
+    by_fact: core::cell::RefCell<AVec<'a, &'a Slot>>,
+    all: core::cell::OnceCell<&'a [&'a Slot]>,
+}
+
+impl<'a> ProofSlots<'a> {
+    fn new(bump: Bump<'a>) -> &'a ProofSlots<'a> {
+        bump.alloc_val(ProofSlots {
+            bump,
+            by_check: core::cell::RefCell::new(Vec::new_in(bump.alloc())),
+            by_fact: core::cell::RefCell::new(Vec::new_in(bump.alloc())),
+            all: core::cell::OnceCell::new(),
+        })
     }
-    slots.sort_unstable_by(|a, b| a.fact.cmp(&b.fact));
+
+    fn slot_for_check(&self, check: Name) -> &'a Slot {
+        {
+            let by_check = self.by_check.borrow();
+            if let Ok(at) = by_check.binary_search_by_key(&check, |slot| slot.check)
+                && let Some(&slot) = by_check.get(at)
+            {
+                return slot;
+            }
+        }
+        let fact = body_fact(check);
+        if let Some(all) = self.all.get()
+            && let Ok(at) = all.binary_search_by_key(&fact, |slot| slot.fact)
+            && let Some(&slot) = all.get(at)
+        {
+            return slot;
+        }
+        let slot: &'a Slot = self.bump.alloc_val(Slot { fact, check, proof: core::cell::OnceCell::new() });
+        {
+            let mut by_check = self.by_check.borrow_mut();
+            if let Err(at) = by_check.binary_search_by_key(&check, |s| s.check) {
+                by_check.insert_shift(at, slot);
+            }
+        }
+        {
+            let mut by_fact = self.by_fact.borrow_mut();
+            if let Err(at) = by_fact.binary_search_by_key(&fact, |s| s.fact) {
+                by_fact.insert_shift(at, slot);
+            }
+        }
+        slot
+    }
+
+    fn slot_for_fact(&self, bodies: &[u8], fact: &[u8; 32]) -> Option<&'a Slot> {
+        {
+            let by_fact = self.by_fact.borrow();
+            if let Ok(at) = by_fact.binary_search_by_key(fact, |slot| slot.fact)
+                && let Some(&slot) = by_fact.get(at)
+            {
+                return Some(slot);
+            }
+        }
+        let all = self.all.get_or_init(|| {
+            let existing = self.by_check.borrow();
+            slots_of_reusing(bodies, existing.as_slice(), self.bump)
+        });
+        let at = all.binary_search_by_key(fact, |slot| slot.fact).ok()?;
+        all.get(at).copied()
+    }
+}
+
+/// Covariant lookup interface for [`ProofSlots`] so [`RunIds<'a>`] stays covariant in `'a`.
+trait ProofSlotLookup {
+    fn slot_for_check(&self, check: Name) -> &Slot;
+    fn slot_for_fact(&self, bodies: &[u8], fact: &[u8; 32]) -> Option<&Slot>;
+    #[cfg(test)]
+    fn checked_count(&self) -> usize;
+    #[cfg(test)]
+    fn all_materialized(&self) -> bool;
+}
+
+impl<'a> ProofSlotLookup for ProofSlots<'a> {
+    fn slot_for_check(&self, check: Name) -> &Slot {
+        ProofSlots::slot_for_check(self, check)
+    }
+
+    fn slot_for_fact(&self, bodies: &[u8], fact: &[u8; 32]) -> Option<&Slot> {
+        ProofSlots::slot_for_fact(self, bodies, fact)
+    }
+
+    #[cfg(test)]
+    fn checked_count(&self) -> usize {
+        self.by_check.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn all_materialized(&self) -> bool {
+        self.all.get().is_some()
+    }
+}
+
+/// Materializes all distinct check slots for `bodies`, reusing any already-settled slots in
+/// `existing` (sorted by `check`), sorted by `fact`. Called only on a cold `BodyIds::today`
+/// lookup for a check that `proof_of` has not touched yet.
+fn slots_of_reusing<'a>(bodies: &[u8], existing: &[&'a Slot], bump: Bump<'a>) -> &'a [&'a Slot] {
+    let mut checks: AVec<'a, Name> = Vec::with_capacity_in(bodies.len() / BODY_ROW, bump.alloc());
+    for b in bodies.chunks_exact(BODY_ROW) {
+        checks.push(row_check(b));
+    }
+    checks.sort_unstable();
+    checks.dedup();
+    let mut slots: Vec<&'a Slot, Bump<'a>> = Vec::with_capacity_in(checks.len(), bump);
+    for check in checks.iter().copied() {
+        if let Ok(at) = existing.binary_search_by_key(&check, |slot| slot.check)
+            && let Some(&slot) = existing.get(at)
+        {
+            slots.push(slot);
+        } else {
+            let slot: &'a Slot = bump.alloc_val(Slot { fact: body_fact(check), check, proof: core::cell::OnceCell::new() });
+            slots.push(slot);
+        }
+    }
+    slots.sort_unstable_by_key(|slot| slot.fact);
     slots.dedup_by_key(|slot| slot.fact);
     slots.into_bump_slice()
 }
@@ -1100,10 +1218,7 @@ pub(crate) fn workspace_of_delta<'a>(
         }
         for (b, checked) in previous.bodies.chunks_exact(BODY_ROW).zip(previous.verdicts.iter().copied()) {
             let row = body_row(b, checked);
-            if reuse.unchanged(row.check)
-                && (checks.binary_search(&row.check).is_ok()
-                    || views.binary_search_by_key(&row.check, |(v, _)| *v).is_ok())
-            {
+            if reuse.unchanged(row.check) {
                 bodies.push(WorkspaceBody { item: row.item, check: row.check, text: row.text, file: row.file });
                 facts.push((row.key, row.checked));
             }
@@ -1975,8 +2090,8 @@ pub(crate) struct RunIds<'a> {
     edges: &'a [Edge],
     /// Every crate fact's digest today, sorted by fact, one each.
     today: &'a [Read],
-    /// One a distinct check of the body rows, sorted by [`body_fact`], its proof read by need.
-    slots: &'a [Slot],
+    /// On-demand proof cache per distinct check, allocated lazily in `bump` (0 hashes at build/read).
+    slots: &'a (dyn ProofSlotLookup + 'a),
     /// Where the proofs are read from; `None` until [`RunIds::reading`] (then a proof is
     /// [`Unread::NoSource`], never a guess).
     from: Option<ReadsFrom<'a>>,
@@ -2092,8 +2207,31 @@ impl<'a> RunIds<'a> {
         facts.push(toolchain_read);
 
         // The crates' grains, and each locked crate's closure digest.
+        // Under a delta build (`previous` + `reuse`, where `UnitGraph` is proven unchanged),
+        // `Place::Fetched` crates have identical keys, packs, and dependency closures to `previous`,
+        // so reuse their `CrateGrain::Locked` reads directly without walking `each_dep` or
+        // re-hashing their Merkle closures.
         let n = crates.len();
-        let digests = locked_digests(crates, toolchain, scoped, answer, alloc)?;
+        let reuse_locked = previous.is_some()
+            && reuse.is_some()
+            && (0..n).all(|at| {
+                if scoped.is_some_and(|s| !s.allows(at)) {
+                    return true;
+                }
+                match crates.place(at) {
+                    Place::Fetched { .. } => matches!(
+                        previous.and_then(|prev| prev.crate_by_key(crates.key(at))),
+                        Some(CrateRow { grain: CrateGrain::Locked(_), .. })
+                    ),
+                    Place::CheckoutDep => false,
+                    Place::Toolchain | Place::Checkout | Place::Unplaced { .. } => true,
+                }
+            });
+        let digests = if reuse_locked {
+            Vec::new_in(alloc)
+        } else {
+            locked_digests(crates, toolchain, scoped, answer, alloc)?
+        };
         let mut rows: AVec<'a, CrateRow> = Vec::with_capacity_in(n, alloc);
         for at in 0..n {
             if scoped.is_some_and(|s| !s.allows(at)) {
@@ -2102,6 +2240,14 @@ impl<'a> RunIds<'a> {
             let key = crates.key(at);
             let grain = match crates.place(at) {
                 Place::Toolchain => CrateGrain::Toolchain,
+                Place::Fetched { .. } if reuse_locked => {
+                    let read = match previous.and_then(|prev| prev.crate_by_key(key)) {
+                        Some(CrateRow { grain: CrateGrain::Locked(read), .. }) => read,
+                        _ => Read { fact: locked_fact(key), digest: ABSENT.0 },
+                    };
+                    facts.push(read);
+                    CrateGrain::Locked(read)
+                }
                 Place::Fetched { .. } | Place::CheckoutDep => {
                     let digest = digests.get(at).copied().unwrap_or(ABSENT.0);
                     let read = Read { fact: locked_fact(key), digest };
@@ -2231,7 +2377,7 @@ impl<'a> RunIds<'a> {
             verdicts.push(row.checked);
         }
         let body_bytes: &'a [u8] = body_bytes.into_bump_slice();
-        let slots = slots_of(body_bytes, bump);
+        let slots = ProofSlots::new(bump);
         // The walked tree, sorted and one each whatever order the walk handed it in.
         let mut tree: Vec<Edge, Bump<'a>> = Vec::with_capacity_in(edges.len(), bump);
         tree.extend_from_slice(edges);
@@ -2266,6 +2412,33 @@ impl<'a> RunIds<'a> {
         u32::try_from(self.bodies.len() / BODY_ROW).unwrap_or(u32::MAX)
     }
 
+    /// The pinned toolchain this table was built under.
+    pub(crate) fn toolchain(&self) -> ToolchainId {
+        self.toolchain
+    }
+
+    /// The check producers digest (`CHECK_KINDS`' tools) this table was built under.
+    pub(crate) fn producers(&self) -> ContentId {
+        self.producers
+    }
+
+    /// Raw `CRATE_ROW` slice for the crate whose 8-byte prefix is `prefix`, or `None`.
+    pub(crate) fn crate_row_bytes(&self, prefix: [u8; 8]) -> Option<&'a [u8]> {
+        let n = self.crates.len() / CRATE_ROW;
+        let at = search(n, |i| self.crates.get(i * CRATE_ROW..i * CRATE_ROW + 8).unwrap_or(&[]).cmp(&prefix[..]))?;
+        self.crates.get(at * CRATE_ROW..(at + 1) * CRATE_ROW)
+    }
+
+    /// Contiguous raw `BODY_ROW` byte slice for every workspace body row whose item key starts
+    /// with `prefix` (already sorted ascending by `ItemKey`, zero allocations, zero store reads).
+    pub(crate) fn crate_bodies_bytes(&self, prefix: [u8; 8]) -> &'a [u8] {
+        let n = self.bodies.len() / BODY_ROW;
+        let at = |i: usize| self.bodies.get(i * BODY_ROW..(i + 1) * BODY_ROW).map_or(ItemKey(0), body_item);
+        let from = partition(n, |i| prefix_of(at(i)) < prefix);
+        let to = partition(n, |i| prefix_of(at(i)) <= prefix);
+        self.bodies.get(from * BODY_ROW..to * BODY_ROW).unwrap_or(&[])
+    }
+
     /// The bytes of the table's record ([`RunIds::write`]'s length), without writing it.
     pub(crate) fn table_bytes(&self) -> u64 {
         (HEADER + self.crates.len() + self.bodies.len() + self.edges.len() * EDGE + self.today.len() * READ) as u64
@@ -2279,9 +2452,8 @@ impl<'a> RunIds<'a> {
     /// The proof of the check `check`, read at its first ask and kept ([`Slot`]): `Err` names
     /// why it cannot be (no source, no row, a refused page, past the cap), the same each ask.
     fn proof_of(&self, check: Name) -> Result<&Proof, Unread> {
-        let fact = body_fact(check);
-        let Ok(at) = self.slots.binary_search_by(|slot| slot.fact.cmp(&fact)) else { return Err(Unread::NoRow { check }) };
-        self.settled(&self.slots[at])
+        let slot = self.slots.slot_for_check(check);
+        self.settled(slot)
     }
 
     /// `slot`'s proof, read now if it was not (counted in the source's [`Asked`]).
@@ -2427,7 +2599,7 @@ impl<'a> RunIds<'a> {
             verdicts: verdicts.into_bump_slice(),
             edges: edges.into_bump_slice(),
             today: today.into_bump_slice(),
-            slots: slots_of(bodies, bump),
+            slots: ProofSlots::new(bump),
             from: None,
         })
     }
@@ -2801,8 +2973,8 @@ impl BodyIds for RunIds<'_> {
         if let Some(read) = self.today_row(fact) {
             return Some(read.digest);
         }
-        let at = self.slots.binary_search_by(|slot| slot.fact.cmp(fact)).ok()?;
-        self.settled(&self.slots[at]).ok().map(|proof| proof.today)
+        let slot = self.slots.slot_for_fact(self.bodies, fact)?;
+        self.settled(slot).ok().map(|proof| proof.today)
     }
 
     fn crate_fact(&self, item: ItemKey) -> Option<Read> {
@@ -3153,5 +3325,120 @@ mod delta_tests {
         let Ok(sc_fresh_walk) = workspace_of_scoped(&cx, &mut ans, body_tool, &scoped_units, WalkFrom::UnitRoots, None, alloc) else { panic!("scoped fresh walk") };
         let Ok(sc_fresh_ids) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &sc_fresh_walk.bodies, &sc_fresh_walk.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("scoped fresh RunIds") };
         assert_eq!(sc_delta_ids.write(alloc).as_slice(), sc_fresh_ids.write(alloc).as_slice(), "scoped cfg-cut delta must drop stale row and match fresh RunIds");
+    }
+
+    #[test]
+    fn lazy_proof_slots_and_locked_reuse_stay_o_of_moved_and_stepped() {
+        struct CountingCrates<'a> {
+            inner: MemCrates<'a>,
+            dep_calls: CoreCell<usize>,
+        }
+        impl CrateTable<'static> for CountingCrates<'_> {
+            fn len(&self) -> usize {
+                self.inner.len()
+            }
+            fn key(&self, at: usize) -> CrateItemKey {
+                self.inner.key(at)
+            }
+            fn name(&self, at: usize) -> &'static str {
+                self.inner.name(at)
+            }
+            fn place(&self, at: usize) -> Place {
+                self.inner.place(at)
+            }
+            fn each_dep(&self, at: usize, each: &mut dyn FnMut(usize)) {
+                self.dep_calls.set(self.dep_calls.get() + 1);
+                self.inner.each_dep(at, each);
+            }
+        }
+        struct StaticReads;
+        impl BodyReads for StaticReads {
+            fn proof(&self, check: Name, _most: u32) -> Result<Proof, Unread> {
+                let mut fold = ProofFold::new(check);
+                fold.read(&[0xab; 32], &ContentId([0x11; 32]), &ContentId([0x11; 32]));
+                Ok(fold.finish())
+            }
+        }
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(9, bstd::io::Limits::USUAL));
+        let Ok(cx) = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME) else { panic!("root context") };
+        let alloc = blaze_own::testing::heap().alloc();
+        let tools = test_tools();
+        let body_tool = tools[Kind::BodyCheck.index()];
+        let toolchain = ToolchainId([0x77; 32]);
+        let crates = CountingCrates { inner: MemCrates(&CRATES), dep_calls: CoreCell::new(0) };
+
+        let rust = blaze_drive::Locate::File { edition: 2 };
+        let src = blaze_drive::Locate::Source(ContentId([0x40; 32]));
+        let pkg_a = Name::manifest(b"a/Cargo.toml");
+        let pkg_b = Name::manifest(b"b/Cargo.toml");
+        let a_lib = Name::file(b"a/src/lib.rs");
+        let b_lib = Name::file(b"b/src/lib.rs");
+        let chk_a1 = Name::new(Kind::BodyCheck, ContentId([0x61; 32]));
+        let chk_b1 = Name::new(Kind::BodyCheck, ContentId([0x62; 32]));
+        let units = [unit_root(CRATE_A, a_lib, false), unit_root(CRATE_B, b_lib, false)];
+
+        let mut ans = SpyAnswer::new(alloc);
+        ans.set_tree(Name::units(), &[part(pkg_a, src), part(pkg_b, src)], alloc);
+        ans.set_tree(pkg_a, &[part(a_lib, rust)], alloc);
+        ans.set_tree(pkg_b, &[part(b_lib, rust)], alloc);
+        ans.set_tree(a_lib, &[part(chk_a1, src)], alloc);
+        ans.set_tree(b_lib, &[part(chk_b1, src)], alloc);
+        ans.set_check(chk_a1, BodyFacts { key: ContentId([0xa1; 32]), checked: Checked::Clean, text: ContentId([0xb1; 32]), file: a_lib }, &[item_key(CRATE_A, 1)], alloc);
+        ans.set_check(chk_b1, BodyFacts { key: ContentId([0xa2; 32]), checked: Checked::Clean, text: ContentId([0xb2; 32]), file: b_lib }, &[item_key(CRATE_B, 1)], alloc);
+        ans.set_out(blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId([CRATE_A; 32]))), ContentId([0xc1; 32]));
+        ans.set_out(blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId([CRATE_B; 32]))), ContentId([0xc2; 32]));
+
+        let Ok(base_walk) = workspace_of_scoped(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, None, alloc) else { panic!("base walk") };
+        let Ok(base_ids) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &base_walk.bodies, &base_walk.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("base RunIds") };
+        assert!(crates.dep_calls.get() > 0, "cold build computes locked dep closure");
+        assert_eq!(base_ids.slots.checked_count(), 0, "new_scoped must not eagerly hash body_fact slots");
+        assert!(!base_ids.slots.all_materialized(), "new_scoped must not eagerly build all slots");
+
+        // Round-trip `RunIds::read` (delta anchor load) builds 0 proof slots.
+        let base_bytes = base_ids.write(alloc);
+        let Ok(prev_ids) = RunIds::read(base_bytes.as_slice(), blaze_own::testing::bump()) else { panic!("read prev") };
+        assert_eq!(prev_ids.slots.checked_count(), 0, "RunIds::read must not eagerly build proof slots");
+        assert!(!prev_ids.slots.all_materialized());
+
+        // Delta build on 1-body edit reuses fetched locked dep closure (0 `each_dep` calls) and builds 0 slots.
+        ans.set_check(chk_a1, BodyFacts { key: ContentId([0xd1; 32]), checked: Checked::Clean, text: ContentId([0xe1; 32]), file: a_lib }, &[item_key(CRATE_A, 1)], alloc);
+        let changed = [chk_a1];
+        let oracle = ChangedList(&changed);
+        crates.dep_calls.set(0);
+        ans.reset_counts();
+        let Ok(delta_walk) = workspace_of_delta(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, &prev_ids, &oracle, alloc) else { panic!("delta walk") };
+        let Ok(delta_ids) = RunIds::from_walked(&cx, toolchain, &crates, None, &tools, &delta_walk, &mut ans, Some((&prev_ids, &oracle)), Most::USUAL, blaze_own::testing::bump()) else { panic!("delta RunIds") };
+        assert_eq!(crates.dep_calls.get(), 0, "delta build must reuse locked dependency digests without re-walking deps");
+        assert_eq!(ans.opens.get(), 0);
+        assert_eq!(ans.body_reads.get(), 1);
+        assert_eq!(delta_ids.slots.checked_count(), 0);
+        assert!(!delta_ids.slots.all_materialized());
+
+        // Byte-identical to fresh build.
+        let Ok(fresh_walk) = workspace_of_scoped(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, None, alloc) else { panic!("fresh walk") };
+        let Ok(fresh_ids) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &fresh_walk.bodies, &fresh_walk.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("fresh RunIds") };
+        assert_eq!(delta_ids.write(alloc).as_slice(), fresh_ids.write(alloc).as_slice());
+
+        // Stepping 1 body settles only 1 slot without materializing `all`, and cold `today`
+        // for the untouched check lazily builds `all` without double-counting the first check.
+        let asked = Asked::default();
+        let reads = StaticReads;
+        let Ok(armed) = delta_ids.reading::<Production>(ReadsFrom::new(&reads, &asked, Most::USUAL)) else { panic!("arm reading") };
+        assert!(armed.runnable(item_key(CRATE_A, 1)).is_ok());
+        let Some(body_id) = armed.body_check(item_key(CRATE_A, 1)) else { panic!("body_check") };
+        let Some(first_read) = body_id.reads.first() else { panic!("one proof read") };
+        assert_eq!(armed.today(&first_read.fact), Some(first_read.digest));
+        assert_eq!(asked.bodies(), 1, "only the 1 stepped body read its proof");
+        assert_eq!(armed.slots.checked_count(), 1);
+        assert!(!armed.slots.all_materialized(), "warm proof_of -> today path must never build all slots");
+
+        // Cold `today` for untouched `chk_b1` lazily builds `all`, while `chk_a1` is not re-read.
+        let b_fact = body_fact(chk_b1);
+        assert!(armed.today(&b_fact).is_some());
+        assert!(armed.slots.all_materialized());
+        assert_eq!(asked.bodies(), 2);
+        assert_eq!(armed.today(&first_read.fact), Some(first_read.digest));
+        assert_eq!(asked.bodies(), 2, "already-settled slot must not be double-counted after `all` builds");
     }
 }

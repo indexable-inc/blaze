@@ -6,8 +6,10 @@ use std::alloc::Allocator;
 use std::{
     alloc::Global,
     collections::BTreeMap,
+    io::Error as IoError,
     ops::Range,
     path::{Path, PathBuf},
+    process,
     time::Duration,
 };
 
@@ -21,7 +23,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Found, GcPlan, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, CommitDurability, Committed, Found, GcPlan, Got, LentRecord, Liveness, PidCheck, PidLiveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::Settings,
 };
@@ -246,6 +248,7 @@ impl<A: Allocator + Clone> Driven<Native, A> {
             lock_step: crate::plain::LockStep::Backoff,
         };
         let mut it = Driven::with(driver, root, cfg, alloc)?;
+        it.set_pid(process::id());
         it.open_files()?;
         Ok(it)
     }
@@ -672,15 +675,35 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.commit_records(batches, &[])
     }
 
+    /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
+    /// least one key being committed in `batches`, `records`, or `self.core.held` (plus any
+    /// segment lacking a valid Bloom filter), leaving non-matching prior-boot segments unmapped
+    /// and unhashed during foreground commits ([`Plain::map_for_commit`]).
+    fn map_for_commit(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<(), StoreError> {
+        if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
+            return Ok(());
+        }
+        let lost = self.core.report().lost.len();
+        let now = self.driver.wall_ns();
+        if self.core.map_for_commit(batches, records, now, &mut self.effects)? && !self.effects.is_empty() {
+            self.run("mapping commit-matching segments")?;
+        }
+        self.hand_losses(lost);
+        Ok(())
+    }
+
     /// [`Driven::commit_with`] with `records` lent where they lie (core.rs
     /// [`Plain::commit_records`]): a `Lent`'s shared arena, copied once, by the layout.
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
-        // After the answer: what is left unmapped is mapped, so the layout refuses two values
-        // under one key against every row. A commit with nothing to lay out maps nothing.
+        // After the answer: only map/verify segments that can conflict with the batch being
+        // committed (Bloom-filtered), unless a `Liveness::Reached` root-set or emergency
+        // auto-tier-merge requires a whole store.
         let writing = self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty();
         let mut auto_folded = false;
-        if writing {
+        if self.core.needs_whole_for_commit() {
             self.map_all()?;
+        }
+        if writing {
             #[cfg(test)]
             let allow_auto = self.auto_merge;
             #[cfg(not(test))]
@@ -690,11 +713,14 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             // at the emergency safety ceiling (`Plain::AUTO_TIER_MERGE_FG` = 128) so interactive
             // `blaze check`/`test` commits never stall on multi-hundred-MB tier merges.
             if allow_auto && !self.core.slice_parked() && self.core.needs_auto_tier_merge() {
+                self.map_all()?;
                 let now = self.driver.wall_ns();
                 if self.core.fold_tiered_slice(now, &mut self.effects)? {
                     self.run("auto-merging tiers on commit")?;
                 }
                 auto_folded = self.core.slice_parked();
+            } else {
+                self.map_for_commit(batches, records)?;
             }
         }
         let now = self.driver.wall_ns();
@@ -827,6 +853,21 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     pub fn rearm_lease(&mut self) {
         let now_ns = self.driver.wall_ns();
         self.core.rearm_lease(now_ns)
+    }
+
+    /// [`Plain::set_commit_durability`].
+    pub fn set_commit_durability(&mut self, durability: CommitDurability) {
+        self.core.set_commit_durability(durability)
+    }
+
+    /// [`Plain::set_pid`].
+    pub fn set_pid(&mut self, pid: u32) {
+        self.core.set_pid(pid)
+    }
+
+    /// [`Plain::reclaim_dead_leases`].
+    pub fn reclaim_dead_leases(&mut self, check: &dyn PidCheck) -> u32 {
+        self.core.reclaim_dead_leases(check)
     }
 
     /// Reads at most [`format::HEAD_LEN`] + 1 bytes of `head` through the driver (zero segment
@@ -1107,6 +1148,40 @@ impl<D: Driver> Drop for ExclusiveLock<D> {
         while self.driver.in_flight() > 0 && !deadline.passed(self.driver.now()) {
             self.driver.poll(&mut done, deadline);
             done.clear();
+        }
+    }
+}
+
+/// Native Unix [`PidCheck`] via `kill(pid, 0)` (outside `#![blaze::sans_io]`, rules 14, 75).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct OsPidCheck;
+
+impl PidCheck for OsPidCheck {
+    fn check_pid(&self, pid: u32) -> PidLiveness {
+        #[cfg(unix)]
+        {
+            let Ok(pid_i32) = libc::pid_t::try_from(pid) else {
+                return PidLiveness::Unknown;
+            };
+            if pid_i32 <= 0 {
+                return PidLiveness::Dead;
+            }
+            // SAFETY: signal 0 performs only a kernel existence/permission check on positive
+            // `pid_i32` without delivering a signal or touching user memory.
+            let rc = unsafe { libc::kill(pid_i32, 0) };
+            if rc == 0 {
+                return PidLiveness::Alive;
+            }
+            match IoError::last_os_error().raw_os_error() {
+                Some(libc::EPERM) => PidLiveness::Alive,
+                Some(libc::ESRCH) => PidLiveness::Dead,
+                _ => PidLiveness::Unknown,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            PidLiveness::Unknown
         }
     }
 }

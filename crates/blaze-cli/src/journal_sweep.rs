@@ -475,7 +475,7 @@ pub(crate) struct Taken<'f> {
     /// unit's place by [`Taken::pair_with_helper`].
     helper_place: Option<[u8; HELPER_PLACE]>,
     /// What the helper said, for the `sweep:` line.
-    helper: Option<HelperRow>,
+    pub(crate) helper: Option<HelperRow>,
     /// True for a linked git worktree when `.git` is a file pointing to an external gitdir whose
     /// `HEAD`/ref/index state changed since the stored timestamp (or could not be verified),
     /// forcing `ScriptGit` / `.git` script rows to be followed even when checkout changes are empty.

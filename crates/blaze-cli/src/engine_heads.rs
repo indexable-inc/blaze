@@ -155,18 +155,18 @@ pub(crate) struct Made {
 }
 
 /// What a worker hands back for one task.
-struct Worked {
+struct Worked<'p> {
     out: ContentId,
-    defines: std::vec::Vec<(Cell, ContentId), Global>,
-    reads: std::vec::Vec<CellId, Global>,
+    defines: SVec<'p, (Cell, ContentId)>,
+    reads: SVec<'p, CellId>,
     /// At cell grain: each header's head read where `Owners::place` put it (a head task's cell,
     /// or a dependency's record whole), read as is ([`HeadsStage::run_phase`]).
-    heads: std::vec::Vec<CellId, Global>,
+    heads: SVec<'p, CellId>,
     payload: std::vec::Vec<u8, Global>,
 }
 
 /// One task's inputs, made on the coordinator.
-struct Job<'r> {
+struct Job<'r, 'p> {
     task: Task,
     krate: blaze_id::CrateItemKey,
     /// The crate's own `CrateScope` name: read whole.
@@ -175,14 +175,14 @@ struct Job<'r> {
     /// opened by need through [`HeadsScopeRecords`] on workers.
     own_crate: Crate<'r>,
     /// Unopened crates of its check scope after crate 0, in reader order.
-    rest: SVec<'static, crate::front_load::Unopened>,
+    rest: SVec<'p, crate::front_load::Unopened>,
     /// Each scope crate's `CrateScope` name, sorted: what a header read widens to.
-    scope: SVec<'static, Name>,
+    scope: SVec<'p, Name>,
     /// The cells a refusal of its tables is a function of ([`scope_cells`]).
-    cells: SVec<'static, CellId>,
+    cells: SVec<'p, CellId>,
 }
 
-impl<'r> Job<'r> {
+impl<'r> Job<'r, '_> {
     fn scope_crates<'s>(&'s self, records: &'s dyn crate::front_load::OpenByNeed) -> crate::run_names::ScopeCrates<'s, 's> {
         crate::run_names::ScopeCrates::ByNeed(crate::run_names::ByNeedScope { own: self.own_crate, rest: &self.rest[..], records })
     }
@@ -190,15 +190,15 @@ impl<'r> Job<'r> {
 
 /// One crate's check scope for the Heads stage: its own records opened, every non-member crate
 /// verified present in the committed snapshot and deferred to [`HeadsScopeRecords`] on workers.
-struct HeadsScope<'r> {
+struct HeadsScope<'r, 'p> {
     own: Crate<'r>,
-    rest: SVec<'static, crate::front_load::Unopened>,
-    lang: SVec<'static, usize>,
-    scope: SVec<'static, Name>,
+    rest: SVec<'p, crate::front_load::Unopened>,
+    lang: SVec<'p, usize>,
+    scope: SVec<'p, Name>,
     cut: Option<(usize, crate::engine_bodies::CutWhy)>,
 }
 
-impl HeadsScope<'_> {
+impl HeadsScope<'_, '_> {
     fn cut_name(&self, list: &blaze_world::crate_list::CrateList<'static>) -> Option<Name> {
         self.cut.as_ref().map(|(one, _)| blaze_drive::key::crate_scope_name(&list.key(*one)))
     }
@@ -291,14 +291,14 @@ impl<'r> HeadsScopeCache<'r> {
 /// Phase-wide lazy scope records for `Heads`: serves any crate already opened in
 /// [`HeadsScopeCache`] (active members) directly without re-reading the store, and opens every
 /// other scope crate at most once on demand from the shared request-wide [`ScopeRecords`].
-struct HeadsScopeRecords<'r, 's, 'l> {
-    preopened: SVec<'static, Option<crate::front_load::CrateRecords<'r>>>,
+struct HeadsScopeRecords<'r, 's, 'l, 'p> {
+    preopened: SVec<'p, Option<crate::front_load::CrateRecords<'r>>>,
     lazy: &'s crate::front_load::ScopeRecords<'l>,
 }
 
-impl<'r, 's, 'l> HeadsScopeRecords<'r, 's, 'l> {
-    fn new(cache: &HeadsScopeCache<'r>, lazy: &'s crate::front_load::ScopeRecords<'l>, crates: usize, heap: &'static blaze_own::Heap) -> HeadsScopeRecords<'r, 's, 'l> {
-        let mut preopened = SVec::with_capacity_in(crates, heap.shared());
+impl<'r, 's, 'l, 'p> HeadsScopeRecords<'r, 's, 'l, 'p> {
+    fn new(cache: &HeadsScopeCache<'r>, lazy: &'s crate::front_load::ScopeRecords<'l>, crates: usize, at_phase: SharedAlloc<'p>) -> HeadsScopeRecords<'r, 's, 'l, 'p> {
+        let mut preopened = SVec::with_capacity_in(crates, at_phase);
         preopened.extend(cache.slots.iter().map(|slot| slot.map(|(_, records)| records)));
         HeadsScopeRecords { preopened, lazy }
     }
@@ -312,7 +312,7 @@ fn by_need_delta(after: crate::front_load::ByNeedCounts, before: crate::front_lo
     }
 }
 
-impl crate::front_load::OpenByNeed for HeadsScopeRecords<'_, '_, '_> {
+impl crate::front_load::OpenByNeed for HeadsScopeRecords<'_, '_, '_, '_> {
     fn open<'s>(&'s self, one: &crate::front_load::Unopened) -> Result<crate::front_load::CrateRecords<'s>, &'static str> {
         if let Some(Some(records)) = self.preopened.get(one.world_at) {
             return Ok(*records);
@@ -336,7 +336,7 @@ impl crate::front_load::OpenByNeed for HeadsScopeRecords<'_, '_, '_> {
 /// for `subjects`), while verifying non-member dependencies are present in `snapshot` without
 /// opening or validating their payloads until a worker actually queries them.
 #[expect(clippy::too_many_arguments, reason = "lazy check-scope builder for Heads stage")]
-fn scope_by_need_heads<'r>(
+fn scope_by_need_heads<'r, 'p>(
     cache: &mut HeadsScopeCache<'r>,
     read: &mut EngineRecords<'r>,
     cx: &Cx,
@@ -345,24 +345,26 @@ fn scope_by_need_heads<'r>(
     names: crate::engine_names::NamesInputs<'_, '_>,
     list: &blaze_world::crate_list::CrateList<'static>,
     at: usize,
+    at_phase: SharedAlloc<'p>,
+    frame: &Frame,
     heap: &'static blaze_own::Heap,
-) -> Result<Result<(HeadsScope<'r>, bool), crate::engine_bodies::ScopeRefusal>, CliError> {
+) -> Result<Result<(HeadsScope<'r, 'p>, bool), crate::engine_bodies::ScopeRefusal>, CliError> {
     let g = heap.alloc();
-    let shared = heap.shared();
     let (_, own_records) = match cache.records_of(read, cx, store, names, list, at, g) {
         Ok(found) => found,
         Err(err) => return Ok(Err(err)),
     };
     let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
-    let checked = match blaze_world::check_scope::check_scope_in(list, at, no_core, g) {
+    let erased = blaze_own::Erased::new(frame);
+    let checked = match blaze_world::check_scope::check_scope_in(list, at, no_core, erased.handle()) {
         Ok(checked) => checked,
         Err(error) => return Ok(Err(crate::engine_bodies::ScopeRefusal::CheckScope { error })),
     };
     let own = Crate { records: own_records, name: CrateGraph::name(list, at), package: list.shown_from(at), world_at: at };
-    let mut rest: SVec<'static, crate::front_load::Unopened> = SVec::with_capacity_in(checked.readers().len().saturating_sub(1), shared);
-    let mut lang: SVec<'static, usize> = SVec::new_in(shared);
+    let mut rest: SVec<'p, crate::front_load::Unopened> = SVec::with_capacity_in(checked.readers().len().saturating_sub(1), at_phase);
+    let mut lang: SVec<'p, usize> = SVec::new_in(at_phase);
     lang.extend(checked.lang_places());
-    let mut scope: SVec<'static, Name> = SVec::with_capacity_in(checked.readers().len(), shared);
+    let mut scope: SVec<'p, Name> = SVec::with_capacity_in(checked.readers().len(), at_phase);
     let mut whole = true;
     let mut cut = None;
     for one in checked.crates() {
@@ -428,23 +430,116 @@ fn scope_crates_labels<'n>(crates: crate::run_names::ScopeCrates<'_, 'n>, frame:
     }
 }
 
-/// Hash index of `outlined` by physical checkout path for O(1) lookup by path.
-fn outlined_by_path<'o>(outlined: &'o [Outlined<'_>], g: Alloc<'static>) -> blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, Alloc<'static>> {
-    let mut index: blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, Alloc<'static>> =
-        blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: g, capacity: Some(outlined.len()) });
+/// Hash index of `outlined` by physical checkout path in phase memory for O(1) lookup by path.
+fn outlined_by_path<'o, 'p>(outlined: &'o [Outlined<'_>], at_phase: SharedAlloc<'p>) -> blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>> {
+    let mut index: blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>> =
+        blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: at_phase, capacity: Some(outlined.len()) });
     for (at, one) in outlined.iter().enumerate() {
         index.entry(one.path.as_slice()).or_insert(at);
     }
     index
 }
 
-/// First outline in `outlined` whose path equals `path`, via [`outlined_by_path`].
-fn find_outlined<'o, 'a, 'p>(
-    outlined: &'o [Outlined<'a>],
-    by_path: &blaze_hash::Map<&'p [u8], usize, blaze_hash::FixedState, Alloc<'static>>,
-    path: &'p [u8],
-) -> Option<&'o Outlined<'a>> {
-    by_path.get(&path).and_then(|&idx| outlined.get(idx))
+/// First outline index in `outlined` whose path equals `path`, via [`outlined_by_path`].
+fn find_outlined_index<'q>(
+    by_path: &blaze_hash::Map<&'q [u8], usize, blaze_hash::FixedState, SharedAlloc<'_>>,
+    path: &'q [u8],
+) -> Option<usize> {
+    by_path.get(&path).copied()
+}
+
+/// Phase-local cache of `(SignatureFile, entries_of)` per outlined file index (`0..outlined.len()`),
+/// so multi-unit crates (lib + test + bin) hash each file's `FileItemsView` at most once per phase
+/// and large batches fan out across all workers (rule 25 deterministic output).
+struct SubjectEntries<'p> {
+    cached: SVec<'p, Option<(crate::signature::SignatureFile, ContentId)>>,
+}
+
+impl<'p> SubjectEntries<'p> {
+    fn new(at_phase: SharedAlloc<'p>) -> SubjectEntries<'p> {
+        SubjectEntries { cached: SVec::new_in(at_phase) }
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "phase-wide subject entry cache and worker pool fanout")]
+    fn populate(
+        &mut self,
+        cx: &Cx,
+        outlined: &[Outlined<'_>],
+        pending: &[([u8; 8], u32, usize)],
+        subjects: &mut SVec<'p, Subject>,
+        max_workers: NonZeroU32,
+        at_phase: SharedAlloc<'p>,
+        frame: &Frame,
+    ) -> Result<(), CliError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if self.cached.len() < outlined.len() {
+            self.cached.resize(outlined.len(), None);
+        }
+        let mut missing: Vec<usize, &Frame> = Vec::new_in(frame);
+        for &(_, _, idx) in pending.iter() {
+            if self.cached.get(idx).copied().flatten().is_none() {
+                missing.push(idx);
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            missing.dedup();
+            let workers = usize::try_from(cx.workers().min(max_workers.get())).unwrap_or(1).max(1);
+            if workers > 1 && missing.len() >= 32 {
+                let missing_slice = missing.as_slice();
+                let chunks = workers.min(missing_slice.len().div_ceil(16)).max(1);
+                let chunk_len = missing_slice.len().div_ceil(chunks);
+                let scope = cx.scope();
+                scope.narrow_workers(max_workers, Class::Foreground);
+                let mut running = Vec::with_capacity_in(chunks, frame);
+                for chunk in missing_slice.chunks(chunk_len) {
+                    running.push(scope.may_overlap("engine heads: subject entries", bstd::mem::TASK_FRAME, move |_cx: &Cx| {
+                        let mut out: SVec<'p, (usize, crate::signature::SignatureFile, ContentId)> = SVec::with_capacity_in(chunk.len(), at_phase);
+                        for &idx in chunk.iter() {
+                            if let Some(one) = outlined.get(idx) {
+                                out.push((idx, crate::signature::SignatureFile::new(&one.path), crate::engine_listing_record::entries_of(one)));
+                            }
+                        }
+                        Ok::<_, Infallible>(out)
+                    }));
+                }
+                let mut stopped = None;
+                for handle in running.into_iter() {
+                    match handle.join(cx) {
+                        Ok(part) => {
+                            for (idx, sig, entries) in part.into_iter() {
+                                if let Some(slot) = self.cached.get_mut(idx) {
+                                    *slot = Some((sig, entries));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            stopped.get_or_insert(error);
+                        }
+                    }
+                }
+                scope.join(cx).map_err(CliError::Pool)?;
+                if let Some(error) = stopped {
+                    return Err(CliError::Pool(error));
+                }
+            } else {
+                for &idx in missing.iter() {
+                    if let (Some(one), Some(slot)) = (outlined.get(idx), self.cached.get_mut(idx)) {
+                        *slot = Some((crate::signature::SignatureFile::new(&one.path), crate::engine_listing_record::entries_of(one)));
+                    }
+                }
+            }
+        }
+        subjects.reserve(pending.len());
+        for &(prefix, file, idx) in pending.iter() {
+            if let (Some(one), Some(Some((signature_file, entries)))) = (outlined.get(idx), self.cached.get(idx).copied()) {
+                subjects.push(Subject { prefix, file, slot: one.name, signature_file, entries });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The cells a refusal over crate `at`'s check scope is a function of (plan row A8): the
@@ -453,8 +548,8 @@ fn find_outlined<'o, 'a, 'p>(
 /// ([`HeadsScope::cut`]), each `WHOLE`. A crate whose names task failed or did
 /// not run defines no cell: read ABSENT, so its task that comes, or its fix, moves the row.
 /// Unsorted: `failed_with` sorts and dedups.
-fn scope_cells(graph: Name, list: &blaze_world::crate_list::CrateList<'static>, at: usize, scope: Option<&HeadsScope<'_>>, shared: SharedAlloc<'static>) -> SVec<'static, CellId> {
-    let mut cells: SVec<'static, CellId> = SVec::with_capacity_in(2 + scope.map_or(1, |scope| scope.scope.len() + 1), shared);
+fn scope_cells<'p>(graph: Name, list: &blaze_world::crate_list::CrateList<'static>, at: usize, scope: Option<&HeadsScope<'_, '_>>, at_phase: SharedAlloc<'p>) -> SVec<'p, CellId> {
+    let mut cells: SVec<'p, CellId> = SVec::with_capacity_in(2 + scope.map_or(1, |scope| scope.scope.len() + 1), at_phase);
     cells.push(CellId { of: graph, cell: WHOLE });
     cells.push(CellId { of: blaze_drive::key::crate_scope_name(&list.key(at)), cell: WHOLE });
     if let Some(scope) = scope {
@@ -613,23 +708,30 @@ impl HeadsStage {
         // The per-item head tasks first ([`HeadsStage::run_items`]), then the crates' tables.
         // Closed-dep impl tables (`!member` with no member in scope) depend only on earlier Names
         // records and overlap directly with `HeadsSetup` and `HeadsSplit` on the same worker pool.
-        let (items, tasks): (std::vec::Vec<Task, Global>, std::vec::Vec<Task, Global>) = tasks.iter().copied().partition(|task| task.planned.name.kind == Kind::Signature);
-        let tasks = &tasks[..];
+        let mut items: SVec<'p, Task> = SVec::new_in(at_phase);
+        let mut table_tasks: SVec<'p, Task> = SVec::new_in(at_phase);
+        for &task in tasks.iter() {
+            if task.planned.name.kind == Kind::Signature {
+                items.push(task);
+            } else {
+                table_tasks.push(task);
+            }
+        }
+        let tasks = &table_tasks[..];
         let heap = handles.env.heap;
         let g = heap.alloc();
-        let shared = heap.shared();
         let at_cells = self.scope_reads.tables_at_cells();
         let listings_plant = self.jobs.listings;
         let mut scope_cache: Option<HeadsScopeCache<'r>> = None;
-        let mut closed_jobs: Vec<(usize, Job<'r>), Alloc<'static>> = Vec::new_in(g);
-        let mut pre_refused: Vec<(usize, &'static str, SVec<'static, CellId>), Alloc<'static>> = Vec::new_in(g);
+        let mut closed_jobs: SVec<'p, (usize, Job<'r, 'p>)> = SVec::new_in(at_phase);
+        let mut pre_refused: SVec<'p, (usize, &'static str, SVec<'p, CellId>)> = SVec::new_in(at_phase);
         if !items.is_empty() && !tasks.is_empty()
             && let (Some(graph), Some(names)) = (handles.graph, handles.names)
             && let Some(list) = kept.list(&cx, store, &graph, frame)?
             && kept.lazy_trees(handles.env, graph.out, list).is_ok()
         {
             let cache = scope_cache.get_or_insert_with(|| HeadsScopeCache::new(CrateGraph::len(&list), g));
-            let mut by_name: Vec<(Name, usize), Alloc<'static>> = Vec::with_capacity_in(CrateGraph::len(&list), g);
+            let mut by_name: SVec<'p, (Name, usize)> = SVec::with_capacity_in(CrateGraph::len(&list), at_phase);
             by_name.extend((0..CrateGraph::len(&list)).map(|at| (impl_tables_name(list.key(at)), at)));
             by_name.sort_unstable();
             for (idx, task) in tasks.iter().enumerate() {
@@ -642,12 +744,12 @@ impl HeadsStage {
                 if list.member(at) {
                     continue;
                 }
-                match scope_by_need_heads(cache, read, &cx, store, snapshot, names, &list, at, heap)? {
+                match scope_by_need_heads(cache, read, &cx, store, snapshot, names, &list, at, at_phase, frame, heap)? {
                     Ok((scope, true)) => {
                         if scope.rest.iter().any(|one| list.member(one.world_at)) {
                             continue;
                         }
-                        let cells = scope_cells(graph.name, &list, at, Some(&scope), shared);
+                        let cells = scope_cells(graph.name, &list, at, Some(&scope), at_phase);
                         let own = names.input_of(blaze_drive::key::crate_scope_name(&list.key(at))).map(|input| input.name);
                         if let Some(own) = own {
                             closed_jobs.push((idx, Job { task: *task, krate: list.key(at), own, own_crate: scope.own, rest: scope.rest, scope: scope.scope, cells }));
@@ -660,20 +762,21 @@ impl HeadsStage {
                             Some(cause) => crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")),
                             None => "its crate's check scope was cut and `scope_of` kept no cut (engine_bodies.rs `scope_of`)",
                         };
-                        let cells = scope_cells(graph.name, &list, at, Some(&scope), shared);
+                        let cells = scope_cells(graph.name, &list, at, Some(&scope), at_phase);
                         pre_refused.push((idx, why, cells));
                     }
                     Err(cause) => {
-                        let cells = scope_cells(graph.name, &list, at, None, shared);
+                        let cells = scope_cells(graph.name, &list, at, None, at_phase);
                         pre_refused.push((idx, crate::engine_head_notes::leak(g, format_args!("its crate's check scope was not read: {cause}")), cells));
                     }
                 }
             }
         }
-        let mut by_path: Option<blaze_hash::Map<&[u8], usize, blaze_hash::FixedState, Alloc<'static>>> = None;
+        let mut by_path: Option<blaze_hash::Map<&[u8], usize, blaze_hash::FixedState, SharedAlloc<'p>>> = None;
+        let mut subject_entries = SubjectEntries::new(at_phase);
         let mut phase_subjects: SVec<'p, Subject> = SVec::new_in(at_phase);
-        let mut loaded_prefixes: Vec<[u8; 8], Alloc<'static>> = Vec::new_in(g);
-        let closed_worked = self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, at_phase, frame, snapshot, &snapshot_owner, &mut scope_cache, &closed_jobs, at_cells, lazy_snap.as_ref(), heads_lazy, once, &mut by_path, &mut phase_subjects, &mut loaded_prefixes)?;
+        let mut loaded_prefixes: SVec<'p, [u8; 8]> = SVec::new_in(at_phase);
+        let closed_worked = self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, at_phase, frame, snapshot, &snapshot_owner, &mut scope_cache, &closed_jobs, at_cells, lazy_snap.as_ref(), heads_lazy, once, &mut by_path, &mut subject_entries, &mut phase_subjects, &mut loaded_prefixes)?;
         if tasks.is_empty() {
             return Ok(());
         }
@@ -725,11 +828,11 @@ impl HeadsStage {
         };
         let cache = scope_cache.get_or_insert_with(|| HeadsScopeCache::new(CrateGraph::len(&list), g));
         // Each crate of the list by its tables' name.
-        let mut by_name: std::vec::Vec<(Name, usize), Global> = std::vec::Vec::with_capacity_in(CrateGraph::len(&list), Global);
+        let mut by_name: SVec<'p, (Name, usize)> = SVec::with_capacity_in(CrateGraph::len(&list), at_phase);
         by_name.extend((0..CrateGraph::len(&list)).map(|at| (impl_tables_name(list.key(at)), at)));
         by_name.sort_unstable();
-        let mut jobs: std::vec::Vec<Job<'r>, Global> = std::vec::Vec::with_capacity_in(tasks.len(), Global);
-        let mut job_indices: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(tasks.len(), g);
+        let mut jobs: SVec<'p, Job<'r, 'p>> = SVec::with_capacity_in(tasks.len(), at_phase);
+        let mut job_indices: SVec<'p, usize> = SVec::with_capacity_in(tasks.len(), at_phase);
         let mut closed_cursor = 0usize;
         let mut pre_refused_cursor = 0usize;
         for (idx, task) in tasks.iter().enumerate() {
@@ -747,10 +850,13 @@ impl HeadsStage {
                 refuse(task, "an `ImplBucket` task of a crate the crate list does not hold", &[graph_cell], buffer);
                 continue;
             };
-            let at = by_name[found].1;
-            match scope_by_need_heads(cache, read, &cx, store, snapshot, names, &list, at, heap)? {
+            let Some(&(_, at)) = by_name.get(found) else {
+                refuse(task, "an `ImplBucket` task of a crate the crate list does not hold", &[graph_cell], buffer);
+                continue;
+            };
+            match scope_by_need_heads(cache, read, &cx, store, snapshot, names, &list, at, at_phase, frame, heap)? {
                 Ok((scope, true)) => {
-                    let cells = scope_cells(graph.name, &list, at, Some(&scope), shared);
+                    let cells = scope_cells(graph.name, &list, at, Some(&scope), at_phase);
                     let own = names.input_of(blaze_drive::key::crate_scope_name(&list.key(at))).map(|input| input.name);
                     let Some(own) = own else {
                         refuse(task, "its crate has no names record this command (its `Names` task failed)", &cells, buffer);
@@ -768,25 +874,25 @@ impl HeadsStage {
                         Some(cause) => crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's {cause}")),
                         None => "its crate's check scope was cut and `scope_of` kept no cut (engine_bodies.rs `scope_of`)",
                     };
-                    refuse(task, why, &scope_cells(graph.name, &list, at, Some(&scope), shared), buffer);
+                    refuse(task, why, &scope_cells(graph.name, &list, at, Some(&scope), at_phase), buffer);
                 }
                 // `scope_by_need_heads` reads the crate's own names record (ABSENT when its task failed)
                 // and the check scope the graph makes: both cells. Its cause printed, typed.
-                Err(cause) => refuse(task, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), &scope_cells(graph.name, &list, at, None, shared), buffer),
+                Err(cause) => refuse(task, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), &scope_cells(graph.name, &list, at, None, at_phase), buffer),
             }
         }
         // Source text belongs to its outline under either names-read strategy; only member crates
         // appearing in the active jobs' scopes can ever be queried by `Owners::place`. Reuse any
         // member subjects and path index already built in `run_items` for this phase.
         let subjects: &Subjects = if !jobs.is_empty() {
-            member_subjects(cache, read, &cx, store, names, &list, handles.outlined, &jobs, &mut by_path, &mut phase_subjects, &mut loaded_prefixes, heap);
+            member_subjects(cache, read, &cx, store, names, &list, handles.outlined, &jobs, &mut by_path, &mut subject_entries, &mut phase_subjects, &mut loaded_prefixes, handles.workers, at_phase, frame, heap)?;
             &phase_subjects[..]
         } else {
             &[]
         };
         let lazy = heads_lazy.get_or_insert_with(|| crate::front_load::ScopeRecords::new(lazy_snap.as_ref(), CrateGraph::len(&list), heap));
         let lazy_before = lazy.counts();
-        let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), heap);
+        let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), at_phase);
         let scope_records = &scope_records;
         // 2. The tables, largest-first (LPT) on the workers; restored to task order below.
         let procs = names.stage().names.as_ref().and_then(|names| names.procs());
@@ -795,7 +901,7 @@ impl HeadsStage {
         let outlined = handles.outlined;
         let clock = handles.clock;
         let max_workers = handles.workers;
-        let mut worked: std::vec::Vec<(Result<Result<Worked, &'static str>, work::Panicked>, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
+        let mut worked: SVec<'p, (Result<Result<Worked<'p>, &'static str>, work::Panicked>, u64)> = SVec::with_capacity_in(jobs.len(), at_phase);
         if !jobs.is_empty() {
             let mut job_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
             job_dispatch.extend(0..jobs.len());
@@ -812,12 +918,12 @@ impl HeadsStage {
                     at,
                     scope.may_overlap("engine impl tables", HEADS_FRAME, move |cx: &Cx| {
                         let began = clock.now();
-                        let made = work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, at_cells, heap, listings, snapshot, max_workers));
+                        let made = work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, at_cells, heap, listings, snapshot, max_workers, at_phase));
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
                 ));
             }
-            let mut worked_paired: Vec<(usize, (Result<Result<Worked, &'static str>, work::Panicked>, u64)), Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+            let mut worked_paired: SVec<'p, (usize, (Result<Result<Worked<'p>, &'static str>, work::Panicked>, u64))> = SVec::with_capacity_in(jobs.len(), at_phase);
             let mut stopped = None;
             for (at, handle) in running.into_iter() {
                 match handle.join(&cx) {
@@ -842,7 +948,7 @@ impl HeadsStage {
         // 3. Each result as the engine's row, its tables on the shelf, in task order.
         // Build a lazy Name -> first Done index map so `one.heads` lookups are O(1) instead of
         // scanning all of `buffer.done` per head read.
-        let mut done_index: Option<blaze_hash::HashMap<Name, usize, Alloc<'static>>> = None;
+        let mut done_index: Option<blaze_hash::HashMap<Name, usize, SharedAlloc<'p>>> = None;
         let mut closed_iter = closed_jobs.iter().zip(closed_worked.into_iter()).peekable();
         let mut rem_iter = job_indices.iter().copied().zip(jobs.iter().zip(worked.into_iter())).peekable();
         loop {
@@ -919,7 +1025,7 @@ impl HeadsStage {
             // head it saw (as a head's read of a sibling head, `job_cells`).
             if !one.heads.is_empty() {
                 let index = done_index.get_or_insert_with(|| {
-                    let mut m = blaze_hash::HashMap::with_capacity_in(buffer.done.len(), g);
+                    let mut m = blaze_hash::HashMap::with_capacity_in(buffer.done.len(), at_phase);
                     for (i, d) in buffer.done.iter().enumerate() {
                         m.entry(d.name).or_insert(i);
                     }
@@ -935,9 +1041,13 @@ impl HeadsStage {
             }
             reads.sort_unstable_by_key(|(id, _)| *id);
             reads.dedup_by_key(|(id, _)| *id);
-            let mut record_reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::with_capacity_in(reads.len(), Global);
-            record_reads.extend(reads.iter().map(|(id, digest)| (id.of, *digest)));
-            record_reads.dedup_by_key(|(of, _)| *of);
+            let unique_names = reads.chunk_by(|a, b| a.0.of == b.0.of).count();
+            let mut record_reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::with_capacity_in(unique_names, Global);
+            for group in reads.chunk_by(|a, b| a.0.of == b.0.of) {
+                if let Some((id, digest)) = group.first() {
+                    record_reads.push((id.of, *digest));
+                }
+            }
             if let Some(index) = done_index.as_mut() {
                 index.entry(name).or_insert(buffer.done.len());
             }
@@ -996,7 +1106,7 @@ const IMPL_SLOW_CHUNK: usize = 8;
 const IMPL_FAST_CHUNK: usize = 32;
 
 /// Predicted impl-row cost for LPT dispatch of `ImplBucket` jobs (O(1) verified header read).
-fn impl_job_weight(job: &Job<'_>, g: Alloc<'static>) -> usize {
+fn impl_job_weight(job: &Job<'_, '_>, g: Alloc<'static>) -> usize {
     ItemsRecord::from_verified(job.own_crate.records.items_proof, g).impls()
 }
 
@@ -1029,7 +1139,9 @@ fn steal_impl_chunks<'n>(
     shared: SharedAlloc<'static>,
 ) -> Result<StolenImplChunks, TableReadRefused> {
     let rec = opened.records;
-    let recorder = Recorder::new(RecorderOpts { alloc: g });
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let fa = bump.alloc();
+    let recorder = Recorder::new(RecorderOpts { alloc: fa });
     let view = Tables::new(TablesOpts { records: rec, impls: None, lang_crates: &[], reads: &recorder });
     let mut local_chunks: Vec<blaze_ladder::front2::buckets::ImplChunk<SharedAlloc<'static>>, SharedAlloc<'static>> = Vec::new_in(shared);
     let mut slot = first_slot;
@@ -1056,8 +1168,8 @@ fn steal_impl_chunks<'n>(
 struct TableReadRefused(&'static str);
 
 /// Result of one closed-dep `ImplBucket` job overlapped with `HeadsSetup`/`HeadsSplit`.
-struct ClosedWorked {
-    made: Result<Result<Worked, &'static str>, work::Panicked>,
+struct ClosedWorked<'p> {
+    made: Result<Result<Worked<'p>, &'static str>, work::Panicked>,
     ns: u64,
 }
 
@@ -1077,7 +1189,9 @@ fn place_table_reads<'n, A: core::alloc::Allocator>(
 where
     A: Copy,
 {
-    let unused = Recorder::new(RecorderOpts { alloc: g });
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let fa = bump.alloc();
+    let unused = Recorder::new(RecorderOpts { alloc: fa });
     let view = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &unused });
     let mut reads: blaze_own::Vec<CellId, A> = blaze_own::Vec::with_capacity_in(done_reads.len(), out_alloc);
     let mut heads: blaze_own::Vec<CellId, A> = blaze_own::Vec::new_in(out_alloc);
@@ -1123,7 +1237,7 @@ where
 /// its scope at most once (lazily after stealing a chunk). The member subjects place source reads.
 /// At cell grain, each header's head read is placed too.
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
-fn tables_of(
+fn tables_of<'p>(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     fs: &bstd::fs::Fs,
@@ -1131,7 +1245,7 @@ fn tables_of(
     packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
-    job: &Job<'_>,
+    job: &Job<'_, '_>,
     scope_records: &dyn crate::front_load::OpenByNeed,
     subjects: &Subjects,
     at_cells: bool,
@@ -1139,13 +1253,14 @@ fn tables_of(
     listings: &Listings,
     snapshot: &crate::store::StoreSnapshot,
     max_workers: NonZeroU32,
-) -> Result<Worked, &'static str> {
+    at_phase: SharedAlloc<'p>,
+) -> Result<Worked<'p>, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
     let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, crate::run_names::Envs { owner: None, rest: None }, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
-    let mut rows = Vec::new_in(g);
+    let mut rows: Vec<ImplRow<'_>, &Frame> = Vec::new_in(frame);
     if !NamesSource::each_impl_row(records, 0, &mut |row| rows.push(row)) {
         if let Some((_, why)) = opened.load.refused() {
             return Err(why);
@@ -1157,7 +1272,7 @@ fn tables_of(
     }
     let workers = usize::try_from(cx.workers().min(max_workers.get())).unwrap_or(1);
     let total_weight: usize = rows.iter().map(|row| if is_slow_impl_row(row) { IMPL_SLOW_WEIGHT } else { 1 }).sum();
-    let (out, defines_v, reads_v, heads_v, tables) = if workers > 1 && rows.len() >= IMPL_TABLE_SPLIT_MIN_ROWS && total_weight >= IMPL_TABLE_SPLIT_MIN_WEIGHT {
+    let (out, defines, reads, heads, tables) = if workers > 1 && rows.len() >= IMPL_TABLE_SPLIT_MIN_ROWS && total_weight >= IMPL_TABLE_SPLIT_MIN_WEIGHT {
         let crate_key = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
         if impl_tables_name(crate_key) != job.task.planned.name {
             return Err("its tables' crate key is not its task's (front2 buckets/records.rs `impl_tables_name`)");
@@ -1166,8 +1281,8 @@ fn tables_of(
         // Partition slow `from_text` candidates into small chunks at the front of the queue (LPT),
         // followed by fast rows in their original `(trait_path, module, key)` order so `RowNames`
         // keeps resolving consecutive equal `(trait_path, module)` runs once per chunk.
-        let mut ordered_rows: Vec<ImplRow<'_>, Alloc<'static>> = Vec::with_capacity_in(rows.len(), g);
-        let mut chunk_ranges: Vec<(usize, usize), Alloc<'static>> = Vec::new_in(g);
+        let mut ordered_rows: Vec<ImplRow<'_>, &Frame> = Vec::with_capacity_in(rows.len(), frame);
+        let mut chunk_ranges: Vec<(usize, usize), &Frame> = Vec::new_in(frame);
         for row in rows.iter() {
             if is_slow_impl_row(row) {
                 ordered_rows.push(*row);
@@ -1198,13 +1313,13 @@ fn tables_of(
         let cursor_ref = &cursor;
         let helper_count = workers.saturating_sub(1).min(ranges_slice.len().saturating_sub(1));
         let mut chunks: Vec<blaze_ladder::front2::buckets::ImplChunk<SharedAlloc<'static>>, Alloc<'static>> = Vec::with_capacity_in(ranges_slice.len(), g);
-        let mut reads_v: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
-        let mut heads_v: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
+        let mut reads: SVec<'p, CellId> = SVec::new_in(at_phase);
+        let mut heads: SVec<'p, CellId> = SVec::new_in(at_phase);
         let mut chunk_err: Option<&'static str> = None;
         {
             let scope = cx.scope();
             scope.narrow_workers(max_workers, Class::Foreground);
-            let mut running = Vec::with_capacity_in(helper_count, g);
+            let mut running = Vec::with_capacity_in(helper_count, frame);
             for _ in 0..helper_count {
                 running.push(scope.may_overlap("engine impl tables worker", HEADS_FRAME, move |cx: &Cx| {
                     let first = cursor_ref.fetch_add(1, Ordering::Relaxed);
@@ -1231,8 +1346,8 @@ fn tables_of(
                 match steal_impl_chunks(parent_first, &opened, scope_crates, ordered_slice, ranges_slice, cursor_ref, subjects, at_cells, listings, frame, g, shared) {
                     Ok((local_chunks, local_reads, local_heads)) => {
                         chunks.extend(local_chunks.into_iter());
-                        reads_v.extend_from_slice(&local_reads);
-                        heads_v.extend_from_slice(&local_heads);
+                        reads.extend_from_slice(&local_reads);
+                        heads.extend_from_slice(&local_heads);
                     }
                     Err(why) => {
                         chunk_err.get_or_insert(why.0);
@@ -1243,8 +1358,8 @@ fn tables_of(
                 match handle.join(cx) {
                     Ok(Ok(Some((local_chunks, local_reads, local_heads)))) => {
                         chunks.extend(local_chunks.into_iter());
-                        reads_v.extend_from_slice(&local_reads);
-                        heads_v.extend_from_slice(&local_heads);
+                        reads.extend_from_slice(&local_reads);
+                        heads.extend_from_slice(&local_heads);
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(why)) => {
@@ -1272,13 +1387,13 @@ fn tables_of(
         let written = finish_impl_tables(crate_key, &chunks, g)
             .map_err(|_| "its impl tables were not written (front2 buckets/records.rs `finish_impl_tables`: a row its writer refuses)")?;
         let out = impl_tables_out(&written.records);
-        let mut defines_v = Vec::with_capacity_in(written.defines.len(), g);
-        defines_v.extend(written.defines.iter().map(|(cell, digest)| (Cell(*cell), *digest)));
-        reads_v.sort_unstable();
-        reads_v.dedup();
-        heads_v.sort_unstable();
-        heads_v.dedup();
-        (out, defines_v, reads_v, heads_v, written.records)
+        let mut defines: SVec<'p, (Cell, ContentId)> = SVec::with_capacity_in(written.defines.len(), at_phase);
+        defines.extend(written.defines.iter().map(|(cell, digest)| (Cell(*cell), *digest)));
+        reads.sort_unstable();
+        reads.dedup();
+        heads.sort_unstable();
+        heads.dedup();
+        (out, defines, reads, heads, written.records)
     } else {
         let done = impl_tables_task(records, 0, &rows, g);
         if let Some((_, why)) = opened.load.refused() {
@@ -1294,23 +1409,17 @@ fn tables_of(
             return Err("its tables' crate key is not its task's (front2 buckets/records.rs `impl_tables_name`)");
         }
         let tables = done.records.ok_or("its impl tables' task made no records")?;
-        let (reads_v, heads_v) = place_table_reads(records, scope_crates, subjects, at_cells, listings, &done.reads, frame, g, g).map_err(|e| e.0)?;
+        let (reads, heads) = place_table_reads(records, scope_crates, subjects, at_cells, listings, &done.reads, frame, g, at_phase).map_err(|e| e.0)?;
         if let Some((_, why)) = opened.load.refused() {
             return Err(why);
         }
         if let Some(why) = packs.refused() {
             return Err(why);
         }
-        let mut defines_v = Vec::with_capacity_in(done.defines.len(), g);
-        defines_v.extend(done.defines.iter().copied());
-        (done.out, defines_v, reads_v, heads_v, tables)
+        let mut defines: SVec<'p, (Cell, ContentId)> = SVec::with_capacity_in(done.defines.len(), at_phase);
+        defines.extend(done.defines.iter().copied());
+        (done.out, defines, reads, heads, tables)
     };
-    let mut reads = std::vec::Vec::with_capacity_in(reads_v.len(), Global);
-    reads.extend_from_slice(&reads_v);
-    let mut heads = std::vec::Vec::with_capacity_in(heads_v.len(), Global);
-    heads.extend_from_slice(&heads_v);
-    let mut defines = std::vec::Vec::with_capacity_in(defines_v.len(), Global);
-    defines.extend_from_slice(&defines_v);
     Ok(Worked { out, defines, reads, heads, payload: framed(&tables, Global) })
 }
 
@@ -3026,14 +3135,18 @@ fn member_subjects<'r, 'p, 'h>(
     names: crate::engine_names::NamesInputs<'_, '_>,
     list: &blaze_world::crate_list::CrateList<'static>,
     outlined: &'h [Outlined<'_>],
-    jobs: &[Job<'r>],
-    by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, Alloc<'static>>>,
+    jobs: &[Job<'r, 'p>],
+    by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>>>,
+    subject_entries: &mut SubjectEntries<'p>,
     subjects: &mut SVec<'p, Subject>,
-    loaded_prefixes: &mut Vec<[u8; 8], Alloc<'static>>,
+    loaded_prefixes: &mut SVec<'p, [u8; 8]>,
+    max_workers: NonZeroU32,
+    at_phase: SharedAlloc<'p>,
+    frame: &Frame,
     heap: &'static blaze_own::Heap,
-) {
+) -> Result<(), CliError> {
     let g = heap.alloc();
-    let mut members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
+    let mut members: Vec<usize, &Frame> = Vec::new_in(frame);
     for job in jobs.iter() {
         if list.member(job.own_crate.world_at) {
             members.push(job.own_crate.world_at);
@@ -3048,44 +3161,47 @@ fn member_subjects<'r, 'p, 'h>(
     members.dedup();
     members.retain(|&member| loaded_prefixes.binary_search(&list.key(member).prefix()).is_err());
     if members.is_empty() {
-        return;
+        return Ok(());
     }
-    let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(outlined, g));
-    let mut added = false;
+    let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(outlined, at_phase));
+    let mut pending: Vec<([u8; 8], u32, usize), &Frame> = Vec::new_in(frame);
+    let erased = blaze_own::Erased::new(frame);
+    let fa = erased.handle();
     for member in members.iter().copied() {
         // A member whose own records cannot be read lists no file here (its heads placed as a
         // dependency's, coarser, never missed); its typed cause is printed by the refusal of
         // that member's own head tasks and bodies.
         let Ok((_, own_records)) = cache.records_of(read, cx, store, names, list, member, g) else { continue };
-        let items = ItemsRecord::from_verified(own_records.items_proof, g);
+        let items = ItemsRecord::from_verified(own_records.items_proof, fa);
         let prefix = list.key(member).prefix();
         loaded_prefixes.push(prefix);
         for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
             let Ok(Some(row)) = items.file_surface(file) else { continue };
-            let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
+            let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
             let Some(path) = path.strip_prefix("/0/") else { continue };
-            if let Some(one) = find_outlined(outlined, by_path, path.as_bytes()) {
-                subjects.push(Subject::new(prefix, file, one));
-                added = true;
+            if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+                pending.push((prefix, file, idx));
             }
         }
     }
     loaded_prefixes.sort_unstable();
     loaded_prefixes.dedup();
-    if added {
+    if !pending.is_empty() {
+        subject_entries.populate(cx, outlined, &pending, subjects, max_workers, at_phase, frame)?;
         subjects.sort_unstable();
         subjects.dedup();
     }
+    Ok(())
 }
 
 /// One member crate's head tasks, made over its check scope's records (its own opened; every
 /// non-member dependency opened by need through [`HeadsScopeRecords`]): its setup on one worker,
 /// its tasks in split jobs on any.
-struct ItemJob<'r> {
+struct ItemJob<'r, 'p> {
     prefix: [u8; 8],
     own: Crate<'r>,
-    rest: SVec<'static, crate::front_load::Unopened>,
-    lang: SVec<'static, usize>,
+    rest: SVec<'p, crate::front_load::Unopened>,
+    lang: SVec<'p, usize>,
     /// Every crate of its scope had records (else its tasks are refused by name).
     whole: bool,
     /// When not `whole`: the cut's cause in words, the crate named (engine_bodies.rs
@@ -3093,36 +3209,36 @@ struct ItemJob<'r> {
     cut_words: Option<&'static str>,
     /// The cells a refusal of its tasks is a function of ([`scope_cells`]): at 0 the graph's,
     /// at 1 the member's own names cell.
-    cells: SVec<'static, CellId>,
+    cells: SVec<'p, CellId>,
     /// Its tasks, sorted by (file, name) before splitting.
-    tasks: std::vec::Vec<Task, Global>,
+    tasks: SVec<'p, Task>,
 }
 
-impl<'r> ItemJob<'r> {
+impl<'r> ItemJob<'r, '_> {
     fn scope_crates<'s>(&'s self, records: &'s dyn crate::front_load::OpenByNeed) -> crate::run_names::ScopeCrates<'s, 's> {
         crate::run_names::ScopeCrates::ByNeed(crate::run_names::ByNeedScope { own: self.own, rest: &self.rest[..], records })
     }
 }
 
 /// One head task as a worker made it.
-struct WorkedHead {
+struct WorkedHead<'p> {
     out: ContentId,
-    defines: std::vec::Vec<(Cell, ContentId), Global>,
+    defines: SVec<'p, (Cell, ContentId)>,
     /// Each cell's item ([`head_item`]) and its unit's crate prefix, as `defines` lists them:
-    /// what the profile counts by. Over the handed heap's `Sync` handle: it crosses back from
-    /// the worker.
-    items: SVec<'static, (Cell, [u8; 8])>,
-    reads: std::vec::Vec<CellId, Global>,
+    /// what the profile counts by. Over the phase's `Sync` handle: it crosses back from the
+    /// worker and is unmapped when the phase ends.
+    items: SVec<'p, (Cell, [u8; 8])>,
+    reads: SVec<'p, CellId>,
     /// Each cell's want (front2 head.rs `want_bytes`), its cell ([`head_cell`], 16 bytes), its
     /// frozen bytes' length (u32 LE) and the frozen bytes, in cell order. The row's record adds
     /// the run facts after them ([`ctor_facts`]; engine_seeds.rs `runs_from`).
     payload: std::vec::Vec<u8, Global>,
     /// Each head it could not freeze: its cell, the head, why (engine_head_notes.rs).
-    failed: SVec<'static, (Cell, &'static str, crate::engine_head_notes::Cause)>,
+    failed: SVec<'p, (Cell, &'static str, crate::engine_head_notes::Cause)>,
     /// The checker keys of the constructors of each ADT the task's entry holds, under this
     /// unit ([`ctors_of`]), 16 big-endian bytes each, any order: its run facts' covers. Over the
-    /// handed heap's `Sync` handle, as `items`.
-    ctors: SVec<'static, [u8; 16]>,
+    /// phase's `Sync` handle, as `items`.
+    ctors: SVec<'p, [u8; 16]>,
     /// Whether an ADT's head (`Want::Adt`) of the task did not freeze: its constructors are not
     /// run ([`ctor_facts`]).
     adt_failed: bool,
@@ -3133,9 +3249,9 @@ struct WorkedHead {
 const HEAD_FAILED_DOMAIN: &str = "blaze-cli engine heads: a head not frozen";
 
 /// A head task that could not freeze a head: why (rule 19), and what it read until then.
-struct HeadFailed {
+struct HeadFailed<'p> {
     why: &'static str,
-    reads: std::vec::Vec<CellId, Global>,
+    reads: SVec<'p, CellId>,
     incomplete_reads: bool,
 }
 
@@ -3174,6 +3290,7 @@ fn ctor_facts(mut ctors: SVec<'_, [u8; 16]>, adt_failed: bool, payload: &mut std
     let mut facts: SVec<'_, u8> = SVec::new_in(alloc);
     crate::engine_body_facts::write(class, &ctors, None, &mut facts).map_err(|_| "its entry's ADTs give more constructors than a run facts record counts (engine_heads.rs `ctor_facts`)")?;
     let len = u32::try_from(facts.len()).map_err(|_| "its run facts are longer than a head payload's 32-bit trailer length (engine_heads.rs `ctor_facts`)")?;
+    payload.reserve_exact(facts.len().saturating_add(4));
     payload.extend_from_slice(&facts);
     payload.extend_from_slice(&len.to_le_bytes());
     Ok(())
@@ -3196,7 +3313,7 @@ struct UnitsMade<'a> {
     reads: SVec<'a, CellId>,
     /// The first unit's freeze, the later units' defines, items, runs and failed heads
     /// appended in unit order ([`WorkedHead::payload`]: one run a (unit, cell)).
-    first: Option<WorkedHead>,
+    first: Option<WorkedHead<'a>>,
 }
 
 impl<'a> UnitsMade<'a> {
@@ -3205,7 +3322,7 @@ impl<'a> UnitsMade<'a> {
     }
 
     /// Unit `prefix`'s freeze of the task (its items carry `prefix` already, `heads_of`).
-    fn take(&mut self, prefix: [u8; 8], mut one: WorkedHead) {
+    fn take(&mut self, prefix: [u8; 8], mut one: WorkedHead<'a>) {
         self.out.update(&prefix).update(&one.out.0);
         self.reads.extend(one.reads.iter().copied());
         // Its list is in the union now: freed here, not kept a second time to the phase's merge
@@ -3309,20 +3426,20 @@ impl HeadsStage {
         snapshot: &crate::store::StoreSnapshot,
         snapshot_owner: &crate::store::SharedSnapshot,
         scope_cache: &mut Option<HeadsScopeCache<'r>>,
-        closed_jobs: &[(usize, Job<'r>)],
+        closed_jobs: &[(usize, Job<'r, 'p>)],
         at_cells: bool,
         lazy_snap: &'l crate::store::StoreSnapshot,
         heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
         once: &crate::engine_heads_once::HeadsOnce,
-        by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, Alloc<'static>>>,
+        by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>>>,
+        subject_entries: &mut SubjectEntries<'p>,
         subjects: &mut SVec<'p, Subject>,
-        loaded_subjects: &mut Vec<[u8; 8], Alloc<'static>>,
-    ) -> Result<Vec<ClosedWorked, Alloc<'static>>, CliError> {
+        loaded_subjects: &mut SVec<'p, [u8; 8]>,
+    ) -> Result<SVec<'p, ClosedWorked<'p>>, CliError> {
         let heap = handles.env.heap;
         let g = heap.alloc();
-        let shared = heap.shared();
         if tasks.is_empty() {
-            return Ok(Vec::new_in(g));
+            return Ok(SVec::new_in(at_phase));
         }
         let refused = &mut self.refused;
         // A refusal with the cells it is a function of, each as the view holds it today (ABSENT
@@ -3333,7 +3450,12 @@ impl HeadsStage {
             reads.extend(cells.iter().map(|id| (*id, view.cell(id))));
             buffer.done.push(crate::engine_tasks::failed_with(task, reads, alloc));
             // The whole task failed: named by the file its entry is in.
-            let file = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).ok().and_then(|at| core::str::from_utf8(&handles.outlined[at].path).ok());
+            let file = handles
+                .outlined
+                .binary_search_by(|one| one.name.cmp(&task.planned.file))
+                .ok()
+                .and_then(|at| handles.outlined.get(at))
+                .and_then(|one| core::str::from_utf8(&one.path).ok());
             let head = match file {
                 Some(path) => crate::engine_head_notes::leak(g, format_args!("a head of '{path}'")),
                 None => "a head of a file the outlines do not hold",
@@ -3346,7 +3468,7 @@ impl HeadsStage {
             for task in tasks.iter() {
                 refuse(task, "this command has no unit graph or no crate's names, so no head", &[], buffer);
             }
-            return Ok(Vec::new_in(g));
+            return Ok(SVec::new_in(at_phase));
         };
         // The crate list, each member's check scope and the packs are the graph record's.
         let graph_cell = CellId { of: graph.name, cell: WHOLE };
@@ -3354,7 +3476,7 @@ impl HeadsStage {
             for task in tasks.iter() {
                 refuse(task, "the crates' inputs could not be made (names.rs `world`; the `UnitGraph` record's finding says why)", &[graph_cell], buffer);
             }
-            return Ok(Vec::new_in(g));
+            return Ok(SVec::new_in(at_phase));
         };
         let (packs, corrected) = match kept.lazy_trees(handles.env, graph.out, list) {
             Ok(trees) => trees,
@@ -3363,24 +3485,25 @@ impl HeadsStage {
                 for task in tasks.iter() {
                     refuse(task, why, &[], buffer);
                 }
-                return Ok(Vec::new_in(g));
+                return Ok(SVec::new_in(at_phase));
             }
         };
         let cache = scope_cache.get_or_insert_with(|| HeadsScopeCache::new(CrateGraph::len(&list), g));
+        let workers = usize::try_from(handles.workers.get()).unwrap_or(1).max(1);
         // 1. Only members whose module tree reaches an entered task's file have their check scope
         // built up front (with non-member dependencies deferred to [`HeadsScopeRecords`]); other
         // members are touched only if an entered task's file was not held by any reaching member,
         // or if they appear as a member dependency inside an active job's scope.
-        let mut task_files: Vec<Name, Alloc<'static>> = Vec::with_capacity_in(tasks.len(), g);
+        let mut task_files: Vec<Name, &Frame> = Vec::with_capacity_in(tasks.len(), frame);
         task_files.extend(tasks.iter().map(|task| task.planned.file));
         task_files.sort_unstable();
         task_files.dedup();
-        let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(handles.outlined, g));
-        let mut jobs: std::vec::Vec<ItemJob<'r>, Global> = std::vec::Vec::new_in(Global);
-        let mut unvisited_members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
+        let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(handles.outlined, at_phase));
+        let mut jobs: SVec<'p, ItemJob<'r, 'p>> = SVec::new_in(at_phase);
+        let mut unvisited_members: Vec<usize, &Frame> = Vec::new_in(frame);
         // Built lazily only if a task's file is in no member crate's items record, avoiding
         // probing `view.cell` for every standing member crate on normal incremental edits.
-        let mut no_member_cells: Option<Vec<CellId, Alloc<'static>>> = None;
+        let mut no_member_cells: Option<Vec<CellId, &Frame>> = None;
         // Every member's items record was read: then a file none lists is no unit's (a `cfg` on
         // its `mod` cut it in every unit, engine_body_plan.rs), not a refusal.
         let mut every_member_read = true;
@@ -3388,29 +3511,112 @@ impl HeadsStage {
         // crate named) and how many were not: what a task no unit holds then prints (rule 19).
         let mut unread: Option<&'static str> = None;
         let mut unread_count = 0u32;
-        // Deduplicated cfg-blind module tree walks by crate root (lib + test share one root).
-        let mut reached_roots: Vec<(Name, Vec<Name, Alloc<'static>>, bool), Alloc<'static>> = Vec::new_in(g);
-        let mut reached_root_index: blaze_hash::Map<Name, usize, blaze_hash::FixedState, Alloc<'static>> =
-            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: g, capacity: None });
-        // Each reaching member unit's cfg-blind walk index (only units whose walk reaches at least
-        // one task file can ever match `task.planned.file`).
-        let mut walks: Vec<(Name, [u8; 8], usize), Alloc<'static>> = Vec::new_in(g);
-        let push_member_subjects = |subjects: &mut SVec<'p, Subject>, member: usize, prefix: [u8; 8], items: &ItemsRecord<'_>| -> bool {
-            let mut matched_task_file = false;
-            for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
-                let Ok(Some(row)) = items.file_surface(file) else { continue };
-                let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
-                let Some(path) = path.strip_prefix("/0/") else { continue };
-                if let Some(one) = find_outlined(handles.outlined, by_path, path.as_bytes()) {
-                    if task_files.binary_search(&one.name).is_ok() {
-                        matched_task_file = true;
+        // Deduplicate cfg-blind module tree walks by crate root (lib + test share one root) and
+        // fan them out across workers on large multi-member workspaces (rule 25 deterministic order).
+        let mut scoped_members: Vec<(usize, usize), &Frame> = Vec::new_in(frame);
+        let mut unique_roots: Vec<Name, &Frame> = Vec::new_in(frame);
+        let mut reached_root_index: blaze_hash::Map<Name, usize, blaze_hash::FixedState, &Frame> =
+            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: frame, capacity: None });
+        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
+            let root = list.root(member);
+            let root_name = Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes());
+            let reach_idx = match reached_root_index.get(&root_name).copied() {
+                Some(idx) => idx,
+                None => {
+                    let idx = unique_roots.len();
+                    unique_roots.push(root_name);
+                    reached_root_index.insert(root_name, idx);
+                    idx
+                }
+            };
+            scoped_members.push((member, reach_idx));
+        }
+        let mut reached_roots: SVec<'p, (SVec<'p, Name>, bool)> = SVec::with_capacity_in(unique_roots.len(), at_phase);
+        let task_files_slice = task_files.as_slice();
+        let outlined_ref = handles.outlined;
+        let active_workers = usize::try_from(cx.workers().min(handles.workers.get())).unwrap_or(1).max(1);
+        if active_workers > 1 && unique_roots.len() >= 4 {
+            let roots_slice = unique_roots.as_slice();
+            let chunks = active_workers.min(roots_slice.len()).max(1);
+            let chunk_len = roots_slice.len().div_ceil(chunks);
+            let scope = cx.scope();
+            scope.narrow_workers(handles.workers, Class::Foreground);
+            let mut running = Vec::with_capacity_in(chunks, frame);
+            for chunk in roots_slice.chunks(chunk_len) {
+                running.push(scope.may_overlap("engine heads: reached roots", bstd::mem::TASK_FRAME, move |_cx: &Cx| {
+                    let local_g = heap.alloc();
+                    let mut out: SVec<'p, Result<(SVec<'p, Name>, bool), crate::engine_body_plan::Unoutlined>> = SVec::with_capacity_in(chunk.len(), at_phase);
+                    for &root_name in chunk.iter() {
+                        match crate::engine_body_plan::reached(outlined_ref, root_name, local_g) {
+                            Ok(reach) => {
+                                let reaches_any = if task_files_slice.len() <= reach.len() {
+                                    task_files_slice.iter().any(|file| reach.binary_search(file).is_ok())
+                                } else {
+                                    reach.iter().any(|file| task_files_slice.binary_search(file).is_ok())
+                                };
+                                let mut kept_reach = SVec::new_in(at_phase);
+                                if reaches_any {
+                                    kept_reach.reserve(reach.len());
+                                    kept_reach.extend_from_slice(&reach);
+                                }
+                                out.push(Ok((kept_reach, reaches_any)));
+                            }
+                            Err(err) => out.push(Err(err)),
+                        }
                     }
-                    subjects.push(Subject::new(prefix, file, one));
+                    Ok::<_, Infallible>(out)
+                }));
+            }
+            let mut stopped = None;
+            let mut first_unoutlined: Option<crate::engine_body_plan::Unoutlined> = None;
+            for handle in running.into_iter() {
+                match handle.join(cx) {
+                    Ok(part) => {
+                        for item in part.into_iter() {
+                            match item {
+                                Ok(pair) => reached_roots.push(pair),
+                                Err(err) => {
+                                    first_unoutlined.get_or_insert(err);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        stopped.get_or_insert(error);
+                    }
                 }
             }
-            matched_task_file
-        };
-        let make_job = |prefix, scope: HeadsScope<'r>, whole, cut_words, cells| ItemJob {
+            scope.join(cx).map_err(CliError::Pool)?;
+            if let Some(error) = stopped {
+                return Err(CliError::Pool(error));
+            }
+            if let Some(err) = first_unoutlined {
+                return Err(EngineCheckError::Unoutlined(err).into());
+            }
+        } else {
+            for &root_name in unique_roots.iter() {
+                let reach = crate::engine_body_plan::reached(outlined_ref, root_name, g).map_err(EngineCheckError::Unoutlined)?;
+                let reaches_any = if task_files_slice.len() <= reach.len() {
+                    task_files_slice.iter().any(|file| reach.binary_search(file).is_ok())
+                } else {
+                    reach.iter().any(|file| task_files_slice.binary_search(file).is_ok())
+                };
+                let mut kept_reach = SVec::new_in(at_phase);
+                if reaches_any {
+                    kept_reach.reserve(reach.len());
+                    kept_reach.extend_from_slice(&reach);
+                }
+                reached_roots.push((kept_reach, reaches_any));
+            }
+        }
+        // Each reaching member unit's cfg-blind walk index (only units whose walk reaches at least
+        // one task file can ever match `task.planned.file`).
+        let mut walks: Vec<(Name, [u8; 8], usize), &Frame> = Vec::new_in(frame);
+        let mut pending_subjects: Vec<([u8; 8], u32, usize), &Frame> = Vec::new_in(frame);
+        let mut held_files: Vec<Name, &Frame> = Vec::new_in(frame);
+        let erased = blaze_own::Erased::new(frame);
+        let fa = erased.handle();
+        let make_job = |prefix, scope: HeadsScope<'r, 'p>, whole, cut_words, cells| ItemJob {
             prefix,
             own: scope.own,
             rest: scope.rest,
@@ -3418,37 +3624,18 @@ impl HeadsStage {
             whole,
             cut_words,
             cells,
-            tasks: std::vec::Vec::new_in(Global),
+            tasks: SVec::new_in(at_phase),
         };
-        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
-            let root = list.root(member);
-            let root_name = Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes());
+        for &(member, reach_idx) in scoped_members.iter() {
             let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
             let prefix = list.key(member).prefix();
-            let (reach_idx, reaches_any) = match reached_root_index.get(&root_name).copied() {
-                Some(idx) => {
-                    let reaches_any = reached_roots.get(idx).is_some_and(|(_, _, any)| *any);
-                    (idx, reaches_any)
-                }
-                None => {
-                    let reach = crate::engine_body_plan::reached(handles.outlined, root_name, g).map_err(EngineCheckError::Unoutlined)?;
-                    let reaches_any = if task_files.len() <= reach.len() {
-                        task_files.iter().any(|file| reach.binary_search(file).is_ok())
-                    } else {
-                        reach.iter().any(|file| task_files.binary_search(file).is_ok())
-                    };
-                    let idx = reached_roots.len();
-                    reached_roots.push((root_name, reach, reaches_any));
-                    reached_root_index.insert(root_name, idx);
-                    (idx, reaches_any)
-                }
-            };
+            let reaches_any = reached_roots.get(reach_idx).is_some_and(|(_, any)| *any);
             if !reaches_any {
                 unvisited_members.push(member);
                 continue;
             }
             walks.push((scope_name, prefix, reach_idx));
-            let (scope, whole) = match scope_by_need_heads(cache, read, cx, store, snapshot, names, &list, member, heap)? {
+            let (scope, whole) = match scope_by_need_heads(cache, read, cx, store, snapshot, names, &list, member, at_phase, frame, heap)? {
                 Ok(made) => made,
                 Err(cause) => {
                     every_member_read = false;
@@ -3457,10 +3644,20 @@ impl HeadsStage {
                     continue;
                 }
             };
-            let cells = scope_cells(graph.name, &list, member, Some(&scope), shared);
+            let cells = scope_cells(graph.name, &list, member, Some(&scope), at_phase);
             let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
-            let items = ItemsRecord::from_verified(scope.own.records.items_proof, g);
-            let _ = push_member_subjects(subjects, member, prefix, &items);
+            let items = ItemsRecord::from_verified(scope.own.records.items_proof, fa);
+            for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                let Ok(Some(row)) = items.file_surface(file) else { continue };
+                let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
+                let Some(path) = path.strip_prefix("/0/") else { continue };
+                if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+                    pending_subjects.push((prefix, file, idx));
+                    if let Some(one) = handles.outlined.get(idx) {
+                        held_files.push(one.name);
+                    }
+                }
+            }
             loaded_subjects.push(prefix);
             jobs.push(make_job(prefix, scope, whole, cut_words, cells));
         }
@@ -3468,7 +3665,6 @@ impl HeadsStage {
         // loaded via macro-expanded `mod`, or a file cut by `#[cfg]` where we must verify all
         // remaining members' own items records to prove no unit holds it), inspect only their own
         // items records first and open a check scope only if one actually holds a task file.
-        let mut held_files: Vec<Name, Alloc<'static>> = Vec::with_capacity_in(subjects.len(), g);
         held_files.extend(subjects.iter().map(|row| row.slot));
         held_files.sort_unstable();
         held_files.dedup();
@@ -3484,13 +3680,16 @@ impl HeadsStage {
                         continue;
                     }
                 };
-                let items = ItemsRecord::from_verified(own_records.items_proof, g);
+                let items = ItemsRecord::from_verified(own_records.items_proof, fa);
                 let mut holds_task_file = false;
                 for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
                     let Ok(Some(row)) = items.file_surface(file) else { continue };
-                    let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
+                    let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
                     let Some(path) = path.strip_prefix("/0/") else { continue };
-                    if find_outlined(handles.outlined, by_path, path.as_bytes()).is_some_and(|one| task_files.binary_search(&one.name).is_ok()) {
+                    if find_outlined_index(by_path, path.as_bytes())
+                        .and_then(|idx| handles.outlined.get(idx))
+                        .is_some_and(|one| task_files.binary_search(&one.name).is_ok())
+                    {
                         holds_task_file = true;
                         break;
                     }
@@ -3498,7 +3697,7 @@ impl HeadsStage {
                 if !holds_task_file {
                     continue;
                 }
-                let (scope, whole) = match scope_by_need_heads(cache, read, cx, store, snapshot, names, &list, member, heap)? {
+                let (scope, whole) = match scope_by_need_heads(cache, read, cx, store, snapshot, names, &list, member, at_phase, frame, heap)? {
                     Ok(made) => made,
                     Err(cause) => {
                         every_member_read = false;
@@ -3507,26 +3706,41 @@ impl HeadsStage {
                         continue;
                     }
                 };
-                let cells = scope_cells(graph.name, &list, member, Some(&scope), shared);
+                let cells = scope_cells(graph.name, &list, member, Some(&scope), at_phase);
                 let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
-                let _ = push_member_subjects(subjects, member, prefix, &items);
+                for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                    let Ok(Some(row)) = items.file_surface(file) else { continue };
+                    let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
+                    let Some(path) = path.strip_prefix("/0/") else { continue };
+                    if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+                        pending_subjects.push((prefix, file, idx));
+                    }
+                }
                 loaded_subjects.push(prefix);
                 jobs.push(make_job(prefix, scope, whole, cut_words, cells));
             }
         }
+        // Populate deduplicated `(SignatureFile, entries_of)` in parallel across all workers.
+        subject_entries.populate(cx, handles.outlined, &pending_subjects, subjects, handles.workers, at_phase, frame)?;
         subjects.sort_unstable();
         subjects.dedup();
         jobs.sort_unstable_by_key(|job| job.prefix);
-        // Invert cfg-blind module walks per task file so each task checks only units whose walk
-        // actually reaches its file (O(1) lookup) instead of scanning all workspace units per task.
-        let mut reaching_by_file: blaze_hash::Map<Name, Vec<(Name, [u8; 8]), Alloc<'static>>, blaze_hash::FixedState, Alloc<'static>> =
-            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: g, capacity: Some(task_files.len()) });
+        // Each task to EVERY member unit (by prefix) whose files hold its file (lane RU1,
+        // `head_cell`): each freezes the task's heads under its own records, one cell a unit.
+        let mut by_file: SVec<'p, (Name, [u8; 8])> = SVec::with_capacity_in(subjects.len(), at_phase);
+        by_file.extend(subjects.iter().map(|row| (row.slot, row.prefix)));
+        by_file.sort_unstable();
+        by_file.dedup();
+        // Flat sorted list of ONLY `(file, unit, prefix)` pairs where a unit's cfg-blind walk
+        // reaches `file` yet the unit does not hold it in `by_file`. Empty (zero allocations and
+        // zero per-task lookups) on the common non-cfg-cut path.
+        let mut unheld_reaching: SVec<'p, (Name, Name, [u8; 8])> = SVec::new_in(at_phase);
         for &(unit, prefix, reach_idx) in walks.iter() {
-            let Some((_, reach, _)) = reached_roots.get(reach_idx) else { continue };
+            let Some((reach, _)) = reached_roots.get(reach_idx) else { continue };
             if task_files.len() <= reach.len() {
                 for &file in task_files.iter() {
-                    if reach.binary_search(&file).is_ok() {
-                        reaching_by_file.entry(file).or_insert_with(|| Vec::new_in(g)).push((unit, prefix));
+                    if reach.binary_search(&file).is_ok() && by_file.binary_search(&(file, prefix)).is_err() {
+                        unheld_reaching.push((file, unit, prefix));
                     }
                 }
             } else {
@@ -3536,18 +3750,16 @@ impl HeadsStage {
                         continue;
                     }
                     prev = Some(file);
-                    if task_files.binary_search(&file).is_ok() {
-                        reaching_by_file.entry(file).or_insert_with(|| Vec::new_in(g)).push((unit, prefix));
+                    if task_files.binary_search(&file).is_ok() && by_file.binary_search(&(file, prefix)).is_err() {
+                        unheld_reaching.push((file, unit, prefix));
                     }
                 }
             }
         }
-        // Each task to EVERY member unit (by prefix) whose files hold its file (lane RU1,
-        // `head_cell`): each freezes the task's heads under its own records, one cell a unit.
-        let mut by_file: std::vec::Vec<(Name, [u8; 8]), Global> = std::vec::Vec::with_capacity_in(subjects.len(), Global);
-        by_file.extend(subjects.iter().map(|row| (row.slot, row.prefix)));
-        by_file.sort_unstable();
-        by_file.dedup();
+        if unheld_reaching.len() > 1 {
+            unheld_reaching.sort_unstable();
+            unheld_reaching.dedup();
+        }
         // Each task that some unit runs, sorted by name, and what its units made (step 3).
         let mut accs: SVec<'p, (Task, UnitsMade<'p>)> = SVec::with_capacity_in(tasks.len(), at_phase);
         let mut holding: SVec<'p, usize> = SVec::new_in(at_phase);
@@ -3558,7 +3770,9 @@ impl HeadsStage {
         for task in tasks.iter() {
             let at = by_file.partition_point(|(file, _)| *file < task.planned.file);
             holding.clear();
-            holding.extend(by_file[at..].iter().take_while(|(file, _)| *file == task.planned.file).filter_map(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok()));
+            if let Some(rest) = by_file.get(at..) {
+                holding.extend(rest.iter().take_while(|(file, _)| *file == task.planned.file).filter_map(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok()));
+            }
             // The plant (`HeadUnits`): one unit alone, as before the rule.
             match self.freeze {
                 HeadUnits::Each | HeadUnits::NoExpansionReads => {}
@@ -3570,14 +3784,14 @@ impl HeadsStage {
                     }
                 }
             }
-            let whole = holding.iter().copied().find(|at| jobs[*at].whole);
+            let whole = holding.iter().copied().find(|&idx| jobs.get(idx).is_some_and(|job| job.whole));
             match (holding.first().copied(), whole) {
                 // No unit holds its file under its cfg: no unit's head, a row with no finding on
                 // the cells that say so (each member's names cell, the graph's), so a unit that
                 // comes to hold it enters it again (engine_body_plan.rs, as its bodies).
                 (None, _) if every_member_read => {
                     let no_member = no_member_cells.get_or_insert_with(|| {
-                        let mut cells = Vec::new_in(g);
+                        let mut cells = Vec::new_in(frame);
                         cells.push(graph_cell);
                         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
                             let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
@@ -3595,7 +3809,7 @@ impl HeadsStage {
                 }
                 (None, _) => {
                     let no_member = no_member_cells.get_or_insert_with(|| {
-                        let mut cells = Vec::new_in(g);
+                        let mut cells = Vec::new_in(frame);
                         cells.push(graph_cell);
                         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
                             let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
@@ -3617,28 +3831,33 @@ impl HeadsStage {
                 // scope was cut at, read ABSENT: its task that comes, or its fix, moves the row.
                 // The cut's cause printed, the crate named (rule 19).
                 (Some(at), None) => {
-                    let why = jobs[at].cut_words.unwrap_or("its crate's check scope was cut and `scope_of` kept no cut (engine_bodies.rs `scope_of`)");
-                    refuse(task, why, &jobs[at].cells, buffer);
+                    if let Some(job) = jobs.get(at) {
+                        let why = job.cut_words.unwrap_or("its crate's check scope was cut and `scope_of` kept no cut (engine_bodies.rs `scope_of`)");
+                        refuse(task, why, &job.cells, buffer);
+                    }
                 }
                 // Frozen under each whole unit; a unit whose scope lacks a names record defines
                 // no cell (its readers read it ABSENT), and the row reads that unit's refusal
                 // cells, so the fix that makes it whole enters the task again (rule 21).
                 (Some(_), Some(first_whole)) => {
-                    shows.push((task.planned.name, jobs[first_whole].prefix));
+                    if let Some(job) = jobs.get(first_whole) {
+                        shows.push((task.planned.name, job.prefix));
+                    }
                     let mut made = UnitsMade::new(at_phase);
                     for at in holding.iter().copied() {
-                        match jobs[at].whole {
-                            true => jobs[at].tasks.push(*task),
-                            false => made.reads.extend(jobs[at].cells.iter().copied()),
+                        if let Some(job) = jobs.get_mut(at) {
+                            match job.whole {
+                                true => job.tasks.push(*task),
+                                false => made.reads.extend(job.cells.iter().copied()),
+                            }
                         }
                     }
                     // The units its file is NOT frozen under though their walk reaches it: their
                     // not-held cells, so one that comes to hold the file moves the row.
-                    let held = &by_file[at..];
-                    let held = &held[..held.partition_point(|(file, _)| *file == task.planned.file)];
-                    if let Some(units) = reaching_by_file.get(&task.planned.file) {
-                        for &(unit, prefix) in units.iter() {
-                            if !held.iter().any(|(_, one)| *one == prefix) {
+                    if !unheld_reaching.is_empty() {
+                        let from = unheld_reaching.partition_point(|(file, _, _)| *file < task.planned.file);
+                        if let Some(rest) = unheld_reaching.get(from..) {
+                            for &(_, unit, prefix) in rest.iter().take_while(|(file, _, _)| *file == task.planned.file) {
                                 made.reads.push(crate::engine_body_plan::file_not_held_cell(view, unit, prefix));
                             }
                         }
@@ -3658,7 +3877,7 @@ impl HeadsStage {
         loaded_subjects.sort_unstable();
         loaded_subjects.dedup();
         if !jobs.is_empty() {
-            let mut dep_members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
+            let mut dep_members: Vec<usize, &Frame> = Vec::new_in(frame);
             for job in jobs.iter() {
                 for one in job.rest.iter() {
                     if list.member(one.world_at) && loaded_subjects.binary_search(&one.key.prefix()).is_err() {
@@ -3669,22 +3888,33 @@ impl HeadsStage {
             dep_members.sort_unstable();
             dep_members.dedup();
             if !dep_members.is_empty() {
+                let mut pending_deps: Vec<([u8; 8], u32, usize), &Frame> = Vec::new_in(frame);
                 for member in dep_members.iter().copied() {
                     let Ok((_, own_records)) = cache.records_of(read, cx, store, names, &list, member, g) else { continue };
-                    let items = ItemsRecord::from_verified(own_records.items_proof, g);
+                    let items = ItemsRecord::from_verified(own_records.items_proof, fa);
                     let prefix = list.key(member).prefix();
-                    let _ = push_member_subjects(subjects, member, prefix, &items);
+                    for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                        let Ok(Some(row)) = items.file_surface(file) else { continue };
+                        let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
+                        let Some(path) = path.strip_prefix("/0/") else { continue };
+                        if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+                            pending_deps.push((prefix, file, idx));
+                        }
+                    }
                     loaded_subjects.push(prefix);
                 }
                 loaded_subjects.sort_unstable();
                 loaded_subjects.dedup();
-                subjects.sort_unstable();
-                subjects.dedup();
+                if !pending_deps.is_empty() {
+                    subject_entries.populate(cx, handles.outlined, &pending_deps, subjects, handles.workers, at_phase, frame)?;
+                    subjects.sort_unstable();
+                    subjects.dedup();
+                }
             }
         }
         let lazy = heads_lazy.get_or_insert_with(|| crate::front_load::ScopeRecords::new(lazy_snap, CrateGraph::len(&list), heap));
         let lazy_before = lazy.counts();
-        let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), heap);
+        let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), at_phase);
         let scope_records = &scope_records;
         // Group the tasks of each file before choosing whole-file cuts.
         for job in jobs.iter_mut() {
@@ -3701,19 +3931,18 @@ impl HeadsStage {
         let clock = handles.clock;
         let subjects = &subjects[..];
         let expansion_reads = self.freeze != HeadUnits::NoExpansionReads;
-        type Ran = Result<Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str>, work::Panicked>;
-        type Setup = Result<Result<CrateSetup, &'static str>, work::Panicked>;
+        type Ran<'p> = Result<Result<SVec<'p, Result<WorkedHead<'p>, HeadFailed<'p>>>, &'static str>, work::Panicked>;
+        type Setup<'p> = Result<Result<CrateSetup<'p>, &'static str>, work::Panicked>;
         // The request's crate listings, lent to every worker as the frozen heads are.
         let head_jobs = self.jobs;
         let listings: &Listings = self.listings.get_or_insert_with(|| Listings::new(heap, head_jobs.listings, Some(snapshot_owner.clone()), handles.tool));
-        let workers = usize::try_from(handles.workers.get()).unwrap_or(usize::MAX);
         let board = handles.board;
         // Each crate's setup, each split job, and any closed-dep `ImplBucket` jobs overlap inside
         // one worker scope so idle cores during `HeadsSetup` and `HeadsSplit` build dep tables.
-        let mut setups: SVec<'static, (Setup, u64)> = SVec::with_capacity_in(jobs.len(), heap.shared());
-        let mut closed_worked: Vec<ClosedWorked, Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
-        let mut splits: SVec<'static, SplitAt> = SVec::new_in(heap.shared());
-        let mut arrived: SVec<'static, (u32, (Ran, u64))> = SVec::new_in(heap.shared());
+        let mut setups: SVec<'p, (Setup<'p>, u64)> = SVec::with_capacity_in(jobs.len(), at_phase);
+        let mut closed_worked: SVec<'p, ClosedWorked<'p>> = SVec::with_capacity_in(closed_jobs.len(), at_phase);
+        let mut splits: SVec<'p, SplitAt> = SVec::new_in(at_phase);
+        let mut arrived: SVec<'p, (u32, (Ran<'p>, u64))> = SVec::new_in(at_phase);
         let mut total = 0usize;
         let mut most_splits = 0usize;
         let mut split_files = 0usize;
@@ -3725,31 +3954,31 @@ impl HeadsStage {
             // crates or small dep `ImplBucket` tasks, then immediately spawn `closed_jobs` in LPT
             // order so heavy dep crates (`core`, `std`, `regex-automata`, ...) overlap with
             // `HeadsSetup` and `HeadsSplit` from t=0 without sitting at the tail.
-            let mut setup_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+            let mut setup_dispatch: Vec<usize, &Frame> = Vec::with_capacity_in(jobs.len(), frame);
             setup_dispatch.extend(0..jobs.len());
             setup_dispatch.sort_unstable_by_key(|&at| {
                 let tasks_len = jobs.get(at).map_or(0, |job| job.tasks.len());
                 (core::cmp::Reverse(tasks_len), at)
             });
-            let mut running = Vec::with_capacity_in(jobs.len(), g);
+            let mut running = Vec::with_capacity_in(jobs.len(), frame);
             for at in setup_dispatch.into_iter() {
                 let Some(job) = jobs.get(at) else { continue };
                 running.push((
                     at,
                     scope.may_overlap("engine heads: a crate's setup", HEADS_FRAME, move |cx: &Cx| {
                         let began = clock.now();
-                        let made = work::unwinding(|| crate_setup(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, view, heap, listings, snapshot));
+                        let made = work::unwinding(|| crate_setup(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, view, heap, listings, snapshot, at_phase));
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
                 ));
             }
-            let mut closed_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
+            let mut closed_dispatch: Vec<usize, &Frame> = Vec::with_capacity_in(closed_jobs.len(), frame);
             closed_dispatch.extend(0..closed_jobs.len());
             closed_dispatch.sort_unstable_by_key(|&at| {
                 let weight = closed_jobs.get(at).map_or(0, |(_, job)| impl_job_weight(job, g));
                 (core::cmp::Reverse(weight), at)
             });
-            let mut running_closed = Vec::with_capacity_in(closed_jobs.len(), g);
+            let mut running_closed = Vec::with_capacity_in(closed_jobs.len(), frame);
             for at in closed_dispatch.into_iter() {
                 let Some((_, job)) = closed_jobs.get(at) else { continue };
                 running_closed.push((
@@ -3759,13 +3988,13 @@ impl HeadsStage {
                         let made = if board.stopping().is_some() {
                             Ok(Err(NOT_BEGUN))
                         } else {
-                            work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, &[], at_cells, heap, listings, snapshot, max_workers))
+                            work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, &[], at_cells, heap, listings, snapshot, max_workers, at_phase))
                         };
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
                 ));
             }
-            let mut setups_paired: Vec<(usize, (Setup, u64)), Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+            let mut setups_paired: Vec<(usize, (Setup<'p>, u64)), &Frame> = Vec::with_capacity_in(jobs.len(), frame);
             let mut stopped = None;
             for (at, handle) in running.into_iter() {
                 match handle.join(cx) {
@@ -3782,42 +4011,32 @@ impl HeadsStage {
             setups_paired.sort_unstable_by_key(|(at, _)| *at);
             setups.extend(setups_paired.into_iter().map(|(_, one)| one));
             if stopped.is_none() {
-                // Weight each Signature task by `1 + heads + calls` (from `setup.listing`) so
-                // traits/impls with many methods and derive-heavy structs get proportional splits
-                // and LPT priority rather than weighing the same as a `type` alias.
-                let mut job_weights: Vec<Vec<usize, Alloc<'static>>, Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+                // Sum per-crate weights already computed in parallel inside `crate_setup`.
                 let mut total_weight = 0usize;
                 for (job, (setup, _)) in jobs.iter().zip(setups.iter()) {
-                    let mut weights = Vec::new_in(g);
                     if let Ok(Ok(setup)) = setup {
                         total = total.saturating_add(job.tasks.len());
-                        weights.reserve(job.tasks.len());
-                        for task in job.tasks.iter() {
-                            let name = task.planned.name;
-                            let w = 1usize
-                                .saturating_add(setup.listing.of_entry(name).len())
-                                .saturating_add(setup.listing.calls_of(name).len());
-                            weights.push(w);
-                            total_weight = total_weight.saturating_add(w);
-                        }
+                        total_weight = total_weight.saturating_add(setup.total_weight);
                     }
-                    job_weights.push(weights);
                 }
-                let mut file_weights: Vec<(usize, usize), Alloc<'static>> = Vec::new_in(g);
-                for (at, ((job, (setup, _)), weights)) in jobs.iter().zip(setups.iter()).zip(job_weights.iter()).enumerate() {
-                    if !matches!(setup, Ok(Ok(_))) {
+                let mut file_weights: Vec<(usize, usize), &Frame> = Vec::new_in(frame);
+                for (at, (job, (setup, _))) in jobs.iter().zip(setups.iter()).enumerate() {
+                    let Ok(Ok(setup)) = setup else {
                         continue;
-                    }
+                    };
+                    let weights = setup.task_weights.as_slice();
                     let len = job.tasks.len();
-                    let crate_weight: usize = weights.iter().copied().sum();
+                    let crate_weight = setup.total_weight;
                     let n = split_count_weighted(head_jobs.split, len, crate_weight, total_weight, workers);
                     let before = splits.len();
                     let mut last_crossed = None;
                     let mut append = |range: core::ops::Range<usize>, weight: usize| {
-                        let file = job.tasks[range.start].planned.file;
-                        if range.start > 0 && job.tasks[range.start - 1].planned.file == file && last_crossed != Some(file) {
-                            split_files += 1;
-                            last_crossed = Some(file);
+                        if let Some(first) = job.tasks.get(range.start) {
+                            let file = first.planned.file;
+                            if range.start > 0 && job.tasks.get(range.start - 1).is_some_and(|prev| prev.planned.file == file) && last_crossed != Some(file) {
+                                split_files += 1;
+                                last_crossed = Some(file);
+                            }
                         }
                         splits.push(SplitAt {
                             job: u32::try_from(at).unwrap_or(u32::MAX),
@@ -3856,7 +4075,7 @@ impl HeadsStage {
                 // and derive/impl-heavy splits start immediately rather than creating a late
                 // straggler tail; `in_split_order` restores deterministic split order using each
                 // split's original `at` index.
-                let mut dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(splits.len(), g);
+                let mut dispatch: Vec<usize, &Frame> = Vec::with_capacity_in(splits.len(), frame);
                 dispatch.extend(0..splits.len());
                 dispatch.sort_unstable_by(|&a, &b| {
                     let w_a = splits.get(a).map_or(0, |s| s.weight);
@@ -3865,7 +4084,7 @@ impl HeadsStage {
                 });
                 // Each split's result as it was joined, then in split order ([`in_split_order`]).
                 arrived.reserve(splits.len());
-                let mut running_splits = Vec::with_capacity_in(splits.len(), g);
+                let mut running_splits = Vec::with_capacity_in(splits.len(), frame);
                 let setups_ref = &setups[..];
                 for at in dispatch.into_iter() {
                     let Some(split) = splits.get(at) else { continue };
@@ -3882,7 +4101,7 @@ impl HeadsStage {
                         scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
                             let began = clock.now();
                             let on_board = OnBoard { board, clock, shows };
-                            let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
+                            let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot, at_phase, workers));
                             Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                         }),
                     ));
@@ -3899,7 +4118,7 @@ impl HeadsStage {
                     }
                 }
             }
-            let mut closed_paired: Vec<(usize, ClosedWorked), Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
+            let mut closed_paired: SVec<'p, (usize, ClosedWorked<'p>)> = SVec::with_capacity_in(closed_jobs.len(), at_phase);
             for (at, handle) in running_closed.into_iter() {
                 match handle.join(cx) {
                     Ok((made, ns, start)) => {
@@ -3920,7 +4139,7 @@ impl HeadsStage {
             closed_paired.sort_unstable_by_key(|(at, _)| *at);
             closed_worked.extend(closed_paired.into_iter().map(|(_, worked)| worked));
         }
-        let worked = in_split_order(arrived, splits.len(), head_jobs.merge, heap.shared()).map_err(|error| CliError::Text { what: crate::engine_head_notes::leak(g, format_args!("{error}")) })?;
+        let worked = in_split_order(arrived, splits.len(), head_jobs.merge, at_phase).map_err(|error| CliError::Text { what: crate::engine_head_notes::leak(g, format_args!("{error}")) })?;
         // 3. Each unit's results gathered by task (units in prefix order, a unit's splits in task
         // order), then each task as the engine's row, in task order.
         let acc = |accs: &[(Task, UnitsMade<'p>)], task: &Task| -> Option<usize> { accs.binary_search_by_key(&task.planned.name, |(one, _)| one.planned.name).ok() };
@@ -4031,7 +4250,7 @@ impl HeadsStage {
         if cursor != splits.len() || worked.next().is_some() {
             return Err(CliError::Text { what: "the head split jobs' results were not each merged into their crate's tasks (engine_heads.rs `run_items`)" });
         }
-        let mut heads_failed: Vec<crate::engine_head_notes::Refused, Alloc<'static>> = Vec::new_in(g);
+        let mut heads_failed: Vec<crate::engine_head_notes::Refused, &Frame> = Vec::new_in(frame);
         let mut counts = UnitCounts::default();
         let mut units: SVec<'p, [u8; 8]> = SVec::new_in(at_phase);
         // The cells this phase's head tasks define, every unit's (a refused task defines none): a
@@ -4041,7 +4260,7 @@ impl HeadsStage {
         // come from several jobs, so this is one table for the phase, not one a job.
         let today = crate::engine_scope_reads::job_cells(accs.iter().map(|(task, made)| (task.planned.name, made.first.as_ref().filter(|_| made.failed.is_none()).map(|one| &one.defines[..]))));
         require_producers(&mut accs, tasks, &today, view, at_phase, g);
-        for (task, made) in accs.into_iter() {
+        for (task, mut made) in accs.into_iter() {
             times.push(task.planned.name, made.ns);
             // One unit's failure fails the task whole: its row is refused on the union of what
             // each failing unit read (owed when one panicked).
@@ -4064,43 +4283,71 @@ impl HeadsStage {
             }
             let mut defines: SVec<'a, (Cell, ContentId)> = SVec::with_capacity_in(one.defines.len(), alloc);
             defines.extend(one.defines.iter().copied());
-            defines.sort_unstable_by_key(|(cell, _)| *cell);
-            defines.dedup_by_key(|(cell, _)| *cell);
-            // Each unit's reads, each cell once (rule 21: the row moves when any unit's do).
+            if defines.len() > 1 {
+                defines.sort_unstable_by_key(|(cell, _)| *cell);
+                defines.dedup_by_key(|(cell, _)| *cell);
+            }
+            // Deduplicate `CellId`s (48 B) BEFORE resolving digests into `(CellId, ContentId)`
+            // (80 B) so multi-unit duplicates never query `today`/`view.cell` twice and `reads`
+            // allocates exact deduplicated capacity in `alloc` already in sorted order.
+            if made.reads.len() > 1 {
+                made.reads.sort_unstable();
+                made.reads.dedup();
+            }
             let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(made.reads.len(), alloc);
             reads.extend(made.reads.iter().map(|id| (*id, crate::engine_scope_reads::today(&today, id).unwrap_or_else(|| view.cell(id)))));
-            reads.sort_unstable_by_key(|(id, _)| *id);
-            reads.dedup_by_key(|(id, _)| *id);
-            let mut record_reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::with_capacity_in(reads.len(), Global);
-            record_reads.extend(reads.iter().map(|(id, digest)| (id.of, *digest)));
-            record_reads.dedup_by_key(|(of, _)| *of);
+            let unique_names = reads.chunk_by(|a, b| a.0.of == b.0.of).count();
+            let mut record_reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::with_capacity_in(unique_names, Global);
+            for group in reads.chunk_by(|a, b| a.0.of == b.0.of) {
+                if let Some((id, digest)) = group.first() {
+                    record_reads.push((id.of, *digest));
+                }
+            }
             let name = task.planned.name;
             // Each head it could not freeze, under each unit: a head note a cell (a reader of
             // either unit's cell quotes its own), one finding a head by path and reason.
-            heads_failed.extend(one.failed.iter().map(|&(cell, head, cause)| crate::engine_head_notes::Refused { name, cell: Some(cell), head, cause }));
-            let mut said: SVec<'p, (&'static str, &'static str)> = SVec::with_capacity_in(one.failed.len(), at_phase);
-            said.extend(one.failed.iter().map(|(_, head, cause)| (*head, cause.group)));
-            said.sort_unstable();
-            said.dedup();
-            let findings = u32::try_from(said.len()).unwrap_or(u32::MAX);
+            let findings = if one.failed.is_empty() {
+                0
+            } else {
+                heads_failed.extend(one.failed.iter().map(|&(cell, head, cause)| crate::engine_head_notes::Refused { name, cell: Some(cell), head, cause }));
+                let mut said: SVec<'p, (&'static str, &'static str)> = SVec::with_capacity_in(one.failed.len(), at_phase);
+                said.extend(one.failed.iter().map(|(_, head, cause)| (*head, cause.group)));
+                if said.len() > 1 {
+                    said.sort_unstable();
+                    said.dedup();
+                }
+                u32::try_from(said.len()).unwrap_or(u32::MAX)
+            };
             // The counts: each (item, unit) once; an item frozen under 2+ units counted shared.
             let mut items = one.items;
-            items.sort_unstable();
-            items.dedup();
-            counts.frozen = counts.frozen.saturating_add(u32::try_from(items.len()).unwrap_or(u32::MAX));
-            for run in items.chunk_by(|a, b| a.0 == b.0) {
+            if items.len() == 1
+                && let Some(&(_, unit)) = items.first()
+            {
+                counts.frozen = counts.frozen.saturating_add(1);
                 counts.items = counts.items.saturating_add(1);
-                if run.len() > 1 {
-                    counts.shared = counts.shared.saturating_add(1);
+                if !units.contains(&unit) {
+                    units.push(unit);
+                }
+            } else if !items.is_empty() {
+                items.sort_unstable();
+                items.dedup();
+                counts.frozen = counts.frozen.saturating_add(u32::try_from(items.len()).unwrap_or(u32::MAX));
+                for run in items.chunk_by(|a, b| a.0 == b.0) {
+                    counts.items = counts.items.saturating_add(1);
+                    if run.len() > 1 {
+                        counts.shared = counts.shared.saturating_add(1);
+                    }
+                }
+                for &(_, unit) in items.iter() {
+                    if !units.contains(&unit) {
+                        units.push(unit);
+                    }
                 }
             }
-            units.extend(items.iter().map(|(_, unit)| *unit));
             let out = made.out.finish();
             buffer.done.push(Done { name, key: task.key, out, defines, reads, findings, failed: false });
             self.made.push(Made { name, out, reads: record_reads, payload });
         }
-        units.sort_unstable();
-        units.dedup();
         counts.units = u32::try_from(units.len()).unwrap_or(u32::MAX);
         // Summed over the request's Heads phases (the units: the most one phase froze under).
         // The jobs: summed over the phases, as the freezes (the most splits: the most of any).
@@ -4165,27 +4412,29 @@ struct SplitAt {
 }
 
 /// What a crate's split jobs share, made once a crate a phase by [`crate_setup`], each list
-/// the request heap's so every split reads it in place on any worker. What cannot be shared:
-/// the records themselves (a reader is one thread's, front2 source.rs `Records`), so a split
-/// opens them again over the same bytes and builds its own tables and lang index from them (the
-/// index holds only the lang rows; what building it reads is `lang_reads`, read here once).
-struct CrateSetup {
-    /// The crates whose lang rows name the lang items.
-    lang: &'static [usize],
+/// in phase memory so every split reads it in place on any worker and the phase's drop unmaps
+/// every byte (zero `.leak_static()`). What cannot be shared: the records themselves (a reader
+/// is one thread's, front2 source.rs `Records`), so a split opens them again over the same bytes
+/// and borrows the setup's lang index (what building it reads is `lang_reads`, read here once).
+struct CrateSetup<'p> {
     sized: Option<blaze_id::ItemKey>,
     /// The program's receiver pointer types (`Pointers::find`, once a crate).
     pointers: blaze_ladder::front2::receiver::Pointers,
     /// What the lang index read, each coarse (engine_heads_once.rs `JobCx::lang_reads`).
-    lang_reads: &'static [CellId],
+    lang_reads: SVec<'p, CellId>,
     /// What finding the pointers read, with `lang_reads` (engine_heads_once.rs `JobCx::pointer_reads`).
-    pointer_reads: &'static [CellId],
+    pointer_reads: SVec<'p, CellId>,
     /// The scope names of the job's crates that are members, sorted.
-    members: &'static [Name],
+    members: SVec<'p, Name>,
     /// The crate's listing, from the request's table.
     listing: &'static Listing,
     /// Owned lang-item index built once per crate setup and borrowed by every split job in
     /// `heads_of` with zero `Global` allocation and zero repeated `ItemsRecord` scans.
     index: blaze_ladder::front2::index::IndexIn,
+    /// Per-task work weights (`1 + heads + calls`) computed in parallel on the setup worker.
+    task_weights: SVec<'p, usize>,
+    /// Sum of `task_weights`.
+    total_weight: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4267,7 +4516,7 @@ fn open_scope_by_need<'n>(
 /// receiver pointers and their reads, its member crates, and its listing from the request's
 /// table (made here when no job made it yet: [`Listings::listing`]).
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
-fn crate_setup(
+fn crate_setup<'p>(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     fs: &bstd::fs::Fs,
@@ -4275,21 +4524,20 @@ fn crate_setup(
     packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
-    job: &ItemJob<'_>,
+    job: &ItemJob<'_, '_>,
     scope_records: &dyn crate::front_load::OpenByNeed,
     subjects: &Subjects,
     view: View<'_, '_>,
     heap: &'static blaze_own::Heap,
     listings: &Listings,
     snapshot: &crate::store::StoreSnapshot,
-) -> Result<CrateSetup, &'static str> {
+    at_phase: SharedAlloc<'p>,
+) -> Result<CrateSetup<'p>, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
     let opened = open_scope_by_need(cx, root, fs, outlined, job.scope_crates(scope_records), packs, corrected, procs, crate::run_names::Envs { owner: None, rest: None }, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
-    let mut lang: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(job.lang.len(), g);
-    lang.extend_from_slice(&job.lang);
-    let lang: &'static [usize] = lang.leak_static();
+    let lang = job.lang.as_slice();
     let mut sized = None;
     for at in lang.iter() {
         NamesSource::each_lang(records, *at, &mut |name, key| {
@@ -4298,17 +4546,19 @@ fn crate_setup(
             }
         });
     }
-    let unused = Recorder::new(RecorderOpts { alloc: g });
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let fa = bump.alloc();
+    let unused = Recorder::new(RecorderOpts { alloc: fa });
     let base = Tables::new(TablesOpts { records, impls: None, lang_crates: lang, reads: &unused });
     // The constant evaluator's lang index; what it read is read by every head that evaluates
     // (engine_head_consts.rs).
-    let lang_recorder = Recorder::new(RecorderOpts { alloc: g });
+    let lang_recorder = Recorder::new(RecorderOpts { alloc: fa });
     let index_in = blaze_ladder::front2::index::IndexIn::from_source_in(base.reading_into(&lang_recorder), lang, heap.shared())
         .map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
     let index = index_in.borrow();
     // The scope names of the job's crates that are members, sorted: every other crate's names
     // reads are kept at its record's `WHOLE` (engine_heads_once.rs `coarse`).
-    let mut members: Vec<Name, Alloc<'static>> = Vec::new_in(g);
+    let mut members: SVec<'p, Name> = SVec::new_in(at_phase);
     members.extend(
         core::iter::once(job.own.records.key)
             .chain(job.rest.iter().map(|one| one.key))
@@ -4317,7 +4567,6 @@ fn crate_setup(
     );
     members.sort_unstable();
     members.dedup();
-    let members: &'static [Name] = members.leak_static();
     let setup_cell = |read: blaze_ladder::front2::tables::recorder::TableRead| -> Result<Option<CellId>, &'static str> {
         let id = if read.is_source() {
             crate::engine_head_consts::source_read(records, subjects, read).map_err(|unplaced| {
@@ -4328,9 +4577,9 @@ fn crate_setup(
         } else {
             cell_id(base, read).map_err(|why| crate::engine_head_notes::leak(g, format_args!("placing a read of the lang index or receiver pointer types: {why}")))?
         };
-        Ok(id.map(|id| crate::engine_heads_once::coarse(members, names_read(view, id))))
+        Ok(id.map(|id| crate::engine_heads_once::coarse(&members, names_read(view, id))))
     };
-    let mut lang_reads: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
+    let mut lang_reads: SVec<'p, CellId> = SVec::new_in(at_phase);
     for one in lang_recorder.finish().map_err(|_| "its lang index read more names cells than the recorder holds (front2 tables/recorder.rs)")?.iter() {
         lang_reads.extend(setup_cell(*one)?);
     }
@@ -4343,9 +4592,9 @@ fn crate_setup(
     // index (alloc's `crate::rc::Rc` and `crate::sync::Arc` resolved from `Box`'s module) is
     // every cell's read (engine_heads_once.rs `JobCx::pointer_reads`); the lang rows they take are
     // `lang_reads`', which every cell then reads too.
-    let pointer_recorder = Recorder::new(RecorderOpts { alloc: g });
+    let pointer_recorder = Recorder::new(RecorderOpts { alloc: fa });
     let pointers = blaze_ladder::front2::receiver::Pointers::find(&index, blaze_ladder::resolve::Paths { names: base.reading_into(&pointer_recorder) });
-    let mut pointer_reads: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
+    let mut pointer_reads: SVec<'p, CellId> = SVec::with_capacity_in(lang_reads.len(), at_phase);
     pointer_reads.extend_from_slice(&lang_reads);
     for one in pointer_recorder.finish().map_err(|_| "finding its receiver pointer types read more names cells than the recorder holds (front2 tables/recorder.rs)")?.iter() {
         pointer_reads.extend(setup_cell(*one)?);
@@ -4365,15 +4614,47 @@ fn crate_setup(
     if let Some(why) = packs.refused() {
         return Err(why);
     }
-    Ok(CrateSetup { lang, sized, pointers, lang_reads: lang_reads.leak_static(), pointer_reads: pointer_reads.leak_static(), members, listing, index: index_in })
+    // Weight each Signature task by `1 + heads + calls` (from `listing`) in parallel on this
+    // worker so the coordinator never does O(tasks * log(heads)) binary searches serially.
+    let mut task_weights: SVec<'p, usize> = SVec::with_capacity_in(job.tasks.len(), at_phase);
+    let mut total_weight = 0usize;
+    for task in job.tasks.iter() {
+        let name = task.planned.name;
+        let w = 1usize
+            .saturating_add(listing.of_entry(name).len())
+            .saturating_add(listing.calls_of(name).len());
+        task_weights.push(w);
+        total_weight = total_weight.saturating_add(w);
+    }
+    Ok(CrateSetup { sized, pointers, lang_reads, pointer_reads, members, listing, index: index_in, task_weights, total_weight })
 }
 
 /// Reset threshold for `heads_of`'s per-split bump scratch frame: once a batch's scratch
 /// stores, `OwnedRecorder`s, and `SeededHeads` tables pass this mark, the batch finishes,
 /// drops them cleanly, and resets the frame (trimming committed pages back to
-/// [`HEADS_SCRATCH_KEEP`]).
+/// [`HEADS_SCRATCH_KEEP`]). Both scale inversely past [`HEADS_FRAME_CAP_BASE_WORKERS`] cores so
+/// 64–128 core machines stay within a fixed aggregate frame budget while 8–18 core Macs keep full
+/// working-set caps.
 const HEADS_SCRATCH_RESET_AT: usize = 32 << 20;
 const HEADS_SCRATCH_KEEP: usize = 8 << 20;
+const HEADS_FRAME_CAP_BASE_WORKERS: usize = 18;
+const HEADS_SCRATCH_RESET_MIN: usize = 4 << 20;
+const HEADS_SCRATCH_KEEP_MIN: usize = 1 << 20;
+
+/// Returns `(reset_at, keep)` for a `heads_of` worker's scratch frame scaled inversely with
+/// active worker count.
+const fn heads_scratch_caps(workers: usize) -> (usize, usize) {
+    let w = if workers == 0 { 1 } else { workers };
+    if w <= HEADS_FRAME_CAP_BASE_WORKERS {
+        return (HEADS_SCRATCH_RESET_AT, HEADS_SCRATCH_KEEP);
+    }
+    let reset = HEADS_SCRATCH_RESET_AT.saturating_mul(HEADS_FRAME_CAP_BASE_WORKERS) / w;
+    let keep = HEADS_SCRATCH_KEEP.saturating_mul(HEADS_FRAME_CAP_BASE_WORKERS) / w;
+    (
+        if reset < HEADS_SCRATCH_RESET_MIN { HEADS_SCRATCH_RESET_MIN } else { reset },
+        if keep < HEADS_SCRATCH_KEEP_MIN { HEADS_SCRATCH_KEEP_MIN } else { keep },
+    )
+}
 
 /// One run of a member crate's head tasks (`tasks`, a split of `job`'s: [`split_count`]) on a
 /// worker: its scope's records opened again in the job's frame over the crate's `setup`, each
@@ -4383,7 +4664,7 @@ const HEADS_SCRATCH_KEEP: usize = 8 << 20;
 /// the engine enters the reader at the wave after its definer, engine.rs), or its crate's names
 /// record. A panic here fails this split's tasks alone (`run_items`).
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
-fn heads_of(
+fn heads_of<'p>(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     fs: &bstd::fs::Fs,
@@ -4392,9 +4673,9 @@ fn heads_of(
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     list: &blaze_world::crate_list::CrateList<'static>,
-    job: &ItemJob<'_>,
+    job: &ItemJob<'_, '_>,
     scope_records: &dyn crate::front_load::OpenByNeed,
-    setup: &CrateSetup,
+    setup: &CrateSetup<'p>,
     tasks: &[Task],
     subjects: &Subjects,
     view: View<'_, '_>,
@@ -4405,7 +4686,9 @@ fn heads_of(
     plant: ListingsPlant,
     on_board: OnBoard<'_>,
     snapshot: &crate::store::StoreSnapshot,
-) -> Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str> {
+    at_phase: SharedAlloc<'p>,
+    max_workers: usize,
+) -> Result<SVec<'p, Result<WorkedHead<'p>, HeadFailed<'p>>>, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
@@ -4414,7 +4697,11 @@ fn heads_of(
     let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, envs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let body_sources: Option<&dyn blaze_ladder::front2::body_host::BodySources> = Some(opened.sources);
-    let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing, ref index } = *setup;
+    let CrateSetup { sized, pointers, ref lang_reads, ref pointer_reads, ref members, listing, ref index, .. } = *setup;
+    let lang = job.lang.as_slice();
+    let lang_reads = lang_reads.as_slice();
+    let pointer_reads = pointer_reads.as_slice();
+    let members = members.as_slice();
     let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let fa = bump.alloc();
     let unused = Recorder::new(RecorderOpts { alloc: fa });
@@ -4437,18 +4724,20 @@ fn heads_of(
     crate_scopes.sort_unstable_by_key(|c| c.prefix);
     // Reusable per-worker bump scratch frame for `SeededHeads`, `OwnedRecorder`s, and `Owners`:
     // reset and trimmed between batches so freezing scratch never touches `Global` (rule 11).
-    let mut scratch_frame = blaze_ladder::front2::tables::head::FreezeScratch::new(HEADS_FRAME, HEADS_SCRATCH_KEEP, bstd::mem::Tag::Infer)
+    let active_workers = usize::try_from(cx.workers()).unwrap_or(max_workers).min(max_workers).max(1);
+    let (scratch_reset_at, scratch_keep) = heads_scratch_caps(active_workers);
+    let mut scratch_frame = blaze_ladder::front2::tables::head::FreezeScratch::new(HEADS_FRAME, scratch_keep, bstd::mem::Tag::Infer)
         .map_err(|_| "could not reserve heads scratch frame (engine_heads.rs `heads_of`)")?;
-    let mut done = std::vec::Vec::with_capacity_in(tasks.len(), Global);
+    let mut done = SVec::with_capacity_in(tasks.len(), at_phase);
     let mut total_lowered = 0u32;
     let mut total_eval_lowered = 0u32;
     let mut total_taken = 0u32;
-    struct ActiveTask<'b, 'f> {
+    struct ActiveTask<'b, 'f, 'p> {
         mine: &'static [ListedHead],
         at_head: usize,
         running: Option<crate::engine_status::Running<'b>>,
         out: blaze_ids::Hasher,
-        worked: WorkedHead,
+        worked: WorkedHead<'p>,
         failed: Option<&'static str>,
         incomplete_reads: bool,
         settled: usize,
@@ -4457,7 +4746,7 @@ fn heads_of(
         #[cfg(not(test))]
         _frame: core::marker::PhantomData<&'f ()>,
     }
-    let mut active: Option<ActiveTask<'_, '_>> = None;
+    let mut active: Option<ActiveTask<'_, '_, 'p>> = None;
     let mut at_task = 0usize;
     while at_task < tasks.len() {
         let mut stop_now = false;
@@ -4520,12 +4809,12 @@ fn heads_of(
                     let out = blaze_ids::Hasher::new(HEAD_OUT_DOMAIN);
                     let mut worked = WorkedHead {
                         out: ContentId([0; 32]),
-                        defines: std::vec::Vec::new_in(*job.tasks.allocator()),
-                        items: SVec::new_in(heap.shared()),
-                        reads: std::vec::Vec::new_in(*job.tasks.allocator()),
-                        payload: std::vec::Vec::new_in(*job.tasks.allocator()),
-                        failed: SVec::new_in(heap.shared()),
-                        ctors: SVec::new_in(heap.shared()),
+                        defines: SVec::new_in(at_phase),
+                        items: SVec::new_in(at_phase),
+                        reads: SVec::new_in(at_phase),
+                        payload: std::vec::Vec::new_in(Global),
+                        failed: SVec::new_in(at_phase),
+                        ctors: SVec::new_in(at_phase),
                         adt_failed: false,
                     };
                     // When this file is held by this unit yet this entry produced no head (e.g., cut by
@@ -4638,7 +4927,16 @@ fn heads_of(
                             cur.worked.defines.push((cell, made.out));
                             cur.out.update(&cell.0).update(&made.out.0);
                             // The cell too: a body finds a member's head by it (engine_seeds.rs `StretchHeads`).
-                            cur.worked.payload.extend_from_slice(&want_bytes(*want));
+                            let wb = want_bytes(*want);
+                            let entry_bytes = wb.len().saturating_add(16).saturating_add(4).saturating_add(made.bytes.len());
+                            if cur.worked.payload.is_empty() && cur.mine.len() == 1 {
+                                // Single-head entry (common case): reserve exact entry bytes + trailer room
+                                // so `payload` takes one `Global` allocation instead of doubling 4-5 times.
+                                cur.worked.payload.reserve_exact(entry_bytes.saturating_add(24));
+                            } else {
+                                cur.worked.payload.reserve(entry_bytes);
+                            }
+                            cur.worked.payload.extend_from_slice(&wb);
                             cur.worked.payload.extend_from_slice(&cell.0);
                             cur.worked.payload.extend_from_slice(&u32::try_from(made.bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
                             cur.worked.payload.extend_from_slice(&made.bytes);
@@ -4656,7 +4954,7 @@ fn heads_of(
                     // can exhaust the per-split bump scratch frame within a single task if we wait
                     // until the end of the task to reset. Yield mid-task so `scratch_frame` resets
                     // and trims cleanly between heads while preserving `cur` across batches.
-                    if cur.at_head < cur.mine.len() && batch_frame.used() >= HEADS_SCRATCH_RESET_AT {
+                    if cur.at_head < cur.mine.len() && batch_frame.used() >= scratch_reset_at {
                         if let Some(why) = crate::engine_heads_once::job_refusal(&freeze_names, &eval_names, g) {
                             cur.failed.get_or_insert(why);
                             cur.incomplete_reads = true;
@@ -4711,7 +5009,7 @@ fn heads_of(
                     running.end(on_board.board.now(on_board.clock));
                 }
                 at_task += 1;
-                if batch_frame.used() >= HEADS_SCRATCH_RESET_AT {
+                if batch_frame.used() >= scratch_reset_at {
                     break;
                 }
             }
@@ -4741,7 +5039,7 @@ pub(crate) const MOST_HEAD_READS: usize = 1 << 12;
 /// pushed, the lists of a phase's tasks were 4.6 GB of the 9.0 GB live four minutes into a real
 /// workspace's check (tempo, 2026-11-17: 1125 lists of about 4 MB each, growing until the
 /// memory guard stopped the run).
-fn once_each<A: core::alloc::Allocator>(reads: &mut std::vec::Vec<CellId, A>) {
+fn once_each<A: core::alloc::Allocator>(reads: &mut Vec<CellId, A>) {
     reads.sort_unstable();
     reads.dedup();
 }
@@ -4749,3 +5047,23 @@ fn once_each<A: core::alloc::Allocator>(reads: &mut std::vec::Vec<CellId, A>) {
 /// A read list is settled ([`once_each`]) when it passes this many entries, and then each time
 /// it doubles, so the sorting stays linear in what was pushed.
 const SETTLE_AT: usize = 1 << 10;
+
+#[cfg(test)]
+mod heads_frame_caps_tests {
+    use super::*;
+
+    #[test]
+    fn heads_scratch_caps_scale_inversely_for_128_cores_and_preserve_mac_caps() {
+        for w in [0usize, 1, 8, 12, 18] {
+            assert_eq!(heads_scratch_caps(w), (HEADS_SCRATCH_RESET_AT, HEADS_SCRATCH_KEEP));
+        }
+        let (r64, k64) = heads_scratch_caps(64);
+        assert!(r64 < HEADS_SCRATCH_RESET_AT && r64 >= HEADS_SCRATCH_RESET_MIN);
+        assert!(k64 < HEADS_SCRATCH_KEEP && k64 >= HEADS_SCRATCH_KEEP_MIN);
+
+        let (r128, k128) = heads_scratch_caps(128);
+        assert!(r128 <= r64 && r128 >= HEADS_SCRATCH_RESET_MIN);
+        assert!(k128 <= k64 && k128 >= HEADS_SCRATCH_KEEP_MIN);
+        assert!(128usize.saturating_mul(k128) <= 160 << 20, "128-core heads scratch keep <= 160 MiB, got {}", 128usize.saturating_mul(k128));
+    }
+}

@@ -450,20 +450,26 @@ pub(super) fn expanded<'a, E: ExpansionTexts + ?Sized>(
             None => None,
         },
     };
-    let mut modules: AVec<'a, Option<LibKey>> = AVec::new_in(alloc);
-    modules.resize(blocks.nested.blocks.len(), None);
-    if let Some(k) = call {
-        for b in 0..blocks.nested.blocks.len() {
+    let modules: AVec<'a, Option<LibKey>> = if let Some(k) = call && blocks.ordinals.iter().any(Option::is_some) {
+        let block_count = blocks.nested.blocks.len();
+        let mut modules = AVec::with_capacity_in(block_count, alloc);
+        modules.resize(block_count, None);
+        for (b, block) in blocks.nested.blocks.iter().enumerate() {
             let Some(ordinal) = blocks.ordinals.get(b).copied().flatten() else { continue };
             // A written block's parent is written (or is block 0) and comes first.
-            let outer = match blocks.nested.blocks[b].parent {
+            let outer = match block.parent {
                 None | Some(0) => Some(k),
-                Some(p) => modules.get(p as usize).copied().flatten(),
+                Some(p) => usize::try_from(p).ok().and_then(|idx| modules.get(idx).copied().flatten()),
             };
             let name = expansion_block_name(k, ordinal, alloc);
-            modules[b] = outer.map(|o| key_of(krate, o, "mod", name.as_str(), 0));
+            if let Some(slot) = modules.get_mut(b) {
+                *slot = outer.map(|o| key_of(krate, o, "mod", name.as_str(), 0));
+            }
         }
-    }
+        modules
+    } else {
+        AVec::new_in(alloc)
+    };
     Ok(Expanded { blocks, call, modules })
 }
 
@@ -474,8 +480,9 @@ pub(super) fn expanded<'a, E: ExpansionTexts + ?Sized>(
 /// call shares.
 fn statement_call(nested: &Nested<'_>, start: u32) -> Option<(u32, u32)> {
     let i = nested.calls.iter().position(|c| c.range.start == start || c.path.start == start)?;
-    let block = nested.calls[i].block;
-    let n = nested.calls[..i].iter().filter(|c| c.block == block).count() as u32;
+    let block = nested.calls.get(i)?.block;
+    let prefix = nested.calls.get(..i)?;
+    let n = u32::try_from(prefix.iter().filter(|c| c.block == block).count()).ok()?;
     Some((block, n))
 }
 
@@ -495,17 +502,27 @@ pub fn build<'a>(
     let scopes = view.scopes.len();
     let expansions = view.expansion_keys.len();
     // The expansions a scope stands in, and every expansion whose text holds such a call:
-    // the call's key needs its writer's blocks.
+    // the call's key needs its writer's blocks. Allocated lazily only when a scope actually comes
+    // from an expansion, keeping expansion-free and expression-macro bodies zero-alloc here.
     let mut needed: AVec<'a, bool> = AVec::new_in(alloc);
-    needed.resize(expansions, false);
+    let mut max_needed: Option<usize> = None;
     for s in 0..scopes {
-        let ScopeOrigin::Expansion { expansion, .. } = view.scope_origin(ScopeId(s as u32))? else { continue };
+        let s_u32 = u32::try_from(s).map_err(|_| ScopeRefused::Record(TextAt::Row(blaze_lower::BadRow { column: "scopes", tag: u16::MAX })))?;
+        let ScopeOrigin::Expansion { expansion, .. } = view.scope_origin(ScopeId(s_u32))? else { continue };
+        if needed.is_empty() && expansions > 0 {
+            needed = AVec::with_capacity_in(expansions, alloc);
+            needed.resize(expansions, false);
+        }
         let mut e = expansion;
         // Each step goes to an earlier expansion (`View::expansion_call_at`): at most one step
         // per expansion.
         for _ in 0..=expansions {
-            match needed.get_mut(e as usize) {
-                Some(slot) if !*slot => *slot = true,
+            let e_idx = usize::try_from(e).map_err(|_| ScopeRefused::Record(TextAt::Row(blaze_lower::BadRow { column: "scopes", tag: u16::MAX })))?;
+            match needed.get_mut(e_idx) {
+                Some(slot) if !*slot => {
+                    *slot = true;
+                    max_needed = Some(max_needed.map_or(e_idx, |prev| prev.max(e_idx)));
+                }
                 Some(_) => break,
                 None => return Err(ScopeRefused::Record(TextAt::Row(blaze_lower::BadRow { column: "scopes", tag: u16::MAX }))),
             }
@@ -517,29 +534,36 @@ pub fn build<'a>(
     }
     // Each needed expansion in order: a writer's index is below its calls' (the View's rule),
     // so its key and modules are made first.
-    let mut made: AVec<'a, Option<Expanded<'a>>> = AVec::new_in(alloc);
-    for j in 0..expansions {
-        if !needed[j] {
+    let made_len = max_needed.map_or(0, |last| last.saturating_add(1));
+    let mut made: AVec<'a, Option<Expanded<'a>>> = AVec::with_capacity_in(made_len, alloc);
+    for j in 0..made_len {
+        if !needed.get(j).copied().unwrap_or(false) {
             made.push(None);
             continue;
         }
-        let one = expanded(krate, nested, hand, view, j as u32, &made, alloc)?;
+        let j_u32 = u32::try_from(j).map_err(|_| ScopeRefused::Record(TextAt::Row(blaze_lower::BadRow { column: "expansion_keys", tag: u16::MAX })))?;
+        let one = expanded(krate, nested, hand, view, j_u32, &made, alloc)?;
         made.push(Some(one));
     }
-    let mut table = ScopeTable { scopes: AVec::new_in(alloc), hand_blocks: AVec::new_in(alloc) };
+    let mut table = ScopeTable {
+        scopes: AVec::with_capacity_in(scopes, alloc),
+        hand_blocks: AVec::with_capacity_in(scopes, alloc),
+    };
     for s in 0..scopes {
-        let id = ScopeId(s as u32);
+        let s_u32 = u32::try_from(s).map_err(|_| ScopeRefused::Record(TextAt::Row(blaze_lower::BadRow { column: "scopes", tag: u16::MAX })))?;
+        let id = ScopeId(s_u32);
         let parent = match view.scope(id)?.parent {
             None => body_module,
-            Some(p) => match table.scopes.get(p.0 as usize) {
+            Some(p) => match usize::try_from(p.0).ok().and_then(|idx| table.scopes.get(idx)) {
                 Some(at) => at.module(),
-                None => return Err(ScopeRefused::ParentAfterChild { scope: s as u32 }),
+                None => return Err(ScopeRefused::ParentAfterChild { scope: s_u32 }),
             },
         };
         let (at, hand_block) = match view.scope_origin(id)? {
             ScopeOrigin::Root => (ScopeAt::Inherits(body_module), None),
             ScopeOrigin::Item { open } => {
-                let b = nested.blocks.iter().position(|blk| blk.open == open).ok_or(ScopeRefused::ScopeNotScanned { scope: s as u32 })?;
+                // `nested.blocks` is pushed in left-to-right lex order, so `blk.open` is strictly sorted.
+                let b = nested.blocks.binary_search_by_key(&open, |blk| blk.open).map_err(|_| ScopeRefused::ScopeNotScanned { scope: s_u32 })?;
                 let at = match hand {
                     Some(h) => match h.get(b).copied().flatten() {
                         Some(m) => ScopeAt::Own(m),
@@ -547,11 +571,17 @@ pub fn build<'a>(
                     },
                     None => ScopeAt::Unfiled(parent),
                 };
-                (at, Some(b as u32))
+                let b_u32 = u32::try_from(b).map_err(|_| ScopeRefused::ScopeNotScanned { scope: s_u32 })?;
+                (at, Some(b_u32))
             }
             ScopeOrigin::Expansion { expansion, open } => {
-                let e = made.get(expansion as usize).and_then(|e| e.as_ref()).ok_or(ScopeRefused::ScopeNotScanned { scope: s as u32 })?;
-                let b = e.blocks.nested.blocks.iter().position(|blk| blk.open == open + WRAP_OPEN).ok_or(ScopeRefused::ScopeNotScanned { scope: s as u32 })?;
+                let e = usize::try_from(expansion)
+                    .ok()
+                    .and_then(|idx| made.get(idx))
+                    .and_then(|e| e.as_ref())
+                    .ok_or(ScopeRefused::ScopeNotScanned { scope: s_u32 })?;
+                let target_open = open.saturating_add(WRAP_OPEN);
+                let b = e.blocks.nested.blocks.binary_search_by_key(&target_open, |blk| blk.open).map_err(|_| ScopeRefused::ScopeNotScanned { scope: s_u32 })?;
                 let at = match (e.blocks.ordinals.get(b).copied().flatten(), e.modules.get(b).copied().flatten()) {
                     (None, _) => ScopeAt::Inherits(parent),
                     (Some(_), Some(_)) if planted == Planted::CallingModuleForExpansions => ScopeAt::Own(parent),

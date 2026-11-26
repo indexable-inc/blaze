@@ -29,12 +29,12 @@ blaze-cad-field	233
 blaze-cad-mesh	61
 blaze-cad-out	10
 blaze-cad-picture	80
-blaze-cas	286
+blaze-cas	285
 blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	621
+blaze-cli	608
 blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
@@ -73,10 +73,10 @@ blaze-inproc	70
 blaze-int	7
 blaze-keyed	677
 blaze-kit	2
-blaze-ladder	1213
+blaze-ladder	1191
 blaze-launch	174
 blaze-launch-rt	455
-blaze-launcher	6
+blaze-launcher	5
 blaze-lint	185
 blaze-lint-defs	21
 blaze-lir	1374

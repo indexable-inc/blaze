@@ -1833,7 +1833,7 @@ fn a_previous_layout_is_refused_by_name() {
     };
     let old = refused(b"BLZHEAD\x03 a content-addressed store's head".to_vec());
     assert_eq!(old, StoreError::Head { what: format::HEAD_FOREIGN, at: format::SLOT_AT[0] });
-    for (format, at) in [(4u32, 0usize), (4, 1), (3, 0), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)] {
+    for (format, at) in [(5u32, 0usize), (5, 1), (4, 0), (4, 1), (3, 0), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)] {
         let slot = Slot { generation: 2 + at as u64, log: 7, manifest_at: 0, manifest_len: 64, manifest_crc: 0 }.encode_as(format);
         let mut head = vec![0u8; format::HEAD_LEN];
         let start = format::SLOT_AT[at] as usize;
@@ -1841,14 +1841,16 @@ fn a_previous_layout_is_refused_by_name() {
         assert_eq!(refused(head), StoreError::Format { what: format::HEAD_SLOT, found: format, wanted: FORMAT }, "slot {at} of format {format}");
     }
 
-    // Manifests of formats 2, 3 and 4 (3: before the sealed flag; 4: before root expiry and
-    // leases): this format's bytes with only the format word changed.
-    for old in [2u32, 3, 4] {
+    // Manifests of formats 2, 3, 4 and 5 (3: before the sealed flag; 4: before root expiry and
+    // leases; 5: before lease boot/pid fields): this format's bytes with only the format word
+    // changed.
+    for old in [2u32, 3, 4, 5] {
         let mut manifest = format::Manifest::default().encode(SEGMENT_MOST).expect("an empty manifest encodes");
         manifest[4..8].copy_from_slice(&old.to_le_bytes());
         assert_eq!(format::Manifest::decode(&manifest, SEGMENT_MOST), Err(StoreError::Format { what: "a plain store's manifest", found: old, wanted: FORMAT }));
     }
-    // This format's retired rows, marked and not, decode to what was encoded.
+    // This format's retired rows, marked and not, and lease rows (with boot + pid) decode to what
+    // was encoded; non-zero reserved bits in a lease row are refused.
     let marked = format::Manifest {
         generation: 4,
         segments: Vec::new_in(Global),
@@ -1856,7 +1858,7 @@ fn a_previous_layout_is_refused_by_name() {
             format::Root { name: "kept".to_owned(), key: key(1).0, generation: 3, expires_ns: format::NEVER },
             format::Root { name: "a checkout's answer".to_owned(), key: key(2).0, generation: 4, expires_ns: 99 },
         ],
-        leases: vec![format::Lease { holder: 7, since: 4, opened_ns: 5, expires_ns: 6 }],
+        leases: vec![format::Lease { holder: 7, since: 4, opened_ns: 5, expires_ns: 6, boot: 11, pid: 4242 }],
         retired: vec![
             format::Retired { id: 1, log: false, since_ns: 10, lost: None },
             format::Retired { id: 2, log: true, since_ns: 11, lost: None },
@@ -1865,7 +1867,12 @@ fn a_previous_layout_is_refused_by_name() {
             format::Retired { id: 5, log: false, since_ns: 14, lost: Some(format::LostMark { kind: format::LostKind::Gone, records: Some(0) }) },
         ],
     };
-    assert_eq!(format::Manifest::decode(&marked.encode(SEGMENT_MOST).expect("rows of no segment encode"), SEGMENT_MOST), Ok(marked));
+    let encoded_marked = marked.encode(SEGMENT_MOST).expect("rows of no segment encode");
+    assert_eq!(format::Manifest::decode(&encoded_marked, SEGMENT_MOST), Ok(marked));
+    let mut bad_lease_reserved = encoded_marked;
+    // Lease row starts at header (32) + retired (5 * 24 = 120) = 152; reserved u32 is at +44 = 196.
+    bad_lease_reserved[196..200].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(format::Manifest::decode(&bad_lease_reserved, SEGMENT_MOST), Err(StoreError::Manifest { .. })));
 
     // A segment of format 1: the bytes of a whole segment of this format with only its format
     // word changed (its digest then fails too; the format is named first).
