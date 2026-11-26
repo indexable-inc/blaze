@@ -705,6 +705,19 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         );
     }
 
+    // Ambient host `TMPDIR` values must never pollute content-addressed `ProbeKey`s or `exec_env`.
+    let env_tmp_a = [("CARGO_PKG_NAME", "zstd-sys"), ("MACOSX_DEPLOYMENT_TARGET", "11.0"), ("TMPDIR", "/private/var/folders/aa/bb/T")];
+    let env_tmp_b = [("CARGO_PKG_NAME", "zstd-sys"), ("MACOSX_DEPLOYMENT_TARGET", "11.0"), ("TMPDIR", "/tmp/other-machine-tmp")];
+    let sp_tmp_a = Spawn { program: "cc", args: &ok_args, env: &env_tmp_a, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let sp_tmp_b = Spawn { program: "cc", args: &ok_args, env: &env_tmp_b, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let sp_no_tmp = Spawn { program: "cc", args: &ok_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let can_tmp_a = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_tmp_a, files, alloc).expect("tmp a");
+    let can_tmp_b = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_tmp_b, files, alloc).expect("tmp b");
+    let can_no_tmp = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_no_tmp, files, alloc).expect("no tmp");
+    assert_eq!(can_tmp_a.key, can_tmp_b.key, "ambient TMPDIR must not split probe keys");
+    assert_eq!(can_tmp_a.key, can_no_tmp.key, "ambient TMPDIR must match absent TMPDIR key");
+    assert!(can_tmp_a.exec_env.iter().all(|(k, _)| k.as_str() != "TMPDIR"), "host TMPDIR must not persist into exec_env");
+
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
     let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");

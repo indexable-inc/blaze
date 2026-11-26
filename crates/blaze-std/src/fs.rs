@@ -2287,7 +2287,10 @@ impl Dir<ReadWrite> {
     pub fn lock_exclusive(&self, cx: &Cx, path: &Path) -> Result<FileLock, FsError> {
         let name = self.beneath(path);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(root_dir) = self.io.native_root_dir() {
+        if self.io.is_native_driver() {
+            let root_dir = self.io.native_root_dir().ok_or_else(|| {
+                driver_error(FsOp::Publish, &name, &"native world missing opened root directory descriptor")
+            })?;
             let native = crate::rt::lock_exclusive_off_thread(cx, root_dir, name.as_str()).map_err(|err| match err {
                 crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
                 crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),

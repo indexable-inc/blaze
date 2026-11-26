@@ -1856,6 +1856,16 @@ impl Io {
             .map(blaze_own::Share::share)
     }
 
+    /// Whether this `Io` is backed by a real native OS driver (never silently falls back to
+    /// inline driver `Effect::Lock`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn is_native_driver(&self) -> bool {
+        let Reach::Shared { world, .. } = &self.reach else {
+            return false;
+        };
+        matches!(world.lock().driver, Backend::Native(_))
+    }
+
     /// Creates a peer [`Io`] handle sharing the same simulated disk and fault injector as `self`
     /// while resetting its temporary-filename counter to `0` with `peer_nonce` — modeling an
     /// independent OS process sharing the same directory for cross-process publication DSTs.

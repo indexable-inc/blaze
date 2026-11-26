@@ -688,6 +688,8 @@ pub use landlock::{
     HostLdCaps, PreloadScanner, feed_nix_runtime_closure, feed_nix_runtime_closure_with,
     parse_ld_so_cache_match, x86_64_fhs_hwcap_subdirs,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use crate::rt::{LockBackend, LockPlant, LockRuntime, NativeLockErr};
 
 /// On macOS hosts, hashes the admitted OS runtime closure (`/System/Library/CoreServices/SystemVersion.plist`,
 /// optional Cryptex `SystemVersion.plist`, `/usr/lib/dyld`, and the active `dyld_shared_cache`
@@ -844,6 +846,19 @@ pub enum ClockSpec {
     /// Accepted ONLY at [`Level::Inputs`] when `SOURCE_DATE_EPOCH` is present and fails `u64`
     /// parsing.
     InvalidEnv,
+}
+
+impl ClockSpec {
+    /// Derives the `ClockSpec` for a caller-supplied `SOURCE_DATE_EPOCH` value using the exact
+    /// same parser that [`HermeticSpec::new`] validates (`parse_u64`), so leading-zero (`01`),
+    /// non-numeric, or out-of-range values resolve to [`ClockSpec::InvalidEnv`] and never fail
+    /// pre-launch with [`Fault::ClockNotInEnv`].
+    pub fn from_source_date_epoch(value: &str) -> Self {
+        match parse_u64(value) {
+            Some(unix_secs) => ClockSpec::Fixed { unix_secs },
+            None => ClockSpec::InvalidEnv,
+        }
+    }
 }
 
 /// What the child may use. Every cap is required (there is no default budget).

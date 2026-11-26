@@ -1259,7 +1259,14 @@ impl ScriptSandbox {
         let owned = || args.to_vec();
         let name = program.rsplit('/').next().unwrap_or(program);
         let found = self.look_up(program)?;
-        let routed = crate::spawn_route::route(name, &args_text, self.script.c_mode, found, self.script.spawner.is_some());
+        let routed = crate::spawn_route::route_with_stdin(
+            name,
+            &args_text,
+            !spawned.stdin.is_empty(),
+            self.script.c_mode,
+            found,
+            self.script.spawner.is_some(),
+        );
         let (code, stdout, stderr): (i32, Vec<u8>, Vec<u8>) = match routed {
             crate::spawn_route::Route::NotFound => {
                 return Err(self.refuse(Refusal::Spawn(SpawnRefusal::NotFoundUnasked { program: program.clone(), args: owned() })));

@@ -656,15 +656,22 @@ impl HermeticClangProbe {
                     if after != stamp {
                         return Err(OwnArc::from_str_in("pinned clang-23 changed during SHA-256 verification", shared));
                     }
-                    if let Some(expected) = expected_voucher
-                        && let Ok(voucher_rel) = bstd::path::Path::new(voucher_name.as_str())
-                    {
-                        let _ = work_root.publish(
-                            vcx,
-                            &voucher_rel,
-                            bstd::fs::Content::bytes(&expected.0),
-                            bstd::fs::Durable::No,
-                        );
+                    if let Some(expected) = expected_voucher {
+                        let voucher_rel = bstd::path::Path::new(voucher_name.as_str())
+                            .map_err(|e| fail(own_fmt(format_args!("invalid clang-23 verification voucher path: {e}"), alloc)))?;
+                        work_root
+                            .publish(
+                                vcx,
+                                &voucher_rel,
+                                bstd::fs::Content::bytes(&expected.0),
+                                bstd::fs::Durable::No,
+                            )
+                            .map_err(|e| {
+                                fail(own_fmt(
+                                    format_args!("publish clang-23 verification voucher {}: {e}", voucher_name.as_str()),
+                                    alloc,
+                                ))
+                            })?;
                     }
                     Ok(VerifiedClang { stamp })
                 }
@@ -921,19 +928,16 @@ impl RootFiles for ProbeFiles {
     }
 }
 
-/// Extracts or defaults `SOURCE_DATE_EPOCH` for the hermetic sandbox clock (`ClockSpec`).
-/// When the caller provided an invalid/out-of-range `SOURCE_DATE_EPOCH`, preserves that exact
-/// environment variable for Clang and returns `ClockSpec::InvalidEnv` so `HermeticSpec::new`
-/// permits launching Clang to produce its normal exit status 1 and diagnostic.
+/// Extracts or defaults `SOURCE_DATE_EPOCH` for the hermetic sandbox clock (`ClockSpec`), using
+/// `ClockSpec::from_source_date_epoch` (the exact same parser `HermeticSpec::new` validates) so
+/// leading-zero (`01`), invalid, or out-of-range values resolve to `ClockSpec::InvalidEnv` and
+/// reach Clang cleanly.
 fn resolve_source_date_epoch<'a>(
     owned_env: &mut AVec<'a, (AString<'a>, AString<'a>)>,
     alloc: Alloc<'a>,
 ) -> ClockSpec {
     if let Some((_, val)) = owned_env.iter().find(|(k, _)| k.as_str() == "SOURCE_DATE_EPOCH") {
-        match val.as_str().parse::<u64>() {
-            Ok(unix_secs) => ClockSpec::Fixed { unix_secs },
-            Err(_) => ClockSpec::InvalidEnv,
-        }
+        ClockSpec::from_source_date_epoch(val.as_str())
     } else {
         owned_env.push((own_str("SOURCE_DATE_EPOCH", alloc), own_str("0", alloc)));
         ClockSpec::Fixed { unix_secs: 0 }
@@ -1089,6 +1093,9 @@ impl ProbeAnswerer for HermeticClangProbe {
                 render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc)?,
             ));
         }
+        // Always give Clang its own confined output directory as `TMPDIR` (ambient host `TMPDIR`
+        // values are intentionally excluded from `CLANG_ENV` / `ProbeKey` for machine independence).
+        owned_env.push((own_str("TMPDIR", alloc), own_str(task_real.as_str(), alloc)));
         let epoch_clock = resolve_source_date_epoch(&mut owned_env, alloc);
         owned_env.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         owned_env.dedup_by(|a, b| a.0.as_str() == b.0.as_str());
@@ -1685,9 +1692,11 @@ mod tests {
         let tmp_cx = tmp_io.cx(super::Duration::from_secs(5), bstd::mem::TASK_FRAME).expect("tmp cx");
         let unsupported = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "riscv64-unknown-linux-gnu", None, alloc);
         assert!(matches!(unsupported, CProbeSetting::Unavailable(_)), "unsupported host must return Unavailable");
+        // Opening a native world over a missing root must fail loudly (never silently drop `native_root_dir`).
+        assert!(crate::record::native_world(&empty_home).is_err(), "native_world over nonexistent root must fail");
+        std::fs::create_dir_all(&empty_home).expect("create empty home");
         let x64_ready = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "x86_64-unknown-linux-gnu", None, alloc);
         assert!(matches!(x64_ready, CProbeSetting::Ready(_)), "x86_64-unknown-linux-gnu must be Ready");
-        std::fs::create_dir_all(&empty_home).expect("create empty home");
         let missing = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "aarch64-unknown-linux-gnu", None, alloc);
         let CProbeSetting::Ready(missing_probes) = missing else {
             panic!("supported host setup must defer shelf check until first probe miss");
@@ -1775,6 +1784,31 @@ mod tests {
             make_spec(&[("SOURCE_DATE_EPOCH", "not-a-num")], bad_clock).is_ok(),
             "HermeticSpec::new must accept ClockSpec::InvalidEnv when SOURCE_DATE_EPOCH is invalid"
         );
+        // Leading-zero `SOURCE_DATE_EPOCH=01` must use the exact same parser as `HermeticSpec::new`
+        // so it resolves to `ClockSpec::InvalidEnv` and reaches Clang instead of `ClockNotInEnv`.
+        let mut env_lz = AVec::new_in(alloc);
+        env_lz.push((OwnString::from_str_in("SOURCE_DATE_EPOCH", alloc), OwnString::from_str_in("01", alloc)));
+        let lz_clock = resolve_source_date_epoch(&mut env_lz, alloc);
+        assert_eq!(lz_clock, super::ClockSpec::InvalidEnv);
+        assert!(
+            make_spec(&[("SOURCE_DATE_EPOCH", "01")], lz_clock).is_ok(),
+            "HermeticSpec::new must accept leading-zero SOURCE_DATE_EPOCH=01 via ClockSpec::InvalidEnv"
+        );
+        // Nonempty-stdin compiler invocations must bypass `Fact::CcProbe` and stay on the ordinary
+        // compiler route (`Deferred` in check mode, `Executor` in build mode).
+        let probe_args = ["-c", "-Wshadow", "-o", "/out/flag_check", "/out/flag_check.c"];
+        assert!(matches!(
+            crate::spawn_route::route_with_stdin("cc", &probe_args, false, blaze_build_script::CMode::Deferred, true, true),
+            crate::spawn_route::Route::Fact(blaze_build_script::facts::Fact::CcProbe { .. })
+        ));
+        assert!(matches!(
+            crate::spawn_route::route_with_stdin("cc", &probe_args, true, blaze_build_script::CMode::Deferred, true, true),
+            crate::spawn_route::Route::Deferred
+        ));
+        assert!(matches!(
+            crate::spawn_route::route_with_stdin("cc", &probe_args, true, blaze_build_script::CMode::Built, true, true),
+            crate::spawn_route::Route::Executor
+        ));
         assert_eq!(
             make_spec(&[("SOURCE_DATE_EPOCH", "123")], super::ClockSpec::InvalidEnv),
             Err(super::Fault::ClockNotInEnv),
@@ -2280,6 +2314,249 @@ mod tests {
         let err = run_reaper_core_dst(bstd::procs::hermetic::ReaperPlant::SingleFifo)
             .expect_err("planted SingleFifo must be caught");
         assert!(err.contains("blocked from cleanup"), "unexpected error: {err}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_lock_runtime_dst(plant: bstd::procs::hermetic::LockPlant) -> Result<(), &'static str> {
+        use bstd::procs::hermetic::{LockBackend, LockRuntime};
+        use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+        use std::thread::{self, JoinHandle, ThreadId};
+
+        struct TrackedHandle {
+            caller_tid: ThreadId,
+            unlocked: StdArc<AtomicBool>,
+            closed_count: StdArc<AtomicUsize>,
+            unlocked_count: StdArc<AtomicUsize>,
+            dropped_on_caller: StdArc<AtomicUsize>,
+        }
+
+        impl Drop for TrackedHandle {
+            fn drop(&mut self) {
+                if thread::current().id() == self.caller_tid {
+                    self.dropped_on_caller.fetch_add(1, Ordering::AcqRel);
+                }
+                if self.unlocked.load(Ordering::Acquire) {
+                    self.unlocked_count.fetch_add(1, Ordering::AcqRel);
+                }
+                self.closed_count.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        struct SimLockBackend {
+            caller_tid: ThreadId,
+            rng: AtomicU64,
+            acquired_count: StdArc<AtomicUsize>,
+            unlocked_count: StdArc<AtomicUsize>,
+            closed_count: StdArc<AtomicUsize>,
+            dropped_on_caller: StdArc<AtomicUsize>,
+            fail_spawn_mask: AtomicUsize,
+            stalled_release: StdArc<AtomicBool>,
+            workers: StdMutex<std::vec::Vec<JoinHandle<()>>>,
+        }
+
+        impl SimLockBackend {
+            fn next_u64(&self) -> u64 {
+                let prev = self.rng.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::AcqRel);
+                let mut z = prev.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            }
+
+            fn join_all(&self) {
+                loop {
+                    let batch = {
+                        let mut guard = self.workers.lock().expect("workers lock");
+                        if guard.is_empty() {
+                            break;
+                        }
+                        core::mem::take(&mut *guard)
+                    };
+                    for handle in batch {
+                        let _ = handle.join();
+                    }
+                }
+            }
+        }
+
+        impl LockBackend<TrackedHandle> for SimLockBackend {
+            fn open_and_try_lock(&self) -> Result<Option<TrackedHandle>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+                let r = self.next_u64();
+                // Deterministic delay so caller cancel/timeout races BOTH before and after worker CAS.
+                if r % 3 == 0 {
+                    thread::sleep(super::Duration::from_micros(150 + (r % 300)));
+                } else if r % 5 == 0 {
+                    // Contended attempt.
+                    return Ok(None);
+                }
+                self.acquired_count.fetch_add(1, Ordering::AcqRel);
+                Ok(Some(TrackedHandle {
+                    caller_tid: self.caller_tid,
+                    unlocked: StdArc::new(AtomicBool::new(false)),
+                    closed_count: StdArc::clone(&self.closed_count),
+                    unlocked_count: StdArc::clone(&self.unlocked_count),
+                    dropped_on_caller: StdArc::clone(&self.dropped_on_caller),
+                }))
+            }
+
+            fn unlock_and_close(&self, handle: TrackedHandle) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+                if self.next_u64() % 4 == 0 {
+                    // Brief stall while active workers saturate the 2-worker cap.
+                    while !self.stalled_release.load(Ordering::Acquire) {
+                        thread::sleep(super::Duration::from_micros(100));
+                    }
+                }
+                handle.unlocked.store(true, Ordering::Release);
+                drop(handle);
+                Ok(())
+            }
+
+            fn spawn_worker<F: FnOnce() + Send + 'static>(&self, _name: &str, f: F) -> Result<(), ()> {
+                let mask = self.fail_spawn_mask.load(Ordering::Acquire);
+                if mask > 0 && self.next_u64() % (mask as u64) == 0 {
+                    return Err(());
+                }
+                let jh = thread::spawn(f);
+                self.workers.lock().expect("workers lock").push(jh);
+                Ok(())
+            }
+
+            fn poll_timeout(&self) -> super::Duration {
+                super::Duration::from_micros(100)
+            }
+        }
+
+        let caller_tid = thread::current().id();
+        for seed in 0..80u64 {
+            let acquired_count = StdArc::new(AtomicUsize::new(0));
+            let unlocked_count = StdArc::new(AtomicUsize::new(0));
+            let closed_count = StdArc::new(AtomicUsize::new(0));
+            let dropped_on_caller = StdArc::new(AtomicUsize::new(0));
+            let stalled_release = StdArc::new(AtomicBool::new(false));
+            let backend = blaze_own::Arc::new_in(
+                SimLockBackend {
+                    caller_tid,
+                    rng: AtomicU64::new(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(17)),
+                    acquired_count: StdArc::clone(&acquired_count),
+                    unlocked_count: StdArc::clone(&unlocked_count),
+                    closed_count: StdArc::clone(&closed_count),
+                    dropped_on_caller: StdArc::clone(&dropped_on_caller),
+                    fail_spawn_mask: AtomicUsize::new(7),
+                    stalled_release: StdArc::clone(&stalled_release),
+                    workers: StdMutex::new(std::vec::Vec::new()),
+                },
+                blaze_own::SharedAlloc::global(),
+            );
+            // Small cap (`max_workers = 2, max_pending = 4`) guarantees worker-cap saturation,
+            // reaper queueing, and spawn-failure recovery trigger on every seed.
+            let rt = LockRuntime::new(2, 4, plant);
+            let mut held = std::vec::Vec::new();
+            for op in 0..14u64 {
+                let choice = (seed.wrapping_add(op)) % 4;
+                if choice < 2 || held.is_empty() {
+                    // Acquire — half the time with a racing cancellation after 1 poll tick!
+                    let cancel_after = if (seed + op) % 2 == 0 { 1usize } else { usize::MAX };
+                    let mut polls = 0usize;
+                    let mut is_stopped = || {
+                        polls += 1;
+                        if polls > cancel_after {
+                            Some(bstd::Stopped::Cancelled { span: "lock_runtime_dst" })
+                        } else {
+                            None
+                        }
+                    };
+                    let mut sleep_backoff = || Ok(());
+                    if let Ok(handle) = rt.lock_exclusive(&backend, &mut is_stopped, &mut sleep_backoff) {
+                        held.push(handle);
+                    }
+                } else if let Some(handle) = held.pop() {
+                    if choice == 2 {
+                        let mut polls = 0usize;
+                        let mut is_stopped = || {
+                            polls += 1;
+                            if polls > 2 {
+                                Some(bstd::Stopped::Cancelled { span: "lock_runtime_dst.unlock" })
+                            } else {
+                                None
+                            }
+                        };
+                        let _ = rt.unlock(handle, &backend, &mut is_stopped);
+                    } else {
+                        rt.retire_handle(handle, &backend);
+                    }
+                }
+            }
+            // Release all remaining held locks (some via `unlock` while workers may still be
+            // stalled at cap=2, exercising the cap-overflow retirement path!).
+            for (idx, handle) in held.drain(..).enumerate() {
+                if idx % 2 == 0 {
+                    let mut polls = 0usize;
+                    let mut is_stopped = || {
+                        polls += 1;
+                        if polls > 1 {
+                            Some(bstd::Stopped::Cancelled { span: "lock_runtime_dst.drain" })
+                        } else {
+                            None
+                        }
+                    };
+                    let _ = rt.unlock(handle, &backend, &mut is_stopped);
+                } else {
+                    rt.retire_handle(handle, &backend);
+                }
+            }
+            // Unblock stalled unlock workers and disable spawn failures to drain cleanly.
+            stalled_release.store(true, Ordering::Release);
+            backend.fail_spawn_mask.store(0, Ordering::Release);
+            rt.pump_reapers(&backend);
+            backend.join_all();
+            // Pump once more in case a worker finished and left a queued item without a live reaper.
+            rt.pump_reapers(&backend);
+            backend.join_all();
+
+            if dropped_on_caller.load(Ordering::Acquire) != 0 {
+                return Err("lock runtime oracle: handle dropped synchronously on caller thread");
+            }
+            let acq = acquired_count.load(Ordering::Acquire);
+            let unl = unlocked_count.load(Ordering::Acquire);
+            let cls = closed_count.load(Ordering::Acquire);
+            if cls != acq {
+                return Err("lock runtime oracle: acquired handle was leaked without closing");
+            }
+            if unl != acq {
+                return Err("lock runtime oracle: acquired handle was dropped without unlocking");
+            }
+            if rt.active_workers() != 0 {
+                return Err("lock runtime oracle: active_workers counter leaked");
+            }
+            if rt.reaper_active() != 0 || rt.reaper_pending() != 0 || rt.reaper_reserved() != 0 {
+                return Err("lock runtime oracle: reaper slot/pending/active state leaked");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lock_runtime_dst_survives_races_cap_overflow_and_spawn_failures() {
+        run_lock_runtime_dst(bstd::procs::hermetic::LockPlant::None)
+            .expect("production LockRuntime DST must never drop on caller, leak slots, or skip unlock");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lock_runtime_dst_catches_planted_sync_drop_on_unlock_cap() {
+        let err = run_lock_runtime_dst(bstd::procs::hermetic::LockPlant::SyncDropOnUnlockCap)
+            .expect_err("planted SyncDropOnUnlockCap must be caught");
+        assert!(err.contains("dropped synchronously on caller thread"), "unexpected error: {err}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lock_runtime_dst_catches_planted_skip_abandon_unlock() {
+        let err = run_lock_runtime_dst(bstd::procs::hermetic::LockPlant::SkipAbandonUnlock)
+            .expect_err("planted SkipAbandonUnlock must be caught");
+        assert!(err.contains("dropped without unlocking"), "unexpected error: {err}");
     }
 
     #[test]

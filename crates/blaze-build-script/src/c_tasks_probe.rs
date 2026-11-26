@@ -63,7 +63,10 @@ pub const OUTPUT: &str = "$OUT";
 
 /// The environment variables clang's driver reads that can change a probe's answer, sorted. A
 /// spawn's value of each is part of its row; every other variable is not read by clang.
-pub const CLANG_ENV: [&str; 11] = [
+/// `TMPDIR` is intentionally excluded: host ambient temp dirs (e.g. `/private/var/folders/...`)
+/// must never pollute content-addressed probe keys; hermetic execution supplies the probe's own
+/// private confined output directory as `TMPDIR`.
+pub const CLANG_ENV: [&str; 10] = [
     "CCC_OVERRIDE_OPTIONS",
     "COMPILER_PATH",
     "CPATH",
@@ -74,7 +77,6 @@ pub const CLANG_ENV: [&str; 11] = [
     "OBJC_INCLUDE_PATH",
     "SDKROOT",
     "SOURCE_DATE_EPOCH",
-    "TMPDIR",
 ];
 
 /// The C and C++ compiler names a probe is spawned as.

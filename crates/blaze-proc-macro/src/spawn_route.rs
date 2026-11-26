@@ -158,7 +158,22 @@ pub(crate) enum Route<'s> {
 /// there is one, else a refusal. Decided from text alone. Not found is first, so a name the
 /// shim was told is missing is never answered here either (`found_covers_every_answered_route`
 /// in the tests holds that every name a later arm answers is found).
+#[cfg(test)]
 pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, found: bool, has_executor: bool) -> Route<'s> {
+    route_with_stdin(name, args, false, c_mode, found, has_executor)
+}
+
+/// Like [`route`], additionally excluding `Fact::CcProbe` when `has_stdin` is true so compiler
+/// invocations with nonempty stdin stay on the ordinary compiler route instead of failing probe
+/// canonicalization with `ProbeWhy::Stdin`.
+pub(crate) fn route_with_stdin<'s>(
+    name: &'s str,
+    args: &'s [&'s str],
+    has_stdin: bool,
+    c_mode: CMode,
+    found: bool,
+    has_executor: bool,
+) -> Route<'s> {
     if !found {
         return Route::NotFound;
     }
@@ -172,10 +187,12 @@ pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, found
     if shell_git || git_words(name, args).is_some() {
         return Route::Git;
     }
-    if let Some(fact) = facts::question(name, args) {
+    if let Some(fact) = facts::question(name, args)
+        && !(has_stdin && matches!(fact, Fact::CcProbe { .. }))
+    {
         return Route::Fact(fact);
     }
-    if probe::is_deferred_tool(name, args) && c_mode == CMode::Deferred {
+    if (probe::is_deferred_tool(name, args) || (has_stdin && probe::is_c_tool(name))) && c_mode == CMode::Deferred {
         return Route::Deferred;
     }
     if has_executor { Route::Executor } else { Route::Refused }

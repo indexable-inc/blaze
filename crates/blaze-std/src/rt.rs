@@ -1233,23 +1233,415 @@ pub(crate) struct NativeRootDir(blaze_sys::posix::io::OwnedFd);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NativeRootDir {
-    pub(crate) fn open(root: &RootPath) -> Option<Self> {
+    pub(crate) fn open(root: &RootPath) -> Result<Self, blaze_sys::Errno> {
         use self::std::os::unix::ffi::OsStrExt as _;
         let raw = root.as_os_str().as_bytes();
         if raw.is_empty() || raw.contains(&0) {
-            return None;
+            return Err(blaze_sys::Errno::Inval);
         }
         let mut buf = blaze_own::Vec::with_capacity_in(raw.len() + 1, blaze_own::SharedAlloc::global());
         buf.extend_from_slice(raw);
         buf.push(0);
-        let cstr = core::ffi::CStr::from_bytes_with_nul(buf.as_slice()).ok()?;
+        let cstr = core::ffi::CStr::from_bytes_with_nul(buf.as_slice()).map_err(|_| blaze_sys::Errno::Inval)?;
         let flags = blaze_sys::posix::io::OpenFlags::DIRECTORY | blaze_sys::posix::io::OpenFlags::CLOSE_ON_EXEC;
-        let fd = blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0).ok()?;
-        Some(Self(fd))
+        let fd = blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0)?;
+        Ok(Self(fd))
     }
 
     fn fd(&self) -> blaze_sys::Fd {
         self.0.fd()
+    }
+}
+
+/// Planted bugs for deterministic interleaving DSTs of [`LockRuntime`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LockPlant {
+    None,
+    /// Control 1: on unlock worker-cap / spawn failure, drops the handle synchronously on the
+    /// caller thread instead of retiring through the bounded reaper pool.
+    SyncDropOnUnlockCap,
+    /// Control 2: on caller-abandon race, skips unlocking the acquired handle before closing it.
+    SkipAbandonUnlock,
+}
+
+/// Platform seam driven by [`LockRuntime`] in both production (`RealOpBackend`) and
+/// deterministic interleaving DSTs (`SimLockBackend`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub trait LockBackend<H: Send + 'static>: Send + Sync + 'static {
+    fn open_and_try_lock(&self) -> Result<Option<H>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+    fn unlock_and_close(&self, handle: H) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+    fn spawn_worker<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) -> Result<(), ()>;
+    fn poll_timeout(&self) -> core::time::Duration;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct RuntimeSlotGuard<'a, H: Send + 'static> {
+    rt: &'a LockRuntime<H>,
+    held: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<H: Send + 'static> Drop for RuntimeSlotGuard<'_, H> {
+    fn drop(&mut self) {
+        if self.held {
+            self.rt.release_slot();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct LockRuntimeInner<H: Send + 'static> {
+    reaper: self::std::sync::Mutex<crate::procs::hermetic::ReaperCore<H>>,
+    active_workers: core::sync::atomic::AtomicUsize,
+    max_workers: usize,
+    plant: LockPlant,
+}
+
+/// Production off-thread advisory lock + bounded reaper coordinator, generic over handle `H` and
+/// [`LockBackend`] so deterministic interleaving DSTs execute the exact production `AtomicU8`
+/// abandon handshake, `active_workers` cap, `mpsc::sync_channel` delivery, and `ReaperCore`
+/// retirement loop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct LockRuntime<H: Send + 'static> {
+    inner: blaze_own::Arc<LockRuntimeInner<H>, blaze_own::SharedAlloc<'static>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<H: Send + 'static> Clone for LockRuntime<H> {
+    fn clone(&self) -> Self {
+        Self { inner: blaze_own::Share::share(&self.inner) }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<H: Send + 'static> blaze_own::Share for LockRuntime<H> {}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<H: Send + 'static> LockRuntime<H> {
+    pub fn new(max_workers: usize, max_pending: usize, plant: LockPlant) -> Self {
+        Self {
+            inner: blaze_own::Arc::new_in(
+                LockRuntimeInner {
+                    reaper: self::std::sync::Mutex::new(crate::procs::hermetic::ReaperCore::new(
+                        max_workers,
+                        max_pending,
+                        crate::procs::hermetic::ReaperPlant::None,
+                    )),
+                    active_workers: core::sync::atomic::AtomicUsize::new(0),
+                    max_workers: max_workers.max(1),
+                    plant,
+                },
+                blaze_own::SharedAlloc::global(),
+            ),
+        }
+    }
+
+    pub fn active_workers(&self) -> usize {
+        self.inner.active_workers.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn reaper_active(&self) -> usize {
+        match self.inner.reaper.lock() {
+            Ok(g) => g.active(),
+            Err(p) => p.into_inner().active(),
+        }
+    }
+
+    pub fn reaper_pending(&self) -> usize {
+        match self.inner.reaper.lock() {
+            Ok(g) => g.pending_len(),
+            Err(p) => p.into_inner().pending_len(),
+        }
+    }
+
+    pub fn reaper_reserved(&self) -> usize {
+        match self.inner.reaper.lock() {
+            Ok(g) => g.reserved(),
+            Err(p) => p.into_inner().reserved(),
+        }
+    }
+
+    fn try_reserve_slot(&self) -> bool {
+        let mut guard = match self.inner.reaper.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.try_reserve()
+    }
+
+    fn release_slot(&self) {
+        let mut guard = match self.inner.reaper.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.release_reservation();
+    }
+
+    /// Attempts to spawn reaper workers for any previously queued items (recovering cleanly after
+    /// transient `thread::spawn` failures once OS thread creation succeeds again).
+    pub fn pump_reapers<B: LockBackend<H>>(
+        &self,
+        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
+    ) {
+        let first = {
+            let mut guard = match self.inner.reaper.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.take_spawnable()
+        };
+        if let Some(item) = first {
+            self.spawn_reaper_loop(item, backend);
+        }
+    }
+
+    /// Retires an owned lock handle off the caller thread through `self.inner.reaper`: NEVER
+    /// unlocks or closes `handle` synchronously on the caller thread, even when all reaper
+    /// workers are wedged or `spawn_worker` transiently fails.
+    pub fn retire_handle<B: LockBackend<H>>(
+        &self,
+        handle: H,
+        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
+    ) {
+        use crate::procs::hermetic::RetireAction;
+        let to_spawn = {
+            let mut guard = match self.inner.reaper.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            match guard.retire_reserved(handle) {
+                RetireAction::Spawn(item) => Some(item),
+                RetireAction::Queued => None,
+                RetireAction::SyncDrop(item) => {
+                    guard.on_spawn_failed(item);
+                    None
+                }
+            }
+        };
+        if let Some(first) = to_spawn {
+            self.spawn_reaper_loop(first, backend);
+        }
+    }
+
+    fn spawn_reaper_loop<B: LockBackend<H>>(
+        &self,
+        first: H,
+        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
+    ) {
+        use self::std::sync::Mutex;
+        let mut to_spawn = Some(first);
+        while let Some(item) = to_spawn {
+            let first_slot = blaze_own::Arc::new_in(Mutex::new(Some(item)), blaze_own::SharedAlloc::global());
+            let worker_slot = blaze_own::Share::share(&first_slot);
+            let rt_w = blaze_own::Share::share(self);
+            let backend_w = blaze_own::Share::share(backend);
+            let spawned = backend.spawn_worker("bstd-lock-reaper", move || {
+                let mut current = match worker_slot.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(p) => p.into_inner().take(),
+                };
+                while let Some(retired) = current {
+                    let _ = backend_w.unlock_and_close(retired);
+                    let mut guard = match rt_w.inner.reaper.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    current = guard.next_after_drop();
+                }
+            });
+            if spawned.is_err() {
+                let returned = match first_slot.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(p) => p.into_inner().take(),
+                };
+                if let Some(item) = returned {
+                    let mut guard = match self.inner.reaper.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    guard.on_spawn_failed(item);
+                }
+                break;
+            }
+            let mut guard = match self.inner.reaper.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            to_spawn = guard.take_spawnable();
+        }
+    }
+
+    pub fn lock_exclusive<B: LockBackend<H>>(
+        &self,
+        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
+        is_stopped: &mut dyn FnMut() -> Option<crate::Stopped>,
+        sleep_backoff: &mut dyn FnMut() -> Result<(), crate::Stopped>,
+    ) -> Result<H, NativeLockErr> {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        use self::std::sync::mpsc;
+
+        const STATE_RUNNING: u8 = 0;
+        const STATE_WORKER_DONE: u8 = 1;
+        const STATE_CALLER_ABANDONED: u8 = 2;
+
+        self.pump_reapers(backend);
+        if !self.try_reserve_slot() {
+            return Err(lock_err_static("file-lock reaper backlog full"));
+        }
+        let mut slot_guard = RuntimeSlotGuard { rt: self, held: true };
+        loop {
+            if let Some(stopped) = is_stopped() {
+                return Err(NativeLockErr::Stopped(stopped));
+            }
+            let prev = self.inner.active_workers.fetch_add(1, Ordering::AcqRel);
+            if prev >= self.inner.max_workers {
+                self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
+                return Err(lock_err_static("file-lock worker cap reached (stalled filesystem backlog full)"));
+            }
+            let state = blaze_own::Arc::new_in(AtomicU8::new(STATE_RUNNING), blaze_own::SharedAlloc::global());
+            let state_w = blaze_own::Share::share(&state);
+            let rt_w = blaze_own::Share::share(self);
+            let backend_w = blaze_own::Share::share(backend);
+            type LockMsg<H> = Result<Option<H>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+            let (tx, rx) = mpsc::sync_channel::<LockMsg<H>>(1);
+            let plant = self.inner.plant;
+            let spawned = backend.spawn_worker("bstd-lock-op", move || {
+                let res: LockMsg<H> = backend_w.open_and_try_lock();
+                if state_w
+                    .compare_exchange(STATE_RUNNING, STATE_WORKER_DONE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    if let Err(mpsc::SendError(Ok(Some(h)))) = tx.send(res) {
+                        if plant != LockPlant::SkipAbandonUnlock {
+                            let _ = backend_w.unlock_and_close(h);
+                        } else {
+                            drop(h);
+                        }
+                    }
+                } else {
+                    if let Ok(Some(h)) = res {
+                        if plant != LockPlant::SkipAbandonUnlock {
+                            let _ = backend_w.unlock_and_close(h);
+                        } else {
+                            drop(h);
+                        }
+                    }
+                    rt_w.release_slot();
+                }
+                rt_w.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
+            });
+            if spawned.is_err() {
+                self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
+                return Err(lock_err_static("failed to spawn off-thread file-lock worker"));
+            }
+            let poll_wait = backend.poll_timeout();
+            loop {
+                match rx.recv_timeout(poll_wait) {
+                    Ok(Ok(Some(h))) => {
+                        slot_guard.held = false;
+                        return Ok(h);
+                    }
+                    Ok(Ok(None)) => break, // Contended: backoff and retry.
+                    Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(stopped) = is_stopped() {
+                            if state
+                                .compare_exchange(STATE_RUNNING, STATE_CALLER_ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                            {
+                                slot_guard.held = false;
+                                return Err(NativeLockErr::Stopped(stopped));
+                            }
+                            if let Ok(Ok(Some(h))) = rx.recv() {
+                                slot_guard.held = false;
+                                self.retire_handle(h, backend);
+                            }
+                            return Err(NativeLockErr::Stopped(stopped));
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(lock_err_static("file-lock worker exited unexpectedly"));
+                    }
+                }
+            }
+            sleep_backoff().map_err(NativeLockErr::Stopped)?;
+        }
+    }
+
+    pub fn unlock<B: LockBackend<H>>(
+        &self,
+        handle: H,
+        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
+        is_stopped: &mut dyn FnMut() -> Option<crate::Stopped>,
+    ) -> Result<(), NativeLockErr> {
+        use core::sync::atomic::Ordering;
+        use self::std::sync::mpsc;
+
+        self.pump_reapers(backend);
+        let prev = self.inner.active_workers.fetch_add(1, Ordering::AcqRel);
+        if prev >= self.inner.max_workers {
+            self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
+            if self.inner.plant == LockPlant::SyncDropOnUnlockCap {
+                drop(handle);
+                self.release_slot();
+            } else {
+                self.retire_handle(handle, backend);
+            }
+            return Err(lock_err_static("file-unlock worker cap reached (retired off-thread)"));
+        }
+        type UnlockMsg = Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+        let (tx, rx) = mpsc::sync_channel::<UnlockMsg>(1);
+        let fd_slot = blaze_own::Arc::new_in(self::std::sync::Mutex::new(Some(handle)), blaze_own::SharedAlloc::global());
+        let worker_slot = blaze_own::Share::share(&fd_slot);
+        let rt_w = blaze_own::Share::share(self);
+        let backend_w = blaze_own::Share::share(backend);
+        let spawned = backend.spawn_worker("bstd-unlock-op", move || {
+            let owned = match worker_slot.lock() {
+                Ok(mut g) => g.take(),
+                Err(p) => p.into_inner().take(),
+            };
+            let res = match owned {
+                Some(h) => backend_w.unlock_and_close(h),
+                None => Ok(()),
+            };
+            rt_w.release_slot();
+            rt_w.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
+            let _ = tx.send(res);
+        });
+        if spawned.is_err() {
+            self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
+            let recovered = match fd_slot.lock() {
+                Ok(mut g) => g.take(),
+                Err(p) => p.into_inner().take(),
+            };
+            if let Some(h) = recovered {
+                if self.inner.plant == LockPlant::SyncDropOnUnlockCap {
+                    drop(h);
+                    self.release_slot();
+                } else {
+                    self.retire_handle(h, backend);
+                }
+            } else {
+                self.release_slot();
+            }
+            return Err(lock_err_static("failed to spawn off-thread file-unlock worker (retired off-thread)"));
+        }
+        let poll_wait = backend.poll_timeout();
+        loop {
+            match rx.recv_timeout(poll_wait) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(stopped) = is_stopped() {
+                        return Err(NativeLockErr::Stopped(stopped));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(lock_err_static("file-unlock worker exited unexpectedly"));
+                }
+            }
+        }
     }
 }
 
@@ -1266,113 +1658,61 @@ const MAX_LOCK_WORKERS: usize = 64;
 const MAX_LOCK_REAPER_PENDING: usize = 64;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-static ACTIVE_LOCK_WORKERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn lock_reaper_pool() -> &'static self::std::sync::Mutex<crate::procs::hermetic::ReaperCore<blaze_sys::posix::io::OwnedFd>> {
-    use self::std::sync::{Mutex, OnceLock};
-    use crate::procs::hermetic::{ReaperCore, ReaperPlant};
-    static POOL: OnceLock<Mutex<ReaperCore<blaze_sys::posix::io::OwnedFd>>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(ReaperCore::new(MAX_LOCK_WORKERS, MAX_LOCK_REAPER_PENDING, ReaperPlant::None)))
+fn global_lock_runtime() -> &'static LockRuntime<blaze_sys::posix::io::OwnedFd> {
+    use self::std::sync::OnceLock;
+    static RT: OnceLock<LockRuntime<blaze_sys::posix::io::OwnedFd>> = OnceLock::new();
+    RT.get_or_init(|| LockRuntime::new(MAX_LOCK_WORKERS, MAX_LOCK_REAPER_PENDING, LockPlant::None))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn try_reserve_lock_slot() -> bool {
-    let pool = lock_reaper_pool();
-    let mut guard = match pool.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.try_reserve()
-}
+struct RealRetireBackend;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn release_lock_slot() {
-    let pool = lock_reaper_pool();
-    let mut guard = match pool.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.release_reservation();
-}
-
-/// Retires an owned lock descriptor off the caller thread through `lock_reaper_pool()`: NEVER
-/// unlocks or closes `fd` synchronously on the caller thread, even when all 64 lock reapers are
-/// wedged or `thread::spawn` transiently fails.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn retire_lock_fd(fd: blaze_sys::posix::io::OwnedFd) {
-    use self::std::sync::Mutex;
-    use crate::procs::hermetic::RetireAction;
-
-    let pool = lock_reaper_pool();
-    let mut to_spawn = {
-        let mut guard = match pool.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match guard.retire_reserved(fd) {
-            RetireAction::Spawn(item) => Some(item),
-            RetireAction::Queued => None,
-            RetireAction::SyncDrop(item) => {
-                guard.on_spawn_failed(item);
-                None
-            }
-        }
-    };
-    while let Some(first) = to_spawn {
-        let first_slot = blaze_own::Arc::new_in(Mutex::new(Some(first)), blaze_own::SharedAlloc::global());
-        let worker_slot = blaze_own::Share::share(&first_slot);
-        let spawned = self::std::thread::Builder::new()
-            .name(self::std::string::String::from("bstd-lock-reaper"))
-            .spawn(move || {
-                let mut current = match worker_slot.lock() {
-                    Ok(mut g) => g.take(),
-                    Err(poisoned) => poisoned.into_inner().take(),
-                };
-                while let Some(retired_fd) = current {
-                    let _ = blaze_sys::posix::io::flock(retired_fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
-                    drop(retired_fd);
-                    let mut guard = match pool.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    current = guard.next_after_drop();
-                }
-            });
-        if spawned.is_err() {
-            let returned = match first_slot.lock() {
-                Ok(mut g) => g.take(),
-                Err(poisoned) => poisoned.into_inner().take(),
-            };
-            if let Some(item) = returned {
-                let mut guard = match pool.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.on_spawn_failed(item);
-            }
-            break;
-        }
-        let mut guard = match pool.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        to_spawn = guard.take_spawnable();
+impl LockBackend<blaze_sys::posix::io::OwnedFd> for RealRetireBackend {
+    fn open_and_try_lock(&self) -> Result<Option<blaze_sys::posix::io::OwnedFd>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+        Ok(None)
     }
+
+    fn unlock_and_close(&self, fd: blaze_sys::posix::io::OwnedFd) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+        let res = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock)
+            .map_err(|e| lock_err_errno("flock (unlock)", e));
+        drop(fd);
+        res
+    }
+
+    fn spawn_worker<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) -> Result<(), ()> {
+        self::std::thread::Builder::new()
+            .name(self::std::string::String::from(name))
+            .spawn(f)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    fn poll_timeout(&self) -> core::time::Duration {
+        core::time::Duration::from_millis(10)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn real_retire_backend() -> &'static blaze_own::Arc<RealRetireBackend, blaze_own::SharedAlloc<'static>> {
+    use self::std::sync::OnceLock;
+    static B: OnceLock<blaze_own::Arc<RealRetireBackend, blaze_own::SharedAlloc<'static>>> = OnceLock::new();
+    B.get_or_init(|| blaze_own::Arc::new_in(RealRetireBackend, blaze_own::SharedAlloc::global()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for NativeLock {
     fn drop(&mut self) {
         if let Some(fd) = self.0.take() {
-            retire_lock_fd(fd);
+            global_lock_runtime().retire_handle(fd, real_retire_backend());
         }
     }
 }
 
 /// Error returned by [`lock_exclusive_off_thread`] / [`unlock_off_thread`].
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) enum NativeLockErr {
+#[derive(Debug)]
+pub enum NativeLockErr {
     Stopped(crate::Stopped),
     Driver(blaze_own::String<blaze_own::SharedAlloc<'static>>),
 }
@@ -1455,10 +1795,18 @@ fn open_dir_beneath_no_symlink(
     parent: blaze_sys::Fd,
     part: &str,
 ) -> Result<blaze_sys::posix::io::OwnedFd, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
-    use blaze_sys::posix::io::{OpenFlags, openat};
+    use blaze_sys::posix::io::{OpenFlags, mkdirat, openat};
     let flags = OpenFlags::DIRECTORY | OpenFlags::NO_FOLLOW | OpenFlags::NO_FOLLOW_ANY | OpenFlags::CLOSE_ON_EXEC;
-    with_component_cstr(part, |cpath| {
-        openat(parent, cpath, flags, 0).map_err(|e| lock_err_errno("openat (lock parent)", e))
+    with_component_cstr(part, |cpath| match openat(parent, cpath, flags, 0) {
+        Ok(fd) => Ok(fd),
+        Err(blaze_sys::Errno::NoEnt) => {
+            match mkdirat(parent, cpath, 0o755) {
+                Ok(()) | Err(blaze_sys::Errno::Exist) => {}
+                Err(errno) => return Err(lock_err_errno("mkdirat (lock parent)", errno)),
+            }
+            openat(parent, cpath, flags, 0).map_err(|e| lock_err_errno("openat (lock parent)", e))
+        }
+        Err(errno) => Err(lock_err_errno("openat (lock parent)", errno)),
     })
 }
 
@@ -1537,14 +1885,37 @@ fn open_and_try_lock_beneath(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-struct LockSlotGuard(bool);
+struct RealOpBackend {
+    root_dir: Option<blaze_own::Arc<NativeRootDir, blaze_own::SharedAlloc<'static>>>,
+    rel: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl Drop for LockSlotGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            release_lock_slot();
-        }
+impl LockBackend<blaze_sys::posix::io::OwnedFd> for RealOpBackend {
+    fn open_and_try_lock(&self) -> Result<Option<blaze_sys::posix::io::OwnedFd>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+        let Some(root_dir) = &self.root_dir else {
+            return Err(blaze_own::String::from_str_in("missing native root dir", blaze_own::SharedAlloc::global()));
+        };
+        open_and_try_lock_beneath(root_dir.fd(), self.rel.as_str())
+    }
+
+    fn unlock_and_close(&self, fd: blaze_sys::posix::io::OwnedFd) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+        let res = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock)
+            .map_err(|e| lock_err_errno("flock (unlock)", e));
+        drop(fd);
+        res
+    }
+
+    fn spawn_worker<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) -> Result<(), ()> {
+        self::std::thread::Builder::new()
+            .name(self::std::string::String::from(name))
+            .spawn(f)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    fn poll_timeout(&self) -> core::time::Duration {
+        core::time::Duration::from_millis(10)
     }
 }
 
@@ -1554,161 +1925,38 @@ pub(crate) fn lock_exclusive_off_thread(
     root_dir: blaze_own::Arc<NativeRootDir, blaze_own::SharedAlloc<'static>>,
     rel: &str,
 ) -> Result<NativeLock, NativeLockErr> {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    use core::time::Duration;
-    use self::std::sync::mpsc;
-
-    const STATE_RUNNING: u8 = 0;
-    const STATE_WORKER_DONE: u8 = 1;
-    const STATE_CALLER_ABANDONED: u8 = 2;
-
-    if !try_reserve_lock_slot() {
-        return Err(lock_err_static("file-lock reaper backlog full"));
-    }
-    let mut slot_guard = LockSlotGuard(true);
-    let backoff = Duration::from_millis(2);
-    loop {
-        cx.stopped_by(cx.io().now()).map_err(NativeLockErr::Stopped)?;
-        let prev = ACTIVE_LOCK_WORKERS.fetch_add(1, Ordering::AcqRel);
-        if prev >= MAX_LOCK_WORKERS {
-            ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-            return Err(lock_err_static("file-lock worker cap reached (stalled filesystem backlog full)"));
-        }
-        let state = blaze_own::Arc::new_in(AtomicU8::new(STATE_RUNNING), blaze_own::SharedAlloc::global());
-        let state_w = blaze_own::Share::share(&state);
-        let root_w = blaze_own::Share::share(&root_dir);
-        let rel_w = blaze_own::String::from_str_in(rel, blaze_own::SharedAlloc::global());
-        type LockMsg = Result<Option<blaze_sys::posix::io::OwnedFd>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
-        let (tx, rx) = mpsc::sync_channel::<LockMsg>(1);
-        let spawned = self::std::thread::Builder::new()
-            .name(self::std::string::String::from("bstd-lock-op"))
-            .spawn(move || {
-                let res: LockMsg = open_and_try_lock_beneath(root_w.fd(), rel_w.as_str());
-                if state_w
-                    .compare_exchange(STATE_RUNNING, STATE_WORKER_DONE, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    if let Err(mpsc::SendError(Ok(Some(fd)))) = tx.send(res) {
-                        let _ = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
-                        drop(fd);
-                    }
-                } else {
-                    if let Ok(Some(fd)) = res {
-                        let _ = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
-                        drop(fd);
-                    }
-                    release_lock_slot();
-                }
-                ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-            });
-        if spawned.is_err() {
-            ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-            return Err(lock_err_static("failed to spawn off-thread file-lock worker"));
-        }
-        loop {
-            match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(Ok(Some(fd))) => {
-                    slot_guard.0 = false;
-                    return Ok(NativeLock(Some(fd)));
-                }
-                Ok(Ok(None)) => break, // Contended: backoff and retry.
-                Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(stopped) = cx.stopped_by(cx.io().now()) {
-                        if state
-                            .compare_exchange(STATE_RUNNING, STATE_CALLER_ABANDONED, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            // Worker is still running and now owns releasing the lock slot on exit.
-                            slot_guard.0 = false;
-                            return Err(NativeLockErr::Stopped(stopped));
-                        }
-                        // Worker already finished and sent its result; retire any acquired fd off-thread.
-                        if let Ok(Ok(Some(fd))) = rx.recv() {
-                            slot_guard.0 = false;
-                            retire_lock_fd(fd);
-                        }
-                        return Err(NativeLockErr::Stopped(stopped));
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(lock_err_static("file-lock worker exited unexpectedly"));
-                }
-            }
-        }
-        let _ = cx
-            .io()
+    let backend = blaze_own::Arc::new_in(
+        RealOpBackend {
+            root_dir: Some(root_dir),
+            rel: blaze_own::String::from_str_in(rel, blaze_own::SharedAlloc::global()),
+        },
+        blaze_own::SharedAlloc::global(),
+    );
+    let backoff = core::time::Duration::from_millis(2);
+    let mut is_stopped = || cx.stopped_by(cx.io().now()).err();
+    let mut sleep_backoff = || {
+        cx.io()
             .call(cx, |tag| blaze_core::Effect::Timer { after: backoff, tag })
-            .map_err(NativeLockErr::Stopped)?;
-    }
+            .map(|_| ())
+    };
+    let fd = global_lock_runtime().lock_exclusive(&backend, &mut is_stopped, &mut sleep_backoff)?;
+    Ok(NativeLock(Some(fd)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn unlock_off_thread(cx: &crate::cx::Cx, lock: &mut NativeLock) -> Result<(), NativeLockErr> {
-    use core::sync::atomic::Ordering;
-    use core::time::Duration;
-    use self::std::sync::mpsc;
-
     let Some(fd) = lock.0.take() else {
         return Ok(());
     };
-    let prev = ACTIVE_LOCK_WORKERS.fetch_add(1, Ordering::AcqRel);
-    if prev >= MAX_LOCK_WORKERS {
-        ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-        // Never restore `fd` for synchronous drop on the caller thread: retire via bounded reaper!
-        retire_lock_fd(fd);
-        return Err(lock_err_static("file-unlock worker cap reached (retired off-thread)"));
-    }
-    type UnlockMsg = Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
-    let (tx, rx) = mpsc::sync_channel::<UnlockMsg>(1);
-    let fd_slot = blaze_own::Arc::new_in(self::std::sync::Mutex::new(Some(fd)), blaze_own::SharedAlloc::global());
-    let worker_slot = blaze_own::Share::share(&fd_slot);
-    let spawned = self::std::thread::Builder::new()
-        .name(self::std::string::String::from("bstd-unlock-op"))
-        .spawn(move || {
-            let owned = match worker_slot.lock() {
-                Ok(mut g) => g.take(),
-                Err(poisoned) => poisoned.into_inner().take(),
-            };
-            let res = if let Some(owned_fd) = owned {
-                let r = blaze_sys::posix::io::flock(owned_fd.fd(), blaze_sys::posix::io::FlockOp::Unlock)
-                    .map_err(|e| lock_err_errno("flock (unlock)", e));
-                drop(owned_fd);
-                r
-            } else {
-                Ok(())
-            };
-            release_lock_slot();
-            ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-            let _ = tx.send(res);
-        });
-    if spawned.is_err() {
-        ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-        let recovered = match fd_slot.lock() {
-            Ok(mut g) => g.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(owned_fd) = recovered {
-            retire_lock_fd(owned_fd);
-        } else {
-            release_lock_slot();
-        }
-        return Err(lock_err_static("failed to spawn off-thread file-unlock worker (retired off-thread)"));
-    }
-    loop {
-        match rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(stopped) = cx.stopped_by(cx.io().now()) {
-                    return Err(NativeLockErr::Stopped(stopped));
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(lock_err_static("file-unlock worker exited unexpectedly"));
-            }
-        }
-    }
+    let backend = blaze_own::Arc::new_in(
+        RealOpBackend {
+            root_dir: None,
+            rel: blaze_own::String::new_in(blaze_own::SharedAlloc::global()),
+        },
+        blaze_own::SharedAlloc::global(),
+    );
+    let mut is_stopped = || cx.stopped_by(cx.io().now()).err();
+    global_lock_runtime().unlock(fd, &backend, &mut is_stopped)
 }
 
 // How the containers only Rust's `std` has hold their type arguments, for `bstd::own`'s walk

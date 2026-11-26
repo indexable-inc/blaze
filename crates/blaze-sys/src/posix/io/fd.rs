@@ -593,6 +593,22 @@ pub fn flock(fd: Fd, op: FlockOp) -> Result<(), Errno> {
     }
 }
 
+/// `mkdirat`: creates directory `path` beneath directory descriptor `dir` with permissions `mode`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn mkdirat(dir: Fd, path: Path<'_>, mode: u32) -> Result<(), Errno> {
+    #[cfg(target_os = "macos")]
+    {
+        let mode_u16 = u16::try_from(mode).map_err(|_| Errno::Inval)?;
+        // SAFETY: `path` is a live NUL-terminated string read by libSystem's `mkdirat`.
+        said(unsafe { crate::macos::cold::mkdirat(dir.raw(), path.as_ptr().cast(), mode_u16) }).map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::mkdirat(dir, path, mode)
+    }
+}
+
 // ---- macOS: fcntl, dup, ioctl, preadv over libSystem ----
 
 /// `F_DUPFD` (sys/fcntl.h).
