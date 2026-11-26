@@ -29,7 +29,7 @@ use blaze_build_script::{
 };
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
-use blaze_wasi::{Answer, Errno, Stop, W32};
+use blaze_wasi::{Answer, Errno, Stop, W32, W64, Width};
 use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, OptLevel, ResourceLimiter, Store as WasmStore, Trap, TypedFunc, WasmBacktraceDetails};
 
 use crate::{
@@ -38,11 +38,17 @@ use crate::{
     script_sandbox::{Read, Refusal, Script, ScriptSandbox},
 };
 
-/// The import module of the process shim's calls.
+/// The import module of the 32-bit process shim's calls.
 const IMPORTS: &str = "blaze_build_script";
 
-/// WASI's module, for the calls `blaze_wasi` leaves out (the writes `OUT_DIR` takes).
-const WASI: &str = "wasi_snapshot_preview1";
+/// The import module of the 64-bit (`memory64`) process shim's calls.
+const IMPORTS_64: &str = "blaze_build_script_64";
+
+/// 32-bit WASI's module, for the calls `blaze_wasi` leaves out (the writes `OUT_DIR` takes).
+const WASI: &str = <W32 as Width>::MODULE;
+
+/// 64-bit (`memory64`) WASI's module, for the calls `blaze_wasi` leaves out.
+const WASI_64: &str = <W64 as Width>::MODULE;
 
 /// The most elements a module's tables may hold.
 const TABLE_MAX: usize = 1 << 20;
@@ -220,70 +226,95 @@ fn errno(answer: Answer<()>) -> Result<i32, Stop> {
     })
 }
 
-fn imports(l: &mut Linker<ScriptHost>) -> wasmtime::Result<()> {
+/// Build-script shim and WASI write-side ABI parameterized by pointer width (`W32` or `W64`).
+trait ScriptWidth: Width {
+    const SHIM: &'static str;
+    const WASI_MODULE: &'static str;
+    fn len_out(len: usize) -> Self::Ptr;
+}
+
+impl ScriptWidth for W32 {
+    const SHIM: &'static str = IMPORTS;
+    const WASI_MODULE: &'static str = WASI;
+    fn len_out(len: usize) -> u32 {
+        len as u32
+    }
+}
+
+impl ScriptWidth for W64 {
+    const SHIM: &'static str = IMPORTS_64;
+    const WASI_MODULE: &'static str = WASI_64;
+    fn len_out(len: usize) -> u64 {
+        len as u64
+    }
+}
+
+fn imports<W: ScriptWidth>(l: &mut Linker<ScriptHost>) -> wasmtime::Result<()> {
+    let shim = W::SHIM;
+    let wasi = W::WASI_MODULE;
     // The shim's lookup before a spawn (guest/script_process.rs `Command::spawn`): 1 when the
     // machine has the program, 0 for the OS's `NotFound` (D192). A module built before the
     // shim asked does not import it, and the linker's unused definition is nothing to it.
-    l.func_wrap(IMPORTS, "found", |mut c: Caller<'_, ScriptHost>, program: u32, len: u32| {
+    l.func_wrap(shim, "found", |mut c: Caller<'_, ScriptHost>, program: W::Ptr, len: W::Ptr| {
         with(&mut c, |mem, host| {
-            let program = blaze_wasi::bytes(mem, u64::from(program), u64::from(len))?.to_vec();
-            Ok(u32::from(host.sandbox.found(&program)?))
+            let program = blaze_wasi::bytes(mem, program.into(), len.into())?;
+            Ok(u32::from(host.sandbox.found(program)?))
         })
     })?;
-    l.func_wrap(IMPORTS, "spawn", |mut c: Caller<'_, ScriptHost>, request: u32, len: u32| {
+    l.func_wrap(shim, "spawn", |mut c: Caller<'_, ScriptHost>, request: W::Ptr, len: W::Ptr| {
         with(&mut c, |mem, host| {
-            let request = blaze_wasi::bytes(mem, u64::from(request), u64::from(len))?.to_vec();
-            host.sandbox.spawn(&request)?;
-            Ok(host.sandbox.reply.len() as u32)
+            let request = blaze_wasi::bytes(mem, request.into(), len.into())?;
+            host.sandbox.spawn(request)?;
+            Ok(W::len_out(host.sandbox.reply.len()))
         })
     })?;
-    l.func_wrap(IMPORTS, "reply", |mut c: Caller<'_, ScriptHost>, into: u32| {
+    l.func_wrap(shim, "reply", |mut c: Caller<'_, ScriptHost>, into: W::Ptr| {
         with(&mut c, |mem, host| {
-            blaze_wasi::put(mem, u64::from(into), &host.sandbox.reply)?;
+            blaze_wasi::put(mem, into.into(), &host.sandbox.reply)?;
             host.sandbox.reply.clear();
             Ok(())
         })
     })?;
-    l.func_wrap(WASI, "path_create_directory", |mut c: Caller<'_, ScriptHost>, fd: u32, path: u32, len: u32| {
+    l.func_wrap(wasi, "path_create_directory", |mut c: Caller<'_, ScriptHost>, fd: u32, path: W::Ptr, len: W::Ptr| {
         with(&mut c, |mem, host| {
-            let path = blaze_wasi::bytes(mem, u64::from(path), u64::from(len))?.to_vec();
-            errno(host.sandbox.create_dir(fd, &path))
+            let path = blaze_wasi::bytes(mem, path.into(), len.into())?;
+            errno(host.sandbox.create_dir(fd, path))
         })
     })?;
     // `fd_sync` and `fd_datasync` (cc syncs the files it writes): a script's files are the
     // sandbox's memory, which no crash tears, so a sync of an open descriptor is done once it is
     // known to be one. Scripts only: a proc macro writes nothing and is refused these.
     for name in ["fd_sync", "fd_datasync"] {
-        l.func_wrap(WASI, name, |mut c: Caller<'_, ScriptHost>, fd: u32| {
+        l.func_wrap(wasi, name, |mut c: Caller<'_, ScriptHost>, fd: u32| {
             with(&mut c, |_, host| errno(blaze_wasi::System::fd_filetype(&mut host.sandbox, fd).map(|it| it.map(|_| ()))))
         })?;
     }
     // `path_link` (std's `fs::hard_link`, which cc imports): `OUT_DIR` holds files, not links,
     // so the sandbox answers ENOTSUP, a WASI errno the script sees and handles as on a file
     // system without hard links (cc then copies).
-    l.func_wrap(WASI, "path_link", |_: Caller<'_, ScriptHost>, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 {
+    l.func_wrap(wasi, "path_link", |_: Caller<'_, ScriptHost>, _: u32, _: u32, _: W::Ptr, _: W::Ptr, _: u32, _: W::Ptr, _: W::Ptr| -> i32 {
         i32::from(Errno::NOTSUP.0)
     })?;
     for (name, dir) in [("path_unlink_file", false), ("path_remove_directory", true)] {
-        l.func_wrap(WASI, name, move |mut c: Caller<'_, ScriptHost>, fd: u32, path: u32, len: u32| {
+        l.func_wrap(wasi, name, move |mut c: Caller<'_, ScriptHost>, fd: u32, path: W::Ptr, len: W::Ptr| {
             with(&mut c, |mem, host| {
-                let path = blaze_wasi::bytes(mem, u64::from(path), u64::from(len))?.to_vec();
-                errno(host.sandbox.remove(fd, &path, dir))
+                let path = blaze_wasi::bytes(mem, path.into(), len.into())?;
+                errno(host.sandbox.remove(fd, path, dir))
             })
         })?;
     }
     l.func_wrap(
-        WASI,
+        wasi,
         "path_rename",
-        |mut c: Caller<'_, ScriptHost>, fd: u32, from: u32, from_len: u32, to_fd: u32, to: u32, to_len: u32| {
+        |mut c: Caller<'_, ScriptHost>, fd: u32, from: W::Ptr, from_len: W::Ptr, to_fd: u32, to: W::Ptr, to_len: W::Ptr| {
             with(&mut c, |mem, host| {
-                let from = blaze_wasi::bytes(mem, u64::from(from), u64::from(from_len))?.to_vec();
-                let to = blaze_wasi::bytes(mem, u64::from(to), u64::from(to_len))?.to_vec();
-                errno(host.sandbox.rename(fd, &from, to_fd, &to))
+                let from = blaze_wasi::bytes(mem, from.into(), from_len.into())?;
+                let to = blaze_wasi::bytes(mem, to.into(), to_len.into())?;
+                errno(host.sandbox.rename(fd, from, to_fd, to))
             })
         },
     )?;
-    l.func_wrap(WASI, "fd_filestat_set_size", |mut c: Caller<'_, ScriptHost>, fd: u32, size: u64| {
+    l.func_wrap(wasi, "fd_filestat_set_size", |mut c: Caller<'_, ScriptHost>, fd: u32, size: u64| {
         with(&mut c, |_, host| errno(host.sandbox.set_size(fd, size)))
     })?;
     Ok(())
@@ -323,14 +354,16 @@ impl ScriptRuntime {
             .wasm_memory64(true);
         let engine = Engine::new(&config).map_err(RuntimeError::Engine)?;
         let mut bytes = Bytes::default();
-        bytes.write(b"blaze build-script host 1\n");
+        bytes.write(b"blaze build-script host 2\n");
         engine.precompile_compatibility_hash().hash(&mut bytes);
         bytes.write(std::env::consts::ARCH.as_bytes());
         bytes.write(std::env::consts::OS.as_bytes());
         let code_id = sha256_hex(&bytes.0);
         let mut linker = Linker::new(&engine);
-        imports(&mut linker).map_err(RuntimeError::Link)?;
+        imports::<W32>(&mut linker).map_err(RuntimeError::Link)?;
+        imports::<W64>(&mut linker).map_err(RuntimeError::Link)?;
         blaze_wasi::link::<W32, ScriptHost>(&mut linker).map_err(RuntimeError::Link)?;
+        blaze_wasi::link::<W64, ScriptHost>(&mut linker).map_err(RuntimeError::Link)?;
         Ok(ScriptRuntime { engine, linker, code_id, store: store.to_owned() })
     }
 
