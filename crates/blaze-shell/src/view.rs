@@ -238,6 +238,10 @@ pub enum HitAction {
     SysMonSelectRow { block: BlockId, row: usize },
     SysMonToggleCollapse { block: BlockId, pid: u32 },
     SysMonClose(BlockId),
+    /// Switch to the workspace tab & pane owning a running process/TUI and scroll to its block.
+    FocusPaneBlock { pane: crate::tiling::PaneId, block: BlockId },
+    /// Open native Activity & GPU Monitor (`top`) focused/filtered on a specific OS PID.
+    InspectProcessPid(u32),
     SortTableColumn { block: BlockId, col: usize },
     ResizeTableColumn { block: BlockId, col: usize, col_x0: i32 },
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
@@ -339,6 +343,27 @@ pub enum HoverKind {
         entries: Vec<DirPreviewEntry>,
         total_items: usize,
         hidden_count: usize,
+    },
+    /// Live processes running inside `cwd` (and subfolders + grandchildren/great-grandchildren).
+    FolderProcs {
+        summary: crate::sysmon_driver::FolderProcSnapshot,
+    },
+    /// Hoverable token span inside a command line; lazily hydrated into `CommandExplain`.
+    CommandToken {
+        source: String,
+        token_start: usize,
+        token_end: usize,
+    },
+    /// Hydrated explanation popover for a hovered command/subcommand/flag/operator token.
+    CommandExplain {
+        source: String,
+        token_start: usize,
+        token_end: usize,
+        badge: &'static str,
+        title: String,
+        summary: String,
+        details: Vec<(String, String)>,
+        source_note: String,
     },
 }
 

@@ -109,6 +109,7 @@ pub struct RawProcess<'a> {
     pub ppid: u32,
     pub uid: u32,
     pub name: AString<'a>,
+    pub cwd: AString<'a>,
     pub exe_path: AString<'a>,
     pub app_bundle_path: Option<AString<'a>>,
     pub cpu_time_ns: u64,
@@ -259,6 +260,7 @@ pub struct ProcessRow<'a> {
     pub child_count: u32,
     pub tree_prefix: AString<'a>,
     pub name: AString<'a>,
+    pub cwd: AString<'a>,
     pub exe_path: AString<'a>,
     pub app_bundle_path: Option<AString<'a>>,
     pub cpu_pct: f32,
@@ -291,6 +293,110 @@ pub fn extract_app_bundle_path(exe_path: &str) -> Option<&str> {
     None
 }
 
+#[inline]
+fn trim_trailing_slashes(s: &str) -> &str {
+    if s.is_empty() {
+        return "";
+    }
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() { "/" } else { trimmed }
+}
+
+/// Returns `true` if `path` is equal to `folder` or strictly inside `folder`.
+///
+/// Trailing `/` characters are trimmed on both paths (except root `"/"`).
+/// Returns `false` if either `path` or `folder` is empty.
+pub fn path_is_within(path: &str, folder: &str) -> bool {
+    if path.is_empty() || folder.is_empty() {
+        return false;
+    }
+    let path = trim_trailing_slashes(path);
+    let folder = trim_trailing_slashes(folder);
+    if folder == "/" {
+        return path.starts_with('/');
+    }
+    path == folder
+        || (path.len() > folder.len()
+            && path.starts_with(folder)
+            && path.as_bytes()[folder.len()] == b'/')
+}
+
+/// Returns `"."` if `path` equals `folder`, the relative subpath (e.g. `"crates/blaze-shell"`)
+/// if `path` is strictly inside `folder`, or `path` unchanged if outside `folder`.
+pub fn relative_subpath<'a>(path: &'a str, folder: &str) -> &'a str {
+    if path.is_empty() || folder.is_empty() {
+        return path;
+    }
+    let trimmed_path = trim_trailing_slashes(path);
+    let trimmed_folder = trim_trailing_slashes(folder);
+    if trimmed_path == trimmed_folder {
+        return ".";
+    }
+    if trimmed_folder == "/" {
+        if trimmed_path.starts_with('/') {
+            let rest = trimmed_path.trim_start_matches('/');
+            return if rest.is_empty() { "." } else { rest };
+        }
+        return path;
+    }
+    if trimmed_path.len() > trimmed_folder.len()
+        && trimmed_path.starts_with(trimmed_folder)
+        && trimmed_path.as_bytes()[trimmed_folder.len()] == b'/'
+    {
+        let rest = trimmed_path[trimmed_folder.len() + 1..].trim_start_matches('/');
+        return if rest.is_empty() { "." } else { rest };
+    }
+    path
+}
+
+/// CPU percentage threshold at or above which a process or folder is considered hot.
+const HOT_CPU_PCT: f32 = 25.0;
+/// GPU percentage threshold at or above which a process or folder is considered hot.
+const HOT_GPU_PCT: f32 = 15.0;
+/// Maximum ancestor depth walked when attributing folder descendants and shell panes.
+const MAX_ANCESTOR_DEPTH: usize = 32;
+
+/// Identifies a child PTY or running job PID owned by a `blaze-shell` pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellPanePid {
+    pub pid: u32,
+    pub pane_id: u64,
+    pub block_id: u64,
+    pub pane_number: u32,
+    pub is_alt_screen: bool,
+}
+
+/// One live running process attributed to a queried folder.
+#[derive(Debug, PartialEq)]
+pub struct FolderProcEntry<'a> {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: AString<'a>,
+    pub cwd: AString<'a>,
+    pub rel_dir: AString<'a>,
+    pub exe_path: AString<'a>,
+    pub app_bundle_path: Option<AString<'a>>,
+    pub cpu_pct: f32,
+    pub gpu_pct: f32,
+    pub mem_bytes: u64,
+    pub threads: u32,
+    pub is_hot: bool,
+    pub via_descendant: bool,
+    pub shell_pane: Option<ShellPanePid>,
+}
+
+/// Summary of all live running processes scoped to a folder (including subfolders & descendants).
+#[derive(Debug, PartialEq)]
+pub struct FolderProcSummary<'a> {
+    pub folder: AString<'a>,
+    pub entries: AVec<'a, FolderProcEntry<'a>>,
+    pub total_cpu_pct: f32,
+    pub total_gpu_pct: f32,
+    pub total_mem_bytes: u64,
+    pub is_hot: bool,
+    pub primary_name: AString<'a>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PrevProcCounters {
     cpu_time_ns: u64,
@@ -303,6 +409,7 @@ struct ComputedProc<'a> {
     pid: u32,
     ppid: u32,
     name: AString<'a>,
+    cwd: AString<'a>,
     exe_path: AString<'a>,
     app_bundle_path: Option<AString<'a>>,
     cpu_pct: f32,
@@ -463,6 +570,7 @@ impl<'a> SysMonEngine<'a> {
                 pid: proc.pid,
                 ppid: proc.ppid,
                 name: proc.name,
+                cwd: proc.cwd,
                 exe_path: proc.exe_path,
                 app_bundle_path,
                 cpu_pct,
@@ -634,6 +742,202 @@ impl<'a> SysMonEngine<'a> {
         self.sample_count
     }
 
+    /// Computes all live running processes scoped to `folder` (including subfolders,
+    /// descendants up to 32 levels deep, hot CPU/GPU indicators, and `blaze-shell` pane
+    /// attribution), sorted hottest-first.
+    pub fn folder_processes_in<'b>(
+        &self,
+        folder: &str,
+        own_pid: u32,
+        pane_roots: &[ShellPanePid],
+        alloc: Alloc<'b>,
+    ) -> FolderProcSummary<'b> {
+        let mut entries: AVec<'b, FolderProcEntry<'b>> = Vec::new_in(alloc);
+        if folder.is_empty() || self.computed_procs.is_empty() {
+            return FolderProcSummary {
+                folder: String::from_str_in(folder, alloc),
+                entries,
+                total_cpu_pct: 0.0,
+                total_gpu_pct: 0.0,
+                total_mem_bytes: 0,
+                is_hot: false,
+                primary_name: String::new_in(alloc),
+            };
+        }
+
+        // Index PID -> computed_procs index (first occurrence wins).
+        let mut pid_to_idx: ABTreeMap<'b, u32, usize> = BTreeMap::new_in(alloc);
+        for (i, proc) in self.computed_procs.iter().enumerate() {
+            if !pid_to_idx.contains_key(&proc.pid) {
+                pid_to_idx.insert(proc.pid, i);
+            }
+        }
+
+        // Index pane root PID -> ShellPanePid and identify panes whose root cwd is in `folder`.
+        let mut pane_by_pid: ABTreeMap<'b, u32, ShellPanePid> = BTreeMap::new_in(alloc);
+        let mut panes_in_folder: ABTreeSet<'b, u64> = BTreeSet::new_in(alloc);
+        for &root in pane_roots {
+            if !pane_by_pid.contains_key(&root.pid) {
+                pane_by_pid.insert(root.pid, root);
+            }
+            if let Some(&idx) = pid_to_idx.get(&root.pid)
+                && path_is_within(self.computed_procs[idx].cwd.as_str(), folder)
+            {
+                panes_in_folder.insert(root.pane_id);
+            }
+        }
+
+        for proc in self.computed_procs.iter() {
+            if proc.pid == own_pid {
+                continue;
+            }
+
+            let direct_match = path_is_within(proc.cwd.as_str(), folder)
+                || (proc.cwd.is_empty()
+                    && pane_by_pid
+                        .get(&proc.pid)
+                        .is_some_and(|sp| panes_in_folder.contains(&sp.pane_id)));
+
+            let via_descendant = if direct_match {
+                false
+            } else {
+                let mut matched_ancestor = false;
+                let mut visited = [0u32; MAX_ANCESTOR_DEPTH + 1];
+                visited[0] = proc.pid;
+                let mut visited_len = 1usize;
+                let mut cur = proc.ppid;
+
+                for _ in 0..MAX_ANCESTOR_DEPTH {
+                    if cur == 0 || cur == 1 || cur == own_pid {
+                        break;
+                    }
+                    if visited[..visited_len].contains(&cur) {
+                        break;
+                    }
+                    visited[visited_len] = cur;
+                    visited_len += 1;
+
+                    match pid_to_idx.get(&cur) {
+                        Some(&anc_idx) => {
+                            let anc = &self.computed_procs[anc_idx];
+                            if path_is_within(anc.cwd.as_str(), folder) {
+                                matched_ancestor = true;
+                                break;
+                            }
+                            if anc.cwd.is_empty()
+                                && pane_by_pid
+                                    .get(&anc.pid)
+                                    .is_some_and(|sp| panes_in_folder.contains(&sp.pane_id))
+                            {
+                                matched_ancestor = true;
+                                break;
+                            }
+                            cur = anc.ppid;
+                        }
+                        None => {
+                            if pane_by_pid
+                                .get(&cur)
+                                .is_some_and(|sp| panes_in_folder.contains(&sp.pane_id))
+                            {
+                                matched_ancestor = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if !matched_ancestor {
+                    continue;
+                }
+                true
+            };
+
+            // Attribute nearest matching ShellPanePid across self -> ancestors (up to depth 32).
+            let shell_pane = if pane_by_pid.is_empty() {
+                None
+            } else {
+                let mut found = None;
+                let mut visited = [0u32; MAX_ANCESTOR_DEPTH + 1];
+                let mut visited_len = 0usize;
+                let mut cur = proc.pid;
+                for _ in 0..=MAX_ANCESTOR_DEPTH {
+                    if cur == 0 || cur == 1 || cur == own_pid {
+                        break;
+                    }
+                    if visited[..visited_len].contains(&cur) {
+                        break;
+                    }
+                    visited[visited_len] = cur;
+                    visited_len += 1;
+
+                    if let Some(&sp) = pane_by_pid.get(&cur) {
+                        found = Some(sp);
+                        break;
+                    }
+                    match pid_to_idx.get(&cur) {
+                        Some(&idx) => cur = self.computed_procs[idx].ppid,
+                        None => break,
+                    }
+                }
+                found
+            };
+
+            let is_hot = proc.cpu_pct >= HOT_CPU_PCT || proc.gpu_pct >= HOT_GPU_PCT;
+            entries.push(FolderProcEntry {
+                pid: proc.pid,
+                ppid: proc.ppid,
+                name: String::from_str_in(proc.name.as_str(), alloc),
+                cwd: String::from_str_in(proc.cwd.as_str(), alloc),
+                rel_dir: String::from_str_in(relative_subpath(proc.cwd.as_str(), folder), alloc),
+                exe_path: String::from_str_in(proc.exe_path.as_str(), alloc),
+                app_bundle_path: proc
+                    .app_bundle_path
+                    .as_ref()
+                    .map(|p| String::from_str_in(p.as_str(), alloc)),
+                cpu_pct: proc.cpu_pct,
+                gpu_pct: proc.gpu_pct,
+                mem_bytes: proc.mem_bytes,
+                threads: proc.threads,
+                is_hot,
+                via_descendant,
+                shell_pane,
+            });
+        }
+
+        entries.as_mut_slice().sort_unstable_by(|a, b| {
+            b.is_hot
+                .cmp(&a.is_hot)
+                .then_with(|| (b.cpu_pct + b.gpu_pct).total_cmp(&(a.cpu_pct + a.gpu_pct)))
+                .then_with(|| b.mem_bytes.cmp(&a.mem_bytes))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+
+        let mut total_cpu_pct = 0.0f32;
+        let mut total_gpu_pct = 0.0f32;
+        let mut total_mem_bytes = 0u64;
+        let mut any_entry_hot = false;
+        for entry in entries.iter() {
+            total_cpu_pct += entry.cpu_pct;
+            total_gpu_pct += entry.gpu_pct;
+            total_mem_bytes = total_mem_bytes.saturating_add(entry.mem_bytes);
+            any_entry_hot |= entry.is_hot;
+        }
+        let is_hot = total_cpu_pct >= HOT_CPU_PCT || total_gpu_pct >= HOT_GPU_PCT || any_entry_hot;
+        let primary_name = match entries.first() {
+            Some(first) => String::from_str_in(first.name.as_str(), alloc),
+            None => String::new_in(alloc),
+        };
+
+        FolderProcSummary {
+            folder: String::from_str_in(folder, alloc),
+            entries,
+            total_cpu_pct,
+            total_gpu_pct,
+            total_mem_bytes,
+            is_hot,
+            primary_name,
+        }
+    }
+
     fn rebuild_rows(&mut self) {
         self.rows.clear();
         let n = self.computed_procs.len();
@@ -695,6 +999,7 @@ impl<'a> SysMonEngine<'a> {
                 child_count: 0,
                 tree_prefix: String::new_in(self.alloc),
                 name: String::from_str_in(proc.name.as_str(), self.alloc),
+                cwd: String::from_str_in(proc.cwd.as_str(), self.alloc),
                 exe_path: String::from_str_in(proc.exe_path.as_str(), self.alloc),
                 app_bundle_path: proc
                     .app_bundle_path
@@ -927,6 +1232,7 @@ impl<'a> SysMonEngine<'a> {
                 child_count: child_count[frame.node],
                 tree_prefix,
                 name: String::from_str_in(proc.name.as_str(), alloc),
+                cwd: String::from_str_in(proc.cwd.as_str(), alloc),
                 exe_path: String::from_str_in(proc.exe_path.as_str(), alloc),
                 app_bundle_path: proc
                     .app_bundle_path
@@ -1065,6 +1371,7 @@ mod tests {
             ppid,
             uid: 501,
             name: String::from_str_in(name, alloc),
+            cwd: AString::new_in(alloc),
             exe_path: String::from_str_in(exe_path, alloc),
             app_bundle_path: None,
             cpu_time_ns,
@@ -1567,5 +1874,526 @@ mod tests {
         });
 
         assert_eq!(engine.rows().len(), 3);
+    }
+
+    fn make_proc_with_cwd<'a>(
+        alloc: Alloc<'a>,
+        pid: u32,
+        ppid: u32,
+        name: &str,
+        cwd: &str,
+        exe_path: &str,
+        cpu_time_ns: u64,
+        gpu_time_ns: u64,
+        mem_bytes: u64,
+        threads: u32,
+    ) -> RawProcess<'a> {
+        let mut p = make_proc(
+            alloc,
+            pid,
+            ppid,
+            name,
+            exe_path,
+            cpu_time_ns,
+            gpu_time_ns,
+            mem_bytes,
+            0,
+            0,
+            threads,
+        );
+        p.cwd = String::from_str_in(cwd, alloc);
+        p
+    }
+
+    #[test]
+    fn path_is_within_and_relative_subpath_edge_cases() {
+        // Exact match and trailing slashes.
+        assert!(path_is_within("/Volumes/Projects/blaze", "/Volumes/Projects/blaze"));
+        assert!(path_is_within("/Volumes/Projects/blaze/", "/Volumes/Projects/blaze"));
+        assert!(path_is_within("/Volumes/Projects/blaze", "/Volumes/Projects/blaze/"));
+        assert!(path_is_within("/Volumes/Projects/blaze///", "/Volumes/Projects/blaze//"));
+
+        // Subfolders match.
+        assert!(path_is_within("/Volumes/Projects/blaze/crates", "/Volumes/Projects/blaze"));
+        assert!(path_is_within(
+            "/Volumes/Projects/blaze/crates/blaze-shell/",
+            "/Volumes/Projects/blaze/"
+        ));
+
+        // Prefix-collision siblings MUST NOT match!
+        assert!(!path_is_within("/Volumes/Projects/blaze-2", "/Volumes/Projects/blaze"));
+        assert!(!path_is_within(
+            "/Volumes/Projects/blaze-2/crates",
+            "/Volumes/Projects/blaze"
+        ));
+        assert!(!path_is_within(
+            "/Volumes/Projects/blaze_extra",
+            "/Volumes/Projects/blaze"
+        ));
+
+        // Empty inputs.
+        assert!(!path_is_within("", "/Volumes/Projects/blaze"));
+        assert!(!path_is_within("/Volumes/Projects/blaze", ""));
+        assert!(!path_is_within("", ""));
+
+        // Root folder "/".
+        assert!(path_is_within("/", "/"));
+        assert!(path_is_within("/Volumes/Projects/blaze", "/"));
+        assert!(path_is_within("/tmp", "///"));
+        assert!(!path_is_within("relative/path", "/"));
+
+        // relative_subpath cases.
+        assert_eq!(
+            relative_subpath("/Volumes/Projects/blaze", "/Volumes/Projects/blaze"),
+            "."
+        );
+        assert_eq!(
+            relative_subpath("/Volumes/Projects/blaze/", "/Volumes/Projects/blaze"),
+            "."
+        );
+        assert_eq!(
+            relative_subpath(
+                "/Volumes/Projects/blaze/crates/blaze-shell",
+                "/Volumes/Projects/blaze"
+            ),
+            "crates/blaze-shell"
+        );
+        assert_eq!(
+            relative_subpath(
+                "/Volumes/Projects/blaze/crates/blaze-shell/",
+                "/Volumes/Projects/blaze/"
+            ),
+            "crates/blaze-shell"
+        );
+        assert_eq!(relative_subpath("/tmp", "/Volumes/Projects/blaze"), "/tmp");
+        assert_eq!(
+            relative_subpath("/Volumes/Projects/blaze-2", "/Volumes/Projects/blaze"),
+            "/Volumes/Projects/blaze-2"
+        );
+        assert_eq!(relative_subpath("/", "/"), ".");
+        assert_eq!(relative_subpath("/tmp/work", "/"), "tmp/work");
+        assert_eq!(relative_subpath("", "/Volumes/Projects/blaze"), "");
+    }
+
+    #[test]
+    fn folder_processes_direct_subfolder_and_deep_descendant_inheritance() {
+        let arena = Inline::<262_144>::new();
+        let erased = Erased::new(&arena);
+        let alloc = erased.handle();
+
+        let mut engine = SysMonEngine::new_in(alloc);
+        let folder = "/Volumes/Projects/blaze";
+
+        // Hierarchy:
+        // 1 (launchd, cwd="/")
+        //  ├─ 100 (zsh, cwd="/Volumes/Projects/blaze") -> direct match, rel_dir="."
+        //  │   └─ 101 (cargo, cwd="/Volumes/Projects/blaze/crates/blaze-shell") -> direct match, rel_dir="crates/blaze-shell"
+        //  │       └─ 102 (rustc-wrapper, cwd="/var/folders/tmp") -> grandchild via_descendant=true, rel_dir="/var/folders/tmp"
+        //  │           └─ 103 (rustc, cwd="/tmp") -> great-grandchild via_descendant=true, rel_dir="/tmp"
+        //  ├─ 200 (other-shell, cwd="/Volumes/Projects/blaze-2") -> MUST NOT match!
+        //  │   └─ 201 (other-child, cwd="/tmp") -> MUST NOT match!
+        let make_snap = |ts: u64, mult: u64| {
+            let mut procs = Vec::new_in(alloc);
+            procs.push(make_proc_with_cwd(alloc, 1, 0, "launchd", "/", "/sbin/launchd", 0, 0, 100, 1));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                100,
+                1,
+                "zsh",
+                "/Volumes/Projects/blaze",
+                "/bin/zsh",
+                10_000_000 * mult,
+                0,
+                200,
+                1,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                101,
+                100,
+                "cargo",
+                "/Volumes/Projects/blaze/crates/blaze-shell",
+                "/usr/bin/cargo",
+                50_000_000 * mult,
+                0,
+                400,
+                4,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                102,
+                101,
+                "rustc-wrapper",
+                "/var/folders/tmp",
+                "/usr/bin/rustc-wrapper",
+                20_000_000 * mult,
+                0,
+                300,
+                2,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                103,
+                102,
+                "rustc",
+                "/tmp",
+                "/usr/bin/rustc",
+                100_000_000 * mult,
+                0,
+                1000,
+                8,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                200,
+                1,
+                "other-zsh",
+                "/Volumes/Projects/blaze-2",
+                "/bin/zsh",
+                300_000_000 * mult,
+                0,
+                5000,
+                1,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                201,
+                200,
+                "other-worker",
+                "/tmp",
+                "/usr/bin/worker",
+                300_000_000 * mult,
+                0,
+                5000,
+                1,
+            ));
+            RawSnapshot {
+                timestamp_ns: ts,
+                cores: Vec::new_in(alloc),
+                mem: RawMemSample::default(),
+                gpu: RawGpuSample::empty_in(alloc),
+                processes: procs,
+                load_avg: [0.0; 3],
+                uptime_secs: 10,
+            }
+        };
+
+        engine.ingest(make_snap(1_000_000_000, 1));
+        engine.ingest(make_snap(2_000_000_000, 2));
+
+        // ProcessRow carries cwd in both tree and flat modes.
+        let zsh_row = engine.rows().iter().find(|r| r.pid == 100).unwrap();
+        assert_eq!(zsh_row.cwd.as_str(), "/Volumes/Projects/blaze");
+        engine.toggle_tree_mode();
+        let cargo_row = engine.rows().iter().find(|r| r.pid == 101).unwrap();
+        assert_eq!(cargo_row.cwd.as_str(), "/Volumes/Projects/blaze/crates/blaze-shell");
+
+        let summary = engine.folder_processes_in(folder, 9999, &[], alloc);
+        assert_eq!(summary.folder.as_str(), folder);
+        assert_eq!(summary.entries.len(), 4);
+
+        // Ordered hottest-first: 103 (10%), 101 (5%), 102 (2%), 100 (1%).
+        assert_eq!(summary.entries[0].pid, 103);
+        assert!(summary.entries[0].via_descendant);
+        assert_eq!(summary.entries[0].rel_dir.as_str(), "/tmp");
+        assert_eq!(summary.entries[0].cwd.as_str(), "/tmp");
+
+        assert_eq!(summary.entries[1].pid, 101);
+        assert!(!summary.entries[1].via_descendant);
+        assert_eq!(summary.entries[1].rel_dir.as_str(), "crates/blaze-shell");
+
+        assert_eq!(summary.entries[2].pid, 102);
+        assert!(summary.entries[2].via_descendant);
+        assert_eq!(summary.entries[2].rel_dir.as_str(), "/var/folders/tmp");
+
+        assert_eq!(summary.entries[3].pid, 100);
+        assert!(!summary.entries[3].via_descendant);
+        assert_eq!(summary.entries[3].rel_dir.as_str(), ".");
+
+        assert_eq!(summary.primary_name.as_str(), "rustc");
+        assert_eq!(summary.total_mem_bytes, 200 + 400 + 300 + 1000);
+        assert!((summary.total_cpu_pct - 18.0).abs() < 1e-3);
+        assert!(!summary.is_hot);
+    }
+
+    #[test]
+    fn folder_processes_shell_pane_attribution_and_alt_screen_propagation() {
+        let arena = Inline::<262_144>::new();
+        let erased = Erased::new(&arena);
+        let alloc = erased.handle();
+
+        let mut engine = SysMonEngine::new_in(alloc);
+        let folder = "/Volumes/Projects/blaze";
+        let own_pid = 50;
+
+        let pane1 = ShellPanePid {
+            pid: 501,
+            pane_id: 1001,
+            block_id: 2001,
+            pane_number: 1,
+            is_alt_screen: true,
+        };
+        let pane2 = ShellPanePid {
+            pid: 502,
+            pane_id: 1002,
+            block_id: 2002,
+            pane_number: 2,
+            is_alt_screen: false,
+        };
+        // Pane 3 belongs to a DIFFERENT folder and must not bleed into `folder`.
+        let pane3 = ShellPanePid {
+            pid: 503,
+            pane_id: 1003,
+            block_id: 2003,
+            pane_number: 3,
+            is_alt_screen: true,
+        };
+
+        let make_snap = |ts: u64, mult: u64| {
+            let mut procs = Vec::new_in(alloc);
+            // Host blaze-shell process itself (must be excluded by own_pid and stop ancestor walk).
+            procs.push(make_proc_with_cwd(
+                alloc,
+                own_pid,
+                1,
+                "blaze-shell",
+                folder,
+                "/Applications/BlazeShell.app/Contents/MacOS/blaze-shell",
+                100_000_000 * mult,
+                0,
+                9000,
+                12,
+            ));
+            // Pane 1 (alt screen, e.g. claude) in folder -> child -> grandchild.
+            procs.push(make_proc_with_cwd(
+                alloc,
+                501,
+                own_pid,
+                "zsh",
+                folder,
+                "/bin/zsh",
+                10_000_000 * mult,
+                0,
+                100,
+                1,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                511,
+                501,
+                "claude",
+                folder,
+                "/usr/local/bin/claude",
+                60_000_000 * mult,
+                0,
+                800,
+                4,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                521,
+                511,
+                "node-worker",
+                "/tmp",
+                "/usr/local/bin/node",
+                40_000_000 * mult,
+                0,
+                500,
+                2,
+            ));
+            // Pane 2 (normal screen) -> cargo -> rustc-wrapper -> rustc (great-grandchild).
+            procs.push(make_proc_with_cwd(
+                alloc,
+                502,
+                own_pid,
+                "zsh",
+                "/Volumes/Projects/blaze/crates",
+                "/bin/zsh",
+                10_000_000 * mult,
+                0,
+                100,
+                1,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                512,
+                502,
+                "cargo",
+                "/Volumes/Projects/blaze/crates",
+                "/usr/bin/cargo",
+                30_000_000 * mult,
+                0,
+                400,
+                4,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                522,
+                512,
+                "rustc-wrapper",
+                "/tmp",
+                "/usr/bin/rustc-wrapper",
+                20_000_000 * mult,
+                0,
+                300,
+                2,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                532,
+                522,
+                "rustc",
+                "/tmp",
+                "/usr/bin/rustc",
+                300_000_000 * mult,
+                0,
+                2000,
+                8,
+            ));
+            // Pane 3 in a different folder, child of own_pid (must NOT inherit own_pid's cwd!).
+            procs.push(make_proc_with_cwd(
+                alloc,
+                503,
+                own_pid,
+                "zsh",
+                "/Volumes/Projects/other",
+                "/bin/zsh",
+                500_000_000 * mult,
+                0,
+                1000,
+                1,
+            ));
+            procs.push(make_proc_with_cwd(
+                alloc,
+                513,
+                503,
+                "vim",
+                "/tmp",
+                "/usr/bin/vim",
+                500_000_000 * mult,
+                0,
+                1000,
+                1,
+            ));
+            RawSnapshot {
+                timestamp_ns: ts,
+                cores: Vec::new_in(alloc),
+                mem: RawMemSample::default(),
+                gpu: RawGpuSample::empty_in(alloc),
+                processes: procs,
+                load_avg: [0.0; 3],
+                uptime_secs: 10,
+            }
+        };
+
+        engine.ingest(make_snap(1_000_000_000, 1));
+        engine.ingest(make_snap(2_000_000_000, 2));
+
+        let summary = engine.folder_processes_in(folder, own_pid, &[pane1, pane2, pane3], alloc);
+
+        // own_pid (50) and Pane 3 (503, 513) must be excluded.
+        assert!(summary.entries.iter().all(|e| e.pid != own_pid));
+        assert!(summary.entries.iter().all(|e| e.pid != 503 && e.pid != 513));
+        assert_eq!(summary.entries.len(), 7);
+
+        // Hottest entry is great-grandchild `rustc` (30% CPU, is_hot=true, Pane 2).
+        assert_eq!(summary.entries[0].pid, 532);
+        assert!(summary.entries[0].is_hot);
+        assert!(summary.entries[0].via_descendant);
+        assert_eq!(summary.entries[0].shell_pane, Some(pane2));
+        assert_eq!(summary.primary_name.as_str(), "rustc");
+
+        // Pane 1's grandchild `node-worker` inherits Pane 1 with `is_alt_screen = true`.
+        let node_worker = summary.entries.iter().find(|e| e.pid == 521).unwrap();
+        assert!(node_worker.via_descendant);
+        assert_eq!(node_worker.shell_pane, Some(pane1));
+        assert!(node_worker.shell_pane.unwrap().is_alt_screen);
+
+        // Pane 1 root itself also carries `Some(pane1)`.
+        let pane1_root = summary.entries.iter().find(|e| e.pid == 501).unwrap();
+        assert!(!pane1_root.via_descendant);
+        assert_eq!(pane1_root.shell_pane, Some(pane1));
+    }
+
+    #[test]
+    fn folder_processes_hot_thresholds_cumulative_hot_and_ordering() {
+        let arena = Inline::<262_144>::new();
+        let erased = Erased::new(&arena);
+        let alloc = erased.handle();
+
+        let folder = "/Volumes/Projects/blaze";
+
+        // Case 1: Cumulative hot folder (no single process >= 25% CPU or >= 15% GPU,
+        //         but 3 processes at 10% CPU each => total_cpu_pct = 30% >= 25%!).
+        let mut engine = SysMonEngine::new_in(alloc);
+        let make_cum_snap = |ts: u64, mult: u64| {
+            let mut procs = Vec::new_in(alloc);
+            procs.push(make_proc_with_cwd(alloc, 10, 1, "w1", folder, "/bin/w1", 100_000_000 * mult, 0, 100, 1));
+            procs.push(make_proc_with_cwd(alloc, 11, 1, "w2", folder, "/bin/w2", 100_000_000 * mult, 0, 500, 1));
+            procs.push(make_proc_with_cwd(alloc, 12, 1, "w3", folder, "/bin/w3", 100_000_000 * mult, 0, 500, 1));
+            RawSnapshot {
+                timestamp_ns: ts,
+                cores: Vec::new_in(alloc),
+                mem: RawMemSample::default(),
+                gpu: RawGpuSample::empty_in(alloc),
+                processes: procs,
+                load_avg: [0.0; 3],
+                uptime_secs: 1,
+            }
+        };
+        engine.ingest(make_cum_snap(1_000_000_000, 1));
+        engine.ingest(make_cum_snap(2_000_000_000, 2));
+
+        let cum = engine.folder_processes_in(folder, 999, &[], alloc);
+        assert_eq!(cum.entries.len(), 3);
+        assert!(cum.entries.iter().all(|e| !e.is_hot));
+        assert!((cum.total_cpu_pct - 30.0).abs() < 1e-3);
+        assert!(cum.is_hot);
+        // Same CPU+GPU (10%): tie-break by mem desc (500 before 100), then pid asc (11 before 12).
+        assert_eq!(cum.entries[0].pid, 11);
+        assert_eq!(cum.entries[1].pid, 12);
+        assert_eq!(cum.entries[2].pid, 10);
+
+        // Case 2: GPU-hot process (0% CPU, 15% GPU => is_hot = true) MUST rank ahead of
+        //         non-hot process with higher CPU+GPU sum (20% CPU + 0% GPU = 20% > 15%)!
+        let mut engine2 = SysMonEngine::new_in(alloc);
+        let make_hot_order_snap = |ts: u64, mult: u64| {
+            let mut procs = Vec::new_in(alloc);
+            // Warm CPU process: 20% CPU, 0% GPU -> NOT hot.
+            procs.push(make_proc_with_cwd(alloc, 20, 1, "warm-cpu", folder, "/bin/a", 200_000_000 * mult, 0, 9000, 1));
+            // Hot GPU process: 0% CPU, 15% GPU -> HOT (gpu >= 15.0).
+            procs.push(make_proc_with_cwd(alloc, 21, 1, "gpu-shader", folder, "/bin/b", 0, 150_000_000 * mult, 100, 1));
+            // Hot CPU process: 25% CPU, 0% GPU -> HOT (cpu >= 25.0).
+            procs.push(make_proc_with_cwd(alloc, 22, 1, "hot-cpu", folder, "/bin/c", 250_000_000 * mult, 0, 100, 1));
+            RawSnapshot {
+                timestamp_ns: ts,
+                cores: Vec::new_in(alloc),
+                mem: RawMemSample::default(),
+                gpu: RawGpuSample::empty_in(alloc),
+                processes: procs,
+                load_avg: [0.0; 3],
+                uptime_secs: 1,
+            }
+        };
+        engine2.ingest(make_hot_order_snap(1_000_000_000, 1));
+        engine2.ingest(make_hot_order_snap(2_000_000_000, 2));
+
+        let ordered = engine2.folder_processes_in(folder, 999, &[], alloc);
+        assert!(ordered.is_hot);
+        assert_eq!(ordered.entries.len(), 3);
+        // Hot entries first: hot-cpu (25%) > gpu-shader (15%), then non-hot warm-cpu (20%).
+        assert_eq!(ordered.entries[0].pid, 22);
+        assert!(ordered.entries[0].is_hot);
+        assert_eq!(ordered.entries[1].pid, 21);
+        assert!(ordered.entries[1].is_hot);
+        assert_eq!(ordered.entries[2].pid, 20);
+        assert!(!ordered.entries[2].is_hot);
+        assert_eq!(ordered.primary_name.as_str(), "hot-cpu");
+
+        // Empty folder returns empty summary safely.
+        let empty = engine2.folder_processes_in("", 999, &[], alloc);
+        assert!(empty.entries.is_empty());
+        assert!(!empty.is_hot);
+        assert_eq!(empty.primary_name.as_str(), "");
     }
 }

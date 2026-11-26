@@ -117,7 +117,7 @@ pub struct GitStatusSummary {
 }
 
 /// Snapshot of prompt metadata captured at block submission and displayed live in the composer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PromptInfo {
     /// Machine hostname (local laptop or remote server over SSH/BSH1).
     pub host: String,
@@ -145,6 +145,8 @@ pub struct PromptInfo {
     pub project_icons: Vec<&'static str>,
     /// Detailed project markers `(icon_name, toolchain_name, marker_file)` for hover inspection.
     pub project_details: Vec<(&'static str, &'static str, &'static str)>,
+    /// Live processes running in `cwd`, subfolders, and descendants (updated asynchronously).
+    pub folder_procs: crate::sysmon_driver::FolderProcSnapshot,
     pub last_exit: i32,
     pub last_duration_ms: u64,
 }
@@ -213,6 +215,7 @@ impl PromptInfo {
             in_rust_project,
             project_icons,
             project_details,
+            folder_procs: crate::sysmon_driver::FolderProcSnapshot::default(),
             last_exit,
             last_duration_ms,
         };

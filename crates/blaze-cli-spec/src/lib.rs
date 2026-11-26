@@ -21,6 +21,7 @@
 extern crate std;
 
 pub mod codec;
+pub mod explain;
 pub mod help_parser;
 pub mod man_parser;
 pub mod manual;

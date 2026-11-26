@@ -191,6 +191,133 @@ pub fn parse_man_output_in<'a>(cmd: &str, raw: &str, alloc: Alloc<'a>) -> CliSpe
     spec
 }
 
+/// Extract a clean one-line summary from the `NAME` section of a formatted `man` page.
+///
+/// Strips ANSI escapes and BSD overstrikes, locates the `NAME` / `Name` section header, joins
+/// wrapped lines until the next blank line or ALL-CAPS section header, takes the text after a
+/// dash separator (` - `, ` -- `, ` – `, ` — `, ` ‐ `, ` − `) if present, and truncates cleanly
+/// to at most 220 UTF-8 bytes on a char boundary.
+pub fn parse_man_summary_in<'a>(src: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
+    const MAX_SUMMARY_BYTES: usize = 220;
+
+    let clean = strip_ansi_and_overstrike_in(src, alloc);
+    let mut lines = clean.as_str().lines();
+
+    let mut name_indent = None;
+    for raw_line in lines.by_ref() {
+        let trimmed = raw_line.trim();
+        if trimmed == "NAME" || trimmed == "Name" {
+            name_indent = Some(raw_line.len() - raw_line.trim_start_matches([' ', '\t']).len());
+            break;
+        }
+    }
+    let name_indent = name_indent?;
+
+    let mut joined = String::new_in(alloc);
+    for raw_line in lines {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            if !joined.as_str().is_empty() {
+                break;
+            }
+            continue;
+        }
+        let indent = raw_line.len() - raw_line.trim_start_matches([' ', '\t']).len();
+        if is_all_caps_section_header(trimmed, indent, name_indent) {
+            break;
+        }
+        if !joined.as_str().is_empty() {
+            joined.push(' ');
+        }
+        push_collapsed_ws(&mut joined, trimmed);
+    }
+
+    let full = joined.as_str().trim();
+    if full.is_empty() {
+        return None;
+    }
+
+    let after_sep = extract_after_dash_sep(full).trim();
+    let chosen = if after_sep.is_empty() { full } else { after_sep };
+    let truncated = truncate_utf8_bytes(chosen, MAX_SUMMARY_BYTES).trim_end();
+    if truncated.is_empty() {
+        return None;
+    }
+    Some(String::from_str_in(truncated, alloc))
+}
+
+fn is_all_caps_section_header(trimmed: &str, indent: usize, header_indent: usize) -> bool {
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return false;
+    }
+    if trimmed.contains(" - ")
+        || trimmed.contains(" -- ")
+        || trimmed.contains(" \u{2013} ")
+        || trimmed.contains(" \u{2014} ")
+    {
+        return false;
+    }
+    let all_caps = trimmed.chars().any(|c| c.is_ascii_uppercase())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, ' ' | '-' | '_'));
+    all_caps && indent <= header_indent
+}
+
+fn push_collapsed_ws(out: &mut AString<'_>, s: &str) {
+    let mut prev_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+}
+
+fn extract_after_dash_sep(s: &str) -> &str {
+    const SEPS: &[&str] = &[
+        " -- ",
+        " - ",
+        " \u{2013} ",
+        " \u{2014} ",
+        " \u{2010} ",
+        " \u{2212} ",
+    ];
+    let mut best: Option<(usize, usize)> = None;
+    for sep in SEPS {
+        if let Some(pos) = s.find(sep) {
+            let take = match best {
+                None => true,
+                Some((best_pos, best_len)) => pos < best_pos || (pos == best_pos && sep.len() > best_len),
+            };
+            if take {
+                best = Some((pos, sep.len()));
+            }
+        }
+    }
+    if let Some((pos, len)) = best {
+        &s[pos + len..]
+    } else {
+        s
+    }
+}
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn split_shell_words_in<'a>(line: &str, alloc: Alloc<'a>) -> AVec<'a, AString<'a>> {
     let mut out = Vec::new_in(alloc);
     let mut cur = String::new_in(alloc);
@@ -230,11 +357,15 @@ fn split_shell_words_in<'a>(line: &str, alloc: Alloc<'a>) -> AVec<'a, AString<'a
 
 #[cfg(test)]
 mod tests {
+    use blaze_own::{Erased, Inline};
+
     use super::*;
 
     #[test]
     fn parses_fish_and_man_no_std() {
-        let alloc = Alloc::global();
+        let buf = Inline::<32768>::new();
+        let erased = Erased::new(&buf);
+        let alloc = erased.handle();
         let fish = r#"
 complete -c fd -s H -l hidden -d 'Search hidden files and directories'
 complete -c fd -s I -l no-ignore -d 'Do not respect .(git|fd)ignore files'
@@ -248,5 +379,62 @@ complete -c fd -s I -l no-ignore -d 'Do not respect .(git|fd)ignore files'
         let mspec = parse_man_output_in("ls", man, alloc);
         assert!(mspec.flags.iter().any(|f| f.short.as_ref().map(AString::as_str) == Some("-a")));
         assert!(mspec.flags.iter().any(|f| f.short.as_ref().map(AString::as_str) == Some("-l")));
+    }
+
+    #[test]
+    fn parse_man_summary_bsd_overstrike_and_wrapped() {
+        let buf = Inline::<32768>::new();
+        let erased = Erased::new(&buf);
+        let alloc = erased.handle();
+
+        // BSD mandoc overstrike: bold NAME and bold command name + wrapped description.
+        let bsd = concat!(
+            "LS(1)                     General Commands Manual                    LS(1)\n\n",
+            "N\x08NA\x08AM\x08ME\x08E\n",
+            "     l\x08ls\x08s -- list directory\n",
+            "     contents with metadata\n\n",
+            "S\x08SY\x08YN\x08NO\x08OP\x08PS\x08SI\x08IS\x08S\n",
+            "     ls [-ABCFGHILPRSTUWZadfgklmnpqrstux1] [file ...]\n",
+        );
+        let summary = parse_man_summary_in(bsd, alloc).expect("summary");
+        assert_eq!(summary.as_str(), "list directory contents with metadata");
+    }
+
+    #[test]
+    fn parse_man_summary_separators_sections_and_truncation() {
+        let buf = Inline::<32768>::new();
+        let erased = Erased::new(&buf);
+        let alloc = erased.handle();
+
+        // ANSI colored header + em-dash + immediate SYNOPSIS without blank line
+        let ansi = "\x1b[1mName\x1b[0m\n     git-log \u{2014} Show commit logs\nSYNOPSIS\n     git log\n";
+        let summary = parse_man_summary_in(ansi, alloc).expect("summary");
+        assert_eq!(summary.as_str(), "Show commit logs");
+
+        // En-dash separator
+        let en = "NAME\n     rg \u{2013} recursively search the current directory for lines matching a pattern\n\nDESCRIPTION\n";
+        let s2 = parse_man_summary_in(en, alloc).expect("en-dash summary");
+        assert_eq!(
+            s2.as_str(),
+            "recursively search the current directory for lines matching a pattern"
+        );
+
+        // No dash separator returns full trimmed line
+        let plain = "NAME\n     standalone summary line without dashes\n\nDESCRIPTION\n";
+        let s3 = parse_man_summary_in(plain, alloc).expect("plain summary");
+        assert_eq!(s3.as_str(), "standalone summary line without dashes");
+
+        // Missing NAME section returns None
+        assert!(parse_man_summary_in("SYNOPSIS\n     foo [bar]\n", alloc).is_none());
+
+        // Long UTF-8 summary truncates cleanly to <= 220 bytes on a char boundary
+        let mut long_page = String::from_str_in("NAME\n     tool - ", alloc);
+        for _ in 0..80 {
+            long_page.push_str("\u{00e9}abc"); // 5 bytes each -> 400 bytes
+        }
+        long_page.push_str("\n\nDESCRIPTION\n");
+        let s4 = parse_man_summary_in(long_page.as_str(), alloc).expect("truncated");
+        assert!(s4.as_str().len() <= 220);
+        assert!(s4.as_str().len() >= 215);
     }
 }

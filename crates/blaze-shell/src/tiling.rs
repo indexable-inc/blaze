@@ -315,6 +315,21 @@ impl TileManager {
         }
     }
 
+    /// Focus `pane` even if it lives in a different workspace tab, switching tabs and unzooming as needed.
+    pub fn focus_pane_anywhere(&mut self, pane: PaneId) -> bool {
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.root.contains(pane) {
+                self.active_tab = idx;
+                if tab.focused != pane {
+                    tab.zoomed = false;
+                }
+                tab.focused = pane;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Cycle focus to next/previous pane in tree order (`Cmd+]` / `Cmd+[`).
     pub fn cycle_pane(&mut self, delta: isize) -> Option<PaneId> {
         let tab = &mut self.tabs[self.active_tab];
