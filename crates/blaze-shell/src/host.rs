@@ -516,21 +516,31 @@ fn run_fs_op(op: &FsOp<'_>, cwd: &str, home: &str) -> Result<(), String> {
             fs::rename(&s, &target)
                 .map_err(|e| format!("mv `{}` -> `{}`: {e}", s.display(), target.display()))
         }
-        FsOp::Rm { path, recursive, force } => {
+        FsOp::Rm { path, recursive, force, permanent } => {
             let p = resolve_path(path.as_str(), cwd, home);
-            if !p.exists() {
-                return if *force {
-                    Ok(())
-                } else {
-                    Err(format!("rm: `{}`: not found", p.display()))
-                };
-            }
-            if p.is_dir() {
-                if *recursive {
-                    fs::remove_dir_all(&p).map_err(|e| format!("rm `{}`: {e}", p.display()))
-                } else {
-                    fs::remove_dir(&p).map_err(|e| format!("rm `{}`: {e}", p.display()))
+            let meta = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return if *force {
+                        Ok(())
+                    } else {
+                        Err(format!("rm: `{}`: not found", p.display()))
+                    };
                 }
+                Err(e) => return Err(format!("rm `{}`: {e}", p.display())),
+            };
+            let is_dir = meta.file_type().is_dir();
+            if is_dir && !*recursive {
+                return Err(format!("rm: `{}`: is a directory; pass -r", p.display()));
+            }
+            #[cfg(target_os = "macos")]
+            if !*permanent {
+                return move_to_macos_trash(&p, is_dir).map(|_| ());
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = permanent;
+            if is_dir {
+                fs::remove_dir_all(&p).map_err(|e| format!("rm `{}`: {e}", p.display()))
             } else {
                 fs::remove_file(&p).map_err(|e| format!("rm `{}`: {e}", p.display()))
             }
@@ -553,6 +563,36 @@ fn run_fs_op(op: &FsOp<'_>, cwd: &str, home: &str) -> Result<(), String> {
                 .map_err(|e| format!("touch `{}`: {e}", p.display()))
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn move_to_macos_trash(path: &Path, is_dir: bool) -> Result<Option<PathBuf>, String> {
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+
+    let Some(path_str) = path.to_str() else {
+        return Err(format!(
+            "rm: `{}`: non-UTF-8 path cannot be moved to macOS Trash (pass -P/--permanent to delete)",
+            path.display()
+        ));
+    };
+    autoreleasepool(|_| {
+        let ns_path = NSString::from_str(path_str);
+        let url = NSURL::fileURLWithPath_isDirectory(&ns_path, is_dir);
+        let fm = NSFileManager::defaultManager();
+        let mut resulting: Option<Retained<NSURL>> = None;
+        fm.trashItemAtURL_resultingItemURL_error(&url, Some(&mut resulting))
+            .map_err(|err| {
+                format!(
+                    "rm (trash) `{}`: {err} (pass -P/--permanent to delete permanently)",
+                    path.display()
+                )
+            })?;
+        let trashed = resulting
+            .and_then(|u| u.path())
+            .map(|p| PathBuf::from(p.to_string()));
+        Ok(trashed)
+    })
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
@@ -1043,4 +1083,120 @@ fn run_external_captured(
         chunks,
         interactive: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "blaze_shell_rm_{tag}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).expect("create temp test dir");
+        dir
+    }
+
+    #[test]
+    fn rm_missing_respects_force_and_dir_requires_recursive() {
+        let dir = unique_temp_dir("flags");
+        let sub = dir.join("subdir");
+        fs::create_dir(&sub).expect("create subdir");
+        let cwd = dir.to_str().expect("utf8 cwd");
+        let alloc = Alloc::global();
+
+        // Missing file without -f fails.
+        let op_missing = FsOp::Rm {
+            path: AString::from_str_in("nope.txt", alloc),
+            recursive: false,
+            force: false,
+            permanent: true,
+        };
+        let err = run_fs_op(&op_missing, cwd, "").expect_err("missing must fail");
+        assert!(err.contains("not found"), "unexpected err: {err}");
+
+        // Missing file with -f succeeds silently (both Trash and permanent).
+        let op_force = FsOp::Rm {
+            path: AString::from_str_in("nope.txt", alloc),
+            recursive: false,
+            force: true,
+            permanent: false,
+        };
+        run_fs_op(&op_force, cwd, "").expect("-f on missing must succeed");
+
+        // Directory without -r fails with `is a directory; pass -r`.
+        let op_dir = FsOp::Rm {
+            path: AString::from_str_in("subdir", alloc),
+            recursive: false,
+            force: false,
+            permanent: false,
+        };
+        let dir_err = run_fs_op(&op_dir, cwd, "").expect_err("dir without -r must fail");
+        assert!(
+            dir_err.contains("is a directory; pass -r"),
+            "unexpected err: {dir_err}"
+        );
+        assert!(sub.exists(), "subdir must not have been deleted");
+
+        // Directory with -r and --permanent deletes permanently.
+        let op_dir_perm = FsOp::Rm {
+            path: AString::from_str_in("subdir", alloc),
+            recursive: true,
+            force: false,
+            permanent: true,
+        };
+        run_fs_op(&op_dir_perm, cwd, "").expect("-r -P must remove dir");
+        assert!(!sub.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_permanent_deletes_file() {
+        let dir = unique_temp_dir("perm");
+        let file = dir.join("gone.txt");
+        fs::write(&file, b"bye").expect("write test file");
+        let cwd = dir.to_str().expect("utf8 cwd");
+        let alloc = Alloc::global();
+
+        let op = FsOp::Rm {
+            path: AString::from_str_in("gone.txt", alloc),
+            recursive: false,
+            force: false,
+            permanent: true,
+        };
+        run_fs_op(&op, cwd, "").expect("permanent rm must succeed");
+        assert!(!file.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rm_default_moves_to_macos_trash_and_cleans_up() {
+        let dir = unique_temp_dir("trash");
+        let file = dir.join("trash_me.txt");
+        fs::write(&file, b"recoverable").expect("write test file");
+
+        let trashed = move_to_macos_trash(&file, false)
+            .expect("NSFileManager::trashItemAtURL should succeed");
+        assert!(!file.exists(), "source file should be moved out of original dir");
+        if let Some(ref trashed_path) = trashed {
+            assert!(
+                trashed_path.exists(),
+                "trashed item should exist at {}",
+                trashed_path.display()
+            );
+            // Clean up test file from Trash so unit tests leave no clutter.
+            let _ = fs::remove_file(trashed_path);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

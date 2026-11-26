@@ -227,6 +227,7 @@ pub enum HitAction {
     ToggleFold(BlockId),
     ToggleTableView(BlockId),
     ToggleHiddenCols(BlockId),
+    TogglePtyFullscreen,
     SortTableColumn { block: BlockId, col: usize },
     ResizeTableColumn { block: BlockId, col: usize, col_x0: i32 },
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
@@ -297,7 +298,11 @@ pub enum HoverKind {
     Tooltip { title: String, subtitle: Option<String> },
     Directory { cwd: String },
     GitBranch { current: String, branches: Vec<String> },
-    GitChanges { files: Vec<(String, &'static str, &'static str)>, total: u32 },
+    GitChanges {
+        files: Vec<(String, &'static str, &'static str)>,
+        details: Vec<crate::prompt::ChangedFileDetail>,
+        total: u32,
+    },
     GitStashes {
         stashes: Vec<String>,
         entries: Vec<crate::prompt::GitStashEntry>,

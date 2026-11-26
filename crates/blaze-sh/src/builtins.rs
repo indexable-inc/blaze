@@ -29,6 +29,12 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
         flags: &["-a", "--all", "-l", "--long"],
     },
     BuiltinSpec {
+        name: "tree",
+        signature: "tree [path] [-L|--depth <n>] [-a|--all] [-d|--dirs-only]",
+        summary: "List directory hierarchy as a structured table with tree connectors, sizes, and modified times",
+        flags: &["-L", "--depth", "-a", "--all", "-d", "--dirs-only"],
+    },
+    BuiltinSpec {
         name: "cd",
         signature: "cd [path]",
         summary: "Change the current working directory",
@@ -66,9 +72,9 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
     },
     BuiltinSpec {
         name: "rm",
-        signature: "rm [-r|--recursive] [-f|--force] <path>...",
-        summary: "Remove one or more files or directories",
-        flags: &["-r", "--recursive", "-f", "--force"],
+        signature: "rm [-r|-f|-P|--permanent] <path>...",
+        summary: "Move files or directories to macOS Trash by default (pass -P/--permanent to delete permanently)",
+        flags: &["-r", "--recursive", "-f", "--force", "-P", "--permanent"],
     },
     BuiltinSpec {
         name: "mkdir",
@@ -1511,6 +1517,7 @@ pub(crate) fn dispatch_builtin<'a>(
     let val = match head {
         // FS & OS
         "ls" => builtin_ls(eval, args, span)?,
+        "tree" => builtin_tree(eval, args, span)?,
         "cd" => builtin_cd(eval, args, span)?,
         "pwd" => Value::Path { path: eval.state().cwd.share(), kind: crate::value::PathKind::Dir },
         "open" => builtin_open(eval, args, span)?,
@@ -1711,6 +1718,188 @@ fn builtin_ls<'a>(
         }
     }
     Ok(Value::Table(table))
+}
+
+const TREE_DEFAULT_DEPTH: usize = 3;
+const TREE_MIN_DEPTH: i64 = 1;
+const TREE_MAX_DEPTH: i64 = 8;
+const TREE_MAX_ENTRIES: usize = 500;
+
+struct TreeWalkCtx<'a> {
+    table: Table<'a>,
+    max_depth: usize,
+    show_hidden: bool,
+    dirs_only: bool,
+    span: Span,
+}
+
+fn builtin_tree<'a>(
+    eval: &mut Evaluator<'a, '_>,
+    mut args: EvalArgs<'a>,
+    span: Span,
+) -> Result<Value<'a>, Control<'a>> {
+    let alloc = eval.alloc();
+    let show_hidden = args.has_flag("all", "a");
+    let dirs_only = args.has_flag("dirs-only", "d");
+    let max_depth = if let Some(val) = args.take_flag_value("depth", "L") {
+        let n = match &val {
+            Value::Int(n) => *n,
+            Value::String(s) => s.as_ref().parse::<i64>().map_err(|_| {
+                Control::Error(ShellError::new(
+                    ErrorKind::Type,
+                    span,
+                    "expected integer for `-L`/`--depth`",
+                    alloc,
+                ))
+            })?,
+            _ => require_int(&val, "depth", span, alloc).map_err(Control::Error)?,
+        };
+        n.clamp(TREE_MIN_DEPTH, TREE_MAX_DEPTH) as usize
+    } else if args.has_flag("depth", "L") {
+        return Err(arity_err("tree", "`-L`/`--depth` requires an integer depth", span, alloc));
+    } else {
+        TREE_DEFAULT_DEPTH
+    };
+
+    let cwd = eval.state().cwd.share();
+    let home = eval.state().get_env("HOME").map(|s| AString::from_str_in(s, alloc));
+    let root_abs = if let Some((v, s)) = args.pos.first() {
+        let raw = require_string(v, "path", *s, alloc).map_err(Control::Error)?;
+        resolve_path(cwd.as_ref(), raw.as_str(), home.as_ref().map(|h| h.as_str()), alloc)
+    } else {
+        AString::from_str_in(cwd.as_ref(), alloc)
+    };
+
+    let mut table = Table::from_col_names(
+        &["name", "size", "modified", "type", "path", "tree_prefix", "depth"],
+        alloc,
+    );
+    table.default_grid = false;
+    table.set_col_display("name", crate::value::ColDisplay::TreeEntry);
+    table.set_col_display("size", crate::value::ColDisplay::FileSize);
+    table.set_col_display("modified", crate::value::ColDisplay::HumanTime);
+    table.hide_col_by_name("type");
+    table.hide_col_by_name("path");
+    table.hide_col_by_name("tree_prefix");
+    table.hide_col_by_name("depth");
+
+    let mut ctx = TreeWalkCtx { table, max_depth, show_hidden, dirs_only, span };
+    tree_walk(eval, &mut ctx, root_abs.as_str(), "", "", 0)?;
+    Ok(Value::Table(ctx.table))
+}
+
+fn tree_walk<'a>(
+    eval: &mut Evaluator<'a, '_>,
+    ctx: &mut TreeWalkCtx<'a>,
+    dir_abs: &str,
+    dir_rel: &str,
+    ancestor_prefix: &str,
+    depth: usize,
+) -> Result<(), Control<'a>> {
+    if ctx.table.nrows() >= TREE_MAX_ENTRIES {
+        return Ok(());
+    }
+    let alloc = eval.alloc();
+    let ans = eval.request(
+        Request::ReadDir {
+            path: AString::from_str_in(dir_abs, alloc),
+            show_hidden: ctx.show_hidden,
+        },
+        ctx.span,
+    )?;
+    let Answer::DirEntries(entries) = ans else {
+        return Err(Control::Error(ShellError::new(
+            ErrorKind::Io,
+            ctx.span,
+            "unexpected host answer for `tree`",
+            alloc,
+        )));
+    };
+
+    let mut order: AVec<'a, usize> = AVec::with_capacity_in(entries.len(), alloc);
+    for (i, e) in entries.iter().enumerate() {
+        if !ctx.show_hidden && e.name.as_str().starts_with('.') {
+            continue;
+        }
+        if ctx.dirs_only && !matches!(e.kind, crate::protocol::FileKind::Dir) {
+            continue;
+        }
+        order.push(i);
+    }
+    order.sort_unstable_by(|&a, &b| {
+        let ea = &entries[a];
+        let eb = &entries[b];
+        let da = !matches!(ea.kind, crate::protocol::FileKind::Dir);
+        let db = !matches!(eb.kind, crate::protocol::FileKind::Dir);
+        da.cmp(&db).then_with(|| {
+            ea.name
+                .as_bytes()
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .cmp(eb.name.as_bytes().iter().map(u8::to_ascii_lowercase))
+                .then_with(|| ea.name.as_str().cmp(eb.name.as_str()))
+        })
+    });
+
+    let total = order.len();
+    for (pos, &idx) in order.iter().enumerate() {
+        if ctx.table.nrows() >= TREE_MAX_ENTRIES {
+            break;
+        }
+        eval.charge(1, ctx.span)?;
+        let e = &entries[idx];
+        let is_last = pos + 1 == total;
+        let is_dir = matches!(e.kind, crate::protocol::FileKind::Dir);
+
+        let mut rel = AString::with_capacity_in(dir_rel.len() + 1 + e.name.len(), alloc);
+        if !dir_rel.is_empty() {
+            rel.push_str(dir_rel);
+            rel.push('/');
+        }
+        rel.push_str(e.name.as_str());
+
+        let connector = if is_last { "└── " } else { "├── " };
+        let mut prefix = AString::with_capacity_in(ancestor_prefix.len() + connector.len(), alloc);
+        prefix.push_str(ancestor_prefix);
+        prefix.push_str(connector);
+
+        let type_str = e.analysis.as_ref().map(|a| a.as_str()).unwrap_or(e.kind.as_str());
+        let row = [
+            Value::string(e.name.as_str(), alloc),
+            Value::Size(e.size),
+            Value::Date(e.modified),
+            Value::string(type_str, alloc),
+            Value::string(rel.as_str(), alloc),
+            Value::string(prefix.as_str(), alloc),
+            Value::Int(depth as i64),
+        ];
+        ctx.table.push_row_values(&row);
+
+        if is_dir && depth + 1 < ctx.max_depth && ctx.table.nrows() < TREE_MAX_ENTRIES {
+            let mut child_abs = AString::with_capacity_in(dir_abs.len() + 1 + e.name.len(), alloc);
+            child_abs.push_str(dir_abs);
+            if !dir_abs.ends_with('/') {
+                child_abs.push('/');
+            }
+            child_abs.push_str(e.name.as_str());
+
+            let next_seg = if is_last { "    " } else { "│   " };
+            let mut next_ancestor =
+                AString::with_capacity_in(ancestor_prefix.len() + next_seg.len(), alloc);
+            next_ancestor.push_str(ancestor_prefix);
+            next_ancestor.push_str(next_seg);
+
+            tree_walk(
+                eval,
+                ctx,
+                child_abs.as_str(),
+                rel.as_str(),
+                next_ancestor.as_str(),
+                depth + 1,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn builtin_cd<'a>(
@@ -1976,9 +2165,13 @@ fn builtin_rm<'a>(
     }
     let recursive = args.has_flag("recursive", "r");
     let force = args.has_flag("force", "f");
+    let permanent = args.has_flag("permanent", "P");
     for (v, s) in args.pos.iter() {
         let path = resolve_arg_path(eval, v, *s)?;
-        let _ = eval.request(Request::FsOp(FsOp::Rm { path, recursive, force }), *s)?;
+        let _ = eval.request(
+            Request::FsOp(FsOp::Rm { path, recursive, force, permanent }),
+            *s,
+        )?;
     }
     Ok(Value::Nothing)
 }

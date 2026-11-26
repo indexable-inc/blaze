@@ -52,7 +52,7 @@ pub enum ExternalMode {
 pub enum FsOp<'a> {
     Cp { src: AString<'a>, dst: AString<'a>, recursive: bool },
     Mv { src: AString<'a>, dst: AString<'a> },
-    Rm { path: AString<'a>, recursive: bool, force: bool },
+    Rm { path: AString<'a>, recursive: bool, force: bool, permanent: bool },
     Mkdir { path: AString<'a>, parents: bool },
     Touch { path: AString<'a> },
 }
