@@ -108,11 +108,25 @@ impl OnDir {
         let cap = len.checked_add(1).ok_or(FilesError::Stopped { name: *name })?;
         let mut bytes = AVec::with_capacity_in(cap, alloc);
         bytes.resize(cap, 0u8);
-        let read = file.read_into(bytes.as_mut_slice(), 0).wait(&cx).map_err(FilesError::Effect)?;
-        if read > len {
+        // Loop until `cap` (`len + 1`, proving file growth) or a zero-length read proves true EOF
+        // so short positional reads on FUSE/network filesystems never truncate a valid record and
+        // trigger a false corruption repair.
+        let mut filled = 0usize;
+        while filled < cap {
+            let step_off = u64::try_from(filled).map_err(|_| FilesError::Stopped { name: *name })?;
+            let Some(dst) = bytes.as_mut_slice().get_mut(filled..) else {
+                break;
+            };
+            let n = file.read_into(dst, step_off).wait(&cx).map_err(FilesError::Effect)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled > len {
             return Err(FilesError::OtherBytes { name: *name });
         }
-        bytes.truncate(read);
+        bytes.truncate(filled);
         let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else {
             return Ok(None);
         };

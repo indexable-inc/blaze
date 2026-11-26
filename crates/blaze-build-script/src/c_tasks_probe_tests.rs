@@ -557,10 +557,26 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         &b"const char *f = __FILE__;\n"[..],
         &b"const char *f = __BASE_FILE__;\n"[..],
         &b"const char *f = __FILE_NAME__;\n"[..],
+        &b"const char *f = __builtin_FILE();\n"[..],
+        &b"const char *f = __builtin_FILE_NAME();\n"[..],
     ] {
         let mut bad_bytes = |rel: &str| (rel == "flag_check.c").then_some(bad_src);
         assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut bad_bytes, alloc).is_err());
     }
+
+    // A package named `asm` in OUT_DIR must NOT be falsely rejected by macro-token scanning.
+    let asm_out = "/target/debug/build/asm-1234/out";
+    let asm_args = ["-c", "-Wall", "-o", "/target/debug/build/asm-1234/out/flag_check", "/target/debug/build/asm-1234/out/flag_check.c"];
+    let sp_asm_pkg = Spawn { program: "cc", args: &asm_args, env: ENV, out_dir: asm_out, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    assert!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_asm_pkg, files, alloc).is_ok(), "package named `asm` must be allowed");
+
+    // Only the exact cc-rs flag-check shape (`-c -o <dir>/flag_check <dir>/flag_check.<ext>`) is
+    // routed as a probe; custom builds compiling another source or linking `-o .../flag_check`
+    // stay on the normal compiler route so their output file is preserved.
+    assert!(is_probe("cc", &asm_args));
+    assert!(!is_probe("cc", &["-c", "-o", "/out/flag_check", "/out/real_code.c"]));
+    assert!(!is_probe("cc", &["-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-o", "/out/flag_check", "/out/flag_check.c", "/out/extra.c"]));
 
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");

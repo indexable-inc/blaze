@@ -185,16 +185,59 @@ fn is_header_search_flag(arg: &str) -> bool {
     false
 }
 
+/// Matches the exact `cc-rs` `is_flag_supported` probe shape: compile-only (`-c`), writing
+/// `-o <dir>/flag_check` with ONLY the companion `<dir>/flag_check.<c-ext>` source input in the
+/// same directory so custom build scripts that happen to name a real object/binary `flag_check`
+/// stay on the normal compiler route and preserve their output file.
+fn is_flag_check_probe(args: &[&str]) -> bool {
+    if !args.contains(&"-c") {
+        return false;
+    }
+    let mut out_path: Option<&str> = None;
+    for pair in args.windows(2) {
+        if pair[0] == "-o" && name_of(pair[1]) == "flag_check" {
+            out_path = Some(pair[1]);
+            break;
+        }
+    }
+    let Some(out_path) = out_path else {
+        return false;
+    };
+    let mut saw_flag_src = false;
+    let mut skip_next = false;
+    for &arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if flag_takes_value(arg) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        let is_companion = arg
+            .strip_prefix(out_path)
+            .is_some_and(|ext| matches!(ext, ".c" | ".cpp" | ".cc" | ".cxx" | ".m" | ".mm"));
+        if !is_companion {
+            return false;
+        }
+        saw_flag_src = true;
+    }
+    saw_flag_src
+}
+
 /// Whether the spawn of `program` with `args` is a compiler probe, from its text alone: a C
-/// compiler asked `-?`, writing `-o …/flag_check` (cc's `is_flag_supported`), or running
-/// cc-rs's zero-header compiler-family detection (`cc -E …detect_compiler_family.c` with no
-/// header-search flags). Real preprocessing jobs (`cc -E /package/src.c`) are NOT probes and
-/// stay on the deferred/build C route.
+/// compiler asked `-?`, running `cc-rs`'s `is_flag_supported` (`-c -o <dir>/flag_check
+/// <dir>/flag_check.<c-ext>`), or running `cc-rs`'s zero-header compiler-family detection
+/// (`cc -E …detect_compiler_family.c` with no header-search flags). Real preprocessing or
+/// compile jobs stay on the deferred/build C route.
 pub fn is_probe(program: &str, args: &[&str]) -> bool {
     if !COMPILERS.contains(&name_of(program)) {
         return false;
     }
-    if args.contains(&"-?") || args.windows(2).any(|pair| pair[0] == "-o" && name_of(pair[1]) == "flag_check") {
+    if args.contains(&"-?") || is_flag_check_probe(args) {
         return true;
     }
     args.contains(&"-E")
@@ -607,6 +650,8 @@ fn contains_disallowed_probe_token(text: &str) -> bool {
         || contains_ident(text, "__FILE__")
         || contains_ident(text, "__BASE_FILE__")
         || contains_ident(text, "__FILE_NAME__")
+        || contains_ident(text, "__builtin_FILE")
+        || contains_ident(text, "__builtin_FILE_NAME")
         || contains_ident(text, "asm")
         || contains_ident(text, "__asm")
         || contains_ident(text, "__asm__")
@@ -864,22 +909,28 @@ pub fn canonicalize<'b, 's>(
     let mut prev_flag: Option<&str> = None;
     for (idx, &arg) in spawn.args.iter().enumerate() {
         let next = spawn.args.get(idx + 1).copied();
-        let masked_arg = mask_quoted_literals(arg, alloc);
-        let masked = masked_arg.as_str();
-        if is_host_dependent_flag(arg, next) || contains_ident(masked, "__TIMESTAMP__") {
+        if is_host_dependent_flag(arg, next) {
             has_host_dep_arg = true;
             break;
         }
         if let Some(prev) = prev_flag.take() {
-            // Reject nested response files (e.g. `-Xassembler @args.rsp`), assembler language
-            // selection (`-x assembler`), and preprocessor/pragma/filename/asm macro tokens in
-            // `-D` values (`-D CAT(a,b)=a##b`, `-D READ=_Pragma(...)`). Only `-o` may carry an
-            // `OUT_DIR` path; any other flag taking a separate value with a path separator
-            // (e.g. `-L /host/lib`) is refused as an unkeyed external input.
-            if arg.starts_with('@')
-                || is_assembler_input_or_lang(arg, Some(prev))
-                || contains_disallowed_probe_token(masked)
-            {
+            if prev == "-D" {
+                let masked_arg = mask_quoted_literals(arg, alloc);
+                let masked = masked_arg.as_str();
+                if contains_ident(masked, "__TIMESTAMP__") {
+                    has_host_dep_arg = true;
+                    break;
+                }
+                if contains_disallowed_probe_token(masked) {
+                    has_arg_package_input = true;
+                    break;
+                }
+            }
+            // Reject nested response files (e.g. `-Xassembler @args.rsp`) and assembler language
+            // selection (`-x assembler`). Only `-o` may carry an `OUT_DIR` path; any other flag
+            // taking a separate value with a path separator (e.g. `-L /host/lib`) is refused as
+            // an unkeyed external input.
+            if arg.starts_with('@') || is_assembler_input_or_lang(arg, Some(prev)) {
                 has_arg_package_input = true;
                 break;
             }
@@ -894,10 +945,23 @@ pub fn canonicalize<'b, 's>(
             }
             continue;
         }
+        if let Some(macro_def) = arg.strip_prefix("-D")
+            && !macro_def.is_empty()
+        {
+            let masked_arg = mask_quoted_literals(macro_def, alloc);
+            let masked = masked_arg.as_str();
+            if contains_ident(masked, "__TIMESTAMP__") {
+                has_host_dep_arg = true;
+                break;
+            }
+            if contains_disallowed_probe_token(masked) {
+                has_arg_package_input = true;
+                break;
+            }
+        }
         if is_header_search_flag(arg)
             || arg.starts_with('@')
             || is_assembler_input_or_lang(arg, None)
-            || contains_disallowed_probe_token(masked)
             || (!spawn.mount.is_empty() && arg.contains(spawn.mount) && !is_prefix_map_flag(arg))
         {
             has_arg_package_input = true;

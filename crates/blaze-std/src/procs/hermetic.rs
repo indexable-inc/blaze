@@ -181,11 +181,42 @@ impl RootFdReader {
         crate::path::Path::new(s).map_err(|_| Fault::Host { call: "proc/self/fd path", code: 22 })
     }
 
-    fn sub_cx(&self, cx: &Cx) -> Result<Cx, Fault> {
+    fn sub_cx(&self, cx: &Cx) -> Result<(Cx, Deadline), Fault> {
         let left = remaining_for_cx(cx)
             .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
         let deadline = Deadline::after(self.io.now(), left);
-        Ok(cx.on_beside(blaze_own::Share::share(&self.io), deadline))
+        Ok((cx.on_beside(blaze_own::Share::share(&self.io), deadline), deadline))
+    }
+
+    /// Waits for `pending` on `self.io` while polling in bounded 10 ms slices so parent
+    /// cancellation (`cx.cancelled()`) abandons a stalled read within a short 50 ms settle bound
+    /// instead of waiting out the full remaining probe deadline.
+    fn wait_read_cancellable<'buf>(
+        &self,
+        cx: &Cx,
+        read_cx: &Cx,
+        deadline: Deadline,
+        mut pending: crate::pending::Pending<'buf, crate::fs::ReadInto<'buf>>,
+        call: &'static str,
+    ) -> Result<usize, Fault> {
+        loop {
+            match pending.try_wait() {
+                Ok(res) => return res.map_err(|e| fs_err_to_fault(call, &e)),
+                Err(still) => pending = still,
+            }
+            if cx.cancelled() {
+                let give_up = Deadline::after(self.io.now(), Duration::from_millis(50));
+                let _ = pending.cancel(read_cx, give_up);
+                return Err(Fault::Host { call: "nix runtime closure (cancelled)", code: 125 });
+            }
+            let now = self.io.now();
+            if deadline.passed(now) {
+                let _ = pending.cancel(read_cx, Deadline::PASSED);
+                return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
+            }
+            let slice = deadline.min(Deadline::after(now, Duration::from_millis(10)));
+            let _ = self.io.poll(slice);
+        }
     }
 
     /// Reads from already-opened `fd` at `offset` through `blaze-core`'s async driver until `out`
@@ -203,7 +234,7 @@ impl RootFdReader {
             return Ok(0);
         }
         let rel = Self::fd_rel(fd)?;
-        let open_cx = self.sub_cx(cx)?;
+        let (open_cx, _) = self.sub_cx(cx)?;
         let file = self.root.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
         let mut filled = 0usize;
         while filled < out.len() {
@@ -211,11 +242,11 @@ impl RootFdReader {
                 .ok()
                 .and_then(|d| offset.checked_add(d))
                 .ok_or(Fault::Host { call, code: 75 })?;
-            let read_cx = self.sub_cx(cx)?;
+            let (read_cx, deadline) = self.sub_cx(cx)?;
             let Some(dst) = out.get_mut(filled..) else {
                 break;
             };
-            let n = file.read_into(dst, step_off).wait(&read_cx).map_err(|e| fs_err_to_fault(call, &e))?;
+            let n = self.wait_read_cancellable(cx, &read_cx, deadline, file.read_into(dst, step_off), call)?;
             if n == 0 {
                 break;
             }
@@ -234,13 +265,13 @@ impl RootFdReader {
         mut feed: impl FnMut(&[u8]),
     ) -> Result<u64, Fault> {
         let rel = Self::fd_rel(fd)?;
-        let open_cx = self.sub_cx(cx)?;
+        let (open_cx, _) = self.sub_cx(cx)?;
         let file = self.root.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
         let mut buf = [0u8; 64 << 10];
         let mut offset = 0u64;
         loop {
-            let read_cx = self.sub_cx(cx)?;
-            let n = file.read_into(&mut buf, offset).wait(&read_cx).map_err(|e| fs_err_to_fault(call, &e))?;
+            let (read_cx, deadline) = self.sub_cx(cx)?;
+            let n = self.wait_read_cancellable(cx, &read_cx, deadline, file.read_into(&mut buf, offset), call)?;
             if n == 0 {
                 break;
             }
