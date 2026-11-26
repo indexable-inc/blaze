@@ -95,6 +95,7 @@ pub(crate) enum BinStubError {
     Cache(blaze_own::ABox<'static, DriveError>),
     Path(PathError),
     Fs(FsError),
+    Home(bstd::fs::HomeError),
     Socket { path: AString<'static>, errno: Errno },
     Stub { path: AString<'static>, errno: Errno },
     PathInvalid { path: AString<'static> },
@@ -144,6 +145,7 @@ impl fmt::Display for BinStubError {
             BinStubError::Cache(why) => write!(f, "CARGO_BIN_EXE stub verified cache: {why}"),
             BinStubError::Path(why) => write!(f, "CARGO_BIN_EXE stub path: {why}"),
             BinStubError::Fs(why) => write!(f, "CARGO_BIN_EXE stub folder/file: {why}"),
+            BinStubError::Home(why) => write!(f, "CARGO_BIN_EXE stub folder: {why}"),
             BinStubError::Socket { path, errno } => {
                 write!(f, "CARGO_BIN_EXE binary server socket `{path}`: {errno}")
             }
@@ -173,6 +175,40 @@ impl Drop for PrivateSocketDir {
             let _ = unlink_at(CWD, blaze_sys::Path::new(c), Unlink::File);
             Ok(())
         });
+        let _ = with_cstr(self.dir.as_str(), self.tables, |c| {
+            let _ = unlink_at(CWD, blaze_sys::Path::new(c), Unlink::Dir);
+            Ok(())
+        });
+    }
+}
+
+/// RAII cleanup for the private, shell-token-safe `/tmp/bzb-<nonce>-b` stub directory (contains
+/// strictly `[a-zA-Z0-9/_.-]`, independent of `$HOME`, so unquoted/quoted shell invocations on
+/// macOS never split or interpret spaces/metacharacters from `$HOME`, and Linux mounts it strictly
+/// read-only at `/target/debug/bin` separately from the socket directory).
+struct PrivateBinsDir {
+    dir: AString<'static>,
+    pkg_dirs: AVec<'static, AString<'static>>,
+    files: AVec<'static, AString<'static>>,
+    tables: Alloc<'static>,
+}
+
+impl Drop for PrivateBinsDir {
+    fn drop(&mut self) {
+        use blaze_sys::posix::io::CWD;
+        use blaze_sys::posix::proc::{Unlink, unlink_at};
+        for file in self.files.iter().rev() {
+            let _ = with_cstr(file.as_str(), self.tables, |c| {
+                let _ = unlink_at(CWD, blaze_sys::Path::new(c), Unlink::File);
+                Ok(())
+            });
+        }
+        for pkg in self.pkg_dirs.iter().rev() {
+            let _ = with_cstr(pkg.as_str(), self.tables, |c| {
+                let _ = unlink_at(CWD, blaze_sys::Path::new(c), Unlink::Dir);
+                Ok(())
+            });
+        }
         let _ = with_cstr(self.dir.as_str(), self.tables, |c| {
             let _ = unlink_at(CWD, blaze_sys::Path::new(c), Unlink::Dir);
             Ok(())
@@ -815,7 +851,7 @@ impl<'a, 'h> BinBackend<'a> for RealBackend<'_, 'a, 'h> {
 
 /// Active binary stub server owned by `run_dirty` for the duration of one `blaze test` command.
 pub(crate) struct BinServer<'a, 'h> {
-    bins_dir: AString<'a>,
+    bins_dir_guard: PrivateBinsDir,
     sock_dir_guard: PrivateSocketDir,
     listener: blaze_sys::posix::io::OwnedFd,
     bins: AVec<'a, BinRuntime<'a, 'h>>,
@@ -828,14 +864,14 @@ pub(crate) struct BinServer<'a, 'h> {
 }
 
 impl<'a, 'h> BinServer<'a, 'h> {
-    /// Creates `<mine>/b/`, creates a short private (`0o700`) `/tmp/bzb-<nonce>` socket dir and
-    /// binds `<sock_dir>/s`, writes launcher stubs + `mode=run` sidecars for each `BinSuite`, and
-    /// initializes per-binary `SuiteCache`s.
+    /// Creates two sibling private (`0o700`) directories under `/tmp`: `/tmp/bzb-<nonce>-b` for
+    /// shell-token-safe launcher stubs + `mode=run` sidecars (independent of `$HOME`), and
+    /// `/tmp/bzb-<nonce>` for the `0o600` Unix listener socket `s`, then initializes per-binary
+    /// `SuiteCache`s.
     #[expect(clippy::too_many_arguments, reason = "prepares the command's binary stub server from run_dirty's capabilities")]
     pub(crate) fn start(
         cx: &Cx,
-        mine: &Dir<ReadWrite>,
-        mine_abs: &str,
+        fs: &bstd::fs::Fs,
         sock_nonce: u64,
         launcher: &str,
         store: &str,
@@ -848,10 +884,10 @@ impl<'a, 'h> BinServer<'a, 'h> {
         frame: &Frame,
         alloc: Alloc<'a>,
     ) -> Result<BinServer<'a, 'h>, BinStubError> {
-        let bins_rel = Path::new("b").map_err(BinStubError::Path)?;
-        let bins_dir_handle = make_or_open_dir(cx, mine, &bins_rel)?;
-        let mut bins_dir = String::new_in(alloc);
-        let _ = write!(bins_dir, "{mine_abs}/b");
+        let mut bins_dir_guard = create_private_bins_dir(sock_nonce, tables)?;
+        let bins_rel_name = bstd::mem::format_in!(frame, "bzb-{sock_nonce:016x}-b");
+        let bins_rel = Path::new(bins_rel_name.as_str()).map_err(BinStubError::Path)?;
+        let bins_dir_handle = fs.home(cx, "/tmp", &bins_rel).map_err(BinStubError::Home)?;
 
         let sock_dir_guard = create_private_socket_dir(sock_nonce, tables)?;
         let listener = blaze_sys::posix::net::listen_unix(sock_dir_guard.socket.as_bytes(), 128).map_err(|errno| {
@@ -894,9 +930,15 @@ impl<'a, 'h> BinServer<'a, 'h> {
 
             let pkg_rel = Path::new(bin.package).map_err(BinStubError::Path)?;
             let pkg_dir = make_or_open_dir(cx, &bins_dir_handle, &pkg_rel)?;
+            let mut pkg_abs = String::new_in(tables);
+            let _ = write!(pkg_abs, "{}/{}", bins_dir_guard.dir.as_str(), bin.package);
+            if !bins_dir_guard.pkg_dirs.iter().any(|p| p.as_str() == pkg_abs.as_str()) {
+                bins_dir_guard.pkg_dirs.push(pkg_abs);
+            }
             let bin_rel = Path::new(bin.bin_name).map_err(BinStubError::Path)?;
             let mut host_path = String::new_in(alloc);
-            let _ = write!(host_path, "{}/{}/{}", bins_dir.as_str(), bin.package, bin.bin_name);
+            let _ = write!(host_path, "{}/{}/{}", bins_dir_guard.dir.as_str(), bin.package, bin.bin_name);
+            bins_dir_guard.files.push(owned_text(host_path.as_str(), tables));
             place_launcher_stub(cx, &pkg_dir, &bin_rel, launcher, host_path.as_str(), &mut launcher_bytes, tables, alloc)?;
 
             let sidecar_name = bstd::mem::format_in!(frame, "{}.blaze-program", bin.bin_name);
@@ -921,6 +963,9 @@ impl<'a, 'h> BinServer<'a, 'h> {
                     natives.push(send);
                 }
             }
+            let mut sidecar_abs = String::new_in(tables);
+            let _ = write!(sidecar_abs, "{}.blaze-program", host_path.as_str());
+            bins_dir_guard.files.push(sidecar_abs);
             pkg_dir
                 .publish(cx, &sidecar_rel, Content::bytes(sidecar.as_bytes()), Durable::No)
                 .map_err(BinStubError::Fs)?;
@@ -950,7 +995,7 @@ impl<'a, 'h> BinServer<'a, 'h> {
         }
 
         Ok(BinServer {
-            bins_dir,
+            bins_dir_guard,
             sock_dir_guard,
             listener,
             bins: runtimes,
@@ -964,7 +1009,7 @@ impl<'a, 'h> BinServer<'a, 'h> {
     }
 
     pub(crate) fn bins_dir(&self) -> &str {
-        self.bins_dir.as_str()
+        self.bins_dir_guard.dir.as_str()
     }
 
     #[cfg(target_os = "linux")]
@@ -1250,6 +1295,23 @@ fn flush_peer<S>(proto: &mut BinProtocol<'_, S, blaze_sys::posix::io::OwnedFd>, 
         }
     }
     wrote_any
+}
+
+fn create_private_bins_dir(nonce: u64, tables: Alloc<'static>) -> Result<PrivateBinsDir, BinStubError> {
+    let mut dir = String::new_in(tables);
+    let _ = write!(dir, "/tmp/bzb-{nonce:016x}-b");
+    with_cstr(dir.as_str(), tables, |cdir| {
+        blaze_sys::posix::proc::make_dir_mode(blaze_sys::Path::new(cdir), 0o700)
+            .map_err(|errno| BinStubError::Stub { path: owned_text(dir.as_str(), tables), errno })
+    })?;
+    let guard = PrivateBinsDir {
+        dir,
+        pkg_dirs: Vec::new_in(tables),
+        files: Vec::new_in(tables),
+        tables,
+    };
+    chmod_path(guard.dir.as_str(), 0o700, tables)?;
+    Ok(guard)
 }
 
 fn create_private_socket_dir(nonce: u64, tables: Alloc<'static>) -> Result<PrivateSocketDir, BinStubError> {

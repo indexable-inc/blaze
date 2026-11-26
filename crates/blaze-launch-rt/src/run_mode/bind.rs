@@ -155,6 +155,8 @@ impl<B: Bind> Bind for LauncherOwn<B> {
                 "execvp" => Some(addr(bin_remap::remap_execvp as *const ())),
                 #[cfg(target_os = "linux")]
                 "execvpe" => Some(addr(bin_remap::remap_execvpe as *const ())),
+                #[cfg(target_os = "macos")]
+                "execvP" => Some(addr(bin_remap::remap_execvP as *const ())),
                 "execl" => Some(addr(bin_remap::remap_execl as *const ())),
                 "execlp" => Some(addr(bin_remap::remap_execlp as *const ())),
                 "execle" => Some(addr(bin_remap::remap_execle as *const ())),

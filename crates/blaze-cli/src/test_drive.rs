@@ -4570,15 +4570,13 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let spawner = host.spawner().map_err(DriveError::Missing)?;
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
-    let mine_abs = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}", command.as_str());
     let sock_nonce = u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(0)
         ^ (u64::from(host.pid()).rotate_left(32));
     let bin_server = if !bins.is_empty() && TestHost::THIS.has_sandbox() {
         Some(RefCell::new(
             crate::test_bins::BinServer::start(
                 cx,
-                &mine,
-                mine_abs.as_str(),
+                fs,
                 sock_nonce,
                 launcher.as_str(),
                 store.as_str(),
