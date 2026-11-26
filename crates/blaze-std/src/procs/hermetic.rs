@@ -189,11 +189,20 @@ impl blaze_own::Share for RootReader {}
 #[cfg(target_os = "linux")]
 impl RootReader {
     pub fn new(cx: &Cx) -> Result<Self, Fault> {
-        if !crate::rt::try_reserve_reaper_slot() {
-            return Err(Fault::Host {
-                call: "bstd::fs root io (stalled-reader backlog full)",
-                code: 11,
-            });
+        match crate::rt::try_reserve_reaper_slot() {
+            Ok(()) => {}
+            Err(crate::rt::ReaperReserveError::BacklogFull) => {
+                return Err(Fault::Host {
+                    call: "bstd::fs root io (stalled-reader backlog full)",
+                    code: 11,
+                });
+            }
+            Err(crate::rt::ReaperReserveError::SpawnFailed) => {
+                return Err(Fault::Host {
+                    call: "bstd::fs root io (reaper worker spawn failed)",
+                    code: 11,
+                });
+            }
         }
         let mut slot_guard = ReaperSlotGuard(true);
         let io = match cx.io().beside(crate::rt::RootPath::new("/")) {
@@ -683,6 +692,160 @@ impl<T> ReaperCore<T> {
         }
         self.active = self.active.saturating_sub(1);
         None
+    }
+}
+
+/// Planted bug for deterministic interleaving DSTs of [`StandbyReaperCore`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StandbyReaperPlant {
+    None,
+    /// Control: lets an idle worker exit without checking whether live `reserved` owners still
+    /// need standby coverage, stranding a subsequent retired driver with 0 workers.
+    ExitWhileNeeded,
+}
+
+/// Next action for a standby reaper worker thread inside its `Condvar` loop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub enum StandbyWorkerStep<T> {
+    Work(T),
+    Wait,
+    Exit,
+}
+
+/// Sans-IO state machine for the pre-spawned standby I/O reaper pool (`rt::try_reserve_reaper_slot`,
+/// `rt::release_reaper_slot`, `rt::retire_stalled_io`):
+/// - Spawns standby workers at admission time (`begin_reserve`) when a typed spawn error can still
+///   be returned to the caller, so `retire_reserved` NEVER calls `thread::spawn`, NEVER fails, and
+///   NEVER needs a background retry loop.
+/// - Tracks in-flight spawns (`spawning`) separately from live parked workers (`idle`) so no live
+///   worker ever exits prematurely counting on an unconfirmed spawn that might fail.
+/// - Surplus idle workers exit immediately on `release_reservation` when `pending` is empty.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct StandbyReaperCore<T> {
+    max_workers: usize,
+    max_pending: usize,
+    active: usize,
+    idle: usize,
+    spawning: usize,
+    reserved: usize,
+    pending: blaze_own::VecDeque<T, blaze_own::SharedAlloc<'static>>,
+    plant: StandbyReaperPlant,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<T> StandbyReaperCore<T> {
+    pub fn new(max_workers: usize, max_pending: usize, plant: StandbyReaperPlant) -> Self {
+        Self {
+            max_workers: max_workers.max(1),
+            max_pending: max_pending.max(1),
+            active: 0,
+            idle: 0,
+            spawning: 0,
+            reserved: 0,
+            pending: blaze_own::VecDeque::new_in(blaze_own::SharedAlloc::global()),
+            plant,
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    pub fn idle(&self) -> usize {
+        self.idle
+    }
+
+    pub fn spawning(&self) -> usize {
+        self.spawning
+    }
+
+    pub fn reserved(&self) -> usize {
+        self.reserved
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn total_cap(&self) -> usize {
+        self.max_workers.saturating_add(self.max_pending)
+    }
+
+    fn needed_standby(&self) -> usize {
+        let demand = self.pending.len().saturating_add(self.reserved);
+        demand.min(self.max_workers.saturating_sub(self.active))
+    }
+
+    /// Attempts to reserve a backlog slot for a new live owner. Returns `Ok(true)` if the caller
+    /// must spawn one standby worker thread (accounting for it in `spawning` until it starts or
+    /// fails via [`Self::abort_spawn_failed`]), `Ok(false)` if existing standby/active workers
+    /// already cover the reservation, or `Err(())` if the total backlog cap is full.
+    pub fn begin_reserve(&mut self) -> Result<bool, ()> {
+        if self.active.saturating_add(self.pending.len()).saturating_add(self.reserved) >= self.total_cap() {
+            return Err(());
+        }
+        self.reserved += 1;
+        let needed = self.needed_standby();
+        if self.idle.saturating_add(self.spawning) < needed {
+            self.spawning += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Rolls back a `begin_reserve()` call whose standby worker spawn failed.
+    pub fn abort_spawn_failed(&mut self) {
+        self.spawning = self.spawning.saturating_sub(1);
+        self.reserved = self.reserved.saturating_sub(1);
+    }
+
+    /// Called as the first step of a newly spawned standby worker thread before polling for work.
+    pub fn on_worker_started(&mut self) {
+        self.spawning = self.spawning.saturating_sub(1);
+        self.idle += 1;
+    }
+
+    /// Releases a reservation on clean close; returns `true` if a surplus idle worker should be
+    /// woken to exit.
+    pub fn release_reservation(&mut self) -> bool {
+        self.reserved = self.reserved.saturating_sub(1);
+        self.idle > self.needed_standby()
+    }
+
+    /// Consumes a reservation and enqueues a stalled item for an already-spawned standby worker
+    /// (or an active worker finishing its current drop). Never spawns and never fails.
+    pub fn retire_reserved(&mut self, item: T) {
+        self.reserved = self.reserved.saturating_sub(1);
+        self.pending.push_back(item);
+    }
+
+    /// Polls for the next action for a parked `idle` worker under the pool lock.
+    pub fn worker_poll(&mut self) -> StandbyWorkerStep<T> {
+        if self.active < self.max_workers
+            && let Some(item) = self.pending.pop_front()
+        {
+            self.idle = self.idle.saturating_sub(1);
+            self.active += 1;
+            return StandbyWorkerStep::Work(item);
+        }
+        let exit_now = match self.plant {
+            StandbyReaperPlant::None => self.pending.is_empty() && self.idle > self.needed_standby(),
+            StandbyReaperPlant::ExitWhileNeeded => self.pending.is_empty(),
+        };
+        if exit_now {
+            self.idle = self.idle.saturating_sub(1);
+            return StandbyWorkerStep::Exit;
+        }
+        StandbyWorkerStep::Wait
+    }
+
+    /// Transitions a worker from `active` back to `idle` after finishing a retired drop.
+    pub fn worker_finished_drop(&mut self) {
+        self.active = self.active.saturating_sub(1);
+        self.idle += 1;
     }
 }
 

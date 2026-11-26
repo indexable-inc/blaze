@@ -510,14 +510,13 @@ impl FileLock {
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             FileLockKind::Native(native) => {
-                cx.stopped_by(dir.io.now())
-                    .map_err(|s| FsError::new(FsOp::Read, &name, FsKind::Stopped(s)))?;
-                match crate::rt::read_bounded_under_lock(native, name.as_str(), max_bytes, single_read_plant, alloc) {
+                match crate::rt::read_bounded_under_lock_off_thread(cx, native, name.as_str(), max_bytes, single_read_plant, alloc) {
                     Ok(crate::rt::NativeBoundedRead::Absent) => Ok(BoundedRead::Absent),
                     Ok(crate::rt::NativeBoundedRead::Oversized) => Ok(BoundedRead::Oversized),
                     Ok(crate::rt::NativeBoundedRead::Grew) => Ok(BoundedRead::Grew),
                     Ok(crate::rt::NativeBoundedRead::Whole(bytes)) => Ok(BoundedRead::Whole(bytes)),
-                    Err(msg) => Err(driver_error(FsOp::Read, &name, &msg.as_str())),
+                    Err(crate::rt::NativeLockErr::Stopped(s)) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(s))),
+                    Err(crate::rt::NativeLockErr::Driver(msg)) => Err(driver_error(FsOp::Read, &name, &msg.as_str())),
                 }
             }
         }
@@ -539,10 +538,10 @@ impl FileLock {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             FileLockKind::Native(native) => {
                 let name = dir.beneath(path);
-                cx.stopped_by(dir.io.now())
-                    .map_err(|s| FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)))?;
-                crate::rt::publish_under_lock(native, name.as_str(), whole, durable == Durable::Yes)
-                    .map_err(|msg| driver_error(FsOp::Publish, &name, &msg.as_str()))
+                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, durable).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+                })
             }
         }
     }

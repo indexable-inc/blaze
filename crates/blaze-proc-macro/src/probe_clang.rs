@@ -1927,8 +1927,10 @@ mod tests {
                 b"corrupt-on-old-inode",
                 "locked read must stay on the locked inode rather than the replacement path"
             );
-            held.publish(&lock_cx, &lock_dir, &rec_path, b"repaired-on-old-inode", bstd::fs::Durable::No)
-                .expect("publish under held lock");
+            held.publish(&lock_cx, &lock_dir, &rec_path, b"repaired-on-old-inode", bstd::fs::Durable::Started)
+                .expect("publish Durable::Started under held lock");
+            held.publish(&lock_cx, &lock_dir, &rec_path, b"repaired-on-old-inode", bstd::fs::Durable::Yes)
+                .expect("publish Durable::Yes under held lock");
             assert_eq!(
                 std::fs::read(moved_root.join("sub/rec")).expect("read old inode"),
                 b"repaired-on-old-inode",
@@ -2537,6 +2539,193 @@ mod tests {
         let err = run_reaper_core_dst(bstd::procs::hermetic::ReaperPlant::SingleFifo)
             .expect_err("planted SingleFifo must be caught");
         assert!(err.contains("blocked from cleanup"), "unexpected error: {err}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_standby_reaper_dst(plant: bstd::procs::hermetic::StandbyReaperPlant) -> Result<u64, &'static str> {
+        use bstd::procs::hermetic::{StandbyReaperCore, StandbyWorkerStep};
+        use std::collections::VecDeque;
+
+        const MAX_WORKERS: usize = 4;
+        const MAX_PENDING: usize = 4;
+        const CAP: usize = MAX_WORKERS + MAX_PENDING;
+        let mut total_reaped = 0u64;
+
+        for seed in 0u64..100 {
+            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mut core = StandbyReaperCore::<u64>::new(MAX_WORKERS, MAX_PENDING, plant);
+            let mut spawning_queue: VecDeque<bool> = VecDeque::new();
+            let mut live_reserved = 0usize;
+            let mut live_idle_workers = 0usize;
+            let mut active_drops: VecDeque<u64> = VecDeque::new();
+            let mut next_id = 1u64;
+            let mut retired_count = 0u64;
+            let mut reaped_count = 0u64;
+
+            let check_oracle = |c: &StandbyReaperCore<u64>, live_res: usize, live_idle: usize, active_d: &VecDeque<u64>, sp: &VecDeque<bool>| -> Result<(), &'static str> {
+                if c.active() + c.pending_len() + c.reserved() > CAP {
+                    return Err("standby reaper exceeded total backlog cap");
+                }
+                if c.active() > MAX_WORKERS {
+                    return Err("standby reaper exceeded max active workers");
+                }
+                if c.reserved() != live_res {
+                    return Err("reserved counter diverged from oracle");
+                }
+                if c.idle() != live_idle {
+                    return Err("idle counter diverged from oracle");
+                }
+                if c.active() != active_d.len() {
+                    return Err("active counter diverged from oracle");
+                }
+                if c.spawning() != sp.len() {
+                    return Err("spawning counter diverged from oracle");
+                }
+                // Zero-stranded invariant: whenever any item is pending and active < MAX_WORKERS,
+                // there MUST be at least one live idle worker or confirmed in-flight spawn to wake.
+                if c.pending_len() > 0 && c.active() < MAX_WORKERS && c.idle() + c.spawning() == 0 {
+                    return Err("pending item stranded with zero active/idle/spawning workers");
+                }
+                Ok(())
+            };
+
+            for _ in 0..80 {
+                let op = next() % 6;
+                match op {
+                    0 | 1 => {
+                        // Reserve (with injected transient spawn failures).
+                        if let Ok(need_spawn) = core.begin_reserve() {
+                            if need_spawn {
+                                if next() % 4 == 0 {
+                                    core.abort_spawn_failed();
+                                } else {
+                                    live_reserved += 1;
+                                    spawning_queue.push_back(true);
+                                }
+                            } else {
+                                live_reserved += 1;
+                            }
+                        }
+                    }
+                    2 => {
+                        // Clean close (release reservation).
+                        if live_reserved > 0 {
+                            live_reserved -= 1;
+                            let _ = core.release_reservation();
+                        }
+                    }
+                    3 => {
+                        // Stalled retire (zero thread::spawn possible!).
+                        if live_reserved > 0 {
+                            live_reserved -= 1;
+                            let id = next_id;
+                            next_id += 1;
+                            retired_count += 1;
+                            core.retire_reserved(id);
+                        }
+                    }
+                    4 => {
+                        // Start one spawned worker OR poll one idle worker.
+                        if let Some(_) = spawning_queue.pop_front() {
+                            core.on_worker_started();
+                            live_idle_workers += 1;
+                        } else if live_idle_workers > 0 {
+                            match core.worker_poll() {
+                                StandbyWorkerStep::Work(id) => {
+                                    live_idle_workers -= 1;
+                                    active_drops.push_back(id);
+                                }
+                                StandbyWorkerStep::Exit => {
+                                    live_idle_workers -= 1;
+                                }
+                                StandbyWorkerStep::Wait => {}
+                            }
+                        }
+                    }
+                    _ => {
+                        // Complete one active drop.
+                        if let Some(_id) = active_drops.pop_front() {
+                            reaped_count += 1;
+                            core.worker_finished_drop();
+                            live_idle_workers += 1;
+                        }
+                    }
+                }
+                check_oracle(&core, live_reserved, live_idle_workers, &active_drops, &spawning_queue)?;
+            }
+
+            // Quiesce: finish all in-flight spawns, retire or release all remaining reservations,
+            // and step all workers until nothing remains.
+            while spawning_queue.pop_front().is_some() {
+                core.on_worker_started();
+                live_idle_workers += 1;
+            }
+            while live_reserved > 0 {
+                live_reserved -= 1;
+                if next() % 2 == 0 {
+                    let id = next_id;
+                    next_id += 1;
+                    retired_count += 1;
+                    core.retire_reserved(id);
+                } else {
+                    let _ = core.release_reservation();
+                }
+                check_oracle(&core, live_reserved, live_idle_workers, &active_drops, &spawning_queue)?;
+            }
+            for _ in 0..256 {
+                if let Some(_id) = active_drops.pop_front() {
+                    reaped_count += 1;
+                    core.worker_finished_drop();
+                    live_idle_workers += 1;
+                }
+                if live_idle_workers > 0 {
+                    match core.worker_poll() {
+                        StandbyWorkerStep::Work(id) => {
+                            live_idle_workers -= 1;
+                            active_drops.push_back(id);
+                        }
+                        StandbyWorkerStep::Exit => {
+                            live_idle_workers -= 1;
+                        }
+                        StandbyWorkerStep::Wait => {}
+                    }
+                }
+                check_oracle(&core, live_reserved, live_idle_workers, &active_drops, &spawning_queue)?;
+                if core.pending_len() == 0 && core.active() == 0 && core.idle() == 0 {
+                    break;
+                }
+            }
+            if reaped_count != retired_count || core.pending_len() != 0 {
+                return Err("retired items stranded after quiescence");
+            }
+            if core.active() != 0 || core.idle() != 0 || core.reserved() != 0 || core.spawning() != 0 {
+                return Err("leaked standby worker or counter after quiescence");
+            }
+            total_reaped += reaped_count;
+        }
+        Ok(total_reaped)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn standby_reaper_pool_dst_survives_interleavings_and_spawn_failures() {
+        let reaped = run_standby_reaper_dst(bstd::procs::hermetic::StandbyReaperPlant::None)
+            .expect("StandbyReaperCore DST must satisfy backlog, non-stranding, and quiescence invariants");
+        assert!(reaped > 0, "expected retired items across 100 seeds");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn standby_reaper_pool_dst_catches_planted_stranded_item() {
+        let err = run_standby_reaper_dst(bstd::procs::hermetic::StandbyReaperPlant::ExitWhileNeeded)
+            .expect_err("planted ExitWhileNeeded must be caught by DST oracle");
+        assert!(err.contains("stranded"), "unexpected error: {err}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
