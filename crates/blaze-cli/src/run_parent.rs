@@ -508,7 +508,7 @@ pub(crate) fn launch_env<'e, A: Allocator>(
 ) {
     // BLAZE_LAUNCH_NATIVE and BLAZE_LAUNCH_TELEMETRY are the parent's word alone: one of the
     // command's own is never passed on.
-    const OURS: [&str; 13] = [
+    const OURS: [&str; 12] = [
         "BLAZE_LAUNCH_FD",
         "BLAZE_LAUNCH_STORE",
         "BLAZE_LAUNCH_ENTRY",
@@ -518,7 +518,6 @@ pub(crate) fn launch_env<'e, A: Allocator>(
         "BLAZE_LAUNCH_BINS_DIR",
         "BLAZE_LAUNCH_BINS_SOCK_DIR",
         "BLAZE_LAUNCH_BIN_MAP",
-        "BLAZE_LAUNCH_BIN_OWNER",
         blaze_launch::grants::VAR,
         blaze_launch::telemetry::VAR,
         "BLAZE_LAUNCH_EXPLORE",

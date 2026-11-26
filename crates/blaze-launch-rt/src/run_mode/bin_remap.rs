@@ -8,34 +8,45 @@
 //! On macOS, root `/` is an immutable APFS Sealed System Volume (SIP) with no unprivileged mount
 //! namespaces, so `/target` cannot be created by an unprivileged test runner. Instead, `BinServer`
 //! places launcher stubs in a short, shell-token-safe user-private directory
-//! `/tmp/bzb-<nonce>-b/<package>/<name>` (strictly `[a-zA-Z0-9/_.-]`, never spaces or shell
-//! metacharacters regardless of `$HOME`), sets runtime `CARGO_BIN_EXE_<name>` to that path, and
-//! this table remaps compile-time `/target/debug/bin/<package>/<name>` literals across
+//! `/tmp/bzb-<nonce>-r<suite>-<row>/<package>/<name>` (strictly `[a-zA-Z0-9/_.-]`, never spaces or
+//! shell metacharacters regardless of `$HOME`), sets runtime `CARGO_BIN_EXE_<name>` to that path,
+//! and this table remaps compile-time `/target/debug/bin/<package>/<name>` literals across
 //! `open`/`openat`/`fopen`/`stat*`/`access*`/`realpath`/`readlink*` AND across every
 //! process-launching entry point (`execv`/`execve`/`execvp`/`execvpe`/`execvP`/`execl`/`execlp`/
 //! `execle`/`posix_spawn`/`posix_spawnp`/`system`/`popen`).
 //!
 //! Installed once on the launcher's main thread before any guest thread starts (from
 //! `BLAZE_LAUNCH_BIN_MAP`, which is removed from the process environment immediately after).
-//! Every wrapper is lock-free, keeps its stack frame tiny (safe even on `PTHREAD_STACK_MIN`
-//! 16 KiB thread stacks), performs zero syscalls when nothing needs remapping, and allocates exact
-//! rewritten storage via async-signal-safe anonymous `mmap(MAP_PRIVATE | MAP_ANON)` freed via
-//! `munmap` on drop (no malloc locks, no artificial argument count cap).
+//! Pre-allocates a demand-paged anonymous scratch pool ONCE at `install()` time (before any thread
+//! or `fork()` exists) so every wrapper is strictly POSIX async-signal-safe between `fork()` and
+//! `exec*` (zero `malloc`, zero `mmap`/`munmap`, zero mutexes), keeps stack frames tiny (safe on
+//! 16 KiB `PTHREAD_STACK_MIN` thread stacks), and supports full `ARG_MAX` (256 KiB) argument and
+//! environment vectors.
 
-use core::ffi::{CStr, c_char, c_int, c_void};
+use core::ffi::{CStr, c_char, c_int};
 use core::mem::{align_of, size_of};
 use core::ptr;
 use core::slice;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use blaze_own::{ABox, AVec, Alloc, Box, Vec};
 
 /// Fixed compile-time guest prefix emitted by `blaze_scope::crate_env::bin_exe`.
 const GUEST_PREFIX: &[u8] = b"/target/debug/bin/";
 
+/// Fixed guest prefix without trailing slash (for `execvP` `search_path` matching).
+const GUEST_ROOT: &[u8] = b"/target/debug/bin";
+
 /// Small stack fast-path pointer count for variadic `execl*` collection (256 bytes on stack;
-/// grows via async-signal-safe anonymous `mmap` when > 31 arguments are passed).
+/// spills into a pre-allocated async-signal-safe scratch slot when > 31 arguments are passed).
 const EXECL_STACK_PTRS: usize = 32;
+
+/// Number of pre-allocated lock-free scratch slots reserved at `install()` time.
+const SCRATCH_SLOTS: usize = 16;
+
+/// Byte capacity per pre-allocated scratch slot (256 KiB = macOS `ARG_MAX`; demand-paged so
+/// untouched pages consume 0 physical RSS).
+const SCRATCH_SLOT_BYTES: usize = 256 * 1024;
 
 struct Entry {
     guest: AVec<'static, u8>,
@@ -43,8 +54,18 @@ struct Entry {
     host: AVec<'static, u8>,
 }
 
+struct ScratchSlot {
+    in_use: AtomicBool,
+    base: *mut u8,
+    len: usize,
+}
+
 struct RemapTable {
     entries: AVec<'static, Entry>,
+    /// Common host root prefix corresponding to `/target/debug/bin` (without trailing slash),
+    /// derived from `entries` when all stubs share `<host_root>/<package>/<bin>`.
+    host_root: AVec<'static, u8>,
+    slots: [ScratchSlot; SCRATCH_SLOTS],
 }
 
 static MAP: AtomicPtr<RemapTable> = AtomicPtr::new(ptr::null_mut());
@@ -58,6 +79,8 @@ pub enum BinRemapError {
     BadGuestPrefix,
     /// Either path contained an embedded NUL byte.
     NulByte,
+    /// Pre-mapping the async-signal-safe scratch pool at startup failed.
+    ScratchAllocFailed,
 }
 
 impl core::fmt::Display for BinRemapError {
@@ -66,25 +89,81 @@ impl core::fmt::Display for BinRemapError {
             BinRemapError::MalformedLine => f.write_str("BLAZE_LAUNCH_BIN_MAP holds a line without `<guest>\\t<host>`"),
             BinRemapError::BadGuestPrefix => f.write_str("BLAZE_LAUNCH_BIN_MAP guest path does not start with `/target/debug/bin/`"),
             BinRemapError::NulByte => f.write_str("BLAZE_LAUNCH_BIN_MAP holds a path with an embedded NUL byte"),
+            BinRemapError::ScratchAllocFailed => f.write_str("BLAZE_LAUNCH_BIN_MAP failed to reserve scratch pool"),
         }
     }
 }
 
-/// Parses `raw` (`<guest>\t<host>\n` lines) and installs the process-wide immutable remap table.
+/// Derives the common `<host_root>` (without trailing `/`) corresponding to `/target/debug/bin`
+/// from `entries`, when every entry has the form `/target/debug/bin/<rel> -> <host_root>/<rel>`.
+fn derive_host_root(entries: &[Entry], alloc: Alloc<'static>) -> AVec<'static, u8> {
+    let mut out = Vec::new_in(alloc);
+    let Some(first) = entries.first() else { return out };
+    let Some(rel) = first.guest.strip_prefix(GUEST_PREFIX) else { return out };
+    let host_no_nul = first.host.get(..first.host.len().saturating_sub(1)).unwrap_or(&[]);
+    let Some(prefix_with_slash) = host_no_nul.strip_suffix(rel) else { return out };
+    let Some(root) = prefix_with_slash.strip_suffix(b"/") else { return out };
+    for entry in entries.iter().skip(1) {
+        let Some(r) = entry.guest.strip_prefix(GUEST_PREFIX) else { return out };
+        let h = entry.host.get(..entry.host.len().saturating_sub(1)).unwrap_or(&[]);
+        let Some(p) = h.strip_suffix(r).and_then(|s| s.strip_suffix(b"/")) else { return out };
+        if p != root {
+            return out;
+        }
+    }
+    out.extend_from_slice(root);
+    out
+}
+
+fn alloc_scratch_slots() -> Result<[ScratchSlot; SCRATCH_SLOTS], BinRemapError> {
+    let total = SCRATCH_SLOTS
+        .checked_mul(SCRATCH_SLOT_BYTES)
+        .ok_or(BinRemapError::ScratchAllocFailed)?;
+    // SAFETY: called once single-threaded at launcher startup before any guest thread or `fork()`.
+    let base = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED || base.is_null() {
+        return Err(BinRemapError::ScratchAllocFailed);
+    }
+    let base_u8 = base.cast::<u8>();
+    Ok(core::array::from_fn(|i| ScratchSlot {
+        in_use: AtomicBool::new(false),
+        // SAFETY: `i * SCRATCH_SLOT_BYTES < total` within the mapped region.
+        base: unsafe { base_u8.add(i * SCRATCH_SLOT_BYTES) },
+        len: SCRATCH_SLOT_BYTES,
+    }))
+}
+
+/// Parses `raw` (`<guest>\t<host>\n` lines), reserves the demand-paged async-signal-safe scratch
+/// pool, and installs the process-wide immutable remap table.
 /// Returns `Ok(true)` if at least one mapping was installed, `Ok(false)` if `raw` was empty.
 pub fn install(raw: &[u8], alloc: Alloc<'static>) -> Result<bool, BinRemapError> {
     let entries = parse_entries(raw, alloc)?;
     if entries.is_empty() {
         return Ok(false);
     }
-    let table: ABox<'static, RemapTable> = Box::new_in(RemapTable { entries }, alloc);
+    let host_root = derive_host_root(entries.as_slice(), alloc);
+    let slots = alloc_scratch_slots()?;
+    let table: ABox<'static, RemapTable> = Box::new_in(RemapTable { entries, host_root, slots }, alloc);
     let (ptr, alloc) = Box::into_raw_with_allocator(table);
     if MAP
         .compare_exchange(ptr::null_mut(), ptr, Ordering::Release, Ordering::Relaxed)
         .is_err()
     {
-        // SAFETY: `ptr` was never published; reclaim it with the same `alloc`.
-        drop(unsafe { Box::from_raw_in(ptr, alloc) });
+        // SAFETY: `ptr` was never published; unmap its scratch pool and reclaim it.
+        unsafe {
+            let total = SCRATCH_SLOTS * SCRATCH_SLOT_BYTES;
+            let _ = libc::munmap((*ptr).slots[0].base.cast(), total);
+            drop(Box::from_raw_in(ptr, alloc));
+        }
     }
     Ok(true)
 }
@@ -121,6 +200,48 @@ fn parse_entries(raw: &[u8], alloc: Alloc<'static>) -> Result<AVec<'static, Entr
         out.push(Entry { guest: guest_buf, host: host_buf });
     }
     Ok(out)
+}
+
+/// Lock-free RAII lease of one pre-allocated scratch slot (strictly POSIX async-signal-safe:
+/// uses only `AtomicBool::compare_exchange` / `store`, zero syscalls, zero allocator calls).
+struct SlotGuard<'a> {
+    slot: Option<&'a ScratchSlot>,
+}
+
+impl<'a> SlotGuard<'a> {
+    const EMPTY: SlotGuard<'a> = SlotGuard { slot: None };
+
+    fn acquire(slots: &'a [ScratchSlot], need: usize) -> Result<SlotGuard<'a>, ()> {
+        for slot in slots.iter() {
+            if slot.len < need {
+                continue;
+            }
+            if slot
+                .in_use
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(SlotGuard { slot: Some(slot) });
+            }
+        }
+        Err(())
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.slot.map_or(ptr::null_mut(), |s| s.base)
+    }
+
+    fn len(&self) -> usize {
+        self.slot.map_or(0, |s| s.len)
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot {
+            slot.in_use.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Returns whether byte `b` can continue a package/binary path component after `entry.guest`.
@@ -292,60 +413,65 @@ fn rewrite_bytes(
     Ok(RewriteResult::Rewritten { start, end: *cursor })
 }
 
-/// Async-signal-safe anonymous `mmap` allocation used lazily ONLY when a call actually rewrites
-/// an argument/environment/command string. Keeps wrapper stack frames minimal (safe on 16 KiB
-/// `PTHREAD_STACK_MIN` thread stacks) and automatically unmaps on drop (or is reclaimed by the
-/// kernel on successful `exec*`).
-struct MmapGuard {
-    ptr: *mut c_void,
-    len: usize,
-}
-
-impl MmapGuard {
-    const EMPTY: MmapGuard = MmapGuard { ptr: ptr::null_mut(), len: 0 };
-
-    fn alloc(len: usize) -> Result<MmapGuard, ()> {
-        if len == 0 {
-            return Ok(MmapGuard::EMPTY);
+/// Rewrites colon-separated `PATH` / `execvP` `search_path` entries replacing `/target/debug/bin`
+/// (or `/target/debug/bin/...`) with `<host_root>` (or `<host_root>/...`) into `scratch`.
+fn rewrite_search_path(
+    input: &[u8],
+    host_root: &[u8],
+    scratch: &mut [u8],
+) -> Result<Option<usize>, ()> {
+    if host_root.is_empty() || find_subslice(input, GUEST_ROOT, 0).is_none() {
+        return Ok(None);
+    }
+    let mut cursor = 0usize;
+    let mut changed = false;
+    let mut first = true;
+    for comp in input.split(|&b| b == b':') {
+        if !first {
+            *scratch.get_mut(cursor).ok_or(())? = b':';
+            cursor += 1;
         }
-        // SAFETY: anonymous private mapping touches no allocator locks and is async-signal-safe.
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
+        first = false;
+        let replaced = if comp == GUEST_ROOT {
+            changed = true;
+            let dst = scratch.get_mut(cursor..cursor.checked_add(host_root.len()).ok_or(())?).ok_or(())?;
+            dst.copy_from_slice(host_root);
+            cursor += host_root.len();
+            true
+        } else if let Some(rest) = comp.strip_prefix(GUEST_PREFIX) {
+            changed = true;
+            let dst = scratch.get_mut(cursor..cursor.checked_add(host_root.len()).ok_or(())?).ok_or(())?;
+            dst.copy_from_slice(host_root);
+            cursor += host_root.len();
+            *scratch.get_mut(cursor).ok_or(())? = b'/';
+            cursor += 1;
+            let dst2 = scratch.get_mut(cursor..cursor.checked_add(rest.len()).ok_or(())?).ok_or(())?;
+            dst2.copy_from_slice(rest);
+            cursor += rest.len();
+            true
+        } else {
+            false
         };
-        if ptr == libc::MAP_FAILED || ptr.is_null() {
-            return Err(());
-        }
-        Ok(MmapGuard { ptr, len })
-    }
-}
-
-impl Drop for MmapGuard {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() && self.len > 0 {
-            // SAFETY: `self.ptr` and `self.len` came from `libc::mmap` in `MmapGuard::alloc`.
-            unsafe {
-                let _ = libc::munmap(self.ptr, self.len);
-            }
+        if !replaced {
+            let dst = scratch.get_mut(cursor..cursor.checked_add(comp.len()).ok_or(())?).ok_or(())?;
+            dst.copy_from_slice(comp);
+            cursor += comp.len();
         }
     }
+    if !changed {
+        return Ok(None);
+    }
+    *scratch.get_mut(cursor).ok_or(())? = 0;
+    Ok(Some(cursor + 1))
 }
 
-/// Rewrites a NUL-terminated `char* const*` list (`argv` or `envp`) whenever any entry matches or
-/// embeds an installed `/target/debug/bin/<package>/<name>` path.
-///
-/// Allocates zero bytes and makes zero syscalls when no entry needs rewriting; otherwise allocates
-/// the exact pointer table + string scratch inside `mmap_guard` (off-stack, async-signal-safe).
-unsafe fn remap_cstr_list_with(
+/// Rewrites a NUL-terminated `char* const*` list (`argv` or `envp`) using a pre-allocated
+/// async-signal-safe scratch slot from `slots` ONLY when at least one entry needs remapping.
+unsafe fn remap_cstr_list_with<'a>(
     list: *const *const c_char,
     entries: &[Entry],
-    mmap_guard: &mut MmapGuard,
+    slots: &'a [ScratchSlot],
+    guard: &mut SlotGuard<'a>,
 ) -> Result<*const *const c_char, ()> {
     if list.is_null() {
         return Ok(list);
@@ -376,12 +502,12 @@ unsafe fn remap_cstr_list_with(
     let ptr_slots = count.checked_add(1).ok_or(())?;
     let ptr_bytes = ptr_slots.checked_mul(size_of::<*const c_char>()).ok_or(())?;
     let total = ptr_bytes.checked_add(need_bytes).ok_or(())?;
-    *mmap_guard = MmapGuard::alloc(total)?;
-    // SAFETY: `mmap` returns page-aligned memory (>= `align_of::<*const c_char>()`),
-    // valid for `ptr_bytes + need_bytes` bytes, exclusively owned by `mmap_guard`.
+    *guard = SlotGuard::acquire(slots, total)?;
+    // SAFETY: every slot base is page-aligned (>= `align_of::<*const c_char>()`), valid for
+    // `total <= slot.len`, and exclusively leased by `guard`.
     let _ = align_of::<*const c_char>();
-    let ptrs_slice = unsafe { slice::from_raw_parts_mut(mmap_guard.ptr.cast::<*const c_char>(), ptr_slots) };
-    let b_ptr = unsafe { mmap_guard.ptr.cast::<u8>().add(ptr_bytes) };
+    let ptrs_slice = unsafe { slice::from_raw_parts_mut(guard.base().cast::<*const c_char>(), ptr_slots) };
+    let b_ptr = unsafe { guard.base().add(ptr_bytes) };
     let scratch_slice = unsafe { slice::from_raw_parts_mut(b_ptr, need_bytes) };
 
     let mut cursor = 0usize;
@@ -403,9 +529,9 @@ unsafe fn remap_cstr_list_with(
     Ok(ptrs_slice.as_ptr())
 }
 
-unsafe fn remap_cstr_list(
+unsafe fn remap_cstr_list<'a>(
     list: *const *const c_char,
-    mmap_guard: &mut MmapGuard,
+    guard: &mut SlotGuard<'a>,
 ) -> Result<*const *const c_char, ()> {
     if list.is_null() {
         return Ok(list);
@@ -415,15 +541,15 @@ unsafe fn remap_cstr_list(
         return Ok(list);
     }
     // SAFETY: `map_ptr` was published once and never freed for the life of the process.
-    let entries = unsafe { (*map_ptr).entries.as_slice() };
-    unsafe { remap_cstr_list_with(list, entries, mmap_guard) }
+    let table: &'a RemapTable = unsafe { &*map_ptr };
+    unsafe { remap_cstr_list_with(list, table.entries.as_slice(), &table.slots, guard) }
 }
 
-/// Rewrites a single shell command C string (for `system` / `popen`) lazily into `mmap_guard`
-/// only when embedded rewriting is needed.
-unsafe fn remap_cmd_cstr(
+/// Rewrites a single shell command C string (for `system` / `popen`) lazily into a pre-allocated
+/// scratch slot only when embedded rewriting is needed.
+unsafe fn remap_cmd_cstr<'a>(
     cmd: *const c_char,
-    mmap_guard: &mut MmapGuard,
+    guard: &mut SlotGuard<'a>,
 ) -> Result<*const c_char, ()> {
     if cmd.is_null() {
         return Ok(cmd);
@@ -433,17 +559,17 @@ unsafe fn remap_cmd_cstr(
         return Ok(cmd);
     }
     // SAFETY: `map_ptr` was published once and never freed for the life of the process.
-    let entries = unsafe { (*map_ptr).entries.as_slice() };
+    let table: &'a RemapTable = unsafe { &*map_ptr };
     let bytes = unsafe { CStr::from_ptr(cmd) }.to_bytes();
-    match measure_rewrite(bytes, entries)? {
+    match measure_rewrite(bytes, table.entries.as_slice())? {
         MeasureResult::Unchanged => Ok(cmd),
         MeasureResult::Exact(host) => Ok(host),
         MeasureResult::NeedsBytes(need) => {
-            *mmap_guard = MmapGuard::alloc(need)?;
-            // SAFETY: `mmap_guard` owns `need` writable bytes.
-            let buf = unsafe { slice::from_raw_parts_mut(mmap_guard.ptr.cast::<u8>(), need) };
+            *guard = SlotGuard::acquire(&table.slots, need)?;
+            // SAFETY: `guard` exclusively leases `need` writable bytes.
+            let buf = unsafe { slice::from_raw_parts_mut(guard.base(), need) };
             let mut cursor = 0usize;
-            match rewrite_bytes(bytes, entries, buf, &mut cursor)? {
+            match rewrite_bytes(bytes, table.entries.as_slice(), buf, &mut cursor)? {
                 RewriteResult::Unchanged => Ok(cmd),
                 RewriteResult::Exact(host) => Ok(host),
                 RewriteResult::Rewritten { start, .. } => {
@@ -451,6 +577,36 @@ unsafe fn remap_cmd_cstr(
                 }
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn remap_search_path_cstr<'a>(
+    search_path: *const c_char,
+    guard: &mut SlotGuard<'a>,
+) -> Result<*const c_char, ()> {
+    if search_path.is_null() {
+        return Ok(search_path);
+    }
+    let map_ptr = MAP.load(Ordering::Acquire);
+    if map_ptr.is_null() {
+        return Ok(search_path);
+    }
+    // SAFETY: `map_ptr` was published once and never freed for the life of the process.
+    let table: &'a RemapTable = unsafe { &*map_ptr };
+    if table.host_root.is_empty() {
+        return Ok(search_path);
+    }
+    let bytes = unsafe { CStr::from_ptr(search_path) }.to_bytes();
+    if find_subslice(bytes, GUEST_ROOT, 0).is_none() {
+        return Ok(search_path);
+    }
+    *guard = SlotGuard::acquire(&table.slots, SCRATCH_SLOT_BYTES)?;
+    // SAFETY: `guard` exclusively leases `guard.len()` writable bytes.
+    let buf = unsafe { slice::from_raw_parts_mut(guard.base(), guard.len()) };
+    match rewrite_search_path(bytes, table.host_root.as_slice(), buf)? {
+        None => Ok(search_path),
+        Some(_) => Ok(buf.as_ptr().cast::<c_char>()),
     }
 }
 
@@ -504,14 +660,14 @@ pub(crate) extern "C" fn remap_execve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    let mut argv_mmap = MmapGuard::EMPTY;
-    let mut envp_mmap = MmapGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let mut argv_slot = SlotGuard::EMPTY;
+    let mut envp_slot = SlotGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
     // SAFETY: `remap_cstr`, `new_argv`, and `new_envp` stay live across `execve`.
@@ -519,9 +675,9 @@ pub(crate) extern "C" fn remap_execve(
 }
 
 pub(crate) extern "C" fn remap_execv(path: *const c_char, argv: *const *const c_char) -> c_int {
-    let mut argv_mmap = MmapGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let mut argv_slot = SlotGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
     // SAFETY: `remap_cstr` and `new_argv` stay live across `execv`.
@@ -529,9 +685,9 @@ pub(crate) extern "C" fn remap_execv(path: *const c_char, argv: *const *const c_
 }
 
 pub(crate) extern "C" fn remap_execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
-    let mut argv_mmap = MmapGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let mut argv_slot = SlotGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
     // SAFETY: `remap_cstr` and `new_argv` stay live across `execvp`.
@@ -544,14 +700,14 @@ pub(crate) extern "C" fn remap_execvpe(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    let mut argv_mmap = MmapGuard::EMPTY;
-    let mut envp_mmap = MmapGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let mut argv_slot = SlotGuard::EMPTY;
+    let mut envp_slot = SlotGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
     // SAFETY: `remap_cstr`, `new_argv`, and `new_envp` stay live across `execvpe`.
@@ -565,17 +721,22 @@ pub(crate) extern "C" fn remap_execvP(
     search_path: *const c_char,
     argv: *const *const c_char,
 ) -> c_int {
-    let mut argv_mmap = MmapGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let mut path_slot = SlotGuard::EMPTY;
+    let mut argv_slot = SlotGuard::EMPTY;
+    let Ok(new_path) = (unsafe { remap_search_path_cstr(search_path, &mut path_slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
-    // SAFETY: `remap_cstr` and `new_argv` stay live across Darwin `execvP`.
-    unsafe { libc::execvP(remap_cstr(file), search_path, new_argv) }
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_slot) }) else {
+        set_errno(libc::E2BIG);
+        return -1;
+    };
+    // SAFETY: `remap_cstr`, `new_path`, and `new_argv` stay live across Darwin `execvP`.
+    unsafe { libc::execvP(remap_cstr(file), new_path, new_argv) }
 }
 
 /// Collects variadic `execl`/`execlp`/`execle` arguments into a tiny 32-pointer stack buffer
-/// (growing via async-signal-safe anonymous `mmap` when > 31 args), then calls `f(argv, envp)`.
+/// (spilling into a pre-allocated async-signal-safe scratch slot when > 31 args), then invokes `f`.
 unsafe fn collect_execl_args<F>(
     arg0: *const c_char,
     mut args: core::ffi::VaList<'_>,
@@ -586,58 +747,48 @@ where
     F: FnOnce(*const *const c_char, *const *const c_char) -> c_int,
 {
     let mut stack = [ptr::null::<c_char>(); EXECL_STACK_PTRS];
+    let mut spill = SlotGuard::EMPTY;
+    let mut spill_cap = 0usize;
     let mut count = 0usize;
-    let mut mmap = MmapGuard::EMPTY;
-    let mut mmap_cap = 0usize;
     let mut cur = arg0;
     loop {
-        if mmap.ptr.is_null() {
+        if spill.base().is_null() {
             if count < EXECL_STACK_PTRS - 1 {
                 if let Some(slot) = stack.get_mut(count) {
                     *slot = cur;
                 }
             } else {
-                let new_cap = EXECL_STACK_PTRS.saturating_mul(2);
-                let Some(bytes) = new_cap.checked_mul(size_of::<*const c_char>()) else {
-                    set_errno(libc::ENOMEM);
+                let map_ptr = MAP.load(Ordering::Acquire);
+                if map_ptr.is_null() {
+                    set_errno(libc::E2BIG);
                     return -1;
-                };
-                let Ok(buf) = MmapGuard::alloc(bytes) else {
-                    set_errno(libc::ENOMEM);
-                    return -1;
-                };
-                // SAFETY: `buf` is page-aligned and holds `new_cap` pointers.
-                unsafe {
-                    ptr::copy_nonoverlapping(stack.as_ptr(), buf.ptr.cast::<*const c_char>(), count);
-                    *buf.ptr.cast::<*const c_char>().add(count) = cur;
                 }
-                mmap = buf;
-                mmap_cap = new_cap;
+                // SAFETY: `map_ptr` lives for the process.
+                let table = unsafe { &*map_ptr };
+                let Ok(leased) = SlotGuard::acquire(&table.slots, SCRATCH_SLOT_BYTES) else {
+                    set_errno(libc::E2BIG);
+                    return -1;
+                };
+                spill_cap = leased.len() / size_of::<*const c_char>();
+                if count >= spill_cap {
+                    set_errno(libc::E2BIG);
+                    return -1;
+                }
+                // SAFETY: `leased.base()` is page-aligned and holds `spill_cap` pointers.
+                unsafe {
+                    ptr::copy_nonoverlapping(stack.as_ptr(), leased.base().cast::<*const c_char>(), count);
+                    *leased.base().cast::<*const c_char>().add(count) = cur;
+                }
+                spill = leased;
             }
         } else {
-            if count >= mmap_cap - 1 {
-                let Some(new_cap) = mmap_cap.checked_mul(2) else {
-                    set_errno(libc::ENOMEM);
-                    return -1;
-                };
-                let Some(bytes) = new_cap.checked_mul(size_of::<*const c_char>()) else {
-                    set_errno(libc::ENOMEM);
-                    return -1;
-                };
-                let Ok(buf) = MmapGuard::alloc(bytes) else {
-                    set_errno(libc::ENOMEM);
-                    return -1;
-                };
-                // SAFETY: `buf` holds `new_cap` pointers; old `mmap` is unmapped on replacement.
-                unsafe {
-                    ptr::copy_nonoverlapping(mmap.ptr.cast::<*const c_char>(), buf.ptr.cast::<*const c_char>(), count);
-                }
-                mmap = buf;
-                mmap_cap = new_cap;
+            if count >= spill_cap {
+                set_errno(libc::E2BIG);
+                return -1;
             }
-            // SAFETY: `count < mmap_cap - 1`.
+            // SAFETY: `count < spill_cap`.
             unsafe {
-                *mmap.ptr.cast::<*const c_char>().add(count) = cur;
+                *spill.base().cast::<*const c_char>().add(count) = cur;
             }
         }
         if cur.is_null() {
@@ -653,10 +804,10 @@ where
     } else {
         ptr::null()
     };
-    let argv = if mmap.ptr.is_null() {
+    let argv = if spill.base().is_null() {
         stack.as_ptr()
     } else {
-        mmap.ptr.cast::<*const c_char>()
+        spill.base().cast::<*const c_char>()
     };
     f(argv, envp)
 }
@@ -693,15 +844,15 @@ pub(crate) extern "C" fn remap_posix_spawn(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let mut argv_mmap = MmapGuard::EMPTY;
-    let mut envp_mmap = MmapGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_mmap) }) else {
-        return libc::ENOMEM;
+    let mut argv_slot = SlotGuard::EMPTY;
+    let mut envp_slot = SlotGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_slot) }) else {
+        return libc::E2BIG;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_mmap) }) else {
-        return libc::ENOMEM;
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_slot) }) else {
+        return libc::E2BIG;
     };
-    // SAFETY: POSIX `posix_spawn` never mutates `argv`/`envp` strings; buffers outlive the call.
+    // SAFETY: POSIX `posix_spawn` never mutates `argv`/`envp` strings; slots outlive the call.
     unsafe {
         libc::posix_spawn(
             pid,
@@ -722,15 +873,15 @@ pub(crate) extern "C" fn remap_posix_spawnp(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let mut argv_mmap = MmapGuard::EMPTY;
-    let mut envp_mmap = MmapGuard::EMPTY;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_mmap) }) else {
-        return libc::ENOMEM;
+    let mut argv_slot = SlotGuard::EMPTY;
+    let mut envp_slot = SlotGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_slot) }) else {
+        return libc::E2BIG;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_mmap) }) else {
-        return libc::ENOMEM;
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_slot) }) else {
+        return libc::E2BIG;
     };
-    // SAFETY: POSIX `posix_spawnp` never mutates `argv`/`envp` strings; buffers outlive the call.
+    // SAFETY: POSIX `posix_spawnp` never mutates `argv`/`envp` strings; slots outlive the call.
     unsafe {
         libc::posix_spawnp(
             pid,
@@ -744,9 +895,9 @@ pub(crate) extern "C" fn remap_posix_spawnp(
 }
 
 pub(crate) extern "C" fn remap_system(command: *const c_char) -> c_int {
-    let mut mmap = MmapGuard::EMPTY;
-    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let mut slot = SlotGuard::EMPTY;
+    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut slot) }) else {
+        set_errno(libc::E2BIG);
         return -1;
     };
     // SAFETY: `cmd` is null or a valid NUL-terminated string live across `libc::system`.
@@ -757,9 +908,9 @@ pub(crate) extern "C" fn remap_popen(
     command: *const c_char,
     mode: *const c_char,
 ) -> *mut libc::FILE {
-    let mut mmap = MmapGuard::EMPTY;
-    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut mmap) }) else {
-        set_errno(libc::ENOMEM);
+    let mut slot = SlotGuard::EMPTY;
+    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut slot) }) else {
+        set_errno(libc::E2BIG);
         return ptr::null_mut();
     };
     // SAFETY: `cmd` and `mode` are valid NUL-terminated C strings live across `libc::popen`.
@@ -907,7 +1058,11 @@ mod tests {
 
     use blaze_own::Vec;
 
-    use super::{BinRemapError, MmapGuard, RewriteResult, parse_entries, remap_cstr_list_with, rewrite_bytes};
+    use super::{
+        BinRemapError, RewriteResult, SCRATCH_SLOTS, SCRATCH_SLOT_BYTES, SlotGuard,
+        alloc_scratch_slots, derive_host_root, parse_entries, remap_cstr_list_with, rewrite_bytes,
+        rewrite_search_path,
+    };
 
     #[test]
     fn parse_valid_and_rejects_malformed() {
@@ -923,13 +1078,16 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_bytes_handles_exact_embedded_env_boundary_and_overflow() {
+    fn rewrite_bytes_and_search_path_handle_all_cases() {
         let alloc = blaze_own::testing::heap().alloc();
         let entries = parse_entries(
-            b"/target/debug/bin/app/cli\t/tmp/bzb-0123-b/app/cli\n/target/debug/bin/app/cli-v2\t/tmp/bzb-0123-b/app/cli-v2\n",
+            b"/target/debug/bin/app/cli\t/tmp/bzb-0123-r0-0/app/cli\n/target/debug/bin/app/cli-v2\t/tmp/bzb-0123-r0-0/app/cli-v2\n",
             alloc,
         )
         .expect("entries");
+        let host_root = derive_host_root(entries.as_slice(), alloc);
+        assert_eq!(host_root.as_slice(), b"/tmp/bzb-0123-r0-0");
+
         let mut scratch = [0u8; 256];
         let mut cursor = 0usize;
 
@@ -944,8 +1102,7 @@ mod tests {
         else {
             panic!("expected exact match");
         };
-        assert_eq!(unsafe { CStr::from_ptr(ptr) }.to_bytes(), b"/tmp/bzb-0123-b/app/cli");
-        assert_eq!(cursor, 0);
+        assert_eq!(unsafe { CStr::from_ptr(ptr) }.to_bytes(), b"/tmp/bzb-0123-r0-0/app/cli");
 
         let Ok(RewriteResult::Rewritten { start, end }) = rewrite_bytes(
             b"\"/target/debug/bin/app/cli\" && /target/debug/bin/app/cli-v2 --ok",
@@ -957,37 +1114,38 @@ mod tests {
         };
         assert_eq!(
             &scratch[start..end - 1],
-            b"\"/tmp/bzb-0123-b/app/cli\" && /tmp/bzb-0123-b/app/cli-v2 --ok"
+            b"\"/tmp/bzb-0123-r0-0/app/cli\" && /tmp/bzb-0123-r0-0/app/cli-v2 --ok"
         );
-        assert_eq!(scratch[end - 1], 0);
 
         assert!(matches!(
             rewrite_bytes(b"/target/debug/bin/app/cli2", entries.as_slice(), &mut scratch, &mut cursor),
             Ok(RewriteResult::Unchanged)
         ));
 
-        let Ok(RewriteResult::Rewritten { start, end }) = rewrite_bytes(
-            b"MY_BIN=/target/debug/bin/app/cli",
-            entries.as_slice(),
-            &mut scratch,
-            &mut cursor,
-        ) else {
-            panic!("expected rewritten env");
-        };
-        assert_eq!(&scratch[start..end - 1], b"MY_BIN=/tmp/bzb-0123-b/app/cli");
-
-        let mut tiny = [0u8; 8];
-        let mut tiny_cur = 0usize;
-        assert!(
-            rewrite_bytes(b"X=/target/debug/bin/app/cli", entries.as_slice(), &mut tiny, &mut tiny_cur).is_err()
+        let mut sp_buf = [0u8; 256];
+        let sp_len = rewrite_search_path(
+            b"/usr/bin:/target/debug/bin/app:/target/debug/bin:/bin",
+            host_root.as_slice(),
+            &mut sp_buf,
+        )
+        .expect("rewrite search_path")
+        .expect("changed");
+        assert_eq!(
+            &sp_buf[..sp_len - 1],
+            b"/usr/bin:/tmp/bzb-0123-r0-0/app:/tmp/bzb-0123-r0-0:/bin"
         );
     }
 
     #[test]
-    fn remap_cstr_list_handles_large_vectors_off_stack() {
+    fn remap_cstr_list_uses_preallocated_async_signal_safe_pool_for_large_vectors() {
         let alloc = blaze_own::testing::heap().alloc();
-        let entries =
-            parse_entries(b"/target/debug/bin/app/cli\t/tmp/bzb-0123-b/app/cli\n", alloc).expect("entries");
+        let entries = parse_entries(
+            b"/target/debug/bin/app/cli\t/tmp/bzb-0123-r0-0/app/cli\n",
+            alloc,
+        )
+        .expect("entries");
+        let slots = alloc_scratch_slots().expect("pre-allocated scratch pool");
+
         let plain = c"arg".as_ptr();
         let exact = c"/target/debug/bin/app/cli".as_ptr();
         let embedded = c"RUN=/target/debug/bin/app/cli --flag".as_ptr();
@@ -1003,25 +1161,33 @@ mod tests {
         }
         raw.push(ptr::null());
 
-        let mut mmap_guard = MmapGuard::EMPTY;
-        let out = unsafe { remap_cstr_list_with(raw.as_ptr(), entries.as_slice(), &mut mmap_guard) }
-            .expect("400-element argv must succeed via anonymous mmap");
-        assert!(!mmap_guard.ptr.is_null(), "expected off-stack mmap allocation when remapping");
-        assert_eq!(unsafe { CStr::from_ptr(*out.add(0)) }.to_bytes(), b"arg");
-        assert_eq!(unsafe { CStr::from_ptr(*out.add(300)) }.to_bytes(), b"/tmp/bzb-0123-b/app/cli");
-        assert_eq!(
-            unsafe { CStr::from_ptr(*out.add(350)) }.to_bytes(),
-            b"RUN=/tmp/bzb-0123-b/app/cli --flag"
-        );
-        assert_eq!(unsafe { CStr::from_ptr(*out.add(399)) }.to_bytes(), b"arg");
-        assert!(unsafe { *out.add(400) }.is_null());
+        {
+            let mut guard = SlotGuard::EMPTY;
+            let out = unsafe { remap_cstr_list_with(raw.as_ptr(), entries.as_slice(), &slots, &mut guard) }
+                .expect("400-element argv must succeed from pre-allocated pool");
+            assert!(!guard.base().is_null());
+            assert_eq!(unsafe { CStr::from_ptr(*out.add(0)) }.to_bytes(), b"arg");
+            assert_eq!(unsafe { CStr::from_ptr(*out.add(300)) }.to_bytes(), b"/tmp/bzb-0123-r0-0/app/cli");
+            assert_eq!(
+                unsafe { CStr::from_ptr(*out.add(350)) }.to_bytes(),
+                b"RUN=/tmp/bzb-0123-r0-0/app/cli --flag"
+            );
+            assert_eq!(unsafe { CStr::from_ptr(*out.add(399)) }.to_bytes(), b"arg");
+            assert!(unsafe { *out.add(400) }.is_null());
+        }
+        // Dropping `guard` returns the slot so all slots are free again.
+        assert!(!slots[0].in_use.load(core::sync::atomic::Ordering::Acquire));
 
-        // Unchanged vector performs zero mmap allocation.
         let unchanged_raw = [plain, plain, ptr::null()];
-        let mut unused_guard = MmapGuard::EMPTY;
-        let same = unsafe { remap_cstr_list_with(unchanged_raw.as_ptr(), entries.as_slice(), &mut unused_guard) }
+        let mut unused_guard = SlotGuard::EMPTY;
+        let same = unsafe { remap_cstr_list_with(unchanged_raw.as_ptr(), entries.as_slice(), &slots, &mut unused_guard) }
             .expect("unchanged vector succeeds");
         assert_eq!(same, unchanged_raw.as_ptr());
-        assert!(unused_guard.ptr.is_null());
+        assert!(unused_guard.base().is_null());
+
+        // Clean up the test's temporary pool mapping.
+        unsafe {
+            let _ = libc::munmap(slots[0].base.cast(), SCRATCH_SLOTS * SCRATCH_SLOT_BYTES);
+        }
     }
 }

@@ -32,10 +32,10 @@
 mod comptime;
 
 use std::env;
-use std::ffi::{CString, OsString, c_char, c_int};
+use std::ffi::{CString, OsStr, OsString, c_char, c_int};
 use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -62,15 +62,40 @@ enum Sidecar {
         program: ProgramId,
     },
     /// `mode=run` stub sidecar (e.g. `blaze test` `CARGO_BIN_EXE_*` launcher stubs): connects to
-    /// `socket`, writes the 4-byte little-endian `bin` id handshake, then speaks the `run_mode`
-    /// wire protocol (`blaze_launch::wire::run`) directly over that stream.
+    /// `socket`, writes the 12-byte little-endian `[bin, owner_suite, owner_row]` handshake, then
+    /// speaks the `run_mode` wire protocol (`blaze_launch::wire::run`) directly over that stream.
     Run {
         socket: PathBuf,
         bin: u32,
+        owner: (u32, u32),
         store: PathBuf,
         entry: OsString,
         native: Option<OsString>,
     },
+}
+
+/// Decodes an even-length hex string into a `PathBuf` using a stack buffer (used for `store_hex=`
+/// so arbitrary Unix paths containing newlines or non-UTF-8 bytes survive line-oriented sidecars).
+fn hex_path(hex: &str) -> Option<PathBuf> {
+    let digits = hex.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    let out_len = digits.len() / 2;
+    let mut buf = [0u8; 4096];
+    let dst = buf.get_mut(..out_len)?;
+    let digit = |it: u8| match it {
+        b'0'..=b'9' => Some(it - b'0'),
+        b'a'..=b'f' => Some(it - b'a' + 10),
+        b'A'..=b'F' => Some(it - b'A' + 10),
+        _ => None,
+    };
+    for (slot, pair) in dst.iter_mut().zip(digits.chunks_exact(2)) {
+        let high = digit(pair[0])?;
+        let low = digit(pair[1])?;
+        *slot = (high << 4) | low;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(dst)))
 }
 
 /// The sidecar beside `exe`, `<exe>.blaze-program`: one `name=value` a line.
@@ -96,10 +121,30 @@ fn sidecar(exe: &Path) -> Result<Sidecar, String> {
         let bin = bin_raw.parse::<u32>().map_err(|_| {
             format!("the sidecar {} names bin `{bin_raw}`, which is no u32", path.display())
         })?;
-        let store = PathBuf::from(field("store")?);
+        let owner = match line("owner") {
+            None => (u32::MAX, u32::MAX),
+            Some(raw) => {
+                let (s, r) = raw.split_once(':').ok_or_else(|| {
+                    format!("the sidecar {} names owner `{raw}`, expected `<suite>:<row>`", path.display())
+                })?;
+                let suite = s.parse::<u32>().map_err(|_| {
+                    format!("the sidecar {} names owner suite `{s}`, which is no u32", path.display())
+                })?;
+                let row = r.parse::<u32>().map_err(|_| {
+                    format!("the sidecar {} names owner row `{r}`, which is no u32", path.display())
+                })?;
+                (suite, row)
+            }
+        };
+        let store = match line("store_hex") {
+            Some(hex) => hex_path(hex).ok_or_else(|| {
+                format!("the sidecar {} has malformed `store_hex`", path.display())
+            })?,
+            None => PathBuf::from(field("store")?),
+        };
         let entry = OsString::from(field("entry")?);
         let native = line("native").map(OsString::from);
-        return Ok(Sidecar::Run { socket, bin, store, entry, native });
+        return Ok(Sidecar::Run { socket, bin, owner, store, entry, native });
     }
     let hex = field("program")?;
     let Some(id) = hex32(hex) else {
@@ -115,7 +160,12 @@ fn sidecar(exe: &Path) -> Result<Sidecar, String> {
 fn hex32(hex: &str) -> Option<[u8; 32]> {
     let mut id = [0u8; 32];
     let digits = hex.as_bytes();
-    let digit = |it: u8| (it as char).to_digit(16).map(|it| it as u8);
+    let digit = |it: u8| match it {
+        b'0'..=b'9' => Some(it - b'0'),
+        b'a'..=b'f' => Some(it - b'a' + 10),
+        b'A'..=b'F' => Some(it - b'A' + 10),
+        _ => None,
+    };
     let whole = digits.len() == 64
         && id.iter_mut().zip(digits.chunks(2)).all(|(byte, pair)| match (digit(pair[0]), digit(pair[1])) {
             (Some(high), Some(low)) => {
@@ -727,7 +777,7 @@ fn main() {
     };
     let (socket_path, program) = match side {
         Sidecar::Daemon { socket, program } => (socket, program),
-        Sidecar::Run { socket, bin, store, entry, native } => {
+        Sidecar::Run { socket, bin, owner: (owner_suite, owner_row), store, entry, native } => {
             use blaze_launch_rt::run_mode::{self, Dlsym, End, EntryForm, Folder, Handed, LauncherOwn, STOPPED, Start};
 
             let start = match Start::parse(entry.as_encoded_bytes()) {
@@ -759,13 +809,6 @@ fn main() {
                     ),
                 ),
             };
-            let (owner_suite, owner_row) = env::var_os("BLAZE_LAUNCH_BIN_OWNER")
-                .and_then(|v| v.into_string().ok())
-                .and_then(|s| {
-                    let (a, b) = s.split_once(':')?;
-                    Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
-                })
-                .unwrap_or((u32::MAX, u32::MAX));
             let [b0, b1, b2, b3] = bin.to_le_bytes();
             let [s0, s1, s2, s3] = owner_suite.to_le_bytes();
             let [r0, r1, r2, r3] = owner_row.to_le_bytes();

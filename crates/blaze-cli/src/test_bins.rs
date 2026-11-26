@@ -46,14 +46,9 @@ use crate::test_cache::EnteredFn;
 use crate::test_drive::DriveError;
 use crate::test_drive::suite_cache::{ChildAnswer, ChildResolver, ChildSent, SuiteCache};
 
-/// Maximum poll/serve bursts per `BinServer::pump` tick so active binaries stream at full speed
-/// without starving test child turns in `OneEach`.
+/// Maximum non-blocking poll/serve bursts per `BinServer::pump` tick so active binaries stream
+/// without starving test child turns or delaying `OneEach`'s injected-clock deadline checks.
 const PUMP_BURSTS: usize = 64;
-
-/// Short poll window (250 µs) used ONLY after a burst already made progress, so a binary child
-/// placing a code record and immediately firing its next `Up::Need` wakes `poll` in ~30 µs instead
-/// of falling back to `OneEach`'s 1 ms idle interval.
-const FOLLOW_UP_POLL: Timespec = Timespec { sec: 0, nsec: 250_000 };
 
 /// Maximum bytes read from one binary connection per burst.
 const READ_CHUNK: usize = 16 * 1024;
@@ -186,11 +181,17 @@ impl Drop for PrivateSocketDir {
 /// strictly `[a-zA-Z0-9/_.-]`, independent of `$HOME`, so unquoted/quoted shell invocations on
 /// macOS never split or interpret spaces/metacharacters from `$HOME`, and Linux mounts it strictly
 /// read-only at `/target/debug/bin` separately from the socket directory).
-struct PrivateBinsDir {
+pub(crate) struct PrivateBinsDir {
     dir: AString<'static>,
     pkg_dirs: AVec<'static, AString<'static>>,
     files: AVec<'static, AString<'static>>,
     tables: Alloc<'static>,
+}
+
+impl PrivateBinsDir {
+    pub(crate) fn dir_str(&self) -> &str {
+        self.dir.as_str()
+    }
 }
 
 impl Drop for PrivateBinsDir {
@@ -216,13 +217,21 @@ impl Drop for PrivateBinsDir {
     }
 }
 
+/// Per-test-row materialized launcher stubs + read-only sidecars (`owner=<suite>:<row>`),
+/// cleaned up automatically when the test row finishes.
+pub(crate) struct RowStubs<'f> {
+    pub guard: PrivateBinsDir,
+    pub env_pairs: Vec<(&'f str, &'f str), &'f Frame>,
+    pub bin_map: Option<String<&'f Frame>>,
+}
+
 struct BinRuntime<'a, 'h> {
     package: &'a str,
     bin_name: &'a str,
     cache_id: blaze_ids::ContentId,
     env_name: AString<'a>,
     guest_path: AString<'a>,
-    host_path: AString<'a>,
+    entry_line: AString<'a>,
     roots: Roots<'static>,
     entry_sym: [u8; 32],
     native: Option<crate::engine_native::NativeSend<'a>>,
@@ -851,7 +860,11 @@ impl<'a, 'h> BinBackend<'a> for RealBackend<'_, 'a, 'h> {
 
 /// Active binary stub server owned by `run_dirty` for the duration of one `blaze test` command.
 pub(crate) struct BinServer<'a, 'h> {
-    bins_dir_guard: PrivateBinsDir,
+    fs: &'a bstd::fs::Fs,
+    sock_nonce: u64,
+    launcher_abs: AString<'a>,
+    store_hex: AString<'a>,
+    cached_launcher: RefCell<Option<AVec<'a, u8>>>,
     sock_dir_guard: PrivateSocketDir,
     listener: blaze_sys::posix::io::OwnedFd,
     bins: AVec<'a, BinRuntime<'a, 'h>>,
@@ -864,14 +877,13 @@ pub(crate) struct BinServer<'a, 'h> {
 }
 
 impl<'a, 'h> BinServer<'a, 'h> {
-    /// Creates two sibling private (`0o700`) directories under `/tmp`: `/tmp/bzb-<nonce>-b` for
-    /// shell-token-safe launcher stubs + `mode=run` sidecars (independent of `$HOME`), and
-    /// `/tmp/bzb-<nonce>` for the `0o600` Unix listener socket `s`, then initializes per-binary
-    /// `SuiteCache`s.
+    /// Creates a short private (`0o700`) `/tmp/bzb-<nonce>` socket dir and binds `<sock_dir>/s`
+    /// (`0o600`), then initializes per-binary `SuiteCache`s. Per-test-row read-only stubs and
+    /// sidecars (`owner=<suite>:<row>`) are materialized on demand by [`Self::prepare_row_stubs`].
     #[expect(clippy::too_many_arguments, reason = "prepares the command's binary stub server from run_dirty's capabilities")]
     pub(crate) fn start(
         cx: &Cx,
-        fs: &bstd::fs::Fs,
+        fs: &'a bstd::fs::Fs,
         sock_nonce: u64,
         launcher: &str,
         store: &str,
@@ -881,14 +893,10 @@ impl<'a, 'h> BinServer<'a, 'h> {
         typed: crate::engine_body_record::TypedFrom<'h>,
         tables: Alloc<'static>,
         make_watch: MakeWatch<'static>,
-        frame: &Frame,
+        _frame: &Frame,
         alloc: Alloc<'a>,
     ) -> Result<BinServer<'a, 'h>, BinStubError> {
-        let mut bins_dir_guard = create_private_bins_dir(sock_nonce, tables)?;
-        let bins_rel_name = bstd::mem::format_in!(frame, "bzb-{sock_nonce:016x}-b");
-        let bins_rel = Path::new(bins_rel_name.as_str()).map_err(BinStubError::Path)?;
-        let bins_dir_handle = fs.home(cx, "/tmp", &bins_rel).map_err(BinStubError::Home)?;
-
+        let _ = cx;
         let sock_dir_guard = create_private_socket_dir(sock_nonce, tables)?;
         let listener = blaze_sys::posix::net::listen_unix(sock_dir_guard.socket.as_bytes(), 128).map_err(|errno| {
             BinStubError::Socket { path: owned_text(sock_dir_guard.socket.as_str(), tables), errno }
@@ -896,12 +904,14 @@ impl<'a, 'h> BinServer<'a, 'h> {
         // Lock the socket node itself to owner read/write only (`0o600`) inside the `0o700` dir.
         let _ = chmod_path(sock_dir_guard.socket.as_str(), 0o600, tables);
 
-        let mut launcher_bytes: Option<AVec<'_, u8>> = None;
+        let mut store_hex = String::with_capacity_in(store.len().saturating_mul(2), alloc);
+        encode_hex(store.as_bytes(), &mut store_hex);
+
         let mut runtimes = Vec::with_capacity_in(bins.len(), alloc);
         #[cfg(target_os = "macos")]
         let mut natives = Vec::new_in(alloc);
 
-        for (id, bin) in bins.iter().enumerate() {
+        for bin in bins.iter() {
             let exports = bin.native.map_or(&[][..], |send| send.items);
             let roots = run_roots(
                 bin.names.records,
@@ -928,47 +938,12 @@ impl<'a, 'h> BinServer<'a, 'h> {
                 why,
             })?;
 
-            let pkg_rel = Path::new(bin.package).map_err(BinStubError::Path)?;
-            let pkg_dir = make_or_open_dir(cx, &bins_dir_handle, &pkg_rel)?;
-            let mut pkg_abs = String::new_in(tables);
-            let _ = write!(pkg_abs, "{}/{}", bins_dir_guard.dir.as_str(), bin.package);
-            if !bins_dir_guard.pkg_dirs.iter().any(|p| p.as_str() == pkg_abs.as_str()) {
-                bins_dir_guard.pkg_dirs.push(pkg_abs);
+            #[cfg(target_os = "macos")]
+            if let Some(send) = bin.native
+                && !natives.iter().any(|existing: &crate::engine_native::NativeSend<'_>| existing.hex == send.hex)
+            {
+                natives.push(send);
             }
-            let bin_rel = Path::new(bin.bin_name).map_err(BinStubError::Path)?;
-            let mut host_path = String::new_in(alloc);
-            let _ = write!(host_path, "{}/{}/{}", bins_dir_guard.dir.as_str(), bin.package, bin.bin_name);
-            bins_dir_guard.files.push(owned_text(host_path.as_str(), tables));
-            place_launcher_stub(cx, &pkg_dir, &bin_rel, launcher, host_path.as_str(), &mut launcher_bytes, tables, alloc)?;
-
-            let sidecar_name = bstd::mem::format_in!(frame, "{}.blaze-program", bin.bin_name);
-            let sidecar_rel = Path::new(sidecar_name.as_str()).map_err(BinStubError::Path)?;
-            let mut sidecar = String::new_in(alloc);
-            let _ = writeln!(sidecar, "mode=run");
-            let _ = writeln!(sidecar, "socket={}", sock_dir_guard.socket.as_str());
-            let _ = writeln!(sidecar, "bin={id}");
-            let _ = writeln!(sidecar, "store={store}");
-            let _ = writeln!(sidecar, "entry={}", head.line);
-            if let Some(send) = bin.native {
-                match send.load_mode {
-                    crate::engine_native::NativeLoadMode::Eager => {
-                        let _ = writeln!(sidecar, "native={}", send.hex);
-                    }
-                    crate::engine_native::NativeLoadMode::Lazy => {
-                        let _ = writeln!(sidecar, "native=lazy:{}", send.hex);
-                    }
-                }
-                #[cfg(target_os = "macos")]
-                if !natives.iter().any(|existing: &crate::engine_native::NativeSend<'_>| existing.hex == send.hex) {
-                    natives.push(send);
-                }
-            }
-            let mut sidecar_abs = String::new_in(tables);
-            let _ = write!(sidecar_abs, "{}.blaze-program", host_path.as_str());
-            bins_dir_guard.files.push(sidecar_abs);
-            pkg_dir
-                .publish(cx, &sidecar_rel, Content::bytes(sidecar.as_bytes()), Durable::No)
-                .map_err(BinStubError::Fs)?;
 
             let mut env_name = String::new_in(alloc);
             let _ = write!(env_name, "CARGO_BIN_EXE_{}", bin.bin_name);
@@ -980,13 +955,15 @@ impl<'a, 'h> BinServer<'a, 'h> {
                 bin.package,
                 bin.bin_name
             );
+            let mut entry_line = String::new_in(alloc);
+            let _ = write!(entry_line, "{}", head.line);
             runtimes.push(BinRuntime {
                 package: bin.package,
                 bin_name: bin.bin_name,
                 cache_id,
                 env_name,
                 guest_path,
-                host_path,
+                entry_line,
                 roots,
                 entry_sym,
                 native: bin.native,
@@ -995,7 +972,11 @@ impl<'a, 'h> BinServer<'a, 'h> {
         }
 
         Ok(BinServer {
-            bins_dir_guard,
+            fs,
+            sock_nonce,
+            launcher_abs: String::from_str_in(launcher, alloc),
+            store_hex,
+            cached_launcher: RefCell::new(None),
             sock_dir_guard,
             listener,
             bins: runtimes,
@@ -1006,10 +987,6 @@ impl<'a, 'h> BinServer<'a, 'h> {
             tables,
             alloc,
         })
-    }
-
-    pub(crate) fn bins_dir(&self) -> &str {
-        self.bins_dir_guard.dir.as_str()
     }
 
     #[cfg(target_os = "linux")]
@@ -1043,39 +1020,100 @@ impl<'a, 'h> BinServer<'a, 'h> {
         self.natives.as_slice()
     }
 
-    /// Appends runtime `CARGO_BIN_EXE_<bin_name>` pairs for `package`. On Linux, runtime values
-    /// point at `/target/debug/bin/<package>/<bin_name>` (physically bind-mounted read-only inside
-    /// the sandbox) and no remap table is needed; on macOS, runtime values point at `<host_stub>`
-    /// and a `BLAZE_LAUNCH_BIN_MAP` table is returned for compile-time literal remapping.
-    pub(crate) fn fill_suite_env<'s, 'f>(
-        &'s self,
+    /// Materializes per-test-row launcher stubs + read-only sidecars (`owner=<suite>:<row>`,
+    /// `store_hex=<hex>`) under `/tmp/bzb-<nonce>-r<suite>-<row>` so:
+    /// - ZERO launcher-private owner metadata leaks into the guest test's environment (`std::env::vars`),
+    /// - attribution is unforgeable (read-only mount on Linux, read-only under Seatbelt on macOS)
+    ///   and survives `Command::env_clear()`, and
+    /// - every stub path contains strictly `[a-zA-Z0-9/_.-]` (shell-token safe regardless of `$HOME`).
+    pub(crate) fn prepare_row_stubs<'f>(
+        &self,
+        cx: &Cx,
         package: &str,
-        vars: &mut Vec<(&'s str, &'s str), &'f Frame>,
+        suite: u32,
+        row: u32,
         frame: &'f Frame,
-    ) -> (bool, Option<String<&'f Frame>>) {
+    ) -> Result<Option<RowStubs<'f>>, BinStubError> {
+        if !self.bins.iter().any(|b| b.package == package) {
+            return Ok(None);
+        }
+        let rel_name = bstd::mem::format_in!(frame, "bzb-{:016x}-r{suite}-{row}", self.sock_nonce);
+        let mut guard = create_private_bins_dir(rel_name.as_str(), self.tables)?;
+        let rel_path = Path::new(rel_name.as_str()).map_err(BinStubError::Path)?;
+        let dir_handle = self.fs.home(cx, "/tmp", &rel_path).map_err(BinStubError::Home)?;
+        let mut env_pairs: Vec<(&'f str, &'f str), &'f Frame> = Vec::new_in(frame);
         #[cfg(not(target_os = "linux"))]
-        let mut map = String::new_in(frame);
-        let mut any = false;
-        for bin in self.bins.iter() {
+        let mut bin_map = String::new_in(frame);
+        let mut cached_launcher = self.cached_launcher.borrow_mut();
+
+        for (id, bin) in self.bins.iter().enumerate() {
             if bin.package != package {
                 continue;
             }
-            any = true;
+            let pkg_rel = Path::new(bin.package).map_err(BinStubError::Path)?;
+            let pkg_dir = make_or_open_dir(cx, &dir_handle, &pkg_rel)?;
+            let mut pkg_abs = String::new_in(self.tables);
+            let _ = write!(pkg_abs, "{}/{}", guard.dir.as_str(), bin.package);
+            if !guard.pkg_dirs.iter().any(|p| p.as_str() == pkg_abs.as_str()) {
+                guard.pkg_dirs.push(pkg_abs);
+            }
+            let bin_rel = Path::new(bin.bin_name).map_err(BinStubError::Path)?;
+            let host_path = bstd::mem::format_in!(frame, "{}/{}/{}", guard.dir.as_str(), bin.package, bin.bin_name);
+            guard.files.push(owned_text(host_path.as_str(), self.tables));
+            place_launcher_stub(
+                cx,
+                &pkg_dir,
+                &bin_rel,
+                self.launcher_abs.as_str(),
+                host_path.as_str(),
+                &mut cached_launcher,
+                self.tables,
+                self.alloc,
+            )?;
+
+            let sidecar_name = bstd::mem::format_in!(frame, "{}.blaze-program", bin.bin_name);
+            let sidecar_rel = Path::new(sidecar_name.as_str()).map_err(BinStubError::Path)?;
+            let mut sidecar = String::new_in(self.alloc);
+            let _ = writeln!(sidecar, "mode=run");
+            let _ = writeln!(sidecar, "socket={}", self.sock_dir_guard.socket.as_str());
+            let _ = writeln!(sidecar, "bin={id}");
+            let _ = writeln!(sidecar, "owner={suite}:{row}");
+            let _ = writeln!(sidecar, "store_hex={}", self.store_hex.as_str());
+            let _ = writeln!(sidecar, "entry={}", bin.entry_line.as_str());
+            if let Some(send) = bin.native {
+                match send.load_mode {
+                    crate::engine_native::NativeLoadMode::Eager => {
+                        let _ = writeln!(sidecar, "native={}", send.hex);
+                    }
+                    crate::engine_native::NativeLoadMode::Lazy => {
+                        let _ = writeln!(sidecar, "native=lazy:{}", send.hex);
+                    }
+                }
+            }
+            let mut sidecar_abs = String::new_in(self.tables);
+            let _ = write!(sidecar_abs, "{}.blaze-program", host_path.as_str());
+            guard.files.push(sidecar_abs);
+            pkg_dir
+                .publish(cx, &sidecar_rel, Content::bytes(sidecar.as_bytes()), Durable::No)
+                .map_err(BinStubError::Fs)?;
+
+            let env_k = crate::work::held_str(bin.env_name.as_str(), frame);
             #[cfg(target_os = "linux")]
             {
-                let _ = frame;
-                vars.push((bin.env_name.as_str(), bin.guest_path.as_str()));
+                let env_v = crate::work::held_str(bin.guest_path.as_str(), frame);
+                env_pairs.push((env_k, env_v));
             }
             #[cfg(not(target_os = "linux"))]
             {
-                vars.push((bin.env_name.as_str(), bin.host_path.as_str()));
-                let _ = writeln!(map, "{}\t{}", bin.guest_path.as_str(), bin.host_path.as_str());
+                let env_v = crate::work::held_str(host_path.as_str(), frame);
+                env_pairs.push((env_k, env_v));
+                let _ = writeln!(bin_map, "{}\t{}", bin.guest_path.as_str(), host_path.as_str());
             }
         }
         #[cfg(target_os = "linux")]
-        return (any, None);
+        return Ok(Some(RowStubs { guard, env_pairs, bin_map: None }));
         #[cfg(not(target_os = "linux"))]
-        return (any, any.then_some(map));
+        return Ok(Some(RowStubs { guard, env_pairs, bin_map: Some(bin_map) }));
     }
 
     /// Joins entered functions and purity recorded by workspace binaries spawned under
@@ -1130,7 +1168,6 @@ impl<'a, 'h> BinServer<'a, 'h> {
         };
         let mut any_progress = false;
         let zero = Some(Timespec { sec: 0, nsec: 0 });
-        let mut timeout = zero;
         let mut read_buf = [0u8; READ_CHUNK];
         for _ in 0..PUMP_BURSTS {
             self.pollfds.clear();
@@ -1142,7 +1179,7 @@ impl<'a, 'h> BinServer<'a, 'h> {
                 }
                 self.pollfds.push(PollFd::new(conn.transport.fd(), ev));
             }
-            let ready = match poll(self.pollfds.as_mut_slice(), timeout) {
+            let ready = match poll(self.pollfds.as_mut_slice(), zero) {
                 Ok(n) => n,
                 Err(Errno::Intr) => continue,
                 Err(errno) => {
@@ -1172,7 +1209,18 @@ impl<'a, 'h> BinServer<'a, 'h> {
                     loop {
                         match blaze_sys::posix::net::accept_unix(self.listener.fd()) {
                             Ok(fd) => {
-                                let same_uid = blaze_sys::posix::net::peer_is_self_uid(fd.fd()).unwrap_or(false);
+                                let same_uid = match blaze_sys::posix::net::peer_is_self_uid(fd.fd()) {
+                                    Ok(ok) => ok,
+                                    Err(errno) => {
+                                        drop(fd);
+                                        return Err(BinServeError {
+                                            owner: None,
+                                            package: owned_text("<listener>", self.tables),
+                                            bin: owned_text("<listener>", self.tables),
+                                            why: BinServeWhy::ListenerPoll(errno),
+                                        });
+                                    }
+                                };
                                 if self.proto.accept(same_uid, fd).is_some() {
                                     burst_progress = true;
                                 }
@@ -1260,12 +1308,21 @@ impl<'a, 'h> BinServer<'a, 'h> {
             }
             if burst_progress {
                 any_progress = true;
-                timeout = Some(FOLLOW_UP_POLL);
             } else {
                 break;
             }
         }
         Ok(any_progress)
+    }
+}
+
+fn encode_hex(bytes: &[u8], out: &mut AString<'_>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in bytes {
+        if let (Some(&hi), Some(&lo)) = (HEX.get(usize::from(b >> 4)), HEX.get(usize::from(b & 0x0f))) {
+            out.push(char::from(hi));
+            out.push(char::from(lo));
+        }
     }
 }
 
@@ -1297,9 +1354,9 @@ fn flush_peer<S>(proto: &mut BinProtocol<'_, S, blaze_sys::posix::io::OwnedFd>, 
     wrote_any
 }
 
-fn create_private_bins_dir(nonce: u64, tables: Alloc<'static>) -> Result<PrivateBinsDir, BinStubError> {
+fn create_private_bins_dir(rel_name: &str, tables: Alloc<'static>) -> Result<PrivateBinsDir, BinStubError> {
     let mut dir = String::new_in(tables);
-    let _ = write!(dir, "/tmp/bzb-{nonce:016x}-b");
+    let _ = write!(dir, "/tmp/{rel_name}");
     with_cstr(dir.as_str(), tables, |cdir| {
         blaze_sys::posix::proc::make_dir_mode(blaze_sys::Path::new(cdir), 0o700)
             .map_err(|errno| BinStubError::Stub { path: owned_text(dir.as_str(), tables), errno })

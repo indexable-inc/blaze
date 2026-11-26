@@ -3108,47 +3108,45 @@ impl<'c> Launched<'c, '_, '_> {
         vars.push(("TMPDIR", temp.as_str()));
         vars.extend_from_slice(self.place.vars);
         let package = self.place.vars;
-        // Borrow `self.bins` strictly synchronously here to snapshot bin-exe env vars and remap
-        // table into `frame` (never across `.await`, rule 27). Only integration-test and benchmark
-        // suites receive `CARGO_BIN_EXE_*` (`blaze_scope::crate_env::env_of`).
+        // Borrow `self.bins` strictly synchronously here to materialize per-row read-only stubs
+        // (`owner=<suite>:<row>` inside the read-only sidecar — zero extra guest env vars!) and
+        // snapshot `CARGO_BIN_EXE_*` into `frame` (never across `.await`, rule 27).
         let mut bin_env_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
         let mut bin_map_text: Option<String<&Frame>> = None;
         let mut bin_dir_text: Option<String<&Frame>> = None;
         #[cfg(target_os = "linux")]
         let mut bin_sock_dir_text: Option<String<&Frame>> = None;
-        let mut bin_owner_text: Option<String<&Frame>> = None;
         #[cfg(target_os = "macos")]
         let mut bin_socket_text: Option<String<&Frame>> = None;
         #[cfg(target_os = "macos")]
         let mut bin_natives: Vec<crate::engine_native::NativeSend<'_>, &Frame> = Vec::new_in(frame);
+        let mut _row_stubs = None;
         if self.expose_bins
             && let Some(bins_cell) = self.bins
         {
             let bins_ref = bins_cell.borrow();
-            let mut raw_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
-            let (any, map) = bins_ref.fill_suite_env(self.package, &mut raw_pairs, frame);
-            if any {
-                for &(k, v) in raw_pairs.iter() {
-                    bin_env_pairs.push((crate::work::held_str(k, frame), crate::work::held_str(v, frame)));
-                }
-                bin_map_text = map;
-                bin_dir_text = Some(String::from_str_in(bins_ref.bins_dir(), frame));
+            if let Some(prepared) = bins_ref
+                .prepare_row_stubs(cx, self.package, self.suite.0, row, frame)
+                .map_err(OneError::Bins)?
+            {
+                bin_env_pairs = prepared.env_pairs;
+                bin_map_text = prepared.bin_map;
+                bin_dir_text = Some(String::from_str_in(prepared.guard.dir_str(), frame));
                 #[cfg(target_os = "linux")]
                 {
                     bin_sock_dir_text = Some(String::from_str_in(bins_ref.sock_dir(), frame));
                 }
-                bin_owner_text = Some(bstd::mem::format_in!(frame, "{}:{row}", self.suite.0));
                 #[cfg(target_os = "macos")]
                 {
                     bin_socket_text = Some(String::from_str_in(bins_ref.socket_path(), frame));
                     bin_natives.extend_from_slice(bins_ref.bin_natives());
                 }
+                _row_stubs = Some(prepared.guard);
             }
         }
         vars.extend_from_slice(bin_env_pairs.as_slice());
         let command = self.env.iter().copied().filter(|(name, _)| {
             *name != "TMPDIR"
-                && *name != "BLAZE_LAUNCH_BIN_OWNER"
                 && package.binary_search_by(|(set, _)| set.cmp(name)).is_err()
                 && !bin_env_pairs.iter().any(|(set, _)| set == name)
         });
@@ -3160,9 +3158,6 @@ impl<'c> Launched<'c, '_, '_> {
         }
         if let Some(map) = bin_map_text.as_ref() {
             vars.push(("BLAZE_LAUNCH_BIN_MAP", map.as_str()));
-        }
-        if let Some(owner) = bin_owner_text.as_ref() {
-            vars.push(("BLAZE_LAUNCH_BIN_OWNER", owner.as_str()));
         }
         #[cfg(target_os = "macos")]
         let unwound_full = self.tests.harnessed().then(|| bstd::mem::format_in!(frame, "{}/unwound-{row}", self.temp));
@@ -4523,7 +4518,7 @@ fn pooled<'h>(
 #[expect(clippy::too_many_arguments, reason = "the command supplies the dirty test loop, records, and specific runtime capabilities")]
 fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     cx: &Cx,
-    fs: &bstd::fs::Fs,
+    fs: &'a bstd::fs::Fs,
     env: Option<&bstd::env::Env>,
     host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
