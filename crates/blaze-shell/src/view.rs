@@ -228,6 +228,7 @@ pub enum HitAction {
     ToggleTableView(BlockId),
     ToggleHiddenCols(BlockId),
     TogglePtyFullscreen,
+    FocusInlinePty(BlockId),
     FindToggleCase,
     FindNext,
     FindPrev,
@@ -783,6 +784,8 @@ pub struct Scene {
     pub drag_sources: Vec<DragSource>,
     /// Logical rect of the recessed composer input hotbar (for click-to-cursor & drag drop).
     pub composer_rect: HitRect,
+    /// Logical rect of the currently running inline PTY block (when not fullscreen).
+    pub inline_pty_rect: Option<HitRect>,
     /// Logical origin `[x, y]` of character `(0, 0)` inside the composer input hotbar.
     pub composer_text_origin: [f32; 2],
     /// Logical rect `[x0, y0, x1, y1]` of the live cursor in this frame (feeds Ghostty sweep trail).
@@ -823,6 +826,7 @@ impl Scene {
             block_tops: Vec::new(),
             drag_sources: Vec::new(),
             composer_rect: HitRect::new(0.0, 0.0, 0.0, 0.0),
+            inline_pty_rect: None,
             composer_text_origin: [0.0, 0.0],
             cursor_rect: None,
             total_content_height: 0.0,
@@ -1593,6 +1597,9 @@ impl Scene {
                 sub.composer_rect.x1 + dx,
                 sub.composer_rect.y1 + dy,
             );
+            self.inline_pty_rect = sub
+                .inline_pty_rect
+                .map(|r| HitRect::new(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy));
             self.composer_text_origin = [
                 sub.composer_text_origin[0] + dx,
                 sub.composer_text_origin[1] + dy,

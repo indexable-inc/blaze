@@ -304,6 +304,7 @@ mod macos_app {
                 HitAction::ResizeAgentSidebar | HitAction::ResizeTableColumn { .. } => {
                     CursorKind::ResizeEW
                 }
+                HitAction::FocusInlinePty(_) => CursorKind::IBeam,
                 _ => CursorKind::Pointer,
             };
         }
@@ -777,6 +778,9 @@ mod macos_app {
         /// Alternate-screen TUIs (`claude`, `vim`, `htop`) render inline by default so scrollback
         /// remains visible; toggle true fullscreen anytime with `Cmd+Shift+F` (or block `⤢` pill).
         pty_fullscreen: bool,
+        /// When an inline PTY is running (`!pty_fullscreen`), whether keyboard & scroll focus is
+        /// captured by the inline PTY (`true`) or returned to the shell composer (`false`).
+        pty_focused: bool,
         active_sysmon: Option<BlockId>,
         sysmon_fullscreen: bool,
         last_sysmon_tick: Instant,
@@ -830,6 +834,7 @@ mod macos_app {
                 scroll_to_block: None,
                 active_pty: None,
                 pty_fullscreen: false,
+                pty_focused: false,
                 active_sysmon: None,
                 sysmon_fullscreen: false,
                 last_sysmon_tick: Instant::now(),
@@ -846,6 +851,41 @@ mod macos_app {
 
         fn cwd(&self) -> &str {
             self.store.active_state().cwd.as_ref()
+        }
+
+        fn pty_accepts_input(&self) -> bool {
+            self.active_pty.is_some() && (self.pty_fullscreen || self.pty_focused)
+        }
+
+        fn send_pty_focus_event(&mut self, focused: bool) {
+            if let Some(ap) = &self.active_pty
+                && let Some(blk) = self.store.block_mut(ap.block_id)
+                && let BlockBody::Terminal { term, running: true, .. } = &mut blk.body
+            {
+                term.set_focused(focused);
+                let seq = blaze_vt::input::focus::encode(
+                    if focused {
+                        blaze_vt::input::focus::FocusEvent::Gained
+                    } else {
+                        blaze_vt::input::focus::FocusEvent::Lost
+                    },
+                    blaze_vt::input::focus::FocusOpts {
+                        reporting: term.mode(blaze_vt::terminal::Mode::FocusEvent),
+                    },
+                );
+                if !seq.is_empty() {
+                    ap.pty.write_all(seq);
+                }
+            }
+        }
+
+        fn set_pty_focus(&mut self, focused: bool) -> bool {
+            if self.pty_focused == focused {
+                return false;
+            }
+            self.pty_focused = focused;
+            self.send_pty_focus_event(focused);
+            true
         }
 
         fn process_tag(&self) -> Option<&'static str> {
@@ -1456,7 +1496,8 @@ mod macos_app {
                         width: cell_px.0,
                         height: cell_px.1,
                     });
-                    if let Ok(term) = Terminal::new_in(opts, alloc) {
+                    if let Ok(mut term) = Terminal::new_in(opts, alloc) {
+                        term.set_focused(true);
                         let body = BlockBody::Terminal {
                             term,
                             pid: child_pid,
@@ -1487,6 +1528,7 @@ mod macos_app {
                             pty,
                             started: Instant::now(),
                         });
+                        self.pty_focused = true;
                         self.auto_scroll_bottom = true;
                     }
                 }
@@ -1895,6 +1937,7 @@ mod macos_app {
                     metrics,
                     scroll_y: pane.scroll_y,
                     cursor_visible: pane_cursor_vis,
+                    pty_focused: pane_cursor_vis && pane.pty_accepts_input(),
                     now_ns: frame_now,
                     zoom_pct,
                     inline_titlebar: false,
@@ -1929,6 +1972,7 @@ mod macos_app {
                         metrics,
                         scroll_y: pane.scroll_y,
                         cursor_visible: pane_cursor_vis,
+                        pty_focused: pane_cursor_vis && pane.pty_accepts_input(),
                         now_ns: frame_now,
                         zoom_pct,
                         inline_titlebar: false,
@@ -2864,6 +2908,9 @@ mod macos_app {
                                             dirty = true;
                                         } else if pane.active_pty.is_some() {
                                             pane.pty_fullscreen = !pane.pty_fullscreen;
+                                            if pane.pty_fullscreen {
+                                                pane.set_pty_focus(true);
+                                            }
                                             pty_sizes_dirty = true;
                                             dirty = true;
                                         }
@@ -3332,10 +3379,23 @@ mod macos_app {
                                 .get_mut(&wm.focused_pane())
                                 .expect("focused pane must exist");
 
-                            // Per-pane macOS Command shortcuts (`Cmd+K/B/A/C/X/V/Z` & line navigation).
+                            // Per-pane macOS Command shortcuts (`Cmd+Escape`, `Cmd+K/B/A/C/X/V/Z` & line navigation).
                             if flags.contains(NSEventModifierFlags::Command) {
-                                // Navigation & editing inside the composer when no PTY is running.
-                                if shell.active_pty.is_none() {
+                                // `Cmd+Escape`: pop keyboard focus out of an inline PTY into the shell composer.
+                                if !ctrl
+                                    && !alt
+                                    && !shift
+                                    && key == Key::Escape
+                                    && shell.active_pty.is_some()
+                                    && !shell.pty_fullscreen
+                                    && shell.pty_focused
+                                {
+                                    shell.set_pty_focus(false);
+                                    dirty = true;
+                                    continue;
+                                }
+                                // Navigation & editing inside the composer when no PTY accepts input.
+                                if !shell.pty_accepts_input() {
                                     match key {
                                         Key::ArrowLeft => {
                                             shell.editor.move_home(shift);
@@ -3393,7 +3453,7 @@ mod macos_app {
                                         dirty = true;
                                         continue;
                                     }
-                                    "z" if shell.active_pty.is_none() => {
+                                    "z" if !shell.pty_accepts_input() => {
                                         if shift {
                                             shell.editor.redo();
                                         } else {
@@ -3404,13 +3464,13 @@ mod macos_app {
                                         dirty = true;
                                         continue;
                                     }
-                                    "a" if shell.active_pty.is_none() => {
+                                    "a" if !shell.pty_accepts_input() => {
                                         output_selection = None;
                                         shell.editor.select_all();
                                         dirty = true;
                                         continue;
                                     }
-                                    "x" if shell.active_pty.is_none() => {
+                                    "x" if !shell.pty_accepts_input() => {
                                         if let Some(cut) = shell.editor.cut_selection() {
                                             copy_to_pasteboard(&cut);
                                             popup_engaged = false;
@@ -3437,7 +3497,7 @@ mod macos_app {
                                                 continue;
                                             }
                                         }
-                                        if shell.active_pty.is_none() {
+                                        if !shell.pty_accepts_input() {
                                             let copy_text = shell
                                                 .editor
                                                 .selected_text()
@@ -3453,7 +3513,9 @@ mod macos_app {
                                         let t = unsafe { NSPasteboardTypeString };
                                         if let Some(s) = pb.stringForType(t) {
                                             let pasted = s.to_string();
-                                            if let Some(ap) = &shell.active_pty {
+                                            if shell.pty_accepts_input()
+                                                && let Some(ap) = &shell.active_pty
+                                            {
                                                 if let Some(blk) = shell.store.block(ap.block_id)
                                                     && let BlockBody::Terminal { term, .. } = &blk.body
                                                 {
@@ -3910,8 +3972,10 @@ mod macos_app {
                                 continue;
                             }
 
-                            // Forward directly to live PTY when an interactive external command is running.
-                            if let Some(ap) = &shell.active_pty {
+                            // Forward directly to live PTY when an interactive external command is focused.
+                            if shell.pty_accepts_input()
+                                && let Some(ap) = &shell.active_pty
+                            {
                                 if let Some(blk) = shell.store.block(ap.block_id)
                                     && let BlockBody::Terminal { term, .. } = &blk.body
                                 {
@@ -4412,6 +4476,11 @@ mod macos_app {
                                     dirty = true;
                                 }
                             } else if let Some(ap) = &shell.active_pty
+                                && (shell.pty_fullscreen
+                                    || (shell.pty_focused
+                                        && composite_scene
+                                            .inline_pty_rect
+                                            .is_some_and(|r| r.contains(mx, my))))
                                 && dy.abs() > 0.5
                                 && let Some(blk) = shell.store.block(ap.block_id)
                                 && let BlockBody::Terminal { term, .. } = &blk.body
@@ -4428,10 +4497,15 @@ mod macos_app {
                                         .unwrap_or_else(|| {
                                             HitRect::new(0.0, TOP_BAR_H, size.width as f32, size.height as f32)
                                         });
+                                    let target_rect = if !shell.pty_fullscreen {
+                                        composite_scene.inline_pty_rect.unwrap_or(pane_rect)
+                                    } else {
+                                        pane_rect
+                                    };
                                     let cw = (fonts.metrics.cell_w as f32 / scale as f32).max(1.0);
                                     let ch = (fonts.metrics.cell_h as f32 / scale as f32).max(1.0);
-                                    let rel_x = (mx - pane_rect.x0 - 10.0).max(0.0);
-                                    let rel_y = (my - pane_rect.y0 - 6.0).max(0.0);
+                                    let rel_x = (mx - target_rect.x0 - 10.0).max(0.0);
+                                    let rel_y = (my - target_rect.y0 - 6.0).max(0.0);
                                     let cols = term.screen().cols() as u32;
                                     let rows = term.screen().rows() as u32;
                                     let msize = blaze_vt::input::mouse::Size {
@@ -4711,7 +4785,13 @@ mod macos_app {
                                                 continue;
                                             }
                                             HitAction::ToggleZoomPane(pid) => {
+                                                let prev_pid = wm.focused_pane();
                                                 wm.focus_pane(pid);
+                                                if prev_pid != pid
+                                                    && let Some(prev) = panes.get_mut(&prev_pid)
+                                                {
+                                                    prev.set_pty_focus(false);
+                                                }
                                                 if wm.toggle_zoom() {
                                                     active_popover = None;
                                                     pty_sizes_dirty = true;
@@ -4720,7 +4800,13 @@ mod macos_app {
                                                 continue;
                                             }
                                             HitAction::FocusPane(pid) => {
+                                                let prev_pid = wm.focused_pane();
                                                 if wm.focus_pane(pid) {
+                                                    if prev_pid != pid
+                                                        && let Some(prev) = panes.get_mut(&prev_pid)
+                                                    {
+                                                        prev.set_pty_focus(false);
+                                                    }
                                                     active_popover = None;
                                                     output_selection = None;
                                                     output_nav = None;
@@ -4733,12 +4819,19 @@ mod macos_app {
                                     }
                                     if let Some(pl) =
                                         tile_layout.panes.iter().find(|p| p.rect.contains(x, y))
-                                        && wm.focus_pane(pl.pane)
                                     {
-                                        active_popover = None;
-                                        output_selection = None;
-                                        output_nav = None;
-                                        dirty = true;
+                                        let prev_pid = wm.focused_pane();
+                                        if wm.focus_pane(pl.pane) {
+                                            if prev_pid != pl.pane
+                                                && let Some(prev) = panes.get_mut(&prev_pid)
+                                            {
+                                                prev.set_pty_focus(false);
+                                            }
+                                            active_popover = None;
+                                            output_selection = None;
+                                            output_nav = None;
+                                            dirty = true;
+                                        }
                                     }
                                 }
                             }
@@ -4828,13 +4921,22 @@ mod macos_app {
                                 continue;
                             }
                             if !on_resize_edge(x, y, size.width as f32, size.height as f32)
-                                && !shell.store.is_alternate_screen()
+                                && !(shell.pty_fullscreen && shell.store.is_alternate_screen())
                                 && shell.yazi.is_none()
                                 && shell.agent_hub.is_none()
                             {
                                 output_nav = None;
                                 if let Some(action) = composite_scene.hit_test(x, y) {
                                     output_selection = None;
+                                    if !matches!(
+                                        action,
+                                        HitAction::FocusInlinePty(_) | HitAction::TogglePtyFullscreen
+                                    ) && shell.active_pty.is_some()
+                                        && !shell.pty_fullscreen
+                                        && shell.set_pty_focus(false)
+                                    {
+                                        dirty = true;
+                                    }
                                     match action {
                                         HitAction::SwitchBranch(bid) => {
                                             if shell.store.switch_branch(bid) {
@@ -4879,9 +4981,18 @@ mod macos_app {
                                                 dirty = true;
                                             } else if shell.active_pty.is_some() {
                                                 shell.pty_fullscreen = !shell.pty_fullscreen;
+                                                if shell.pty_fullscreen {
+                                                    shell.set_pty_focus(true);
+                                                }
                                                 pty_sizes_dirty = true;
                                                 dirty = true;
                                             }
+                                        }
+                                        HitAction::FocusInlinePty(_) => {
+                                            active_popover = None;
+                                            output_selection = None;
+                                            shell.set_pty_focus(true);
+                                            dirty = true;
                                         }
                                         HitAction::SysMonToggleTree(bid) => {
                                             if let Some(blk) = shell.store.block_mut(bid)
@@ -5262,6 +5373,15 @@ mod macos_app {
                                     active_popover = None;
                                     dirty = true;
                                 }
+                                if shell.active_pty.is_some()
+                                    && !shell.pty_fullscreen
+                                    && !composite_scene
+                                        .inline_pty_rect
+                                        .is_some_and(|r| r.contains(x, y))
+                                    && shell.set_pty_focus(false)
+                                {
+                                    dirty = true;
+                                }
 
                                 // Click inside the inline composer: enter Insert mode and position/select cursor.
                                 if composite_scene.composer_rect.contains(x, y) {
@@ -5399,7 +5519,7 @@ mod macos_app {
                                 });
                                 if in_open_popover {
                                     dirty = true;
-                                } else if !shell.store.is_alternate_screen()
+                                } else if !(shell.pty_fullscreen && shell.store.is_alternate_screen())
                                     && shell.yazi.is_none()
                                     && shell.agent_hub.is_none()
                                     && shell.editor.reverse_search.is_none()
@@ -5465,7 +5585,7 @@ mod macos_app {
                                     &composite_scene,
                                     &tile_layout.handles,
                                     dragging_split,
-                                    shell.store.is_alternate_screen(),
+                                    shell.pty_fullscreen,
                                     pending_drag.as_ref().is_some_and(|d| d.active),
                                     selecting_composer || selecting_output,
                                     x,
@@ -5604,7 +5724,7 @@ mod macos_app {
                                 dirty = true;
                                 let alt_scr = panes
                                     .get(&wm.focused_pane())
-                                    .is_some_and(|p| p.store.is_alternate_screen());
+                                    .is_some_and(|p| p.pty_fullscreen);
                                 let next = cursor_for_point(
                                     &composite_scene,
                                     &tile_layout.handles,
@@ -5670,7 +5790,7 @@ mod macos_app {
                                     &composite_scene,
                                     &tile_layout.handles,
                                     None,
-                                    shell.store.is_alternate_screen(),
+                                    shell.pty_fullscreen,
                                     false,
                                     false,
                                     x,
@@ -5688,7 +5808,7 @@ mod macos_app {
                                     &composite_scene,
                                     &tile_layout.handles,
                                     None,
-                                    shell.store.is_alternate_screen(),
+                                    shell.pty_fullscreen,
                                     false,
                                     false,
                                     x,
@@ -5711,7 +5831,7 @@ mod macos_app {
                                     &composite_scene,
                                     &tile_layout.handles,
                                     None,
-                                    shell.store.is_alternate_screen(),
+                                    shell.pty_fullscreen,
                                     false,
                                     false,
                                     x,
@@ -5995,6 +6115,7 @@ mod macos_app {
                 }
                 if let Some((block_id, code, dur_ms)) = pty_finished {
                     pane.pty_fullscreen = false;
+                    pane.pty_focused = false;
                     if let Some(ap) = pane.active_pty.take() {
                         let drain_deadline = Instant::now() + std::time::Duration::from_millis(15);
                         loop {
@@ -6086,6 +6207,11 @@ mod macos_app {
             let now_key_window = window.isKeyWindow();
             if now_key_window != was_key_window {
                 was_key_window = now_key_window;
+                if let Some(pane) = panes.get_mut(&wm.focused_pane())
+                    && pane.pty_accepts_input()
+                {
+                    pane.send_pty_focus_event(now_key_window);
+                }
                 dirty = true;
             }
             if dirty && !is_hidden_or_min {
@@ -6258,7 +6384,7 @@ mod macos_app {
                 {
                     let alt_scr = panes
                         .get(&wm.focused_pane())
-                        .is_some_and(|p| p.store.is_alternate_screen());
+                        .is_some_and(|p| p.pty_fullscreen);
                     let next = cursor_for_point(
                         &composite_scene,
                         &tile_layout.handles,

@@ -16,7 +16,7 @@ use blaze_vt::page::Wide;
 use blaze_vt::style::{Color as VtColor, Rgb as VtRgb, Underline as VtUnderline};
 use blaze_vt::terminal::{Mode as VtMode, Terminal};
 
-use crate::blocks::{Block, BlockBody, BlockStore, TABLE_FOLD_ROWS};
+use crate::blocks::{Block, BlockBody, BlockId, BlockStore, TABLE_FOLD_ROWS};
 use crate::editor::{
     COMPLETION_VISIBLE_ROWS, CommandPalette, CompletionKind, Editor, HISTORY_VISIBLE_ROWS,
     PALETTE_VISIBLE_ROWS,
@@ -52,6 +52,8 @@ pub struct LayoutInput<'a> {
     pub metrics: CellMetrics,
     pub scroll_y: f32,
     pub cursor_visible: bool,
+    /// True when an inline running PTY block in this pane currently holds keyboard focus.
+    pub pty_focused: bool,
     /// Current UTC timestamp in nanoseconds for human relative time formatting (`3m ago`).
     pub now_ns: i64,
     /// Current UI zoom percentage (100 = default `13pt`).
@@ -130,6 +132,7 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
             m,
             feed_clip,
             input.cursor_visible,
+            input.pty_focused,
             input.now_ns,
         );
         content_y += h + BLOCK_PAD_Y;
@@ -152,7 +155,7 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
         col_x1,
         m,
         feed_clip,
-        input.cursor_visible,
+        input.cursor_visible && !input.pty_focused,
         input.drag,
         input.cursor_trail,
     );
@@ -1246,6 +1249,7 @@ fn layout_block(
     m: CellMetrics,
     clip_id: u32,
     cursor_visible: bool,
+    pty_focused: bool,
     now_ns: i64,
 ) -> f32 {
     let mut cur_y = y0;
@@ -1334,7 +1338,49 @@ fn layout_block(
                     subtitle: Some("Inline by default so scrollback stays visible".to_owned()),
                 },
             );
-            rx = fx0 - 10.0;
+            rx = fx0 - 6.0;
+
+            let (foc_lbl, foc_fg, foc_bg, foc_border) = if pty_focused {
+                (
+                    "● focused",
+                    theme::rgb(0x8c, 0xc2, 0xff),
+                    theme::rgba(0x58, 0x9d, 0xf6, 0.14),
+                    theme::rgba(0x58, 0x9d, 0xf6, 0.35),
+                )
+            } else {
+                ("click to type", theme::INK_3, theme::BG_CHIP, theme::LINE_FAINT)
+            };
+            let foc_w = foc_lbl.chars().count() as f32 * m.cw + 10.0;
+            let foc_x0 = rx - foc_w;
+            scene.round_rect(
+                foc_x0,
+                cur_y - 1.0,
+                rx,
+                cur_y + m.ch + 1.0,
+                4.0,
+                foc_bg,
+                1.0,
+                foc_border,
+                clip_id,
+            );
+            scene.text(foc_x0 + 5.0, cur_y, foc_lbl, foc_fg, false, false, clip_id);
+            let foc_rect = HitRect::new(foc_x0, cur_y - 2.0, rx, cur_y + m.ch + 2.0);
+            if !pty_focused {
+                scene.push_hit_clipped(foc_rect, clip_id, HitAction::FocusInlinePty(block.id));
+            }
+            scene.push_hover_clipped(
+                foc_rect,
+                clip_id,
+                HoverKind::Tooltip {
+                    title: if pty_focused {
+                        "Inline terminal focused (⌘⎋ or click below to type in shell)".to_owned()
+                    } else {
+                        "Click to focus inline terminal".to_owned()
+                    },
+                    subtitle: None,
+                },
+            );
+            rx = foc_x0 - 10.0;
         }
         let elapsed_ms = (now_ns.max(0) as u64 / 1_000_000).saturating_sub(block.started_ms);
         let dur = format_duration_ms(elapsed_ms);
@@ -1455,18 +1501,19 @@ fn layout_block(
                     now_ns,
                 )
             }
-            BlockBody::Terminal { term, running, .. } => {
-                layout_inline_terminal(
-                    scene,
-                    term,
-                    *running && cursor_visible,
-                    x0,
-                    cur_y,
-                    body_w,
-                    m,
-                    clip_id,
-                )
-            }
+            BlockBody::Terminal { term, running, .. } => layout_inline_terminal(
+                scene,
+                block.id,
+                term,
+                *running,
+                *running && pty_focused,
+                cursor_visible,
+                x0,
+                cur_y,
+                body_w,
+                m,
+                clip_id,
+            ),
             BlockBody::Running { label, pid } => {
                 scene.over_circle(x0 + 5.0, cur_y + m.ch * 0.5, 3.0, theme::FIRE, clip_id);
                 let p = pid.load(std::sync::atomic::Ordering::Relaxed);
@@ -4955,8 +5002,11 @@ fn layout_rust_cell_body(
 #[allow(clippy::too_many_arguments)]
 fn layout_inline_terminal(
     scene: &mut Scene,
+    block_id: BlockId,
     term: &Terminal<'_>,
-    cursor_on: bool,
+    running: bool,
+    focused: bool,
+    cursor_blink_on: bool,
     x0: f32,
     y0: f32,
     width: f32,
@@ -4966,13 +5016,14 @@ fn layout_inline_terminal(
     let screen = term.screen();
     let top = screen.pages.active_top();
     let rows = screen.rows();
+    let cursor_on = running && (cursor_blink_on || !focused);
 
     let show_rows = if matches!(term.active(), blaze_vt::terminal::Which::Alternate) {
         // Alternate-screen TUIs (`claude`, `vim`, `htop`) keep a steady inline frame height
         // so redraws never bounce vertically while scrollback stays visible above!
         rows.max(1)
     } else {
-        let mut last_non_empty = if cursor_on { screen.cursor.y } else { 0 };
+        let mut last_non_empty = if running { screen.cursor.y } else { 0 };
         for y in 0..rows {
             let cells = screen.pages.cells(top + y);
             if cells.iter().any(|c| c.codepoint() > 0x20) {
@@ -4985,7 +5036,29 @@ fn layout_inline_terminal(
     let total_h = show_rows as f32 * m.ch + pad * 2.0;
     let x1 = x0 + width;
 
-    scene.round_rect(x0, y0, x1, y0 + total_h, 8.0, theme::BG_SURFACE, 1.0, theme::LINE, clip_id);
+    let (border_w, border_col) = if running && focused {
+        (1.5, theme::rgba(0x58, 0x9d, 0xf6, 0.58))
+    } else if running {
+        (1.0, theme::LINE_FAINT)
+    } else {
+        (1.0, theme::LINE)
+    };
+    scene.round_rect(
+        x0,
+        y0,
+        x1,
+        y0 + total_h,
+        8.0,
+        theme::BG_SURFACE,
+        border_w,
+        border_col,
+        clip_id,
+    );
+    if running {
+        let card_rect = HitRect::new(x0, y0, x1, y0 + total_h);
+        scene.inline_pty_rect = Some(card_rect);
+        scene.push_hit_clipped(card_rect, clip_id, HitAction::FocusInlinePty(block_id));
+    }
     let inner_clip = scene.push_clip(x0 + 1.0, y0 + 1.0, x1 - 1.0, y0 + total_h - 1.0, 7.0);
     draw_terminal_rows(
         scene,
@@ -4995,6 +5068,7 @@ fn layout_inline_terminal(
         show_rows,
         m,
         cursor_on,
+        focused,
         inner_clip,
     );
     total_h
@@ -5078,7 +5152,7 @@ fn layout_fullscreen_terminal_inner(
     let pad_x = 10.0;
     let pad_y = TOP_BAR_H + 6.0;
     let rows = term.screen().rows();
-    draw_terminal_rows(&mut scene, term, pad_x, pad_y, rows, m, cursor_on, term_clip);
+    draw_terminal_rows(&mut scene, term, pad_x, pad_y, rows, m, cursor_on, true, term_clip);
 
     // Keep session tabs, traffic-light clearance, cwd/branch, and fork button live in fullscreen!
     if draw_top_bar {
@@ -5096,6 +5170,7 @@ fn draw_terminal_rows(
     row_count: usize,
     m: CellMetrics,
     cursor_on: bool,
+    cursor_focused: bool,
     clip_id: u32,
 ) {
     let colors = term.colors();
@@ -5134,94 +5209,122 @@ fn draw_terminal_rows(
             let x1 = x0 + m.cw * span;
             let at_cursor = cursor_visible && x == cx && y == cy;
             if at_cursor {
-                match screen.cursor.shape {
-                    blaze_vt::screen::CursorShape::Bar => {
-                        if has_bg || f.inverse {
-                            scene.round_rect(
-                                x0 - 0.5,
-                                y0 - 0.5,
-                                x1 + 0.5,
-                                y0 + m.ch + 0.5,
-                                0.0,
-                                vt_rgbf(bg),
-                                0.0,
-                                [0.0; 4],
-                                clip_id,
-                            );
-                        }
-                        scene.over_round_rect(
-                            x0,
-                            y0 + 1.0,
-                            x0 + 2.0,
-                            y0 + m.ch - 1.0,
-                            1.0,
-                            vt_rgbf(cursor_c),
-                            clip_id,
-                        );
-                    }
-                    blaze_vt::screen::CursorShape::Underline => {
-                        if has_bg || f.inverse {
-                            scene.round_rect(
-                                x0 - 0.5,
-                                y0 - 0.5,
-                                x1 + 0.5,
-                                y0 + m.ch + 0.5,
-                                0.0,
-                                vt_rgbf(bg),
-                                0.0,
-                                [0.0; 4],
-                                clip_id,
-                            );
-                        }
-                        scene.over_round_rect(
-                            x0,
-                            y0 + m.ch - 2.2,
-                            x1,
-                            y0 + m.ch,
-                            0.75,
-                            vt_rgbf(cursor_c),
-                            clip_id,
-                        );
-                    }
-                    blaze_vt::screen::CursorShape::BlockHollow => {
-                        if has_bg || f.inverse {
-                            scene.round_rect(
-                                x0 - 0.5,
-                                y0 - 0.5,
-                                x1 + 0.5,
-                                y0 + m.ch + 0.5,
-                                0.0,
-                                vt_rgbf(bg),
-                                0.0,
-                                [0.0; 4],
-                                clip_id,
-                            );
-                        }
+                if !cursor_focused {
+                    if has_bg || f.inverse {
                         scene.round_rect(
-                            x0,
-                            y0,
-                            x1,
-                            y0 + m.ch,
-                            1.0,
-                            [0.0; 4],
-                            1.0,
-                            vt_rgbf(cursor_c),
-                            clip_id,
-                        );
-                    }
-                    blaze_vt::screen::CursorShape::Block => {
-                        scene.round_rect(
-                            x0,
-                            y0,
-                            x1,
-                            y0 + m.ch,
-                            1.0,
-                            vt_rgbf(cursor_c),
+                            x0 - 0.5,
+                            y0 - 0.5,
+                            x1 + 0.5,
+                            y0 + m.ch + 0.5,
+                            0.0,
+                            vt_rgbf(bg),
                             0.0,
                             [0.0; 4],
                             clip_id,
                         );
-                        fg = bg0;
+                    }
+                    let cursor_f = vt_rgbf(cursor_c);
+                    scene.round_rect(
+                        x0,
+                        y0,
+                        x1,
+                        y0 + m.ch,
+                        1.0,
+                        [0.0; 4],
+                        1.0,
+                        [cursor_f[0], cursor_f[1], cursor_f[2], 0.34],
+                        clip_id,
+                    );
+                } else {
+                    match screen.cursor.shape {
+                        blaze_vt::screen::CursorShape::Bar => {
+                            if has_bg || f.inverse {
+                                scene.round_rect(
+                                    x0 - 0.5,
+                                    y0 - 0.5,
+                                    x1 + 0.5,
+                                    y0 + m.ch + 0.5,
+                                    0.0,
+                                    vt_rgbf(bg),
+                                    0.0,
+                                    [0.0; 4],
+                                    clip_id,
+                                );
+                            }
+                            scene.over_round_rect(
+                                x0,
+                                y0 + 1.0,
+                                x0 + 2.0,
+                                y0 + m.ch - 1.0,
+                                1.0,
+                                vt_rgbf(cursor_c),
+                                clip_id,
+                            );
+                        }
+                        blaze_vt::screen::CursorShape::Underline => {
+                            if has_bg || f.inverse {
+                                scene.round_rect(
+                                    x0 - 0.5,
+                                    y0 - 0.5,
+                                    x1 + 0.5,
+                                    y0 + m.ch + 0.5,
+                                    0.0,
+                                    vt_rgbf(bg),
+                                    0.0,
+                                    [0.0; 4],
+                                    clip_id,
+                                );
+                            }
+                            scene.over_round_rect(
+                                x0,
+                                y0 + m.ch - 2.2,
+                                x1,
+                                y0 + m.ch,
+                                0.75,
+                                vt_rgbf(cursor_c),
+                                clip_id,
+                            );
+                        }
+                        blaze_vt::screen::CursorShape::BlockHollow => {
+                            if has_bg || f.inverse {
+                                scene.round_rect(
+                                    x0 - 0.5,
+                                    y0 - 0.5,
+                                    x1 + 0.5,
+                                    y0 + m.ch + 0.5,
+                                    0.0,
+                                    vt_rgbf(bg),
+                                    0.0,
+                                    [0.0; 4],
+                                    clip_id,
+                                );
+                            }
+                            scene.round_rect(
+                                x0,
+                                y0,
+                                x1,
+                                y0 + m.ch,
+                                1.0,
+                                [0.0; 4],
+                                1.0,
+                                vt_rgbf(cursor_c),
+                                clip_id,
+                            );
+                        }
+                        blaze_vt::screen::CursorShape::Block => {
+                            scene.round_rect(
+                                x0,
+                                y0,
+                                x1,
+                                y0 + m.ch,
+                                1.0,
+                                vt_rgbf(cursor_c),
+                                0.0,
+                                [0.0; 4],
+                                clip_id,
+                            );
+                            fg = bg0;
+                        }
                     }
                 }
             } else if has_bg || f.inverse {
