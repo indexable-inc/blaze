@@ -44,6 +44,8 @@ use crate::{Bad, Head, NotSelected, Refused, Reg, ShapeWhy, Variance};
 const MAX_ELAB_VISITED: usize = 256;
 const MAX_ELAB_STACK: usize = 512;
 const MAX_ELAB_DEPTH: u32 = 24;
+type ElabKey = (ItemKey, PTy, bool);
+const ELAB_KEY_ZERO: ElabKey = (ItemKey(0), PTy(0), false);
 
 /// What a fresh origin is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1626,7 +1628,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         Some(Some(prev)) if prev == rhs_reg => {}
                         _ => *unique_rhs = Some(None),
                     }
-                } else if cur_depth + 1 < 12 {
+                } else if cur_depth + 1 < MAX_ELAB_DEPTH {
                     let tc = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
                     if let Ok(PNode::ExTrait(super_ct, _)) = self.node(tc)
                         && self.fits(tc).is_ok()
@@ -2860,7 +2862,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         trait_ref: Side<'c>,
         has_subject: bool,
         depth: u32,
-        visited: &mut [(ItemKey, bool); MAX_ELAB_VISITED],
+        visited: &mut [ElabKey; MAX_ELAB_VISITED],
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
         let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
@@ -2875,7 +2877,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 continue;
             };
             let is_sub = self.erased_sides(cur_self, subject);
-            let visit_key = (cur_tr, is_sub);
+            let visit_key = (cur_tr, cur_self.ty, is_sub);
             if cur_depth >= MAX_ELAB_DEPTH || *vlen >= MAX_ELAB_VISITED || visited.iter().take(*vlen).any(|&k| k == visit_key) {
                 continue;
             }
@@ -2897,7 +2899,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
             let next_depth = cur_depth + 1;
-            if next_depth < 12 {
+            if next_depth < MAX_ELAB_DEPTH {
                 let (sub_chain, sub_clen) = self.alias_self_chain(subject);
                 let start = sp;
                 for cv in views {
@@ -2943,7 +2945,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         want_tr: ItemKey,
         want_name: blaze_typeck::Name,
         depth: u32,
-        visited: &mut [(ItemKey, bool); MAX_ELAB_VISITED],
+        visited: &mut [ElabKey; MAX_ELAB_VISITED],
         vlen: &mut usize,
     ) -> Result<Option<Side<'c>>, Refused> {
         let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; MAX_ELAB_STACK] = [None; MAX_ELAB_STACK];
@@ -2958,7 +2960,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 continue;
             };
             let is_sub = self.erased_sides(cur_self, subject);
-            let visit_key = (cur_tr, is_sub);
+            let visit_key = (cur_tr, cur_self.ty, is_sub);
             if cur_depth >= MAX_ELAB_DEPTH || *vlen >= MAX_ELAB_VISITED || visited.iter().take(*vlen).any(|&k| k == visit_key) {
                 continue;
             }
@@ -2980,7 +2982,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
             let next_depth = cur_depth + 1;
-            if next_depth < 12 {
+            if next_depth < MAX_ELAB_DEPTH {
                 let (sub_chain, sub_clen) = self.alias_self_chain(subject);
                 let start = sp;
                 for cv in views {
@@ -3105,7 +3107,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+        let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
         let mut vlen = 0usize;
         for cv in views {
             if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
@@ -3151,7 +3153,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+        let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
         let mut vlen = 0usize;
         for cv in views {
             if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
@@ -3225,7 +3227,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
             }
-            let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+            let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
             let mut vlen = 0usize;
             for cv in clauses {
                 let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
@@ -3296,7 +3298,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
                 let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
-                let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+                let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
                 let mut vlen = 0usize;
                 for k in 0..skids.len() {
                     let (pred, sr) = self.kid(subject, &skids, srest, k)?;
@@ -3321,19 +3323,34 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     if let Some((at_lts, views)) = source
                         && !views.is_empty()
                         && self.fits(subject).is_ok()
-                        && self.try_prove_from_alias_clauses(at_lts, views, subject, trait_ref, has_subject, trait_)?
+                        && self.try_prove_from_alias_clauses(at_lts, views, subject, subject, trait_ref, has_subject, trait_)?
                     {
                         return Ok(true);
                     }
                 }
-                // Also elaborate bounds of any ancestor `Opaque` in `subject`'s self-chain
-                // (e.g. `<impl ExecutableTxIterator<Evm> as ExecutableTxTuple>::Tx: ExecutableTxFor<Evm>`).
+                // Also elaborate bounds of any ancestor `Opaque` or `Alias` in `subject`'s
+                // self-chain (e.g. `<impl ExecutableTxIterator<Evm> as ExecutableTxTuple>::Tx`,
+                // or `<<N as FullNodeTypes>::Provider as BlockReader>::Block`).
                 let (chain, clen) = self.alias_self_chain(subject);
                 for anc in chain.iter().take(clen).flatten().copied() {
-                    if let Ok(PNode::Opaque(op_key, _)) = self.node(anc)
-                        && self.try_prove_from_opaque_clauses(op_key, anc, subject, trait_ref, has_subject, trait_)?
-                    {
-                        return Ok(true);
+                    match self.node(anc) {
+                        Ok(PNode::Opaque(op_key, _)) => {
+                            if self.try_prove_from_opaque_clauses(op_key, anc, subject, trait_ref, has_subject, trait_)? {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(PNode::Alias { trait_: aat, name: aname, .. }) => {
+                            for source in [selected.assoc_clauses(aat, aname), selected.trait_clauses(aat)] {
+                                if let Some((at_lts, views)) = source
+                                    && !views.is_empty()
+                                    && self.fits(anc).is_ok()
+                                    && self.try_prove_from_alias_clauses(at_lts, views, anc, subject, trait_ref, has_subject, trait_)?
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3342,21 +3359,23 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         Ok(false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_prove_from_alias_clauses(
         &mut self,
         at_lts: u32,
         views: &'c [blaze_typeck::region_facts::ClauseView<'c>],
+        alias_side: Side<'c>,
         subject: Side<'c>,
         trait_ref: Side<'c>,
         has_subject: bool,
         trait_: ItemKey,
     ) -> Result<bool, Refused> {
-        let s_own = self.own(subject)?;
-        let skids = self.kids_of(subject)?;
+        let s_own = self.own(alias_side)?;
+        let skids = self.kids_of(alias_side)?;
         let lts = at_lts.max(s_own.get());
         let Some(aenv) = self.envs.impl_env(lts, skids.len()) else { return Ok(false) };
         for k in 0..at_lts.min(s_own.get()) {
-            match self.slot(subject, k)? {
+            match self.slot(alias_side, k)? {
                 RegAt::Known(r) => {
                     if self.envs.bind_reg(aenv, k, r).is_err() {
                         return Ok(false);
@@ -3369,9 +3388,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let o = self.out.fresh(Kind::Existential);
             let _ = self.envs.bind_reg(aenv, k, Reg::Origin(o));
         }
-        let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
+        let (_, mut srest) = alias_side.slots.split(s_own).ok_or(self.malformed(alias_side.ty, Bad::StepBound))?;
         for k in 0..skids.len() {
-            let (kid, sr) = self.kid(subject, &skids, srest, k)?;
+            let (kid, sr) = self.kid(alias_side, &skids, srest, k)?;
             srest = sr;
             let _ = self.envs.bind_type(aenv, k, kid);
         }
@@ -3383,7 +3402,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+        let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
         let mut vlen = 0usize;
         for cv in views {
             let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };
@@ -3394,7 +3413,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 && ckids.len() > 0
                 && let Some((_, crest)) = c.slots.split(c_own)
                 && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                && self.erased_sides(c_self, subject)
+                && (self.erased_sides(c_self, alias_side) || self.erased_sides(c_self, subject))
             {
                 let c = self.instantiate_clause_side(c, cv.binders)?;
                 let (_, crest) = c.slots.split(c_own).ok_or(self.malformed(c.ty, Bad::StepBound))?;
@@ -3485,7 +3504,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
             }
-            let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+            let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
             let mut vlen = 0usize;
             for cv in clauses {
                 let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
@@ -3586,7 +3605,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
                 let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
-                let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+                let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
                 let mut vlen = 0usize;
                 for k in 0..skids.len() {
                     let (pred, sr) = self.kid(subject, &skids, srest, k)?;
@@ -3650,7 +3669,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 }
                             }
                         }
-                        let mut visited = [(ItemKey(0), false); MAX_ELAB_VISITED];
+                        let mut visited = [ELAB_KEY_ZERO; MAX_ELAB_VISITED];
                         let mut vlen = 0usize;
                         for cv in views {
                             let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };

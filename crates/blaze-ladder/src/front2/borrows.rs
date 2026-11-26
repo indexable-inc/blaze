@@ -1781,13 +1781,96 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             }
         }
     }
-    // Ensure trait heads transitively through supertraits so `regions.clauses(trait_)` is loaded
-    // for supertrait elaboration in `blaze-borrow`.
+    // Ensure trait heads transitively through supertraits, trait where-clauses, associated-type
+    // item bounds, and nested alias traits so `regions.clauses` and `assoc_items` are loaded for
+    // supertrait elaboration in `blaze-borrow`.
     {
+        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>) {
+            let (args, extra_ty) = match *cl {
+                tc::PClause::Trait { trait_: sup, args } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), None)
+                }
+                tc::PClause::Projection { trait_: sup, args, term, .. } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), Some(term))
+                }
+                _ => (None, None),
+            };
+            let mut st = [tc::PTy(0); 32];
+            let mut len = 0usize;
+            if let Some(args) = args
+                && let Ok(list) = stys.list(args)
+            {
+                for &t in list {
+                    if len < st.len() {
+                        st[len] = t;
+                        len += 1;
+                    }
+                }
+            }
+            if let Some(t) = extra_ty
+                && len < st.len()
+            {
+                st[len] = t;
+                len += 1;
+            }
+            let mut steps = 0u32;
+            while len > 0 && steps < 64 {
+                len -= 1;
+                steps += 1;
+                let Ok(node) = stys.node(st[len]) else { continue };
+                match node {
+                    tc::PNode::Alias { trait_: at, args: al, .. }
+                    | tc::PNode::ExProj { trait_: at, args: al, .. }
+                    | tc::PNode::ExTrait(at, al) => {
+                        if traits.scan_for(&at.0).is_none() {
+                            traits.push(at.0);
+                        }
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Adt(_, al)
+                    | tc::PNode::Tuple(al)
+                    | tc::PNode::Dynamic(al)
+                    | tc::PNode::Opaque(_, al) => {
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Ref(_, x)
+                    | tc::PNode::Ptr(_, x)
+                    | tc::PNode::Slice(x)
+                    | tc::PNode::Array(x, _) => {
+                        if len < st.len() {
+                            st[len] = x;
+                            len += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let mut ti = 0usize;
         traits.sort_unstable();
         traits.dedup();
-        while ti < traits.len() && traits.len() < 256 {
+        while ti < traits.len() && traits.len() < 1024 {
             let tk = tc::ItemKey(traits[ti]);
             ti += 1;
             if let Some(lib) = r.keys.library_in(r.names, tk)
@@ -1796,23 +1879,21 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 container_head(r, lib, true);
                 r.store.ensure_assoc_regions(r.names, r.keys, lib);
             }
+            let stys = r.store.tys.view();
+            if let Some(p) = r.store.preds.get(&tk) {
+                for cl in p.clauses.iter() {
+                    push_clause_traits(stys, cl, &mut traits);
+                }
+            }
             if let Some(def) = r.store.trait_defs.get(&tk) {
                 for sc in def.supertraits.iter() {
-                    if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *sc
-                        && traits.scan_for(&sup.0).is_none()
-                    {
-                        traits.push(sup.0);
-                    }
+                    push_clause_traits(stys, sc, &mut traits);
                 }
                 for a in def.assoc.iter() {
                     g.assoc_items.push((tk.0, a.name, a.item));
                     if let Some(ap) = r.store.preds.get(&a.item) {
                         for ac in ap.clauses.iter() {
-                            if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *ac
-                                && traits.scan_for(&sup.0).is_none()
-                            {
-                                traits.push(sup.0);
-                            }
+                            push_clause_traits(stys, ac, &mut traits);
                         }
                     }
                 }
