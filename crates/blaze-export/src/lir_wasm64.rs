@@ -34,8 +34,8 @@ use blaze_own::{AVec, Alloc, Vec};
 
 use crate::wasm64::{
     HOST_IMPORT_COUNT, HOST_IMPORT_SIGS, HOST_MODULE, ValType, Wasm64Data, Wasm64Error,
-    Wasm64Exported, Wasm64Func, Wasm64Opts, Wasm64Program, export_wasm64, push_i32_leb,
-    push_i64_leb, push_u32_leb, push_u64_leb,
+    Wasm64ExportGlobal, Wasm64Exported, Wasm64Func, Wasm64Import, Wasm64Opts, Wasm64Program,
+    export_wasm64, push_i32_leb, push_i64_leb, push_u32_leb, push_u64_leb,
 };
 
 // ---- Public API -----------------------------------------------------------------------------
@@ -49,20 +49,53 @@ pub struct LirWasm64Func<'a> {
     pub view: View<'a>,
 }
 
+/// Target of an 8-byte relocation inside a [`LirWasm64Static`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LirWasm64RelocTarget {
+    Static(u32),
+    Func(u32),
+}
+
+/// One 8-byte little-endian relocation patched into a [`LirWasm64Static`] at `offset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LirWasm64StaticReloc {
+    pub offset: u32,
+    pub target: LirWasm64RelocTarget,
+    pub addend: i64,
+}
+
 /// One module-level static/rodata segment placed in 64-bit linear memory.
 #[derive(Clone, Copy, Debug)]
 pub struct LirWasm64Static<'a> {
     pub place: u32,
     pub align: u32,
     pub bytes: &'a [u8],
+    pub relocs: &'a [LirWasm64StaticReloc],
 }
 
-/// One imported host function bound to a LIR `RefKind::Func` place.
+/// One imported host function (or `__blaze_wasm64` inline intrinsic) bound to a LIR
+/// `RefKind::Func` place.
 #[derive(Clone, Copy, Debug)]
 pub struct LirWasm64Import<'a> {
     pub place: u32,
     pub module: &'a str,
     pub field: &'a str,
+    pub params: &'a [ValType],
+    pub results: &'a [ValType],
+}
+
+/// Value of an exported immutable `i64` global in a [`LirWasm64Module`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LirWasm64GlobalValue {
+    StaticAddr(u32),
+    I64(i64),
+}
+
+/// One exported immutable `i64` global declared on a [`LirWasm64Module`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LirWasm64Global<'a> {
+    pub name: &'a str,
+    pub value: LirWasm64GlobalValue,
 }
 
 /// Complete LIR module input to [`compile_lir_wasm64`].
@@ -72,6 +105,8 @@ pub struct LirWasm64Module<'a> {
     pub funcs: &'a [LirWasm64Func<'a>],
     pub statics: &'a [LirWasm64Static<'a>],
     pub imports: &'a [LirWasm64Import<'a>],
+    pub globals: &'a [LirWasm64Global<'a>],
+    pub include_blaze_host_v1: bool,
     pub opts: Wasm64Opts,
     pub profile_digest: Option<[u8; 32]>,
 }
@@ -133,7 +168,7 @@ impl fmt::Display for LirWasm64Error {
             LirWasm64Error::UnsupportedImport { place } => {
                 write!(
                     f,
-                    "lir_wasm64: import place {place} is not a supported `{HOST_MODULE}` host import"
+                    "lir_wasm64: import place {place} is not a supported host import or `{INTRINSIC_MODULE}` intrinsic"
                 )
             }
             LirWasm64Error::DuplicatePlace { kind, place } => {
@@ -207,6 +242,8 @@ const OP_F32_STORE: u8 = 0x38;
 const OP_F64_STORE: u8 = 0x39;
 const OP_I32_STORE8: u8 = 0x3A;
 const OP_I32_STORE16: u8 = 0x3B;
+const OP_MEMORY_SIZE: u8 = 0x3F;
+const OP_MEMORY_GROW: u8 = 0x40;
 
 const OP_I32_CONST: u8 = 0x41;
 const OP_I64_CONST: u8 = 0x42;
@@ -351,6 +388,8 @@ const FC_MEMORY_FILL: u32 = 11;
 
 const BLOCKTYPE_VOID: u8 = 0x40;
 const GLOBAL_STACK_POINTER: u32 = 0;
+const GLOBAL_HEAP_BASE: u32 = 1;
+const INTRINSIC_MODULE: &str = "__blaze_wasm64";
 const NULL_GUARD_BYTES: u64 = 4096;
 const PAGE_BYTES: u64 = 65_536;
 const MAX_ALIGN_LOG2: u32 = 29;
@@ -533,15 +572,43 @@ fn flatten_sig<'a>(
 
 // ---- Module-level state ---------------------------------------------------------------------
 
-struct ModuleCtx<'a> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wasm64Intrinsic {
+    MemoryGrow,
+    MemorySize,
+    HeapBase,
+}
+
+impl Wasm64Intrinsic {
+    const fn sig(self) -> (&'static [ValType], &'static [ValType]) {
+        match self {
+            Wasm64Intrinsic::MemoryGrow => (&[ValType::I64], &[ValType::I64]),
+            Wasm64Intrinsic::MemorySize => (&[], &[ValType::I64]),
+            Wasm64Intrinsic::HeapBase => (&[], &[ValType::I64]),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallTarget {
+    Func(u32),
+    Intrinsic(Wasm64Intrinsic),
+}
+
+struct ModuleCtx<'a, 'm> {
     alloc: Alloc<'a>,
-    /// `(place, wasm_func_idx)` across both `module.funcs` and `module.imports`.
+    include_blaze_host_v1: bool,
+    /// Additional host imports emitted after `blaze_host_v1` (or at 0.. when omitted).
+    extra_imports: AVec<'a, Wasm64Import<'m>>,
+    /// `(place, wasm_func_idx)` across both `module.funcs` and host `module.imports`.
     func_map: AVec<'a, (u32, u32)>,
+    /// `(place, intrinsic)` for `__blaze_wasm64` inline memory intrinsics.
+    intrinsic_map: AVec<'a, (u32, Wasm64Intrinsic)>,
     /// `(place, linear_addr)` for `module.statics`.
     static_addrs: AVec<'a, (u32, u64)>,
     /// Per-function `datas` addresses: `func_data_addrs[func_idx][data_id]`.
     func_data_addrs: AVec<'a, AVec<'a, u64>>,
-    /// Pre-flattened `(params, results)` for every `module.funcs[i]` (type indices `3..3+N`).
+    /// Pre-flattened `(params, results)` for every `module.funcs[i]`.
     func_sigs: AVec<'a, (AVec<'a, ValType>, AVec<'a, ValType>)>,
     /// Indirect-call table entries (Wasm func indices placed at table slots `1..=len`).
     indirect_table: AVec<'a, u32>,
@@ -549,11 +616,40 @@ struct ModuleCtx<'a> {
     extra_types: AVec<'a, (AVec<'a, ValType>, AVec<'a, ValType>)>,
 }
 
-impl<'a> ModuleCtx<'a> {
+impl<'a, 'm> ModuleCtx<'a, 'm> {
+    #[inline]
+    fn base_imports(&self) -> u32 {
+        if self.include_blaze_host_v1 { HOST_IMPORT_COUNT } else { 0 }
+    }
+
+    #[inline]
+    fn import_count(&self) -> u32 {
+        self.base_imports() + self.extra_imports.len() as u32
+    }
+
     fn resolve_func(&self, func: u32, inst: usize, place: u32) -> Result<u32, LirWasm64Error> {
         for &(p, idx) in self.func_map.as_slice() {
             if p == place {
                 return Ok(idx);
+            }
+        }
+        Err(LirWasm64Error::UnresolvedFunc { func, inst, place })
+    }
+
+    fn resolve_call_target(
+        &self,
+        func: u32,
+        inst: usize,
+        place: u32,
+    ) -> Result<CallTarget, LirWasm64Error> {
+        for &(p, idx) in self.func_map.as_slice() {
+            if p == place {
+                return Ok(CallTarget::Func(idx));
+            }
+        }
+        for &(p, intr) in self.intrinsic_map.as_slice() {
+            if p == place {
+                return Ok(CallTarget::Intrinsic(intr));
             }
         }
         Err(LirWasm64Error::UnresolvedFunc { func, inst, place })
@@ -579,50 +675,84 @@ impl<'a> ModuleCtx<'a> {
     }
 
     fn intern_type(&mut self, params: &[ValType], results: &[ValType]) -> u32 {
-        for (i, &(hp, hr)) in HOST_IMPORT_SIGS.iter().enumerate() {
-            if hp == params && hr == results {
-                return i as u32;
+        let base_imports = self.base_imports();
+        if self.include_blaze_host_v1 {
+            for (i, &(hp, hr)) in HOST_IMPORT_SIGS.iter().enumerate() {
+                if hp == params && hr == results {
+                    return i as u32;
+                }
             }
         }
+        for (i, imp) in self.extra_imports.as_slice().iter().enumerate() {
+            if imp.params == params && imp.results == results {
+                return base_imports + i as u32;
+            }
+        }
+        let import_count = self.import_count();
         for (i, (fp, fr)) in self.func_sigs.as_slice().iter().enumerate() {
             if fp.as_slice() == params && fr.as_slice() == results {
-                return HOST_IMPORT_COUNT + i as u32;
+                return import_count + i as u32;
             }
         }
         for (i, (ep, er)) in self.extra_types.as_slice().iter().enumerate() {
             if ep.as_slice() == params && er.as_slice() == results {
-                return HOST_IMPORT_COUNT + self.func_sigs.len() as u32 + i as u32;
+                return import_count + self.func_sigs.len() as u32 + i as u32;
             }
         }
         let mut p = Vec::new_in(self.alloc);
         p.extend_from_slice(params);
         let mut r = Vec::new_in(self.alloc);
         r.extend_from_slice(results);
-        let idx = HOST_IMPORT_COUNT + self.func_sigs.len() as u32 + self.extra_types.len() as u32;
+        let idx = import_count + self.func_sigs.len() as u32 + self.extra_types.len() as u32;
         self.extra_types.push((p, r));
         idx
     }
 
     fn expected_wasm_sig(&self, wasm_func_idx: u32) -> (&[ValType], &[ValType]) {
-        if wasm_func_idx < HOST_IMPORT_COUNT {
+        let base_imports = self.base_imports();
+        let import_count = self.import_count();
+        if wasm_func_idx < base_imports {
             HOST_IMPORT_SIGS[wasm_func_idx as usize]
+        } else if wasm_func_idx < import_count {
+            let imp = self.extra_imports[(wasm_func_idx - base_imports) as usize];
+            (imp.params, imp.results)
         } else {
-            let (p, r) = &self.func_sigs[(wasm_func_idx - HOST_IMPORT_COUNT) as usize];
+            let (p, r) = &self.func_sigs[(wasm_func_idx - import_count) as usize];
             (p.as_slice(), r.as_slice())
         }
     }
 }
 
-fn resolve_host_import(imp: &LirWasm64Import<'_>) -> Result<u32, LirWasm64Error> {
-    if imp.module != HOST_MODULE {
-        return Err(LirWasm64Error::UnsupportedImport { place: imp.place });
+fn resolve_intrinsic(imp: &LirWasm64Import<'_>) -> Result<Wasm64Intrinsic, LirWasm64Error> {
+    let intr = match imp.field {
+        "memory_grow" => Wasm64Intrinsic::MemoryGrow,
+        "memory_size" => Wasm64Intrinsic::MemorySize,
+        "heap_base" => Wasm64Intrinsic::HeapBase,
+        _ => return Err(LirWasm64Error::UnsupportedImport { place: imp.place }),
+    };
+    if !imp.params.is_empty() || !imp.results.is_empty() {
+        let (exp_p, exp_r) = intr.sig();
+        if imp.params != exp_p || imp.results != exp_r {
+            return Err(LirWasm64Error::UnsupportedImport { place: imp.place });
+        }
     }
-    match imp.field {
-        "submit_wait" => Ok(0),
-        "host_caps" => Ok(1),
-        "host_log" => Ok(2),
-        _ => Err(LirWasm64Error::UnsupportedImport { place: imp.place }),
+    Ok(intr)
+}
+
+fn resolve_blaze_host_import(imp: &LirWasm64Import<'_>) -> Result<u32, LirWasm64Error> {
+    let idx = match imp.field {
+        "submit_wait" => 0u32,
+        "host_caps" => 1u32,
+        "host_log" => 2u32,
+        _ => return Err(LirWasm64Error::UnsupportedImport { place: imp.place }),
+    };
+    if !imp.params.is_empty() || !imp.results.is_empty() {
+        let (exp_p, exp_r) = HOST_IMPORT_SIGS[idx as usize];
+        if imp.params != exp_p || imp.results != exp_r {
+            return Err(LirWasm64Error::UnsupportedImport { place: imp.place });
+        }
     }
+    Ok(idx)
 }
 
 // ---- Compiled function buffer ---------------------------------------------------------------
@@ -643,9 +773,84 @@ pub fn compile_lir_wasm64<'a>(
     out: &mut AVec<'a, u8>,
     alloc: Alloc<'a>,
 ) -> Result<Wasm64Exported, LirWasm64Error> {
-    // 1. Validate places & build function/import index map + flatten every function's signature.
-    let mut func_map = Vec::with_capacity_in(module.funcs.len() + module.imports.len(), alloc);
+    // 1. Validate places & build import/intrinsic/function index maps + flatten signatures.
+    let base_imports = if module.include_blaze_host_v1 { HOST_IMPORT_COUNT } else { 0 };
+    let mut extra_imports: AVec<'a, Wasm64Import<'_>> = Vec::new_in(alloc);
+    let mut intrinsic_map: AVec<'a, (u32, Wasm64Intrinsic)> = Vec::new_in(alloc);
+    let mut func_map: AVec<'a, (u32, u32)> =
+        Vec::with_capacity_in(module.funcs.len() + module.imports.len(), alloc);
     let mut func_sigs = Vec::with_capacity_in(module.funcs.len(), alloc);
+
+    for imp in module.imports {
+        for &(existing, _) in func_map.as_slice() {
+            if existing == imp.place {
+                return Err(LirWasm64Error::DuplicatePlace { kind: "import", place: imp.place });
+            }
+        }
+        for &(existing, _) in intrinsic_map.as_slice() {
+            if existing == imp.place {
+                return Err(LirWasm64Error::DuplicatePlace { kind: "import", place: imp.place });
+            }
+        }
+
+        if imp.module == INTRINSIC_MODULE {
+            let intr = resolve_intrinsic(imp)?;
+            intrinsic_map.push((imp.place, intr));
+        } else if imp.module == HOST_MODULE {
+            let host_idx = resolve_blaze_host_import(imp)?;
+            if module.include_blaze_host_v1 {
+                func_map.push((imp.place, host_idx));
+            } else {
+                let (params, results) = HOST_IMPORT_SIGS[host_idx as usize];
+                let existing = extra_imports.as_slice().iter().position(|e: &Wasm64Import<'_>| {
+                    e.module == imp.module
+                        && e.field == imp.field
+                        && e.params == params
+                        && e.results == results
+                });
+                let wasm_idx = match existing {
+                    Some(idx) => base_imports + idx as u32,
+                    None => {
+                        let idx = base_imports + extra_imports.len() as u32;
+                        extra_imports.push(Wasm64Import {
+                            module: imp.module,
+                            field: imp.field,
+                            params,
+                            results,
+                        });
+                        idx
+                    }
+                };
+                func_map.push((imp.place, wasm_idx));
+            }
+        } else {
+            if imp.module.is_empty() || imp.field.is_empty() {
+                return Err(LirWasm64Error::UnsupportedImport { place: imp.place });
+            }
+            let existing = extra_imports.as_slice().iter().position(|e: &Wasm64Import<'_>| {
+                e.module == imp.module
+                    && e.field == imp.field
+                    && e.params == imp.params
+                    && e.results == imp.results
+            });
+            let wasm_idx = match existing {
+                Some(idx) => base_imports + idx as u32,
+                None => {
+                    let idx = base_imports + extra_imports.len() as u32;
+                    extra_imports.push(Wasm64Import {
+                        module: imp.module,
+                        field: imp.field,
+                        params: imp.params,
+                        results: imp.results,
+                    });
+                    idx
+                }
+            };
+            func_map.push((imp.place, wasm_idx));
+        }
+    }
+
+    let import_count = base_imports + extra_imports.len() as u32;
 
     for (i, f) in module.funcs.iter().enumerate() {
         if f.view.head.ptr_bits != 64 {
@@ -662,25 +867,22 @@ pub fn compile_lir_wasm64<'a>(
                 return Err(LirWasm64Error::DuplicatePlace { kind: "func", place: f.place });
             }
         }
-        func_map.push((f.place, HOST_IMPORT_COUNT + i as u32));
-        let sig = flatten_sig(f.view, SigId(f.view.head.sig), f.place, 0, alloc)?;
-        func_sigs.push(sig);
-    }
-
-    for imp in module.imports {
-        let host_idx = resolve_host_import(imp)?;
-        for &(existing, _) in func_map.as_slice() {
-            if existing == imp.place {
-                return Err(LirWasm64Error::DuplicatePlace { kind: "import", place: imp.place });
+        for &(existing, _) in intrinsic_map.as_slice() {
+            if existing == f.place {
+                return Err(LirWasm64Error::DuplicatePlace { kind: "func", place: f.place });
             }
         }
-        func_map.push((imp.place, host_idx));
+        func_map.push((f.place, import_count + i as u32));
+        let sig = flatten_sig(f.view, SigId(f.view.head.sig), f.place, 0, alloc)?;
+        func_sigs.push(sig);
     }
 
     // 2. Lay out module.statics and per-function DataRec segments from data_base.
     let data_base = module.opts.stack_top.max(NULL_GUARD_BYTES);
     let mut cursor = data_base;
     let mut static_addrs = Vec::with_capacity_in(module.statics.len(), alloc);
+    let mut static_buf_idx: AVec<'a, Option<usize>> =
+        Vec::with_capacity_in(module.statics.len(), alloc);
     let mut data_bufs: AVec<'a, (u64, AVec<'a, u8>)> = Vec::new_in(alloc);
 
     for st in module.statics {
@@ -699,10 +901,14 @@ pub fn compile_lir_wasm64<'a>(
         if !st.bytes.is_empty() {
             let mut copy = Vec::with_capacity_in(st.bytes.len(), alloc);
             copy.extend_from_slice(st.bytes);
+            let idx = data_bufs.len();
             data_bufs.push((cursor, copy));
+            static_buf_idx.push(Some(idx));
             cursor = cursor
                 .checked_add(st.bytes.len() as u64)
                 .ok_or(LirWasm64Error::Overflow { what: "static data size" })?;
+        } else {
+            static_buf_idx.push(None);
         }
     }
 
@@ -750,7 +956,10 @@ pub fn compile_lir_wasm64<'a>(
 
     let mut ctx = ModuleCtx {
         alloc,
+        include_blaze_host_v1: module.include_blaze_host_v1,
+        extra_imports,
         func_map,
+        intrinsic_map,
         static_addrs,
         func_data_addrs,
         func_sigs,
@@ -758,7 +967,49 @@ pub fn compile_lir_wasm64<'a>(
         extra_types: Vec::new_in(alloc),
     };
 
-    // 3. Patch all DataRec relocations (which may intern functions into `indirect_table`).
+    // 3a. Patch module-level static relocations (static-to-static & static-to-func for vtables /
+    //     `#[rustc_proc_macro_decls]`).
+    for (st_idx, st) in module.statics.iter().enumerate() {
+        if st.relocs.is_empty() {
+            continue;
+        }
+        let Some(buf_idx) = static_buf_idx[st_idx] else {
+            return Err(LirWasm64Error::InvalidDataReloc {
+                func: u32::MAX,
+                data_id: st.place,
+                offset: st.relocs[0].offset,
+            });
+        };
+        for reloc in st.relocs {
+            let off = reloc.offset as usize;
+            let end = off.checked_add(8).ok_or(LirWasm64Error::InvalidDataReloc {
+                func: u32::MAX,
+                data_id: st.place,
+                offset: reloc.offset,
+            })?;
+            if end > data_bufs[buf_idx].1.len() {
+                return Err(LirWasm64Error::InvalidDataReloc {
+                    func: u32::MAX,
+                    data_id: st.place,
+                    offset: reloc.offset,
+                });
+            }
+            let patched: i64 = match reloc.target {
+                LirWasm64RelocTarget::Static(target_place) => {
+                    let addr = ctx.resolve_static(u32::MAX, 0, target_place)?;
+                    (addr as i64).wrapping_add(reloc.addend)
+                }
+                LirWasm64RelocTarget::Func(target_place) => {
+                    let wasm_idx = ctx.resolve_func(u32::MAX, 0, target_place)?;
+                    let slot = ctx.intern_indirect_func(wasm_idx);
+                    i64::from(slot).wrapping_add(reloc.addend)
+                }
+            };
+            data_bufs[buf_idx].1[off..end].copy_from_slice(&patched.to_le_bytes());
+        }
+    }
+
+    // 3b. Patch all DataRec relocations (which may intern functions into `indirect_table`).
     for (func_idx, f) in module.funcs.iter().enumerate() {
         for d in 0..f.view.datas.len() {
             let relocs = f.view.data_relocs_of(DataId(d as u32));
@@ -865,7 +1116,23 @@ pub fn compile_lir_wasm64<'a>(
         compiled_funcs.push(cf);
     }
 
-    // 6. Assemble borrowed `Wasm64Program` and emit `.wasm` bytes via `export_wasm64`.
+    // 6. Resolve exported module globals and assemble borrowed `Wasm64Program`.
+    let mut wasm_extra_globals = Vec::with_capacity_in(module.globals.len(), alloc);
+    for g in module.globals {
+        let init_i64 = match g.value {
+            LirWasm64GlobalValue::StaticAddr(place) => {
+                ctx.resolve_static(u32::MAX, 0, place)? as i64
+            }
+            LirWasm64GlobalValue::I64(v) => v,
+        };
+        wasm_extra_globals.push(Wasm64ExportGlobal {
+            name: g.name,
+            val_type: ValType::I64,
+            mutable: false,
+            init_i64,
+        });
+    }
+
     let mut wasm_funcs = Vec::with_capacity_in(compiled_funcs.len(), alloc);
     for (cf, f) in compiled_funcs.as_slice().iter().zip(module.funcs) {
         wasm_funcs.push(Wasm64Func {
@@ -891,6 +1158,9 @@ pub fn compile_lir_wasm64<'a>(
         data: wasm_data.as_slice(),
         indirect_table: ctx.indirect_table.as_slice(),
         extra_types: wasm_extra_types.as_slice(),
+        omit_blaze_host_v1: !module.include_blaze_host_v1,
+        extra_imports: ctx.extra_imports.as_slice(),
+        extra_globals: wasm_extra_globals.as_slice(),
         profile_digest: module.profile_digest,
         opts,
     };
@@ -906,8 +1176,8 @@ struct ValLocals {
     count: u16,
 }
 
-struct FuncEmitter<'a, 'c, 'v> {
-    ctx: &'c mut ModuleCtx<'a>,
+struct FuncEmitter<'a, 'm, 'c, 'v> {
+    ctx: &'c mut ModuleCtx<'a, 'm>,
     func_idx: usize,
     place: u32,
     view: View<'v>,
@@ -925,8 +1195,8 @@ struct FuncEmitter<'a, 'c, 'v> {
     code: AVec<'a, u8>,
 }
 
-fn lower_func<'a, 'v>(
-    ctx: &mut ModuleCtx<'a>,
+fn lower_func<'a, 'm, 'v>(
+    ctx: &mut ModuleCtx<'a, 'm>,
     func_idx: usize,
     func: &LirWasm64Func<'v>,
 ) -> Result<CompiledFunc<'a>, LirWasm64Error> {
@@ -1120,7 +1390,7 @@ fn lower_func<'a, 'v>(
     })
 }
 
-impl<'a, 'c, 'v> FuncEmitter<'a, 'c, 'v> {
+impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
     // ---- Low-level Wasm emission helpers ----------------------------------------------------
 
     #[inline]
@@ -1904,13 +2174,12 @@ impl<'a, 'c, 'v> FuncEmitter<'a, 'c, 'v> {
                 let callee_ref = o.reference();
                 let sig_id = o.sig();
                 let args = o.values();
-                let wasm_idx = self.resolve_call_ref(inst, callee_ref)?;
-                self.check_direct_call_sig(inst, sig_id, wasm_idx)?;
+                let target = self.resolve_call_ref(inst, callee_ref)?;
+                self.check_direct_call_sig(inst, sig_id, target)?;
                 for arg in args.iter() {
                     self.push_val(arg);
                 }
-                self.op(OP_CALL);
-                push_u32_leb(&mut self.code, wasm_idx);
+                self.emit_direct_call_target(target);
                 self.pop_val(inst);
             }
             Op::CallIndirect => {
@@ -2036,13 +2305,12 @@ impl<'a, 'c, 'v> FuncEmitter<'a, 'c, 'v> {
                 let _unwind_block = o.block();
                 let args = o.values();
                 let depth = dispatch_depth.expect("invoke requires dispatcher");
-                let wasm_idx = self.resolve_call_ref(inst, callee_ref)?;
-                self.check_direct_call_sig(inst, sig_id, wasm_idx)?;
+                let target = self.resolve_call_ref(inst, callee_ref)?;
+                self.check_direct_call_sig(inst, sig_id, target)?;
                 for arg in args.iter() {
                     self.push_val(arg);
                 }
-                self.op(OP_CALL);
-                push_u32_leb(&mut self.code, wasm_idx);
+                self.emit_direct_call_target(target);
                 self.pop_val(inst);
                 let pc = self.pc_local.expect("pc_local for invoke");
                 self.i32_const(normal_block.0 as i32);
@@ -2069,14 +2337,13 @@ impl<'a, 'c, 'v> FuncEmitter<'a, 'c, 'v> {
                 let callee_ref = o.reference();
                 let sig_id = o.sig();
                 let args = o.values();
-                let wasm_idx = self.resolve_call_ref(inst, callee_ref)?;
-                self.check_direct_call_sig(inst, sig_id, wasm_idx)?;
+                let target = self.resolve_call_ref(inst, callee_ref)?;
+                self.check_direct_call_sig(inst, sig_id, target)?;
                 self.emit_epilogue();
                 for arg in args.iter() {
                     self.push_val(arg);
                 }
-                self.op(OP_CALL);
-                push_u32_leb(&mut self.code, wasm_idx);
+                self.emit_direct_call_target(target);
                 self.op(OP_RETURN);
             }
             Op::TailCallIndirect => {
@@ -2097,7 +2364,11 @@ impl<'a, 'c, 'v> FuncEmitter<'a, 'c, 'v> {
 
     // ---- Call helpers -----------------------------------------------------------------------
 
-    fn resolve_call_ref(&self, inst: usize, callee_ref: RefId) -> Result<u32, LirWasm64Error> {
+    fn resolve_call_ref(
+        &self,
+        inst: usize,
+        callee_ref: RefId,
+    ) -> Result<CallTarget, LirWasm64Error> {
         if callee_ref.index() >= self.view.refs.len() {
             return Err(LirWasm64Error::UnsupportedRef {
                 func: self.place,
@@ -2115,17 +2386,20 @@ impl<'a, 'c, 'v> FuncEmitter<'a, 'c, 'v> {
                 place: rec.place,
             });
         }
-        self.ctx.resolve_func(self.place, inst, rec.place)
+        self.ctx.resolve_call_target(self.place, inst, rec.place)
     }
 
     fn check_direct_call_sig(
         &self,
         inst: usize,
         sig_id: SigId,
-        wasm_idx: u32,
+        target: CallTarget,
     ) -> Result<(), LirWasm64Error> {
         let (call_p, call_r) = flatten_sig(self.view, sig_id, self.place, inst, self.ctx.alloc)?;
-        let (exp_p, exp_r) = self.ctx.expected_wasm_sig(wasm_idx);
+        let (exp_p, exp_r) = match target {
+            CallTarget::Func(wasm_idx) => self.ctx.expected_wasm_sig(wasm_idx),
+            CallTarget::Intrinsic(intr) => intr.sig(),
+        };
         if call_p.as_slice() != exp_p || call_r.as_slice() != exp_r {
             return Err(LirWasm64Error::InvalidSignature {
                 func: self.place,
@@ -2134,6 +2408,26 @@ impl<'a, 'c, 'v> FuncEmitter<'a, 'c, 'v> {
             });
         }
         Ok(())
+    }
+
+    fn emit_direct_call_target(&mut self, target: CallTarget) {
+        match target {
+            CallTarget::Func(wasm_idx) => {
+                self.op(OP_CALL);
+                push_u32_leb(&mut self.code, wasm_idx);
+            }
+            CallTarget::Intrinsic(Wasm64Intrinsic::MemoryGrow) => {
+                self.op(OP_MEMORY_GROW);
+                self.code.push(0x00); // memory 0
+            }
+            CallTarget::Intrinsic(Wasm64Intrinsic::MemorySize) => {
+                self.op(OP_MEMORY_SIZE);
+                self.code.push(0x00); // memory 0
+            }
+            CallTarget::Intrinsic(Wasm64Intrinsic::HeapBase) => {
+                self.global_get(GLOBAL_HEAP_BASE);
+            }
+        }
     }
 
     fn emit_call_indirect(
@@ -4703,10 +4997,11 @@ mod tests {
     use blaze_own::{Alloc, Vec};
 
     use super::{
-        LirWasm64Error, LirWasm64Func, LirWasm64Import, LirWasm64Module, LirWasm64Static,
+        LirWasm64Error, LirWasm64Func, LirWasm64Global, LirWasm64GlobalValue, LirWasm64Import,
+        LirWasm64Module, LirWasm64RelocTarget, LirWasm64Static, LirWasm64StaticReloc,
         compile_lir_wasm64,
     };
-    use crate::wasm64::{HOST_MODULE, Wasm64Error, Wasm64Opts, check_wasm64};
+    use crate::wasm64::{HOST_MODULE, ValType, Wasm64Error, Wasm64Opts, check_wasm64};
 
     fn new_builder(params: &[Ty], rets: &[Ty]) -> Builder<Global, Full> {
         let mut b = Builder::<Global, Full>::new_in(64, Global);
@@ -4735,8 +5030,13 @@ mod tests {
         let checked = check_wasm64(out1.as_slice()).expect("check_wasm64 accepts compiled module");
         assert!(checked.memory64);
         assert!(checked.has_memory_export);
-        assert!(checked.has_start_export);
-        assert_eq!(checked.host_imports, 3);
+        if module.include_blaze_host_v1 {
+            assert!(checked.has_start_export);
+            assert!(checked.has_blaze_host_v1);
+            assert_eq!(checked.host_imports, 3);
+        } else {
+            assert!(!checked.has_blaze_host_v1);
+        }
         (out1, checked)
     }
 
@@ -4765,6 +5065,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -4849,6 +5151,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -4886,6 +5190,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -4968,13 +5274,21 @@ mod tests {
             LirWasm64Func { name: "_start", export_name: Some("_start"), place: 0, view: start.view() },
             LirWasm64Func { name: "helper", export_name: None, place: 1, view: helper.view() },
         ];
-        let statics = [LirWasm64Static { place: 7, align: 8, bytes: b"hello" }];
-        let imports = [LirWasm64Import { place: 100, module: HOST_MODULE, field: "host_log" }];
+        let statics = [LirWasm64Static { place: 7, align: 8, bytes: b"hello", relocs: &[] }];
+        let imports = [LirWasm64Import {
+            place: 100,
+            module: HOST_MODULE,
+            field: "host_log",
+            params: &[],
+            results: &[],
+        }];
         let module = LirWasm64Module {
             name: "full-feature",
             funcs: &funcs,
             statics: &statics,
             imports: &imports,
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: Some([0x42; 32]),
         };
@@ -5019,12 +5333,14 @@ mod tests {
             LirWasm64Func { name: "_start", export_name: Some("_start"), place: 0, view: start.view() },
             LirWasm64Func { name: "callee", export_name: None, place: 1, view: callee.view() },
         ];
-        let statics = [LirWasm64Static { place: 5, align: 8, bytes: b"abcdef" }];
+        let statics = [LirWasm64Static { place: 5, align: 8, bytes: b"abcdef", relocs: &[] }];
         let module = LirWasm64Module {
             name: "data-relocs",
             funcs: &funcs,
             statics: &statics,
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -5052,6 +5368,8 @@ mod tests {
             funcs: &funcs_no_start,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -5067,18 +5385,312 @@ mod tests {
             place: 0,
             view: f.view(),
         }];
-        let bad_imports = [LirWasm64Import { place: 9, module: "env", field: "unknown" }];
+        let bad_intrinsic = [LirWasm64Import {
+            place: 9,
+            module: "__blaze_wasm64",
+            field: "unknown",
+            params: &[],
+            results: &[],
+        }];
         let m2 = LirWasm64Module {
-            name: "bad-import",
+            name: "bad-intrinsic",
             funcs: &funcs_start,
             statics: &[],
-            imports: &bad_imports,
+            imports: &bad_intrinsic,
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
         assert_eq!(
             compile_lir_wasm64(&m2, &mut out, Alloc::global()),
             Err(LirWasm64Error::UnsupportedImport { place: 9 })
+        );
+
+        let bad_host = [LirWasm64Import {
+            place: 10,
+            module: HOST_MODULE,
+            field: "unknown",
+            params: &[],
+            results: &[],
+        }];
+        let m3 = LirWasm64Module {
+            name: "bad-host-import",
+            funcs: &funcs_start,
+            statics: &[],
+            imports: &bad_host,
+            globals: &[],
+            include_blaze_host_v1: true,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+        assert_eq!(
+            compile_lir_wasm64(&m3, &mut out, Alloc::global()),
+            Err(LirWasm64Error::UnsupportedImport { place: 10 })
+        );
+    }
+
+    #[test]
+    fn wasi64_custom_import_without_blaze_host_v1() {
+        // helper(x: i32) -> i32 { x + 1 }
+        let mut bh = new_builder(&[Ty::I32], &[Ty::I32]);
+        let x = bh.param(Ty::I32);
+        let one = bh.iconst(Ty::I32, 1);
+        let y = bh.binary(Op::Add, Flags::NONE, x, one);
+        bh.ret(&[y]);
+        let helper = bh.finish_checked().unwrap();
+
+        // Reactor entry `_initialize() -> i32` calling custom `wasi_snapshot_preview1_64::fd_write`
+        // and defined `helper` (verifying func indices are offset by `import_count == 1`).
+        let mut b = Builder::<Global, Full>::new_in(64, Global);
+        let init_sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I32)]);
+        let fd_write_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I32), Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I32)],
+        );
+        let helper_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
+        b.set_signature(init_sig);
+        let fd_write_ref = b.reference(RefKind::Func, 100);
+        let helper_ref = b.reference(RefKind::Func, 1);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let fd = b.iconst(Ty::I32, 1);
+        let null_ptr = b.null();
+        let zero64 = b.iconst(Ty::I64, 0);
+        let wrote = b.call(Flags::NONE, fd_write_ref, fd_write_sig, &[fd, null_ptr, zero64, null_ptr]);
+        let res = b.call(Flags::NONE, helper_ref, helper_sig, &[wrote]);
+        b.ret(&[res]);
+        let init_fn = b.finish_checked().unwrap();
+
+        let funcs = [
+            LirWasm64Func {
+                name: "_initialize",
+                export_name: Some("_initialize"),
+                place: 0,
+                view: init_fn.view(),
+            },
+            LirWasm64Func { name: "helper", export_name: None, place: 1, view: helper.view() },
+        ];
+        let imports = [LirWasm64Import {
+            place: 100,
+            module: "wasi_snapshot_preview1_64",
+            field: "fd_write",
+            params: &[ValType::I32, ValType::I64, ValType::I64, ValType::I64],
+            results: &[ValType::I32],
+        }];
+        let module = LirWasm64Module {
+            name: "wasi64-reactor",
+            funcs: &funcs,
+            statics: &[],
+            imports: &imports,
+            globals: &[],
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+
+        let (wasm, checked) = compile_and_check_deterministic(&module);
+        assert!(!checked.has_blaze_host_v1);
+        assert_eq!(checked.host_imports, 0);
+        assert_eq!(checked.import_count, 1);
+        assert_eq!(checked.func_count, 2);
+        assert!(!checked.has_start_export);
+        assert_eq!(checked.export_count, 3, "memory + blaze_ring_abi_version + _initialize");
+        assert!(wasm.windows(b"wasi_snapshot_preview1_64".len()).any(|w| w == b"wasi_snapshot_preview1_64"));
+        assert!(wasm.windows(b"fd_write".len()).any(|w| w == b"fd_write"));
+        assert!(!wasm.windows(HOST_MODULE.len()).any(|w| w == HOST_MODULE.as_bytes()));
+        // `fd_write` is func 0 (`call 0` = 0x10 0x00), `helper` is func 2 (`call 2` = 0x10 0x02).
+        assert!(wasm.windows(2).any(|w| w == [0x10, 0x00]), "direct call to custom import index 0");
+        assert!(wasm.windows(2).any(|w| w == [0x10, 0x02]), "direct call to defined helper index 2");
+    }
+
+    #[test]
+    fn wasm64_memory_intrinsics_emit_inline_with_zero_imports() {
+        let mut b = Builder::<Global, Full>::new_in(64, Global);
+        let fn_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        let nullary_i64 = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+        b.set_signature(fn_sig);
+        let r_grow = b.reference(RefKind::Func, 10);
+        let r_size = b.reference(RefKind::Func, 11);
+        let r_heap = b.reference(RefKind::Func, 12);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let delta = b.param(Ty::I64);
+        let hb = b.call(Flags::NONE, r_heap, nullary_i64, &[]);
+        let sz = b.call(Flags::NONE, r_size, nullary_i64, &[]);
+        let prev = b.call(Flags::NONE, r_grow, fn_sig, &[delta]);
+        let s1 = b.binary(Op::Add, Flags::NONE, hb, sz);
+        let s2 = b.binary(Op::Add, Flags::NONE, s1, prev);
+        b.ret(&[s2]);
+        let mem_ops = b.finish_checked().unwrap();
+
+        let funcs = [LirWasm64Func {
+            name: "mem_ops",
+            export_name: Some("mem_ops"),
+            place: 0,
+            view: mem_ops.view(),
+        }];
+        let imports = [
+            LirWasm64Import {
+                place: 10,
+                module: "__blaze_wasm64",
+                field: "memory_grow",
+                params: &[ValType::I64],
+                results: &[ValType::I64],
+            },
+            LirWasm64Import {
+                place: 11,
+                module: "__blaze_wasm64",
+                field: "memory_size",
+                params: &[],
+                results: &[ValType::I64],
+            },
+            LirWasm64Import {
+                place: 12,
+                module: "__blaze_wasm64",
+                field: "heap_base",
+                params: &[],
+                results: &[ValType::I64],
+            },
+        ];
+        let module = LirWasm64Module {
+            name: "wasm64-intrinsics",
+            funcs: &funcs,
+            statics: &[],
+            imports: &imports,
+            globals: &[],
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+
+        let (wasm, checked) = compile_and_check_deterministic(&module);
+        assert!(!checked.has_blaze_host_v1);
+        assert_eq!(checked.host_imports, 0);
+        assert_eq!(checked.import_count, 0, "intrinsics must NOT emit any host imports");
+        assert_eq!(checked.func_count, 1);
+        assert!(!wasm.windows(b"__blaze_wasm64".len()).any(|w| w == b"__blaze_wasm64"));
+        assert!(wasm.windows(2).any(|w| w == [0x23, 0x01]), "heap_base emits global.get 1");
+        assert!(wasm.windows(2).any(|w| w == [0x3F, 0x00]), "memory_size emits memory.size 0");
+        assert!(wasm.windows(2).any(|w| w == [0x40, 0x00]), "memory_grow emits memory.grow 0");
+    }
+
+    #[test]
+    fn static_relocs_and_exported_globals_patch_and_validate() {
+        // callee() -> i64 { 42 }
+        let mut bc = new_builder(&[], &[Ty::I64]);
+        let v42 = bc.iconst(Ty::I64, 42);
+        bc.ret(&[v42]);
+        let callee = bc.finish_checked().unwrap();
+
+        // blaze_proc_macro_expand() -> i64: loads function ptr from static 20 + 8 and calls indirectly.
+        let mut b = Builder::<Global, Full>::new_in(64, Global);
+        let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let decls_ref = b.reference(RefKind::Static, 20);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let decls_ptr = b.data_addr(decls_ref);
+        let fn_ptr = b.load(Ty::PTR, Flags::NONE, decls_ptr, 8, MemAttrs::aligned(3));
+        let res = b.call_indirect(Flags::NONE, fn_ptr, sig, &[]);
+        b.ret(&[res]);
+        let expand = b.finish_checked().unwrap();
+
+        let funcs = [
+            LirWasm64Func {
+                name: "blaze_proc_macro_expand",
+                export_name: Some("blaze_proc_macro_expand"),
+                place: 0,
+                view: expand.view(),
+            },
+            LirWasm64Func { name: "callee", export_name: None, place: 1, view: callee.view() },
+        ];
+        let relocs = [
+            LirWasm64StaticReloc {
+                offset: 0,
+                target: LirWasm64RelocTarget::Static(10),
+                addend: 4,
+            },
+            LirWasm64StaticReloc {
+                offset: 8,
+                target: LirWasm64RelocTarget::Func(1),
+                addend: 0,
+            },
+        ];
+        let statics = [
+            LirWasm64Static {
+                place: 10,
+                align: 8,
+                bytes: b"proc-macro-decls",
+                relocs: &[],
+            },
+            LirWasm64Static {
+                place: 20,
+                align: 8,
+                bytes: &[0u8; 16],
+                relocs: &relocs,
+            },
+        ];
+        let globals = [
+            LirWasm64Global {
+                name: "__blaze_proc_macro_decls",
+                value: LirWasm64GlobalValue::StaticAddr(20),
+            },
+            LirWasm64Global {
+                name: "__blaze_abi_magic",
+                value: LirWasm64GlobalValue::I64(0x504D_3634),
+            },
+        ];
+        let module = LirWasm64Module {
+            name: "proc-macro-decls",
+            funcs: &funcs,
+            statics: &statics,
+            imports: &[],
+            globals: &globals,
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+
+        let (wasm, checked) = compile_and_check_deterministic(&module);
+        assert!(!checked.has_blaze_host_v1);
+        assert_eq!(checked.import_count, 0);
+        assert_eq!(checked.func_count, 2);
+        assert_eq!(checked.table_size, 2, "slot 0 null + slot 1 relocated callee");
+        assert_eq!(checked.elem_count, 1);
+        assert_eq!(checked.data_segments, 2);
+        assert_eq!(checked.global_count, 5, "3 built-in + 2 extra globals");
+        assert_eq!(checked.export_count, 5, "memory + abi_version + 1 func + 2 globals");
+
+        // Verify static 20 was patched with `(static_10_addr + 4)` and table slot `1`.
+        let static_10_addr = Wasm64Opts::DEFAULT.stack_top as i64;
+        let mut expected_patched = [0u8; 16];
+        expected_patched[0..8].copy_from_slice(&(static_10_addr + 4).to_le_bytes());
+        expected_patched[8..16].copy_from_slice(&1i64.to_le_bytes());
+        assert!(
+            wasm.windows(16).any(|w| w == expected_patched),
+            "static 20 data segment must contain patched static+4 and func table slot 1"
+        );
+        assert!(wasm.windows(b"__blaze_proc_macro_decls".len()).any(|w| w == b"__blaze_proc_macro_decls"));
+        assert!(wasm.windows(b"__blaze_abi_magic".len()).any(|w| w == b"__blaze_abi_magic"));
+
+        // Out-of-bounds static reloc is refused with `InvalidDataReloc`.
+        let oob_relocs = [LirWasm64StaticReloc {
+            offset: 12,
+            target: LirWasm64RelocTarget::Static(10),
+            addend: 0,
+        }];
+        let bad_statics = [
+            statics[0],
+            LirWasm64Static { place: 20, align: 8, bytes: &[0u8; 16], relocs: &oob_relocs },
+        ];
+        let bad_module = LirWasm64Module { statics: &bad_statics, ..module };
+        let mut out = Vec::new_in(Alloc::global());
+        assert_eq!(
+            compile_lir_wasm64(&bad_module, &mut out, Alloc::global()),
+            Err(LirWasm64Error::InvalidDataReloc { func: u32::MAX, data_id: 20, offset: 12 })
         );
     }
 }

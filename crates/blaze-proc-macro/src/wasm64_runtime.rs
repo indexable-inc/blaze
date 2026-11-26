@@ -844,6 +844,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -958,6 +960,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -1096,6 +1100,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -1230,6 +1236,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts,
             profile_digest: None,
         };
@@ -1291,6 +1299,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -1380,6 +1390,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -1521,13 +1533,15 @@ mod tests {
             LirWasm64Func { name: "emit_log", export_name: Some("emit_log"), place: PLACE_LOG_FN, view: log_fn.view() },
             LirWasm64Func { name: "static_ptr", export_name: Some("static_ptr"), place: PLACE_PTR_FN, view: ptr_fn.view() },
         ];
-        let statics = [LirWasm64Static { place: PLACE_GREETING_STATIC, align: 1, bytes: MSG }];
-        let imports = [LirWasm64Import { place: PLACE_LOG_IMPORT, module: EXPORT_HOST_MODULE, field: "host_log" }];
+        let statics = [LirWasm64Static { place: PLACE_GREETING_STATIC, align: 1, bytes: MSG, relocs: &[] }];
+        let imports = [LirWasm64Import { place: PLACE_LOG_IMPORT, module: EXPORT_HOST_MODULE, field: "host_log", params: &[], results: &[] }];
         let module = LirWasm64Module {
             name: "oracle_rodata_and_host_log",
             funcs: &funcs,
             statics: &statics,
             imports: &imports,
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -1632,6 +1646,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -1729,6 +1745,8 @@ mod tests {
             funcs: &funcs,
             statics: &[],
             imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
             opts: Wasm64Opts::DEFAULT,
             profile_digest: None,
         };
@@ -1772,5 +1790,404 @@ mod tests {
             .expect("host::Settings engine initializes with memory64");
         wasmtime::Module::new(&host_engine, &wasm)
             .expect("host::Settings engine compiles memory64 module");
+    }
+
+    // ---- 10. End-to-end `compile_lir_wasm64` -> `ScriptRuntime` (`wasi_snapshot_preview1_64`)
+
+    #[test]
+    fn wasm64_build_script_runs_end_to_end_through_script_runtime() {
+        use std::sync::Arc;
+        use blaze_build_script::{Env, key::{CMode, RunLimits}};
+        use blaze_export::{
+            lir_wasm64::{LirWasm64Global, LirWasm64GlobalValue},
+            wasm64::ValType,
+        };
+        use crate::{
+            script::ScriptRuntime,
+            script_sandbox::{Script, ScriptRoot, Tree},
+        };
+
+        const PLACE_START: u32 = 0;
+        const PLACE_MSG: u32 = 10;
+        const PLACE_FD_WRITE: u32 = 20;
+        const PLACE_PROC_EXIT: u32 = 21;
+        const PLACE_MEM_GROW: u32 = 22;
+        const PLACE_HEAP_BASE: u32 = 23;
+
+        const CARGO_LINES: &[u8] = b"cargo:rustc-cfg=from_wasm64\ncargo:rustc-env=WASM64_KEY=hello64\n";
+
+        let start_fn = {
+            let mut b = begin_fn(&[], &[]);
+            let grow_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let heap_sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            let fd_write_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I32), Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I32)],
+            );
+            let exit_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[]);
+
+            let r_grow = b.reference(RefKind::Func, PLACE_MEM_GROW);
+            let r_heap = b.reference(RefKind::Func, PLACE_HEAP_BASE);
+            let r_fd_write = b.reference(RefKind::Func, PLACE_FD_WRITE);
+            let r_exit = b.reference(RefKind::Func, PLACE_PROC_EXIT);
+            let r_msg = b.reference(RefKind::Static, PLACE_MSG);
+
+            // Grow memory by 1 page via inline `__blaze_wasm64::memory_grow`, then use `heap_base`
+            // for our 16-byte 64-bit WASI iovec `[ptr: u64, len: u64]` + 8-byte `nwritten`.
+            let one_page = b.iconst(Ty::I64, 1);
+            let _prev = b.call(Flags::NONE, r_grow, grow_sig, &[one_page]);
+            let base = b.call(Flags::NONE, r_heap, heap_sig, &[]);
+            let base_ptr = b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, base);
+
+            let msg_ptr = b.data_addr(r_msg);
+            let msg_addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, msg_ptr);
+            let msg_len = b.iconst(Ty::I64, CARGO_LINES.len() as u128);
+            let off16 = b.iconst(Ty::I64, 16);
+            let nwritten_addr = b.binary(Op::Add, Flags::NONE, base, off16);
+
+            let ma = MemAttrs::aligned(3);
+            b.store(Flags::NONE, msg_addr, base_ptr, 0, ma);
+            b.store(Flags::NONE, msg_len, base_ptr, 8, ma);
+
+            let stdout_fd = b.iconst(Ty::I32, 1);
+            let one_iov = b.iconst(Ty::I64, 1);
+            let _errno = b.call(Flags::NONE, r_fd_write, fd_write_sig, &[stdout_fd, base, one_iov, nwritten_addr]);
+
+            let zero = b.iconst(Ty::I32, 0);
+            let _ = b.call(Flags::NONE, r_exit, exit_sig, &[zero]);
+            b.ret(&[]);
+            b.finish_checked().expect("wasm64 build.rs _start builds")
+        };
+
+        let funcs = [LirWasm64Func { name: "_start", export_name: Some("_start"), place: PLACE_START, view: start_fn.view() }];
+        let statics = [LirWasm64Static { place: PLACE_MSG, align: 1, bytes: CARGO_LINES, relocs: &[] }];
+        let imports = [
+            LirWasm64Import {
+                place: PLACE_FD_WRITE,
+                module: "wasi_snapshot_preview1_64",
+                field: "fd_write",
+                params: &[ValType::I32, ValType::I64, ValType::I64, ValType::I64],
+                results: &[ValType::I32],
+            },
+            LirWasm64Import {
+                place: PLACE_PROC_EXIT,
+                module: "wasi_snapshot_preview1_64",
+                field: "proc_exit",
+                params: &[ValType::I32],
+                results: &[],
+            },
+            LirWasm64Import {
+                place: PLACE_MEM_GROW,
+                module: "__blaze_wasm64",
+                field: "memory_grow",
+                params: &[ValType::I64],
+                results: &[ValType::I64],
+            },
+            LirWasm64Import {
+                place: PLACE_HEAP_BASE,
+                module: "__blaze_wasm64",
+                field: "heap_base",
+                params: &[],
+                results: &[ValType::I64],
+            },
+        ];
+        let globals = [LirWasm64Global { name: "__test_msg_addr", value: LirWasm64GlobalValue::StaticAddr(PLACE_MSG) }];
+        let module = LirWasm64Module {
+            name: "wasm64_build_script_e2e",
+            funcs: &funcs,
+            statics: &statics,
+            imports: &imports,
+            globals: &globals,
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+
+        let alloc = test_alloc();
+        let mut wasm = AVec::new_in(alloc);
+        compile_lir_wasm64(&module, &mut wasm, alloc).expect("compile_lir_wasm64 succeeds");
+        let checked = check_wasm64(&wasm).expect("check_wasm64 validates WASI-64 build script");
+        assert!(checked.memory64);
+        assert!(!checked.has_blaze_host_v1);
+        assert_eq!(checked.import_count, 2, "only fd_write and proc_exit imported; memory intrinsics inline");
+
+        let dir = std::env::temp_dir().join(format!("blaze-wasm64-script-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rt = ScriptRuntime::new(&dir).expect("ScriptRuntime initializes");
+        let loaded = rt.load("wasm64-demo 0.1.0", &wasm).expect("ScriptRuntime loads wasm64 module");
+
+        let vars = vec![("OUT_DIR".to_owned(), "/out".to_owned())];
+        let mut env_vars = blaze_own::Vec::new_in(alloc);
+        env_vars.push((blaze_own::String::from_str_in("OUT_DIR", alloc), blaze_own::String::from_str_in("/out", alloc)));
+        let env = Env { vars: env_vars };
+        let script = Arc::new(Script {
+            package: "wasm64-demo 0.1.0".to_owned(),
+            tree: Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: None },
+            root: ScriptRoot::package(),
+            env: vars,
+            target: "aarch64-apple-darwin".to_owned(),
+            host: "aarch64-apple-darwin".to_owned(),
+            c_mode: CMode::Deferred,
+            limits: RunLimits { fuel: 1 << 26, memory: 16 << 20, out_dir_bytes: 1 << 20, out_dir_files: 16, output: 1 << 20, line: 256 << 10 },
+            table: Arc::new(Vec::new()),
+            probes: None,
+            spawner: None,
+            step: blaze_ids::ContentId::default(),
+            spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),
+            deps: Arc::new(crate::script_sandbox::dep_mount::DepViews::none()),
+        });
+
+        let ran = rt.run(&loaded, script, &env, alloc).expect("wasm64 build script runs cleanly");
+        assert!(ran.fuel > 0, "fuel must be metered on wasm64 build script");
+        assert!(
+            ran.outputs.cfgs.iter().any(|(name, value)| name.as_str() == "from_wasm64" && value.is_none()),
+            "expected cargo:rustc-cfg=from_wasm64 in {:?}",
+            ran.outputs.cfgs
+        );
+        assert!(
+            ran.outputs.env.iter().any(|(name, value)| name.as_str() == "WASM64_KEY" && value.as_str() == "hello64"),
+            "expected cargo:rustc-env=WASM64_KEY=hello64 in {:?}",
+            ran.outputs.env
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 11. End-to-end `compile_lir_wasm64` -> `host::Runtime` (`blaze_proc_macro_64`) ------
+
+    #[test]
+    fn wasm64_proc_macro_runs_end_to_end_through_host_runtime() {
+        use std::sync::Arc;
+        use blaze_expand::{Edition, ProcCall, ProcKind, lex};
+        use blaze_export::{
+            lir_wasm64::{LirWasm64Global, LirWasm64GlobalValue, LirWasm64RelocTarget, LirWasm64StaticReloc},
+            wasm64::ValType,
+        };
+        use crate::{
+            host::{CallError, Limits, Runtime},
+            module::{Exported, ModuleRecord, sha256_hex},
+            package_env::PackageEnv,
+            sandbox::{Files, Package},
+        };
+
+        const PLACE_INIT: u32 = 0;
+        const PLACE_ALLOC: u32 = 1;
+        const PLACE_EXPAND: u32 = 2;
+        const PLACE_MACRO_IMPL: u32 = 3;
+
+        const PLACE_DECLS: u32 = 10;
+        const PLACE_ENV_KEY: u32 = 11;
+        const PLACE_EMPTY_REPLY: u32 = 12;
+
+        const PLACE_ENV_VAR: u32 = 20;
+        const PLACE_OUTPUT: u32 = 21;
+        const PLACE_HEAP_BASE: u32 = 22;
+
+        const ENV_KEY: &[u8] = b"FOO";
+        // Bridge encoding of `Ok(None)` (empty token stream): `0u8` (`Ok`) + `1u8` (`None`).
+        const EMPTY_REPLY: &[u8] = &[0u8, 1u8];
+        const DECLS_ZERO: &[u8] = &[0u8; 8];
+
+        let init_fn = {
+            let mut b = begin_fn(&[], &[]);
+            b.ret(&[]);
+            b.finish_checked().expect("_initialize builds")
+        };
+
+        let alloc_fn = {
+            let mut b = begin_fn(&[Ty::I64], &[Ty::I64]);
+            let _len = b.param(Ty::I64);
+            let heap_sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            let r_heap = b.reference(RefKind::Func, PLACE_HEAP_BASE);
+            let base = b.call(Flags::NONE, r_heap, heap_sig, &[]);
+            b.ret(&[base]);
+            b.finish_checked().expect("blaze_proc_macro_alloc builds")
+        };
+
+        let macro_impl = {
+            let mut b = begin_fn(&[Ty::I64, Ty::I64], &[Ty::I32]);
+            let _in_ptr = b.param(Ty::I64);
+            let _in_len = b.param(Ty::I64);
+            let env_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            let out_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[]);
+            let heap_sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+
+            let r_env = b.reference(RefKind::Func, PLACE_ENV_VAR);
+            let r_out = b.reference(RefKind::Func, PLACE_OUTPUT);
+            let r_heap = b.reference(RefKind::Func, PLACE_HEAP_BASE);
+            let r_key = b.reference(RefKind::Static, PLACE_ENV_KEY);
+            let r_reply = b.reference(RefKind::Static, PLACE_EMPTY_REPLY);
+
+            // Read env var `FOO` into scratch buffer above input (heap_base + 4096) so Sandbox tracks it.
+            let base = b.call(Flags::NONE, r_heap, heap_sig, &[]);
+            let off = b.iconst(Ty::I64, 4096);
+            let buf = b.binary(Op::Add, Flags::NONE, base, off);
+            let key_ptr = b.data_addr(r_key);
+            let key_addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, key_ptr);
+            let key_len = b.iconst(Ty::I64, ENV_KEY.len() as u128);
+            let cap = b.iconst(Ty::I64, 64);
+            let _env_len = b.call(Flags::NONE, r_env, env_sig, &[key_addr, key_len, buf, cap]);
+
+            // Emit valid bridge empty token stream reply `[0, 0]`.
+            let reply_ptr = b.data_addr(r_reply);
+            let reply_addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, reply_ptr);
+            let reply_len = b.iconst(Ty::I64, EMPTY_REPLY.len() as u128);
+            let _ = b.call(Flags::NONE, r_out, out_sig, &[reply_addr, reply_len]);
+
+            let ok = b.iconst(Ty::I32, 0);
+            b.ret(&[ok]);
+            b.finish_checked().expect("macro_impl builds")
+        };
+
+        let expand_fn = {
+            let mut b = begin_fn(&[Ty::I64, Ty::I32, Ty::I64, Ty::I64], &[Ty::I32]);
+            let ok_blk = b.create_block(BlockKind::Normal);
+            let bad_blk = b.create_block(BlockKind::Normal);
+
+            let decls = b.param(Ty::I64);
+            let index = b.param(Ty::I32);
+            let in_ptr = b.param(Ty::I64);
+            let in_len = b.param(Ty::I64);
+
+            let zero = b.iconst(Ty::I32, 0);
+            let is_zero = b.icmp(IntCond::Eq, index, zero);
+            b.br(Flags::NONE, is_zero, (ok_blk, &[]), (bad_blk, &[]));
+
+            b.begin(ok_blk);
+            let ma = MemAttrs::aligned(3);
+            let decls_ptr = b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, decls);
+            // Load patched function-table index from `decls[0]` and dispatch via `call_indirect`!
+            let fn_idx = b.load(Ty::I64, Flags::NONE, decls_ptr, 0, ma);
+            let fn_ptr = b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, fn_idx);
+            let impl_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[Param::of(Ty::I32)]);
+            let status = b.call_indirect(Flags::NONE, fn_ptr, impl_sig, &[in_ptr, in_len]);
+            b.ret(&[status]);
+
+            b.begin(bad_blk);
+            let missing = b.iconst(Ty::I32, 1);
+            b.ret(&[missing]);
+            b.finish_checked().expect("blaze_proc_macro_expand builds")
+        };
+
+        let funcs = [
+            LirWasm64Func { name: "_initialize", export_name: Some("_initialize"), place: PLACE_INIT, view: init_fn.view() },
+            LirWasm64Func { name: "blaze_proc_macro_alloc", export_name: Some("blaze_proc_macro_alloc"), place: PLACE_ALLOC, view: alloc_fn.view() },
+            LirWasm64Func { name: "blaze_proc_macro_expand", export_name: Some("blaze_proc_macro_expand"), place: PLACE_EXPAND, view: expand_fn.view() },
+            LirWasm64Func { name: "macro_impl", export_name: None, place: PLACE_MACRO_IMPL, view: macro_impl.view() },
+        ];
+        let decls_relocs = [LirWasm64StaticReloc {
+            offset: 0,
+            target: LirWasm64RelocTarget::Func(PLACE_MACRO_IMPL),
+            addend: 0,
+        }];
+        let statics = [
+            LirWasm64Static { place: PLACE_DECLS, align: 8, bytes: DECLS_ZERO, relocs: &decls_relocs },
+            LirWasm64Static { place: PLACE_ENV_KEY, align: 1, bytes: ENV_KEY, relocs: &[] },
+            LirWasm64Static { place: PLACE_EMPTY_REPLY, align: 1, bytes: EMPTY_REPLY, relocs: &[] },
+        ];
+        let imports = [
+            LirWasm64Import {
+                place: PLACE_ENV_VAR,
+                module: "blaze_proc_macro_64",
+                field: "env_var",
+                params: &[ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+                results: &[ValType::I64],
+            },
+            LirWasm64Import {
+                place: PLACE_OUTPUT,
+                module: "blaze_proc_macro_64",
+                field: "output",
+                params: &[ValType::I64, ValType::I64],
+                results: &[],
+            },
+            LirWasm64Import {
+                place: PLACE_HEAP_BASE,
+                module: "__blaze_wasm64",
+                field: "heap_base",
+                params: &[],
+                results: &[ValType::I64],
+            },
+        ];
+        let globals = [LirWasm64Global {
+            name: "__rustc_proc_macro_decls_wasm64__",
+            value: LirWasm64GlobalValue::StaticAddr(PLACE_DECLS),
+        }];
+        let module = LirWasm64Module {
+            name: "wasm64_proc_macro_e2e",
+            funcs: &funcs,
+            statics: &statics,
+            imports: &imports,
+            globals: &globals,
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+
+        let alloc = test_alloc();
+        let mut wasm = AVec::new_in(alloc);
+        compile_lir_wasm64(&module, &mut wasm, alloc).expect("compile_lir_wasm64 succeeds");
+        let checked = check_wasm64(&wasm).expect("check_wasm64 validates proc-macro reactor");
+        assert!(checked.memory64);
+        assert!(!checked.has_blaze_host_v1);
+        assert_eq!(checked.import_count, 2);
+
+        let dir = std::env::temp_dir().join(format!("blaze-wasm64-pm-e2e-{}", std::process::id()));
+        let pkg_dir = dir.join("pkg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&pkg_dir).expect("pkg dir");
+        std::fs::write(dir.join("module.wasm"), wasm.as_slice()).expect("write module.wasm");
+        let digest = sha256_hex(wasm.as_slice());
+
+        let record = ModuleRecord {
+            key: digest.clone(),
+            name: "wasm64-pm-demo".to_owned(),
+            version: "0.1.0".to_owned(),
+            wasm_sha256: digest,
+            macros: vec![
+                Exported { index: 0, kind: ProcKind::FnLike, name: "demo".to_owned(), helpers: Vec::new() },
+                Exported { index: 1, kind: ProcKind::FnLike, name: "missing".to_owned(), helpers: Vec::new() },
+            ],
+            decls: "__rustc_proc_macro_decls_wasm64__".to_owned(),
+            dir: dir.clone(),
+            compiled: dir.join("compiled"),
+            native_dylib: None,
+        };
+
+        let rt = Runtime::new(blaze_own::testing::heap()).expect("Runtime initializes");
+        let loaded = rt.load(&record).expect("Runtime loads wasm64 proc-macro reactor");
+        let env = PackageEnv::set_only(vec![("FOO".to_owned(), "bar64".to_owned())]).expect("PackageEnv");
+        let pkg = Arc::new(Package::new(Files::Folder(pkg_dir), env).expect("Package"));
+
+        let input = lex("struct Demo;", Edition::E2024, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+
+        let ran = rt
+            .expand(&loaded, &record.macros[0], &call, Edition::E2024, Arc::clone(&pkg), Limits::STANDARD, alloc)
+            .expect("wasm64 proc-macro expands via indirect decls dispatch");
+        assert!(ran.produced.tokens.is_empty());
+        assert!(ran.fuel > 0);
+        assert!(
+            ran.produced.reads.list().iter().any(|r| ran.produced.reads.subject(r) == "env:FOO"),
+            "expected tracked env:FOO read in {:?}",
+            ran.produced.reads.list()
+        );
+
+        // Control: out-of-range macro index returns status 1 and is refused cleanly.
+        let err = rt
+            .expand(&loaded, &record.macros[1], &call, Edition::E2024, pkg, Limits::STANDARD, alloc)
+            .err()
+            .expect("index 1 must fail");
+        assert!(
+            matches!(err.error, CallError::Failed(ref why) if why.contains("no macro at index 1")),
+            "expected missing macro index error, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -81,8 +81,8 @@ use std::{
 
 use blaze_expand::{Edition, HostAsk, HostError, HostWhy, ProcCall, ProcLimit, Produced, ReadAnswer, ReadKind, Reads};
 use blaze_own::Alloc;
-use blaze_wasi::{Stop, W32};
-use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, OperatorCost, OptLevel, ResourceLimiter, Store, Trap, TypedFunc, Val, WasmBacktraceDetails};
+use blaze_wasi::{Stop, W32, W64, Width};
+use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, OperatorCost, OptLevel, ResourceLimiter, Store, Trap, TypedFunc, Val, WasmBacktraceDetails, WasmTy};
 
 use crate::{
     module::{Exported, ModuleRecord, sha256_hex},
@@ -92,8 +92,11 @@ use crate::{
     server::{Outcome, ProduceError, Server, ServerError, ServerLimits, Tracked},
 };
 
-/// The import module of the shim's calls.
+/// The import module of the 32-bit shim's calls.
 const IMPORTS: &str = "blaze_proc_macro";
+
+/// The import module of the 64-bit (`memory64`) shim's calls.
+const IMPORTS_64: &str = "blaze_proc_macro_64";
 
 /// The deepest a module's stack may grow.
 pub const MAX_WASM_STACK: usize = 4 << 20;
@@ -373,7 +376,7 @@ impl Runtime {
     pub fn with_settings(settings: &Settings, heap: &'static blaze_own::Heap) -> Result<Runtime, RuntimeError> {
         let engine = Engine::new(&settings.config()).map_err(|e| RuntimeError::Engine(format!("{e:#}")))?;
         let mut bytes = Bytes::default();
-        bytes.write(b"blaze proc-macro host 2\n");
+        bytes.write(b"blaze proc-macro host 3\n");
         settings.hash(&mut bytes);
         // The target triple, the compiler's flags, the host CPU features Wasmtime compiled for
         // (`isa_flags`), its tunables and wasm features, and Wasmtime's version.
@@ -382,8 +385,10 @@ impl Runtime {
         bytes.write(std::env::consts::OS.as_bytes());
         let code_id = sha256_hex(&bytes.0);
         let mut linker = Linker::new(&engine);
-        imports(&mut linker).map_err(|e| RuntimeError::Linker(format!("{e:#}")))?;
+        imports::<W32>(&mut linker).map_err(|e| RuntimeError::Linker(format!("{e:#}")))?;
+        imports::<W64>(&mut linker).map_err(|e| RuntimeError::Linker(format!("{e:#}")))?;
         blaze_wasi::link::<W32, Host>(&mut linker).map_err(|e| RuntimeError::Linker(format!("{e:#}")))?;
+        blaze_wasi::link::<W64, Host>(&mut linker).map_err(|e| RuntimeError::Linker(format!("{e:#}")))?;
         Ok(Runtime {
             engine,
             linker,
@@ -728,30 +733,69 @@ impl blaze_wasi::Embed for Host {
     }
 }
 
+/// Proc-macro shim and WASI refusal ABI parameterized by pointer width (`W32` or `W64`).
+trait HostWidth: Width {
+    const SHIM: &'static str;
+    const WASI_MODULE: &'static str;
+    type SignedLen: WasmTy;
+    fn len_out(len: usize) -> Self::Ptr;
+    fn missing_env() -> Self::SignedLen;
+    fn signed_len(len: usize) -> Result<Self::SignedLen, Stop>;
+}
+
+impl HostWidth for W32 {
+    const SHIM: &'static str = IMPORTS;
+    const WASI_MODULE: &'static str = WASI;
+    type SignedLen = i32;
+    fn len_out(len: usize) -> u32 {
+        len as u32
+    }
+    fn missing_env() -> i32 {
+        -1
+    }
+    fn signed_len(len: usize) -> Result<i32, Stop> {
+        i32::try_from(len).map_err(|_| Stop(format!("was given {len} bytes, more than a 32-bit memory holds")))
+    }
+}
+
+impl HostWidth for W64 {
+    const SHIM: &'static str = IMPORTS_64;
+    const WASI_MODULE: &'static str = WASI_64;
+    type SignedLen = i64;
+    fn len_out(len: usize) -> u64 {
+        len as u64
+    }
+    fn missing_env() -> i64 {
+        -1
+    }
+    fn signed_len(len: usize) -> Result<i64, Stop> {
+        i64::try_from(len).map_err(|_| Stop(format!("was given {len} bytes, more than a 64-bit length holds")))
+    }
+}
+
 /// Writes `value` at `into` when it fits in `capacity`: its length.
-fn give(mem: &mut [u8], into: u32, capacity: u32, value: &[u8]) -> Result<i32, Stop> {
-    let Ok(n) = i32::try_from(value.len()) else {
-        return Err(Stop(format!("was given {} bytes, more than a 32-bit memory holds", value.len())));
-    };
-    if value.len() <= capacity as usize {
-        blaze_wasi::put(mem, u64::from(into), value)?;
+fn give<W: HostWidth>(mem: &mut [u8], into: W::Ptr, capacity: W::Ptr, value: &[u8]) -> Result<W::SignedLen, Stop> {
+    let n = W::signed_len(value.len())?;
+    if (value.len() as u64) <= capacity.into() {
+        blaze_wasi::put(mem, into.into(), value)?;
     }
     Ok(n)
 }
 
-fn imports(l: &mut Linker<Host>) -> wasmtime::Result<()> {
-    l.func_wrap(IMPORTS, "dispatch", |mut c: Caller<'_, Host>, request: u32, len: u32| {
+fn imports<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<()> {
+    let shim = W::SHIM;
+    l.func_wrap(shim, "dispatch", |mut c: Caller<'_, Host>, request: W::Ptr, len: W::Ptr| {
         c.data_mut().requests += 1;
         let clock = c.data().clock;
         let at = clock.map_or(0, |clock| clock());
         with(&mut c, |mem, host| {
-            let request = blaze_wasi::bytes(mem, u64::from(request), u64::from(len))?;
+            let request = blaze_wasi::bytes(mem, request.into(), len.into())?;
             let served = host.server.dispatch(request, &mut host.reply);
             if let Some(clock) = clock {
                 host.bridge_nanos += clock().saturating_sub(at);
             }
             match served {
-                Ok(()) => Ok(host.reply.len() as u32),
+                Ok(()) => Ok(W::len_out(host.reply.len())),
                 Err(error) => {
                     host.server_error = Some(error);
                     Err(Stop(error.to_string()))
@@ -759,52 +803,56 @@ fn imports(l: &mut Linker<Host>) -> wasmtime::Result<()> {
             }
         })
     })?;
-    l.func_wrap(IMPORTS, "reply", |mut c: Caller<'_, Host>, into: u32| {
+    l.func_wrap(shim, "reply", |mut c: Caller<'_, Host>, into: W::Ptr| {
         with(&mut c, |mem, host| {
-            blaze_wasi::put(mem, u64::from(into), &host.reply)?;
+            blaze_wasi::put(mem, into.into(), &host.reply)?;
             host.reply.clear();
             Ok(())
         })
     })?;
-    l.func_wrap(IMPORTS, "output", |mut c: Caller<'_, Host>, bytes: u32, len: u32| {
+    l.func_wrap(shim, "output", |mut c: Caller<'_, Host>, bytes: W::Ptr, len: W::Ptr| {
         with(&mut c, |mem, host| {
             if host.output.is_some() {
                 return Err(Stop("gave its output twice".to_owned()));
             }
-            if len as usize > host.output_limit {
+            let len_u64: u64 = len.into();
+            if len_u64 > host.output_limit as u64 {
                 host.over_output = true;
-                return Err(Stop(format!("gave {len} bytes of output, more than its {}", host.output_limit)));
+                return Err(Stop(format!("gave {len_u64} bytes of output, more than its {}", host.output_limit)));
             }
-            host.output = Some(blaze_wasi::bytes(mem, u64::from(bytes), u64::from(len))?.to_vec());
+            host.output = Some(blaze_wasi::bytes(mem, bytes.into(), len_u64)?.to_vec());
             Ok(())
         })
     })?;
-    l.func_wrap(IMPORTS, "env_var", |mut c: Caller<'_, Host>, name: u32, len: u32, into: u32, capacity: u32| {
+    l.func_wrap(shim, "env_var", |mut c: Caller<'_, Host>, name: W::Ptr, len: W::Ptr, into: W::Ptr, capacity: W::Ptr| {
         with(&mut c, |mem, host| {
-            let name = blaze_wasi::bytes(mem, u64::from(name), u64::from(len))?;
+            let name = blaze_wasi::bytes(mem, name.into(), len.into())?;
             let Ok(name) = std::str::from_utf8(name) else {
                 return Err(Stop(format!("read the variable {:?}, whose name is not UTF-8", String::from_utf8_lossy(name))));
             };
             let name = name.to_owned();
             match host.sandbox.var(&name) {
-                Ok(Some(value)) => give(mem, into, capacity, value.as_bytes()),
-                Ok(None) => Ok(-1),
+                Ok(Some(value)) => give::<W>(mem, into, capacity, value.as_bytes()),
+                Ok(None) => Ok(W::missing_env()),
                 // Kept in `sandbox.env_refused`: `stopped_by` gives it as the call's error.
                 Err(refused) => Err(Stop(refused.to_string())),
             }
         })
     })?;
-    l.func_wrap(IMPORTS, "current_dir", |mut c: Caller<'_, Host>, into: u32, capacity: u32| {
+    l.func_wrap(shim, "current_dir", |mut c: Caller<'_, Host>, into: W::Ptr, capacity: W::Ptr| {
         with(&mut c, |mem, host| {
             let dir = host.sandbox.package().cwd();
-            give(mem, into, capacity, dir.as_bytes())
+            give::<W>(mem, into, capacity, dir.as_bytes())
         })
     })?;
-    refused_wasi(l)
+    refused_wasi::<W>(l)
 }
 
-/// The WASI module a proc macro imports from (wasm32-wasip1: 32-bit pointers).
-const WASI: &str = <W32 as blaze_wasi::Width>::MODULE;
+/// The WASI module a 32-bit proc macro imports from (`wasm32-wasip1`).
+const WASI: &str = <W32 as Width>::MODULE;
+
+/// The WASI module a 64-bit (`memory64`) proc macro imports from.
+const WASI_64: &str = <W64 as Width>::MODULE;
 
 /// The preview 1 calls a proc macro may import but the sandbox permits none of (rule 9: it has
 /// no writable file system, no socket and no signal): each is defined, so a module that links
@@ -839,49 +887,52 @@ pub(crate) const REFUSED_WASI: &[&str] = &[
 /// call answers `ENOTSUP`, a named errno, never a guess at what the call would have done.
 pub(crate) const UNSERVED_WASI: &[&str] = &["fd_advise", "fd_pread", "fd_renumber"];
 
-/// Defines [`REFUSED_WASI`] and [`UNSERVED_WASI`] with preview 1's signatures (`witx`): a wrong
-/// signature would fail the load as the missing import did.
-fn refused_wasi(l: &mut Linker<Host>) -> wasmtime::Result<()> {
+/// Defines [`REFUSED_WASI`] and [`UNSERVED_WASI`] with preview 1's signatures (`witx`) at
+/// pointer width `W`: a wrong signature would fail the load as the missing import did.
+fn refused_wasi<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<()> {
+    let wasi = W::WASI_MODULE;
     let perm = i32::from(blaze_wasi::Errno::PERM.0);
     let notsup = i32::from(blaze_wasi::Errno::NOTSUP.0);
     // (fd)
     for name in ["fd_datasync", "fd_sync", "proc_raise"] {
-        l.func_wrap(WASI, name, move |_: u32| -> i32 { perm })?;
+        l.func_wrap(wasi, name, move |_: u32| -> i32 { perm })?;
     }
     // (fd, to) and (fd, how)
     for (name, errno) in [("fd_renumber", notsup), ("sock_shutdown", perm)] {
-        l.func_wrap(WASI, name, move |_: u32, _: u32| -> i32 { errno })?;
+        l.func_wrap(wasi, name, move |_: u32, _: u32| -> i32 { errno })?;
     }
-    // (fd, path, path_len) and (fd, flags, fd_out)
-    for name in ["path_create_directory", "path_remove_directory", "path_unlink_file", "sock_accept"] {
-        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32| -> i32 { perm })?;
+    // (fd, path, path_len)
+    for name in ["path_create_directory", "path_remove_directory", "path_unlink_file"] {
+        l.func_wrap(wasi, name, move |_: u32, _: W::Ptr, _: W::Ptr| -> i32 { perm })?;
     }
+    // (fd, flags, fd_out)
+    l.func_wrap(wasi, "sock_accept", move |_: u32, _: u32, _: W::Ptr| -> i32 { perm })?;
     // (fd, size)
-    l.func_wrap(WASI, "fd_filestat_set_size", move |_: u32, _: u64| -> i32 { perm })?;
+    l.func_wrap(wasi, "fd_filestat_set_size", move |_: u32, _: u64| -> i32 { perm })?;
     // (fd, offset, len) and (fd, base, inheriting)
     for name in ["fd_allocate", "fd_fdstat_set_rights"] {
-        l.func_wrap(WASI, name, move |_: u32, _: u64, _: u64| -> i32 { perm })?;
+        l.func_wrap(wasi, name, move |_: u32, _: u64, _: u64| -> i32 { perm })?;
     }
     // (fd, offset, len, advice) and (fd, atim, mtim, fst_flags)
     for (name, errno) in [("fd_advise", notsup), ("fd_filestat_set_times", perm)] {
-        l.func_wrap(WASI, name, move |_: u32, _: u64, _: u64, _: u32| -> i32 { errno })?;
+        l.func_wrap(wasi, name, move |_: u32, _: u64, _: u64, _: u32| -> i32 { errno })?;
     }
     // (fd, iovs, iovs_len, offset, out)
     for (name, errno) in [("fd_pread", notsup), ("fd_pwrite", perm)] {
-        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32, _: u64, _: u32| -> i32 { errno })?;
+        l.func_wrap(wasi, name, move |_: u32, _: W::Ptr, _: W::Ptr, _: u64, _: W::Ptr| -> i32 { errno })?;
     }
     // (fd, flags, path, path_len, atim, mtim, fst_flags)
-    l.func_wrap(WASI, "path_filestat_set_times", move |_: u32, _: u32, _: u32, _: u32, _: u64, _: u64, _: u32| -> i32 { perm })?;
+    l.func_wrap(wasi, "path_filestat_set_times", move |_: u32, _: u32, _: W::Ptr, _: W::Ptr, _: u64, _: u64, _: u32| -> i32 { perm })?;
     // (old_fd, old_flags, old_path, old_len, new_fd, new_path, new_len)
-    l.func_wrap(WASI, "path_link", move |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { perm })?;
-    // (fd, old_path, old_len, new_fd, new_path, new_len) and (fd, data, data_len, flags, len_out, flags_out)
+    l.func_wrap(wasi, "path_link", move |_: u32, _: u32, _: W::Ptr, _: W::Ptr, _: u32, _: W::Ptr, _: W::Ptr| -> i32 { perm })?;
+    // (fd, old_path, old_len, new_fd, new_path, new_len) and (fd, ri_data, ri_data_len, ri_flags, ro_datalen, ro_flags)
     for name in ["path_rename", "sock_recv"] {
-        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { perm })?;
+        l.func_wrap(wasi, name, move |_: u32, _: W::Ptr, _: W::Ptr, _: u32, _: W::Ptr, _: W::Ptr| -> i32 { perm })?;
     }
-    // (old_path, old_len, fd, new_path, new_len) and (fd, data, data_len, flags, len_out)
-    for name in ["path_symlink", "sock_send"] {
-        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { perm })?;
-    }
+    // (old_path, old_len, fd, new_path, new_len)
+    l.func_wrap(wasi, "path_symlink", move |_: W::Ptr, _: W::Ptr, _: u32, _: W::Ptr, _: W::Ptr| -> i32 { perm })?;
+    // (fd, si_data, si_data_len, si_flags, so_datalen)
+    l.func_wrap(wasi, "sock_send", move |_: u32, _: W::Ptr, _: W::Ptr, _: u32, _: W::Ptr| -> i32 { perm })?;
     Ok(())
 }
 
@@ -1103,6 +1154,7 @@ fn run(store: &mut Store<Host>, loaded: &Loaded, index: u32, input: &[u8], mark:
     let Some(memory) = instance.get_memory(&mut *store, "memory") else {
         return Err(wasmtime::Error::msg("the module exports no memory"));
     };
+    let is_64 = memory.ty(&*store).is_64();
     store.data_mut().memory = Some(memory);
     mark.lap(Part::Instantiate);
     // A reactor's constructors and wasi-libc's start-up.
@@ -1112,19 +1164,37 @@ fn run(store: &mut Store<Host>, loaded: &Loaded, index: u32, input: &[u8], mark:
     let Some(global) = instance.get_global(&mut *store, &loaded.decls) else {
         return Err(wasmtime::Error::msg(format!("the module exports no `{}`", loaded.decls)));
     };
-    let Val::I32(decls) = global.get(&mut *store) else {
-        return Err(wasmtime::Error::msg(format!("`{}` is not an i32", loaded.decls)));
+    let status = if is_64 {
+        let Val::I64(decls) = global.get(&mut *store) else {
+            return Err(wasmtime::Error::msg(format!("`{}` is not an i64", loaded.decls)));
+        };
+        let alloc: TypedFunc<u64, u64> = instance.get_typed_func(&mut *store, "blaze_proc_macro_alloc")?;
+        let expand: TypedFunc<(u64, u32, u64, u64), u32> = instance.get_typed_func(&mut *store, "blaze_proc_macro_expand")?;
+        let Ok(len) = u64::try_from(input.len()) else {
+            return Err(wasmtime::Error::msg("its input is more than a 64-bit memory holds"));
+        };
+        mark.lap(Part::Exports);
+        let at = alloc.call(&mut *store, len)?;
+        let offset = usize::try_from(at).map_err(|_| wasmtime::Error::msg("the module returned an allocation address outside host usize"))?;
+        memory.write(&mut *store, offset, input)?;
+        mark.lap(Part::Input);
+        expand.call(&mut *store, (decls as u64, index, at, len))?
+    } else {
+        let Val::I32(decls) = global.get(&mut *store) else {
+            return Err(wasmtime::Error::msg(format!("`{}` is not an i32", loaded.decls)));
+        };
+        let alloc: TypedFunc<u32, u32> = instance.get_typed_func(&mut *store, "blaze_proc_macro_alloc")?;
+        let expand: TypedFunc<(u32, u32, u32, u32), u32> = instance.get_typed_func(&mut *store, "blaze_proc_macro_expand")?;
+        let Ok(len) = u32::try_from(input.len()) else {
+            return Err(wasmtime::Error::msg("its input is more than a 32-bit memory holds"));
+        };
+        mark.lap(Part::Exports);
+        let at = alloc.call(&mut *store, len)?;
+        memory.write(&mut *store, at as usize, input)?;
+        mark.lap(Part::Input);
+        expand.call(&mut *store, (decls as u32, index, at, len))?
     };
-    let alloc: TypedFunc<u32, u32> = instance.get_typed_func(&mut *store, "blaze_proc_macro_alloc")?;
-    let expand: TypedFunc<(u32, u32, u32, u32), u32> = instance.get_typed_func(&mut *store, "blaze_proc_macro_expand")?;
-    let Ok(len) = u32::try_from(input.len()) else {
-        return Err(wasmtime::Error::msg("its input is more than a 32-bit memory holds"));
-    };
-    mark.lap(Part::Exports);
-    let at = alloc.call(&mut *store, len)?;
-    memory.write(&mut *store, at as usize, input)?;
-    mark.lap(Part::Input);
-    match expand.call(&mut *store, (decls as u32, index, at, len))? {
+    match status {
         0 => Ok(()),
         1 => Err(wasmtime::Error::msg(format!("the module has no macro at index {index}"))),
         status if status & 0xff == 2 => {
