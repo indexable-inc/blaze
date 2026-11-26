@@ -36,8 +36,8 @@
 use blaze_own::Vec;
 use core::alloc::Allocator;
 
-use crate::bits::{self, Bits};
-use crate::flow::{Bound, Flow, Local, Operand, Place, Stmt, StmtKind, Value};
+use crate::bits::{self, BlockBits};
+use crate::flow::{Block, Bound, Flow, Local, Operand, Place, Stmt, StmtKind, Value};
 use crate::moves::{Inits, for_each_operand, inits};
 use crate::record::Plant;
 
@@ -129,8 +129,8 @@ fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> R
         };
         // A `Suspend` is its block's terminator: the statements before it in the block are
         // `range.start..s`.
-        let b = flow.stmt_block[s].index();
-        let range = flow.blocks[b];
+        let b = flow.stmt_block[s];
+        let range = flow.blocks[b.index()];
         st.copy_from_slice(storage.row(b));
         bo.copy_from_slice(borrowed.row(b));
         let s_u32 = u32::try_from(s).unwrap_or(u32::MAX);
@@ -138,8 +138,8 @@ fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> R
             storage_step(flow, Stmt(t), &mut st);
             borrow_step(flow, Stmt(t), &mut bo);
         }
-        keep.copy_from_slice(live.row(resume.index()));
-        bits::union_into(&mut keep, live.row(cancel.index()));
+        keep.copy_from_slice(live.row(resume));
+        bits::union_into(&mut keep, live.row(cancel));
         if borrows {
             bits::union_into(&mut keep, &bo);
         }
@@ -178,13 +178,13 @@ fn forward<A: Allocator + Copy>(
     limit: u64,
     what: &'static str,
     alloc: A,
-) -> Result<Bits<A>, Bound> {
+) -> Result<BlockBits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
+    let mut rows = BlockBits::new_in(flow, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
     if blocks == 0 {
         return Ok(rows);
     }
-    rows.row_mut(0).copy_from_slice(entry);
+    rows.row_mut(Block(0)).copy_from_slice(entry);
     let mut cur = zeroed(rows.words(), alloc);
     let mut passes = 0u64;
     loop {
@@ -194,17 +194,18 @@ fn forward<A: Allocator + Copy>(
         }
         let mut changed = false;
         for b in 0..blocks {
+            let blk = Block(b as u32);
             let range = flow.blocks[b];
             // `FlowBuilder::finish` refuses a block without its terminator: every block has a row.
             if range.end <= range.start {
                 continue;
             }
-            cur.copy_from_slice(rows.row(b));
+            cur.copy_from_slice(rows.row(blk));
             for s in range.start..range.end {
                 step(flow, Stmt(s), &mut cur);
             }
             flow.for_each_succ(Stmt(range.end - 1), |t| {
-                let to = flow.stmt_block[t.index()].index();
+                let to = flow.stmt_block[t.index()];
                 changed |= bits::union_into(rows.row_mut(to), &cur);
             });
         }
@@ -274,9 +275,9 @@ fn live_by_use<A: Allocator + Copy>(
     init: &Inits<A>,
     limit: u64,
     alloc: A,
-) -> Result<Bits<A>, Bound> {
+) -> Result<BlockBits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
+    let mut rows = BlockBits::new_in(flow, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
     let mut cur = zeroed(rows.words(), alloc);
     let mut passes = 0u64;
     loop {
@@ -286,6 +287,7 @@ fn live_by_use<A: Allocator + Copy>(
         }
         let mut changed = false;
         for b in (0..blocks).rev() {
+            let blk = Block(b as u32);
             let range = flow.blocks[b];
             // `FlowBuilder::finish` refuses a block without its terminator: every block has a row.
             if range.end <= range.start {
@@ -293,13 +295,13 @@ fn live_by_use<A: Allocator + Copy>(
             }
             cur.fill(0);
             flow.for_each_succ(Stmt(range.end - 1), |t| {
-                let from = flow.stmt_block[t.index()].index();
+                let from = flow.stmt_block[t.index()];
                 bits::union_into(&mut cur, rows.row(from));
             });
             for s in (range.start..range.end).rev() {
                 live_step(flow, init, Stmt(s), &mut cur);
             }
-            changed |= bits::union_into(rows.row_mut(b), &cur);
+            changed |= bits::union_into(rows.row_mut(blk), &cur);
         }
         if !changed {
             return Ok(rows);

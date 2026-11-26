@@ -1246,10 +1246,11 @@ fn large_flow_stress_and_equivalence() {
     let mut cur_init = std::vec![0u64; w];
     let mut cur_uninit = std::vec![0u64; w];
     for &(s, p) in &drop_stmts {
-        let b = flow.stmt_block[s.index()].index();
+        let blk = flow.stmt_block[s.index()];
+        let b = blk.index();
         let range = flow.blocks[b];
-        cur_init.copy_from_slice(st.init.row(b));
-        cur_uninit.copy_from_slice(st.uninit.row(b));
+        cur_init.copy_from_slice(st.init.row(blk));
+        cur_uninit.copy_from_slice(st.uninit.row(blk));
         if st.reached[b] {
             for t in range.start..s.0 {
                 crate::moves::transfer(&flow, Stmt(t), &mut cur_init, &mut cur_uninit);
@@ -2038,13 +2039,14 @@ fn block_grain_facts_equals_statement_level_oracle() {
         f.init.drop_may_run(&flow, Stmt(s as u32), flow.local_place(Local(l as u32)))
     };
     let local_mi_out = |s: usize, l: usize| -> bool {
-        let bi = flow.stmt_block[s].index();
+        let blk = flow.stmt_block[s];
+        let bi = blk.index();
         if !f.init.reached[bi] {
             return false;
         }
         let range = flow.blocks[bi];
-        let mut ci = f.init.init.row(bi).to_vec();
-        let mut cu = f.init.uninit.row(bi).to_vec();
+        let mut ci = f.init.init.row(blk).to_vec();
+        let mut cu = f.init.uninit.row(blk).to_vec();
         for t in range.start..=(s as u32) {
             crate::moves::transfer(&flow, Stmt(t), &mut ci, &mut cu);
         }

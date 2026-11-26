@@ -267,6 +267,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.is_auto_trait(trait_)
     }
+    fn is_try_as_dyn_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_try_as_dyn_trait(trait_)
+    }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.is_fn_trait(trait_)
     }
@@ -318,6 +321,9 @@ impl Facts for NestedFacts<'_, '_> {
     }
     fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         self.facts.drop_args(adt)
+    }
+    fn inst_needs_drop(&self, ty: tc::PTy) -> Option<bool> {
+        self.facts.inst_needs_drop(ty)
     }
     fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         self.facts.drop_strict(adt)

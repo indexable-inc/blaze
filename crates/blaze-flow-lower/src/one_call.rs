@@ -582,6 +582,9 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     fn is_future_trait(&self, trait_: ItemKey) -> bool {
         self.facts.is_future_trait(trait_)
     }
+    fn is_try_as_dyn_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_try_as_dyn_trait(trait_)
+    }
     fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
         self.facts.is_into_future_trait(trait_)
     }

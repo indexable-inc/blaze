@@ -1267,6 +1267,13 @@ pub trait Selected {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`):
+    /// compiler-builtin (`#[rustc_deny_explicit_impl]`) for `dyn Trait<'b, ..> + 'a`, tying
+    /// the trait's lifetime parameter `'a` invariantly to the object's lifetime.
+    fn is_try_as_dyn_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
     /// The signature column and where-clauses of a `FnDef` item (a fn, method, or tuple
     /// constructor), for proving builtin `Fn` / `FnMut` / `FnOnce` bounds and `Output`.
     fn fn_def_sig(&self, item: ItemKey) -> Result<(ParamsView<'_>, ColView<'_>, ImplWhere<'_>), NotSelected> {

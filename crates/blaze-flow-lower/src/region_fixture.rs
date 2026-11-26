@@ -583,6 +583,15 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
         self.base.is_fn_trait(trait_)
     }
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_future_trait(trait_)
+    }
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_into_future_trait(trait_)
+    }
+    fn is_try_as_dyn_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_try_as_dyn_trait(trait_)
+    }
     fn deref_impl(&self, adt: ItemKey) -> Option<ItemKey> {
         self.base.deref_impl(adt)
     }
@@ -615,6 +624,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     }
     fn drop_args(&self, adt: ItemKey) -> Option<&[bool]> {
         self.base.drop_args(adt)
+    }
+    fn inst_needs_drop(&self, ty: PTy) -> Option<bool> {
+        self.base.inst_needs_drop(ty)
     }
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
         self.base.field_count(adt, variant)

@@ -996,3 +996,138 @@ fn unsize_to_dyn_records_trait_and_projection_selection() {
         "array-to-slice unsizing must record no trait selection row: {slice_rows:?}"
     );
 }
+
+/// 4: `impl_where_rows` scans the selected impl's own header (`self_ty` and `trait_args`) for
+/// `PNode::Alias` nodes — e.g. `impl<T: AsContextMut> From<&mut T> for StoreContextMut<<T as
+/// AsContext>::Data>` (wasmtime's `Caller<'_, Host>` -> `StoreContextMut<'_, Host>` in
+/// `blaze-proc-macro/{script,host,wasm64_runtime}.rs`) — selecting the nested `<Caller<Host> as
+/// AsContext>::Data` impl row at the call. Negative control: when `T` is a caller type parameter
+/// `P: AsContextMut` with no concrete `AsContext` impl, no bogus `Impl` row is fabricated.
+#[test]
+fn impl_header_alias_selects_nested_assoc_impl() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let unit = fx.unit();
+
+    // trait AsContext { type Data; }
+    let as_ctx = fx.tr("AsContext", 1, Vec::new(), &["Data"]);
+    let p0_as_ctx = fx.bound(as_ctx, &[p0]);
+    let p0_data = fx.alias(as_ctx, "Data", &[p0]);
+    let p0_data_sized = fx.bound(sized, &[p0_data]);
+    fx.set_assoc_bounds(as_ctx, "Data", std::vec![p0_data_sized]);
+
+    // trait AsContextMut: AsContext {}
+    let as_ctx_mut = fx.tr("AsContextMut", 1, std::vec![p0_as_ctx], &[]);
+    let p0_as_ctx_mut = fx.bound(as_ctx_mut, &[p0]);
+
+    // trait MyFrom<T> { fn from(v: T) -> Self; }
+    let my_from = fx.tr("MyFrom", 2, Vec::new(), &[]);
+    fx.trait_fn(my_from, "from", false, &[p1], p0);
+
+    // struct Host; struct Caller<T>(T); struct StoreContextMut<T>(T);
+    let host = fx.strukt("Host", 0, &[]);
+    let host_ty = fx.adt(host, &[]);
+    let caller = fx.strukt("Caller", 1, &[("data", p0)]);
+    let caller_p0 = fx.adt(caller, &[p0]);
+    let caller_host = fx.adt(caller, &[host_ty]);
+    let store_mut = fx.strukt("StoreContextMut", 1, &[("data", p0)]);
+    let store_mut_data = fx.adt(store_mut, &[p0_data]);
+    let store_mut_host = fx.adt(store_mut, &[host_ty]);
+    let mut_p0 = fx.r(Mutbl::Mut, p0);
+    let mut_caller_host = fx.r(Mutbl::Mut, caller_host);
+
+    // impl<T> AsContext for Caller<T> { type Data = T; }
+    let impl_as_ctx_caller = fx.imp(
+        "impl<T> AsContext for Caller<T>",
+        1,
+        caller_p0,
+        Some((as_ctx, &[])),
+        &[("Data", p0)],
+        Vec::new(),
+    );
+    // impl<T> AsContextMut for Caller<T> {}
+    fx.imp(
+        "impl<T> AsContextMut for Caller<T>",
+        1,
+        caller_p0,
+        Some((as_ctx_mut, &[])),
+        &[],
+        Vec::new(),
+    );
+    // impl<T: AsContextMut> MyFrom<&mut T> for StoreContextMut<<T as AsContext>::Data> {}
+    let impl_from_store = fx.imp(
+        "impl<T: AsContextMut> MyFrom<&mut T> for StoreContextMut<<T as AsContext>::Data>",
+        1,
+        store_mut_data,
+        Some((my_from, &[mut_p0])),
+        &[],
+        std::vec![p0_as_ctx_mut],
+    );
+
+    // fn data_and_store<S, T>(s: S) where StoreContextMut<T>: MyFrom<S>
+    let store_mut_p1 = fx.adt(store_mut, &[p1]);
+    let store_from_s = fx.bound(my_from, &[store_mut_p1, p0]);
+    fx.func("data_and_store", 2, &[p0], unit, std::vec![store_from_s]);
+
+    let owner_concrete = fx.func("owner_concrete", 0, &[mut_caller_host], unit, Vec::new());
+    let owner_generic = fx.func("owner_generic", 1, &[mut_p0], unit, std::vec![p0_as_ctx_mut]);
+    let _ = store_mut_host;
+    fx.finish();
+
+    // Positive: `data_and_store::<&mut Caller<Host>, Host>(c)` selects `impl_from_store` AND scans
+    // its `self_ty` `StoreContextMut<<T as AsContext>::Data>` to file `<Caller<Host> as AsContext>::Data`.
+    {
+        use crate::ids::List;
+        use crate::portable::PNode;
+        let mut b = Bb::new();
+        let b_host = b.ty(PNode::Adt(host, List::EMPTY));
+        let b_host_l = b.t.intern_list(&[b_host]).expect("list");
+        let b_caller_host = b.ty(PNode::Adt(caller, b_host_l));
+        let b_mut_caller = b.ty(PNode::Ref(Mutbl::Mut, b_caller_host));
+        let c_param = b.param("c");
+        let lc = b.local(c_param);
+        let f = b.path_args("data_and_store", &[b_mut_caller, b_host]);
+        let call = b.call(f, &[lc]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, owner_concrete, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        let rows = c.call_selections(call);
+        assert!(
+            rows.iter().any(|r| r.trait_ == my_from && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_from_store)),
+            "expected `MyFrom` impl row on call: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.trait_ == as_ctx && r.name == Some(crate::ids::Name::of("Data")) && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_as_ctx_caller)),
+            "impl header alias `<T as AsContext>::Data` must file `<Caller<Host> as AsContext>::Data -> impl_as_ctx_caller`: {rows:?}"
+        );
+    }
+
+    // Negative control: generic `P: AsContextMut` with `data_and_store::<&mut P, <P as AsContext>::Data>(c)`
+    // selects `impl_from_store`, and `<P as AsContext>::Data` must NOT fabricate a concrete `Impl` row.
+    {
+        use crate::portable::PNode;
+        let mut b = Bb::new();
+        let b_p0 = b.ty(PNode::Param(0));
+        let b_mut_p0 = b.ty(PNode::Ref(Mutbl::Mut, b_p0));
+        let b_p0_l = b.t.intern_list(&[b_p0]).expect("list");
+        let b_p0_data = b.ty(PNode::Alias { trait_: as_ctx, name: crate::ids::Name::of("Data"), args: b_p0_l });
+        let c_param = b.param("c");
+        let lc = b.local(c_param);
+        let f = b.path_args("data_and_store", &[b_mut_p0, b_p0_data]);
+        let call = b.call(f, &[lc]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, owner_generic, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        let rows = c.call_selections(call);
+        assert!(
+            rows.iter().any(|r| r.trait_ == my_from && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_from_store)),
+            "expected `MyFrom` impl row on generic call: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.trait_ == as_ctx && r.name == Some(crate::ids::Name::of("Data")) && matches!(r.selected, Selected::Impl { .. })),
+            "generic `<P as AsContext>::Data` must not fabricate an `Impl` row: {rows:?}"
+        );
+    }
+}

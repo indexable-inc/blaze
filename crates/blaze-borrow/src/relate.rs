@@ -587,22 +587,67 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// and trait arguments. When the fast syntactic check returns `false` and either side holds
     /// an alias (e.g. a forwarding inner alias like `<<TempoEthApi<N> as RpcNodeCore>::Evm as
     /// ConfigureEvm>::BlockExecutorFactory` vs `<<N as RpcNodeCore>::Evm as ConfigureEvm>::BlockExecutorFactory`),
-    /// retries with inner-alias normalization.
+    /// retries with inner-alias normalization (`d > 0`, preserving `walk_loop`'s `same_alias`).
     fn erased_sides(&mut self, a: Side<'c>, b: Side<'c>) -> bool {
-        self.erased_sides_with(a, b, false)
-    }
-
-    fn erased_sides_with(&mut self, a: Side<'c>, b: Side<'c>, allow_alias: bool) -> bool {
-        if self.erased_sides_with_raw(a, b, allow_alias) {
+        if self.erased_sides_raw(a, b) {
             return true;
         }
         if self.in_erased_norm {
             return false;
         }
-        self.erased_sides_norm(a, b, allow_alias)
+        self.erased_sides_norm(a, b, false, false)
     }
 
-    fn erased_sides_with_raw(&self, a: Side<'c>, b: Side<'c>, allow_alias: bool) -> bool {
+    /// Match a non-self clause argument `clause_arg` against a goal argument `goal_arg`:
+    /// tries fast syntactic equality first, then alias-normalizing equality including top-level
+    /// (`d >= 0`) aliases; when `allow_alias` is true, permits an unnormalized `PNode::Alias`
+    /// only where `walk_loop` under `BinderCtx::Clause` soundly relates it without failing
+    /// ([`Walk::unnorm_alias_matches`]).
+    fn match_clause_arg(&mut self, clause_arg: Side<'c>, goal_arg: Side<'c>, allow_alias: bool) -> bool {
+        if self.erased_sides_raw(clause_arg, goal_arg) {
+            return true;
+        }
+        if self.in_erased_norm {
+            return false;
+        }
+        self.erased_sides_norm(clause_arg, goal_arg, allow_alias, true)
+    }
+
+    /// Whether an unnormalized `PNode::Alias` on one side may match the other side during the
+    /// `allow_alias = true` pass of clause-argument matching. Mirrors the exact cases where
+    /// `walk_loop` under `BinderCtx::Clause` succeeds without normalizing the alias:
+    /// - `a` (clause side) is `Alias` and `b` (goal side) is inert or `a` is a zero-slot builtin
+    ///   associated type (`Pointee::Metadata`, `DiscriminantKind::Discriminant`);
+    /// - `b` (goal side) is `Alias` and both `a` and `b` are inert or `b` is a zero-slot builtin
+    ///   associated type.
+    ///
+    /// A rigid non-inert goal alias like `<S as ClosureSource>::Error` MUST NOT match a concrete
+    /// clause argument like `CheckError` (which would falsely commit to `S::Error: From<CheckError>`
+    /// when proving `S::Error: From<S::Error>`, aborting before blanket `impl<T> From<T> for T`).
+    fn unnorm_alias_matches(&self, a: Side<'c>, na: PNode, b: Side<'c>, nb: PNode) -> bool {
+        if let PNode::Alias { trait_, name, .. } = na {
+            if self.selected.is_zero_slot_builtin_assoc(trait_, name) {
+                return true;
+            }
+            let mut budget = MOST_WALK_STEPS;
+            if matches!(self.inert(b, 0, &mut budget), Ok(true)) {
+                return true;
+            }
+        }
+        if let PNode::Alias { trait_, name, .. } = nb {
+            if self.selected.is_zero_slot_builtin_assoc(trait_, name) {
+                return true;
+            }
+            let mut ba = MOST_WALK_STEPS;
+            let mut bb = MOST_WALK_STEPS;
+            if matches!(self.inert(a, 0, &mut ba), Ok(true)) && matches!(self.inert(b, 0, &mut bb), Ok(true)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn erased_sides_raw(&self, a: Side<'c>, b: Side<'c>) -> bool {
         const MAX_FRAMES: usize = 257;
         #[derive(Clone, Copy)]
         struct Frame<'c> {
@@ -628,9 +673,6 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     return false;
                 };
                 if is_const(na) && is_const(nb) {
-                    continue;
-                }
-                if allow_alias && (matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. })) {
                     continue;
                 }
                 if !head_eq(na, nb) {
@@ -673,9 +715,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     }
 
     /// Alias-normalizing erased structural equality: descends with split slots where available and
-    /// normalizes inner `PNode::Alias` nodes before failing `head_eq` or recursing on differing
-    /// alias arguments. Reclaims any temporary environments created during normalization.
-    fn erased_sides_norm(&mut self, a: Side<'c>, b: Side<'c>, allow_alias: bool) -> bool {
+    /// normalizes `PNode::Alias` nodes before failing `head_eq` or recursing on differing alias
+    /// arguments. Reclaims any temporary environments created during normalization.
+    fn erased_sides_norm(&mut self, a: Side<'c>, b: Side<'c>, allow_alias: bool, allow_top_norm: bool) -> bool {
         const MAX_FRAMES: usize = 64;
         #[derive(Clone, Copy)]
         struct NormFrame<'c> {
@@ -708,7 +750,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     res = false;
                     break;
                 };
-                if self.erased_sides_with_raw(a, b, allow_alias) {
+                if self.erased_sides_raw(a, b) {
                     continue;
                 }
                 let (Ok(na), Ok(nb)) = (self.node(a), self.node(b)) else {
@@ -718,10 +760,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 if is_const(na) && is_const(nb) {
                     continue;
                 }
-                if allow_alias && (matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. })) {
-                    continue;
-                }
-                if d > 0 && (matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. })) {
+                if (d > 0 || allow_top_norm) && (matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. })) {
                     let (a2, da) = if matches!(na, PNode::Alias { .. }) && self.fits(a).is_ok() {
                         self.try_normalize_subject_flag(a, d)
                     } else {
@@ -736,6 +775,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         enter = Some((a2, b2, d + 1));
                         continue;
                     }
+                }
+                if allow_alias && self.unnorm_alias_matches(a, na, b, nb) {
+                    continue;
                 }
                 if !head_eq(na, nb) {
                     res = false;
@@ -3512,12 +3554,26 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(false);
         }
         let w_off = u32::from(has_subject);
-        for k in 0..non_self {
-            let (Some(ca), Some(wa)) = (self.erased_kid(clause, k + 1), self.erased_kid(trait_ref, k + w_off)) else {
-                return Ok(false);
-            };
-            if !self.erased_sides_with(ca, wa, allow_alias) {
-                return Ok(false);
+        if non_self > 0 {
+            let Some((_, crest0)) = clause.slots.split(c_own) else { return Ok(false) };
+            let Ok((_, mut crest)) = self.kid(clause, &ckids, crest0, 0) else { return Ok(false) };
+            let Some((_, mut wrest)) = trait_ref.slots.split(w_own) else { return Ok(false) };
+            if has_subject {
+                let Ok((_, wr)) = self.kid(trait_ref, &wkids, wrest, 0) else { return Ok(false) };
+                wrest = wr;
+            }
+            for k in 0..non_self {
+                let (Ok((ca, cr)), Ok((wa, wr))) = (
+                    self.kid(clause, &ckids, crest, k + 1),
+                    self.kid(trait_ref, &wkids, wrest, k + w_off),
+                ) else {
+                    return Ok(false);
+                };
+                crest = cr;
+                wrest = wr;
+                if !self.match_clause_arg(ca, wa, allow_alias) {
+                    return Ok(false);
+                }
             }
         }
         let clause = self.instantiate_clause_side(clause, binders)?;
@@ -3564,12 +3620,25 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return Ok(false);
         }
         let w_off = u32::from(has_subject);
-        for k in 0..non_self {
-            let (Some(pa), Some(wa)) = (self.erased_kid(pred, k), self.erased_kid(trait_ref, k + w_off)) else {
-                return Ok(false);
-            };
-            if !self.erased_sides_with(pa, wa, allow_alias) {
-                return Ok(false);
+        if non_self > 0 {
+            let Some((_, mut prest)) = pred.slots.split(p_own) else { return Ok(false) };
+            let Some((_, mut wrest)) = trait_ref.slots.split(w_own) else { return Ok(false) };
+            if has_subject {
+                let Ok((_, wr)) = self.kid(trait_ref, &wkids, wrest, 0) else { return Ok(false) };
+                wrest = wr;
+            }
+            for k in 0..non_self {
+                let (Ok((pa, pr)), Ok((wa, wr))) = (
+                    self.kid(pred, &pkids, prest, k),
+                    self.kid(trait_ref, &wkids, wrest, k + w_off),
+                ) else {
+                    return Ok(false);
+                };
+                prest = pr;
+                wrest = wr;
+                if !self.match_clause_arg(pa, wa, allow_alias) {
+                    return Ok(false);
+                }
             }
         }
         for k in 0..w_own.get() {
@@ -3616,17 +3685,28 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         if c_own != w_own || ckids.len() != want_arg_count + 1 {
             return Ok(None);
         }
-        for k in 0..want_arg_count {
-            let ok = if k == 0 {
-                self.match_clause_self(clause, c_own, &ckids, subject)
-            } else {
-                let (Some(ca), Some(wa)) = (self.erased_kid(clause, k), self.erased_kid(want, k)) else {
-                    return Ok(None);
-                };
-                self.erased_sides_with(ca, wa, allow_alias)
-            };
-            if !ok {
+        if want_arg_count > 0 {
+            if !self.match_clause_self(clause, c_own, &ckids, subject) {
                 return Ok(None);
+            }
+            if want_arg_count > 1 {
+                let Some((_, crest0)) = clause.slots.split(c_own) else { return Ok(None) };
+                let Ok((_, mut crest)) = self.kid(clause, &ckids, crest0, 0) else { return Ok(None) };
+                let Some((_, wrest0)) = want.slots.split(w_own) else { return Ok(None) };
+                let Ok((_, mut wrest)) = self.kid(want, &wkids, wrest0, 0) else { return Ok(None) };
+                for k in 1..want_arg_count {
+                    let (Ok((ca, cr)), Ok((wa, wr))) = (
+                        self.kid(clause, &ckids, crest, k),
+                        self.kid(want, &wkids, wrest, k),
+                    ) else {
+                        return Ok(None);
+                    };
+                    crest = cr;
+                    wrest = wr;
+                    if !self.match_clause_arg(ca, wa, allow_alias) {
+                        return Ok(None);
+                    }
+                }
             }
         }
         let clause = self.instantiate_clause_side(clause, binders)?;
@@ -4165,6 +4245,25 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         {
             return Ok(true);
         }
+        // 1c. Builtin `dyn Trait<'b, ..> + 'o: TryAsDynCompatible<'a>` (`#[lang = "try_as_dyn"]`,
+        //     `#[rustc_deny_explicit_impl]`, library/core/src/any.rs): ties `'a` invariantly to
+        //     the trait object's own lifetime `'o` (slot 0 of `PNode::Dynamic`).
+        if self.selected.is_try_as_dyn_trait(trait_)
+            && matches!(self.node(subject)?, PNode::Dynamic(_))
+        {
+            self.fits(trait_ref)?;
+            self.fits(subject)?;
+            let t_own = self.own(trait_ref)?;
+            let tkids = self.kids_of(trait_ref)?;
+            let s_own = self.own(subject)?;
+            let non_self = if has_subject { tkids.len().saturating_sub(1) } else { tkids.len() };
+            if t_own == SlotCount::new(1) && non_self == 0 && s_own == SlotCount::new(1) {
+                let a = self.slot(trait_ref, 0)?;
+                let o = self.slot(subject, 0)?;
+                self.pair(trait_ref.ty, a, o, Variance::In, Self::env_of(trait_ref), Self::env_of(subject))?;
+                return Ok(true);
+            }
+        }
         let owner: &'c dyn Owner = self.owner;
         let clauses = owner.clauses();
         // 2. Direct `Param(p)` bound via `Owner::bound` ONLY when `Owner::clauses` is empty
@@ -4552,14 +4651,27 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                             let pkids = self.kids_of(pred)?;
                             if p_own == w_own && pkids.len() == non_self + 1 {
                                 let mut same = true;
-                                for j in 0..non_self {
-                                    let (Some(pa), Some(wa)) = (self.erased_kid(pred, j), self.erased_kid(want, j + 1)) else {
+                                if non_self > 0 {
+                                    if let (Some((_, mut pr0)), Some((_, wr0))) = (pred.slots.split(p_own), want.slots.split(w_own))
+                                        && let Ok((_, mut wr1)) = self.kid(want, &wkids, wr0, 0)
+                                    {
+                                        for j in 0..non_self {
+                                            let (Ok((pa, pr)), Ok((wa, wr))) = (
+                                                self.kid(pred, &pkids, pr0, j),
+                                                self.kid(want, &wkids, wr1, j + 1),
+                                            ) else {
+                                                same = false;
+                                                break;
+                                            };
+                                            pr0 = pr;
+                                            wr1 = wr;
+                                            if !self.match_clause_arg(pa, wa, allow_alias) {
+                                                same = false;
+                                                break;
+                                            }
+                                        }
+                                    } else {
                                         same = false;
-                                        break;
-                                    };
-                                    if !self.erased_sides_with(pa, wa, allow_alias) {
-                                        same = false;
-                                        break;
                                     }
                                 }
                                 if same {

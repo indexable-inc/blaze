@@ -1093,3 +1093,349 @@ fn generic_fn_param_called_inside_closure_checks_owner_lifetime() {
         assert!(!report.borrows.is_empty(), "NEGATIVE: local `&s` passed to `F: Fn(&'a S)` inside closure must fail borrow check");
     }
 }
+
+/// Struct-destructured `&'a dyn Fn() -> &'a S` (`Edge { opts, .. }` in `engine_check.rs::serve`)
+/// captured into a nested closure:
+/// - Positive: `let Edge { opts } = edge; let _c = || { let r = opts(); g(r); };` lowers cleanly
+///   inside the nested closure without `CalleeValueUnknown`.
+/// - Negative (soundness): `let Edge { opts } = edge; let _c = || { let s = mk(); opts(&s); };`
+///   where `opts: &'a dyn Fn(&'a S)` catches local `&s` escaping into `'a`.
+#[test]
+fn destructured_struct_dyn_fn_field_called_in_nested_closure() {
+    use crate::{FieldRegion, Variance};
+
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let fns = add_fn_traits(fx);
+        let dyn_ret = dyn_fn_ty(fx, fns.0, fns.2, &[], rs);
+        let ref_dyn_ret = fx.r(Mutbl::Not, dyn_ret);
+        let edge_ret = fx.strukt("EdgeRet", 0, &[("opts", ref_dyn_ret)]);
+        let edge_ret_ty = fx.adt(edge_ret, &[]);
+
+        let dyn_take = dyn_fn_ty(fx, fns.0, fns.2, &[rs], unit);
+        let ref_dyn_take = fx.r(Mutbl::Not, dyn_take);
+        let edge_take = fx.strukt("EdgeTake", 0, &[("opts", ref_dyn_take)]);
+        let edge_take_ty = fx.adt(edge_take, &[]);
+
+        let f_ok = fx.func("ok", 0, &[edge_ret_ty], unit, no_clauses());
+        let f_bad = fx.func("bad", 0, &[edge_take_ty], unit, no_clauses());
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+        items = Some((fns, edge_ret, edge_ret_ty, ref_dyn_ret, edge_take, edge_take_ty, ref_dyn_take, f_ok, f_bad, mk));
+    });
+    let (fns, edge_ret, edge_ret_ty, ref_dyn_ret, edge_take, edge_take_ty, ref_dyn_take, f_ok, f_bad, mk) = items.expect("declared");
+
+    const INV: [Variance; 1] = [Variance::In];
+    const RET_FR: [FieldRegion; 3] = [FieldRegion::Lifetime(0), FieldRegion::Lifetime(0), FieldRegion::Lifetime(0)];
+    const TAKE_FR: [FieldRegion; 4] = [FieldRegion::Lifetime(0), FieldRegion::Lifetime(0), FieldRegion::Lifetime(0), FieldRegion::Lifetime(0)];
+
+    let mut facts = DynFacts::of(&w, fns);
+    facts.adts.push((edge_ret, AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 1, union: false, is_enum: false, is_box: false }, &INV));
+    facts.adts.push((edge_take, AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 1, union: false, is_enum: false, is_box: false }, &INV));
+    facts.fields.push((edge_ret, 0, "opts", 0, &RET_FR));
+    facts.fields.push((edge_take, 0, "opts", 0, &TAKE_FR));
+    facts.lane.wide.sigs.decls.adt(edge_ret, 1);
+    facts.lane.wide.sigs.decls.adt(edge_take, 1);
+    facts.lane.wide.sigs.decls.field(edge_ret, 0, 0, ref_dyn_ret, &[P0, P0, P0]);
+    facts.lane.wide.sigs.decls.field(edge_take, 0, 0, ref_dyn_take, &[P0, P0, P0, P0]);
+    facts.lane.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.lane.wide.add(f_ok, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[edge_ret_ty], output: w.unit, slots: &[P0] });
+    facts.lane.wide.add(f_bad, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[edge_take_ty], output: w.unit, slots: &[P0] });
+
+    // Positive: `let EdgeRet { opts } = edge; let _c = || { let r = opts(); g(r); };`
+    {
+        let mut b = Bb::new();
+        let pedge = b.param("edge");
+        let popts = b.bind("opts");
+        let pat_edge = b.variant_pat(&["EdgeRet"], &[popts]);
+        let ledge = b.local(pedge);
+        let st_destr = b.let_(pat_edge, None, ledge);
+        let lopts = b.local(popts);
+        let call_opts = b.call(lopts, &[]);
+        let pr = b.bind("r");
+        let st1 = b.let_(pr, None, call_opts);
+        let use_r = call1(&mut b, "g", pr);
+        let st2 = b.semi(use_r);
+        let inner = b.block(&[st1, st2], None);
+        let cl = b.closure(&[], inner);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_destr, st_c], None);
+        let mut body = b.view(f_ok, root);
+        let mut pats_owned = body.pats.to_vec();
+        let path = match pats_owned[pat_edge.ix()] {
+            blaze_typeck::Pat::TupleStruct { path, .. } => path,
+            _ => unreachable!(),
+        };
+        let field_pats = [blaze_typeck::FieldPat { name: Name::of("opts"), pat: popts }];
+        pats_owned[pat_edge.ix()] = blaze_typeck::Pat::Struct { path, fields: blaze_typeck::List { start: 0, len: 1 }, rest: false };
+        body.pats = &pats_owned;
+        body.field_pats = &field_pats;
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc()).expect("lower nested closure");
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        assert!(
+            report.moves.is_empty() && report.borrows.is_empty(),
+            "POSITIVE: destructured struct `&'a dyn Fn() -> &'a S` in nested closure must check clean: {:?}",
+            report.borrows
+        );
+    }
+
+    // Negative: `let EdgeTake { opts } = edge; let _c = || { let s = mk(); opts(&s); };`
+    {
+        let mut b = Bb::new();
+        let pedge = b.param("edge");
+        let popts = b.bind("opts");
+        let pat_edge = b.variant_pat(&["EdgeTake"], &[popts]);
+        let ledge = b.local(pedge);
+        let st_destr = b.let_(pat_edge, None, ledge);
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let ps = b.bind("s");
+        let st1 = b.let_(ps, None, call_mk);
+        let lopts = b.local(popts);
+        let ls = b.local(ps);
+        let rs_e = b.borrow(Mutbl::Not, ls);
+        let call_opts = b.call(lopts, &[rs_e]);
+        let st2 = b.semi(call_opts);
+        let inner = b.block(&[st1, st2], None);
+        let cl = b.closure(&[], inner);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_destr, st_c], None);
+        let mut body = b.view(f_bad, root);
+        let mut pats_owned = body.pats.to_vec();
+        let path = match pats_owned[pat_edge.ix()] {
+            blaze_typeck::Pat::TupleStruct { path, .. } => path,
+            _ => unreachable!(),
+        };
+        let field_pats = [blaze_typeck::FieldPat { name: Name::of("opts"), pat: popts }];
+        pats_owned[pat_edge.ix()] = blaze_typeck::Pat::Struct { path, fields: blaze_typeck::List { start: 0, len: 1 }, rest: false };
+        body.pats = &pats_owned;
+        body.field_pats = &field_pats;
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc()).expect("lower nested closure");
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        assert!(!report.borrows.is_empty(), "NEGATIVE: local `&s` passed to destructured `&'a dyn Fn(&'a S)` in nested closure must fail borrowck");
+    }
+}
+
+/// Immutable local fn pointer initialized by a `match` of `FnDef` arms
+/// (`TopEntryPoint::parse_with`, `PrefixEntryPoint::parse`, `cmp_dotted`):
+/// - Positive: `let f: fn(&S) = match flag { true => take_any, false => take_any2 }; f(&local);` passes.
+/// - Negative: `let f: fn(&S) = match flag { true => take_any, false => take_static }; f(&local);`
+///   enforces EVERY leaf arm's contract and rejects `&local` escaping into `'static`.
+#[test]
+fn match_initialized_fndef_local_enforces_every_arm() {
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let bool_ty = fx.ty(PNode::Bool);
+        let fn_list = fx.list(&[rs, unit]);
+        let fn_ty = fx.ty(PNode::FnPtr(fn_list, blaze_typeck::FnPtrHeader::RUST));
+        let take_any = fx.func("take_any", 0, &[rs], unit, no_clauses());
+        let take_any2 = fx.func("take_any2", 0, &[rs], unit, no_clauses());
+        let take_static = fx.func("take_static", 0, &[rs], unit, no_clauses());
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+        let f_ok = fx.func("ok", 0, &[bool_ty], unit, no_clauses());
+        let f_bad = fx.func("bad", 0, &[bool_ty], unit, no_clauses());
+        items = Some((bool_ty, fn_ty, take_any, take_any2, take_static, mk, f_ok, f_bad));
+    });
+    let (bool_ty, fn_ty, take_any, take_any2, take_static, mk, f_ok, f_bad) = items.expect("declared");
+    let mut facts = Lane::of(&w);
+    facts.wide.add(take_any, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[w.rs], output: w.unit, slots: &[P0] });
+    facts.wide.add(take_any2, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[w.rs], output: w.unit, slots: &[P0] });
+    facts.wide.add(take_static, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[w.rs], output: w.unit, slots: &[crate::Region::Static] });
+    facts.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.wide.add(f_ok, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[bool_ty], output: w.unit, slots: &[] });
+    facts.wide.add(f_bad, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[bool_ty], output: w.unit, slots: &[] });
+
+    let run = |owner: ItemKey, second_arm: &str| {
+        let mut b = Bb::new();
+        let pflag = b.param("flag");
+        let lflag = b.local(pflag);
+        let pat_t = b.wild();
+        let pat_f = b.wild();
+        let e1 = b.path(&["take_any"]);
+        let e2 = b.path(&[second_arm]);
+        let m = b.match_(lflag, &[(pat_t, e1), (pat_f, e2)]);
+        let pf = b.bind("f");
+        let st_f = b.let_(pf, Some(fn_ty), m);
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let ps = b.bind("s");
+        let st_s = b.let_(ps, None, call_mk);
+        let lf = b.local(pf);
+        let ls = b.local(ps);
+        let rs_e = b.borrow(Mutbl::Not, ls);
+        let call_f = b.call(lf, &[rs_e]);
+        let st_c = b.semi(call_f);
+        let root = b.block(&[st_f, st_s, st_c], None);
+        let mut view = b.view(owner, root);
+        view.types = w.fx.t.view();
+        let mut pats_owned = view.pats.to_vec();
+        pats_owned[pat_t.ix()] = blaze_typeck::Pat::Lit(blaze_typeck::Lit::Bool(true));
+        pats_owned[pat_f.ix()] = blaze_typeck::Pat::Lit(blaze_typeck::Lit::Bool(false));
+        view.pats = &pats_owned;
+        crate::region_fixture::run(&w.fx, &view, &facts, facts.decls(), Plant::None).map(|r| r.lines)
+    };
+
+    assert_eq!(run(f_ok, "take_any2"), Ok(std::vec::Vec::new()), "POSITIVE: match of higher-ranked FnDefs must pass");
+    let bad = run(f_bad, "take_static").expect("bad lowers cleanly");
+    assert!(bad.iter().any(|l| l.starts_with("borrow ")), "NEGATIVE: match arm requiring `&'static S` must reject `&local`: {bad:?}");
+}
+
+/// Callables unwrapped through `?` (`match Try::branch(x) { Continue(v) => v, Break(r) => return .. }`),
+/// covering `heap_pages`, `alt_paths`, `current_file`, and `const_holds`:
+/// - Positive: `let f = opt_any()?; f(&local);` passes cleanly.
+/// - Negative: `let f = opt_static()?; f(&local);` enforces `'static` and rejects `&local`.
+#[test]
+fn try_unwrapped_callable_traces_source_signature_soundly() {
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let p0 = fx.param(0);
+        let p1 = fx.param(1);
+        let fn_list = fx.list(&[rs, unit]);
+        let fn_ty = fx.ty(PNode::FnPtr(fn_list, blaze_typeck::FnPtrHeader::RUST));
+        let (opt, _) = fx.enum_("Option", 1, &[("Some", &[p0]), ("None", &[])]);
+        let (cf, _) = fx.enum_("ControlFlow", 2, &[("Continue", &[p1]), ("Break", &[p0])]);
+        let opt_p0 = fx.adt(opt, &[p0]);
+        let cf_unit_p0 = fx.adt(cf, &[unit, p0]);
+        let opt_fn = fx.adt(opt, &[fn_ty]);
+        let opt_unit = fx.adt(opt, &[unit]);
+        let branch = fx.func("branch", 1, &[opt_p0], cf_unit_p0, no_clauses());
+        let none_fn = fx.func("none_out", 0, &[unit], opt_unit, no_clauses());
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+        let f_ok = fx.func("ok", 0, &[opt_fn], opt_unit, no_clauses());
+        let f_bad = fx.func("bad", 0, &[opt_fn], opt_unit, no_clauses());
+        items = Some((opt, cf, opt_p0, cf_unit_p0, opt_fn, opt_unit, branch, none_fn, mk, f_ok, f_bad));
+    });
+    let (opt, cf, opt_p0, cf_unit_p0, opt_fn, opt_unit, branch, none_fn, mk, f_ok, f_bad) = items.expect("declared");
+    let mut facts = DynFacts::of(&w, (ItemKey(9001), ItemKey(9002), ItemKey(9003)));
+    facts.adts.push((opt, AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: true, is_box: false }, &[crate::Variance::Co]));
+    facts.adts.push((cf, AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: true, is_box: false }, &[crate::Variance::Co, crate::Variance::Co]));
+    facts.field_counts.push((opt, 0, 1));
+    facts.field_counts.push((opt, 1, 0));
+    facts.field_counts.push((cf, 0, 1));
+    facts.field_counts.push((cf, 1, 1));
+    facts.lane.wide.sigs.decls.adt(opt, 0);
+    facts.lane.wide.sigs.decls.adt(cf, 0);
+    facts.lane.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.lane.wide.add(none_fn, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[w.unit], output: opt_unit, slots: &[] });
+    facts.lane.wide.add(branch, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[opt_p0], output: cf_unit_p0, slots: &[] });
+    // `ok(cb: Option<fn(&S)>) -> Option<()>` (higher-ranked `fn(&S)` under binder 1)
+    facts.lane.wide.add(f_ok, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[opt_fn], output: opt_unit, slots: &[BOUND1] });
+    // `bad(cb: Option<fn(&'static S)>) -> Option<()>` (`'static`)
+    facts.lane.wide.add(f_bad, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[opt_fn], output: opt_unit, slots: &[crate::Region::Static] });
+
+    let run = |owner: ItemKey| {
+        let mut b = Bb::new();
+        let pcb = b.param("cb");
+        let lcb = b.local(pcb);
+        let pbranch = b.path(&["branch"]);
+        let scr = b.call(pbranch, &[lcb]);
+        let pv = b.bind("v");
+        let pcont = b.variant_pat(&["ControlFlow", "Continue"], &[pv]);
+        let lv = b.local(pv);
+        let pr = b.bind("r");
+        let pbrk = b.variant_pat(&["ControlFlow", "Break"], &[pr]);
+        let lr = b.local(pr);
+        let pnone = b.path(&["none_out"]);
+        let call_none = b.call(pnone, &[lr]);
+        let ret_brk = b.ret(Some(call_none));
+        let try_m = b.match_(scr, &[(pcont, lv), (pbrk, ret_brk)]);
+        let pf = b.bind("f");
+        let st_f = b.let_(pf, None, try_m);
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let ps = b.bind("s");
+        let st_s = b.let_(ps, None, call_mk);
+        let lf = b.local(pf);
+        let ls = b.local(ps);
+        let rs_e = b.borrow(Mutbl::Not, ls);
+        let call_f = b.call(lf, &[rs_e]);
+        let st_c = b.semi(call_f);
+        let pnone2 = b.path(&["none_out"]);
+        let u = b.tuple(&[]);
+        let tail = b.call(pnone2, &[u]);
+        let root = b.block(&[st_f, st_s, st_c], Some(tail));
+        let view = b.view(owner, root);
+        crate::region_fixture::run(&w.fx, &view, &facts, facts.decls(), Plant::None).map(|r| r.lines)
+    };
+
+    assert_eq!(run(f_ok), Ok(std::vec::Vec::new()), "POSITIVE: `?`-unwrapped `Option<fn(&S)>` must pass");
+    let bad = run(f_bad).expect("bad lowers cleanly");
+    assert!(bad.iter().any(|l| l.starts_with("borrow ")), "NEGATIVE: `?`-unwrapped `Option<fn(&'static S)>` must reject `&local`: {bad:?}");
+}
+
+/// Closure parameter typed as `&dyn Fn(&S)` (`closing` in `blaze-report/src/frame/mod.rs`):
+/// - Positive: `|draw: &dyn Fn(&S)| { let s = mk(); draw(&s); }` with no explicit `'static`/named
+///   regions in `closure_param_regions` checks cleanly.
+/// - Negative: if `closure_param_regions` records an explicit `'static` on `draw`, it is refused
+///   (`CalleeValueUnknown`) rather than unsoundly treating `&'static S` as higher-ranked.
+#[test]
+fn closure_dyn_fn_param_higher_ranked_positive_and_static_negative() {
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let fns = add_fn_traits(fx);
+        let dyn_fn = dyn_fn_ty(fx, fns.0, fns.2, &[rs], unit);
+        let ref_dyn = fx.r(Mutbl::Not, dyn_fn);
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+        let f = fx.func("f", 0, &[], unit, no_clauses());
+        items = Some((fns, ref_dyn, mk, f));
+    });
+    let (fns, ref_dyn, mk, f) = items.expect("declared");
+    let mut facts = DynFacts::of(&w, fns);
+    facts.lane.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.lane.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.unit, slots: &[] });
+
+    let run = |with_static_region: bool| {
+        let mut b = Bb::new();
+        let pdraw = b.bind("draw");
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let ps = b.bind("s");
+        let st1 = b.let_(ps, None, call_mk);
+        let ldraw = b.local(pdraw);
+        let ls = b.local(ps);
+        let rs_e = b.borrow(Mutbl::Not, ls);
+        let call_draw = b.call(ldraw, &[rs_e]);
+        let st2 = b.semi(call_draw);
+        let inner = b.block(&[st1, st2], None);
+        let cl = b.closure(&[pdraw], inner);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_c], None);
+        let mut body = b.view(f, root);
+        let opt_tys = [Some(ref_dyn)];
+        body.types = w.fx.t.view();
+        body.opt_types = &opt_tys;
+        let written = [blaze_typeck::ClosureParamRegion {
+            closure: cl,
+            param: 0,
+            path: blaze_typeck::ClosureParamRegion::ROOT,
+            own: 0,
+            kind: blaze_typeck::WrittenRegion::Static,
+        }];
+        if with_static_region {
+            body.closure_param_regions = &written;
+        }
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc())
+    };
+
+    let ok = run(false).expect("POSITIVE: higher-ranked `&dyn Fn(&S)` closure param must lower cleanly");
+    let report = blaze_flow::check(&ok.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(report.moves.is_empty() && report.borrows.is_empty(), "POSITIVE: expected clean check: {:?}", report.borrows);
+
+    let bad = run(true);
+    assert!(
+        matches!(bad, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+        "NEGATIVE: explicit `'static` on `&dyn Fn` closure param must be refused, got {:?}",
+        bad.err()
+    );
+}

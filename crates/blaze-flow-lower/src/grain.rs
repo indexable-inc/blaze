@@ -350,13 +350,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     let Some(&ce) = ck.closures.column::<0>().get(ordinal as usize) else {
                         return self.refuse(Form::Malformed, e);
                     };
-                    Some((ce, Some(ordinal as usize)))
+                    Some((ce, Some(ordinal as usize), None))
                 }
-                PNode::Future(fe, _, _) => Some((fe, None)),
+                PNode::Future(fe, out, _) => Some((fe, None, Some(out))),
                 _ => None,
             };
             match body {
-                Some((expr, row)) => {
+                Some((expr, row, future_out)) => {
                     if table.iter().any(|&(x, _)| x == t) {
                         continue;
                     }
@@ -367,7 +367,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                         return self.refuse(Form::Bound, e);
                     }
                     path.push(expr);
-                    let n = self.captured_slots(expr, row, path, e)?;
+                    let n = self.captured_slots(expr, row, future_out, path, e)?;
                     path.pop();
                     table.push((t, SlotCount::new(n)));
                 }
@@ -389,11 +389,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
     /// `Checked::closures`, or an async block): each capture in row order, by reference its
     /// reference's slot then the captured variable's type's slots (`Checked::local_ty`, as
     /// lib.rs `closure_value` lays them), then a closure's owner-bound signature slots.
-    fn captured_slots(&self, expr: ExprId, row: Option<usize>, path: &mut Vec<ExprId, A>, e: ExprId) -> Result<u32, Refusal> {
+    fn captured_slots(&self, expr: ExprId, row: Option<usize>, future_out: Option<PTy>, path: &mut Vec<ExprId, A>, e: ExprId) -> Result<u32, Refusal> {
         let ck: &'c Checked<'c> = self.ck;
         let mut n = match row {
             Some(r) => self.owner_sig_count(r, e)?,
-            None => 0,
+            None => match future_out {
+                Some(out) => self.region_slots_in(out, path, e)?,
+                None => 0,
+            },
         };
         for f in ck.env_fields_by::<blaze_typeck::Places>(expr) {
             let Some(t) = f.place_ty(ck) else {

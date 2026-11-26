@@ -420,24 +420,27 @@ pub fn impl_read(imp: u128, names: &[tc::Name], regions: &dyn blaze_flow_lower::
     Read { fact: Fact { kind: FactKind::BorrowHead, key: imp, detail: IMPL_DETAIL }, answer: Some(h.finish()) }
 }
 
-/// The `detail` of a trait's `Self` supertraits read for transitive `Copy` and `'static` bounds (borrows.rs).
+/// The `detail` of a trait's `Self` supertraits read for transitive `Copy` and `Self: 'r` bounds (borrows.rs).
 pub const COPY_SUPERTRAIT_DETAIL: u64 = 9;
-const COPY_SUPERTRAIT_DOMAIN: &str = "blaze-ladder front2 borrow copy supertrait v2";
+const COPY_SUPERTRAIT_DOMAIN: &str = "blaze-ladder front2 borrow copy supertrait v3";
 
 /// The `detail` of a nested ADT's drop summary read (borrow_fields.rs `drop_facts_of`).
 pub const DROP_ADT_DETAIL: u64 = 10;
 const DROP_ADT_DOMAIN: &str = "blaze-ladder front2 borrow drop adt v1";
 
 /// The row of what the borrow check took about trait `trait_key`'s direct `Self` supertraits
-/// (and whether it directly declares `Self: 'static`).
-/// `supers` is `None` when the trait head was not made, else `(sorted direct supertrait keys, self_static)`.
-pub fn copy_supertrait_read(trait_key: u128, supers: Option<(&[u128], bool)>) -> Read {
+/// and `Self: 'r` outlives bounds.
+/// `supers` is `None` when the trait head was not made, else `(sorted direct supertrait keys, sorted Self: 'r bounds)`.
+pub fn copy_supertrait_read(trait_key: u128, supers: Option<(&[u128], &[Region])>) -> Read {
     let mut h = StableHasher::new(COPY_SUPERTRAIT_DOMAIN);
     match supers {
         None => h.tag(0),
-        Some((list, self_static)) => {
+        Some((list, self_outlives)) => {
             h.tag(1);
-            h.tag(u8::from(self_static));
+            h.u32(u32::try_from(self_outlives.len()).unwrap_or(u32::MAX));
+            for &r in self_outlives {
+                region(&mut h, r);
+            }
             h.u32(u32::try_from(list.len()).unwrap_or(u32::MAX));
             for &sup in list {
                 h.u128(sup);
@@ -523,6 +526,30 @@ pub fn assoc_copy_read(assoc_item: u128, is_copy: bool) -> Read {
     let mut h = StableHasher::new(ASSOC_COPY_DOMAIN);
     flag(&mut h, is_copy);
     Read { fact: Fact { kind: FactKind::BorrowHead, key: assoc_item, detail: ASSOC_COPY_DETAIL }, answer: Some(h.finish()) }
+}
+
+/// The detail of a [`FactKind::BorrowAdt`] row holding an ADT inspected by `inst_needs_drop`
+/// (rule 21).
+pub const INST_DROP_ADT_DETAIL: u64 = 13;
+
+/// The detail of a [`FactKind::BorrowHead`] row holding a trait impl inspected by `inst_needs_drop`
+/// (rule 21).
+pub const INST_DROP_IMPL_DETAIL: u64 = 14;
+
+/// The detail of a [`FactKind::BorrowHead`] row holding the candidate impl queries for a trait
+/// inspected by `inst_needs_drop` (rule 21).
+pub const INST_DROP_TRAIT_DETAIL: u64 = 15;
+
+pub fn inst_drop_adt_read(adt: u128, digest: u64) -> Read {
+    Read { fact: Fact { kind: FactKind::BorrowAdt, key: adt, detail: INST_DROP_ADT_DETAIL }, answer: Some(digest) }
+}
+
+pub fn inst_drop_impl_read(imp: u128, digest: u64) -> Read {
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: imp, detail: INST_DROP_IMPL_DETAIL }, answer: Some(digest) }
+}
+
+pub fn inst_drop_trait_read(trait_: u128, digest: u64) -> Read {
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: trait_, detail: INST_DROP_TRAIT_DETAIL }, answer: Some(digest) }
 }
 
 /// Files the borrow check's `rows` into the body's read list in `verdict` (sorted by fact, one

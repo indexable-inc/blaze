@@ -30,7 +30,8 @@ use blaze_typeck as tc;
 use blaze_typeck::region_facts::RegionFacts;
 use blaze_typeck::regions::{Arity, Region, RegionError, Unknown, region_arity};
 
-use crate::front2::borrow_reads::drop_adt_read;
+use crate::front2::borrow_reads::{drop_adt_read, inst_drop_adt_read, inst_drop_impl_read, inst_drop_trait_read};
+use crate::front2::buckets::shape_of;
 use crate::front2::check::{Records, answer_impls};
 use crate::front2::heads::{Store, Want};
 use crate::front2::keys::{Keys, checker_of};
@@ -207,9 +208,13 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
         }
         let node = tys.node(t).map_err(table)?;
         // Nodes whose positions no `FieldRegion` names, before the counter is asked of them.
+        // A projection (`PNode::Alias`) can normalize at a use site (e.g. `where F: Front<Maker =
+        // RunMaker<'h>>`) to a different slot count than the unnormalized declared field type,
+        // which would trigger `FieldRegionsUnaligned` in `blaze-flow-lower` (Facts::field_regions).
         if matches!(
             node,
-            tc::PNode::Opaque(..)
+            tc::PNode::Alias { .. }
+                | tc::PNode::Opaque(..)
                 | tc::PNode::Closure { .. }
                 | tc::PNode::Future(..)
                 | tc::PNode::Coroutine { .. }
@@ -1373,6 +1378,1359 @@ fn hash_pty_for_drop(tys: tc::PTys<'_>, root: tc::PTy, h: &mut tc::StableHasher,
     }
 }
 
+/// Bounds for instantiated structural drop-glue evaluation ([`InstDropEval`], rule 18).
+const MOST_INST_DROP_STEPS: u32 = 4096;
+const MOST_INST_DROP_DEPTH: u32 = 32;
+const MOST_INST_NORM_DEPTH: u32 = 16;
+const MOST_INST_DROP_CANDIDATES: usize = 64;
+
+#[derive(Clone, Copy)]
+struct InstAdtInfo {
+    made: bool,
+    is_union: bool,
+    inert: bool,
+    uncond_copy: bool,
+    drop_impl: Option<bool>,
+}
+
+enum ImplMatch<'a> {
+    Selected { imp: tc::ItemKey, subst: AVec<'a, tc::PTy>, trait_arg_count: usize },
+    None,
+    Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+/// Bounded, sound instantiated drop-glue evaluator for concrete `PTy`s whose ADT summary was
+/// conservatively `needs_drop && !drop_impl` (e.g. `Flatten<...>`, `Split<'_, &str>`,
+/// `SplitWhitespace<'_>` whose fields hold `PNode::Alias`).
+///
+/// Substitutes ADT generic parameters into fields, normalizes `PNode::Alias` projections through
+/// `front2`'s impl index with strict `where`-clause verification (disqualifying non-matching
+/// blanket impls only when a clause is proven false), and proves `Some(false)` ONLY when every
+/// dropping field has zero drop glue. Returns `Some(true)` when any field or explicit `Drop` impl
+/// drops, or `None` when uncertain/generic — never unsoundly returning `Some(false)`.
+pub(super) struct InstDropEval<'a> {
+    tys: tc::PortableTys<'a>,
+    memo: AVec<'a, (tc::PTy, Option<bool>)>,
+    active: AVec<'a, tc::PTy>,
+    active_goals: AVec<'a, (tc::ItemKey, tc::PTy)>,
+    adt_cache: AVec<'a, (tc::ItemKey, InstAdtInfo)>,
+    read_adts: AVec<'a, (u128, u64)>,
+    read_impls: AVec<'a, (u128, u64)>,
+    read_queries: AVec<'a, (u128, u64, u64)>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> InstDropEval<'a> {
+    pub(super) fn new_in(alloc: Alloc<'a>) -> InstDropEval<'a> {
+        InstDropEval {
+            tys: tc::PortableTys::new_in(alloc),
+            memo: AVec::new_in(alloc),
+            active: AVec::new_in(alloc),
+            active_goals: AVec::new_in(alloc),
+            adt_cache: AVec::new_in(alloc),
+            read_adts: AVec::new_in(alloc),
+            read_impls: AVec::new_in(alloc),
+            read_queries: AVec::new_in(alloc),
+            alloc,
+        }
+    }
+
+    /// Evaluates whether the body type `ty` (in `body_tys`) needs drop glue.
+    pub(super) fn eval_body_ty<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        body_tys: tc::PTys<'_>,
+        ty: tc::PTy,
+    ) -> Option<bool> {
+        let mut budget = MOST_INST_DROP_STEPS;
+        let root = self.copy_from_table(body_tys, ty, None, 0, &mut budget)?;
+        self.eval_inst_ty(r, langs, root, 0, &mut budget)
+    }
+
+    /// Flushes deduplicated Rule 21 read rows for every ADT, impl, and trait query inspected.
+    pub(super) fn push_reads(&self, reads: &mut AVec<'a, Read>) {
+        for &(adt, digest) in self.read_adts.iter() {
+            reads.push(inst_drop_adt_read(adt, digest));
+        }
+        for &(imp, digest) in self.read_impls.iter() {
+            reads.push(inst_drop_impl_read(imp, digest));
+        }
+        if !self.read_queries.is_empty() {
+            let mut sorted: AVec<'a, (u128, u64, u64)> = AVec::with_capacity_in(self.read_queries.len(), self.alloc);
+            sorted.extend_from_slice(&self.read_queries);
+            sorted.sort_unstable();
+            sorted.dedup();
+            let mut i = 0;
+            while i < sorted.len() {
+                let tr = sorted[i].0;
+                let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop trait queries v1");
+                while i < sorted.len() && sorted[i].0 == tr {
+                    h.u64(sorted[i].1);
+                    h.u64(sorted[i].2);
+                    i += 1;
+                }
+                reads.push(inst_drop_trait_read(tr, h.finish()));
+            }
+        }
+    }
+
+    fn copy_from_table(
+        &mut self,
+        src: tc::PTys<'_>,
+        ty: tc::PTy,
+        subst: Option<&[tc::PTy]>,
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<tc::PTy> {
+        if depth > MOST_INST_DROP_DEPTH || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let node = src.node(ty).ok()?;
+        let mapped = match node {
+            tc::PNode::Param(p) => match subst {
+                Some(args) => return usize::try_from(p).ok().and_then(|pi| args.get(pi).copied()),
+                None => tc::PNode::Param(p),
+            },
+            tc::PNode::ConstParam(p) => match subst {
+                Some(args) => return usize::try_from(p).ok().and_then(|pi| args.get(pi).copied()),
+                None => tc::PNode::ConstParam(p),
+            },
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Str
+            | tc::PNode::Never
+            | tc::PNode::Infer
+            | tc::PNode::Error
+            | tc::PNode::ExAuto(_)
+            | tc::PNode::Foreign(_) => node,
+            tc::PNode::Ref(m, i) => tc::PNode::Ref(m, self.copy_from_table(src, i, subst, depth + 1, budget)?),
+            tc::PNode::Ptr(m, i) => tc::PNode::Ptr(m, self.copy_from_table(src, i, subst, depth + 1, budget)?),
+            tc::PNode::Slice(i) => tc::PNode::Slice(self.copy_from_table(src, i, subst, depth + 1, budget)?),
+            tc::PNode::Array(elem, len) => tc::PNode::Array(
+                self.copy_from_table(src, elem, subst, depth + 1, budget)?,
+                self.copy_from_table(src, len, subst, depth + 1, budget)?,
+            ),
+            tc::PNode::Pat(base, ranges) => tc::PNode::Pat(
+                self.copy_from_table(src, base, subst, depth + 1, budget)?,
+                self.copy_list_from_table(src, ranges, subst, depth + 1, budget)?,
+            ),
+            tc::PNode::Tuple(l) => tc::PNode::Tuple(self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::Record(s, l) => tc::PNode::Record(s, self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::Union(l) => tc::PNode::Union(self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::Adt(k, l) => tc::PNode::Adt(k, self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::FnDef(k, l) => tc::PNode::FnDef(k, self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::FnPtr(l, hdr) => tc::PNode::FnPtr(self.copy_list_from_table(src, l, subst, depth + 1, budget)?, hdr),
+            tc::PNode::Closure { owner, ordinal, args } => tc::PNode::Closure {
+                owner,
+                ordinal,
+                args: self.copy_list_from_table(src, args, subst, depth + 1, budget)?,
+            },
+            tc::PNode::Future(e, o, i) => tc::PNode::Future(
+                e,
+                self.copy_from_table(src, o, subst, depth + 1, budget)?,
+                self.copy_from_table(src, i, subst, depth + 1, budget)?,
+            ),
+            tc::PNode::Coroutine { owner, ordinal, args } => tc::PNode::Coroutine {
+                owner,
+                ordinal,
+                args: self.copy_list_from_table(src, args, subst, depth + 1, budget)?,
+            },
+            tc::PNode::Alias { trait_, name, args } => tc::PNode::Alias {
+                trait_,
+                name,
+                args: self.copy_list_from_table(src, args, subst, depth + 1, budget)?,
+            },
+            tc::PNode::Opaque(k, l) => tc::PNode::Opaque(k, self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::ConstValue { ty: ct, bits } => tc::PNode::ConstValue {
+                ty: self.copy_from_table(src, ct, subst, depth + 1, budget)?,
+                bits,
+            },
+            tc::PNode::Dynamic(l) => tc::PNode::Dynamic(self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::ExTrait(k, l) => tc::PNode::ExTrait(k, self.copy_list_from_table(src, l, subst, depth + 1, budget)?),
+            tc::PNode::ExProj { trait_, name, args, term } => tc::PNode::ExProj {
+                trait_,
+                name,
+                args: self.copy_list_from_table(src, args, subst, depth + 1, budget)?,
+                term: self.copy_from_table(src, term, subst, depth + 1, budget)?,
+            },
+        };
+        self.tys.intern(mapped).ok()
+    }
+
+    fn copy_list_from_table(
+        &mut self,
+        src: tc::PTys<'_>,
+        list: tc::List,
+        subst: Option<&[tc::PTy]>,
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<tc::List> {
+        let items = src.list(list).ok()?;
+        let mut out: AVec<'a, tc::PTy> = AVec::with_capacity_in(items.len(), self.alloc);
+        for &it in items {
+            out.push(self.copy_from_table(src, it, subst, depth, budget)?);
+        }
+        self.tys.intern_list(&out).ok()
+    }
+
+    fn adt_info<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        adt: tc::ItemKey,
+    ) -> InstAdtInfo {
+        if let Some(&(_, info)) = self.adt_cache.iter().find(|&&(k, _)| k == adt) {
+            return info;
+        }
+        let inert = langs.manually_drop == Some(adt) || langs.phantom_data == Some(adt);
+        if !r.store.adts.contains_key(&adt)
+            && let Some(lib) = r.keys.library_in(r.names, adt)
+        {
+            super::ensure_one(r, Want::Adt(lib));
+        }
+        let uncond_copy = if inert {
+            false
+        } else {
+            let mut scratch: AVec<'a, bool> = AVec::new_in(self.alloc);
+            let copy_impl = super::has_impl(r, langs.copy, adt).ok();
+            is_uncond_copy(r, langs, adt, copy_impl, &mut scratch, self.alloc)
+        };
+        let drop_impl = if inert || uncond_copy || langs.drop.is_none() {
+            Some(false)
+        } else {
+            super::has_impl(r, langs.drop, adt).ok()
+        };
+        let (made, is_union, generics) = match BodyHeadFacts::new(&*r.store, r.names).adt(adt) {
+            Some(row) => (true, row.kind == tc::AdtKind::Union, row.generics),
+            None => (false, false, 0),
+        };
+        let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop adt v1");
+        h.tag(u8::from(made));
+        h.tag(u8::from(is_union));
+        h.tag(u8::from(inert));
+        h.tag(u8::from(uncond_copy));
+        match drop_impl {
+            None => h.tag(0),
+            Some(false) => h.tag(1),
+            Some(true) => h.tag(2),
+        }
+        h.u32(generics);
+        if let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(adt) {
+            let stys = r.store.tys.view();
+            let mut stack: AVec<'a, tc::PTy> = AVec::new_in(self.alloc);
+            h.u32(u32::try_from(row.fields.len()).unwrap_or(u32::MAX));
+            for f in row.fields.iter() {
+                let mut hb = MOST_DROP_NODES;
+                hash_pty_structural(stys, f.ty, &mut h, &mut hb, &mut stack);
+            }
+        }
+        let digest = h.finish();
+        if !self.read_adts.iter().any(|&(k, _)| k == adt.0) {
+            self.read_adts.push((adt.0, digest));
+        }
+        let info = InstAdtInfo { made, is_union, inert, uncond_copy, drop_impl };
+        self.adt_cache.push((adt, info));
+        info
+    }
+
+    fn eval_inst_ty<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        ty: tc::PTy,
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<bool> {
+        if depth > MOST_INST_DROP_DEPTH || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        if let Some(&(_, res)) = self.memo.iter().find(|&&(t, _)| t == ty) {
+            return res;
+        }
+        if self.active.scan_for(&ty).is_some() {
+            return None;
+        }
+        self.active.push(ty);
+        let res = self.eval_inst_ty_inner(r, langs, ty, depth, budget);
+        self.active.pop();
+        if res.is_some() {
+            self.memo.push((ty, res));
+        }
+        res
+    }
+
+    fn eval_inst_ty_inner<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        ty: tc::PTy,
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<bool> {
+        let node = self.tys.view().node(ty).ok()?;
+        match node {
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Never
+            | tc::PNode::Ptr(..)
+            | tc::PNode::Ref(..)
+            | tc::PNode::FnDef(..)
+            | tc::PNode::FnPtr(..)
+            | tc::PNode::ConstValue { .. }
+            | tc::PNode::ConstParam(_) => Some(false),
+            tc::PNode::Array(elem, _) | tc::PNode::Pat(elem, _) => {
+                self.eval_inst_ty(r, langs, elem, depth + 1, budget)
+            }
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
+                let elems = self.copy_own_list(l)?;
+                let mut any_unknown = false;
+                for &el in elems.iter() {
+                    match self.eval_inst_ty(r, langs, el, depth + 1, budget) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => any_unknown = true,
+                    }
+                }
+                if any_unknown { None } else { Some(false) }
+            }
+            tc::PNode::Alias { .. } => {
+                let norm = self.normalize_alias(r, langs, ty, 0, budget)?;
+                if norm == ty {
+                    return None;
+                }
+                self.eval_inst_ty(r, langs, norm, depth + 1, budget)
+            }
+            tc::PNode::Adt(adt, args_list) => {
+                let info = self.adt_info(r, langs, adt);
+                if info.inert || info.uncond_copy {
+                    return Some(false);
+                }
+                if info.drop_impl == Some(true) {
+                    return Some(true);
+                }
+                if info.drop_impl != Some(false) || !info.made {
+                    return None;
+                }
+                if info.is_union {
+                    return Some(false);
+                }
+                let args = self.copy_own_list(args_list)?;
+                // Snapshot field types from `r.store.tys` into `self.tys` with `args` substituted
+                // before recursing (which borrows `r` mutably).
+                let mut field_insts: AVec<'a, Option<tc::PTy>> = AVec::new_in(self.alloc);
+                {
+                    let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(adt) else {
+                        return None;
+                    };
+                    let stys = r.store.tys.view();
+                    field_insts.reserve(row.fields.len());
+                    for f in row.fields.iter() {
+                        field_insts.push(self.copy_from_table(stys, f.ty, Some(&args), 0, budget));
+                    }
+                }
+                let mut any_unknown = false;
+                for &fi in field_insts.iter() {
+                    let Some(fty) = fi else {
+                        any_unknown = true;
+                        continue;
+                    };
+                    match self.eval_inst_ty(r, langs, fty, depth + 1, budget) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => any_unknown = true,
+                    }
+                }
+                if any_unknown { None } else { Some(false) }
+            }
+            _ => None,
+        }
+    }
+
+    fn copy_own_list(&self, list: tc::List) -> Option<AVec<'a, tc::PTy>> {
+        let slice = self.tys.view().list(list).ok()?;
+        let mut out = AVec::with_capacity_in(slice.len(), self.alloc);
+        out.extend_from_slice(slice);
+        Some(out)
+    }
+
+    /// Recursively normalizes any `PNode::Alias` anywhere inside `ty` (bounded).
+    fn normalize_deep<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        ty: tc::PTy,
+        norm_depth: u32,
+        budget: &mut u32,
+    ) -> Option<tc::PTy> {
+        if norm_depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return Some(ty);
+        }
+        *budget -= 1;
+        let node = self.tys.view().node(ty).ok()?;
+        match node {
+            tc::PNode::Alias { .. } => {
+                match self.normalize_alias(r, langs, ty, norm_depth, budget) {
+                    Some(norm) => Some(norm),
+                    None => Some(ty),
+                }
+            }
+            tc::PNode::Ref(m, i) => {
+                let ni = self.normalize_deep(r, langs, i, norm_depth + 1, budget)?;
+                if ni == i { Some(ty) } else { self.tys.intern(tc::PNode::Ref(m, ni)).ok() }
+            }
+            tc::PNode::Ptr(m, i) => {
+                let ni = self.normalize_deep(r, langs, i, norm_depth + 1, budget)?;
+                if ni == i { Some(ty) } else { self.tys.intern(tc::PNode::Ptr(m, ni)).ok() }
+            }
+            tc::PNode::Slice(i) => {
+                let ni = self.normalize_deep(r, langs, i, norm_depth + 1, budget)?;
+                if ni == i { Some(ty) } else { self.tys.intern(tc::PNode::Slice(ni)).ok() }
+            }
+            tc::PNode::Array(e, c) => {
+                let ne = self.normalize_deep(r, langs, e, norm_depth + 1, budget)?;
+                if ne == e { Some(ty) } else { self.tys.intern(tc::PNode::Array(ne, c)).ok() }
+            }
+            tc::PNode::Pat(b, ranges) => {
+                let nb = self.normalize_deep(r, langs, b, norm_depth + 1, budget)?;
+                if nb == b { Some(ty) } else { self.tys.intern(tc::PNode::Pat(nb, ranges)).ok() }
+            }
+            tc::PNode::Tuple(l) => {
+                let nl = self.normalize_list(r, langs, l, norm_depth + 1, budget)?;
+                if nl == l { Some(ty) } else { self.tys.intern(tc::PNode::Tuple(nl)).ok() }
+            }
+            tc::PNode::Record(s, l) => {
+                let nl = self.normalize_list(r, langs, l, norm_depth + 1, budget)?;
+                if nl == l { Some(ty) } else { self.tys.intern(tc::PNode::Record(s, nl)).ok() }
+            }
+            tc::PNode::Union(l) => {
+                let nl = self.normalize_list(r, langs, l, norm_depth + 1, budget)?;
+                if nl == l { Some(ty) } else { self.tys.intern(tc::PNode::Union(nl)).ok() }
+            }
+            tc::PNode::Adt(k, l) => {
+                let nl = self.normalize_list(r, langs, l, norm_depth + 1, budget)?;
+                if nl == l { Some(ty) } else { self.tys.intern(tc::PNode::Adt(k, nl)).ok() }
+            }
+            tc::PNode::FnDef(k, l) => {
+                let nl = self.normalize_list(r, langs, l, norm_depth + 1, budget)?;
+                if nl == l { Some(ty) } else { self.tys.intern(tc::PNode::FnDef(k, nl)).ok() }
+            }
+            tc::PNode::FnPtr(l, hdr) => {
+                let nl = self.normalize_list(r, langs, l, norm_depth + 1, budget)?;
+                if nl == l { Some(ty) } else { self.tys.intern(tc::PNode::FnPtr(nl, hdr)).ok() }
+            }
+            _ => Some(ty),
+        }
+    }
+
+    fn normalize_list<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        list: tc::List,
+        norm_depth: u32,
+        budget: &mut u32,
+    ) -> Option<tc::List> {
+        let items = self.copy_own_list(list)?;
+        let mut changed = false;
+        let mut out: AVec<'a, tc::PTy> = AVec::with_capacity_in(items.len(), self.alloc);
+        for &it in items.iter() {
+            let nit = self.normalize_deep(r, langs, it, norm_depth, budget)?;
+            if nit != it {
+                changed = true;
+            }
+            out.push(nit);
+        }
+        if !changed { Some(list) } else { self.tys.intern_list(&out).ok() }
+    }
+
+    fn normalize_alias<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        ty: tc::PTy,
+        norm_depth: u32,
+        budget: &mut u32,
+    ) -> Option<tc::PTy> {
+        if norm_depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let tc::PNode::Alias { trait_, name, args } = self.tys.view().node(ty).ok()? else {
+            return None;
+        };
+        let raw_args = self.copy_own_list(args)?;
+        let mut norm_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(raw_args.len(), self.alloc);
+        for &a in raw_args.iter() {
+            norm_args.push(self.normalize_deep(r, langs, a, norm_depth + 1, budget)?);
+        }
+        let &self_ty = norm_args.first()?;
+        // Builtin `FnOnce::Output` on `FnPtr` or `FnDef`.
+        if langs.fn_traits.contains(&Some(trait_)) && name == tc::Name::of("Output") {
+            match self.tys.view().node(self_ty).ok()? {
+                tc::PNode::FnPtr(l, _) => {
+                    let list = self.tys.view().list(l).ok()?;
+                    return list.last().copied();
+                }
+                tc::PNode::FnDef(fn_key, fn_args) => {
+                    let fn_args_vec = self.copy_own_list(fn_args)?;
+                    let out_ty = r.store.fn_output(fn_key).or_else(|| r.store.fns.get(&fn_key).map(|f| f.output))?;
+                    let stys = r.store.tys.view();
+                    let inst = self.copy_from_table(stys, out_ty, Some(&fn_args_vec), 0, budget)?;
+                    return self.normalize_deep(r, langs, inst, norm_depth + 1, budget);
+                }
+                _ => {}
+            }
+        }
+        let ImplMatch::Selected { imp, subst, trait_arg_count } = self.select_impl(r, langs, trait_, &norm_args, norm_depth + 1, budget) else {
+            return None;
+        };
+        let assoc_ty = {
+            let head = r.store.impls.get(&imp)?;
+            head.assoc.iter().find(|&&(n, _)| n == name).map(|&(_, t)| t)?
+        };
+        let mut full_subst: AVec<'a, tc::PTy> = AVec::with_capacity_in(subst.len() + norm_args.len(), self.alloc);
+        full_subst.extend_from_slice(&subst);
+        if let Some(gat_args) = norm_args.get(1 + trait_arg_count..) {
+            full_subst.extend_from_slice(gat_args);
+        }
+        let stys = r.store.tys.view();
+        let inst = self.copy_from_table(stys, assoc_ty, Some(&full_subst), 0, budget)?;
+        self.normalize_deep(r, langs, inst, norm_depth + 1, budget)
+    }
+
+    fn record_impl_read(&mut self, store: &Store<'_>, imp: tc::ItemKey) {
+        if self.read_impls.iter().any(|&(k, _)| k == imp.0) {
+            return;
+        }
+        let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop impl v1");
+        if let Some(head) = store.impls.get(&imp) {
+            h.tag(1);
+            h.u32(head.generics);
+            h.tag(match head.polarity {
+                tc::ImplPolarity::Positive => 0,
+                tc::ImplPolarity::Negative => 1,
+                tc::ImplPolarity::Reservation => 2,
+            });
+            let stys = store.tys.view();
+            let mut stack: AVec<'a, tc::PTy> = AVec::new_in(self.alloc);
+            let mut hb = MOST_DROP_NODES;
+            hash_pty_structural(stys, head.self_ty, &mut h, &mut hb, &mut stack);
+            if let Ok(ta) = stys.list(head.trait_args.list()) {
+                h.u32(u32::try_from(ta.len()).unwrap_or(u32::MAX));
+                for &t in ta {
+                    let mut hb = MOST_DROP_NODES;
+                    hash_pty_structural(stys, t, &mut h, &mut hb, &mut stack);
+                }
+            }
+            h.u32(u32::try_from(head.assoc.len()).unwrap_or(u32::MAX));
+            for &(name, ty) in head.assoc.iter() {
+                h.u64(name.0);
+                let mut hb = MOST_DROP_NODES;
+                hash_pty_structural(stys, ty, &mut h, &mut hb, &mut stack);
+            }
+            if let Some(preds) = store.preds.get(&imp) {
+                h.tag(1);
+                h.u32(u32::try_from(preds.clauses.len()).unwrap_or(u32::MAX));
+                for c in preds.clauses.iter() {
+                    match *c {
+                        tc::PClause::Trait { trait_, args } => {
+                            h.tag(1);
+                            h.u128(trait_.0);
+                            if let Ok(al) = stys.list(args) {
+                                h.u32(u32::try_from(al.len()).unwrap_or(u32::MAX));
+                                for &a in al {
+                                    let mut hb = MOST_DROP_NODES;
+                                    hash_pty_structural(stys, a, &mut h, &mut hb, &mut stack);
+                                }
+                            }
+                        }
+                        tc::PClause::Projection { trait_, name, args, term } => {
+                            h.tag(2);
+                            h.u128(trait_.0);
+                            h.u64(name.0);
+                            if let Ok(al) = stys.list(args) {
+                                h.u32(u32::try_from(al.len()).unwrap_or(u32::MAX));
+                                for &a in al {
+                                    let mut hb = MOST_DROP_NODES;
+                                    hash_pty_structural(stys, a, &mut h, &mut hb, &mut stack);
+                                }
+                            }
+                            let mut hb = MOST_DROP_NODES;
+                            hash_pty_structural(stys, term, &mut h, &mut hb, &mut stack);
+                        }
+                        _ => h.tag(3),
+                    }
+                }
+            } else {
+                h.tag(0);
+            }
+        } else {
+            h.tag(0);
+        }
+        self.read_impls.push((imp.0, h.finish()));
+    }
+
+    fn select_impl<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        trait_: tc::ItemKey,
+        args: &[tc::PTy],
+        norm_depth: u32,
+        budget: &mut u32,
+    ) -> ImplMatch<'a> {
+        if norm_depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return ImplMatch::Unknown;
+        }
+        *budget -= 1;
+        let Some(&self_ty) = args.first() else { return ImplMatch::Unknown };
+        if self.active_goals.scan_for(&(trait_, self_ty)).is_some() {
+            return ImplMatch::Unknown;
+        }
+        let Some(shape) = shape_of(self.tys.view(), self_ty) else {
+            return ImplMatch::Unknown;
+        };
+        let Some(impls) = answer_impls(r, trait_, shape) else {
+            return ImplMatch::Unknown;
+        };
+        // Record Rule 21 digest for this `(trait_, shape) -> impls` query.
+        {
+            let mut sh = tc::StableHasher::new("blaze-ladder front2 inst drop shape v1");
+            hash_shape(&mut sh, shape);
+            let shape_digest = sh.finish();
+            let mut ih = tc::StableHasher::new("blaze-ladder front2 inst drop impls v1");
+            ih.u32(u32::try_from(impls.len()).unwrap_or(u32::MAX));
+            for &imp in impls.iter() {
+                ih.u128(imp.0);
+            }
+            let impls_digest = ih.finish();
+            if !self.read_queries.iter().any(|&(t, sd, _)| t == trait_.0 && sd == shape_digest) {
+                self.read_queries.push((trait_.0, shape_digest, impls_digest));
+            }
+        }
+        if impls.len() > MOST_INST_DROP_CANDIDATES {
+            return ImplMatch::Unknown;
+        }
+        self.active_goals.push((trait_, self_ty));
+        let mut matched: Option<(tc::ItemKey, AVec<'a, tc::PTy>, usize)> = None;
+        let mut saw_unknown = false;
+        let after_self = &args[1..];
+        for &imp in impls.iter() {
+            if !r.store.impls.contains_key(&imp) {
+                if let Some(lib) = r.keys.library_in(r.names, imp) {
+                    if !super::ensure_one(r, Want::Impl(lib)) {
+                        saw_unknown = true;
+                        continue;
+                    }
+                } else {
+                    saw_unknown = true;
+                    continue;
+                }
+            }
+            self.record_impl_read(&*r.store, imp);
+            let (generics, polarity, header_ok, trait_arg_count, subst_opt) = {
+                let Some(head) = r.store.impls.get(&imp) else {
+                    saw_unknown = true;
+                    continue;
+                };
+                if head.polarity != tc::ImplPolarity::Positive {
+                    continue;
+                }
+                if head.generics > 64 {
+                    saw_unknown = true;
+                    continue;
+                }
+                let stys = r.store.tys.view();
+                let Ok(head_ta) = stys.list(head.trait_args.list()) else {
+                    saw_unknown = true;
+                    continue;
+                };
+                if after_self.len() < head_ta.len() {
+                    continue;
+                }
+                let g_usize = head.generics as usize;
+                let mut subst_buf = [None; 64];
+                let mut ok = match_pattern(stys, head.self_ty, self.tys.view(), self_ty, &mut subst_buf[..g_usize], 0);
+                if ok {
+                    for (&pat_a, &val_a) in head_ta.iter().zip(after_self.iter()) {
+                        if !match_pattern(stys, pat_a, self.tys.view(), val_a, &mut subst_buf[..g_usize], 0) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let all_bound = subst_buf[..g_usize].iter().all(Option::is_some);
+                let subst_opt = if all_bound {
+                    let mut v: AVec<'a, tc::PTy> = AVec::with_capacity_in(g_usize, self.alloc);
+                    for s in &subst_buf[..g_usize] {
+                        if let Some(t) = *s {
+                            v.push(t);
+                        }
+                    }
+                    Some(v)
+                } else {
+                    None
+                };
+                (head.generics, head.polarity, true, head_ta.len(), subst_opt)
+            };
+            let _ = (generics, polarity, header_ok);
+            let Some(subst) = subst_opt else {
+                saw_unknown = true;
+                continue;
+            };
+            match self.check_impl_clauses(r, langs, imp, &subst, norm_depth + 1, budget) {
+                Truth::True => {
+                    if matched.is_some() {
+                        // Two distinct impls both proved: ambiguous, refuse conservatively.
+                        self.active_goals.pop();
+                        return ImplMatch::Unknown;
+                    }
+                    matched = Some((imp, subst, trait_arg_count));
+                }
+                Truth::False => {}
+                Truth::Unknown => saw_unknown = true,
+            }
+        }
+        self.active_goals.pop();
+        match (matched, saw_unknown) {
+            (Some((imp, subst, trait_arg_count)), false) => ImplMatch::Selected { imp, subst, trait_arg_count },
+            (None, false) => ImplMatch::None,
+            _ => ImplMatch::Unknown,
+        }
+    }
+
+    fn check_impl_clauses<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        imp: tc::ItemKey,
+        subst: &[tc::PTy],
+        norm_depth: u32,
+        budget: &mut u32,
+    ) -> Truth {
+        // Snapshot instantiated clauses from `r.store.preds` before recursively querying `r`.
+        enum InstClause<'a> {
+            Trait(tc::ItemKey, AVec<'a, tc::PTy>),
+            Proj(tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy),
+            Unknown,
+        }
+        let mut clauses: AVec<'a, InstClause<'a>> = AVec::new_in(self.alloc);
+        {
+            let Some(preds) = r.store.preds.get(&imp) else {
+                return Truth::Unknown;
+            };
+            let stys = r.store.tys.view();
+            for c in preds.clauses.iter() {
+                match *c {
+                    tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
+                    tc::PClause::Trait { trait_, args } => {
+                        let Ok(al) = stys.list(args) else {
+                            clauses.push(InstClause::Unknown);
+                            continue;
+                        };
+                        let mut inst_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                        let mut ok = true;
+                        for &a in al {
+                            match self.copy_from_table(stys, a, Some(subst), 0, budget) {
+                                Some(t) => inst_args.push(t),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            clauses.push(InstClause::Trait(trait_, inst_args));
+                        } else {
+                            clauses.push(InstClause::Unknown);
+                        }
+                    }
+                    tc::PClause::Projection { trait_, name, args, term } => {
+                        let Ok(al) = stys.list(args) else {
+                            clauses.push(InstClause::Unknown);
+                            continue;
+                        };
+                        let mut inst_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                        let mut ok = true;
+                        for &a in al {
+                            match self.copy_from_table(stys, a, Some(subst), 0, budget) {
+                                Some(t) => inst_args.push(t),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let inst_term = self.copy_from_table(stys, term, Some(subst), 0, budget);
+                        match (ok, inst_term) {
+                            (true, Some(t)) => clauses.push(InstClause::Proj(trait_, name, inst_args, t)),
+                            _ => clauses.push(InstClause::Unknown),
+                        }
+                    }
+                    tc::PClause::Const { .. } | tc::PClause::ForFields { .. } => {
+                        clauses.push(InstClause::Unknown);
+                    }
+                }
+            }
+        }
+        let mut any_unknown = false;
+        for cl in clauses.iter() {
+            match cl {
+                InstClause::Unknown => any_unknown = true,
+                InstClause::Trait(ct, cargs) => {
+                    match self.prove_trait(r, langs, *ct, cargs, norm_depth, budget) {
+                        Truth::True => {}
+                        Truth::False => return Truth::False,
+                        Truth::Unknown => any_unknown = true,
+                    }
+                }
+                InstClause::Proj(pt, pn, pargs, pterm) => {
+                    let Ok(list) = self.tys.intern_list(pargs) else {
+                        any_unknown = true;
+                        continue;
+                    };
+                    let Ok(alias_ty) = self.tys.intern(tc::PNode::Alias { trait_: *pt, name: *pn, args: list }) else {
+                        any_unknown = true;
+                        continue;
+                    };
+                    let lhs = self.normalize_alias(r, langs, alias_ty, norm_depth, budget);
+                    let rhs = self.normalize_deep(r, langs, *pterm, norm_depth, budget);
+                    match (lhs, rhs) {
+                        (Some(l), Some(rt)) if l == rt => {}
+                        (Some(l), Some(rt))
+                            if self.is_concrete_normalized(l) && self.is_concrete_normalized(rt) =>
+                        {
+                            return Truth::False;
+                        }
+                        _ => any_unknown = true,
+                    }
+                }
+            }
+        }
+        if any_unknown { Truth::Unknown } else { Truth::True }
+    }
+
+    fn is_concrete_normalized(&self, ty: tc::PTy) -> bool {
+        !matches!(
+            self.tys.view().node(ty),
+            Ok(tc::PNode::Param(_) | tc::PNode::Alias { .. } | tc::PNode::Opaque(..) | tc::PNode::Infer | tc::PNode::Error) | Err(_)
+        )
+    }
+
+    fn prove_trait<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        trait_: tc::ItemKey,
+        raw_args: &[tc::PTy],
+        norm_depth: u32,
+        budget: &mut u32,
+    ) -> Truth {
+        if norm_depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return Truth::Unknown;
+        }
+        let [sized, meta_sized, pointee_sized, destruct] = langs.relates_nothing;
+        let sized = sized.or_else(|| r.store.sized.map(checker_of));
+        if Some(trait_) == pointee_sized || Some(trait_) == destruct {
+            return Truth::True;
+        }
+        let mut args: AVec<'a, tc::PTy> = AVec::with_capacity_in(raw_args.len(), self.alloc);
+        for &a in raw_args {
+            match self.normalize_deep(r, langs, a, norm_depth + 1, budget) {
+                Some(na) => args.push(na),
+                None => return Truth::Unknown,
+            }
+        }
+        let Some(&self_ty) = args.first() else { return Truth::Unknown };
+        if Some(trait_) == sized || Some(trait_) == meta_sized {
+            return match self.is_known_sized(r, self_ty, 0, budget) {
+                Some(true) => Truth::True,
+                Some(false) if Some(trait_) == sized => Truth::False,
+                _ => Truth::Unknown,
+            };
+        }
+        if Some(trait_) == langs.tuple_trait {
+            return match self.tys.view().node(self_ty) {
+                Ok(tc::PNode::Tuple(_)) => Truth::True,
+                Ok(tc::PNode::Param(_) | tc::PNode::Alias { .. } | tc::PNode::Opaque(..) | tc::PNode::Infer | tc::PNode::Error) | Err(_) => {
+                    Truth::Unknown
+                }
+                Ok(_) => Truth::False,
+            };
+        }
+        if langs.fn_traits.contains(&Some(trait_)) {
+            match self.tys.view().node(self_ty) {
+                Ok(tc::PNode::FnPtr(l, _)) => {
+                    if let (Ok(fp_elems), Some(&arg_tuple)) = (self.tys.view().list(l), args.get(1))
+                        && let Ok(tc::PNode::Tuple(tl)) = self.tys.view().node(arg_tuple)
+                        && let Ok(t_elems) = self.tys.view().list(tl)
+                    {
+                        let inputs = fp_elems.get(..fp_elems.len().saturating_sub(1)).unwrap_or(&[]);
+                        return if inputs == t_elems { Truth::True } else { Truth::False };
+                    }
+                    return Truth::Unknown;
+                }
+                Ok(tc::PNode::FnDef(fn_key, fn_args)) => {
+                    let Some(fn_args_vec) = self.copy_own_list(fn_args) else { return Truth::Unknown };
+                    let Some(&arg_tuple) = args.get(1) else { return Truth::Unknown };
+                    let Ok(tc::PNode::Tuple(tl)) = self.tys.view().node(arg_tuple) else { return Truth::Unknown };
+                    let Some(t_elems) = self.copy_own_list(tl) else { return Truth::Unknown };
+                    let mut fn_inputs: AVec<'a, tc::PTy> = AVec::new_in(self.alloc);
+                    {
+                        let Some(f) = r.store.fns.get(&fn_key) else { return Truth::Unknown };
+                        let stys = r.store.tys.view();
+                        for &inp in f.inputs.iter() {
+                            match self.copy_from_table(stys, inp, Some(&fn_args_vec), 0, budget) {
+                                Some(t) => fn_inputs.push(t),
+                                None => return Truth::Unknown,
+                            }
+                        }
+                    }
+                    return if fn_inputs.as_slice() == t_elems.as_slice() { Truth::True } else { Truth::False };
+                }
+                _ => {}
+            }
+        }
+        match self.select_impl(r, langs, trait_, &args, norm_depth + 1, budget) {
+            ImplMatch::Selected { .. } => Truth::True,
+            ImplMatch::None => Truth::False,
+            ImplMatch::Unknown => Truth::Unknown,
+        }
+    }
+
+    fn is_known_sized<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        ty: tc::PTy,
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<bool> {
+        if depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        match self.tys.view().node(ty).ok()? {
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Never
+            | tc::PNode::Ref(..)
+            | tc::PNode::Ptr(..)
+            | tc::PNode::Array(..)
+            | tc::PNode::FnPtr(..)
+            | tc::PNode::FnDef(..)
+            | tc::PNode::ConstValue { .. }
+            | tc::PNode::ConstParam(_) => Some(true),
+            tc::PNode::Str | tc::PNode::Slice(_) | tc::PNode::Dynamic(_) | tc::PNode::Foreign(_) => Some(false),
+            tc::PNode::Pat(inner, _) => self.is_known_sized(r, inner, depth + 1, budget),
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
+                let elems = self.copy_own_list(l)?;
+                for &e in elems.iter() {
+                    if !self.is_known_sized(r, e, depth + 1, budget)? {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
+            tc::PNode::Adt(adt, args_list) => {
+                if !r.store.adts.contains_key(&adt)
+                    && let Some(lib) = r.keys.library_in(r.names, adt)
+                {
+                    super::ensure_one(r, Want::Adt(lib));
+                }
+                let args = self.copy_own_list(args_list)?;
+                let last_field = {
+                    let row = BodyHeadFacts::new(&*r.store, r.names).adt(adt)?;
+                    if row.kind != tc::AdtKind::Struct {
+                        return Some(true);
+                    }
+                    let Some(last) = row.fields.last() else {
+                        return Some(true);
+                    };
+                    let stys = r.store.tys.view();
+                    self.copy_from_table(stys, last.ty, Some(&args), 0, budget)?
+                };
+                self.is_known_sized(r, last_field, depth + 1, budget)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Convenience wrapper evaluating one instantiated body `PTy` and recording its Rule 21 reads.
+#[allow(dead_code)]
+pub(super) fn inst_needs_drop<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    langs: super::BorrowLangs,
+    body_tys: tc::PTys<'_>,
+    ty: tc::PTy,
+    reads: &mut AVec<'a, Read>,
+    alloc: Alloc<'a>,
+) -> Option<bool> {
+    let mut eval = InstDropEval::new_in(alloc);
+    let res = eval.eval_body_ty(r, langs, body_tys, ty);
+    eval.push_reads(reads);
+    res
+}
+
+fn match_pattern(
+    pat_tys: tc::PTys<'_>,
+    pat: tc::PTy,
+    val_tys: tc::PTys<'_>,
+    val: tc::PTy,
+    subst: &mut [Option<tc::PTy>],
+    depth: u32,
+) -> bool {
+    if depth > MOST_INST_DROP_DEPTH {
+        return false;
+    }
+    let (Ok(pn), Ok(vn)) = (pat_tys.node(pat), val_tys.node(val)) else {
+        return false;
+    };
+    match (pn, vn) {
+        (tc::PNode::Param(p) | tc::PNode::ConstParam(p), _) => {
+            let Ok(pi) = usize::try_from(p) else { return false };
+            let Some(slot) = subst.get_mut(pi) else { return false };
+            match *slot {
+                None => {
+                    *slot = Some(val);
+                    true
+                }
+                Some(prev) => prev == val,
+            }
+        }
+        (tc::PNode::Bool, tc::PNode::Bool)
+        | (tc::PNode::Char, tc::PNode::Char)
+        | (tc::PNode::Str, tc::PNode::Str)
+        | (tc::PNode::Never, tc::PNode::Never) => true,
+        (tc::PNode::Int(a), tc::PNode::Int(b)) => a == b,
+        (tc::PNode::Uint(a), tc::PNode::Uint(b)) => a == b,
+        (tc::PNode::Float(a), tc::PNode::Float(b)) => a == b,
+        (tc::PNode::Foreign(a), tc::PNode::Foreign(b)) => a == b,
+        (tc::PNode::ExAuto(a), tc::PNode::ExAuto(b)) => a == b,
+        (tc::PNode::ConstValue { ty: pt, bits: pb }, tc::PNode::ConstValue { ty: vt, bits: vb }) => {
+            pb == vb && match_pattern(pat_tys, pt, val_tys, vt, subst, depth + 1)
+        }
+        (tc::PNode::Ref(pm, pi), tc::PNode::Ref(vm, vi)) if pm == vm => {
+            match_pattern(pat_tys, pi, val_tys, vi, subst, depth + 1)
+        }
+        (tc::PNode::Ptr(pm, pi), tc::PNode::Ptr(vm, vi)) if pm == vm => {
+            match_pattern(pat_tys, pi, val_tys, vi, subst, depth + 1)
+        }
+        (tc::PNode::Slice(pi), tc::PNode::Slice(vi)) => {
+            match_pattern(pat_tys, pi, val_tys, vi, subst, depth + 1)
+        }
+        (tc::PNode::Array(pe, pl), tc::PNode::Array(ve, vl)) => {
+            match_pattern(pat_tys, pe, val_tys, ve, subst, depth + 1)
+                && match_pattern(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (tc::PNode::Pat(pb, pr), tc::PNode::Pat(vb, vr)) => {
+            match_pattern(pat_tys, pb, val_tys, vb, subst, depth + 1)
+                && match_pattern_lists(pat_tys, pr, val_tys, vr, subst, depth + 1)
+        }
+        (tc::PNode::Tuple(pl), tc::PNode::Tuple(vl))
+        | (tc::PNode::Union(pl), tc::PNode::Union(vl))
+        | (tc::PNode::Dynamic(pl), tc::PNode::Dynamic(vl)) => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (tc::PNode::Record(ps, pl), tc::PNode::Record(vs, vl)) if ps == vs => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (tc::PNode::Adt(pk, pl), tc::PNode::Adt(vk, vl)) if pk == vk => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (tc::PNode::FnDef(pk, pl), tc::PNode::FnDef(vk, vl)) if pk == vk => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (tc::PNode::FnPtr(pl, ph), tc::PNode::FnPtr(vl, vh)) if ph == vh => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (tc::PNode::Opaque(pk, pl), tc::PNode::Opaque(vk, vl)) if pk == vk => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (tc::PNode::ExTrait(pk, pl), tc::PNode::ExTrait(vk, vl)) if pk == vk => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+        }
+        (
+            tc::PNode::Alias { trait_: pt, name: pn, args: pl },
+            tc::PNode::Alias { trait_: vt, name: vn, args: vl },
+        ) if pt == vt && pn == vn => match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1),
+        (
+            tc::PNode::ExProj { trait_: pt, name: pn, args: pl, term: pterm },
+            tc::PNode::ExProj { trait_: vt, name: vn, args: vl, term: vterm },
+        ) if pt == vt && pn == vn => {
+            match_pattern_lists(pat_tys, pl, val_tys, vl, subst, depth + 1)
+                && match_pattern(pat_tys, pterm, val_tys, vterm, subst, depth + 1)
+        }
+        _ => false,
+    }
+}
+
+fn match_pattern_lists(
+    pat_tys: tc::PTys<'_>,
+    pl: tc::List,
+    val_tys: tc::PTys<'_>,
+    vl: tc::List,
+    subst: &mut [Option<tc::PTy>],
+    depth: u32,
+) -> bool {
+    let (Ok(ps), Ok(vs)) = (pat_tys.list(pl), val_tys.list(vl)) else {
+        return false;
+    };
+    ps.len() == vs.len()
+        && ps.iter().zip(vs.iter()).all(|(&p, &v)| match_pattern(pat_tys, p, val_tys, v, subst, depth))
+}
+
+fn hash_shape(h: &mut tc::StableHasher, shape: tc::Shape) {
+    match shape {
+        tc::Shape::Bool => h.tag(0),
+        tc::Shape::Char => h.tag(1),
+        tc::Shape::Int(i) => {
+            h.tag(2);
+            h.tag(i as u8);
+        }
+        tc::Shape::Uint(u) => {
+            h.tag(3);
+            h.tag(u as u8);
+        }
+        tc::Shape::Float(f) => {
+            h.tag(4);
+            h.tag(f as u8);
+        }
+        tc::Shape::Str => h.tag(5),
+        tc::Shape::Never => h.tag(6),
+        tc::Shape::Tuple(n) => {
+            h.tag(7);
+            h.u32(n);
+        }
+        tc::Shape::Record(s, n) => {
+            h.tag(8);
+            h.u64(s);
+            h.u32(n);
+        }
+        tc::Shape::Union(n) => {
+            h.tag(9);
+            h.u32(n);
+        }
+        tc::Shape::Ref(m) => {
+            h.tag(10);
+            h.tag(u8::from(m == tc::Mutbl::Mut));
+        }
+        tc::Shape::Ptr(m) => {
+            h.tag(11);
+            h.tag(u8::from(m == tc::Mutbl::Mut));
+        }
+        tc::Shape::Array => h.tag(12),
+        tc::Shape::Slice => h.tag(13),
+        tc::Shape::Pat => h.tag(14),
+        tc::Shape::Adt(k) => {
+            h.tag(15);
+            h.u128(k.0);
+        }
+        tc::Shape::FnDef(k) => {
+            h.tag(16);
+            h.u128(k.0);
+        }
+        tc::Shape::FnPtr(n) => {
+            h.tag(17);
+            h.u32(n);
+        }
+        tc::Shape::Closure => h.tag(18),
+        tc::Shape::Param => h.tag(19),
+        tc::Shape::Opaque(k) => {
+            h.tag(20);
+            h.u128(k.0);
+        }
+        tc::Shape::Foreign(k) => {
+            h.tag(21);
+            h.u128(k.0);
+        }
+        tc::Shape::Dynamic(k) => {
+            h.tag(22);
+            match k {
+                None => h.tag(0),
+                Some(t) => {
+                    h.tag(1);
+                    h.u128(t.0);
+                }
+            }
+        }
+        tc::Shape::AnyInt => h.tag(23),
+        tc::Shape::AnyFloat => h.tag(24),
+    }
+}
+
+fn hash_pty_structural(tys: tc::PTys<'_>, root: tc::PTy, h: &mut tc::StableHasher, budget: &mut u32, stack: &mut AVec<'_, tc::PTy>) {
+    stack.clear();
+    stack.push(root);
+    while let Some(ty) = stack.pop() {
+        if *budget == 0 {
+            h.tag(0xff);
+            stack.clear();
+            return;
+        }
+        *budget -= 1;
+        match tys.node(ty) {
+            Ok(tc::PNode::Bool) => h.tag(1),
+            Ok(tc::PNode::Char) => h.tag(2),
+            Ok(tc::PNode::Int(i)) => {
+                h.tag(3);
+                h.tag(i as u8);
+            }
+            Ok(tc::PNode::Uint(u)) => {
+                h.tag(4);
+                h.tag(u as u8);
+            }
+            Ok(tc::PNode::Float(f)) => {
+                h.tag(5);
+                h.tag(f as u8);
+            }
+            Ok(tc::PNode::Never) => h.tag(6),
+            Ok(tc::PNode::Str) => h.tag(7),
+            Ok(tc::PNode::Ptr(m, inner)) => {
+                h.tag(8);
+                h.tag(u8::from(m == tc::Mutbl::Mut));
+                stack.push(inner);
+            }
+            Ok(tc::PNode::Ref(m, inner)) => {
+                h.tag(9);
+                h.tag(u8::from(m == tc::Mutbl::Mut));
+                stack.push(inner);
+            }
+            Ok(tc::PNode::Slice(inner)) => {
+                h.tag(10);
+                stack.push(inner);
+            }
+            Ok(tc::PNode::Array(elem, len)) => {
+                h.tag(11);
+                stack.push(len);
+                stack.push(elem);
+            }
+            Ok(tc::PNode::Pat(elem, _)) => {
+                h.tag(12);
+                stack.push(elem);
+            }
+            Ok(tc::PNode::ConstValue { ty: ct, bits }) => {
+                h.tag(13);
+                h.u128(bits);
+                stack.push(ct);
+            }
+            Ok(tc::PNode::ConstParam(cp)) => {
+                h.tag(14);
+                h.u32(cp);
+            }
+            Ok(tc::PNode::Param(p)) => {
+                h.tag(15);
+                h.u32(p);
+            }
+            Ok(tc::PNode::Tuple(l)) => {
+                h.tag(16);
+                if let Ok(es) = tys.list(l) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::Record(s, l)) => {
+                h.tag(17);
+                h.u64(s.0);
+                if let Ok(es) = tys.list(l) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::Union(l)) => {
+                h.tag(18);
+                if let Ok(es) = tys.list(l) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::Adt(k, args)) => {
+                h.tag(19);
+                h.u128(k.0);
+                if let Ok(es) = tys.list(args) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::Alias { trait_, name, args }) => {
+                h.tag(20);
+                h.u128(trait_.0);
+                h.u64(name.0);
+                if let Ok(es) = tys.list(args) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::FnDef(k, args)) => {
+                h.tag(21);
+                h.u128(k.0);
+                if let Ok(es) = tys.list(args) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::FnPtr(args, _)) => {
+                h.tag(22);
+                if let Ok(es) = tys.list(args) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::Opaque(k, args)) => {
+                h.tag(23);
+                h.u128(k.0);
+                if let Ok(es) = tys.list(args) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::Foreign(k)) => {
+                h.tag(24);
+                h.u128(k.0);
+            }
+            _ => h.tag(25),
+        }
+    }
+}
+
 #[cfg(test)]
 mod field_row_tests {
     //! A field's row is its head column's slots, read at the field type's own positions (D148):
@@ -1471,5 +2829,17 @@ mod field_row_tests {
         assert_eq!(row(&t, f, &col, 0), Ok(std::vec![FieldRegion::Bound(0), FieldRegion::Bound(1)]));
         let p = t.intern(PNode::Param(0)).unwrap();
         assert_eq!(row(&t, p, &[], 0), Ok(std::vec![FieldRegion::Arg(0)]));
+    }
+
+    /// A field whose declared type holds a projection (`PNode::Alias`) has no `FieldRegion` row
+    /// (`Unlaid::Unnamed`), because normalizing that projection at a use site can introduce
+    /// lifetimes absent from the unnormalized declaration (`FieldRegionsUnaligned`).
+    #[test]
+    fn alias_field_is_unnamed() {
+        let mut t = PortableTys::new_in(a());
+        let p = t.intern(PNode::Param(0)).unwrap();
+        let args = t.intern_list(&[p]).unwrap();
+        let alias = t.intern(PNode::Alias { trait_: TR, name: tc::Name::of("Maker"), args }).unwrap();
+        assert_eq!(row(&t, alias, &[Region::Param(0)], 1), Err(Unlaid::Unnamed));
     }
 }

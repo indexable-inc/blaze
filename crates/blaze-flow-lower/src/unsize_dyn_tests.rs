@@ -23,7 +23,9 @@ struct UnsizeFacts {
     traits: vec::Vec<(ItemKey, u32)>,
     aliases: vec::Vec<(ItemKey, Name, u32)>,
     fn_traits: [Option<ItemKey>; 3],
+    future_trait: Option<ItemKey>,
     closure_bodies_checked: bool,
+    async_bodies_checked: bool,
     closure_reqs: vec::Vec<(ExprId, vec::Vec<Requirement>)>,
 }
 
@@ -34,7 +36,9 @@ impl UnsizeFacts {
             traits: vec::Vec::new(),
             aliases: vec::Vec::new(),
             fn_traits: [None; 3],
+            future_trait: None,
             closure_bodies_checked: false,
+            async_bodies_checked: false,
             closure_reqs: vec::Vec::new(),
         }
     }
@@ -75,7 +79,7 @@ impl Facts for UnsizeFacts {
         self.closure_reqs.iter().find(|(e, _)| *e == c).map_or(&[], |(_, r)| r.as_slice())
     }
     fn async_bodies_checked(&self) -> bool {
-        false
+        self.async_bodies_checked
     }
     fn is_future(&self, _: PTy) -> Option<bool> {
         None
@@ -97,6 +101,9 @@ impl Facts for UnsizeFacts {
     }
     fn is_fn_trait(&self, k: ItemKey) -> bool {
         self.fn_traits.contains(&Some(k))
+    }
+    fn is_future_trait(&self, k: ItemKey) -> bool {
+        self.future_trait == Some(k)
     }
     fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> {
         None
@@ -843,4 +850,451 @@ fn lower_closure_as_fn_once_owns_by_value_captures_and_rejects_returning_local_r
             rep_bad.borrows
         );
     }
+}
+
+/// `crates/blaze-sim/src/check.rs::replace_hook` shape:
+/// `let hook = MyBox::new(move |info: &Info<'_>| on_panic(&before, info)); set_hook(hook);`
+/// where `before: MyBox<dyn for<'a, 'b> Fn(&'a Info<'b>) + 'static>` and `set_hook` expects
+/// `MyBox<dyn for<'a, 'b> Fn(&'a Info<'b>) + 'static>`.
+///
+/// RFC 1214 outlives components for `dyn Tr + 'o`: `dyn Tr + 'o: 'r` iff `'o: 'r` (predicate slots
+/// `1..` hold rigid `dyn_bound_placeholders` that must NOT be forced to outlive `'static`).
+/// - POSITIVE: `before` has object lifetime `'static` -> passes cleanly with zero findings.
+/// - NEGATIVE: `before` has non-`'static` object lifetime `'short` -> MUST fail borrow check
+///   (`UnprovenOutlives`) because `'short: 'static` does not hold!
+#[test]
+fn unsize_box_closure_capturing_hrtb_dyn_fn_ignores_predicate_placeholders() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(LangItem::Sized, sized);
+    let unsize = fx.tr("Unsize", 2, vec![], &[]);
+    fx.lang(LangItem::Unsize, unsize);
+    let coerce_unsized = fx.tr("CoerceUnsized", 2, vec![], &[]);
+    fx.lang(LangItem::CoerceUnsized, coerce_unsized);
+    let fn_once = fx.tr("FnOnce", 2, vec![], &["Output"]);
+    let fn_mut = fx.tr("FnMut", 2, vec![], &[]);
+    let fn_tr = fx.tr("Fn", 2, vec![], &[]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    fx.lang(LangItem::FnMut, fn_mut);
+    fx.lang(LangItem::Fn, fn_tr);
+
+    let info_k = fx.strukt("Info", 0, &[]);
+    let info_ty = fx.adt(info_k, &[]);
+    let ref_info = fx.r(Mutbl::Not, info_ty);
+    let arg_tup = fx.tuple(&[ref_info]);
+    let unit = fx.unit();
+
+    let arg_list = fx.list(&[arg_tup]);
+    let ex_fn = fx.ty(PNode::ExTrait(fn_tr, arg_list));
+    let ex_out = fx.ty(PNode::ExProj { trait_: fn_once, name: Name::of("Output"), args: arg_list, term: unit });
+    let dyn_preds = fx.list(&[ex_fn, ex_out]);
+    let dyn_hook = fx.ty(PNode::Dynamic(dyn_preds));
+
+    let p0 = fx.param(0);
+    let p1 = fx.param(1);
+    let box_k = fx.strukt("MyBox", 1, &[]);
+    let box_p0 = fx.adt(box_k, &[p0]);
+    let box_p1 = fx.adt(box_k, &[p1]);
+    let box_dyn = fx.adt(box_k, &[dyn_hook]);
+    let ref_box_dyn = fx.r(Mutbl::Not, box_dyn);
+
+    let b_unsize = fx.bound(unsize, &[p0, p1]);
+    let coerce_imp = fx.imp("impl<T, U> CoerceUnsized<MyBox<U>> for MyBox<T> where T: Unsize<U>", 2, box_p0, Some((coerce_unsized, &[box_p1])), &[], vec![b_unsize]);
+    fx.unsized_param(coerce_imp, 0);
+    fx.unsized_param(coerce_imp, 1);
+
+    let box_new = fx.func("box_new", 1, &[p0], box_p0, vec![]);
+    let on_panic = fx.func("on_panic", 0, &[ref_box_dyn, ref_info], unit, vec![]);
+    let set_hook = fx.func("set_hook", 0, &[box_dyn], unit, vec![]);
+    let fn_ok = fx.func("ok", 0, &[box_dyn], unit, vec![]);
+    let fn_bad = fx.func("bad", 0, &[box_dyn], unit, vec![]);
+    fx.finish();
+
+    let late1_0 = Region::Late { binder: 1, var: 0 };
+    let late1_1 = Region::Late { binder: 1, var: 1 };
+
+    let mut decls = Decls::new();
+    decls.adt(info_k, 1);
+    decls.adt(box_k, 0);
+    decls.trait_(fn_tr, 0);
+    decls.trait_(fn_mut, 0);
+    decls.trait_(fn_once, 0);
+    decls.alias(fn_once, "Output", 0);
+
+    // `box_new<T>(x: T) -> MyBox<T>` (0 lifetime params; generic T's slots pass through)
+    decls.func(box_new, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[p0], output: box_p0, slots: &[] });
+    // `on_panic<'r, 'o, 'i, 'b>(_: &'r MyBox<dyn for<'a, 'c> Fn(&'a Info<'c>) + 'o>, _: &'i Info<'b>)`
+    decls.func(
+        on_panic,
+        FnHead {
+            lifetimes: 4,
+            late: &[0, 1, 2, 3],
+            outlives: &[],
+            inputs: &[ref_box_dyn, ref_info],
+            output: unit,
+            slots: &[P0, P1, late1_0, late1_1, late1_0, late1_1, P2, Region::Param(3)],
+        },
+    );
+    // `set_hook(_: MyBox<dyn for<'a, 'b> Fn(&'a Info<'b>) + 'static>)`
+    decls.func(
+        set_hook,
+        FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[box_dyn], output: unit, slots: &[Region::Static, late1_0, late1_1, late1_0, late1_1] },
+    );
+    // POSITIVE: `fn ok(before: MyBox<dyn for<'a, 'b> Fn(&'a Info<'b>) + 'static>)`
+    decls.func(
+        fn_ok,
+        FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[box_dyn], output: unit, slots: &[Region::Static, late1_0, late1_1, late1_0, late1_1] },
+    );
+    // NEGATIVE: `fn bad<'short>(before: MyBox<dyn for<'a, 'b> Fn(&'a Info<'b>) + 'short>)`
+    decls.func(
+        fn_bad,
+        FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[box_dyn], output: unit, slots: &[P0, late1_0, late1_1, late1_0, late1_1] },
+    );
+
+    let mut facts = UnsizeFacts::new();
+    facts.adts.push((info_k, 1, false));
+    facts.adts.push((box_k, 0, false));
+    facts.traits.push((fn_tr, 0));
+    facts.traits.push((fn_mut, 0));
+    facts.traits.push((fn_once, 0));
+    facts.aliases.push((fn_once, Name::of("Output"), 0));
+    facts.fn_traits = [Some(fn_tr), Some(fn_mut), Some(fn_once)];
+    facts.closure_bodies_checked = true;
+
+    let run = |owner: ItemKey| {
+        let mut b = Bb::new();
+        let p_before = b.param("before");
+        let p_info = b.bind("info");
+        let l_before = b.local(p_before);
+        let r_before = b.borrow(Mutbl::Not, l_before);
+        let l_info = b.local(p_info);
+        let f_on = b.path(&["on_panic"]);
+        let call_on = b.call(f_on, &[r_before, l_info]);
+        let cl = b.move_closure(&[p_info], call_on);
+        let f_new = b.path(&["box_new"]);
+        let boxed = b.call(f_new, &[cl]);
+        let f_set = b.path(&["set_hook"]);
+        let call_set = b.call(f_set, &[boxed]);
+        let st = b.semi(call_set);
+        let root = b.block(&[st], None);
+        let view = b.view(owner, root);
+        let mut ck = region_fixture::checked(&fx, &view);
+        region_fixture::lower(&fx, &view, &mut ck, &facts, &decls, Plant::None).expect("lower")
+    };
+
+    let ok = run(fn_ok);
+    assert!(ok.lines.is_empty(), "POSITIVE: Box<Closure> capturing `Box<dyn for<'a,'b> Fn(&'a Info<'b>) + 'static>` must pass cleanly: {:?}", ok.lines);
+    let bad = run(fn_bad);
+    assert!(
+        bad.lines.iter().any(|l| l.starts_with("borrow UnprovenOutlives")),
+        "NEGATIVE: Box<Closure> capturing `Box<dyn Fn + 'short>` coerced to `+ 'static` MUST fail borrow check: {:?}",
+        bad.lines
+    );
+}
+
+/// `crates/blaze-cli/src/engine_check.rs::outlines_phase` shape:
+/// `Pool<'a>::run(&self, f: &(dyn Fn(&Self::Cx, &mut Buf<'a>)))` invoked on `MyPool` where
+/// `type Cx = Cx` (0 lifetimes, whereas `<Self as Pool<'a>>::Cx` has 1 lifetime slot `'a`!).
+/// `find_unique_dyn_with_binder` must NOT reject the `dyn Fn` expectation because `want_slots`
+/// (from the unnormalized alias) differs from the body `dyn Fn`'s normalized slot count.
+/// - POSITIVE: `|cx: &Cx, buf: &mut Buf<'_>| take_buf_a(buf)` gets `SigSlot::Owner(0)` for `Buf<'_>`
+///   and checks clean.
+/// - NEGATIVE: `|cx: &Cx, buf: &mut Buf<'_>| take_cx_a(cx)` keeps `&Cx` as late-bound `SigSlot::Late`
+///   and MUST fail borrow check when passed where `&'a Cx` is required!
+#[test]
+fn closure_expectation_matches_dyn_fn_with_associated_type_lifetime() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(LangItem::Sized, sized);
+    let unsize = fx.tr("Unsize", 2, vec![], &[]);
+    fx.lang(LangItem::Unsize, unsize);
+    let fn_once = fx.tr("FnOnce", 2, vec![], &["Output"]);
+    let fn_mut = fx.tr("FnMut", 2, vec![], &[]);
+    let fn_tr = fx.tr("Fn", 2, vec![], &[]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    fx.lang(LangItem::FnMut, fn_mut);
+    fx.lang(LangItem::Fn, fn_tr);
+
+    let cx_k = fx.strukt("Cx", 0, &[]);
+    let cx_ty = fx.adt(cx_k, &[]);
+    let ref_cx = fx.r(Mutbl::Not, cx_ty);
+    let buf_k = fx.strukt("Buf", 0, &[]);
+    let buf_ty = fx.adt(buf_k, &[]);
+    let mut_buf = fx.r(Mutbl::Mut, buf_ty);
+    let pool_k = fx.strukt("MyPool", 0, &[]);
+    let pool_ty = fx.adt(pool_k, &[]);
+    let ref_pool = fx.r(Mutbl::Not, pool_ty);
+    let unit = fx.unit();
+
+    let pool_tr = fx.tr("Pool", 1, vec![], &["Cx"]);
+    let p0 = fx.param(0);
+    let self_cx = fx.alias(pool_tr, "Cx", &[p0]);
+    let ref_self_cx = fx.r(Mutbl::Not, self_cx);
+    let _pool_imp = fx.imp("impl<'a> Pool<'a> for MyPool { type Cx = Cx; }", 0, pool_ty, Some((pool_tr, &[])), &[("Cx", cx_ty)], vec![]);
+
+    let arg_tup_decl = fx.tuple(&[ref_self_cx, mut_buf]);
+    let arg_decl_list = fx.list(&[arg_tup_decl]);
+    let ex_fn_decl = fx.ty(PNode::ExTrait(fn_tr, arg_decl_list));
+    let ex_out_decl = fx.ty(PNode::ExProj { trait_: fn_once, name: Name::of("Output"), args: arg_decl_list, term: unit });
+    let dyn_decl_preds = fx.list(&[ex_fn_decl, ex_out_decl]);
+    let dyn_decl = fx.ty(PNode::Dynamic(dyn_decl_preds));
+    let ref_dyn_decl = fx.r(Mutbl::Not, dyn_decl);
+
+    let b_pool = fx.bound(pool_tr, &[p0]);
+    let ref_p0 = fx.r(Mutbl::Not, p0);
+    let run_fn = fx.func("run_pool", 1, &[ref_p0, ref_dyn_decl], unit, vec![b_pool]);
+    let tie_buf_a = fx.func("tie_buf_a", 0, &[ref_pool, mut_buf], unit, vec![]);
+    let tie_cx_a = fx.func("tie_cx_a", 0, &[ref_pool, ref_cx], unit, vec![]);
+    let owner = fx.func("owner", 0, &[ref_pool], unit, vec![]);
+    fx.finish();
+
+    let late1_0 = Region::Late { binder: 1, var: 0 };
+    let late1_1 = Region::Late { binder: 1, var: 1 };
+
+    let mut decls = Decls::new();
+    decls.adt(cx_k, 0);
+    decls.adt(buf_k, 1);
+    decls.adt(pool_k, 0);
+    decls.trait_(pool_tr, 1);
+    decls.alias(pool_tr, "Cx", 1);
+    decls.trait_(fn_tr, 0);
+    decls.trait_(fn_mut, 0);
+    decls.trait_(fn_once, 0);
+    decls.alias(fn_once, "Output", 0);
+
+    // `run_pool<'a, 'r, 'o, P: Pool<'a>>(&'r P, &'r (dyn for<'c, 'b> Fn(&'c <P as Pool<'a>>::Cx, &'b mut Buf<'a>) + 'o))`
+    // Note: `<P as Pool<'a>>::Cx` adds 1 slot (`P0`) in the declared sig (8 predicate slots inside `dyn`),
+    // while in the body `Cx` has 0 slots (6 predicate slots inside `dyn`)!
+    decls.func(
+        run_fn,
+        FnHead {
+            lifetimes: 3,
+            late: &[1, 2],
+            outlives: &[],
+            inputs: &[ref_p0, ref_dyn_decl],
+            output: unit,
+            slots: &[P1, P1, P2, late1_0, P0, late1_1, P0, late1_0, P0, late1_1, P0],
+        },
+    );
+    // `tie_buf_a<'a, 'b>(_: &'a MyPool, _: &'b mut Buf<'a>)` (forces `Buf`'s lifetime to equal `'a`!)
+    decls.func(tie_buf_a, FnHead { lifetimes: 2, late: &[1], outlives: &[], inputs: &[ref_pool, mut_buf], output: unit, slots: &[P0, P1, P0] });
+    // `tie_cx_a<'a>(_: &'a MyPool, _: &'a Cx)` where `Cx` must outlive `'a` — wait: `&'a Cx` is
+    // covariant so both inputs could shorten to a common shorter `'x` unless `'a` is invariant!
+    // Use `fn tie_cx_static(_: &'static Cx)` for the negative so late-bound `&Cx` MUST fail `'late: 'static`.
+    decls.func(tie_cx_a, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ref_pool, ref_cx], output: unit, slots: &[P0, Region::Static] });
+    decls.func(owner, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[ref_pool], output: unit, slots: &[P0] });
+
+    let mut facts = UnsizeFacts::new();
+    facts.adts.push((cx_k, 0, false));
+    facts.adts.push((buf_k, 1, false));
+    facts.adts.push((pool_k, 0, false));
+    facts.traits.push((pool_tr, 1));
+    facts.aliases.push((pool_tr, Name::of("Cx"), 1));
+    facts.traits.push((fn_tr, 0));
+    facts.traits.push((fn_mut, 0));
+    facts.traits.push((fn_once, 0));
+    facts.aliases.push((fn_once, Name::of("Output"), 0));
+    facts.fn_traits = [Some(fn_tr), Some(fn_mut), Some(fn_once)];
+
+    for use_cx_bad in [false, true] {
+        let mut b = Bb::new();
+        let p_pool = b.param("pool");
+        let p_cx = b.bind("cx");
+        let p_buf = b.bind("buf");
+        let body = if use_cx_bad {
+            let f = b.path(&["tie_cx_a"]);
+            let lp = b.local(p_pool);
+            let l = b.local(p_cx);
+            b.call(f, &[lp, l])
+        } else {
+            let f = b.path(&["tie_buf_a"]);
+            let lp = b.local(p_pool);
+            let l = b.local(p_buf);
+            b.call(f, &[lp, l])
+        };
+        let cl = b.closure(&[p_cx, p_buf], body);
+        let r_cl = b.borrow(Mutbl::Not, cl);
+        let l_pool = b.local(p_pool);
+        let f_run = b.path(&["run_pool"]);
+        let call_run = b.call(f_run, &[l_pool, r_cl]);
+        let st = b.semi(call_run);
+        let root = b.block(&[st], None);
+
+        let view = b.view(owner, root);
+        let mut ck = region_fixture::checked(&fx, &view);
+        let regions = decls.lay(fx.t.view(), &mut ck.types);
+        let with = region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = lower_closure_external(&view, &ck, cl, &with, region_fixture::alloc()).expect("lower closure");
+        let rep = blaze_flow::check(&cf.lowered.flow, region_fixture::alloc()).expect("check");
+        if use_cx_bad {
+            assert!(
+                rep.borrows.iter().any(|f| matches!(
+                    *f,
+                    blaze_flow::BorrowFinding::UnprovenOutlives { from, into, .. }
+                        if requirement(&cf.externals, from, into).is_none()
+                )),
+                "NEGATIVE: passing late-bound `&Cx` as `&'static Cx` MUST fail borrow check inside closure: {:?}",
+                rep.borrows
+            );
+        } else {
+            assert!(
+                cf.externals.iter().any(|&(_, w)| w == External::SigOwner(0)),
+                "POSITIVE: `Buf<'_>` matched to `dyn Fn(&Self::Cx, &mut Buf<'a>)` must receive External::SigOwner(0): {:?}",
+                cf.externals
+            );
+            assert!(
+                rep.moves.is_empty()
+                    && rep.borrows.iter().all(|f| matches!(
+                        *f,
+                        blaze_flow::BorrowFinding::UnprovenOutlives { from, into, .. }
+                            if requirement(&cf.externals, from, into).is_some()
+                    )),
+                "POSITIVE: `&mut Buf<'_>` tied to `pool: &'a MyPool` must have zero un-exportable borrow errors: moves={:?} borrows={:?} externals={:?}",
+                rep.moves,
+                rep.borrows,
+                cf.externals
+            );
+        }
+    }
+}
+
+/// `crates/blaze-cli/src/test_drive.rs::ask` shape:
+/// `Pin<Box<async move { mk_out(runs, heap) }>>` coerced to `Pin<Box<dyn Future<Output = Out<'static>> + 'b>>`
+/// where `runs: &'b R` and `heap: &'static H`.
+/// - POSITIVE: `async move` captures `(&'b R, &'static H)` and produces `Out<'static>` ->
+///   passes cleanly with `coarse.is_none()` (no `ValueInexact` and no false `'b: 'static`!).
+/// - NEGATIVE 1: `async move` produces `Out<'b>` (output tied to `runs`) coerced to `Output = Out<'static>` ->
+///   MUST fail borrow check (`UnprovenOutlives`).
+/// - NEGATIVE 2: `async move` capturing `runs: &'b R` coerced to `dyn Future<Output = Out<'static>> + 'static` ->
+///   MUST fail borrow check (`UnprovenOutlives` for `'b: 'static`).
+#[test]
+fn unsize_pin_box_async_move_separates_captures_from_output() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(LangItem::Sized, sized);
+    let unsize = fx.tr("Unsize", 2, vec![], &[]);
+    fx.lang(LangItem::Unsize, unsize);
+    let coerce_unsized = fx.tr("CoerceUnsized", 2, vec![], &[]);
+    fx.lang(LangItem::CoerceUnsized, coerce_unsized);
+    let fut_tr = fx.tr("Future", 1, vec![], &["Output"]);
+    fx.lang(LangItem::Future, fut_tr);
+
+    let r_k = fx.strukt("R", 0, &[]);
+    let h_k = fx.strukt("H", 0, &[]);
+    let out_k = fx.strukt("Out", 0, &[]);
+    let r_ty = fx.adt(r_k, &[]);
+    let h_ty = fx.adt(h_k, &[]);
+    let out_ty = fx.adt(out_k, &[]);
+    let ref_r = fx.r(Mutbl::Not, r_ty);
+    let ref_h = fx.r(Mutbl::Not, h_ty);
+
+    let p0 = fx.param(0);
+    let p1 = fx.param(1);
+    let box_k = fx.strukt("MyBox", 1, &[]);
+    let pin_k = fx.strukt("MyPin", 1, &[]);
+    let box_p0 = fx.adt(box_k, &[p0]);
+    let box_p1 = fx.adt(box_k, &[p1]);
+    let pin_p0 = fx.adt(pin_k, &[p0]);
+    let pin_p1 = fx.adt(pin_k, &[p1]);
+
+    let b_unsize = fx.bound(unsize, &[p0, p1]);
+    let box_coerce = fx.imp("impl<T, U> CoerceUnsized<MyBox<U>> for MyBox<T> where T: Unsize<U>", 2, box_p0, Some((coerce_unsized, &[box_p1])), &[], vec![b_unsize]);
+    fx.unsized_param(box_coerce, 0);
+    fx.unsized_param(box_coerce, 1);
+    let b_coerce = fx.bound(coerce_unsized, &[p0, p1]);
+    let _pin_coerce = fx.imp("impl<P, Q> CoerceUnsized<MyPin<Q>> for MyPin<P> where P: CoerceUnsized<Q>", 2, pin_p0, Some((coerce_unsized, &[pin_p1])), &[], vec![b_coerce]);
+
+    let ex_fut = fx.ty(PNode::ExTrait(fut_tr, List::EMPTY));
+    let ex_out = fx.ty(PNode::ExProj { trait_: fut_tr, name: Name::of("Output"), args: List::EMPTY, term: out_ty });
+    let dyn_fut_preds = fx.list(&[ex_fut, ex_out]);
+    let dyn_fut = fx.ty(PNode::Dynamic(dyn_fut_preds));
+    let box_dyn_fut = fx.adt(box_k, &[dyn_fut]);
+    let pin_box_dyn = fx.adt(pin_k, &[box_dyn_fut]);
+    let pin_box_p0 = fx.adt(pin_k, &[box_p0]);
+
+    let pin_box = fx.func("pin_box", 1, &[p0], pin_box_p0, vec![]);
+    let mk_out_static = fx.func("mk_out_static", 0, &[ref_r, ref_h], out_ty, vec![]);
+    let mk_out_from_r = fx.func("mk_out_from_r", 0, &[ref_r, ref_h], out_ty, vec![]);
+    let fn_ok = fx.func("ask_ok", 0, &[ref_r, ref_h], pin_box_dyn, vec![]);
+    let fn_bad_out = fx.func("ask_bad_out", 0, &[ref_r, ref_h], pin_box_dyn, vec![]);
+    let fn_bad_obj = fx.func("ask_bad_obj", 0, &[ref_r, ref_h], pin_box_dyn, vec![]);
+    fx.finish();
+
+    let mut decls = Decls::new();
+    decls.adt(r_k, 0);
+    decls.adt(h_k, 0);
+    decls.adt(out_k, 1);
+    decls.adt(box_k, 0);
+    decls.adt(pin_k, 0);
+    decls.trait_(fut_tr, 0);
+    decls.alias(fut_tr, "Output", 0);
+
+    decls.func(pin_box, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[p0], output: pin_box_p0, slots: &[] });
+    // `mk_out_static<'b, 'h>(_: &'b R, _: &'h H) -> Out<'h>`
+    decls.func(mk_out_static, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[ref_r, ref_h], output: out_ty, slots: &[P0, P1, P1] });
+    // `mk_out_from_r<'b, 'h>(_: &'b R, _: &'h H) -> Out<'b>`
+    decls.func(mk_out_from_r, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[ref_r, ref_h], output: out_ty, slots: &[P0, P1, P0] });
+    // `ask_ok<'b>(runs: &'b R, heap: &'static H) -> MyPin<MyBox<dyn Future<Output = Out<'static>> + 'b>>`
+    decls.func(fn_ok, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[ref_r, ref_h], output: pin_box_dyn, slots: &[P0, Region::Static, P0, Region::Static] });
+    // `ask_bad_out<'b>(runs: &'b R, heap: &'static H) -> MyPin<MyBox<dyn Future<Output = Out<'static>> + 'b>>`
+    decls.func(fn_bad_out, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[ref_r, ref_h], output: pin_box_dyn, slots: &[P0, Region::Static, P0, Region::Static] });
+    // `ask_bad_obj<'b>(runs: &'b R, heap: &'static H) -> MyPin<MyBox<dyn Future<Output = Out<'static>> + 'static>>`
+    decls.func(fn_bad_obj, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[ref_r, ref_h], output: pin_box_dyn, slots: &[P0, Region::Static, Region::Static, Region::Static] });
+
+    let run = |owner: ItemKey, tie_out_to_runs: bool| {
+        let mut b = Bb::new();
+        let p_r = b.param("runs");
+        let p_h = b.param("heap");
+        let l_r = b.local(p_r);
+        let l_h = b.local(p_h);
+        let f_mk = b.path(&[if tie_out_to_runs { "mk_out_from_r" } else { "mk_out_static" }]);
+        let call_mk = b.call(f_mk, &[l_r, l_h]);
+        let ab = b.async_block(call_mk, blaze_typeck::Capture::Move);
+        let f_pb = b.path(&["pin_box"]);
+        let pinned = b.call(f_pb, &[ab]);
+        let root = b.block(&[], Some(pinned));
+
+        let view = b.view(owner, root);
+        let mut ck = region_fixture::checked(&fx, &view);
+        let regions = decls.lay(fx.t.view(), &mut ck.types);
+
+        let mut facts = UnsizeFacts::new();
+        facts.adts.push((r_k, 0, false));
+        facts.adts.push((h_k, 0, false));
+        facts.adts.push((out_k, 1, false));
+        facts.adts.push((box_k, 0, false));
+        facts.adts.push((pin_k, 0, false));
+        facts.traits.push((fut_tr, 0));
+        facts.aliases.push((fut_tr, Name::of("Output"), 0));
+        facts.future_trait = Some(fut_tr);
+        facts.async_bodies_checked = true;
+        // First lower the async block itself to harvest its exact `Capture(k) -> Sig(0)` requirements,
+        // mirroring `front2/borrows_nested.rs`!
+        let with0 = region_fixture::WithRegions { base: &facts, regions: &regions };
+        let af = crate::lower_async(&view, &ck, ab, &with0, region_fixture::alloc()).expect("lower async");
+        let arep = blaze_flow::check(&af.flow, region_fixture::alloc()).expect("check async");
+        let mut reqs = vec::Vec::new();
+        for f in arep.borrows.iter() {
+            if let blaze_flow::BorrowFinding::UnprovenOutlives { from, into, .. } = *f {
+                if let Some(req) = requirement(&af.externals, from, into) {
+                    reqs.push(req);
+                }
+            }
+        }
+        facts.closure_reqs.push((ab, reqs));
+        let with = region_fixture::WithRegions { base: &facts, regions: &regions };
+        let lowered = crate::lower(&view, &ck, &with, region_fixture::alloc()).expect("lower owner");
+        let rep = blaze_flow::check(&lowered.flow, region_fixture::alloc()).expect("check owner");
+        (lowered.coarse, rep.borrows.len(), rep.moves.len())
+    };
+
+    let (ok_coarse, ok_b, ok_m) = run(fn_ok, false);
+    assert!(ok_coarse.is_none(), "POSITIVE: Pin<Box<async move>> must not record coarse ValueInexact: {ok_coarse:?}");
+    assert_eq!((ok_b, ok_m), (0, 0), "POSITIVE: `ask_ok` must pass cleanly without false `'b: 'static`");
+
+    let (_, bad_out_b, _) = run(fn_bad_out, true);
+    assert!(bad_out_b > 0, "NEGATIVE 1: async move returning `Out<'b>` as `Output = Out<'static>` MUST fail borrow check");
+
+    let (_, bad_obj_b, _) = run(fn_bad_obj, false);
+    assert!(bad_obj_b > 0, "NEGATIVE 2: async move capturing `&'b R` as `+ 'static` MUST fail borrow check");
 }

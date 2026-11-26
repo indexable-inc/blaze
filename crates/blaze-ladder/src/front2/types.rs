@@ -3846,6 +3846,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 // written, each an elided lifetime of this position (`fn f(x: R)`, the
                 // position's elision rule decides it, as for an ADT's), made where first used.
                 let laid = self.heads.alias_slots(found.key);
+                let alias_want = laid.map(|l| l.lifetimes).or_else(|| self.resolver.names.declared_lifetimes(found.key));
                 let mut given: Vec<Option<SlotKind>, Alloc<'s>> = Vec::new_in(alloc);
                 match laid {
                     Some(l) if lifetimes.is_empty() => given.resize(l.lifetimes as usize, None),
@@ -3879,7 +3880,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 i,
                                 raw_default,
                                 sub,
-                                DefaultOwner::Alias,
+                                DefaultOwner::Alias { want: alias_want },
                                 &mut item_lts,
                                 (pool, index),
                                 (&def_pool, &def_index),
@@ -3915,10 +3916,15 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         match index.get(i as usize) {
                             Some(&(start, len, b)) => {
                                 for &slot in &pool[start as usize..(start + len) as usize] {
-                                    if let SlotKind::ObjectDefault(oat) = slot.kind {
-                                        return Ok(Err(RegionRefusal::ObjectDefault { at: oat }));
-                                    }
-                                    s.scratch.push(slot.shifted(binders));
+                                    let slot = match slot.kind {
+                                        // A trait object argument of a type alias with no lifetime
+                                        // parameter (`type Arc<T> = alloc::sync::Arc<T>; Arc<dyn Tr>`):
+                                        // `'static` (the Reference, "Default trait object lifetimes").
+                                        SlotKind::ObjectDefault(_) if alias_want == Some(0) => Slot::quiet(SlotKind::Static),
+                                        SlotKind::ObjectDefault(oat) => return Ok(Err(RegionRefusal::ObjectDefault { at: oat })),
+                                        _ => slot.shifted(binders),
+                                    };
+                                    s.scratch.push(slot);
                                 }
                                 binders += b;
                             }
@@ -3928,7 +3934,12 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             {
                                 Some(&(start, len, b)) => {
                                     for &slot in &def_pool[start as usize..(start + len) as usize] {
-                                        s.scratch.push(slot.shifted(binders));
+                                        let slot = match slot.kind {
+                                            SlotKind::ObjectDefault(_) if alias_want == Some(0) => Slot::quiet(SlotKind::Static),
+                                            SlotKind::ObjectDefault(oat) => return Ok(Err(RegionRefusal::ObjectDefault { at: oat })),
+                                            _ => slot.shifted(binders),
+                                        };
+                                        s.scratch.push(slot);
                                     }
                                     binders += b;
                                 }
@@ -4044,7 +4055,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     {
                         for &slot in slice {
                             let slot = match (slot.kind, owner) {
-                                (SlotKind::ObjectDefault(_), DefaultOwner::Adt { want: 0 }) => Slot::quiet(SlotKind::Static),
+                                (SlotKind::ObjectDefault(_), DefaultOwner::Adt { want: 0 } | DefaultOwner::Alias { want: Some(0) }) => {
+                                    Slot::quiet(SlotKind::Static)
+                                }
                                 (SlotKind::ObjectDefault(oat), _) => return Ok(Err(RegionRefusal::ObjectDefault { at: oat })),
                                 _ => Slot::quiet(slot.shifted(db).kind),
                             };
@@ -4148,7 +4161,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     };
                     for &slot in slice {
                         let slot = match (slot.kind, owner) {
-                            (SlotKind::ObjectDefault(_), DefaultOwner::Adt { want: 0 }) => Slot::quiet(SlotKind::Static),
+                            (SlotKind::ObjectDefault(_), DefaultOwner::Adt { want: 0 } | DefaultOwner::Alias { want: Some(0) }) => {
+                                Slot::quiet(SlotKind::Static)
+                            }
                             (SlotKind::ObjectDefault(oat), _) => return Ok(Err(RegionRefusal::ObjectDefault { at: oat })),
                             _ => Slot::quiet(slot.shifted(db).kind),
                         };
@@ -4179,9 +4194,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 None => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r))),
                             },
                             SlotKind::ObjectDefault(_) => match owner {
-                                DefaultOwner::Adt { want: 0 } => Slot::quiet(SlotKind::Static),
+                                DefaultOwner::Adt { want: 0 } | DefaultOwner::Alias { want: Some(0) } => Slot::quiet(SlotKind::Static),
                                 DefaultOwner::Adt { .. } => return Ok(Err(RegionRefusal::ObjectDefault { at: r })),
-                                DefaultOwner::Alias => Slot::quiet(SlotKind::ObjectDefault(r)),
+                                DefaultOwner::Alias { .. } => Slot::quiet(SlotKind::ObjectDefault(r)),
                             },
                             SlotKind::Elided(_) | SlotKind::Bound(_) | SlotKind::Given(_) => {
                                 return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
@@ -4852,13 +4867,12 @@ fn push_dyn_node_own_slots(
     true
 }
 
-/// Whether a defaulted type argument belongs to an ADT (where a `dyn Trait` object default
-/// resolves to `'static` when the ADT declares no lifetime) or a type alias (where an object
-/// default stays unresolved for the enclosing context).
+/// Whether a defaulted type argument belongs to an ADT or a type alias (in both, a `dyn Trait`
+/// object default resolves to `'static` when the item declares no lifetime).
 #[derive(Clone, Copy)]
 enum DefaultOwner {
     Adt { want: u32 },
-    Alias,
+    Alias { want: Option<u32> },
 }
 
 /// How an item's declared lifetimes are supplied when substituting into a defaulted type argument.

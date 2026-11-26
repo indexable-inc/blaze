@@ -409,6 +409,11 @@ pub trait Facts {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is the compiler's `TryAsDynCompatible` lang trait (`lang("try_as_dyn")`),
+    /// forwarded to `blaze_borrow::Selected::is_try_as_dyn_trait`.
+    fn is_try_as_dyn_trait(&self, _trait_: ItemKey) -> bool {
+        false
+    }
     /// Whether `trait_` is `core::future::IntoFuture`.
     fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
         let _ = trait_;
@@ -501,6 +506,14 @@ pub trait Facts {
     /// `PhantomData<&'a T>`), `[true]` for `Option<T>`. Read only when
     /// [`AdtFacts::needs_drop`] is `false`. `None`: every argument may be dropped.
     fn drop_args(&self, _adt: ItemKey) -> Option<&[bool]> {
+        None
+    }
+    /// Whether the instantiated type `ty` (in the body's own `PTys` table) actually needs drop,
+    /// overriding an ADT's uninstantiated structural `needs_drop: true` (e.g. `Flatten<I>` or
+    /// `Split<'a, P>` whose generic `PNode::Alias` field resolves to a non-dropping type at this
+    /// concrete instantiation). Only consulted when `f.needs_drop && !f.drop_impl`.
+    /// `None`: conservative (falls back to `true`).
+    fn inst_needs_drop(&self, _ty: PTy) -> Option<bool> {
         None
     }
     /// For each generic argument of `adt`, whether dropping `adt` may directly inspect arbitrary
@@ -1266,6 +1279,8 @@ struct PInfo {
     exact: bool,
     /// 0: not a deref; 1: deref of a shared reference; 2: of a mutable one; 3: of a raw pointer.
     deref: u8,
+    /// 0: not a union field projection; 1: union field of a non-`Drop` union; 2: of a `Drop` union.
+    union_field: u8,
     parent: u32,
     local: u32,
 }
@@ -2082,10 +2097,16 @@ pub fn pty_needs_drop<'a, 'c, F: Facts, A: Allocator + Copy, E>(
             PNode::Adt(k, l) => {
                 let f = walk.facts.adt(k).ok_or_else(|| on_err(DropWalkError::UnknownAdt))?;
                 if f.needs_drop {
+                    if !f.drop_impl && walk.facts.inst_needs_drop(t) == Some(false) {
+                        continue;
+                    }
                     if let Some(rc) = walk.drop_memo.get(root_ix) {
                         rc.set(2);
                     }
                     return Ok(true);
+                }
+                if f.union && !f.drop_impl {
+                    continue;
                 }
                 let s = list(l).ok_or_else(|| on_err(DropWalkError::Malformed))?;
                 match walk.facts.drop_args(k) {
@@ -2685,7 +2706,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // "Async blocks": "Async blocks capture variables from their environment using
                 // the same capture modes as closures"): one position per capture by
                 // reference, then the captured type's own.
-                PNode::Future(fe, _, _) => {
+                PNode::Future(fe, out, _) => {
+                    if <R::Grain as grain::Grain>::SLOTS {
+                        stack.push(out);
+                    }
                     let ck: &'c Checked<'c> = self.ck;
                     for f in ck.env_fields_by::<blaze_typeck::Places>(fe) {
                         if f.how != blaze_typeck::CaptureKind::ByValue {
@@ -2815,7 +2839,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let caps = at - ci.start;
         let nsig = match self.closure_row(e) {
             Some(row) => self.owner_sig_count(row, e)?,
-            None => 0,
+            None => match self.node(ty.ty, e)? {
+                PNode::Future(_, out, _) if <R::Grain as grain::Grain>::SLOTS => self.npos(out, e)?,
+                _ => 0,
+            },
         };
         if at + nsig != ci.start + ci.len {
             return self.refuse(Form::Malformed, e);
@@ -2982,7 +3009,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     fn ensure_pinfo(&mut self, p: Place, info: PInfo) {
         let i = p.0 as usize;
         if self.pinfo.len() <= i {
-            self.pinfo.resize(i + 1, PInfo { start: 0, len: 0, exact: true, deref: 0, parent: u32::MAX, local: 0 });
+            self.pinfo.resize(i + 1, PInfo { start: 0, len: 0, exact: true, deref: 0, union_field: 0, parent: u32::MAX, local: 0 });
         }
         self.pinfo[i] = info;
     }
@@ -3084,7 +3111,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::Full));
                         }
-                    } else if mode == DropMode::None || af.union {
+                    } else if mode == DropMode::None
+                        || af.union
+                        || (af.needs_drop && !af.drop_impl && self.facts.inst_needs_drop(ty) == Some(false))
+                    {
                         for &x in args.iter().rev() {
                             todo.push(Step::Ty(x, DropMode::None));
                         }
@@ -3269,7 +3299,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         self.local_ty[i] = t;
         self.local_origs[i] = (start, n);
         let p = self.b.local(l.0);
-        self.ensure_pinfo(p, PInfo { start, len: n, exact: true, deref: 0, parent: u32::MAX, local: l.0 });
+        self.ensure_pinfo(p, PInfo { start, len: n, exact: true, deref: 0, union_field: 0, parent: u32::MAX, local: l.0 });
     }
 
     fn temp(&mut self, t: TyD, e: ExprId) -> Result<Local, Refusal> {
@@ -3308,7 +3338,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         };
         let p = self.b.project_in(parent, proj, mark);
         let pi = self.info(parent);
-        let mut info = PInfo { start: pi.start, len: pi.len, exact: false, deref: 0, parent: parent.0, local: pi.local };
+        let union_field = if parent_ty.wrap.is_none()
+            && let (Proj::Subslice { from, to, from_end: false }, PNode::Adt(k, _)) = (proj, self.node(parent_ty.ty, e)?)
+            && from == to
+            && let f = self.adt_facts(k, e)?
+            && f.union
+        {
+            if f.drop_impl { 2 } else { 1 }
+        } else {
+            0
+        };
+        let mut info = PInfo { start: pi.start, len: pi.len, exact: false, deref: 0, union_field, parent: parent.0, local: pi.local };
         if pi.exact {
             match (proj, parent_ty.wrap) {
                 (Proj::Deref, Some(m)) => {
@@ -3321,11 +3361,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         info = PInfo { start: pi.start + 1, len, exact: true, deref: if m == Mutbl::Mut { 2 } else { 1 }, ..info };
                     }
                     (Proj::Deref, PNode::Ptr(..)) => {
-                        info = PInfo { start: pi.start, len: 0, exact: true, deref: 3, ..info };
+                        let len = self.npos_d(child, e)?;
+                        info = PInfo { start: pi.start, len, exact: len == pi.len, deref: 3, ..info };
                     }
                     (Proj::DerefBox, _) | (Proj::Index, _) => {
                         let len = self.npos_d(child, e)?;
                         info = PInfo { start: pi.start, len, exact: true, ..info };
+                    }
+                    (Proj::ConstantIndex { .. } | Proj::Subslice { .. }, PNode::Array(..) | PNode::Slice(_)) => {
+                        let len = self.npos_d(child, e)?;
+                        info = PInfo { start: pi.start, len, exact: len == pi.len, ..info };
                     }
                     (Proj::Field(i), PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l)) => {
                         let elems = self.list(l, e)?;
@@ -3354,6 +3399,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                             && let Some((start, len)) = self.field_slot(pi, parent_ty.ty, variant, i, child, e)?
                         {
                             info = PInfo { start, len, exact: true, ..info };
+                        }
+                    }
+                    // A field of a `union` (`Proj::Subslice { from: i, to: i, from_end: false }`
+                    // so distinct union fields overlap in `blaze-flow::loans::overlap` while
+                    // distinct subfields of the same union field stay disjoint): exact origins
+                    // come from `Facts::field_regions`, or 0 when the field type carries none.
+                    (Proj::Subslice { from: i, to, from_end: false }, PNode::Adt(..)) if union_field != 0 && to == i => {
+                        if let Some((start, len)) = self.field_slot(pi, parent_ty.ty, 0, i, child, e)? {
+                            info = PInfo { start, len, exact: true, ..info };
+                        } else if self.npos_d(child, e)? == 0 {
+                            info = PInfo { start: pi.start, len: 0, exact: true, ..info };
                         }
                     }
                     _ => {}
@@ -3579,7 +3635,30 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 if self.plant == Plant::AllCopy || self.is_copy(v.ty, e)? {
                     Operand::Copy(p)
                 } else {
-                    Operand::Move(p)
+                    // Moving a non-`Copy` field out of a `union` moves the whole union place
+                    // (so reading any overlapping sibling field afterwards is `UseOfMoved`,
+                    // E0382); moving a field out of a `Drop` union is forbidden (E0509).
+                    let mut cur = p;
+                    let mut move_p = p;
+                    let mut steps = 0u32;
+                    loop {
+                        let pi = self.info(cur);
+                        if pi.deref != 0 || pi.parent == u32::MAX {
+                            break;
+                        }
+                        if pi.union_field == 2 {
+                            return self.refuse(Form::Union, e);
+                        }
+                        if pi.union_field == 1 {
+                            move_p = Place(pi.parent);
+                        }
+                        cur = Place(pi.parent);
+                        steps += 1;
+                        if steps > MOST_POSITIONS {
+                            return self.refuse(Form::Bound, e);
+                        }
+                    }
+                    Operand::Move(move_p)
                 }
             }
         })
@@ -3667,7 +3746,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         if vs.len() as u32 != pi.len {
                             return this.refuse(Form::Malformed, e);
                         }
-                        if kind != BorrowKind::Shared {
+                        if kind != BorrowKind::Shared || this.plant == Plant::NoVariance {
                             for v in vs.iter_mut() {
                                 *v = Variance::In;
                             }
@@ -3711,6 +3790,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     let r = self.origs[up.start as usize];
                     self.b.subset(r, o);
                     if !up.exact {
+                        if up.len > 1 {
+                            self.coarse_step(Form::Unified { why: Unified::ValueInexact }, e);
+                        }
                         for k in up.start + 1..up.start + up.len {
                             let x = self.origs[k as usize];
                             self.b.subset(x, o);
@@ -6481,57 +6563,152 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(UnsizeDone::Fallback);
         }
         let facts: &'b F = self.facts;
-        // Peel either `&T -> &dyn ...` (`ref_skip = 1`) or `Box<T> -> Box<dyn ...>` (`ref_skip = 0`,
-        // with zero lifetimes on `Box` and zero slots on its allocator parameter).
-        let (ref_skip, from_inner, obj) = if from.wrap.is_some() || matches!(self.node(from.ty, e)?, PNode::Ref(..)) {
-            if s.len == 0 || d.len < 2 {
-                return Ok(UnsizeDone::Fallback);
+        // Peel matching outer `CoerceUnsized` wrappers: `&T -> &dyn ...`, `*const T -> *const dyn ...`,
+        // `Box<T, A> -> Box<dyn ..., A>`, `Pin<Box<T, A>> -> Pin<Box<dyn ..., A>>`, `Pin<&mut T>`,
+        // `Arc<T, A>`, etc. Leading references increment `ref_skip`; trailing identical ADT args
+        // (such as an allocator `&'a Frame` on `Box<T, &'a Frame>`) accumulate in `tail_slots`.
+        let mut ref_skip = 0u32;
+        let mut tail_slots = 0u32;
+        let mut from_cur = from;
+        let mut to_cur = to;
+        for _ in 0..8 {
+            if matches!(to_cur.wrap, None) && matches!(self.node(to_cur.ty, e)?, PNode::Dynamic(_)) {
+                break;
             }
-            let obj = match to.wrap {
-                Some(_) => to.ty,
-                None => match self.node(to.ty, e)? {
-                    PNode::Ref(_, i) => i,
-                    _ => return Ok(UnsizeDone::Fallback),
+            let from_ref = match from_cur.wrap {
+                Some(m) => Some((m, from_cur.ty)),
+                None => match self.node(from_cur.ty, e)? {
+                    PNode::Ref(m, i) => Some((m, i)),
+                    _ => None,
                 },
             };
-            let from_inner = match from.wrap {
-                Some(_) => from.ty,
-                None => match self.node(from.ty, e)? {
-                    PNode::Ref(_, i) => i,
-                    _ => return Ok(UnsizeDone::Fallback),
+            let to_ref = match to_cur.wrap {
+                Some(m) => Some((m, to_cur.ty)),
+                None => match self.node(to_cur.ty, e)? {
+                    PNode::Ref(m, i) => Some((m, i)),
+                    _ => None,
                 },
             };
-            (1u32, from_inner, obj)
-        } else if to.wrap.is_none()
-            && let (PNode::Adt(fk, fl), PNode::Adt(tk, tl)) = (self.node(from.ty, e)?, self.node(to.ty, e)?)
-            && fk == tk
-            && facts.adt(fk).is_some_and(|a| a.is_box && a.lifetimes == 0)
-        {
-            if d.len < 1 {
-                return Ok(UnsizeDone::Fallback);
+            if let (Some((fm, fi)), Some((tm, ti))) = (from_ref, to_ref)
+                && fm == tm
+                && tail_slots == 0
+            {
+                ref_skip += 1;
+                from_cur = TyD::of(fi);
+                to_cur = TyD::of(ti);
+                continue;
             }
-            let (flist, tlist) = (self.list(fl, e)?, self.list(tl, e)?);
-            let (Some(&fi), Some(&ti)) = (flist.first(), tlist.first()) else {
-                return Ok(UnsizeDone::Fallback);
-            };
-            if flist.len() != tlist.len() || flist[1..].iter().any(|&a| self.npos(a, e).unwrap_or(1) != 0) {
-                return Ok(UnsizeDone::Fallback);
+            if from_cur.wrap.is_none()
+                && to_cur.wrap.is_none()
+                && let (PNode::Ptr(fm, fi), PNode::Ptr(tm, ti)) = (self.node(from_cur.ty, e)?, self.node(to_cur.ty, e)?)
+                && fm == tm
+            {
+                from_cur = TyD::of(fi);
+                to_cur = TyD::of(ti);
+                continue;
             }
-            (0u32, fi, ti)
-        } else if from.wrap.is_none()
-            && to.wrap.is_none()
-            && let (PNode::Ptr(_, fi), PNode::Ptr(_, ti)) = (self.node(from.ty, e)?, self.node(to.ty, e)?)
-        {
-            if d.len < 1 {
-                return Ok(UnsizeDone::Fallback);
+            if from_cur.wrap.is_none()
+                && to_cur.wrap.is_none()
+                && let (PNode::Adt(fk, fl), PNode::Adt(tk, tl)) = (self.node(from_cur.ty, e)?, self.node(to_cur.ty, e)?)
+                && fk == tk
+                && facts.adt(fk).is_some_and(|a| a.lifetimes == 0)
+            {
+                let (flist, tlist) = (self.list(fl, e)?, self.list(tl, e)?);
+                let (Some(&fi), Some(&ti)) = (flist.first(), tlist.first()) else {
+                    return Ok(UnsizeDone::Fallback);
+                };
+                if flist.len() != tlist.len() || flist[1..] != tlist[1..] {
+                    return Ok(UnsizeDone::Fallback);
+                }
+                for &a in &flist[1..] {
+                    tail_slots += self.npos(a, e)?;
+                }
+                from_cur = TyD::of(fi);
+                to_cur = TyD::of(ti);
+                continue;
             }
-            (0u32, fi, ti)
-        } else {
             return Ok(UnsizeDone::Fallback);
-        };
+        }
+        if from_cur.wrap.is_some()
+            || to_cur.wrap.is_some()
+            || s.len < ref_skip + tail_slots
+            || d.len < ref_skip + 1 + tail_slots
+        {
+            return Ok(UnsizeDone::Fallback);
+        }
+        let (from_inner, obj) = (from_cur.ty, to_cur.ty);
         let PNode::Dynamic(preds) = self.node(obj, e)? else {
             return Ok(UnsizeDone::Fallback);
         };
+        let s_inner_len = s.len - ref_skip - tail_slots;
+        let d_inner_end = d.len - tail_slots;
+        let relate_wrappers = |this: &mut Self| {
+            for k in 0..ref_skip {
+                let d0 = this.origs[(d.start + k) as usize];
+                this.b.subset(this.origs[(s.start + k) as usize], d0);
+            }
+            let s_tail = s.start + s.len - tail_slots;
+            let d_tail = d.start + d.len - tail_slots;
+            for k in 0..tail_slots {
+                let (a, b) = (this.origs[(s_tail + k) as usize], this.origs[(d_tail + k) as usize]);
+                this.b.subset(a, b);
+                this.b.subset(b, a);
+            }
+        };
+        // Exact async-block `PNode::Future -> dyn Future<Output = T> + 'q` unsizing (e.g.
+        // `Pin<Box<async move { .. }, A>> -> Pin<Box<dyn Future<Output = T> + 'q, A>>`):
+        // only the future's captures outlive `'q` (never forcing unrelated captures to outlive
+        // `Output`'s lifetimes like `'static`), and the future's trailing output slots equate with
+        // `ExProj(Future::Output)`'s term slots.
+        if <R::Grain as grain::Grain>::SLOTS
+            && let PNode::Future(_, out_ty, _) = self.node(from_inner, e)?
+        {
+            let nout = self.npos(out_ty, e)?;
+            if s_inner_len >= nout {
+                let ncap = s_inner_len - nout;
+                let out_name = Name::of("Output");
+                let mut out_ties: Vec<u32, A> = Vec::new_in(self.alloc);
+                let mut dyn_at = ref_skip + 1;
+                let mut ok = true;
+                for &p in self.list(preds, e)? {
+                    let pn = self.npos(p, e)?;
+                    match self.node(p, e)? {
+                        PNode::ExAuto(_) if pn == 0 => {}
+                        PNode::ExTrait(k, args) if facts.is_future_trait(k) && self.list(args, e)?.is_empty() && pn == 0 => {}
+                        PNode::ExProj { trait_: k, name, args, term }
+                            if facts.is_future_trait(k) && name == out_name && self.list(args, e)?.is_empty() && self.npos(term, e)? == nout && pn == nout =>
+                        {
+                            out_ties.push(dyn_at);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    dyn_at += pn;
+                }
+                if ok && dyn_at == d_inner_end {
+                    relate_wrappers(self);
+                    let q = self.origs[(d.start + ref_skip) as usize];
+                    self.emit_outlives_origins(from_inner, s.start + ref_skip, ncap, q, true, e)?;
+                    let mut cap_params: Vec<u32, A> = Vec::new_in(self.alloc);
+                    let _ = self.outlives_components(from_inner, e, &mut cap_params, true)?;
+                    for &u in cap_params.iter() {
+                        let rho = self.param_origin(u);
+                        self.b.subset(rho, q);
+                    }
+                    for &dyn_off in out_ties.iter() {
+                        for k in 0..nout {
+                            let f_orig = self.origs[(s.start + ref_skip + ncap + k) as usize];
+                            let d_orig = self.origs[(d.start + dyn_off + k) as usize];
+                            self.b.subset(f_orig, d_orig);
+                            self.b.subset(d_orig, f_orig);
+                        }
+                    }
+                    return Ok(UnsizeDone::Handled);
+                }
+            }
+        }
         // Exact closure-to-`dyn Fn*(Args) -> Ret + 'q` unsizing (both HRTB and non-HRTB):
         // `'r_src: 'r_dst` (when `&`/`&mut`), every capture slot outlives `'q` (one-way), and every
         // `dyn` `Fn*` / `FnOnce::Output` predicate slot equates with the closure's corresponding
@@ -6543,8 +6720,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             let mut sig_slots: Vec<closure::SigSlot, A> = Vec::new_in(self.alloc);
             if self.sig_slots(ordinal as usize, ce, &mut sig_slots).is_ok() {
                 let nsig = self.owner_sig_count(ordinal as usize, e)?;
-                if s.len >= ref_skip + nsig {
-                    let ncap = s.len - ref_skip - nsig;
+                if s_inner_len >= nsig {
+                    let ncap = s_inner_len - nsig;
                     let out_name = Name::of("Output");
                     // `(dyn_off, sig_base, count)` pairs to equate after validating every predicate.
                     let mut ties: Vec<(u32, usize, u32), A> = Vec::new_in(self.alloc);
@@ -6584,15 +6761,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         }
                         dyn_at += pn;
                     }
-                    if ok && dyn_at == d.len {
-                        if ref_skip == 1 {
-                            let d0 = self.origs[d.start as usize];
-                            self.b.subset(self.origs[s.start as usize], d0);
-                        }
+                    if ok && dyn_at == d_inner_end {
+                        relate_wrappers(self);
                         let q = self.origs[(d.start + ref_skip) as usize];
-                        for j in 0..ncap {
-                            self.b.subset(self.origs[(s.start + ref_skip + j) as usize], q);
-                        }
+                        self.emit_outlives_origins(from_inner, s.start + ref_skip, ncap, q, true, e)?;
                         let mut cap_params: Vec<u32, A> = Vec::new_in(self.alloc);
                         let _ = self.outlives_components(from_inner, e, &mut cap_params, true)?;
                         for &u in cap_params.iter() {
@@ -6629,10 +6801,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             }
         }
-        // Fast path when `dyn Trait + 'q` carries ONLY the object lifetime (`d.len == ref_skip + 1`,
+        // Fast path when `dyn Trait + 'q` carries ONLY the object lifetime (`d_inner_end == ref_skip + 1`,
         // every principal trait declares no lifetimes, and every predicate argument/term holds no
         // lifetime or type parameter).
-        let mut zero_trait_lt = d.len == ref_skip + 1;
+        let mut zero_trait_lt = d_inner_end == ref_skip + 1;
         if zero_trait_lt {
             let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
             for &p in self.list(preds, e)? {
@@ -6664,14 +6836,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         if zero_trait_lt {
-            if ref_skip == 1 {
-                let d0 = self.origs[d.start as usize];
-                self.b.subset(self.origs[s.start as usize], d0);
-            }
+            relate_wrappers(self);
             let q = self.origs[(d.start + ref_skip) as usize];
-            for j in s.start + ref_skip..s.start + s.len {
-                self.b.subset(self.origs[j as usize], q);
-            }
+            self.emit_outlives_origins(from_inner, s.start + ref_skip, s_inner_len, q, false, e)?;
             let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
             let _ = self.outlives_components(from_inner, e, &mut params, true)?;
             for &u in params.iter() {
@@ -6683,9 +6850,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // Exact `dyn Trait<'m, Args..., Assoc = Term> + 'q` unsizing through `blaze-borrow`:
         // proves `from_inner: 'q`, every `ExTrait` and `ExProj` predicate, and all impl
         // where-clauses (including `Fn*` bounds on closures inside ADTs such as `MadeOnce<'n, F>`).
-        if let crate::one_call::UnsizeBorrow::Proven { closures_tied } =
-            self.unsize_via_borrow(s, from_inner, d, obj, preds, ref_skip, e)?
+        let s_sub = PInfo { len: s.len - tail_slots, ..s };
+        let d_sub = PInfo { len: d.len - tail_slots, ..d };
+        if ref_skip <= 1
+            && let crate::one_call::UnsizeBorrow::Proven { closures_tied } =
+                self.unsize_via_borrow(s_sub, from_inner, d_sub, obj, preds, ref_skip, e)?
         {
+            if tail_slots > 0 {
+                let s_tail = s.start + s.len - tail_slots;
+                let d_tail = d.start + d.len - tail_slots;
+                for k in 0..tail_slots {
+                    let (a, b) = (self.origs[(s_tail + k) as usize], self.origs[(d_tail + k) as usize]);
+                    self.b.subset(a, b);
+                    self.b.subset(b, a);
+                }
+            }
             return Ok(if closures_tied { UnsizeDone::ClosureSigTied } else { UnsizeDone::Handled });
         }
         // Sound conservative fallback when an unsizing impl could not be resolved (e.g. no
@@ -6694,20 +6873,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // covariant (`'r: 's`, never coupled to `T`'s inner lifetimes), unify all inner slots of
         // `T` with all slots of `dyn ...` through one hub, and enforce `P: 'q` for caller type
         // parameters.
-        if ref_skip == 1 {
-            let d0 = self.origs[d.start as usize];
-            self.b.subset(self.origs[s.start as usize], d0);
-        }
-        let inner_s = s.len.saturating_sub(ref_skip);
-        let inner_d = d.len.saturating_sub(ref_skip);
+        relate_wrappers(self);
+        let inner_s = s_inner_len;
+        let inner_d = d_inner_end.saturating_sub(ref_skip);
         if inner_s + inner_d > 0 {
             let hub = self.b.origin(false);
-            for j in s.start + ref_skip..s.start + s.len {
+            for j in s.start + ref_skip..s.start + ref_skip + inner_s {
                 let o = self.origs[j as usize];
                 self.b.subset(o, hub);
                 self.b.subset(hub, o);
             }
-            for j in d.start + ref_skip..d.start + d.len {
+            for j in d.start + ref_skip..d.start + d_inner_end {
                 let o = self.origs[j as usize];
                 self.b.subset(o, hub);
                 self.b.subset(hub, o);
@@ -6724,6 +6900,144 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.b.subset(rho, q);
         }
         Ok(UnsizeDone::Handled)
+    }
+
+    /// Emits `origin: target` for every RFC 1214 outlives-component origin of `root` laid in
+    /// `self.origs[start..start + len]` (exact `npos` pre-order): for `dyn Tr + 'o`, only the
+    /// object lifetime `'o` (slot 0) must outlive `target`, NEVER the `dyn`'s higher-ranked
+    /// predicate slots `1..` (which hold rigid `dyn_bound_placeholders`; `blaze-borrow/src/relate.rs`
+    /// "`dyn Tr + 'o: 'r` iff `'o: 'r`"). When `captures_only` is true on a top-level `Closure`,
+    /// only its `len` capture slots are walked (excluding trailing owner-signature slots).
+    fn emit_outlives_origins(
+        &mut self,
+        root: PTy,
+        start: u32,
+        len: u32,
+        target: Origin,
+        captures_only: bool,
+        e: ExprId,
+    ) -> Result<(), Refusal> {
+        if len == 0 {
+            return Ok(());
+        }
+        enum Item {
+            Ty(PTy),
+            Emit(u32),
+            Skip(u32),
+        }
+        let mut stack: Vec<Item, A> = Vec::new_in(self.alloc);
+        stack.push(Item::Ty(root));
+        let mut cursor = start;
+        let end = start + len;
+        let mut steps = 0u32;
+        let mut top = true;
+        while let Some(item) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match item {
+                Item::Emit(n) => {
+                    let hi = cursor.saturating_add(n).min(end);
+                    for idx in cursor..hi {
+                        self.b.subset(self.origs[idx as usize], target);
+                    }
+                    cursor = hi;
+                }
+                Item::Skip(n) => {
+                    cursor = cursor.saturating_add(n).min(end);
+                }
+                Item::Ty(t) => {
+                    let is_top = top;
+                    top = false;
+                    match self.node(t, e)? {
+                        PNode::Ref(_, inner) => {
+                            stack.push(Item::Ty(inner));
+                            stack.push(Item::Emit(1));
+                        }
+                        PNode::Ptr(_, inner) | PNode::Slice(inner) | PNode::Array(inner, _) | PNode::Pat(inner, _) => {
+                            stack.push(Item::Ty(inner));
+                        }
+                        PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                            for &child in self.list(l, e)?.iter().rev() {
+                                stack.push(Item::Ty(child));
+                            }
+                        }
+                        PNode::Adt(k, l) => {
+                            let nl = self.adt_facts(k, e)?.lifetimes;
+                            for &child in self.list(l, e)?.iter().rev() {
+                                stack.push(Item::Ty(child));
+                            }
+                            if nl > 0 {
+                                stack.push(Item::Emit(nl));
+                            }
+                        }
+                        PNode::Dynamic(_) => {
+                            // `dyn Tr + 'o: 'q` iff `'o: 'q`: emit slot 0 (`'o`), skip predicate
+                            // slots `1..` (which may hold higher-ranked `dyn_bound_placeholders`).
+                            let total = self.npos(t, e)?;
+                            if total > 1 {
+                                stack.push(Item::Skip(total - 1));
+                            }
+                            if total > 0 {
+                                stack.push(Item::Emit(1));
+                            }
+                        }
+                        PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                            let ck: &'c Checked<'c> = self.ck;
+                            let Some(&ce) = ck.closures.column::<0>().get(ordinal as usize) else {
+                                return self.refuse(Form::Malformed, e);
+                            };
+                            if !(is_top && captures_only) {
+                                let nsig = self.owner_sig_count(ordinal as usize, e)?;
+                                if nsig > 0 {
+                                    stack.push(Item::Emit(nsig));
+                                }
+                            }
+                            let mut fields: Vec<(bool, PTy), A> = Vec::new_in(self.alloc);
+                            for f in ck.env_fields_by::<blaze_typeck::Places>(ce) {
+                                let Some(ct) = f.place_ty(ck) else {
+                                    return self.refuse(Form::Malformed, e);
+                                };
+                                fields.push((f.how != blaze_typeck::CaptureKind::ByValue, ct));
+                            }
+                            for &(by_ref, ct) in fields.iter().rev() {
+                                stack.push(Item::Ty(ct));
+                                if by_ref {
+                                    stack.push(Item::Emit(1));
+                                }
+                            }
+                        }
+                        PNode::Future(fe, out_ty, _) => {
+                            let ck: &'c Checked<'c> = self.ck;
+                            if !(is_top && captures_only) && <R::Grain as grain::Grain>::SLOTS {
+                                stack.push(Item::Ty(out_ty));
+                            }
+                            let mut fields: Vec<(bool, PTy), A> = Vec::new_in(self.alloc);
+                            for f in ck.env_fields_by::<blaze_typeck::Places>(fe) {
+                                let Some(ct) = f.place_ty(ck) else {
+                                    return self.refuse(Form::Malformed, e);
+                                };
+                                fields.push((f.how != blaze_typeck::CaptureKind::ByValue, ct));
+                            }
+                            for &(by_ref, ct) in fields.iter().rev() {
+                                stack.push(Item::Ty(ct));
+                                if by_ref {
+                                    stack.push(Item::Emit(1));
+                                }
+                            }
+                        }
+                        _ => {
+                            let n = self.npos(t, e)?;
+                            if n > 0 {
+                                stack.push(Item::Emit(n));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether type `t` contains a `PNode::Dynamic` anywhere inside its structural wrappers.
@@ -7137,11 +7451,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if v.ty.wrap.is_some() {
                 return self.refuse(Form::Malformed, e);
             }
-            if let PNode::Adt(k, _) = self.node(v.ty.ty, e)?
-                && self.adt_facts(k, e)?.union
-            {
-                return self.refuse(Form::Union, e);
-            }
             self.vals.push(Val { at: At::Const, ty });
             return Ok(());
         }
@@ -7150,6 +7459,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return self.refuse(Form::Malformed, e);
         }
         let mut field_adt: Option<ItemKey> = None;
+        let mut is_union = false;
         let (idx, drop_type) = match self.node(v.ty.ty, e)? {
             PNode::Tuple(_) => match self.expr(e)? {
                 Expr::TupleField { index, .. } => (index, false),
@@ -7157,9 +7467,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             },
             PNode::Adt(k, _) => {
                 let f = self.adt_facts(k, e)?;
-                if f.union {
-                    return self.refuse(Form::Union, e);
-                }
+                is_union = f.union;
                 field_adt = Some(k);
                 match self.field_of(e) {
                     Some(i) => (i, f.drop_impl),
@@ -7168,7 +7476,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
             _ => return self.refuse(Form::UnknownField, e),
         };
-        let fp = self.project(p, v.ty, Proj::Field(idx), ty, drop_type, e)?;
+        let proj = if is_union {
+            Proj::Subslice { from: idx, to: idx, from_end: false }
+        } else {
+            Proj::Field(idx)
+        };
+        let fp = self.project(p, v.ty, proj, ty, drop_type, e)?;
         if let Some(k) = field_adt {
             let holds_fn = match self.node(ty.ty, e)? {
                 PNode::FnPtr(..) => true,
@@ -7292,10 +7605,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             At::Place(ip) => self.info(ip).len,
             At::Const => 0,
         };
-        let mapped_index = if idx_len == 0
-            && ri.len > 1
+        let mapped_index = if ri.len > 1
             && bi.len > 1
-            && let Some(slots) = self.map_index_output_slots(e, base.ty.ty, idx.ty.ty, bi.len - 1, ri.len - 1)?
+            && let Some(slots) = self.map_index_output_slots(e, base.ty.ty, idx.ty.ty, idx_len > 0, bi.len - 1, ri.len - 1)?
         {
             for (k, slot) in slots.iter().enumerate() {
                 let to_idx = usize::try_from(ri.start).ok().and_then(|s| s.checked_add(1)).and_then(|s| s.checked_add(k));
@@ -8725,8 +9037,49 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     }
                     cur = base;
                 }
+                Expr::Match { scrutinee, arms } => {
+                    let Some(arm_list) = self.body.arms.get(arms.range()) else { return Ok(None) };
+                    let mut live_arm: Option<&blaze_typeck::Arm> = None;
+                    for arm in arm_list.iter() {
+                        if let Ok(bt) = self.expr_ty(arm.body)
+                            && matches!(self.node(bt, e), Ok(PNode::Never))
+                        {
+                            continue;
+                        }
+                        if live_arm.is_some() {
+                            return Ok(None);
+                        }
+                        live_arm = Some(arm);
+                    }
+                    let Some(arm) = live_arm else { return Ok(None) };
+                    // `?` desugaring (`match Try::branch(x) { Continue(v) => v, Break(r) => return .. }`):
+                    // unwrap directly to `x` when `scrutinee` is `Try::branch(x)` (its declared
+                    // output carries no callable of its own and `x`'s ADT args contain `v`'s type).
+                    if let Expr::Local(v) = self.expr(arm.body)?
+                        && self.pat_contains(arm.pat, v)?
+                        && let Expr::Call { args, .. } = self.expr(scrutinee)?
+                        && let Some(&[only]) = self.body.expr_lists.get(args.range())
+                    {
+                        if let Some((callee, _)) = self.callee_of(scrutinee)
+                            && let Ok(sig) = facts.sig(callee)
+                            && let Some(out_slots) = sig.output()
+                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                            && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
+                        {
+                            return Ok(Some((ty, sl, false)));
+                        }
+                        if let (Ok(only_ty), Ok(arm_ty)) = (self.adjusted_ty(only), self.expr_ty(arm.body))
+                            && let Ok(PNode::Adt(_, adt_args)) = self.node(only_ty, e)
+                            && self.list(adt_args, e)?.contains(&arm_ty)
+                        {
+                            cur = only;
+                            continue;
+                        }
+                    }
+                    cur = arm.body;
+                }
                 Expr::Local(p) => {
-                    if let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
+                    if let Some((adt, variant, field)) = self.pat_field_source(p)?
                         && let Ok(col) = facts.regions().field(adt, variant, field)
                         && let Some((ty, sl)) = self.extract_callable_from_head(col.ty(), col.as_slice(), heads, want, e)?
                     {
@@ -8784,25 +9137,72 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         Ok(false)
     }
 
-    /// Returns the unique initializer/scrutinee expression that introduces binding `p` (via
-    /// `let`, `let ... else`, `if let`, `while let`, or `match`), refusing if `p` is ever
-    /// reassigned, mutably borrowed via `&mut p`, or given an explicit `let` type annotation
-    /// that could coerce its region signature.
-    fn local_binding_init(&self, p: PatId) -> Result<Option<ExprId>, Refusal> {
+    /// Whether local binding `p` is never assigned to or mutably borrowed anywhere in the body.
+    fn local_is_immutable(&self, p: PatId) -> bool {
         for expr in self.body.exprs.iter() {
             match *expr {
                 Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. }
                     if matches!(self.body.exprs.get(lhs.ix()), Some(&Expr::Local(q)) if q == p) =>
                 {
-                    return Ok(None);
+                    return false;
                 }
                 Expr::Ref { mutbl: Mutbl::Mut, operand }
                     if matches!(self.body.exprs.get(operand.ix()), Some(&Expr::Local(q)) if q == p) =>
                 {
-                    return Ok(None);
+                    return false;
                 }
                 _ => {}
             }
+        }
+        true
+    }
+
+    /// If binding `p` was directly extracted from a struct or tuple-struct field pattern
+    /// anywhere in the enclosing body (including an outer closure/block when `self.in_nested`)
+    /// and is never reassigned or mutably borrowed, returns `Some((adt, variant, field_idx))`.
+    fn pat_field_source(&self, p: PatId) -> Result<Option<(ItemKey, u32, u32)>, Refusal> {
+        if !self.local_is_immutable(p) {
+            return Ok(None);
+        }
+        if let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p) {
+            return Ok(Some((adt, variant, field)));
+        }
+        for (i, pat) in self.body.pats.iter().enumerate() {
+            let Ok(idx) = u32::try_from(i) else { continue };
+            let pid = PatId(idx);
+            match *pat {
+                Pat::Struct { fields, .. } => {
+                    for f in self.body.field_pats.get(fields.range()).unwrap_or(&[]) {
+                        if f.pat == p
+                            && let Ok((adt, variant)) = self.variant_of(pid)
+                            && let Some(fi) = self.facts.field(adt, variant, f.name)
+                        {
+                            return Ok(Some((adt, variant, fi)));
+                        }
+                    }
+                }
+                Pat::TupleStruct { elems, rest, .. } => {
+                    let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
+                    if let Some(j) = es.iter().position(|&sp| sp == p)
+                        && let Ok((adt, variant)) = self.variant_of(pid)
+                        && let Some(n) = self.facts.field_count(adt, variant)
+                    {
+                        return Ok(Some((adt, variant, field_index(j, es.len(), n as usize, rest))));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns the unique initializer/scrutinee expression that introduces binding `p` (via
+    /// `let`, `let ... else`, `if let`, `while let`, or `match`), refusing if `p` is ever
+    /// reassigned, mutably borrowed via `&mut p`, or given an explicit `let` type annotation
+    /// that could coerce its region signature.
+    fn local_binding_init(&self, p: PatId) -> Result<Option<ExprId>, Refusal> {
+        if !self.local_is_immutable(p) {
+            return Ok(None);
         }
         let mut found: Option<ExprId> = None;
         for stmt in self.body.stmts.iter() {
@@ -9109,16 +9509,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(false);
         }
         // Reject if `p` is ever assigned or mutably borrowed anywhere in the body.
-        for expr in self.body.exprs.iter() {
-            match *expr {
-                Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } if matches!(self.body.exprs.get(lhs.ix()), Some(&Expr::Local(q)) if q == p) => {
-                    return Ok(false);
-                }
-                Expr::Ref { mutbl: Mutbl::Mut, operand } if matches!(self.body.exprs.get(operand.ix()), Some(&Expr::Local(q)) if q == p) => {
-                    return Ok(false);
-                }
-                _ => {}
-            }
+        if !self.local_is_immutable(p) {
+            return Ok(false);
         }
         let mut init = None;
         for stmt in self.body.stmts.iter() {
@@ -9148,8 +9540,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     stack.push(el);
                     stack.push(then);
                 }
+                Expr::Match { arms, .. } => {
+                    let Some(arm_list) = self.body.arms.get(arms.range()) else { return Ok(false) };
+                    if arm_list.is_empty() {
+                        return Ok(false);
+                    }
+                    for arm in arm_list.iter().rev() {
+                        stack.push(arm.body);
+                    }
+                }
                 _ => {
                     let Ok(ty) = self.expr_ty(cur) else { return Ok(false) };
+                    if matches!(self.node(ty, cur), Ok(PNode::Never)) {
+                        continue;
+                    }
                     let Ok(PNode::FnDef(item, ty_args)) = self.node(ty, cur) else { return Ok(false) };
                     leaves.push((item, ty_args));
                 }
@@ -9165,7 +9569,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         Ok(true)
     }
 
-    /// Calls a fn-pointer parameter of an enclosing closure (e.g. `|edit: fn(&mut Tx)| edit(&mut tx)`)
+    /// Calls a fn-pointer or `dyn Fn*` parameter of an enclosing closure (e.g.
+    /// `|edit: fn(&mut Tx)| edit(&mut tx)` or `|draw: &dyn Fn(&mut Pen<'_, '_>)| draw(pen)`)
     /// when its return type carries zero lifetime slots and its written parameter type carries no
     /// explicit `'static`/named lifetime annotations (so every input lifetime is higher-ranked).
     fn call_through_closure_fn_ptr_param(&mut self, c: ExprId, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
@@ -9174,8 +9579,31 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(false);
         }
         let Ok(c_ty) = self.expr_ty(c) else { return Ok(false) };
-        let Ok(PNode::FnPtr(fn_list, _)) = self.node(c_ty, c) else { return Ok(false) };
-        if self.list(fn_list, e)?.len() != args.len() + 1 {
+        let facts: &'b F = self.facts;
+        let callable_arity_ok = if let Some((fp_ty, _)) = self.peel_body_fn_ptr(TyD::of(c_ty), e)?
+            && let Ok(PNode::FnPtr(fn_list, _)) = self.node(fp_ty, c)
+        {
+            self.list(fn_list, e)?.len() == args.len() + 1
+        } else if let Some(dyn_ty) = self.peel_body_dyn(c_ty, e)?
+            && let Ok(PNode::Dynamic(preds)) = self.node(dyn_ty, c)
+        {
+            let mut matched = false;
+            for &pred in self.list(preds, e)? {
+                if let PNode::ExTrait(tr, al) = self.node(pred, e)?
+                    && facts.is_fn_trait(tr)
+                    && let [tup] = self.list(al, e)?
+                    && let PNode::Tuple(tk) = self.node(*tup, e)?
+                    && self.list(tk, e)?.len() == args.len()
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            matched
+        } else {
+            false
+        };
+        if !callable_arity_ok {
             return Ok(false);
         }
         let mut found: Option<(ExprId, u32)> = None;
@@ -9942,9 +10370,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Some(f) => f,
             None => return self.refuse_pat(Form::UnknownAdt, p),
         };
-        if f.union {
-            return self.refuse_pat(Form::Union, p);
-        }
         let base = if f.is_enum { self.project(place, ty, Proj::Downcast(variant), ty, false, root)? } else { place };
         for &(fi, sp) in subs {
             if !self.binds(sp)? {
@@ -9963,7 +10388,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 None => return self.refuse_pat(Form::Malformed, sp),
             };
             let ft = if peels { self.peeled_field_ty(ty, adt, variant, fi, sp, own, mode)? } else { TyD::of(own) };
-            let q = self.project(base, ty, Proj::Field(fi), ft, f.drop_impl, root)?;
+            let proj = if f.union {
+                Proj::Subslice { from: fi, to: fi, from_end: false }
+            } else {
+                Proj::Field(fi)
+            };
+            let q = self.project(base, ty, proj, ft, f.drop_impl, root)?;
             stack.push(BindItem::Pat(sp, q, ft, mode));
         }
         Ok(())
@@ -10236,7 +10666,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
                 self.place_super_let(s, from, self.body.root)?;
             }
-            TStmt::Let { init: Some(init), .. } => {
+            TStmt::Let { pat, init: Some(init), else_, .. } => {
+                // RFC 2229 (disjoint capture in closures): `let _ = path;` (wildcard/non-binding
+                // pattern with a pure place expression without derefs rooted at an outer local)
+                // reads, moves, and borrows nothing, so the closure does NOT capture `path`.
+                // Skip lowering it in a nested closure so it does not fail with `UnknownLocal`
+                // while keeping `let _ = *r;` (which DOES capture `r`) and in-flow `let _ = local;`
+                // mentions intact.
+                if self.in_nested
+                    && else_.is_none()
+                    && self.binds_nothing(pat)?
+                    && self.is_uncaptured_place_no_deref(init)?
+                {
+                    return Ok(());
+                }
                 let depth = self.scope_marks.len() as u32;
                 self.mark_extended(init, depth)?;
                 self.tasks.push(Task::CloseTemps(init));
@@ -10246,6 +10689,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         Ok(())
+    }
+
+    /// Whether `e` is a side-effect-free place chain (`Local`, `Paren`, `Field`, `TupleField`, no
+    /// derefs and no adjustments) rooted at an outer local not captured by the current nested flow.
+    fn is_uncaptured_place_no_deref(&self, mut cur: ExprId) -> Result<bool, Refusal> {
+        for _ in 0..32 {
+            let (lo, hi) = self.adjust_rows(cur);
+            if hi > lo {
+                return Ok(false);
+            }
+            match self.expr(cur)? {
+                Expr::Paren(i) | Expr::Field { base: i, .. } | Expr::TupleField { base: i, .. } => cur = i,
+                Expr::Local(p) => {
+                    return Ok(self.upvar_place(p).is_none() && self.get_pat_local(p).is_none());
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
     }
 
     /// The Reference, "Temporary lifetime extension": "the operand of an extending borrow
