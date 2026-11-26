@@ -142,6 +142,7 @@ struct RootReaderInner {
     io: Option<crate::io::Io>,
     root: Option<crate::fs::Dir<crate::fs::ReadOnly>>,
     stalled: core::sync::atomic::AtomicBool,
+    holds_reaper_slot: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -149,8 +150,26 @@ impl Drop for RootReaderInner {
     fn drop(&mut self) {
         if self.stalled.load(core::sync::atomic::Ordering::Acquire) {
             if let (Some(io), Some(root)) = (self.io.take(), self.root.take()) {
+                self.holds_reaper_slot = false;
                 crate::rt::retire_stalled_io(io, root);
+                return;
             }
+        }
+        if self.holds_reaper_slot {
+            self.holds_reaper_slot = false;
+            crate::rt::release_reaper_slot();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ReaperSlotGuard(bool);
+
+#[cfg(target_os = "linux")]
+impl Drop for ReaperSlotGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            crate::rt::release_reaper_slot();
         }
     }
 }
@@ -167,12 +186,13 @@ impl blaze_own::Share for RootReader {}
 #[cfg(target_os = "linux")]
 impl RootReader {
     pub fn new(cx: &Cx) -> Result<Self, Fault> {
-        if !crate::rt::reaper_has_capacity() {
+        if !crate::rt::try_reserve_reaper_slot() {
             return Err(Fault::Host {
                 call: "bstd::fs root io (stalled-reader backlog full)",
                 code: 11,
             });
         }
+        let mut slot_guard = ReaperSlotGuard(true);
         let io = match cx.io().beside(crate::rt::RootPath::new("/")) {
             Some(Ok(io)) => io,
             Some(Err(_)) | None => {
@@ -183,11 +203,13 @@ impl RootReader {
             .need_fs()
             .map_err(|_| Fault::Host { call: "bstd::fs root io (missing fs)", code: 5 })?;
         let root = fs.root().read_only();
+        slot_guard.0 = false;
         let inner = blaze_own::Arc::new_in(
             RootReaderInner {
                 io: Some(io),
                 root: Some(root),
                 stalled: core::sync::atomic::AtomicBool::new(false),
+                holds_reaper_slot: true,
             },
             blaze_own::SharedAlloc::global(),
         );
@@ -518,12 +540,13 @@ mod tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod process_tests;
 
-/// Sans-IO coordinator for bounded independent reaper workers (`rt::retire_stalled_io`):
-/// guarantees that retiring an abandoned driver NEVER drops synchronously on the caller (even
-/// past the `max_workers` cap or on transient `thread::spawn` failure), while bounding active
-/// reaper threads and allowing up to `max_workers` independent stalled mounts to drain without
-/// head-of-line blocking each other.
-#[cfg(target_os = "linux")]
+/// Sans-IO coordinator for bounded independent reaper workers (`rt::retire_stalled_io` and
+/// `rt::retire_lock_fd`): guarantees that retiring an abandoned driver or file lock NEVER drops
+/// synchronously on the caller (even past the `max_workers` cap or on transient `thread::spawn`
+/// failure), reserves slots at admission time so `active + pending + reserved` can NEVER exceed
+/// `max_workers + max_pending`, and allows up to `max_workers` independent stalled mounts to
+/// drain without head-of-line blocking each other.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReaperPlant {
     None,
@@ -533,7 +556,7 @@ pub enum ReaperPlant {
     SingleFifo,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(PartialEq, Eq, Debug)]
 pub enum RetireAction<T> {
     Spawn(T),
@@ -541,31 +564,60 @@ pub enum RetireAction<T> {
     SyncDrop(T),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct ReaperCore<T> {
     max_workers: usize,
     max_pending: usize,
     active: usize,
+    reserved: usize,
     pending: blaze_own::VecDeque<T, blaze_own::SharedAlloc<'static>>,
     plant: ReaperPlant,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<T> ReaperCore<T> {
     pub fn new(max_workers: usize, max_pending: usize, plant: ReaperPlant) -> Self {
         Self {
             max_workers: max_workers.max(1),
             max_pending: max_pending.max(1),
             active: 0,
+            reserved: 0,
             pending: blaze_own::VecDeque::new_in(blaze_own::SharedAlloc::global()),
             plant,
         }
     }
 
-    /// Whether the stalled-driver backlog still has room to admit another reader without growing
-    /// threads, descriptors, or memory past `max_workers + max_pending`.
+    fn total_cap(&self) -> usize {
+        self.max_workers.saturating_add(self.max_pending)
+    }
+
+    /// Whether the reaper backlog still has room to admit another live owner without allowing
+    /// `active + pending + reserved` to grow past `max_workers + max_pending`.
     pub fn has_capacity(&self) -> bool {
-        self.pending.len() < self.max_pending
+        self.active.saturating_add(self.pending.len()).saturating_add(self.reserved) < self.total_cap()
+    }
+
+    /// Atomically reserves one slot for a newly admitted live owner (`RootReader` or `NativeLock`).
+    /// Must be paired with either [`Self::release_reservation`] (normal close) or
+    /// [`Self::retire_reserved`] (stalled retirement).
+    pub fn try_reserve(&mut self) -> bool {
+        if self.has_capacity() {
+            self.reserved += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Releases a reservation when a live owner closes cleanly without stalling.
+    pub fn release_reservation(&mut self) {
+        self.reserved = self.reserved.saturating_sub(1);
+    }
+
+    /// Consumes a previously reserved slot and retires `item` into the bounded reaper pool.
+    pub fn retire_reserved(&mut self, item: T) -> RetireAction<T> {
+        self.reserved = self.reserved.saturating_sub(1);
+        self.retire(item)
     }
 
     fn effective_cap(&self) -> usize {
@@ -577,6 +629,10 @@ impl<T> ReaperCore<T> {
 
     pub fn active(&self) -> usize {
         self.active
+    }
+
+    pub fn reserved(&self) -> usize {
+        self.reserved
     }
 
     pub fn pending_len(&self) -> usize {
@@ -628,7 +684,10 @@ impl<T> ReaperCore<T> {
 }
 
 #[cfg(target_os = "linux")]
-pub use landlock::{HostLdCaps, feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match};
+pub use landlock::{
+    HostLdCaps, PreloadScanner, feed_nix_runtime_closure, feed_nix_runtime_closure_with,
+    parse_ld_so_cache_match, x86_64_fhs_hwcap_subdirs,
+};
 
 /// On macOS hosts, hashes the admitted OS runtime closure (`/System/Library/CoreServices/SystemVersion.plist`,
 /// optional Cryptex `SystemVersion.plist`, `/usr/lib/dyld`, and the active `dyld_shared_cache`
@@ -779,6 +838,12 @@ pub enum ClockSpec {
     /// nothing; the env must then hold no `SOURCE_DATE_EPOCH`. At [`Level::Execution`] a clock
     /// call is refused and ends the run.
     NeverAsks,
+    /// The caller explicitly supplied a malformed or out-of-range `SOURCE_DATE_EPOCH` at
+    /// [`Level::Inputs`] and wants the child process (e.g., Clang) to see that exact environment
+    /// value and produce its normal diagnostic rather than rejecting the spec pre-launch.
+    /// Accepted ONLY at [`Level::Inputs`] when `SOURCE_DATE_EPOCH` is present and fails `u64`
+    /// parsing.
+    InvalidEnv,
 }
 
 /// What the child may use. Every cap is required (there is no default budget).
@@ -926,6 +991,7 @@ impl<'a> HermeticSpec<'a> {
         match (opts.clock, epoch) {
             (ClockSpec::Fixed { unix_secs }, Some(value)) if parse_u64(value) == Some(unix_secs) => {}
             (ClockSpec::NeverAsks, None) => {}
+            (ClockSpec::InvalidEnv, Some(value)) if opts.level == Level::Inputs && parse_u64(value).is_none() => {}
             _ => return refuse(Fault::ClockNotInEnv),
         }
         if opts.level == Level::Inputs && opts.budget.steps.is_some() {

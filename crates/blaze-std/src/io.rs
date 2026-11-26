@@ -295,7 +295,8 @@ struct World {
     temp_nonce: Option<u64>,
     peer_temps: [(u64, Option<u64>); 32],
     peer_next: usize,
-    native_root: Option<blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    native_root_dir: Option<blaze_own::Arc<crate::rt::NativeRootDir, blaze_own::SharedAlloc<'static>>>,
     /// Effects made and not yet handed to the driver.
     effects: Vec<Effect>,
     /// What the last poll moved, before it is sorted into `got`.
@@ -416,7 +417,8 @@ impl Escape {
             hosted: None,
             disk: None,
             plant: Plant::None,
-            native_root: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir: None,
         });
         Escape(Lock::new("bstd.io.world", world))
     }
@@ -652,7 +654,8 @@ struct Start {
     hosted: Option<Box<SimHost>>,
     disk: Option<Box<Disk>>,
     plant: Plant,
-    native_root: Option<blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    native_root_dir: Option<blaze_own::Arc<crate::rt::NativeRootDir, blaze_own::SharedAlloc<'static>>>,
 }
 
 /// The target's driver could not be made over a root.
@@ -752,7 +755,8 @@ impl Io {
             // alloc: once per simulated world, its disk's ledger.
             disk: Some(Box::new(Disk::new())),
             plant,
-            native_root: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir: None,
         }, workers)
     }
 
@@ -897,7 +901,21 @@ fn written(
 
 impl World {
     fn new(start: Start) -> World {
-        let Start { driver, seed, above, env: _, args: _, host, offers: _, limits, hosted, disk, plant: _, native_root } = start;
+        let Start {
+            driver,
+            seed,
+            above,
+            env: _,
+            args: _,
+            host,
+            offers: _,
+            limits,
+            hosted,
+            disk,
+            plant: _,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir,
+        } = start;
         World {
             driver,
             above,
@@ -905,7 +923,8 @@ impl World {
             temp_nonce: None,
             peer_temps: [(0, None); 32],
             peer_next: 0,
-            native_root,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            native_root_dir,
             // alloc: the effects' queue, grown once to the most made between waits.
             effects: Vec::new(),
             // alloc: the poll's buffer, grown once to the most a poll moves.
@@ -1823,17 +1842,18 @@ impl Io {
         Some(*locked.temp_nonce.get_or_insert(drawn))
     }
 
-    /// Native filesystem root directory of this world when running on a real OS driver, or
-    /// `None` in simulated/hosted worlds.
-    pub(crate) fn native_root(&self) -> Option<blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    /// Opened native filesystem root directory descriptor of this world when running on a real
+    /// Unix OS driver, or `None` in simulated/hosted worlds.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn native_root_dir(&self) -> Option<blaze_own::Arc<crate::rt::NativeRootDir, blaze_own::SharedAlloc<'static>>> {
         let Reach::Shared { world, .. } = &self.reach else {
             return None;
         };
         world
             .lock()
-            .native_root
+            .native_root_dir
             .as_ref()
-            .map(|s| blaze_own::String::from_str_in(s.as_str(), blaze_own::SharedAlloc::global()))
+            .map(blaze_own::Share::share)
     }
 
     /// Creates a peer [`Io`] handle sharing the same simulated disk and fault injector as `self`

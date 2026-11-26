@@ -670,10 +670,14 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert_eq!(canon_dot.row.files.len(), 1, "normalized ./flag_check.c must resolve the OUT_DIR input digest");
     assert_eq!(canon_dot.input_rels[0].1.as_str(), "flag_check.c");
 
-    // Root substitution must only occur at genuine path boundaries (`/` or EOF, plus `=` only in
-    // `-f*-prefix-map=`); filename punctuation, closing brackets, whitespace, and non-ASCII bytes
-    // must NOT rewrite path literals to `$OUT_DIR`.
+    // Root substitution must only occur at genuine path boundaries (start `None`/`=`/`:` and end
+    // `/` or EOF, plus `=` only in `-f*-prefix-map=`) and NEVER inside `-D`/`-U` macro defines;
+    // embedded roots like `prefix/x/out/file` and punctuation/non-ASCII suffixes stay literal.
     for literal_def in [
+        "-DROOT=\"prefix/target/debug/build/zstd-sys-1/out/file\"",
+        "-DROOT=/target/debug/build/zstd-sys-1/out",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out/file\"",
+        "-fdebug-compilation-dir=prefix/target/debug/build/zstd-sys-1/out/file",
         "-DROOT=\"/target/debug/build/zstd-sys-1/out+suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/out:suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/out;suffix\"",
@@ -689,11 +693,15 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         let def_args = flag_args(literal_def);
         let sp_def = Spawn { program: "cc", args: &def_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
         let canon = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_def, files, alloc)
-            .expect("literal macro def with punctuation/non-ASCII suffix");
+            .expect("literal arg with embedded root or punctuation suffix");
         assert!(
             canon.row.args.iter().any(|a| a.as_str() == literal_def),
             "expected `{literal_def}` to stay literal without $OUT_DIR substitution, got {:?}",
             canon.row.args
+        );
+        assert!(
+            canon.exec_args.iter().flatten().all(|s| !matches!(s, crate::c_tasks_probe::Segment::OutDir)),
+            "expected `{literal_def}` exec_args to contain no Segment::OutDir"
         );
     }
 

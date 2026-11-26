@@ -921,19 +921,22 @@ impl RootFiles for ProbeFiles {
     }
 }
 
-/// Extracts or defaults `SOURCE_DATE_EPOCH` for the hermetic sandbox clock (`ClockSpec::Fixed`).
+/// Extracts or defaults `SOURCE_DATE_EPOCH` for the hermetic sandbox clock (`ClockSpec`).
 /// When the caller provided an invalid/out-of-range `SOURCE_DATE_EPOCH`, preserves that exact
-/// environment variable for Clang (so Clang itself produces its normal exit status 1 and
-/// diagnostic) and uses `0` for the sandbox clock rather than aborting the build.
+/// environment variable for Clang and returns `ClockSpec::InvalidEnv` so `HermeticSpec::new`
+/// permits launching Clang to produce its normal exit status 1 and diagnostic.
 fn resolve_source_date_epoch<'a>(
     owned_env: &mut AVec<'a, (AString<'a>, AString<'a>)>,
     alloc: Alloc<'a>,
-) -> u64 {
+) -> ClockSpec {
     if let Some((_, val)) = owned_env.iter().find(|(k, _)| k.as_str() == "SOURCE_DATE_EPOCH") {
-        val.as_str().parse::<u64>().unwrap_or(0)
+        match val.as_str().parse::<u64>() {
+            Ok(unix_secs) => ClockSpec::Fixed { unix_secs },
+            Err(_) => ClockSpec::InvalidEnv,
+        }
     } else {
         owned_env.push((own_str("SOURCE_DATE_EPOCH", alloc), own_str("0", alloc)));
-        0
+        ClockSpec::Fixed { unix_secs: 0 }
     }
 }
 
@@ -1086,7 +1089,7 @@ impl ProbeAnswerer for HermeticClangProbe {
                 render_segments(segs.as_slice(), task_real.as_str(), sdk_str, placeholders.as_slice(), alloc)?,
             ));
         }
-        let epoch_secs = resolve_source_date_epoch(&mut owned_env, alloc);
+        let epoch_clock = resolve_source_date_epoch(&mut owned_env, alloc);
         owned_env.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         owned_env.dedup_by(|a, b| a.0.as_str() == b.0.as_str());
         let mut env_refs: AVec<'a, (&str, &str)> = OwnVec::with_capacity_in(owned_env.len(), alloc);
@@ -1137,7 +1140,7 @@ impl ProbeAnswerer for HermeticClangProbe {
             helpers: &[],
             helper_folders: &[],
             channels: &[],
-            clock: ClockSpec::Fixed { unix_secs: epoch_secs },
+            clock: epoch_clock,
             seed: 0,
             budget: Budget { cpu: run_rem, memory: PROBE_MEMORY_BYTES, steps: None },
             deadline: Deadline::after(clock.now().since_start(), run_rem),
@@ -1729,17 +1732,94 @@ mod tests {
             let _ = std::fs::remove_file(&pin_file);
         }
 
-        // SOURCE_DATE_EPOCH parsing honors nonzero epoch and preserves invalid text for Clang.
+        // SOURCE_DATE_EPOCH parsing honors nonzero epoch, preserves invalid text for Clang, and
+        // passes `HermeticSpec::new` end-to-end via `ClockSpec::InvalidEnv` (while rejecting
+        // `InvalidEnv` when `SOURCE_DATE_EPOCH` is valid or absent).
         let mut env_nz = AVec::new_in(alloc);
         env_nz.push((OwnString::from_str_in("SOURCE_DATE_EPOCH", alloc), OwnString::from_str_in("1700000000", alloc)));
-        assert_eq!(resolve_source_date_epoch(&mut env_nz, alloc), 1_700_000_000);
+        assert_eq!(resolve_source_date_epoch(&mut env_nz, alloc), super::ClockSpec::Fixed { unix_secs: 1_700_000_000 });
         let mut env_default = AVec::new_in(alloc);
-        assert_eq!(resolve_source_date_epoch(&mut env_default, alloc), 0);
+        assert_eq!(resolve_source_date_epoch(&mut env_default, alloc), super::ClockSpec::Fixed { unix_secs: 0 });
         assert_eq!(env_default.len(), 1);
         let mut env_bad = AVec::new_in(alloc);
         env_bad.push((OwnString::from_str_in("SOURCE_DATE_EPOCH", alloc), OwnString::from_str_in("not-a-num", alloc)));
-        assert_eq!(resolve_source_date_epoch(&mut env_bad, alloc), 0);
+        let bad_clock = resolve_source_date_epoch(&mut env_bad, alloc);
+        assert_eq!(bad_clock, super::ClockSpec::InvalidEnv);
         assert_eq!(env_bad[0].1.as_str(), "not-a-num", "invalid SOURCE_DATE_EPOCH must be preserved for Clang");
+        let spec_roots_arr = [super::Root { name: "out", kind: super::RootKind::Output }];
+        let spec_mounts_arr = [super::Mount { spelling: b"/tmp/out", root: super::RootId(0) }];
+        let spec_roots = super::Roots::new(&spec_roots_arr).expect("spec roots");
+        let make_spec = |env: &[(&str, &str)], clock: super::ClockSpec| -> Result<(), super::Fault> {
+            super::HermeticSpec::new(super::HermeticOpts {
+                program: super::Program::Stored { name: "clang-23", digest: super::Digest([1; 32]), path: "/tmp/out/clang" },
+                args: &["-c"],
+                env,
+                roots: spec_roots,
+                mounts: &spec_mounts_arr,
+                cwd: "/tmp/out",
+                helpers: &[],
+                helper_folders: &[],
+                channels: &[],
+                clock,
+                seed: 0,
+                budget: super::Budget { cpu: super::Duration::from_secs(5), memory: 1 << 28, steps: None },
+                deadline: super::Deadline::after(super::Duration::ZERO, super::Duration::from_secs(5)),
+                streams: super::HermeticStreams { stdout: super::Capture::Keep { most: 4096 }, stderr: super::Capture::Keep { most: 4096 } },
+                level: super::Level::Inputs,
+                report: super::ReportSpec::WholeRoots,
+            })
+            .map(|_| ())
+            .map_err(|e| e.fault)
+        };
+        assert!(
+            make_spec(&[("SOURCE_DATE_EPOCH", "not-a-num")], bad_clock).is_ok(),
+            "HermeticSpec::new must accept ClockSpec::InvalidEnv when SOURCE_DATE_EPOCH is invalid"
+        );
+        assert_eq!(
+            make_spec(&[("SOURCE_DATE_EPOCH", "123")], super::ClockSpec::InvalidEnv),
+            Err(super::Fault::ClockNotInEnv),
+            "ClockSpec::InvalidEnv must reject valid numeric SOURCE_DATE_EPOCH"
+        );
+        assert_eq!(
+            make_spec(&[], super::ClockSpec::InvalidEnv),
+            Err(super::Fault::ClockNotInEnv),
+            "ClockSpec::InvalidEnv must reject missing SOURCE_DATE_EPOCH"
+        );
+
+        // Native `Dir::lock_exclusive` resolves strictly beneath the opened root descriptor and
+        // refuses symbolic links in both intermediate directories and the leaf lock file.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let lock_root = std::env::temp_dir().join(format!("blaze-cprobe-locksym-{}", std::process::id()));
+            let lock_outside = std::env::temp_dir().join(format!("blaze-cprobe-lockout-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&lock_root);
+            let _ = std::fs::remove_dir_all(&lock_outside);
+            std::fs::create_dir_all(&lock_root).expect("lock root");
+            std::fs::create_dir_all(&lock_outside).expect("lock outside");
+            std::os::unix::fs::symlink(&lock_outside, lock_root.join("escape-dir")).expect("symlink dir");
+            std::os::unix::fs::symlink(lock_outside.join("escaped.lock"), lock_root.join("escape.lock")).expect("symlink leaf");
+            let (lock_io, lock_dir) = crate::record::native_world(&lock_root).expect("lock world");
+            let lock_cx = lock_io.cx(super::Duration::from_secs(5), bstd::mem::TASK_FRAME).expect("lock cx");
+            let sym_dir_path = bstd::path::Path::new("escape-dir/.repair.lock").expect("sym dir path");
+            assert!(
+                lock_dir.lock_exclusive(&lock_cx, &sym_dir_path).is_err(),
+                "native lock_exclusive must refuse symlink intermediate directory"
+            );
+            let sym_leaf_path = bstd::path::Path::new("escape.lock").expect("sym leaf path");
+            assert!(
+                lock_dir.lock_exclusive(&lock_cx, &sym_leaf_path).is_err(),
+                "native lock_exclusive must refuse symlink leaf lock file"
+            );
+            assert!(
+                !lock_outside.join(".repair.lock").exists() && !lock_outside.join("escaped.lock").exists(),
+                "refused symlink locks must never create files outside native root"
+            );
+            let ok_path = bstd::path::Path::new("sub/.repair.lock").expect("ok path");
+            let held = lock_dir.lock_exclusive(&lock_cx, &ok_path).expect("legitimate lock beneath root");
+            held.unlock(&lock_cx).expect("unlock legitimate lock");
+            let _ = std::fs::remove_dir_all(&lock_root);
+            let _ = std::fs::remove_dir_all(&lock_outside);
+        }
 
         // Lazy verification runs through `bstd::sync::Flight` without holding any lock across
         // filesystem waits; concurrent waiters park on its Signal and honor their own deadline.
@@ -1972,6 +2052,37 @@ mod tests {
         )
         .expect_err("corrupt ld.so.cache must fail loudly");
         assert!(matches!(err, bstd::procs::hermetic::Fault::Host { code: 22, .. }));
+
+        // Streaming `/etc/ld.so.preload` scanner must detect entries past 4096 bytes of comments.
+        let mut preload_bytes = std::vec![b'#'; 5000];
+        preload_bytes.push(b'\n');
+        preload_bytes.extend_from_slice(b"  /lib/evil.so\n");
+        let mut scanner = bstd::procs::hermetic::PreloadScanner::new();
+        let mut saw_entry = false;
+        for chunk in preload_bytes.chunks(4096) {
+            if scanner.feed(chunk) {
+                saw_entry = true;
+                break;
+            }
+        }
+        assert!(saw_entry, "PreloadScanner must detect preload entry past byte 4096");
+        let mut clean_scanner = bstd::procs::hermetic::PreloadScanner::new();
+        assert!(!clean_scanner.feed(b"# comment\n   \n# another comment\n"));
+
+        // FHS fallback glibc-hwcaps search order must descend v4 -> v3 -> v2.
+        assert_eq!(
+            bstd::procs::hermetic::x86_64_fhs_hwcap_subdirs(4),
+            &[
+                b"glibc-hwcaps/x86-64-v4/".as_slice(),
+                b"glibc-hwcaps/x86-64-v3/".as_slice(),
+                b"glibc-hwcaps/x86-64-v2/".as_slice(),
+            ]
+        );
+        assert_eq!(
+            bstd::procs::hermetic::x86_64_fhs_hwcap_subdirs(3),
+            &[b"glibc-hwcaps/x86-64-v3/".as_slice(), b"glibc-hwcaps/x86-64-v2/".as_slice()]
+        );
+        assert_eq!(bstd::procs::hermetic::x86_64_fhs_hwcap_subdirs(1), &[] as &[&[u8]]);
     }
 
     #[cfg(target_os = "linux")]
@@ -2118,17 +2229,32 @@ mod tests {
                 return Err("reaper oracle: drained core must report capacity available");
             }
         }
-        // Admission-control bound check: once `MAX_WORKERS + MAX_PENDING` items are wedged,
-        // `has_capacity()` must turn false so stalled-driver backlog is strictly bounded.
+        // Admission-control reservation check: admitting `MAX_WORKERS + MAX_PENDING` live owners
+        // while `pending == 0` must reserve every slot so the next admission is refused BEFORE
+        // any of them wedge, and retiring all reserved owners keeps `active + pending + reserved`
+        // strictly bounded at `MAX_WORKERS + MAX_PENDING`.
         let mut cap_core: ReaperCore<usize> = ReaperCore::new(MAX_WORKERS, MAX_PENDING, plant);
-        for i in 0..(MAX_WORKERS + MAX_PENDING) {
-            if !cap_core.has_capacity() {
-                return Err("reaper oracle: has_capacity turned false before MAX_WORKERS + MAX_PENDING");
+        for _ in 0..(MAX_WORKERS + MAX_PENDING) {
+            if !cap_core.try_reserve() {
+                return Err("reaper oracle: try_reserve failed before MAX_WORKERS + MAX_PENDING");
             }
-            let _ = cap_core.retire(i);
         }
-        if cap_core.has_capacity() {
-            return Err("reaper oracle: has_capacity stayed true at MAX_WORKERS + MAX_PENDING");
+        if cap_core.try_reserve() || cap_core.has_capacity() {
+            return Err("reaper oracle: try_reserve succeeded past MAX_WORKERS + MAX_PENDING while pending was empty");
+        }
+        // Releasing one clean reservation immediately re-opens capacity, then re-reserving closes it.
+        cap_core.release_reservation();
+        if !cap_core.try_reserve() {
+            return Err("reaper oracle: release_reservation failed to restore capacity");
+        }
+        for i in 0..(MAX_WORKERS + MAX_PENDING) {
+            let _ = cap_core.retire_reserved(i);
+            if cap_core.active() + cap_core.pending_len() + cap_core.reserved() > MAX_WORKERS + MAX_PENDING {
+                return Err("reaper oracle: total live + wedged count exceeded MAX_WORKERS + MAX_PENDING");
+            }
+        }
+        if cap_core.reserved() != 0 || cap_core.has_capacity() {
+            return Err("reaper oracle: retired reserved core had wrong count or stale capacity");
         }
         Ok(())
     }

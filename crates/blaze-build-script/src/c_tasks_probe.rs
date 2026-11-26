@@ -1629,7 +1629,21 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
     let mut paths: AVec<'b, (AString<'b>, &'s str)> = Vec::new_in(alloc);
     let mut input_rels: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
     let (mut inputs, mut outputs) = (0u32, 0u32);
+    let mut prev_is_define_flag = false;
     for arg in spawn.args.iter().copied() {
+        let is_define_val = prev_is_define_flag
+            || (arg.starts_with("-D") && arg.len() > 2)
+            || (arg.starts_with("-U") && arg.len() > 2);
+        prev_is_define_flag = matches!(arg, "-D" | "-U");
+        if is_define_val {
+            // Macro definitions (`-D...`, `-D <val>`, `-U...`) carry literal C tokens/strings and
+            // must NEVER have embedded root substrings rewritten to `$OUT_DIR` / `$SDKROOT`.
+            args.push(own(arg));
+            let mut segs: AVec<'b, Segment<'b>> = Vec::new_in(alloc);
+            segs.push(Segment::Literal(own(arg)));
+            exec_args.push(segs);
+            continue;
+        }
         let Some(rel_owned) = normalize_under_out_dir(arg, spawn.out_dir, alloc) else {
             args.push(spelled_roots(arg, &roots, alloc));
             exec_args.push(spelled_segments(arg, &roots, alloc));
@@ -1718,6 +1732,13 @@ fn same_key(a: &Row<'_>, b: &Row<'_>) -> bool {
         && same_set(&a.files, &b.files)
 }
 
+/// Whether `prev` is a genuine path start boundary immediately before a substituted root directory
+/// (`None` for start-of-value, `'='` for `--flag=/path` / `-f*-prefix-map=old=new`, or `':'` for
+/// colon-delimited path lists). Prevents matching embedded substrings like `prefix/x/out/file`.
+fn is_root_start_boundary(prev: Option<u8>) -> bool {
+    matches!(prev, None | Some(b'=') | Some(b':'))
+}
+
 /// Whether `next` is a genuine path boundary immediately after a substituted root directory
 /// (`None` for end-of-value, `'/'` for a child path component, or `'='` only inside
 /// `-f*-prefix-map=old=new`). Never treats Unix filename punctuation or whitespace as delimiters.
@@ -1740,24 +1761,27 @@ fn spelled_segments<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) ->
         if rest.is_empty() {
             break;
         }
-        for (root, spelling) in roots.iter().copied() {
-            if !root.is_empty()
-                && rest.starts_with(root)
-                && is_root_end_boundary(bytes.get(at + root.len()).copied(), allow_eq)
-            {
-                if !lit.is_empty() {
-                    out.push(Segment::Literal(lit));
-                    lit = String::new_in(alloc);
+        let prev = at.checked_sub(1).and_then(|i| bytes.get(i).copied());
+        if is_root_start_boundary(prev) {
+            for (root, spelling) in roots.iter().copied() {
+                if !root.is_empty()
+                    && rest.starts_with(root)
+                    && is_root_end_boundary(bytes.get(at + root.len()).copied(), allow_eq)
+                {
+                    if !lit.is_empty() {
+                        out.push(Segment::Literal(lit));
+                        lit = String::new_in(alloc);
+                    }
+                    let seg = match spelling {
+                        OUT_DIR => Segment::OutDir,
+                        SDKROOT => Segment::SdkRoot,
+                        MOUNT => Segment::Mount,
+                        other => Segment::Placeholder(String::from_str_in(other, alloc)),
+                    };
+                    out.push(seg);
+                    at += root.len();
+                    continue 'scan;
                 }
-                let seg = match spelling {
-                    OUT_DIR => Segment::OutDir,
-                    SDKROOT => Segment::SdkRoot,
-                    MOUNT => Segment::Mount,
-                    other => Segment::Placeholder(String::from_str_in(other, alloc)),
-                };
-                out.push(seg);
-                at += root.len();
-                continue 'scan;
             }
         }
         if let Some(ch) = rest.chars().next() {
@@ -1780,14 +1804,17 @@ fn spelled_roots<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) -> AS
     let bytes = text.as_bytes();
     let mut at = 0;
     'scan: while at < text.len() {
-        for (root, spelling) in roots.iter().copied() {
-            if !root.is_empty()
-                && text[at..].starts_with(root)
-                && is_root_end_boundary(bytes.get(at + root.len()).copied(), allow_eq)
-            {
-                out.push_str(spelling);
-                at += root.len();
-                continue 'scan;
+        let prev = at.checked_sub(1).and_then(|i| bytes.get(i).copied());
+        if is_root_start_boundary(prev) {
+            for (root, spelling) in roots.iter().copied() {
+                if !root.is_empty()
+                    && text[at..].starts_with(root)
+                    && is_root_end_boundary(bytes.get(at + root.len()).copied(), allow_eq)
+                {
+                    out.push_str(spelling);
+                    at += root.len();
+                    continue 'scan;
+                }
             }
         }
         let width = text[at..].chars().next().map_or(1, char::len_utf8);

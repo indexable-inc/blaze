@@ -1130,16 +1130,28 @@ fn reaper_pool() -> &'static self::std::sync::Mutex<crate::procs::hermetic::Reap
     POOL.get_or_init(|| Mutex::new(ReaperCore::new(MAX_REAPERS, MAX_REAPER_PENDING, ReaperPlant::None)))
 }
 
-/// Whether the stalled-reader reaper backlog still has capacity to admit another [`RootReader`]
-/// (bounds total wedged workers, descriptors, and memory at `MAX_REAPERS + MAX_REAPER_PENDING`).
+/// Atomically reserves a slot in the stalled-reader reaper backlog when admitting a new
+/// [`RootReader`] so live readers + active reapers + pending items NEVER exceed
+/// `MAX_REAPERS + MAX_REAPER_PENDING`.
 #[cfg(target_os = "linux")]
-pub(crate) fn reaper_has_capacity() -> bool {
+pub(crate) fn try_reserve_reaper_slot() -> bool {
     let pool = reaper_pool();
-    let guard = match pool.lock() {
+    let mut guard = match pool.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.has_capacity()
+    guard.try_reserve()
+}
+
+/// Releases a previously reserved slot when a [`RootReader`] closes cleanly without stalling.
+#[cfg(target_os = "linux")]
+pub(crate) fn release_reaper_slot() {
+    let pool = reaper_pool();
+    let mut guard = match pool.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.release_reservation();
 }
 
 /// Retires an abandoned native `Io` (whose worker thread is still blocked in an uninterruptible
@@ -1149,7 +1161,8 @@ pub(crate) fn reaper_has_capacity() -> bool {
 ///    reaper finishes),
 /// 2. Up to `MAX_REAPERS = 64` independent reaper threads run concurrently so one permanently
 ///    wedged mount never blocks cleanup of later retired drivers, and
-/// 3. Total wedged backlog is bounded by `reaper_has_capacity()` (`MAX_REAPERS + MAX_REAPER_PENDING`).
+/// 3. Total live + wedged backlog is atomically bounded at admission by `try_reserve_reaper_slot()`
+///    (`MAX_REAPERS + MAX_REAPER_PENDING`).
 #[cfg(target_os = "linux")]
 pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::fs::ReadOnly>) {
     use self::std::sync::Mutex;
@@ -1161,7 +1174,7 @@ pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::f
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match guard.retire((io, root)) {
+        match guard.retire_reserved((io, root)) {
             RetireAction::Spawn(item) => Some(item),
             RetireAction::Queued => None,
             RetireAction::SyncDrop(item) => {
@@ -1212,36 +1225,147 @@ pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::f
     }
 }
 
-/// Exclusive advisory file lock acquired off the driver's polling thread on native Unix hosts so
-/// stalled FUSE/NFS `open` or `try_lock` calls never freeze driver polling and always honor
-/// `Cx::cancelled()` and `Cx::deadline()`.
+/// Opened kernel directory descriptor (`O_DIRECTORY | O_CLOEXEC`) cached once when a native Unix
+/// world opens, so off-thread advisory locks resolve strictly beneath the opened root without
+/// reopening a mutable path string or traversing symbolic links.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) struct NativeLock(Option<self::std::fs::File>);
+pub(crate) struct NativeRootDir(blaze_sys::posix::io::OwnedFd);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl NativeRootDir {
+    pub(crate) fn open(root: &RootPath) -> Option<Self> {
+        use self::std::os::unix::ffi::OsStrExt as _;
+        let raw = root.as_os_str().as_bytes();
+        if raw.is_empty() || raw.contains(&0) {
+            return None;
+        }
+        let mut buf = blaze_own::Vec::with_capacity_in(raw.len() + 1, blaze_own::SharedAlloc::global());
+        buf.extend_from_slice(raw);
+        buf.push(0);
+        let cstr = core::ffi::CStr::from_bytes_with_nul(buf.as_slice()).ok()?;
+        let flags = blaze_sys::posix::io::OpenFlags::DIRECTORY | blaze_sys::posix::io::OpenFlags::CLOSE_ON_EXEC;
+        let fd = blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0).ok()?;
+        Some(Self(fd))
+    }
+
+    fn fd(&self) -> blaze_sys::Fd {
+        self.0.fd()
+    }
+}
+
+/// Exclusive advisory file lock acquired off the driver's polling thread on native Unix hosts so
+/// stalled FUSE/NFS `openat2`/`flock` calls never freeze driver polling, always honor
+/// `Cx::cancelled()` and `Cx::deadline()`, and NEVER close/drop a lock fd synchronously on the
+/// caller thread even under worker-cap overflow or `thread::spawn` failure.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct NativeLock(Option<blaze_sys::posix::io::OwnedFd>);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_LOCK_WORKERS: usize = 64;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_LOCK_REAPER_PENDING: usize = 64;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 static ACTIVE_LOCK_WORKERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lock_reaper_pool() -> &'static self::std::sync::Mutex<crate::procs::hermetic::ReaperCore<blaze_sys::posix::io::OwnedFd>> {
+    use self::std::sync::{Mutex, OnceLock};
+    use crate::procs::hermetic::{ReaperCore, ReaperPlant};
+    static POOL: OnceLock<Mutex<ReaperCore<blaze_sys::posix::io::OwnedFd>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(ReaperCore::new(MAX_LOCK_WORKERS, MAX_LOCK_REAPER_PENDING, ReaperPlant::None)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn try_reserve_lock_slot() -> bool {
+    let pool = lock_reaper_pool();
+    let mut guard = match pool.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.try_reserve()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn release_lock_slot() {
+    let pool = lock_reaper_pool();
+    let mut guard = match pool.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.release_reservation();
+}
+
+/// Retires an owned lock descriptor off the caller thread through `lock_reaper_pool()`: NEVER
+/// unlocks or closes `fd` synchronously on the caller thread, even when all 64 lock reapers are
+/// wedged or `thread::spawn` transiently fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn retire_lock_fd(fd: blaze_sys::posix::io::OwnedFd) {
+    use self::std::sync::Mutex;
+    use crate::procs::hermetic::RetireAction;
+
+    let pool = lock_reaper_pool();
+    let mut to_spawn = {
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.retire_reserved(fd) {
+            RetireAction::Spawn(item) => Some(item),
+            RetireAction::Queued => None,
+            RetireAction::SyncDrop(item) => {
+                guard.on_spawn_failed(item);
+                None
+            }
+        }
+    };
+    while let Some(first) = to_spawn {
+        let first_slot = blaze_own::Arc::new_in(Mutex::new(Some(first)), blaze_own::SharedAlloc::global());
+        let worker_slot = blaze_own::Share::share(&first_slot);
+        let spawned = self::std::thread::Builder::new()
+            .name(self::std::string::String::from("bstd-lock-reaper"))
+            .spawn(move || {
+                let mut current = match worker_slot.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                while let Some(retired_fd) = current {
+                    let _ = blaze_sys::posix::io::flock(retired_fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
+                    drop(retired_fd);
+                    let mut guard = match pool.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    current = guard.next_after_drop();
+                }
+            });
+        if spawned.is_err() {
+            let returned = match first_slot.lock() {
+                Ok(mut g) => g.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(item) = returned {
+                let mut guard = match pool.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.on_spawn_failed(item);
+            }
+            break;
+        }
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        to_spawn = guard.take_spawnable();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for NativeLock {
     fn drop(&mut self) {
-        if let Some(file) = self.0.take() {
-            let prev = ACTIVE_LOCK_WORKERS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-            if prev < MAX_LOCK_WORKERS {
-                let spawned = self::std::thread::Builder::new()
-                    .name(self::std::string::String::from("bstd-lock-drop"))
-                    .spawn(move || {
-                        let _ = file.unlock();
-                        drop(file);
-                        ACTIVE_LOCK_WORKERS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-                    });
-                if spawned.is_ok() {
-                    return;
-                }
-            }
-            ACTIVE_LOCK_WORKERS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        if let Some(fd) = self.0.take() {
+            retire_lock_fd(fd);
         }
     }
 }
@@ -1259,26 +1383,189 @@ fn lock_err_static(msg: &str) -> NativeLockErr {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn lock_err_display(err: impl core::fmt::Display) -> blaze_own::String<blaze_own::SharedAlloc<'static>> {
+fn lock_err_errno(call: &str, errno: blaze_sys::Errno) -> blaze_own::String<blaze_own::SharedAlloc<'static>> {
     let mut out = blaze_own::String::new_in(blaze_own::SharedAlloc::global());
-    let _ = core::fmt::write(&mut out, format_args!("{err}"));
+    let _ = core::fmt::write(&mut out, format_args!("{call} failed (errno {})", errno.raw()));
     out
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn with_component_cstr<R>(
+    part: &str,
+    f: impl FnOnce(blaze_sys::Path<'_>) -> Result<R, blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+) -> Result<R, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    let bytes = part.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&0) || bytes.contains(&b'/') {
+        return Err(blaze_own::String::from_str_in("invalid lock path component", blaze_own::SharedAlloc::global()));
+    }
+    if bytes.len() < 256 {
+        let mut stack = [0u8; 256];
+        if let Some(dst) = stack.get_mut(..bytes.len()) {
+            dst.copy_from_slice(bytes);
+        }
+        let cstr = core::ffi::CStr::from_bytes_with_nul(stack.get(..=bytes.len()).unwrap_or(&[0]))
+            .map_err(|_| blaze_own::String::from_str_in("invalid NUL in lock path", blaze_own::SharedAlloc::global()))?;
+        return f(blaze_sys::Path::new(cstr));
+    }
+    let mut heap = blaze_own::Vec::with_capacity_in(bytes.len() + 1, blaze_own::SharedAlloc::global());
+    heap.extend_from_slice(bytes);
+    heap.push(0);
+    let cstr = core::ffi::CStr::from_bytes_with_nul(heap.as_slice())
+        .map_err(|_| blaze_own::String::from_str_in("invalid NUL in lock path", blaze_own::SharedAlloc::global()))?;
+    f(blaze_sys::Path::new(cstr))
+}
+
+#[cfg(target_os = "linux")]
+fn open_dir_beneath_no_symlink(
+    parent: blaze_sys::Fd,
+    part: &str,
+) -> Result<blaze_sys::posix::io::OwnedFd, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    use blaze_sys::linux::{OpenFlags, OpenHow, Resolve, mkdirat, openat, openat2};
+    let resolve = Resolve::BENEATH.with(Resolve::NO_SYMLINKS).with(Resolve::NO_MAGICLINKS);
+    let how = OpenHow::new(OpenFlags::DIRECTORY | OpenFlags::CLOSE_ON_EXEC, 0, resolve);
+    with_component_cstr(part, |cpath| match openat2(parent, cpath, &how) {
+        Ok(fd) => Ok(fd),
+        Err(blaze_sys::Errno::NoEnt) => {
+            match mkdirat(parent, cpath, 0o755) {
+                Ok(()) | Err(blaze_sys::Errno::Exist) => {}
+                Err(errno) => return Err(lock_err_errno("mkdirat (lock parent)", errno)),
+            }
+            openat2(parent, cpath, &how).map_err(|e| lock_err_errno("openat2 (lock parent)", e))
+        }
+        Err(blaze_sys::Errno::NoSys) => {
+            let flags = OpenFlags::DIRECTORY | OpenFlags::NO_FOLLOW | OpenFlags::CLOSE_ON_EXEC;
+            match openat(parent, cpath, flags, 0) {
+                Ok(fd) => Ok(fd),
+                Err(blaze_sys::Errno::NoEnt) => {
+                    match mkdirat(parent, cpath, 0o755) {
+                        Ok(()) | Err(blaze_sys::Errno::Exist) => {}
+                        Err(errno) => return Err(lock_err_errno("mkdirat (lock parent)", errno)),
+                    }
+                    openat(parent, cpath, flags, 0).map_err(|e| lock_err_errno("openat (lock parent)", e))
+                }
+                Err(errno) => Err(lock_err_errno("openat (lock parent)", errno)),
+            }
+        }
+        Err(errno) => Err(lock_err_errno("openat2 (lock parent)", errno)),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open_dir_beneath_no_symlink(
+    parent: blaze_sys::Fd,
+    part: &str,
+) -> Result<blaze_sys::posix::io::OwnedFd, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    use blaze_sys::posix::io::{OpenFlags, openat};
+    let flags = OpenFlags::DIRECTORY | OpenFlags::NO_FOLLOW | OpenFlags::NO_FOLLOW_ANY | OpenFlags::CLOSE_ON_EXEC;
+    with_component_cstr(part, |cpath| {
+        openat(parent, cpath, flags, 0).map_err(|e| lock_err_errno("openat (lock parent)", e))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_leaf_beneath_no_symlink(
+    parent: blaze_sys::Fd,
+    leaf: &str,
+) -> Result<blaze_sys::posix::io::OwnedFd, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    use blaze_sys::linux::{OpenFlags, OpenHow, Resolve, openat, openat2};
+    let flags = OpenFlags::READ_WRITE | OpenFlags::CREATE | OpenFlags::CLOSE_ON_EXEC | OpenFlags::NONBLOCK;
+    let resolve = Resolve::BENEATH.with(Resolve::NO_SYMLINKS).with(Resolve::NO_MAGICLINKS);
+    let how = OpenHow::new(flags, 0o600, resolve);
+    with_component_cstr(leaf, |cpath| match openat2(parent, cpath, &how) {
+        Ok(fd) => Ok(fd),
+        Err(blaze_sys::Errno::NoSys) => {
+            openat(parent, cpath, flags | OpenFlags::NO_FOLLOW, 0o600)
+                .map_err(|e| lock_err_errno("openat (lock file)", e))
+        }
+        Err(errno) => Err(lock_err_errno("openat2 (lock file)", errno)),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open_leaf_beneath_no_symlink(
+    parent: blaze_sys::Fd,
+    leaf: &str,
+) -> Result<blaze_sys::posix::io::OwnedFd, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    use blaze_sys::posix::io::{OpenFlags, openat};
+    let flags = OpenFlags::READ_WRITE
+        | OpenFlags::CREATE
+        | OpenFlags::NO_FOLLOW
+        | OpenFlags::NO_FOLLOW_ANY
+        | OpenFlags::CLOSE_ON_EXEC
+        | OpenFlags::NONBLOCK;
+    with_component_cstr(leaf, |cpath| {
+        openat(parent, cpath, flags, 0o600).map_err(|e| lock_err_errno("openat (lock file)", e))
+    })
+}
+
+/// Opens `rel` strictly beneath the already-opened `root_fd` without traversing any symbolic link
+/// in any intermediate directory or at the final leaf, then attempts a non-blocking exclusive
+/// `flock`. Returns `Ok(None)` on contention (`EAGAIN`/`EWOULDBLOCK`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_and_try_lock_beneath(
+    root_fd: blaze_sys::Fd,
+    rel: &str,
+) -> Result<Option<blaze_sys::posix::io::OwnedFd>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    let mut parts = rel.split('/').peekable();
+    let mut owned_dir: Option<blaze_sys::posix::io::OwnedFd> = None;
+    let mut leaf: Option<&str> = None;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            leaf = Some(part);
+            break;
+        }
+        let cur = owned_dir.as_ref().map_or(root_fd, |d| d.fd());
+        let next = open_dir_beneath_no_symlink(cur, part)?;
+        owned_dir = Some(next);
+    }
+    let Some(leaf_name) = leaf else {
+        return Err(blaze_own::String::from_str_in("empty lock path", blaze_own::SharedAlloc::global()));
+    };
+    let cur = owned_dir.as_ref().map_or(root_fd, |d| d.fd());
+    let fd = open_leaf_beneath_no_symlink(cur, leaf_name)?;
+    match blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::ExclusiveNonBlock) {
+        Ok(()) => Ok(Some(fd)),
+        Err(blaze_sys::Errno::Again) => {
+            drop(fd);
+            Ok(None)
+        }
+        Err(errno) => {
+            drop(fd);
+            Err(lock_err_errno("flock (exclusive)", errno))
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct LockSlotGuard(bool);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for LockSlotGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            release_lock_slot();
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn lock_exclusive_off_thread(
     cx: &crate::cx::Cx,
-    root: &str,
+    root_dir: blaze_own::Arc<NativeRootDir, blaze_own::SharedAlloc<'static>>,
     rel: &str,
 ) -> Result<NativeLock, NativeLockErr> {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicU8, Ordering};
     use core::time::Duration;
-    use self::std::fs::{OpenOptions, TryLockError};
-    use self::std::path::PathBuf;
     use self::std::sync::mpsc;
 
-    let mut full = PathBuf::from(root);
-    full.push(rel);
+    const STATE_RUNNING: u8 = 0;
+    const STATE_WORKER_DONE: u8 = 1;
+    const STATE_CALLER_ABANDONED: u8 = 2;
+
+    if !try_reserve_lock_slot() {
+        return Err(lock_err_static("file-lock reaper backlog full"));
+    }
+    let mut slot_guard = LockSlotGuard(true);
     let backoff = Duration::from_millis(2);
     loop {
         cx.stopped_by(cx.io().now()).map_err(NativeLockErr::Stopped)?;
@@ -1287,40 +1574,30 @@ pub(crate) fn lock_exclusive_off_thread(
             ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
             return Err(lock_err_static("file-lock worker cap reached (stalled filesystem backlog full)"));
         }
-        let abandoned = blaze_own::Arc::new_in(AtomicBool::new(false), blaze_own::SharedAlloc::global());
-        let abandoned_w = blaze_own::Share::share(&abandoned);
-        let path_w = PathBuf::from(full.as_os_str());
-        type LockMsg = Result<Option<self::std::fs::File>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+        let state = blaze_own::Arc::new_in(AtomicU8::new(STATE_RUNNING), blaze_own::SharedAlloc::global());
+        let state_w = blaze_own::Share::share(&state);
+        let root_w = blaze_own::Share::share(&root_dir);
+        let rel_w = blaze_own::String::from_str_in(rel, blaze_own::SharedAlloc::global());
+        type LockMsg = Result<Option<blaze_sys::posix::io::OwnedFd>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
         let (tx, rx) = mpsc::sync_channel::<LockMsg>(1);
         let spawned = self::std::thread::Builder::new()
             .name(self::std::string::String::from("bstd-lock-op"))
             .spawn(move || {
-                let res: LockMsg = (|| {
-                    if let Some(parent) = path_w.parent() {
-                        let _ = self::std::fs::create_dir_all(parent);
+                let res: LockMsg = open_and_try_lock_beneath(root_w.fd(), rel_w.as_str());
+                if state_w
+                    .compare_exchange(STATE_RUNNING, STATE_WORKER_DONE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    if let Err(mpsc::SendError(Ok(Some(fd)))) = tx.send(res) {
+                        let _ = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
+                        drop(fd);
                     }
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(&path_w)
-                        .map_err(lock_err_display)?;
-                    #[allow(clippy::disallowed_methods, reason = "NativeLock::unlock unlocks explicitly before close")]
-                    match file.try_lock() {
-                        Ok(()) => Ok(Some(file)),
-                        Err(TryLockError::WouldBlock) => Ok(None),
-                        Err(TryLockError::Error(e)) => Err(lock_err_display(e)),
+                } else {
+                    if let Ok(Some(fd)) = res {
+                        let _ = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
+                        drop(fd);
                     }
-                })();
-                if abandoned_w.load(Ordering::Acquire) {
-                    if let Ok(Some(file)) = res {
-                        let _ = file.unlock();
-                        drop(file);
-                    }
-                } else if let Err(mpsc::SendError(Ok(Some(file)))) = tx.send(res) {
-                    let _ = file.unlock();
-                    drop(file);
+                    release_lock_slot();
                 }
                 ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
             });
@@ -1330,12 +1607,27 @@ pub(crate) fn lock_exclusive_off_thread(
         }
         loop {
             match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(Ok(Some(file))) => return Ok(NativeLock(Some(file))),
+                Ok(Ok(Some(fd))) => {
+                    slot_guard.0 = false;
+                    return Ok(NativeLock(Some(fd)));
+                }
                 Ok(Ok(None)) => break, // Contended: backoff and retry.
                 Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Err(stopped) = cx.stopped_by(cx.io().now()) {
-                        abandoned.store(true, Ordering::Release);
+                        if state
+                            .compare_exchange(STATE_RUNNING, STATE_CALLER_ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            // Worker is still running and now owns releasing the lock slot on exit.
+                            slot_guard.0 = false;
+                            return Err(NativeLockErr::Stopped(stopped));
+                        }
+                        // Worker already finished and sent its result; retire any acquired fd off-thread.
+                        if let Ok(Ok(Some(fd))) = rx.recv() {
+                            slot_guard.0 = false;
+                            retire_lock_fd(fd);
+                        }
                         return Err(NativeLockErr::Stopped(stopped));
                     }
                 }
@@ -1357,28 +1649,51 @@ pub(crate) fn unlock_off_thread(cx: &crate::cx::Cx, lock: &mut NativeLock) -> Re
     use core::time::Duration;
     use self::std::sync::mpsc;
 
-    let Some(file) = lock.0.take() else {
+    let Some(fd) = lock.0.take() else {
         return Ok(());
     };
     let prev = ACTIVE_LOCK_WORKERS.fetch_add(1, Ordering::AcqRel);
     if prev >= MAX_LOCK_WORKERS {
         ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-        lock.0 = Some(file);
-        return Err(lock_err_static("file-unlock worker cap reached"));
+        // Never restore `fd` for synchronous drop on the caller thread: retire via bounded reaper!
+        retire_lock_fd(fd);
+        return Err(lock_err_static("file-unlock worker cap reached (retired off-thread)"));
     }
     type UnlockMsg = Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
     let (tx, rx) = mpsc::sync_channel::<UnlockMsg>(1);
+    let fd_slot = blaze_own::Arc::new_in(self::std::sync::Mutex::new(Some(fd)), blaze_own::SharedAlloc::global());
+    let worker_slot = blaze_own::Share::share(&fd_slot);
     let spawned = self::std::thread::Builder::new()
         .name(self::std::string::String::from("bstd-unlock-op"))
         .spawn(move || {
-            let res = file.unlock().map_err(lock_err_display);
-            drop(file);
-            let _ = tx.send(res);
+            let owned = match worker_slot.lock() {
+                Ok(mut g) => g.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            let res = if let Some(owned_fd) = owned {
+                let r = blaze_sys::posix::io::flock(owned_fd.fd(), blaze_sys::posix::io::FlockOp::Unlock)
+                    .map_err(|e| lock_err_errno("flock (unlock)", e));
+                drop(owned_fd);
+                r
+            } else {
+                Ok(())
+            };
+            release_lock_slot();
             ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            let _ = tx.send(res);
         });
     if spawned.is_err() {
         ACTIVE_LOCK_WORKERS.fetch_sub(1, Ordering::AcqRel);
-        return Err(lock_err_static("failed to spawn off-thread file-unlock worker"));
+        let recovered = match fd_slot.lock() {
+            Ok(mut g) => g.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(owned_fd) = recovered {
+            retire_lock_fd(owned_fd);
+        } else {
+            release_lock_slot();
+        }
+        return Err(lock_err_static("failed to spawn off-thread file-unlock worker (retired off-thread)"));
     }
     loop {
         match rx.recv_timeout(Duration::from_millis(10)) {

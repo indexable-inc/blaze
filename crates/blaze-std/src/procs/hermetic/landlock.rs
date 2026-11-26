@@ -405,24 +405,34 @@ fn walk_nix_elf_closure(
 
     // Refuse Linux hosts with a non-empty `/etc/ld.so.preload` (rule 3/21): the dynamic loader
     // preloads those DSOs into every process before `main`, which would either be denied by
-    // Landlock or alter compiler behavior outside the keyed ELF closure.
+    // Landlock or alter compiler behavior outside the keyed ELF closure. Stream through EOF up to
+    // `MAX_PRELOAD_SCAN` bytes so entries past byte 4096 (after long comment headers) are never
+    // truncated or misclassified as empty.
     match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.preload"), OpenFlags::CLOSE_ON_EXEC, 0) {
         Ok(preload_fd) => {
+            const MAX_PRELOAD_SCAN: u64 = 64 << 10;
             let mut preload_buf = [0u8; 4096];
-            let n = read_nix_at(reader, cx, preload_fd.fd(), &mut preload_buf, 0, "pread (/etc/ld.so.preload)")?;
-            let has_entry = preload_buf
-                .get(..n)
-                .unwrap_or(&[])
-                .split(|&b| b == b'\n')
-                .any(|line| {
-                    let trimmed = line.iter().skip_while(|b| b.is_ascii_whitespace()).copied().next();
-                    matches!(trimmed, Some(b) if b != b'#')
-                });
-            if has_entry {
-                return Err(Fault::Host {
-                    call: "landlock (/etc/ld.so.preload unsupported for hermetic probes)",
-                    code: 38,
-                });
+            let mut off = 0u64;
+            let mut scanner = PreloadScanner::new();
+            loop {
+                let n = read_nix_at(reader, cx, preload_fd.fd(), &mut preload_buf, off, "pread (/etc/ld.so.preload)")?;
+                if n == 0 {
+                    break;
+                }
+                if scanner.feed(preload_buf.get(..n).unwrap_or(&[])) {
+                    return Err(Fault::Host {
+                        call: "landlock (/etc/ld.so.preload unsupported for hermetic probes)",
+                        code: 38,
+                    });
+                }
+                let step = u64::try_from(n).unwrap_or(0);
+                off = off.saturating_add(step);
+                if off >= MAX_PRELOAD_SCAN {
+                    return Err(Fault::Host {
+                        call: "landlock (/etc/ld.so.preload exceeds bounded scan limit)",
+                        code: 38,
+                    });
+                }
             }
             if let Some(f) = feed.as_deref_mut() {
                 f(b"/etc/ld.so.preload:empty");
@@ -1453,13 +1463,96 @@ fn enqueue_nix_soname<const N: usize>(
         ];
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let fhs_dirs: &[&[u8]] = &[b"/lib64/", b"/usr/lib64/", b"/lib/", b"/usr/lib/"];
+        let hwcap_subdirs = fhs_hwcap_subdirs(host_caps);
         for fhs_dir in fhs_dirs {
+            // glibc searches supported `glibc-hwcaps/<subdir>/` entries inside each search dir
+            // in descending ISA rank BEFORE falling back to the baseline directory itself.
+            for sub in hwcap_subdirs {
+                let mut joined = [0u8; 128];
+                let jlen = fhs_dir.len().saturating_add(sub.len());
+                if jlen <= joined.len() {
+                    if let Some(head) = joined.get_mut(..fhs_dir.len()) {
+                        head.copy_from_slice(fhs_dir);
+                    }
+                    if let Some(tail) = joined.get_mut(fhs_dir.len()..jlen) {
+                        tail.copy_from_slice(sub);
+                    }
+                    if let Some(prefix) = joined.get(..jlen)
+                        && try_grant_and_enqueue_lib(reader, cx, ruleset, prefix, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
             if try_grant_and_enqueue_lib(reader, cx, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
                 return Ok(());
             }
         }
     }
     Ok(())
+}
+
+/// Streaming line-oriented scanner for `/etc/ld.so.preload` chunks: returns `true` as soon as any
+/// non-whitespace, non-comment (`#`) entry byte is observed, across arbitrary chunk boundaries.
+pub struct PreloadScanner {
+    at_line_start: bool,
+    in_comment: bool,
+}
+
+impl PreloadScanner {
+    pub const fn new() -> Self {
+        Self { at_line_start: true, in_comment: false }
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) -> bool {
+        for &b in chunk {
+            if b == b'\n' {
+                self.at_line_start = true;
+                self.in_comment = false;
+            } else if self.in_comment {
+                continue;
+            } else if self.at_line_start {
+                if b.is_ascii_whitespace() {
+                    continue;
+                }
+                if b == b'#' {
+                    self.in_comment = true;
+                    self.at_line_start = false;
+                } else {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Ranked `glibc-hwcaps` subdirectories searched before baseline FHS directories for a given
+/// x86-64 microarchitecture level (4 -> v4,v3,v2; 3 -> v3,v2; 2 -> v2; <=1 -> none).
+pub const fn x86_64_fhs_hwcap_subdirs(x86_64_level: u8) -> &'static [&'static [u8]] {
+    const ALL: &[&[u8]] = &[
+        b"glibc-hwcaps/x86-64-v4/",
+        b"glibc-hwcaps/x86-64-v3/",
+        b"glibc-hwcaps/x86-64-v2/",
+    ];
+    match x86_64_level {
+        4.. => ALL,
+        3 => &[b"glibc-hwcaps/x86-64-v3/", b"glibc-hwcaps/x86-64-v2/"],
+        2 => &[b"glibc-hwcaps/x86-64-v2/"],
+        _ => &[],
+    }
+}
+
+fn fhs_hwcap_subdirs(host_caps: &HostLdCaps) -> &'static [&'static [u8]] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64_fhs_hwcap_subdirs(host_caps.x86_64_level)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = host_caps;
+        &[]
+    }
 }
 
 fn try_grant_and_enqueue_lib<const N: usize>(
