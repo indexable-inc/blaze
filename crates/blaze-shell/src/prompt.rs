@@ -81,6 +81,24 @@ pub struct ChangedFileDetail {
     pub deleted_lines: Option<u32>,
 }
 
+/// Relation of the current HEAD to the repository's base branch (`main`/`master`/`origin/...`),
+/// including ahead/behind commit counts and common ancestor (`git merge-base`) commit summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchRelation {
+    /// Short display name of the comparison ref (e.g. `"main"`, `"master"`, `"origin/main"`).
+    pub base_ref: String,
+    /// Commits reachable from `HEAD` but not from `base_ref`.
+    pub ahead: u32,
+    /// Commits reachable from `base_ref` but not from `HEAD`.
+    pub behind: u32,
+    /// Abbreviated SHA of the common ancestor (`git merge-base <base_ref> HEAD`).
+    pub merge_base_short: String,
+    /// Unix timestamp (seconds) of the common ancestor commit.
+    pub merge_base_time_secs: i64,
+    /// Single-line subject of the common ancestor commit.
+    pub merge_base_subject: String,
+}
+
 /// Full Starship-class Git prompt summary produced by `blaze-git`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitStatusSummary {
@@ -105,6 +123,9 @@ pub struct GitStatusSummary {
     pub stash_entries: Vec<GitStashEntry>,
     /// Local git branches read directly from `refs/heads` + `packed-refs` (current first, max 16).
     pub branches: Vec<String>,
+    /// Relation of current HEAD to the repo's default/base branch (`main`/`master`/`origin/...`)
+    /// and their common ancestor commit, cached by `(head_oid, base_oid)`.
+    pub branch_relation: Option<BranchRelation>,
     pub dirty: bool,
     pub conflicted: u32,
     pub staged: u32,
@@ -555,6 +576,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     read_git_stash_entries(&head.common_dir, &head.work_tree, &stashes, 6)
                 };
                 let branches = read_local_branches(&head.common_dir, &branch, 16);
+                let branch_relation = read_branch_relation(&head, &branch, detached);
 
                 let dirty = c.conflicted > 0
                     || staged > 0
@@ -575,6 +597,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     stashes,
                     stash_entries,
                     branches,
+                    branch_relation,
                     dirty,
                     conflicted: c.conflicted,
                     staged,
@@ -900,6 +923,228 @@ fn read_local_branches(common_dir: &Path, current: &str, limit: usize) -> Vec<St
     });
     names.truncate(limit);
     names
+}
+
+/// Resolve a git ref (such as `"HEAD"`, `"refs/heads/main"`, `"refs/remotes/origin/main"`)
+/// directly from loose ref files and `packed-refs` with zero subprocesses.
+fn resolve_git_ref_oid(git_dir: &Path, common_dir: &Path, refname: &str) -> Option<String> {
+    let mut current = refname.to_owned();
+    for _ in 0..5 {
+        let loose = if current == "HEAD" {
+            git_dir.join("HEAD")
+        } else {
+            common_dir.join(&current)
+        };
+        if let Ok(raw) = fs::read_to_string(&loose) {
+            let line = raw.lines().next().unwrap_or("").trim();
+            if let Some(target) = line.strip_prefix("ref:") {
+                let next = target.trim();
+                if next.is_empty() {
+                    return None;
+                }
+                current = next.to_owned();
+                continue;
+            }
+            if is_git_oid_hex(line) {
+                return Some(line.to_owned());
+            }
+            return None;
+        }
+        // Loose ref absent: fall back to `packed-refs` in `common_dir`.
+        let packed = fs::read_to_string(common_dir.join("packed-refs")).ok()?;
+        for line in packed.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((oid, name)) = line.split_once(' ')
+                && name == current
+                && is_git_oid_hex(oid)
+            {
+                return Some(oid.to_owned());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+#[inline]
+fn is_git_oid_hex(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Read the remote default branch name from `refs/remotes/origin/HEAD` (e.g. `"main"` or `"master"`).
+fn read_origin_default_branch(common_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(common_dir.join("refs/remotes/origin/HEAD")).ok()?;
+    let line = raw.lines().next()?.trim();
+    let target = line.strip_prefix("ref:")?.trim();
+    let name = target.strip_prefix("refs/remotes/origin/")?;
+    if name.is_empty() { None } else { Some(name.to_owned()) }
+}
+
+/// Pick the best comparison base ref for `current_branch`, returning `(display_name, full_ref, oid)`.
+///
+/// - On a feature branch or detached HEAD: prefers the repo's default branch (`origin/HEAD` target,
+///   then `main`, `origin/main`, `master`, `origin/master`).
+/// - On the default branch itself (`main`/`master`): compares against `origin/<current>` when present.
+fn pick_base_branch_ref(
+    common_dir: &Path,
+    current_branch: &str,
+    detached: bool,
+) -> Option<(String, String, String)> {
+    let origin_def = read_origin_default_branch(common_dir);
+    let on_default = !detached
+        && (current_branch == "main"
+            || current_branch == "master"
+            || origin_def.as_deref() == Some(current_branch));
+
+    let mut candidates: Vec<(String, String)> = Vec::with_capacity(8);
+    if on_default {
+        candidates.push((
+            format!("origin/{current_branch}"),
+            format!("refs/remotes/origin/{current_branch}"),
+        ));
+    } else {
+        if let Some(def) = &origin_def {
+            candidates.push((def.clone(), format!("refs/heads/{def}")));
+            candidates.push((format!("origin/{def}"), format!("refs/remotes/origin/{def}")));
+        }
+        candidates.push(("main".to_owned(), "refs/heads/main".to_owned()));
+        candidates.push(("origin/main".to_owned(), "refs/remotes/origin/main".to_owned()));
+        candidates.push(("master".to_owned(), "refs/heads/master".to_owned()));
+        candidates.push(("origin/master".to_owned(), "refs/remotes/origin/master".to_owned()));
+    }
+
+    let mut seen: Vec<String> = Vec::with_capacity(candidates.len());
+    for (display, full_ref) in candidates {
+        if (!detached && display == current_branch) || seen.contains(&full_ref) {
+            continue;
+        }
+        seen.push(full_ref.clone());
+        if let Some(oid) = resolve_git_ref_oid(common_dir, common_dir, &full_ref) {
+            return Some((display, full_ref, oid));
+        }
+    }
+    None
+}
+
+/// Compute ahead/behind divergence and common ancestor (`git merge-base`) against the repository's
+/// base branch (`main`/`master`/`origin/...`), cached in-process by `(work_tree, head_oid, base_oid)`.
+fn read_branch_relation(
+    head: &GitHead,
+    current_branch: &str,
+    detached: bool,
+) -> Option<BranchRelation> {
+    use std::collections::HashMap;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    struct CachedBranchRel {
+        head_oid: String,
+        base_ref: String,
+        base_oid: String,
+        relation: Option<BranchRelation>,
+    }
+    static BRANCH_REL_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedBranchRel>>> = OnceLock::new();
+
+    let head_oid = resolve_git_ref_oid(&head.git_dir, &head.common_dir, "HEAD")?;
+    let (base_ref, full_ref, base_oid) =
+        pick_base_branch_ref(&head.common_dir, current_branch, detached)?;
+
+    let cache = BRANCH_REL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(hit) = guard.get(&head.work_tree)
+        && hit.head_oid == head_oid
+        && hit.base_ref == base_ref
+        && hit.base_oid == base_oid
+    {
+        return hit.relation.clone();
+    }
+
+    let (ahead, behind, merge_base_oid) = if head_oid == base_oid {
+        (0u32, 0u32, Some(head_oid.clone()))
+    } else {
+        let range = format!("{full_ref}...HEAD");
+        let count_out = Command::new("git")
+            .arg("-C")
+            .arg(&head.work_tree)
+            .args(["rev-list", "--left-right", "--count", &range])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !count_out.status.success() {
+            return None;
+        }
+        let count_str = String::from_utf8_lossy(&count_out.stdout);
+        let mut parts = count_str.split_whitespace();
+        let behind = parts.next()?.parse::<u32>().ok()?;
+        let ahead = parts.next()?.parse::<u32>().ok()?;
+
+        let mb_oid = Command::new("git")
+            .arg("-C")
+            .arg(&head.work_tree)
+            .args(["merge-base", &full_ref, "HEAD"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|s| !s.is_empty());
+
+        (ahead, behind, mb_oid)
+    };
+
+    let (merge_base_short, merge_base_time_secs, merge_base_subject) =
+        if let Some(mb) = merge_base_oid {
+            Command::new("git")
+                .arg("-C")
+                .arg(&head.work_tree)
+                .args(["show", "-s", "--format=%h\x1f%ct\x1f%s", &mb])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    let mut it = s.trim_end_matches(['\r', '\n']).splitn(3, '\x1f');
+                    let short = it.next()?.trim().to_owned();
+                    let ts = it.next()?.trim().parse::<i64>().unwrap_or(0);
+                    let subj = it.next().unwrap_or("").trim().to_owned();
+                    Some((short, ts, subj))
+                })
+                .unwrap_or_else(|| (mb.chars().take(7).collect(), 0, String::new()))
+        } else {
+            (String::new(), 0, String::new())
+        };
+
+    let rel = Some(BranchRelation {
+        base_ref: base_ref.clone(),
+        ahead,
+        behind,
+        merge_base_short,
+        merge_base_time_secs,
+        merge_base_subject,
+    });
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 16 {
+            guard.clear();
+        }
+        guard.insert(
+            head.work_tree.clone(),
+            CachedBranchRel {
+                head_oid,
+                base_ref,
+                base_oid,
+                relation: rel.clone(),
+            },
+        );
+    }
+    rel
 }
 
 fn resolve_scoped(head: &GitHead, sp: &ScopedPath<'_>) -> PathBuf {
@@ -1806,6 +2051,68 @@ mod tests {
             classify_changed_file_kind(&dir.join("deleted_noext"), "deleted_noext"),
             "File"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_relation_reports_divergence_and_common_ancestor() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "blaze_shell_branch_rel_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp repo");
+
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "Blaze")
+                .env("GIT_AUTHOR_EMAIL", "blaze@example.com")
+                .env("GIT_COMMITTER_NAME", "Blaze")
+                .env("GIT_COMMITTER_EMAIL", "blaze@example.com")
+                .args(args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        run_git(&["init", "-q", "-b", "main"]);
+        fs::write(dir.join("a.txt"), "base\n").expect("write base");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "common base commit"]);
+
+        // Create feature branch with 2 commits ahead of common base.
+        run_git(&["switch", "-q", "-c", "feat/demo"]);
+        fs::write(dir.join("feat1.txt"), "1\n").expect("write feat1");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "feat commit one"]);
+        fs::write(dir.join("feat2.txt"), "2\n").expect("write feat2");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "feat commit two"]);
+
+        // Advance `main` by 1 commit so `feat/demo` is 2 ahead, 1 behind `main`.
+        run_git(&["switch", "-q", "main"]);
+        fs::write(dir.join("main2.txt"), "m\n").expect("write main2");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "main moved ahead"]);
+
+        // Switch back to `feat/demo` and verify `query_blaze_git_status` populates `branch_relation`.
+        run_git(&["switch", "-q", "feat/demo"]);
+        let st = query_blaze_git_status(dir.to_str().unwrap()).expect("git status");
+        let rel = st.branch_relation.expect("expected branch relation vs main");
+        assert_eq!(rel.base_ref, "main");
+        assert_eq!(rel.ahead, 2);
+        assert_eq!(rel.behind, 1);
+        assert!(!rel.merge_base_short.is_empty());
+        assert!(rel.merge_base_time_secs > 0);
+        assert_eq!(rel.merge_base_subject, "common base commit");
+
+        // Second call hits the in-process OID cache and returns the exact same relation.
+        let st2 = query_blaze_git_status(dir.to_str().unwrap()).expect("cached git status");
+        assert_eq!(st2.branch_relation, Some(rel));
 
         let _ = fs::remove_dir_all(&dir);
     }

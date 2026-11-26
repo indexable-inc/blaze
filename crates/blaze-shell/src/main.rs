@@ -91,9 +91,9 @@ mod macos_app {
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
-        NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
-        NSPasteboardTypeString, NSResponder, NSView, NSWindow, NSWindowStyleMask,
+        NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSBackingStoreType,
+        NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem,
+        NSPasteboard, NSPasteboardTypeString, NSResponder, NSView, NSWindow, NSWindowStyleMask,
         NSWindowTitleVisibility,
     };
     use objc2_core_graphics::CGColor;
@@ -141,11 +141,19 @@ mod macos_app {
     const ZOOM_STEP_POINTS: f64 = 1.5;
     const CURSOR_TRAIL_SECS: f32 = 0.20;
     /// macOS `FullSizeContentView` native window resize border zone (px).
-    const RESIZE_EDGE: f32 = 8.0;
+    /// Matches AppKit's actual ~4pt inner edge band (avoiding a dead inset strip) with a slightly
+    /// wider corner zone so diagonal corner grabs always reach `NSThemeFrame`.
+    const RESIZE_EDGE: f32 = 4.5;
+    const RESIZE_CORNER: f32 = 9.0;
 
     #[inline]
     fn on_resize_edge(x: f32, y: f32, w: f32, h: f32) -> bool {
-        x <= RESIZE_EDGE || x >= w - RESIZE_EDGE || y >= h - RESIZE_EDGE || y <= 4.0
+        if x <= RESIZE_EDGE || x >= w - RESIZE_EDGE || y <= RESIZE_EDGE || y >= h - RESIZE_EDGE {
+            return true;
+        }
+        let corner_x = x <= RESIZE_CORNER || x >= w - RESIZE_CORNER;
+        let corner_y = y <= RESIZE_CORNER || y >= h - RESIZE_CORNER;
+        corner_x && corner_y
     }
 
     struct CliOpts {
@@ -256,11 +264,11 @@ mod macos_app {
         ResizeNS,
     }
 
-    fn apply_cursor(cur: &mut CursorKind, next: CursorKind) {
-        if *cur == next {
+    fn apply_cursor(cur: &mut Option<CursorKind>, next: CursorKind) {
+        if *cur == Some(next) {
             return;
         }
-        *cur = next;
+        *cur = Some(next);
         #[allow(deprecated)]
         let cursor = match next {
             CursorKind::Arrow => NSCursor::arrowCursor(),
@@ -2683,7 +2691,12 @@ mod macos_app {
             use objc2_app_kit::NSAppearanceCustomization as _;
             window.setAppearance(Some(&app_dark));
         }
+        window.setMinSize(NSSize::new(420.0, 260.0));
         let view = BlazeMetalView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(init_w, init_h)));
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
         window.setContentView(Some(&view));
 
         let renderer = Renderer::new(MTLCreateSystemDefaultDevice().expect("no Metal GPU device"));
@@ -2892,7 +2905,7 @@ mod macos_app {
         let mut active_popover: Option<ActivePopover> = None;
         let mut popup_engaged = false;
         let mut zoom_changed = false;
-        let mut cur_cursor = CursorKind::Arrow;
+        let mut cur_cursor: Option<CursorKind> = None;
         let mut last_mouse: Option<(f32, f32)> = None;
         let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
@@ -4738,22 +4751,25 @@ mod macos_app {
                             let pt = ev.locationInWindow();
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
+                            // Always yield native window resize edges/corners (and traffic lights
+                            // on unfocused windows) directly to AppKit via `with_resize_hook` below.
+                            let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
+                            let yield_to_appkit = on_resize_edge(x, y, size.width as f32, size.height as f32)
+                                || (!window.isKeyWindow() && in_traffic_lights);
+                            if yield_to_appkit {
+                                cur_cursor = None;
+                            }
                             // Clicking an unfocused window activates it AND immediately focuses the
                             // clicked pane, tab, button, or text cursor in a single click (never
-                            // requiring two clicks!). Traffic lights still go straight to AppKit.
-                            if !window.isKeyWindow() {
-                                let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
-                                if in_traffic_lights {
-                                    app.sendEvent(&ev);
-                                    continue;
-                                }
+                            // requiring two clicks!).
+                            if !yield_to_appkit && !window.isKeyWindow() {
                                 #[allow(deprecated)]
                                 app.activateIgnoringOtherApps(true);
                                 window.makeKeyAndOrderFront(None);
                                 dirty = true;
                             }
                             // 0. If the Command Palette is open, handle row clicks or backdrop dismiss!
-                            if let Some(pal) = &command_palette {
+                            if !yield_to_appkit && let Some(pal) = &command_palette {
                                 if let Some(HitAction::SelectPalette(idx)) = composite_scene.hit_test(x, y)
                                     && let Some(act) = pal.action_at(idx)
                                 {
@@ -4776,7 +4792,7 @@ mod macos_app {
                                 continue;
                             }
                             // Let macOS AppKit handle native window edge/corner resize drags directly!
-                            if !on_resize_edge(x, y, size.width as f32, size.height as f32) {
+                            if !yield_to_appkit {
                                 // 1. Grabbing a tiled split divider starts live drag resize!
                                 if y >= TOP_BAR_H
                                     && let Some(&sh) = tile_layout
@@ -4984,7 +5000,7 @@ mod macos_app {
                             let shell = panes
                                 .get_mut(&wm.focused_pane())
                                 .expect("focused pane must exist");
-                            if !on_resize_edge(x, y, size.width as f32, size.height as f32)
+                            if !yield_to_appkit
                                 && shell.agent_hub.is_some()
                             {
                                 if let Some(action) = composite_scene.hit_test(x, y) {
@@ -5066,7 +5082,7 @@ mod macos_app {
                                 }
                                 continue;
                             }
-                            if !on_resize_edge(x, y, size.width as f32, size.height as f32)
+                            if !yield_to_appkit
                                 && !(shell.pty_fullscreen && shell.store.is_alternate_screen())
                                 && shell.yazi.is_none()
                                 && shell.agent_hub.is_none()
@@ -5727,6 +5743,10 @@ mod macos_app {
                                     dirty = true;
                                 }
 
+                                // Keep AppKit's `NSThemeFrame` tracking areas in sync on every
+                                // `MouseMoved` so native resize-border cursors never linger inset
+                                // inside the window, then apply our content cursor on top.
+                                app.sendEvent(&ev);
                                 let next = cursor_for_point(
                                     &composite_scene,
                                     &tile_layout.handles,
@@ -5741,18 +5761,29 @@ mod macos_app {
                                 );
                                 apply_cursor(&mut cur_cursor, next);
                                 continue;
-                            } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
-                                active_popover = None;
-                                dirty = true;
                             }
                             if active_popover.as_ref().is_some_and(|p| !p.pinned) {
                                 active_popover = None;
                                 dirty = true;
                             }
-                            // Only reset to Arrow when strictly outside resize edges (otherwise let AppKit show resize arrows!).
-                            if !near_resize_edge {
+                            if near_resize_edge || !in_window {
+                                // Yield cursor ownership completely to AppKit on the resize border
+                                // and outside the window so the first pixel back inside resets it.
+                                cur_cursor = None;
+                                if !in_window {
+                                    last_mouse = None;
+                                }
+                            } else {
+                                // Over traffic lights (inside window, not on resize edge): let
+                                // AppKit highlight the buttons and ensure the cursor resets to Arrow.
+                                app.sendEvent(&ev);
                                 apply_cursor(&mut cur_cursor, CursorKind::Arrow);
+                                continue;
                             }
+                        }
+                        NSEventType::MouseExited => {
+                            cur_cursor = None;
+                            last_mouse = None;
                         }
                         NSEventType::LeftMouseDragged if window.isKeyWindow() => {
                             let pt = ev.locationInWindow();
@@ -6370,6 +6401,10 @@ mod macos_app {
             let now_key_window = window.isKeyWindow();
             if now_key_window != was_key_window {
                 was_key_window = now_key_window;
+                if !now_key_window {
+                    cur_cursor = None;
+                    last_mouse = None;
+                }
                 if let Some(pane) = panes.get_mut(&wm.focused_pane())
                     && pane.pty_accepts_input()
                 {
@@ -6544,7 +6579,13 @@ mod macos_app {
                 scene.overlay_text.clear();
                 composite_scene = scene;
                 if let Some((mx, my)) = last_mouse
+                    && cur_cursor.is_some()
                     && window.isKeyWindow()
+                    && mx >= 0.0
+                    && my >= 0.0
+                    && mx <= size.width as f32
+                    && my <= size.height as f32
+                    && !(my < TOP_BAR_H && mx < 76.0)
                     && !on_resize_edge(mx, my, size.width as f32, size.height as f32)
                 {
                     let alt_scr = panes

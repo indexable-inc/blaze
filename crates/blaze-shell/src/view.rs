@@ -338,7 +338,11 @@ pub struct DirPreviewEntry {
 pub enum HoverKind {
     Tooltip { title: String, subtitle: Option<String> },
     Directory { cwd: String },
-    GitBranch { current: String, branches: Vec<String> },
+    GitBranch {
+        current: String,
+        branches: Vec<String>,
+        relation: Option<crate::prompt::BranchRelation>,
+    },
     GitChanges {
         files: Vec<(String, &'static str, &'static str)>,
         details: Vec<crate::prompt::ChangedFileDetail>,
