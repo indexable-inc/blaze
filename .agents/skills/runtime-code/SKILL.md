@@ -86,16 +86,17 @@ client, the hub. Logic that does its own IO (reads a file, the clock or the envi
 thread or a process, opens a socket, sleeps) is not finished work, whoever wrote it and however long
 it has been there. When you meet such code in what you are changing, cut the seam in the same change
 without being asked: the decisions go into a core, the IO into a driver that only performs effects
-and returns completions; when it is too large for the change, add an an `agents/annoyances/` row
-naming the file and what blocks it, and a ledger row if it needs one. One implementation, the real
-one: the code that ships is the code the simulation runs. A fake, mock, stub, test double or second
-model written because the real code could not run in a test (a simulated request loop beside the
-real one, a toy scheduler in a test, a hand-written in-memory store with its own logic) is a
-duplicate (`one-concept-one-home`) that proves nothing about what ships: make the real code sans-IO,
-drive it with `Sim`, and delete the fake in the same change. What stays outside the cores is only
-the drivers, and a driver holds no decision: no branch on state, no retry, no ordering choice; if a
-driver needs a test of its logic, that logic belongs in the core. The same unifying goes for two
-cores that decide the same thing: merge them and ban the removed name.
+and returns completions; when it is too large for the change, record a fact/gotcha in
+`agents/kb/facts.jsonl` via `scripts/src/bin/kb.rs` naming the file and what blocks it, and add a
+ledger row if it needs one. One implementation, the real one: the code that ships is the code the
+simulation runs. A fake, mock, stub, test double or second model written because the real code could
+not run in a test (a simulated request loop beside the real one, a toy scheduler in a test, a
+hand-written in-memory store with its own logic) is a duplicate (`one-concept-one-home`) that proves
+nothing about what ships: make the real code sans-IO, drive it with `Sim`, and delete the fake in
+the same change. What stays outside the cores is only the drivers, and a driver holds no decision:
+no branch on state, no retry, no ordering choice; if a driver needs a test of its logic, that logic
+belongs in the core. The same unifying goes for two cores that decide the same thing: merge them and
+ban the removed name.
 
 ## every-wait-says-what (rule 15)
 

@@ -33,9 +33,13 @@ The input is one JSON object (rule 42, unknown fields refused):
     workloads     subset of ["smoke", "cold_hello", "mod500", "ripgrep", "build", "noop_startup"]
                   (default ["smoke", "cold_hello", "mod500"])
     timeout_secs  per-command timeout in seconds (default 120, capped 1..=3600; rule 69)
+    record_kb     optional bool (default false): upsert measured `new` rows into
+                  `<kb_root>/agents/kb/baselines.jsonl`
+    kb_root       optional repo root for KB baselines (default ".")
 "#;
 
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt::Write as _,
     path::{Path, PathBuf},
@@ -47,8 +51,9 @@ use blaze_script::{
     child::{self, Ended, Measured},
     exit, expect, fail,
     input::{self, Fields, Input, InputError},
-    read_text_lossy, run_within,
+    py_round, read_text_lossy, run_within, utc_now,
 };
+use serde_json::{Map, Number, Value};
 
 const SCRIPT: &str = "bench_wave";
 const WORKLOADS: [&str; 6] = [
@@ -61,10 +66,12 @@ const WORKLOADS: [&str; 6] = [
 ];
 const DEFAULT_WORKLOADS: [&str; 3] = ["smoke", "cold_hello", "mod500"];
 const DEFAULT_HELLO_WORLD: &str = "/Volumes/Projects/tmp/hello-world";
+const DEFAULT_KB_ROOT: &str = ".";
 const DEFAULT_TRIALS: i64 = 3;
 const MAX_TRIALS: i64 = 20;
 const DEFAULT_TIMEOUT_SECS: i64 = 120;
 const MAX_TIMEOUT_SECS: i64 = 3600;
+const GIT_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 const MOD500_COUNT: usize = 500;
 const NOOP_STARTUP_RUNS: usize = 10;
 const REMOVE_RETRY_ATTEMPTS: usize = 5;
@@ -96,6 +103,8 @@ struct Args {
     workloads: Vec<String>,
     workloads_explicit: bool,
     timeout_secs: u64,
+    record_kb: bool,
+    kb_root: String,
 }
 
 impl Input for Args {
@@ -107,6 +116,8 @@ impl Input for Args {
         "ripgrep",
         "workloads",
         "timeout_secs",
+        "record_kb",
+        "kb_root",
     ];
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
@@ -157,6 +168,11 @@ impl Input for Args {
         let timeout_secs = u64::try_from(timeout_raw).map_err(|_| {
             InputError(format!("{} is out of range: {timeout_raw}", f.at("timeout_secs")))
         })?;
+        let record_kb = f.bool("record_kb", Some(false))?;
+        let kb_root = f.str("kb_root", Some(DEFAULT_KB_ROOT))?;
+        if kb_root.trim().is_empty() {
+            return Err(InputError(format!("{} must not be empty", f.at("kb_root"))));
+        }
         Ok(Args {
             old,
             new,
@@ -166,6 +182,8 @@ impl Input for Args {
             workloads,
             workloads_explicit,
             timeout_secs,
+            record_kb,
+            kb_root,
         })
     }
 }
@@ -1931,7 +1949,269 @@ fn run_wave_inner(args: &Args, work_root: &WorkRoot) -> Result<i32, String> {
         report.push_str(&render_smoke_quote(&new_display, &platform, cores, steps));
     }
     write_stdout(&report);
+    if args.record_kb && !rows.is_empty() {
+        let kb_root = Path::new(&args.kb_root);
+        let commit = git_head_short(kb_root);
+        let date = utc_date_from_iso(&utc_now());
+        let meta = KbRecordMeta {
+            machine: &platform,
+            cores,
+            commit: &commit,
+            date: &date,
+            trials: args.trials,
+            noop_runs: noop_startup.as_ref().map_or(NOOP_STARTUP_RUNS, |s| s.runs),
+            noop_bin_bytes: noop_startup.as_ref().map(|s| s.new_bin_bytes),
+        };
+        let (path, written) = upsert_kb_baselines(kb_root, &rows, &meta)?;
+        write_stderr(&format!(
+            "{SCRIPT}: recorded {written} baseline row(s) to {}\n",
+            path.display()
+        ));
+    }
     Ok(exit_code)
+}
+
+/// Context needed to serialize measured `new` workload rows into `agents/kb/baselines.jsonl`.
+struct KbRecordMeta<'a> {
+    machine: &'a str,
+    cores: usize,
+    commit: &'a str,
+    date: &'a str,
+    trials: usize,
+    noop_runs: usize,
+    noop_bin_bytes: Option<u64>,
+}
+
+/// Extract `YYYY-MM-DD` from an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
+fn utc_date_from_iso(iso: &str) -> String {
+    iso.get(..10)
+        .filter(|s| {
+            let b = s.as_bytes();
+            b.len() == 10
+                && b[4] == b'-'
+                && b[7] == b'-'
+                && b.iter()
+                    .enumerate()
+                    .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        })
+        .map_or_else(|| "1970-01-01".to_owned(), str::to_owned)
+}
+
+/// Short git HEAD commit hash in `root`, or `"unknown"` when `root` is not a git checkout
+/// or `git` fails/times out (Rule 69).
+fn git_head_short(root: &Path) -> String {
+    if !root.is_dir() {
+        return "unknown".to_owned();
+    }
+    let Ok(Some(ran)) = run_within(
+        &["git", "rev-parse", "--short", "HEAD"],
+        root,
+        GIT_HEAD_TIMEOUT,
+    ) else {
+        return "unknown".to_owned();
+    };
+    if ran.status != 0 {
+        return "unknown".to_owned();
+    }
+    let trimmed = ran.out().trim().to_owned();
+    if trimmed.is_empty()
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        "unknown".to_owned()
+    } else {
+        trimmed
+    }
+}
+
+/// Canonical KB workload slug for `agents/kb/baselines.jsonl` (safe for `<machine>-<workload>-<commit>` IDs).
+fn kb_workload_slug(label: &str) -> String {
+    match label {
+        "cold_hello (check)" => return "cold_hello".to_owned(),
+        "mod500 (cold)" => return "mod500_cold".to_owned(),
+        "mod500 (1-file edit)" => return "mod500_edit".to_owned(),
+        "ripgrep/crates/regex (cold)" => return "ripgrep_cold".to_owned(),
+        "ripgrep/crates/regex (1-file edit)" => return "ripgrep_edit".to_owned(),
+        "build (hello-world)" => return "build_hello".to_owned(),
+        "noop_startup (warm check)" => return "noop_startup_warm_check".to_owned(),
+        "noop_startup (--version)" => return "noop_startup_version".to_owned(),
+        _ => {}
+    }
+    let mut slug = String::with_capacity(label.len());
+    let mut prev_sep = true;
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep {
+            slug.push('_');
+            prev_sep = true;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "workload".to_owned()
+    } else {
+        slug
+    }
+}
+
+fn json_f64(value: f64) -> Result<Value, String> {
+    let finite = if value.is_finite() { value } else { 0.0 };
+    let rounded = py_round(finite, 2);
+    let clean = if rounded == 0.0 { 0.0 } else { rounded };
+    Number::from_f64(clean)
+        .map(Value::Number)
+        .ok_or_else(|| format!("non-finite float cannot be serialized to JSON: {value}"))
+}
+
+fn breakdown_item(component: &str, value: f64, unit: &str) -> Result<Value, String> {
+    let mut obj = Map::with_capacity(3);
+    obj.insert("component".to_owned(), Value::String(component.to_owned()));
+    obj.insert("value".to_owned(), json_f64(value)?);
+    obj.insert("unit".to_owned(), Value::String(unit.to_owned()));
+    Ok(Value::Object(obj))
+}
+
+/// Build one canonical JSONL line for `<kb_root>/agents/kb/baselines.jsonl` from a measured `new` row.
+fn build_baseline_entry(
+    row: &RowSummary,
+    meta: &KbRecordMeta<'_>,
+) -> Result<(String, String), String> {
+    let workload = kb_workload_slug(&row.workload);
+    let id = format!("{}-{workload}-{}", meta.machine, meta.commit);
+    let wall_ms = json_f64(row.new.wall_ms)?;
+    let rss_mb = json_f64(row.new.peak_rss_bytes as f64 / 1_000_000.0)?;
+
+    let mut breakdown = Vec::new();
+    for (stage_name, stage) in [
+        ("stage_names", row.new.names),
+        ("stage_heads", row.new.heads),
+        ("stage_bodies", row.new.bodies),
+    ] {
+        if let Some(st) = stage {
+            breakdown.push(breakdown_item(&format!("{stage_name}_wall"), st.wall_ms, "ms")?);
+            breakdown.push(breakdown_item(&format!("{stage_name}_cpu"), st.cpu_ms, "ms")?);
+        }
+    }
+    if workload.starts_with("noop_startup")
+        && let Some(bin_bytes) = meta.noop_bin_bytes
+    {
+        breakdown.push(breakdown_item(
+            "binary_size",
+            bin_bytes as f64 / 1_000_000.0,
+            "MB",
+        )?);
+    }
+
+    let per_core = format_per_core(row.new.wall_ms, meta.cores, row.work_bytes);
+    let floor_note = if workload.starts_with("noop_startup") {
+        if let Some(bin_bytes) = meta.noop_bin_bytes {
+            format!(
+                "bench_wave ({} runs, {} cores, binary {}): {per_core}",
+                meta.noop_runs,
+                meta.cores,
+                format_mb(bin_bytes)
+            )
+        } else {
+            format!("bench_wave ({} runs, {} cores): {per_core}", meta.noop_runs, meta.cores)
+        }
+    } else {
+        format!("bench_wave ({} trials, {} cores): {per_core}", meta.trials, meta.cores)
+    };
+
+    let mut obj = Map::with_capacity(10);
+    obj.insert("id".to_owned(), Value::String(id.clone()));
+    obj.insert("machine".to_owned(), Value::String(meta.machine.to_owned()));
+    obj.insert("cores".to_owned(), Value::Number(Number::from(meta.cores as u64)));
+    obj.insert("commit".to_owned(), Value::String(meta.commit.to_owned()));
+    obj.insert("date".to_owned(), Value::String(meta.date.to_owned()));
+    obj.insert("workload".to_owned(), Value::String(workload));
+    obj.insert("wall_ms".to_owned(), wall_ms);
+    obj.insert("rss_mb".to_owned(), rss_mb);
+    obj.insert("breakdown".to_owned(), Value::Array(breakdown));
+    obj.insert("floor_note".to_owned(), Value::String(floor_note));
+
+    let line = serde_json::to_string(&Value::Object(obj))
+        .map_err(|e| format!("failed to serialize KB baseline `{id}`: {e}"))?;
+    Ok((id, line))
+}
+
+/// Upsert measured `new` workload rows into `<kb_root>/agents/kb/baselines.jsonl`, keeping
+/// lines canonically sorted by `id` (1 JSON object per line, trailing newline) so `kb check` passes.
+fn upsert_kb_baselines(
+    kb_root: &Path,
+    rows: &[RowSummary],
+    meta: &KbRecordMeta<'_>,
+) -> Result<(PathBuf, usize), String> {
+    let kb_dir = kb_root.join("agents").join("kb");
+    let path = kb_dir.join("baselines.jsonl");
+    let mut by_id: BTreeMap<String, String> = BTreeMap::new();
+
+    if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        for (idx, raw_line) in existing.lines().enumerate() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let line_no = idx + 1;
+            let val: Value = serde_json::from_str(trimmed)
+                .map_err(|e| format!("{}:{line_no}: invalid JSON line: {e}", path.display()))?;
+            let id = val
+                .as_object()
+                .and_then(|obj| obj.get("id"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "{}:{line_no}: baseline row must be a JSON object with non-empty string `id`",
+                        path.display()
+                    )
+                })?
+                .to_owned();
+            let canonical = serde_json::to_string(&val).map_err(|e| {
+                format!("{}:{line_no}: failed to serialize baseline row: {e}", path.display())
+            })?;
+            if by_id.contains_key(&id) {
+                return Err(format!("{}:{line_no}: duplicate baseline id `{id}`", path.display()));
+            }
+            by_id.insert(id, canonical);
+        }
+    }
+
+    let mut written = 0usize;
+    for row in rows {
+        let (id, line) = build_baseline_entry(row, meta)?;
+        by_id.insert(id, line);
+        written += 1;
+    }
+
+    std::fs::create_dir_all(&kb_dir)
+        .map_err(|e| format!("failed to create {}: {e}", kb_dir.display()))?;
+    let mut out = String::new();
+    for line in by_id.values() {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let tmp_path = kb_dir.join(format!(".baselines.jsonl.tmp-{}", std::process::id()));
+    std::fs::write(&tmp_path, &out)
+        .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        if std::fs::remove_file(&tmp_path).is_err() {
+            // Best-effort cleanup of sibling temp file before reporting the rename error.
+        }
+        return Err(format!(
+            "failed to rename {} -> {}: {e}",
+            tmp_path.display(),
+            path.display()
+        ));
+    }
+    Ok((path, written))
 }
 
 fn run_wave(args: &Args) -> ! {
@@ -1971,7 +2251,9 @@ fn run_selftest_cases() {
             && minimal.hello_world == DEFAULT_HELLO_WORLD
             && minimal.ripgrep.is_none()
             && minimal.workloads == ["smoke", "cold_hello", "mod500"]
-            && minimal.timeout_secs == 120,
+            && minimal.timeout_secs == 120
+            && !minimal.record_kb
+            && minimal.kb_root == DEFAULT_KB_ROOT,
         "minimal JSON input applies all documented defaults",
     );
 
@@ -1983,7 +2265,9 @@ fn run_selftest_cases() {
             "hello_world": "/custom/hw",
             "ripgrep": "/custom/rg",
             "workloads": ["smoke", "cold_hello", "mod500", "ripgrep", "build", "noop_startup"],
-            "timeout_secs": 45
+            "timeout_secs": 45,
+            "record_kb": true,
+            "kb_root": "/custom/kb"
         }"#,
     )
     .unwrap_or_else(|e| fail(SCRIPT, &format!("full input failed: {}", e.0)));
@@ -1995,8 +2279,10 @@ fn run_selftest_cases() {
             && full.ripgrep.as_deref() == Some("/custom/rg")
             && full.workloads
                 == ["smoke", "cold_hello", "mod500", "ripgrep", "build", "noop_startup"]
-            && full.timeout_secs == 45,
-        "full A/B JSON input parses every field including noop_startup",
+            && full.timeout_secs == 45
+            && full.record_kb
+            && full.kb_root == "/custom/kb",
+        "full A/B JSON input parses every field including noop_startup, record_kb and kb_root",
     );
 
     let noop_only = parse_args_json(r#"{"new": "/b/blaze", "workloads": ["noop_startup"]}"#)
@@ -2025,6 +2311,9 @@ fn run_selftest_cases() {
         r#"{"new": "/b/blaze", "workloads": ["nope"]}"#,
         r#"{"new": "/b/blaze", "workloads": ["export"]}"#,
         r#"{"new": "/b/blaze", "workloads": ["smoke", "smoke"]}"#,
+        r#"{"new": "/b/blaze", "record_kb": "yes"}"#,
+        r#"{"new": "/b/blaze", "kb_root": ""}"#,
+        r#"{"new": "/b/blaze", "kb_root": 123}"#,
     ] {
         check(
             parse_args_json(bad).is_err(),
@@ -2259,6 +2548,210 @@ Names ran 0.0 s beside Scripts
     let removed_ok = remove_tree_writable(&mod_dir).is_ok()
         && !mod_dir.exists()
         && remove_tree_writable(&mod_dir).is_ok();
+
+    // 5. KB baseline recording (`record_kb`): write, canonical sorting, and upsert by `id`.
+    check(
+        utc_date_from_iso("2026-11-26T09:07:07Z") == "2026-11-26"
+            && utc_date_from_iso("not-a-date") == "1970-01-01",
+        "utc_date_from_iso extracts YYYY-MM-DD and guards malformed input",
+    );
+    check(
+        git_head_short(Path::new("/nonexistent/bench-wave-kb-selftest")) == "unknown",
+        "git_head_short falls back to `unknown` for missing/non-git roots",
+    );
+    check(
+        kb_workload_slug("cold_hello (check)") == "cold_hello"
+            && kb_workload_slug("mod500 (cold)") == "mod500_cold"
+            && kb_workload_slug("mod500 (1-file edit)") == "mod500_edit"
+            && kb_workload_slug("ripgrep/crates/regex (cold)") == "ripgrep_cold"
+            && kb_workload_slug("ripgrep/crates/regex (1-file edit)") == "ripgrep_edit"
+            && kb_workload_slug("noop_startup (warm check)") == "noop_startup_warm_check"
+            && kb_workload_slug("noop_startup (--version)") == "noop_startup_version",
+        "kb_workload_slug produces canonical ID-safe slugs for all wave workloads",
+    );
+
+    let kb_root = tmp.path().join("kb-repo");
+    let kb_meta = KbRecordMeta {
+        machine: "macos-aarch64",
+        cores: 18,
+        commit: "abc1234",
+        date: "2026-11-26",
+        trials: 3,
+        noop_runs: NOOP_STARTUP_RUNS,
+        noop_bin_bytes: Some(48_100_000),
+    };
+    let initial_rows = [
+        RowSummary {
+            workload: "ripgrep/crates/regex (cold)".to_owned(),
+            work_bytes: 500_000,
+            old: None,
+            new: SideSummary {
+                wall_ms: 420.126,
+                peak_rss_bytes: 95_400_000,
+                names: Some(StageTime { wall_ms: 30.2, cpu_ms: 110.4 }),
+                heads: None,
+                bodies: Some(StageTime { wall_ms: 210.5, cpu_ms: 1400.0 }),
+            },
+        },
+        RowSummary {
+            workload: "cold_hello (check)".to_owned(),
+            work_bytes: 120,
+            old: None,
+            new: SideSummary {
+                wall_ms: 47.8,
+                peak_rss_bytes: 18_200_000,
+                ..SideSummary::default()
+            },
+        },
+        noop_ab.check_row.clone(),
+        noop_ab.version_row.clone(),
+        ab_rows[0].clone(),
+    ];
+    let (kb_path, first_written) = match upsert_kb_baselines(&kb_root, &initial_rows, &kb_meta) {
+        Ok(res) => res,
+        Err(e) => {
+            drop(tmp);
+            fail(SCRIPT, &format!("initial upsert_kb_baselines failed: {e}"));
+        }
+    };
+    let first_text = match std::fs::read_to_string(&kb_path) {
+        Ok(text) => text,
+        Err(e) => {
+            drop(tmp);
+            fail(SCRIPT, &format!("failed to read {}: {e}", kb_path.display()));
+        }
+    };
+    let first_lines: Vec<&str> = first_text.lines().collect();
+    let mut first_ids = Vec::with_capacity(first_lines.len());
+    let mut schema_ok = first_written == initial_rows.len()
+        && first_lines.len() == initial_rows.len()
+        && first_text.ends_with('\n');
+    for line in &first_lines {
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(line) else {
+            schema_ok = false;
+            break;
+        };
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        let expected_keys = [
+            "id",
+            "machine",
+            "cores",
+            "commit",
+            "date",
+            "workload",
+            "wall_ms",
+            "rss_mb",
+            "breakdown",
+            "floor_note",
+        ];
+        if keys != expected_keys {
+            schema_ok = false;
+            break;
+        }
+        let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
+        let cores_ok = obj.get("cores").and_then(Value::as_i64) == Some(18);
+        let wall_ok = matches!(obj.get("wall_ms"), Some(Value::Number(n)) if n.is_f64());
+        let rss_ok = matches!(obj.get("rss_mb"), Some(Value::Number(n)) if n.is_f64());
+        let breakdown_ok = obj.get("breakdown").is_some_and(Value::is_array);
+        let note_ok = obj
+            .get("floor_note")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        if id.is_empty() || !cores_ok || !wall_ok || !rss_ok || !breakdown_ok || !note_ok {
+            schema_ok = false;
+            break;
+        }
+        first_ids.push(id.to_owned());
+    }
+    let first_sorted = first_ids.windows(2).all(|w| w[0] < w[1]);
+    let has_expected_first_ids = first_ids
+        == [
+            "macos-aarch64-cold_hello-abc1234",
+            "macos-aarch64-mod500_cold-abc1234",
+            "macos-aarch64-noop_startup_version-abc1234",
+            "macos-aarch64-noop_startup_warm_check-abc1234",
+            "macos-aarch64-ripgrep_cold-abc1234",
+        ];
+
+    // Second write: upsert `noop_startup (warm check)` with a new wall_ms and add `mod500 (1-file edit)`.
+    let upsert_rows = [
+        RowSummary {
+            workload: "noop_startup (warm check)".to_owned(),
+            work_bytes: 120,
+            old: None,
+            new: SideSummary {
+                wall_ms: 4.69,
+                peak_rss_bytes: 7_900_000,
+                ..SideSummary::default()
+            },
+        },
+        RowSummary {
+            workload: "mod500 (1-file edit)".to_owned(),
+            work_bytes: 200_000,
+            old: None,
+            new: SideSummary {
+                wall_ms: 14.25,
+                peak_rss_bytes: 62_000_000,
+                ..SideSummary::default()
+            },
+        },
+    ];
+    let (_, second_written) = match upsert_kb_baselines(&kb_root, &upsert_rows, &kb_meta) {
+        Ok(res) => res,
+        Err(e) => {
+            drop(tmp);
+            fail(SCRIPT, &format!("upsert_kb_baselines update failed: {e}"));
+        }
+    };
+    let second_text = match std::fs::read_to_string(&kb_path) {
+        Ok(text) => text,
+        Err(e) => {
+            drop(tmp);
+            fail(SCRIPT, &format!("failed to re-read {}: {e}", kb_path.display()));
+        }
+    };
+    let second_lines: Vec<&str> = second_text.lines().collect();
+    let mut second_ids = Vec::with_capacity(second_lines.len());
+    let mut updated_warm_check_ok = false;
+    for line in &second_lines {
+        if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(line)
+            && let Some(id) = obj.get("id").and_then(Value::as_str)
+        {
+            if id == "macos-aarch64-noop_startup_warm_check-abc1234" {
+                let wall_eq = obj
+                    .get("wall_ms")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|w| approx_eq(w, 4.69));
+                let rss_eq = obj
+                    .get("rss_mb")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|r| approx_eq(r, 7.9));
+                let has_bin_size = obj
+                    .get("breakdown")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.iter().any(|item| {
+                            item.get("component").and_then(Value::as_str) == Some("binary_size")
+                                && item.get("unit").and_then(Value::as_str) == Some("MB")
+                        })
+                    });
+                updated_warm_check_ok = wall_eq && rss_eq && has_bin_size;
+            }
+            second_ids.push(id.to_owned());
+        }
+    }
+    let second_sorted = second_ids.windows(2).all(|w| w[0] < w[1]);
+    let upsert_count_ok = second_written == 2 && second_ids.len() == 6;
+
+    // Corrupt existing baselines.jsonl must fail loudly (Rule 3 & Rule 19).
+    let bad_kb_root = tmp.path().join("bad-kb-repo");
+    let bad_kb_dir = bad_kb_root.join("agents").join("kb");
+    let bad_setup_ok = std::fs::create_dir_all(&bad_kb_dir).is_ok()
+        && std::fs::write(bad_kb_dir.join("baselines.jsonl"), "{not-json}\n").is_ok();
+    let bad_kb_rejected = bad_setup_ok
+        && upsert_kb_baselines(&bad_kb_root, &upsert_rows, &kb_meta)
+            .is_err_and(|msg| msg.contains("baselines.jsonl:1:"));
+
     drop(tmp);
 
     check(
@@ -2268,6 +2761,22 @@ Names ran 0.0 s beside Scripts
     );
     check(generated_ok, "mod500 fixture generator writes valid crate layout");
     check(removed_ok, "remove_tree_writable removes populated and already-absent directories");
+    check(
+        schema_ok && first_sorted && has_expected_first_ids,
+        &format!(
+            "record_kb writes canonical sorted baselines.jsonl (ids={first_ids:?}):\n{first_text}"
+        ),
+    );
+    check(
+        upsert_count_ok && second_sorted && updated_warm_check_ok,
+        &format!(
+            "record_kb upserts existing id and preserves sorted baselines.jsonl (ids={second_ids:?}):\n{second_text}"
+        ),
+    );
+    check(
+        bad_kb_rejected,
+        "record_kb refuses malformed existing baselines.jsonl naming file and line",
+    );
 }
 
 fn selftest() {
