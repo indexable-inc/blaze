@@ -833,14 +833,17 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             b: PTy,
             next_k: u32,
             depth: u32,
+            /// Inside a matched `Alias` pair, a child mismatch means `Unknown` (the two aliases
+            /// may still normalize to the same type), never `Differ`.
+            in_alias: bool,
         }
         let open = |n: PNode| matches!(n, PNode::Infer | PNode::Error | PNode::Alias { .. });
         let mut stack: [Option<ErasedFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
         let mut sp: usize = 0;
         let mut out = Keyed::Same;
-        let mut enter = Some((a, b, depth));
+        let mut enter = Some((a, b, depth, false));
         loop {
-            if let Some((a, b, d)) = enter.take() {
+            if let Some((a, b, d, in_alias)) = enter.take() {
                 if d > MOST_WALK_DEPTH || budget.get() == 0 {
                     out = Keyed::Unknown;
                     continue;
@@ -863,19 +866,32 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     out = Keyed::Unknown;
                     continue;
                 };
+                // Two syntactically identical aliases (`<T as Tr>::A` vs `<T as Tr>::A`, e.g.
+                // inside `NodeTypesWithDBAdapter<Node::Types, Node::DB>`) match `Keyed::Same` when
+                // all their arguments match `Keyed::Same`; any mismatch inside an alias downgrades
+                // to `Keyed::Unknown` (never `Differ`, since distinct aliases can normalize equal).
+                let same_alias_head = matches!(
+                    (na, nb),
+                    (PNode::Alias { trait_: t1, name: n1, .. }, PNode::Alias { trait_: t2, name: n2, .. })
+                        if t1 == t2 && n1 == n2
+                );
                 // What structure does not decide: a hole, an error, or an alias not normalized here.
                 // Distinct `Opaque(x)` / `Opaque(y)` and `Opaque` vs concrete types are distinct
                 // nominal types in callers (`head_eq` returns `Keyed::Differ`).
-                if open(na) || open(nb) {
+                if !same_alias_head && (open(na) || open(nb)) {
                     out = Keyed::Unknown;
                     continue;
                 }
                 // A const's type is a node of its own table: compare its bits, then its type.
                 if let (PNode::ConstValue { ty: ta, bits: x }, PNode::ConstValue { ty: tb, bits: y }) = (na, nb) {
                     if x != y {
+                        if in_alias {
+                            out = Keyed::Unknown;
+                            continue;
+                        }
                         return Keyed::Differ;
                     }
-                    enter = Some((Side { ty: ta, slots: a.slots }, tb, d + 1));
+                    enter = Some((Side { ty: ta, slots: a.slots }, tb, d + 1, in_alias));
                     continue;
                 }
                 // An impl's or callee's const parameter (never bound by `blaze-borrow`, since
@@ -885,7 +901,11 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     out = Keyed::Unknown;
                     continue;
                 }
-                if !head_eq(na, nb) {
+                if !same_alias_head && !head_eq(na, nb) {
+                    if in_alias {
+                        out = Keyed::Unknown;
+                        continue;
+                    }
                     return Keyed::Differ;
                 }
                 let (Ok(ka), Ok(kb)) = (self.kids_of(a), self.types.kids(b)) else {
@@ -893,6 +913,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     continue;
                 };
                 if ka.len() != kb.len() {
+                    if in_alias || same_alias_head {
+                        out = Keyed::Unknown;
+                        continue;
+                    }
                     return Keyed::Differ;
                 }
                 if ka.len() > 0 {
@@ -900,7 +924,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         out = Keyed::Unknown;
                         continue;
                     };
-                    *slot = Some(ErasedFrame { a, b, next_k: 0, depth: d });
+                    *slot = Some(ErasedFrame { a, b, next_k: 0, depth: d, in_alias: in_alias || same_alias_head });
                     sp += 1;
                 }
                 continue;
@@ -927,7 +951,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     sp = top_idx;
                     continue;
                 };
-                enter = Some((Side { ty: x, slots: frame.a.slots }, y, frame.depth + 1));
+                enter = Some((Side { ty: x, slots: frame.a.slots }, y, frame.depth + 1, frame.in_alias));
             } else {
                 sp = top_idx;
             }
@@ -1018,7 +1042,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 let both_alias = matches!((na, nb), (PNode::Alias { .. }, PNode::Alias { .. }));
                 let same_alias = matches!((na, nb), (PNode::Alias { trait_: t, name: n, .. }, PNode::Alias { trait_: u, name: m, .. }) if t == u && n == m)
                     && self.erased_sides(a, b);
-                if !same_alias {
+                // A trait fn's RPITIT return type appears as `Opaque(op, args)` in the trait
+                // signature and as its synthetic `Alias { trait_, name, args }` in the caller's
+                // typed body. When delegating through a caller where-clause (no concrete impl
+                // selected), both sides denote the same abstract future and equate directly.
+                let same_rpitit = match (na, nb) {
+                    (PNode::Opaque(op, _), PNode::Alias { trait_, name, .. })
+                    | (PNode::Alias { trait_, name, .. }, PNode::Opaque(op, _)) => self.selected.is_rpitit_alias(op, trait_, name),
+                    _ => false,
+                };
+                if !same_alias && !same_rpitit {
                     if matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. }) {
                         let mut ba = MOST_WALK_STEPS;
                         let mut bb = MOST_WALK_STEPS;
@@ -1091,7 +1124,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         continue;
                     }
                 }
-                let mut heads_match = head_eq(na, nb);
+                let mut heads_match = head_eq(na, nb) || same_rpitit;
                 if !heads_match {
                     if let PNode::Opaque(op_key, _) = na {
                         match self.normalize_rpitit(a, op_key, nb, d)? {
@@ -2665,8 +2698,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             return self.walk(norm, term, Variance::In, 1);
         }
         // Reflexive projection equality (`<T as Tr<A..>>::N == <T as Tr<A..>>::N`, e.g.
-        // `P: WriterIn<Buffer = B>` instantiated with `B = P::Buffer`): relate own lifetime slots
-        // and `[Self, A..]` invariantly, just as `walk_loop`'s `same_alias` does.
+        // `P: WriterIn<Buffer = B>` instantiated with `B = P::Buffer`, or
+        // `Pool::Transaction::Pooled == <BasicNetworkPrimitives<_, Pool::Transaction::Pooled> as NetworkPrimitives>::PooledTransaction`):
+        // normalize `term` first so projections that reduce to the same alias match reflexively,
+        // then relate own lifetime slots and `[Self, A..]` invariantly, just as `walk_loop`'s
+        // `same_alias` does.
+        let term = if let Resolved::Side(term_res) = self.resolve(term)? {
+            self.try_normalize_subject(term_res, 0)
+        } else {
+            term
+        };
         if let Resolved::Side(term_res) = self.resolve(term)?
             && let PNode::Alias { trait_: t2, name: n2, .. } = self.node(term_res)?
             && t2 == trait_
