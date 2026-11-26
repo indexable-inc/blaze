@@ -118,7 +118,7 @@ covers. Numbers are stable ids, not an order. Edit scripts/src/bin/rules.rs, run
 
 ### Evidence and debugging (skill `debugging`)
 - **17. ask-the-profile-first**: Say why a build was slow, reran or grew from its profile, before guessing or measuring.
-- **61. claims-from-evidence**: State as fact only what a tool call here showed; a pass counts only with proof the check ran.
+- **61. claims-from-evidence**: State only measured facts & Amdahl-bounded estimates; a pass needs proof the check ran.
 
 ### Design and changing code (skill `changing-code`)
 - **13. fix-through-blaze-lints**: Change many sites with an astlog rules file or a `.clippy.toml` ban: never by text.
