@@ -548,18 +548,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return Ok(self.common.err);
             };
             self.register_trait(tr, trait_args, self.written_cause(anchor.ty_range, cause))?;
-            // The GAT's own parameters follow Self and the trait parameters. Check arity
-            // before lowering any argument against its corresponding declaration.
-            let own = assoc.generic_args.len;
-            let written = def.generics.saturating_add(own);
-            if !self.alias_arity(tr, assoc.name, written, cause)? {
-                return Ok(self.common.err);
-            }
-            let projection_args = if own == 0 {
-                trait_args
-            } else {
-                let args = self.explicit_args(at, Some(assoc), decl.item, def.generics, own)?;
+            // The GAT's own parameters follow Self and the trait parameters. In value/expression
+            // path position, omitted arguments (`<K as Key>::MapStorage::empty()`) are inferred
+            // with fresh inference variables; explicit turbofish arguments are checked against
+            // the declared arity.
+            let projection_args = if assoc.has_args {
+                let own = assoc.generic_args.len;
+                let written = def.generics.saturating_add(own);
+                if !self.alias_arity(tr, assoc.name, written, cause)? {
+                    return Ok(self.common.err);
+                }
+                if own == 0 {
+                    trait_args
+                } else {
+                    let args = self.explicit_args(at, Some(assoc), decl.item, def.generics, own)?;
+                    self.concat(trait_args, args)?
+                }
+            } else if let Some(g) = self.reads.assoc_generics(tr, assoc.name)?
+                && g.own > 0
+            {
+                let args = self.fresh_generic_args(decl.item, def.generics, g.own)?;
                 self.concat(trait_args, args)?
+            } else {
+                trait_args
             };
             let projected = self.project(tr, projection_args, assoc.name, cause)?;
             let projected = self.try_structurally_resolve(projected)?;
