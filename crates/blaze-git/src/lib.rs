@@ -52,6 +52,7 @@ pub mod slab;
 pub mod storage;
 pub mod vfs;
 pub mod wire;
+pub mod worktree;
 
 #[cfg(test)]
 mod engine_tests;
