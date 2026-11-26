@@ -702,3 +702,170 @@ fn parallel_slab_records_and_chunked_pack_match_reference() {
         assert_eq!(a_buf.as_slice(), b_buf.as_slice());
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. LazyVfs CoW overlay, O(dirty) status, write_tree, BGOV manifest, and NFSv3 wire protocol
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lazy_vfs_cow_status_write_tree_and_nfs3_protocol_roundtrip() {
+    use crate::{
+        FileStatus, UntrackedMode,
+        nfs3::Nfs3Conn,
+        vfs::{
+            LazyVfs, ROOT_INO, VfsKind, VfsOpts, decode_overlay_status, encode_overlay_status,
+        },
+    };
+
+    let alloc = test_alloc();
+    let mut store = MemStore::new(alloc);
+
+    let b_readme = mk_blob(&mut store, b"hello lazy vfs\n");
+    let b_src = mk_blob(&mut store, b"fn main() {}\n");
+    let b_untouched = mk_blob(&mut store, b"never hydrated\n");
+    let b_link = mk_blob(&mut store, b"README.md");
+
+    let t_src = mk_tree(
+        &mut store,
+        &[TreeBuildEntry { mode: 0o100644, name: b"main.rs", oid: b_src }],
+        alloc,
+    );
+    let t_untouched = mk_tree(
+        &mut store,
+        &[TreeBuildEntry { mode: 0o100644, name: b"deep.txt", oid: b_untouched }],
+        alloc,
+    );
+    let root_tree = mk_tree(
+        &mut store,
+        &[
+            TreeBuildEntry { mode: 0o100644, name: b"README.md", oid: b_readme },
+            TreeBuildEntry { mode: 0o120000, name: b"doc-link", oid: b_link },
+            TreeBuildEntry { mode: 0o040000, name: b"src", oid: t_src },
+            TreeBuildEntry { mode: 0o040000, name: b"untouched", oid: t_untouched },
+        ],
+        alloc,
+    );
+
+    // 1. O(1) lazy mount: 0 trees hydrated, 0 blobs read!
+    let mut vfs = LazyVfs::new(Some(root_tree), VfsOpts::DEFAULT, alloc);
+    assert_eq!(vfs.stats().trees_hydrated, 0);
+    assert_eq!(vfs.stats().blobs_read_from_store, 0);
+
+    // 2. Lookup + stat uses `object_size` without inflating blobs!
+    let (_readme_ino, readme_attr) = vfs.lookup(ROOT_INO, "README.md", &store).unwrap();
+    assert_eq!(readme_attr.kind, VfsKind::File);
+    assert_eq!(readme_attr.size, 15);
+    assert_eq!(vfs.stats().trees_hydrated, 1); // ONLY root hydrated; `src` and `untouched` untouched!
+    assert_eq!(vfs.stats().blobs_read_from_store, 0);
+
+    let (link_ino, link_attr) = vfs.lookup(ROOT_INO, "doc-link", &store).unwrap();
+    assert_eq!(link_attr.kind, VfsKind::Symlink);
+    let mut link_out = Vec::new_in(alloc);
+    vfs.readlink(link_ino, &store, &mut link_out).unwrap();
+    assert_eq!(link_out.as_slice(), b"README.md");
+
+    // 3. Copy-on-Write edit, revert-to-clean check, create, mkdir, remove, rename.
+    let (src_ino, _) = vfs.lookup(ROOT_INO, "src", &store).unwrap();
+    let (main_ino, _) = vfs.lookup(src_ino, "main.rs", &store).unwrap();
+    vfs.write(main_ino, 0, b"fn main() { 42 }\n", 1_700_000_100, &store).unwrap();
+    let (fresh_ino, _) = vfs.create(ROOT_INO, "new.txt", 0o644, true, 1_700_000_101, &store).unwrap();
+    vfs.write(fresh_ino, 0, b"brand new\n", 1_700_000_101, &store).unwrap();
+    vfs.remove(ROOT_INO, "README.md", 1_700_000_102, &store).unwrap();
+
+    // `untouched/` was NEVER hydrated — and `dirty_status` must NOT hydrate it!
+    let hydrated_before = vfs.stats().trees_hydrated;
+    assert_eq!(hydrated_before, 2); // root + src only!
+    let (counts, entries) = vfs.dirty_status(UntrackedMode::Normal, &store, alloc).unwrap();
+    assert_eq!(vfs.stats().trees_hydrated, hydrated_before);
+    assert_eq!(counts.deleted, 1);
+    assert_eq!(counts.modified, 1);
+    assert_eq!(counts.untracked, 1);
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].path.as_str(), "README.md");
+    assert_eq!(entries[0].worktree, FileStatus::Deleted);
+    assert_eq!(entries[1].path.as_str(), "new.txt");
+    assert_eq!(entries[1].worktree, FileStatus::Untracked);
+    assert_eq!(entries[2].path.as_str(), "src/main.rs");
+    assert_eq!(entries[2].worktree, FileStatus::Modified);
+
+    // 4. `BGOV` v1 manifest round-trip & CRC corruption refusal.
+    let mut bgov = Vec::new_in(alloc);
+    encode_overlay_status(
+        vfs.overlay_generation(),
+        Some("main"),
+        Some(root_tree),
+        counts,
+        &entries,
+        &mut bgov,
+    );
+    let decoded = decode_overlay_status(&bgov, alloc).unwrap();
+    assert_eq!(decoded.branch.as_ref().map(|s| s.as_str()), Some("main"));
+    assert_eq!(decoded.entries.len(), 3);
+    // Flip a byte -> CRC-32 must reject!
+    bgov[10] ^= 0xff;
+    assert!(decode_overlay_status(&bgov, alloc).is_err());
+
+    // 5. `write_tree` materializes ONLY dirty subtrees (reuses `t_untouched` OID directly!).
+    let new_root = vfs.write_tree(&mut store).unwrap();
+    assert_ne!(new_root, root_tree);
+    let mut new_root_raw = Vec::new_in(alloc);
+    assert_eq!(store.read_object(&new_root, &mut new_root_raw).unwrap(), Some(ObjectKind::Tree));
+    let mut found_untouched_oid = None;
+    let mut iter = crate::objects::TreeIter::new(new_root, &new_root_raw);
+    while let Some(te) = iter.next_entry().unwrap() {
+        if te.name == b"untouched" {
+            found_untouched_oid = Some(te.oid);
+        }
+    }
+    assert_eq!(found_untouched_oid, Some(t_untouched));
+
+    // 6. SunRPC/XDR + MOUNTv3 + NFSv3 wire protocol round-trip over fragmented TCP (7-byte chunks).
+    let mut conn = Nfs3Conn::new(alloc);
+    let mut rpc_req = Vec::new_in(alloc);
+    let mut push_call = |xid: u32, prog: u32, vers: u32, proc_id: u32, args: &[u8]| {
+        let mut body = Vec::new_in(alloc);
+        for w in [xid, 0u32, 2, prog, vers, proc_id, 0, 0, 0, 0] {
+            body.extend_from_slice(&w.to_be_bytes());
+        }
+        body.extend_from_slice(args);
+        let rm = 0x8000_0000u32 | (body.len() as u32);
+        rpc_req.extend_from_slice(&rm.to_be_bytes());
+        rpc_req.extend_from_slice(&body);
+    };
+
+    // Call 1: MOUNTv3 MNT("/")
+    let mut mnt_args = Vec::new_in(alloc);
+    mnt_args.extend_from_slice(&1u32.to_be_bytes());
+    mnt_args.extend_from_slice(b"/\0\0\0");
+    push_call(101, 100_005, 3, 1, &mnt_args);
+
+    // Call 2: NFSv3 READ on `new.txt` (fresh_ino)
+    let mut read_args = Vec::new_in(alloc);
+    read_args.extend_from_slice(&8u32.to_be_bytes());
+    read_args.extend_from_slice(&fresh_ino.to_be_bytes());
+    read_args.extend_from_slice(&0u64.to_be_bytes()); // offset
+    read_args.extend_from_slice(&64u32.to_be_bytes()); // count
+    push_call(102, 100_003, 3, 6, &read_args);
+
+    // Feed 7 bytes at a time to exercise TCP fragmentation!
+    let mut replies = Vec::new_in(alloc);
+    for chunk in rpc_req.chunks(7) {
+        conn.feed_bytes(chunk);
+        conn.poll(&mut vfs, &store, 1_700_000_200, &mut replies).unwrap();
+    }
+    // Parse both framed SunRPC replies and verify XIDs + payload bytes `"brand new\n"`.
+    assert!(replies.len() > 40);
+    let r1_len = (u32::from_be_bytes(replies[0..4].try_into().unwrap()) & 0x7fff_ffff) as usize;
+    let r1 = &replies[4..4 + r1_len];
+    assert_eq!(u32::from_be_bytes(r1[0..4].try_into().unwrap()), 101); // XID 101
+    assert_eq!(u32::from_be_bytes(r1[20..24].try_into().unwrap()), 0); // ACCEPT_SUCCESS
+    assert_eq!(u32::from_be_bytes(r1[24..28].try_into().unwrap()), 0); // MNT3_OK
+
+    let r2_off = 4 + r1_len;
+    let r2_len = (u32::from_be_bytes(replies[r2_off..r2_off + 4].try_into().unwrap()) & 0x7fff_ffff) as usize;
+    let r2 = &replies[r2_off + 4..r2_off + 4 + r2_len];
+    assert_eq!(u32::from_be_bytes(r2[0..4].try_into().unwrap()), 102); // XID 102
+    assert_eq!(u32::from_be_bytes(r2[20..24].try_into().unwrap()), 0); // ACCEPT_SUCCESS
+    assert_eq!(u32::from_be_bytes(r2[24..28].try_into().unwrap()), 0); // NFS3_OK
+    assert!(r2.windows(10).any(|w| w == b"brand new\n"));
+}

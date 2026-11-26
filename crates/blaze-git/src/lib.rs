@@ -43,12 +43,14 @@ pub mod index;
 pub mod infect;
 pub mod machine;
 pub mod merge;
+pub mod nfs3;
 pub mod objects;
 pub mod pack_write;
 pub mod plant;
 pub mod refs;
 pub mod slab;
 pub mod storage;
+pub mod vfs;
 pub mod wire;
 
 #[cfg(test)]

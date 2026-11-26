@@ -136,6 +136,10 @@ impl<'a> ObjectStore<'a> for MappedSlabView<'_, 'a> {
         Ok(Some(rec.kind))
     }
 
+    fn object_size(&self, oid: &Oid, _alloc: Alloc<'a>) -> Result<Option<u64>, GitError> {
+        Ok(self.idx().and_then(|idx| idx.lookup(oid)).map(|loc| u64::from(loc.raw_len)))
+    }
+
     fn write_object(&mut self, _kind: ObjectKind, _body: &[u8]) -> Result<Oid, GitError> {
         Err(GitError { file: GitFile::Slab, at: 0, kind: ErrorKind::UnexpectedReply })
     }
@@ -548,6 +552,13 @@ impl<'a> ObjectStore<'a> for BgitDiskStore<'a> {
             out.extend_from_slice(slice);
         }
         Ok(Some(rec.kind))
+    }
+
+    fn object_size(&self, oid: &Oid, alloc: Alloc<'a>) -> Result<Option<u64>, GitError> {
+        if self.overlay.has_object(oid) {
+            return self.overlay.object_size(oid, alloc);
+        }
+        Ok(self.verified_index().and_then(|idx| idx.lookup(oid)).map(|loc| u64::from(loc.raw_len)))
     }
 
     fn write_object(&mut self, kind: ObjectKind, body: &[u8]) -> Result<Oid, GitError> {

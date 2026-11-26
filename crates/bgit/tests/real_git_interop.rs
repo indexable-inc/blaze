@@ -269,3 +269,84 @@ fn bgit_status_matches_real_git_porcelain_and_works_on_pure_bgit_repos() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn bgit_clone_vfs_lazy_mount_cow_edits_and_o_dirty_status_on_macos() {
+    let base = std::env::temp_dir().join(format!("bgit-vfs-interop-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let origin = base.join("origin");
+    let lazy_clone = base.join("lazy-work");
+    fs::create_dir_all(origin.join("src")).unwrap();
+
+    run_git(&origin, &["init", "-b", "main"]);
+    fs::write(origin.join("README.md"), "origin readme\n").unwrap();
+    fs::write(origin.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    run_git(&origin, &["add", "."]);
+    run_git(&origin, &["commit", "-m", "initial"]);
+    run_bgit(&["infect", origin.to_str().unwrap()]);
+
+    // Serve `origin` over Smart HTTP v2 and clone with `--vfs` (0 files written to APFS)!
+    let mut server = Command::new(bgit_bin())
+        .args(["serve", "--http", "127.0.0.1:0", origin.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bgit serve");
+
+    let mut ready_line = String::new();
+    let mut reader = BufReader::new(server.stdout.take().unwrap());
+    reader.read_line(&mut ready_line).unwrap();
+    let url = ready_line
+        .trim()
+        .strip_prefix("bgit-http listening on ")
+        .expect("listening banner")
+        .split_whitespace()
+        .next()
+        .expect("url")
+        .to_string();
+
+    let clone_out = run_bgit(&["clone", "--vfs", &url, lazy_clone.to_str().unwrap()]);
+    assert!(clone_out.contains("files=0"), "expected 0 files materialized on disk: {clone_out}");
+    assert!(clone_out.contains("Mounted"), "expected VFS mount confirmation: {clone_out}");
+
+    // Ensure unmount happens even if an assertion fails.
+    struct UnmountGuard(std::path::PathBuf);
+    impl Drop for UnmountGuard {
+        fn drop(&mut self) {
+            let _ = Command::new(bgit_bin()).args(["unmount", self.0.to_str().unwrap()]).output();
+        }
+    }
+    let _guard = UnmountGuard(lazy_clone.clone());
+
+    // 1. Lazy read through macOS kernel NFSv3!
+    assert_eq!(fs::read_to_string(lazy_clone.join("src/lib.rs")).unwrap(), "pub fn answer() -> u32 { 42 }\n");
+    let clean_st = Command::new(bgit_bin())
+        .args(["status", lazy_clone.to_str().unwrap(), "--porcelain", "-b"])
+        .output()
+        .unwrap();
+    assert!(clean_st.status.success());
+    assert_eq!(String::from_utf8_lossy(&clean_st.stdout), "## main\n");
+
+    // 2. Copy-on-Write edit, create, and delete inside the lazy VFS!
+    fs::write(lazy_clone.join("src/lib.rs"), "pub fn answer() -> u32 { 99 }\n").unwrap();
+    fs::write(lazy_clone.join("added.txt"), "hello vfs\n").unwrap();
+    fs::remove_file(lazy_clone.join("README.md")).unwrap();
+    assert_eq!(fs::read_to_string(lazy_clone.join("src/lib.rs")).unwrap(), "pub fn answer() -> u32 { 99 }\n");
+
+    // 3. O(dirty) `bgit status` must reflect all 3 overlay mutations immediately!
+    let dirty_st = Command::new(bgit_bin())
+        .args(["status", lazy_clone.to_str().unwrap(), "--porcelain", "-b"])
+        .output()
+        .unwrap();
+    assert!(dirty_st.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&dirty_st.stdout),
+        "## main\n D README.md\n M src/lib.rs\n?? added.txt\n"
+    );
+
+    drop(_guard);
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = fs::remove_dir_all(&base);
+}
