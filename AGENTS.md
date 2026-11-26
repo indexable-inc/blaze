@@ -33,15 +33,17 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
   and `.agents/skills/` (load the relevant skill before domain work, including `authoring-prompts`
   before editing rules/skills/briefs).
 - ✨ **Core gap (build scripts & proc macros):** `MacroModule` (`macros.rs`/`script_modules.rs`) is
-  lookup-only — blaze does not compile `build.rs` or proc-macro crates itself yet (it has native
-  arm64 codegen + OS sandboxes, no wasm32 backend yet), so any crate missing from
+  lookup-only — blaze does not compile `build.rs` or proc-macro crates itself yet (no `blaze-lir →
+  wasm64` emitter wired yet), so any crate missing from
   `~/.blaze/v2/{proc-macro,build-script}/modules` fails `CrateScope` and blocks downstream crates. ✨
 - 🚀 **Endgame (self-compiled usercode):** Turn `MacroModule` into a real blaze compile task (zero
   `toolrun.sh`/`rustc`): (1) Tier 0 `#[comptime]` reflection for blaze/bstd code (zero proc-macros);
-  (2) Tier 1 `wasm32-wasip1` emitter off blaze's V3 SSA/LIR backend for all proc-macros & pure-Rust
-  `build.rs` (~10-50 µs in-process Wasmtime, exact WASI read-tracing, cross-OS R2-shared `.wasm`);
-  (3) Tier 2 blaze's native arm64 backend + OS sandbox + pinned `clang` for C-linking `build.rs`
-  (built first to unblock `build.rs` immediately with zero throwaway work). 🚀
+  (2) Tier 1 `wasm64` (`memory64`) emitter off `blaze-lir` + `blaze-export/src/wasm64.rs` for all
+  proc-macros & pure-Rust `build.rs` (64-bit pointers match host layout, no
+  `wasi-libc`/`wasm-lld`/regalloc, ~10-50 µs in-process Wasmtime, exact `blaze-comptime`
+  read-tracing, cross-OS R2-shared `.wasm`); (3) Tier 2 host spawns & C-linking native tools
+  (`clang`/`cc`/`cmake`) routed through blaze's own hypervisor micro-VM sandbox (hardware isolation,
+  hermetic FS, deterministic prefix-maps). 🚀
 
 ## Core Rules
 
