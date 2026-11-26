@@ -169,14 +169,13 @@ fn swap_remove_fast<T>(v: &mut Vec<T, Alloc<'_>>, idx: usize) {
     }
 }
 
+/// Binary-searches a `orig_inst`-sorted call-clobber table in O(log C).
 #[inline]
-fn lookup_call_clobbers(table: &[(u32, CallClobbers)], orig_inst: u32) -> CallClobbers {
-    for &(idx, clob) in table {
-        if idx == orig_inst {
-            return clob;
-        }
+fn lookup_call_clobbers_sorted(table: &[(u32, CallClobbers)], orig_inst: u32) -> CallClobbers {
+    match table.binary_search_by_key(&orig_inst, |&(idx, _)| idx) {
+        Ok(pos) => table[pos].1,
+        Err(_) => CallClobbers::C_ABI_ARM64,
     }
-    CallClobbers::C_ABI_ARM64
 }
 
 // -----------------------------------------------------------------------------
@@ -1417,9 +1416,55 @@ fn range_list_shorten_def(
     range_list_add(head, nodes, def_pt, def_pt);
 }
 
-/// Two-pointer overlap test over two sorted disjoint half-point range slices.
+/// Overlap test over two sorted disjoint half-point range slices.
+///
+/// Uses O(1) bounding-box rejection and O(|small| log |large|) binary search when the two slices
+/// differ sharply in size (the common `VReg` vs `phys_spans` case on large functions), falling into
+/// a linear two-pointer merge when lengths are comparable.
 #[inline]
 fn ranges_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    let (Some(&(a0_s, a0_e)), Some(&(b0_s, b0_e))) = (a.first(), b.first()) else {
+        return false;
+    };
+    let a_last_e = a[a.len() - 1].1;
+    let b_last_e = b[b.len() - 1].1;
+    if a_last_e < b0_s || b_last_e < a0_s {
+        return false;
+    }
+    if a.len() == 1 {
+        let j = b.partition_point(|&(_, b_e)| b_e < a0_s);
+        return b.get(j).is_some_and(|&(b_s, _)| b_s <= a0_e);
+    }
+    if b.len() == 1 {
+        let i = a.partition_point(|&(_, a_e)| a_e < b0_s);
+        return a.get(i).is_some_and(|&(a_s, _)| a_s <= b0_e);
+    }
+    if b.len() > a.len().saturating_mul(4) {
+        let mut j = 0usize;
+        for &(a_s, a_e) in a {
+            j += b[j..].partition_point(|&(_, b_e)| b_e < a_s);
+            let Some(&(b_s, _)) = b.get(j) else {
+                return false;
+            };
+            if b_s <= a_e {
+                return true;
+            }
+        }
+        return false;
+    }
+    if a.len() > b.len().saturating_mul(4) {
+        let mut i = 0usize;
+        for &(b_s, b_e) in b {
+            i += a[i..].partition_point(|&(_, a_e)| a_e < b_s);
+            let Some(&(a_s, _)) = a.get(i) else {
+                return false;
+            };
+            if a_s <= b_e {
+                return true;
+            }
+        }
+        return false;
+    }
     let mut i = 0usize;
     let mut j = 0usize;
     while let (Some(&(a_s, a_e)), Some(&(b_s, b_e))) = (a.get(i), b.get(j)) {
@@ -2438,6 +2483,19 @@ pub fn allocate_mfunc<'a>(
     let n_blocks = func.block_insts.len();
     let n_vregs = func.vreg_class.len();
 
+    // Ensure `call_clobbers` is sorted by `orig_inst` once so every per-call lookup across
+    // Phases 1, 2, 3, and 5 is O(log C) instead of O(C). Zero allocation when already sorted.
+    let mut call_clobbers_owned: Vec<(u32, CallClobbers), Alloc<'a>> = Vec::new_in(alloc);
+    let call_clobbers_sorted: &[(u32, CallClobbers)] =
+        if opts.call_clobbers.is_sorted_by_key(|&(idx, _)| idx) {
+            opts.call_clobbers
+        } else {
+            call_clobbers_owned.reserve(opts.call_clobbers.len());
+            call_clobbers_owned.extend_from_slice(opts.call_clobbers);
+            call_clobbers_owned.sort_unstable_by_key(|&(idx, _)| idx);
+            call_clobbers_owned.as_slice()
+        };
+
     // Ensure CSR predecessor/successor tables are populated before dataflow.
     if func.block_succs_off.len() != n_blocks + 1 || func.block_preds_off.len() != n_blocks + 1 {
         func.rebuild_cfg(alloc);
@@ -2457,6 +2515,7 @@ pub fn allocate_mfunc<'a>(
 
     let mut lin_to_orig: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(func.ops.len(), alloc);
     let mut call_sites: Vec<CallSite, Alloc<'a>> = Vec::new_in(alloc);
+    let mut all_call_clobbers: u64 = 0;
     let mut sp_mod_lins: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
     let mut has_calls = false;
     let mut explicitly_uses_fp = false;
@@ -2478,7 +2537,8 @@ pub fn allocate_mfunc<'a>(
             let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             if is_call_op(op, fl) {
                 has_calls = true;
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32);
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32);
+                all_call_clobbers |= clob.clobbered.0;
                 let def_pt = lin_p
                     .checked_mul(2)
                     .and_then(|x| x.checked_add(1))
@@ -2552,7 +2612,7 @@ pub fn allocate_mfunc<'a>(
             let (_, pdefs) = explicit_phys_masks(op, &func.copy_pairs);
             phys_gen |= pdefs;
             if is_call_op(op, fl) {
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0;
                 phys_gen &= !clob;
                 kill |= clob;
             }
@@ -2609,7 +2669,7 @@ pub fn allocate_mfunc<'a>(
             let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             if is_call_op(op, fl) {
                 slice_set(&mut inst_impl_phys_uses, p, reach & CALL_ARG_PHYS_MASK);
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0;
                 reach &= !clob;
             } else if matches!(*op, MOp::Ret) {
                 slice_set(&mut inst_impl_phys_uses, p, reach & RET_VAL_PHYS_MASK & ret_allowed_mask);
@@ -2668,7 +2728,7 @@ pub fn allocate_mfunc<'a>(
             let total_pu = op_pu | slice_at(&inst_impl_phys_uses, p, 0);
             pu_acc |= total_pu & !pd_acc;
             if is_call_op(op, fl) {
-                op_pd |= lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
+                op_pd |= lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0;
                 op_pd |= 1u64 << 30; // `bl`/`blr` writes `LR` (`X30`).
             }
             pd_acc |= op_pd;
@@ -2807,7 +2867,7 @@ pub fn allocate_mfunc<'a>(
             // 1. Physical busy spans at `def_pt` and `use_pt` (excluding call clobbers handled via `call_sites`).
             let (op_pu, op_pd) = explicit_phys_masks(op, &func.copy_pairs);
             let call_clob = if is_call_op(op, fl) {
-                lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0 | (1u64 << 30)
+                lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0 | (1u64 << 30)
             } else {
                 0
             };
@@ -2989,14 +3049,20 @@ pub fn allocate_mfunc<'a>(
         //    Uses `def_pt <= re` because a `VReg` live-out past a trailing call in its block
         //    ends at `blk_end_pt == call.def_pt`, whereas a `Blr` target dying at the call ends
         //    at even `use_pt == call.def_pt - 1`.
-        if !call_sites.is_empty() {
+        if !call_sites.is_empty() && (forbid.0 & all_call_clobbers) != all_call_clobbers {
             for &(rs, re) in slice {
+                if (forbid.0 & all_call_clobbers) == all_call_clobbers {
+                    break;
+                }
                 let mut pos = call_sites.partition_point(|c| c.def_pt <= rs);
                 while let Some(&cs) = call_sites.get(pos) {
                     if cs.def_pt > re {
                         break;
                     }
                     forbid = forbid.union(cs.clobbers.clobbered);
+                    if (forbid.0 & all_call_clobbers) == all_call_clobbers {
+                        break;
+                    }
                     pos += 1;
                 }
             }
@@ -3911,7 +3977,7 @@ pub fn allocate_mfunc<'a>(
 
             if is_call_op(&op, fl) {
                 let orig_u32 = u32_of(orig).unwrap_or(0);
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32);
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32);
                 transitive_call_clobbers = transitive_call_clobbers
                     .union(clob.clobbered)
                     .with(Reg(30));
@@ -6132,6 +6198,32 @@ mod tests {
                 let cold_sum = 8u64.wrapping_mul(cold_base).wrapping_add(360);
                 let expected = n.wrapping_mul(per_iter).wrapping_add(cold_sum);
                 assert_eq!(f(n, base, cold_base), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn ranges_overlap_matches_linear_oracle_across_asymmetric_shapes() {
+        fn oracle(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+            a.iter().any(|&(as_, ae)| b.iter().any(|&(bs, be)| as_ <= be && bs <= ae))
+        }
+        let long: std::vec::Vec<(u32, u32)> = (0..100).map(|i| (i * 10, i * 10 + 3)).collect();
+        let probes: [&[(u32, u32)]; 9] = [
+            &[],
+            &[(4, 9)],
+            &[(990, 990)],
+            &[(994, 1050)],
+            &[(4, 9), (14, 19), (994, 999)],
+            &[(4, 9), (503, 505), (994, 999)],
+            &[(0, 0), (10, 10)],
+            &[(3, 10)],
+            &[(5, 8), (15, 18), (25, 28), (35, 38), (45, 48), (55, 58)],
+        ];
+        for p in probes {
+            assert_eq!(super::ranges_overlap(p, &long), oracle(p, &long), "probe vs long: {p:?}");
+            assert_eq!(super::ranges_overlap(&long, p), oracle(&long, p), "long vs probe: {p:?}");
+            for q in probes {
+                assert_eq!(super::ranges_overlap(p, q), oracle(p, q), "probe vs probe: {p:?} vs {q:?}");
             }
         }
     }

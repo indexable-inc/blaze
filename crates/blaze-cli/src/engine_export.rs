@@ -979,6 +979,7 @@ fn run_export_worker_epoch<'f>(
     let reader = sync_typed.reader(cx, crates.snapshot(), heap.alloc());
     let mut maker: Maker<'_, crate::run_ids::Runnable, _> =
         Maker::of_start(names, maker_entry, maker_start, ByKind::new(reader), builder, heap.alloc());
+    maker.watch(crate::run_parent::command_make_watch());
     let mut scratch: AVec<'_, u8> = Vec::new_in(heap.alloc());
     let mut makes = 0usize;
 
@@ -1631,6 +1632,7 @@ fn export_program<'f>(
         None => (!roots.is_empty()).then(|| roots.root(0).tabled),
     };
     let mut maker = Maker::of_roots(names, maker_entry, &roots, ByKind::new(typed.over(ids)), &builder, heap.alloc());
+    maker.watch(crate::run_parent::command_make_watch());
     let mut codes = HomeCodeStore::new(lent);
 
     // Whole-program reachability closure from all roots.
