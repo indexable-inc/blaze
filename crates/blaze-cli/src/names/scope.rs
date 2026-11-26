@@ -124,9 +124,10 @@ const PREPARES_RESERVE: usize = 2 << 30;
 /// frees in bulk at end of `resolve_metered`).
 const PAR_CRATE_RESERVE: usize = 1 << 30;
 
-/// Per-item scratch frame reservation inside parallel `FilePar::map` worker calls (chunk-cached
-/// in `blaze_mem`, zero syscalls on hot path, dropped immediately after each item).
-const PAR_CALL_SCRATCH: usize = 64 << 20;
+/// Per-item scratch frame reservation inside parallel `FilePar::map` worker calls (virtual
+/// address space reserved, committed on demand; chunk-cached in `blaze_mem`, dropped immediately
+/// after each item). Large proc-macro expansions (`alloy_sol_types::sol!`) exceed 64 MiB.
+const PAR_CALL_SCRATCH: usize = 1 << 30;
 
 /// Stage-scoped compiled declarative macro cache (`Prepares`), shared across all crates in one
 /// `Names` stage so `core`/`std`/`serde`/`cfg_if!` macros are lexed and compiled once per build

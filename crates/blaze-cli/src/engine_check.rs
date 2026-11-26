@@ -5616,9 +5616,10 @@ where
     loop {
         let mut heads_lazy: Option<crate::front_load::ScopeRecords<'_>> = None;
         let mut reset_heads = false;
+        let mut refresh_snap = false;
         let mut more = true;
         while more {
-            let mut ran_heads = false;
+            let mut ran_stage = None;
             more = one_phase(
                 rq,
                 engine,
@@ -5632,16 +5633,22 @@ where
                 &heads_snap,
                 &mut heads_lazy,
                 &mut heads_once,
-                &mut ran_heads,
+                &mut ran_stage,
             )?;
-            if ran_heads && !engine.has_pending_stage(Stage::Heads) {
+            if ran_stage == Some(Stage::Heads) && !engine.has_pending_stage(Stage::Heads) {
                 reset_heads = true;
+                break;
+            }
+            if ran_stage == Some(Stage::Names) && heads_snap.get().is_some() {
+                refresh_snap = true;
                 break;
             }
         }
         drop(heads_lazy);
         if reset_heads {
             heads_once = None;
+            heads_snap = core::cell::OnceCell::new();
+        } else if refresh_snap {
             heads_snap = core::cell::OnceCell::new();
         }
         if !more {
@@ -5676,7 +5683,7 @@ fn one_phase<'d, 'f, 'r, 's, 'w, 'm, 'l>(
     heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
     heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
     heads_once: &mut Option<crate::engine_heads_once::HeadsOnce>,
-    ran_heads: &mut bool,
+    ran_stage: &mut Option<Stage>,
 ) -> Result<bool, CliError>
 where
     'r: 's,
@@ -5744,9 +5751,7 @@ where
     // The Bodies phase's run facts, in this phase's arena: made by `run_phase`, copied into the
     // put below, dropped with the phase's other buffers.
     let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, &mut phase, mixed, &mut entered, at_phase, heads_snap, heads_lazy, heads_once)?;
-    if phase.stage == Stage::Heads {
-        *ran_heads = true;
-    }
+    *ran_stage = Some(phase.stage);
     *rq.active = Some(phase);
     // Pipelined: the coordinator filed finished Scripts and Names tasks in order; else it ran
     // the phase whole (its pool joined).
