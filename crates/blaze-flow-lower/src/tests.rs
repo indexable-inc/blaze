@@ -1535,3 +1535,565 @@ fn large_body_with_many_closures_stays_within_small_bump_frame() {
         "bump-frame usage too high: after_200_closures={after_closures}B, total_peak={peak}B",
     );
 }
+
+/// Sound union field lowering (`mach.rs::{inet, tcp}`, `inline_vec.rs::{len, as_ptr, parts_mut,
+/// try_push, try_grow_to, try_shrink_to_fit}`):
+/// - Positive 1: simultaneous shared borrows `&u.a` and `&u.b` pass cleanly.
+/// - Positive 2: disjoint mutable borrows of the SAME union field's tuple subfields (`&mut u.a.0`
+///   and `&mut u.a.1`) pass cleanly.
+/// - Negative 1: borrowing `&u.a` across a write to `u.b` is rejected as `borrow Invalidated`.
+/// - Negative 2: mutable borrows of subfields of DIFFERENT union fields (`&mut u.a.0` and
+///   `&mut u.b.1`) are rejected as `borrow Invalidated`.
+/// - Negative 3: moving a non-`Copy` union field `u.md` moves the whole union so reading `u.b`
+///   afterwards is rejected as `move UseOfMoved`.
+#[test]
+fn union_field_borrows_and_moves_are_sound() {
+    struct UnionWorld {
+        u_adt: ItemKey,
+        md_adt: ItemKey,
+        sigs: Sigs,
+    }
+    impl Declared for UnionWorld {
+        fn decls(&self) -> &Decls {
+            self.sigs.decls()
+        }
+    }
+    impl Facts for UnionWorld {
+        fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt_variances(&self, _: ItemKey) -> Option<&[crate::Variance]> { None }
+        fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: ExprId) -> &[crate::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { None }
+        fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> { None }
+        fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+            if k == self.u_adt {
+                Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: true, is_enum: false, is_box: false })
+            } else if k == self.md_adt {
+                Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
+            } else {
+                None
+            }
+        }
+        fn callee(&self, k: ItemKey) -> Option<CalleeFacts> { self.sigs.callee(k) }
+        fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
+            if adt == self.u_adt && variant == 0 {
+                if name == Name::of("a") {
+                    Some(0)
+                } else if name == Name::of("b") {
+                    Some(1)
+                } else if name == Name::of("md") {
+                    Some(2)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
+            if adt == self.u_adt && variant == 0 { Some(3) } else { None }
+        }
+        fn param_copy(&self, _: u32) -> bool { false }
+    }
+
+    let mut fx = Fx::new();
+    let u32_t = fx.u32();
+    let pair_t = fx.tuple(&[u32_t, u32_t]);
+    let ref_pair = fx.r(Mutbl::Not, pair_t);
+    let mut_u32 = fx.r(Mutbl::Mut, u32_t);
+    let md_adt = fx.strukt("Md", 0, &[("v", u32_t)]);
+    let md_t = fx.adt(md_adt, &[]);
+    let u_adt = fx.strukt("U", 0, &[("a", pair_t), ("b", pair_t), ("md", md_t)]);
+    let u_t = fx.adt(u_adt, &[]);
+    let unit = fx.unit();
+    let use_shared = fx.func("use_shared", 0, &[ref_pair, ref_pair], unit, vec::Vec::new());
+    let use_mut2 = fx.func("use_mut2", 0, &[mut_u32, mut_u32], unit, vec::Vec::new());
+    let use_one = fx.func("use_one", 0, &[ref_pair], unit, vec::Vec::new());
+    let take_md = fx.func("take_md", 0, &[md_t], unit, vec::Vec::new());
+    let take_pair = fx.func("take_pair", 0, &[pair_t], unit, vec::Vec::new());
+    let f = fx.func("f", 0, &[u_t, pair_t], unit, vec::Vec::new());
+    fx.finish();
+
+    let mut sigs = Sigs::new();
+    sigs.decls.adt(u_adt, 0);
+    sigs.decls.adt(md_adt, 0);
+    sigs.add(use_shared, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[ref_pair, ref_pair], output: unit, slots: &[P0, P1] });
+    sigs.add(use_mut2, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[mut_u32, mut_u32], output: unit, slots: &[P0, P1] });
+    sigs.add(use_one, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[ref_pair], output: unit, slots: &[P0] });
+    sigs.add(take_md, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[md_t], output: unit, slots: &[] });
+    sigs.add(take_pair, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[pair_t], output: unit, slots: &[] });
+    sigs.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[u_t, pair_t], output: unit, slots: &[] });
+    let world = UnionWorld { u_adt, md_adt, sigs };
+
+    let tuple_field = |b: &mut Bb, p: blaze_typeck::PatId, base: ExprId, index: u32| -> ExprId {
+        let at = b.local(p);
+        b.exprs[at.ix()] = blaze_typeck::Expr::TupleField { base, index };
+        at
+    };
+    let assign_expr = |b: &mut Bb, lhs: ExprId, rhs: ExprId| -> ExprId {
+        let at = b.bool();
+        b.exprs[at.ix()] = blaze_typeck::Expr::Assign { lhs, rhs };
+        at
+    };
+
+    // Positive 1: `use_shared(&u.a, &u.b)`
+    {
+        let mut b = Bb::new();
+        let (pu, _) = (b.param("u"), b.param("val"));
+        let u1 = b.local(pu);
+        let fa = field(&mut b, pu, u1, "a");
+        let ra = b.borrow(Mutbl::Not, fa);
+        let u2 = b.local(pu);
+        let fb = field(&mut b, pu, u2, "b");
+        let rb = b.borrow(Mutbl::Not, fb);
+        let cal = b.path(&["use_shared"]);
+        let call = b.call(cal, &[ra, rb]);
+        let st = b.semi(call);
+        let root = b.block(&[st], None);
+        assert_eq!(findings_laid(&fx, &b, f, root, &world, Plant::None), Ok(vec::Vec::new()), "POSITIVE 1: shared borrows of two union fields");
+    }
+
+    // Positive 2: `use_mut2(&mut u.a.0, &mut u.a.1)` (same union field, disjoint tuple subfields)
+    {
+        let mut b = Bb::new();
+        let (pu, _) = (b.param("u"), b.param("val"));
+        let u1 = b.local(pu);
+        let fa1 = field(&mut b, pu, u1, "a");
+        let f0 = tuple_field(&mut b, pu, fa1, 0);
+        let r0 = b.borrow(Mutbl::Mut, f0);
+        let u2 = b.local(pu);
+        let fa2 = field(&mut b, pu, u2, "a");
+        let f1 = tuple_field(&mut b, pu, fa2, 1);
+        let r1 = b.borrow(Mutbl::Mut, f1);
+        let cal = b.path(&["use_mut2"]);
+        let call = b.call(cal, &[r0, r1]);
+        let st = b.semi(call);
+        let root = b.block(&[st], None);
+        assert_eq!(findings_laid(&fx, &b, f, root, &world, Plant::None), Ok(vec::Vec::new()), "POSITIVE 2: disjoint subfields of same union field");
+    }
+
+    // Negative 1: `let r = &u.a; u.b = val; use_one(r);`
+    {
+        let mut b = Bb::new();
+        let (pu, pval) = (b.param("u"), b.param("val"));
+        let u1 = b.local(pu);
+        let fa = field(&mut b, pu, u1, "a");
+        let ra = b.borrow(Mutbl::Not, fa);
+        let pr = b.bind("r");
+        let st1 = b.let_(pr, None, ra);
+        let u2 = b.local(pu);
+        let fb = field(&mut b, pu, u2, "b");
+        let lval = b.local(pval);
+        let asgn = assign_expr(&mut b, fb, lval);
+        let st2 = b.semi(asgn);
+        let cal = b.path(&["use_one"]);
+        let lr = b.local(pr);
+        let call = b.call(cal, &[lr]);
+        let st3 = b.semi(call);
+        let root = b.block(&[st1, st2, st3], None);
+        let got = findings_laid(&fx, &b, f, root, &world, Plant::None).expect("lowers");
+        assert!(got.iter().any(|l| l.starts_with("borrow Invalidated")), "NEGATIVE 1: writing u.b while &u.a is live must conflict: {got:?}");
+    }
+
+    // Negative 2: `let r0 = &mut u.a.0; let r1 = &mut u.b.1; use_mut2(r0, r1);`
+    {
+        let mut b = Bb::new();
+        let (pu, _) = (b.param("u"), b.param("val"));
+        let u1 = b.local(pu);
+        let fa = field(&mut b, pu, u1, "a");
+        let f0 = tuple_field(&mut b, pu, fa, 0);
+        let r0 = b.borrow(Mutbl::Mut, f0);
+        let pr0 = b.bind("r0");
+        let st1 = b.let_(pr0, None, r0);
+        let u2 = b.local(pu);
+        let fb = field(&mut b, pu, u2, "b");
+        let f1 = tuple_field(&mut b, pu, fb, 1);
+        let r1 = b.borrow(Mutbl::Mut, f1);
+        let pr1 = b.bind("r1");
+        let st2 = b.let_(pr1, None, r1);
+        let cal = b.path(&["use_mut2"]);
+        let lr0 = b.local(pr0);
+        let lr1 = b.local(pr1);
+        let call = b.call(cal, &[lr0, lr1]);
+        let st3 = b.semi(call);
+        let root = b.block(&[st1, st2, st3], None);
+        let got = findings_laid(&fx, &b, f, root, &world, Plant::None).expect("lowers");
+        assert!(got.iter().any(|l| l.starts_with("borrow Invalidated")), "NEGATIVE 2: &mut u.a.0 and &mut u.b.1 must conflict: {got:?}");
+    }
+
+    // Negative 3: `take_md(u.md); take_pair(u.b);` (move of non-Copy union field invalidates whole union)
+    {
+        let mut b = Bb::new();
+        let (pu, _) = (b.param("u"), b.param("val"));
+        let u1 = b.local(pu);
+        let fmd = field(&mut b, pu, u1, "md");
+        let cal1 = b.path(&["take_md"]);
+        let call1 = b.call(cal1, &[fmd]);
+        let st1 = b.semi(call1);
+        let u2 = b.local(pu);
+        let fb = field(&mut b, pu, u2, "b");
+        let cal2 = b.path(&["take_pair"]);
+        let call2 = b.call(cal2, &[fb]);
+        let st2 = b.semi(call2);
+        let root = b.block(&[st1, st2], None);
+        let got = findings_laid(&fx, &b, f, root, &world, Plant::None).expect("lowers");
+        assert!(got.iter().any(|l| l.starts_with("move UseOfMoved")), "NEGATIVE 3: moving non-Copy u.md must invalidate u.b: {got:?}");
+    }
+}
+
+struct SimpleWorld {
+    sigs: Sigs,
+    adts: vec::Vec<(ItemKey, AdtFacts)>,
+    fields: vec::Vec<(ItemKey, u32, &'static str, u32, &'static [crate::FieldRegion])>,
+}
+
+impl SimpleWorld {
+    fn of(sigs: Sigs) -> Self {
+        Self { sigs, adts: vec::Vec::new(), fields: vec::Vec::new() }
+    }
+}
+
+impl Facts for SimpleWorld {
+    fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+    fn adt_variances(&self, _: ItemKey) -> Option<&[crate::Variance]> { Some(&[crate::Variance::Co, crate::Variance::Co]) }
+    fn implied_bounds(&self) -> Option<(&[(u32, Region)], &[(Region, Region)])> { None }
+    fn constant_initializer(&self) -> bool { false }
+    fn fn_binders(&self) -> bool { true }
+    fn closure_bodies_checked(&self) -> bool { false }
+    fn closure_requirements(&self, _: ExprId) -> &[crate::Requirement] { &[] }
+    fn async_bodies_checked(&self) -> bool { false }
+    fn is_future(&self, _: PTy) -> Option<bool> { None }
+    fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+    fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+    fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+    fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { Some(0) }
+    fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> { Some(0) }
+    fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+    fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+    fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+    fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+    fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+        self.adts.iter().find(|&&(id, _)| id == k).map(|&(_, f)| f).or(Some(AdtFacts {
+            copy: false,
+            drop_impl: false,
+            needs_drop: false,
+            lifetimes: 0,
+            union: false,
+            is_enum: false,
+            is_box: false,
+        }))
+    }
+    fn callee(&self, _: ItemKey) -> Option<CalleeFacts> { None }
+    fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
+        self.fields.iter().find(|&&(a, v, n, _, _)| a == adt && v == variant && Name::of(n) == name).map(|&(_, _, _, i, _)| i)
+    }
+    fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
+        let c = self.fields.iter().filter(|&&(a, v, _, _, _)| a == adt && v == variant).count() as u32;
+        (c > 0).then_some(c)
+    }
+    fn field_regions(&self, adt: ItemKey, variant: u32, field: u32) -> Option<&[crate::FieldRegion]> {
+        self.fields.iter().find(|&&(a, v, _, i, _)| a == adt && v == variant && i == field).map(|&(_, _, _, _, r)| r)
+    }
+    fn param_copy(&self, _: u32) -> bool { false }
+}
+
+/// `crates/blaze-comptime-sys/src/child.rs::dlopen` shape:
+/// RFC 2229 does NOT capture `outer` in `move || { let _ = outer; }` because `_` does not read
+/// or move the place.
+/// - POSITIVE: `let _ = outer;` inside a closure lowers cleanly (no `UnknownLocal`) with 0 findings.
+/// - NEGATIVE: `let _ = *r;` inside a closure (with deref!) is NOT skipped, so an active mutable
+///   borrow of `s` across `let _ = *r;` is still checked (`Invalidated`).
+#[test]
+fn closure_let_wild_uncaptured_outer_local_is_no_op_but_deref_checks_borrow() {
+    let mut fx = Fx::new();
+    let s_k = fx.strukt("S", 0, &[]);
+    let st = fx.adt(s_k, &[]);
+    let rs = fx.r(Mutbl::Not, st);
+    let rms = fx.r(Mutbl::Mut, st);
+    let unit = fx.unit();
+    let use_mut = fx.func("use_mut", 0, &[rms], unit, vec::Vec::new());
+    let f_ok = fx.func("dlopen_ok", 0, &[rs], unit, vec::Vec::new());
+    let f_bad = fx.func("dlopen_deref_bad", 0, &[st], unit, vec::Vec::new());
+    fx.finish();
+
+    let mut sigs = Sigs::new();
+    sigs.decls.adt(s_k, 0);
+    sigs.add(use_mut, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rms], output: unit, slots: &[P0] });
+    sigs.add(f_ok, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rs], output: unit, slots: &[P0] });
+    sigs.add(f_bad, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[st], output: unit, slots: &[] });
+
+    let mut world = SimpleWorld::of(sigs);
+    world.adts.push((s_k, AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false }));
+
+    // POSITIVE: `fn dlopen_ok(path: &S) { let c = move || { let _ = path; }; }`
+    {
+        let mut b = Bb::new();
+        let p_path = b.param("path");
+        let l_path = b.local(p_path);
+        let w = b.wild();
+        let st_w = b.let_(w, None, l_path);
+        let c_body = b.block(&[st_w], None);
+        let cl = b.move_closure(&[], c_body);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_c], None);
+        let view = b.view(f_ok, root);
+        let mut ck = crate::region_fixture::checked(&fx, &view);
+        let regions = world.sigs.decls.lay(fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &world, regions: &regions };
+        let cf = crate::lower_closure_external(&view, &ck, cl, &with, crate::region_fixture::alloc())
+            .expect("POSITIVE: `let _ = path;` in closure must not fail with UnknownLocal");
+        let rep = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("check");
+        assert!(rep.moves.is_empty() && rep.borrows.is_empty(), "POSITIVE: clean: {:?}", rep.borrows);
+    }
+
+    // NEGATIVE: `fn dlopen_deref_bad(mut s: S) { let r = &s; let m = &mut s; let _ = *r; use_mut(m); }`
+    // Deref `*r` inside `let _ = *r;` MUST NOT be skipped (it reads through `r`, invalidating `m`!).
+    {
+        let mut b = Bb::new();
+        let p_s = b.param_mut("s");
+        let l_s1 = b.local(p_s);
+        let r_s = b.borrow(Mutbl::Not, l_s1);
+        let p_r = b.bind("r");
+        let st_r = b.let_(p_r, None, r_s);
+        let l_s2 = b.local(p_s);
+        let m_s = b.borrow(Mutbl::Mut, l_s2);
+        let p_m = b.bind("m");
+        let st_m = b.let_(p_m, None, m_s);
+        let l_r = b.local(p_r);
+        let deref_r = b.bool();
+        b.exprs[deref_r.ix()] = blaze_typeck::Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: l_r };
+        let w = b.wild();
+        let st_w = b.let_(w, None, deref_r);
+        let f_use = b.path(&["use_mut"]);
+        let l_m = b.local(p_m);
+        let call_m = b.call(f_use, &[l_m]);
+        let st_use = b.semi(call_m);
+        let c_body = b.block(&[st_r, st_m, st_w, st_use], None);
+        let cl = b.move_closure(&[], c_body);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_c], None);
+        let view = b.view(f_bad, root);
+        let mut ck = crate::region_fixture::checked(&fx, &view);
+        let regions = world.sigs.decls.lay(fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &world, regions: &regions };
+        let cf = crate::lower_closure_external(&view, &ck, cl, &with, crate::region_fixture::alloc()).expect("lower");
+        let rep = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("check");
+        assert!(
+            rep.borrows.iter().any(|f| matches!(f, blaze_flow::BorrowFinding::Invalidated { .. })),
+            "NEGATIVE: `let _ = *r;` must still check borrow conflict with `m = &mut s`: {:?}",
+            rep.borrows
+        );
+    }
+}
+
+/// `crates/blaze-cli/src/run_package.rs::choose` & `crates/blaze-scope/src/task/lower.rs::item` shape:
+/// Slice patterns `[x] => *x` on `xs: &[&'a S]` keep `exact = true` on `ConstantIndex` / `Subslice`
+/// projections of arrays and slices (no `BorrowInexact`).
+/// - POSITIVE: `fn choose<'a>(xs: &[&'a S], fallback: &'a S) -> &'a S` lowers with `coarse.is_none()` and 0 findings.
+/// - NEGATIVE: `fn choose_bad<'a, 'b>(xs: &[&'a S], fallback: &'b S) -> &'b S` fails `UnprovenOutlives`.
+#[test]
+fn slice_pattern_element_of_ref_slice_has_exact_origins() {
+    let mut fx = Fx::new();
+    let s_k = fx.strukt("S", 0, &[]);
+    let st = fx.adt(s_k, &[]);
+    let rs = fx.r(Mutbl::Not, st);
+    let slice_rs = fx.ty(PNode::Slice(rs));
+    let ref_slice = fx.r(Mutbl::Not, slice_rs);
+    let f_ok = fx.func("choose_ok", 0, &[ref_slice, rs], rs, vec::Vec::new());
+    let f_bad = fx.func("choose_bad", 0, &[ref_slice, rs], rs, vec::Vec::new());
+    fx.finish();
+
+    let mut sigs = Sigs::new();
+    sigs.decls.adt(s_k, 0);
+    // `choose_ok<'s, 'a>(xs: &'s [&'a S], fb: &'a S) -> &'a S`
+    sigs.add(f_ok, FnHead { lifetimes: 2, late: &[0], outlives: &[], inputs: &[ref_slice, rs], output: rs, slots: &[P0, P1, P1, P1] });
+    // `choose_bad<'s, 'a, 'b>(xs: &'s [&'a S], fb: &'b S) -> &'b S`
+    sigs.add(f_bad, FnHead { lifetimes: 3, late: &[0], outlives: &[], inputs: &[ref_slice, rs], output: rs, slots: &[P0, P1, Region::Param(2), Region::Param(2)] });
+    let mut world = SimpleWorld::of(sigs);
+    world.adts.push((s_k, AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false }));
+
+    for bad in [false, true] {
+        let mut b = Bb::new();
+        let p_xs = b.param("xs");
+        let p_fb = b.param("fb");
+        let l_xs = b.local(p_xs);
+        let px = b.bind("x");
+        let pat_one = b.slice_pat(&[px], None);
+        let lx = b.local(px);
+        let deref_x = b.bool();
+        b.exprs[deref_x.ix()] = blaze_typeck::Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: lx };
+        let wild = b.wild();
+        let l_fb = b.local(p_fb);
+        let m = b.match_(l_xs, &[(pat_one, deref_x), (wild, l_fb)]);
+        let root = b.block(&[], Some(m));
+
+        let owner = if bad { f_bad } else { f_ok };
+        let view = b.view(owner, root);
+        let mut ck = crate::region_fixture::checked(&fx, &view);
+        let regions = world.sigs.decls.lay(fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &world, regions: &regions };
+        let lowered = crate::lower(&view, &ck, &with, crate::region_fixture::alloc()).expect("lower");
+        assert!(lowered.coarse.is_none(), "slice pattern `[x] => *x` must NOT record coarse BorrowInexact: {:?}", lowered.coarse);
+        let rep = blaze_flow::check(&lowered.flow, crate::region_fixture::alloc()).expect("check");
+        if bad {
+            assert!(
+                rep.borrows.iter().any(|f| matches!(f, blaze_flow::BorrowFinding::UnprovenOutlives { .. })),
+                "NEGATIVE: returning `&'a S` from `&[&'a S]` as `&'b S` MUST fail UnprovenOutlives: {:?}",
+                rep.borrows
+            );
+        } else {
+            assert!(rep.moves.is_empty() && rep.borrows.is_empty(), "POSITIVE: clean: {:?}", rep.borrows);
+        }
+    }
+}
+
+/// `crates/blaze-resolve/src/lockfile.rs::encodable_package_id` shape (`counts[&id.name()]`):
+/// `Index<&Q>` where the index operand carries a reference lifetime (`idx_len == 1`) still maps
+/// `Output = Hold<'a>` from `Self = Map<S, Hold<'a>>` without recording `DerefTarget`.
+/// - POSITIVE: `fn get_ok<'m, 'a, 'k>(m: &'m Map<S, Hold<'a>>, k: &'k S) -> &'a S { m[k].r }`
+///   lowers with `coarse.is_none()` and 0 findings.
+/// - NEGATIVE: returning `m[k].r` as unrelated `&'b S` fails `UnprovenOutlives`.
+#[test]
+fn index_with_ref_key_maps_self_output_slots_exact() {
+    let mut fx = Fx::new();
+    let idx_tr = fx.tr("Index", 2, vec::Vec::new(), &["Output"]);
+    fx.lang(blaze_typeck::LangItem::Index, idx_tr);
+    let s_k = fx.strukt("S", 0, &[]);
+    let st = fx.adt(s_k, &[]);
+    let rs = fx.r(Mutbl::Not, st);
+    let hold_k = fx.strukt("Hold", 0, &[("r", rs)]);
+    let hold_t = fx.adt(hold_k, &[]);
+    let p0 = fx.param(0);
+    let p1 = fx.param(1);
+    let map_k = fx.strukt("Map", 2, &[]);
+    let map_p = fx.adt(map_k, &[p0, p1]);
+    let ref_p0 = fx.r(Mutbl::Not, p0);
+    let idx_imp = fx.imp("impl<K, V> Index<&K> for Map<K, V> { type Output = V; }", 2, map_p, Some((idx_tr, &[ref_p0])), &[("Output", p1)], vec![]);
+
+    let map_sh = fx.adt(map_k, &[st, hold_t]);
+    let ref_map = fx.r(Mutbl::Not, map_sh);
+    let f_ok = fx.func("get_ok", 0, &[ref_map, rs], rs, vec::Vec::new());
+    let f_bad = fx.func("get_bad", 0, &[ref_map, rs], rs, vec::Vec::new());
+    fx.finish();
+
+    let mut sigs = Sigs::new();
+    sigs.decls.adt(s_k, 0);
+    sigs.decls.adt(hold_k, 1);
+    sigs.decls.adt(map_k, 0);
+    sigs.decls.trait_(idx_tr, 0);
+    sigs.decls.alias(idx_tr, "Output", 0);
+    sigs.decls.imp(idx_imp, crate::region_fixture::ImplHead { lifetimes: 1, outlives: &[], self_ty: map_p, self_slots: &[], trait_ref: Some((idx_tr, &[ref_p0], &[P0])) });
+    sigs.decls.impl_assoc(idx_imp, "Output", p1, &[]);
+    sigs.add(f_ok, FnHead { lifetimes: 3, late: &[0, 2], outlives: &[], inputs: &[ref_map, rs], output: rs, slots: &[P0, P1, Region::Param(2), P1] });
+    sigs.add(f_bad, FnHead { lifetimes: 4, late: &[0, 2], outlives: &[], inputs: &[ref_map, rs], output: rs, slots: &[P0, P1, Region::Param(2), Region::Param(3)] });
+
+    const HOLD_R: [crate::FieldRegion; 1] = [crate::FieldRegion::Lifetime(0)];
+    let mut world = SimpleWorld::of(sigs);
+    world.adts.push((hold_k, AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 1, union: false, is_enum: false, is_box: false }));
+    world.fields.push((hold_k, 0, "r", 0, &HOLD_R));
+
+    for bad in [false, true] {
+        let mut b = Bb::new();
+        let p_m = b.param("m");
+        let p_k = b.param("k");
+        let l_m = b.local(p_m);
+        let l_k = b.local(p_k);
+        let ix = b.bool();
+        b.exprs[ix.ix()] = blaze_typeck::Expr::Index { base: l_m, index: l_k };
+        let fr = field(&mut b, p_m, ix, "r");
+        let root = b.block(&[], Some(fr));
+
+        let owner = if bad { f_bad } else { f_ok };
+        let view = b.view(owner, root);
+        let mut ck = crate::region_fixture::checked(&fx, &view);
+        let regions = world.sigs.decls.lay(fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &world, regions: &regions };
+        let lowered = crate::lower(&view, &ck, &with, crate::region_fixture::alloc()).expect("lower");
+        assert!(lowered.coarse.is_none(), "`m[k].r` with `&K` key must NOT record coarse DerefTarget: {:?}", lowered.coarse);
+        let rep = blaze_flow::check(&lowered.flow, crate::region_fixture::alloc()).expect("check");
+        if bad {
+            assert!(
+                rep.borrows.iter().any(|f| matches!(f, blaze_flow::BorrowFinding::UnprovenOutlives { .. })),
+                "NEGATIVE: returning `m[k].r` (`&'a S`) as `&'b S` MUST fail UnprovenOutlives: {:?}",
+                rep.borrows
+            );
+        } else {
+            assert!(rep.moves.is_empty() && rep.borrows.is_empty(), "POSITIVE: clean: {:?}", rep.borrows);
+        }
+    }
+}
+
+/// `crates/blaze-scope/src/asked.rs::push` shape (Lane 3 bonus):
+/// `(*node).next` on `node: *mut Node<'a>` must preserve `Node<'a>`'s region slots across
+/// `(Proj::Deref, PNode::Ptr(..))` instead of setting `len: 0, exact: true` (`FieldRegionsUnaligned`).
+/// - POSITIVE: `fn read_ok<'a>(node: *mut Node<'a>) -> &'a S { (*node).next }` lowers cleanly.
+/// - NEGATIVE: `fn read_bad<'a, 'b>(node: *mut Node<'a>) -> &'b S { (*node).next }` fails `UnprovenOutlives`.
+#[test]
+fn raw_ptr_deref_field_preserves_adt_regions() {
+    let mut fx = Fx::new();
+    let s_k = fx.strukt("S", 0, &[]);
+    let st = fx.adt(s_k, &[]);
+    let rs = fx.r(Mutbl::Not, st);
+    let node_k = fx.strukt("Node", 0, &[("next", rs)]);
+    let node_t = fx.adt(node_k, &[]);
+    let ptr_node = fx.ty(PNode::Ptr(Mutbl::Mut, node_t));
+    let f_ok = fx.func("read_ok", 0, &[ptr_node], rs, vec::Vec::new());
+    let f_bad = fx.func("read_bad", 0, &[ptr_node], rs, vec::Vec::new());
+    fx.finish();
+
+    let mut sigs = Sigs::new();
+    sigs.decls.adt(s_k, 0);
+    sigs.decls.adt(node_k, 1);
+    sigs.add(f_ok, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[ptr_node], output: rs, slots: &[P0, P0] });
+    sigs.add(f_bad, FnHead { lifetimes: 2, late: &[], outlives: &[], inputs: &[ptr_node], output: rs, slots: &[P0, P1] });
+
+    const NODE_NEXT: [crate::FieldRegion; 1] = [crate::FieldRegion::Lifetime(0)];
+    let mut world = SimpleWorld::of(sigs);
+    world.adts.push((node_k, AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 1, union: false, is_enum: false, is_box: false }));
+    world.fields.push((node_k, 0, "next", 0, &NODE_NEXT));
+
+    for bad in [false, true] {
+        let mut b = Bb::new();
+        let p_node = b.param("node");
+        let l_node = b.local(p_node);
+        let deref_n = b.bool();
+        b.exprs[deref_n.ix()] = blaze_typeck::Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: l_node };
+        let fn_next = field(&mut b, p_node, deref_n, "next");
+        let root = b.block(&[], Some(fn_next));
+
+        let owner = if bad { f_bad } else { f_ok };
+        let view = b.view(owner, root);
+        let mut ck = crate::region_fixture::checked(&fx, &view);
+        let regions = world.sigs.decls.lay(fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &world, regions: &regions };
+        let lowered = crate::lower(&view, &ck, &with, crate::region_fixture::alloc())
+            .expect("`(*node).next` must NOT refuse with FieldRegionsUnaligned");
+        let rep = blaze_flow::check(&lowered.flow, crate::region_fixture::alloc()).expect("check");
+        if bad {
+            assert!(
+                rep.borrows.iter().any(|f| matches!(f, blaze_flow::BorrowFinding::UnprovenOutlives { .. })),
+                "NEGATIVE: returning `(*node).next` (`&'a S`) as `&'b S` MUST fail UnprovenOutlives: {:?}",
+                rep.borrows
+            );
+        } else {
+            assert!(rep.moves.is_empty() && rep.borrows.is_empty(), "POSITIVE: clean: {:?}", rep.borrows);
+        }
+    }
+}

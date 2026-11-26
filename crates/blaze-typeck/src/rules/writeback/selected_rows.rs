@@ -468,75 +468,82 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             iargs.clear();
             iargs.extend_from_slice(ex.out.view().list(args)?);
-            // If this row selected an impl for a projection `type Assoc = V;` and `V` itself
-            // contains a projection `<X as Tr>::N` (e.g. `impl<T, U: TryFrom<T>> TryInto<U> for T {
-            // type Error = U::Error; }`), select those nested projections too so `blaze-borrow`
-            // can normalize through chained associated types.
-            if let Some(assoc_name) = row_name {
-                let hdr = match self.reads.impl_header(imp) {
-                    Ok(h) => h,
-                    Err(Stop::Need(_)) if self.reads.stopped() => return Ok(()),
-                    Err(Stop::Need(_)) => None,
-                    Err(Stop::Error(err)) => return Err(err),
-                };
-                if let Some(h) = hdr
+            // Scan the selected impl's header (`self_ty` and `trait_args`, e.g.
+            // `impl<'a, T: AsContextMut> From<&'a mut T> for StoreContextMut<'a, <T as AsContext>::Data>`)
+            // and, for a projection row, its `type Assoc = V;` value (e.g.
+            // `impl<T, U: TryFrom<T>> TryInto<U> for T { type Error = U::Error; }`) for nested
+            // `PNode::Alias` nodes, selecting them so `blaze-borrow` can normalize through impl
+            // headers and chained associated types.
+            let hdr = match self.reads.impl_header(imp) {
+                Ok(h) => h,
+                Err(Stop::Need(_)) if self.reads.stopped() => return Ok(()),
+                Err(Stop::Need(_)) => None,
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            if let Some(h) = hdr {
+                let mut aliases: Vec<(ItemKey, Name, List), Alloc<'a>> = Vec::new_in(alloc);
+                let mut astack: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+                let mut akids: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+                astack.push(h.self_ty);
+                if let Ok(targs) = h.types.list(h.trait_args.list()) {
+                    astack.extend_from_slice(targs);
+                }
+                if let Some(assoc_name) = row_name
                     && let Some(&(_, val_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == assoc_name)
                 {
-                    let mut aliases: Vec<(ItemKey, Name, List), Alloc<'a>> = Vec::new_in(alloc);
-                    let mut astack: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-                    let mut akids: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
                     astack.push(val_ty);
-                    let mut asteps = 0u32;
-                    while let Some(t) = astack.pop() {
-                        asteps += 1;
-                        if asteps > MOST_NODES {
-                            break;
-                        }
-                        let Ok(node) = h.types.node(t) else { break };
-                        if let PNode::Alias { trait_: nt, name: nn, args: na } = node {
-                            aliases.push((nt, nn, na));
-                        }
-                        akids.clear();
-                        if h.types.children_of(node, &mut akids).is_ok() {
-                            astack.extend_from_slice(&akids);
-                        }
+                }
+                let mut asteps = 0u32;
+                while let Some(t) = astack.pop() {
+                    asteps += 1;
+                    if asteps > MOST_NODES {
+                        break;
                     }
-                    for (nt, nn, na) in aliases {
-                        let Ok(formal_list) = h.types.list(na) else { continue };
-                        if !params_in_bounds(h.types, formal_list, iargs.len() as u32, alloc)? {
-                            continue;
-                        }
-                        ps.clear();
-                        for &t in formal_list {
-                            let sub = subst_into(h.types, t, &iargs, &mut ex.out, alloc)?;
-                            let norm = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, sub, 0)?;
-                            if self.reads.stopped() {
-                                return Ok(());
-                            }
-                            ps.push(norm);
-                        }
-                        let list = ex.out.intern_list(&ps)?;
-                        if seen.insert((e, nt, Some(nn), list), ()).is_some() {
-                            continue;
-                        }
-                        if out.len() >= MOST_PROJECTED {
-                            return Err(CheckError::Limit(Limit::Solver));
-                        }
-                        let selected = self.select_row(ex, rows, inert, &ps, (nt, list, Some(nn)), e)?;
+                    let Ok(node) = h.types.node(t) else { break };
+                    if let PNode::Alias { trait_: nt, name: nn, args: na } = node {
+                        aliases.push((nt, nn, na));
+                    }
+                    akids.clear();
+                    if h.types.children_of(node, &mut akids).is_ok() {
+                        astack.extend_from_slice(&akids);
+                    }
+                }
+                let Ok(iargs_u32) = u32::try_from(iargs.len()) else { continue };
+                for (nt, nn, na) in aliases {
+                    let Ok(formal_list) = h.types.list(na) else { continue };
+                    if !params_in_bounds(h.types, formal_list, iargs_u32, alloc)? {
+                        continue;
+                    }
+                    ps.clear();
+                    for &t in formal_list {
+                        let sub = subst_into(h.types, t, &iargs, &mut ex.out, alloc)?;
+                        let norm = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, sub, 0)?;
                         if self.reads.stopped() {
                             return Ok(());
                         }
-                        if matches!(selected, Selected::Impl { .. }) {
-                            out.push(Projected { expr: e, at: 0, trait_: nt, name: Some(nn), args: list, global_env: rows.env.global, selected });
-                            nest.push((out.len() - 1, depth + 1));
-                        } else if let Some(rhs) = self.normalize_from_env_or_assoc(ex, inert, nt, nn, &ps)? {
-                            if self.reads.stopped() {
-                                return Ok(());
-                            }
-                            let _ = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, rhs, 0)?;
-                            if self.reads.stopped() {
-                                return Ok(());
-                            }
+                        ps.push(norm);
+                    }
+                    let list = ex.out.intern_list(&ps)?;
+                    if seen.insert((e, nt, Some(nn), list), ()).is_some() {
+                        continue;
+                    }
+                    if out.len() >= MOST_PROJECTED {
+                        return Err(CheckError::Limit(Limit::Solver));
+                    }
+                    let selected = self.select_row(ex, rows, inert, &ps, (nt, list, Some(nn)), e)?;
+                    if self.reads.stopped() {
+                        return Ok(());
+                    }
+                    if matches!(selected, Selected::Impl { .. }) {
+                        out.push(Projected { expr: e, at: 0, trait_: nt, name: Some(nn), args: list, global_env: rows.env.global, selected });
+                        nest.push((out.len() - 1, depth + 1));
+                    } else if let Some(rhs) = self.normalize_from_env_or_assoc(ex, inert, nt, nn, &ps)? {
+                        if self.reads.stopped() {
+                            return Ok(());
+                        }
+                        let _ = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, rhs, 0)?;
+                        if self.reads.stopped() {
+                            return Ok(());
                         }
                     }
                 }

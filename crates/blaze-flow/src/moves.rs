@@ -11,7 +11,7 @@
 use blaze_own::Vec;
 use core::alloc::Allocator;
 
-use crate::bits::{self, BitWorklist, Bits};
+use crate::bits::{self, BitWorklist, BlockBits};
 use crate::flow::{Block, Bound, Flow, Local, Operand, Place, Point, Proj, Span, Stmt, StmtKind, Value};
 use crate::record::Plant;
 
@@ -225,8 +225,8 @@ impl<A: Allocator> LocalMods<A> {
 
 /// The two dataflows' entry states, one row per basic block.
 pub struct Inits<A: Allocator> {
-    pub init: Bits<A>,
-    pub uninit: Bits<A>,
+    pub init: BlockBits<A>,
+    pub uninit: BlockBits<A>,
     pub reached: Vec<bool, A>,
     pub(crate) subtrees: PlaceSubtrees<A>,
     pub(crate) local_mods: LocalMods<A>,
@@ -239,8 +239,8 @@ impl<A: Allocator> Inits<A> {
     /// Because intra-block transfer only overwrites each place independently with `(true, false)`
     /// or `(false, true)`, the latest statement in `block.start..s` whose target or moved operand
     /// is a prefix of `q` determines `q`'s state; if none does, block `b`'s entry bits hold.
-    fn place_state_at<B: Allocator>(&self, flow: &Flow<B>, b: usize, s: Stmt, q: Place) -> (bool, bool) {
-        let start = flow.blocks[b].start;
+    fn place_state_at<B: Allocator>(&self, flow: &Flow<B>, b: Block, s: Stmt, q: Place) -> (bool, bool) {
+        let start = flow.blocks[b.index()].start;
         if s.0 > start {
             let mods = self.local_mods.row(flow.place(q).local);
             let end = mods.partition_point(|&t| t < s);
@@ -305,8 +305,8 @@ impl<A: Allocator> Inits<A> {
     /// path is no use of it (drop elaboration removes it; RFC 2094, "liveness": a variable is
     /// drop-live only where it may be initialized).
     pub fn drop_may_run<B: Allocator>(&self, flow: &Flow<B>, s: Stmt, p: Place) -> bool {
-        let b = flow.stmt_block[s.index()].index();
-        if !self.reached[b] {
+        let b = flow.stmt_block[s.index()];
+        if !self.reached[b.index()] {
             return false;
         }
         self.subtrees.subtree(p).iter().any(|&q| self.place_state_at(flow, b, s, Place(q)).0)
@@ -426,21 +426,22 @@ pub fn inits<A: Allocator + Copy>(flow: &Flow<A>, plant: Plant, alloc: A) -> Res
     let (nb, n, m) = (flow.blocks.len(), flow.stmts.len(), flow.places.len());
     let subtrees = PlaceSubtrees::new_in(flow, alloc);
     let local_mods = LocalMods::new_in(flow, alloc);
-    let mut init = Bits::new_in(nb, m, alloc);
-    let mut uninit = Bits::new_in(nb, m, alloc);
+    let mut init = BlockBits::new_in(flow, m, alloc);
+    let mut uninit = BlockBits::new_in(flow, m, alloc);
     let mut reached = Vec::with_capacity_in(nb, alloc);
     reached.resize(nb, false);
     if n == 0 || nb == 0 || flow.blocks[0].end <= flow.blocks[0].start {
         return Ok(Inits { init, uninit, reached, subtrees, local_mods });
     }
-    let eb = flow.stmt_block[flow.entry().index()].index();
+    let eb_blk = flow.stmt_block[flow.entry().index()];
+    let eb = eb_blk.index();
     reached[eb] = true;
     for q in 0..m {
         let l = flow.places[q].local.0;
         if l >= 1 && l <= flow.args {
-            init.set(eb, q);
+            init.set(eb_blk, q);
         } else {
-            uninit.set(eb, q);
+            uninit.set(eb_blk, q);
         }
     }
     // Compute RPO of basic blocks reachable from `eb` via iterative DFS.
@@ -493,29 +494,29 @@ pub fn inits<A: Allocator + Copy>(flow: &Flow<A>, plant: Plant, alloc: A) -> Res
         if pops > limit {
             return Err(Bound::Passes { what: "move dataflow passes", limit });
         }
-        let b = rpo[r] as usize;
-        let range = flow.blocks[b];
+        let blk = Block(rpo[r]);
+        let range = flow.blocks[blk.index()];
         if range.end <= range.start {
             continue;
         }
-        cur_init.copy_from_slice(init.row(b));
-        cur_uninit.copy_from_slice(uninit.row(b));
+        cur_init.copy_from_slice(init.row(blk));
+        cur_uninit.copy_from_slice(uninit.row(blk));
         for s in range.start..range.end {
             transfer_with(&subtrees, flow, Stmt(s), &mut cur_init, &mut cur_uninit);
         }
-        flow.for_each_block_succ(Block(b as u32), |tb| {
+        flow.for_each_block_succ(blk, |tb| {
             let t = tb.index();
             let changed = if !reached[t] {
                 reached[t] = true;
-                init.row_mut(t).copy_from_slice(&cur_init);
-                uninit.row_mut(t).copy_from_slice(&cur_uninit);
+                init.row_mut(tb).copy_from_slice(&cur_init);
+                uninit.row_mut(tb).copy_from_slice(&cur_uninit);
                 true
             } else if plant == Plant::MovesIntersect {
-                bits::intersect_into(init.row_mut(t), &cur_init)
-                    | bits::intersect_into(uninit.row_mut(t), &cur_uninit)
+                bits::intersect_into(init.row_mut(tb), &cur_init)
+                    | bits::intersect_into(uninit.row_mut(tb), &cur_uninit)
             } else {
-                bits::union_into(init.row_mut(t), &cur_init)
-                    | bits::union_into(uninit.row_mut(t), &cur_uninit)
+                bits::union_into(init.row_mut(tb), &cur_init)
+                    | bits::union_into(uninit.row_mut(tb), &cur_uninit)
             };
             if changed {
                 worklist.push(rank[t] as usize);
@@ -691,11 +692,12 @@ pub(crate) fn check_moves_with_inits<A: Allocator + Copy>(
     // Walk blocks in statement order (`flow.stmts` is partitioned into contiguous block ranges).
     let mut s = 0usize;
     while s < flow.stmts.len() {
-        let b = flow.stmt_block[s].index();
+        let blk = flow.stmt_block[s];
+        let b = blk.index();
         let range = flow.blocks[b];
         if st.reached[b] && range.start < range.end {
-            cur_init.copy_from_slice(st.init.row(b));
-            cur_uninit.copy_from_slice(st.uninit.row(b));
+            cur_init.copy_from_slice(st.init.row(blk));
+            cur_uninit.copy_from_slice(st.uninit.row(blk));
             for stmt_idx in range.start..range.end {
                 let stmt = Stmt(stmt_idx);
                 check_stmt(flow, st, stmt, &cur_uninit, plant, &mut seen, &mut scratch, &mut out);
@@ -721,8 +723,8 @@ pub fn check_moves_planted<A: Allocator + Copy>(
 
 /// What drop elaboration does at statement `s` for `p`, from the same dataflows.
 pub fn drop_kind<A: Allocator>(flow: &Flow<A>, st: &Inits<A>, s: Stmt, p: Place) -> DropKind {
-    let b = flow.stmt_block[s.index()].index();
-    if !st.reached[b] {
+    let b = flow.stmt_block[s.index()];
+    if !st.reached[b.index()] {
         return DropKind::Nothing;
     }
     let (i, u) = st.place_state_at(flow, b, s, p);

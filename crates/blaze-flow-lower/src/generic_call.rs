@@ -829,6 +829,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         e: ExprId,
         base_ty: PTy,
         idx_ty: PTy,
+        idx_has_slots: bool,
         base_pos_count: u32,
         expected_out: u32,
     ) -> Result<Option<Vec<ImplAssocSlot, A>>, Refusal> {
@@ -851,8 +852,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 continue;
             }
             // Bind any trait type argument (e.g. `I` in `impl<T, I, A> Index<I> for Vec<T, A>`)
-            // against `idx_ty` (which carries 0 lifetime positions here).
-            if let Some(tc) = trait_col
+            // against `idx_ty` ONLY when `idx_ty` carries 0 lifetime positions (so `param_span`
+            // offsets remain exclusively indices into `base`'s origins; when `idx_ty` carries
+            // slots like `HashMap::index(&self, key: &Q) -> &V`, `Output = V` resolves solely from
+            // `Self`'s bindings, and any `Output` referencing `idx`'s regions safely returns `None`).
+            if !idx_has_slots
+                && let Some(tc) = trait_col
                 && let Ok(blaze_borrow::Kids::List(hkids)) = blaze_borrow::RegionTypes::kids(&heads, tc.ty())
                 && hkids.len() >= 2
             {

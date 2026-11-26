@@ -16,7 +16,9 @@ mod solver_tests;
 use blaze_own::Vec;
 use core::alloc::Allocator;
 
-use crate::bits::{self, BitWorklist, Bits};
+#[cfg(test)]
+use crate::bits::Bits;
+use crate::bits::{self, BitWorklist, BlockBits};
 use crate::flow::{
     Block, BorrowKind, Bound, Flow, Loan, Local, Operand, Origin, Place, Point, Proj, Span, Stmt,
     StmtKind, Value,
@@ -265,7 +267,7 @@ struct LiveFacts<A: Allocator> {
     /// Maps `ol_idx -> cross_ol` column, or `u32::MAX` if never upward-exposed in any block.
     ol_to_cross: Vec<u32, A>,
     /// Block-exit regular liveness (`nb × cross_ol`).
-    block_live_out: Bits<A>,
+    block_live_out: BlockBits<A>,
     /// Per `ol_idx`, sorted ascending events (at most one per stmt):
     /// `EVENT_FLAG` = 1 for Use / UseAndDef, 0 for pure Def; low 31 bits = `stmt.0`.
     ol_events: Csr<u32, A>,
@@ -276,7 +278,7 @@ struct LiveFacts<A: Allocator> {
     dl_to_cross: Vec<u32, A>,
     /// `block_d_out & block_drop_trans` (`nb × cross_dl`): when set on a reached block, `dl` is
     /// drop-live at every point in that block.
-    block_d_const: Bits<A>,
+    block_d_const: BlockBits<A>,
     /// Per `dl_idx`, sorted ascending disjoint half-open `Point` intervals `(p_lo, p_hi)` for
     /// blocks where drop-liveness varies within the block.
     dl_intervals: Csr<(u32, u32), A>,
@@ -287,11 +289,11 @@ impl<A: Allocator + Copy> LiveFacts<A> {
         Self {
             ol_by_origin: Csr::empty_in(alloc),
             ol_to_cross: Vec::new_in(alloc),
-            block_live_out: Bits::new_in(0, 0, alloc),
+            block_live_out: BlockBits::empty_in(alloc),
             ol_events: Csr::empty_in(alloc),
             dl_by_origin: Csr::empty_in(alloc),
             dl_to_cross: Vec::new_in(alloc),
-            block_d_const: Bits::new_in(0, 0, alloc),
+            block_d_const: BlockBits::empty_in(alloc),
             dl_intervals: Csr::empty_in(alloc),
         }
     }
@@ -301,8 +303,8 @@ impl<A: Allocator> LiveFacts<A> {
     #[inline]
     fn is_ol_live<B: Allocator>(&self, flow: &Flow<B>, p: Point, oi: usize) -> bool {
         let s = p.stmt();
-        let b = flow.stmt_block[s.index()].index();
-        let block_end = flow.blocks[b].end;
+        let b = flow.stmt_block[s.index()];
+        let block_end = flow.blocks[b.index()].end;
         let evs = self.ol_events.row(oi);
         let idx = evs.partition_point(|&e| (e & EVENT_STMT_MASK) < s.0);
         let cross_out = || {
@@ -330,8 +332,8 @@ impl<A: Allocator> LiveFacts<A> {
 
     #[inline]
     fn is_dl_live<B: Allocator>(&self, flow: &Flow<B>, init: &Inits<A>, p: Point, di: usize) -> bool {
-        let b = flow.stmt_block[p.stmt().index()].index();
-        if !init.reached[b] {
+        let b = flow.stmt_block[p.stmt().index()];
+        if !init.reached[b.index()] {
             return false;
         }
         let ci = self.dl_to_cross[di];
@@ -353,7 +355,7 @@ struct ActiveFacts<A: Allocator> {
     /// Reachability from entry block (empty when `al == 0`).
     reached: Vec<bool, A>,
     /// Block-entry activation bits (`nb × al`).
-    block_active: Bits<A>,
+    block_active: BlockBits<A>,
     /// Per `al_idx`, sorted ascending events: `EVENT_FLAG` = 1 for Activate, 0 for Borrow;
     /// low 31 bits = `stmt.0`.
     events: Csr<u32, A>,
@@ -364,7 +366,7 @@ impl<A: Allocator + Copy> ActiveFacts<A> {
         Self {
             loan_to_al: Vec::new_in(alloc),
             reached: Vec::new_in(alloc),
-            block_active: Bits::new_in(0, 0, alloc),
+            block_active: BlockBits::empty_in(alloc),
             events: Csr::empty_in(alloc),
         }
     }
@@ -379,11 +381,11 @@ impl<A: Allocator> ActiveFacts<A> {
         if al == u32::MAX {
             return false;
         }
-        let b = flow.stmt_block[s.index()].index();
-        if !self.reached[b] {
+        let b = flow.stmt_block[s.index()];
+        if !self.reached[b.index()] {
             return false;
         }
-        let start = flow.blocks[b].start;
+        let start = flow.blocks[b.index()].start;
         if s.0 > start {
             let evs = self.events.row(al as usize);
             let end = evs.partition_point(|&e| (e & EVENT_STMT_MASK) < s.0);
@@ -563,7 +565,7 @@ fn union_masked_into(dst: &mut [u64], src: &[u64], mask: &[u64]) -> bool {
 fn init_tracked_block<A: Allocator>(
     flow: &Flow<A>,
     init: &Inits<A>,
-    b: usize,
+    b: Block,
     local_to_dl: &[u32],
     cur_init: &mut [u64],
     init_count: &mut [u32],
@@ -877,33 +879,33 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                 let preds = build_block_preds(flow, nb, alloc);
                 // Block-grain backward liveness over cross-block origin-bearing locals:
                 // `live_in(b) = block_use(b) | (live_out(b) & block_trans(b))`.
-                let mut block_live_in = Bits::new_in(nb, cross_ol, alloc);
-                let mut block_live_out = Bits::new_in(nb, cross_ol, alloc);
-                let mut block_trans = Bits::new_in(nb, cross_ol, alloc);
+                let mut block_live_in = BlockBits::new_in(flow, cross_ol, alloc);
+                let mut block_live_out = BlockBits::new_in(flow, cross_ol, alloc);
+                let mut block_trans = BlockBits::new_in(flow, cross_ol, alloc);
                 for b in 0..nb {
-                    fill_all_bits(block_trans.row_mut(b), cross_ol);
+                    fill_all_bits(block_trans.row_mut(Block(b as u32)), cross_ol);
                 }
                 for (ci, &oi) in cross_to_ol.iter().enumerate() {
                     let mut last_b = u32::MAX;
                     for &e in live.ol_events.row(oi as usize) {
-                        let b = flow.stmt_block[(e & EVENT_STMT_MASK) as usize].0;
-                        if b != last_b {
-                            last_b = b;
-                            let bu = b as usize;
+                        let blk = flow.stmt_block[(e & EVENT_STMT_MASK) as usize];
+                        if blk.0 != last_b {
+                            last_b = blk.0;
                             if (e & EVENT_FLAG) != 0 {
-                                block_live_in.set(bu, ci);
+                                block_live_in.set(blk, ci);
                             } else {
-                                block_trans.clear(bu, ci);
+                                block_trans.clear(blk, ci);
                             }
                         }
                     }
                 }
                 for b in 0..nb {
-                    if block_live_in.row(b).iter().any(|&w| w != 0) {
+                    let blk = Block(b as u32);
+                    if block_live_in.row(blk).iter().any(|&w| w != 0) {
                         for &pred in preds.row(b) {
-                            let p = pred as usize;
-                            if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
-                                worklist.push(post_rank[p] as usize);
+                            let pb = Block(pred);
+                            if bits::union_into(block_live_out.row_mut(pb), block_live_in.row(blk)) {
+                                worklist.push(post_rank[pb.index()] as usize);
                             }
                         }
                     }
@@ -922,19 +924,19 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     if pops > limit {
                         return Err(Bound::Passes { what: "liveness passes", limit });
                     }
-                    let b = postorder[rank] as usize;
+                    let blk = Block(postorder[rank]);
                     for ((dst, &out_w), &tr_w) in scratch_l
                         .iter_mut()
-                        .zip(block_live_out.row(b).iter())
-                        .zip(block_trans.row(b).iter())
+                        .zip(block_live_out.row(blk).iter())
+                        .zip(block_trans.row(blk).iter())
                     {
                         *dst = out_w & tr_w;
                     }
-                    if bits::union_into(block_live_in.row_mut(b), &scratch_l) {
-                        for &pred in preds.row(b) {
-                            let p = pred as usize;
-                            if bits::union_into(block_live_out.row_mut(p), block_live_in.row(b)) {
-                                worklist.push(post_rank[p] as usize);
+                    if bits::union_into(block_live_in.row_mut(blk), &scratch_l) {
+                        for &pred in preds.row(blk.index()) {
+                            let pb = Block(pred);
+                            if bits::union_into(block_live_out.row_mut(pb), block_live_in.row(blk)) {
+                                worklist.push(post_rank[pb.index()] as usize);
                             }
                         }
                     }
@@ -1004,10 +1006,10 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     None => build_block_preds(flow, nb, alloc),
                 };
 
-                let mut block_d_in = Bits::new_in(nb, dl, alloc);
-                let mut block_d_out = Bits::new_in(nb, dl, alloc);
-                let mut block_drop_trans = Bits::new_in(nb, dl, alloc);
-                let mut block_mi_out = Bits::new_in(nb, dl, alloc);
+                let mut block_d_in = BlockBits::new_in(flow, dl, alloc);
+                let mut block_d_out = BlockBits::new_in(flow, dl, alloc);
+                let mut block_drop_trans = BlockBits::new_in(flow, dl, alloc);
+                let mut block_mi_out = BlockBits::new_in(flow, dl, alloc);
 
                 let pw = init.init.words();
                 let mut cur_init = Vec::with_capacity_in(pw, alloc);
@@ -1028,33 +1030,34 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     if range.end <= range.start {
                         continue;
                     }
+                    let blk = Block(b as u32);
                     init_tracked_block(
                         flow,
                         &init,
-                        b,
+                        blk,
                         &local_to_dl,
                         &mut cur_init,
                         &mut init_count,
                         &mut mi_row,
                     );
-                    fill_all_bits(block_drop_trans.row_mut(b), dl);
+                    fill_all_bits(block_drop_trans.row_mut(blk), dl);
                     let mut du = drop_uses.partition_point(|&(ds, _)| ds.0 < range.start);
                     for s in range.start..range.end {
                         let stmt = Stmt(s);
                         while du < drop_uses.len() && drop_uses[du].0 == stmt {
                             let dli = drop_uses[du].1 as usize;
                             du += 1;
-                            if block_drop_trans.get(b, dli) {
-                                block_d_in.set(b, dli);
+                            if block_drop_trans.get(blk, dli) {
+                                block_d_in.set(blk, dli);
                             }
                         }
                         if let Some(d) = stmt_def(flow, stmt) {
                             let dli = local_to_dl[d.index()];
                             if dli != u32::MAX {
-                                block_drop_trans.clear(b, dli as usize);
+                                block_drop_trans.clear(blk, dli as usize);
                             }
                         }
-                        bits::intersect_into(block_drop_trans.row_mut(b), &mi_row);
+                        bits::intersect_into(block_drop_trans.row_mut(blk), &mi_row);
                         step_tracked_init(
                             flow,
                             &init,
@@ -1066,25 +1069,26 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                             |_| {},
                         );
                         if s + 1 < range.end {
-                            bits::intersect_into(block_drop_trans.row_mut(b), &mi_row);
+                            bits::intersect_into(block_drop_trans.row_mut(blk), &mi_row);
                         }
                     }
-                    block_mi_out.row_mut(b).copy_from_slice(&mi_row);
+                    block_mi_out.row_mut(blk).copy_from_slice(&mi_row);
                 }
 
                 // Seed backward worklist from blocks whose `block_d_in` has any upward-exposed drop.
                 for b in 0..nb {
-                    if !init.reached[b] || !block_d_in.row(b).iter().any(|&w| w != 0) {
+                    let blk = Block(b as u32);
+                    if !init.reached[b] || !block_d_in.row(blk).iter().any(|&w| w != 0) {
                         continue;
                     }
                     for &pred in preds.row(b) {
-                        let p = pred as usize;
+                        let pb = Block(pred);
                         if union_masked_into(
-                            block_d_out.row_mut(p),
-                            block_d_in.row(b),
-                            block_mi_out.row(p),
+                            block_d_out.row_mut(pb),
+                            block_d_in.row(blk),
+                            block_mi_out.row(pb),
                         ) {
-                            worklist.push(post_rank[p] as usize);
+                            worklist.push(post_rank[pb.index()] as usize);
                         }
                     }
                 }
@@ -1100,23 +1104,23 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     if dpops > dlimit {
                         return Err(Bound::Passes { what: "drop liveness passes", limit: dlimit });
                     }
-                    let b = postorder[rank] as usize;
+                    let blk = Block(postorder[rank]);
                     for ((dst, &out_w), &tr_w) in scratch_d
                         .iter_mut()
-                        .zip(block_d_out.row(b).iter())
-                        .zip(block_drop_trans.row(b).iter())
+                        .zip(block_d_out.row(blk).iter())
+                        .zip(block_drop_trans.row(blk).iter())
                     {
                         *dst = out_w & tr_w;
                     }
-                    if bits::union_into(block_d_in.row_mut(b), &scratch_d) {
-                        for &pred in preds.row(b) {
-                            let p = pred as usize;
+                    if bits::union_into(block_d_in.row_mut(blk), &scratch_d) {
+                        for &pred in preds.row(blk.index()) {
+                            let pb = Block(pred);
                             if union_masked_into(
-                                block_d_out.row_mut(p),
-                                block_d_in.row(b),
-                                block_mi_out.row(p),
+                                block_d_out.row_mut(pb),
+                                block_d_in.row(blk),
+                                block_mi_out.row(pb),
                             ) {
-                                worklist.push(post_rank[p] as usize);
+                                worklist.push(post_rank[pb.index()] as usize);
                             }
                         }
                     }
@@ -1132,8 +1136,9 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     if !init.reached[b] {
                         continue;
                     }
-                    let out_r = block_d_out.row(b);
-                    let tr_r = block_drop_trans.row(b);
+                    let blk = Block(b as u32);
+                    let out_r = block_d_out.row(blk);
+                    let tr_r = block_drop_trans.row(blk);
                     for w in 0..dlw {
                         let mut c = out_r[w] & tr_r[w];
                         let base = w * 64;
@@ -1149,20 +1154,21 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                 }
                 let cross_dl = cross_to_dl.len();
                 if cross_dl > 0 {
-                    let mut block_d_const = Bits::new_in(nb, cross_dl, alloc);
+                    let mut block_d_const = BlockBits::new_in(flow, cross_dl, alloc);
                     for b in 0..nb {
                         if !init.reached[b] {
                             continue;
                         }
-                        let out_r = block_d_out.row(b);
-                        let tr_r = block_drop_trans.row(b);
+                        let blk = Block(b as u32);
+                        let out_r = block_d_out.row(blk);
+                        let tr_r = block_drop_trans.row(blk);
                         for w in 0..dlw {
                             let mut c = out_r[w] & tr_r[w];
                             let base = w * 64;
                             while c != 0 {
                                 let dli = base + usize::try_from(c.trailing_zeros()).unwrap_or(0);
                                 c &= c - 1;
-                                block_d_const.set(b, dl_to_cross[dli] as usize);
+                                block_d_const.set(blk, dl_to_cross[dli] as usize);
                             }
                         }
                     }
@@ -1193,8 +1199,9 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     if range.end <= range.start {
                         continue;
                     }
-                    let out_r = block_d_out.row(b);
-                    let tr_r = block_drop_trans.row(b);
+                    let blk = Block(b as u32);
+                    let out_r = block_d_out.row(blk);
+                    let tr_r = block_drop_trans.row(blk);
                     let mut any_case3 = false;
                     for w in 0..dlw {
                         let m = out_r[w] & !tr_r[w];
@@ -1230,7 +1237,7 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                     init_tracked_block(
                         flow,
                         &init,
-                        b,
+                        blk,
                         &local_to_dl,
                         &mut cur_init,
                         &mut init_count,
@@ -1250,7 +1257,7 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                         );
                     }
 
-                    cur_out.copy_from_slice(block_d_out.row(b));
+                    cur_out.copy_from_slice(block_d_out.row(blk));
                     let mut du_cur = du_end;
                     for i in (0..len).rev() {
                         // Undo statement `i`'s flips so `mi_row` holds `mi_in[i]`.
@@ -1392,7 +1399,7 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
             }
             let events = Csr { offsets: ev_off, entries: ev_entries };
 
-            let mut block_active = Bits::new_in(nb, al, alloc);
+            let mut block_active = BlockBits::new_in(flow, al, alloc);
             let mut reached = Vec::with_capacity_in(nb, alloc);
             reached.resize(nb, false);
             reached[eb] = true;
@@ -1410,9 +1417,9 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                 if pops > limit {
                     return Err(Bound::Passes { what: "activation passes", limit });
                 }
-                let b = postorder[nb - 1 - rpo_r] as usize;
-                let range = flow.blocks[b];
-                scratch.copy_from_slice(block_active.row(b));
+                let blk = Block(postorder[nb - 1 - rpo_r]);
+                let range = flow.blocks[blk.index()];
+                scratch.copy_from_slice(block_active.row(blk));
                 for s in range.start..range.end {
                     match flow.stmt(Stmt(s)).kind {
                         StmtKind::Activate(l) => {
@@ -1430,13 +1437,13 @@ pub(crate) fn facts_with_inits<A: Allocator + Copy>(
                         _ => {}
                     }
                 }
-                flow.for_each_block_succ(Block(b as u32), |tb| {
+                flow.for_each_block_succ(blk, |tb| {
                     let t = tb.index();
                     let first = !reached[t];
                     if first {
                         reached[t] = true;
                     }
-                    let grew = bits::union_into(block_active.row_mut(t), &scratch);
+                    let grew = bits::union_into(block_active.row_mut(tb), &scratch);
                     if first || grew {
                         worklist.push(nb - 1 - post_rank[t] as usize);
                     }

@@ -1212,7 +1212,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     ) -> Result<Option<(PTy, &'b [Region], u32)>, Refusal> {
         use blaze_borrow::RegionTypes;
 
-        let want_slots = self.npos(want_dyn, e)?;
         let PNode::Dynamic(want_preds) = self.node(want_dyn, e)? else { return Ok(None) };
         let want_list = self.list(want_preds, e)?;
         let mut stack: Vec<(PTy, &'b [Region], bool), A> = Vec::new_in(self.alloc);
@@ -1230,10 +1229,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             if let Some(PNode::Dynamic(h_preds)) = cur_node {
                 let my_binder = next_binder;
                 next_binder += 1;
-                if !under_fn_ptr
-                    && usize::try_from(want_slots).ok() == Some(cur_slots.len())
-                    && self.dyn_preds_match(h_preds, want_list, e)?
-                {
+                if !under_fn_ptr && self.dyn_preds_match(h_preds, want_list, e)? {
                     match found {
                         None => found = Some((cur, cur_slots, my_binder)),
                         Some((_, prev_slots, prev_b)) if prev_b == my_binder && prev_slots == cur_slots => {}

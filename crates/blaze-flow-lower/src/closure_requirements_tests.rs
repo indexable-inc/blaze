@@ -5,10 +5,11 @@
 //! through closure.rs `requirement`); the owner emits it at the closure expression.
 //!
 //! `fn f<'a, 'b>(a: &'a S, b: &'b S) { let c = || two(a, b); c(); }`, with the closure's
-//! body needing its captured `a`'s referent region to be `'static` (as `let _: &'static S = a;`
-//! in its body would): the closure value holds, in capture order, `a` by reference
-//! (`&'c1 &'x1 S`: positions 0 and 1) and `b` by reference (`&'c2 &'x3 S`: positions 2 and 3),
-//! so the requirement is `Capture(1)` outlives `'static`.
+//! body needing its captured `a`'s region to be `'static` (as `let _: &'static S = a;`
+//! in its body would): under RFC 2229 disjoint capture with reborrowing (`&*a`, `&*b`), the
+//! closure value holds, in capture order, `*a` by reference (`&'c0 S`: position 0, with
+//! `'a: 'c0`) and `*b` by reference (`&'c1 S`: position 1, with `'b: 'c1`), so the
+//! requirement is `Capture(0)` outlives `'static`.
 //!
 //! WHY NOT `Capture(3)` outlives `Capture(1)` (the first fixture, which found nothing, rightly):
 //! a shared capture of `a: &'a S` is a reborrow into the closure value's field, which is
@@ -26,8 +27,8 @@ use crate::region_fixture::{FnHead, P0, P1};
 use crate::tests::findings_laid;
 use crate::{Need, Plant, Requirement};
 
-/// The captured `a`'s referent outlives `'static` (the module doc).
-const A_STATIC: [Requirement; 1] = [Requirement { from: Need::Capture(1), into: Need::Static }];
+/// The captured `a`'s region outlives `'static` (the module doc).
+const A_STATIC: [Requirement; 1] = [Requirement { from: Need::Capture(0), into: Need::Static }];
 
 /// The owner `fn f<'a, 'b>(..)` cannot prove `'a: 'static`: `UnprovenOutlives` at the
 /// closure's range (rustc: "lifetime may not live long enough", pointing at the closure). Its
