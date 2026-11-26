@@ -71,7 +71,7 @@ const EXPORT_PER_WORKER_IN_FLIGHT: usize = 6;
 const EXPORT_HAND_WAIT: core::time::Duration = core::time::Duration::from_secs(30);
 const EXPORT_PROCS_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 const EXPORT_RECV_SLICE: core::time::Duration = core::time::Duration::from_millis(10);
-const EXPORT_END_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
+const EXPORT_END_WAIT: core::time::Duration = core::time::Duration::from_secs(300);
 
 /// Program root shape domain for `blaze build` (`start_list::ListName::of` -> `RootName::program`),
 /// distinct from `engine_start.rs`'s `RUN_SHAPE` so `blaze build`'s release-profile code root
@@ -1484,9 +1484,11 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
         Ok(())
     })();
 
-    // Always close channels and join all worker tasks before returning (linear scope invariant).
+    // Always close channels, drain unstarted queued jobs, and join all worker tasks before
+    // returning (linear scope invariant).
     for ch in inboxes.iter() {
         ch.close();
+        while ch.try_recv().is_ok() {}
     }
     done_ch.close();
     procs_asked.close();

@@ -837,6 +837,18 @@ impl<'n> Locals<'n> {
         (it.module == h.names_at && strip_leading_trivia(it.text) == strip_leading_trivia(text)).then_some(found.key)
     }
 
+    /// The `(body, scope)` at which an AST node of `owner` with lowered block scope `scope` stands:
+    /// inside `owner` at `s` when `scope` is `Some(s)`, or—when `scope` is `None` (a local item's
+    /// signature or unblocked initializer, which has no enclosing `Expr::Block` in its own view)—at
+    /// the declaring block `(h.enclosing, h.scope)` of that local item (`LocalHead`). `None` for a
+    /// non-local item's signature.
+    pub fn scope_or_declared(&self, owner: ItemKey, scope: Option<u32>) -> Option<(ItemKey, u32)> {
+        match scope {
+            Some(s) => Some((owner, s)),
+            None => self.head(owner).map(|h| (h.enclosing, h.scope)),
+        }
+    }
+
     /// The local item `name` names in `ns`, written in block `scope` of the body `owner`: the
     /// block's items, then each enclosing block's (innermost first); where the body is itself
     /// a local item's, then the blocks around its declaration. `None`: the module's names.

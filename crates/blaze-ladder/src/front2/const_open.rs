@@ -343,8 +343,8 @@ pub(super) fn local_const<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
             _ => return Ok(None),
         }
     }
-    let Some(scope) = scope else { return Ok(None) };
-    local_const_in_scope(resolver, marks, locals, owner, module, heads, view, scope.0, found_path, name, range, ArrayLenSite::Repeat)
+    let Some((owner, scope)) = locals.scope_or_declared(owner, scope.map(|s| s.0)) else { return Ok(None) };
+    local_const_in_scope(resolver, marks, locals, owner, module, heads, view, scope, found_path, name, range, ArrayLenSite::Repeat)
 }
 
 /// What a generic argument written as ONE plain name means when an item declared in the body
@@ -383,18 +383,18 @@ pub(super) fn local_arg<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
     range: Range,
 ) -> Result<Option<LocalArg>, Why> {
     let lf::TypeRef::Path(p) = view.ty(t)? else { return Ok(None) };
-    let Some(scope) = view.path(p)?.scope else { return Ok(None) };
-    if let Some(row) = locals.find(owner, Some(scope.0), name, LocalNs::Type) {
+    let Some((owner, scope)) = locals.scope_or_declared(owner, view.path(p)?.scope.map(|s| s.0)) else { return Ok(None) };
+    if let Some(row) = locals.find(owner, Some(scope), name, LocalNs::Type) {
         if row.kind != LocalKind::Use {
             return Ok(Some(LocalArg::Type));
         }
-        let ty_target = resolve_use_target(resolver, marks, locals, owner, module, view, scope.0, Some(p), name, &row, Ns::Type, range)?;
+        let ty_target = resolve_use_target(resolver, marks, locals, owner, module, view, scope, Some(p), name, &row, Ns::Type, range)?;
         if let Some(target) = ty_target
             && matches!(target.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. })
         {
             return Ok(Some(LocalArg::Type));
         }
-        return match resolve_use_target(resolver, marks, locals, owner, module, view, scope.0, Some(p), name, &row, Ns::Value, range)? {
+        return match resolve_use_target(resolver, marks, locals, owner, module, view, scope, Some(p), name, &row, Ns::Value, range)? {
             Some(target) if target.kind == Kind::Const => {
                 let bits = const_item_bits(heads, target.key, name, range)?;
                 Ok(Some(LocalArg::Const(bits)))
@@ -409,7 +409,7 @@ pub(super) fn local_arg<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
             }
         };
     }
-    let Some(row) = locals.find(owner, Some(scope.0), name, LocalNs::Value) else { return Ok(None) };
+    let Some(row) = locals.find(owner, Some(scope), name, LocalNs::Value) else { return Ok(None) };
     match row.kind {
         LocalKind::Const => {
             let bits = const_item_bits(heads, row.key, name, range)?;
@@ -506,6 +506,41 @@ pub fn turbofish_use_fn_refused() {
     use crate::diag::not_a_const;
     let _ = take::<not_a_const>();
 }
+pub fn local_fn_sig_const_array_len_ok() -> [u8; 4] {
+    const MAX_PARTS: usize = 4;
+    fn fill(out: &mut [u8; MAX_PARTS]) {
+        out[0] = 1;
+    }
+    let mut buf = [0u8; MAX_PARTS];
+    fill(&mut buf);
+    buf
+}
+pub fn local_fn_sig_const_array_len_wrong() -> [u8; 5] {
+    const MAX_PARTS: usize = 4;
+    fn make() -> [u8; MAX_PARTS] {
+        [0u8; MAX_PARTS]
+    }
+    make()
+}
+pub fn local_fn_sig_const_generic_arg_ok() -> Wrap<4> {
+    const MAX_PARTS: usize = 4;
+    fn wrap(w: Wrap<MAX_PARTS>) -> Wrap<MAX_PARTS> {
+        w
+    }
+    wrap(Wrap([0u8; MAX_PARTS]))
+}
+pub fn local_fn_sig_use_const_array_len_ok() -> [u8; 4] {
+    use crate::diag::MOST_PENDING_SHOWN;
+    fn make() -> [u8; MOST_PENDING_SHOWN] {
+        [0u8; MOST_PENDING_SHOWN]
+    }
+    make()
+}
+pub fn local_const_repeat_sibling_const_ok() -> [u8; 4] {
+    const A: usize = 4;
+    const B: [u8; A] = [0u8; A];
+    B
+}
 ";
 
     #[test]
@@ -518,6 +553,10 @@ pub fn turbofish_use_fn_refused() {
             "turbofish_use_const_ok",
             "type_arg_use_const_ok",
             "turbofish_use_type_ok",
+            "local_fn_sig_const_array_len_ok",
+            "local_fn_sig_const_generic_arg_ok",
+            "local_fn_sig_use_const_array_len_ok",
+            "local_const_repeat_sibling_const_ok",
         ] {
             let diags = check_fn(APP, ok).unwrap_or_else(|e| panic!("`{ok}` was refused: {e}"));
             assert!(diags.is_empty(), "`{ok}` had unexpected diagnostics: {diags:?}");
@@ -527,6 +566,8 @@ pub fn turbofish_use_fn_refused() {
         assert!(wrong_repeat.contains(&"E0308"), "expected E0308, got {wrong_repeat:?}");
         let wrong_arg = check_fn(APP, "turbofish_use_const_wrong_len").expect("turbofish_use_const_wrong_len should typecheck with E0308");
         assert!(wrong_arg.contains(&"E0308"), "expected E0308, got {wrong_arg:?}");
+        let wrong_local_sig = check_fn(APP, "local_fn_sig_const_array_len_wrong").expect("local_fn_sig_const_array_len_wrong should typecheck with E0308");
+        assert!(wrong_local_sig.contains(&"E0308"), "expected E0308, got {wrong_local_sig:?}");
     }
 
     #[test]
