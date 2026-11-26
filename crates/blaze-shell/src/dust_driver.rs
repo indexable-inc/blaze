@@ -197,22 +197,8 @@ fn publish_progress(root: &Path, dir_mtime_ns: u128, progress: DustProgress) {
     REVISION.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Format a byte count compactly matching `blaze-sh`'s `Bytes` column (`8 B`, `44.9 KB`, `184.6 MB`, `2.1 GB`).
+/// Format a byte count compactly in IEC binary units (`8 B`, `44.9 KiB`, `43.9 MiB`, `2.1 GiB`).
 pub fn format_bytes_compact(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    const TB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if b < MB {
-        format!("{:.1} KB", b / KB)
-    } else if b < GB {
-        format!("{:.1} MB", b / MB)
-    } else if b < TB {
-        format!("{:.1} GB", b / GB)
-    } else {
-        format!("{:.1} TB", b / TB)
-    }
+    let alloc = Alloc::global();
+    blaze_dust::format_iec_bytes_in(bytes, alloc).as_str().to_owned()
 }

@@ -2450,11 +2450,23 @@ fn layout_table(
                             ColDisplay::FileSize => {
                                 let row_is_dir = row_file_kind.is_some_and(blaze_sniff::is_dir_label);
                                 let effective_max = col_max_num[c].max(dust_max_bytes as f64);
+                                let max_bytes_u64 = effective_max.round().max(1.0) as u64;
                                 let bar_on = effective_max > 0.0;
                                 let text_area_w = if bar_on {
                                     (content_w - SIZE_BAR_W - 10.0).max(m.cw * 3.0)
                                 } else {
                                     content_w
+                                };
+                                let tier_bar_color = |bytes: u64, scanning: bool| -> [f32; 4] {
+                                    if scanning {
+                                        return theme::rgba(0xe5, 0xb5, 0x67, 0.50);
+                                    }
+                                    match blaze_dust::size_tier(bytes) {
+                                        blaze_dust::SizeTier::Bytes => theme::rgba(0x88, 0x90, 0x9e, 0.55),
+                                        blaze_dust::SizeTier::KiB => theme::rgb(0x58, 0x9d, 0xf6),
+                                        blaze_dust::SizeTier::MiB => theme::rgb(0xe5, 0xb5, 0x67),
+                                        blaze_dust::SizeTier::GiB => theme::rgb(0xe8, 0x6a, 0x45),
+                                    }
                                 };
                                 if row_is_dir {
                                     if let Some(prog) = row_dust.get(vis_i).copied().flatten() {
@@ -2477,23 +2489,14 @@ fn layout_table(
                                             scene.text(tx, ty, txt, txt_col, false, false, clip_id);
 
                                             if bar_on && prog.bytes > 0 {
-                                                let frac = blaze_dust::bar_fraction(
-                                                    prog.bytes,
-                                                    effective_max.round().max(1.0) as u64,
-                                                );
-                                                if frac >= 0.012 {
+                                                let frac = blaze_dust::bar_fraction(prog.bytes, max_bytes_u64);
+                                                if frac >= 0.02 {
                                                     let bx0 = rx + text_area_w + 10.0;
                                                     let by0 = ty + m.ch * 0.5 - 2.0;
                                                     let by1 = by0 + 4.0;
                                                     scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
                                                     let fill_w = (SIZE_BAR_W * frac).max(3.0);
-                                                    let fill_col = if !prog.done {
-                                                        theme::rgba(0xe5, 0xb5, 0x67, 0.55)
-                                                    } else if frac >= 0.85 {
-                                                        theme::rgb(0xe5, 0xb5, 0x67)
-                                                    } else {
-                                                        theme::rgb(0x58, 0x9d, 0xf6)
-                                                    };
+                                                    let fill_col = tier_bar_color(prog.bytes, !prog.done);
                                                     scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
                                                 }
                                             }
@@ -2528,15 +2531,16 @@ fn layout_table(
                                     let tx = rx + text_area_w - txt.chars().count() as f32 * m.cw;
                                     scene.text(tx, ty, txt, theme::INK_2, false, false, clip_id);
 
-                                    if bar_on && let Value::Size(Bytes(b)) = cell {
-                                        let frac = ((*b).max(0) as f64 / effective_max).clamp(0.0, 1.0) as f32;
-                                        if frac >= 0.015 {
+                                    if bar_on && let Value::Size(Bytes(b)) = cell && *b > 0 {
+                                        let bytes_u64 = *b as u64;
+                                        let frac = blaze_dust::bar_fraction(bytes_u64, max_bytes_u64);
+                                        if frac >= 0.02 {
                                             let bx0 = rx + text_area_w + 10.0;
                                             let by0 = ty + m.ch * 0.5 - 2.0;
                                             let by1 = by0 + 4.0;
                                             scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
                                             let fill_w = (SIZE_BAR_W * frac).max(3.0);
-                                            let fill_col = if frac >= 0.99 { theme::INK_2 } else { theme::INK_4 };
+                                            let fill_col = tier_bar_color(bytes_u64, false);
                                             scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
                                         }
                                     }
