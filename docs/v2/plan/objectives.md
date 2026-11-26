@@ -29,7 +29,7 @@ What a user feels, on one warm machine.
 | T6 | A warm daemon start takes under 1 s | *write: v2 check replacing harness/v2/budgets.py {"budgets":["warm-start","restart"]}* | 35 s nushell, 238 s in CI (10-29) | ? |
 | T7 | blaze's own CI on a small pull request takes under 2 min | *write: v2 check replacing harness/v2/budgets.py {"budgets":["ci"]}* | 30 min+ (10-29) | ? |
 | T8 | A cold build of blaze keeps every core busy; wall time is within 25% of its critical path | *write: v2 check replacing harness/v2/budgets.py {"budgets":["cold-blaze"]}* | ripgrep cold dev build 70.9 s on a stage 1 of all-1110, 50.3 s on 0.20261105.4, cargo 5.2 s (2026-11-10) | ? |
-| T9 | No build is killed for memory; peak is at most cargo's | *write: v2 check replacing harness/v2/budgets.py {"budgets":["memory"]}; harness/v2/tightmemory.py* | ripgrep: daemon holds 15.6-16.8 GB after the run, cargo peaks at 2.76 GB (2026-11-10) | ? |
+| T9 | No build is killed for memory; peak is at most cargo's | `tightmemory.py` | ripgrep: daemon holds 15.6-16.8 GB after the run, cargo peaks at 2.76 GB (2026-11-10) | ? |
 | T10 | A body edit in a big top crate (ruff) takes under 50 ms | *write: v2 check replacing harness/v2/budgets.py {"budgets":["big-crate"]}* | 75 s (10-29) | ? |
 | T11 | Dev-build code runs at least as fast as cargo's debug build on ripgrep | *write: v2 check replacing harness/v2/budgets.py {"budgets":["dev-speed"]}* | 5.8x slower (10-29) | ? |
 | T12 | Release code runs at least as fast as cargo's release build | *write: v2 check replacing harness/v2/budgets.py {"budgets":["release-speed"]}* |  | ? |
