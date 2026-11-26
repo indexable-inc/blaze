@@ -648,3 +648,334 @@ fn emergency_foreground_fold_survives_crashes_at_every_cut() {
     }
     assert!(reached_once && cuts > 8, "expected crash cuts across emergency fold + commit (cuts={cuts}, reached={reached_once})");
 }
+
+/// Post-reboot foreground commits MUST NOT run `map_all()` + full-segment BLAKE3 verification over
+/// unrelated unsealed prior-boot segments; instead `Driven::commit_records` maps and verifies ONLY
+/// segments whose Bloom filter matches a key being committed (or segments lacking a Bloom filter),
+/// while still detecting and refusing `TwoValues` conflicts on matching keys (rules 21, 43).
+///
+/// Control (`Plant::CommitMapsAll`): reproducing the old eager `map_all()` hashes all 24 prior-boot
+/// unsealed segments on a single disjoint foreground commit and is caught by the oracle.
+#[test]
+fn post_reboot_foreground_commit_only_maps_bloom_matching_segments_and_refuses_two_values() {
+    use blaze_keyed::store::StoreError;
+
+    const SEGS: u32 = 24;
+    fn boot_cfg<'a>(n: u64, boot: u64, root: &'a Frame) -> PlainConfig<&'a Frame> {
+        let mut c = cfg(n, root);
+        c.boot = boot;
+        c.durable = false;
+        c
+    }
+
+    let seed_boot1 = |root: &Frame| -> Sim {
+        let mut w = Driven::with(Sim::new(131, Faults::default()), Path::new("/sim"), boot_cfg(1, 1, root), root).expect("boot1 open");
+        w.disable_auto_merge();
+        for s in 0..SEGS {
+            let k = record(300_000 + s);
+            w.put(k, Namespace::LOCAL, TAG, &value(300_000 + s)).expect("boot1 put");
+            w.commit_with(&[]).expect("boot1 commit");
+        }
+        assert_eq!(w.core().segments().len(), usize::try_from(SEGS).unwrap_or(24));
+        w.into_driver()
+    };
+
+    // 1. Disjoint foreground commit after reboot (boot 2): targeted Bloom mapping vs Plant::CommitMapsAll.
+    let run_disjoint = |plant: Plant| {
+        let root = test_root();
+        let sim = seed_boot1(&root);
+        let mut w2 = Driven::planted(sim, Path::new("/sim"), boot_cfg(2, 2, &root), &root, plant).expect("boot2 open");
+        assert_eq!(w2.mapped_of_named(), (0, SEGS), "lazy open maps nothing");
+        assert_eq!(w2.core().checks().full, 0, "lazy open hashes nothing");
+
+        let fresh_n = 399_001u32;
+        let fresh_k = record(fresh_n);
+        w2.put(fresh_k, Namespace::LOCAL, TAG, &value(fresh_n)).expect("fresh put");
+        w2.commit_with(&[]).expect("fresh foreground commit");
+        let (mapped, named) = w2.mapped_of_named();
+        let full_checks = w2.core().checks().full;
+        (mapped, named, full_checks, w2.into_driver())
+    };
+
+    let (mapped, named, full_checks, sim_after) = run_disjoint(Plant::None);
+    assert_eq!(named, SEGS + 1, "one new segment committed");
+    assert!(
+        full_checks <= 2 && mapped <= 3,
+        "targeted commit must skip unrelated prior-boot segments (mapped={mapped}/{named}, full_checks={full_checks})"
+    );
+
+    let (planted_mapped, _, planted_checks, _) = run_disjoint(Plant::CommitMapsAll);
+    assert_eq!(
+        planted_checks,
+        u64::from(SEGS),
+        "planted CommitMapsAll must hash every prior-boot unsealed segment (got {planted_checks}, mapped={planted_mapped})"
+    );
+
+    // 2. Conflicting TwoValues commit on an existing key in an unmapped prior-boot segment MUST be
+    //    caught and refused while STILL leaving unrelated prior-boot segments unmapped/unhashed.
+    {
+        let root = test_root();
+        let mut w3 = Driven::with(sim_after, Path::new("/sim"), boot_cfg(3, 2, &root), &root).expect("boot2 reopen");
+        assert_eq!(w3.mapped_of_named(), (0, SEGS + 1));
+        let target_n = 300_007u32;
+        let target_k = record(target_n);
+        let mut bad_bytes = value(target_n);
+        bad_bytes.push(0xfe);
+        w3.put(target_k, Namespace::LOCAL, TAG, &bad_bytes).expect("conflicting put buffered before map");
+        let refused = w3.commit_with(&[]);
+        assert!(
+            matches!(refused, Err(StoreError::TwoValues(_))),
+            "conflicting foreground commit against unmapped prior-boot segment must refuse TwoValues: {refused:?}"
+        );
+        let (mapped_conflict, named_conflict) = w3.mapped_of_named();
+        let checks_conflict = w3.core().checks().full;
+        assert!(
+            checks_conflict >= 1 && checks_conflict <= 3 && mapped_conflict < named_conflict,
+            "conflict check must verify the matching segment without hashing all unrelated segments (mapped={mapped_conflict}/{named_conflict}, checks={checks_conflict})"
+        );
+    }
+
+    // 3. Missing Bloom sidecar: falls back to mapping Bloom-less segments so TwoValues is still refused.
+    {
+        let root = test_root();
+        let mut sim = seed_boot1(&root);
+        sim.delete(&FileName::new("plain/bloom").expect("bloom name"));
+        let mut w4 = Driven::with(sim, Path::new("/sim"), boot_cfg(4, 2, &root), &root).expect("boot2 no-bloom open");
+        let target_n = 300_011u32;
+        let target_k = record(target_n);
+        let mut bad_bytes = value(target_n);
+        bad_bytes.push(0xaa);
+        w4.put(target_k, Namespace::LOCAL, TAG, &bad_bytes).expect("no-bloom conflicting put");
+        let refused = w4.commit_with(&[]);
+        assert!(
+            matches!(refused, Err(StoreError::TwoValues(_))),
+            "without Bloom sidecar, conflicting foreground commit must still map and refuse TwoValues: {refused:?}"
+        );
+        assert_eq!(w4.core().checks().full, u64::from(SEGS), "all Bloom-less prior-boot segments checked");
+    }
+}
+
+/// Live leases MUST protect retired segments past `GRACE_NS` from being unlinked, while once
+/// `LEASE_NS` expires a single GC slice unlinks them immediately (`removed > 0`, `bytes_out == 0`)
+/// and preserves every live rooted record byte-for-byte.
+///
+/// Control (`Plant::LeaseNeverExpires`): expired lease still pins retired files forever (`retired_ready == 0`).
+#[test]
+fn live_lease_protects_retired_segments_and_expired_lease_unlinks_immediately() {
+    use core::time::Duration;
+    use super::core::{GRACE_NS, LEASE_NS, ROOT_LIFE_NS};
+
+    assert!(GRACE_NS <= 120 * 1_000_000_000, "GRACE_NS must stay bounded (got {GRACE_NS} ns)");
+    assert!(LEASE_NS <= 30 * 60 * 1_000_000_000, "LEASE_NS must stay bounded (got {LEASE_NS} ns)");
+
+    let run = |plant: Plant| {
+        let root = test_root();
+        let sim = Sim::new(141, Faults::default());
+
+        // Process 1 writes a live rooted record and releases its lease.
+        let live_k = record(400_001);
+        let sim = {
+            let mut p1 = Driven::with(sim, Path::new("/sim"), reached_cfg(1, &root), &root).expect("p1 open");
+            p1.put(live_k, Namespace::LOCAL, TAG, &value(400_001)).expect("live put");
+            p1.root_for("live.root", &[live_k], ROOT_LIFE_NS).expect("live root");
+            p1.release_lease();
+            p1.commit_with(&[]).expect("p1 commit");
+            p1.into_driver()
+        };
+
+        // Process 2 opens and commits 6 small unrooted segments (creating a tier-0 merge candidate
+        // AND leaving a live lease when it dies).
+        let sim = {
+            let mut p2 = Driven::with(sim, Path::new("/sim"), reached_cfg(2, &root), &root).expect("p2 open");
+            for i in 0..6u32 {
+                let n = 400_100 + i;
+                p2.put(record(n), Namespace::LOCAL, TAG, &value(n)).expect("dead put");
+                p2.commit_with(&[]).expect("dead commit");
+            }
+            let mut s = p2.into_driver();
+            s.processes_died();
+            s
+        };
+
+        // GC compacts the 6 tier-0 segments into 1 merged segment, retiring the 6 originals.
+        let mut sim = {
+            let mut gc = Driven::planted(sim, Path::new("/sim"), reached_cfg(3, &root), &root, plant).expect("gc1 open");
+            let ran = gc.compact_foreground(4).expect("gc1 compact");
+            assert!(ran.iter().any(|s| s.segments >= 5 && !s.aborted), "tier-0 merge must retire originals: {ran:?}");
+            gc.into_driver()
+        };
+
+        // Advance past GRACE_NS (still inside LEASE_NS): p2's live lease protects the retired files!
+        sim.advance(Duration::from_nanos(GRACE_NS + 1_000_000_000));
+        let (ready_during_lease, removed_during_lease, mut sim) = {
+            let mut gc = Driven::planted(sim, Path::new("/sim"), reached_cfg(4, &root), &root, plant).expect("gc2 open");
+            let plan = gc.plan_gc().expect("plan during lease");
+            let ran = gc.compact_foreground(2).expect("compact during lease");
+            let removed: u32 = ran.iter().map(|s| s.removed).sum();
+            (plan.retired_ready, removed, gc.into_driver())
+        };
+
+        // Advance past LEASE_NS: p2's lease expires -> retired files become immediately unlinkable.
+        sim.advance(Duration::from_nanos(LEASE_NS + 1_000_000_000));
+        let (ready_after_expiry, removed_after_expiry, bytes_out_unlink, sim) = {
+            let mut gc = Driven::planted(sim, Path::new("/sim"), reached_cfg(5, &root), &root, plant).expect("gc3 open");
+            let plan = gc.plan_gc().expect("plan after expiry");
+            // Reuse `plan_gc` cached reachability on a second immediate call.
+            let plan2 = gc.plan_gc().expect("plan2 after expiry");
+            assert_eq!(plan, plan2, "cached plan_gc must match identically");
+            let ran = gc.compact_foreground(1).expect("unlink slice after expiry");
+            let removed: u32 = ran.iter().map(|s| s.removed).sum();
+            let bytes_out: u64 = ran.iter().map(|s| s.bytes_out).sum();
+            (plan.retired_ready, removed, bytes_out, gc.into_driver())
+        };
+
+        // Live rooted record must read back intact.
+        let mut reader = Driven::with(sim, Path::new("/sim"), reached_cfg(6, &root), &root).expect("reader open");
+        let got = reader.get(&live_k).expect("get live").expect("live record must survive");
+        assert_eq!(reader.got(got).bytes, value(400_001).as_slice());
+
+        (ready_during_lease, removed_during_lease, ready_after_expiry, removed_after_expiry, bytes_out_unlink)
+    };
+
+    let (ready_live, removed_live, ready_exp, removed_exp, bytes_out_unlink) = run(Plant::None);
+    assert_eq!(ready_live, 0, "live lease must keep retired_ready == 0 past GRACE_NS");
+    assert_eq!(removed_live, 0, "live lease must prevent unlinking retired segments");
+    assert!(ready_exp >= 5, "expired lease must expose all retired segments as ready (got {ready_exp})");
+    assert!(removed_exp >= 5, "first post-expiry slice must unlink retired segments immediately (got {removed_exp})");
+    assert_eq!(bytes_out_unlink, 0, "post-expiry retired unlink must be zero-copy metadata-only");
+
+    // Planted-bug control: `Plant::LeaseNeverExpires` pins retired segments forever.
+    let (_, _, planted_ready, planted_removed, _) = run(Plant::LeaseNeverExpires);
+    assert_eq!((planted_ready, planted_removed), (0, 0), "oracle must catch non-expiring lease pinning retired segments");
+}
+
+/// On a compaction conflict (`slice.aborted`), `Plain` refreshes its manifest in-place and maps
+/// only the delta segment(s) written by the concurrent commit, preserving existing `mmap`s and
+/// `ReachCache` so the next `compact` slice on the SAME handle succeeds without reopening the store.
+#[test]
+fn compaction_conflict_refreshes_manifest_in_place_without_reopen() {
+    use core::time::Duration;
+    use blaze_core::{Driver, wait::Deadline};
+    use super::core::{Plain, ROOT_LIFE_NS};
+
+    let root = test_root();
+    let mut sim = Sim::new(151, Faults::default());
+
+    let settle = |sim: &mut Sim, store: &mut Plain<&Frame>, effects: &mut _| {
+        let mut done = core::iter::empty().collect();
+        for _ in 0..100_000u32 {
+            sim.submit(effects);
+            if store.ready() && sim.in_flight() == 0 {
+                return;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for c in done.drain(..) {
+                if store.owns(c.tag) {
+                    store.complete(c, wall, effects);
+                }
+            }
+            if store.broken().is_some() {
+                return;
+            }
+        }
+        panic!("store did not settle");
+    };
+
+    // Seed 6 tier-0 segments and a root with a writer, releasing its lease.
+    let mut keys = blaze_own::Vec::new_in(&root);
+    let mut seed_w = Plain::new(reached_cfg(1, &root), &root);
+    let mut weffects = core::iter::empty().collect();
+    seed_w.open_whole(&mut weffects);
+    settle(&mut sim, &mut seed_w, &mut weffects);
+    seed_w.handed();
+    for i in 0..6u32 {
+        let n = 500_000 + i;
+        let k = record(n);
+        seed_w.put(k, Namespace::LOCAL, TAG, &value(n)).expect("seed put");
+        let wall = sim.wall_ns();
+        seed_w.commit(&[], wall, &mut weffects).expect("seed commit");
+        settle(&mut sim, &mut seed_w, &mut weffects);
+        assert!(matches!(seed_w.take_committed(), Some(Ok(_))));
+        keys.push((n, k));
+    }
+    let mut key_list = blaze_own::Vec::with_capacity_in(keys.len(), &root);
+    key_list.extend(keys.iter().map(|&(_, k)| k));
+    seed_w.root_for("conflict.root", &key_list, ROOT_LIFE_NS).expect("root");
+    seed_w.release_lease();
+    let wall = sim.wall_ns();
+    seed_w.commit(&[], wall, &mut weffects).expect("root commit");
+    settle(&mut sim, &mut seed_w, &mut weffects);
+    assert!(matches!(seed_w.take_committed(), Some(Ok(_))));
+
+    // Open two concurrent compactors (`gc1`, `gc2`) on the exact same generation.
+    let mut gc1 = Plain::new(reached_cfg(2, &root), &root);
+    let mut g1_effects = core::iter::empty().collect();
+    gc1.open_whole(&mut g1_effects);
+    settle(&mut sim, &mut gc1, &mut g1_effects);
+    gc1.handed();
+
+    let mut gc2 = Plain::new(reached_cfg(3, &root), &root);
+    let mut g2_effects = core::iter::empty().collect();
+    gc2.open_whole(&mut g2_effects);
+    settle(&mut sim, &mut gc2, &mut g2_effects);
+    gc2.handed();
+
+    let gen_before = gc1.generation();
+    let maps_before = gc1.mapped_of_named().0;
+    let plan = gc1.plan_gc(sim.wall_ns()).expect("plan_gc populates reach cache");
+    assert_eq!(plan.segments, 7);
+
+    // Start `gc1` compacting and advance it until it is about to acquire the flip lock (so its
+    // merged copy is already written, `sim.in_flight() == 0`, and its `Effect::Lock` is parked in
+    // `g1_effects` — deterministic conflict with zero dropped completions!).
+    assert!(gc1.compact(&mut g1_effects));
+    let mut done = core::iter::empty().collect();
+    let mut parked_lock = false;
+    for _ in 0..10_000u32 {
+        if g1_effects.iter().any(|e| matches!(e, blaze_core::Effect::Lock { .. })) {
+            parked_lock = true;
+            break;
+        }
+        sim.submit(&mut g1_effects);
+        if sim.in_flight() == 0 {
+            break;
+        }
+        let now = sim.now();
+        sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+        let wall = sim.wall_ns();
+        for c in done.drain(..) {
+            if gc1.owns(c.tag) {
+                gc1.complete(c, wall, &mut g1_effects);
+            }
+        }
+    }
+    assert!(parked_lock && sim.in_flight() == 0, "gc1 must pause right before acquiring flip lock");
+
+    // `gc2` runs to completion while `gc1`'s flip lock is parked, merging all 7 segments into 1!
+    assert!(gc2.compact(&mut g2_effects));
+    settle(&mut sim, &mut gc2, &mut g2_effects);
+    let s2 = gc2.take_sliced().expect("gc2 sliced");
+    assert!(!s2.aborted && s2.segments >= 6, "gc2 must land merge first: {s2:?}");
+
+    // Now release `gc1`'s parked flip lock: its slice MUST abort AND refresh `gc1` in-place to
+    // `gc2`'s new generation!
+    settle(&mut sim, &mut gc1, &mut g1_effects);
+    let s1 = gc1.take_sliced().expect("gc1 sliced");
+    assert!(s1.aborted, "gc1 must detect conflict and abort: {s1:?}");
+    assert_eq!(gc1.generation(), gc2.generation(), "aborted compaction must refresh generation in-place without reopen");
+    assert!(gc1.generation() > gen_before);
+    assert_eq!(gc1.segments().len(), gc2.segments().len(), "refreshed manifest must match latest segments");
+    let (mapped_after, named_after) = gc1.mapped_of_named();
+    assert_eq!(mapped_after, named_after, "refreshed eager handle must have every latest segment mapped");
+    assert!(maps_before >= 6, "pre-conflict mappings existed");
+
+    // Subsequent read & plan on the SAME `gc1` handle work cleanly without reopening!
+    let plan_after = gc1.plan_gc(sim.wall_ns()).expect("plan_gc after in-place refresh");
+    assert_eq!(plan_after.segments, 1, "refreshed handle sees single merged segment");
+    for &(n, k) in &keys {
+        let got = gc1.get(&k).expect("record readable on refreshed handle");
+        assert_eq!(got.bytes, value(n).as_slice());
+    }
+}

@@ -327,11 +327,13 @@ fn body_ids_cert(root: ContentId, scope: crate::engine_check::CheckScope<'_>) ->
     }
 }
 
-/// Tag bytes under [`SCOPED_IDS_CERT_DOMAIN`] for the last-`RunIds` delta anchor and pointer
+/// Tag bytes under [`SCOPED_IDS_CERT_DOMAIN`] for the last-`RunIds` delta anchor and pointers
 /// (disjoint from `body_ids_cert`, which hashes 32-byte `root` followed by tag `1` or `2`).
 const DELTA_ANCHOR_TAG: u8 = 3;
 const DELTA_PTR_TAG: u8 = 4;
+const DELTA_WS_PTR_TAG: u8 = 5;
 const DELTA_ANCHOR_BYTES: usize = 64;
+const WORKSPACE_ANCHOR_DOMAIN: &str = "blaze-cli run ids workspace anchor 1";
 
 fn hash_scope(h: &mut blaze_ids::Hasher, scope: crate::engine_check::CheckScope<'_>) {
     let put_len = |h: &mut blaze_ids::Hasher, n: usize| {
@@ -386,6 +388,50 @@ fn body_ids_last_ptr(
     h.update(&[DELTA_PTR_TAG]);
     h.update(&u64::try_from(checkout.len()).unwrap_or(u64::MAX).to_le_bytes());
     h.update(checkout.as_bytes());
+    hash_scope(&mut h, scope);
+    h.update(&toolchain.0);
+    for tool in tools {
+        h.id(&tool.0);
+    }
+    blaze_cas::Key(h.finish())
+}
+
+/// Deterministic, checkout-path-free workspace identity derived from member `(name, /0/... root)`
+/// entries in `list`, shared across worktrees of the same repository (rules 25, 36).
+fn workspace_anchor_id(list: &blaze_world::crate_list::CrateList<'_>, alloc: Alloc<'_>) -> Option<ContentId> {
+    use blaze_world::crate_list::CrateGraph as _;
+
+    let mut members: blaze_own::AVec<'_, (&str, &str)> = blaze_own::Vec::new_in(alloc);
+    for at in 0..list.len() {
+        if list.member(at) {
+            members.push((list.name(at), list.root(at)));
+        }
+    }
+    if members.is_empty() {
+        return None;
+    }
+    members.sort_unstable();
+    members.dedup();
+    let mut h = blaze_ids::Hasher::new(WORKSPACE_ANCHOR_DOMAIN);
+    h.update(&u64::try_from(members.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for (name, root) in members.iter() {
+        h.part(name.as_bytes()).part(root.as_bytes());
+    }
+    Some(h.finish())
+}
+
+/// Cross-worktree CAS pointer for the workspace+scope's most recent `RunIds` delta anchor, keyed
+/// by `(workspace_anchor, scope, toolchain, tools)` without any checkout path so a fresh worktree
+/// hits delta `BZRI` on its first edit after adopting a shared workspace base.
+fn body_ids_workspace_ptr(
+    workspace: ContentId,
+    scope: crate::engine_check::CheckScope<'_>,
+    toolchain: blaze_toolchain::ToolchainId,
+    tools: &[Tool; KINDS],
+) -> blaze_cas::Key {
+    let mut h = blaze_ids::Hasher::new(SCOPED_IDS_CERT_DOMAIN);
+    h.update(&[DELTA_WS_PTR_TAG]);
+    h.id(&workspace);
     hash_scope(&mut h, scope);
     h.update(&toolchain.0);
     for tool in tools {
@@ -497,10 +543,14 @@ impl PageReuseOracle<'_> {
     }
 
     /// Sans-IO builder over flat page key slices (`!is_radix`), directly testable without a store.
-    fn from_flat_pages<'a>(
+    /// When `ug_row_unchanged` is `true`, a changed `ug_page` is treated as a hash-bucket
+    /// collision (keeping `ug_page` marked changed so colliding tasks re-read fresh while allowing
+    /// delta `BZRI` reuse across all untouched pages).
+    fn from_flat_pages_with_ug<'a>(
         bits: u8,
         prev_pages: &[Key],
         curr_pages: &[Key],
+        ug_row_unchanged: bool,
         skipped_changed: blaze_own::AVec<'a, blaze_drive::Name>,
         alloc: Alloc<'a>,
     ) -> Option<PageReuseOracle<'a>> {
@@ -520,23 +570,35 @@ impl PageReuseOracle<'_> {
             }
         }
         let ug_page = usize::try_from(blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), bits)).unwrap_or(usize::MAX);
-        if Self::is_page_changed(changed_pages.as_slice(), ug_page) {
+        if Self::is_page_changed(changed_pages.as_slice(), ug_page) && !ug_row_unchanged {
             return None;
         }
         Some(PageReuseOracle { bits, changed_pages, skipped_changed })
+    }
+
+    #[cfg(test)]
+    fn from_flat_pages<'a>(
+        bits: u8,
+        prev_pages: &[Key],
+        curr_pages: &[Key],
+        skipped_changed: blaze_own::AVec<'a, blaze_drive::Name>,
+        alloc: Alloc<'a>,
+    ) -> Option<PageReuseOracle<'a>> {
+        Self::from_flat_pages_with_ug(bits, prev_pages, curr_pages, false, skipped_changed, alloc)
     }
 
     /// Sans-IO builder for flat roots (`!curr.is_radix()`).
     fn from_flat_roots<'a>(
         prev: &blaze_engine::pages::Root<'_>,
         curr: &blaze_engine::pages::Root<'_>,
+        ug_row_unchanged: bool,
         alloc: Alloc<'a>,
     ) -> Option<PageReuseOracle<'a>> {
         if prev.bits != curr.bits || prev.is_radix() || curr.is_radix() {
             return None;
         }
         let skipped_changed = Self::collect_skipped_diff(prev, curr, alloc);
-        Self::from_flat_pages(curr.bits, prev.pages.as_slice(), curr.pages.as_slice(), skipped_changed, alloc)
+        Self::from_flat_pages_with_ug(curr.bits, prev.pages.as_slice(), curr.pages.as_slice(), ug_row_unchanged, skipped_changed, alloc)
     }
 }
 
@@ -596,6 +658,45 @@ fn decode_shard_from_store<'a, 'm>(
     .ok())
 }
 
+/// Inspects `Name::unit_graph()` directly on `prev_page_key` and `curr_page_key` when `ug_page`'s
+/// page key moved: returns `Ok(true)` iff the `UnitGraph` row's `out`, `key`, and stored record key
+/// are bit-for-bit identical (meaning `ug_page` moved solely due to a hash-bucket collision with an
+/// unrelated task, so delta `BZRI` remains 100% sound under rule 21).
+fn unit_graph_row_unchanged<'m>(
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'m>,
+    prev_page_key: Key,
+    curr_page_key: Key,
+    ug_page: u32,
+    bits: u8,
+) -> Result<bool, CliError> {
+    if prev_page_key == Key::default() || curr_page_key == Key::default() {
+        return Ok(false);
+    }
+    let Some(prev_held) = store.get(cx, prev_page_key)? else { return Ok(false) };
+    let Some(curr_held) = store.get(cx, curr_page_key)? else { return Ok(false) };
+    let Ok(prev_page) = blaze_engine::pages::VerifiedPage::open(
+        blaze_engine::pages::Sealed::by_store(prev_page_key, prev_held.bytes, prev_held.proof),
+        ug_page,
+        bits,
+    ) else {
+        return Ok(false);
+    };
+    let Ok(curr_page) = blaze_engine::pages::VerifiedPage::open(
+        blaze_engine::pages::Sealed::by_store(curr_page_key, curr_held.bytes, curr_held.proof),
+        ug_page,
+        bits,
+    ) else {
+        return Ok(false);
+    };
+    let ug = blaze_drive::Name::unit_graph();
+    let Some(prev_row) = prev_page.row(ug) else { return Ok(false) };
+    let Some(curr_row) = curr_page.row(ug) else { return Ok(false) };
+    Ok(prev_row.facts.out == curr_row.facts.out
+        && prev_row.facts.key == curr_row.facts.key
+        && prev_page.record(ug) == curr_page.record(ug))
+}
+
 fn build_page_reuse_oracle<'a, 'm>(
     cx: &Cx,
     store: &mut dyn crate::store::Store<'m>,
@@ -612,8 +713,17 @@ fn build_page_reuse_oracle<'a, 'm>(
     if prev.bits != curr.bits {
         return Ok(None);
     }
+    let ug_page_u32 = blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), curr.bits);
+    let ug_page = usize::try_from(ug_page_u32).unwrap_or(usize::MAX);
     if !curr.is_radix() {
-        return Ok(PageReuseOracle::from_flat_roots(&prev, &curr, alloc));
+        let prev_ug = prev.pages.get(ug_page).copied().unwrap_or_default();
+        let curr_ug = curr.pages.get(ug_page).copied().unwrap_or_default();
+        let ug_unchanged = if prev_ug != curr_ug {
+            unit_graph_row_unchanged(cx, store, prev_ug, curr_ug, ug_page_u32, curr.bits)?
+        } else {
+            false
+        };
+        return Ok(PageReuseOracle::from_flat_roots(&prev, &curr, ug_unchanged, alloc));
     }
     if prev.page_shards.len() != curr.page_shards.len() {
         return Ok(None);
@@ -621,6 +731,10 @@ fn build_page_reuse_oracle<'a, 'm>(
     let words = curr.page_count().div_ceil(64).max(1);
     let mut changed_pages = blaze_own::Vec::with_capacity_in(words, alloc);
     changed_pages.resize(words, 0u64);
+    let ug_shard = ug_page / blaze_engine::pages::RADIX_LEAF_PAGES;
+    let ug_slot = ug_page % blaze_engine::pages::RADIX_LEAF_PAGES;
+    let mut prev_ug_key = Key::default();
+    let mut curr_ug_key = Key::default();
     for (shard_idx, (&prev_sk, &curr_sk)) in prev.page_shards.iter().zip(curr.page_shards.iter()).enumerate() {
         if prev_sk == curr_sk {
             continue;
@@ -642,6 +756,10 @@ fn build_page_reuse_oracle<'a, 'm>(
             };
             Some(decoded)
         };
+        if shard_idx == ug_shard {
+            prev_ug_key = prev_shard.as_ref().and_then(|s| s.keys.get(ug_slot).copied()).unwrap_or_default();
+            curr_ug_key = curr_shard.as_ref().and_then(|s| s.keys.get(ug_slot).copied()).unwrap_or_default();
+        }
         let base = shard_idx * blaze_engine::pages::RADIX_LEAF_PAGES;
         for slot in 0..blaze_engine::pages::RADIX_LEAF_PAGES {
             let pk = prev_shard.as_ref().and_then(|s| s.keys.get(slot).copied()).unwrap_or_default();
@@ -651,8 +769,9 @@ fn build_page_reuse_oracle<'a, 'm>(
             }
         }
     }
-    let ug_page = usize::try_from(blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), curr.bits)).unwrap_or(usize::MAX);
-    if PageReuseOracle::is_page_changed(changed_pages.as_slice(), ug_page) {
+    if PageReuseOracle::is_page_changed(changed_pages.as_slice(), ug_page)
+        && !unit_graph_row_unchanged(cx, store, prev_ug_key, curr_ug_key, ug_page_u32, curr.bits)?
+    {
         return Ok(None);
     }
     let skipped_changed = PageReuseOracle::collect_skipped_diff(&prev, &curr, alloc);
@@ -679,11 +798,18 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     let lent = standing.lent;
     let checkout_id = standing.place.served.root_text().unwrap_or(standing.place.checkout);
     let last_ptr = body_ids_last_ptr(checkout_id, standing.scope, toolchain, &tools);
+    let ws_ptr = workspace_anchor_id(list, alloc).map(|ws| body_ids_workspace_ptr(ws, standing.scope, toolchain, &tools));
+    let save_anchors = |root: ContentId, table: Key| {
+        save_last_body_ids_if_moved(lent, &last_ptr, root, table);
+        if let Some(ref ptr) = ws_ptr {
+            save_last_body_ids_if_moved(lent, ptr, root, table);
+        }
+    };
     let most = crate::run_ids::Most::USUAL;
     let from = crate::run_ids::ReadsFrom::new(standing.rows(), asked, most);
     let reading = |ids: RunIds<'a>| ids.reading::<crate::run_ids::Production>(from).map_err(|why| refused(RunIdsError::Unread(why)));
     if let Some(ids) = RunIds::from_record(cx, &mut *standing.store, cert, toolchain, &tools, bump).map_err(refused)? {
-        save_last_body_ids_if_moved(lent, &last_ptr, standing.root, table_cas_key);
+        save_anchors(standing.root, table_cas_key);
         return reading(ids);
     }
     // Each active member unit's root and view: the walk asks each unit's row of a body at its view (D191).
@@ -691,10 +817,13 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     let units = crate::run_ids::unit_roots_scoped(list, scoped.as_ref(), alloc).map_err(refused)?;
     let walk_from = if scoped.is_some() { crate::run_ids::WalkFrom::UnitRoots } else { crate::run_ids::WalkFrom::Workspace };
     let body_tool = blaze_engine::Tools(tools).of(blaze_drive::Name { kind: Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
-    // Incremental delta fast path: when a prior `RunIds` record exists for this `(checkout, scope,
-    // toolchain, tools)` and `UnitGraph` did not move, diff `prev_root` vs `curr_root` pages and
-    // copy all standing crates/files/checks directly from `prev_ids` without opening their records.
-    if let Some((prev_root_id, prev_bytes)) = load_last_body_ids(lent, &last_ptr) {
+    // Incremental delta fast path: check this checkout's own anchor first, then the cross-worktree
+    // workspace anchor (so a fresh worktree adopting a shared base hits delta `BZRI` on its first
+    // edit). Diff `prev_root` vs `curr_root` pages and copy all standing crates/files/checks
+    // directly from `prev_ids` without opening their records.
+    let prior_anchor = load_last_body_ids(lent, &last_ptr)
+        .or_else(|| ws_ptr.as_ref().and_then(|ptr| load_last_body_ids(lent, ptr)));
+    if let Some((prev_root_id, prev_bytes)) = prior_anchor {
         let prev_erased = blaze_own::Erased::new(frame);
         let prev_bump = prev_erased.bump();
         if let Ok(prev_ids) = RunIds::read(prev_bytes, prev_bump)
@@ -707,7 +836,7 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
                 let ids = RunIds::from_walked(cx, toolchain, list, scoped.as_ref(), &tools, &walk, &mut answer, Some((&prev_ids, &oracle)), most, bump).map_err(refused)?;
                 drop(answer);
                 ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
-                save_last_body_ids_if_moved(lent, &last_ptr, standing.root, table_cas_key);
+                save_anchors(standing.root, table_cas_key);
                 return reading(ids);
             }
         }
@@ -717,7 +846,7 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     let ids = RunIds::from_walked(cx, toolchain, list, scoped.as_ref(), &tools, &walk, &mut answer, None, most, bump).map_err(refused)?;
     drop(answer);
     ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
-    save_last_body_ids_if_moved(lent, &last_ptr, standing.root, table_cas_key);
+    save_anchors(standing.root, table_cas_key);
     reading(ids)
 }
 
@@ -782,6 +911,7 @@ pub(crate) fn run_program(
     let began = phases.now();
     let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
     let ids_ns = phases.since(began);
+    phases.mark_cx(cx, "body_ids", frame);
     // The line's table half now: the table itself is handed to the parent below.
     let ids_line = ids.line(&asked, ids_ns);
     let mut made = Some(ids);
@@ -816,6 +946,7 @@ pub(crate) fn run_program(
     let mut ids = || made.take().ok_or_else(|| crate::run_parent::ParentError::BodyIds { shown: std::boxed::Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
     let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
     end_procs(cx, &maker, standing.err, "run")?;
+    phases.mark_cx(cx, "program_run", frame);
     let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
     phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
     if let Some(why) = seen.refused() {
@@ -941,19 +1072,33 @@ pub(crate) fn run_tests_status(
         let began = phases.now();
         let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
         let ids_ns = phases.since(began);
+        phases.mark_cx(cx, "body_ids", frame);
         let overflow = program::dev_overflow(cx, root, frame)?;
         let panic = blaze_ladder::panic_strategy::of_profile(blaze_world::panic::TEST_PROFILE);
         // Boxed in the process heap: the error outlives this frame to `main`'s print.
         let parent = move |why| CliError::OwnProcess(blaze_own::Box::new_in(crate::own_process::OwnError::Parent(why), heap.alloc()));
         let isa = crate::run_parent::isa().map_err(parent)?;
         let producer = standing.producers.get::<blaze_ids::producer::CodeBuilder>();
+        let certificate = crate::start_list::Certificate::of_answer(&standing);
+        let tools_digest = crate::test_cache::tools_digest(&standing.tools);
+        let curr_root = decode_root_from_store(cx, &mut *standing.store, Key(standing.root), standing.heap.shared())?;
         let mut specs = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
         for (_, unit) in &inventory.suites {
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
-            specs.push(crate::test_drive::SuiteSpec { unit: *unit, builder });
+            let digests = crate::test_cache::compute_suite_digests(
+                *unit,
+                &builder,
+                list,
+                &ids,
+                tools_digest,
+                standing.root,
+                standing.errors,
+                curr_root.as_ref(),
+                alloc,
+            );
+            specs.push(crate::test_drive::SuiteSpec { unit: *unit, builder, digests });
         }
-        let certificate = crate::start_list::Certificate::of_answer(&standing);
-        let tools_digest = crate::test_cache::tools_digest(&standing.tools);
+        drop(curr_root);
         let lent = standing.lent;
         let prep_erased = blaze_own::Erased::new(frame);
         let prep_bump = prep_erased.bump();
@@ -961,6 +1106,7 @@ pub(crate) fn run_tests_status(
             cx, clock, launch.out, specs.as_slice(), &ids, &certificate, tools_digest, config, launch.args, lent, watch, prep_bump,
         )
         .map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?;
+        phases.mark_cx(cx, "test_prepare", frame);
         match prepared {
             // Zero-spawn fast path: every targeted test hit `TestCache` (or was filtered/ignored);
             // skip native-image linking, crate names opening, `$TMPDIR`, code workers, and launcher spawns.
@@ -1013,12 +1159,14 @@ pub(crate) fn run_tests_status(
                     let native = images.get(at).copied().unwrap_or(Ok(None));
                     runnable.push(Some(crate::test_drive::Suite { names, crates, builder: spec.builder, unit: *unit, place, native }));
                 }
+                phases.mark_cx(cx, "test_open_suites", frame);
                 let typed = crate::engine_body_record::TypedFrom { cx, lent, records: standing.records(), alloc: heap.alloc() };
                 let ran = dirty.run(
                     cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err,
-                    runnable.as_slice(), &ids, typed, certificate, config, launch.args, lent, root, procs, heap, watch, frame,
+                    runnable.as_slice(), &ids, typed, config, launch.args, lent, root, procs, heap, watch, frame,
                 );
                 end_procs(cx, &maker, err, "test")?;
+                phases.mark_cx(cx, "test_run", frame);
                 ids_line = Some(ids.line(&asked, ids_ns));
                 ran.map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?
             }
@@ -1109,16 +1257,74 @@ mod tests {
             }
         }
 
-        // Control: when UnitGraph's page changed, oracle returns None so full walk runs.
+        // Control: when UnitGraph's page changed and UnitGraph's row moved, oracle returns None so full walk runs.
         if let Some(slot) = curr.get_mut(ug_page) {
             *slot = blaze_drive::Key(blaze_ids::ContentId([0x30; 32]));
         }
         assert!(
             super::PageReuseOracle::from_flat_pages(bits, &prev, &curr, blaze_own::Vec::new_in(alloc), alloc).is_none(),
-            "changed UnitGraph page must disable delta reuse"
+            "changed UnitGraph page with moved UnitGraph row must disable delta reuse"
         );
+        // Hash-bucket collision on `ug_page` when `Name::unit_graph()` row is unchanged:
+        // oracle succeeds, marks `ug_page` changed (so colliding tasks re-read fresh), and keeps
+        // all untouched pages reusable!
+        let colliding = super::PageReuseOracle::from_flat_pages_with_ug(bits, &prev, &curr, true, blaze_own::Vec::new_in(alloc), alloc);
+        assert!(colliding.is_some(), "ug_page hash-bucket collision with unchanged UnitGraph row must allow delta reuse");
+        if let Some(oracle) = colliding {
+            assert!(!oracle.unchanged(blaze_drive::Name::unit_graph()), "ug_page itself remains marked changed for colliding tasks");
+            let untouched_page = usize::try_from(blaze_drive::answers::page_of(untouched_file, bits)).unwrap_or(0);
+            if untouched_page != target_page && untouched_page != ug_page {
+                assert!(oracle.unchanged(untouched_file), "untouched pages stay reusable across ug_page collision");
+            }
+        }
         // Control: mismatched slice length returns None.
         assert!(super::PageReuseOracle::from_flat_pages(bits, &prev[..8], &curr, blaze_own::Vec::new_in(alloc), alloc).is_none());
+    }
+
+    #[test]
+    fn workspace_body_ids_anchor_shares_across_worktrees() {
+        use blaze_cas::plain::{Namespace, Settings as StoreSettings};
+        use blaze_core::FileName;
+        use blaze_core::sim::{Faults, Sim};
+        use crate::store::plain_place::{Facts, after_answer, config, open, test_cx};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let cx = test_cx();
+        let open_lent = |sim: Sim, nonce: u64| {
+            let Some(store_name) = FileName::new("store") else { panic!("store name") };
+            let cfg = config(store_name, &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+            let Ok(lent) = open(sim, cfg, alloc) else { panic!("open sim lent {nonce}") };
+            lent
+        };
+        let lent1 = open_lent(Sim::new(72, Faults::default()), 201);
+        let tools: [blaze_drive::Tool; blaze_drive::key::KINDS] =
+            core::array::from_fn(|at| blaze_drive::Tool(blaze_ids::ContentId([u8::try_from(at).unwrap_or(u8::MAX); 32])));
+        let tc = blaze_toolchain::ToolchainId([0x66; 32]);
+        let ws_id = blaze_ids::ContentId([0x42; 32]);
+
+        let ptr_wt_a = super::body_ids_last_ptr("/wt/a", crate::engine_check::CheckScope::Whole, tc, &tools);
+        let ptr_wt_b = super::body_ids_last_ptr("/wt/b", crate::engine_check::CheckScope::Whole, tc, &tools);
+        let ws_ptr = super::body_ids_workspace_ptr(ws_id, crate::engine_check::CheckScope::Whole, tc, &tools);
+        assert_ne!(ptr_wt_a, ptr_wt_b);
+        assert_ne!(ws_ptr, ptr_wt_a);
+        assert_ne!(ws_ptr, ptr_wt_b);
+
+        // Worktree A saves its checkout anchor AND shared workspace anchor.
+        let root_a = blaze_ids::ContentId([0x1a; 32]);
+        let table_a = blaze_drive::Key(blaze_ids::ContentId([0x2b; 32]));
+        let fake_bzri = b"BZRI-worktree-a";
+        assert!(lent1.put(&blaze_cas::Key(table_a.0), Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), fake_bzri).is_ok());
+        super::save_last_body_ids_if_moved(&lent1, &ptr_wt_a, root_a, table_a);
+        super::save_last_body_ids_if_moved(&lent1, &ws_ptr, root_a, table_a);
+        assert!(after_answer(&cx, &lent1, 0).is_ok());
+
+        // Worktree B opens the shared store on its first edit: its checkout pointer misses, so it
+        // adopts Worktree A's anchor through the workspace pointer and hits delta BZRI.
+        let lent2 = open_lent(lent1.into_store().into_driver(), 202);
+        assert!(super::load_last_body_ids(&lent2, &ptr_wt_b).is_none());
+        let adopted = super::load_last_body_ids(&lent2, &ptr_wt_b)
+            .or_else(|| super::load_last_body_ids(&lent2, &ws_ptr));
+        assert_eq!(adopted, Some((root_a, &fake_bzri[..])));
     }
 
     #[test]

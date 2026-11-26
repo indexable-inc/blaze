@@ -2266,6 +2266,33 @@ impl<'a> RunIds<'a> {
         u32::try_from(self.bodies.len() / BODY_ROW).unwrap_or(u32::MAX)
     }
 
+    /// The pinned toolchain this table was built under.
+    pub(crate) fn toolchain(&self) -> ToolchainId {
+        self.toolchain
+    }
+
+    /// The check producers digest (`CHECK_KINDS`' tools) this table was built under.
+    pub(crate) fn producers(&self) -> ContentId {
+        self.producers
+    }
+
+    /// Raw `CRATE_ROW` slice for the crate whose 8-byte prefix is `prefix`, or `None`.
+    pub(crate) fn crate_row_bytes(&self, prefix: [u8; 8]) -> Option<&'a [u8]> {
+        let n = self.crates.len() / CRATE_ROW;
+        let at = search(n, |i| self.crates.get(i * CRATE_ROW..i * CRATE_ROW + 8).unwrap_or(&[]).cmp(&prefix[..]))?;
+        self.crates.get(at * CRATE_ROW..(at + 1) * CRATE_ROW)
+    }
+
+    /// Contiguous raw `BODY_ROW` byte slice for every workspace body row whose item key starts
+    /// with `prefix` (already sorted ascending by `ItemKey`, zero allocations, zero store reads).
+    pub(crate) fn crate_bodies_bytes(&self, prefix: [u8; 8]) -> &'a [u8] {
+        let n = self.bodies.len() / BODY_ROW;
+        let at = |i: usize| self.bodies.get(i * BODY_ROW..(i + 1) * BODY_ROW).map_or(ItemKey(0), body_item);
+        let from = partition(n, |i| prefix_of(at(i)) < prefix);
+        let to = partition(n, |i| prefix_of(at(i)) <= prefix);
+        self.bodies.get(from * BODY_ROW..to * BODY_ROW).unwrap_or(&[])
+    }
+
     /// The bytes of the table's record ([`RunIds::write`]'s length), without writing it.
     pub(crate) fn table_bytes(&self) -> u64 {
         (HEADER + self.crates.len() + self.bodies.len() + self.edges.len() * EDGE + self.today.len() * READ) as u64

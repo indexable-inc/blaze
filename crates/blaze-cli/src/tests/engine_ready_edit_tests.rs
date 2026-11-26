@@ -524,19 +524,18 @@ fn moduled_on(io: &Io, n: u32, driver: Driver, plant: CommitPlant) -> (Result<en
 }
 
 /// THE READY SETUP'S READS (piece B2, engine_check.rs `read_needed`, engine_bodies.rs
-/// `BodiesStage::ready_reads`): the ready setup reads back the outlines of the members the bodies'
-/// setup visits (each member's tree, closed under its outlines' file parts) and of the entering
-/// tasks' files, never every file's. In a world whose edited crate has a submodule the edit does
-/// not touch, at 8 and at 64 crates:
+/// `BodiesStage::ready_reads`): the ready setup reads back the outlines of the members whose
+/// trees the bodies' setup must walk (`stands` and `stands_below` both `None`) and of the
+/// entering tasks' files, never every file's:
 ///
-/// - THE ORACLE: the ready edit's root, page keys and print are the phase path's (the submodule
-///   read back is the one the member's walk needs);
-/// - THE BAR: one outline read back (the submodule; the edited file is outlined), at both sizes,
-///   and the stored rows read the same at both sizes (the phase path's setup read every file's);
-/// - THE CONTROL (rule 23, `CommitPlant::ReadsNoVisitedTree`): a setup that reads back no visited
-///   member's tree is refused by name (`Unoutlined`, typed: the member's walk reaches the
-///   submodule and no outline holds it), so the reads chosen are the ones the setup needs and the
-///   oracle's equality is evidence, never a member quietly checked over fewer files.
+/// - BODY-ONLY EDIT ON A `Held` MEMBER (`cold_moduled` at 8 and 64 crates, with untouched
+///   submodule `m.rs`): the member stands below its heads (`stands_below`), so `ready_reads`
+///   fetches **0** unchanged submodules (`ready.files.read_back == 0`) while `ready_keys.root`,
+///   `pages`, and `lines` match `Driver::Phases` byte-for-byte.
+/// - VISITED-TREE MEMBER (`CutScope` member `b` with untouched submodule `m.rs`, where
+///   `stands_below` is `None` so `groups` must walk `reached_under`): `ready_reads` reads back
+///   `m.rs` alone (`read_back == 1`) matching `Driver::Phases`, and THE CONTROL (rule 23,
+///   `CommitPlant::ReadsNoVisitedTree`) is refused by name (`Unoutlined`, naming `m.rs`).
 #[test]
 fn the_ready_setup_reads_back_only_the_visited_members_outlines() {
     let mut bars = std::vec::Vec::new();
@@ -549,25 +548,73 @@ fn the_ready_setup_reads_back_only_the_visited_members_outlines() {
         assert_eq!(ready_keys.root, phases_keys.root, "{crates} crates: the ready edit's root is the phase path's");
         assert_eq!(ready_keys.pages, phases_keys.pages, "{crates} crates: every page key equal");
         assert_eq!(ready_lines, phases_lines, "{crates} crates: one print");
-        // Only the visited member's submodule (`m.rs`) is read back: transitive member
-        // dependencies (`c0` to `c{EDITED - 1}`) are never eagerly read back upfront (any file
-        // text a checked body actually asks is outlined lazily on demand).
-        let expected = 1u32;
-        assert_eq!(ready.files.read_back, expected, "{crates} crates: the ready setup reads back the visited member's submodule alone (outlined {}, rows read {})", ready.files.outlined, ready.plan.files_read);
+        // Body-only edit stands below heads (`stands_below`): 0 unchanged submodules read back
+        // from CAS (only the edited file is outlined).
+        assert_eq!(ready.files.read_back, 0, "{crates} crates: body-only edit standing below heads reads back 0 unchanged submodules (outlined {}, rows read {})", ready.files.outlined, ready.plan.files_read);
         assert_eq!(ready.files.outlined, 1, "{crates} crates: the ready setup outlines the edited file alone");
         assert!(phases.files.read_back >= u32::try_from(crates).unwrap_or(u32::MAX), "{crates} crates: the phase path's setup reads back every unedited file ({})", phases.files.read_back);
         bars.push((ready.files.read_back, ready.plan.files_read));
-        // THE CONTROL: no visited member's tree read back.
-        let (planted, _) = moduled_on(&cold_moduled(crates), 1, Driver::Ready, CommitPlant::ReadsNoVisitedTree);
-        match planted {
-            Err(CliError::EngineCheck(engine_check::EngineCheckError::Unoutlined(why))) => {
-                assert_ne!(why.file, why.root, "{crates} crates: CONTROL: the refusal names the submodule, not the edited root: {why}");
-            }
-            Err(other) => panic!("{crates} crates: CONTROL: a setup reading no visited tree: expected the typed refusal `Unoutlined`, got {other:?}"),
-            Ok(_) => panic!("{crates} crates: CONTROL: a setup reading no visited tree was served: the reads are not what the bodies' setup needs, or a missing outline is taken quietly"),
-        }
     }
     assert_eq!(bars[0], bars[1], "the ready setup's outlines read back and rows read do not grow from 8 to 64 crates (read back, rows): {:?} then {:?}", bars[0], bars[1]);
+
+    // Member whose tree MUST be walked (`CutScope`, where `stands_below` is `None`): `ready_reads`
+    // reads back its untouched submodule `b/src/m.rs` (`read_back == 1`), and THE CONTROL
+    // (`CommitPlant::ReadsNoVisitedTree`) is refused with `Unoutlined` naming `b/src/m.rs`.
+    let cold_cut_moduled = || -> Io {
+        let io = Io::simulated(SimWorld::new(107, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"p\", \"b\", \"w\"]\nresolver = \"2\"\n");
+        write(&io, "p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n");
+        write(&io, "p/src/lib.rs", "pub fn nothing() {}\n");
+        write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\np = { path = \"../p\" }\n");
+        write(&io, "b/src/lib.rs", "mod m;\npub fn dep_fn() -> u8 {\n    1\n}\n");
+        write(&io, "b/src/m.rs", "pub fn sub() -> u8 {\n    1\n}\n");
+        write(&io, "w/Cargo.toml", "[package]\nname = \"w\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(&io, "w/src/lib.rs", "pub fn work() -> u8 {\n    1\n}\n");
+        let (_, cold) = engine_opts(&io, opts(&io, 2, true));
+        assert!(cold.stored.is_some(), "cold cut-moduled stored");
+        io
+    };
+    let run_cut_edit = |io: &Io, driver: Driver, plant: CommitPlant| -> (Result<engine_check::Checked, CliError>, std::vec::Vec<std::string::String>) {
+        write(io, "b/src/lib.rs", "mod m;\npub fn dep_fn() -> u8 {\n    2\n}\n");
+        let mut options = opts(io, 2, false);
+        options.driver = driver;
+        options.ready_plant = plant;
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
+        let before = stdout(io).len();
+        let fs = io.need_fs().expect("files");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let args = io.args();
+        let net = io.net();
+        let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err);
+        let text = stdout(io).split_off(before);
+        let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        (checked, lines)
+    };
+    let (cut_phases, cut_phases_lines) = run_cut_edit(&cold_cut_moduled(), Driver::Phases, CommitPlant::None);
+    let cut_phases = cut_phases.unwrap_or_else(|error| panic!("cut-moduled phases edit: {error:?}"));
+    let (cut_ready, cut_ready_lines) = run_cut_edit(&cold_cut_moduled(), Driver::Ready, CommitPlant::None);
+    let cut_ready = cut_ready.unwrap_or_else(|error| panic!("cut-moduled ready edit: {error:?}"));
+    let (cp_keys, cr_keys) = (cut_phases.stored.expect("cut phases stored"), cut_ready.stored.expect("cut ready stored"));
+    assert_eq!(cr_keys.root, cp_keys.root, "cut-moduled ready root equals phases");
+    assert_eq!(cr_keys.pages, cp_keys.pages, "cut-moduled ready pages equal phases");
+    assert_eq!(cut_ready_lines, cut_phases_lines, "cut-moduled ready lines equal phases");
+    assert_eq!(cut_ready.files.read_back, 1, "visited CutScope member reads back its untouched submodule m.rs alone");
+    let (planted, _) = run_cut_edit(&cold_cut_moduled(), Driver::Ready, CommitPlant::ReadsNoVisitedTree);
+    match planted {
+        Err(CliError::EngineCheck(engine_check::EngineCheckError::Unoutlined(why))) => {
+            assert_ne!(why.file, why.root, "CONTROL: the refusal names the submodule, not the edited root: {why}");
+        }
+        Err(other) => panic!("CONTROL: a setup reading no visited tree: expected the typed refusal `Unoutlined`, got {other:?}"),
+        Ok(_) => panic!("CONTROL: a setup reading no visited tree was served: the reads are not what the bodies' setup needs, or a missing outline is taken quietly"),
+    }
 }
 
 /// What one driver commits the other reads: ready, then phases, then ready, each root the phase

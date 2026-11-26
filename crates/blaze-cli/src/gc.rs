@@ -378,12 +378,12 @@ pub(crate) fn run_with(
     if store_exists {
         let mut remaining_slices = GC_SLICES_MOST;
         let mut totals = Sliced::default();
+        // Open the store ONCE: on a compaction conflict (`slice.aborted`), `Plain` refreshes its
+        // manifest in-place and maps only delta segments from the concurrent writer so all
+        // existing segment `mmap`s and `ReachCache` survive across conflict retries.
+        let lent = home.open_store_with_liveness(&settings, facts, Liveness::Reached, heap.alloc())?;
+        summary.bytes_before = lent.total_bytes();
         for attempt in 0..=GC_CONFLICT_RETRIES_MOST {
-            let attempt_facts = if attempt == 0 { facts } else { Facts { boot, nonce: nonce(rng) } };
-            let lent = home.open_store_with_liveness(&settings, attempt_facts, Liveness::Reached, heap.alloc())?;
-            if attempt == 0 {
-                summary.bytes_before = lent.total_bytes();
-            }
             let ran = if opts.background {
                 lent.compact(remaining_slices)
             } else {
@@ -403,61 +403,51 @@ pub(crate) fn run_with(
                 }
             }
             if aborted && remaining_slices > 0 && attempt < GC_CONFLICT_RETRIES_MOST {
-                // Another foreground process committed concurrently; drop and reopen on the newest
-                // manifest rather than abandoning remaining reclamation work.
-                drop(lent);
+                // `Plain` already adopted the newer manifest and mapped delta segments in-place;
+                // retry compaction directly on `lent` without dropping or reopening the store.
                 continue;
             }
-            // If the final attempt still hit a conflict on a segment copy, reopen on the latest
-            // manifest so expired retired files (past `GRACE_NS`) and unsealed segments are still
-            // cleaned up cleanly.
-            let lent = if aborted {
-                drop(lent);
-                home.open_store_with_liveness(&settings, Facts { boot, nonce: nonce(rng) }, Liveness::Reached, heap.alloc())?
+            break;
+        }
+        // Ensure any older retired files whose `GRACE_NS` elapsed before or during compaction
+        // are unlinked via a zero-conflict metadata-only slice before exiting.
+        if lent
+            .plan_gc()
+            .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?
+            .retired_ready
+            > 0
+        {
+            let cleanup = if opts.background {
+                lent.compact(1)
             } else {
-                lent
-            };
-            // Ensure any older retired files whose `GRACE_NS` elapsed before or during compaction
-            // are unlinked via a zero-conflict metadata-only slice before exiting.
-            if lent
-                .plan_gc()
-                .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?
-                .retired_ready
-                > 0
-            {
-                let cleanup = if opts.background {
-                    lent.compact(1)
-                } else {
-                    lent.compact_foreground(1)
-                }
-                .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
-                for slice in &cleanup {
-                    if !slice.aborted {
-                        totals = totals.and(*slice);
-                        if slice.segments > 0 || slice.evicted_roots > 0 || slice.removed > 0 || slice.orphans > 0 {
-                            summary.slices += 1;
-                        }
+                lent.compact_foreground(1)
+            }
+            .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+            for slice in &cleanup {
+                if !slice.aborted {
+                    totals = totals.and(*slice);
+                    if slice.segments > 0 || slice.evicted_roots > 0 || slice.removed > 0 || slice.orphans > 0 {
+                        summary.slices += 1;
                     }
                 }
             }
-            // Seal unsealed local segments so post-reboot opens verify them in O(1) without full
-            // BLAKE3 re-hashing. Up to 2 passes: pass 1 stamps any earlier-boot segments checked
-            // during `map_all` onto the current boot; pass 2 barrier-seals them.
-            for _ in 0..2u8 {
-                let sealed = if opts.background {
-                    lent.seal()
-                } else {
-                    lent.seal_foreground()
-                }
-                .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
-                if !sealed || !lent.needs_seal() {
-                    break;
-                }
-            }
-            summary.bytes_after = lent.total_bytes();
-            drop(lent);
-            break;
         }
+        // Seal unsealed local segments so post-reboot opens verify them in O(1) without full
+        // BLAKE3 re-hashing. Up to 2 passes: pass 1 stamps any earlier-boot segments checked
+        // during `map_all` onto the current boot; pass 2 barrier-seals them.
+        for _ in 0..2u8 {
+            let sealed = if opts.background {
+                lent.seal()
+            } else {
+                lent.seal_foreground()
+            }
+            .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+            if !sealed || !lent.needs_seal() {
+                break;
+            }
+        }
+        summary.bytes_after = lent.total_bytes();
+        drop(lent);
         summary.evicted_roots = totals.evicted_roots;
         summary.files_unlinked = totals.removed;
     }
