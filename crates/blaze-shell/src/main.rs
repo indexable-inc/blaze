@@ -5001,6 +5001,47 @@ mod macos_app {
                                             shell.auto_scroll_bottom = true;
                                             dirty = true;
                                         }
+                                        HitAction::KillProcessPid(target_pid) => {
+                                            let force_sigkill = ev
+                                                .modifierFlags()
+                                                .contains(NSEventModifierFlags::Shift);
+                                            let _ = blaze_shell::sysmon_driver::send_process_signal(
+                                                target_pid,
+                                                force_sigkill,
+                                            );
+                                            blaze_shell::sysmon_driver::notify_folder_proc_killed(
+                                                target_pid,
+                                            );
+                                            // Optimistically remove the killed PID from both the live prompt pill
+                                            // and open hover popover so it disappears instantaneously.
+                                            let strip_pid = |snap: &mut blaze_shell::sysmon_driver::FolderProcSnapshot| {
+                                                snap.items.retain(|it| it.pid != target_pid);
+                                                snap.total_cpu_pct = snap.items.iter().map(|it| it.cpu_pct).sum();
+                                                snap.total_gpu_pct = snap.items.iter().map(|it| it.gpu_pct).sum();
+                                                snap.total_mem_bytes = snap
+                                                    .items
+                                                    .iter()
+                                                    .fold(0u64, |acc, it| acc.saturating_add(it.mem_bytes));
+                                                snap.is_hot = snap.total_cpu_pct >= 25.0
+                                                    || snap.total_gpu_pct >= 15.0
+                                                    || snap.items.iter().any(|it| it.is_hot);
+                                                snap.primary_name = snap
+                                                    .items
+                                                    .first()
+                                                    .map(|it| it.name.clone())
+                                                    .unwrap_or_default();
+                                            };
+                                            strip_pid(&mut shell.prompt.folder_procs);
+                                            if let Some(pop) = active_popover.as_mut()
+                                                && let HoverKind::FolderProcs { summary } = &mut pop.kind
+                                            {
+                                                strip_pid(summary);
+                                                if summary.items.is_empty() {
+                                                    active_popover = None;
+                                                }
+                                            }
+                                            dirty = true;
+                                        }
                                         HitAction::FindToggleCase => {
                                             if let Some(fb) = &mut find_bar {
                                                 fb.toggle_case();

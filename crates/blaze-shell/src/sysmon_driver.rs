@@ -454,6 +454,55 @@ pub fn folder_proc_revision() -> u64 {
     FOLDER_PROC_REVISION.load(Ordering::Acquire)
 }
 
+/// Immediately wake the background folder-process sampler (e.g. after killing a PID from the popover)
+/// and optimistically strip `killed_pid` from all cached folder snapshots so UI updates in 0ms.
+pub fn notify_folder_proc_killed(killed_pid: u32) {
+    if let Some(watcher) = FOLDER_PROC_WATCHER.get() {
+        if let Ok(mut cache) = watcher.cache.lock() {
+            for snap in cache.values_mut() {
+                snap.items.retain(|it| it.pid != killed_pid);
+                snap.total_cpu_pct = snap.items.iter().map(|it| it.cpu_pct).sum();
+                snap.total_gpu_pct = snap.items.iter().map(|it| it.gpu_pct).sum();
+                snap.total_mem_bytes = snap
+                    .items
+                    .iter()
+                    .fold(0u64, |acc, it| acc.saturating_add(it.mem_bytes));
+                snap.is_hot = snap.total_cpu_pct >= 25.0
+                    || snap.total_gpu_pct >= 15.0
+                    || snap.items.iter().any(|it| it.is_hot);
+                snap.primary_name = snap
+                    .items
+                    .first()
+                    .map(|it| it.name.clone())
+                    .unwrap_or_default();
+            }
+        }
+        if let Ok(mut state) = watcher.watch.lock() {
+            state.wake_seq = state.wake_seq.wrapping_add(1);
+            watcher.wake.notify_all();
+        }
+        FOLDER_PROC_REVISION.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Resolve version-only executable basenames like `~/.local/share/claude/versions/2.1.332`
+/// to their parent tool name (`"claude"`) so Starship pills, popovers, and `top` stay readable.
+fn friendly_versioned_exe_name<'a>(chosen_name: &'a str, exe_path: &'a str) -> &'a str {
+    let looks_like_version = !chosen_name.is_empty()
+        && chosen_name.bytes().any(|b| b.is_ascii_digit())
+        && chosen_name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'));
+    if looks_like_version
+        && let Some((prefix, _)) = exe_path.rsplit_once("/versions/")
+        && let Some(tool) = prefix.rsplit('/').next()
+        && !tool.is_empty()
+    {
+        return tool;
+    }
+    chosen_name
+}
+
 /// Zero-block O(1) lookup of active processes running inside `folder`.
 ///
 /// Registers `(folder, pane_roots)` into a bounded watch table (at most 8 active folders) and
@@ -1351,6 +1400,7 @@ mod macos {
             } else {
                 exe_basename
             };
+            let chosen_name = super::friendly_versioned_exe_name(chosen_name, &exe_path_str);
 
             // Task info (thread count, plus fallback RSS & CPU ticks when `proc_pid_rusage` gets EPERM).
             let task_info = macos_proc::proc_task_info(raw_pid).ok();
@@ -1597,6 +1647,25 @@ mod tests {
         assert_eq!(parse_creator_pid("pid "), None);
         assert_eq!(parse_creator_pid(""), None);
         assert_eq!(parse_creator_pid("pid 99999999999999999999, overflow"), None);
+    }
+
+    #[test]
+    fn friendly_versioned_exe_name_maps_claude_versions_to_claude() {
+        assert_eq!(
+            friendly_versioned_exe_name(
+                "2.1.332",
+                "/Users/me/.local/share/claude/versions/2.1.332"
+            ),
+            "claude"
+        );
+        assert_eq!(
+            friendly_versioned_exe_name("bun", "/opt/homebrew/bin/bun"),
+            "bun"
+        );
+        assert_eq!(
+            friendly_versioned_exe_name("python3.13", "/usr/bin/python3.13"),
+            "python3.13"
+        );
     }
 
     #[test]

@@ -6681,7 +6681,7 @@ fn layout_active_popover(
         }
         HoverKind::FolderProcs { summary } => {
             let shown = summary.items.len().clamp(1, 10);
-            let w = 580.0f32.min((vw - 24.0).max(340.0));
+            let w = 616.0f32.min((vw - 24.0).max(340.0));
             let proc_row_h = m.ch * 2.0 + 16.0;
             let foot_h = if summary.items.len() > shown { m.ch + 6.0 } else { 0.0 };
             let h = hdr_h + 4.0 + shown as f32 * proc_row_h + foot_h + pad_y;
@@ -7501,7 +7501,35 @@ fn layout_active_popover(
                     scene.overlay_svg_icon(ix, iy, main_icon, svg, 0);
                 }
 
-                // Line 1 right side: clickable action pill (`Pane N · TUI ↗` or `top ↗`), MEM, GPU%, CPU%, Uptime!
+                // Line 1 right side: crimson `Kill` button (SIGTERM; Shift+click SIGKILL) +
+                // clickable action pill (`Pane N · TUI ↗` or `top ↗`), MEM, GPU%, CPU%, Uptime!
+                let kill_lbl = "Kill";
+                let kill_w = m.measure(kill_lbl, TextFace::UiSmall) + 12.0;
+                let kill_x1 = x1 - pad_x;
+                let kill_x0 = kill_x1 - kill_w;
+                let kill_rect = HitRect::new(kill_x0, ty1 - 2.0, kill_x1, ty1 + m.ch + 2.0);
+                let kill_hovered = is_hovered(kill_rect);
+                scene.overlay_round_rect(
+                    kill_x0,
+                    ty1 - 1.5,
+                    kill_x1,
+                    ty1 + m.ch + 1.5,
+                    4.5,
+                    if kill_hovered {
+                        theme::rgba(0xe0, 0x55, 0x55, 0.30)
+                    } else {
+                        theme::rgba(0xe0, 0x55, 0x55, 0.14)
+                    },
+                    0.75,
+                    if kill_hovered {
+                        theme::rgba(0xf0, 0x6b, 0x6b, 0.65)
+                    } else {
+                        theme::rgba(0xe0, 0x55, 0x55, 0.36)
+                    },
+                    0,
+                );
+                scene.overlay_ui_small(kill_x0 + 6.0, ty1, kill_lbl, theme::DANGER, true, false, 0);
+
                 let (act_lbl, act_fg, act_bg, action) = if let Some(sp) = item.shell_pane {
                     let lbl = if sp.is_alt_screen {
                         format!("Pane {} · TUI ↗", sp.pane_number)
@@ -7526,11 +7554,12 @@ fn layout_active_popover(
                     )
                 };
                 let act_w = m.measure(&act_lbl, TextFace::UiSmall) + 12.0;
-                let act_x0 = x1 - pad_x - act_w;
+                let act_x1 = kill_x0 - 6.0;
+                let act_x0 = act_x1 - act_w;
                 scene.overlay_round_rect(
                     act_x0,
                     ty1 - 1.5,
-                    x1 - pad_x,
+                    act_x1,
                     ty1 + m.ch + 1.5,
                     4.5,
                     act_bg,
@@ -7664,6 +7693,8 @@ fn layout_active_popover(
                 scene.overlay_ui_small(name_x, ty2, &shown_sub, theme::INK_4, false, false, 0);
 
                 scene.push_hit(row_rect, action);
+                // Push Kill hit rect AFTER row_rect so top-most `.rev()` hit-test picks Kill cleanly!
+                scene.push_hit(kill_rect, HitAction::KillProcessPid(item.pid));
                 ry += proc_row_h;
             }
             if summary.items.len() > 10 {
