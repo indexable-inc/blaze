@@ -70,9 +70,10 @@ spot duplicated logic or patterns across the repo that can be generalized into a
 ALWAYS immediately spawn a subagent to extract and generalize it into one shared crate, sweep all
 callers, ban the removed duplicates with a `replacement` (`fix-through-blaze-lints`), and
 land/admin-merge it cleanly (`agents-are-a-cost`) — never leave duplicates behind or merely file an
-issue. For the CLI, `blaze-cli-spec` (`BLAZE_APP`) is the single source of truth for commands,
-flags, help text, usage, and shell completions — never hand-duplicate help strings or reach for proc
-macros.
+issue. For CLI binaries, `bstd::cli` (`CommandSpec`, nested subcommands, aliases, typo hints, ANSI
+`--help`) is the in-house `clap` replacement — never hand-roll `env::args` loops, hand-duplicate
+help strings, or depend on `clap`/proc macros; for `blaze` itself and `blaze-shell` completions,
+`blaze-cli-spec` (`BLAZE_APP`) is the single source of truth.
 
 ## guard-the-cause (rule 54)
 

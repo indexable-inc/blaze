@@ -32,10 +32,12 @@ use blaze_git::{
 };
 use blaze_git_fetch::{Kind as ObjectKind, Oid};
 use blaze_own::{AVec, Alloc, String as OwnString, Vec as OwnVec};
+use bstd::cli::Matches;
 
 use crate::{
     disk::{BgitDiskStore, infect_repo_on_disk, open_or_infect},
-    vfs_driver::{cmd_unmount, spawn_background_mount},
+    print_help,
+    vfs_driver::{cmd_unmount_path, spawn_background_mount},
 };
 
 const WORKTREES_FILE: &str = "worktrees.bgwt";
@@ -76,73 +78,38 @@ fn save_worktrees<'a>(
 }
 
 /// Entry point for `bgit worktree` (alias `bgit wt`).
-pub(crate) fn cmd_worktree<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        print_worktree_usage();
-        return Ok(());
-    }
-    match args[0].as_str() {
-        "add" => cmd_wt_add(&args[1..], alloc),
-        "list" | "ls" => cmd_wt_list(&args[1..], alloc),
-        "sync" => cmd_wt_sync(&args[1..], alloc),
-        "watch" => cmd_wt_watch(&args[1..], alloc),
-        "remove" | "rm" => cmd_wt_remove(&args[1..], alloc),
-        other => Err(io::Error::new(
+pub(crate) fn cmd_worktree<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    use_color: bool,
+    alloc: Alloc<'a>,
+) -> io::Result<()> {
+    match matches.command_path().get(2).copied() {
+        None => {
+            print_help(matches.active_command(), matches.command_path(), use_color, alloc);
+            Ok(())
+        }
+        Some("add") => cmd_wt_add(matches, alloc),
+        Some("list") => cmd_wt_list(matches, alloc),
+        Some("sync") => cmd_wt_sync(matches, alloc),
+        Some("watch") => cmd_wt_watch(matches, alloc),
+        Some("remove") => cmd_wt_remove(matches, alloc),
+        Some(other) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown worktree subcommand `{other}` (run `bgit worktree --help`)"),
         )),
     }
 }
 
-fn print_worktree_usage() {
-    println!(
-        "USAGE:\n\
-         \tbgit worktree add [repo] <path> <branch> [--from <rev>] [--track <branch>] [--vfs] [--no-auto-delete]\n\
-         \tbgit worktree list [repo]\n\
-         \tbgit worktree sync [repo] [--dry-run] [--force]\n\
-         \tbgit worktree watch [repo] [--interval-ms N]\n\
-         \tbgit worktree remove [repo] <path-or-branch> [--force]"
-    );
-}
+fn cmd_wt_add<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    let from_rev = matches.opt("from");
+    let track_rev = matches.opt("track");
+    let use_vfs = matches.flag("vfs");
+    let auto_delete = !matches.flag("no-auto-delete");
 
-fn cmd_wt_add<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    let mut pos: Vec<String> = Vec::new();
-    let mut from_rev: Option<String> = None;
-    let mut track_rev: Option<String> = None;
-    let mut use_vfs = false;
-    let mut auto_delete = true;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--from" => {
-                i += 1;
-                from_rev = args.get(i).cloned();
-            }
-            "--track" => {
-                i += 1;
-                track_rev = args.get(i).cloned();
-            }
-            "--vfs" => use_vfs = true,
-            "--no-auto-delete" => auto_delete = false,
-            "-h" | "--help" => {
-                print_worktree_usage();
-                return Ok(());
-            }
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown worktree add flag: {other}"),
-                ));
-            }
-            other => pos.push(other.to_string()),
-        }
-        i += 1;
-    }
-
+    let pos = matches.positionals();
     let (repo_dir, wt_path_raw, branch_arg) = match pos.len() {
-        2 => (PathBuf::from("."), PathBuf::from(&pos[0]), pos[1].as_str()),
-        3 => (PathBuf::from(&pos[0]), PathBuf::from(&pos[1]), pos[2].as_str()),
+        2 => (PathBuf::from("."), PathBuf::from(pos[0]), pos[1]),
+        3 => (PathBuf::from(pos[0]), PathBuf::from(pos[1]), pos[2]),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -165,8 +132,8 @@ fn cmd_wt_add<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
 
     let branch_ref = canonical_branch_ref(branch_arg);
     let track_ref = match track_rev {
-        Some(t) => canonical_branch_ref(&t),
-        None => match &from_rev {
+        Some(t) => canonical_branch_ref(t),
+        None => match from_rev {
             Some(f) if f != "HEAD" => canonical_branch_ref(f),
             _ => head_branch.clone().unwrap_or_else(|| "refs/heads/main".to_string()),
         },
@@ -184,7 +151,7 @@ fn cmd_wt_add<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             .unwrap_or(existing);
         (existing, base)
     } else {
-        let base_rev = from_rev.as_deref().unwrap_or("HEAD");
+        let base_rev = from_rev.unwrap_or("HEAD");
         let base_oid = store
             .resolve_rev(base_rev)
             .map_err(|e| io::Error::other(format!("{e}")))?
@@ -281,8 +248,8 @@ impl StrDisplayCompat for blaze_own::AString<'_> {
     }
 }
 
-fn cmd_wt_list<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    let repo_dir = args.first().map_or_else(|| PathBuf::from("."), PathBuf::from);
+fn cmd_wt_list<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    let repo_dir = PathBuf::from(matches.positional(0).unwrap_or("."));
     let store = open_or_infect(&repo_dir, alloc)?;
     let records = load_worktrees(&store.bgit_dir, alloc)?;
     if records.is_empty() {
@@ -303,51 +270,22 @@ fn cmd_wt_list<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_wt_sync<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    let mut repo_dir = PathBuf::from(".");
-    let mut dry_run = false;
-    let mut force = false;
-    let mut from_hook = false;
-    for a in args {
-        match a.as_str() {
-            "--dry-run" => dry_run = true,
-            "--force" | "-f" => force = true,
-            "--from-hook" => from_hook = true,
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown worktree sync flag: {other}"),
-                ));
-            }
-            other => repo_dir = PathBuf::from(other),
-        }
-    }
+fn cmd_wt_sync<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    let repo_dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+    let dry_run = matches.flag("dry-run");
+    let force = matches.flag("force");
+    let from_hook = matches.flag("from-hook");
     sync_all_worktrees(&repo_dir, None, dry_run, force, from_hook, alloc)?;
     Ok(())
 }
 
-fn cmd_wt_watch<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    let mut repo_dir = PathBuf::from(".");
-    let mut interval_ms = 250u64;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--interval-ms" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    interval_ms = v.parse().unwrap_or(250).clamp(50, 10_000);
-                }
-            }
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown worktree watch flag: {other}"),
-                ));
-            }
-            other => repo_dir = PathBuf::from(other),
-        }
-        i += 1;
-    }
+fn cmd_wt_watch<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    let repo_dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+    let interval_ms = matches
+        .opt_parse::<u64>("interval-ms")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?
+        .unwrap_or(250)
+        .clamp(50, 10_000);
 
     let canon_repo = fs::canonicalize(&repo_dir)?;
     println!(
@@ -371,24 +309,12 @@ fn cmd_wt_watch<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     }
 }
 
-fn cmd_wt_remove<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    let mut pos: Vec<String> = Vec::new();
-    let mut force = false;
-    for a in args {
-        match a.as_str() {
-            "--force" | "-f" => force = true,
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown worktree remove flag: {other}"),
-                ));
-            }
-            other => pos.push(other.to_string()),
-        }
-    }
+fn cmd_wt_remove<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+    let force = matches.flag("force");
+    let pos = matches.positionals();
     let (repo_dir, target) = match pos.len() {
-        1 => (PathBuf::from("."), pos[0].as_str()),
-        2 => (PathBuf::from(&pos[0]), pos[1].as_str()),
+        1 => (PathBuf::from("."), pos[0]),
+        2 => (PathBuf::from(pos[0]), pos[1]),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -795,12 +721,7 @@ fn remove_worktree_folder<'a>(
         }
     }
     if rec.is_vfs {
-        let args = if force {
-            vec![rec.path.as_str().to_string(), "--force".to_string()]
-        } else {
-            vec![rec.path.as_str().to_string()]
-        };
-        let _ = cmd_unmount(&args);
+        let _ = cmd_unmount_path(wt_path, force);
     }
     if wt_path.exists() {
         fs::remove_dir_all(wt_path)?;
