@@ -213,7 +213,7 @@ impl OnDir {
         alloc: Alloc<'a>,
     ) -> Result<Option<AVec<'a, u8>>, FilesError> {
         let cx = self.cx(name)?;
-        let mut bytes = match guard.read_bounded(&cx, &self.dir, &Self::path(name)?, max_bytes, single_read_plant, alloc).map_err(FilesError::Effect)? {
+        let mut bytes = match guard.read_bounded(&cx, &Self::path(name)?, max_bytes, single_read_plant, alloc).map_err(FilesError::Effect)? {
             bstd::fs::BoundedRead::Absent | bstd::fs::BoundedRead::Oversized => return Ok(None),
             bstd::fs::BoundedRead::Grew => return Err(FilesError::OtherBytes { name: *name }),
             bstd::fs::BoundedRead::Whole(bytes) => bytes,
@@ -235,7 +235,7 @@ impl OnDir {
     /// publish and lock always target the exact same directory inode.
     fn publish_under_lock(&self, guard: &bstd::fs::FileLock, name: &RecordName, whole: &[u8]) -> Result<(), FilesError> {
         let cx = self.cx(name)?;
-        guard.publish(&cx, &self.dir, &Self::path(name)?, whole, Durable::No).map_err(FilesError::Effect)
+        guard.publish_unsynced(&cx, &Self::path(name)?, whole).map_err(FilesError::Effect)
     }
 
     /// [`RecordPlant::FramedPublish`]'s write: `whole` copied into the task's frame, then

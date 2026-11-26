@@ -856,7 +856,7 @@ pub use landlock::{
     validate_rpath_entry, x86_64_fhs_hwcap_subdirs,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, NativeLockErr};
+pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, LockedIoHandshake, LockedIoPlant, NativeLockErr};
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
 pub use machine::{Effect, Event, HermeticMachine, MachineOpts, State, Stream, Usage};
 pub use plan::{Access, Plan, PlanOpts, Rule as PlanRule, Why};

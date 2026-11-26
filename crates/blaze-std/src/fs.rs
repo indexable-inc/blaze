@@ -450,27 +450,27 @@ pub enum BoundedRead<'a> {
 
 pub struct FileLock {
     kind: FileLockKind,
+    dir: Dir<ReadWrite>,
     name: FileName,
     unlocked: bool,
 }
 
 impl FileLock {
-    /// Reads `path` (bounded at `max_bytes` before allocating) through the exact same root
-    /// directory capability that holds this lock — eliminating any TOCTOU window if the root
-    /// pathname is renamed or replaced while the lock is held.
+    /// Reads `path` (bounded at `max_bytes` before allocating) through the exact directory and
+    /// root capability that acquired this lock — eliminating both cross-world misuse and any
+    /// TOCTOU window if the root pathname is renamed or replaced while the lock is held.
     pub fn read_bounded<'a>(
         &self,
         cx: &Cx,
-        dir: &Dir<ReadWrite>,
         path: &Path,
         max_bytes: u64,
         single_read_plant: bool,
         alloc: blaze_own::Alloc<'a>,
     ) -> Result<BoundedRead<'a>, FsError> {
-        let name = dir.beneath(path);
+        let name = self.dir.beneath(path);
         match &self.kind {
             FileLockKind::Sim { .. } => {
-                let file = match dir.open_read(cx, path) {
+                let file = match self.dir.open_read(cx, path) {
                     Ok(file) => file,
                     Err(error) if error.kind == FsKind::NotFound => return Ok(BoundedRead::Absent),
                     Err(error) => return Err(error),
@@ -522,23 +522,33 @@ impl FileLock {
         }
     }
 
-    /// Atomically publishes `whole` at `path` through the exact same root directory capability
-    /// that holds this lock — eliminating any TOCTOU window if the root pathname is renamed or
-    /// replaced while the lock is held.
-    pub fn publish(
-        &self,
-        cx: &Cx,
-        dir: &Dir<ReadWrite>,
-        path: &Path,
-        whole: &[u8],
-        durable: Durable,
-    ) -> Result<(), FsError> {
+    /// Atomically publishes `whole` at `path` (unsynced, [`Durable::No`]) through the exact
+    /// directory and root capability that acquired this lock — never waiting for device flush and
+    /// eliminating both cross-world misuse and post-lock root-rename TOCTOU windows.
+    pub fn publish_unsynced(&self, cx: &Cx, path: &Path, whole: &[u8]) -> Result<(), FsError> {
         match &self.kind {
-            FileLockKind::Sim { .. } => dir.publish(cx, path, Content::bytes(whole), durable).map(|_| ()),
+            FileLockKind::Sim { .. } => self.dir.publish(cx, path, Content::bytes(whole), Durable::No).map(|_| ()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             FileLockKind::Native(native) => {
-                let name = dir.beneath(path);
-                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, durable).map_err(|err| match err {
+                let name = self.dir.beneath(path);
+                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, false).map_err(|err| match err {
+                    crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
+                    crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
+                })
+            }
+        }
+    }
+
+    /// Atomically publishes `whole` at `path` (synced, [`Durable::Yes`]: file synced before rename
+    /// and parent directory synced after) through the exact directory and root capability that
+    /// acquired this lock.
+    pub fn publish_synced(&self, cx: &Cx, path: &Path, whole: &[u8]) -> Result<(), FsError> {
+        match &self.kind {
+            FileLockKind::Sim { .. } => self.dir.publish_synced(cx, path, Content::bytes(whole)).map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            FileLockKind::Native(native) => {
+                let name = self.dir.beneath(path);
+                crate::rt::publish_under_lock_off_thread(cx, native, name.as_str(), whole, true).map_err(|err| match err {
                     crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
                     crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
                 })
@@ -2394,7 +2404,7 @@ impl Dir<ReadWrite> {
                 crate::rt::NativeLockErr::Stopped(s) => FsError::new(FsOp::Publish, &name, FsKind::Stopped(s)),
                 crate::rt::NativeLockErr::Driver(msg) => driver_error(FsOp::Publish, &name, &msg.as_str()),
             })?;
-            return Ok(FileLock { kind: FileLockKind::Native(native), name, unlocked: false });
+            return Ok(FileLock { kind: FileLockKind::Native(native), dir: self.share(), name, unlocked: false });
         }
         let backoff = core::time::Duration::from_millis(2);
         loop {
@@ -2413,6 +2423,7 @@ impl Dir<ReadWrite> {
                 Done::Locked => {
                     return Ok(FileLock {
                         kind: FileLockKind::Sim { io: self.io.share(), tag: acquired_tag },
+                        dir: self.share(),
                         name,
                         unlocked: false,
                     });

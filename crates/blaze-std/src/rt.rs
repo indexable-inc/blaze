@@ -1363,7 +1363,7 @@ pub struct AttemptSignal {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AttemptSignal {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             done: self::std::sync::Mutex::new(false),
             cvar: self::std::sync::Condvar::new(),
@@ -1406,35 +1406,59 @@ pub trait LockBackend<H: Send + 'static>: Send + Sync + 'static {
     fn unlock_and_close(&self, handle: H) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
     fn spawn_worker<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) -> Result<(), ()>;
     fn wait_signal(&self, signal: &AttemptSignal);
+
+    /// Parks a standby reaper worker waiting for retired handles or surplus exit. Real OS backends
+    /// block on `cvar.wait(guard)` and return `Some(guard)`; single-threaded DST backends record a
+    /// parked worker and return `None` to yield back to the deterministic scheduler.
+    fn park_reaper<'a>(
+        &self,
+        cvar: &self::std::sync::Condvar,
+        guard: self::std::sync::MutexGuard<'a, crate::procs::hermetic::StandbyReaperCore<H>>,
+    ) -> Option<self::std::sync::MutexGuard<'a, crate::procs::hermetic::StandbyReaperCore<H>>> {
+        Some(match cvar.wait(guard) {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        })
+    }
+
+    /// Wakes one (`all == false`) or all (`all == true`) parked standby reaper workers.
+    fn notify_reaper(&self, cvar: &self::std::sync::Condvar, all: bool) {
+        if all {
+            cvar.notify_all();
+        } else {
+            cvar.notify_one();
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-struct RuntimeSlotGuard<'a, H: Send + 'static> {
+struct RuntimeSlotGuard<'a, H: Send + 'static, B: LockBackend<H>> {
     rt: &'a LockRuntime<H>,
+    backend: &'a B,
     held: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl<H: Send + 'static> Drop for RuntimeSlotGuard<'_, H> {
+impl<H: Send + 'static, B: LockBackend<H>> Drop for RuntimeSlotGuard<'_, H, B> {
     fn drop(&mut self) {
         if self.held {
-            self.rt.release_slot();
+            self.rt.release_slot(self.backend);
         }
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct LockRuntimeInner<H: Send + 'static> {
-    reaper: self::std::sync::Mutex<crate::procs::hermetic::ReaperCore<H>>,
+    reaper: self::std::sync::Mutex<crate::procs::hermetic::StandbyReaperCore<H>>,
+    reaper_wake: self::std::sync::Condvar,
     active_workers: core::sync::atomic::AtomicUsize,
     max_workers: usize,
     plant: LockPlant,
 }
 
-/// Production off-thread advisory lock + bounded reaper coordinator, generic over handle `H` and
-/// [`LockBackend`] so deterministic interleaving DSTs execute the exact production `AtomicU8`
-/// abandon handshake, `active_workers` cap, `mpsc::sync_channel` delivery, and `ReaperCore`
-/// retirement loop.
+/// Production off-thread advisory lock + pre-spawned standby reaper coordinator, generic over
+/// handle `H` and [`LockBackend`] so deterministic interleaving DSTs execute the exact production
+/// abandon handshake, `active_workers` cap, and [`StandbyReaperCore`] standby worker pool.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LockRuntime<H: Send + 'static> {
     inner: blaze_own::Arc<LockRuntimeInner<H>, blaze_own::SharedAlloc<'static>>,
@@ -1456,11 +1480,12 @@ impl<H: Send + 'static> LockRuntime<H> {
         Self {
             inner: blaze_own::Arc::new_in(
                 LockRuntimeInner {
-                    reaper: self::std::sync::Mutex::new(crate::procs::hermetic::ReaperCore::new(
+                    reaper: self::std::sync::Mutex::new(crate::procs::hermetic::StandbyReaperCore::new(
                         max_workers,
                         max_pending,
-                        crate::procs::hermetic::ReaperPlant::None,
+                        crate::procs::hermetic::StandbyReaperPlant::None,
                     )),
+                    reaper_wake: self::std::sync::Condvar::new(),
                     active_workers: core::sync::atomic::AtomicUsize::new(0),
                     max_workers: max_workers.max(1),
                     plant,
@@ -1481,6 +1506,20 @@ impl<H: Send + 'static> LockRuntime<H> {
         }
     }
 
+    pub fn reaper_idle(&self) -> usize {
+        match self.inner.reaper.lock() {
+            Ok(g) => g.idle(),
+            Err(p) => p.into_inner().idle(),
+        }
+    }
+
+    pub fn reaper_spawning(&self) -> usize {
+        match self.inner.reaper.lock() {
+            Ok(g) => g.spawning(),
+            Err(p) => p.into_inner().spawning(),
+        }
+    }
+
     pub fn reaper_pending(&self) -> usize {
         match self.inner.reaper.lock() {
             Ok(g) => g.pending_len(),
@@ -1495,114 +1534,110 @@ impl<H: Send + 'static> LockRuntime<H> {
         }
     }
 
-    fn try_reserve_slot(&self) -> bool {
-        let mut guard = match self.inner.reaper.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        guard.try_reserve()
-    }
-
-    fn release_slot(&self) {
-        let mut guard = match self.inner.reaper.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        guard.release_reservation();
-    }
-
-    /// Attempts to spawn reaper workers for any previously queued items (recovering cleanly after
-    /// transient `thread::spawn` failures once OS thread creation succeeds again).
-    pub fn pump_reapers<B: LockBackend<H>>(
-        &self,
-        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
-    ) {
-        let first = {
+    /// Runs the standby lock-reaper loop for one already-started worker until it exits (or yields
+    /// back to a single-threaded DST scheduler via [`LockBackend::park_reaper`]).
+    pub fn run_standby_reaper_loop<B: LockBackend<H>>(&self, backend: &B) {
+        use crate::procs::hermetic::StandbyWorkerStep;
+        loop {
+            let item = {
+                let mut guard = match self.inner.reaper.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                loop {
+                    match guard.worker_poll() {
+                        StandbyWorkerStep::Work(item) => break Some(item),
+                        StandbyWorkerStep::Exit => break None,
+                        StandbyWorkerStep::Wait => {
+                            let Some(next_guard) = backend.park_reaper(&self.inner.reaper_wake, guard) else {
+                                return;
+                            };
+                            guard = next_guard;
+                        }
+                    }
+                }
+            };
+            let Some(retired) = item else {
+                break;
+            };
+            let _ = backend.unlock_and_close(retired);
             let mut guard = match self.inner.reaper.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            guard.take_spawnable()
-        };
-        if let Some(item) = first {
-            self.spawn_reaper_loop(item, backend);
+            guard.worker_finished_drop();
         }
     }
 
-    /// Retires an owned lock handle off the caller thread through `self.inner.reaper`: NEVER
-    /// unlocks or closes `handle` synchronously on the caller thread, even when all reaper
-    /// workers are wedged or `spawn_worker` transiently fails.
+    fn reserve_slot<B: LockBackend<H>>(
+        &self,
+        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
+    ) -> Result<(), NativeLockErr> {
+        let need_spawn = {
+            let mut guard = match self.inner.reaper.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            match guard.begin_reserve() {
+                Ok(need) => need,
+                Err(()) => return Err(lock_err_static("file-lock reaper backlog full")),
+            }
+        };
+        if need_spawn {
+            let rt_w = blaze_own::Share::share(self);
+            let backend_w = blaze_own::Share::share(backend);
+            let spawned = backend.spawn_worker("bstd-lock-reaper", move || {
+                {
+                    let mut guard = match rt_w.inner.reaper.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    guard.on_worker_started();
+                }
+                rt_w.run_standby_reaper_loop(&*backend_w);
+            });
+            if spawned.is_err() {
+                let mut guard = match self.inner.reaper.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                guard.abort_spawn_failed();
+                drop(guard);
+                backend.notify_reaper(&self.inner.reaper_wake, true);
+                return Err(lock_err_static("file-lock reaper worker spawn failed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn release_slot<B: LockBackend<H>>(&self, backend: &B) {
+        let wake_surplus = {
+            let mut guard = match self.inner.reaper.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.release_reservation()
+        };
+        if wake_surplus {
+            backend.notify_reaper(&self.inner.reaper_wake, false);
+        }
+    }
+
+    /// Retires an owned lock handle into the pre-spawned standby reaper pool: NEVER unlocks or
+    /// closes `handle` synchronously on the caller thread and NEVER calls `spawn_worker`.
     pub fn retire_handle<B: LockBackend<H>>(
         &self,
         handle: H,
         backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
     ) {
-        use crate::procs::hermetic::RetireAction;
-        let to_spawn = {
+        {
             let mut guard = match self.inner.reaper.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            match guard.retire_reserved(handle) {
-                RetireAction::Spawn(item) => Some(item),
-                RetireAction::Queued => None,
-                RetireAction::SyncDrop(item) => {
-                    guard.on_spawn_failed(item);
-                    None
-                }
-            }
-        };
-        if let Some(first) = to_spawn {
-            self.spawn_reaper_loop(first, backend);
+            guard.retire_reserved(handle);
         }
-    }
-
-    fn spawn_reaper_loop<B: LockBackend<H>>(
-        &self,
-        first: H,
-        backend: &blaze_own::Arc<B, blaze_own::SharedAlloc<'static>>,
-    ) {
-        use self::std::sync::Mutex;
-        let mut to_spawn = Some(first);
-        while let Some(item) = to_spawn {
-            let first_slot = blaze_own::Arc::new_in(Mutex::new(Some(item)), blaze_own::SharedAlloc::global());
-            let worker_slot = blaze_own::Share::share(&first_slot);
-            let rt_w = blaze_own::Share::share(self);
-            let backend_w = blaze_own::Share::share(backend);
-            let spawned = backend.spawn_worker("bstd-lock-reaper", move || {
-                let mut current = match worker_slot.lock() {
-                    Ok(mut g) => g.take(),
-                    Err(p) => p.into_inner().take(),
-                };
-                while let Some(retired) = current {
-                    let _ = backend_w.unlock_and_close(retired);
-                    let mut guard = match rt_w.inner.reaper.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    current = guard.next_after_drop();
-                }
-            });
-            if spawned.is_err() {
-                let returned = match first_slot.lock() {
-                    Ok(mut g) => g.take(),
-                    Err(p) => p.into_inner().take(),
-                };
-                if let Some(item) = returned {
-                    let mut guard = match self.inner.reaper.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    guard.on_spawn_failed(item);
-                }
-                break;
-            }
-            let mut guard = match self.inner.reaper.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            to_spawn = guard.take_spawnable();
-        }
+        backend.notify_reaper(&self.inner.reaper_wake, false);
     }
 
     pub fn lock_exclusive<B: LockBackend<H>>(
@@ -1622,11 +1657,8 @@ impl<H: Send + 'static> LockRuntime<H> {
             Taken,
         }
 
-        self.pump_reapers(backend);
-        if !self.try_reserve_slot() {
-            return Err(lock_err_static("file-lock reaper backlog full"));
-        }
-        let mut slot_guard = RuntimeSlotGuard { rt: self, held: true };
+        self.reserve_slot(backend)?;
+        let mut slot_guard = RuntimeSlotGuard { rt: self, backend: &**backend, held: true };
         loop {
             if let Some(stopped) = is_stopped() {
                 return Err(NativeLockErr::Stopped(stopped));
@@ -1669,7 +1701,7 @@ impl<H: Send + 'static> LockRuntime<H> {
                             drop(h);
                         }
                     }
-                    rt_w.release_slot();
+                    rt_w.release_slot(&*backend_w);
                 } else {
                     signal_w.notify();
                 }
@@ -1735,13 +1767,12 @@ impl<H: Send + 'static> LockRuntime<H> {
 
         type UnlockMsg = Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
 
-        self.pump_reapers(backend);
         let prev = self.inner.active_workers.fetch_add(1, Ordering::AcqRel);
         if prev >= self.inner.max_workers {
             self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
             if self.inner.plant == LockPlant::SyncDropOnUnlockCap {
                 drop(handle);
-                self.release_slot();
+                self.release_slot(&**backend);
             } else {
                 self.retire_handle(handle, backend);
             }
@@ -1764,7 +1795,7 @@ impl<H: Send + 'static> LockRuntime<H> {
                 Some(h) => backend_w.unlock_and_close(h),
                 None => Ok(()),
             };
-            rt_w.release_slot();
+            rt_w.release_slot(&*backend_w);
             rt_w.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
             {
                 let mut g = match result_w.lock() {
@@ -1784,12 +1815,12 @@ impl<H: Send + 'static> LockRuntime<H> {
             if let Some(h) = recovered {
                 if self.inner.plant == LockPlant::SyncDropOnUnlockCap {
                     drop(h);
-                    self.release_slot();
+                    self.release_slot(&**backend);
                 } else {
                     self.retire_handle(h, backend);
                 }
             } else {
-                self.release_slot();
+                self.release_slot(&**backend);
             }
             return Err(lock_err_static("failed to spawn off-thread file-unlock worker (retired off-thread)"));
         }
@@ -1819,7 +1850,7 @@ impl<H: Send + 'static> LockRuntime<H> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct LockedFd {
     fd: self::std::sync::Mutex<Option<blaze_sys::posix::io::OwnedFd>>,
-    in_flight: core::sync::atomic::AtomicUsize,
+    in_flight: blaze_own::Arc<core::sync::atomic::AtomicUsize, blaze_own::SharedAlloc<'static>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2121,7 +2152,10 @@ pub(crate) fn lock_exclusive_off_thread(
     let locked = blaze_own::Arc::new_in(
         LockedFd {
             fd: self::std::sync::Mutex::new(Some(fd)),
-            in_flight: core::sync::atomic::AtomicUsize::new(0),
+            in_flight: blaze_own::Arc::new_in(
+                core::sync::atomic::AtomicUsize::new(0),
+                blaze_own::SharedAlloc::global(),
+            ),
         },
         blaze_own::SharedAlloc::global(),
     );
@@ -2334,6 +2368,77 @@ fn create_exclusive_file_beneath_no_symlink(
     openat(parent, blaze_sys::Path::new(cstr), flags, 0o600)
 }
 
+/// Planted bug for deterministic interleaving tests of [`LockedIoHandshake`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LockedIoPlant {
+    None,
+    /// Control: publishes `Some(res)` before decrementing `in_flight`, letting a fast caller call
+    /// `FileLock::unlock` while `in_flight > 0` and spuriously deferring lock release.
+    PublishBeforeDecrement,
+}
+
+/// Completion/counter handshake shared between [`run_locked_io_off_thread`] and its deterministic
+/// interleaving test: guarantees `in_flight` and `active_workers` are decremented and any held
+/// lock reference is released BEFORE publishing `Some(res)` to the caller.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct LockedIoHandshake<R: Send + 'static> {
+    in_flight: blaze_own::Arc<core::sync::atomic::AtomicUsize, blaze_own::SharedAlloc<'static>>,
+    active_workers: &'static core::sync::atomic::AtomicUsize,
+    slot: blaze_own::Arc<self::std::sync::Mutex<Option<R>>, blaze_own::SharedAlloc<'static>>,
+    signal: blaze_own::Arc<AttemptSignal, blaze_own::SharedAlloc<'static>>,
+    plant: LockedIoPlant,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<R: Send + 'static> LockedIoHandshake<R> {
+    pub fn new(
+        in_flight: blaze_own::Arc<core::sync::atomic::AtomicUsize, blaze_own::SharedAlloc<'static>>,
+        active_workers: &'static core::sync::atomic::AtomicUsize,
+        slot: blaze_own::Arc<self::std::sync::Mutex<Option<R>>, blaze_own::SharedAlloc<'static>>,
+        signal: blaze_own::Arc<AttemptSignal, blaze_own::SharedAlloc<'static>>,
+        plant: LockedIoPlant,
+    ) -> Self {
+        Self { in_flight, active_workers, slot, signal, plant }
+    }
+
+    /// Runs the completion handshake: under [`LockedIoPlant::None`], decrements `in_flight` and
+    /// `active_workers` BEFORE storing `Some(res)` and waking `signal` (and invokes `between` right
+    /// after publishing, before any deferred teardown, so a deterministic test can model a fast
+    /// caller racing `unlock` against worker teardown).
+    pub fn complete_with_hook<F: FnOnce()>(&self, res: R, between: F) {
+        use core::sync::atomic::Ordering;
+        match self.plant {
+            LockedIoPlant::None => {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                self.active_workers.fetch_sub(1, Ordering::AcqRel);
+                {
+                    let mut guard = match self.slot.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    *guard = Some(res);
+                }
+                self.signal.notify();
+                between();
+            }
+            LockedIoPlant::PublishBeforeDecrement => {
+                {
+                    let mut guard = match self.slot.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    *guard = Some(res);
+                }
+                self.signal.notify();
+                between();
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                self.active_workers.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_locked_io_off_thread<R, F>(
     cx: &crate::cx::Cx,
@@ -2364,16 +2469,31 @@ where
     }
     locked_fd.in_flight.fetch_add(1, Ordering::AcqRel);
 
+    // Panic-only safety net: on normal completion `disarm_for_handshake()` drops `locked` and
+    // transfers counter decrement + completion publication to `LockedIoHandshake::complete_with_hook`.
     struct WorkerGuards {
-        locked: blaze_own::Arc<LockedFd, blaze_own::SharedAlloc<'static>>,
+        locked: Option<blaze_own::Arc<LockedFd, blaze_own::SharedAlloc<'static>>>,
         signal: blaze_own::Arc<AttemptSignal, blaze_own::SharedAlloc<'static>>,
+        armed: bool,
+    }
+    impl WorkerGuards {
+        fn disarm_for_handshake(&mut self) {
+            self.armed = false;
+            let _ = self.locked.take();
+        }
     }
     impl Drop for WorkerGuards {
         fn drop(&mut self) {
             use core::sync::atomic::Ordering;
-            self.locked.in_flight.fetch_sub(1, Ordering::AcqRel);
-            ACTIVE_LOCKED_IO.fetch_sub(1, Ordering::AcqRel);
-            self.signal.notify();
+            if self.armed {
+                self.armed = false;
+                if let Some(locked) = self.locked.take() {
+                    locked.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    drop(locked);
+                }
+                ACTIVE_LOCKED_IO.fetch_sub(1, Ordering::AcqRel);
+                self.signal.notify();
+            }
         }
     }
 
@@ -2386,6 +2506,7 @@ where
 
     let root_w = blaze_own::Share::share(&lock.root_dir);
     let locked_w = blaze_own::Share::share(locked_fd);
+    let in_flight_w = blaze_own::Share::share(&locked_fd.in_flight);
     let signal_w = blaze_own::Share::share(&signal);
     let cancelled_w = blaze_own::Share::share(&cancelled);
     let slot_w = blaze_own::Share::share(&slot);
@@ -2393,13 +2514,17 @@ where
     let spawned = self::std::thread::Builder::new()
         .name(self::std::string::String::from("bstd-locked-io"))
         .spawn(move || {
-            let _guards = WorkerGuards { locked: locked_w, signal: signal_w };
+            let mut guards = WorkerGuards { locked: Some(locked_w), signal: blaze_own::Share::share(&signal_w), armed: true };
             let res = op(&root_w, &cancelled_w);
-            let mut guard = match slot_w.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            *guard = Some(res);
+            guards.disarm_for_handshake();
+            let handshake = LockedIoHandshake::new(
+                in_flight_w,
+                &ACTIVE_LOCKED_IO,
+                slot_w,
+                signal_w,
+                LockedIoPlant::None,
+            );
+            handshake.complete_with_hook(res, || {});
         });
     if spawned.is_err() {
         locked_fd.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -2530,76 +2655,59 @@ fn read_bounded_under_lock_sync(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn sync_file_for_durable(
+fn sync_file_for_publish(
     fd: blaze_sys::Fd,
-    durable: crate::fs::Durable,
+    synced: bool,
 ) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
-    match durable {
-        crate::fs::Durable::No => Ok(()),
-        crate::fs::Durable::Started => {
-            #[cfg(target_os = "linux")]
-            {
-                blaze_sys::linux::sync_file_range(fd, 0, 0, blaze_sys::linux::SyncRange::WRITE)
-                    .map_err(|e| lock_err_errno("sync_file_range (locked publish)", e))
-            }
-            #[cfg(target_os = "macos")]
-            {
-                blaze_sys::posix::io::fsync(fd).map_err(|e| lock_err_errno("fsync (locked publish)", e))
-            }
-        }
-        crate::fs::Durable::Yes => {
-            #[cfg(target_os = "linux")]
-            {
-                blaze_sys::posix::io::fsync(fd).map_err(|e| lock_err_errno("fsync (locked publish)", e))
-            }
-            #[cfg(target_os = "macos")]
-            {
-                blaze_sys::posix::io::full_fsync(fd).map_err(|e| lock_err_errno("F_FULLFSYNC (locked publish)", e))
-            }
-        }
+    if !synced {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        blaze_sys::posix::io::fsync(fd).map_err(|e| lock_err_errno("fsync (locked publish)", e))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        blaze_sys::posix::io::full_fsync(fd).map_err(|e| lock_err_errno("F_FULLFSYNC (locked publish)", e))
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn sync_dir_for_durable(
+fn sync_dir_for_publish(
     parent_fd: blaze_sys::Fd,
-    durable: crate::fs::Durable,
+    synced: bool,
 ) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
-    match durable {
-        crate::fs::Durable::No => Ok(()),
-        crate::fs::Durable::Started => {
-            blaze_sys::posix::io::fsync(parent_fd).map_err(|e| lock_err_errno("fsync dir (locked publish)", e))
-        }
-        crate::fs::Durable::Yes => {
-            #[cfg(target_os = "linux")]
-            {
-                blaze_sys::posix::io::fsync(parent_fd).map_err(|e| lock_err_errno("fsync dir (locked publish)", e))
-            }
-            #[cfg(target_os = "macos")]
-            {
-                blaze_sys::posix::io::full_fsync(parent_fd)
-                    .map_err(|e| lock_err_errno("F_FULLFSYNC dir (locked publish)", e))
-            }
-        }
+    if !synced {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        blaze_sys::posix::io::fsync(parent_fd).map_err(|e| lock_err_errno("fsync dir (locked publish)", e))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        blaze_sys::posix::io::full_fsync(parent_fd)
+            .map_err(|e| lock_err_errno("F_FULLFSYNC dir (locked publish)", e))
     }
 }
 
 /// Atomically publishes `whole` at `rel` strictly beneath `lock.root_dir.fd()` on a bounded
 /// off-thread worker that honors `cx` deadline/cancellation, sharing the exact opened directory
-/// inode holding the flock and preserving all three [`crate::fs::Durable`] modes.
+/// inode holding the flock. When `synced` is `true`, syncs file bytes before rename and parent
+/// directory after; when `false`, performs no device sync (`Durable::No`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn publish_under_lock_off_thread(
     cx: &crate::cx::Cx,
     lock: &NativeLock,
     rel: &str,
     whole: &[u8],
-    durable: crate::fs::Durable,
+    synced: bool,
 ) -> Result<(), NativeLockErr> {
     let rel_owned = blaze_own::String::from_str_in(rel, blaze_own::SharedAlloc::global());
     let mut whole_owned = blaze_own::Vec::with_capacity_in(whole.len(), blaze_own::SharedAlloc::global());
     whole_owned.extend_from_slice(whole);
     run_locked_io_off_thread(cx, lock, move |root_dir, cancelled| {
-        publish_under_lock_sync(root_dir, rel_owned.as_str(), whole_owned.as_slice(), durable, cancelled)
+        publish_under_lock_sync(root_dir, rel_owned.as_str(), whole_owned.as_slice(), synced, cancelled)
     })
 }
 
@@ -2608,11 +2716,16 @@ fn publish_under_lock_sync(
     root_dir: &NativeRootDir,
     rel: &str,
     whole: &[u8],
-    durable: crate::fs::Durable,
+    synced: bool,
     cancelled: &core::sync::atomic::AtomicBool,
 ) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
     use core::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    const OPEN_TEMP_CALL: &str = if cfg!(target_os = "linux") {
+        "openat2 (locked publish temp)"
+    } else {
+        "openat (locked publish temp)"
+    };
 
     if cancelled.load(Ordering::Acquire) {
         return Err(blaze_own::String::from_str_in("locked publish cancelled", blaze_own::SharedAlloc::global()));
@@ -2647,7 +2760,7 @@ fn publish_under_lock_sync(
                 break;
             }
             Err(blaze_sys::Errno::Exist) => continue,
-            Err(errno) => return Err(lock_err_errno("openat2 (locked publish temp)", errno)),
+            Err(errno) => return Err(lock_err_errno(OPEN_TEMP_CALL, errno)),
         }
     }
     let Some(fd) = tmp_fd else {
@@ -2700,7 +2813,7 @@ fn publish_under_lock_sync(
             }
         }
     }
-    if let Err(err) = sync_file_for_durable(fd.fd(), durable) {
+    if let Err(err) = sync_file_for_publish(fd.fd(), synced) {
         drop(fd);
         let cleanup = unlink_tmp(tmp_name.as_str());
         return Err(combine_io_and_cleanup(err, cleanup));
@@ -2723,7 +2836,7 @@ fn publish_under_lock_sync(
         let cleanup = unlink_tmp(tmp_name.as_str());
         return Err(combine_io_and_cleanup(err, cleanup));
     }
-    sync_dir_for_durable(parent_fd, durable)?;
+    sync_dir_for_publish(parent_fd, synced)?;
     Ok(())
 }
 

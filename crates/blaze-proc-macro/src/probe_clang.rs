@@ -1917,7 +1917,7 @@ mod tests {
             std::fs::write(lock_root.join("sub/rec"), b"sentinel-on-new-inode").expect("write new inode sentinel");
 
             let seen = held
-                .read_bounded(&lock_cx, &lock_dir, &rec_path, 4096, false, alloc)
+                .read_bounded(&lock_cx, &rec_path, 4096, false, alloc)
                 .expect("read_bounded under held lock");
             let bstd::fs::BoundedRead::Whole(seen_bytes) = seen else {
                 panic!("expected Whole read from locked old inode");
@@ -1927,10 +1927,10 @@ mod tests {
                 b"corrupt-on-old-inode",
                 "locked read must stay on the locked inode rather than the replacement path"
             );
-            held.publish(&lock_cx, &lock_dir, &rec_path, b"repaired-on-old-inode", bstd::fs::Durable::Started)
-                .expect("publish Durable::Started under held lock");
-            held.publish(&lock_cx, &lock_dir, &rec_path, b"repaired-on-old-inode", bstd::fs::Durable::Yes)
-                .expect("publish Durable::Yes under held lock");
+            held.publish_unsynced(&lock_cx, &rec_path, b"repaired-unsynced-on-old-inode")
+                .expect("publish_unsynced under held lock");
+            held.publish_synced(&lock_cx, &rec_path, b"repaired-on-old-inode")
+                .expect("publish_synced under held lock");
             assert_eq!(
                 std::fs::read(moved_root.join("sub/rec")).expect("read old inode"),
                 b"repaired-on-old-inode",
@@ -2759,6 +2759,7 @@ mod tests {
             rng: u64,
             fail_spawn_mask: u64,
             ready_queue: VecDeque<std::boxed::Box<dyn FnOnce() + Send + 'static>>,
+            parked_reapers: usize,
             trace_hash: u64,
         }
 
@@ -2784,6 +2785,8 @@ mod tests {
             unlocked_count: StdArc<AtomicUsize>,
             closed_count: StdArc<AtomicUsize>,
             dropped_on_caller: StdArc<AtomicUsize>,
+            rt_slot: std::sync::OnceLock<LockRuntime<TrackedHandle>>,
+            self_slot: std::sync::OnceLock<blaze_own::Arc<SimLockBackend, blaze_own::SharedAlloc<'static>>>,
         }
 
         impl SimLockBackend {
@@ -2865,6 +2868,35 @@ mod tests {
                     }
                 }
             }
+
+            fn park_reaper<'a>(
+                &self,
+                _cvar: &std::sync::Condvar,
+                _guard: std::sync::MutexGuard<'a, bstd::procs::hermetic::StandbyReaperCore<TrackedHandle>>,
+            ) -> Option<std::sync::MutexGuard<'a, bstd::procs::hermetic::StandbyReaperCore<TrackedHandle>>> {
+                self.state.lock().expect("sim state lock").parked_reapers += 1;
+                None
+            }
+
+            fn notify_reaper(&self, _cvar: &std::sync::Condvar, all: bool) {
+                let mut st = self.state.lock().expect("sim state lock");
+                let wake_count = if all { st.parked_reapers } else { st.parked_reapers.min(1) };
+                st.parked_reapers -= wake_count;
+                let Some(rt) = self.rt_slot.get() else {
+                    return;
+                };
+                let Some(me) = self.self_slot.get() else {
+                    return;
+                };
+                for _ in 0..wake_count {
+                    let rt_w = blaze_own::Share::share(rt);
+                    let me_w = blaze_own::Share::share(me);
+                    // Waking an already-spawned parked standby reaper does NOT call `spawn_worker`.
+                    st.ready_queue.push_back(std::boxed::Box::new(move || {
+                        rt_w.run_standby_reaper_loop(&*me_w);
+                    }));
+                }
+            }
         }
 
         let mut combined_trace = 0u64;
@@ -2874,12 +2906,16 @@ mod tests {
             let unlocked_count = StdArc::new(AtomicUsize::new(0));
             let closed_count = StdArc::new(AtomicUsize::new(0));
             let dropped_on_caller = StdArc::new(AtomicUsize::new(0));
+            // Small cap (`max_workers = 2, max_pending = 4`) deterministically saturates workers,
+            // queues reapers, and exercises spawn failures on every seed.
+            let rt = LockRuntime::new(2, 4, plant);
             let backend = blaze_own::Arc::new_in(
                 SimLockBackend {
                     state: StdMutex::new(SimState {
                         rng: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(17),
                         fail_spawn_mask: 7,
                         ready_queue: VecDeque::new(),
+                        parked_reapers: 0,
                         trace_hash: seed,
                     }),
                     in_worker: StdArc::clone(&in_worker),
@@ -2887,12 +2923,13 @@ mod tests {
                     unlocked_count: StdArc::clone(&unlocked_count),
                     closed_count: StdArc::clone(&closed_count),
                     dropped_on_caller: StdArc::clone(&dropped_on_caller),
+                    rt_slot: std::sync::OnceLock::new(),
+                    self_slot: std::sync::OnceLock::new(),
                 },
                 blaze_own::SharedAlloc::global(),
             );
-            // Small cap (`max_workers = 2, max_pending = 4`) deterministically saturates workers,
-            // queues reapers, and triggers spawn-failure recovery on every seed.
-            let rt = LockRuntime::new(2, 4, plant);
+            let _ = backend.rt_slot.set(blaze_own::Share::share(&rt));
+            let _ = backend.self_slot.set(blaze_own::Share::share(&backend));
             let mut held = std::vec::Vec::new();
             for op in 0..24u64 {
                 let choice = (seed.wrapping_add(op)) % 4;
@@ -2951,18 +2988,10 @@ mod tests {
                     rt.retire_handle(handle, &backend);
                 }
             }
-            // Disable spawn failures and drain the deterministic scheduler to quiescence.
-            backend.state.lock().expect("sim state lock").fail_spawn_mask = 0;
-            loop {
-                rt.pump_reapers(&backend);
-                let before = backend.state.lock().expect("sim state lock").ready_queue.len();
-                backend.drain_all();
-                rt.pump_reapers(&backend);
-                let after = backend.state.lock().expect("sim state lock").ready_queue.len();
-                if before == 0 && after == 0 {
-                    break;
-                }
-            }
+            // Force 100% spawn failure during quiescence (NO `pump_reapers`, NO new spawns):
+            // pre-spawned standby reapers MUST still unlock, close, and exit cleanly!
+            backend.state.lock().expect("sim state lock").fail_spawn_mask = 1;
+            backend.drain_all();
 
             if dropped_on_caller.load(Ordering::Acquire) != 0 {
                 return Err("lock runtime oracle: handle dropped synchronously on caller thread");
@@ -2979,12 +3008,73 @@ mod tests {
             if rt.active_workers() != 0 {
                 return Err("lock runtime oracle: active_workers counter leaked");
             }
-            if rt.reaper_active() != 0 || rt.reaper_pending() != 0 || rt.reaper_reserved() != 0 {
-                return Err("lock runtime oracle: reaper slot/pending/active state leaked");
+            if rt.reaper_active() != 0
+                || rt.reaper_idle() != 0
+                || rt.reaper_spawning() != 0
+                || rt.reaper_pending() != 0
+                || rt.reaper_reserved() != 0
+            {
+                return Err("lock runtime oracle: reaper slot/pending/active/idle state leaked");
             }
             combined_trace ^= backend.state.lock().expect("sim state lock").trace_hash;
         }
         Ok(combined_trace)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_locked_io_handshake_dst(plant: bstd::procs::hermetic::LockedIoPlant) -> Result<(), &'static str> {
+        use bstd::procs::hermetic::{AttemptSignal, LockedIoHandshake};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex as StdMutex;
+
+        static TEST_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        for iter in 0..100usize {
+            let in_flight = blaze_own::Arc::new_in(AtomicUsize::new(1), blaze_own::SharedAlloc::global());
+            TEST_ACTIVE.store(1, Ordering::Release);
+            let slot = blaze_own::Arc::new_in(StdMutex::new(Option::<usize>::None), blaze_own::SharedAlloc::global());
+            let signal = blaze_own::Arc::new_in(AttemptSignal::new(), blaze_own::SharedAlloc::global());
+            let handshake = LockedIoHandshake::new(
+                blaze_own::Share::share(&in_flight),
+                &TEST_ACTIVE,
+                blaze_own::Share::share(&slot),
+                blaze_own::Share::share(&signal),
+                plant,
+            );
+            let mut saw_in_flight_on_unlock = false;
+            let mut saw_active_on_unlock = false;
+            handshake.complete_with_hook(iter, || {
+                // Simulate a fast caller waking the instant `Some(res)` is published and
+                // immediately invoking `FileLock::unlock` BEFORE any post-publish worker teardown.
+                let taken = slot.lock().expect("slot lock").take();
+                assert_eq!(taken, Some(iter));
+                if in_flight.load(Ordering::Acquire) > 0 {
+                    saw_in_flight_on_unlock = true;
+                }
+                if TEST_ACTIVE.load(Ordering::Acquire) > 0 {
+                    saw_active_on_unlock = true;
+                }
+            });
+            if saw_in_flight_on_unlock {
+                return Err("locked-I/O handshake: caller unlock observed in_flight > 0 after completion");
+            }
+            if saw_active_on_unlock {
+                return Err("locked-I/O handshake: active_workers remained > 0 after completion");
+            }
+            if in_flight.load(Ordering::Acquire) != 0 || TEST_ACTIVE.load(Ordering::Acquire) != 0 {
+                return Err("locked-I/O handshake: counters did not return to zero");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn locked_io_handshake_decrements_in_flight_before_publish_and_catches_planted_order() {
+        run_locked_io_handshake_dst(bstd::procs::hermetic::LockedIoPlant::None)
+            .expect("normal LockedIoHandshake must decrement in_flight before publishing completion");
+        let err = run_locked_io_handshake_dst(bstd::procs::hermetic::LockedIoPlant::PublishBeforeDecrement)
+            .expect_err("planted PublishBeforeDecrement must be caught immediately");
+        assert!(err.contains("in_flight > 0"), "unexpected error: {err}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
