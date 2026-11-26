@@ -1461,6 +1461,29 @@ where
 {
     repop_on_new_blocks(client)
 }
+
+// Delegating trait `async fn` whose synthetic RPITIT associated type appears in the borrow-check's
+// `alias_counts` (`tempo_node::executed_state::TempoTreeValidatorBuilder::build_tree_validator`).
+trait TreeValidatorBuilder<N> {
+    type Validator;
+    async fn build_tree_validator(self, ctx: &N) -> Self::Validator;
+}
+struct InnerTreeBuilder;
+impl<N> TreeValidatorBuilder<N> for InnerTreeBuilder {
+    type Validator = u64;
+    async fn build_tree_validator(self, _ctx: &N) -> Self::Validator {
+        42
+    }
+}
+struct WrappingTreeBuilder {
+    inner: InnerTreeBuilder,
+}
+impl<N> TreeValidatorBuilder<N> for WrappingTreeBuilder {
+    type Validator = <InnerTreeBuilder as TreeValidatorBuilder<N>>::Validator;
+    async fn build_tree_validator(self, ctx: &N) -> Self::Validator {
+        self.inner.build_tree_validator(ctx).await
+    }
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

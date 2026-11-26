@@ -1075,14 +1075,28 @@ fn reply_terminators() {
     assert_eq!(run(&mut c, b"\x1b]4;256;?\x1b\\").0, b"");
 }
 
+#[test]
+fn osc_7770_blaze_term_api() {
+    assert!(unbounded(b"7770;"));
+    assert!(!unbounded(b"7770"));
+    assert_eq!(
+        p(b"7770;{\"op\":\"ping\"}"),
+        Some(Command::BlazeTermApi(b"{\"op\":\"ping\"}"))
+    );
+    assert_eq!(p(b"7770;"), None);
+    assert_eq!(p(b"7770"), None);
+    let big = repeat(b"7770;", b'x', MAX_BUF * 3);
+    assert_eq!(p(&big), Some(Command::BlazeTermApi(&big[5..])));
+}
+
 // Property: parsing never panics, on prefixes ghostty knows followed by bytes drawn from the
 // separators and characters the parsers look at; and a command's colour lists always end.
 #[test]
 fn parse_never_panics() {
-    const PREFIXES: [&[u8]; 26] = [
+    const PREFIXES: [&[u8]; 27] = [
         b"0;", b"1;", b"2;", b"4;", b"5;", b"7;", b"8;", b"9;", b"10;", b"12;", b"19;", b"21;",
         b"22;", b"52;", b"66;", b"72;", b"104;", b"105;", b"110;", b"133;", b"777;", b"1337;",
-        b"3008;", b"5522;", b"9;4;", b"",
+        b"3008;", b"5522;", b"7770;", b"9;4;", b"",
     ];
     const ALPHABET: &[u8] = b";:=?0123459abfAILNPDCrgbi#/ .,-+_\x00\x1b\x7f\xc3\xa9\xff";
     blaze_sim::check(blaze_sim::Config::cases(3000), |tape| {

@@ -197,6 +197,21 @@ pub struct EmojiQuad {
     pub clip_id: u32,
 }
 
+/// A Retina custom symbol registered via the Blaze Terminal API (SVG, in-memory font glyph,
+/// PNG bitmap, or composite text), positioned in logical pixels and rasterized through `IconAtlas`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomSymbolQuad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub name: String,
+    /// Optional RGBA tint applied on the GPU (used for monochrome SVGs and untinted font glyphs).
+    pub tint: Option<[f32; 4]>,
+    pub alpha: f32,
+    pub clip_id: u32,
+}
+
 /// Logical display width for a custom emoji / symbol badge of height `h`.
 #[inline]
 pub fn symbol_badge_width(text: &str, h: f32) -> f32 {
@@ -755,6 +770,8 @@ pub struct Scene {
     pub icon_quads: Vec<IconQuad>,
     /// Full-color Retina Apple Color Emoji / custom symbol quads rasterized via `IconAtlas`.
     pub emoji_quads: Vec<EmojiQuad>,
+    /// Retina custom symbols registered via the Blaze Terminal API, rasterized via `IconAtlas`.
+    pub custom_symbols: Vec<CustomSymbolQuad>,
     pub image_quads: Vec<ImageQuad>,
     /// Foreground overlays (underlines, error carets, beam cursor, hairlines) drawn over text.
     pub over_rects: Vec<RectInst>,
@@ -811,6 +828,7 @@ impl Scene {
             text_runs: Vec::new(),
             icon_quads: Vec::new(),
             emoji_quads: Vec::new(),
+            custom_symbols: Vec::new(),
             image_quads: Vec::new(),
             over_rects: Vec::new(),
             overlay_rects: Vec::new(),
@@ -1072,6 +1090,21 @@ impl Scene {
             clip_id,
         });
         w
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn custom_symbol(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        name: String,
+        tint: Option<[f32; 4]>,
+        alpha: f32,
+        clip_id: u32,
+    ) {
+        self.custom_symbols.push(CustomSymbolQuad { x, y, w, h, name, tint, alpha, clip_id });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1527,6 +1560,12 @@ impl Scene {
             em.y += dy;
             em.clip_id = map_clip(em.clip_id);
             self.emoji_quads.push(em);
+        }
+        for mut cs in sub.custom_symbols {
+            cs.x += dx;
+            cs.y += dy;
+            cs.clip_id = map_clip(cs.clip_id);
+            self.custom_symbols.push(cs);
         }
         for mut img in sub.image_quads {
             img.x += dx;

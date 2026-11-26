@@ -2357,6 +2357,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-term-api"
+version = "0.0.0"
+dependencies = [
+ "blaze-base64",
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-test-reach"
 version = "0.0.0"
 dependencies = [
