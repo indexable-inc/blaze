@@ -615,3 +615,86 @@ pub extern \"C\" fn main() -> i32 {
     println!("IPC START INNER: {got:?}");
     assert_eq!(got, Ok(11));
 }
+
+#[test]
+fn while_let_await_match_with_guard_and_dropped_arm_binding() {
+    let got = run("
+struct Val(u32);
+impl Drop for Val {
+    fn drop(&mut self) {}
+}
+
+enum Outcome {
+    Valid { tx: Val, extra: Val },
+    Invalid(Val),
+}
+
+enum Out {
+    Ok(Val),
+    Err(Val),
+}
+
+async fn recv(n: &mut u32) -> Option<(u32, u32, Outcome)> {
+    let k = Later { left: 1, value: *n }.await;
+    if k == 0 {
+        None
+    } else {
+        *n = k - 1;
+        Some((k, k % 2, Outcome::Valid { tx: Val(k * 10), extra: Val(1) }))
+    }
+}
+
+fn handle(o: Outcome) -> Out {
+    match o {
+        Outcome::Valid { tx, .. } => Out::Ok(tx),
+        Outcome::Invalid(v) => Out::Err(v),
+    }
+}
+
+async fn run_guarded() -> u32 {
+    let mut sum = 0u32;
+    let mut n = 3u32;
+    let mut slot = Out::Err(Val(0));
+    while let Some((_idx, epoch, outcome)) = recv(&mut n).await {
+        slot = match outcome {
+            Outcome::Valid { tx, .. } if epoch != 0 => {
+                let copy = Val(tx.0 + 1);
+                Out::Err(copy)
+            }
+            outcome => handle(outcome),
+        };
+        match &slot {
+            Out::Ok(v) | Out::Err(v) => sum = sum + v.0,
+        }
+    }
+    sum
+}
+
+async fn run_unguarded() -> u32 {
+    let mut sum = 0u32;
+    let mut n = 2u32;
+    let mut slot = Out::Err(Val(0));
+    while let Some((_idx, _epoch, outcome)) = recv(&mut n).await {
+        slot = match outcome {
+            Outcome::Valid { tx, .. } => {
+                let copy = Val(tx.0 + 2);
+                Out::Err(copy)
+            }
+            Outcome::Invalid(v) => Out::Err(v),
+        };
+        match &slot {
+            Out::Ok(v) | Out::Err(v) => sum = sum + v.0,
+        }
+    }
+    sum
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // guarded: k=3 (epoch=1 -> 31), k=2 (epoch=0 -> 20), k=1 (epoch=1 -> 11) => 62
+    // unguarded: k=2 (-> 22), k=1 (-> 12) => 34
+    (block_on(run_guarded()) + block_on(run_unguarded())) as i32
+}
+");
+    assert_eq!(got, Ok(96));
+}
