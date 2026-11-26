@@ -315,8 +315,14 @@ pub(crate) fn http_ls_remote<'a>(url: &str, alloc: Alloc<'a>) -> io::Result<()> 
     Ok(())
 }
 
-/// Clones a remote Git repository over Smart HTTP v2 directly into a native `.bgit` store + worktree!
-pub(crate) fn http_clone<'a>(url: &str, dest_dir: &Path, alloc: Alloc<'a>) -> io::Result<()> {
+/// Clones a remote Git repository over Smart HTTP v2 directly into a native `.bgit` store
+/// (and optionally checks out the working tree; pass `checkout = false` for lazy `--vfs` clones).
+pub(crate) fn http_clone<'a>(
+    url: &str,
+    dest_dir: &Path,
+    checkout: bool,
+    alloc: Alloc<'a>,
+) -> io::Result<()> {
     let parsed = parse_http_url(url)?;
     let info_path = format!("{}/info/refs?service=git-upload-pack", parsed.base_path);
     let advert = http_exchange(parsed.host_port, "GET", &info_path, None, true, b"")?;
@@ -404,9 +410,9 @@ pub(crate) fn http_clone<'a>(url: &str, dest_dir: &Path, alloc: Alloc<'a>) -> io
     }
     store.flush()?;
 
-    // Materialize HEAD commit tree into `dest_dir`.
+    // Materialize HEAD commit tree into `dest_dir` unless `--vfs` lazy checkout was requested.
     let mut checked_out = 0u32;
-    if let Some(tip) = head_oid {
+    if checkout && let Some(tip) = head_oid {
         let mut buf = OwnVec::new_in(alloc);
         if store
             .read_object(&tip, &mut buf)

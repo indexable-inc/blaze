@@ -19,6 +19,7 @@
 mod disk;
 mod net_driver;
 mod status_driver;
+mod vfs_driver;
 
 use std::{
     alloc::Global,
@@ -43,6 +44,7 @@ use crate::{
     disk::{BgitDiskStore, disinfect_repo_on_disk, infect_repo_on_disk, open_or_infect},
     net_driver::{http_clone, http_ls_remote, http_push, serve_http, serve_stdio},
     status_driver::run_status,
+    vfs_driver::{cmd_internal_vfs_serve, cmd_mount, cmd_unmount, spawn_background_mount},
 };
 
 fn main() -> ExitCode {
@@ -67,6 +69,8 @@ fn print_usage() {
         "bgit — sans-IO, Git-wire-compatible VCS engine (macOS / APFS native .bgit store)\n\n\
          USAGE:\n\
          \tbgit status [dir] [-s|--short] [--porcelain] [-b|--branch] [-uno|-unormal|-uall] [--prompt] [--timing]\n\
+         \tbgit mount <repo> <mountpoint> [rev] [--ro] [--foreground]  (or `bgit mount --list`)\n\
+         \tbgit unmount <mountpoint> [--force]\n\
          \tbgit init [dir]\n\
          \tbgit infect [dir] [--raw]\n\
          \tbgit disinfect <dir> <out-git-dir>\n\
@@ -77,7 +81,7 @@ fn print_usage() {
          \tbgit serve --http <addr> <repo>\n\
          \tbgit serve --stdio <upload-pack|receive-pack> <repo>\n\
          \tbgit ls-remote <http-url>\n\
-         \tbgit clone <http-url> <dest-dir>\n\
+         \tbgit clone [--vfs] <http-url> <dest-dir>\n\
          \tbgit push <http-url> <dir> <ref>\n\
          \tbgit bench <repo>"
     );
@@ -86,6 +90,9 @@ fn print_usage() {
 fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     match args[0].as_str() {
         "status" | "st" => cmd_status(&args[1..], alloc),
+        "mount" => cmd_mount(&args[1..], alloc),
+        "unmount" | "umount" => cmd_unmount(&args[1..]),
+        "__vfs-serve" => cmd_internal_vfs_serve(&args[1..], alloc),
         "init" => {
             let dir = args.get(1).map_or_else(|| PathBuf::from("."), PathBuf::from);
             let store = BgitDiskStore::init(&dir, alloc)?;
@@ -211,13 +218,37 @@ fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
             http_ls_remote(&args[1], alloc)
         }
         "clone" => {
-            if args.len() < 3 {
+            let mut use_vfs = false;
+            let mut pos = Vec::new();
+            for a in &args[1..] {
+                if a == "--vfs" {
+                    use_vfs = true;
+                } else {
+                    pos.push(a.as_str());
+                }
+            }
+            if pos.len() < 2 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "usage: bgit clone <http-url> <dest-dir>",
+                    "usage: bgit clone [--vfs] <http-url> <dest-dir>",
                 ));
             }
-            http_clone(&args[1], Path::new(&args[2]), alloc)
+            let url = pos[0];
+            let dest = Path::new(pos[1]);
+            if use_vfs {
+                // Store `.bgit` objects in sibling `<dest>.bgit-store` with 0 checked-out files,
+                // then lazily mount onto `<dest>` via NFSv3!
+                let mut store_name = dest
+                    .file_name()
+                    .map(|n| n.to_os_string())
+                    .unwrap_or_else(|| std::ffi::OsString::from("repo"));
+                store_name.push(".bgit-store");
+                let store_dir = dest.with_file_name(store_name);
+                http_clone(url, &store_dir, false, alloc)?;
+                spawn_background_mount(&store_dir, dest, "HEAD", false)
+            } else {
+                http_clone(url, dest, true, alloc)
+            }
         }
         "push" => {
             if args.len() < 4 {

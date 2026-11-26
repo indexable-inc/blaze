@@ -152,6 +152,12 @@ pub(crate) fn run_status<'a>(
     alloc: Alloc<'a>,
 ) -> io::Result<(PromptStatus<'a>, StatusTiming)> {
     let t_total = Instant::now();
+    // O(dirty) fast-path for active lazy VFS mounts (< 1 ms, 0 directory walks!).
+    if let Some(vfs_status) = crate::vfs_driver::try_vfs_mount_status(start, opts, alloc)? {
+        let mut timing = StatusTiming::default();
+        timing.total_us = t_total.elapsed().as_micros() as u64;
+        return Ok((vfs_status, timing));
+    }
     let repo = discover_repo(start)?;
     let (status, mut timing) = match repo {
         DiscoveredRepo::Git { worktree, git_dir, common_dir, bgit_dir, kind } => {
