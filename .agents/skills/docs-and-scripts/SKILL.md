@@ -20,15 +20,17 @@ See [docs/v2/plan.md#9-one-interface](../../../docs/v2/plan.md#9-one-interface).
 Every doc under `docs/` has front matter: `current` (kept true), `plan`, `record` (dated history) or
 `superseded` (naming its replacement). Trust current docs; read plans and records as of their date.
 A change that makes a current doc untrue fixes it or marks it superseded in the same change; `blaze
-run -q -p scripts --bin docs -- check` holds them to the tree.
+run -q -p scripts --bin docs -- check` holds them to the tree. Every doc, skill, rule, and interface
+name states its exact action or role unambiguously (e.g. `authoring-prompts`, never a vague topic
+noun that hides direction or purpose).
 
 See [docs/contributing.md#documents](../../../docs/contributing.md#documents).
 
 ## scripts-take-typed-input (rule 42)
 
-A script takes one JSON value (a file path, `-` or inline), parsed into a frozen dataclass that
-refuses unknown fields, not a set of flags or hidden environment variables. An existing script moves
-to this when next changed.
+A script takes one JSON value (a file path, `-` or inline), parsed into a typed Rust struct
+implementing `blaze_script::Input` (refusing unknown fields), not a set of flags or hidden
+environment variables. An existing script moves to this when next changed.
 
 ## docs-stay-small (rule 49)
 

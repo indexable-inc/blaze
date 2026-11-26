@@ -148,7 +148,7 @@ covers. Numbers are stable ids, not an order. Edit scripts/src/bin/rules.rs, run
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
 - **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
 - **35. fan-out-write-only**: Lanes write and check their own crate through the one build lock; the main agent admits the tree.
-- **36. worktree-per-lane**: One directory, each lane in its own files; a worktree is the exception; never `git stash`.
+- **36. worktree-per-lane**: Prefer one directory with disjoint files per lane (NOT a worktree per lane); never `git stash`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
 - **46. ledger-decides**: Work comes from the objectives ledger and is done when its row's check passes on a named commit.
 - **47. every-agent-has-a-task**: Every agent starts on one task with its outcome and check; people follow tasks, not agents.
@@ -165,8 +165,8 @@ covers. Numbers are stable ids, not an order. Edit scripts/src/bin/rules.rs, run
 
 ### Docs and scripts (skill `docs-and-scripts`)
 - **33. no-mcp**: Agent interfaces are a Unix socket or HTTP with one versioned schema in deterministic CBOR.
-- **41. docs-say-what-they-are**: Front matter says current, plan, record or superseded; current docs are kept true.
-- **42. scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not flags or env vars.
+- **41. docs-say-what-they-are**: Names & front matter state exact role/action (current|plan|record|superseded); no vague nouns.
+- **42. scripts-take-typed-input**: A script takes one JSON value parsed into a typed `blaze_script::Input` struct, not flags or env.
 - **49. docs-stay-small**: The plan, the ledger, the bounds and one spec per unbuilt design; delete what stops being true.
 
 ## Code Review Rules
