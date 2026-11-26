@@ -2573,6 +2573,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             let slot = self.b.slot(8, 3, SlotKind::Named);
             self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
             self.record_mask_decl_loop(slot);
+            self.preregister_local_match_parts(p, g, slot);
             Some(slot)
         } else {
             None

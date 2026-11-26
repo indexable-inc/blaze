@@ -46,8 +46,9 @@ use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with
 use blaze_proc_macro::script_unit::{self, Setting};
 use blaze_proc_macro::spawn_route::SpawnSetting;
 use blaze_scope::crate_env::{BinNames, CrateEnv, EnvFacts, SeenRoot};
+use blaze_scope::crate_scope::{Kept, Ready, Solved, resolve_kept};
 use blaze_scope::graph::{CrateId, Sysroot};
-use blaze_scope::resolve::{CrateInput, SourceTexts, aligned, resolve_crates};
+use blaze_scope::resolve::{CrateInput, SourceTexts, aligned};
 use blaze_scope::task::{MacroBody, Par, Scratch, Serial, proc_macro_decls_key};
 use blaze_scope::{items_record, names_record};
 use blaze_surface::{Edition, ItemKind, ProcKind};
@@ -64,12 +65,17 @@ pub(crate) const WASM64_TARGET: &str = "wasm64-blaze-wasip1";
 const PROC_MACRO_DECLS_GLOBAL: &str = "__rustc_proc_macro_decls_blaze__";
 
 /// Virtual reservation for the scratch arena of one on-demand wasm64 compile (costs zero physical
-/// pages until touched; unmapped on return). Sized for large proc-macro closures (`serde_derive` +
-/// `syn` + `quote` + `proc-macro2` + `std`).
-const COMPILE_FRAME_RESERVE: usize = 8 << 30;
+/// pages until touched; unmapped on return). Growing LIR/Wasm worklist structures use `heap_alloc`
+/// so old buffers are freed on realloc; this frame only holds resolved scope/items records.
+const COMPILE_FRAME_RESERVE: usize = 2 << 30;
 
 /// Atomic counter for unique staging directory names during atomic module publication.
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v1/<tc_id>/` has missing sysroot
+/// crate records on a completely cold store, preventing N parallel build-script/proc-macro
+/// workers from simultaneously re-parsing `core`/`alloc`/`std` (~3.5x peak RSS reduction).
+static SYSROOT_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Immutable inputs borrowed from the coordinator for on-demand wasm64 self-compilation.
 #[derive(Clone, Copy)]
@@ -452,6 +458,8 @@ struct KeptRecords<'a> {
     names: OwnVec<&'a [u8], Alloc<'a>>,
     items: OwnVec<&'a [u8], Alloc<'a>>,
     files: OwnVec<blaze_own::BTreeMap<&'a str, &'a str, Alloc<'a>>, Alloc<'a>>,
+    tc_packs: OwnVec<Option<PackView<'a>>, Alloc<'a>>,
+    arena: &'a Arena,
     expansions: OwnVec<blaze_own::BTreeMap<LibKey, &'a str, Alloc<'a>>, Alloc<'a>>,
     origins: OwnVec<blaze_own::BTreeMap<LibKey, &'a [u8], Alloc<'a>>, Alloc<'a>>,
 }
@@ -470,7 +478,17 @@ impl<'a> Load<'a> for KeptRecords<'a> {
         krate: usize,
         path: blaze_scope::package_path::PackagePath<'_>,
     ) -> Option<&'a str> {
-        self.files.get(krate)?.get(&path.as_str()).copied()
+        if let Some(text) = self.files.get(krate).and_then(|m| m.get(&path.as_str()).copied()) {
+            return Some(text);
+        }
+        let pack = self.tc_packs.get(krate).copied().flatten()?;
+        let entry = pack.find_entry(path.as_str())?;
+        let local = self.arena.local();
+        let bytes = match entry.read_in(&local).ok()? {
+            FileBytes::Borrowed(b) => b,
+            FileBytes::Owned(b) => local.alloc_slice_copy(b.as_slice()),
+        };
+        core::str::from_utf8(bytes).ok()
     }
 
     fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'a>> {
@@ -587,11 +605,29 @@ fn ensure_build_script_unit(
     let unit = &graph.units[script_id.index()];
     let mut feats: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
     feats.sort_unstable();
+    let files_digest = members
+        .iter()
+        .find(|(id, _, _)| *id == unit.package)
+        .map(|(_, dir, _)| {
+            let pkg_dir = if dir.is_empty() {
+                checkout.path().to_path_buf()
+            } else {
+                checkout.path().join(dir)
+            };
+            script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).map_err(|e| {
+                std::format!("reading build script files of {}: {e}", unit.name.as_str())
+            })
+        })
+        .transpose()?;
 
     // Fast path: already compiled and cached on disk.
-    if let Ok(Some(record_dir)) =
-        script_unit::module_of(store, unit.name.as_str(), unit.version.as_str(), &feats)
-        && let Ok(digest) = std::fs::read_to_string(record_dir.join("wasm-sha256"))
+    if let Ok(Some(record_dir)) = script_unit::module_of_files(
+        store,
+        unit.name.as_str(),
+        unit.version.as_str(),
+        &feats,
+        files_digest.as_deref(),
+    ) && let Ok(digest) = std::fs::read_to_string(record_dir.join("wasm-sha256"))
     {
         return Ok(digest.trim().to_owned());
     }
@@ -610,13 +646,16 @@ fn ensure_build_script_unit(
     .wasm;
 
     let id = blaze_toolchain::PINNED;
-    let identity = std::format!(
-        "blaze build-script module 3\nname {}\nversion {}\nfeatures {}\ntoolchain {id}\n{}\nbuilder blaze-wasm64\n",
+    let mut identity = std::format!(
+        "blaze build-script module 3\nname {}\nversion {}\nfeatures {}\n",
         unit.name.as_str(),
         unit.version.as_str(),
         feats.join(","),
-        script_unit::shim_line(),
     );
+    if let Some(hex) = &files_digest {
+        let _ = writeln!(identity, "files {hex}");
+    }
+    let _ = writeln!(identity, "toolchain {id}\n{}\nbuilder blaze-wasm64", script_unit::shim_line());
     let key = sha256_hex(identity.as_bytes());
     let wasm_sha256 = sha256_hex(&wasm);
     publish_build_script_module(store, &key, &identity, &wasm, &wasm_sha256)?;
@@ -868,6 +907,17 @@ fn run_dep_build_script(
     let rows = blaze_world::script_setting::pinned_table(WASM64_TARGET, shipped, alloc);
     let mut table: std::vec::Vec<blaze_build_script::probe::Row> = rows.as_slice().to_vec();
     table.sort_unstable_by_key(|r| r.key);
+    let files_digest = members
+        .iter()
+        .find(|(id, _, _)| *id == unit.package)
+        .and_then(|(_, dir, _)| {
+            let pkg_dir = if dir.is_empty() {
+                checkout.path().to_path_buf()
+            } else {
+                checkout.path().join(dir)
+            };
+            script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).ok()
+        });
     let setting = Setting {
         store,
         target: WASM64_TARGET,
@@ -878,6 +928,7 @@ fn run_dep_build_script(
         mode: Mode::Check,
         native: None,
         spawn_setting: Arc::new(SpawnSetting::off()),
+        files_digest: files_digest.as_deref(),
     };
     let mut side_cfg: AVec<'_, CfgAtom<'_>> = OwnVec::with_capacity_in(tc_cfg.len(), alloc);
     for (k, v) in tc_cfg {
@@ -1433,7 +1484,10 @@ fn compile_unit_in<'a>(
         bstd: role_id(Role::Bstd),
     };
 
-    // 5. Resolve all crates together with `blaze-scope`.
+    // 5. Resolve all crates together with `blaze-scope`, reusing persisted disk records for
+    //    `wasm64-blaze-wasip1` sysroot crates (`krate >= tc_base`) under
+    //    `<store>/wasm64-sysroot-v1/<tc_id>/` (Rule 51: content-addressed records on disk, page
+    //    cache only, zero in-memory cross-command cache).
     let sources: &'a Wasm64Sources<'a, 'a> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         Wasm64Sources {
             origins,
@@ -1446,13 +1500,25 @@ fn compile_unit_in<'a>(
         frame,
     ));
     let par = CompilePar::new();
-    let names = resolve_crates(crates.as_slice(), sysroot, sources, &par, bump)
-        .map_err(|e| std::format!("blaze-scope resolve failed: {e}"))?;
+    let sysroot_dir = store.join("wasm64-sysroot-v1").join(std::format!("{tc_id}"));
+    let mut sysroot_kept = Wasm64SysrootKept::open(&sysroot_dir, tc_base, crates.as_slice(), bump);
+    let sysroot_guard = if sysroot_kept.has_missing() {
+        let guard = SYSROOT_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        sysroot_kept = Wasm64SysrootKept::open(&sysroot_dir, tc_base, crates.as_slice(), bump);
+        if sysroot_kept.has_missing() { Some(guard) } else { None }
+    } else {
+        None
+    };
+    let ready = Ready::serial(core::time::Duration::from_secs(120));
+    let (solved, _) = resolve_kept(crates.as_slice(), sysroot, sources, &par, &ready, &sysroot_kept, bump)
+        .map_err(|(at, e)| std::format!("blaze-scope resolve failed on `{}`: {e:?}", crates[at].name))?;
 
     // Extract proc-macro exports in declaration order (matching `_DECLS`) if in ProcMacro mode.
     let mut exported_macros: std::vec::Vec<Exported> = std::vec::Vec::new();
-    if mode == CompileMode::ProcMacro {
-        let pm_crate = names.krate(0);
+    if mode == CompileMode::ProcMacro
+        && let Some(Solved::Solved(pm_scope)) = solved.first()
+    {
+        let pm_crate = pm_scope.names;
         if let Some((_, root_decls)) = pm_crate.decls.get(&pm_crate.root) {
             let mut idx = 0u32;
             for decl in root_decls.items.iter() {
@@ -1481,41 +1547,79 @@ fn compile_unit_in<'a>(
         }
     }
 
-    // 6. Encode names & items records into `bump` and construct `blaze-ladder` `Records`.
+    // 6. Collect names & items records into `bump`, atomically persist newly-solved sysroot
+    //    records, and construct `blaze-ladder` `Records`.
+    let fresh_sysroot = sysroot_kept.take_fresh();
     let mut kept = KeptRecords {
         names: OwnVec::with_capacity_in(crates.len(), alloc),
         items: OwnVec::with_capacity_in(crates.len(), alloc),
         files: OwnVec::with_capacity_in(crates.len(), alloc),
+        tc_packs: OwnVec::with_capacity_in(crates.len(), alloc),
+        arena,
         expansions: OwnVec::with_capacity_in(crates.len(), alloc),
         origins: OwnVec::with_capacity_in(crates.len(), alloc),
     };
-    for c in names.crates().iter() {
-        let nr = names_record::encode(c, alloc)
-            .map_err(|e| std::format!("names_record encode for `{}`: {e:?}", c.name))?;
-        kept.names.push(aligned(&nr, bump));
-        let ir = items_record::encode_with(c, &names, alloc)
-            .map_err(|e| std::format!("items_record encode for `{}`: {e:?}", c.name))?;
-        kept.items.push(aligned(&ir, bump));
-        let mut f_map = blaze_own::BTreeMap::new_in(alloc);
-        for f in c.files.iter() {
-            f_map.insert(&*bump.alloc_str(f.package.as_str()), f.text);
-        }
-        kept.files.push(f_map);
-        let mut e_map = blaze_own::BTreeMap::new_in(alloc);
-        let mut o_map = blaze_own::BTreeMap::new_in(alloc);
-        for (call, e) in c.expansions.iter() {
-            if let Some(m) = e.made.as_ref() {
-                e_map.insert(*call, m.text);
-                let bytes: &'a [u8] = match &m.origins {
-                    Ok(b) => bump.alloc_slice_copy(b),
-                    Err(_) => &[],
-                };
-                o_map.insert(*call, bytes);
+    for (krate, entry) in solved.iter().enumerate() {
+        let tc_pack = (krate >= tc_base).then(|| tc_units[krate - tc_base].pack);
+        kept.tc_packs.push(tc_pack);
+        match entry {
+            Solved::Solved(scope) => {
+                let c = scope.names;
+                if let Some(fresh) = fresh_sysroot.get(&krate) {
+                    kept.names.push(aligned(&fresh.names, bump));
+                    kept.items.push(aligned(&fresh.items, bump));
+                } else {
+                    let nr = names_record::encode(c, alloc)
+                        .map_err(|e| std::format!("names_record encode for `{}`: {e:?}", c.name))?;
+                    kept.names.push(aligned(&nr, bump));
+                    let ir = items_record::encode(c, alloc)
+                        .map_err(|e| std::format!("items_record encode for `{}`: {e:?}", c.name))?;
+                    kept.items.push(aligned(&ir, bump));
+                }
+                let mut f_map = blaze_own::BTreeMap::new_in(alloc);
+                for f in c.files.iter() {
+                    f_map.insert(&*bump.alloc_str(f.package.as_str()), f.text);
+                }
+                kept.files.push(f_map);
+                let mut e_map = blaze_own::BTreeMap::new_in(alloc);
+                let mut o_map = blaze_own::BTreeMap::new_in(alloc);
+                for (call, e) in c.expansions.iter() {
+                    if let Some(m) = e.made.as_ref() {
+                        e_map.insert(*call, m.text);
+                        let bytes: &'a [u8] = match &m.origins {
+                            Ok(b) => bump.alloc_slice_copy(b),
+                            Err(_) => &[],
+                        };
+                        o_map.insert(*call, bytes);
+                    }
+                }
+                if krate >= tc_base
+                    && let Some(fresh) = fresh_sysroot.get(&krate)
+                {
+                    let exp_bytes = encode_expansions_table(&e_map, &o_map);
+                    let key_hex = hex_content_id(crates[krate].key.0);
+                    let _ = publish_sysroot_crate(&sysroot_dir, &key_hex, fresh, &exp_bytes);
+                }
+                kept.expansions.push(e_map);
+                kept.origins.push(o_map);
+            }
+            Solved::Found { .. } => {
+                let cached = sysroot_kept.loaded_at(krate).ok_or_else(|| {
+                    std::format!("cached sysroot crate `{}` missing loaded records", crates[krate].name)
+                })?;
+                kept.names.push(cached.names);
+                kept.items.push(cached.items);
+                // Toolchain files are served directly from `tc_packs[krate]` (zero extra copy).
+                kept.files.push(blaze_own::BTreeMap::new_in(alloc));
+                let mut e_map = blaze_own::BTreeMap::new_in(alloc);
+                let mut o_map = blaze_own::BTreeMap::new_in(alloc);
+                decode_expansions_table(cached.expansions, &mut e_map, &mut o_map)?;
+                kept.expansions.push(e_map);
+                kept.origins.push(o_map);
             }
         }
-        kept.expansions.push(e_map);
-        kept.origins.push(o_map);
     }
+    drop(sysroot_guard);
 
     let keys: &'a [CrateItemKey] = {
         let mut v: OwnVec<CrateItemKey, Bump<'a>> = OwnVec::with_capacity_in(crates.len(), bump);
@@ -1595,8 +1699,10 @@ fn emit_wasm64_from_records<'n>(
     let nr = NamesRecords { records, frame: infer_frame, lang_crates, body_sources: Some(body_sources) };
     let builder = wasm64_builder(tc_id);
 
-    // 7. Single-pass LIR -> Wasm64 compilation!
-    let mut wasm_out: AVec<'n, u8> = OwnVec::new_in(alloc);
+    // 7. Single-pass LIR -> Wasm64 compilation! Use `heap_alloc` for the growing worklist,
+    //    `Vec<OwnedFunc>`, and emitted wasm buffer so reallocations free old backing storage
+    //    instead of accumulating inside the bump-only scratch frame.
+    let mut wasm_out: AVec<'static, u8> = OwnVec::new_in(heap_alloc);
     match mode {
         CompileMode::BuildScript => {
             let roots = run_roots(nr.records, nr.lang_crates, builder.settings.panic, &[], nr.frame, heap_alloc, alloc)
@@ -1628,7 +1734,7 @@ fn emit_wasm64_from_records<'n>(
                 &opts,
                 default_wasm64_import,
                 &mut wasm_out,
-                alloc,
+                heap_alloc,
             )
             .map_err(|e| std::format!("wasm64 build-script compile failed: {e}"))?;
         }
@@ -1692,7 +1798,7 @@ fn emit_wasm64_from_records<'n>(
                 &opts,
                 default_wasm64_import,
                 &mut wasm_out,
-                alloc,
+                heap_alloc,
             )
             .map_err(|e| std::format!("wasm64 proc-macro compile failed: {e}"))?;
         }
@@ -1798,6 +1904,217 @@ fn publish_proc_macro_module(
         }
         let _ = std::fs::remove_dir_all(&stage);
         return Err(std::format!("publish {}: {err}", final_dir.display()));
+    }
+    Ok(())
+}
+
+struct CachedSysrootCrate<'a> {
+    exports: &'a [u8],
+    inner: &'a [u8],
+    read: &'a [u8],
+    names: &'a [u8],
+    items: &'a [u8],
+    expansions: &'a [u8],
+}
+
+#[derive(Default)]
+struct FreshSysrootCrate {
+    exports: std::vec::Vec<u8>,
+    inner: std::vec::Vec<u8>,
+    read: std::vec::Vec<u8>,
+    names: std::vec::Vec<u8>,
+    items: std::vec::Vec<u8>,
+}
+
+/// Persisted disk record store for resolved `wasm64-blaze-wasip1` sysroot crates
+/// (`<store>/wasm64-sysroot-v1/<tc_id>/<crate_key_hex>/`). Follows Rule 51: content-addressed
+/// records written once via atomic staging-dir rename, read in place via the kernel page cache,
+/// and verified by `resolve_kept`'s read-list check (`blaze_scope::asked::check`).
+struct Wasm64SysrootKept<'a> {
+    tc_base: usize,
+    loaded: std::vec::Vec<Option<CachedSysrootCrate<'a>>>,
+    fresh: std::sync::Mutex<HashMap<usize, FreshSysrootCrate>>,
+}
+
+impl<'a> Wasm64SysrootKept<'a> {
+    fn open(sysroot_dir: &Path, tc_base: usize, crates: &[CrateInput<'_>], bump: Bump<'a>) -> Self {
+        let mut loaded = std::vec::Vec::with_capacity(crates.len());
+        for (krate, input) in crates.iter().enumerate() {
+            if krate < tc_base {
+                loaded.push(None);
+                continue;
+            }
+            let dir = sysroot_dir.join(hex_content_id(input.key.0));
+            let rec = (|| -> Option<CachedSysrootCrate<'a>> {
+                let exports = std::fs::read(dir.join("exports.bin")).ok()?;
+                let inner = std::fs::read(dir.join("inner.bin")).ok()?;
+                let read = std::fs::read(dir.join("read.bin")).ok()?;
+                let names = std::fs::read(dir.join("names.bin")).ok()?;
+                let items = std::fs::read(dir.join("items.bin")).ok()?;
+                let expansions = std::fs::read(dir.join("expansions.bin")).ok()?;
+                Some(CachedSysrootCrate {
+                    exports: aligned(&exports, bump),
+                    inner: aligned(&inner, bump),
+                    read: aligned(&read, bump),
+                    names: aligned(&names, bump),
+                    items: aligned(&items, bump),
+                    expansions: bump.alloc_slice_copy(&expansions),
+                })
+            })();
+            loaded.push(rec);
+        }
+        Self { tc_base, loaded, fresh: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    fn has_missing(&self) -> bool {
+        self.loaded.iter().skip(self.tc_base).any(Option::is_none)
+    }
+
+    fn loaded_at(&self, krate: usize) -> Option<&CachedSysrootCrate<'a>> {
+        self.loaded.get(krate)?.as_ref()
+    }
+
+    fn take_fresh(&self) -> HashMap<usize, FreshSysrootCrate> {
+        let mut guard = self.fresh.lock().unwrap_or_else(|p| p.into_inner());
+        core::mem::take(&mut *guard)
+    }
+}
+
+impl Kept for Wasm64SysrootKept<'_> {
+    fn find(&self, krate: usize) -> Option<(&[u8], &[u8], &[u8])> {
+        let c = self.loaded.get(krate)?.as_ref()?;
+        Some((c.exports, c.inner, c.read))
+    }
+
+    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[u8]) {
+        if krate < self.tc_base {
+            return;
+        }
+        let mut guard = self.fresh.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = guard.entry(krate).or_default();
+        entry.exports = record.to_vec();
+        entry.inner = inner.to_vec();
+        entry.read = read.to_vec();
+    }
+
+    fn keeps_names(&self) -> bool {
+        true
+    }
+
+    fn names(&self, krate: usize, names: &[u8]) {
+        if krate < self.tc_base {
+            return;
+        }
+        let mut guard = self.fresh.lock().unwrap_or_else(|p| p.into_inner());
+        guard.entry(krate).or_default().names = names.to_vec();
+    }
+
+    fn keeps_items(&self) -> bool {
+        true
+    }
+
+    fn items(&self, krate: usize, items: &[u8]) {
+        if krate < self.tc_base {
+            return;
+        }
+        let mut guard = self.fresh.lock().unwrap_or_else(|p| p.into_inner());
+        guard.entry(krate).or_default().items = items.to_vec();
+    }
+}
+
+fn hex_content_id(id: ContentId) -> std::string::String {
+    let mut s = std::string::String::with_capacity(64);
+    for b in id.0 {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn encode_expansions_table(
+    expansions: &blaze_own::BTreeMap<LibKey, &str, Alloc<'_>>,
+    origins: &blaze_own::BTreeMap<LibKey, &[u8], Alloc<'_>>,
+) -> std::vec::Vec<u8> {
+    let mut out = std::vec::Vec::new();
+    let count = expansions.len() as u32;
+    out.extend_from_slice(&count.to_le_bytes());
+    for (&call, &text) in expansions.iter() {
+        let orig = origins.get(&call).copied().unwrap_or(&[]);
+        out.extend_from_slice(&call.0.0);
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(orig.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(orig);
+    }
+    out
+}
+
+fn decode_expansions_table<'a>(
+    bytes: &'a [u8],
+    expansions: &mut blaze_own::BTreeMap<LibKey, &'a str, Alloc<'a>>,
+    origins: &mut blaze_own::BTreeMap<LibKey, &'a [u8], Alloc<'a>>,
+) -> Result<(), std::string::String> {
+    if bytes.len() < 4 {
+        return Err(std::string::String::from("truncated wasm64 sysroot expansions table"));
+    }
+    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let mut at = 4usize;
+    for _ in 0..count {
+        if at + 40 > bytes.len() {
+            return Err(std::string::String::from("truncated wasm64 sysroot expansion entry header"));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&bytes[at..at + 32]);
+        let key = LibKey(ContentId(id));
+        let tlen = u32::from_le_bytes([bytes[at + 32], bytes[at + 33], bytes[at + 34], bytes[at + 35]]) as usize;
+        let olen = u32::from_le_bytes([bytes[at + 36], bytes[at + 37], bytes[at + 38], bytes[at + 39]]) as usize;
+        at += 40;
+        if at + tlen + olen > bytes.len() {
+            return Err(std::string::String::from("truncated wasm64 sysroot expansion entry payload"));
+        }
+        let text = core::str::from_utf8(&bytes[at..at + tlen])
+            .map_err(|_| std::string::String::from("non-utf8 wasm64 sysroot expansion text"))?;
+        let orig = &bytes[at + tlen..at + tlen + olen];
+        at += tlen + olen;
+        expansions.insert(key, text);
+        origins.insert(key, orig);
+    }
+    Ok(())
+}
+
+fn publish_sysroot_crate(
+    sysroot_dir: &Path,
+    key_hex: &str,
+    fresh: &FreshSysrootCrate,
+    expansions: &[u8],
+) -> Result<(), std::string::String> {
+    if fresh.exports.is_empty() || fresh.names.is_empty() || fresh.items.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(sysroot_dir)
+        .map_err(|e| std::format!("create {}: {e}", sysroot_dir.display()))?;
+    let final_dir = sysroot_dir.join(key_hex);
+    if final_dir.join("expansions.bin").is_file() {
+        return Ok(());
+    }
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let stage = sysroot_dir.join(std::format!(".tmp.{key_hex}.{}.{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage)
+        .map_err(|e| std::format!("create {}: {e}", stage.display()))?;
+    std::fs::write(stage.join("exports.bin"), &fresh.exports)
+        .map_err(|e| std::format!("write exports.bin: {e}"))?;
+    std::fs::write(stage.join("inner.bin"), &fresh.inner)
+        .map_err(|e| std::format!("write inner.bin: {e}"))?;
+    std::fs::write(stage.join("read.bin"), &fresh.read)
+        .map_err(|e| std::format!("write read.bin: {e}"))?;
+    std::fs::write(stage.join("names.bin"), &fresh.names)
+        .map_err(|e| std::format!("write names.bin: {e}"))?;
+    std::fs::write(stage.join("items.bin"), &fresh.items)
+        .map_err(|e| std::format!("write items.bin: {e}"))?;
+    std::fs::write(stage.join("expansions.bin"), expansions)
+        .map_err(|e| std::format!("write expansions.bin: {e}"))?;
+    if std::fs::rename(&stage, &final_dir).is_err() {
+        let _ = std::fs::remove_dir_all(&stage);
     }
     Ok(())
 }

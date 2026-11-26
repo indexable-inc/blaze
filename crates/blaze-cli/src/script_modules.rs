@@ -31,11 +31,9 @@ use crate::work::{Did, Made, held_str};
 
 use crate::scripts::RanAs;
 
-// "2": the subject holds the run's placement (a native script's record is a host binary,
-// `target <host>` in its identity and `bin-sha256` its digest; tempo 2026-11-17: libproc,
-// reth-mdbx-sys and librocksdb-sys, placed native, were looked up as wasm modules and refused
-// while their native records stood in the store).
-const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 2";
+// "3": path/workspace-member build scripts include their `files <sha256>` digest (rule 21) so
+// editing `build.rs` invalidates the module lookup and distinct path packages never collide.
+const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 3";
 const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 1";
 const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
@@ -43,11 +41,17 @@ const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 pub(crate) const RULE: &str = "script_modules.rs";
 
 /// What a build script's module is named by: the run's placement (D112: a wasm module or a
-/// host binary), the script unit's package, version and features (sorted and without repeats,
-/// as the graph holds them), each field length-prefixed.
-pub(crate) fn subject(ran_as: RanAs, package: &str, version: &str, features: &[&str]) -> ContentId {
+/// host binary), the script unit's package, version, optional path-package `files` digest
+/// (rule 21), and features (sorted and without repeats, as the graph holds them), each field
+/// length-prefixed.
+pub(crate) fn subject(ran_as: RanAs, package: &str, version: &str, features: &[&str], files: Option<&str>) -> ContentId {
     let mut text = std::vec::Vec::new_in(std::alloc::Global);
     text.push(ran_as as u8);
+    text.push(u8::from(files.is_some()));
+    if let Some(hex) = files {
+        text.extend_from_slice(&(hex.len() as u64).to_le_bytes());
+        text.extend_from_slice(hex.as_bytes());
+    }
     for field in [package, version].into_iter().chain(features.iter().copied()) {
         text.extend_from_slice(&(field.len() as u64).to_le_bytes());
         text.extend_from_slice(field.as_bytes());
@@ -79,15 +83,17 @@ pub(crate) struct ScriptModule {
     pub package: &'static str,
     pub version: &'static str,
     pub features: std::vec::Vec<&'static str, std::alloc::Global>,
+    pub files: Option<std::string::String>,
 }
 
-/// What one lookup is for: the run's placement and the script unit's package, version and
-/// features.
+/// What one lookup is for: the run's placement and the script unit's package, version,
+/// features, and optional path-package `files` digest.
 pub(crate) struct Wanted<'w> {
     pub ran_as: RanAs,
     pub package: &'w str,
     pub version: &'w str,
     pub features: &'w [&'w str],
+    pub files: Option<&'w str>,
 }
 
 /// One build-script module lookup: the record `<home>/.blaze/v2/build-script/modules/<key>`
@@ -110,11 +116,11 @@ pub(crate) fn run<'b>(
         return Ok(Did::Hole(refused("no home: the module store is under it"), "the build-script module store is under the home, and HOME is not set"));
     };
     let store = std::path::Path::new(home).join(".blaze/v2");
-    let Wanted { ran_as, package, version, features } = wanted;
+    let Wanted { ran_as, package, version, features, files } = wanted;
     let host = crate::graph::TRIPLE;
     let (found, digest_file) = match ran_as {
-        RanAs::Wasm => (blaze_proc_macro::script_unit::module_of(&store, package, version, features), "wasm-sha256"),
-        RanAs::Native => (blaze_proc_macro::script_unit::module_of_native(&store, package, version, features, host), "bin-sha256"),
+        RanAs::Wasm => (blaze_proc_macro::script_unit::module_of_files(&store, package, version, features, files), "wasm-sha256"),
+        RanAs::Native => (blaze_proc_macro::script_unit::module_of_native_files(&store, package, version, features, host, files), "bin-sha256"),
     };
     let unread = |error: &blaze_proc_macro::script_unit::ModuleLookupError| {
         let words = bstd::mem::format_in!(held, "the build script of {package} {version}: {error}");
@@ -147,7 +153,7 @@ pub(crate) fn run<'b>(
                 }
             }
         }
-        let asked = asked_lines(ran_as, package, version, features, host);
+        let asked = asked_lines(ran_as, package, version, features, host, files);
         let nearest = match blaze_proc_macro::script_unit::records_named(&store, package, version) {
             Ok(nearest) => nearest,
             Err(error) => return Ok(unread(&error)),
@@ -196,10 +202,13 @@ pub(crate) fn run<'b>(
 /// name, version, the sorted features and, for a native run, `target <host>`; for a wasm run,
 /// the process shim this binary answers (`script_unit::shim_line`), so a module built with
 /// another is named by its `shim` line.
-pub(crate) fn asked_lines(ran_as: RanAs, package: &str, version: &str, features: &[&str], host: &str) -> std::vec::Vec<std::string::String> {
+pub(crate) fn asked_lines(ran_as: RanAs, package: &str, version: &str, features: &[&str], host: &str, files: Option<&str>) -> std::vec::Vec<std::string::String> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let mut lines = std::vec![std::format!("name {package}"), std::format!("version {version}"), std::format!("features {}", sorted.join(","))];
+    if let Some(hex) = files {
+        lines.push(std::format!("files {hex}"));
+    }
     match ran_as {
         RanAs::Native => lines.push(std::format!("target {host}")),
         RanAs::Wasm => lines.push(blaze_proc_macro::script_unit::shim_line()),
@@ -233,24 +242,26 @@ mod tests {
     fn a_lookup_names_the_line_that_differs() {
         let libproc = "blaze build-script module 3\nname libproc\nversion 0.14.11\nfeatures \ntoolchain nightly-2026-10-27\ntarget aarch64-apple-darwin\nbuilder bootstrap\n";
         let host = "aarch64-apple-darwin";
-        let native = asked_lines(RanAs::Native, "libproc", "0.14.11", &[], host);
+        let native = asked_lines(RanAs::Native, "libproc", "0.14.11", &[], host, None);
         assert_eq!(differing(&native, RanAs::Native, libproc).count(), 0);
         let shim = blaze_proc_macro::script_unit::shim_line();
-        let wasm = asked_lines(RanAs::Wasm, "libproc", "0.14.11", &[], host);
+        let wasm = asked_lines(RanAs::Wasm, "libproc", "0.14.11", &[], host, None);
         let said: std::vec::Vec<_> = differing(&wasm, RanAs::Wasm, libproc).collect();
         assert_eq!(said, [std::format!("no `{shim}` line"), "target aarch64-apple-darwin (a native host binary; asked: a wasm module)".to_owned()]);
         let nix = std::format!("blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\n{shim}\nbuilder bootstrap\n");
-        let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["time", "default", "ioctl", "memoffset", "socket"], host);
+        let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["time", "default", "ioctl", "memoffset", "socket"], host, None);
         let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, &nix).collect();
         assert_eq!(said, ["features default,ioctl,memoffset,socket (asked: features default,ioctl,memoffset,socket,time)"]);
         // A module built with another process shim (before `found`, guest/script_process.rs)
         // is named by that line: what its rebuild changes.
         let stale = "blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\nshim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6\nbuilder bootstrap\n";
-        let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["default", "ioctl", "memoffset", "socket"], host);
+        let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["default", "ioctl", "memoffset", "socket"], host, None);
         let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, stale).collect();
         assert_eq!(said, [std::format!("shim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6 (asked: {shim})")]);
         assert_eq!(differing(&asked, RanAs::Wasm, &nix).count(), 0, "CONTROL: the record with this host's shim answers the ask");
         // A native and a wasm ask of one script are two lookups.
-        assert_ne!(subject(RanAs::Native, "libproc", "0.14.11", &[]), subject(RanAs::Wasm, "libproc", "0.14.11", &[]));
+        assert_ne!(subject(RanAs::Native, "libproc", "0.14.11", &[], None), subject(RanAs::Wasm, "libproc", "0.14.11", &[], None));
+        // Distinct path-package file digests produce distinct lookup subjects (rule 21).
+        assert_ne!(subject(RanAs::Wasm, "app", "0.1.0", &[], Some("aaa")), subject(RanAs::Wasm, "app", "0.1.0", &[], Some("bbb")));
     }
 }

@@ -215,10 +215,17 @@ pub fn lay<'f, 'l>(
                 // stamp, so the next sweep proves the crate unchanged by stats alone (rule 77).
                 if member.lib.iter().any(|lib| lib.proc_macro) {
                     crate::macro_files::read_row(&cx, root, stamps, member.dir.as_str(), rows, frame)?;
+                } else if let Some(build) = &member.build {
+                    let rel = if member.dir.is_empty() {
+                        build.root.as_str()
+                    } else {
+                        build.root.as_str().strip_prefix(member.dir.as_str()).and_then(|s| s.strip_prefix('/')).unwrap_or(build.root.as_str())
+                    };
+                    crate::macro_files::read_script_files(&cx, root, stamps, member.dir.as_str(), rel, rows, frame)?;
                 }
             }
             // Non-member path packages: keep each target root's edition for the file walk and
-            // track proc-macro source trees in the sweep leaf table (rule 21).
+            // track proc-macro and build-script source trees in the sweep leaf table (rule 21).
             for pkg in units.path_packages.iter() {
                 let edition = syntax_of(pkg.edition.syntax).byte();
                 for target in pkg.lib.iter().chain(pkg.bins.iter()).chain(pkg.build.iter()) {
@@ -226,6 +233,13 @@ pub fn lay<'f, 'l>(
                 }
                 if pkg.lib.iter().any(|lib| lib.proc_macro) {
                     crate::macro_files::read_row(&cx, root, stamps, pkg.dir.as_str(), rows, frame)?;
+                } else if let Some(build) = &pkg.build {
+                    let rel = if pkg.dir.is_empty() {
+                        build.root.as_str()
+                    } else {
+                        build.root.as_str().strip_prefix(pkg.dir.as_str()).and_then(|s| s.strip_prefix('/')).unwrap_or(build.root.as_str())
+                    };
+                    crate::macro_files::read_script_files(&cx, root, stamps, pkg.dir.as_str(), rel, rows, frame)?;
                 }
             }
         }

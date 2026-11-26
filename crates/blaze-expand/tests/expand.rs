@@ -1773,3 +1773,30 @@ fn an_include_s_read_list_entry_is_root_relative() {
         );
     }
 }
+
+/// An expression fragment with leading outer attributes (`#[cfg(windows)] "a".parse().unwrap()`,
+/// as in `vec![#[cfg(windows)] ...]`) keeps the outer attributes OUTSIDE any synthetic
+/// parentheses so `#[cfg(..)]` strips the whole element instead of leaving an empty `PAREN_EXPR`.
+#[test]
+fn expr_fragment_keeps_outer_attrs_outside_synthetic_parens() {
+    let cx = TestCx::new();
+    let def = rules("($($x:expr),+ $(,)?) => { [$($x),+] }", 1);
+    let exp = call_fn(
+        &def,
+        "#[cfg(unix)] \"a\".parse().unwrap(), #[cfg(windows)] \"b\".parse().unwrap(), #[allow(unused)] 1",
+        &cx,
+    );
+    let shown = show(&exp.tokens);
+    assert!(
+        shown.contains("# [ cfg ( windows ) ] ( \"b\" . parse ( ) . unwrap ( ) )"),
+        "outer #[cfg(windows)] must stay outside synthetic parens: {shown}"
+    );
+    assert!(
+        !shown.contains("( # [ cfg ( windows ) ]"),
+        "outer #[cfg(windows)] must not be wrapped inside synthetic parens: {shown}"
+    );
+    assert!(
+        shown.contains("# [ allow ( unused ) ] 1"),
+        "leaf body after outer attr needs no synthetic parens: {shown}"
+    );
+}

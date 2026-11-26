@@ -2291,9 +2291,6 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     /// The first STRICTER relation this flow used where the precise one could not be made
     /// ([`Lowered::coarse`]): a `Cell` because the type walks that meet one take `&self`.
     coarse: core::cell::Cell<Option<Refusal>>,
-    /// Pattern-bound locals extracted directly from an ADT variant field (`(pat, adt, variant, field)`),
-    /// so `call_through_value` can read the field's declared `dyn Fn*` regions (e.g. `Provider::Handler(handler)`).
-    local_field_source: Vec<(PatId, ItemKey, u32, u32), A>,
     /// Places projected from an ADT field (`(place, adt, variant, field)`), so pattern bindings
     /// extracting a fn pointer (e.g. `let Some(dup) = self.duplicator`) can trace back to the
     /// field's declared region column.
@@ -2420,7 +2417,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             awaiting: Vec::new_in(alloc),
             awaited: Vec::new_in(alloc),
             coarse: core::cell::Cell::new(None),
-            local_field_source: Vec::new_in(alloc),
             place_field_source: Vec::new_in(alloc),
             local_fn_field: Vec::new_in(alloc),
             const_init: false,
@@ -9157,43 +9153,66 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         true
     }
 
-    /// If binding `p` was directly extracted from a struct or tuple-struct field pattern
-    /// anywhere in the enclosing body (including an outer closure/block when `self.in_nested`)
-    /// and is never reassigned or mutably borrowed, returns `Some((adt, variant, field_idx))`.
+    /// If `p` is a `Pat::Bind` directly bound from a unique ADT/enum variant field in
+    /// `self.body.pats` (e.g. `Sorter::ByName(cmp)` or `S { cmp }`) and never reassigned or
+    /// mutably borrowed, returns `Some((adt, variant, field_idx))`. Scans `self.body.pats`
+    /// directly so nested closures capturing `p` see the same declared field signature as the
+    /// enclosing body.
     fn pat_field_source(&self, p: PatId) -> Result<Option<(ItemKey, u32, u32)>, Refusal> {
-        if !self.local_is_immutable(p) {
+        if !matches!(self.body.pats.get(p.ix()), Some(Pat::Bind { .. })) || !self.local_is_immutable(p) {
             return Ok(None);
         }
-        if let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p) {
-            return Ok(Some((adt, variant, field)));
-        }
-        for (i, pat) in self.body.pats.iter().enumerate() {
-            let Ok(idx) = u32::try_from(i) else { continue };
-            let pid = PatId(idx);
-            match *pat {
-                Pat::Struct { fields, .. } => {
-                    for f in self.body.field_pats.get(fields.range()).unwrap_or(&[]) {
-                        if f.pat == p
-                            && let Ok((adt, variant)) = self.variant_of(pid)
-                            && let Some(fi) = self.facts.field(adt, variant, f.name)
-                        {
-                            return Ok(Some((adt, variant, fi)));
-                        }
-                    }
+        let matches_target = |mut sp: PatId| -> bool {
+            for _ in 0..8 {
+                if sp == p {
+                    return true;
                 }
+                match self.body.pats.get(sp.ix()) {
+                    Some(&Pat::Ref { inner, .. }) => sp = inner,
+                    _ => return false,
+                }
+            }
+            false
+        };
+        let mut found: Option<(ItemKey, u32, u32)> = None;
+        for (i, pat) in self.body.pats.iter().enumerate() {
+            let Ok(idx) = u32::try_from(i) else { break };
+            let parent = PatId(idx);
+            match *pat {
                 Pat::TupleStruct { elems, rest, .. } => {
                     let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
-                    if let Some(j) = es.iter().position(|&sp| sp == p)
-                        && let Ok((adt, variant)) = self.variant_of(pid)
-                        && let Some(n) = self.facts.field_count(adt, variant)
-                    {
-                        return Ok(Some((adt, variant, field_index(j, es.len(), n as usize, rest))));
+                    for (j, &sp) in es.iter().enumerate() {
+                        if !matches_target(sp) {
+                            continue;
+                        }
+                        let Ok((adt, variant)) = self.variant_of(parent) else { continue };
+                        let Some(n) = self.facts.field_count(adt, variant) else { continue };
+                        let fi = field_index(j, es.len(), n as usize, rest);
+                        let src = (adt, variant, fi);
+                        if found.is_some_and(|prev| prev != src) {
+                            return Ok(None);
+                        }
+                        found = Some(src);
+                    }
+                }
+                Pat::Struct { fields, .. } => {
+                    for f in self.body.field_pats.get(fields.range()).unwrap_or(&[]) {
+                        if !matches_target(f.pat) {
+                            continue;
+                        }
+                        let Ok((adt, variant)) = self.variant_of(parent) else { continue };
+                        let Some(fi) = self.facts.field(adt, variant, f.name) else { continue };
+                        let src = (adt, variant, fi);
+                        if found.is_some_and(|prev| prev != src) {
+                            return Ok(None);
+                        }
+                        found = Some(src);
                     }
                 }
                 _ => {}
             }
         }
-        Ok(None)
+        Ok(found)
     }
 
     /// Returns the unique initializer/scrutinee expression that introduces binding `p` (via
@@ -10379,9 +10398,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, sp),
             };
-            if matches!(spat, Pat::Bind { .. }) {
-                self.local_field_source.push((sp, adt, variant, fi));
-            }
             let peels = matches!(spat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. });
             let own = match self.ck.pat_ty.get(sp.ix()) {
                 Some(&t) => t,
