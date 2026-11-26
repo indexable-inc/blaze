@@ -407,3 +407,65 @@ fn impl_where_projection_clause_normalizes_lhs_and_rhs_aliases() {
     assert!(has_impl(node_types, true, impl_nt_adapter), "missing Adapter NodeTypes impl row: {rows:?}");
     assert!(has_impl(node_types, true, impl_nt_tempo), "missing TempoNode NodeTypes impl row: {rows:?}");
 }
+
+/// A caller where-clause on a rigid parameter alias (`C::Spec: SubMarker`, where `SubMarker: Marker`
+/// and no projection equality equates `C::Spec`) cannot match a ground row `&u8: Marker`, so the
+/// ground row still selects `impl Marker for &'static u8`. Twin: when the caller also equates
+/// `C::Spec = &u8`, the alias is no longer rigid and `&u8: Marker` stays `Selected::Generic`.
+#[test]
+fn rigid_param_alias_clause_does_not_shadow_ground_impl() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let p0 = fx.param(0);
+    let unit = fx.unit();
+    let u8_ = fx.u8();
+    let ru8 = fx.r(Mutbl::Not, u8_);
+
+    let marker = fx.tr("Marker", 1, Vec::new(), &[]);
+    let super_marker = fx.bound(marker, &[p0]);
+    let sub_marker = fx.tr("SubMarker", 1, std::vec![super_marker], &[]);
+    let provider = fx.tr("Provider", 1, Vec::new(), &["Spec"]);
+    let marker_ref = fx.imp("impl Marker for &u8", 0, ru8, Some((marker, &[])), &[], Vec::new());
+
+    let p0_marker = fx.bound(marker, &[p0]);
+    fx.func("need", 1, &[p0], unit, std::vec![p0_marker]);
+
+    let p0_prov = fx.bound(provider, &[p0]);
+    let p0_spec = fx.alias(provider, "Spec", &[p0]);
+    let spec_sub = fx.bound(sub_marker, &[p0_spec]);
+    let rigid_caller = fx.func("rigid_caller", 1, &[ru8], unit, std::vec![p0_prov, spec_sub]);
+
+    let p0_prov2 = fx.bound(provider, &[p0]);
+    let spec_eq = fx.proj(provider, &[p0], "Spec", ru8);
+    let spec_sub2 = fx.bound(sub_marker, &[p0_spec]);
+    let equated_caller = fx.func("equated_caller", 1, &[ru8], unit, std::vec![p0_prov2, spec_eq, spec_sub2]);
+    fx.finish();
+
+    let run = |owner: ItemKey| {
+        let mut b = Bb::new();
+        let x = b.param("x");
+        let f = b.path(&["need"]);
+        let lx = b.local(x);
+        let call = b.call(f, &[lx]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, owner, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        c.call_selections(call).to_vec()
+    };
+
+    let rigid_rows = run(rigid_caller);
+    assert_eq!(rigid_rows.len(), 1, "{rigid_rows:?}");
+    assert!(
+        matches!(rigid_rows[0].selected, Selected::Impl { imp, .. } if imp == marker_ref),
+        "rigid `C::Spec: SubMarker` must not shadow ground `&u8: Marker`: {rigid_rows:?}"
+    );
+
+    let equated_rows = run(equated_caller);
+    assert_eq!(equated_rows.len(), 1, "{equated_rows:?}");
+    assert_eq!(
+        equated_rows[0].selected,
+        Selected::Generic,
+        "TWIN: equated `C::Spec = &u8` with `C::Spec: SubMarker` may shadow `&u8: Marker`: {equated_rows:?}"
+    );
+}
