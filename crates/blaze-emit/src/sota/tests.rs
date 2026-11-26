@@ -2327,6 +2327,87 @@ mod std_readiness_tests {
         assert_eq!(unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(5), 45);
     }
 
+    /// Regression test for the O(S^3) hang in `pack_slots` (Wave 7 Lane 2):
+    /// 1. 2,048 mutually-live slots must pack disjointly without quadratic re-scanning.
+    /// 2. Non-monotone conflicting intervals with gaps and mixed alignments must still
+    ///    receive exact deterministic first-fit offsets.
+    #[test]
+    fn pack_slots_2048_mutually_live_and_gap_reuse() {
+        let alloc = test_alloc();
+        // 1. 2,048 mutually-live 8-byte slots (no `SlotDead`).
+        let n_slots: usize = 2048;
+        let func_big = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let zero = b.iconst(Ty::I64, 0);
+            let mut ptrs = blaze_own::Vec::with_capacity_in(n_slots, alloc);
+            for _ in 0..n_slots {
+                let s = b.slot(8, 3, SlotKind::Named);
+                let p = b.slot_addr(s);
+                b.store(Flags::NONE, zero, p, 0, MemAttrs::aligned(3));
+                ptrs.push(p);
+            }
+            let mut acc = zero;
+            for &p in ptrs.iter() {
+                let v = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                acc = b.binary(Op::Add, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed_big = crate::pass::frame::pack_slots(func_big.view(), 0, alloc).expect("packs 2048 slots");
+        assert_eq!(packed_big.end, (n_slots as u64) * 8);
+        let mut seen = blaze_own::Vec::with_capacity_in(n_slots, alloc);
+        for &off in packed_big.slot_at.iter() {
+            seen.push(off);
+        }
+        seen.sort_unstable();
+        for (i, &off) in seen.iter().enumerate() {
+            assert_eq!(off, (i as u32) * 8, "every mutually-live slot must get a unique 8-byte offset");
+        }
+
+        // 2. Non-monotone conflicting intervals & gap reuse:
+        //    - s0 (64 B, align 16): live first, then dead -> placed at 0..64.
+        //    - s1 (64 B, align 16): live overlapping s0 -> placed at 64..128.
+        //    - s2 (32 B, align 16): live after s0 is dead, overlapping s1 -> placed at 0..32 (before s1!).
+        //    - s3 (16 B, align 16): live overlapping BOTH s1 (64..128) and s2 (0..32) ->
+        //      conflicting intervals arrive out of order (s1 at 64, s2 at 0), sorted to [0..32, 64..128],
+        //      so first-fit MUST place s3 in the gap at 32..48!
+        let func_gap = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let s0 = b.slot(64, 4, SlotKind::Temp);
+            let s1 = b.slot(64, 4, SlotKind::Temp);
+            let s2 = b.slot(32, 4, SlotKind::Temp);
+            let s3 = b.slot(16, 4, SlotKind::Temp);
+            let zero = b.iconst(Ty::I64, 0);
+            b.slot_live(s0);
+            b.slot_live(s1);
+            b.slot_dead(s0);
+            b.slot_live(s2);
+            b.slot_live(s3);
+            b.slot_dead(s3);
+            b.slot_dead(s2);
+            b.slot_dead(s1);
+            b.ret(&[zero]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed_gap = crate::pass::frame::pack_slots(func_gap.view(), 0, alloc).expect("packs gap");
+        assert_eq!(packed_gap.slot_at[0], 0);
+        assert_eq!(packed_gap.slot_at[1], 64);
+        assert_eq!(packed_gap.slot_at[2], 0);
+        assert_eq!(packed_gap.slot_at[3], 32, "s3 must first-fit into the 32..64 gap between s2 and s1");
+        assert_eq!(packed_gap.end, 128);
+    }
+
     /// Regression test for the `crypto_bigint::Uint::<4>::from_be_slice` infinite loop:
     /// when `thread_jumps` folds a loop entry directly into a higher-indexed body block,
     /// the resulting CFG is valid SSA but non-RPO (`header > latch`). Both the full SOTA
