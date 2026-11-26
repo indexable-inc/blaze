@@ -2085,7 +2085,6 @@ fn layout_table(
             match disp {
                 ColDisplay::FileEntry | ColDisplay::Crate | ColDisplay::Process => icon_pad + 10.0,
                 ColDisplay::Status => 14.0,
-                ColDisplay::HumanTime => 11.0,
                 ColDisplay::FileSize if max_num > 0.0 || dust_max_bytes > 0 => SIZE_BAR_W + 10.0,
                 ColDisplay::Percent if max_num > 0.0 => SIZE_BAR_W + 10.0,
                 _ => 0.0,
@@ -2684,19 +2683,17 @@ fn layout_table(
                             }
                             ColDisplay::HumanTime => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));
-                                let max_ch = ((content_w - 11.0).max(m.cw * 2.0) / m.cw).floor().max(2.0) as usize;
+                                let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
                                 let txt = truncate_chars(&raw, max_ch);
-                                let txt_w = txt.chars().count() as f32 * m.cw;
-                                let tx = rx + content_w - txt_w;
-                                if let Value::Date(dt) = cell {
-                                    let age_secs = (now_ns.saturating_sub(dt.utc_ns)).max(0) as u64 / 1_000_000_000;
-                                    let (txt_col, dot_col) = theme::recency_heat_color(age_secs);
-                                    let dot_x = (tx - 7.5).max(rx + 2.5);
-                                    scene.over_circle(dot_x, ty + m.ch * 0.52, 2.2, dot_col, clip_id);
-                                    scene.text(tx, ty, txt, txt_col, false, false, clip_id);
+                                let tx = rx + content_w - txt.chars().count() as f32 * m.cw;
+                                let txt_col = if let Value::Date(dt) = cell {
+                                    let age_secs =
+                                        (now_ns.saturating_sub(dt.utc_ns)).max(0) as u64 / 1_000_000_000;
+                                    theme::recency_heat_color(age_secs)
                                 } else {
-                                    scene.text(tx, ty, txt, theme::INK_3, false, false, clip_id);
-                                }
+                                    theme::INK_3
+                                };
+                                scene.text(tx, ty, txt, txt_col, false, false, clip_id);
                             }
                             _ => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));

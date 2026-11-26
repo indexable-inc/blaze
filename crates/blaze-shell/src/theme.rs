@@ -169,15 +169,13 @@ fn lerp_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     ]
 }
 
-/// Smooth $\log_2$-scale thermal recency heatmap for timestamps (`modified` / `ColDisplay::HumanTime`).
-///
-/// Returns `(text_color, indicator_dot_color)`:
+/// Smooth $\log_2$-scale thermal recency heatmap color for timestamps (`modified` / `ColDisplay::HumanTime`):
 /// - `just now` / minutes (`heat ~ 0.85..1.0`): ember coral-red (`#F26457`)
 /// - hours (`heat ~ 0.55..0.85`, e.g. `5h ago`): warm blaze orange (`#E88B48`)
 /// - days (`heat ~ 0.30..0.55`, e.g. `3d ago`): warm amber-gold (`#D9AF62`)
 /// - weeks (`heat ~ 0.15..0.30`, e.g. `13d ago`): warm stone (`#9C978E`)
 /// - months / years (`heat < 0.15`): cool muted slate (`#666A74`)
-pub fn recency_heat_color(age_secs: u64) -> ([f32; 4], [f32; 4]) {
+pub fn recency_heat_color(age_secs: u64) -> [f32; 4] {
     let h = blaze_dust::recency_heat(age_secs);
     let cold = rgb(0x66, 0x6a, 0x74);
     let stone = rgb(0x9c, 0x97, 0x8e);
@@ -185,7 +183,7 @@ pub fn recency_heat_color(age_secs: u64) -> ([f32; 4], [f32; 4]) {
     let orange = rgb(0xe8, 0x8b, 0x48);
     let hot = rgb(0xf2, 0x64, 0x57);
 
-    let text = if h < 0.22 {
+    if h < 0.22 {
         lerp_rgba(cold, stone, h / 0.22)
     } else if h < 0.45 {
         lerp_rgba(stone, amber, (h - 0.22) / 0.23)
@@ -193,8 +191,5 @@ pub fn recency_heat_color(age_secs: u64) -> ([f32; 4], [f32; 4]) {
         lerp_rgba(amber, orange, (h - 0.45) / 0.27)
     } else {
         lerp_rgba(orange, hot, (h - 0.72) / 0.28)
-    };
-    let dot_alpha = (0.22 + h * 0.78).clamp(0.20, 1.0);
-    let dot = [text[0], text[1], text[2], dot_alpha];
-    (text, dot)
+    }
 }
