@@ -108,9 +108,8 @@ mod macos_app {
     use blaze_shell::image_atlas::ImageAtlas;
     use blaze_shell::keys;
     use blaze_shell::layout::{
-        LayoutInput, PANE_HEADER_H, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
-        draw_split_dividers, draw_tiled_pane_chrome, layout_command_palette,
-        layout_fullscreen_terminal_pane, layout_window_top_bar,
+        LayoutInput, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers,
+        layout_command_palette, layout_fullscreen_terminal_pane, layout_window_top_bar,
     };
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
@@ -1421,13 +1420,8 @@ mod macos_app {
         fonts: &Fonts,
         scale: f64,
     ) {
-        let show_hdr = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
         for pl in &tile_layout.panes {
-            let content_rect = if show_hdr {
-                HitRect::new(pl.rect.x0, (pl.rect.y0 + PANE_HEADER_H).min(pl.rect.y1), pl.rect.x1, pl.rect.y1)
-            } else {
-                pl.rect
-            };
+            let content_rect = pl.rect;
             if let Some(pane) = panes.get_mut(&pl.pane)
                 && let Some(ap) = &pane.active_pty
             {
@@ -1469,28 +1463,14 @@ mod macos_app {
         let work_area = HitRect::new(0.0, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
         let tile_layout = wm.layout(work_area, TILE_GAP);
         let mut master = Scene::new();
-        let show_pane_hdr = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
+        let is_split = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
 
         // 1. Lay out and composite every visible pane in the active workspace tab!
         for pl in &tile_layout.panes {
             let Some(pane) = panes.get_mut(&pl.pane) else {
                 continue;
             };
-            let content_rect = if show_pane_hdr {
-                let proc_tag = pane.process_tag();
-                draw_tiled_pane_chrome(
-                    &mut master,
-                    pl.pane,
-                    pl.rect,
-                    pl.focused,
-                    &pane.prompt.dir_short,
-                    pane.prompt.git_branch.as_deref(),
-                    proc_tag,
-                    metrics,
-                )
-            } else {
-                pl.rect
-            };
+            let content_rect = pl.rect;
             let pw = (content_rect.x1 - content_rect.x0).max(120.0);
             let ph = (content_rect.y1 - content_rect.y0).max(80.0);
             let sub_vh = ph + TOP_BAR_H;
@@ -1632,7 +1612,7 @@ mod macos_app {
             master.composite_pane(sub, content_rect, TOP_BAR_H, pl.focused, vw, vh);
 
             // Subtle Ghostty-style dim veil on unfocused tiled panes so focus is unmistakable.
-            if show_pane_hdr && !pl.focused {
+            if is_split && !pl.focused {
                 master.over_round_rect(
                     pl.rect.x0,
                     pl.rect.y0,

@@ -34,7 +34,6 @@ use crate::view::{
 };
 
 pub const TOP_BAR_H: f32 = 34.0;
-pub const PANE_HEADER_H: f32 = 24.0;
 pub const TILE_GAP: f32 = 2.0;
 const TRAFFIC_LIGHTS_PAD: f32 = 80.0;
 const OUTER_PAD_X: f32 = 16.0;
@@ -676,119 +675,6 @@ pub fn layout_window_top_bar(
             x += bw + 5.0;
         }
     }
-}
-
-/// Draw crisp monochrome tiling pane header + subtle active/inactive border when `pane_count > 1`.
-/// Returns the inner content `HitRect` below the 24px pane header.
-#[allow(clippy::too_many_arguments)]
-pub fn draw_tiled_pane_chrome(
-    scene: &mut Scene,
-    pane_id: PaneId,
-    outer: HitRect,
-    focused: bool,
-    title: &str,
-    branch: Option<&str>,
-    process_tag: Option<&str>,
-    m: CellMetrics,
-) -> HitRect {
-    let hdr_y1 = (outer.y0 + PANE_HEADER_H).min(outer.y1);
-    let hdr_bg = if focused {
-        theme::rgb(0x16, 0x16, 0x19)
-    } else {
-        theme::rgb(0x12, 0x12, 0x14)
-    };
-    let border_col = if focused {
-        theme::rgb(0x3a, 0x3a, 0x42)
-    } else {
-        theme::LINE_FAINT
-    };
-
-    // Header bar background + hairline bottom divider + active accent rail on top edge.
-    scene.round_rect(outer.x0, outer.y0, outer.x1, hdr_y1, 0.0, hdr_bg, 0.0, [0.0; 4], 0);
-    if focused {
-        scene.line(outer.x0, outer.y0 + 1.0, outer.x1, outer.y0 + 1.0, 2.0, theme::rgb(0x6e, 0x6e, 0x78), 0);
-    }
-    scene.line(outer.x0, hdr_y1 - 0.5, outer.x1, hdr_y1 - 0.5, 1.0, border_col, 0);
-
-    // Clicking anywhere on the header focuses the pane.
-    scene.push_hit(HitRect::new(outer.x0, outer.y0, outer.x1, hdr_y1), HitAction::FocusPane(pane_id));
-
-    let chrome_ch = m.line_h(TextFace::Chrome);
-    let mid_y = outer.y0 + (PANE_HEADER_H - chrome_ch) * 0.5;
-    let mut lx = outer.x0 + 10.0;
-    let dot_col = if focused { theme::INK_1 } else { theme::INK_4 };
-    scene.over_circle(lx + 2.5, outer.y0 + PANE_HEADER_H * 0.5, 2.5, dot_col, 0);
-    lx += 11.0;
-
-    // Right-aligned Zoom + Close icon buttons on the pane header.
-    let btn_s = 10.0;
-    let btn_w = 20.0;
-    let mut rx = outer.x1 - 4.0;
-    if rx - btn_w > lx + 40.0 {
-        let close_r = HitRect::new(rx - btn_w, outer.y0 + 2.0, rx, hdr_y1 - 2.0);
-        draw_icon(
-            scene,
-            Icon::Close,
-            close_r.x0 + (btn_w - btn_s) * 0.5,
-            outer.y0 + (PANE_HEADER_H - btn_s) * 0.5,
-            btn_s,
-            theme::INK_4,
-            0,
-        );
-        scene.push_hit(close_r, HitAction::ClosePane(pane_id));
-        rx -= btn_w + 2.0;
-    }
-    if rx - btn_w > lx + 40.0 {
-        let zoom_r = HitRect::new(rx - btn_w, outer.y0 + 2.0, rx, hdr_y1 - 2.0);
-        draw_icon(
-            scene,
-            Icon::Maximize,
-            zoom_r.x0 + (btn_w - btn_s) * 0.5,
-            outer.y0 + (PANE_HEADER_H - btn_s) * 0.5,
-            btn_s,
-            theme::INK_4,
-            0,
-        );
-        scene.push_hit(zoom_r, HitAction::ToggleZoomPane(pane_id));
-        rx -= btn_w + 6.0;
-    }
-
-    // Folder icon + title + optional git branch / active process badge.
-    let icon_s = 11.5;
-    scene.svg_icon_alpha(
-        lx,
-        outer.y0 + (PANE_HEADER_H - icon_s) * 0.5,
-        icon_s,
-        "folder_macos",
-        if focused { 1.0 } else { 0.65 },
-        0,
-    );
-    lx += icon_s + 6.0;
-
-    let mut label = title.to_owned();
-    if let Some(br) = branch
-        && !br.is_empty()
-    {
-        label.push_str("  ·  ");
-        label.push_str(br);
-    }
-    if let Some(tag) = process_tag {
-        label.push_str("  [");
-        label.push_str(tag);
-        label.push(']');
-    }
-    let avg_cw = m.measure("n", TextFace::Chrome).max(4.5);
-    let max_c = ((rx - lx) / avg_cw).floor().max(6.0) as usize;
-    scene.chrome_text(
-        lx,
-        mid_y,
-        truncate_chars(&label, max_c),
-        if focused { theme::INK_1 } else { theme::INK_4 },
-        focused,
-        0,
-    );
-
-    HitRect::new(outer.x0, hdr_y1, outer.x1, outer.y1.max(hdr_y1 + 20.0))
 }
 
 /// Draw crisp 1px hairline split dividers between tiled panes (highlighted while actively dragged).

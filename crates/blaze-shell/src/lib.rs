@@ -1087,8 +1087,7 @@ mod tests {
     #[test]
     fn tiling_wm_invariants_and_scene_compositing() {
         use crate::layout::{
-            TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers, draw_tiled_pane_chrome,
-            layout_window_top_bar,
+            TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers, layout_window_top_bar,
         };
         use crate::tiling::{CloseOutcome, FocusDir, SplitAxis, TileManager};
         use crate::view::{HitRect, Scene};
@@ -1197,16 +1196,7 @@ mod tests {
         let l = wm.layout(area, 2.0);
         let mut master = Scene::new();
         for pl in &l.panes {
-            let content = draw_tiled_pane_chrome(
-                &mut master,
-                pl.pane,
-                pl.rect,
-                pl.focused,
-                "tmp",
-                Some("main"),
-                None,
-                CellMetrics::default(),
-            );
+            let content = pl.rect;
             let sub = build_pane_scene(&LayoutInput {
                 store: &store,
                 editor: &editor,
