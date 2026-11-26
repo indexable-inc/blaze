@@ -869,3 +869,179 @@ fn lazy_vfs_cow_status_write_tree_and_nfs3_protocol_roundtrip() {
     assert_eq!(u32::from_be_bytes(r2[24..28].try_into().unwrap()), 0); // NFS3_OK
     assert!(r2.windows(10).any(|w| w == b"brand new\n"));
 }
+
+// ---------------------------------------------------------------------------
+// 7. Worktree BGWT manifest, tracked-branch auto-merge/auto-delete, and FS 3-way planner
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worktree_bgwt_sync_auto_merge_auto_delete_and_fs_three_way_plan() {
+    use crate::worktree::{
+        DiskFile, FsAction, FsConflictKind, WorktreeRecord, WorktreeSyncDecision, decode_worktrees,
+        encode_worktrees, evaluate_worktree_sync, plan_worktree_fs_update,
+    };
+
+    let alloc = test_alloc();
+    let mut store = MemStore::new(alloc);
+
+    let b_base = mk_blob(&mut store, b"line1\nline2\nline3\nline4\nline5\n");
+    let b_keep = mk_blob(&mut store, b"untouched\n");
+    let t_sub = mk_tree(
+        &mut store,
+        &[TreeBuildEntry { mode: 0o100644, name: b"keep.txt", oid: b_keep }],
+        alloc,
+    );
+    let t0 = mk_tree(
+        &mut store,
+        &[
+            TreeBuildEntry { mode: 0o100644, name: b"shared.txt", oid: b_base },
+            TreeBuildEntry { mode: 0o040000, name: b"untouched", oid: t_sub },
+        ],
+        alloc,
+    );
+    let c0 = mk_commit(&mut store, t0, &[], 1_700_000_000, "base\n", alloc);
+    store.set_ref("refs/heads/main", RefTarget::Direct(c0)).unwrap();
+    store.set_ref("refs/heads/feat", RefTarget::Direct(c0)).unwrap();
+
+    // 1. BGWT v1 manifest round-trip & CRC corruption rejection.
+    let mut rec = WorktreeRecord {
+        name: String::from_str_in("wt-feat", alloc),
+        path: String::from_str_in("/tmp/wt-feat", alloc),
+        branch: String::from_str_in("refs/heads/feat", alloc),
+        track_branch: String::from_str_in("refs/heads/main", alloc),
+        base_commit: c0,
+        head_commit: c0,
+        head_tree: t0,
+        is_vfs: false,
+        auto_delete_on_merge: true,
+    };
+    let mut bgwt = Vec::new_in(alloc);
+    encode_worktrees(core::slice::from_ref(&rec), &mut bgwt);
+    let decoded = decode_worktrees(&bgwt, 64, alloc).unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0], rec);
+    bgwt[12] ^= 0xff;
+    assert!(decode_worktrees(&bgwt, 64, alloc).is_err());
+
+    // 2. `main` advances to c1 while `feat` is still at `base_commit` -> must FastForward, NOT delete!
+    let b_main_1 = mk_blob(&mut store, b"line1\nline2\nline3\nline4\nline5_from_main\n");
+    let b_added = mk_blob(&mut store, b"new from main\n");
+    let t1 = mk_tree(
+        &mut store,
+        &[
+            TreeBuildEntry { mode: 0o100644, name: b"added.txt", oid: b_added },
+            TreeBuildEntry { mode: 0o100644, name: b"shared.txt", oid: b_main_1 },
+            TreeBuildEntry { mode: 0o040000, name: b"untouched", oid: t_sub },
+        ],
+        alloc,
+    );
+    let c1 = mk_commit(&mut store, t1, &[c0], 1_700_000_100, "main update\n", alloc);
+    store.set_ref("refs/heads/main", RefTarget::Direct(c1)).unwrap();
+
+    let d1 = evaluate_worktree_sync(&rec, &mut store, None, MergeOpts::DEFAULT, alloc).unwrap();
+    assert!(matches!(d1, WorktreeSyncDecision::FastForward { new_commit, .. } if new_commit == c1));
+
+    // 3. Filesystem-aware 3-way projection: local disk edited line1 of `shared.txt`, upstream edited line5!
+    let mut disk_shared = Vec::new_in(alloc);
+    disk_shared.extend_from_slice(b"line1_from_disk\nline2\nline3\nline4\nline5\n");
+    let plan = plan_worktree_fs_update(
+        &store,
+        t0,
+        t1,
+        |rel| {
+            if rel == "shared.txt" {
+                let mut b = Vec::new_in(alloc);
+                b.extend_from_slice(&disk_shared);
+                Some(DiskFile { mode: 0o100644, bytes: b })
+            } else {
+                None
+            }
+        },
+        MergeOpts::DEFAULT,
+        alloc,
+    )
+    .unwrap();
+    assert!(plan.is_clean());
+    assert_eq!(plan.subtrees_skipped, 1); // `untouched/` skipped in O(1)!
+    assert_eq!(plan.auto_merged_files, 1);
+    assert_eq!(plan.actions.len(), 2);
+    assert!(plan.actions.iter().any(|a| matches!(
+        a,
+        FsAction::WriteFile { path, bytes, .. }
+            if path.as_str() == "shared.txt"
+                && bytes.as_slice() == b"line1_from_disk\nline2\nline3\nline4\nline5_from_main\n"
+    )));
+    assert!(plan.actions.iter().any(|a| matches!(
+        a,
+        FsAction::WriteFile { path, .. } if path.as_str() == "added.txt"
+    )));
+
+    // 4. Conflicting local edit on line5 -> reports ContentConflict without clobbering!
+    let plan_conflict = plan_worktree_fs_update(
+        &store,
+        t0,
+        t1,
+        |rel| {
+            if rel == "shared.txt" {
+                let mut b = Vec::new_in(alloc);
+                b.extend_from_slice(b"line1\nline2\nline3\nline4\nline5_from_disk_conflict\n");
+                Some(DiskFile { mode: 0o100644, bytes: b })
+            } else {
+                None
+            }
+        },
+        MergeOpts::DEFAULT,
+        alloc,
+    )
+    .unwrap();
+    assert!(!plan_conflict.is_clean());
+    assert_eq!(plan_conflict.conflicts.len(), 1);
+    assert_eq!(plan_conflict.conflicts[0].kind, FsConflictKind::ContentConflict);
+
+    // 5. `feat` makes its own commit c2, then `main` merges `feat` in c3 -> MergedIntoTracked (auto-delete)!
+    let b_feat = mk_blob(&mut store, b"feat work\n");
+    let t_feat = mk_tree(
+        &mut store,
+        &[
+            TreeBuildEntry { mode: 0o100644, name: b"feat.txt", oid: b_feat },
+            TreeBuildEntry { mode: 0o100644, name: b"shared.txt", oid: b_base },
+            TreeBuildEntry { mode: 0o040000, name: b"untouched", oid: t_sub },
+        ],
+        alloc,
+    );
+    let c2 = mk_commit(&mut store, t_feat, &[c0], 1_700_000_200, "feat commit\n", alloc);
+    store.set_ref("refs/heads/feat", RefTarget::Direct(c2)).unwrap();
+    rec.head_commit = c2;
+    rec.head_tree = t_feat;
+
+    // While diverged from c1, `evaluate_worktree_sync` returns `AutoMerge`!
+    let d_div = evaluate_worktree_sync(&rec, &mut store, None, MergeOpts::DEFAULT, alloc).unwrap();
+    assert!(matches!(
+        d_div,
+        WorktreeSyncDecision::AutoMerge { status: MergeStatus::MergedClean, .. }
+    ));
+
+    // Now merge `feat` (c2) into `main` (c1) -> c3!
+    let c3 = mk_commit(&mut store, t1, &[c1, c2], 1_700_000_300, "merge feat into main\n", alloc);
+    store.set_ref("refs/heads/main", RefTarget::Direct(c3)).unwrap();
+    let d_merged = evaluate_worktree_sync(&rec, &mut store, None, MergeOpts::DEFAULT, alloc).unwrap();
+    assert!(matches!(
+        d_merged,
+        WorktreeSyncDecision::MergedIntoTracked { branch_oid, track_oid }
+            if branch_oid == c2 && track_oid == c3
+    ));
+
+    // Fast-forward merge: `main` fast-forwards directly to `c2` (so `branch_oid == track_oid != base_commit`) -> MergedIntoTracked!
+    store.set_ref("refs/heads/main", RefTarget::Direct(c2)).unwrap();
+    let d_ff_merged = evaluate_worktree_sync(&rec, &mut store, None, MergeOpts::DEFAULT, alloc).unwrap();
+    assert!(matches!(
+        d_ff_merged,
+        WorktreeSyncDecision::MergedIntoTracked { branch_oid, track_oid }
+            if branch_oid == c2 && track_oid == c2
+    ));
+
+    // Brand-new branch with 0 commits (`branch_oid == track_oid == base_commit`) -> UpToDate (never falsely deleted!).
+    rec.base_commit = c2;
+    let d_fresh = evaluate_worktree_sync(&rec, &mut store, None, MergeOpts::DEFAULT, alloc).unwrap();
+    assert!(matches!(d_fresh, WorktreeSyncDecision::UpToDate));
+}

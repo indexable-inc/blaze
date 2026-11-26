@@ -55,6 +55,14 @@ fn c6() -> u8 { let x: V<u8> = V::new(1); x.t }
 fn n1() -> V<u8, G> { V::<u8, G, u16>::new(1) }
 fn n2() -> P<u8, bool> { P::<u8>::pair(1, true) }
 fn n3() -> u8 { let x: W = W { t: 1 }; 1 }
+fn c7<Err: Mk>(r: Result<u8, Err>) -> Result<u8, Err> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(_e) => Err(Err::mk()),
+    }
+}
+fn c8<const N: usize>() -> usize { N }
+fn n4<T>() -> u8 { let _ = T; 1 }
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,22 +71,27 @@ enum Want2 {
     Clean,
     /// The checker's E0107 (`DiagCode::GenericArgCount`).
     Count,
+    /// The checker's E0423 (`DiagCode::NotAValue`).
+    NotAValue,
     /// A type written short of a parameter with no default: refused before the check, naming
     /// it (types.rs `with_defaults`: "parameter 0 has no default").
     NoDefault,
 }
 
 /// Each body, what it must give, and what it proves.
-const BODIES: [(&str, Want2, &str); 9] = [
+const BODIES: [(&str, Want2, &str); 12] = [
     ("c1", Want2::Clean, "`V::<u8>::new(1)` is a `V<u8, G>`: the left-out `A` takes its default"),
     ("c2", Want2::Clean, "the same against `V<u8>` in type position (`V<u8, G>`)"),
     ("c3", Want2::Clean, "`V::<u8>::make(1)` with two `Mk` impls: `A` is the default `G`, not a variable left ambiguous"),
     ("c4", Want2::Clean, "`V::new(1)`: nothing written, every parameter inferred"),
     ("c5", Want2::Clean, "`V::<u8> { .. }`: a struct expression's segment takes the default too"),
     ("c6", Want2::Clean, "`let x: V<u8>` in type position is `V<u8, G>`"),
+    ("c7", Want2::Clean, "type parameter `Err` does not shadow value-namespace `Result::Err` while `Err::mk()` still resolves the type param"),
+    ("c8", Want2::Clean, "const parameter `N` still resolves in value position"),
     ("n1", Want2::Count, "`V::<u8, G, u16>`: three arguments for two parameters"),
     ("n2", Want2::Count, "`P::<u8>`: `U` has no default"),
     ("n3", Want2::NoDefault, "`let x: W` in type position: `T` has no default"),
+    ("n4", Want2::NotAValue, "type parameter `T` alone in value position with no value `T` in scope still diagnoses E0423 NotAValue"),
 ];
 
 /// Expected line: `test adt_segment_takes_its_defaults ... ok`. Without
@@ -134,6 +147,9 @@ fn adt_segment_takes_its_defaults() {
             (Ok(done), Want2::Clean) if done.diags.is_empty() => notes.push(format!("{name}: clean")),
             (Err(CheckFail::Diags { diags, .. }), Want2::Count) if format!("{diags:?}").contains("GenericArgCount") => {
                 notes.push(format!("{name}: E0107, as it must be"))
+            }
+            (Err(CheckFail::Diags { diags, .. }), Want2::NotAValue) if format!("{diags:?}").contains("NotAValue") => {
+                notes.push(format!("{name}: E0423, as it must be"))
             }
             (Ok(done), _) => {
                 notes.push(format!("{name}: Ok with diagnostics {:?}; wanted {want:?} ({proves})", done.diags));

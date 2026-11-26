@@ -294,6 +294,13 @@ impl<'a> BgitDiskStore<'a> {
         SlabIndex::from_verified(mapped.bytes(), *proof).ok()
     }
 
+    /// Appends OIDs of all objects written into the in-memory overlay since the last `flush()`.
+    pub(crate) fn overlay_oids(&self, out: &mut AVec<'a, Oid>) -> io::Result<()> {
+        self.overlay
+            .list_oids(out)
+            .map_err(|e| io::Error::other(format!("{e}")))
+    }
+
     /// Verifies the full CRC-32 checksum of `index.bgix` and every record across all slabs.
     pub(crate) fn verify_full(&self) -> io::Result<u32> {
         if let Some((mapped, _)) = self.index.as_ref() {
@@ -945,6 +952,9 @@ pub(crate) fn infect_repo_on_disk<'a>(
     // Ensure `.bgit/` is excluded in `.git/info/exclude` (local-only, never touches `.gitignore`)
     // so `git status` and shell prompts stay clean after infecting a `.git` repository.
     ensure_bgit_excluded_in_git(&git_dir)?;
+    // Install lightweight `.git/hooks/reference-transaction` hook so plain `git merge`/`git pull`
+    // automatically updates tracking worktrees and deletes merged worktrees (no-op if no worktrees).
+    let _ = crate::worktree_driver::install_git_worktree_hooks(repo_root);
 
     Ok(InfectStats {
         loose_objects_in: loose_count,

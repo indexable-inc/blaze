@@ -88,6 +88,11 @@ fn handle_http_conn<'a>(
 
     // Persist any received objects & ref updates atomically before sending HTTP 200!
     store.flush()?;
+    if req.target.contains("receive-pack")
+        && let Some(repo_dir) = store.bgit_dir.parent()
+    {
+        let _ = crate::worktree_driver::sync_all_worktrees(repo_dir, None, false, false, false, alloc);
+    }
     stream.write_all(&resp)?;
     stream.flush()?;
     Ok(())
@@ -152,6 +157,14 @@ pub(crate) fn serve_stdio<'a>(service: &str, repo_root: &Path, alloc: Alloc<'a>)
             )
             .map_err(|e| io::Error::other(format!("{e}")))?;
             store.flush()?;
+            let _ = crate::worktree_driver::sync_all_worktrees(
+                repo_root,
+                None,
+                false,
+                false,
+                false,
+                alloc,
+            );
             stdout.write_all(&resp)?;
             stdout.flush()?;
             Ok(())

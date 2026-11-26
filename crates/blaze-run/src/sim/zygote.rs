@@ -505,6 +505,10 @@ fn a_child_takes_its_steps_in_order_and_reports_once() {
         names.push(step.index());
         if let Step::Sandbox { profile } = step {
             assert!(profile.contains("(deny default)") && profile.contains("(subpath \"/tmp/blaze-test/t4\")"));
+            assert!(profile.contains("(allow file-write* (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\") (literal \"/dev/null\"))"));
+            assert!(profile.contains("(allow network-bind (local ip \"localhost:*\") (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\"))"));
+            assert!(profile.contains("(allow network-inbound (local ip \"localhost:*\") (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\"))"));
+            assert!(profile.contains("(allow network-outbound (remote ip \"localhost:*\") (subpath \"/tmp/blaze-test/t4\") (subpath \"/private/tmp\"))"));
         }
     }
     assert_eq!(names, vec![0, 1, 2, 3, 4, 5, 7]);

@@ -20,6 +20,7 @@ mod disk;
 mod net_driver;
 mod status_driver;
 mod vfs_driver;
+mod worktree_driver;
 
 use std::{
     alloc::Global,
@@ -45,6 +46,7 @@ use crate::{
     net_driver::{http_clone, http_ls_remote, http_push, serve_http, serve_stdio},
     status_driver::run_status,
     vfs_driver::{cmd_internal_vfs_serve, cmd_mount, cmd_unmount, spawn_background_mount},
+    worktree_driver::{canonical_branch_ref, cmd_worktree, on_branch_merged},
 };
 
 fn main() -> ExitCode {
@@ -69,6 +71,7 @@ fn print_usage() {
         "bgit — sans-IO, Git-wire-compatible VCS engine (macOS / APFS native .bgit store)\n\n\
          USAGE:\n\
          \tbgit status [dir] [-s|--short] [--porcelain] [-b|--branch] [-uno|-unormal|-uall] [--prompt] [--timing]\n\
+         \tbgit worktree <add|list|sync|watch|remove> ...  (alias: `bgit wt`)\n\
          \tbgit mount <repo> <mountpoint> [rev] [--ro] [--foreground]  (or `bgit mount --list`)\n\
          \tbgit unmount <mountpoint> [--force]\n\
          \tbgit init [dir]\n\
@@ -77,7 +80,7 @@ fn print_usage() {
          \tbgit verify [dir]\n\
          \tbgit log [dir] [rev] [-n N]\n\
          \tbgit merge-base <dir> <revA> <revB>\n\
-         \tbgit merge <dir> <ours> <theirs> [--write-commit]\n\
+         \tbgit merge <dir> <ours> <theirs> [--write-commit] [--keep-worktree] [--no-sync]\n\
          \tbgit serve --http <addr> <repo>\n\
          \tbgit serve --stdio <upload-pack|receive-pack> <repo>\n\
          \tbgit ls-remote <http-url>\n\
@@ -90,6 +93,7 @@ fn print_usage() {
 fn run<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     match args[0].as_str() {
         "status" | "st" => cmd_status(&args[1..], alloc),
+        "worktree" | "wt" => cmd_worktree(&args[1..], alloc),
         "mount" => cmd_mount(&args[1..], alloc),
         "unmount" | "umount" => cmd_unmount(&args[1..]),
         "__vfs-serve" => cmd_internal_vfs_serve(&args[1..], alloc),
@@ -331,6 +335,8 @@ fn cmd_merge<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
     let ours_rev = &args[1];
     let theirs_rev = &args[2];
     let write_commit = args.iter().any(|a| a == "--write-commit");
+    let keep_worktree = args.iter().any(|a| a == "--keep-worktree");
+    let no_sync = args.iter().any(|a| a == "--no-sync");
 
     let mut store = open_or_infect(dir, alloc)?;
     let ours = store
@@ -370,23 +376,43 @@ fn cmd_merge<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
         println!("  CONFLICT ({:?}): {}", c.kind, c.path.as_str());
     }
 
-    if write_commit && result.status == MergeStatus::MergedClean {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let sig = Signature { name: "bgit", email: "bgit@ix.dev", timestamp: now, tz: "+0000" };
-        let mut commit_buf = OwnVec::new_in(alloc);
-        let msg = format!("Merge {theirs_rev} into {ours_rev}\n");
-        encode_commit(result.tree, &[ours, theirs], sig, sig, &msg, &mut commit_buf);
-        let commit_oid = store
-            .write_object(ObjectKind::Commit, &commit_buf)
-            .map_err(|e| io::Error::other(format!("{e}")))?;
+    if write_commit
+        && (result.status == MergeStatus::MergedClean || result.status == MergeStatus::FastForward)
+    {
+        let commit_oid = if result.status == MergeStatus::FastForward {
+            theirs
+        } else {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let sig = Signature { name: "bgit", email: "bgit@ix.dev", timestamp: now, tz: "+0000" };
+            let mut commit_buf = OwnVec::new_in(alloc);
+            let msg = format!("Merge {theirs_rev} into {ours_rev}\n");
+            encode_commit(result.tree, &[ours, theirs], sig, sig, &msg, &mut commit_buf);
+            store
+                .write_object(ObjectKind::Commit, &commit_buf)
+                .map_err(|e| io::Error::other(format!("{e}")))?
+        };
 
-        // Update current branch if HEAD is symbolic.
-        if let Some(RefTarget::Symbolic(sym)) = store
+        // Update the target branch (`ours_rev` if it is a branch ref, otherwise current symbolic HEAD).
+        let target_ref: Option<String> = if ours_rev != "HEAD"
+            && store
+                .resolve_ref(&canonical_branch_ref(ours_rev))
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            Some(canonical_branch_ref(ours_rev))
+        } else if let Some(RefTarget::Symbolic(sym)) = store
             .read_head(alloc)
             .map_err(|e| io::Error::other(format!("{e}")))?
         {
+            Some(sym.as_str().to_string())
+        } else {
+            None
+        };
+
+        if let Some(ref sym) = target_ref {
             let _ = store
                 .apply_ref_updates(
                     &[RefUpdate {
@@ -401,6 +427,17 @@ fn cmd_merge<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
         }
         store.flush()?;
         println!("commit={commit_oid}");
+
+        // Auto-delete merged worktree folder (by default) and auto-merge downstream worktrees!
+        drop(store);
+        on_branch_merged(
+            dir,
+            target_ref.as_deref(),
+            theirs_rev,
+            keep_worktree,
+            no_sync,
+            alloc,
+        )?;
     } else if result.status == MergeStatus::MergedClean || result.status == MergeStatus::Conflicted {
         store.flush()?;
     }

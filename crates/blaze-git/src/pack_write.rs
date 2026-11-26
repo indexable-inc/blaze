@@ -518,6 +518,49 @@ fn zlib_append<'a>(
     })
 }
 
+/// Encodes one Git loose object (`"<kind> <len>\0<body>"`, zlib-compressed) into `out` and
+/// returns its exact SHA-1 [`Oid`].
+pub fn encode_loose_object<'a>(
+    kind: ObjectKind,
+    body: &[u8],
+    alloc: Alloc<'a>,
+    out: &mut AVec<'a, u8>,
+) -> Result<Oid, GitError> {
+    let kind_str = match kind {
+        ObjectKind::Commit => b"commit".as_slice(),
+        ObjectKind::Tree => b"tree".as_slice(),
+        ObjectKind::Blob => b"blob".as_slice(),
+        ObjectKind::Tag => b"tag".as_slice(),
+    };
+    let mut len_buf = [0u8; 24];
+    let len_slice = format_usize_dec(body.len(), &mut len_buf);
+    let mut raw = Vec::with_capacity_in(kind_str.len() + 1 + len_slice.len() + 1 + body.len(), alloc);
+    raw.extend_from_slice(kind_str);
+    raw.push(b' ');
+    raw.extend_from_slice(len_slice);
+    raw.push(0);
+    raw.extend_from_slice(body);
+    let oid = Oid(sha1(&raw));
+    out.clear();
+    zlib_append(&raw, DeflateLevel::Fast, alloc, out)?;
+    Ok(oid)
+}
+
+fn format_usize_dec(mut n: usize, buf: &mut [u8; 24]) -> &[u8] {
+    let mut i = buf.len();
+    if n == 0 {
+        i -= 1;
+        buf[i] = b'0';
+        return &buf[i..];
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &buf[i..]
+}
+
 /// Generates a standard Git `.idx` version 2 pack index for `pack_bytes` and `entries`
 /// (produced by [`write_pack_from_store`]).
 pub fn write_pack_index_v2<'a>(
