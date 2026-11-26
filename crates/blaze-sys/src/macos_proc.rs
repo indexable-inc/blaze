@@ -1,8 +1,8 @@
 //! macOS host telemetry and process inspection through libSystem: Mach host counters
 //! (`host_processor_info`, `host_page_size`, `host_statistics64`, `mach_timebase_info`),
-//! BSD sysctl (`hw.memsize`, `vm.swapusage`, `kern.boottime`, `KERN_PROCARGS2`, `getloadavg`),
-//! libproc (`proc_listallpids`, `proc_pidinfo`, `proc_pid_rusage`, `proc_pidpath`), and
-//! `kill(2)`.
+//! BSD sysctl (`hw.memsize`, `vm.swapusage`, `kern.boottime`, `KERN_PROC_PID`, `KERN_PROCARGS2`,
+//! `getloadavg`), libproc (`proc_listallpids`, `proc_pidinfo`, `proc_pid_rusage`, `proc_pidpath`),
+//! and `kill(2)`.
 //!
 //! `#![no_std]`, zero dependencies beyond `core`, no allocation and no panics
 //! (`#[blaze::noalloc]`, `#[blaze::nopanic]`). Reuses `crate::macos::cold` for symbols already
@@ -20,7 +20,17 @@ use crate::Errno;
 // ---------------------------------------------------------------------------------------------
 
 const CTL_KERN: c_int = 1;
+const KERN_PROC: c_int = 14;
+const KERN_PROC_PID: c_int = 1;
 const KERN_PROCARGS2: c_int = 49;
+
+const KINFO_PROC_SIZE: usize = 648;
+const KINFO_PROC_STARTTIME_SEC_OFFSET: usize = 0;
+const KINFO_PROC_PID_OFFSET: usize = 40;
+const KINFO_PROC_COMM_OFFSET: usize = 243;
+const KINFO_PROC_COMM_LEN: usize = 17;
+const KINFO_PROC_PPID_OFFSET: usize = 560;
+const KINFO_PROC_TDEV_OFFSET: usize = 572;
 
 const KERN_SUCCESS: c_int = 0;
 const KERN_INVALID_ADDRESS: c_int = 1;
@@ -220,6 +230,13 @@ struct RawProcVnodePathInfo {
     pvi_rdir: RawVnodeInfoPath,
 }
 
+/// `<sys/sysctl.h>` `struct kinfo_proc` on 64-bit macOS arm64 & x86_64 (648 bytes, 8-byte aligned).
+///
+/// Stored as an aligned raw byte buffer so fields at SDK-verified offsets can be decoded with
+/// `from_ne_bytes` / slice copies without duplicating the 50-field XNU layout.
+#[repr(C, align(8))]
+struct RawKinfoProc([u8; KINFO_PROC_SIZE]);
+
 // Compile-time layout assertions against MacOSX.sdk sizes and key field offsets.
 const _: () = {
     assert!(size_of::<RawMachTimebaseInfo>() == 8);
@@ -270,6 +287,14 @@ const _: () = {
     assert!(size_of::<RawProcVnodePathInfo>() == 2352);
     assert!(offset_of!(RawProcVnodePathInfo, pvi_cdir) == 0);
     assert!(offset_of!(RawProcVnodePathInfo, pvi_rdir) == 1176);
+
+    assert!(size_of::<RawKinfoProc>() == KINFO_PROC_SIZE);
+    assert!(align_of::<RawKinfoProc>() == 8);
+    assert!(KINFO_PROC_STARTTIME_SEC_OFFSET + size_of::<i64>() <= KINFO_PROC_SIZE);
+    assert!(KINFO_PROC_PID_OFFSET + size_of::<i32>() <= KINFO_PROC_SIZE);
+    assert!(KINFO_PROC_COMM_OFFSET + KINFO_PROC_COMM_LEN <= KINFO_PROC_SIZE);
+    assert!(KINFO_PROC_PPID_OFFSET + size_of::<i32>() <= KINFO_PROC_SIZE);
+    assert!(KINFO_PROC_TDEV_OFFSET + size_of::<i32>() <= KINFO_PROC_SIZE);
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -309,7 +334,7 @@ mod ffi {
         pub(super) fn proc_listallpids(buffer: *mut c_void, buffersize: c_int) -> c_int;
         /// `<libproc.h>`: resolves the executable path of `pid` into `buffer`.
         pub(super) fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
-        /// `<sys/sysctl.h>`: reads or writes a MIB sysctl (`KERN_PROCARGS2`).
+        /// `<sys/sysctl.h>`: reads or writes a MIB sysctl (`KERN_PROCARGS2`, `KERN_PROC_PID`).
         pub(super) fn sysctl(
             name: *mut c_int,
             namelen: u32,
@@ -374,6 +399,16 @@ fn trim_nul(bytes: &[u8]) -> &[u8] {
         Some(len) => bytes.get(..len).unwrap_or(bytes),
         None => bytes,
     }
+}
+
+#[blaze::noalloc]
+#[blaze::nopanic]
+fn kinfo_bytes<const OFFSET: usize, const N: usize>(raw: &RawKinfoProc) -> Result<[u8; N], Errno> {
+    const { assert!(OFFSET + N <= KINFO_PROC_SIZE) };
+    let Some(slice) = raw.0.get(OFFSET..OFFSET + N) else {
+        return Err(Errno::Io);
+    };
+    <[u8; N]>::try_from(slice).map_err(|_| Errno::Io)
 }
 
 #[blaze::noalloc]
@@ -687,6 +722,72 @@ pub fn proc_bsd_info(pid: i32) -> Result<ProcBsdInfo, Errno> {
     })
 }
 
+/// Basic process identity from `sysctl([CTL_KERN, KERN_PROC, KERN_PROC_PID, pid])`.
+///
+/// Unlike `proc_bsd_info`, `KERN_PROC_PID` is world-readable on macOS for cross-UID / root
+/// processes (such as `/usr/bin/login`), keeping the process tree intact across login wrappers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcKinfoBasic {
+    pub pid: u32,
+    pub ppid: u32,
+    pub comm: [u8; 17],
+    pub start_time_secs: u64,
+    pub tty_dev: i32,
+}
+
+impl ProcKinfoBasic {
+    /// Process command name trimmed at the first NUL byte (`kp_proc.p_comm`).
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub fn name_bytes(&self) -> &[u8] {
+        trim_nul(&self.comm)
+    }
+}
+
+/// Reads basic process identity for `pid` via `sysctl([CTL_KERN, KERN_PROC, KERN_PROC_PID, pid])`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn proc_kinfo_basic(pid: i32) -> Result<ProcKinfoBasic, Errno> {
+    if pid <= 0 {
+        return Err(Errno::Inval);
+    }
+    let mut mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid];
+    let mut raw = RawKinfoProc([0u8; KINFO_PROC_SIZE]);
+    let mut len = KINFO_PROC_SIZE;
+    crate::posix::signal::set_errno(Errno::from_raw(0));
+    // SAFETY: `mib` has 4 `c_int` entries; `raw.0` holds `KINFO_PROC_SIZE` (648) writable,
+    // 8-byte-aligned bytes matching `sizeof(struct kinfo_proc)`; `newp` is null.
+    let rc = unsafe {
+        ffi::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            raw.0.as_mut_ptr().cast::<c_void>(),
+            &raw mut len,
+            core::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(last_errno_or(Errno::Io));
+    }
+    if len < KINFO_PROC_SIZE {
+        return Err(Errno::Srch);
+    }
+    let tv_sec = i64::from_ne_bytes(kinfo_bytes::<KINFO_PROC_STARTTIME_SEC_OFFSET, 8>(&raw)?);
+    let raw_pid = i32::from_ne_bytes(kinfo_bytes::<KINFO_PROC_PID_OFFSET, 4>(&raw)?);
+    let comm = kinfo_bytes::<KINFO_PROC_COMM_OFFSET, KINFO_PROC_COMM_LEN>(&raw)?;
+    let raw_ppid = i32::from_ne_bytes(kinfo_bytes::<KINFO_PROC_PPID_OFFSET, 4>(&raw)?);
+    let tty_dev = i32::from_ne_bytes(kinfo_bytes::<KINFO_PROC_TDEV_OFFSET, 4>(&raw)?);
+    let Ok(pid) = u32::try_from(raw_pid) else {
+        return Err(Errno::Io);
+    };
+    let Ok(ppid) = u32::try_from(raw_ppid) else {
+        return Err(Errno::Io);
+    };
+    let start_time_secs = u64::try_from(tv_sec).unwrap_or(0);
+    Ok(ProcKinfoBasic { pid, ppid, comm, start_time_secs, tty_dev })
+}
+
 /// Process task counters from `proc_pidinfo(PROC_PIDTASKINFO)`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcTaskInfo {
@@ -901,6 +1002,8 @@ mod tests {
         assert_eq!(size_of::<RawRusageInfoV4>(), 296);
         assert_eq!(size_of::<RawVnodeInfoPath>(), 1176);
         assert_eq!(size_of::<RawProcVnodePathInfo>(), 2352);
+        assert_eq!(size_of::<RawKinfoProc>(), 648);
+        assert_eq!(align_of::<RawKinfoProc>(), 8);
 
         // Cross-check against libc oracle where libc exposes the struct.
         assert_eq!(size_of::<RawTimeval>(), size_of::<libc::timeval>());
@@ -1065,5 +1168,24 @@ mod tests {
         // Signal 0 checks permission and process existence without sending a signal.
         let self_pid = std::process::id() as i32;
         assert_eq!(kill_pid(self_pid, 0), Ok(()));
+    }
+
+    #[test]
+    fn proc_kinfo_basic_reads_launchd_and_matches_self_bsd_info() {
+        assert_eq!(proc_kinfo_basic(0), Err(Errno::Inval));
+        assert_eq!(proc_kinfo_basic(-1), Err(Errno::Inval));
+
+        let launchd = proc_kinfo_basic(1).expect("proc_kinfo_basic(1) without root");
+        assert_eq!(launchd.pid, 1);
+        assert_eq!(launchd.ppid, 0);
+        assert_eq!(launchd.name_bytes(), b"launchd");
+
+        let self_pid = std::process::id() as i32;
+        let kinfo = proc_kinfo_basic(self_pid).expect("proc_kinfo_basic(self)");
+        let bsd = proc_bsd_info(self_pid).expect("proc_bsd_info(self)");
+        assert_eq!(kinfo.pid, bsd.pid);
+        assert_eq!(kinfo.ppid, bsd.ppid);
+        assert_eq!(kinfo.start_time_secs, bsd.start_time_secs);
+        assert!(!kinfo.name_bytes().is_empty(), "expected non-empty kinfo comm");
     }
 }

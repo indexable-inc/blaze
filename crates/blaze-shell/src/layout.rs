@@ -1175,8 +1175,15 @@ fn layout_starship_line(
         } else {
             theme::OK
         };
+        let primary_icon = fp.items.first().and_then(|first| {
+            first
+                .app_icon_path
+                .as_deref()
+                .or(first.origin_app_icon_path.as_deref())
+        });
         if fp.is_hot {
-            let approx_w = 12.0 + m.measure(&label, TextFace::UiSmall) + 8.0;
+            let icon_extra = if primary_icon.is_some() { 16.0 } else { 0.0 };
+            let approx_w = 12.0 + icon_extra + m.measure(&label, TextFace::UiSmall) + 8.0;
             scene.round_rect(
                 seg6_x0 + 1.0,
                 y + 2.5,
@@ -1195,6 +1202,17 @@ fn layout_starship_line(
         } else {
             scene.over_circle(cx + 3.0, ty + m.ch * 0.5, 2.7, dot_col, clip_id);
             cx += 9.5;
+        }
+        if let Some(icon_path) = primary_icon {
+            scene.image(
+                cx,
+                y + (cap_h - 13.0) * 0.5,
+                13.0,
+                13.0,
+                icon_path.to_owned(),
+                clip_id,
+            );
+            cx += 16.0;
         }
         scene.ui_small(cx, ty, &label, pill_fg, fp.is_hot, false, clip_id);
         cx += m.measure(&label, TextFace::UiSmall) + 2.0;
@@ -6398,8 +6416,8 @@ fn layout_active_popover(
         }
         HoverKind::FolderProcs { summary } => {
             let shown = summary.items.len().clamp(1, 10);
-            let w = 560.0f32.min((vw - 24.0).max(320.0));
-            let proc_row_h = m.ch * 2.0 + 12.0;
+            let w = 580.0f32.min((vw - 24.0).max(340.0));
+            let proc_row_h = m.ch * 2.0 + 16.0;
             let foot_h = if summary.items.len() > shown { m.ch + 6.0 } else { 0.0 };
             let h = hdr_h + 4.0 + shown as f32 * proc_row_h + foot_h + pad_y;
             (w, h)
@@ -7165,7 +7183,8 @@ fn layout_active_popover(
                 crate::sysmon_view::format_iec_bytes(summary.total_mem_bytes),
             );
             let mut ry = draw_header(scene, &left_hdr, &right_hdr) + 2.0;
-            let proc_row_h = m.ch * 2.0 + 12.0;
+            let proc_row_h = m.ch * 2.0 + 16.0;
+            let main_icon = 20.0;
             for item in summary.items.iter().take(10) {
                 let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + proc_row_h);
                 if is_hovered(row_rect) {
@@ -7181,27 +7200,43 @@ fn layout_active_popover(
                         0,
                     );
                 }
-                let ty1 = ry + 5.0;
-                let ty2 = ty1 + m.ch + 2.0;
+                let ty1 = ry + 6.5;
+                let ty2 = ty1 + m.ch + 3.0;
                 let ix = x0 + pad_x;
-                let iy = ty1 + (m.ch - icon_s) * 0.5;
+                let iy = ry + (proc_row_h - main_icon) * 0.5;
+                let mut used_origin_as_main = false;
                 if let Some(app_ic) = item.app_icon_path.as_deref() {
-                    scene.overlay_avatar_image(ix, iy, icon_s, app_ic.to_owned(), 0);
+                    scene.overlay_image(ix, iy, main_icon, main_icon, app_ic.to_owned(), 0);
+                } else if is_shell_name(&item.name)
+                    && let Some(orig_ic) = item.origin_app_icon_path.as_deref()
+                {
+                    scene.overlay_image(ix, iy, main_icon, main_icon, orig_ic.to_owned(), 0);
+                    used_origin_as_main = true;
                 } else {
                     let lc = item.name.to_ascii_lowercase();
                     let svg = if lc.contains("rust") || lc.contains("cargo") || lc.contains("blaze") {
-                        "rust_dark"
+                        if lc == "blaze-shell" {
+                            "shell_dark"
+                        } else {
+                            "rust_dark"
+                        }
                     } else if lc.contains("node") || lc.contains("bun") || lc.contains("deno") {
-                        "javascript_dark"
-                    } else if lc.contains("python") {
+                        "javaScript_dark"
+                    } else if lc.contains("python") || lc == "pytest" || lc == "uv" {
                         "python_dark"
+                    } else if lc == "go" || lc == "gopls" {
+                        "go_dark"
+                    } else if lc.contains("docker") || lc == "containerd" || lc == "orbstack" {
+                        "docker_dark"
+                    } else if lc.starts_with("swift") || lc == "sourcekit-lsp" {
+                        "swiftLang_dark"
                     } else {
                         "shell_dark"
                     };
-                    scene.overlay_svg_icon(ix, iy, icon_s, svg, 0);
+                    scene.overlay_svg_icon(ix, iy, main_icon, svg, 0);
                 }
 
-                // Line 1 right side: clickable action pill (`Pane N · TUI ↗` or `pid N ↗`), MEM, GPU%, CPU%, Uptime!
+                // Line 1 right side: clickable action pill (`Pane N · TUI ↗` or `top ↗`), MEM, GPU%, CPU%, Uptime!
                 let (act_lbl, act_fg, act_bg, action) = if let Some(sp) = item.shell_pane {
                     let lbl = if sp.is_alt_screen {
                         format!("Pane {} · TUI ↗", sp.pane_number)
@@ -7219,7 +7254,7 @@ fn layout_active_popover(
                     )
                 } else {
                     (
-                        format!("pid {} ↗", item.pid),
+                        "top ↗".to_owned(),
                         theme::INK_3,
                         theme::rgba(0xff, 0xff, 0xff, 0.06),
                         HitAction::InspectProcessPid(item.pid),
@@ -7280,29 +7315,85 @@ fn layout_active_popover(
                     rx -= 10.0;
                 }
 
-                let name_x = ix + icon_s + 7.0;
-                let avail_ch = ((rx - name_x) / m.cw).floor().max(8.0) as usize;
+                // Line 1 left side: bold process name + subtle origin pill when space permits.
+                let name_x = ix + main_icon + 9.0;
+                let origin_pill = if item.shell_pane.is_none()
+                    && !item.origin_app_name.is_empty()
+                    && !item.origin_app_name.eq_ignore_ascii_case(&item.name)
+                {
+                    let app_short = truncate_chars(&item.origin_app_name, 16);
+                    if !used_origin_as_main
+                        && let Some(orig_ic) = item.origin_app_icon_path.as_deref()
+                    {
+                        let tw = m.measure(&app_short, TextFace::UiSmall);
+                        Some((Some(orig_ic), app_short, 5.0 + 12.0 + 4.0 + tw + 6.0))
+                    } else {
+                        let lbl = format!("in {app_short}");
+                        let tw = m.measure(&lbl, TextFace::UiSmall);
+                        Some((None, lbl, 6.0 + tw + 6.0))
+                    }
+                } else {
+                    None
+                };
+                let pill_gap = 7.0;
+                let total_avail_w = (rx - name_x - 4.0).max(m.cw * 6.0);
+                let reserve_for_pill = origin_pill
+                    .as_ref()
+                    .filter(|(_, _, pw)| total_avail_w >= pw + pill_gap + m.cw * 6.0)
+                    .map_or(0.0, |(_, _, pw)| pw + pill_gap);
+                let name_avail_w = (total_avail_w - reserve_for_pill).max(m.cw * 6.0);
+                let avail_ch = (name_avail_w / m.cw).floor().max(6.0) as usize;
                 let shown_name = truncate_chars(&item.name, avail_ch);
                 scene.overlay_text_run(name_x, ty1, &shown_name, theme::INK_1, true, false, 0);
 
-                // Line 2 subtitle: exact cmdline + parent chain + subfolder + thread count!
+                let shown_name_w = m.measure(&shown_name, TextFace::Mono);
+                if let Some((pill_icon, pill_lbl, pill_w)) = origin_pill {
+                    let pill_x0 = name_x + shown_name_w + pill_gap;
+                    if pill_x0 + pill_w <= rx - 2.0 {
+                        let pill_y0 = ty1 - 1.0;
+                        let pill_y1 = ty1 + m.ch + 1.0;
+                        let pill_h = pill_y1 - pill_y0;
+                        scene.overlay_round_rect(
+                            pill_x0,
+                            pill_y0,
+                            pill_x0 + pill_w,
+                            pill_y1,
+                            pill_h * 0.5,
+                            theme::rgba(0xff, 0xff, 0xff, 0.06),
+                            0.75,
+                            theme::rgba(0xff, 0xff, 0xff, 0.12),
+                            0,
+                        );
+                        let mut px = pill_x0;
+                        if let Some(orig_ic) = pill_icon {
+                            px += 5.0;
+                            let ic_s = 12.0;
+                            let ic_y = pill_y0 + (pill_h - ic_s) * 0.5;
+                            scene.overlay_image(px, ic_y, ic_s, ic_s, orig_ic.to_owned(), 0);
+                            px += ic_s + 4.0;
+                        } else {
+                            px += 6.0;
+                        }
+                        scene.overlay_ui_small(px, ty1, &pill_lbl, theme::INK_3, false, false, 0);
+                    }
+                }
+
+                // Line 2 subtitle: multi-hop origin chain + cmdline + subfolder + pid + thread count!
                 let mut sub_parts: Vec<String> = Vec::new();
+                if !item.origin_chain.is_empty() && item.origin_chain.contains('›') {
+                    sub_parts.push(truncate_chars(&item.origin_chain, 38));
+                }
                 if !item.cmdline.is_empty() && item.cmdline != item.name {
                     sub_parts.push(truncate_chars(&item.cmdline, 44));
-                }
-                if !item.parent_name.is_empty() {
-                    sub_parts.push(format!("via {}", item.parent_name));
                 }
                 if item.rel_dir != "." && !item.rel_dir.is_empty() {
                     sub_parts.push(format!("in {}/", item.rel_dir));
                 }
+                sub_parts.push(format!("pid {}", item.pid));
                 if item.threads > 0 {
                     sub_parts.push(format!("{} thr", item.threads));
                 }
-                if sub_parts.is_empty() && !item.exe_path.is_empty() {
-                    sub_parts.push(truncate_middle(&item.exe_path, 48));
-                }
-                let sub_line = sub_parts.join("  ·  ");
+                let sub_line = sub_parts.join(" · ");
                 let max_sub_ch = ((x1 - pad_x - name_x) / (m.cw * 0.85)).floor().max(16.0) as usize;
                 let shown_sub = truncate_chars(&sub_line, max_sub_ch);
                 scene.overlay_ui_small(name_x, ty2, &shown_sub, theme::INK_4, false, false, 0);
@@ -7702,6 +7793,23 @@ pub fn apply_find_overlay(
     }
 
     active_match
+}
+
+fn is_shell_name(name: &str) -> bool {
+    let base = name.trim_start_matches('-');
+    matches!(
+        base.to_ascii_lowercase().as_str(),
+        "nu" | "zsh"
+            | "bash"
+            | "fish"
+            | "sh"
+            | "dash"
+            | "tcsh"
+            | "csh"
+            | "elvish"
+            | "xonsh"
+            | "pwsh"
+    )
 }
 
 fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {

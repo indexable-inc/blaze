@@ -259,6 +259,7 @@ pub struct ProcessRow<'a> {
     pub has_children: bool,
     pub collapsed: bool,
     pub is_last_sibling: bool,
+    pub ancestor_mask: u64,
     pub child_count: u32,
     pub tree_prefix: AString<'a>,
     pub name: AString<'a>,
@@ -296,6 +297,21 @@ pub fn extract_app_bundle_path(exe_path: &str) -> Option<&str> {
         seg_start = seg_end.saturating_add(1);
     }
     None
+}
+
+/// Extracts the display name of a macOS `.app` bundle path
+/// (e.g. `"/Applications/Ghostty.app"` -> `"Ghostty"`).
+pub fn app_display_name(bundle_path: &str) -> &str {
+    let trimmed = bundle_path.trim_end_matches('/');
+    let last = match trimmed.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => trimmed,
+    };
+    if last.len() > 4 && last.as_bytes()[last.len() - 4..].eq_ignore_ascii_case(b".app") {
+        &last[..last.len() - 4]
+    } else {
+        last
+    }
 }
 
 #[inline]
@@ -390,6 +406,9 @@ pub struct FolderProcEntry<'a> {
     pub is_hot: bool,
     pub via_descendant: bool,
     pub shell_pane: Option<ShellPanePid>,
+    pub origin_app_name: AString<'a>,
+    pub origin_app_bundle_path: Option<AString<'a>>,
+    pub origin_chain: AString<'a>,
 }
 
 /// Summary of all live running processes scoped to a folder (including subfolders & descendants).
@@ -910,6 +929,153 @@ impl<'a> SysMonEngine<'a> {
                 }
                 None => String::new_in(alloc),
             };
+
+            // Walk ancestors `[parent, grandparent, ...]` (up to MAX_ANCESTOR_DEPTH, cycle-guarded,
+            // stopping at 0, 1, or missing PID) to discover host `.app` origin & clean ancestor chain.
+            let mut ancestor_indices = [0usize; MAX_ANCESTOR_DEPTH];
+            let mut ancestor_len = 0usize;
+            {
+                let mut visited = [0u32; MAX_ANCESTOR_DEPTH + 1];
+                visited[0] = proc.pid;
+                let mut visited_len = 1usize;
+                let mut cur = proc.ppid;
+                for _ in 0..MAX_ANCESTOR_DEPTH {
+                    if cur == 0 || cur == 1 {
+                        break;
+                    }
+                    if visited[..visited_len].contains(&cur) {
+                        break;
+                    }
+                    visited[visited_len] = cur;
+                    visited_len += 1;
+                    let Some(&anc_idx) = pid_to_idx.get(&cur) else {
+                        break;
+                    };
+                    ancestor_indices[ancestor_len] = anc_idx;
+                    ancestor_len += 1;
+                    cur = self.computed_procs[anc_idx].ppid;
+                }
+            }
+            let ancestors = &ancestor_indices[..ancestor_len];
+
+            let mut origin_app_pos: Option<usize> = None;
+            let mut origin_app_bundle_path: Option<AString<'b>> = None;
+            let mut origin_app_name = String::new_in(alloc);
+
+            if shell_pane.is_some() {
+                origin_app_name.push_str("blaze-shell");
+                if let Some(&own_idx) = pid_to_idx.get(&own_pid) {
+                    origin_app_bundle_path = self.computed_procs[own_idx]
+                        .app_bundle_path
+                        .as_ref()
+                        .map(|p| String::from_str_in(p.as_str(), alloc));
+                }
+                origin_app_pos = ancestors
+                    .iter()
+                    .position(|&idx| self.computed_procs[idx].pid == own_pid);
+            } else {
+                let mut found_app_pos = None;
+                for (pos, &anc_idx) in ancestors.iter().enumerate() {
+                    let anc = &self.computed_procs[anc_idx];
+                    if anc.pid == own_pid {
+                        continue;
+                    }
+                    if anc.app_bundle_path.is_some() {
+                        found_app_pos = Some(pos);
+                        break;
+                    }
+                }
+                if let Some(mut app_pos) = found_app_pos {
+                    let bundle = self.computed_procs[ancestors[app_pos]]
+                        .app_bundle_path
+                        .as_ref()
+                        .map(|p| p.as_str())
+                        .unwrap_or("");
+                    // Walk up through contiguous ancestors belonging to the same `.app` bundle
+                    // so helper binaries inside the bundle (e.g. `Antigravity.app -> language_server`)
+                    // stay visible in `origin_chain` underneath the host app.
+                    while app_pos + 1 < ancestors.len() {
+                        let next = &self.computed_procs[ancestors[app_pos + 1]];
+                        if next.pid == own_pid {
+                            break;
+                        }
+                        if next.app_bundle_path.as_ref().map(|p| p.as_str()) == Some(bundle) {
+                            app_pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    origin_app_pos = Some(app_pos);
+                    origin_app_bundle_path = Some(String::from_str_in(bundle, alloc));
+                    origin_app_name.push_str(app_display_name(bundle));
+                } else if let Some(bundle) = proc.app_bundle_path.as_ref() {
+                    origin_app_bundle_path = Some(String::from_str_in(bundle.as_str(), alloc));
+                    origin_app_name.push_str(app_display_name(bundle.as_str()));
+                } else {
+                    for &anc_idx in ancestors.iter() {
+                        let anc = &self.computed_procs[anc_idx];
+                        if anc.pid == own_pid {
+                            continue;
+                        }
+                        let name = anc.name.as_str();
+                        if !is_os_wrapper_for_origin(name) {
+                            origin_app_name.push_str(name);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let mut hop_buf = [""; MAX_ANCESTOR_DEPTH];
+            let mut hop_len = 0usize;
+            if !ancestors.is_empty() {
+                let start_pos = origin_app_pos.unwrap_or(ancestors.len() - 1);
+                for pos in (0..=start_pos).rev() {
+                    let is_origin_hop = origin_app_pos == Some(pos);
+                    let hop_name = if is_origin_hop {
+                        origin_app_name.as_str()
+                    } else {
+                        self.computed_procs[ancestors[pos]].name.as_str()
+                    };
+                    if hop_name.is_empty() || (!is_origin_hop && is_noisy_chain_wrapper(hop_name)) {
+                        continue;
+                    }
+                    if hop_len > 0 && hop_buf[hop_len - 1].eq_ignore_ascii_case(hop_name) {
+                        continue;
+                    }
+                    hop_buf[hop_len] = hop_name;
+                    hop_len += 1;
+                }
+            }
+
+            const MAX_CHAIN_HOPS: usize = 4;
+            let mut origin_chain = String::new_in(alloc);
+            if hop_len <= MAX_CHAIN_HOPS {
+                for (i, &hop) in hop_buf[..hop_len].iter().enumerate() {
+                    if i > 0 {
+                        origin_chain.push_str(" › ");
+                    }
+                    origin_chain.push_str(hop);
+                }
+            } else if origin_app_pos.is_some() {
+                origin_chain.push_str(hop_buf[0]);
+                let mut prev = hop_buf[0];
+                for &hop in &hop_buf[hop_len - (MAX_CHAIN_HOPS - 1)..hop_len] {
+                    if !prev.eq_ignore_ascii_case(hop) {
+                        origin_chain.push_str(" › ");
+                        origin_chain.push_str(hop);
+                        prev = hop;
+                    }
+                }
+            } else {
+                for (i, &hop) in hop_buf[hop_len - MAX_CHAIN_HOPS..hop_len].iter().enumerate() {
+                    if i > 0 {
+                        origin_chain.push_str(" › ");
+                    }
+                    origin_chain.push_str(hop);
+                }
+            }
+
             entries.push(FolderProcEntry {
                 pid: proc.pid,
                 ppid: proc.ppid,
@@ -930,6 +1096,9 @@ impl<'a> SysMonEngine<'a> {
                 is_hot,
                 via_descendant,
                 shell_pane,
+                origin_app_name,
+                origin_app_bundle_path,
+                origin_chain,
             });
         }
 
@@ -1026,6 +1195,7 @@ impl<'a> SysMonEngine<'a> {
                 has_children: false,
                 collapsed: false,
                 is_last_sibling: pos + 1 == total,
+                ancestor_mask: 0,
                 child_count: 0,
                 tree_prefix: String::new_in(self.alloc),
                 name: String::from_str_in(proc.name.as_str(), self.alloc),
@@ -1239,6 +1409,13 @@ impl<'a> SysMonEngine<'a> {
                 ancestor_has_more.truncate(frame.depth - 1);
             }
 
+            let mut ancestor_mask = 0u64;
+            for (lvl, &has_more) in ancestor_has_more.iter().enumerate() {
+                if has_more && lvl < 64 {
+                    ancestor_mask |= 1u64 << lvl;
+                }
+            }
+
             let mut tree_prefix = String::new_in(alloc);
             if frame.depth > 0 {
                 for &has_more in ancestor_has_more.iter() {
@@ -1268,6 +1445,7 @@ impl<'a> SysMonEngine<'a> {
                 has_children,
                 collapsed,
                 is_last_sibling: frame.is_last,
+                ancestor_mask,
                 child_count: child_count[frame.node],
                 tree_prefix,
                 name: String::from_str_in(proc.name.as_str(), alloc),
@@ -1388,6 +1566,21 @@ fn matches_filter(proc: &ComputedProc<'_>, query: &str) -> bool {
     let mut pid_buf = [0u8; 10];
     let pid_str = format_u32_decimal(proc.pid, &mut pid_buf);
     contains_ignore_ascii_case(pid_str, query)
+}
+
+fn is_os_wrapper_for_origin(name: &str) -> bool {
+    name.is_empty()
+        || name.eq_ignore_ascii_case("login")
+        || name.eq_ignore_ascii_case("launchd")
+        || name.eq_ignore_ascii_case("kernel_task")
+        || name.eq_ignore_ascii_case("init")
+        || name.eq_ignore_ascii_case("systemd")
+}
+
+fn is_noisy_chain_wrapper(name: &str) -> bool {
+    is_os_wrapper_for_origin(name)
+        || name.eq_ignore_ascii_case("sudo")
+        || name.eq_ignore_ascii_case("su")
 }
 
 #[cfg(test)]
@@ -2592,5 +2785,232 @@ mod tests {
         assert_eq!(helper.subtree_mem_bytes, 3_000);
         assert_eq!(helper.subtree_threads, 9);
         assert_eq!(helper.subtree_disk_bps, 1_750);
+    }
+
+    #[test]
+    fn ancestor_mask_tracks_continuing_and_last_sibling_branches() {
+        let arena = Inline::<262_144>::new();
+        let erased = Erased::new(&arena);
+        let alloc = erased.handle();
+        let mut engine = SysMonEngine::new_in(alloc);
+        engine.set_sort(SortColumn::Pid); // deterministic ascending PID order
+
+        // Tree:
+        // 1 (depth 0, last root)                             -> mask 0b00
+        // ├─ 10 (depth 1, continuing)                        -> mask 0b00
+        // │  ├─ 11 (depth 2, continuing; lvl0=1)             -> mask 0b01
+        // │  │  ├─ 13 (depth 3, continuing; lvl0=1, lvl1=1)  -> mask 0b11
+        // │  │  └─ 14 (depth 3, last;       lvl0=1, lvl1=1)  -> mask 0b11
+        // │  └─ 12 (depth 2, last;       lvl0=1)             -> mask 0b01
+        // │     └─ 15 (depth 3, last;    lvl0=1, lvl1=0)     -> mask 0b01
+        // └─ 20 (depth 1, last)                              -> mask 0b00
+        //    ├─ 21 (depth 2, continuing; lvl0=0)             -> mask 0b00
+        //    │  └─ 23 (depth 3, last;    lvl0=0, lvl1=1)     -> mask 0b10
+        //    └─ 22 (depth 2, last;       lvl0=0)             -> mask 0b00
+        //       └─ 24 (depth 3, last;    lvl0=0, lvl1=0)     -> mask 0b00
+        let mut procs = Vec::new_in(alloc);
+        procs.push(make_proc(alloc, 1, 0, "root", "/sbin/launchd", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 10, 1, "a", "/bin/a", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 11, 10, "a1", "/bin/a1", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 13, 11, "a1a", "/bin/a1a", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 14, 11, "a1b", "/bin/a1b", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 12, 10, "a2", "/bin/a2", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 15, 12, "a2a", "/bin/a2a", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 20, 1, "b", "/bin/b", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 21, 20, "b1", "/bin/b1", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 23, 21, "b1a", "/bin/b1a", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 22, 20, "b2", "/bin/b2", 0, 0, 10, 0, 0, 1));
+        procs.push(make_proc(alloc, 24, 22, "b2a", "/bin/b2a", 0, 0, 10, 0, 0, 1));
+
+        engine.ingest(RawSnapshot {
+            timestamp_ns: 1_000_000_000,
+            wall_time_secs: 0,
+            cores: Vec::new_in(alloc),
+            mem: RawMemSample::default(),
+            gpu: RawGpuSample::empty_in(alloc),
+            processes: procs,
+            load_avg: [0.0; 3],
+            uptime_secs: 1,
+        });
+
+        let expected: &[(u32, u16, bool, u64, &str)] = &[
+            (1, 0, true, 0b00, ""),
+            (10, 1, false, 0b00, "├─ "),
+            (11, 2, false, 0b01, "│  ├─ "),
+            (13, 3, false, 0b11, "│  │  ├─ "),
+            (14, 3, true, 0b11, "│  │  └─ "),
+            (12, 2, true, 0b01, "│  └─ "),
+            (15, 3, true, 0b01, "│     └─ "),
+            (20, 1, true, 0b00, "└─ "),
+            (21, 2, false, 0b00, "   ├─ "),
+            (23, 3, true, 0b10, "   │  └─ "),
+            (22, 2, true, 0b00, "   └─ "),
+            (24, 3, true, 0b00, "      └─ "),
+        ];
+        assert_eq!(engine.rows().len(), expected.len());
+        for (row, &(pid, depth, is_last, mask, prefix)) in engine.rows().iter().zip(expected.iter()) {
+            assert_eq!(row.pid, pid);
+            assert_eq!(row.depth, depth, "pid {pid}");
+            assert_eq!(row.is_last_sibling, is_last, "pid {pid}");
+            assert_eq!(row.ancestor_mask, mask, "pid {pid}");
+            assert_eq!(row.tree_prefix.as_str(), prefix, "pid {pid}");
+        }
+
+        // Flat mode always zeroes `ancestor_mask`.
+        engine.toggle_tree_mode();
+        assert!(engine.rows().iter().all(|r| r.ancestor_mask == 0));
+    }
+
+    #[test]
+    fn folder_processes_origin_walks_through_login_to_host_app() {
+        // 1. Unit checks for `app_display_name`.
+        assert_eq!(app_display_name("/Applications/Ghostty.app"), "Ghostty");
+        assert_eq!(app_display_name("/Applications/Ghostty.app/"), "Ghostty");
+        assert_eq!(app_display_name("/Applications/Visual Studio Code.APP///"), "Visual Studio Code");
+        assert_eq!(app_display_name("/System/Applications/Utilities/Terminal.app"), "Terminal");
+        assert_eq!(app_display_name("Ghostty.app"), "Ghostty");
+        assert_eq!(app_display_name("/usr/bin/zsh"), "zsh");
+        assert_eq!(app_display_name(""), "");
+        assert_eq!(app_display_name("/"), "");
+
+        let arena = Inline::<262_144>::new();
+        let erased = Erased::new(&arena);
+        let alloc = erased.handle();
+        let mut engine = SysMonEngine::new_in(alloc);
+        let folder = "/Volumes/Projects/blaze";
+        let own_pid = 900;
+
+        let pane1 = ShellPanePid {
+            pid: 901,
+            pane_id: 1,
+            block_id: 10,
+            pane_number: 1,
+            is_alt_screen: false,
+        };
+
+        let mut procs = Vec::new_in(alloc);
+        // launchd
+        procs.push(make_proc_with_cwd(alloc, 1, 0, "launchd", "/", "/sbin/launchd", 0, 0, 10, 1));
+
+        // Case A: Finder.app -> Ghostty.app (ghostty) -> login -> nu (cwd = folder)
+        // Must pick nearest `.app` (Ghostty, not Finder) and skip `login`.
+        procs.push(make_proc_with_cwd(
+            alloc,
+            5,
+            1,
+            "Finder",
+            "/",
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            0,
+            0,
+            100,
+            1,
+        ));
+        procs.push(make_proc_with_cwd(
+            alloc,
+            10,
+            5,
+            "ghostty",
+            "/",
+            "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            0,
+            0,
+            200,
+            4,
+        ));
+        procs.push(make_proc_with_cwd(alloc, 11, 10, "login", "/", "/usr/bin/login", 0, 0, 50, 1));
+        procs.push(make_proc_with_cwd(alloc, 12, 11, "nu", folder, "/opt/homebrew/bin/nu", 0, 0, 300, 2));
+
+        // Case B: Antigravity.app -> language_server -> zsh -> cargo (cwd = folder)
+        procs.push(make_proc_with_cwd(
+            alloc,
+            20,
+            1,
+            "Antigravity",
+            "/",
+            "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            0,
+            0,
+            500,
+            8,
+        ));
+        procs.push(make_proc_with_cwd(
+            alloc,
+            21,
+            20,
+            "language_server",
+            "/",
+            "/Applications/Antigravity.app/Contents/Resources/app/bin/language_server",
+            0,
+            0,
+            400,
+            6,
+        ));
+        procs.push(make_proc_with_cwd(alloc, 22, 21, "zsh", folder, "/bin/zsh", 0, 0, 100, 1));
+        procs.push(make_proc_with_cwd(alloc, 23, 22, "cargo", folder, "/usr/bin/cargo", 0, 0, 800, 4));
+
+        // Case C: tmux -> zsh -> rg (no `.app` ancestor)
+        procs.push(make_proc_with_cwd(alloc, 30, 1, "tmux", "/", "/opt/homebrew/bin/tmux", 0, 0, 80, 1));
+        procs.push(make_proc_with_cwd(alloc, 31, 30, "zsh", "/tmp", "/bin/zsh", 0, 0, 60, 1));
+        procs.push(make_proc_with_cwd(alloc, 32, 31, "rg", folder, "/opt/homebrew/bin/rg", 0, 0, 90, 2));
+
+        // Case D: blaze-shell (own_pid, shell_pane = Some(pane1)) -> zsh -> claude
+        procs.push(make_proc_with_cwd(
+            alloc,
+            own_pid,
+            10,
+            "blaze-shell",
+            folder,
+            "/Applications/BlazeShell.app/Contents/MacOS/blaze-shell",
+            0,
+            0,
+            600,
+            4,
+        ));
+        procs.push(make_proc_with_cwd(alloc, 901, own_pid, "zsh", folder, "/bin/zsh", 0, 0, 70, 1));
+        procs.push(make_proc_with_cwd(alloc, 902, 901, "claude", folder, "/usr/local/bin/claude", 0, 0, 700, 4));
+
+        engine.ingest(RawSnapshot {
+            timestamp_ns: 1_000_000_000,
+            wall_time_secs: 1_700_000_000,
+            cores: Vec::new_in(alloc),
+            mem: RawMemSample::default(),
+            gpu: RawGpuSample::empty_in(alloc),
+            processes: procs,
+            load_avg: [0.0; 3],
+            uptime_secs: 100,
+        });
+
+        let summary = engine.folder_processes_in(folder, own_pid, &[pane1], alloc);
+
+        let nu = summary.entries.iter().find(|e| e.pid == 12).unwrap();
+        assert_eq!(nu.origin_app_name.as_str(), "Ghostty");
+        assert_eq!(
+            nu.origin_app_bundle_path.as_ref().map(|s| s.as_str()),
+            Some("/Applications/Ghostty.app")
+        );
+        assert_eq!(nu.origin_chain.as_str(), "Ghostty");
+
+        let cargo = summary.entries.iter().find(|e| e.pid == 23).unwrap();
+        assert_eq!(cargo.origin_app_name.as_str(), "Antigravity");
+        assert_eq!(
+            cargo.origin_app_bundle_path.as_ref().map(|s| s.as_str()),
+            Some("/Applications/Antigravity.app")
+        );
+        assert_eq!(cargo.origin_chain.as_str(), "Antigravity › language_server › zsh");
+
+        let rg = summary.entries.iter().find(|e| e.pid == 32).unwrap();
+        assert_eq!(rg.origin_app_name.as_str(), "zsh");
+        assert_eq!(rg.origin_app_bundle_path, None);
+        assert_eq!(rg.origin_chain.as_str(), "tmux › zsh");
+
+        let claude = summary.entries.iter().find(|e| e.pid == 902).unwrap();
+        assert_eq!(claude.shell_pane, Some(pane1));
+        assert_eq!(claude.origin_app_name.as_str(), "blaze-shell");
+        assert_eq!(
+            claude.origin_app_bundle_path.as_ref().map(|s| s.as_str()),
+            Some("/Applications/BlazeShell.app")
+        );
+        assert_eq!(claude.origin_chain.as_str(), "blaze-shell › zsh");
     }
 }
