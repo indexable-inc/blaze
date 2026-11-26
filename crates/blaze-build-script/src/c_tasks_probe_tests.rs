@@ -551,6 +551,16 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
             ProbeWhy::HostDependent
         );
     }
+    for clock_argv in [
+        ["-c", "-DD=__DATE__", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+        ["-c", "-D", "T=__TIME__", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"].as_slice(),
+    ] {
+        let sp = Spawn { program: "cc", args: clock_argv, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        assert_eq!(
+            canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp, files, alloc).err().expect("clock macro flag").why,
+            ProbeWhy::HostDependent
+        );
+    }
     for bad_src in [
         &b".include \"sibling.inc\"\n"[..],
         &b"nop; .incbin \"blob.bin\"\n"[..],
@@ -560,6 +570,8 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
         &b"const char *f = __builtin_FILE();\n"[..],
         &b"const char *f = __builtin_FILE_NAME();\n"[..],
         &b"const void *loc = __builtin_source_location();\n"[..],
+        &b"const char *d = __DATE__;\n"[..],
+        &b"const char *t = __TIME__;\n"[..],
     ] {
         let mut bad_bytes = |rel: &str| (rel == "flag_check.c").then_some(bad_src);
         assert!(resolve(&PanicAnswerer, &NoCache, &CLANG_PIN, &sp_ok, files, &mut bad_bytes, alloc).is_err());
@@ -590,6 +602,11 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert!(!is_probe("cc", &["-c", "-MD", "-MF", "/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
     assert!(!is_probe("cc", &["-c", "-save-temps=obj", "-o", "/out/flag_check", "/out/flag_check.c"]));
     assert!(!is_probe("cc", &["-c", "--coverage", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-Wp,-MD,/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-E", "-Wp,-MD,/out/deps.d", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-c", "-Xpreprocessor", "-MD", "-Xpreprocessor", "-MF", "-Xpreprocessor", "/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-E", "-Xpreprocessor", "-MD", "/out/12345detect_compiler_family.c"]));
+    assert!(!is_probe("cc", &["-c", "-Xclang", "-dependency-file", "-Xclang", "/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
 
     // TableAnswerer strategy id changes when the table bytes change.
     let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");

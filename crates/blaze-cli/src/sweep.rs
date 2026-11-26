@@ -173,7 +173,7 @@ impl<'a> FactFiles<'a> {
             (Some((cx, _)), Some(home)) => {
                 #[cfg(target_os = "linux")]
                 let computed = {
-                    if self.root_reader.is_none() {
+                    if self.root_reader.as_ref().is_none_or(|r| r.is_stalled()) {
                         let created = bstd::procs::hermetic::RootReader::new(cx).map_err(|_| {
                             CliError::Text { what: "cannot open root reader for c-probe runtime closure identity" }
                         })?;

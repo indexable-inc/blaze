@@ -934,13 +934,21 @@ impl HermeticClangProbe {
         cx: &bstd::cx::Cx,
         alloc: Alloc<'a>,
     ) -> Result<bstd::procs::hermetic::RootReader, AString<'a>> {
-        if let Some(existing) = crate::host::lock(&self.root_reader).as_ref() {
+        if let Some(existing) = crate::host::lock(&self.root_reader).as_ref()
+            && !existing.is_stalled()
+        {
             return Ok(existing.share());
         }
         let created = bstd::procs::hermetic::RootReader::new(cx)
             .map_err(|fault| own_fmt(format_args!("c-probe root reader: {fault:?}"), alloc))?;
         let mut slot = crate::host::lock(&self.root_reader);
-        Ok(slot.get_or_insert(created).share())
+        if slot.as_ref().is_none_or(|r| r.is_stalled()) {
+            *slot = Some(created);
+        }
+        match slot.as_ref() {
+            Some(r) => Ok(r.share()),
+            None => Err(own_str("c-probe root reader unavailable", alloc)),
+        }
     }
 
     fn live_strategy_id<'a>(&self, cx: &bstd::cx::Cx, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {

@@ -1116,6 +1116,29 @@ pub(crate) fn panicking() -> bool {
     std::thread::panicking()
 }
 
+/// Retires an abandoned native `Io` (whose worker thread is still blocked in an uninterruptible
+/// kernel read after cancellation/deadline) onto a single lazily-started detached reaper thread so
+/// caller stack-drop never hangs in `Threads::drop` AND the worker thread + driver allocation are
+/// cleanly reclaimed once the stalled syscall eventually returns (never leaking via `mem::forget`).
+#[cfg(target_os = "linux")]
+pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::fs::ReadOnly>) {
+    use self::std::sync::{OnceLock, mpsc};
+    static REAPER: OnceLock<mpsc::Sender<(crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>)>> = OnceLock::new();
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>)>();
+        let _ = self::std::thread::Builder::new()
+            .name(self::std::string::String::from("bstd-io-reaper"))
+            .spawn(move || {
+                while let Ok((retired_io, retired_root)) = rx.recv() {
+                    drop(retired_root);
+                    drop(retired_io);
+                }
+            });
+        tx
+    });
+    let _ = tx.send((io, root));
+}
+
 // How the containers only Rust's `std` has hold their type arguments, for `bstd::own`'s walk
 // (`own.rs` states core's and alloc's, with the rule): the maps behind a pointer they alone
 // own, the locks and the once-cells in place, changeable through a shared reference.

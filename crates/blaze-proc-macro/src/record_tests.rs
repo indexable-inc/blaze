@@ -477,3 +477,156 @@ fn run_cross_world_publish_race() -> Result<(), &'static str> {
 fn c_probe_cross_world_publish_if_absent_isolates_temp_files() {
     run_cross_world_publish_race().expect("independent native worlds must never collide on sibling temp files");
 }
+
+/// Deterministic simulation (DST) for cross-world `publish_if_absent` under `bstd::test::seeded`:
+/// models two independent OS processes (`peer_a`, `peer_b`, both starting `Io::fresh()` at `0`)
+/// sharing the same simulated disk, deterministically interleaves their `stage_publish_if_absent`
+/// and `finish_publish_if_absent` phases in BOTH orders (`A-then-B` and `B-then-A`) with
+/// `Durable::Yes` across seeded power cuts and sync/I/O failures, and verifies the invariant
+/// oracle: every committed record is whole (`want_a` or `want_b`), never torn, and whenever a
+/// peer's `finish_publish_if_absent` reports `Ok(true)`, the other peer cannot also win and the
+/// durable record on disk matches that winner's exact sealed payload.
+///
+/// With `planted_shared_temp == true`, both peers omit the per-world nonce (`None`), reproducing
+/// the pre-fix `.<leaf>.0.bstd-new` collision bug so the oracle must catch it deterministically.
+fn c_probe_cross_world_sim_program(io: &Io, planted_shared_temp: bool) -> Result<(), FilesError> {
+    let dir = io.need_fs().map_err(|_| FilesError::NoTree)?.root();
+    let store = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir }, RecordPlant::None);
+    let alloc = blaze_own::testing::heap().alloc();
+
+    let mut buf_a = [0u8; LONGEST];
+    let mut buf_b = [0u8; LONGEST];
+    let check_oracle = |store: &DirStore| -> Result<(), FilesError> {
+        let mut a = [0u8; LONGEST];
+        let mut b = [0u8; LONGEST];
+        for k in 0..8u32 {
+            let want_a = payload(k, &mut a);
+            let want_b = payload(k + 16, &mut b);
+            if let Some(held) = store.get_c_probe(&key(k), alloc)? {
+                assert!(
+                    held.as_slice() == want_a || held.as_slice() == want_b,
+                    "cross-world publish oracle: key {k} corrupted on disk (len {})",
+                    held.len()
+                );
+            }
+        }
+        Ok(())
+    };
+    check_oracle(&store)?;
+
+    let seal_payload = |body: &[u8]| -> blaze_own::AVec<'_, u8> {
+        let seal = blaze_ids::ContentId::of(super::SEAL, body).0;
+        let mut out = blaze_own::AVec::with_capacity_in(body.len() + seal.len(), alloc);
+        out.extend_from_slice(body);
+        out.extend_from_slice(&seal);
+        out
+    };
+
+    for k in 0..8u32 {
+        let want_a = payload(k, &mut buf_a);
+        let want_b = payload(k + 16, &mut buf_b);
+        let sealed_a = seal_payload(want_a);
+        let sealed_b = seal_payload(want_b);
+        let name = DirStore::named(b"c-probe/", &key(k));
+        let rel = bstd::path::Path::new(name.as_str()).map_err(|_| FilesError::NoTree)?;
+
+        // Two independent peer worlds sharing the simulated disk, BOTH starting `fresh() == 0`.
+        let (nonce_a, nonce_b) = if planted_shared_temp {
+            (None, None)
+        } else {
+            (Some(0xa11c_e000_0000_0000 | u64::from(k)), Some(0xb0b0_f000_0000_0000 | u64::from(k)))
+        };
+        let peer_a = io.peer_world_for_test(nonce_a).ok_or(FilesError::NoTree)?;
+        let peer_b = io.peer_world_for_test(nonce_b).ok_or(FilesError::NoTree)?;
+        let cx_a = peer_a
+            .cx(core::time::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| FilesError::Stopped { name: DirStore::named(b"c-probe/", &key(k)) })?;
+        let cx_b = peer_b
+            .cx(core::time::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| FilesError::Stopped { name: DirStore::named(b"c-probe/", &key(k)) })?;
+        let dir_a = peer_a.need_fs().map_err(|_| FilesError::NoTree)?.root();
+        let dir_b = peer_b.need_fs().map_err(|_| FilesError::NoTree)?.root();
+
+        // Both peers stage concurrently BEFORE either calls `Effect::Link`.
+        let staged_a = dir_a
+            .stage_publish_if_absent(&cx_a, &rel, bstd::fs::Content::bytes(&sealed_a), bstd::fs::Durable::Yes)
+            .map_err(|_| FilesError::NoTree)?;
+        let staged_b = dir_b
+            .stage_publish_if_absent(&cx_b, &rel, bstd::fs::Content::bytes(&sealed_b), bstd::fs::Durable::Yes)
+            .map_err(|_| FilesError::NoTree)?;
+
+        // Exercise both finish interleavings across keys.
+        let (won_a, won_b) = if k % 2 == 0 {
+            let a = dir_a
+                .finish_publish_if_absent(&cx_a, staged_a, bstd::fs::Durable::Yes)
+                .map_err(|_| FilesError::NoTree)?;
+            let b = dir_b
+                .finish_publish_if_absent(&cx_b, staged_b, bstd::fs::Durable::Yes)
+                .map_err(|_| FilesError::NoTree)?;
+            (a, b)
+        } else {
+            let b = dir_b
+                .finish_publish_if_absent(&cx_b, staged_b, bstd::fs::Durable::Yes)
+                .map_err(|_| FilesError::NoTree)?;
+            let a = dir_a
+                .finish_publish_if_absent(&cx_a, staged_a, bstd::fs::Durable::Yes)
+                .map_err(|_| FilesError::NoTree)?;
+            (a, b)
+        };
+
+        assert!(!(won_a && won_b), "cross-world publish oracle: both peers won on key {k}");
+        let held = store.get_c_probe(&key(k), alloc)?;
+        if won_a {
+            assert!(
+                held.as_deref() == Some(want_a),
+                "cross-world publish oracle: peer A won on key {k} but disk holds another payload"
+            );
+        }
+        if won_b {
+            assert!(
+                held.as_deref() == Some(want_b),
+                "cross-world publish oracle: peer B won on key {k} but disk holds another payload"
+            );
+        }
+    }
+    check_oracle(&store)
+}
+
+#[test]
+fn c_probe_cross_world_dst_survives_crashes_and_isolates_peers() {
+    match seeded(
+        "blaze-proc-macro",
+        module_path!(),
+        "c_probe_cross_world_publish",
+        Seeds::DEFAULT.from(0, 300),
+        Given::NOTHING,
+        |_: &Cx, io: Io| c_probe_cross_world_sim_program(&io, false),
+    ) {
+        Ok(passed) => {
+            assert!(passed.counts.cuts > 100, "too few power cuts: {:?}", passed.counts);
+            assert!(passed.counts.failures > 100, "too few failures: {:?}", passed.counts);
+        }
+        Err(failed) => panic!("{failed}"),
+    }
+}
+
+#[test]
+fn c_probe_cross_world_dst_catches_planted_shared_temp_collision() {
+    match seeded(
+        "blaze-proc-macro",
+        module_path!(),
+        "c_probe_cross_world_planted_collision",
+        Seeds::DEFAULT.from(0, 32),
+        Given::NOTHING,
+        |_: &Cx, io: Io| c_probe_cross_world_sim_program(&io, true),
+    ) {
+        Ok(passed) => panic!("planted shared-temp collision was not caught in {} starts", passed.starts),
+        Err(failed) => {
+            let said = std::format!("{failed}");
+            assert!(
+                said.contains("cross-world publish oracle"),
+                "planted shared-temp collision failed otherwise: {said}"
+            );
+        }
+    }
+}

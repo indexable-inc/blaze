@@ -223,10 +223,17 @@ fn is_extra_output_flag(arg: &str) -> bool {
             | "-ftest-coverage"
             | "--coverage"
             | "--output"
+            | "-Xpreprocessor"
+            | "-Xclang"
+            | "-Xassembler"
+            | "-Xlinker"
     ) || arg.starts_with("-MF")
         || arg.starts_with("-MQ")
         || arg.starts_with("-MT")
         || arg.starts_with("-MJ")
+        || arg.starts_with("-Wp,")
+        || arg.starts_with("-Wa,")
+        || arg.starts_with("-Wl,")
         || arg.starts_with("-dependency-file=")
         || arg.starts_with("--dependency-file=")
         || arg.starts_with("-serialize-diagnostics=")
@@ -1000,13 +1007,21 @@ fn disallowed_probe_source(bytes: &[u8], alloc: Alloc<'_>) -> Option<ProbeWhy> {
     if contains_disallowed_probe_token(text) {
         return Some(ProbeWhy::PackageInput);
     }
-    if contains_ident(text, "__TIMESTAMP__") {
+    if contains_clock_macro(text) {
         return Some(ProbeWhy::HostDependent);
     }
     None
 }
 
 /// Builds a [`CanonicalProbe`] and its [`ProbeKey`] from a script spawn.
+
+/// Whether `text` references a wall-clock macro whose expansion depends on the host clock (or on
+/// Blaze injecting `SOURCE_DATE_EPOCH=0` when the caller did not set one).
+fn contains_clock_macro(text: &str) -> bool {
+    contains_ident(text, "__TIMESTAMP__")
+        || contains_ident(text, "__DATE__")
+        || contains_ident(text, "__TIME__")
+}
 pub fn canonicalize<'b, 's>(
     answerer_id: ContentId,
     clang: &[u8; 32],
@@ -1037,7 +1052,7 @@ pub fn canonicalize<'b, 's>(
             if prev == "-D" {
                 let masked_arg = mask_quoted_literals(arg, alloc);
                 let masked = masked_arg.as_str();
-                if contains_ident(masked, "__TIMESTAMP__") {
+                if contains_clock_macro(masked) {
                     has_host_dep_arg = true;
                     break;
                 }
@@ -1070,7 +1085,7 @@ pub fn canonicalize<'b, 's>(
         {
             let masked_arg = mask_quoted_literals(macro_def, alloc);
             let masked = masked_arg.as_str();
-            if contains_ident(masked, "__TIMESTAMP__") {
+            if contains_clock_macro(masked) {
                 has_host_dep_arg = true;
                 break;
             }

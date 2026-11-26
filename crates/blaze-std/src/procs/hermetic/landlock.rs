@@ -110,10 +110,16 @@ impl Prepared {
 /// closure use that exact opened descriptor and the child executes it via `execveat(...,
 /// AT_EMPTY_PATH)`.
 pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepared, Fault> {
-    prepare_with_exec(plan, budget, processes, None)
+    prepare_with_exec(plan, budget, processes, None, None)
 }
 
-pub(super) fn prepare_with_exec(plan: &Plan<'_>, budget: Budget, processes: bool, exec_fd: Option<Fd>) -> Result<Prepared, Fault> {
+pub(super) fn prepare_with_exec(
+    plan: &Plan<'_>,
+    budget: Budget,
+    processes: bool,
+    exec_fd: Option<Fd>,
+    alloc: Option<Alloc<'_>>,
+) -> Result<Prepared, Fault> {
     let abi = landlock_abi().map_err(|errno| Fault::Host { call: "landlock_create_ruleset (version)", code: errno.raw() })?;
     if abi < LEAST_ABI {
         return Err(Fault::LandlockAbi { abi, least: LEAST_ABI });
@@ -142,7 +148,7 @@ pub(super) fn prepare_with_exec(plan: &Plan<'_>, budget: Budget, processes: bool
             // exec on it and rejects `memfd` in `PathBeneath` with EBADFD). We therefore omit
             // granting `EXECUTE` on the on-disk program path and walk the Nix ELF closure directly
             // from the sealed `efd`.
-            grant_nix_elf_closure(ruleset.fd(), path, Some(efd), plan, has_helper_folder)?;
+            grant_nix_elf_closure(ruleset.fd(), path, Some(efd), plan, has_helper_folder, alloc)?;
             continue;
         }
         // A folder rule is opened as a folder; a path that is a file (a whole-subtree rule on a
@@ -168,7 +174,7 @@ pub(super) fn prepare_with_exec(plan: &Plan<'_>, budget: Budget, processes: bool
         let pb = PathBeneath { allowed_access: granted, parent_fd: fd.fd().raw() };
         landlock_add_rule_path(ruleset.fd(), &pb).map_err(|errno| Fault::Host { call: "landlock_add_rule", code: errno.raw() })?;
         if matches!(rule.why, Why::Program | Why::Helper) {
-            grant_nix_elf_closure(ruleset.fd(), path, None, plan, has_helper_folder)?;
+            grant_nix_elf_closure(ruleset.fd(), path, None, plan, has_helper_folder, alloc)?;
         }
     }
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
@@ -304,9 +310,10 @@ fn grant_nix_elf_closure(
     verified_exec_fd: Option<Fd>,
     plan: &Plan<'_>,
     has_helper_folder: bool,
+    alloc: Option<Alloc<'_>>,
 ) -> Result<(), Fault> {
     let mut no_feed: Option<&mut dyn FnMut(&[u8])> = None;
-    let _ = walk_nix_elf_closure(None, None, None, Some(ruleset), program, verified_exec_fd, Some(plan), has_helper_folder, &mut no_feed)?;
+    let _ = walk_nix_elf_closure(None, None, alloc, Some(ruleset), program, verified_exec_fd, Some(plan), has_helper_folder, &mut no_feed)?;
     Ok(())
 }
 
@@ -386,13 +393,6 @@ fn walk_nix_elf_closure(
             return Err(Fault::Host { call: "readlinkat (nix ELF PT_INTERP)", code: errno.raw() });
         }
     };
-    if !is_nix && feed.is_none() {
-        // Landlock confinement only needs extra single-file grants on NixOS (standard FHS hosts
-        // already receive `/lib`, `/lib64`, `/usr/lib`, `/etc/ld.so.cache` from `Why::System`).
-        // When `feed.is_some()` (runtime closure hashing), continue walking the full FHS ELF64
-        // closure + `/etc/ld.so.cache` so non-Nix Linux hosts also key their actual runtime libs.
-        return Ok(false);
-    }
     // Generated helpers inside `Why::HelperFolder` do not exist pre-exec so their transitive
     // Nix-store `DT_NEEDED` closure cannot be computed upfront; refuse explicitly rather than
     // granting `/nix/store` or letting generated helpers fail mid-run (rule 3).
@@ -406,6 +406,9 @@ fn walk_nix_elf_closure(
     // Grant single-file READ_FILE | EXECUTE ONLY on the resolved loader (`PT_INTERP`) and, when
     // the loader is NixOS's `nix-ld` shim, its delegated glibc `ld.so` (and feed both — plus
     // `/etc/ld.so.cache` on non-Nix FHS Linux — into any caller hashing the runtime closure).
+    // On non-Nix FHS Linux, BOTH confinement (`ruleset.is_some()`) and closure hashing
+    // (`feed.is_some()`) also load `/etc/ld.so.cache` so custom configured library directories
+    // (e.g. `/opt/vendor` or `glibc-hwcaps`) are both hashed AND granted `READ_FILE` in Landlock.
     if is_nix && let Some(rs) = ruleset {
         add_nix_loader_rule(rs, interp_cstr)?;
         if is_nix_ld {
@@ -457,6 +460,36 @@ fn walk_nix_elf_closure(
                 Err(errno) => {
                     return Err(Fault::Host { call: "openat (/etc/ld.so.cache)", code: errno.raw() });
                 }
+            }
+        }
+    } else if !is_nix
+        && let Some(a) = alloc
+    {
+        match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.cache"), OpenFlags::CLOSE_ON_EXEC, 0) {
+            Ok(cache_fd) => {
+                let mut raw = AVec::new_in(a);
+                let mut buf = [0u8; 64 << 10];
+                let mut off = 0u64;
+                loop {
+                    let n = pread(cache_fd.fd(), &mut buf, off)
+                        .map_err(|errno| Fault::Host { call: "pread (/etc/ld.so.cache)", code: errno.raw() })?;
+                    if n == 0 {
+                        break;
+                    }
+                    if raw.len().saturating_add(n) > MAX_LD_CACHE_BYTES {
+                        return Err(Fault::Host { call: "read (/etc/ld.so.cache exceeds 4 MiB cap)", code: 27 });
+                    }
+                    if let Some(chunk) = buf.get(..n) {
+                        raw.extend_from_slice(chunk);
+                    }
+                    let step = u64::try_from(n).map_err(|_| Fault::Host { call: "pread (/etc/ld.so.cache overflow)", code: 75 })?;
+                    off = off.checked_add(step).ok_or(Fault::Host { call: "pread (/etc/ld.so.cache overflow)", code: 75 })?;
+                }
+                ld_cache_bytes = Some(raw);
+            }
+            Err(blaze_sys::Errno::NoEnt) => {}
+            Err(errno) => {
+                return Err(Fault::Host { call: "openat (/etc/ld.so.cache)", code: errno.raw() });
             }
         }
     }
@@ -677,6 +710,8 @@ fn walk_nix_elf_closure(
                     exp_slice,
                     child_chain,
                     NIX_LD_DIR,
+                    is_nix,
+                    false,
                     plan,
                     &mut queue,
                     &mut q_len,
@@ -697,6 +732,7 @@ fn walk_nix_elf_closure(
                     child_chain,
                     NIX_LD_DIR,
                     glibc_dir,
+                    is_nix,
                     ld_cache_bytes.as_deref(),
                     plan,
                     &mut queue,
@@ -1095,6 +1131,7 @@ fn enqueue_nix_soname<const N: usize>(
     child_chain: RpathChain,
     nix_ld_dir: &[u8],
     glibc_dir: Option<&[u8]>,
+    is_nix: bool,
     ld_cache: Option<&[u8]>,
     plan: Option<&Plan<'_>>,
     queue: &mut [([u8; 320], usize, RpathChain); N],
@@ -1103,23 +1140,24 @@ fn enqueue_nix_soname<const N: usize>(
 ) -> Result<(), Fault> {
     for (dir_buf, dir_len) in search_dirs {
         let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
-        if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+        if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
             return Ok(());
         }
     }
-    if try_grant_and_enqueue_lib(reader, cx, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
-        return Ok(());
-    }
-    if let Some(dir) = glibc_dir {
-        if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+    if is_nix {
+        if try_grant_and_enqueue_lib(reader, cx, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
             return Ok(());
         }
-    }
-    // On non-Nix FHS Linux (runtime closure hashing mode, where `ruleset` is `None`), resolve
-    // through `/etc/ld.so.cache` FIRST (hashing every matching arch path including custom
-    // `/etc/ld.so.conf.d` dirs and `glibc-hwcaps` variants), falling back to standard FHS dirs
-    // only when no matching cache entry exists.
-    if ruleset.is_none() {
+        if let Some(dir) = glibc_dir {
+            if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+                return Ok(());
+            }
+        }
+    } else {
+        // On non-Nix FHS Linux (in BOTH Landlock confinement AND runtime closure hashing),
+        // resolve through `/etc/ld.so.cache` FIRST (granting `READ_FILE` and/or hashing every
+        // matching arch path including custom `/etc/ld.so.conf.d` dirs and `glibc-hwcaps`
+        // variants), falling back to standard FHS dirs only when no matching cache entry exists.
         if let Some(cache_bytes) = ld_cache
             && !cache_bytes.is_empty()
         {
@@ -1132,6 +1170,8 @@ fn enqueue_nix_soname<const N: usize>(
                     resolved_path,
                     child_chain,
                     nix_ld_dir,
+                    is_nix,
+                    true,
                     plan,
                     queue,
                     q_len,
@@ -1152,7 +1192,7 @@ fn enqueue_nix_soname<const N: usize>(
             &b"/lib/"[..],
             &b"/usr/lib/"[..],
         ] {
-            if try_grant_and_enqueue_lib(reader, cx, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+            if try_grant_and_enqueue_lib(reader, cx, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
                 return Ok(());
             }
         }
@@ -1168,6 +1208,8 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     soname: &[u8],
     child_chain: RpathChain,
     nix_ld_dir: &[u8],
+    is_nix: bool,
+    from_ld_cache: bool,
     plan: Option<&Plan<'_>>,
     queue: &mut [([u8; 320], usize, RpathChain); N],
     q_len: &mut usize,
@@ -1204,13 +1246,21 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     let mut resolved = [0u8; 320];
     let res_len = readlink_fd_path(fd.fd(), &mut resolved)?;
     let res_slice = resolved.get(..res_len).unwrap_or(&[]);
-    if let Some(p) = plan
-        && !is_authorized_nix_dep_path(res_slice, nix_ld_dir, p)
-    {
-        return Err(Fault::Host {
-            call: "landlock (NixOS ELF dependency resolved outside authorized roots)",
-            code: 13,
-        });
+    if let Some(p) = plan {
+        let authorized = if !is_nix && from_ld_cache {
+            // System-configured `/etc/ld.so.cache` targets (e.g. `/opt/vendor` or `glibc-hwcaps`)
+            // are authorized for single-file `READ_FILE` (never `EXECUTE`) as long as the resolved
+            // path is absolute and traversal-free.
+            res_slice.first() == Some(&b'/') && !res_slice.split(|&b| b == b'/').any(|seg| seg == b"..")
+        } else {
+            is_authorized_nix_dep_path(res_slice, nix_ld_dir, p)
+        };
+        if !authorized {
+            return Err(Fault::Host {
+                call: "landlock (NixOS ELF dependency resolved outside authorized roots)",
+                code: 13,
+            });
+        }
     }
     if let Some(rs) = ruleset {
         // Shared libraries need ONLY `READ_FILE` (never `EXECUTE`, which authorizes `execve`).
@@ -1360,13 +1410,13 @@ pub(super) fn run<'a>(
 struct Landlock;
 
 impl Confiner for Landlock {
-    fn start(&mut self, spawner: &Spawner, cx: &Cx, start: &StartView<'_>, streams: Streams, _alloc: Alloc<'_>) -> Result<Started<Run>, Fault> {
+    fn start(&mut self, spawner: &Spawner, cx: &Cx, start: &StartView<'_>, streams: Streams, alloc: Alloc<'_>) -> Result<Started<Run>, Fault> {
         let spec = start.spec;
         let plan = start.plan()?;
         let Program::Stored { path, .. } = spec.program() else {
             return Err(Fault::RecordsNeedExecution);
         };
-        let prepared = prepare_with_exec(plan, spec.budget(), spec.starts_programs(), spec.verified_exec_fd())?;
+        let prepared = prepare_with_exec(plan, spec.budget(), spec.starts_programs(), spec.verified_exec_fd(), Some(alloc))?;
         // `prepared` (the ruleset descriptor, the filter, the limits, and any verified exec fd)
         // lives until the start returns, by which time the child has exec'd (CLONE_VFORK) and
         // holds its own domain.

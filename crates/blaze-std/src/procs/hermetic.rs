@@ -132,14 +132,33 @@ pub(super) fn remaining_for_cx(cx: &Cx) -> Result<Duration, crate::Stopped> {
 ///
 /// Hold one instance across probes (e.g. on `HermeticClangProbe` or `FactFiles`): when a read is
 /// cancelled or expires on a stalled filesystem, `Pending::cancel` bounds the wait to 50 ms and
-/// retires the stale tag via `Io::forget` without dropping or leaking the reader's worker thread;
-/// once the stalled syscall eventually returns, the single worker thread is reused and cleanly
-/// reclaimed on normal owner drop.
+/// retires the stale tag via `Io::forget`. If the kernel read is still stuck when `RootReader`
+/// drops (even on a stack-owned owner such as `FactFiles`), `RootReaderInner::drop` hands the
+/// secondary `Io` off to a single detached background reaper thread (`rt::retire_stalled_io`) so
+/// caller drop returns immediately AND the worker thread + driver are cleanly reclaimed once the
+/// stalled syscall returns (zero unbounded hang, zero `mem::forget` leak).
+#[cfg(target_os = "linux")]
+struct RootReaderInner {
+    io: Option<crate::io::Io>,
+    root: Option<crate::fs::Dir<crate::fs::ReadOnly>>,
+    stalled: core::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RootReaderInner {
+    fn drop(&mut self) {
+        if self.stalled.load(core::sync::atomic::Ordering::Acquire) {
+            if let (Some(io), Some(root)) = (self.io.take(), self.root.take()) {
+                crate::rt::retire_stalled_io(io, root);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct RootReader {
-    io: crate::io::Io,
-    root: crate::fs::Dir<crate::fs::ReadOnly>,
+    inner: blaze_own::Arc<RootReaderInner, blaze_own::SharedAlloc<'static>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -158,7 +177,29 @@ impl RootReader {
             .need_fs()
             .map_err(|_| Fault::Host { call: "bstd::fs root io (missing fs)", code: 5 })?;
         let root = fs.root().read_only();
-        Ok(Self { io, root })
+        let inner = blaze_own::Arc::new_in(
+            RootReaderInner {
+                io: Some(io),
+                root: Some(root),
+                stalled: core::sync::atomic::AtomicBool::new(false),
+            },
+            blaze_own::SharedAlloc::global(),
+        );
+        Ok(Self { inner })
+    }
+
+    /// Whether a cancelled/expired read on this reader left a stalled syscall in flight (so
+    /// long-lived owners should rotate in a fresh reader and let this one retire to the reaper).
+    pub fn is_stalled(&self) -> bool {
+        self.inner.stalled.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    fn io_ref(&self) -> Result<&crate::io::Io, Fault> {
+        self.inner.io.as_ref().ok_or(Fault::Host { call: "bstd::fs root io (retired)", code: 5 })
+    }
+
+    fn root_ref(&self) -> Result<&crate::fs::Dir<crate::fs::ReadOnly>, Fault> {
+        self.inner.root.as_ref().ok_or(Fault::Host { call: "bstd::fs root io (retired)", code: 5 })
     }
 
     fn fd_rel(fd: blaze_sys::Fd) -> Result<crate::path::Path, Fault> {
@@ -192,17 +233,18 @@ impl RootReader {
     }
 
     fn sub_cx(&self, cx: &Cx) -> Result<(Cx, Deadline), Fault> {
+        let io = self.io_ref()?;
         let left = remaining_for_cx(cx)
             .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
-        let deadline = Deadline::after(self.io.now(), left);
-        Ok((cx.on_beside(blaze_own::Share::share(&self.io), deadline), deadline))
+        let deadline = Deadline::after(io.now(), left);
+        Ok((cx.on_beside(blaze_own::Share::share(io), deadline), deadline))
     }
 
     /// Waits for `pending` on `self.io` while polling in bounded 10 ms slices so parent
     /// cancellation (`cx.cancelled()`) abandons a stalled read within a short 50 ms settle bound
-    /// instead of waiting out the full remaining probe deadline. When the caller reuses this
-    /// [`RootReader`] across probes, a stalled syscall whose tag was retired via `Io::forget`
-    /// never leaks a worker thread and is cleanly reclaimed once it returns.
+    /// instead of waiting out the full remaining probe deadline. If the read still has not
+    /// completed after `Pending::cancel`, marks this reader stalled so dropping it retires its
+    /// worker to the detached background reaper instead of blocking caller drop or leaking.
     fn wait_read_cancellable<'buf>(
         &self,
         cx: &Cx,
@@ -211,23 +253,34 @@ impl RootReader {
         mut pending: crate::pending::Pending<'buf, crate::fs::ReadInto<'buf>>,
         call: &'static str,
     ) -> Result<usize, Fault> {
+        let io = self.io_ref()?;
         loop {
             match pending.try_wait() {
                 Ok(res) => return res.map_err(|e| fs_err_to_fault(call, &e)),
                 Err(still) => pending = still,
             }
             if cx.cancelled() {
-                let give_up = Deadline::after(self.io.now(), Duration::from_millis(50));
-                let _ = pending.cancel(read_cx, give_up);
+                let give_up = Deadline::after(io.now(), Duration::from_millis(50));
+                if matches!(
+                    pending.cancel(read_cx, give_up),
+                    Err(crate::fs::FsError { kind: crate::fs::FsKind::Stopped(_), .. })
+                ) {
+                    self.inner.stalled.store(true, core::sync::atomic::Ordering::Release);
+                }
                 return Err(Fault::Host { call: "nix runtime closure (cancelled)", code: 125 });
             }
-            let now = self.io.now();
+            let now = io.now();
             if deadline.passed(now) {
-                let _ = pending.cancel(read_cx, Deadline::PASSED);
+                if matches!(
+                    pending.cancel(read_cx, Deadline::PASSED),
+                    Err(crate::fs::FsError { kind: crate::fs::FsKind::Stopped(_), .. })
+                ) {
+                    self.inner.stalled.store(true, core::sync::atomic::Ordering::Release);
+                }
                 return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
             }
             let slice = deadline.min(Deadline::after(now, Duration::from_millis(10)));
-            let _ = self.io.poll(slice);
+            let _ = io.poll(slice);
         }
     }
 
@@ -247,7 +300,7 @@ impl RootReader {
         }
         let rel = Self::fd_rel(fd)?;
         let (open_cx, _) = self.sub_cx(cx)?;
-        let file = self.root.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
         let mut filled = 0usize;
         while filled < out.len() {
             let step_off = u64::try_from(filled)
@@ -278,7 +331,7 @@ impl RootReader {
     ) -> Result<u64, Fault> {
         let rel = Self::fd_rel(fd)?;
         let (open_cx, _) = self.sub_cx(cx)?;
-        let file = self.root.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
         let mut buf = [0u8; 64 << 10];
         let mut offset = 0u64;
         loop {

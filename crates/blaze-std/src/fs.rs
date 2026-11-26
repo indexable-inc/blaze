@@ -1141,6 +1141,14 @@ fn copy_file(
 /// or `<seq>` in simulated/hosted worlds (preserving deterministic simulation names).
 struct TempTag(Option<u64>, u64);
 
+/// A staged sibling temporary file produced by [`Dir::stage_publish_if_absent`] awaiting atomic
+/// `Effect::Link` publication in [`Dir::finish_publish_if_absent`].
+pub struct StagedPublish {
+    name: FileName,
+    temp: FileName,
+    how: How,
+}
+
 impl core::fmt::Display for TempTag {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
@@ -2161,21 +2169,52 @@ impl Dir<ReadWrite> {
         Ok(Published { file: Flushed::of(&self.io, name, seen), how })
     }
 
-    /// `path` made to hold `content` atomically ONLY if nothing exists at `path` yet (via
-    /// `Effect::Link` from a sibling temporary file): returns `Ok(true)` when this call created
-    /// `path`, or `Ok(false)` when another entry already occupied `path` (never overwriting it).
-    pub fn publish_if_absent(
+    /// A staged sibling temporary file ready to be linked into its target path by
+    /// [`Dir::finish_publish_if_absent`].
+    pub fn stage_publish_if_absent(
         &self,
         cx: &Cx,
         path: &Path,
         content: Content<'_>,
         durable: Durable,
+    ) -> Result<StagedPublish, FsError> {
+        self.stage_if_absent_inner(cx, path, content, durable)
+    }
+
+    /// Commits a [`StagedPublish`] created by [`Dir::stage_publish_if_absent`] via `Effect::Link`
+    /// only if the target path is still absent, removing the temporary file and syncing directory
+    /// names as requested by `durable`.
+    pub fn finish_publish_if_absent(
+        &self,
+        cx: &Cx,
+        staged: StagedPublish,
+        durable: Durable,
     ) -> Result<bool, FsError> {
+        self.finish_if_absent_inner(cx, staged, durable)
+    }
+
+    fn stage_if_absent_inner(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<StagedPublish, FsError> {
         let name = self.beneath(path);
         let (temp, how) = self.place(cx, &name, content)?;
         if durable == Durable::Yes {
             let _ = Written::of(&self.io, temp.share()).flush(cx)?;
         }
+        Ok(StagedPublish { name, temp, how })
+    }
+
+    fn finish_if_absent_inner(
+        &self,
+        cx: &Cx,
+        staged: StagedPublish,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        let StagedPublish { name, temp, how } = staged;
         let from = temp.share();
         let to = name.share();
         let linked = match call(&self.io, cx, FsOp::Publish, &name, |tag| Effect::Link { from, to, tag })? {
@@ -2205,6 +2244,20 @@ impl Dir<ReadWrite> {
         }
         cx.event(how.says());
         Ok(linked)
+    }
+
+    /// `path` made to hold `content` atomically ONLY if nothing exists at `path` yet (via
+    /// `Effect::Link` from a sibling temporary file): returns `Ok(true)` when this call created
+    /// `path`, or `Ok(false)` when another entry already occupied `path` (never overwriting it).
+    pub fn publish_if_absent(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        content: Content<'_>,
+        durable: Durable,
+    ) -> Result<bool, FsError> {
+        let staged = self.stage_if_absent_inner(cx, path, content, durable)?;
+        self.finish_if_absent_inner(cx, staged, durable)
     }
 
     /// Acquires an exclusive advisory file lock at `path` (creating the lock file if absent) via
