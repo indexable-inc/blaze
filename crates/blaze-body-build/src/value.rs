@@ -1437,7 +1437,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             (PNode::Dynamic(_), PNode::Dynamic(_), Some(vt)) => {
                 let (pf, pt) = (self.principal(f)?, self.principal(t)?);
                 match (pf, pt) {
-                    (_, None) => return Err(self.unsupported("an unsizing to a trait object of auto traits alone")),
+                    (_, None) => vt,
                     (Some((a_tr, _)), Some((b_tr, _))) if a_tr == b_tr => vt,
                     (Some((a_tr, _)), Some((b_tr, _))) => {
                         let shape = vtable::Shape::of(a_tr, |tr| self.adts.object_trait(tr), self.subst.scratch)
@@ -1456,9 +1456,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 }
             }
             (_, PNode::Dynamic(_), None) => {
-                let Some((principal, args)) = self.principal(t)? else {
-                    return Err(self.unsupported("an unsizing to a trait object of auto traits alone"));
-                };
+                let (principal, args) = self.principal(t)?.unwrap_or((vtable::AUTO_ONLY_PRINCIPAL, List::EMPTY));
                 self.vtable_addr(VtableRef { concrete: f, principal, args })
             }
             _ => return Err(self.unsupported("an unsizing coercion of an unsupported shape")),
