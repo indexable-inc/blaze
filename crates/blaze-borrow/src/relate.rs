@@ -1306,6 +1306,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             s = cur;
             let Ok(n @ PNode::Alias { .. }) = self.node(s) else { break };
             let saved = (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v);
+            let env_mark = self.envs.len();
+            let seen_mark = self.impl_seen.len();
             match self.normalize(s, n, depth + step + 1) {
                 Ok(next) => {
                     (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
@@ -1314,6 +1316,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
                 Err(_) => {
                     (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
+                    self.impl_seen.truncate(seen_mark);
+                    self.truncate_envs(env_mark);
                     break;
                 }
             }
@@ -1329,6 +1333,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let kids = self.kids_of(s)?;
         let (_, args_rest) = s.slots.split(own).ok_or(self.malformed(s.ty, Bad::StepBound))?;
         let mut norm_subject = None;
+        let mut raw_fallback = None;
         let mut norm_args = [None; MAX_NORM_ARGS];
         if kids.len() > 0 {
             let (raw_sub, mut rem) = self.kid(s, &kids, args_rest, 0)?;
@@ -1338,10 +1343,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 if let Some(val) = self.try_normalize_non_impl(s, kids.len(), subject, trait_, name)? {
                     return Ok(val);
                 }
-                if (changed || subject.ty != raw_sub.ty)
-                    && let Some(val) = self.try_normalize_non_impl(s, kids.len(), raw_sub, trait_, name)?
-                {
-                    return Ok(val);
+                if changed || subject.ty != raw_sub.ty {
+                    raw_fallback = Some(raw_sub);
                 }
             }
             for k in 1..kids.len() {
@@ -1366,7 +1369,20 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let (head, value) = match selected.select_keyed(Ask { trait_, name: Some(name), written: s.ty }, &key) {
             Selection::Impl { head, value: Some(value) } => (head, value),
             Selection::Impl { value: None, .. } => return Err(self.malformed(s.ty, Bad::NoValue)),
-            Selection::Not(why) => return Err(Refused::Unselected { item: self.item, node: s.ty, trait_, name: Some(name), why }),
+            Selection::Not(why) => {
+                // Only fall back to non-impl bounds on the unnormalized raw subject when no
+                // concrete impl was selected for the normalized subject. Checking raw-subject
+                // trait bounds before `select_keyed` would prefer a cyclic trait bound like
+                // `SolCall::Parameters<'a>: SolType<Token<'a> = Self::Token<'a>>` over the
+                // concrete `impl SolType for (Address, Uint<256>)`, looping forever until
+                // `MOST_WALK_DEPTH`.
+                if let Some(raw_sub) = raw_fallback
+                    && let Some(val) = self.try_normalize_non_impl(s, kids.len(), raw_sub, trait_, name)?
+                {
+                    return Ok(val);
+                }
+                return Err(Refused::Unselected { item: self.item, node: s.ty, trait_, name: Some(name), why });
+            }
         };
         let ImplValue { value, gat_lifetimes } = value;
         let env = self.envs.impl_env_gat(head.lifetimes, gat_lifetimes, head.types).ok_or(self.malformed(s.ty, Bad::StepBound))?;
