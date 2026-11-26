@@ -527,3 +527,21 @@ fn by_value_shim_method_gets_slot_and_by_value_target() {
         ]
     );
 }
+
+/// Auto-trait-only trait objects (`dyn Send + Sync`, `AUTO_ONLY_PRINCIPAL`) have a header-only
+/// 3-word vtable `[drop_in_place, size, align]` with zero methods and zero supertrait slots.
+#[test]
+fn auto_only_principal_builds_header_only_vtable() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let shape = Shape::of(super::AUTO_ONLY_PRINCIPAL, |_| None, alloc).expect("auto-only shape");
+    assert!(shape.words.is_empty());
+    assert!(shape.prefix.is_empty());
+    let mut g = PortableTys::new_in(alloc);
+    let u32_ = g.intern(PNode::Uint(UintTy::U32)).unwrap();
+    let drop_fn = Instance { item: ItemKey(0xdd), args: g.intern_list(&[u32_]).unwrap() };
+    let vt = Vtable::build(&shape, u32_, &[], 16, 8, Some(drop_fn), &mut g, &NoFacts, alloc, alloc).expect("auto-only vtable");
+    assert_eq!(vt.bytes.len(), 24);
+    assert_eq!(u64::from_le_bytes(vt.bytes[8..16].try_into().unwrap()), 16);
+    assert_eq!(u64::from_le_bytes(vt.bytes[16..24].try_into().unwrap()), 8);
+    assert_eq!(&vt.relocs[..], &[(0, VtableTarget::Fn(drop_fn))]);
+}
