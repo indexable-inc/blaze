@@ -2456,6 +2456,11 @@ impl<M: MadeFor> Makers<M> {
         self.evicted
     }
 
+    /// Number of resident `(suite, MakerKind)` makers currently kept on this worker.
+    pub(crate) fn len(&self) -> usize {
+        self.kept.len()
+    }
+
     /// The maker of `job`'s suite and start class: kept, or made by `make` and kept. A kept
     /// maker made for another start class than `job`'s is refused by name (its control:
     /// [`MakersPlant::BySuiteAlone`]), never used. For `MakerStart::Direct(_)`, retargets the
@@ -2593,6 +2598,7 @@ impl KeptMakers for SuiteMakers<'_> {
         let cx = self.cx;
         let typed = self.typed;
         let tables = self.tables;
+        let before_makers = self.makers.len();
         let maker = self.makers.of(job, || {
             let reader = typed.reader(cx, side.crates.snapshot(), tables);
             let mut maker = Maker::of_start(names, job.entry, job.start, ByKind::new(reader), &side.builder, tables);
@@ -2601,8 +2607,9 @@ impl KeptMakers for SuiteMakers<'_> {
         })?;
         maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
         let out = job.order.make(maker, &job.proof, job.name.as_slice(), entry);
+        let cold_resident = self.makers.len() > before_makers && !self.makers.evicted();
         self.makes = self.makes.saturating_add(1);
-        if self.makes == 1 {
+        if cold_resident {
             let used = self.frame.used();
             if used >= self.reset_at && used < WORKER_FRAME_HARD_RESET_AT {
                 self.reset_at = used.saturating_add(256 << 20).min(WORKER_FRAME_HARD_RESET_AT);
