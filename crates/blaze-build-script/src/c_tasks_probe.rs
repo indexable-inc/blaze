@@ -1329,8 +1329,7 @@ fn probe_key(
 }
 
 /// Strategy seam (rule 78) for answering a canonical compiler probe: first instantiation is
-/// hermetic pinned `clang-23` (`HermeticClangProbe`), future instantiation is `blaze-cfront`,
-/// and offline zero-download mode uses [`TableAnswerer`].
+/// hermetic pinned `clang-23` (`HermeticClangProbe`), future instantiation is `blaze-cfront`.
 pub trait ProbeAnswerer {
     /// Stable identity of this answerer strategy and its confinement/format version (hashed into
     /// [`ProbeKey`]). Fallible because deriving a host runtime-closure digest can fail if a
@@ -1411,83 +1410,6 @@ pub fn resolve<'a, 'b>(
         stderr: probe.unspell(canonical.stderr.as_str(), spawn, alloc),
     };
     Ok(ResolvedProbe { key: probe.key, answerer_id, canonical_digest, answered })
-}
-
-/// Strategy implementation backed by the checked-in `pins/answers/clang.json` corpus (used only
-/// when no local clang shelf is installed).
-pub struct TableAnswerer<'t> {
-    table: &'t Table<'t>,
-}
-
-impl<'t> TableAnswerer<'t> {
-    pub fn new(table: &'t Table<'t>) -> TableAnswerer<'t> {
-        TableAnswerer { table }
-    }
-
-    pub fn strategy_id(table_id: ContentId) -> ContentId {
-        let mut h = Hasher::new("blaze-build-script c-probe table answerer 1");
-        h.id(&table_id).id(&implementation_id());
-        h.finish()
-    }
-}
-
-/// Escapes literal `$$` to `$$$$` so table-supplied replies round-trip verbatim through
-/// [`CanonicalProbe::unspell`] (which unescapes `$$` -> `$` while restoring placeholders).
-fn escape_double_dollar<'a>(text: &str, alloc: Alloc<'a>) -> AString<'a> {
-    if !text.contains("$$") {
-        return String::from_str_in(text, alloc);
-    }
-    let mut out = String::new_in(alloc);
-    let mut at = 0usize;
-    while let Some(rest) = text.get(at..) {
-        if rest.is_empty() {
-            break;
-        }
-        if rest.starts_with("$$") {
-            out.push_str("$$$$");
-            at += 2;
-        } else if let Some(ch) = rest.chars().next() {
-            out.push(ch);
-            at += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    out
-}
-
-impl ProbeAnswerer for TableAnswerer<'_> {
-    fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
-        Ok(Self::strategy_id(self.table.id()))
-    }
-
-    fn answer<'a, 'b>(
-        &self,
-        probe: &CanonicalProbe<'_, '_>,
-        _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
-        alloc: Alloc<'a>,
-    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
-        // Match against the table, treating `$MOUNT` as equivalent to `/package` for legacy rows
-        // written before mount normalization.
-        let found = self.table.rows.iter().find(|row| same_key_mount_compat(row, &probe.row));
-        let Some(row) = found else {
-            let refused = ProbeRefused { why: ProbeWhy::NoRow, row: row_json(&probe.row, alloc) };
-            let mut msg = String::new_in(alloc);
-            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{refused}"));
-            return Err(msg);
-        };
-        let Answer::Known { code, stdout, stderr } = &row.answer else {
-            let refused = ProbeRefused { why: ProbeWhy::Pending, row: row_json(&probe.row, alloc) };
-            let mut msg = String::new_in(alloc);
-            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{refused}"));
-            return Err(msg);
-        };
-        Ok(ProbeAnswer {
-            code: *code,
-            stdout: escape_double_dollar(stdout.as_str(), alloc),
-            stderr: escape_double_dollar(stderr.as_str(), alloc),
-        })
-    }
 }
 
 /// Like [`same_key`], also matching legacy `/package` rows against `$MOUNT`-normalized args.

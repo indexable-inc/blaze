@@ -14,7 +14,7 @@
 use blaze_own::Alloc;
 
 use crate::c_tasks_probe::{
-    Answered, CanonicalProbe, MOUNT, ProbeAnswer, ProbeAnswerer, ProbeCache, ProbeKey, ProbeWhy, Spawn, Table, TableAnswerer, TableWhy,
+    Answered, CanonicalProbe, MOUNT, ProbeAnswer, ProbeAnswerer, ProbeCache, ProbeKey, ProbeWhy, Spawn, Table, TableWhy,
     canonical_reply_digest, canonicalize, decode_answer, encode_answer, is_probe, resolve,
 };
 
@@ -256,7 +256,7 @@ fn the_pinned_table_answers_a_linux_arm64_family_probe() {
 #[test]
 fn mount_normalization_shares_probe_key_across_package_and_vendored_workspace() {
     let alloc = blaze_own::testing::heap().alloc();
-    let id = TableAnswerer::strategy_id(blaze_ids::ContentId([0; 32]));
+    let id = blaze_ids::ContentId([7; 32]);
     let pkg_args = flag_args("-ffile-prefix-map=/package=");
     let ws_args = flag_args("-ffile-prefix-map=/workspace/vendored/aws-lc-sys=");
     let pkg_spawn = Spawn { program: "cc", args: &pkg_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
@@ -722,9 +722,4 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert_eq!(can_tmp_a.key, can_tmp_b.key, "ambient TMPDIR must not split probe keys");
     assert_eq!(can_tmp_a.key, can_no_tmp.key, "ambient TMPDIR must match absent TMPDIR key");
     assert!(can_tmp_a.exec_env.iter().all(|(k, _)| k.as_str() != "TMPDIR"), "host TMPDIR must not persist into exec_env");
-
-    // TableAnswerer strategy id changes when the table bytes change.
-    let t1 = Table::parse(br#"{"form":1,"rows":[]}"#, alloc).expect("t1");
-    let t2 = Table::parse(br#"{"form":1,"comment":"v2","rows":[]}"#, alloc).expect("t2");
-    assert_ne!(TableAnswerer::new(&t1).id(alloc).expect("id1"), TableAnswerer::new(&t2).id(alloc).expect("id2"));
 }

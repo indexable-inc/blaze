@@ -578,63 +578,87 @@ impl ScriptSandbox {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = &self.out;
         let held_digest = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
-        let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
 
-        // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) stay on the ordinary compiler
-        // route so large generated `-E` or flag-check sources never trip the probe capture cap.
-        if crate::probe_clang::has_oversized_probe_input(&arg_refs, script.out_dir(), &mut held_bytes) {
-            return self.spawn_ordinary_compiler(program, spawned);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let table = match c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc) {
+                Ok(table) => table,
+                Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+            };
+            let probe = c_tasks_probe::Spawn {
+                program,
+                args: &arg_refs,
+                env: &env,
+                out_dir: script.out_dir(),
+                sdk,
+                mount: mount.as_str(),
+                sdk_id: "",
+                stdin: &spawned.stdin,
+            };
+            match table.answer(&clang, &probe, held_digest, alloc) {
+                Ok(answer) => self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()),
+                Err(why) => Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+            }
         }
 
-        match &script.c_probes {
-            Some(crate::probe_clang::CProbeSetting::Ready(c_probes)) => {
-                let configured_sdk = c_probes.sdk_dir.as_ref();
-                if !sdk.is_empty() && sdk != configured_sdk {
-                    return Err(self.refuse(Refusal::Spawn(refused(format!(
-                        "compiler probe SDKROOT `{sdk}` does not match configured command SDK `{configured_sdk}` (rule 21)"
-                    )))));
-                }
-                let probe = c_tasks_probe::Spawn {
-                    program,
-                    args: &arg_refs,
-                    env: &env,
-                    out_dir: script.out_dir(),
-                    sdk,
-                    mount: mount.as_str(),
-                    sdk_id: &c_probes.sdk_id,
-                    stdin: &spawned.stdin,
-                };
-                let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
-                let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
-                    Ok(resolved) => resolved,
-                    Err(why)
-                        if crate::probe_clang::is_stream_overflow_error(why.as_str())
-                            || crate::probe_clang::is_unlisted_table_probe_error(why.as_str()) =>
-                    {
-                        return self.spawn_ordinary_compiler(program, spawned);
+        #[cfg(target_os = "linux")]
+        {
+            let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
+
+            // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) stay on the ordinary compiler
+            // route so large generated `-E` or flag-check sources never trip the probe capture cap.
+            if crate::probe_clang::has_oversized_probe_input(&arg_refs, script.out_dir(), &mut held_bytes) {
+                return self.spawn_ordinary_compiler(program, spawned);
+            }
+
+            match &script.c_probes {
+                Some(crate::probe_clang::CProbeSetting::Ready(c_probes)) => {
+                    let configured_sdk = c_probes.sdk_dir.as_ref();
+                    if !sdk.is_empty() && sdk != configured_sdk {
+                        return Err(self.refuse(Refusal::Spawn(refused(format!(
+                            "compiler probe SDKROOT `{sdk}` does not match configured command SDK `{configured_sdk}` (rule 21)"
+                        )))));
                     }
-                    Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
-                };
-                let subject = facts::cc_probe_subject(&resolved.answerer_id, &clang, &c_probes.sdk_digest, &resolved.key, alloc);
-                let code = resolved.answered.code;
-                let stdout = resolved.answered.stdout.as_bytes().to_vec();
-                let stderr = resolved.answered.stderr.as_bytes().to_vec();
-                let subject_owned = subject.as_str().to_owned();
-                self.record(subject_owned, Some(resolved.canonical_digest));
-                self.deliver(program, spawned.modes, code, &stdout, &stderr)
+                    let probe = c_tasks_probe::Spawn {
+                        program,
+                        args: &arg_refs,
+                        env: &env,
+                        out_dir: script.out_dir(),
+                        sdk,
+                        mount: mount.as_str(),
+                        sdk_id: &c_probes.sdk_id,
+                        stdin: &spawned.stdin,
+                    };
+                    let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
+                    let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
+                        Ok(resolved) => resolved,
+                        Err(why) if crate::probe_clang::is_stream_overflow_error(why.as_str()) => {
+                            return self.spawn_ordinary_compiler(program, spawned);
+                        }
+                        Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
+                    };
+                    let subject = facts::cc_probe_subject(&resolved.answerer_id, &clang, &c_probes.sdk_digest, &resolved.key, alloc);
+                    let code = resolved.answered.code;
+                    let stdout = resolved.answered.stdout.as_bytes().to_vec();
+                    let stderr = resolved.answered.stderr.as_bytes().to_vec();
+                    let subject_owned = subject.as_str().to_owned();
+                    self.record(subject_owned, Some(resolved.canonical_digest));
+                    self.deliver(program, spawned.modes, code, &stdout, &stderr)
+                }
+                Some(crate::probe_clang::CProbeSetting::Unavailable(why)) => {
+                    Err(self.refuse(Refusal::Spawn(refused(why.as_ref().to_owned()))))
+                }
+                None => Err(self.refuse(Refusal::Spawn(refused(
+                    "no C compiler probe setting configured on this Script (rule 3)".to_owned(),
+                )))),
             }
-            Some(crate::probe_clang::CProbeSetting::Unavailable(why)) => {
-                Err(self.refuse(Refusal::Spawn(refused(why.as_ref().to_owned()))))
-            }
-            None => Err(self.refuse(Refusal::Spawn(refused(
-                "no C compiler probe setting configured on this Script (rule 3)".to_owned(),
-            )))),
         }
     }
 
     /// Routes a compiler invocation that outgrew probe bounds (input > 64 KiB or stream > 1 MiB)
     /// onto the ordinary compiler route (`Deferred` in check mode, `Executor` in build mode, or
     /// `NoSandbox` when no executor is configured).
+    #[cfg(target_os = "linux")]
     fn spawn_ordinary_compiler(&mut self, program: &str, spawned: &Decoded) -> Result<(), Stop> {
         if self.script.c_mode == CMode::Deferred {
             return self.spawn_deferred(program, spawned);

@@ -203,7 +203,7 @@ pub fn fact_now_with_probes<'a>(
             &probes.sdk_digest,
             Some(&*probes.records),
             alloc,
-        )
+        )?
         .flatten();
         return Ok(FactNow::Answer(now));
     }

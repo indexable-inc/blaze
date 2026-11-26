@@ -204,7 +204,7 @@ impl<'a> FactFiles<'a> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = alloc;
-            Ok(blaze_proc_macro::probe_clang::PinnedTableAnswerer::strategy_id())
+            Ok(blaze_proc_macro::probe_clang::default_answerer_strategy_id())
         }
     }
 

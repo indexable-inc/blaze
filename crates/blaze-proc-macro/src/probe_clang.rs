@@ -1,21 +1,20 @@
 //! Compiler probe answerer + content-addressed probe cache (`c-probe/<64-hex>`), implementing
 //! [`blaze_build_script::c_tasks_probe::ProbeAnswerer`] (rule 78, D174/D177).
 //!
-//! - Explicit per-OS answerer selection (rule 3: never a silent runtime fallback):
-//!   - On Linux hosts with a pinned `clang-23` shelf (`pins/clang.json`), [`open_command_c_probes`]
-//!     selects [`HermeticClangProbe`]: every probe miss executes the kernel-sealed `MFD_EXEC`
-//!     `clang-23` snapshot (`F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`) via
-//!     `execveat(..., AT_EMPTY_PATH)` inside `bstd::procs::hermetic::Hermetic` at `Level::Inputs`
-//!     (Landlock + seccomp) with `-fintegrated-cc1 --no-default-config`, live pre/post-exec ELF
-//!     runtime closure validation, and only the probe's own `OUT_DIR` inputs staged in a fresh
-//!     task folder.
-//!   - On macOS hosts (where XNU lacks descriptor-bound `execveat` / sealed `memfd`),
-//!     [`open_command_c_probes`] explicitly selects [`PinnedTableAnswerer`] over the checked-in
-//!     `pins/answers/clang.json` corpus paired with the same `c-probe/<64-hex>` CAS cache and
-//!     per-probe read invalidation.
-//! - If the host has no clang pin in `pins/clang.json`, [`open_command_c_probes`] returns a named
-//!   refusal retained as [`CProbeSetting::Unavailable`] so unrelated build scripts still run, while
-//!   any script issuing a C compiler probe fails explicitly naming what is missing.
+//! - On Linux hosts with a pinned `clang-23` shelf (`pins/clang.json`), [`open_command_c_probes`]
+//!   opens [`HermeticClangProbe`]: every probe miss executes the kernel-sealed `MFD_EXEC`
+//!   `clang-23` snapshot (`F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`) via
+//!   `execveat(..., AT_EMPTY_PATH)` inside `bstd::procs::hermetic::Hermetic` at `Level::Inputs`
+//!   (Landlock + seccomp) with `-fintegrated-cc1 --no-default-config`, live pre/post-exec ELF
+//!   runtime closure validation, and only the probe's own `OUT_DIR` inputs staged in a fresh
+//!   task folder.
+//! - On non-Linux hosts (e.g. macOS, where XNU lacks descriptor-bound `execveat` / sealed `memfd`),
+//!   `spawn_route::ScriptSandbox::spawn_probe` preserves the existing `pins/answers/clang.json`
+//!   pinned-table route untouched, and [`open_command_c_probes`] returns
+//!   [`CProbeSetting::Unavailable`].
+//! - If a Linux host has no clang pin in `pins/clang.json`, [`open_command_c_probes`] returns a
+//!   named refusal retained as [`CProbeSetting::Unavailable`] so unrelated build scripts still
+//!   run, while any script issuing a C compiler probe fails explicitly naming what is missing.
 //! - Every resolved probe's canonical answer is cached in [`CProbeStore`] (`DirStore` under
 //!   `c-probe/<64-hex>` or [`MemCProbeStore`] in tests), and [`c_probe_reply_now`] revalidates
 //!   `cc-probe\n<answerer>\n<clang>\n<sdk>\n<key>` against BOTH the active `(answerer_id,
@@ -36,12 +35,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use blaze_build_script::c_tasks_probe::{
-    self, CanonicalProbe, ProbeAnswer, ProbeAnswerer, ProbeCache, ProbeKey, canonical_reply_digest, decode_answer,
+    self, ProbeAnswerer, ProbeKey, canonical_reply_digest, decode_answer,
 };
+#[cfg(target_os = "linux")]
+use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeCache, Segment};
 #[cfg(any(target_os = "linux", test))]
 use blaze_build_script::c_tasks_probe::{OUT_DIR, SDKROOT};
-#[cfg(target_os = "linux")]
-use blaze_build_script::c_tasks_probe::Segment;
 use blaze_build_script::facts;
 #[cfg(target_os = "linux")]
 use blaze_build_script::shelf_pins;
@@ -50,7 +49,7 @@ use blaze_build_script::toolchain;
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Arc as OwnArc, SharedAlloc, String as OwnString, Vec as OwnVec};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use blaze_own::Share as _;
 use blaze_pins::CLANG_JSON;
 #[cfg(target_os = "linux")]
@@ -81,18 +80,16 @@ const PROBE_MOST_STREAM: u32 = 1 << 20;
 
 /// Maximum `OUT_DIR` input file size classified for hermetic probe execution; larger generated
 /// sources stay on the ordinary compiler route so they never trip `PROBE_MOST_STREAM`.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const MAX_PROBE_INPUT_BYTES: usize = 64 << 10;
 
 /// Error prefix emitted when a probe child exceeds `PROBE_MOST_STREAM` (`Stop::Stream`), signaling
 /// `spawn_probe` to route the invocation to the ordinary compiler path instead of aborting.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const STREAM_OVERFLOW_PREFIX: &str = "c-probe stream limit exceeded:";
 
-/// Error prefix emitted when [`PinnedTableAnswerer`] has no known row in `pins/answers/clang.json`
-/// for a probe, signaling `spawn_probe` to leave unlisted probes on the ordinary compiler route
-/// instead of aborting the build script.
-pub(crate) const UNLISTED_TABLE_PROBE_PREFIX: &str = "c-probe unlisted in pinned table:";
-
 /// Returns whether any `OUT_DIR` input file referenced by `args` exceeds `MAX_PROBE_INPUT_BYTES`.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn has_oversized_probe_input<'b>(
     args: &[&str],
     out_dir: &str,
@@ -113,14 +110,9 @@ pub(crate) fn has_oversized_probe_input<'b>(
 }
 
 /// Returns whether a probe answerer error indicates stream-capture overflow (`Stop::Stream`).
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn is_stream_overflow_error(msg: &str) -> bool {
     msg.starts_with(STREAM_OVERFLOW_PREFIX)
-}
-
-/// Returns whether a probe answerer error indicates an unlisted or pending table row that should
-/// stay on the ordinary compiler route.
-pub(crate) fn is_unlisted_table_probe_error(msg: &str) -> bool {
-    msg.starts_with(UNLISTED_TABLE_PROBE_PREFIX)
 }
 
 /// Maximum encoded + sealed `c-probe/<64-hex>` record size accepted from disk (`2 * 1 MiB`
@@ -234,9 +226,11 @@ impl CProbeStore for MemCProbeStore {
 }
 
 /// Adapter bridging [`CProbeStore`] to [`c_tasks_probe::ProbeCache`].
+#[cfg(any(target_os = "linux", test))]
 pub(crate) struct CacheAdapter<'s>(pub(crate) &'s dyn CProbeStore);
 
-impl ProbeCache for CacheAdapter<'_> {
+#[cfg(any(target_os = "linux", test))]
+impl c_tasks_probe::ProbeCache for CacheAdapter<'_> {
     fn get<'a>(&self, key: &ProbeKey, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, AString<'a>> {
         self.0.get(key, alloc).map_err(|e| own_fmt(format_args!("{e}"), alloc))
     }
@@ -284,57 +278,10 @@ impl CProbeSetting {
     }
 }
 
-/// Strategy answerer backed by the checked-in `pins/answers/clang.json` corpus.
-///
-/// Explicitly selected on macOS hosts (where XNU lacks descriptor-bound `execveat` / sealed
-/// `memfd`), preserving macOS's pinned-table probe behavior while retaining per-probe CAS caching
-/// and per-probe read invalidation. Never used as a silent runtime fallback on Linux (rule 3).
-pub struct PinnedTableAnswerer;
-
-impl PinnedTableAnswerer {
-    /// Strategy id derived from `pins/answers/clang.json` and the probe routing/storage
-    /// implementation sources (rule 69).
-    pub fn strategy_id() -> ContentId {
-        let table_id = c_tasks_probe::table_id(blaze_pins::CLANG_ANSWERS_JSON.as_bytes());
-        let base = c_tasks_probe::TableAnswerer::strategy_id(table_id);
-        let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe pinned table 1");
-        h.id(&base)
-            .part(include_bytes!("probe_clang.rs"))
-            .part(include_bytes!("spawn_route.rs"))
-            .part(include_bytes!("record.rs"));
-        h.finish()
-    }
-}
-
-impl ProbeAnswerer for PinnedTableAnswerer {
-    fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
-        Ok(Self::strategy_id())
-    }
-
-    fn answer<'a, 'b>(
-        &self,
-        probe: &CanonicalProbe<'_, '_>,
-        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
-        alloc: Alloc<'a>,
-    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
-        let table = c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc)
-            .map_err(|e| own_fmt(format_args!("pins/answers/clang.json: {e}"), alloc))?;
-        let inner = c_tasks_probe::TableAnswerer::new(&table);
-        let ans = inner
-            .answer(probe, input_bytes, alloc)
-            .map_err(|why| own_fmt(format_args!("{UNLISTED_TABLE_PROBE_PREFIX} {why}"), alloc))?;
-        let requested = probe.row.program.as_str();
-        Ok(ProbeAnswer {
-            code: ans.code,
-            stdout: rewrite_driver_prefix(ans.stdout.as_str(), requested, alloc),
-            stderr: rewrite_driver_prefix(ans.stderr.as_str(), requested, alloc),
-        })
-    }
-}
-
 /// Rewrites Clang's driver diagnostic prefix (`clang-23:`) at the start of any line to the
 /// requested compiler spelling (e.g. `cc:`, `c++:`, `gcc:`, `clang:`) so stderr/stdout match the
 /// spawned driver `argv[0]` rather than exposing the internal shelf binary name `clang-23`.
+#[cfg(any(target_os = "linux", test))]
 fn rewrite_driver_prefix<'a>(text: &str, requested_program: &str, alloc: Alloc<'a>) -> AString<'a> {
     if requested_program.is_empty() || requested_program == "clang-23" || !text.contains("clang-23:") {
         return OwnString::from_str_in(text, alloc);
@@ -373,7 +320,8 @@ pub fn default_answerer_strategy_id() -> ContentId {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        PinnedTableAnswerer::strategy_id()
+        let table_id = c_tasks_probe::table_id(blaze_pins::CLANG_ANSWERS_JSON.as_bytes());
+        ContentId::of("blaze-build-script c-probe non-linux table 1", &table_id.0)
     }
 }
 
@@ -730,10 +678,10 @@ impl HermeticClangProbe {
 /// Opens the command's [`CProbeSetting`] once at the command's edge (rule 75) through the
 /// command's existing deadline-aware [`bstd::fs::Fs`] capability (never opening a separate
 /// `NativeWorld` outside a context):
-/// - Uses `DirStore::build_scripts` for `c-probe/<64-hex>` records.
-/// - On Linux, uses [`HermeticClangProbe`] (kernel-sealed `MFD_EXEC` + `execveat`).
-/// - On macOS, explicitly uses [`PinnedTableAnswerer`] over `pins/answers/clang.json` (never a
-///   silent runtime fallback, rule 3).
+/// - On Linux, uses `DirStore::build_scripts` for `c-probe/<64-hex>` records and
+///   [`HermeticClangProbe`] (kernel-sealed `MFD_EXEC` + `execveat`).
+/// - On non-Linux hosts, returns [`CProbeSetting::Unavailable`] (non-Linux hosts continue using
+///   `pins/answers/clang.json` directly in `spawn_route::ScriptSandbox::spawn_probe`).
 /// - On hosts without a clang pin, returns [`CProbeSetting::Unavailable`] immediately with zero
 ///   filesystem I/O.
 pub fn open_command_c_probes<'a>(
@@ -745,25 +693,27 @@ pub fn open_command_c_probes<'a>(
     alloc: Alloc<'a>,
 ) -> CProbeSetting {
     let shared = SharedAlloc::global();
-    let pin = match toolchain::clang_pin(CLANG_JSON, host) {
-        Ok(pin) => pin,
-        Err(e) => {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cx, fs, home, host, sdk, alloc);
+        CProbeSetting::Unavailable(OwnArc::from_str_in(
+            "hermetic live C compiler probes require Linux kernel-sealed execveat (MFD_EXEC); non-Linux hosts use pins/answers/clang.json",
+            shared,
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let pin = match toolchain::clang_pin(CLANG_JSON, host) {
+            Ok(pin) => pin,
+            Err(e) => {
+                let msg = own_fmt(format_args!("{e}"), alloc);
+                return CProbeSetting::Unavailable(OwnArc::from_str_in(msg.as_str(), shared));
+            }
+        };
+        if let Err(e) = shelf_pins::shelf_program(CLANG_JSON, host, "clang-23") {
             let msg = own_fmt(format_args!("{e}"), alloc);
             return CProbeSetting::Unavailable(OwnArc::from_str_in(msg.as_str(), shared));
         }
-    };
-    #[cfg(target_os = "linux")]
-    if let Err(e) = shelf_pins::shelf_program(CLANG_JSON, host, "clang-23") {
-        let msg = own_fmt(format_args!("{e}"), alloc);
-        return CProbeSetting::Unavailable(OwnArc::from_str_in(msg.as_str(), shared));
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (cx, fs, home, sdk, pin);
-        return CProbeSetting::Unavailable(OwnArc::from_str_in("C compiler probes are unsupported on this host OS", shared));
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
         let Ok(v2_rel) = bstd::path::Path::new(".blaze/v2") else {
             return CProbeSetting::Unavailable(OwnArc::from_str_in("invalid .blaze/v2 path", shared));
         };
@@ -775,50 +725,43 @@ pub fn open_command_c_probes<'a>(
             }
         };
         let io = blaze_v2.world().share();
+        let Some(home_fs) = io.fs() else {
+            return CProbeSetting::Unavailable(OwnArc::from_str_in("c-probe home capability has no fs", shared));
+        };
+        let home_root = home_fs.root();
         let Ok(store_rel) = bstd::path::Path::new("build-script/records") else {
             return CProbeSetting::Unavailable(OwnArc::from_str_in("invalid c-probe records path", shared));
         };
         let store_dir = blaze_v2.subdir(&store_rel);
         let records: OwnArc<dyn CProbeStore, SharedAlloc<'static>> =
             OwnArc::new_in(DirStore::build_scripts(io.spawner(), io.boot().ok(), &store_dir), shared);
+        let shelf_hex = hex_bytes(&pin.sha256, alloc);
+        let shelf_sub_str = own_fmt(format_args!("toolchain/clang/{}", shelf_hex.as_str()), alloc);
+        let Ok(shelf_sub) = bstd::path::Path::new(shelf_sub_str.as_str()) else {
+            return CProbeSetting::Unavailable(OwnArc::from_str_in("invalid c-probe shelf path", shared));
+        };
+        let shelf_dir_cap = blaze_v2.subdir(&shelf_sub);
+        let work_rel = own_fmt(format_args!("{}/c-probes", crate::native_setting::NATIVE_WORK_DIR), alloc);
+        let work_root = Path::new(home).join(crate::native_setting::NATIVE_WORK_DIR).join("c-probes");
+        let (hermetic, clang_sha256) = match HermeticClangProbe::open_from_shelf(
+            home,
+            host,
+            sdk,
+            io,
+            shelf_dir_cap,
+            home_root,
+            work_rel.as_str(),
+            work_root,
+            alloc,
+        ) {
+            Ok(pair) => pair,
+            Err(why) => return CProbeSetting::Unavailable(OwnArc::from_str_in(why.as_str(), shared)),
+        };
         let (sdk_dir_str, sdk_str) = sdk.map_or(("", ""), |(dir, id)| (dir, id));
         let sdk_dir: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_dir_str, shared);
         let sdk_id: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_str, shared);
         let sdk_digest = facts::sdk_id_digest(sdk_str);
-        #[cfg(target_os = "linux")]
-        let (answerer, clang_sha256): (OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>>, [u8; 32]) = {
-            let Some(home_fs) = io.fs() else {
-                return CProbeSetting::Unavailable(OwnArc::from_str_in("c-probe home capability has no fs", shared));
-            };
-            let home_root = home_fs.root();
-            let shelf_hex = hex_bytes(&pin.sha256, alloc);
-            let shelf_sub_str = own_fmt(format_args!("toolchain/clang/{}", shelf_hex.as_str()), alloc);
-            let Ok(shelf_sub) = bstd::path::Path::new(shelf_sub_str.as_str()) else {
-                return CProbeSetting::Unavailable(OwnArc::from_str_in("invalid c-probe shelf path", shared));
-            };
-            let shelf_dir_cap = blaze_v2.subdir(&shelf_sub);
-            let work_rel = own_fmt(format_args!("{}/c-probes", crate::native_setting::NATIVE_WORK_DIR), alloc);
-            let work_root = Path::new(home).join(crate::native_setting::NATIVE_WORK_DIR).join("c-probes");
-            let (hermetic, clang_sha256) = match HermeticClangProbe::open_from_shelf(
-                home,
-                host,
-                sdk,
-                io,
-                shelf_dir_cap,
-                home_root,
-                work_rel.as_str(),
-                work_root,
-                alloc,
-            ) {
-                Ok(pair) => pair,
-                Err(why) => return CProbeSetting::Unavailable(OwnArc::from_str_in(why.as_str(), shared)),
-            };
-            (OwnArc::new_in(hermetic, shared), clang_sha256)
-        };
-        #[cfg(target_os = "macos")]
-        let (answerer, clang_sha256): (OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>>, [u8; 32]) = {
-            (OwnArc::new_in(PinnedTableAnswerer, shared), pin.sha256)
-        };
+        let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = OwnArc::new_in(hermetic, shared);
         CProbeSetting::Ready(CScriptProbes { answerer, records, sdk_dir, sdk_id, sdk_digest, clang_sha256 })
     }
 }
@@ -830,30 +773,40 @@ pub fn active_clang_pin(host: &str) -> Option<[u8; 32]> {
 
 /// Re-checks a recorded `cc-probe\n<answerer>\n<clang>\n<sdk>\n<key>` read subject against the
 /// command's active `(answerer_id, clang_sha256, sdk_digest)` and `store`:
-/// - `None`: `subject` is not a `cc-probe` subject.
-/// - `Some(None)`: active answerer, clang pin, or SDK changed, or cache miss/unreadable record
-///   (differs from any recorded digest, so only scripts that asked this probe re-run).
-/// - `Some(Some(digest))`: active identity matches and cached canonical probe answer hashes to `digest`.
-pub fn c_probe_reply_now(
+/// - `Ok(None)`: `subject` is not a `cc-probe` subject, or no store was provided.
+/// - `Ok(Some(None))`: active answerer, clang pin, or SDK changed, or the record is genuinely
+///   absent/corrupt (differs from any recorded digest, so only scripts that asked this probe re-run).
+/// - `Ok(Some(Some(digest)))`: active identity matches and cached canonical probe answer hashes to
+///   `digest`.
+/// - `Err(why)`: reading from `store` failed with a real [`CProbeStoreError`] (e.g. I/O,
+///   permission, or deadline error), propagated instead of silently downgrading to a cache miss.
+pub fn c_probe_reply_now<'a>(
     subject: &str,
     active_answerer: &ContentId,
     active_clang: &[u8; 32],
     active_sdk: &[u8; 32],
     store: Option<&dyn CProbeStore>,
-    alloc: Alloc<'_>,
-) -> Option<Option<ContentId>> {
-    let parsed = facts::parse_cc_probe_subject(subject)?;
+    alloc: Alloc<'a>,
+) -> Result<Option<Option<ContentId>>, AString<'a>> {
+    let Some(parsed) = facts::parse_cc_probe_subject(subject) else {
+        return Ok(None);
+    };
     if parsed.answerer != *active_answerer || parsed.clang != *active_clang || parsed.sdk != *active_sdk {
-        return Some(None);
+        return Ok(Some(None));
     }
-    let store = store?;
-    let Ok(Some(bytes)) = store.get(&parsed.key, alloc) else {
-        return Some(None);
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let Some(bytes) = store
+        .get(&parsed.key, alloc)
+        .map_err(|e| own_fmt(format_args!("{e}"), alloc))?
+    else {
+        return Ok(Some(None));
     };
     let Ok(ans) = decode_answer(bytes.as_slice(), alloc) else {
-        return Some(None);
+        return Ok(Some(None));
     };
-    Some(Some(canonical_reply_digest(&ans)))
+    Ok(Some(Some(canonical_reply_digest(&ans))))
 }
 
 /// Bounded RAII cleanup of a per-probe task folder through deadline-aware `bstd::fs` (zero
@@ -1456,7 +1409,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::HermeticClangProbe;
     use super::{
-        CProbeSetting, CProbeStore as _, CacheAdapter, MemCProbeStore, PinnedTableAnswerer, c_probe_reply_now,
+        CProbeSetting, CProbeStore as _, CacheAdapter, MemCProbeStore, c_probe_reply_now,
         open_command_c_probes, resolve_source_date_epoch,
     };
 
@@ -1576,7 +1529,7 @@ mod tests {
             );
             assert_eq!(
                 c_probe_reply_now(subject.as_str(), &aid, &pin.sha256, &empty_sdk, Some(store.as_ref()), alloc),
-                Some(Some(resolved.canonical_digest))
+                Ok(Some(Some(resolved.canonical_digest)))
             );
             checked += 1;
         }
@@ -1671,17 +1624,43 @@ mod tests {
         let subj_a = cc_probe_subject(&stub_id, &pin, &sdk_a, &res_a.key, alloc);
         let subj_b = cc_probe_subject(&stub_id, &pin, &sdk_a, &res_b.key, alloc);
 
-        assert_eq!(c_probe_reply_now(subj_a.as_str(), &stub_id, &pin, &sdk_a, Some(&store), alloc), Some(Some(res_a.canonical_digest)));
-        assert_eq!(c_probe_reply_now(subj_b.as_str(), &stub_id, &pin, &sdk_a, Some(&store), alloc), Some(Some(res_b.canonical_digest)));
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &stub_id, &pin, &sdk_a, Some(&store), alloc), Ok(Some(Some(res_a.canonical_digest))));
+        assert_eq!(c_probe_reply_now(subj_b.as_str(), &stub_id, &pin, &sdk_a, Some(&store), alloc), Ok(Some(Some(res_b.canonical_digest))));
 
         // Upgrading clang pin, answerer id, or macOS SDK invalidates recorded probe reads even
         // though the old record file still exists on disk.
         let new_pin = [8u8; 32];
-        assert_eq!(c_probe_reply_now(subj_a.as_str(), &stub_id, &new_pin, &sdk_a, Some(&store), alloc), Some(None));
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &stub_id, &new_pin, &sdk_a, Some(&store), alloc), Ok(Some(None)));
         let new_answerer = blaze_ids::ContentId::of("stub-cprobe-selective-test", b"2");
-        assert_eq!(c_probe_reply_now(subj_a.as_str(), &new_answerer, &pin, &sdk_a, Some(&store), alloc), Some(None));
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &new_answerer, &pin, &sdk_a, Some(&store), alloc), Ok(Some(None)));
         let new_sdk = blaze_build_script::facts::sdk_id_digest("macos-sdk-15.4");
-        assert_eq!(c_probe_reply_now(subj_a.as_str(), &stub_id, &pin, &new_sdk, Some(&store), alloc), Some(None));
+        assert_eq!(c_probe_reply_now(subj_a.as_str(), &stub_id, &pin, &new_sdk, Some(&store), alloc), Ok(Some(None)));
+
+        // Store read failures (I/O, permission, deadline) must propagate as Err instead of
+        // silently downgrading to a cache miss in both `c_probe_reply_now` and `fact_now_with_probes`.
+        struct FailingCProbeStore;
+        impl super::CProbeStore for FailingCProbeStore {
+            fn get<'a>(&self, key: &blaze_build_script::c_tasks_probe::ProbeKey, _alloc: blaze_own::Alloc<'a>) -> Result<Option<AVec<'a, u8>>, super::CProbeStoreError> {
+                Err(super::CProbeStoreError::Twice(*key))
+            }
+            fn put(&self, key: &blaze_build_script::c_tasks_probe::ProbeKey, _bytes: &[u8]) -> Result<(), super::CProbeStoreError> {
+                Err(super::CProbeStoreError::Twice(*key))
+            }
+        }
+        let store_err = c_probe_reply_now(subj_a.as_str(), &stub_id, &pin, &sdk_a, Some(&FailingCProbeStore), alloc)
+            .expect_err("store read failure must propagate from c_probe_reply_now");
+        assert!(store_err.as_str().contains("already held"), "unexpected store error: {store_err}");
+        let failing_probes = super::CScriptProbes {
+            answerer: blaze_own::Arc::new_in(StubAnswerer, super::SharedAlloc::global()),
+            records: blaze_own::Arc::new_in(FailingCProbeStore, super::SharedAlloc::global()),
+            sdk_dir: blaze_own::Arc::from_str_in("", super::SharedAlloc::global()),
+            sdk_id: blaze_own::Arc::from_str_in("macos-sdk-15.2", super::SharedAlloc::global()),
+            sdk_digest: sdk_a,
+            clang_sha256: pin,
+        };
+        let fact_store_err = crate::fact_pins::fact_now_with_probes(subj_a.as_str(), None, Some(&failing_probes), alloc)
+            .expect_err("store read failure must propagate from fact_now_with_probes");
+        assert!(fact_store_err.as_str().contains("already held"), "unexpected fact_now store error: {fact_store_err}");
 
         // Mutating ONLY probe A's cached record invalidates A and leaves B intact.
         let mut mutated = AVec::new_in(alloc);
@@ -1693,12 +1672,12 @@ mod tests {
 
         assert_ne!(
             c_probe_reply_now(subj_a.as_str(), &stub_id, &pin, &sdk_a, Some(&store), alloc),
-            Some(Some(res_a.canonical_digest)),
+            Ok(Some(Some(res_a.canonical_digest))),
             "mutated probe A must invalidate its asking script"
         );
         assert_eq!(
             c_probe_reply_now(subj_b.as_str(), &stub_id, &pin, &sdk_a, Some(&store), alloc),
-            Some(Some(res_b.canonical_digest)),
+            Ok(Some(Some(res_b.canonical_digest))),
             "unrelated probe B must remain valid"
         );
 
@@ -1729,78 +1708,10 @@ mod tests {
                 .expect_err("missing shelf must fail loudly on first probe miss");
             assert!(err.as_str().contains("missing"), "unexpected missing-shelf error: {err}");
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         {
-            let mac_ready = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "aarch64-apple-darwin", None, alloc);
-            let CProbeSetting::Ready(mac_probes) = mac_ready else {
-                panic!("macOS host must select PinnedTableAnswerer");
-            };
-            assert_eq!(mac_probes.answerer.id(alloc).expect("id"), PinnedTableAnswerer::strategy_id());
-        }
-        // `PinnedTableAnswerer` resolves a pinned `pins/answers/clang.json` row via the CAS cache,
-        // revalidates through `c_probe_reply_now`, and refuses unknown probes explicitly.
-        {
-            let darwin_pin = clang_pin(CLANG_JSON, "aarch64-apple-darwin").expect("darwin pin").sha256;
-            let table_store = MemCProbeStore::default();
-            let table_cache = CacheAdapter(&table_store);
-            let sp_q = Spawn {
-                program: "cc",
-                args: &["-?"],
-                env: &[("MACOSX_DEPLOYMENT_TARGET", "11.0")],
-                out_dir: "/out",
-                sdk: "",
-                mount: "/package",
-                sdk_id: "",
-                stdin: &[],
-            };
-            let mut no_bytes = |_: &str| None;
-            let resolved = resolve(&PinnedTableAnswerer, &table_cache, &darwin_pin, &sp_q, |_| None, &mut no_bytes, alloc)
-                .expect("pinned table resolves known darwin probe");
-            assert_eq!(resolved.answerer_id, PinnedTableAnswerer::strategy_id());
-            assert!(
-                resolved.answered.stderr.as_str().starts_with("cc: error:"),
-                "pinned table answerer must preserve requested driver spelling, got: {}",
-                resolved.answered.stderr.as_str()
-            );
-            assert_eq!(table_store.len(), 1);
-            let table_subj = cc_probe_subject(
-                &resolved.answerer_id,
-                &darwin_pin,
-                &blaze_build_script::facts::sdk_id_digest(""),
-                &resolved.key,
-                alloc,
-            );
-            assert_eq!(
-                c_probe_reply_now(
-                    table_subj.as_str(),
-                    &PinnedTableAnswerer::strategy_id(),
-                    &darwin_pin,
-                    &blaze_build_script::facts::sdk_id_digest(""),
-                    Some(&table_store),
-                    alloc,
-                ),
-                Some(Some(resolved.canonical_digest)),
-            );
-            let sp_unknown = Spawn {
-                program: "cc",
-                args: &["-fno-such-pinned-probe-flag-xyz", "-c", "/out/flag_check.c", "-o", "/out/flag_check"],
-                env: &[],
-                out_dir: "/out",
-                sdk: "",
-                mount: "/package",
-                sdk_id: "",
-                stdin: &[],
-            };
-            let unknown_err = resolve(&PinnedTableAnswerer, &table_cache, &darwin_pin, &sp_unknown, dig, &mut bytes, alloc)
-                .expect_err("unlisted probe must signal handoff to ordinary compiler route");
-            assert!(
-                super::is_unlisted_table_probe_error(unknown_err.as_str()),
-                "unlisted table probe must carry UNLISTED_TABLE_PROBE_PREFIX so spawn_probe hands off to ordinary compiler, got: {unknown_err}"
-            );
-            assert!(
-                !super::is_unlisted_table_probe_error("pins/answers/clang.json: invalid json"),
-                "parse errors must NOT be misclassified as unlisted table rows"
-            );
+            let non_linux = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "aarch64-apple-darwin", None, alloc);
+            assert!(matches!(non_linux, CProbeSetting::Unavailable(_)), "non-Linux hosts keep pinned-table route");
         }
         let _ = std::fs::remove_dir_all(&empty_home);
 

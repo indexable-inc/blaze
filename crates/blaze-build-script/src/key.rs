@@ -131,6 +131,14 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         .update(&l.out_dir_files.to_le_bytes())
         .update(&l.output.to_le_bytes())
         .update(&l.line.to_le_bytes());
+    #[cfg(not(target_os = "linux"))]
+    if let RunnerKey::Wasm = inputs.runner {
+        // On non-Linux hosts, wasm compiler probes still use the pinned table in
+        // `pins/answers/clang.json` (preserving main's exact behavior until a descriptor-bound
+        // macOS execution backend lands). On Linux, probes execute hermetically and record
+        // per-probe `cc-probe` read subjects instead of hashing the whole table into every key.
+        hasher.part(b"clang answers").id(&crate::c_tasks_probe::table_id(blaze_pins::CLANG_ANSWERS_JSON.as_bytes()));
+    }
     if let RunnerKey::Native { compiler, target, sysroot, host_tools } = inputs.runner {
         hasher.part(b"native").part(&compiler).part(target.as_bytes()).part(sysroot.as_bytes());
         if !host_tools.is_empty() {

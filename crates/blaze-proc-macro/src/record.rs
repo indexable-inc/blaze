@@ -542,10 +542,14 @@ impl DirStore {
             Some(self.files.lock_exclusive(&lock_name)?)
         };
         let single_read = self.plant == RecordPlant::SingleReadCProbe;
-        let result = if repair_guard.is_some()
-            && let Some(held) = self.files.read_sealed_bounded(name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc)?
-        {
-            if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) }
+        let result = if repair_guard.is_some() {
+            match self.files.read_sealed_bounded(name, crate::probe_clang::MAX_RECORD_BYTES, single_read, alloc) {
+                Ok(Some(held)) => {
+                    if held.as_slice() == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name: *name }) }
+                }
+                Ok(None) => self.files.publish(name, whole.as_slice()),
+                Err(err) => Err(err),
+            }
         } else {
             self.files.publish(name, whole.as_slice())
         };
