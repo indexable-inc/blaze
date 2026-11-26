@@ -202,7 +202,13 @@ impl<'h> TypedFrom<'h> {
     /// The reader over the run's body ids `ids` (a second view of the parent's table, no row
     /// copied: run_ids.rs `RunIds` is `Copy`).
     pub(crate) fn over(self, ids: crate::run_ids::RunIds<'h>) -> StoreTyped<'h> {
-        StoreTyped { from: self, ids }
+        StoreTyped {
+            from: self,
+            ids,
+            kept_program: blaze_own::Vec::new_in(self.alloc),
+            kept_toolchain: blaze_own::Vec::new_in(self.alloc),
+            persist_error: None,
+        }
     }
 
     /// `Send + Sync` worker-side handle over the standing answer's `Records` and immutable
@@ -211,6 +217,55 @@ impl<'h> TypedFrom<'h> {
     pub(crate) fn sync_over(self, ids: crate::run_ids::RunIds<'h>) -> SyncTypedFrom<'h> {
         SyncTypedFrom { records: self.records, ids: ids.lookup() }
     }
+}
+
+/// One newly typechecked dependency or toolchain body encoded into a `BZR1`-selective buffer on
+/// a parallel export worker, awaiting main-thread `Lent::put` and root registration.
+pub(crate) struct PendingTypedPut {
+    pub(crate) key: Key,
+    pub(crate) class: blaze_ladder::code_records::CodeClass,
+    pub(crate) bytes: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+}
+
+/// Per-job batch of encoded dependency/toolchain typed-body puts and program-class cache hits
+/// drained from a parallel export worker's [`SnapshotTyped`] into `ExportDone`.
+pub(crate) struct WorkerTypedBatch {
+    pub(crate) puts: blaze_own::Vec<PendingTypedPut, blaze_own::SharedAlloc<'static>>,
+    pub(crate) hit_program: blaze_own::Vec<blaze_cas::Key, blaze_own::SharedAlloc<'static>>,
+}
+
+impl WorkerTypedBatch {
+    fn new_in(shared: blaze_own::SharedAlloc<'static>) -> Self {
+        Self {
+            puts: blaze_own::Vec::new_in(shared),
+            hit_program: blaze_own::Vec::new_in(shared),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.puts.is_empty() && self.hit_program.is_empty()
+    }
+}
+
+/// Puts an encoded dependency/toolchain typed-body record into `lent` under `key` if absent,
+/// returning `Ok(true)` when a new write occurred and `Ok(false)` when already stored.
+/// Refuses loudly on any store error (including `TwoValues`, rules 3 and 21).
+pub(crate) fn put_dep_typed_if_absent<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    key: Key,
+    bytes: &[u8],
+) -> Result<bool, blaze_cas::plain::LentError> {
+    let cas_key = blaze_cas::Key(key.0);
+    if lent.tag_of(&cas_key)?.is_some() {
+        return Ok(false);
+    }
+    lent.put(
+        &cas_key,
+        blaze_keyed::kind::Namespace::LOCAL,
+        blaze_keyed::kind::ReservedTag::Drive.tag(),
+        bytes,
+    )?;
+    Ok(true)
 }
 
 /// `Send + Sync` typed-record lookup inputs shared read-only across all `CodePool` workers.
@@ -223,6 +278,8 @@ pub(crate) struct SyncTypedFrom<'h> {
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SyncTypedFrom<'static>>();
+    fn assert_send<T: Send>() {}
+    assert_send::<WorkerTypedBatch>();
 };
 
 impl<'h> SyncTypedFrom<'h> {
@@ -237,30 +294,70 @@ impl<'h> SyncTypedFrom<'h> {
     where
         'h: 'w,
     {
-        SnapshotTyped { cx, snapshot, records: self.records, ids: self.ids, alloc }
+        SnapshotTyped { cx, snapshot, records: self.records, ids: self.ids, alloc, pending: None }
+    }
+
+    /// Constructs a lock-free [`SnapshotTyped`] reader on a parallel export worker that also
+    /// buffers newly typechecked dependency/toolchain `Checked` records and program-class cache
+    /// hits in `shared` for main-thread CAS persistence and GC rooting.
+    pub(crate) fn reader_persisting<'w>(
+        self,
+        cx: &'w Cx,
+        snapshot: &'w crate::store::StoreSnapshot,
+        alloc: blaze_own::Alloc<'static>,
+        shared: blaze_own::SharedAlloc<'static>,
+    ) -> SnapshotTyped<'w>
+    where
+        'h: 'w,
+    {
+        SnapshotTyped {
+            cx,
+            snapshot,
+            records: self.records,
+            ids: self.ids,
+            alloc,
+            pending: Some((shared, core::cell::RefCell::new(WorkerTypedBatch::new_in(shared)))),
+        }
     }
 }
 
 /// Lock-free read-only [`KeptBodies`](blaze_ladder::front2::program::lazy::typed::KeptBodies)
 /// reader for parallel `CodePool` workers: reads both committed segments and uncommitted check
 /// puts (`Visibility::InArena`) straight from [`StoreSnapshot`](crate::store::StoreSnapshot) with
-/// zero locks, avoiding redundant workspace re-typechecking on worker threads.
+/// zero locks, avoiding redundant workspace, dependency, and toolchain re-typechecking on worker
+/// threads. When constructed via [`SyncTypedFrom::reader_persisting`], newly checked dependency
+/// and toolchain bodies are encoded into [`WorkerTypedBatch`] for coordinator persistence.
 pub(crate) struct SnapshotTyped<'h> {
     cx: &'h Cx,
     snapshot: &'h crate::store::StoreSnapshot,
     records: &'h dyn crate::engine_run_answer::Records,
     ids: crate::run_ids::IdsLookup<'h>,
     alloc: blaze_own::Alloc<'static>,
+    pending: Option<(blaze_own::SharedAlloc<'static>, core::cell::RefCell<WorkerTypedBatch>)>,
+}
+
+impl SnapshotTyped<'_> {
+    /// Drains any pending dep/toolchain typed-body puts and program-class cache hits accumulated
+    /// since the previous drain. Returns `None` when nothing was queued (zero allocation).
+    pub(crate) fn take_pending(&self) -> Option<WorkerTypedBatch> {
+        let (shared, batch_cell) = self.pending.as_ref()?;
+        let mut batch = batch_cell.borrow_mut();
+        if batch.is_empty() {
+            return None;
+        }
+        Some(core::mem::replace(&mut *batch, WorkerTypedBatch::new_in(*shared)))
+    }
 }
 
 /// THE READER of the typed records, kind by kind (blaze-ladder lazy/typed.rs `KeptBodies`), what
 /// the run's maker reads through (run_parent.rs `RunMaker`, blaze-ladder make_one.rs `ByKind`):
 ///
-/// - a toolchain's or a dependency's body (`RunIds::grain`) is the run's own check, by kind:
-///   `check` checks none of them;
-/// - a fn declared in a body (its key's inner bit, typed.rs `is_local`) likewise: its check is
-///   its root's, and the root's record is not its own (reading it under the local's key would be
-///   two values under one key, rule 21);
+/// - a non-local toolchain or dependency body (`RunIds::grain`, `IdsLookup::dep_typed_key`):
+///   probes the CAS under its deterministic input-complete key; reads `Checked` on hit, or checks
+///   once on miss and persists the `BZR1`-selective `Checked` record via `keep_checked`;
+/// - a fn declared in a body (its key's inner bit, typed.rs `is_local`): checked by the run
+///   because its check is its root's and reading the root's record under the local's key would be
+///   two values under one key (rule 21);
 /// - a workspace root body: its row (`RunIds::check_of`), the check's run facts record where the
 ///   answer names it (`Records::record`), the typed record's key the facts hold
 ///   (engine_body_facts.rs `BodyFacts::typed`), the record from the store, decoded once
@@ -274,6 +371,28 @@ pub(crate) struct SnapshotTyped<'h> {
 pub(crate) struct StoreTyped<'h> {
     from: TypedFrom<'h>,
     ids: crate::run_ids::RunIds<'h>,
+    kept_program: blaze_own::Vec<blaze_cas::Key, blaze_own::Alloc<'static>>,
+    kept_toolchain: blaze_own::Vec<blaze_cas::Key, blaze_own::Alloc<'static>>,
+    persist_error: Option<blaze_cas::plain::LentError>,
+}
+
+impl StoreTyped<'_> {
+    /// Program-class (`Grain::Dependency`) typed-body keys read or written by this reader, for
+    /// `keep_program` GC rooting before store commit.
+    pub(crate) fn kept_program(&self) -> &[blaze_cas::Key] {
+        self.kept_program.as_slice()
+    }
+
+    /// Newly written toolchain-class (`Grain::Toolchain`) typed-body keys, for `keep_toolchain`
+    /// GC rooting before store commit.
+    pub(crate) fn kept_toolchain(&self) -> &[blaze_cas::Key] {
+        self.kept_toolchain.as_slice()
+    }
+
+    /// First store error encountered while persisting a dep/toolchain typed record, if any.
+    pub(crate) fn persist_error(&self) -> Option<&blaze_cas::plain::LentError> {
+        self.persist_error.as_ref()
+    }
 }
 
 /// Single shared decode path for [`StoreTyped`] and [`SnapshotTyped`] (rule 30).
@@ -284,20 +403,51 @@ fn decode_body_source<'s>(
     alloc: blaze_own::Alloc<'static>,
     key: blaze_typeck::ItemKey,
     mut get: impl FnMut(Name, Key) -> Result<Option<&'s [u8]>, TypedReadError>,
+    mut on_dep_hit: impl FnMut(Key, blaze_ladder::code_records::CodeClass),
 ) -> Result<blaze_ladder::front2::program::lazy::typed::BodySource, blaze_ladder::front2::program::lazy::typed::TypedGap> {
     use blaze_ladder::front2::program::lazy::typed::{BodySource, RunChecked, TypedGap, is_local};
     use crate::run_ids::Grain;
-    match ids.grain(key) {
-        Some(Grain::Toolchain) => return Ok(BodySource::Run(RunChecked::Toolchain)),
-        Some(Grain::Dependency) => return Ok(BodySource::Run(RunChecked::Dependency)),
-        Some(Grain::Workspace) => {}
+    let grain = match ids.grain(key) {
+        Some(grain) => grain,
         // No crate row: the run gate refused it before any make (run_ids.rs `runnable`).
         None => return Err(TypedGap::NoRecord { key }),
-    }
+    };
     if is_local(key) {
-        return Ok(BodySource::Run(RunChecked::Local));
+        return Ok(BodySource::Run(match grain {
+            Grain::Toolchain => RunChecked::Toolchain,
+            Grain::Dependency => RunChecked::Dependency,
+            Grain::Workspace => RunChecked::Local,
+        }));
     }
     let read = |why: TypedReadError| TypedGap::Read { key, why: Box::new(why) };
+    match grain {
+        Grain::Toolchain | Grain::Dependency => {
+            let run_kind = match grain {
+                Grain::Toolchain => RunChecked::Toolchain,
+                Grain::Dependency => RunChecked::Dependency,
+                Grain::Workspace => unreachable!(),
+            };
+            let Some((dep_key, class)) = ids.dep_typed_key(key) else {
+                return Ok(BodySource::Run(run_kind));
+            };
+            let check = Name::new(blaze_drive::Kind::BodyCheck, dep_key.0);
+            let _cx = cx.span("engine: a dep/toolchain body's typed record read");
+            let Some(bytes) = get(check, dep_key).map_err(read)? else {
+                return Ok(BodySource::Run(run_kind));
+            };
+            let decoded = crate::store::record_codec::decode_if_envelope_in(
+                bytes,
+                crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+                alloc,
+            )
+            .map_err(|why| read(TypedReadError::Decompress { body: check, key: dep_key, why }))?;
+            let checked = blaze_typeck::checked_record::decode(decoded.as_slice(), alloc)
+                .map_err(|why| TypedGap::Record { key, why })?;
+            on_dep_hit(dep_key, class);
+            return Ok(BodySource::Read(checked));
+        }
+        Grain::Workspace => {}
+    }
     let facts_refused = |check: Name, what: &'static str| read(TypedReadError::Facts { body: check, what });
     let Some(check) = ids.check_of(key) else { return Err(TypedGap::NoRecord { key }) };
     let Some(facts_at) = records.record(check).map_err(|what| facts_refused(check, what))? else { return Err(TypedGap::NoRecord { key }) };
@@ -318,7 +468,7 @@ fn decode_body_source<'s>(
     let decoded = crate::store::record_codec::decode_if_envelope_in(
         bytes,
         crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
-        cx.frame(),
+        alloc,
     )
     .map_err(|why| read(TypedReadError::Decompress { body: check, key: at, why }))?;
     blaze_typeck::checked_record::decode(decoded.as_slice(), alloc).map(BodySource::Read).map_err(|why| TypedGap::Record { key, why })
@@ -327,21 +477,130 @@ fn decode_body_source<'s>(
 impl blaze_ladder::front2::program::lazy::typed::KeptBodies for StoreTyped<'_> {
     fn source(&mut self, key: blaze_typeck::ItemKey) -> Result<blaze_ladder::front2::program::lazy::typed::BodySource, blaze_ladder::front2::program::lazy::typed::TypedGap> {
         let lent = self.from.lent;
-        decode_body_source(self.from.cx, self.ids.lookup(), self.from.records, self.from.alloc, key, |check, at| {
-            match lent.get(&blaze_cas::Key(at.0)) {
+        let kept_program = &mut self.kept_program;
+        decode_body_source(
+            self.from.cx,
+            self.ids.lookup(),
+            self.from.records,
+            self.from.alloc,
+            key,
+            |check, at| match lent.get(&blaze_cas::Key(at.0)) {
                 Ok(found) => Ok(found.map(|lend| lend.bytes)),
                 Err(why) => Err(TypedReadError::Store { body: check, key: at, why }),
+            },
+            |dep_key, class| {
+                if class == blaze_ladder::code_records::CodeClass::Program {
+                    kept_program.push(blaze_cas::Key(dep_key.0));
+                }
+            },
+        )
+    }
+
+    fn keep_checked(
+        &mut self,
+        key: blaze_typeck::ItemKey,
+        kind: blaze_ladder::front2::program::lazy::typed::RunChecked,
+        checked: &blaze_typeck::Checked<'static>,
+    ) {
+        use blaze_ladder::code_records::CodeClass;
+        use blaze_ladder::front2::program::lazy::typed::RunChecked;
+        if !matches!(kind, RunChecked::Toolchain | RunChecked::Dependency) {
+            return;
+        }
+        let Some((dep_key, class)) = self.ids.lookup().dep_typed_key(key) else {
+            return;
+        };
+        let cas_key = blaze_cas::Key(dep_key.0);
+        match self.from.lent.tag_of(&cas_key) {
+            Ok(Some(_)) => {
+                if class == CodeClass::Program {
+                    self.kept_program.push(cas_key);
+                }
+                return;
             }
-        })
+            Ok(None) => {}
+            Err(why) => {
+                if self.persist_error.is_none() {
+                    self.persist_error = Some(why);
+                }
+                return;
+            }
+        }
+        let _span = self.from.cx.span("engine: persist dep/toolchain typed record");
+        let Ok(raw) = blaze_typeck::checked_record::encode(checked, self.from.alloc) else {
+            return;
+        };
+        let Ok(encoded) = crate::store::record_codec::encode_selective_in(raw.as_slice(), self.from.alloc) else {
+            return;
+        };
+        match put_dep_typed_if_absent(self.from.lent, dep_key, encoded.as_slice()) {
+            Ok(wrote) => match class {
+                CodeClass::Program => self.kept_program.push(cas_key),
+                CodeClass::Toolchain if wrote => self.kept_toolchain.push(cas_key),
+                CodeClass::Toolchain => {}
+            },
+            Err(why) => {
+                if self.persist_error.is_none() {
+                    self.persist_error = Some(why);
+                }
+            }
+        }
     }
 }
 
 impl blaze_ladder::front2::program::lazy::typed::KeptBodies for SnapshotTyped<'_> {
     fn source(&mut self, key: blaze_typeck::ItemKey) -> Result<blaze_ladder::front2::program::lazy::typed::BodySource, blaze_ladder::front2::program::lazy::typed::TypedGap> {
         let snapshot = self.snapshot;
-        decode_body_source(self.cx, self.ids, self.records, self.alloc, key, |check, at| {
-            snapshot.get(at).map_err(|why| TypedReadError::Snapshot { body: check, key: at, why })
-        })
+        let pending = self.pending.as_ref();
+        decode_body_source(
+            self.cx,
+            self.ids,
+            self.records,
+            self.alloc,
+            key,
+            |check, at| snapshot.get(at).map_err(|why| TypedReadError::Snapshot { body: check, key: at, why }),
+            |dep_key, class| {
+                if class == blaze_ladder::code_records::CodeClass::Program
+                    && let Some((_, batch)) = pending
+                {
+                    batch.borrow_mut().hit_program.push(blaze_cas::Key(dep_key.0));
+                }
+            },
+        )
+    }
+
+    fn keep_checked(
+        &mut self,
+        key: blaze_typeck::ItemKey,
+        kind: blaze_ladder::front2::program::lazy::typed::RunChecked,
+        checked: &blaze_typeck::Checked<'static>,
+    ) {
+        use blaze_ladder::front2::program::lazy::typed::RunChecked;
+        if !matches!(kind, RunChecked::Toolchain | RunChecked::Dependency) {
+            return;
+        }
+        let Some((shared, ref batch)) = self.pending else {
+            return;
+        };
+        let Some((dep_key, class)) = self.ids.dep_typed_key(key) else {
+            return;
+        };
+        let _span = self.cx.span("engine: encode dep/toolchain typed record");
+        let Ok(raw) = blaze_typeck::checked_record::encode(checked, self.alloc) else {
+            return;
+        };
+        let Ok(encoded) = crate::store::record_codec::encode_selective_in(raw.as_slice(), shared) else {
+            return;
+        };
+        let bytes = match encoded {
+            crate::store::record_codec::Encoded::Compressed(buf) => buf,
+            crate::store::record_codec::Encoded::Raw(slice) => {
+                let mut buf = blaze_own::Vec::with_capacity_in(slice.len(), shared);
+                buf.extend_from_slice(slice);
+                buf
+            }
+        };
+        batch.borrow_mut().puts.push(PendingTypedPut { key: dep_key, class, bytes });
     }
 }
 
@@ -460,5 +719,271 @@ mod tests {
         )
         .expect("decode prepared typed record");
         assert_eq!(dec.as_slice(), large.as_slice());
+    }
+
+    /// Minimal valid `CheckedRecord` raw bytes with 2 type nodes (`Bool`, `Uint(U8)`) and
+    /// `expr_count` `ExprTy` rows alternating between `PTy(0)` and `PTy(1)`.
+    fn sample_checked_bytes(expr_count: u32, alloc: blaze_own::Alloc<'static>) -> blaze_own::Vec<u8, blaze_own::Alloc<'static>> {
+        use blaze_typeck::checked_record::{CHECKED_RECORD_MAGIC, COLS, Col};
+        let mut raw = blaze_own::Vec::new_in(alloc);
+        raw.extend_from_slice(&CHECKED_RECORD_MAGIC);
+        raw.extend_from_slice(&(COLS.len() as u32).to_le_bytes());
+        for col in COLS {
+            let rows: u32 = match col {
+                Col::TyNodes => 2,
+                Col::ExprTy => expr_count,
+                _ => 0,
+            };
+            raw.extend_from_slice(&rows.to_le_bytes());
+        }
+        // Node 0: PNode::Bool (tag 0), width 40
+        let mut n0 = [0u8; 40];
+        n0[0] = 0;
+        raw.extend_from_slice(&n0);
+        // Node 1: PNode::Uint(UintTy::U8) (tag 3, uint tag 1), width 40
+        let mut n1 = [0u8; 40];
+        n1[0] = 3;
+        n1[1] = 1;
+        raw.extend_from_slice(&n1);
+        // ExprTy rows
+        for i in 0..expr_count {
+            raw.extend_from_slice(&(i & 1).to_le_bytes());
+        }
+        // Validate round-trip through `decode` -> `encode`.
+        let checked = blaze_typeck::checked_record::decode(raw.as_slice(), alloc).expect("sample checked decodes");
+        let reencoded = blaze_typeck::checked_record::encode(&checked, alloc).expect("sample checked re-encodes");
+        assert_eq!(reencoded.as_slice(), raw.as_slice());
+        raw
+    }
+
+    struct EmptyRecords;
+
+    impl crate::engine_run_answer::Records for EmptyRecords {
+        fn record(&self, _name: Name) -> Result<Option<blaze_drive::Key>, &'static str> {
+            Ok(None)
+        }
+        fn skipped(&self, _file: Name) -> bool {
+            false
+        }
+    }
+
+    struct TestCrates;
+
+    impl crate::run_ids::CrateTable<'static> for TestCrates {
+        fn len(&self) -> usize {
+            3
+        }
+        fn key(&self, at: usize) -> blaze_id::CrateItemKey {
+            let b = match at {
+                0 => 0x11,
+                1 => 0x21,
+                _ => 0x31,
+            };
+            blaze_id::CrateItemKey(blaze_ids::ContentId([b; 32]))
+        }
+        fn name(&self, at: usize) -> &'static str {
+            match at {
+                0 => "core",
+                1 => "dep",
+                _ => "ws",
+            }
+        }
+        fn place(&self, at: usize) -> crate::run_ids::Place {
+            match at {
+                0 => crate::run_ids::Place::Toolchain,
+                1 => crate::run_ids::Place::Fetched { source: blaze_ids::ContentId([0x21; 32]), files: [0xee; 32] },
+                _ => crate::run_ids::Place::Checkout,
+            }
+        }
+        fn each_dep(&self, at: usize, each: &mut dyn FnMut(usize)) {
+            if at == 1 {
+                each(0);
+            } else if at == 2 {
+                each(1);
+                each(0);
+            }
+        }
+    }
+
+    struct EmptyAnswer;
+
+    impl crate::run_ids::Today for EmptyAnswer {
+        fn out(&self, _name: Name) -> Option<blaze_ids::ContentId> {
+            None
+        }
+        fn cell(&self, _name: Name, _cell: blaze_drive::Cell) -> Option<blaze_ids::ContentId> {
+            None
+        }
+    }
+
+    impl crate::run_ids::Answer for EmptyAnswer {
+        fn open(
+            &mut self,
+            _cx: &bstd::cx::Cx,
+            _name: Name,
+            _seen: &mut dyn FnMut(crate::run_ids::Seen<'_>) -> Result<(), crate::run_ids::RunIdsError<'static>>,
+        ) -> Result<bool, crate::run_ids::RunIdsError<'static>> {
+            Ok(false)
+        }
+        fn skipped(&self, _file: Name) -> bool {
+            false
+        }
+        fn body(
+            &mut self,
+            _cx: &bstd::cx::Cx,
+            _check: Name,
+            _tool: blaze_drive::Tool,
+            _known: Option<(blaze_ids::ContentId, Name)>,
+            _out: &mut crate::run_ids::BodyScratch<'_>,
+        ) -> Result<Option<crate::run_ids::BodyFacts>, crate::run_ids::RunIdsError<'static>> {
+            Ok(None)
+        }
+    }
+
+    fn make_item(prefix_byte: u8, low: u64) -> blaze_typeck::ItemKey {
+        let mut b = [prefix_byte; 16];
+        b[8..16].copy_from_slice(&low.to_be_bytes());
+        blaze_typeck::ItemKey(u128::from_be_bytes(b))
+    }
+
+    #[test]
+    fn dep_typed_round_trip_read_miss_hit_bzr1_and_corrupt_refusal() {
+        use blaze_ladder::code_records::CodeClass;
+        use blaze_ladder::front2::program::lazy::typed::{BodySource, RunChecked, TypedGap};
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(11, bstd::io::Limits::USUAL));
+        let Ok(cx) = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME) else { panic!("root context") };
+        let alloc = blaze_own::testing::heap().alloc();
+        let tools: [blaze_drive::Tool; blaze_drive::key::KINDS] =
+            core::array::from_fn(|at| blaze_drive::Tool(blaze_ids::ContentId([u8::try_from(at).unwrap_or(u8::MAX); 32])));
+        let mut ans = EmptyAnswer;
+        let ids = crate::run_ids::RunIds::new_scoped(
+            &cx,
+            blaze_toolchain::ToolchainId([0xaa; 32]),
+            &TestCrates,
+            None,
+            &tools,
+            &[],
+            &[],
+            &mut ans,
+            None,
+            crate::run_ids::Most::USUAL,
+            blaze_own::testing::bump(),
+        )
+        .expect("RunIds::new_scoped");
+        let lookup = ids.lookup();
+
+        let tc_item = make_item(0x11, 7);
+        let dep_item = make_item(0x21, 9);
+        let dep_local = make_item(0x21, 9 | (u64::from(blaze_id::ItemKey::INNER) << 56));
+        let (tc_key, tc_class) = lookup.dep_typed_key(tc_item).expect("tc dep_typed_key");
+        let (dep_key, dep_class) = lookup.dep_typed_key(dep_item).expect("dep dep_typed_key");
+        assert_eq!(tc_class, CodeClass::Toolchain);
+        assert_eq!(dep_class, CodeClass::Program);
+
+        // 1. Cache miss returns `BodySource::Run(Toolchain | Dependency)` with zero dep hits.
+        let mut hits = 0usize;
+        let miss_tc = super::decode_body_source(&cx, lookup, &EmptyRecords, alloc, tc_item, |_, _| Ok(None), |_, _| hits += 1)
+            .expect("miss tc");
+        assert!(matches!(miss_tc, BodySource::Run(RunChecked::Toolchain)));
+        let miss_dep = super::decode_body_source(&cx, lookup, &EmptyRecords, alloc, dep_item, |_, _| Ok(None), |_, _| hits += 1)
+            .expect("miss dep");
+        assert!(matches!(miss_dep, BodySource::Run(RunChecked::Dependency)));
+        assert_eq!(hits, 0);
+
+        // Local fn in a dependency crate always returns `BodySource::Run(Dependency)` without probing.
+        let local_dep = super::decode_body_source(
+            &cx,
+            lookup,
+            &EmptyRecords,
+            alloc,
+            dep_local,
+            |_, _| panic!("local dep fn must not probe store"),
+            |_, _| hits += 1,
+        )
+        .expect("local dep");
+        assert!(matches!(local_dep, BodySource::Run(RunChecked::Dependency)));
+
+        // 2. Hit with small raw Checked record (Toolchain).
+        let small_raw = sample_checked_bytes(4, alloc);
+        let small_enc = crate::store::record_codec::encode_selective_in(small_raw.as_slice(), alloc).expect("encode small");
+        assert!(!small_enc.is_compressed());
+        let mut saw_hit = None;
+        let hit_tc = super::decode_body_source(
+            &cx,
+            lookup,
+            &EmptyRecords,
+            alloc,
+            tc_item,
+            |_, at| {
+                assert_eq!(at, tc_key);
+                Ok(Some(small_enc.as_slice()))
+            },
+            |k, c| saw_hit = Some((k, c)),
+        )
+        .expect("hit tc");
+        match hit_tc {
+            BodySource::Read(checked) => {
+                let again = blaze_typeck::checked_record::encode(&checked, alloc).expect("re-encode tc");
+                assert_eq!(again.as_slice(), small_raw.as_slice());
+            }
+            BodySource::Run(_) => panic!("expected BodySource::Read on cache hit"),
+        }
+        assert_eq!(saw_hit, Some((tc_key, CodeClass::Toolchain)));
+
+        // 3. Hit with large BZR1-compressed Checked record (Dependency).
+        let large_raw = sample_checked_bytes(2048, alloc);
+        let large_enc = crate::store::record_codec::encode_selective_in(large_raw.as_slice(), alloc).expect("encode large");
+        assert!(large_enc.is_compressed(), "large checked record should use BZR1 Zstd envelope");
+        saw_hit = None;
+        let hit_dep = super::decode_body_source(
+            &cx,
+            lookup,
+            &EmptyRecords,
+            alloc,
+            dep_item,
+            |_, at| {
+                assert_eq!(at, dep_key);
+                Ok(Some(large_enc.as_slice()))
+            },
+            |k, c| saw_hit = Some((k, c)),
+        )
+        .expect("hit dep");
+        match hit_dep {
+            BodySource::Read(checked) => {
+                let again = blaze_typeck::checked_record::encode(&checked, alloc).expect("re-encode dep");
+                assert_eq!(again.as_slice(), large_raw.as_slice());
+            }
+            BodySource::Run(_) => panic!("expected BodySource::Read on BZR1 cache hit"),
+        }
+        assert_eq!(saw_hit, Some((dep_key, CodeClass::Program)));
+
+        // 4. Corrupt BZR1 envelope fails loudly (`TypedGap::Read` wrapping `Decompress`), never falls back (Rule 3).
+        let mut bad_bzr1 = large_enc.as_slice().to_vec();
+        let last = bad_bzr1.len() - 1;
+        bad_bzr1[last] ^= 0xff;
+        let err_bzr1 = super::decode_body_source(
+            &cx,
+            lookup,
+            &EmptyRecords,
+            alloc,
+            dep_item,
+            |_, _| Ok(Some(bad_bzr1.as_slice())),
+            |_, _| panic!("corrupt bytes must not register hit"),
+        );
+        assert!(matches!(err_bzr1, Err(TypedGap::Read { key, .. }) if key == dep_item), "corrupt BZR1 must fail loudly");
+
+        // 5. Corrupt raw Checked record fails loudly (`TypedGap::Record`), never falls back (Rule 3).
+        let bad_raw = b"not a valid bzchkd07 record";
+        let err_raw = super::decode_body_source(
+            &cx,
+            lookup,
+            &EmptyRecords,
+            alloc,
+            tc_item,
+            |_, _| Ok(Some(bad_raw.as_slice())),
+            |_, _| panic!("corrupt raw bytes must not register hit"),
+        );
+        assert!(matches!(err_raw, Err(TypedGap::Record { key, .. }) if key == tc_item), "corrupt checked bytes must fail loudly");
     }
 }

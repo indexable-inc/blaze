@@ -126,6 +126,92 @@ fn keep_export_roots<D: blaze_core::Driver>(
     ExportRootsKept { program, toolchain }
 }
 
+/// Persists a parallel export worker's newly typechecked dependency/toolchain `Checked` records
+/// into `lent` and records program-class hits/writes and newly written toolchain keys for closing
+/// GC root registration.
+fn persist_worker_typed_batch<'a, D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    batch: Option<crate::engine_body_record::WorkerTypedBatch>,
+    dep_typed_program: &mut AVec<'a, blaze_cas::Key>,
+    dep_typed_toolchain: &mut AVec<'a, blaze_cas::Key>,
+    frame: &Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<(), CliError> {
+    let Some(batch) = batch else { return Ok(()) };
+    dep_typed_program.extend_from_slice(batch.hit_program.as_slice());
+    for put in batch.puts {
+        let cas_key = blaze_cas::Key(put.key.0);
+        let wrote = crate::engine_body_record::put_dep_typed_if_absent(lent, put.key, put.bytes.as_slice()).map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots {
+                    class: "dep/toolchain typed body",
+                    shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()),
+                },
+                heap,
+            )
+        })?;
+        match put.class {
+            blaze_ladder::code_records::CodeClass::Program => dep_typed_program.push(cas_key),
+            blaze_ladder::code_records::CodeClass::Toolchain if wrote => dep_typed_toolchain.push(cas_key),
+            blaze_ladder::code_records::CodeClass::Toolchain => {}
+        }
+    }
+    Ok(())
+}
+
+/// Surfaces any main-thread typed-record persistence error, flushes `codes`, merges persisted
+/// dependency/toolchain typed-body keys into `walked` / `toolchain_made`, and roots them before
+/// the command's closing store commit.
+#[expect(clippy::too_many_arguments, reason = "closing export root persistence joins code store and dep/toolchain typed keys")]
+fn finish_export_roots<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    today: &crate::start_list::Today,
+    toolchain: blaze_toolchain::ToolchainId,
+    mut codes: HomeCodeStore<'_, D>,
+    typed: &crate::engine_body_record::StoreTyped<'_>,
+    dep_typed_program: &[blaze_cas::Key],
+    dep_typed_toolchain: &[blaze_cas::Key],
+    frame: &Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<(), CliError> {
+    if let Some(why) = typed.persist_error() {
+        return Err(box_err(
+            ExportCliError::KeepRoots {
+                class: "dep/toolchain typed body",
+                shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()),
+            },
+            heap,
+        ));
+    }
+    codes.ensure_persisted().map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "program code entries", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    let mut walked = codes.reached();
+    let mut toolchain_made = codes.toolchain_made();
+    drop(codes);
+    walked.extend_from_slice(typed.kept_program());
+    walked.extend_from_slice(dep_typed_program);
+    toolchain_made.extend_from_slice(typed.kept_toolchain());
+    toolchain_made.extend_from_slice(dep_typed_toolchain);
+    let kept_roots = keep_export_roots(lent, today, toolchain, &walked, &toolchain_made);
+    kept_roots.program.map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "program code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    kept_roots.toolchain.map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "toolchain code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    Ok(())
+}
+
 /// Why `blaze export` stopped before writing a valid executable, naming the thing (rule 19).
 #[derive(Debug)]
 pub enum ExportCliError {
@@ -893,6 +979,7 @@ struct ExportDone {
     worker: usize,
     row: usize,
     result: Result<Vec<u8, SharedAlloc<'static>>, ExportWorkerErr>,
+    typed: Option<crate::engine_body_record::WorkerTypedBatch>,
 }
 
 type ExportProcsAnswer = Result<&'static crate::proc_runner::ProcRunner<'static>, String<SharedAlloc<'static>>>;
@@ -972,12 +1059,12 @@ fn run_export_worker_epoch<'f>(
         Err(why) => {
             if let Some(job) = carry.take() {
                 let msg = export_err_string(format_args!("export worker names init failed: {why}"), shared);
-                let _ = done.send(cx, ExportDone { worker, row: job.row, result: Err(ExportWorkerErr::Fatal(msg)) });
+                let _ = done.send(cx, ExportDone { worker, row: job.row, result: Err(ExportWorkerErr::Fatal(msg)), typed: None });
             }
             return ExportEpochEnd::Done;
         }
     };
-    let reader = sync_typed.reader(cx, crates.snapshot(), heap.alloc());
+    let reader = sync_typed.reader_persisting(cx, crates.snapshot(), heap.alloc(), shared);
     let mut maker: Maker<'_, crate::run_ids::Runnable, _> = Maker::of_start(
         names,
         maker_entry,
@@ -1035,9 +1122,10 @@ fn run_export_worker_epoch<'f>(
                 Err(ExportWorkerErr::Fatal(msg))
             }
         };
+        let typed = maker.typing().kept.take_pending();
         let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
         let sending = by.span("blaze build: send compiled entry");
-        if done.send(&sending, ExportDone { worker, row: job.row, result }).is_err() {
+        if done.send(&sending, ExportDone { worker, row: job.row, result, typed }).is_err() {
             return ExportEpochEnd::Done;
         }
         if worker_frame.used() >= *reset_at {
@@ -1116,7 +1204,10 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     root_count: usize,
     walk: &mut Walk<'a>,
     next_row: &mut usize,
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
     codes: &mut HomeCodeStore<'_, D>,
+    dep_typed_program: &mut AVec<'a, blaze_cas::Key>,
+    dep_typed_toolchain: &mut AVec<'a, blaze_cas::Key>,
     maker: &mut Maker<'_, crate::run_ids::Runnable, ByKind<crate::engine_body_record::StoreTyped<'_>>>,
     scratch: &mut Scratch<'a>,
     outcomes: &mut AVec<'a, RowOutcome<'a>>,
@@ -1302,6 +1393,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                     &mut queued,
                     &inboxes,
                 )?;
+                persist_worker_typed_batch(lent, done.typed, dep_typed_program, dep_typed_toolchain, frame, heap)?;
                 let row = done.row;
                 let rel = row - start_row;
                 let pend = pending_rows[rel].take().ok_or_else(|| {
@@ -1462,6 +1554,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                             &mut queued,
                             &inboxes,
                         )?;
+                        persist_worker_typed_batch(lent, done.typed, dep_typed_program, dep_typed_toolchain, frame, heap)?;
                         let row = done.row;
                         let rel = row - start_row;
                         let pend = pending_rows[rel].take().ok_or_else(|| {
@@ -1713,6 +1806,8 @@ fn export_program<'f>(
 
     let mut scratch = Scratch::new_in(alloc);
     let mut outcomes: AVec<'_, RowOutcome<'_>> = Vec::new_in(alloc);
+    let mut dep_typed_program: AVec<'_, blaze_cas::Key> = Vec::new_in(alloc);
+    let mut dep_typed_toolchain: AVec<'_, blaze_cas::Key> = Vec::new_in(alloc);
     let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
     let root_count = roots.len();
     let export_workers = usize::try_from(standing.workers.get().min(cx.workers()).saturating_sub(1))
@@ -1741,7 +1836,10 @@ fn export_program<'f>(
                     root_count,
                     &mut walk,
                     &mut next_row,
+                    lent,
                     &mut codes,
+                    &mut dep_typed_program,
+                    &mut dep_typed_toolchain,
                     &mut maker,
                     &mut scratch,
                     &mut outcomes,
@@ -1830,28 +1928,17 @@ fn export_program<'f>(
         if let Some(why) = seen.refused() {
             return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
         }
-        codes.ensure_persisted().map_err(|why| {
-            box_err(
-                ExportCliError::KeepRoots { class: "program code entries", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
-        let walked = codes.reached();
-        let toolchain_made = codes.toolchain_made();
-        drop(codes);
-        let kept_roots = keep_export_roots(lent, &today, builder.toolchain, &walked, &toolchain_made);
-        kept_roots.program.map_err(|why| {
-            box_err(
-                ExportCliError::KeepRoots { class: "program code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
-        kept_roots.toolchain.map_err(|why| {
-            box_err(
-                ExportCliError::KeepRoots { class: "toolchain code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
+        finish_export_roots(
+            lent,
+            &today,
+            builder.toolchain,
+            codes,
+            &maker.typing().kept,
+            dep_typed_program.as_slice(),
+            dep_typed_toolchain.as_slice(),
+            frame,
+            heap,
+        )?;
         write_output_file(cx, fs, output_path, wasm_bytes.as_slice(), false, heap)?;
         let exported = Exported {
             platform: Platform::Wasm64,
@@ -2235,28 +2322,17 @@ fn export_program<'f>(
     drop(symbol_names);
     drop(data);
     drop(seen_data);
-    codes.ensure_persisted().map_err(|why| {
-        box_err(
-            ExportCliError::KeepRoots { class: "program code entries", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-            heap,
-        )
-    })?;
-    let walked = codes.reached();
-    let toolchain_made = codes.toolchain_made();
-    drop(codes);
-    let kept_roots = keep_export_roots(lent, &today, builder.toolchain, &walked, &toolchain_made);
-    kept_roots.program.map_err(|why| {
-        box_err(
-            ExportCliError::KeepRoots { class: "program code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-            heap,
-        )
-    })?;
-    kept_roots.toolchain.map_err(|why| {
-        box_err(
-            ExportCliError::KeepRoots { class: "toolchain code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-            heap,
-        )
-    })?;
+    finish_export_roots(
+        lent,
+        &today,
+        builder.toolchain,
+        codes,
+        &maker.typing().kept,
+        dep_typed_program.as_slice(),
+        dep_typed_toolchain.as_slice(),
+        frame,
+        heap,
+    )?;
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
     Ok(ExportSummary {

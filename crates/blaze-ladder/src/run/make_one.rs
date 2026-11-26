@@ -434,8 +434,9 @@ impl<'n, S: crate::front2::program::lazy::PositionSource<'n>, K: crate::front2::
         match self.kept.source(key) {
             Ok(BodySource::Run(kind)) => {
                 let made = program.check_one(key)?;
-                if made.is_some() {
+                if let Some((_, ref checked)) = made {
                     self.counts.checked[kind.index()] += 1;
+                    self.kept.keep_checked(key, kind, checked);
                 }
                 Ok(made)
             }
