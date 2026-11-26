@@ -1663,10 +1663,36 @@ fn entry_roots<'a>(harness: bool, names: NamesRecords<'_>, test: LibKey, exports
     }
 }
 
-/// [`Refuse`] over the test roots: each row's roots made in a scratch frame, the words of a
-/// refusal kept for the caller. The run makes them again in its own frame: one head lowered
-/// twice, until the zygote's protocol carries a refusal (NOT DONE, piece 9).
-pub(crate) struct EntryCheck<'c, 'h> {
+/// Per-suite validated roots handed from [`EntryCheck::refusal`] to [`Launched::run_captured`],
+/// avoiding running `entry_roots` (`Store::new`, head lowering, and `personality_of`) twice per
+/// test and avoiding a per-test `Frame::new` allocation in `EntryCheck`. Borrowed strictly
+/// synchronously, never across `.await` (rule 27).
+pub(crate) struct RootsCache<'a, T = Roots<'a>> {
+    rows: blaze_hash::Map<u32, T, blaze_hash::FixedState, Alloc<'a>>,
+}
+
+impl<'a, T> RootsCache<'a, T> {
+    pub(crate) fn new(alloc: Alloc<'a>) -> Self {
+        Self { rows: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }) }
+    }
+
+    pub(crate) fn contains(&self, row: u32) -> bool {
+        self.rows.contains_key(&row)
+    }
+
+    pub(crate) fn insert(&mut self, row: u32, roots: T) {
+        self.rows.insert(row, roots);
+    }
+
+    pub(crate) fn take(&mut self, row: u32) -> Option<T> {
+        self.rows.remove(&row)
+    }
+}
+
+/// [`Refuse`] over the test roots: each row's roots are computed once into `roots_alloc`,
+/// cached in `roots_cache` for [`Launched::run_captured`] to consume without recomputing, and any
+/// refusal's words are kept for the caller.
+pub(crate) struct EntryCheck<'c, 'h, 'a> {
     pub tests: TestRows<'c>,
     pub names: NamesRecords<'h>,
     pub builder: Builder,
@@ -1674,10 +1700,12 @@ pub(crate) struct EntryCheck<'c, 'h> {
     /// Its suite's native image's exports (`NativeSend::items`, roots of every row), else why the
     /// image could not be had ([`Suite::native`]): every row's refusal.
     pub image: Result<&'c [LibKey], &'c str>,
+    pub roots_cache: &'c RefCell<RootsCache<'a>>,
+    pub roots_alloc: Alloc<'a>,
     said: AString<'c>,
 }
 
-impl Refuse for EntryCheck<'_, '_> {
+impl Refuse for EntryCheck<'_, '_, '_> {
     fn refusal(&mut self, row: u32) -> Result<Option<&str>, OneError> {
         let exports = match self.image {
             Ok(exports) => exports,
@@ -1687,14 +1715,21 @@ impl Refuse for EntryCheck<'_, '_> {
                 return Ok(Some(self.said.as_str()));
             }
         };
+        if self.roots_cache.borrow().contains(row) {
+            return Ok(None);
+        }
         let test = key_of(&self.tests, row)?;
-        let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
-        let erased = blaze_own::Erased::new(&frame);
-        let made = entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, erased.handle());
-        let Err(why) = made else { return Ok(None) };
-        self.said.clear();
-        write!(self.said, "{why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
-        Ok(Some(self.said.as_str()))
+        match entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, self.roots_alloc) {
+            Ok(roots) => {
+                self.roots_cache.borrow_mut().insert(row, roots);
+                Ok(None)
+            }
+            Err(why) => {
+                self.said.clear();
+                write!(self.said, "{why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
+                Ok(Some(self.said.as_str()))
+            }
+        }
     }
 }
 
@@ -2830,6 +2865,9 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     pub bins: Option<&'c RefCell<crate::test_bins::BinServer<'a, 'h>>>,
     /// Whether this suite exposes `CARGO_BIN_EXE_*` (integration tests and benchmarks only).
     pub expose_bins: bool,
+    /// Per-suite validated `Roots<'a>` populated by [`EntryCheck::refusal`] and consumed here
+    /// synchronously before spawning (never held across `.await`, rule 27).
+    pub roots_cache: &'c RefCell<RootsCache<'a>>,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
@@ -3056,11 +3094,16 @@ impl<'c> Launched<'c, '_, '_> {
         let named = Path::new(name.as_str()).map_err(OneError::Path)?;
         suite_dir.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
         let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
-        // 2. Per-test roots rooted into the suite's single shared walk.
+        // 2. Per-test roots rooted into the suite's single shared walk (reusing validated roots
+        // from `EntryCheck::refusal` so `entry_roots` runs once per test, never twice).
         let exports = self.native.map_or(&[][..], |send| send.items);
         signals.begin(Doing::Roots);
-        let roots = entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, alloc)
-            .map_err(|why| OneError::Parent(ParentError::Roots(why)))?;
+        let cached_roots = self.roots_cache.borrow_mut().take(row);
+        let roots = match cached_roots {
+            Some(roots) => roots,
+            None => entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, self.cache_alloc)
+                .map_err(|why| OneError::Parent(ParentError::Roots(why)))?,
+        };
         let head = roots.head();
         let test_entry = {
             let mut sc = self.suite_cache.borrow_mut();
@@ -4256,7 +4299,7 @@ struct Selected<'r, T> {
     rows: &'r [Location],
 }
 
-impl Refuse for Selected<'_, Option<EntryCheck<'_, '_>>> {
+impl Refuse for Selected<'_, Option<EntryCheck<'_, '_, '_>>> {
     fn refusal(&mut self, flat: u32) -> Result<Option<&str>, OneError> {
         let flat_idx = usize::try_from(flat).map_err(|_| OneError::NoRow { row: flat })?;
         let loc = self.rows.get(flat_idx).ok_or(OneError::NoRow { row: flat })?;
@@ -4816,18 +4859,23 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let mut child_base = 0usize;
     let entered_sink: RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>> = RefCell::new(Vec::new_in(alloc));
     let mut suite_caches = Vec::with_capacity_in(suites.len(), alloc);
+    let mut roots_caches = Vec::with_capacity_in(suites.len(), alloc);
     for suite in suites {
         match suite {
             Some(suite) => {
                 let sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
                 suite_caches.push(Some(RefCell::new(sc)));
+                roots_caches.push(Some(RefCell::new(RootsCache::new(alloc))));
             }
-            None => suite_caches.push(None),
+            None => {
+                suite_caches.push(None);
+                roots_caches.push(None);
+            }
         }
     }
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
-    for (index, (suite, suite_cache)) in suites.iter().zip(suite_caches.iter()).enumerate() {
+    for (index, ((suite, suite_cache), roots_cache)) in suites.iter().zip(suite_caches.iter()).zip(roots_caches.iter()).enumerate() {
         let Some(suite) = suite else {
             launches.push(None);
             checks.push(None);
@@ -4840,6 +4888,9 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             return Err(DriveError::NoSuite { suite: suite_id });
         };
         let Some(suite_cache) = suite_cache.as_ref() else {
+            return Err(DriveError::NoSuite { suite: suite_id });
+        };
+        let Some(roots_cache) = roots_cache.as_ref() else {
             return Err(DriveError::NoSuite { suite: suite_id });
         };
         launches.push(Some(Launched {
@@ -4857,9 +4908,19 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             suite_cache,
             bins: bin_server.as_ref(),
             expose_bins: unit.expose_bins,
+            roots_cache,
         }));
         child_base += tests.len();
-        checks.push(Some(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) }));
+        checks.push(Some(EntryCheck {
+            tests,
+            names: suite.names,
+            builder: suite.builder,
+            tables,
+            image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)),
+            roots_cache,
+            roots_alloc: alloc,
+            said: String::new_in(alloc),
+        }));
     }
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
     let launched = Selected { suites: launches.as_mut_slice(), rows: locations };
@@ -5700,5 +5761,19 @@ mod zero_spawn_tests {
             Ok(PreparedSuites::Done(status)) => panic!("edited suite 0 must not be Done: {status:?}"),
             Err(err) => panic!("partial prepare failed: {err}"),
         }
+    }
+
+    #[test]
+    fn roots_cache_hands_validated_roots_from_check_to_launch_without_recomputing() {
+        let heap = blaze_own::testing::heap();
+        let cache = RefCell::new(RootsCache::<u32>::new(heap.alloc()));
+        assert!(!cache.borrow().contains(9));
+        // EntryCheck inserts validated roots once; a repeated check hits without recomputing.
+        cache.borrow_mut().insert(9, 42);
+        assert!(cache.borrow().contains(9));
+        // Launch takes the cached entry once, leaving the slot empty for any later retry.
+        assert_eq!(cache.borrow_mut().take(9), Some(42));
+        assert!(!cache.borrow().contains(9));
+        assert_eq!(cache.borrow_mut().take(9), None);
     }
 }

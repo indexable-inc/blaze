@@ -189,12 +189,23 @@ fn fn_sig_text<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>,
     } else if let Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Fn, name }) = keys.origin(k) {
         let lib = keys.library_in(names, *container)?;
         let mut text = None;
-        let listed = names.each_member(lib, &mut |member| {
-            if member.kind == blaze_surface::ItemKind::Function && member.name == Some(name.as_ref()) {
-                names.read_member_signature(member.key, member.written_by);
-                text = Some(member.text);
-            }
-        });
+        let target = name.as_ref();
+        let listed = names.each_member_matching(
+            lib,
+            &mut |kind, mname| {
+                if kind == blaze_surface::ItemKind::Function && mname == Some(target) {
+                    crate::front2::source::MemberWant::WithText
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |member| {
+                if member.kind == blaze_surface::ItemKind::Function && member.name == Some(target) {
+                    names.read_member_signature(member.key, member.written_by);
+                    text = Some(member.text);
+                }
+            },
+        );
         if !listed {
             return None;
         }

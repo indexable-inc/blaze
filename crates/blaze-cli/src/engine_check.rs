@@ -548,9 +548,11 @@ fn request_frame() -> Result<Frame, CliError> {
 }
 
 /// Deferred macOS SDK resolution: skips `SDKSettings.json` / `SystemVersion.plist` / `sdk-answers`
-/// I/O during `open_checkout` so certificate hits, `Driver::Ready` body edits, and `blaze why` pay
-/// 0 ms for SDK probing; resolves at most once via `OnceCell` on demand when `Driver::Phases` plans
-/// build scripts or when `check_and_open` constructs `Standing` for `run`/`test`/`export`.
+/// I/O during `open_checkout` and `Standing` construction so certificate hits, `Driver::Ready`
+/// body edits, pure-Rust `Driver::Phases` checks, cached `blaze test`, and `blaze why` pay 0 ms
+/// for SDK probing; resolves at most once via `OnceCell` on demand when a workspace has build
+/// scripts or when native linking / C compilation actually needs the SDK, reusing the open
+/// `~/.blaze` home directory to avoid spawning a second `Fs::home` driver pool.
 pub(crate) struct LazySdk<'f> {
     fs: &'f bstd::fs::Fs,
     sdkroot: Option<&'f str>,
@@ -560,26 +562,52 @@ pub(crate) struct LazySdk<'f> {
 }
 
 impl<'f> LazySdk<'f> {
-    fn resolve(&self, cx: &Cx, phases: &mut Phases) -> Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>> {
+    fn resolve_raw(
+        &self,
+        cx: &Cx,
+        blaze_home: Option<&Dir<ReadWrite>>,
+        wall_ns: u64,
+    ) -> (Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>, Option<&'static str>) {
         let mut phase_label: Option<&'static str> = None;
-        let clock = phases.clock();
         let &sdk = self.resolved.get_or_init(|| {
             let (sdk, how) = crate::sdk::resolve_how(
                 cx,
                 self.fs,
+                blaze_home,
                 self.sdkroot,
                 &self.xcrun_env,
                 crate::sdk::SHIPPED,
-                clock,
+                wall_ns,
                 self.frame,
             );
             phase_label = Some(how.phase());
             sdk
         });
+        (sdk, phase_label)
+    }
+
+    fn resolve_in_home(
+        &self,
+        cx: &Cx,
+        blaze_home: Option<&Dir<ReadWrite>>,
+        phases: &mut Phases,
+    ) -> Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>> {
+        let (sdk, phase_label) = self.resolve_raw(cx, blaze_home, phases.clock().wall().as_ns());
         if let Some(label) = phase_label {
             phases.mark_cx(cx, label, self.frame);
         }
         sdk
+    }
+
+    /// Resolves the macOS SDK on demand without requiring `&mut Phases` (called lazily from
+    /// [`Standing::resolve_sdk`] when native linking or deferred C tasks need it).
+    fn resolve_on_demand(
+        &self,
+        cx: &Cx,
+        blaze_home: Option<&Dir<ReadWrite>>,
+        wall_ns: u64,
+    ) -> Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>> {
+        self.resolve_raw(cx, blaze_home, wall_ns).0
     }
 }
 
@@ -847,9 +875,24 @@ pub(crate) struct Standing<'r, 'm> {
     pub(crate) picked: Option<crate::run_package::Program<'r>>,
     /// Pre-resolved package list for `blaze test` (resolved once before checking).
     pub(crate) test_packages: Option<&'r [&'r str]>,
+    /// Deferred macOS SDK resolver (covariant in `'r`, backed by `LazySdk`'s `OnceCell`) and
+    /// already-opened `~/.blaze` directory so pure-Rust starts pay 0 ms for SDK probing.
+    sdk_resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
+    home_dir: Option<&'r Dir<ReadWrite>>,
 }
 
 impl<'r, 'm> Standing<'r, 'm> {
+    /// Resolves the macOS SDK lazily on first demand (at most once per command via `OnceCell`),
+    /// reusing the already-opened `~/.blaze` home directory and caching the result into
+    /// `self.place.sdk`.
+    pub(crate) fn resolve_sdk(&mut self, cx: &Cx) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>> {
+        if self.place.sdk.is_ok() {
+            return self.place.sdk;
+        }
+        let sdk = (self.sdk_resolver)(cx, self.home_dir, self.lent.wall_ns());
+        self.place.sdk = sdk;
+        sdk
+    }
     /// E2's answer (engine_run_answer.rs) over the stored rows and the store: what run_ids.rs
     /// walks for the body ids and reads each body's facts from.
     pub(crate) fn answer(&mut self) -> crate::engine_run_answer::EngineAnswer<'_, 'r, '_, 'm> {
@@ -2103,9 +2146,9 @@ fn check_and_open<R>(
     let request = request_frame()?;
     edge(cx, fs, env, net, host, out, err, phases, heap, flags, None, &request, |edge, phases| {
         #[cfg(unix)]
-        let Edge { root, opts, mut shown, err, caps, shown_root, frame, mut place, lazy_sdk, workers, producers, member, signals, .. } = edge;
+        let Edge { root, opts, mut shown, err, caps, shown_root, frame, place, lazy_sdk, workers, producers, member, signals, .. } = edge;
         #[cfg(not(unix))]
-        let Edge { root, opts, mut shown, err, caps, shown_root, frame, mut place, lazy_sdk, workers, producers, member, .. } = edge;
+        let Edge { root, opts, mut shown, err, caps, shown_root, frame, place, lazy_sdk, workers, producers, member, .. } = edge;
         let mut fixes_applied: u32 = 0;
         let mut files_fixed: u32 = 0;
         let (require_graph, check_scope, picked, selected_packages) = match mode {
@@ -2219,9 +2262,11 @@ fn check_and_open<R>(
         if require_graph && let Some((name, why)) = refused.get() {
             return Err(EngineCheckError::StartPage { name, why }.into());
         }
+        let sdk_resolver = |cx: &Cx, home_dir: Option<&Dir<ReadWrite>>, wall_ns: u64| {
+            lazy_sdk.resolve_on_demand(cx, home_dir, wall_ns)
+        };
         let standing = match (pointer.as_ref(), rows.as_ref(), stored.as_ref(), graph) {
             (Some(pointer), Some(rows_ref), Some(stored_ref), Some(graph)) if refused.get().is_none() => {
-                place.sdk = lazy_sdk.resolve(cx, phases);
                 let records: &dyn crate::engine_run_answer::Records = stored_ref;
                 Some(Standing {
                     root: pointer.root.0,
@@ -2247,6 +2292,8 @@ fn check_and_open<R>(
                     scope: check_scope,
                     picked,
                     test_packages: selected_packages,
+                    sdk_resolver: &sdk_resolver,
+                    home_dir: Some(opened.home.dir()),
                 })
             }
             _ => None,
@@ -3491,11 +3538,6 @@ fn checking<'f, 's: 'f>(
         }
     }
 
-    if ready_preflight.is_none()
-        && let Some(lazy) = lazy_sdk
-    {
-        env.sdk = lazy.resolve(cx, phases);
-    }
     let start = stored.as_ref().map_or_else(|| Answer::new_in(request), |source| source.answer());
     let mut records = RecordKeys { base: stored.as_ref().map(|one| one as &dyn StoredPages), changes: SMap::new_in(request) };
     let mut setup = match ready_preflight {
@@ -3558,6 +3600,11 @@ fn checking<'f, 's: 'f>(
                 planned.push(Planned { name: one.name, phase: Phase::new(Stage::Units, one.wave), source: one.source, file: one.name });
             }
             if let Some(stage) = &names {
+                if stage.names.as_ref().is_some_and(|world| world.script_keys().next().is_some())
+                    && let Some(lazy) = lazy_sdk
+                {
+                    env.sdk = lazy.resolve_in_home(cx, home_dir, phases);
+                }
                 let _cx = cx.span(STAGES_PLAN_SPAN);
                 let preserved_names = match (scoped.as_ref(), stored.as_ref()) {
                     (Some(strict), Some(last_stored)) => preserve_standing_sibling_names(
