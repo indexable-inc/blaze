@@ -1980,10 +1980,17 @@ fn layout_file_grid(
     };
     let type_col = table.col_index("type");
 
-    // In compact grid mode we can comfortably display up to 60 items before folding.
-    const GRID_FOLD_ITEMS: usize = 60;
-    let visible = if block.folded && total > GRID_FOLD_ITEMS {
-        GRID_FOLD_ITEMS
+    let row_h = m.ch + 2.0;
+    let pane_h = scene
+        .clips
+        .get(clip_id as usize)
+        .map(|c| (c.rect[3] - c.rect[1]).max(220.0))
+        .unwrap_or(720.0);
+    let max_grid_rows = ((pane_h / 3.0 - 24.0) / row_h).floor().clamp(4.0, 9.0) as usize;
+    // Cap initial scan for optimal column packing; after packing we enforce `<= 1/3` pane height.
+    let grid_scan_cap = (max_grid_rows * 6).min(54);
+    let visible_scan = if block.folded && total > grid_scan_cap {
+        grid_scan_cap
     } else {
         total
     };
@@ -2001,9 +2008,9 @@ fn layout_file_grid(
         git: Option<GitFileStatus>,
         w_px: f32,
     }
-    let mut raw_entries: Vec<(String, bool)> = Vec::with_capacity(visible);
-    let mut items: Vec<GridItem> = Vec::with_capacity(visible);
-    for r in 0..visible {
+    let mut raw_entries: Vec<(String, bool)> = Vec::with_capacity(visible_scan);
+    let mut items: Vec<GridItem> = Vec::with_capacity(visible_scan);
+    for r in 0..visible_scan {
         let raw = table
             .cell(r, name_col)
             .and_then(Value::as_str)
@@ -2037,11 +2044,11 @@ fn layout_file_grid(
 
     // Pick the largest column count `ncols` (1..=6) whose column-major widths fit in `width`
     // (exact `eza` optimal grid packing!).
-    let max_cols = visible.min(6);
+    let max_cols = visible_scan.min(6);
     let mut best_cols = 1usize;
     let mut best_col_widths = vec![width];
     for nc in (1..=max_cols).rev() {
-        let nrows = visible.div_ceil(nc);
+        let nrows = visible_scan.div_ceil(nc);
         let mut widths = vec![0.0f32; nc];
         for (i, item) in items.iter().enumerate() {
             let c = i / nrows;
@@ -2057,8 +2064,16 @@ fn layout_file_grid(
         }
     }
 
+    // Enforce <= 1/3 pane height in folded mode so narrow panes don't expand to 30+ rows.
+    let grid_fold_items = (best_cols * max_grid_rows).max(4);
+    let visible = if block.folded && total > grid_fold_items {
+        items.truncate(grid_fold_items);
+        grid_fold_items
+    } else {
+        visible_scan
+    };
+
     let nrows = visible.div_ceil(best_cols);
-    let row_h = m.ch + 2.0;
     let mut cur_y = y0;
 
     for r in 0..nrows {
@@ -2129,12 +2144,12 @@ fn layout_file_grid(
         cur_y += row_h;
     }
 
-    if total > GRID_FOLD_ITEMS {
+    if total > grid_fold_items {
         cur_y += 4.0;
         let lbl = if block.folded {
-            format!("+ {} more entries", total - GRID_FOLD_ITEMS)
+            format!("+ {} more entries", total - grid_fold_items)
         } else {
-            format!("− collapse to {GRID_FOLD_ITEMS} entries")
+            format!("− collapse to {grid_fold_items} entries")
         };
         let pw = lbl.chars().count() as f32 * m.cw + 8.0;
         scene.text(x0, cur_y, lbl, theme::INK_3, false, false, clip_id);
@@ -2208,8 +2223,18 @@ fn layout_table(
     }
 
     let total_rows = table.nrows();
-    let is_scrollable = depth <= 1 && block.folded && total_rows > TABLE_FOLD_ROWS;
-    let visible_rows = if is_scrollable { TABLE_FOLD_ROWS } else { total_rows };
+    let row_h_est = m.ch + 7.0;
+    let pane_h = scene
+        .clips
+        .get(clip_id as usize)
+        .map(|c| (c.rect[3] - c.rect[1]).max(240.0))
+        .unwrap_or(720.0);
+    // Keep default folded tables compact: never more than ~1/3 of the pane height (4..=TABLE_FOLD_ROWS).
+    let fold_rows = ((pane_h / 3.0 - (m.ch + 28.0)) / row_h_est)
+        .floor()
+        .clamp(4.0, TABLE_FOLD_ROWS as f32) as usize;
+    let is_scrollable = depth <= 1 && block.folded && total_rows > fold_rows;
+    let visible_rows = if is_scrollable { fold_rows } else { total_rows };
     let type_col_idx = table.col_index("type");
     let sample_rows = total_rows.min(256);
 
@@ -2320,12 +2345,12 @@ fn layout_table(
         });
     }
 
-    let hidden_col_names: Vec<&str> = (0..ncols)
+    let mut hidden_col_names: Vec<&str> = (0..ncols)
         .filter(|&c| table.is_col_hidden(c))
         .filter_map(|c| table.columns.get(c).map(|s| s.as_ref()))
         .collect();
-    let has_hidden_toggle = depth <= 1 && !hidden_col_names.is_empty();
-    let col_visible: Vec<bool> = (0..ncols)
+    let mut has_hidden_toggle = depth <= 1 && !hidden_col_names.is_empty();
+    let mut col_visible: Vec<bool> = (0..ncols)
         .map(|c| block.show_hidden_cols || !table.is_col_hidden(c))
         .collect();
 
@@ -2336,8 +2361,6 @@ fn layout_table(
     let idx_w = idx_chars as f32 * m.cw + 16.0;
     let col_gap = 22.0;
     let scrollbar_reserve = if is_scrollable { 12.0 } else { 0.0 };
-    let hidden_toggle_reserve = if has_hidden_toggle { 58.0 } else { 0.0 };
-    let avail_w = (width - idx_w - scrollbar_reserve - hidden_toggle_reserve).max(80.0);
 
     let mut col_chars: Vec<usize> = Vec::with_capacity(ncols);
     let mut col_right_align: Vec<bool> = Vec::with_capacity(ncols);
@@ -2405,7 +2428,15 @@ fn layout_table(
                         tree_prefix_col
                             .and_then(|pc| table.cell(r, pc))
                             .and_then(Value::as_str)
-                            .map_or(0, |s| s.chars().count())
+                            .map_or(0, |s| {
+                                let (segs, _, _) = parse_tree_prefix(s);
+                                if segs == 0 {
+                                    0
+                                } else {
+                                    ((segs as f32 * DATAFRAME_TREE_STEP + 4.0) / m.cw.max(1.0))
+                                        .ceil() as usize
+                                }
+                            })
                     } else {
                         0
                     };
@@ -2436,6 +2467,8 @@ fn layout_table(
         }
         let col_cap = if matches!(hdr, "code" | "message" | "subject" | "summary") {
             110
+        } else if disp == ColDisplay::TreeEntry {
+            64
         } else {
             40
         };
@@ -2480,6 +2513,52 @@ fn layout_table(
             }
         })
         .collect();
+
+    // Auto-compress overflow columns on wide tables by default (collapsible via the `+N cols` pill):
+    // keep the primary columns readable (at most 5 default columns, or fewer if wider than the pane),
+    // never auto-hiding the primary file/tree column or the active sort column.
+    if depth <= 1 {
+        const DEFAULT_MAX_VISIBLE_COLS: usize = 5;
+        let sort_col = block.table_sort.map(|(sc, _)| sc);
+        let natural_visible: Vec<usize> = (0..ncols).filter(|&c| !table.is_col_hidden(c)).collect();
+        let mut kept = 0usize;
+        let mut running_w = 0.0f32;
+        let toggle_budget = (width - idx_w - scrollbar_reserve - 58.0).max(80.0);
+        let mut auto_hidden: Vec<usize> = Vec::new();
+        for &c in &natural_visible {
+            let cw = if let Some(&(_, custom_w)) =
+                block.col_width_overrides.iter().find(|&&(oc, _)| oc == c)
+            {
+                custom_w
+            } else {
+                col_chars[c] as f32 * m.cw + col_extra_px[c] + col_gap
+            };
+            let must_keep = kept < 3 || Some(c) == file_entry_col || Some(c) == sort_col;
+            let fits_budget = kept < DEFAULT_MAX_VISIBLE_COLS && running_w + cw <= toggle_budget + 40.0;
+            if must_keep || fits_budget {
+                kept += 1;
+                running_w += cw;
+            } else {
+                auto_hidden.push(c);
+            }
+        }
+        if !auto_hidden.is_empty() {
+            has_hidden_toggle = true;
+            for &c in &auto_hidden {
+                if let Some(name) = table.columns.get(c).map(|s| s.as_ref())
+                    && !hidden_col_names.contains(&name)
+                {
+                    hidden_col_names.push(name);
+                }
+                if !block.show_hidden_cols {
+                    col_visible[c] = false;
+                    col_widths[c] = 0.0;
+                }
+            }
+        }
+    }
+    let hidden_toggle_reserve = if has_hidden_toggle { 58.0 } else { 0.0 };
+    let avail_w = (width - idx_w - scrollbar_reserve - hidden_toggle_reserve).max(80.0);
     let total_w: f32 = col_widths.iter().sum();
     if total_w > avail_w && total_w > 0.0 {
         let is_flex: Vec<bool> = (0..ncols)
@@ -2866,10 +2945,28 @@ fn layout_table(
                                 } else {
                                     leaf_name.clone()
                                 };
-                                let pref_w = prefix.chars().count() as f32 * m.cw;
-                                if !prefix.is_empty() {
-                                    scene.text(rx, ty, prefix, theme::INK_4, false, false, clip_id);
-                                }
+                                let has_visible_child = is_dir && vis_i + 1 < visible_rows && {
+                                    let (cur_segs, _, _) = parse_tree_prefix(prefix);
+                                    let next_r = row_order[disp_idx + 1];
+                                    let next_prefix = tree_prefix_col
+                                        .and_then(|pc| table.cell(next_r, pc))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let (next_segs, next_mask, next_elbow) =
+                                        parse_tree_prefix(next_prefix);
+                                    (next_elbow.is_some() && next_segs == cur_segs + 1)
+                                        || (cur_segs < 64 && ((next_mask >> cur_segs) & 1) != 0)
+                                };
+                                let pref_w = draw_dataframe_tree_guides(
+                                    scene,
+                                    rx,
+                                    cur_y,
+                                    row_h,
+                                    icon_s,
+                                    prefix,
+                                    has_visible_child,
+                                    clip_id,
+                                );
                                 let item_x = rx + pref_w;
                                 let max_ch = ((content_w - pref_w - icon_pad - 6.0) / m.cw)
                                     .floor()
@@ -3559,7 +3656,7 @@ fn layout_table(
         );
     }
 
-    if depth <= 1 && total_rows > TABLE_FOLD_ROWS {
+    if depth <= 1 && total_rows > fold_rows {
         cur_y += 4.0;
         let lbl = if block.folded {
             format!(
@@ -3569,7 +3666,7 @@ fn layout_table(
                 total_rows
             )
         } else {
-            format!("− collapse to {TABLE_FOLD_ROWS}-row scrollable view")
+            format!("− collapse to {fold_rows}-row scrollable view")
         };
         let pw = lbl.chars().count() as f32 * m.cw + 8.0;
         scene.text(x0 + idx_w, cur_y, lbl, theme::INK_3, false, false, clip_id);
@@ -3582,6 +3679,174 @@ fn layout_table(
     }
 
     cur_y - y0
+}
+
+const DATAFRAME_TREE_STEP: f32 = 18.0;
+
+/// Parse `blaze-sh`'s 4-char-per-level `tree_prefix` (composed of `"│   "`, `"    "`, `"├── "`,
+/// `"└── "`) into `(segments_count, continuing_mask, last_is_elbow_last)`.
+fn parse_tree_prefix(prefix: &str) -> (usize, u64, Option<bool>) {
+    let mut chars = prefix.chars();
+    let mut segments = 0usize;
+    let mut continuing_mask = 0u64;
+    let mut last_is_elbow_last = None;
+
+    while let Some(first) = chars.next() {
+        let lvl = segments;
+        for _ in 0..3 {
+            if chars.next().is_none() {
+                break;
+            }
+        }
+        segments += 1;
+        match first {
+            '│' => {
+                if lvl < 64 {
+                    continuing_mask |= 1u64 << lvl;
+                }
+            }
+            '├' => {
+                last_is_elbow_last = Some(false);
+            }
+            '└' => {
+                last_is_elbow_last = Some(true);
+            }
+            _ => {}
+        }
+    }
+
+    (segments, continuing_mask, last_is_elbow_last)
+}
+
+/// Draw crisp, continuous, pixel-snapped 1px GPU vector tree guides, L/T elbows, and
+/// parent-folder drop-stems for `ColDisplay::TreeEntry` rows.
+///
+/// Returns the horizontal pixel offset (`pref_w`) at which the entry's file/folder icon starts.
+#[allow(clippy::too_many_arguments)]
+fn draw_dataframe_tree_guides(
+    scene: &mut Scene,
+    rx: f32,
+    cur_y: f32,
+    row_h: f32,
+    icon_s: f32,
+    prefix: &str,
+    has_visible_child: bool,
+    clip_id: u32,
+) -> f32 {
+    const TREE_STEP: f32 = DATAFRAME_TREE_STEP;
+    let (segments_count, continuing_mask, last_is_elbow_last) = parse_tree_prefix(prefix);
+
+    let guide_col = theme::rgba(0xff, 0xff, 0xff, 0.14);
+    let elbow_col = theme::rgba(0xff, 0xff, 0xff, 0.19);
+    let cy = (cur_y + row_h * 0.5).round();
+    let row_y1 = cur_y + row_h;
+
+    let pass_through_end = if last_is_elbow_last.is_some() {
+        segments_count.saturating_sub(1)
+    } else {
+        segments_count
+    };
+
+    // Continuous pass-through vertical ancestor rails spanning the exact full row height.
+    for lvl in 0..pass_through_end {
+        if lvl < 64 && ((continuing_mask >> lvl) & 1) != 0 {
+            let sx = (rx + 6.0 + lvl as f32 * TREE_STEP).round();
+            scene.round_rect(
+                sx - 0.5,
+                cur_y,
+                sx + 0.5,
+                row_y1,
+                0.0,
+                guide_col,
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+        }
+    }
+
+    // Final L (`└── `) or T (`├── `) elbow connecting the ancestor rail to this entry's icon.
+    if let Some(is_last) = last_is_elbow_last
+        && segments_count > 0
+    {
+        let elbow_lvl = segments_count - 1;
+        let sx = (rx + 6.0 + elbow_lvl as f32 * TREE_STEP).round();
+        let branch_x1 = (sx + TREE_STEP - 5.0).round();
+        if is_last {
+            if cy - 0.5 > cur_y {
+                scene.round_rect(
+                    sx - 0.5,
+                    cur_y,
+                    sx + 0.5,
+                    cy - 0.5,
+                    0.0,
+                    elbow_col,
+                    0.0,
+                    [0.0; 4],
+                    clip_id,
+                );
+            }
+            scene.round_rect(
+                sx - 0.5,
+                cy - 0.5,
+                branch_x1,
+                cy + 0.5,
+                0.0,
+                elbow_col,
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+        } else {
+            scene.round_rect(
+                sx - 0.5,
+                cur_y,
+                sx + 0.5,
+                row_y1,
+                0.0,
+                guide_col,
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+            scene.round_rect(
+                sx + 0.5,
+                cy - 0.5,
+                branch_x1,
+                cy + 0.5,
+                0.0,
+                elbow_col,
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+        }
+    }
+
+    // Parent-folder drop-stem meeting the first child's top edge with zero vertical gap.
+    if has_visible_child {
+        let drop_x = (rx + 6.0 + segments_count as f32 * TREE_STEP).round();
+        let drop_y0 = cy + (icon_s * 0.5).ceil() + 1.0;
+        if drop_y0 < row_y1 {
+            scene.round_rect(
+                drop_x - 0.5,
+                drop_y0,
+                drop_x + 0.5,
+                row_y1,
+                0.0,
+                guide_col,
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+        }
+    }
+
+    if segments_count == 0 {
+        0.0
+    } else {
+        segments_count as f32 * TREE_STEP + 2.0
+    }
 }
 
 /// Draw a filename with subtle semantic shading between the stem and `.{ext}` (or trailing `/`):
@@ -7829,4 +8094,20 @@ fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {
         out = out.split_off(out.len() - 6);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tree_prefix;
+
+    #[test]
+    fn parse_tree_prefix_handles_standard_segments() {
+        assert_eq!(parse_tree_prefix(""), (0, 0, None));
+        assert_eq!(parse_tree_prefix("├── "), (1, 0, Some(false)));
+        assert_eq!(parse_tree_prefix("└── "), (1, 0, Some(true)));
+        assert_eq!(parse_tree_prefix("│   ├── "), (2, 0b1, Some(false)));
+        assert_eq!(parse_tree_prefix("│   │   └── "), (3, 0b11, Some(true)));
+        assert_eq!(parse_tree_prefix("    └── "), (2, 0b0, Some(true)));
+        assert_eq!(parse_tree_prefix("    │   ├── "), (3, 0b10, Some(false)));
+    }
 }

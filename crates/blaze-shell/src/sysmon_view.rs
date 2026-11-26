@@ -11,7 +11,7 @@ use blaze_sysmon::{HistoryRing, ProcessRow, SortColumn, SysMonEngine};
 
 use crate::blocks::BlockId;
 use crate::theme;
-use crate::view::{CellMetrics, HitAction, HitRect, Scene, TextFace, truncate_chars};
+use crate::view::{CellMetrics, HitAction, HitRect, Scene, TextFace, truncate_chars, truncate_middle};
 
 // =============================================================================
 // Layout Geometry & Palette Tokens
@@ -31,6 +31,8 @@ const ROW_H: f32 = 22.0;
 const TREE_BASE_X: f32 = 13.0;
 const TREE_INDENT: f32 = 18.0;
 const TREE_MAX_VISUAL_DEPTH: usize = 10;
+const INSPECTOR_GAP: f32 = 6.0;
+const INSPECTOR_H: f32 = 42.0;
 const FOOTER_GAP: f32 = 6.0;
 const FOOTER_H: f32 = 24.0;
 const PAD_Y: f32 = 10.0;
@@ -61,6 +63,8 @@ const MEM_CACHED: [f32; 4] = theme::OK;
 
 const KILL_BG: [f32; 4] = theme::rgba(0xff, 0x71, 0x68, 0.14);
 const KILL_BORDER: [f32; 4] = theme::rgba(0xff, 0x71, 0x68, 0.44);
+const KILL_CHIP_BG: [f32; 4] = theme::rgba(0xe0, 0x55, 0x55, 0.14);
+const KILL_CHIP_BORDER: [f32; 4] = theme::rgba(0xe0, 0x55, 0x55, 0.36);
 
 // =============================================================================
 // Interactive Controller State
@@ -79,6 +83,9 @@ pub struct SysMonState {
     /// When true (default), parent rows in tree mode display cumulative subtree CPU %, GPU %,
     /// and Memory across all descendants (press `c` or click `Σ Cumul` to toggle self-only).
     pub cumulative: bool,
+    /// Cached `(pid, cmdline)` for the currently selected row so `KERN_PROCARGS2` is queried
+    /// only when the selected PID changes (zero per-frame syscall overhead).
+    pub cached_cmdline: Option<(u32, String)>,
 }
 
 impl Default for SysMonState {
@@ -100,25 +107,44 @@ impl SysMonState {
             status_msg: None,
             running: true,
             cumulative: true,
+            cached_cmdline: None,
         }
+    }
+
+    /// Lazily refresh the cached command line for the currently selected process.
+    ///
+    /// Only invokes `read_proc_cmdline` when the selected PID actually changes.
+    pub fn refresh_selected_cmdline(&mut self) {
+        let Some(pid) = self.engine.rows().get(self.selected_row).map(|r| r.pid) else {
+            self.cached_cmdline = None;
+            return;
+        };
+        if self.cached_cmdline.as_ref().is_some_and(|(p, _)| *p == pid) {
+            return;
+        }
+        let cmd = crate::sysmon_driver::read_proc_cmdline(pid);
+        self.cached_cmdline = Some((pid, cmd));
     }
 
     /// Clamp `selected_row` and `scroll_row` to the current visible row list.
     pub fn clamp_selection(&mut self, visible_rows: usize) {
         let total = self.engine.rows().len();
         self.clamp_selection_with_len(visible_rows, total);
+        self.refresh_selected_cmdline();
     }
 
     /// Move selection up/down by `delta` rows, scrolling the table viewport to keep it in view.
     pub fn move_selection(&mut self, delta: isize, visible_rows: usize) {
         let total = self.engine.rows().len();
         self.move_selection_with_len(delta, visible_rows, total);
+        self.refresh_selected_cmdline();
     }
 
     /// Scroll the process table viewport by `delta_rows` while keeping selection within view.
     pub fn scroll_by(&mut self, delta_rows: isize, visible_rows: usize) {
         let total = self.engine.rows().len();
         self.scroll_by_with_len(delta_rows, visible_rows, total);
+        self.refresh_selected_cmdline();
     }
 
     /// Select an absolute row index (e.g. from clicking a process row).
@@ -127,10 +153,12 @@ impl SysMonState {
         if total == 0 {
             self.selected_row = 0;
             self.scroll_row = 0;
+            self.cached_cmdline = None;
             return;
         }
         self.selected_row = row.min(total - 1);
         self.clamp_selection_with_len(visible_rows, total);
+        self.refresh_selected_cmdline();
     }
 
     /// Toggle collapse/expand on the currently selected process row if it has children.
@@ -140,6 +168,67 @@ impl SysMonState {
         {
             let pid = row.pid;
             self.engine.toggle_collapse(pid);
+            self.refresh_selected_cmdline();
+        }
+    }
+
+    /// Native macOS / Finder / btop `→` / `l` tree navigation:
+    /// - If the selected row has children and is collapsed, expand it.
+    /// - Else if it has children and is expanded (with a child row immediately below), move
+    ///   selection into its first child.
+    pub fn expand_or_child(&mut self, visible_rows: usize) {
+        if !self.engine.tree_mode() {
+            return;
+        }
+        let Some((pid, has_children, collapsed, depth)) = self
+            .engine
+            .rows()
+            .get(self.selected_row)
+            .map(|r| (r.pid, r.has_children, r.collapsed, r.depth))
+        else {
+            return;
+        };
+        if has_children && collapsed {
+            self.engine.toggle_collapse(pid);
+            self.clamp_selection(visible_rows);
+        } else if has_children
+            && !collapsed
+            && self
+                .engine
+                .rows()
+                .get(self.selected_row + 1)
+                .is_some_and(|next| next.depth > depth)
+        {
+            self.move_selection(1, visible_rows);
+        }
+    }
+
+    /// Native macOS / Finder / btop `←` / `h` tree navigation:
+    /// - If the selected row has children and is expanded, collapse it.
+    /// - Else if it is a nested child (`depth > 0`), jump selection up to its parent row and
+    ///   scroll it into view.
+    pub fn collapse_or_parent(&mut self, visible_rows: usize) {
+        if !self.engine.tree_mode() {
+            return;
+        }
+        let Some((pid, ppid, has_children, collapsed, depth)) = self
+            .engine
+            .rows()
+            .get(self.selected_row)
+            .map(|r| (r.pid, r.ppid, r.has_children, r.collapsed, r.depth))
+        else {
+            return;
+        };
+        if has_children && !collapsed {
+            self.engine.toggle_collapse(pid);
+            self.clamp_selection(visible_rows);
+        } else if depth > 0 {
+            let parent_idx = self.engine.rows()[..self.selected_row]
+                .iter()
+                .rposition(|r| r.pid == ppid || r.depth < depth);
+            if let Some(idx) = parent_idx {
+                self.select_row(idx, visible_rows);
+            }
         }
     }
 
@@ -184,6 +273,7 @@ impl SysMonState {
         self.engine.set_filter(&self.filter_input);
         self.selected_row = 0;
         self.scroll_row = 0;
+        self.refresh_selected_cmdline();
     }
 
     /// Append a character to the live filter input.
@@ -192,6 +282,7 @@ impl SysMonState {
         self.engine.set_filter(&self.filter_input);
         self.selected_row = 0;
         self.scroll_row = 0;
+        self.refresh_selected_cmdline();
     }
 
     /// Remove the last character from the live filter input.
@@ -200,6 +291,7 @@ impl SysMonState {
         self.engine.set_filter(&self.filter_input);
         self.selected_row = 0;
         self.scroll_row = 0;
+        self.refresh_selected_cmdline();
     }
 
     /// Clear the filter input and unfocus the filter bar.
@@ -320,7 +412,7 @@ pub fn visible_rows_for_height(
     has_filter_bar: bool,
 ) -> usize {
     let filter_h = if has_filter_bar { FILTER_H + FILTER_GAP } else { 0.0 };
-    let fixed = PAD_Y * 2.0
+    let fixed_without_inspector = PAD_Y * 2.0
         + HEADER_H
         + HEADER_GAP
         + CARDS_H
@@ -329,16 +421,18 @@ pub fn visible_rows_for_height(
         + TABLE_HEADER_H
         + FOOTER_GAP
         + FOOTER_H;
+    let fixed = fixed_without_inspector + INSPECTOR_GAP + INSPECTOR_H;
     let default_h = fixed + INLINE_VISIBLE_ROWS as f32 * ROW_H;
     let target_h = if fullscreen {
-        max_h.unwrap_or(default_h).max(fixed + ROW_H)
+        max_h.unwrap_or(default_h).max(fixed_without_inspector + ROW_H)
     } else {
         match max_h {
-            Some(h) => default_h.min(h).max(fixed + ROW_H),
+            Some(h) => default_h.min(h).max(fixed_without_inspector + ROW_H),
             None => default_h,
         }
     };
-    (((target_h - fixed) / ROW_H).floor() as usize).max(1)
+    let eff_fixed = if target_h >= fixed + ROW_H { fixed } else { fixed_without_inspector };
+    (((target_h - eff_fixed) / ROW_H).floor() as usize).max(1)
 }
 
 // =============================================================================
@@ -365,7 +459,7 @@ pub fn layout_sysmon_block(
     let has_filter_bar = state.filter_focused || !state.filter_input.is_empty();
     let filter_section_h = if has_filter_bar { FILTER_H + FILTER_GAP } else { 0.0 };
 
-    let fixed_chrome_h = PAD_Y * 2.0
+    let fixed_without_inspector = PAD_Y * 2.0
         + HEADER_H
         + HEADER_GAP
         + CARDS_H
@@ -374,17 +468,16 @@ pub fn layout_sysmon_block(
         + TABLE_HEADER_H
         + FOOTER_GAP
         + FOOTER_H;
+    let fixed_with_inspector = fixed_without_inspector + INSPECTOR_GAP + INSPECTOR_H;
 
     let visible_rows = visible_rows_for_height(max_h, fullscreen, has_filter_bar);
+    let natural_h = fixed_with_inspector + visible_rows as f32 * ROW_H;
     let total_h = if fullscreen {
-        max_h
-            .unwrap_or(fixed_chrome_h + visible_rows as f32 * ROW_H)
-            .max(fixed_chrome_h + ROW_H)
+        max_h.unwrap_or(natural_h).max(fixed_without_inspector + ROW_H)
     } else {
-        let natural = fixed_chrome_h + visible_rows as f32 * ROW_H;
         match max_h {
-            Some(h) => natural.min(h).max(fixed_chrome_h + ROW_H),
-            None => natural,
+            Some(h) => natural_h.min(h).max(fixed_without_inspector + ROW_H),
+            None => natural_h,
         }
     };
 
@@ -444,10 +537,21 @@ pub fn layout_sysmon_block(
     }
 
     // -------------------------------------------------------------------------
-    // e. Sortable Process Tree Table
+    // e. Sortable Process Tree Table + Selected-Process Inspector Bar
     // -------------------------------------------------------------------------
     let footer_y0 = y0 + total_h - PAD_Y - FOOTER_H;
-    let table_y1 = (footer_y0 - FOOTER_GAP).max(cur_y + TABLE_HEADER_H + ROW_H);
+    let selected_row = state.engine.rows().get(state.selected_row);
+    let insp_y1 = footer_y0 - FOOTER_GAP;
+    let insp_y0 = insp_y1 - INSPECTOR_H;
+    let min_table_y1 = cur_y + TABLE_HEADER_H + ROW_H;
+    let show_inspector =
+        selected_row.is_some() && insp_y0 - INSPECTOR_GAP >= min_table_y1 && insp_y1 <= footer_y0;
+
+    let table_y1 = if show_inspector {
+        insp_y0 - INSPECTOR_GAP
+    } else {
+        (footer_y0 - FOOTER_GAP).max(min_table_y1)
+    };
     let rows_avail = (((table_y1 - cur_y - TABLE_HEADER_H) / ROW_H).floor() as usize).max(1);
     let table_visible_rows = if fullscreen { rows_avail } else { visible_rows.min(rows_avail) };
 
@@ -465,7 +569,27 @@ pub fn layout_sysmon_block(
     );
 
     // -------------------------------------------------------------------------
-    // f. Footer / Kill Confirm Bar
+    // f. Selected-Process Inspector Bar
+    // -------------------------------------------------------------------------
+    if show_inspector
+        && let Some(row) = selected_row
+    {
+        draw_selected_inspector(
+            scene,
+            block_id,
+            state,
+            row,
+            ix0,
+            insp_y0,
+            ix1,
+            insp_y1,
+            m,
+            inner_clip,
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // g. Footer / Kill Confirm Bar
     // -------------------------------------------------------------------------
     draw_footer_bar(scene, state, ix0, footer_y0, ix1, FOOTER_H, m, inner_clip);
 
@@ -1921,6 +2045,164 @@ fn draw_mem_cell(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn draw_selected_inspector(
+    scene: &mut Scene,
+    block_id: BlockId,
+    state: &SysMonState,
+    row: &ProcessRow<'static>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    m: CellMetrics,
+    clip_id: u32,
+) {
+    scene.round_rect(x0, y0, x1, y1, 6.0, CARD_BG, 1.0, theme::LINE, clip_id);
+    let iclip = intersect_clip(scene, clip_id, x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0, 5.0);
+
+    let ix0 = x0 + 9.0;
+    let ix1 = x1 - 9.0;
+    let line1_y0 = y0 + 2.5;
+    let line1_h = 18.5;
+    let line2_y0 = y0 + 21.0;
+    let line2_h = (y1 - line2_y0 - 2.0).max(16.0);
+
+    // -------------------------------------------------------------------------
+    // Line 1: 14px icon + bold name + metadata badges + right-aligned Kill chip
+    // -------------------------------------------------------------------------
+    let kill_h = 17.0;
+    let kill_y0 = line1_y0 + (line1_h - kill_h) * 0.5;
+    let kill_x0 = draw_pill_right(
+        scene,
+        ix1,
+        kill_y0,
+        kill_y0 + kill_h,
+        "Kill",
+        theme::DANGER,
+        KILL_CHIP_BG,
+        KILL_CHIP_BORDER,
+        m,
+        iclip,
+        HitAction::SysMonRequestKill(block_id),
+    );
+    let line1_max_x = (kill_x0 - 8.0).max(ix0 + 60.0);
+    let l1_clip = intersect_clip(scene, iclip, ix0, line1_y0, line1_max_x, line1_y0 + line1_h, 0.0);
+    let l1_ty = center_text_y(line1_y0, line1_h, m.line_h(TextFace::UiSmall));
+
+    let mut lx = ix0;
+    let icon_size = 14.0;
+    let icon_y = line1_y0 + (line1_h - icon_size) * 0.5;
+    if lx + icon_size < line1_max_x {
+        let app_icon = row
+            .app_bundle_path
+            .as_deref()
+            .and_then(crate::sysmon_driver::lookup_or_cache_app_icon);
+        if let Some(icon_path) = app_icon {
+            scene.image(lx, icon_y, icon_size, icon_size, icon_path, l1_clip);
+        } else if let Some(svg_name) = fallback_svg_icon_for_process(row.name.as_str()) {
+            scene.svg_icon(lx, icon_y, icon_size, svg_name, l1_clip);
+        } else {
+            draw_process_glyph_badge(scene, row.name.as_str(), lx, icon_y, icon_size, m, l1_clip);
+        }
+        lx += icon_size + 6.0;
+    }
+
+    let name_budget_w = (line1_max_x - lx).clamp(40.0, 220.0);
+    let max_name_chars = (name_budget_w / (m.cw * 0.80).max(4.5)).floor().max(4.0) as usize;
+    let name_shown = truncate_chars(row.name.as_str(), max_name_chars);
+    let name_w = m.measure_styled(&name_shown, TextFace::UiSmall, true);
+    scene.ui_small(lx, l1_ty, name_shown, theme::INK_1, true, false, l1_clip);
+    lx += name_w + 8.0;
+
+    // Metadata badges separated by ` · `
+    let mut meta: Vec<(String, [f32; 4], bool)> = Vec::with_capacity(6);
+    meta.push((format!("PID {}", row.pid), theme::INK_3, false));
+
+    let wall_now = state.engine.wall_time_secs();
+    if row.start_time_secs > 0 && wall_now > 0 {
+        let up_secs = wall_now.saturating_sub(row.start_time_secs);
+        meta.push((format!("up {}", format_uptime(up_secs)), theme::INK_3, false));
+    }
+
+    let tree_mode = state.engine.tree_mode();
+    if tree_mode && row.has_children {
+        meta.push((format!("self {}", format_iec_bytes(row.mem_bytes)), theme::INK_3, false));
+        meta.push((
+            format!("Σ {} (+{})", format_iec_bytes(row.subtree_mem_bytes), row.child_count),
+            theme::rgb(0x96, 0xc2, 0xff),
+            false,
+        ));
+    }
+
+    let use_subtree = tree_mode && row.has_children && (state.cumulative || row.collapsed);
+    let disk_bps = if use_subtree { row.subtree_disk_bps } else { row.disk_bps };
+    if disk_bps > 0 {
+        let io_col = if disk_bps >= 1024 * 1024 { AMBER } else { theme::INK_2 };
+        meta.push((format!("I/O {}/s", format_iec_bytes(disk_bps)), io_col, false));
+    }
+
+    if row.gpu_queues > 0 {
+        meta.push((format!("{} GPU q", row.gpu_queues), GPU_CYAN_BRIGHT, true));
+    }
+
+    let sep = " · ";
+    let sep_w = m.measure(sep, TextFace::UiSmall);
+    for (idx, (seg, col, bold)) in meta.into_iter().enumerate() {
+        let seg_w = m.measure_styled(&seg, TextFace::UiSmall, bold);
+        let needed = if idx > 0 { sep_w + seg_w } else { seg_w };
+        if lx + needed > line1_max_x {
+            break;
+        }
+        if idx > 0 {
+            scene.ui_small(lx, l1_ty, sep, theme::INK_4, false, false, l1_clip);
+            lx += sep_w;
+        }
+        scene.ui_small(lx, l1_ty, seg, col, bold, false, l1_clip);
+        lx += seg_w;
+    }
+
+    // -------------------------------------------------------------------------
+    // Line 2: Cached cmdline (fallback exe_path) + right-aligned cwd (no overlap)
+    // -------------------------------------------------------------------------
+    let l2_ty = center_text_y(line2_y0, line2_h, m.line_h(TextFace::UiSmall));
+    let l2_avail_w = (ix1 - ix0).max(40.0);
+    let mut cmd_max_x = ix1;
+
+    if !row.cwd.is_empty() && l2_avail_w >= 240.0 {
+        let cwd_budget_w = (l2_avail_w * 0.36).clamp(80.0, 320.0);
+        let avg_small_cw = (m.cw * 0.78).max(4.5);
+        let prefix = "in ";
+        let prefix_w = m.measure(prefix, TextFace::UiSmall);
+        let path_budget_w = (cwd_budget_w - prefix_w).max(24.0);
+        let max_cwd_chars = (path_budget_w / avg_small_cw).floor().max(8.0) as usize;
+        let cwd_trunc = truncate_middle(row.cwd.as_str(), max_cwd_chars);
+        let cwd_label = format!("{prefix}{cwd_trunc}");
+        let cwd_w = m.measure(&cwd_label, TextFace::UiSmall).min(cwd_budget_w);
+        let cwd_x = (ix1 - cwd_w).max(ix0 + l2_avail_w * 0.55);
+        let cwd_clip = intersect_clip(scene, iclip, cwd_x, line2_y0, ix1, line2_y0 + line2_h, 0.0);
+        scene.ui_small(cwd_x, l2_ty, cwd_label, theme::INK_4, false, false, cwd_clip);
+        cmd_max_x = (cwd_x - 10.0).max(ix0 + 40.0);
+    }
+
+    let cached_cmd = state
+        .cached_cmdline
+        .as_ref()
+        .and_then(|(p, cmd)| (*p == row.pid && !cmd.is_empty()).then_some(cmd.as_str()));
+    let cmd_raw = cached_cmd.unwrap_or_else(|| {
+        if !row.exe_path.is_empty() {
+            row.exe_path.as_str()
+        } else {
+            row.name.as_str()
+        }
+    });
+    let cmd_avail_w = (cmd_max_x - ix0).max(24.0);
+    let cmd_clip = intersect_clip(scene, iclip, ix0, line2_y0, cmd_max_x, line2_y0 + line2_h, 0.0);
+    let cmd_max_chars = ((cmd_avail_w / (m.cw * 0.80).max(4.5)).floor() as usize).max(4);
+    let cmd_shown = truncate_chars(cmd_raw, cmd_max_chars);
+    scene.ui_small(ix0, l2_ty, cmd_shown, theme::INK_2, false, false, cmd_clip);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_footer_bar(
     scene: &mut Scene,
     state: &SysMonState,
@@ -1945,7 +2227,7 @@ fn draw_footer_bar(
         scene.ui_small(x0 + 10.0, ty, msg.as_str(), theme::INK_2, false, false, fclip);
     } else {
         let legend =
-            "↑↓ select · Space fold · t tree · c cumul · / filter · 1-5 sort · x kill · p pause · ⌘⇧F expand · q close";
+            "↑↓ select · ←→ fold · t tree · c cumul · / filter · 1-5 sort · x kill · p pause · ⌘⇧F expand · q close";
         let max_chars = ((x1 - x0 - 8.0) / (m.cw * 0.78).max(4.0)).floor().max(8.0) as usize;
         let shown = truncate_chars(legend, max_chars);
         scene.ui_small(x0 + 4.0, ty, shown, theme::INK_4, false, false, fclip);
@@ -2179,16 +2461,16 @@ mod tests {
                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                     alloc,
                 ),
-                cwd: AString::new_in(alloc),
+                cwd: AString::from_str_in("/Volumes/Projects/blaze", alloc),
                 app_bundle_path: None,
                 cpu_time_ns: 250_000_000 * tick,
                 gpu_time_ns: 120_000_000 * tick,
                 gpu_queues: 2,
                 mem_bytes: 1_500_000_000,
-                disk_read_bytes: 0,
-                disk_write_bytes: 0,
+                disk_read_bytes: 2 * 1024 * 1024 * tick,
+                disk_write_bytes: 1024 * 1024 * tick,
                 threads: 42,
-                start_time_secs: 0,
+                start_time_secs: 1_700_000_000,
             });
             for idx in 1u32..=15 {
                 procs.push(RawProcess {
@@ -2211,7 +2493,7 @@ mod tests {
             }
             RawSnapshot {
                 timestamp_ns: ts_ns,
-                wall_time_secs: 0,
+                wall_time_secs: 1_700_003_600,
                 cores,
                 mem: RawMemSample {
                     total_bytes: 64 * 1024u64.pow(3),
@@ -2250,7 +2532,11 @@ mod tests {
         assert_eq!(st.scroll_row, 0);
         assert_eq!(st.selected_row, INLINE_VISIBLE_ROWS - 1);
 
-        // Render inline card and verify height + key hit regions + text.
+        // Select parent row (pid 100) so the inspector displays subtree + GPU + I/O + cwd.
+        st.select_row(0, INLINE_VISIBLE_ROWS);
+        assert_eq!(st.selected_row, 0);
+
+        // Render inline card and verify height + key hit regions + inspector text.
         let mut scene = Scene::new();
         let bid = BlockId(42);
         let h = layout_sysmon_block(
@@ -2265,9 +2551,10 @@ mod tests {
             0,
             false,
         );
-        assert!((500.0..=545.0).contains(&h), "inline height should be ~500-540px, got {h}");
+        assert!((545.0..=590.0).contains(&h), "inline height should be ~568px, got {h}");
         assert!(scene.hit_regions.iter().any(|r| r.action == HitAction::SysMonToggleTree(bid)));
         assert!(scene.hit_regions.iter().any(|r| r.action == HitAction::SysMonTogglePause(bid)));
+        assert!(scene.hit_regions.iter().any(|r| r.action == HitAction::SysMonRequestKill(bid)));
         assert!(scene.hit_regions.iter().any(|r| r.action == HitAction::TogglePtyFullscreen));
         assert!(scene.hit_regions.iter().any(|r| r.action == HitAction::SysMonClose(bid)));
         assert!(scene.hit_regions.iter().any(|r| {
@@ -2278,5 +2565,115 @@ mod tests {
         }));
         assert!(scene.text_runs.iter().any(|t| t.text.contains("Apple M5 Max")));
         assert!(scene.text_runs.iter().any(|t| t.text.contains("Activity & GPU")));
+        assert!(scene.text_runs.iter().any(|t| t.text.contains("PID 100")));
+        assert!(scene.text_runs.iter().any(|t| t.text.contains("up 1h")));
+        assert!(scene.text_runs.iter().any(|t| t.text.contains("2 GPU q")));
+        assert!(scene.text_runs.iter().any(|t| t.text == "Kill"));
+        assert!(scene.text_runs.iter().any(|t| t.text.contains("in /Volumes/Projects/blaze")));
+    }
+
+    #[test]
+    fn tree_navigation_expand_collapse_and_parent_jump() {
+        use blaze_own::{AString, AVec};
+        use blaze_sysmon::{CoreTicks, RawGpuSample, RawMemSample, RawProcess, RawSnapshot};
+
+        let alloc = Alloc::global();
+        let make_proc = |pid: u32, ppid: u32, name: &str, cpu_ns: u64| RawProcess {
+            pid,
+            ppid,
+            uid: 501,
+            name: AString::from_str_in(name, alloc),
+            exe_path: AString::from_str_in("/usr/bin/env", alloc),
+            cwd: AString::new_in(alloc),
+            app_bundle_path: None,
+            cpu_time_ns: cpu_ns,
+            gpu_time_ns: 0,
+            gpu_queues: 0,
+            mem_bytes: 32 * 1024 * 1024,
+            disk_read_bytes: 0,
+            disk_write_bytes: 0,
+            threads: 2,
+            start_time_secs: 0,
+        };
+        let make_snap = |ts_ns: u64, tick: u64| {
+            let mut cores = AVec::new_in(alloc);
+            cores.push(CoreTicks { user: 10 * tick, system: 5 * tick, idle: 100 * tick, nice: 0 });
+            let mut procs = AVec::new_in(alloc);
+            // Tree: 100 (root) -> 200 (mid, higher cpu) -> 300 (grandchild)
+            //                  -> 201 (sibling leaf)
+            procs.push(make_proc(100, 1, "root-app", 400_000_000 * tick));
+            procs.push(make_proc(200, 100, "mid-worker", 200_000_000 * tick));
+            procs.push(make_proc(300, 200, "leaf-task", 100_000_000 * tick));
+            procs.push(make_proc(201, 100, "sibling-leaf", 50_000_000 * tick));
+            RawSnapshot {
+                timestamp_ns: ts_ns,
+                wall_time_secs: 1_700_000_000,
+                cores,
+                mem: RawMemSample::default(),
+                gpu: RawGpuSample::empty_in(alloc),
+                processes: procs,
+                load_avg: [0.5, 0.4, 0.3],
+                uptime_secs: 3600,
+            }
+        };
+
+        let mut st = SysMonState::new();
+        st.engine.ingest(make_snap(1_000_000_000, 1));
+        st.engine.ingest(make_snap(2_000_000_000, 2));
+        // Expected order in tree mode (sorted by subtree CPU desc): [100, 200, 300, 201]
+        assert_eq!(st.engine.rows().len(), 4);
+        assert_eq!(st.engine.rows()[0].pid, 100);
+        assert_eq!(st.engine.rows()[1].pid, 200);
+        assert_eq!(st.engine.rows()[2].pid, 300);
+        assert_eq!(st.engine.rows()[3].pid, 201);
+
+        // Start on root (100, expanded): `expand_or_child` descends into first child (200).
+        st.select_row(0, 2);
+        st.expand_or_child(2);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 200);
+
+        // On expanded mid-worker (200): `expand_or_child` descends into grandchild (300) and scrolls.
+        st.expand_or_child(2);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 300);
+        assert_eq!(st.scroll_row, 1);
+
+        // On leaf grandchild (300): `expand_or_child` is a no-op.
+        st.expand_or_child(2);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 300);
+
+        // On leaf grandchild (300): `collapse_or_parent` jumps up to parent (200).
+        st.collapse_or_parent(2);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 200);
+
+        // On expanded mid-worker (200): `collapse_or_parent` collapses it (hiding 300).
+        st.collapse_or_parent(2);
+        assert_eq!(st.engine.rows().len(), 3);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 200);
+        assert!(st.engine.rows()[st.selected_row].collapsed);
+
+        // On now-collapsed mid-worker (200): `collapse_or_parent` jumps up to root (100) and scrolls it into view.
+        st.collapse_or_parent(2);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 100);
+        assert_eq!(st.scroll_row, 0);
+
+        // On expanded root (100): `collapse_or_parent` collapses root (only 1 row visible).
+        st.collapse_or_parent(2);
+        assert_eq!(st.engine.rows().len(), 1);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 100);
+        assert!(st.engine.rows()[0].collapsed);
+
+        // On collapsed root (100): `expand_or_child` expands root (200 stays collapsed -> 3 rows).
+        st.expand_or_child(2);
+        assert_eq!(st.engine.rows().len(), 3);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 100);
+        assert!(!st.engine.rows()[0].collapsed);
+
+        // Second `expand_or_child` descends into first child (200); third expands (200) revealing (300).
+        st.expand_or_child(2);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 200);
+        st.expand_or_child(2);
+        assert_eq!(st.engine.rows().len(), 4);
+        assert_eq!(st.engine.rows()[st.selected_row].pid, 200);
+        assert!(!st.engine.rows()[st.selected_row].collapsed);
     }
 }
