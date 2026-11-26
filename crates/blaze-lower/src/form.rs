@@ -676,13 +676,15 @@ pub enum TypeRef {
     Error,
 }
 
-/// The pattern of a [`TypeRef::Pat`]: `!null` (core's `NonNull` pointer), or a pattern node
+/// The pattern of a [`TypeRef::Pat`]: `!null` (core's `NonNull` pointer), `in CONST_EXPR`
+/// (a finite const value-set pattern type, e.g. `SemVer is in VERSIONS`), or a pattern node
 /// (a [`Pat::Range`] with optional ends, a [`Pat::Lit`] or [`Pat::NegLit`] standing for
 /// itself, or a [`Pat::Or`] of those): the set the pinned library writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TyPat {
     NotNull,
     Of(PatId),
+    In(ConstIdx),
 }
 
 impl TypeRef {
@@ -713,6 +715,7 @@ impl TypeRef {
             TypeRef::For { binder, inner } => Node { a: binder.start, b: binder.len, c: inner.0, ..n.with(12) },
             TypeRef::Error => n.with(13),
             TypeRef::Pat { base, pat: TyPat::NotNull } => Node { a: base.0, ..n.with(14 | 1 << 8) },
+            TypeRef::Pat { base, pat: TyPat::In(c) } => Node { a: base.0, b: c.0, ..n.with(14 | 2 << 8) },
             TypeRef::Pat { base, pat: TyPat::Of(p) } => Node { a: base.0, b: p.0, ..n.with(14) },
             TypeRef::Record(l) => Node { a: l.start, b: l.len, ..n.with(15) },
             TypeRef::Union(l) => Node { a: l.start, b: l.len, ..n.with(16) },
@@ -746,6 +749,7 @@ impl TypeRef {
             11 => TypeRef::Macro(RowIdx(n.a)),
             12 => TypeRef::For { binder: list(n.a, n.b), inner: TypeId(n.c) },
             13 => TypeRef::Error,
+            14 if n.flags & (2 << 8) != 0 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::In(ConstIdx(n.b)) },
             14 if n.flags & (1 << 8) != 0 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::NotNull },
             14 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::Of(PatId(n.b)) },
             15 => TypeRef::Record(list(n.a, n.b)),

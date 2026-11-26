@@ -802,6 +802,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ctx"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-cbor",
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+ "blaze-tab",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-cunit"
 version = "0.0.0"
 dependencies = [

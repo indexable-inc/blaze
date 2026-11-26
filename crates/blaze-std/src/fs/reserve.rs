@@ -325,6 +325,7 @@ impl Dir<ReadWrite> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;

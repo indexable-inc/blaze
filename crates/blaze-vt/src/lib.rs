@@ -22,6 +22,7 @@
 //! | [`reply`] | every reply's exact bytes and terminator, as encoders over plain state | built |
 //! | [`kitty`] | APC: kitty graphics (parse, transmit, store, place, delete, reply, virtual placements) and the glyph protocol | built |
 //! | [`input`] | key (legacy, modifyOtherKeys 2, kitty flags 1–16), mouse (9/1000/1002/1003; X10, 1005, 1006, 1015, 1016), paste (2004, unsafe bytes) and focus (1004) encoding into the caller's buffer | built |
+//! | [`snapshot`] | canonical, portable VT snapshot & restore (scrollback, active/alt screens, styles, hyperlinks, cursor, modes, palette, title, cwd, soft-wrap metadata) | built |
 
 #![no_std]
 #![feature(register_tool, custom_inner_attributes)]
@@ -43,6 +44,7 @@ pub mod plant;
 pub mod reply;
 pub mod screen;
 pub mod sgr;
+pub mod snapshot;
 pub mod style;
 pub mod terminal;
 pub mod terminfo;
@@ -58,6 +60,8 @@ mod parser_tests;
 mod screen_tests;
 #[cfg(test)]
 mod sim_tests;
+#[cfg(test)]
+mod snapshot_tests;
 #[cfg(test)]
 mod terminal_tests;
 #[cfg(test)]

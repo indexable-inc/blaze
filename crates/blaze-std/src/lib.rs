@@ -314,6 +314,8 @@ pub mod union_ty;
 pub mod view;
 /// Structural Records (`{ a: T, b: U }`) and named-argument functions with defaults (`bstd::record_fn!`, `bstd::call!`).
 pub mod record_ty;
+/// Zero-cost, `#![forbid(unsafe_code)]` finite const value-set pattern types (`ValueSet`, `FinitePat`, `InSet`, `bstd::define_value_set!`).
+pub mod pat_ty;
 /// Zero-copy shared Prefabs (`LocalShare` + `TypeSet!`) and reactive Templates with retractions.
 /// Zero-unsafe, sans-IO, Flecs 4.2-equivalent archetype Entity-Component-System (`World`,
 /// generational `Entity`, `(Rel, Target)` pairs with `ChildOf` cascade & `IsA` prefab inheritance,

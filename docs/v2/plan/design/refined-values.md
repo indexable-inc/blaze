@@ -35,6 +35,12 @@ A range that is not a power of two needs no wrapper struct: **pattern types (`T 
 - **Enum variants (`Conn is Conn::Open { .. } | Conn::Draining { .. }`)** narrow flow-sensitively
   through `match`/`let else`, unlock direct field access when reduced to a single variant, and
   forbid whole-value overwrites through `&uniq (T is PAT)`.
+- **Finite const value sets (`SemVer is in VERSIONS`, `&str is in ["1.1.1", "1.2.2"]`)** refine
+  any `StructuralPartialEq` base type to a canonical sorted, deduplicated compile-time slice
+  (`blaze-ty::pat_ty::ConstSetPatTy`; portable zero-cost `bstd::pat_ty::FinitePat` / `InSet`),
+  with same layout as `T`, free subset subtyping (`OLD <: ALL <: T`), flow-sensitive `match`
+  exhaustiveness (`narrow_exclude` + `missing_members` witnesses), and strict `&uniq` field-and-whole
+  write guards.
 - **`#[blaze::invariant]` and `requires`/`ensures`** focus purely on **relational** properties
   across multiple fields or parameters (`self.len <= self.cap`, `i < v.len()`).
 

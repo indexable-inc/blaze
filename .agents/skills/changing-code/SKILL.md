@@ -38,11 +38,12 @@ then hand the batch over. A half-ported tree blocks every lane's run.
 ## best-long-term-design (rule 28)
 
 Build only what you are proud of, on the first iteration too: the first version of a design is
-already the one you would defend, never a placeholder to improve later; then iterate. Pick the best
-long-term design, not the least work: own the layer or port rustc's rule properly, and spend the
-effort on proving it right: real crates' own test suites passing under blaze, property tests and
-deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of
-hostile bytes.
+already the one you would defend, never a placeholder to improve later; then iterate. Always pursue
+and present the longest-term best solution by default (assume infinite time, even if
+out-of-distribution), not the least work: own the layer or port rustc's rule properly, show unitless
+proportional effort bars (`[████████░░]`) when comparing options, and spend the effort on proving it
+right: real crates' own test suites passing under blaze, property tests and deterministic simulation
+of blaze's own invariants (`testing` skill), and fuzzing of parsers of hostile bytes.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
