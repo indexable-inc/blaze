@@ -1910,6 +1910,73 @@ fn use_cy_sol_call<C: CySolCall>(_c: &C) {}
 fn repro_sol_call_cyclic_assoc_bound() {
     use_cy_sol_call(&CyTransferCall);
 }
+
+// `TxRequest<'a, 'host, T, Tx>::host: &'a mut T::Host<'host>` and
+// `BlockAssemblerInput<'a, 'b, F, H>::execution_ctx: F::ExecutionCtx<'a>` pattern:
+// GAT-projected ADT fields must keep independent lifetimes (`'a` vs `'host`, `'a` vs `'b`)
+// via `field_slot_via_borrow` without collapsing them into `BorrowInexact` / `ValueInexact`.
+trait GatHostTypes {
+    type Tx;
+    type Host<'h>;
+}
+struct GatEvm<'h>(&'h mut u32);
+impl<'h> GatEvm<'h> {
+    fn spec_id(&self) -> u32 {
+        *self.0
+    }
+    fn bump(&mut self) {
+        *self.0 += 1;
+    }
+}
+struct GatTempoTypes;
+impl GatHostTypes for GatTempoTypes {
+    type Tx = u32;
+    type Host<'h> = GatEvm<'h>;
+}
+struct GatTxRequest<'a, 'host, T: GatHostTypes, Tx> {
+    envelope: &'a T::Tx,
+    tx: &'a Tx,
+    host: &'a mut T::Host<'host>,
+}
+fn repro_gat_field_borrow_request_host<'a, 'host>(
+    request: &mut GatTxRequest<'a, 'host, GatTempoTypes, u32>,
+) -> &'a u32 {
+    let _s = request.host.spec_id();
+    request.host.bump();
+    request.tx
+}
+fn control_gat_field_host_lifetime_escape<'a, 'host>(
+    request: &mut GatTxRequest<'a, 'host, GatTempoTypes, u32>,
+) -> &'static u32 {
+    request.host.0
+}
+
+trait GatExecFactory {
+    type Ctx<'a>;
+}
+struct GatExecCtx<'a>(&'a u32);
+struct GatFactory;
+impl GatExecFactory for GatFactory {
+    type Ctx<'a> = GatExecCtx<'a>;
+}
+struct GatAssemblerInput<'a, 'b, F: GatExecFactory> {
+    ctx: F::Ctx<'a>,
+    parent: &'a u32,
+    output: &'b u32,
+}
+fn repro_gat_field_destructure_assembler<'a, 'b>(
+    input: GatAssemblerInput<'a, 'b, GatFactory>,
+) -> (&'a u32, &'b u32) {
+    let GatAssemblerInput { ctx: GatExecCtx(inner), parent, output } = input;
+    let _ = parent;
+    (inner, output)
+}
+fn control_gat_field_destructure_swap_lifetimes<'a, 'b>(
+    input: GatAssemblerInput<'a, 'b, GatFactory>,
+) -> &'b u32 {
+    let GatAssemblerInput { ctx: GatExecCtx(inner), .. } = input;
+    inner
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

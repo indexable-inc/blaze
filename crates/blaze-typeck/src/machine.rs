@@ -2518,8 +2518,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     fn lowered_projection(&mut self, trait_: ItemKey, name: Name, args: TyList, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
         let term = self.fresh()?;
         self.ty.register(Obligation { goal: Goal::Projection { trait_, args, name, term }, cause })?;
-        if let (Lower::Args(_), Cause::Expr(e)) = (mode, cause) {
-            self.projected.push((e, trait_, Some(name), args));
+        if let Lower::Args(_) = mode {
+            match cause {
+                Cause::Expr(e) => self.projected.push((e, trait_, Some(name), args)),
+                Cause::Pat(_) => self.projected.push((self.body.root, trait_, Some(name), args)),
+                _ => {}
+            }
         }
         if self.sig_rows && matches!(mode, Lower::Body) {
             self.projected.push((self.body.root, trait_, Some(name), args));
