@@ -1512,6 +1512,13 @@ fn emit_st_spill_fp(words: &mut Vec<u32, Alloc<'_>>, vs: Reg, spill_base: u32, s
     words.push(enc::fp_access(enc::str(Size::X, vs, SP, off / 8)));
 }
 
+/// `add xd, xn|sp, xm, uxtx` (ADD, extended register, 64-bit, UXTX, #0): required when `rn == SP`
+/// because shifted-register `enc::add` treats register 31 as `XZR`.
+#[inline]
+const fn add_ext_uxtx(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x8b20_6000 | (rm << 16) | (rn << 5) | rd
+}
+
 /// Emits a 128-bit NEON vector load (`is_load = true`) or store (`is_load = false`) at `[rn, #off]`.
 fn emit_mem_q(words: &mut Vec<u32, Alloc<'_>>, is_load: bool, vt: Reg, rn: Reg, off: i64) {
     if off >= 0 && off % 16 == 0 && off / 16 < 4096 {
@@ -1522,7 +1529,7 @@ fn emit_mem_q(words: &mut Vec<u32, Alloc<'_>>, is_load: bool, vt: Reg, rn: Reg, 
         words.push(if is_load { enc::ldur_q(vt, rn, off_i32) } else { enc::stur_q(vt, rn, off_i32) });
     } else {
         emit_const_u64(words, X17, off.cast_unsigned());
-        words.push(enc::add(X17, rn, X17));
+        words.push(if rn == SP { add_ext_uxtx(X17, SP, X17) } else { enc::add(X17, rn, X17) });
         words.push(if is_load { enc::ldr_q(vt, X17, 0) } else { enc::str_q(vt, X17, 0) });
     }
 }
@@ -19569,5 +19576,31 @@ mod tests {
                 assert_eq!(f(n, mask, seed), want, "n={n} mask={mask} seed={seed}");
             }
         }
+    }
+
+    #[test]
+    fn emit_mem_q_uses_extended_add_when_base_is_sp() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut words = Vec::new_in(alloc);
+        // Unaligned >255 stack offset (e.g. spilled Q register at sp + 0x818): must use
+        // extended-register `add x17, sp, x17, uxtx` (0x8b31_63f1), never shifted-register
+        // `add x17, xzr, x17` (0x8b11_03f1) which drops SP to 0 and faults.
+        super::emit_mem_q(&mut words, false, super::V30, super::SP, 0x818);
+        assert!(
+            words.scan_for(&0x8b31_63f1).is_some(),
+            "expected extended add x17, sp, x17, uxtx (0x8b31_63f1), got {words:#x?}"
+        );
+        assert!(
+            words.scan_for(&0x8b11_03f1).is_none(),
+            "must not emit shifted add x17, xzr, x17 (0x8b11_03f1), got {words:#x?}"
+        );
+
+        let mut non_sp_words = Vec::new_in(alloc);
+        super::emit_mem_q(&mut non_sp_words, true, super::V30, super::X1, 0x818);
+        assert!(
+            non_sp_words.scan_for(&super::enc::add(super::X17, super::X1, super::X17)).is_some(),
+            "non-SP base should still emit shifted add, got {non_sp_words:#x?}"
+        );
     }
 }

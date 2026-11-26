@@ -19,19 +19,19 @@ use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use blaze_hash::{FixedState, Map, MapOpts};
-use blaze_own::Vec as OwnVec;
+use blaze_own::{Alloc, SharedAlloc, Vec as OwnVec};
 
 use crate::{
     Op, View,
     body::{Bodies, BodyId, Datum, DatumId, Target},
     func::{Func, RefId},
-    inline::{ImportedRef, InlineError, InlinePolicy, SiteWeights, inline_guided_with_cache},
+    inline::{ImportedRef, InlineError, InlinePolicy, SiteWeights, inline_guided_with_base_cache, inline_guided_with_cache},
     pgo::PgoSiteTable,
     simplify::{
         RegBudget, SimplifyError, SuperoptOpts, auto_vectorize_loops, dead, eliminate_redundant_checks, if_convert,
-        optimize_memory, propagate, scalar_replace, schedule_dag, slp_vectorize, sota_optimize_fixpoint,
-        speculative_devirt, superopt_a64, tail_duplicate_dispatch, thread_jumps, unroll_scalar_loops, unswitch_loops,
-        vectorize_memchr_loops, IndirectTarget,
+        memopt::scalarize_small_memops, optimize_memory, propagate, scalar_replace, schedule_dag, slp_vectorize,
+        sota_optimize_fixpoint, speculative_devirt, superopt_a64, tail_duplicate_dispatch, thread_jumps,
+        unroll_scalar_loops, unswitch_loops, vectorize_memchr_loops, IndirectTarget,
     },
     summary::FnSummary,
 };
@@ -264,7 +264,9 @@ impl<A: Allocator> Bodies for ModuleBodies<'_, A> {
 /// (bounds-check hoisting, GEMM, vectorization, unrolling, LICM) see the inlined loop body as
 /// a single block.
 fn simplify_body<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
-    let sroa = scalar_replace(view, alloc)?;
+    let scalarized = scalarize_small_memops(view, alloc)?;
+    let sroa_in = scalarized.as_ref().map_or(view, |f| f.view());
+    let sroa = scalar_replace(sroa_in, alloc)?;
     let prop1 = propagate(sroa.view(), alloc)?;
     let threaded = thread_jumps(prop1.view(), alloc)?;
     let prop2 = propagate(threaded.view(), alloc)?;
@@ -453,6 +455,610 @@ pub fn lto_optimize_module<A: Allocator + Copy>(
     Ok(ModuleLto {
         bodies: out_bodies,
         scc_count: sccs.len(),
+        total_inlined_bodies,
+    })
+}
+
+/// Parallel execution strategy for [`lto_optimize_module_par`] (Rule 78: strategy-is-a-type-parameter).
+///
+/// Runs `f(idx, worker_scratch_alloc)` for every `idx` in `0..count` and returns results in exact
+/// ascending `idx` order (Rule 25). Each worker provides a reusable scratch [`Alloc`] that is
+/// reset between items while persistent outputs allocate in `out_alloc` (`SharedAlloc<'static>`).
+pub trait LtoRunner {
+    fn par_map<T: Send, F>(
+        &self,
+        count: usize,
+        out_alloc: SharedAlloc<'static>,
+        f: F,
+    ) -> Result<OwnVec<T, SharedAlloc<'static>>, SimplifyError>
+    where
+        F: Fn(usize, Alloc<'_>) -> T + Sync;
+}
+
+/// Sequential [`LtoRunner`] running every item inline on the caller's thread.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SequentialLtoRunner;
+
+impl LtoRunner for SequentialLtoRunner {
+    fn par_map<T: Send, F>(
+        &self,
+        count: usize,
+        out_alloc: SharedAlloc<'static>,
+        f: F,
+    ) -> Result<OwnVec<T, SharedAlloc<'static>>, SimplifyError>
+    where
+        F: Fn(usize, Alloc<'_>) -> T + Sync,
+    {
+        let mut out = OwnVec::with_capacity_in(count, out_alloc);
+        let scratch = out_alloc.local();
+        for idx in 0..count {
+            out.push(f(idx, scratch));
+        }
+        Ok(out)
+    }
+}
+
+/// Read-only overlay for a multi-node recursive SCC running inside one worker task: checks
+/// SCC-local updated bodies/imports first, falling back to the frozen module from lower levels.
+struct SccLocalBodies<'a, 'b, A: Allocator> {
+    local_indices: &'b [u32],
+    local_funcs: &'b [Option<Func<Alloc<'a>>>],
+    local_imports: &'b [Option<OwnVec<ImportedRef, Alloc<'a>>>],
+    base_bodies: &'b [ModuleBody<A>],
+    base_imports: &'b [OwnVec<ImportedRef, A>],
+    id_to_index: &'b Map<BodyId, usize, FixedState, A>,
+    external: &'b (dyn Bodies + Sync),
+}
+
+impl<A: Allocator> SccLocalBodies<'_, '_, A> {
+    fn local_pos(&self, idx: usize) -> Option<usize> {
+        let idx_u32 = u32::try_from(idx).ok()?;
+        self.local_indices.binary_search(&idx_u32).ok()
+    }
+
+    fn resolve_origin(&self, mut from: BodyId, mut reference: RefId) -> (BodyId, RefId) {
+        for _ in 0..32 {
+            let Some(&idx) = self.id_to_index.get(&from) else {
+                break;
+            };
+            let found = if let Some(lpos) = self.local_pos(idx)
+                && let Some(Some(imps)) = self.local_imports.get(lpos)
+            {
+                imps.iter().find(|r| r.caller_ref == reference).copied()
+            } else {
+                self.base_imports
+                    .get(idx)
+                    .and_then(|imps| imps.iter().find(|r| r.caller_ref == reference).copied())
+            };
+            let Some(imp) = found else {
+                break;
+            };
+            from = imp.source_body;
+            reference = imp.source_ref;
+        }
+        (from, reference)
+    }
+}
+
+impl<A: Allocator> Bodies for SccLocalBodies<'_, '_, A> {
+    fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        let (callee_id, ext_view) = self.external.callee(orig_from, orig_ref)?;
+        if let Some(&idx) = self.id_to_index.get(&callee_id) {
+            if let Some(lpos) = self.local_pos(idx)
+                && let Some(Some(f)) = self.local_funcs.get(lpos)
+            {
+                return Some((callee_id, f.view()));
+            }
+            if let Some(mb) = self.base_bodies.get(idx) {
+                return Some((callee_id, mb.func.view()));
+            }
+        }
+        Some((callee_id, ext_view))
+    }
+
+    fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        self.external.target(orig_from, orig_ref)
+    }
+
+    fn datum(&self, id: DatumId) -> Option<Datum<'_>> {
+        self.external.datum(id)
+    }
+
+    fn body(&self, id: BodyId) -> Option<View<'_>> {
+        if let Some(&idx) = self.id_to_index.get(&id) {
+            if let Some(lpos) = self.local_pos(idx)
+                && let Some(Some(f)) = self.local_funcs.get(lpos)
+            {
+                return Some(f.view());
+            }
+            return self.base_bodies.get(idx).map(|b| b.func.view());
+        }
+        self.external.body(id)
+    }
+
+    fn position(&self, item: u128, site: u32) -> Option<(u32, u32)> {
+        self.external.position(item, site)
+    }
+}
+
+/// Result of optimizing one node inside an SCC wavefront task.
+struct SccNodeResult {
+    idx: usize,
+    func: Func<SharedAlloc<'static>>,
+    summary: FnSummary,
+    read: OwnVec<BodyId, SharedAlloc<'static>>,
+    imported_refs: OwnVec<ImportedRef, SharedAlloc<'static>>,
+}
+
+/// Copies a slice of `Copy` items into an `OwnVec<T, A>`.
+fn copy_own_vec<T: Copy, A: Allocator>(src: &[T], alloc: A) -> OwnVec<T, A> {
+    let mut out = OwnVec::with_capacity_in(src.len(), alloc);
+    out.extend_from_slice(src);
+    out
+}
+
+/// Read-only overlay for parallel singleton SCC tasks backed by `OwnVec` import tables.
+struct ParModuleBodies<'a, A: Allocator> {
+    bodies: &'a [ModuleBody<A>],
+    imports: &'a [OwnVec<ImportedRef, A>],
+    id_to_index: &'a Map<BodyId, usize, FixedState, A>,
+    external: &'a (dyn Bodies + Sync),
+}
+
+impl<A: Allocator> ParModuleBodies<'_, A> {
+    fn resolve_origin(&self, mut from: BodyId, mut reference: RefId) -> (BodyId, RefId) {
+        for _ in 0..32 {
+            let Some(&idx) = self.id_to_index.get(&from) else {
+                break;
+            };
+            let Some(body_imports) = self.imports.get(idx) else {
+                break;
+            };
+            let Some(imp) = body_imports.iter().find(|r| r.caller_ref == reference) else {
+                break;
+            };
+            from = imp.source_body;
+            reference = imp.source_ref;
+        }
+        (from, reference)
+    }
+}
+
+impl<A: Allocator> Bodies for ParModuleBodies<'_, A> {
+    fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        let (callee_id, ext_view) = self.external.callee(orig_from, orig_ref)?;
+        if let Some(&idx) = self.id_to_index.get(&callee_id)
+            && let Some(mb) = self.bodies.get(idx)
+        {
+            return Some((callee_id, mb.func.view()));
+        }
+        Some((callee_id, ext_view))
+    }
+
+    fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        self.external.target(orig_from, orig_ref)
+    }
+
+    fn datum(&self, id: DatumId) -> Option<Datum<'_>> {
+        self.external.datum(id)
+    }
+
+    fn body(&self, id: BodyId) -> Option<View<'_>> {
+        if let Some(&idx) = self.id_to_index.get(&id) {
+            return self.bodies.get(idx).map(|b| b.func.view());
+        }
+        self.external.body(id)
+    }
+
+    fn position(&self, item: u128, site: u32) -> Option<(u32, u32)> {
+        self.external.position(item, site)
+    }
+}
+
+/// Parallel deterministic bottom-up SCC ThinLTO optimization over `module`.
+///
+/// 1. Runs intra-procedural pre-inline `simplify_body` + `FnSummary` across all `n` bodies in
+///    parallel using per-worker scratch frames.
+/// 2. Partitions the Tarjan SCC DAG into reverse-topological levels (wavefronts) and optimizes
+///    every independent SCC within each level in parallel, merging outputs in exact ascending
+///    node index order so output is bit-for-bit identical to [`lto_optimize_module`] (Rule 25).
+pub fn lto_optimize_module_par<R: LtoRunner>(
+    mut module: OwnVec<ModuleBody<SharedAlloc<'static>>, SharedAlloc<'static>>,
+    external: &(dyn Bodies + Sync),
+    weights: &(dyn SiteWeights + Sync),
+    policy: InlinePolicy,
+    alloc: SharedAlloc<'static>,
+    runner: &R,
+) -> Result<ModuleLto<SharedAlloc<'static>>, SimplifyError> {
+    let n = module.len();
+    let mut id_to_index: Map<BodyId, usize, FixedState, SharedAlloc<'static>> = Map::new(MapOpts {
+        hasher: FixedState,
+        alloc,
+        capacity: Some(n),
+    });
+    for (idx, mb) in module.iter().enumerate() {
+        id_to_index.insert(mb.id, idx);
+    }
+
+    // Build intra-module direct call graph in CSR form.
+    let mut adj_offsets: OwnVec<u32, SharedAlloc<'static>> = OwnVec::with_capacity_in(n + 1, alloc);
+    let mut adj: OwnVec<u32, SharedAlloc<'static>> = OwnVec::with_capacity_in(n.saturating_mul(2), alloc);
+    adj_offsets.push(0);
+    for mb in module.iter() {
+        let view = mb.func.view();
+        let edge_start = adj.len();
+        for at in 0..view.len() {
+            if !matches!(view.op(at), Op::Call | Op::Invoke) {
+                continue;
+            }
+            let Some(extra_start) = view.data.get(at).and_then(|&d| usize::try_from(d).ok()) else {
+                continue;
+            };
+            let Some(&ref_word) = view.extra.get(extra_start) else {
+                continue;
+            };
+            let reference = RefId(ref_word);
+            if let Some((callee_id, _)) = external.callee(mb.id, reference)
+                && let Some(&callee_idx) = id_to_index.get(&callee_id)
+                && let Ok(c_u32) = u32::try_from(callee_idx)
+            {
+                adj.push(c_u32);
+            }
+        }
+        if let Some(edge_slice) = adj.get_mut(edge_start..) {
+            edge_slice.sort_unstable();
+        }
+        let mut w = edge_start;
+        for r in edge_start..adj.len() {
+            let cur = adj.get(r).copied().unwrap_or(0);
+            let prev = w.checked_sub(1).and_then(|p| adj.get(p).copied());
+            if w == edge_start || prev != Some(cur) {
+                if let Some(slot) = adj.get_mut(w) {
+                    *slot = cur;
+                }
+                w += 1;
+            }
+        }
+        adj.truncate(w);
+        adj_offsets.push(u32_of(adj.len()));
+    }
+
+    // Condense call graph into reverse-topological SCCs (callees before callers).
+    let sccs = tarjan_sccs(n, &adj_offsets, &adj, alloc);
+    let scc_count = sccs.len();
+
+    // Phase 0 + Phase 1 (100% intra-procedural): compute initial summary, run pre-inline
+    // `simplify_body` in worker scratch, and refresh summary across all `n` bodies in parallel.
+    let module_ref = module.as_slice();
+    let pre_results = runner.par_map(n, alloc, |idx, scratch| -> Result<(FnSummary, FnSummary, Func<SharedAlloc<'static>>), SimplifyError> {
+        let Some(mb) = module_ref.get(idx) else {
+            return Err(SimplifyError::Refused { inst: 0, what: "module index out of range" });
+        };
+        let view = mb.func.view();
+        let prev = FnSummary::compute(view, &scratch);
+        let simplified = simplify_body(view, scratch)?;
+        let post = FnSummary::compute(simplified.view(), &scratch);
+        let owned = simplified.view().to_func_in(alloc);
+        Ok((prev, post, owned))
+    })?;
+
+    let mut prev_summaries: OwnVec<FnSummary, SharedAlloc<'static>> = OwnVec::with_capacity_in(n, alloc);
+    let mut summaries: Map<BodyId, FnSummary, FixedState, SharedAlloc<'static>> = Map::new(MapOpts {
+        hasher: FixedState,
+        alloc,
+        capacity: Some(n),
+    });
+    for (idx, res) in pre_results.into_iter().enumerate() {
+        let (prev, post, simplified) = res?;
+        prev_summaries.push(prev);
+        if let Some(mb) = module.get_mut(idx) {
+            summaries.insert(mb.id, post);
+            mb.func = simplified;
+        }
+    }
+
+    // Group SCCs into topological wavefront levels (0 = leaves, max = roots).
+    let mut node_scc: OwnVec<u32, SharedAlloc<'static>> = OwnVec::from_elem_in(0u32, n, alloc);
+    for scc_idx in 0..scc_count {
+        let scc_u32 = u32_of(scc_idx);
+        for &node in sccs.component(scc_idx) {
+            if let Some(slot) = node_scc.get_mut(to_idx(node)) {
+                *slot = scc_u32;
+            }
+        }
+    }
+    let mut scc_level: OwnVec<u32, SharedAlloc<'static>> = OwnVec::from_elem_in(0u32, scc_count, alloc);
+    let mut max_level = 0u32;
+    for scc_idx in 0..scc_count {
+        let mut lvl = 0u32;
+        for &node in sccs.component(scc_idx) {
+            let ni = to_idx(node);
+            let start = adj_offsets.get(ni).copied().map_or(0, to_idx);
+            let end = adj_offsets.get(ni + 1).copied().map_or(start, to_idx);
+            if let Some(callees) = adj.get(start..end) {
+                for &callee in callees {
+                    let cs = node_scc.get(to_idx(callee)).copied().map_or(scc_idx, to_idx);
+                    if cs != scc_idx {
+                        let cl = scc_level.get(cs).copied().unwrap_or(0).saturating_add(1);
+                        if cl > lvl {
+                            lvl = cl;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(slot) = scc_level.get_mut(scc_idx) {
+            *slot = lvl;
+        }
+        if lvl > max_level {
+            max_level = lvl;
+        }
+    }
+    let num_levels = to_idx(max_level).saturating_add(1);
+    let mut level_counts: OwnVec<usize, SharedAlloc<'static>> = OwnVec::from_elem_in(0usize, num_levels, alloc);
+    for &lvl in scc_level.iter() {
+        if let Some(slot) = level_counts.get_mut(to_idx(lvl)) {
+            *slot += 1;
+        }
+    }
+    let mut level_offsets: OwnVec<usize, SharedAlloc<'static>> = OwnVec::with_capacity_in(num_levels + 1, alloc);
+    let mut sum_off = 0usize;
+    for &c in level_counts.iter() {
+        level_offsets.push(sum_off);
+        sum_off += c;
+    }
+    level_offsets.push(sum_off);
+    let mut level_fill: OwnVec<usize, SharedAlloc<'static>> = OwnVec::with_capacity_in(num_levels, alloc);
+    level_fill.extend_from_slice(level_offsets.get(..num_levels).unwrap_or(&[]));
+    let mut level_sccs: OwnVec<u32, SharedAlloc<'static>> = OwnVec::from_elem_in(0u32, scc_count, alloc);
+    for scc_idx in 0..scc_count {
+        let lvl = scc_level.get(scc_idx).copied().map_or(0, to_idx);
+        if let Some(pos_slot) = level_fill.get_mut(lvl) {
+            let pos = *pos_slot;
+            *pos_slot += 1;
+            if let Some(slot) = level_sccs.get_mut(pos) {
+                *slot = u32_of(scc_idx);
+            }
+        }
+    }
+
+    let mut reads: OwnVec<OwnVec<BodyId, SharedAlloc<'static>>, SharedAlloc<'static>> = OwnVec::with_capacity_in(n, alloc);
+    let mut imports: OwnVec<OwnVec<ImportedRef, SharedAlloc<'static>>, SharedAlloc<'static>> = OwnVec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        reads.push(OwnVec::new_in(alloc));
+        imports.push(OwnVec::new_in(alloc));
+    }
+
+    let mut total_inlined_bodies = 0usize;
+
+    // Phase 2: bottom-up SCC wavefronts. Every SCC in the same level depends only on levels < lvl.
+    for lvl in 0..num_levels {
+        let l_start = level_offsets.get(lvl).copied().unwrap_or(0);
+        let l_end = level_offsets.get(lvl + 1).copied().unwrap_or(l_start);
+        let level_slice = level_sccs.get(l_start..l_end).unwrap_or(&[]);
+        if level_slice.is_empty() {
+            continue;
+        }
+        let sccs_ref = &sccs;
+        let module_ref = module.as_slice();
+        let imports_ref = imports.as_slice();
+        let id_to_index_ref = &id_to_index;
+        let summaries_ref = &summaries;
+
+        let level_results = runner.par_map(level_slice.len(), alloc, |pos, scratch| -> Result<OwnVec<SccNodeResult, SharedAlloc<'static>>, SimplifyError> {
+            let Some(&scc_u32) = level_slice.get(pos) else {
+                return Ok(OwnVec::new_in(alloc));
+            };
+            let comp = sccs_ref.component(to_idx(scc_u32));
+            let mut results = OwnVec::with_capacity_in(comp.len(), alloc);
+
+            if comp.len() == 1 {
+                let Some(&node_u32) = comp.first() else {
+                    return Ok(results);
+                };
+                let idx = to_idx(node_u32);
+                let Some(mb) = module_ref.get(idx) else {
+                    return Ok(results);
+                };
+                let body_id = mb.id;
+                let overlay = ParModuleBodies {
+                    bodies: module_ref,
+                    imports: imports_ref,
+                    id_to_index: id_to_index_ref,
+                    external,
+                };
+                let mut local_sums: Map<BodyId, FnSummary, FixedState, Alloc<'_>> = Map::new(MapOpts {
+                    hasher: FixedState,
+                    alloc: scratch,
+                    capacity: None,
+                });
+                let inlined = inline_guided_with_base_cache(
+                    mb.func.view(),
+                    body_id,
+                    &overlay,
+                    weights,
+                    policy,
+                    Some(summaries_ref),
+                    &mut local_sums,
+                    scratch,
+                )
+                .map_err(from_inline)?;
+                let spliced_count = inlined.read.len();
+                let mut cur_func = if spliced_count > 0 {
+                    simplify_body(inlined.func.view(), scratch)?
+                } else {
+                    inlined.func
+                };
+                let read_shared = copy_own_vec(inlined.read.as_slice(), alloc);
+                let imp_shared = copy_own_vec(inlined.imported_refs.as_slice(), alloc);
+                let imp_local = copy_own_vec(inlined.imported_refs.as_slice(), scratch);
+                let local_idx_arr = [node_u32];
+                let local_funcs_arr = [None::<Func<Alloc<'_>>>];
+                let local_imps_arr = [Some(imp_local)];
+                let tce_overlay = SccLocalBodies {
+                    local_indices: &local_idx_arr,
+                    local_funcs: &local_funcs_arr,
+                    local_imports: &local_imps_arr,
+                    base_bodies: module_ref,
+                    base_imports: imports_ref,
+                    id_to_index: id_to_index_ref,
+                    external,
+                };
+                if let Some((tce_func, _)) = eliminate_self_tail_calls_if_any(cur_func.view(), body_id, &tce_overlay, scratch)? {
+                    cur_func = simplify_body(tce_func.view(), scratch)?;
+                }
+                let final_summary = FnSummary::compute(cur_func.view(), &scratch);
+                results.push(SccNodeResult {
+                    idx,
+                    func: cur_func.view().to_func_in(alloc),
+                    summary: final_summary,
+                    read: read_shared,
+                    imported_refs: imp_shared,
+                });
+                return Ok(results);
+            }
+
+            // Multi-node recursive SCC: process nodes in deterministic ascending index order
+            // within this worker task using a local overlay over the frozen base module.
+            let mut local_funcs: OwnVec<Option<Func<Alloc<'_>>>, Alloc<'_>> = OwnVec::with_capacity_in(comp.len(), scratch);
+            let mut local_imps: OwnVec<Option<OwnVec<ImportedRef, Alloc<'_>>>, Alloc<'_>> = OwnVec::with_capacity_in(comp.len(), scratch);
+            for _ in 0..comp.len() {
+                local_funcs.push(None);
+                local_imps.push(None);
+            }
+            let mut local_sums: Map<BodyId, FnSummary, FixedState, Alloc<'_>> = Map::new(MapOpts {
+                hasher: FixedState,
+                alloc: scratch,
+                capacity: Some(comp.len()),
+            });
+            for (lpos, &node_u32) in comp.iter().enumerate() {
+                let idx = to_idx(node_u32);
+                let Some(mb) = module_ref.get(idx) else {
+                    continue;
+                };
+                let body_id = mb.id;
+                let inlined = {
+                    let overlay = SccLocalBodies {
+                        local_indices: comp,
+                        local_funcs: local_funcs.as_slice(),
+                        local_imports: local_imps.as_slice(),
+                        base_bodies: module_ref,
+                        base_imports: imports_ref,
+                        id_to_index: id_to_index_ref,
+                        external,
+                    };
+                    inline_guided_with_base_cache(
+                        mb.func.view(),
+                        body_id,
+                        &overlay,
+                        weights,
+                        policy,
+                        Some(summaries_ref),
+                        &mut local_sums,
+                        scratch,
+                    )
+                    .map_err(from_inline)?
+                };
+                let spliced_count = inlined.read.len();
+                let mut cur_func = if spliced_count > 0 {
+                    simplify_body(inlined.func.view(), scratch)?
+                } else {
+                    inlined.func
+                };
+                let read_shared = copy_own_vec(inlined.read.as_slice(), alloc);
+                let imp_shared = copy_own_vec(inlined.imported_refs.as_slice(), alloc);
+                if let Some(slot) = local_imps.get_mut(lpos) {
+                    *slot = Some(copy_own_vec(inlined.imported_refs.as_slice(), scratch));
+                }
+                let tce = {
+                    let overlay = SccLocalBodies {
+                        local_indices: comp,
+                        local_funcs: local_funcs.as_slice(),
+                        local_imports: local_imps.as_slice(),
+                        base_bodies: module_ref,
+                        base_imports: imports_ref,
+                        id_to_index: id_to_index_ref,
+                        external,
+                    };
+                    eliminate_self_tail_calls_if_any(cur_func.view(), body_id, &overlay, scratch)?
+                };
+                if let Some((tce_func, _)) = tce {
+                    cur_func = simplify_body(tce_func.view(), scratch)?;
+                }
+                let final_summary = FnSummary::compute(cur_func.view(), &scratch);
+                local_sums.insert(body_id, final_summary);
+                let shared_func = cur_func.view().to_func_in(alloc);
+                if let Some(slot) = local_funcs.get_mut(lpos) {
+                    *slot = Some(cur_func);
+                }
+                results.push(SccNodeResult {
+                    idx,
+                    func: shared_func,
+                    summary: final_summary,
+                    read: read_shared,
+                    imported_refs: imp_shared,
+                });
+            }
+            Ok(results)
+        })?;
+
+        for scc_res in level_results {
+            let nodes = scc_res?;
+            for item in nodes {
+                total_inlined_bodies += item.read.len();
+                if let Some(mb) = module.get_mut(item.idx) {
+                    summaries.insert(mb.id, item.summary);
+                    mb.func = item.func;
+                }
+                if let Some(slot) = reads.get_mut(item.idx) {
+                    *slot = item.read;
+                }
+                if let Some(slot) = imports.get_mut(item.idx) {
+                    *slot = item.imported_refs;
+                }
+            }
+        }
+    }
+
+    let mut out_bodies: OwnVec<OptimizedBody<SharedAlloc<'static>>, SharedAlloc<'static>> = OwnVec::with_capacity_in(n, alloc);
+    let mut mod_iter = module.into_iter();
+    let mut read_iter = reads.into_iter();
+    let mut imp_iter = imports.into_iter();
+    for idx in 0..n {
+        let Some(mb) = mod_iter.next() else {
+            return Err(SimplifyError::Refused { inst: 0, what: "module length mismatch" });
+        };
+        let Some(read_own) = read_iter.next() else {
+            return Err(SimplifyError::Refused { inst: 0, what: "reads length mismatch" });
+        };
+        let Some(imp_own) = imp_iter.next() else {
+            return Err(SimplifyError::Refused { inst: 0, what: "imports length mismatch" });
+        };
+        let prev_summary = prev_summaries.get(idx).copied().unwrap_or_else(|| FnSummary::compute(mb.func.view(), &alloc));
+        let summary = summaries.get(&mb.id).copied().unwrap_or(prev_summary);
+        let summary_changed = summary.summary_hash != prev_summary.summary_hash;
+        let mut read = Vec::with_capacity_in(read_own.len(), alloc);
+        read.extend_from_slice(read_own.as_slice());
+        let mut imported_refs = Vec::with_capacity_in(imp_own.len(), alloc);
+        imported_refs.extend_from_slice(imp_own.as_slice());
+        out_bodies.push(OptimizedBody {
+            id: mb.id,
+            func: mb.func,
+            prev_summary,
+            summary,
+            read,
+            imported_refs,
+            summary_changed,
+        });
+    }
+
+    Ok(ModuleLto {
+        bodies: out_bodies,
+        scc_count,
         total_inlined_bodies,
     })
 }
@@ -2214,5 +2820,158 @@ mod tests {
             .filter(|&i| out.func.view().op(i) == Op::Call)
             .count();
         assert_eq!(call_count, 1);
+    }
+
+    #[test]
+    fn lto_optimize_module_par_matches_sequential() {
+        let shared = blaze_own::testing::heap().shared();
+        let alloc = Alloc::from(shared);
+
+        // Build a 4-body multi-level DAG:
+        //   leaf(x)   = x + 7
+        //   mid(x)    = leaf(x) * 3
+        //   root_a(x) = mid(x) + leaf(x)
+        //   root_b(x) = leaf(x) ^ 1
+        let leaf_id = BodyId([11u8; 32]);
+        let mid_id = BodyId([12u8; 32]);
+        let root_a_id = BodyId([13u8; 32]);
+        let root_b_id = BodyId([14u8; 32]);
+
+        let build_unary_leaf = || {
+            let mut b = Builder::<_, Full>::new_in(32, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c7 = b.iconst(Ty::I64, 7);
+            let sum = b.binary(Op::Add, Flags::NONE, x, c7);
+            b.ret(&[sum]);
+            b.finish_checked().unwrap()
+        };
+
+        let leaf_func = build_unary_leaf();
+
+        let (mid_func, mid_to_leaf) = {
+            let mut b = Builder::<_, Full>::new_in(32, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let leaf_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let r = b.call(Flags::NONE, leaf_ref, sig, &[x]);
+            let c3 = b.iconst(Ty::I64, 3);
+            let prod = b.binary(Op::Mul, Flags::NONE, r, c3);
+            b.ret(&[prod]);
+            (b.finish_checked().unwrap(), leaf_ref)
+        };
+
+        let (root_a_func, ra_to_mid, ra_to_leaf) = {
+            let mut b = Builder::<_, Full>::new_in(32, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let mid_ref = b.reference(RefKind::Func, 0);
+            let leaf_ref = b.reference(RefKind::Func, 1);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let m = b.call(Flags::NONE, mid_ref, sig, &[x]);
+            let l = b.call(Flags::NONE, leaf_ref, sig, &[x]);
+            let sum = b.binary(Op::Add, Flags::NONE, m, l);
+            b.ret(&[sum]);
+            (b.finish_checked().unwrap(), mid_ref, leaf_ref)
+        };
+
+        let (root_b_func, rb_to_leaf) = {
+            let mut b = Builder::<_, Full>::new_in(32, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let leaf_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let l = b.call(Flags::NONE, leaf_ref, sig, &[x]);
+            let c1 = b.iconst(Ty::I64, 1);
+            let xored = b.binary(Op::Xor, Flags::NONE, l, c1);
+            b.ret(&[xored]);
+            (b.finish_checked().unwrap(), leaf_ref)
+        };
+
+        struct DagBodies<'a> {
+            leaf_id: BodyId,
+            mid_id: BodyId,
+            root_a_id: BodyId,
+            root_b_id: BodyId,
+            mid_to_leaf: RefId,
+            ra_to_mid: RefId,
+            ra_to_leaf: RefId,
+            rb_to_leaf: RefId,
+            leaf_view: View<'a>,
+            mid_view: View<'a>,
+        }
+
+        impl Bodies for DagBodies<'_> {
+            fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+                if (from == self.mid_id && reference == self.mid_to_leaf)
+                    || (from == self.root_a_id && reference == self.ra_to_leaf)
+                    || (from == self.root_b_id && reference == self.rb_to_leaf)
+                {
+                    return Some((self.leaf_id, self.leaf_view));
+                }
+                if from == self.root_a_id && reference == self.ra_to_mid {
+                    return Some((self.mid_id, self.mid_view));
+                }
+                None
+            }
+
+            fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+                self.callee(from, reference).map(|(id, _)| Target::Func(id))
+            }
+        }
+
+        let bank = DagBodies {
+            leaf_id,
+            mid_id,
+            root_a_id,
+            root_b_id,
+            mid_to_leaf,
+            ra_to_mid,
+            ra_to_leaf,
+            rb_to_leaf,
+            leaf_view: leaf_func.view(),
+            mid_view: mid_func.view(),
+        };
+
+        let mut seq_mod = OwnVec::with_capacity_in(4, alloc);
+        seq_mod.push(ModuleBody { id: root_a_id, func: root_a_func.view().to_func_in(alloc) });
+        seq_mod.push(ModuleBody { id: root_b_id, func: root_b_func.view().to_func_in(alloc) });
+        seq_mod.push(ModuleBody { id: mid_id, func: mid_func.view().to_func_in(alloc) });
+        seq_mod.push(ModuleBody { id: leaf_id, func: leaf_func.view().to_func_in(alloc) });
+
+        let mut par_mod = OwnVec::with_capacity_in(4, shared);
+        par_mod.push(ModuleBody { id: root_a_id, func: root_a_func.view().to_func_in(shared) });
+        par_mod.push(ModuleBody { id: root_b_id, func: root_b_func.view().to_func_in(shared) });
+        par_mod.push(ModuleBody { id: mid_id, func: mid_func.view().to_func_in(shared) });
+        par_mod.push(ModuleBody { id: leaf_id, func: leaf_func.view().to_func_in(shared) });
+
+        let policy = InlinePolicy::default();
+        let seq = lto_optimize_module(seq_mod, &bank, &NoWeights, policy, alloc).unwrap();
+        let par = lto_optimize_module_par(par_mod, &bank, &NoWeights, policy, shared, &SequentialLtoRunner).unwrap();
+
+        assert_eq!(par.total_inlined_bodies, seq.total_inlined_bodies);
+        assert!(par.total_inlined_bodies >= 3, "expected transitive bottom-up inlining");
+        assert_eq!(par.bodies.len(), seq.bodies.len());
+        for (p, s) in par.bodies.iter().zip(seq.bodies.iter()) {
+            assert_eq!(p.id, s.id);
+            assert_eq!(p.summary.summary_hash, s.summary.summary_hash);
+            assert_eq!(p.prev_summary.summary_hash, s.prev_summary.summary_hash);
+            assert_eq!(p.read.as_slice(), s.read.as_slice());
+            assert_eq!(p.imported_refs.as_slice(), s.imported_refs.as_slice());
+            assert_eq!(p.func.view().ops, s.func.view().ops);
+            assert_eq!(p.func.view().data, s.func.view().data);
+            assert_eq!(p.func.view().extra, s.func.view().extra);
+            verify(p.func.view()).unwrap();
+        }
     }
 }

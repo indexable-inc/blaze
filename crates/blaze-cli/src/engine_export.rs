@@ -30,7 +30,7 @@ use blaze_ladder::code_records::{CodeKey, entry_of, statics};
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker};
 use blaze_ladder::run::special::{EntryForm, Roots, Special, make_special, run_roots};
 use blaze_ladder::run::RunError;
-use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, String, Vec};
+use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, SharedAlloc, String, Vec};
 use blaze_typeck::ItemKey;
 use bstd::Cx;
 use bstd::entry::Status;
@@ -333,8 +333,8 @@ enum RowOutcome<'a> {
     /// (`Machine::SME2 | Machine::CSSC | Machine::SHA3`), kept ephemeral in `export_bump` so
     /// host-specific code never enters portable `HomeCodeStore` (Rule 25).
     Lto {
-        record: AVec<'a, u8>,
-        vtable_data: AVec<'a, (CodeSymbol, AVec<'a, u8>)>,
+        record: Vec<u8, SharedAlloc<'static>>,
+        vtable_data: Vec<(CodeSymbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     },
     /// A non-root library/cold function that `blaze-build` cannot lower to LIR yet: replaced by a
     /// deterministic trap stub (`write(2, msg, len); _exit(125); brk #0`) that reports the exact
@@ -607,6 +607,131 @@ fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSym
     false
 }
 
+/// Virtual reservation for each parallel export LTO worker's reusable scratch frame (reset after
+/// every body, trimmed when committed exceeds [`EXPORT_LTO_WORKER_TRIM`]). Untouched virtual pages
+/// cost zero RSS; 2 GiB avoids exhausting bump space on large post-inline functions.
+const EXPORT_LTO_WORKER_FRAME: usize = 2 << 30;
+const EXPORT_LTO_WORKER_KEEP: usize = 4 << 20;
+const EXPORT_LTO_WORKER_TRIM: usize = 32 << 20;
+/// Minimum batch count to fan out export LTO work across worker threads.
+const EXPORT_LTO_PAR_MIN: usize = 4;
+
+/// `Cx::scope`-backed parallel executor for `optimize_export_workspace_par`: dynamically steals
+/// work across `workers` with one reusable bump [`Frame`] per worker and returns results in exact
+/// ascending index order (Rule 25).
+struct CliLtoRunner<'c> {
+    cx: &'c Cx,
+    workers: core::num::NonZeroU32,
+}
+
+impl blaze_ladder::run::make_one::export_lto::ExportLtoRunner for CliLtoRunner<'_> {
+    fn par_map<T: Send, F>(
+        &self,
+        count: usize,
+        out_alloc: SharedAlloc<'static>,
+        f: F,
+    ) -> Result<Vec<T, SharedAlloc<'static>>, blaze_ladder::run::make_one::export_lto::ExportLtoSimplifyError>
+    where
+        F: Fn(usize, Alloc<'_>) -> T + Sync,
+    {
+        use blaze_ladder::run::make_one::export_lto::ExportLtoSimplifyError;
+
+        let mut out = Vec::with_capacity_in(count, out_alloc);
+        if count == 0 {
+            return Ok(out);
+        }
+        let active_workers = self.workers.get().min(self.cx.workers());
+        if count < EXPORT_LTO_PAR_MIN || active_workers <= 1 {
+            let mut scratch = Frame::with_reserve(EXPORT_LTO_WORKER_FRAME, bstd::mem::Tag::Other)
+                .map_err(|_| ExportLtoSimplifyError::Refused { inst: 0, what: "export LTO scratch frame reserve failed" })?;
+            for idx in 0..count {
+                scratch.reset();
+                if scratch.committed() > EXPORT_LTO_WORKER_TRIM {
+                    scratch.trim(EXPORT_LTO_WORKER_KEEP);
+                }
+                let erased = Erased::new(&scratch);
+                out.push(f(idx, erased.handle()));
+            }
+            return Ok(out);
+        }
+
+        let worker_count = usize::try_from(active_workers).unwrap_or(1).min(count);
+        let batch = if count >= worker_count.saturating_mul(16) { 4 } else { 1 };
+        let next = core::sync::atomic::AtomicUsize::new(0);
+        let next_ref = &next;
+        let f_ref = &f;
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let mut handles = Vec::with_capacity_in(worker_count, out_alloc);
+        let est_per_worker = (count / worker_count).saturating_add(batch);
+        for _ in 0..worker_count {
+            handles.push(scope.may_overlap(
+                "export: LTO worker",
+                4 << 20,
+                move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
+                    let mut scratch = match Frame::with_reserve(EXPORT_LTO_WORKER_FRAME, bstd::mem::Tag::Other) {
+                        Ok(frame) => frame,
+                        Err(_) => return Ok(Err("export LTO worker scratch frame reserve failed")),
+                    };
+                    let mut local: Vec<(usize, T), SharedAlloc<'static>> = Vec::with_capacity_in(est_per_worker, out_alloc);
+                    loop {
+                        let start = next_ref.fetch_add(batch, core::sync::atomic::Ordering::Relaxed);
+                        if start >= count {
+                            break;
+                        }
+                        let end = start.saturating_add(batch).min(count);
+                        for idx in start..end {
+                            scratch.reset();
+                            if scratch.committed() > EXPORT_LTO_WORKER_TRIM {
+                                scratch.trim(EXPORT_LTO_WORKER_KEEP);
+                            }
+                            let erased = Erased::new(&scratch);
+                            local.push((idx, f_ref(idx, erased.handle())));
+                        }
+                    }
+                    Ok(Ok(local))
+                },
+            ));
+        }
+
+        let mut slots: Vec<Option<T>, SharedAlloc<'static>> = Vec::with_capacity_in(count, out_alloc);
+        for _ in 0..count {
+            slots.push(None);
+        }
+        let mut err_what: Option<&'static str> = None;
+        for handle in handles {
+            match handle.join(self.cx) {
+                Ok(Ok(part)) => {
+                    for (idx, item) in part {
+                        if let Some(slot) = slots.get_mut(idx) {
+                            *slot = Some(item);
+                        }
+                    }
+                }
+                Ok(Err(what)) => {
+                    err_what.get_or_insert(what);
+                }
+                Err(_) => {
+                    err_what.get_or_insert("export LTO worker task panicked or stopped");
+                }
+            }
+        }
+        if scope.join(self.cx).is_err() {
+            err_what.get_or_insert("export LTO worker scope join failed");
+        }
+        if let Some(what) = err_what {
+            return Err(ExportLtoSimplifyError::Refused { inst: 0, what });
+        }
+        for slot in slots {
+            let Some(item) = slot else {
+                return Err(ExportLtoSimplifyError::Refused { inst: 0, what: "export LTO worker missed index" });
+            };
+            out.push(item);
+        }
+        Ok(out)
+    }
+}
+
 /// Core whole-program reachability closure + `blaze_export::export` + atomic write + chmod.
 fn export_program<'f>(
     cx: &Cx,
@@ -802,17 +927,19 @@ fn export_program<'f>(
         }
     }
     let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
+    let lto_runner = CliLtoRunner { cx, workers: standing.workers };
     let lto_out = {
         let _lto_span = cx.span("export: workspace LTO");
-        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+        blaze_ladder::run::make_one::export_lto::optimize_export_workspace_par(
             &walk,
             lto_seeds.as_slice(),
             |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
             |tabled| ids.runnable(tabled).ok(),
             &mut maker,
             lto_opts,
+            heap.shared(),
             alloc,
-            heap.alloc(),
+            &lto_runner,
         )
         .map_err(|why| {
             box_err(
@@ -823,7 +950,7 @@ fn export_program<'f>(
     };
     let lto_bodies = lto_out.bodies.len();
     let lto_inlined = lto_out.total_inlined;
-    let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
+    let mut extra_roots: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(heap.shared());
     for body in lto_out.bodies {
         if let Some(slot) = outcomes.get_mut(body.row) {
             *slot = RowOutcome::Lto {

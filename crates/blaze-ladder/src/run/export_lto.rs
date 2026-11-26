@@ -22,27 +22,32 @@
 
 use core::fmt;
 
-use blaze_code::record::{Symbol, TrapSource};
+use blaze_code::datum::DatumView;
+use blaze_code::record::{Space, Symbol, TrapSource};
 use blaze_emit::Isa;
 use blaze_lir::{
     Block, BlockKind, Field, Flags, Layout, Op, Ty, VerifyError,
     body::{Bodies, BodyId, DatumId, Target},
-    func::{Conv, FnAttrs, Inline, ParamKind, RefId, RefKind, RefRec, SigId, SigRec},
+    func::{Conv, DataId, FnAttrs, Inline, ParamKind, RefId, RefKind, RefRec, SigId, SigRec},
     inline::{InlinePolicy, NoWeights},
-    lto::{ModuleBody, OptimizedBody, lto_optimize_module},
+    lto::{LtoRunner, ModuleBody, OptimizedBody, SequentialLtoRunner, lto_optimize_module_par},
     simplify::SimplifyError,
     verify,
 };
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
 use blaze_tier::{Arch, Machine};
 use blaze_typeck::ItemKey;
 
-use super::{BuiltCallee, BuiltLir, Maker, RecordsProgram, Typing};
+use super::{BuiltCallee, BuiltLir, Maker, RecordsProgram, Typing, func_needs_soft_float};
 use crate::body_ids::{Grant, Walk};
 pub use crate::code_records::export_machine;
 use crate::code_records::{Callee, CodeRecordError, InstanceNames, emit_code_record_for_machine};
+use crate::front2::builtins_shim::{BoundRef, Routines};
 use crate::run::RunError;
 use crate::symbols::{static_symbol, tls_symbol};
+
+pub use blaze_lir::lto::LtoRunner as ExportLtoRunner;
+pub use blaze_lir::simplify::SimplifyError as ExportLtoSimplifyError;
 
 /// Upper bound on transitive `ImportedRef` resolution hops (Rule 18).
 const MAX_IMPORT_HOPS: usize = 32;
@@ -52,7 +57,7 @@ const MAX_IMPORT_HOPS: usize = 32;
 pub struct ExportLtoOpts {
     /// Target host machine features (typically from [`export_machine`]).
     pub machine: Machine,
-    /// Maximum BFS hop depth from workspace seed functions into inlineable callees.
+    /// Maximum BFS hop depth from workspace seed functions into reachable non-cold callees.
     pub max_depth: u8,
     /// Maximum total function bodies gathered into the LTO module.
     pub max_bodies: usize,
@@ -61,33 +66,34 @@ pub struct ExportLtoOpts {
     /// Maximum LIR instruction count for keeping a `#[inline(always)]` non-workspace callee.
     pub max_always_inline_insts: usize,
     /// Maximum LIR instruction count for keeping a reachable non-cold library caller (e.g.
+    /// `serde_json::Deserializer::parse_value`, derived `Visitor::visit_map`,
     /// `core::slice::sort::drift::sort`, `hashbrown::RawTable::find`) in the LTO module so its
     /// own small callees inline bottom-up into it and it emits with host-ISA SOTA codegen.
     pub max_caller_insts: usize,
-    /// Cross-function inlining policy handed to `blaze_lir::lto::lto_optimize_module`.
+    /// Cross-function inlining policy handed to `blaze_lir::lto::lto_optimize_module_par`.
     pub policy: InlinePolicy,
 }
 
 impl ExportLtoOpts {
-    /// Release export defaults: bounded demand-driven BFS (`depth <= 16`, `<= 4096` bodies,
-    /// non-cold library callers `<= 2048` LIR insts) and aggressive cross-function inlining
-    /// (`lto_optimize_module` enforces `Inline::Never` and `policy.max_callee_insts` when
-    /// deciding whether a body may be inlined into its own callers).
+    /// Release export defaults: bounded demand-driven BFS (`depth <= 24`, `<= 12288` bodies,
+    /// non-cold library callers `<= 8192` pre-SROA LIR insts) and aggressive cross-function
+    /// inlining (`lto_optimize_module_par` enforces `Inline::Never` and `policy.max_callee_insts`
+    /// when deciding whether a body may be inlined into its own callers).
     pub fn for_export(isa: Isa) -> Self {
         Self {
             machine: export_machine(isa),
-            max_depth: 16,
-            max_bodies: 4096,
-            max_callee_insts: 384,
-            max_always_inline_insts: 640,
-            max_caller_insts: 2048,
+            max_depth: 24,
+            max_bodies: 12288,
+            max_callee_insts: 512,
+            max_always_inline_insts: 1024,
+            max_caller_insts: 8192,
             policy: InlinePolicy {
                 cost_threshold: 120,
                 max_callee_insts: 256,
                 hot_multiplier: 4,
                 hot_weight_threshold: 10,
                 max_depth: 16,
-                max_growth: 4096,
+                max_growth: 6144,
                 allow_external_refs: true,
                 allow_loops: true,
             },
@@ -178,43 +184,41 @@ impl fmt::Display for ExportLtoError {
 impl core::error::Error for ExportLtoError {}
 
 /// One LTO-optimized and re-emitted function record for `blaze export`.
-pub struct LtoBodyOut<'a> {
+pub struct LtoBodyOut {
     /// Row index in `Walk`.
     pub row: usize,
     /// Instance symbol.
     pub symbol: Symbol,
     /// Encoded sealed canonical `CodeRecord` bytes (ready for `CodeView::read` and
     /// `materialize_positionless`).
-    pub record: AVec<'a, u8>,
+    pub record: Vec<u8, SharedAlloc<'static>>,
     /// Encoded vtable datums referenced by this body or any of its inlined callees.
-    pub vtable_data: AVec<'a, (Symbol, AVec<'a, u8>)>,
+    pub vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     /// Any `SoftFloat` routines that legalization called during emission, as `(tabled, name_bytes)`.
-    pub extra_declared: AVec<'a, (ItemKey, AVec<'a, u8>)>,
+    pub extra_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     /// Count of callee bodies spliced into this function.
     pub inlined_bodies: usize,
 }
 
-/// Output of [`optimize_export_workspace`].
-pub struct ExportLtoOut<'a> {
+/// Output of [`optimize_export_workspace`] / [`optimize_export_workspace_par`].
+pub struct ExportLtoOut {
     /// Optimized functions replacing their walk rows in the exported binary.
-    pub bodies: AVec<'a, LtoBodyOut<'a>>,
+    pub bodies: Vec<LtoBodyOut, SharedAlloc<'static>>,
     /// Total bodies gathered into the LTO module.
     pub module_bodies: usize,
     /// Total callee bodies spliced across the module.
     pub total_inlined: usize,
 }
 
-struct LtoOrigin<'a> {
+struct LtoOrigin {
     row: usize,
     symbol: Symbol,
-    is_seed: bool,
-    lowered_libm: bool,
     orig_unreachables: usize,
-    built: BuiltLir<'a>,
+    built: BuiltLir<SharedAlloc<'static>>,
 }
 
-struct LtoBodies<'a, 'b> {
-    origins: &'b [LtoOrigin<'a>],
+struct LtoBodies<'b> {
+    origins: &'b [LtoOrigin],
     by_sym: &'b [([u8; 32], usize)],
 }
 
@@ -223,7 +227,7 @@ fn find_body_idx(by_sym: &[([u8; 32], usize)], sym: [u8; 32]) -> Option<usize> {
     by_sym.get(pos).map(|row| row.1)
 }
 
-impl Bodies for LtoBodies<'_, '_> {
+impl Bodies for LtoBodies<'_> {
     fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, blaze_lir::View<'_>)> {
         let caller_idx = find_body_idx(self.by_sym, from.0)?;
         let caller = self.origins.get(caller_idx)?;
@@ -277,41 +281,64 @@ impl Bodies for LtoBodies<'_, '_> {
     }
 }
 
+/// Thread-safe (`Send`) subset of [`ExportLtoError`] returned by parallel Stage 3 body emission.
+enum EmitBodyError {
+    Verify { symbol: [u8; 32], error: VerifyError },
+    UnresolvedImport { symbol: [u8; 32], source: [u8; 32] },
+    ImportCycle { symbol: [u8; 32] },
+    BadRef { symbol: [u8; 32], what: &'static str, ref_id: u32 },
+    RefKindMismatch { symbol: [u8; 32], ref_id: u32 },
+    Record { symbol: [u8; 32], error: CodeRecordError },
+}
+
+impl From<EmitBodyError> for ExportLtoError {
+    fn from(err: EmitBodyError) -> Self {
+        match err {
+            EmitBodyError::Verify { symbol, error } => ExportLtoError::Verify { symbol, error },
+            EmitBodyError::UnresolvedImport { symbol, source } => ExportLtoError::UnresolvedImport { symbol, source },
+            EmitBodyError::ImportCycle { symbol } => ExportLtoError::ImportCycle { symbol },
+            EmitBodyError::BadRef { symbol, what, ref_id } => ExportLtoError::BadRef { symbol, what, ref_id },
+            EmitBodyError::RefKindMismatch { symbol, ref_id } => ExportLtoError::RefKindMismatch { symbol, ref_id },
+            EmitBodyError::Record { symbol, error } => ExportLtoError::Record { symbol, error },
+        }
+    }
+}
+
 /// Transitively resolves an `ImportedRef` (`start_idx`, `start_ref`) back through bottom-up SCC
 /// inlining layers to its originating body index and pre-LTO `RefRec`.
-fn resolve_ref_origin<'a>(
+fn resolve_ref_origin(
     start_idx: usize,
     start_ref: RefId,
-    lto_bodies: &[OptimizedBody<Alloc<'a>>],
-    origins: &[LtoOrigin<'a>],
+    lto_bodies: &[OptimizedBody<SharedAlloc<'static>>],
+    origins: &[LtoOrigin],
     by_sym: &[([u8; 32], usize)],
-) -> Result<(usize, RefRec), ExportLtoError> {
+) -> Result<(usize, RefRec), EmitBodyError> {
     let start_sym = origins.get(start_idx).map_or([0u8; 32], |o| o.symbol.0);
     let mut cur_idx = start_idx;
     let mut cur_ref = start_ref;
     for _ in 0..=MAX_IMPORT_HOPS {
         let Some(opt) = lto_bodies.get(cur_idx) else {
-            return Err(ExportLtoError::BadRef { symbol: start_sym, what: "LTO body index", ref_id: cur_ref.0 });
+            return Err(EmitBodyError::BadRef { symbol: start_sym, what: "LTO body index", ref_id: cur_ref.0 });
         };
         if let Ok(pos) = opt.imported_refs.binary_search_by_key(&cur_ref, |r| r.caller_ref)
             && let Some(imp) = opt.imported_refs.get(pos)
         {
             let Some(next_idx) = find_body_idx(by_sym, imp.source_body.0) else {
-                return Err(ExportLtoError::UnresolvedImport { symbol: start_sym, source: imp.source_body.0 });
+                return Err(EmitBodyError::UnresolvedImport { symbol: start_sym, source: imp.source_body.0 });
             };
             cur_idx = next_idx;
             cur_ref = imp.source_ref;
             continue;
         }
         let Some(orig) = origins.get(cur_idx) else {
-            return Err(ExportLtoError::BadRef { symbol: start_sym, what: "origin body index", ref_id: cur_ref.0 });
+            return Err(EmitBodyError::BadRef { symbol: start_sym, what: "origin body index", ref_id: cur_ref.0 });
         };
         let Some(&rec) = orig.built.func.view().refs.get(cur_ref.index()) else {
-            return Err(ExportLtoError::BadRef { symbol: start_sym, what: "origin RefId", ref_id: cur_ref.0 });
+            return Err(EmitBodyError::BadRef { symbol: start_sym, what: "origin RefId", ref_id: cur_ref.0 });
         };
         return Ok((cur_idx, rec));
     }
-    Err(ExportLtoError::ImportCycle { symbol: start_sym })
+    Err(EmitBodyError::ImportCycle { symbol: start_sym })
 }
 
 /// Writes `val` at `place` in `table` (overwriting an unused slot `< len` or appending at `len`).
@@ -322,7 +349,7 @@ fn put_at<'a, T>(
     symbol: [u8; 32],
     what: &'static str,
     ref_id: u32,
-) -> Result<(), ExportLtoError> {
+) -> Result<(), EmitBodyError> {
     if let Some(slot) = table.get_mut(place) {
         *slot = val;
         return Ok(());
@@ -331,15 +358,20 @@ fn put_at<'a, T>(
         table.push(val);
         return Ok(());
     }
-    Err(ExportLtoError::BadRef { symbol, what, ref_id })
+    Err(EmitBodyError::BadRef { symbol, what, ref_id })
 }
 
 /// Appends `(symbol, bytes)` to `out` if `symbol` is not already present.
-fn push_vtable_datum<'a>(out: &mut AVec<'a, (Symbol, AVec<'a, u8>)>, symbol: Symbol, bytes: &[u8], alloc: Alloc<'a>) {
+fn push_vtable_datum(
+    out: &mut Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
+    symbol: Symbol,
+    bytes: &[u8],
+    alloc: SharedAlloc<'static>,
+) {
     if out.iter().any(|(s, _)| *s == symbol) {
         return;
     }
-    let mut copied: AVec<'a, u8> = Vec::with_capacity_in(bytes.len(), alloc);
+    let mut copied: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(bytes.len(), alloc);
     copied.extend_from_slice(bytes);
     out.push((symbol, copied));
 }
@@ -402,7 +434,7 @@ fn match_ieee_libm(raw_name: &str, machine: Machine) -> Option<LibmOp> {
 
 /// Checks whether instruction `inst` is a non-variadic `Conv::C` `Op::Call` or `Op::Invoke` to an
 /// exact IEEE-754 libm function supported by `sota` on `machine` with matching signature and types.
-fn detect_libm_call(built: &BuiltLir<'_>, inst: usize, machine: Machine) -> Option<LoweredLibmCall> {
+fn detect_libm_call<A: core::alloc::Allocator>(built: &BuiltLir<A>, inst: usize, machine: Machine) -> Option<LoweredLibmCall> {
     let view = built.func.view();
     let op = Op::from_byte(*view.ops.get(inst)?)?;
     let is_invoke = match op {
@@ -614,7 +646,7 @@ fn copy_remapped_extra<'a>(
 /// / `sqrt` wrappers into tiny unwind-free pure leaves that `lto_optimize_module` inlines directly
 /// into caller loops (exposing `Op::Fma` to `gemm.rs` SME2 `FMOPA.S`/`FMOPA.D`).
 /// Returns `true` iff at least one call/invoke was lowered.
-fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: Alloc<'a>) -> bool {
+fn lower_ieee_libm_calls<A: core::alloc::Allocator>(built: &mut BuiltLir<A>, machine: Machine, alloc: Alloc<'_>) -> bool {
     let n = built.func.ops.len();
     if n == 0 || built.funcs.is_empty() || built.c_text.is_empty() {
         return false;
@@ -632,7 +664,7 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         return false;
     };
 
-    let mut rewrites: AVec<'a, Option<LoweredLibmCall>> = Vec::with_capacity_in(n, alloc);
+    let mut rewrites: AVec<'_, Option<LoweredLibmCall>> = Vec::with_capacity_in(n, alloc);
     rewrites.resize(n, None);
     if let Some(slot) = rewrites.get_mut(first_idx) {
         *slot = Some(first_hit);
@@ -649,7 +681,7 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         }
     }
 
-    let mut val_map: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
+    let mut val_map: AVec<'_, u32> = Vec::with_capacity_in(n, alloc);
     let mut next_inst = 0u32;
     for i in 0..n {
         val_map.push(next_inst);
@@ -669,13 +701,13 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         return false;
     };
     let new_cap = n.saturating_add(extra_insts);
-    let mut new_ops: AVec<'a, u8> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_flags: AVec<'a, u8> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_tys: AVec<'a, u16> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_data: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_extra: AVec<'a, u32> = Vec::with_capacity_in(built.func.extra.len(), alloc);
-    let mut new_attrs: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
-    let mut new_locs: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_ops: AVec<'_, u8> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_flags: AVec<'_, u8> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_tys: AVec<'_, u16> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_data: AVec<'_, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_extra: AVec<'_, u32> = Vec::with_capacity_in(built.func.extra.len(), alloc);
+    let mut new_attrs: AVec<'_, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_locs: AVec<'_, u32> = Vec::with_capacity_in(new_cap, alloc);
 
     {
         let view = built.func.view();
@@ -792,7 +824,7 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
         }
     }
 
-    let mut new_block_starts: AVec<'a, u32> = Vec::with_capacity_in(built.func.block_starts.len(), alloc);
+    let mut new_block_starts: AVec<'_, u32> = Vec::with_capacity_in(built.func.block_starts.len(), alloc);
     for &old_start in built.func.block_starts.iter() {
         let Some(mapped) = remap_val(val_map.as_slice(), old_start) else {
             return false;
@@ -819,14 +851,25 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
     true
 }
 
-/// Runs demand-driven whole-program cross-function LIR inlining and host-ISA SOTA emission over
+/// Decides whether a non-workspace callee reached during demand-driven export LTO BFS should have
+/// its normal-block callees expanded. Cold (unless `#[inline(always)]`) and `#[noreturn]` bodies
+/// are never expanded so panic/format/backtrace subgraphs stay out of LTO, while large non-cold
+/// callers (even past `opts.max_caller_insts`) ARE still expanded so their downstream hot call
+/// subgraph (`SliceRead::*`, `Vec::push`, etc.) is never severed!
+fn should_expand_non_seed(attrs: u32) -> bool {
+    let is_cold = (attrs & FnAttrs::COLD) != 0;
+    let is_noreturn = (attrs & FnAttrs::NORETURN) != 0;
+    let inline_attr = FnAttrs(attrs).inline();
+    !is_noreturn && (!is_cold || inline_attr == Inline::Always)
+}
+
 /// Decides whether a non-workspace callee reached during demand-driven export LTO BFS enters
 /// the LTO module. Non-cold, non-noreturn library callers up to `opts.max_caller_insts` (including
-/// `#[inline(never)]` hot algorithms such as `core::slice::sort::drift::sort`) are kept so their
-/// own small callees inline bottom-up into them and they emit with host-ISA SOTA codegen, while
-/// `lto_optimize_module` continues enforcing `Inline::Never` and `opts.policy.max_callee_insts`
-/// when deciding whether to inline them into their own callers. Cold and noreturn bodies stay out
-/// of the module unless explicitly marked `#[inline(always)]`.
+/// `#[inline(never)]` hot algorithms such as `core::slice::sort::drift::sort` and derived
+/// `serde::de::Visitor::visit_map`) are kept so their own small callees inline bottom-up into them
+/// and they emit with host-ISA SOTA codegen, while `lto_optimize_module_par` continues enforcing
+/// `Inline::Never` and `opts.policy.max_callee_insts` when deciding whether to inline them into
+/// their own callers. Cold and noreturn bodies stay out unless explicitly `#[inline(always)]`.
 fn should_keep_non_seed(
     attrs: u32,
     insts: usize,
@@ -834,12 +877,10 @@ fn should_keep_non_seed(
     tiny_leaf_insts: usize,
     opts: &ExportLtoOpts,
 ) -> bool {
-    let is_cold = (attrs & FnAttrs::COLD) != 0;
-    let is_noreturn = (attrs & FnAttrs::NORETURN) != 0;
-    let inline_attr = FnAttrs(attrs).inline();
-    if is_noreturn || (is_cold && inline_attr != Inline::Always) {
+    if !should_expand_non_seed(attrs) {
         return false;
     }
+    let inline_attr = FnAttrs(attrs).inline();
     if in_tiny_reserve {
         return matches!(inline_attr, Inline::Always | Inline::Hint) && insts <= tiny_leaf_insts;
     }
@@ -853,43 +894,435 @@ fn should_keep_non_seed(
     insts <= keep_limit
 }
 
+/// Enqueues a candidate target symbol into either `call_queue` (direct `Call`/`Invoke` edges) or
+/// `indirect_queue` (`FuncAddr` and vtable method targets) if eligible and not yet queued at that
+/// priority.
+const UNSEEN: u8 = 0;
+const QUEUED_INDIRECT: u8 = 1;
+const QUEUED_CALL: u8 = 2;
+const PROCESSED: u8 = 3;
+
+fn enqueue_sym(
+    walk: &Walk<'_>,
+    sym: Symbol,
+    direct: bool,
+    next_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+) {
+    let Some(callee_row) = walk.row_of(&sym) else {
+        return;
+    };
+    if !is_eligible_callee(callee_row) {
+        return;
+    }
+    if let Some(state) = visited.get_mut(callee_row) {
+        if direct && *state < QUEUED_CALL {
+            *state = QUEUED_CALL;
+            call_queue.push((callee_row, next_depth, false));
+        } else if !direct && *state == UNSEEN {
+            *state = QUEUED_INDIRECT;
+            indirect_queue.push((callee_row, next_depth, false));
+        }
+    }
+}
+
+/// Enqueues every concrete `Space::Func` method symbol referenced by vtable `vsym` in
+/// `built.vtable_data` into `indirect_queue` so `&dyn Trait` hot implementations (e.g.
+/// `serde_json::read::SliceRead`, `std::io::Read`) are discovered by export LTO BFS.
+fn enqueue_vtable_methods<A: core::alloc::Allocator>(
+    built: &BuiltLir<A>,
+    vsym: Symbol,
+    walk: &Walk<'_>,
+    next_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+) {
+    for (sym, datum_bytes) in built.vtable_data.iter() {
+        if *sym != vsym {
+            continue;
+        }
+        let Ok(dv) = DatumView::read(datum_bytes.as_slice()) else {
+            continue;
+        };
+        for i in 0..dv.targets() {
+            let target = dv.target(i);
+            if target.space == Space::Func {
+                enqueue_sym(walk, target.symbol, false, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+            }
+        }
+    }
+}
+
+/// Enqueues every non-cold callee reachable from `BlockKind::Normal` blocks of `built`:
+/// - direct `Op::Call` and `Op::Invoke` targets into `call_queue` (now that unwinding `Op::Invoke`
+///   inlines cleanly, normal-block `Op::Invoke` is a first-class hot edge);
+/// - `Op::FuncAddr` function-pointer targets and `Op::DataAddr` vtable / relocated-data targets
+///   into `indirect_queue`.
+fn enqueue_normal_callees<A: core::alloc::Allocator>(
+    built: &BuiltLir<A>,
+    walk: &Walk<'_>,
+    next_depth: u8,
+    is_eligible_callee: &impl Fn(usize) -> bool,
+    visited: &mut [u8],
+    call_queue: &mut AVec<'_, (usize, u8, bool)>,
+    indirect_queue: &mut AVec<'_, (usize, u8, bool)>,
+) {
+    let view = built.func.view();
+    for b in 0..view.blocks() {
+        let Ok(b_u32) = u32::try_from(b) else { break };
+        let block = Block(b_u32);
+        if view.block_kind(block) != BlockKind::Normal {
+            continue;
+        }
+        for at in view.block(block) {
+            if view.flags(at).contains(Flags::COLD) {
+                continue;
+            }
+            let op = view.op(at);
+            match op {
+                Op::Call | Op::Invoke => {
+                    let Some(&data_at) = view.data.get(at) else { continue };
+                    let Ok(extra_idx) = usize::try_from(data_at) else { continue };
+                    let Some(&ref_word) = view.extra.get(extra_idx) else { continue };
+                    let Some(rec) = view.refs.get(RefId(ref_word).index()) else { continue };
+                    if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
+                        continue;
+                    }
+                    let Ok(place_idx) = usize::try_from(rec.place) else { continue };
+                    let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
+                    enqueue_sym(walk, callee_sym, true, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                }
+                Op::FuncAddr => {
+                    let Some(&ref_word) = view.data.get(at) else { continue };
+                    let Some(rec) = view.refs.get(RefId(ref_word).index()) else { continue };
+                    if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
+                        continue;
+                    }
+                    let Ok(place_idx) = usize::try_from(rec.place) else { continue };
+                    let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
+                    enqueue_sym(walk, callee_sym, false, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                }
+                Op::DataAddr => {
+                    let Some(&ref_word) = view.data.get(at) else { continue };
+                    let Some(rec) = view.refs.get(RefId(ref_word).index()) else { continue };
+                    match RefKind::from_word(rec.kind) {
+                        Some(RefKind::Vtable) => {
+                            let Ok(place_idx) = usize::try_from(rec.place) else { continue };
+                            let Some(&vsym) = built.vtables.get(place_idx) else { continue };
+                            enqueue_vtable_methods(built, vsym, walk, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                        }
+                        Some(RefKind::Data) => {
+                            for reloc in view.data_relocs_of(DataId(rec.place)) {
+                                let Some(trec) = view.refs.get(RefId(reloc.target).index()) else { continue };
+                                match RefKind::from_word(trec.kind) {
+                                    Some(RefKind::Func) => {
+                                        let Ok(place_idx) = usize::try_from(trec.place) else { continue };
+                                        let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
+                                        enqueue_sym(walk, callee_sym, false, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                                    }
+                                    Some(RefKind::Vtable) => {
+                                        let Ok(place_idx) = usize::try_from(trec.place) else { continue };
+                                        let Some(&vsym) = built.vtables.get(place_idx) else { continue };
+                                        enqueue_vtable_methods(built, vsym, walk, next_depth, is_eligible_callee, visited, call_queue, indirect_queue);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Emits one post-LTO function (`idx`) into a sealed canonical `CodeRecord` targeting `machine`,
+/// using `worker_scratch` for temporary reference/emitter tables and copying only the final compact
+/// record/vtable/declared bytes into `out_alloc` (`SharedAlloc<'static>`).
+#[expect(clippy::too_many_arguments, reason = "parallel per-body emission worker over immutable module tables and explicit allocators")]
+fn emit_one_lto_body(
+    idx: usize,
+    origins: &[LtoOrigin],
+    lto_bodies: &[OptimizedBody<SharedAlloc<'static>>],
+    by_sym: &[([u8; 32], usize)],
+    bound_routines: Option<BoundRef<'_>>,
+    machine: Machine,
+    out_alloc: SharedAlloc<'static>,
+    worker_scratch: Alloc<'_>,
+) -> Result<LtoBodyOut, EmitBodyError> {
+    let Some(orig) = origins.get(idx) else {
+        return Err(EmitBodyError::BadRef { symbol: [0u8; 32], what: "origin index", ref_id: 0 });
+    };
+    let Some(opt) = lto_bodies.get(idx) else {
+        return Err(EmitBodyError::BadRef { symbol: orig.symbol.0, what: "LTO body index", ref_id: 0 });
+    };
+
+    let mut funcs: AVec<'_, Callee<'_>> =
+        Vec::with_capacity_in(orig.built.funcs.len() + opt.imported_refs.len(), worker_scratch);
+    for p in 0..orig.built.funcs.len() {
+        let p_u32 = u32::try_from(p).map_err(|_| EmitBodyError::BadRef {
+            symbol: orig.symbol.0,
+            what: "original func place",
+            ref_id: u32::MAX,
+        })?;
+        let Some(callee) = orig.built.callee_at(p_u32) else {
+            return Err(EmitBodyError::BadRef {
+                symbol: orig.symbol.0,
+                what: "original func name",
+                ref_id: p_u32,
+            });
+        };
+        funcs.push(callee);
+    }
+    let mut statics: AVec<'_, ItemKey> = Vec::with_capacity_in(orig.built.statics.len(), worker_scratch);
+    statics.extend_from_slice(orig.built.statics.as_slice());
+    let mut c_statics: AVec<'_, (ItemKey, &str)> = Vec::with_capacity_in(orig.built.c_statics.len(), worker_scratch);
+    for &(item, start, len) in orig.built.c_statics.iter() {
+        let Some(cname) = orig.built.c_str(start, len) else {
+            return Err(EmitBodyError::BadRef {
+                symbol: orig.symbol.0,
+                what: "original foreign static name",
+                ref_id: 0,
+            });
+        };
+        c_statics.push((item, cname));
+    }
+    let mut vtables: AVec<'_, Symbol> = Vec::with_capacity_in(orig.built.vtables.len(), worker_scratch);
+    vtables.extend_from_slice(orig.built.vtables.as_slice());
+    let mut vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+        Vec::with_capacity_in(orig.built.vtable_data.len(), out_alloc);
+    for (vsym, bytes) in orig.built.vtable_data.iter() {
+        push_vtable_datum(&mut vtable_data, *vsym, bytes.as_slice(), out_alloc);
+    }
+    let mut tls: AVec<'_, ItemKey> = Vec::with_capacity_in(orig.built.tls.len(), worker_scratch);
+    tls.extend_from_slice(orig.built.tls.as_slice());
+
+    for imp in opt.imported_refs.iter() {
+        let Some(kind) = RefKind::from_word(imp.rec.kind) else {
+            return Err(EmitBodyError::BadRef {
+                symbol: orig.symbol.0,
+                what: "imported ref kind",
+                ref_id: imp.caller_ref.0,
+            });
+        };
+        let place = usize::try_from(imp.rec.place).map_err(|_| EmitBodyError::BadRef {
+            symbol: orig.symbol.0,
+            what: "imported ref place",
+            ref_id: imp.caller_ref.0,
+        })?;
+        let (origin_idx, origin_rec) = resolve_ref_origin(
+            idx,
+            imp.caller_ref,
+            lto_bodies,
+            origins,
+            by_sym,
+        )?;
+        if RefKind::from_word(origin_rec.kind) != Some(kind) {
+            return Err(EmitBodyError::RefKindMismatch {
+                symbol: orig.symbol.0,
+                ref_id: imp.caller_ref.0,
+            });
+        }
+        let Some(src_origin) = origins.get(origin_idx) else {
+            return Err(EmitBodyError::BadRef {
+                symbol: orig.symbol.0,
+                what: "origin body index",
+                ref_id: imp.caller_ref.0,
+            });
+        };
+        let src_place = usize::try_from(origin_rec.place).map_err(|_| EmitBodyError::BadRef {
+            symbol: orig.symbol.0,
+            what: "origin ref place",
+            ref_id: imp.caller_ref.0,
+        })?;
+        match kind {
+            RefKind::Func => {
+                let Some(callee) = src_origin.built.callee_at(origin_rec.place) else {
+                    return Err(EmitBodyError::BadRef {
+                        symbol: orig.symbol.0,
+                        what: "origin func callee",
+                        ref_id: imp.caller_ref.0,
+                    });
+                };
+                put_at(&mut funcs, place, callee, orig.symbol.0, "imported func place", imp.caller_ref.0)?;
+            }
+            RefKind::Static => {
+                let Some(&item) = src_origin.built.statics.get(src_place) else {
+                    return Err(EmitBodyError::BadRef {
+                        symbol: orig.symbol.0,
+                        what: "origin static item",
+                        ref_id: imp.caller_ref.0,
+                    });
+                };
+                put_at(&mut statics, place, item, orig.symbol.0, "imported static place", imp.caller_ref.0)?;
+                if let Some(cname) = src_origin.built.foreign_static_name(item)
+                    && !c_statics.iter().any(|(k, _)| *k == item)
+                {
+                    c_statics.push((item, cname));
+                }
+            }
+            RefKind::Vtable => {
+                let Some(&vsym) = src_origin.built.vtables.get(src_place) else {
+                    return Err(EmitBodyError::BadRef {
+                        symbol: orig.symbol.0,
+                        what: "origin vtable symbol",
+                        ref_id: imp.caller_ref.0,
+                    });
+                };
+                put_at(&mut vtables, place, vsym, orig.symbol.0, "imported vtable place", imp.caller_ref.0)?;
+                for (sym, bytes) in src_origin.built.vtable_data.iter() {
+                    push_vtable_datum(&mut vtable_data, *sym, bytes.as_slice(), out_alloc);
+                }
+            }
+            RefKind::Tls => {
+                let Some(&item) = src_origin.built.tls.get(src_place) else {
+                    return Err(EmitBodyError::BadRef {
+                        symbol: orig.symbol.0,
+                        what: "origin tls item",
+                        ref_id: imp.caller_ref.0,
+                    });
+                };
+                put_at(&mut tls, place, item, orig.symbol.0, "imported tls place", imp.caller_ref.0)?;
+            }
+            RefKind::Data => {
+                return Err(EmitBodyError::BadRef {
+                    symbol: orig.symbol.0,
+                    what: "unexpected imported Data ref",
+                    ref_id: imp.caller_ref.0,
+                });
+            }
+        }
+    }
+
+    // Bind compiler_builtins soft-float routines only when the body touches f16/f128.
+    let routines = if func_needs_soft_float(&opt.func.view()) {
+        match bound_routines {
+            Some(bound) => bound
+                .bind(&mut funcs)
+                .map_err(|error| EmitBodyError::Record { symbol: orig.symbol.0, error })?,
+            None => Routines::NONE,
+        }
+    } else {
+        Routines::NONE
+    };
+    let names = InstanceNames {
+        funcs: funcs.as_slice(),
+        statics: statics.as_slice(),
+        c_statics: c_statics.as_slice(),
+        vtables: vtables.as_slice(),
+        tls: tls.as_slice(),
+    };
+    let verified = verify(opt.func.view())
+        .map_err(|error| EmitBodyError::Verify { symbol: orig.symbol.0, error })?;
+    let post_unreachables = opt
+        .func
+        .view()
+        .ops
+        .iter()
+        .filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable))
+        .count();
+    let traps: &[TrapSource] = if opt.read.is_empty() && orig.orig_unreachables == post_unreachables {
+        orig.built.traps.as_slice()
+    } else {
+        &[]
+    };
+    let (record_tmp, called_declared) = emit_code_record_for_machine(verified, &names, routines, traps, machine, worker_scratch)
+        .map_err(|error| EmitBodyError::Record { symbol: orig.symbol.0, error })?;
+    let mut record: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(record_tmp.len(), out_alloc);
+    record.extend_from_slice(record_tmp.as_slice());
+    let mut extra_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+        Vec::with_capacity_in(called_declared.len(), out_alloc);
+    for d in called_declared.iter() {
+        let mut name_buf: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(d.name.len(), out_alloc);
+        name_buf.extend_from_slice(d.name);
+        extra_declared.push((d.tabled, name_buf));
+    }
+    Ok(LtoBodyOut {
+        row: orig.row,
+        symbol: orig.symbol,
+        record,
+        vtable_data,
+        extra_declared,
+        inlined_bodies: opt.read.len(),
+    })
+}
+
 /// Whole-program demand-driven cross-function LIR inlining and host-ISA SOTA emission over
-/// workspace seed rows and their small inlineable callees.
-#[expect(clippy::too_many_arguments, reason = "whole-program export LTO over walk, seeds, gate, maker, options, output allocator, and scratch allocator")]
-pub fn optimize_export_workspace<'a, 's, 'n, G, T>(
+/// workspace seed rows and their reachable non-cold callees (sequential convenience wrapper).
+#[expect(clippy::too_many_arguments, reason = "whole-program export LTO over walk, seeds, gate, maker, options, shared output allocator, and scratch allocator")]
+pub fn optimize_export_workspace<'s, 'n, G, T>(
+    walk: &Walk<'_>,
+    seeds: &[usize],
+    is_eligible_callee: impl Fn(usize) -> bool,
+    grant_for: impl FnMut(ItemKey) -> Option<G>,
+    maker: &mut Maker<'n, G, T>,
+    opts: ExportLtoOpts,
+    shared: SharedAlloc<'static>,
+    scratch: Alloc<'s>,
+) -> Result<ExportLtoOut, ExportLtoError>
+where
+    G: Grant,
+    T: Typing<RecordsProgram<'n>>,
+{
+    optimize_export_workspace_par(
+        walk,
+        seeds,
+        is_eligible_callee,
+        grant_for,
+        maker,
+        opts,
+        shared,
+        scratch,
+        &SequentialLtoRunner,
+    )
+}
+
+/// Whole-program demand-driven cross-function LIR inlining and parallel host-ISA SOTA emission
+/// over workspace seed rows and their reachable non-cold callees.
+///
+/// 1. Demand-driven BFS from `seeds` follows normal-block `Op::Call`, `Op::Invoke`,
+///    `Op::FuncAddr`, and vtable/relocated-data `Space::Func` edges without severing callees of
+///    oversized non-cold callers.
+/// 2. Bottom-up Tarjan SCC ThinLTO (`lto_optimize_module_par`) runs pre-inline simplify and
+///    wavefront SCC inlining in parallel across `runner`.
+/// 3. Host-ISA SOTA + superopt codegen (`emit_code_record_for_machine`) emits every gathered
+///    non-cold body in parallel across `runner` in exact deterministic index order (Rule 25).
+#[expect(clippy::too_many_arguments, reason = "whole-program parallel export LTO over walk, seeds, gate, maker, options, shared output allocator, scratch allocator, and parallel runner")]
+pub fn optimize_export_workspace_par<'s, 'n, G, T, R>(
     walk: &Walk<'_>,
     seeds: &[usize],
     is_eligible_callee: impl Fn(usize) -> bool,
     mut grant_for: impl FnMut(ItemKey) -> Option<G>,
     maker: &mut Maker<'n, G, T>,
     opts: ExportLtoOpts,
-    alloc: Alloc<'a>,
+    shared: SharedAlloc<'static>,
     scratch: Alloc<'s>,
-) -> Result<ExportLtoOut<'a>, ExportLtoError>
+    runner: &R,
+) -> Result<ExportLtoOut, ExportLtoError>
 where
     G: Grant,
     T: Typing<RecordsProgram<'n>>,
+    R: LtoRunner,
 {
     if seeds.is_empty() || opts.max_bodies == 0 {
         return Ok(ExportLtoOut {
-            bodies: Vec::new_in(alloc),
+            bodies: Vec::new_in(shared),
             module_bodies: 0,
             total_inlined: 0,
         });
     }
 
-    // Visited states: prioritize direct `Op::Call` callees (which `inline_guided` can splice)
-    // ahead of `Op::Invoke` callees so unwind/formatting subtrees never evict small leaf helpers
-    // (`PartialOrd::lt`, `slice::iter`, `IntoIterator::into_iter`) from the LTO module budget.
-    const UNSEEN: u8 = 0;
-    const QUEUED_INVOKE: u8 = 1;
-    const QUEUED_CALL: u8 = 2;
-    const PROCESSED: u8 = 3;
-
     let mut visited: AVec<'s, u8> = Vec::with_capacity_in(walk.len(), scratch);
     visited.resize(walk.len(), UNSEEN);
     let mut call_queue: AVec<'s, (usize, u8, bool)> = Vec::with_capacity_in(seeds.len().min(opts.max_bodies), scratch);
-    let mut invoke_queue: AVec<'s, (usize, u8, bool)> = Vec::new_in(scratch);
+    let mut indirect_queue: AVec<'s, (usize, u8, bool)> = Vec::new_in(scratch);
     for &row in seeds {
         if let Some(state) = visited.get_mut(row)
             && *state == UNSEEN
@@ -900,19 +1333,20 @@ where
         }
     }
 
-    // 1. Bounded demand-driven BFS: gather workspace seeds + small inlineable callees.
+    // 1. Bounded demand-driven BFS: gather workspace seeds + reachable non-cold dependency bodies.
     // Reserve the final eighth of large LTO budgets for tiny `<= 24`-inst `#[inline]` /
-    // `#[inline(always)]` leaf helpers (e.g. `slice::get -> ptr::add -> ptr::read -> ub_checks`)
-    // so medium callees in huge workspaces never crowd out deep leaf chains.
+    // `#[inline(always)]` leaf helpers so medium callees never crowd out deep leaf chains.
     const TINY_INLINE_LEAF_INSTS: usize = 24;
     const MAX_RESERVE_SCANS: usize = 2048;
     let tiny_reserve = if opts.max_bodies >= 512 { opts.max_bodies / 8 } else { 0 };
     let soft_limit = opts.max_bodies.saturating_sub(tiny_reserve);
+    let max_scanned = opts.max_bodies.saturating_mul(2);
+    let mut total_scanned = 0usize;
     let mut reserve_scans = 0usize;
-    let mut origins: AVec<'s, LtoOrigin<'s>> = Vec::with_capacity_in(call_queue.len(), scratch);
+    let mut origins: Vec<LtoOrigin, SharedAlloc<'static>> = Vec::with_capacity_in(call_queue.len(), shared);
     let mut call_head = 0usize;
-    let mut invoke_head = 0usize;
-    while origins.len() < opts.max_bodies {
+    let mut indirect_head = 0usize;
+    while origins.len() < opts.max_bodies && total_scanned < max_scanned {
         let in_tiny_reserve = tiny_reserve > 0 && origins.len() >= soft_limit;
         if in_tiny_reserve && reserve_scans >= MAX_RESERVE_SCANS {
             break;
@@ -921,9 +1355,9 @@ where
             call_head += 1;
             item
         } else if !in_tiny_reserve
-            && let Some(&item) = invoke_queue.get(invoke_head)
+            && let Some(&item) = indirect_queue.get(indirect_head)
         {
-            invoke_head += 1;
+            indirect_head += 1;
             item
         } else {
             break;
@@ -936,6 +1370,7 @@ where
             continue;
         }
         *state = PROCESSED;
+        total_scanned += 1;
         if in_tiny_reserve && !is_seed {
             reserve_scans += 1;
         }
@@ -946,7 +1381,7 @@ where
             return Err(ExportLtoError::NotRunnable { symbol: symbol.0, tabled });
         };
         let mut built = maker
-            .build_lir(&grant, tabled, name, scratch)
+            .build_lir_in(&grant, tabled, name, shared)
             .map_err(|error| ExportLtoError::BuildLir { symbol: symbol.0, error })?;
         let lowered_libm = lower_ieee_libm_calls(&mut built, opts.machine, scratch);
         if lowered_libm {
@@ -955,58 +1390,38 @@ where
         }
 
         let view = built.func.view();
+        if !is_seed && !should_expand_non_seed(view.head.attrs) {
+            continue;
+        }
+
+        // Always expand normal-block callees of every seed and every non-cold, non-noreturn body
+        // BEFORE checking `max_caller_insts` / `in_tiny_reserve` so large callers never sever
+        // their downstream call subgraph (`SliceRead::*`, `Vec::push`, etc.).
+        if depth < opts.max_depth {
+            let next_depth = depth.saturating_add(1);
+            enqueue_normal_callees(
+                &built,
+                walk,
+                next_depth,
+                &is_eligible_callee,
+                visited.as_mut_slice(),
+                &mut call_queue,
+                &mut indirect_queue,
+            );
+        }
+
         if !is_seed && !should_keep_non_seed(view.head.attrs, view.len(), in_tiny_reserve, TINY_INLINE_LEAF_INSTS, &opts) {
             continue;
         }
 
-        if depth < opts.max_depth {
-            let next_depth = depth.saturating_add(1);
-            for b in 0..view.blocks() {
-                let Ok(b_u32) = u32::try_from(b) else { break };
-                let block = Block(b_u32);
-                if view.block_kind(block) != BlockKind::Normal {
-                    continue;
-                }
-                for at in view.block(block) {
-                    let op = view.op(at);
-                    if !matches!(op, Op::Call | Op::Invoke) {
-                        continue;
-                    }
-                    if view.flags(at).contains(Flags::COLD) {
-                        continue;
-                    }
-                    let Some(&data_at) = view.data.get(at) else { continue };
-                    let Ok(extra_idx) = usize::try_from(data_at) else { continue };
-                    let Some(&ref_word) = view.extra.get(extra_idx) else { continue };
-                    let Some(rec) = view.refs.get(RefId(ref_word).index()) else { continue };
-                    if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
-                        continue;
-                    }
-                    let Ok(place_idx) = usize::try_from(rec.place) else { continue };
-                    let Some(&BuiltCallee::Symbol(callee_sym)) = built.funcs.get(place_idx) else { continue };
-                    let Some(callee_row) = walk.row_of(&callee_sym) else { continue };
-                    if !is_eligible_callee(callee_row) {
-                        continue;
-                    }
-                    if let Some(state) = visited.get_mut(callee_row) {
-                        if op == Op::Call && *state < QUEUED_CALL {
-                            *state = QUEUED_CALL;
-                            call_queue.push((callee_row, next_depth, false));
-                        } else if op == Op::Invoke && *state == UNSEEN {
-                            *state = QUEUED_INVOKE;
-                            invoke_queue.push((callee_row, next_depth, false));
-                        }
-                    }
-                }
-            }
-        }
-
-        let orig_unreachables = view.ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count();
+        let orig_unreachables = view
+            .ops
+            .iter()
+            .filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable))
+            .count();
         origins.push(LtoOrigin {
             row,
             symbol,
-            is_seed,
-            lowered_libm,
             orig_unreachables,
             built,
         });
@@ -1014,207 +1429,58 @@ where
 
     if origins.is_empty() {
         return Ok(ExportLtoOut {
-            bodies: Vec::new_in(alloc),
+            bodies: Vec::new_in(shared),
             module_bodies: 0,
             total_inlined: 0,
         });
     }
 
-    // 2. Bottom-up Tarjan SCC cross-function LIR inlining + SROA/propagate/DCE/CFG-coalesce.
+    // 2. Parallel bottom-up Tarjan SCC cross-function LIR inlining + SROA/propagate/DCE/CFG-coalesce.
     let n = origins.len();
-    let mut by_sym: AVec<'s, ([u8; 32], usize)> = Vec::with_capacity_in(n, scratch);
-    let mut mod_bodies: AVec<'s, ModuleBody<Alloc<'s>>> = Vec::with_capacity_in(n, scratch);
+    let mut by_sym: Vec<([u8; 32], usize), SharedAlloc<'static>> = Vec::with_capacity_in(n, shared);
+    let mut mod_bodies: Vec<ModuleBody<SharedAlloc<'static>>, SharedAlloc<'static>> = Vec::with_capacity_in(n, shared);
     for (idx, orig) in origins.iter().enumerate() {
         by_sym.push((orig.symbol.0, idx));
         mod_bodies.push(ModuleBody {
             id: BodyId(orig.symbol.0),
-            func: orig.built.func.view().to_func_in(scratch),
+            func: orig.built.func.view().to_func_in(shared),
         });
     }
     by_sym.sort_unstable();
 
     let bodies_view = LtoBodies { origins: origins.as_slice(), by_sym: by_sym.as_slice() };
-    let lto = lto_optimize_module(mod_bodies, &bodies_view, &NoWeights, opts.policy, scratch)
+    let lto = lto_optimize_module_par(mod_bodies, &bodies_view, &NoWeights, opts.policy, shared, runner)
         .map_err(ExportLtoError::Optimize)?;
 
-    // 3. Expand reference tables transitively for every `ImportedRef` and emit host-ISA records.
-    let mut out_bodies: AVec<'a, LtoBodyOut<'a>> = Vec::with_capacity_in(n, alloc);
-    for (idx, (orig, opt)) in origins.iter().zip(lto.bodies.iter()).enumerate() {
-        if !orig.is_seed && !orig.lowered_libm && opt.read.is_empty() {
-            continue;
-        }
-        let mut funcs: AVec<'s, Callee<'_>> = Vec::with_capacity_in(orig.built.funcs.len() + opt.imported_refs.len(), scratch);
-        for p in 0..orig.built.funcs.len() {
-            let p_u32 = u32::try_from(p).map_err(|_| ExportLtoError::BadRef {
-                symbol: orig.symbol.0,
-                what: "original func place",
-                ref_id: u32::MAX,
-            })?;
-            let Some(callee) = orig.built.callee_at(p_u32) else {
-                return Err(ExportLtoError::BadRef {
-                    symbol: orig.symbol.0,
-                    what: "original func name",
-                    ref_id: p_u32,
-                });
-            };
-            funcs.push(callee);
-        }
-        let mut statics: AVec<'s, ItemKey> = Vec::with_capacity_in(orig.built.statics.len(), scratch);
-        statics.extend_from_slice(orig.built.statics.as_slice());
-        let mut c_statics: AVec<'s, (ItemKey, &str)> = Vec::with_capacity_in(orig.built.c_statics.len(), scratch);
-        for &(item, start, len) in orig.built.c_statics.iter() {
-            let Some(cname) = orig.built.c_str(start, len) else {
-                return Err(ExportLtoError::BadRef {
-                    symbol: orig.symbol.0,
-                    what: "original foreign static name",
-                    ref_id: 0,
-                });
-            };
-            c_statics.push((item, cname));
-        }
-        let mut vtables: AVec<'s, Symbol> = Vec::with_capacity_in(orig.built.vtables.len(), scratch);
-        vtables.extend_from_slice(orig.built.vtables.as_slice());
-        let mut vtable_data: AVec<'a, (Symbol, AVec<'a, u8>)> = Vec::with_capacity_in(orig.built.vtable_data.len(), alloc);
-        for (vsym, bytes) in orig.built.vtable_data.iter() {
-            push_vtable_datum(&mut vtable_data, *vsym, bytes.as_slice(), alloc);
-        }
-        let mut tls: AVec<'s, ItemKey> = Vec::with_capacity_in(orig.built.tls.len(), scratch);
-        tls.extend_from_slice(orig.built.tls.as_slice());
+    // 3. Prepare soft-float routines once on the main thread, then emit EVERY gathered non-cold
+    // body in parallel with host-ISA SOTA + superopt codegen so hot dependency functions receive
+    // full `Tier::Optimized` placement and host ISA tuning.
+    let bound_routines = maker
+        .prepare_routines()
+        .map_err(|error| ExportLtoError::Record { symbol: [0u8; 32], error })?;
+    let origins_ref = origins.as_slice();
+    let lto_bodies_ref = lto.bodies.as_slice();
+    let by_sym_ref = by_sym.as_slice();
+    let machine = opts.machine;
 
-        for imp in opt.imported_refs.iter() {
-            let Some(kind) = RefKind::from_word(imp.rec.kind) else {
-                return Err(ExportLtoError::BadRef {
-                    symbol: orig.symbol.0,
-                    what: "imported ref kind",
-                    ref_id: imp.caller_ref.0,
-                });
-            };
-            let place = usize::try_from(imp.rec.place).map_err(|_| ExportLtoError::BadRef {
-                symbol: orig.symbol.0,
-                what: "imported ref place",
-                ref_id: imp.caller_ref.0,
-            })?;
-            let (origin_idx, origin_rec) = resolve_ref_origin(
+    let emitted = runner
+        .par_map(n, shared, |idx, worker_scratch| {
+            emit_one_lto_body(
                 idx,
-                imp.caller_ref,
-                lto.bodies.as_slice(),
-                origins.as_slice(),
-                by_sym.as_slice(),
-            )?;
-            if RefKind::from_word(origin_rec.kind) != Some(kind) {
-                return Err(ExportLtoError::RefKindMismatch {
-                    symbol: orig.symbol.0,
-                    ref_id: imp.caller_ref.0,
-                });
-            }
-            let Some(src_origin) = origins.get(origin_idx) else {
-                return Err(ExportLtoError::BadRef {
-                    symbol: orig.symbol.0,
-                    what: "origin body index",
-                    ref_id: imp.caller_ref.0,
-                });
-            };
-            let src_place = usize::try_from(origin_rec.place).map_err(|_| ExportLtoError::BadRef {
-                symbol: orig.symbol.0,
-                what: "origin ref place",
-                ref_id: imp.caller_ref.0,
-            })?;
-            match kind {
-                RefKind::Func => {
-                    let Some(callee) = src_origin.built.callee_at(origin_rec.place) else {
-                        return Err(ExportLtoError::BadRef {
-                            symbol: orig.symbol.0,
-                            what: "origin func callee",
-                            ref_id: imp.caller_ref.0,
-                        });
-                    };
-                    put_at(&mut funcs, place, callee, orig.symbol.0, "imported func place", imp.caller_ref.0)?;
-                }
-                RefKind::Static => {
-                    let Some(&item) = src_origin.built.statics.get(src_place) else {
-                        return Err(ExportLtoError::BadRef {
-                            symbol: orig.symbol.0,
-                            what: "origin static item",
-                            ref_id: imp.caller_ref.0,
-                        });
-                    };
-                    put_at(&mut statics, place, item, orig.symbol.0, "imported static place", imp.caller_ref.0)?;
-                    if let Some(cname) = src_origin.built.foreign_static_name(item)
-                        && !c_statics.iter().any(|(k, _)| *k == item)
-                    {
-                        c_statics.push((item, cname));
-                    }
-                }
-                RefKind::Vtable => {
-                    let Some(&vsym) = src_origin.built.vtables.get(src_place) else {
-                        return Err(ExportLtoError::BadRef {
-                            symbol: orig.symbol.0,
-                            what: "origin vtable symbol",
-                            ref_id: imp.caller_ref.0,
-                        });
-                    };
-                    put_at(&mut vtables, place, vsym, orig.symbol.0, "imported vtable place", imp.caller_ref.0)?;
-                    for (sym, bytes) in src_origin.built.vtable_data.iter() {
-                        push_vtable_datum(&mut vtable_data, *sym, bytes.as_slice(), alloc);
-                    }
-                }
-                RefKind::Tls => {
-                    let Some(&item) = src_origin.built.tls.get(src_place) else {
-                        return Err(ExportLtoError::BadRef {
-                            symbol: orig.symbol.0,
-                            what: "origin tls item",
-                            ref_id: imp.caller_ref.0,
-                        });
-                    };
-                    put_at(&mut tls, place, item, orig.symbol.0, "imported tls place", imp.caller_ref.0)?;
-                }
-                RefKind::Data => {
-                    return Err(ExportLtoError::BadRef {
-                        symbol: orig.symbol.0,
-                        what: "unexpected imported Data ref",
-                        ref_id: imp.caller_ref.0,
-                    });
-                }
-            }
-        }
+                origins_ref,
+                lto_bodies_ref,
+                by_sym_ref,
+                bound_routines,
+                machine,
+                shared,
+                worker_scratch,
+            )
+        })
+        .map_err(ExportLtoError::Optimize)?;
 
-        // Bind compiler_builtins soft-float routines AFTER all original + imported function refs.
-        let routines = maker
-            .bind_routines(&mut funcs)
-            .map_err(|error| ExportLtoError::Record { symbol: orig.symbol.0, error })?;
-        let names = InstanceNames {
-            funcs: funcs.as_slice(),
-            statics: statics.as_slice(),
-            c_statics: c_statics.as_slice(),
-            vtables: vtables.as_slice(),
-            tls: tls.as_slice(),
-        };
-        let verified = verify(opt.func.view())
-            .map_err(|error| ExportLtoError::Verify { symbol: orig.symbol.0, error })?;
-        let post_unreachables = opt.func.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count();
-        let traps: &[TrapSource] = if opt.read.is_empty() && orig.orig_unreachables == post_unreachables {
-            orig.built.traps.as_slice()
-        } else {
-            &[]
-        };
-        let (record_tmp, called_declared) = emit_code_record_for_machine(verified, &names, routines, traps, opts.machine, scratch)
-            .map_err(|error| ExportLtoError::Record { symbol: orig.symbol.0, error })?;
-        let mut record: AVec<'a, u8> = Vec::with_capacity_in(record_tmp.len(), alloc);
-        record.extend_from_slice(record_tmp.as_slice());
-        let mut extra_declared: AVec<'a, (ItemKey, AVec<'a, u8>)> = Vec::with_capacity_in(called_declared.len(), alloc);
-        for d in called_declared.iter() {
-            let mut name_buf: AVec<'a, u8> = Vec::with_capacity_in(d.name.len(), alloc);
-            name_buf.extend_from_slice(d.name);
-            extra_declared.push((d.tabled, name_buf));
-        }
-        out_bodies.push(LtoBodyOut {
-            row: orig.row,
-            symbol: orig.symbol,
-            record,
-            vtable_data,
-            extra_declared,
-            inlined_bodies: opt.read.len(),
-        });
+    let mut out_bodies: Vec<LtoBodyOut, SharedAlloc<'static>> = Vec::with_capacity_in(n, shared);
+    for res in emitted {
+        out_bodies.push(res?);
     }
 
     Ok(ExportLtoOut {
@@ -1253,7 +1519,7 @@ mod tests {
         func: blaze_lir::Func<Alloc<'static>>,
         c_names: &[&str],
         alloc: Alloc<'static>,
-    ) -> BuiltLir<'static> {
+    ) -> BuiltLir<Alloc<'static>> {
         let mut funcs: AVec<'static, BuiltCallee> = Vec::with_capacity_in(c_names.len(), alloc);
         let mut c_text: AVec<'static, u8> = Vec::new_in(alloc);
         for &name in c_names {
@@ -1281,7 +1547,7 @@ mod tests {
         ret_ty: Ty,
         variadic: Variadic,
         alloc: Alloc<'static>,
-    ) -> BuiltLir<'static> {
+    ) -> BuiltLir<Alloc<'static>> {
         let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
         let sig_params: std::vec::Vec<Param> = param_tys.iter().copied().map(Param::of).collect();
         let ret_params = [Param::of(ret_ty)];
@@ -1497,5 +1763,98 @@ mod tests {
         assert!(should_keep_non_seed(always_inline, 12, true, 24, &opts));
         assert!(!should_keep_non_seed(0, 12, true, 24, &opts));
         assert!(!should_keep_non_seed(hint_inline, 25, true, 24, &opts));
+
+        // Oversized non-cold callers are still expanded so their downstream call subgraph is never
+        // severed, while cold/noreturn bodies stay unexpanded.
+        assert!(should_expand_non_seed(0));
+        assert!(should_expand_non_seed(no_inline));
+        assert!(should_expand_non_seed(FnAttrs::COLD | always_inline));
+        assert!(!should_expand_non_seed(FnAttrs::COLD));
+        assert!(!should_expand_non_seed(FnAttrs::NORETURN));
+        assert!(!should_expand_non_seed(FnAttrs::NORETURN | always_inline));
+    }
+
+    #[test]
+    fn enqueue_normal_callees_discovers_call_invoke_func_addr_and_vtable_methods() {
+        use blaze_code::datum::{Datum, Place as DatumPlace};
+        use blaze_code::record::{Target as CodeTarget, Word as CodeWord};
+
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Register 4 reachable functions in a Walk: direct_call, direct_invoke, fn_ptr, vtable_method.
+        let mut walk = Walk::new_in(alloc);
+        let row_call = walk.root::<RunError>((ItemKey(1), b"direct_call"), 64).expect("row_call");
+        let row_invoke = walk.root::<RunError>((ItemKey(2), b"direct_invoke"), 64).expect("row_invoke");
+        let row_fnptr = walk.root::<RunError>((ItemKey(3), b"fn_ptr"), 64).expect("row_fnptr");
+        let row_vmethod = walk.root::<RunError>((ItemKey(4), b"vtable_method"), 64).expect("row_vmethod");
+        let sym_call = walk.symbol(row_call);
+        let sym_invoke = walk.symbol(row_invoke);
+        let sym_fnptr = walk.symbol(row_fnptr);
+        let sym_vmethod = walk.symbol(row_vmethod);
+        let vsym = Symbol::of_name("test_vtable");
+
+        // Build a vtable datum referencing `sym_vmethod`.
+        let mut vt_datum = Datum::new_in(DatumPlace::ReadOnly, 3, alloc);
+        vt_datum.bytes.extend_from_slice(&[0u8; 8]);
+        let t_idx = vt_datum.target(CodeTarget { space: Space::Func, symbol: sym_vmethod });
+        vt_datum.words.push(CodeWord { at: 0, target: t_idx, addend: 0 });
+        let mut vt_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        vt_datum.seal().expect("seal").encode(&mut vt_bytes);
+
+        let func = {
+            let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+            b.set_signature(sig);
+            let r_call = b.reference(RefKind::Func, 0);
+            let r_invoke = b.reference(RefKind::Func, 1);
+            let r_fnptr = b.reference(RefKind::Func, 2);
+            let r_vtable = b.reference(RefKind::Vtable, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            b.call(Flags::NONE, r_call, sig, &[]);
+            let _fp = b.func_addr(r_fnptr);
+            let _vt = b.data_addr(r_vtable);
+            b.invoke(Flags::NONE, r_invoke, sig, &[], norm, pad);
+            b.begin(norm);
+            b.ret(&[]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("valid caller")
+        };
+
+        let mut funcs_tbl: AVec<'static, BuiltCallee> = Vec::new_in(alloc);
+        funcs_tbl.push(BuiltCallee::Symbol(sym_call));
+        funcs_tbl.push(BuiltCallee::Symbol(sym_invoke));
+        funcs_tbl.push(BuiltCallee::Symbol(sym_fnptr));
+        let mut vtables_tbl: AVec<'static, Symbol> = Vec::new_in(alloc);
+        vtables_tbl.push(vsym);
+        let mut vtable_data: AVec<'static, (Symbol, AVec<'static, u8>)> = Vec::new_in(alloc);
+        vtable_data.push((vsym, vt_bytes));
+
+        let built = BuiltLir {
+            func,
+            funcs: funcs_tbl,
+            statics: Vec::new_in(alloc),
+            c_statics: Vec::new_in(alloc),
+            vtables: vtables_tbl,
+            vtable_data,
+            tls: Vec::new_in(alloc),
+            traps: Vec::new_in(alloc),
+            c_text: Vec::new_in(alloc),
+        };
+
+        let mut visited: AVec<'static, u8> = Vec::with_capacity_in(walk.len(), alloc);
+        visited.resize(walk.len(), UNSEEN);
+        let mut call_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        let mut indirect_queue: AVec<'static, (usize, u8, bool)> = Vec::new_in(alloc);
+        enqueue_normal_callees(&built, &walk, 1, &|_| true, visited.as_mut_slice(), &mut call_queue, &mut indirect_queue);
+
+        assert!(call_queue.iter().any(|&(r, d, _)| r == row_call && d == 1));
+        assert!(call_queue.iter().any(|&(r, d, _)| r == row_invoke && d == 1));
+        assert!(indirect_queue.iter().any(|&(r, d, _)| r == row_fnptr && d == 1));
+        assert!(indirect_queue.iter().any(|&(r, d, _)| r == row_vmethod && d == 1));
     }
 }
