@@ -263,15 +263,58 @@ pub fn lower_closure_external<A: Allocator + Copy, F: Facts>(
     facts: &F,
     alloc: A,
 ) -> Result<ClosureFlow<A>, Refusal> {
-    lower_closure_with::<A, F, crate::one_call::Production>(body, ck, closure, facts, false, alloc, &mut None)
+    lower_closure_with_override::<A, F, crate::one_call::Production>(body, ck, closure, None, facts, false, alloc, &mut None)
+}
+
+/// [`lower_closure_external`], overriding the closure's call kind to `kind` (for example,
+/// `ClosureKind::FnOnce` when the enclosing call consumes the closure strictly as `FnOnce` even
+/// though `blaze-typeck` inferred `FnMut` because captures are only reborrowed).
+pub fn lower_closure_with_kind<A: Allocator + Copy, F: Facts>(
+    body: &BodyView<'_>,
+    ck: &Checked<'_>,
+    closure: ExprId,
+    kind: ClosureKind,
+    facts: &F,
+    alloc: A,
+) -> Result<ClosureFlow<A>, Refusal> {
+    lower_closure_with_override::<A, F, crate::one_call::Production>(body, ck, closure, Some(kind), facts, false, alloc, &mut None)
+}
+
+/// [`lower_closure_external`] lowered as `FnOnce::call_once(self)` regardless of `Checked::closures`'
+/// inferred kind: `ByValue` captures become owned argument locals (dropped at closure exit, so
+/// returning a reference to a capture local itself is still rejected as a dangling local borrow,
+/// while reborrowing `&mut *captured_ref` keeps its capture lifetime without `External::Env`).
+pub fn lower_closure_as_fn_once<A: Allocator + Copy, F: Facts>(
+    body: &BodyView<'_>,
+    ck: &Checked<'_>,
+    closure: ExprId,
+    facts: &F,
+    alloc: A,
+) -> Result<ClosureFlow<A>, Refusal> {
+    lower_closure_with_kind(body, ck, closure, ClosureKind::FnOnce, facts, alloc)
 }
 
 /// [`lower_closure_external`] under the call rule `R`; with `logged` (the oracle's comparing
 /// lowering, lib.rs `lower_with`) each call's record into `log`, kept on a refusal too.
+#[allow(dead_code)]
 pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_call::CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     closure: ExprId,
+    facts: &F,
+    logged: bool,
+    alloc: A,
+    log: &mut Option<crate::builder::Log<A>>,
+) -> Result<ClosureFlow<A>, Refusal> {
+    lower_closure_with_override::<A, F, R>(body, ck, closure, None, facts, logged, alloc, log)
+}
+
+#[expect(clippy::too_many_arguments, reason = "body, checked, closure id, optional kind override, facts, log flag, allocator, log sink")]
+fn lower_closure_with_override<A: Allocator + Copy, F: Facts, R: crate::one_call::CallRule>(
+    body: &BodyView<'_>,
+    ck: &Checked<'_>,
+    closure: ExprId,
+    kind_override: Option<ClosureKind>,
     facts: &F,
     logged: bool,
     alloc: A,
@@ -288,9 +331,12 @@ pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_ca
         None => return Err(Refusal { form: Form::Malformed, range }),
     };
     let row = ck.closures.column::<0>().iter().position(|&c| c == closure);
-    let kind = match row.and_then(|i| ck.closures.column::<1>().get(i)) {
-        Some(&k) => k,
-        None => return Err(Refusal { form: Form::Malformed, range }),
+    let kind = match kind_override {
+        Some(k) => k,
+        None => match row.and_then(|i| ck.closures.column::<1>().get(i)) {
+            Some(&k) => k,
+            None => return Err(Refusal { form: Form::Malformed, range }),
+        },
     };
     // The closure's signature as the type check settled it (`Checked::closures`: a fn pointer
     // type, its inputs then its output; typeck rules/closure.rs `expr_closure`): each
@@ -1342,6 +1388,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 out.push(SigSlot::InnerBound(u32::MAX - 1, slot_idx));
                             }
                         }
+                    }
+                }
+                PNode::Alias { trait_, name, args } if <R::Grain as crate::grain::Grain>::SLOTS => {
+                    if let Some(nl) = self.facts.alias_lifetimes(trait_, name) {
+                        for lt in 0..nl {
+                            push_written(p, lt, owner, out);
+                        }
+                        for (ci, &child) in self.list(args, e)?.iter().enumerate().rev() {
+                            stack.push((child, blaze_typeck::ClosureParamRegion::push_step(p, to_u32(ci))));
+                        }
+                    } else {
+                        push_default(self.npos(t, e)?, owner, out);
                     }
                 }
                 PNode::FnPtr(..) => {

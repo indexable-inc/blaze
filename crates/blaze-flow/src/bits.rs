@@ -100,12 +100,6 @@ pub fn put(row: &mut [u64], c: usize, on: bool) {
     }
 }
 
-/// Whether two equal-length bit rows share any set bit.
-#[inline]
-pub(crate) fn intersects(a: &[u64], b: &[u64]) -> bool {
-    a.iter().zip(b).any(|(&x, &y)| (x & y) != 0)
-}
-
 /// Bounded, duplicate-free priority worklist over dense ranks `0..len`, popping the smallest
 /// queued rank in `O(log_64 len)` word operations.
 pub(crate) struct BitWorklist<A: Allocator> {

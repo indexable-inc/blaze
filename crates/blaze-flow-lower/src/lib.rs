@@ -119,7 +119,10 @@ pub use coroutine::{AsyncWitness, InteriorPart, LoweredAsync, interior, interior
 
 pub mod closure;
 
-pub use closure::{ClosureFlow, External, Need, Requirement, SigSlot, escapes_closure, lower_async_fn, lower_closure, lower_closure_external, requirement};
+pub use closure::{
+    ClosureFlow, External, Need, Requirement, SigSlot, escapes_closure, lower_async_fn, lower_closure, lower_closure_as_fn_once,
+    lower_closure_external, lower_closure_with_kind, requirement,
+};
 
 // Guards that move, or-pattern bindings, slice patterns (lane B8).
 mod pattern_forms;
@@ -133,6 +136,8 @@ mod callee_value;
 mod callee_value_tests;
 #[cfg(test)]
 mod closure_requirements_tests;
+#[cfg(test)]
+mod unsize_dyn_tests;
 
 mod variance;
 pub use variance::Variance;
@@ -6315,7 +6320,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                             match self.unsize_to_object(p, v.ty, tp, out, e)? {
                                 UnsizeDone::ClosureSigTied => closure_sig_tied = true,
                                 UnsizeDone::Handled => {}
-                                UnsizeDone::Fallback => self.relate(p, tp, out, e)?,
+                                UnsizeDone::Fallback => {
+                                    // Never relate mismatched `T -> dyn Trait` structures position-by-position
+                                    // even when their slot counts happen to coincide (e.g. smart-pointer
+                                    // `CoerceUnsized` like `Arc<T> -> Arc<dyn Trait<'m>>`).
+                                    if self.contains_dynamic(out.ty, e)? && !self.contains_dynamic(v.ty.ty, e)? {
+                                        let (si, di) = (self.info(p), self.info(tp));
+                                        if si.len + di.len > 2 {
+                                            self.coarse_step(Form::Unified { why: Unified::ValueInexact }, e);
+                                        }
+                                        self.unify(&[p, tp]);
+                                    } else {
+                                        self.relate(p, tp, out, e)?;
+                                    }
+                                }
                             }
                         } else {
                             self.relate(p, tp, out, e)?;
@@ -6500,6 +6518,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 return Ok(UnsizeDone::Fallback);
             }
             (0u32, fi, ti)
+        } else if from.wrap.is_none()
+            && to.wrap.is_none()
+            && let (PNode::Ptr(_, fi), PNode::Ptr(_, ti)) = (self.node(from.ty, e)?, self.node(to.ty, e)?)
+        {
+            if d.len < 1 {
+                return Ok(UnsizeDone::Fallback);
+            }
+            (0u32, fi, ti)
         } else {
             return Ok(UnsizeDone::Fallback);
         };
@@ -6567,6 +6593,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         for j in 0..ncap {
                             self.b.subset(self.origs[(s.start + ref_skip + j) as usize], q);
                         }
+                        let mut cap_params: Vec<u32, A> = Vec::new_in(self.alloc);
+                        let _ = self.outlives_components(from_inner, e, &mut cap_params, true)?;
+                        for &u in cap_params.iter() {
+                            let rho = self.param_origin(u);
+                            self.b.subset(rho, q);
+                        }
                         let nsig_usize = usize::try_from(nsig).unwrap_or(0);
                         let mut tied: Vec<bool, A> = Vec::with_capacity_in(nsig_usize, self.alloc);
                         tied.resize(nsig_usize, false);
@@ -6597,38 +6629,120 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             }
         }
-        if d.len != ref_skip + 1 {
-            return Ok(UnsizeDone::Fallback);
-        }
-        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
-        for &p in self.list(preds, e)? {
-            let (args, term) = match self.node(p, e)? {
-                PNode::ExTrait(k, args) => {
-                    if facts.object_trait_lifetimes(k) != Some(false) {
-                        return Ok(UnsizeDone::Fallback);
+        // Fast path when `dyn Trait + 'q` carries ONLY the object lifetime (`d.len == ref_skip + 1`,
+        // every principal trait declares no lifetimes, and every predicate argument/term holds no
+        // lifetime or type parameter).
+        let mut zero_trait_lt = d.len == ref_skip + 1;
+        if zero_trait_lt {
+            let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
+            for &p in self.list(preds, e)? {
+                let (args, term) = match self.node(p, e)? {
+                    PNode::ExTrait(k, args) => {
+                        if facts.object_trait_lifetimes(k) != Some(false) {
+                            zero_trait_lt = false;
+                            break;
+                        }
+                        (args, None)
                     }
-                    (args, None)
+                    PNode::ExProj { args, term, .. } => (args, Some(term)),
+                    PNode::ExAuto(_) => continue,
+                    _ => {
+                        zero_trait_lt = false;
+                        break;
+                    }
+                };
+                for &t in self.list(args, e)?.iter().chain(term.as_ref()) {
+                    held.clear();
+                    if self.npos(t, e)? > 0 || self.unplaced(t, e, &mut held)? || !held.is_empty() {
+                        zero_trait_lt = false;
+                        break;
+                    }
                 }
-                PNode::ExProj { args, term, .. } => (args, Some(term)),
-                PNode::ExAuto(_) => continue,
-                _ => return Ok(UnsizeDone::Fallback),
-            };
-            for &t in self.list(args, e)?.iter().chain(term.as_ref()) {
-                held.clear();
-                if self.npos(t, e)? > 0 || self.unplaced(t, e, &mut held)? || !held.is_empty() {
-                    return Ok(UnsizeDone::Fallback);
+                if !zero_trait_lt {
+                    break;
                 }
             }
         }
+        if zero_trait_lt {
+            if ref_skip == 1 {
+                let d0 = self.origs[d.start as usize];
+                self.b.subset(self.origs[s.start as usize], d0);
+            }
+            let q = self.origs[(d.start + ref_skip) as usize];
+            for j in s.start + ref_skip..s.start + s.len {
+                self.b.subset(self.origs[j as usize], q);
+            }
+            let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
+            let _ = self.outlives_components(from_inner, e, &mut params, true)?;
+            for &u in params.iter() {
+                let rho = self.param_origin(u);
+                self.b.subset(rho, q);
+            }
+            return Ok(UnsizeDone::Handled);
+        }
+        // Exact `dyn Trait<'m, Args..., Assoc = Term> + 'q` unsizing through `blaze-borrow`:
+        // proves `from_inner: 'q`, every `ExTrait` and `ExProj` predicate, and all impl
+        // where-clauses (including `Fn*` bounds on closures inside ADTs such as `MadeOnce<'n, F>`).
+        if let crate::one_call::UnsizeBorrow::Proven { closures_tied } =
+            self.unsize_via_borrow(s, from_inner, d, obj, preds, ref_skip, e)?
+        {
+            return Ok(if closures_tied { UnsizeDone::ClosureSigTied } else { UnsizeDone::Handled });
+        }
+        // Sound conservative fallback when an unsizing impl could not be resolved (e.g. no
+        // selection row filed yet): NEVER fall through to position-by-position `relate` (whose
+        // `s.len == d.len` branch equates mismatched slot layouts). Keep the outer reference
+        // covariant (`'r: 's`, never coupled to `T`'s inner lifetimes), unify all inner slots of
+        // `T` with all slots of `dyn ...` through one hub, and enforce `P: 'q` for caller type
+        // parameters.
         if ref_skip == 1 {
             let d0 = self.origs[d.start as usize];
             self.b.subset(self.origs[s.start as usize], d0);
         }
+        let inner_s = s.len.saturating_sub(ref_skip);
+        let inner_d = d.len.saturating_sub(ref_skip);
+        if inner_s + inner_d > 0 {
+            let hub = self.b.origin(false);
+            for j in s.start + ref_skip..s.start + s.len {
+                let o = self.origs[j as usize];
+                self.b.subset(o, hub);
+                self.b.subset(hub, o);
+            }
+            for j in d.start + ref_skip..d.start + d.len {
+                let o = self.origs[j as usize];
+                self.b.subset(o, hub);
+                self.b.subset(hub, o);
+            }
+            if inner_s + inner_d > 2 {
+                self.coarse_step(Form::Unified { why: Unified::ValueInexact }, e);
+            }
+        }
         let q = self.origs[(d.start + ref_skip) as usize];
-        for j in s.start + ref_skip..s.start + s.len {
-            self.b.subset(self.origs[j as usize], q);
+        let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
+        let _ = self.outlives_components(from_inner, e, &mut params, true)?;
+        for &u in params.iter() {
+            let rho = self.param_origin(u);
+            self.b.subset(rho, q);
         }
         Ok(UnsizeDone::Handled)
+    }
+
+    /// Whether type `t` contains a `PNode::Dynamic` anywhere inside its structural wrappers.
+    fn contains_dynamic(&self, t: PTy, e: ExprId) -> Result<bool, Refusal> {
+        let mut stack = TyStack::new(t, self.alloc);
+        let mut steps = 0u32;
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(cur, e)? {
+                PNode::Dynamic(_) => return Ok(true),
+                PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                _ => {}
+            }
+        }
+        Ok(false)
     }
 
     fn target_flow(&mut self, from: PInfo, skip: u32, r: PInfo, m: bool) {
@@ -7505,17 +7619,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(());
         }
         // An explicit cast `&T as &dyn Trait` (e.g. tracing's `&display(&x) as &dyn Value`):
-        // unsizing to a trait object whose trait writes no lifetimes relates one way into the
-        // object reference and its lifetime bound (`unsize_to_object`), never via `AggregateHub`.
+        // unsizing to a trait object relates through `unsize_to_object`, never via `AggregateHub`.
         if !fmt
             && elems.is_none()
             && parts.len() == 1
             && matches!(self.expr(e)?, Expr::Cast { .. })
             && let At::Place(p) = parts[0].at
-            && self.unsize_to_object(p, parts[0].ty, tp, ty, e)? != UnsizeDone::Fallback
         {
-            self.push_place(tp, ty);
-            return Ok(());
+            match self.unsize_to_object(p, parts[0].ty, tp, ty, e)? {
+                UnsizeDone::ClosureSigTied => {
+                    self.push_place(tp, ty);
+                    return Ok(());
+                }
+                UnsizeDone::Handled => {
+                    self.closure_sig_kept(parts[0].ty.ty, e)?;
+                    self.push_place(tp, ty);
+                    return Ok(());
+                }
+                UnsizeDone::Fallback => {}
+            }
         }
         match elems {
             Some(tys) if !fmt && d.exact && tys.len() == vs.len() && self.plant != Plant::TupleUnified => {

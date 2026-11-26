@@ -405,3 +405,213 @@ pub extern \"C\" fn main() -> i32 {
     println!("PATH CALL AWAITED: {got:?}");
     assert_eq!(got, Ok(43));
 }
+
+#[test]
+fn ipc_start_inner_loop_match_await_let_else_and_pin() {
+    let got = run("
+enum Opt<T> {
+    Some(T),
+    None,
+}
+struct Stream(u32);
+impl Drop for Stream {
+    fn drop(&mut self) {}
+}
+struct Reader(u32);
+impl Drop for Reader {
+    fn drop(&mut self) {}
+}
+struct Writer(u32);
+impl Drop for Writer {
+    fn drop(&mut self) {}
+}
+impl Stream {
+    fn split(self) -> (Reader, Writer) {
+        (Reader(self.0), Writer(self.0))
+    }
+}
+struct PinMacroHelper<T> {
+    value: T,
+}
+fn pin_new_unchecked<T>(p: &mut T) -> Pin<&mut T> {
+    Pin { pointer: p }
+}
+fn my_drop<T>(_x: T) {}
+struct StopFut(u32);
+impl Drop for StopFut {
+    fn drop(&mut self) {}
+}
+impl Future for StopFut {
+    type Output = u32;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u32> {
+        Poll::Ready(self.pointer.0)
+    }
+}
+struct WriteAll<'a> {
+    w: &'a mut Writer,
+    buf: &'a [u8],
+    left: u32,
+}
+enum Res<T, E> {
+    Ok(T),
+    Err(E),
+}
+impl<T, E> Res<T, E> {
+    fn ok(self) -> Opt<T> {
+        match self {
+            Res::Ok(v) => Opt::Some(v),
+            Res::Err(_) => Opt::None,
+        }
+    }
+}
+struct OnReady(u32);
+impl Drop for OnReady {
+    fn drop(&mut self) {}
+}
+impl OnReady {
+    fn send(self, _v: Res<(), ErrObj>) -> Res<(), ()> {
+        Res::Ok(())
+    }
+}
+struct Server {
+    endpoint: u32,
+    cfg: ErrObj,
+}
+impl<'a> Future for WriteAll<'a> {
+    type Output = Res<(), ErrObj>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Res<(), ErrObj>> {
+        let this = self.pointer;
+        if this.left == 0 {
+            Poll::Ready(Res::Ok(()))
+        } else {
+            this.left = this.left - 1;
+            *cx.wakes = *cx.wakes + 1;
+            Poll::Pending
+        }
+    }
+}
+impl Writer {
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> WriteAll<'a> {
+        WriteAll { w: self, buf, left: 1 }
+    }
+}
+struct Tx(u32);
+impl Drop for Tx {
+    fn drop(&mut self) {}
+}
+struct Rx(u32);
+impl Drop for Rx {
+    fn drop(&mut self) {}
+}
+impl Rx {
+    async fn recv(&mut self) -> Opt<u32> {
+        let v = Later { left: 1, value: self.0 }.await;
+        if v > 0 {
+            self.0 = v - 1;
+            Opt::Some(v)
+        } else {
+            Opt::None
+        }
+    }
+}
+impl<T> Opt<T> {
+    fn is_some(&self) -> bool {
+        match *self {
+            Opt::Some(_) => true,
+            Opt::None => false,
+        }
+    }
+}
+fn channel() -> (Tx, Rx) {
+    (Tx(1), Rx(1))
+}
+struct Permit(u32);
+impl Drop for Permit {
+    fn drop(&mut self) {}
+}
+struct Guard {
+    avail: u32,
+}
+impl Guard {
+    fn try_acquire(&mut self) -> Opt<Permit> {
+        if self.avail > 0 {
+            self.avail = self.avail - 1;
+            Opt::Some(Permit(self.avail + 1))
+        } else {
+            Opt::None
+        }
+    }
+}
+struct ErrObj(u32);
+impl Drop for ErrObj {
+    fn drop(&mut self) {}
+}
+enum Accept<S> {
+    Shutdown,
+    Established { stream: Stream, stop: S },
+    Err((ErrObj, S)),
+}
+async fn try_accept<S>(n: &mut u32, stop: S) -> Accept<S> {
+    let k = Later { left: 1, value: *n }.await;
+    *n = k + 1;
+    match k {
+        0 => Accept::Established { stream: Stream(10), stop },
+        1 => Accept::Established { stream: Stream(20), stop },
+        2 => Accept::Err((ErrObj(7), stop)),
+        _ => Accept::Shutdown,
+    }
+}
+async fn backoff<S>(err: &ErrObj, stop: S) -> Opt<S> {
+    let _ = Later { left: 1, value: err.0 }.await;
+    Opt::Some(stop)
+}
+async fn start_inner(srv: Server, on_ready: OnReady) -> u32 {
+    let mut listener = match if srv.endpoint == 0 { Res::Ok(0u32) } else { Res::Err(ErrObj(1)) } {
+        Res::Ok(l) => l,
+        Res::Err(err) => {
+            on_ready.send(Res::Err(err)).ok();
+            return 0;
+        }
+    };
+    on_ready.send(Res::Ok(())).ok();
+    let mut guard = Guard { avail: 1 };
+    let stopped = StopFut(0u32);
+    let mut stopped = {
+        super let mut pinned = PinMacroHelper { value: stopped };
+        pin_new_unchecked(&mut pinned.value)
+    };
+    let (drop_on_completion, mut awaiter) = channel();
+    let mut sum = 0u32;
+    loop {
+        match try_accept(&mut listener, stopped).await {
+            Accept::Established { stream, stop } => {
+                let Opt::Some(permit) = guard.try_acquire() else {
+                    let (_r, mut w) = stream.split();
+                    let _ = w.write_all(b\"too many\").await;
+                    stopped = stop;
+                    continue;
+                };
+                sum = sum + stream.0 + permit.0;
+                stopped = stop;
+            }
+            Accept::Shutdown => break,
+            Accept::Err((err, stop)) => {
+                let Opt::Some(stop) = backoff(&err, stop).await else { break };
+                stopped = stop;
+            }
+        }
+    }
+    my_drop(drop_on_completion);
+    while awaiter.recv().await.is_some() {}
+    let _ = srv.cfg.0;
+    sum
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    block_on(start_inner(Server { endpoint: 0, cfg: ErrObj(2) }, OnReady(1))) as i32
+}
+");
+    println!("IPC START INNER: {got:?}");
+    assert_eq!(got, Ok(11));
+}

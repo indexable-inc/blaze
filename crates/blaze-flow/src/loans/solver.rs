@@ -164,7 +164,9 @@ struct Scratch<A: Allocator> {
     component_loans: Vec<u64, A>,
     closed: Vec<LoanWord, A>,
     live_loans: Vec<u64, A>,
+    live_words: Vec<u32, A>,
     killed: Vec<u64, A>,
+    killed_words: Vec<u32, A>,
     returned: Vec<u64, A>,
     return_origin: Vec<bool, A>,
     placeholders: Vec<Origin, A>,
@@ -183,10 +185,118 @@ impl<A: Allocator + Copy> Scratch<A> {
             graph: Components::new(alloc), component_loans: Vec::new_in(alloc),
             closed: Vec::new_in(alloc), placeholders: Vec::new_in(alloc),
             live_loans: Vec::from_elem_in(0, words, alloc),
+            live_words: Vec::new_in(alloc),
             killed: Vec::from_elem_in(0, words, alloc),
+            killed_words: Vec::new_in(alloc),
             returned: Vec::from_elem_in(0, words, alloc), return_origin,
             invalid: BTreeSet::new_in(alloc), first: BTreeMap::new_in(alloc),
         }
+    }
+
+    #[inline]
+    fn clear_killed(&mut self) {
+        for &w in &self.killed_words {
+            self.killed[w as usize] = 0;
+        }
+        self.killed_words.clear();
+    }
+
+    #[inline]
+    fn clear_live(&mut self) {
+        for &w in &self.live_words {
+            self.live_loans[w as usize] = 0;
+        }
+        self.live_words.clear();
+    }
+
+    /// Checks accesses and kills at `Start(s)` against the currently populated `self.live_loans` /
+    /// `self.live_words`, iterating whichever of `(live loans, loans on local)` is smaller.
+    fn check_start_accesses_and_kills(
+        &mut self,
+        p: Point,
+        flow: &Flow<A>,
+        facts: &Facts<A>,
+        keep: &Candidates<A>,
+        total_live: usize,
+        meter: &mut Meter,
+    ) -> Result<(), Exhausted> {
+        let stmt = p.stmt();
+        let mut result = Ok(());
+        for_each_access(flow, stmt, |a| {
+            if result.is_err() { return; }
+            let acc_local = flow.place(a.place).local;
+            let loans = keep.places.row(acc_local.index());
+            if loans.is_empty() { return; }
+            if total_live < loans.len() {
+                result = meter.charge(1 + total_live);
+                if result.is_err() { return; }
+                for &w in &self.live_words {
+                    let mut bits = self.live_loans[w as usize];
+                    let base = (w as usize) * 64;
+                    while bits != 0 {
+                        let l = base + bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let loan = Loan(l as u32);
+                        if flow.place(flow.loan(loan).place).local == acc_local
+                            && conflicts(flow, loan, a, facts.is_active(flow, stmt, loan))
+                        {
+                            self.invalid.insert((p, loan));
+                        }
+                    }
+                }
+            } else {
+                result = meter.charge(1 + loans.len());
+                if result.is_err() { return; }
+                for &loan in loans {
+                    if bits::test(&self.live_loans, loan.index())
+                        && conflicts(flow, loan, a, facts.is_active(flow, stmt, loan))
+                    {
+                        self.invalid.insert((p, loan));
+                    }
+                }
+            }
+        });
+        result?;
+        // Kills apply to Start -> Mid only, after recording the invalidation.
+        if let StmtKind::Assign { dest, .. } | StmtKind::Call { dest, .. } = flow.stmt(stmt).kind {
+            let dest_local = flow.place(dest).local;
+            let loans = keep.places.row(dest_local.index());
+            if !loans.is_empty() {
+                if total_live < loans.len() {
+                    meter.charge(total_live)?;
+                    for &w in &self.live_words {
+                        let mut bits = self.live_loans[w as usize];
+                        let base = (w as usize) * 64;
+                        while bits != 0 {
+                            let l = base + bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let loan = Loan(l as u32);
+                            if flow.place(flow.loan(loan).place).local == dest_local
+                                && kills(flow, stmt, loan)
+                            {
+                                let kw = l / 64;
+                                if self.killed[kw] == 0 {
+                                    self.killed_words.push(kw as u32);
+                                }
+                                bits::put(&mut self.killed, l, true);
+                            }
+                        }
+                    }
+                } else {
+                    meter.charge(loans.len())?;
+                    for &loan in loans {
+                        if bits::test(&self.live_loans, loan.index()) && kills(flow, stmt, loan) {
+                            let kw = loan.index() / 64;
+                            if self.killed[kw] == 0 {
+                                self.killed_words.push(kw as u32);
+                            }
+                            bits::put(&mut self.killed, loan.index(), true);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn close_loans(&mut self, rows: &[LoanWord], plant: Plant, meter: &mut Meter) -> Result<(), Exhausted> {
@@ -259,51 +369,85 @@ impl<A: Allocator + Copy> Scratch<A> {
             }
         }
         if self.closed.is_empty() { return Ok(()); }
-        let stmt = p.stmt();
         meter.charge(self.closed.len())?;
+        let mut total_live = 0usize;
         for row in &self.closed {
             if self.return_origin[row.origin.index()] {
                 self.returned[row.word as usize] |= row.bits;
             }
             // All input to a Start crossed an edge filtered by that Start's liveness.
             // A subset at Start also has two live endpoints. Mid issues need not be live.
-            if !p.is_mid() { self.live_loans[row.word as usize] |= row.bits; }
-        }
-        if !p.is_mid() {
-            let mut result = Ok(());
-            for_each_access(flow, stmt, |a| {
-                if result.is_err() { return; }
-                let loans = keep.places.row(flow.place(a.place).local.index());
-                result = meter.charge(1 + loans.len());
-                if result.is_err() { return; }
-                for &loan in loans {
-                    if bits::test(&self.live_loans, loan.index())
-                        && conflicts(flow, loan, a, facts.active.get(stmt.index(), loan.index()))
-                    {
-                        self.invalid.insert((p, loan));
+            if !p.is_mid() {
+                let w = row.word as usize;
+                let was = self.live_loans[w];
+                let next = was | row.bits;
+                if next != was {
+                    if was == 0 {
+                        self.live_words.push(row.word);
                     }
-                }
-            });
-            result?;
-            // Kills apply to Start -> Mid only, after recording the invalidation.
-            if let StmtKind::Assign { dest, .. } | StmtKind::Call { dest, .. } = flow.stmt(stmt).kind {
-                let loans = keep.places.row(flow.place(dest).local.index());
-                meter.charge(loans.len())?;
-                for &loan in loans {
-                    if bits::test(&self.live_loans, loan.index()) && kills(flow, stmt, loan) {
-                        bits::put(&mut self.killed, loan.index(), true);
-                    }
+                    total_live += (next ^ was).count_ones() as usize;
+                    self.live_loans[w] = next;
                 }
             }
+        }
+        if !p.is_mid() {
+            self.check_start_accesses_and_kills(p, flow, facts, keep, total_live, meter)?;
         }
         Ok(())
     }
 
-    fn finish_point(&mut self) {
-        for row in &self.closed {
-            self.live_loans[row.word as usize] = 0;
-            self.killed[row.word as usize] = 0;
+    /// Observe a `Start(s)` whose input is already closed and came from a single earlier
+    /// predecessor: `returned` and `first` were already updated there, so only accesses and
+    /// kills on kept locals need checking. Returns whether any loan was killed.
+    fn observe_start_closed(
+        &mut self,
+        p: Point,
+        flow: &Flow<A>,
+        facts: &Facts<A>,
+        keep: &Candidates<A>,
+        rows: &[LoanWord],
+        meter: &mut Meter,
+    ) -> Result<bool, Exhausted> {
+        if rows.is_empty() {
+            return Ok(false);
         }
+        let stmt = p.stmt();
+        let mut touches = false;
+        for_each_access(flow, stmt, |a| {
+            if !touches && !keep.places.row(flow.place(a.place).local.index()).is_empty() {
+                touches = true;
+            }
+        });
+        if !touches {
+            if let StmtKind::Assign { dest, .. } | StmtKind::Call { dest, .. } = flow.stmt(stmt).kind {
+                touches = !keep.places.row(flow.place(dest).local.index()).is_empty();
+            }
+        }
+        if !touches {
+            return Ok(false);
+        }
+        meter.charge(rows.len())?;
+        let mut total_live = 0usize;
+        for row in rows {
+            let w = row.word as usize;
+            let was = self.live_loans[w];
+            let next = was | row.bits;
+            if next != was {
+                if was == 0 {
+                    self.live_words.push(row.word);
+                }
+                total_live += (next ^ was).count_ones() as usize;
+                self.live_loans[w] = next;
+            }
+        }
+        self.check_start_accesses_and_kills(p, flow, facts, keep, total_live, meter)?;
+        self.clear_live();
+        Ok(!self.killed_words.is_empty())
+    }
+
+    fn finish_point(&mut self) {
+        self.clear_live();
+        self.clear_killed();
     }
 }
 
@@ -316,30 +460,86 @@ pub(super) fn solve<A: Allocator + Copy, N>(
     })
 }
 
+fn deliver<A: Allocator + Copy>(
+    p: usize,
+    q: usize,
+    edges: &[Edge],
+    loans: &[LoanWord],
+    inputs: &mut Inputs<A>,
+    merge: &mut Input<A>,
+    in_degree: &[u8],
+    has_seed: &[bool],
+    closed_input: &mut [bool],
+    cfg: &mut Points<A>,
+    meter: &mut Meter,
+) -> Result<(), Exhausted> {
+    if inputs.slot[q].is_none() {
+        meter.charge(edges.len().saturating_add(loans.len()))?;
+        let dst = inputs.at(q);
+        dst.edges.extend_from_slice(edges);
+        dst.loans.extend_from_slice(loans);
+        closed_input[q] = in_degree[q] == 1 && !has_seed[q] && p < q;
+        cfg.schedule(q);
+        return Ok(());
+    }
+    closed_input[q] = false;
+    let dst = inputs.at(q);
+    let edges_grew = join(&mut dst.edges, edges, &mut merge.edges, |e| *e, |_, _| false, meter)?;
+    let loans_grew = join(
+        &mut dst.loans,
+        loans,
+        &mut merge.loans,
+        LoanWord::key,
+        |dst, src| {
+            let old = dst.bits;
+            dst.bits |= src.bits;
+            dst.bits != old
+        },
+        meter,
+    )?;
+    if edges_grew || loans_grew {
+        cfg.schedule(q);
+    }
+    Ok(())
+}
+
 fn run<A: Allocator + Copy>(
     flow: &Flow<A>, facts: &Facts<A>, plant: Plant, alloc: A, meter: &mut Meter,
 ) -> Result<Vec<BorrowFinding, A>, Exhausted> {
     let keep = candidates(flow, facts, plant, meter, alloc)?;
     let mut out = Vec::new_in(alloc);
     if !keep.origins.iter().any(|&keep| keep) { return Ok(out); }
+    let points = flow.stmts.len() * 2;
     let mut cfg = Points::new(flow, meter, alloc)?;
-    let mut inputs = Inputs::new(flow.stmts.len() * 2, alloc);
+    let mut in_degree = Vec::from_elem_in(0u8, points, alloc);
+    for p in 0..points {
+        for &q in cfg.successors(p) {
+            in_degree[q] = in_degree[q].saturating_add(1).min(2);
+        }
+    }
+    let mut inputs = Inputs::new(points, alloc);
+    let mut has_seed = Vec::from_elem_in(false, points, alloc);
+    let mut closed_input = Vec::from_elem_in(false, points, alloc);
     meter.charge(flow.subsets.len())?;
     for &(s, a, b) in &flow.subsets {
         if a != b && keep.origins[a.index()] && keep.origins[b.index()] {
-            inputs.at(Point::mid(s).index()).edges.push((a, b));
+            let mid = Point::mid(s).index();
+            has_seed[mid] = true;
+            inputs.at(mid).edges.push((a, b));
         }
     }
     for (l, row) in flow.loans.iter().enumerate() {
         if keep.loans[l] {
-            inputs.at(Point::mid(row.at).index()).loans.push(LoanWord {
+            let mid = Point::mid(row.at).index();
+            has_seed[mid] = true;
+            inputs.at(mid).loans.push(LoanWord {
                 word: (l / 64) as u32, origin: row.origin, bits: 1 << (l % 64),
             });
         }
     }
     for row in &mut inputs.rows { row.normalize(meter)?; }
 
-    let check_placeholders = plant != Plant::AllKnown && flow.placeholder.iter().filter(|p| **p).take(2).count() == 2;
+    let check_placeholders = keep.check_placeholders;
     let mut known = Components::new(alloc);
     if check_placeholders && plant != Plant::KnownIgnored && !flow.known.is_empty() {
         known.build(&flow.known, meter)?;
@@ -359,36 +559,180 @@ fn run<A: Allocator + Copy>(
         let Some(id) = inputs.slot[p] else { continue; };
         let slot = id.get() - 1;
         mem::swap(&mut inputs.rows[slot], &mut source);
-        scratch.graph.build(&source.edges, meter)?;
-        scratch.close_loans(&source.loans, plant, meter)?;
-        scratch.observe(Point(p as u32), flow, facts, &keep, &known, check_placeholders, meter)?;
-        for edge in 0..cfg.successors(p).len() {
-            meter.charge(1)?;
-            let q = cfg.successors(p)[edge];
-            let live = facts.live.row(q);
-            sent.clear();
-            scratch.graph.project(live, &mut sent.edges, meter)?;
-            meter.charge(scratch.closed.len())?;
-            for row in &scratch.closed {
-                let bits = row.bits & !scratch.killed[row.word as usize];
-                if bits != 0 && bits::test(live, row.origin.index()) {
-                    sent.loans.push(LoanWord { bits, ..*row });
+        let pt = Point(p as u32);
+        let revisit = cfg.can_revisit(p);
+
+        if closed_input[p] {
+            if !pt.is_mid() {
+                // `Start(s)` with already-closed input from a single earlier predecessor:
+                // its sole successor is `Mid(s) = p + 1`, and `live(Start(s)) ⊆ live(Mid(s))`.
+                let any_killed = scratch.observe_start_closed(pt, flow, facts, &keep, &source.loans, meter)?;
+                let q = p + 1;
+                if !revisit && inputs.slot[q].is_none() {
+                    if any_killed {
+                        meter.charge(source.loans.len())?;
+                        let mut write = 0;
+                        for read in 0..source.loans.len() {
+                            let mut row = source.loans[read];
+                            let bits = row.bits & !scratch.killed[row.word as usize];
+                            if bits != 0 {
+                                row.bits = bits;
+                                source.loans[write] = row;
+                                write += 1;
+                            }
+                        }
+                        source.loans.truncate(write);
+                        scratch.clear_killed();
+                    }
+                    if !source.empty() {
+                        mem::swap(&mut inputs.rows[slot], &mut source);
+                        inputs.slot[p] = None;
+                        inputs.slot[q] = Some(id);
+                        closed_input[q] = !has_seed[q];
+                        cfg.schedule(q);
+                        continue;
+                    }
+                } else if any_killed {
+                    sent.clear();
+                    meter.charge(source.edges.len().saturating_add(source.loans.len()))?;
+                    sent.edges.extend_from_slice(&source.edges);
+                    for row in &source.loans {
+                        let bits = row.bits & !scratch.killed[row.word as usize];
+                        if bits != 0 {
+                            sent.loans.push(LoanWord { bits, ..*row });
+                        }
+                    }
+                    scratch.clear_killed();
+                    if !sent.empty() {
+                        deliver(
+                            p, q, &sent.edges, &sent.loans,
+                            &mut inputs, &mut merge, &in_degree, &has_seed,
+                            &mut closed_input, &mut cfg, meter,
+                        )?;
+                    }
+                } else if !source.empty() {
+                    deliver(
+                        p, q, &source.edges, &source.loans,
+                        &mut inputs, &mut merge, &in_degree, &has_seed,
+                        &mut closed_input, &mut cfg, meter,
+                    )?;
+                }
+            } else {
+                // `Mid(s)` with already-closed input (no seeded edges or loans at `Mid(s)`).
+                let succs_len = cfg.successors(p).len();
+                let mut moved = false;
+                if succs_len == 1 && !revisit {
+                    let q = cfg.successors(p)[0];
+                    if inputs.slot[q].is_none() {
+                        let qp = Point(q as u32);
+                        meter.charge(source.edges.len().saturating_add(source.loans.len()))?;
+                        let all_edges_live = source.edges.iter().all(|&(a, b)| {
+                            facts.is_live(flow, qp, a) && facts.is_live(flow, qp, b)
+                        });
+                        let all_loans_live = all_edges_live
+                            && source.loans.iter().all(|row| facts.is_live(flow, qp, row.origin));
+                        if all_loans_live {
+                            mem::swap(&mut inputs.rows[slot], &mut source);
+                            inputs.slot[p] = None;
+                            inputs.slot[q] = Some(id);
+                            closed_input[q] = in_degree[q] == 1 && !has_seed[q] && p < q;
+                            cfg.schedule(q);
+                            moved = true;
+                        }
+                    }
+                }
+                if moved {
+                    continue;
+                }
+                let mut built_graph = false;
+                for edge in 0..succs_len {
+                    meter.charge(1)?;
+                    let q = cfg.successors(p)[edge];
+                    let qp = Point(q as u32);
+                    meter.charge(source.edges.len().saturating_add(source.loans.len()))?;
+                    let all_edges_live = source.edges.iter().all(|&(a, b)| {
+                        facts.is_live(flow, qp, a) && facts.is_live(flow, qp, b)
+                    });
+                    let all_loans_live =
+                        source.loans.iter().all(|row| facts.is_live(flow, qp, row.origin));
+                    if all_edges_live && all_loans_live {
+                        deliver(
+                            p, q, &source.edges, &source.loans,
+                            &mut inputs, &mut merge, &in_degree, &has_seed,
+                            &mut closed_input, &mut cfg, meter,
+                        )?;
+                        continue;
+                    }
+                    sent.clear();
+                    if all_edges_live {
+                        sent.edges.extend_from_slice(&source.edges);
+                    } else {
+                        if !built_graph {
+                            scratch.graph.build(&source.edges, meter)?;
+                            built_graph = true;
+                        }
+                        scratch.graph.project(|o| facts.is_live(flow, qp, o), &mut sent.edges, meter)?;
+                        meter.sort(sent.edges.len())?;
+                        sent.edges.sort_unstable();
+                        sent.edges.dedup();
+                    }
+                    for row in &source.loans {
+                        if facts.is_live(flow, qp, row.origin) {
+                            sent.loans.push(*row);
+                        }
+                    }
+                    if sent.empty() {
+                        continue;
+                    }
+                    deliver(
+                        p, q, &sent.edges, &sent.loans,
+                        &mut inputs, &mut merge, &in_degree, &has_seed,
+                        &mut closed_input, &mut cfg, meter,
+                    )?;
                 }
             }
-            if sent.empty() { continue; }
-            sent.normalize(meter)?;
-            let dst = inputs.at(q);
-            let edges = join(&mut dst.edges, &sent.edges, &mut merge.edges, |e| *e, |_, _| false, meter)?;
-            let loans = join(&mut dst.loans, &sent.loans, &mut merge.loans, LoanWord::key, |dst, src| {
-                let old = dst.bits;
-                dst.bits |= src.bits;
-                dst.bits != old
-            }, meter)?;
-            if edges || loans { cfg.schedule(q); }
+        } else {
+            scratch.graph.build(&source.edges, meter)?;
+            scratch.close_loans(&source.loans, plant, meter)?;
+            scratch.observe(pt, flow, facts, &keep, &known, check_placeholders, meter)?;
+            let is_start = !pt.is_mid();
+            for edge in 0..cfg.successors(p).len() {
+                meter.charge(1)?;
+                let q = cfg.successors(p)[edge];
+                let qp = Point(q as u32);
+                sent.clear();
+                if is_start {
+                    // `Start(s) -> Mid(s)`: every origin live at `Start(s)` is live at `Mid(s)`.
+                    scratch.graph.project(|_| true, &mut sent.edges, meter)?;
+                    meter.charge(scratch.closed.len())?;
+                    for row in &scratch.closed {
+                        let bits = row.bits & !scratch.killed[row.word as usize];
+                        if bits != 0 {
+                            sent.loans.push(LoanWord { bits, ..*row });
+                        }
+                    }
+                } else {
+                    scratch.graph.project(|o| facts.is_live(flow, qp, o), &mut sent.edges, meter)?;
+                    meter.charge(scratch.closed.len())?;
+                    for row in &scratch.closed {
+                        let bits = row.bits & !scratch.killed[row.word as usize];
+                        if bits != 0 && facts.is_live(flow, qp, row.origin) {
+                            sent.loans.push(LoanWord { bits, ..*row });
+                        }
+                    }
+                }
+                if sent.empty() { continue; }
+                sent.normalize(meter)?;
+                deliver(
+                    p, q, &sent.edges, &sent.loans,
+                    &mut inputs, &mut merge, &in_degree, &has_seed,
+                    &mut closed_input, &mut cfg, meter,
+                )?;
+            }
+            scratch.finish_point();
         }
-        scratch.finish_point();
         // Start -> Mid and Mid -> Start always have distinct IDs, even on a self-loop.
-        if !cfg.can_revisit(p) {
+        if !revisit {
             source.clear();
             inputs.slot[p] = None;
             inputs.free.push(slot);

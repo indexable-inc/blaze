@@ -875,6 +875,97 @@ fn proj_clause_of<'v>(heads: &dyn RegionTypes, views: &'v [ClauseView<'v>], p: u
     })
 }
 
+/// Outcome of [`Lower::unsize_via_borrow`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnsizeBorrow {
+    /// `T: 'q` and every trait/projection predicate of `dyn ...` were proven through `blaze-borrow`
+    /// and all resulting constraints were emitted to `self.b`. `closures_tied` is `true` when
+    /// every closure of this body inside `from_inner` had its signature laid for `blaze-borrow`.
+    Proven { closures_tied: bool },
+    /// At least one predicate could not be resolved (for example, no impl selection row was filed
+    /// yet); no constraint was emitted to `self.b`.
+    Unresolved,
+}
+
+/// Synthetic subject-first projection node built from an existential `dyn` `ExProj` predicate
+/// (`args` holds `[subject, orig_args...]`) so `blaze-borrow`'s `Clause::ProjOf` proves it through
+/// the exact same impl-header, impl-where, and associated-type normalization engine as calls.
+struct UnsizeProj<'t> {
+    synth: PTy,
+    orig: PTy,
+    args: &'t [PTy],
+    term: PTy,
+}
+
+/// Caller `RegionTypes` extended with synthetic subject-first `ExProj` nodes for one unsizing.
+struct UnsizeTypes<'t> {
+    inner: BodyTypes<'t>,
+    projs: &'t [UnsizeProj<'t>],
+}
+
+impl RegionTypes for UnsizeTypes<'_> {
+    fn node(&self, ty: PTy) -> Result<PNode, blaze_borrow::Unknown> {
+        if let Some(p) = self.projs.iter().find(|p| p.synth == ty) {
+            return self.inner.node(p.orig);
+        }
+        self.inner.node(ty)
+    }
+    fn own(&self, ty: PTy) -> Result<SlotCount, blaze_borrow::Unknown> {
+        if let Some(p) = self.projs.iter().find(|p| p.synth == ty) {
+            return self.inner.own(p.orig);
+        }
+        self.inner.own(ty)
+    }
+    fn kids(&self, ty: PTy) -> Result<blaze_borrow::Kids<'_>, blaze_borrow::Unknown> {
+        if let Some(p) = self.projs.iter().find(|p| p.synth == ty) {
+            return Ok(blaze_borrow::Kids::ListThen(p.args, p.term));
+        }
+        self.inner.kids(ty)
+    }
+    fn adt_variances(&self, adt: ItemKey) -> Option<&[Variance]> {
+        self.inner.adt_variances(adt)
+    }
+}
+
+/// Buffering constraint sink for [`Lower::unsize_via_borrow`]: collects `subset` pairs and only
+/// flushes them into `Builder` if every predicate of the trait object succeeds.
+struct BufferedSink<'s, A: Allocator + Copy> {
+    b: &'s mut Builder<A>,
+    static_: Origin,
+    dyn_ph: &'s mut Vec<Origin, A>,
+    subsets: &'s mut Vec<(Origin, Origin), A>,
+}
+
+impl<A: Allocator + Copy> Constraints for BufferedSink<'_, A> {
+    fn subset(&mut self, a: Origin, b: Origin) {
+        self.subsets.push((a, b));
+    }
+    fn outlives_static(&mut self, a: Origin) {
+        self.subsets.push((a, self.static_));
+    }
+    fn fresh(&mut self, kind: Kind) -> Origin {
+        let o = self.b.origin(kind == Kind::Placeholder);
+        if kind == Kind::Placeholder {
+            self.b.known(self.static_, o);
+        }
+        o
+    }
+    fn dyn_placeholder(&mut self, ordinal: u32) -> Origin {
+        let Ok(idx) = usize::try_from(ordinal) else { return self.fresh(Kind::Placeholder) };
+        if let Some(&o) = self.dyn_ph.get(idx) {
+            return o;
+        }
+        let mut last = self.static_;
+        while self.dyn_ph.len() <= idx {
+            let o = self.b.origin(true);
+            self.b.known(self.static_, o);
+            self.dyn_ph.push(o);
+            last = o;
+        }
+        last
+    }
+}
+
 /// The one rule's constraints into the lowering's builder, at the call statement it pushed.
 struct Sink<'s, A: Allocator + Copy> {
     b: &'s mut Builder<A>,
@@ -1382,7 +1473,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 self.captured_params(t, e, &mut sc.one)?;
                 let (Ok(start), Ok(len)) = (u32::try_from(sc.held.len()), u32::try_from(sc.one.len())) else { return Ok(false) };
                 for &p in sc.one.iter() {
-                    if !sc.seen.contains(&p) {
+                    if sc.seen.scan_for(&p).is_none() {
                         sc.seen.push(p);
                     }
                     sc.held.push(p);
@@ -1453,6 +1544,328 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 ok
             };
             Ok(call_res.is_ok())
+        })();
+        self.call_scratch = Some(sc);
+        res
+    }
+
+    /// Proves unsizing `from_inner -> dyn <preds> + 'q` (with `s` / `d` holding the outer
+    /// container's slots and `ref_skip` leading slots for `&` / `&mut`) through `blaze-borrow`'s
+    /// one-rule clause solver:
+    ///
+    /// 1. `from_inner: 'q` (`Clause::TypeOutlives`, full RFC 1214 outlives components including
+    ///    caller type parameters and closure/future captures);
+    /// 2. every `ExTrait(k, args)` predicate (`Clause::Trait`, walking the selected impl's header
+    ///    and its `impl_where` clauses, or the caller's own bounds / supertraits / builtin `Fn*`);
+    /// 3. every `ExProj { trait_, name, args, term }` predicate (`Clause::ProjOf` via
+    ///    [`UnsizeTypes`], relating `<from_inner as trait_<args>>::name == term` invariantly and
+    ///    checking `impl_where`).
+    ///
+    /// Constraints are buffered and only flushed (along with covariant outer `'r: 's` when
+    /// `ref_skip == 1`) if every predicate succeeds; on any unresolved predicate this emits nothing
+    /// and returns [`UnsizeBorrow::Unresolved`].
+    #[expect(clippy::too_many_arguments, reason = "source/dest slot ranges, inner types, predicates, ref skip and site")]
+    pub(crate) fn unsize_via_borrow(
+        &mut self,
+        s: PInfo,
+        from_inner: PTy,
+        d: PInfo,
+        obj: PTy,
+        preds: List,
+        ref_skip: u32,
+        e: ExprId,
+    ) -> Result<UnsizeBorrow, Refusal> {
+        if !<R::Grain as Grain>::SLOTS || !s.exact || !d.exact || s.len < ref_skip || d.len < ref_skip + 1 {
+            return Ok(UnsizeBorrow::Unresolved);
+        }
+        let from_start = s.start + ref_skip;
+        let from_len = s.len - ref_skip;
+        let Some(&q_origin) = usize::try_from(d.start + ref_skip).ok().and_then(|i| self.origs.get(i)) else {
+            return Ok(UnsizeBorrow::Unresolved);
+        };
+        let mut pred_spans: Vec<(PTy, u32, u32), A> = Vec::new_in(self.alloc);
+        let mut pred_at = d.start + ref_skip + 1;
+        for &pred in self.list(preds, e)? {
+            let pn = self.npos(pred, e)?;
+            if pred_at.checked_add(pn).is_none_or(|end| end > d.start + d.len) {
+                return Ok(UnsizeBorrow::Unresolved);
+            }
+            pred_spans.push((pred, pred_at, pn));
+            pred_at += pn;
+        }
+        if pred_at != d.start + d.len {
+            return Ok(UnsizeBorrow::Unresolved);
+        }
+        let mut sc = self.call_scratch.take().unwrap_or_else(|| CallOneScratch::new_in(self.alloc));
+        sc.clear();
+        let res = (|| -> Result<UnsizeBorrow, Refusal> {
+            let facts: &'b F = self.facts;
+            let arity = FactsArity { facts };
+            self.body_slots(from_inner, &mut sc.bodies, e)?;
+            self.body_slots(obj, &mut sc.bodies, e)?;
+            let mut bi = 0usize;
+            while bi < sc.bodies.len() {
+                let bt = sc.bodies[bi].0;
+                bi += 1;
+                if let PNode::Closure { owner, ordinal, .. } = self.node(bt, e)?
+                    && owner == self.body.owner
+                    && let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
+                {
+                    self.body_slots(sig_ty, &mut sc.bodies, e)?;
+                }
+            }
+            let caller_base = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &sc.bodies);
+            if caller_base.count(from_inner) != Ok(SlotCount::new(from_len)) {
+                return Ok(UnsizeBorrow::Unresolved);
+            }
+            self.note_params(from_inner, e, &mut sc.seen)?;
+            self.note_params(obj, e, &mut sc.seen)?;
+            let mut all_closures_laid = true;
+            for &(t, total_slots) in sc.bodies.iter() {
+                sc.one.clear();
+                self.captured_params(t, e, &mut sc.one)?;
+                let (Ok(start), Ok(len)) = (u32::try_from(sc.held.len()), u32::try_from(sc.one.len())) else {
+                    return Ok(UnsizeBorrow::Unresolved);
+                };
+                for &p in sc.one.iter() {
+                    if sc.seen.scan_for(&p).is_none() {
+                        sc.seen.push(p);
+                    }
+                    sc.held.push(p);
+                }
+                sc.body_rows.push((t, start, len));
+                if let PNode::Closure { owner, ordinal, .. } = self.node(t, e)?
+                    && owner == self.body.owner
+                    && !sc.closure_rows.iter().any(|r| r.0 == ordinal)
+                {
+                    let mut laid = false;
+                    if let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
+                        && self.sig_slots(ordinal as usize, e, &mut sc.sslots).is_ok()
+                        && caller_base.count(sig_ty) == Ok(SlotCount::new(sc.sslots.len() as u32))
+                    {
+                        let mut nsig = 0u32;
+                        let mut max_late = 0u32;
+                        for &sl in sc.sslots.iter() {
+                            match sl {
+                                crate::closure::SigSlot::Owner(j) => nsig = nsig.max(j + 1),
+                                crate::closure::SigSlot::Late(Some((0, v))) => max_late = max_late.max(v + 1),
+                                _ => {}
+                            }
+                        }
+                        if let Some(ncap) = total_slots.get().checked_sub(nsig) {
+                            let rstart = u32::try_from(sc.closure_regs.len()).unwrap_or(u32::MAX);
+                            let mut next_late = max_late;
+                            for &sl in sc.sslots.iter() {
+                                sc.closure_regs.push(match sl {
+                                    crate::closure::SigSlot::Owner(j) => Region::Param(j),
+                                    crate::closure::SigSlot::Static => Region::Static,
+                                    crate::closure::SigSlot::Late(Some((binder, var))) | crate::closure::SigSlot::InnerBound(binder, var) => {
+                                        Region::Late { binder, var }
+                                    }
+                                    crate::closure::SigSlot::Late(None) => {
+                                        let var = next_late;
+                                        next_late += 1;
+                                        Region::Late { binder: 0, var }
+                                    }
+                                });
+                            }
+                            let rlen = sc.sslots.len() as u32;
+                            sc.closure_rows.push((ordinal, sig_ty, ncap, nsig, rstart, rlen));
+                            laid = true;
+                        }
+                    }
+                    if !laid {
+                        all_closures_laid = false;
+                    }
+                }
+            }
+            let push_origs = |origs: &[Origin], col: &mut Vec<Origin, A>, start: u32, len: u32| -> Option<SlotRange> {
+                let lo = usize::try_from(start).ok()?;
+                let hi = lo.checked_add(usize::try_from(len).ok()?)?;
+                let slice = origs.get(lo..hi)?;
+                let col_start = u32::try_from(col.len()).ok()?;
+                col.extend_from_slice(slice);
+                SlotRange::new(Slot::new(col_start), SlotCount::new(len))
+            };
+            let Some(from_range) = push_origs(&self.origs, &mut sc.col, from_start, from_len) else {
+                return Ok(UnsizeBorrow::Unresolved);
+            };
+            let from_arg = Arg { ty: from_inner, at: from_range };
+            let Some(q_idx) = u32::try_from(sc.col.len()).ok() else {
+                return Ok(UnsizeBorrow::Unresolved);
+            };
+            sc.col.push(q_origin);
+            let q_slot = Slot::new(q_idx);
+
+            let mut ex_trait_slots: Vec<(ItemKey, u32, u32), A> = Vec::new_in(self.alloc);
+            for &(pred, pred_start, pred_len) in pred_spans.iter() {
+                if let PNode::ExTrait(k, _) = self.node(pred, e)?
+                    && let Some(tl) = facts.trait_lifetimes(k)
+                    && tl > 0
+                    && tl <= pred_len
+                {
+                    ex_trait_slots.push((k, pred_start, tl));
+                }
+            }
+
+            let mut clauses: Vec<blaze_borrow::Clause<'_>, A> = Vec::new_in(self.alloc);
+            clauses.push(blaze_borrow::Clause::TypeOutlives {
+                subject: blaze_borrow::Side::caller(from_arg),
+                region: blaze_borrow::Reg::Slot(q_slot),
+            });
+            let mut ex_proj_args_buf: Vec<PTy, A> = Vec::new_in(self.alloc);
+            let mut ex_proj_meta: Vec<(PTy, PTy, usize, usize, PTy), A> = Vec::new_in(self.alloc);
+            let mut extra_eqs: Vec<(Origin, Origin), A> = Vec::new_in(self.alloc);
+
+            for &(pred, pred_start, pred_len) in pred_spans.iter() {
+                match self.node(pred, e)? {
+                    PNode::ExAuto(_) => {}
+                    PNode::ExTrait(_, _) => {
+                        if caller_base.count(pred) != Ok(SlotCount::new(pred_len)) {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        }
+                        let Some(pred_range) = push_origs(&self.origs, &mut sc.col, pred_start, pred_len) else {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        };
+                        let pred_arg = Arg { ty: pred, at: pred_range };
+                        clauses.push(blaze_borrow::Clause::Trait {
+                            subject: blaze_borrow::Side::caller(from_arg),
+                            trait_ref: blaze_borrow::Side::caller(pred_arg),
+                        });
+                    }
+                    PNode::ExProj { trait_: k, name, args, term } => {
+                        let Some(own) = facts.alias_lifetimes(k, name) else {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        };
+                        if own > pred_len || caller_base.count(pred) != Ok(SlotCount::new(pred_len)) {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        }
+                        let Some(meta_idx) = u32::try_from(ex_proj_meta.len()).ok() else {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        };
+                        let synth = PTy(u32::MAX - meta_idx);
+                        if self.tys.node(synth).is_ok() {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        }
+                        let args_lo = ex_proj_args_buf.len();
+                        ex_proj_args_buf.push(from_inner);
+                        ex_proj_args_buf.extend_from_slice(self.list(args, e)?);
+                        let args_hi = ex_proj_args_buf.len();
+                        ex_proj_meta.push((synth, pred, args_lo, args_hi, term));
+
+                        let Some(col_start) = u32::try_from(sc.col.len()).ok() else {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        };
+                        if push_origs(&self.origs, &mut sc.col, pred_start, own).is_none()
+                            || push_origs(&self.origs, &mut sc.col, from_start, from_len).is_none()
+                            || push_origs(&self.origs, &mut sc.col, pred_start + own, pred_len - own).is_none()
+                        {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        }
+                        let Some(total_proj_len) = from_len.checked_add(pred_len) else {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        };
+                        let Some(synth_range) = SlotRange::new(Slot::new(col_start), SlotCount::new(total_proj_len)) else {
+                            return Ok(UnsizeBorrow::Unresolved);
+                        };
+                        clauses.push(blaze_borrow::Clause::ProjOf {
+                            proj: blaze_borrow::Side::caller(Arg { ty: synth, at: synth_range }),
+                            binders: 0,
+                        });
+                        // `proj_of_in` returns early when `term` is inert (e.g. `Out = u8`), so
+                        // explicitly equate `ExProj`'s leading trait lifetime slots with the
+                        // principal `ExTrait`'s trait lifetime slots.
+                        if let Some(tl) = facts.trait_lifetimes(k)
+                            && tl > 0
+                            && tl <= own
+                            && let Some(&(_, tr_start, tr_tl)) = ex_trait_slots.iter().find(|&&(tk, _, _)| tk == k)
+                            && tr_tl == tl
+                        {
+                            for i in 0..tl {
+                                let (Some(&a), Some(&b)) = (
+                                    usize::try_from(tr_start + i).ok().and_then(|ix| self.origs.get(ix)),
+                                    usize::try_from(pred_start + i).ok().and_then(|ix| self.origs.get(ix)),
+                                ) else {
+                                    return Ok(UnsizeBorrow::Unresolved);
+                                };
+                                extra_eqs.push((a, b));
+                                extra_eqs.push((b, a));
+                            }
+                        }
+                    }
+                    _ => return Ok(UnsizeBorrow::Unresolved),
+                }
+            }
+
+            let mut unsize_projs: Vec<UnsizeProj<'_>, A> = Vec::with_capacity_in(ex_proj_meta.len(), self.alloc);
+            for &(synth, orig, lo, hi, term) in ex_proj_meta.iter() {
+                unsize_projs.push(UnsizeProj { synth, orig, args: &ex_proj_args_buf[lo..hi], term });
+            }
+            let unsize_types = UnsizeTypes { inner: caller_base, projs: &unsize_projs };
+            let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+            let regions = facts.regions();
+            let static_ = self.universal(Region::Static);
+            let owner = self.body.owner;
+            let own_opt = facts.sig(owner).ok();
+            if let Some(own) = own_opt {
+                for i in 0..own.params().count() {
+                    self.universal(Region::Param(i));
+                }
+            }
+            for &p in sc.seen.iter() {
+                self.param_origin(p);
+            }
+            let bounds: &[ClauseView<'_>] = regions.clauses(owner).unwrap_or(&[]);
+            let sel = CallSel { rows: self.ck.call_selections(e), body_rows: &self.ck.selected, facts, tys: self.tys };
+            let mut buffered_subsets: Vec<(Origin, Origin), A> = Vec::new_in(self.alloc);
+            let proven = {
+                let who = CallOwner {
+                    item: owner,
+                    uni: &self.uni,
+                    params: &self.param_origs,
+                    bounds,
+                    sig: own_opt.filter(|_| !self.in_nested).map(|own| {
+                        let c = own.regions().col;
+                        Typed { ty: c.ty(), col: c.as_slice() }
+                    }),
+                    heads: &heads,
+                    bodies: BodyParams { rows: &sc.body_rows, held: &sc.held },
+                    closures: ClosureSigs { rows: &sc.closure_rows, regs: &sc.closure_regs },
+                };
+                let mut sink = BufferedSink {
+                    b: &mut self.b,
+                    static_,
+                    dyn_ph: &mut self.dyn_bound_placeholders,
+                    subsets: &mut buffered_subsets,
+                };
+                let mut cx = Cx { types: &unsize_types, sig_types: &heads, selected: &sel, owner: &who, origins: &sc.col, out: &mut sink };
+                let mut inst = blaze_borrow::Inst {
+                    item: owner,
+                    inputs: Vec::new_in(self.alloc),
+                    output: blaze_borrow::Side::caller(from_arg),
+                    clauses,
+                    envs: blaze_borrow::Envs::new_in(self.alloc),
+                };
+                blaze_borrow::clauses(&mut cx, &mut inst).is_ok()
+            };
+            if !proven {
+                return Ok(UnsizeBorrow::Unresolved);
+            }
+            if ref_skip == 1
+                && let (Some(&s0), Some(&d0)) = (
+                    usize::try_from(s.start).ok().and_then(|i| self.origs.get(i)),
+                    usize::try_from(d.start).ok().and_then(|i| self.origs.get(i)),
+                )
+            {
+                self.b.subset(s0, d0);
+            }
+            for &(a, b) in buffered_subsets.iter() {
+                self.b.subset(a, b);
+            }
+            for &(a, b) in extra_eqs.iter() {
+                self.b.subset(a, b);
+            }
+            Ok(UnsizeBorrow::Proven { closures_tied: all_closures_laid })
         })();
         self.call_scratch = Some(sc);
         res
