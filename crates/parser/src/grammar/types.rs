@@ -532,12 +532,17 @@ fn path_or_macro_type<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
 
     // test bare_pattern_type
     // type A = E is E::A(..) | E::B;
+    // type B = SemVer is in VERSIONS;
     if kind == PATH_TYPE && p.bare_pattern_types() && p.at_contextual_kw(T![is]) {
-        // `#![blaze::pattern_types]`'s `T is PAT`: the feature gate refuses it in a crate
-        // without the gate, and before the gate `T is` was never a valid type.
+        // `#![blaze::pattern_types]`'s `T is PAT` and `T is in CONST_EXPR`: the feature gate
+        // refuses it in a crate without the gate, and before the gate `T is` was never a valid type.
         let m = path.precede(p);
         p.bump_remap(T![is]);
-        pat_top(p);
+        if p.eat(T![in]) {
+            const_set_arg(p);
+        } else {
+            pat_top(p);
+        }
         m.complete(p, PATTERN_TYPE);
         return;
     }
@@ -622,10 +627,79 @@ fn pattern_type<S: Sink>(p: &mut Parser<'_, S>) {
         if !p.eat_contextual_kw(T![is]) {
             p.error("expected `is`")
         }
-        pat_top(p);
+        if p.eat(T![in]) {
+            const_set_arg(p);
+        } else {
+            pat_top(p);
+        }
         p.expect(T![')']);
         m.complete(p, PATTERN_TYPE);
     } else {
         m.abandon(p);
+    }
+}
+
+/// Parses the const slice/array expression in `T is in CONST_EXPR` wrapped in `CONST_ARG`.
+///
+/// Parses primary/unary const-set forms (`VERSIONS`, `[V1, V2, V3]`, `&[V1, V2]`, `const { .. }`,
+/// `{ .. }`, `(expr)`) without consuming enclosing type delimiters such as `=` (in `let x: T is in
+/// VERSIONS = y;`), `{` (in `fn f() -> T is in VERSIONS { .. }`), `>`, or `|`.
+fn const_set_arg<S: Sink>(p: &mut Parser<'_, S>) {
+    let c = p.start();
+    const_set_expr(p);
+    c.complete(p, CONST_ARG);
+}
+
+fn const_set_expr<S: Sink>(p: &mut Parser<'_, S>) {
+    if p.at(T![&]) {
+        let m = p.start();
+        p.bump(T![&]);
+        const_set_expr(p);
+        m.complete(p, REF_EXPR);
+        return;
+    }
+    match p.current() {
+        T!['['] => {
+            let m = p.start();
+            let mut n_exprs = 0u32;
+            let mut has_semi = false;
+            p.bump(T!['[']);
+            while !p.at(EOF) && !p.at(T![']']) {
+                n_exprs += 1;
+                if expressions::expr(p).is_none() {
+                    break;
+                }
+                if n_exprs == 1 && p.eat(T![;]) {
+                    has_semi = true;
+                    continue;
+                }
+                if has_semi || (!p.at(T![']']) && !p.expect(T![,])) {
+                    break;
+                }
+            }
+            p.expect(T![']']);
+            m.complete(p, ARRAY_EXPR);
+        }
+        T![const] if p.nth_at(1, T!['{']) => {
+            expressions::const_block(p);
+        }
+        T!['{'] => {
+            expressions::block_expr(p);
+        }
+        T!['('] => {
+            let m = p.start();
+            p.bump(T!['(']);
+            expressions::expr(p);
+            p.expect(T![')']);
+            m.complete(p, PAREN_EXPR);
+        }
+        _ if paths::is_path_start(p) => {
+            let m = p.start();
+            paths::expr_path(p);
+            m.complete(p, PATH_EXPR);
+        }
+        _ => {
+            expressions::expr_no_struct(p);
+        }
     }
 }

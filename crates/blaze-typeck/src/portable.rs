@@ -39,11 +39,15 @@ pub enum PNode {
     /// only) an `Infer` hole.
     Array(PTy, PTy),
     Slice(PTy),
-    /// A pattern type `base is PAT` (typeck.md, "Pattern types"): the values of `base` in
-    /// `ranges`, a list of `ConstValue` terms in pairs, `start ..= end` each, canonical (sorted,
-    /// merged, `start > end` a wrapping range). For a raw pointer the values are `usize`s of its
-    /// address (`!null` is `1 ..= usize::MAX`). Equal only to a pattern type with the same base
-    /// and ranges; never to its base.
+    /// A pattern type `base is PAT` (typeck.md, "Pattern types"): either
+    /// - a range pattern (`PortableTys::pattern`): the values of `base` in `ranges`, a list of
+    ///   `ConstValue` terms in pairs, `start ..= end` each, canonical (sorted, merged,
+    ///   `start > end` a wrapping range; for a raw pointer the values are `usize`s of its address),
+    /// - or a finite const value-set pattern (`PortableTys::pattern_const_set`, `T is in CONST`):
+    ///   a leading `PNode::Never` sentinel followed by canonical sorted, deduplicated
+    ///   `ConstValue { ty: u128, bits: digest }` member digests.
+    /// Equal only to a pattern type with the same base and canonical pattern list; never to its
+    /// base.
     Pat(PTy, List),
     /// An ADT and its generic arguments.
     Adt(ItemKey, List),
@@ -437,6 +441,38 @@ impl<'a> PTys<'a> {
     pub fn record_names_iter(&self) -> impl Iterator<Item = &'a Name> + Clone + 'a {
         self.record_names.base.iter().chain(self.record_names.own.iter())
     }
+
+    /// Extracts the base type and canonical sorted 128-bit member digests of a finite const
+    /// value-set pattern type constructed by [`PortableTys::pattern_const_set`]; returns `None`
+    /// for range patterns or any other node.
+    pub fn const_set_parts(&self, pat: PTy) -> Option<(PTy, [u128; MAX_PATTERN_SET_MEMBERS], usize)> {
+        let PNode::Pat(base, list) = *self.get(pat)? else { return None };
+        let items = self.list(list).ok()?;
+        if items.len() < 2 || items.len() - 1 > MAX_PATTERN_SET_MEMBERS {
+            return None;
+        }
+        if !matches!(self.get(items[0]), Some(PNode::Never)) {
+            return None;
+        }
+        let mut out = [0u128; MAX_PATTERN_SET_MEMBERS];
+        let n = items.len() - 1;
+        for (i, &item) in items[1..].iter().enumerate() {
+            let PNode::ConstValue { ty, bits } = *self.get(item)? else { return None };
+            if !matches!(self.get(ty), Some(PNode::Uint(UintTy::U128))) {
+                return None;
+            }
+            out[i] = bits;
+        }
+        Some((base, out, n))
+    }
+
+    /// Whether `sub` and `sup` are canonical finite const value-set pattern types over the same
+    /// base type with `members(sub) ⊆ members(sup)` (`(SemVer is in OLD) <: (SemVer is in ALL)`).
+    pub fn const_set_is_subset(&self, sub: PTy, sup: PTy) -> bool {
+        let Some((sub_base, sub_digests, sub_n)) = self.const_set_parts(sub) else { return false };
+        let Some((sup_base, sup_digests, sup_n)) = self.const_set_parts(sup) else { return false };
+        sub_base == sup_base && sorted_digests_is_subset(&sub_digests[..sub_n], &sup_digests[..sup_n])
+    }
 }
 
 /// Hashed as one table (base then own), so an overlay hashes as the copy it stands for.
@@ -758,6 +794,67 @@ pub fn canonical_ranges(
     let mut out = [(0u128, 0u128); MAX_PATTERN_RANGES];
     out[..m].copy_from_slice(&merged[..m]);
     Ok((out, m))
+}
+
+/// The most members one finite const value-set pattern type (`T is in CONST_SLICE`) holds
+/// (rule 18: bounded stack canonicalization, zero heap allocation).
+pub const MAX_PATTERN_SET_MEMBERS: usize = 64;
+
+/// The canonical form of a finite const value-set pattern's 128-bit member digests
+/// (`PortableTys::pattern_const_set`): sorted ascending and deduplicated into a fixed stack array,
+/// with the count of distinct members. Declaration order and duplicates do not change type
+/// identity. Empty slices are refused (`Malformed::EmptyPatternSet`); more than
+/// `MAX_PATTERN_SET_MEMBERS` inputs is `Limit::PatternSetMembers`.
+pub fn canonical_const_set(
+    member_digests: &[u128],
+) -> Result<([u128; MAX_PATTERN_SET_MEMBERS], usize), CheckError> {
+    if member_digests.is_empty() {
+        return Err(CheckError::Malformed(Malformed::EmptyPatternSet));
+    }
+    if member_digests.len() > MAX_PATTERN_SET_MEMBERS {
+        return Err(CheckError::Limit(crate::error::Limit::PatternSetMembers));
+    }
+    let mut out = [0u128; MAX_PATTERN_SET_MEMBERS];
+    let len = member_digests.len();
+    out[..len].copy_from_slice(member_digests);
+    out[..len].sort_unstable();
+    let mut n = 0;
+    for i in 0..len {
+        if n == 0 || out[i] != out[n - 1] {
+            out[n] = out[i];
+            n += 1;
+        }
+    }
+    Ok((out, n))
+}
+
+/// Whether two non-empty, strictly ascending slices of canonical const-set member digests satisfy
+/// `sub ⊆ sup`. Returns `false` if either slice is empty or not strictly ascending.
+pub(crate) fn sorted_digests_is_subset(sub: &[u128], sup: &[u128]) -> bool {
+    if sub.is_empty() || sup.is_empty() || sub.len() > sup.len() {
+        return false;
+    }
+    for w in sub.windows(2) {
+        if w[0] >= w[1] {
+            return false;
+        }
+    }
+    for w in sup.windows(2) {
+        if w[0] >= w[1] {
+            return false;
+        }
+    }
+    let mut j = 0usize;
+    for &a in sub {
+        while j < sup.len() && sup[j] < a {
+            j += 1;
+        }
+        if j >= sup.len() || sup[j] != a {
+            return false;
+        }
+        j += 1;
+    }
+    true
 }
 
 /// An owned portable table, hash-consed: equal structure is an equal `PTy`, and an equal list
@@ -1559,6 +1656,32 @@ impl<'a> PortableTys<'a> {
             terms[2 * i + 1] = self.intern(PNode::ConstValue { ty: value_ty, bits: end })?;
         }
         let list = self.intern_list(&terms[..2 * n])?;
+        self.intern(PNode::Pat(base, list))
+    }
+
+    /// The finite const value-set pattern type `base is in CONST_SLICE` in its canonical form.
+    /// Each member is identified by its 128-bit canonical structural digest (as computed by
+    /// `blaze_ty::pat_ty::ConstPatMember::digest128`). Digests are sorted and deduplicated by
+    /// [`canonical_const_set`], and stored in `PNode::Pat(base, list)` with a leading
+    /// `PNode::Never` tag followed by `PNode::ConstValue { ty: u128, bits: digest }` nodes, so
+    /// value-set patterns never collide with range patterns ([`PortableTys::pattern`]) and work
+    /// for any `StructuralPartialEq` base type (structs such as `SemVer`, `&str`, tuples, generic
+    /// ADTs, scalars). Refuses empty sets (`Malformed::EmptyPatternSet`) and sets past
+    /// `MAX_PATTERN_SET_MEMBERS` (`Limit::PatternSetMembers`).
+    pub fn pattern_const_set(
+        &mut self,
+        base: PTy,
+        member_digests: &[u128],
+    ) -> Result<PTy, CheckError> {
+        let (digests, n) = canonical_const_set(member_digests)?;
+        let tag = self.intern(PNode::Never)?;
+        let u128_ty = self.intern(PNode::Uint(UintTy::U128))?;
+        let mut terms = [PTy(0); 1 + MAX_PATTERN_SET_MEMBERS];
+        terms[0] = tag;
+        for (i, digest) in digests[..n].iter().copied().enumerate() {
+            terms[1 + i] = self.intern(PNode::ConstValue { ty: u128_ty, bits: digest })?;
+        }
+        let list = self.intern_list(&terms[..1 + n])?;
         self.intern(PNode::Pat(base, list))
     }
 

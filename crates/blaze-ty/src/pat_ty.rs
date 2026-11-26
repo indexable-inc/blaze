@@ -12,6 +12,11 @@
 //!    same-layout variant narrowing ([`VariantPatTy`]) with direct single-variant field access
 //!    (`sole_variant()`), flow-sensitive arm exclusion (`narrow_exclude`), and `&uniq (T is PAT)`
 //!    write guards forbidding whole-value overwrites that could escape `PAT`.
+//! 3. **Finite const value-set pattern types (`SemVer is in VERSIONS`, `&str is in ["1.1.1", "1.2.2"]`)**:
+//!    same-layout canonical sorted deduplicated sets of `StructuralPartialEq` compile-time values
+//!    ([`ConstSetPatTy`]), with free subset subtyping (`OLD <: ALL <: T`), flow-sensitive
+//!    exhaustiveness narrowing (`narrow_exclude` + `missing_members` witnesses), strict `&uniq`
+//!    field-and-whole write guards, and deterministic interning into `TyKind::Pat`.
 
 use core::fmt;
 
@@ -67,6 +72,12 @@ pub enum PatTyError {
     VariantOutOfBounds { variant: u8, total: u8 },
     /// Assigning or swapping the whole value through `&uniq (T is PAT)` could escape `PAT`.
     WholeWriteThroughUniqRef,
+    /// Base type of a finite const value-set pattern type does not implement `StructuralPartialEq`.
+    NotStructuralEq,
+    /// Attempted to exclude or match a value that is not a member of the finite pattern set.
+    ValueNotInPattern,
+    /// Mutating a field through `&uniq (T is in CONST_SLICE)` could escape the finite value set.
+    FieldWriteThroughConstSet,
 }
 
 impl fmt::Display for PatTyError {
@@ -91,6 +102,21 @@ impl fmt::Display for PatTyError {
                 write!(
                     f,
                     "cannot assign or swap the whole value through `&uniq (T is PAT)`; mutate its fields or widen first"
+                )
+            }
+            PatTyError::NotStructuralEq => {
+                write!(
+                    f,
+                    "finite const value-set pattern type requires its base type to implement `StructuralPartialEq`"
+                )
+            }
+            PatTyError::ValueNotInPattern => {
+                write!(f, "constant value is not a member of the pattern type's allowed set")
+            }
+            PatTyError::FieldWriteThroughConstSet => {
+                write!(
+                    f,
+                    "cannot mutate a field through `&uniq (T is in CONST_SLICE)` because the resulting value may leave the allowed set"
                 )
             }
         }
@@ -436,6 +462,291 @@ impl VariantPatTy {
     }
 }
 
+/// One canonical compile-time constant member of a [`ConstSetPatTy`] (e.g. a `SemVer` struct
+/// value encoded by structural fields, a `&str` literal `"1.2.2"`, or a scalar).
+///
+/// Equality and ordering are defined purely on `bytes` (the canonical structural encoding of the
+/// constant value), so two representations of the same value compare equal regardless of display
+/// formatting; `label` is carried for diagnostics (`missing match arm: SemVer { 1, 2, 2 }`).
+#[derive(Clone, Copy, Debug)]
+pub struct ConstPatMember<'s> {
+    bytes: &'s [u8],
+    label: &'s str,
+}
+
+impl<'s> ConstPatMember<'s> {
+    /// Constructs a member from its canonical structural byte encoding and diagnostic label.
+    #[inline]
+    pub const fn from_bytes(bytes: &'s [u8], label: &'s str) -> Self {
+        Self { bytes, label }
+    }
+
+    /// Constructs a member for a string literal (`&str is in ["1.1.1", "1.2.2"]`).
+    #[inline]
+    pub const fn from_str(value: &'s str) -> Self {
+        Self { bytes: value.as_bytes(), label: value }
+    }
+
+    /// Canonical structural byte representation of this constant value.
+    #[inline]
+    pub const fn bytes(self) -> &'s [u8] {
+        self.bytes
+    }
+
+    /// Human-readable label for compiler diagnostics and missing-arm witnesses.
+    #[inline]
+    pub const fn label(self) -> &'s str {
+        self.label
+    }
+
+    /// Deterministic 128-bit domain-separated digest of `self.bytes`, used when interning a
+    /// [`ConstSetPatTy`] into `cx.tys` as `TyKind::Pat(base, list)`.
+    pub const fn digest128(self) -> u128 {
+        // Two independent FNV-1a 64-bit lanes mixed with SplitMix64 finalizers over length + bytes.
+        let mut h1: u64 = 0xcbf2_9ce4_8422_2325 ^ (self.bytes.len() as u64);
+        let mut h2: u64 = 0xaf63_dc4c_8601_ec8c ^ ((self.bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut i = 0usize;
+        while i < self.bytes.len() {
+            let b = self.bytes[i] as u64;
+            h1 ^= b;
+            h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+            h2 ^= b.wrapping_add(i as u64);
+            h2 = h2.wrapping_mul(0x94d0_49bb_1331_11eb);
+            i += 1;
+        }
+        h1 ^= h1 >> 30;
+        h1 = h1.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h1 ^= h1 >> 27;
+        h1 = h1.wrapping_mul(0x94d0_49bb_1331_11eb);
+        h1 ^= h1 >> 31;
+
+        h2 ^= h2 >> 30;
+        h2 = h2.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h2 ^= h2 >> 27;
+        h2 = h2.wrapping_mul(0x94d0_49bb_1331_11eb);
+        h2 ^= h2 >> 31;
+
+        ((h1 as u128) << 64) | (h2 as u128)
+    }
+}
+
+impl PartialEq for ConstPatMember<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for ConstPatMember<'_> {}
+
+impl PartialOrd for ConstPatMember<'_> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ConstPatMember<'_> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.bytes.cmp(other.bytes)
+    }
+}
+
+impl core::hash::Hash for ConstPatMember<'_> {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+    }
+}
+
+/// Kind of mutation attempted through `&uniq (T is in CONST_SLICE)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConstSetWriteKind {
+    /// Mutating a single field (`v.major = 99`): forbidden because the modified struct may leave
+    /// the finite allowed set.
+    FieldWrite,
+    /// Assigning or swapping an arbitrary `T` value: forbidden unless proven in the set.
+    WholeAssign,
+    /// Assigning a value already typed as a subset of `self` (`*v = known_version`).
+    ProvenInSet,
+}
+
+/// Finite const value-set pattern type (`SemVer is in VERSIONS`, `&str is in ["1.1.1", "1.2.2"]`).
+///
+/// Stores a canonical, strictly sorted, deduplicated set of `StructuralPartialEq` compile-time
+/// values with the exact same layout as `base`:
+/// - Free subset subtyping: `(SemVer is in OLD_VERSIONS) <: (SemVer is in ALL_VERSIONS) <: SemVer`.
+/// - Flow-sensitive exhaustiveness: `narrow_exclude` removes each handled `match` arm until
+///   `Ok(None)` (exhaustive, no `_` arm required); `missing_members` names every uncovered value.
+/// - Strict `&uniq` write guard: forbids both field writes and arbitrary whole-value overwrites
+///   that could escape the finite set.
+#[derive(Debug)]
+pub struct ConstSetPatTy<'a, 's> {
+    base: Ty,
+    values: Vec<ConstPatMember<'s>, Alloc<'a>>,
+}
+
+impl<'a, 's> ConstSetPatTy<'a, 's> {
+    /// Constructs a canonical finite const value-set pattern type over `base`.
+    ///
+    /// Refuses non-`StructuralPartialEq` base types (`PatTyError::NotStructuralEq`) and empty
+    /// slices (`PatTyError::EmptyPattern`). Sorts and deduplicates members by canonical structural
+    /// bytes so declaration order and duplicates do not change type identity.
+    pub fn from_values(
+        base: Ty,
+        structural_eq: bool,
+        raw: &[ConstPatMember<'s>],
+        alloc: Alloc<'a>,
+    ) -> Result<Self, PatTyError> {
+        if !structural_eq {
+            return Err(PatTyError::NotStructuralEq);
+        }
+        if raw.is_empty() {
+            return Err(PatTyError::EmptyPattern);
+        }
+        let mut sorted = Vec::with_capacity_in(raw.len(), alloc);
+        for &m in raw {
+            sorted.push(m);
+        }
+        sorted.sort_unstable();
+
+        let mut dedup = Vec::with_capacity_in(sorted.len(), alloc);
+        for &m in sorted.iter() {
+            if dedup.last().is_some_and(|prev: &ConstPatMember<'s>| prev.bytes == m.bytes) {
+                continue;
+            }
+            dedup.push(m);
+        }
+        Ok(Self { base, values: dedup })
+    }
+
+    /// Base type (`SemVer`, `&str`, integer, tuple, ...).
+    #[inline]
+    pub const fn base(&self) -> Ty {
+        self.base
+    }
+
+    /// Canonical sorted, deduplicated allowed values.
+    #[inline]
+    pub fn values(&self) -> &[ConstPatMember<'s>] {
+        &self.values
+    }
+
+    /// Number of distinct allowed values in the set.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Always `false` for a valid [`ConstSetPatTy`] (empty sets are refused on construction).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Returns `true` iff `member` is in this finite value set (`O(log n)` binary search).
+    #[inline]
+    pub fn contains(&self, member: &ConstPatMember<'_>) -> bool {
+        self.values.binary_search_by(|m| m.bytes.cmp(member.bytes)).is_ok()
+    }
+
+    /// If narrowed to a single value, returns that sole value.
+    #[inline]
+    pub fn sole_value(&self) -> Option<ConstPatMember<'s>> {
+        if self.values.len() == 1 { self.values.first().copied() } else { None }
+    }
+
+    /// Free subtyping check: `self <: wider` iff both share `base` and every value in `self` is
+    /// present in `wider` (`(SemVer is in OLD) <: (SemVer is in ALL) <: SemVer`).
+    pub fn is_subset_of(&self, wider: &ConstSetPatTy<'_, '_>) -> bool {
+        if self.base != wider.base {
+            return false;
+        }
+        let mut j = 0usize;
+        for a in self.values.iter() {
+            while let Some(b) = wider.values.get(j) {
+                if b.bytes < a.bytes {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            match wider.values.get(j) {
+                Some(b) if b.bytes == a.bytes => j += 1,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Flow-sensitive narrowing: excludes `handled` after a `match` arm or `let else` covers it.
+    ///
+    /// - Returns `Ok(None)` when the last remaining member has been covered (exhaustive `match`
+    ///   with no `_` wildcard required).
+    /// - Returns `Err(PatTyError::ValueNotInPattern)` if `handled` is not in `self` (unreachable
+    ///   arm).
+    pub fn narrow_exclude<'b>(
+        &self,
+        handled: &ConstPatMember<'_>,
+        alloc: Alloc<'b>,
+    ) -> Result<Option<ConstSetPatTy<'b, 's>>, PatTyError> {
+        let Ok(idx) = self.values.binary_search_by(|m| m.bytes.cmp(handled.bytes)) else {
+            return Err(PatTyError::ValueNotInPattern);
+        };
+        if self.values.len() == 1 {
+            return Ok(None);
+        }
+        let mut rem = Vec::with_capacity_in(self.values.len() - 1, alloc);
+        for (i, &m) in self.values.iter().enumerate() {
+            if i != idx {
+                rem.push(m);
+            }
+        }
+        Ok(Some(ConstSetPatTy { base: self.base, values: rem }))
+    }
+
+    /// Returns every member of `self` not covered by `covered`, in canonical order, for
+    /// non-exhaustive `match` diagnostics (e.g. `missing match arm: SemVer { 1, 2, 2 }`).
+    pub fn missing_members<'b>(
+        &self,
+        covered: &[ConstPatMember<'_>],
+        alloc: Alloc<'b>,
+    ) -> Vec<ConstPatMember<'s>, Alloc<'b>> {
+        let mut missing = Vec::new_in(alloc);
+        for &m in self.values.iter() {
+            if !covered.iter().any(|c| c.bytes == m.bytes) {
+                missing.push(m);
+            }
+        }
+        missing
+    }
+
+    /// Checks a write through `&uniq (T is in CONST_SLICE)`: only values proven to be in the set
+    /// may be written; both field mutation and unrefined whole-value assignment are refused.
+    pub const fn check_unique_write(&self, kind: ConstSetWriteKind) -> Result<(), PatTyError> {
+        match kind {
+            ConstSetWriteKind::ProvenInSet => Ok(()),
+            ConstSetWriteKind::FieldWrite => Err(PatTyError::FieldWriteThroughConstSet),
+            ConstSetWriteKind::WholeAssign => Err(PatTyError::WholeWriteThroughUniqRef),
+        }
+    }
+
+    /// Interns this finite value-set pattern type directly into `cx.tys` as a first-class
+    /// `ty::PAT` node (`TyKind::Pat(base, canonical_member_digests)`).
+    ///
+    /// Because `self.values` is canonically sorted and deduplicated, two sets with the same
+    /// members in different declaration orders intern to the exact same `Ty` id.
+    pub fn intern_into(&self, cx: &mut TyCx<'_>, scratch: Alloc<'_>) -> Ty {
+        let mut args: Vec<Arg, Alloc<'_>> = Vec::with_capacity_in(self.values.len(), scratch);
+        for &m in self.values.iter() {
+            args.push(cx.tys.const_value(self.base, m.digest128()).arg());
+        }
+        let list = cx.tys.mk_list(&args);
+        cx.tys.pat(self.base, list)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_own::testing::heap;
@@ -528,5 +839,112 @@ mod tests {
             Err(PatTyError::WholeWriteThroughUniqRef)
         );
         assert!(full.check_unique_write(VariantWriteKind::WholeAssign).is_ok());
+    }
+
+    #[test]
+    fn const_set_pattern_type_semver_and_str_canonical_subtyping_narrowing_and_guards() {
+        let h = heap();
+        let a = h.alloc();
+        let mut cx = TyCx::new_in(a);
+        let semver = cx.tys.adt(Def(77), List::EMPTY);
+        let other_adt = cx.tys.adt(Def(78), List::EMPTY);
+        let str_ref = cx.tys.reference(crate::ids::Region::STATIC, Ty::STR, crate::ids::Mutability::Not);
+
+        // Canonical structural bytes for `SemVer { major: u16, minor: u16, patch: u16 }`.
+        let encode_semver = |major: u16, minor: u16, patch: u16| -> [u8; 6] {
+            let mut buf = [0u8; 6];
+            buf[0..2].copy_from_slice(&major.to_le_bytes());
+            buf[2..4].copy_from_slice(&minor.to_le_bytes());
+            buf[4..6].copy_from_slice(&patch.to_le_bytes());
+            buf
+        };
+        let b_111 = encode_semver(1, 1, 1);
+        let b_122 = encode_semver(1, 2, 2);
+        let b_345 = encode_semver(3, 4, 5);
+        let b_999 = encode_semver(9, 9, 9);
+
+        let v111 = ConstPatMember::from_bytes(&b_111, "SemVer { 1, 1, 1 }");
+        let v122 = ConstPatMember::from_bytes(&b_122, "SemVer { 1, 2, 2 }");
+        let v345 = ConstPatMember::from_bytes(&b_345, "SemVer { 3, 4, 5 }");
+        let v999 = ConstPatMember::from_bytes(&b_999, "SemVer { 9, 9, 9 }");
+
+        // Canonical sorting & deduplication: different input orders + duplicates produce
+        // identical `values()` and identical interned `Ty`.
+        let all_a = ConstSetPatTy::from_values(semver, true, &[v345, v111, v122, v111], a).unwrap();
+        let all_b = ConstSetPatTy::from_values(semver, true, &[v122, v345, v345, v111], a).unwrap();
+        assert_eq!(all_a.base(), semver);
+        assert_eq!(all_a.len(), 3);
+        assert!(!all_a.is_empty());
+        assert_eq!(all_a.values(), &[v111, v122, v345]);
+        assert_eq!(all_a.values(), all_b.values());
+        assert!(all_a.contains(&v111));
+        assert!(all_a.contains(&v122));
+        assert!(all_a.contains(&v345));
+        assert!(!all_a.contains(&v999));
+
+        let ty_a = all_a.intern_into(&mut cx, a);
+        let ty_b = all_b.intern_into(&mut cx, a);
+        assert_eq!(ty_a, ty_b);
+        assert!(matches!(cx.tys.ty_kind(ty_a), TyKind::Pat(base, _) if base == semver));
+
+        // `&str` literals (`&str is in ["1.1.1", "1.2.2", "3.4.5"]`).
+        let s111 = ConstPatMember::from_str("1.1.1");
+        let s122 = ConstPatMember::from_str("1.2.2");
+        let s345 = ConstPatMember::from_str("3.4.5");
+        let s_set_1 = ConstSetPatTy::from_values(str_ref, true, &[s345, s111, s122], a).unwrap();
+        let s_set_2 = ConstSetPatTy::from_values(str_ref, true, &[s111, s122, s345, s122], a).unwrap();
+        assert_eq!(s_set_1.values(), &[s111, s122, s345]);
+        assert_eq!(s_set_1.intern_into(&mut cx, a), s_set_2.intern_into(&mut cx, a));
+        assert_eq!(s_set_1.values()[0].label(), "1.1.1");
+
+        // Free subset subtyping: `OLD <: ALL`, `!ALL <: OLD`, different base rejected.
+        let old = ConstSetPatTy::from_values(semver, true, &[v111, v122], a).unwrap();
+        let other_base = ConstSetPatTy::from_values(other_adt, true, &[v111, v122], a).unwrap();
+        assert!(old.is_subset_of(&all_a));
+        assert!(all_a.is_subset_of(&all_b));
+        assert!(!all_a.is_subset_of(&old));
+        assert!(!other_base.is_subset_of(&all_a));
+        assert!(!old.is_subset_of(&other_base));
+
+        // Flow-sensitive narrowing: exclude arms down to `sole_value()` then `Ok(None)` (exhaustive).
+        assert_eq!(all_a.sole_value(), None);
+        let rem1 = all_a.narrow_exclude(&v111, a).unwrap().expect("2 versions remain");
+        assert_eq!(rem1.len(), 2);
+        assert_eq!(rem1.sole_value(), None);
+        let rem2 = rem1.narrow_exclude(&v345, a).unwrap().expect("1 version remains");
+        assert_eq!(rem2.sole_value(), Some(v122));
+        assert!(rem2.narrow_exclude(&v122, a).unwrap().is_none());
+
+        // Impossible arm (`v999` not in set, or already-handled `v111`) -> `ValueNotInPattern`.
+        assert_eq!(all_a.narrow_exclude(&v999, a).unwrap_err(), PatTyError::ValueNotInPattern);
+        assert_eq!(rem1.narrow_exclude(&v111, a).unwrap_err(), PatTyError::ValueNotInPattern);
+
+        // Missing-member witnesses name uncovered versions in canonical order.
+        let missing = all_a.missing_members(&[v111], a);
+        assert_eq!(missing.as_slice(), &[v122, v345]);
+        assert_eq!(missing[0].label(), "SemVer { 1, 2, 2 }");
+        assert_eq!(missing[1].label(), "SemVer { 3, 4, 5 }");
+        assert!(all_a.missing_members(&[v345, v111, v122], a).is_empty());
+
+        // `&uniq (SemVer is in VERSIONS)` write guards.
+        assert_eq!(all_a.check_unique_write(ConstSetWriteKind::ProvenInSet), Ok(()));
+        assert_eq!(
+            all_a.check_unique_write(ConstSetWriteKind::FieldWrite),
+            Err(PatTyError::FieldWriteThroughConstSet)
+        );
+        assert_eq!(
+            all_a.check_unique_write(ConstSetWriteKind::WholeAssign),
+            Err(PatTyError::WholeWriteThroughUniqRef)
+        );
+
+        // Refusals: non-`StructuralPartialEq` base and empty slice.
+        assert_eq!(
+            ConstSetPatTy::from_values(semver, false, &[v111], a).unwrap_err(),
+            PatTyError::NotStructuralEq
+        );
+        assert_eq!(
+            ConstSetPatTy::from_values(semver, true, &[], a).unwrap_err(),
+            PatTyError::EmptyPattern
+        );
     }
 }

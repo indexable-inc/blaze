@@ -2023,6 +2023,46 @@ mod pattern_types {
         assert_eq!(what(lower(t, u32_, "u32 is -1..")), "a negative end in a pattern type over an unsigned base");
         assert_eq!(what(lower(t, PNode::Bool, "bool is true")), "a range pattern type over a type that is not an integer or `char`");
     }
+
+    #[test]
+    fn const_set_pattern_type_parses_and_refuses_without_const_slice_eval() {
+        let mut tys = PortableTys::new_in(Alloc::global());
+        let parsed_ident = parse_pattern_type("SemVer is in VERSIONS", at()).expect("parses `is in VERSIONS`");
+        assert_eq!(parsed_ident.base, "SemVer");
+        assert!(!parsed_ident.not_null);
+        assert_eq!(parsed_ident.in_const, Some("VERSIONS"));
+        assert!(parsed_ident.ranges.iter().all(Option::is_none));
+
+        let parsed_array = parse_pattern_type("SemVer is in [V1, V2, V3]", at()).expect("parses `is in [..]`");
+        assert_eq!(parsed_array.base, "SemVer");
+        assert_eq!(parsed_array.in_const, Some("[V1, V2, V3]"));
+
+        let parsed_str = parse_pattern_type(r#"&str is in ["1.1.1", "1.2.2"]"#, at()).expect("parses `&str is in`");
+        assert_eq!(parsed_str.base, "&str");
+        assert_eq!(parsed_str.in_const, Some(r#"["1.1.1", "1.2.2"]"#));
+
+        // Identifier starting with `in` is not misparsed as `in <const_expr>`.
+        let parsed_path = parse_pattern_type("u32 is in_min..=in_max", at()).expect("parses path range");
+        assert_eq!(parsed_path.in_const, None);
+        assert!(parsed_path.ranges[0].is_some());
+
+        // Missing const expression after `in` is refused by name.
+        assert!(matches!(
+            parse_pattern_type("SemVer is in", at()),
+            Err(Refused::Form { what: "a finite value-set pattern type without a const expression after `in`", .. })
+        ));
+
+        // Lowering via `pattern_type` gives a typed refusal naming const-slice evaluation.
+        let base = tys.intern(PNode::Uint(UintTy::U32)).expect("intern");
+        let mut eval = |_: &str| Err(Refused::Form { what: "unused", range: at() });
+        assert!(matches!(
+            pattern_type(&mut tys, base, &parsed_ident, 64, at(), &mut eval),
+            Err(Refused::Form {
+                what: "a finite const value-set pattern type (`T is in CONST_SLICE`) requires const-slice evaluation",
+                ..
+            })
+        ));
+    }
 }
 
 /// `record_closure_param_regions` descends into `fn(...) -> ...` and `for<..> fn(...) -> ...`

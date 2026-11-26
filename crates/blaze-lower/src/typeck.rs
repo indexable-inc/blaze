@@ -2222,19 +2222,21 @@ pub struct PatRange<'t> {
 }
 
 /// The input of `pattern_type!` read from its text: the base's text (the caller lowers it as a
-/// type) and the pattern, `!null` or an or of ranges (at most
-/// `blaze_typeck::MAX_PATTERN_RANGES`).
+/// type) and the pattern, `!null`, a finite const value set (`in CONST_SLICE`), or an or of
+/// ranges (at most `blaze_typeck::MAX_PATTERN_RANGES`).
 #[derive(Clone, Copy, Debug)]
 pub struct PatternTypeText<'t> {
     pub base: &'t str,
     pub not_null: bool,
+    pub in_const: Option<&'t str>,
     pub ranges: [Option<PatRange<'t>>; blaze_typeck::MAX_PATTERN_RANGES],
 }
 
 /// Reads `T is PAT`, the input of the pinned library's built-in `pattern_type!` (core/src/pat.rs;
 /// the forms core writes are in typeck.md, "Pattern types": integer and `char` ranges with
-/// literal or path ends, ors of them, and `!null`). A form outside these is
-/// `Refused::Form` naming it, at `range` (the macro call's).
+/// literal or path ends, ors of them, and `!null`) or Blaze's finite const value-set pattern type
+/// (`T is in CONST_SLICE`). A form outside these is `Refused::Form` naming it, at `range` (the
+/// macro call's).
 pub fn parse_pattern_type(input: &str, range: blaze_surface::Range) -> Result<PatternTypeText<'_>, Refused> {
     let refuse = |what: &'static str| Refused::Form { what, range };
     let at = word_at(input, "is").ok_or(refuse("a `pattern_type!` without `is`"))?;
@@ -2243,12 +2245,27 @@ pub fn parse_pattern_type(input: &str, range: blaze_surface::Range) -> Result<Pa
     if base.is_empty() {
         return Err(refuse("a `pattern_type!` without a base type"));
     }
-    let mut out = PatternTypeText { base, not_null: false, ranges: [None; blaze_typeck::MAX_PATTERN_RANGES] };
+    let mut out = PatternTypeText {
+        base,
+        not_null: false,
+        in_const: None,
+        ranges: [None; blaze_typeck::MAX_PATTERN_RANGES],
+    };
     if let Some(rest) = pat.strip_prefix('!') {
         if rest.trim() != "null" {
             return Err(refuse("a negated pattern other than `!null` in a pattern type"));
         }
         out.not_null = true;
+        return Ok(out);
+    }
+    if let Some(rest) = pat.strip_prefix("in")
+        && rest.as_bytes().first().is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
+    {
+        let expr = rest.trim();
+        if expr.is_empty() {
+            return Err(refuse("a finite value-set pattern type without a const expression after `in`"));
+        }
+        out.in_const = Some(expr);
         return Ok(out);
     }
     for (i, alt) in pat.split('|').enumerate() {
@@ -2390,6 +2407,11 @@ pub fn pattern_type(
         (Some(IntTy::I128), _) | (_, Some(UintTy::U128)) => 128,
         _ => pointer_bits,
     };
+    if text.in_const.is_some() {
+        return Err(refuse(
+            "a finite const value-set pattern type (`T is in CONST_SLICE`) requires const-slice evaluation",
+        ));
+    }
     if text.not_null {
         // `!null` is every address but zero (pat.rs, non_null.rs `NonNull::pointer`).
         match tys.view().node(base)? {
