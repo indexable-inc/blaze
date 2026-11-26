@@ -46,5 +46,5 @@ pub use span::{LineCol, Span, line_col};
 pub use state::{DefData, EngineState, RustCell, VarSlot};
 pub use value::{
     Bytes, ClosureData, ColDisplay, DateTime, Nanos, PathKind, PathMember, RangeVal, Record, Table,
-    Value, format_relative_time,
+    Value, format_date, format_exact_elapsed, format_relative_time, format_u64_commas,
 };

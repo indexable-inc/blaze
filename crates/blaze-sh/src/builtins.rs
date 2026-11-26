@@ -1650,6 +1650,7 @@ fn builtin_ls<'a>(
     table.hide_col_by_name("type");
     if long {
         table.set_col_display("readonly", crate::value::ColDisplay::Status);
+        table.hide_col_by_name("readonly");
     }
     // Sort directories first, then case-insensitive by name (like `eza --group-directories-first`).
     let mut order: AVec<'a, usize> = AVec::with_capacity_in(entries.len(), alloc);
