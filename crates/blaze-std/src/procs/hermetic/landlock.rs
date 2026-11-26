@@ -549,6 +549,23 @@ fn walk_nix_elf_closure(
         None
     };
 
+    let mut interp_resolved = [0u8; PATH_CAP];
+    let active_loader_for_lib: &[u8] = if is_nix_ld {
+        glibc_dir.unwrap_or(interp_cstr.to_bytes())
+    } else if let Some(rlen) = resolve_symlink_path(interp_cstr.to_bytes(), &mut interp_resolved) {
+        interp_resolved.get(..rlen).unwrap_or(interp_cstr.to_bytes())
+    } else {
+        interp_cstr.to_bytes()
+    };
+    let lib_token = dl_dst_lib_token(active_loader_for_lib);
+    let platform_token = dl_dst_platform_token();
+    if let Some(f) = feed.as_deref_mut() {
+        f(b"dl-dst:");
+        f(lib_token);
+        f(b":");
+        f(platform_token);
+    }
+
     // Bounded BFS queue of `(canonical ELF path, len, ordered inherited DT_RPATH chain)` seeded
     // ONLY with the executable itself, its `PT_INTERP`, and (for `nix-ld`) `NIX_LD_SO`.
     // For the primary program we always keep `program` (its shelf path) for `$ORIGIN` expansion
@@ -671,7 +688,7 @@ fn walk_nix_elf_closure(
                     let Some(slot) = search_dirs.get_mut(search_count) else {
                         return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
                     };
-                    let expanded_len = expand_origin(entry, origin_dir, &mut slot.0)?;
+                    let expanded_len = expand_rpath_tokens(entry, origin_dir, lib_token, platform_token, &mut slot.0)?;
                     if expanded_len == 0 {
                         return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entry exceeds path cap)", code: 36 });
                     }
@@ -696,7 +713,7 @@ fn walk_nix_elf_closure(
                         continue;
                     }
                     let mut exp = [0u8; PATH_CAP];
-                    let expanded_len = expand_origin(entry, origin_dir, &mut exp)?;
+                    let expanded_len = expand_rpath_tokens(entry, origin_dir, lib_token, platform_token, &mut exp)?;
                     if expanded_len == 0 {
                         return Err(Fault::Host { call: "landlock (NixOS ELF RPATH entry exceeds path cap)", code: 36 });
                     }
@@ -735,7 +752,7 @@ fn walk_nix_elf_closure(
             }
             if soname.contains(&b'/') {
                 let mut expanded = [0u8; PATH_CAP];
-                let exp_len = expand_origin(soname, origin_dir, &mut expanded)?;
+                let exp_len = expand_rpath_tokens(soname, origin_dir, lib_token, platform_token, &mut expanded)?;
                 let file_len = if exp_len > 1 && expanded.get(exp_len - 1) == Some(&b'/') {
                     exp_len - 1
                 } else {
@@ -888,15 +905,71 @@ fn parse_elf64_meta(
     Ok(Some(meta))
 }
 
-fn expand_origin(entry: &[u8], origin_dir: &[u8], out: &mut [u8; 320]) -> Result<usize, Fault> {
+/// Derives glibc's `$LIB` dynamic-string-token value (`DL_DST_LIB`) from the resolved dynamic
+/// loader path (`PT_INTERP`): Debian/Ubuntu multiarch uses `lib/<triplet>`, standard 64-bit FHS
+/// uses `lib64`, and NixOS glibc uses `lib`.
+pub fn dl_dst_lib_token(loader_path: &[u8]) -> &'static [u8] {
+    let dir = match loader_path.iter().rposition(|&b| b == b'/') {
+        Some(pos) => loader_path.get(..pos).unwrap_or(&[]),
+        None => &[],
+    };
+    if dir.ends_with(b"/lib/x86_64-linux-gnu") {
+        b"lib/x86_64-linux-gnu"
+    } else if dir.ends_with(b"/lib/aarch64-linux-gnu") {
+        b"lib/aarch64-linux-gnu"
+    } else if dir.ends_with(b"/lib64") {
+        b"lib64"
+    } else {
+        b"lib"
+    }
+}
+
+/// Returns Linux's `AT_PLATFORM` (`ELF_PLATFORM`) dynamic-string-token value for this target.
+pub const fn dl_dst_platform_token() -> &'static [u8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        b"aarch64"
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        b"x86_64"
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        b""
+    }
+}
+
+fn dst_boundary(next: Option<u8>) -> bool {
+    matches!(next, None | Some(b'/') | Some(b':'))
+}
+
+/// Expands glibc's standard ELF dynamic string tokens (`$ORIGIN`/`${ORIGIN}`, `$LIB`/`${LIB}`,
+/// `$PLATFORM`/`${PLATFORM}`) in a `DT_RPATH`, `DT_RUNPATH`, or path-bearing `DT_NEEDED` entry.
+/// Refuses unknown `$...` tokens with `ENOSYS` rather than passing them through unexpanded.
+pub fn expand_rpath_tokens(
+    entry: &[u8],
+    origin_dir: &[u8],
+    lib_token: &[u8],
+    platform_token: &[u8],
+    out: &mut [u8; 320],
+) -> Result<usize, Fault> {
     let mut len = 0usize;
     let mut i = 0usize;
     while i < entry.len() {
         let rest = entry.get(i..).unwrap_or(&[]);
-        let (chunk, step) = if rest.starts_with(b"$ORIGIN") {
-            (origin_dir, 7)
-        } else if rest.starts_with(b"${ORIGIN}") {
+        let (chunk, step) = if rest.starts_with(b"${ORIGIN}") {
             (origin_dir, 9)
+        } else if rest.starts_with(b"$ORIGIN") && dst_boundary(rest.get(7).copied()) {
+            (origin_dir, 7)
+        } else if rest.starts_with(b"${LIB}") {
+            (lib_token, 6)
+        } else if rest.starts_with(b"$LIB") && dst_boundary(rest.get(4).copied()) {
+            (lib_token, 4)
+        } else if rest.starts_with(b"${PLATFORM}") && !platform_token.is_empty() {
+            (platform_token, 11)
+        } else if rest.starts_with(b"$PLATFORM") && !platform_token.is_empty() && dst_boundary(rest.get(9).copied()) {
+            (platform_token, 9)
         } else if rest.first() == Some(&b'$') {
             return Err(Fault::Host {
                 call: "landlock (NixOS ELF unsupported dynamic-loader token in RUNPATH)",

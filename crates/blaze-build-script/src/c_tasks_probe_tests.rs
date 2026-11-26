@@ -181,7 +181,10 @@ fn two_rows_with_one_key_are_refused() {
 #[test]
 fn only_probe_shaped_compiler_spawns_are_probes() {
     assert!(is_probe("cc", &flag_args("-fno-builtin")));
-    assert!(is_probe("/usr/bin/c++", &["-E", "/out/1detect_compiler_family.c"]));
+    assert!(is_probe("c++", &["-E", "/out/1detect_compiler_family.c"]));
+    assert!(!is_probe("/usr/bin/c++", &["-E", "/out/1detect_compiler_family.c"]), "path-qualified compiler must stay on normal route");
+    assert!(!is_probe("/opt/gcc/bin/gcc", &["-E", "/out/1detect_compiler_family.c"]), "explicit compiler path must not route to pinned clang");
+    assert!(!is_probe("/missing/cc", &flag_args("-fno-builtin")), "missing path-qualified compiler must not route to pinned clang");
     assert!(is_probe("cc", &["-?"]));
     assert!(!is_probe("cc", &["-c", "/pkg/src/a.c", "-o", "/out/a.o"]), "an object compile is a C request");
     assert!(!is_probe("ar", &["cq", "/out/libz.a", "/out/a.o"]));

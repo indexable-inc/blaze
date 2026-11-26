@@ -466,7 +466,10 @@ fn is_family_probe(args: &[&str]) -> bool {
 /// (`cc -E <dir>/<digits>detect_compiler_family.c` with no `-o` or header-search flags). Real
 /// preprocessing or compile jobs stay on the deferred/build C route.
 pub fn is_probe(program: &str, args: &[&str]) -> bool {
-    if !COMPILERS.contains(&name_of(program)) {
+    // Path-qualified compiler paths (e.g. `/opt/gcc/bin/gcc`, `/missing/cc`) may refer to a
+    // distinct or absent binary and must stay on the normal compiler route instead of being
+    // redirected by basename to the pinned clang-23 probe answerer.
+    if program.contains('/') || !COMPILERS.contains(&program) {
         return false;
     }
     args.contains(&"-?") || is_flag_check_probe(args) || is_family_probe(args)

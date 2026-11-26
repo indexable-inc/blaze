@@ -163,17 +163,19 @@ pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, found
     route_with_stdin(name, args, false, c_mode, found, has_executor)
 }
 
-/// Like [`route`], additionally excluding `Fact::CcProbe` when `has_stdin` is true so compiler
-/// invocations with nonempty stdin stay on the ordinary compiler route instead of failing probe
-/// canonicalization with `ProbeWhy::Stdin`.
+/// Like [`route`], additionally excluding `Fact::CcProbe` when `has_stdin` is true or `program`
+/// is path-qualified (`program.contains('/')`) so nonempty-stdin and explicit-path compiler
+/// invocations stay on the ordinary compiler route instead of being redirected to pinned clang-23.
 pub(crate) fn route_with_stdin<'s>(
-    name: &'s str,
+    program: &'s str,
     args: &'s [&'s str],
     has_stdin: bool,
     c_mode: CMode,
     found: bool,
     has_executor: bool,
 ) -> Route<'s> {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    let is_path_qualified = program.contains('/');
     if !found {
         return Route::NotFound;
     }
@@ -188,11 +190,11 @@ pub(crate) fn route_with_stdin<'s>(
         return Route::Git;
     }
     if let Some(fact) = facts::question(name, args)
-        && !(has_stdin && matches!(fact, Fact::CcProbe { .. }))
+        && !((has_stdin || is_path_qualified) && matches!(fact, Fact::CcProbe { .. }))
     {
         return Route::Fact(fact);
     }
-    if (probe::is_deferred_tool(name, args) || (has_stdin && probe::is_c_tool(name))) && c_mode == CMode::Deferred {
+    if (probe::is_deferred_tool(program, args) || (has_stdin && probe::is_c_tool(name))) && c_mode == CMode::Deferred {
         return Route::Deferred;
     }
     if has_executor { Route::Executor } else { Route::Refused }

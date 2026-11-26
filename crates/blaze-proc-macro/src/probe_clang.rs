@@ -1794,8 +1794,8 @@ mod tests {
             make_spec(&[("SOURCE_DATE_EPOCH", "01")], lz_clock).is_ok(),
             "HermeticSpec::new must accept leading-zero SOURCE_DATE_EPOCH=01 via ClockSpec::InvalidEnv"
         );
-        // Nonempty-stdin compiler invocations must bypass `Fact::CcProbe` and stay on the ordinary
-        // compiler route (`Deferred` in check mode, `Executor` in build mode).
+        // Nonempty-stdin and path-qualified compiler invocations must bypass `Fact::CcProbe` and
+        // stay on the ordinary compiler route (`Deferred` in check mode, `Executor` in build mode).
         let probe_args = ["-c", "-Wshadow", "-o", "/out/flag_check", "/out/flag_check.c"];
         assert!(matches!(
             crate::spawn_route::route_with_stdin("cc", &probe_args, false, blaze_build_script::CMode::Deferred, true, true),
@@ -1807,6 +1807,14 @@ mod tests {
         ));
         assert!(matches!(
             crate::spawn_route::route_with_stdin("cc", &probe_args, true, blaze_build_script::CMode::Built, true, true),
+            crate::spawn_route::Route::Executor
+        ));
+        assert!(matches!(
+            crate::spawn_route::route_with_stdin("/opt/gcc/bin/gcc", &probe_args, false, blaze_build_script::CMode::Built, true, true),
+            crate::spawn_route::Route::Executor
+        ));
+        assert!(matches!(
+            crate::spawn_route::route_with_stdin("/missing/cc", &probe_args, false, blaze_build_script::CMode::Built, true, true),
             crate::spawn_route::Route::Executor
         ));
         assert_eq!(
@@ -2117,6 +2125,39 @@ mod tests {
             &[b"glibc-hwcaps/x86-64-v3/".as_slice(), b"glibc-hwcaps/x86-64-v2/".as_slice()]
         );
         assert_eq!(bstd::procs::hermetic::x86_64_fhs_hwcap_subdirs(1), &[] as &[&[u8]]);
+
+        // glibc standard ELF RUNPATH tokens (`$ORIGIN`, `$LIB`, `$PLATFORM`, and braced variants)
+        // must expand accurately while unknown `$...` tokens fail loudly with ENOSYS.
+        assert_eq!(bstd::procs::hermetic::dl_dst_lib_token(b"/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"), b"lib/x86_64-linux-gnu");
+        assert_eq!(bstd::procs::hermetic::dl_dst_lib_token(b"/lib64/ld-linux-x86-64.so.2"), b"lib64");
+        assert_eq!(bstd::procs::hermetic::dl_dst_lib_token(b"/nix/store/abc-glibc/lib/ld-linux-aarch64.so.1"), b"lib");
+        let mut exp_buf = [0u8; 320];
+        let n = bstd::procs::hermetic::expand_rpath_tokens(
+            b"$ORIGIN/../$LIB/${PLATFORM}",
+            b"/opt/tool/bin",
+            b"lib64",
+            b"x86_64",
+            &mut exp_buf,
+        )
+        .expect("standard glibc tokens must expand");
+        assert_eq!(&exp_buf[..n], b"/opt/tool/bin/../lib64/x86_64/");
+        let n2 = bstd::procs::hermetic::expand_rpath_tokens(
+            b"${ORIGIN}/${LIB}/$PLATFORM",
+            b"/opt/tool/bin",
+            b"lib/aarch64-linux-gnu",
+            b"aarch64",
+            &mut exp_buf,
+        )
+        .expect("braced glibc tokens must expand");
+        assert_eq!(&exp_buf[..n2], b"/opt/tool/bin/lib/aarch64-linux-gnu/aarch64/");
+        assert!(
+            bstd::procs::hermetic::expand_rpath_tokens(b"$ORIGIN/$UNKNOWN", b"/opt/bin", b"lib", b"aarch64", &mut exp_buf).is_err(),
+            "unknown dynamic-loader token must fail loudly"
+        );
+        assert!(
+            bstd::procs::hermetic::expand_rpath_tokens(b"$LIB_CUSTOM", b"/opt/bin", b"lib", b"aarch64", &mut exp_buf).is_err(),
+            "non-delimited $LIB_CUSTOM must not misexpand as $LIB"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2317,14 +2358,14 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn run_lock_runtime_dst(plant: bstd::procs::hermetic::LockPlant) -> Result<(), &'static str> {
-        use bstd::procs::hermetic::{LockBackend, LockRuntime};
-        use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    fn run_lock_runtime_dst(plant: bstd::procs::hermetic::LockPlant) -> Result<u64, &'static str> {
+        use bstd::procs::hermetic::{AttemptSignal, LockBackend, LockRuntime};
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::collections::VecDeque;
         use std::sync::{Arc as StdArc, Mutex as StdMutex};
-        use std::thread::{self, JoinHandle, ThreadId};
 
         struct TrackedHandle {
-            caller_tid: ThreadId,
+            in_worker: StdArc<AtomicBool>,
             unlocked: StdArc<AtomicBool>,
             closed_count: StdArc<AtomicUsize>,
             unlocked_count: StdArc<AtomicUsize>,
@@ -2333,7 +2374,7 @@ mod tests {
 
         impl Drop for TrackedHandle {
             fn drop(&mut self) {
-                if thread::current().id() == self.caller_tid {
+                if !self.in_worker.load(Ordering::Acquire) {
                     self.dropped_on_caller.fetch_add(1, Ordering::AcqRel);
                 }
                 if self.unlocked.load(Ordering::Acquire) {
@@ -2343,56 +2384,72 @@ mod tests {
             }
         }
 
+        struct SimState {
+            rng: u64,
+            fail_spawn_mask: u64,
+            ready_queue: VecDeque<std::boxed::Box<dyn FnOnce() + Send + 'static>>,
+            trace_hash: u64,
+        }
+
+        impl SimState {
+            fn next_u64(&mut self) -> u64 {
+                self.rng = self.rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = self.rng;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                let out = z ^ (z >> 31);
+                self.trace_hash = self.trace_hash.rotate_left(7) ^ out;
+                out
+            }
+        }
+
+        /// 100% single-threaded deterministic discrete-event scheduler driving the EXACT
+        /// production `LockRuntime<TrackedHandle>` seam with zero `std::thread::spawn` and zero
+        /// `thread::sleep`. Any `u64` seed replays the exact same interleaving bit-for-bit.
         struct SimLockBackend {
-            caller_tid: ThreadId,
-            rng: AtomicU64,
+            state: StdMutex<SimState>,
+            in_worker: StdArc<AtomicBool>,
             acquired_count: StdArc<AtomicUsize>,
             unlocked_count: StdArc<AtomicUsize>,
             closed_count: StdArc<AtomicUsize>,
             dropped_on_caller: StdArc<AtomicUsize>,
-            fail_spawn_mask: AtomicUsize,
-            stalled_release: StdArc<AtomicBool>,
-            workers: StdMutex<std::vec::Vec<JoinHandle<()>>>,
         }
 
         impl SimLockBackend {
-            fn next_u64(&self) -> u64 {
-                let prev = self.rng.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::AcqRel);
-                let mut z = prev.wrapping_add(0x9e37_79b9_7f4a_7c15);
-                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-                z ^ (z >> 31)
+            fn step_one(&self, pick_from_back: bool) -> bool {
+                let task = {
+                    let mut st = self.state.lock().expect("sim state lock");
+                    if pick_from_back {
+                        st.ready_queue.pop_back()
+                    } else {
+                        st.ready_queue.pop_front()
+                    }
+                };
+                if let Some(f) = task {
+                    self.in_worker.store(true, Ordering::Release);
+                    f();
+                    self.in_worker.store(false, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
             }
 
-            fn join_all(&self) {
-                loop {
-                    let batch = {
-                        let mut guard = self.workers.lock().expect("workers lock");
-                        if guard.is_empty() {
-                            break;
-                        }
-                        core::mem::take(&mut *guard)
-                    };
-                    for handle in batch {
-                        let _ = handle.join();
-                    }
-                }
+            fn drain_all(&self) {
+                while self.step_one(false) {}
             }
         }
 
         impl LockBackend<TrackedHandle> for SimLockBackend {
             fn open_and_try_lock(&self) -> Result<Option<TrackedHandle>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
-                let r = self.next_u64();
-                // Deterministic delay so caller cancel/timeout races BOTH before and after worker CAS.
-                if r % 3 == 0 {
-                    thread::sleep(super::Duration::from_micros(150 + (r % 300)));
-                } else if r % 5 == 0 {
+                let r = self.state.lock().expect("sim state lock").next_u64();
+                if r % 5 == 0 {
                     // Contended attempt.
                     return Ok(None);
                 }
                 self.acquired_count.fetch_add(1, Ordering::AcqRel);
                 Ok(Some(TrackedHandle {
-                    caller_tid: self.caller_tid,
+                    in_worker: StdArc::clone(&self.in_worker),
                     unlocked: StdArc::new(AtomicBool::new(false)),
                     closed_count: StdArc::clone(&self.closed_count),
                     unlocked_count: StdArc::clone(&self.unlocked_count),
@@ -2401,62 +2458,82 @@ mod tests {
             }
 
             fn unlock_and_close(&self, handle: TrackedHandle) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
-                if self.next_u64() % 4 == 0 {
-                    // Brief stall while active workers saturate the 2-worker cap.
-                    while !self.stalled_release.load(Ordering::Acquire) {
-                        thread::sleep(super::Duration::from_micros(100));
-                    }
-                }
                 handle.unlocked.store(true, Ordering::Release);
                 drop(handle);
                 Ok(())
             }
 
             fn spawn_worker<F: FnOnce() + Send + 'static>(&self, _name: &str, f: F) -> Result<(), ()> {
-                let mask = self.fail_spawn_mask.load(Ordering::Acquire);
-                if mask > 0 && self.next_u64() % (mask as u64) == 0 {
+                let mut st = self.state.lock().expect("sim state lock");
+                if st.fail_spawn_mask > 0 && st.next_u64() % st.fail_spawn_mask == 0 {
                     return Err(());
                 }
-                let jh = thread::spawn(f);
-                self.workers.lock().expect("workers lock").push(jh);
+                st.ready_queue.push_back(std::boxed::Box::new(f));
                 Ok(())
             }
 
-            fn poll_timeout(&self) -> super::Duration {
-                super::Duration::from_micros(100)
+            fn wait_signal(&self, _signal: &AttemptSignal) {
+                // Deterministically decide whether this poll tick sees:
+                // - 0 tasks run (stalled worker -> poll timeout -> caller may abandon `Running`),
+                // - oldest queued worker run (FIFO completion), or
+                // - newest queued worker run (LIFO reordering / worker finishes right before caller
+                //   checks `is_stopped()`, hitting the atomic `Done(res)` retirement branch!).
+                let roll = self.state.lock().expect("sim state lock").next_u64() % 4;
+                match roll {
+                    0 => {} // Simulate stalled worker on this tick.
+                    1 => {
+                        let _ = self.step_one(false);
+                    }
+                    2 => {
+                        let _ = self.step_one(true);
+                    }
+                    _ => {
+                        // Run two tasks to interleave unlock/reaper completions with acquire.
+                        let _ = self.step_one(false);
+                        let _ = self.step_one(true);
+                    }
+                }
             }
         }
 
-        let caller_tid = thread::current().id();
-        for seed in 0..80u64 {
+        let mut combined_trace = 0u64;
+        for seed in 0..300u64 {
+            let in_worker = StdArc::new(AtomicBool::new(false));
             let acquired_count = StdArc::new(AtomicUsize::new(0));
             let unlocked_count = StdArc::new(AtomicUsize::new(0));
             let closed_count = StdArc::new(AtomicUsize::new(0));
             let dropped_on_caller = StdArc::new(AtomicUsize::new(0));
-            let stalled_release = StdArc::new(AtomicBool::new(false));
             let backend = blaze_own::Arc::new_in(
                 SimLockBackend {
-                    caller_tid,
-                    rng: AtomicU64::new(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(17)),
+                    state: StdMutex::new(SimState {
+                        rng: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(17),
+                        fail_spawn_mask: 7,
+                        ready_queue: VecDeque::new(),
+                        trace_hash: seed,
+                    }),
+                    in_worker: StdArc::clone(&in_worker),
                     acquired_count: StdArc::clone(&acquired_count),
                     unlocked_count: StdArc::clone(&unlocked_count),
                     closed_count: StdArc::clone(&closed_count),
                     dropped_on_caller: StdArc::clone(&dropped_on_caller),
-                    fail_spawn_mask: AtomicUsize::new(7),
-                    stalled_release: StdArc::clone(&stalled_release),
-                    workers: StdMutex::new(std::vec::Vec::new()),
                 },
                 blaze_own::SharedAlloc::global(),
             );
-            // Small cap (`max_workers = 2, max_pending = 4`) guarantees worker-cap saturation,
-            // reaper queueing, and spawn-failure recovery trigger on every seed.
+            // Small cap (`max_workers = 2, max_pending = 4`) deterministically saturates workers,
+            // queues reapers, and triggers spawn-failure recovery on every seed.
             let rt = LockRuntime::new(2, 4, plant);
             let mut held = std::vec::Vec::new();
-            for op in 0..14u64 {
+            for op in 0..24u64 {
                 let choice = (seed.wrapping_add(op)) % 4;
                 if choice < 2 || held.is_empty() {
-                    // Acquire — half the time with a racing cancellation after 1 poll tick!
-                    let cancel_after = if (seed + op) % 2 == 0 { 1usize } else { usize::MAX };
+                    // Half the acquires cancel after 1..=2 ticks, deterministically hitting BOTH
+                    // `Running -> Abandoned` (worker runs later) AND `Done(Ok(Some(h)))` on a
+                    // stopped tick (caller retires `h` immediately without blocking).
+                    let cancel_after = if (seed + op) % 2 == 0 {
+                        usize::try_from(1 + ((seed + op) % 2)).unwrap_or(1)
+                    } else {
+                        6
+                    };
                     let mut polls = 0usize;
                     let mut is_stopped = || {
                         polls += 1;
@@ -2487,8 +2564,6 @@ mod tests {
                     }
                 }
             }
-            // Release all remaining held locks (some via `unlock` while workers may still be
-            // stalled at cap=2, exercising the cap-overflow retirement path!).
             for (idx, handle) in held.drain(..).enumerate() {
                 if idx % 2 == 0 {
                     let mut polls = 0usize;
@@ -2505,14 +2580,18 @@ mod tests {
                     rt.retire_handle(handle, &backend);
                 }
             }
-            // Unblock stalled unlock workers and disable spawn failures to drain cleanly.
-            stalled_release.store(true, Ordering::Release);
-            backend.fail_spawn_mask.store(0, Ordering::Release);
-            rt.pump_reapers(&backend);
-            backend.join_all();
-            // Pump once more in case a worker finished and left a queued item without a live reaper.
-            rt.pump_reapers(&backend);
-            backend.join_all();
+            // Disable spawn failures and drain the deterministic scheduler to quiescence.
+            backend.state.lock().expect("sim state lock").fail_spawn_mask = 0;
+            loop {
+                rt.pump_reapers(&backend);
+                let before = backend.state.lock().expect("sim state lock").ready_queue.len();
+                backend.drain_all();
+                rt.pump_reapers(&backend);
+                let after = backend.state.lock().expect("sim state lock").ready_queue.len();
+                if before == 0 && after == 0 {
+                    break;
+                }
+            }
 
             if dropped_on_caller.load(Ordering::Acquire) != 0 {
                 return Err("lock runtime oracle: handle dropped synchronously on caller thread");
@@ -2532,15 +2611,19 @@ mod tests {
             if rt.reaper_active() != 0 || rt.reaper_pending() != 0 || rt.reaper_reserved() != 0 {
                 return Err("lock runtime oracle: reaper slot/pending/active state leaked");
             }
+            combined_trace ^= backend.state.lock().expect("sim state lock").trace_hash;
         }
-        Ok(())
+        Ok(combined_trace)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn lock_runtime_dst_survives_races_cap_overflow_and_spawn_failures() {
-        run_lock_runtime_dst(bstd::procs::hermetic::LockPlant::None)
-            .expect("production LockRuntime DST must never drop on caller, leak slots, or skip unlock");
+        let trace_a = run_lock_runtime_dst(bstd::procs::hermetic::LockPlant::None)
+            .expect("deterministic LockRuntime DST must never drop on caller, leak slots, or skip unlock");
+        let trace_b = run_lock_runtime_dst(bstd::procs::hermetic::LockPlant::None)
+            .expect("deterministic LockRuntime DST second run must also pass");
+        assert_eq!(trace_a, trace_b, "deterministic LockRuntime DST must replay identical traces across runs");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

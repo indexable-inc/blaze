@@ -685,11 +685,12 @@ impl<T> ReaperCore<T> {
 
 #[cfg(target_os = "linux")]
 pub use landlock::{
-    HostLdCaps, PreloadScanner, feed_nix_runtime_closure, feed_nix_runtime_closure_with,
-    parse_ld_so_cache_match, x86_64_fhs_hwcap_subdirs,
+    HostLdCaps, PreloadScanner, dl_dst_lib_token, dl_dst_platform_token, expand_rpath_tokens,
+    feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match,
+    x86_64_fhs_hwcap_subdirs,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use crate::rt::{LockBackend, LockPlant, LockRuntime, NativeLockErr};
+pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, NativeLockErr};
 
 /// On macOS hosts, hashes the admitted OS runtime closure (`/System/Library/CoreServices/SystemVersion.plist`,
 /// optional Cryptex `SystemVersion.plist`, `/usr/lib/dyld`, and the active `dyld_shared_cache`

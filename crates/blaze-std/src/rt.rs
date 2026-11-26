@@ -1265,14 +1265,60 @@ pub enum LockPlant {
     SkipAbandonUnlock,
 }
 
+/// Completion notification signal used by [`LockRuntime`] and [`LockBackend::wait_signal`]:
+/// in production uses a `Mutex<bool>` + `Condvar` (`wait_timeout`); in deterministic simulation
+/// lets the single-threaded scheduler step queued workers without OS threads or `thread::sleep`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct AttemptSignal {
+    done: self::std::sync::Mutex<bool>,
+    cvar: self::std::sync::Condvar,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl AttemptSignal {
+    fn new() -> Self {
+        Self {
+            done: self::std::sync::Mutex::new(false),
+            cvar: self::std::sync::Condvar::new(),
+        }
+    }
+
+    fn notify(&self) {
+        let mut guard = match self.done.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = true;
+        self.cvar.notify_one();
+    }
+
+    pub fn is_notified(&self) -> bool {
+        let guard = match self.done.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard
+    }
+
+    pub fn wait_timeout(&self, timeout: core::time::Duration) {
+        let guard = match self.done.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if !*guard {
+            let _ = self.cvar.wait_timeout(guard, timeout);
+        }
+    }
+}
+
 /// Platform seam driven by [`LockRuntime`] in both production (`RealOpBackend`) and
-/// deterministic interleaving DSTs (`SimLockBackend`).
+/// 100% single-threaded deterministic discrete-event simulation (`SimLockBackend`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub trait LockBackend<H: Send + 'static>: Send + Sync + 'static {
     fn open_and_try_lock(&self) -> Result<Option<H>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
     fn unlock_and_close(&self, handle: H) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
     fn spawn_worker<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) -> Result<(), ()>;
-    fn poll_timeout(&self) -> core::time::Duration;
+    fn wait_signal(&self, signal: &AttemptSignal);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1478,12 +1524,16 @@ impl<H: Send + 'static> LockRuntime<H> {
         is_stopped: &mut dyn FnMut() -> Option<crate::Stopped>,
         sleep_backoff: &mut dyn FnMut() -> Result<(), crate::Stopped>,
     ) -> Result<H, NativeLockErr> {
-        use core::sync::atomic::{AtomicU8, Ordering};
-        use self::std::sync::mpsc;
+        use core::sync::atomic::Ordering;
+        use self::std::sync::Mutex;
 
-        const STATE_RUNNING: u8 = 0;
-        const STATE_WORKER_DONE: u8 = 1;
-        const STATE_CALLER_ABANDONED: u8 = 2;
+        type LockMsg<H> = Result<Option<H>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
+        enum AttemptState<H> {
+            Running,
+            Done(LockMsg<H>),
+            Abandoned,
+            Taken,
+        }
 
         self.pump_reapers(backend);
         if !self.try_reserve_slot() {
@@ -1499,28 +1549,33 @@ impl<H: Send + 'static> LockRuntime<H> {
                 self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
                 return Err(lock_err_static("file-lock worker cap reached (stalled filesystem backlog full)"));
             }
-            let state = blaze_own::Arc::new_in(AtomicU8::new(STATE_RUNNING), blaze_own::SharedAlloc::global());
-            let state_w = blaze_own::Share::share(&state);
+            // Single `Mutex<AttemptState<H>>` publishes `Done(res)` atomically in the exact same
+            // critical section as the state transition — impossible for cancellation to block on
+            // separate channel delivery after the worker marks completion.
+            let attempt = blaze_own::Arc::new_in(Mutex::new(AttemptState::<H>::Running), blaze_own::SharedAlloc::global());
+            let signal = blaze_own::Arc::new_in(AttemptSignal::new(), blaze_own::SharedAlloc::global());
+            let attempt_w = blaze_own::Share::share(&attempt);
+            let signal_w = blaze_own::Share::share(&signal);
             let rt_w = blaze_own::Share::share(self);
             let backend_w = blaze_own::Share::share(backend);
-            type LockMsg<H> = Result<Option<H>, blaze_own::String<blaze_own::SharedAlloc<'static>>>;
-            let (tx, rx) = mpsc::sync_channel::<LockMsg<H>>(1);
             let plant = self.inner.plant;
             let spawned = backend.spawn_worker("bstd-lock-op", move || {
                 let res: LockMsg<H> = backend_w.open_and_try_lock();
-                if state_w
-                    .compare_exchange(STATE_RUNNING, STATE_WORKER_DONE, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    if let Err(mpsc::SendError(Ok(Some(h)))) = tx.send(res) {
-                        if plant != LockPlant::SkipAbandonUnlock {
-                            let _ = backend_w.unlock_and_close(h);
-                        } else {
-                            drop(h);
+                let abandoned = {
+                    let mut guard = match attempt_w.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    match *guard {
+                        AttemptState::Running => {
+                            *guard = AttemptState::Done(res);
+                            None
                         }
+                        AttemptState::Abandoned | AttemptState::Done(_) | AttemptState::Taken => Some(res),
                     }
-                } else {
-                    if let Ok(Some(h)) = res {
+                };
+                if let Some(abandoned_res) = abandoned {
+                    if let Ok(Some(h)) = abandoned_res {
                         if plant != LockPlant::SkipAbandonUnlock {
                             let _ = backend_w.unlock_and_close(h);
                         } else {
@@ -1528,6 +1583,8 @@ impl<H: Send + 'static> LockRuntime<H> {
                         }
                     }
                     rt_w.release_slot();
+                } else {
+                    signal_w.notify();
                 }
                 rt_w.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
             });
@@ -1535,34 +1592,45 @@ impl<H: Send + 'static> LockRuntime<H> {
                 self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
                 return Err(lock_err_static("failed to spawn off-thread file-lock worker"));
             }
-            let poll_wait = backend.poll_timeout();
             loop {
-                match rx.recv_timeout(poll_wait) {
-                    Ok(Ok(Some(h))) => {
-                        slot_guard.held = false;
-                        return Ok(h);
-                    }
-                    Ok(Ok(None)) => break, // Contended: backoff and retry.
-                    Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some(stopped) = is_stopped() {
-                            if state
-                                .compare_exchange(STATE_RUNNING, STATE_CALLER_ABANDONED, Ordering::AcqRel, Ordering::Acquire)
-                                .is_ok()
-                            {
-                                slot_guard.held = false;
-                                return Err(NativeLockErr::Stopped(stopped));
-                            }
-                            if let Ok(Ok(Some(h))) = rx.recv() {
-                                slot_guard.held = false;
-                                self.retire_handle(h, backend);
-                            }
-                            return Err(NativeLockErr::Stopped(stopped));
+                backend.wait_signal(&signal);
+                let stopped = is_stopped();
+                let ready = {
+                    let mut guard = match attempt.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    if matches!(*guard, AttemptState::Done(_)) {
+                        match core::mem::replace(&mut *guard, AttemptState::Taken) {
+                            AttemptState::Done(res) => Some(res),
+                            AttemptState::Running | AttemptState::Abandoned | AttemptState::Taken => None,
                         }
+                    } else if stopped.is_some() {
+                        *guard = AttemptState::Abandoned;
+                        slot_guard.held = false;
+                        None
+                    } else {
+                        None
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(lock_err_static("file-lock worker exited unexpectedly"));
+                };
+                if let Some(res) = ready {
+                    if let Some(stopped) = stopped {
+                        if let Ok(Some(h)) = res {
+                            slot_guard.held = false;
+                            self.retire_handle(h, backend);
+                        }
+                        return Err(NativeLockErr::Stopped(stopped));
                     }
+                    match res {
+                        Ok(Some(h)) => {
+                            slot_guard.held = false;
+                            return Ok(h);
+                        }
+                        Ok(None) => break, // Contended: backoff and retry.
+                        Err(msg) => return Err(NativeLockErr::Driver(msg)),
+                    }
+                } else if let Some(stopped) = stopped {
+                    return Err(NativeLockErr::Stopped(stopped));
                 }
             }
             sleep_backoff().map_err(NativeLockErr::Stopped)?;
@@ -1576,7 +1644,9 @@ impl<H: Send + 'static> LockRuntime<H> {
         is_stopped: &mut dyn FnMut() -> Option<crate::Stopped>,
     ) -> Result<(), NativeLockErr> {
         use core::sync::atomic::Ordering;
-        use self::std::sync::mpsc;
+        use self::std::sync::Mutex;
+
+        type UnlockMsg = Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
 
         self.pump_reapers(backend);
         let prev = self.inner.active_workers.fetch_add(1, Ordering::AcqRel);
@@ -1590,9 +1660,11 @@ impl<H: Send + 'static> LockRuntime<H> {
             }
             return Err(lock_err_static("file-unlock worker cap reached (retired off-thread)"));
         }
-        type UnlockMsg = Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>>;
-        let (tx, rx) = mpsc::sync_channel::<UnlockMsg>(1);
-        let fd_slot = blaze_own::Arc::new_in(self::std::sync::Mutex::new(Some(handle)), blaze_own::SharedAlloc::global());
+        let result_slot = blaze_own::Arc::new_in(Mutex::new(Option::<UnlockMsg>::None), blaze_own::SharedAlloc::global());
+        let signal = blaze_own::Arc::new_in(AttemptSignal::new(), blaze_own::SharedAlloc::global());
+        let fd_slot = blaze_own::Arc::new_in(Mutex::new(Some(handle)), blaze_own::SharedAlloc::global());
+        let result_w = blaze_own::Share::share(&result_slot);
+        let signal_w = blaze_own::Share::share(&signal);
         let worker_slot = blaze_own::Share::share(&fd_slot);
         let rt_w = blaze_own::Share::share(self);
         let backend_w = blaze_own::Share::share(backend);
@@ -1607,7 +1679,14 @@ impl<H: Send + 'static> LockRuntime<H> {
             };
             rt_w.release_slot();
             rt_w.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
-            let _ = tx.send(res);
+            {
+                let mut g = match result_w.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                *g = Some(res);
+            }
+            signal_w.notify();
         });
         if spawned.is_err() {
             self.inner.active_workers.fetch_sub(1, Ordering::AcqRel);
@@ -1627,19 +1706,20 @@ impl<H: Send + 'static> LockRuntime<H> {
             }
             return Err(lock_err_static("failed to spawn off-thread file-unlock worker (retired off-thread)"));
         }
-        let poll_wait = backend.poll_timeout();
         loop {
-            match rx.recv_timeout(poll_wait) {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(msg)) => return Err(NativeLockErr::Driver(msg)),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(stopped) = is_stopped() {
-                        return Err(NativeLockErr::Stopped(stopped));
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(lock_err_static("file-unlock worker exited unexpectedly"));
-                }
+            backend.wait_signal(&signal);
+            let ready = {
+                let mut g = match result_slot.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                g.take()
+            };
+            if let Some(res) = ready {
+                return res.map_err(NativeLockErr::Driver);
+            }
+            if let Some(stopped) = is_stopped() {
+                return Err(NativeLockErr::Stopped(stopped));
             }
         }
     }
@@ -1688,8 +1768,8 @@ impl LockBackend<blaze_sys::posix::io::OwnedFd> for RealRetireBackend {
             .map_err(|_| ())
     }
 
-    fn poll_timeout(&self) -> core::time::Duration {
-        core::time::Duration::from_millis(10)
+    fn wait_signal(&self, signal: &AttemptSignal) {
+        signal.wait_timeout(core::time::Duration::from_millis(10));
     }
 }
 
@@ -1914,8 +1994,8 @@ impl LockBackend<blaze_sys::posix::io::OwnedFd> for RealOpBackend {
             .map_err(|_| ())
     }
 
-    fn poll_timeout(&self) -> core::time::Duration {
-        core::time::Duration::from_millis(10)
+    fn wait_signal(&self, signal: &AttemptSignal) {
+        signal.wait_timeout(core::time::Duration::from_millis(10));
     }
 }
 

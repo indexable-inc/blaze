@@ -1260,7 +1260,7 @@ impl ScriptSandbox {
         let name = program.rsplit('/').next().unwrap_or(program);
         let found = self.look_up(program)?;
         let routed = crate::spawn_route::route_with_stdin(
-            name,
+            program,
             &args_text,
             !spawned.stdin.is_empty(),
             self.script.c_mode,
