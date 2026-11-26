@@ -2326,6 +2326,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let slot = self.b.slot(size, align, SlotKind::Named);
         self.name_slot(slot, blaze_flow_lower::identity::Identity::Binding(p));
         self.slots[p.ix()] = Some((Home::Slot(slot), repr));
+        self.track_local_slot(p);
         Ok((Home::Slot(slot), repr))
     }
 

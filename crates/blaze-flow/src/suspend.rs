@@ -68,9 +68,29 @@ pub(crate) enum SavedPlant {
     NoBorrows,
 }
 
+/// Maximum number of saved locals for which [`saved_plan`] builds a quadratic storage-conflict
+/// bit matrix (4096 locals -> 2 MiB max); larger bodies fall back to empty conflicts (no overlap).
+const MAX_CONFLICT_LOCALS: usize = 4096;
+
+/// Saved locals together with their pairwise storage-conflict bit matrix (row `i`, bit `j` set
+/// iff saved locals `locals[i]` and `locals[j]` may be storage-live simultaneously at some point
+/// in the flow). An empty `conflicts` slice when `locals` is non-empty means the body exceeded
+/// [`MAX_CONFLICT_LOCALS`] and callers must not overlap its saved locals.
+pub struct SavedPlan<A: Allocator> {
+    pub saved: Saved<A>,
+    pub locals: Vec<Local, A>,
+    pub conflicts: Vec<u64, A>,
+}
+
 /// The saved locals of `flow`, the union over its `Suspend` statements.
 pub fn saved<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Saved<A>, Bound> {
-    saved_with(flow, true, alloc)
+    saved_with(flow, true, false, alloc).map(|p| p.saved)
+}
+
+/// The saved locals of `flow` plus their pairwise storage-conflict matrix for overlapping
+/// coroutine state layout.
+pub fn saved_plan<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<SavedPlan<A>, Bound> {
+    saved_with(flow, true, true, alloc)
 }
 
 #[cfg(test)]
@@ -79,7 +99,7 @@ pub(crate) fn saved_planted<A: Allocator + Copy>(
     plant: SavedPlant,
     alloc: A,
 ) -> Result<Saved<A>, Bound> {
-    saved_with(flow, plant != SavedPlant::NoBorrows, alloc)
+    saved_with(flow, plant != SavedPlant::NoBorrows, false, alloc).map(|p| p.saved)
 }
 
 fn zeroed<A: Allocator>(words: usize, alloc: A) -> Vec<u64, A> {
@@ -88,14 +108,18 @@ fn zeroed<A: Allocator>(words: usize, alloc: A) -> Vec<u64, A> {
     v
 }
 
-fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> Result<Saved<A>, Bound> {
+fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, want_conflicts: bool, alloc: A) -> Result<SavedPlan<A>, Bound> {
     let locals = usize::try_from(flow.locals).unwrap_or(usize::MAX);
     let words = locals.div_ceil(64);
     let mut out = zeroed(words, alloc);
     let suspends =
         u32::try_from(flow.stmts.iter().filter(|row| matches!(row.kind, StmtKind::Suspend { .. })).count()).unwrap_or(u32::MAX);
     if suspends == 0 {
-        return Ok(Saved { bits: out, suspends });
+        return Ok(SavedPlan {
+            saved: Saved { bits: out, suspends },
+            locals: Vec::new_in(alloc),
+            conflicts: Vec::new_in(alloc),
+        });
     }
     let blocks_u64 = u64::try_from(flow.blocks.len()).unwrap_or(u64::MAX);
     let limit = blocks_u64.saturating_mul(u64::from(flow.locals)).saturating_add(1);
@@ -149,7 +173,125 @@ fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> R
     if locals > 0 {
         bits::put(&mut out, 0, false);
     }
-    Ok(Saved { bits: out, suspends })
+    let saved = Saved { bits: out, suspends };
+    if !want_conflicts {
+        return Ok(SavedPlan { saved, locals: Vec::new_in(alloc), conflicts: Vec::new_in(alloc) });
+    }
+    let mut saved_locals = Vec::new_in(alloc);
+    for l in (flow.args + 1)..flow.locals {
+        let local = Local(l);
+        if saved.is_saved(local) {
+            saved_locals.push(local);
+        }
+    }
+    let conflicts = compute_conflicts(flow, &storage, &saved_locals, alloc);
+    Ok(SavedPlan { saved, locals: saved_locals, conflicts })
+}
+
+fn each_bit(words: &[u64], mut f: impl FnMut(usize)) {
+    for (w, &word) in words.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            f(w * 64 + rest.trailing_zeros() as usize);
+            rest &= rest - 1;
+        }
+    }
+}
+
+/// Pairwise storage-conflict bit matrix over `saved_locals`: row `i` holds bit `j` when some
+/// point of `flow` has both `saved_locals[i]` and `saved_locals[j]` maybe storage-live (or
+/// accesses one while the other is storage-live).
+fn compute_conflicts<A: Allocator + Copy>(
+    flow: &Flow<A>,
+    storage: &BlockBits<A>,
+    saved_locals: &[Local],
+    alloc: A,
+) -> Vec<u64, A> {
+    let n = saved_locals.len();
+    if n == 0 || n > MAX_CONFLICT_LOCALS {
+        return Vec::new_in(alloc);
+    }
+    let locals = usize::try_from(flow.locals).unwrap_or(usize::MAX);
+    let mut ordinal: Vec<u32, A> = Vec::with_capacity_in(locals, alloc);
+    ordinal.resize(locals, u32::MAX);
+    for (i, &local) in saved_locals.iter().enumerate() {
+        if local.index() < locals {
+            ordinal[local.index()] = i as u32;
+        }
+    }
+    let rw = n.div_ceil(64);
+    let mut matrix = zeroed(n * rw, alloc);
+    let mut cur = zeroed(rw, alloc);
+    let mark_live = |local: Local, ordinal: &[u32], cur: &mut [u64], matrix: &mut [u64]| {
+        let ord = ordinal.get(local.index()).copied().unwrap_or(u32::MAX);
+        if ord == u32::MAX {
+            return;
+        }
+        let i = ord as usize;
+        let (word, bit) = (i / 64, 1u64 << (i % 64));
+        if cur[word] & bit != 0 {
+            return;
+        }
+        cur[word] |= bit;
+        let row = i * rw;
+        for w in 0..rw {
+            matrix[row + w] |= cur[w];
+        }
+        each_bit(cur, |j| matrix[j * rw + word] |= bit);
+    };
+    for b in 0..flow.blocks.len() {
+        cur.fill(0);
+        let blk = Block(b as u32);
+        let st_row = storage.row(blk);
+        for (i, &local) in saved_locals.iter().enumerate() {
+            if bits::test(st_row, local.index()) {
+                cur[i / 64] |= 1u64 << (i % 64);
+            }
+        }
+        each_bit(&cur, |i| {
+            let row = i * rw;
+            for w in 0..rw {
+                matrix[row + w] |= cur[w];
+            }
+        });
+        let range = flow.blocks[b];
+        for s in range.start..range.end {
+            match flow.stmt(Stmt(s)).kind {
+                StmtKind::StorageLive(l) => mark_live(l, &ordinal, &mut cur, &mut matrix),
+                StmtKind::StorageDead(l) => {
+                    let ord = ordinal.get(l.index()).copied().unwrap_or(u32::MAX);
+                    if ord != u32::MAX {
+                        let i = ord as usize;
+                        cur[i / 64] &= !(1u64 << (i % 64));
+                    }
+                }
+                StmtKind::Assign { dest, value } => {
+                    mark_live(flow.place(dest).local, &ordinal, &mut cur, &mut matrix);
+                    for_each_operand(flow, value, |o| {
+                        if let Operand::Copy(p) | Operand::Move(p) = o {
+                            mark_live(flow.place(p).local, &ordinal, &mut cur, &mut matrix);
+                        }
+                    });
+                    if let Value::Borrow { place, .. } = value {
+                        mark_live(flow.place(place).local, &ordinal, &mut cur, &mut matrix);
+                    }
+                }
+                StmtKind::Call { args, dest } => {
+                    mark_live(flow.place(dest).local, &ordinal, &mut cur, &mut matrix);
+                    for o in flow.ops(args) {
+                        if let Operand::Copy(p) | Operand::Move(p) = *o {
+                            mark_live(flow.place(p).local, &ordinal, &mut cur, &mut matrix);
+                        }
+                    }
+                }
+                StmtKind::Drop(p) => mark_live(flow.place(p).local, &ordinal, &mut cur, &mut matrix),
+                StmtKind::Activate(l) => mark_live(flow.place(flow.loan(l).place).local, &ordinal, &mut cur, &mut matrix),
+                StmtKind::Switch { on, .. } => mark_live(flow.place(on).local, &ordinal, &mut cur, &mut matrix),
+                _ => {}
+            }
+        }
+    }
+    matrix
 }
 
 fn storage_step<A: Allocator>(flow: &Flow<A>, s: Stmt, row: &mut [u64]) {

@@ -60,6 +60,10 @@ pub struct SavedLocal {
 pub struct StateRecipe<A: Allocator> {
     /// Per saved local past the arguments, in local order.
     pub saved: Vec<SavedLocal, A>,
+    /// Pairwise storage-conflict bit matrix over `saved` (`saved.len() * saved.len().div_ceil(64)`
+    /// words): row `i` holds bit `j` when `saved[i]` and `saved[j]` may be storage-live
+    /// simultaneously. Empty when `saved` is empty or exceeded the conflict matrix cap.
+    pub conflicts: Vec<u64, A>,
     /// The number of suspensions (`.await`s) of the body: the tag holds `3 + points` values.
     pub points: u32,
 }
@@ -71,13 +75,10 @@ pub struct StateRecipe<A: Allocator> {
 pub fn state_recipe<A: Allocator + Copy, B: Allocator + Clone>(body: &BodyView<'_>, lowered: &LoweredAsync<A>, alloc: B) -> Result<StateRecipe<B>, Refusal> {
     let range = lowered.range;
     let flow = &lowered.flow;
-    // `saved` takes the flow's own allocator `A` (its answer is read here and dropped).
-    let saved = blaze_flow::saved(flow, *flow.stmts.allocator()).map_err(|_| Refusal { form: Form::Bound, range })?;
-    let mut out = Vec::new_in(alloc);
-    for l in (flow.args + 1)..flow.locals {
-        if !saved.is_saved(Local(l)) {
-            continue;
-        }
+    // `saved_plan` takes the flow's own allocator `A` (its answer is read here and dropped).
+    let plan = blaze_flow::saved_plan(flow, *flow.stmts.allocator()).map_err(|_| Refusal { form: Form::Bound, range })?;
+    let mut out = Vec::with_capacity_in(plan.locals.len(), alloc);
+    for &Local(l) in plan.locals.iter() {
         let ty = *lowered.local_ty.get(l as usize).ok_or(Refusal { form: Form::Malformed, range })?;
         let wrap = lowered.local_wrap.get(l as usize).copied().ok_or(Refusal { form: Form::Malformed, range })?;
         let identity = lowered.identity.get(l as usize).copied().ok_or(Refusal { form: Form::Malformed, range })?;
@@ -91,5 +92,7 @@ pub fn state_recipe<A: Allocator + Copy, B: Allocator + Clone>(body: &BodyView<'
         let at = w[0].expr().map_or(range, |e| range_of(body, e));
         return Err(Refusal { form: Form::IdentityTwice, range: at });
     }
-    Ok(StateRecipe { saved: out, points: saved.suspends })
+    let mut conflicts = Vec::with_capacity_in(plan.conflicts.len(), out.allocator().clone());
+    conflicts.extend_from_slice(&plan.conflicts);
+    Ok(StateRecipe { saved: out, conflicts, points: plan.saved.suspends })
 }

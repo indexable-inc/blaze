@@ -44,4 +44,4 @@ pub use flow::{
 pub use loans::{BorrowFinding, Kept, LoanParts, TierOne};
 pub use moves::{DropKind, MoveFinding, MoveFindingKind, MoveOut};
 pub use record::{Checked, Record, check, check_named};
-pub use suspend::{Saved, saved};
+pub use suspend::{Saved, SavedPlan, saved, saved_plan};
