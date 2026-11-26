@@ -28,9 +28,6 @@ mod counters;
 /// Descriptor control (`fcntl` as typed operations, `dup`, `ioctl`) and the memory and file
 /// calls `posix::io` needs: `preadv`, `fallocate`, `memfd_create`, `mincore`, `msync`.
 pub mod fdctl;
-/// Cancellable, deadline-bounded positional reads (`io_uring`) on open file descriptors.
-mod fd_read;
-pub use fd_read::{DeadlineReader, READ_BUF_LEN, ReadUntilError};
 mod fs;
 /// The process's identity, group, session, limits and affinity, and the host's name.
 pub mod host;

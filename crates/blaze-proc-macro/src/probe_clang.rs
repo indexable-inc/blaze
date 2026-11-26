@@ -490,10 +490,13 @@ impl HermeticClangProbe {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = (work_root, boot);
+                    let clang_rel = bstd::path::Path::new(prog.shelf_path)
+                        .map_err(|_| fail(own_fmt(format_args!("invalid shelf path `{}`", prog.shelf_path), alloc)))?;
                     let mut hasher = blaze_sha256::Sha256::new();
                     let exec = bstd::procs::hermetic::VerifiedExec::open_and_seal(
                         vcx,
-                        self.clang_path.as_str(),
+                        &self.shelf_dir_cap,
+                        &clang_rel,
                         |chunk| {
                             hasher.update(chunk);
                         },
@@ -1557,12 +1560,15 @@ mod tests {
         // nor in-place writes nor direct writes to the fd can ever alter the verified bytes.
         #[cfg(target_os = "linux")]
         {
-            let pin_file = std::env::temp_dir().join(format!("blaze-cprobe-sealed-{}.bin", std::process::id()));
+            let pin_name = format!("blaze-cprobe-sealed-{}.bin", std::process::id());
+            let pin_file = std::env::temp_dir().join(&pin_name);
+            let pin_rel = bstd::path::Path::new(&pin_name).expect("pin rel");
             std::fs::write(&pin_file, b"original-verified-bytes").expect("write original");
             let mut hashed = blaze_sha256::Sha256::new();
             let vex = bstd::procs::hermetic::VerifiedExec::open_and_seal(
                 &tmp_cx,
-                &pin_file.to_string_lossy(),
+                &tmp_dir,
+                &pin_rel,
                 |chunk| { hashed.update(chunk); },
             )
             .expect("open_and_seal VerifiedExec");
