@@ -162,8 +162,7 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     };
     // Only expressions evaluated by this block contribute suspension points. Evaluating a
     // closure or nested async block constructs its captures; its body has a flow of its own.
-    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new(body, ck, facts, alloc);
-    l.in_nested = true;
+    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new_nested(body, ck, facts, inner, alloc);
     if logged {
         l.b.start_log(alloc);
         l.per_call = true;
@@ -174,9 +173,14 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     let ran = l.finish_held(ran);
     *log = l.b.take_log();
     ran?;
-    // `'static`, made when the walk first met it (`Lower::universal`), as closure.rs does.
-    if let Some(&(_, st)) = l.uni.iter().find(|(r, _)| *r == Region::Static) {
-        externals.push((st, External::Static));
+    // `'static` and any universal lifetime parameters of the enclosing fn met during the walk
+    // (`Lower::universal`), as closure.rs does.
+    for &(r, o) in l.uni.iter() {
+        match r {
+            Region::Static => externals.push((o, External::Static)),
+            Region::Param(i) => externals.push((o, External::OwnerParam(i))),
+            Region::Late { .. } => {}
+        }
     }
     let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
     let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
@@ -491,9 +495,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 match kind {
                     CaptureKind::ByValue => {
                         self.new_local_with(TyD::of(t), true, Some(l), block)?;
-                        if let Some(slot) = self.pat_local.get_mut(p.ix()) {
-                            *slot = l.0;
-                        } else {
+                        if !self.set_pat_local(p, l.0) {
                             return self.refuse_pat(Form::Malformed, p);
                         }
                     }
@@ -575,9 +577,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 self.vars.push(l);
                 match self.body.pats.get(p.ix()) {
                     Some(blaze_typeck::Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() => {
-                        if let Some(slot) = self.pat_local.get_mut(p.ix()) {
-                            *slot = l.0;
-                        } else {
+                        if !self.set_pat_local(p, l.0) {
                             return self.refuse_pat(Form::Malformed, p);
                         }
                         self.name_local(l, Identity::Binding(p));
@@ -706,8 +706,15 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         }
         self.temps.pop();
         self.drop_local(fut, e)?;
-        self.temps.push(r);
-        self.push_place(rp, out);
+        if out.wrap.is_none() && matches!(self.node(out.ty, e)?, PNode::Never) {
+            self.b.stmt(StmtKind::StorageDead(r), span);
+            self.b.stmt(StmtKind::Unreachable, span);
+            self.fresh();
+            self.vals.push(crate::Val { at: At::Const, ty: out });
+        } else {
+            self.temps.push(r);
+            self.push_place(rp, out);
+        }
         Ok(())
     }
 

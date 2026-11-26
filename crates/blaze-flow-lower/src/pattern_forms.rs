@@ -30,9 +30,12 @@
 //! its own block into the locals of its names' FIRST bindings (pre-order, as the code walk's
 //! `first_binds`: blaze-build walk/matches/forms.rs), and all meet at one join block where the
 //! rest of the pattern goes on. A use of the name after the pattern reads that one local; a
-//! move in any alternative's path moves it. In a guarded arm that moves a binding the
-//! alternatives are refused by name (`Form::OrPatternBinding`): the guard would run once per
-//! alternative (blaze-build walk/matches/alts.rs), which this lowering does not model.
+//! move in any alternative's path moves it. In a guarded arm that moves a binding,
+//! [`BindPass::GuardRefs`] switches across the alternatives into each name's single shared
+//! guard-reference local (`&T`, keyed by its first binding in `upvar_places`) so the guard
+//! sees `*tmp` (catching moves in the guard as E0507 and keeping the scrutinee unmoved if the
+//! guard fails), and [`BindPass::GuardMoves`] switches across the alternatives after the guard
+//! holds to move/copy each alternative's place into the single shared by-value local.
 //!
 //! # Slice patterns
 //!
@@ -73,6 +76,9 @@ pub(crate) enum BindItem {
     /// A pattern against a place of a type, under a default binding mode (0 move, 1 `ref`,
     /// 2 `ref mut`).
     Pat(PatId, Place, TyD, u8),
+    /// By-value outer `@` binding (`x @ subpat`): executed AFTER `subpat` so `subpat` can read
+    /// `Copy` fields or borrow sub-places before `x` moves `place`.
+    BindAfterSub { p: PatId, place: Place, ty: TyD, is_residual: bool },
     /// Start an or-pattern alternative's block, or the alternatives' join.
     Start(Block),
     /// An alternative's end: go to the join (the span is the or-pattern's).
@@ -80,9 +86,11 @@ pub(crate) enum BindItem {
 }
 
 impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
-    /// Each name `root` binds with its first binding pattern in source order (pre-order, left to
-    /// right): the variable every or-alternative's binding of that name binds.
-    pub(crate) fn first_binds(&self, root: PatId, out: &mut Vec<(Name, PatId), A>) -> Result<(), Refusal> {
+    /// For every secondary `Pat::Bind` inside a `Pat::Or`, maps that binding's `PatId` to the
+    /// first binding `PatId` of the same name within the same enclosing outermost `Pat::Or`
+    /// (pre-order, left to right). Bindings outside any `Pat::Or` (such as synthetic
+    /// temporaries in a destructuring assignment `(a, b) = expr`) are never aliased.
+    pub(crate) fn first_binds(&self, root: PatId, out: &mut Vec<(PatId, PatId), A>) -> Result<(), Refusal> {
         let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         let mut subs: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
@@ -96,10 +104,34 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, q),
             };
-            if let Pat::Bind { name, .. } = pat
-                && !out.iter().any(|&(n, _)| n == name)
-            {
-                out.push((name, q));
+            if matches!(pat, Pat::Or { .. }) {
+                let mut firsts: Vec<(Name, PatId), A> = Vec::new_in(self.alloc);
+                let mut or_todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+                or_todo.push(q);
+                let mut or_steps = 0usize;
+                while let Some(oq) = or_todo.pop() {
+                    or_steps += 1;
+                    if or_steps > self.body.pats.len() + 1 {
+                        return self.refuse_pat(Form::Bound, root);
+                    }
+                    let opat = match self.body.pats.get(oq.ix()) {
+                        Some(x) => *x,
+                        None => return self.refuse_pat(Form::Malformed, oq),
+                    };
+                    if let Pat::Bind { name, .. } = opat {
+                        match firsts.iter().find(|&&(n, _)| n == name) {
+                            Some(&(_, first)) => out.push((oq, first)),
+                            None => firsts.push((name, oq)),
+                        }
+                    }
+                    subs.clear();
+                    self.sub_pats(opat, &mut subs)?;
+                    // Last first, so they pop in source order.
+                    for &s in subs.iter().rev() {
+                        or_todo.push(s);
+                    }
+                }
+                continue;
             }
             subs.clear();
             self.sub_pats(pat, &mut subs)?;
@@ -111,57 +143,83 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         Ok(())
     }
 
-    /// The local binding `p` (named `name`, of type `lt`) binds: its name's first binding's
-    /// when an earlier or-alternative made it ([`Self::first_binds`]), else a new one.
-    pub(crate) fn binding_local(&mut self, p: PatId, name: Name, lt: TyD, alias: &[(Name, PatId)]) -> Result<Local, Refusal> {
-        let first = alias.iter().find(|&&(n, _)| n == name).map_or(p, |&(_, f)| f);
+    /// The local binding `p` (of type `lt`) binds: its name's first binding's in the same
+    /// or-pattern when an earlier alternative made it ([`Self::first_binds`]), else a new one.
+    pub(crate) fn binding_local(&mut self, p: PatId, lt: TyD, alias: &[(PatId, PatId)]) -> Result<Local, Refusal> {
+        let root = self.body.root;
+        let first = alias.iter().find(|&&(at, _)| at == p).map_or(p, |&(_, f)| f);
         if first != p
-            && let Some(&l) = self.pat_local.get(first.ix())
-            && l != u32::MAX
+            && let Some(l) = self.get_pat_local(first)
         {
             // The alternatives agree on the type (rules/pat.rs checks each against the scrutinee
             // and unifies a name's bindings); a disagreement here is a malformed table.
-            if self.local_ty.get(l as usize).map(|t| t.ty) != Some(lt.ty) {
+            let same = match self.local_ty.get(l as usize).map(|t| t.ty) {
+                Some(pt) if pt == lt.ty => true,
+                Some(pt) => self.same_up_to_alias(pt, lt.ty, root)?,
+                None => false,
+            };
+            if !same {
                 return self.refuse_pat(Form::OrPatternBinding, p);
             }
-            self.pat_local[p.ix()] = l;
+            self.set_pat_local(p, l);
             return Ok(Local(l));
         }
-        let root = self.body.root;
         let l = self.new_local_with(lt, false, None, root)?;
-        self.name_local(l, Identity::Binding(p));
-        self.pat_local[p.ix()] = l.0;
+        self.name_local(l, Identity::Binding(first));
+        self.set_pat_local(p, l.0);
+        if first != p {
+            self.set_pat_local(first, l.0);
+        }
         self.vars.push(l);
         Ok(l)
     }
 
     /// Before guard `g`: the by-value binding `p` (of type `lt`, its place `place` of type `ty`)
-    /// as a temporary `&lt` borrowing the place, and the guard's uses of `p` as `*tmp`.
-    pub(crate) fn guard_ref_binding(&mut self, p: PatId, place: Place, ty: TyD, lt: TyD, g: ExprId) -> Result<(), Refusal> {
+    /// as a temporary `&lt` borrowing the place, and the guard's uses of `p` (by its first
+    /// binding in `alias`) as `*tmp`. For an or-pattern, every alternative borrows into the
+    /// same `&lt` temporary created by the first alternative.
+    #[expect(clippy::too_many_arguments, reason = "one guard binding's frame")]
+    pub(crate) fn guard_ref_binding(
+        &mut self,
+        p: PatId,
+        place: Place,
+        ty: TyD,
+        lt: TyD,
+        g: ExprId,
+        alias: &[(PatId, PatId)],
+    ) -> Result<(), Refusal> {
         let root = self.body.root;
         if ty.wrap.is_some() || !self.same_up_to_alias(ty.ty, lt.ty, root)? {
             return self.refuse_pat(Form::BindingMode, p);
+        }
+        let first = alias.iter().find(|&&(at, _)| at == p).map_or(p, |&(_, f)| f);
+        if let Some(&(_, star, prev_lt)) = self.upvar_places.iter().find(|u| u.0 == first) {
+            if prev_lt.ty != lt.ty && !self.same_up_to_alias(prev_lt.ty, lt.ty, root)? {
+                return self.refuse_pat(Form::OrPatternBinding, p);
+            }
+            let r = Local(self.info(star).local);
+            self.b.stmt(StmtKind::StorageLive(r), self.span(g));
+            self.borrow(place, ty, BorrowKind::Shared, r, root)?;
+            return Ok(());
         }
         let rt = TyD { wrap: Some(Mutbl::Not), ty: lt.ty };
         let r = self.new_local_with(rt, false, None, root)?;
         // Named as the binding: the reference is dead before the by-value binding is made
         // (`GuardMoves`), so no suspension holds both under one identity (`Form::IdentityTwice`).
-        self.name_local(r, Identity::Binding(p));
+        self.name_local(r, Identity::Binding(first));
         // Live for the guard: its span is the guard's.
         self.b.stmt(StmtKind::StorageLive(r), self.span(g));
         self.vars.push(r);
         self.borrow(place, ty, BorrowKind::Shared, r, root)?;
         let rp = self.place_of(r);
         let star = self.project(rp, rt, Proj::Deref, lt, false, root)?;
-        self.upvar_places.retain(|u| u.0 != p);
-        self.upvar_places.push((p, star, lt));
+        self.upvar_places.push((first, star, lt));
         Ok(())
     }
 
     /// An or-pattern `p` with alternatives `alts` against `place`: when any alternative binds, a
     /// switch on the place to one block per alternative, each binding it and going to a join
     /// where the walk goes on (the module doc).
-    #[expect(clippy::too_many_arguments, reason = "one pattern's frame")]
     pub(crate) fn or_alternatives(
         &mut self,
         p: PatId,
@@ -169,7 +227,6 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         place: Place,
         ty: TyD,
         mode: u8,
-        pass: BindPass,
         stack: &mut Vec<BindItem, A>,
     ) -> Result<(), Refusal> {
         let body = self.body;
@@ -183,9 +240,6 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         }
         if !any {
             return Ok(());
-        }
-        if pass != BindPass::Whole {
-            return self.refuse_pat(Form::OrPatternBinding, p);
         }
         let mut blocks: Vec<Block, A> = Vec::new_in(self.alloc);
         for _ in list {

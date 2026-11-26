@@ -28,7 +28,10 @@ use super::body::Body;
 use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, assoc_copy_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
-use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
+use super::borrows_nested::{
+    FlowOf, NestedFacts, Requirements, classify_closure_env_use, closure_flow_of, env_escapes_closure, flow_of, nested_inner_first, nested_range,
+    next_nested, prepare_closure_env, propagate_nested_requirement,
+};
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
 use super::borrows_unmade::{AdtUnmade, HeadClass};
 use super::heads::{HeadError, Want, member_fn_want};
@@ -3442,7 +3445,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                 FlowOf::Owner => continue,
             }
         };
-        let (flow, params, externals, flow_coarse) = match lowered {
+        let (flow, params, mut externals, flow_coarse) = match lowered {
             Ok(x) => x,
             Err(refusal) => {
                 verdict.refused = Some(lower_refused(r, &facts, refusal));
@@ -3457,10 +3460,17 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             let _ = show_flow(&flow, of, out);
         }
         needs.clear();
+        let mut forbid_env_escape: AVec<'a, blaze_flow::Origin> = AVec::new_in(alloc);
+        if plant != FactsPlant::NoClosureRequirements
+            && let FlowOf::Closure(closure) = of
+        {
+            let usage = classify_closure_env_use(closure, &view, done, r.store, &langs, &lowering, alloc);
+            prepare_closure_env(closure, done, usage, &mut externals, &mut forbid_env_escape, alloc);
+        }
         // The control (FactsPlant::NoClosureRequirements): no externals, so no requirement is
         // mapped and each outlives result stays the refusal.
         let externals = if plant == FactsPlant::NoClosureRequirements { None } else { Some(&externals[..]) };
-        if file_flow(&flow, &params, of, &view, externals, &mut needs, &mut verdict, alloc) {
+        if file_flow(&flow, &params, of, &view, externals, &forbid_env_escape, &mut needs, &mut verdict, alloc) {
             break;
         }
         let made = match of {
@@ -3494,7 +3504,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         if let Some(out) = show.as_deref_mut() {
             let _ = show_flow(&flow, of, out);
         }
-        if file_flow(&flow, &params, of, &view, None, &mut needs, &mut verdict, alloc) {
+        if file_flow(&flow, &params, of, &view, None, &[], &mut needs, &mut verdict, alloc) {
             break;
         }
         next = next_nested(&view, of);
@@ -3540,13 +3550,14 @@ fn lower_refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowF
 /// nested flow's outlives result as a closure requirement pushed onto `needs` (when `externals`
 /// is a closure's and blaze-flow-lower `requirement` maps it) or else a `NestedOutlives`
 /// refusal. `true`: the body's check stops here (`verdict.refused` is set, `within` with it).
-#[expect(clippy::too_many_arguments, reason = "the flow, its parameters, which flow, the body's view, the closure's externals, the two outputs and the allocator")]
+#[expect(clippy::too_many_arguments, reason = "the flow, its parameters, which flow, the body's view, the closure's externals and env-escape list, the two outputs and the allocator")]
 pub(super) fn file_flow<'a>(
     flow: &Flow<Alloc<'a>>,
     params: &[blaze_flow_lower::ParamOrigin],
     of: FlowOf,
     view: &tc::BodyView<'_>,
     externals: Option<&[(blaze_flow::Origin, blaze_flow_lower::External)]>,
+    forbid_env_escape: &[blaze_flow::Origin],
     needs: &mut AVec<'a, Requirement>,
     verdict: &mut BorrowVerdict<'a>,
     alloc: Alloc<'a>,
@@ -3574,11 +3585,12 @@ pub(super) fn file_flow<'a>(
                     (span, invalidated_words(flow, at, loan, returned))
                 }
                 // A nested body's outlives result is its owner's to prove: a closure's, between
-                // two positions of its value, is a requirement its maker's flow emits; a region
-                // the call chooses escaping into one the closure keeps is E0521; any other is
-                // refused (never dropped).
+                // two positions of its value (or propagated through a late-bound region's
+                // non-local upper/lower bound in `flow.known`), is a requirement its maker's flow
+                // emits; a region the call chooses escaping into one the closure keeps is E0521;
+                // any other is refused (never dropped).
                 BorrowFinding::UnprovenOutlives { span, from, into, .. } if of.is_nested(view) => {
-                    if let Some(req) = externals.and_then(|ext| blaze_flow_lower::requirement(ext, from, into)) {
+                    if let Some(req) = externals.and_then(|ext| propagate_nested_requirement(ext, &flow.known, from, into, alloc)) {
                         needs.push(req);
                         continue;
                     }
@@ -3588,6 +3600,8 @@ pub(super) fn file_flow<'a>(
                     // requirement on the owner (blaze-flow-lower closure.rs `escapes_closure`).
                     if externals.is_some_and(|ext| blaze_flow_lower::escapes_closure(ext, &flow.known, from, into, alloc)) {
                         (span, ("E0521", "borrowed data escapes outside of closure: a region each call chooses must outlive one the closure keeps"))
+                    } else if externals.is_some_and(|ext| env_escapes_closure(ext, &flow.known, forbid_env_escape, from, into, alloc)) {
+                        (span, ("E0521", "captured variable cannot escape closure body: a per-call environment reference must outlive a region the closure's owner names"))
                     } else {
                         if verdict.refused.is_none() {
                             let endpoint = |origin| externals?.iter().find(|(o, _)| *o == origin).map(|&(_, end)| end);
@@ -3879,15 +3893,17 @@ fn calls_macro_type() {
     let _ = *r;
 }
 
-struct Def<T = &'static u8>(T);
+fn stub<'a>(a: &'a u8, _b: &'a u8) -> &'a u8 {
+    a
+}
 
-fn m(x: &u8, _y: Def) -> &u8 {
+fn m(x: &u8, _y: fn(&u8, &u8) -> &u8) -> &u8 {
     x
 }
 
 fn calls_soft_refused() {
     let a = 1u8;
-    let r = m(&a, Def(&0));
+    let r = m(&a, stub);
     let _ = *r;
 }
 
@@ -4011,16 +4027,17 @@ fn main() {}
                 assert!(matches!(why, blaze_typeck::region_facts::UnreadWhy::Refused { .. }), "calls_soft_refused: why: {why:?}");
                 let named = item.and_then(|lib| names.item_text(lib)).and_then(|t| t.name);
                 assert_eq!(named, Some("m"), "calls_soft_refused names the callee");
-                // By its typed cause and part: `m`'s input 1 is `Def`, whose defaulted argument
-                // carries a lifetime the region walk does not lay; the class is printed first and
-                // short (blaze-cli `first_refusal_class` keeps up to the first `] `).
+                // By its typed cause and part: `m`'s input 1 is `fn(&u8, &u8) -> &u8`, whose
+                // elided return lifetime has two input lifetimes (`FnPtrElision`); the class is
+                // printed first and short (blaze-cli `first_refusal_class` keeps up to the first
+                // `] `).
                 use crate::front2::head_record::Unlaid;
                 use crate::front2::types::{NotLaidWhy, SigPart};
-                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::DefaultArg, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
+                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::FnPtrElision, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
                 let mut said = super::Words::EMPTY;
                 core::fmt::Write::write_fmt(&mut said, format_args!("{refused}")).unwrap();
                 let said = said.as_str();
-                assert!(said.starts_with("[NotLaid/DefaultArg/Input] "), "calls_soft_refused: the class is not first: {said}");
+                assert!(said.starts_with("[NotLaid/FnPtrElision/Input] "), "calls_soft_refused: the class is not first: {said}");
                 assert!(said.contains("input 1"), "calls_soft_refused: the input is not named: {said}");
                 // CONTROL (rule 23): the same refusal with no typed kind prints the old class,
                 // so the bracket above is the kind's, not the text's.
@@ -4129,5 +4146,730 @@ fn main() {}
         assert!(!twin.is_clean() && twin.diagnostics.iter().any(|d| d.code == "E0277"), "local_send_rc: {twin:?}");
         assert!(!matches!(twin.typed, Some(Ok(_))), "local_send_rc keeps a record: {:?}", twin.typed);
         std::println!("F18: local_send keeps {} bytes; control: {control:?}; twin: {:?}", bytes.len(), twin.typed.as_ref().map(|t| t.as_ref().map(|b| b.len())));
+    }
+}
+
+/// `[External::Env -> External::SigOwner]`: a closure passed directly to an `FnOnce`-only callee
+/// (e.g. `Option::and_then(|p| self.ends.get_mut(p))`) consumes its `ByMutRef` capture once, so
+/// its `&mut` capture position becomes an owner-enforced `Need::Capture` -> `Need::Sig`
+/// requirement; `FnMut` closures and `ByValue` captures still reject escaping env references
+/// with `E0521`, and owner-side aliasing/dangling borrows are still caught.
+#[cfg(test)]
+mod closure_env_tests {
+    use super::{BorrowRefused, FactsPlant};
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+struct Slab {
+    items: [u8; 4],
+}
+
+impl Slab {
+    fn get_mut(&mut self, i: usize) -> Option<&mut u8> {
+        self.items.get_mut(i)
+    }
+}
+
+struct Sim {
+    ends: Slab,
+}
+
+fn fnonce_and_then_mut_capture(slab: &mut Slab, peer: Option<usize>) {
+    if let Some(it) = peer.and_then(|p| slab.get_mut(p)) {
+        *it = 1;
+    }
+}
+
+fn fnonce_projected_field_mut_capture(sim: &mut Sim, peer: Option<usize>) {
+    if let Some(it) = peer.and_then(|p| sim.ends.get_mut(p)) {
+        *it = 2;
+    }
+}
+
+fn fnonce_aliasing_conflict_rejected(slab: &mut Slab, peer: Option<usize>) {
+    let it = peer.and_then(|p| slab.get_mut(p));
+    let other = slab.items[0];
+    if let Some(m) = it {
+        *m = other;
+    }
+}
+
+fn fnonce_dangling_return_rejected(peer: Option<usize>) -> Option<&'static mut u8> {
+    let mut slab = Slab { items: [0; 4] };
+    peer.and_then(|p| slab.get_mut(p))
+}
+
+fn call_mut_twice<'a, F: FnMut() -> &'a mut u8>(mut f: F) -> (&'a mut u8, &'a mut u8) {
+    let a = f();
+    let b = f();
+    (a, b)
+}
+
+fn fn_mut_escape_rejected() {
+    let mut x = 0u8;
+    let (_a, _b) = call_mut_twice(|| &mut x);
+}
+
+fn fnonce_by_value_escape_rejected() {
+    let x = 0u8;
+    let r = Some(()).map(move |()| &x);
+    if let Some(p) = r {
+        let _ = *p;
+    }
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn closure_fnonce_env_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/cenv/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "cenv", dir: "/cenv/", root: "/cenv/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in ["fnonce_and_then_mut_capture", "fnonce_projected_field_mut_capture"] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // CONTROL (rule 23): without closure requirements, `fnonce_and_then_mut_capture` falls
+        // back to `NestedOutlives`.
+        let (_, planted) = world.check_borrows_planted(body("fnonce_and_then_mut_capture"), FactsPlant::NoClosureRequirements, alloc);
+        assert!(matches!(planted.refused, Some(BorrowRefused::NestedOutlives { .. })), "CONTROL: {planted:?}");
+
+        // NEGATIVE 1: owner still enforces mutable borrow lifetime of the captured place.
+        let (types, aliasing) = world.check_borrows(body("fnonce_aliasing_conflict_rejected"), alloc);
+        assert!(types.is_clean(), "aliasing types: {types:?}");
+        assert!(aliasing.refused.is_none(), "aliasing refused: {aliasing:?}");
+        assert!(
+            aliasing.findings.iter().any(|d| d.code == "E0503" || d.code == "E0502"),
+            "aliasing must be rejected as E0503/E0502: {aliasing:?}"
+        );
+
+        // NEGATIVE 2: owner rejects returning a borrow of a local slab through `Option::and_then`.
+        let (types, dangling) = world.check_borrows(body("fnonce_dangling_return_rejected"), alloc);
+        assert!(types.is_clean(), "dangling types: {types:?}");
+        assert!(dangling.refused.is_none(), "dangling refused: {dangling:?}");
+        assert!(
+            dangling.findings.iter().any(|d| d.code == "E0515" || d.code == "E0597"),
+            "dangling must be rejected as E0515/E0597: {dangling:?}"
+        );
+
+        // NEGATIVE 3: `FnMut` closure cannot return `&mut` reborrowed from `&mut self`.
+        let (types, fn_mut) = world.check_borrows(body("fn_mut_escape_rejected"), alloc);
+        assert!(types.is_clean(), "fn_mut types: {types:?}");
+        assert!(fn_mut.refused.is_none(), "fn_mut refused: {fn_mut:?}");
+        assert!(
+            fn_mut.findings.iter().any(|d| d.code == "E0521"),
+            "fn_mut escape must be rejected as E0521: {fn_mut:?}"
+        );
+
+        // NEGATIVE 4: `ByValue` capture in a `move` `FnOnce` closure cannot return a reference
+        // to the closure-owned variable.
+        let (types, by_val) = world.check_borrows(body("fnonce_by_value_escape_rejected"), alloc);
+        assert!(types.is_clean(), "by_val types: {types:?}");
+        assert!(by_val.refused.is_none(), "by_val refused: {by_val:?}");
+        assert!(
+            by_val.findings.iter().any(|d| d.code == "E0521"),
+            "by_val escape must be rejected as E0521: {by_val:?}"
+        );
+    }
+}
+
+/// `[NotLaid/DynRegion/Input]` & `[NotLaid/DynRegion/Output]`: trait objects whose principal
+/// trait carries lifetime parameters (`&mut dyn Store<'_>`, `&dyn Store<'m>`,
+/// `Box<dyn Store<'m>>`, `&mut dyn StoreAssoc<'m, Out = &'a u8>`) lay both the object's
+/// default lifetime bound (RFC 599/1156) and the trait's own lifetime arguments soundly.
+#[cfg(test)]
+mod dyn_region_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+trait Store<'m> {
+    fn get(&self) -> &'m u8;
+}
+
+struct MemStore<'m>(&'m u8);
+
+impl<'m> Store<'m> for MemStore<'m> {
+    fn get(&self) -> &'m u8 {
+        self.0
+    }
+}
+
+trait StoreAssoc<'m> {
+    type Out;
+    fn take(&mut self) -> Self::Out;
+}
+
+fn tell_public(store: &mut dyn Store<'_>) -> u8 {
+    *store.get()
+}
+
+fn run_snapshot(store: &dyn Store<'_>) -> u8 {
+    *store.get()
+}
+
+fn read_store<'m>(store: &dyn Store<'m>) -> &'m u8 {
+    store.get()
+}
+
+fn take_box<'m>(store: Box<dyn Store<'m>>) -> &'m u8 {
+    store.get()
+}
+
+fn keep_store<'a, 'm>(store: &'a dyn Store<'m>) -> &'a dyn Store<'m> {
+    store
+}
+
+fn use_assoc<'m, 'a>(store: &mut dyn StoreAssoc<'m, Out = &'a u8>) -> &'a u8 {
+    store.take()
+}
+
+fn dyn_store_named_lifetime_ok<'a, 'm>(store: &'a dyn Store<'m>) -> &'m u8 {
+    let r = read_store(store);
+    r
+}
+
+fn dyn_store_dangling_trait_lifetime_rejected<'a, 'm, 'b>(store: &'a dyn Store<'m>) -> &'b u8 {
+    read_store(store)
+}
+
+fn dyn_store_object_default_dangling_rejected<'a, 'm>(store: &'a dyn Store<'m>) -> &'m dyn Store<'m> {
+    keep_store(store)
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn dyn_trait_lifetimes_and_defaults_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/dynr/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "dynr", dir: "/dynr/", root: "/dynr/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in [
+            "tell_public",
+            "run_snapshot",
+            "read_store",
+            "take_box",
+            "keep_store",
+            "use_assoc",
+            "dyn_store_named_lifetime_ok",
+        ] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1: trait lifetime `'m` of `&'a dyn Store<'m>` cannot satisfy unrelated `'a`.
+        let (types, bad_trait_lt) = world.check_borrows(body("dyn_store_dangling_trait_lifetime_rejected"), alloc);
+        assert!(types.is_clean(), "bad_trait_lt types: {types:?}");
+        assert!(bad_trait_lt.refused.is_none(), "bad_trait_lt refused: {bad_trait_lt:?}");
+        assert!(
+            !bad_trait_lt.findings.is_empty(),
+            "unrelated trait lifetime `'m` -> `'a` must be rejected: {bad_trait_lt:?}"
+        );
+
+        // NEGATIVE 2: default object lifetime `'a` of `&'a dyn Store<'m>` cannot satisfy unrelated `'m`.
+        let (types, bad_obj_lt) = world.check_borrows(body("dyn_store_object_default_dangling_rejected"), alloc);
+        assert!(types.is_clean(), "bad_obj_lt types: {types:?}");
+        assert!(bad_obj_lt.refused.is_none(), "bad_obj_lt refused: {bad_obj_lt:?}");
+        assert!(
+            !bad_obj_lt.findings.is_empty(),
+            "unrelated object lifetime `'a` -> `'m` must be rejected: {bad_obj_lt:?}"
+        );
+    }
+}
+
+/// `[NotLaid/DefaultArg]`: omitted defaulted type arguments whose defaults mention lifetimes
+/// (`Records<'r, 'n, S = &'n Names<'n>>`, `Def<T = &'static u8>`, chained defaults, type aliases
+/// with lifetime defaults, fn-pointer defaults) lay their exact region slots in `PNode::Adt`
+/// order as `Slot::quiet` while preserving Rust soundness and elision rules.
+#[cfg(test)]
+mod default_arg_region_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+struct Names<'n>(&'n u8);
+
+struct Records<'r, 'n, S = &'n Names<'n>> {
+    r: &'r u8,
+    s: S,
+}
+
+struct Def<T = &'static u8>(T);
+
+struct Chain<'a, A = &'a u8, B = (A, &'a u8)>(A, B);
+
+struct FnDef<F = for<'x> fn(&'x u8) -> &'x u8>(F);
+
+type AliasRec<'r, 'n, S = &'n Names<'n>> = Records<'r, 'n, S>;
+
+fn id<'x>(x: &'x u8) -> &'x u8 {
+    x
+}
+
+fn records_elided(r: &Records<'_, '_>) -> u8 {
+    *r.r + *r.s.0
+}
+
+fn records_named<'r, 'n>(r: &'r Records<'r, 'n>) -> &'n u8 {
+    r.s.0
+}
+
+fn def_static_quiet(x: &u8, _y: Def) -> &u8 {
+    x
+}
+
+fn def_in_option(x: &u8, _y: Option<Def>) -> &u8 {
+    x
+}
+
+fn chain_ok<'a>(c: Chain<'a>) -> &'a u8 {
+    c.1.1
+}
+
+fn alias_rec_ok<'r, 'n>(r: &'r AliasRec<'r, 'n>) -> &'n u8 {
+    r.s.0
+}
+
+fn fn_def_ok<'a>(f: FnDef, x: &'a u8) -> &'a u8 {
+    (f.0)(x)
+}
+
+fn calls_all_defaults() {
+    let a = 1u8;
+    let b = 2u8;
+    let names = Names(&b);
+    let rec = Records { r: &a, s: &names };
+    let _ = records_elided(&rec);
+    let n = records_named(&rec);
+    let _ = *n;
+    let d = def_static_quiet(&a, Def(&0));
+    let _ = *d;
+    let o = def_in_option(&a, Some(Def(&0)));
+    let _ = *o;
+    let c = chain_ok(Chain(&a, (&a, &a)));
+    let _ = *c;
+    let ar = alias_rec_ok(&rec);
+    let _ = *ar;
+    let fr = fn_def_ok(FnDef(id), &a);
+    let _ = *fr;
+}
+
+fn records_default_static_rejected<'r, 'n>(r: &'r Records<'r, 'n>) -> &'static u8 {
+    r.s.0
+}
+
+fn records_default_wrong_lt_rejected<'r, 'n>(r: Records<'r, 'n>) -> &'r u8 {
+    r.s.0
+}
+
+fn records_local_dangling_rejected<'a>() -> &'a u8 {
+    let a = 1u8;
+    let b = 2u8;
+    let names = Names(&b);
+    let rec = Records { r: &a, s: &names };
+    records_named(&rec)
+}
+
+fn chain_wrong_lt_rejected<'a, 'b>(c: Chain<'a>) -> &'b u8 {
+    c.1.1
+}
+
+fn def_elision_rejected(d: Def) -> &u8 {
+    d.0
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn defaulted_type_arg_lifetimes_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/defarg/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "defarg", dir: "/defarg/", root: "/defarg/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in [
+            "records_elided",
+            "records_named",
+            "def_static_quiet",
+            "def_in_option",
+            "chain_ok",
+            "alias_rec_ok",
+            "fn_def_ok",
+            "calls_all_defaults",
+        ] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1-4: defaulted lifetime arguments enforce exact outlives and dangling checks.
+        for name in [
+            "records_default_static_rejected",
+            "records_default_wrong_lt_rejected",
+            "records_local_dangling_rejected",
+            "chain_wrong_lt_rejected",
+        ] {
+            let (types, bad) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(bad.refused.is_none(), "{name} must not refuse: {bad:?}");
+            assert!(!bad.findings.is_empty(), "{name} must be rejected: {bad:?}");
+        }
+
+        // NEGATIVE 5: defaulted `'static` in `Def` is `quiet` and does NOT satisfy output elision (E0106).
+        let (elision_types, _) = world.check_borrows(body("def_elision_rejected"), alloc);
+        let elision_text = std::format!("{elision_types:?}");
+        assert!(!elision_types.is_clean(), "def_elision_rejected must fail E0106: {elision_text}");
+        assert!(elision_text.contains("E0106"), "def_elision_rejected must report E0106: {elision_text}");
+    }
+}
+
+/// `NestedOutlives { from: Capture | Param, into: Late }`: NLL closure region propagation through
+/// late-bound regions (`std::thread::scope`'s `'env: 'scope`, and unbounded `for<'a>` propagating
+/// to `'static`), preserving Rust soundness against local-borrow escapes, unbounded type params,
+/// and unprovable `Late -> Late` constraints.
+#[cfg(test)]
+mod nested_late_outlives_tests {
+    use super::{BorrowRefused, FactsPlant};
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+fn scope_mut_capture_ok(xs: &mut [u8], tag: &u8) {
+    std::thread::scope(|scope| {
+        for chunk in xs.chunks_mut(2) {
+            scope.spawn(move || {
+                for slot in chunk.iter_mut() {
+                    *slot = *tag;
+                }
+            });
+        }
+    });
+}
+
+fn scope_generic_param_ok<A: Send>(first: impl FnOnce() -> A + Send) -> A {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(first);
+        handle.join().unwrap()
+    })
+}
+
+fn call_with_any<F>(f: F) -> u8
+where
+    F: for<'a> FnOnce(&'a u8) -> &'a u8,
+{
+    static X: u8 = 42;
+    *f(&X)
+}
+
+static GLOBAL_BYTE: u8 = 7;
+
+fn unbounded_late_static_capture_ok() -> u8 {
+    let r: &'static u8 = &GLOBAL_BYTE;
+    call_with_any(|_x| r)
+}
+
+fn unbounded_late_local_capture_rejected() -> u8 {
+    let local = 1u8;
+    let r = &local;
+    call_with_any(|_x| r)
+}
+
+fn require_for_all<F>(f: F)
+where
+    F: for<'a> FnOnce(&mut &'a u8),
+{
+    static X: u8 = 0;
+    let mut r: &u8 = &X;
+    f(&mut r);
+}
+
+fn need_outlives<'a, T: 'a>(_: &mut &'a u8, _: T) {}
+
+fn unbounded_late_param_rejected<T>(x: T) {
+    require_for_all(move |a| {
+        need_outlives(a, x);
+    });
+}
+
+fn call_two_lates<F>(f: F) -> u8
+where
+    F: for<'a, 'b> FnOnce(&'a u8, &'b u8) -> &'a u8,
+{
+    static X: u8 = 1;
+    let y = 2u8;
+    *f(&X, &y)
+}
+
+fn late_to_late_rejected() -> u8 {
+    call_two_lates(|_x, y| y)
+}
+
+struct FakeScope<'scope, 'env: 'scope> {
+    _marker: core::marker::PhantomData<(&'scope mut &'scope (), &'env mut &'env ())>,
+}
+
+impl<'scope, 'env> FakeScope<'scope, 'env> {
+    fn spawn<F: FnOnce() + 'scope>(&'scope self, _f: F) {}
+}
+
+fn with_fake_scope<'env, F>(_anchor: &mut &'env u8, f: F)
+where
+    F: for<'scope> FnOnce(&'scope FakeScope<'scope, 'env>),
+{
+    let s = FakeScope { _marker: core::marker::PhantomData };
+    f(&s);
+}
+
+fn fake_scope_short_capture_rejected<'env>(anchor: &mut &'env u8) {
+    let local = 1u8;
+    let r = &local;
+    with_fake_scope(anchor, |scope| {
+        scope.spawn(move || {
+            let _ = *r;
+        });
+    });
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn nested_outlives_into_late_propagation_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/nlate/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "nlate", dir: "/nlate/", root: "/nlate/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in ["scope_mut_capture_ok", "scope_generic_param_ok", "unbounded_late_static_capture_ok"] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // CONTROL (rule 23): without closure requirements, `scope_mut_capture_ok` falls back to `NestedOutlives`.
+        let (_, planted) = world.check_borrows_planted(body("scope_mut_capture_ok"), FactsPlant::NoClosureRequirements, alloc);
+        assert!(matches!(planted.refused, Some(BorrowRefused::NestedOutlives { .. })), "CONTROL: {planted:?}");
+
+        // NEGATIVE 1: unbounded `for<'a>` with local borrow capture propagates to `'static` and rejects (E0597).
+        let (types, bad_local) = world.check_borrows(body("unbounded_late_local_capture_rejected"), alloc);
+        assert!(types.is_clean(), "bad_local types: {types:?}");
+        assert!(bad_local.refused.is_none(), "bad_local refused: {bad_local:?}");
+        assert!(bad_local.findings.iter().any(|d| d.code == "E0597"), "bad_local must be E0597: {bad_local:?}");
+
+        // NEGATIVE 2: unbounded `for<'a>` with generic param `T` propagates to `T: 'static` and rejects (E0310).
+        let (types, bad_param) = world.check_borrows(body("unbounded_late_param_rejected"), alloc);
+        assert!(types.is_clean(), "bad_param types: {types:?}");
+        assert!(bad_param.refused.is_none(), "bad_param refused: {bad_param:?}");
+        assert!(bad_param.findings.iter().any(|d| d.code == "E0310"), "bad_param must be E0310: {bad_param:?}");
+
+        // NEGATIVE 3: `Late -> Late` (`'b: 'a`) with no lower bound must never be accepted.
+        let (types, bad_late) = world.check_borrows(body("late_to_late_rejected"), alloc);
+        assert!(types.is_clean(), "bad_late types: {types:?}");
+        assert!(!bad_late.is_clean(), "late_to_late must never be accepted: {bad_late:?}");
+
+        // NEGATIVE 4: explicit outer `'env` longer than local borrow rejects (E0597) after propagation.
+        let (types, bad_scope) = world.check_borrows(body("fake_scope_short_capture_rejected"), alloc);
+        assert!(types.is_clean(), "bad_scope types: {types:?}");
+        assert!(bad_scope.refused.is_none(), "bad_scope refused: {bad_scope:?}");
+        assert!(bad_scope.findings.iter().any(|d| d.code == "E0597"), "bad_scope must be E0597: {bad_scope:?}");
+    }
+}
+
+/// Regression and soundness tests for closures taking `me: &Self` inside `impl<'a> T<'a>` and
+/// `impl T<'_>` (`blaze-consteval/src/machine.rs:1996` and `blaze-native/src/layout.rs:1204`
+/// shapes): `Self`'s container lifetimes are owner regions (`WrittenRegion::Named`), while the
+/// outer `&` on `&Self` remains a per-call late region so returning `&me.tag` is still rejected
+/// with E0521 and returning `'a` as `'static` is still rejected.
+#[cfg(test)]
+mod closure_self_param_region_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+struct Writer<'a> {
+    bytes: &'a [u8],
+    tag: u8,
+}
+
+impl<'a> Writer<'a> {
+    fn slice(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    fn far_ok(&mut self, opt: Option<&'a [u8]>) -> Result<&'a [u8], &'a [u8]> {
+        let far = |me: &Self| -> &'a [u8] { me.slice() };
+        opt.ok_or_else(|| far(self))
+    }
+
+    fn info_ok(&mut self) -> Result<u8, &'a [u8]> {
+        let info = |m: &Self| -> Result<u8, &'a [u8]> {
+            if m.tag == 0 { Err(m.slice()) } else { Ok(m.tag) }
+        };
+        info(self)
+    }
+
+    fn bad_escape_self_ref(&mut self) -> &'a u8 {
+        let bad = |me: &Self| -> &'a u8 { &me.tag };
+        bad(self)
+    }
+
+    fn bad_static_self(&mut self) -> &'static [u8] {
+        let bad = |me: &Self| -> &'static [u8] { me.slice() };
+        bad(self)
+    }
+}
+
+impl Writer<'_> {
+    fn elided_impl_ok(&mut self) -> u8 {
+        let far = |me: &Self| me.slice();
+        far(self).len() as u8
+    }
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn closure_self_param_regions_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/cself/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "cself", dir: "/cself/", root: "/cself/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let member = |method: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Member { name, .. } = body else { return None };
+                    (name == method).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture method {method}"))
+        };
+
+        for name in ["far_ok", "info_ok", "elided_impl_ok"] {
+            let (types, borrows) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1: outer `&` on `me: &Self` is still a per-call late region (E0521).
+        let (types, bad_ref) = world.check_borrows(member("bad_escape_self_ref"), alloc);
+        assert!(types.is_clean(), "bad_escape_self_ref types: {types:?}");
+        assert!(bad_ref.refused.is_none(), "bad_escape_self_ref refused: {bad_ref:?}");
+        assert!(
+            bad_ref.findings.iter().any(|d| d.code == "E0521"),
+            "bad_escape_self_ref must be E0521: {bad_ref:?}",
+        );
+
+        // NEGATIVE 2: `'a` inside `Self` must remain an owner lifetime, never `'static`.
+        let (types, bad_static) = world.check_borrows(member("bad_static_self"), alloc);
+        assert!(types.is_clean(), "bad_static_self types: {types:?}");
+        assert!(!bad_static.is_clean(), "bad_static_self must be rejected: {bad_static:?}");
     }
 }

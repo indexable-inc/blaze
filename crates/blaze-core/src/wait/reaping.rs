@@ -15,7 +15,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::{io, time::Duration};
+// `std::io` is imported only for its pure error/result data types (`Error`, `Result`) carried
+// across the `Children` capability boundary; this module performs no IO.
+use std::{io as os_io, time::Duration};
 
 use super::{Clock, Deadline, WaitError, Waited, parking::Still};
 use crate::world::children::{Child, Life, NoChild};
@@ -27,7 +29,7 @@ pub(crate) trait Children {
 
     /// Reaps `pid` if it has exited, without blocking (`wait4(WNOHANG)`): `None` while it
     /// runs; an error (`ECHILD`) for a pid that is no child, or one reaped already.
-    fn reap_now(&mut self, pid: i32) -> io::Result<Option<Self::Reaped>>;
+    fn reap_now(&mut self, pid: i32) -> os_io::Result<Option<Self::Reaped>>;
 
     /// Waits until `pid` has exited, by `deadline` on `clock` (forever for `None`); with
     /// `keep`, leaves it unreaped (`WNOWAIT`).
@@ -96,8 +98,8 @@ struct Script {
 
 /// What a call about no child fails with. `ECHILD` is opaque to a proof: no run the theorem
 /// claims reaches it.
-fn no_child() -> io::Error {
-    io::Error::other("no child")
+fn no_child() -> os_io::Error {
+    os_io::Error::other("no child")
 }
 
 impl Script {
@@ -114,7 +116,7 @@ impl Script {
 impl Children for Script {
     type Reaped = i32;
 
-    fn reap_now(&mut self, _pid: i32) -> io::Result<Option<i32>> {
+    fn reap_now(&mut self, _pid: i32) -> os_io::Result<Option<i32>> {
         match self.child.reap_now() {
             Ok(reaped) => Ok(reaped),
             Err(NoChild) => Err(no_child()),

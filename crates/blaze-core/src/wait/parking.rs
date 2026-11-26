@@ -110,7 +110,7 @@ pub(crate) fn park<K: Futex, C: Clock>(
     let mut retry = Retry::new(what, deadline, clock.now());
     loop {
         kernel.switch();
-        let waited = match kernel.wait(what, word, PARKED, deadline, clock) {
+        let waited = match Futex::wait(kernel, what, word, PARKED, deadline, clock) {
             Ok(waited) => waited,
             // Not parked any more, whatever the wait says; a token that came is still one.
             Err(error) => {

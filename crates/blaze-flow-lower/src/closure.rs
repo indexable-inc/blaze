@@ -310,8 +310,7 @@ pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_ca
         _ => return Err(Refusal { form: Form::Malformed, range }),
     };
     let Some(row) = row else { return Err(Refusal { form: Form::Malformed, range }) };
-    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new(body, ck, facts, alloc);
-    l.in_nested = true;
+    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new_nested(body, ck, facts, inner, alloc);
     if logged {
         l.b.start_log(alloc);
         l.per_call = true;
@@ -442,9 +441,8 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 match through {
                     None => {
                         self.new_local_with(TyD::of(t), true, Some(l), closure)?;
-                        match self.pat_local.get_mut(p.ix()) {
-                            Some(slot) => *slot = l.0,
-                            None => return self.refuse_pat(Form::Malformed, p),
+                        if !self.set_pat_local(p, l.0) {
+                            return self.refuse_pat(Form::Malformed, p);
                         }
                     }
                     Some(m) => {
@@ -591,7 +589,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
             let pl = self.place_of(l);
             match self.body.pats.get(p.ix()) {
                 Some(Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() => {
-                    self.pat_local[p.ix()] = l.0;
+                    self.set_pat_local(p, l.0);
                 }
                 _ => self.bind_pattern(p, Val { at: At::Place(pl), ty })?,
             }
@@ -623,9 +621,15 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         e: ExprId,
     ) -> Result<(), Refusal> {
         let n = self.npos_d(t, e)?;
-        let mut live_mask: Vec<crate::OriginLive, A> = Vec::new_in(self.alloc);
-        if n > 0 {
-            self.origin_live_mask(t, &mut live_mask, e)?;
+        let mut live_mask = core::mem::replace(&mut self.live_mask_scratch, Vec::new_in(self.alloc));
+        let mask_res = if n > 0 {
+            self.origin_live_mask(t, &mut live_mask, e)
+        } else {
+            Ok(())
+        };
+        if let Err(err) = mask_res {
+            self.live_mask_scratch = live_mask;
+            return Err(err);
         }
         let start = to_u32(self.origs.len());
         for k in 0..to_usize(n) {
@@ -648,6 +652,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
             }
             self.origs.push(o);
         }
+        self.live_mask_scratch = live_mask;
         self.set_local(l, t, start, n);
         let identity = match l {
             Local(0) => crate::Identity::Return,

@@ -30,7 +30,8 @@
 #[cfg(test)]
 extern crate std;
 
-use core::{alloc::Allocator, fmt};
+use core::alloc::Allocator;
+use core::fmt;
 
 use blaze_own::{
     String, Vec,

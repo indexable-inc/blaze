@@ -266,6 +266,30 @@ type ThroughImpl<'b, A> = Option<(PTy, &'b [Region], ImplBinds<A>)>;
 impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> {
     /// The region slots of `t` (the module doc), bounded.
     pub(crate) fn region_slots(&self, t: PTy, e: ExprId) -> Result<u32, Refusal> {
+        if let Some(cached) = self.npos_cached(t) {
+            return Ok(cached);
+        }
+        let quick = match self.node(t, e)? {
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Str
+            | PNode::Never
+            | PNode::Param(_)
+            | PNode::Error
+            | PNode::ConstValue { .. }
+            | PNode::ConstParam(_)
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => Some(0),
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(0),
+            _ => None,
+        };
+        if let Some(ans) = quick {
+            self.npos_cache_set(t, ans);
+            return Ok(ans);
+        }
         let mut path: Vec<ExprId, A> = Vec::new_in(self.alloc);
         self.region_slots_in(t, &mut path, e)
     }
@@ -273,13 +297,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
     /// [`Lower::region_slots`] inside the bodies `path` (the body expressions whose captures
     /// are being counted, outermost first).
     fn region_slots_in(&self, t: PTy, path: &mut Vec<ExprId, A>, e: ExprId) -> Result<u32, Refusal> {
+        if let Some(cached) = self.npos_cached(t) {
+            return Ok(cached);
+        }
         let mut table: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc);
         self.body_slots_in(t, &mut table, path, e)?;
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let types = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &table);
         match types.count(t) {
-            Ok(n) if n.get() <= MOST_POSITIONS => Ok(n.get()),
+            Ok(n) if n.get() <= MOST_POSITIONS => {
+                // Only cache types with no local closure/future capture walk so
+                // `MOST_BODY_NEST` is never bypassed across chained nested closures.
+                if table.is_empty() {
+                    self.npos_cache_set(t, n.get());
+                }
+                Ok(n.get())
+            }
             Ok(_) => self.refuse(Form::Bound, e),
             Err(u) => self.uncounted(u, e),
         }
@@ -303,8 +337,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let cols = Columns::new(self.tys, &arity, &arity);
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
-        stack.push(t);
+        let mut stack = crate::TyStack::new(t, self.alloc);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;

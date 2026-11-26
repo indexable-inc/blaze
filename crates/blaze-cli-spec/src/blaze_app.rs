@@ -149,7 +149,11 @@ const CI_FLAGS: &[ArgSpec] = &[
 ];
 
 const INSPECT_FLAGS: &[ArgSpec] = &[
-    flag_bool("json", "json", None, "Emit JSON output", false),
+    flag_value("lines", "lines", None, "<start-end>", "Inspect an inclusive 1-based line range (e.g. 10-80 or 42)", false),
+    flag_bool("json", "json", None, "Emit deterministic JSON output", false),
+    flag_bool("no-docs", "no-docs", None, "Omit inline LSP hover docs and Referenced Docs appendix", false),
+    flag_bool("no-outline", "no-outline", None, "Omit item outline header", false),
+    flag_bool("no-types", "no-types", None, "Skip front2 semantic type inlay hints (outline + docs only)", false),
     flag_bool("all-exprs", "all-exprs", None, "Include all sub-expressions", false),
     flag_bool("no-coercions", "no-coercions", None, "Omit coercion hints", false),
     flag_bool("no-defaults", "no-defaults", None, "Omit defaulted argument hints", false),
@@ -254,8 +258,8 @@ const COMMANDS: &[CommandSpec] = &[
         name: "inspect",
         aliases: &[],
         hidden: false,
-        about: "Inspect lowered MIR/types for a file or function",
-        usage_args: "<file.rs[::fn]> [options]",
+        about: "View a file, line slice, or item with inline types and LSP-style docs",
+        usage_args: "<file.rs[:start-end|::item]> [options]",
         flags: INSPECT_FLAGS,
         accepts_passthrough: false,
     },

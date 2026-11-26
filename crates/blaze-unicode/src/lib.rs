@@ -11,8 +11,7 @@
 //! [`UNICODE_VERSION`]; nothing here is edited by hand.
 //!
 //! No dependency, and nothing allocates: [`nfd_chars`] gives NFD's characters for the caller to
-//! put where it keeps text. `alloc` only for the deprecated [`nfd`], which writes into a
-//! global-heap `String`, while its one caller (blaze-fetch) moves.
+//! put where it keeps text, and [`nfd`] appends them to any [`core::iter::Extend<char>`].
 
 #![no_std]
 #![feature(register_tool, custom_inner_attributes)]
@@ -20,9 +19,6 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
-
-// Only the deprecated [`nfd`]'s `String`: it goes with its last caller, and this line with it.
-extern crate alloc;
 
 // The tests' `String`, `Vec` and `format!`.
 #[cfg(test)]

@@ -45,10 +45,10 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use call::call;
+pub use call::{CallScratch, call, call_in};
 pub use inst::{
     Arg, Ask, Callee, Clause, ClauseIn, EnvId, Envs, GenericArgs, ImplHead, ImplValue, Inst, Late, NotSelected, RpititTarget, Selected,
-    Selection, SelfShape, Side, Sig, Slots, Typed, ValueKind, instantiate, split_fn_col,
+    Selection, SelfShape, Side, Sig, Slots, Typed, ValueKind, instantiate, instantiate_into, split_fn_col, split_fn_col_into,
 };
 pub use relate::{ClosureSig, Constraints, Cx, Kind, Owner, clauses, head_eq, relate, relate_sides, well_formed};
 pub use sink::FlowConstraints;

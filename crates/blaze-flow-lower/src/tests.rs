@@ -1470,3 +1470,68 @@ fn shared_index_of_immutable_static_returns_static() {
         "CONTROL: &local_arr[i] must NOT return &'static: {got_b:?}",
     );
 }
+
+/// Regression test for the 1 GiB bump-frame OOM on large bodies with many closures (e.g.
+/// `emit_sota_a64_with_abi` with ~54k exprs and ~600 closures): lowering `K` nested closures inside
+/// a large enclosing body must scale with each closure's own size (`O(K + E)`), not `O(K * E)`,
+/// and repeated calls/assignments must reuse scratch buffers rather than leaking into the frame.
+#[test]
+fn large_body_with_many_closures_stays_within_small_bump_frame() {
+    let (fx, f, facts) = closure_world();
+    let mut b = Bb::new();
+    let s = b.param("s");
+    let mut stmts = vec::Vec::new();
+    let mut closures = vec::Vec::new();
+
+    // 200 closures, each capturing `s` by shared reference and calling `g(&s)`.
+    for _ in 0..200usize {
+        let callee = b.path(&["g"]);
+        let ls = b.local(s);
+        let bor = b.borrow(Mutbl::Not, ls);
+        let inner = b.call(callee, &[bor]);
+        let cl = b.closure(&[], inner);
+        closures.push(cl);
+        let pc = b.bind("c");
+        stmts.push(b.let_(pc, None, cl));
+    }
+
+    // 1,500 additional let-borrow + call pairs (~7,500 exprs, ~1,500 pats) to enlarge the
+    // enclosing body (`E > 8,500`, `P > 1,700`). Previously `Lower::new` allocated ~25*E + 8*P
+    // (~226 KB) per closure (> 45 MB for 200 closures alone) plus per-call Vec leaks.
+    for _ in 0..1_500usize {
+        let ls = b.local(s);
+        let bor = b.borrow(Mutbl::Not, ls);
+        let pr = b.bind("r");
+        stmts.push(b.let_(pr, None, bor));
+        let callee = b.path(&["g"]);
+        let lr = b.local(pr);
+        let call = b.call(callee, &[lr]);
+        stmts.push(b.semi(call));
+    }
+
+    let root = b.block(&stmts, None);
+    let view = b.view(f, root);
+    assert!(view.exprs.len() > 8_000, "synthetic body should be large: {}", view.exprs.len());
+    let mut ck = region_fixture::checked(&fx, &view);
+    let regions = facts.decls().lay(fx.t.view(), &mut ck.types);
+    let with = region_fixture::WithRegions { base: &facts, regions: &regions };
+
+    // 8 MiB hard cap: old O(K * E) tables needed > 45 MiB for this body and would panic here.
+    let frame = std::boxed::Box::new(blaze_own::Inline::<{ 8 * 1024 * 1024 }>::new());
+    let mut lowered_closures = vec::Vec::with_capacity(closures.len());
+    for &cl in &closures {
+        let got = crate::closure::lower_closure_external(&view, &ck, cl, &with, &*frame)
+            .expect("nested closure lowers cleanly inside 8 MiB bump frame");
+        lowered_closures.push(got);
+    }
+    let after_closures = frame.used();
+    let owner_lowered = crate::lower(&view, &ck, &with, &*frame)
+        .expect("enclosing body lowers cleanly inside 8 MiB bump frame");
+    let peak = frame.used();
+    assert_eq!(lowered_closures.len(), 200);
+    assert!(owner_lowered.stats.calls_by_signature >= 1_500);
+    assert!(
+        after_closures < 2 * 1024 * 1024 && peak < 6 * 1024 * 1024,
+        "bump-frame usage too high: after_200_closures={after_closures}B, total_peak={peak}B",
+    );
+}

@@ -32,7 +32,7 @@ use std::vec::Vec;
 
 use super::{Want, check_body, differences};
 use crate::body::IntSuffix;
-use crate::diag::DiagCode;
+use crate::diag::{DiagCode, Node};
 use crate::fixture::{Bb, Fx};
 use crate::ids::{ItemKey, LangItem, Mutbl, UintTy};
 use crate::infer::InferPlant;
@@ -158,4 +158,152 @@ fn an_argument_needing_a_coercion_rust_lacks_is_refused() {
     let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::Mismatch, arg)] };
     let d = written(differences(&fx, &b, &c, &want));
     assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// World for trait-method return deref coercion under an expected `&str`
+/// (`blaze-source/src/interning.rs:37`, `InternedString { inner: strings.get(at) }`):
+///
+/// ```text
+/// #[lang = "sized"] trait Sized {}
+/// #[lang = "deref"] trait Deref { type Target: ?Sized; }
+/// struct Box<T: ?Sized>;
+/// impl<T: ?Sized> Deref for Box<T> { type Target = T; }
+/// struct Idx<T>;
+/// trait Interner<T: Sized> { fn get(&self, idx: Idx<T>) -> &T; }
+/// struct Sharded<T>;
+/// impl<T> Interner<T> for Sharded<T> { fn get(&self, idx: Idx<T>) -> &T; }
+/// struct Multi;
+/// impl Interner<Box<str>> for Multi { fn get(&self, idx: Idx<Box<str>>) -> &Box<str>; }
+/// impl Interner<u8> for Multi { fn get(&self, idx: Idx<u8>) -> &u8; }
+/// ```
+///
+/// Returns `(fx, [sharded_ok, multi_ok, sharded_wrong_idx, sharded_no_deref])`.
+fn interner_world() -> (Fx, [ItemKey; 4]) {
+    let mut world = Fx::new();
+    let fx = &mut world;
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let deref = fx.tr("Deref", 1, Vec::new(), &["Target"]);
+    fx.lang(LangItem::Deref, deref);
+
+    let (u8_, p0, p1) = (fx.u8(), fx.param(0), fx.param(1));
+    let str_ = fx.ty(PNode::Str);
+    let r_str = fx.r(Mutbl::Not, str_);
+    let r_u8 = fx.r(Mutbl::Not, u8_);
+
+    let box_k = fx.strukt("Box", 1, &[]);
+    let box_p0 = fx.adt(box_k, &[p0]);
+    let box_deref = fx.imp("impl<T: ?Sized> Deref for Box<T>", 1, box_p0, Some((deref, &[])), &[("Target", p0)], Vec::new());
+    fx.unsized_param(box_deref, 0);
+    let box_str = fx.adt(box_k, &[str_]);
+    let r_box_str = fx.r(Mutbl::Not, box_str);
+
+    let idx_k = fx.strukt("Idx", 1, &[]);
+    let idx_p0 = fx.adt(idx_k, &[p0]);
+    let idx_p1 = fx.adt(idx_k, &[p1]);
+    let idx_box_str = fx.adt(idx_k, &[box_str]);
+    let idx_u8 = fx.adt(idx_k, &[u8_]);
+
+    let interner = fx.tr("Interner", 2, Vec::new(), &[]);
+    let r_self = fx.r(Mutbl::Not, p0);
+    let r_t = fx.r(Mutbl::Not, p1);
+    let t_sized = fx.bound(sized, &[p1]);
+    fx.trait_fn_own(interner, "get", true, 0, &[r_self, idx_p1], r_t, std::vec![t_sized]);
+    fx.use_trait(interner);
+
+    let sharded_k = fx.strukt("Sharded", 1, &[]);
+    let sharded_p0 = fx.adt(sharded_k, &[p0]);
+    let r_sharded_p0 = fx.r(Mutbl::Not, sharded_p0);
+    let r_p0 = fx.r(Mutbl::Not, p0);
+    let imp_sharded = fx.imp("impl<T> Interner<T> for Sharded<T>", 1, sharded_p0, Some((interner, &[p0])), &[], Vec::new());
+    fx.impl_fn(imp_sharded, "get", true, &[r_sharded_p0, idx_p0], r_p0);
+
+    let multi_k = fx.strukt("Multi", 0, &[]);
+    let multi_ty = fx.adt(multi_k, &[]);
+    let r_multi = fx.r(Mutbl::Not, multi_ty);
+    let imp_multi_str = fx.imp("impl Interner<Box<str>> for Multi", 0, multi_ty, Some((interner, &[box_str])), &[], Vec::new());
+    fx.impl_fn(imp_multi_str, "get", true, &[r_multi, idx_box_str], r_box_str);
+    let imp_multi_u8 = fx.imp("impl Interner<u8> for Multi", 0, multi_ty, Some((interner, &[u8_])), &[], Vec::new());
+    fx.impl_fn(imp_multi_u8, "get", true, &[r_multi, idx_u8], r_u8);
+
+    let sharded_box_str = fx.adt(sharded_k, &[box_str]);
+    let r_sharded_box_str = fx.r(Mutbl::Not, sharded_box_str);
+    let sharded_u8 = fx.adt(sharded_k, &[u8_]);
+    let r_sharded_u8 = fx.r(Mutbl::Not, sharded_u8);
+
+    let sharded_ok = fx.func("sharded_ok", 0, &[r_sharded_box_str, idx_box_str], r_str, Vec::new());
+    let multi_ok = fx.func("multi_ok", 0, &[r_multi, idx_box_str], r_str, Vec::new());
+    let sharded_wrong_idx = fx.func("sharded_wrong_idx", 0, &[r_sharded_box_str, idx_u8], r_str, Vec::new());
+    let sharded_no_deref = fx.func("sharded_no_deref", 0, &[r_sharded_u8, idx_u8], r_str, Vec::new());
+    fx.finish();
+    (world, [sharded_ok, multi_ok, sharded_wrong_idx, sharded_no_deref])
+}
+
+/// `strings.get(at)` on `&Sharded<Box<str>>` returning `&str`: the unique impl
+/// `impl<T> Interner<T> for Sharded<T>` resolves `?T = Box<str>` before `expected_inputs` probes
+/// `&?T` against `&str`, so `strings.get(at)` returns `&Box<str>` and deref-coerces to `&str`.
+#[test]
+fn trait_method_output_resolves_obligations_before_expected_inputs_probe() {
+    let (fx, [sharded_ok, ..]) = interner_world();
+    let mut b = Bb::new();
+    let strings = b.param("strings");
+    let at = b.param("at");
+    let recv = b.local(strings);
+    let arg = b.local(at);
+    let call = b.method(recv, "get", &[arg]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, sharded_ok, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "sharded_ok: {:?}", c.diags);
+}
+
+/// `m.get(at)` on `&Multi` (implementing both `Interner<Box<str>>` and `Interner<u8>`, neither
+/// for `str`) returning `&str`: probing `?T = str` violates `Multi: Interner<str>` and
+/// `str: Sized`, so `expected_inputs` does not bind `?T = str`; `at` infers `?T = Box<str>` and
+/// `&Box<str>` deref-coerces to `&str`.
+#[test]
+fn multi_impl_trait_method_does_not_bind_unsatisfied_expected_output() {
+    let (fx, [_, multi_ok, ..]) = interner_world();
+    let mut b = Bb::new();
+    let m = b.param("m");
+    let at = b.param("at");
+    let recv = b.local(m);
+    let arg = b.local(at);
+    let call = b.method(recv, "get", &[arg]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, multi_ok, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "multi_ok: {:?}", c.diags);
+}
+
+/// Negative control: `strings.get(bad_at)` on `&Sharded<Box<str>>` with `bad_at: Idx<u8>` fails
+/// once with E0308 at `bad_at` (`Idx<u8>` vs `Idx<Box<str>>`), with no bogus E0277 for `str`.
+#[test]
+fn trait_method_wrong_idx_reports_mismatch_without_str_unsatisfied() {
+    let (fx, [_, _, sharded_wrong_idx, _]) = interner_world();
+    let mut b = Bb::new();
+    let strings = b.param("strings");
+    let at = b.param("at");
+    let recv = b.local(strings);
+    let arg = b.local(at);
+    let call = b.method(recv, "get", &[arg]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, sharded_wrong_idx, root, Plant::None, InferPlant::None);
+    let got: Vec<_> = c.diags.iter().map(|d| (d.code, d.node)).collect();
+    assert_eq!(got, std::vec![(DiagCode::Mismatch, Some(Node::Expr(arg)))], "sharded_wrong_idx: {:?}", c.diags);
+}
+
+/// Negative control: `strings.get(at)` on `&Sharded<u8>` returning `&str` still fails with E0308
+/// at the call because `&u8` does not deref-coerce to `&str`.
+#[test]
+fn trait_method_output_without_deref_to_expected_ref_is_mismatch() {
+    let (fx, [_, _, _, sharded_no_deref]) = interner_world();
+    let mut b = Bb::new();
+    let strings = b.param("strings");
+    let at = b.param("at");
+    let recv = b.local(strings);
+    let arg = b.local(at);
+    let call = b.method(recv, "get", &[arg]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, sharded_no_deref, root, Plant::None, InferPlant::None);
+    let got: Vec<_> = c.diags.iter().map(|d| (d.code, d.node)).collect();
+    assert_eq!(got, std::vec![(DiagCode::Mismatch, Some(Node::Expr(call)))], "sharded_no_deref: {:?}", c.diags);
 }

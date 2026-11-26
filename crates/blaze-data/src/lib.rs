@@ -66,8 +66,9 @@ mod std_types;
 mod value;
 mod walk;
 
-// The `std` feature's impls name std's types; the tests' models are std's maps and vectors.
-#[cfg(any(feature = "std", test))]
+// The tests' models are std's maps and vectors (`std_types` brings in its own `extern crate std`
+// under the `std` feature).
+#[cfg(test)]
 extern crate std;
 
 #[cfg(test)]

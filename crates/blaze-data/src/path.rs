@@ -7,7 +7,8 @@
 
 #![blaze::sans_io]
 
-use core::{alloc::Allocator, cell::RefCell, fmt, fmt::Write as _};
+use core::alloc::Allocator;
+use core::{cell::RefCell, fmt, fmt::Write as _};
 
 use blaze_own::{String, Vec};
 

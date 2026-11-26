@@ -68,7 +68,7 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
-    fn wait(&self) -> bool {
+    fn is_waiting(&self) -> bool {
         match *self {
             Outcome::Import { wait, .. } | Outcome::Glob { wait, .. } | Outcome::Call { wait, .. } => wait,
         }
@@ -660,7 +660,7 @@ impl<'a, N: Name> Work<'a, N> {
             }
             if self.relaxing {
                 self.outcomes.insert((m, item), o);
-                if o.wait() && !blocked(&ms[mu], item) {
+                if o.is_waiting() && !blocked(&ms[mu], item) {
                     if self.first_round {
                         self.raised.push((m, item));
                     } else {

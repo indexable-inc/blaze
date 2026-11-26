@@ -5,8 +5,8 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use crate::flow::{Bound, Flow};
-use crate::loans::{BorrowFinding, LoanParts, TierOne, facts, loan_parts, tier_one, tier_two};
-use crate::moves::{MoveFinding, check_moves_planted};
+use crate::loans::{BorrowFinding, LoanParts, TierOne, facts, facts_with_inits, loan_parts, tier_one, tier_two};
+use crate::moves::{MoveFinding, check_moves_planted, check_moves_with_inits, inits};
 
 /// A planted bug for the simulations' controls; `None` everywhere but in a control.
 #[doc(hidden)]
@@ -71,8 +71,18 @@ pub fn check_planted<A: Allocator + Copy>(
     plant: Plant,
     alloc: A,
 ) -> Result<Record<A>, Bound> {
-    let moves = check_moves_planted(flow, plant, alloc)?;
-    let facts = facts(flow, alloc)?;
+    // Share the unplanted `Inits` between the move check and `facts` (when `MovesIntersect` is
+    // planted, keep it isolated to moves so liveness still sees the unplanted init dataflow).
+    let (moves, facts) = if plant == Plant::MovesIntersect {
+        let moves = check_moves_planted(flow, plant, alloc)?;
+        let facts = facts(flow, alloc)?;
+        (moves, facts)
+    } else {
+        let st = inits(flow, Plant::None, alloc)?;
+        let moves = check_moves_with_inits(flow, &st, plant, alloc);
+        let facts = facts_with_inits(flow, st, alloc)?;
+        (moves, facts)
+    };
     let (borrows, tier) = match tier_one(flow, &facts, plant, alloc)? {
         TierOne::Accepted => (Vec::new_in(alloc), 1),
         TierOne::Refused => (tier_two(flow, &facts, plant, alloc)?, 2),

@@ -13,7 +13,8 @@
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
-#![deny(blaze::std_use)]
+// Not yet `blaze::std_use`: `extern crate alloc` stays for `impl Out for alloc::vec::Vec<u8>` in
+// `out.rs` until `blaze-http` and `blaze-std` move their buffers to `blaze_own::Vec`.
 #![deny(blaze::implicit_allocator)]
 #![deny(blaze::process_static)]
 #![forbid(unsafe_code)]

@@ -37,7 +37,7 @@ use super::scoped::ScopedBy;
 use super::source::NamesSource;
 use super::spell::Spelling;
 use super::type_miss::TypeMiss;
-use super::types::{Bounds, Builder, Env, ParamBound, SelfTy, Why};
+use super::types::{Bounds, Builder, ContainerParamBound, Env, HeadsArity, ParamBound, SelfGiven, SelfTy, Why};
 use crate::resolve::Paths;
 
 /// What a body's lowering did not take, by its range in the item's text (or past it, in an
@@ -408,6 +408,9 @@ struct BodyTypes<'b, S> {
     /// The fn heads made so far (`Store::fns`): a callee's `#[rustc_legacy_const_generics]`
     /// positions ([`Types::legacy_term`]).
     legacy: &'b dyn LegacyPositions,
+    /// Enclosing container `Self` regions, impl trait regions, and container + fn parameter bounds
+    /// handed to `RegionSink::set_given` when laying closure parameter annotations (`&Self`, `P::Cx`).
+    self_given: SelfGiven<'b>,
 }
 
 /// A fn's `#[rustc_legacy_const_generics(..)]` positions, by its key: what
@@ -743,6 +746,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
             env.module = block.module;
         }
         let mut sink = super::types::RegionSink::new_in(self.mark_alloc);
+        sink.set_given(self.self_given);
         let Ok(made) = self.builder.ty_regions(tys, &env, view, t, &mut sink) else {
             return false;
         };
@@ -830,6 +834,56 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                         let Some(dst) = stack.get_mut(sp) else { return false };
                         *dst = (child, next);
                         sp += 1;
+                    }
+                }
+                blaze_typeck::PNode::Alias { trait_, name, args } => {
+                    let Some(trait_count) = super::types::declared_lifetimes(
+                        self.builder.heads,
+                        self.builder.resolver.names,
+                        trait_,
+                        super::types::Declared::Trait,
+                    ) else {
+                        return false;
+                    };
+                    let Some(own_count) = super::types::declared_lifetimes(
+                        self.builder.heads,
+                        self.builder.resolver.names,
+                        trait_,
+                        super::types::Declared::Assoc(name),
+                    ) else {
+                        return false;
+                    };
+                    let Some(nl) = trait_count.checked_add(own_count) else { return false };
+                    for own in 0..nl {
+                        let Some(&slot) = slots.get(cursor) else { return false };
+                        cursor += 1;
+                        if let Some(kind) = kind_of(slot) {
+                            out(blaze_typeck::ClosureParamRegion { closure, param, path, own, kind });
+                        }
+                    }
+                    let Ok(arg_list) = tys.list(args) else { return false };
+                    for (ci, &child) in arg_list.iter().enumerate().rev() {
+                        let Ok(ci_u32) = u32::try_from(ci) else { return false };
+                        let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else { return false };
+                        let Some(dst) = stack.get_mut(sp) else { return false };
+                        *dst = (child, next);
+                        sp += 1;
+                    }
+                }
+                blaze_typeck::PNode::Dynamic(_) => {
+                    let arity = HeadsArity { heads: self.builder.heads, opaques: &[], names: self.builder.resolver.names };
+                    let Ok(sub) = super::types::subtree(tys, ty, &arity, self.mark_alloc) else { return false };
+                    let Ok(total) = usize::try_from(sub.slots) else { return false };
+                    if total > 0 {
+                        let Some(&slot) = slots.get(cursor) else { return false };
+                        if let Some(kind) = kind_of(slot) {
+                            out(blaze_typeck::ClosureParamRegion { closure, param, path, own: 0, kind });
+                        }
+                        let Some(next_cursor) = cursor.checked_add(total) else { return false };
+                        if next_cursor > slots.len() {
+                            return false;
+                        }
+                        cursor = next_cursor;
                     }
                 }
                 blaze_typeck::PNode::Bool
@@ -1306,6 +1360,8 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     let site = Site {
         item,
         owner,
+        regions_owner: head_key,
+        container,
         krate,
         module: head.module,
         text,
@@ -1357,7 +1413,14 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
     let head = store.fns.get(&owner).ok_or(BodyError::NoHead(owner))?;
     let alloc = store.work_alloc();
     let site = Site {
-        item, owner, krate, module, text, marks,
+        item,
+        owner,
+        regions_owner: owner,
+        container: head.container,
+        krate,
+        module,
+        text,
+        marks,
         params: copy_slice(&head.params, alloc),
         consts: copy_slice(&head.consts, alloc),
         bounds: copy_slice(&head.bounds, alloc),
@@ -1424,6 +1487,8 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     let site = Site {
         item: head.lib,
         owner: key,
+        regions_owner: key,
+        container: head.container,
         krate,
         module: head.module,
         text: head.text,
@@ -1467,6 +1532,10 @@ fn refused_head<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>
 struct Site<'n> {
     item: LibKey,
     owner: ItemKey,
+    /// Checker key whose head regions (`Store::regions`) hold this fn's declared `where` bounds.
+    regions_owner: ItemKey,
+    /// Enclosing trait or impl container (`FnHead::container`), for `Self` / impl-trait / container bounds.
+    container: Option<ItemKey>,
     krate: usize,
     module: LibKey,
     text: &'n str,
@@ -1563,7 +1632,7 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
 
 #[expect(clippy::too_many_arguments, reason = "internal body lowering entry point")]
 fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>, param_subst: Option<&[PTy]>, extra_extensions: parser::Extensions) -> Result<Body<'n>, BodyError> {
-    let Site { item, owner, krate, module, text, marks, params, consts, bounds, self_, self_assoc } = site;
+    let Site { item, owner, regions_owner, container, krate, module, text, marks, params, consts, bounds, self_, self_assoc } = site;
     // The body's local items keep these marks for their own heads and bodies (locals.rs
     // `LocalHead::marks`).
     let text_marks = marks;
@@ -1701,7 +1770,46 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     note_body_record_field_names(&view, &store.maps);
     let mut last = item;
     let mut typeck = None;
+    let mut given_param_bounds: blaze_own::Vec<ContainerParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     for _ in 0..MOST_ROUNDS {
+        let mut given_self: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
+        let mut given_impl_trait: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
+        given_param_bounds.clear();
+        if let Some(cr) = container.and_then(|c| store.container_regions.get(&c)) {
+            if matches!(self_, SelfTy::Ty(..)) {
+                if let Some(sr) = cr.self_regions.as_deref() {
+                    let mut v = blaze_own::Vec::with_capacity_in(sr.len(), alloc);
+                    v.extend_from_slice(sr);
+                    given_self = Some(v);
+                }
+                if let Some(tr) = cr.trait_regions.as_deref() {
+                    let mut v = blaze_own::Vec::with_capacity_in(tr.len(), alloc);
+                    v.extend_from_slice(tr);
+                    given_impl_trait = Some(v);
+                }
+            }
+            for pb in &cr.param_bounds {
+                let mut regs = blaze_own::Vec::with_capacity_in(pb.regions.len(), alloc);
+                regs.extend_from_slice(&pb.regions);
+                given_param_bounds.push(ContainerParamBound { param: pb.param, trait_: pb.trait_, regions: regs });
+            }
+        }
+        if let Some(filed) = store.regions.made(regions_owner) {
+            let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
+            super::heads::extract_elaborated_param_bounds(
+                store.tys.view(),
+                &store.regions,
+                &arity,
+                &filed.regions().clauses,
+                &mut given_param_bounds,
+                alloc,
+            );
+        }
+        let self_given = SelfGiven {
+            self_: given_self.as_deref(),
+            impl_trait: given_impl_trait.as_deref(),
+            param_bounds: &given_param_bounds,
+        };
         let mut types = BodyTypes {
             mark_alloc: alloc,
             // Every word's mark is in the lowered record (`View::mark_of_path`): an expansion's
@@ -1728,6 +1836,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             owner,
             async_ret,
             legacy: &store.fns,
+            self_given,
         };
         // Each round converts into a fresh overlay of the records' table (read in place, never
         // copied): a refused round's types are dropped with it, none reaches `store.tys`, and
@@ -2178,7 +2287,7 @@ mod closure_param_regions_tests {
     use blaze_typeck::{ClosureParamRegion, WrittenRegion};
     use blaze_unit_graph::{Implicit, Prelude, StdIs};
 
-    use super::{Store, lower_fn};
+    use super::{Store, lower_fn, lower_member};
     use crate::front2::Front2;
     use crate::refusal::SourceFile;
 
@@ -2218,6 +2327,51 @@ mod closure_param_regions_tests {
             .find(|(k, _, _)| names.item_text(*k).and_then(|t| t.name) == Some(fn_name))
             .expect("target fn");
         let body = lower_fn(&names, &prepared, &mut front.keys, &mut store, item).expect("lower_fn");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.typeck.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+        out
+    }
+
+    fn lower_member_regions<'a>(source: &str, method_name: &str, alloc: blaze_own::Alloc<'a>) -> blaze_own::Vec<(u32, u64, u32, WrittenRegion), blaze_own::Alloc<'a>> {
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let heap = blaze_own::testing::heap();
+        let store_alloc = heap.alloc();
+        let input = CrateInput {
+            name: "fnptr_test",
+            key: CrateItemKey(ContentId::of("closure_param_regions_member_test", b"member_test")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(source), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: source }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+        let mut target = None;
+        for (item, _, _) in names.items(0) {
+            if names.item_text(item).is_some_and(|t| t.text.trim_start().starts_with("impl")) {
+                store.ensure(&names, &mut front.keys, super::Want::Impl(item)).expect("impl head");
+            }
+        }
+        for (&key, head) in store.fns.iter() {
+            if head.text.contains(&std::format!("fn {method_name}(")) {
+                target = Some(key);
+                break;
+            }
+        }
+        let key = target.expect("target member fn");
+        let body = lower_member(&names, &prepared, &mut front.keys, &mut store, key).expect("lower_member");
         let mut out = blaze_own::Vec::new_in(alloc);
         for r in body.typeck.closure_param_regions.iter() {
             out.push((r.param, r.path, r.own, r.kind));
@@ -2275,6 +2429,76 @@ pub fn hrtb_alias_and_tuple<'a>() {
                 (1, step(root, 1), 0, WrittenRegion::Named),
                 (1, step(root, 2), 0, WrittenRegion::Static),
                 (2, step(root, 1), 0, WrittenRegion::Named),
+            ]
+        );
+    }
+
+    #[test]
+    fn front2_closure_param_regions_self_alias_and_dyn() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub trait Tr {}
+pub trait Pool<'a> {
+    type Cx;
+}
+pub struct Writer<'a> {
+    pub r: &'a u8,
+    pub tag: u8,
+}
+impl<'a> Writer<'a> {
+    pub fn use_self(&self) {
+        let _ = |me: &Self, out: &'a u8| { let _ = (me, out); };
+    }
+}
+impl Writer<'_> {
+    pub fn use_elided_self(&self) {
+        let _ = |me: &Self| { let _ = me; };
+    }
+}
+pub fn use_proj<'a, P: Pool<'a>>() {
+    let _ = |cx: &P::Cx, x: &'a u8| { let _ = (cx, x); };
+}
+pub fn use_dyn<'a>() {
+    let _ = |a: &(dyn Tr + 'a), b: &(dyn Tr + 'static), c: &dyn Tr| { let _ = (a, b, c); };
+}
+"#;
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+
+        // `|me: &Self, out: &'a u8|` in `impl<'a> Writer<'a>`:
+        // outer `&` on `me` is elided (per-call late), while `Self`'s `'a` is `Named`.
+        assert_eq!(
+            &lower_member_regions(src, "use_self", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (1, root, 0, WrittenRegion::Named),
+            ]
+        );
+
+        // `|me: &Self|` in `impl Writer<'_>`: elided impl lifetime is an owner lifetime of `Self`.
+        assert_eq!(
+            &lower_member_regions(src, "use_elided_self", alloc)[..],
+            &[(0, step(root, 0), 0, WrittenRegion::Named)]
+        );
+
+        // `|cx: &P::Cx, x: &'a u8|` in `fn use_proj<'a, P: Pool<'a>>()`:
+        // outer `&` on `cx` is elided (late), while `P::Cx`'s trait lifetime `'a` is `Named`.
+        assert_eq!(
+            &lower_regions(src, "use_proj", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (1, root, 0, WrittenRegion::Named),
+            ]
+        );
+
+        // `|a: &(dyn Tr + 'a), b: &(dyn Tr + 'static), c: &dyn Tr|`:
+        // explicit `'a` / `'static` object bounds emit `Named` / `Static`; default stays elided.
+        assert_eq!(
+            &lower_regions(src, "use_dyn", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (1, step(root, 0), 0, WrittenRegion::Static),
             ]
         );
     }

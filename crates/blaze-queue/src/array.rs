@@ -14,8 +14,8 @@
 
 #[allow(blaze::std_use, reason = "the deprecated `ArrayQueue::new` alone (the crate's doc)")]
 use alloc::alloc::Global;
+use core::alloc::{Allocator, Layout};
 use core::{
-    alloc::{Allocator, Layout},
     cell::UnsafeCell,
     fmt,
     mem::MaybeUninit,

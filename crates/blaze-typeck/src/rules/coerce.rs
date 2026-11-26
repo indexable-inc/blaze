@@ -198,7 +198,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// asked in a probe, then registered; never on a variable source pointee (one to a `dyn`
     /// target is first resolved by selecting the pending obligations: a projection's variable).
     fn coerce_unsized(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<Option<Unsizing>, Stop> {
-        let (ma, pointee_a, mb, pointee_b, raw) = match (self.view(a), self.view(b)) {
+        let (ma, mut pointee_a, mb, mut pointee_b, raw) = match (self.view(a), self.view(b)) {
             (TyView::Ref(ma, x), TyView::Ref(mb, y)) => (ma, x, mb, y, false),
             (TyView::Ref(ma, x), TyView::Ptr(mb, y)) | (TyView::Ptr(ma, x), TyView::Ptr(mb, y)) => {
                 (ma, x, mb, y, true)
@@ -209,29 +209,31 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if ma == Mutbl::Not && mb == Mutbl::Mut {
             return Ok(None);
         }
+        // A type that names an associated type (an indexed `<Vec<[u8; 32]> as Index<usize>>::Output`,
+        // a field `digest: T::Digest` read through `&self.digest`, a call's `-> &T::Digest`) is
+        // lowered as a variable bound by its `Projection` obligation (`Machine::lower` /
+        // `Machine::project`), and is the concrete array/struct or rigid alias only once that
+        // obligation is selected. Resolve before matching any unsizable target (slice, `dyn`, or
+        // struct reaching unsized), as autoderef does at each step: else the variable refuses the
+        // unsizing, the reborrow arm resolves it via autoderef, and `&[u8; 32]` to `&[u8]` or
+        // `&Alias` to `&dyn Debug` is E0308.
+        if matches!(self.view(pointee_b), TyView::Alias { .. }) {
+            pointee_b = self.try_structurally_resolve(pointee_b)?;
+        }
+        let target_is_unsizable = match self.view(pointee_b) {
+            TyView::Slice(_) | TyView::Dynamic(_) => true,
+            TyView::Adt(_, lb) => self.target_reaches_unsized(lb),
+            _ => false,
+        };
+        if target_is_unsizable && (self.is_ty_var(pointee_a) || matches!(self.view(pointee_a), TyView::Alias { .. })) {
+            pointee_a = self.try_structurally_resolve(pointee_a)?;
+        }
         let unsizing = match (self.view(pointee_a), self.view(pointee_b)) {
             (TyView::Array(elem_a, _), TyView::Slice(elem_b)) => {
                 if !self.unify(elem_a, elem_b)? {
                     return Ok(None);
                 }
                 Some(Unsizing::Adjust)
-            }
-            // A type that names an associated type (a field `digest: T::Digest` read through
-            // `&self.digest`, a call's `-> &T::Digest`) is lowered as a variable bound by its
-            // `Projection` obligation (`Machine::lower`), and is the alias (`<T as
-            // Digestible>::Digest`, rigid in a generic body) only once that obligation is
-            // selected. Selected here, as autoderef does at each step: else the variable
-            // refused the unsizing, the reborrow arm then resolved it to the alias, and `&Alias`
-            // to `&dyn Debug` was E0308. The Reference, "Unsized Coercions": "`T` to `dyn U`,
-            // when `T` implements `U + Sized`": for a projection that is the associated type's
-            // declared bounds (`type Digest: Debug;`, its implied `Sized`) or a where clause in
-            // scope, which the solver's `Unsize` asks of the alias.
-            (TyView::Infer(_), TyView::Dynamic(_)) if self.is_ty_var(pointee_a) => {
-                let resolved = self.try_structurally_resolve(pointee_a)?;
-                if self.is_ty_var(resolved) {
-                    return Ok(None);
-                }
-                self.unsize_to_dyn(resolved, pointee_b, cause)?
             }
             (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
             (_, TyView::Dynamic(_)) => self.unsize_to_dyn(pointee_a, pointee_b, cause)?,
@@ -282,8 +284,14 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// (rules/coerce_nested.rs) and the two do not unify as they are; then the one general
     /// question `a: CoerceUnsized<b>`, asked, registered, and one `Unsize` adjustment. The
     /// nested pointer's own `CoerceUnsized` is the impl's where-clause, the solver's goal.
-    fn coerce_unsized_adt(&mut self, a: Ty, b: Ty, lb: TyList, cause: Cause) -> Result<Option<Unsizing>, Stop> {
-        if !self.target_reaches_unsized(lb) || self.probe(|m| m.unify_some(a, b))?.is_some() {
+    fn coerce_unsized_adt(&mut self, mut a: Ty, b: Ty, lb: TyList, cause: Cause) -> Result<Option<Unsizing>, Stop> {
+        if !self.target_reaches_unsized(lb) {
+            return Ok(None);
+        }
+        if !self.ty.ty_flags(a).is_empty() {
+            a = self.try_structurally_resolve(a)?;
+        }
+        if self.probe(|m| m.unify_some(a, b))?.is_some() {
             return Ok(None);
         }
         let unsizing = self.unsize_goal(LangItem::CoerceUnsized, a, b, cause)?;

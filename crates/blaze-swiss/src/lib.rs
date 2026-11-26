@@ -40,7 +40,8 @@ extern crate std;
 
 use blaze_own::planted::{NoPlant, Planted, Plants};
 
-use core::{alloc::Allocator, fmt};
+use core::alloc::Allocator;
+use core::fmt;
 
 use blaze_int::Int;
 use blaze_own::{Box, Vec};
