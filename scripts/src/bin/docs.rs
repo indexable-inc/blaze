@@ -286,8 +286,9 @@ fn py_repr(s: &str) -> String {
 }
 
 /// A front matter value as YAML reads it, so GitHub renders the front matter instead of a YAML error.
-/// A plain value must not hold what YAML gives a meaning (`: `, ` #`, a leading indicator); such a
-/// value is written in double quotes, with `\"` and `\\` its only escapes.
+/// A plain value must not hold what YAML gives a meaning (`: `, ` #`, a leading indicator, a
+/// leading `-`, `?` or `:` that a space or the end follows, a trailing `:`); such a value is
+/// written in double quotes, with `\"` and `\\` its only escapes.
 fn yaml_scalar(value: &str) -> Result<String, &'static str> {
     if let Some(quoted) = value.strip_prefix('"') {
         let inner = quoted.strip_suffix('"').ok_or("opens a double quote it does not close")?;
@@ -306,7 +307,17 @@ fn yaml_scalar(value: &str) -> Result<String, &'static str> {
         return Ok(out);
     }
     const INDICATORS: &[char] = &['`', '[', ']', '{', '}', '*', '&', '!', '|', '>', '\'', '%', '@', '#', ','];
-    if value.contains(": ") || value.contains(" #") || value.starts_with(INDICATORS) {
+    // `-`, `?` and `:` open a block (a list item, a key, a value) only when a space or the end
+    // follows them: `-dash` is plain text, `- dash` a list.
+    let opens_block = ['-', '?', ':']
+        .into_iter()
+        .any(|c| value.strip_prefix(c).is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')));
+    if value.contains(": ")
+        || value.contains(" #")
+        || value.ends_with(':')
+        || value.starts_with(INDICATORS)
+        || opens_block
+    {
         return Err("holds `: `, ` #` or a leading YAML indicator, so it goes in double quotes");
     }
     Ok(value.to_owned())
@@ -1028,6 +1039,16 @@ fn selftest(p: &Patterns) {
     let mut errors = Vec::new();
     parse_front(p, "d.md", "---\nstatus: current\nsummary: `x` is y\n---\n", &mut errors);
     expect(errors.len() == 2, "a plain value opening with a YAML indicator is refused");
+    for plain in ["- a list", "? a key", "-", "ends with:"] {
+        let mut errors = Vec::new();
+        parse_front(p, "d.md", &format!("---\nstatus: current\nsummary: {plain}\n---\n"), &mut errors);
+        expect(errors.len() == 2, "a plain value YAML reads as a list item, a key or a mapping is refused");
+    }
+    for plain in ["-dash", "?query", "a:b"] {
+        let mut errors = Vec::new();
+        parse_front(p, "d.md", &format!("---\nstatus: current\nsummary: {plain}\n---\n"), &mut errors);
+        expect(errors.is_empty(), "`-`, `?` and `:` with no space after are plain text");
+    }
     // A table's key (agents.json A38).
     let gate = "| workflow | event | what |\n|---|---|---|\n| `blaze.yaml` (`gate`) | pull request | every test |\n";
     expect(duplicate_rows("d.md", gate).is_empty(), "a table whose rows have their own keys holds");
