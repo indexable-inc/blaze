@@ -1688,8 +1688,18 @@ impl<A: Allocator + Clone> Layouts<A> {
     /// `str` (a length) or a trait object (a vtable), or ends in one; `None` when it is thin.
     /// Only the kind is read: a slice's stride here is a placeholder, its row has the real one.
     fn pointee_tail(&mut self, mut p: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<Option<Tail>, Refusal> {
-        // Each step goes to a strictly smaller type: at most the table's length of steps.
-        for _ in 0..=cx.ground.len() {
+        // Each step grounds the last field of a struct into `cx.ground`, which can grow `cx.ground`
+        // beyond its initial length (e.g. a small const-eval table starting with only a few types
+        // while walking a deep struct chain like `crossbeam_epoch::Local`). Track visited `PTy`s
+        // up to a generous depth bound so valid chains succeed regardless of initial table size
+        // while malformed recursive tails are still rejected immediately.
+        const MAX_TAIL_DEPTH: usize = 1024;
+        let mut seen: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
+        for _ in 0..MAX_TAIL_DEPTH {
+            if seen.iter().any(|&q| q == p) {
+                return Err(Refusal::Malformed("a pointee tail that does not end"));
+            }
+            seen.push(p);
             let view = cx.ground.view();
             match view.node(p).map_err(|_| Refusal::Malformed("a type past the ground table"))? {
                 PNode::Str => return Ok(Some(Tail::Slice { stride: 1 })),
