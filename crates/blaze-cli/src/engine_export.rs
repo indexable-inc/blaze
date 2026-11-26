@@ -52,19 +52,22 @@ use crate::{CliError, program, run_names, run_package};
 /// words, native image layout, and the emitted executable bytes). Untouched pages cost zero RSS.
 const EXPORT_FRAME_RESERVE: usize = 4 << 30;
 
-/// Maximum concurrent codegen workers during `blaze build` whole-program reachability closure
-/// (matches `test_drive::MAX_CODE_WORKERS` so per-worker `Maker` memory stays bounded).
-const MAX_EXPORT_WORKERS: usize = 16;
+/// Maximum concurrent codegen workers during `blaze build` whole-program reachability closure.
+/// 12 workers saturate Apple Silicon P-cores while keeping per-worker `Names`/`Maker` RSS bounded.
+const MAX_EXPORT_WORKERS: usize = 12;
 
 /// Cold misses handled serially before spinning up parallel codegen workers so warm no-op builds
 /// and single-function edits pay zero worker/frame startup overhead.
 const EXPORT_PAR_MIN_MISSES: usize = 4;
 
-/// Per-worker frame reset/trim budgets during parallel export codegen (mirrors `test_drive.rs`).
-const EXPORT_WORKER_FRAME_RESET_AT: usize = 256 << 20;
-const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 3 << 30;
+/// Per-worker frame reset/trim budgets during parallel export codegen. After the first make sets
+/// the baseline (crate `Names` + `Maker` init), each worker gets at least `HEADROOM` bytes before
+/// resetting so large workspaces (200+ crates) never thrash `Maker::construct`.
+const EXPORT_WORKER_FRAME_HEADROOM: usize = 1 << 30;
+const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 4 << 30;
 const EXPORT_WORKER_FRAME_KEEP: usize = 16 << 20;
 const EXPORT_WORKER_SCRATCH: usize = 1 << 20;
+const EXPORT_PER_WORKER_IN_FLIGHT: usize = 6;
 const EXPORT_HAND_WAIT: core::time::Duration = core::time::Duration::from_secs(30);
 const EXPORT_PROCS_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 const EXPORT_RECV_SLICE: core::time::Duration = core::time::Duration::from_millis(10);
@@ -886,6 +889,7 @@ enum ExportWorkerErr {
 }
 
 struct ExportDone {
+    worker: usize,
     row: usize,
     result: Result<Vec<u8, SharedAlloc<'static>>, ExportWorkerErr>,
 }
@@ -967,7 +971,7 @@ fn run_export_worker_epoch<'f>(
         Err(why) => {
             if let Some(job) = carry.take() {
                 let msg = export_err_string(format_args!("export worker names init failed: {why}"), shared);
-                let _ = done.send(cx, ExportDone { row: job.row, result: Err(ExportWorkerErr::Fatal(msg)) });
+                let _ = done.send(cx, ExportDone { worker, row: job.row, result: Err(ExportWorkerErr::Fatal(msg)) });
             }
             return ExportEpochEnd::Done;
         }
@@ -1000,9 +1004,7 @@ fn run_export_worker_epoch<'f>(
                 makes = makes.saturating_add(1);
                 if makes == 1 {
                     let used = worker_frame.used();
-                    if used >= *reset_at && used < EXPORT_WORKER_FRAME_HARD_RESET_AT {
-                        *reset_at = used.saturating_add(256 << 20).min(EXPORT_WORKER_FRAME_HARD_RESET_AT);
-                    }
+                    *reset_at = used.saturating_add(EXPORT_WORKER_FRAME_HEADROOM).min(EXPORT_WORKER_FRAME_HARD_RESET_AT);
                 }
                 let mut out = Vec::with_capacity_in(scratch.len(), shared);
                 out.extend_from_slice(scratch.as_slice());
@@ -1027,7 +1029,7 @@ fn run_export_worker_epoch<'f>(
         };
         let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
         let sending = by.span("blaze build: send compiled entry");
-        if done.send(&sending, ExportDone { row: job.row, result }).is_err() {
+        if done.send(&sending, ExportDone { worker, row: job.row, result }).is_err() {
             return ExportEpochEnd::Done;
         }
         if worker_frame.used() >= *reset_at {
@@ -1057,7 +1059,7 @@ fn run_export_code_worker(
         return;
     };
     let mut carry: Option<ExportJob> = None;
-    let mut reset_at = EXPORT_WORKER_FRAME_RESET_AT;
+    let mut reset_at = EXPORT_WORKER_FRAME_HEADROOM;
 
     loop {
         worker_frame.reset();
@@ -1123,21 +1125,24 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
 
     let shared = heap.shared();
     let start_row = *next_row;
-    let queue_cap = NonZeroUsize::new((worker_count * 4).max(4)).expect("non-zero queue cap");
+    let inbox_cap = NonZeroUsize::new(EXPORT_PER_WORKER_IN_FLIGHT * 2).expect("non-zero inbox cap");
+    let done_cap = NonZeroUsize::new((worker_count * EXPORT_PER_WORKER_IN_FLIGHT).max(8)).expect("non-zero done cap");
     let worker_nz = NonZeroUsize::new(worker_count).expect("non-zero worker count");
-    let jobs_ch = owned::<ExportJob, _>("blaze build: export jobs", queue_cap, shared);
-    let done_ch = owned::<ExportDone, _>("blaze build: export done", queue_cap, shared);
-    let procs_asked = owned::<usize, _>("blaze build: export procs asks", worker_nz, shared);
+    let mut inboxes: Vec<bstd::sync::chan::OwnedChan<ExportJob, SharedAlloc<'static>>, SharedAlloc<'static>> =
+        Vec::with_capacity_in(worker_count, shared);
     let mut procs_answers: Vec<bstd::sync::chan::OwnedChan<ExportProcsAnswer, SharedAlloc<'static>>, SharedAlloc<'static>> =
         Vec::with_capacity_in(worker_count, shared);
     for _ in 0..worker_count {
+        inboxes.push(owned("blaze build: export worker inbox", inbox_cap, shared));
         procs_answers.push(owned("blaze build: export procs answer", NonZeroUsize::MIN, shared));
     }
+    let done_ch = owned::<ExportDone, _>("blaze build: export done", done_cap, shared);
+    let procs_asked = owned::<usize, _>("blaze build: export procs asks", worker_nz, shared);
 
     let scope = cx.scope();
     let mut tasks = Vec::with_capacity_in(worker_count, heap.alloc());
     for worker_id in 0..worker_count {
-        let jobs_ref = &jobs_ch;
+        let jobs_ref = &inboxes[worker_id];
         let done_ref = &done_ch;
         let asked_ref = &procs_asked;
         let answer_ref = &procs_answers[worker_id];
@@ -1166,9 +1171,11 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     }
 
     let active_workers = tasks.len();
-    let max_in_flight = (active_workers * 3).max(1);
+    let max_in_flight = (active_workers * EXPORT_PER_WORKER_IN_FLIGHT).max(1);
     let mut par_outcomes: AVec<'a, Option<RowOutcome<'a>>> = Vec::new_in(alloc);
     let mut pending_rows: AVec<'a, Option<blaze_ladder::body_ids::Pending>> = Vec::new_in(alloc);
+    let mut worker_in_flight: AVec<'a, usize> = Vec::with_capacity_in(active_workers, alloc);
+    worker_in_flight.resize(active_workers, 0);
     let mut in_flight = 0usize;
 
     let serve_procs = |procs_asked: &bstd::sync::chan::OwnedChan<usize, SharedAlloc<'static>>,
@@ -1235,6 +1242,9 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
             // `HomeCodeStore` and expands newly reached callees.
             while let Ok(done) = done_ch.try_recv() {
                 in_flight -= 1;
+                if let Some(slot) = worker_in_flight.get_mut(done.worker) {
+                    *slot = slot.saturating_sub(1);
+                }
                 let row = done.row;
                 let rel = row - start_row;
                 let pend = pending_rows[rel].take().ok_or_else(|| {
@@ -1332,9 +1342,23 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                         name.extend_from_slice(name_slice);
                         let enclosers = crate::test_drive::suite_cache::local_enclosers_of(walk, row, tabled);
                         let job = ExportJob { row, order: pend.order(), proof, name, enclosers };
+                        // Route by `ItemKey` home affinity so repeated monomorphizations of the
+                        // same generic body (`Vec::push`, `Iterator::next`, etc.) reuse one
+                        // worker's warm `MakerState` instead of re-checking on all workers;
+                        // spill to the least-loaded worker only when the home worker is full.
+                        let home = (tabled.0 as usize) % active_workers;
+                        let target_worker = if worker_in_flight[home] < EXPORT_PER_WORKER_IN_FLIGHT {
+                            home
+                        } else {
+                            worker_in_flight
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|&(_, &load)| load)
+                                .map_or(home, |(idx, _)| idx)
+                        };
                         let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
                         let sending = by.span("blaze build: dispatch export job");
-                        if jobs_ch.send(&sending, job).is_err() {
+                        if inboxes[target_worker].send(&sending, job).is_err() {
                             let _ = walk.abandon::<RunError>(pend);
                             return Err(box_err(
                                 ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("export worker job channel closed or timed out"), frame, heap.alloc()) },
@@ -1342,6 +1366,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                             ));
                         }
                         pending_rows[rel] = Some(pend);
+                        worker_in_flight[target_worker] += 1;
                         in_flight += 1;
                     }
                     Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
@@ -1372,6 +1397,9 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                 match done_ch.recv(&slice_cx) {
                     Ok(done) => {
                         in_flight -= 1;
+                        if let Some(slot) = worker_in_flight.get_mut(done.worker) {
+                            *slot = slot.saturating_sub(1);
+                        }
                         let row = done.row;
                         let rel = row - start_row;
                         let pend = pending_rows[rel].take().ok_or_else(|| {
@@ -1454,7 +1482,9 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     })();
 
     // Always close channels and join all worker tasks before returning (linear scope invariant).
-    jobs_ch.close();
+    for ch in inboxes.iter() {
+        ch.close();
+    }
     done_ch.close();
     procs_asked.close();
     for ch in procs_answers.iter() {
