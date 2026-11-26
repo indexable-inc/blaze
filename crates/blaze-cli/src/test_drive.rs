@@ -3655,7 +3655,10 @@ impl<'c> Launched<'c, '_, '_> {
         if self.expose_bins
             && let Some(bins_cell) = self.bins
         {
-            bins_cell.borrow_mut().drain_owner_evidence(self.suite.0, row, &mut entered_fns, &mut keep);
+            bins_cell
+                .borrow_mut()
+                .drain_owner_evidence(self.suite.0, row, &mut entered_fns, &mut keep)
+                .map_err(OneError::BinServe)?;
         }
         if entered_fns.is_empty() && keep.is_ok() {
             keep = Err(NotKept::Untraced);

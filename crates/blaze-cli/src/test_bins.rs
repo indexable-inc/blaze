@@ -115,6 +115,7 @@ pub(crate) struct BinServeError {
 pub(crate) enum BinServeWhy {
     Parent(ParentError),
     Protocol(&'static str),
+    ListenerPoll(Errno),
 }
 
 impl fmt::Display for BinServeError {
@@ -122,6 +123,7 @@ impl fmt::Display for BinServeError {
         match &self.why {
             BinServeWhy::Parent(err) => write!(f, "binary `{}/{}` code serving failed: {err}", self.package, self.bin),
             BinServeWhy::Protocol(msg) => write!(f, "binary `{}/{}` protocol limit exceeded: {msg}", self.package, self.bin),
+            BinServeWhy::ListenerPoll(errno) => write!(f, "binary server listener poll failed: {errno}"),
         }
     }
 }
@@ -256,6 +258,34 @@ struct OwnerEvidence<'a> {
     row: u32,
     keep: Result<(), NotKept>,
     entered_fns: AVec<'a, EnteredFn<'a>>,
+}
+
+/// Result of non-blockingly checking the binary server's listening socket before finalizing a
+/// finishing test row's cache decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListenerPoll {
+    /// No peer is queued on the listener.
+    Idle,
+    /// At least one unaccepted peer is queued on the listener.
+    Queued,
+    /// Polling the listener failed with a kernel error (`Errno`) or error revents (`ERR`/`NVAL`).
+    Err(Errno),
+}
+
+/// Sans-I/O interpretation of a non-blocking `poll` result on the listening socket.
+fn interpret_listener_poll(
+    res: Result<usize, Errno>,
+    found: blaze_sys::posix::io::PollEvents,
+) -> ListenerPoll {
+    use blaze_sys::posix::io::PollEvents;
+    match res {
+        Err(errno) => ListenerPoll::Err(errno),
+        Ok(_) if found.contains(PollEvents::ERR) || found.contains(PollEvents::NVAL) => {
+            ListenerPoll::Err(Errno::BadF)
+        }
+        Ok(ready) if ready > 0 && found.contains(PollEvents::IN) => ListenerPoll::Queued,
+        Ok(_) => ListenerPoll::Idle,
+    }
 }
 
 /// Sans-I/O multi-peer binary stub protocol state machine (rule 14: sans-io-cores).
@@ -549,23 +579,37 @@ impl<'a, S, T> BinProtocol<'a, S, T> {
     /// Joins entered functions and purity recorded by workspace binaries spawned under
     /// `(suite, row)` into the spawning test's `entered_fns` and `keep` verdict.
     ///
+    /// Propagates any listener readiness check failure as a typed [`BinServeError`] (rule 3).
     /// Conservatively marks the row unkeepable (`Err(NotKept::Untraced)` unless already impure)
     /// whenever ANY helper connection might still produce post-exit work for this row:
     /// - a live connection owned by `(suite, row)` (`!conn.dead && conn.owner == Some((suite, row))`),
     /// - a live connection whose 12-byte handshake has not completed yet (`!conn.dead && conn.bin_id.is_none()`), or
-    /// - an unaccepted peer queued on the listening socket (`has_queued_accept == true`).
+    /// - an unaccepted peer queued on the listening socket (`ListenerPoll::Queued`).
     /// (Any test process that actually calls `posix_spawn`/`fork`/`clone` is also already marked
     /// `Err(NotKept::Foreign)` at the syscall boundary before this join runs.)
     fn drain_owner_evidence(
         &mut self,
         suite: u32,
         row: u32,
-        has_queued_accept: bool,
+        listener: ListenerPoll,
         entered_fns: &mut AVec<'a, EnteredFn<'a>>,
         keep: &mut Result<(), NotKept>,
-    ) {
-        if has_queued_accept && keep.is_ok() {
-            *keep = Err(NotKept::Untraced);
+    ) -> Result<(), BinServeError> {
+        match listener {
+            ListenerPoll::Err(errno) => {
+                return Err(BinServeError {
+                    owner: Some((suite, row)),
+                    package: owned_text("<listener>", self.tables),
+                    bin: owned_text("<listener>", self.tables),
+                    why: BinServeWhy::ListenerPoll(errno),
+                });
+            }
+            ListenerPoll::Queued => {
+                if keep.is_ok() {
+                    *keep = Err(NotKept::Untraced);
+                }
+            }
+            ListenerPoll::Idle => {}
         }
         for conn in self.conns.iter_mut() {
             if !conn.dead && conn.bin_id.is_none() {
@@ -604,6 +648,7 @@ impl<'a, S, T> BinProtocol<'a, S, T> {
                 i += 1;
             }
         }
+        Ok(())
     }
 }
 
@@ -996,18 +1041,25 @@ impl<'a, 'h> BinServer<'a, 'h> {
         row: u32,
         entered_fns: &mut AVec<'a, EnteredFn<'a>>,
         keep: &mut Result<(), NotKept>,
-    ) {
+    ) -> Result<(), BinServeError> {
         use blaze_sys::posix::io::{PollEvents, PollFd, poll};
 
         // Check non-blockingly whether any peer is already queued on the listening socket waiting
-        // to be accepted (fail-closed on `poll` error).
-        let mut pfd = [PollFd::new(self.listener.fd(), PollEvents::IN)];
+        // to be accepted; retry transient `EINTR` up to a small bound and propagate any real
+        // kernel error via `interpret_listener_poll` (rule 3, rule 18).
         let zero = Some(Timespec { sec: 0, nsec: 0 });
-        let has_queued_accept = match poll(&mut pfd, zero) {
-            Ok(ready) => ready > 0 && pfd[0].found().contains(PollEvents::IN),
-            Err(_) => true,
-        };
-        self.proto.drain_owner_evidence(suite, row, has_queued_accept, entered_fns, keep);
+        let mut listener = ListenerPoll::Err(Errno::Intr);
+        for _ in 0..8 {
+            let mut pfd = [PollFd::new(self.listener.fd(), PollEvents::IN)];
+            match poll(&mut pfd, zero) {
+                Err(Errno::Intr) => continue,
+                res => {
+                    listener = interpret_listener_poll(res, pfd[0].found());
+                    break;
+                }
+            }
+        }
+        self.proto.drain_owner_evidence(suite, row, listener, entered_fns, keep)
     }
 
     /// Non-blocking poll/accept/read/serve/write pump across the listener and every connected
@@ -1342,6 +1394,9 @@ mod dst_tests {
         LiveConnStillKeepable,
         /// Re-introduces the bug where queued or partially-handshaken peers leave a row keepable.
         UnattributedPeerStillKeepable,
+        /// Re-introduces the bug where a listener poll error is swallowed as `Queued` instead of
+        /// returning a typed `BinServeError`.
+        SwallowListenerPollError,
         /// Re-introduces the bug where a binary serving error reports the wrong owner.
         WrongErrorOwner,
         /// Re-introduces the bug where an outbox overflow is silently ignored.
@@ -1558,6 +1613,8 @@ mod dst_tests {
             BinProtocol::new(MAX_SIM_CONNS, MAX_SIM_INBOX, MAX_SIM_OUTBOX, alloc, alloc);
         let mut backend = SimBackend::new(BIN_COUNT, bug, alloc, alloc);
         let mut peers: AVec<'static, SimPeer<'static>> = Vec::new_in(alloc);
+        // Simulated kernel accept queue on the listening socket (`same_uid` for each queued peer).
+        let mut listen_queue: AVec<'static, bool> = Vec::new_in(alloc);
 
         // Oracle persisted BZTV set per binary (checked across simulated restarts).
         let mut oracle_bztv: AVec<'static, Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>> =
@@ -1584,9 +1641,15 @@ mod dst_tests {
             }
 
             let op = rng.range(100);
-            if op < 22 {
-                // Accept a new peer (testing wrong UID, cap overflow, valid/unknown bin_id, owned/unowned).
-                let same_uid = rng.range(8) != 0;
+            if op < 12 {
+                // Client calls `connect()`: enters the simulated kernel listener accept queue.
+                if listen_queue.len() < 4 {
+                    let same_uid = rng.range(8) != 0;
+                    listen_queue.push(same_uid);
+                }
+            } else if op < 26 && !listen_queue.is_empty() {
+                // Server calls `accept()` on the next peer queued on the listening socket.
+                let same_uid = listen_queue.remove_swap(0);
                 let was_full = proto.conns().len() >= MAX_SIM_CONNS;
                 let accepted = proto.accept(same_uid, ());
                 if !same_uid || was_full {
@@ -1784,89 +1847,158 @@ mod dst_tests {
                 }
                 proto.reap_dead();
             } else if op < 95 {
-                // Finish an owner `(suite, row)` and check the evidence + live-conn oracle!
+                // Finish an owner `(suite, row)` and check the evidence + listener-poll oracle!
+                use blaze_sys::posix::io::PollEvents;
                 let suite = u32::try_from(rng.range(2)).unwrap_or(0);
                 let row = u32::try_from(rng.range(4)).unwrap_or(0);
-                let has_queued_accept = rng.range(8) == 0;
+                // Derive the simulated kernel `poll` outcome from `listen_queue` plus occasional
+                // injected kernel poll failures (`Errno::BadF` or `PollEvents::ERR`).
+                let inject_poll_err = rng.range(12) == 0;
+                let (poll_res, poll_found) = if inject_poll_err {
+                    if rng.range(2) == 0 {
+                        (Err(Errno::BadF), PollEvents::NONE)
+                    } else {
+                        (Ok(1), PollEvents::ERR)
+                    }
+                } else if !listen_queue.is_empty() {
+                    (Ok(1), PollEvents::IN)
+                } else {
+                    (Ok(0), PollEvents::NONE)
+                };
+                let listener = match bug {
+                    PlantedBug::SwallowListenerPollError => match interpret_listener_poll(poll_res, poll_found) {
+                        ListenerPoll::Err(_) => ListenerPoll::Queued,
+                        other => other,
+                    },
+                    _ => interpret_listener_poll(poll_res, poll_found),
+                };
                 let mut drained_entered = Vec::new_in(alloc);
                 let mut drained_keep: Result<(), NotKept> = Ok(());
 
-                if bug == PlantedBug::LiveConnStillKeepable {
-                    // Simulate the pre-fix bug: copy live evidence without marking live conn unkeepable.
-                    for conn in proto.conns.iter_mut() {
-                        if conn.owner == Some((suite, row)) {
-                            if let Err(why) = conn.keep
-                                && drained_keep.is_ok()
-                            {
-                                drained_keep = Err(why);
+                let drain_res = if bug == PlantedBug::LiveConnStillKeepable {
+                    // Simulate ONLY the live-owned-conn bug (still propagating poll errors and
+                    // rejecting queued/pre-handshake peers).
+                    match listener {
+                        ListenerPoll::Err(errno) => Err(BinServeError {
+                            owner: Some((suite, row)),
+                            package: owned_text("<listener>", alloc),
+                            bin: owned_text("<listener>", alloc),
+                            why: BinServeWhy::ListenerPoll(errno),
+                        }),
+                        ListenerPoll::Queued | ListenerPoll::Idle => {
+                            if listener == ListenerPoll::Queued && drained_keep.is_ok() {
+                                drained_keep = Err(NotKept::Untraced);
                             }
-                            while let Some(e) = conn.entered_fns.pop() {
-                                drained_entered.push(e);
+                            for conn in proto.conns.iter_mut() {
+                                if !conn.dead && conn.bin_id.is_none() {
+                                    if drained_keep.is_ok() {
+                                        drained_keep = Err(NotKept::Untraced);
+                                    }
+                                } else if conn.owner == Some((suite, row)) {
+                                    if let Err(why) = conn.keep
+                                        && drained_keep.is_ok()
+                                    {
+                                        drained_keep = Err(why);
+                                    }
+                                    while let Some(e) = conn.entered_fns.pop() {
+                                        drained_entered.push(e);
+                                    }
+                                }
                             }
-                        }
-                    }
-                    let mut i = 0;
-                    while i < proto.evidence.len() {
-                        if proto.evidence.get(i).is_some_and(|ev| ev.suite == suite && ev.row == row) {
-                            let mut ev = proto.evidence.remove_swap(i);
-                            if let Err(why) = ev.keep
-                                && drained_keep.is_ok()
-                            {
-                                drained_keep = Err(why);
+                            let mut i = 0;
+                            while i < proto.evidence.len() {
+                                if proto.evidence.get(i).is_some_and(|ev| ev.suite == suite && ev.row == row) {
+                                    let mut ev = proto.evidence.remove_swap(i);
+                                    if let Err(why) = ev.keep
+                                        && drained_keep.is_ok()
+                                    {
+                                        drained_keep = Err(why);
+                                    }
+                                    while let Some(e) = ev.entered_fns.pop() {
+                                        drained_entered.push(e);
+                                    }
+                                } else {
+                                    i += 1;
+                                }
                             }
-                            while let Some(e) = ev.entered_fns.pop() {
-                                drained_entered.push(e);
-                            }
-                        } else {
-                            i += 1;
+                            Ok(())
                         }
                     }
                 } else if bug == PlantedBug::UnattributedPeerStillKeepable {
-                    // Simulate the pre-fix bug: mark live owned connections unkeepable, but ignore
-                    // queued accepts and partially-handshaken (`bin_id.is_none()`) peers.
-                    for conn in proto.conns.iter_mut() {
-                        if conn.owner == Some((suite, row)) {
-                            if !conn.dead {
-                                if drained_keep.is_ok() {
-                                    drained_keep = Err(conn.keep.err().unwrap_or(NotKept::Untraced));
+                    // Simulate ONLY the queued/pre-handshake omission (still propagating poll errors).
+                    match listener {
+                        ListenerPoll::Err(errno) => Err(BinServeError {
+                            owner: Some((suite, row)),
+                            package: owned_text("<listener>", alloc),
+                            bin: owned_text("<listener>", alloc),
+                            why: BinServeWhy::ListenerPoll(errno),
+                        }),
+                        ListenerPoll::Queued | ListenerPoll::Idle => {
+                            for conn in proto.conns.iter_mut() {
+                                if conn.owner == Some((suite, row)) {
+                                    if !conn.dead {
+                                        if drained_keep.is_ok() {
+                                            drained_keep = Err(conn.keep.err().unwrap_or(NotKept::Untraced));
+                                        }
+                                    } else if let Err(why) = conn.keep
+                                        && drained_keep.is_ok()
+                                    {
+                                        drained_keep = Err(why);
+                                    }
+                                    while let Some(e) = conn.entered_fns.pop() {
+                                        drained_entered.push(e);
+                                    }
                                 }
-                            } else if let Err(why) = conn.keep
-                                && drained_keep.is_ok()
-                            {
-                                drained_keep = Err(why);
                             }
-                            while let Some(e) = conn.entered_fns.pop() {
-                                drained_entered.push(e);
+                            let mut i = 0;
+                            while i < proto.evidence.len() {
+                                if proto.evidence.get(i).is_some_and(|ev| ev.suite == suite && ev.row == row) {
+                                    let mut ev = proto.evidence.remove_swap(i);
+                                    if let Err(why) = ev.keep
+                                        && drained_keep.is_ok()
+                                    {
+                                        drained_keep = Err(why);
+                                    }
+                                    while let Some(e) = ev.entered_fns.pop() {
+                                        drained_entered.push(e);
+                                    }
+                                } else {
+                                    i += 1;
+                                }
                             }
-                        }
-                    }
-                    let mut i = 0;
-                    while i < proto.evidence.len() {
-                        if proto.evidence.get(i).is_some_and(|ev| ev.suite == suite && ev.row == row) {
-                            let mut ev = proto.evidence.remove_swap(i);
-                            if let Err(why) = ev.keep
-                                && drained_keep.is_ok()
-                            {
-                                drained_keep = Err(why);
-                            }
-                            while let Some(e) = ev.entered_fns.pop() {
-                                drained_entered.push(e);
-                            }
-                        } else {
-                            i += 1;
+                            Ok(())
                         }
                     }
                 } else {
-                    proto.drain_owner_evidence(suite, row, has_queued_accept, &mut drained_entered, &mut drained_keep);
+                    proto.drain_owner_evidence(suite, row, listener, &mut drained_entered, &mut drained_keep)
+                };
+
+                if inject_poll_err {
+                    match drain_res {
+                        Err(err) => {
+                            if err.owner != Some((suite, row)) {
+                                return Err("listener poll error attributed to wrong owner");
+                            }
+                            if !matches!(err.why, BinServeWhy::ListenerPoll(_)) {
+                                return Err("listener poll error had wrong variant");
+                            }
+                        }
+                        Ok(()) => return Err("listener poll error was swallowed instead of propagated"),
+                    }
+                    continue;
+                }
+                if drain_res.is_err() {
+                    return Err("unexpected listener poll error on healthy listener");
                 }
 
                 // Oracle: check whether ANY live peer currently has `owner == Some((suite, row))`,
-                // OR any live peer is still pre-handshake (`bin_id.is_none()`), OR a peer is queued.
+                // OR any live peer is still pre-handshake (`bin_id.is_none()`), OR `listen_queue`
+                // holds an unaccepted peer.
                 let has_live_owned = proto
                     .conns()
                     .iter()
                     .any(|c| !c.dead && c.owner == Some((suite, row)));
-                let has_unattributed = has_queued_accept
+                let has_unattributed = !listen_queue.is_empty()
                     || proto.conns().iter().any(|c| !c.dead && c.bin_id.is_none());
                 let mut expected_keep: Result<(), NotKept> = Ok(());
                 let mut expected_entered: AVec<'static, [u8; 32]> = Vec::new_in(alloc);
@@ -2029,6 +2161,23 @@ mod dst_tests {
         assert!(
             caught,
             "planted bug UnattributedPeerStillKeepable must be caught by the DST oracle"
+        );
+    }
+
+    #[test]
+    fn dst_planted_bug_swallow_listener_poll_error_is_caught() {
+        let mut caught = false;
+        for seed in 1u64..=32 {
+            if run_dst(seed, PlantedBug::SwallowListenerPollError)
+                == Err("listener poll error was swallowed instead of propagated")
+            {
+                caught = true;
+                break;
+            }
+        }
+        assert!(
+            caught,
+            "planted bug SwallowListenerPollError must be caught by the DST oracle"
         );
     }
 }
