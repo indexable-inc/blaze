@@ -374,11 +374,12 @@ pub(crate) fn tools_digest(tools: &[blaze_drive::Tool; blaze_drive::key::KINDS])
     h.finish().0
 }
 
-/// Typed store error from persisting incremental test cache records (rule 19).
+/// Typed store error from persisting or reading incremental test cache records (rule 19).
 #[derive(Debug)]
 pub(crate) enum CacheError {
     Store(LentError),
     Root(RootError),
+    Corrupt(&'static str),
 }
 
 impl core::fmt::Display for CacheError {
@@ -386,6 +387,7 @@ impl core::fmt::Display for CacheError {
         match self {
             CacheError::Store(e) => core::fmt::Display::fmt(e, f),
             CacheError::Root(e) => core::fmt::Display::fmt(e, f),
+            CacheError::Corrupt(what) => f.write_str(what),
         }
     }
 }
@@ -407,6 +409,95 @@ pub(crate) fn suite_id(unit: TestUnit<'_>, builder: &Builder) -> ContentId {
         .part(&[u8::from(unit.tests.harnessed())]);
     hash_builder(&mut h, builder);
     h.finish()
+}
+
+/// Computes the stable suite identity for a workspace `[[bin]]` stub served via `CARGO_BIN_EXE_*`
+/// so its `SuiteCache::verified` (`BZTV`) set persists across runs under today's `Certificate`.
+pub(crate) fn bin_cache_id(package: &str, bin_name: &str, key: blaze_id::CrateItemKey, builder: &Builder) -> ContentId {
+    let mut h = Hasher::new(SUITE_ID_DOMAIN);
+    h.part(package.as_bytes())
+        .part(b"bin-exe:")
+        .part(bin_name.as_bytes())
+        .id(&key.0)
+        .part(&[2]);
+    hash_builder(&mut h, builder);
+    h.finish()
+}
+
+/// Loads previously verified `(instance_key, content_key)` pairs for an arbitrary suite/binary
+/// identity `id` if and only if they were recorded under today's exact `certificate`.
+/// Returns `Ok((0, 0))` only on a genuine cold miss (no pointer or certificate mismatch); store
+/// I/O errors, dangling pointers, wrong tags, and corrupt `BZTV` payloads are returned as typed
+/// errors.
+pub(crate) fn load_verified_by_id<D: Driver>(
+    lent: &Lent<D, StoreAlloc>,
+    id: ContentId,
+    certificate: &crate::start_list::Certificate,
+    into_closed: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    into_workspace: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+) -> Result<(usize, usize), DriveError> {
+    let store_err = |e: LentError| DriveError::CacheStore { what: "reading binary stub verified cache", why: CacheError::Store(e) };
+    let corrupt = |what: &'static str| DriveError::CacheStore { what: "reading binary stub verified cache", why: CacheError::Corrupt(what) };
+    let ptr_key = verified_ptr_key(id);
+    let Some(state_key) = lent.pointed(TestIndex::TAG, &ptr_key).map_err(store_err)? else {
+        return Ok((0, 0));
+    };
+    let Some(lend) = lent.get(&state_key).map_err(store_err)? else {
+        return Err(corrupt("verified cache pointer names a missing record"));
+    };
+    if lend.tag != TestIndex::TAG {
+        return Err(corrupt("verified cache record has unexpected store tag"));
+    }
+    let cert = *certificate.bytes();
+    match decode_verified_status(lend.bytes, cert, cert, into_closed, into_workspace) {
+        VerifiedDecode::Loaded(closed, ws) => Ok((closed, ws)),
+        VerifiedDecode::StaleCertificate => Ok((0, 0)),
+        VerifiedDecode::Corrupt => Err(corrupt("malformed BZTV verified cache payload")),
+    }
+}
+
+/// Persists and pins verified `(instance_key, content_key)` pairs for a workspace binary identity
+/// `id` under today's exact `certificate`.
+pub(crate) fn save_verified_by_id<D: Driver>(
+    lent: &Lent<D, StoreAlloc>,
+    id: ContentId,
+    certificate: &crate::start_list::Certificate,
+    closed_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+    workspace_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+    alloc: Alloc<'_>,
+) -> Result<(), DriveError> {
+    let store_err = |e: LentError| DriveError::CacheStore { what: "writing binary stub verified cache", why: CacheError::Store(e) };
+    let root_err = |e: RootError| DriveError::CacheStore { what: "pinning binary stub verified cache", why: CacheError::Root(e) };
+    let mut closed_list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+    for pair in closed_pairs {
+        if closed_list.len() >= MOST_VERIFIED_PERSISTED {
+            break;
+        }
+        closed_list.push(pair);
+    }
+    let mut ws_list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+    for pair in workspace_pairs {
+        if ws_list.len() >= MOST_VERIFIED_PERSISTED {
+            break;
+        }
+        ws_list.push(pair);
+    }
+    if closed_list.is_empty() && ws_list.is_empty() {
+        return Ok(());
+    }
+    closed_list.sort_unstable();
+    closed_list.dedup();
+    ws_list.sort_unstable();
+    ws_list.dedup();
+    let cert = *certificate.bytes();
+    let mut vbytes: AVec<'_, u8> = Vec::new_in(alloc);
+    encode_verified(cert, cert, closed_list.as_slice(), ws_list.as_slice(), &mut vbytes);
+    let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
+    let vptr_key = verified_ptr_key(id);
+    lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
+    lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(store_err)?;
+    roots::keep_test_suite(lent, &id, &[vptr_key, vstate_key]).map_err(root_err)?;
+    Ok(())
 }
 
 /// Computes the stable base [`TestId`] for one test row, covering every input that affects its
@@ -1701,7 +1792,7 @@ fn decode_suite_state<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Option<DecodedSuite
     Some(DecodedSuiteState { cert, suite_cert, tools_digest, head_key, postings_key, fns, closed_crates, result_keys })
 }
 
-fn encode_verified(
+pub(crate) fn encode_verified(
     suite_cert: [u8; 32],
     closed_crates_digest: [u8; 32],
     closed_pairs: &[([u8; 32], [u8; 32])],
@@ -1728,39 +1819,70 @@ fn encode_verified(
     }
 }
 
-fn decode_verified(
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VerifiedDecode {
+    Loaded(usize, usize),
+    StaleCertificate,
+    Corrupt,
+}
+
+pub(crate) fn decode_verified_status(
     bytes: &[u8],
     suite_cert: [u8; 32],
     closed_crates_digest: [u8; 32],
     into_closed: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     into_workspace: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
-) -> Option<(usize, usize)> {
+) -> VerifiedDecode {
     let header_len = 4 + 4 + 32 + 32 + 4 + 4;
     if bytes.len() < header_len || bytes.get(0..4) != Some(&VERIFIED_MAGIC) {
-        return None;
+        return VerifiedDecode::Corrupt;
     }
-    let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
-    if version != VERIFIED_VERSION {
-        return None;
+    let Some(version_bytes) = bytes.get(4..8).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return VerifiedDecode::Corrupt;
+    };
+    if u32::from_le_bytes(version_bytes) != VERIFIED_VERSION {
+        return VerifiedDecode::Corrupt;
     }
-    let stored_suite_cert = bytes.get(8..40)?;
-    let stored_closed_digest = bytes.get(40..72)?;
-    let closed_count = usize::try_from(u32::from_le_bytes(bytes.get(72..76)?.try_into().ok()?)).ok()?;
-    let workspace_count = usize::try_from(u32::from_le_bytes(bytes.get(76..80)?.try_into().ok()?)).ok()?;
-    let total_pairs = closed_count.checked_add(workspace_count)?;
-    let payload = total_pairs.checked_mul(64)?;
-    if bytes.len().checked_sub(header_len)? != payload {
-        return None;
+    let Some(stored_suite_cert) = bytes.get(8..40) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(stored_closed_digest) = bytes.get(40..72) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(closed_count_bytes) = bytes.get(72..76).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(ws_count_bytes) = bytes.get(76..80).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Ok(closed_count) = usize::try_from(u32::from_le_bytes(closed_count_bytes)) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Ok(workspace_count) = usize::try_from(u32::from_le_bytes(ws_count_bytes)) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(total_pairs) = closed_count.checked_add(workspace_count) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(payload) = total_pairs.checked_mul(64) else {
+        return VerifiedDecode::Corrupt;
+    };
+    if bytes.len().checked_sub(header_len) != Some(payload) {
+        return VerifiedDecode::Corrupt;
     }
     if stored_closed_digest != closed_crates_digest.as_slice() {
-        return None;
+        return VerifiedDecode::StaleCertificate;
     }
     let mut at = header_len;
     let mut loaded_closed = 0usize;
     for _ in 0..closed_count {
-        let key: [u8; 32] = bytes.get(at..at.checked_add(32)?)?.try_into().ok()?;
-        let under: [u8; 32] = bytes.get(at.checked_add(32)?..at.checked_add(64)?)?.try_into().ok()?;
-        at = at.checked_add(64)?;
+        let Some(key) = bytes.get(at..at + 32).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+            return VerifiedDecode::Corrupt;
+        };
+        let Some(under) = bytes.get(at + 32..at + 64).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+            return VerifiedDecode::Corrupt;
+        };
+        at += 64;
         if into_closed.insert((key, under)) {
             loaded_closed += 1;
         }
@@ -1768,15 +1890,32 @@ fn decode_verified(
     let mut loaded_workspace = 0usize;
     if stored_suite_cert == suite_cert.as_slice() {
         for _ in 0..workspace_count {
-            let key: [u8; 32] = bytes.get(at..at.checked_add(32)?)?.try_into().ok()?;
-            let under: [u8; 32] = bytes.get(at.checked_add(32)?..at.checked_add(64)?)?.try_into().ok()?;
-            at = at.checked_add(64)?;
+            let Some(key) = bytes.get(at..at + 32).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+                return VerifiedDecode::Corrupt;
+            };
+            let Some(under) = bytes.get(at + 32..at + 64).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+                return VerifiedDecode::Corrupt;
+            };
+            at += 64;
             if into_workspace.insert((key, under)) {
                 loaded_workspace += 1;
             }
         }
     }
-    Some((loaded_closed, loaded_workspace))
+    VerifiedDecode::Loaded(loaded_closed, loaded_workspace)
+}
+
+fn decode_verified(
+    bytes: &[u8],
+    suite_cert: [u8; 32],
+    closed_crates_digest: [u8; 32],
+    into_closed: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    into_workspace: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+) -> Option<(usize, usize)> {
+    match decode_verified_status(bytes, suite_cert, closed_crates_digest, into_closed, into_workspace) {
+        VerifiedDecode::Loaded(closed, ws) => Some((closed, ws)),
+        VerifiedDecode::StaleCertificate | VerifiedDecode::Corrupt => None,
+    }
 }
 
 fn load_suite_state<'a, 'm, D: Driver>(lent: &'m Lent<D, StoreAlloc>, suite: ContentId, alloc: Alloc<'a>) -> Option<LoadedState<'a, 'm>> {

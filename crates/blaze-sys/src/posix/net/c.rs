@@ -36,6 +36,9 @@ unsafe extern "C" {
     /// `int listen(int socket, int backlog)` (sys/socket.h).
     /// replaces libc::listen (macOS)
     pub fn listen(socket: c_int, backlog: c_int) -> c_int;
+    /// `int accept(int socket, struct sockaddr *address, socklen_t *address_len)` (sys/socket.h).
+    /// replaces libc::accept (macOS)
+    pub fn accept(socket: c_int, address: *mut sockaddr, len: *mut socklen_t) -> c_int;
     /// `int getsockname(int socket, struct sockaddr *address, socklen_t *address_len)`
     /// (sys/socket.h).
     /// replaces libc::getsockname (macOS)

@@ -2854,6 +2854,7 @@ impl fmt::Display for WhyText {
     }
 }
 
+pub mod bin_remap;
 pub mod bind;
 pub mod fault_report;
 mod native;

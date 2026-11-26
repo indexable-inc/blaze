@@ -119,26 +119,89 @@ impl Bind for Dlsym {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LauncherOwn<B> {
     inner: B,
+    remap_bins: bool,
 }
 
 impl<B> LauncherOwn<B> {
     pub const fn new(inner: B) -> LauncherOwn<B> {
-        LauncherOwn { inner }
+        LauncherOwn { inner, remap_bins: false }
+    }
+
+    pub const fn with_bin_remap(inner: B, remap_bins: bool) -> LauncherOwn<B> {
+        LauncherOwn { inner, remap_bins }
     }
 }
 
 impl<B: Bind> Bind for LauncherOwn<B> {
     fn intercept(&mut self, name: &str) -> Option<u64> {
         static DSO_HANDLE: u8 = 0;
-        match name {
+        if let Some(addr) = match name {
             "__dso_handle" => Some(&raw const DSO_HANDLE as u64),
             "pthread_create" => Some(crate::threads::create as *const () as u64),
             #[cfg(target_arch = "aarch64")]
             "_Unwind_RaiseException" => Some(crate::observe::unwind_raise_exception as *const () as u64),
             #[cfg(target_os = "linux")]
             "dl_iterate_phdr" => Some(crate::symbols::iterate as *const () as u64),
-            _ => self.inner.intercept(name),
+            _ => None,
+        } {
+            return Some(addr);
         }
+        if self.remap_bins {
+            use super::bin_remap;
+            let addr = |p: *const ()| u64::try_from(p.addr()).unwrap_or(0);
+            if let Some(target) = match name {
+                "execve" => Some(addr(bin_remap::remap_execve as *const ())),
+                "execv" => Some(addr(bin_remap::remap_execv as *const ())),
+                "execvp" => Some(addr(bin_remap::remap_execvp as *const ())),
+                #[cfg(target_os = "linux")]
+                "execvpe" => Some(addr(bin_remap::remap_execvpe as *const ())),
+                #[cfg(target_os = "macos")]
+                "execvP" => Some(addr(bin_remap::remap_execvP as *const ())),
+                "execl" => Some(addr(bin_remap::remap_execl as *const ())),
+                "execlp" => Some(addr(bin_remap::remap_execlp as *const ())),
+                "execle" => Some(addr(bin_remap::remap_execle as *const ())),
+                "posix_spawn" => Some(addr(bin_remap::remap_posix_spawn as *const ())),
+                "posix_spawnp" => Some(addr(bin_remap::remap_posix_spawnp as *const ())),
+                "posix_spawn_file_actions_addopen" => {
+                    Some(addr(bin_remap::remap_posix_spawn_file_actions_addopen as *const ()))
+                }
+                #[cfg(target_os = "macos")]
+                "posix_spawn_file_actions_addchdir_np" => {
+                    Some(addr(bin_remap::remap_posix_spawn_file_actions_addchdir_np as *const ()))
+                }
+                "chdir" => Some(addr(bin_remap::remap_chdir as *const ())),
+                "opendir" => Some(addr(bin_remap::remap_opendir as *const ())),
+                "system" => Some(addr(bin_remap::remap_system as *const ())),
+                "popen" => Some(addr(bin_remap::remap_popen as *const ())),
+                "stat" => Some(addr(bin_remap::remap_stat as *const ())),
+                "lstat" => Some(addr(bin_remap::remap_lstat as *const ())),
+                "fstatat" => Some(addr(bin_remap::remap_fstatat as *const ())),
+                #[cfg(target_os = "linux")]
+                "stat64" => Some(addr(bin_remap::remap_stat64 as *const ())),
+                #[cfg(target_os = "linux")]
+                "lstat64" => Some(addr(bin_remap::remap_lstat64 as *const ())),
+                #[cfg(target_os = "linux")]
+                "fstatat64" => Some(addr(bin_remap::remap_fstatat64 as *const ())),
+                #[cfg(target_os = "linux")]
+                "statx" => Some(addr(bin_remap::remap_statx as *const ())),
+                "access" => Some(addr(bin_remap::remap_access as *const ())),
+                "faccessat" => Some(addr(bin_remap::remap_faccessat as *const ())),
+                "realpath" => Some(addr(bin_remap::remap_realpath as *const ())),
+                "readlink" => Some(addr(bin_remap::remap_readlink as *const ())),
+                "readlinkat" => Some(addr(bin_remap::remap_readlinkat as *const ())),
+                "fopen" => Some(addr(bin_remap::remap_fopen as *const ())),
+                "open" => Some(addr(bin_remap::remap_open as *const ())),
+                "openat" => Some(addr(bin_remap::remap_openat as *const ())),
+                #[cfg(target_os = "linux")]
+                "open64" => Some(addr(bin_remap::remap_open as *const ())),
+                #[cfg(target_os = "linux")]
+                "openat64" => Some(addr(bin_remap::remap_openat as *const ())),
+                _ => None,
+            } {
+                return Some(target);
+            }
+        }
+        self.inner.intercept(name)
     }
 
     fn address(&mut self, name: &str, cname: &CStr) -> Result<u64, BindError> {

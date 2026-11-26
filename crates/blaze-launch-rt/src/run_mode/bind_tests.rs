@@ -48,6 +48,11 @@ fn the_two_strategies_agree_on_own_rows_and_the_table_walls_the_rest() {
 #[test]
 fn launcher_own_intercepts_threads_and_unwind_without_touching_ordinary_symbols() {
     let mut own = LauncherOwn::new(Dlsym);
+    assert_eq!(own.intercept("execve"), None);
+    let mut remapped = LauncherOwn::with_bin_remap(Dlsym, true);
+    assert!(remapped.intercept("execve").is_some());
+    assert!(remapped.intercept("posix_spawn").is_some());
+    assert!(remapped.intercept("stat").is_some());
     assert_eq!(
         own.intercept("pthread_create"),
         Some(crate::threads::create as *const () as u64),

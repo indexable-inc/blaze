@@ -1326,19 +1326,84 @@ pub(crate) fn run_tests_status(
                     images.push(image);
                 }
                 // One runner for every dirty suite, made at the first proc-macro call any body meets
-                // ([`RunProcs`]; C9). Before `runnable`, whose names records borrow it, so it outlives them.
+                // ([`RunProcs`]; C9). Before `runnable` and `bin_suites`, whose names records borrow it.
                 let inputs = inventory.suites.first().map(|(found, _)| RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env: &facts.fetch_env, frame });
                 let maker = crate::job_texts::MadeOnce::new(|| match &inputs {
                     Some(inputs) => inputs.make(),
                     None => Err("no proc-macro runner: this command has no test suite (engine_start.rs `run_tests`)"),
                 });
                 let procs = crate::job_texts::Procs::ByNeed(&maker);
-                // Command-wide lazy scope-record opener shared across every dirty suite and every
-                // `CodePool` worker: `test_open_suites` opens ZERO dependency/toolchain crates
-                // upfront (rule 77), and touched crates share one `VerifiedModules` + `FileItems` cache.
+                // Command-wide lazy scope-record opener shared across every dirty suite, binary
+                // stub, and `CodePool` worker: `test_open_suites` opens ZERO dependency/toolchain
+                // crates upfront (rule 77), and touched crates share one `VerifiedModules` +
+                // `FileItems` cache.
                 let scope_records = inventory.suites.first().map(|(found, _)| {
                     crate::front_load::ScopeRecords::new(found.snapshot(), blaze_world::crate_list::CrateGraph::len(list), heap)
                 });
+                // Collect workspace `[[bin]]` targets exposed via `CARGO_BIN_EXE_<name>` by at least
+                // one dirty integration-test/bench suite (`test.md` piece 17). Native-image failures
+                // for a helper are isolated to that package's `expose_bins` suites.
+                let mut needed_bins: blaze_own::Vec<(&str, &str), _> = blaze_own::Vec::new_in(frame);
+                for (at, (_, unit)) in inventory.suites.iter().enumerate() {
+                    if !dirty.is_suite_dirty(at) || !unit.expose_bins {
+                        continue;
+                    }
+                    let env_facts = list.env_facts(unit.at);
+                    if let Some((pkg, _)) = env_facts.package {
+                        for bin_name in env_facts.bin_exes.names() {
+                            if !needed_bins.iter().any(|&(p, b)| p == pkg && b == bin_name) {
+                                needed_bins.push((pkg, bin_name));
+                            }
+                        }
+                    }
+                }
+                let bin_panic = blaze_ladder::panic_strategy::of_profile(profile);
+                let mut bin_suites = blaze_own::Vec::new_in(frame);
+                let mut bin_native_errors: blaze_own::Vec<(&str, &str), _> = blaze_own::Vec::new_in(frame);
+                for (found, bin_unit) in &inventory.bins {
+                    if !needed_bins.iter().any(|&(p, b)| p == bin_unit.package && b == bin_unit.bin_name) {
+                        continue;
+                    }
+                    let native = if crate::native_image::linked(list, bin_unit.at) {
+                        let closure = suite_closure(list, bin_unit.at, alloc);
+                        match crate::engine_native::image_for(cx, &mut standing, &closure, watch) {
+                            Ok(image) => image.send,
+                            Err(error) => {
+                                let shown = crate::work::held_str(
+                                    bstd::mem::format_in!(
+                                        frame,
+                                        "CARGO_BIN_EXE helper `{}/{}` native image: {error}",
+                                        bin_unit.package,
+                                        bin_unit.bin_name
+                                    )
+                                    .as_str(),
+                                    frame,
+                                );
+                                if !bin_native_errors.iter().any(|&(p, _)| p == bin_unit.package) {
+                                    bin_native_errors.push((bin_unit.package, shown));
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let crates = match scope_records.as_ref() {
+                        Some(sr) => run_names::crates_of_by_need(cx, found, run_names::Owner::At(bin_unit.at), &mut *standing.store, &mut facts.bodies, &mut read, sr, &facts.fetch_env, &pack_dirs, frame, heap),
+                        None => run_names::crates_of(cx, found, run_names::Owner::At(bin_unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, &pack_dirs, frame, heap),
+                    }
+                    .map_err(CliError::RunNames)?;
+                    let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
+                    let builder = crate::run_parent::builder_for(bin_unit.edition.name(), overflow, bin_panic, producer, isa).map_err(parent)?;
+                    bin_suites.push(crate::test_bins::BinSuite {
+                        package: bin_unit.package,
+                        bin_name: bin_unit.bin_name,
+                        key: bin_unit.key,
+                        names,
+                        builder,
+                        native,
+                    });
+                }
                 let mut runnable = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
                 // Each dirty test unit runs in its package's root, told its package's variables
                 // (test_drive.rs `PackageRun`); clean cached suites skip crates/names loading.
@@ -1361,14 +1426,24 @@ pub(crate) fn run_tests_status(
                     let Some(spec) = specs.get(at) else {
                         return Err(CliError::Start(StartError::NoProgram));
                     };
-                    let native = images.get(at).copied().unwrap_or(Ok(None));
+                    let native = match images.get(at).copied().unwrap_or(Ok(None)) {
+                        Err(why) => Err(why),
+                        Ok(send) => match unit
+                            .expose_bins
+                            .then(|| bin_native_errors.iter().find(|&&(p, _)| p == unit.package).map(|&(_, why)| why))
+                            .flatten()
+                        {
+                            Some(why) => Err(why),
+                            None => Ok(send),
+                        },
+                    };
                     runnable.push(Some(crate::test_drive::Suite { names, crates, builder: spec.builder, unit: *unit, place, native }));
                 }
                 phases.mark_cx(cx, "test_open_suites", frame);
                 let typed = crate::engine_body_record::TypedFrom { cx, lent, records: standing.records(), alloc: heap.alloc() };
                 let ran = dirty.run(
                     cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err,
-                    runnable.as_slice(), &ids, typed, config, launch.args, lent, root, procs, heap, watch, frame,
+                    runnable.as_slice(), bin_suites.as_slice(), &ids, typed, certificate, config, launch.args, lent, root, procs, heap, watch, frame,
                 );
                 drop(runnable);
                 if let Some(ref sr) = scope_records {

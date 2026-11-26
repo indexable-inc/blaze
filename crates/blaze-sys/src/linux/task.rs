@@ -719,6 +719,15 @@ pub fn umount2(target: Path<'_>, flags: UnmountFlags) -> Result<(), Errno> {
     raw::check(unsafe { raw::syscall2(nr::UMOUNT2, target.as_ptr() as usize, flags.bits() as usize) }).map(|_| ())
 }
 
+/// `pivot_root(new_root, put_old)`: changes the root mount in the current mount namespace.
+/// replaces libc::SYS_pivot_root
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn pivot_root(new_root: Path<'_>, put_old: Path<'_>) -> Result<(), Errno> {
+    // SAFETY: both paths are live NUL-terminated strings read by the kernel and not kept.
+    raw::check(unsafe { raw::syscall2(nr::PIVOT_ROOT, new_root.as_ptr().addr(), put_old.as_ptr().addr()) }).map(|_| ())
+}
+
 // ---- priorities and load ------------------------------------------------------------------
 
 /// Which kind of id a [`getpriority`] or [`setpriority`] names (`PRIO_*`, linux/resource.h).

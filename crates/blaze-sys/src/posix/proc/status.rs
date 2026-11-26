@@ -447,6 +447,18 @@ pub use crate::macos::cold::fchmodat;
 #[cfg(target_os = "macos")]
 pub use crate::macos::cold::mkdir;
 
+/// Creates directory `path` with explicit permission bits `mode` (subject to umask; follow with
+/// [`change_mode`] on an opened fd to guarantee exact bits).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn make_dir_mode(path: Path<'_>, mode: mode_t) -> Result<(), Errno> {
+    #[cfg(target_os = "linux")]
+    return crate::linux::mkdirat(crate::linux::CWD, path, mode);
+    // SAFETY: `path` is a live NUL-terminated C string read by the call and not kept.
+    #[cfg(target_os = "macos")]
+    return super::said(unsafe { mkdir(path.as_ptr(), mode) }).map(|_| ());
+}
+
 /// `utimensat` (sys/stat.h), from the table of calls found at first use:
 /// `int utimensat(int dir, const char *path, const struct timespec times[2], int flags)`,
 /// `times` two [`crate::Timespec`]s. On Linux the call is `crate::linux::utimensat`.
