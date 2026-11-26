@@ -597,6 +597,149 @@ fn peel_redundant_mask(
 }
 
 #[inline]
+fn resolve_stand(stands: Option<&[u32]>, raw: u32) -> Option<u32> {
+    match stands {
+        Some(s) => stand_of(s, raw),
+        None => Some(raw),
+    }
+}
+
+/// Matches a flagless binary instruction `expect_op(lhs, rhs)` of exact type `expect_ty`,
+/// resolving operand leaders through `stands` when provided.
+#[inline]
+fn match_flagless_binop(
+    view: &View<'_>,
+    stands: Option<&[u32]>,
+    node: u32,
+    expect_op: Op,
+    expect_ty: Ty,
+) -> Option<(u32, u32)> {
+    let ni = u32_ix(node);
+    if view.op(ni) != expect_op
+        || !inst_flags_zero(view, ni)
+        || inst_ty(view, ni) != Some(expect_ty)
+    {
+        return None;
+    }
+    let at = get_u32(view.data, ni).map(u32_ix)?;
+    let (ra, rb) = extra_pair(view, at)?;
+    let a = resolve_stand(stands, ra)?;
+    let b = resolve_stand(stands, rb)?;
+    Some((a, b))
+}
+
+/// Matches flagless `Op::Shl(inner, Iconst(k))` of scalar integer type `expect_ty` (`bits` wide)
+/// with `k < bits`, returning `(inner, k)`.
+#[inline]
+fn match_flagless_shl_const(
+    view: &View<'_>,
+    stands: Option<&[u32]>,
+    known: &[Option<u128>],
+    node: u32,
+    expect_ty: Ty,
+    bits: u32,
+) -> Option<(u32, u32)> {
+    if bits == 0 || bits > 128 {
+        return None;
+    }
+    let (lhs, rhs) = match_flagless_binop(view, stands, node, Op::Shl, expect_ty)?;
+    let k_u128 = get_const(known, rhs)?;
+    if k_u128 < u128::from(bits) {
+        Some((lhs, low_u32(k_u128)))
+    } else {
+        None
+    }
+}
+
+/// Returns `true` when `node` (of scalar integer type `expect_ty`, `bits` wide) is provably
+/// bit-disjoint from `and_mask` (`(node & and_mask) == 0`):
+/// - `Iconst(c)` with `(c & and_mask) == 0`, OR
+/// - flagless `Op::Shl(_, Iconst(k))` with `0 < k < bits` and `(and_mask >> k) == 0`.
+#[inline]
+fn is_disjoint_from_mask(
+    view: &View<'_>,
+    stands: Option<&[u32]>,
+    known: &[Option<u128>],
+    node: u32,
+    expect_ty: Ty,
+    bits: u32,
+    and_mask: u128,
+) -> bool {
+    if let Some(c) = get_const(known, node) {
+        return (c & and_mask) == 0;
+    }
+    if let Some((_inner, k)) = match_flagless_shl_const(view, stands, known, node, expect_ty, bits) {
+        return k > 0 && (and_mask >> k) == 0;
+    }
+    false
+}
+
+/// Returns `true` when `node` (of scalar integer type `expect_ty`) is provably zero in every
+/// bit outside `keep_mask` (`(node & !keep_mask) == 0`):
+/// - `Iconst(c)` with `(c & !keep_mask) == 0`,
+/// - flagless `Op::And(_, Iconst(m))` (either side) with `(m & !keep_mask) == 0`, OR
+/// - flagless `Op::Zext(inner)` whose source width mask fits inside `keep_mask`.
+#[inline]
+fn known_within_mask(
+    view: &View<'_>,
+    stands: Option<&[u32]>,
+    known: &[Option<u128>],
+    ptr_bits: u32,
+    node: u32,
+    expect_ty: Ty,
+    keep_mask: u128,
+) -> bool {
+    if let Some(c) = get_const(known, node) {
+        return (c & !keep_mask) == 0;
+    }
+    let ni = u32_ix(node);
+    if !inst_flags_zero(view, ni) || inst_ty(view, ni) != Some(expect_ty) {
+        return false;
+    }
+    match view.op(ni) {
+        Op::And => {
+            let Some(at) = get_u32(view.data, ni).map(u32_ix) else { return false };
+            let Some((ra, rb)) = extra_pair(view, at) else { return false };
+            let (Some(a), Some(b)) = (resolve_stand(stands, ra), resolve_stand(stands, rb)) else {
+                return false;
+            };
+            get_const(known, b).is_some_and(|m| (m & !keep_mask) == 0)
+                || get_const(known, a).is_some_and(|m| (m & !keep_mask) == 0)
+        }
+        Op::Zext => {
+            let Some(raw_inner) = get_u32(view.data, ni) else { return false };
+            let Some(inner) = resolve_stand(stands, raw_inner) else { return false };
+            let Some(inner_ty) = inst_ty(view, u32_ix(inner)) else { return false };
+            let Some((_inner_bits, inner_mask)) = scalar_int_mask(inner_ty, ptr_bits) else {
+                return false;
+            };
+            (inner_mask & !keep_mask) == 0
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` when `node` (of scalar integer type `expect_ty`, `bits` wide) is provably zero
+/// in all bit positions `>= k` (for `0 < k < bits`), so `Lshr(node, k) == 0`.
+#[inline]
+fn known_fits_below_shift(
+    view: &View<'_>,
+    stands: Option<&[u32]>,
+    known: &[Option<u128>],
+    ptr_bits: u32,
+    node: u32,
+    expect_ty: Ty,
+    bits: u32,
+    k: u32,
+) -> bool {
+    if k == 0 || k >= bits || bits > 128 {
+        return false;
+    }
+    let low_mask = (1u128 << k) - 1;
+    known_within_mask(view, stands, known, ptr_bits, node, expect_ty, low_mask)
+}
+
+#[inline]
 const fn swap_int_cond(c: IntCond) -> IntCond {
     match c {
         IntCond::Eq => IntCond::Eq,
@@ -1504,6 +1647,63 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                                         || unary_stand(&view, &stands, a, Op::Not) == Some(b)
                                     {
                                         folded_const = Some(0); // x & !x == 0
+                                    } else if flags.0 == 0 {
+                                        // Rule A: `And(Or(x, y), Iconst(m))` when one arm is
+                                        // bit-disjoint from `m` (shifted left past `m` or const
+                                        // with `(c & m) == 0`).
+                                        let and_or = if let Some(m) = cb {
+                                            Some((a, m & mask))
+                                        } else if let Some(m) = ca {
+                                            Some((b, m & mask))
+                                        } else {
+                                            None
+                                        };
+                                        if let Some((or_cand, and_mask)) = and_or
+                                            && let Some((ox, oy)) = match_flagless_binop(
+                                                &view,
+                                                Some(&stands),
+                                                or_cand,
+                                                Op::Or,
+                                                ty,
+                                            )
+                                        {
+                                            let x_disj = is_disjoint_from_mask(
+                                                &view,
+                                                Some(&stands),
+                                                &known_const,
+                                                ox,
+                                                ty,
+                                                bits,
+                                                and_mask,
+                                            );
+                                            let y_disj = is_disjoint_from_mask(
+                                                &view,
+                                                Some(&stands),
+                                                &known_const,
+                                                oy,
+                                                ty,
+                                                bits,
+                                                and_mask,
+                                            );
+                                            if x_disj && y_disj {
+                                                folded_const = Some(0);
+                                            } else if x_disj || y_disj {
+                                                let keep = if x_disj { oy } else { ox };
+                                                if let Some(c) = get_const(&known_const, keep) {
+                                                    folded_const = Some(c & and_mask);
+                                                } else if known_within_mask(
+                                                    &view,
+                                                    Some(&stands),
+                                                    &known_const,
+                                                    ptr_bits,
+                                                    keep,
+                                                    ty,
+                                                    and_mask,
+                                                ) {
+                                                    folded_val = Some(keep);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 Op::Or => {
@@ -1536,6 +1736,94 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                                     if let Some(sh) = cb {
                                         if (sh % u128::from(bits)) == 0 {
                                             folded_val = Some(a);
+                                        } else if op == Op::Lshr
+                                            && flags.0 == 0
+                                            && sh > 0
+                                            && sh < u128::from(bits)
+                                        {
+                                            let k = low_u32(sh);
+                                            let keep_mask = mask >> k;
+                                            // Rule B: `Lshr(Or(x, y), k)` drops any arm proven to
+                                            // fit below bit `k`, immediately chaining Rule C
+                                            // (`Lshr(Shl(inner, k), k) -> inner` when `inner` fits
+                                            // within `keep_mask`).
+                                            let base = if let Some((ox, oy)) = match_flagless_binop(
+                                                &view,
+                                                Some(&stands),
+                                                a,
+                                                Op::Or,
+                                                ty,
+                                            ) {
+                                                let x_fits = known_fits_below_shift(
+                                                    &view,
+                                                    Some(&stands),
+                                                    &known_const,
+                                                    ptr_bits,
+                                                    ox,
+                                                    ty,
+                                                    bits,
+                                                    k,
+                                                );
+                                                let y_fits = known_fits_below_shift(
+                                                    &view,
+                                                    Some(&stands),
+                                                    &known_const,
+                                                    ptr_bits,
+                                                    oy,
+                                                    ty,
+                                                    bits,
+                                                    k,
+                                                );
+                                                if x_fits && y_fits {
+                                                    folded_const = Some(0);
+                                                    None
+                                                } else if y_fits {
+                                                    Some(ox)
+                                                } else if x_fits {
+                                                    Some(oy)
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                Some(a)
+                                            };
+                                            if let Some(src) = base {
+                                                if let Some(c) = get_const(&known_const, src) {
+                                                    folded_const = Some(c >> k);
+                                                } else if known_fits_below_shift(
+                                                    &view,
+                                                    Some(&stands),
+                                                    &known_const,
+                                                    ptr_bits,
+                                                    src,
+                                                    ty,
+                                                    bits,
+                                                    k,
+                                                ) {
+                                                    folded_const = Some(0);
+                                                } else if let Some((shl_x, shl_k)) =
+                                                    match_flagless_shl_const(
+                                                        &view,
+                                                        Some(&stands),
+                                                        &known_const,
+                                                        src,
+                                                        ty,
+                                                        bits,
+                                                    )
+                                                    && shl_k == k
+                                                    && known_within_mask(
+                                                        &view,
+                                                        Some(&stands),
+                                                        &known_const,
+                                                        ptr_bits,
+                                                        shl_x,
+                                                        ty,
+                                                        keep_mask,
+                                                    )
+                                                {
+                                                    folded_val = Some(shl_x);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1641,6 +1929,78 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                                     set_at(&mut edit_const, inst, Some(res));
                                     stats.constants_folded += 1;
                                     continue;
+                                }
+                            }
+                            // Rule D: `Trunc` through `Shl` / `Or` when a shifted or constant
+                            // operand has all low `bits` guaranteed zero (`dst_bits < src_bits`).
+                            if op == Op::Trunc
+                                && flags.0 == 0
+                                && let Some((src_bits, _)) = scalar_int_mask(src_ty, ptr_bits)
+                                && bits < src_bits
+                            {
+                                if let Some((_inner, k)) = match_flagless_shl_const(
+                                    &view,
+                                    Some(&stands),
+                                    &known_const,
+                                    a,
+                                    src_ty,
+                                    src_bits,
+                                ) && k >= bits
+                                {
+                                    set_at(&mut known_const, inst, Some(0));
+                                    set_at(&mut edit_const, inst, Some(0));
+                                    stats.identities_folded += 1;
+                                    continue;
+                                }
+                                if let Some((ox, oy)) =
+                                    match_flagless_binop(&view, Some(&stands), a, Op::Or, src_ty)
+                                {
+                                    let x_zero = is_disjoint_from_mask(
+                                        &view,
+                                        Some(&stands),
+                                        &known_const,
+                                        ox,
+                                        src_ty,
+                                        src_bits,
+                                        mask,
+                                    );
+                                    let y_zero = is_disjoint_from_mask(
+                                        &view,
+                                        Some(&stands),
+                                        &known_const,
+                                        oy,
+                                        src_ty,
+                                        src_bits,
+                                        mask,
+                                    );
+                                    if x_zero && y_zero {
+                                        set_at(&mut known_const, inst, Some(0));
+                                        set_at(&mut edit_const, inst, Some(0));
+                                        stats.identities_folded += 1;
+                                        continue;
+                                    }
+                                    if x_zero || y_zero {
+                                        let keep = if x_zero { oy } else { ox };
+                                        if let Some(c) = get_const(&known_const, keep) {
+                                            let res = c & mask;
+                                            set_at(&mut known_const, inst, Some(res));
+                                            set_at(&mut edit_const, inst, Some(res));
+                                            stats.identities_folded += 1;
+                                            continue;
+                                        }
+                                        let ki = u32_ix(keep);
+                                        if matches!(view.op(ki), Op::Zext | Op::Sext)
+                                            && inst_flags_zero(&view, ki)
+                                            && let Some(raw_inner) = get_u32(view.data, ki)
+                                            && let Some(inner) = stand_of(&stands, raw_inner)
+                                            && inst_ty(&view, u32_ix(inner)) == Some(ty)
+                                        {
+                                            set_at(&mut stands, inst, inner);
+                                            copy_const(&mut known_const, inst, inner);
+                                            stats.identities_folded += 1;
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
                             let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b: 0, c: 0 };
@@ -3996,101 +4356,164 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                             }
                         }
                     }
-                } else if op == Op::Trunc && (ty == Ty::I64 || ty == Ty::I32) {
-                    // Fold widened multiply-high idioms into single-instruction `Op::Umulhi`/`Op::Smulhi`:
-                    //   `trunc(lshr|ashr(mul(zext(a), zext(b)), W) -> iW) -> umulhi(a, b)`
-                    //   `trunc(lshr|ashr(mul(sext(a), sext(b)), W) -> iW) -> smulhi(a, b)`
-                    // (Also handles a folded wide constant operand fitting in `iW`!)
-                    let narrow_bits = ty.bits(ptr_bits);
-                    let wide_ty = if ty == Ty::I64 { Ty::I128 } else { Ty::I64 };
-                    let wide_bits = wide_ty.bits(ptr_bits);
-                    let narrow_mask = if narrow_bits == 64 {
-                        u128::from(u64::MAX)
-                    } else {
-                        u128::from(u32::MAX)
-                    };
-                    if let Some(sh_raw) = get_u32(view.data, inst) {
-                        let shi = u32_ix(sh_raw);
-                        let shop = view.op(shi);
-                        if matches!(shop, Op::Lshr | Op::Ashr)
-                            && inst_ty(&view, shi) == Some(wide_ty)
-                            && get_u8(view.flags, shi).is_some_and(|f| shop.info().flags.meanings_only(Flags(f)).0 == 0)
-                            && let Some(sh_at) = get_u32(view.data, shi).map(u32_ix)
-                            && let Some((mul_raw, amt_raw)) = extra_pair(&view, sh_at)
-                            && get_const(&known, amt_raw) == Some(u128::from(narrow_bits))
-                        {
-                            let mi = u32_ix(mul_raw);
-                            if view.op(mi) == Op::Mul
-                                && inst_ty(&view, mi) == Some(wide_ty)
-                                && get_u8(view.flags, mi)
-                                    .is_some_and(|f| Op::Mul.info().flags.meanings_only(Flags(f)).0 == 0)
-                                && let Some(m_at) = get_u32(view.data, mi).map(u32_ix)
-                                && let Some((ma_raw, mb_raw)) = extra_pair(&view, m_at)
+                } else if op == Op::Trunc {
+                    if ty == Ty::I64 || ty == Ty::I32 {
+                        // Fold widened multiply-high idioms into single-instruction `Op::Umulhi`/`Op::Smulhi`:
+                        //   `trunc(lshr|ashr(mul(zext(a), zext(b)), W) -> iW) -> umulhi(a, b)`
+                        //   `trunc(lshr|ashr(mul(sext(a), sext(b)), W) -> iW) -> smulhi(a, b)`
+                        // (Also handles a folded wide constant operand fitting in `iW`!)
+                        let narrow_bits = ty.bits(ptr_bits);
+                        let wide_ty = if ty == Ty::I64 { Ty::I128 } else { Ty::I64 };
+                        let wide_bits = wide_ty.bits(ptr_bits);
+                        let narrow_mask = if narrow_bits == 64 {
+                            u128::from(u64::MAX)
+                        } else {
+                            u128::from(u32::MAX)
+                        };
+                        if let Some(sh_raw) = get_u32(view.data, inst) {
+                            let shi = u32_ix(sh_raw);
+                            let shop = view.op(shi);
+                            if matches!(shop, Op::Lshr | Op::Ashr)
+                                && inst_ty(&view, shi) == Some(wide_ty)
+                                && get_u8(view.flags, shi).is_some_and(|f| shop.info().flags.meanings_only(Flags(f)).0 == 0)
+                                && let Some(sh_at) = get_u32(view.data, shi).map(u32_ix)
+                                && let Some((mul_raw, amt_raw)) = extra_pair(&view, sh_at)
+                                && get_const(&known, amt_raw) == Some(u128::from(narrow_bits))
                             {
-                                enum MulHiArg {
-                                    Val(u32),
-                                    Const(u128),
-                                }
-                                let extract_unsigned = |v: u32| -> Option<MulHiArg> {
-                                    let vi = u32_ix(v);
-                                    if view.op(vi) == Op::Zext && inst_flags_zero(&view, vi) {
-                                        let inner = get_u32(view.data, vi)?;
-                                        if inst_ty(&view, u32_ix(inner)) == Some(ty) {
-                                            let mv = get_u32(&val_map, u32_ix(inner))?;
-                                            if mv != NONE {
-                                                return Some(MulHiArg::Val(mv));
+                                let mi = u32_ix(mul_raw);
+                                if view.op(mi) == Op::Mul
+                                    && inst_ty(&view, mi) == Some(wide_ty)
+                                    && get_u8(view.flags, mi)
+                                        .is_some_and(|f| Op::Mul.info().flags.meanings_only(Flags(f)).0 == 0)
+                                    && let Some(m_at) = get_u32(view.data, mi).map(u32_ix)
+                                    && let Some((ma_raw, mb_raw)) = extra_pair(&view, m_at)
+                                {
+                                    enum MulHiArg {
+                                        Val(u32),
+                                        Const(u128),
+                                    }
+                                    let extract_unsigned = |v: u32| -> Option<MulHiArg> {
+                                        let vi = u32_ix(v);
+                                        if view.op(vi) == Op::Zext && inst_flags_zero(&view, vi) {
+                                            let inner = get_u32(view.data, vi)?;
+                                            if inst_ty(&view, u32_ix(inner)) == Some(ty) {
+                                                let mv = get_u32(&val_map, u32_ix(inner))?;
+                                                if mv != NONE {
+                                                    return Some(MulHiArg::Val(mv));
+                                                }
                                             }
                                         }
-                                    }
-                                    if let Some(c) = get_const(&known, v)
-                                        && c <= narrow_mask
-                                    {
-                                        return Some(MulHiArg::Const(c));
-                                    }
-                                    None
-                                };
-                                let extract_signed = |v: u32| -> Option<MulHiArg> {
-                                    let vi = u32_ix(v);
-                                    if view.op(vi) == Op::Sext && inst_flags_zero(&view, vi) {
-                                        let inner = get_u32(view.data, vi)?;
-                                        if inst_ty(&view, u32_ix(inner)) == Some(ty) {
-                                            let mv = get_u32(&val_map, u32_ix(inner))?;
-                                            if mv != NONE {
-                                                return Some(MulHiArg::Val(mv));
+                                        if let Some(c) = get_const(&known, v)
+                                            && c <= narrow_mask
+                                        {
+                                            return Some(MulHiArg::Const(c));
+                                        }
+                                        None
+                                    };
+                                    let extract_signed = |v: u32| -> Option<MulHiArg> {
+                                        let vi = u32_ix(v);
+                                        if view.op(vi) == Op::Sext && inst_flags_zero(&view, vi) {
+                                            let inner = get_u32(view.data, vi)?;
+                                            if inst_ty(&view, u32_ix(inner)) == Some(ty) {
+                                                let mv = get_u32(&val_map, u32_ix(inner))?;
+                                                if mv != NONE {
+                                                    return Some(MulHiArg::Val(mv));
+                                                }
                                             }
                                         }
-                                    }
-                                    if let Some(c) = get_const(&known, v) {
-                                        let sc = sext(c, wide_bits);
-                                        let fits = if narrow_bits == 64 {
-                                            i64::try_from(sc).is_ok()
-                                        } else {
-                                            i32::try_from(sc).is_ok()
+                                        if let Some(c) = get_const(&known, v) {
+                                            let sc = sext(c, wide_bits);
+                                            let fits = if narrow_bits == 64 {
+                                                i64::try_from(sc).is_ok()
+                                            } else {
+                                                i32::try_from(sc).is_ok()
+                                            };
+                                            if fits {
+                                                return Some(MulHiArg::Const(c & narrow_mask));
+                                            }
+                                        }
+                                        None
+                                    };
+                                    let matched = match (extract_unsigned(ma_raw), extract_unsigned(mb_raw)) {
+                                        (Some(la), Some(rb)) => Some((Op::Umulhi, la, rb)),
+                                        _ => match (extract_signed(ma_raw), extract_signed(mb_raw)) {
+                                            (Some(la), Some(rb)) => Some((Op::Smulhi, la, rb)),
+                                            _ => None,
+                                        },
+                                    };
+                                    if let Some((mulhi_op, la, rb)) = matched {
+                                        let lhs_m = match la {
+                                            MulHiArg::Val(v) => v,
+                                            MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
                                         };
-                                        if fits {
-                                            return Some(MulHiArg::Const(c & narrow_mask));
-                                        }
+                                        let rhs_m = match rb {
+                                            MulHiArg::Val(v) => v,
+                                            MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
+                                        };
+                                        replaced = Some(push_binary_inst(&mut func, mulhi_op, ty, lhs_m, rhs_m, loc));
                                     }
-                                    None
-                                };
-                                let matched = match (extract_unsigned(ma_raw), extract_unsigned(mb_raw)) {
-                                    (Some(la), Some(rb)) => Some((Op::Umulhi, la, rb)),
-                                    _ => match (extract_signed(ma_raw), extract_signed(mb_raw)) {
-                                        (Some(la), Some(rb)) => Some((Op::Smulhi, la, rb)),
-                                        _ => None,
-                                    },
-                                };
-                                if let Some((mulhi_op, la, rb)) = matched {
-                                    let lhs_m = match la {
-                                        MulHiArg::Val(v) => v,
-                                        MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
-                                    };
-                                    let rhs_m = match rb {
-                                        MulHiArg::Val(v) => v,
-                                        MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
-                                    };
-                                    replaced = Some(push_binary_inst(&mut func, mulhi_op, ty, lhs_m, rhs_m, loc));
                                 }
+                            }
+                        }
+                    }
+                    // Rule D: `Trunc` through `Shl` / `Or` / redundant `And` mask (`dst_bits < src_bits`).
+                    if replaced.is_none()
+                        && inst_flags_zero(&view, inst)
+                        && let Some((dst_bits, dst_mask)) = scalar_int_mask(ty, ptr_bits)
+                        && let Some(src_raw) = get_u32(view.data, inst)
+                        && let Some(src_ty) = inst_ty(&view, u32_ix(src_raw))
+                        && let Some((src_bits, _)) = scalar_int_mask(src_ty, ptr_bits)
+                        && dst_bits < src_bits
+                    {
+                        if let Some((_inner, k)) = match_flagless_shl_const(
+                            &view, None, &known, src_raw, src_ty, src_bits,
+                        ) && k >= dst_bits
+                        {
+                            replaced = Some(push_const_inst(&mut func, ty, ptr_bits, 0, loc));
+                        } else if let Some((ox, oy)) =
+                            match_flagless_binop(&view, None, src_raw, Op::Or, src_ty)
+                        {
+                            let x_zero = is_disjoint_from_mask(
+                                &view, None, &known, ox, src_ty, src_bits, dst_mask,
+                            );
+                            let y_zero = is_disjoint_from_mask(
+                                &view, None, &known, oy, src_ty, src_bits, dst_mask,
+                            );
+                            if x_zero && y_zero {
+                                replaced = Some(push_const_inst(&mut func, ty, ptr_bits, 0, loc));
+                            } else if x_zero || y_zero {
+                                let keep_raw = if x_zero { oy } else { ox };
+                                if let Some(c) = get_const(&known, keep_raw) {
+                                    replaced = Some(push_const_inst(
+                                        &mut func,
+                                        ty,
+                                        ptr_bits,
+                                        c & dst_mask,
+                                        loc,
+                                    ));
+                                } else if let Some(mk) = get_u32(&val_map, u32_ix(keep_raw))
+                                    && mk != NONE
+                                {
+                                    replaced = Some(push_unary_inst(&mut func, Op::Trunc, ty, mk, loc));
+                                }
+                            }
+                        } else if let Some((ax, ay)) =
+                            match_flagless_binop(&view, None, src_raw, Op::And, src_ty)
+                        {
+                            let keep_raw = if get_const(&known, ay)
+                                .is_some_and(|m| (dst_mask & !m) == 0)
+                            {
+                                Some(ax)
+                            } else if get_const(&known, ax).is_some_and(|m| (dst_mask & !m) == 0) {
+                                Some(ay)
+                            } else {
+                                None
+                            };
+                            if let Some(kr) = keep_raw
+                                && let Some(mk) = get_u32(&val_map, u32_ix(kr))
+                                && mk != NONE
+                            {
+                                replaced = Some(push_unary_inst(&mut func, Op::Trunc, ty, mk, loc));
                             }
                         }
                     }
@@ -4977,10 +5400,60 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                     if let Some((expr_raw, mask_mapped, outer_m)) = mask_pair
                                         && outer_m != 0
                                     {
-                                        if let Some(PeeledMaskOperand::ViaConv { conv_op, mapped_x }) =
-                                            peel_redundant_mask(
-                                                &view, &known, &val_map, ptr_bits, expr_raw, ty, outer_m,
+                                        // Rule A: `And(Or(x, y), Iconst(m))` when one arm is
+                                        // bit-disjoint from `m` -> `And(other, m)` (or direct
+                                        // value/constant when `other` fits within `m` or is const).
+                                        if outer_m != mask
+                                            && let Some((ox, oy)) = match_flagless_binop(
+                                                &view, None, expr_raw, Op::Or, ty,
                                             )
+                                        {
+                                            let x_disj = is_disjoint_from_mask(
+                                                &view, None, &known, ox, ty, bits, outer_m,
+                                            );
+                                            let y_disj = is_disjoint_from_mask(
+                                                &view, None, &known, oy, ty, bits, outer_m,
+                                            );
+                                            if x_disj && y_disj {
+                                                replaced =
+                                                    Some(push_const_inst(&mut func, ty, ptr_bits, 0, loc));
+                                            } else if x_disj || y_disj {
+                                                let keep_raw = if x_disj { oy } else { ox };
+                                                if let Some(c) = get_const(&known, keep_raw) {
+                                                    replaced = Some(push_const_inst(
+                                                        &mut func,
+                                                        ty,
+                                                        ptr_bits,
+                                                        c & outer_m,
+                                                        loc,
+                                                    ));
+                                                } else if let Some(mk) =
+                                                    get_u32(&val_map, u32_ix(keep_raw))
+                                                    && mk != NONE
+                                                {
+                                                    if known_within_mask(
+                                                        &view, None, &known, ptr_bits, keep_raw,
+                                                        ty, outer_m,
+                                                    ) {
+                                                        replaced = Some(mk);
+                                                    } else {
+                                                        replaced = Some(push_binary_inst(
+                                                            &mut func,
+                                                            Op::And,
+                                                            ty,
+                                                            mk,
+                                                            mask_mapped,
+                                                            loc,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if replaced.is_none()
+                                            && let Some(PeeledMaskOperand::ViaConv { conv_op, mapped_x }) =
+                                                peel_redundant_mask(
+                                                    &view, &known, &val_map, ptr_bits, expr_raw, ty, outer_m,
+                                                )
                                         {
                                             let new_conv =
                                                 push_unary_inst(&mut func, conv_op, ty, mapped_x, loc);
@@ -4992,7 +5465,7 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                                 mask_mapped,
                                                 loc,
                                             ));
-                                        } else {
+                                        } else if replaced.is_none() {
                                             let ei = u32_ix(expr_raw);
                                             let inner_op = view.op(ei);
                                             let op_ok = match inner_op {
@@ -5061,6 +5534,91 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                             replaced = Some(push_binary_inst(&mut func, op, ty, x, cc, loc));
                                         } else {
                                             replaced = Some(push_const_inst(&mut func, ty, ptr_bits, 0, loc));
+                                        }
+                                    }
+                                    // Rules B & C:
+                                    // - `Lshr(Or(x, y), k)` drops any arm proven to fit below `k`.
+                                    // - `Lshr(Shl(x, k), k)` -> `x` (when `x` fits `keep_mask`) or
+                                    //   `And(x, keep_mask)`.
+                                    if replaced.is_none()
+                                        && op == Op::Lshr
+                                        && inst_flags_zero(&view, inst)
+                                        && c2 > 0
+                                        && c2 < u128::from(bits)
+                                    {
+                                        let k = low_u32(c2);
+                                        let keep_mask = mask >> k;
+                                        let (peeled_or, base_raw) = if let Some((ox, oy)) =
+                                            match_flagless_binop(&view, None, raw_a, Op::Or, ty)
+                                        {
+                                            let x_fits = known_fits_below_shift(
+                                                &view, None, &known, ptr_bits, ox, ty, bits, k,
+                                            );
+                                            let y_fits = known_fits_below_shift(
+                                                &view, None, &known, ptr_bits, oy, ty, bits, k,
+                                            );
+                                            if x_fits && y_fits {
+                                                replaced = Some(push_const_inst(
+                                                    &mut func, ty, ptr_bits, 0, loc,
+                                                ));
+                                                (false, None)
+                                            } else if y_fits {
+                                                (true, Some(ox))
+                                            } else if x_fits {
+                                                (true, Some(oy))
+                                            } else {
+                                                (false, None)
+                                            }
+                                        } else {
+                                            (false, Some(raw_a))
+                                        };
+                                        if replaced.is_none()
+                                            && let Some(src_raw) = base_raw
+                                        {
+                                            if let Some(c) = get_const(&known, src_raw) {
+                                                replaced = Some(push_const_inst(
+                                                    &mut func,
+                                                    ty,
+                                                    ptr_bits,
+                                                    c >> k,
+                                                    loc,
+                                                ));
+                                            } else if known_fits_below_shift(
+                                                &view, None, &known, ptr_bits, src_raw, ty, bits, k,
+                                            ) {
+                                                replaced = Some(push_const_inst(
+                                                    &mut func, ty, ptr_bits, 0, loc,
+                                                ));
+                                            } else if let Some((shl_x_raw, shl_k)) =
+                                                match_flagless_shl_const(
+                                                    &view, None, &known, src_raw, ty, bits,
+                                                )
+                                                && shl_k == k
+                                                && let Some(mx) =
+                                                    get_u32(&val_map, u32_ix(shl_x_raw))
+                                                && mx != NONE
+                                            {
+                                                if known_within_mask(
+                                                    &view, None, &known, ptr_bits, shl_x_raw, ty,
+                                                    keep_mask,
+                                                ) {
+                                                    replaced = Some(mx);
+                                                } else {
+                                                    let mc = push_const_inst(
+                                                        &mut func, ty, ptr_bits, keep_mask, loc,
+                                                    );
+                                                    replaced = Some(push_binary_inst(
+                                                        &mut func, Op::And, ty, mx, mc, loc,
+                                                    ));
+                                                }
+                                            } else if peeled_or
+                                                && let Some(mk) = get_u32(&val_map, u32_ix(src_raw))
+                                                && mk != NONE
+                                            {
+                                                replaced = Some(push_binary_inst(
+                                                    &mut func, Op::Lshr, ty, mk, b_val, loc,
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -9552,6 +10110,270 @@ mod tests {
                             eval::run_in(v, &args, 10_000, alloc).unwrap(),
                             "depth-3 disjunctive select mismatch on ({cv1}, {cv2}, {cv3})"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn egraph_collapses_packed_option_u8_payload_and_tag() {
+        let alloc = TestHeap;
+
+        // 1. Packed `Option<u8>` (`Some(x)` = `(zext(x: i8 -> i16) << 8) | 1`):
+        //    - `Trunc(packed -> i8)` folds directly to `1`
+        //    - `Trunc(Lshr(packed, 8) -> i8)` folds directly to `x`
+        //    - `And(packed, 0xff)` folds directly to `1`
+        //    All in a single `aegraph_optimize` pass with zero bitfield ops remaining!
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I8)],
+                &[Param::of(Ty::I8), Param::of(Ty::I8), Param::of(Ty::I16)],
+            );
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let x = b.param(Ty::I8);
+            let zx = b.convert(Op::Zext, Flags::NONE, Ty::I16, x);
+            let c8 = b.iconst(Ty::I16, 8);
+            let sh = b.binary(Op::Shl, Flags::NONE, zx, c8);
+            let c1 = b.iconst(Ty::I16, 1);
+            let packed = b.binary(Op::Or, Flags::NONE, sh, c1);
+            let tag_trunc = b.convert(Op::Trunc, Flags::NONE, Ty::I8, packed);
+            let hi = b.binary(Op::Lshr, Flags::NONE, packed, c8);
+            let payload = b.convert(Op::Trunc, Flags::NONE, Ty::I8, hi);
+            let cff = b.iconst(Ty::I16, 0xff);
+            let tag_and = b.binary(Op::And, Flags::NONE, packed, cff);
+            b.ret(&[tag_trunc, payload, tag_and]);
+            let f = b.finish_checked().unwrap();
+
+            let opt = aegraph_optimize(f.view(), alloc).unwrap();
+            let v = opt.func.view();
+            verify(v).unwrap();
+            for forbidden in [Op::Shl, Op::Lshr, Op::Or, Op::And, Op::Zext, Op::Trunc] {
+                assert_eq!(
+                    (0..v.len()).filter(|&i| v.op(i) == forbidden).count(),
+                    0,
+                    "expected {forbidden:?} completely eliminated from packed Option<u8>"
+                );
+            }
+
+            for &xv in &[0u8, 1, 42, 0x7f, 0x80, 0xff] {
+                let args = [Val::Int(u128::from(xv))];
+                let before = eval::run_in(f.view(), &args, 10_000, alloc).unwrap();
+                let after = eval::run_in(v, &args, 10_000, alloc).unwrap();
+                assert_eq!(before, after, "packed Option<u8> mismatch on x={xv:#x}");
+                match after {
+                    Outcome::Returned(vals) => {
+                        assert_eq!(
+                            vals.as_slice(),
+                            &[Val::Int(1), Val::Int(u128::from(xv)), Val::Int(1)]
+                        );
+                    }
+                    other => panic!("expected Returned for x={xv:#x}, got {other:?}"),
+                }
+            }
+        }
+
+        // 2. Generalized non-constant Rules A/B/C/D via `sota_optimize_fixpoint`:
+        //    - `And(Or(Shl(Zext(x), 8), y), 0xff)` -> `And(y, 0xff)`
+        //    - `Trunc(Or(Shl(Zext(x), 8), y) -> i8)` -> `Trunc(y -> i8)`
+        //    - `Trunc(Shl(y, 8) -> i8)` -> `0`
+        //    - `Lshr(Shl(y, 8), 8)` -> `And(y, 0xff)` (GVN-shared with above)
+        //    - `Lshr(Or(y, Zext(x)), 8)` -> `Lshr(y, 8)`
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I8), Param::of(Ty::I16)],
+                &[
+                    Param::of(Ty::I16),
+                    Param::of(Ty::I8),
+                    Param::of(Ty::I8),
+                    Param::of(Ty::I16),
+                    Param::of(Ty::I16),
+                ],
+            );
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let x = b.param(Ty::I8);
+            let y = b.param(Ty::I16);
+            let zx = b.convert(Op::Zext, Flags::NONE, Ty::I16, x);
+            let c8 = b.iconst(Ty::I16, 8);
+            let cff = b.iconst(Ty::I16, 0xff);
+            let sh_x = b.binary(Op::Shl, Flags::NONE, zx, c8);
+            let packed = b.binary(Op::Or, Flags::NONE, sh_x, y);
+            let low_and = b.binary(Op::And, Flags::NONE, packed, cff);
+            let low_trunc = b.convert(Op::Trunc, Flags::NONE, Ty::I8, packed);
+            let sh_y = b.binary(Op::Shl, Flags::NONE, y, c8);
+            let zero_trunc = b.convert(Op::Trunc, Flags::NONE, Ty::I8, sh_y);
+            let mask_shl = b.binary(Op::Lshr, Flags::NONE, sh_y, c8);
+            let packed_low = b.binary(Op::Or, Flags::NONE, y, zx);
+            let drop_zext = b.binary(Op::Lshr, Flags::NONE, packed_low, c8);
+            b.ret(&[low_and, low_trunc, zero_trunc, mask_shl, drop_zext]);
+            let f = b.finish_checked().unwrap();
+
+            let opt = sota_optimize_fixpoint(f.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+            let v = opt.func.view();
+            verify(v).unwrap();
+            assert_eq!(materialize_strength_reduction(v, alloc).unwrap().1, 0, "expected fixed point");
+            assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Or).count(), 0);
+            assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Shl).count(), 0);
+            assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Zext).count(), 0);
+            assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::And).count(), 1);
+            assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Lshr).count(), 1);
+            assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Trunc).count(), 1);
+
+            for &(xv, yv) in &[(0u8, 0u16), (0xab, 0x1234), (0xff, 0xffff), (0x55, 0x8001)] {
+                let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(yv))];
+                assert_eq!(
+                    eval::run_in(f.view(), &args, 10_000, alloc).unwrap(),
+                    eval::run_in(v, &args, 10_000, alloc).unwrap(),
+                    "generalized bitfield rewrite mismatch on ({xv:#x}, {yv:#x})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn egraph_bitfield_rewrites_respect_shift_and_tag_guards() {
+        let alloc = TestHeap;
+
+        // 1. Negative guard (`k = 7 < dst_bits = 8` and `(0xff >> 7) != 0`):
+        //    `packed = Or(Shl(Zext(x: i8 -> i16), 7), 1)` MUST NOT fold `Trunc(packed -> i8)`
+        //    or `And(packed, 0xff)` to constant `1` because bit 7 depends on bit 0 of `x`.
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I8)],
+                &[Param::of(Ty::I8), Param::of(Ty::I16)],
+            );
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let x = b.param(Ty::I8);
+            let zx = b.convert(Op::Zext, Flags::NONE, Ty::I16, x);
+            let c7 = b.iconst(Ty::I16, 7);
+            let sh = b.binary(Op::Shl, Flags::NONE, zx, c7);
+            let c1 = b.iconst(Ty::I16, 1);
+            let packed = b.binary(Op::Or, Flags::NONE, sh, c1);
+            let lo_trunc = b.convert(Op::Trunc, Flags::NONE, Ty::I8, packed);
+            let cff = b.iconst(Ty::I16, 0xff);
+            let lo_and = b.binary(Op::And, Flags::NONE, packed, cff);
+            b.ret(&[lo_trunc, lo_and]);
+            let f = b.finish_checked().unwrap();
+
+            let ae = aegraph_optimize(f.view(), alloc).unwrap();
+            let sota = sota_optimize_fixpoint(f.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+            for v in [ae.func.view(), sota.func.view()] {
+                verify(v).unwrap();
+                assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Or).count(), 1);
+                assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Shl).count(), 1);
+                for &xv in &[0u8, 1, 2, 0x7f, 0x80, 0xff] {
+                    let args = [Val::Int(u128::from(xv))];
+                    assert_eq!(
+                        eval::run_in(f.view(), &args, 10_000, alloc).unwrap(),
+                        eval::run_in(v, &args, 10_000, alloc).unwrap(),
+                        "k < dst_bits guard mismatch on x={xv:#x}"
+                    );
+                }
+            }
+        }
+
+        // 2. Negative guard (`tag = 0x101` has bit `8 >= k = 8` set):
+        //    `Trunc(Lshr(Or(Shl(Zext(x: i8 -> i16), 8), 0x101), 8) -> i8)` MUST NOT fold to `x`
+        //    because bit 8 of `tag` leaks into bit 0 of the shifted result (`x | 1`).
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I8)], &[Param::of(Ty::I8)]);
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let x = b.param(Ty::I8);
+            let zx = b.convert(Op::Zext, Flags::NONE, Ty::I16, x);
+            let c8 = b.iconst(Ty::I16, 8);
+            let sh = b.binary(Op::Shl, Flags::NONE, zx, c8);
+            let bad_tag = b.iconst(Ty::I16, 0x101);
+            let packed = b.binary(Op::Or, Flags::NONE, sh, bad_tag);
+            let hi = b.binary(Op::Lshr, Flags::NONE, packed, c8);
+            let payload = b.convert(Op::Trunc, Flags::NONE, Ty::I8, hi);
+            b.ret(&[payload]);
+            let f = b.finish_checked().unwrap();
+
+            let ae = aegraph_optimize(f.view(), alloc).unwrap();
+            let sota = sota_optimize_fixpoint(f.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+            for v in [ae.func.view(), sota.func.view()] {
+                verify(v).unwrap();
+                assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Lshr).count(), 1);
+                assert_eq!((0..v.len()).filter(|&i| v.op(i) == Op::Or).count(), 1);
+                for &xv in &[0u8, 1, 0x42, 0xfe, 0xff] {
+                    let args = [Val::Int(u128::from(xv))];
+                    let after = eval::run_in(v, &args, 10_000, alloc).unwrap();
+                    assert_eq!(
+                        eval::run_in(f.view(), &args, 10_000, alloc).unwrap(),
+                        after,
+                        "high-bit tag guard mismatch on x={xv:#x}"
+                    );
+                    match after {
+                        Outcome::Returned(vals) => {
+                            assert_eq!(vals.as_slice(), &[Val::Int(u128::from(xv | 1))]);
+                        }
+                        other => panic!("expected Returned for x={xv:#x}, got {other:?}"),
+                    }
+                }
+            }
+        }
+
+        // 3. Negative guard for Rule C (`Zext(x: i16 -> i32)` exceeds `bits - k = 32 - 24 = 8`):
+        //    `Lshr(Shl(Zext(x: i16 -> i32), 24), 24)` MUST NOT fold to `Zext(x)` (high byte must
+        //    still be masked out to `x & 0xff`).
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I16)], &[Param::of(Ty::I32)]);
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let x = b.param(Ty::I16);
+            let zx = b.convert(Op::Zext, Flags::NONE, Ty::I32, x);
+            let c24 = b.iconst(Ty::I32, 24);
+            let sh = b.binary(Op::Shl, Flags::NONE, zx, c24);
+            let res = b.binary(Op::Lshr, Flags::NONE, sh, c24);
+            b.ret(&[res]);
+            let f = b.finish_checked().unwrap();
+
+            let ae = aegraph_optimize(f.view(), alloc).unwrap();
+            verify(ae.func.view()).unwrap();
+            assert_eq!(
+                (0..ae.func.view().len()).filter(|&i| ae.func.view().op(i) == Op::Lshr).count(),
+                1,
+                "Rule C must not drop mask when Zext width exceeds bits - k"
+            );
+
+            let sota = sota_optimize_fixpoint(f.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+            let sv = sota.func.view();
+            verify(sv).unwrap();
+            assert_eq!((0..sv.len()).filter(|&i| sv.op(i) == Op::And).count(), 1);
+            for &xv in &[0u16, 0x00ff, 0x0100, 0xabcd, 0xffff] {
+                let args = [Val::Int(u128::from(xv))];
+                for v in [ae.func.view(), sv] {
+                    let after = eval::run_in(v, &args, 10_000, alloc).unwrap();
+                    assert_eq!(
+                        eval::run_in(f.view(), &args, 10_000, alloc).unwrap(),
+                        after,
+                        "Rule C width guard mismatch on x={xv:#x}"
+                    );
+                    match after {
+                        Outcome::Returned(vals) => {
+                            assert_eq!(vals.as_slice(), &[Val::Int(u128::from(xv & 0xff))]);
+                        }
+                        other => panic!("expected Returned for x={xv:#x}, got {other:?}"),
                     }
                 }
             }

@@ -616,6 +616,8 @@ pub enum MOp {
     Msub { dst: MReg, rn: MReg, rm: MReg, ra: MReg, wide: bool },
     Umulh { dst: MReg, rn: MReg, rm: MReg },
     Smulh { dst: MReg, rn: MReg, rm: MReg },
+    /// 64-bit add/sub with carry (`adc` / `adcs` / `sbc` / `sbcs`) for multi-word `i128` ops.
+    CarryAddSub { dst: MReg, rn: MReg, rm: MReg, is_sub: bool, sets_flags: bool },
     Udiv { dst: MReg, rn: MReg, rm: MReg, wide: bool },
     Sdiv { dst: MReg, rn: MReg, rm: MReg, wide: bool },
     Umin { dst: MReg, rn: MReg, rm: MReg, wide: bool },
@@ -682,7 +684,8 @@ impl MOp {
             | Self::AddReg { sets_flags, .. }
             | Self::SubReg { sets_flags, .. }
             | Self::AddExt { sets_flags, .. }
-            | Self::SubExt { sets_flags, .. } => sets_flags,
+            | Self::SubExt { sets_flags, .. }
+            | Self::CarryAddSub { sets_flags, .. } => sets_flags,
             Self::LogicalImm { kind, .. } | Self::LogicalReg { kind, .. } => {
                 matches!(kind, LogicalKind::Ands)
             }
@@ -755,6 +758,7 @@ impl MOp {
         match *self {
             Self::CcmpImm { .. }
             | Self::CcmpReg { .. }
+            | Self::CarryAddSub { .. }
             | Self::Csel { .. }
             | Self::Csinc { .. }
             | Self::Csinv { .. }
@@ -856,6 +860,7 @@ impl MOp {
             | Self::Msub { .. }
             | Self::Umulh { .. }
             | Self::Smulh { .. }
+            | Self::CarryAddSub { .. }
             | Self::Udiv { .. }
             | Self::Sdiv { .. }
             | Self::Umin { .. }
@@ -1780,6 +1785,7 @@ fn verify_op(func: &MFunc<'_>, inst: MInst, op: &MOp) -> Result<(), MVerifyError
         | MOp::Mul { dst, rn, rm, .. }
         | MOp::Umulh { dst, rn, rm }
         | MOp::Smulh { dst, rn, rm }
+        | MOp::CarryAddSub { dst, rn, rm, .. }
         | MOp::Udiv { dst, rn, rm, .. }
         | MOp::Sdiv { dst, rn, rm, .. }
         | MOp::Umin { dst, rn, rm, .. }
@@ -2258,11 +2264,15 @@ fn block_ends_with_uncond_term(func: &MFunc<'_>, blk: MBlock) -> bool {
 
 /// True iff `func.block_order[ord_pos]` should be padded with alignment `NOP`s to a 16-byte
 /// boundary:
-/// - Always align any block (`ord_pos > 0`) that is the target of a backward branch (`src >= dst`),
-///   so hot loop headers and latches land cleanly on Apple Silicon / Graviton 16-byte fetch packets.
-/// - Otherwise, when `func.block_align16[blk]` is set, pad only if the immediately preceding
-///   non-empty block ends with an unconditional terminator (never emitting alignment `NOP`s on a
-///   fallthrough-only non-backedge path).
+/// - Never pad the entry block (`ord_pos == 0`).
+/// - Always align a true loop header (`func.block_align16[blk]` AND `is_backedge_target[blk]`),
+///   even across a pre-header fallthrough, so hot loop headers land cleanly on Apple Silicon /
+///   Graviton 16-byte fetch packets.
+/// - Never align when neither `func.block_align16[blk]` nor `is_backedge_target[blk]` holds.
+/// - Otherwise (`block_align16` without a backward branch, or a backward branch targeting a
+///   non-loop block such as a diamond merge jumped to from a cold tail), pad ONLY if the
+///   immediately preceding non-empty block ends with an unconditional terminator (zero executed
+///   fallthrough `NOP`s ever).
 #[inline]
 fn should_align16_block(func: &MFunc<'_>, is_backedge_target: &[bool], ord_pos: usize) -> bool {
     if ord_pos == 0 {
@@ -2272,10 +2282,12 @@ fn should_align16_block(func: &MFunc<'_>, is_backedge_target: &[bool], ord_pos: 
         return false;
     };
     let b = to_idx(blk.0);
-    if is_backedge_target.get(b).copied().unwrap_or(false) {
+    let is_hdr = func.block_align16.get(b).copied().unwrap_or(false);
+    let is_back = is_backedge_target.get(b).copied().unwrap_or(false);
+    if is_hdr && is_back {
         return true;
     }
-    if !func.block_align16.get(b).copied().unwrap_or(false) {
+    if !is_hdr && !is_back {
         return false;
     }
     for &prev_blk in func.block_order.get(..ord_pos).unwrap_or(&[]).iter().rev() {
@@ -3359,6 +3371,18 @@ fn encode_inst(
                 req_gpr_or_zr(inst, rm)?,
             ));
         }
+        MOp::CarryAddSub { dst, rn, rm, is_sub, sets_flags } => {
+            let rd = req_gpr_or_zr(inst, dst)?;
+            let r1 = req_gpr_or_zr(inst, rn)?;
+            let r2 = req_gpr_or_zr(inst, rm)?;
+            let word = match (is_sub, sets_flags) {
+                (false, false) => enc::adc(rd, r1, r2),
+                (false, true) => enc::adcs(rd, r1, r2),
+                (true, false) => enc::sbc(rd, r1, r2),
+                (true, true) => enc::sbcs(rd, r1, r2),
+            };
+            out.push(word);
+        }
         MOp::Udiv { dst, rn, rm, wide } => {
             out.push(enc::sf(
                 wide,
@@ -4171,8 +4195,9 @@ mod tests {
     fn mencode_align16_pads_after_uncond_term_but_skips_fallthrough() {
         let alloc = test_alloc();
 
-        // (a) Unconditional-`B` predecessor (even across an intervening empty block) pads `align16`
-        //     target to a 16-byte boundary.
+        // Case 4a (`block_align16 = true`, no backward branch, after unconditional terminator):
+        // Unconditional-`B` predecessor (even across an intervening empty block) pads `align16`
+        // target cleanly to a 16-byte boundary (zero executed `NOP`s).
         let mut uncond = new_post_ra(Os::MacOs);
         let u_b0 = uncond.new_block(false);
         let u_empty = uncond.new_block(false);
@@ -4198,8 +4223,9 @@ mod tests {
         assert_eq!(u_enc.words[3], enc::nop());
         assert_eq!(u_enc.words[4], enc::ret());
 
-        // (b) Fallthrough predecessor (even across an intervening empty block) must emit ZERO
-        //     alignment `NOP`s before an `align16` block.
+        // Case 1 (`block_align16 = true` + backward branch): true RPO loop header reached by
+        // fallthrough from pre-header `f_prep` (even across an intervening empty block) IS ALWAYS
+        // padded to 16-byte alignment (`mod 4 == 0`).
         let mut fall = new_post_ra(Os::MacOs);
         let f_entry = fall.new_block(false);
         let f_prep = fall.new_block(false);
@@ -4259,8 +4285,6 @@ mod tests {
         fall.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
         fall.end_block(f_exit);
 
-        // Case 2: Backward-branch target `f_loop` (even reached by fallthrough from pre-header
-        // `f_prep`) IS padded to 16-byte alignment so hot loop headers stay aligned (`mod 4 == 0`).
         let f_enc = mencode(&fall, alloc).expect("mencode backedge align16 must succeed");
         assert_eq!(f_enc.block_word_off.as_slice(), &[0, 2, 3, 4, 6]);
         assert_eq!(f_enc.words.len(), 7);
@@ -4269,9 +4293,8 @@ mod tests {
         assert_eq!(f_enc.words[5], enc::b_cond(enc::Cond::Lo, -1));
         assert_eq!(f_enc.words[6], enc::ret());
 
-        // Case 3: Fallthrough-only `align16` block with NO backward branch targeting it (branch
-        // targets `f_entry` instead, like `decode_exec_leaf_single`'s latch->header fallthrough)
-        // emits ZERO alignment NOPs!
+        // Case 4b (`block_align16 = true`, no backward branch, on a fallthrough path): branch
+        // targets `f_entry` instead of `f_loop` -> emits ZERO fallthrough `NOP`s!
         fall.ops[super::to_idx(f_blo.0)] = MOp::BCond { cond: MCond::Lo, target: f_entry };
         let f_no_back = mencode(&fall, alloc).expect("mencode non-backedge fallthrough must succeed");
         assert_eq!(f_no_back.block_word_off.as_slice(), &[0, 2, 3, 3, 5]);
@@ -4280,6 +4303,112 @@ mod tests {
             !f_no_back.words.iter().any(|&w| w == enc::nop()),
             "fallthrough-only non-backedge align16 block must emit ZERO alignment NOPs"
         );
+
+        // Case 2 (`block_align16 = false` + backward branch from a cold tail on a fallthrough
+        // path): non-loop diamond merge `d_merge` falls through from `d_hot` and is also targeted
+        // backward by cold tail `d_cold` -> ZERO fallthrough `NOP`s!
+        let mut diamond = new_post_ra(Os::MacOs);
+        let d_entry = diamond.new_block(false);
+        let d_hot = diamond.new_block(false);
+        let d_merge = diamond.new_block(false);
+        let d_cold = diamond.new_block(false);
+
+        diamond.begin_block(d_entry);
+        diamond.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X0), target: d_cold, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        diamond.end_block(d_entry);
+
+        diamond.begin_block(d_hot);
+        diamond.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 1, wide: true }, MInstFlags::NONE);
+        diamond.end_block(d_hot);
+
+        diamond.begin_block(d_merge);
+        diamond.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                imm12: 2,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        diamond.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        diamond.end_block(d_merge);
+
+        diamond.begin_block(d_cold);
+        diamond.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 7, wide: true }, MInstFlags::NONE);
+        diamond.push_inst(MOp::B { target: d_merge }, MInstFlags::TERMINATOR);
+        diamond.end_block(d_cold);
+
+        let d_enc = mencode(&diamond, alloc).expect("mencode diamond merge must succeed");
+        assert_eq!(d_enc.block_word_off.as_slice(), &[0, 1, 2, 4]);
+        assert_eq!(d_enc.words.len(), 6);
+        assert_eq!(d_enc.words[0], enc::sf(true, enc::cbz(X0, 4)));
+        assert_eq!(d_enc.words[1], enc::movz(X0, 1, 0));
+        assert_eq!(d_enc.words[2], enc::sf(true, enc::add_imm(X0, X0, 2, false)));
+        assert_eq!(d_enc.words[3], enc::ret());
+        assert_eq!(d_enc.words[4], enc::movz(X0, 7, 0));
+        assert_eq!(d_enc.words[5], enc::b(-3));
+        assert!(
+            !d_enc.words.iter().any(|&w| w == enc::nop()),
+            "non-loop diamond merge on fallthrough must emit ZERO alignment NOPs"
+        );
+
+        // Case 3 (`block_align16 = false` + backward branch after an unconditional terminator):
+        // preceded by unconditional `B` (even across an intervening empty block) -> aligned
+        // cleanly to a 16-byte boundary with zero executed `NOP`s!
+        let mut back_uncond = new_post_ra(Os::MacOs);
+        let bu_entry = back_uncond.new_block(false);
+        let bu_empty = back_uncond.new_block(false);
+        let bu_merge = back_uncond.new_block(false);
+        let bu_cold = back_uncond.new_block(false);
+
+        back_uncond.begin_block(bu_entry);
+        back_uncond.push_inst(
+            MOp::Cbz { rt: MReg::p(PReg::X0), target: bu_cold, wide: true },
+            MInstFlags::TERMINATOR,
+        );
+        back_uncond.push_inst(MOp::B { target: bu_merge }, MInstFlags::TERMINATOR);
+        back_uncond.end_block(bu_entry);
+
+        back_uncond.begin_block(bu_empty);
+        back_uncond.end_block(bu_empty);
+
+        back_uncond.begin_block(bu_merge);
+        back_uncond.push_inst(
+            MOp::AddImm {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::p(PReg::X0),
+                imm12: 2,
+                shift12: false,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        back_uncond.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        back_uncond.end_block(bu_merge);
+
+        back_uncond.begin_block(bu_cold);
+        back_uncond.push_inst(MOp::MovImm { dst: MReg::p(PReg::X0), imm: 7, wide: true }, MInstFlags::NONE);
+        back_uncond.push_inst(MOp::B { target: bu_merge }, MInstFlags::TERMINATOR);
+        back_uncond.end_block(bu_cold);
+
+        let bu_enc = mencode(&back_uncond, alloc).expect("mencode uncond backedge target must succeed");
+        assert_eq!(bu_enc.block_word_off.as_slice(), &[0, 2, 4, 6]);
+        assert_eq!(bu_enc.words.len(), 8);
+        assert_eq!(bu_enc.words[0], enc::sf(true, enc::cbz(X0, 6)));
+        assert_eq!(bu_enc.words[1], enc::b(3));
+        assert_eq!(bu_enc.words[2], enc::nop());
+        assert_eq!(bu_enc.words[3], enc::nop());
+        assert_eq!(bu_enc.words[4], enc::sf(true, enc::add_imm(X0, X0, 2, false)));
+        assert_eq!(bu_enc.words[5], enc::ret());
+        assert_eq!(bu_enc.words[6], enc::movz(X0, 7, 0));
+        assert_eq!(bu_enc.words[7], enc::b(-3));
     }
 
     #[test]
