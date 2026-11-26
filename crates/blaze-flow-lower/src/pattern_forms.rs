@@ -139,7 +139,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
     /// as a temporary `&lt` borrowing the place, and the guard's uses of `p` as `*tmp`.
     pub(crate) fn guard_ref_binding(&mut self, p: PatId, place: Place, ty: TyD, lt: TyD, g: ExprId) -> Result<(), Refusal> {
         let root = self.body.root;
-        if ty.wrap.is_some() || ty.ty != lt.ty {
+        if ty.wrap.is_some() || !self.same_up_to_alias(ty.ty, lt.ty, root)? {
             return self.refuse_pat(Form::BindingMode, p);
         }
         let rt = TyD { wrap: Some(Mutbl::Not), ty: lt.ty };

@@ -11,11 +11,13 @@
 //! the future operand"; the head's own signature (`fn into_future(self) -> Self::IntoFuture`)
 //! is what its call may relate.
 
+use blaze_borrow::{Columns, RegionTypes, SlotCount};
 use blaze_flow::{Local, Place};
 use core::alloc::Allocator;
 
 use blaze_typeck::{ExprId, ItemKey, List, Name, PNode, PTy};
 
+use crate::one_call::FactsArity;
 use crate::{AwaitUnrelated, Facts, Form, Lower, Refusal, Region, SigLife, TyD, Val};
 
 impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
@@ -138,7 +140,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let facts: &'b F = self.facts;
         let out_ty = self.sig_declared(life, life.inputs(), e)?;
         let PNode::Opaque(k, _) = self.head_node(out_ty, e)? else {
-            return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+            return self.dyn_future_output(life, out_ty, e);
         };
         let regions = facts.regions();
         let (Ok(captures), Ok(clauses)) = (regions.opaque_captures(k), regions.clauses(k)) else {
@@ -170,5 +172,85 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
         }
         Ok(found.ok_or(AwaitUnrelated::OpaqueOutputUnread { opaque: k }))
+    }
+
+    /// The awaited value of a sync call whose return type is a trait-object future wrapped in
+    /// transparent pointer layers (`Pin<Box<dyn Future<Output = T> + Send + 'a>>`,
+    /// `Box<dyn Future<Output = T> + 'a>`, `Pin<&mut dyn Future<Output = T>>`, or
+    /// `&mut dyn Future<Output = T>`): extracts `T` and its exact slot slice from the
+    /// `ExProj { name: "Output", args: [], term: T }` predicate inside `PNode::Dynamic`, so the
+    /// awaited value carries only the lifetimes `T` names and never the future object's `'a`.
+    fn dyn_future_output(
+        &self,
+        life: SigLife<'b>,
+        out_ty: PTy,
+        e: ExprId,
+    ) -> Result<Result<(PTy, &'b [Region]), AwaitUnrelated>, Refusal> {
+        let Some(mut cur_slots) = life.output() else {
+            return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+        };
+        let facts: &'b F = self.facts;
+        let arity = FactsArity { facts };
+        let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        let mut cur_ty = out_ty;
+        for _ in 0..4 {
+            match self.head_node(cur_ty, e)? {
+                PNode::Dynamic(preds) => {
+                    let Ok(own) = heads.own(cur_ty) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    let Some(mut rest) = cur_slots.get(own.len()..) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    let mut found: Option<(PTy, &'b [Region])> = None;
+                    for &pred in self.head_list(preds, e)? {
+                        let Ok(pc) = heads.count(pred) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                        let Some((pslots, next_rest)) = rest.split_at_checked(pc.len()) else {
+                            return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                        };
+                        rest = next_rest;
+                        if let PNode::ExProj { name, args, term, .. } = self.head_node(pred, e)?
+                            && name == Name::of("Output")
+                        {
+                            if !self.head_list(args, e)?.is_empty()
+                                || heads.own(pred).ok() != Some(SlotCount::ZERO)
+                                || found.is_some()
+                            {
+                                return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                            }
+                            let Ok(tc) = heads.count(term) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                            if pslots.len() != tc.len() {
+                                return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                            }
+                            found = Some((term, pslots));
+                        }
+                    }
+                    return Ok(found.ok_or(AwaitUnrelated::NoWrittenReturn));
+                }
+                PNode::Ref(_, inner) => {
+                    let Ok(own) = heads.own(cur_ty) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    let Some(next) = cur_slots.get(own.len()..) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    cur_ty = inner;
+                    cur_slots = next;
+                }
+                PNode::Adt(k, args) => {
+                    let Ok(own) = heads.own(cur_ty) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                    if own != SlotCount::ZERO {
+                        return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                    }
+                    let list = self.head_list(args, e)?;
+                    let is_box = facts.adt(k).is_some_and(|a| a.is_box);
+                    // Only peel `Pin<P>` (single-param zero-lifetime wrapper) or `Box<T, A>`
+                    // (`is_box`); `call_one` still checks `term` against the `.await` expr's type.
+                    if (is_box && !list.is_empty()) || list.len() == 1 {
+                        let inner = list[0];
+                        let Ok(ic) = heads.count(inner) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                        let Some(next) = cur_slots.get(..ic.len()) else { return Ok(Err(AwaitUnrelated::NoWrittenReturn)) };
+                        cur_ty = inner;
+                        cur_slots = next;
+                    } else {
+                        return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+                    }
+                }
+                _ => return Ok(Err(AwaitUnrelated::NoWrittenReturn)),
+            }
+        }
+        Ok(Err(AwaitUnrelated::NoWrittenReturn))
     }
 }
