@@ -452,7 +452,7 @@ pub(crate) fn warm_toolchain(
         shown.quiet = true;
         let mut check_opts = opts();
         check_opts.fresh = fresh;
-        let checked = check_live(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err, None, Some(&lazy_sdk), None)?;
+        let checked = check_live(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err, None, Some(&lazy_sdk), None, crate::store::StoreTeardown::Drop)?;
         let tc_hex = blaze_toolchain::PINNED.hex();
         out.line(
             cx,
@@ -492,7 +492,7 @@ fn serve(
 ) -> Result<Status, CliError> {
     let flags = crate::flags(args)?;
     let request = request_frame()?;
-    edge(cx, fs, env, net, host, out, err, phases, heap, &flags, why, &request, |edge, phases| {
+    let status = edge(cx, fs, env, net, host, out, err, phases, heap, &flags, why, &request, |edge, phases| {
         let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, lazy_sdk, .. } = edge;
         let Some(target) = why else {
             let checked = match flags.fix {
@@ -508,7 +508,7 @@ fn serve(
                     let ran = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
                         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
                         let live = line.live.then_some(bg);
-                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(&lazy_sdk), None);
+                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(&lazy_sdk), None, crate::store::StoreTeardown::ForgetForExit);
                         watch.see(blaze_screen::Step::Says);
                         res
                     }).map_err(CliError::RunLine)??;
@@ -524,7 +524,7 @@ fn serve(
                     if selectors.is_empty() {
                         selectors.push("all");
                     }
-                    let mut ask = |mut shown| check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&lazy_sdk), None).map(|checked| (checked, shown));
+                    let mut ask = |mut shown| check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&lazy_sdk), None, crate::store::StoreTeardown::Drop).map(|checked| (checked, shown));
                     match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
                         crate::Fixed::Refused => None,
                         crate::Fixed::Checked(checked, _) => Some(checked),
@@ -535,10 +535,21 @@ fn serve(
             if flags.stats {
                 err.line(cx, format_args!("{}", stats_line(&checked, phases.in_main(), frame)))?;
             }
-            return Ok(checked.status);
+            let status = checked.status;
+            if !cfg!(test) && !cx.is_simulated() && flags.fix.is_none() {
+                core::mem::forget(checked);
+            }
+            return Ok(status);
         };
         crate::engine_why::explain(cx, fs, host, rng, root, &opts(), target, phases, out, err)
-    })
+    })?;
+    if !cfg!(test) && !cx.is_simulated() && why.is_none() && flags.fix.is_none() {
+        // One-shot native CLI `blaze check`: all commits, profile writes, and output writes are
+        // complete (`bstd::rt::run_on` flushes stdout/stderr right after `main` returns and exits
+        // via `exit_now`). Skip unmapping the 64 GiB request frame reservation.
+        core::mem::forget(request);
+    }
+    Ok(status)
 }
 
 /// The request's frame, never the command's fixed 64 MiB one (tempo panicked at 95.7 s,
@@ -2445,7 +2456,7 @@ fn check_and_open<R>(
                     let mut first = print::Shown::new(caps, blaze_report::frame::plain::View::Agent, shown_root, frame);
                     first.quiet = true;
                     first.output_only = false;
-                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None, Some(&lazy_sdk), Some(&mut reused_store))?;
+                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None, Some(&lazy_sdk), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
                     if first.listed.iter().any(|l| l.fix.is_some())
                         && let Ok(applied) = crate::fix::apply(cx, root, &crate::fix::Atomic, &first.listed, &["all"], frame)?
                     {
@@ -2462,7 +2473,7 @@ fn check_and_open<R>(
         let mut opts = opts();
         opts.scope = check_scope;
         let toolchain = opts.toolchain;
-        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live, Some(&lazy_sdk), Some(&mut reused_store))?;
+        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live, Some(&lazy_sdk), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
         // The check has answered: its signals go back before the start, which takes the
         // parent's own (D103: run_loop.rs `Held::hold`; a suite's pool, test_drive.rs
         // `Signals`, once for the suite). Held into the start, the first run is refused.
@@ -2594,7 +2605,15 @@ fn check_and_open<R>(
         drop(stored);
         drop(snapshot);
         drop(store);
-        crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
+        crate::store::after_answer_printed_with(
+            cx,
+            opened.lent,
+            &opened.home,
+            false,
+            crate::store::StoreTeardown::ForgetForExit,
+            phases.clock(),
+            err,
+        )?;
         Ok(started)
     })
 }
@@ -2842,7 +2861,7 @@ pub(crate) fn check<'f>(
     out: &Out,
     err: &Out,
 ) -> Result<Checked, CliError> {
-    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None, None, None)
+    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None, None, None, crate::store::StoreTeardown::Drop)
 }
 
 /// Extracts an [`crate::engine_answer::Unreadable`] reason when reading a lazy page or standing
@@ -2907,11 +2926,12 @@ fn finish_store_for_check(
     cx: &Cx,
     opened: crate::store::Opened,
     reuse_store: Option<&mut Option<crate::store::Opened>>,
+    teardown: crate::store::StoreTeardown,
     clock: &bstd::clock::Clock,
     err: &Out,
 ) -> Result<crate::store::roots::CleanupLine, CliError> {
     match reuse_store {
-        None => crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, clock, err),
+        None => crate::store::after_answer_printed_with(cx, opened.lent, &opened.home, false, teardown, clock, err),
         Some(slot) => {
             let cleanup = if opened.lent.needs_commit() {
                 crate::store::plain_place::after_answer(cx, &opened.lent, 0)?.cleanup
@@ -2955,6 +2975,7 @@ fn check_live<'f, 's: 'f>(
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     lazy_sdk: Option<&LazySdk<'s>>,
     mut reuse_store: Option<&mut Option<crate::store::Opened>>,
+    teardown: crate::store::StoreTeardown,
 ) -> Result<Checked, CliError> {
     #[cfg(test)]
     stack_probe::at("check");
@@ -2975,8 +2996,12 @@ fn check_live<'f, 's: 'f>(
     let allow_stale_fallback = true;
     let mut recovery = StoredRecovery::Normal;
     let mut prior_unreadable: Option<crate::engine_answer::Unreadable> = None;
-    let result = loop {
+    let (result, request_mem_slot) = loop {
         let mut used_pointer: Option<(blaze_drive::Key, bool)> = None;
+        // Lazily initialized on first arena use (after certified no-op checks) so certified
+        // no-op `blaze check` never issues a 64 GiB `mmap` + `munmap`; on one-shot native CLI
+        // exit, forgotten after `checking` succeeds so the kernel reclaims it in one shot.
+        let request_mem_slot: core::cell::OnceCell<crate::engine_phase_mem::RequestMem> = core::cell::OnceCell::new();
         let attempt = {
             let prior = prior_unreadable.take();
             let began = phases.now().since_start();
@@ -3006,6 +3031,8 @@ fn check_live<'f, 's: 'f>(
                             live,
                             lazy_sdk,
                             reuse,
+                            &request_mem_slot,
+                            teardown,
                         )
                     }).map_err(EngineCheckError::Watcher)?
                 } else {
@@ -3031,6 +3058,8 @@ fn check_live<'f, 's: 'f>(
                         live,
                         lazy_sdk,
                         reuse,
+                        &request_mem_slot,
+                        teardown,
                     )
                 }
             })
@@ -3053,7 +3082,7 @@ fn check_live<'f, 's: 'f>(
             _ => None,
         };
         let Some((next, unreadable)) = next_recovery else {
-            break attempt;
+            break (attempt, request_mem_slot);
         };
         board = eager_watch.then(|| board_in(heap, &asking, phases.now().since_start()));
         active = None;
@@ -3062,7 +3091,12 @@ fn check_live<'f, 's: 'f>(
     };
     let error = match result {
         // Unboxed once, here ([`BoxedChecked`]): the caller's return slot is the one copy.
-        Ok(Ok(checked)) => return Ok(blaze_own::Box::into_inner(checked)),
+        Ok(Ok(checked)) => {
+            if !cfg!(test) && !cx.is_simulated() && teardown == crate::store::StoreTeardown::ForgetForExit {
+                core::mem::forget(request_mem_slot);
+            }
+            return Ok(blaze_own::Box::into_inner(checked));
+        }
         // The signal handler already published the stopped status.
         Ok(Err(error @ CliError::EngineCheck(EngineCheckError::Stopped { .. }))) => return Err(error),
         Ok(Err(error)) if active.is_none() && board.as_ref().is_none_or(|b| b.stage().is_none()) => return Err(error),
@@ -3116,6 +3150,24 @@ fn made_boxed<T>(heap: &'static blaze_own::Heap, make: impl FnOnce() -> T) -> bl
     blaze_own::Box::new_in(make(), heap.alloc())
 }
 
+/// Lazily initializes `slot`'s [`crate::engine_phase_mem::RequestMem`] on first arena use so
+/// certified no-op checks skip the 64 GiB virtual reservation (`mmap` + `munmap`).
+fn request_mem_of(slot: &core::cell::OnceCell<crate::engine_phase_mem::RequestMem>) -> Result<&crate::engine_phase_mem::RequestMem, CliError> {
+    if let Some(mem) = slot.get() {
+        return Ok(mem);
+    }
+    let mem = crate::engine_phase_mem::RequestMem::new()?;
+    let _ = slot.set(mem);
+    slot.get().ok_or(CliError::Text { what: "the request's arena was not initialized" })
+}
+
+/// Whether writing `.blaze/v2/profile.txt` needs to check/create `.blaze/.gitignore`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckoutIgnore {
+    Ensure,
+    AlreadyPresent,
+}
+
 /// [`check`] under its board.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 fn checking<'f, 's: 'f>(
@@ -3140,21 +3192,15 @@ fn checking<'f, 's: 'f>(
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     lazy_sdk: Option<&LazySdk<'s>>,
     mut reuse_store: Option<&mut Option<crate::store::Opened>>,
+    request_mem_slot: &core::cell::OnceCell<crate::engine_phase_mem::RequestMem>,
+    teardown: crate::store::StoreTeardown,
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
     let &Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
     let fresh = fresh || recovery == StoredRecovery::Fresh || names_oracle.on();
-    let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
-    // The request's arena (engine_phase_mem.rs): what this call keeps to its end and no record
-    // holds, given back whole when it returns; each phase's arena is made from it. Declared
-    // first, so dropped last: every value over it is a local dropped before it.
-    let request_mem = crate::engine_phase_mem::RequestMem::new()?;
-    let request = request_mem.shared();
-    // The phases' arenas and the heap kept past each, by stage.
-    let mut phase_mem = made_boxed(heap, crate::engine_phase_mem::PhaseLedger::new);
     // The one store, reused from `check_and_open` when already opened (warm `blaze test`
     // selection) else opened here, committed after the answer.
     let (opened, store_reused) = match reuse_store.as_deref_mut().and_then(Option::take) {
@@ -3229,7 +3275,7 @@ fn checking<'f, 's: 'f>(
         if !fresh {
             match recovery {
                 StoredRecovery::SkipOwn { exclude } => {
-                    if let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(exclude), false, false, request, frame)?
+                    if let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(exclude), false, false, request_mem_of(request_mem_slot)?.shared(), frame)?
                         && from != FallbackFrom::Toolchain
                     {
                         pointer = Some(loaded.pointer);
@@ -3253,7 +3299,7 @@ fn checking<'f, 's: 'f>(
                             let mut loaded_own_whole = false;
                             if !check_scope.is_whole()
                                 && let Some(Ok(whole_ptr)) = crate::engine_answer::load_pointer(cx, &mut store, &whole_root)?
-                                && let Ok(lines) = crate::engine_answer::load_lines_in(cx, &mut store, whole_ptr.lines, frame, request)?
+                                && let Ok(lines) = crate::engine_answer::load_lines_in(cx, &mut store, whole_ptr.lines, frame, heap.shared())?
                             {
                                 pointer = Some(whole_ptr);
                                 last_lines = Some(lines);
@@ -3261,7 +3307,7 @@ fn checking<'f, 's: 'f>(
                                 loaded_own_whole = true;
                             }
                             if !loaded_own_whole
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request, frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                             {
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
@@ -3279,7 +3325,7 @@ fn checking<'f, 's: 'f>(
                         Some(Err(why)) => {
                             phases.mark_cx(cx, "stored answer's pointer read", frame);
                             if allow_stale_fallback
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request, frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                             {
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
@@ -3307,7 +3353,7 @@ fn checking<'f, 's: 'f>(
                             let mut used_fallback = false;
                             if !own_ptr.certifies_under(&tools)
                                 && allow_stale_fallback
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), true, false, request, frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), true, false, request_mem_of(request_mem_slot)?.shared(), frame)?
                                 && from != FallbackFrom::Toolchain
                             {
                                 pointer = Some(loaded.pointer);
@@ -3319,14 +3365,14 @@ fn checking<'f, 's: 'f>(
                                 used_fallback = true;
                             }
                             if !used_fallback {
-                                match crate::engine_answer::load_lines_in(cx, &mut store, own_ptr.lines, frame, request)? {
+                                match crate::engine_answer::load_lines_in(cx, &mut store, own_ptr.lines, frame, heap.shared())? {
                                     Ok(lines) => {
                                         pointer = Some(own_ptr);
                                         last_lines = Some(lines);
                                     }
                                     Err(why) => {
                                         if allow_stale_fallback
-                                            && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), false, true, request, frame)?
+                                            && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                                         {
                                             pointer = Some(loaded.pointer);
                                             last_lines = Some(loaded.lines);
@@ -3481,7 +3527,7 @@ fn checking<'f, 's: 'f>(
                     base_aux,
                     &followed.now,
                     &journal,
-                    request,
+                    request_mem_of(request_mem_slot)?.shared(),
                     frame,
                 )?,
                 _ => None,
@@ -3489,7 +3535,7 @@ fn checking<'f, 's: 'f>(
             let scoped_filtered = if whole_clean_cert || !own_certifies {
                 None
             } else {
-                match filter_whole_lines_for_scope(cx, &mut store, pointer, &followed.now, lines, check_scope, request, heap.alloc())? {
+                match filter_whole_lines_for_scope(cx, &mut store, pointer, &followed.now, lines, check_scope, request_mem_of(request_mem_slot)?.shared(), heap.alloc())? {
                     ScopedWholeLines::Filtered(filtered, bodies_whole) => Some((filtered, bodies_whole)),
                     ScopedWholeLines::Skipped(why) => {
                         phases.mark_cx(cx, why, frame);
@@ -3520,14 +3566,15 @@ fn checking<'f, 's: 'f>(
                     live.see(blaze_screen::Step::Says);
                 }
                 *printed_out = true;
-                let stood = certified(cx, root, active_view_slot, pointer, lines, filtered_arg, cert_root, adopted.is_some(), journal, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
+                let stood = certified(cx, root, active_view_slot, pointer, lines, filtered_arg, cert_root, adopted.is_some(), journal, &mut store, (&tools, toolchain), shown, phases, (request_mem_slot, heap), frame, out)?;
                 drop(scoped_filtered);
                 drop(cert_view_slot);
                 drop(view_slot);
                 drop(store);
-                let cleanup = finish_store_for_check(cx, opened, reuse_store, phases.clock(), err)?;
+                let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                return certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame, own_whole);
+                let ignore = if adopted.is_some() { CheckoutIgnore::Ensure } else { CheckoutIgnore::AlreadyPresent };
+                return certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame, own_whole, ignore);
             }
         }
     }
@@ -3543,7 +3590,7 @@ fn checking<'f, 's: 'f>(
         && whole_ptr.certifies_under(&tools)
         && whole_ptr.facts.owed == 0
         && whole_ptr.facts.printed.replayable
-        && let Ok(whole_lines) = crate::engine_answer::load_lines_in(cx, &mut store, whole_ptr.lines, frame, request)?
+        && let Ok(whole_lines) = crate::engine_answer::load_lines_in(cx, &mut store, whole_ptr.lines, frame, heap.shared())?
     {
         let whole_chosen = crate::journal_checkpoint::read(cx, &mut store, whole_root.as_str(), whole_ptr.key, whole_ptr.journal, frame)?;
         let whole_journal = {
@@ -3581,7 +3628,7 @@ fn checking<'f, 's: 'f>(
             let scoped_filtered = if whole_clean_cert {
                 None
             } else {
-                match filter_whole_lines_for_scope(cx, &mut store, &whole_ptr, &whole_followed.now, &whole_lines, check_scope, request, heap.alloc())? {
+                match filter_whole_lines_for_scope(cx, &mut store, &whole_ptr, &whole_followed.now, &whole_lines, check_scope, request_mem_of(request_mem_slot)?.shared(), heap.alloc())? {
                     ScopedWholeLines::Filtered(filtered, bodies_whole) => Some((filtered, bodies_whole)),
                     ScopedWholeLines::Skipped(why) => {
                         phases.mark_cx(cx, why, frame);
@@ -3601,14 +3648,14 @@ fn checking<'f, 's: 'f>(
                     live.see(blaze_screen::Step::Says);
                 }
                 *printed_out = true;
-                let stood = certified(cx, root, whole_view_slot.as_ref(), &whole_ptr, &whole_lines, filtered_arg, whole_root.as_str(), false, journal_arg, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
+                let stood = certified(cx, root, whole_view_slot.as_ref(), &whole_ptr, &whole_lines, filtered_arg, whole_root.as_str(), false, journal_arg, &mut store, (&tools, toolchain), shown, phases, (request_mem_slot, heap), frame, out)?;
                 drop(scoped_filtered);
                 drop(whole_view_slot);
                 drop(view_slot);
                 drop(store);
-                let cleanup = finish_store_for_check(cx, opened, reuse_store, phases.clock(), err)?;
+                let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                return certificate_checked(cx, root, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame, true);
+                return certificate_checked(cx, root, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame, true, CheckoutIgnore::AlreadyPresent);
             }
             pointer = Some(whole_ptr);
             last_lines = Some(whole_lines);
@@ -3623,7 +3670,11 @@ fn checking<'f, 's: 'f>(
             journal = whole_journal;
         }
     }
-    // Past both certificate fast paths: materialize the status board once when deferred.
+    // Past both certificate fast paths: materialize the request arena, phase ledger, and status
+    // board once when deferred.
+    let request_mem = request_mem_of(request_mem_slot)?;
+    let request = request_mem.shared();
+    let mut phase_mem = made_boxed(heap, crate::engine_phase_mem::PhaseLedger::new);
     let board = board_slot.get_or_init(heap);
     let last_dir = if let Some(root_dir) = preopened_root.take() {
         Some(root_dir)
@@ -4408,7 +4459,7 @@ fn checking<'f, 's: 'f>(
         fresh,
         heads_from,
         body_locals,
-        request_mem: &request_mem,
+        request_mem,
         env: &env,
         graph,
         scoped,
@@ -4551,7 +4602,7 @@ fn checking<'f, 's: 'f>(
             live.see(blaze_screen::Step::Says);
         }
         *printed_out = true;
-        let printed = print_answer(cx, root, &view_slot, &mut store, &made, rows, (names.as_ref(), &*bodies), &finished, (outlined, files_checked), unreadable.as_ref(), names_oracle, (&*phases, began), shown, frame, out)?;
+        let printed = print_answer(cx, root, &view_slot, &mut store, &made, rows, (names.as_ref(), &*bodies), &finished, (outlined, files_checked), unreadable.as_ref(), names_oracle, &*phases, shown, frame, out)?;
         let AnswerPrinted { tally, lines_key, lines_bytes, status, oracle, bodies_whole } = printed;
         let Made { unprinted, unused_dep_keys, .. } = made;
         phases.mark_cx(cx, "answer printed", frame);
@@ -4692,7 +4743,7 @@ fn checking<'f, 's: 'f>(
         Ok(blaze_own::Box::new_in((finished.causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, leaf_set_changed), heap.alloc()))
     })?;
     // The whole cleanup line: this profile is written after the commit (store.rs).
-    let cleanup = finish_store_for_check(cx, opened, reuse_store, phases.clock(), err)?;
+    let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
     phases.mark_cx(cx, "store committed", frame);
     own_frame(|| -> Result<BoxedChecked, CliError> {
         let (causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, _leaf_set_changed) = blaze_own::Box::into_inner(answered);
@@ -4776,7 +4827,11 @@ fn checking<'f, 's: 'f>(
             let _ = writeln!(text, "tail heap (bytes): engine finished {heap_engine}, lines made {heap_lines_made}, answer printed {heap_printed}, answer stored {heap_stored}");
         }
         // Written in place, never synced, as `check`'s profile (print.rs `profile`).
-        crate::print::ensure_checkout_ignore(cx, root)?;
+        // Skip the redundant `.blaze/.gitignore` stat when this checkout already has its own
+        // stored answer (written by an earlier command that ensured `.blaze/.gitignore`).
+        if !read_from_last || other_checkout {
+            crate::print::ensure_checkout_ignore(cx, root)?;
+        }
         let file = root.create(cx, &Path::new(print::PROFILE)?)?;
         file.append(cx, text.as_bytes(), bstd::fs::Durable::No)?;
         file.close(cx, bstd::fs::Durable::No)?;
@@ -5142,7 +5197,7 @@ fn print_answer<'m, 'f, 'a>(
     (outlined, files_checked): (&[Outlined<'_>], u32),
     unreadable: Option<&crate::engine_answer::Unreadable>,
     names_oracle: crate::engine_names::NamesOracle,
-    (phases, began): (&Phases, bstd::clock::Instant),
+    phases: &Phases,
     shown: &mut print::Shown<'f>,
     frame: &'f Frame,
     out: &Out,
@@ -5198,7 +5253,7 @@ fn print_answer<'m, 'f, 'a>(
         // (`check_unchecked_items.rs`).
         let unchecked_only = (unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
         if !unchecked_only {
-            print::closing(cx, shown, files_checked, phases.since(began), Some(finished.report.entered), None, coverage, frame, out)?;
+            print::closing(cx, shown, files_checked, phases.in_main(), Some(finished.report.entered), None, coverage, frame, out)?;
         }
     }
     // The bodies not checked, under one line beside the closing line, as `check` prints it.
@@ -5268,8 +5323,7 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     (tools, toolchain): (&blaze_engine::Tools, blaze_toolchain::ToolchainId),
     shown: &mut print::Shown<'f>,
     phases: &mut Phases,
-    began: bstd::clock::Instant,
-    request: SharedAlloc<'_>,
+    (request_mem, heap): (&core::cell::OnceCell<crate::engine_phase_mem::RequestMem>, &'static blaze_own::Heap),
     frame: &'f Frame,
     out: &Out,
 ) -> Result<(Status, crate::engine_lines::Tally), CliError> {
@@ -5283,19 +5337,33 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     // reading or overwriting `whole_root`'s rendered view slot.
     let (tally, view_hit, whole) = match (scoped_filtered, view_slot) {
         (Some((filtered, scoped_bodies_whole)), _) => (
-            crate::engine_lines::print_all(cx, root, filtered.blocks(), shown, request, frame, out)?,
+            crate::engine_lines::print_all(cx, root, filtered.blocks(), shown, request_mem_of(request_mem)?.shared(), frame, out)?,
             false,
             scoped_bodies_whole,
         ),
         (None, Some(slot)) => match slot.certified(cx, pointer.lines, shown, frame, out)? {
             Some(tally) => (tally, true, facts.printed.bodies_whole),
-            None => (slot.new_view(cx, root, store, pointer.lines, lines, shown, request, frame, out)?, false, facts.printed.bodies_whole),
+            None => {
+                let alloc = if lines.blocks().next().is_none() {
+                    heap.shared()
+                } else {
+                    request_mem_of(request_mem)?.shared()
+                };
+                (slot.new_view(cx, root, store, pointer.lines, lines, shown, alloc, frame, out)?, false, facts.printed.bodies_whole)
+            }
         },
-        (None, None) => (
-            crate::engine_lines::print_all(cx, root, lines.blocks(), shown, request, frame, out)?,
-            false,
-            facts.printed.bodies_whole,
-        ),
+        (None, None) => {
+            let alloc = if lines.blocks().next().is_none() {
+                heap.shared()
+            } else {
+                request_mem_of(request_mem)?.shared()
+            };
+            (
+                crate::engine_lines::print_all(cx, root, lines.blocks(), shown, alloc, frame, out)?,
+                false,
+                facts.printed.bodies_whole,
+            )
+        }
     };
     let (ran_stages, not_stages) = crate::check_coverage(facts.printed.names, whole, whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
@@ -5308,7 +5376,7 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
         print::stage_notes(cx, &not_stages, shown, frame, out)?;
         let unchecked_only = (tally.unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
         if !unchecked_only {
-            print::closing(cx, shown, facts.files, phases.since(began), Some(0), None, coverage, frame, out)?;
+            print::closing(cx, shown, facts.files, phases.in_main(), Some(0), None, coverage, frame, out)?;
         }
     }
     if let Some(words) = crate::not_checked::items::summary(tally.unchecked, shown.behind, frame) {
@@ -5373,10 +5441,13 @@ fn certificate_checked(
     heap: &'static blaze_own::Heap,
     frame: &Frame,
     used_whole_root: bool,
+    ignore: CheckoutIgnore,
 ) -> Result<BoxedChecked, CliError> {
     let tail = tally.tail.line(tally.listed, frame);
     let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written but the roots renewed (and the journal's checkpoint when due)\n{sweep_counts}\n{journal_counts}\n{cleanup}\n{tail}\n{phases}");
-    crate::print::ensure_checkout_ignore(cx, root)?;
+    if ignore == CheckoutIgnore::Ensure {
+        crate::print::ensure_checkout_ignore(cx, root)?;
+    }
     let file = root.create(cx, &Path::new(print::PROFILE)?)?;
     file.append(cx, text.as_bytes(), bstd::fs::Durable::No)?;
     file.close(cx, bstd::fs::Durable::No)?;

@@ -169,9 +169,9 @@ struct Class {
     cold: Stack,
     counts: Counts,
     /// Where the one thread trimming ([`Counts::trimming`]) sorts the indices of the blocks it
-    /// took: [`TRIM_MOST`] of them, committed when the class is made (128 KiB of address
-    /// space a class; resident once the class has trimmed).
-    scratch: Region,
+    /// took: [`TRIM_MOST`] of them, reserved and committed lazily on the class's first trim
+    /// (128 KiB of address space; zero mmaps for classes that never trim).
+    scratch: OnceLock<Region>,
 }
 
 /// A class's counts, in bytes; warm and cold are folded in from threads ([`GATHER`]), so each
@@ -263,11 +263,7 @@ impl Class {
             warm: Stack::new(),
             cold: Stack::new(),
             counts: Counts::new(),
-            scratch: {
-                let scratch = Region::reserve(TRIM_MOST * size_of::<u32>(), free)?;
-                scratch.ensure(TRIM_MOST * size_of::<u32>())?;
-                scratch
-            },
+            scratch: OnceLock::new(),
         })
     }
 
@@ -459,11 +455,35 @@ impl Class {
         if self.counts.trimming.swap(true, Ordering::Acquire) {
             return Trimmed { busy: true, ..Trimmed::default() };
         }
-        // SAFETY: the scratch holds `TRIM_MOST` `u32`s, committed when the class was made and
-        // aligned to a page; the `trimming` flag, swapped to true above, makes this thread the
-        // one that touches it until the flag is cleared below.
+        let scratch = match self.scratch.get() {
+            Some(scratch) => scratch,
+            None => {
+                let bytes = TRIM_MOST * size_of::<u32>();
+                let region = match Region::reserve(bytes, self.free)
+                    .and_then(|region| region.ensure(bytes).map(|()| region))
+                {
+                    Ok(region) => region,
+                    Err(_) => {
+                        let left = self.counts.warm.load(Ordering::Relaxed);
+                        self.counts.trim_at.store(trim_at(left), Ordering::Relaxed);
+                        self.counts.trimming.store(false, Ordering::Release);
+                        return Trimmed { busy: true, ..Trimmed::default() };
+                    }
+                };
+                // Only the thread holding `trimming` initializes `scratch`.
+                let _ = self.scratch.set(region);
+                let Some(scratch) = self.scratch.get() else {
+                    self.counts.trimming.store(false, Ordering::Release);
+                    return Trimmed { busy: true, ..Trimmed::default() };
+                };
+                scratch
+            }
+        };
+        // SAFETY: `scratch` holds `TRIM_MOST` `u32`s, reserved and committed above on the first
+        // trim and aligned to a page; the `trimming` flag, swapped to true above, makes this
+        // thread the one that touches it until the flag is cleared below.
         let held = unsafe {
-            core::slice::from_raw_parts_mut(self.scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
+            core::slice::from_raw_parts_mut(scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
         };
         let mut taken = 0;
         let mut warm = self.counts.warm.load(Ordering::Relaxed);

@@ -210,8 +210,12 @@ blaze-bitflags.opt-level = 2
 blaze-sys.opt-level = 2
 
 [profile.release]
-# Set this to 1 or 2 to get more useful backtraces in debugger.
-debug = 0
+# Emit line-table DWARF packed into a side `.dSYM`/`.dwp` bundle and strip the running binary's
+# symbol table: shrinks macOS `__LINKEDIT` by ~13.6 MB and cuts `LC_CODE_SIGNATURE` hashing and
+# page-ins at startup while preserving full symbols in `.dSYM` for `lldb`/`samply`/crash reports.
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = "symbols"
 # Incremental: `release` is the bootstrap binary the harnesses, the runner and the self-build rebuild
 # after every edit, so its rebuild time is the edit loop ("make release mode at least incremental",
 # Andrew, 2026-11-03; a release rebuild took 5-12 min). The shipped binary is `dist`, built from
@@ -223,7 +227,7 @@ incremental = true
 [profile.release.build-override]
 opt-level = 3
 codegen-units = 16
-debug = 0
+debug = "line-tables-only"
 incremental = true
 
 # As in `profile.dev.package`: build dependencies are built at opt-level 0 otherwise.

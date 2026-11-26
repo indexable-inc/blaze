@@ -601,6 +601,18 @@ impl BloomIndex {
             return;
         };
         let bytes = map.bytes();
+        let expected = segments.len().saturating_add(roots.len());
+        if expected > 0 {
+            if self.entries.is_empty() {
+                self.entries = Map::new(MapOpts {
+                    hasher: BuildKeyHasher::default(),
+                    alloc: BLOOM_ALLOC,
+                    capacity: Some(expected),
+                });
+            } else {
+                self.entries.reserve(expected);
+            }
+        }
         let mut by_seg_id: Option<Map<u64, usize, BuildKeyHasher, Kept>> = if segments.len() > 16 {
             let mut m = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(segments.len()) });
             for (i, seg) in segments.iter().enumerate() {
