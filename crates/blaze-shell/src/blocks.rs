@@ -53,6 +53,8 @@ pub enum BlockBody {
         /// Live OS child PID (0 until child process spawns or for in-process tasks).
         pid: Arc<AtomicU32>,
     },
+    /// Native Metal btop + macOS Activity & GPU Monitor (`top` / `btop` / `htop` / `sysmon`).
+    SysMon(Box<crate::sysmon_view::SysMonState>),
 }
 
 /// One submitted command and its structured output card.

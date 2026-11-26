@@ -200,6 +200,7 @@ dependencies = [
  "blaze-shell-config",
  "blaze-sniff",
  "blaze-ssh",
+ "blaze-sysmon",
  "blaze-ui",
  "blaze-vim",
  "blaze-vt",
@@ -245,6 +246,13 @@ dependencies = [
 [[package]]
 name = "blaze-sys"
 version = "0.0.0"
+
+[[package]]
+name = "blaze-sysmon"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+]
 
 [[package]]
 name = "blaze-tab"
