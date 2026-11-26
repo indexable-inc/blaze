@@ -491,3 +491,58 @@ fn the_oracle_catches_a_lost_refused_waiter() {
 fn the_oracle_catches_uncancelled_speculation() {
     control(Config::cases(4), Plant::None, Plant::KeepOrphans, "orphan speculation not cancelled", scenario);
 }
+
+#[test]
+fn serial_demands_reuse_most_recently_warm_worker() {
+    let deadline = Time(100);
+    let mut pool = CodePool::new(Options {
+        alloc: alloc(), hash_seed: 7, children: 1, workers: 3, frontier: 0, demands: 10, deadline,
+    }).unwrap();
+    let mut out = SVec::new_in(alloc());
+    let mut t = 1u64;
+    let mut step = |pool: &mut CodePool<'_>, event: Event<'_>, out: &mut SVec<'_, Action>| {
+        out.clear();
+        pool.step(Time(t), event, out).unwrap();
+        t += 1;
+    };
+    for w in 0..3 {
+        step(&mut pool, Event::Free(Worker(w)), &mut out);
+    }
+    let build_worker = |out: &[Action]| -> Option<Worker> {
+        out.iter().find_map(|a| match *a {
+            Action::Build { worker, .. } => Some(worker),
+            _ => None,
+        })
+    };
+
+    // First miss takes cold Worker(0).
+    let k0 = key(10);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k0 }, &mut out);
+    step(&mut pool, Event::Looked { key: k0, result: Ok(None) }, &mut out);
+    assert_eq!(build_worker(&out), Some(Worker(0)));
+    step(&mut pool, Event::Finished { key: k0, worker: Worker(0), result: Finished::Made(Record { identity: ContentId([10; 32]), direct: &[] }) }, &mut out);
+    step(&mut pool, Event::Free(Worker(0)), &mut out);
+
+    // Next serial miss reuses warm Worker(0) rather than cold-starting Worker(1).
+    let k1 = key(11);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k1 }, &mut out);
+    step(&mut pool, Event::Looked { key: k1, result: Ok(None) }, &mut out);
+    assert_eq!(build_worker(&out), Some(Worker(0)));
+
+    // Concurrent miss while Worker(0) is busy spills to cold Worker(1), leaving Worker(2) untouched.
+    let k2 = key(12);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(2), key: k2 }, &mut out);
+    step(&mut pool, Event::Looked { key: k2, result: Ok(None) }, &mut out);
+    assert_eq!(build_worker(&out), Some(Worker(1)));
+
+    // Worker(0) finishes first, then Worker(1) finishes second -> Worker(1) is MRU.
+    step(&mut pool, Event::Finished { key: k1, worker: Worker(0), result: Finished::Made(Record { identity: ContentId([11; 32]), direct: &[] }) }, &mut out);
+    step(&mut pool, Event::Free(Worker(0)), &mut out);
+    step(&mut pool, Event::Finished { key: k2, worker: Worker(1), result: Finished::Made(Record { identity: ContentId([12; 32]), direct: &[] }) }, &mut out);
+    step(&mut pool, Event::Free(Worker(1)), &mut out);
+
+    let k3 = key(13);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k3 }, &mut out);
+    step(&mut pool, Event::Looked { key: k3, result: Ok(None) }, &mut out);
+    assert_eq!(build_worker(&out), Some(Worker(1)));
+}
