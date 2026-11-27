@@ -136,6 +136,10 @@ pub enum RunError {
     /// `why` names the cause (a front end that checks only the whole program, a fn with no
     /// checked body, the maker's own state).
     OneBody { key: ItemKey, why: &'static str },
+    /// A repeated non-speculative `ensure` of fn `key` whose first refusal was already returned
+    /// earlier on the same [`crate::run::make_one::MakerState`]: replays the rendered original
+    /// refusal without calling `check_one` a second time.
+    PriorEnsureFailure { key: ItemKey, first: Box<str>, scope: crate::scope::Scope },
     /// Static `static_`'s value has no run record (code_records.rs `statics`; run.md, "Statics
     /// in the run"): `error` names what of it is refused.
     StaticRecord { static_: Box<str>, error: crate::code_records::statics::StaticRecordError },
@@ -276,6 +280,7 @@ impl core::fmt::Display for RunError {
             RunError::Place(error) => write!(f, "{error}"),
             RunError::NoMain => write!(f, "the crate root has no `main`"),
             RunError::OneBody { key, why } => write!(f, "fn {:#x}: {why} (D106: the record walk makes one instance at a time)", key.0),
+            RunError::PriorEnsureFailure { first, .. } => f.write_str(first),
             RunError::StaticRecord { static_, error } => write!(f, "the static `{static_}`: {error}"),
             RunError::Lang(l) => write!(f, "the lang item {:?}: {} (rule no-fallback: no build without it)", l.item, l.why),
             RunError::MainShape { main, what } => write!(f, "`{main}`: {what}"),
@@ -398,6 +403,7 @@ impl RunError {
             | RunError::OverflowDisagrees { .. }
             | RunError::NoMain
             | RunError::OneBody { .. }
+            | RunError::PriorEnsureFailure { .. }
             | RunError::StaticRecord { .. }
             | RunError::Lang(_)
             | RunError::Statics { .. }

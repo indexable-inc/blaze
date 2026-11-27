@@ -87,6 +87,7 @@ impl RunError {
             | RunError::Args(_)
             | RunError::OwnProcess { .. } => Scope::Suite,
             // The instance's: its body, its callees, its types, data and code (each was `_`).
+            RunError::PriorEnsureFailure { scope, .. } => *scope,
             RunError::Lower { .. }
             | RunError::Check { .. }
             | RunError::Need { .. }

@@ -803,3 +803,106 @@ pub extern "C-unwind" fn main() -> u64 {
         "ArcBox::<Inner, GlobalA>::drop_slow and GlobalB must stay distinct concrete instances"
     );
 }
+
+#[test]
+fn poly_summary_swallowed_ensure_error_unmasks_real_error_in_walk() {
+    const SRC: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+const BAD: i32 = 1 / 0;
+
+#[inline(never)]
+fn bad_callee<T>(_x: &T) -> i32 {
+    BAD
+}
+
+#[inline(never)]
+fn wrapper<T>(x: &T) -> i32 {
+    bad_callee::<T>(x)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let a = 1u32;
+    wrapper(&a)
+}
+"#;
+
+    let f = fixture(SRC);
+    let ids = ids_of(&f);
+    let mut store = MemoryStore::new_in(alloc());
+    let names = reader(&f);
+    let b = builder();
+    let mut maker = Maker::new(names, Some(ids.entry), &b, alloc());
+    let err = match walk_records(ids.entry, &ids, &mut store, &b, &producer(), &mut maker, alloc()) {
+        Ok(_) => panic!("walk_records must fail on bad_callee's BAD const"),
+        Err(err) => err,
+    };
+    let shown = format!("{err}");
+    assert!(
+        !shown.contains("asked for twice"),
+        "Walk must surface the underlying const refusal after compute_poly_summary swallowed it, not AskedTwice: {shown}"
+    );
+    assert!(
+        shown.contains("BAD") || shown.contains("constant"),
+        "expected underlying constant evaluation refusal, got: {shown}"
+    );
+}
+
+#[test]
+fn poly_summary_swallowed_ensure_error_on_unreachable_callee_still_compiles() {
+    const SRC: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+const BAD: i32 = 1 / 0;
+
+#[inline(never)]
+fn bad_callee<T>(_x: &T) -> i32 {
+    BAD
+}
+
+fn ignore_fn<F>(_f: F) -> i32 {
+    7
+}
+
+#[inline(never)]
+fn wrapper<T>(_x: &T) -> i32 {
+    // Names `bad_callee::<T>` as a ZST FnDef (so `compute_poly_summary` BFS speculatively
+    // ensures `bad_callee` and swallows its const error), without ever calling it so `Walk`
+    // never reaches `bad_callee`.
+    ignore_fn(bad_callee::<T>)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let a = 1u32;
+    let b = 2u64;
+    wrapper(&a) + wrapper(&b)
+}
+"#;
+
+    let f = fixture(SRC);
+    let ids = ids_of(&f);
+    let mut store = MemoryStore::new_in(alloc());
+    let summary = run_walk(&f, &ids, &mut store);
+    let wrapper = fn_named(&f, "wrapper");
+    // Because `bad_callee` errored during `compute_poly_summary`, `wrapper` stayed concrete
+    // (2 concrete instances for u32 and u64) and the build still succeeded cleanly.
+    assert_eq!(
+        instances_of(&summary, wrapper).len(),
+        2,
+        "wrapper must stay concrete after speculative callee error and still compile cleanly"
+    );
+}
