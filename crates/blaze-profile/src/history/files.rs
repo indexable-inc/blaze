@@ -31,7 +31,6 @@
 use std::{
     alloc::{Allocator, Global},
     collections::{BTreeMap, BTreeSet, VecDeque},
-    io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -42,6 +41,7 @@ use blaze_own::Share;
 use super::{
     CompactError, HistoryError, OWNER,
     compact::{self, Name},
+    io_other, io_would_block,
     manifest::{self, Entry, Held, Manifest, ManifestError, Recorder},
     merge,
     retire::{self, PINS, PinFile},
@@ -468,7 +468,7 @@ impl<H: Host> Cx<'_, H> {
 
 /// The error of an effect on `path` that failed doing `doing`.
 fn io_failed(path: PathBuf, doing: &'static str, error: IoError) -> HistoryError {
-    HistoryError::Io { path, doing, error: io::Error::other(error.0) }
+    HistoryError::Io { path, doing, error: io_other(error.0) }
 }
 
 /// The error of a completion no such effect has: a driver's bug, named.
@@ -477,7 +477,7 @@ fn unexpected(path: PathBuf, doing: &'static str, done: &Done) -> HistoryError {
         path,
         doing,
         // alloc: an error
-        error: io::Error::other(format!(
+        error: io_other(format!(
             "the driver answered {done:?}, which no such effect answers"
         )),
     }
@@ -1945,7 +1945,7 @@ impl Compact {
     ) -> Option<HistoryError> {
         let Done::Failed(error) = done else { return None };
         let hidden = cx.path_of(&cx.hidden(&self.current().output.file_name()));
-        Some(self.fail(cx, hidden, doing, CompactError::Io(io::Error::other(error.0))))
+        Some(self.fail(cx, hidden, doing, CompactError::Io(io_other(error.0))))
     }
 
     /// The error of [`merge::Concat`] failing.
@@ -2017,7 +2017,7 @@ impl Compact {
                         let mapping = match done {
                             Done::Mapped(it) => it,
                             Done::Failed(error) => {
-                                let error = CompactError::Io(io::Error::other(error.0));
+                                let error = CompactError::Io(io_other(error.0));
                                 return Step::Ready(Err(self.fail(
                                     cx,
                                     path,
@@ -2235,7 +2235,7 @@ impl Recover {
         HistoryError::Postmortem(postmortem::PostmortemError::Io {
             path: cx.path(&postmortem::file_name(pid)),
             doing,
-            error: io::Error::other(error.0),
+            error: io_other(error.0),
         })
     }
 
@@ -2698,7 +2698,7 @@ impl Open {
             let bytes = match it {
                 Done::Read(bytes) => bytes,
                 Done::Failed(error) => {
-                    let error = io::Error::other(error.0);
+                    let error = io_other(error.0);
                     self.crashes.refused.push(crash::CrashError::Io {
                         path,
                         doing: "reading",
@@ -2708,7 +2708,7 @@ impl Open {
                 }
                 other => {
                     // alloc: an error
-                    let error = io::Error::other(format!("the driver answered {other:?}"));
+                    let error = io_other(format!("the driver answered {other:?}"));
                     self.crashes.refused.push(crash::CrashError::Io {
                         path,
                         doing: "reading",
@@ -2812,7 +2812,7 @@ impl Open {
                                 }
                                 CrashFile::SetAside => "setting aside a refused crash record",
                             };
-                            let error = io::Error::other(error.0);
+                            let error = io_other(error.0);
                             self.crashes.refused.push(crash::CrashError::Io {
                                 path: cx.path(name),
                                 doing,
@@ -3118,7 +3118,7 @@ impl FlushJob {
                             self.out.undeleted.push(crash::CrashError::Io {
                                 path: cx.path(&name),
                                 doing: "deleting a recovered crash record",
-                                error: io::Error::other(error.0),
+                                error: io_other(error.0),
                             });
                         }
                     }
@@ -3693,7 +3693,7 @@ impl PinJob {
                             return Step::Ready(Err(HistoryError::Io {
                                 path: path(),
                                 doing: "locking a reader's pin, which another holds",
-                                error: io::ErrorKind::WouldBlock.into(),
+                                error: io_would_block(),
                             }));
                         }
                         Ok(other) => {
@@ -4109,7 +4109,7 @@ impl<H: Host> Files<H> {
                             let error = HistoryError::Io {
                                 path: self.root.join(self.dir.as_str()),
                                 doing: "stepping the history's files",
-                                error: io::Error::other(
+                                error: io_other(
                                     "a step of the history's core waited on no effect",
                                 ),
                             };

@@ -36,9 +36,9 @@ use blaze_script::{
 
 const SCRIPT: &str = "rustcsites.py";
 
-/// The checkout: this package's parent, as the Python's was its own directory's.
+/// The checkout root: current working directory (hermetic builds set virtual CARGO_MANIFEST_DIR=/workspace/scripts).
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    PathBuf::from(".")
 }
 
 fn place() -> Regex {

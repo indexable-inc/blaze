@@ -52,11 +52,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt, io,
+    fmt,
     path::Path,
     sync::Arc,
     time::Duration,
 };
+
+use blaze_parquet::File as ParquetFile;
 
 use blaze_report::{say, say::Code};
 use serde_derive::{Deserialize, Serialize};
@@ -232,12 +234,12 @@ impl Entry {
         bytes: &[u8],
         version: Option<u32>,
     ) -> Result<Entry, HistoryError> {
-        let file = blaze_parquet::File::open(bytes, std::alloc::Global).map_err(|error| {
+        let file = ParquetFile::open(bytes, std::alloc::Global).map_err(|error| {
             HistoryError::Io {
                 // alloc: an error
                 path: path.to_owned(),
                 doing: "reading its footer",
-                error: io::Error::other(error),
+                error: super::io_other(error),
             }
         })?;
         // alloc: an error

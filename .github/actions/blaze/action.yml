@@ -1,26 +1,21 @@
-# blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the release
-# .github/blaze-version names, installed by site/install.sh into ~/.cargo/bin with the Rust it builds
-# with (its own toolchain, ~/.blaze/toolchains, docs/v2/plan.md: no rustup), and an empty
-# store at BLAZE_CACHE. With `llvm: true`, also the LLVM blaze pins
-# (pins/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
-# a build of blaze, which links it (blaze-engine's default `native`). No Nix: the C compiler and linker are the runner's own (gcc and
-# glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
-# No shared remote: the v2 blaze pinned since 0.20261105.0 has no `blaze cache build|pull|push`
-# (its `blaze cache` is `gc` alone), so every run starts from an empty store until v2 has a remote.
+# Installs the pinned v2 `blaze` and `blaze-launcher` release (.github/blaze-cli-version) via
+# site/install.sh, configures Linux user namespaces and locked memory for sandboxing and io_uring,
+# preserves the v2 home store ($HOME/.blaze/v2) across warm ix runner snapshots, and pre-warms the
+# pinned toolchain records (`blaze warm-toolchain`). Zero cargo, zero rustc, zero rustup.
 name: blaze
-description: the release of blaze .github/blaze-version names, its toolchain, and an empty store
+description: Install pinned v2 blaze + blaze-launcher (.github/blaze-cli-version), configure Linux sandbox/memlock, and warm toolchain records
 inputs:
-  job:
-    description: the job whose store this is (build, tests)
-    required: true
-  llvm:
-    description: also the pinned LLVM, as LLVM_SYS_231_PREFIX (true or false)
-    default: "false"
+  warm-toolchain:
+    description: run `blaze warm-toolchain` after install (true or false)
+    default: "true"
+  require-launcher:
+    description: fail if `blaze-launcher` is absent beside `blaze` (true or false)
+    default: "true"
 runs:
   using: composite
   steps:
-    # `blaze test` runs every test in a sandbox made of namespaces a user makes, which
-    # Ubuntu's AppArmor keeps users from making unless told otherwise.
+    # `blaze test` and sandboxed proc-macros/build scripts use unprivileged user namespaces, which
+    # Ubuntu's AppArmor restricts unless cleared.
     - name: user namespaces
       if: runner.os == 'Linux'
       shell: bash
@@ -28,10 +23,9 @@ runs:
         if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
           sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
         fi
-    # The daemon pins its direct-IO buffers with io_uring (crates/blaze-core/src/uring.rs,
-    # `Registered`), which needs more locked memory than Ubuntu's 8 MiB RLIMIT_MEMLOCK; without
-    # it `blaze serve` exits at start ("io_uring registered buffers: Cannot allocate memory").
-    # Each later step's shell is a child of Runner.Worker, so its limit is the one raised.
+
+    # Raise RLIMIT_MEMLOCK on Runner.Worker so every later step inherits unlimited locked memory
+    # for io_uring registered buffers and pinned memory regions.
     - name: locked memory
       if: runner.os == 'Linux'
       shell: bash
@@ -44,132 +38,64 @@ runs:
       shell: bash
       run: |
         [ "$(ulimit -l)" = unlimited ] || { echo "::error::locked memory: RLIMIT_MEMLOCK is $(ulimit -l) KiB in a step after it was raised"; exit 1; }
-    # The release .github/blaze-version names, not the newest canary: canaries come every 40
-    # minutes, sooner than a cold run (about an hour) ends and pushes, so with the newest every
-    # run whose canary changed blaze's sources would be cold. A pull request that moves the gate
-    # to a release built from other sources, and main's next run, are cold once; one that moves
-    # it to a release of the same sources keeps the store.
-    - name: blaze (the release .github/blaze-version names)
+
+    - name: install pinned v2 blaze (.github/blaze-cli-version)
       id: install
       shell: bash
       env:
-        JOB: ${{ inputs.job }}
+        REQUIRE_LAUNCHER: ${{ inputs.require-launcher }}
       run: |
-        # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
-        # as a user's install does, rather than at the first build.
-        # install.sh puts blaze in $CARGO_HOME/bin; GitHub's hosted images have that on PATH, ix's
-        # image does not.
+        set -euo pipefail
         bin="${CARGO_HOME:-$HOME/.cargo}/bin"
         export PATH="$bin:$PATH"
         echo "$bin" >> "$GITHUB_PATH"
-        sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
-        said=$(blaze-engine --version)
-        version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
-        [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
-        if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
-          # On an ix runner (the only self-hosted runners that run this action; docs/harness.md
-          # "ix runners") the machine is a fork of the
-          # snapshot of its label set's last green job on main, its disk included, so a store
-          # under $HOME starts with what that job had and the pull below fetches only what is
-          # newer. Not under $RUNNER_TEMP: ix's scrub deletes _work/_temp before the snapshot.
-          # That disk lives on from job to job, so the store is collected (least recently used
-          # packs first) above a bound with room for a few releases' projects.
-          echo "BLAZE_CACHE=$HOME/.cache/blaze-ci/store" >> "$GITHUB_ENV"
-          echo "BLAZE_CACHE_MAX=200G" >> "$GITHUB_ENV"
-        else
-          echo "BLAZE_CACHE=$RUNNER_TEMP/blaze-store" >> "$GITHUB_ENV"
-          # No limit on the store: its default, a tenth of the free disk (about 3 GB on a hosted
-          # runner), left a third of main's packs unpulled ("318 left that do not fit under
-          # BLAZE_CACHE_MAX"), so a warm run still rebuilt what they held. A hosted runner's disk
-          # lives for one job, so nothing needs collecting.
-          echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
+        version="$(tr -d '[:space:]' < .github/blaze-cli-version)"
+
+        have=""
+        if [ -x "$bin/blaze" ]; then
+          have=$("$bin/blaze" --version 2>/dev/null | awk '$1 == "blaze" { print $2 }' || true)
         fi
-        mkdir -p "$(grep -m1 '^BLAZE_CACHE=' "$GITHUB_ENV" | cut -d= -f2-)"
-    # TODO(stage 0 after 3732f60733): remove these two steps once .github/blaze-version names a
-    # release cut after 3732f60733 (the perf sampler, no signals). The pinned 0.20261105.4
-    # (built from e930296025) still has the signal sampler (68b022735f), which tgkills every span
-    # thread with SIGRTMIN+6 about every 20 ms; a relative-timeout wait restarts on each signal,
-    # so the serve loop never wakes and the watchdog reports LOOP_STALLED (run 42110597024). Its
-    # sampler::platform::check() leaves the sampler off when SIGRTMIN+6's action is not SIG_DFL,
-    # and SIG_IGN is inherited across fork and exec: every later step's bash sources BASH_ENV,
-    # so the daemon it starts inherits the ignored signal. Linux only: macOS has no RTMIN.
-    - name: SIGRTMIN+6 ignored (the pinned release's signal sampler off)
-      if: runner.os == 'Linux'
+        need_install=false
+        if [ "$have" != "$version" ]; then
+          need_install=true
+        elif [ "$REQUIRE_LAUNCHER" = "true" ] && [ ! -x "$bin/blaze-launcher" ]; then
+          need_install=true
+        fi
+        if [ "$need_install" = "true" ]; then
+          if command -v timeout >/dev/null 2>&1; then
+            timeout -k 30 300 sh site/install.sh --version "$version" --no-toolchain --verbose
+          elif command -v gtimeout >/dev/null 2>&1; then
+            gtimeout -k 30 300 sh site/install.sh --version "$version" --no-toolchain --verbose
+          else
+            sh site/install.sh --version "$version" --no-toolchain --verbose
+          fi
+        fi
+
+        [ -x "$bin/blaze" ] || { echo "::error::blaze binary missing at $bin/blaze after install"; exit 1; }
+        if [ "$REQUIRE_LAUNCHER" = "true" ] && [ ! -x "$bin/blaze-launcher" ]; then
+          echo "::error::blaze-launcher missing at $bin/blaze-launcher (v2 release $version must bundle blaze-launcher)"
+          exit 1
+        fi
+        blaze --version
+
+        # Persistent v2 home store on warm ix runners (snapshot preserves $HOME/.blaze/v2 across jobs).
+        echo "BLAZE_HOME=$HOME/.blaze" >> "$GITHUB_ENV"
+        if [ "${RUNNER_ENVIRONMENT:-}" = self-hosted ]; then
+          echo "BLAZE_STORE_MAX_GB=200" >> "$GITHUB_ENV"
+        else
+          echo "BLAZE_STORE_MAX_GB=0" >> "$GITHUB_ENV"
+        fi
+        mkdir -p "$HOME/.blaze/v2"
+
+    - name: warm toolchain records
+      if: inputs.warm-toolchain == 'true'
       shell: bash
       run: |
-        env_file="$RUNNER_TEMP/blaze-sigrtmin6.sh"
-        echo "trap '' RTMIN+6" > "$env_file"
-        echo "BASH_ENV=$env_file" >> "$GITHUB_ENV"
-    # The cause, shown: the release's daemon, started from a step whose bash read BASH_ENV, has
-    # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off.
-    - name: the release's daemon has its sampler off
-      if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        log="$RUNNER_TEMP/blaze-sigcheck.log"
-        blaze serve > "$log" 2>&1 & serve=$!
-        for _ in $(seq 120); do
-          grep -q "no CPU samples" "$log" && break
-          kill -0 "$serve" 2>/dev/null || break
-          sleep 0.5
-        done
-        rtmin6=$(( $(kill -l RTMIN) + 6 ))
-        sigign=$(awk '/^SigIgn:/ { print $2 }' "/proc/$serve/status" 2>/dev/null || true)
-        echo "daemon $serve: SigIgn $sigign; SIGRTMIN+6 is $rtmin6 (bit $(( rtmin6 - 1 )))"
-        cat "$log"
-        blaze stop >/dev/null 2>&1 || kill "$serve" 2>/dev/null || true
-        wait "$serve" 2>/dev/null || true
-        [ -n "$sigign" ] && (( (16#$sigign >> (rtmin6 - 1)) & 1 )) || { echo "::error::the release's daemon does not ignore SIGRTMIN+6 (SigIgn ${sigign:-unread}): BASH_ENV's trap did not reach it"; exit 1; }
-        grep -q "no CPU samples" "$log" || { echo "::error::the release's daemon did not say its sampler is off"; exit 1; }
-    # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
-    # sha256 and unpacks it; vendor/llvm-sys/pin.rs refuses any other prefix. Below
-    # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
-    # build script in blaze's sandbox may name only system directories of libraries
-    # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
-    # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
-    # llvm.py takes JSON through typed_input, which needs Python 3.12; the oldest hosted Ubuntu has
-    # 3.10. An ix runner's python3 is new enough (blaze.yaml's runs of typed_input scripts).
-    - if: inputs.llvm == 'true' && runner.environment == 'github-hosted'
-      uses: actions/setup-python@v7
-      with:
-        python-version: "3.13"
-    - name: LLVM (the pin)
-      if: inputs.llvm == 'true'
-      shell: bash
-      run: |
-        case "$RUNNER_OS-$RUNNER_ARCH" in
-          Linux-X64) triple=x86_64-unknown-linux-gnu ;;
-          Linux-ARM64) triple=aarch64-unknown-linux-gnu ;;
-          macOS-ARM64) triple=aarch64-apple-darwin ;;
-          *) echo "::error::pins/llvm.json has no LLVM for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
-        esac
-        sudo mkdir -p /usr/local/lib/blaze-llvm
-        sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-        python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"$triple\", \"dir\": \"/usr/local/lib/blaze-llvm/$triple\"}"
-        echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_ENV"
-    # A cold store (a release of other sources, or a project main has not pushed yet) builds blaze in more
-    # than a hosted runner's 16 GB (rcache, #664): swap lets that run finish, slowly, where it
-    # would be killed, and the warm runs after it never touch it. The pinned 0.20261030 release
-    # builds each program whole in one worker that keeps every crate's memos until the build ends
-    # (its salsa `lru` evicts only between builds): that worker's resident plus swapped memory
-    # was 34.2 GB on 2026-10-30 (green) and passed 36.4 GB, still rising, on 2026-11-04 (run
-    # 41755023516), when 20 GB of swap ran out and the runner was shut down. So 40 GB, as the disk
-    # allows with 20 GB left for the store and target/, until the release the gate builds with
-    # bounds its own memory (#1376). Not on an ix runner:
-    # its memory grows on demand up to 256 GiB, and ix's scrub refuses to snapshot a machine
-    # with swap on, so a job that turned it on would never become its label set's seed.
-    - name: swap
-      if: runner.os == 'Linux' && runner.environment == 'github-hosted'
-      shell: bash
-      run: |
-        # On the disk with the most room: /mnt on x86-64, the root on AArch64, which has no /mnt.
-        disk=$(df --output=avail,target / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -n 1 | awk '{ print $2 }')
-        swap="${disk%/}/blaze.swap"
-        avail=$(df --output=avail -BG "$disk" | tail -n 1 | tr -dc 0-9)
-        gb=$(( avail - 20 < 40 ? avail - 20 : 40 ))
-        [ "$gb" -ge 20 ] || { echo "::error::swap: $disk has ${avail} GB free, too little for 20 GB of swap and 20 GB for the build"; exit 1; }
-        sudo fallocate -l "${gb}G" "$swap"
-        sudo chmod 600 "$swap"
-        sudo mkswap "$swap" > /dev/null
-        sudo swapon "$swap"
-        free -g
+        set -euo pipefail
+        if command -v timeout >/dev/null 2>&1; then
+          timeout -k 30 600 blaze warm-toolchain
+        elif command -v gtimeout >/dev/null 2>&1; then
+          gtimeout -k 30 600 blaze warm-toolchain
+        else
+          blaze warm-toolchain
+        fi

@@ -172,7 +172,7 @@ pub(crate) fn run_program<'a, R: Resolve + ?Sized>(
     let Started { child, pipes: _ } = spawner.start_served(cx, &spec).map_err(LoopError::Start)?;
     // A hold refused returns here: the child's drop kills and reaps it (bstd `Run`).
     let mut held = Held::hold().map_err(LoopError::Signals)?;
-    let mut inbox = std::vec::Vec::new_in(alloc);
+    let mut inbox = blaze_own::Vec::new_in(alloc);
     let mut out = std::vec::Vec::new_in(alloc);
     let ran = drive(child, needs, resolve, ahead, &Bounds::run(), &mut held, &mut inbox, &mut out);
     // The dispositions back (on an unwind, the drop does the same), then the program's end.
@@ -191,7 +191,7 @@ pub(crate) fn drive<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Alloc
     ahead: &[u8],
     bounds: &Bounds,
     signals: &mut S,
-    inbox: &mut std::vec::Vec<u8, A>,
+    inbox: &mut blaze_own::Vec<u8, A>,
     out: &mut std::vec::Vec<u8, A>,
 ) -> Result<Ran, LoopError> {
     drive_with(child, needs, resolve, ahead, bounds, signals, inbox, out, Plant::None)
@@ -205,7 +205,7 @@ fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
     ahead: &[u8],
     bounds: &Bounds,
     signals: &mut S,
-    inbox: &mut std::vec::Vec<u8, A>,
+    inbox: &mut blaze_own::Vec<u8, A>,
     out: &mut std::vec::Vec<u8, A>,
     plant: Plant,
 ) -> Result<Ran, LoopError> {
@@ -463,8 +463,8 @@ mod tests {
         let mut needs = Needs::new(alloc);
         let mut index = index(alloc);
         let mut child = SimChild::new(acts, seed, ProcId(42));
-        let mut inbox = std::vec::Vec::new();
-        let mut out = std::vec::Vec::new();
+        let mut inbox = blaze_own::Vec::new_in(alloc);
+        let mut out = std::vec::Vec::new_in(alloc);
         let mut signals = Scripted::new(&[]);
         let ran = drive_with(&mut child, &mut needs, &mut index, &[], &bounds(until), &mut signals, &mut inbox, &mut out, plant);
         (ran, child.answers(), child.killed(), child.trace(), child.now())
@@ -492,8 +492,8 @@ mod tests {
         let mut index = index(alloc);
         let mut child = TermChild::new(SimChild::new(acts, seed, ProcId(42)), on, ProcId(42));
         let mut signals = Scripted::new(arrivals);
-        let mut inbox = std::vec::Vec::new();
-        let mut out = std::vec::Vec::new();
+        let mut inbox = blaze_own::Vec::new_in(alloc);
+        let mut out = std::vec::Vec::new_in(alloc);
         let ran = drive_with(&mut child, &mut needs, &mut index, &[], bounds, &mut signals, &mut inbox, &mut out, plant);
         Seen {
             ran,
@@ -764,7 +764,7 @@ mod tests {
 
             fn recv_message<A: Allocator>(
                 &mut self,
-                into: &mut crate::run_parent::WireOut<A>,
+                into: &mut blaze_own::Vec<u8, A>,
                 most: u32,
                 _deadline: Deadline,
             ) -> Result<Message, RunError> {
@@ -855,7 +855,7 @@ mod tests {
             done: false,
         };
         let mut signals = Scripted::new(&[]);
-        let mut inbox = crate::run_parent::wire_out(alloc);
+        let mut inbox = blaze_own::Vec::new_in(alloc);
         let mut out = crate::run_parent::wire_out(alloc);
         let b = Bounds { tick: Duration::from_millis(50), write: Duration::from_secs(5), until: Deadline::after(child.clock.now(), Duration::from_secs(10)), grace: GRACE };
         let ran = drive(&mut child, &mut needs, &mut resolver, &ahead, &b, &mut signals, &mut inbox, &mut out)

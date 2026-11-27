@@ -29,6 +29,8 @@ use crate::world::{AdtKind, Reads, World};
 
 /// Maximum nesting depth for transitive capability field walks (Rule 18).
 const MAX_WALK_DEPTH: usize = 32;
+/// Maximum visit steps per `walk_pty` call (Rule 18: bounds DAG/generic fan-out).
+const MAX_WALK_STEPS: usize = 4096;
 
 /// One violation of `blaze::capability_in_sans_io`: a `#[blaze::capability]` type stored
 /// (directly or transitively, owned or borrowed) as a field of a `#![blaze::sans_io]` ADT.
@@ -147,7 +149,7 @@ enum WalkStep<'t> {
     },
     PushField(Name),
     PopField,
-    PopVisited,
+    PopVisited { adt: ItemKey, monomorphic: bool },
 }
 
 fn walk_pty<'a, 't, W: World>(
@@ -160,7 +162,9 @@ fn walk_pty<'a, 't, W: World>(
     alloc: Alloc<'a>,
 ) -> Result<(), Stop> {
     let mut substs: Vec<SubstNode<'t>, Alloc<'a>> = Vec::new_in(alloc);
+    let mut clean_mono: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
     let mut work: Vec<WalkStep<'t>, Alloc<'a>> = Vec::new_in(alloc);
+    let mut steps: usize = 0;
     work.push(WalkStep::Visit {
         types: root_types,
         ty: root_ty,
@@ -176,13 +180,18 @@ fn walk_pty<'a, 't, W: World>(
             WalkStep::PopField => {
                 let _ = path_buf.pop();
             }
-            WalkStep::PopVisited => {
+            WalkStep::PopVisited { adt, monomorphic } => {
                 let _ = visited.pop();
+                let _ = substs.pop();
+                if monomorphic && hit.is_none() && !clean_mono.iter().any(|&k| k == adt) {
+                    clean_mono.push(adt);
+                }
             }
             WalkStep::Visit { types, ty, subst, depth, borrowed, via_adt } => {
-                if hit.is_some() || depth >= MAX_WALK_DEPTH {
+                if hit.is_some() || depth >= MAX_WALK_DEPTH || steps >= MAX_WALK_STEPS {
                     continue;
                 }
+                steps += 1;
                 let Ok(node) = types.node(ty) else {
                     continue;
                 };
@@ -259,13 +268,15 @@ fn walk_pty<'a, 't, W: World>(
                         }
                         // 1. Queued last (runs first): inspect inner ADT's fields with generic
                         //    arguments substituted so `Wrap<Cap>` reports full nested field paths.
-                        if !visited.iter().any(|&k| k == inner_adt)
+                        let monomorphic = arg_slice.is_empty();
+                        if (!monomorphic || !clean_mono.iter().any(|&k| k == inner_adt))
+                            && !visited.iter().any(|&k| k == inner_adt)
                             && let Some(inner_def) = reads.adt(inner_adt)?
                         {
                             visited.push(inner_adt);
                             let next_subst = substs.len();
                             substs.push(SubstNode { caller_types: types, args: arg_slice, parent: subst });
-                            work.push(WalkStep::PopVisited);
+                            work.push(WalkStep::PopVisited { adt: inner_adt, monomorphic });
                             for variant in inner_def.variants.iter().rev() {
                                 let Some(fields) = inner_def.fields.get(variant.fields.range()) else {
                                     continue;

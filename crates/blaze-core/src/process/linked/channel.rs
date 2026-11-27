@@ -320,7 +320,7 @@ impl Channel {
     /// refused before its body is read.
     pub fn recv_message<A: Allocator>(
         &mut self,
-        into: &mut Vec<u8, A>,
+        into: &mut blaze_own::Vec<u8, A>,
         most: u32,
         deadline: Deadline,
         clock: &impl Clock,
@@ -502,7 +502,7 @@ mod tests {
         let clock = Monotonic::new();
         let soon = || Deadline::after(clock.now(), Duration::from_millis(50));
         let (mut parent, child) = pair().expect("a pair");
-        let mut inbox = Vec::new();
+        let mut inbox = blaze_own::Vec::new_in(std::alloc::Global);
         raw_write(&child, b"\0\0\0\x03a");
         assert_eq!(parent.recv_message(&mut inbox, 16, soon(), &clock).expect("a wait"), Message::Deadline);
         assert_eq!(&inbox[..], b"\0\0\0\x03a", "the half stays for the next call");
@@ -521,7 +521,7 @@ mod tests {
         let (mut parent, child) = pair().expect("a pair");
         raw_write(&child, b"\0\0\0\x40");
         assert_eq!(
-            parent.recv_message(&mut Vec::new(), 16, soon(), &clock),
+            parent.recv_message(&mut blaze_own::Vec::new_in(std::alloc::Global), 16, soon(), &clock),
             Err(ChannelError::TooLong { len: 64, most: 16 })
         );
         println!("channel: split frame joined, deadline kept the half, torn named, hangup named");
@@ -574,8 +574,8 @@ mod tests {
         let deadline = Deadline::after(clock.now(), Duration::from_secs(10));
         let mut parent_sent = 0usize;
         let mut child_sent = 0usize;
-        let mut parent_inbox = core::default::Default::default();
-        let mut child_inbox = core::default::Default::default();
+        let mut parent_inbox: blaze_own::AVec<'_, u8> = blaze_own::AVec::new_in(alloc);
+        let mut child_inbox: blaze_own::AVec<'_, u8> = blaze_own::AVec::new_in(alloc);
         let mut parent_got: blaze_own::AVec<'_, u8> = blaze_own::AVec::with_capacity_in(expected_child_len, alloc);
         let mut child_got: blaze_own::AVec<'_, u8> = blaze_own::AVec::with_capacity_in(expected_parent_len, alloc);
         let mut saw_backpressure = false;
