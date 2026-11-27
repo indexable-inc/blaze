@@ -25,13 +25,13 @@ use core::fmt::Write as _;
 use std::borrow::Cow;
 
 use blaze_expand::{
-    Delim, Edition, LitKind, ProcCall, ProcKind, Produced, Reads, Spacing, TokenKind, TokenOrigin,
-    TokenStream, Transparency, lex,
+    Delim, Edition, LitKind, ProcCall, ProcKind, Produced, Raw, Reads, Spacing, TokenKind,
+    TokenOrigin, TokenStream, Transparency, lex,
 };
 use blaze_own::{AVec, Alloc};
 
 /// Versioned digest domain used when caching pure comptime-patch expansions.
-pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v4";
+pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v5";
 
 /// Cumulative telemetry counters for the built-in comptime patch library.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -222,6 +222,7 @@ struct ParsedField {
     attrs: Vec<RawAttr>,
     name: Option<String>,
     ty: String,
+    ty_range: (usize, usize),
 }
 
 #[derive(Clone, Debug)]
@@ -428,13 +429,16 @@ fn render_tokens(stream: &TokenStream<'_>, start: usize, end: usize) -> String {
                 prev_joint = spacing == Spacing::Joint || matches!(c, '\'' | '#');
                 prev_word = None;
             }
-            TokenKind::Ident { .. } => {
+            TokenKind::Ident { raw, .. } => {
                 if !out.is_empty()
                     && !prev_joint
                     && !out.ends_with(['(', '[', '{', '<', '\'', '.', '&', '#'])
                     && !out.ends_with("::")
                 {
                     out.push(' ');
+                }
+                if raw == Raw::Yes {
+                    out.push_str("r#");
                 }
                 let word = stream.text_at(i);
                 out.push_str(word);
@@ -669,11 +673,12 @@ fn parse_named_fields(stream: &TokenStream<'_>, open_brace: usize) -> Option<Vec
         let comma = find_top_level(stream, p, close, &[',']);
         // Strip field default `= expr` if present (RFC 3681).
         let eq = find_top_level(stream, p, comma, &['=']);
-        let ty = render_tokens(stream, p, eq.min(comma));
+        let ty_end = eq.min(comma);
+        let ty = render_tokens(stream, p, ty_end);
         if ty.is_empty() {
             return None;
         }
-        fields.push(ParsedField { attrs, name: Some(name), ty });
+        fields.push(ParsedField { attrs, name: Some(name), ty, ty_range: (p, ty_end) });
         p = if comma < close { comma + 1 } else { close };
     }
     Some(fields)
@@ -694,7 +699,7 @@ fn parse_tuple_fields(stream: &TokenStream<'_>, open_paren: usize) -> Option<Vec
         if ty.is_empty() {
             return None;
         }
-        fields.push(ParsedField { attrs, name: None, ty });
+        fields.push(ParsedField { attrs, name: None, ty, ty_range: (p, comma) });
         p = if comma < close { comma + 1 } else { close };
     }
     Some(fields)
@@ -2289,6 +2294,161 @@ fn expand_bytemuck(stream: &TokenStream<'_>, macro_name: &str) -> Option<String>
 // 3. `thiserror_impl` Comptime Patch (`#[derive(Error)]`)
 // =================================================================================================
 
+/// Skip a balanced `<...>` group starting at `start` in `stream[..end]`, returning the token
+/// index immediately after the matching `>`. Delimiter groups (`()`, `[]`, `{}`), `->` arrows,
+/// and literal tokens (such as `'>'`) are skipped atomically.
+fn skip_angle_group(stream: &TokenStream<'_>, start: usize, end: usize) -> Option<usize> {
+    if start >= end || !is_punct(stream, start, '<') {
+        return None;
+    }
+    let tokens = stream.tokens();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < end {
+        match tokens.get(i)?.kind {
+            TokenKind::Open(_) => {
+                let close = stream.close_of(i)?;
+                if close >= end {
+                    return None;
+                }
+                i = close + 1;
+                continue;
+            }
+            TokenKind::Punct { char: '-', spacing: Spacing::Joint }
+                if i + 1 < end && is_punct(stream, i + 1, '>') =>
+            {
+                i += 2;
+                continue;
+            }
+            TokenKind::Punct { char: '<', .. } => depth += 1,
+            TokenKind::Punct { char: '>', .. } => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// If `stream[start..end]` is a Rust `Type::Path` whose final segment is `Option<T>` with a
+/// single type argument (e.g. `Option<io::Error>`, `core::option::Option<E>`,
+/// `módulo::Option<E>`, `<Provider<'>'> as Factory>::Option<E>`, `Option<error_ty! { A, B }>`),
+/// return the inner token range `(arg_start, arg_end)`.
+///
+/// Matches `thiserror_impl::expand::type_parameter_of_option` directly on tokens.
+fn option_inner_range(
+    stream: &TokenStream<'_>,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if start >= end {
+        return None;
+    }
+    let mut i = start;
+    // Optional `<Type as Trait>::` QSelf or leading `::`.
+    if is_punct(stream, i, '<') {
+        i = skip_angle_group(stream, i, end)?;
+        if i + 1 >= end || !is_punct(stream, i, ':') || !is_punct(stream, i + 1, ':') {
+            return None;
+        }
+        i += 2;
+    } else if i + 1 < end && is_punct(stream, i, ':') && is_punct(stream, i + 1, ':') {
+        i += 2;
+    }
+
+    let (arg_start, mut arg_end) = loop {
+        if i >= end || !is_any_ident(stream, i) {
+            return None;
+        }
+        let ident = stream.text_at(i);
+        i += 1;
+
+        let mut saw_sep = false;
+        if i + 1 < end && is_punct(stream, i, ':') && is_punct(stream, i + 1, ':') {
+            saw_sep = true;
+            i += 2;
+        }
+
+        if i < end && is_punct(stream, i, '<') {
+            let open = i;
+            let after = skip_angle_group(stream, open, end)?;
+            if after == end {
+                if ident != "Option" {
+                    return None;
+                }
+                break (open + 1, after - 1);
+            }
+            if after + 1 >= end
+                || !is_punct(stream, after, ':')
+                || !is_punct(stream, after + 1, ':')
+            {
+                return None;
+            }
+            i = after + 2;
+        } else if saw_sep {
+            continue;
+        } else {
+            return None;
+        }
+    };
+
+    if arg_end > arg_start && is_punct(stream, arg_end - 1, ',') {
+        arg_end -= 1;
+    }
+    if arg_start >= arg_end {
+        return None;
+    }
+
+    // Reject non-type generic arguments (lifetimes `'a` and const expressions/literals).
+    let tokens = stream.tokens();
+    match tokens.get(arg_start)?.kind {
+        TokenKind::Literal { .. } | TokenKind::Open(Delim::Brace) => return None,
+        TokenKind::Punct { char: '\'' | '-', .. } => return None,
+        TokenKind::Ident { raw: Raw::No, .. }
+            if matches!(stream.text_at(arg_start), "true" | "false") =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+
+    // Verify a single type argument (no top-level `,` or `=`, while allowing them inside
+    // nested `<...>`, `(...)`, `[...]`, and `{...}`).
+    let mut j = arg_start;
+    let mut angle_depth = 0usize;
+    while j < arg_end {
+        match tokens.get(j)?.kind {
+            TokenKind::Open(_) => {
+                let close = stream.close_of(j)?;
+                if close >= arg_end {
+                    return None;
+                }
+                j = close + 1;
+                continue;
+            }
+            TokenKind::Punct { char: '-', spacing: Spacing::Joint }
+                if j + 1 < arg_end && is_punct(stream, j + 1, '>') =>
+            {
+                j += 2;
+                continue;
+            }
+            TokenKind::Punct { char: '<', .. } => angle_depth += 1,
+            TokenKind::Punct { char: '>', .. } => angle_depth = angle_depth.checked_sub(1)?,
+            TokenKind::Punct { char: ',' | '=', .. } if angle_depth == 0 => return None,
+            _ => {}
+        }
+        j += 1;
+    }
+    if angle_depth != 0 {
+        return None;
+    }
+    Some((arg_start, arg_end))
+}
+
 fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
     let adt = parse_adt(stream)?;
     if adt.has_cfg_on_members() {
@@ -2337,37 +2497,57 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
             let (disp_expr, transparent) = parse_thiserror_attr(err_attr, v, true)?;
             let _ = writeln!(display_arms, "        {disp_expr}");
 
-            // Check `#[from]` / `#[source]` fields.
-            let mut source_field: Option<(usize, &ParsedField)> = None;
+            // Check `#[from]` / `#[source]` fields (explicit attrs take priority over implicit `source`).
+            let mut explicit_source: Option<(usize, &ParsedField)> = None;
+            let mut implicit_source: Option<(usize, &ParsedField)> = None;
             for (i, f) in v.fields.iter().enumerate() {
                 if has_exotic(&f.attrs) {
                     return None;
                 }
                 let is_from = f.attrs.iter().any(|a| a.path == "from");
-                let is_source = f.attrs.iter().any(|a| a.path == "source")
-                    || f.name.as_deref() == Some("source");
+                let has_source_attr = f.attrs.iter().any(|a| a.path == "source");
+                let is_implicit_source = matches!(f.name.as_deref(), Some("source" | "r#source"));
                 if is_from {
-                    if v.fields.len() != 1 {
+                    if v.fields.len() != 1 || explicit_source.is_some() {
                         return None;
                     }
-                    let ctor = match v.shape {
-                        FieldsShape::Named => {
-                            format!("{name} {{ {}: __source }}", f.name.as_deref()?)
-                        }
-                        FieldsShape::Tuple => format!("{name}(__source)"),
-                        FieldsShape::Unit => return None,
+                    let opt_inner = option_inner_range(stream, f.ty_range.0, f.ty_range.1)
+                        .map(|(s, e)| render_tokens(stream, s, e));
+                    let (from_ty, source_expr) = match opt_inner.as_deref() {
+                        Some(inner) => (inner, "::core::option::Option::Some(__source)"),
+                        None => (f.ty.as_str(), "__source"),
                     };
-                    let _ = writeln!(
-                        from_impls,
-                        "#[automatically_derived] impl{impl_g} ::core::convert::From<{}> for {name}{ty_g}{where_c} {{ fn from(__source: {}) -> Self {{ {ctor} }} }}",
-                        f.ty, f.ty
-                    );
-                    source_field = Some((i, f));
-                } else if is_source {
-                    source_field = Some((i, f));
+                    match v.shape {
+                        FieldsShape::Named => {
+                            let fname = f.name.as_deref()?;
+                            let _ = writeln!(
+                                from_impls,
+                                "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name} {{ {fname}: {source_expr} }} }} }}",
+                            );
+                        }
+                        FieldsShape::Tuple => {
+                            let _ = writeln!(
+                                from_impls,
+                                "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name}({source_expr}) }} }}",
+                            );
+                        }
+                        FieldsShape::Unit => return None,
+                    }
+                    explicit_source = Some((i, f));
+                } else if has_source_attr {
+                    if explicit_source.is_some() {
+                        return None;
+                    }
+                    explicit_source = Some((i, f));
+                } else if is_implicit_source {
+                    implicit_source = Some((i, f));
                 }
             }
+            let source_field = explicit_source.or(implicit_source);
             if transparent && v.fields.len() == 1 {
+                if v.fields[0].attrs.iter().any(|a| a.path == "source") {
+                    return None;
+                }
                 let acc = match v.shape {
                     FieldsShape::Named => format!("&self.{}", v.fields[0].name.as_deref()?),
                     FieldsShape::Tuple => "&self.0".to_owned(),
@@ -2383,10 +2563,17 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                     FieldsShape::Tuple => format!("&self.{idx}"),
                     FieldsShape::Unit => return None,
                 };
-                let _ = writeln!(
-                    source_arms,
-                    "        ::core::option::Option::Some({acc} as &(dyn ::core::error::Error + 'static))"
-                );
+                if option_inner_range(stream, f.ty_range.0, f.ty_range.1).is_some() {
+                    let _ = writeln!(
+                        source_arms,
+                        "        match ({acc}).as_ref() {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }}"
+                    );
+                } else {
+                    let _ = writeln!(
+                        source_arms,
+                        "        ::core::option::Option::Some({acc} as &(dyn ::core::error::Error + 'static))"
+                    );
+                }
             } else {
                 let _ = writeln!(source_arms, "        ::core::option::Option::None");
             }
@@ -2407,45 +2594,72 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                 let pat = variant_ref_pattern(name, v);
                 let _ = writeln!(display_arms, "            {pat} => {disp_body},");
 
-                let mut source_idx: Option<usize> = None;
+                let mut explicit_source: Option<(usize, &ParsedField)> = None;
+                let mut implicit_source: Option<(usize, &ParsedField)> = None;
                 for (i, f) in v.fields.iter().enumerate() {
                     if has_exotic(&f.attrs) {
                         return None;
                     }
                     let is_from = f.attrs.iter().any(|a| a.path == "from");
-                    let is_source = f.attrs.iter().any(|a| a.path == "source")
-                        || f.name.as_deref() == Some("source");
+                    let has_source_attr = f.attrs.iter().any(|a| a.path == "source");
+                    let is_implicit_source = matches!(f.name.as_deref(), Some("source" | "r#source"));
                     if is_from {
-                        if v.fields.len() != 1 {
+                        if v.fields.len() != 1 || explicit_source.is_some() {
                             return None;
                         }
-                        let ctor = match v.shape {
-                            FieldsShape::Named => {
-                                format!("{name}::{vname} {{ {}: __source }}", f.name.as_deref()?)
-                            }
-                            FieldsShape::Tuple => format!("{name}::{vname}(__source)"),
-                            FieldsShape::Unit => return None,
+                        let opt_inner = option_inner_range(stream, f.ty_range.0, f.ty_range.1)
+                            .map(|(s, e)| render_tokens(stream, s, e));
+                        let (from_ty, source_expr) = match opt_inner.as_deref() {
+                            Some(inner) => (inner, "::core::option::Option::Some(__source)"),
+                            None => (f.ty.as_str(), "__source"),
                         };
-                        let _ = writeln!(
-                            from_impls,
-                            "#[automatically_derived] impl{impl_g} ::core::convert::From<{}> for {name}{ty_g}{where_c} {{ fn from(__source: {}) -> Self {{ {ctor} }} }}",
-                            f.ty, f.ty
-                        );
-                        source_idx = Some(i);
-                    } else if is_source {
-                        source_idx = Some(i);
+                        match v.shape {
+                            FieldsShape::Named => {
+                                let fname = f.name.as_deref()?;
+                                let _ = writeln!(
+                                    from_impls,
+                                    "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name}::{vname} {{ {fname}: {source_expr} }} }} }}",
+                                );
+                            }
+                            FieldsShape::Tuple => {
+                                let _ = writeln!(
+                                    from_impls,
+                                    "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name}::{vname}({source_expr}) }} }}",
+                                );
+                            }
+                            FieldsShape::Unit => return None,
+                        }
+                        explicit_source = Some((i, f));
+                    } else if has_source_attr {
+                        if explicit_source.is_some() {
+                            return None;
+                        }
+                        explicit_source = Some((i, f));
+                    } else if is_implicit_source {
+                        implicit_source = Some((i, f));
                     }
                 }
+                let source_field = explicit_source.or(implicit_source);
                 if transparent && v.fields.len() == 1 {
+                    if v.fields[0].attrs.iter().any(|a| a.path == "source") {
+                        return None;
+                    }
                     let _ = writeln!(
                         source_arms,
                         "            {pat} => ::core::error::Error::source(__f0),"
                     );
-                } else if let Some(idx) = source_idx {
-                    let _ = writeln!(
-                        source_arms,
-                        "            {pat} => ::core::option::Option::Some(__f{idx} as &(dyn ::core::error::Error + 'static)),"
-                    );
+                } else if let Some((idx, f)) = source_field {
+                    if option_inner_range(stream, f.ty_range.0, f.ty_range.1).is_some() {
+                        let _ = writeln!(
+                            source_arms,
+                            "            {pat} => match __f{idx}.as_ref() {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }},"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            source_arms,
+                            "            {pat} => ::core::option::Option::Some(__f{idx} as &(dyn ::core::error::Error + 'static)),"
+                        );
+                    }
                 } else {
                     let _ = writeln!(
                         source_arms,
@@ -3201,10 +3415,10 @@ mod tests {
     fn comptime_patch_previous_version_is_distinct() {
         assert_ne!(
             COMPTIME_PATCH_VERSION,
-            b"blaze-comptime-patch-v3",
-            "v4 expansion adds visit_u64 and visit_bytes to __FieldVisitor and must not share v3's digest domain"
+            b"blaze-comptime-patch-v4",
+            "v5 expansion unwraps Option<E> source fields in thiserror_impl and must not share v4's digest domain"
         );
-        assert_eq!(COMPTIME_PATCH_VERSION, b"blaze-comptime-patch-v4");
+        assert_eq!(COMPTIME_PATCH_VERSION, b"blaze-comptime-patch-v5");
     }
 
     #[test]
@@ -3310,6 +3524,315 @@ mod tests {
         // paste!
         let p = expand_code("paste", ProcKind::FnLike, "paste", "fn [<get_ FooBar:snake>]() -> u32 { 42 }").unwrap();
         assert!(p.contains("fn get_foo_bar"), "got: {p}");
+    }
+
+    #[test]
+    fn thiserror_option_source_fields_and_fallbacks() {
+        // 1. Struct with explicit `#[source] Option<E>` (matches sqlx-core ResolveError).
+        let resolve_err = r#"
+            #[derive(Debug)]
+            #[error("{message}")]
+            pub struct ResolveError {
+                message: String,
+                #[source]
+                source: Option<io::Error>,
+            }
+        "#;
+        let exp = expand_code("thiserror-impl", ProcKind::Derive, "Error", resolve_err)
+            .expect("struct explicit #[source] Option<E> expands");
+        assert!(
+            exp.contains("match (&self.source).as_ref()")
+                && exp.contains("::core::option::Option::Some(__e) =>::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static))"),
+            "must unwrap Option<E> via .as_ref() instead of casting &Option<E>:\n{exp}"
+        );
+        assert!(
+            !exp.contains("&self.source as &(dyn"),
+            "must not cast &Option<E> directly to &dyn Error:\n{exp}"
+        );
+
+        // 2. Struct with implicit `source: Option<E>` (no `#[source]` attr).
+        let implicit_err = r#"
+            #[derive(Debug)]
+            #[error("{message}")]
+            pub struct ImplicitErr {
+                message: String,
+                source: Option<std::io::Error>,
+            }
+        "#;
+        let exp_imp = expand_code("thiserror_impl", ProcKind::Derive, "Error", implicit_err)
+            .expect("struct implicit source: Option<E> expands");
+        assert!(
+            exp_imp.contains("match (&self.source).as_ref()"),
+            "implicit source: Option<E> must unwrap Option:\n{exp_imp}"
+        );
+
+        // 3. Tuple struct with `#[source] Option<E>`.
+        let tuple_err = r#"
+            #[derive(Debug)]
+            #[error("wrapped")]
+            pub struct TupleOptErr(#[source] Option<std::io::Error>);
+        "#;
+        let exp_tup = expand_code("thiserror_impl", ProcKind::Derive, "Error", tuple_err)
+            .expect("tuple struct #[source] Option<E> expands");
+        assert!(
+            exp_tup.contains("match (&self.0).as_ref()"),
+            "tuple struct #[source] Option<E> must unwrap &self.0:\n{exp_tup}"
+        );
+
+        // 4. Enum with named explicit `#[source]`, named implicit `source`, tuple `#[source]`,
+        //    and qualified `core::option::Option` / `::core::option::Option` / `std::option::Option`.
+        let enum_opt = r#"
+            #[derive(Debug)]
+            pub enum OptEnumErr {
+                #[error("named {msg}")]
+                Named {
+                    msg: String,
+                    #[source]
+                    cause: core::option::Option<std::io::Error>,
+                },
+                #[error("implicit")]
+                Implicit {
+                    source: ::core::option::Option<std::io::Error>,
+                },
+                #[error("tuple")]
+                Tuple(#[source] std::option::Option<std::io::Error>),
+                #[error("abs")]
+                Abs(#[source] ::std::option::Option<std::io::Error>),
+                #[error("none")]
+                Empty,
+            }
+        "#;
+        let exp_enum = expand_code("thiserror_impl", ProcKind::Derive, "Error", enum_opt)
+            .expect("enum Option<E> source variants expand");
+        assert!(
+            exp_enum.contains("match __f1.as_ref()")
+                && exp_enum.contains("match __f0.as_ref()"),
+            "enum variants must unwrap Option<E> via __fN.as_ref():\n{exp_enum}"
+        );
+        assert!(
+            !exp_enum.contains("__f0 as &(dyn") && !exp_enum.contains("__f1 as &(dyn"),
+            "enum variants must not cast &Option<E> directly:\n{exp_enum}"
+        );
+
+        // 5. Explicit `#[source]` takes precedence over a later field named `source`.
+        let prec_err = r#"
+            #[derive(Debug)]
+            #[error("prec")]
+            pub struct PrecErr {
+                #[source]
+                cause: Option<std::io::Error>,
+                source: String,
+            }
+        "#;
+        let exp_prec = expand_code("thiserror_impl", ProcKind::Derive, "Error", prec_err)
+            .expect("explicit #[source] before field named source expands");
+        assert!(
+            exp_prec.contains("match (&self.cause).as_ref()")
+                && !exp_prec.contains("&self.source"),
+            "explicit #[source] must beat later implicit `source` field:\n{exp_prec}"
+        );
+
+        // 6. Helper unit checks directly on lexed tokens: Unicode paths, literals inside
+        //    qualified paths, braced macros, non-Option types, and const/lifetime args.
+        let alloc = heap().alloc();
+        let opt_inner = |src: &str| -> Option<String> {
+            let stream = lex(src, Edition::E2021, alloc).unwrap();
+            let (s, e) = option_inner_range(&stream, 0, stream.len())?;
+            Some(render_tokens(&stream, s, e))
+        };
+        assert_eq!(opt_inner("Option<io::Error>").as_deref(), Some("io::Error"));
+        assert_eq!(opt_inner("core::option::Option<Foo<A, B>>").as_deref(), Some("Foo <A, B>"));
+        assert_eq!(opt_inner("::std::option::Option<E,>").as_deref(), Some("E"));
+        assert_eq!(opt_inner("Option<&'static io::Error>").as_deref(), Some("&'static io::Error"));
+        assert_eq!(opt_inner("Option<r#Error>").as_deref(), Some("r#Error"));
+        assert_eq!(opt_inner("Option<r#true>").as_deref(), Some("r#true"));
+        assert_eq!(opt_inner("módulo::Option<std::io::Error>").as_deref(), Some("std::io::Error"));
+        assert_eq!(opt_inner("<Provider as Factory>::Option<io::Error>").as_deref(), Some("io::Error"));
+        assert_eq!(opt_inner("<Provider<'>'> as Factory>::Option<std::io::Error>").as_deref(), Some("std::io::Error"));
+        assert_eq!(opt_inner("<Foo<A, B> as Bar<C>>::sub::Option<E>").as_deref(), Some("E"));
+        assert_eq!(opt_inner("Outer<T>::Option<E>").as_deref(), Some("E"));
+        assert_eq!(opt_inner("Option<error_ty! { A, B }>").as_deref(), Some("error_ty! {A, B}"));
+        assert_eq!(opt_inner("Option<error_ty! { A = 1, B = 2 }>").as_deref(), Some("error_ty! {A = 1, B = 2}"));
+        assert_eq!(opt_inner("Box<Option<io::Error>>"), None);
+        assert_eq!(opt_inner("&Option<io::Error>"), None);
+        assert_eq!(opt_inner("MyOption<io::Error>"), None);
+        assert_eq!(opt_inner("<Provider as Factory>::MyOption<io::Error>"), None);
+        assert_eq!(opt_inner("Option<A, B>"), None);
+        assert_eq!(opt_inner("fn() -> Option<io::Error>"), None);
+        assert_eq!(opt_inner("Option<3>"), None);
+        assert_eq!(opt_inner("Option<-1>"), None);
+        assert_eq!(opt_inner("Option<{ 1 + 1 }>"), None);
+        assert_eq!(opt_inner("Option<true>"), None);
+        assert_eq!(opt_inner("Option<false>"), None);
+        assert_eq!(opt_inner("Option<'a>"), None);
+        assert_eq!(opt_inner("Option<'c'>"), None);
+        assert_eq!(opt_inner("Option<\"x\">"), None);
+        assert_eq!(opt_inner("Option<b\"x\">"), None);
+        assert_eq!(opt_inner("Option<b'x'>"), None);
+        assert_eq!(opt_inner("Option<c\"x\">"), None);
+        assert_eq!(opt_inner("Option<r#\"x\"#>"), None);
+
+        // 6a. Unicode module path and char literal `'>'` inside qualified path expand directly.
+        let unicode_opt = r#"#[derive(Debug)] #[error("unicode")] pub struct UnicodeOpt { #[source] source: módulo::Option<std::io::Error> }"#;
+        let exp_unicode = expand_code("thiserror_impl", ProcKind::Derive, "Error", unicode_opt)
+            .expect("Unicode module path Option expands directly");
+        assert!(
+            exp_unicode.contains("match (&self.source).as_ref()"),
+            "módulo::Option<E> must unwrap via .as_ref():\n{exp_unicode}"
+        );
+        let lit_qpath_opt = r#"#[derive(Debug)] #[error("lit qpath")] pub struct LitQPathOpt { #[source] source: <Provider<'>'> as Factory>::Option<std::io::Error> }"#;
+        let exp_lit_qpath = expand_code("thiserror_impl", ProcKind::Derive, "Error", lit_qpath_opt)
+            .expect("qualified path with '>' literal expands directly");
+        assert!(
+            exp_lit_qpath.contains("match (&self.source).as_ref()"),
+            "<Provider<'>'> as Factory>::Option<E> must unwrap via .as_ref():\n{exp_lit_qpath}"
+        );
+
+        // 6b. Custom `struct Option<const N: usize>` used as `#[source]` / `#[from]` must NOT
+        //     be unwrapped as `core::option::Option`.
+        let const_opt_err = r#"
+            #[derive(Debug)]
+            #[error("const opt")]
+            pub struct ConstOptErr {
+                #[from]
+                source: Option<3>,
+            }
+        "#;
+        let exp_const_opt = expand_code("thiserror_impl", ProcKind::Derive, "Error", const_opt_err)
+            .expect("const-generic Option<3> expands as a plain error type");
+        assert!(
+            exp_const_opt.contains("::core::convert::From <Option <3>> for ConstOptErr")
+                && exp_const_opt.contains("::core::option::Option::Some(&self.source as &(dyn ::core::error::Error + 'static))")
+                && !exp_const_opt.contains(".as_ref()"),
+            "Option<3> must not be unwrapped as Option:\n{exp_const_opt}"
+        );
+
+        // 6c. Reference-valued sources (`&'static E` and `Option<&'static E>`, `#[source]` & `#[from]`)
+        //     expand directly because `core::error::Error` is implemented for `&T`.
+        let ref_src = r#"#[derive(Debug)] #[error("ref")] pub struct RefSrc { #[source] source: &'static std::io::Error }"#;
+        let exp_ref_src = expand_code("thiserror_impl", ProcKind::Derive, "Error", ref_src)
+            .expect("&'static E source expands directly");
+        assert!(
+            exp_ref_src.contains("::core::option::Option::Some(&self.source as &(dyn ::core::error::Error + 'static))"),
+            "direct &'static E source must cast &self.source:\n{exp_ref_src}"
+        );
+        let opt_ref_src = r#"#[derive(Debug)] #[error("opt ref")] pub struct OptRefSrc { #[source] source: Option<&'static std::io::Error> }"#;
+        let exp_opt_ref = expand_code("thiserror_impl", ProcKind::Derive, "Error", opt_ref_src)
+            .expect("Option<&'static E> source expands directly");
+        assert!(
+            exp_opt_ref.contains("match (&self.source).as_ref()"),
+            "Option<&'static E> source must unwrap via .as_ref():\n{exp_opt_ref}"
+        );
+        let from_opt_ref = r#"#[derive(Debug)] #[error("from opt ref")] pub struct FromOptRef { #[from] source: Option<&'static std::io::Error> }"#;
+        let exp_from_opt_ref = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_ref)
+            .expect("#[from] Option<&'static E> expands directly");
+        assert!(
+            exp_from_opt_ref.contains("::core::convert::From <&'static std::io::Error> for FromOptRef")
+                && exp_from_opt_ref.contains("match (&self.source).as_ref()"),
+            "#[from] Option<&'static E> must impl From<&'static E> and unwrap source():\n{exp_from_opt_ref}"
+        );
+
+        // 7. `#[from] Option<E>` expands directly (wrapping `Some(__source)` in `From<E>`
+        //    and unwrapping via `.as_ref()` in `Error::source`) for structs and enums.
+        let from_opt_named = r#"
+            #[derive(Debug)]
+            #[error("from named")]
+            pub struct FromOptNamed {
+                #[from]
+                source: Option<std::io::Error>,
+            }
+        "#;
+        let exp_from_named = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_named)
+            .expect("struct #[from] Option<E> expands");
+        assert!(
+            exp_from_named.contains("::core::convert::From <std::io::Error> for FromOptNamed")
+                && exp_from_named.contains("FromOptNamed {source: ::core::option::Option::Some(__source)}")
+                && exp_from_named.contains("match (&self.source).as_ref()"),
+            "struct #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_named}"
+        );
+
+        let from_opt_tuple = r#"
+            #[derive(Debug)]
+            #[error("from tuple")]
+            pub struct FromOptTuple(#[from] core::option::Option<std::io::Error>);
+        "#;
+        let exp_from_tuple = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_tuple)
+            .expect("tuple struct #[from] Option<E> expands");
+        assert!(
+            exp_from_tuple.contains("::core::convert::From <std::io::Error> for FromOptTuple")
+                && exp_from_tuple.contains("FromOptTuple(::core::option::Option::Some(__source))")
+                && exp_from_tuple.contains("match (&self.0).as_ref()"),
+            "tuple struct #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_tuple}"
+        );
+
+        let from_opt_enum = r#"
+            #[derive(Debug)]
+            pub enum FromOptEnum {
+                #[error("io")]
+                Io { #[from] source: Option<std::io::Error> },
+                #[error("fmt")]
+                Fmt(#[from] std::option::Option<std::fmt::Error>),
+            }
+        "#;
+        let exp_from_enum = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_enum)
+            .expect("enum #[from] Option<E> expands");
+        assert!(
+            exp_from_enum.contains("::core::convert::From <std::io::Error> for FromOptEnum")
+                && exp_from_enum.contains("FromOptEnum::Io {source: ::core::option::Option::Some(__source)}")
+                && exp_from_enum.contains("::core::convert::From <std::fmt::Error> for FromOptEnum")
+                && exp_from_enum.contains("FromOptEnum::Fmt(::core::option::Option::Some(__source))")
+                && exp_from_enum.contains("match __f0.as_ref()"),
+            "enum #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_enum}"
+        );
+
+        // 8. Transparent custom `Option`, nested `Option<Option<E>>`, qualified assoc `Option`,
+        //    and braced macro arg inside `Option<...>` all expand directly on the comptime path.
+        let trans_opt = r#"#[derive(Debug)] #[error(transparent)] pub struct TransOpt(Option<Leaf>);"#;
+        let exp_trans = expand_code("thiserror_impl", ProcKind::Derive, "Error", trans_opt)
+            .expect("#[error(transparent)] wrapping custom Option expands directly");
+        assert!(
+            exp_trans.contains("::core::error::Error::source(&self.0)"),
+            "transparent custom Option must delegate directly to Error::source(&self.0):\n{exp_trans}"
+        );
+
+        let nested_opt = r#"#[derive(Debug)] #[error("nested")] pub struct NestedOpt { #[source] source: Option<CustomOpt::Option<Leaf>> }"#;
+        let exp_nested = expand_code("thiserror_impl", ProcKind::Derive, "Error", nested_opt)
+            .expect("nested Option<CustomOpt::Option<Leaf>> expands directly");
+        assert!(
+            exp_nested.contains("match (&self.source).as_ref()"),
+            "nested Option must unwrap only outer Option layer:\n{exp_nested}"
+        );
+
+        let qpath_opt = r#"#[derive(Debug)] #[error("qpath")] pub struct QPathOpt { #[source] source: <Provider as Factory>::Option<std::io::Error> }"#;
+        let exp_qpath = expand_code("thiserror_impl", ProcKind::Derive, "Error", qpath_opt)
+            .expect("qualified associated-type Option expands directly");
+        assert!(
+            exp_qpath.contains("match (&self.source).as_ref()"),
+            "qualified associated-type Option must unwrap via .as_ref():\n{exp_qpath}"
+        );
+
+        let braced_macro_opt = r#"#[derive(Debug)] #[error("macro")] pub struct MacroOpt { #[source] source: Option<error_ty! { A, B }> }"#;
+        let exp_macro = expand_code("thiserror_impl", ProcKind::Derive, "Error", braced_macro_opt)
+            .expect("Option<error_ty! { A, B }> expands directly");
+        assert!(
+            exp_macro.contains("match (&self.source).as_ref()"),
+            "Option with braced macro arg must unwrap via .as_ref():\n{exp_macro}"
+        );
+
+        // 9. Fallbacks to real `thiserror-impl`:
+        //    - `Option<Box<dyn Error>>` / `Option<&'static dyn Error>`
+        //    - `#[error(transparent)]` with invalid `#[source]`
+        let fallbacks = [
+            r#"#[derive(Debug)] #[error("dyn")] pub struct DynOpt { #[source] source: Option<Box<dyn std::error::Error + Send + Sync>> }"#,
+            r#"#[derive(Debug)] #[error("dyn ref")] pub struct DynRefOpt { #[source] source: Option<&'static dyn std::error::Error> }"#,
+            r#"#[derive(Debug)] #[error(transparent)] pub struct TransWithSource(#[source] std::io::Error);"#,
+        ];
+        for src in fallbacks {
+            assert!(
+                expand_code("thiserror_impl", ProcKind::Derive, "Error", src).is_none(),
+                "expected fallback to real thiserror-impl for:\n{src}"
+            );
+        }
     }
 
     #[test]
